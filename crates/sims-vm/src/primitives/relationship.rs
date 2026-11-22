@@ -32,7 +32,7 @@ use sims_sim::neighbors::Row;
 
 impl Machine<'_, '_> {
     pub(crate) fn relationship(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
-        self.relationship_with(operands, None)
+        self.relationship_with(operands, None, true)
     }
 
     /// Old Relationship (opcode 24), the same primitive with its operands
@@ -63,10 +63,16 @@ impl Machine<'_, '_> {
         self.relationship_with(
             &[operands[1], operands[3], flags, 0, 9, 0, index[0], index[1]],
             named,
+            false,
         )
     }
 
-    fn relationship_with(&mut self, operands: &[u8; 8], named: Option<i16>) -> Result<bool, Trap> {
+    fn relationship_with(
+        &mut self,
+        operands: &[u8; 8],
+        named: Option<i16>,
+        sets_scratch_ptr: bool,
+    ) -> Result<bool, Trap> {
         let frame = self.frame()?;
         let stack_object = frame.stack_object;
         let direction = operands[1];
@@ -159,6 +165,16 @@ impl Machine<'_, '_> {
             values(self.world, table, key)
                 .ok_or_else(|| Trap::Invalid("a relationship row vanished".into()))?
                 .resize(column + 1, 0);
+        }
+        // 0x44d513: Relationship (opcode 26) binds `[edi + 0x128]` to the
+        // local scratch slot before resolving the value operand and never
+        // clears it. Old Relationship (opcode 24, 0x44d593) reads the
+        // parameter directly without touching `[edi + 0x128]`.
+        if sets_scratch_ptr {
+            self.world.scratch_ptr_set_to_next.remove(&self.me);
+            self.world.scratch_ptr_expression.remove(&self.me);
+            self.world.scratch_ptr_arg_slot.remove(&self.me);
+            self.world.scratch_ptr_set.insert(self.me);
         }
         // The operand is resolved for writing in both directions.
         let (cell, writable) = self.resolve(operands[4], word(operands, 6), true)?;

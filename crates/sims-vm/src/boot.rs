@@ -245,10 +245,10 @@ pub struct Finished {
 /// ([`Lot::load_after_pools`]).
 #[derive(Debug, Clone, Default)]
 pub struct Handoff {
-    /// The skeletons, by name, whose files the game has already read.
-    /// They are added to the files our load counts as read before the
-    /// first lot.
-    pub skeletons_read: BTreeSet<String>,
+    /// The skeletons, by name, whose files the game has already read, in exact
+    /// open order so duplicate entries across already-opened catalogs preserve
+    /// native first-registration order (`0x59f18c`, `0x59f34c`).
+    pub skeletons_read: Vec<String>,
     /// Whether the two indicators' graphics roots already exist.
     pub indicators_made: bool,
 }
@@ -831,6 +831,15 @@ impl Lot {
             Ok(assets) => sims_content::Wardrobe::load(&assets),
             Err(error) => sims_content::Wardrobe::unread(error),
         });
+        program.ordered_wardrobe =
+            Some(match sims_content::ImportWardrobe::load_lenient(&install) {
+                Ok((ordered, errors)) if errors.is_empty() => Ok(ordered),
+                Ok((_, errors)) => {
+                    let (file, error) = errors.into_iter().next().unwrap();
+                    Err(format!("{file} ({error})"))
+                }
+                Err(error) => Err(error.to_string()),
+            });
         if let Some(characters) = &characters {
             program.character_files = crate::program::character_files(&index, characters);
         }
@@ -869,6 +878,43 @@ impl Lot {
                     .into());
                 };
                 world.skeleton_files.insert(file.clone());
+                // The handoff's catalog was already opened through `0x59f087`
+                // before the lot load, so its indexed skeletons and appearances
+                // are already registered in the avatar registry (preventing a
+                // duplicate lazy load and CRT RNG draw during house load).
+                if let Some((items, _)) = program.people.indexed_catalogs.get(file) {
+                    for item in items {
+                        if !program.people.skeletons_by_name.contains_key(&item.name)
+                            && !world.loaded_indexed_skeletons.contains_key(&item.name)
+                        {
+                            world
+                                .loaded_indexed_skeletons
+                                .insert(item.name.clone(), Some(file.clone()));
+                        }
+                    }
+                }
+                if let Some((suits, _)) = program.people.indexed_suit_catalogs.get(file) {
+                    let catalog_bones = program.people.indexed_suit_head_bones.get(file);
+                    for (app_name, has_head) in suits {
+                        if !program.people.eager_suits.contains(app_name)
+                            && !world.loaded_indexed_suits.contains_key(app_name)
+                        {
+                            world
+                                .loaded_indexed_suits
+                                .insert(app_name.clone(), Some(*has_head));
+                            if let Some(bones) = catalog_bones.and_then(|m| m.get(app_name)) {
+                                world
+                                    .loaded_indexed_suit_bones
+                                    .insert(app_name.clone(), bones.clone());
+                            }
+                            if !program.people.indexed_suits.contains_key(app_name)
+                                && !world.runtime_added_suits.contains(app_name)
+                            {
+                                world.runtime_added_suits.push(app_name.clone());
+                            }
+                        }
+                    }
+                }
             }
             world.read_neighbors(
                 &neighborhood,
@@ -1254,6 +1300,7 @@ impl Lot {
         let tuning = self.tuning.as_ref().ok_or(StepError::Incomplete)?;
         let asks = self.asks;
         let sounds = RefCell::new(Vec::new());
+        let ui_effects = RefCell::new(Vec::new());
         let masks_rebuilt = Cell::new(0);
         let dialog_text = RefCell::new(self.last_dialog_text.clone());
         let character_names = RefCell::new(self.character_names.clone());
@@ -1262,6 +1309,7 @@ impl Lot {
             .unwrap_or((self.view_rotation, self.view_centre));
         let interpreter = Interpreter {
             sounds: Some(&sounds),
+            ui_effects: Some(&ui_effects),
             masks_rebuilt: Some(&masks_rebuilt),
             view_rotation,
             view_centre,
@@ -1329,6 +1377,7 @@ impl Lot {
                     // it: the errors caught, a skipped first frame, and
                     // the sounds.
                     update.sounds = sounds.take();
+                    update.ui_effects = ui_effects.take();
                     update.masks_rebuilt = masks_rebuilt.get();
                     StepError::Tick {
                         tick,
@@ -1369,6 +1418,7 @@ impl Lot {
         // The step's sounds go with its update whether or not the frame
         // failed.
         update.sounds = sounds.into_inner();
+        update.ui_effects = ui_effects.into_inner();
         update.masks_rebuilt = masks_rebuilt.get();
         self.last_dialog_text = dialog_text.into_inner();
         self.character_names = character_names.into_inner();
@@ -3313,6 +3363,7 @@ mod tests {
                 people: Default::default(),
                 icon_frames: None,
                 wardrobe: None,
+                ordered_wardrobe: None,
                 character_files: Default::default(),
                 expansions: 0,
                 characters: Default::default(),
@@ -4108,6 +4159,9 @@ mod tests {
                         skin: None,
                         tones: Vec::new(),
                         rig: Default::default(),
+                        body: None,
+                        head: None,
+                        suit_rows: Default::default(),
                     },
                 );
             }
@@ -4141,11 +4195,12 @@ mod tests {
         assert!(restored.world().saved_portraits.contains(&PERSON_A));
 
         // Tick 2 runs after replay_view is cleared, so PERSON_B's portrait search
-        // MUST use the moved live [2, 2] and hit the no-tile trap (0x4e9706 / 0x4e938c).
-        let err = restored.step().unwrap_err().to_string();
-        assert!(
-            err.contains("0x4e9706") && err.contains("0x4e938c"),
-            "{err}"
-        );
+        // MUST use the moved live [2, 2], find no tile, remove unput (`0x4e9706`)
+        // without caching or saving PERSON_B, and pause on tick 2's dialog.
+        assert_eq!(restored.step().unwrap_err(), StepError::Asking { tick: 2 });
+        restored.answer(2).unwrap();
+        restored.step().unwrap();
+        assert!(!restored.world().portraits.contains(&PERSON_B));
+        assert!(!restored.world().saved_portraits.contains(&PERSON_B));
     }
 }

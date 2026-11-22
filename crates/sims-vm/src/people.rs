@@ -204,6 +204,8 @@ pub(crate) fn profile<'p>(
     };
     let mut profile = profile.clone();
     for (index, string) in [
+        (characters::BODY, &mut profile.body),
+        (characters::HEAD, &mut profile.head),
         (characters::GENDER, &mut profile.gender),
         (characters::AGE, &mut profile.age),
         (characters::SKIN, &mut profile.skin),
@@ -215,11 +217,11 @@ pub(crate) fn profile<'p>(
     Ok(Cow::Owned(profile))
 }
 
-/// A person type's skeleton: the one its body string 0 names. A type made
-/// while the game ran names the skeleton Make New Character wrote, or its
-/// template's; a skeleton named so is the one any person type of that
-/// name resolved to, as the name alone chooses the file. A type with no
-/// skeleton in `people` fails.
+/// A person type's skeleton (read-only lookup): the one its body string 0
+/// names. A type made while the game ran names the skeleton Make New
+/// Character wrote, or its template's; lazy `.ndx` catalogs already loaded at
+/// runtime (`World::loaded_indexed_skeletons`) take precedence over unopened
+/// catalog entries. A type with no skeleton in `people` fails.
 pub(crate) fn skeleton<'p>(
     people: &'p People,
     world: &World,
@@ -227,35 +229,474 @@ pub(crate) fn skeleton<'p>(
 ) -> Result<&'p Skeleton, Trap> {
     let made = world.characters.made.get(&guid);
     let template = made.map_or(guid, |made| made.template);
-    let none = || {
+    let requested_name = made
+        .and_then(|made| made.strings.get(&characters::SKELETON))
+        .or_else(|| people.skeleton_names.get(&template));
+    if let Some(name) = requested_name {
+        if people.skeletons_by_name.contains_key(name)
+            || world.loaded_indexed_skeletons.contains_key(name)
+            || people.indexed_skeletons.contains_key(name)
+        {
+            return lookup_loaded_skeleton_by_name(people, world, name).ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "no person type's skeleton is named {name:?}, which the person type \
+                     0x{guid:08X} names"
+                ))
+            });
+        }
+        if let Some(skeleton) = people.skeletons.get(&template).filter(|s| s.name == *name) {
+            return Ok(skeleton);
+        }
+        return lookup_loaded_skeleton_by_name(people, world, name).ok_or_else(|| {
+            Trap::Unsupported(format!(
+                "no person type's skeleton is named {name:?}, which the person type \
+                 0x{guid:08X} names"
+            ))
+        });
+    }
+    people.skeletons.get(&template).ok_or_else(|| {
         Trap::Unsupported(format!(
             "no skeleton was supplied for the person type 0x{guid:08X}"
         ))
-    };
-    let skeleton = people.skeletons.get(&template).ok_or_else(none)?;
-    match made.and_then(|made| made.strings.get(&characters::SKELETON)) {
-        Some(name) if !name.eq_ignore_ascii_case(&skeleton.name) => people
-            .skeletons
-            .values()
-            .find(|s| s.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| {
-                Trap::Unsupported(format!(
-                    "no person type's skeleton is named {name:?}, which the made person type \
-                         0x{guid:08X} names"
-                ))
-            }),
-        _ => Ok(skeleton),
+    })
+}
+
+/// Read-only lookup of a skeleton by exact name (`0x5a280f`), checking:
+/// 1. startup-loaded skeletons (`people.skeletons_by_name`);
+/// 2. runtime-loaded `.ndx` skeletons and filled siblings
+///    (`world.loaded_indexed_skeletons` → `people.indexed_catalogs`);
+/// 3. still-unloaded `.ndx` entry's own catalog (for read-only callers that
+///    inspect a person whose skeleton was not resolved via the factory);
+/// 4. fallback over `people.skeletons.values()` for synthetic fixtures.
+fn lookup_loaded_skeleton_by_name<'p>(
+    people: &'p People,
+    world: &World,
+    name: &str,
+) -> Option<&'p Skeleton> {
+    if let Some(skeleton) = people.skeletons_by_name.get(name) {
+        return Some(skeleton);
+    }
+    if let Some(slot) = world.loaded_indexed_skeletons.get(name) {
+        return slot.as_deref().and_then(|loc| {
+            people
+                .indexed_catalogs
+                .get(loc)
+                .and_then(|(items, _)| items.iter().find(|s| s.name == name))
+        });
+    }
+    if let Some(Ok(loc)) = people.indexed_skeletons.get(name)
+        && let Some((items, _)) = people.indexed_catalogs.get(loc)
+        && let Some(skeleton) = items.iter().find(|s| s.name == name)
+    {
+        return Some(skeleton);
+    }
+    people.skeletons.values().find(|s| s.name == name)
+}
+
+/// Mutable avatar-registry and CRT-RNG state threaded through skeleton and
+/// appearance resolution (`0x5a0384`, `0x5a044d`, `0x59e60e` → `0x59f087`).
+pub(crate) struct RegistryMut<'a, 'b> {
+    pub loaded_skeletons: &'a mut std::collections::BTreeMap<String, Option<String>>,
+    pub loaded_suits: &'a mut std::collections::BTreeMap<String, Option<bool>>,
+    pub loaded_suit_bones: &'a mut std::collections::BTreeMap<String, Vec<Vec<String>>>,
+    pub runtime_added_suits: &'a mut Vec<String>,
+    pub draws: &'a mut crate::objects::Draws<'b>,
+    pub files: &'a mut BTreeSet<String>,
+}
+
+/// Loads one `.ndx`-referenced `.bcf` catalog (`0x59e60e` → `0x59f087`),
+/// building its skeletons once into the C runtime RNG stream (`0x59f107` →
+/// `0x598af7`, tracked in `files`) and populating BOTH unloaded skeletons
+/// (`0x59f18c`–`0x59f19f`) AND unloaded appearances (`0x59f34c`–`0x59f35f`)
+/// without overwriting eager or previously attempted entries.
+fn load_indexed_bcf_catalog_into(people: &People, loc: &str, reg: &mut RegistryMut<'_, '_>) {
+    if let Some((items, _)) = people.indexed_catalogs.get(loc) {
+        if let Some(first) = items.first() {
+            // Mark the file read so a subsequent `build_skeleton` for the
+            // resolved person draws only its own copy (`0x598da3`).
+            reg.files.insert(first.file.clone());
+        }
+        // 0x59e70a -> 0x59f087 -> 0x59f107 -> 0x598af7: EVERY time an
+        // unresolved `.ndx` entry opens this `.bcf` catalog (including a
+        // later reopen for another unresolved `.ndx` entry, and including
+        // duplicate skeleton entries in the file), every skeleton decoded
+        // from the catalog draws its wiggle scales before checking whether
+        // its name is already registered.
+        for item in items {
+            if let Some(scales) = item.scales.get(item.place) {
+                reg.draws.skeleton(scales);
+            }
+        }
+        for item in items {
+            if !people.skeletons_by_name.contains_key(&item.name)
+                && !reg.loaded_skeletons.contains_key(&item.name)
+            {
+                reg.loaded_skeletons
+                    .insert(item.name.clone(), Some(loc.to_owned()));
+            }
+        }
+    }
+    if let Some((catalog_heads, _)) = people.indexed_suit_catalogs.get(loc) {
+        let catalog_bones = people.indexed_suit_head_bones.get(loc);
+        for (app_name, has_head) in catalog_heads {
+            if !people.eager_suits.contains(app_name) && !reg.loaded_suits.contains_key(app_name) {
+                reg.loaded_suits.insert(app_name.clone(), Some(*has_head));
+                if let Some(bones) = catalog_bones.and_then(|m| m.get(app_name)) {
+                    reg.loaded_suit_bones
+                        .insert(app_name.clone(), bones.clone());
+                }
+                // 0x59f320 -> 0x5a1fb1: appearances not already present in the
+                // startup eager or `.ndx` hash table are inserted as new nodes.
+                if !people.indexed_suits.contains_key(app_name)
+                    && !reg.runtime_added_suits.contains(app_name)
+                {
+                    reg.runtime_added_suits.push(app_name.clone());
+                }
+            }
+        }
     }
 }
 
+fn resolve_skeleton_by_name_into<'p>(
+    people: &'p People,
+    guid: u32,
+    name: &str,
+    reg: &mut RegistryMut<'_, '_>,
+) -> Result<&'p Skeleton, Trap> {
+    if let Some(skeleton) = people.skeletons_by_name.get(name) {
+        return Ok(skeleton);
+    }
+    if let Some(slot) = reg.loaded_skeletons.get(name) {
+        return match slot.as_deref() {
+            Some(loc) => people
+                .indexed_catalogs
+                .get(loc)
+                .and_then(|(items, _)| items.iter().find(|s| s.name == name))
+                .ok_or_else(|| {
+                    Trap::Unsupported(format!(
+                        "0x5a03c0: loaded catalog {loc} does not define skeleton {name:?}"
+                    ))
+                }),
+            None => Err(Trap::Unsupported(format!(
+                "0x5a389b: earlier lazy lookup for skeleton {name:?} failed"
+            ))),
+        };
+    }
+    if let Some(entry) = people.indexed_skeletons.get(name) {
+        let loc = match entry {
+            Ok(loc) => loc,
+            Err(reason) => {
+                // 0x5a389b: mark failed so later catalog loads cannot overwrite it.
+                reg.loaded_skeletons.insert(name.to_owned(), None);
+                return Err(Trap::Unsupported(reason.clone()));
+            }
+        };
+        let (_, decode_error) = people.indexed_catalogs.get(loc).ok_or_else(|| {
+            Trap::Unsupported(format!(
+                "0x5a3810: indexed catalog {loc} for skeleton {name:?} is unavailable"
+            ))
+        })?;
+        // 0x59e60e -> 0x59f087: loading this `.bcf` builds its skeletons
+        // (`0x59f107`), registers skeletons (`0x59f18c`), and registers
+        // appearances (`0x59f34c`).
+        load_indexed_bcf_catalog_into(people, loc, reg);
+        if let Some(Some(filled_loc)) = reg.loaded_skeletons.get(name)
+            && let Some(skeleton) = people
+                .indexed_catalogs
+                .get(filled_loc)
+                .and_then(|(catalog, _)| catalog.iter().find(|s| s.name == name))
+        {
+            return Ok(skeleton);
+        }
+        // 0x5a389b: mark failed so later catalog loads cannot overwrite it.
+        reg.loaded_skeletons.insert(name.to_owned(), None);
+        let reason = if let Some(error) = decode_error {
+            format!("0x5a3810: the skeletons of {loc} do not decode ({error})")
+        } else {
+            format!("0x5a03c0: {loc} does not define skeleton {name:?}")
+        };
+        return Err(Trap::Unsupported(reason));
+    }
+    people
+        .skeletons
+        .values()
+        .find(|s| s.name == name)
+        .ok_or_else(|| {
+            Trap::Unsupported(format!(
+                "no person type's skeleton is named {name:?}, which the person type \
+                 0x{guid:08X} names"
+            ))
+        })
+}
+
+/// Resolves a skeleton by exact byte-for-byte name (`0x5a0384`, `0x5a280f`),
+/// executing lazy `.ndx` catalog loads in runtime call order.
+pub(crate) fn resolve_skeleton_by_name<'p>(
+    people: &'p People,
+    world: &mut World,
+    guid: u32,
+    name: &str,
+) -> Result<&'p Skeleton, Trap> {
+    let mut draws = crate::objects::Draws {
+        stream: &mut world.crt_rng,
+        count: 0,
+    };
+    let mut reg = RegistryMut {
+        loaded_skeletons: &mut world.loaded_indexed_skeletons,
+        loaded_suits: &mut world.loaded_indexed_suits,
+        loaded_suit_bones: &mut world.loaded_indexed_suit_bones,
+        runtime_added_suits: &mut world.runtime_added_suits,
+        draws: &mut draws,
+        files: &mut world.skeleton_files,
+    };
+    resolve_skeleton_by_name_into(people, guid, name, &mut reg)
+}
+
+/// Resolves the skeleton for constructing a saved-house person of `guid`
+/// (`0x58838b` → `0x5a073b` → `0x5a0384`), honoring runtime `.ndx` catalog
+/// load order and sibling registration on the house load's working state.
+pub(crate) fn resolve_skeleton_for_saved<'p>(
+    people: &'p People,
+    guid: u32,
+    reg: &mut RegistryMut<'_, '_>,
+) -> Result<&'p Skeleton, Trap> {
+    if let Some(name) = people.skeleton_names.get(&guid) {
+        if people.skeletons_by_name.contains_key(name)
+            || reg.loaded_skeletons.contains_key(name)
+            || people.indexed_skeletons.contains_key(name)
+        {
+            return resolve_skeleton_by_name_into(people, guid, name, reg);
+        }
+        if let Some(skeleton) = people.skeletons.get(&guid).filter(|s| s.name == *name) {
+            return Ok(skeleton);
+        }
+        return resolve_skeleton_by_name_into(people, guid, name, reg);
+    }
+    people.skeletons.get(&guid).ok_or_else(|| {
+        Trap::Unsupported(format!(
+            "no skeleton was supplied for the person type 0x{guid:08X}"
+        ))
+    })
+}
+
+/// Resolves the skeleton for constructing a person of `guid` (`0x58833c` →
+/// `0x5a0384`), honoring runtime-made overrides, `early_name` (loader-ordered
+/// body string 0), and runtime `.ndx` load order.
+pub(crate) fn resolve_skeleton<'p>(
+    people: &'p People,
+    world: &mut World,
+    guid: u32,
+    early_name: Option<&str>,
+) -> Result<&'p Skeleton, Trap> {
+    let made = world.characters.made.get(&guid);
+    let template = made.map_or(guid, |made| made.template);
+    let requested_name = early_name
+        .map(str::to_owned)
+        .or_else(|| {
+            made.and_then(|made| made.strings.get(&characters::SKELETON))
+                .cloned()
+        })
+        .or_else(|| people.skeleton_names.get(&template).cloned());
+    if let Some(name) = requested_name {
+        // Check startup-loaded and runtime-ordered `.ndx` registries BEFORE
+        // `people.skeletons` so catalog types whose skeletons are `.ndx`-indexed
+        // honor exact runtime lookup order (`0x5a0384`, `0x59f18c`–`0x59f19f`).
+        if people.skeletons_by_name.contains_key(&name)
+            || world.loaded_indexed_skeletons.contains_key(&name)
+            || people.indexed_skeletons.contains_key(&name)
+        {
+            return resolve_skeleton_by_name(people, world, guid, &name);
+        }
+        if let Some(skeleton) = people.skeletons.get(&template).filter(|s| s.name == name) {
+            return Ok(skeleton);
+        }
+        return resolve_skeleton_by_name(people, world, guid, &name);
+    }
+    people.skeletons.get(&template).ok_or_else(|| {
+        Trap::Unsupported(format!(
+            "no skeleton was supplied for the person type 0x{guid:08X}"
+        ))
+    })
+}
+
+/// Result of looking up lowercased appearance `suit` via `0x5a044d` →
+/// `0x5a38da` → `0x59e60e` → `0x59f087`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedSuit {
+    /// Appearance exists; `bool` is whether it binds `"HEAD"` with a valid mesh.
+    Found(bool),
+    /// Appearance is confirmed absent (or previously attempted and failed cleanly at `0x5a3965`).
+    Missing,
+    /// An earlier decode error prevented knowing whether `suit` exists / binds `"HEAD"`.
+    Unknown,
+}
+
+/// Whether a previously failed indexed lookup for `suit` (`loaded_indexed_suits[suit] == None`)
+/// failed because decoding stopped with an error (leaving existence / HEAD binding unknown)
+/// rather than a clean catalog miss or missing file (`0x5a392f -> 0x5a3965`).
+fn failed_indexed_suit_is_unknown(people: &People, suit: &str) -> bool {
+    match people.indexed_suits.get(suit) {
+        Some(Ok(loc)) => people
+            .indexed_suit_catalogs
+            .get(loc)
+            .is_none_or(|(_, err)| err.is_some()),
+        // 0x5a392f -> 0x5a3965: an `.ndx` entry pointing to a missing file is
+        // a definite miss even if an unrelated catalog populated `suit_errors`;
+        // only a genuine lookup error recorded in `suit_errors` is unknown.
+        Some(Err(reason)) => people.suit_errors.values().any(|err| err == reason),
+        None => !people.suit_errors.is_empty(),
+    }
+}
+
+/// Read-only inspection of already-loaded appearance state (`0x58a1f8` skips
+/// dressing without triggering new `.ndx` catalog loads).
+pub(crate) fn peek_suit_head(people: &People, world: &World, suit: &str) -> ResolvedSuit {
+    if people.eager_suits.contains(suit) {
+        return ResolvedSuit::Found(people.head_suits.contains(suit));
+    }
+    if let Some(&slot) = world.loaded_indexed_suits.get(suit) {
+        return match slot {
+            Some(has_head) => ResolvedSuit::Found(has_head),
+            None if failed_indexed_suit_is_unknown(people, suit) => ResolvedSuit::Unknown,
+            None => ResolvedSuit::Missing,
+        };
+    }
+    if people.indexed_suits.contains_key(suit) {
+        return ResolvedSuit::Missing;
+    }
+    if people.head_suits.contains(suit) {
+        ResolvedSuit::Found(true)
+    } else if people.suits.contains(suit) {
+        ResolvedSuit::Found(false)
+    } else if !people.suit_errors.is_empty() {
+        ResolvedSuit::Unknown
+    } else {
+        ResolvedSuit::Missing
+    }
+}
+
+/// Resolves appearance `suit` byte-for-byte via `0x5a044d` → `0x5a38da` →
+/// `0x59e60e` → `0x59f087` against explicit transactional registry state
+/// (used both by live runtime dressing and saved-house object reads).
+pub(crate) fn resolve_suit_into(
+    people: &People,
+    suit: &str,
+    reg: &mut RegistryMut<'_, '_>,
+) -> ResolvedSuit {
+    if people.eager_suits.contains(suit) {
+        return ResolvedSuit::Found(people.head_suits.contains(suit));
+    }
+    if let Some(&slot) = reg.loaded_suits.get(suit) {
+        return match slot {
+            Some(has_head) => ResolvedSuit::Found(has_head),
+            None if failed_indexed_suit_is_unknown(people, suit) => ResolvedSuit::Unknown,
+            None => ResolvedSuit::Missing,
+        };
+    }
+    if let Some(entry) = people.indexed_suits.get(suit) {
+        match entry {
+            Ok(loc) => {
+                if let Some((_, decode_error)) = people.indexed_suit_catalogs.get(loc) {
+                    // 0x59e60e -> 0x59f087: loading this `.bcf` builds its
+                    // skeletons (`0x59f107`), registers skeletons (`0x59f18c`),
+                    // and registers appearances (`0x59f34c`).
+                    load_indexed_bcf_catalog_into(people, loc, reg);
+                    if let Some(&Some(has_head)) = reg.loaded_suits.get(suit) {
+                        return ResolvedSuit::Found(has_head);
+                    }
+                    // 0x5a3965: mark the requested entry attempted (`None`)
+                    // BEFORE returning even on a decode error, so later
+                    // catalog loads cannot fill it (`0x59f34c`), while
+                    // `failed_indexed_suit_is_unknown` preserves decode
+                    // uncertainty for subsequent queries.
+                    reg.loaded_suits.insert(suit.to_owned(), None);
+                    return if decode_error.is_some() {
+                        ResolvedSuit::Unknown
+                    } else {
+                        ResolvedSuit::Missing
+                    };
+                }
+                reg.loaded_suits.insert(suit.to_owned(), None);
+                return ResolvedSuit::Unknown;
+            }
+            Err(reason) => {
+                // 0x5a392f -> 0x5a3965: missing catalog file is a definite
+                // miss regardless of unrelated `suit_errors`.
+                reg.loaded_suits.insert(suit.to_owned(), None);
+                return if people.suit_errors.values().any(|err| err == reason) {
+                    ResolvedSuit::Unknown
+                } else {
+                    ResolvedSuit::Missing
+                };
+            }
+        }
+    }
+    if people.head_suits.contains(suit) {
+        ResolvedSuit::Found(true)
+    } else if people.suits.contains(suit) {
+        ResolvedSuit::Found(false)
+    } else if !people.suit_errors.is_empty() {
+        ResolvedSuit::Unknown
+    } else {
+        ResolvedSuit::Missing
+    }
+}
+
+pub(crate) fn resolve_suit(people: &People, world: &mut World, suit: &str) -> ResolvedSuit {
+    let mut draws = crate::objects::Draws {
+        stream: &mut world.crt_rng,
+        count: 0,
+    };
+    let mut reg = RegistryMut {
+        loaded_skeletons: &mut world.loaded_indexed_skeletons,
+        loaded_suits: &mut world.loaded_indexed_suits,
+        loaded_suit_bones: &mut world.loaded_indexed_suit_bones,
+        runtime_added_suits: &mut world.runtime_added_suits,
+        draws: &mut draws,
+        files: &mut world.skeleton_files,
+    };
+    resolve_suit_into(people, suit, &mut reg)
+}
+
+/// Whether `suit` has a `"HEAD"` mesh binding whose required bones all exist
+/// in `skeleton` (`0x599f8a..0x59a01c`), using the winning runtime-loaded
+/// `.bcf` catalog's mesh requirements (`World::loaded_indexed_suit_bones`,
+/// `0x59f34c..0x59f35f`) for lazy suits and `People::head_mesh_bones` for
+/// eager or synthetic suits.
+pub(crate) fn suit_head_matches_skeleton(
+    people: &People,
+    world: &World,
+    suit: &str,
+    has_head: bool,
+    skeleton: Option<&Skeleton>,
+) -> bool {
+    let mesh_bones = if people.eager_suits.contains(suit) {
+        people.head_mesh_bones.get(suit).map(Vec::as_slice)
+    } else if world.loaded_indexed_suits.contains_key(suit) {
+        world.loaded_indexed_suit_bones.get(suit).map(Vec::as_slice)
+    } else {
+        people.head_mesh_bones.get(suit).map(Vec::as_slice)
+    };
+    people.suit_head_matches_skeleton_with_bones(suit, has_head, mesh_bones, skeleton)
+}
+
 /// Reads person `id`'s appearance again if its animator says it is to be
-/// read (`stale`, animator byte +0xd8), as looking up a clip does
-/// (0x5893b3, 0x592625): the flag is cleared and the appearance read from
-/// the person type's profile in [`crate::Program::people`]
-/// ([`reload_profile`], the animator's virtual function 0x14).
+/// read (`stale`, animator byte +0xd8), executing `0x5888d3`:
 ///
-/// A person type with no profile there fails.
+/// 1. `vtable[+0x10]` (`0x5887fc`): detach all body/extra/accessory/head slots;
+/// 2. `0x588914`, `0x588921`: zero live hand words 22 and 23;
+/// 3. `0x588930`: call `cTSPerson::Dress(0)` (`0x58a178(0)`) BEFORE reloading
+///    profile words;
+/// 4. `0x588935..0x588ce5`: reload gender (65), age (58), and skin tone (60)
+///    from `STR# 200` ([`reload_profile`]);
+/// 5. `0x588cea` → `vtable[+0x18]` (`0x588d11`): destroy and clear accessories;
+/// 6. `0x588ced`, `0x588cf4`: reset cached suit and variant (`last_dressed[0]`
+///    and `last_dressed[1]`) to `-1`.
+///
+/// A person type with no profile in [`crate::Program::people`] fails before
+/// mutating state.
 pub(crate) fn read_appearance_if_stale(
+    catalog: &sims_content::Catalog,
     world: &mut World,
     program: &crate::Program,
     id: u16,
@@ -269,17 +710,66 @@ pub(crate) fn read_appearance_if_stale(
         .get(&id)
         .ok_or(Trap::native(10, "missing object"))?
         .guid;
-    // Looked up before the person is borrowed; a missing profile still
-    // fails after the person check.
+    // Looked up before mutating so a missing object, non-person, or missing
+    // profile still fails cleanly.
     let profile = profile(&program.people, world, guid);
+    if world
+        .objects
+        .get(&id)
+        .and_then(|object| object.person.as_ref())
+        .is_none()
+    {
+        return Err(Trap::native(0x1c, "object is not a person"));
+    }
+    let profile = profile?.into_owned();
+    *stale = false;
+
+    // 1. 0x5888f1 -> 0x5887fc: detach all bound attachment slots (keeping
+    //    `last_dressed` untouched for the immediately following `0x58a178(0)`).
+    {
+        let outfit = world.person_outfits.entry(id).or_default();
+        outfit.head = None;
+        outfit.body = None;
+        outfit.body_alt = None;
+        outfit.extra_left = None;
+        outfit.extra_right = None;
+        outfit.accessories.clear();
+    }
+    // 2. 0x588914, 0x588921: clear live hand words 22 & 23 before dressing.
+    if let Some(person) = world
+        .objects
+        .get_mut(&id)
+        .and_then(|object| object.person.as_mut())
+    {
+        if let Some(w) = person.data.get_mut(22) {
+            *w = 0;
+        }
+        if let Some(w) = person.data.get_mut(23) {
+            *w = 0;
+        }
+    }
+    world.routing.unknown_words.remove(&(id, 22));
+    world.routing.unknown_words.remove(&(id, 23));
+
+    // 3. 0x588930 -> 0x58a178(0): dress BEFORE reloading profile words.
+    crate::outfits::dress_person(catalog, program, world, id, false)?;
+
+    // 4. 0x588935..0x588ce5: reload profile words (gender, age, skin, hands).
     let person = world
         .objects
         .get_mut(&id)
         .and_then(|object| object.person.as_mut())
         .ok_or(Trap::native(0x1c, "object is not a person"))?;
-    let profile = profile?;
-    *stale = false;
-    reload_profile(&mut person.data, &profile)
+    reload_profile(&mut person.data, &profile)?;
+    // 5. 0x588cea -> 0x588d11: clear all accessories.
+    person.accessories.clear();
+    if let Some(outfit) = world.person_outfits.get_mut(&id) {
+        outfit.accessories.clear();
+        // 6. 0x588ced, 0x588cf4: reset cached suit & variant to -1.
+        outfit.last_dressed[0] = -1;
+        outfit.last_dressed[1] = -1;
+    }
+    Ok(())
 }
 
 /// Which string table holds a person's motive curves (0x459d23), as

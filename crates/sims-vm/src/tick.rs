@@ -71,6 +71,7 @@ use crate::interpreter::{Interpreter, Status, Stream};
 use crate::placement::Refreshing;
 use crate::play::{Play, Recovery, ScriptError};
 use crate::primitives::dialog::{self, DONE, NEW, SHOWN};
+use crate::primitives::ui_effect::UiEffectEvent;
 use crate::selection::{publish_waited_for, selected};
 use crate::sounds::SoundEvent;
 use crate::visits::function;
@@ -348,6 +349,11 @@ pub struct Update {
     /// ([`crate::sounds`]). Empty when the interpreter carries its own
     /// sink ([`Interpreter::sounds`]), which then has them.
     pub sounds: Vec<SoundEvent>,
+    /// The HUD highlight requests emitted by UI Effect (opcode 34, `0x44acff`)
+    /// during the update, in order ([`UiEffectEvent`]). Empty when the
+    /// interpreter carries its own sink ([`Interpreter::ui_effects`]), which
+    /// then has them.
+    pub ui_effects: Vec<UiEffectEvent>,
     /// The levels whose rooms' cutaway masks the original built again
     /// during the update, as bits (1 for level 1, 2 for level 2): those a
     /// room update counted, which builds them at its end at the zoom of
@@ -421,8 +427,10 @@ impl Interpreter<'_> {
         // and a later one given its ID are told apart (Interpreter::recover).
         let deleted = RefCell::new(Vec::new());
         let sink = RefCell::new(Vec::new());
+        let ui_sink = RefCell::new(Vec::new());
         let this = Interpreter {
             sounds: Some(self.sounds.unwrap_or(&sink)),
+            ui_effects: Some(self.ui_effects.unwrap_or(&ui_sink)),
             deleted: match play {
                 Some(_) => Some(&deleted),
                 None => self.deleted,
@@ -431,6 +439,7 @@ impl Interpreter<'_> {
         };
         let result = this.run_update(world, tuning, player, play, &deleted, &mut update);
         update.sounds = sink.into_inner();
+        update.ui_effects = ui_sink.into_inner();
         (update, result)
     }
 

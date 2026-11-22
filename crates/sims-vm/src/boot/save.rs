@@ -26,7 +26,7 @@
 use super::Lot;
 use crate::Answers;
 use serde::{Deserialize, Serialize};
-use sims_sim::World;
+use sims_sim::{PersonOutfit, PortraitFile, World};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
@@ -44,8 +44,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// lot name & description; layout 7 keeps choice-only follow-up answers
 /// (`Answers::choices_after`) separately from explicit dialog replay queues
 /// and records the neighborhood's `deletion_epoch` at save time so reusing a
-/// deleted character GUID never revives stale instances on older saved lots.
-pub const FORMAT: u32 = 7;
+/// deleted character GUID never revives stale instances on older saved lots;
+/// layout 8 keeps the unencoded auxiliary portrait, outfit, lazy-index,
+/// and scratch-pointer tables omitted from [`World::encode`].
+pub const FORMAT: u32 = 8;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +80,27 @@ pub struct Saved {
     /// Format 7 on: neighborhood `deletion_epoch` at the time this lot was
     /// saved (`0` for non-REDB saves).
     pub(crate) deletion_epoch: u64,
+    /// Format 8 on: generated `BMP_` 2002 writebacks (`0x4e9000`),
+    /// runtime-made character `"HEAD"` binding outcomes (`0x4e7824`),
+    /// ambiguous `0x44b126` pet renders, runtime-loaded `.ndx` skeletons and
+    /// suits (`0x5a0384`, `0x5a044d`), picked Make New Character outfits, live
+    /// person attachment slots, and scratch destination pointer states, which
+    /// [`World::encode`] omits to keep snapshot format 32's wire bytes
+    /// unchanged.
+    generated_portrait_2002: BTreeSet<PortraitFile>,
+    made_portrait_head: BTreeMap<u32, Option<bool>>,
+    ambiguous_portraits: BTreeSet<u32>,
+    loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
+    loaded_indexed_suits: BTreeMap<String, Option<bool>>,
+    loaded_indexed_suit_bones: BTreeMap<String, Vec<Vec<String>>>,
+    made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
+    person_outfits: BTreeMap<u16, PersonOutfit>,
+    scratch_ptr_set: BTreeSet<u16>,
+    scratch_ptr_set_to_next: BTreeSet<u16>,
+    scratch_ptr_expression: BTreeSet<u16>,
+    scratch_ptr_arg_slot: BTreeSet<u16>,
+    runtime_added_suits: Vec<String>,
+    suit_scan_cache: Option<Vec<String>>,
 }
 
 /// Why a lot could not be saved or restored.
@@ -165,7 +188,22 @@ impl Saved {
                 sims_sim::SNAPSHOT_FORMAT
             )));
         }
-        postcard::from_bytes(body).map_err(|e| format(e.to_string()))
+        let mut saved: Self = postcard::from_bytes(body).map_err(|e| format(e.to_string()))?;
+        saved.world.generated_portrait_2002 = saved.generated_portrait_2002.clone();
+        saved.world.made_portrait_head = saved.made_portrait_head.clone();
+        saved.world.ambiguous_portraits = saved.ambiguous_portraits.clone();
+        saved.world.loaded_indexed_skeletons = saved.loaded_indexed_skeletons.clone();
+        saved.world.loaded_indexed_suits = saved.loaded_indexed_suits.clone();
+        saved.world.loaded_indexed_suit_bones = saved.loaded_indexed_suit_bones.clone();
+        saved.world.made_outfits = saved.made_outfits.clone();
+        saved.world.person_outfits = saved.person_outfits.clone();
+        saved.world.scratch_ptr_set = saved.scratch_ptr_set.clone();
+        saved.world.scratch_ptr_set_to_next = saved.scratch_ptr_set_to_next.clone();
+        saved.world.scratch_ptr_expression = saved.scratch_ptr_expression.clone();
+        saved.world.scratch_ptr_arg_slot = saved.scratch_ptr_arg_slot.clone();
+        saved.world.runtime_added_suits = saved.runtime_added_suits.clone();
+        saved.world.suit_scan_cache = saved.suit_scan_cache.clone();
+        Ok(saved)
     }
 }
 
@@ -257,6 +295,20 @@ impl Lot {
                     })?;
             }
         }
+        let generated_portrait_2002 = world.generated_portrait_2002.clone();
+        let made_portrait_head = world.made_portrait_head.clone();
+        let ambiguous_portraits = world.ambiguous_portraits.clone();
+        let loaded_indexed_skeletons = world.loaded_indexed_skeletons.clone();
+        let loaded_indexed_suits = world.loaded_indexed_suits.clone();
+        let loaded_indexed_suit_bones = world.loaded_indexed_suit_bones.clone();
+        let made_outfits = world.made_outfits.clone();
+        let person_outfits = world.person_outfits.clone();
+        let scratch_ptr_set = world.scratch_ptr_set.clone();
+        let scratch_ptr_set_to_next = world.scratch_ptr_set_to_next.clone();
+        let scratch_ptr_expression = world.scratch_ptr_expression.clone();
+        let scratch_ptr_arg_slot = world.scratch_ptr_arg_slot.clone();
+        let runtime_added_suits = world.runtime_added_suits.clone();
+        let suit_scan_cache = world.suit_scan_cache.clone();
         Ok(Saved {
             world,
             ticks: self.ticks,
@@ -276,6 +328,20 @@ impl Lot {
             lot_name: self.lot_name.clone(),
             lot_description: self.lot_description.clone(),
             deletion_epoch: 0,
+            generated_portrait_2002,
+            made_portrait_head,
+            ambiguous_portraits,
+            loaded_indexed_skeletons,
+            loaded_indexed_suits,
+            loaded_indexed_suit_bones,
+            made_outfits,
+            person_outfits,
+            scratch_ptr_set,
+            scratch_ptr_set_to_next,
+            scratch_ptr_expression,
+            scratch_ptr_arg_slot,
+            runtime_added_suits,
+            suit_scan_cache,
         })
     }
 
@@ -329,5 +395,133 @@ impl Lot {
         // continuation of the store revision this `Lot` was opened from.
         self.neighborhood_origin = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_round_trip_preserves_unencoded_portrait_sets() {
+        let mut world = World::empty();
+        world.dirty_portraits.insert(0x1111_2222);
+        world
+            .generated_portrait_2002
+            .insert(PortraitFile::Resource(7));
+        world.generated_portrait_2002.insert(PortraitFile::Made(3));
+        world.made_portrait_head.insert(0x5555_6666, Some(true));
+        world.ambiguous_portraits.insert(0x7777_8888);
+        world
+            .loaded_indexed_skeletons
+            .insert("beta".into(), Some("alpha.bcf".into()));
+        world
+            .loaded_indexed_suits
+            .insert("suit_b".into(), Some(true));
+        world
+            .loaded_indexed_suit_bones
+            .insert("suit_b".into(), vec![vec!["HEAD".into()]]);
+        world.made_outfits.insert(
+            0x5555_6666,
+            BTreeMap::from([
+                (1, "b001,BODY=b001".into()),
+                (2, "c001,HEAD-HEAD=c001".into()),
+            ]),
+        );
+        world.scratch_ptr_set.insert(42);
+        world.scratch_ptr_set_to_next.insert(43);
+        world.scratch_ptr_expression.insert(42);
+        world.scratch_ptr_arg_slot.insert(44);
+        world.runtime_added_suits.push("late_suit".into());
+        world.suit_scan_cache = Some(vec!["suit_a".into(), "late_suit".into()]);
+        let saved = Saved {
+            generated_portrait_2002: world.generated_portrait_2002.clone(),
+            made_portrait_head: world.made_portrait_head.clone(),
+            ambiguous_portraits: world.ambiguous_portraits.clone(),
+            loaded_indexed_skeletons: world.loaded_indexed_skeletons.clone(),
+            loaded_indexed_suits: world.loaded_indexed_suits.clone(),
+            loaded_indexed_suit_bones: world.loaded_indexed_suit_bones.clone(),
+            made_outfits: world.made_outfits.clone(),
+            person_outfits: world.person_outfits.clone(),
+            scratch_ptr_set: world.scratch_ptr_set.clone(),
+            scratch_ptr_set_to_next: world.scratch_ptr_set_to_next.clone(),
+            scratch_ptr_expression: world.scratch_ptr_expression.clone(),
+            scratch_ptr_arg_slot: world.scratch_ptr_arg_slot.clone(),
+            runtime_added_suits: world.runtime_added_suits.clone(),
+            suit_scan_cache: world.suit_scan_cache.clone(),
+            world,
+            ticks: 1,
+            start: 0,
+            answers: Answers::default(),
+            fresh: BTreeSet::new(),
+            view_rotation: 0,
+            answered: false,
+            house: 5,
+            family: 1,
+            loaded: [0; 32],
+            view_centre: Some([32, 32]),
+            floor_rotation: 0,
+            replay_view: None,
+            last_dialog_text: String::new(),
+            character_names: BTreeMap::new(),
+            lot_name: String::new(),
+            lot_description: String::new(),
+            deletion_epoch: 0,
+        };
+        let bytes = saved.encode();
+        let decoded = Saved::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.world().dirty_portraits,
+            BTreeSet::from([0x1111_2222])
+        );
+        assert_eq!(
+            decoded.world().generated_portrait_2002,
+            BTreeSet::from([PortraitFile::Resource(7), PortraitFile::Made(3)])
+        );
+        assert_eq!(
+            decoded.world().made_portrait_head,
+            BTreeMap::from([(0x5555_6666, Some(true))])
+        );
+        assert_eq!(
+            decoded.world().ambiguous_portraits,
+            BTreeSet::from([0x7777_8888])
+        );
+        assert_eq!(
+            decoded.world().loaded_indexed_skeletons,
+            BTreeMap::from([("beta".to_owned(), Some("alpha.bcf".to_owned()))])
+        );
+        assert_eq!(
+            decoded.world().loaded_indexed_suits,
+            BTreeMap::from([("suit_b".to_owned(), Some(true))])
+        );
+        assert_eq!(
+            decoded.world().loaded_indexed_suit_bones,
+            BTreeMap::from([("suit_b".to_owned(), vec![vec!["HEAD".to_owned()]])])
+        );
+        assert_eq!(
+            decoded.world().made_outfits,
+            BTreeMap::from([(
+                0x5555_6666,
+                BTreeMap::from([
+                    (1, "b001,BODY=b001".to_owned()),
+                    (2, "c001,HEAD-HEAD=c001".to_owned()),
+                ])
+            )])
+        );
+        assert_eq!(decoded.world().scratch_ptr_set, BTreeSet::from([42]));
+        assert_eq!(
+            decoded.world().scratch_ptr_set_to_next,
+            BTreeSet::from([43])
+        );
+        assert_eq!(decoded.world().scratch_ptr_expression, BTreeSet::from([42]));
+        assert_eq!(decoded.world().scratch_ptr_arg_slot, BTreeSet::from([44]));
+        assert_eq!(
+            decoded.world().runtime_added_suits,
+            vec!["late_suit".to_owned()]
+        );
+        assert_eq!(
+            decoded.world().suit_scan_cache,
+            Some(vec!["suit_a".to_owned(), "late_suit".to_owned()])
+        );
     }
 }

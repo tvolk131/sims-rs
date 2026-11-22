@@ -90,10 +90,10 @@ pub struct Library {
     /// Sound Event plays (0x582c57). The name is the chunk's bytes up to
     /// the first zero, read as Latin-1.
     pub sounds: BTreeMap<u16, String>,
-    /// Whether the file holds a decodable `BMP_` 2002 ("faces") resource
-    /// (`0x4e9260` → `0x5a5752` → `0x4dece6`): when a dialog's portrait
-    /// build finds no tile (`0x4e9706`), `0x4e92a8` falls back to this
-    /// bitmap instead of calling `0x4e8c5d` again (`0x4e938c`).
+    /// Whether the file holds a decodable neutral-language `BMP_` 2002
+    /// (`0x7d2`, high byte of flags 0) portrait image ("faces", `0x4e9260` →
+    /// `0x4dece6` → `0x4ded4a` → `0x41cb2f` → `0x41bab1`) that `0x4e92a8` can
+    /// load without calling `0x4e8c5d`.
     pub has_portrait_bitmap: bool,
     /// Whether the original opens this file writable (`iResFile::CanWrite`,
     /// `vtable[+0x20]`, checked at `0x4e8cc6` and `0x4e9031`): true only for
@@ -214,6 +214,12 @@ pub struct Program {
     /// they were not read: making a character then fails.
     /// [`Program::link`] leaves it None for the caller to fill.
     pub wardrobe: Option<sims_content::Wardrobe>,
+    /// Native-ordered suit and texture lists (`0x409255`, `0x40895a`) for
+    /// exact index selection in Make New Character (`0x44b151`, `0x44b167`,
+    /// `0x44b07e`), or the error that blocked loading them on a real install
+    /// (failing Make New Character loudly rather than falling back to sorted
+    /// `wardrobe`). [`Program::link`] leaves it None for synthetic fixtures.
+    pub ordered_wardrobe: Option<std::result::Result<sims_content::ImportWardrobe, String>>,
     /// The numbers of the `User%05d.iff` files in the neighborhood's
     /// `Characters` folder: the file numbers Make New Character's copy
     /// finds taken (0x4722b8), besides those of the types it makes.
@@ -253,6 +259,7 @@ impl Program {
             people: People::default(),
             icon_frames: None,
             wardrobe: None,
+            ordered_wardrobe: None,
             character_files: Default::default(),
             expansions: 0,
             characters: BTreeSet::new(),
@@ -352,9 +359,12 @@ impl Program {
                 _ => {}
             }
         }
+        // Portrait bitmap 2002 (0x7d2) read by 0x4e92a8 -> 0x4e9260 -> 0x4dece6
+        // -> 0x4ded4a -> 0x41cb2f -> 0x41bab1: 0x41bad8 zeros the lookup key's
+        // high byte, so only a neutral-language (high byte 0) BMP_ 2002 matches.
         library.has_portrait_bitmap = iff
             .get(b"BMP_", PORTRAIT_BITMAP)
-            .is_some_and(|chunk| sims_formats::bitmap::bmp(iff.data(chunk)).is_ok());
+            .is_some_and(|chunk| is_native_portrait_bmp(iff.data(chunk)));
         // 0x43c6b9/0x43c2c1/0x43c5bf → 0x43e48a → 0x465970 → 0x413094..0x4130dd:
         // only loose files under `Characters` are opened with writable = 1, and
         // `FlatFile::Open` sets `CanWrite()` (byte +8) only if the read-write
@@ -1441,6 +1451,159 @@ fn string_table(
 ) -> sims_formats::Result<sims_formats::strings::StringTable> {
     use sims_formats::strings::StringTable;
     StringTable::parse(data).or_else(|_| StringTable::parse_chunk(data, flags))
+}
+
+/// Whether a raw `BMP_` 2002 resource decodes cleanly through the original's
+/// portrait bitmap reader (`0x4dece6` → `0x4ded4a..0x4df13d`).
+///
+/// Unlike `sims_formats::bitmap::bmp`, the original decoder does not reject
+/// uncompressed 32-bit BMPs: `0x4ded62..0x4dedc9` checks only `"BM"`, non-zero
+/// dimensions, and an optional `<= 256`-entry palette (where `used == 0` computes
+/// `1u32.wrapping_shl((planes * bpp) as u32)`, matching x86 `shl eax, cl` at
+/// `0x4dedb7`), and `0x4def5b..0x4df122` decodes RLE8 (`compression == 1`),
+/// 8-bit plain (`bpp == 8`), or 3-bytes-per-pixel rows padded by `width & 3`
+/// (`0x4df06a..0x4df11c`, which accepts 24-bit and 32-bit uncompressed BMPs).
+fn is_native_portrait_bmp(data: &[u8]) -> bool {
+    const MAX_PIXELS: u64 = 4096 * 4096;
+    if data.len() < 54 || &data[0..2] != b"BM" {
+        return false;
+    }
+    let offset = u32::from_le_bytes(data[10..14].try_into().unwrap()) as usize;
+    let width = i32::from_le_bytes(data[18..22].try_into().unwrap());
+    let raw_height = i32::from_le_bytes(data[22..26].try_into().unwrap());
+    if width <= 0 || raw_height == 0 || raw_height == i32::MIN {
+        return false;
+    }
+    let w = width as usize;
+    let h = raw_height.unsigned_abs() as usize;
+    if (w as u64).saturating_mul(h as u64) > MAX_PIXELS {
+        return false;
+    }
+    let planes = u16::from_le_bytes(data[26..28].try_into().unwrap());
+    let bpp = u16::from_le_bytes(data[28..30].try_into().unwrap());
+    let compression = u32::from_le_bytes(data[30..34].try_into().unwrap());
+    let used_raw = u32::from_le_bytes(data[46..50].try_into().unwrap());
+    let used = if used_raw != 0 {
+        used_raw
+    } else {
+        1u32.wrapping_shl(u32::from(planes.wrapping_mul(bpp)))
+    };
+    // 0x4dee73..0x4deea6 / 0x4deec1..0x4deef3 read only the 3 BGR bytes of
+    // each palette entry (advancing by 4 between entries), so the final
+    // entry's 4th reserved byte is never read (`54 + (used - 1) * 4 + 3`).
+    if (1..=256).contains(&used) {
+        let Some(pal_end) = (used as usize - 1)
+            .checked_mul(4)
+            .and_then(|n| 57usize.checked_add(n))
+        else {
+            return false;
+        };
+        if pal_end > data.len() {
+            return false;
+        }
+    }
+    let Some(body) = data.get(offset..) else {
+        return false;
+    };
+    if compression == 1 {
+        // 0x4def0c..0x4df014 decodes RLE8 directly into a linear 16-bit
+        // DirectDraw surface (`ebx = lPitch >> 1`, DWORD-aligned so
+        // `pitch = (w + 1) & !1`; `row_step = +pitch` for top-down,
+        // `-pitch` for bottom-up, starting at row `0` or `h - 1`). Runs
+        // advance `edx` linearly without checking logical row width, so a run
+        // that crosses a scanline or fills row padding still succeeds whenever
+        // every written pixel stays within `[0, pitch * h)`.
+        let Some(pitch) = w.checked_add(1).map(|n| n & !1) else {
+            return false;
+        };
+        let Some(total) = pitch.checked_mul(h).and_then(|n| isize::try_from(n).ok()) else {
+            return false;
+        };
+        let Ok(pitch_isize) = isize::try_from(pitch) else {
+            return false;
+        };
+        let top_down = raw_height < 0;
+        let row_step = if top_down { pitch_isize } else { -pitch_isize };
+        let mut row_start = if top_down {
+            0
+        } else {
+            (h as isize - 1) * pitch_isize
+        };
+        let mut cursor = row_start;
+        let mut pos = 0usize;
+        while pos + 2 <= body.len() {
+            let count = usize::from(body[pos]);
+            let val = body[pos + 1];
+            pos += 2;
+            if count > 0 {
+                let n = count as isize;
+                if cursor < 0 || cursor.checked_add(n).is_none_or(|end| end > total) {
+                    return false;
+                }
+                cursor += n;
+            } else {
+                match val {
+                    // 0x4def84 (EOL) and 0x4def97..0x4defab (delta) only adjust
+                    // the cursor without writing pixels, so an extra EOL or a
+                    // delta past row width before `00 01` (EOF) succeeds at
+                    // 0x4df122 as long as no subsequent run writes out of bounds.
+                    0 => {
+                        row_start = row_start.saturating_add(row_step);
+                        cursor = row_start;
+                    }
+                    1 => return true,
+                    2 => {
+                        if pos + 2 > body.len() {
+                            return false;
+                        }
+                        let dx = isize::from(body[pos]);
+                        let dy = isize::from(body[pos + 1]);
+                        pos += 2;
+                        let dy_off = dy.saturating_mul(row_step);
+                        row_start = row_start.saturating_add(dy_off);
+                        cursor = cursor.saturating_add(dx).saturating_add(dy_off);
+                    }
+                    n => {
+                        let n = usize::from(n);
+                        let n_isize = n as isize;
+                        if cursor < 0 || cursor.checked_add(n_isize).is_none_or(|end| end > total) {
+                            return false;
+                        }
+                        let advance = n + (n & 1);
+                        if pos.checked_add(advance).is_none_or(|end| end > body.len()) {
+                            return false;
+                        }
+                        pos += advance;
+                        cursor += n_isize;
+                    }
+                }
+            }
+        }
+        false
+    } else if bpp == 8 {
+        // 0x4df050..0x4df063 advances `esi` past the final row's padding and
+        // immediately exits without dereferencing those padding bytes.
+        let Some(stride) = w.checked_add(3).map(|n| n & !3) else {
+            return false;
+        };
+        stride
+            .checked_mul(h - 1)
+            .and_then(|n| n.checked_add(w))
+            .is_some_and(|need| need <= body.len())
+    } else {
+        // 0x4df10e..0x4df122 advances `esi` past `width & 3` on the final row
+        // and immediately exits without reading the unused trailing padding.
+        let Some(pixel_bytes) = w.checked_mul(3) else {
+            return false;
+        };
+        let Some(row_bytes) = pixel_bytes.checked_add(w & 3) else {
+            return false;
+        };
+        row_bytes
+            .checked_mul(h - 1)
+            .and_then(|n| n.checked_add(pixel_bytes))
+            .is_some_and(|need| need <= body.len())
+    }
 }
 
 #[cfg(test)]
