@@ -7722,6 +7722,25 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
         );
         assert_eq!(lot5.world().budget.funds, funds_after_first_sell);
 
+        // Retained `BuyCursor` across `buy_undo` at the public `Lot` API must
+        // refuse double-selling or free resurrection, while `buy_cancel` still
+        // cleans up the stale `"Tile Cursor"` without placing the chair back.
+        let mut ch_stale_src = lot5.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+        assert!(lot5.buy_move(&mut ch_stale_src, [600, 440], 1).unwrap());
+        let stale_chair = lot5.buy_commit(&ch_stale_src).unwrap();
+        let mut stale_cur = lot5.buy_pick_up(stale_chair).unwrap().unwrap();
+        assert!(lot5.buy_undo().unwrap()); // refunds $80, detaches stale_chair
+        let funds_after_stale_undo = lot5.world().budget.funds;
+        assert!(lot5.world().objects[&stale_chair].position[0] < 0);
+        assert!(!lot5.buy_sell(&stale_cur).unwrap());
+        assert!(!lot5.buy_move(&mut stale_cur, [600, 440], 1).unwrap());
+        assert!(lot5.buy_commit(&stale_cur).is_err());
+        assert_eq!(lot5.world().budget.funds, funds_after_stale_undo);
+        lot5.buy_cancel(&stale_cur).unwrap();
+        assert!(!lot5.world().objects.contains_key(&stale_cur.cursor));
+        assert!(!lot5.world().objects.contains_key(&stale_chair));
+        assert_eq!(lot5.world().budget.funds, funds_after_stale_undo);
+
         // P2 #1: Buy Redo affordability check after a refused Sell Redo.
         let mut ch_keep = lot5.buy_start(chair_guid, 1, 2).unwrap().unwrap();
         assert!(lot5.buy_move(&mut ch_keep, [600, 440], 1).unwrap());

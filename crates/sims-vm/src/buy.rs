@@ -1719,6 +1719,24 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    /// Deletes only `"Tile Cursor"` for a stale existing-object cursor whose
+    /// held object was already detached/refunded by an intervening Undo/Sell,
+    /// without resurrecting the detached object back onto the lot.
+    pub fn buy_discard_tile_cursor(
+        &self,
+        world: &mut World,
+        cursor: &BuyCursor,
+    ) -> Result<(), Fault> {
+        let cur_lead = self.lead_object(world, cursor.cursor);
+        if let Some(obj) = world.objects.get(&cur_lead) {
+            if on_lot([obj.position[0], obj.position[1]]) {
+                self.take_off(world, cur_lead, true)?;
+            }
+            self.remove_now(world, cur_lead)?;
+        }
+        Ok(())
+    }
+
     /// Cancels an active Buy Mode cursor (`0x487191` / `0x487105`):
     /// - For a new unpaid catalog preview (`!cursor.is_existing()`): runs
     ///   unconditional `TakeOff(1)` on both the `"Tile Cursor"` and the

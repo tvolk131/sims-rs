@@ -189,9 +189,20 @@ impl Lot {
             // undone surface container's slot is cleanly unlinked and deleted
             // before detached history objects are purged.
             if let Some(cursor) = cursor {
-                interpreter.buy_cancel(&mut world, cursor).map_err(|e| {
-                    SaveError::Format(format!("clearing Buy Mode preview for save: {e}"))
-                })?;
+                if self.is_stale_existing_cursor(&interpreter, cursor) {
+                    interpreter
+                        .buy_discard_tile_cursor(&mut world, cursor)
+                        .map_err(|e| {
+                            SaveError::Format(format!(
+                                "clearing stale Buy Mode cursor for save: {e}"
+                            ))
+                        })?;
+                } else {
+                    let live = self.strip_detached_origin_children(cursor);
+                    interpreter.buy_cancel(&mut world, &live).map_err(|e| {
+                        SaveError::Format(format!("clearing Buy Mode preview for save: {e}"))
+                    })?;
+                }
             }
             if has_history {
                 let empty = std::collections::BTreeSet::new();

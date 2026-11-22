@@ -1473,9 +1473,16 @@ impl Lot {
                 .map_err(OrderError::Refused)?;
         }
         if let Some(cur) = cursor {
-            interpreter
-                .buy_cancel(&mut world, cur)
-                .map_err(OrderError::Refused)?;
+            if self.is_stale_existing_cursor(&interpreter, cur) {
+                interpreter
+                    .buy_discard_tile_cursor(&mut world, cur)
+                    .map_err(OrderError::Refused)?;
+            } else {
+                let live = self.strip_detached_origin_children(cur);
+                interpreter
+                    .buy_cancel(&mut world, &live)
+                    .map_err(OrderError::Refused)?;
+            }
             if clearing {
                 let empty = BTreeSet::new();
                 interpreter
@@ -1592,6 +1599,69 @@ impl Lot {
     /// `Ok(false)` without changing the lot if `can_delete` refuses it, or
     /// `Ok(true)` once sold (pushing a `Sell` record onto Undo and clearing
     /// Redo) or cancelled (for an unpaid catalog preview).
+    /// Whether `id` is currently detached/refunded (`!placed` and off-lot) in
+    /// Buy Mode history (`buy_undo`, `buy_redo`, or `buy_orphans`).
+    fn is_detached_history_object(&self, id: u16) -> bool {
+        self.buy_undo
+            .iter()
+            .chain(self.buy_redo.iter())
+            .chain(self.buy_orphans.iter())
+            .any(|p| {
+                !p.placed
+                    && p.object == id
+                    && self
+                        .world
+                        .objects
+                        .get(&id)
+                        .is_none_or(|o| o.position[0] < 0)
+            })
+    }
+
+    /// Whether an existing-object `BuyCursor` has gone stale across an
+    /// intervening history operation (its held object was detached/refunded or
+    /// removed, or its `"Tile Cursor"` was removed).
+    pub(super) fn is_stale_existing_cursor(
+        &self,
+        interpreter: &Interpreter,
+        cursor: &BuyCursor,
+    ) -> bool {
+        if !cursor.is_existing() {
+            return false;
+        }
+        let cur_lead = interpreter.lead_object(&self.world, cursor.cursor);
+        let held_lead = interpreter.lead_object(&self.world, cursor.held);
+        !self.world.objects.contains_key(&cur_lead)
+            || !self.world.objects.contains_key(&held_lead)
+            || self.is_detached_history_object(held_lead)
+    }
+
+    /// Returns a copy of `cursor` whose `origin.children` exclude any surface
+    /// children that have already been detached/refunded by an intervening
+    /// Undo/Sell so snapback never resurrects refunded children for free.
+    pub(super) fn strip_detached_origin_children(&self, cursor: &BuyCursor) -> BuyCursor {
+        fn prune(lot: &Lot, placement: &mut crate::BuyPlacement) {
+            placement
+                .children
+                .retain(|c| !lot.is_detached_history_object(c.object));
+            for child in &mut placement.children {
+                prune(lot, child);
+            }
+        }
+        let mut out = cursor.clone();
+        if let Some(origin) = &mut out.origin {
+            prune(self, origin);
+        }
+        out
+    }
+
+    /// Sells or deletes the held Buy Mode object (`0x487e18`):
+    /// - Returns `Ok(false)` without mutating `world` if `can_delete` refuses
+    ///   (or if `cursor` is a stale existing-object cursor whose held object
+    ///   was already detached/refunded by Undo/Sell).
+    /// - For an unpaid catalog preview, deletes both objects with `0` refund.
+    /// - For a picked-up existing object, refunds `resale_value`, deletes only
+    ///   `"Tile Cursor"`, leaves the sold object detached off-lot for Undo,
+    ///   pushes a `BuyActionKind::Sell` undo record, and purges `buy_redo`.
     pub fn buy_sell(&mut self, cursor: &BuyCursor) -> Result<bool, OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
@@ -1601,6 +1671,9 @@ impl Lot {
             view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
+        if self.is_stale_existing_cursor(&interpreter, cursor) {
+            return Ok(false);
+        }
         let mut world = self.world.clone();
         let Some(record) = interpreter
             .buy_sell(&mut world, cursor)
@@ -1640,6 +1713,9 @@ impl Lot {
             view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
+        if self.is_stale_existing_cursor(&interpreter, cursor) {
+            return Ok(false);
+        }
         let mut world = self.world.clone();
         let mut next = cursor.clone();
         let valid = interpreter
@@ -1663,6 +1739,9 @@ impl Lot {
             view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
+        if self.is_stale_existing_cursor(&interpreter, cursor) {
+            return Ok(false);
+        }
         let mut world = self.world.clone();
         let mut next = cursor.clone();
         let valid = interpreter
@@ -1686,6 +1765,9 @@ impl Lot {
             view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
+        if self.is_stale_existing_cursor(&interpreter, cursor) {
+            return Ok(false);
+        }
         let mut world = self.world.clone();
         let mut next = cursor.clone();
         let valid = interpreter
@@ -1728,6 +1810,9 @@ impl Lot {
             view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
+        if self.is_stale_existing_cursor(&interpreter, cursor) {
+            return Ok(false);
+        }
         let mut world = self.world.clone();
         let mut next = cursor.clone();
         let valid = interpreter
@@ -1754,6 +1839,9 @@ impl Lot {
             view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
+        if self.is_stale_existing_cursor(&interpreter, cursor) {
+            return Ok(false);
+        }
         let mut world = self.world.clone();
         let mut next = cursor.clone();
         let valid = interpreter
@@ -1780,6 +1868,13 @@ impl Lot {
             view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
+        if self.is_stale_existing_cursor(&interpreter, cursor) {
+            return Err(OrderError::Refused(crate::Fault {
+                object: cursor.held,
+                at: None,
+                trap: crate::Trap::Invalid("cannot commit stale cursor for detached object".into()),
+            }));
+        }
         let mut world = self.world.clone();
         let purchase = interpreter
             .buy_commit_record(&mut world, cursor)
@@ -1950,13 +2045,23 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
-        interpreter
-            .buy_cancel(&mut world, cursor)
-            .map_err(OrderError::Refused)?;
+        let stale = self.is_stale_existing_cursor(&interpreter, cursor);
+        if stale {
+            interpreter
+                .buy_discard_tile_cursor(&mut world, cursor)
+                .map_err(OrderError::Refused)?;
+        } else {
+            let live = self.strip_detached_origin_children(cursor);
+            interpreter
+                .buy_cancel(&mut world, &live)
+                .map_err(OrderError::Refused)?;
+        }
         if cursor.is_existing() {
             let mut keep = BTreeSet::new();
             crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
-            keep.insert(interpreter.lead_object(&world, cursor.held));
+            if !stale {
+                keep.insert(interpreter.lead_object(&world, cursor.held));
+            }
             interpreter
                 .buy_purge_detached(&mut world, &self.buy_redo, &keep)
                 .map_err(OrderError::Refused)?;
@@ -1982,9 +2087,16 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
-        interpreter
-            .buy_cancel(&mut world, cursor)
-            .map_err(OrderError::Refused)?;
+        if self.is_stale_existing_cursor(&interpreter, cursor) {
+            interpreter
+                .buy_discard_tile_cursor(&mut world, cursor)
+                .map_err(OrderError::Refused)?;
+        } else {
+            let live = self.strip_detached_origin_children(cursor);
+            interpreter
+                .buy_cancel(&mut world, &live)
+                .map_err(OrderError::Refused)?;
+        }
         self.world = world;
         Ok(())
     }
