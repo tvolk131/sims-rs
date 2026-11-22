@@ -68,13 +68,15 @@
 //!
 //! Bytes +0xd9 and +0xda are not kept: besides the first draw, many
 //! places set +0xd9 (the appearance read among them), and none of them is
-//! ported as such. Their effects are what matter, and here they are
-//! checked instead: the skin update of step 4 changes nothing when the
-//! skin is up to date at the animator's clock, and placing changes
-//! nothing when no part of the position is unset. A frame that would
-//! find either otherwise fails, since whether the original's bytes are
-//! set then is not known. After the animator's tick both hold, so in
-//! practice only the first draw changes anything.
+//! ported as such. On the first draw (`Animator::undrawn` / byte +0xdb),
+//! step 3 (`0x5893a9` → `0x589361` at `0x58939e`) unconditionally sets
+//! +0xd9 = 1, so step 4 (`0x590d26`) always calls `0x5992b3`
+//! ([`Interpreter::update_skin`]) and sets +0xda = 1. On later draws their
+//! effects are checked instead: the skin update of step 4 changes nothing
+//! when the skin is up to date at the animator's clock, and placing changes
+//! nothing when no part of the position is unset. A later frame that would
+//! find either otherwise fails, since whether the original's bytes are set
+//! then is not known.
 //!
 //! When the game draws a frame is up to the game's main loop and the
 //! window system, not the simulation. A capture of the original stops
@@ -202,9 +204,17 @@ impl Interpreter<'_> {
             a.position = [UNSET; 3];
         }
 
-        // 4. Byte +0xd9: the skin's update, which changes nothing when the
-        // skin is up to date at the animator's clock.
-        if a.skin_dirty || a.skin_clock != a.clock {
+        // 4. Byte +0xd9: the skin's update (`0x590d06..0x590d2b`).
+        // On the first draw (`first`, byte +0xdb), step 3 (`0x5893a9` →
+        // `0x589361` at `0x58939e`) unconditionally sets byte +0xd9 = 1, so
+        // `0x590d26` always runs `cVitaboySkin::Update(clock, 1, 0)`
+        // (`0x5992b3`, `Interpreter::update_skin`) and sets byte +0xda = 1.
+        // On later draws, whether byte +0xd9 is set is not tracked; the step
+        // changes nothing only when the skin is already up to date.
+        if first {
+            let clock = a.clock;
+            self.update_skin(world, id, &mut a, clock, false)?;
+        } else if a.skin_dirty || a.skin_clock != a.clock {
             return Err(Trap::Unsupported(format!(
                 "a frame is drawn while person {id}'s skin waits for its update (0x590d26), \
                  which is not ported"

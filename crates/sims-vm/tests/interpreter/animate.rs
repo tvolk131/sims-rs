@@ -2115,9 +2115,12 @@ fn what_a_draw_does_not_port_fails_loudly() {
         Trap::Unsupported(message) => message,
         other => panic!("{other:?}"),
     };
-    // The skin waits for its update.
+    // The skin waits for its update on a later draw (when byte +0xd9 is not
+    // known to be set; the first draw sets +0xd9 at 0x58939e and updates it).
     let mut fx = turning();
-    fx.world.animators.get_mut(&SIM).unwrap().skin_dirty = true;
+    let a = fx.world.animators.get_mut(&SIM).unwrap();
+    a.undrawn = false;
+    a.skin_dirty = true;
     assert!(failed(&mut fx).contains("skin"));
     // Drawn before, and not placed.
     let mut fx = turning();

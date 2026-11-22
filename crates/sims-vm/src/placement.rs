@@ -583,6 +583,32 @@ fn relink(world: &mut World, id: u16, place: Place) -> Result<(), Trap> {
     Ok(())
 }
 
+/// Object grid array IDs for ground (level 1) and upper (level 2) floors.
+pub(crate) const LEVEL_GRIDS: [u16; 2] = [3, 103];
+
+/// Unlinks `id` from its tile (ground or upper floor) or container — promoting
+/// any next object in `slot 0` to take its place — and moves it off-lot without
+/// invoking object callbacks.
+pub(crate) fn unlink_off_lot(world: &mut World, id: u16) -> Result<(), Trap> {
+    relink(
+        world,
+        id,
+        Place {
+            on_lot: false,
+            position: [-16, -16],
+            container: None,
+            slot: -1,
+            level: 1,
+        },
+    )?;
+    if let Some(obj) = world.objects.get_mut(&id) {
+        obj.position = [-16, -16, 1];
+    }
+    set_datum(world, id, data::CONTAINER, 0)?;
+    set_datum(world, id, data::CONTAINER_SLOT, -1)?;
+    Ok(())
+}
+
 /// Walks an object and everything linked below it, slot by slot, slot 0
 /// included (0x43f364, 0x43f379). The next object is read after the
 /// caller has dealt with the current one.

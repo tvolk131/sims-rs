@@ -109,6 +109,58 @@ impl Neighborhood {
         resolve(&self.directory, "Characters")
     }
 
+    /// Regular files in the neighborhood's `Characters` folder (including
+    /// nested subdirectories), in sorted name order. Empty when there is no
+    /// such folder.
+    pub fn character_files(&self) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .character_tree()?
+            .into_iter()
+            .filter(|(rel, _)| !rel.ends_with('/'))
+            .map(|(_, path)| path)
+            .collect())
+    }
+
+    /// Regular files and directories in the neighborhood's `Characters` folder,
+    /// recursively, returning `(relative_slash_path, disk_path)` pairs in
+    /// `sorted_entries` traversal order. Every directory is emitted with a
+    /// trailing `/` so inline mounts preserve `MountedFiles::scan` directory
+    /// precedence (e.g. a directory shadowing a same-named FAR member even if
+    /// all loose files inside it are later deleted). Empty when there is no
+    /// such folder.
+    pub fn character_tree(&self) -> Result<Vec<(String, PathBuf)>> {
+        fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
+            if !prefix.is_empty() {
+                out.push((format!("{prefix}/"), dir.to_path_buf()));
+            }
+            for path in sorted_entries(dir)? {
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let rel = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if path.is_dir() {
+                    walk(&path, &rel, out)?;
+                } else if path.is_file() {
+                    out.push((rel, path));
+                }
+            }
+            Ok(())
+        }
+        let mut out = Vec::new();
+        if let Some(directory) = self.characters()?
+            && directory.is_dir()
+        {
+            walk(&directory, "", &mut out)?;
+        }
+        Ok(out)
+    }
+
     /// Each lot's zoning by lot number, from the neighborhood's
     /// `LotZoning.iff`: 1 residential, 2 community. Empty when the
     /// neighborhood has no such file.
@@ -266,7 +318,29 @@ impl House {
     /// through `catalog`, which must already include the neighborhood's
     /// characters; an object whose GUID it lacks is an error.
     pub fn load(path: &Path, catalog: &Catalog) -> Result<Self> {
-        let iff = read_iff(path)?;
+        let bytes = std::fs::read(path).map_err(|e| Error::io(path, e))?;
+        Self::parse_bytes(bytes, path, catalog)
+    }
+
+    /// Parses a house file from in-memory bytes (such as bytes stored in a
+    /// persistence database). Saved objects are matched to their definitions
+    /// through `catalog`, which must already include the neighborhood's
+    /// characters.
+    pub fn parse_bytes(bytes: Vec<u8>, path: &Path, catalog: &Catalog) -> Result<Self> {
+        Self::parse_bytes_with_deleted(bytes, path, catalog, &std::collections::BTreeSet::new())
+    }
+
+    /// Like [`House::parse_bytes`], treating any character GUID listed in
+    /// `deleted_characters` whose loose `.iff` file was deleted on bulldoze as
+    /// single-tile (`multipart = false`) during `ObjM` decoding so callers can
+    /// strip or purge the deleted character cleanly instead of aborting load.
+    pub fn parse_bytes_with_deleted(
+        bytes: Vec<u8>,
+        path: &Path,
+        catalog: &Catalog,
+        deleted_characters: &std::collections::BTreeSet<u32>,
+    ) -> Result<Self> {
+        let iff = Iff::parse(bytes).map_err(|e| Error::format(&path.display().to_string(), e))?;
         let location = |tag: &str, id: u16| format!("{} {tag} #{id}", path.display());
         let one = |tag: &'static [u8; 4]| {
             iff.chunks
@@ -296,7 +370,12 @@ impl House {
             }
         }
         let chunk = one(b"ObjM")?;
-        let multipart = |guid| catalog.object(guid).map(|o| o.master != 0);
+        let multipart = |guid| {
+            catalog
+                .object(guid)
+                .map(|o| o.master != 0)
+                .or_else(|| deleted_characters.contains(&guid).then_some(false))
+        };
         let objects = Objects::parse(iff.data(chunk), &types, multipart)
             .map_err(|e| Error::format(&location("ObjM", chunk.id), e))?;
         let mut arrays = BTreeMap::new();

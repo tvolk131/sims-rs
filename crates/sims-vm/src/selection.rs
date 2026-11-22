@@ -223,6 +223,56 @@ impl Interpreter<'_> {
         set_global(world, SELECTED, sim as i16)
     }
 
+    /// Selects the next household member on the lot (0x445501, normal path with
+    /// `[0x6e4f64] == 0`): finds the selected family (`globals[9]`), locates the
+    /// currently selected Sim among its `members` via `0x44093d` (first person
+    /// in `world.people` of that GUID), and selects the next member present on
+    /// the lot wrapping around. When nobody is selected, starts at member 0.
+    /// Returns `Ok(None)` without error when the family has no member on the
+    /// lot (such as an empty or newly moved-in lot before arrival spawns them)
+    /// or when a currently selected Sim is not in the family's member list.
+    pub fn select_next_resident(&self, world: &mut World) -> Result<Option<u16>, Fault> {
+        let family_id = i32::from(world.globals.get(FAMILY).copied().unwrap_or(0));
+        let Some(members) = world
+            .families
+            .iter()
+            .find(|f| f.id == family_id)
+            .map(|f| f.members.clone())
+        else {
+            return Ok(None);
+        };
+        if members.is_empty() {
+            return Ok(None);
+        }
+        let find_person = |world: &World, guid: u32| -> Option<u16> {
+            world
+                .people
+                .iter()
+                .copied()
+                .find(|id| world.objects.get(id).is_some_and(|o| o.guid == guid))
+        };
+        let current = selected(world);
+        let start: isize = match current {
+            None => -1,
+            Some(cur) => match members
+                .iter()
+                .position(|&guid| find_person(world, guid) == Some(cur))
+            {
+                Some(index) => index as isize,
+                None => return Ok(None),
+            },
+        };
+        let len = members.len();
+        for offset in 1..=len {
+            let index = ((start + offset as isize) as usize) % len;
+            if let Some(person) = find_person(world, members[index]) {
+                self.select(world, Some(person))?;
+                return Ok(Some(person));
+            }
+        }
+        Ok(None)
+    }
+
     /// Deselects the selected Sim `sim`, the first half of 0x445449: its
     /// selected mark is taken off (0x4320da with the flags' low five bits
     /// less bit 1), and the indicators are moved for a Sim without the

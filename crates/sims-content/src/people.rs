@@ -2157,11 +2157,13 @@ xskin-b001-PELVIS-BODY\r\n\
                 mount: 0,
                 path: dir.0.join("GameData/Objects/missing.iff"),
                 member: None,
+                inline: None,
             },
             Resource {
                 mount: 0,
                 path: dir.0.join("GameData/Objects/empty.iff"),
                 member: None,
+                inline: None,
             },
         ];
         let index = Index {
