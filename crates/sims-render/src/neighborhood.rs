@@ -568,8 +568,9 @@ impl MapLot {
     }
 
     /// Screen-space bounding rectangle `[left, top, right, bottom]` inside a
-    /// viewport of size `viewport`, using the loaded backdrop's centered origin
-    /// (`0x568fa7..0x568fe6`).
+    /// viewport of size `viewport`, using the backdrop dimensions captured when
+    /// the map was loaded (`0x568fa7..0x568fe6`). If [`NeighborhoodMap::backdrop`]
+    /// is replaced after loading, use [`NeighborhoodMap::lot_screen_rect`].
     pub fn screen_rect(&self, viewport: [u32; 2]) -> [i32; 4] {
         self.screen_rect_at(map_origin_for_backdrop(viewport, self.backdrop_size))
     }
@@ -950,6 +951,23 @@ impl NeighborhoodMap {
         ]
     }
 
+    /// Centered backdrop clip rectangle (`[ox, oy, ox + bw, oy + bh]` clamped
+    /// to `viewport`), matching native backdrop/wave destination bounds
+    /// (`0x55f95f..0x55f98a`).
+    fn backdrop_clip_for(&self, viewport: [u32; 2]) -> [i32; 4] {
+        let [ox, oy] = self.map_origin_for(viewport);
+        let bw = self.backdrop.width.min(i32::MAX as usize) as i32;
+        let bh = self.backdrop.height.min(i32::MAX as usize) as i32;
+        let vw = viewport[0].min(i32::MAX as u32) as i32;
+        let vh = viewport[1].min(i32::MAX as u32) as i32;
+        [
+            ox,
+            oy,
+            ox.saturating_add(bw).min(vw),
+            oy.saturating_add(bh).min(vh),
+        ]
+    }
+
     /// Renders the neighborhood map screen into an existing [`Canvas`].
     ///
     /// Sets `canvas.set_id(Some(lot.id))` for each lot's opaque pixels so
@@ -959,6 +977,7 @@ impl NeighborhoodMap {
         let viewport = [canvas.width as u32, canvas.height as u32];
         let origin = self.map_origin_for(viewport);
         let full_clip = [0, 0, canvas.width as i32, canvas.height as i32];
+        let backdrop_clip = self.backdrop_clip_for(viewport);
         let map_clip = self.lot_clip_for(viewport);
         let overlay_keyed = !self.opaque_overlays;
 
@@ -974,9 +993,10 @@ impl NeighborhoodMap {
         }
 
         // 2. Map backdrop at centered origin (0x556db7..0x556ddc, 0x568fa7..0x568fe6).
-        blit_surface_to_canvas(canvas, &self.backdrop, origin, full_clip, false, None);
+        blit_surface_to_canvas(canvas, &self.backdrop, origin, backdrop_clip, false, None);
 
-        // 3. Pre-lot water wave overlay for Unleashed (0x5570c1) and Classic.
+        // 3. Pre-lot water wave overlay for Unleashed (0x5570c1) and Classic
+        //    (clipped to the centered backdrop rectangle per 0x55f95f..0x55f98a).
         if !self.kind.waves_draw_after_lots()
             && let Some(frame_idx) = options.water_frame
             && !self.waves.is_empty()
@@ -984,7 +1004,7 @@ impl NeighborhoodMap {
         {
             let [wx, wy] = self.kind.wave_offset();
             let at = [origin[0].saturating_add(wx), origin[1].saturating_add(wy)];
-            blit_surface_to_canvas(canvas, wave, at, full_clip, overlay_keyed, None);
+            blit_surface_to_canvas(canvas, wave, at, backdrop_clip, overlay_keyed, None);
         }
 
         // 4. Lots in back-to-front Z-order, clipped strictly to the 800×600 rect
@@ -1014,8 +1034,8 @@ impl NeighborhoodMap {
             && self.kind == NeighborhoodKind::Vacation
             && let (Some(port), Some(trees)) = (&self.vacation_port, &self.vacation_trees)
         {
-            blit_color_only_mode(canvas, port, origin, full_clip, overlay_keyed);
-            blit_color_only_mode(canvas, trees, origin, full_clip, overlay_keyed);
+            blit_color_only_mode(canvas, port, origin, backdrop_clip, overlay_keyed);
+            blit_color_only_mode(canvas, trees, origin, backdrop_clip, overlay_keyed);
         }
 
         // 6. Post-lot water wave overlay for Downtown (0x54cb21), Vacation
@@ -1027,7 +1047,7 @@ impl NeighborhoodMap {
         {
             let [wx, wy] = self.kind.wave_offset();
             let at = [origin[0].saturating_add(wx), origin[1].saturating_add(wy)];
-            blit_color_only_mode(canvas, wave, at, full_clip, overlay_keyed);
+            blit_color_only_mode(canvas, wave, at, backdrop_clip, overlay_keyed);
         }
 
         // 7. Optional residential occupied/vacant status markers.
@@ -1071,12 +1091,14 @@ impl NeighborhoodMap {
                     let [dx, dy] = self.kind.filter_badge_offset(lot.id);
                     let bx = origin[0].saturating_add(lot.anchor[0]).saturating_add(dx);
                     let by = origin[1].saturating_add(lot.anchor[1]).saturating_add(dy);
+                    // Native filter badge blits pass a null clip (e.g. 0x56bec5),
+                    // allowing badges on edge lots to extend into the outer frame.
                     blit_subrect_to_canvas(
                         canvas,
                         strip,
                         [src_x, 0, cell_w, strip.height],
                         [bx, by],
-                        map_clip,
+                        full_clip,
                     );
                 }
             }
@@ -2785,6 +2807,7 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
     let mut height = 0usize;
     let mut progressive = false;
     let mut comps: Vec<JpegComponent> = Vec::new();
+    let mut comp_has_scan: Vec<bool> = Vec::new();
     let mut h_max = 1usize;
     let mut v_max = 1usize;
     let mut mcu_cols = 0usize;
@@ -2916,6 +2939,7 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
                     return None;
                 }
                 comps.clear();
+                comp_has_scan.clear();
                 h_max = 1;
                 v_max = 1;
                 for c in 0..ncomp {
@@ -2950,6 +2974,7 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
                     }
                     comp.coeffs = vec![[0i32; 64]; total_blocks];
                 }
+                comp_has_scan = vec![false; comps.len()];
             }
             0xda => {
                 // SOS
@@ -3187,13 +3212,20 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
                         }
                     }
                 }
+                for &(ci, _, _) in &scan_comps {
+                    comp_has_scan[ci] = true;
+                }
                 pos = br.finish_scan_pos();
             }
             _ => {}
         }
     }
 
-    if comps.is_empty() || width == 0 || height == 0 {
+    if comps.is_empty()
+        || width == 0
+        || height == 0
+        || !comp_has_scan.iter().all(|&has_scan| has_scan)
+    {
         return None;
     }
 
@@ -4351,6 +4383,65 @@ mod tests {
             ..RenderOptions::default()
         });
         assert_eq!(vac_frame2.color[110 * 800 + 110], widen_565(wave2_c));
+
+        // Filter badges use a null/full-viewport clip (0x56bec5) so edge-lot
+        // badges extend into the 1024×768 outer frame; Classic waves clip to
+        // the centered backdrop rectangle (0x55f95f..0x55f98a).
+        let mut badge_vac = make_test_map(
+            NeighborhoodKind::Vacation,
+            vec![{
+                let mut l = make_lot(
+                    40,
+                    [10, 10],
+                    Surface565::filled(4, 4, pack_565([0, 200, 0])),
+                );
+                l.filter_mask = CommunityFilter::Lodging.bit();
+                l
+            }],
+        );
+        let badge_px = pack_565([250, 220, 0]);
+        badge_vac.filter_badges.insert(
+            CommunityFilter::Lodging,
+            Surface565::filled(12, 8, badge_px), // 3 cells of 4×8
+        );
+        // Lot 40 at anchor (10, 10) with Vacation offset (-24, -10) -> map (-14, 0),
+        // screen (112 - 14, 84) = (98, 84), outside the 800×600 lot clip x >= 112.
+        let badge_1024 = badge_vac.render(&RenderOptions {
+            viewport: [1024, 768],
+            active_filter: Some(CommunityFilter::Lodging),
+            ..RenderOptions::default()
+        });
+        assert_eq!(badge_1024.color[84 * 1024 + 98], widen_565(badge_px));
+
+        let mut classic_small = make_test_map(NeighborhoodKind::Classic, Vec::new());
+        let frame_c = pack_565([40, 40, 40]);
+        classic_small.backdrop = Surface565::filled(600, 400, bg_c);
+        classic_small.large_frame = Some(Surface565::filled(1024, 768, frame_c));
+        classic_small.waves = vec![Some(Surface565::filled(800, 600, COLOR_KEY_565))];
+        classic_small.opaque_overlays = true;
+        let classic_1024 = classic_small.render(&RenderOptions {
+            viewport: [1024, 768],
+            water_frame: Some(0),
+            ..RenderOptions::default()
+        });
+        // Centered 600×400 backdrop spans x=212..812, so (850, 200) keeps outer frame.
+        assert_eq!(classic_1024.color[200 * 1024 + 850], widen_565(frame_c));
+        assert_eq!(
+            classic_1024.color[200 * 1024 + 500],
+            widen_565(COLOR_KEY_565)
+        );
+
+        // Header-only JPEG with zero SOS image scans must be rejected so the
+        // loader falls back to bundled artwork rather than drawing gray.
+        let zero_scan_jpeg: &[u8] = &[
+            0xff, 0xd8, // SOI
+            0xff, 0xdb, 0x00, 0x43, 0x00, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // SOF0: 8×8, 1 comp, NO SOS!
+            0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01, 0x01, 0x11, 0x00, 0xff,
+            0xd9, // EOI
+        ];
+        assert!(decode_jpeg_to_surface565(zero_scan_jpeg).is_none());
 
         // On a 900px-wide backdrop, lot clip remains 800×600 from origin (0x56928b).
         let mut wide_map = make_test_map(
