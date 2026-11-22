@@ -2163,7 +2163,7 @@ fn boot_from_saved_lot(
     let play = Play { fresh: saved.fresh };
     Ok(Lot {
         program,
-        catalog,
+        catalog: std::sync::Arc::new(catalog),
         surfaces,
         world,
         tuning: None,
@@ -2578,7 +2578,7 @@ fn boot_from_base_house(
     let loaded = world.hash();
     Ok(Lot {
         program,
-        catalog,
+        catalog: std::sync::Arc::new(catalog),
         surfaces,
         world,
         tuning: None,
