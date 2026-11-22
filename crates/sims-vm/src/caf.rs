@@ -26,11 +26,14 @@
 //!   school defaults (`-1`/`4` in words 56–57).
 //! - **Household (`FAMI`) & Family Bin commit**: version 9, `house = 0`,
 //!   `number = max_existing + 1`, starting funds from `Global.far FCNS #4`
-//!   `"starting money for new family"` (default `$20,000`), `flags = 0x18`
+//!   `"money for new family"` (default `$20,000`), `flags = 0x18`
 //!   ([`CAF_INITIAL_FAMILY_FLAGS`]), 1..=8 member GUIDs with at least one adult
 //!   human Sim, and 16-byte zeroed v9 tail (`secondary_house` + 6 magic words).
-//!   Persisted into REDB [`NeighborhoodStore`] so the household immediately
-//!   appears in `StoredNeighborhood::family_bin()`, passes
+//!   Persisted into REDB [`NeighborhoodStore`] via a serialized three-phase
+//!   tombstone-shielded commit so concurrent CAF commits never overwrite each
+//!   other's character files, mid-flight lot loads never register staged
+//!   characters as stray neighbors, and the household publishes atomically so
+//!   it immediately appears in `StoredNeighborhood::family_bin()`, passes
 //!   [`crate::lifecycle::move_in`], and boots cleanly into any vacant
 //!   residential lot.
 //! - **Delete Family (`delete_bin_family`)**: removes an un-housed playable
@@ -45,9 +48,11 @@ use sims_content::{Catalog, ImportWardrobe, Index, Install};
 use sims_core::CrtRng;
 use sims_formats::bitmap::{Image, bmp};
 use sims_formats::family_file::FamilyFile;
-use sims_formats::far::{decode_name, encode_name};
+use sims_formats::far::{
+    decode_name, directory as far_directory, directory_len, encode_name, manifest_offset,
+};
 use sims_formats::iff::{ChunkData, Iff, write as write_iff};
-use sims_formats::neighborhood::{Family, Inventory, Neighbor, Relationship};
+use sims_formats::neighborhood::{Family, Inventory, InventoryItem, Neighbor, Relationship};
 use sims_formats::strings::{Format, StringTable, decode};
 use sims_formats::tuning::Constants;
 use sims_sim::neighborhood_store::{
@@ -57,12 +62,20 @@ use sims_sim::patch_import::allocate_record;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
+use std::sync::Mutex;
+
+/// Serializes multi-step CAF REDB writes (`commit_family`, `import_family_fam`,
+/// `delete_bin_family`) within a process. REDB itself enforces exclusive file
+/// locking across processes and handles, so this prevents two concurrent
+/// in-process CAF callers from allocating overlapping `User%05d.iff` filenames
+/// or overwriting each other's staged character blobs.
+static CAF_COMMIT_LOCK: Mutex<()> = Mutex::new(());
 
 /// `TemplatePerson.iff` object definition GUID (`0x7fd96b54`).
 pub const TEMPLATE_PERSON_GUID: u32 = TEMPLATE_PERSON;
 
 /// Native Complete Collection 1.91 starting household funds (`Global.far`
-/// `FCNS #4` `"starting money for new family"`).
+/// `FCNS #4` `"money for new family"`).
 pub const DEFAULT_STARTING_FUNDS: i32 = 20_000;
 
 /// Maximum members allowed in a household created in Create-a-Family.
@@ -482,14 +495,16 @@ impl PortraitKind {
 ///
 /// Hosts that render 3D Sim portraits via `sims_people::caf_preview::render_portrait`
 /// pass the six resulting RGBA canvases through [`PortraitBitmaps::from_images`].
+/// Fields are private so every instance is guaranteed to hold canonical
+/// uncompressed 24-bit bottom-up BMPs at exact native dimensions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortraitBitmaps {
-    pub faces_2002: Vec<u8>,
-    pub relationship_2003: Vec<u8>,
-    pub new_image_2004: Vec<u8>,
-    pub speech_med_2005: Vec<u8>,
-    pub speech_large_2006: Vec<u8>,
-    pub web_image_2007: Vec<u8>,
+    faces_2002: Vec<u8>,
+    relationship_2003: Vec<u8>,
+    new_image_2004: Vec<u8>,
+    speech_med_2005: Vec<u8>,
+    speech_large_2006: Vec<u8>,
+    web_image_2007: Vec<u8>,
 }
 
 impl PortraitBitmaps {
@@ -531,7 +546,8 @@ impl PortraitBitmaps {
 
     /// Validates six already-encoded Windows BMP payloads (confirming each
     /// decodes cleanly via [`sims_formats::bitmap::bmp`] and matches its native
-    /// dimensions).
+    /// dimensions) and normalizes every payload to Complete Collection's
+    /// uncompressed 24-bit bottom-up BMP layout via [`encode_bmp24`].
     pub fn from_raw_bmps(
         faces_2002: Vec<u8>,
         relationship_2003: Vec<u8>,
@@ -540,14 +556,7 @@ impl PortraitBitmaps {
         speech_large_2006: Vec<u8>,
         web_image_2007: Vec<u8>,
     ) -> Result<Self, CafError> {
-        for (kind, bytes) in [
-            (PortraitKind::Faces2002, &faces_2002),
-            (PortraitKind::Relationship2003, &relationship_2003),
-            (PortraitKind::NewImage2004, &new_image_2004),
-            (PortraitKind::SpeechMed2005, &speech_med_2005),
-            (PortraitKind::SpeechLarge2006, &speech_large_2006),
-            (PortraitKind::WebImage2007, &web_image_2007),
-        ] {
+        let normalize = |kind: PortraitKind, bytes: &[u8]| -> Result<Vec<u8>, CafError> {
             let decoded = bmp(bytes).map_err(|e| {
                 CafError::InvalidPortrait(format!("BMP_ {} invalid BMP: {e}", kind.chunk_id()))
             })?;
@@ -562,14 +571,15 @@ impl PortraitBitmaps {
                     decoded.height
                 )));
             }
-        }
+            encode_bmp24(&decoded)
+        };
         Ok(Self {
-            faces_2002,
-            relationship_2003,
-            new_image_2004,
-            speech_med_2005,
-            speech_large_2006,
-            web_image_2007,
+            faces_2002: normalize(PortraitKind::Faces2002, &faces_2002)?,
+            relationship_2003: normalize(PortraitKind::Relationship2003, &relationship_2003)?,
+            new_image_2004: normalize(PortraitKind::NewImage2004, &new_image_2004)?,
+            speech_med_2005: normalize(PortraitKind::SpeechMed2005, &speech_med_2005)?,
+            speech_large_2006: normalize(PortraitKind::SpeechLarge2006, &speech_large_2006)?,
+            web_image_2007: normalize(PortraitKind::WebImage2007, &web_image_2007)?,
         })
     }
 
@@ -769,8 +779,8 @@ impl FamilySpec {
                 "family bio exceeds {MAX_BIO_LEN} characters"
             )));
         }
-        encode_w1252(family_name, "family name")?;
-        encode_w1252(&self.family_bio, "family bio")?;
+        encode_for_language(family_name, self.language, "family name")?;
+        encode_for_language(&self.family_bio, self.language, "family bio")?;
 
         if let Some(funds) = self.starting_funds
             && funds < 0
@@ -802,8 +812,8 @@ impl FamilySpec {
                     "member {index} bio exceeds {MAX_BIO_LEN} characters"
                 )));
             }
-            encode_w1252(first, "Sim first name")?;
-            encode_w1252(&member.bio, "Sim bio")?;
+            encode_for_language(first, self.language, "Sim first name")?;
+            encode_for_language(&member.bio, self.language, "Sim bio")?;
             member.personality.validate()?;
             for (field, value) in [
                 ("body_appearance", member.body_appearance.trim()),
@@ -1064,15 +1074,15 @@ fn read_starting_funds(index: &Index) -> Option<i32> {
     let (_, resource) = index.named("Global.iff").next()?;
     let bytes = resource.read().ok()?;
     let iff = Iff::parse(bytes).ok()?;
+    read_starting_funds_from_iff(&iff)
+}
+
+fn read_starting_funds_from_iff(iff: &Iff) -> Option<i32> {
     let chunk = iff.get(b"FCNS", NEIGHBORHOOD_TUNING_ID)?;
     let fcns = Constants::parse(iff.data(chunk)).ok()?;
     fcns.entries
         .iter()
-        .find(|entry| {
-            entry
-                .name
-                .eq_ignore_ascii_case("starting money for new family")
-        })
+        .find(|entry| entry.name.eq_ignore_ascii_case("money for new family"))
         .map(|entry| entry.value as i32)
 }
 
@@ -1120,21 +1130,52 @@ fn parse_user_file_number(name: &str) -> Option<i32> {
     digits.parse::<i32>().ok()
 }
 
+/// Visits every loose `.iff` and `.far`-archived member payload inside
+/// `character_files`, matching how `Index::add_character_files` mounts both
+/// loose files and `.far` archives from a neighborhood's `Characters` store.
+fn visit_character_blobs(
+    character_files: &BTreeMap<String, Vec<u8>>,
+    mut visit: impl FnMut(&str, &[u8]),
+) {
+    for (key, bytes) in character_files {
+        if key.to_ascii_lowercase().ends_with(".far") {
+            let file_len = bytes.len() as u64;
+            if let Ok(offset) = manifest_offset(bytes, file_len)
+                && directory_len(offset, file_len).is_ok()
+                && let Ok(entries) = far_directory(&bytes[offset as usize..], file_len)
+            {
+                for entry in entries {
+                    if !entry.within_payload(offset) {
+                        continue;
+                    }
+                    let start = entry.offset as usize;
+                    let end = start.saturating_add(entry.stored_size as usize);
+                    if let Some(slice) = bytes.get(start..end) {
+                        visit(&entry.name, slice);
+                    }
+                }
+            }
+        } else {
+            visit(key, bytes);
+        }
+    }
+}
+
 /// Allocates the lowest unused character file number (`User%05d.iff`) in
-/// `0..32000`, avoiding every existing character file in REDB, every
-/// runtime-made character, every `NBRS` user filename, and every number in
-/// `reserved`.
+/// `0..32000`, avoiding every existing character file in REDB (loose or inside
+/// `.far` archives), every runtime-made character, every `NBRS` user filename,
+/// and every number in `reserved`.
 pub fn allocate_character_file_number(
     character_files: &BTreeMap<String, Vec<u8>>,
     stored: &StoredNeighborhood,
     reserved: &BTreeSet<i32>,
 ) -> Result<i32, CafError> {
     let mut used = reserved.clone();
-    for key in character_files.keys() {
-        if let Some(n) = parse_user_file_number(key) {
+    visit_character_blobs(character_files, |name, _| {
+        if let Some(n) = parse_user_file_number(name) {
             used.insert(n);
         }
-    }
+    });
     for made in stored.made_characters.made.values() {
         used.insert(made.file);
     }
@@ -1149,8 +1190,9 @@ pub fn allocate_character_file_number(
 }
 
 /// Collects every GUID already in use or tombstoned across the install catalog,
-/// REDB character files, neighborhood families, `NBRS`, runtime-made
-/// characters, and deleted/tombstoned character epochs.
+/// REDB character files (loose `.iff` and `.far` archives), neighborhood
+/// families, `NBRS`, runtime-made characters, and deleted/tombstoned character
+/// epochs.
 pub fn collect_used_guids(
     catalog_guids: &BTreeSet<u32>,
     character_files: &BTreeMap<String, Vec<u8>>,
@@ -1159,8 +1201,8 @@ pub fn collect_used_guids(
     let mut used = catalog_guids.clone();
     used.insert(0);
     used.insert(TEMPLATE_PERSON_GUID);
-    for bytes in character_files.values() {
-        if let Ok(iff) = Iff::parse(bytes.clone()) {
+    visit_character_blobs(character_files, |_, bytes| {
+        if let Ok(iff) = Iff::parse(bytes.to_vec()) {
             for chunk in iff.all(b"OBJD") {
                 let data = iff.data(chunk);
                 if let Some(raw) = data.get(0x1c..0x20) {
@@ -1168,7 +1210,7 @@ pub fn collect_used_guids(
                 }
             }
         }
-    }
+    });
     for family in stored.families.values() {
         used.extend(family.members.iter().copied());
     }
@@ -1220,6 +1262,25 @@ fn encode_w1252(text: &str, field: &str) -> Result<Vec<u8>, CafError> {
     Ok(bytes)
 }
 
+/// Encodes `text` for Complete Collection string-table `language` (`1..=20`),
+/// verifying that decoding the emitted bytes under `language`'s code page
+/// round-trips verbatim (preventing Windows-1252 bytes such as `é` from being
+/// tagged with non-1252 languages like Russian `13` where they decode as `й`).
+fn encode_for_language(text: &str, language: u8, field: &str) -> Result<Vec<u8>, CafError> {
+    if !(1..=20).contains(&language) {
+        return Err(CafError::InvalidText(format!(
+            "language code {language} outside native 1..=20 range"
+        )));
+    }
+    let bytes = encode_w1252(text, field)?;
+    if decode(&bytes, language) != text {
+        return Err(CafError::InvalidText(format!(
+            "{field} contains characters that cannot round-trip under language {language}"
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Encodes a Complete Collection localized (`-3`) string table (`STR#` / `CTSS` /
 /// `FAMs`), including the native 1-byte-per-row trailing zero slack allocated
 /// by `0x46fc9f` / `0x47090e`.
@@ -1246,12 +1307,7 @@ fn encode_localized_strings<'a>(
 /// Encodes a `FAMs` (or `CTSS #1000`) localized string table holding the family
 /// last name in `language`, matching `01-after-create/Neighborhood.iff` `FAMs 7`.
 pub fn encode_fams(family_name: &str, language: u8) -> Result<Vec<u8>, CafError> {
-    if !(1..=20).contains(&language) {
-        return Err(CafError::InvalidText(format!(
-            "language code {language} outside native 1..=20 range"
-        )));
-    }
-    let raw = encode_w1252(family_name.trim(), "family name")?;
+    let raw = encode_for_language(family_name.trim(), language, "family name")?;
     encode_localized_strings([(language, raw.as_slice(), &[][..])])
 }
 
@@ -1409,8 +1465,8 @@ pub fn synthesize_character_iff(
     if first_name.is_empty() {
         return Err(CafError::EmptyFirstName { member: 0 });
     }
-    let raw_name = encode_w1252(first_name, "Sim first name")?;
-    let raw_bio = encode_w1252(&spec.bio, "Sim bio")?;
+    let raw_name = encode_for_language(first_name, language, "Sim first name")?;
+    let raw_bio = encode_for_language(&spec.bio, language, "Sim bio")?;
 
     // Copy every live resource from TemplatePerson except deleted slots and old portraits.
     let mut chunks = Vec::new();
@@ -1632,6 +1688,107 @@ pub fn commit_family(
     commit_family_with_context(&ctx, store, neighborhood_id, spec, rng)
 }
 
+/// Performs a single checked neighborhood save, translating store version
+/// mismatches into [`CafError`].
+fn checked_save_neighborhood(
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    expected_instance: u128,
+    expected_revision: u64,
+    state: &StoredNeighborhood,
+) -> Result<(u128, u64), CafError> {
+    match store.save_neighborhood_checked(
+        neighborhood_id,
+        expected_instance,
+        expected_revision,
+        state,
+    )? {
+        Ok(version) => Ok(version),
+        Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
+            Err(CafError::NeighborhoodMismatch {
+                expected: format!("{neighborhood_id}#{expected:032x}"),
+                actual: format!("{neighborhood_id}#{current:032x}"),
+            })
+        }
+        Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
+            Err(CafError::StaleNeighborhood {
+                neighborhood: neighborhood_id.to_owned(),
+                expected_revision: expected,
+                current_revision: current,
+            })
+        }
+    }
+}
+
+/// Persists synthesized character IFFs and publishes `final_stored` using a
+/// three-phase tombstone-shielded protocol (held under [`CAF_COMMIT_LOCK`]):
+///
+/// 1. **Phase 1 (Checked tombstone reservation):** Atomically checks
+///    `(origin_instance_id, origin_revision)` and inserts every new member's
+///    GUID into `deleted_characters` BEFORE writing any character file. If the
+///    neighborhood changed concurrently, returns `StaleNeighborhood` /
+///    `NeighborhoodMismatch` with zero files written. If `expected_revision`
+///    would roll over `u64::MAX` during Phase 2, advances the checked
+///    reservation across the rollover first so Phase 2 never crosses `u64::MAX`
+///    without an authoritative `instance_id`.
+/// 2. **Phase 2 (Staged character IFF writes):** Writes each `User%05d.iff`
+///    into REDB. Because every staged GUID is already suppressed in
+///    `deleted_characters`, any concurrent `load_lot_snapshot` / `enter_lot`
+///    (or recovery after a mid-write crash) ignores every staged/orphaned file
+///    and never registers it in `NBRS` (`World::read_neighbors`).
+/// 3. **Phase 3 (Atomic publication):** Atomically checks the post-Phase-2
+///    `(expected_instance, expected_revision)` and writes `final_stored`
+///    (un-tombstoning the new GUIDs and publishing `FAMI` + `NBRS` together).
+fn persist_household_staged(
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    origin_neighborhood: &StoredNeighborhood,
+    final_stored: &StoredNeighborhood,
+    created_members: &[CreatedSim],
+) -> Result<u64, CafError> {
+    let mut reservation = origin_neighborhood.clone();
+    for member in created_members {
+        reservation.deleted_characters.insert(member.guid);
+    }
+    let (mut expected_instance, mut expected_revision) = checked_save_neighborhood(
+        store,
+        neighborhood_id,
+        origin_neighborhood.instance_id,
+        origin_neighborhood.revision,
+        &reservation,
+    )?;
+    // Guarantee `expected_revision + created_members.len()` cannot cross
+    // `u64::MAX` during Phase 2's per-file writes without checked rotation.
+    while expected_revision
+        .checked_add(created_members.len() as u64)
+        .is_none()
+    {
+        (expected_instance, expected_revision) = checked_save_neighborhood(
+            store,
+            neighborhood_id,
+            expected_instance,
+            expected_revision,
+            &reservation,
+        )?;
+    }
+
+    for member in created_members {
+        store.save_character_file(neighborhood_id, &member.file_name, &member.iff_bytes)?;
+        expected_revision = expected_revision
+            .checked_add(1)
+            .expect("rollover cleared before Phase 2");
+    }
+
+    let (_, committed_revision) = checked_save_neighborhood(
+        store,
+        neighborhood_id,
+        expected_instance,
+        expected_revision,
+        final_stored,
+    )?;
+    Ok(committed_revision)
+}
+
 /// Like [`commit_family`], reusing a pre-loaded [`CafContext`] (suitable for
 /// repeated CAF commits or pure unit tests without `SIMS_INSTALL`).
 pub fn commit_family_with_context(
@@ -1643,11 +1800,15 @@ pub fn commit_family_with_context(
 ) -> Result<CreatedHousehold, CafError> {
     spec.validate()?;
 
+    let _guard = CAF_COMMIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let snapshot = store
         .load_lot_snapshot(neighborhood_id, 0)?
         .ok_or_else(|| CafError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    let origin_neighborhood = snapshot.neighborhood.clone();
     let mut stored = snapshot.neighborhood;
-    let origin_instance_id = stored.instance_id;
     let origin_revision = stored.revision;
     let character_files = snapshot.character_files;
 
@@ -1690,8 +1851,6 @@ pub fn commit_family_with_context(
             .clone()
             .expect("allocated slot is occupied");
 
-        // Ensure GUID is no longer marked deleted (impossible for fresh GUIDs,
-        // kept defensively in sync with `write_back_world`).
         stored.deleted_characters.remove(&guid);
 
         member_guids.push(guid);
@@ -1721,46 +1880,13 @@ pub fn commit_family_with_context(
     };
     stored.families.insert(family_id, family.clone());
 
-    // Persist each newly synthesized character IFF first (each call bumps
-    // neighborhood revision by +1), then commit `StoredNeighborhood` with a
-    // checked `(instance_id, revision)` guard so concurrent updates are caught.
-    let mut expected_instance = origin_instance_id;
-    let mut expected_revision = origin_revision;
-    for member in &created_members {
-        store.save_character_file(neighborhood_id, &member.file_name, &member.iff_bytes)?;
-        match expected_revision.checked_add(1) {
-            Some(next) => expected_revision = next,
-            None => {
-                let refreshed = store
-                    .load_neighborhood(neighborhood_id)?
-                    .ok_or_else(|| CafError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
-                expected_instance = refreshed.instance_id;
-                expected_revision = refreshed.revision;
-            }
-        }
-    }
-
-    let committed_revision = match store.save_neighborhood_checked(
+    let committed_revision = persist_household_staged(
+        store,
         neighborhood_id,
-        expected_instance,
-        expected_revision,
+        &origin_neighborhood,
         &stored,
-    )? {
-        Ok((_, revision)) => revision,
-        Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
-            return Err(CafError::NeighborhoodMismatch {
-                expected: format!("{neighborhood_id}#{expected:032x}"),
-                actual: format!("{neighborhood_id}#{current:032x}"),
-            });
-        }
-        Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
-            return Err(CafError::StaleNeighborhood {
-                neighborhood: neighborhood_id.to_owned(),
-                expected_revision: expected,
-                current_revision: current,
-            });
-        }
-    };
+        &created_members,
+    )?;
 
     Ok(CreatedHousehold {
         family_id,
@@ -1794,6 +1920,10 @@ pub fn delete_bin_family(
     if is_reserved_pool_family(family_id) {
         return Err(CafError::ReservedFamily { family: family_id });
     }
+
+    let _guard = CAF_COMMIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let mut stored = store
         .load_neighborhood(neighborhood_id)?
@@ -1872,27 +2002,13 @@ pub fn delete_bin_family(
         }
     }
 
-    let committed_revision = match store.save_neighborhood_checked(
+    let (_, committed_revision) = checked_save_neighborhood(
+        store,
         neighborhood_id,
         origin_instance_id,
         origin_revision,
         &stored,
-    )? {
-        Ok((_, revision)) => revision,
-        Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
-            return Err(CafError::NeighborhoodMismatch {
-                expected: format!("{neighborhood_id}#{expected:032x}"),
-                actual: format!("{neighborhood_id}#{current:032x}"),
-            });
-        }
-        Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
-            return Err(CafError::StaleNeighborhood {
-                neighborhood: neighborhood_id.to_owned(),
-                expected_revision: expected,
-                current_revision: current,
-            });
-        }
-    };
+    )?;
 
     Ok(DeletedFamilyReport {
         family_id,
@@ -1982,6 +2098,167 @@ fn encode_finv(member_ids: &[u16], inventories: &[Option<Inventory>]) -> Vec<u8>
     out
 }
 
+/// Parses `FINV #2` (version 73 `VNIF`) holding exported family neighbor
+/// inventories, matching `Export/Alice_7.FAM` and `Neighborhood::parse`.
+fn parse_finv(bytes: &[u8]) -> Result<Vec<Option<Inventory>>, CafError> {
+    let mut pos = 0usize;
+    let take = |pos: &mut usize, len: usize| -> Result<&[u8], CafError> {
+        let end = pos
+            .checked_add(len)
+            .ok_or_else(|| CafError::TemplateInvalid("FINV offset overflow".into()))?;
+        let slice = bytes
+            .get(*pos..end)
+            .ok_or_else(|| CafError::TemplateInvalid("truncated FINV #2 chunk".into()))?;
+        *pos = end;
+        Ok(slice)
+    };
+    let read_u16 = |pos: &mut usize| -> Result<u16, CafError> {
+        Ok(u16::from_le_bytes(take(pos, 2)?.try_into().unwrap()))
+    };
+    let read_i16 = |pos: &mut usize| -> Result<i16, CafError> {
+        Ok(i16::from_le_bytes(take(pos, 2)?.try_into().unwrap()))
+    };
+    let read_u32 = |pos: &mut usize| -> Result<u32, CafError> {
+        Ok(u32::from_le_bytes(take(pos, 4)?.try_into().unwrap()))
+    };
+    let read_i32 = |pos: &mut usize| -> Result<i32, CafError> {
+        Ok(i32::from_le_bytes(take(pos, 4)?.try_into().unwrap()))
+    };
+
+    let _mode = read_u32(&mut pos)?;
+    let _version = read_u32(&mut pos)?;
+    if take(&mut pos, 4)? != b"VNIF" {
+        return Err(CafError::TemplateInvalid(
+            "FINV #2 chunk missing VNIF tag".into(),
+        ));
+    }
+    let count = read_u32(&mut pos)? as usize;
+    if count.saturating_mul(4) > bytes.len().saturating_sub(pos) {
+        return Err(CafError::TemplateInvalid(
+            "FINV #2 entry count exceeds chunk length".into(),
+        ));
+    }
+    let mut inventories = Vec::with_capacity(count);
+    for _ in 0..count {
+        match read_i32(&mut pos)? {
+            0 => inventories.push(None),
+            1 => {
+                let neighbor = read_i16(&mut pos)?;
+                let item_count = read_u32(&mut pos)? as usize;
+                if item_count.saturating_mul(10) > bytes.len().saturating_sub(pos) {
+                    return Err(CafError::TemplateInvalid(
+                        "FINV #2 item count exceeds chunk length".into(),
+                    ));
+                }
+                let mut items = Vec::with_capacity(item_count);
+                for _ in 0..item_count {
+                    let kind = read_i32(&mut pos)?;
+                    let guid = read_u32(&mut pos)?;
+                    let item_qty = read_u16(&mut pos)?;
+                    items.push(InventoryItem {
+                        kind,
+                        guid,
+                        count: item_qty,
+                    });
+                }
+                inventories.push(Some(Inventory { neighbor, items }));
+            }
+            other => {
+                return Err(CafError::TemplateInvalid(format!(
+                    "FINV #2 unknown presence flag {other}"
+                )));
+            }
+        }
+    }
+    if pos != bytes.len() {
+        return Err(CafError::TemplateInvalid(format!(
+            "FINV #2 has {} unexpected trailing bytes",
+            bytes.len() - pos
+        )));
+    }
+    Ok(inventories)
+}
+
+/// Revision-gated `NBRS` person fields matching `sims_content::family_import`
+/// (`0x423827`).
+const IMPORT_PERSON_FIELDS: &[(i32, &[usize])] = &[
+    (
+        1,
+        &[
+            2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 16, 20, 15, 26, 17, 18, 46, 47, 48, 49, 50, 51, 52,
+            53, 13, 14, 58, 60, 61,
+        ],
+    ),
+    (2, &[56, 57, 63]),
+    (3, &[65]),
+    (4, &[67, 68]),
+    (5, &[69]),
+    (6, &[74]),
+    (7, &[54, 55, 75, 76]),
+    (8, &[80, 81]),
+    (9, &[82]),
+    (10, &[83, 84, 85, 86]),
+];
+
+/// Allocates the destination `(family_id, family_number)` for an imported
+/// `.FAM` archive matching `sims_content::family_import::family_numbers`
+/// (`0x425dea`, `0x42913f`): verifies a free non-reserved family ID exists,
+/// retains `exported_id` when it is positive, non-reserved, and unoccupied,
+/// and otherwise falls back to the lowest free non-reserved ID.
+fn allocate_imported_family_id(
+    families: &BTreeMap<u16, Family>,
+    exported_id: u16,
+) -> Result<(u16, i32), CafError> {
+    let (free_id, number) = allocate_family_id(families)?;
+    if exported_id == 0 || exported_id > i16::MAX as u16 {
+        return Err(CafError::TemplateInvalid(format!(
+            "invalid exported family ID {exported_id}"
+        )));
+    }
+    let id = if !is_reserved_pool_family(exported_id) && !families.contains_key(&exported_id) {
+        exported_id
+    } else {
+        free_id
+    };
+    Ok((id, number))
+}
+
+/// Allocates a destination `NBRS` slot for an imported `.FAM` member matching
+/// `sims_content::family_import::allocate_neighbor` (`0x425884`): tries the
+/// exported one-based slot first (extending with `None` if past the end), and
+/// if occupied pops the last vacant slot or appends a new slot.
+fn allocate_imported_neighbor_slot(
+    neighbors: &mut Vec<Option<Neighbor>>,
+    exported_id: u16,
+    placeholder: Neighbor,
+) -> Result<i16, CafError> {
+    if exported_id == 0 || exported_id > i16::MAX as u16 {
+        return Err(CafError::TemplateInvalid(format!(
+            "invalid exported neighbor ID {exported_id}"
+        )));
+    }
+    let requested = usize::from(exported_id);
+    let slot = if requested > neighbors.len() {
+        neighbors.resize(requested, None);
+        requested - 1
+    } else if neighbors[requested - 1].is_none() {
+        requested - 1
+    } else if let Some(vacancy) = neighbors.iter().rposition(Option::is_none) {
+        vacancy
+    } else {
+        neighbors.push(None);
+        neighbors.len() - 1
+    };
+    let id = i16::try_from(slot + 1)
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or(CafError::NoFreeNeighborSlot)?;
+    let mut record = placeholder;
+    record.id = id;
+    neighbors[slot] = Some(record);
+    Ok(id)
+}
+
 /// Serializes `EXPi #0` (version `0x3f` `iPXE`), matching `Export/Alice_7.FAM`.
 fn encode_expi(family_id: u16, member_ids: &[u16], language: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(31);
@@ -2003,7 +2280,7 @@ fn encode_expi(family_id: u16, member_ids: &[u16], language: u8) -> Vec<u8> {
 /// Exports a household from `stored` + `character_files` into a Complete
 /// Collection 1.91 `.FAM` IFF container matching `Export/Alice_7.FAM`:
 /// `FAMI`, `FAMs`, `CTSS #1000`, `EXPi #0`, per-member `uChr`, `CTSS`,
-/// `CTSS + 2000` (20-language copy), `BMP_` (`newimage` 2004), `NBRS #1`, and
+/// `CTSS + 2000` (localized copy), `BMP_` (`newimage` 2004), `NBRS #1`, and
 /// optionally `FINV #2` (`include_finv = true` matches `Alice_7.FAM` chunk-for-chunk;
 /// `include_finv = false` also passes `sims_content::family_import::import`).
 pub fn export_family_fam(
@@ -2028,10 +2305,10 @@ pub fn export_family_fam(
     }
     let fams = encode_fams(family_name, language)?;
 
-    // Index character IFFs by OBJD GUID.
+    // Index character IFFs by OBJD GUID across both loose `.iff` and `.far` archives.
     let mut char_iffs_by_guid: BTreeMap<u32, Iff> = BTreeMap::new();
-    for bytes in character_files.values() {
-        if let Ok(iff) = Iff::parse(bytes.clone()) {
+    visit_character_blobs(character_files, |_, bytes| {
+        if let Ok(iff) = Iff::parse(bytes.to_vec()) {
             for chunk in iff.all(b"OBJD") {
                 if let Some(raw) = iff.data(chunk).get(0x1c..0x20) {
                     let guid = u32::from_le_bytes(raw.try_into().unwrap());
@@ -2039,8 +2316,9 @@ pub fn export_family_fam(
                 }
             }
         }
-    }
+    });
 
+    let mut used_ctss_ids = BTreeSet::from([1000u16]);
     let mut member_ids = Vec::with_capacity(family.members.len());
     let mut member_chunks = Vec::new();
     for &guid in &family.members {
@@ -2059,6 +2337,17 @@ pub fn export_family_fam(
             .ok()
             .filter(|&id| id > 0 && id <= i16::MAX as u16 && (id as i16) == neighbor.id)
             .ok_or(CafError::NoFreeNeighborSlot)?;
+        let localized_id = mid.checked_add(2000).ok_or_else(|| {
+            CafError::TemplateInvalid(format!(
+                "family {family_id} member slot {mid} overflows localized CTSS ID"
+            ))
+        })?;
+        if !used_ctss_ids.insert(mid) || !used_ctss_ids.insert(localized_id) {
+            return Err(CafError::TemplateInvalid(format!(
+                "family {family_id} member slot {mid} collides with another CTSS chunk ID \
+                 (1000 or member+2000)"
+            )));
+        }
         member_ids.push(mid);
 
         let iff = char_iffs_by_guid.get(&guid).ok_or_else(|| {
@@ -2080,25 +2369,28 @@ pub fn export_family_fam(
         });
 
         let ctss_chunk = iff.get(b"CTSS", 2000);
-        let (ctss_bytes, name_bytes, bio_bytes) = if let Some(chunk) = ctss_chunk {
-            let raw = iff.data(chunk).to_vec();
-            let parsed = StringTable::parse(&raw)?;
-            let name = parsed
-                .entry(0, language)
-                .map(|e| e.raw_text.clone())
-                .unwrap_or_default();
-            let bio = parsed
-                .entry(1, language)
-                .map(|e| e.raw_text.clone())
-                .unwrap_or_default();
-            (raw, name, bio)
-        } else {
-            let empty = encode_localized_strings([
-                (language, &[][..], &[][..]),
-                (language, &[][..], &[][..]),
-            ])?;
-            (empty, Vec::new(), Vec::new())
-        };
+        let (ctss_bytes, name_bytes, bio_bytes, name_text, bio_text) =
+            if let Some(chunk) = ctss_chunk {
+                let raw = iff.data(chunk).to_vec();
+                let parsed = StringTable::parse(&raw)?;
+                let name = parsed
+                    .entry(0, language)
+                    .map(|e| e.raw_text.clone())
+                    .unwrap_or_default();
+                let bio = parsed
+                    .entry(1, language)
+                    .map(|e| e.raw_text.clone())
+                    .unwrap_or_default();
+                let name_s = decode(&name, language);
+                let bio_s = decode(&bio, language);
+                (raw, name, bio, name_s, bio_s)
+            } else {
+                let empty = encode_localized_strings([
+                    (language, &[][..], &[][..]),
+                    (language, &[][..], &[][..]),
+                ])?;
+                (empty, Vec::new(), Vec::new(), String::new(), String::new())
+            };
         member_chunks.push(ChunkData {
             tag: *b"CTSS",
             id: mid,
@@ -2107,16 +2399,23 @@ pub fn export_family_fam(
             data: ctss_bytes,
         });
 
-        // Localized CTSS at `mid + 2000` (all 20 native languages, matching `Alice_7.FAM` CTSS 2464).
+        // Localized CTSS at `mid + 2000`: include every native language 1..=20
+        // whose code page preserves `name_text` and `bio_text` verbatim (all 20
+        // languages for ASCII text, matching `Alice_7.FAM` CTSS 2464; active
+        // language + compatible Western languages for non-ASCII 1252 text).
         let mut all_langs = Vec::with_capacity(40);
         for lang in 1u8..=20 {
-            all_langs.push((lang, name_bytes.as_slice(), &[][..]));
-            all_langs.push((lang, bio_bytes.as_slice(), &[][..]));
+            if lang == language
+                || (decode(&name_bytes, lang) == name_text && decode(&bio_bytes, lang) == bio_text)
+            {
+                all_langs.push((lang, name_bytes.as_slice(), &[][..]));
+                all_langs.push((lang, bio_bytes.as_slice(), &[][..]));
+            }
         }
         let ctss_2000 = encode_localized_strings(all_langs)?;
         member_chunks.push(ChunkData {
             tag: *b"CTSS",
-            id: mid.wrapping_add(2000),
+            id: localized_id,
             flags: CHUNK_CONVERTED,
             label: String::new(),
             data: ctss_2000,
@@ -2194,7 +2493,8 @@ pub fn export_family_fam(
 /// Imports a Complete Collection 1.91 Family Bin `.FAM` archive (such as
 /// `Export/Alice_7.FAM` or bytes produced by [`export_family_fam`]) directly
 /// into `store` under `neighborhood_id` as a new Family Bin household with
-/// fresh unique GUIDs, `User%05d.iff` character files, and `NBRS` records.
+/// fresh unique GUIDs, `User%05d.iff` character files, `NBRS` records, and
+/// remapped `FINV #2` inventories.
 pub fn import_family_fam(
     ctx: &CafContext,
     store: &NeighborhoodStore,
@@ -2251,15 +2551,27 @@ pub fn import_family_fam(
         }
     }
 
+    // Parse and validate optional FINV #2 up front before acquiring any locks or
+    // writing anything to REDB.
+    let exported_inventories = match parsed.iff.get(b"FINV", 2) {
+        Some(chunk) => parse_finv(parsed.iff.data(chunk))?,
+        None => Vec::new(),
+    };
+
+    let _guard = CAF_COMMIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let snapshot = store
         .load_lot_snapshot(neighborhood_id, 0)?
         .ok_or_else(|| CafError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    let origin_neighborhood = snapshot.neighborhood.clone();
     let mut stored = snapshot.neighborhood;
-    let origin_instance_id = stored.instance_id;
     let origin_revision = stored.revision;
     let character_files = snapshot.character_files;
 
-    let (family_id, family_number) = allocate_family_id(&stored.families)?;
+    let (family_id, family_number) =
+        allocate_imported_family_id(&stored.families, parsed.export_info.family_id)?;
     let fams_chunk = encode_fams(&family_name, language)?;
     let mut used_guids = collect_used_guids(&ctx.catalog_guids, &character_files, &stored);
     let mut reserved_files = BTreeSet::new();
@@ -2292,6 +2604,12 @@ pub fn import_family_fam(
                 CafError::TemplateInvalid(format!("FAM member {exported_id} missing NBRS record"))
             })?
             .clone();
+        if source_neighbor.person_mode < 0 {
+            return Err(CafError::TemplateInvalid(format!(
+                "FAM member {exported_id} has negative person revision {}",
+                source_neighbor.person_mode
+            )));
+        }
 
         let (first_name, bio) = extract_fam_member_text(member, language)?;
         let body_strings: Vec<String> = member
@@ -2336,15 +2654,15 @@ pub fn import_family_fam(
             version_extra: Some(SAVED_REVISION),
             name: format!("user{file_number:05}"),
             unknown_zero: 0,
-            person_mode: source_neighbor.person_mode.max(SAVED_REVISION),
+            person_mode: source_neighbor.person_mode,
             person_data: vec![0; PERSON_WORDS],
             id: 0,
             guid,
             unknown_negative: -1,
             relationships: Vec::new(),
         };
-        let neighbor_id = allocate_record(&mut stored.neighbors, placeholder)
-            .map_err(|_| CafError::NoFreeNeighborSlot)?;
+        let neighbor_id =
+            allocate_imported_neighbor_slot(&mut stored.neighbors, exported_id, placeholder)?;
 
         staged.push(ExportedMemberData {
             exported_id,
@@ -2359,28 +2677,65 @@ pub fn import_family_fam(
         });
     }
 
-    // Second pass: remap intra-family relationships and synthesize character IFFs.
-    let id_map: BTreeMap<i32, i32> = staged
+    // Second pass: remap intra-family relationships (first row per exported
+    // target in EXPi order, matching `family_import.rs::copy_neighbor`),
+    // transfer revision-gated person_data fields, and synthesize character IFFs.
+    let member_id_pairs: Vec<(u16, i16)> = staged
         .iter()
-        .map(|m| (i32::from(m.exported_id), i32::from(m.neighbor_id)))
+        .map(|m| (m.exported_id, m.neighbor_id))
         .collect();
+    let id_map: BTreeMap<i16, i16> = member_id_pairs
+        .iter()
+        .map(|&(exported_id, new_id)| (exported_id as i16, new_id))
+        .collect();
+
+    // Validate and remap FINV #2 inventories before mutating REDB.
+    let mut remapped_inventories = Vec::new();
+    for inv in exported_inventories.into_iter().flatten() {
+        if let Some(&new_neighbor) = id_map.get(&inv.neighbor) {
+            if !inv.items.is_empty() {
+                remapped_inventories.push(Inventory {
+                    neighbor: new_neighbor,
+                    items: inv.items,
+                });
+            }
+        } else if !inv.items.is_empty() {
+            return Err(CafError::TemplateInvalid(format!(
+                "FINV #2 contains non-empty inventory for non-member neighbor {}",
+                inv.neighbor
+            )));
+        }
+    }
 
     let mut created_members = Vec::with_capacity(staged.len());
     let mut member_guids = Vec::with_capacity(staged.len());
     for m in staged {
         let mut person_data = vec![0i16; PERSON_WORDS];
-        let copy_len = m.source_neighbor.person_data.len().min(PERSON_WORDS);
-        person_data[..copy_len].copy_from_slice(&m.source_neighbor.person_data[..copy_len]);
+        for &(_, indices) in IMPORT_PERSON_FIELDS
+            .iter()
+            .take_while(|(since, _)| *since <= m.source_neighbor.person_mode)
+        {
+            for &index in indices {
+                person_data[index] = m
+                    .source_neighbor
+                    .person_data
+                    .get(index)
+                    .copied()
+                    .unwrap_or(0);
+            }
+        }
         person_data[person_word::FAMILY] = family_id as i16;
 
-        let relationships: Vec<Relationship> = m
-            .source_neighbor
-            .relationships
+        let relationships: Vec<Relationship> = member_id_pairs
             .iter()
-            .filter_map(|row| {
-                let &new_target = id_map.get(&row.target)?;
+            .filter_map(|&(target_exported, target_new)| {
+                let row = m
+                    .source_neighbor
+                    .relationships
+                    .iter()
+                    .find(|row| row.target == i32::from(target_exported))?;
                 (!row.values.is_empty()).then(|| Relationship {
-                    target: new_target,
+                    target: i32::from(target_new),
                     values: row.values.clone(),
                 })
             })
@@ -2391,7 +2746,7 @@ pub fn import_family_fam(
             version_extra: Some(SAVED_REVISION),
             name: format!("user{:05}", m.file_number),
             unknown_zero: 0,
-            person_mode: m.source_neighbor.person_mode.max(SAVED_REVISION),
+            person_mode: m.source_neighbor.person_mode,
             person_data: person_data.clone(),
             id: m.neighbor_id,
             guid: m.guid,
@@ -2435,12 +2790,25 @@ pub fn import_family_fam(
         });
     }
 
+    for inv in remapped_inventories {
+        if let Some(existing) = stored
+            .inventories
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.neighbor == inv.neighbor)
+        {
+            existing.items = inv.items;
+        } else {
+            stored.inventories.push(Some(inv));
+        }
+    }
+
     let family = Family {
         version: 9,
         house: 0,
         number: family_number,
         budget: parsed.family.budget,
-        architecture_value: 0,
+        architecture_value: parsed.family.architecture_value,
         friends: 0,
         flags: parsed.family.flags & 1,
         members: member_guids,
@@ -2448,43 +2816,13 @@ pub fn import_family_fam(
     };
     stored.families.insert(family_id, family.clone());
 
-    let mut expected_instance = origin_instance_id;
-    let mut expected_revision = origin_revision;
-    for member in &created_members {
-        store.save_character_file(neighborhood_id, &member.file_name, &member.iff_bytes)?;
-        match expected_revision.checked_add(1) {
-            Some(next) => expected_revision = next,
-            None => {
-                let refreshed = store
-                    .load_neighborhood(neighborhood_id)?
-                    .ok_or_else(|| CafError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
-                expected_instance = refreshed.instance_id;
-                expected_revision = refreshed.revision;
-            }
-        }
-    }
-
-    let committed_revision = match store.save_neighborhood_checked(
+    let committed_revision = persist_household_staged(
+        store,
         neighborhood_id,
-        expected_instance,
-        expected_revision,
+        &origin_neighborhood,
         &stored,
-    )? {
-        Ok((_, revision)) => revision,
-        Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
-            return Err(CafError::NeighborhoodMismatch {
-                expected: format!("{neighborhood_id}#{expected:032x}"),
-                actual: format!("{neighborhood_id}#{current:032x}"),
-            });
-        }
-        Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
-            return Err(CafError::StaleNeighborhood {
-                neighborhood: neighborhood_id.to_owned(),
-                expected_revision: expected,
-                current_revision: current,
-            });
-        }
-    };
+        &created_members,
+    )?;
 
     Ok(CreatedHousehold {
         family_id,
@@ -2529,8 +2867,8 @@ fn synthesize_imported_member_iff(
     language: u8,
     wardrobe: Option<&ImportWardrobe>,
 ) -> Result<Vec<u8>, CafError> {
-    let raw_name = encode_w1252(first_name, "Sim first name")?;
-    let raw_bio = encode_w1252(bio, "Sim bio")?;
+    let raw_name = encode_for_language(first_name, language, "Sim first name")?;
+    let raw_bio = encode_for_language(bio, language, "Sim bio")?;
 
     let mut chunks = Vec::new();
     let tags: BTreeSet<[u8; 4]> = template.chunks.iter().map(|c| c.tag).collect();
@@ -2631,8 +2969,9 @@ fn synthesize_imported_member_iff(
     if let Some(raw_2004) = portrait_2004
         && let Ok(img) = bmp(raw_2004)
         && [img.width, img.height] == PortraitKind::NewImage2004.expected_size()
+        && let Ok(normalized) = encode_bmp24(&img)
     {
-        portraits.new_image_2004 = raw_2004.to_vec();
+        portraits.new_image_2004 = normalized;
     }
     for kind in PortraitKind::ALL {
         upsert_chunk(
@@ -2792,5 +3131,218 @@ mod tests {
             let decoded = bmp(iff.data(chunk)).unwrap();
             assert_eq!([decoded.width, decoded.height], kind.expected_size());
         }
+    }
+
+    #[test]
+    fn fcns_reads_custom_money_for_new_family_tuning() {
+        // Minimal FCNS version 1 payload containing `"money for new family" = 35000.0`
+        // (NUL-terminated strings aligned to even stream offsets).
+        let mut fcns = Vec::new();
+        fcns.extend_from_slice(&0u32.to_le_bytes());
+        fcns.extend_from_slice(&1u32.to_le_bytes());
+        fcns.extend_from_slice(b"SNCF");
+        fcns.extend_from_slice(&1u32.to_le_bytes());
+        fcns.extend_from_slice(b"money for new family\0\0");
+        fcns.extend_from_slice(&35_000.0f32.to_le_bytes());
+        fcns.extend_from_slice(b"\0\0"); // empty comment, aligned
+        let iff = Iff::parse(
+            write_iff(&[ChunkData {
+                tag: *b"FCNS",
+                id: NEIGHBORHOOD_TUNING_ID,
+                flags: CHUNK_CONVERTED,
+                label: "Neighborhood Tuning".to_owned(),
+                data: fcns,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_starting_funds_from_iff(&iff), Some(35_000));
+    }
+
+    #[test]
+    fn collect_used_guids_and_file_numbers_scan_far_archives() {
+        let tpl = synthetic_template_iff();
+        let spec = SimSpec {
+            first_name: "Archived".into(),
+            bio: String::new(),
+            age: Age::Adult,
+            gender: Gender::Female,
+            skin_tone: SkinTone::Medium,
+            body_appearance: "b002fafit_01".into(),
+            body_texture: "b002fafitmed_mom02".into(),
+            head_appearance: "c809fa_beth".into(),
+            head_texture: "c809famed_beth3".into(),
+            personality: Personality::new(5, 5, 5, 5, 5).unwrap(),
+            portraits: None,
+        };
+        let archived_guid = 0x55aa_1234u32;
+        let iff_bytes = synthesize_character_iff(&tpl, &spec, archived_guid, 7, 1, None).unwrap();
+
+        // Build a minimal valid FAR 1a archive containing `User00007.iff`.
+        let member_name = b"User00007.iff";
+        let payload_offset = 16u32;
+        let manifest_off = payload_offset + iff_bytes.len() as u32;
+        let mut far = Vec::new();
+        far.extend_from_slice(b"FAR!byAZ");
+        far.extend_from_slice(&1u32.to_le_bytes());
+        far.extend_from_slice(&manifest_off.to_le_bytes());
+        far.extend_from_slice(&iff_bytes);
+        far.extend_from_slice(&1u32.to_le_bytes());
+        far.extend_from_slice(&(iff_bytes.len() as u32).to_le_bytes());
+        far.extend_from_slice(&(iff_bytes.len() as u32).to_le_bytes());
+        far.extend_from_slice(&payload_offset.to_le_bytes());
+        far.extend_from_slice(&(member_name.len() as u32).to_le_bytes());
+        far.extend_from_slice(member_name);
+
+        let files = BTreeMap::from([("bundle.far".to_owned(), far)]);
+        let empty = StoredNeighborhood {
+            name: "FarTest".into(),
+            families: BTreeMap::new(),
+            neighbors: Vec::new(),
+            inventories: Vec::new(),
+            data: [0; 16],
+            options: None,
+            type_attributes: None,
+            zoning: BTreeMap::new(),
+            lot_rows: Vec::new(),
+            made_characters: sims_sim::characters::Characters::default(),
+            deleted_characters: BTreeSet::new(),
+            deletion_epoch: 0,
+            deleted_at_epoch: BTreeMap::new(),
+            instance_id: 1,
+            revision: 0,
+        };
+        let used = collect_used_guids(&BTreeSet::new(), &files, &empty);
+        assert!(used.contains(&archived_guid));
+        let reserved: BTreeSet<i32> = (0..7).collect();
+        assert_eq!(
+            allocate_character_file_number(&files, &empty, &reserved).unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn from_raw_bmps_normalizes_top_down_bmp_to_canonical_24bit_bottom_up() {
+        let make_top_down = |kind: PortraitKind| -> Vec<u8> {
+            let [w, h] = kind.expected_size();
+            let mut img = Image {
+                width: w,
+                height: h,
+                rgba: vec![0; (w * h * 4) as usize],
+            };
+            for y in 0..h {
+                for x in 0..w {
+                    let p = ((y * w + x) * 4) as usize;
+                    img.rgba[p] = (x & 0xff) as u8;
+                    img.rgba[p + 1] = (y & 0xff) as u8;
+                    img.rgba[p + 2] = 0x55;
+                    img.rgba[p + 3] = 255;
+                }
+            }
+            let mut canonical = encode_bmp24(&img).unwrap();
+            // Flip to top-down (negative biHeight) and set non-zero bfSize.
+            let total = canonical.len() as u32;
+            canonical[2..6].copy_from_slice(&total.to_le_bytes());
+            canonical[22..26].copy_from_slice(&(-(h as i32)).to_le_bytes());
+            let row_bytes = (w as usize) * 3;
+            let stride = row_bytes.div_ceil(4) * 4;
+            for y in 0..(h as usize / 2) {
+                let a = 54 + y * stride;
+                let b = 54 + (h as usize - 1 - y) * stride;
+                for i in 0..stride {
+                    canonical.swap(a + i, b + i);
+                }
+            }
+            canonical
+        };
+        let normalized = PortraitBitmaps::from_raw_bmps(
+            make_top_down(PortraitKind::Faces2002),
+            make_top_down(PortraitKind::Relationship2003),
+            make_top_down(PortraitKind::NewImage2004),
+            make_top_down(PortraitKind::SpeechMed2005),
+            make_top_down(PortraitKind::SpeechLarge2006),
+            make_top_down(PortraitKind::WebImage2007),
+        )
+        .unwrap();
+        for kind in PortraitKind::ALL {
+            let bytes = normalized.chunk_bytes(kind);
+            // Normalized header must have bfSize = 0, positive biHeight, 24-bit BI_RGB.
+            assert_eq!(u32::from_le_bytes(bytes[2..6].try_into().unwrap()), 0);
+            assert!(i32::from_le_bytes(bytes[22..26].try_into().unwrap()) > 0);
+            assert_eq!(u16::from_le_bytes(bytes[28..30].try_into().unwrap()), 24);
+        }
+    }
+
+    #[test]
+    fn language_round_trip_rejects_mismatched_code_page_and_accepts_western() {
+        // 'é' round-trips in French (3) and US English (1), but would become 'й' in Russian (13).
+        assert!(encode_fams("René", 1).is_ok());
+        assert!(encode_fams("René", 3).is_ok());
+        assert!(matches!(
+            encode_fams("René", 13),
+            Err(CafError::InvalidText(_))
+        ));
+        // Pure ASCII round-trips in Russian (13).
+        assert!(encode_fams("Alice", 13).is_ok());
+    }
+
+    #[test]
+    fn export_family_fam_rejects_colliding_ctss_chunk_ids() {
+        let tpl = synthetic_template_iff();
+        let spec = SimSpec {
+            first_name: "Collider".into(),
+            bio: String::new(),
+            age: Age::Adult,
+            gender: Gender::Female,
+            skin_tone: SkinTone::Light,
+            body_appearance: "b002fafit_01".into(),
+            body_texture: "b002fafitlgt_mom02".into(),
+            head_appearance: "c809fa_beth".into(),
+            head_texture: "c809falgt_beth3".into(),
+            personality: Personality::new(5, 5, 5, 5, 5).unwrap(),
+            portraits: None,
+        };
+        let mut rng = CrtRng::from_state(99);
+        let guid = 0x7777_0001u32;
+        let iff_bytes = synthesize_character_iff(&tpl, &spec, guid, 1, 1, None).unwrap();
+        let mut neighbors = vec![None; 1000];
+        neighbors[999] = Some(synthesize_neighbor(&spec, 1000, guid, 1, 1, &mut rng));
+        let mut families = BTreeMap::new();
+        families.insert(
+            1,
+            Family {
+                version: 9,
+                house: 0,
+                number: 1,
+                budget: 20_000,
+                architecture_value: 0,
+                friends: 0,
+                flags: CAF_INITIAL_FAMILY_FLAGS,
+                members: vec![guid],
+                tail: vec![0; 16],
+            },
+        );
+        let stored = StoredNeighborhood {
+            name: "Collide".into(),
+            families,
+            neighbors,
+            inventories: Vec::new(),
+            data: [0; 16],
+            options: None,
+            type_attributes: None,
+            zoning: BTreeMap::new(),
+            lot_rows: Vec::new(),
+            made_characters: sims_sim::characters::Characters::default(),
+            deleted_characters: BTreeSet::new(),
+            deletion_epoch: 0,
+            deleted_at_epoch: BTreeMap::new(),
+            instance_id: 1,
+            revision: 0,
+        };
+        let chars = BTreeMap::from([("User00001.iff".to_owned(), iff_bytes)]);
+        assert!(matches!(
+            export_family_fam(&stored, &chars, 1, "Collide", 1, true),
+            Err(CafError::TemplateInvalid(_))
+        ));
     }
 }

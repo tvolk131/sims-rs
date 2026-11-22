@@ -17,16 +17,29 @@ and `Export/Alice_7.FAM`).
   by `sims_people::caf_preview::render_portrait` as `sims_formats::bitmap::Image`
   values (`PortraitBitmaps::from_images`) or validated BMP bytes
   (`PortraitBitmaps::from_raw_bmps`), encoding them into uncompressed 24-bit
-  bottom-up Windows BMPs (`encode_bmp24`) matching `User00172.iff` byte-for-byte.
+  bottom-up Windows BMPs (`encode_bmp24`) matching `User00172.iff` header-for-header
+  and pixel-for-pixel.
   Headless callers/tests without a renderer may omit portraits to embed valid
   native-dimension placeholders (`PortraitBitmaps::placeholder`).
 - **Read-only install, REDB-backed persistence:**
   `CafContext::from_install` reads `TemplatePerson.iff` (`0x7fd96b54`), the
   install's catalog GUIDs, `ImportWardrobe`, and `Global.far` `FCNS #4`
-  `"starting money for new family"` (`$20,000`) strictly read-only. All
-  synthesized `User%05d.iff` blobs and updated `StoredNeighborhood` metadata are
-  persisted into `NeighborhoodStore` (REDB) without modifying `SIMS_INSTALL` on
-  disk.
+  `"money for new family"` (`$20,000`) strictly read-only. All synthesized
+  `User%05d.iff` blobs and updated `StoredNeighborhood` metadata are persisted
+  into `NeighborhoodStore` (REDB) without modifying `SIMS_INSTALL` on disk.
+- **Three-phase tombstone-shielded commit safety:**
+  Because `NeighborhoodStore` currently exposes separate `save_character_file`
+  and `save_neighborhood_checked` APIs, `commit_family_with_context` and
+  `import_family_fam` serialize in-process CAF writes (`CAF_COMMIT_LOCK`;
+  REDB enforces single-process exclusive file locking) and run a three-phase
+  protocol: (1) atomically check `(instance_id, revision)` and reserve every
+  new GUID in `deleted_characters` before writing any character file (advancing
+  across `u64::MAX` revision rollover under checked commits if ever reached),
+  (2) write each `User%05d.iff` (invisible to concurrent `load_lot_snapshot` /
+  `enter_lot` and safe across mid-write crashes because its GUID is suppressed
+  by `deleted_characters`), and (3) atomically publish `FAMI`, `NBRS`, and
+  un-tombstoned GUIDs via `save_neighborhood_checked`. A follow-up `sims-sim`
+  helper can later collapse these phases into a single REDB write transaction.
 
 ## Complete Collection 1.91 Parity Verified Against `caf-create-family-20261121`
 
@@ -83,11 +96,12 @@ and `Export/Alice_7.FAM`).
      `house = 0`, `budget = $20,000`, `architecture_value = 0`, `friends = 0`,
      `flags = 0x18` (`FAMILY_FLAG_BIT_3 | FAMILY_FLAG_CAF_CREATED`), 1..=8
      members with at least one adult human Sim, and 16-byte zeroed v9 tail —
-     verified byte-for-byte against `FAMI 7` (60 bytes) and `FAMs 7` (13 bytes).
+     verified byte-for-byte against `FAMI 7` (60 bytes) and length-/field-level
+     against `FAMs 7` (13 bytes, zero-filling the 1-byte native trailing slack).
    - Fresh GUID allocation (`0x4725ff` high/low word structure) avoids `0`,
-     `TEMPLATE_PERSON_GUID`, catalog GUIDs, existing character file OBJDs,
-     `NBRS`, `FAMI`, `made_characters`, `deleted_characters`, and
-     `deleted_at_epoch`.
+     `TEMPLATE_PERSON_GUID`, catalog GUIDs, existing character file OBJDs
+     (both loose `.iff` and `.far` archives), `NBRS`, `FAMI`, `made_characters`,
+     `deleted_characters`, and `deleted_at_epoch`.
    - `delete_bin_family` rejects reserved pool families (`0`, `2000`,
      `3000..=3009`, `4000`, `5000`, `5500`, `6000`) and housed families, removes
      the `FAMI` entry, vacates unshared members' `NBRS` slots, scrubs reciprocal
@@ -98,10 +112,13 @@ and `Export/Alice_7.FAM`).
 4. **`.FAM` Export & Import Helpers:**
    - `export_family_fam` writes Complete Collection `.FAM` archives (`FAMI`,
      `FAMs`, `CTSS #1000`, `EXPi #0`, per-member `uChr`/`CTSS`/`CTSS+2000`/`BMP_`,
-     `NBRS #1`, and optional `FINV #2`) verified through `FamilyFile::parse`.
+     `NBRS #1`, and optional `FINV #2`), rejecting colliding `CTSS` chunk IDs
+     before serialization and verified chunk-for-chunk against `Export/Alice_7.FAM`.
    - `import_family_fam` imports Family Bin `.FAM` archives (including Track 2's
-     `Export/Alice_7.FAM`) into `NeighborhoodStore` with freshly allocated GUIDs,
-     character IFFs, and `NBRS` records.
+     `Export/Alice_7.FAM`) into `NeighborhoodStore` following native
+     `family_import` ID/slot retention, revision-gated `NBRS` field transfer,
+     relationship deduplication/remapping, `architecture_value` preservation,
+     24-bit BMP normalization, and `FINV #2` inventory decoding & remapping.
 
 ## Consequences
 

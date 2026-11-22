@@ -6,7 +6,7 @@ use sims_core::CrtRng;
 use sims_formats::bitmap::bmp;
 use sims_formats::family_file::FamilyFile;
 use sims_formats::iff::{ChunkData, Iff, write as write_iff};
-use sims_formats::neighborhood::{Family, Neighbors};
+use sims_formats::neighborhood::{Family, Inventory, InventoryItem, Neighbors, Relationship};
 use sims_formats::strings::StringTable;
 use sims_sim::characters::Characters;
 use sims_sim::{FAMILY_FLAG_NEW_MOVE_IN, NeighborhoodStore, StoredNeighborhood};
@@ -261,7 +261,52 @@ fn synthetic_commit_delete_tombstone_and_fam_round_trip() {
     assert_eq!(bin.len(), 1);
     assert_eq!(bin[0].0, created.family_id);
 
+    // Seed intra-family relationships, an external relationship, architecture_value,
+    // and non-empty inventory items on family 1 before exporting to .FAM so export,
+    // import remapping, and delete_bin_family scrubbing are all genuinely verified.
+    {
+        let mut seeded = store.load_neighborhood("SyntheticNH").unwrap().unwrap();
+        seeded.families.get_mut(&1).unwrap().architecture_value = 3_450;
+        let id0 = created.members[0].neighbor_id;
+        let id1 = created.members[1].neighbor_id;
+        // Member 0 -> Member 1 (with duplicate row to verify first-row deduplication) + external 99.
+        seeded.neighbors[(id0 - 1) as usize]
+            .as_mut()
+            .unwrap()
+            .relationships = vec![
+            Relationship {
+                target: i32::from(id1),
+                values: vec![75, 50],
+            },
+            Relationship {
+                target: i32::from(id1),
+                values: vec![12, 10],
+            },
+            Relationship {
+                target: 99,
+                values: vec![40, 20],
+            },
+        ];
+        seeded.neighbors[(id1 - 1) as usize]
+            .as_mut()
+            .unwrap()
+            .relationships = vec![Relationship {
+            target: i32::from(id0),
+            values: vec![80, 60],
+        }];
+        seeded.inventories.push(Some(Inventory {
+            neighbor: id0,
+            items: vec![InventoryItem {
+                kind: 2,
+                guid: 0x1234_abcd,
+                count: 3,
+            }],
+        }));
+        store.save_neighborhood("SyntheticNH", &seeded).unwrap();
+    }
+
     // Export to .FAM and re-import as a second household with fresh unique GUIDs.
+    let stored = store.load_neighborhood("SyntheticNH").unwrap().unwrap();
     let chars = store.load_character_files("SyntheticNH").unwrap();
     let fam_bytes = export_family_fam(
         &stored,
@@ -279,11 +324,63 @@ fn synthetic_commit_delete_tombstone_and_fam_round_trip() {
 
     let reimported =
         import_family_fam(&ctx, &store, "SyntheticNH", &fam_bytes, 1, &mut rng).unwrap();
+    // Exported family ID 1 is occupied, so import falls back to lowest free ID (2).
     assert_eq!(reimported.family_id, 2);
     assert_eq!(reimported.family_name, "Alice");
+    assert_eq!(reimported.family.architecture_value, 3_450);
+    assert_eq!(reimported.family.flags, 0);
     assert_eq!(reimported.members.len(), 2);
     for imported_sim in &reimported.members {
         assert!(!created.members.iter().any(|m| m.guid == imported_sim.guid));
+    }
+    // Verify intra-family relationships were remapped & deduplicated, external
+    // target 99 was dropped, and FINV #2 inventory items were transferred to the
+    // remapped neighbor ID!
+    let new_id0 = reimported.members[0].neighbor_id;
+    let new_id1 = reimported.members[1].neighbor_id;
+    assert_eq!(
+        reimported.members[0].neighbor.relationships,
+        vec![Relationship {
+            target: i32::from(new_id1),
+            values: vec![75, 50],
+        }]
+    );
+    assert_eq!(
+        reimported.members[1].neighbor.relationships,
+        vec![Relationship {
+            target: i32::from(new_id0),
+            values: vec![80, 60],
+        }]
+    );
+    let after_reimport = store.load_neighborhood("SyntheticNH").unwrap().unwrap();
+    let transferred_inv = after_reimport
+        .inventories
+        .iter()
+        .flatten()
+        .find(|inv| inv.neighbor == new_id0)
+        .expect("FINV #2 inventory must transfer to remapped neighbor ID");
+    assert_eq!(
+        transferred_inv.items,
+        vec![InventoryItem {
+            kind: 2,
+            guid: 0x1234_abcd,
+            count: 3,
+        }]
+    );
+
+    // Seed a cross-family relationship from family 2 member -> family 1 member 0 so
+    // we verify `delete_bin_family` scrubs reciprocal relationships AND inventories!
+    {
+        let mut with_cross = store.load_neighborhood("SyntheticNH").unwrap().unwrap();
+        with_cross.neighbors[(new_id0 - 1) as usize]
+            .as_mut()
+            .unwrap()
+            .relationships
+            .push(Relationship {
+                target: i32::from(created.members[0].neighbor_id),
+                values: vec![55, 30],
+            });
+        store.save_neighborhood("SyntheticNH", &with_cross).unwrap();
     }
 
     // Deleting a reserved pool family or housed family is rejected cleanly.
@@ -308,7 +405,8 @@ fn synthetic_commit_delete_tombstone_and_fam_round_trip() {
         ));
     }
 
-    // Delete un-housed Family Bin family 1: tombstones GUIDs, vacates NBRS slots, bumps epoch.
+    // Delete un-housed Family Bin family 1: tombstones GUIDs, vacates NBRS slots,
+    // scrubs reciprocal relationships on family 2 and removes family 1's inventory.
     let deleted = delete_bin_family(&store, "SyntheticNH", 1).unwrap();
     assert_eq!(deleted.family_id, 1);
     assert_eq!(deleted.deletion_epoch, 1);
@@ -323,6 +421,80 @@ fn synthetic_commit_delete_tombstone_and_fam_round_trip() {
     for &guid in &deleted.deleted_guids {
         assert!(after_delete.deleted_characters.contains(&guid));
         assert_eq!(after_delete.deleted_at_epoch.get(&guid), Some(&1));
+    }
+    // Surviving family 2 member must have its reciprocal relationship to deleted slot 1 scrubbed.
+    let surviving_rels = &after_delete.neighbors[(new_id0 - 1) as usize]
+        .as_ref()
+        .unwrap()
+        .relationships;
+    assert!(
+        surviving_rels
+            .iter()
+            .all(|r| r.target != i32::from(created.members[0].neighbor_id)),
+        "delete_bin_family must scrub reciprocal relationships pointing to deleted members"
+    );
+    // Deleted family 1's inventory must be removed while surviving family 2's remains intact.
+    assert!(
+        after_delete
+            .inventories
+            .iter()
+            .flatten()
+            .all(|inv| inv.neighbor != created.members[0].neighbor_id)
+    );
+    assert!(
+        after_delete
+            .inventories
+            .iter()
+            .flatten()
+            .any(|inv| inv.neighbor == new_id0)
+    );
+
+    // Re-importing the same `.FAM` now that family ID 1 & slots 1..=2 are free
+    // must retain exported family ID 1 and exported neighbor slots 1 & 2!
+    let restored = import_family_fam(&ctx, &store, "SyntheticNH", &fam_bytes, 1, &mut rng).unwrap();
+    assert_eq!(restored.family_id, 1);
+    assert_eq!(restored.members[0].neighbor_id, 1);
+    assert_eq!(restored.members[1].neighbor_id, 2);
+
+    // Concurrent multi-threaded CAF commits sharing `&NeighborhoodStore` must
+    // serialize cleanly without overwriting filenames or colliding GUIDs.
+    let concurrent_results: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let ctx_ref = &ctx;
+                let store_ref = &store;
+                scope.spawn(move || {
+                    let mut sim = alice_sim_spec(None);
+                    sim.first_name = format!("ThreadSim{i}");
+                    let fam_spec = FamilySpec::new(format!("Concurrent{i}"), "", vec![sim]);
+                    let mut local_rng = CrtRng::from_state(9000 + i as u32);
+                    commit_family_with_context(
+                        ctx_ref,
+                        store_ref,
+                        "SyntheticNH",
+                        &fam_spec,
+                        &mut local_rng,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let final_chars = store.load_character_files("SyntheticNH").unwrap();
+    let mut seen_fams = BTreeSet::new();
+    let mut seen_files = BTreeSet::new();
+    let mut seen_guids = BTreeSet::new();
+    for res in &concurrent_results {
+        assert!(seen_fams.insert(res.family_id));
+        let sim = &res.members[0];
+        assert!(seen_files.insert(sim.file_name.clone()));
+        assert!(seen_guids.insert(sim.guid));
+        assert_eq!(
+            final_chars.get(&sim.file_name).map(Vec::as_slice),
+            Some(sim.iff_bytes.as_slice()),
+            "concurrent CAF commit must not overwrite another household's character IFF"
+        );
     }
 }
 
@@ -640,6 +812,48 @@ fn oracle_cross_check_against_alice_capture() {
         synth_fam.export_info.language,
         oracle_fam.export_info.language
     );
+
+    // Also verify member uChr 464, CTSS 464, CTSS 2464, BMP_ 464, and NBRS #1
+    // against Export/Alice_7.FAM!
+    let synth_m = synth_fam.members.get(&464).unwrap();
+    let oracle_m = oracle_fam.members.get(&464).unwrap();
+    assert_eq!(
+        synth_m
+            .body_strings
+            .entries
+            .iter()
+            .map(|e| &e.text)
+            .collect::<Vec<_>>(),
+        oracle_m
+            .body_strings
+            .entries
+            .iter()
+            .map(|e| &e.text)
+            .collect::<Vec<_>>(),
+        "exported uChr 464 body strings must match Alice_7.FAM"
+    );
+    let synth_ctss_m = StringTable::parse(synth_m.ctss.as_deref().unwrap()).unwrap();
+    let oracle_ctss_m = StringTable::parse(oracle_m.ctss.as_deref().unwrap()).unwrap();
+    assert_eq!(synth_ctss_m.get(0, 1), oracle_ctss_m.get(0, 1));
+    assert_eq!(synth_ctss_m.get(1, 1), oracle_ctss_m.get(1, 1));
+    let synth_loc_ctss = StringTable::parse(synth_m.localized_ctss.as_deref().unwrap()).unwrap();
+    let oracle_loc_ctss = StringTable::parse(oracle_m.localized_ctss.as_deref().unwrap()).unwrap();
+    assert_eq!(synth_loc_ctss.entries.len(), oracle_loc_ctss.entries.len());
+    for lang in 1u8..=20 {
+        assert_eq!(synth_loc_ctss.get(0, lang), oracle_loc_ctss.get(0, lang));
+        assert_eq!(synth_loc_ctss.get(1, lang), oracle_loc_ctss.get(1, lang));
+    }
+    let synth_bmp = bmp(synth_m.portrait.as_deref().unwrap()).unwrap();
+    let oracle_bmp = bmp(oracle_m.portrait.as_deref().unwrap()).unwrap();
+    assert_eq!(synth_bmp, oracle_bmp);
+    assert_eq!(
+        synth_fam.neighbors.entries.len(),
+        oracle_fam.neighbors.entries.len()
+    );
+    assert_eq!(
+        synth_fam.neighbors.entries[463],
+        oracle_fam.neighbors.entries[463]
+    );
 }
 
 /// Full end-to-end gameplay lifecycle test on Complete Collection `UserData`:
@@ -799,6 +1013,40 @@ fn end_to_end_create_family_move_in_500_ticks_save_and_delete_bin_family() {
     for _ in 0..10 {
         goth.step().unwrap();
     }
+
+    // 6. Verify crash/mid-flight safety of Phase 1 tombstone shielding:
+    //    if a character IFF is staged in REDB while its GUID is reserved in
+    //    `deleted_characters` (before Phase 3 publishes FAMI/NBRS), `enter_lot`
+    //    must never register that staged/orphaned character as a stray neighbor.
+    let staged_guid = 0xfeed_beef_u32;
+    let ctx = CafContext::from_install(&root).unwrap();
+    let staged_iff = synthesize_character_iff(
+        &ctx.template_iff,
+        &alice_sim_spec(None),
+        staged_guid,
+        1999,
+        1,
+        ctx.wardrobe.as_ref(),
+    )
+    .unwrap();
+    {
+        let mut reserved = store.load_neighborhood("UserData").unwrap().unwrap();
+        reserved.deleted_characters.insert(staged_guid);
+        store.save_neighborhood("UserData", &reserved).unwrap();
+        store
+            .save_character_file("UserData", "User01999.iff", &staged_iff)
+            .unwrap();
+    }
+    let goth_with_staged =
+        enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+    assert!(
+        goth_with_staged
+            .world()
+            .neighbors
+            .first_of(staged_guid)
+            .is_none(),
+        "tombstone-shielded staged character IFF must never be registered in NBRS on lot load"
+    );
 }
 
 /// Ensures the oracle `.FAM` file (`Export/Alice_7.FAM`) imports cleanly into
