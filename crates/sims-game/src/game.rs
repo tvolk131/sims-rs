@@ -8163,16 +8163,33 @@ impl Game {
                 }
             }
         }
-        const MAX_BOOK_LINES: usize = 10;
+        const MAX_BOOK_LINES: usize = 6;
+        const MAX_LINE_CHARS: usize = 36;
+        let clamp_line = |s: &str| -> String {
+            let mut chars = s.chars();
+            let head: String = chars.by_ref().take(MAX_LINE_CHARS).collect();
+            if chars.next().is_some() {
+                format!("{head}...")
+            } else {
+                head
+            }
+        };
         let body = if entries.is_empty() {
             "—".to_owned()
         } else if entries.len() > MAX_BOOK_LINES {
             let remaining = entries.len() - (MAX_BOOK_LINES - 1);
-            let mut shown = entries[..(MAX_BOOK_LINES - 1)].to_vec();
+            let mut shown: Vec<String> = entries[..(MAX_BOOK_LINES - 1)]
+                .iter()
+                .map(|e| clamp_line(e))
+                .collect();
             shown.push(format!("+{remaining}"));
             shown.join("\n")
         } else {
-            entries.join("\n")
+            entries
+                .iter()
+                .map(|e| clamp_line(e))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
         (title, body)
     }
@@ -8302,6 +8319,31 @@ impl Game {
             SpecialPanelRequest::MagicTownLotPicker { .. } => ShopKind::MagicVendor,
             _ => ShopKind::MagicVendor,
         };
+        let travel_strings =
+            sims_ui::travel::TravelStrings::load(self.hud.install(), US_ENGLISH).ok();
+        let non_empty = |s: Option<&String>| -> Option<String> {
+            s.map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        let title_override = match request {
+            SpecialPanelRequest::DowntownLotPicker => travel_strings
+                .as_ref()
+                .and_then(|ts| non_empty(ts.go_downtown_dialog.first()))
+                .or_else(|| Some("21-30".into())),
+            SpecialPanelRequest::VacationLotPicker { .. } => travel_strings
+                .as_ref()
+                .and_then(|ts| non_empty(ts.go_vacation_dialog.first())),
+            SpecialPanelRequest::OldTownLotPicker { .. } => travel_strings
+                .as_ref()
+                .and_then(|ts| non_empty(ts.visit_neighborhood.first()))
+                .or_else(|| Some("58-68".into())),
+            SpecialPanelRequest::StudioTownLotPicker { .. } => None,
+            SpecialPanelRequest::MagicTownLotPicker { .. } => travel_strings
+                .as_ref()
+                .and_then(|ts| non_empty(ts.visit_magic_town.first())),
+            _ => None,
+        };
 
         let filtered: Vec<SpecialLotEntry> = entries
             .into_iter()
@@ -8352,7 +8394,58 @@ impl Game {
             });
             responses.insert(id, SpecialPanelResponse::Lot(Some(entry.lot_id as i16)));
         }
-        (shop_kind, None, items, responses)
+        (shop_kind, title_override, items, responses)
+    }
+
+    fn format_wardrobe_row_label(suit: &str, row: &str) -> String {
+        if let Some((_, desc)) = row.split_once(',')
+            && let Some((_, tex)) = desc.split_once('=')
+        {
+            let tex = tex.trim();
+            if !tex.is_empty() && !tex.eq_ignore_ascii_case(suit) {
+                return format!("{suit} ({tex})");
+            }
+        }
+        suit.to_owned()
+    }
+
+    fn person_skin_tone(&self, world: &sims_sim::World, person: u16) -> String {
+        let Some(obj) = world.objects.get(&person) else {
+            return "lgt".into();
+        };
+        let normalize = |raw: &str| -> Option<String> {
+            let prefix: String = raw.trim().chars().take(3).collect();
+            if prefix.eq_ignore_ascii_case("lgt")
+                || prefix.eq_ignore_ascii_case("med")
+                || prefix.eq_ignore_ascii_case("drk")
+            {
+                Some(prefix.to_ascii_lowercase())
+            } else {
+                None
+            }
+        };
+        if let Some(outfits) = world.made_outfits.get(&obj.guid)
+            && let Some(raw) = outfits.get(&14)
+            && let Some(tone) = normalize(raw)
+        {
+            return tone;
+        }
+        let catalog = self.assets.catalog();
+        if let Some(entry) = catalog
+            .by_guid
+            .get(&obj.guid)
+            .and_then(|&idx| catalog.objects.get(idx))
+            && let Some(res) = self.assets.index().resources.get(entry.resource)
+            && let Ok(bytes) = res.read()
+            && let Ok(iff) = sims_formats::iff::Iff::parse(bytes)
+            && let Some(chunk) = iff.get(b"STR#", 200)
+            && let Ok(table) = sims_formats::strings::StringTable::parse(iff.data(chunk))
+            && let Some(raw) = table.get(14, US_ENGLISH).or_else(|| table.get(14, 1))
+            && let Some(tone) = normalize(raw)
+        {
+            return tone;
+        }
+        "lgt".into()
     }
 
     fn ensure_ordered_wardrobe(&mut self) -> Option<&sims_content::ImportWardrobe> {
@@ -8383,11 +8476,12 @@ impl Game {
                     ((kind & 1) == 1, age < 18)
                 })
                 .unwrap_or((false, false));
+            let skin = self.person_skin_tone(world, person);
             if let Some(wardrobe) = self.ensure_ordered_wardrobe() {
-                let count = wardrobe.count(false, female, child, "lgt").min(32);
+                let count = wardrobe.count(false, female, child, &skin).min(32);
                 for idx in 0..count {
-                    if let Some((suit, _)) = wardrobe.pick(false, female, child, "lgt", idx) {
-                        entries.push((idx, suit));
+                    if let Some((suit, row)) = wardrobe.pick(false, female, child, &skin, idx) {
+                        entries.push((idx, Self::format_wardrobe_row_label(&suit, &row)));
                     }
                 }
             }
@@ -8453,8 +8547,9 @@ impl Game {
         if let Some(wardrobe) = self.ensure_ordered_wardrobe() {
             let count = wardrobe.count_pet(is_cat).min(64);
             for idx in 0..count {
-                if let Some((suit, _)) = wardrobe.pick_pet(is_cat, idx) {
-                    entries.push((idx, suit));
+                if let Some((suit, row)) = wardrobe.pick_pet(is_cat, idx) {
+                    let label = Self::format_wardrobe_row_label(&suit, &row);
+                    entries.push((idx, label));
                 }
             }
         }
@@ -9065,28 +9160,35 @@ impl Game {
             stats.snapshots_restored += 1;
         }
         stats.drift_events += poll2.drift_events as u32;
-
-        // Bounded retry guard: if a peer's special-panel answer was dropped by
-        // full host ingress while the same dialog ID remains active, reopen the
-        // modal so the client can retry instead of waiting indefinitely.
-        const COOP_SPECIAL_PANEL_RETRY_PUMPS: u32 = 120;
-        if let Some((submitted_id, ref mut pumps)) = self.submitted_coop_special_panel {
-            let still_active = self
-                .lot
-                .coop()
-                .and_then(|c| c.active_special_panel.as_ref().map(|(id, _)| *id))
-                == Some(submitted_id);
-            if still_active {
-                *pumps = pumps.saturating_add(1);
-                if *pumps >= COOP_SPECIAL_PANEL_RETRY_PUMPS {
-                    self.submitted_coop_special_panel = None;
-                    self.sync_special_panel();
-                }
-            } else {
-                self.submitted_coop_special_panel = None;
-            }
-        }
+        self.tick_coop_special_panel_retry();
         Ok(stats)
+    }
+
+    /// Bounded retry guard shared by both headless (`coop_pump`) and live
+    /// (`advance_coop_while`) co-op loops: if a peer's special-panel answer was
+    /// dropped by full host ingress while the same dialog ID remains active,
+    /// reopen the modal so the client can retry instead of waiting forever.
+    fn tick_coop_special_panel_retry(&mut self) -> bool {
+        const COOP_SPECIAL_PANEL_RETRY_PUMPS: u32 = 120;
+        let Some((submitted_id, ref mut pumps)) = self.submitted_coop_special_panel else {
+            return false;
+        };
+        let still_active = self
+            .lot
+            .coop()
+            .and_then(|c| c.active_special_panel.as_ref().map(|(id, _)| *id))
+            == Some(submitted_id);
+        if still_active {
+            *pumps = pumps.saturating_add(1);
+            if *pumps >= COOP_SPECIAL_PANEL_RETRY_PUMPS {
+                self.submitted_coop_special_panel = None;
+                self.sync_special_panel();
+                return true;
+            }
+        } else {
+            self.submitted_coop_special_panel = None;
+        }
+        false
     }
 
     /// Gracefully leaves any active co-op session, detaching `Lot::coop` and
@@ -9277,6 +9379,9 @@ impl Game {
             }
         }
 
+        if self.tick_coop_special_panel_retry() {
+            self.blink_dirty = true;
+        }
         if any_batch || poll.snapshot_restored {
             self.dirty = true;
             self.blink_dirty = true;

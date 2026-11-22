@@ -1168,9 +1168,20 @@ impl NeighborhoodShell {
         self.clock_us / 1_000
     }
 
-    fn update_hover_fade(&mut self, hovered: Option<u16>) {
+    fn update_hover_fade(&mut self, prev_lot: Option<u16>, hovered: Option<u16>) {
         if self.clock_us > 0 {
             let now_ms = self.clock_us / 1_000;
+            // If `prev_lot` was hovered at `clock_us == 0` (rendered settled at
+            // 1.0 without starting a hidden ramp), seed it as settled before
+            // transitioning so moving away fades its roof back in smoothly.
+            if self.hover_fade.hovered().is_none()
+                && let Some(prev) = prev_lot
+                && prev_lot != hovered
+            {
+                let seed_ms =
+                    now_ms.saturating_sub(sims_render::neighborhood::HOVER_FADE_DURATION_MS);
+                self.hover_fade.set_hovered(Some(prev), seed_ms);
+            }
             self.hover_fade.set_hovered(hovered, now_ms);
             self.hover_fade_was_animating = self.hover_fade.is_animating(now_ms);
         } else {
@@ -1782,7 +1793,7 @@ impl NeighborhoodShell {
                     self.hovered_lot_since_us = next_lot.map(|_| self.clock_us);
                     self.hover_card_shown_for = None;
                     self.nbhd_state.hovered_lot = None;
-                    self.update_hover_fade(next_lot);
+                    self.update_hover_fade(prev_lot, next_lot);
                 }
                 chrome_changed || next_lot != prev_lot
             }
@@ -1830,12 +1841,12 @@ impl NeighborhoodShell {
                 self.chrome.clear_pointer();
                 self.magic_family_bin_hovered = false;
                 self.magic_family_bin_pressed = false;
-                self.hovered_lot_id = None;
+                let prev_lot = self.hovered_lot_id.take();
                 self.hovered_lot_since_us = None;
                 self.hover_card_shown_for = None;
                 self.pressed_lot_id = None;
                 self.nbhd_state.hovered_lot = None;
-                self.update_hover_fade(None);
+                self.update_hover_fade(prev_lot, None);
                 had_state
             }
             ActiveScreen::FamilyBin => {
@@ -2022,11 +2033,12 @@ impl NeighborhoodShell {
                     };
                     self.pressed_lot_id = hit;
                     if hit != self.hovered_lot_id {
+                        let prev_lot = self.hovered_lot_id;
                         self.hovered_lot_id = hit;
                         self.hovered_lot_since_us = hit.map(|_| self.clock_us);
                         self.hover_card_shown_for = None;
                         self.nbhd_state.hovered_lot = None;
-                        self.update_hover_fade(hit);
+                        self.update_hover_fade(prev_lot, hit);
                     }
                     return ShellOutcome {
                         redraw: hit.is_some(),
@@ -2048,11 +2060,12 @@ impl NeighborhoodShell {
                         .hit_test_with_state(frame_size, point, self.hovered_lot_id, true);
                 self.pressed_lot_id = hit;
                 if hit != self.hovered_lot_id {
+                    let prev_lot = self.hovered_lot_id;
                     self.hovered_lot_id = hit;
                     self.hovered_lot_since_us = hit.map(|_| self.clock_us);
                     self.hover_card_shown_for = None;
                     self.nbhd_state.hovered_lot = None;
-                    self.update_hover_fade(hit);
+                    self.update_hover_fade(prev_lot, hit);
                 }
                 ShellOutcome {
                     redraw: hit.is_some(),
@@ -5595,9 +5608,10 @@ impl NeighborhoodShell {
     /// and installed `*Desc.iff` / `StreetNames.iff` tables for VM special lot
     /// pickers (`Dialog` kinds `5, 7, 8, 11, 13`).
     fn build_special_lot_catalog(&self) -> Vec<SpecialLotEntry> {
-        let mut lot_ids: BTreeSet<u16> = self.lot_meta.keys().copied().collect();
+        let mut lot_ids: BTreeSet<u16> = BTreeSet::new();
         // Single key-scan over stored houses (no character-file copying), so
-        // only lots that actually exist in the neighborhood store are offered.
+        // only lots that actually exist in the neighborhood store are offered
+        // (never unbacked map metadata entries).
         if let Ok(stored_houses) = self.store.list_houses(&self.neighborhood_id) {
             for house in stored_houses {
                 if let Ok(id) = u16::try_from(house) {
