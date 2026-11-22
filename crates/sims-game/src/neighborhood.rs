@@ -3896,63 +3896,57 @@ impl NeighborhoodShell {
                             .to_owned(),
                     )
                 } else {
-                    let preferred_slot = parse_slot_id(&slot_id);
-                    let preferred_res = preferred_slot
-                        .ok_or_else(|| format!("unknown fallback slot {slot_id:?}"))
-                        .and_then(|slot| self.load_autosave_slot_into_lot(lot_id, slot));
-                    match preferred_res {
-                        Ok(tick) => Ok(tick),
-                        Err(first_err) => {
-                            // Explicitly validate remaining candidates in descending
-                            // `(sim_tick, saved_at_unix_secs, slot)` order so a corrupt
-                            // newest autosave falls back to the true next-newest intact
-                            // slot rather than jumping straight to an older manual save.
-                            let mut candidates: Vec<sims_sim::autosave::SaveMetadata> = self
-                                .store
-                                .autosaves()
-                                .list_saves_metadata(&self.neighborhood_id, lot_id)
-                                .map_err(|e| e.to_string())
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter_map(|entry| match entry {
-                                    sims_sim::autosave::SaveSlotEntry::Intact(meta)
-                                        if Some(meta.slot) != preferred_slot =>
-                                    {
-                                        Some(meta)
-                                    }
-                                    _ => None,
-                                })
-                                .collect();
-                            candidates.sort_by(|a, b| {
-                                let key_a = match a.slot {
-                                    SaveSlot::Manual => (1u8, 0u64),
-                                    SaveSlot::Autosave(seq) => (0u8, seq),
-                                };
-                                let key_b = match b.slot {
-                                    SaveSlot::Manual => (1u8, 0u64),
-                                    SaveSlot::Autosave(seq) => (0u8, seq),
-                                };
-                                b.sim_tick
-                                    .cmp(&a.sim_tick)
-                                    .then_with(|| b.saved_at_unix_secs.cmp(&a.saved_at_unix_secs))
-                                    .then_with(|| key_b.cmp(&key_a))
-                            });
-                            let mut recovered_tick = None;
-                            let mut last_err = first_err;
-                            for meta in candidates {
-                                match self.load_autosave_slot_into_lot(lot_id, meta.slot) {
-                                    Ok(tick) => {
-                                        recovered_tick = Some(tick);
-                                        break;
-                                    }
-                                    Err(err) => {
-                                        last_err = err;
-                                    }
-                                }
+                    // Always consult current REDB metadata first and validate
+                    // candidates in descending `(sim_tick, saved_at_unix_secs, slot)`
+                    // order so a newer save committed after the UI snapshot is
+                    // never bypassed in favor of an older slot.
+                    let mut candidates: Vec<sims_sim::autosave::SaveMetadata> = self
+                        .store
+                        .autosaves()
+                        .list_saves_metadata(&self.neighborhood_id, lot_id)
+                        .map_err(|e| e.to_string())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|entry| match entry {
+                            sims_sim::autosave::SaveSlotEntry::Intact(meta) => Some(meta),
+                            sims_sim::autosave::SaveSlotEntry::Corrupt { .. } => None,
+                        })
+                        .collect();
+                    candidates.sort_by(|a, b| {
+                        let key_a = match a.slot {
+                            SaveSlot::Manual => (1u8, 0u64),
+                            SaveSlot::Autosave(seq) => (0u8, seq),
+                        };
+                        let key_b = match b.slot {
+                            SaveSlot::Manual => (1u8, 0u64),
+                            SaveSlot::Autosave(seq) => (0u8, seq),
+                        };
+                        b.sim_tick
+                            .cmp(&a.sim_tick)
+                            .then_with(|| b.saved_at_unix_secs.cmp(&a.saved_at_unix_secs))
+                            .then_with(|| key_b.cmp(&key_a))
+                    });
+                    let mut ordered_slots: Vec<SaveSlot> =
+                        candidates.into_iter().map(|m| m.slot).collect();
+                    if let Some(hint_slot) = parse_slot_id(&slot_id)
+                        && !ordered_slots.contains(&hint_slot)
+                    {
+                        ordered_slots.push(hint_slot);
+                    }
+                    let mut recovered_tick = None;
+                    let mut last_err = format!("no intact save slots available for lot {lot_id}");
+                    for slot in ordered_slots {
+                        match self.load_autosave_slot_into_lot(lot_id, slot) {
+                            Ok(tick) => {
+                                recovered_tick = Some(tick);
+                                break;
                             }
-                            recovered_tick.ok_or(last_err)
+                            Err(err) => {
+                                last_err = err;
+                            }
                         }
                     }
+                    recovered_tick.ok_or(last_err)
                 };
                 match result {
                     Ok(tick) => {
@@ -6094,6 +6088,10 @@ impl NeighborhoodShell {
                     };
                 for chunk in effective {
                     let eff_flags = parsed.iff.resource_flags(chunk);
+                    // Clear `DELETED` (`4`) when emitting a mapless IFF so an
+                    // `rsmp`-listed live resource is never skipped by the
+                    // physical chunk scanner on reparse.
+                    let write_flags = eff_flags & !sims_formats::iff::DELETED;
                     let data =
                         if &chunk.tag == b"FAMI" && chunk.id == fami_id && (eff_flags >> 8) == 0 {
                             fami_bytes.clone()
@@ -6103,7 +6101,7 @@ impl NeighborhoodShell {
                     chunks.push(ChunkData {
                         tag: chunk.tag,
                         id: chunk.id,
-                        flags: eff_flags,
+                        flags: write_flags,
                         label: chunk.label.clone(),
                         data,
                     });

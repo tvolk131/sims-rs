@@ -8850,7 +8850,7 @@ impl Game {
             ShopKind::DowntownBoutique(WardrobeCategory::Formal) => Some("f"),
             ShopKind::DowntownBoutique(WardrobeCategory::Pajamas) => Some("l"),
             ShopKind::DowntownBoutique(WardrobeCategory::Winterwear) => Some("w"),
-            ShopKind::StudioWardrobe => Some("f"),
+            ShopKind::StudioWardrobe => Some("h"),
             _ => None,
         };
         let Some(prefix) = category_prefix else {
