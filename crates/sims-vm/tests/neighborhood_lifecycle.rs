@@ -996,12 +996,106 @@ fn copied_redb_and_save_neighborhood_writes_invalidate_open_lots() {
     //    so an already-open lot still saves cleanly after reopening the renamed
     //    file.
     let mut open_for_rename =
-        enter_lot(&root, &store_orig, "UserData", 5, &[3], no_frames).unwrap();
+        enter_lot(&root, &store_orig, "UserData", 5, &[3], no_frames.clone()).unwrap();
     drop(store_orig);
     let db_renamed = TempDb::new("copied-orig-renamed");
     std::fs::rename(&db_orig.0, &db_renamed.0).unwrap();
     let store_renamed = NeighborhoodStore::open(&db_renamed.0).unwrap();
     save_and_leave_lot(&root, &store_renamed, "UserData", &mut open_for_rename).unwrap();
+
+    // 6. Submitting `revision = u64::MAX` through `save_neighborhood_checked`
+    //    must NOT saturate revision: opening a lot afterward and committing a
+    //    newer metadata edit must still reject Save & Leave with StaleNeighborhood.
+    let cur = store_renamed
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap();
+    let mut max_attempt = cur.clone();
+    max_attempt.revision = u64::MAX;
+    assert!(
+        store_renamed
+            .save_neighborhood_checked("UserData", cur.instance_id, cur.revision, &max_attempt)
+            .unwrap()
+            .is_ok()
+    );
+    let mut goth_after_max = enter_lot(
+        &root,
+        &store_renamed,
+        "UserData",
+        5,
+        &[3],
+        no_frames.clone(),
+    )
+    .unwrap();
+    let mut newer_meta = store_renamed
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap();
+    newer_meta.data[14] = 999;
+    assert!(
+        store_renamed
+            .save_neighborhood_checked(
+                "UserData",
+                newer_meta.instance_id,
+                newer_meta.revision,
+                &newer_meta,
+            )
+            .unwrap()
+            .is_ok()
+    );
+    assert!(matches!(
+        save_and_leave_lot(&root, &store_renamed, "UserData", &mut goth_after_max),
+        Err(LifecycleError::StaleNeighborhood { .. })
+    ));
+    assert_eq!(
+        store_renamed
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .data[14],
+        999
+    );
+
+    // 7. Deleting a neighborhood and recreating it via `save_neighborhood` with
+    //    a retained pre-delete snapshot must mint a fresh `instance_id` so an
+    //    already-open pre-delete lot fails with NeighborhoodMismatch.
+    let retained_nh = store_renamed
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap();
+    let retained_house5 = store_renamed
+        .load_base_house("UserData", 5)
+        .unwrap()
+        .unwrap();
+    let retained_chars = store_renamed.load_character_files("UserData").unwrap();
+    let mut open_pre_delete =
+        enter_lot(&root, &store_renamed, "UserData", 5, &[3], no_frames).unwrap();
+    assert!(store_renamed.delete_neighborhood("UserData").unwrap());
+    let mut recreated_nh = retained_nh;
+    recreated_nh.data[15] = 2718;
+    store_renamed
+        .save_neighborhood("UserData", &recreated_nh)
+        .unwrap();
+    store_renamed
+        .save_base_house("UserData", 5, &retained_house5)
+        .unwrap();
+    for (name, bytes) in &retained_chars {
+        store_renamed
+            .save_character_file("UserData", name, bytes)
+            .unwrap();
+    }
+    assert!(matches!(
+        save_and_leave_lot(&root, &store_renamed, "UserData", &mut open_pre_delete),
+        Err(LifecycleError::NeighborhoodMismatch { .. })
+    ));
+    assert_eq!(
+        store_renamed
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .data[15],
+        2718
+    );
 }
 
 #[test]

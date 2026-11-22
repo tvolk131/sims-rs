@@ -96,6 +96,11 @@ const NEIGHBORHOOD_META: TableDefinition<&str, &[u8]> = TableDefinition::new("ne
 /// Key inside [`NEIGHBORHOOD_META`] holding the active neighborhood ID as UTF-8.
 const ACTIVE_KEY: &str = "active";
 
+/// Key inside [`NEIGHBORHOOD_META`] holding a monotonic 64-bit counter used so
+/// every created, recreated, re-imported, or rolled-over neighborhood instance
+/// inside this REDB file receives a strictly unique 128-bit `instance_id`.
+const INSTANCE_SEQ_KEY: &str = "instance_seq";
+
 /// Bumped whenever [`StoredNeighborhood`]'s postcard layout changes so an older
 /// record is refused cleanly instead of misread.
 pub const NEIGHBORHOOD_FORMAT: u32 = 2;
@@ -561,10 +566,67 @@ fn bind_store_file_identity(persisted_id: u128, canonical_path: &Path) -> u128 {
     if id == 0 { 1 } else { id }
 }
 
-/// Strictly advances `NEIGHBORHOODS[id].revision` inside an open write
+/// Mints a strictly fresh non-zero 128-bit neighborhood `instance_id` using a
+/// persisted monotonic counter inside [`NEIGHBORHOOD_META`], guaranteeing that
+/// deleting and recreating a neighborhood (even with a retained snapshot across
+/// process restarts) or rolling over `u64::MAX` never reuses an old `instance_id`.
+fn mint_instance_id(
+    txn: &redb::WriteTransaction,
+    store_id: u128,
+    prev: u128,
+    id: &str,
+) -> Result<u128> {
+    let mut meta = txn.open_table(NEIGHBORHOOD_META).map_err(store)?;
+    let seq = meta
+        .get(INSTANCE_SEQ_KEY)
+        .map_err(store)?
+        .and_then(|v| v.value().try_into().ok())
+        .map_or(0u64, u64::from_le_bytes)
+        .wrapping_add(1);
+    meta.insert(INSTANCE_SEQ_KEY, seq.to_le_bytes().as_slice())
+        .map_err(store)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"neighborhood-instance");
+    hasher.update(store_id.to_le_bytes());
+    hasher.update(seq.to_le_bytes());
+    hasher.update(prev.to_le_bytes());
+    hasher.update(id.as_bytes());
+    let digest = hasher.finalize();
+    let bytes: [u8; 16] = digest[..16].try_into().expect("sha256 is 32 bytes");
+    let candidate = u128::from_le_bytes(bytes);
+    let candidate = if candidate == 0 { 1 } else { candidate };
+    if candidate == prev {
+        Ok(candidate.wrapping_add(1).max(1))
+    } else {
+        Ok(candidate)
+    }
+}
+
+/// Strictly advances `(instance_id, revision)` past `(prev_instance_id, prev_revision)`:
+/// - Normally keeps `prev_instance_id` and increments `revision` by 1.
+/// - If `prev_revision == u64::MAX`, rotates to a brand-new `instance_id` and
+///   resets `revision = 0` so stale-write protection can never saturate.
+fn advance_version(
+    txn: &redb::WriteTransaction,
+    store_id: u128,
+    id: &str,
+    prev_instance_id: u128,
+    prev_revision: u64,
+) -> Result<(u128, u64)> {
+    match prev_revision.checked_add(1) {
+        Some(next_rev) => Ok((prev_instance_id, next_rev)),
+        None => Ok((mint_instance_id(txn, store_id, prev_instance_id, id)?, 0)),
+    }
+}
+
+/// Strictly advances `NEIGHBORHOODS[id]`'s version inside an open write
 /// transaction whenever neighborhood `id` already exists, invalidating any
 /// already-open lot session against stale overwrites.
-fn bump_neighborhood_revision(txn: &redb::WriteTransaction, id: &str) -> Result<()> {
+fn bump_neighborhood_revision(
+    txn: &redb::WriteTransaction,
+    store_id: u128,
+    id: &str,
+) -> Result<()> {
     let mut table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
     let existing = table
         .get(id)
@@ -572,7 +634,10 @@ fn bump_neighborhood_revision(txn: &redb::WriteTransaction, id: &str) -> Result<
         .map(|v| StoredNeighborhood::decode(id, v.value()))
         .transpose()?;
     if let Some(mut nh) = existing {
-        nh.revision = nh.revision.saturating_add(1);
+        let (next_instance, next_rev) =
+            advance_version(txn, store_id, id, nh.instance_id, nh.revision)?;
+        nh.instance_id = next_instance;
+        nh.revision = next_rev;
         let encoded = nh.encode();
         table.insert(id, encoded.as_slice()).map_err(store)?;
     }
@@ -702,10 +767,8 @@ impl NeighborhoodStore {
                 .map_err(store)?
                 .and_then(|v| StoredNeighborhood::decode(id, v.value()).ok())
                 .map_or(0, |prev| prev.instance_id);
-            let mut seed = self.store_id.to_le_bytes().to_vec();
-            seed.extend_from_slice(id.as_bytes());
-            seed.extend_from_slice(directory.to_string_lossy().as_bytes());
-            stored.instance_id = fresh_unique_id("neighborhood", prev_instance, &seed);
+            stored.instance_id = mint_instance_id(&txn, self.store_id, prev_instance, id)?;
+            stored.revision = 0;
             let encoded = stored.encode();
             let mut char_table = txn.open_table(NEIGHBORHOOD_CHARACTERS).map_err(store)?;
             let mut house_table = txn.open_table(NEIGHBORHOOD_HOUSES).map_err(store)?;
@@ -938,9 +1001,12 @@ impl NeighborhoodStore {
 
     /// Saves `state` for neighborhood `id`, replacing any previous state.
     ///
-    /// When overwriting an existing neighborhood record, strictly advances the
-    /// committed `revision` past the previously stored revision so any already-
-    /// open lot session cannot silently overwrite the new state on Save & Leave.
+    /// When overwriting an existing neighborhood record, strictly advances its
+    /// committed `(instance_id, revision)` past the previously stored version
+    /// (rotating `instance_id` on `u64::MAX` rollover). When creating or
+    /// recreating a neighborhood that does not currently exist, always mints a
+    /// fresh `instance_id` and starts at `revision = 0` so no session opened
+    /// before deletion can overwrite the recreated neighborhood.
     pub fn save_neighborhood(&self, id: &str, state: &StoredNeighborhood) -> Result<()> {
         let txn = self.db.begin_write().map_err(store)?;
         {
@@ -951,15 +1017,14 @@ impl NeighborhoodStore {
                 .and_then(|v| StoredNeighborhood::decode(id, v.value()).ok());
             let mut committed = state.clone();
             if let Some(prev) = previous {
-                if committed.revision <= prev.revision {
-                    committed.revision = prev.revision.saturating_add(1);
-                }
-                if committed.instance_id == 0 {
-                    committed.instance_id = prev.instance_id;
-                }
-            }
-            if committed.instance_id == 0 {
-                committed.instance_id = fresh_unique_id("neighborhood", 0, id.as_bytes());
+                let (next_instance, next_rev) =
+                    advance_version(&txn, self.store_id, id, prev.instance_id, prev.revision)?;
+                committed.instance_id = next_instance;
+                committed.revision = next_rev;
+            } else {
+                committed.instance_id =
+                    mint_instance_id(&txn, self.store_id, state.instance_id, id)?;
+                committed.revision = 0;
             }
             let encoded = committed.encode();
             table.insert(id, encoded.as_slice()).map_err(store)?;
@@ -969,9 +1034,10 @@ impl NeighborhoodStore {
 
     /// Atomically saves `state` for neighborhood `id` only if the committed
     /// neighborhood's `(instance_id, revision)` still matches
-    /// `(expected_instance_id, expected_revision)`, always preserving
-    /// `instance_id` and strictly advancing `revision` past the committed
-    /// revision so no concurrent or open lot session can silently overwrite it.
+    /// `(expected_instance_id, expected_revision)`, always advancing
+    /// `(instance_id, revision)` strictly past the committed version (rotating
+    /// `instance_id` on `u64::MAX` rollover) so no caller can saturate revision
+    /// or let a concurrent/open lot session silently overwrite the commit.
     pub fn save_neighborhood_checked(
         &self,
         id: &str,
@@ -1001,10 +1067,15 @@ impl NeighborhoodStore {
                 }));
             }
             let mut committed = state.clone();
-            committed.instance_id = current.instance_id;
-            if committed.revision <= current.revision {
-                committed.revision = current.revision.saturating_add(1);
-            }
+            let (next_instance, next_rev) = advance_version(
+                &txn,
+                self.store_id,
+                id,
+                current.instance_id,
+                current.revision,
+            )?;
+            committed.instance_id = next_instance;
+            committed.revision = next_rev;
             let encoded = committed.encode();
             table.insert(id, encoded.as_slice()).map_err(store)?;
         }
@@ -1041,7 +1112,7 @@ impl NeighborhoodStore {
             let mut table = txn.open_table(NEIGHBORHOOD_CHARACTERS).map_err(store)?;
             table.insert((id, filename), bytes).map_err(store)?;
         }
-        bump_neighborhood_revision(&txn, id)?;
+        bump_neighborhood_revision(&txn, self.store_id, id)?;
         txn.commit().map_err(store)
     }
 
@@ -1096,7 +1167,7 @@ impl NeighborhoodStore {
             let mut table = txn.open_table(NEIGHBORHOOD_HOUSES).map_err(store)?;
             table.insert((id, house), bytes).map_err(store)?;
         }
-        bump_neighborhood_revision(&txn, id)?;
+        bump_neighborhood_revision(&txn, self.store_id, id)?;
         txn.commit().map_err(store)
     }
 
@@ -1168,10 +1239,15 @@ impl NeighborhoodStore {
                     }));
                 }
                 let mut next = state.clone();
-                next.instance_id = current.instance_id;
-                if next.revision <= current.revision {
-                    next.revision = current.revision.saturating_add(1);
-                }
+                let (next_instance, next_rev) = advance_version(
+                    &txn,
+                    self.store_id,
+                    id,
+                    current.instance_id,
+                    current.revision,
+                )?;
+                next.instance_id = next_instance;
+                next.revision = next_rev;
                 next
             } else {
                 let previous = nh_table
@@ -1180,15 +1256,14 @@ impl NeighborhoodStore {
                     .and_then(|v| StoredNeighborhood::decode(id, v.value()).ok());
                 let mut next = state.clone();
                 if let Some(prev) = previous {
-                    if next.revision <= prev.revision {
-                        next.revision = prev.revision.saturating_add(1);
-                    }
-                    if next.instance_id == 0 {
-                        next.instance_id = prev.instance_id;
-                    }
-                }
-                if next.instance_id == 0 {
-                    next.instance_id = fresh_unique_id("neighborhood", 0, id.as_bytes());
+                    let (next_instance, next_rev) =
+                        advance_version(&txn, self.store_id, id, prev.instance_id, prev.revision)?;
+                    next.instance_id = next_instance;
+                    next.revision = next_rev;
+                } else {
+                    next.instance_id =
+                        mint_instance_id(&txn, self.store_id, state.instance_id, id)?;
+                    next.revision = 0;
                 }
                 next
             };

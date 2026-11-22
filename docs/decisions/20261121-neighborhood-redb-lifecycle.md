@@ -73,9 +73,11 @@ recursive directory / inline `.far` mounting, Windows-1252 key encoding, and
    snapshot cannot bypass the revision guard, every mutating store writer
    (`save_neighborhood`, `save_neighborhood_checked`,
    `save_lot_and_neighborhood`, `save_lot_and_neighborhood_checked`,
-   `save_base_house`, `save_character_file`) strictly advances `revision` when
-   mutating an existing neighborhood record, and `enter_lot`/`evict`/
-   `bulldoze`/`lot_price` all read from a single MVCC REDB read transaction via
+   `save_base_house`, `save_character_file`) strictly advances `(instance_id,
+   revision)` by `+1` (rotating to a fresh persisted-counter `instance_id` on
+   `u64::MAX` rollover, and always minting a fresh `instance_id` at `revision = 0`
+   on creation or delete+recreate), and `enter_lot`/`evict`/`bulldoze`/
+   `lot_price` all read from a single MVCC REDB read transaction via
    `NeighborhoodStore::load_lot_snapshot`. `move_in` likewise commits via an
    in-transaction `(instance_id, revision)` check.
 2. Flush every live person on the lot into its neighborhood record via

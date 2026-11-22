@@ -177,12 +177,12 @@ fn multi_neighborhood_crud_and_active_switching_round_trip() {
         Some("UserData2")
     );
     store.set_active_neighborhood("UserData").unwrap();
+    let loaded_nh1 = store.load_neighborhood("UserData").unwrap().unwrap();
+    assert_ne!(loaded_nh1.instance_id, 0);
     let mut expected_nh1 = nh1.clone();
+    expected_nh1.instance_id = loaded_nh1.instance_id;
     expected_nh1.revision = 3;
-    assert_eq!(
-        store.load_neighborhood("UserData").unwrap().as_ref(),
-        Some(&expected_nh1)
-    );
+    assert_eq!(loaded_nh1, expected_nh1);
     assert_eq!(
         store.load_saved_lot("UserData", 5).unwrap().as_deref(),
         Some(b"saved-lot-bytes".as_slice())
@@ -675,4 +675,43 @@ fn copied_store_gets_distinct_store_id_and_save_neighborhood_advances_revision()
             .revision,
         after_lot_checked.revision + 2
     );
+
+    // Submitting `revision = u64::MAX` through checked writers advances only by
+    // +1 (cannot fast-forward to saturation), and deleting + recreating via
+    // `save_neighborhood` with a retained snapshot always mints a brand-new
+    // `instance_id` at `revision = 0`.
+    let before_max = reopened_renamed
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap();
+    let mut attempted_max = before_max.clone();
+    attempted_max.revision = u64::MAX;
+    assert!(
+        reopened_renamed
+            .save_neighborhood_checked(
+                "UserData",
+                before_max.instance_id,
+                before_max.revision,
+                &attempted_max,
+            )
+            .unwrap()
+            .is_ok()
+    );
+    let after_max = reopened_renamed
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_max.instance_id, before_max.instance_id);
+    assert_eq!(after_max.revision, before_max.revision + 1);
+
+    assert!(reopened_renamed.delete_neighborhood("UserData").unwrap());
+    reopened_renamed
+        .save_neighborhood("UserData", &after_max)
+        .unwrap();
+    let recreated = reopened_renamed
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap();
+    assert_ne!(recreated.instance_id, after_max.instance_id);
+    assert_eq!(recreated.revision, 0);
 }

@@ -874,6 +874,13 @@ fn remove_person_cleanly(
     }
     for route in world.routing.routes.values_mut() {
         route.contexts.retain(|c| c.target != id);
+        for c in &mut route.contexts {
+            if c.objects[1] == id {
+                c.byte_84 = true;
+                c.objects[1] = 0;
+                c.action = 0;
+            }
+        }
     }
     if let Some(person) = world
         .objects
@@ -899,10 +906,10 @@ fn purge_orphaned_person(
     interpreter: &Interpreter<'_>,
     world: &mut World,
     id: u16,
-) -> Result<(), LifecycleError> {
-    if !world.objects.contains_key(&id) {
-        return Ok(());
-    }
+) -> Result<(Vec<u16>, Vec<u16>), LifecycleError> {
+    let Some(deleted_guid) = world.objects.get(&id).map(|o| o.guid) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
     // Unlink cleanly from the object's tile (ground or upper floor) or
     // container FIRST so any surviving object behind `id` in `slot 0` is
     // promoted into `id`'s tile/container head (`placement::relink` / 0x4329c1).
@@ -956,17 +963,53 @@ fn purge_orphaned_person(
         }
     }
     let id_i16 = id as i16;
-    for obj in world.objects.values_mut() {
+    let mut people_to_reset = Vec::new();
+    let mut objects_to_reset = Vec::new();
+    let deleted_types: BTreeSet<i16> = world
+        .types
+        .iter()
+        .filter_map(|(&ty, &guid)| {
+            if guid == deleted_guid
+                || crate::interpreter::object_definition(interpreter.catalog, world, guid).is_none()
+            {
+                i16::try_from(ty).ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (&other_id, obj) in &mut world.objects {
+        if other_id == id {
+            continue;
+        }
         for slot in &mut obj.slots {
             if slot.object == id_i16 {
                 slot.object = 0;
             }
         }
+        let stack_hits_deleted = obj.stack.iter().any(|frame| {
+            frame.stack_object == id_i16 || deleted_types.contains(&frame.code_owner_type)
+        });
         if let Some(person) = obj.person.as_mut() {
+            let uses_deleted = person.object_uses.iter().any(|used| used.target == id_i16);
+            let active_hits_deleted = person.active.target == id_i16
+                || person.active.icon == id_i16
+                || person.active.caller == id_i16;
+            if uses_deleted || active_hits_deleted || stack_hits_deleted {
+                people_to_reset.push(other_id);
+                person.active = crate::object_uses::no_action();
+            }
             person.object_uses.retain(|used| used.target != id_i16);
-            person
-                .queue
-                .retain(|action| action.target != id_i16 && action.caller != id_i16);
+            person.queue.retain(|action| {
+                action.target != id_i16 && action.icon != id_i16 && action.caller != id_i16
+            });
+            if person.last.target == id_i16 || person.last.caller == id_i16 {
+                person.last = crate::object_uses::no_action();
+            } else if person.last.icon == id_i16 {
+                person.last.icon = 0;
+            }
+        } else if stack_hits_deleted {
+            objects_to_reset.push(other_id);
         }
     }
     world.objects.remove(&id);
@@ -988,6 +1031,13 @@ fn purge_orphaned_person(
     world.routing.routes.remove(&id);
     for route in world.routing.routes.values_mut() {
         route.contexts.retain(|c| c.target != id);
+        for c in &mut route.contexts {
+            if c.objects[1] == id {
+                c.byte_84 = true;
+                c.objects[1] = 0;
+                c.action = 0;
+            }
+        }
     }
     world.routing.slot_flags.retain(|&(obj, _), _| obj != id);
     world.routing.slots.retain(|&(obj, _), _| obj != id);
@@ -1014,7 +1064,7 @@ fn purge_orphaned_person(
     world.repair_grid().map_err(|e| {
         LifecycleError::Lot(format!("repairing grid after purging person {id}: {e}"))
     })?;
-    Ok(())
+    Ok((people_to_reset, objects_to_reset))
 }
 
 /// Computes the purchase price of `house` in `neighborhood_id` (`0x427f78`):
@@ -1499,8 +1549,12 @@ fn boot_from_saved_lot(
                 })
             })
             .collect();
+        let mut people_to_reset = BTreeSet::new();
+        let mut objects_to_reset = BTreeSet::new();
         for person_id in orphaned_people {
-            purge_orphaned_person(&interpreter, &mut world, person_id)?;
+            let (p_reset, o_reset) = purge_orphaned_person(&interpreter, &mut world, person_id)?;
+            people_to_reset.extend(p_reset);
+            objects_to_reset.extend(o_reset);
         }
 
         // Re-attach every live person's persistent fields from the latest NBRS
@@ -1515,6 +1569,36 @@ fn boot_from_saved_lot(
                     .attach_neighbor(&mut world, person_id)
                     .map_err(|e| {
                         LifecycleError::Lot(format!("attaching person {person_id}: {e}"))
+                    })?;
+            }
+        }
+
+        // Reset any surviving person or object whose active action or BHAV
+        // stack referenced a purged visitor or deleted character definition so
+        // its next tick resumes cleanly on its own Main tree.
+        for person_id in people_to_reset {
+            if world
+                .objects
+                .get(&person_id)
+                .is_some_and(|o| o.person.is_some())
+            {
+                interpreter
+                    .reset_person(&mut world, person_id, &program.people)
+                    .map_err(|e| {
+                        LifecycleError::Lot(format!(
+                            "resetting person {person_id} after orphaned visitor purge: {e}"
+                        ))
+                    })?;
+            }
+        }
+        for object_id in objects_to_reset {
+            if world.objects.contains_key(&object_id) {
+                interpreter
+                    .reset(&mut world, object_id, false)
+                    .map_err(|e| {
+                        LifecycleError::Lot(format!(
+                            "resetting object {object_id} after orphaned visitor purge: {e}"
+                        ))
                     })?;
             }
         }
@@ -2079,11 +2163,17 @@ fn save_and_leave_lot_inner(
             });
         }
     }
+    let (committed_instance, committed_revision) = match origin.revision.checked_add(1) {
+        Some(next_rev) => (origin.instance_id, next_rev),
+        None => store
+            .load_neighborhood(neighborhood_id)?
+            .map_or((stored.instance_id, 0), |nh| (nh.instance_id, nh.revision)),
+    };
     lot.neighborhood_origin = Some(NeighborhoodOrigin {
         store_id: store.store_id(),
         neighborhood_id: neighborhood_id.to_owned(),
-        instance_id: stored.instance_id,
-        revision: stored.revision,
+        instance_id: committed_instance,
+        revision: committed_revision,
     });
 
     Ok(SaveReport {
@@ -2095,7 +2185,7 @@ fn save_and_leave_lot_inner(
         lot_total_value: total_value,
         objects_value,
         architecture_value,
-        revision: stored.revision,
+        revision: committed_revision,
     })
 }
 
@@ -3107,6 +3197,28 @@ mod tests {
             .insert(visitor_upstairs_id, visitor_upstairs);
         house7.world.order.push(visitor_upstairs_id);
         house7.world.people.push(visitor_upstairs_id);
+
+        // 3. Stage the resident `template_id` actively executing BHAV 4096
+        //    owned by `next_type` (`0x7757D9EE`) targeting `visitor_ground_id`
+        //    so re-entry must reset the resident's action & frame cleanly.
+        {
+            let resident = house7.world.objects.get_mut(&template_id).unwrap();
+            resident.stack.push(sims_formats::saved_objects::Frame {
+                stack_object: visitor_ground_id as i16,
+                tree: 4096,
+                node: 0,
+                parameters: Vec::new(),
+                locals: Vec::new(),
+                primitive_state: 0,
+                code_owner_type: next_type as i16,
+            });
+            if let Some(person) = resident.person.as_mut() {
+                person.active.target = visitor_ground_id as i16;
+                person.active.icon = visitor_ground_id as i16;
+                person.active.action = 4096;
+            }
+            house7.world.frame_storage.remove(&template_id);
+        }
         save_and_leave_lot(&root, &store, "UserData", &mut house7).unwrap();
 
         // Bulldoze House 5: deletes `0x7757D9EE` from NBRS and its loose `.iff`.
