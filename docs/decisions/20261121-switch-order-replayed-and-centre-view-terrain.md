@@ -103,5 +103,6 @@ part averaging.
   centring, consistent with the `-97` opening offset) was not traced or
   changed.
 - Hiding the entire UI (`F10`, `0x53b2eb` expanding the house view back
-  to full height) and tall Buy/Build strips (`height - 150`) are not
-  ported.
+  to full height) is not ported; Buy/Build strips share `0x4f4b43`'s
+  150-pixel container and use the same `height - 100` house viewport as
+  Live mode (`docs/decisions/20261121-room-lamps-parallel-point-and-565-expansion.md`).

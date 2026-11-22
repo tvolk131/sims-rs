@@ -307,11 +307,54 @@ impl Corners {
                 }
             }
         }
+        let mut order: Vec<[i32; 2]> = corners
+            .iter()
+            .filter(|(_, c)| c.record)
+            .map(|(&k, _)| k)
+            .collect();
+        order.sort_by_key(|k| key(corners[k].view));
+        // 2. Cut walls at each record: into the cut set, or marked.
+        let mut sets: BTreeMap<[i32; 2], (u8, u8)> = BTreeMap::new();
+        for k in &order {
+            let c = &corners[k];
+            let bits = |i: usize| {
+                let d = walls[i].other(c.view);
+                bit([d[0] - c.view[0], d[1] - c.view[1]])
+            };
+            let mut standing = c.slots.iter().flatten().fold(0, |m, &i| m | bits(i));
+            let mut cut = 0;
+            let active = c.slots.map(|s| s.map(|i| flags[i] & 1 != 0));
+            for (s, wall) in c.slots.iter().enumerate() {
+                let Some(i) = *wall else { continue };
+                if active[s] != Some(true) {
+                    continue;
+                }
+                let alone = (0..4).all(|o| {
+                    o == s
+                        || match (c.slots[o], active[o]) {
+                            (Some(j), Some(false)) => !solid(walls[j].style),
+                            _ => true,
+                        }
+                });
+                let b = bits(i);
+                if alone {
+                    if standing & b != 0 {
+                        cut |= b;
+                        standing &= !b;
+                    }
+                } else if flags[i] & 6 == 0 {
+                    flags[i] |= if s == 0 || s == 3 { 2 } else { 4 };
+                }
+            }
+            sets.insert(*k, (standing, cut));
+        }
         // Where a run passes straight through, the run's own drawing lays
         // the trim and, at a cut doorway or fence join along X or Y, the
-        // wall end cap (0x53de05 to 0x53e77c). Each run is processed
-        // independently so a crossing diagonal never drops a straight run's
-        // cap or cut trim.
+        // wall end cap (0x53de05 to 0x53e77c). Runs after step 2 so mid-run
+        // trims see both run-transition marks (0x54059a) and corner-record
+        // marks (0x53ca67), matching draw time in the original. Each run is
+        // processed independently so a crossing diagonal never drops a
+        // straight run's cap or cut trim.
         let run_end = |start: usize| -> usize {
             let mut last = start;
             let dir = [
@@ -337,7 +380,7 @@ impl Corners {
             }
             last
         };
-        let straight_corners: Vec<_> = at
+        let run_corners: Vec<_> = at
             .iter()
             .filter(|(corner, _)| !corners[*corner].record)
             .map(|(&corner, (list, _))| {
@@ -346,35 +389,27 @@ impl Corners {
                     .iter()
                     .filter_map(|&prev| {
                         let (line, [_, hi]) = walls[prev].run();
-                        if !matches!(line, Line::X | Line::Y) || hi != view {
+                        if hi != view {
                             return None;
                         }
                         let curr = list.iter().copied().find(|&m| {
                             let (l, [lo, _]) = walls[m].run();
                             m != prev && l == line && lo == view
                         })?;
-                        Some((line, prev, curr, run_end(curr)))
+                        let light_wall = matches!(line, Line::X | Line::Y).then(|| run_end(curr));
+                        Some((line, prev, curr, light_wall))
                     })
                     .collect();
                 (corner, pairs)
             })
             .collect();
-        for (corner, pairs) in straight_corners {
+        for (corner, pairs) in run_corners {
             let list = &at[&corner].0;
             let c = corners.get_mut(&corner).unwrap();
             let mut handled = Vec::new();
             for (line, prev, curr, light_wall) in pairs {
                 handled.push(prev);
                 handled.push(curr);
-                let (prev_bit, curr_bit, prev_mark, curr_mark) = match line {
-                    Line::X => (2u8, 8u8, 4u8, 2u8),
-                    Line::Y => (1u8, 4u8, 2u8, 4u8),
-                    _ => unreachable!(),
-                };
-                // Straight-run segments own their straight slots even when a
-                // diagonal crosses the same corner.
-                c.slots[slot(prev_bit).unwrap()] = Some(prev);
-                c.slots[slot(curr_bit).unwrap()] = Some(curr);
                 let (pw, cw) = (&walls[prev], &walls[curr]);
                 let (pf, cf) = (flags[prev], flags[curr]);
                 // 0x53de05..0x53de4e: cut state follows `curr` if solid, else
@@ -387,6 +422,69 @@ impl Corners {
                     false
                 };
                 let (prev_not_fence, curr_not_fence) = (!is_fence(pw.style), !is_fence(cw.style));
+                match line {
+                    Line::Rising => {
+                        // 0x53df39..0x53df5c: rising diagonal mid-run trim
+                        // starts at 0x50, drops 0x40 when `curr` is marked or
+                        // a fence, and drops 0x10 when `prev` is a fence.
+                        // `0x53e184..0x53e1a8` leaves `trim_cut` unchanged for
+                        // run kind 5 (Rising).
+                        let mut mask = if cf & 6 != 0 { 0x10 } else { 0x50 };
+                        if !curr_not_fence {
+                            mask &= !0x40;
+                        }
+                        if !prev_not_fence {
+                            mask &= !0x10;
+                        }
+                        if mask != 0 {
+                            c.run_trims.push((mask, is_cut));
+                            if is_cut {
+                                c.cut |= mask;
+                            } else {
+                                c.standing |= mask;
+                            }
+                        }
+                        continue;
+                    }
+                    Line::Falling => {
+                        // 0x53df61..0x53df90: falling diagonal mid-run trim
+                        // starts at 0xa0, drops 0x80 when `curr` is marked or
+                        // a fence, and drops 0x20 when `prev` is marked or a
+                        // fence. `0x53e184..0x53e1a8` clears `trim_cut` when
+                        // `curr` has mark bit 2 (`run_kind == 6`).
+                        let mut mask = if cf & 6 != 0 { 0x20 } else { 0xa0 };
+                        if pf & 6 != 0 {
+                            mask &= !0x20;
+                        }
+                        if !curr_not_fence {
+                            mask &= !0x80;
+                        }
+                        if !prev_not_fence {
+                            mask &= !0x20;
+                        }
+                        let trim_cut = is_cut && cf & 2 == 0;
+                        if mask != 0 {
+                            c.run_trims.push((mask, trim_cut));
+                            if trim_cut {
+                                c.cut |= mask;
+                            } else {
+                                c.standing |= mask;
+                            }
+                        }
+                        continue;
+                    }
+                    Line::X | Line::Y => {}
+                }
+                let light_wall = light_wall.unwrap();
+                let (prev_bit, curr_bit, prev_mark, curr_mark) = match line {
+                    Line::X => (2u8, 8u8, 4u8, 2u8),
+                    Line::Y => (1u8, 4u8, 2u8, 4u8),
+                    Line::Rising | Line::Falling => unreachable!(),
+                };
+                // Straight-run segments own their straight slots even when a
+                // diagonal crosses the same corner.
+                c.slots[slot(prev_bit).unwrap()] = Some(prev);
+                c.slots[slot(curr_bit).unwrap()] = Some(curr);
                 let mut mask = prev_bit | curr_bit;
                 let mut cap_flag = false;
                 if is_cut {
@@ -480,47 +578,6 @@ impl Corners {
                 c.standing |= other_standing;
                 c.cut |= other_cut;
             }
-        }
-        let mut order: Vec<[i32; 2]> = corners
-            .iter()
-            .filter(|(_, c)| c.record)
-            .map(|(&k, _)| k)
-            .collect();
-        order.sort_by_key(|k| key(corners[k].view));
-        // 2. Cut walls at each record: into the cut set, or marked.
-        let mut sets: BTreeMap<[i32; 2], (u8, u8)> = BTreeMap::new();
-        for k in &order {
-            let c = &corners[k];
-            let bits = |i: usize| {
-                let d = walls[i].other(c.view);
-                bit([d[0] - c.view[0], d[1] - c.view[1]])
-            };
-            let mut standing = c.slots.iter().flatten().fold(0, |m, &i| m | bits(i));
-            let mut cut = 0;
-            let active = c.slots.map(|s| s.map(|i| flags[i] & 1 != 0));
-            for (s, wall) in c.slots.iter().enumerate() {
-                let Some(i) = *wall else { continue };
-                if active[s] != Some(true) {
-                    continue;
-                }
-                let alone = (0..4).all(|o| {
-                    o == s
-                        || match (c.slots[o], active[o]) {
-                            (Some(j), Some(false)) => !solid(walls[j].style),
-                            _ => true,
-                        }
-                });
-                let b = bits(i);
-                if alone {
-                    if standing & b != 0 {
-                        cut |= b;
-                        standing &= !b;
-                    }
-                } else if flags[i] & 6 == 0 {
-                    flags[i] |= if s == 0 || s == 3 { 2 } else { 4 };
-                }
-            }
-            sets.insert(*k, (standing, cut));
         }
         // 3. The masks, the trim and the cap.
         for k in &order {
@@ -796,6 +853,66 @@ mod tests {
         assert_eq!(cross.run_caps[0].2, 1);
         assert_eq!(cross.run_caps[0].3, 3);
         assert_eq!(c.corners[&[7, 5]].run_caps[0].3, 3);
+    }
+
+    #[test]
+    fn diagonal_mid_run_trims_follow_binary_masks_at_cut_and_standing_joins() {
+        // Rising diagonal (House02 (26,23)-(27,24)-(28,25)): cut (marked)
+        // followed by standing keeps 0x50 standing trim at the mid-run join
+        // (0x53df39..0x53df5c: only `curr` marked drops 0x40).
+        let rising_cut_to_standing = Corners::new(vec![
+            styled_wall([26, 23], [27, 24], 22, true),
+            styled_wall([27, 24], [28, 25], 1, false),
+        ]);
+        let mid = &rising_cut_to_standing.corners[&[27, 24]];
+        assert!(!mid.record);
+        assert_eq!(rising_cut_to_standing.flags[0], 1 | 2 | 8);
+        assert_eq!(rising_cut_to_standing.flags[1], 0);
+        assert_eq!((mid.standing, mid.cut), (0x50, 0));
+        assert_eq!(mid.run_trims, vec![(0x50, false)]);
+
+        // Rising diagonal: standing followed by cut (marked `curr`) drops 0x40
+        // leaving 0x10 and keeps `trim_cut = true` (0x53e184..0x53e1a8 leaves
+        // run kind 5 unchanged).
+        let rising_standing_to_cut = Corners::new(vec![
+            styled_wall([26, 23], [27, 24], 1, false),
+            styled_wall([27, 24], [28, 25], 1, true),
+        ]);
+        let mid = &rising_standing_to_cut.corners[&[27, 24]];
+        assert_eq!(rising_standing_to_cut.flags[1], 1 | 4);
+        assert_eq!((mid.standing, mid.cut), (0, 0x10));
+        assert_eq!(mid.run_trims, vec![(0x10, true)]);
+
+        // Falling diagonal: cut (marked `prev`) followed by standing drops 0x20
+        // leaving 0x80 at standing height (0x53df61..0x53df90).
+        let falling_cut_to_standing = Corners::new(vec![
+            styled_wall([10, 12], [11, 11], 1, true),
+            styled_wall([11, 11], [12, 10], 1, false),
+        ]);
+        let mid = &falling_cut_to_standing.corners[&[11, 11]];
+        assert!(!mid.record);
+        assert_eq!(falling_cut_to_standing.flags[0], 1 | 4);
+        assert_eq!((mid.standing, mid.cut), (0x80, 0));
+        assert_eq!(mid.run_trims, vec![(0x80, false)]);
+
+        // Falling diagonal: standing followed by cut (marked `curr` with bit 2)
+        // drops 0x80 leaving 0x20 and clears `trim_cut` to standing (0x53e19a).
+        let falling_standing_to_cut = Corners::new(vec![
+            styled_wall([10, 12], [11, 11], 1, false),
+            styled_wall([11, 11], [12, 10], 1, true),
+        ]);
+        let mid = &falling_standing_to_cut.corners[&[11, 11]];
+        assert_eq!(falling_standing_to_cut.flags[1], 1 | 2);
+        assert_eq!((mid.standing, mid.cut), (0x20, 0));
+        assert_eq!(mid.run_trims, vec![(0x20, false)]);
+
+        // Fence meeting a standing rising diagonal drops only the fence's bit.
+        let rising_fence = Corners::new(vec![
+            styled_wall([26, 23], [27, 24], 12, false),
+            styled_wall([27, 24], [28, 25], 1, false),
+        ]);
+        let mid = &rising_fence.corners[&[27, 24]];
+        assert_eq!((mid.standing, mid.cut), (0x40, 0));
     }
 
     #[test]
