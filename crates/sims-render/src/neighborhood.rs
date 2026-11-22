@@ -613,8 +613,15 @@ pub struct RenderOptions {
     pub highlighted_lots: BTreeSet<u16>,
     /// Outline RGB for highlighted lots (defaults to [`DEFAULT_HIGHLIGHT_RGB`]).
     pub highlight_rgb: [u8; 3],
-    /// Optional water animation frame index (`0..wave_count`). `None` renders
-    /// the static backdrop without a wave overlay.
+    /// Optional water animation playback step. `None` renders the static
+    /// backdrop without a wave overlay. Native playback cycles:
+    /// - [`NeighborhoodKind::Classic`]: 4-step cycle (`0` = backdrop only,
+    ///   `1..=3` = wave slots `0..=2`, `0x55f8fe..0x55f92f`).
+    /// - [`NeighborhoodKind::Unleashed`]: 6-step cycle (`0..6`), retaining the
+    ///   previous loaded wave when a custom slot is absent (`0x557e87`).
+    /// - [`NeighborhoodKind::Downtown`] & [`NeighborhoodKind::Vacation`]:
+    ///   10-step ping-pong (`0,1,2,3,4,4,3,2,1,0`, `0x54caf5`, `0x56baa5`).
+    /// - [`NeighborhoodKind::MagicTown`]: 6-step cycle (`0..6`, `0x542553`).
     pub water_frame: Option<usize>,
     /// Active community amenity filter (`0x55d5ac..0x55d735`). On Unleashed,
     /// community lots receive the native blue highlight (`0x54f520`) and
@@ -970,19 +977,29 @@ impl NeighborhoodMap {
 
     /// Resolves the active water wave surface for `frame_idx`, matching each
     /// neighborhood's native wave playback logic:
+    /// - **Classic (`0x55f8fe..0x55f92f`)**: 4-step cycle where step `0` skips
+    ///   the wave blit (backdrop only) and steps `1..=3` draw wave slots `0..=2`.
     /// - **Downtown (`0x54caf5`) & Vacation (`0x56baa5`)**: 10-step ping-pong
     ///   over slots `0..=4` (`0,1,2,3,4,4,3,2,1,0`); slot `5` is never selected.
     /// - **Unleashed (`0x557066`, `0x557e87`)**: cycles through slots `0..len`
     ///   and skips widget updates when a slot is missing, keeping the most
     ///   recently loaded wave visible.
-    /// - **Classic (`0x55f91a..0x55f92f`) & Magic Town (`0x554ff6`)**: direct
-    ///   modulo indexing over `self.waves`, drawing nothing if the slot is empty.
+    /// - **Magic Town (`0x542553`, `0x554ff6`)**: direct modulo indexing over
+    ///   `self.waves`, drawing nothing if the slot is empty.
     fn wave_for_frame(&self, frame_idx: usize) -> Option<&Surface565> {
         let len = self.waves.len();
         if len == 0 {
             return None;
         }
         match self.kind {
+            NeighborhoodKind::Classic => {
+                let step = frame_idx % 4;
+                if step == 0 {
+                    None
+                } else {
+                    self.waves.get(step - 1).and_then(Option::as_ref)
+                }
+            }
             NeighborhoodKind::Downtown | NeighborhoodKind::Vacation => {
                 let step = frame_idx % 10;
                 let slot = if step < 5 { step } else { 9 - step };
@@ -2862,8 +2879,6 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
     let mut mcu_cols = 0usize;
     let mut mcu_rows = 0usize;
     let mut restart_interval = 0usize;
-    let mut adobe_transform: Option<u8> = None;
-
     while pos + 1 < data.len() {
         while pos < data.len() && data[pos] != 0xff {
             pos += 1;
@@ -2961,12 +2976,6 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
                     return None;
                 }
                 restart_interval = usize::from(u16::from_be_bytes([seg[0], seg[1]]));
-            }
-            0xee => {
-                // Adobe APP14
-                if seg.len() >= 12 && &seg[0..5] == b"Adobe" {
-                    adobe_transform = Some(seg[11]);
-                }
             }
             0xc0..=0xc2 => {
                 // SOF0 / SOF1 / SOF2
@@ -3302,10 +3311,6 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
         planes.push((pw, ph, plane));
     }
 
-    let is_rgb = comps.len() == 3
-        && (adobe_transform == Some(0)
-            || (comps[0].id == b'R' && comps[1].id == b'G' && comps[2].id == b'B'));
-
     let mut pixels = vec![0u16; width * height];
     for y in 0..height {
         for x in 0..width {
@@ -3320,29 +3325,13 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
                     let v = sample(0) as u8;
                     [v, v, v]
                 }
-                3 => {
-                    let c0 = sample(0);
-                    let c1 = sample(1);
-                    let c2 = sample(2);
-                    if is_rgb {
-                        [c0 as u8, c1 as u8, c2 as u8]
-                    } else {
-                        let cb = c1 - 128;
-                        let cr = c2 - 128;
-                        let r = (c0 + ((91_881 * cr + 32_768) >> 16)).clamp(0, 255) as u8;
-                        let g = (c0 + ((-22_554 * cb - 46_802 * cr + 32_768) >> 16)).clamp(0, 255)
-                            as u8;
-                        let b = (c0 + ((116_130 * cb + 32_768) >> 16)).clamp(0, 255) as u8;
-                        [r, g, b]
-                    }
-                }
-                4 => {
+                3 | 4 => {
                     // Shipped `gimex.dll` (`0x600185b5..0x600185dc`) calls
                     // `ijl10.dll` (`ijlInit` sets `JPGColor = IJL_YCBCR (3)`,
                     // `DIBColor = IJL_BGR (2)`, `DIBChannels = 3`) with
                     // `cconversion_reqd = 1` without overriding `JPGColor`, so
-                    // 4-component CMYK and YCCK JPEGs are converted from the
-                    // first three channels as YCbCr -> RGB and channel 4 is dropped.
+                    // all 3-component (including direct-RGB) and 4-component
+                    // (CMYK / YCCK) JPEGs convert channels 0..3 as YCbCr -> RGB.
                     let c0 = sample(0);
                     let cb = sample(1) - 128;
                     let cr = sample(2) - 128;
@@ -3353,6 +3342,15 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
                     [r, g, b]
                 }
                 _ => return None,
+            };
+            // Match shipped `gimex.dll` (`0x6001860b..0x600186aa`), whose
+            // in-place right-to-left BGR->BGRA expansion (`dst = 4*x`,
+            // `src = 3*x`) overwrites `src[1..3]` at `x == 1` (`[b, b, b]`)
+            // and `src[2]` at `x == 2` (`[b, g, b]`).
+            let rgb = match x {
+                1 => [rgb[2], rgb[2], rgb[2]],
+                2 => [rgb[2], rgb[1], rgb[2]],
+                _ => rgb,
             };
             pixels[y * width + x] = pack_565(rgb);
         }
@@ -4583,9 +4581,17 @@ mod tests {
             pixels: vec![left_c, right_c],
         })];
         classic_small.opaque_overlays = true;
-        let classic_1024 = classic_small.render(&RenderOptions {
+        // Classic wraps at 4 (`0x55f8fe..0x55f92f`): step 0 skips the wave blit
+        // (backdrop only), while steps 1..=3 draw wave slots 0..=2.
+        let classic_step0 = classic_small.render(&RenderOptions {
             viewport: [1024, 768],
             water_frame: Some(0),
+            ..RenderOptions::default()
+        });
+        assert_eq!(classic_step0.color[200 * 1024 + 300], widen_565(bg_c));
+        let classic_1024 = classic_small.render(&RenderOptions {
+            viewport: [1024, 768],
+            water_frame: Some(1),
             ..RenderOptions::default()
         });
         assert_eq!(classic_1024.color[200 * 1024 + 850], widen_565(frame_c));
@@ -4610,7 +4616,7 @@ mod tests {
         classic_wide.opaque_overlays = true;
         let classic_800 = classic_wide.render(&RenderOptions {
             viewport: [800, 600],
-            water_frame: Some(0),
+            water_frame: Some(1),
             ..RenderOptions::default()
         });
         assert!(
@@ -4979,12 +4985,49 @@ mod tests {
         ];
         let red_decoded = decode_jpeg_to_surface565(red_16x16_jpeg).expect("decode 16×16 red JPEG");
         assert_eq!((red_decoded.width, red_decoded.height), (16, 16));
-        assert!(
-            red_decoded.pixels.iter().all(|&p| {
-                let [r, g, b] = widen_565(p);
-                r >= 240 && g <= 8 && b <= 8
-            }),
-            "expected solid red pixels"
-        );
+        // Gimex's in-place BGR->BGRA expansion (`0x6001860b..0x600186aa`)
+        // overwrites G & R with B at column 1 and R with B at column 2, so a
+        // solid-red JPEG decodes columns 1 and 2 to black while columns 0 and
+        // 3..16 stay red.
+        for y in 0..16 {
+            for x in 0..16 {
+                let [r, g, b] = widen_565(red_decoded.pixels[y * 16 + x]);
+                if x == 1 || x == 2 {
+                    assert!(
+                        r <= 8 && g <= 8 && b <= 8,
+                        "expected Gimex column-{x} overwrite to black, got [{r}, {g}, {b}]"
+                    );
+                } else {
+                    assert!(
+                        r >= 240 && g <= 8 && b <= 8,
+                        "expected solid red at ({x}, {y}), got [{r}, {g}, {b}]"
+                    );
+                }
+            }
+        }
+
+        // Direct-RGB 3-component JPEG (component IDs 'R','G','B' + Adobe APP14
+        // transform=0) still runs through `ijl10.dll`'s default YCbCr->RGB
+        // conversion (`JPGColor = IJL_YCBCR`), so (255, 0, 0) decodes to 0x4fe3.
+        let direct_rgb_1x1_jpeg: &[u8] = &[
+            0xff, 0xd8, // SOI
+            0xff, 0xee, 0x00, 0x0e, b'A', b'd', b'o', b'b', b'e', 0x00, 0x64, 0x00, 0x00, 0x00,
+            0x00, 0x00, // Adobe APP14 transform=0 (RGB)
+            0xff, 0xdb, 0x00, 0x43, 0x00, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            // SOF0: 8-bit, 1×1, 3 components ('R', 'G', 'B')
+            0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x01, 0x00, 0x01, 0x03, b'R', 0x11, 0x00, b'G',
+            0x11, 0x00, b'B', 0x11, 0x00, // DHT DC 0: 0 -> size 10; DHT AC 0: 0 -> EOB
+            0xff, 0xc4, 0x00, 0x14, 0x00, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a,
+            0xff, 0xc4, 0x00, 0x14, 0x10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00,
+            // SOS: 3 components ('R', 'G', 'B')
+            0xff, 0xda, 0x00, 0x0c, 0x03, b'R', 0x00, b'G', 0x00, b'B', 0x00, 0x00, 0x3f, 0x00,
+            // 3 blocks: (+1016 => 255), (-1024 => 0), (-1024 => 0) = 36 bits + 4 pad bits
+            0x7f, 0x80, 0x00, 0x00, 0x0f, 0xff, 0xd9,
+        ];
+        let direct_rgb_decoded =
+            decode_jpeg_to_surface565(direct_rgb_1x1_jpeg).expect("decode direct-RGB JPEG");
+        assert_eq!(direct_rgb_decoded.pixels[0], 0x4fe3);
     }
 }
