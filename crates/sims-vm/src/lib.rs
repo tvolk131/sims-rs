@@ -73,6 +73,7 @@ mod routing;
 mod selection;
 pub mod sounds;
 mod tick;
+pub mod travel;
 mod visits;
 
 pub use animator::snap_to_path;
