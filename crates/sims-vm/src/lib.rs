@@ -77,13 +77,22 @@ mod visits;
 
 pub use animator::snap_to_path;
 pub use build::{
-    ARCHITECTURE_BUDGET, BuildHistory, BuildPrices, FloorDragMode, FloorPlan, SPLIT_FLOOR_ID,
-    WALL_ASCENDING, WALL_CURSOR_GUID, WALL_DESCENDING, WALL_EAST, WALL_NORTH, WALL_SOUTH,
-    WALL_WEST, WallCursor, WallDragMode, WallFace, WallPlan, WallSegment, WallStyle,
-    WallpaperDragMode, WallpaperPlan, build_refund, is_buildable_tile, plan_floor_edit,
-    plan_wall_drag, plan_wallpaper_edit, preview_floor_on_world, preview_wall_on_world,
-    preview_wallpaper_on_world, room_wallpaper_faces, snap_wall_corner, wall_cursor_fine,
-    wall_line_segments, wall_room_box_segments, wallpaper_cursor_facing, wallpaper_cursor_fine,
+    ARCHITECTURE_BUDGET, BuildHistory, BuildPrices, DEFAULT_GRASS_PRICE, DEFAULT_POOL_PRICE,
+    DEFAULT_ROOF_PATTERN, DEFAULT_TERRAIN_PRICE, DEFAULT_WATER_PRICE, FLAG_LOCKED, FloorDragMode,
+    FloorPlan, GRASS_ARRAY, GRASS_RESTORED_VALUE, MAX_TERRAIN_SLOPE, PoolMode, PoolPlan,
+    ROOF_META_ARRAY, RoofPitch, RoofPlan, RoofState, SPLIT_FLOOR_ID, TARGET_GRASS_ARRAY,
+    TERRAIN_DIRT_GRASS, TerrainMode, TerrainPlan, ToolPrices, WALL_ASCENDING, WALL_CURSOR_GUID,
+    WALL_DESCENDING, WALL_EAST, WALL_NORTH, WALL_SOUTH, WALL_WEST, WallCursor, WallDragMode,
+    WallFace, WallPlan, WallSegment, WallStyle, WallpaperDragMode, WallpaperPlan, WaterMode,
+    WaterPlan, build_refund, is_buildable_tile, is_grass_tile_editable, is_pool_tile,
+    is_terrain_vertex_editable, is_water_tile, plan_floor_edit, plan_pool_edit, plan_roof_edit,
+    plan_roof_edit_with_base, plan_roof_pattern, plan_roof_pattern_with_base, plan_roof_pitch,
+    plan_roof_pitch_with_base, plan_terrain_edit, plan_wall_drag, plan_wallpaper_edit,
+    plan_water_edit, preview_floor_on_world, preview_pool_on_world, preview_roof_on_world,
+    preview_terrain_on_world, preview_wall_on_world, preview_wallpaper_on_world,
+    preview_water_on_world, roof_state, roof_state_with_base, room_wallpaper_faces,
+    snap_wall_corner, terrain_vertex_height, wall_cursor_fine, wall_line_segments,
+    wall_room_box_segments, wallpaper_cursor_facing, wallpaper_cursor_fine,
 };
 pub use buy::{
     BuyActionKind, BuyCursor, BuyPlacement, BuyPurchase, COMEANDSEE_GUID, TILE_CURSOR_GUID,
