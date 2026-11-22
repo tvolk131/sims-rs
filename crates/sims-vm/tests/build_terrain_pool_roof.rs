@@ -11,9 +11,10 @@ use sims_vm::{
     RoofPitch, RoofState, Stream, TARGET_GRASS_ARRAY, TERRAIN_DIRT_GRASS, TerrainMode, ToolPrices,
     WALL_WEST, WallDragMode, WallStyle, WaterMode, build_refund, is_grass_tile_editable,
     is_pool_tile, is_terrain_vertex_editable, is_water_tile, plan_floor_edit, plan_pool_edit,
-    plan_roof_edit, plan_roof_pattern, plan_roof_pitch, plan_terrain_edit, plan_wall_drag,
-    plan_water_edit, preview_pool_on_world, preview_roof_on_world, preview_terrain_on_world,
-    preview_water_on_world, roof_state, terrain_vertex_height,
+    plan_roof_edit, plan_roof_edit_with_base, plan_roof_pattern, plan_roof_pattern_with_base,
+    plan_roof_pitch, plan_roof_pitch_with_base, plan_terrain_edit, plan_wall_drag, plan_water_edit,
+    preview_pool_on_world, preview_roof_on_world, preview_terrain_on_world, preview_water_on_world,
+    roof_state, roof_state_with_base, terrain_vertex_height,
 };
 use std::path::PathBuf;
 
@@ -779,18 +780,46 @@ fn live_goth_lot_terrain_water_pool_roof_undo_redo_and_save_restore() {
     assert!(is_pool_tile(lot.world(), ax, ay));
     assert!(lot.world().rooms.rooms.values().any(|r| r.pool));
 
-    // 5. Switch roof pattern & pitch ($0)
-    let roof_plan = plan_roof_edit(lot.world(), Some("r4_"), Some(RoofPitch::Steep));
-    assert!(lot.build_commit_roof(&roof_plan).unwrap());
-    assert_eq!(lot.roof_state().pattern, "r4_");
-    assert_eq!(lot.roof_state().pitch, RoofPitch::Steep);
+    // 5. Switch roof pitch preserving House05's HOUS 0 baseline (`r3_`, `Steep`),
+    // then switch pattern to `r1_` (must not be treated as a no-op!).
+    let goth_house = sims_content::House::load(&house_path, lot.catalog()).expect("parse House05");
+    let goth_base = RoofState::from_house_view(goth_house.view.as_ref().expect("House05 HOUS 0"));
+    assert_eq!(
+        goth_base,
+        RoofState {
+            pattern: "r3_".to_owned(),
+            pitch: RoofPitch::Steep,
+        }
+    );
+    assert_eq!(lot.roof_state_with_base(&goth_base), goth_base);
+    let roof_pitch_plan = plan_roof_pitch_with_base(lot.world(), &goth_base, RoofPitch::Shallow);
+    assert!(roof_pitch_plan.valid);
+    assert_eq!(roof_pitch_plan.after.pattern, "r3_");
+    assert!(lot.build_commit_roof(&roof_pitch_plan).unwrap());
+    assert_eq!(
+        lot.roof_state_with_base(&goth_base),
+        RoofState {
+            pattern: "r3_".to_owned(),
+            pitch: RoofPitch::Shallow,
+        }
+    );
+    let roof_pat_plan = plan_roof_pattern_with_base(lot.world(), &goth_base, "r1_");
+    assert!(roof_pat_plan.valid);
+    assert!(lot.build_commit_roof(&roof_pat_plan).unwrap());
+    assert_eq!(
+        lot.roof_state_with_base(&goth_base),
+        RoofState {
+            pattern: "r1_".to_owned(),
+            pitch: RoofPitch::Shallow,
+        }
+    );
 
     // Check exact Architecture budget accounting (+1 + 1 + 60 + 300 = +362).
     assert_eq!(lot.world().budget.funds, initial_funds - 362);
     assert_eq!(arch_spend(lot.world()), initial_arch + 362);
 
-    // Undo all 5 steps in chronological reverse order!
-    for _ in 0..5 {
+    // Undo all 6 steps in chronological reverse order!
+    for _ in 0..6 {
         assert!(lot.undo().unwrap());
     }
     assert!(!lot.can_undo());
@@ -803,17 +832,20 @@ fn live_goth_lot_terrain_water_pool_roof_undo_redo_and_save_restore() {
     );
     assert!(!is_water_tile(lot.world(), ax + 3, ay));
     assert!(!is_pool_tile(lot.world(), ax, ay));
-    assert_eq!(lot.roof_state().pattern, DEFAULT_ROOF_PATTERN);
-    assert_eq!(lot.roof_state().pitch, RoofPitch::Medium);
+    assert!(!lot.world().arrays.contains_key(&ROOF_META_ARRAY));
+    assert_eq!(lot.roof_state_with_base(&goth_base), goth_base);
 
-    // Redo all 5 steps!
-    for _ in 0..5 {
+    // Redo all 6 steps!
+    for _ in 0..6 {
         assert!(lot.redo().unwrap());
     }
     assert!(!lot.can_redo());
     assert_eq!(lot.world().budget.funds, initial_funds - 362);
-    assert_eq!(lot.roof_state().pattern, "r4_");
-    assert_eq!(lot.roof_state().pitch, RoofPitch::Steep);
+    assert_eq!(lot.roof_state_with_base(&goth_base).pattern, "r1_");
+    assert_eq!(
+        lot.roof_state_with_base(&goth_base).pitch,
+        RoofPitch::Shallow
+    );
     assert!(is_pool_tile(lot.world(), ax, ay));
     assert!(is_water_tile(lot.world(), ax + 3, ay));
 
@@ -831,10 +863,10 @@ fn live_goth_lot_terrain_water_pool_roof_undo_redo_and_save_restore() {
     assert!(is_pool_tile(restored.world(), ax, ay));
     assert!(restored.world().rooms.rooms.values().any(|r| r.pool));
     assert_eq!(
-        restored.roof_state(),
+        restored.roof_state_with_base(&goth_base),
         RoofState {
-            pattern: "r4_".to_owned(),
-            pitch: RoofPitch::Steep,
+            pattern: "r1_".to_owned(),
+            pitch: RoofPitch::Shallow,
         }
     );
 
@@ -904,4 +936,442 @@ fn terrain_level_clamps_asymmetric_fixed_neighbors() {
     );
     assert!(h5.abs_diff(h6) <= MAX_TERRAIN_SLOPE);
     assert!(h6.abs_diff(h7) <= MAX_TERRAIN_SLOPE);
+}
+
+#[test]
+fn undo_and_redo_enforce_live_terrain_pond_and_pool_guards() {
+    let (program, catalog) = empty_interpreter();
+    let interp = Interpreter::new(&program, &catalog, Stream::Global);
+    let prices = ToolPrices::default();
+    let mut world = synthetic_world(20, 1000, 3);
+
+    // 1. Pool demolish -> Sim moves onto dry tile -> Undo MUST refuse without changing world/funds!
+    let dig = plan_pool_edit(&world, [6, 6], [7, 7], PoolMode::Dig, &prices);
+    let mut dig_hist = interp.build_commit_pool(&mut world, &dig).unwrap().unwrap();
+    let demo = plan_pool_edit(&world, [6, 6], [7, 7], PoolMode::Demolish, &prices);
+    let mut demo_hist = interp
+        .build_commit_pool(&mut world, &demo)
+        .unwrap()
+        .unwrap();
+    let funds_after_demo = world.budget.funds;
+    place_dummy_object(&mut world, 50, [6, 6], 1);
+    let snapshot_with_sim = world.clone();
+    assert!(
+        !interp.build_undo_entry(&mut world, &mut demo_hist).unwrap(),
+        "undoing pool demolition under an occupant must be refused"
+    );
+    assert_eq!(world.budget.funds, funds_after_demo);
+    assert!(!is_pool_tile(&world, 6, 6));
+    assert_eq!(world.arrays[&9].data, snapshot_with_sim.arrays[&9].data);
+
+    // Removing the occupant allows Undo to succeed.
+    world.objects.remove(&50);
+    assert!(interp.build_undo_entry(&mut world, &mut demo_hist).unwrap());
+    assert!(is_pool_tile(&world, 6, 6));
+
+    // Undo pool dig, then place a floor / lock / object -> Redo pool dig MUST refuse!
+    assert!(interp.build_undo_entry(&mut world, &mut dig_hist).unwrap());
+    let foff = cell(6, 6) * 2;
+    world.arrays.get_mut(&FLOORS[0]).unwrap().data[foff..foff + 2]
+        .copy_from_slice(&1u16.to_le_bytes());
+    let funds_before_redo = world.budget.funds;
+    assert!(
+        !interp.build_redo_entry(&mut world, &mut dig_hist).unwrap(),
+        "redoing pool dig over a newly laid floor must be refused"
+    );
+    assert_eq!(world.budget.funds, funds_before_redo);
+    assert!(!is_pool_tile(&world, 6, 6));
+    world.arrays.get_mut(&FLOORS[0]).unwrap().data[foff..foff + 2].copy_from_slice(&[0, 0]);
+    world.arrays.get_mut(&8).unwrap().data[cell(6, 6)] |= FLAG_LOCKED;
+    assert!(
+        !interp.build_redo_entry(&mut world, &mut dig_hist).unwrap(),
+        "redoing pool dig over a locked tile must be refused"
+    );
+    world.arrays.get_mut(&8).unwrap().data[cell(6, 6)] &= !FLAG_LOCKED;
+    assert!(interp.build_redo_entry(&mut world, &mut dig_hist).unwrap());
+    assert!(is_pool_tile(&world, 6, 6));
+
+    // 2. Terrain Undo/Redo refused if an incident tile gains an object.
+    let raise = plan_terrain_edit(&world, [12, 12], [12, 12], TerrainMode::Raise, &prices);
+    let mut raise_hist = interp
+        .build_commit_terrain(&mut world, &raise)
+        .unwrap()
+        .unwrap();
+    place_dummy_object(&mut world, 51, [12, 12], 1);
+    assert!(
+        !interp
+            .build_undo_entry(&mut world, &mut raise_hist)
+            .unwrap(),
+        "undoing terrain raise under an object must be refused"
+    );
+    assert_eq!(terrain_vertex_height(&world, 12, 12), Some(4));
+    world.objects.remove(&51);
+    assert!(
+        interp
+            .build_undo_entry(&mut world, &mut raise_hist)
+            .unwrap()
+    );
+    assert_eq!(terrain_vertex_height(&world, 12, 12), Some(3));
+
+    // 3. Pond Paint Undo refused if a tile becomes locked or occupied.
+    let pond = plan_water_edit(&world, [15, 15], [15, 15], WaterMode::Paint, &prices);
+    let mut pond_hist = interp
+        .build_commit_water(&mut world, &pond)
+        .unwrap()
+        .unwrap();
+    world.arrays.get_mut(&8).unwrap().data[cell(15, 15)] |= FLAG_LOCKED;
+    assert!(
+        !interp.build_undo_entry(&mut world, &mut pond_hist).unwrap(),
+        "undoing pond paint on a locked tile must be refused"
+    );
+    assert!(is_water_tile(&world, 15, 15));
+    world.arrays.get_mut(&8).unwrap().data[cell(15, 15)] &= !FLAG_LOCKED;
+    assert!(interp.build_undo_entry(&mut world, &mut pond_hist).unwrap());
+    assert!(!is_water_tile(&world, 15, 15));
+}
+
+#[test]
+fn roof_baseline_preserves_untouched_hous0_fields_and_avoids_double_strip() {
+    let (program, catalog) = empty_interpreter();
+    let interp = Interpreter::new(&program, &catalog, Stream::Global);
+    let mut world = synthetic_world(16, 500, 0);
+    let base = RoofState {
+        pattern: "r3_".to_owned(),
+        pitch: RoofPitch::Steep,
+    };
+
+    assert_eq!(roof_state_with_base(&world, &base), base);
+    assert!(!world.arrays.contains_key(&ROOF_META_ARRAY));
+
+    // Pitch-only edit preserves `r3_` from `HOUS 0` baseline.
+    let pitch_only = plan_roof_pitch_with_base(&world, &base, RoofPitch::Shallow);
+    assert!(pitch_only.valid);
+    assert_eq!(pitch_only.before, base);
+    assert_eq!(pitch_only.after.pattern, "r3_");
+    assert_eq!(pitch_only.after.pitch, RoofPitch::Shallow);
+    let mut pitch_hist = interp
+        .build_commit_roof(&mut world, &pitch_only)
+        .unwrap()
+        .unwrap();
+    assert_eq!(roof_state_with_base(&world, &base).pattern, "r3_");
+    assert_eq!(
+        roof_state_with_base(&world, &base).pitch,
+        RoofPitch::Shallow
+    );
+
+    // Undo removes `ROOF_META_ARRAY` and resolves back to `HOUS 0` baseline.
+    assert!(
+        interp
+            .build_undo_entry(&mut world, &mut pitch_hist)
+            .unwrap()
+    );
+    assert!(!world.arrays.contains_key(&ROOF_META_ARRAY));
+    assert_eq!(roof_state_with_base(&world, &base), base);
+
+    // Selecting `r1_` on a house whose baseline is `r3_` is valid (not a no-op).
+    let select_r1 = plan_roof_pattern_with_base(&world, &base, "r1_");
+    assert!(select_r1.valid);
+    assert_eq!(select_r1.after.pattern, "r1_");
+    assert_eq!(select_r1.after.pitch, RoofPitch::Steep);
+
+    // Normalization strips `.bmp` once: `tile.bmp.bmp` -> `tile.bmp` and reads back identically.
+    let dbl = plan_roof_edit_with_base(&world, &base, Some("tile.bmp.bmp"), None);
+    assert!(dbl.valid);
+    assert_eq!(dbl.after.pattern, "tile.bmp");
+    interp.build_commit_roof(&mut world, &dbl).unwrap().unwrap();
+    assert_eq!(roof_state_with_base(&world, &base).pattern, "tile.bmp");
+}
+
+#[test]
+fn leveling_preexisting_cliff_never_creates_new_slope_above_five() {
+    let prices = ToolPrices::default();
+    let set_v = |world: &mut World, vx: usize, vy: usize, h: u8| {
+        if vx > 0 && vy > 0 {
+            world.arrays.get_mut(&0).unwrap().data[cell(vx - 1, vy - 1) * 4 + 3] = h;
+        }
+        if vx < 64 && vy > 0 {
+            world.arrays.get_mut(&0).unwrap().data[cell(vx, vy - 1) * 4] = h;
+        }
+        if vx > 0 && vy < 64 {
+            world.arrays.get_mut(&0).unwrap().data[cell(vx - 1, vy) * 4 + 2] = h;
+        }
+        if vx < 64 && vy < 64 {
+            world.arrays.get_mut(&0).unwrap().data[cell(vx, vy) * 4 + 1] = h;
+        }
+    };
+    let check_mode = |mode: TerrainMode| {
+        let (program, catalog) = empty_interpreter();
+        let interp = Interpreter::new(&program, &catalog, Stream::Global);
+        let mut world = synthetic_world(16, 500, 15);
+        // Set up Sol's fixture: three editable vertices along y=6 at x=5,6,7
+        // with heights [0, 25, 25], and fixed neighbors at y=5/y=7 holding 15
+        // and x=4 holding 0, x=8 holding 20 so old internal slope on (5,6)-(6,6)
+        // is 25 and (6,6)-(7,6) is 0.
+        for vx in 0..=16usize {
+            for vy in 0..=16usize {
+                let h = if vy == 6 && vx == 5 {
+                    0
+                } else if vy == 6 && (vx == 6 || vx == 7) {
+                    25
+                } else if vy == 6 && vx == 4 {
+                    0
+                } else if vy == 6 && vx == 8 {
+                    20
+                } else {
+                    15
+                };
+                set_v(&mut world, vx, vy, h);
+            }
+        }
+        // Snapshot every original orthogonal edge difference in the area.
+        let mut orig = [[0u8; 17]; 17];
+        for (vx, col) in orig.iter_mut().enumerate() {
+            for (vy, slot) in col.iter_mut().enumerate() {
+                *slot = terrain_vertex_height(&world, vx, vy).unwrap();
+            }
+        }
+        let plan = plan_terrain_edit(&world, [5, 6], [7, 6], mode, &prices);
+        if plan.valid {
+            interp
+                .build_commit_terrain(&mut world, &plan)
+                .unwrap()
+                .unwrap();
+        }
+        for vx in 4..=8usize {
+            for vy in 5..=7usize {
+                let h = terrain_vertex_height(&world, vx, vy).unwrap();
+                for (nx, ny) in [(vx + 1, vy), (vx, vy + 1)] {
+                    if nx <= 8 && ny <= 7 {
+                        let nh = terrain_vertex_height(&world, nx, ny).unwrap();
+                        let old_d = orig[vx][vy].abs_diff(orig[nx][ny]);
+                        let new_d = h.abs_diff(nh);
+                        assert!(
+                            new_d <= MAX_TERRAIN_SLOPE.max(old_d),
+                            "{mode:?} steepened edge ({vx},{vy})-({nx},{ny}) from {old_d} to {new_d}"
+                        );
+                    }
+                }
+            }
+        }
+    };
+    check_mode(TerrainMode::Level);
+    check_mode(TerrainMode::LevelAverage);
+}
+
+#[test]
+fn stale_adjacent_pool_pond_plans_rejected_and_undo_preserves_distant_edits() {
+    let (program, catalog) = empty_interpreter();
+    let interp = Interpreter::new(&program, &catalog, Stream::Global);
+    let prices = ToolPrices::default();
+    let mut world = synthetic_world(20, 1000, 2);
+
+    // Preserve a distant `0x10` sentinel in Arry 9 across edits.
+    world.arrays.get_mut(&9).unwrap().data[cell(14, 14)] = 0x10;
+
+    // Plan two adjacent 1-tile pool digs on an existing dry array.
+    let p1 = plan_pool_edit(&world, [5, 5], [5, 5], PoolMode::Dig, &prices);
+    let p2 = plan_pool_edit(&world, [6, 5], [6, 5], PoolMode::Dig, &prices);
+    assert!(p1.valid && p2.valid);
+    assert!(interp.build_commit_pool(&mut world, &p1).unwrap().is_some());
+    assert_eq!(world.arrays[&9].data[cell(14, 14)], 0x10);
+    // Committing stale p2 must be rejected so disconnected `0x00` masks cannot form!
+    assert!(
+        interp.build_commit_pool(&mut world, &p2).unwrap().is_none(),
+        "stale adjacent pool plan must be rejected to prevent disconnected masks"
+    );
+    assert!(!is_pool_tile(&world, 6, 5));
+
+    // Same stale adjacent check for Pond/Water.
+    let w1 = plan_water_edit(&world, [10, 5], [10, 5], WaterMode::Paint, &prices);
+    let w2 = plan_water_edit(&world, [11, 5], [11, 5], WaterMode::Paint, &prices);
+    assert!(w1.valid && w2.valid);
+    assert!(
+        interp
+            .build_commit_water(&mut world, &w1)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        interp
+            .build_commit_water(&mut world, &w2)
+            .unwrap()
+            .is_none(),
+        "stale adjacent pond plan must be rejected to prevent disconnected masks"
+    );
+    assert!(!is_water_tile(&world, 11, 5));
+
+    // Array creation Undo refuses if a distant tile or `0x10` sentinel was added later.
+    world.arrays.remove(&9);
+    let create_pool = plan_pool_edit(&world, [5, 10], [5, 10], PoolMode::Dig, &prices);
+    assert!(create_pool.valid && create_pool.created_pool_array);
+    let mut create_hist = interp
+        .build_commit_pool(&mut world, &create_pool)
+        .unwrap()
+        .unwrap();
+    world.arrays.get_mut(&9).unwrap().data[cell(14, 14)] = 0x10;
+    assert!(
+        !interp
+            .build_undo_entry(&mut world, &mut create_hist)
+            .unwrap(),
+        "undoing array-creation entry must refuse when a distant 0x10 sentinel exists"
+    );
+    assert_eq!(world.arrays[&9].data[cell(14, 14)], 0x10);
+    world.arrays.get_mut(&9).unwrap().data[cell(14, 14)] = 0xff;
+    world.arrays.get_mut(&9).unwrap().data[cell(12, 12)] = 0x00;
+    assert!(
+        !interp
+            .build_undo_entry(&mut world, &mut create_hist)
+            .unwrap(),
+        "undoing array-creation entry must refuse when a distant pool tile exists"
+    );
+    assert!(is_pool_tile(&world, 12, 12));
+    world.arrays.get_mut(&9).unwrap().data[cell(12, 12)] = 0xff;
+    assert!(
+        interp
+            .build_undo_entry(&mut world, &mut create_hist)
+            .unwrap()
+    );
+    assert!(!world.arrays.contains_key(&9));
+}
+
+#[test]
+fn removing_entire_pond_fills_center_back_to_dry_bank() {
+    let (program, catalog) = empty_interpreter();
+    let interp = Interpreter::new(&program, &catalog, Stream::Global);
+    let prices = ToolPrices::default();
+    let mut world = synthetic_world(20, 500, 3);
+
+    // Paint a 2x2 pond at (5..=6, 5..=6) on flat height 3 -> all 9 vertices drop to 2.
+    let paint = plan_water_edit(&world, [5, 5], [6, 6], WaterMode::Paint, &prices);
+    assert!(paint.valid);
+    interp
+        .build_commit_water(&mut world, &paint)
+        .unwrap()
+        .unwrap();
+    for vx in 5..=7 {
+        for vy in 5..=7 {
+            assert_eq!(terrain_vertex_height(&world, vx, vy), Some(2));
+        }
+    }
+
+    // Ordinary Remove of all 4 tiles restores EVERY vertex including center (6, 6) to 3!
+    let remove_all = plan_water_edit(&world, [5, 5], [6, 6], WaterMode::Remove, &prices);
+    assert!(remove_all.valid);
+    interp
+        .build_commit_water(&mut world, &remove_all)
+        .unwrap()
+        .unwrap();
+    for vx in 5..=7 {
+        for vy in 5..=7 {
+            assert_eq!(
+                terrain_vertex_height(&world, vx, vy),
+                Some(3),
+                "vertex ({vx}, {vy}) should refill back to surrounding dry bank height 3"
+            );
+        }
+    }
+
+    // Partial removal pins vertices bordering surviving water at 2 while raising dry outer rim.
+    let paint2 = plan_water_edit(&world, [5, 5], [6, 6], WaterMode::Paint, &prices);
+    interp
+        .build_commit_water(&mut world, &paint2)
+        .unwrap()
+        .unwrap();
+    let remove_half = plan_water_edit(&world, [6, 5], [6, 6], WaterMode::Remove, &prices);
+    interp
+        .build_commit_water(&mut world, &remove_half)
+        .unwrap()
+        .unwrap();
+    assert_eq!(terrain_vertex_height(&world, 6, 6), Some(2));
+    assert_eq!(terrain_vertex_height(&world, 7, 6), Some(3));
+}
+
+#[test]
+fn grow_grass_allows_undo_commits_are_transactional_and_extreme_coords_never_panic() {
+    let (program, catalog) = empty_interpreter();
+    let interp = Interpreter::new(&program, &catalog, Stream::Global);
+    let prices = ToolPrices::default();
+    let mut world = synthetic_world(20, 500, 3);
+
+    // Terrain raise followed by natural `grow_grass` still undoes cleanly.
+    let raise = plan_terrain_edit(&world, [10, 10], [10, 10], TerrainMode::Raise, &prices);
+    let mut raise_hist = interp
+        .build_commit_terrain(&mut world, &raise)
+        .unwrap()
+        .unwrap();
+    world.grow_grass(5).expect("grow grass");
+    assert!(
+        (world.arrays[&GRASS_ARRAY].data[cell(10, 10)] as i8) > TERRAIN_DIRT_GRASS,
+        "grow_grass should advance Arry 6 toward target"
+    );
+    assert!(
+        interp
+            .build_undo_entry(&mut world, &mut raise_hist)
+            .unwrap(),
+        "normal lawn regrowth must not strand terrain undo"
+    );
+    assert_eq!(terrain_vertex_height(&world, 10, 10), Some(3));
+    assert_eq!(world.budget.funds, 500);
+
+    // Pond paint followed by `grow_grass` still undoes cleanly.
+    let pond = plan_water_edit(&world, [6, 6], [6, 6], WaterMode::Paint, &prices);
+    let mut pond_hist = interp
+        .build_commit_water(&mut world, &pond)
+        .unwrap()
+        .unwrap();
+    world.grow_grass(5).expect("grow grass");
+    assert!(
+        interp.build_undo_entry(&mut world, &mut pond_hist).unwrap(),
+        "normal lawn regrowth must not strand pond undo"
+    );
+    assert!(!is_water_tile(&world, 6, 6));
+    assert_eq!(world.budget.funds, 500);
+
+    // Direct interpreter commits stage transactionally: missing budget day faults without mutating world!
+    let mut no_budget = synthetic_world(20, 500, 3);
+    no_budget.budget.days.clear();
+    let before_fault = no_budget.clone();
+    let tp = plan_terrain_edit(&no_budget, [8, 8], [8, 8], TerrainMode::Raise, &prices);
+    assert!(interp.build_commit_terrain(&mut no_budget, &tp).is_err());
+    assert_eq!(no_budget.arrays[&0].data, before_fault.arrays[&0].data);
+    let wp = plan_water_edit(&no_budget, [8, 8], [8, 8], WaterMode::Paint, &prices);
+    assert!(interp.build_commit_water(&mut no_budget, &wp).is_err());
+    assert_eq!(no_budget.arrays[&10].data, before_fault.arrays[&10].data);
+    let pp = plan_pool_edit(&no_budget, [8, 8], [8, 8], PoolMode::Dig, &prices);
+    assert!(interp.build_commit_pool(&mut no_budget, &pp).is_err());
+    assert_eq!(no_budget.arrays[&9].data, before_fault.arrays[&9].data);
+
+    // Extreme i32::MAX / i32::MIN coordinates never panic with overflow checks enabled.
+    assert!(
+        !plan_terrain_edit(
+            &world,
+            [i32::MAX, i32::MAX],
+            [i32::MAX, i32::MAX],
+            TerrainMode::Raise,
+            &prices
+        )
+        .valid
+    );
+    assert!(
+        !plan_water_edit(
+            &world,
+            [i32::MAX, 5],
+            [i32::MAX, 5],
+            WaterMode::Paint,
+            &prices
+        )
+        .valid
+    );
+    assert!(
+        !plan_water_edit(
+            &world,
+            [i32::MIN, i32::MIN],
+            [5, 5],
+            WaterMode::Paint,
+            &prices
+        )
+        .valid
+    );
+    assert!(!plan_pool_edit(&world, [5, i32::MAX], [5, i32::MAX], PoolMode::Dig, &prices).valid);
+    assert!(!plan_pool_edit(&world, [i32::MIN, 5], [5, 5], PoolMode::Dig, &prices).valid);
 }

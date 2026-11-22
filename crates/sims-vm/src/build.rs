@@ -2107,20 +2107,24 @@ impl Interpreter<'_> {
                 grass_changes,
                 net_cost,
             } => {
-                if !terrain_diffs_match(world, height_changes, grass_changes, false) {
+                if !terrain_diffs_match_for_history(world, height_changes, grass_changes, false)
+                    || !terrain_changes_allowed(world, height_changes, grass_changes)
+                {
                     return Ok(false);
                 }
-                apply_terrain_diffs(world, height_changes, grass_changes, false)?;
+                let mut staged = world.clone();
+                apply_terrain_diffs(&mut staged, height_changes, grass_changes, false)?;
                 if !height_changes.is_empty() {
-                    self.rebuild_architecture_rooms(world)?;
+                    self.rebuild_architecture_rooms(&mut staged)?;
                 }
                 if *net_cost != 0 {
-                    spend(world, ARCHITECTURE_BUDGET, -*net_cost).map_err(|trap| Fault {
+                    spend(&mut staged, ARCHITECTURE_BUDGET, -*net_cost).map_err(|trap| Fault {
                         object: 0,
                         at: None,
                         trap,
                     })?;
                 }
+                *world = staged;
                 Ok(true)
             }
             BuildHistory::Water {
@@ -2130,29 +2134,41 @@ impl Interpreter<'_> {
                 created_water_array,
                 net_cost,
             } => {
-                if !byte_array_diffs_match(world, WATER_ARRAY, water_changes, false, false)
-                    || !terrain_diffs_match(world, height_changes, grass_changes, false)
-                {
-                    return Ok(false);
-                }
-                apply_byte_array_diffs(
+                if !byte_array_diffs_match(
                     world,
                     WATER_ARRAY,
                     water_changes,
                     *created_water_array,
                     false,
+                ) || !terrain_diffs_match_for_history(
+                    world,
+                    height_changes,
+                    grass_changes,
+                    false,
+                ) || !water_changes_allowed(world, water_changes, height_changes, false)
+                {
+                    return Ok(false);
+                }
+                let mut staged = world.clone();
+                apply_byte_array_diffs(
+                    &mut staged,
+                    WATER_ARRAY,
+                    water_changes,
+                    *created_water_array,
+                    false,
                 )?;
-                apply_terrain_diffs(world, height_changes, grass_changes, false)?;
+                apply_terrain_diffs(&mut staged, height_changes, grass_changes, false)?;
                 if !height_changes.is_empty() {
-                    self.rebuild_architecture_rooms(world)?;
+                    self.rebuild_architecture_rooms(&mut staged)?;
                 }
                 if *net_cost != 0 {
-                    spend(world, ARCHITECTURE_BUDGET, -*net_cost).map_err(|trap| Fault {
+                    spend(&mut staged, ARCHITECTURE_BUDGET, -*net_cost).map_err(|trap| Fault {
                         object: 0,
                         at: None,
                         trap,
                     })?;
                 }
+                *world = staged;
                 Ok(true)
             }
             BuildHistory::Pool {
@@ -2160,24 +2176,33 @@ impl Interpreter<'_> {
                 created_pool_array,
                 net_cost,
             } => {
-                if !byte_array_diffs_match(world, POOL_ARRAY, pool_changes, false, false) {
-                    return Ok(false);
-                }
-                apply_byte_array_diffs(
+                if !byte_array_diffs_match(
                     world,
                     POOL_ARRAY,
                     pool_changes,
                     *created_pool_array,
                     false,
+                ) || !pool_changes_allowed(world, pool_changes, false)
+                {
+                    return Ok(false);
+                }
+                let mut staged = world.clone();
+                apply_byte_array_diffs(
+                    &mut staged,
+                    POOL_ARRAY,
+                    pool_changes,
+                    *created_pool_array,
+                    false,
                 )?;
-                self.rebuild_architecture_rooms(world)?;
+                self.rebuild_architecture_rooms(&mut staged)?;
                 if *net_cost != 0 {
-                    spend(world, ARCHITECTURE_BUDGET, -*net_cost).map_err(|trap| Fault {
+                    spend(&mut staged, ARCHITECTURE_BUDGET, -*net_cost).map_err(|trap| Fault {
                         object: 0,
                         at: None,
                         trap,
                     })?;
                 }
+                *world = staged;
                 Ok(true)
             }
             BuildHistory::Roof {
@@ -2279,20 +2304,24 @@ impl Interpreter<'_> {
                 grass_changes,
                 net_cost,
             } => {
-                if !terrain_diffs_match(world, height_changes, grass_changes, true) {
+                if !terrain_diffs_match_for_history(world, height_changes, grass_changes, true)
+                    || !terrain_changes_allowed(world, height_changes, grass_changes)
+                {
                     return Ok(false);
                 }
-                apply_terrain_diffs(world, height_changes, grass_changes, true)?;
+                let mut staged = world.clone();
+                apply_terrain_diffs(&mut staged, height_changes, grass_changes, true)?;
                 if !height_changes.is_empty() {
-                    self.rebuild_architecture_rooms(world)?;
+                    self.rebuild_architecture_rooms(&mut staged)?;
                 }
                 if *net_cost != 0 {
-                    spend(world, ARCHITECTURE_BUDGET, *net_cost).map_err(|trap| Fault {
+                    spend(&mut staged, ARCHITECTURE_BUDGET, *net_cost).map_err(|trap| Fault {
                         object: 0,
                         at: None,
                         trap,
                     })?;
                 }
+                *world = staged;
                 Ok(true)
             }
             BuildHistory::Water {
@@ -2308,28 +2337,31 @@ impl Interpreter<'_> {
                     water_changes,
                     *created_water_array,
                     true,
-                ) || !terrain_diffs_match(world, height_changes, grass_changes, true)
+                ) || !terrain_diffs_match_for_history(world, height_changes, grass_changes, true)
+                    || !water_changes_allowed(world, water_changes, height_changes, true)
                 {
                     return Ok(false);
                 }
+                let mut staged = world.clone();
                 apply_byte_array_diffs(
-                    world,
+                    &mut staged,
                     WATER_ARRAY,
                     water_changes,
                     *created_water_array,
                     true,
                 )?;
-                apply_terrain_diffs(world, height_changes, grass_changes, true)?;
+                apply_terrain_diffs(&mut staged, height_changes, grass_changes, true)?;
                 if !height_changes.is_empty() {
-                    self.rebuild_architecture_rooms(world)?;
+                    self.rebuild_architecture_rooms(&mut staged)?;
                 }
                 if *net_cost != 0 {
-                    spend(world, ARCHITECTURE_BUDGET, *net_cost).map_err(|trap| Fault {
+                    spend(&mut staged, ARCHITECTURE_BUDGET, *net_cost).map_err(|trap| Fault {
                         object: 0,
                         at: None,
                         trap,
                     })?;
                 }
+                *world = staged;
                 Ok(true)
             }
             BuildHistory::Pool {
@@ -2343,18 +2375,27 @@ impl Interpreter<'_> {
                     pool_changes,
                     *created_pool_array,
                     true,
-                ) {
+                ) || !pool_changes_allowed(world, pool_changes, true)
+                {
                     return Ok(false);
                 }
-                apply_byte_array_diffs(world, POOL_ARRAY, pool_changes, *created_pool_array, true)?;
-                self.rebuild_architecture_rooms(world)?;
+                let mut staged = world.clone();
+                apply_byte_array_diffs(
+                    &mut staged,
+                    POOL_ARRAY,
+                    pool_changes,
+                    *created_pool_array,
+                    true,
+                )?;
+                self.rebuild_architecture_rooms(&mut staged)?;
                 if *net_cost != 0 {
-                    spend(world, ARCHITECTURE_BUDGET, *net_cost).map_err(|trap| Fault {
+                    spend(&mut staged, ARCHITECTURE_BUDGET, *net_cost).map_err(|trap| Fault {
                         object: 0,
                         at: None,
                         trap,
                     })?;
                 }
+                *world = staged;
                 Ok(true)
             }
             BuildHistory::Roof {
@@ -2589,9 +2630,8 @@ impl RoofState {
             return None;
         }
         let pitch_f32 = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let stem = std::str::from_utf8(&bytes[4..]).ok()?;
-        let pattern = normalize_roof_stem(stem);
-        if pattern.is_empty() {
+        let pattern = std::str::from_utf8(&bytes[4..]).ok()?.to_owned();
+        if pattern.trim().is_empty() {
             return None;
         }
         Some(Self {
@@ -3020,13 +3060,18 @@ pub fn plan_terrain_edit(
                             }
                         }
                     }
-                    // Relax feasible intervals across internal edges of the editable set.
+                    // Relax feasible intervals across internal edges of the editable set,
+                    // using the same pre-existing slope allowance as fixed boundary edges
+                    // so `cur` always remains feasible even across pre-existing cliffs.
                     let mut changed = true;
                     let mut guard = editable.len().saturating_add(1);
                     while changed && guard > 0 {
                         changed = false;
                         guard -= 1;
                         for &(vx, vy) in &editable {
+                            let cur_v = i32::from(
+                                read_vertex_height(&orig_heights.data, vx, vy).unwrap_or(target_h),
+                            );
                             let mut cur_lo = lo[&(vx, vy)];
                             let mut cur_hi = hi[&(vx, vy)];
                             for (nx, ny) in [
@@ -3041,8 +3086,13 @@ pub fn plan_terrain_edit(
                                 if !editable_set.contains(&(nx, ny)) {
                                     continue;
                                 }
-                                let nlo = lo[&(nx, ny)] - slope;
-                                let nhi = hi[&(nx, ny)] + slope;
+                                let cur_n = i32::from(
+                                    read_vertex_height(&orig_heights.data, nx, ny)
+                                        .unwrap_or(target_h),
+                                );
+                                let edge_limit = slope.max((cur_v - cur_n).abs());
+                                let nlo = lo[&(nx, ny)] - edge_limit;
+                                let nhi = hi[&(nx, ny)] + edge_limit;
                                 if nlo > cur_lo {
                                     cur_lo = nlo;
                                     lo.insert((vx, vy), nlo);
@@ -3071,6 +3121,43 @@ pub fn plan_terrain_edit(
                             write_vertex_height(&mut heights_buf, vx, vy, next);
                             changed_vertices += 1;
                         }
+                    }
+                    // Final safety validation across every edge incident to an edited vertex:
+                    // no edge may exceed MAX_TERRAIN_SLOPE unless it did not steepen beyond its
+                    // original pre-existing difference.
+                    let mut slope_valid = true;
+                    'validate_edges: for &(vx, vy) in &editable {
+                        let Some(orig_v) = read_vertex_height(&orig_heights.data, vx, vy) else {
+                            continue;
+                        };
+                        let Some(new_v) = read_vertex_height(&heights_buf, vx, vy) else {
+                            continue;
+                        };
+                        for (nx, ny) in [
+                            (vx.checked_sub(1), Some(vy)),
+                            ((vx < active).then_some(vx + 1), Some(vy)),
+                            (Some(vx), vy.checked_sub(1)),
+                            (Some(vx), (vy < active).then_some(vy + 1)),
+                        ] {
+                            let (Some(nx), Some(ny)) = (nx, ny) else {
+                                continue;
+                            };
+                            let (Some(orig_n), Some(new_n)) = (
+                                read_vertex_height(&orig_heights.data, nx, ny),
+                                read_vertex_height(&heights_buf, nx, ny),
+                            ) else {
+                                continue;
+                            };
+                            let old_diff = orig_v.abs_diff(orig_n);
+                            let new_diff = new_v.abs_diff(new_n);
+                            if new_diff > MAX_TERRAIN_SLOPE && new_diff > old_diff {
+                                slope_valid = false;
+                                break 'validate_edges;
+                            }
+                        }
+                    }
+                    if !slope_valid {
+                        return empty;
                     }
                 }
                 TerrainMode::RestoreGrass | TerrainMode::RemoveGrass => unreachable!(),
@@ -3128,29 +3215,238 @@ pub fn plan_terrain_edit(
 }
 
 /// Recomputes the native 4-bit cardinal connectivity bitmask (`0x00..=0x0f`:
-/// `N=1, W=2, S=4, E=8`) for every present (`< 16`) cell in `buf`.
-fn recompute_water_pool_masks(buf: &mut [u8], active: usize) {
+/// `N=1, W=2, S=4, E=8`) only for `edited_tiles` and their in-bounds cardinal
+/// neighbors, preserving untouched distant cells (including `0x10` sentinels).
+fn recompute_water_pool_masks_around(
+    buf: &mut [u8],
+    active: usize,
+    edited_tiles: &[(usize, usize)],
+) {
+    let limit = active.min(FULL_SIZE);
+    let mut dirty = BTreeSet::new();
+    for &(x, y) in edited_tiles {
+        if x < limit && y < limit {
+            dirty.insert((x, y));
+            if y > 0 {
+                dirty.insert((x, y - 1));
+            }
+            if x > 0 {
+                dirty.insert((x - 1, y));
+            }
+            if y + 1 < limit {
+                dirty.insert((x, y + 1));
+            }
+            if x + 1 < limit {
+                dirty.insert((x + 1, y));
+            }
+        }
+    }
     let snapshot: Vec<bool> = buf.iter().map(|&v| v < 16).collect();
-    for x in 0..active.min(FULL_SIZE) {
-        for y in 0..active.min(FULL_SIZE) {
-            let idx = cell_index(x, y);
-            if !snapshot[idx] {
+    for (x, y) in dirty {
+        let idx = cell_index(x, y);
+        if !snapshot[idx] {
+            continue;
+        }
+        let mut mask = 0u8;
+        if y > 0 && snapshot[cell_index(x, y - 1)] {
+            mask |= 0x01; // North
+        }
+        if x > 0 && snapshot[cell_index(x - 1, y)] {
+            mask |= 0x02; // West
+        }
+        if y + 1 < limit && snapshot[cell_index(x, y + 1)] {
+            mask |= 0x04; // South
+        }
+        if x + 1 < limit && snapshot[cell_index(x + 1, y)] {
+            mask |= 0x08; // East
+        }
+        buf[idx] = mask;
+    }
+}
+
+fn vertex_borders_water(water_buf: &[u8], active: usize, vx: usize, vy: usize) -> bool {
+    let limit = active.min(FULL_SIZE);
+    let candidates = [
+        (vx.checked_sub(1), vy.checked_sub(1)),
+        ((vx < limit).then_some(vx), vy.checked_sub(1)),
+        (vx.checked_sub(1), (vy < limit).then_some(vy)),
+        ((vx < limit).then_some(vx), (vy < limit).then_some(vy)),
+    ];
+    candidates.into_iter().any(|(tx, ty)| {
+        let (Some(tx), Some(ty)) = (tx, ty) else {
+            return false;
+        };
+        tx < limit && ty < limit && water_buf[cell_index(tx, ty)] < 16
+    })
+}
+
+fn fill_removed_pond_basin(
+    world: &World,
+    orig_heights: &[u8],
+    heights_buf: &mut [u8],
+    water_buf: &[u8],
+    active: usize,
+    candidate_vertices: &BTreeSet<(usize, usize)>,
+) {
+    let fillable: BTreeSet<(usize, usize)> = candidate_vertices
+        .iter()
+        .copied()
+        .filter(|&(vx, vy)| {
+            is_terrain_vertex_editable_inner(world, vx, vy, true)
+                && !vertex_borders_water(water_buf, active, vx, vy)
+        })
+        .collect();
+    if fillable.is_empty() {
+        return;
+    }
+    let mut visited = BTreeSet::new();
+    let slope = i32::from(MAX_TERRAIN_SLOPE);
+    for &seed in &fillable {
+        if visited.contains(&seed) {
+            continue;
+        }
+        let mut comp = Vec::new();
+        let mut queue = vec![seed];
+        visited.insert(seed);
+        while let Some((vx, vy)) = queue.pop() {
+            comp.push((vx, vy));
+            for (nx, ny) in [
+                (vx.checked_sub(1), Some(vy)),
+                ((vx < active).then_some(vx + 1), Some(vy)),
+                (Some(vx), vy.checked_sub(1)),
+                (Some(vx), (vy < active).then_some(vy + 1)),
+            ] {
+                let (Some(nx), Some(ny)) = (nx, ny) else {
+                    continue;
+                };
+                if fillable.contains(&(nx, ny)) && visited.insert((nx, ny)) {
+                    queue.push((nx, ny));
+                }
+            }
+        }
+        let comp_set: BTreeSet<(usize, usize)> = comp.iter().copied().collect();
+        // Collect surrounding dry bank perimeter vertices (not in this fillable
+        // component and not bordering surviving water).
+        let mut bank_vertices = BTreeSet::new();
+        for &(vx, vy) in &comp {
+            for (nx, ny) in [
+                (vx.checked_sub(1), Some(vy)),
+                ((vx < active).then_some(vx + 1), Some(vy)),
+                (Some(vx), vy.checked_sub(1)),
+                (Some(vx), (vy < active).then_some(vy + 1)),
+            ] {
+                let (Some(nx), Some(ny)) = (nx, ny) else {
+                    continue;
+                };
+                if !comp_set.contains(&(nx, ny))
+                    && !vertex_borders_water(water_buf, active, nx, ny)
+                    && read_vertex_height(orig_heights, nx, ny).is_some()
+                {
+                    bank_vertices.insert((nx, ny));
+                }
+            }
+        }
+        if bank_vertices.is_empty() {
+            continue;
+        }
+        let bank_sum: u32 = bank_vertices
+            .iter()
+            .filter_map(|&(nx, ny)| read_vertex_height(orig_heights, nx, ny).map(u32::from))
+            .sum();
+        let bank_count = bank_vertices.len() as u32;
+        let Some(bank_target) = (bank_sum + bank_count / 2).checked_div(bank_count) else {
+            continue;
+        };
+        let bank_target = bank_target as u8;
+
+        // Compute slope-feasible bounds [lo, hi] against all pinned neighbors
+        // (including protected vertices and vertices bordering surviving water).
+        let mut lo: BTreeMap<(usize, usize), i32> = BTreeMap::new();
+        let mut hi: BTreeMap<(usize, usize), i32> = BTreeMap::new();
+        for &v in &comp {
+            lo.insert(v, 0);
+            hi.insert(v, i32::from(u8::MAX));
+        }
+        for &(vx, vy) in &comp {
+            let cur = i32::from(read_vertex_height(orig_heights, vx, vy).unwrap_or(bank_target));
+            for (nx, ny) in [
+                (vx.checked_sub(1), Some(vy)),
+                ((vx < active).then_some(vx + 1), Some(vy)),
+                (Some(vx), vy.checked_sub(1)),
+                (Some(vx), (vy < active).then_some(vy + 1)),
+            ] {
+                let (Some(nx), Some(ny)) = (nx, ny) else {
+                    continue;
+                };
+                if comp_set.contains(&(nx, ny)) {
+                    continue;
+                }
+                if let Some(nh) = read_vertex_height(orig_heights, nx, ny) {
+                    let nh = i32::from(nh);
+                    let allowed = slope.max((cur - nh).abs());
+                    *lo.get_mut(&(vx, vy)).unwrap() = lo[&(vx, vy)].max(nh - allowed);
+                    *hi.get_mut(&(vx, vy)).unwrap() = hi[&(vx, vy)].min(nh + allowed);
+                }
+            }
+        }
+        let mut changed = true;
+        let mut guard = comp.len().saturating_add(1);
+        while changed && guard > 0 {
+            changed = false;
+            guard -= 1;
+            for &(vx, vy) in &comp {
+                let cur_v =
+                    i32::from(read_vertex_height(orig_heights, vx, vy).unwrap_or(bank_target));
+                let mut cur_lo = lo[&(vx, vy)];
+                let mut cur_hi = hi[&(vx, vy)];
+                for (nx, ny) in [
+                    (vx.checked_sub(1), Some(vy)),
+                    ((vx < active).then_some(vx + 1), Some(vy)),
+                    (Some(vx), vy.checked_sub(1)),
+                    (Some(vx), (vy < active).then_some(vy + 1)),
+                ] {
+                    let (Some(nx), Some(ny)) = (nx, ny) else {
+                        continue;
+                    };
+                    if !comp_set.contains(&(nx, ny)) {
+                        continue;
+                    }
+                    let cur_n =
+                        i32::from(read_vertex_height(orig_heights, nx, ny).unwrap_or(bank_target));
+                    let edge_limit = slope.max((cur_v - cur_n).abs());
+                    let nlo = lo[&(nx, ny)] - edge_limit;
+                    let nhi = hi[&(nx, ny)] + edge_limit;
+                    if nlo > cur_lo {
+                        cur_lo = nlo;
+                        lo.insert((vx, vy), nlo);
+                        changed = true;
+                    }
+                    if nhi < cur_hi {
+                        cur_hi = nhi;
+                        hi.insert((vx, vy), nhi);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        for &(vx, vy) in &comp {
+            let Some(cur) = read_vertex_height(orig_heights, vx, vy) else {
+                continue;
+            };
+            if bank_target <= cur {
                 continue;
             }
-            let mut mask = 0u8;
-            if y > 0 && snapshot[cell_index(x, y - 1)] {
-                mask |= 0x01; // North
+            let desired = cur.saturating_add(1).min(bank_target);
+            let v_lo = lo[&(vx, vy)];
+            let v_hi = hi[&(vx, vy)];
+            let next = if v_lo <= v_hi {
+                i32::from(desired).clamp(v_lo, v_hi).clamp(0, 255) as u8
+            } else {
+                cur
+            };
+            if next != cur {
+                write_vertex_height(heights_buf, vx, vy, next);
             }
-            if x > 0 && snapshot[cell_index(x - 1, y)] {
-                mask |= 0x02; // West
-            }
-            if y + 1 < active && snapshot[cell_index(x, y + 1)] {
-                mask |= 0x04; // South
-            }
-            if x + 1 < active && snapshot[cell_index(x + 1, y)] {
-                mask |= 0x08; // East
-            }
-            buf[idx] = mask;
         }
     }
 }
@@ -3194,14 +3490,15 @@ pub fn plan_water_edit(
     if active < 4 {
         return empty;
     }
+    let max_valid = active as i32 - 2;
     let min_x = start_tile[0].min(end_tile[0]);
     let max_x = start_tile[0].max(end_tile[0]);
     let min_y = start_tile[1].min(end_tile[1]);
     let max_y = start_tile[1].max(end_tile[1]);
     if min_x < 1
         || min_y < 1
-        || max_x + 1 >= active as i32
-        || max_y + 1 >= active as i32
+        || max_x > max_valid
+        || max_y > max_valid
         || min_x > max_x
         || min_y > max_y
     {
@@ -3252,7 +3549,7 @@ pub fn plan_water_edit(
         return empty;
     }
 
-    recompute_water_pool_masks(&mut water_buf, active);
+    recompute_water_pool_masks_around(&mut water_buf, active, &changed_tiles);
 
     let mut water_changes = Vec::new();
     for idx in 0..(FULL_SIZE * FULL_SIZE) {
@@ -3261,7 +3558,9 @@ pub fn plan_water_edit(
         }
     }
 
-    // Depress mutable basin vertices on Paint, or restore depressed vertices on Remove.
+    // Depress mutable basin vertices on Paint, or fill removed basin from the
+    // surrounding dry bank on Remove (while pinning protected & wet-bordering
+    // vertices).
     let mut height_changes = Vec::new();
     let mut grass_changes = Vec::new();
     if let Some(orig_heights) = world.arrays.get(&HEIGHTS_ARRAY).filter(|a| a.stride == 4) {
@@ -3272,53 +3571,30 @@ pub fn plan_water_edit(
                 candidate_vertices.insert((vx, vy));
             }
         }
-        for (vx, vy) in candidate_vertices {
-            if !is_terrain_vertex_editable_inner(world, vx, vy, true) {
-                continue;
-            }
-            let Some(cur) = read_vertex_height(&heights_buf, vx, vy) else {
-                continue;
-            };
-            match mode {
-                WaterMode::Paint => {
+        match mode {
+            WaterMode::Paint => {
+                for (vx, vy) in candidate_vertices {
+                    if !is_terrain_vertex_editable_inner(world, vx, vy, true) {
+                        continue;
+                    }
+                    let Some(cur) = read_vertex_height(&heights_buf, vx, vy) else {
+                        continue;
+                    };
                     let next = cur.saturating_sub(1);
                     if next != cur && vertex_slope_ok(&heights_buf, active, vx, vy, next) {
                         write_vertex_height(&mut heights_buf, vx, vy, next);
                     }
                 }
-                WaterMode::Remove => {
-                    // Only raise vertices that no longer border any surviving water tile.
-                    let still_wet = [(vx - 1, vy - 1), (vx, vy - 1), (vx - 1, vy), (vx, vy)]
-                        .into_iter()
-                        .any(|(tx, ty)| water_buf[cell_index(tx, ty)] < 16);
-                    if still_wet {
-                        continue;
-                    }
-                    let mut bank_sum = 0u32;
-                    let mut bank_count = 0u32;
-                    for (nx, ny) in [
-                        (vx.checked_sub(1), Some(vy)),
-                        ((vx < active).then_some(vx + 1), Some(vy)),
-                        (Some(vx), vy.checked_sub(1)),
-                        (Some(vx), (vy < active).then_some(vy + 1)),
-                    ] {
-                        let (Some(nx), Some(ny)) = (nx, ny) else {
-                            continue;
-                        };
-                        if let Some(nh) = read_vertex_height(&orig_heights.data, nx, ny)
-                            && nh > cur
-                        {
-                            bank_sum += u32::from(nh);
-                            bank_count += 1;
-                        }
-                    }
-                    if let Some(target) = (bank_sum + bank_count / 2).checked_div(bank_count) {
-                        let next = cur.saturating_add(1).min(target as u8);
-                        if next != cur && vertex_slope_ok(&heights_buf, active, vx, vy, next) {
-                            write_vertex_height(&mut heights_buf, vx, vy, next);
-                        }
-                    }
-                }
+            }
+            WaterMode::Remove => {
+                fill_removed_pond_basin(
+                    world,
+                    &orig_heights.data,
+                    &mut heights_buf,
+                    &water_buf,
+                    active,
+                    &candidate_vertices,
+                );
             }
         }
         let mut disturbed = Vec::new();
@@ -3418,14 +3694,15 @@ pub fn plan_pool_edit(
     if active < 4 {
         return empty;
     }
+    let max_valid = active as i32 - 2;
     let min_x = start_tile[0].min(end_tile[0]);
     let max_x = start_tile[0].max(end_tile[0]);
     let min_y = start_tile[1].min(end_tile[1]);
     let max_y = start_tile[1].max(end_tile[1]);
     if min_x < 1
         || min_y < 1
-        || max_x + 1 >= active as i32
-        || max_y + 1 >= active as i32
+        || max_x > max_valid
+        || max_y > max_valid
         || min_x > max_x
         || min_y > max_y
     {
@@ -3439,7 +3716,7 @@ pub fn plan_pool_edit(
         None => vec![0xff; FULL_SIZE * FULL_SIZE],
     };
     let mut pool_buf = orig_pool.clone();
-    let mut changed_count = 0i32;
+    let mut changed_tiles = Vec::new();
     let mut pool_elev: Option<u8> = None;
 
     for x in min_x..=max_x {
@@ -3483,7 +3760,7 @@ pub fn plan_pool_edit(
                         }
                     }
                     pool_buf[idx] = 0;
-                    changed_count += 1;
+                    changed_tiles.push((ux, uy));
                 }
                 PoolMode::Demolish => {
                     if !is_pool {
@@ -3493,17 +3770,17 @@ pub fn plan_pool_edit(
                         return empty;
                     }
                     pool_buf[idx] = 0xff;
-                    changed_count += 1;
+                    changed_tiles.push((ux, uy));
                 }
             }
         }
     }
 
-    if changed_count == 0 {
+    if changed_tiles.is_empty() {
         return empty;
     }
 
-    recompute_water_pool_masks(&mut pool_buf, active);
+    recompute_water_pool_masks_around(&mut pool_buf, active, &changed_tiles);
 
     let mut pool_changes = Vec::new();
     for idx in 0..(FULL_SIZE * FULL_SIZE) {
@@ -3511,6 +3788,8 @@ pub fn plan_pool_edit(
             pool_changes.push((idx, orig_pool[idx], pool_buf[idx]));
         }
     }
+
+    let changed_count = changed_tiles.len() as i32;
 
     let net_cost = match mode {
         PoolMode::Dig => changed_count.saturating_mul(prices.pool.max(0)),
@@ -3527,23 +3806,38 @@ pub fn plan_pool_edit(
     }
 }
 
-/// Reads the lot's active [`RoofState`] from `world`, falling back to
-/// [`RoofState::default`] (`r1_`, `Medium`) when never edited.
-pub fn roof_state(world: &World) -> RoofState {
+/// Reads the lot's active [`RoofState`] from `world`, falling back to `base`
+/// (parsed from the house file's `HOUS 0` via [`RoofState::from_house_view`])
+/// when no Build Mode roof edit has overridden it yet.
+pub fn roof_state_with_base(world: &World, base: &RoofState) -> RoofState {
     world
         .arrays
         .get(&ROOF_META_ARRAY)
         .and_then(|arr| RoofState::decode(&arr.data))
-        .unwrap_or_default()
+        .unwrap_or_else(|| base.clone())
 }
 
-/// Plans changing the lot's roof texture pattern and/or pitch (`$0`).
-pub fn plan_roof_edit(world: &World, pattern: Option<&str>, pitch: Option<RoofPitch>) -> RoofPlan {
+/// Reads the lot's active [`RoofState`] from `world`, falling back to
+/// [`RoofState::default`] (`r1_`, `Medium`) when never edited.
+pub fn roof_state(world: &World) -> RoofState {
+    roof_state_with_base(world, &RoofState::default())
+}
+
+/// Plans changing the lot's roof texture pattern and/or pitch (`$0`), using
+/// `base` (parsed from the house file's `HOUS 0`) as the untouched fallback so
+/// partial edits preserve the untouched field and selecting `"r1_"` on a
+/// non-default house is not treated as a no-op.
+pub fn plan_roof_edit_with_base(
+    world: &World,
+    base: &RoofState,
+    pattern: Option<&str>,
+    pitch: Option<RoofPitch>,
+) -> RoofPlan {
     let before_raw = world
         .arrays
         .get(&ROOF_META_ARRAY)
         .map(|arr| arr.data.clone());
-    let before = roof_state(world);
+    let before = roof_state_with_base(world, base);
     let next_pattern = match pattern {
         Some(raw) => {
             let norm = normalize_roof_stem(raw);
@@ -3573,6 +3867,23 @@ pub fn plan_roof_edit(world: &World, pattern: Option<&str>, pitch: Option<RoofPi
     }
 }
 
+/// Plans changing the lot's roof texture pattern and/or pitch (`$0`) against
+/// [`RoofState::default`]. Prefer [`plan_roof_edit_with_base`] when a house's
+/// `HOUS 0` roof baseline is known.
+pub fn plan_roof_edit(world: &World, pattern: Option<&str>, pitch: Option<RoofPitch>) -> RoofPlan {
+    plan_roof_edit_with_base(world, &RoofState::default(), pattern, pitch)
+}
+
+/// Plans switching the lot's roof pattern stem against a house `HOUS 0` baseline.
+pub fn plan_roof_pattern_with_base(world: &World, base: &RoofState, pattern: &str) -> RoofPlan {
+    plan_roof_edit_with_base(world, base, Some(pattern), None)
+}
+
+/// Plans switching the lot's roof pitch preset against a house `HOUS 0` baseline.
+pub fn plan_roof_pitch_with_base(world: &World, base: &RoofState, pitch: RoofPitch) -> RoofPlan {
+    plan_roof_edit_with_base(world, base, None, Some(pitch))
+}
+
 /// Plans switching the lot's roof pattern stem (e.g. `"r2_"` or `"r2_.bmp"`).
 pub fn plan_roof_pattern(world: &World, pattern: &str) -> RoofPlan {
     plan_roof_edit(world, Some(pattern), None)
@@ -3583,11 +3894,34 @@ pub fn plan_roof_pitch(world: &World, pitch: RoofPitch) -> RoofPlan {
     plan_roof_edit(world, None, Some(pitch))
 }
 
-fn terrain_diffs_match(
+fn grass_regrowth_compatible(world: &World, idx: usize, expected: i8, cur: i8) -> bool {
+    if cur == expected {
+        return true;
+    }
+    // Natural `World::grow_grass` (0x47b3c8) monotonically raises Arry 6 toward
+    // Arry 7 (`TARGET_GRASS_ARRAY`) when `g < target`. Accept any intermediate
+    // regrowth value in `(expected, target]` so lawn regrowth never strands
+    // Undo/Redo while out-of-band manual edits outside that interval still fail.
+    if let Some(target_arr) = world
+        .arrays
+        .get(&TARGET_GRASS_ARRAY)
+        .filter(|a| a.stride == 1)
+        && let Some(&target_byte) = target_arr.data.get(idx)
+    {
+        let target = target_byte as i8;
+        if expected < target && cur > expected && cur <= target {
+            return true;
+        }
+    }
+    false
+}
+
+fn terrain_diffs_match_inner(
     world: &World,
     height_changes: &[(usize, [u8; 4], [u8; 4])],
     grass_changes: &[(usize, i8, i8)],
     forward: bool,
+    allow_grass_regrowth: bool,
 ) -> bool {
     if !height_changes.is_empty() {
         let Some(heights) = world.arrays.get(&HEIGHTS_ARRAY).filter(|a| a.stride == 4) else {
@@ -3606,10 +3940,168 @@ fn terrain_diffs_match(
             return false;
         };
         for &(idx, before, after) in grass_changes {
-            let expected = if forward { before as u8 } else { after as u8 };
-            if grass.data.get(idx).copied() != Some(expected) {
+            let expected = if forward { before } else { after };
+            let Some(cur_byte) = grass.data.get(idx).copied() else {
+                return false;
+            };
+            let cur = cur_byte as i8;
+            if allow_grass_regrowth {
+                if !grass_regrowth_compatible(world, idx, expected, cur) {
+                    return false;
+                }
+            } else if cur != expected {
                 return false;
             }
+        }
+    }
+    true
+}
+
+fn terrain_diffs_match(
+    world: &World,
+    height_changes: &[(usize, [u8; 4], [u8; 4])],
+    grass_changes: &[(usize, i8, i8)],
+    forward: bool,
+) -> bool {
+    terrain_diffs_match_inner(world, height_changes, grass_changes, forward, false)
+}
+
+fn terrain_diffs_match_for_history(
+    world: &World,
+    height_changes: &[(usize, [u8; 4], [u8; 4])],
+    grass_changes: &[(usize, i8, i8)],
+    forward: bool,
+) -> bool {
+    terrain_diffs_match_inner(world, height_changes, grass_changes, forward, true)
+}
+
+fn touched_height_vertices(
+    height_changes: &[(usize, [u8; 4], [u8; 4])],
+) -> BTreeSet<(usize, usize)> {
+    let mut touched = BTreeSet::new();
+    for &(idx, before, after) in height_changes {
+        let tx = idx / FULL_SIZE;
+        let ty = idx % FULL_SIZE;
+        // Corners: 0=(tx, ty+1), 1=(tx, ty), 2=(tx+1, ty), 3=(tx+1, ty+1)
+        let corners = [(tx, ty + 1), (tx, ty), (tx + 1, ty), (tx + 1, ty + 1)];
+        for (ci, v) in corners.into_iter().enumerate() {
+            if before[ci] != after[ci] {
+                touched.insert(v);
+            }
+        }
+    }
+    touched
+}
+
+fn terrain_changes_allowed(
+    world: &World,
+    height_changes: &[(usize, [u8; 4], [u8; 4])],
+    grass_changes: &[(usize, i8, i8)],
+) -> bool {
+    if !height_changes.is_empty() {
+        for (vx, vy) in touched_height_vertices(height_changes) {
+            if !is_terrain_vertex_editable(world, vx, vy) {
+                return false;
+            }
+        }
+    } else {
+        for &(idx, _, _) in grass_changes {
+            let tx = idx / FULL_SIZE;
+            let ty = idx % FULL_SIZE;
+            if !is_grass_tile_editable(world, tx, ty) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn water_changes_allowed(
+    world: &World,
+    water_changes: &[(usize, u8, u8)],
+    height_changes: &[(usize, [u8; 4], [u8; 4])],
+    forward: bool,
+) -> bool {
+    for &(idx, before, after) in water_changes {
+        let (src, dst) = if forward {
+            (before, after)
+        } else {
+            (after, before)
+        };
+        let tx = idx / FULL_SIZE;
+        let ty = idx % FULL_SIZE;
+        if src >= 16 && dst < 16 && !tile_supports_water_paint(world, tx, ty) {
+            return false;
+        }
+        if src < 16 && dst >= 16 && !tile_supports_water_remove(world, tx, ty) {
+            return false;
+        }
+    }
+    if !height_changes.is_empty() {
+        for (vx, vy) in touched_height_vertices(height_changes) {
+            if !is_terrain_vertex_editable_inner(world, vx, vy, true) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn pool_changes_allowed(world: &World, pool_changes: &[(usize, u8, u8)], forward: bool) -> bool {
+    let active = usize::try_from(world.size).unwrap_or(0);
+    let mut becoming_dry = BTreeSet::new();
+    for &(idx, before, after) in pool_changes {
+        let (src, dst) = if forward {
+            (before, after)
+        } else {
+            (after, before)
+        };
+        if src < 16 && dst >= 16 {
+            becoming_dry.insert((idx / FULL_SIZE, idx % FULL_SIZE));
+        }
+    }
+    let mut dig_elev: Option<u8> = None;
+    for &(idx, before, after) in pool_changes {
+        let (src, dst) = if forward {
+            (before, after)
+        } else {
+            (after, before)
+        };
+        let tx = idx / FULL_SIZE;
+        let ty = idx % FULL_SIZE;
+        if src >= 16 && dst < 16 {
+            if !tile_supports_pool_dig(world, tx, ty) {
+                return false;
+            }
+            let Some(elev) = tile_flat_elevation(world, tx, ty) else {
+                return false;
+            };
+            if let Some(expected) = dig_elev {
+                if elev != expected {
+                    return false;
+                }
+            } else {
+                dig_elev = Some(elev);
+            }
+            for (nx, ny) in [
+                (tx.checked_sub(1), Some(ty)),
+                ((tx + 1 < active).then_some(tx + 1), Some(ty)),
+                (Some(tx), ty.checked_sub(1)),
+                (Some(tx), (ty + 1 < active).then_some(ty + 1)),
+            ] {
+                let (Some(nx), Some(ny)) = (nx, ny) else {
+                    continue;
+                };
+                if !becoming_dry.contains(&(nx, ny))
+                    && is_pool_tile(world, nx, ny)
+                    && tile_flat_elevation(world, nx, ny) != Some(elev)
+                {
+                    return false;
+                }
+            }
+        }
+        if src < 16 && dst >= 16 && !tile_supports_pool_demolish(world, tx, ty) {
+            return false;
         }
     }
     true
@@ -3661,19 +4153,102 @@ fn byte_array_diffs_match(
     if changes.is_empty() {
         return true;
     }
-    if forward && created_array {
+    let active = usize::try_from(world.size).unwrap_or(0).min(FULL_SIZE);
+    let mut change_map: BTreeMap<usize, u8> = BTreeMap::new();
+    for &(idx, before, after) in changes {
+        let dst = if forward { after } else { before };
+        change_map.insert(idx, dst);
+    }
+
+    let existing_data: Option<&[u8]> = if forward && created_array {
         if world.arrays.contains_key(&array_id) {
             return false;
         }
-        return changes.iter().all(|&(_, before, _)| before == 0xff);
-    }
-    let Some(arr) = world.arrays.get(&array_id).filter(|a| a.stride == 1) else {
-        return false;
+        if !changes.iter().all(|&(_, before, _)| before == 0xff) {
+            return false;
+        }
+        None
+    } else {
+        let Some(arr) = world
+            .arrays
+            .get(&array_id)
+            .filter(|a| a.stride == 1 && a.data.len() == FULL_SIZE * FULL_SIZE)
+        else {
+            return false;
+        };
+        for &(idx, before, after) in changes {
+            let expected = if forward { before } else { after };
+            if arr.data.get(idx).copied() != Some(expected) {
+                return false;
+            }
+        }
+        // When undoing an entry that created the array, verify untouched cells
+        // still hold the initial dry `0xff` value so Undo never deletes
+        // independent edits or `0x10` sentinels elsewhere in the array.
+        if !forward && created_array {
+            for (idx, &val) in arr.data.iter().enumerate() {
+                if !change_map.contains_key(&idx) && val != 0xff {
+                    return false;
+                }
+            }
+        }
+        Some(&arr.data)
+    };
+
+    // Validate cardinal-neighbor connectivity so stale adjacent plans cannot
+    // commit or replay disconnected 4-bit masks.
+    let live_byte = |idx: usize| -> u8 { existing_data.map_or(0xff, |d| d[idx]) };
+    let next_byte = |idx: usize| -> u8 {
+        change_map
+            .get(&idx)
+            .copied()
+            .unwrap_or_else(|| live_byte(idx))
     };
     for &(idx, before, after) in changes {
-        let expected = if forward { before } else { after };
-        if arr.data.get(idx).copied() != Some(expected) {
-            return false;
+        let (src, dst) = if forward {
+            (before, after)
+        } else {
+            (after, before)
+        };
+        let tx = idx / FULL_SIZE;
+        let ty = idx % FULL_SIZE;
+        if tx >= active || ty >= active {
+            continue;
+        }
+        let toggled = (src < 16) != (dst < 16);
+        if toggled {
+            for (nx, ny) in [
+                (tx.checked_sub(1), Some(ty)),
+                ((tx + 1 < active).then_some(tx + 1), Some(ty)),
+                (Some(tx), ty.checked_sub(1)),
+                (Some(tx), (ty + 1 < active).then_some(ty + 1)),
+            ] {
+                let (Some(nx), Some(ny)) = (nx, ny) else {
+                    continue;
+                };
+                let nidx = cell_index(nx, ny);
+                if !change_map.contains_key(&nidx) && live_byte(nidx) < 16 {
+                    return false;
+                }
+            }
+        }
+        if dst < 16 {
+            let mut expected_mask = 0u8;
+            if ty > 0 && next_byte(cell_index(tx, ty - 1)) < 16 {
+                expected_mask |= 0x01;
+            }
+            if tx > 0 && next_byte(cell_index(tx - 1, ty)) < 16 {
+                expected_mask |= 0x02;
+            }
+            if ty + 1 < active && next_byte(cell_index(tx, ty + 1)) < 16 {
+                expected_mask |= 0x04;
+            }
+            if tx + 1 < active && next_byte(cell_index(tx + 1, ty)) < 16 {
+                expected_mask |= 0x08;
+            }
+            if dst != expected_mask {
+                return false;
+            }
         }
     }
     true
@@ -3786,6 +4361,7 @@ pub fn preview_roof_on_world(world: &mut World, plan: &RoofPlan) {
 impl Interpreter<'_> {
     /// Commits a planned Terrain or Grass edit to `world`, rebuilding tile
     /// flags when terrain heights changed and charging Architecture category `7`.
+    /// Staged transactionally so any fault leaves `world` untouched.
     pub fn build_commit_terrain(
         &self,
         world: &mut World,
@@ -3795,49 +4371,23 @@ impl Interpreter<'_> {
             || !plan.affordable
             || (plan.net_cost > 0 && plan.net_cost > available_funds(world))
             || !terrain_diffs_match(world, &plan.height_changes, &plan.grass_changes, true)
+            || !terrain_changes_allowed(world, &plan.height_changes, &plan.grass_changes)
         {
             return Ok(None);
         }
-        // Re-validate live buildability guards so stale plans cannot mutate
-        // tiles that gained walls, floors, pools, water, or objects.
+        let mut staged = world.clone();
+        apply_terrain_diffs(&mut staged, &plan.height_changes, &plan.grass_changes, true)?;
         if !plan.height_changes.is_empty() {
-            let mut touched_vertices = BTreeSet::new();
-            for &(idx, before, after) in &plan.height_changes {
-                let tx = idx / FULL_SIZE;
-                let ty = idx % FULL_SIZE;
-                // Corners: 0=(tx, ty+1), 1=(tx, ty), 2=(tx+1, ty), 3=(tx+1, ty+1)
-                let corners = [(tx, ty + 1), (tx, ty), (tx + 1, ty), (tx + 1, ty + 1)];
-                for (ci, v) in corners.into_iter().enumerate() {
-                    if before[ci] != after[ci] {
-                        touched_vertices.insert(v);
-                    }
-                }
-            }
-            for (vx, vy) in touched_vertices {
-                if !is_terrain_vertex_editable(world, vx, vy) {
-                    return Ok(None);
-                }
-            }
-        } else {
-            for &(idx, _, _) in &plan.grass_changes {
-                let tx = idx / FULL_SIZE;
-                let ty = idx % FULL_SIZE;
-                if !is_grass_tile_editable(world, tx, ty) {
-                    return Ok(None);
-                }
-            }
-        }
-        apply_terrain_diffs(world, &plan.height_changes, &plan.grass_changes, true)?;
-        if !plan.height_changes.is_empty() {
-            self.rebuild_architecture_rooms(world)?;
+            self.rebuild_architecture_rooms(&mut staged)?;
         }
         if plan.net_cost != 0 {
-            spend(world, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
+            spend(&mut staged, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
                 object: 0,
                 at: None,
                 trap,
             })?;
         }
+        *world = staged;
         Ok(Some(BuildHistory::Terrain {
             height_changes: plan.height_changes.clone(),
             grass_changes: plan.grass_changes.clone(),
@@ -3847,6 +4397,7 @@ impl Interpreter<'_> {
 
     /// Commits a planned Pond/Water edit to `world`, updating `Arry 10`,
     /// terrain depression/grass diffs, tile flags, and Architecture category `7`.
+    /// Staged transactionally so any fault leaves `world` untouched.
     pub fn build_commit_water(
         &self,
         world: &mut World,
@@ -3863,55 +4414,30 @@ impl Interpreter<'_> {
                 true,
             )
             || !terrain_diffs_match(world, &plan.height_changes, &plan.grass_changes, true)
+            || !water_changes_allowed(world, &plan.water_changes, &plan.height_changes, true)
         {
             return Ok(None);
         }
-        for &(idx, before, after) in &plan.water_changes {
-            let tx = idx / FULL_SIZE;
-            let ty = idx % FULL_SIZE;
-            if before >= 16 && after < 16 && !tile_supports_water_paint(world, tx, ty) {
-                return Ok(None);
-            }
-            if before < 16 && after >= 16 && !tile_supports_water_remove(world, tx, ty) {
-                return Ok(None);
-            }
-        }
-        if !plan.height_changes.is_empty() {
-            let mut touched_vertices = BTreeSet::new();
-            for &(idx, before, after) in &plan.height_changes {
-                let tx = idx / FULL_SIZE;
-                let ty = idx % FULL_SIZE;
-                let corners = [(tx, ty + 1), (tx, ty), (tx + 1, ty), (tx + 1, ty + 1)];
-                for (ci, v) in corners.into_iter().enumerate() {
-                    if before[ci] != after[ci] {
-                        touched_vertices.insert(v);
-                    }
-                }
-            }
-            for (vx, vy) in touched_vertices {
-                if !is_terrain_vertex_editable_inner(world, vx, vy, true) {
-                    return Ok(None);
-                }
-            }
-        }
+        let mut staged = world.clone();
         apply_byte_array_diffs(
-            world,
+            &mut staged,
             WATER_ARRAY,
             &plan.water_changes,
             plan.created_water_array,
             true,
         )?;
-        apply_terrain_diffs(world, &plan.height_changes, &plan.grass_changes, true)?;
+        apply_terrain_diffs(&mut staged, &plan.height_changes, &plan.grass_changes, true)?;
         if !plan.height_changes.is_empty() {
-            self.rebuild_architecture_rooms(world)?;
+            self.rebuild_architecture_rooms(&mut staged)?;
         }
         if plan.net_cost != 0 {
-            spend(world, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
+            spend(&mut staged, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
                 object: 0,
                 at: None,
                 trap,
             })?;
         }
+        *world = staged;
         Ok(Some(BuildHistory::Water {
             water_changes: plan.water_changes.clone(),
             height_changes: plan.height_changes.clone(),
@@ -3923,7 +4449,8 @@ impl Interpreter<'_> {
 
     /// Commits a planned Swimming Pool dig/demolish edit to `world`, updating
     /// `Arry 9`, rebuilding rooms & tile flags, and charging/refunding
-    /// Architecture category `7`.
+    /// Architecture category `7`. Staged transactionally so any fault leaves
+    /// `world` untouched.
     pub fn build_commit_pool(
         &self,
         world: &mut World,
@@ -3939,63 +4466,27 @@ impl Interpreter<'_> {
                 plan.created_pool_array,
                 true,
             )
+            || !pool_changes_allowed(world, &plan.pool_changes, true)
         {
             return Ok(None);
         }
-        let active = usize::try_from(world.size).unwrap_or(0);
-        let mut dig_elev: Option<u8> = None;
-        for &(idx, before, after) in &plan.pool_changes {
-            let tx = idx / FULL_SIZE;
-            let ty = idx % FULL_SIZE;
-            if before >= 16 && after < 16 {
-                if !tile_supports_pool_dig(world, tx, ty) {
-                    return Ok(None);
-                }
-                let Some(elev) = tile_flat_elevation(world, tx, ty) else {
-                    return Ok(None);
-                };
-                if let Some(expected) = dig_elev {
-                    if elev != expected {
-                        return Ok(None);
-                    }
-                } else {
-                    dig_elev = Some(elev);
-                }
-                for (nx, ny) in [
-                    (tx.checked_sub(1), Some(ty)),
-                    ((tx + 1 < active).then_some(tx + 1), Some(ty)),
-                    (Some(tx), ty.checked_sub(1)),
-                    (Some(tx), (ty + 1 < active).then_some(ty + 1)),
-                ] {
-                    let (Some(nx), Some(ny)) = (nx, ny) else {
-                        continue;
-                    };
-                    if is_pool_tile(world, nx, ny)
-                        && tile_flat_elevation(world, nx, ny) != Some(elev)
-                    {
-                        return Ok(None);
-                    }
-                }
-            }
-            if before < 16 && after >= 16 && !tile_supports_pool_demolish(world, tx, ty) {
-                return Ok(None);
-            }
-        }
+        let mut staged = world.clone();
         apply_byte_array_diffs(
-            world,
+            &mut staged,
             POOL_ARRAY,
             &plan.pool_changes,
             plan.created_pool_array,
             true,
         )?;
-        self.rebuild_architecture_rooms(world)?;
+        self.rebuild_architecture_rooms(&mut staged)?;
         if plan.net_cost != 0 {
-            spend(world, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
+            spend(&mut staged, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
                 object: 0,
                 at: None,
                 trap,
             })?;
         }
+        *world = staged;
         Ok(Some(BuildHistory::Pool {
             pool_changes: plan.pool_changes.clone(),
             created_pool_array: plan.created_pool_array,
@@ -4097,6 +4588,12 @@ impl Lot {
     /// unified Undo/Redo stack.
     pub fn build_commit_pool(&mut self, plan: &PoolPlan) -> Result<bool, OrderError> {
         commit_build_history_on_lot(self, |interp, world| interp.build_commit_pool(world, plan))
+    }
+
+    /// Returns the lot's current [`RoofState`] (pattern stem and pitch preset),
+    /// falling back to `base` (from `HOUS 0`) when never edited.
+    pub fn roof_state_with_base(&self, base: &RoofState) -> RoofState {
+        roof_state_with_base(&self.world, base)
     }
 
     /// Returns the lot's current [`RoofState`] (pattern stem and pitch preset).

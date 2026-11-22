@@ -52,43 +52,59 @@ Verified directly against Complete Collection 1.91 game assets (`GameData/Build.
 - **Terrain (`plan_terrain_edit`, `build_commit_terrain`)**:
   - Supports `Raise`, `Lower`, `Level` (anchor vertex height per `STR# 128[3]`),
     `LevelAverage` (rounded mean), `RestoreGrass`, and `RemoveGrass`.
-  - Enforces buildability guards on all four incident tiles of every edited
-    vertex: inside `2..=active-2`, off-road (`FLOORS[0] not in 9..=13`),
-    unlocked (`Arry 8` bit `0x20` clear), no walls or floors on level 1 or 2,
-    no pool (`Arry 9 < 16`) or water (`Arry 10 < 16`), and no non-cursor on-lot
-    objects.
+  - Enforces buildability guards on editable vertices (`2..=active-2`) and all
+    four of their incident tiles (`1..=active-2`): off-road
+    (`FLOORS[0] not in 9..=13`), unlocked (`Arry 8` bit `0x20` clear), no walls
+    or floors on level 1 or 2, no pool (`Arry 9 < 16`) or water
+    (`Arry 10 < 16`), and no non-cursor on-lot objects.
   - Enforces `MAX_TERRAIN_SLOPE = 5` (matching `sims-render/src/grass.rs`'s
     `[-5, 5]` lighting table) on single-vertex edits and via feasible-interval
-    relaxation on `Level`/`LevelAverage` drags so boundary edges never exceed
-    the slope limit.
+    relaxation (preserving pre-existing slope allowances on both boundary and
+    internal edges plus a final edge validation pass) on `Level`/`LevelAverage`
+    drags so edits never create new slopes above 5 steps.
   - Rebuilds rooms and `FLAG_BUILDABLE` flags (`rebuild_architecture_rooms`)
-    whenever terrain heights change, and charges Architecture budget category `7`.
+    whenever terrain heights change, charges Architecture budget category `7`,
+    stages interpreter commits transactionally so faults leave `World` intact,
+    and reconciles natural `World::grow_grass` regrowth (`expected < cur <= target`)
+    separately from geometry conflicts during Undo/Redo.
 - **Water/Pond (`plan_water_edit`, `build_commit_water`)**:
-  - Paints or Ctrl-removes `Arry 10` tiles with automatic 4-bit connectivity
-    recomputation across modified tiles and neighbors, depresses mutable basin
-    vertices on elevated terrain (without disturbing locked/wall/floor/pool/object
-    banks), protects locked river tiles (`FLAG_LOCKED = 0x20`), charges `$15` /
-    refunds `$12` (80%) to Architecture category `7`, and handles optional
-    `Arry 10` creation/removal across Undo.
+  - Paints or Ctrl-removes `Arry 10` tiles with localized 4-bit connectivity
+    recomputation across modified tiles and cardinal neighbors (preserving
+    untouched distant bytes and `0x10` sentinels), depresses mutable basin
+    vertices on Paint, fills removed dry basins from the surrounding dry bank
+    on Remove (while pinning protected vertices and those bordering surviving
+    water), protects locked river tiles (`FLAG_LOCKED = 0x20`), charges `$15` /
+    refunds `$12` (80%) to Architecture category `7`, validates neighbor
+    connectivity & untouched `0xff` bytes before array deletion on Undo, and
+    enforces directional live guards on commit, Undo, and Redo.
 - **Swimming Pool (`plan_pool_edit`, `build_commit_pool`)**:
   - Validates flat ground, uniform pool elevation across drag and adjacent
     existing pool tiles, off-road, unlocked, dry, wall-free, floor-free, and
     object-free tiles on Dig; refuses demolishing tiles occupied by a Sim or
     object on Demolish; charges `$75` / refunds `$60` (80%) to Architecture
-    category `7`; and runs `rebuild_architecture_rooms` so `World::rooms`
-    tracks `room.pool` and tile flags immediately.
-- **Roof (`plan_roof_edit`, `plan_roof_pattern`, `plan_roof_pitch`, `build_commit_roof`)**:
+    category `7`; runs `rebuild_architecture_rooms` so `World::rooms` tracks
+    `room.pool` and tile flags immediately; and enforces directional live
+    guards, neighbor mask validation, and transactional staging across commit,
+    Undo, and Redo.
+- **Roof (`roof_state_with_base`, `plan_roof_edit_with_base`, `build_commit_roof`)**:
+  - Callers pass the house's `HOUS 0` baseline (`RoofState::from_house_view`)
+    into `roof_state_with_base` / `plan_roof_*_with_base` so partial pattern or
+    pitch edits preserve the untouched `HOUS 0` field and selecting `"r1_"` on
+    non-default houses (e.g. `House05.iff` `r3_`) is never misclassified as a
+    no-op.
   - Stores edited roof state inside `World::arrays[ROOF_META_ARRAY]` (`0x7266`,
-    `[pitch_f32_le][utf8_stem]`) only upon explicit roof edits so load hashes
-    and existing replay/ratchet outputs remain bit-identical, while `World::clone`,
-    `Lot::save()`/`Lot::restore()`, and `BuildHistory::Roof` Undo/Redo
-    (removing `ROOF_META_ARRAY` when undoing back to initial state) work
-    seamlessly without altering `World`'s snapshot schema.
+    `[pitch_f32_le][utf8_stem]`, normalizing `.bmp` once on input) only upon
+    explicit roof edits so load hashes and existing replay/ratchet outputs
+    remain bit-identical, while `World::clone`, `Lot::save()`/`Lot::restore()`,
+    and `BuildHistory::Roof` Undo/Redo (removing `ROOF_META_ARRAY` when undoing
+    back to the untouched baseline) work seamlessly without altering `World`'s
+    snapshot schema.
 - **Unified Undo/Redo (`BuildHistory::{Terrain, Water, Pool, Roof}` & `Lot::build_commit_*`)**:
-  - Implemented `Lot::build_commit_{terrain, water, pool, roof}` and
-    `Lot::roof_state` directly in `crates/sims-vm/src/build.rs`, integrating
-    chronologically with `Lot::undo()` / `Lot::redo()` and re-validating live
-    guards, funds, and cell pre-states before every commit/undo/redo.
+  - Implemented `Lot::build_commit_{terrain, water, pool, roof}`,
+    `Lot::roof_state`, and `Lot::roof_state_with_base` directly in
+    `crates/sims-vm/src/build.rs`, integrating chronologically with
+    `Lot::undo()` / `Lot::redo()` and re-validating directional live guards,
+    funds, and cell/neighbor pre-states before every commit, Undo, and Redo.
 
 ### 3. UI Subtools, Roof Catalog & Narrow-Viewport Overlap Fix (`sims-ui::build`)
 - Added native `Res_CPanel.h` subtool and roof resource IDs (`3516..=3520`,
@@ -101,11 +117,15 @@ Verified directly against Complete Collection 1.91 game assets (`GameData/Build.
   `BuildSubtoolPopup`, `BuildLayout::press_subtool`, `BuildState::apply_subtool`,
   and `build::draw_with_catalog` so `sims-game` compiles untouched until the
   follow-up wiring pass lands.
-- Fixed the sub-620 px narrow-viewport Build tool-strip overlap nit by
-  computing right-hand grid geometry first and paginating the 6×2 Build tool
-  columns strictly left of `prev_arrow_x` with a `ToolPage(1)` cycle control
-  when `width < 620`, while preserving exact native `cWinArch` coordinates for
-  all `width >= 620` viewports.
+- Fixed the narrow-viewport Build tool-strip overlap nit using measured art
+  dimensions: standard tools switch below `620 px` and `BuildTool::Roof`
+  switches below `652 px` (accommodating its pitch column), while wide
+  viewports preserve exact native `cWinArch` coordinates. On narrow viewports
+  (e.g. `480 px`–`651 px`), all 12 Build tools compact into a non-overlapping
+  4×3 grid strictly left of `prev_arrow_x` with scaled icon rendering so every
+  existing tool remains directly clickable through `BuildLayout::press` (no
+  regression in the existing HUD) and no swatch or arrow ever overlaps even
+  down to `360 px`.
 
 ## What Would Reopen This
 - Wiring the thin `sims-game` pointer/drag dispatch and `sims-render` roof/pool

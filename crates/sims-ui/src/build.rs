@@ -150,12 +150,17 @@ const STR_POOL: u16 = 133;
 const STR_PLUGIN_FLOOR: u16 = 134;
 const STR_PLUGIN_WALL: u16 = 135;
 
-/// Narrow-viewport threshold below which Build Mode compacts/paginates the
-/// tool strip so catalog slots never overlap tool buttons.
+/// Narrow-viewport threshold below which Build Mode compacts the tool strip so
+/// catalog slots never overlap tool buttons (`Roof` switches below 652 px when
+/// its pitch column needs extra width).
 const NARROW_WIDTH: i32 = 620;
 const TOOL_STRIP_LEFT: i32 = 268;
 const TOOL_COL_GAP: i32 = 2;
-const ROOF_PITCH_COL_WIDTH: i32 = 32;
+/// Minimum horizontal room required to render all 12 Build tools in a compact
+/// 4×3 grid directly clickable through `BuildLayout::press`.
+const COMPACT_TOOL_COLS: i32 = 4;
+const COMPACT_TOOL_ROWS: i32 = 3;
+const COMPACT_TOOL_MIN_W: i32 = 14;
 
 /// Native 6-column × 2-row pairing of [`TOOL_BUTTONS`] indices (top, bottom)
 /// used when paginating tool buttons on sub-620 px narrow viewports.
@@ -1201,30 +1206,35 @@ pub fn layout(
 
     // Undo / Redo buttons (`0x5005a3`, `0x50065b`).
     let [uw, uh] = btn_size(id::UNDO);
-    widgets.push(BuildWidget {
-        rect: Rect::new(UNDO_POS[0], strip_y + UNDO_POS[1], uw, uh),
-        kind: BuildWidgetKind::Button {
-            id: id::UNDO,
-            selected: false,
-            enabled: can_undo,
-        },
-        command: can_undo.then_some(Command::Undo),
-        tooltip: Some("Undo".into()),
-    });
     let [rw, rh] = btn_size(id::REDO);
-    widgets.push(BuildWidget {
-        rect: Rect::new(REDO_POS[0], strip_y + REDO_POS[1], rw, rh),
-        kind: BuildWidgetKind::Button {
-            id: id::REDO,
-            selected: false,
-            enabled: can_redo,
-        },
-        command: can_redo.then_some(Command::Redo),
-        tooltip: Some("Redo".into()),
-    });
+    let undo_right = UNDO_POS[0] + uw.max(rw);
+    if UNDO_POS[0] + uw <= width {
+        widgets.push(BuildWidget {
+            rect: Rect::new(UNDO_POS[0], strip_y + UNDO_POS[1], uw, uh),
+            kind: BuildWidgetKind::Button {
+                id: id::UNDO,
+                selected: false,
+                enabled: can_undo,
+            },
+            command: can_undo.then_some(Command::Undo),
+            tooltip: Some("Undo".into()),
+        });
+    }
+    if REDO_POS[0] + rw <= width {
+        widgets.push(BuildWidget {
+            rect: Rect::new(REDO_POS[0], strip_y + REDO_POS[1], rw, rh),
+            kind: BuildWidgetKind::Button {
+                id: id::REDO,
+                selected: false,
+                enabled: can_redo,
+            },
+            command: can_redo.then_some(Command::Redo),
+            tooltip: Some("Redo".into()),
+        });
+    }
 
-    // Determine right-hand catalog/subtool grid geometry first so narrow
-    // viewports (< 620 px) can paginate tool buttons strictly to the left.
+    // Determine right-hand catalog/subtool grid geometry using measured art
+    // sizes so narrow viewports never overlap tools, swatches, or page arrows.
     let cell = CELL as i32;
     let [prev_aw, prev_ah] = arrow_size(id::PREV_ARROW);
     let [next_aw, next_ah] = arrow_size(id::NEXT_ARROW);
@@ -1237,40 +1247,67 @@ pub fn layout(
         None => false,
     };
 
-    let grid_right = (width - GRID_RIGHT_MARGIN).max(cell).min(width);
-    let roof_extra = if is_roof { ROOF_PITCH_COL_WIDTH } else { 0 };
-    let narrow =
-        width < NARROW_WIDTH || (has_right_grid && grid_right - GRID_LEFT < cell + roof_extra);
-    let grid_left = if !has_right_grid {
-        width
-    } else if !narrow {
-        GRID_LEFT
-    } else {
-        // Reserve 2 catalog columns on narrow viewports when room remains for
-        // at least one tool column + arrows, otherwise 1 column.
-        let min_tools = TOOL_STRIP_LEFT + 46 + prev_aw + 8;
-        let two_col = grid_right - cell * 2 - roof_extra;
-        let one_col = grid_right - cell - roof_extra;
-        if two_col >= min_tools {
-            two_col
-        } else {
-            one_col
-                .max(TOOL_STRIP_LEFT + prev_aw + 4)
-                .min(grid_right - cell)
-                .max(0)
-        }
-    };
-    let prev_arrow_x = if grid_left == GRID_LEFT && !narrow {
-        PREV_ARROW_X
-    } else {
-        (grid_left - prev_aw - 4).max(0)
-    };
-    let next_arrow_x = (width - NEXT_ARROW_MARGIN)
-        .max(grid_right + 1)
-        .min((width - next_aw).max(0));
+    let max_pitch_w = RoofPitchPreset::ALL
+        .iter()
+        .map(|p| pitch_size(p.resource_id())[0])
+        .max()
+        .unwrap_or(26);
+    let roof_pitch_col_w = max_pitch_w + 4;
+    let roof_extra = if is_roof { roof_pitch_col_w } else { 0 };
+    let native_tools_right = TOOL_BUTTONS
+        .iter()
+        .map(|&(_, res_id, pos, _)| pos[0] + btn_size(res_id)[0])
+        .max()
+        .unwrap_or(538);
 
-    // 12 Build Tool buttons (`0x6f2bf0`): native coordinates on wide viewports,
-    // non-overlapping paginated columns strictly left of the grid when narrow.
+    let wide_next_arrow_x = (width - NEXT_ARROW_MARGIN)
+        .min((width - next_aw).max(0))
+        .max(0);
+    let wide_grid_right = (width - GRID_RIGHT_MARGIN)
+        .min((wide_next_arrow_x - 1).max(0))
+        .max(0);
+    let wide_fits = width >= NARROW_WIDTH
+        && native_tools_right <= width
+        && (!has_right_grid
+            || (native_tools_right < PREV_ARROW_X
+                && PREV_ARROW_X + prev_aw <= GRID_LEFT
+                && wide_grid_right - GRID_LEFT >= cell + roof_extra));
+    let narrow = !wide_fits;
+
+    let (grid_left, grid_right, prev_arrow_x, next_arrow_x) = if !narrow {
+        (
+            if has_right_grid { GRID_LEFT } else { width },
+            wide_grid_right,
+            PREV_ARROW_X,
+            wide_next_arrow_x,
+        )
+    } else {
+        let next_x = (width - next_aw - 2).max(0);
+        let right = (next_x - 2).max(0);
+        let tools_left = (undo_right + 4).max(TOOL_STRIP_LEFT);
+        let min_grid_left = undo_right + prev_aw + 3;
+        let min_compact_tools = COMPACT_TOOL_COLS * 16 + (COMPACT_TOOL_COLS - 1) * TOOL_COL_GAP;
+        let left = if !has_right_grid {
+            width
+        } else {
+            let two_col = right - cell * 2 - roof_extra;
+            let one_col = right - cell - roof_extra;
+            if two_col >= tools_left + min_compact_tools + prev_aw + 6 {
+                two_col
+            } else if one_col >= min_grid_left {
+                one_col
+            } else {
+                min_grid_left.min(right)
+            }
+        };
+        let prev_x = (left - prev_aw - 2).max(0);
+        (left, right, prev_x, next_x)
+    };
+
+    // 12 Build Tool buttons (`0x6f2bf0`): exact native coordinates on wide
+    // viewports; on narrow viewports compact all 12 tools into a non-overlapping
+    // grid strictly left of `prev_arrow_x` so every tool stays directly
+    // reachable through `BuildLayout::press` without hiding behind a pager.
     let mut tool_page = 0usize;
     let mut total_tool_pages = 1usize;
     if !narrow {
@@ -1288,67 +1325,30 @@ pub fn layout(
             });
         }
     } else {
-        let tools_left = (UNDO_POS[0] + uw.max(rw) + 4).max(TOOL_STRIP_LEFT);
+        let tools_left = (undo_right + 4).max(TOOL_STRIP_LEFT);
         let tools_right = if has_right_grid {
-            (prev_arrow_x - 4).max(tools_left)
+            (prev_arrow_x - 3).max(tools_left)
         } else {
             (width - 4).max(tools_left)
         };
+        let avail_w = (tools_right - tools_left).max(0);
         let col_widths: [i32; 6] = std::array::from_fn(|ci| {
             let (top_i, bot_i) = TOOL_COLUMNS[ci];
             btn_size(TOOL_BUTTONS[top_i].1)[0].max(btn_size(TOOL_BUTTONS[bot_i].1)[0])
         });
-        let total_w: i32 = col_widths.iter().sum::<i32>() + TOOL_COL_GAP * 5;
-        let need_pager = total_w > (tools_right - tools_left);
-        let usable_right = if need_pager {
-            (tools_right - next_aw - 4).max(tools_left)
-        } else {
-            tools_right
-        };
-        // Pack columns greedily into pages so no button ever overflows `usable_right`.
-        let mut pages: Vec<Vec<usize>> = Vec::new();
-        let mut cur_page: Vec<usize> = Vec::new();
-        let mut cur_w = 0i32;
-        for (ci, &cw) in col_widths.iter().enumerate() {
-            let add = if cur_page.is_empty() {
-                cw
-            } else {
-                TOOL_COL_GAP + cw
-            };
-            if !cur_page.is_empty() && cur_w + add > (usable_right - tools_left) {
-                pages.push(std::mem::take(&mut cur_page));
-                cur_w = 0;
-            }
-            if cur_page.is_empty() && cw > (usable_right - tools_left) {
-                // Skip if the viewport is impossibly tiny (< 1 button wide).
-                continue;
-            }
-            let step = if cur_page.is_empty() {
-                cw
-            } else {
-                TOOL_COL_GAP + cw
-            };
-            cur_page.push(ci);
-            cur_w += step;
-        }
-        if !cur_page.is_empty() {
-            pages.push(cur_page);
-        }
-        total_tool_pages = pages.len().max(1);
-        tool_page = if pages.is_empty() {
-            0
-        } else {
-            state.tool_page % pages.len()
-        };
-        if let Some(cols_on_page) = pages.get(tool_page) {
+        let total_6x2_w: i32 = col_widths.iter().sum::<i32>() + TOOL_COL_GAP * 5;
+        let min_4x3_w =
+            COMPACT_TOOL_COLS * COMPACT_TOOL_MIN_W + (COMPACT_TOOL_COLS - 1) * TOOL_COL_GAP;
+
+        if total_6x2_w <= avail_w {
             let mut x = tools_left;
-            for &ci in cols_on_page {
+            for (ci, &cw) in col_widths.iter().enumerate() {
                 let (top_i, bot_i) = TOOL_COLUMNS[ci];
-                let cw = col_widths[ci];
-                for &(idx, row_y) in &[(top_i, 4), (bot_i, 54)] {
+                for &(idx, row_y) in &[(top_i, 4), (bot_i, 52)] {
                     let (tool, res_id, _, _) = TOOL_BUTTONS[idx];
                     let [w, h] = btn_size(res_id);
-                    if x + w <= usable_right {
+                    let h = h.min(45);
+                    if x + w <= tools_right {
                         widgets.push(BuildWidget {
                             rect: Rect::new(x, strip_y + row_y, w, h),
                             kind: BuildWidgetKind::Button {
@@ -1363,19 +1363,72 @@ pub fn layout(
                 }
                 x += cw + TOOL_COL_GAP;
             }
-        }
-        if pages.len() > 1 && usable_right + 2 + next_aw <= tools_right {
-            subtools.push(BuildSubtoolWidget {
-                rect: Rect::new(usable_right + 2, strip_y + ARROW_Y, next_aw, next_ah),
-                action: BuildSubtoolAction::ToolPage(1),
-                resource_id: Some(id::NEXT_ARROW),
-                roof_pattern: None,
-                selected: false,
-                affordable: true,
-                name: "More Build Tools".to_owned(),
-                price: 0,
-                description: "Cycle Build Mode tool strip page.".to_owned(),
-            });
+        } else if avail_w >= min_4x3_w {
+            let row_gap = 2;
+            let btn_w = (avail_w - (COMPACT_TOOL_COLS - 1) * TOOL_COL_GAP) / COMPACT_TOOL_COLS;
+            let btn_h = (STRIP - 4 - (COMPACT_TOOL_ROWS - 1) * row_gap) / COMPACT_TOOL_ROWS;
+            for (idx, &(tool, res_id, _, _)) in TOOL_BUTTONS.iter().enumerate() {
+                let col = (idx as i32) % COMPACT_TOOL_COLS;
+                let row = (idx as i32) / COMPACT_TOOL_COLS;
+                let x = tools_left + col * (btn_w + TOOL_COL_GAP);
+                let y = strip_y + 2 + row * (btn_h + row_gap);
+                widgets.push(BuildWidget {
+                    rect: Rect::new(x, y, btn_w, btn_h),
+                    kind: BuildWidgetKind::Button {
+                        id: res_id,
+                        selected: state.tool == Some(tool),
+                        enabled: true,
+                    },
+                    command: Some(Command::BuildTool(tool)),
+                    tooltip: Some(catalog.tool_tip(tool).to_owned()),
+                });
+            }
+        } else if avail_w >= COMPACT_TOOL_MIN_W + next_aw + 2 {
+            // Ultra-narrow fallback (< ~430 px): paginate compact 3-row columns
+            // without ever dropping a tool or overflowing `tools_right`.
+            let usable_w = avail_w - next_aw - 2;
+            let cols_per_page =
+                ((usable_w + TOOL_COL_GAP) / (COMPACT_TOOL_MIN_W + TOOL_COL_GAP)).max(1) as usize;
+            let per_page = cols_per_page * (COMPACT_TOOL_ROWS as usize);
+            total_tool_pages = TOOL_BUTTONS.len().div_ceil(per_page).max(1);
+            tool_page = state.tool_page % total_tool_pages;
+            let start = tool_page * per_page;
+            let col_w = ((usable_w - (cols_per_page as i32 - 1) * TOOL_COL_GAP)
+                / cols_per_page as i32)
+                .max(1);
+            let row_gap = 2;
+            let btn_h = (STRIP - 4 - (COMPACT_TOOL_ROWS - 1) * row_gap) / COMPACT_TOOL_ROWS;
+            for (slot, &(tool, res_id, _, _)) in
+                TOOL_BUTTONS.iter().skip(start).take(per_page).enumerate()
+            {
+                let col = (slot / COMPACT_TOOL_ROWS as usize) as i32;
+                let row = (slot % COMPACT_TOOL_ROWS as usize) as i32;
+                let x = tools_left + col * (col_w + TOOL_COL_GAP);
+                let y = strip_y + 2 + row * (btn_h + row_gap);
+                widgets.push(BuildWidget {
+                    rect: Rect::new(x, y, col_w, btn_h),
+                    kind: BuildWidgetKind::Button {
+                        id: res_id,
+                        selected: state.tool == Some(tool),
+                        enabled: true,
+                    },
+                    command: Some(Command::BuildTool(tool)),
+                    tooltip: Some(catalog.tool_tip(tool).to_owned()),
+                });
+            }
+            if total_tool_pages > 1 {
+                subtools.push(BuildSubtoolWidget {
+                    rect: Rect::new(tools_right - next_aw, strip_y + ARROW_Y, next_aw, next_ah),
+                    action: BuildSubtoolAction::ToolPage(1),
+                    resource_id: Some(id::NEXT_ARROW),
+                    roof_pattern: None,
+                    selected: false,
+                    affordable: true,
+                    name: "More Build Tools".to_owned(),
+                    price: 0,
+                    description: "Cycle Build Mode tool strip page.".to_owned(),
+                });
+            }
         }
     }
 
@@ -1398,46 +1451,52 @@ pub fn layout(
             } else {
                 catalog.terrain_subtools.clone()
             };
-            let cols = ((grid_right - grid_left) / cell).max(1) as usize;
-            let per_page = cols * GRID_ROWS;
-            total_pages = entries.len().div_ceil(per_page);
-            page = if total_pages > 0 {
-                page.min(total_pages - 1)
-            } else {
-                0
-            };
-            let start = page * per_page;
-            for (slot, entry) in entries.iter().skip(start).take(per_page).enumerate() {
-                let col = (slot % cols) as i32;
-                let row = (slot / cols) as i32;
-                let rect = Rect::new(
-                    grid_left + col * cell,
-                    strip_y + GRID_TOP + row * cell,
-                    cell,
-                    cell,
+            let cols = ((grid_right - grid_left) / cell).max(0) as usize;
+            if cols > 0 {
+                let per_page = cols * GRID_ROWS;
+                total_pages = entries.len().div_ceil(per_page);
+                page = if total_pages > 0 {
+                    page.min(total_pages - 1)
+                } else {
+                    0
+                };
+                let start = page * per_page;
+                for (slot, entry) in entries.iter().skip(start).take(per_page).enumerate() {
+                    let col = (slot % cols) as i32;
+                    let row = (slot / cols) as i32;
+                    let rect = Rect::new(
+                        grid_left + col * cell,
+                        strip_y + GRID_TOP + row * cell,
+                        cell,
+                        cell,
+                    );
+                    subtools.push(BuildSubtoolWidget {
+                        rect,
+                        action: BuildSubtoolAction::Terrain(entry.subtool),
+                        resource_id: Some(entry.resource_id),
+                        roof_pattern: None,
+                        selected: state.terrain_subtool == entry.subtool,
+                        affordable: entry.price <= available_funds,
+                        name: entry.name.clone(),
+                        price: entry.price,
+                        description: entry.description.clone(),
+                    });
+                }
+                push_page_arrows(
+                    &mut widgets,
+                    page,
+                    start + per_page < entries.len(),
+                    prev_arrow_x,
+                    next_arrow_x,
+                    undo_right,
+                    grid_left,
+                    grid_right,
+                    width,
+                    strip_y,
+                    [prev_aw, prev_ah],
+                    [next_aw, next_ah],
                 );
-                subtools.push(BuildSubtoolWidget {
-                    rect,
-                    action: BuildSubtoolAction::Terrain(entry.subtool),
-                    resource_id: Some(entry.resource_id),
-                    roof_pattern: None,
-                    selected: state.terrain_subtool == entry.subtool,
-                    affordable: entry.price <= available_funds,
-                    name: entry.name.clone(),
-                    price: entry.price,
-                    description: entry.description.clone(),
-                });
             }
-            push_page_arrows(
-                &mut widgets,
-                page,
-                start + per_page < entries.len(),
-                prev_arrow_x,
-                next_arrow_x,
-                strip_y,
-                [prev_aw, prev_ah],
-                [next_aw, next_ah],
-            );
         }
         Some(BuildTool::Water) => {
             let water_entries: Vec<WaterSubtoolEntry> = if catalog.water_subtools.is_empty() {
@@ -1456,89 +1515,110 @@ pub fn layout(
             };
             let obj_items = catalog.items_for(BuildTool::Water);
             let total_entries = water_entries.len() + obj_items.len();
-            let cols = ((grid_right - grid_left) / cell).max(1) as usize;
-            let per_page = cols * GRID_ROWS;
-            total_pages = total_entries.div_ceil(per_page);
-            page = if total_pages > 0 {
-                page.min(total_pages - 1)
-            } else {
-                0
-            };
-            let start = page * per_page;
-            for slot in 0..per_page {
-                let global_idx = start + slot;
-                if global_idx >= total_entries {
-                    break;
-                }
-                let col = (slot % cols) as i32;
-                let row = (slot / cols) as i32;
-                let rect = Rect::new(
-                    grid_left + col * cell,
-                    strip_y + GRID_TOP + row * cell,
-                    cell,
-                    cell,
-                );
-                if global_idx < water_entries.len() {
-                    let entry = &water_entries[global_idx];
-                    subtools.push(BuildSubtoolWidget {
-                        rect,
-                        action: BuildSubtoolAction::Water(entry.subtool),
-                        resource_id: Some(entry.resource_id),
-                        roof_pattern: None,
-                        selected: state.selected.is_none() && state.water_subtool == entry.subtool,
-                        affordable: entry.price <= available_funds,
-                        name: entry.name.clone(),
-                        price: entry.price,
-                        description: entry.description.clone(),
-                    });
+            let cols = ((grid_right - grid_left) / cell).max(0) as usize;
+            if cols > 0 {
+                let per_page = cols * GRID_ROWS;
+                total_pages = total_entries.div_ceil(per_page);
+                page = if total_pages > 0 {
+                    page.min(total_pages - 1)
                 } else {
-                    let item = obj_items[global_idx - water_entries.len()];
-                    widgets.push(BuildWidget {
-                        rect,
-                        kind: BuildWidgetKind::Slot {
-                            item: item.id,
-                            selected: state.selected == Some(item.id),
-                            affordable: item.price <= available_funds,
-                        },
-                        command: Some(Command::BuildItem(item.id)),
-                        tooltip: None,
-                    });
+                    0
+                };
+                let start = page * per_page;
+                for slot in 0..per_page {
+                    let global_idx = start + slot;
+                    if global_idx >= total_entries {
+                        break;
+                    }
+                    let col = (slot % cols) as i32;
+                    let row = (slot / cols) as i32;
+                    let rect = Rect::new(
+                        grid_left + col * cell,
+                        strip_y + GRID_TOP + row * cell,
+                        cell,
+                        cell,
+                    );
+                    if global_idx < water_entries.len() {
+                        let entry = &water_entries[global_idx];
+                        subtools.push(BuildSubtoolWidget {
+                            rect,
+                            action: BuildSubtoolAction::Water(entry.subtool),
+                            resource_id: Some(entry.resource_id),
+                            roof_pattern: None,
+                            selected: state.selected.is_none()
+                                && state.water_subtool == entry.subtool,
+                            affordable: entry.price <= available_funds,
+                            name: entry.name.clone(),
+                            price: entry.price,
+                            description: entry.description.clone(),
+                        });
+                    } else {
+                        let item = obj_items[global_idx - water_entries.len()];
+                        widgets.push(BuildWidget {
+                            rect,
+                            kind: BuildWidgetKind::Slot {
+                                item: item.id,
+                                selected: state.selected == Some(item.id),
+                                affordable: item.price <= available_funds,
+                            },
+                            command: Some(Command::BuildItem(item.id)),
+                            tooltip: None,
+                        });
+                    }
                 }
+                push_page_arrows(
+                    &mut widgets,
+                    page,
+                    start + per_page < total_entries,
+                    prev_arrow_x,
+                    next_arrow_x,
+                    undo_right,
+                    grid_left,
+                    grid_right,
+                    width,
+                    strip_y,
+                    [prev_aw, prev_ah],
+                    [next_aw, next_ah],
+                );
             }
-            push_page_arrows(
-                &mut widgets,
-                page,
-                start + per_page < total_entries,
-                prev_arrow_x,
-                next_arrow_x,
-                strip_y,
-                [prev_aw, prev_ah],
-                [next_aw, next_ah],
-            );
         }
         Some(BuildTool::Roof) => {
-            // Left pitch column (Flat, Shallow, Medium, Steep).
-            let mut py = strip_y + 6;
-            for preset in RoofPitchPreset::ALL {
-                let [pw, ph] = pitch_size(preset.resource_id());
-                subtools.push(BuildSubtoolWidget {
-                    rect: Rect::new(grid_left, py, pw, ph),
-                    action: BuildSubtoolAction::RoofPitch(preset),
-                    resource_id: Some(preset.resource_id()),
-                    roof_pattern: None,
-                    selected: state.roof_pitch == preset,
-                    affordable: true,
-                    name: preset.label().to_owned(),
-                    price: 0,
-                    description: format!("Set roof slope pitch to {:.1}.", preset.pitch_f32()),
-                });
-                py += ph + 3;
+            // Left pitch column (Flat, Shallow, Medium, Steep) fitted cleanly
+            // within the strip height using measured art dimensions.
+            if grid_left + max_pitch_w <= grid_right {
+                let raw_heights: [i32; 4] =
+                    std::array::from_fn(|i| pitch_size(RoofPitchPreset::ALL[i].resource_id())[1]);
+                let sum_h: i32 = raw_heights.iter().sum();
+                let (mut py, gap, cap_h) = if sum_h + 9 <= STRIP - 10 {
+                    (strip_y + 6, 3, i32::MAX)
+                } else if sum_h + 3 <= STRIP - 4 {
+                    (strip_y + 2, ((STRIP - 4 - sum_h) / 3).max(1), i32::MAX)
+                } else {
+                    (strip_y + 2, 1, ((STRIP - 4 - 3) / 4).max(1))
+                };
+                for (i, preset) in RoofPitchPreset::ALL.into_iter().enumerate() {
+                    let [pw, _] = pitch_size(preset.resource_id());
+                    let ph = raw_heights[i].min(cap_h);
+                    subtools.push(BuildSubtoolWidget {
+                        rect: Rect::new(grid_left, py, pw.min(max_pitch_w), ph),
+                        action: BuildSubtoolAction::RoofPitch(preset),
+                        resource_id: Some(preset.resource_id()),
+                        roof_pattern: None,
+                        selected: state.roof_pitch == preset,
+                        affordable: true,
+                        name: preset.label().to_owned(),
+                        price: 0,
+                        description: format!("Set roof slope pitch to {:.1}.", preset.pitch_f32()),
+                    });
+                    py += ph + gap;
+                }
             }
-            // Paginated `GameData/Roofs/*.bmp` pattern swatches to the right.
-            let pattern_left = grid_left + ROOF_PITCH_COL_WIDTH;
+            // Paginated `GameData/Roofs/*.bmp` pattern swatches strictly within
+            // `pattern_left..grid_right` (never overflowing into `next_arrow_x`).
+            let pattern_left = grid_left + roof_pitch_col_w;
             let patterns = catalog.roof_patterns();
-            if !patterns.is_empty() && grid_right > pattern_left {
-                let cols = ((grid_right - pattern_left) / cell).max(1) as usize;
+            let cols = ((grid_right - pattern_left) / cell).max(0) as usize;
+            if !patterns.is_empty() && cols > 0 {
                 let per_page = cols * GRID_ROWS;
                 total_pages = patterns.len().div_ceil(per_page);
                 page = if total_pages > 0 {
@@ -1574,6 +1654,10 @@ pub fn layout(
                     start + per_page < patterns.len(),
                     prev_arrow_x,
                     next_arrow_x,
+                    undo_right,
+                    grid_left,
+                    grid_right,
+                    width,
                     strip_y,
                     [prev_aw, prev_ah],
                     [next_aw, next_ah],
@@ -1582,8 +1666,8 @@ pub fn layout(
         }
         Some(tool) => {
             let items = catalog.items_for(tool);
-            if !items.is_empty() {
-                let cols = ((grid_right - grid_left) / cell).max(1) as usize;
+            let cols = ((grid_right - grid_left) / cell).max(0) as usize;
+            if !items.is_empty() && cols > 0 {
                 let per_page = cols * GRID_ROWS;
                 total_pages = items.len().div_ceil(per_page);
                 if total_pages > 0 {
@@ -1618,6 +1702,10 @@ pub fn layout(
                     start + per_page < items.len(),
                     prev_arrow_x,
                     next_arrow_x,
+                    undo_right,
+                    grid_left,
+                    grid_right,
+                    width,
                     strip_y,
                     [prev_aw, prev_ah],
                     [next_aw, next_ah],
@@ -1692,11 +1780,15 @@ fn push_page_arrows(
     has_next: bool,
     prev_arrow_x: i32,
     next_arrow_x: i32,
+    undo_right: i32,
+    grid_left: i32,
+    grid_right: i32,
+    width: i32,
     strip_y: i32,
     prev_size: [i32; 2],
     next_size: [i32; 2],
 ) {
-    if page > 0 {
+    if page > 0 && prev_arrow_x >= undo_right && prev_arrow_x + prev_size[0] <= grid_left {
         widgets.push(BuildWidget {
             rect: Rect::new(prev_arrow_x, strip_y + ARROW_Y, prev_size[0], prev_size[1]),
             kind: BuildWidgetKind::Button {
@@ -1708,7 +1800,7 @@ fn push_page_arrows(
             tooltip: None,
         });
     }
-    if has_next {
+    if has_next && next_arrow_x >= grid_right && next_arrow_x + next_size[0] <= width {
         widgets.push(BuildWidget {
             rect: Rect::new(next_arrow_x, strip_y + ARROW_Y, next_size[0], next_size[1]),
             kind: BuildWidgetKind::Button {
@@ -1768,7 +1860,11 @@ pub fn draw_with_catalog(
     if let Some(left) = art.image(id::TOOTHPICK_LEFT) {
         frame.draw_all(left, [266, strip_y + 2]);
     }
-    if layout.total_tool_pages <= 1
+    let native_wide = layout
+        .widgets
+        .iter()
+        .any(|w| matches!(w.command, Some(Command::BuildTool(BuildTool::Hand))) && w.rect.x == 502);
+    if native_wide
         && frame.width() as i32 >= NARROW_WIDTH
         && let Some(right) = art.image(id::TOOTHPICK_RIGHT)
     {
@@ -1793,7 +1889,7 @@ pub fn draw_with_catalog(
                     0
                 };
                 if let Some(img) = art.cell(id, 4, cell) {
-                    frame.draw_all(&img, [widget.rect.x, widget.rect.y]);
+                    draw_image_fitted(frame, &img, widget.rect);
                 }
             }
             BuildWidgetKind::Slot {
@@ -1885,9 +1981,7 @@ pub fn draw_with_catalog(
                 frame.draw_all(&bg, [sub.rect.x, sub.rect.y]);
             }
             if let Some(img) = art.cell(res_id, 4, cell) {
-                let dx = (sub.rect.width - img.width as i32) / 2;
-                let dy = (sub.rect.height - img.height as i32) / 2;
-                frame.draw_all(&img, [sub.rect.x + dx, sub.rect.y + dy]);
+                draw_image_fitted(frame, &img, sub.rect);
             }
         }
     }
@@ -1937,6 +2031,42 @@ pub fn draw_with_catalog(
             },
         );
     }
+}
+
+fn draw_image_fitted(frame: &mut Frame, img: &Image, rect: Rect) {
+    if rect.width <= 0 || rect.height <= 0 || img.width == 0 || img.height == 0 {
+        return;
+    }
+    if img.width as i32 <= rect.width && img.height as i32 <= rect.height {
+        let dx = (rect.width - img.width as i32) / 2;
+        let dy = (rect.height - img.height as i32) / 2;
+        frame.draw_all(img, [rect.x + dx, rect.y + dy]);
+        return;
+    }
+    let scale = (rect.width as f32 / img.width as f32).min(rect.height as f32 / img.height as f32);
+    let dst_w = ((img.width as f32 * scale).round() as u32).clamp(1, rect.width as u32);
+    let dst_h = ((img.height as f32 * scale).round() as u32).clamp(1, rect.height as u32);
+    let mut rgba = vec![0u8; dst_w as usize * dst_h as usize * 4];
+    for dy in 0..dst_h {
+        let sy = ((u64::from(dy) * u64::from(img.height)) / u64::from(dst_h))
+            .min(u64::from(img.height - 1)) as u32;
+        for dx in 0..dst_w {
+            let sx = ((u64::from(dx) * u64::from(img.width)) / u64::from(dst_w))
+                .min(u64::from(img.width - 1)) as u32;
+            if let Some(px) = img.pixel(sx, sy) {
+                let off = (dy as usize * dst_w as usize + dx as usize) * 4;
+                rgba[off..off + 4].copy_from_slice(&px);
+            }
+        }
+    }
+    let scaled = Image {
+        width: dst_w,
+        height: dst_h,
+        rgba,
+    };
+    let ox = (rect.width - dst_w as i32) / 2;
+    let oy = (rect.height - dst_h as i32) / 2;
+    frame.draw_all(&scaled, [rect.x + ox, rect.y + oy]);
 }
 
 fn draw_popup_card<F>(

@@ -56,7 +56,7 @@ fn narrow_viewport_build_strip_has_zero_overlaps_across_tools() {
     ]);
     let art = Art::default();
 
-    for width in [480, 512, 580, 619, 620, 640, 660, 800, 1024] {
+    for width in [360, 480, 512, 580, 619, 620, 640, 651, 652, 660, 800, 1024] {
         for tool in [
             None,
             Some(BuildTool::Terrain),
@@ -68,7 +68,7 @@ fn narrow_viewport_build_strip_has_zero_overlaps_across_tools() {
             if let Some(t) = tool {
                 state.select_tool(t, &catalog);
             }
-            let layout = build::layout(
+            let first = build::layout(
                 [width, 384],
                 &catalog,
                 &state,
@@ -78,48 +78,41 @@ fn narrow_viewport_build_strip_has_zero_overlaps_across_tools() {
                 false,
                 None,
             );
-            assert_layout_has_no_overlaps_and_in_bounds(&layout, width);
-            if width >= 660 {
-                assert_eq!(layout.total_tool_pages, 1);
+            assert_layout_has_no_overlaps_and_in_bounds(&first, width);
+            for p in 0..first.total_pages.max(1) {
+                state.page = p;
+                let lay = build::layout(
+                    [width, 384],
+                    &catalog,
+                    &state,
+                    &art,
+                    1000,
+                    true,
+                    false,
+                    None,
+                );
+                assert_layout_has_no_overlaps_and_in_bounds(&lay, width);
+            }
+            if width >= 480 {
+                assert_eq!(first.total_tool_pages, 1);
+                // Every single one of the 12 Build tools must be directly clickable
+                // through `layout.press(point)` (no unreachable pager!).
+                let mut clickable = std::collections::BTreeSet::new();
+                for w in &first.widgets {
+                    if let Some(Command::BuildTool(t)) = w.command {
+                        let c = [w.rect.x + w.rect.width / 2, w.rect.y + w.rect.height / 2];
+                        assert_eq!(first.press(c), Some(Command::BuildTool(t)));
+                        clickable.insert(t);
+                    }
+                }
+                assert_eq!(
+                    clickable.len(),
+                    12,
+                    "all 12 Build tools must remain reachable via press() at width {width} tool {tool:?}"
+                );
             }
         }
     }
-
-    // Verify tool-strip paging cycles through all 12 Build tools cleanly at 512x384.
-    let mut state = BuildState::default();
-    state.select_tool(BuildTool::Terrain, &catalog);
-    let mut seen_tools = std::collections::BTreeSet::new();
-    let first = build::layout([512, 384], &catalog, &state, &art, 1000, true, false, None);
-    assert!(
-        first.total_tool_pages > 1,
-        "512px narrow viewport with active grid should paginate tool strip"
-    );
-    for _ in 0..first.total_tool_pages {
-        let lay = build::layout([512, 384], &catalog, &state, &art, 1000, true, false, None);
-        assert_layout_has_no_overlaps_and_in_bounds(&lay, 512);
-        for w in &lay.widgets {
-            if let Some(Command::BuildTool(t)) = w.command {
-                seen_tools.insert(t);
-            }
-        }
-        let pager = lay
-            .subtools
-            .iter()
-            .find(|s| matches!(s.action, BuildSubtoolAction::ToolPage(_)))
-            .expect("narrow layout must expose tool-page button");
-        let center = [
-            pager.rect.x + pager.rect.width / 2,
-            pager.rect.y + pager.rect.height / 2,
-        ];
-        assert!(lay.covers(center));
-        let action = lay.press_subtool(center).expect("hit tool-page button");
-        assert!(state.apply_subtool(action, &catalog));
-    }
-    assert_eq!(
-        seen_tools.len(),
-        12,
-        "all 12 Build Mode tools must remain reachable via narrow-viewport pagination"
-    );
 }
 
 #[test]
@@ -292,10 +285,17 @@ fn live_install_roof_catalog_subtool_prices_and_narrow_layout_rendering() {
         );
     }
 
-    // Verify zero overlaps on both 800x600 and narrow 512x384 across all tools with real art!
+    // Verify zero overlaps across 360..=800 widths, every tool, and every page with real art!
     let thumbs = Thumbnails::default();
     let swatches = BuildSwatches::default();
-    for size in [[800, 600], [512, 384]] {
+    for size in [
+        [360, 384],
+        [480, 384],
+        [512, 384],
+        [620, 384],
+        [640, 384],
+        [800, 600],
+    ] {
         for tool in [
             BuildTool::Terrain,
             BuildTool::Water,
@@ -305,11 +305,32 @@ fn live_install_roof_catalog_subtool_prices_and_narrow_layout_rendering() {
         ] {
             let mut state = BuildState::default();
             state.select_tool(tool, &build_cat);
-            let lay = build::layout(size, &build_cat, &state, &art, 5000, true, true, None);
-            assert_layout_has_no_overlaps_and_in_bounds(&lay, size[0]);
-            if tool == BuildTool::Floor {
+            let first = build::layout(size, &build_cat, &state, &art, 5000, true, true, None);
+            assert_layout_has_no_overlaps_and_in_bounds(&first, size[0]);
+            for p in 0..first.total_pages.clamp(1, 4) {
+                state.page = p;
+                let lay = build::layout(size, &build_cat, &state, &art, 5000, true, true, None);
+                assert_layout_has_no_overlaps_and_in_bounds(&lay, size[0]);
+            }
+            if size[0] >= 480 {
+                let mut clickable = std::collections::BTreeSet::new();
+                for w in &first.widgets {
+                    if let Some(Command::BuildTool(t)) = w.command {
+                        let c = [w.rect.x + w.rect.width / 2, w.rect.y + w.rect.height / 2];
+                        assert_eq!(first.press(c), Some(Command::BuildTool(t)));
+                        clickable.insert(t);
+                    }
+                }
+                assert_eq!(
+                    clickable.len(),
+                    12,
+                    "all 12 real-art Build tools (including 43px Floor & Water) must be clickable via press() at {size:?} {tool:?}"
+                );
+            }
+            if tool == BuildTool::Floor && size[0] >= 360 {
                 assert!(
-                    lay.widgets
+                    first
+                        .widgets
                         .iter()
                         .any(|w| matches!(w.kind, BuildWidgetKind::Slot { .. })),
                     "Floor slots must remain visible at {size:?}"
@@ -322,7 +343,7 @@ fn live_install_roof_catalog_subtool_prices_and_narrow_layout_rendering() {
                 &thumbs,
                 &swatches,
                 Some(&build_cat),
-                &lay,
+                &first,
                 None,
             );
             assert!(
