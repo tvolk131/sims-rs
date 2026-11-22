@@ -1081,9 +1081,10 @@ mod tests {
             std::array::from_fn(|i| (i as u8).wrapping_mul(7) ^ 0xa5);
 
         // --- Golden FORMAT 6 bytes (commit `2ddea688`) ---
+        assert_eq!(sims_sim::SNAPSHOT_FORMAT, 32);
         let mut raw_2ddea688 = Vec::new();
         raw_2ddea688.extend_from_slice(&6u32.to_le_bytes()); // FORMAT = 6
-        raw_2ddea688.extend_from_slice(&sims_sim::SNAPSHOT_FORMAT.to_le_bytes()); // SNAPSHOT_FORMAT = 32
+        raw_2ddea688.extend_from_slice(&32u32.to_le_bytes()); // SNAPSHOT_FORMAT = 32
         raw_2ddea688.extend_from_slice(&world_postcard); // 1. world: World
         push_varint_u64(&mut raw_2ddea688, 777); // 2. ticks: u32
         push_varint_u64(&mut raw_2ddea688, 33); // 3. start: u32
@@ -1149,7 +1150,7 @@ mod tests {
         // --- Golden FORMAT 7 bytes (commit `50106efb`) ---
         let mut raw_50106efb = Vec::new();
         raw_50106efb.extend_from_slice(&7u32.to_le_bytes()); // FORMAT = 7
-        raw_50106efb.extend_from_slice(&sims_sim::SNAPSHOT_FORMAT.to_le_bytes()); // SNAPSHOT_FORMAT = 32
+        raw_50106efb.extend_from_slice(&32u32.to_le_bytes()); // SNAPSHOT_FORMAT = 32
         raw_50106efb.extend_from_slice(&world_postcard); // 1. world: World
         push_varint_u64(&mut raw_50106efb, 888); // 2. ticks: u32
         push_varint_u64(&mut raw_50106efb, 33); // 3. start: u32

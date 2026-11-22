@@ -1569,4 +1569,30 @@ fn lot_thumbnails_checked_crud_fencing_corruption_and_purge() {
         store.import_directory("NH2", &user_data, 0xff).unwrap();
         assert!(store.load_lot_thumbnails("NH2").unwrap().is_empty());
     }
+
+    // Neighborhood IDs longer than 1,024 bytes remain readable and writable.
+    let long_id = "UserData_".to_owned() + &"y".repeat(1200);
+    store
+        .save_neighborhood(&long_id, &sample_neighborhood(&long_id))
+        .unwrap();
+    let long_nh = store.load_neighborhood(&long_id).unwrap().unwrap();
+    store
+        .save_lot_thumbnail_checked(&long_id, long_nh.instance_id, 3, &thumb5)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.load_lot_thumbnail(&long_id, 3).unwrap().as_ref(),
+        Some(&thumb5)
+    );
+    assert_eq!(
+        store.load_lot_thumbnails(&long_id).unwrap().get(&3),
+        Some(&thumb5)
+    );
+    assert_eq!(
+        store
+            .delete_lot_thumbnail_checked(&long_id, long_nh.instance_id, 3)
+            .unwrap(),
+        Ok(true)
+    );
+    assert!(store.load_lot_thumbnail(&long_id, 3).unwrap().is_none());
 }

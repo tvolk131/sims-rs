@@ -33,14 +33,16 @@ write. That left a narrow Phase 2 window against a concurrent
   and `import_family_fam`. Each household commit now advances revision by +1
   atomically with zero staging tombstones and zero partial-write window against
   concurrent `import_directory`, `delete_neighborhood`, lot saves, or crashes.
-- **Transactional family-deletion album purge:** All neighborhood write paths
-  (`save_neighborhood`, `save_neighborhood_checked`,
+- **Transactional family-deletion & orphan album purge:** All neighborhood write
+  paths (`save_neighborhood`, `save_neighborhood_checked`,
   `save_lot_and_neighborhood_checked`, and
   `save_characters_and_neighborhood_checked`) atomically purge albums and bump
   `photo_album_family_epoch` for any non-zero family removed from
   `StoredNeighborhood::families` inside the exact same REDB write transaction,
-  covering `sims-vm::caf::delete_bin_family`, `sims-game`'s Family Bin UI, and
-  empty-household pruning on lot save with zero two-transaction gap.
+  and also clear any preexisting orphaned album rows for newly allocated
+  `family_id`s (defending against legacy databases upgraded with leftover
+  orphans). This covers `sims-vm::caf::delete_bin_family`, `sims-game`'s Family
+  Bin UI, and empty-household pruning on lot save with zero two-transaction gap.
 
 ## 2. Household Photo Album REDB Storage (`sims-sim::album_store`)
 
@@ -66,9 +68,13 @@ and `delete_family_album`).
   magic, 4-byte little-endian format version (`ALBUM_FORMAT = 1`), 32-byte
   domain-separated SHA-256 checksum, strict exact-length `postcard` decoding
   (`decode_postcard_exact`), and full key-binding verification. Encoded byte
-  ceilings (`MAX_ALBUM_INDEX_ENCODED_BYTES`, `MAX_ALBUM_PHOTO_ENCODED_BYTES`)
-  are checked **before** hashing, and custom `Deserialize` visitors enforce
-  exact pixel counts (`width × height`), string byte/char limits
+  ceilings (`MAX_ALBUM_INDEX_ENCODED_BYTES + neighborhood_id.len()`,
+  `MAX_ALBUM_PHOTO_ENCODED_BYTES + neighborhood_id.len()`)
+  are checked **before** hashing, and custom `Deserialize` / `DeserializeSeed`
+  visitors validate the encoded `neighborhood_id` against the known REDB key
+  before allocating (preserving compatibility for arbitrarily long v1
+  neighborhood IDs while supporting both sequence and map Serde formats), and
+  enforce exact pixel counts (`width × height`), string byte/char limits
   (`MAX_ALBUM_TITLE_CHARS = 80`, `MAX_ALBUM_CAPTION_CHARS = 512`), and
   `MAX_ALBUM_ENTRIES = 256` **before** allocating collections. Bulk reads
   (`list` / `list_page`) enforce `MAX_BULK_ALBUM_PIXEL_BYTES` (32 MiB), with

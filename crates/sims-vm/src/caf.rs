@@ -3552,14 +3552,14 @@ mod tests {
         // neighborhood (simulating concurrent `import_directory`), resume CAF,
         // and assert deterministic `NeighborhoodMismatch` + byte-for-byte
         // preservation of the replacement neighborhood and zero leaked files.
-        let (snap_tx, snap_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let mut replacement_encoded = Vec::new();
-        let mut replacement_chars = BTreeMap::new();
         let ctx_ref = &ctx;
         let store_ref = &store;
         let spec_ref = &spec;
+        let mut replacement_encoded = Vec::new();
+        let mut replacement_chars = BTreeMap::new();
         let err = std::thread::scope(|scope| {
+            let (snap_tx, snap_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
             let h = scope.spawn(move || {
                 let mut rng = CrtRng::from_state(0x1122_3344);
                 commit_family_with_context_hook(
@@ -3569,8 +3569,8 @@ mod tests {
                     spec_ref,
                     &mut rng,
                     || {
-                        snap_tx.send(()).unwrap();
-                        resume_rx.recv().unwrap();
+                        let _ = snap_tx.send(());
+                        let _ = resume_rx.recv();
                     },
                 )
             });
@@ -3609,10 +3609,10 @@ mod tests {
         // Case 2: Pause CAF right after snapshot capture, bump same-instance
         // revision via `save_neighborhood_checked`, resume CAF, and assert
         // deterministic `StaleNeighborhood` + byte-for-byte preservation.
-        let (snap_tx2, snap_rx2) = mpsc::channel();
-        let (resume_tx2, resume_rx2) = mpsc::channel();
         let mut bumped_encoded = Vec::new();
         let err2 = std::thread::scope(|scope| {
+            let (snap_tx2, snap_rx2) = mpsc::channel();
+            let (resume_tx2, resume_rx2) = mpsc::channel();
             let h = scope.spawn(move || {
                 let mut rng = CrtRng::from_state(0x5566_7788);
                 commit_family_with_context_hook(
@@ -3622,8 +3622,8 @@ mod tests {
                     spec_ref,
                     &mut rng,
                     || {
-                        snap_tx2.send(()).unwrap();
-                        resume_rx2.recv().unwrap();
+                        let _ = snap_tx2.send(());
+                        let _ = resume_rx2.recv();
                     },
                 )
             });

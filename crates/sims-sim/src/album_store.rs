@@ -39,7 +39,6 @@
 //!   write transaction.
 
 use crate::Error;
-use crate::migration::decode_postcard_exact;
 use crate::neighborhood_store::{NEIGHBORHOODS as NEIGHBORHOODS_TABLE, StoredNeighborhood};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -63,9 +62,6 @@ const PHOTO_HASH_DOMAIN: &[u8] = b"sims-sim:album-photo:v1";
 /// Length of the fixed envelope prefix: 4-byte magic + 4-byte version +
 /// 32-byte SHA-256 checksum.
 const HEADER_LEN: usize = 4 + 4 + 32;
-
-/// Maximum UTF-8 byte length accepted for a neighborhood ID in album records.
-const MAX_NEIGHBORHOOD_ID_BYTES: usize = 1024;
 
 /// Earliest supported photo album record format version.
 pub const ALBUM_MIN_FORMAT: u32 = 1;
@@ -94,13 +90,14 @@ pub const MAX_ALBUM_ENTRIES: usize = 256;
 /// or [`PhotoAlbumStore::get`].
 pub const MAX_BULK_ALBUM_PIXEL_BYTES: usize = 32 * 1024 * 1024;
 
-/// Maximum encoded byte length accepted for an `ALBUM_INDEX` row before hashing
-/// or deserializing (header + neighborhood_id + up to 256 varint u64 IDs + slack).
+/// Base encoded byte ceiling for an `ALBUM_INDEX` row before hashing or
+/// deserializing (header + up to 256 varint u64 IDs + slack); callers add
+/// `neighborhood_id.len()` so arbitrarily long v1 neighborhood IDs stay valid.
 pub const MAX_ALBUM_INDEX_ENCODED_BYTES: usize = 16 * 1024;
 
-/// Maximum encoded byte length accepted for an `ALBUM_PHOTOS` row before
-/// hashing or deserializing (header + text/metadata + up to `MAX_ALBUM_PHOTO_PIXELS`
-/// varint-encoded `u16`s at <= 3 bytes each).
+/// Base encoded byte ceiling for an `ALBUM_PHOTOS` row before hashing or
+/// deserializing (header + text/metadata + up to `MAX_ALBUM_PHOTO_PIXELS`
+/// varint-encoded `u16`s at <= 3 bytes each); callers add `neighborhood_id.len()`.
 pub const MAX_ALBUM_PHOTO_ENCODED_BYTES: usize = HEADER_LEN + 8 * 1024 + 3 * MAX_ALBUM_PHOTO_PIXELS;
 
 /// Per-household album index (`next_photo_id` + ordered `photo_id` list) keyed
@@ -241,6 +238,52 @@ impl<'de> Deserialize<'de> for AlbumImage {
                     rgb565,
                 })
             }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut width: Option<u32> = None;
+                let mut height: Option<u32> = None;
+                let mut rgb565: Option<Vec<u16>> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "width" => {
+                            if width.is_some() {
+                                return Err(serde::de::Error::duplicate_field("width"));
+                            }
+                            width = Some(map.next_value()?);
+                        }
+                        "height" => {
+                            if height.is_some() {
+                                return Err(serde::de::Error::duplicate_field("height"));
+                            }
+                            height = Some(map.next_value()?);
+                        }
+                        "rgb565" => {
+                            if rgb565.is_some() {
+                                return Err(serde::de::Error::duplicate_field("rgb565"));
+                            }
+                            if let (Some(w), Some(h)) = (width, height) {
+                                let expected = checked_photo_pixel_count(w, h)
+                                    .map_err(serde::de::Error::custom)?;
+                                rgb565 = Some(map.next_value_seed(ExactU16VecSeed { expected })?);
+                            } else {
+                                rgb565 = Some(map.next_value_seed(BoundedU16VecSeed {
+                                    max_len: MAX_ALBUM_PHOTO_PIXELS,
+                                })?);
+                            }
+                        }
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                let width = width.ok_or_else(|| serde::de::Error::missing_field("width"))?;
+                let height = height.ok_or_else(|| serde::de::Error::missing_field("height"))?;
+                let rgb565 = rgb565.ok_or_else(|| serde::de::Error::missing_field("rgb565"))?;
+                AlbumImage::new(width, height, rgb565).map_err(serde::de::Error::custom)
+            }
         }
 
         deserializer.deserialize_struct(
@@ -248,6 +291,61 @@ impl<'de> Deserialize<'de> for AlbumImage {
             &["width", "height", "rgb565"],
             AlbumImageVisitor,
         )
+    }
+}
+
+struct BoundedU16VecSeed {
+    max_len: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BoundedU16VecSeed {
+    type Value = Vec<u16>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        struct BoundedVisitor {
+            max_len: usize,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for BoundedVisitor {
+            type Value = Vec<u16>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "at most {} RGB565 u16 pixels", self.max_len)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                if let Some(hint) = seq.size_hint()
+                    && hint > self.max_len
+                {
+                    return Err(serde::de::Error::custom(format!(
+                        "pixel count {hint} exceeds maximum {}",
+                        self.max_len
+                    )));
+                }
+                let cap = seq.size_hint().map_or(0, |h| h.min(self.max_len));
+                let mut out = Vec::with_capacity(cap);
+                while let Some(px) = seq.next_element::<u16>()? {
+                    if out.len() >= self.max_len {
+                        return Err(serde::de::Error::custom(format!(
+                            "pixel count exceeds maximum {}",
+                            self.max_len
+                        )));
+                    }
+                    out.push(px);
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedVisitor {
+            max_len: self.max_len,
+        })
     }
 }
 
@@ -601,6 +699,46 @@ impl From<AlbumError> for Error {
     }
 }
 
+struct ExpectedStrSeed<'a> {
+    expected: &'a str,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ExpectedStrSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<(), D::Error> {
+        struct ExpectedStrVisitor<'a> {
+            expected: &'a str,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for ExpectedStrVisitor<'_> {
+            type Value = ();
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("expected neighborhood_id key string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<(), E> {
+                if v != self.expected {
+                    return Err(E::custom(format!(
+                        "record neighborhood_id mismatch (got {} byte(s), expected {} byte(s))",
+                        v.len(),
+                        self.expected.len()
+                    )));
+                }
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_str(ExpectedStrVisitor {
+            expected: self.expected,
+        })
+    }
+}
+
 fn deserialize_bounded_string<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
     field: &'static str,
@@ -647,17 +785,6 @@ fn deserialize_bounded_string<'de, D: serde::Deserializer<'de>>(
         max_bytes,
         max_chars,
     })
-}
-
-fn deserialize_neighborhood_id<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<String, D::Error> {
-    deserialize_bounded_string(
-        deserializer,
-        "neighborhood_id",
-        MAX_NEIGHBORHOOD_ID_BYTES,
-        None,
-    )
 }
 
 fn deserialize_title<'de, D: serde::Deserializer<'de>>(
@@ -722,74 +849,176 @@ fn deserialize_bounded_order<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_seq(OrderVisitor)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct AlbumIndexV1 {
-    #[serde(deserialize_with = "deserialize_neighborhood_id")]
     neighborhood_id: String,
     family_id: u16,
     next_photo_id: u64,
-    #[serde(deserialize_with = "deserialize_bounded_order")]
     order: Vec<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct AlbumPhotoV1 {
-    #[serde(deserialize_with = "deserialize_neighborhood_id")]
     neighborhood_id: String,
     family_id: u16,
     id: u64,
-    #[serde(deserialize_with = "deserialize_title")]
     title: String,
-    #[serde(deserialize_with = "deserialize_caption")]
     caption: String,
     sim_day: Option<u32>,
     image: Option<AlbumImage>,
 }
 
-fn record_checksum(domain: &[u8], version: u32, body: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update(version.to_le_bytes());
-    hasher.update(body);
-    let digest = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
+struct AlbumIndexSeed<'a> {
+    expected_neighborhood_id: &'a str,
 }
 
-fn encode_framed<T: Serialize>(
-    record: &str,
-    magic: [u8; 4],
-    domain: &[u8],
-    max_encoded_bytes: usize,
-    value: &T,
-) -> std::result::Result<Vec<u8>, AlbumError> {
-    let body = postcard::to_allocvec(value).map_err(|error| AlbumError::DecodeFailed {
-        record: record.to_owned(),
-        detail: format!("failed to encode record: {error}"),
-    })?;
-    let total_len = HEADER_LEN.saturating_add(body.len());
-    if total_len > max_encoded_bytes {
-        return Err(AlbumError::InvalidInput(format!(
-            "{record}: encoded record size {total_len} exceeds maximum {max_encoded_bytes}"
-        )));
+impl<'de> serde::de::DeserializeSeed<'de> for AlbumIndexSeed<'_> {
+    type Value = AlbumIndexV1;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        struct Visitor<'a> {
+            expected_neighborhood_id: &'a str,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for Visitor<'_> {
+            type Value = AlbumIndexV1;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("AlbumIndexV1")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                seq.next_element_seed(ExpectedStrSeed {
+                    expected: self.expected_neighborhood_id,
+                })?
+                .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let family_id: u16 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let next_photo_id: u64 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                #[derive(Deserialize)]
+                struct BoundedOrder(
+                    #[serde(deserialize_with = "deserialize_bounded_order")] Vec<u64>,
+                );
+                let BoundedOrder(order) = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                Ok(AlbumIndexV1 {
+                    neighborhood_id: self.expected_neighborhood_id.to_owned(),
+                    family_id,
+                    next_photo_id,
+                    order,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "AlbumIndexV1",
+            &["neighborhood_id", "family_id", "next_photo_id", "order"],
+            Visitor {
+                expected_neighborhood_id: self.expected_neighborhood_id,
+            },
+        )
     }
-    let checksum = record_checksum(domain, ALBUM_FORMAT, &body);
-    let mut out = Vec::with_capacity(total_len);
-    out.extend_from_slice(&magic);
-    out.extend_from_slice(&ALBUM_FORMAT.to_le_bytes());
-    out.extend_from_slice(&checksum);
-    out.extend_from_slice(&body);
-    Ok(out)
 }
 
-fn decode_framed<'a, T: Deserialize<'a>>(
+struct AlbumPhotoSeed<'a> {
+    expected_neighborhood_id: &'a str,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for AlbumPhotoSeed<'_> {
+    type Value = AlbumPhotoV1;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        struct Visitor<'a> {
+            expected_neighborhood_id: &'a str,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for Visitor<'_> {
+            type Value = AlbumPhotoV1;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("AlbumPhotoV1")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                seq.next_element_seed(ExpectedStrSeed {
+                    expected: self.expected_neighborhood_id,
+                })?
+                .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let family_id: u16 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let id: u64 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                #[derive(Deserialize)]
+                struct BoundedTitle(#[serde(deserialize_with = "deserialize_title")] String);
+                #[derive(Deserialize)]
+                struct BoundedCaption(#[serde(deserialize_with = "deserialize_caption")] String);
+                let BoundedTitle(title) = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                let BoundedCaption(caption) = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
+                let sim_day: Option<u32> = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
+                let image: Option<AlbumImage> = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(6, &self))?;
+                Ok(AlbumPhotoV1 {
+                    neighborhood_id: self.expected_neighborhood_id.to_owned(),
+                    family_id,
+                    id,
+                    title,
+                    caption,
+                    sim_day,
+                    image,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "AlbumPhotoV1",
+            &[
+                "neighborhood_id",
+                "family_id",
+                "id",
+                "title",
+                "caption",
+                "sim_day",
+                "image",
+            ],
+            Visitor {
+                expected_neighborhood_id: self.expected_neighborhood_id,
+            },
+        )
+    }
+}
+
+fn decode_framed_body<'a>(
     record: &str,
     magic: [u8; 4],
     domain: &[u8],
     max_encoded_bytes: usize,
     bytes: &'a [u8],
-) -> std::result::Result<T, AlbumError> {
+) -> std::result::Result<(u32, &'a [u8]), AlbumError> {
     if bytes.len() < 8 {
         return Err(AlbumError::DecodeFailed {
             record: record.to_owned(),
@@ -839,10 +1068,69 @@ fn decode_framed<'a, T: Deserialize<'a>>(
             actual,
         });
     }
-    decode_postcard_exact(record, version, body).map_err(|error| AlbumError::DecodeFailed {
+    Ok((version, body))
+}
+
+fn decode_postcard_seed_exact<'a, S: serde::de::DeserializeSeed<'a>>(
+    record: &str,
+    body: &'a [u8],
+    seed: S,
+) -> std::result::Result<S::Value, AlbumError> {
+    let mut de = postcard::Deserializer::from_bytes(body);
+    let value = seed
+        .deserialize(&mut de)
+        .map_err(|error| AlbumError::DecodeFailed {
+            record: record.to_owned(),
+            detail: error.to_string(),
+        })?;
+    let trailing = de.finalize().map_err(|error| AlbumError::DecodeFailed {
         record: record.to_owned(),
         detail: error.to_string(),
-    })
+    })?;
+    if !trailing.is_empty() {
+        return Err(AlbumError::DecodeFailed {
+            record: record.to_owned(),
+            detail: format!("{} unexpected trailing byte(s)", trailing.len()),
+        });
+    }
+    Ok(value)
+}
+
+fn record_checksum(domain: &[u8], version: u32, body: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(version.to_le_bytes());
+    hasher.update(body);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn encode_framed<T: Serialize>(
+    record: &str,
+    magic: [u8; 4],
+    domain: &[u8],
+    max_encoded_bytes: usize,
+    value: &T,
+) -> std::result::Result<Vec<u8>, AlbumError> {
+    let body = postcard::to_allocvec(value).map_err(|error| AlbumError::DecodeFailed {
+        record: record.to_owned(),
+        detail: format!("failed to encode record: {error}"),
+    })?;
+    let total_len = HEADER_LEN.saturating_add(body.len());
+    if total_len > max_encoded_bytes {
+        return Err(AlbumError::InvalidInput(format!(
+            "{record}: encoded record size {total_len} exceeds maximum {max_encoded_bytes}"
+        )));
+    }
+    let checksum = record_checksum(domain, ALBUM_FORMAT, &body);
+    let mut out = Vec::with_capacity(total_len);
+    out.extend_from_slice(&magic);
+    out.extend_from_slice(&ALBUM_FORMAT.to_le_bytes());
+    out.extend_from_slice(&checksum);
+    out.extend_from_slice(&body);
+    Ok(out)
 }
 
 fn decode_index(
@@ -851,12 +1139,14 @@ fn decode_index(
     bytes: &[u8],
 ) -> std::result::Result<AlbumIndexV1, AlbumError> {
     let record = format!("{neighborhood_id}:family{family_id}:album-index");
-    let index: AlbumIndexV1 = decode_framed(
+    let max_bytes = MAX_ALBUM_INDEX_ENCODED_BYTES.saturating_add(neighborhood_id.len());
+    let (_, body) = decode_framed_body(&record, INDEX_MAGIC, INDEX_HASH_DOMAIN, max_bytes, bytes)?;
+    let index = decode_postcard_seed_exact(
         &record,
-        INDEX_MAGIC,
-        INDEX_HASH_DOMAIN,
-        MAX_ALBUM_INDEX_ENCODED_BYTES,
-        bytes,
+        body,
+        AlbumIndexSeed {
+            expected_neighborhood_id: neighborhood_id,
+        },
     )?;
     if index.neighborhood_id != neighborhood_id || index.family_id != family_id {
         return Err(AlbumError::DecodeFailed {
@@ -910,12 +1200,14 @@ fn decode_photo(
     bytes: &[u8],
 ) -> std::result::Result<AlbumPhotoV1, AlbumError> {
     let record = format!("{neighborhood_id}:family{family_id}:photo#{photo_id}");
-    let photo: AlbumPhotoV1 = decode_framed(
+    let max_bytes = MAX_ALBUM_PHOTO_ENCODED_BYTES.saturating_add(neighborhood_id.len());
+    let (_, body) = decode_framed_body(&record, PHOTO_MAGIC, PHOTO_HASH_DOMAIN, max_bytes, bytes)?;
+    let photo = decode_postcard_seed_exact(
         &record,
-        PHOTO_MAGIC,
-        PHOTO_HASH_DOMAIN,
-        MAX_ALBUM_PHOTO_ENCODED_BYTES,
-        bytes,
+        body,
+        AlbumPhotoSeed {
+            expected_neighborhood_id: neighborhood_id,
+        },
     )?;
     if photo.neighborhood_id != neighborhood_id
         || photo.family_id != family_id
@@ -967,12 +1259,6 @@ fn validate_neighborhood_id(neighborhood_id: &str) -> std::result::Result<(), Al
         return Err(AlbumError::InvalidInput(
             "neighborhood_id must not be empty".into(),
         ));
-    }
-    if neighborhood_id.len() > MAX_NEIGHBORHOOD_ID_BYTES {
-        return Err(AlbumError::InvalidInput(format!(
-            "neighborhood_id byte length {} exceeds maximum {MAX_NEIGHBORHOOD_ID_BYTES}",
-            neighborhood_id.len()
-        )));
     }
     Ok(())
 }
@@ -1217,7 +1503,7 @@ impl PhotoAlbumStore {
                 &photo_name,
                 PHOTO_MAGIC,
                 PHOTO_HASH_DOMAIN,
-                MAX_ALBUM_PHOTO_ENCODED_BYTES,
+                MAX_ALBUM_PHOTO_ENCODED_BYTES.saturating_add(neighborhood_id.len()),
                 &photo_record,
             )?;
 
@@ -1228,7 +1514,7 @@ impl PhotoAlbumStore {
                 &index_name,
                 INDEX_MAGIC,
                 INDEX_HASH_DOMAIN,
-                MAX_ALBUM_INDEX_ENCODED_BYTES,
+                MAX_ALBUM_INDEX_ENCODED_BYTES.saturating_add(neighborhood_id.len()),
                 &index,
             )?;
 
@@ -1317,7 +1603,7 @@ impl PhotoAlbumStore {
                 &photo_name,
                 PHOTO_MAGIC,
                 PHOTO_HASH_DOMAIN,
-                MAX_ALBUM_PHOTO_ENCODED_BYTES,
+                MAX_ALBUM_PHOTO_ENCODED_BYTES.saturating_add(neighborhood_id.len()),
                 &photo,
             )?;
             photo_table
@@ -1385,7 +1671,7 @@ impl PhotoAlbumStore {
                     &index_name,
                     INDEX_MAGIC,
                     INDEX_HASH_DOMAIN,
-                    MAX_ALBUM_INDEX_ENCODED_BYTES,
+                    MAX_ALBUM_INDEX_ENCODED_BYTES.saturating_add(neighborhood_id.len()),
                     &index,
                 )?;
                 index_table
@@ -1437,7 +1723,7 @@ impl PhotoAlbumStore {
                 &index_name,
                 INDEX_MAGIC,
                 INDEX_HASH_DOMAIN,
-                MAX_ALBUM_INDEX_ENCODED_BYTES,
+                MAX_ALBUM_INDEX_ENCODED_BYTES.saturating_add(neighborhood_id.len()),
                 &index,
             )?;
             index_table
@@ -1522,7 +1808,7 @@ impl PhotoAlbumStore {
                         &index_name,
                         INDEX_MAGIC,
                         INDEX_HASH_DOMAIN,
-                        MAX_ALBUM_INDEX_ENCODED_BYTES,
+                        MAX_ALBUM_INDEX_ENCODED_BYTES.saturating_add(neighborhood_id.len()),
                         &cleared,
                     )?;
                     index_table
@@ -1843,6 +2129,47 @@ pub(crate) fn purge_family_in_txn(
     epoch_table
         .insert((neighborhood_id, family_id), next_epoch)
         .map_err(|e| Error::Store(e.to_string()))?;
+    Ok(())
+}
+
+/// If any orphan `ALBUM_INDEX` or `ALBUM_PHOTOS` rows already exist for a
+/// newly allocated `family_id` (e.g. from an older database before transactional
+/// family-delete album cleanup), removes them and bumps `ALBUM_FAMILY_EPOCH`
+/// inside the same write transaction so the new household always starts clean.
+pub(crate) fn purge_orphan_family_in_txn(
+    txn: &redb::WriteTransaction,
+    neighborhood_id: &str,
+    family_id: u16,
+) -> std::result::Result<(), Error> {
+    if family_id == 0 {
+        return Ok(());
+    }
+    let has_orphan = {
+        let index_table = txn
+            .open_table(ALBUM_INDEX)
+            .map_err(|e| Error::Store(e.to_string()))?;
+        let has_index = index_table
+            .get((neighborhood_id, family_id))
+            .map_err(|e| Error::Store(e.to_string()))?
+            .is_some();
+        if has_index {
+            true
+        } else {
+            let photo_table = txn
+                .open_table(ALBUM_PHOTOS)
+                .map_err(|e| Error::Store(e.to_string()))?;
+            photo_table
+                .range((neighborhood_id, family_id, 0u64)..=(neighborhood_id, family_id, u64::MAX))
+                .map_err(|e| Error::Store(e.to_string()))?
+                .next()
+                .transpose()
+                .map_err(|e| Error::Store(e.to_string()))?
+                .is_some()
+        }
+    };
+    if has_orphan {
+        purge_family_in_txn(txn, neighborhood_id, family_id)?;
+    }
     Ok(())
 }
 

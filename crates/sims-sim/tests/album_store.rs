@@ -619,11 +619,11 @@ fn album_store_detects_checksum_version_key_binding_and_pre_allocation_bounds() 
     ));
     drop(store);
 
-    // 3. Oversized encoded photo blob (> MAX_ALBUM_PHOTO_ENCODED_BYTES) rejected
-    //    before hashing.
+    // 3. Oversized encoded photo blob (> MAX_ALBUM_PHOTO_ENCODED_BYTES + neighborhood_id.len())
+    //    rejected before hashing.
     let raw_db = redb::Database::open(&db.0).unwrap();
     {
-        let mut oversized = vec![0u8; MAX_ALBUM_PHOTO_ENCODED_BYTES + 1];
+        let mut oversized = vec![0u8; MAX_ALBUM_PHOTO_ENCODED_BYTES + "UserData".len() + 1];
         oversized[0..4].copy_from_slice(b"ALBP");
         oversized[4..8].copy_from_slice(&ALBUM_FORMAT.to_le_bytes());
         let w = raw_db.begin_write().unwrap();
@@ -735,4 +735,145 @@ fn album_store_concurrent_shared_handles() {
             vec![1, 2, 3, 4, 5, 6, 7, 8]
         );
     }
+}
+
+#[test]
+fn preexisting_orphan_album_is_purged_on_new_family_allocation_and_long_ids_round_trip() {
+    use redb::ReadableDatabase;
+
+    const INDEX_TABLE: redb::TableDefinition<(&str, u16), &[u8]> =
+        redb::TableDefinition::new("photo_album_index");
+    const PHOTO_TABLE: redb::TableDefinition<(&str, u16, u64), &[u8]> =
+        redb::TableDefinition::new("photo_album_photos");
+
+    // 1. Seed a valid album for family 2, then simulate an older upgraded DB
+    //    where family 2 was removed without purging its album rows (orphan).
+    let db = TempDb::new("orphan-and-long-id");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .save_neighborhood("UserData", &sample_neighborhood("UserData", &[1, 2]))
+        .unwrap();
+    let albums = store.albums();
+    let tok2 = albums.family_token("UserData", 2).unwrap().unwrap();
+    let orphan_photo = albums
+        .add(
+            "UserData",
+            tok2,
+            NewAlbumPhoto::with_image("Orphan", "From legacy DB", sample_image(2, 2, 9)),
+        )
+        .unwrap();
+    assert_eq!(orphan_photo.id, 1);
+
+    // Capture raw album rows for family 2, delete family 2 cleanly, then
+    // re-inject the orphaned rows directly in REDB to simulate a pre-fix DB.
+    drop(albums);
+    drop(store);
+    let (raw_index, raw_photo) = {
+        let raw_db = redb::Database::open(&db.0).unwrap();
+        let r = raw_db.begin_read().unwrap();
+        let idx = r
+            .open_table(INDEX_TABLE)
+            .unwrap()
+            .get(("UserData", 2))
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        let ph = r
+            .open_table(PHOTO_TABLE)
+            .unwrap()
+            .get(("UserData", 2, 1))
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        (idx, ph)
+    };
+
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    let mut without_fam2 = store.load_neighborhood("UserData").unwrap().unwrap();
+    let fam2_record = without_fam2.families.remove(&2).unwrap();
+    store
+        .save_neighborhood_checked(
+            "UserData",
+            without_fam2.instance_id,
+            without_fam2.revision,
+            &without_fam2,
+        )
+        .unwrap()
+        .unwrap();
+    drop(store);
+
+    // Re-inject orphan album rows while family 2 is absent.
+    {
+        let raw_db = redb::Database::open(&db.0).unwrap();
+        let w = raw_db.begin_write().unwrap();
+        {
+            w.open_table(INDEX_TABLE)
+                .unwrap()
+                .insert(("UserData", 2), raw_index.as_slice())
+                .unwrap();
+            w.open_table(PHOTO_TABLE)
+                .unwrap()
+                .insert(("UserData", 2, 1), raw_photo.as_slice())
+                .unwrap();
+        }
+        w.commit().unwrap();
+    }
+
+    // Creating a replacement household with family_id = 2 via
+    // `save_characters_and_neighborhood_checked` must atomically purge the
+    // preexisting orphan rows before committing.
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    let mut with_replacement = store.load_neighborhood("UserData").unwrap().unwrap();
+    with_replacement.families.insert(2, fam2_record);
+    store
+        .save_characters_and_neighborhood_checked(
+            "UserData",
+            with_replacement.instance_id,
+            with_replacement.revision,
+            [("User00042.iff", b"replacement-char".as_slice())],
+            &with_replacement,
+        )
+        .unwrap()
+        .unwrap();
+
+    let albums = store.albums();
+    assert!(albums.list("UserData", 2).unwrap().is_empty());
+    let new_tok2 = albums.family_token("UserData", 2).unwrap().unwrap();
+    let fresh = albums
+        .add("UserData", new_tok2, NewAlbumPhoto::blank("Fresh", "Clean"))
+        .unwrap();
+    assert_eq!(fresh.id, 1);
+
+    // 2. Neighborhood IDs longer than 1,024 bytes remain readable and writable.
+    let long_id = "UserData_".to_owned() + &"x".repeat(1200);
+    store
+        .save_neighborhood(&long_id, &sample_neighborhood(&long_id, &[1]))
+        .unwrap();
+    let long_tok = albums.family_token(&long_id, 1).unwrap().unwrap();
+    let p1 = albums
+        .add(
+            &long_id,
+            long_tok,
+            NewAlbumPhoto::with_image("Long1", "Cap1", sample_image(2, 2, 5)),
+        )
+        .unwrap();
+    let p2 = albums
+        .add(&long_id, long_tok, NewAlbumPhoto::blank("Long2", "Cap2"))
+        .unwrap();
+    albums
+        .update_text(&long_id, long_tok, p1.id, "Long1-Edited", "Cap1-Edited")
+        .unwrap();
+    assert_eq!(
+        albums.move_entry(&long_id, long_tok, p2.id, 0).unwrap(),
+        vec![p2.id, p1.id]
+    );
+    let listed = albums.list(&long_id, 1).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].title, "Long2");
+    assert_eq!(listed[1].title, "Long1-Edited");
+    assert!(albums.delete(&long_id, long_tok, p2.id).unwrap());
+    assert!(albums.delete_family_album(&long_id, long_tok).unwrap());
+    assert!(albums.list(&long_id, 1).unwrap().is_empty());
 }
