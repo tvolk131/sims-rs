@@ -326,12 +326,8 @@ struct Sound(Option<sims_game::output::Output>);
 
 #[cfg(any(target_os = "macos", feature = "sound"))]
 impl Sound {
-    fn start(install: &std::path::Path, mute: bool) -> Self {
-        if mute {
-            return Self(None);
-        }
-        let started =
-            sims_game::sound::Mixer::open(install).and_then(sims_game::output::Output::start);
+    fn from_mixer(mixer: Result<sims_game::sound::Mixer, String>) -> Self {
+        let started = mixer.and_then(sims_game::output::Output::start);
         match started {
             Ok(output) => Self(Some(output)),
             Err(e) => {
@@ -339,6 +335,13 @@ impl Sound {
                 Self(None)
             }
         }
+    }
+
+    fn start(install: &std::path::Path, mute: bool) -> Self {
+        if mute {
+            return Self(None);
+        }
+        Self::from_mixer(sims_game::sound::Mixer::open(install))
     }
 
     fn send(&self, input: Input) {
@@ -1770,6 +1773,24 @@ fn run() -> Result<(), String> {
         };
         eprintln!("sims-game: booting {}", game_options.house.display());
         let started = Instant::now();
+        #[cfg(any(target_os = "macos", feature = "sound"))]
+        let (mut game, preloaded_mixer) = if config.still.is_none() && !config.mute {
+            let (game_res, mixer_res) = std::thread::scope(|scope| {
+                let mixer_handle =
+                    scope.spawn(|| sims_game::sound::Mixer::open(&game_options.install));
+                let game_res = Game::open(&game_options);
+                (
+                    game_res,
+                    mixer_handle
+                        .join()
+                        .unwrap_or_else(|_| Err("sound mixer worker panicked".to_owned())),
+                )
+            });
+            (game_res?, Some(mixer_res))
+        } else {
+            (Game::open(&game_options)?, None)
+        };
+        #[cfg(not(any(target_os = "macos", feature = "sound")))]
         let mut game = Game::open(&game_options)?;
         eprintln!(
             "sims-game: booted in {:.1} s",
@@ -1812,6 +1833,12 @@ fn run() -> Result<(), String> {
             eprintln!("sims-game: {}: {e}", options_file.display());
         }
         let saved_optn = game.options().to_optn();
+        #[cfg(any(target_os = "macos", feature = "sound"))]
+        let sound = match preloaded_mixer {
+            Some(mixer) => Sound::from_mixer(mixer),
+            None => Sound::start(&config.install, config.mute),
+        };
+        #[cfg(not(any(target_os = "macos", feature = "sound")))]
         let sound = Sound::start(&config.install, config.mute);
         let mut app = App {
             session: Session::Standalone {
@@ -1852,6 +1879,39 @@ fn run() -> Result<(), String> {
         config.install.display()
     );
     let started = Instant::now();
+    #[cfg(any(target_os = "macos", feature = "sound"))]
+    let (shell, preloaded_mixer) = if !config.mute {
+        let install_for_mixer = config.install.clone();
+        let (shell_res, mixer_res) = std::thread::scope(|scope| {
+            let mixer_handle = scope.spawn(|| sims_game::sound::Mixer::open(&install_for_mixer));
+            let shell_res = NeighborhoodShell::open(
+                config.install.clone(),
+                config.saves.clone(),
+                1,
+                config.play,
+                config.answers,
+                sims_game::Frames::default(),
+            );
+            (
+                shell_res,
+                mixer_handle
+                    .join()
+                    .unwrap_or_else(|_| Err("sound mixer worker panicked".to_owned())),
+            )
+        });
+        (shell_res?, Some(mixer_res))
+    } else {
+        let shell = NeighborhoodShell::open(
+            config.install.clone(),
+            config.saves.clone(),
+            1,
+            config.play,
+            config.answers,
+            sims_game::Frames::default(),
+        )?;
+        (shell, None)
+    };
+    #[cfg(not(any(target_os = "macos", feature = "sound")))]
     let shell = NeighborhoodShell::open(
         config.install.clone(),
         config.saves.clone(),
@@ -1865,6 +1925,12 @@ fn run() -> Result<(), String> {
         shell.neighborhood_slot(),
         started.elapsed().as_secs_f32()
     );
+    #[cfg(any(target_os = "macos", feature = "sound"))]
+    let sound = match preloaded_mixer {
+        Some(mixer) => Sound::from_mixer(mixer),
+        None => Sound::start(&config.install, config.mute),
+    };
+    #[cfg(not(any(target_os = "macos", feature = "sound")))]
     let sound = Sound::start(&config.install, config.mute);
     let mut app = App {
         session: Session::Shell(Box::new(shell)),

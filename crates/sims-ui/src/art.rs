@@ -47,23 +47,127 @@ impl Art {
     /// Loads resources `ids` in `language` (falling back to the rows for
     /// every language) and the fonts of [`FONT_SIZES`].
     pub fn load(ui: &UiGraphics, language: u8, ids: &[i32]) -> Result<Self> {
-        let mut art = Self::default();
-        for &id in ids {
+        Self::load_with_optional(ui, language, ids, &[])
+    }
+
+    /// Loads required `ids`, optional `optional_ids`, and the fonts of
+    /// [`FONT_SIZES`] in parallel, inserting all images and missing IDs in
+    /// exact input order.
+    pub fn load_with_optional(
+        ui: &UiGraphics,
+        language: u8,
+        ids: &[i32],
+        optional_ids: &[i32],
+    ) -> Result<Self> {
+        let decode_req = |&id: &i32| -> Result<(i32, Option<Image>)> {
             match ui.bitmap(id, language).map_err(Error::Content)? {
                 Some(mut image) => {
                     image.key(KEY);
                     unpremultiply_tga(&mut image);
+                    Ok((id, Some(image)))
+                }
+                None => Ok((id, None)),
+            }
+        };
+        let decode_opt = |&id: &i32| -> (i32, Option<Image>) {
+            match ui.bitmap(id, language) {
+                Ok(Some(mut image)) => {
+                    image.key(KEY);
+                    unpremultiply_tga(&mut image);
+                    (id, Some(image))
+                }
+                Ok(None) | Err(_) => (id, None),
+            }
+        };
+        let decode_font = |size: u8| -> Result<(u8, Font)> {
+            let bytes = ui
+                .read(&format!("Fonts/variablesans_{size:02}.ffn"))
+                .map_err(Error::Content)?;
+            let font = sims_formats::ffn::Font::parse(&bytes).map_err(Error::Format)?;
+            Ok((size, Font::new(font)))
+        };
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .clamp(1, 8);
+        let (req_results, opt_results, font_results) = if workers <= 1
+            || ids.len() + optional_ids.len() <= 4
+        {
+            (
+                ids.iter().map(decode_req).collect::<Vec<_>>(),
+                optional_ids.iter().map(decode_opt).collect::<Vec<_>>(),
+                FONT_SIZES.into_iter().map(decode_font).collect::<Vec<_>>(),
+            )
+        } else {
+            // Keep total spawned workers <= 8 (bitmap workers + 1 font worker).
+            enum BitmapJob {
+                Required(i32),
+                Optional(i32),
+            }
+            enum BitmapOut {
+                Required(Result<(i32, Option<Image>)>),
+                Optional((i32, Option<Image>)),
+            }
+            let mut jobs = Vec::with_capacity(ids.len() + optional_ids.len());
+            jobs.extend(ids.iter().copied().map(BitmapJob::Required));
+            jobs.extend(optional_ids.iter().copied().map(BitmapJob::Optional));
+            let bitmap_workers = (workers - 1).max(1).min(jobs.len());
+            let chunk_size = jobs.len().div_ceil(bitmap_workers);
+            let (bitmap_out, font_out) = std::thread::scope(|scope| {
+                let handles: Vec<_> = jobs
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|job| match job {
+                                    BitmapJob::Required(id) => BitmapOut::Required(decode_req(id)),
+                                    BitmapJob::Optional(id) => BitmapOut::Optional(decode_opt(id)),
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                let font_handle = scope
+                    .spawn(move || FONT_SIZES.into_iter().map(decode_font).collect::<Vec<_>>());
+                let mut out = Vec::with_capacity(jobs.len());
+                for h in handles {
+                    out.extend(h.join().expect("art bitmap worker panicked"));
+                }
+                let fonts = font_handle.join().expect("art font worker panicked");
+                (out, fonts)
+            });
+            let mut req_out = Vec::with_capacity(ids.len());
+            let mut opt_out = Vec::with_capacity(optional_ids.len());
+            for item in bitmap_out {
+                match item {
+                    BitmapOut::Required(r) => req_out.push(r),
+                    BitmapOut::Optional(o) => opt_out.push(o),
+                }
+            }
+            (req_out, opt_out, font_out)
+        };
+        let mut art = Self::default();
+        for item in req_results {
+            let (id, image) = item?;
+            match image {
+                Some(image) => {
                     art.images.insert(id, image);
                 }
                 None => art.missing.push(id),
             }
         }
-        for size in FONT_SIZES {
-            let bytes = ui
-                .read(&format!("Fonts/variablesans_{size:02}.ffn"))
-                .map_err(Error::Content)?;
-            let font = sims_formats::ffn::Font::parse(&bytes).map_err(Error::Format)?;
-            art.fonts.insert(size, Font::new(font));
+        for item in font_results {
+            let (size, font) = item?;
+            art.fonts.insert(size, font);
+        }
+        for (id, image) in opt_results {
+            match image {
+                Some(image) => {
+                    art.images.insert(id, image);
+                }
+                None => art.missing.push(id),
+            }
         }
         Ok(art)
     }

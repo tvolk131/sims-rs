@@ -250,11 +250,17 @@ impl People {
     /// Reads the people's files from the install at `root`, and the cast
     /// of the neighborhood `house` is in.
     pub fn open(root: &Path, house: &Path) -> Result<Self, String> {
-        Ok(Self {
-            people: sims_people::People::open(root, house)?,
+        Ok(Self::from_inner(sims_people::People::open(root, house)?))
+    }
+
+    /// Wraps an already-constructed [`sims_people::People`] built from shared
+    /// startup state.
+    pub(crate) fn from_inner(people: sims_people::People) -> Self {
+        Self {
+            people,
             _temp_cast_dir: None,
             problems: Vec::new(),
-        })
+        }
     }
 
     /// Reads the people's files from the install at `root`, and the cast
@@ -264,11 +270,9 @@ impl People {
         let assets = sims_people::Assets::scan(root)?;
         let library = sims_people::Library::scan(&assets)?;
         let cast = sims_people::Cast::open(root, neighborhood_dir)?;
-        Ok(Self {
-            people: sims_people::People::new(assets, library, cast),
-            _temp_cast_dir: None,
-            problems: Vec::new(),
-        })
+        Ok(Self::from_inner(sims_people::People::new(
+            assets, library, cast,
+        )))
     }
 
     /// Reads the people's files from the install at `root` and builds the

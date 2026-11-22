@@ -140,6 +140,62 @@ pub fn walk(root: &Path, keep: &dyn Fn(&str) -> bool) -> Result<(Vec<Entry>, Vec
     Ok((entries, problems))
 }
 
+/// Like [`walk`], parallelizing top-level subdirectories of `root` across
+/// worker threads while merging entries and problems in exact sorted order.
+pub(crate) fn walk_parallel(
+    root: &Path,
+    keep: &(dyn Fn(&str) -> bool + Sync),
+) -> Result<(Vec<Entry>, Vec<String>)> {
+    #[allow(clippy::disallowed_methods)]
+    let listing = std::fs::read_dir(root).map_err(|e| Error::io(root, e))?;
+    let mut paths = Vec::new();
+    for entry in listing {
+        paths.push(entry.map_err(|e| Error::io(root, e))?.path());
+    }
+    paths.sort();
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(paths.len());
+    if workers <= 1 {
+        let mut entries = Vec::new();
+        let mut problems = Vec::new();
+        for path in &paths {
+            visit_entry(path, "", keep, &mut entries, &mut problems)?;
+        }
+        return Ok((entries, problems));
+    }
+    let chunk_size = paths.len().div_ceil(workers);
+    let per_chunk: Vec<Result<(Vec<Entry>, Vec<String>)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = paths
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || -> Result<(Vec<Entry>, Vec<String>)> {
+                    let mut entries = Vec::new();
+                    let mut problems = Vec::new();
+                    for path in chunk {
+                        visit_entry(path, "", keep, &mut entries, &mut problems)?;
+                    }
+                    Ok((entries, problems))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("sound walk worker panicked"))
+            .collect()
+    });
+    let mut entries = Vec::new();
+    let mut problems = Vec::new();
+    for batch in per_chunk {
+        let (e, p) = batch?;
+        entries.extend(e);
+        problems.extend(p);
+    }
+    Ok((entries, problems))
+}
+
 fn visit(
     directory: &Path,
     at: &str,
@@ -156,46 +212,57 @@ fn visit(
     }
     paths.sort();
     for path in paths {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let relative = format!("{at}{name}");
-        if path.is_dir() {
-            visit(&path, &format!("{relative}\\"), keep, entries, problems)?;
-            continue;
-        }
-        let extension = name
-            .rsplit_once('.')
-            .map(|(_, e)| e.to_ascii_lowercase())
-            .unwrap_or_default();
-        if extension == "far" {
-            match members(&path) {
-                Ok(members) => {
-                    for member in members {
-                        let entry = Entry {
-                            path: format!("{at}{}", member.name.replace('/', "\\")),
-                            source: Source::Member {
-                                archive: path.clone(),
-                                name: member.name,
-                                offset: u64::from(member.offset),
-                                size: u64::from(member.stored_size),
-                            },
-                        };
-                        if keep(&entry.extension()) {
-                            entries.push(entry);
-                        }
+        visit_entry(&path, at, keep, entries, problems)?;
+    }
+    Ok(())
+}
+
+fn visit_entry(
+    path: &Path,
+    at: &str,
+    keep: &dyn Fn(&str) -> bool,
+    entries: &mut Vec<Entry>,
+    problems: &mut Vec<String>,
+) -> Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let relative = format!("{at}{name}");
+    if path.is_dir() {
+        visit(path, &format!("{relative}\\"), keep, entries, problems)?;
+        return Ok(());
+    }
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension == "far" {
+        match members(path) {
+            Ok(members) => {
+                for member in members {
+                    let entry = Entry {
+                        path: format!("{at}{}", member.name.replace('/', "\\")),
+                        source: Source::Member {
+                            archive: path.to_path_buf(),
+                            name: member.name,
+                            offset: u64::from(member.offset),
+                            size: u64::from(member.stored_size),
+                        },
+                    };
+                    if keep(&entry.extension()) {
+                        entries.push(entry);
                     }
                 }
-                Err(error) => problems.push(error.to_string()),
             }
+            Err(error) => problems.push(error.to_string()),
         }
-        if keep(&extension) {
-            entries.push(Entry {
-                path: relative,
-                source: Source::Loose(path),
-            });
-        }
+    }
+    if keep(&extension) {
+        entries.push(Entry {
+            path: relative,
+            source: Source::Loose(path.to_path_buf()),
+        });
     }
     Ok(())
 }
@@ -241,7 +308,7 @@ impl SoundFiles {
     /// Lists the sound files under `root` (those with one of
     /// [`EXTENSIONS`]).
     pub fn scan(root: &Path) -> Result<Self> {
-        let (entries, problems) = walk(root, &|e| EXTENSIONS.contains(&e))?;
+        let (entries, problems) = walk_parallel(root, &|e| EXTENSIONS.contains(&e))?;
         let mut files = Self {
             root: root.to_path_buf(),
             problems,

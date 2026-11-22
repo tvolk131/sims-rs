@@ -21,12 +21,14 @@
 //! not state anything here can act on.
 
 pub mod animator;
+pub mod autosave;
 pub mod characters;
 mod cow;
 mod error;
 pub mod grass;
 pub mod head;
 pub mod load;
+pub mod migration;
 pub mod motives;
 pub mod neighborhood_store;
 pub mod neighbors;
@@ -38,8 +40,18 @@ mod snapshot;
 pub mod speed;
 mod world;
 
+pub use autosave::{
+    AUTOSAVE_FORMAT, AUTOSAVE_MIN_FORMAT, AutosavePolicy, AutosaveStore, DEFAULT_MAX_AUTOSAVES,
+    LoadedSave, RecoveryLoad, SaveError, SaveJob, SaveMetadata, SavePayload, SavePayloadKind,
+    SaveSlot, SaveSlotEntry, SaveTarget,
+};
 pub use cow::{CowBox, CowMap};
 pub use error::Error;
+pub use migration::{
+    MigratedBytes, MigratedRecord, MigrationError, MigrationRegistry, MigrationReport,
+    MigrationStep, NEIGHBORHOOD_MIGRATIONS, NEIGHBORHOOD_MIN_FORMAT, NeighborhoodSchemaStatus,
+    StoreMigrationError, StoreMigrationReport, StoredNeighborhoodV1, StoredNeighborhoodV2,
+};
 pub use neighborhood_store::{
     CheckedCommitError, DEFAULT_ARCH_VALUE_MULTIPLIER, DEFAULT_LAYOUT_HISTORY_FILL,
     DEFAULT_NEW_FAMILY_START_HOUR, FAMILY_FLAG_BIT_3, FAMILY_FLAG_HAS_CATEGORY_1,

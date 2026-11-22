@@ -15,6 +15,7 @@
 use crate::index::{all_far_members, sorted_entries};
 use crate::install::resolve;
 use crate::people::{Bone, Skeleton};
+use crate::pool::{ArchivePool, worker_count};
 use crate::{Error, Index, Install, Resource, Result};
 use sims_formats::animation::{Samples, read_bcf, read_cfp};
 use std::collections::{BTreeMap, BTreeSet};
@@ -200,6 +201,22 @@ impl Animations {
     /// holds every clip in them, is **unverified**; the library's loader is
     /// not ported.
     pub fn load(install: &Install, index: &Index) -> Result<Self> {
+        Self::load_with_pool(install, index, &ArchivePool::new())
+    }
+
+    /// Like [`Animations::load`], reusing open FAR handles from `pool` and
+    /// reading/parsing animation and sample members in parallel while merging
+    /// into deterministic `BTreeMap`/`BTreeSet` order.
+    pub fn load_with_pool(install: &Install, index: &Index, pool: &ArchivePool) -> Result<Self> {
+        enum Item {
+            Cfp { skill: String, resource: Resource },
+            Bcf { resource: Resource },
+        }
+        enum Decoded {
+            Cfp { skill: String, bytes: Vec<u8> },
+            Bcf { location: String, clips: Vec<Clip> },
+            Skip,
+        }
         let mut resources = Vec::new();
         if let Some(directory) = resolve(&install.root, "GameData/Animation")? {
             for path in sorted_entries(&directory)? {
@@ -219,7 +236,7 @@ impl Animations {
             }
         }
         resources.extend(index.resources.iter().cloned());
-        let mut animations = Self::default();
+        let mut items = Vec::new();
         for resource in resources {
             let name = resource.name().to_ascii_lowercase();
             if let Some(stem) = name.strip_suffix(".cfp") {
@@ -227,58 +244,99 @@ impl Animations {
                 // ExpansionShared.far's "Animations\xskill-....cfp" does;
                 // the sample file is known by its own name.
                 let file = stem.rsplit(['\\', '/']).next().unwrap_or(stem);
-                let bytes = resource.read()?;
-                animations
-                    .samples
-                    .entry(file.to_owned())
-                    .or_default()
-                    .insert(bytes);
-                continue;
+                items.push(Item::Cfp {
+                    skill: file.to_owned(),
+                    resource,
+                });
+            } else if name.ends_with(".bcf") {
+                items.push(Item::Bcf { resource });
             }
-            if !name.ends_with(".bcf") {
-                continue;
-            }
-            let bytes = resource.read()?;
-            if bytes.get(..8).is_none_or(|head| head != [0; 8]) {
-                continue;
-            }
-            let Ok(parsed) = read_bcf(&bytes) else {
-                continue;
-            };
-            let location = resource.location(&install.root);
-            for animation in parsed {
-                let clip = Clip {
-                    skill: animation.skill,
-                    duration: animation.duration_ms.to_bits(),
-                    distance: animation.distance.to_bits(),
-                    moving: animation.moving,
-                    frames: animation.motions.first().map_or(0, |m| m.frames),
-                    motions: animation.motions.len(),
-                    tracks: animation
-                        .motions
-                        .iter()
-                        .flat_map(|m| m.event_lists.iter().map(|list| (&m.bone, list)))
-                        .filter(|(_, list)| !list.is_empty())
-                        .map(|(bone, list)| Track::build(bone, list))
-                        .collect(),
-                    channels: animation
-                        .motions
-                        .iter()
-                        .map(|m| Channel {
-                            bone: m.bone.clone(),
-                            translation: m.translation,
-                            rotation: m.rotation,
+        }
+        let decode_item = |item: &Item| -> Result<Decoded> {
+            match item {
+                Item::Cfp { skill, resource } => Ok(Decoded::Cfp {
+                    skill: skill.clone(),
+                    bytes: resource.read_with(pool)?,
+                }),
+                Item::Bcf { resource } => {
+                    let head = resource.read_head_with(pool, 8)?;
+                    if head.len() < 8 || head != [0; 8] {
+                        return Ok(Decoded::Skip);
+                    }
+                    let bytes = resource.read_with(pool)?;
+                    let Ok(parsed) = read_bcf(&bytes) else {
+                        return Ok(Decoded::Skip);
+                    };
+                    let location = resource.location(&install.root);
+                    let clips = parsed
+                        .into_iter()
+                        .map(|animation| Clip {
+                            skill: animation.skill,
+                            duration: animation.duration_ms.to_bits(),
+                            distance: animation.distance.to_bits(),
+                            moving: animation.moving,
+                            frames: animation.motions.first().map_or(0, |m| m.frames),
+                            motions: animation.motions.len(),
+                            tracks: animation
+                                .motions
+                                .iter()
+                                .flat_map(|m| m.event_lists.iter().map(|list| (&m.bone, list)))
+                                .filter(|(_, list)| !list.is_empty())
+                                .map(|(bone, list)| Track::build(bone, list))
+                                .collect(),
+                            channels: animation
+                                .motions
+                                .iter()
+                                .map(|m| Channel {
+                                    bone: m.bone.clone(),
+                                    translation: m.translation,
+                                    rotation: m.rotation,
+                                })
+                                .collect(),
+                            samples: [animation.translation_count, animation.rotation_count],
+                            name: animation.name,
                         })
-                        .collect(),
-                    samples: [animation.translation_count, animation.rotation_count],
-                    name: animation.name,
-                };
-                animations.index_clip_name(&clip.name);
-                animations
-                    .clips
-                    .entry(clip.name.clone())
-                    .or_default()
-                    .insert(location.clone(), clip);
+                        .collect();
+                    Ok(Decoded::Bcf { location, clips })
+                }
+            }
+        };
+        let workers = worker_count(items.len());
+        let decoded: Vec<Result<Decoded>> = if workers <= 1 {
+            items.iter().map(decode_item).collect()
+        } else {
+            let chunk_size = items.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = items
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || chunk.iter().map(decode_item).collect::<Vec<_>>())
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(items.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("animations worker panicked"));
+                }
+                out
+            })
+        };
+        let mut animations = Self::default();
+        for item in decoded {
+            match item? {
+                Decoded::Cfp { skill, bytes } => {
+                    animations.samples.entry(skill).or_default().insert(bytes);
+                }
+                Decoded::Bcf { location, clips } => {
+                    for clip in clips {
+                        animations.index_clip_name(&clip.name);
+                        animations
+                            .clips
+                            .entry(clip.name.clone())
+                            .or_default()
+                            .insert(location.clone(), clip);
+                    }
+                }
+                Decoded::Skip => {}
             }
         }
         animations.revision = animations.revision.wrapping_add(1);
