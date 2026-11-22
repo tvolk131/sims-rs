@@ -414,6 +414,11 @@ impl App {
                 self.changed(true);
                 return;
             }
+            Key::Named(NamedKey::F3) => {
+                self.game.set_mode(sims_ui::command::Mode::Build);
+                self.changed(true);
+                return;
+            }
             Key::Named(NamedKey::F5) => return self.save(false),
             Key::Named(NamedKey::F9) => return self.save(true),
             Key::Named(NamedKey::Delete | NamedKey::Backspace) => {
@@ -750,6 +755,7 @@ impl ApplicationHandler for App {
                 self.shift_held = state.shift_key();
                 self.ctrl_or_cmd_held = state.control_key() || state.super_key();
                 self.game.set_shift(self.shift_held);
+                self.game.set_ctrl(state.control_key());
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if event.logical_key == Key::Named(NamedKey::Escape) {

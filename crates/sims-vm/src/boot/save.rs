@@ -174,9 +174,13 @@ impl Lot {
             .filter(|c| self.is_active_buy_cursor(c))
             .or_else(|| self.active_buy_cursor.as_ref().map(|a| &a.cursor));
         let mut world = self.world.clone();
-        let has_history =
-            !self.buy_redo.is_empty() || !self.buy_undo.is_empty() || !self.buy_orphans.is_empty();
-        if cursor.is_some() || has_history {
+        let has_history = !self.buy_redo.is_empty()
+            || !self.buy_undo.is_empty()
+            || !self.buy_orphans.is_empty()
+            || !self.build_undo.is_empty()
+            || !self.build_redo.is_empty();
+        let has_wall_cursor = self.active_wall_cursor.is_some();
+        if cursor.is_some() || has_history || has_wall_cursor {
             let sounds = std::cell::RefCell::new(Vec::new());
             let interpreter = crate::interpreter::Interpreter {
                 sounds: Some(&sounds),
@@ -198,8 +202,19 @@ impl Lot {
                     SaveError::Format(format!("clearing Buy Mode preview for save: {e}"))
                 })?;
             }
+            if let Some(wall_cur) = self.active_wall_cursor.as_ref() {
+                interpreter
+                    .build_cursor_close(&mut world, wall_cur)
+                    .map_err(|e| {
+                        SaveError::Format(format!("clearing Build Mode cursor for save: {e}"))
+                    })?;
+            }
             if has_history {
                 let empty = std::collections::BTreeSet::new();
+                let mut build_detached = Vec::new();
+                for entry in self.build_undo.iter().chain(self.build_redo.iter()) {
+                    build_detached.extend_from_slice(entry.detached_objects());
+                }
                 interpreter
                     .buy_purge_detached(&mut world, &self.buy_redo, &empty)
                     .and_then(|()| {
@@ -207,6 +222,9 @@ impl Lot {
                     })
                     .and_then(|()| {
                         interpreter.buy_purge_detached(&mut world, &self.buy_orphans, &empty)
+                    })
+                    .and_then(|()| {
+                        interpreter.buy_purge_detached(&mut world, &build_detached, &empty)
                     })
                     .map_err(|e| {
                         SaveError::Format(format!("clearing detached Buy Mode redo objects: {e}"))
@@ -266,6 +284,11 @@ impl Lot {
         self.buy_redo.clear();
         self.buy_orphans.clear();
         self.active_buy_cursor = None;
+        self.build_undo.clear();
+        self.build_redo.clear();
+        self.undo_order.clear();
+        self.redo_order.clear();
+        self.active_wall_cursor = None;
         Ok(())
     }
 }

@@ -37,6 +37,7 @@ mod animator;
 mod autonomy;
 pub mod boot;
 mod both_ways;
+mod build;
 mod buy;
 mod cancel;
 mod clip_events;
@@ -72,6 +73,15 @@ mod tick;
 mod visits;
 
 pub use animator::snap_to_path;
+pub use build::{
+    ARCHITECTURE_BUDGET, BuildHistory, BuildPrices, FloorDragMode, FloorPlan, SPLIT_FLOOR_ID,
+    WALL_ASCENDING, WALL_CURSOR_GUID, WALL_DESCENDING, WALL_EAST, WALL_NORTH, WALL_SOUTH,
+    WALL_WEST, WallCursor, WallDragMode, WallFace, WallPlan, WallSegment, WallStyle,
+    WallpaperDragMode, WallpaperPlan, build_refund, is_buildable_tile, plan_floor_edit,
+    plan_wall_drag, plan_wallpaper_edit, preview_floor_on_world, preview_wall_on_world,
+    preview_wallpaper_on_world, room_wallpaper_faces, snap_wall_corner, wall_cursor_fine,
+    wall_line_segments, wall_room_box_segments, wallpaper_cursor_facing, wallpaper_cursor_fine,
+};
 pub use buy::{
     BuyActionKind, BuyCursor, BuyPlacement, BuyPurchase, COMEANDSEE_GUID, TILE_CURSOR_GUID,
     available_funds, default_buy_direction, panel_mode, snap_to_tile_centre,

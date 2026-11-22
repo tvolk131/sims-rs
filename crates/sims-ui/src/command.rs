@@ -81,6 +81,37 @@ pub enum Camera {
     Photo,
 }
 
+/// One of the 12 Build Mode tool buttons in `cWinArch` (`0x5004f5`, `0x6f2bf0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BuildTool {
+    Terrain,
+    Water,
+    Wall,
+    Wallpaper,
+    Stairs,
+    Fireplace,
+    Plants,
+    Floor,
+    Doors,
+    Windows,
+    Roof,
+    Hand,
+}
+
+/// One selectable entry in the Build Mode catalog strip (`cWinArch`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BuildItemId {
+    /// Wall or fence style ID (`1, 2, 12, 13, 14`).
+    WallStyle(u16),
+    /// Floor tile pattern key (`floors.iff` built-in or `.flr` plug-in).
+    Floor(u16),
+    /// Wallpaper pattern key (`walls.iff` built-in or `.wll` plug-in).
+    Wallpaper(u16),
+    /// Build Mode catalog object master GUID (doors, windows, columns, stairs,
+    /// fireplaces, plants).
+    Object(u32),
+}
+
 /// One player action.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Command {
@@ -154,6 +185,13 @@ pub enum Command {
     /// Select catalog master GUID `u32` in the Buy Mode catalog grid
     /// (`0x5065c8`).
     BuyItem(u32),
+    /// Select one of the 12 Build Mode tools (`cWinArch`, `0x501197`).
+    BuildTool(BuildTool),
+    /// Step the Build Mode catalog grid page by `-1` or `+1`.
+    BuildPage(i32),
+    /// Select a Build Mode catalog entry (wall/fence style, floor, wallpaper,
+    /// or door/window/column/stair/fireplace/plant object).
+    BuildItem(BuildItemId),
     /// Undo the most recent Buy/Build action (`0x4cf2e0` → `0x4932fa`).
     Undo,
     /// Redo the most recently undone Buy/Build action (`0x4cf317` → `0x493338`).

@@ -20,11 +20,17 @@ use crate::pick;
 use crate::sound;
 use crate::view::{Move, View};
 use sims_render::{Camera, Canvas, Selected, Walls, open_house};
-use sims_ui::command::{Camera as UiCamera, Command, Mode, Speed, Walls as UiWalls};
+use sims_ui::command::{
+    BuildItemId, BuildTool, Camera as UiCamera, Command, Mode, Speed, Walls as UiWalls,
+};
 use sims_vm::boot::save::Saved;
 use sims_vm::boot::{Frames, Lot, StepError};
 use sims_vm::play::{Recovery, ScriptError};
-use sims_vm::{BuyCursor, PanelMode, SkippedFrame, SoundEvent};
+use sims_vm::{
+    BuyCursor, FloorDragMode, FloorPlan, PanelMode, SkippedFrame, SoundEvent, WALL_ASCENDING,
+    WALL_DESCENDING, WALL_EAST, WALL_NORTH, WALL_SOUTH, WALL_WEST, WallCursor, WallDragMode,
+    WallFace, WallPlan, WallStyle, WallpaperDragMode, WallpaperPlan,
+};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -153,8 +159,19 @@ pub struct Game {
     /// when returning from Buy/Build/Options back to Live Mode.
     live_panel_expanded: bool,
     /// Whether Shift is currently held (`VK_SHIFT`, `0x4864f9`), which rearms
-    /// any Buy Mode item for repeat purchase on placement (`0x48680f`).
+    /// any Buy Mode item for repeat purchase on placement (`0x48680f`), and
+    /// switches Build Mode Wall/Floor/Wallpaper tools to Room-Box / Room-Fill.
     shift_held: bool,
+    /// Whether Ctrl is currently held (`VK_CONTROL`), which switches Build Mode
+    /// Wall/Floor/Wallpaper tools to Demolish / Remove / Strip.
+    ctrl_held: bool,
+    /// Active Build Mode `"Wall Cursor"` (`0x00000439`) when the Wall or
+    /// Wallpaper tool is active.
+    wall_cursor: Option<WallCursor>,
+    /// Active Build Mode drag operation (Wall, Floor, or Wallpaper).
+    build_drag: Option<BuildDrag>,
+    /// Temporary rendered lot shape showing live Build Mode drag/Shift preview.
+    build_preview_shape: Option<sims_render::Lot>,
     /// Last `clock_us` when `UI_moneyback` (`0x492ad4`) or `UI_archtool_delete`
     /// (`0x492b05`) played, enforcing the native 400 ms sound cooldown.
     buy_moneyback_us: Option<u64>,
@@ -240,6 +257,10 @@ impl Game {
             buy_commit_on_release: false,
             live_panel_expanded: true,
             shift_held: false,
+            ctrl_held: false,
+            wall_cursor: None,
+            build_drag: None,
+            build_preview_shape: None,
             buy_moneyback_us: None,
             buy_delete_us: None,
             note: None,
@@ -642,9 +663,10 @@ impl Game {
         // The lot, then the people, then the objects that hold someone
         // (a bench a Sim sits on), as the original's frame does.
         let preview = self.buy_cursor.as_ref().map(|c| (c.cursor, c.held));
+        let draw_shape = self.build_preview_shape.as_ref().unwrap_or(&self.lot_shape);
         self.lot_cache.draw_lot_with_preview(
             world,
-            &self.lot_shape,
+            draw_shape,
             &mut self.assets,
             &self.view.camera,
             viewport,
@@ -667,7 +689,7 @@ impl Game {
         self.people_ids.take(&self.canvas);
         sims_render::draw_held(
             world,
-            &self.lot_shape,
+            draw_shape,
             &mut self.assets,
             &self.view.camera,
             &mut self.canvas,
@@ -727,6 +749,16 @@ impl Game {
         }
         self.hud.sync_clock_blink(world, self.clock_us);
         self.blink_dirty = false;
+        if self.hud.controls.mode == Mode::Build && self.hud.controls.expanded {
+            self.hud.layout_build(
+                self.view.size,
+                world,
+                &self.assets,
+                self.lot.can_undo(),
+                self.lot.can_redo(),
+            );
+            self.hud.ensure_build_swatches(&mut self.assets);
+        }
         self.hud.draw_with_sell(
             world,
             self.lot.residential(),
@@ -737,6 +769,7 @@ impl Game {
             sell.as_ref(),
             &mut self.canvas,
         );
+        self.draw_build_cost_label();
         // The help balloon closed by the selection's going.
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
@@ -857,6 +890,18 @@ impl Game {
                 redraw |= self.hover_buy(point);
             } else {
                 redraw |= self.hide_buy_cursor();
+            }
+        } else if self.hud.controls.mode == Mode::Build {
+            if self.buy_selected.is_some() || self.buy_cursor.is_some() {
+                if !self.hud.covers(point) || self.buy_dragging.is_some() {
+                    redraw |= self.hover_buy(point);
+                } else {
+                    redraw |= self.hide_buy_cursor();
+                }
+            } else if !self.hud.covers(point) || self.build_drag.is_some() {
+                redraw |= self.hover_build(point);
+            } else {
+                redraw |= self.hide_build_cursor();
             }
         } else {
             redraw |= self.follow();
@@ -991,6 +1036,70 @@ impl Game {
                 photo: false,
             };
         }
+        if self.hud.controls.mode == Mode::Build {
+            if self.stopped.is_some() {
+                self.note = Some("The lot has stopped, so it takes no orders.".into());
+                return Outcome::redraw();
+            }
+            if self.buy_selected.is_some() || self.buy_cursor.is_some() {
+                self.pointer = Some(point);
+                self.hover_buy(point);
+                self.buy_dragging = Some(point);
+                self.buy_commit_on_release = true;
+                let valid = self.buy_cursor.as_ref().is_some_and(|c| c.valid);
+                self.hud.play(if valid {
+                    "UI_object_move_place"
+                } else {
+                    crate::hud::ERROR
+                });
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                return Outcome::redraw();
+            }
+            if self.hud.build_state.tool == Some(BuildTool::Hand) {
+                if let Some(target) = self.under(point) {
+                    match self.lot.buy_pick_up(target) {
+                        Ok(Some(cursor)) => {
+                            let screen =
+                                lot_point(&self.view.camera, &self.lot_shape, cursor.position);
+                            self.buy_grab_offset = [
+                                point[0] - (screen[0] + pick::ORIGIN_COLUMN),
+                                point[1] - screen[1],
+                            ];
+                            self.buy_cursor = Some(cursor);
+                            self.buy_in_house = true;
+                            self.buy_dragging = Some(point);
+                            self.buy_commit_on_release = false;
+                            self.pointer = Some(point);
+                            self.hud.play("UI_object_move");
+                            let sounds = self.hud.take_sounds();
+                            self.keep_sounds(sounds);
+                            self.refresh_world();
+                            self.layout_build();
+                            return Outcome::redraw();
+                        }
+                        Ok(None) => {
+                            self.hud.play(crate::hud::ERROR);
+                            let sounds = self.hud.take_sounds();
+                            self.keep_sounds(sounds);
+                            return Outcome::redraw();
+                        }
+                        Err(e) => {
+                            self.note = Some(format!("Object {target} was not picked up: {e}"));
+                            self.hud.play(crate::hud::ERROR);
+                            let sounds = self.hud.take_sounds();
+                            self.keep_sounds(sounds);
+                            return Outcome::redraw();
+                        }
+                    }
+                }
+                return Outcome {
+                    redraw: cleared || dismissed,
+                    photo: false,
+                };
+            }
+            return self.press_build(point);
+        }
         if self.hud.controls.mode != Mode::Live {
             return Outcome {
                 redraw: cleared,
@@ -1013,12 +1122,15 @@ impl Game {
         if !self.in_view(point) {
             return self.release_outside();
         }
-        if self.hud.controls.mode == Mode::Buy
+        if matches!(self.hud.controls.mode, Mode::Buy | Mode::Build)
             && let Some(anchor) = self.buy_dragging
         {
             // Dropping a held object onto the Buy catalog strip sells it
             // (`0x50d04d` → `0x4cf97a` → `0x487e18`).
-            if self.hud.over_buy_catalog(self.view.size, point) && self.buy_cursor.is_some() {
+            if self.hud.controls.mode == Mode::Buy
+                && self.hud.over_buy_catalog(self.view.size, point)
+                && self.buy_cursor.is_some()
+            {
                 self.buy_dragging = None;
                 self.buy_commit_on_release = false;
                 self.sell_held();
@@ -1039,6 +1151,9 @@ impl Game {
                 return self.commit_buy(point);
             }
             return Outcome::redraw();
+        }
+        if self.hud.controls.mode == Mode::Build && self.build_drag.is_some() {
+            return self.release_build(point);
         }
         if self.hud.dialog().is_some() || self.hud.menu.is_none() {
             return Outcome {
@@ -1105,6 +1220,14 @@ impl Game {
                 photo: false,
             };
         }
+        if self.build_drag.take().is_some() {
+            self.build_preview_shape = None;
+            let redraw = self.hide_build_cursor();
+            return Outcome {
+                redraw: redraw || true,
+                photo: false,
+            };
+        }
         if self.hud.dialog().is_some() || self.hud.menu.is_none() {
             return Outcome {
                 redraw: false,
@@ -1140,6 +1263,14 @@ impl Game {
         if self.hud.controls.mode == Mode::Buy {
             if self.buy_dragging.is_none() {
                 redraw |= self.hide_buy_cursor();
+            }
+            redraw
+        } else if self.hud.controls.mode == Mode::Build {
+            if self.buy_dragging.is_none() {
+                redraw |= self.hide_buy_cursor();
+            }
+            if self.build_drag.is_none() {
+                redraw |= self.hide_build_cursor();
             }
             redraw
         } else {
@@ -1663,6 +1794,9 @@ impl Game {
         self.buy_dragging = None;
         self.buy_grab_offset = [0, 0];
         self.buy_commit_on_release = false;
+        self.wall_cursor = None;
+        self.build_drag = None;
+        self.build_preview_shape = None;
         self.live_panel_expanded = true;
         self.hud.forget();
         self.hud.controls.mode = ui_mode(self.lot.mode());
@@ -1809,6 +1943,18 @@ impl Game {
                 self.select_buy_item(guid);
                 Outcome::redraw()
             }
+            Command::BuildTool(tool) => {
+                self.select_build_tool(tool);
+                Outcome::redraw()
+            }
+            Command::BuildPage(delta) => {
+                self.page_build(delta);
+                Outcome::redraw()
+            }
+            Command::BuildItem(item) => {
+                self.select_build_item(item);
+                Outcome::redraw()
+            }
             Command::Undo => {
                 self.undo_buy();
                 Outcome::redraw()
@@ -1824,6 +1970,8 @@ impl Game {
                 self.sync_view_centre();
                 if self.hud.controls.mode == Mode::Buy {
                     self.layout_buy();
+                } else if self.hud.controls.mode == Mode::Build {
+                    self.layout_build();
                 }
                 Outcome::redraw()
             }
@@ -1935,7 +2083,7 @@ impl Game {
     /// `0x50d04d` → `0x4cf97a` → `0x487e18`). Returns `true` if a Buy cursor
     /// was active and handled.
     pub fn sell_held(&mut self) -> bool {
-        if self.hud.controls.mode != Mode::Buy || self.stopped.is_some() {
+        if !matches!(self.hud.controls.mode, Mode::Buy | Mode::Build) || self.stopped.is_some() {
             return false;
         }
         let Some(cursor) = self.buy_cursor.take() else {
@@ -1994,17 +2142,25 @@ impl Game {
         true
     }
 
-    /// Whether a committed Buy Mode purchase can be undone (`0x4cf074`).
+    /// Whether a committed Buy or Build Mode action can be undone (`0x4cf074`).
     pub fn can_undo(&self) -> bool {
-        self.hud.controls.mode == Mode::Buy && self.lot.can_buy_undo()
+        match self.hud.controls.mode {
+            Mode::Buy => self.lot.can_buy_undo(),
+            Mode::Build => self.lot.can_undo(),
+            _ => false,
+        }
     }
 
-    /// Whether an undone Buy Mode purchase can be redone (`0x4cf08c`).
+    /// Whether an undone Buy or Build Mode action can be redone (`0x4cf08c`).
     pub fn can_redo(&self) -> bool {
-        self.hud.controls.mode == Mode::Buy && self.lot.can_buy_redo()
+        match self.hud.controls.mode {
+            Mode::Buy => self.lot.can_buy_redo(),
+            Mode::Build => self.lot.can_redo(),
+            _ => false,
+        }
     }
 
-    /// Runs a Buy Mode Undo (`undo = true`) or Redo (`undo = false`). If the
+    /// Runs a Buy/Build Mode Undo (`undo = true`) or Redo (`undo = false`). If the
     /// Hand Tool currently holds a picked-up existing lot object, snaps it
     /// back and clears cursor ownership first (without clearing the redo
     /// stack) so the Hand Tool never conflicts with or double-refunds an
@@ -2019,6 +2175,8 @@ impl Game {
         if !allowed || self.stopped.is_some() {
             return false;
         }
+        self.build_drag = None;
+        self.build_preview_shape = None;
         let snapped_existing = if self.buy_cursor.as_ref().is_some_and(BuyCursor::is_existing) {
             let cursor = self.buy_cursor.take().unwrap();
             match self.lot.buy_snap_back(&cursor) {
@@ -2038,7 +2196,13 @@ impl Game {
         } else {
             false
         };
-        let result = if undo {
+        let result = if self.hud.controls.mode == Mode::Build {
+            if undo {
+                self.lot.undo()
+            } else {
+                self.lot.redo()
+            }
+        } else if undo {
             self.lot.buy_undo()
         } else {
             self.lot.buy_redo()
@@ -2057,21 +2221,29 @@ impl Game {
         match result {
             Ok(true) => {
                 self.refresh_world();
-                self.layout_buy();
+                if self.hud.controls.mode == Mode::Build {
+                    self.layout_build();
+                } else {
+                    self.layout_buy();
+                }
                 true
             }
             Ok(false) => {
                 self.refresh_world();
-                if snapped_existing {
+                if self.hud.controls.mode == Mode::Build {
+                    self.layout_build();
+                } else if snapped_existing {
                     self.layout_buy();
                 }
                 false
             }
             Err(e) => {
                 let verb = if undo { "undone" } else { "redone" };
-                self.note = Some(format!("The purchase was not {verb}: {e}"));
+                self.note = Some(format!("The action was not {verb}: {e}"));
                 self.refresh_world();
-                if snapped_existing {
+                if self.hud.controls.mode == Mode::Build {
+                    self.layout_build();
+                } else if snapped_existing {
                     self.layout_buy();
                 }
                 false
@@ -2079,27 +2251,47 @@ impl Game {
         }
     }
 
-    /// Undoes the most recent committed Buy Mode purchase (`0x4cf2e0` / event
-    /// `0xec` → `0x4932fa` → `0x48bd21`), keeping any active placement preview
-    /// and catalog selection armed (`0x4a8545`). Returns `true` if a purchase
-    /// was undone.
+    /// Undoes the most recent committed Buy/Build Mode action (`0x4cf2e0` /
+    /// event `0xec` → `0x4932fa`). Returns `true` if an action was undone.
     pub fn undo_buy(&mut self) -> bool {
         self.apply_buy_history(true)
     }
 
-    /// Redoes the most recently undone Buy Mode purchase (`0x4cf317` / event
-    /// `0xed` → `0x493338` → `0x48bdfe`), keeping any active placement preview
-    /// and catalog selection armed (`0x4a856a`). Returns `true` if a purchase
-    /// was redone.
+    /// Redoes the most recently undone Buy/Build Mode action (`0x4cf317` /
+    /// event `0xed` → `0x493338`). Returns `true` if an action was redone.
     pub fn redo_buy(&mut self) -> bool {
         self.apply_buy_history(false)
     }
 
     /// Sets whether the Shift modifier is held (`VK_SHIFT`, `0x4864f9`),
     /// which keeps the Buy tool armed for repeat purchases after placing any
-    /// affordable item (`0x48680f`).
+    /// affordable item (`0x48680f`) and toggles Build Mode Room-Box / Room-Fill.
     pub fn set_shift(&mut self, held: bool) {
+        if self.shift_held == held {
+            return;
+        }
         self.shift_held = held;
+        if self.hud.controls.mode == Mode::Build
+            && let Some(pt) = self.pointer
+            && !self.hud.covers(pt)
+        {
+            self.hover_build(pt);
+        }
+    }
+
+    /// Sets whether the Ctrl modifier is held (`VK_CONTROL`), which switches
+    /// Build Mode Wall/Floor/Wallpaper tools to Demolish / Remove / Strip.
+    pub fn set_ctrl(&mut self, held: bool) {
+        if self.ctrl_held == held {
+            return;
+        }
+        self.ctrl_held = held;
+        if self.hud.controls.mode == Mode::Build
+            && let Some(pt) = self.pointer
+            && !self.hud.covers(pt)
+        {
+            self.hover_build(pt);
+        }
     }
 
     /// Switches between Live, Buy, Build, and Options modes (`0x4cea5d`,
@@ -2132,6 +2324,9 @@ impl Game {
         self.buy_commit_on_release = false;
         self.buy_in_house = false;
         self.buy_selected = None;
+        self.wall_cursor = None;
+        self.build_drag = None;
+        self.build_preview_shape = None;
         self.hud.buy_state.selected = None;
         self.close_menu();
         self.reached = None;
@@ -2153,6 +2348,7 @@ impl Game {
         }
         self.hud.controls.help = None;
         self.hud.buy_state.reset();
+        self.hud.build_state.reset();
         // Native `0x487191` clears the active selection/cursor while retaining
         // `buy_last_guid` (`tool[0x12]`) and `buy_facing` (`tool[0x10]`).
         self.buy_in_house = false;
@@ -2167,6 +2363,9 @@ impl Game {
             &self.assets,
             None,
         );
+        if mode == Mode::Build {
+            self.layout_build();
+        }
     }
 
     /// Arms catalog master `guid` on the Buy Mode placement tool (`0x5065c8`).
@@ -2225,11 +2424,17 @@ impl Game {
         } else {
             false
         };
+        let had_build_drag = self.build_drag.take().is_some();
+        if had_build_drag {
+            self.build_preview_shape = None;
+        }
         let had_selection = self.buy_selected.take().is_some();
         let had_hud = self.hud.buy_state.selected.take().is_some();
-        if had_selection || had_hud || had_cursor {
+        if had_selection || had_hud || had_cursor || had_build_drag {
             if self.hud.controls.mode == Mode::Buy {
                 self.layout_buy();
+            } else if self.hud.controls.mode == Mode::Build {
+                self.layout_build();
             }
             true
         } else {
@@ -2471,7 +2676,11 @@ impl Game {
                     self.hud.buy_state.selected = None;
                     self.refresh_world();
                 }
-                self.layout_buy();
+                if self.hud.controls.mode == Mode::Build {
+                    self.layout_build();
+                } else {
+                    self.layout_buy();
+                }
             }
             Err(e) => {
                 // `Lot::buy_commit` rolled back the world; keep the cursor
@@ -2486,6 +2695,883 @@ impl Game {
         Outcome::redraw()
     }
 
+    /// The Build Mode panel state (active tool, page, selected item).
+    pub fn build_state(&self) -> sims_ui::build::BuildState {
+        self.hud.build_state
+    }
+
+    /// The Build Mode panel layout as last built.
+    pub fn build_layout(&self) -> &sims_ui::build::BuildLayout {
+        self.hud.build_layout()
+    }
+
+    /// Rebuilds the cached Build Mode panel layout for the current viewport and
+    /// Undo/Redo availability.
+    fn layout_build(&mut self) {
+        let can_undo = self.lot.can_undo();
+        let can_redo = self.lot.can_redo();
+        self.hud.layout_build(
+            self.view.size,
+            self.lot.world(),
+            &self.assets,
+            can_undo,
+            can_redo,
+        );
+    }
+
+    /// Selects one of the 12 Build Mode tools (`cWinArch`, `0x501197`),
+    /// managing `"Wall Cursor"` (`0x00000439`) activation/deactivation
+    /// (`0x48b68b`, `0x48a66a`, `0x48a6e5`).
+    pub fn select_build_tool(&mut self, tool: BuildTool) {
+        self.cancel_buy();
+        self.build_drag = None;
+        self.build_preview_shape = None;
+        let catalog = self.hud.ensure_build_catalog(&self.assets).clone();
+        self.hud.build_state.select_tool(tool, &catalog);
+        match tool {
+            BuildTool::Wall => {
+                let mode = self.current_wall_drag_mode().cursor_mode();
+                self.open_wall_cursor(mode);
+            }
+            BuildTool::Wallpaper => {
+                self.open_wall_cursor(2);
+            }
+            _ => {
+                self.close_wall_cursor();
+            }
+        }
+        self.layout_build();
+        self.refresh_world();
+    }
+
+    /// Steps the Build Mode catalog grid page by `delta`.
+    pub fn page_build(&mut self, delta: i32) -> bool {
+        if self.hud.controls.mode != Mode::Build || !self.hud.controls.expanded {
+            return false;
+        }
+        let changed = self.hud.build_state.step_page(delta);
+        self.layout_build();
+        changed
+    }
+
+    /// Selects a Build Mode catalog entry (wall/fence style, floor, wallpaper,
+    /// or door/window/column/stair/fireplace/plant object).
+    pub fn select_build_item(&mut self, item: BuildItemId) {
+        self.cancel_buy();
+        self.build_drag = None;
+        self.build_preview_shape = None;
+        self.hud.build_state.select_item(item);
+        match item {
+            BuildItemId::WallStyle(_) => {
+                let mode = self.current_wall_drag_mode().cursor_mode();
+                self.open_wall_cursor(mode);
+            }
+            BuildItemId::Wallpaper(_) => {
+                self.open_wall_cursor(2);
+            }
+            BuildItemId::Floor(_) => {
+                self.close_wall_cursor();
+            }
+            BuildItemId::Object(guid) => {
+                self.close_wall_cursor();
+                let price = self
+                    .hud
+                    .ensure_build_catalog(&self.assets)
+                    .get(item)
+                    .map(|e| e.price);
+                let funds = sims_vm::available_funds(self.lot.world());
+                match price {
+                    Some(p) if p <= 0 || p <= funds => {
+                        self.buy_selected = Some(guid);
+                    }
+                    Some(_) => {
+                        self.hud.play(crate::hud::ERROR);
+                        self.buy_selected = None;
+                        self.hud.build_state.selected = None;
+                    }
+                    None => {
+                        self.buy_selected = None;
+                    }
+                }
+            }
+        }
+        self.layout_build();
+        self.refresh_world();
+    }
+
+    fn open_wall_cursor(&mut self, mode: i16) {
+        if let Some(mut cur) = self.wall_cursor.take() {
+            if cur.mode != mode {
+                let pos = cur.position;
+                let _ = self.lot.build_cursor_move(&mut cur, pos, None, Some(mode));
+            }
+            self.wall_cursor = Some(cur);
+            return;
+        }
+        match self.lot.build_cursor_open(mode) {
+            Ok(cursor) => self.wall_cursor = Some(cursor),
+            Err(e) => self.note = Some(format!("Could not open Wall Cursor: {e}")),
+        }
+    }
+
+    fn close_wall_cursor(&mut self) {
+        if let Some(cursor) = self.wall_cursor.take() {
+            if let Err(e) = self.lot.build_cursor_close(&cursor) {
+                self.note = Some(format!("Could not close Wall Cursor: {e}"));
+            }
+        } else {
+            let _ = self.lot.build_cursor_close_active();
+        }
+    }
+
+    fn current_wall_drag_mode(&self) -> WallDragMode {
+        match (self.shift_held, self.ctrl_held) {
+            (false, false) => WallDragMode::Build,
+            (false, true) => WallDragMode::Demolish,
+            (true, false) => WallDragMode::RoomBox,
+            (true, true) => WallDragMode::RoomBoxDemolish,
+        }
+    }
+
+    fn current_floor_drag_mode(&self) -> FloorDragMode {
+        match (self.shift_held, self.ctrl_held) {
+            (false, false) => FloorDragMode::Lay,
+            (false, true) => FloorDragMode::Remove,
+            (true, false) => FloorDragMode::RoomFillLay,
+            (true, true) => FloorDragMode::RoomFillRemove,
+        }
+    }
+
+    fn current_wallpaper_drag_mode(&self) -> WallpaperDragMode {
+        match (self.shift_held, self.ctrl_held) {
+            (false, false) => WallpaperDragMode::Apply,
+            (false, true) => WallpaperDragMode::Strip,
+            (true, false) => WallpaperDragMode::RoomFillApply,
+            (true, true) => WallpaperDragMode::RoomFillStrip,
+        }
+    }
+
+    fn unproject_build_fine(&self, point: [i32; 2]) -> [i32; 2] {
+        let at = [point[0] - pick::ORIGIN_COLUMN, point[1]];
+        sims_render::unproject_terrain(&self.lot_shape, &self.view.camera, at)
+            .unwrap_or_else(|| self.view.camera.unproject_fine(at))
+    }
+
+    /// Computes which diagonal half (`0` or `1`) of tile `(tx, ty)` the fine
+    /// coordinates `(fx, fy)` fall into for a split diagonal floor tile.
+    fn split_half_at(&self, fine: [i32; 2], tx: i32, ty: i32, level: u8) -> Option<u8> {
+        let level_idx = usize::from(level.saturating_sub(1)).min(1);
+        let size = self.lot_shape.size;
+        if tx < 0 || ty < 0 || tx as usize >= size || ty as usize >= size {
+            return None;
+        }
+        let segs = self.lot_shape.levels[level_idx].walls
+            [sims_render::Lot::cell(tx as usize, ty as usize)]
+        .segments;
+        let lx = fine[0] - tx * 16;
+        let ly = fine[1] - ty * 16;
+        if (segs & WALL_DESCENDING) != 0 {
+            Some(u8::from(lx + ly >= 16))
+        } else if (segs & WALL_ASCENDING) != 0 {
+            Some(u8::from(lx > ly))
+        } else {
+            None
+        }
+    }
+
+    /// Screen-space front-facing wall quad hit-test for the Wallpaper tool
+    /// (`cNewWallpaperTool::HitTest` `0x48a709`), accurate across all 3 zooms
+    /// and 4 camera rotations.
+    fn pick_wall_face(&self, point: [i32; 2]) -> Option<WallFace> {
+        let level = u8::try_from(self.view.camera.level)
+            .unwrap_or(1)
+            .clamp(1, 2);
+        let level_idx = usize::from(level - 1);
+        let active = self.lot_shape.size;
+        if active < 2 {
+            return None;
+        }
+        let wall_h = match self.view.camera.zoom {
+            sims_render::Zoom::Far => 29,
+            sims_render::Zoom::Medium => 58,
+            sims_render::Zoom::Near => 116,
+        };
+        let walls = &self.lot_shape.levels[level_idx].walls;
+        let lvl = i32::from(level);
+        // Gather candidate tiles around the ground unprojections at heights
+        // `0..=wall_h` so clicks anywhere on a standing wall are included.
+        let mut candidates = BTreeSet::new();
+        for dy in [0, wall_h / 3, (wall_h * 2) / 3, wall_h] {
+            let fine = self.unproject_build_fine([point[0], point[1] + dy]);
+            let cx = fine[0] >> 4;
+            let cy = fine[1] >> 4;
+            for ox in -2..=2 {
+                for oy in -2..=2 {
+                    let tx = cx + ox;
+                    let ty = cy + oy;
+                    if tx >= 1 && ty >= 1 && (tx as usize) < active && (ty as usize) < active {
+                        candidates.insert((tx as usize, ty as usize));
+                    }
+                }
+            }
+        }
+
+        let px = point[0] as f32;
+        let py = point[1] as f32;
+        let mut best: Option<(f32, WallFace)> = None;
+
+        let mut test_quad = |c0: [i32; 2], c1: [i32; 2], normal: [i32; 2], face: WallFace| {
+            let mid = [(c0[0] + c1[0]) / 2, (c0[1] + c1[1]) / 2];
+            let p_mid = lot_point(&self.view.camera, &self.lot_shape, [mid[0], mid[1], lvl]);
+            let p_out = lot_point(
+                &self.view.camera,
+                &self.lot_shape,
+                [mid[0] + normal[0], mid[1] + normal[1], lvl],
+            );
+            // Front-facing iff outward normal projects downward toward camera (`delta_y > 0`).
+            if p_out[1] <= p_mid[1] {
+                return;
+            }
+            let p0 = lot_point(&self.view.camera, &self.lot_shape, [c0[0], c0[1], lvl]);
+            let p1 = lot_point(&self.view.camera, &self.lot_shape, [c1[0], c1[1], lvl]);
+            let x0 = (p0[0] + pick::ORIGIN_COLUMN) as f32;
+            let y0 = p0[1] as f32;
+            let x1 = (p1[0] + pick::ORIGIN_COLUMN) as f32;
+            let y1 = p1[1] as f32;
+            let min_x = x0.min(x1) - 2.0;
+            let max_x = x0.max(x1) + 2.0;
+            if px < min_x || px > max_x {
+                return;
+            }
+            let span = (x1 - x0).abs();
+            let t = if span < 1.0 {
+                0.5
+            } else {
+                ((px - x0) / (x1 - x0)).clamp(0.0, 1.0)
+            };
+            let y_bot = y0 + t * (y1 - y0);
+            if py >= y_bot - wall_h as f32 - 2.0 && py <= y_bot + 3.0 {
+                let score = y_bot;
+                if best.is_none_or(|(b, _)| score > b) {
+                    best = Some((score, face));
+                }
+            }
+        };
+
+        for (x, y) in candidates {
+            let segs = walls[sims_render::Lot::cell(x, y)].segments;
+            let fx = (x as i32) * 16;
+            let fy = (y as i32) * 16;
+            if (segs & WALL_WEST) != 0 {
+                test_quad(
+                    [fx, fy],
+                    [fx, fy + 16],
+                    [4, 0],
+                    WallFace {
+                        tile: [x as u8, y as u8],
+                        bit: WALL_WEST,
+                        side: 0,
+                    },
+                );
+                if x > 0 {
+                    test_quad(
+                        [fx, fy],
+                        [fx, fy + 16],
+                        [-4, 0],
+                        WallFace {
+                            tile: [(x - 1) as u8, y as u8],
+                            bit: WALL_EAST,
+                            side: 0,
+                        },
+                    );
+                }
+            }
+            if (segs & WALL_NORTH) != 0 {
+                test_quad(
+                    [fx, fy],
+                    [fx + 16, fy],
+                    [0, 4],
+                    WallFace {
+                        tile: [x as u8, y as u8],
+                        bit: WALL_NORTH,
+                        side: 0,
+                    },
+                );
+                if y > 0 {
+                    test_quad(
+                        [fx, fy],
+                        [fx + 16, fy],
+                        [0, -4],
+                        WallFace {
+                            tile: [x as u8, (y - 1) as u8],
+                            bit: WALL_SOUTH,
+                            side: 0,
+                        },
+                    );
+                }
+            }
+            if (segs & WALL_DESCENDING) != 0 {
+                test_quad(
+                    [fx + 16, fy],
+                    [fx, fy + 16],
+                    [-4, -4],
+                    WallFace {
+                        tile: [x as u8, y as u8],
+                        bit: WALL_DESCENDING,
+                        side: 0,
+                    },
+                );
+                test_quad(
+                    [fx + 16, fy],
+                    [fx, fy + 16],
+                    [4, 4],
+                    WallFace {
+                        tile: [x as u8, y as u8],
+                        bit: WALL_DESCENDING,
+                        side: 1,
+                    },
+                );
+            }
+            if (segs & WALL_ASCENDING) != 0 {
+                test_quad(
+                    [fx, fy],
+                    [fx + 16, fy + 16],
+                    [-4, 4],
+                    WallFace {
+                        tile: [x as u8, y as u8],
+                        bit: WALL_ASCENDING,
+                        side: 0,
+                    },
+                );
+                test_quad(
+                    [fx, fy],
+                    [fx + 16, fy + 16],
+                    [4, -4],
+                    WallFace {
+                        tile: [x as u8, y as u8],
+                        bit: WALL_ASCENDING,
+                        side: 1,
+                    },
+                );
+            }
+        }
+        best.map(|(_, f)| f)
+    }
+
+    fn hover_build(&mut self, point: [i32; 2]) -> bool {
+        if self.stopped.is_some() {
+            return false;
+        }
+        let level = u8::try_from(self.view.camera.level)
+            .unwrap_or(1)
+            .clamp(1, 2);
+        let active = self.lot_shape.size;
+        let tool = self.hud.build_state.tool;
+
+        // 1. Update active drag if one is in progress.
+        if let Some(mut drag) = self.build_drag.take() {
+            let prices = self.hud.build_prices(&self.assets);
+            match &mut drag {
+                BuildDrag::Wall {
+                    start_corner,
+                    end_corner,
+                    style,
+                    mode,
+                    plan,
+                } => {
+                    let fine = self.unproject_build_fine(point);
+                    let corner = sims_vm::snap_wall_corner(fine, active);
+                    *end_corner = corner;
+                    *mode = self.current_wall_drag_mode();
+                    if let Some(mut cur) = self.wall_cursor.take() {
+                        let cfine = sims_vm::wall_cursor_fine(corner, level);
+                        let _ = self.lot.build_cursor_move(
+                            &mut cur,
+                            cfine,
+                            Some(0),
+                            Some(mode.cursor_mode()),
+                        );
+                        self.wall_cursor = Some(cur);
+                    }
+                    let computed = sims_vm::plan_wall_drag(
+                        self.lot.world(),
+                        *start_corner,
+                        *end_corner,
+                        level,
+                        *style,
+                        *mode,
+                        &prices,
+                    );
+                    if computed.valid {
+                        let mut preview_world = self.lot.world().clone();
+                        sims_vm::preview_wall_on_world(&mut preview_world, &computed);
+                        self.build_preview_shape = sims_render::Lot::from_world(&preview_world)
+                            .ok()
+                            .map(|s| s.with_floor_rotation(self.lot.floor_rotation()));
+                    } else {
+                        self.build_preview_shape = None;
+                    }
+                    *plan = Some(computed);
+                }
+                BuildDrag::Floor {
+                    start_tile,
+                    end_tile,
+                    floor_id,
+                    mode,
+                    split_half,
+                    plan,
+                } => {
+                    let fine = self.unproject_build_fine(point);
+                    let tile = [fine[0] >> 4, fine[1] >> 4];
+                    *end_tile = tile;
+                    *mode = self.current_floor_drag_mode();
+                    *split_half = self.split_half_at(fine, tile[0], tile[1], level);
+                    let computed = sims_vm::plan_floor_edit(
+                        self.lot.world(),
+                        *start_tile,
+                        *end_tile,
+                        level,
+                        *floor_id,
+                        *mode,
+                        &prices,
+                        *split_half,
+                    );
+                    if computed.valid {
+                        let mut preview_world = self.lot.world().clone();
+                        sims_vm::preview_floor_on_world(&mut preview_world, &computed);
+                        self.build_preview_shape = sims_render::Lot::from_world(&preview_world)
+                            .ok()
+                            .map(|s| s.with_floor_rotation(self.lot.floor_rotation()));
+                    } else {
+                        self.build_preview_shape = None;
+                    }
+                    *plan = Some(computed);
+                }
+                BuildDrag::Wallpaper {
+                    faces,
+                    pattern_id,
+                    mode,
+                    plan,
+                } => {
+                    *mode = self.current_wallpaper_drag_mode();
+                    if let Some(face) = self.pick_wall_face(point) {
+                        if let Some(mut cur) = self.wall_cursor.take() {
+                            let cfine = sims_vm::wallpaper_cursor_fine(face, level);
+                            let facing =
+                                sims_vm::wallpaper_cursor_facing(face, self.view.camera.rotation);
+                            let _ = self.lot.build_cursor_move(&mut cur, cfine, facing, Some(2));
+                            self.wall_cursor = Some(cur);
+                        }
+                        if !faces.contains(&face) {
+                            faces.push(face);
+                        }
+                    }
+                    let computed = sims_vm::plan_wallpaper_edit(
+                        self.lot.world(),
+                        faces,
+                        level,
+                        *pattern_id,
+                        *mode,
+                        &prices,
+                    );
+                    if computed.valid {
+                        let mut preview_world = self.lot.world().clone();
+                        sims_vm::preview_wallpaper_on_world(&mut preview_world, &computed);
+                        self.build_preview_shape = sims_render::Lot::from_world(&preview_world)
+                            .ok()
+                            .map(|s| s.with_floor_rotation(self.lot.floor_rotation()));
+                    } else {
+                        self.build_preview_shape = None;
+                    }
+                    *plan = Some(computed);
+                }
+            }
+            self.build_drag = Some(drag);
+            return true;
+        }
+
+        // 2. Non-dragging hover: move `"Wall Cursor"` and preview Shift room-fills.
+        self.build_preview_shape = None;
+        match tool {
+            Some(BuildTool::Wall) => {
+                let fine = self.unproject_build_fine(point);
+                let corner = sims_vm::snap_wall_corner(fine, active);
+                let mode = self.current_wall_drag_mode().cursor_mode();
+                if let Some(mut cur) = self.wall_cursor.take() {
+                    let cfine = sims_vm::wall_cursor_fine(corner, level);
+                    let _ = self
+                        .lot
+                        .build_cursor_move(&mut cur, cfine, Some(0), Some(mode));
+                    self.wall_cursor = Some(cur);
+                }
+                true
+            }
+            Some(BuildTool::Wallpaper) => {
+                if let Some(face) = self.pick_wall_face(point) {
+                    if let Some(mut cur) = self.wall_cursor.take() {
+                        let cfine = sims_vm::wallpaper_cursor_fine(face, level);
+                        let facing =
+                            sims_vm::wallpaper_cursor_facing(face, self.view.camera.rotation);
+                        let _ = self.lot.build_cursor_move(&mut cur, cfine, facing, Some(2));
+                        self.wall_cursor = Some(cur);
+                    }
+                    if self.shift_held {
+                        let pat = self.hud.build_state.last_wallpaper.unwrap_or(1);
+                        let prices = self.hud.build_prices(&self.assets);
+                        let mode = self.current_wallpaper_drag_mode();
+                        let plan = sims_vm::plan_wallpaper_edit(
+                            self.lot.world(),
+                            &[face],
+                            level,
+                            pat,
+                            mode,
+                            &prices,
+                        );
+                        if plan.valid {
+                            let mut preview_world = self.lot.world().clone();
+                            sims_vm::preview_wallpaper_on_world(&mut preview_world, &plan);
+                            self.build_preview_shape = sims_render::Lot::from_world(&preview_world)
+                                .ok()
+                                .map(|s| s.with_floor_rotation(self.lot.floor_rotation()));
+                        }
+                    }
+                    true
+                } else {
+                    self.hide_build_cursor()
+                }
+            }
+            Some(BuildTool::Floor) if self.shift_held => {
+                let fine = self.unproject_build_fine(point);
+                let tile = [fine[0] >> 4, fine[1] >> 4];
+                let split_half = self.split_half_at(fine, tile[0], tile[1], level);
+                let fid = self.hud.build_state.last_floor.unwrap_or(1);
+                let prices = self.hud.build_prices(&self.assets);
+                let mode = self.current_floor_drag_mode();
+                let plan = sims_vm::plan_floor_edit(
+                    self.lot.world(),
+                    tile,
+                    tile,
+                    level,
+                    fid,
+                    mode,
+                    &prices,
+                    split_half,
+                );
+                if plan.valid {
+                    let mut preview_world = self.lot.world().clone();
+                    sims_vm::preview_floor_on_world(&mut preview_world, &plan);
+                    self.build_preview_shape = sims_render::Lot::from_world(&preview_world)
+                        .ok()
+                        .map(|s| s.with_floor_rotation(self.lot.floor_rotation()));
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn hide_build_cursor(&mut self) -> bool {
+        self.build_preview_shape = None;
+        let Some(mut cur) = self.wall_cursor.take() else {
+            return false;
+        };
+        let was_on_lot = cur.position[0] >= 0;
+        if was_on_lot {
+            let _ = self.lot.build_cursor_hide(&mut cur);
+        }
+        self.wall_cursor = Some(cur);
+        was_on_lot
+    }
+
+    fn press_build(&mut self, point: [i32; 2]) -> Outcome {
+        let level = u8::try_from(self.view.camera.level)
+            .unwrap_or(1)
+            .clamp(1, 2);
+        let active = self.lot_shape.size;
+        self.pointer = Some(point);
+        match self.hud.build_state.tool {
+            Some(BuildTool::Wall) => {
+                let fine = self.unproject_build_fine(point);
+                let corner = sims_vm::snap_wall_corner(fine, active);
+                let style = WallStyle::from_style_id(self.hud.build_state.last_wall_style)
+                    .unwrap_or(WallStyle::Standard);
+                let mode = self.current_wall_drag_mode();
+                if let Some(mut cur) = self.wall_cursor.take() {
+                    let cfine = sims_vm::wall_cursor_fine(corner, level);
+                    let _ = self.lot.build_cursor_move(
+                        &mut cur,
+                        cfine,
+                        Some(0),
+                        Some(mode.cursor_mode()),
+                    );
+                    self.wall_cursor = Some(cur);
+                }
+                self.build_drag = Some(BuildDrag::Wall {
+                    start_corner: corner,
+                    end_corner: corner,
+                    style,
+                    mode,
+                    plan: None,
+                });
+                self.hud.play(crate::hud::BLD_DRAG_DOWN);
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+            Some(BuildTool::Floor) => {
+                let fine = self.unproject_build_fine(point);
+                let tile = [fine[0] >> 4, fine[1] >> 4];
+                let split_half = self.split_half_at(fine, tile[0], tile[1], level);
+                let floor_id = self
+                    .hud
+                    .build_state
+                    .last_floor
+                    .or_else(|| self.hud.ensure_build_catalog(&self.assets).default_floor())
+                    .unwrap_or(1);
+                let mode = self.current_floor_drag_mode();
+                let prices = self.hud.build_prices(&self.assets);
+                let plan = sims_vm::plan_floor_edit(
+                    self.lot.world(),
+                    tile,
+                    tile,
+                    level,
+                    floor_id,
+                    mode,
+                    &prices,
+                    split_half,
+                );
+                if plan.valid {
+                    let mut preview_world = self.lot.world().clone();
+                    sims_vm::preview_floor_on_world(&mut preview_world, &plan);
+                    self.build_preview_shape = sims_render::Lot::from_world(&preview_world)
+                        .ok()
+                        .map(|s| s.with_floor_rotation(self.lot.floor_rotation()));
+                }
+                self.build_drag = Some(BuildDrag::Floor {
+                    start_tile: tile,
+                    end_tile: tile,
+                    floor_id,
+                    mode,
+                    split_half,
+                    plan: Some(plan),
+                });
+                self.hud.play(crate::hud::BLD_DRAG_DOWN);
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+            Some(BuildTool::Wallpaper) => {
+                let Some(face) = self.pick_wall_face(point) else {
+                    self.hud.play(crate::hud::ERROR);
+                    let sounds = self.hud.take_sounds();
+                    self.keep_sounds(sounds);
+                    return Outcome::redraw();
+                };
+                if let Some(mut cur) = self.wall_cursor.take() {
+                    let cfine = sims_vm::wallpaper_cursor_fine(face, level);
+                    let facing = sims_vm::wallpaper_cursor_facing(face, self.view.camera.rotation);
+                    let _ = self.lot.build_cursor_move(&mut cur, cfine, facing, Some(2));
+                    self.wall_cursor = Some(cur);
+                }
+                let pattern_id = self
+                    .hud
+                    .build_state
+                    .last_wallpaper
+                    .or_else(|| {
+                        self.hud
+                            .ensure_build_catalog(&self.assets)
+                            .default_wallpaper()
+                    })
+                    .unwrap_or(1);
+                let mode = self.current_wallpaper_drag_mode();
+                let prices = self.hud.build_prices(&self.assets);
+                let plan = sims_vm::plan_wallpaper_edit(
+                    self.lot.world(),
+                    &[face],
+                    level,
+                    pattern_id,
+                    mode,
+                    &prices,
+                );
+                if plan.valid {
+                    let mut preview_world = self.lot.world().clone();
+                    sims_vm::preview_wallpaper_on_world(&mut preview_world, &plan);
+                    self.build_preview_shape = sims_render::Lot::from_world(&preview_world)
+                        .ok()
+                        .map(|s| s.with_floor_rotation(self.lot.floor_rotation()));
+                }
+                self.build_drag = Some(BuildDrag::Wallpaper {
+                    faces: vec![face],
+                    pattern_id,
+                    mode,
+                    plan: Some(plan),
+                });
+                self.hud.play(crate::hud::BLD_DRAG_DOWN);
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+            _ => Outcome::default(),
+        }
+    }
+
+    fn release_build(&mut self, point: [i32; 2]) -> Outcome {
+        self.pointer = Some(point);
+        self.hover_build(point);
+        let Some(drag) = self.build_drag.take() else {
+            return Outcome::default();
+        };
+        self.build_preview_shape = None;
+        match drag {
+            BuildDrag::Wall {
+                start_corner,
+                end_corner,
+                mode,
+                plan,
+                ..
+            } => {
+                if let Some(plan) = plan {
+                    if plan.valid && plan.affordable {
+                        match self.lot.build_commit_wall(&plan) {
+                            Ok(true) => {
+                                if mode.is_demolish() {
+                                    self.hud.play(if plan.net_cost < 0 {
+                                        crate::hud::MONEYBACK
+                                    } else {
+                                        crate::hud::ARCHTOOL_DELETE
+                                    });
+                                } else {
+                                    self.hud.play(crate::hud::BLD_DRAG_UP);
+                                }
+                            }
+                            Ok(false) => self.hud.play(crate::hud::ERROR),
+                            Err(e) => {
+                                self.note = Some(format!("Wall edit failed: {e}"));
+                                self.hud.play(crate::hud::ERROR);
+                            }
+                        }
+                    } else if start_corner != end_corner {
+                        self.hud.play(crate::hud::ERROR);
+                    }
+                }
+            }
+            BuildDrag::Floor { mode, plan, .. } => {
+                if let Some(plan) = plan {
+                    if plan.valid && plan.affordable {
+                        match self.lot.build_commit_floor(&plan) {
+                            Ok(true) => {
+                                if mode.is_remove() {
+                                    self.hud.play(if plan.net_cost < 0 {
+                                        crate::hud::MONEYBACK
+                                    } else {
+                                        crate::hud::ARCHTOOL_DELETE
+                                    });
+                                } else {
+                                    self.hud.play(crate::hud::BLD_DRAG_UP);
+                                }
+                            }
+                            Ok(false) => self.hud.play(crate::hud::ERROR),
+                            Err(e) => {
+                                self.note = Some(format!("Floor edit failed: {e}"));
+                                self.hud.play(crate::hud::ERROR);
+                            }
+                        }
+                    } else if !plan.affordable {
+                        self.hud.play(crate::hud::ERROR);
+                    }
+                }
+            }
+            BuildDrag::Wallpaper { mode, plan, .. } => {
+                if let Some(plan) = plan {
+                    if plan.valid && plan.affordable {
+                        match self.lot.build_commit_wallpaper(&plan) {
+                            Ok(true) => {
+                                if mode.is_strip() {
+                                    self.hud.play(if plan.net_cost < 0 {
+                                        crate::hud::MONEYBACK
+                                    } else {
+                                        crate::hud::ARCHTOOL_DELETE
+                                    });
+                                } else {
+                                    self.hud.play(crate::hud::BLD_DRAG_UP);
+                                }
+                            }
+                            Ok(false) => self.hud.play(crate::hud::ERROR),
+                            Err(e) => {
+                                self.note = Some(format!("Wallpaper edit failed: {e}"));
+                                self.hud.play(crate::hud::ERROR);
+                            }
+                        }
+                    } else if !plan.affordable {
+                        self.hud.play(crate::hud::ERROR);
+                    }
+                }
+            }
+        }
+        self.refresh_world();
+        self.layout_build();
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        Outcome::redraw()
+    }
+
+    /// Draws the floating Architecture cost/refund tag next to the cursor while
+    /// dragging a wall, floor, or wallpaper edit.
+    fn draw_build_cost_label(&mut self) {
+        let Some([px, py]) = self.pointer else {
+            return;
+        };
+        let (cost, affordable) = match &self.build_drag {
+            Some(BuildDrag::Wall { plan: Some(p), .. }) if p.valid => (p.net_cost, p.affordable),
+            Some(BuildDrag::Floor { plan: Some(p), .. }) if p.valid => (p.net_cost, p.affordable),
+            Some(BuildDrag::Wallpaper { plan: Some(p), .. }) if p.valid => {
+                (p.net_cost, p.affordable)
+            }
+            _ => return,
+        };
+        if cost == 0 {
+            return;
+        }
+        let Some(font) = self.hud.art.font(10) else {
+            return;
+        };
+        let label = if cost > 0 {
+            format!("${cost}")
+        } else {
+            format!("+${}", -cost)
+        };
+        let (w, h) = (
+            u32::try_from(self.canvas.width).unwrap_or(0),
+            u32::try_from(self.canvas.height).unwrap_or(0),
+        );
+        let Ok(mut frame) =
+            sims_ui::frame::Frame::from_rgb(w, h, std::mem::take(&mut self.canvas.color))
+        else {
+            return;
+        };
+        let text_w = font.width(&label).max(20);
+        let box_w = text_w + 10;
+        let box_h = font.line_height + 6;
+        let bx = (px + 14).clamp(4, (w as i32 - box_w - 4).max(4));
+        let by = (py - box_h - 6).clamp(4, (h as i32 - box_h - 4).max(4));
+        let bg = if affordable {
+            [20, 32, 92]
+        } else {
+            [110, 24, 24]
+        };
+        let fg = if cost < 0 {
+            [152, 240, 168]
+        } else if affordable {
+            [248, 240, 180]
+        } else {
+            [255, 160, 160]
+        };
+        frame.fill(sims_ui::frame::Rect::new(bx, by, box_w, box_h), bg);
+        font.draw(&mut frame, &label, [bx + 5, by + 3], fg);
+        self.canvas.color = frame.into_rgb();
+    }
+
     /// Refreshes the cached render lot shape and people from `self.lot.world()`.
     fn refresh_world(&mut self) {
         let world = self.lot.world();
@@ -2497,6 +3583,31 @@ impl Game {
                 .note(vec![format!("the lot is not redrawn: {e}")]),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+enum BuildDrag {
+    Wall {
+        start_corner: [i32; 2],
+        end_corner: [i32; 2],
+        style: WallStyle,
+        mode: WallDragMode,
+        plan: Option<WallPlan>,
+    },
+    Floor {
+        start_tile: [i32; 2],
+        end_tile: [i32; 2],
+        floor_id: u16,
+        mode: FloorDragMode,
+        split_half: Option<u8>,
+        plan: Option<FloorPlan>,
+    },
+    Wallpaper {
+        faces: Vec<WallFace>,
+        pattern_id: u16,
+        mode: WallpaperDragMode,
+        plan: Option<WallpaperPlan>,
+    },
 }
 
 fn panel_mode_for(mode: Mode) -> PanelMode {
