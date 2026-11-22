@@ -9,7 +9,7 @@ use crate::menu::{Menu, Release};
 use crate::pace::Pace;
 use crate::view::View;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
-use sims_content::{Install, Neighborhood};
+use sims_content::{ArchivePool, Catalog, Index, Install, Neighborhood};
 use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
@@ -33,6 +33,7 @@ use sims_ui::thumbnail::{self, Thumbnails};
 use sims_vm::SoundEvent;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 /// The status line's font size and colors.
 const STATUS_SIZE: u8 = 10;
@@ -205,6 +206,115 @@ pub struct Hud {
     sounds: Vec<SoundEvent>,
 }
 
+/// Install-only HUD assets (art, UI strings, options defaults) that depend
+/// solely on [`Install`] and can be loaded in parallel with lot boot.
+pub(crate) struct HudStatic {
+    art: Art,
+    labels: Labels,
+    rating_labels: RatingLabels,
+    sell_labels: SellLabels,
+    texts: Texts,
+    fame: Fame,
+    options_texts: OptionsTexts,
+    options_state: options::OptionsState,
+}
+
+impl HudStatic {
+    pub(crate) fn load(install: &Install, pool: Arc<ArchivePool>) -> Result<Self, String> {
+        let (art_res, text_res) = std::thread::scope(|scope| {
+            let text_handle = scope.spawn(|| -> Result<_, String> {
+                let labels = Labels::load(install).map_err(|e| e.to_string())?;
+                let rating_labels = RatingLabels::load(install);
+                let sell_labels = SellLabels::load(install);
+                // Without the balloons' or options' strings the HUD still opens with defaults.
+                let texts = Texts::load(install).unwrap_or_default();
+                let fame = Fame::load(install).unwrap_or_default();
+                let options_texts = OptionsTexts::load(install).unwrap_or_default();
+                let options_state =
+                    options::OptionsState::load_install(install).unwrap_or_default();
+                Ok((
+                    labels,
+                    rating_labels,
+                    sell_labels,
+                    texts,
+                    fame,
+                    options_texts,
+                    options_state,
+                ))
+            });
+            let art_res = (|| -> Result<Art, String> {
+                let ui = UiGraphics::open_with_pool(install, pool).map_err(|e| e.to_string())?;
+                let resources: Vec<i32> = hud::RESOURCES
+                    .iter()
+                    .chain(&options::RESOURCES)
+                    .chain(&dialog::RESOURCES)
+                    .chain(&pie::RESOURCES)
+                    .chain(&sims_ui::queue::RESOURCES)
+                    .chain(&thumbnail::RESOURCES)
+                    .copied()
+                    .collect();
+                let optional: Vec<i32> = hud::OPTIONAL_RESOURCES
+                    .iter()
+                    .chain(&options::HELP_RESOURCES)
+                    .chain(&[options::id::SAVE_CARD])
+                    .copied()
+                    .chain(buy::resource_ids())
+                    .chain(build::resource_ids())
+                    .collect();
+                Art::load_with_optional(&ui, US_ENGLISH, &resources, &optional)
+                    .map_err(|e| e.to_string())
+            })();
+            (
+                art_res,
+                text_handle.join().expect("hud text worker panicked"),
+            )
+        });
+        let art = art_res?;
+        let (labels, rating_labels, sell_labels, texts, fame, options_texts, options_state) =
+            text_res?;
+        Ok(Self {
+            art,
+            labels,
+            rating_labels,
+            sell_labels,
+            texts,
+            fame,
+            options_texts,
+            options_state,
+        })
+    }
+}
+
+/// Index/Catalog-dependent HUD tables (`work.iff` careers and house rating
+/// tuning) that can be loaded in parallel with VM linking and animations.
+pub(crate) struct HudShared {
+    careers: Careers,
+    house: house::Tuning,
+}
+
+impl HudShared {
+    pub(crate) fn load(
+        index: &Index,
+        catalog: &Catalog,
+        pool: &ArchivePool,
+    ) -> Result<Self, String> {
+        let (careers_res, house_res) = std::thread::scope(|scope| {
+            let house_handle = scope.spawn(|| {
+                house::Tuning::load_with_pool(index, catalog, pool).map_err(|e| e.to_string())
+            });
+            let careers_res = Careers::load_with_pool(index, pool).map_err(|e| e.to_string());
+            (
+                careers_res,
+                house_handle.join().expect("hud tuning worker panicked"),
+            )
+        });
+        Ok(Self {
+            careers: careers_res?,
+            house: house_res?,
+        })
+    }
+}
+
 impl Hud {
     /// Reads the art, and the household of `house` from its neighborhood
     /// with the portraits from the people's files. `world` is the booted
@@ -218,40 +328,6 @@ impl Hud {
         world: &World,
         friendship: i32,
     ) -> Result<Self, String> {
-        let install = Install::detect(install).map_err(|e| e.to_string())?;
-        let ui = UiGraphics::open(&install).map_err(|e| e.to_string())?;
-        let resources: Vec<i32> = hud::RESOURCES
-            .iter()
-            .chain(&options::RESOURCES)
-            .chain(&dialog::RESOURCES)
-            .chain(&pie::RESOURCES)
-            .chain(&sims_ui::queue::RESOURCES)
-            .chain(&thumbnail::RESOURCES)
-            .copied()
-            .collect();
-        let mut art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
-        for id in hud::OPTIONAL_RESOURCES
-            .iter()
-            .chain(&options::HELP_RESOURCES)
-            .chain(&[options::id::SAVE_CARD])
-            .copied()
-        {
-            art.load_optional(&ui, US_ENGLISH, id);
-        }
-        for id in buy::resource_ids() {
-            art.load_optional(&ui, US_ENGLISH, id);
-        }
-        for id in build::resource_ids() {
-            art.load_optional(&ui, US_ENGLISH, id);
-        }
-        let labels = Labels::load(&install).map_err(|e| e.to_string())?;
-        let rating_labels = RatingLabels::load(&install);
-        let sell_labels = SellLabels::load(&install);
-        // Without the balloons' or options' strings the HUD still opens with defaults.
-        let texts = Texts::load(&install).unwrap_or_default();
-        let fame = Fame::load(&install).unwrap_or_default();
-        let options_texts = OptionsTexts::load(&install).unwrap_or_default();
-        let options_state = options::OptionsState::load_install(&install).unwrap_or_default();
         let neighborhood = house
             .parent()
             .and_then(Path::parent)
@@ -267,43 +343,160 @@ impl Hud {
             .and_then(|n| neighborhood.family_in(n))
             .map(|(_, f)| f.members.clone())
             .unwrap_or_default();
+        Self::open_with_members(install, members, assets, world, friendship)
+    }
+
+    /// Reads the art and faces for a lot whose occupying household members
+    /// come from a `NeighborhoodStore` rather than a `Houses/HouseXX.iff` path.
+    pub fn open_with_members(
+        install: &Path,
+        members: Vec<u32>,
+        assets: &Assets,
+        world: &World,
+        friendship: i32,
+    ) -> Result<Self, String> {
+        let install = Install::detect(install).map_err(|e| e.to_string())?;
+        let pool = Arc::new(ArchivePool::new());
+        let static_part = HudStatic::load(&install, Arc::clone(&pool))?;
+        // Load Careers + Tuning in parallel with Faces while deferring their
+        // error checks until after `Faces::load`.
+        let (shared_res, faces_res) = std::thread::scope(|scope| {
+            let shared_handle =
+                scope.spawn(|| HudShared::load(assets.index(), assets.catalog(), &pool));
+            let faces_res = {
+                let mut people = members.clone();
+                for record in world.neighbors.slots.iter().flatten() {
+                    if !people.contains(&record.guid) {
+                        people.push(record.guid);
+                    }
+                }
+                Faces::load_with_pool(assets.index(), assets.catalog(), &people, &pool)
+                    .map_err(|e| e.to_string())
+            };
+            (
+                shared_handle.join().expect("hud shared worker panicked"),
+                faces_res,
+            )
+        });
+        let faces = faces_res?;
+        let shared_part = shared_res?;
+        Ok(Self::assemble(
+            &install,
+            assets,
+            friendship,
+            static_part,
+            shared_part,
+            members,
+            faces,
+        ))
+    }
+
+    /// Builds a [`Hud`] from preloaded [`HudStatic`] and [`HudShared`] tables
+    /// plus the shared [`Install`], [`Neighborhood`], and [`ArchivePool`],
+    /// preserving original error precedence (`houses` -> `Faces` -> `HudShared`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_preloaded(
+        install: &Install,
+        house: &Path,
+        neighborhood: &Neighborhood,
+        assets: &Assets,
+        world: &World,
+        friendship: i32,
+        static_part: HudStatic,
+        shared_part: Result<HudShared, String>,
+        pool: &ArchivePool,
+    ) -> Result<Self, String> {
+        let number = neighborhood
+            .houses()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|(_, path)| path.file_name() == house.file_name())
+            .map(|(n, _)| n);
+        let members = number
+            .and_then(|n| neighborhood.family_in(n))
+            .map(|(_, f)| f.members.clone())
+            .unwrap_or_default();
+        Self::from_preloaded_with_members(
+            install,
+            members,
+            assets,
+            world,
+            friendship,
+            static_part,
+            shared_part,
+            pool,
+        )
+    }
+
+    /// Builds a [`Hud`] from preloaded [`HudStatic`] and [`HudShared`] tables
+    /// for a lot whose occupying household members are already known (e.g. from
+    /// a REDB `NeighborhoodStore` snapshot).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_preloaded_with_members(
+        install: &Install,
+        members: Vec<u32>,
+        assets: &Assets,
+        world: &World,
+        friendship: i32,
+        static_part: HudStatic,
+        shared_part: Result<HudShared, String>,
+        pool: &ArchivePool,
+    ) -> Result<Self, String> {
         let mut people = members.clone();
         for record in world.neighbors.slots.iter().flatten() {
             if !people.contains(&record.guid) {
                 people.push(record.guid);
             }
         }
-        let faces =
-            Faces::load(assets.index(), assets.catalog(), &people).map_err(|e| e.to_string())?;
-        let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
-        let house =
-            house::Tuning::load(assets.index(), assets.catalog()).map_err(|e| e.to_string())?;
+        let faces = Faces::load_with_pool(assets.index(), assets.catalog(), &people, pool)
+            .map_err(|e| e.to_string())?;
+        let shared_part = shared_part?;
+        Ok(Self::assemble(
+            install,
+            assets,
+            friendship,
+            static_part,
+            shared_part,
+            members,
+            faces,
+        ))
+    }
+
+    fn assemble(
+        install: &Install,
+        assets: &Assets,
+        friendship: i32,
+        static_part: HudStatic,
+        shared_part: HudShared,
+        members: Vec<u32>,
+        faces: Faces,
+    ) -> Self {
         let known = Acquaintances::read(
             assets.index(),
             assets.catalog(),
             install.expansions,
             friendship,
         );
-        Ok(Self {
-            art,
+        Self {
+            art: static_part.art,
             boot_faces: faces.clone(),
             faces,
             thumbnails: Thumbnails::default(),
             problems: Vec::new(),
-            careers,
-            fame,
-            house,
+            careers: shared_part.careers,
+            fame: static_part.fame,
+            house: shared_part.house,
             kinds: house::Kinds::default(),
             known,
-            labels,
-            texts,
-            options_texts,
+            labels: static_part.labels,
+            texts: static_part.texts,
+            options_texts: static_part.options_texts,
             members,
             // The strip opens as if Live had been pressed, with preferences
             // loaded from `UserData/Options.iff` (`Optn` 128, `0x4e6505`).
             controls: Controls {
                 expanded: true,
-                options: options_state,
+                options: static_part.options_state,
                 ..Controls::default()
             },
             items: Vec::new(),
@@ -320,11 +513,11 @@ impl Hud {
             clock_blink: ClockBlink::default(),
             idle_speed: false,
             buy_catalog: None,
-            rating_labels,
-            sell_labels,
+            rating_labels: static_part.rating_labels,
+            sell_labels: static_part.sell_labels,
             buy_state: BuyState::default(),
             buy_layout: BuyLayout::default(),
-            install,
+            install: install.clone(),
             build_catalog: None,
             build_swatches: BuildSwatches::default(),
             build_state: BuildState {
@@ -333,7 +526,7 @@ impl Hud {
             },
             build_layout: BuildLayout::default(),
             sounds: Vec::new(),
-        })
+        }
     }
 
     /// Forgets what the panel kept of the lot it showed, for a lot put

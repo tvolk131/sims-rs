@@ -28,6 +28,7 @@
 
 use crate::Assets;
 use crate::people::read_suits;
+use crate::pool::{ArchivePool, worker_count};
 use sims_formats::avatar::read_cmx;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -58,22 +59,39 @@ impl Wardrobe {
     /// (`.bmp`, `.tga`, 0x6c0f80, 0x6c0f7c) of `assets`, as the registry's
     /// scan loads every `.cmx` and `.bcf` (0x59f844).
     pub fn load(assets: &Assets) -> Self {
+        Self::load_with_pool(assets, &ArchivePool::new())
+    }
+
+    /// Like [`Wardrobe::load`], reusing open FAR handles from `pool` and
+    /// reading/parsing catalogs in parallel while merging in exact sorted
+    /// name and source order.
+    pub fn load_with_pool(assets: &Assets, pool: &ArchivePool) -> Self {
         let mut wardrobe = Self::default();
+        let mut items: Vec<(&str, &crate::Resource)> = Vec::new();
         for name in assets.names() {
             if name.ends_with(".bmp") || name.ends_with(".tga") {
                 wardrobe.textures.insert(name.to_owned());
             }
-            let catalog = name.ends_with(".cmx") || name.ends_with(".bcf");
-            if !catalog {
-                continue;
+            if name.ends_with(".cmx") || name.ends_with(".bcf") {
+                for resource in assets.sources(name) {
+                    items.push((name, resource));
+                }
             }
-            for resource in assets.sources(name) {
-                // A binary file is read for its suits alone, as a file
-                // that holds animations too still gives its suits
-                // ([`crate::people`]'s reader).
+        }
+        let decode_one =
+            |&(name, resource): &(&str, &crate::Resource)| -> (BTreeSet<String>, Option<String>) {
                 let mut suits = BTreeSet::new();
+                if name.ends_with(".bcf") {
+                    match resource.read_head_with(pool, 8) {
+                        Ok(head) if head.len() == 8 && head == [0; 8] => {
+                            return (suits, None);
+                        }
+                        Ok(_) => {}
+                        Err(error) => return (suits, Some(error.to_string())),
+                    }
+                }
                 let read = resource
-                    .read()
+                    .read_with(pool)
                     .map_err(|e| e.to_string())
                     .and_then(|bytes| {
                         if name.ends_with(".bcf") {
@@ -84,16 +102,37 @@ impl Wardrobe {
                             Ok(())
                         }
                     });
-                if let Err(error) = read {
-                    wardrobe.errors.insert(name.to_owned(), error);
+                (suits, read.err())
+            };
+        let workers = worker_count(items.len());
+        let results: Vec<(BTreeSet<String>, Option<String>)> = if workers <= 1 {
+            items.iter().map(decode_one).collect()
+        } else {
+            let chunk_size = items.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = items
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || chunk.iter().map(decode_one).collect::<Vec<_>>())
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(items.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("wardrobe worker panicked"));
                 }
-                wardrobe.suits.extend(
-                    suits
-                        .into_iter()
-                        .map(|n| n.to_ascii_lowercase())
-                        .filter(|n| !n.starts_with("suit-")),
-                );
+                out
+            })
+        };
+        for ((name, _), (suits, error)) in items.into_iter().zip(results) {
+            if let Some(error) = error {
+                wardrobe.errors.insert(name.to_owned(), error);
             }
+            wardrobe.suits.extend(
+                suits
+                    .into_iter()
+                    .map(|n| n.to_ascii_lowercase())
+                    .filter(|n| !n.starts_with("suit-")),
+            );
         }
         wardrobe
     }

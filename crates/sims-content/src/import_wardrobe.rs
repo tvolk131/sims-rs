@@ -1,6 +1,7 @@
 //! The ordered suit and texture names used by family import.
 use crate::file_table::Table;
 use crate::index::MountedFiles;
+use crate::pool::{ArchivePool, worker_count};
 use crate::{Error, Expansions, Install, Resource, Result};
 use sims_formats::avatar::catalog::Binary;
 use sims_formats::avatar::index::{IndexReader, Kind};
@@ -36,7 +37,11 @@ pub(crate) struct AvatarPaths {
 /// [`crate::people::AvatarRegistry`]. When `strict_archives` is false,
 /// unreadable FAR archives are skipped during directory scanning as at
 /// `0x5ba8d6`.
-pub(crate) fn mount_avatar_paths(install: &Install, strict_archives: bool) -> Result<AvatarPaths> {
+pub(crate) fn mount_avatar_paths(
+    install: &Install,
+    strict_archives: bool,
+    pool: &ArchivePool,
+) -> Result<AvatarPaths> {
     let mut files = MountedFiles::default();
     let root = &install.root;
     for directory in ["GameData/Global", "GameData/Objects", Install::USER_OBJECTS] {
@@ -52,7 +57,7 @@ pub(crate) fn mount_avatar_paths(install: &Install, strict_archives: bool) -> Re
         files.register(root, "TemplateNPCs", false, strict_archives)?;
     }
     files.register(root, "Downloads", true, strict_archives)?;
-    let providers = download_providers(&files, root)?;
+    let providers = download_providers(&files, root, pool)?;
     let mut texture_paths = texture_paths(&mut files, install, strict_archives)?;
     for path in &providers {
         files.register(&install.root, path, true, strict_archives)?;
@@ -96,19 +101,20 @@ impl ImportWardrobe {
     /// Replays the startup file tables (0x43ae81), avatar catalogs (0x5835ed)
     /// and texture cache (0x414633, 0x40895a).
     pub fn load(install: &Install) -> Result<Self> {
+        let pool = ArchivePool::new();
         let AvatarPaths {
             files,
             appearance,
             indexed,
             texture_paths,
-        } = mount_avatar_paths(install, true)?;
+        } = mount_avatar_paths(install, true, &pool)?;
 
         // 0x59f844 loads all CMX before BCF. 0x584562 then adds the indexed
         // names, including entries whose catalog has yet to be opened.
         let mut registry = Table::default();
         for extension in [b".cmx", b".bcf"] {
             for (_, source) in resources(&files, &appearance, extension)? {
-                let bytes = source.read()?;
+                let bytes = source.read_with(&pool)?;
                 let register = |name: &str, registry: &mut Table| {
                     let name = encode_name(name).ok_or_else(|| {
                         Error::Unsupported(format!(
@@ -143,7 +149,7 @@ impl ImportWardrobe {
             }
         }
         for (_, source) in resources(&files, &indexed, b".ndx")? {
-            for entry in IndexReader::new(&source.read()?) {
+            for entry in IndexReader::new(&source.read_with(&pool)?) {
                 let entry =
                     entry.map_err(|error| catalog_error(install, "0x59fc48", &source, error))?;
                 if entry.kind == Kind::Appearance {
@@ -176,76 +182,124 @@ impl ImportWardrobe {
     /// (`0x5ba8d6`) and records corrupt `.cmx`/`.bcf`/`.ndx` catalogs into the
     /// returned error map instead of failing boot.
     pub fn load_lenient(install: &Install) -> Result<(Self, BTreeMap<String, String>)> {
+        Self::load_lenient_with_pool(install, &ArchivePool::new())
+    }
+
+    /// Like [`ImportWardrobe::load_lenient`], reusing open FAR archive handles
+    /// from `pool` and decoding `.cmx`/`.bcf` catalogs in parallel while
+    /// preserving exact startup insertion order into the native hash table.
+    pub fn load_lenient_with_pool(
+        install: &Install,
+        pool: &ArchivePool,
+    ) -> Result<(Self, BTreeMap<String, String>)> {
         let AvatarPaths {
             files,
             appearance,
             indexed,
             texture_paths,
-        } = mount_avatar_paths(install, false)?;
+        } = mount_avatar_paths(install, false, pool)?;
 
         let mut registry = Table::default();
         let mut errors = BTreeMap::new();
         for extension in [b".cmx", b".bcf"] {
-            for (_, source) in resources(&files, &appearance, extension)? {
-                let location = source.location(&install.root);
-                let bytes = match source.read() {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        errors.insert(location, error.to_string());
-                        continue;
-                    }
-                };
-                if extension == b".cmx" {
-                    match read_cmx(&bytes) {
-                        Ok(catalog) => {
-                            for suit in catalog.appearances {
-                                if let Some(name) = encode_name(&suit.name) {
-                                    registry.insert_name(name);
-                                }
+            let sources = resources(&files, &appearance, extension)?;
+            let is_cmx = extension == b".cmx";
+            let decode_one =
+                |(_, source): &(Vec<u8>, Resource)| -> (String, Vec<Vec<u8>>, Option<String>) {
+                    let location = source.location(&install.root);
+                    if !is_cmx {
+                        match source.read_head_with(pool, 8) {
+                            Ok(head) if head.len() == 8 && head == [0; 8] => {
+                                return (location, Vec::new(), None);
                             }
-                        }
-                        Err(error) => {
-                            errors.insert(location, error.to_string());
+                            Ok(_) => {}
+                            Err(error) => return (location, Vec::new(), Some(error.to_string())),
                         }
                     }
-                } else {
-                    let mut binary = Binary::new(&bytes);
-                    for kind in [Kind::Skeleton, Kind::Appearance] {
-                        let count = match binary.count(kind) {
-                            Ok(Some(count)) => count,
-                            Ok(None) => break,
-                            Err(error) => {
-                                errors.insert(location.clone(), error.to_string());
-                                break;
-                            }
-                        };
-                        let mut failed = false;
-                        for _ in 0..count {
-                            match binary.read(kind) {
-                                Ok(record) => {
-                                    if kind == Kind::Appearance
-                                        && let Some(name) = encode_name(record.name())
-                                    {
-                                        registry.insert_name(name);
+                    let bytes = match source.read_with(pool) {
+                        Ok(bytes) => bytes,
+                        Err(error) => return (location, Vec::new(), Some(error.to_string())),
+                    };
+                    let mut names = Vec::new();
+                    if is_cmx {
+                        match read_cmx(&bytes) {
+                            Ok(catalog) => {
+                                for suit in catalog.appearances {
+                                    if let Some(name) = encode_name(&suit.name) {
+                                        names.push(name);
                                     }
                                 }
+                                (location, names, None)
+                            }
+                            Err(error) => (location, names, Some(error.to_string())),
+                        }
+                    } else {
+                        let mut binary = Binary::new(&bytes);
+                        let mut err = None;
+                        for kind in [Kind::Skeleton, Kind::Appearance] {
+                            let count = match binary.count(kind) {
+                                Ok(Some(count)) => count,
+                                Ok(None) => break,
                                 Err(error) => {
-                                    errors.insert(location.clone(), error.to_string());
-                                    failed = true;
+                                    err = Some(error.to_string());
                                     break;
                                 }
+                            };
+                            let mut failed = false;
+                            for _ in 0..count {
+                                match binary.read(kind) {
+                                    Ok(record) => {
+                                        if kind == Kind::Appearance
+                                            && let Some(name) = encode_name(record.name())
+                                        {
+                                            names.push(name);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        err = Some(error.to_string());
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if failed {
+                                break;
                             }
                         }
-                        if failed {
-                            break;
-                        }
+                        (location, names, err)
                     }
+                };
+            let workers = worker_count(sources.len());
+            let decoded: Vec<(String, Vec<Vec<u8>>, Option<String>)> = if workers <= 1 {
+                sources.iter().map(decode_one).collect()
+            } else {
+                let chunk_size = sources.len().div_ceil(workers);
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = sources
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            scope.spawn(move || chunk.iter().map(decode_one).collect::<Vec<_>>())
+                        })
+                        .collect();
+                    let mut out = Vec::with_capacity(sources.len());
+                    for handle in handles {
+                        out.extend(handle.join().expect("import wardrobe worker panicked"));
+                    }
+                    out
+                })
+            };
+            for (location, names, err) in decoded {
+                for name in names {
+                    registry.insert_name(name);
+                }
+                if let Some(error) = err {
+                    errors.insert(location, error);
                 }
             }
         }
         for (_, source) in resources(&files, &indexed, b".ndx")? {
             let location = source.location(&install.root);
-            let bytes = match source.read() {
+            let bytes = match source.read_with(pool) {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     errors.insert(location, error.to_string());
@@ -537,7 +591,11 @@ fn catalog_error(
 /// directory when category & 3 is 2. Only Downloads has that category
 /// (0x43c609). A resource contributes once if any OBJD survived the +0x20
 /// filter at registration, so its directory first appears in file walk order.
-fn download_providers(files: &MountedFiles, root: &Path) -> Result<Vec<String>> {
+fn download_providers(
+    files: &MountedFiles,
+    root: &Path,
+    pool: &ArchivePool,
+) -> Result<Vec<String>> {
     let mut providers = Vec::new();
     let mut seen = BTreeSet::new();
     for source in files.objects("Downloads")? {
@@ -545,7 +603,7 @@ fn download_providers(files: &MountedFiles, root: &Path) -> Result<Vec<String>> 
             continue;
         }
         let fail = |error| Error::format(&format!("0x43b89c {}", source.location(root)), error);
-        let iff = Iff::parse(source.read()?).map_err(fail)?;
+        let iff = Iff::parse(source.read_with(pool)?).map_err(fail)?;
         let definitions = iff.resource_order(b"OBJD").map_err(fail)?;
         if definitions.len() >= i16::MAX as usize {
             return Err(Error::Unsupported(format!(

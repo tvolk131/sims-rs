@@ -580,3 +580,271 @@ fn a_pause_holds_the_score_in_live_music_mode_only() {
         ["no track 517", "no track 2957", "no track 519"]
     );
 }
+
+// ============================================================================
+// Environmental Lot & Expansion Ambience Mixer Tests
+// ============================================================================
+
+fn synth_wav(rate: u32, samples: &[i16]) -> Vec<u8> {
+    let data_bytes = (samples.len() * 2) as u32;
+    let riff_size = 36 + data_bytes;
+    let mut out = Vec::with_capacity(44 + data_bytes as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_size.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&1u16.to_le_bytes()); // mono
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * 2).to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_bytes.to_le_bytes());
+    for &s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+#[test]
+fn mixer_loops_seamlessly_and_crossfades_day_to_night_and_zones() {
+    use sims_audio::ambience::{
+        AmbienceCatalog, AmbienceMixer, AmbienceZone, TimeOfDay, ZoomLevel,
+    };
+
+    let mut catalog = AmbienceCatalog::empty();
+    catalog.insert(
+        AmbienceZone::Residential,
+        TimeOfDay::Day,
+        vec!["day.wav".to_owned()],
+    );
+    catalog.insert(
+        AmbienceZone::Residential,
+        TimeOfDay::Night,
+        vec!["night.wav".to_owned()],
+    );
+    catalog.insert(
+        AmbienceZone::MagicTown,
+        TimeOfDay::Night,
+        vec!["magic.wav".to_owned()],
+    );
+
+    let mut sources = BTreeMap::new();
+    sources.insert("day.wav".to_owned(), synth_wav(1000, &[4000; 32]));
+    sources.insert("night.wav".to_owned(), synth_wav(1000, &[-4000; 32]));
+    sources.insert("magic.wav".to_owned(), synth_wav(1000, &[2000; 32]));
+
+    let mut mixer = AmbienceMixer::with_rate(catalog, sources, 1000);
+    mixer.set_crossfade_ms(20);
+    mixer.set_zoom(ZoomLevel::Near);
+    mixer.set_outdoor_percent(100);
+    // Snap ramp to Near/100%
+    let _ = mixer.render_stereo(200);
+
+    mixer.set_environment(AmbienceZone::Residential, TimeOfDay::Day);
+    assert_eq!(mixer.current_track(), Some("day.wav"));
+
+    // Render 100 frames (> 3x the 32-frame clip): zero silent gaps across loops.
+    let day_pcm = mixer.render_stereo(100);
+    assert!(
+        day_pcm
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|lr| lr[0] > 0 && lr[1] > 0),
+        "seamless looping should never drop to zero between loops"
+    );
+
+    // Transition Day -> Night via hour 21
+    mixer.set_hour(21);
+    assert_eq!(mixer.time_of_day(), TimeOfDay::Night);
+    assert!(mixer.is_crossfading());
+    assert_eq!(mixer.current_track(), Some("night.wav"));
+
+    // Render through 20ms crossfade (20 frames) + steady night tail
+    let xfade_pcm = mixer.render_stereo(40);
+    assert!(!mixer.is_crossfading());
+    let first_l = xfade_pcm[0];
+    let last_l = xfade_pcm[xfade_pcm.len() - 2];
+    assert!(first_l > 0, "crossfade starts near outgoing day level");
+    assert!(last_l < 0, "crossfade settles to incoming night level");
+
+    // Transition zone Residential -> MagicTown
+    mixer.set_zone(AmbienceZone::MagicTown);
+    assert!(mixer.is_crossfading());
+    let magic_pcm = mixer.render_stereo(40);
+    assert!(!mixer.is_crossfading());
+    assert!(magic_pcm[magic_pcm.len() - 2] > 0);
+}
+
+#[test]
+fn mixer_attenuates_by_zoom_indoor_outdoor_and_volume_steps() {
+    use sims_audio::ambience::{
+        AmbienceCatalog, AmbienceMixer, AmbienceZone, TimeOfDay, ZoomLevel,
+    };
+    use sims_audio::player::VOLUME_STEPS;
+
+    let mut catalog = AmbienceCatalog::empty();
+    catalog.insert(
+        AmbienceZone::Residential,
+        TimeOfDay::Day,
+        vec!["bed.wav".to_owned()],
+    );
+    let mut sources = BTreeMap::new();
+    sources.insert("bed.wav".to_owned(), synth_wav(1000, &[10_000; 64]));
+
+    let mut mixer = AmbienceMixer::with_rate(catalog, sources, 1000);
+    mixer.set_environment(AmbienceZone::Residential, TimeOfDay::Day);
+
+    // Near + 100% outdoors
+    mixer.set_zoom(ZoomLevel::Near);
+    mixer.set_outdoor_percent(100);
+    let _ = mixer.render_stereo(200);
+    let near_out = mixer.render_stereo(16)[0];
+
+    // Far + 100% outdoors should be quieter than Near
+    mixer.set_zoom(ZoomLevel::Far);
+    let _ = mixer.render_stereo(200);
+    let far_out = mixer.render_stereo(16)[0];
+    assert!(far_out > 0 && far_out < near_out);
+
+    // Near + 0% outdoors (indoors) should be muffled to indoor floor
+    mixer.set_zoom(ZoomLevel::Near);
+    mixer.set_outdoor_percent(0);
+    let _ = mixer.render_stereo(200);
+    let near_in = mixer.render_stereo(16)[0];
+    assert!(near_in > 0 && near_in < far_out);
+
+    // VOLUME_STEPS 0 silences output; step 5 is strictly between 0 and 10
+    mixer.set_outdoor_percent(100);
+    let _ = mixer.render_stereo(200);
+    mixer.set_volume_step(5);
+    assert_eq!(mixer.volume(), VOLUME_STEPS[5]);
+    let mid_vol = mixer.render_stereo(16)[0];
+    assert!(mid_vol > 0 && mid_vol < near_out);
+
+    mixer.set_volume_step(0);
+    assert_eq!(mixer.volume(), 0);
+    let muted = mixer.render_stereo(16);
+    assert!(muted.iter().all(|&s| s == 0));
+}
+
+#[test]
+fn catalog_indexes_complete_collection_zones_and_streams_real_xa() {
+    use sims_audio::ambience::{AmbienceCatalog, AmbienceMixer, AmbienceZone, TimeOfDay};
+    use sims_audio::files::SoundFiles;
+    use std::path::PathBuf;
+
+    let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+        return;
+    };
+    if !root.is_dir() {
+        return;
+    }
+
+    let files = SoundFiles::scan(&root).expect("scan SoundFiles");
+    let catalog = AmbienceCatalog::from_sound_files(&files);
+    assert!(catalog.total_tracks() > 0);
+
+    for zone in AmbienceZone::ALL {
+        assert!(
+            catalog.has_tracks(zone, TimeOfDay::Day),
+            "expected Day ambience tracks for {zone:?}"
+        );
+        assert!(
+            catalog.has_tracks(zone, TimeOfDay::Night),
+            "expected Night ambience tracks for {zone:?}"
+        );
+    }
+
+    // Verify Beach prefers wave_loop.XA and Magic Town / Residential stream real PCM
+    assert!(
+        catalog.tracks(AmbienceZone::VacationBeach, TimeOfDay::Day)[0]
+            .to_ascii_lowercase()
+            .contains("wave_loop")
+    );
+
+    let mut mixer = AmbienceMixer::new(catalog, files);
+    mixer.set_environment(AmbienceZone::Residential, TimeOfDay::Night);
+    let pcm = mixer.render_stereo(256);
+    assert_eq!(pcm.len(), 512);
+    assert!(
+        pcm.iter().any(|&s| s != 0),
+        "real Complete Collection night loop should decode non-zero PCM"
+    );
+}
+
+#[test]
+fn mixer_preserves_crossfade_across_eof_and_avoids_retrying_unplayable_bucket() {
+    use sims_audio::ambience::{
+        AmbienceCatalog, AmbienceMixer, AmbienceZone, TimeOfDay, ZoomLevel,
+    };
+    use sims_audio::music::TrackSource;
+
+    // 1. Outgoing & incoming clips hit EOF mid-crossfade: energy stays constant (no dip).
+    let mut catalog = AmbienceCatalog::empty();
+    catalog.insert(
+        AmbienceZone::Residential,
+        TimeOfDay::Day,
+        vec!["a.wav".to_owned()],
+    );
+    catalog.insert(
+        AmbienceZone::Residential,
+        TimeOfDay::Night,
+        vec!["b.wav".to_owned()],
+    );
+    let mut sources = BTreeMap::new();
+    sources.insert("a.wav".to_owned(), synth_wav(1000, &[4000; 32]));
+    sources.insert("b.wav".to_owned(), synth_wav(1000, &[4000; 8]));
+
+    let mut mixer = AmbienceMixer::with_rate(catalog, sources, 1000);
+    mixer.set_crossfade_ms(20);
+    mixer.set_zoom(ZoomLevel::Near);
+    mixer.set_outdoor_percent(100);
+    let _ = mixer.render_stereo(200);
+
+    mixer.set_environment(AmbienceZone::Residential, TimeOfDay::Day);
+    let _ = mixer.render_stereo(31); // 1 frame left before EOF on outgoing clip
+    mixer.set_time_of_day(TimeOfDay::Night); // 8-frame incoming clip also loops mid-20ms fade
+    let xfade = mixer.render_stereo(25);
+    assert!(
+        xfade
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|lr| lr[0] >= 3500 && lr[1] >= 3500),
+        "crossfade across EOF must not dip when both clips are equal amplitude"
+    );
+
+    // 2. Unplayable bucket should be attempted once, not on every output frame.
+    let attempts = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    struct CountingMissingSource(std::rc::Rc<std::cell::Cell<usize>>);
+    impl TrackSource for CountingMissingSource {
+        fn read_bytes(&mut self, _path: &str) -> Option<Vec<u8>> {
+            self.0.set(self.0.get() + 1);
+            None
+        }
+    }
+
+    let mut bad_cat = AmbienceCatalog::empty();
+    bad_cat.insert(
+        AmbienceZone::MagicTown,
+        TimeOfDay::Day,
+        vec!["missing.wav".to_owned()],
+    );
+    let mut bad_mixer =
+        AmbienceMixer::with_rate(bad_cat, CountingMissingSource(attempts.clone()), 1000);
+    bad_mixer.set_environment(AmbienceZone::MagicTown, TimeOfDay::Day);
+    let silence = bad_mixer.render_stereo(100);
+    assert!(silence.iter().all(|&s| s == 0));
+    assert_eq!(
+        attempts.get(),
+        1,
+        "unplayable bucket must not retry on every output frame"
+    );
+    // Verify TimeOfDay::from_hour matches HOUR_COLUMNS at hour 5.
+    assert_eq!(TimeOfDay::from_hour(4), TimeOfDay::Night);
+    assert_eq!(TimeOfDay::from_hour(5), TimeOfDay::Day);
+}

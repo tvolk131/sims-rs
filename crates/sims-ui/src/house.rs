@@ -4,7 +4,7 @@
 
 use crate::{Error, Result};
 use sims_content::ui_graphics::US_ENGLISH;
-use sims_content::{Catalog, Index, Install, Surfaces, atoi};
+use sims_content::{ArchivePool, Catalog, Index, Install, Surfaces, atoi};
 use sims_core::{Ext, F32};
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
@@ -72,10 +72,16 @@ impl Tuning {
     /// Reads the curves and the yard multiplier from the install's global
     /// file.
     pub fn load(index: &Index, catalog: &Catalog) -> Result<Self> {
+        Self::load_with_pool(index, catalog, &ArchivePool::new())
+    }
+
+    /// Like [`Tuning::load`], reusing open archive handles from `pool`.
+    pub fn load_with_pool(index: &Index, catalog: &Catalog, pool: &ArchivePool) -> Result<Self> {
         let Some(global) = index.resources.get(catalog.global) else {
             return Ok(Self::default());
         };
-        let iff = Iff::parse(global.read().map_err(Error::Content)?).map_err(Error::Format)?;
+        let iff =
+            Iff::parse(global.read_with(pool).map_err(Error::Content)?).map_err(Error::Format)?;
         // By its ID and a flags' high byte of 0, as the original's string
         // loader looks it up (0x415dd6, through 0x46ff01 and 0x41bab1).
         let curves = iff

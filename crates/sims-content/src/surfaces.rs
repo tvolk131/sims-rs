@@ -37,6 +37,7 @@
 
 use crate::index::Index;
 use crate::install::resolve;
+use crate::pool::{ArchivePool, worker_count};
 use crate::ui_graphics::US_ENGLISH;
 use crate::{Error, Install, Resource, Result};
 use sims_formats::iff::Iff;
@@ -133,33 +134,222 @@ pub struct SurfaceCatalog {
     pub files: Vec<SurfaceFile>,
 }
 
+struct ParsedSurface {
+    name: String,
+    location: String,
+    count: i16,
+    present: Vec<u16>,
+    meta: FileMetadata,
+}
+
+fn parse_surface(
+    resource: &Resource,
+    name: &[u8],
+    sprite: [u8; 4],
+    root: &std::path::Path,
+    pool: &ArchivePool,
+    collect_plugins: bool,
+) -> Result<Option<ParsedSurface>> {
+    let location = resource.location(root);
+    // A file the original cannot open is left out too. Which files our
+    // reader refuses that the original opens, or the reverse, is not
+    // known, so a refusal stops the build.
+    let iff = Iff::parse(resource.read_with(pool)?).map_err(|e| Error::format(&location, e))?;
+    let count = iff.all(&sprite).count() as i16 / 3;
+    if count < 1 {
+        return Ok(None);
+    }
+    let present = (1..=count as u16)
+        .filter(|&number| iff.get(&sprite, number).is_some())
+        .collect();
+    let meta = if collect_plugins {
+        metadata(&iff)
+    } else {
+        FileMetadata {
+            price: metadata_price(&iff),
+            ..FileMetadata::default()
+        }
+    };
+    Ok(Some(ParsedSurface {
+        name: sims_formats::far::decode_name(name),
+        location,
+        count,
+        present,
+        meta,
+    }))
+}
+
+type SurfaceDirectoryListing = (Vec<(Vec<u8>, Resource)>, Vec<String>);
+
+fn scan_surface_directory(
+    install: &Install,
+    directory: &str,
+    at: &'static str,
+) -> Result<SurfaceDirectoryListing> {
+    match resolve(&install.root, directory)?.filter(|p| p.is_dir()) {
+        Some(path) => Index::listing(&path, at.as_bytes()),
+        None => Ok((Vec::new(), Vec::new())),
+    }
+}
+
+fn scan_surface_directories(
+    install: &Install,
+    directories: &[(String, &'static str)],
+) -> Vec<Result<SurfaceDirectoryListing>> {
+    let scan_one =
+        |(directory, at): &(String, &'static str)| scan_surface_directory(install, directory, at);
+    let workers = worker_count(directories.len());
+    if workers <= 1 {
+        directories.iter().map(scan_one).collect()
+    } else {
+        let chunk_size = directories.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = directories
+                .chunks(chunk_size)
+                .map(|chunk| scope.spawn(move || chunk.iter().map(scan_one).collect::<Vec<_>>()))
+                .collect();
+            let mut out = Vec::with_capacity(directories.len());
+            for handle in handles {
+                out.extend(handle.join().expect("surface directory worker panicked"));
+            }
+            out
+        })
+    }
+}
+
 impl SurfaceCatalog {
     /// Builds the catalog of `kind` for an install.
     pub fn build(install: &Install, kind: SurfaceKind) -> Result<Self> {
-        let (catalog, _) = Self::scan(install, kind, false)?;
-        Ok(catalog)
+        Self::build_with_pool(install, kind, &ArchivePool::new())
     }
 
     /// Scans the plug-in floor (`.flr`) or wall (`.wll`) patterns of `kind`
     /// for `install`, keyed by their exact catalog keys (`0x4a01cb`,
     /// `0x4c512d`).
     pub fn plugins(install: &Install, kind: SurfaceKind) -> Result<BTreeMap<u16, SurfacePlugin>> {
-        let (_, plugins) = Self::scan(install, kind, true)?;
+        Self::plugins_with_pool(install, kind, &ArchivePool::new())
+    }
+
+    /// Like [`Self::plugins`], reusing open FAR archive handles from `pool`.
+    pub fn plugins_with_pool(
+        install: &Install,
+        kind: SurfaceKind,
+        pool: &ArchivePool,
+    ) -> Result<BTreeMap<u16, SurfacePlugin>> {
+        let (_, plugins) = Self::scan_with_pool(install, kind, true, pool)?;
         Ok(plugins)
     }
 
-    fn scan(
+    pub(crate) fn build_with_pool(
+        install: &Install,
+        kind: SurfaceKind,
+        pool: &ArchivePool,
+    ) -> Result<Self> {
+        let (catalog, _) = Self::scan_with_pool(install, kind, false, pool)?;
+        Ok(catalog)
+    }
+
+    fn scan_with_pool(
         install: &Install,
         kind: SurfaceKind,
         collect_plugins: bool,
+        pool: &ArchivePool,
+    ) -> Result<(Self, BTreeMap<u16, SurfacePlugin>)> {
+        let Profile { own, .. } = kind.profile();
+        let mut directories = shared_surface_directories(install);
+        directories.push((own.to_owned(), ""));
+        let listings = scan_surface_directories(install, &directories);
+        let mut ok_dirs = Vec::with_capacity(listings.len());
+        let mut trailing_err = None;
+        for listing in listings {
+            match listing {
+                Ok(dir) => ok_dirs.push(dir),
+                Err(error) => {
+                    trailing_err = Some(error);
+                    break;
+                }
+            }
+        }
+        let refs: Vec<&SurfaceDirectoryListing> = ok_dirs.iter().collect();
+        Self::from_listings(install, kind, &refs, trailing_err, collect_plugins, pool)
+    }
+
+    fn from_listings(
+        install: &Install,
+        kind: SurfaceKind,
+        listings: &[&SurfaceDirectoryListing],
+        trailing_error: Option<Error>,
+        collect_plugins: bool,
+        pool: &ArchivePool,
     ) -> Result<(Self, BTreeMap<u16, SurfacePlugin>)> {
         let Profile {
             builtin,
             suffix,
-            own,
             sprite,
             seeds,
+            ..
         } = kind.profile();
+        // Collect matching files only up to the first directory with a skipped
+        // archive so later directories never mask an earlier directory's parse
+        // or scan error, while still parsing all reachable files in parallel.
+        let mut matching: Vec<(usize, &[u8], &Resource)> = Vec::new();
+        for (dir_idx, (listed, skipped)) in listings.iter().enumerate() {
+            if !skipped.is_empty() {
+                break;
+            }
+            for (name, resource) in listed {
+                if name.ends_with(suffix) {
+                    matching.push((dir_idx, name.as_slice(), resource));
+                }
+            }
+        }
+        let workers = worker_count(matching.len());
+        let parsed: Vec<(usize, &Resource, Result<Option<ParsedSurface>>)> = if workers <= 1 {
+            matching
+                .iter()
+                .map(|&(dir_idx, name, resource)| {
+                    (
+                        dir_idx,
+                        resource,
+                        parse_surface(resource, name, sprite, &install.root, pool, collect_plugins),
+                    )
+                })
+                .collect()
+        } else {
+            let chunk_size = matching.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = matching
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|&(dir_idx, name, resource)| {
+                                    (
+                                        dir_idx,
+                                        resource,
+                                        parse_surface(
+                                            resource,
+                                            name,
+                                            sprite,
+                                            &install.root,
+                                            pool,
+                                            collect_plugins,
+                                        ),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(matching.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("surface parse worker panicked"));
+                }
+                out
+            })
+        };
+        let mut parsed_iter = parsed.into_iter().peekable();
         let mut files = vec![SurfaceFile {
             name: builtin.to_owned(),
             location: format!("GameData/{builtin}"),
@@ -170,109 +360,63 @@ impl SurfaceCatalog {
         // The free list: 0x58055b puts each range at the front, and a key
         // is taken from the front range (0x4a1a08).
         let mut free: Vec<(u16, u16)> = seeds.iter().rev().copied().collect();
-        let mut directories = Vec::new();
-        for (bit, directory, _) in crate::Expansions::ALL {
-            if install.expansions.contains(bit) {
-                directories.push((directory.to_owned(), "wallsandfloors\\"));
+        for (dir_idx, (_, skipped)) in listings.iter().enumerate() {
+            if let Some(reason) = skipped.first() {
+                return Err(Error::Unsupported(reason.clone()));
             }
-        }
-        if install.expansions.0 > 3 {
-            directories.push(("ExpansionShared".to_owned(), "wallsandfloors\\"));
-        }
-        directories.push((own.to_owned(), ""));
-        for (directory, at) in directories {
-            let Some(path) = resolve(&install.root, &directory)? else {
-                continue;
-            };
-            if !path.is_dir() {
-                continue;
-            }
-            let (listed, skipped) = Index::listing(&path, at.as_bytes())?;
-            if let Some(reason) = skipped.into_iter().next() {
-                return Err(Error::Unsupported(reason));
-            }
-            for (name, resource) in listed {
-                if !name.ends_with(suffix) {
-                    continue;
+            while let Some((item_dir, _, _)) = parsed_iter.peek() {
+                if *item_dir != dir_idx {
+                    break;
                 }
-                if let Some((file, file_plugins)) = Self::add(
-                    &resource,
-                    name,
-                    sprite,
-                    &mut free,
-                    &install.root,
-                    collect_plugins,
-                )? {
-                    files.push(file);
-                    for plugin in file_plugins {
-                        plugins.insert(plugin.key, plugin);
+                let (_, resource, item) = parsed_iter.next().expect("peeked above");
+                let Some(surface) = item? else {
+                    continue;
+                };
+                let mut keys = BTreeMap::new();
+                let mut present_idx = 0usize;
+                for number in 1..=surface.count as u16 {
+                    let Some((low, high)) = free.first().copied() else {
+                        break;
+                    };
+                    free.remove(0);
+                    if low < high {
+                        free.insert(0, (low + 1, high));
+                    }
+                    if surface.present.get(present_idx) == Some(&number) {
+                        keys.insert(number, low);
+                        present_idx += 1;
                     }
                 }
-            }
-        }
-        Ok((Self { files }, plugins))
-    }
-
-    /// Reads one pattern file (0x4a0744, 0x4c552e), or None for a file the
-    /// original leaves out: one with no pattern.
-    fn add(
-        resource: &Resource,
-        name: Vec<u8>,
-        sprite: [u8; 4],
-        free: &mut Vec<(u16, u16)>,
-        root: &std::path::Path,
-        collect_plugins: bool,
-    ) -> Result<Option<(SurfaceFile, Vec<SurfacePlugin>)>> {
-        let location = resource.location(root);
-        // A file the original cannot open is left out too. Which files our
-        // reader refuses that the original opens, or the reverse, is not
-        // known, so a refusal stops the build.
-        let iff = Iff::parse(resource.read()?).map_err(|e| Error::format(&location, e))?;
-        let count = iff.all(&sprite).count() as i16 / 3;
-        if count < 1 {
-            return Ok(None);
-        }
-        let mut keys = BTreeMap::new();
-        for number in 1..=count as u16 {
-            let Some((low, high)) = free.first().copied() else {
-                break;
-            };
-            free.remove(0);
-            if low < high {
-                free.insert(0, (low + 1, high));
-            }
-            if iff.get(&sprite, number).is_some() {
-                keys.insert(number, low);
-            }
-        }
-        let meta = metadata(&iff);
-        let file_name = sims_formats::far::decode_name(&name);
-        let mut file_plugins = Vec::new();
-        if collect_plugins {
-            for (&local, &key) in &keys {
-                file_plugins.push(SurfacePlugin {
-                    key,
-                    local,
-                    file_name: file_name.clone(),
-                    resource: resource.clone(),
-                    name: meta.name.clone(),
-                    raw_name: meta.raw_name.clone(),
-                    price: meta.price,
-                    description: meta.description.clone(),
+                if collect_plugins {
+                    for (&local, &key) in &keys {
+                        plugins.insert(
+                            key,
+                            SurfacePlugin {
+                                key,
+                                local,
+                                file_name: surface.name.clone(),
+                                resource: resource.clone(),
+                                name: surface.meta.name.clone(),
+                                raw_name: surface.meta.raw_name.clone(),
+                                price: surface.meta.price,
+                                description: surface.meta.description.clone(),
+                            },
+                        );
+                    }
+                }
+                files.push(SurfaceFile {
+                    name: surface.name,
+                    location: surface.location,
+                    keys,
+                    price: surface.meta.price,
                 });
             }
         }
-        Ok(Some((
-            SurfaceFile {
-                name: file_name,
-                location,
-                keys,
-                price: meta.price,
-            },
-            file_plugins,
-        )))
+        if let Some(error) = trailing_error {
+            return Err(error);
+        }
+        Ok((Self { files }, plugins))
     }
-
     /// The first file whose name is `name`, ignoring ASCII case, as the
     /// load matches a house's map entry (0x4a1d25, comparing at 0x46f891).
     pub fn file(&self, name: &str) -> Option<usize> {
@@ -287,6 +431,19 @@ impl SurfaceCatalog {
     }
 }
 
+fn shared_surface_directories(install: &Install) -> Vec<(String, &'static str)> {
+    let mut directories = Vec::new();
+    for (bit, directory, _) in crate::Expansions::ALL {
+        if install.expansions.contains(bit) {
+            directories.push((directory.to_owned(), "wallsandfloors\\"));
+        }
+    }
+    if install.expansions.0 > 3 {
+        directories.push(("ExpansionShared".to_owned(), "wallsandfloors\\"));
+    }
+    directories
+}
+
 /// Both catalogs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Surfaces {
@@ -296,9 +453,156 @@ pub struct Surfaces {
 
 impl Surfaces {
     pub fn build(install: &Install) -> Result<Self> {
-        Ok(Self {
-            floors: SurfaceCatalog::build(install, SurfaceKind::Floor)?,
-            walls: SurfaceCatalog::build(install, SurfaceKind::Wall)?,
+        Self::build_with_pool(install, &ArchivePool::new())
+    }
+
+    /// Builds both floor and wall catalogs, scanning shared expansion
+    /// `WallsAndFloors` directories once and parsing pattern IFFs in parallel
+    /// through `pool`.
+    pub fn build_with_pool(install: &Install, pool: &ArchivePool) -> Result<Self> {
+        let (surfaces, _, _) = Self::build_all_with_pool(install, false, pool)?;
+        Ok(surfaces)
+    }
+
+    /// Builds both floor and wall catalogs together with their plug-in metadata
+    /// maps in one shared parallel scan through `pool`.
+    #[allow(clippy::type_complexity)]
+    pub fn build_with_plugins_and_pool(
+        install: &Install,
+        pool: &ArchivePool,
+    ) -> Result<(
+        Self,
+        BTreeMap<u16, SurfacePlugin>,
+        BTreeMap<u16, SurfacePlugin>,
+    )> {
+        Self::build_all_with_pool(install, true, pool)
+    }
+
+    /// Scans plug-in floor and wall metadata maps in one shared parallel scan
+    /// through `pool`, returning an empty map for any kind whose scan fails
+    /// (matching [`SurfaceCatalog::plugins`] with `.unwrap_or_default()`).
+    pub fn plugins_with_pool(
+        install: &Install,
+        pool: &ArchivePool,
+    ) -> (BTreeMap<u16, SurfacePlugin>, BTreeMap<u16, SurfacePlugin>) {
+        let (floors, walls) = Self::scan_both_with_pool(install, true, pool, false);
+        (
+            floors.map(|(_, plugins)| plugins).unwrap_or_default(),
+            walls.map(|(_, plugins)| plugins).unwrap_or_default(),
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn build_all_with_pool(
+        install: &Install,
+        collect_plugins: bool,
+        pool: &ArchivePool,
+    ) -> Result<(
+        Self,
+        BTreeMap<u16, SurfacePlugin>,
+        BTreeMap<u16, SurfacePlugin>,
+    )> {
+        let (floors, walls) = Self::scan_both_with_pool(install, collect_plugins, pool, true);
+        let (floors, floor_plugins) = floors?;
+        let (walls, wall_plugins) = walls?;
+        Ok((Self { floors, walls }, floor_plugins, wall_plugins))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn scan_both_with_pool(
+        install: &Install,
+        collect_plugins: bool,
+        pool: &ArchivePool,
+        fail_fast_wall_on_floor_err: bool,
+    ) -> (
+        Result<(SurfaceCatalog, BTreeMap<u16, SurfacePlugin>)>,
+        Result<(SurfaceCatalog, BTreeMap<u16, SurfacePlugin>)>,
+    ) {
+        let shared = shared_surface_directories(install);
+        let shared_len = shared.len();
+        let mut all_dirs = shared;
+        all_dirs.push((SurfaceKind::Floor.profile().own.to_owned(), ""));
+        all_dirs.push((SurfaceKind::Wall.profile().own.to_owned(), ""));
+        let mut listings = scan_surface_directories(install, &all_dirs);
+        let wall_own = listings.pop().expect("wall directory listing");
+        let floor_own = listings.pop().expect("floor directory listing");
+        debug_assert_eq!(listings.len(), shared_len);
+
+        // Keep every leading `Ok` shared directory and capture the exact first
+        // shared `Error` by value without retrying any filesystem scan.
+        let mut ok_shared = Vec::with_capacity(shared_len);
+        let mut first_shared_err = None;
+        for listing in listings {
+            match listing {
+                Ok(dir) => ok_shared.push(dir),
+                Err(error) => {
+                    first_shared_err = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(shared_err) = first_shared_err {
+            if !fail_fast_wall_on_floor_err {
+                // Both independent `SurfaceCatalog::plugins` calls fail on the
+                // same shared directory before reading `own`.
+                return (
+                    Err(Error::Unsupported(shared_err.to_string())),
+                    Err(shared_err),
+                );
+            }
+            let floor_refs: Vec<&SurfaceDirectoryListing> = ok_shared.iter().collect();
+            let floors = SurfaceCatalog::from_listings(
+                install,
+                SurfaceKind::Floor,
+                &floor_refs,
+                Some(shared_err),
+                collect_plugins,
+                pool,
+            );
+            return (floors, Ok((SurfaceCatalog::default(), BTreeMap::new())));
+        }
+        let (floor_own_ok, floor_err) = match floor_own {
+            Ok(dir) => (Some(dir), None),
+            Err(error) => (None, Some(error)),
+        };
+        let (wall_own_ok, wall_err) =
+            if fail_fast_wall_on_floor_err && floor_own_ok.is_none() && floor_err.is_some() {
+                (None, None)
+            } else {
+                match wall_own {
+                    Ok(dir) => (Some(dir), None),
+                    Err(error) => (None, Some(error)),
+                }
+            };
+        let mut floor_refs: Vec<&SurfaceDirectoryListing> = ok_shared.iter().collect();
+        if let Some(ref own) = floor_own_ok {
+            floor_refs.push(own);
+        }
+        let mut wall_refs: Vec<&SurfaceDirectoryListing> = ok_shared.iter().collect();
+        if let Some(ref own) = wall_own_ok {
+            wall_refs.push(own);
+        }
+        std::thread::scope(|scope| {
+            let floor_handle = scope.spawn(|| {
+                SurfaceCatalog::from_listings(
+                    install,
+                    SurfaceKind::Floor,
+                    &floor_refs,
+                    floor_err,
+                    collect_plugins,
+                    pool,
+                )
+            });
+            let walls = SurfaceCatalog::from_listings(
+                install,
+                SurfaceKind::Wall,
+                &wall_refs,
+                wall_err,
+                collect_plugins,
+                pool,
+            );
+            let floors = floor_handle.join().expect("floor catalog worker panicked");
+            (floors, walls)
         })
     }
 }
@@ -343,6 +647,12 @@ fn metadata(iff: &Iff) -> FileMetadata {
 /// The table is the `STR#` with ID 0 and a flags' high byte of 0, as the
 /// original's string loader looks it up (through 0x46ff01 and 0x41bab1,
 /// which matches the key's ID and high byte at 0x41d94f to 0x41d95b).
+fn metadata_price(iff: &Iff) -> Option<i32> {
+    let chunk = iff.get(b"STR#", 0)?;
+    let table = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)).ok()?;
+    table.entry(1, US_ENGLISH).map(|e| atoi(&e.raw_text))
+}
+
 #[cfg(test)]
 fn price(iff: &Iff) -> Option<i32> {
     metadata(iff).price

@@ -10,6 +10,7 @@
 //! `docs/decisions/`.
 
 pub mod assets;
+pub mod build_preview;
 pub mod cache;
 pub mod camera;
 pub mod canvas;
@@ -26,7 +27,7 @@ pub mod pools;
 pub mod scene;
 pub mod shadows;
 
-pub use assets::Assets;
+pub use assets::{Assets, BaseAssets};
 pub use cache::{CacheHit, LotCache};
 pub use camera::{Camera, Walls, Zoom};
 pub use canvas::{Canvas, Ids, Image};
