@@ -7,6 +7,7 @@ use sims_game::sound::{Input, Mixer};
 use sims_game::view::Move;
 use sims_render::Walls;
 use sims_ui::command::Speed;
+use std::sync::Arc;
 
 #[test]
 fn an_event_plays_and_the_inputs_are_taken() {
@@ -47,7 +48,7 @@ fn hour_change_with_still_camera_updates_the_night_loop() {
     // (`sound::enter_live`), then stop the ambience score and
     // neighbourhood music with StopAll so every sound heard comes solely
     // from `nite_loop`.
-    mixer.input(Input::Sources(snap(18)));
+    mixer.input(Input::Sources(Arc::new(snap(18))));
     mixer.input(Input::View(0));
     mixer.input(Input::Hour(18));
     let mut events = sims_game::sound::enter_live();
@@ -59,7 +60,7 @@ fn hour_change_with_still_camera_updates_the_night_loop() {
     // Clock crosses 19:00 with NO Input::Camera (stationary camera):
     // Input::Hour runs kind 33 (0x46d4d3 -> 0x4f66bc -> 0x57aac5) and
     // starts `nite_loop`.
-    mixer.input(Input::Sources(snap(19)));
+    mixer.input(Input::Sources(Arc::new(snap(19))));
     mixer.input(Input::Hour(19));
     let night = mixer.render(RATE as usize);
     assert!(
@@ -68,7 +69,7 @@ fn hour_change_with_still_camera_updates_the_night_loop() {
     );
 
     // Clock crosses 06:00 with NO Input::Camera: `nite_loop` fades out.
-    mixer.input(Input::Sources(snap(6)));
+    mixer.input(Input::Sources(Arc::new(snap(6))));
     mixer.input(Input::Hour(6));
     let _ = mixer.render(RATE as usize);
     assert!(
@@ -110,7 +111,7 @@ fn pausing_the_lot_pauses_live_ambience_and_night_loop() {
     // ambience, and confirm audio is playing before pausing.
     let mut night = game.sound_sources();
     night.absent[4] = 22;
-    mixer.input(Input::Sources(night));
+    mixer.input(Input::Sources(Arc::new(night)));
     mixer.input(Input::Hour(22));
     assert!(
         mixer.render(RATE as usize).iter().any(|&s| s != 0),
@@ -220,7 +221,7 @@ fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
     // backyard ambience, not `nite_loop`).
     let mut noon = game.sound_sources();
     noon.absent[4] = 12;
-    mixer.input(Input::Sources(noon));
+    mixer.input(Input::Sources(Arc::new(noon)));
     mixer.input(Input::View(100));
     mixer.input(Input::Hour(12));
     assert!(
@@ -476,7 +477,7 @@ fn the_goths_sounds_play() {
     while game.run(20) > 0 {
         game.apply(Move::Scroll([8, 0]));
         assert_ne!(game.shot(), shot);
-        mixer.input(Input::Sources(game.sound_sources()));
+        mixer.input(Input::Sources(Arc::new(game.sound_sources())));
         let sounds = game.take_sounds();
         for event in &sounds {
             if let sims_vm::SoundEvent::Play { name, .. } = event {

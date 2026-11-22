@@ -125,7 +125,7 @@ pub struct VoiceQuery<'a> {
 /// Indexed Simlish voice bank over an install's [`SoundFiles`].
 #[derive(Debug, Clone)]
 pub struct VoiceCatalog {
-    files: SoundFiles,
+    files: std::sync::Arc<SoundFiles>,
     clips: Vec<VoiceClip>,
     by_key: BTreeMap<String, usize>,
     by_voice: BTreeMap<VoiceAgeGender, Vec<usize>>,
@@ -142,6 +142,12 @@ impl VoiceCatalog {
 
     /// Builds a voice bank index from an already-scanned [`SoundFiles`] table.
     pub fn from_sound_files(files: SoundFiles) -> Self {
+        Self::from_shared_sound_files(std::sync::Arc::new(files))
+    }
+
+    /// Builds a voice bank index sharing an existing `Arc<SoundFiles>` without
+    /// duplicating its file table.
+    pub fn from_shared_sound_files(files: std::sync::Arc<SoundFiles>) -> Self {
         let mut clips = Vec::new();
         let mut script_sets = Vec::new();
 
