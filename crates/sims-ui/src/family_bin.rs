@@ -194,11 +194,11 @@ pub enum ColumnHeader {
 pub enum FamilyBinCommand {
     /// Highlighted a household row (single click).
     SelectFamily(u32),
-    /// Activated "Create New Family".
+    /// Activated the create-family button (`STR# 128` index 2).
     CreateNewFamily,
-    /// Activated "Move In Family" (button click or row double-click).
+    /// Activated the move-in button (`STR# 128` index 3) or double-clicked a row.
     MoveInFamily(u32),
-    /// Activated "Delete Family" for the currently selected household.
+    /// Activated the delete-family button (`STR# 128` index 4) for the selected household.
     DeleteFamily(u32),
     /// Cancelled and returned to the neighborhood screen.
     Cancel,
@@ -255,9 +255,9 @@ impl FamilyBinStrings {
 
     pub fn button_tooltip(&self, button: FamilyBinButton) -> Option<&str> {
         match button {
-            // `0x563a21`: Cancel tooltip uses STR# 128 index 15 ("Back to Neighborhood").
+            // `0x563a21`: Cancel tooltip uses STR# 128 index 15.
             FamilyBinButton::Cancel => self.get(15).or_else(|| self.get(5)),
-            // `0x56375d`: Create button uses index 2 (or 16).
+            // `0x56375d`: Create button uses STR# 128 index 2 (or 16).
             FamilyBinButton::CreateNewFamily => self.get(2).or_else(|| self.get(16)),
             FamilyBinButton::MoveInFamily => self.get(3),
             FamilyBinButton::DeleteFamily => self.get(4),
@@ -354,12 +354,12 @@ impl FamilyBinLayout {
             let scrollbar = if family_count > VISIBLE_ROWS {
                 let sb_x = list_x + ROW_WIDTH + 6;
                 let sb_h = (VISIBLE_ROWS as i32) * ROW_HEIGHT;
-                Some(compute_scrollbar(
+                compute_scrollbar(
                     Rect::new(sb_x, list_y, 24, sb_h),
                     family_count,
                     VISIBLE_ROWS,
                     scroll_offset,
-                ))
+                )
             } else {
                 None
             };
@@ -448,40 +448,46 @@ impl FamilyBinLayout {
             .map(|i| Rect::new(list_x, list_top + (i as i32) * row_h, row_w, row_h))
             .collect();
 
-        let scrollbar = if needs_scroll {
-            Some(compute_scrollbar(
-                Rect::new(
-                    list_x + row_w + 6,
-                    list_top,
-                    sb_w,
-                    row_h * visible_rows as i32,
-                ),
+        let sb_h = row_h.saturating_mul(visible_rows as i32);
+        let scrollbar = if needs_scroll && sb_h >= 36 {
+            compute_scrollbar(
+                Rect::new(list_x + row_w + 6, list_top, sb_w, sb_h),
                 family_count,
                 visible_rows,
                 scroll_offset,
-            ))
+            )
         } else {
             None
         };
 
         let magic = mode == FamilyBinMode::MagicTown;
         let hy = (list_top - header_h).max(title_rect.y + title_rect.height);
-        let funds_x = list_x + (row_w * 72) / 100;
-        let friends_x = list_x + (row_w * 86) / 100;
-        let mut headers = vec![
-            (ColumnHeader::NetWorth, Rect::new(funds_x, hy, 24, 18)),
-            (ColumnHeader::Friends, Rect::new(friends_x, hy, 24, 18)),
-        ];
-        if magic {
-            let magic_x = list_x + (row_w * 93) / 100;
-            headers.push((ColumnHeader::MagicCoins, Rect::new(magic_x, hy, 22, 18)));
+        let hh = header_h.min((list_top - hy).max(0));
+        let col_count = if magic { 3i64 } else { 2i64 };
+        let hdr_start = list_x + ((i64::from(row_w) * 70) / 100) as i32;
+        let hdr_avail = (list_x + row_w - hdr_start).max(0);
+        let slot_w = (i64::from(hdr_avail) / col_count) as i32;
+        let mut headers = Vec::new();
+        if hh > 0 && slot_w > 0 {
+            let cw = slot_w.min(24);
+            headers.push((ColumnHeader::NetWorth, Rect::new(hdr_start, hy, cw, hh)));
+            headers.push((
+                ColumnHeader::Friends,
+                Rect::new(hdr_start + slot_w, hy, cw, hh),
+            ));
+            if magic {
+                headers.push((
+                    ColumnHeader::MagicCoins,
+                    Rect::new(hdr_start + slot_w * 2, hy, cw, hh),
+                ));
+            }
         }
 
         // Distribute the 4 bottom buttons evenly with 6 px gaps.
         let gap = 6;
         let usable_w = (w - margin_x * 2 - gap * 3).max(40);
-        let weights = [120, 92, 92, 164];
-        let total_weight: i32 = weights.iter().sum();
+        let weights = [120i64, 92, 92, 164];
+        let total_weight: i64 = weights.iter().sum();
         let btn_y = (h - btn_h - bottom_pad).max(list_bottom + 2);
         let mut bx = margin_x;
         let mut btn_rects = [Rect::default(); 4];
@@ -489,7 +495,7 @@ impl FamilyBinLayout {
             let bw = if i == 3 {
                 (w - margin_x - bx).max(10)
             } else {
-                ((usable_w * wt) / total_weight).max(10)
+                ((i64::from(usable_w) * wt) / total_weight).max(10) as i32
             };
             btn_rects[i] = Rect::new(bx, btn_y, bw, btn_h.min((h - btn_y).max(0)));
             bx += bw + gap;
@@ -545,8 +551,15 @@ fn compute_scrollbar(
     total_items: usize,
     visible_rows: usize,
     scroll_offset: usize,
-) -> ScrollbarLayout {
-    let arrow_h = outer.width.min(outer.height / 4).max(12);
+) -> Option<ScrollbarLayout> {
+    if outer.width < 8 || outer.height < 36 || total_items <= visible_rows {
+        return None;
+    }
+    let arrow_h = outer.width.min(outer.height / 3).max(10);
+    let track_h = outer.height - arrow_h * 2;
+    if track_h < 8 {
+        return None;
+    }
     let up_arrow = Rect::new(outer.x, outer.y, outer.width, arrow_h);
     let down_arrow = Rect::new(
         outer.x,
@@ -554,32 +567,34 @@ fn compute_scrollbar(
         outer.width,
         arrow_h,
     );
-    let track = Rect::new(
-        outer.x,
-        up_arrow.y + up_arrow.height,
-        outer.width,
-        (outer.height - arrow_h * 2).max(1),
-    );
+    let track = Rect::new(outer.x, up_arrow.y + up_arrow.height, outer.width, track_h);
     let max_scroll = total_items.saturating_sub(visible_rows).max(1);
     let clamped_off = scroll_offset.min(max_scroll);
-    let thumb_h =
+    let raw_thumb =
         ((i64::from(track.height) * visible_rows as i64) / total_items.max(1) as i64) as i32;
-    let thumb_h = thumb_h.clamp(20.min(track.height), track.height);
+    // Leave at least 2 px of travel so the thumb remains draggable on short tracks.
+    let max_thumb = (track.height - 2).max(1);
+    let min_thumb = 12.min(max_thumb);
+    let thumb_h = raw_thumb.clamp(min_thumb, max_thumb);
     let travel = (track.height - thumb_h).max(0);
     let thumb_y = track.y + ((i64::from(travel) * clamped_off as i64) / max_scroll as i64) as i32;
     let thumb = Rect::new(track.x + 2, thumb_y, (track.width - 4).max(4), thumb_h);
-    ScrollbarLayout {
+    Some(ScrollbarLayout {
         track,
         up_arrow,
         down_arrow,
         thumb,
-    }
+    })
 }
 
-/// Interactive state for the Family Bin ("Select a Family") screen.
+/// Interactive state for the Family Bin picker screen.
+///
+/// Tracks the selected household by stable [`FamilyEntry::id`] rather than
+/// list index so removing or reordering households never retargets a
+/// Delete or Move-In action to a different family.
 #[derive(Debug, Clone, Default)]
 pub struct FamilyBin {
-    selected: Option<usize>,
+    selected_id: Option<u32>,
     scroll_offset: usize,
     hovered_row: Option<usize>,
     hovered_button: Option<FamilyBinButton>,
@@ -594,28 +609,44 @@ impl FamilyBin {
         Self::default()
     }
 
-    pub fn selected_index(&self) -> Option<usize> {
-        self.selected
+    /// Stable ID of the currently selected household, if any.
+    pub fn selected_id(&self) -> Option<u32> {
+        self.selected_id
+    }
+
+    /// Current row index of the selected household in `families`, if still present.
+    pub fn selected_index(&self, families: &[FamilyEntry]) -> Option<usize> {
+        let id = self.selected_id?;
+        families.iter().position(|f| f.id == id)
     }
 
     pub fn selected_family<'a>(&self, families: &'a [FamilyEntry]) -> Option<&'a FamilyEntry> {
-        self.selected.and_then(|i| families.get(i))
+        let id = self.selected_id?;
+        families.iter().find(|f| f.id == id)
     }
 
-    pub fn select(&mut self, index: Option<usize>, family_count: usize) {
-        self.selected = index.filter(|&i| i < family_count);
+    /// Selects the household at `index` in `families` (storing its stable ID).
+    pub fn select(&mut self, index: Option<usize>, families: &[FamilyEntry]) {
+        self.selected_id = index.and_then(|i| families.get(i)).map(|f| f.id);
+    }
+
+    /// Selects a household by its stable ID if present in `families`.
+    pub fn select_id(&mut self, id: Option<u32>, families: &[FamilyEntry]) {
+        self.selected_id = id.filter(|&target| families.iter().any(|f| f.id == target));
     }
 
     pub fn scroll_offset(&self) -> usize {
         self.scroll_offset
     }
 
-    /// Clamps selection and scroll offset when the underlying family list changes.
-    pub fn sync(&mut self, family_count: usize, visible_rows: usize) {
-        if self.selected.is_some_and(|i| i >= family_count) {
-            self.selected = None;
+    /// Revalidates selection and scroll offset when the family list changes.
+    pub fn sync(&mut self, families: &[FamilyEntry], visible_rows: usize) {
+        if let Some(id) = self.selected_id
+            && !families.iter().any(|f| f.id == id)
+        {
+            self.selected_id = None;
         }
-        let max_scroll = family_count.saturating_sub(visible_rows.max(1));
+        let max_scroll = families.len().saturating_sub(visible_rows.max(1));
         if self.scroll_offset > max_scroll {
             self.scroll_offset = max_scroll;
         }
@@ -648,7 +679,7 @@ impl FamilyBin {
             self.scroll_offset,
             view.mode,
         );
-        self.sync(view.families.len(), layout.visible_rows);
+        self.sync(view.families, layout.visible_rows);
 
         if self.dragging_thumb
             && let Some(sb) = layout.scrollbar
@@ -686,8 +717,8 @@ impl FamilyBin {
             self.scroll_offset,
             view.mode,
         );
-        self.sync(view.families.len(), layout.visible_rows);
-        let has_selection = self.selected.is_some();
+        self.sync(view.families, layout.visible_rows);
+        let has_selection = self.selected_family(view.families).is_some();
 
         if let Some(btn) = layout.hit_button(x, y) {
             self.hovered_button = Some(btn);
@@ -725,7 +756,7 @@ impl FamilyBin {
         if let Some(slot) = layout.hit_row(x, y) {
             let idx = self.scroll_offset + slot;
             if let Some(family) = view.families.get(idx) {
-                self.selected = Some(idx);
+                self.selected_id = Some(family.id);
                 self.hovered_row = Some(idx);
                 return Some(FamilyBinCommand::SelectFamily(family.id));
             }
@@ -750,11 +781,11 @@ impl FamilyBin {
             self.scroll_offset,
             view.mode,
         );
-        self.sync(view.families.len(), layout.visible_rows);
+        self.sync(view.families, layout.visible_rows);
         let slot = layout.hit_row(x, y)?;
         let idx = self.scroll_offset + slot;
         let family = view.families.get(idx)?;
-        self.selected = Some(idx);
+        self.selected_id = Some(family.id);
         Some(FamilyBinCommand::MoveInFamily(family.id))
     }
 
@@ -776,10 +807,10 @@ impl FamilyBin {
             self.scroll_offset,
             view.mode,
         );
-        self.sync(view.families.len(), layout.visible_rows);
+        self.sync(view.families, layout.visible_rows);
         let hit = layout.hit_button(x, y);
         self.hovered_button = hit;
-        let has_selection = self.selected.is_some();
+        let has_selection = self.selected_family(view.families).is_some();
         let btn = pressed.filter(|&b| Some(b) == hit && b.is_enabled(has_selection))?;
         match btn {
             FamilyBinButton::Cancel => Some(FamilyBinCommand::Cancel),
@@ -814,7 +845,7 @@ impl FamilyBin {
             self.scroll_offset,
             view.mode,
         );
-        let has_selection = self.selected.is_some_and(|i| i < view.families.len());
+        let has_selection = self.selected_family(view.families).is_some();
 
         // 1. Background fill and `PickBkg.bmp` / `PickBkgMagic.bmp`.
         frame.fill(
@@ -840,7 +871,7 @@ impl FamilyBin {
             }
         }
 
-        // 2. Centered title header (`SELECT A FAMILY`, `0x563672..0x56372f`).
+        // 2. Centered title header (`STR# 128` index 8, `0x563672..0x56372f`).
         let title = strings.title();
         if !title.is_empty()
             && let Some(font) = art
@@ -859,7 +890,7 @@ impl FamilyBin {
         for (slot, &row_rect) in layout.row_rects.iter().enumerate() {
             let family_idx = self.scroll_offset + slot;
             let family = view.families.get(family_idx);
-            let is_selected = family.is_some() && self.selected == Some(family_idx);
+            let is_selected = family.is_some_and(|f| Some(f.id) == self.selected_id);
             let is_hovered = family.is_some() && self.hovered_row == Some(family_idx);
             let row_state = if is_selected {
                 2
@@ -988,18 +1019,23 @@ fn draw_family_row_contents(
         (row.height - 18).clamp(18, 42)
     };
     let p_stride = p_size + 3;
-    let p_start_x = row.x + if native { 110 } else { (row.width * 18) / 100 };
-    let p_y = row.y + if native { 16 } else { row.height - p_size - 3 };
-    let funds_col_x = row.x
+    let p_start_x = row.x
         + if native {
-            if magic { 494 } else { 526 }
+            110
         } else {
-            (row.width * 72) / 100
+            ((i64::from(row.width) * 18) / 100) as i32
+        };
+    let p_y = row.y + if native { 16 } else { row.height - p_size - 3 };
+    let funds_x = row.x
+        + if native {
+            if magic { 516 } else { 548 }
+        } else {
+            ((i64::from(row.width) * 70) / 100) as i32
         };
 
     for (i, member) in entry.members.iter().take(MAX_PORTRAITS).enumerate() {
         let px = p_start_x + (i as i32) * p_stride;
-        if px + p_size > funds_col_x - 8 {
+        if px + p_size > funds_x - 8 {
             break;
         }
         let prect = Rect::new(px, p_y, p_size, p_size);
@@ -1025,7 +1061,6 @@ fn draw_family_row_contents(
                 (row.height - font.line_height) / 2
             };
         let funds_str = format_simoleons(entry.funds);
-        let funds_x = funds_col_x + if native { 22 } else { 0 };
         font.draw(frame, &funds_str, [funds_x + 1, ty + 1], TEXT_SHADOW);
         font.draw(frame, &funds_str, [funds_x, ty], ink);
 
@@ -1034,14 +1069,19 @@ fn draw_family_row_contents(
             + if native {
                 if magic { 606 } else { 620 }
             } else {
-                (row.width * 86) / 100
+                ((i64::from(row.width) * 85) / 100) as i32
             };
         font.draw(frame, &friends_str, [friends_x + 1, ty + 1], TEXT_SHADOW);
         font.draw(frame, &friends_str, [friends_x, ty], ink);
 
         if magic {
             let magic_str = entry.magic_coins.to_string();
-            let magic_x = row.x + if native { 649 } else { (row.width * 93) / 100 };
+            let magic_x = row.x
+                + if native {
+                    649
+                } else {
+                    ((i64::from(row.width) * 93) / 100) as i32
+                };
             font.draw(frame, &magic_str, [magic_x + 1, ty + 1], TEXT_SHADOW);
             font.draw(frame, &magic_str, [magic_x, ty], ink);
         }

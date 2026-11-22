@@ -550,22 +550,41 @@ impl StreamDeck {
             return None;
         }
         let mut idx = (self.phase >> 32) as usize;
-        if idx + 1 >= self.buffer.len() / 2 && !self.eof {
+        // Loop refill so large steps (e.g. very low output rates) catch up
+        // across multiple source blocks without inserting silent dropouts.
+        while idx + 1 >= self.buffer.len() / 2 && !self.eof {
+            let before = self.phase;
+            let before_len = self.buffer.len();
             self.refill();
             idx = (self.phase >> 32) as usize;
+            if self.phase == before && self.buffer.len() == before_len && !self.eof {
+                break;
+            }
         }
         let frames = self.buffer.len() / 2;
         if idx >= frames {
             return None;
         }
         let next = (idx + 1).min(frames - 1);
-        let frac = (self.phase & 0xffff_ffff) as i64;
-        let l0 = i64::from(self.buffer[idx * 2]);
-        let r0 = i64::from(self.buffer[idx * 2 + 1]);
-        let l1 = i64::from(self.buffer[next * 2]);
-        let r1 = i64::from(self.buffer[next * 2 + 1]);
-        let left = l0 + (((l1 - l0) * frac) >> 32);
-        let right = r0 + (((r1 - r0) * frac) >> 32);
+        let (left, right) = if self.step >= (2u64 << 32) {
+            // Simple 2-tap box anti-aliasing filter when downsampling by >= 2x
+            // (e.g. 44.1 kHz MP3 -> 22.05 kHz output).
+            let l0 = i64::from(self.buffer[idx * 2]);
+            let r0 = i64::from(self.buffer[idx * 2 + 1]);
+            let l1 = i64::from(self.buffer[next * 2]);
+            let r1 = i64::from(self.buffer[next * 2 + 1]);
+            ((l0 + l1) >> 1, (r0 + r1) >> 1)
+        } else {
+            let frac = (self.phase & 0xffff_ffff) as i64;
+            let l0 = i64::from(self.buffer[idx * 2]);
+            let r0 = i64::from(self.buffer[idx * 2 + 1]);
+            let l1 = i64::from(self.buffer[next * 2]);
+            let r1 = i64::from(self.buffer[next * 2 + 1]);
+            (
+                l0 + (((l1 - l0) * frac) >> 32),
+                r0 + (((r1 - r0) * frac) >> 32),
+            )
+        };
 
         self.phase = self.phase.wrapping_add(self.step);
 
@@ -755,8 +774,9 @@ impl<S: TrackSource> ModeMusicPlayer<S> {
                 }
             }
 
-            // Returning from FamilyBin to Neighborhood keeps the neighborhood
-            // music playing uninterrupted (`0x575263`).
+            // Returning from FamilyBin to Neighborhood keeps the preserved
+            // music deck playing uninterrupted (`0x575263`), without
+            // clobbering an expansion station if one was already active.
             MusicMode::Neighborhood
                 if previous == MusicMode::FamilyBin && self.current.is_some() =>
             {
@@ -766,7 +786,9 @@ impl<S: TrackSource> ModeMusicPlayer<S> {
                 {
                     deck.start_fade(MAX_VOLUME, crossfade, false);
                 }
-                self.active_station = Some(MusicMode::Neighborhood);
+                if self.active_station.is_none() {
+                    self.active_station = Some(MusicMode::Neighborhood);
+                }
             }
 
             // Makin' Magic Build <-> Buy keeps playing (`0x575467..0x5754bf`).
@@ -886,14 +908,16 @@ impl<S: TrackSource> ModeMusicPlayer<S> {
     }
 
     fn crossfade_frames(&self) -> u32 {
-        ((u64::from(self.output_rate) * u64::from(self.crossfade_ms)) / 1000) as u32
+        ((u64::from(self.output_rate) * u64::from(self.crossfade_ms)) / 1000)
+            .min(u64::from(u32::MAX)) as u32
     }
 
     /// Number of output frames for `FadeAndKillTrackSlow` (`1024 / 3` ≈ 342
     /// 20 ms ticks = 6.84 s).
     fn slow_fade_frames(&self) -> u32 {
         let ticks = (MAX_VOLUME + SLOW_FADE_STEP_PER_TICK - 1) / SLOW_FADE_STEP_PER_TICK;
-        ((u64::from(self.output_rate) * ticks as u64) / u64::from(HIT_TICK_HZ)) as u32
+        ((u64::from(self.output_rate) * ticks as u64) / u64::from(HIT_TICK_HZ))
+            .min(u64::from(u32::MAX)) as u32
     }
 
     fn start_next_track(&mut self, mode: MusicMode, fade_in: bool) -> bool {
@@ -901,33 +925,56 @@ impl<S: TrackSource> ModeMusicPlayer<S> {
         if count == 0 {
             return false;
         }
-        // Try up to `count` candidates so a single corrupt/missing file skips
-        // cleanly to the next track instead of stalling playback.
-        for _ in 0..count {
+        // Try every unique candidate index at most once (avoiding re-attempting
+        // already-failed indices across a shuffle boundary).
+        let mut tried = vec![false; count];
+        let mut unique_tried = 0usize;
+        while unique_tried < count {
             let idx = self.next_playlist_index(mode, count);
-            let path = self.catalog.tracks(mode)[idx].clone();
-            let Some(bytes) = self.source.read_bytes(&path) else {
-                self.faults.push(format!("missing music track: {path}"));
-                continue;
-            };
-            match StreamDeck::open(path.clone(), bytes, self.output_rate) {
-                Ok(mut deck) => {
-                    if fade_in {
-                        let cf = self.crossfade_frames();
-                        if cf > 0 {
-                            deck.gain_fp = 0;
-                            deck.start_fade(MAX_VOLUME, cf, false);
-                        }
-                    }
-                    self.current = Some(deck);
+            if tried[idx] {
+                // Find the first untried index deterministically.
+                let Some(fallback) = tried.iter().position(|&t| !t) else {
+                    break;
+                };
+                tried[fallback] = true;
+                unique_tried += 1;
+                if self.try_open_track(mode, fallback, fade_in) {
                     return true;
                 }
-                Err(err) => {
-                    self.faults.push(format!("failed to open {path}: {err}"));
-                }
+                continue;
+            }
+            tried[idx] = true;
+            unique_tried += 1;
+            if self.try_open_track(mode, idx, fade_in) {
+                return true;
             }
         }
         false
+    }
+
+    fn try_open_track(&mut self, mode: MusicMode, idx: usize, fade_in: bool) -> bool {
+        let path = self.catalog.tracks(mode)[idx].clone();
+        let Some(bytes) = self.source.read_bytes(&path) else {
+            self.faults.push(format!("missing music track: {path}"));
+            return false;
+        };
+        match StreamDeck::open(path.clone(), bytes, self.output_rate) {
+            Ok(mut deck) => {
+                if fade_in {
+                    let cf = self.crossfade_frames();
+                    if cf > 0 {
+                        deck.gain_fp = 0;
+                        deck.start_fade(MAX_VOLUME, cf, false);
+                    }
+                }
+                self.current = Some(deck);
+                true
+            }
+            Err(err) => {
+                self.faults.push(format!("failed to open {path}: {err}"));
+                false
+            }
+        }
     }
 
     /// Picks the next track index from `mode`'s shuffled cycle, guaranteeing no

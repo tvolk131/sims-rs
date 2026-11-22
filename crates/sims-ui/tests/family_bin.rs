@@ -159,7 +159,7 @@ fn selection_buttons_double_click_and_empty_slots() {
         bin.press(empty_row.x + 20, empty_row.y + 20, size, &view),
         None
     );
-    assert_eq!(bin.selected_index(), None);
+    assert_eq!(bin.selected_index(&families), None);
 
     // Clicking populated row #2 selects Family2 (id 102).
     let row2 = layout.row_rects[2];
@@ -167,7 +167,8 @@ fn selection_buttons_double_click_and_empty_slots() {
         bin.press(row2.x + 20, row2.y + 20, size, &view),
         Some(FamilyBinCommand::SelectFamily(102))
     );
-    assert_eq!(bin.selected_index(), Some(2));
+    assert_eq!(bin.selected_index(&families), Some(2));
+    assert_eq!(bin.selected_id(), Some(102));
     assert_eq!(
         click_btn(&mut bin, FamilyBinButton::MoveInFamily),
         Some(FamilyBinCommand::MoveInFamily(102))
@@ -177,13 +178,38 @@ fn selection_buttons_double_click_and_empty_slots() {
         Some(FamilyBinCommand::DeleteFamily(102))
     );
 
+    // Removing a preceding row keeps selection pinned to stable ID 102 (never retargets!).
+    let shifted: Vec<FamilyEntry> = families[1..].to_vec(); // ids 101, 102
+    let shifted_view = FamilyBinView {
+        mode: FamilyBinMode::Standard,
+        families: &shifted,
+    };
+    assert_eq!(bin.selected_index(&shifted), Some(1));
+    let del_r = layout.button_rect(FamilyBinButton::DeleteFamily).unwrap();
+    let (dx, dy) = (del_r.x + del_r.width / 2, del_r.y + del_r.height / 2);
+    assert_eq!(bin.press(dx, dy, size, &shifted_view), None);
+    assert_eq!(
+        bin.release(dx, dy, size, &shifted_view),
+        Some(FamilyBinCommand::DeleteFamily(102))
+    );
+
+    // Removing the selected household itself clears selection so Delete does nothing.
+    let without_102: Vec<FamilyEntry> = vec![families[0].clone(), families[1].clone()];
+    let without_view = FamilyBinView {
+        mode: FamilyBinMode::Standard,
+        families: &without_102,
+    };
+    assert_eq!(bin.press(dx, dy, size, &without_view), None);
+    assert_eq!(bin.release(dx, dy, size, &without_view), None);
+    assert_eq!(bin.selected_id(), None);
+
     // Double-clicking row #1 immediately emits MoveInFamily(101).
     let row1 = layout.row_rects[1];
     assert_eq!(
         bin.double_click(row1.x + 20, row1.y + 20, size, &view),
         Some(FamilyBinCommand::MoveInFamily(101))
     );
-    assert_eq!(bin.selected_index(), Some(1));
+    assert_eq!(bin.selected_index(&families), Some(1));
 
     // Escape cancels cleanly.
     assert_eq!(bin.cancel(), FamilyBinCommand::Cancel);
@@ -247,10 +273,35 @@ fn scrolling_arrows_track_drag_and_list_shrink() {
     // Wheel scroll and sync after shrinking list.
     bin.scroll(100, families.len(), VISIBLE_ROWS);
     assert_eq!(bin.scroll_offset(), 4);
-    bin.select(Some(9), families.len());
-    bin.sync(3, VISIBLE_ROWS);
-    assert_eq!(bin.selected_index(), None);
+    bin.select(Some(9), &families);
+    bin.sync(&families[..3], VISIBLE_ROWS);
+    assert_eq!(bin.selected_id(), None);
     assert_eq!(bin.scroll_offset(), 0);
+}
+
+#[test]
+fn tiny_and_extreme_viewports_do_not_overlap_or_overflow() {
+    // 190x240 Magic Town: column headers must not overlap.
+    let tiny = FamilyBinLayout::compute(190, 240, 10, 0, FamilyBinMode::MagicTown);
+    for i in 0..tiny.headers.len() {
+        for j in (i + 1)..tiny.headers.len() {
+            assert!(
+                !rects_overlap(tiny.headers[i].1, tiny.headers[j].1),
+                "headers overlap at 190x240: {:?} vs {:?}",
+                tiny.headers[i],
+                tiny.headers[j]
+            );
+        }
+    }
+    // 190x110: scrollbar either stays absent or leaves draggable travel.
+    let short = FamilyBinLayout::compute(190, 110, 10, 0, FamilyBinMode::Standard);
+    if let Some(sb) = short.scrollbar {
+        assert!(sb.thumb.height < sb.track.height);
+        assert!(!rects_overlap(sb.up_arrow, sb.track));
+        assert!(!rects_overlap(sb.down_arrow, sb.track));
+    }
+    // Extreme width u32::MAX must not overflow in debug builds.
+    let _ = FamilyBinLayout::compute(u32::MAX, 599, 10, 0, FamilyBinMode::MagicTown);
 }
 
 #[test]
@@ -303,7 +354,7 @@ fn install_family_bin_art_strings_and_rendering() {
         families: &families,
     };
     let mut bin = FamilyBin::new();
-    bin.select(Some(2), families.len());
+    bin.select(Some(2), &families);
 
     // Hover Create button to verify tooltip rendering too.
     let layout_preview = FamilyBinLayout::compute(800, 600, families.len(), 0, view.mode);

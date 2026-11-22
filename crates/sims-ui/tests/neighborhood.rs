@@ -303,6 +303,19 @@ fn lot_popup_formats_occupied_vacant_movein_cant_afford_and_clamps_below_bar() {
     assert!(popup.rect.x + popup.rect.width <= 800);
     assert!(popup.rect.y + popup.rect.height <= 600);
     assert_eq!(popup.portrait_rects.len(), 7);
+    for &pr in &popup.portrait_rects {
+        assert!(!rects_overlap(popup.text_rect, pr));
+    }
+
+    // Tiny viewport (160x100): portraits must never overlap text_rect.
+    let tiny_popup = LotPopupLayout::compute(&occupied, &state, [160, 100], &art, &strings);
+    for &pr in &tiny_popup.portrait_rects {
+        assert!(
+            !rects_overlap(tiny_popup.text_rect, pr),
+            "portrait {pr:?} overlaps text_rect {:?} at 160x100",
+            tiny_popup.text_rect
+        );
+    }
 
     // Vacant house in Move-In mode: unaffordable vs affordable.
     let vacant = LotInfo {

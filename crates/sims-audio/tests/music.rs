@@ -225,16 +225,57 @@ fn music_volume_slider_follows_191_volume_steps_and_mixes() {
 #[test]
 fn missing_or_corrupt_track_records_fault_and_falls_back_to_next() {
     let mut catalog = ModeCatalog::empty();
-    catalog.insert(MusicMode::Buy, vec!["bad.mp3".into(), "good.wav".into()]);
+    catalog.insert(
+        MusicMode::Buy,
+        vec!["bad1.mp3".into(), "bad2.mp3".into(), "good.wav".into()],
+    );
     let mut files = BTreeMap::new();
-    files.insert("bad.mp3".into(), b"not-a-valid-mp3".to_vec());
-    files.insert("good.wav".into(), make_wav(RATE, 2, 512, 4_000));
+    files.insert("bad1.mp3".into(), b"not-a-valid-mp3".to_vec());
+    files.insert("bad2.mp3".into(), b"also-invalid".to_vec());
+    files.insert("good.wav".into(), make_wav(RATE, 2, 128, 4_000));
 
-    let mut player = ModeMusicPlayer::new(catalog, files, 3);
+    // Seed 0 with 2 bad tracks + 1 good track must never stall across multiple cycles.
+    let mut player = ModeMusicPlayer::new(catalog, files, 0);
+    player.set_crossfade_ms(0);
     player.set_mode(MusicMode::Buy);
     assert_eq!(player.current_track(), Some("good.wav"));
-    let out = player.render_stereo(32);
-    assert!(out.iter().any(|&s| s != 0));
+    for _ in 0..8 {
+        let out = player.render_stereo(140);
+        assert!(out.iter().any(|&s| s != 0));
+        assert_eq!(player.current_track(), Some("good.wav"));
+    }
+}
+
+#[test]
+fn low_output_rate_and_expansion_return_from_family_bin() {
+    let mut catalog = ModeCatalog::empty();
+    catalog.insert(MusicMode::Downtown, vec!["dt.wav".into()]);
+    catalog.insert(MusicMode::Neighborhood, vec!["nb.wav".into()]);
+    let mut files = BTreeMap::new();
+    files.insert(
+        "dt.wav".into(),
+        make_wav(RATE, 2, RATE as usize * 10, 6_000),
+    );
+    files.insert("nb.wav".into(), make_wav(RATE, 2, RATE as usize * 2, 3_000));
+
+    // Very low output rate (1 Hz) over a 22.05 kHz constant WAV must not drop frames.
+    let mut low = ModeMusicPlayer::with_rate(catalog.clone(), files.clone(), 1, 1);
+    low.set_crossfade_ms(0);
+    low.set_mode(MusicMode::Downtown);
+    let out = low.render_stereo(6);
+    assert!(
+        out.iter().all(|&s| s != 0),
+        "low output rate dropped frames: {out:?}"
+    );
+
+    // Downtown -> FamilyBin -> Neighborhood keeps Downtown's active_station intact.
+    let mut player = ModeMusicPlayer::new(catalog, files, 1);
+    player.set_mode(MusicMode::Downtown);
+    assert_eq!(player.active_station(), Some(MusicMode::Downtown));
+    player.set_mode(MusicMode::FamilyBin);
+    player.set_mode(MusicMode::Neighborhood);
+    assert_eq!(player.active_station(), Some(MusicMode::Downtown));
+    assert_eq!(player.current_track(), Some("dt.wav"));
 }
 
 #[test]

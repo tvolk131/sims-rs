@@ -726,10 +726,17 @@ impl LotPopupLayout {
         let font = art.font(10).or_else(|| art.font(12));
         let line_height = font.map_or(14, |f| f.line_height.max(1));
 
+        let fw = i32::try_from(frame_size[0]).unwrap_or(i32::MAX).max(0);
+        let fh = i32::try_from(frame_size[1]).unwrap_or(i32::MAX).max(0);
+        let top_limit = BAR_HEIGHT.min(fh);
+        let avail_h = (fh - top_limit).max(0);
+
         let first_line = text.lines().next().unwrap_or("");
+        let max_text_w = (fw - POPUP_PAD.min(fw / 4) * 2).clamp(1, POPUP_MAX_TEXT_W);
+        let min_text_w = POPUP_MIN_TEXT_W.min(max_text_w);
         let mut text_w = font
             .map_or((first_line.len() as i32) * 7, |f| f.width(first_line))
-            .clamp(POPUP_MIN_TEXT_W, POPUP_MAX_TEXT_W);
+            .clamp(min_text_w, max_text_w);
 
         let portrait_count = lot.occupant.as_ref().map_or(0, |occ| occ.portraits.len());
 
@@ -738,16 +745,17 @@ impl LotPopupLayout {
         let mut lines = Vec::new();
         let mut total_w = 0;
         let mut total_h = 0;
-        let mut per_row = 1usize;
 
         for attempt in 0..=2 {
-            text_w = text_w.clamp(POPUP_MIN_TEXT_W, POPUP_MAX_TEXT_W);
+            text_w = text_w.clamp(min_text_w, max_text_w);
             lines = break_popup_lines(&text, text_w, font);
             let text_h = (lines.len() as i32).max(1).saturating_mul(line_height);
-            total_w = text_w + POPUP_PAD * 2;
-            total_h = text_h + POPUP_PAD * 2;
+            let pad_x = POPUP_PAD.min((fw - text_w).max(0) / 2);
+            let pad_y = POPUP_PAD.min(avail_h / 4);
+            total_w = text_w + pad_x * 2;
+            total_h = text_h + pad_y * 2;
             if portrait_count > 0 {
-                per_row = ((total_w - POPUP_PAD * 2) / POPUP_PORTRAIT_SIZE).max(1) as usize;
+                let per_row = ((total_w - pad_x * 2) / POPUP_PORTRAIT_SIZE).max(1) as usize;
                 total_h += POPUP_PORTRAIT_GAP;
                 if portrait_count <= per_row {
                     total_h += POPUP_PORTRAIT_SIZE;
@@ -761,11 +769,6 @@ impl LotPopupLayout {
             text_w = (text_w * 3) / 2;
         }
 
-        let fw = i32::try_from(frame_size[0]).unwrap_or(i32::MAX).max(0);
-        let fh = i32::try_from(frame_size[1]).unwrap_or(i32::MAX).max(0);
-        let top_limit = BAR_HEIGHT.min(fh);
-        let avail_h = (fh - top_limit).max(0);
-
         let clamped_w = total_w.min(fw);
         let clamped_h = total_h.min(avail_h);
 
@@ -778,26 +781,45 @@ impl LotPopupLayout {
         let rect = Rect::new(x, y, clamped_w, clamped_h);
         let pad_x = POPUP_PAD.min(clamped_w / 4);
         let pad_y = POPUP_PAD.min(clamped_h / 4);
+        let inner_w = (rect.width - pad_x * 2).max(0);
+        if inner_w > 0 && inner_w < text_w {
+            lines = break_popup_lines(&text, inner_w, font);
+        }
+
+        let mut portrait_rects = Vec::with_capacity(portrait_count);
+        let mut reserved_portrait_h = 0;
+        if portrait_count > 0 && inner_w >= POPUP_PORTRAIT_SIZE && rect.height > pad_y * 2 {
+            let eff_per_row = (inner_w / POPUP_PORTRAIT_SIZE).max(1) as usize;
+            let want_rows = if portrait_count > eff_per_row { 2 } else { 1 };
+            let min_text_h = line_height.min((rect.height - pad_y * 2).max(0));
+            let room_for_portraits =
+                (rect.height - pad_y * 2 - min_text_h - POPUP_PORTRAIT_GAP).max(0);
+            let fit_rows = (room_for_portraits / POPUP_PORTRAIT_SIZE).min(want_rows);
+            if fit_rows > 0 {
+                reserved_portrait_h = fit_rows * POPUP_PORTRAIT_SIZE + POPUP_PORTRAIT_GAP;
+                let bottom = rect.y + rect.height - pad_y;
+                let row0_y = bottom - fit_rows * POPUP_PORTRAIT_SIZE;
+                for i in 0..portrait_count.min(eff_per_row * fit_rows as usize) {
+                    let row = (i / eff_per_row) as i32;
+                    let col = (i % eff_per_row) as i32;
+                    let px = rect.x + pad_x + col * POPUP_PORTRAIT_SIZE;
+                    let py = row0_y + row * POPUP_PORTRAIT_SIZE;
+                    portrait_rects.push(Rect::new(
+                        px,
+                        py,
+                        POPUP_PORTRAIT_SIZE,
+                        POPUP_PORTRAIT_SIZE,
+                    ));
+                }
+            }
+        }
+
         let text_rect = Rect::new(
             rect.x + pad_x,
             rect.y + pad_y,
-            (rect.width - pad_x * 2).max(0),
-            (rect.height - pad_y * 2).max(0),
+            inner_w,
+            (rect.height - pad_y * 2 - reserved_portrait_h).max(0),
         );
-
-        let mut portrait_rects = Vec::with_capacity(portrait_count);
-        if portrait_count > 0 && rect.width > pad_x * 2 && rect.height > pad_y * 2 {
-            let rows = if portrait_count > per_row { 2 } else { 1 };
-            let bottom = rect.y + rect.height - pad_y;
-            let row0_y = bottom - rows * POPUP_PORTRAIT_SIZE;
-            for i in 0..portrait_count.min(per_row * 2) {
-                let row = (i / per_row) as i32;
-                let col = (i % per_row) as i32;
-                let px = rect.x + pad_x + col * POPUP_PORTRAIT_SIZE;
-                let py = row0_y + row * POPUP_PORTRAIT_SIZE;
-                portrait_rects.push(Rect::new(px, py, POPUP_PORTRAIT_SIZE, POPUP_PORTRAIT_SIZE));
-            }
-        }
 
         Self {
             rect,
