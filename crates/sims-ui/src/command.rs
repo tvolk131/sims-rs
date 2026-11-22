@@ -145,6 +145,9 @@ pub enum Command {
     /// Return from Buy Mode subcategories to top-level categories (`0x50633e`,
     /// presentation only).
     BuyBack,
+    /// Toggle Buy Mode catalog sort order between By-Function and By-Room
+    /// (`0x53a2c3`, `0x4cf3af`, presentation only).
+    BuyToggleSort,
     /// Step the Buy Mode catalog grid page by `-1` or `+1` (`0x50633e`,
     /// presentation only).
     BuyPage(i32),

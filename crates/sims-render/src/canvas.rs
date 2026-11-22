@@ -343,7 +343,20 @@ impl Canvas {
         light: Light,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
-        self.blit(image, at, flip, |_, _| light, 0, depth);
+        self.blit(image, at, flip, |_, _, rgb| light.apply(rgb), 0, depth);
+    }
+
+    /// Draws an image through the original's red-tinted blocked-placement
+    /// palette (`0x42242f` → `0x4b44eb(1)` → `0x4c76d1` → `0x4b9425(3, 0.9)`
+    /// → `0x49bd78`), used for invalid Buy Mode previews.
+    pub fn draw_tinted(
+        &mut self,
+        image: &Image,
+        at: [i32; 2],
+        flip: bool,
+        depth: impl Fn(i32, i32, u8) -> Option<i32>,
+    ) {
+        self.blit(image, at, flip, |_, _, rgb| tint_blocked(rgb), 0, depth);
     }
 
     /// Draws an image whose light changes from pixel to pixel: `light`
@@ -356,7 +369,14 @@ impl Canvas {
         light: impl Fn(usize, usize) -> Light,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
-        self.blit(image, at, false, light, 0, depth);
+        self.blit(
+            image,
+            at,
+            false,
+            |ix, iy, rgb| light(ix, iy).apply(rgb),
+            0,
+            depth,
+        );
     }
 
     /// Draws a wall: as [`Canvas::draw_lit`], but a pixel up to one unit
@@ -381,7 +401,14 @@ impl Canvas {
         light: impl Fn(usize, usize) -> Light,
         depth: impl Fn(i32, i32) -> i32,
     ) {
-        self.blit(image, at, false, light, 1, |x, y, _| Some(depth(x, y)));
+        self.blit(
+            image,
+            at,
+            false,
+            |ix, iy, rgb| light(ix, iy).apply(rgb),
+            1,
+            |x, y, _| Some(depth(x, y)),
+        );
     }
 
     /// Draws an image whose pixels each take their depth from `depth`
@@ -395,7 +422,7 @@ impl Canvas {
         light: Light,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
-        self.blit(image, at, false, |_, _| light, 1, depth);
+        self.blit(image, at, false, |_, _, rgb| light.apply(rgb), 1, depth);
     }
 
     /// Like [`Canvas::draw_layered`], clipped horizontally to screen columns
@@ -408,7 +435,15 @@ impl Canvas {
         columns: Option<[i32; 2]>,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
-        self.blit_clipped(image, at, false, |_, _| light, 1, columns, depth);
+        self.blit_clipped(
+            image,
+            at,
+            false,
+            |_, _, rgb| light.apply(rgb),
+            1,
+            columns,
+            depth,
+        );
     }
 
     /// Like [`Canvas::draw_lit`], clipped horizontally to screen columns
@@ -572,11 +607,11 @@ impl Canvas {
         image: &Image,
         at: [i32; 2],
         flip: bool,
-        light: impl Fn(usize, usize) -> Light,
+        color: impl Fn(usize, usize, [u8; 3]) -> [u8; 3],
         slack: i32,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
-        self.blit_clipped(image, at, flip, light, slack, None, depth);
+        self.blit_clipped(image, at, flip, color, slack, None, depth);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -585,7 +620,7 @@ impl Canvas {
         image: &Image,
         at: [i32; 2],
         flip: bool,
-        light: impl Fn(usize, usize) -> Light,
+        color: impl Fn(usize, usize, [u8; 3]) -> [u8; 3],
         slack: i32,
         columns: Option<[i32; 2]>,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
@@ -652,7 +687,7 @@ impl Canvas {
                     if d > dst_depth[offset].saturating_add(slack) {
                         continue;
                     }
-                    let rgb = light(ix, iy).apply([rgba[si], rgba[si + 1], rgba[si + 2]]);
+                    let rgb = color(ix, iy, [rgba[si], rgba[si + 1], rgba[si + 2]]);
                     dst_depth[offset] = d.clamp(0, EMPTY);
                     dst_ids[offset] = pen;
                     if a == 255 {
@@ -682,7 +717,7 @@ impl Canvas {
                     if d > self.depth[target].saturating_add(slack) {
                         continue;
                     }
-                    let rgb = light(ix, iy).apply([rgba[si], rgba[si + 1], rgba[si + 2]]);
+                    let rgb = color(ix, iy, [rgba[si], rgba[si + 1], rgba[si + 2]]);
                     let pixel = &mut self.color[target];
                     self.depth[target] = d.clamp(0, EMPTY);
                     self.ids[target] = pen;
@@ -1070,6 +1105,17 @@ pub fn quantize565([r, g, b]: [u8; 3]) -> [u8; 3] {
     ]
 }
 
+/// Red-tinted blocked-placement palette transform (`0x42242f` → `0x4b44eb(1)`
+/// → `0x4c76d1` → `0x4b9425(3, 0.9)` → `0x49bd78`): converts `rgb` to a
+/// 0.9× grayscale luminance `gray`, boosts the red channel by `+0x30`, and
+/// packs the result through the display's 16-bit RGB565 palette (`0x4b9425`).
+pub fn tint_blocked([r, g, b]: [u8; 3]) -> [u8; 3] {
+    let sum = f32::from(r) + f32::from(g) + f32::from(b);
+    let gray = ((sum * (1.0_f32 / 3.0) * 0.9_f32 + 0.5_f32).trunc() as i32).clamp(0, 255);
+    let red = (gray + 0x30).clamp(0, 255);
+    quantize565([red as u8, gray as u8, gray as u8])
+}
+
 /// The original's 32 × 32 × 32 5-bit alpha-blend table (`0x6e5eac`),
 /// filled once at start-up by `0x49a315..0x49a41c`.
 ///
@@ -1396,6 +1442,25 @@ mod tests {
         let mut c = Canvas::new(1, 1, [0, 0, 0]);
         c.draw_lit(&wall, [0, 0], false, Light::FULL, |_, _, _| None);
         assert_eq!(c, Canvas::new(1, 1, [0, 0, 0]));
+    }
+
+    #[test]
+    fn blocked_preview_tint_matches_native_0x49bd78() {
+        // Exact `0x49bd78` formula with intensity 0.9 packed through native
+        // `0x4b9425` RGB565 palette storage:
+        // gray = ((r + g + b) * (1/3) * 0.9 + 0.5).trunc(), red = min(255, gray + 0x30).
+        assert_eq!(tint_blocked([0, 0, 0]), quantize565([0x30, 0, 0]));
+        assert_eq!(tint_blocked([255, 255, 255]), quantize565([255, 230, 230]));
+        assert_eq!(tint_blocked([90, 120, 150]), quantize565([156, 108, 108]));
+        let mut c = Canvas::new(1, 1, [0, 0, 0]);
+        c.draw_tinted(
+            &image(1, 1, [90, 120, 150, 255], None),
+            [0, 0],
+            false,
+            |_, _, _| Some(5),
+        );
+        assert_eq!(c.color[0], quantize565([156, 108, 108]));
+        assert_eq!(c.depth[0], 5);
     }
 
     #[test]

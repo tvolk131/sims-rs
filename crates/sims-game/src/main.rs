@@ -404,8 +404,24 @@ impl App {
                 self.changed(true);
                 return;
             }
+            Key::Named(NamedKey::F1) => {
+                self.game.set_mode(sims_ui::command::Mode::Live);
+                self.changed(true);
+                return;
+            }
+            Key::Named(NamedKey::F2) => {
+                self.game.set_mode(sims_ui::command::Mode::Buy);
+                self.changed(true);
+                return;
+            }
             Key::Named(NamedKey::F5) => return self.save(false),
             Key::Named(NamedKey::F9) => return self.save(true),
+            Key::Named(NamedKey::Delete | NamedKey::Backspace) => {
+                if self.game.sell_held() {
+                    self.changed(true);
+                }
+                return;
+            }
             Key::Character(c) => {
                 if self.ctrl_or_cmd_held {
                     match c.as_str() {
@@ -442,6 +458,18 @@ impl App {
                             return;
                         }
                         Move::Rotate(true)
+                    }
+                    "x" | "X" => {
+                        if self.game.page_buy(1) {
+                            self.changed(true);
+                        }
+                        return;
+                    }
+                    "z" | "Z" => {
+                        if self.game.page_buy(-1) {
+                            self.changed(true);
+                        }
+                        return;
                     }
                     "1" => Move::Walls(Walls::Up),
                     "2" => Move::Walls(Walls::Cutaway),
@@ -725,14 +753,18 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if event.logical_key == Key::Named(NamedKey::Escape) {
-                    // Escape closes the pie menu, else quits. A repeat
-                    // does neither, so holding Escape to close a menu does
-                    // not quit.
-                    if event.repeat {
-                    } else if self.game.close_menu() || self.game.cancel_buy() {
-                        self.changed(true);
-                    } else {
-                        event_loop.exit();
+                    // Escape closes the pie menu or cancels Buy Mode, else
+                    // quits. A repeat does neither, and a refused Buy snapback
+                    // keeps the cursor open so the user sees the error instead
+                    // of exiting.
+                    if !event.repeat {
+                        let closed = self.game.close_menu();
+                        let cancelled = !closed && self.game.cancel_buy();
+                        if escape_exits(closed, cancelled, self.game.buy_cursor().is_some()) {
+                            event_loop.exit();
+                        } else {
+                            self.changed(true);
+                        }
                     }
                 } else {
                     self.key(&event.logical_key);
@@ -898,6 +930,13 @@ fn slot(house: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Whether a non-repeat Escape press should exit the desktop window.
+/// Closing a pie menu, cancelling Buy Mode, or keeping an active Buy cursor
+/// after a refused snapback all consume Escape instead of quitting.
+fn escape_exits(closed_menu: bool, cancelled_buy: bool, has_buy_cursor: bool) -> bool {
+    !closed_menu && !cancelled_buy && !has_buy_cursor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,5 +1042,13 @@ mod tests {
                 assert_eq!(got, want, "scale={scale} bw={bw} bh={bh}");
             }
         }
+    }
+
+    #[test]
+    fn escape_does_not_exit_when_buy_snapback_is_refused() {
+        assert!(!escape_exits(true, false, false));
+        assert!(!escape_exits(false, true, false));
+        assert!(!escape_exits(false, false, true));
+        assert!(escape_exits(false, false, false));
     }
 }

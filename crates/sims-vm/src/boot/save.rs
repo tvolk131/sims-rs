@@ -170,6 +170,9 @@ impl Lot {
         if self.halted {
             return Err(SaveError::Halted);
         }
+        let cursor = cursor
+            .filter(|c| self.is_active_buy_cursor(c))
+            .or_else(|| self.active_buy_cursor.as_ref().map(|a| &a.cursor));
         let mut world = self.world.clone();
         let has_history =
             !self.buy_redo.is_empty() || !self.buy_undo.is_empty() || !self.buy_orphans.is_empty();
@@ -185,19 +188,26 @@ impl Lot {
                     crate::interpreter::Stream::Global,
                 )
             };
-            // Strip any unpaid Buy preview first so an item linked into an
-            // undone surface container's slot is cleanly unlinked and deleted
-            // before detached history objects are purged.
+            // Strip any active Buy preview (or snap back any held existing
+            // furniture) first so a saved lot never serializes an unpaid item,
+            // a `"Tile Cursor"`, or a held/hidden paid object stranded off-lot,
+            // and never double-deletes a preview linked in a detached surface.
             if let Some(cursor) = cursor {
-                interpreter.buy_cancel(&mut world, cursor).map_err(|e| {
+                let live = self.strip_detached_origin_children(cursor);
+                interpreter.buy_cancel(&mut world, &live).map_err(|e| {
                     SaveError::Format(format!("clearing Buy Mode preview for save: {e}"))
                 })?;
             }
             if has_history {
+                let empty = std::collections::BTreeSet::new();
                 interpreter
-                    .buy_purge_detached(&mut world, &self.buy_redo)
-                    .and_then(|()| interpreter.buy_purge_detached(&mut world, &self.buy_undo))
-                    .and_then(|()| interpreter.buy_purge_detached(&mut world, &self.buy_orphans))
+                    .buy_purge_detached(&mut world, &self.buy_redo, &empty)
+                    .and_then(|()| {
+                        interpreter.buy_purge_detached(&mut world, &self.buy_undo, &empty)
+                    })
+                    .and_then(|()| {
+                        interpreter.buy_purge_detached(&mut world, &self.buy_orphans, &empty)
+                    })
                     .map_err(|e| {
                         SaveError::Format(format!("clearing detached Buy Mode redo objects: {e}"))
                     })?;
@@ -255,6 +265,7 @@ impl Lot {
         self.buy_undo.clear();
         self.buy_redo.clear();
         self.buy_orphans.clear();
+        self.active_buy_cursor = None;
         Ok(())
     }
 }

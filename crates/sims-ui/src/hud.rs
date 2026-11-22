@@ -676,7 +676,14 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
     };
     let mode = |m: Mode| {
         if controls.mode == m {
-            Command::TogglePanel
+            // 0x53a2c3 -> 0x4cf3af: pressing Buy while already in Buy Mode
+            // toggles the catalog sort (ByFunction <-> ByRoom) rather than
+            // collapsing the strip.
+            if m == Mode::Buy {
+                Command::BuyToggleSort
+            } else {
+                Command::TogglePanel
+            }
         } else {
             Command::SetMode(m)
         }

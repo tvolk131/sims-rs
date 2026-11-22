@@ -8,7 +8,7 @@ use crate::frame::{Frame, Rect};
 use crate::hud::STRIP;
 use crate::thumbnail::{SIZE as CELL, TEMPLATE, Thumbnails};
 use sims_content::ui_graphics::US_ENGLISH;
-use sims_content::{Catalog, Index};
+use sims_content::{Catalog, Index, Install};
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 
@@ -78,6 +78,17 @@ impl BuyState {
                     false
                 }
             }
+            Command::BuyToggleSort => {
+                self.sort = match self.sort {
+                    BuySort::ByFunction => BuySort::ByRoom,
+                    BuySort::ByRoom => BuySort::ByFunction,
+                };
+                self.category = None;
+                self.subcategory = 0;
+                self.page = 0;
+                self.selected = None;
+                true
+            }
             Command::BuyPage(delta) => {
                 let next = if delta < 0 {
                     self.page.saturating_sub(delta.unsigned_abs() as usize)
@@ -111,6 +122,204 @@ pub struct BuyItem {
     pub function_subsort: u16,
     /// OBJD `+0x8a` (word 69): nonzero for Build-mode catalog objects.
     pub build_mode_type: i16,
+    /// OBJD `+0xa4..+0xb0` (words 82..88): Hunger, Comfort, Hygiene, Bladder,
+    /// Energy, Fun, Room motive ratings (`0x457a36` cases `0..7`).
+    pub ratings: [i16; 7],
+    /// OBJD `+0xb2` low 7 bits: Cooking, Mechanical, Logic, Body, Creativity,
+    /// Charisma, Study skill/activity flags (`0x457a36` cases `7..14`).
+    pub skill_flags: u8,
+}
+
+/// Catalog popup rating labels loaded from `GameData/UIText.iff STR# 160`
+/// (`0x508168` → `0x50845d`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RatingLabels {
+    labels: [String; 14],
+}
+
+impl Default for RatingLabels {
+    fn default() -> Self {
+        Self {
+            labels: [
+                "Hunger: %d".into(),
+                "Comfort: %d".into(),
+                "Hygiene: %d".into(),
+                "Bladder: %d".into(),
+                "Energy: %d".into(),
+                "Fun: %d".into(),
+                "Room: %d".into(),
+                "+ Cooking".into(),
+                "+ Mechanical".into(),
+                "+ Logic".into(),
+                "+ Body".into(),
+                "+ Creativity".into(),
+                "+ Charisma".into(),
+                "+ Study".into(),
+            ],
+        }
+    }
+}
+
+impl RatingLabels {
+    /// Reads `STR# 160` (`0xa0`) from `GameData/UIText.iff`, falling back to
+    /// built-in US English strings for any missing entry.
+    pub fn load(install: &Install) -> Self {
+        let mut out = Self::default();
+        let Ok(path) = install.file("GameData/UIText.iff") else {
+            return out;
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return out;
+        };
+        let Ok(iff) = Iff::parse(bytes) else {
+            return out;
+        };
+        let Some(chunk) = iff.get(b"STR#", 160) else {
+            return out;
+        };
+        let Ok(table) = StringTable::parse(iff.data(chunk)) else {
+            return out;
+        };
+        let us: Vec<&str> = table
+            .entries
+            .iter()
+            .filter(|e| e.language == US_ENGLISH)
+            .map(|e| e.text.as_str())
+            .collect();
+        for (i, slot) in out.labels.iter_mut().enumerate() {
+            if let Some(&text) = us.get(i)
+                && !text.is_empty()
+            {
+                *slot = text.to_owned();
+            }
+        }
+        out
+    }
+
+    /// Formats all nonzero motive ratings and set skill flags for `item`
+    /// (`0x50845d` loop `0..0xe`).
+    pub fn format(&self, item: &BuyItem) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (i, &val) in item.ratings.iter().enumerate() {
+            if val != 0 {
+                lines.push(self.labels[i].replace("%d", &val.to_string()));
+            }
+        }
+        for bit in 0..7 {
+            if (item.skill_flags & (1u8 << bit)) != 0 {
+                lines.push(self.labels[7 + bit].clone());
+            }
+        }
+        lines
+    }
+}
+
+/// Buy Mode sell/dispose prompt templates loaded from `GameData/UIText.iff STR# 136`
+/// (`0x50a343`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SellLabels {
+    /// Entry 0: free disposal (`can_delete && refund == 0`).
+    pub dispose: String,
+    /// Entry 1: paid sale (`can_delete && refund > 0`).
+    pub sell: String,
+    /// Entry 2: non-deletable (`!can_delete`).
+    pub cannot_delete: String,
+}
+
+impl Default for SellLabels {
+    fn default() -> Self {
+        Self {
+            dispose: "Press \"Delete\" or click here \r\nto dispose of %.".into(),
+            sell: "Press \"Delete\" or click here \r\nto sell % for $.".into(),
+            cannot_delete: "% cannot be deleted.".into(),
+        }
+    }
+}
+
+impl SellLabels {
+    /// Reads `STR# 136` (`0x88`) from `GameData/UIText.iff`, falling back to
+    /// built-in US English templates for any missing entry.
+    pub fn load(install: &Install) -> Self {
+        let mut out = Self::default();
+        let Ok(path) = install.file("GameData/UIText.iff") else {
+            return out;
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return out;
+        };
+        let Ok(iff) = Iff::parse(bytes) else {
+            return out;
+        };
+        let Some(chunk) = iff.get(b"STR#", 136) else {
+            return out;
+        };
+        let Ok(table) = StringTable::parse(iff.data(chunk)) else {
+            return out;
+        };
+        let us: Vec<&str> = table
+            .entries
+            .iter()
+            .filter(|e| e.language == US_ENGLISH)
+            .map(|e| e.text.as_str())
+            .collect();
+        if let Some(&text) = us.first()
+            && !text.is_empty()
+        {
+            out.dispose = text.to_owned();
+        }
+        if let Some(&text) = us.get(1)
+            && !text.is_empty()
+        {
+            out.sell = text.to_owned();
+        }
+        if let Some(&text) = us.get(2)
+            && !text.is_empty()
+        {
+            out.cannot_delete = text.to_owned();
+        }
+        out
+    }
+
+    /// Formats the sell/dispose/cannot-delete prompt lines for `info`
+    /// (`0x50a343`, substituting `%` with the object name and `$` with
+    /// `$<refund>` — rendered as `§` by the Sims UI font).
+    pub fn format(&self, info: &SellInfo) -> Vec<String> {
+        let template = if !info.can_delete {
+            &self.cannot_delete
+        } else if info.refund > 0 {
+            &self.sell
+        } else {
+            &self.dispose
+        };
+        let price = format!("${}", info.refund);
+        let mut rendered = String::with_capacity(template.len() + info.name.len() + price.len());
+        for ch in template.chars() {
+            match ch {
+                '%' => rendered.push_str(&info.name),
+                '$' => rendered.push_str(&price),
+                other => rendered.push(other),
+            }
+        }
+        rendered
+            .split('\n')
+            .map(|line| line.trim_end_matches(['\r', ' ']).to_owned())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+}
+
+/// Information about a picked-up existing lot object needed to build the Buy
+/// Mode sell prompt (`0x487d7a` → `0x4cf90b` → `0x50a343`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SellInfo {
+    /// Catalog master GUID (or object GUID fallback) for the thumbnail icon.
+    pub guid: u32,
+    /// Display name of the held object.
+    pub name: String,
+    /// Depreciated resale value (`0x43219a`).
+    pub refund: i32,
+    /// Whether `CanDelete` (`0x435440` / `0x423135`) permits deleting/selling.
+    pub can_delete: bool,
 }
 
 /// All residential-buyable objects from an install, sorted by `(price, name)`
@@ -118,9 +327,15 @@ pub struct BuyItem {
 #[derive(Debug, Clone, Default)]
 pub struct BuyCatalog {
     items: Vec<BuyItem>,
+    /// Maps each non-master part GUID of a multi-tile object to its master OBJD GUID.
+    master_by_part: std::collections::BTreeMap<u32, u32>,
+    /// Display names for non-catalog objects (e.g. `room_sort == 0`) read from CTSS/OBJD.
+    fallback_names: std::collections::BTreeMap<u32, String>,
+    rating_labels: RatingLabels,
+    sell_labels: SellLabels,
 }
 
-/// OBJD byte offsets read by `0x4cd149` and `0x4cb8e7..0x4cb979`.
+/// OBJD byte offsets read by `0x4cd149`, `0x4cb8e7..0x4cb979`, and `0x457a36`.
 const OBJD_GRAPHICS: usize = 0x08;
 const OBJD_TTAB: usize = 0x0e;
 const OBJD_TYPE: usize = 0x12;
@@ -131,6 +346,8 @@ const OBJD_ROOM_SORT: usize = 0x4e;
 const OBJD_FUNC_SORT: usize = 0x50;
 const OBJD_CTSS: usize = 0x52;
 const OBJD_BUILD_TYPE: usize = 0x8a;
+const OBJD_RATING_BASE: usize = 0xa4;
+const OBJD_RATING_SKILLS: usize = 0xb2;
 const OBJD_FUNC_SUBSORT: usize = 0xbc;
 
 /// Object type 2 is a person (excluded at `0x4575d2`).
@@ -241,6 +458,8 @@ impl BuyCatalog {
     /// (`0x4cd149`, `0x4cd9a5`).
     pub fn load(index: &Index, catalog: &Catalog) -> Self {
         let mut items = Vec::new();
+        let mut master_by_part = std::collections::BTreeMap::new();
+        let mut fallback_names = std::collections::BTreeMap::new();
         // Cache parsed IFF files per resource index so multi-OBJD archives
         // are parsed once.
         let mut by_resource: std::collections::BTreeMap<usize, Vec<(u32, u16)>> =
@@ -266,6 +485,9 @@ impl BuyCatalog {
             let Ok(iff) = Iff::parse(bytes) else {
                 continue;
             };
+            let mut master_guids: std::collections::BTreeMap<i16, u32> =
+                std::collections::BTreeMap::new();
+            let mut part_masters: Vec<(u32, i16)> = Vec::new();
             for (guid, chunk_id) in entries {
                 let Some(chunk) = iff.get(b"OBJD", chunk_id) else {
                     continue;
@@ -273,6 +495,13 @@ impl BuyCatalog {
                 let data = iff.data(chunk);
                 let master = read_i16(data, OBJD_MASTER);
                 let sub_index = read_i16(data, OBJD_SUB_INDEX);
+                if master != 0 {
+                    if sub_index == -1 {
+                        master_guids.insert(master, guid);
+                    } else {
+                        part_masters.push((guid, master));
+                    }
+                }
                 // 0x4575b8: skip non-master tiles of multi-tile objects.
                 if master != 0 && sub_index != -1 {
                     continue;
@@ -281,22 +510,6 @@ impl BuyCatalog {
                 if kind == PERSON_TYPE {
                     continue;
                 }
-                // 0x4cb905: residential Buy Mode requires room_sort != 0.
-                let room_sort = read_i16(data, OBJD_ROOM_SORT) as u16;
-                if room_sort == 0 {
-                    continue;
-                }
-                // 0x457588 / 0x4575a1: needs graphics (master != 0 ||
-                // base_graphic_id != 0) or an interaction table.
-                let graphics = read_i16(data, OBJD_GRAPHICS);
-                let ttab = read_i16(data, OBJD_TTAB);
-                if master == 0 && graphics == 0 && ttab <= 0 {
-                    continue;
-                }
-                let price = i32::from(read_i16(data, OBJD_PRICE));
-                let function_sort = read_i16(data, OBJD_FUNC_SORT) as u16;
-                let function_subsort = read_i16(data, OBJD_FUNC_SUBSORT) as u16;
-                let build_mode_type = read_i16(data, OBJD_BUILD_TYPE);
                 let ctss_id = read_i16(data, OBJD_CTSS);
                 let (mut name, description, mut raw_name) = read_ctss(&iff, ctss_id);
                 // 0x457d3b: when the catalog string table is missing or its
@@ -305,6 +518,27 @@ impl BuyCatalog {
                     name = chunk.label.clone();
                     raw_name = cp1252_bytes(&chunk.label);
                 }
+                // 0x4cb905: residential Buy Mode requires room_sort != 0.
+                let room_sort = read_i16(data, OBJD_ROOM_SORT) as u16;
+                // 0x457588 / 0x4575a1: needs graphics (master != 0 ||
+                // base_graphic_id != 0) or an interaction table.
+                let graphics = read_i16(data, OBJD_GRAPHICS);
+                let ttab = read_i16(data, OBJD_TTAB);
+                if room_sort == 0 || (master == 0 && graphics == 0 && ttab <= 0) {
+                    if !name.is_empty() {
+                        fallback_names.insert(guid, name);
+                    }
+                    continue;
+                }
+                let price = i32::from(read_i16(data, OBJD_PRICE));
+                let function_sort = read_i16(data, OBJD_FUNC_SORT) as u16;
+                let function_subsort = read_i16(data, OBJD_FUNC_SUBSORT) as u16;
+                let build_mode_type = read_i16(data, OBJD_BUILD_TYPE);
+                let mut ratings = [0i16; 7];
+                for (i, slot) in ratings.iter_mut().enumerate() {
+                    *slot = read_i16(data, OBJD_RATING_BASE + i * 2);
+                }
+                let skill_flags = data.get(OBJD_RATING_SKILLS).copied().unwrap_or(0) & 0x7f;
                 items.push((
                     raw_name,
                     BuyItem {
@@ -316,8 +550,15 @@ impl BuyCatalog {
                         function_sort,
                         function_subsort,
                         build_mode_type,
+                        ratings,
+                        skill_flags,
                     },
                 ));
+            }
+            for (part_guid, master_id) in part_masters {
+                if let Some(&master_guid) = master_guids.get(&master_id) {
+                    master_by_part.insert(part_guid, master_guid);
+                }
             }
         }
 
@@ -332,7 +573,23 @@ impl BuyCatalog {
 
         Self {
             items: items.into_iter().map(|(_, item)| item).collect(),
+            master_by_part,
+            fallback_names,
+            rating_labels: RatingLabels::default(),
+            sell_labels: SellLabels::default(),
         }
+    }
+
+    /// Attaches localized `UIText.iff STR# 160` rating labels to this catalog.
+    pub fn with_rating_labels(mut self, rating_labels: RatingLabels) -> Self {
+        self.rating_labels = rating_labels;
+        self
+    }
+
+    /// Attaches localized `UIText.iff STR# 136` sell prompt labels to this catalog.
+    pub fn with_sell_labels(mut self, sell_labels: SellLabels) -> Self {
+        self.sell_labels = sell_labels;
+        self
     }
 
     /// Constructs a catalog from explicit items (for unit tests).
@@ -343,12 +600,46 @@ impl BuyCatalog {
                 .then_with(|| cp1252_bytes(&a.name).cmp(&cp1252_bytes(&b.name)))
                 .then_with(|| a.guid.cmp(&b.guid))
         });
-        Self { items }
+        Self {
+            items,
+            master_by_part: std::collections::BTreeMap::new(),
+            fallback_names: std::collections::BTreeMap::new(),
+            rating_labels: RatingLabels::default(),
+            sell_labels: SellLabels::default(),
+        }
     }
 
     /// Looks up an item by its catalog master GUID.
     pub fn get(&self, guid: u32) -> Option<&BuyItem> {
         self.items.iter().find(|item| item.guid == guid)
+    }
+
+    /// Resolves any multi-tile part GUID to its master OBJD GUID, returning
+    /// `guid` unchanged for single-tile or master GUIDs.
+    pub fn master_guid(&self, guid: u32) -> u32 {
+        self.master_by_part.get(&guid).copied().unwrap_or(guid)
+    }
+
+    /// Looks up the catalog master [`BuyItem`] for either a master GUID or any
+    /// non-master part GUID of a multi-tile object.
+    pub fn get_for_object(&self, guid: u32) -> Option<&BuyItem> {
+        self.get(self.master_guid(guid))
+    }
+
+    /// Resolves the master GUID and display name of any object GUID (buyable
+    /// catalog items and non-catalog objects alike).
+    pub fn display_for_object(&self, guid: u32) -> (u32, String) {
+        let master = self.master_guid(guid);
+        if let Some(item) = self.get(master) {
+            return (item.guid, item.name.clone());
+        }
+        let name = self
+            .fallback_names
+            .get(&master)
+            .or_else(|| self.fallback_names.get(&guid))
+            .cloned()
+            .unwrap_or_default();
+        (master, name)
     }
 
     /// Every residential-buyable item in catalog sort order.
@@ -417,11 +708,13 @@ pub enum BuyWidgetKind {
     },
 }
 
-/// Laid-out Buy Mode strip widgets and optional popup card.
+/// Laid-out Buy Mode strip widgets, optional popup card, and optional sell
+/// prompt (`0x487d7a` → `0x4cf90b` → `0x50a343`).
 #[derive(Debug, Clone, Default)]
 pub struct BuyLayout {
     pub widgets: Vec<BuyWidget>,
     pub popup: Option<PopupCard>,
+    pub sell_prompt: Option<SellPrompt>,
     pub page: usize,
     pub total_pages: usize,
 }
@@ -434,16 +727,35 @@ pub struct PopupCard {
     pub name: String,
     pub price: i32,
     pub description: String,
+    /// Formatted motive/skill rating entries (`0x50845d`, `STR# 160`).
+    pub ratings: Vec<String>,
+}
+
+/// Active sell/dispose/cannot-delete prompt shown in the Buy Mode catalog strip
+/// while holding an existing lot object (`0x487d7a` → `0x4cf90b` → `0x50a343`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SellPrompt {
+    pub rect: Rect,
+    pub guid: u32,
+    pub name: String,
+    pub refund: i32,
+    pub can_delete: bool,
+    pub lines: Vec<String>,
 }
 
 impl BuyLayout {
-    /// Whether any interactive Buy Mode strip widget covers `point`.
+    /// Whether any interactive Buy Mode strip widget (or the active sell
+    /// prompt target) covers `point`.
     /// The popup card is informational and mouse-transparent so moving into
     /// the house view immediately activates the placement tool (`0x487d3d`).
     pub fn covers(&self, point: [i32; 2]) -> bool {
         self.widgets
             .iter()
             .any(|w| w.rect.contains(point[0], point[1]))
+            || self
+                .sell_prompt
+                .as_ref()
+                .is_some_and(|p| p.rect.contains(point[0], point[1]))
     }
 
     /// Command emitted by pressing `point` inside the Buy Mode strip, if any.
@@ -465,8 +777,39 @@ pub fn layout(
     art: &Art,
     available_funds: i32,
 ) -> BuyLayout {
+    layout_with_sell(size, catalog, state, art, available_funds, None)
+}
+
+/// Lays out the Buy Mode strip widgets, popup card, or active Hand Tool sell
+/// prompt (`0x487d7a` → `0x4cf90b` → `0x50a343`) for a canvas of `size`.
+pub fn layout_with_sell(
+    size: [i32; 2],
+    catalog: &BuyCatalog,
+    state: &BuyState,
+    art: &Art,
+    available_funds: i32,
+    sell: Option<&SellInfo>,
+) -> BuyLayout {
     let [width, height] = size.map(|v| v.clamp(0, 1 << 15));
     let strip_y = height - STRIP;
+    if let Some(info) = sell {
+        let prompt_x = 240.min(width);
+        let prompt_w = (width - prompt_x).max(0);
+        return BuyLayout {
+            widgets: Vec::new(),
+            popup: None,
+            sell_prompt: Some(SellPrompt {
+                rect: Rect::new(prompt_x, strip_y, prompt_w, STRIP),
+                guid: info.guid,
+                name: info.name.clone(),
+                refund: info.refund,
+                can_delete: info.can_delete,
+                lines: catalog.sell_labels.format(info),
+            }),
+            page: state.page,
+            total_pages: 0,
+        };
+    }
     let btn_size = |id: i32| -> [i32; 2] {
         art.cell(id, 4, 0)
             .map(|img| [img.width as i32, img.height as i32])
@@ -609,25 +952,53 @@ pub fn layout(
         .map(|item| {
             let card_x = 240.min(width);
             let card_w = (width - card_x).max(0);
-            let card_h = 127;
+            let ratings = catalog.rating_labels.format(item);
+            // Native `0x50845d` places each formatted STR# 160 rating on its
+            // own line and expands the popup card height past 127 px to fit
+            // wrapped description lines plus all rating lines.
+            let max_w = (card_w - 190).max(40);
+            let card_h = if let Some(font) = art.font(10) {
+                let desc_lines = if item.description.is_empty() {
+                    0
+                } else {
+                    font.wrap(&item.description, max_w).len() as i32
+                };
+                let rating_lines: i32 = ratings
+                    .iter()
+                    .map(|r| font.wrap(r, max_w).len() as i32)
+                    .sum();
+                let line_step = font.line_height + 2;
+                let ratings_gap = if desc_lines > 0 && rating_lines > 0 {
+                    4
+                } else {
+                    0
+                };
+                let needed = 32 + (desc_lines + rating_lines) * line_step + ratings_gap + 10;
+                needed.max(127).min(strip_y.max(0))
+            } else {
+                127.min(strip_y.max(0))
+            };
             PopupCard {
                 rect: Rect::new(card_x, (strip_y - card_h).max(0), card_w, card_h),
                 guid: item.guid,
                 name: item.name.clone(),
                 price: item.price,
                 description: item.description.clone(),
+                ratings,
             }
         });
 
     BuyLayout {
         widgets,
         popup,
+        sell_prompt: None,
         page,
         total_pages,
     }
 }
 
-/// Draws the Buy Mode strip widgets and selected item popup card into `frame`.
+/// Draws the Buy Mode strip widgets, active sell prompt, and selected item
+/// popup card into `frame`.
 pub fn draw(
     frame: &mut Frame,
     art: &Art,
@@ -635,6 +1006,68 @@ pub fn draw(
     layout: &BuyLayout,
     pointer: Option<[i32; 2]>,
 ) {
+    if let Some(prompt) = &layout.sell_prompt {
+        // Native `0x50a343`: draw the object's isometric preview (`0x4384c8`)
+        // centered in the left portrait box (`after-sell.png`: bench spans
+        // x=264..343, y=509..590 centered at (304, 550); text at x=399, y=517),
+        // falling back to the catalog icon/thumbnail when absent.
+        let box_x = prompt.rect.x + 8;
+        let box_w = 112;
+        let box_h = prompt.rect.height.max(1);
+        if let Some(pic) = thumbnails.balloon_picture(prompt.guid, None, box_w, box_h) {
+            let draw_w = (pic.width as i32).min(box_w);
+            let draw_h = (pic.height as i32).min(box_h);
+            let src_x = ((pic.width as i32 - draw_w) / 2).max(0);
+            let src_y = ((pic.height as i32 - draw_h) / 2).max(0);
+            let dst_x = box_x + (box_w - draw_w) / 2;
+            let dst_y = prompt.rect.y + (box_h - draw_h) / 2;
+            frame.draw(pic, Rect::new(src_x, src_y, draw_w, draw_h), [dst_x, dst_y]);
+        } else if let Some(icon) = thumbnails.icon(art, prompt.guid) {
+            let draw_h = (icon.height as i32).min(prompt.rect.height);
+            let src_y = ((icon.height as i32 - draw_h) / 2).max(0);
+            let dst_y = prompt.rect.y + ((prompt.rect.height - draw_h) / 2).max(0);
+            frame.draw(
+                &icon,
+                Rect::new(0, src_y, icon.width as i32, draw_h),
+                [box_x + (box_w - icon.width as i32) / 2, dst_y],
+            );
+        } else if let Some(thumb) = thumbnails
+            .item(prompt.guid)
+            .and_then(|i| i.thumbnail.as_ref())
+        {
+            let half = if thumb.width > CELL {
+                thumb.width / 2
+            } else {
+                thumb.width
+            };
+            let dst_y = prompt.rect.y + ((prompt.rect.height - thumb.height as i32) / 2).max(0);
+            frame.draw(
+                thumb,
+                Rect::new(0, 0, half as i32, thumb.height as i32),
+                [box_x + (box_w - half as i32) / 2, dst_y],
+            );
+        }
+        if let Some(font) = art.font(10) {
+            // Native `after-sell.png`: 10pt text starts at `(399, 517)`..`526`
+            // on line 1 and `(399, 536)`..`548` on line 2 (`19` px line step).
+            let text_x = prompt.rect.x + 158;
+            let max_w = (prompt.rect.width - 170).max(40);
+            let mut wrapped = Vec::new();
+            for line in &prompt.lines {
+                wrapped.extend(font.wrap(line, max_w));
+            }
+            let line_step = 19;
+            let mut y = prompt.rect.y + 12;
+            for line in wrapped {
+                if y + font.line_height <= prompt.rect.y + prompt.rect.height {
+                    font.draw(frame, &line, [text_x, y], [235, 240, 255]);
+                }
+                y += line_step;
+            }
+        }
+        return;
+    }
+
     for widget in &layout.widgets {
         let hovered = pointer.is_some_and(|[px, py]| widget.rect.contains(px, py));
         match widget.kind {
@@ -720,9 +1153,31 @@ pub fn draw(
         if let Some(font) = art.font(10) {
             let max_w = (card.rect.width - 190).max(40);
             let mut y = card.rect.y + 32;
-            for line in font.wrap(&card.description, max_w).into_iter().take(5) {
-                font.draw(frame, &line, [text_x, y], [210, 224, 248]);
-                y += font.line_height + 2;
+            let line_step = font.line_height + 2;
+            let desc_lines = if card.description.is_empty() {
+                Vec::new()
+            } else {
+                font.wrap(&card.description, max_w)
+            };
+            let mut rating_lines = Vec::new();
+            for rating in &card.ratings {
+                rating_lines.extend(font.wrap(rating, max_w));
+            }
+            let bottom = card.rect.y + card.rect.height - 4;
+            for line in &desc_lines {
+                if y + font.line_height <= bottom {
+                    font.draw(frame, line, [text_x, y], [210, 224, 248]);
+                }
+                y += line_step;
+            }
+            if !desc_lines.is_empty() && !rating_lines.is_empty() {
+                y += 4;
+            }
+            for line in &rating_lines {
+                if y + font.line_height <= bottom {
+                    font.draw(frame, line, [text_x, y], [248, 232, 168]);
+                }
+                y += line_step;
             }
         }
     }
@@ -839,6 +1294,8 @@ mod tests {
                 function_sort: 0x01,    // Seating
                 function_subsort: 0x01, // Dining Chairs
                 build_mode_type: 0,
+                ratings: [0, 4, 0, 0, 0, 0, 1],
+                skill_flags: 0,
             },
             BuyItem {
                 guid: 0x26bf_bb29,
@@ -849,6 +1306,8 @@ mod tests {
                 function_sort: 0x01,
                 function_subsort: 0x01,
                 build_mode_type: 0,
+                ratings: [0, 2, 0, 0, 0, 0, 0],
+                skill_flags: 0,
             },
             BuyItem {
                 guid: 0x2222_2222,
@@ -859,6 +1318,8 @@ mod tests {
                 function_sort: 0x01,    // Seating
                 function_subsort: 0x04, // Sofas
                 build_mode_type: 0,
+                ratings: [0, 6, 0, 0, 3, 0, 2],
+                skill_flags: 0x04, // + Logic
             },
         ])
     }
@@ -892,6 +1353,8 @@ mod tests {
                 function_sort: 1,
                 function_subsort: 1,
                 build_mode_type: 0,
+                ratings: [0; 7],
+                skill_flags: 0,
             },
             BuyItem {
                 guid: 2,
@@ -902,6 +1365,8 @@ mod tests {
                 function_sort: 1,
                 function_subsort: 1,
                 build_mode_type: 0,
+                ratings: [0; 7],
+                skill_flags: 0,
             },
             BuyItem {
                 guid: 3,
@@ -912,6 +1377,8 @@ mod tests {
                 function_sort: 1,
                 function_subsort: 1,
                 build_mode_type: 0,
+                ratings: [0; 7],
+                skill_flags: 0,
             },
             BuyItem {
                 guid: 4,
@@ -922,6 +1389,8 @@ mod tests {
                 function_sort: 1,
                 function_subsort: 1,
                 build_mode_type: 0,
+                ratings: [0; 7],
+                skill_flags: 0,
             },
         ]);
         let names: Vec<&str> = tied.all().iter().map(|i| i.name.as_str()).collect();
@@ -944,6 +1413,22 @@ mod tests {
             seating.press([437, 523]),
             Some(Command::BuyItem(0x26bf_bb29))
         );
+        // Selecting an item populates formatted ratings on the popup card.
+        state.selected = Some(0x2222_2222);
+        let with_popup = layout([800, 600], &cat, &state, &art, 2542);
+        let popup = with_popup.popup.expect("popup card for selected item");
+        assert_eq!(
+            popup.ratings,
+            vec!["Comfort: 6", "Energy: 3", "Room: 2", "+ Logic"]
+        );
+        // Second Buy click toggles sort between ByFunction and ByRoom and
+        // returns to top-level categories.
+        assert!(state.apply(&Command::BuyToggleSort));
+        assert_eq!(state.sort, BuySort::ByRoom);
+        assert_eq!(state.category, None);
+        assert_eq!(state.selected, None);
+        assert!(state.apply(&Command::BuyToggleSort));
+        assert_eq!(state.sort, BuySort::ByFunction);
     }
 
     /// Builds a minimal IFF 2.5 buffer from `(type_code, id, payload)` chunks.
