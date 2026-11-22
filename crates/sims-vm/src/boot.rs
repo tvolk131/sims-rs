@@ -1439,6 +1439,28 @@ impl Lot {
                 crate::buy::collect_cursor_ids(cur, &mut keep);
                 keep.insert(interpreter.lead_object(&world, cur.cursor));
                 keep.insert(interpreter.lead_object(&world, cur.held));
+                // Protect any detached ancestor container holding `cur.held`
+                // (e.g. an unpaid preview sitting in an undone table's slot)
+                // until `buy_cancel` unlinks `cur.held` cleanly; a final pass
+                // below purges any deferred off-lot container afterwards.
+                let mut probe: Vec<u16> = keep.iter().copied().collect();
+                while let Some(id) = probe.pop() {
+                    if let Some(cid) = world
+                        .objects
+                        .get(&id)
+                        .and_then(|o| o.data.get(2).copied())
+                        .and_then(|c| u16::try_from(c).ok())
+                        .filter(|&c| c != 0)
+                    {
+                        let lead = interpreter.lead_object(&world, cid);
+                        if keep.insert(cid) {
+                            probe.push(cid);
+                        }
+                        if keep.insert(lead) {
+                            probe.push(lead);
+                        }
+                    }
+                }
             }
             interpreter
                 .buy_purge_detached(&mut world, &self.buy_redo, &keep)
@@ -1454,6 +1476,18 @@ impl Lot {
             interpreter
                 .buy_cancel(&mut world, cur)
                 .map_err(OrderError::Refused)?;
+            if clearing {
+                let empty = BTreeSet::new();
+                interpreter
+                    .buy_purge_detached(&mut world, &self.buy_redo, &empty)
+                    .map_err(OrderError::Refused)?;
+                interpreter
+                    .buy_purge_detached(&mut world, &self.buy_undo, &empty)
+                    .map_err(OrderError::Refused)?;
+                interpreter
+                    .buy_purge_detached(&mut world, &self.buy_orphans, &empty)
+                    .map_err(OrderError::Refused)?;
+            }
         }
         self.world = world;
         if clearing {

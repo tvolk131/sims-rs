@@ -252,6 +252,20 @@ pub(crate) fn collect_cursor_ids(cursor: &BuyCursor, out: &mut BTreeSet<u16>) {
     }
 }
 
+/// Returns whether the root object and every recursive surface child in
+/// `target` are currently placed on-lot (preventing `Move` Undo/Redo from
+/// resurrecting a detached/refunded child for free).
+fn all_placement_objects_on_lot(world: &World, target: &BuyPlacement) -> bool {
+    world
+        .objects
+        .get(&target.object)
+        .is_some_and(|o| on_lot([o.position[0], o.position[1]]))
+        && target
+            .children
+            .iter()
+            .all(|child| all_placement_objects_on_lot(world, child))
+}
+
 /// Checks `0x422632`: both tile coordinates strictly inside `1..size - 1`.
 fn inside_placement_bounds(world: &World, [x, y]: [i32; 2]) -> bool {
     let limit = i32::from(world.size).saturating_sub(1);
@@ -1416,8 +1430,9 @@ impl Interpreter<'_> {
     }
 
     /// Restores a single [`BuyPlacement`] and recursively restores all of its
-    /// surface children (`0x48bfab`). Returns `Ok(true)` if the root placement
-    /// succeeded, or `Ok(false)` if it was refused.
+    /// surface children (`0x48bfab`). Returns `Ok(Some(id))` if the root
+    /// placement and every surface child succeeded, or `Ok(None)` if any was
+    /// refused (rolling back any partial parent/sibling placement atomically).
     fn restore_placement(
         &self,
         world: &mut World,
@@ -1428,6 +1443,7 @@ impl Interpreter<'_> {
         if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
             return Ok(None);
         }
+        let snapshot = (!target.children.is_empty()).then(|| world.clone());
         let (id, created_fresh) = if world.objects.contains_key(&target.object) {
             (target.object, false)
         } else if allow_create {
@@ -1475,6 +1491,13 @@ impl Interpreter<'_> {
                 .restore_placement(world, child, allow_create)?
                 .is_none()
             {
+                if let Some(saved) = snapshot {
+                    *world = saved;
+                }
+                if allow_create && !created_fresh {
+                    self.run_user_pickup(world, id)?;
+                    self.take_off(world, id, true)?;
+                }
                 return Ok(None);
             }
         }
@@ -1519,11 +1542,7 @@ impl Interpreter<'_> {
                 let Some(before) = purchase.before.clone() else {
                     return Ok(false);
                 };
-                if !world
-                    .objects
-                    .get(&before.object)
-                    .is_some_and(|o| on_lot([o.position[0], o.position[1]]))
-                {
+                if !all_placement_objects_on_lot(world, &before) {
                     return Ok(false);
                 }
                 let Some(id) = self.restore_placement(world, &before, false)? else {
@@ -1613,11 +1632,7 @@ impl Interpreter<'_> {
                 let Some(after) = purchase.after.clone() else {
                     return Ok(false);
                 };
-                if !world
-                    .objects
-                    .get(&after.object)
-                    .is_some_and(|o| on_lot([o.position[0], o.position[1]]))
-                {
+                if !all_placement_objects_on_lot(world, &after) {
                     return Ok(false);
                 }
                 let Some(id) = self.restore_placement(world, &after, false)? else {
@@ -1636,6 +1651,7 @@ impl Interpreter<'_> {
                         .objects
                         .get(&purchase.object)
                         .is_some_and(|o| on_lot([o.position[0], o.position[1]]))
+                    || !self.can_delete(world, purchase.object)?
                 {
                     return Ok(false);
                 }

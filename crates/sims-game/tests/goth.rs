@@ -6549,10 +6549,12 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
     );
     let canvas = game.render();
     // Native `after-sell.png` draws the bench isometric preview (`0x4384c8`)
-    // at x=264..343, y=509..590 (centered at 304, 550) and text starting at
-    // (399, 517).
+    // at x=264..343, y=509..590 (centered at 304, 550), line 1 starting at
+    // (399, 517), and line 2 starting at y=536.
     let mut portrait_min_x = i32::MAX;
     let mut portrait_max_x = 0;
+    let mut portrait_min_y = i32::MAX;
+    let mut portrait_max_y = 0;
     let mut portrait_pixels = 0usize;
     for y in 505..597 {
         let bg = canvas.color[y as usize * canvas.width + 245];
@@ -6564,17 +6566,22 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
                 portrait_pixels += 1;
                 portrait_min_x = portrait_min_x.min(x);
                 portrait_max_x = portrait_max_x.max(x);
+                portrait_min_y = portrait_min_y.min(y);
+                portrait_max_y = portrait_max_y.max(y);
             }
         }
     }
     assert!(
         portrait_pixels > 1500
             && (260..=268).contains(&portrait_min_x)
-            && (339..=347).contains(&portrait_max_x),
-        "expected bench portrait near x=264..343, got {portrait_pixels} px at x={portrait_min_x}..{portrait_max_x}"
+            && (339..=347).contains(&portrait_max_x)
+            && (506..=513).contains(&portrait_min_y)
+            && (586..=594).contains(&portrait_max_y),
+        "expected bench portrait near x=264..343 y=509..590, got {portrait_pixels} px at x={portrait_min_x}..{portrait_max_x} y={portrait_min_y}..{portrait_max_y}"
     );
     let mut text_min_x = i32::MAX;
     let mut text_min_y = i32::MAX;
+    let mut line2_min_y = i32::MAX;
     let mut prompt_text_pixels = 0usize;
     for y in 505..595 {
         for x in 395..780 {
@@ -6583,14 +6590,18 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
                 prompt_text_pixels += 1;
                 text_min_x = text_min_x.min(x);
                 text_min_y = text_min_y.min(y);
+                if y >= 532 {
+                    line2_min_y = line2_min_y.min(y);
+                }
             }
         }
     }
     assert!(
         prompt_text_pixels > 80
-            && (397..=406).contains(&text_min_x)
-            && (515..=525).contains(&text_min_y),
-        "expected sell prompt text starting near (399, 517), got {prompt_text_pixels} bright px starting at ({text_min_x}, {text_min_y})"
+            && (397..=402).contains(&text_min_x)
+            && (515..=520).contains(&text_min_y)
+            && (534..=539).contains(&line2_min_y),
+        "expected sell prompt text line 1 near (399, 517) and line 2 near y=536, got {prompt_text_pixels} bright px starting at ({text_min_x}, {text_min_y}) and line2 y={line2_min_y}"
     );
 
     // Delete sells porch bench 173/174 before u=844: refunds $250 (2462 -> 2712),
@@ -7406,7 +7417,7 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
         // chair's tile runs `go_live` -> `update_comeandsee` -> `0x4933dc`
         // BEFORE tearing down the Buy tool (`0x4cea5d`), so chair1's marker
         // does NOT reuse either the undone chair's ID or the preview's IDs.
-        let mut g4 = Game::open(&options(install)).expect("open Goth house");
+        let mut g4 = Game::open(&options(install.clone())).expect("open Goth house");
         g4.resize([800, 600]);
         g4.render();
         assert_eq!(g4.run(60), 60);
@@ -7452,6 +7463,183 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
         assert_ne!(marker, chair2);
         assert_ne!(marker, preview.held);
         assert_ne!(marker, preview.cursor);
+    }
+
+    // --- 5. Sol Round 4 regressions: Redo Move child resurrection, Redo Sell
+    //        non-empty surface guard, F1 unpaid preview on undone surface, and
+    //        refused Buy Redo atomic parent/child rollback ---
+    {
+        let desk = catalog
+            .all()
+            .iter()
+            .find(|i| i.name.contains("Mesquite") && i.name.contains("Desk"))
+            .expect("Mesquite Desk");
+        let lamp = catalog
+            .all()
+            .iter()
+            .find(|i| i.name.contains("Gloominator"))
+            .expect("Gloominator Desk Lamp");
+
+        // P1 #1: Redo Move of a desk must NOT resurrect a refunded lamp child.
+        let mut lot_p1a =
+            Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+        for _ in 0..60 {
+            lot_p1a.step().unwrap();
+        }
+        lot_p1a.set_mode(sims_vm::PanelMode::Buy).unwrap();
+        let mut d1 = lot_p1a.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot_p1a.buy_move(&mut d1, [584, 472], 1).unwrap());
+        let desk1 = lot_p1a.buy_commit(&d1).unwrap();
+        let mut d2 = lot_p1a.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot_p1a.buy_move(&mut d2, [552, 472], 1).unwrap());
+        let desk2 = lot_p1a.buy_commit(&d2).unwrap();
+        let mut l1 = lot_p1a.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot_p1a.buy_move(&mut l1, [584, 472], 1).unwrap());
+        assert_eq!(l1.container.map(|(c, _)| c), Some(desk1));
+        let lamp_id = lot_p1a.buy_commit(&l1).unwrap();
+        let mut lm = lot_p1a.buy_pick_up(lamp_id).unwrap().unwrap();
+        assert!(lot_p1a.buy_move(&mut lm, [552, 472], 1).unwrap());
+        assert_eq!(lm.container.map(|(c, _)| c), Some(desk2));
+        lot_p1a.buy_commit(&lm).unwrap();
+        let mut dm = lot_p1a.buy_pick_up(desk2).unwrap().unwrap();
+        assert!(lot_p1a.buy_move(&mut dm, [600, 440], 1).unwrap());
+        lot_p1a.buy_commit(&dm).unwrap();
+        // Undo desk2 move, lamp move, and lamp buy -> lamp refunded & off-lot.
+        assert!(lot_p1a.buy_undo().unwrap());
+        assert!(lot_p1a.buy_undo().unwrap());
+        assert!(lot_p1a.buy_undo().unwrap());
+        let funds_after_refund = lot_p1a.world().budget.funds;
+        assert!(lot_p1a.world().objects[&lamp_id].position[0] < 0);
+        // Block (desk1, 0) with unpaid preview lamp, then Redo x3.
+        let mut blocker = lot_p1a.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot_p1a.buy_move(&mut blocker, [584, 472], 1).unwrap());
+        assert!(!lot_p1a.buy_redo().unwrap()); // lamp buy refused
+        assert!(!lot_p1a.buy_redo().unwrap()); // lamp move refused
+        assert!(!lot_p1a.buy_redo().unwrap()); // desk2 move MUST refuse (child lamp is detached!)
+        assert!(lot_p1a.world().objects[&lamp_id].position[0] < 0);
+        assert_eq!(lot_p1a.world().objects[&desk2].position, [552, 472, 1]);
+        assert_eq!(lot_p1a.world().budget.funds, funds_after_refund);
+        lot_p1a.buy_cancel(&blocker).unwrap();
+
+        // P1 #2: Redo Sell of a desk that still holds a paid lamp (after a
+        // refused Move Redo) must refuse via `can_delete` instead of detaching
+        // and permanently deleting the paid lamp.
+        let mut lot_p1b =
+            Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+        for _ in 0..60 {
+            lot_p1b.step().unwrap();
+        }
+        lot_p1b.set_mode(sims_vm::PanelMode::Buy).unwrap();
+        let mut d1 = lot_p1b.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot_p1b.buy_move(&mut d1, [584, 472], 1).unwrap());
+        let desk1 = lot_p1b.buy_commit(&d1).unwrap();
+        let mut d2 = lot_p1b.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot_p1b.buy_move(&mut d2, [552, 472], 1).unwrap());
+        let desk2 = lot_p1b.buy_commit(&d2).unwrap();
+        let mut l1 = lot_p1b.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot_p1b.buy_move(&mut l1, [584, 472], 1).unwrap());
+        let lamp_id = lot_p1b.buy_commit(&l1).unwrap();
+        let mut lm = lot_p1b.buy_pick_up(lamp_id).unwrap().unwrap();
+        assert!(lot_p1b.buy_move(&mut lm, [552, 472], 1).unwrap());
+        assert_eq!(lm.container.map(|(c, _)| c), Some(desk2));
+        lot_p1b.buy_commit(&lm).unwrap();
+        let d1_pick = lot_p1b.buy_pick_up(desk1).unwrap().unwrap();
+        assert!(lot_p1b.buy_sell(&d1_pick).unwrap());
+        // Undo Sell (restores desk1) and Undo Move (puts lamp back on desk1).
+        assert!(lot_p1b.buy_undo().unwrap());
+        assert!(lot_p1b.buy_undo().unwrap());
+        let funds_before_redo = lot_p1b.world().budget.funds;
+        assert_eq!(lot_p1b.world().objects[&lamp_id].data[2], desk1 as i16);
+        let mut blocker = lot_p1b.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot_p1b.buy_move(&mut blocker, [552, 472], 1).unwrap());
+        assert!(!lot_p1b.buy_redo().unwrap()); // lamp move refused; lamp stays on desk1
+        assert!(!lot_p1b.buy_redo().unwrap()); // desk1 sell MUST refuse (`can_delete` false)
+        assert!(lot_p1b.world().objects[&desk1].position[0] >= 0);
+        assert!(lot_p1b.world().objects[&lamp_id].position[0] >= 0);
+        assert_eq!(lot_p1b.world().budget.funds, funds_before_redo);
+        lot_p1b.buy_cancel(&blocker).unwrap();
+        lot_p1b.set_mode(sims_vm::PanelMode::Live).unwrap();
+        assert!(lot_p1b.world().objects.contains_key(&desk1));
+        assert!(lot_p1b.world().objects.contains_key(&lamp_id));
+
+        // P2 #2: Refused Buy Redo with a child in its placement record must
+        // roll back atomically (leaving the refunded desk off-lot AND keeping
+        // the paid lamp on-lot on desk2).
+        let mut lot_p2b =
+            Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+        for _ in 0..60 {
+            lot_p2b.step().unwrap();
+        }
+        lot_p2b.set_mode(sims_vm::PanelMode::Buy).unwrap();
+        let mut d2 = lot_p2b.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot_p2b.buy_move(&mut d2, [552, 472], 1).unwrap());
+        let desk2 = lot_p2b.buy_commit(&d2).unwrap();
+        let mut d1 = lot_p2b.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot_p2b.buy_move(&mut d1, [584, 472], 1).unwrap());
+        let mut l1 = lot_p2b.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot_p2b.buy_move(&mut l1, [584, 472], 1).unwrap());
+        let paid_lamp = lot_p2b.buy_commit(&l1).unwrap();
+        let desk1 = lot_p2b.buy_commit(&d1).unwrap();
+        // Move paid_lamp onto desk2 (uncommitted cursor), block (desk1, 0),
+        // then Undo desk1 and Redo desk1.
+        let mut moved_lamp = lot_p2b.buy_pick_up(paid_lamp).unwrap().unwrap();
+        assert!(lot_p2b.buy_move(&mut moved_lamp, [552, 472], 1).unwrap());
+        assert_eq!(moved_lamp.container.map(|(c, _)| c), Some(desk2));
+        let mut unpaid_blocker = lot_p2b.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(
+            lot_p2b
+                .buy_move(&mut unpaid_blocker, [584, 472], 1)
+                .unwrap()
+        );
+        assert_eq!(unpaid_blocker.container.map(|(c, _)| c), Some(desk1));
+        assert!(lot_p2b.buy_undo().unwrap()); // undo desk1
+        assert!(lot_p2b.world().objects[&desk1].position[0] < 0);
+        assert!(lot_p2b.world().objects[&paid_lamp].position[0] >= 0);
+        let funds_before_desk1_redo = lot_p2b.world().budget.funds;
+        // Desk1's Buy Redo tries to restore desk1 + child paid_lamp, which
+        // collides with unpaid_blocker in (desk1, 0): must refuse atomically,
+        // leaving desk1 off-lot and paid_lamp STILL on-lot on desk2!
+        assert!(!lot_p2b.buy_redo().unwrap());
+        assert!(lot_p2b.world().objects[&desk1].position[0] < 0);
+        assert!(lot_p2b.world().objects[&paid_lamp].position[0] >= 0);
+        assert_eq!(lot_p2b.world().budget.funds, funds_before_desk1_redo);
+        lot_p2b.buy_cancel(&unpaid_blocker).unwrap();
+        lot_p2b.buy_cancel(&moved_lamp).ok();
+
+        // P2 #1: F1 with an unpaid lamp preview sitting on an undone end table
+        // must switch to Live Mode cleanly without failing `missing object`.
+        let mut g5 = Game::open(&options(install)).expect("open Goth house");
+        g5.resize([800, 600]);
+        g5.render();
+        assert_eq!(g5.run(60), 60);
+        g5.set_mode(Mode::Buy);
+        g5.press([295, 524]); // Surfaces -> End Tables
+        g5.release([295, 524]);
+        g5.press([437, 523]); // Slot 0 End Table
+        g5.release([437, 523]);
+        g5.hover([577, 432]);
+        let table_id = g5.buy_cursor().unwrap().held;
+        g5.press([577, 432]);
+        g5.release([577, 432]);
+        g5.cancel_buy();
+        g5.press([234, 550]); // Back
+        g5.release([234, 550]);
+        g5.press([337, 570]); // Lighting -> Table Lamps
+        g5.release([337, 570]);
+        g5.press([437, 523]); // Slot 0 Desk Lamp
+        g5.release([437, 523]);
+        g5.hover([577, 432]);
+        let lamp_prev = g5.buy_cursor().expect("lamp preview on table").clone();
+        assert_eq!(lamp_prev.container.map(|(c, _)| c), Some(table_id));
+        assert!(g5.undo_buy()); // table detached off-lot with lamp_prev in slot 0
+        assert!(g5.lot().world().objects[&table_id].position[0] < 0);
+        // Press F1 without moving the pointer.
+        g5.set_mode(Mode::Live);
+        assert_eq!(g5.mode(), Mode::Live);
+        assert!(g5.buy_cursor().is_none());
+        assert!(!g5.lot().world().objects.contains_key(&table_id));
+        assert!(!g5.lot().world().objects.contains_key(&lamp_prev.held));
+        assert!(!g5.lot().world().objects.contains_key(&lamp_prev.cursor));
     }
 }
 
