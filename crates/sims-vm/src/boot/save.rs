@@ -462,6 +462,7 @@ impl Saved {
         );
         self.world.runtime_added_suits = self.runtime_added_suits.clone();
         self.world.suit_scan_cache = self.suit_scan_cache.clone();
+        self.world.mark_all_frame_storage_dirty();
     }
 
     /// Reads [`Saved::encode`]'s bytes, deterministically migrating supported

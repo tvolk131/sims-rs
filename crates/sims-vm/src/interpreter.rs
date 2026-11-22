@@ -427,6 +427,7 @@ impl<'a> Interpreter<'a> {
             active_frame: None,
             cached_owner: None,
             order_validated: false,
+            order_unique: false,
             last_order_cursor: None,
         }
     }
@@ -592,6 +593,9 @@ pub(crate) struct Machine<'a, 'w> {
     /// True once `Set To Next` has validated `world.order` within this turn
     /// and no subsequent primitive could have mutated object registration.
     pub(crate) order_validated: bool,
+    /// True when the validated `world.order` contains no duplicate IDs,
+    /// allowing `O(1)` cursor continuation via `last_order_cursor`.
+    pub(crate) order_unique: bool,
     /// Last `(object_id, index_in_order)` returned by `Set To Next` in this
     /// turn so sequential scans advance in `O(1)` per step.
     pub(crate) last_order_cursor: Option<(u16, usize)>,
@@ -1425,6 +1429,7 @@ impl<'a> Machine<'a, '_> {
         };
         if !matches!(instruction.opcode, 2 | 8 | 21 | 22 | 24 | 26 | 31 | 38 | 39) {
             self.order_validated = false;
+            self.order_unique = false;
             self.last_order_cursor = None;
         }
         if self
@@ -1914,5 +1919,85 @@ mod tests {
             m.pop_frame().unwrap();
         }
         assert_matches_full(&world);
+    }
+
+    #[test]
+    fn dirty_lower_frame_survives_world_encode_decode_roundtrip() {
+        let program = Program {
+            global: 0,
+            libraries: BTreeMap::from([(0, Library::default())]),
+            semi_globals: BTreeMap::new(),
+            careers: None,
+            career_texts_end: false,
+            labels_hold_no_token: false,
+            zoning: BTreeMap::new(),
+            animations: Default::default(),
+            people: Default::default(),
+            icon_frames: None,
+            wardrobe: None,
+            ordered_wardrobe: None,
+            character_files: Default::default(),
+            expansions: 0,
+            characters: Default::default(),
+        };
+        let catalog = Catalog {
+            global: 0,
+            objects: Vec::new(),
+            by_guid: BTreeMap::new(),
+            semi_globals: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut live = World::empty();
+        live.objects.insert(
+            1,
+            sims_sim::Object {
+                id: 1,
+                guid: 1,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 64],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: vec![frame(4096, 1, 7, vec![10], vec![1])],
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+        let interpreter = Interpreter::new(&program, &catalog, Stream::Lot);
+        {
+            let mut m = interpreter.machine(&mut live, 1, 0, false);
+            m.push_frame(frame(4097, 2, 8, vec![30], vec![0]), false)
+                .unwrap();
+        }
+        // Mutate lower frame 0 (as Idle For Input does) and mark dirty.
+        live.objects.get_mut(&1).unwrap().stack[0].parameters[0] = 0;
+        live.objects.get_mut(&1).unwrap().stack[0].primitive_state = 1;
+        mark_frame_dirty(&mut live, 1, 0);
+
+        // Save/restore drops #[serde(skip)] dirty_frames; World::decode must
+        // re-mark frame_storage entries so the next push matches uninterrupted.
+        let encoded = live.encode();
+        let mut restored = World::decode(&encoded).unwrap();
+        assert_eq!(live.hash(), restored.hash());
+
+        for w in [&mut live, &mut restored] {
+            let mut m = interpreter.machine(w, 1, 0, false);
+            m.push_frame(frame(4098, 0, 9, vec![], vec![0]), false)
+                .unwrap();
+        }
+        assert_eq!(live.frame_storage.get(&1), restored.frame_storage.get(&1));
+        assert_eq!(live.hash(), restored.hash());
     }
 }

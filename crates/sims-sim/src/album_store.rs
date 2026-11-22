@@ -933,6 +933,16 @@ impl AlbumImageV2 {
                 ),
             });
         }
+        let consumed = decoder.into_inner().total_in();
+        if consumed != self.deflated_rgb565_le.len() as u64 {
+            return Err(AlbumError::DecodeFailed {
+                record: record.to_owned(),
+                detail: format!(
+                    "V2 photo compressed stream has trailing bytes (consumed {consumed} of {} bytes)",
+                    self.deflated_rgb565_le.len()
+                ),
+            });
+        }
         let mut rgb565 = Vec::with_capacity(expected_pixels);
         for chunk in raw.as_chunks::<2>().0 {
             rgb565.push(u16::from_le_bytes(*chunk));
@@ -942,6 +952,63 @@ impl AlbumImageV2 {
             height: self.height,
             rgb565,
         })
+    }
+
+    /// Validates the V2 compressed pixel stream into a fixed stack discard
+    /// buffer so summary listings enforce exact parity with full reads without
+    /// allocating or retaining pixel buffers.
+    fn validate_stream(&self, record: &str) -> std::result::Result<(), AlbumError> {
+        let expected_pixels = checked_photo_pixel_count(self.width, self.height)?;
+        let expected_bytes =
+            expected_pixels
+                .checked_mul(2)
+                .ok_or_else(|| AlbumError::DecodeFailed {
+                    record: record.to_owned(),
+                    detail: "photo RGB565 byte count overflows".into(),
+                })?;
+        let mut decoder = DeflateDecoder::new(self.deflated_rgb565_le.as_slice())
+            .take((expected_bytes as u64).saturating_add(1));
+        let mut scratch = [0u8; 4096];
+        let mut total = 0usize;
+        loop {
+            let n = decoder
+                .read(&mut scratch)
+                .map_err(|e| AlbumError::DecodeFailed {
+                    record: record.to_owned(),
+                    detail: format!("failed to decompress V2 photo pixels: {e}"),
+                })?;
+            if n == 0 {
+                break;
+            }
+            total = total.saturating_add(n);
+            if total > expected_bytes {
+                return Err(AlbumError::DecodeFailed {
+                    record: record.to_owned(),
+                    detail: format!(
+                        "decompressed V2 photo byte length exceeds expected {expected_bytes}"
+                    ),
+                });
+            }
+        }
+        if total != expected_bytes {
+            return Err(AlbumError::DecodeFailed {
+                record: record.to_owned(),
+                detail: format!(
+                    "decompressed V2 photo byte length {total} does not match expected {expected_bytes}"
+                ),
+            });
+        }
+        let consumed = decoder.into_inner().total_in();
+        if consumed != self.deflated_rgb565_le.len() as u64 {
+            return Err(AlbumError::DecodeFailed {
+                record: record.to_owned(),
+                detail: format!(
+                    "V2 photo compressed stream has trailing bytes (consumed {consumed} of {} bytes)",
+                    self.deflated_rgb565_le.len()
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1612,6 +1679,9 @@ fn decode_photo_summary(
                         photo_id
                     ),
                 });
+            }
+            if let Some(ref img) = v2.image {
+                img.validate_stream(&record)?;
             }
             Ok(AlbumPhotoSummary {
                 id: v2.id,

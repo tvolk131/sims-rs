@@ -492,6 +492,13 @@ impl ThumbnailSurface565V2 {
                 raw.len()
             )));
         }
+        let consumed = decoder.into_inner().total_in();
+        if consumed != self.deflated_rgb565_le.len() as u64 {
+            return Err(Error::Snapshot(format!(
+                "V2 lot thumbnail compressed stream has trailing bytes (consumed {consumed} of {} bytes)",
+                self.deflated_rgb565_le.len()
+            )));
+        }
         let mut pixels = Vec::with_capacity(expected_pixels);
         for chunk in raw.as_chunks::<2>().0 {
             pixels.push(u16::from_le_bytes(*chunk));

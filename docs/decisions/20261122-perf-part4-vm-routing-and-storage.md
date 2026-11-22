@@ -78,8 +78,11 @@ crates (`sims-game`, `sims-render`, `sims-antics`), and keep every simulation st
   mutation sites (`idle.rs`, `go_to_slot.rs`, `notify.rs`, `memory.rs::wake`, `create.rs`)
   call `mark_frame_dirty(world, id, depth)` without touching `frame_storage` early; the
   object's next `sync_top_frame` flushes only those dirty depths plus the top frame at the
-  exact tick boundary full `sync_frames` would have. Verified against full `sync_frames` in
-  `interpreter::tests::incremental_sync_top_frame_with_dirty_marks_matches_full_sync_frames`.
+  exact tick boundary full `sync_frames` would have. `World::decode` and
+  `Saved::hydrate_world_aux` call `World::mark_all_frame_storage_dirty()` so restored
+  worlds perform one full sync on each object's first post-restore push/pop (preserving
+  bit-exact parity if a lower frame was dirty before save). Verified against full
+  `sync_frames` and across `World::encode`/`World::decode` in `interpreter::tests`.
 - Eliminated `instruction.operands.to_vec()` in `Machine::call` by reading `&[u8]` directly
   for standard calls and copying into a stack `[u8; 20]` buffer for extended operand layouts.
 - Added a `#[doc(hidden)] #[serde(skip)]` `World::types_by_guid: TypesByGuidCache` (`Arc`-backed
@@ -152,17 +155,19 @@ crates (`sims-game`, `sims-render`, `sims-antics`), and keep every simulation st
 ### 7. Versioned V2 REDB Persistence with V1 Backwards Compatibility (Item 4.4 `sims-sim`)
 - **`AutosaveStore` (`crates/sims-sim/src/autosave.rs`):** Bumped `AUTOSAVE_FORMAT = 2`
   (`AUTOSAVE_MIN_FORMAT = 1`). V2 splits `AutosaveHeaderV2` + raw deflate
-  (`flate2::Compression::fast()`) payload in a single buffer, enforces a 128 MiB decompression
-  bound, drops redundant inner payload SHA-256 re-hashing on V2 decode (envelope SHA-256
-  already covers the entire V2 body), preserves full V1 read compatibility, and adds
+  (`flate2::Compression::fast()`) payload in a single buffer, enforces a 128 MiB payload cap
+  on both write (before transaction/pruning) and read, rejects trailing compressed bytes,
+  verifies `payload_sha256` on full reads, preserves full V1 read compatibility, and adds
   `AutosaveStore::list_saves_metadata` (envelope SHA-256 + V2 header only — zero decompression).
 - **`AlbumStore` (`crates/sims-sim/src/album_store.rs`):** Bumped `ALBUM_FORMAT = 2`
   (`ALBUM_MIN_FORMAT = 1`). V2 packs RGB565 pixels as raw little-endian bytes compressed with
-  `Compression::fast()` + bounded deserialization/decompression; `list_summaries` skips V2
-  pixel decompression; V1 varint records remain fully readable.
+  `Compression::fast()` + bounded deserialization/decompression and trailing-byte rejection;
+  `list_summaries` validates V2 pixel streams via a 4 KiB stack discard buffer without
+  retaining pixel buffers; V1 varint records remain fully readable.
 - **`NeighborhoodStore` lot thumbnails (`crates/sims-sim/src/neighborhood_store.rs`):** Added
   `LOT_THUMBNAIL_MIN_FORMAT = 1`, bumped `LOT_THUMBNAIL_FORMAT = 2`, packing raw LE RGB565
-  bytes with `Compression::fast()` + bounded decompression and full V1 backwards compatibility.
+  bytes with `Compression::fast()` + bounded decompression, trailing-byte rejection, and full
+  V1 backwards compatibility.
 
 ## Before vs. After Benchmark (`House05.iff`, `--release`, Apple Silicon)
 
@@ -174,7 +179,7 @@ Measured on the same machine (`origin/main` `e6295101` baseline vs. `perf/vm-rou
 | 43,200-tick Goth day SHA-256 hash | `df6eb544be87b93233011f355999ac9abb0c36dc5e914f2f7c0fe2f49967b19a` | `df6eb544be87b93233011f355999ac9abb0c36dc5e914f2f7c0fe2f49967b19a` | **Bit-for-bit identical** |
 | `World::hash()` / `coop_world_hash()` temporary heap buffer | ~200–400 KB `Vec<u8>` per hash | `0 B` heap (256 B stack buffer via `Sha256Flavor`) | **Zero heap allocations** |
 | `AutosaveStore` V2 vs V1 stored record size (64 KiB repetitive lot payload) | V1 uncompressed postcard | V2 `Compression::fast()` deflate | **>4× smaller** + zero-decompress `list_saves_metadata` |
-| `AlbumStore` V2 vs V1 stored photo size (`128×96` RGB565 with `0xf81f`) | V1 varint `Vec<u16>` (up to 3 B/px) | V2 raw LE + `Compression::fast()` | **>3× smaller** + zero-decompress `list_summaries` |
+| `AlbumStore` V2 vs V1 stored photo size (`128×96` RGB565 with `0xf81f`) | V1 varint `Vec<u16>` (up to 3 B/px) | V2 raw LE + `Compression::fast()` | **>3× smaller** + stack-validated `list_summaries` (zero pixel buffer allocation) |
 | `NeighborhoodStore` lot thumbnail V2 vs V1 (`128×96` normal + roofs_off) | V1 varint `Vec<u16>` | V2 raw LE + `Compression::fast()` | **>4× smaller** |
 
 ## What would reopen this

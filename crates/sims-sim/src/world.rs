@@ -1216,7 +1216,25 @@ impl World {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        postcard::from_bytes(bytes).map_err(|e| Error::Snapshot(e.to_string()))
+        let mut world: Self =
+            postcard::from_bytes(bytes).map_err(|e| Error::Snapshot(e.to_string()))?;
+        world.mark_all_frame_storage_dirty();
+        Ok(world)
+    }
+
+    /// Marks every existing [`Self::frame_storage`] entry dirty so each object
+    /// performs one full `sync_frames` on its first frame push/pop after a
+    /// save/restore (preserving bit-exact parity for lower frames edited before
+    /// serialization).
+    #[doc(hidden)]
+    pub fn mark_all_frame_storage_dirty(&mut self) {
+        if self.frame_storage.is_empty() {
+            return;
+        }
+        let dirty = self.dirty_frames.as_mut();
+        for &id in self.frame_storage.keys() {
+            dirty.insert(id, u64::MAX);
+        }
     }
 
     /// SHA-256 of the canonical encoding, computed via zero-allocation

@@ -1018,3 +1018,100 @@ fn album_v2_roundtrip_compression_and_v1_backwards_compatibility() {
     assert_eq!(listed[1].title, "V1 Legacy");
     assert_eq!(listed[1].image, Some(img));
 }
+
+#[test]
+fn album_v2_rejects_trailing_and_corrupt_deflate_in_both_get_and_list_summaries() {
+    use sha2::{Digest, Sha256};
+
+    let db = TempDb::new("album_v2_trailing");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .save_neighborhood("UserData", &sample_neighborhood("UserData", &[1]))
+        .unwrap();
+    let albums = store.albums();
+    let tok = albums.family_token("UserData", 1).unwrap().unwrap();
+    let img = AlbumImage::new(8, 8, vec![0xf81f; 64]).unwrap();
+    let added = albums
+        .add("UserData", tok, NewAlbumPhoto::with_image("Shot", "", img))
+        .unwrap();
+    drop(albums);
+    drop(store);
+
+    const PHOTO_TABLE: redb::TableDefinition<(&str, u16, u64), &[u8]> =
+        redb::TableDefinition::new("photo_album_photos");
+
+    #[derive(serde::Serialize)]
+    struct RawImageV2 {
+        width: u32,
+        height: u32,
+        deflated_rgb565_le: Vec<u8>,
+    }
+    #[derive(serde::Serialize)]
+    struct RawPhotoV2 {
+        neighborhood_id: String,
+        family_id: u16,
+        id: u64,
+        title: String,
+        caption: String,
+        sim_day: Option<u32>,
+        image: Option<RawImageV2>,
+    }
+
+    let sign_v2 = |photo: &RawPhotoV2| -> Vec<u8> {
+        let body = postcard::to_allocvec(photo).unwrap();
+        let mut h = Sha256::new();
+        h.update(b"sims-sim:album-photo:v1");
+        h.update(2u32.to_le_bytes());
+        h.update(&body);
+        let mut framed = Vec::new();
+        framed.extend_from_slice(b"ALBP");
+        framed.extend_from_slice(&2u32.to_le_bytes());
+        framed.extend_from_slice(&h.finalize());
+        framed.extend_from_slice(&body);
+        framed
+    };
+
+    // Valid compressed bytes for 8x8 RGB565 + trailing junk bytes.
+    let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut enc, &[0x1f; 128]).unwrap();
+    let mut with_trailing = enc.finish().unwrap();
+    with_trailing.extend_from_slice(b"TRAILING");
+
+    for bad_stream in [with_trailing, vec![0xff, 0x00, 0xde, 0xad]] {
+        let framed = sign_v2(&RawPhotoV2 {
+            neighborhood_id: "UserData".into(),
+            family_id: 1,
+            id: added.id,
+            title: "Bad".into(),
+            caption: String::new(),
+            sim_day: None,
+            image: Some(RawImageV2 {
+                width: 8,
+                height: 8,
+                deflated_rgb565_le: bad_stream,
+            }),
+        });
+        {
+            let raw_db = redb::Database::open(&db.0).unwrap();
+            let w = raw_db.begin_write().unwrap();
+            {
+                let mut pt = w.open_table(PHOTO_TABLE).unwrap();
+                pt.insert(("UserData", 1, added.id), framed.as_slice())
+                    .unwrap();
+            }
+            w.commit().unwrap();
+        }
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        let albums = store.albums();
+        assert!(matches!(
+            albums.get("UserData", 1, added.id),
+            Err(AlbumError::DecodeFailed { .. })
+        ));
+        assert!(matches!(
+            albums.list_summaries("UserData", 1),
+            Err(AlbumError::DecodeFailed { .. })
+        ));
+        drop(albums);
+        drop(store);
+    }
+}

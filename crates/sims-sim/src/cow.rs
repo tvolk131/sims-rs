@@ -936,9 +936,18 @@ impl<K: CowKey, V: Clone> CowMap<K, V> {
             }
         }
         inner.trim_pages();
+        struct OverflowLenGuard<'a, K, V> {
+            inner: &'a mut CowMapInner<K, V>,
+            before: usize,
+        }
+        impl<K, V> Drop for OverflowLenGuard<'_, K, V> {
+            fn drop(&mut self) {
+                self.inner.len -= self.before - self.inner.overflow.len();
+            }
+        }
         let before = inner.overflow.len();
-        inner.overflow.retain(|k, v| f(k, Arc::make_mut(v)));
-        inner.len -= before - inner.overflow.len();
+        let guard = OverflowLenGuard { inner, before };
+        guard.inner.overflow.retain(|k, v| f(k, Arc::make_mut(v)));
     }
 
     #[inline]

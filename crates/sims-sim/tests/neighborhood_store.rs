@@ -1694,4 +1694,56 @@ fn lot_thumbnail_v2_roundtrip_compression_and_v1_backwards_compatibility() {
         store.load_lot_thumbnail("NH1", 6).unwrap().as_ref(),
         Some(&thumb)
     );
+    drop(store);
+
+    // Trailing junk bytes after a valid V2 deflate stream (with valid outer
+    // checksum) must be rejected.
+    #[derive(serde::Serialize)]
+    struct RawThumbSurfaceV2 {
+        width: u32,
+        height: u32,
+        deflated_rgb565_le: Vec<u8>,
+    }
+    #[derive(serde::Serialize)]
+    struct RawThumbV2 {
+        neighborhood_id: String,
+        lot_id: u32,
+        normal: RawThumbSurfaceV2,
+        roofs_off: Option<RawThumbSurfaceV2>,
+    }
+    let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut enc, &[0x1f; 8 * 8 * 2]).unwrap();
+    let mut with_trailing = enc.finish().unwrap();
+    with_trailing.extend_from_slice(b"EXTRA");
+    let bad_body = postcard::to_allocvec(&RawThumbV2 {
+        neighborhood_id: "NH1".into(),
+        lot_id: 7,
+        normal: RawThumbSurfaceV2 {
+            width: 8,
+            height: 8,
+            deflated_rgb565_le: with_trailing,
+        },
+        roofs_off: None,
+    })
+    .unwrap();
+    let mut h = Sha256::new();
+    h.update(b"sims-sim:lot-thumbnail:v1");
+    h.update(2u32.to_le_bytes());
+    h.update(&bad_body);
+    let mut bad_framed = Vec::new();
+    bad_framed.extend_from_slice(b"THMB");
+    bad_framed.extend_from_slice(&2u32.to_le_bytes());
+    bad_framed.extend_from_slice(&h.finalize());
+    bad_framed.extend_from_slice(&bad_body);
+    {
+        let raw_db = redb::Database::open(&db.0).unwrap();
+        let w = raw_db.begin_write().unwrap();
+        {
+            let mut t = w.open_table(THUMB_TABLE).unwrap();
+            t.insert(("NH1", 7), bad_framed.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    assert!(store.load_lot_thumbnail("NH1", 7).is_err());
 }

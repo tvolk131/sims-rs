@@ -309,7 +309,12 @@ impl Machine<'_, '_> {
         } else if !self.order_validated {
             // Validate every entry in registration order once per contiguous
             // read-only scan within a turn (matching `registration_order`:
-            // object lookup before script-word conversion).
+            // object lookup before script-word conversion), and track whether
+            // all IDs are unique so `last_order_cursor` preserves first-match
+            // semantics even if `world.order` has duplicate entries.
+            let mut seen_low = [0u64; 64];
+            let mut seen_high: Option<std::collections::BTreeSet<u16>> = None;
+            let mut unique = true;
             for &raw_id in &self.world.order {
                 if !self.world.objects.contains_key(&raw_id) {
                     return Err(Trap::Invalid(format!(
@@ -319,8 +324,23 @@ impl Machine<'_, '_> {
                 i16::try_from(raw_id).map_err(|_| {
                     Trap::Invalid(format!("object ID {raw_id} does not fit a script word"))
                 })?;
+                if unique {
+                    let idx = usize::from(raw_id);
+                    if idx < 4096 {
+                        let word = &mut seen_low[idx >> 6];
+                        let bit = 1u64 << (idx & 63);
+                        if *word & bit != 0 {
+                            unique = false;
+                        } else {
+                            *word |= bit;
+                        }
+                    } else if !seen_high.get_or_insert_default().insert(raw_id) {
+                        unique = false;
+                    }
+                }
             }
             self.order_validated = true;
+            self.order_unique = unique;
         }
         let ids: &[u16] = if is_people {
             &self.world.people
@@ -331,6 +351,7 @@ impl Machine<'_, '_> {
             0 => 0,
             _ => match u16::try_from(current).ok().and_then(|cur| {
                 if !is_people
+                    && self.order_unique
                     && let Some((last_id, last_idx)) = self.last_order_cursor
                     && last_id == cur
                     && ids.get(last_idx) == Some(&cur)

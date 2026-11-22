@@ -611,6 +611,12 @@ fn encode_record_v2(
     header: &AutosaveHeaderV2,
     payload: &[u8],
 ) -> std::result::Result<Vec<u8>, SaveError> {
+    if payload.len() > MAX_AUTOSAVE_PAYLOAD_BYTES {
+        return Err(SaveError::InvalidInput(format!(
+            "save payload length {} exceeds maximum {MAX_AUTOSAVE_PAYLOAD_BYTES}",
+            payload.len()
+        )));
+    }
     let mut out = Vec::with_capacity(RECORD_HEADER_LEN + 256 + payload.len() / 4);
     out.extend_from_slice(&AUTOSAVE_MAGIC);
     out.extend_from_slice(&AUTOSAVE_FORMAT.to_le_bytes());
@@ -756,6 +762,18 @@ fn decompress_v2_payload(
             detail: format!(
                 "decompressed V2 payload length {} does not match header length {expected_len}",
                 payload.len()
+            ),
+        });
+    }
+    let consumed = decoder.into_inner().total_in();
+    if consumed != compressed.len() as u64 {
+        return Err(SaveError::DecodeFailed {
+            neighborhood_id: neighborhood_id.to_owned(),
+            lot_id,
+            slot,
+            detail: format!(
+                "V2 compressed payload has trailing bytes (consumed {consumed} of {} bytes)",
+                compressed.len()
             ),
         });
     }
@@ -998,11 +1016,18 @@ where
                     slot,
                     detail: format!("V2 payload length {} overflows usize", header.payload_len),
                 })?;
-            // Outer record_checksum already authenticates both header and
-            // compressed payload, avoiding a redundant second SHA-256 pass over
-            // the uncompressed bytes.
             let payload =
                 decompress_v2_payload(neighborhood_id, lot_id, slot, compressed, expected_len)?;
+            let actual_payload_sha = sha256_bytes(&payload);
+            if actual_payload_sha != header.payload_sha256 {
+                return Err(SaveError::CorruptChecksum {
+                    neighborhood_id: neighborhood_id.to_owned(),
+                    lot_id,
+                    slot,
+                    expected: header.payload_sha256,
+                    actual: actual_payload_sha,
+                });
+            }
             validate_payload_bytes(
                 neighborhood_id,
                 lot_id,
@@ -1208,6 +1233,12 @@ impl AutosaveStore {
         }
 
         let (payload_kind, payload_bytes) = job.payload.into_encoded();
+        if payload_bytes.len() > MAX_AUTOSAVE_PAYLOAD_BYTES {
+            return Err(SaveError::InvalidInput(format!(
+                "save payload length {} exceeds maximum {MAX_AUTOSAVE_PAYLOAD_BYTES}",
+                payload_bytes.len()
+            )));
+        }
         let validation_slot = match job.target {
             SaveTarget::Manual | SaveTarget::ManualForceReplace => SaveSlot::Manual,
             SaveTarget::Autosave => SaveSlot::Autosave(0),
