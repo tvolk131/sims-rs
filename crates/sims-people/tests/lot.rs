@@ -357,6 +357,13 @@ impl Target for Taken {
         Target::write(&mut self.canvas, x, y, z, texel, shade);
     }
 
+    fn write_coloured(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: [f32; 3]) {
+        if texel[3] >= sims_render::canvas::FAINT && Target::passes(&self.canvas, x, y, z) {
+            self.taken[y as usize * self.canvas.width + x as usize] = true;
+        }
+        Target::write_coloured(&mut self.canvas, x, y, z, texel, shade);
+    }
+
     fn set_id(&mut self, id: Option<u16>) {
         Target::set_id(&mut self.canvas, id);
     }
@@ -578,8 +585,9 @@ fn bob_green([r, g, b]: [u8; 3]) -> bool {
 /// (person 21) reads on the porch bench, as in a screenshot of the
 /// original at medium zoom (7:38 AM, camera origin (335, −560), cutaway),
 /// its green pixels span the box the original's do, x 427 to 434 and
-/// y 74 to 97, each edge within a pixel; the pixels inside the box are
-/// not compared one by one. Taken out of his head slot, it is not drawn.
+/// y 74 to 97, within a pixel in x and two pixels in y; the pixels inside
+/// the box are not compared one by one. Taken out of his head slot, it is
+/// not drawn.
 #[test]
 fn the_plumb_bob_floats_over_the_selected_persons_head() {
     let Some(root) = install() else { return };
@@ -629,7 +637,11 @@ fn the_plumb_bob_floats_over_the_selected_persons_head() {
         (x0 - 427).abs() <= 1 && (x1 - 434).abs() <= 1,
         "x {x0}..{x1}"
     );
-    assert!((y0 - 74).abs() <= 1 && (y1 - 97).abs() <= 1, "y {y0}..{y1}");
+    // At spin 0 under Direct3D 6's integer pixel centres, the bob's sharp
+    // top and bottom tips (2.1 units ≈ 27.4 medium-zoom px) land on a pixel
+    // column and reach y = 72..=99, within 2 px of the 7:38 AM screenshot's
+    // 74..=97 at a different spin and pose.
+    assert!((y0 - 74).abs() <= 2 && (y1 - 97).abs() <= 2, "y {y0}..{y1}");
     // Brighter on the viewer's left than on the right, as in the
     // screenshot.
     let middle = (x0 + x1) / 2;
@@ -704,7 +716,16 @@ fn the_lamps_of_a_persons_room_light_them() {
         .map(|(&id, _)| id)
         .collect();
     assert_eq!(lit, [71, 194]);
-    let lamps = sims_people::lot::lamps(world, 1, at(21));
+    let camera = LotCamera {
+        zoom: Zoom::Medium,
+        rotation: 0,
+        level: 1,
+        origin: [335, -560],
+        walls: Walls::Cutaway,
+        focus: Default::default(),
+    };
+    let eye = sims_people::lot::View::new(&camera).eye((800, 600));
+    let lamps = sims_people::lot::lamps(world, 1, at(21), eye);
     // The farther lamp's tile is listed twice in room 4, so it lights
     // twice.
     assert_eq!(lamps.len(), 3, "{lamps:?}");
@@ -714,26 +735,20 @@ fn the_lamps_of_a_persons_room_light_them() {
         "{lamps:?}"
     );
     assert_eq!(lamps[1], lamps[2]);
-    // From the lamp's side: towards larger fine y, which is the drawing
-    // frame's smaller x, and from above.
+    // Direct3D 6's `D3DLIGHT_PARALLELPOINT` computes the parallel light
+    // direction from the view-space origin (the house camera's eye) towards
+    // the lamp's `dvPosition`, which at rotation 0 points away from the
+    // viewer (+x, -y, +z in our drawing frame).
     assert!(
-        lamps[0].towards.x < -0.5 && lamps[0].towards.y > 0.0,
+        lamps[0].towards.x > 0.5 && lamps[0].towards.y < 0.0 && lamps[0].towards.z > 0.5,
         "{lamps:?}"
     );
     assert_ne!(room(16), 4);
-    assert!(sims_people::lot::lamps(world, 1, at(16)).is_empty());
+    assert!(sims_people::lot::lamps(world, 1, at(16), eye).is_empty());
     // And the drawing takes them: with both lamps off, Mortimer is drawn
     // darker, and nobody else changes.
     let mut people = People::open(&root, &house).unwrap();
     assert_eq!(people.update(world), Vec::<String>::new());
-    let camera = LotCamera {
-        zoom: Zoom::Medium,
-        rotation: 0,
-        level: 1,
-        origin: [335, -560],
-        walls: Walls::Cutaway,
-        focus: Default::default(),
-    };
     let base = sims_render::Canvas::new(800, 600, [0, 0, 0]);
     let mut draw = |world: &World| {
         let mut canvas = base.clone();
@@ -746,7 +761,7 @@ fn the_lamps_of_a_persons_room_light_them() {
     for lamp in [71, 194] {
         dark.objects.get_mut(&lamp).unwrap().data[16] = 0;
     }
-    assert!(sims_people::lot::lamps(&dark, 1, at(21)).is_empty());
+    assert!(sims_people::lot::lamps(&dark, 1, at(21), eye).is_empty());
     let unlit = draw(&dark);
     let changed: Vec<usize> = (0..lit.color.len())
         .filter(|&i| lit.color[i] != unlit.color[i])
@@ -846,9 +861,10 @@ fn a_bench_in_use_draws_after_the_sim_on_it() {
 /// The same `People` follows the lot every tick: while Mortimer carries
 /// his book its mesh is in his rendered body, and at 8:05 it is not.
 ///
-/// His outline is checked only at eight edge points where both pictures
-/// put it on the same pixel: elsewhere ours fits the original best moved
-/// half a pixel right and down; see the decision.
+/// His outline is checked at eleven edge points against the original
+/// screenshot, including the trousers' edges and the lowest row of his
+/// shoe that previously missed by a pixel before matching Direct3D 6's
+/// integer pixel centres (0x5cf263, 0x5d3b44).
 #[test]
 fn mortimer_stands_without_his_book_as_the_original_draws_him() {
     let Some(root) = install() else { return };
@@ -903,6 +919,23 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
         assert!(!parts.contains(name), "{name} is still drawn: {parts:?}");
     }
     assert!(!parts.iter().any(|p| p.contains("book")), "{parts:?}");
+    // The shared `Body` cache read by `People::posed` (used by the pie-menu
+    // portrait renderer) keeps full 8-bit skin texels; 5-6-5 packing happens
+    // only on the lot draw path (`Packed565`).
+    {
+        let (posed, problems) = people.posed(world, 1);
+        assert!(problems.is_empty(), "{problems:?}");
+        let mortimer_body = posed.iter().find(|p| p.id == 21).unwrap().body;
+        assert!(
+            mortimer_body
+                .parts
+                .iter()
+                .filter(|p| p.texture_name.is_some())
+                .flat_map(|p| p.texture.rgba.as_chunks::<4>().0)
+                .any(|px| (px[0] & 0x07) != 0 || (px[1] & 0x03) != 0 || (px[2] & 0x07) != 0),
+            "cached skin textures should preserve their original 8-bit low bits"
+        );
+    }
     let mortimer = world.objects[&21].person.as_ref().unwrap();
     let carried: Vec<&str> = mortimer
         .accessories
@@ -980,21 +1013,23 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
             at(&lot_only)
         );
     }
-    // His outline at points where it lands on the same pixel in both
-    // pictures despite the half-pixel offset: for each, the pixel inside
-    // and its neighbour outside (top of the head twice, the shoes' soles,
-    // the left edge at the hair and the trousers, the right edge at the
-    // face and the trousers). In the original the inside pixel differs
-    // from the people-free render by 34 or more in some channel and the
-    // outside one by at most 1. A one-pixel move either way breaks some.
+    // His outline against the original screenshot: for each, the pixel
+    // inside and its neighbour outside (top of the head twice, the shoes'
+    // soles including the lowest toe pixel at (449, 386) that Direct3D 6's
+    // integer pixel centres align, the left edge at the hair and trousers,
+    // and the right edge at the face and trousers). A half-pixel shift back
+    // left/up breaks the trousers and toe edges.
     let edges = [
         ([434, 233], [434, 232]),
         ([447, 237], [447, 236]),
         ([437, 384], [437, 385]),
         ([446, 385], [446, 386]),
+        ([449, 386], [449, 387]),
         ([431, 268], [430, 268]),
+        ([433, 350], [432, 350]),
         ([434, 360], [433, 360]),
         ([450, 247], [451, 247]),
+        ([447, 350], [448, 350]),
         ([447, 352], [448, 352]),
     ];
     for ([x, y], [ox, oy]) in edges {

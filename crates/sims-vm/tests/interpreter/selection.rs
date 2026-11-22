@@ -552,6 +552,8 @@ fn the_room_constants_come_from_the_global_files_table_3() {
 fn before_the_frame_the_selected_familys_friend_count_is_worked_out() {
     use sims_sim::neighbors::{FAMILY, Family, Neighbor, Row};
     let (mut fx, _) = lot();
+    let lot_number = fx.world.globals[10];
+    fx.program.zoning.insert(lot_number, 1);
     // Records 1 and 2 like each other 25, the default threshold: record
     // 2, of family 7, is a friend of family 5's one member.
     let record = |id: i16, guid: u32, family: i16, target: i32| {

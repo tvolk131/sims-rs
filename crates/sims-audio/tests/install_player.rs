@@ -4,7 +4,7 @@
 use sha2::{Digest, Sha256};
 use sims_audio::files::SoundFiles;
 use sims_audio::module::Module;
-use sims_audio::player::{BLOCK, NoSources, Player, RATE, Samples};
+use sims_audio::player::{NoSources, Player, RATE, Samples, TIMER_FRAMES};
 use sims_audio::stations::StationLists;
 use sims_audio::{Pcm, SoundEvent};
 use std::collections::BTreeMap;
@@ -42,8 +42,8 @@ fn digest(samples: &[i16]) -> String {
         .collect()
 }
 
-/// The rendered sound is the sample, then silence to the end of the block
-/// in which it ended.
+/// The rendered sound is the sample, then silence until the next 40 ms
+/// (`2 * TIMER_FRAMES`) `wait_samp` poll (`0x57e468` → `0x57e6bd`) sees it end.
 fn assert_plays(out: &[i16], sample: &[i16]) {
     assert!(
         out.len() >= sample.len(),
@@ -56,7 +56,7 @@ fn assert_plays(out: &[i16], sample: &[i16]) {
         "rendered PCM differs from the sample"
     );
     assert!(out[sample.len()..].iter().all(|&s| s == 0));
-    assert!(out.len() - sample.len() < BLOCK);
+    assert!(out.len() - sample.len() < 2 * TIMER_FRAMES);
 }
 
 #[test]
@@ -94,7 +94,7 @@ fn the_phone_rings() {
     assert_plays(&out, &decoded(&files, "sounddata\\phone\\Phone_ring.xa"));
     assert_eq!(
         format!("{} {}", out.len(), digest(&out)),
-        "57600 7c80c9c31e36190b39af9de8232ab099624491d07d901120cbcaf01d91866640"
+        "58212 2a49bb418a1bdfcdf948831a8398b3cd0064fa9309f32b9a8fb734e6fa90488a"
     );
 }
 
@@ -144,14 +144,14 @@ fn a_sim_takes_a_soft_footstep() {
     assert_eq!(
         chosen,
         [
-            "1: footstep_soft4.xa a26534af81aefb44",
-            "2: footstep_soft1.xa d87bc948c3a4427e",
-            "3: footstep_soft1.xa d87bc948c3a4427e",
-            "4: footstep_soft1.xa d87bc948c3a4427e",
-            "5: footstep_soft3.xa 876e27b375a26b71",
-            "6: footstep_soft3.xa 876e27b375a26b71",
-            "7: footstep_soft1.xa d87bc948c3a4427e",
-            "8: footstep_soft4.xa a26534af81aefb44",
+            "1: footstep_soft4.xa c339b0602e236218",
+            "2: footstep_soft1.xa effad2d961e7eb87",
+            "3: footstep_soft1.xa effad2d961e7eb87",
+            "4: footstep_soft1.xa effad2d961e7eb87",
+            "5: footstep_soft3.xa 46a848e359516648",
+            "6: footstep_soft3.xa 46a848e359516648",
+            "7: footstep_soft1.xa effad2d961e7eb87",
+            "8: footstep_soft4.xa c339b0602e236218",
         ]
     );
 
@@ -206,7 +206,7 @@ fn every_event_definition_runs_without_a_bad_instruction() {
         player.handle(&SoundEvent::StopAll, &NoSources);
         player.faults.clear();
         player.play_from(*module, 1, name, &NoSources);
-        player.render(20 * BLOCK, &NoSources);
+        player.render(20 * TIMER_FRAMES, &NoSources);
         if !player.is_idle() {
             still_running += 1;
         }
@@ -238,24 +238,31 @@ fn every_event_definition_runs_without_a_bad_instruction() {
     // events with an empty track field (the original's lookup of track 0
     // finds nothing, as here) and the 2 events of kinds not ported:
     // pausing (103) and reloading (104). The 5 ambience modes (52) start
-    // and stop scores, none of which this test loads. Of the 186 events
-    // still running after 20 blocks, 5 change the music mode (36) and
-    // start music or a river loop, or a slow fade of the music, that runs
-    // on; the piano (43) plays notes for ever; the 60 that turn on a
-    // television or radio play their station for ever; 119 more loop
-    // (fires, appliances, voices that loop) and one,
-    // `Grimreaper_loop_kill`, fades its own vol for 21 blocks: the loop
-    // track it targets is not running, so `target` is itself.
+    // and stop scores, none of which this test loads. Of the 183 events
+    // still running after 20 HIT timer ticks (400 ms), 4 change the music
+    // mode (36) and start music or a river loop that runs on (`bkground_fade`
+    // targets stopped `MainMusicLoop`, where 0x57e059 forces `fade_on` back
+    // to 0 so its `waiteq` finishes immediately, as does `Grimreaper_loop_kill`
+    // targeting stopped `Grimreaper_loop`); the piano (43) plays notes
+    // for ever; the 60 that turn on a television or radio play their
+    // station for ever; and 118 more loop (fires, appliances, voices
+    // that loop).
     // (`shoo_tub_inside_vox` waits a random time, which the station
-    // scripts' draws make short here. `ltub_running` starts nothing: a
-    // later `[Patch]` line registers its track 68262 again as a patch.)
+    // scripts' draws finish within 20 ticks here. `ltub_running` starts
+    // nothing: a later `[Patch]` line registers its track 68262 again as
+    // a patch. `playtag_laugh_vox` (track 3928) has only a child hit list
+    // (`v1=0, v2=0, v3=0x46b; call 0x103; loop`), so under `NoSources`
+    // (gender 0 = adult male) `0x103` returns without waiting and `loop`
+    // (`0x57ee33`) legitimately hits our host step limit (`STEPS`).)
     assert_eq!(definitions.len(), 4494);
-    assert_eq!((still_running, format!("{unported:?}")), (186, "{}".into()));
+    assert_eq!((still_running, format!("{unported:?}")), (183, "{}".into()));
     assert_eq!(format!("{kinds:?}"), "{103: 1, 104: 1}");
     assert_eq!(
         format!("{faults:?}"),
         "{\"event names no track\": 14, \"event of a kind not ported\": 2, \
-         \"hit list not found\": 1, \"patch not found\": 3, \"track entry point not found\": 10}"
+         \"hit list not found\": 1, \"patch not found\": 3, \
+         \"track 3928 (sounddata\\\\simsgeneratedhitsource) at 0x29: ran too long without waiting\": 1, \
+         \"track entry point not found\": 10}"
     );
 }
 
@@ -391,9 +398,9 @@ fn the_backyard_ambience_plays() {
     let out = player.render_stereo(60 * RATE as usize, &noon);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     let ambience = player.ambience().unwrap();
-    // The neighbourhood's music starts and live's fades it out within a
-    // second; its scripts draw on the random numbers the ambience's
-    // cells are picked with.
+    // The neighbourhood's music starts and live's slow fade-out
+    // (`fade_speed = 3` per 20 ms tick ≈ 6.84 s) fades it out; its scripts
+    // draw on the random numbers the ambience's cells are picked with.
     let loud = out.iter().filter(|s| s.unsigned_abs() > 64).count();
     assert!(loud > out.len() / 20, "{loud} of {}", out.len());
     assert_eq!(
@@ -404,7 +411,7 @@ fn the_backyard_ambience_plays() {
             out.len(),
             digest(&out)
         ),
-        "(13, 6) 3 2646000 43a4d0f5cfcb9688209f7f1760202de8ddbe276b450fbd6b35484c700e24f055"
+        "(13, 6) 3 2646000 ea094de0e96af7f418000639cd2698f6dcdcfc383b6eacdb73b866d1c80cec88"
     );
 }
 
@@ -442,9 +449,9 @@ fn the_night_and_beach_loops_play_in_live_mode() {
             &day,
         );
     }
-    // Let the neighbourhood music finish fading out; daytime live mode
-    // is silent.
-    let _ = player.render_stereo(5 * RATE as usize, &day);
+    // Let the neighbourhood music finish its slow fade-out (`fade_speed = 3` per
+    // 20 ms tick ≈ 6.84 s); daytime live mode is then silent.
+    let _ = player.render_stereo(8 * RATE as usize, &day);
     assert!(
         player
             .render_stereo(RATE as usize, &day)
@@ -496,4 +503,64 @@ fn the_night_and_beach_loops_play_in_live_mode() {
     player.handle(&SoundEvent::Pause, &downtown_noon);
     let paused = player.render_stereo(RATE as usize, &downtown_noon);
     assert!(paused.iter().all(|&s| s == 0));
+}
+
+#[test]
+fn effects_volume_slider_starts_and_stops_installed_night_loop() {
+    let Some(root) = install() else { return };
+    let files = SoundFiles::scan(&root).unwrap();
+    let mut player = player(&root, 1);
+    player.add_stations(&StationLists::build(&files));
+
+    let snap = |hour: i32| {
+        let mut s = sims_audio::sources::Snapshot::default();
+        s.absent[4] = hour;
+        s.lot = 1;
+        s
+    };
+    let night = snap(22);
+    let day = snap(12);
+
+    // Enter live mode at night with effects muted (step 0): `nite_loop`
+    // cannot start while group 1 volume is 0.
+    player.set_fx_volume_step(0, &night);
+    for name in ["bkground_nhood1", "bkground_live"] {
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &night,
+        );
+    }
+    let _ = player.render_stereo(8 * RATE as usize, &night);
+    assert!(
+        player
+            .render_stereo(RATE as usize, &night)
+            .iter()
+            .all(|&s| s == 0),
+        "nite_loop should stay silent while effects slider is at 0"
+    );
+
+    // Raising the effects slider (kind 37, step 6 -> 790) re-runs 0x574978
+    // and starts `nite_loop` without a camera move.
+    player.set_fx_volume_step(6, &night);
+    let out = player.render_stereo(RATE as usize, &night);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    assert!(
+        out.iter().any(|&s| s != 0),
+        "raising effects slider at night should start nite_loop"
+    );
+
+    // Moving the effects slider during daytime stops `nite_loop` via 0x574978.
+    player.set_fx_volume_step(10, &day);
+    let _ = player.render_stereo(RATE as usize, &day);
+    assert!(
+        player
+            .render_stereo(RATE as usize, &day)
+            .iter()
+            .all(|&s| s == 0),
+        "kind 37 during daytime should fade out nite_loop"
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
 }

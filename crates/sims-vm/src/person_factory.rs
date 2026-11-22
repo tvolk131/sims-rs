@@ -335,7 +335,7 @@ impl Interpreter<'_> {
     /// fails. The lot is residential when global 10 is 0 or a house zoned
     /// 1 (0x40745f, 0x42b9e3).
     pub(crate) fn visitor_pass(&self, world: &mut World) -> Result<(), Trap> {
-        visitor_pass(self.program, world)
+        visitor_pass(self.program, world, self.active_family)
     }
 
     /// Gives person `id` default interests and personality (0x459a9c) if
@@ -494,24 +494,34 @@ fn residential(program: &Program, world: &World) -> bool {
 }
 
 /// The visitor pass (0x42a2b4): see [`Interpreter::visitor_pass`].
-pub(crate) fn visitor_pass(program: &Program, world: &mut World) -> Result<(), Trap> {
+pub(crate) fn visitor_pass(
+    program: &Program,
+    world: &mut World,
+    active_family: Option<&[u32]>,
+) -> Result<(), Trap> {
     if !world.people.iter().any(|id| world.objects.contains_key(id)) {
         return Ok(());
     }
     let family = i32::from(world.globals.get(9).copied().unwrap_or(0));
-    if family == 0 {
-        return Err(Trap::Unsupported(
-            "0x42a2b4: the visitor pass with global 9 at 0: which family the game holds \
-             (game +0x10) is not kept"
-                .into(),
-        ));
-    }
-    let members = world
-        .families
-        .iter()
-        .find(|f| f.id == family)
-        .map(|f| f.members.clone())
-        .ok_or_else(|| Trap::Invalid(format!("global 9 names family {family}, which is gone")))?;
+    let members: Vec<u32> = if family == 0 {
+        let Some(members) = active_family else {
+            return Err(Trap::Unsupported(
+                "0x42a2b4: the visitor pass with global 9 at 0: which family the game holds \
+                 (game +0x10) is not kept"
+                    .into(),
+            ));
+        };
+        members.to_vec()
+    } else {
+        world
+            .families
+            .iter()
+            .find(|f| f.id == family)
+            .map(|f| f.members.clone())
+            .ok_or_else(|| {
+                Trap::Invalid(format!("global 9 names family {family}, which is gone"))
+            })?
+    };
     let residential = residential(program, world);
     for id in world.people.clone() {
         let Some(object) = world.objects.get_mut(&id) else {

@@ -329,6 +329,10 @@ impl<'a> Machine<'a, '_> {
             view_centre: self.view_centre,
             refreshing: interpreter.refreshing,
             taken_off: interpreter.taken_off,
+            dialog_text: self.dialog_text,
+            character_names: self.character_names,
+            default_character_name: self.default_character_name,
+            active_family: self.active_family,
         }
     }
 
@@ -576,7 +580,7 @@ mod tests {
         let a = World::empty();
         let mut b = a.clone();
         b.dirty_portraits.insert(0x1234_5678);
-        assert_eq!(a.encode(), b.encode(), "dirty_portraits is not encoded");
+        assert_ne!(a.encode(), b.encode(), "dirty_portraits is encoded");
         assert!(!same_lot(&a, &b));
 
         let mut c = a.clone();

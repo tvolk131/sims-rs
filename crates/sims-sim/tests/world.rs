@@ -275,7 +275,8 @@ fn world() -> World {
             next_file: 4,
         },
         portraits: BTreeSet::from([0x1234_0042, 0x7fd9_6b54]),
-        dirty_portraits: BTreeSet::new(),
+        dirty_portraits: BTreeSet::from([0xdead_beef]),
+        saved_portraits: BTreeSet::from([0xfeed_face]),
         generated_portrait_2002: BTreeSet::new(),
         made_portrait_head: BTreeMap::new(),
         ambiguous_portraits: BTreeSet::new(),
@@ -461,7 +462,14 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "20fd811dcc1faebf0012fb041c894f499a0306c53d0cd7705f7530b18ea3b55f";
+const PINNED: &str = "34b77b707e0e920d6b4a00e824b93934c9b7bbecf32898ea5e96df18219b8a2e";
+
+#[test]
+fn without_the_dirty_and_saved_portraits_the_encoding_is_format_31() {
+    // Snapshot format 32 added the portrait dirty and saved sets at the end.
+    assert_eq!(digest(&format_31_bytes(&world())), PINNED_31);
+}
+const PINNED_31: &str = "20fd811dcc1faebf0012fb041c894f499a0306c53d0cd7705f7530b18ea3b55f";
 
 #[test]
 fn without_the_portraits_the_encoding_is_format_30() {
@@ -479,12 +487,25 @@ fn without_the_made_characters_the_encoding_is_format_29() {
 }
 const PINNED_29: &str = "f1663444bf686193967fab0511a75eaad4599c03369d188260cc34f84ee1f9ae";
 
+/// The encoding of `world` as snapshot format 31 wrote it: without the
+/// portrait dirty and saved sets ([`sims_sim::World::dirty_portraits`],
+/// [`sims_sim::World::saved_portraits`]) that format 32 added at the end.
+/// The older formats' encodings start from this one.
+fn format_31_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let saved = postcard::to_allocvec(&world.saved_portraits).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - saved.len()), saved);
+    let dirty = postcard::to_allocvec(&world.dirty_portraits).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - dirty.len()), dirty);
+    bytes
+}
+
 /// The encoding of `world` as snapshot format 30 wrote it: without the
 /// person types whose portrait the interface has built
 /// ([`sims_sim::World::portraits`]) that format 31 added at the end. The
 /// older formats' encodings start from this one.
 fn format_30_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_31_bytes(world);
     let built = postcard::to_allocvec(&world.portraits).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - built.len()), built);
     bytes
@@ -1242,6 +1263,12 @@ fn any_field_change_changes_the_hash() {
     changed.portraits.remove(&0x7fd9_6b54);
     assert_ne!(changed.hash(), base);
     let mut changed = world();
+    changed.dirty_portraits.remove(&0xdead_beef);
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.saved_portraits.remove(&0xfeed_face);
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
     changed.dialogs.records[0].status = 5;
     assert_ne!(changed.hash(), base);
     let mut changed = world();
@@ -1380,6 +1407,41 @@ fn saved_lots_round_trip_through_redb_apart_from_the_snapshots() {
         world.encode()
     );
     assert!(store.load_lot("missing").unwrap().is_none());
+}
+
+#[test]
+fn snapshot_floor_rotations_round_trip_and_clear_on_plain_save() {
+    let file = Temp::new("snapshot-floor-rot");
+    let world = world();
+    let mut overwritten = world.clone();
+    overwritten.ticks += 7;
+    {
+        let store = Snapshots::open(&file.0).unwrap();
+        assert!(store.load_with_floor_rotation("boot").unwrap().is_none());
+        store.save_with_floor_rotation("boot", &world, 7).unwrap();
+        store.save("plain", &world).unwrap();
+    }
+    {
+        let ro = ReadOnlySnapshots::open(&file.0).unwrap();
+        let (loaded, rot) = ro.load_with_floor_rotation("boot").unwrap().unwrap();
+        assert_eq!(rot, Some(3));
+        assert_eq!(loaded.encode(), world.encode());
+        assert_eq!(ro.load("boot").unwrap().unwrap().encode(), world.encode());
+        let (plain_world, plain_rot) = ro.load_with_floor_rotation("plain").unwrap().unwrap();
+        assert_eq!(plain_rot, None);
+        assert_eq!(plain_world.encode(), world.encode());
+        assert!(ro.load_with_floor_rotation("missing").unwrap().is_none());
+    }
+    // Overwriting a named snapshot with plain save (the exact legacy record
+    // format written by older writers) replaces the record and leaves no stale
+    // floor rotation behind.
+    {
+        let store = Snapshots::open(&file.0).unwrap();
+        store.save("boot", &overwritten).unwrap();
+        let (loaded, rot) = store.load_with_floor_rotation("boot").unwrap().unwrap();
+        assert_eq!(rot, None);
+        assert_eq!(loaded.ticks, world.ticks + 7);
+    }
 }
 
 fn person() -> sims_formats::saved_objects::Person {

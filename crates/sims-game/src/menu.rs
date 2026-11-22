@@ -413,9 +413,19 @@ pub struct Menu {
     /// Whether the left mouse button is held down over the pie, which
     /// draws the highlighted label in cyan (0x5eb04c).
     held: bool,
-    /// The head of the Sim the menu is for, drawn in each menu's middle
-    /// (`People::head`), if it was rendered.
+    /// The head of the Sim the menu is for, rasterized into the active house
+    /// viewport (`People::head_in_viewport`), if it was rendered.
     pub head: Option<Image>,
+    /// Top-left house-viewport pixel where [`Menu::head`] sits.
+    pub head_origin: [i32; 2],
+    /// Native 16-bit house z-buffer depth per pixel of [`Menu::head`]
+    /// (`sims_render::depth::EMPTY` where transparent), for `D3DCMP_LESSEQUAL`
+    /// depth testing against the house scene (`0x4a9500`, `0x5ce959`–`0x5ce977`).
+    pub head_depth: Vec<i32>,
+    /// The main menu's pie-head look frozen when a submenu opened (`0x462106`,
+    /// `0x462290` reads highlighted/angle/distance from the parent menu while
+    /// a submenu is active).
+    submenu_look: Option<sims_people::pie_head::Look>,
 }
 
 /// What a left release on an open [`Menu`] did (0x5eb433).
@@ -478,6 +488,9 @@ impl Menu {
             moved: false,
             held: true,
             head: None,
+            head_origin: [0, 0],
+            head_depth: Vec::new(),
+            submenu_look: None,
         };
         menu.layout(art, size);
         menu.moved = menu.layouts.first().is_some_and(|l| l.moved);
@@ -558,6 +571,7 @@ impl Menu {
             self.sticky = true;
             return Release::Settled;
         }
+        let opening_look = (self.layouts.len() == 1).then(|| self.head_look(Some(point)));
         match self.pie.press(&self.layouts, point) {
             Pressed::Chose(choice) => Release::Chose(choice),
             pressed @ (Pressed::Opened { .. } | Pressed::Back) => {
@@ -565,9 +579,11 @@ impl Menu {
                 self.layout(art, self.size);
                 match pressed {
                     Pressed::Opened { .. } => {
+                        self.submenu_look = opening_look;
                         self.pointer = self.layouts.last().map(|l| l.center);
                     }
                     Pressed::Back => {
+                        self.submenu_look = None;
                         // Backing out restores the parent at its requested
                         // position (0x48db38) and re-runs placement
                         // (0x5ebab2), which warps the pointer back to the
@@ -597,6 +613,11 @@ impl Menu {
         Release::Closed
     }
 
+    /// Where the pointer is to be moved, without consuming the pending warp.
+    pub fn pending_pointer(&self) -> Option<[i32; 2]> {
+        self.pointer
+    }
+
     /// Where the pointer is to be moved, once.
     pub fn take_pointer(&mut self) -> Option<[i32; 2]> {
         self.pointer.take()
@@ -617,8 +638,9 @@ impl Menu {
             .unwrap_or_default()
     }
 
-    /// The size of the face in each menu's middle, which the head is
-    /// drawn to fill: the face bitmap's.
+    /// The size of the transparent face placeholder bitmap in each menu's
+    /// middle (`PieFace1.bmp`, drawn by `0x5eb04c`; the 3D head itself draws
+    /// separately in the house viewport at `0x462985`).
     pub fn face_size(&self) -> [u32; 2] {
         let face = self
             .layouts
@@ -627,17 +649,57 @@ impl Menu {
         face.map(|n| u32::try_from(n).unwrap_or(0))
     }
 
-    /// Draws the menus as last laid out, with [`Menu::head`] over the face
-    /// bitmap in the middle.
+    /// The top-left screen position of the first menu's face rectangle.
+    pub fn face_origin(&self) -> Option<[i32; 2]> {
+        self.layouts.first().map(|l| [l.face.x, l.face.y])
+    }
+
+    /// The center of the first (main) menu, where the 3D pie head is
+    /// positioned in the house viewport (`0x462621` → `0x462985`).
+    pub fn main_center(&self) -> Option<[i32; 2]> {
+        self.layouts.first().map(|l| l.center)
+    }
+
+    /// The center of the currently active menu (the submenu if one is open,
+    /// otherwise the main menu), where the dark radial backdrop sits
+    /// (`0x46216e` → `0x4ac8ff`).
+    pub fn active_center(&self) -> Option<[i32; 2]> {
+        self.layouts.last().map(|l| l.center)
+    }
+
+    /// The pie head's [`sims_people::pie_head::Look`] for `pointer`
+    /// (`0x462290`). While a submenu is open, the original keeps reading the
+    /// frozen parent menu's highlighted entry and pointer vector; otherwise it
+    /// tracks `pointer` live against the main menu.
+    pub fn head_look(&self, pointer: Option<[i32; 2]>) -> sims_people::pie_head::Look {
+        if self.layouts.len() > 1 {
+            return self
+                .submenu_look
+                .unwrap_or_else(sims_people::pie_head::Look::neutral);
+        }
+        let Some(main) = self.layouts.first() else {
+            return sims_people::pie_head::Look::neutral();
+        };
+        let highlighted = pointer.and_then(|p| pie::hit(main, p));
+        sims_people::pie_head::Look::from_menu(main.center, pointer, highlighted, main.labels.len())
+    }
+
+    /// Draws the menus as last laid out, compositing [`Menu::head`] at
+    /// [`Menu::head_origin`] behind the 2D menu labels (`0x462621` →
+    /// `0x5eb04c`).
     pub fn draw(&self, frame: &mut Frame, art: &Art, pointer: Option<[i32; 2]>) {
-        Pie::draw(
-            frame,
-            art,
-            &self.layouts,
-            self.head.as_ref(),
-            pointer,
-            self.held,
-        );
+        if let Some(head) = &self.head {
+            frame.draw_all(head, self.head_origin);
+        }
+        Pie::draw(frame, art, &self.layouts, None, pointer, self.held);
+    }
+
+    /// Draws only the pie menu's 2D UI layer (face bitmap, title, and labels),
+    /// leaving out [`Menu::head`] because `Game::draw` already composited it
+    /// in the house viewport pass before the bottom HUD panel (`0x4a953e` →
+    /// `0x5eb04c`).
+    pub fn draw_labels(&self, frame: &mut Frame, art: &Art, pointer: Option<[i32; 2]>) {
+        Pie::draw(frame, art, &self.layouts, None, pointer, self.held);
     }
 }
 
@@ -891,6 +953,38 @@ mod tests {
     }
 
     #[test]
+    fn head_look_tracks_pointer_and_freezes_parent_direction_in_submenu() {
+        let art = art();
+        let mut menu = Menu::new(1, 2, named(&STUDIES), [400, 300], &art, [800, 600]);
+        assert_eq!(menu.release(&art, [400, 300]), Release::Settled);
+        // Inside the dead zone: idle ambient (0.8), no compass direction.
+        let idle = menu.head_look(Some([400, 300]));
+        assert_eq!(idle.direction, None);
+        assert_eq!(idle.ambient(), sims_people::pie_head::AMBIENT_IDLE);
+
+        // Hovering "Study" (bottom entry of 2 -> compass direction 4):
+        let study = centre(menu.layouts[0].labels[1].rect);
+        let on_study = menu.head_look(Some(study));
+        assert_eq!(on_study.direction, Some(4));
+        assert_eq!(
+            on_study.ambient(),
+            sims_people::pie_head::AMBIENT_HIGHLIGHTED
+        );
+
+        // Opening the submenu freezes the parent look even as pointer moves to submenu center.
+        assert_eq!(menu.release(&art, study), Release::Stays);
+        assert_eq!(menu.layouts.len(), 2);
+        let sub_center = menu.layouts[1].center;
+        assert_eq!(menu.active_center(), Some(sub_center));
+        assert_eq!(menu.head_look(Some(sub_center)), on_study);
+
+        // Going back resumes live tracking on the parent menu.
+        assert_eq!(menu.release(&art, sub_center), Release::Stays);
+        assert_eq!(menu.layouts.len(), 1);
+        assert_eq!(menu.head_look(Some([400, 300])).direction, None);
+    }
+
+    #[test]
     fn a_debug_entry_is_starred_unless_it_carries_its_stored_name() {
         assert_eq!(entry_label(Some("Eat"), 3, false, false), "Eat");
         assert_eq!(entry_label(Some("Eat"), 3, true, false), "*Eat");
@@ -898,5 +992,33 @@ mod tests {
         assert_eq!(entry_label(Some(" "), 3, true, true), "Interaction 3");
         assert_eq!(entry_label(Some(" "), 3, true, false), "*Interaction 3");
         assert_eq!(entry_label(None, 3, false, true), "Interaction 3");
+    }
+
+    #[test]
+    fn menu_draw_places_cached_head_at_head_origin() {
+        let art = art();
+        let mut menu = Menu::new(1, 2, named(&STUDIES), [400, 300], &art, [800, 600]);
+        let face_origin = menu.face_origin().expect("face origin");
+        let head_origin = [face_origin[0] + 80, face_origin[1] + 68];
+        menu.head_origin = head_origin;
+        menu.head = Some(Image {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                220, 40, 30, 255, 220, 40, 30, 255, //
+                220, 40, 30, 255, 220, 40, 30, 255,
+            ],
+        });
+        let mut frame = Frame::new(800, 600, [0, 0, 0]);
+        menu.draw(&mut frame, &art, Some([400, 300]));
+        assert_eq!(
+            frame.pixel(head_origin[0], head_origin[1]),
+            Some([220, 40, 30])
+        );
+        assert_eq!(
+            frame.pixel(face_origin[0], face_origin[1]),
+            Some([0, 0, 0]),
+            "head must be drawn at head_origin, not face_origin"
+        );
     }
 }

@@ -12,16 +12,16 @@ use std::path::PathBuf;
 /// SHA-256 prefixes of the 16-bit-color images, by zoom, rotation and wall
 /// mode.
 const DIGESTS: &[(u32, u8, &str, &str)] = &[
-    (1, 0, "up", "489e49d35047767d"),
-    (1, 0, "cutaway", "20032461d289c46a"),
-    (1, 1, "up", "72bddc2febc0bd2e"),
-    (1, 1, "cutaway", "83511cc4400a8a8e"),
-    (1, 2, "up", "2b0a18029c134301"),
-    (1, 2, "cutaway", "5fc3f9fdb1b0f02d"),
-    (1, 3, "up", "a3c600e6189168e3"),
-    (1, 3, "cutaway", "ebece623c9ccf6a9"),
+    (1, 0, "up", "5877f89cf54dc9af"),
+    (1, 0, "cutaway", "19e845535fe44521"),
+    (1, 1, "up", "2519158dc4fe07e5"),
+    (1, 1, "cutaway", "edeca76b2354401a"),
+    (1, 2, "up", "9240057d55b0a9f8"),
+    (1, 2, "cutaway", "85ea76decfc5415d"),
+    (1, 3, "up", "807ab0f0e4c988c3"),
+    (1, 3, "cutaway", "da7881b4da22bc0b"),
     (2, 0, "up", "05116b4bdf73c830"),
-    (2, 0, "cutaway", "c135b92db338e7bf"),
+    (2, 0, "cutaway", "0fad7a22e4a68aad"),
     (2, 1, "up", "f2ac49d9955f711b"),
     (2, 1, "cutaway", "bb47a2398aaf781f"),
     (2, 2, "up", "8f4c2e2aabd0a0c8"),
@@ -29,7 +29,7 @@ const DIGESTS: &[(u32, u8, &str, &str)] = &[
     (2, 3, "up", "96ba51bf04a1e71e"),
     (2, 3, "cutaway", "e175524ba183b815"),
     (3, 0, "up", "83522815a8355fb6"),
-    (3, 0, "cutaway", "e5222a8890e99e5a"),
+    (3, 0, "cutaway", "d4d87ef539bb974f"),
     (3, 1, "up", "4aa47d188bdab023"),
     (3, 1, "cutaway", "cdd27beba0720a5e"),
     (3, 2, "up", "5028f52b7a2b74a8"),
@@ -58,7 +58,9 @@ fn goth_house_renders_the_same_at_every_zoom_and_rotation() {
     // The house asks for a lot 52 tiles on a side; the grass's random
     // streams depend on it.
     assert_eq!(opened.world.size, 52);
-    let lot = Lot::from_world(&opened.world).unwrap();
+    let lot = Lot::from_world(&opened.world)
+        .unwrap()
+        .with_floor_rotation(opened.rotation);
     let before = opened.world.hash();
     let upstairs: std::collections::BTreeSet<i16> = lot.levels[1]
         .rooms
@@ -125,7 +127,9 @@ fn hidden_objects_are_not_drawn() {
     };
     let house = root.join("UserData/Houses/House05.iff");
     let mut opened = open_house(&root, &house).unwrap();
-    let lot = Lot::from_world(&opened.world).unwrap();
+    let lot = Lot::from_world(&opened.world)
+        .unwrap()
+        .with_floor_rotation(opened.rotation);
     let mut camera = Camera {
         zoom: Zoom::Far,
         rotation: 0,
@@ -213,7 +217,9 @@ fn off_lot_void_colour_follows_time_of_day_and_house_99() {
     ];
     // Build `Lot` once at daytime; `draw` reads live globals 4 and 10 on each
     // clear (0x4aa9bd) so changes to globals take effect without rebuilding `Lot`.
-    let lot = Lot::from_world(&opened.world).unwrap();
+    let lot = Lot::from_world(&opened.world)
+        .unwrap()
+        .with_floor_rotation(opened.rotation);
     for (time_of_day, house_no, want) in cases {
         let mut world = opened.world.clone();
         if world.globals.len() <= 10 {
@@ -245,7 +251,9 @@ fn cut_doorways_draw_no_wall_stub_and_cap_both_flanking_ends() {
     // Clear objects so the test checks only floors, walls and mid-run caps
     // (load scripts that mark style-3 doors hidden have not run here).
     opened.world.objects.clear();
-    let lot = Lot::from_world(&opened.world).unwrap();
+    let lot = Lot::from_world(&opened.world)
+        .unwrap()
+        .with_floor_rotation(opened.rotation);
     // Control lot with every wall removed, giving the bare floor beneath.
     let mut no_walls = lot.clone();
     for cell in &mut no_walls.levels[0].walls {
@@ -405,4 +413,215 @@ fn cut_doorways_draw_no_wall_stub_and_cap_both_flanking_ends() {
             "cap ({x}, {y}) should change when its surviving wall is repainted"
         );
     }
+}
+
+#[test]
+fn road_dashes_swap_on_odd_rotations_and_respect_saved_rotation_level_and_splits() {
+    let Some(root) = install() else {
+        return;
+    };
+
+    // 1. House05 is saved at rotation 0 with a Y-road storing floor 11 at
+    //    (46, 5). At rotation 1 (odd parity from 0), it must draw sprite 10;
+    //    at rotation 2 (even parity), it must keep sprite 11.
+    let house05 = root.join("UserData/Houses/House05.iff");
+    let mut opened = open_house(&root, &house05).unwrap();
+    assert_eq!(opened.rotation, 0);
+    let lot = Lot::from_world(&opened.world)
+        .unwrap()
+        .with_floor_rotation(opened.rotation);
+    let cell = Lot::cell(46, 5);
+    assert_eq!(lot.levels[0].floors[cell], 11);
+
+    let render_tile = |assets: &mut sims_render::Assets,
+                       world: &sims_sim::World,
+                       lot: &Lot,
+                       rotation: u8,
+                       level: i32,
+                       tile: [i32; 2]| {
+        let mut camera = Camera {
+            zoom: Zoom::Near,
+            rotation,
+            level,
+            origin: [0, 0],
+            walls: Walls::Down,
+            focus: Focus::default(),
+        };
+        let fine = [tile[0] * 16 + 8, tile[1] * 16 + 8];
+        let elev = i32::from(lot.heights[Lot::cell(tile[0] as usize, tile[1] as usize)][0]) * 16;
+        let p = camera.project_fine(camera.rotate_fine(fine), level, elev);
+        camera.origin = [80 - p[0], 50 - p[1]];
+        let mut canvas = Canvas::new(160, 100, [0, 0, 0]);
+        draw(world, lot, assets, &camera, &mut canvas);
+        canvas
+    };
+
+    let swap_all_level1 = |base: &Lot, floor_rotation: u8| {
+        let mut out = base.clone().with_floor_rotation(floor_rotation);
+        for id in &mut out.levels[0].floors {
+            if matches!(*id, 10 | 11) {
+                *id ^= 1;
+            }
+        }
+        out
+    };
+
+    // Reference at rotation 1 with floor_rotation = 1 (no swap): swapping
+    // every level-1 road dash in place must match `lot` drawn at rotation 1,
+    // while leaving them unswapped must differ.
+    let ref_swapped = swap_all_level1(&lot, 1);
+    let ref_unswapped = lot.clone().with_floor_rotation(1);
+
+    let actual_r1 = render_tile(&mut opened.assets, &opened.world, &lot, 1, 1, [46, 5]);
+    let expected_10 = render_tile(
+        &mut opened.assets,
+        &opened.world,
+        &ref_swapped,
+        1,
+        1,
+        [46, 5],
+    );
+    let wrong_11 = render_tile(
+        &mut opened.assets,
+        &opened.world,
+        &ref_unswapped,
+        1,
+        1,
+        [46, 5],
+    );
+    assert_eq!(actual_r1, expected_10);
+    assert_ne!(actual_r1, wrong_11);
+
+    // Rotation 2 (even parity from 0) must keep sprite 11.
+    let ref_r2_same = lot.clone().with_floor_rotation(2);
+    let ref_r2_swapped = swap_all_level1(&lot, 2);
+    let actual_r2 = render_tile(&mut opened.assets, &opened.world, &lot, 2, 1, [46, 5]);
+    assert_eq!(
+        actual_r2,
+        render_tile(
+            &mut opened.assets,
+            &opened.world,
+            &ref_r2_same,
+            2,
+            1,
+            [46, 5]
+        )
+    );
+    assert_ne!(
+        actual_r2,
+        render_tile(
+            &mut opened.assets,
+            &opened.world,
+            &ref_r2_swapped,
+            2,
+            1,
+            [46, 5]
+        )
+    );
+
+    // 2. Level 2 never swaps 10 <-> 11 (0x4a8080 walks [lot + 0x24] only).
+    let mut upstairs = lot.clone().with_floor_rotation(0);
+    let up_tile = [30, 10];
+    let up_cell = Lot::cell(up_tile[0] as usize, up_tile[1] as usize);
+    upstairs.levels[1].floors[up_cell] = 10;
+    let upstairs_no_swap = upstairs.clone().with_floor_rotation(1);
+    let mut upstairs_swapped = upstairs.clone().with_floor_rotation(1);
+    upstairs_swapped.levels[1].floors[up_cell] = 11;
+    let actual_up = render_tile(&mut opened.assets, &opened.world, &upstairs, 1, 2, up_tile);
+    assert_eq!(
+        actual_up,
+        render_tile(
+            &mut opened.assets,
+            &opened.world,
+            &upstairs_no_swap,
+            1,
+            2,
+            up_tile
+        )
+    );
+    assert_ne!(
+        actual_up,
+        render_tile(
+            &mut opened.assets,
+            &opened.world,
+            &upstairs_swapped,
+            1,
+            2,
+            up_tile
+        )
+    );
+
+    // 3. A level-1 split tile (floor == SPLIT_FLOOR) holding 10 in its wall
+    //    cell never swaps at odd parity (0x4a8089 tests the floor grid only).
+    let split_tile = [30, 10];
+    let split_cell = Lot::cell(split_tile[0] as usize, split_tile[1] as usize);
+    let mut split = lot.clone().with_floor_rotation(0);
+    split.levels[0].floors[split_cell] = sims_render::lot::SPLIT_FLOOR;
+    split.levels[0].walls[split_cell].segments = sims_render::lot::DESCENDING;
+    split.levels[0].walls[split_cell].styles[0] = 10;
+    split.levels[0].walls[split_cell].patterns[0] = 10;
+    let split_no_swap = split.clone().with_floor_rotation(1);
+    let mut split_swapped = split.clone().with_floor_rotation(1);
+    split_swapped.levels[0].walls[split_cell].styles[0] = 11;
+    split_swapped.levels[0].walls[split_cell].patterns[0] = 11;
+    let actual_split = render_tile(&mut opened.assets, &opened.world, &split, 1, 1, split_tile);
+    assert_eq!(
+        actual_split,
+        render_tile(
+            &mut opened.assets,
+            &opened.world,
+            &split_no_swap,
+            1,
+            1,
+            split_tile
+        )
+    );
+    assert_ne!(
+        actual_split,
+        render_tile(
+            &mut opened.assets,
+            &opened.world,
+            &split_swapped,
+            1,
+            1,
+            split_tile
+        )
+    );
+
+    // 4. House24 is saved at odd rotation (camera_direction = 1) with a Y-road
+    //    already storing floor 10 at (39, 6). At rotation 1 it must keep
+    //    sprite 10; at rotation 0 it must swap to sprite 11.
+    let house24 = root.join("UserData/Houses/House24.iff");
+    let mut h24 = open_house(&root, &house24).unwrap();
+    assert_eq!(h24.rotation, 1);
+    let lot24 = Lot::from_world(&h24.world)
+        .unwrap()
+        .with_floor_rotation(h24.rotation);
+    let c24 = Lot::cell(39, 6);
+    assert_eq!(lot24.levels[0].floors[c24], 10);
+
+    let h24_ref_same = lot24.clone().with_floor_rotation(0);
+    let h24_ref_swapped = swap_all_level1(&lot24, 0);
+
+    let at_r0 = render_tile(&mut h24.assets, &h24.world, &lot24, 0, 1, [39, 6]);
+    assert_eq!(
+        at_r0,
+        render_tile(&mut h24.assets, &h24.world, &h24_ref_swapped, 0, 1, [39, 6])
+    );
+    assert_ne!(
+        at_r0,
+        render_tile(&mut h24.assets, &h24.world, &h24_ref_same, 0, 1, [39, 6])
+    );
+
+    let h24_r1_same = lot24.clone().with_floor_rotation(1);
+    let h24_r1_swapped = swap_all_level1(&lot24, 1);
+    let at_r1 = render_tile(&mut h24.assets, &h24.world, &lot24, 1, 1, [39, 6]);
+    assert_eq!(
+        at_r1,
+        render_tile(&mut h24.assets, &h24.world, &h24_r1_same, 1, 1, [39, 6])
+    );
+    assert_ne!(
+        at_r1,
+        render_tile(&mut h24.assets, &h24.world, &h24_r1_swapped, 1, 1, [39, 6])
+    );
 }

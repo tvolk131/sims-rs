@@ -464,10 +464,18 @@ impl Machine<'_, '_> {
     /// Which IFF file holds the winning definition for `guid` (`0x4e893e` →
     /// `0x43ac10`), as `0x4e9000` writes `BMP_` 2002 into that file.
     pub(crate) fn portrait_file(&self, guid: u32) -> Option<PortraitFile> {
-        if let Some(made) = self.world.characters.made.get(&guid) {
+        self.portrait_file_in(self.world, guid)
+    }
+
+    pub(crate) fn portrait_file_in(
+        &self,
+        world: &sims_sim::World,
+        guid: u32,
+    ) -> Option<PortraitFile> {
+        if let Some(made) = world.characters.made.get(&guid) {
             return Some(PortraitFile::Made(made.file));
         }
-        crate::interpreter::object_definition(self.catalog, self.world, guid)
+        crate::interpreter::object_definition(self.catalog, world, guid)
             .map(|def| PortraitFile::Resource(def.resource))
     }
 
@@ -475,20 +483,24 @@ impl Machine<'_, '_> {
     /// `0x43ac10`) holds a neutral-language `BMP_` 2002 portrait (either
     /// loaded from disk or generated earlier by `0x4e938c` → `0x4e9000`).
     pub(crate) fn has_portrait_2002(&self, guid: u32) -> bool {
+        self.has_portrait_2002_in(self.world, guid)
+    }
+
+    pub(crate) fn has_portrait_2002_in(&self, world: &sims_sim::World, guid: u32) -> bool {
         if self
-            .portrait_file(guid)
-            .is_some_and(|file| self.world.generated_portrait_2002.contains(&file))
+            .portrait_file_in(world, guid)
+            .is_some_and(|file| world.generated_portrait_2002.contains(&file))
+            || self.file_has_saved_portrait_in(world, guid)
         {
             return true;
         }
-        let Some(def) = crate::interpreter::object_definition(self.catalog, self.world, guid)
-        else {
+        let Some(def) = crate::interpreter::object_definition(self.catalog, world, guid) else {
             return false;
         };
         self.program
             .libraries
             .get(&def.resource)
-            .is_some_and(|library| library.has_portrait_2002)
+            .is_some_and(|library| library.has_portrait_bitmap)
     }
 
     /// Whether the program/world supplies appearance, suit, or bone metadata
@@ -556,7 +568,7 @@ impl Machine<'_, '_> {
         self.program
             .libraries
             .get(&def.resource)
-            .is_some_and(|library| !library.read_only)
+            .is_some_and(|library| library.writable)
     }
 
     /// Runs `0x4e8c5d(index, 1, save_bitmap)` for a `guid` already verified
@@ -577,7 +589,13 @@ impl Machine<'_, '_> {
     /// `0x4e7801` → `0x58a178(1)`), which can clear the portrait cache via
     /// `0x58d4e1` → `0x4eb0cc` → `0x4e897e` when the pet's head slot is empty.
     pub(crate) fn try_render_pet_portrait(&mut self, guid: u32) -> Result<(), Trap> {
-        self.render_portrait(guid, true, true, 5, "Make New Character's portrait")
+        self.render_portrait(
+            guid,
+            true,
+            true,
+            5,
+            "Make New Character's pet portrait (0x44b126)",
+        )
     }
 
     fn render_portrait(
@@ -623,6 +641,7 @@ impl Machine<'_, '_> {
                 self.world.dirty_portraits.remove(&guid);
                 if save_bitmap && self.is_portrait_file_writable(guid) {
                     self.world.generated_portrait_2002.insert(file_key);
+                    self.world.saved_portraits.insert(guid);
                 }
             }
             // 0x4e8dab..0x4e8fbb: additional flags in `0x4e8c5d` run forced
@@ -731,6 +750,7 @@ impl Machine<'_, '_> {
                 lot.dirty_portraits.remove(&guid);
                 if save_bitmap {
                     lot.generated_portrait_2002.insert(file_key);
+                    lot.saved_portraits.insert(guid);
                 }
             }
             // 0x4e8dab..0x4e8fbb: additional flags in `0x4e8c5d(index, 0x1f, 1)`
@@ -791,7 +811,18 @@ impl Machine<'_, '_> {
                             crate::placement::PORTRAIT_SEARCH_RULES,
                         )
                         .map_err(|f| f.trap)?;
-                    finish_at(tile, tile.is_some(), lot, run_cells)
+                    let (mut lot, run_cells) = finish_at(tile, tile.is_some(), lot, run_cells)?;
+                    // After a dirty rebuild (`0x4e92f2`, `save_bitmap == false`),
+                    // `0x4e931c -> 0x4e9338` immediately reloads `BMP_` 2002 into
+                    // slot 1 when empty, so placed and unput starts converge.
+                    if !save_bitmap
+                        && !lot.portraits.contains(&guid)
+                        && self.has_portrait_2002_in(&lot, guid)
+                    {
+                        lot.portraits.insert(guid);
+                        lot.dirty_portraits.remove(&guid);
+                    }
+                    Ok((lot, run_cells))
                 };
                 let first = run_start(starts[0])?;
                 let first_lot = crate::both_ways::LotSnapshot::of(&first.0);

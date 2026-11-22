@@ -100,7 +100,7 @@ fn clean_slot_with_bmp_2002_caches_without_creating_a_sim_while_dirty_slot_rende
         .libraries
         .get_mut(&file)
         .unwrap()
-        .has_portrait_2002 = true;
+        .has_portrait_bitmap = true;
     let crt_before = fx.world.crt_rng;
     assert_eq!(
         run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
@@ -119,7 +119,7 @@ fn clean_slot_with_bmp_2002_caches_without_creating_a_sim_while_dirty_slot_rende
         .libraries
         .get_mut(&file)
         .unwrap()
-        .has_portrait_2002 = true;
+        .has_portrait_bitmap = true;
     fx.world.dirty_portraits.insert(WIDGET);
     let crt_before = fx.world.crt_rng;
     assert_eq!(
@@ -140,7 +140,7 @@ fn read_only_off_lot_skips_factory_and_fallback_render_persists_bmp_2002() {
     // 0x4e9652 completely (no Init, no CRT RNG draw, portrait stays uncached,
     // returns true).
     let (mut fx, file, record) = visitors();
-    fx.program.libraries.get_mut(&file).unwrap().read_only = true;
+    fx.program.libraries.get_mut(&file).unwrap().writable = false;
     let crt_before = fx.world.crt_rng;
     assert_eq!(
         run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
@@ -154,7 +154,7 @@ fn read_only_off_lot_skips_factory_and_fallback_render_persists_bmp_2002() {
     // 0x4e8cc6 writability gate, caching the portrait without persisting a
     // generated BMP_ 2002 to the read-only file.
     let (mut fx, _, _) = visitors();
-    fx.program.libraries.get_mut(&SIM_FILE).unwrap().read_only = true;
+    fx.program.libraries.get_mut(&SIM_FILE).unwrap().writable = false;
     fx.world.neighbors.slots.push(Some(Neighbor {
         guid: SIM_GUID,
         id: 2,
@@ -177,7 +177,7 @@ fn read_only_off_lot_skips_factory_and_fallback_render_persists_bmp_2002() {
     // rendering succeeds and persists BMP_ 2002.
     let (mut fx, file, _) = visitors();
     fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
-    fx.program.libraries.get_mut(&file).unwrap().read_only = true;
+    fx.program.libraries.get_mut(&file).unwrap().writable = false;
     let made_guid = 0x5555_0002u32;
     fx.world.characters.made.insert(
         made_guid,
@@ -696,7 +696,7 @@ fn mode_1_handles_on_lot_household_and_runtime_made_characters_without_trapping(
         .libraries
         .get_mut(&file)
         .unwrap()
-        .has_portrait_2002 = true;
+        .has_portrait_bitmap = true;
     fx.world.neighbors.slots.push(Some(Neighbor {
         guid: made_guid,
         id: 51,
@@ -773,7 +773,7 @@ fn mode_1_handles_off_lot_failures_and_duplicate_catalog_guids() {
         .libraries
         .get_mut(&file)
         .unwrap()
-        .has_portrait_2002 = true;
+        .has_portrait_bitmap = true;
     count_init_unplaceable(&mut fx, file);
     assert_eq!(
         run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
@@ -833,7 +833,7 @@ fn mode_1_handles_off_lot_failures_and_duplicate_catalog_guids() {
         .libraries
         .get_mut(&LAMP_FILE)
         .unwrap()
-        .has_portrait_2002 = true;
+        .has_portrait_bitmap = true;
     assert_eq!(
         run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
         Ok(true)
@@ -869,14 +869,9 @@ fn mode_1_handles_off_lot_failures_and_duplicate_catalog_guids() {
         )]),
     );
     {
-        let cb = fx
-            .program
-            .libraries
-            .get_mut(&LAMP_FILE)
-            .unwrap()
-            .callbacks
-            .get_mut(&128)
-            .unwrap();
+        let lib = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+        lib.writable = true;
+        let cb = lib.callbacks.get_mut(&128).unwrap();
         cb[0].action = 4098;
         cb[1].action = 4097;
     }
@@ -1980,7 +1975,7 @@ fn dialog_reloads_embedded_bmp_2002_and_clones_inherit_session_writeback() {
         .libraries
         .get_mut(&file)
         .unwrap()
-        .has_portrait_2002 = true;
+        .has_portrait_bitmap = true;
     fx.add(
         LAMP_FILE,
         4096,
@@ -2534,7 +2529,7 @@ fn person_data_invalidation_catalog_dialog_indexed_suits_live_outfits_and_ordere
     // honors save flag 0 when dirty.
     {
         let (mut fx, file, record) = visitors();
-        fx.program.libraries.get_mut(&file).unwrap().read_only = true;
+        fx.program.libraries.get_mut(&file).unwrap().writable = false;
         let before_rng = fx.world.crt_rng.state();
         fx.add(
             LAMP_FILE,
@@ -7266,7 +7261,7 @@ fn round_26_dirty_reset_invalidation_mixed_starts() {
             .libraries
             .get_mut(&file)
             .unwrap()
-            .has_portrait_2002 = true;
+            .has_portrait_bitmap = true;
         fx.world.dirty_portraits.insert(WIDGET);
         // Removal callback (`BEFORE_REMOVAL`, function 5 -> Wait: use `Reset` /
         // function 5 `BEFORE_REMOVAL` which runs during `remove_now` on BOTH

@@ -114,6 +114,8 @@ pub mod scope {
     pub const TEMPS: u8 = 8;
     pub const PARAMETERS: u8 = 9;
     pub const STACK_OBJECT: u8 = 10;
+    pub const MY_PERSON: u8 = 18;
+    pub const STACK_PERSON: u8 = 19;
     pub const LOCALS: u8 = 25;
 }
 pub mod op {
@@ -364,6 +366,7 @@ impl Fixture {
             callbacks: BTreeMap::from([(128, callbacks.to_vec())]),
             definitions: BTreeMap::from([(128, words)]),
             definition_order: vec![128],
+            writable: kind == 2,
             ..Library::default()
         };
         self.program.libraries.insert(resource, library);

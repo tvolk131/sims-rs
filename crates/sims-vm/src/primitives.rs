@@ -4,7 +4,7 @@
 
 pub(crate) mod action_string;
 mod animate;
-mod budget;
+pub(crate) mod budget;
 mod burn;
 pub(crate) mod change_suit;
 mod create;

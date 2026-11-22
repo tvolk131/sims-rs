@@ -169,9 +169,15 @@ pub fn sources(world: &World) -> Snapshot {
 /// high, through `camera`, as the original's sound code asks the view
 /// (0x570e09): the object's fine position rotated into the view about
 /// 1023, not the drawing's 1024 (0x47bc1f), then projected on its level
-/// by [`fine_point`]. Empty for a camera so far off that its arithmetic
-/// would overflow, which no view the controls make comes near.
-pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, Projection> {
+/// with the tile's terrain heights ([`object_point_on_lot`]). Empty for a
+/// camera so far off that its arithmetic would overflow, which no view
+/// the controls make comes near.
+pub fn screen(
+    world: &World,
+    lot: &sims_render::Lot,
+    camera: &Camera,
+    size: [i32; 2],
+) -> BTreeMap<i32, Projection> {
     if camera.origin.iter().any(|n| n.unsigned_abs() >= 1 << 26) {
         return BTreeMap::new();
     }
@@ -180,7 +186,7 @@ pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, P
         .values()
         .filter(|object| object.id > 0)
         .map(|object| {
-            let at = object_point(camera, object.position);
+            let at = object_point_on_lot(camera, lot, object.position);
             let view = Projection {
                 at,
                 screen: size,
@@ -192,50 +198,132 @@ pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, P
         .collect()
 }
 
-/// The screen point of an object at `position` (fine, fine, level), as
-/// the original's view works it out for an object (0x4071a3, 0x47bc1f,
+/// The active lot's rotated tile bounds `[min_x, max_x, min_y, max_y]`
+/// (0x4791a6).
+pub(crate) fn lot_bounds(lot: &sims_render::Lot, camera: &Camera) -> [i32; 4] {
+    if lot.size == 0 {
+        return [0; 4];
+    }
+    let last = lot.size as i32 - 1;
+    let a = camera.rotate_tile([0, 0]);
+    let b = camera.rotate_tile([last, last]);
+    [
+        a[0].min(b[0]),
+        a[0].max(b[0]),
+        a[1].min(b[1]),
+        a[1].max(b[1]),
+    ]
+}
+
+/// A view tile's four corner terrain heights in view order (0x479567,
+/// corner table 0x6c4ebc: left, top, right, bottom). Returns `[0; 4]` if
+/// the unrotated tile is outside the lot.
+pub(crate) fn raw_tile_corners(
+    lot: &sims_render::Lot,
+    camera: &Camera,
+    view_tile: [i32; 2],
+) -> [u8; 4] {
+    let [x, y] = camera.unrotate_tile(view_tile);
+    if !lot.contains(x, y) {
+        return [0; 4];
+    }
+    let h = lot.heights[sims_render::Lot::cell(x as usize, y as usize)];
+    let rotation = usize::from(camera.rotation & 3);
+    std::array::from_fn(|n| h[(n + 4 - rotation) & 3])
+}
+
+/// A view tile's four corner terrain heights as `0x4a9c50` and `0x4a9dc7`
+/// read them: [`raw_tile_corners`] on the lot's inner tiles
+/// (`min_x + 1..=max_x - 1`, `min_y + 1..=max_y - 1`), and `[0; 4]` on
+/// the border or off the lot.
+pub fn tile_corners(lot: &sims_render::Lot, camera: &Camera, view_tile: [i32; 2]) -> [i32; 4] {
+    if lot.size < 3 {
+        return [0; 4];
+    }
+    let b = lot_bounds(lot, camera);
+    if view_tile[0] <= b[0] || view_tile[0] >= b[1] || view_tile[1] <= b[2] || view_tile[1] >= b[3]
+    {
+        return [0; 4];
+    }
+    raw_tile_corners(lot, camera, view_tile).map(i32::from)
+}
+
+/// Rotates a fine lot position into view coordinates about 1023, as
+/// `0x47bc1f` does with `param_4 = 0x400`.
+pub(crate) fn rotate_object_fine(camera: &Camera, [x, y]: [i32; 2]) -> [i32; 2] {
+    let m: i32 = 1023;
+    match camera.rotation & 3 {
+        1 => [m.wrapping_sub(y), x],
+        2 => [m.wrapping_sub(x), m.wrapping_sub(y)],
+        3 => [y, m.wrapping_sub(x)],
+        _ => [x, y],
+    }
+}
+
+/// The screen point of an object at `position` (fine, fine, level) on flat
+/// ground, as the original's view works it out (0x4071a3, 0x47bc1f,
 /// 0x4a9dc7): the fine position rotated into the view about 1023, not
 /// the drawing's 1024, then projected on its level by [`fine_point`].
 pub fn object_point(camera: &Camera, position: [i32; 3]) -> [i32; 2] {
-    let m = 1023;
     let [x, y, level] = position;
-    let rotated = match camera.rotation & 3 {
-        1 => [m - y, x],
-        2 => [m - x, m - y],
-        3 => [y, m - x],
-        _ => [x, y],
-    };
-    fine_point(camera, rotated, level)
+    fine_point(camera, rotate_object_fine(camera, [x, y]), level)
+}
+
+/// The screen point of an object at `position` (fine, fine, level) on
+/// `lot`, including the tile's terrain heights (0x4071a3, 0x47bc1f,
+/// 0x4a9dc7, 0x479567).
+pub fn object_point_on_lot(
+    camera: &Camera,
+    lot: &sims_render::Lot,
+    position: [i32; 3],
+) -> [i32; 2] {
+    let [x, y, level] = position;
+    let rotated = rotate_object_fine(camera, [x, y]);
+    let tile = [rotated[0] >> 4, rotated[1] >> 4].map(|n| i32::from(n as i16));
+    let corners = tile_corners(lot, camera, tile);
+    fine_point_with_heights(camera, rotated, level, corners)
+}
+
+/// The screen point of a fine view position on `level` on flat ground, as
+/// the original's view works it out (0x4a9dc7): see
+/// [`fine_point_with_heights`].
+pub fn fine_point(camera: &Camera, fine: [i32; 2], level: i32) -> [i32; 2] {
+    fine_point_with_heights(camera, fine, level, [0; 4])
 }
 
 /// The screen point of a fine view position on `level`, as the
-/// original's view works it out (0x4a9dc7), which the drawing's
-/// [`Camera::project_fine`] does not: the tile's corner is projected and
-/// cut to 16 bits each way, then each part of the step across the tile
-/// is cut toward zero on its own and added in 16 bits. The result can be
-/// a pixel off the drawing's.
-///
-/// The original also raises the corner, and slants the step, by the
-/// heights of the tile's four corners. Those are left out (the ground is
-/// taken as flat), which only moves the point up or down
-/// (**unverified** on a lot that is not flat).
-pub fn fine_point(camera: &Camera, [x, y]: [i32; 2], level: i32) -> [i32; 2] {
+/// original's view works it out (0x4a9dc7, 0x4a9c50): the tile's top
+/// corner is projected at `corners[1]` and cut to 16 bits each way, then
+/// each part of the step across the tile (slanted by `corners`, in view
+/// order: left, top, right, bottom) is cut toward zero on its own and
+/// added in 16 bits. The result can be a pixel off the drawing's
+/// [`Camera::project_fine`].
+pub fn fine_point_with_heights(
+    camera: &Camera,
+    [x, y]: [i32; 2],
+    level: i32,
+    corners: [i32; 4],
+) -> [i32; 2] {
     let shift = camera.zoom.level();
     let [tx, ty] = [x >> 4, y >> 4].map(|n| i32::from(n as i16));
     let [fx, fy] = [x & 15, y & 15];
-    let [cx, cy] = camera.project([tx, ty], level, 0).map(|n| n as i16);
-    // Down the tile, (rise + 2) or (rise + 4) steps of the zoom's half
-    // tile, for a part `f` of 16; the rises are 0 on flat ground.
+    let [cx, cy] = camera
+        .project([tx, ty], level, corners[1])
+        .map(|n| n as i16);
+    // Down the tile, (top - corner + 2) or (top - bottom + 4) steps of
+    // the zoom's half tile, for a part `f` of 16 (0x4a9dc7).
     let down = |steps: i32, f: i32| (steps << (shift + 1)) * f / 16;
     let across = 8 << shift;
     let (dx, dy) = if fx == fy {
-        (0, down(4, fx))
+        (0, down(corners[1] - corners[3] + 4, fx))
     } else if fx > fy {
-        let (side, diagonal) = (down(2, fx), down(4, fx));
+        let side = down(corners[1] - corners[2] + 2, fx);
+        let diagonal = down(corners[1] - corners[3] + 4, fx);
         let right = across * fx / 16;
         (right - right * fy / fx, (diagonal - side) * fy / fx + side)
     } else {
-        let (side, diagonal) = (down(2, fy), down(4, fy));
+        let side = down(corners[1] - corners[0] + 2, fy);
+        let diagonal = down(corners[1] - corners[3] + 4, fy);
         let left = across * fy / -16;
         (left - left * fx / fy, (diagonal - side) * fx / fy + side)
     };
@@ -282,10 +370,11 @@ pub fn pause_event(paused: bool) -> SoundEvent {
 
 /// Bridges a [`crate::Game`] into a [`Mixer`] (or [`crate::output::Output`]):
 /// sends object sources, live-mode entry ([`enter_live`]), live-mode
-/// pause/unpause ([`pause_event`], `0x4ce5c5` / `0x4ce5d9`), the
-/// simulation's sound events, the ambience view/hour/speed, and kind 33
-/// camera moves in the order the window uses.
-#[derive(Default)]
+/// pause/unpause ([`pause_event`], `0x4ce5c5` / `0x4ce5d9`), window
+/// focus changes ([`Input::Active`], kind 25 at `0x4f7608` → `0x4f76d5`,
+/// with live-mode auto-pause matching `byte [0x6c9fa1] == 1` at
+/// `0x4f7635`..`0x4f7666`), the simulation's sound events, the ambience
+/// view/hour/speed, and kind 33 camera moves in the order the window uses.
 pub struct Feed {
     /// The hour, speed and ambience view the sound was last told.
     heard: Option<(u32, Speed, i32)>,
@@ -293,11 +382,211 @@ pub struct Feed {
     told: Option<Snapshot>,
     /// The camera the sound last heard move.
     shot: Option<Shot>,
-    /// Whether the sound was last told the lot is paused.
-    paused: bool,
+    /// The last `game.paused()` value observed from [`crate::Game`], used to
+    /// distinguish manual pause toggles from a focus-loss pause request that a
+    /// modal dialog refused on the simulation side.
+    observed_game_paused: bool,
+    /// The requested pause state (`byte [esi + 0x40]` at `0x4cee5d`, read by
+    /// `0x4939c0` on focus loss and tested at `0x4ce5b0` to choose kind 21 vs
+    /// kind 22 independently of whether the simulation accepted the pause).
+    requested_paused: bool,
+    /// Whether `0x4cee4a` marked the pause flag dirty (`or [esi + 0xc], 0x800040`,
+    /// where `0x800000` is tested at `0x4ce59e` for pause dispatch) so the next
+    /// [`Feed::update`] dispatches `pause_event(self.requested_paused)` even
+    /// when the requested boolean matches the previous one.
+    pause_dirty: bool,
+    /// Whether the window is focused (`true` at startup, matching
+    /// `0x4eee14` and `0x4f7610` deduplication).
+    focused: bool,
+    /// The requested pause state saved on focus loss (`[esi + 0xbc]` at
+    /// `0x4f7645`..`0x4f764a`), restored on focus regain (`0x4f765c`..`0x4f7666`).
+    saved_paused: bool,
+    /// Whether the most recent focus loss auto-paused the lot (true when
+    /// `Sim In Background` was off at blur time, `[0x6c9fa1] == 1`).
+    paused_for_blur: bool,
+    /// The last `[fx, music, vox]` volume steps (`0..=10`) sent to the mixer
+    /// (matching `Player::new`'s `[10, 10, 10]` startup defaults).
+    volumes: [u8; 3],
+}
+
+impl Default for Feed {
+    fn default() -> Self {
+        Self {
+            heard: None,
+            told: None,
+            shot: None,
+            observed_game_paused: false,
+            requested_paused: false,
+            pause_dirty: false,
+            focused: true,
+            saved_paused: false,
+            paused_for_blur: false,
+            volumes: [sims_ui::options::VOLUME_MAX; 3],
+        }
+    }
 }
 
 impl Feed {
+    /// Whether the window is currently considered focused.
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
+    /// Handles a window focus change (`WM_ACTIVATEAPP`, `0x4f7608`..`0x4f76dc`),
+    /// returning whether the lot's pause state changed (so the window should
+    /// redraw).
+    ///
+    /// Repeated notifications with the same state are ignored, including an
+    /// initial `true` at window creation (`0x4eee14`, `0x4f7610`).
+    ///
+    /// - On focus loss (`true -> false`): flushes any already-pending game
+    ///   sources, sounds, and camera moves first so kind 25 off does not
+    ///   overtake earlier events; saves the requested pause state and requests
+    ///   pause (`0x4f7635`..`0x4f765a`, matching `byte [0x6c9fa1] == 1`);
+    ///   then sends [`Input::Active`]`(false)` (`0x4f76d5`). The pending
+    ///   pause reaches sound as [`SoundEvent::Pause`] on the next
+    ///   [`Feed::update`] (`0x4ce5b0`..`0x4ce5c5`), even if a modal dialog
+    ///   kept `game.paused()` false.
+    /// - On focus regain (`false -> true`): refreshes [`Input::Sources`]
+    ///   (and initial [`enter_live`] if needed) without flushing a stale
+    ///   pending focus-loss pause; restores the saved pause state
+    ///   (`0x4f765c`..`0x4f7666`); then sends [`Input::Active`]`(true)`
+    ///   (`0x4f76d5`). The restored pause request reaches sound as
+    ///   [`SoundEvent::Pause`] or [`SoundEvent::Unpause`] on the next
+    ///   [`Feed::update`] (`0x4ce5b0`..`0x4ce5d9`).
+    pub fn set_focused(
+        &mut self,
+        focused: bool,
+        game: &mut crate::Game,
+        mut send: impl FnMut(Input),
+    ) -> bool {
+        if self.focused == focused {
+            return false;
+        }
+        // Pick up any manual pause toggle or mode transition (`0x4ce4c4..0x4ce4d1`)
+        // that happened since the last update so `0x4f7645 -> 0x4939c0` saves
+        // the latest requested pause state.
+        let live_mode = game.mode() == sims_ui::command::Mode::Live;
+        let current_audio_paused = game.paused() || !live_mode;
+        if current_audio_paused != self.observed_game_paused {
+            self.observed_game_paused = current_audio_paused;
+            self.requested_paused = current_audio_paused;
+            self.pause_dirty = true;
+        }
+        let pause_changed = if !focused {
+            // Flush prior clicks, sounds, and camera moves before focus loss
+            // so kind 25 off cannot drop or overtake earlier events, without
+            // prematurely emitting a pending focus-regain `Unpause` when a
+            // rapid refocus-then-blur occurs before the next `update`.
+            self.flush_before_blur(game, &mut send);
+            // `0x4f762b..0x4f763c`: auto-pause only in Live mode (`mode == 2`)
+            // and when `Sim In Background` is off (`byte [0x6c9fa1] == 1`,
+            // toggled at `0x4e628d`).
+            if !live_mode || game.options().play.sim_in_background {
+                self.paused_for_blur = false;
+                false
+            } else {
+                self.paused_for_blur = true;
+                self.saved_paused = self.requested_paused;
+                let before = game.paused();
+                if !before {
+                    game.toggle_pause();
+                }
+                self.observed_game_paused = game.paused() || !live_mode;
+                // `0x4cee52`..`0x4cee5d` records requested pause = true and marks
+                // pause dirty (`0x800000`) unconditionally.
+                self.requested_paused = true;
+                self.pause_dirty = true;
+                game.paused() != before
+            }
+        } else {
+            let first = self.told.is_none();
+            let sources = game.sound_sources();
+            if self.told.as_ref() != Some(&sources) {
+                send(Input::Sources(sources.clone()));
+                self.told = Some(sources);
+            }
+            if first {
+                send(Input::Events(enter_live()));
+            }
+            if !self.paused_for_blur || !live_mode {
+                if live_mode {
+                    self.paused_for_blur = false;
+                }
+                false
+            } else {
+                self.paused_for_blur = false;
+                let before = game.paused();
+                if before != self.saved_paused {
+                    game.toggle_pause();
+                }
+                self.observed_game_paused = game.paused() || !live_mode;
+                // `0x4cee52`..`0x4cee5d` records requested pause = saved_paused and
+                // marks pause dirty (`0x800000`) unconditionally, so a rapid
+                // blur-then-refocus still dispatches the final pause state on the
+                // next update (`0x4ce59e` → `0x4ce5b0`).
+                self.requested_paused = self.saved_paused;
+                self.pause_dirty = true;
+                game.paused() != before
+            }
+        };
+        self.focused = focused;
+        send(Input::Active(focused));
+        pause_changed
+    }
+
+    /// Flushes prior game sources, sounds, and camera moves before focus loss
+    /// without flushing pending pause changes (both manual toggles at
+    /// `0x53a5bf` and focus changes at `0x4f7655` write the same deferred
+    /// pause state at `0x4cee52`..`0x4cee5d`, dispatched only on the next
+    /// [`Feed::update`] at `0x4ce59e`).
+    fn flush_before_blur(&mut self, game: &mut crate::Game, mut send: impl FnMut(Input)) {
+        let first = self.told.is_none();
+        let sources = game.sound_sources();
+        if self.told.as_ref() != Some(&sources) {
+            send(Input::Sources(sources.clone()));
+            self.told = Some(sources);
+        }
+        if first {
+            send(Input::Events(enter_live()));
+        }
+        let sounds = game.take_sounds();
+        if !sounds.is_empty() {
+            send(Input::Events(sounds.into_iter().map(event).collect()));
+        }
+        let now = (game.hour(), game.pace.speed, game.ambience_view());
+        if self.heard != Some(now) {
+            send(Input::View(now.2));
+            send(Input::Hour(now.0));
+            send(Input::Speed(now.1));
+            self.heard = Some(now);
+        }
+        let shot = game.shot();
+        if self.shot != Some(shot) {
+            send(Input::Camera);
+            self.shot = Some(shot);
+        }
+        self.sync_volumes(game, &mut send);
+    }
+
+    /// Sends changed `[fx, music, vox]` slider steps (`0..=10`) to the mixer
+    /// (kinds 37, 38, and 39, `0x4e6182..0x4e620e`).
+    fn sync_volumes(&mut self, game: &crate::Game, mut send: impl FnMut(Input)) {
+        let volumes = game.volumes();
+        if volumes[0] != self.volumes[0] {
+            send(Input::FxVolume(volumes[0]));
+            self.volumes[0] = volumes[0];
+        }
+        if volumes[1] != self.volumes[1] {
+            send(Input::MusicVolume(volumes[1]));
+            self.volumes[1] = volumes[1];
+        }
+        if volumes[2] != self.volumes[2] {
+            send(Input::VoxVolume(volumes[2]));
+            self.volumes[2] = volumes[2];
+        }
+    }
+
     /// Sends every sound input that changed on `game` since the last call.
     pub fn update(&mut self, game: &mut crate::Game, mut send: impl FnMut(Input)) {
         // What the tick's sounds may ask about their objects, before the
@@ -312,10 +601,18 @@ impl Feed {
         if first {
             send(Input::Events(enter_live()));
         }
-        let paused = game.paused();
-        if paused != self.paused {
-            send(Input::Events(vec![pause_event(paused)]));
-            self.paused = paused;
+        self.sync_volumes(game, &mut send);
+        // `0x4ce4c4..0x4ce4d1`: leaving Live mode (e.g. entering Options) pauses
+        // live audio; returning to Live unpauses unless the lot is paused.
+        let audio_paused = game.paused() || game.mode() != sims_ui::command::Mode::Live;
+        if audio_paused != self.observed_game_paused {
+            self.observed_game_paused = audio_paused;
+            self.requested_paused = audio_paused;
+            self.pause_dirty = true;
+        }
+        if self.pause_dirty {
+            send(Input::Events(vec![pause_event(self.requested_paused)]));
+            self.pause_dirty = false;
         }
         let sounds = game.take_sounds();
         if !sounds.is_empty() {
@@ -398,6 +695,14 @@ pub enum Input {
     /// The camera moved (kind 33): sent after the [`Input::Sources`]
     /// and [`Input::View`] that show the lot through the moved camera.
     Camera,
+    /// The window gained or lost focus (kind 25, `0x4f7608` → `0x4f76d5`).
+    Active(bool),
+    /// Sound effects volume slider step `0..=10` (kind 37, `0x4e6182` → `0x57408f`).
+    FxVolume(u8),
+    /// Music volume slider step `0..=10` (kind 38, `0x4e61bb` → `0x5740f9`).
+    MusicVolume(u8),
+    /// Voice volume slider step `0..=10` (kind 39, `0x4e61f4` → `0x57410d`).
+    VoxVolume(u8),
 }
 
 /// The sound player with every module, station and ambient score of an
@@ -453,10 +758,25 @@ impl Mixer {
             Input::Camera => self
                 .player
                 .camera_moved(self.view, self.hour, &self.sources),
+            Input::Active(active) => self.player.set_active(active, &self.sources),
+            Input::FxVolume(step) => self
+                .player
+                .set_fx_volume_step(usize::from(step), &self.sources),
+            Input::MusicVolume(step) => self.player.set_music_volume_step(usize::from(step)),
+            Input::VoxVolume(step) => self.player.set_vox_volume_step(usize::from(step)),
             Input::Speed(speed) => self
                 .player
                 .set_global(SPEED_REGISTER, speed_register(speed)),
         }
+    }
+
+    /// Current `[fx, music, vox]` slider steps (`0..=10`) stored in the player.
+    pub fn volume_steps(&self) -> [u8; 3] {
+        [
+            self.player.fx_volume_step(),
+            self.player.music_volume_step(),
+            self.player.vox_volume_step(),
+        ]
     }
 
     /// Renders `frames` stereo frames at [`sims_audio::player::RATE`],
@@ -533,6 +853,95 @@ mod tests {
     }
 
     #[test]
+    fn terrain_heights_raise_and_slant_fine_point() {
+        use sims_render::camera::{Walls, Zoom};
+        let camera = Camera {
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            origin: [400, 100],
+            walls: Walls::Up,
+            focus: sims_render::Focus::default(),
+        };
+        // A flat elevated tile raises y by `h << (zoom + 1)` without
+        // changing x or the sub-tile step.
+        let flat = fine_point(&camera, [163, 161], 1);
+        assert_eq!(
+            fine_point_with_heights(&camera, [163, 161], 1, [6, 6, 6, 6]),
+            [flat[0], flat[1] - (6 << 2)]
+        );
+        // Sloped tile: top=6, right=2, bottom=0, left=4.
+        // Diagonal (fx == fy == 8): corner raised by 6*4=24, step down by
+        // ((6 - 0 + 4) << 2) * 8 / 16 = 20 (vs flat 8).
+        let diag_flat = fine_point(&camera, [168, 168], 1);
+        assert_eq!(
+            fine_point_with_heights(&camera, [168, 168], 1, [4, 6, 2, 0]),
+            [diag_flat[0], diag_flat[1] - 24 + 12]
+        );
+        // fx > fy (fx=8, fy=4): side = ((6-2+2)<<2)*8/16 = 12,
+        // diagonal = ((6-0+4)<<2)*8/16 = 20 -> dy = (20-12)*4/8 + 12 = 16.
+        let right_base = camera.project([10, 10], 1, 6);
+        assert_eq!(
+            fine_point_with_heights(&camera, [168, 164], 1, [4, 6, 2, 0]),
+            [right_base[0] + 4, right_base[1] + 16]
+        );
+        // fx < fy (fx=4, fy=8): side = ((6-4+2)<<2)*8/16 = 8,
+        // diagonal = ((6-0+4)<<2)*8/16 = 20 -> dy = (20-8)*4/8 + 8 = 14.
+        assert_eq!(
+            fine_point_with_heights(&camera, [164, 168], 1, [4, 6, 2, 0]),
+            [right_base[0] - 4, right_base[1] + 14]
+        );
+    }
+
+    #[test]
+    fn tile_corners_rotate_and_zero_the_border() {
+        use sims_render::camera::{Walls, Zoom};
+        let mut world = World::empty();
+        world.size = 52;
+        let full = sims_render::lot::FULL * sims_render::lot::FULL;
+        for (id, stride) in [(0, 4), (1, 1), (2, 8), (101, 1), (102, 8)] {
+            world.arrays.insert(
+                id,
+                sims_formats::lot::Array {
+                    width: sims_render::lot::FULL,
+                    height: sims_render::lot::FULL,
+                    stride,
+                    encoding: 0,
+                    data: vec![0; full * stride],
+                },
+            );
+        }
+        // Set inner tile (10, 20) to [1, 2, 3, 4] and border tile (0, 20)
+        // to [9, 9, 9, 9].
+        let cell = |x: usize, y: usize| (x * sims_render::lot::FULL + y) * 4;
+        let arr0 = world.arrays.get_mut(&0).unwrap();
+        arr0.data[cell(10, 20)..cell(10, 20) + 4].copy_from_slice(&[1, 2, 3, 4]);
+        arr0.data[cell(0, 20)..cell(0, 20) + 4].copy_from_slice(&[9, 9, 9, 9]);
+        let lot = sims_render::Lot::from_world(&world).unwrap();
+
+        let expected = [[1, 2, 3, 4], [4, 1, 2, 3], [3, 4, 1, 2], [2, 3, 4, 1]];
+        for rotation in 0u8..4 {
+            let camera = Camera {
+                zoom: Zoom::Far,
+                rotation,
+                level: 1,
+                origin: [0, 0],
+                walls: Walls::Up,
+                focus: sims_render::Focus::default(),
+            };
+            let view_inner = camera.rotate_tile([10, 20]);
+            assert_eq!(
+                tile_corners(&lot, &camera, view_inner),
+                expected[usize::from(rotation)],
+                "rotation {rotation}"
+            );
+            // Border tile is zeroed by 0x4a9c50 / 0x4a9dc7.
+            let view_border = camera.rotate_tile([0, 20]);
+            assert_eq!(tile_corners(&lot, &camera, view_border), [0; 4]);
+        }
+    }
+
+    #[test]
     fn a_requests_object_is_widened_without_its_sign() {
         let play = event(sims_vm::SoundEvent::Play {
             object: -1,
@@ -552,5 +961,10 @@ mod tests {
             matches!(stop, SoundEvent::StopObject { object: 12 }),
             "{stop:?}"
         );
+    }
+
+    #[test]
+    fn feed_starts_focused_like_app_constructor() {
+        assert!(Feed::default().focused());
     }
 }

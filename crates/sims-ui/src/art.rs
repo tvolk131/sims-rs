@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 /// The TGAs have an alpha channel instead and no pixel of this color.
 pub const KEY: [u8; 3] = [255, 0, 255];
 
-/// The font sizes the interface uses (`Fonts/variablesans_NN.ffn`).
-pub const FONT_SIZES: [u8; 7] = [7, 8, 9, 10, 11, 12, 14];
+/// The font sizes the interface uses (`Fonts/variablesans_NN.ffn`):
+/// sizes 7..14 plus 18 (`0x6f2b0c`, Child Report Card grade button).
+pub const FONT_SIZES: [u8; 8] = [7, 8, 9, 10, 11, 12, 14, 18];
 
 /// Bitmaps by resource ID, and fonts by size.
 #[derive(Debug, Clone, Default)]

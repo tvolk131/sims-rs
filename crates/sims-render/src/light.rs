@@ -26,6 +26,45 @@
 //! Blue takes the level below and one step more, so black under any light
 //! shows a little blue.
 
+use std::sync::OnceLock;
+
+/// Precomputed 5-6-5 lighting lookup tables matching the original's startup
+/// tables (`0x49eea8`): 32 light levels × (32 red, 64 green, 32 blue) levels,
+/// widened back to 8-bit channels.
+struct Tables {
+    r: [[u8; 32]; 32],
+    g: [[u8; 64]; 32],
+    b: [[u8; 32]; 32],
+}
+
+fn tables() -> &'static Tables {
+    static TABLES: OnceLock<Tables> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        let mut t = Tables {
+            r: [[0; 32]; 32],
+            g: [[0; 64]; 32],
+            b: [[0; 32]; 32],
+        };
+        let inv31 = f64::from(1.0f32 / 31.0);
+        let inv63 = f64::from(1.0f32 / 63.0);
+        for level in 0..32usize {
+            let l = level as f64;
+            let lb = l.max(1.0) - 1.0;
+            for v in 0..32usize {
+                let r = ((l * v as f64 * inv31 + 0.5) as u8).min(31);
+                t.r[level][v] = (r << 3) | (r >> 2);
+                let b = ((lb * v as f64 * inv31 + 1.5) as u8).min(31);
+                t.b[level][v] = (b << 3) | (b >> 2);
+            }
+            for v in 0..64usize {
+                let g = ((2.0 * l * v as f64 * inv63 + 0.5) as u8).min(63);
+                t.g[level][v] = (g << 2) | (g >> 4);
+            }
+        }
+        t
+    })
+}
+
 /// The brightest a lit tile may be drawn, by the time of day (global 4: 0
 /// day, 1 dusk, 2 night, 3 dawn): 1 by day and the float 0.8 otherwise.
 /// The lot sets it on every change of the time of day and at the end of a
@@ -101,20 +140,17 @@ impl Light {
 
     /// A color under this light. Full light leaves it as it is; any other
     /// light gives a 16-bit color, widened back to 8 bits a channel.
+    #[inline]
     pub fn apply(self, [r, g, b]: [u8; 3]) -> [u8; 3] {
         let Some(level) = self.0 else {
             return [r, g, b];
         };
-        let l = f64::from(level);
-        let entry = |x: f64| x as u8;
-        let r = entry(l * f64::from(r >> 3) * f64::from(1.0f32 / 31.0) + 0.5);
-        let g = entry(2.0 * l * f64::from(g >> 2) * f64::from(1.0f32 / 63.0) + 0.5);
-        let b = entry((l.max(1.0) - 1.0) * f64::from(b >> 3) * f64::from(1.0f32 / 31.0) + 1.5);
-        let (r, g, b) = (r.min(31), g.min(63), b.min(31));
+        let t = tables();
+        let l = usize::from(level).min(31);
         [
-            (r << 3) | (r >> 2),
-            (g << 2) | (g >> 4),
-            (b << 3) | (b >> 2),
+            t.r[l][usize::from(r >> 3)],
+            t.g[l][usize::from(g >> 2)],
+            t.b[l][usize::from(b >> 3)],
         ]
     }
 }
@@ -206,5 +242,31 @@ mod tests {
         let light = Light::from_byte(254, 1.0);
         assert_eq!(light.apply([255, 255, 255]), [255, 251, 255]);
         assert_eq!(light.apply([0, 0, 0])[2] >> 3, 1);
+    }
+
+    #[test]
+    fn lookup_tables_match_floating_point_formula_for_every_level_and_channel() {
+        let reference = |level: u8, [r, g, b]: [u8; 3]| {
+            let l = f64::from(level);
+            let r = (l * f64::from(r >> 3) * f64::from(1.0f32 / 31.0) + 0.5) as u8;
+            let g = (2.0 * l * f64::from(g >> 2) * f64::from(1.0f32 / 63.0) + 0.5) as u8;
+            let b = ((l.max(1.0) - 1.0) * f64::from(b >> 3) * f64::from(1.0f32 / 31.0) + 1.5) as u8;
+            let (r, g, b) = (r.min(31), g.min(63), b.min(31));
+            [
+                (r << 3) | (r >> 2),
+                (g << 2) | (g >> 4),
+                (b << 3) | (b >> 2),
+            ]
+        };
+        for level in 0..32u8 {
+            let light = Light(Some(level));
+            for c in 0..=255u8 {
+                assert_eq!(
+                    light.apply([c, c, c]),
+                    reference(level, [c, c, c]),
+                    "level={level} c={c}"
+                );
+            }
+        }
     }
 }

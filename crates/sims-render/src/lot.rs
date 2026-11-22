@@ -52,7 +52,7 @@ impl WallCell {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Level {
     pub floors: Vec<u16>,
     pub walls: Vec<WallCell>,
@@ -94,6 +94,14 @@ pub struct Lot {
     pub halves: BTreeMap<[u8; 3], [(u8, i16); 2]>,
     /// Each tile's lamps, by level (0 or 1) and cell: see [`Lamps`].
     pub lamps: [Vec<Lamps>; 2],
+    /// The camera rotation (`0..=3`) that `levels[0].floors`'s road-dash
+    /// tiles (`10` and `11`) are oriented for: `HOUS 0`'s saved
+    /// `camera_direction & 3` (`0` by default). The original swaps `10` and
+    /// `11` in place across level 1's floor array on each odd-parity view
+    /// turn (`0x4a7dfe`, `0x4a8042` to `0x4a80b1`) and loads without
+    /// swapping (`0x4a861f`), so saved arrays keep their last turn's
+    /// orientation.
+    pub floor_rotation: u8,
 }
 
 /// The offsets from a tile to the two nearest lit lamps of its room, in
@@ -251,7 +259,37 @@ impl Lot {
             time_of_day: world.globals.get(4).copied().unwrap_or(0),
             halves,
             lamps,
+            floor_rotation: 0,
         })
+    }
+
+    /// Bit-exact structural equality across all fields of [`Lot`] (comparing
+    /// `f32` room/outdoor light fractions by `.to_bits()`).
+    pub(crate) fn exact_eq(&self, other: &Self) -> bool {
+        self.size == other.size
+            && self.time_of_day == other.time_of_day
+            && self.floor_rotation == other.floor_rotation
+            && self.outdoor_light.map(f32::to_bits) == other.outdoor_light.map(f32::to_bits)
+            && self.room_lights == other.room_lights
+            && self.room_fractions.len() == other.room_fractions.len()
+            && self
+                .room_fractions
+                .iter()
+                .zip(other.room_fractions.iter())
+                .all(|((k1, v1), (k2, v2))| k1 == k2 && v1.to_bits() == v2.to_bits())
+            && self.outdoor_rooms == other.outdoor_rooms
+            && self.halves == other.halves
+            && self.heights == other.heights
+            && self.grass == other.grass
+            && self.levels == other.levels
+            && self.lamps == other.lamps
+    }
+
+    /// Sets [`Lot::floor_rotation`] to `rotation & 3`, matching a house
+    /// file's saved `camera_direction` (`HOUS 0`).
+    pub fn with_floor_rotation(mut self, rotation: u8) -> Self {
+        self.floor_rotation = rotation & 3;
+        self
     }
 
     /// The middle of what is built on the ground level (the box around its
@@ -282,6 +320,23 @@ impl Lot {
 
     pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= 0 && y >= 0 && (x as usize) < self.size && (y as usize) < self.size
+    }
+
+    /// The terrain altitude at unrotated fine position `fine` (sixteenths of
+    /// a tile), in terrain steps (`0x478dfe`). `0x478e2a`–`0x478e4e` indexes
+    /// the raw 64×64 altitude array directly without checking the active lot
+    /// size (`0x45ee1d` is not called on the object-draw path); coordinates
+    /// outside `0..FULL` return `0.0`. The tile is divided along its diagonal
+    /// into two flat triangles (`sims_sim::head::altitude_at`), with the
+    /// second coordinate (`y & 15`) passed first as `0x478dfe` reads `{ y, x }`.
+    pub fn altitude_at(&self, fine: [i32; 2]) -> f32 {
+        let [tx, ty] = [fine[0] >> 4, fine[1] >> 4];
+        let bounds = 0..FULL as i32;
+        if !bounds.contains(&tx) || !bounds.contains(&ty) {
+            return 0.0;
+        }
+        let corners = self.heights[Self::cell(tx as usize, ty as usize)];
+        sims_sim::head::altitude_at(corners, fine[1] & 15, fine[0] & 15).to_f32()
     }
 }
 

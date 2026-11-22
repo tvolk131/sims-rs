@@ -18,6 +18,7 @@
 
 pub mod art;
 pub mod balloon;
+pub mod buy;
 pub mod command;
 pub mod dialog;
 pub mod font;
@@ -25,6 +26,7 @@ pub mod frame;
 pub mod house;
 pub mod household;
 pub mod hud;
+pub mod options;
 pub mod pie;
 pub mod queue;
 pub mod thumbnail;

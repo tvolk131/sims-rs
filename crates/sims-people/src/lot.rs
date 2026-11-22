@@ -20,7 +20,36 @@
 //! near-zoom pixels. [`View::screen`] then projects as the lot renderer's
 //! `project_fine` does, with a level's floor height per level above the
 //! first, and one column right as the lot renderer draws objects (its
-//! `OBJECT_COLUMN`; unchecked for people).
+//! `OBJECT_COLUMN`).
+//!
+//! **Direct3D 6 rasterization.** The original submits person and plumb-bob
+//! meshes to Direct3D 6 (`IDirect3DDevice3::DrawIndexedPrimitive` at
+//! 0x5d3b44 and `DrawIndexedPrimitiveVB` at 0x5d36c6) through the house
+//! camera (0x49b0de, viewport matrix at 0x5cf263 mapping NDC (0, 0) to
+//! `(vp.dwX + width/2, vp.dwY + height/2)` with no half-pixel offset —
+//! integer for even dimensions such as 800×600). Under Direct3D 6
+//! rasterization rules, pixel `(x, y)` has its sample centre at integer
+//! `(x, y)`, whereas [`crate::raster`] samples at `(x + 0.5, y + 0.5)`.
+//! [`People::draw`] therefore adds `(+0.5, +0.5)` to each projected vertex
+//! via `project_lot_vertex` so triangles sample at integer pixel centres.
+//! Skin bitmaps are packed into 16-bit 5-6-5 textures on upload (0x5ca0d3 /
+//! 0x5ca1f8 for indexed 8-bit skins, 0x5ca55f for 24-bit → 0x5ca635 →
+//! 0x49f0ae, truncating `r >> 3`, `g >> 2`, `b >> 3`) with white materials
+//! (0x5d452b, 0x5a1b5c), default point filtering (0x49b090, 0x5d3a65),
+//! Gouraud shading (0x5ce935), `D3DTOP_MODULATE` (0x5d3a30), and dithering
+//! off (0x5ce99e). [`People::draw`] wraps textured parts' writes in
+//! `Packed565` to truncate texels to 5-6-5 and expand them back to 8-bit
+//! unorm by MSB bit-replication (`(r5 << 3) | (r5 >> 2)`,
+//! `(g6 << 2) | (g6 >> 4)`, `(b5 << 3) | (b5 >> 2)`) before modulation—a
+//! standard unorm5/unorm6 expansion chosen for the Direct3D 6 rasterizer
+//! (whose internal expansion is outside `Sims.exe`)—preserving the original
+//! 8-bit bitmaps in the shared `Body` cache read by [`People::posed`] (such
+//! as the pie-menu portrait renderer) and leaving untextured meshes (such as
+//! the plumb bob's `white` material at 0x5d452b, texture handle 0 at
+//! 0x5d48ce) at full 8-bit white—and `sims_render::Canvas`'s [`Target`]
+//! implementation modulates with half-up 8-bit rounding (an approximation
+//! that avoids truncating 1-ULP barycentric shortfalls below 1.0 by a full
+//! 5-6-5 step).
 //!
 //! A person stands on the terrain under it (`sims_sim::head::ground_height`:
 //! the tile's altitude where its position falls, as the original finds it,
@@ -54,14 +83,20 @@
 //! turn about the vertical by a quarter turn per rotation, built at
 //! 0x49b60e) before it sets it (0x4b49c7). A person in a room at full
 //! light is drawn in full light all over; one in a dark room shows the
-//! light's side. Each lit lamp of the person's room adds a warm light from
-//! the lamp to the person ([`lamps`]). After dark the level is at most
-//! 0.8, as for everything drawn ([`level`]). The level's fade over
-//! 250 ms and the person's flag that draws them at full light are not
-//! ported (decisions entries "A person is lit
-//! by the original's standard light, at their room's level" and "The
-//! standard light shines from the viewer's side, and lamps light
-//! people").
+//! light's side. Each lit lamp of the person's room adds a warm
+//! `D3DLIGHT_PARALLELPOINT` light (`0x4673d0` → `0x5d009a` → `0x5d0d0b` →
+//! `0x5d09a0(4)`): its strength follows the person's squared distance to the
+//! lamp (`0x4b4ba6`..`0x4b4c37`), while Direct3D 6 transforms its
+//! `dvPosition` into view space (`M_view * [dvPosition, 1]`) and takes the
+//! parallel light direction from the view-space origin (the house camera's
+//! eye, [`View::eye`], `0x49b0de`) towards `dvPosition` ([`lamps`]). After
+//! dark the level is at most 0.8, as for everything drawn ([`level`]). The
+//! level's fade over 250 ms and the person's flag that draws them at full
+//! light are not ported (decisions entries "A person is lit by the
+//! original's standard light, at their room's level", "The standard light
+//! shines from the viewer's side, and lamps light people", and "Room lamps
+//! are Direct3D 6 parallel point lights and 5-6-5 skin texels expand by MSB
+//! bit-replication").
 
 use crate::animation::{Clip, Library};
 use crate::appearance::{Body, Outfit};
@@ -198,6 +233,63 @@ impl View {
         let back = rotate((4 - (self.camera.rotation & 3)) & 3, fine, 0.0);
         Vec3::new(-back[1], light.y, -back[0])
     }
+
+    /// The house camera's eye position in the drawing frame for a viewport
+    /// of `size` `(width, height)` pixels, as `0x49b0de` passes to
+    /// `0x5d0595`. Used to compute the view-space position of room lamps
+    /// (`D3DLIGHT_PARALLELPOINT`, [`lamps`]).
+    ///
+    /// In `0x49b0de`, the orthographic house camera starts `eye_dist` units
+    /// (`far - 12.5`, with `far = √3·(√2·3·64)/2 + (255·3/(2√6) + 68)/2`)
+    /// behind the rotated lot corner along the 30°-down isometric view axis,
+    /// then shifts along its screen right and up axes by
+    /// `((width >> 1) - scroll_x)` and `((height >> 1) - scroll_y)` pixels
+    /// scaled by `3√2 / (16 << zoom)`. `Camera::origin[0]` is `scroll_x - 1`
+    /// (matching [`OBJECT_COLUMN`]).
+    pub fn eye(&self, size: (u32, u32)) -> Vec3 {
+        let span = sims_render::camera::ARRAY_SIZE as f32 * UNITS_PER_TILE;
+        let h = (255.0 / (2.0 * 6.0f32.sqrt())) * UNITS_PER_TILE + 68.0;
+        let far = 3.0f32.sqrt() * (2.0f32.sqrt() * span) * 0.5 + h * 0.5;
+        let eye_dist = far - 12.5;
+        let scale_px = 2.0f32.sqrt() * UNITS_PER_TILE / self.camera.zoom.tile_width() as f32;
+        let s2 = 0.5f32.sqrt();
+        let s6 = (3.0f32 / 8.0).sqrt();
+        let s3 = 0.75f32.sqrt();
+        let h2 = 0.5 * s2;
+        // Basis in our drawing frame (half-turn about Y from Sims's world
+        // frame: X_ours = -X_sims, Y_ours = Y_sims, Z_ours = -Z_sims).
+        let (corner, eye_dir, right, up) = match self.camera.rotation & 3 {
+            1 => (
+                Vec3::new(-span, 0.0, 0.0),
+                Vec3::new(s6, 0.5, -s6),
+                Vec3::new(s2, 0.0, s2),
+                Vec3::new(-h2, s3, h2),
+            ),
+            2 => (
+                Vec3::new(-span, 0.0, -span),
+                Vec3::new(s6, 0.5, s6),
+                Vec3::new(-s2, 0.0, s2),
+                Vec3::new(-h2, s3, -h2),
+            ),
+            3 => (
+                Vec3::new(0.0, 0.0, -span),
+                Vec3::new(-s6, 0.5, s6),
+                Vec3::new(-s2, 0.0, -s2),
+                Vec3::new(h2, s3, -h2),
+            ),
+            _ => (
+                Vec3::ZERO,
+                Vec3::new(-s6, 0.5, -s6),
+                Vec3::new(s2, 0.0, -s2),
+                Vec3::new(h2, s3, h2),
+            ),
+        };
+        let scroll_x = i64::from(self.camera.origin[0]) + 1;
+        let scroll_y = i64::from(self.camera.origin[1]);
+        let dx = ((size.0 / 2) as i64 - scroll_x) as f32 * scale_px;
+        let dy = ((size.1 / 2) as i64 - scroll_y) as f32 * scale_px;
+        corner + eye_dir * eye_dist + right * dx - up * dy
+    }
 }
 
 /// The direction towards the original's standard light at rotation 0, in
@@ -250,9 +342,116 @@ const LAMP_HEIGHT: f32 = 5.0;
 /// The most lamp lights the original keeps for a room (0x467eff).
 const ROOM_LAMPS: usize = 6;
 
+const FULL_SIDE: usize = sims_sim::FULL_SIZE as usize;
+
+/// Indexed view of every lit lamp (`sims_render::lot::gives_light`) in a
+/// [`World`], built once per frame so [`lamps`] never rescans `world.objects`
+/// for each tile in a room.
+struct LitLamps<'a> {
+    by_tile: BTreeMap<[i32; 3], Vec<&'a sims_sim::Object>>,
+    mask: [[u64; FULL_SIDE]; 2],
+    has_other: bool,
+}
+
+impl<'a> LitLamps<'a> {
+    fn from_world(world: &'a World) -> Self {
+        let mut by_tile: BTreeMap<[i32; 3], Vec<&'a sims_sim::Object>> = BTreeMap::new();
+        let mut mask = [[0u64; FULL_SIDE]; 2];
+        let mut has_other = false;
+        let full = sims_sim::FULL_SIZE as i32;
+        for o in world.objects.values() {
+            if !sims_render::lot::gives_light(o) {
+                continue;
+            }
+            let tile = World::tile(o.position).map(i32::from);
+            if (1..=2).contains(&tile[2])
+                && (0..full).contains(&tile[0])
+                && (0..full).contains(&tile[1])
+            {
+                mask[(tile[2] - 1) as usize][tile[0] as usize] |= 1u64 << tile[1];
+            } else {
+                has_other = true;
+            }
+            by_tile.entry(tile).or_default().push(o);
+        }
+        Self {
+            by_tile,
+            mask,
+            has_other,
+        }
+    }
+
+    fn lamps_for(&self, world: &World, level: i32, at: Vec3, eye: Vec3) -> Vec<Lamp> {
+        if self.by_tile.is_empty() {
+            return Vec::new();
+        }
+        let fine = [-at.z, -at.x].map(|u| (u * FINE_PER_UNIT).round() as i32);
+        let [x, y] = fine.map(|f| f.div_euclid(16));
+        let full = sims_sim::FULL_SIZE as i32;
+        let inner = |n: i32| n >= 1 && n < full - 1;
+        if !inner(x) || !inner(y) {
+            return Vec::new();
+        }
+        let room = usize::try_from(level - 1)
+            .ok()
+            .and_then(|index| world.rooms.map.get(index))
+            .and_then(|map| map.get((x * full + y) as usize).copied())
+            .filter(|&room| room >= 0);
+        let Some(room) = room.and_then(|room| world.rooms.rooms.get(&room)) else {
+            return Vec::new();
+        };
+        let mut selected: Vec<&sims_sim::Object> = Vec::with_capacity(ROOM_LAMPS);
+        'tiles: for &tile in &room.tiles {
+            let tile = tile.map(i32::from);
+            let present = if (1..=2).contains(&tile[2])
+                && (0..full).contains(&tile[0])
+                && (0..full).contains(&tile[1])
+            {
+                (self.mask[(tile[2] - 1) as usize][tile[0] as usize] >> tile[1]) & 1 != 0
+            } else {
+                self.has_other
+            };
+            if !present {
+                continue;
+            }
+            if let Some(objects) = self.by_tile.get(&tile) {
+                for &lamp in objects {
+                    selected.push(lamp);
+                    if selected.len() == ROOM_LAMPS {
+                        break 'tiles;
+                    }
+                }
+            }
+        }
+        selected
+            .into_iter()
+            .filter_map(|lamp| {
+                let [fx, fy, _] = lamp.position;
+                let ground = sims_sim::head::ground_height(
+                    world,
+                    [F32::from_f32(fx as f32), F32::from_f32(fy as f32)],
+                )
+                .map_or(0.0, F32::to_f32);
+                // The drawing frame: fine (x, y) at (−3y/16, height, −3x/16).
+                let light = Vec3::new(
+                    -(fy as f32) / FINE_PER_UNIT,
+                    ground + LAMP_HEIGHT,
+                    -(fx as f32) / FINE_PER_UNIT,
+                );
+                let from = at - light;
+                Some(Lamp {
+                    towards: (light - eye).normalize(),
+                    strength: lamp_strength(from.dot(from))?,
+                })
+            })
+            .collect()
+    }
+}
+
 /// The lamps' lights on a person on `level` whose skeleton's root is at
-/// `at` (the drawing frame: the ground's height under them, moved by
-/// [`View::level_lift`] on a level above the first, as the original's
+/// `at`, viewed from house camera position `eye` ([`View::eye`]), both in
+/// the drawing frame (`at` is the ground's height under the person, moved
+/// by [`View::level_lift`] on a level above the first, as the original's
 /// model root is). The original sets them with the standard light
 /// (0x4b4b04 to 0x4b4c95), from its lighting record of the person: their
 /// level and their root, rounded back to fine position (0x4b4987 through
@@ -265,58 +464,23 @@ const ROOM_LAMPS: usize = 6;
 /// (0x467ed7): it visits the room's listed tiles in order, repeats
 /// included, and each lit lamp ([`sims_render::lot::gives_light`])
 /// standing on a tile it visits adds a light, at most [`ROOM_LAMPS`]. So a
-/// lamp on a tile listed twice lights twice. A light is at the lamp's fine
-/// position, [`LAMP_HEIGHT`] above the ground there, and shines from there
-/// to the root at [`lamp_strength`].
+/// lamp on a tile listed twice lights twice.
+///
+/// A light is placed at the lamp's fine position, [`LAMP_HEIGHT`] above
+/// the ground there, with [`lamp_strength`] computed from its squared
+/// distance to `at` (0x4b4ba6..0x4b4c37). Because `Sims.exe` creates room
+/// lamps as `D3DLIGHT_PARALLELPOINT` (`dltType = 4`, `0x4673d0` →
+/// `0x5d009a` → `0x5d0d0b` → `0x5d09a0(4)`), Direct3D 6 ignores
+/// `dvDirection`, transforms `dvPosition` into camera space
+/// (`M_view * [dvPosition, 1]`), and lights with the unit vector from the
+/// camera-space origin towards that transformed position—i.e.,
+/// `(light - eye).normalize()` in the drawing frame.
 ///
 /// The objects on a tile are taken in ID order. The original takes them
 /// in the order the lot links them; the two differ only for a tile with
 /// two lit lamps in a room past six lights.
-pub fn lamps(world: &World, level: i32, at: Vec3) -> Vec<Lamp> {
-    let fine = [-at.z, -at.x].map(|u| (u * FINE_PER_UNIT).round() as i32);
-    let [x, y] = fine.map(|f| f.div_euclid(16));
-    let full = sims_sim::FULL_SIZE as i32;
-    let inner = |n: i32| n >= 1 && n < full - 1;
-    if !inner(x) || !inner(y) {
-        return Vec::new();
-    }
-    let room = usize::try_from(level - 1)
-        .ok()
-        .and_then(|index| world.rooms.map.get(index))
-        .and_then(|map| map.get((x * full + y) as usize).copied())
-        .filter(|&room| room >= 0);
-    let Some(room) = room.and_then(|room| world.rooms.rooms.get(&room)) else {
-        return Vec::new();
-    };
-    room.tiles
-        .iter()
-        .flat_map(|&tile| {
-            world.objects.values().filter(move |o| {
-                World::tile(o.position).map(i32::from) == tile.map(i32::from)
-                    && sims_render::lot::gives_light(o)
-            })
-        })
-        .take(ROOM_LAMPS)
-        .filter_map(|lamp| {
-            let [fx, fy, _] = lamp.position;
-            let ground = sims_sim::head::ground_height(
-                world,
-                [F32::from_f32(fx as f32), F32::from_f32(fy as f32)],
-            )
-            .map_or(0.0, F32::to_f32);
-            // The drawing frame: fine (x, y) at (−3y/16, height, −3x/16).
-            let light = Vec3::new(
-                -(fy as f32) / FINE_PER_UNIT,
-                ground + LAMP_HEIGHT,
-                -(fx as f32) / FINE_PER_UNIT,
-            );
-            let from = at - light;
-            Some(Lamp {
-                towards: (light - at).normalize(),
-                strength: lamp_strength(from.dot(from))?,
-            })
-        })
-        .collect()
+pub fn lamps(world: &World, level: i32, at: Vec3, eye: Vec3) -> Vec<Lamp> {
+    LitLamps::from_world(world).lamps_for(world, level, at, eye)
 }
 
 /// A lamp's strength on a person at squared distance `squared` (model
@@ -337,7 +501,8 @@ pub fn lamp_strength(squared: f32) -> Option<f32> {
 /// rule: a depth no farther than what is there wins (ties too), a pixel
 /// fainter than its `FAINT` is left out, a soft one blends, and every
 /// pixel drawn writes its depth. Depths are cut to whole units toward
-/// zero.
+/// zero. Channels are modulated with half-up 8-bit rounding before
+/// `Canvas::put` stores 8-bit RGB (quantized to 5-6-5 by `rgb565()`).
 impl Target for sims_render::Canvas {
     fn size(&self) -> (u32, u32) {
         (self.width as u32, self.height as u32)
@@ -348,14 +513,118 @@ impl Target for sims_render::Canvas {
     }
 
     fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
-        let lit = |c: u8| (f32::from(c) * shade).min(255.0) as u8;
+        self.write_coloured(x, y, z, texel, [shade; 3]);
+    }
+
+    fn write_coloured(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: [f32; 3]) {
+        // Half-up 8-bit rounding approximates Direct3D 6 modulation without
+        // truncating a 1-ULP barycentric shortfall below 1.0 down by a full
+        // 5-6-5 step. Textured lot parts are wrapped in `Packed565` by
+        // `People::draw`, while untextured meshes (the plumb bob's `white`
+        // material at 0x5d452b) stay full 8-bit white.
+        let lit = |c: u8, s: f32| (f32::from(c) * s + 0.5).clamp(0.0, 255.0) as u8;
         let [r, g, b, a] = texel;
-        self.put(x as i32, y as i32, [lit(r), lit(g), lit(b), a], z as i32);
+        self.put(
+            x as i32,
+            y as i32,
+            [lit(r, shade[0]), lit(g, shade[1]), lit(b, shade[2]), a],
+            z as i32,
+        );
     }
 
     fn set_id(&mut self, id: Option<u16>) {
         sims_render::Canvas::set_id(self, id);
     }
+}
+
+/// Packs a texel's RGB channels to 16-bit 5-6-5 by truncation (verified in
+/// `Sims.exe`'s texture surface upload at `0x5ca0d3` / `0x5ca1f8` for
+/// indexed 8-bit skins and `0x5ca55f` for 24-bit BMPs → `0x5ca635` →
+/// `0x49f0ae`) and expands them back to 8-bit unorm by MSB bit-replication
+/// (`(r5 << 3) | (r5 >> 2)`, `(g6 << 2) | (g6 >> 4)`,
+/// `(b5 << 3) | (b5 >> 2)`). Direct3D 6's internal 5-6-5-to-8-bit expansion
+/// before `D3DTOP_MODULATE` lives inside Direct3D's rasterizer, not
+/// `Sims.exe`; MSB bit-replication is a standard unorm5/unorm6 expansion
+/// mapping maximum 5-6-5 white `(31, 63, 31)` to `[255, 255, 255]` (and
+/// differing by at most 1 from rounded normalization on some low/mid codes).
+fn expand_565([r, g, b, a]: [u8; 4]) -> [u8; 4] {
+    let r5 = r >> 3;
+    let g6 = g >> 2;
+    let b5 = b >> 3;
+    [
+        (r5 << 3) | (r5 >> 2),
+        (g6 << 2) | (g6 >> 4),
+        (b5 << 3) | (b5 >> 2),
+        a,
+    ]
+}
+
+/// Target adapter used by [`People::draw`] for textured parts: quantizes
+/// each sampled texel to 5-6-5 and expands it by MSB bit-replication on
+/// the lot draw path without mutating the cached `Body` textures (which
+/// [`People::posed`] shares with offscreen callers like the pie-menu
+/// portrait renderer) and without affecting untextured meshes such as the
+/// plumb bob.
+pub(crate) struct Packed565<'a, T: ?Sized>(pub(crate) &'a mut T);
+
+impl<T: Target + ?Sized> Target for Packed565<'_, T> {
+    fn size(&self) -> (u32, u32) {
+        self.0.size()
+    }
+
+    fn passes(&self, x: u32, y: u32, z: f32) -> bool {
+        self.0.passes(x, y, z)
+    }
+
+    fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
+        self.0.write(x, y, z, expand_565(texel), shade);
+    }
+
+    fn write_coloured(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: [f32; 3]) {
+        self.0.write_coloured(x, y, z, expand_565(texel), shade);
+    }
+
+    fn set_id(&mut self, id: Option<u16>) {
+        self.0.set_id(id);
+    }
+}
+
+/// Draws one skinned part of a person on the lot into `target`, with or
+/// without room lamps.
+fn draw_lot_part<T: Target + ?Sized>(
+    target: &mut T,
+    part: &crate::appearance::Part,
+    skinned: &crate::skin::Skinned,
+    lighting: Lighting,
+    lamps: &[Lamp],
+    project: impl Fn(Vec3) -> Vec3,
+) {
+    if lamps.is_empty() {
+        draw_part(target, part, skinned, lighting, project);
+    } else {
+        let towards = lighting.towards.normalize();
+        let shade: Vec<Shade> = skinned
+            .normals
+            .iter()
+            .map(|&n| lighting.shade_with_unit(n, towards, lamps))
+            .collect();
+        draw_shaded(target, part, skinned, &shade, project);
+    }
+}
+
+/// Projects a world point for lot rasterization: [`View::place_on`] and
+/// [`View::screen`], shifted by `(+0.5, +0.5)` so [`crate::raster`]'s
+/// half-integer pixel-centre sampler matches Direct3D 6's integer pixel
+/// centres (`0x49b0de`, `0x5cf263`, `0x5d3b44`).
+fn project_lot_vertex(
+    view: &View,
+    p: Vec3,
+    level: i32,
+    depth: &impl Fn([f32; 2], f32, i32) -> f32,
+) -> Vec3 {
+    let (fine, elevation) = view.place_on(p, level);
+    let [x, y] = view.screen(fine, elevation, level);
+    Vec3::new(x + 0.5, y + 0.5, depth(fine, elevation, level))
 }
 
 /// Turns a fine position (or, with `size` 0, a direction) by `rotation`
@@ -599,30 +868,87 @@ impl People {
         (posed, problems)
     }
 
+    /// Renders `person`'s pie-menu 3D head ([`crate::pie_head::draw_body`])
+    /// into an RGBA [`crate::raster::Canvas`] of `size` pixels looking as
+    /// `look` specifies. Call [`People::update`] first so the person's body
+    /// is loaded.
+    pub fn pie_head(
+        &self,
+        person: u16,
+        size: [u32; 2],
+        look: crate::pie_head::Look,
+    ) -> Result<crate::raster::Canvas, String> {
+        let loaded = self
+            .people
+            .get(&person)
+            .ok_or_else(|| format!("person {person} is not loaded"))?;
+        let (body, _) = loaded.body.as_ref().map_err(Clone::clone)?;
+        crate::pie_head::draw_body(body, size, look).map_err(|e| format!("person {person}: {e}"))
+    }
+
+    /// Renders `person`'s pie-menu 3D head positioned at `center` inside the
+    /// active house `viewport` ([`crate::pie_head::draw_body_in_viewport`]),
+    /// clipped to the house viewport boundary and native near/far frustum for
+    /// `zoom` rather than the 201×201 face bitmap (`0x462621` → `0x462985`).
+    /// Call [`People::update`] first.
+    pub fn pie_head_in_viewport(
+        &self,
+        person: u16,
+        viewport: [u32; 2],
+        center: [i32; 2],
+        zoom: sims_render::Zoom,
+        look: crate::pie_head::Look,
+    ) -> Result<crate::pie_head::DrawnHead, String> {
+        let loaded = self
+            .people
+            .get(&person)
+            .ok_or_else(|| format!("person {person} is not loaded"))?;
+        let (body, _) = loaded.body.as_ref().map_err(Clone::clone)?;
+        crate::pie_head::draw_body_in_viewport(body, viewport, center, zoom, look)
+            .map_err(|e| format!("person {person}: {e}"))
+    }
+
     /// Draws every placed person on the camera's levels over a lot the lot
     /// renderer has drawn into `canvas` (`sims_render::draw_lot` first,
     /// and `sims_render::draw_held` after, as the original's frame does),
     /// each pixel tested against the lot's depth: walls, furniture and
     /// floors in front of a person hide them. Depth is the lot renderer's
     /// [`Depth::point`]; the pixels go in by its sprite rule
-    /// ([`sims_render::Canvas::put`]).
+    /// ([`sims_render::Canvas::put`]). Uses the full canvas dimensions as
+    /// the house viewport for [`View::eye`].
     pub fn draw_on_lot(
         &mut self,
         world: &World,
         camera: &Camera,
         canvas: &mut sims_render::Canvas,
     ) -> Drawn {
+        let viewport = (canvas.width as u32, canvas.height as u32);
+        self.draw_on_lot_in_viewport(world, camera, viewport, canvas)
+    }
+
+    /// Like [`People::draw_on_lot`], using `viewport` `(width, height)` as
+    /// the active 3D house viewport passed to [`View::eye`] (`0x49ae5e`,
+    /// `0x4f4b43`, `0x4d363b`, `0x53b2eb` → `0x4b136b` → `0x49b0bf` →
+    /// `0x5cf1b6`: `(width, height)` with the bottom strip closed,
+    /// `(width, height - 100)` with the strip open).
+    pub fn draw_on_lot_in_viewport(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        viewport: (u32, u32),
+        canvas: &mut sims_render::Canvas,
+    ) -> Drawn {
         let depth = Depth::new(camera);
-        self.draw(world, camera, canvas, |fine, elevation, level| {
+        self.draw_in_viewport(world, camera, viewport, canvas, |fine, elevation, level| {
             depth.point(fine, elevation, level)
         })
     }
 
     /// Draws every placed person on the camera's levels into `target`,
     /// far to near. `depth` gives the target's depth for a point: its fine
-    /// view position, its elevation above its level in near-zoom pixels,
-    /// and the level (the lot renderer's [`Depth::point`]). Call
-    /// [`People::update`] first.
+    /// view position, elevation above its level in near-zoom pixels, and
+    /// the level (the lot renderer's [`Depth::point`]). Uses `target.size()`
+    /// as the house viewport for [`View::eye`]. Call [`People::update`] first.
     pub fn draw<T: Target + ?Sized>(
         &mut self,
         world: &World,
@@ -630,8 +956,24 @@ impl People {
         target: &mut T,
         depth: impl Fn([f32; 2], f32, i32) -> f32,
     ) -> Drawn {
+        self.draw_in_viewport(world, camera, target.size(), target, depth)
+    }
+
+    /// Like [`People::draw`], taking the active 3D house `viewport` size
+    /// `(width, height)` for [`View::eye`] (`0x49b0de`) independently of
+    /// `target.size()` (e.g. `800×500` over an `800×600` framebuffer when
+    /// the live-mode strip is open).
+    pub fn draw_in_viewport<T: Target + ?Sized>(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        viewport: (u32, u32),
+        target: &mut T,
+        depth: impl Fn([f32; 2], f32, i32) -> f32,
+    ) -> Drawn {
         let view = View::new(camera);
         let light = view.light();
+        let eye = view.eye(viewport);
         // The plumb bob is loaded the first time the lot has one.
         let mut bob = self.bob.take();
         if bob.is_none() && world.objects.values().any(|o| o.guid == bob::STANDARD) {
@@ -647,32 +989,28 @@ impl People {
             depth(fine, elevation, p.level)
         };
         posed.sort_by(|a, b| far(b).total_cmp(&far(a)).then(a.id.cmp(&b.id)));
+        let lit_lamps = (!posed.is_empty()).then(|| LitLamps::from_world(world));
         for person in &posed {
-            let project = |p| {
-                let (fine, elevation) = view.place_on(p, person.level);
-                let [x, y] = view.screen(fine, elevation, person.level);
-                Vec3::new(x, y, depth(fine, elevation, person.level))
-            };
+            let project = |p| project_lot_vertex(&view, p, person.level, &depth);
             // Each pixel the person draws names them, for a click.
             target.set_id(Some(person.id));
             let lighting = Lighting::standard(light, level(world, person.id));
-            let lamps = lamps(
-                world,
-                person.level,
-                person.root.translation + view.level_lift(person.level),
-            );
+            let lamps = lit_lamps.as_ref().map_or_else(Vec::new, |lit| {
+                lit.lamps_for(
+                    world,
+                    person.level,
+                    person.root.translation + view.level_lift(person.level),
+                    eye,
+                )
+            });
             for part in person.body.parts.iter().filter(|p| p.censor == 0) {
                 let skinned = skin(part, &person.bones);
-                if lamps.is_empty() {
-                    draw_part(target, part, &skinned, lighting, project);
-                    continue;
+                if part.texture_name.is_some() {
+                    let mut packed = Packed565(target);
+                    draw_lot_part(&mut packed, part, &skinned, lighting, &lamps, project);
+                } else {
+                    draw_lot_part(target, part, &skinned, lighting, &lamps, project);
                 }
-                let shade: Vec<Shade> = skinned
-                    .normals
-                    .iter()
-                    .map(|&n| lighting.shade_with(n, &lamps))
-                    .collect();
-                draw_shaded(target, part, &skinned, &shade, project);
             }
             // The plumb bob over their head, if they hold it. Its pixels
             // name the bob itself, so the pointer on it finds the bob, not
@@ -855,6 +1193,274 @@ mod tests {
         assert_eq!([canvas.id_at(0, 0), canvas.id_at(1, 0)], [Some(5), None]);
     }
 
+    /// `Packed565` truncates textured lot draws to 5-6-5 (`0x49f0ae`) and
+    /// expands them back to 8-bit unorm by MSB bit-replication before
+    /// modulation without modifying cached `Body` textures, while direct
+    /// writes (untextured meshes such as the plumb bob's `white` material at
+    /// `0x5d452b`) keep full 8-bit channels, and the lot canvas rounds
+    /// modulation so a 1-ULP barycentric shortfall below 1.0 never loses a
+    /// 5-6-5 step.
+    #[test]
+    fn the_lot_canvas_packs_textured_parts_to_565_and_rounds_modulation() {
+        use sims_render::Canvas as LotCanvas;
+
+        let mut canvas = LotCanvas::new(5, 1, [0, 0, 0]);
+        // Textured grey write quantizes to 5-6-5 and expands via MSB bit-replication:
+        // 207 -> r5=25 -> 206, 199 -> g6=49 -> 199, 55 -> b5=6 -> 49.
+        {
+            let mut packed = Packed565(&mut canvas);
+            packed.write(0, 0, 0.0, [207, 199, 55, 255], 1.0);
+            // Textured coloured (lamp-lit) write expands per channel and rounds:
+            // [206*1.0, 199*0.5, 49*0.5] -> [206, 100, 25].
+            packed.write_coloured(1, 0, 0.0, [207, 199, 55, 255], [1.0, 0.5, 0.5]);
+            // Maximum 5-6-5 white [248, 252, 248] expands to full [255, 255, 255].
+            packed.write(2, 0, 0.0, [248, 252, 248, 255], 1.0);
+        }
+        // 1 ULP below 1.0 (as barycentric weights w0 + w1 + w2 can give)
+        // must round back to [40, 136, 40], not truncate to [39, 135, 39].
+        let target: &mut dyn Target = &mut canvas;
+        target.write(3, 0, 0.0, [40, 136, 40, 255], 0.999_999_94);
+        // Untextured plumb bob modulated at full 255 without 5-6-5 packing.
+        target.write_coloured(4, 0, 0.0, [255, 255, 255, 255], [0.5, 1.0, 0.25]);
+        assert_eq!(
+            canvas.color,
+            vec![
+                [206, 199, 49],
+                [206, 100, 25],
+                [255, 255, 255],
+                [40, 136, 40],
+                [128, 255, 64],
+            ]
+        );
+    }
+
+    /// `View::eye` (`0x49b0de`) places the orthographic camera at the exact
+    /// depth and screen offset computed by `0x49b0de`: every world point
+    /// projects onto the same screen coordinates as `View::screen`, the
+    /// distance along the view axis matches `eye_dist = far - 12.5` at every
+    /// rotation and zoom (including odd viewports and negative horizontal
+    /// scroll), and shortening the viewport by the 100-pixel live strip shifts
+    /// the eye by `50 * scale_px` along the camera's up axis.
+    #[test]
+    fn the_house_camera_eye_projects_world_points_onto_the_lot_view() {
+        let span = sims_render::camera::ARRAY_SIZE as f32 * UNITS_PER_TILE;
+        let h = (255.0 / (2.0 * 6.0f32.sqrt())) * UNITS_PER_TILE + 68.0;
+        let far = 3.0f32.sqrt() * (2.0f32.sqrt() * span) * 0.5 + h * 0.5;
+        let expected_eye_dist = far - 12.5;
+        let s2 = 0.5f32.sqrt();
+        let s6 = (3.0f32 / 8.0).sqrt();
+        let s3 = 0.75f32.sqrt();
+        let h2 = 0.5 * s2;
+        for zoom in Zoom::ALL {
+            let scale_px = 2.0f32.sqrt() * UNITS_PER_TILE / zoom.tile_width() as f32;
+            for rotation in 0..4 {
+                let (corner, eye_dir, right, up) = match rotation {
+                    1 => (
+                        Vec3::new(-span, 0.0, 0.0),
+                        Vec3::new(s6, 0.5, -s6),
+                        Vec3::new(s2, 0.0, s2),
+                        Vec3::new(-h2, s3, h2),
+                    ),
+                    2 => (
+                        Vec3::new(-span, 0.0, -span),
+                        Vec3::new(s6, 0.5, s6),
+                        Vec3::new(-s2, 0.0, s2),
+                        Vec3::new(-h2, s3, -h2),
+                    ),
+                    3 => (
+                        Vec3::new(0.0, 0.0, -span),
+                        Vec3::new(-s6, 0.5, s6),
+                        Vec3::new(-s2, 0.0, -s2),
+                        Vec3::new(h2, s3, -h2),
+                    ),
+                    _ => (
+                        Vec3::ZERO,
+                        Vec3::new(-s6, 0.5, -s6),
+                        Vec3::new(s2, 0.0, -s2),
+                        Vec3::new(h2, s3, h2),
+                    ),
+                };
+                for &(origin, size) in &[
+                    ([279, -2004], (800, 600)),
+                    ([335, -560], (1024, 768)),
+                    ([-250, -560], (801, 599)),
+                ] {
+                    let c = Camera {
+                        zoom,
+                        rotation,
+                        level: 1,
+                        origin,
+                        walls: Walls::Down,
+                        focus: Default::default(),
+                    };
+                    let view = View::new(&c);
+                    let eye = view.eye(size);
+                    // Depth along the view axis must equal `eye_dist` from `0x49b0de`.
+                    let depth_from_corner = (eye - corner).dot(eye_dir);
+                    assert!(
+                        (depth_from_corner - expected_eye_dist).abs() < 1e-3,
+                        "{zoom:?} rot={rotation}: depth {depth_from_corner} != {expected_eye_dist}"
+                    );
+                    for p in [
+                        Vec3::new(-88.5, 8.674, -79.5),
+                        Vec3::new(-79.5, 3.674, -72.0),
+                        Vec3::new(-12.0, 0.0, -150.0),
+                    ] {
+                        let (fine, elev) = view.place(p);
+                        let want = view.screen(fine, elev, 1);
+                        let rel = p - eye;
+                        let sx = rel.dot(right) / scale_px + (size.0 / 2) as f32;
+                        let sy = -rel.dot(up) / scale_px + (size.1 / 2) as f32;
+                        assert!(
+                            (sx - want[0]).abs() < 1e-3 && (sy - want[1]).abs() < 1e-3,
+                            "{zoom:?} rot={rotation} {p:?}: got ({sx}, {sy}) != {want:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Pin the absolute `near-r2-0805` eye position against `0x49b0de`.
+        let r2 = View::new(&Camera {
+            zoom: Zoom::Near,
+            rotation: 2,
+            level: 1,
+            origin: [279, -2004],
+            walls: Walls::Down,
+            focus: Default::default(),
+        })
+        .eye((800, 600));
+        assert!(
+            (r2.x - 37.166).abs() < 1e-3
+                && (r2.y - 101.228).abs() < 1e-3
+                && (r2.z - 42.791).abs() < 1e-3,
+            "near-r2-0805 eye: {r2:?}"
+        );
+        // Shortening an 800×600 viewport by the 100-pixel live strip moves the
+        // eye by 50 * scale_px along `up` (≈ 6.629 model units at far zoom).
+        let far_view = View::new(&Camera {
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            origin: [367, -130],
+            walls: Walls::Cutaway,
+            focus: Default::default(),
+        });
+        let full_eye = far_view.eye((800, 600));
+        let strip_eye = far_view.eye((800, 500));
+        let shift = (strip_eye - full_eye).length();
+        let expected_shift = 50.0 * 2.0f32.sqrt() * UNITS_PER_TILE / Zoom::Far.tile_width() as f32;
+        assert!(
+            (shift - expected_shift).abs() < 1e-4,
+            "far strip eye shift: {shift} != {expected_shift}"
+        );
+    }
+
+    /// `project_lot_vertex` (used by `People::draw`) adds `(+0.5, +0.5)` to
+    /// `View::screen` so `raster`'s half-integer pixel-centre sampler matches
+    /// Direct3D 6's integer pixel centres (0x49b0de, 0x5cf263, 0x5d3b44).
+    #[test]
+    fn direct3d_integer_pixel_centers_shift_projected_triangles_half_a_pixel() {
+        use crate::appearance::Part;
+        use crate::skin::Skinned;
+        use crate::texture::Texture;
+        use sims_formats::avatar::{Mesh, MeshBinding, Vertex};
+        use sims_render::Canvas as LotCanvas;
+
+        let c = Camera {
+            zoom: Zoom::Near,
+            rotation: 0,
+            level: 1,
+            origin: [0, 0],
+            walls: Walls::Up,
+            focus: Default::default(),
+        };
+        let view = View::new(&c);
+        // A world point whose `View::screen` lands on integer (sx, sy).
+        let world_p = Vec3::new(0.0, 0.0, 0.0);
+        let (fine, elev) = view.place_on(world_p, 1);
+        let [sx, sy] = view.screen(fine, elev, 1);
+        let projected = project_lot_vertex(&view, world_p, 1, &|_, _, _| 0.0);
+        assert_eq!(projected.x, sx + 0.5);
+        assert_eq!(projected.y, sy + 0.5);
+
+        // Place a tiny world-space quad whose `View::screen` spans
+        // [cx - 0.2, cx + 0.2] x [cy - 0.2, cy + 0.2] around an integer
+        // pixel (cx, cy). Only `project_lot_vertex` hits pixel (cx, cy).
+        let (cx, cy) = (sx.round() as i32, sy.round() as i32);
+        let c = Camera {
+            origin: [3 - cx, 3 - cy],
+            ..c
+        };
+        let view = View::new(&c);
+        let [sx, sy] = view.screen(fine, elev, 1);
+        assert!((sx - 3.0).abs() < 1e-4 && (sy - 3.0).abs() < 1e-4);
+
+        let vertex = |p: Vec3| Vertex {
+            position: [p.x, p.y, p.z],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.5, 0.5],
+            bone: 0,
+        };
+        // Along world (x - z), screen x moves; along world y, screen y moves.
+        let dx = Vec3::new(0.005, 0.0, -0.005);
+        let dy = Vec3::new(0.0, 0.008, 0.0);
+        let corners = [
+            world_p - dx - dy,
+            world_p + dx - dy,
+            world_p + dx + dy,
+            world_p - dx + dy,
+        ];
+        let part = Part {
+            appearance: "quad".into(),
+            bone: 0,
+            bones: vec![0],
+            mesh: Mesh {
+                name: "quad".into(),
+                texture: String::new(),
+                bones: vec!["ROOT".into()],
+                bindings: vec![MeshBinding {
+                    bone: 0,
+                    first_vertex: 0,
+                    vertex_count: 4,
+                    first_blend: 0,
+                    blend_count: 0,
+                }],
+                triangles: vec![[0, 1, 2], [0, 2, 3]],
+                vertices: corners.into_iter().map(vertex).collect(),
+                blends: Vec::new(),
+            },
+            texture_name: None,
+            texture: Texture::solid([248, 252, 248, 255]),
+            censor: 0,
+        };
+        let skinned = Skinned {
+            positions: corners.to_vec(),
+            normals: vec![Vec3::new(0.0, 0.0, 1.0); 4],
+        };
+        let mut unshifted = LotCanvas::new(6, 6, [0, 0, 0]);
+        draw_part(
+            &mut unshifted,
+            &part,
+            &skinned,
+            Lighting::standard(Vec3::new(0.0, 0.0, 1.0), 1.0),
+            |p| {
+                let (f, e) = view.place_on(p, 1);
+                let [x, y] = view.screen(f, e, 1);
+                Vec3::new(x, y, 0.0)
+            },
+        );
+        let mut d3d6 = LotCanvas::new(6, 6, [0, 0, 0]);
+        draw_part(
+            &mut d3d6,
+            &part,
+            &skinned,
+            Lighting::standard(Vec3::new(0.0, 0.0, 1.0), 1.0),
+            |p| project_lot_vertex(&view, p, 1, &|_, _, _| 0.0),
+        );
+        assert_eq!(unshifted.color[3 * 6 + 3], [0, 0, 0]);
+        assert_eq!(d3d6.color[3 * 6 + 3], [248, 252, 248]);
+    }
+
     /// The light keeps its place relative to the viewer as the view
     /// turns.
     #[test]
@@ -913,6 +1519,104 @@ mod tests {
         assert_eq!(lamp_strength(227.0), Some(0.5));
         assert_eq!(lamp_strength(400.0), Some(1.0 / 88.5));
         assert_eq!(lamp_strength(400.01), None);
+    }
+
+    /// `lamps` treats each lit room lamp as a Direct3D 6
+    /// `D3DLIGHT_PARALLELPOINT` light (`0x4673d0` → `0x5d0d0b`): direction is
+    /// `(light - eye).normalize()` (depending on camera `eye`, not the
+    /// person's position `at`), while strength follows the squared distance
+    /// between `at` and `light`. When `eye == light`, direction is zero
+    /// rather than NaN.
+    #[test]
+    fn room_lamps_use_parallel_point_direction_from_camera_eye() {
+        let mut world = World::empty();
+        world.size = 64;
+        let full = sims_sim::FULL_SIZE as usize;
+        let mut map = vec![0i16; full * full];
+        for x in 10..=20 {
+            for y in 10..=20 {
+                map[x * full + y] = 4;
+            }
+        }
+        world.rooms.map = [map, Vec::new()];
+        let room = sims_sim::rooms::Room {
+            tiles: vec![[12, 12, 1]],
+            ..Default::default()
+        };
+        world.rooms.rooms.insert(4, room);
+        let mut data = vec![0i16; 64];
+        (data[16], data[40], data[51]) = (1, 0x400, 25);
+        world.objects.insert(
+            71,
+            sims_sim::Object {
+                id: 71,
+                guid: 0,
+                footprint: [0; 4],
+                position: [12 * 16 + 8, 12 * 16 + 8, 1],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: Vec::new(),
+                data,
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+
+        let light_pos = Vec3::new(
+            -(200.0) / FINE_PER_UNIT,
+            LAMP_HEIGHT,
+            -(200.0) / FINE_PER_UNIT,
+        );
+        let eye = Vec3::new(100.0, 100.0, 100.0);
+        let expected_dir = (light_pos - eye).normalize();
+
+        // Two people on opposite sides of the lamp receive the exact same
+        // parallel-point direction, with different distance-based strengths
+        // (near: d² = 43 < 225 → 1.0; far: d² = 245.5 ∈ (225, 400) → attenuated).
+        let near_at = Vec3::new(-(184.0) / FINE_PER_UNIT, 0.0, -(184.0) / FINE_PER_UNIT);
+        let far_at = Vec3::new(-(256.0) / FINE_PER_UNIT, 0.0, -(256.0) / FINE_PER_UNIT);
+        let near_lamps = lamps(&world, 1, near_at, eye);
+        let far_lamps = lamps(&world, 1, far_at, eye);
+        assert_eq!(near_lamps.len(), 1);
+        assert_eq!(far_lamps.len(), 1);
+        assert_eq!(near_lamps[0].towards, expected_dir);
+        assert_eq!(far_lamps[0].towards, expected_dir);
+        assert_eq!(near_lamps[0].strength, 1.0);
+        assert!(far_lamps[0].strength < 1.0 && far_lamps[0].strength > 0.0);
+
+        // Degenerate eye == light produces zero direction, not NaN.
+        let degenerate = lamps(&world, 1, near_at, light_pos);
+        assert_eq!(degenerate[0].towards, Vec3::ZERO);
+
+        // Shortening an 800×600 viewport to 800×500 (expanded live strip)
+        // shifts the far-zoom eye by ≈ 6.629 units and changes the lamp
+        // direction accordingly.
+        let far_view = View::new(&Camera {
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            origin: [367, -130],
+            walls: Walls::Cutaway,
+            focus: Default::default(),
+        });
+        let full_dir = lamps(&world, 1, near_at, far_view.eye((800, 600)))[0].towards;
+        let strip_dir = lamps(&world, 1, near_at, far_view.eye((800, 500)))[0].towards;
+        assert!(
+            (full_dir - strip_dir).length() > 1e-2,
+            "full={full_dir:?} strip={strip_dir:?}"
+        );
     }
 
     /// The level lift is the offset `place_on` adds, at every rotation:
@@ -992,5 +1696,144 @@ mod tests {
         let tilted = (towards * 0.5 + side * (3.0f32.sqrt() / 2.0)).normalize();
         assert!((tilted.dot(towards) - 0.5).abs() < 1e-6);
         assert!((half.shade(tilted) - (128.0 / 255.0 + 0.25)).abs() < 1e-6);
+    }
+
+    /// `LitLamps` preserves every detail of the reference room-tile scan:
+    /// duplicate entries in `room.tiles`, multiple lit lamps on the same tile
+    /// in ascending ID order, and enforcing the `ROOM_LAMPS` (6) cap *before*
+    /// filtering by distance (`lamp_strength`).
+    #[test]
+    fn indexed_lit_lamps_match_reference_scan_with_duplicates_and_cap() {
+        let mut world = World::empty();
+        world.size = 64;
+        let full = FULL_SIDE;
+        let mut map = vec![0i16; full * full];
+        map[12 * full + 12] = 7;
+        world.rooms.map = [map, Vec::new()];
+        world.rooms.rooms.insert(
+            7,
+            sims_sim::rooms::Room {
+                tiles: vec![
+                    [12, 12, 1],
+                    [12, 12, 1],
+                    [50, 50, 1],
+                    [50, 50, 1],
+                    [13, 12, 1],
+                ],
+                ..Default::default()
+            },
+        );
+        let mk_lamp = |id: u16, fx: i32, fy: i32| {
+            let mut data = vec![0i16; 64];
+            (data[16], data[40], data[51]) = (1, 0x400, 25);
+            sims_sim::Object {
+                id,
+                guid: 0,
+                footprint: [0; 4],
+                position: [fx, fy, 1],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: Vec::new(),
+                data,
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            }
+        };
+        // Two lit lamps on the same tile with distinct fine coordinates so
+        // ID ordering produces distinct direction and strength bits.
+        world
+            .objects
+            .insert(10, mk_lamp(10, 12 * 16 + 2, 12 * 16 + 3));
+        world
+            .objects
+            .insert(20, mk_lamp(20, 12 * 16 + 14, 12 * 16 + 13));
+        // Out-of-range lamp listed twice before tile (13, 12): must consume
+        // slots 5 and 6 of ROOM_LAMPS before distance filtering.
+        world
+            .objects
+            .insert(30, mk_lamp(30, 50 * 16 + 7, 50 * 16 + 9));
+        // Nearby lamp on tile (13, 12) that would be #7 and must be dropped.
+        world
+            .objects
+            .insert(40, mk_lamp(40, 13 * 16 + 6, 12 * 16 + 11));
+
+        let at = Vec3::new(-(12.5 * 3.0), 0.0, -(12.5 * 3.0));
+        let eye = Vec3::new(100.0, 100.0, 100.0);
+
+        let reference_lamps = |world: &World, level: i32, at: Vec3, eye: Vec3| -> Vec<Lamp> {
+            let fine = [-at.z, -at.x].map(|u| (u * FINE_PER_UNIT).round() as i32);
+            let [x, y] = fine.map(|f| f.div_euclid(16));
+            let full = sims_sim::FULL_SIZE as i32;
+            let room = world.rooms.map[(level - 1) as usize][(x * full + y) as usize];
+            let room = &world.rooms.rooms[&room];
+            let mut selected = Vec::new();
+            'tiles: for &tile in &room.tiles {
+                let tile = tile.map(i32::from);
+                for o in world.objects.values() {
+                    if sims_render::lot::gives_light(o)
+                        && World::tile(o.position).map(i32::from) == tile
+                    {
+                        selected.push(o);
+                        if selected.len() == ROOM_LAMPS {
+                            break 'tiles;
+                        }
+                    }
+                }
+            }
+            selected
+                .into_iter()
+                .filter_map(|lamp| {
+                    let [fx, fy, _] = lamp.position;
+                    let ground = sims_sim::head::ground_height(
+                        world,
+                        [F32::from_f32(fx as f32), F32::from_f32(fy as f32)],
+                    )
+                    .map_or(0.0, F32::to_f32);
+                    let light = Vec3::new(
+                        -(fy as f32) / FINE_PER_UNIT,
+                        ground + LAMP_HEIGHT,
+                        -(fx as f32) / FINE_PER_UNIT,
+                    );
+                    let from = at - light;
+                    Some(Lamp {
+                        towards: (light - eye).normalize(),
+                        strength: lamp_strength(from.dot(from))?,
+                    })
+                })
+                .collect()
+        };
+
+        let bits = |ls: &[Lamp]| -> Vec<([u32; 3], u32)> {
+            ls.iter()
+                .map(|l| {
+                    (
+                        [l.towards.x, l.towards.y, l.towards.z].map(f32::to_bits),
+                        l.strength.to_bits(),
+                    )
+                })
+                .collect()
+        };
+
+        let got = lamps(&world, 1, at, eye);
+        let want = reference_lamps(&world, 1, at, eye);
+        assert_eq!(got.len(), 4);
+        assert_ne!(
+            bits(&got[0..1]),
+            bits(&got[1..2]),
+            "same-tile lamps must have distinct light vectors to pin ordering"
+        );
+        assert_eq!(bits(&got), bits(&want));
     }
 }

@@ -34,6 +34,8 @@ fn rest(fx: &Fixture) -> [u8; 32] {
     let mut world = fx.world.clone();
     world.dialogs.records.clear();
     world.portraits.clear();
+    world.dirty_portraits.clear();
+    world.saved_portraits.clear();
     hash_without_frames(&world)
 }
 
@@ -122,18 +124,145 @@ fn a_portrait_the_port_cannot_tell_was_built_fails_loudly() {
     });
     assert_eq!(inform(&mut fx, 2, record), Ok(true));
     assert!(fx.world.portraits.contains(&WIDGET));
-    // A type made while the game ran may not be in the interface's table.
-    let (mut fx, _, record) = visitors();
-    fx.world.characters.made.insert(
-        WIDGET,
+
+    // When the same off-lot household member has a clean slot and BMP_ 2002,
+    // 0x4e92e5 → 0x4e9338 loads the bitmap directly with zero builds.
+    let (mut fx, widget_file, record) = visitors();
+    fx.world.globals[9] = 7;
+    fx.world.families.push(sims_sim::neighbors::Family {
+        id: 7,
+        house: 0,
+        members: vec![WIDGET],
+        friends: 0,
+        stale: false,
+    });
+    fx.program
+        .libraries
+        .get_mut(&widget_file)
+        .unwrap()
+        .has_portrait_bitmap = true;
+    let before = as_with_no_portrait(&fx, record);
+    assert_eq!(inform(&mut fx, 2, record), Ok(true));
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(fx.world.dirty_portraits.is_empty());
+    assert_eq!(rest(&fx), before);
+}
+
+#[test]
+fn a_runtime_made_person_type_is_listed_in_the_portrait_table() {
+    // 0x4265fd calls 0x4e8a3a once the table is initialized ([0x6f26a4] = 1 at
+    // 0x4e8a32), appending newly created person types at 0x4e8add. Cloning
+    // copies every resource from the template (0x472356..0x472519), including
+    // BMP_ 2002 when present (as on TemplateCat.iff and TemplateDog.iff), into
+    // a new writable User%05d.iff file.
+    const MADE_GUID: u32 = 0x5555_0001;
+    let attach_made =
+        |fx: &mut Fixture, strings: std::collections::BTreeMap<usize, String>| -> i16 {
+            fx.world.characters.made.insert(
+                MADE_GUID,
+                sims_sim::characters::Character {
+                    template: WIDGET,
+                    file: 3,
+                    strings,
+                },
+            );
+            fx.world
+                .neighbors
+                .slots
+                .push(Some(sims_sim::neighbors::Neighbor {
+                    id: (fx.world.neighbors.slots.len() + 1) as i16,
+                    guid: MADE_GUID,
+                    revision: 7,
+                    data: vec![12; 256],
+                    relationships: Vec::new(),
+                    friends: 0,
+                    stale: false,
+                }));
+            fx.world.neighbors.slots.len() as i16
+        };
+
+    // 1. Template with BMP_ 2002 (e.g. TemplateCat/TemplateDog): the clone
+    //    inherits BMP_ 2002, so a clean off-lot dialog loads directly with
+    //    zero builds even on a blocked lot (and is not read-only even if the
+    //    template file was read-only).
+    let (mut fx_bmp, widget_file, _) = visitors();
+    fx_bmp.world.size = 2;
+    let template = fx_bmp.program.libraries.get_mut(&widget_file).unwrap();
+    template.has_portrait_bitmap = true;
+    template.writable = false;
+    let made_record = attach_made(&mut fx_bmp, Default::default());
+    let before = as_with_no_portrait(&fx_bmp, made_record);
+    assert_eq!(inform(&mut fx_bmp, 2, made_record), Ok(true));
+    assert_eq!(fx_bmp.world.portraits, [MADE_GUID].into());
+    assert!(fx_bmp.world.saved_portraits.is_empty());
+    assert_eq!(rest(&fx_bmp), before);
+
+    // 2. Template without BMP_ 2002 (e.g. TemplatePerson): the clone's own
+    //    User%05d.iff is writable even if the template was read-only, so an
+    //    off-lot dialog builds once and saves BMP_ 2002 at 0x4e938c → 0x4e9000.
+    let (mut fx, widget_file, _) = visitors();
+    fx.program.libraries.get_mut(&widget_file).unwrap().writable = false;
+    let made_record = attach_made(&mut fx, Default::default());
+    let before = as_with_no_portrait(&fx, made_record);
+    assert_eq!(inform(&mut fx, 2, made_record), Ok(true));
+    assert_eq!(fx.world.portraits, [MADE_GUID].into());
+    assert_eq!(fx.world.saved_portraits, [MADE_GUID].into());
+    assert_ne!(rest(&fx), before);
+
+    // 3. On-lot: builds directly with zero temporary persons and records
+    //    MADE_GUID (not its template GUID).
+    let (mut fx_on, _, _) = visitors();
+    fx_on.world.characters.made.insert(
+        MADE_GUID,
         sims_sim::characters::Character {
             template: WIDGET,
-            file: 0,
+            file: 3,
             strings: Default::default(),
         },
     );
-    let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
-    assert!(fault.contains("0x6f2698"), "{fault}");
+    let mut person = object(40, MADE_GUID);
+    person.person = Some(person_data());
+    fx_on.world.objects.insert(40, person);
+    fx_on.world.people.push(40);
+    let before_on = as_with_no_portrait(&fx_on, 40);
+    assert_eq!(inform(&mut fx_on, 0, 40), Ok(true));
+    assert_eq!(fx_on.world.portraits, [MADE_GUID].into());
+    assert_eq!(fx_on.world.saved_portraits, [MADE_GUID].into());
+    assert_eq!(rest(&fx_on), before_on);
+}
+
+fn person_data() -> sims_formats::saved_objects::Person {
+    let interaction = sims_formats::saved_objects::Interaction {
+        join: 0,
+        uid: 0,
+        caller: 0,
+        target: 0,
+        icon: 0,
+        table_index: 0,
+        args: [0; 4],
+        priority: 0,
+        action: 0,
+        attenuation: 0.0,
+        flags: 0,
+    };
+    sims_formats::saved_objects::Person {
+        animation_events: 0,
+        engaged: 0,
+        appearance: Default::default(),
+        accessories: Vec::new(),
+        animations: Default::default(),
+        routing_state: 0,
+        floats: [0.0; 9],
+        previous_motives: [0.0; 16],
+        motives: [0.0; 16],
+        data: vec![0; 256],
+        routing_frames: 0,
+        active: interaction.clone(),
+        last: interaction,
+        queue: Vec::new(),
+        object_uses: Vec::new(),
+        motive_deltas: Vec::new(),
+    }
 }
 
 #[test]
@@ -377,11 +506,12 @@ fn a_portrait_searches_from_the_view_centre_when_it_is_given() {
         .unwrap_err()
         .to_string();
     assert!(fault.contains("0x4e96dd"), "{fault}");
-    // From a centre outdoors the search ends outdoors, in the start's
-    // room, wherever outdoors it starts (a start outside the border is
-    // taken inside it), and the lot ends the same.
+    // From an in-bounds centre outdoors the search ends outdoors, in the
+    // start's room, and the lot ends the same. An out-of-bounds pick like
+    // [0, 0] or [2, 60] falls back to the lot midpoint [3, 3] (0x434891),
+    // which is indoors and marks room 1 occupied natively.
     let mut ends = Vec::new();
-    for centre in [[1, 1], [2, 4], [0, 0], [2, 60]] {
+    for centre in [[1, 1], [2, 4]] {
         let (mut fx, _, record) = visitors();
         rooms(&mut fx);
         assert_eq!(inform_from(&mut fx, 2, record, Some(centre)), Ok(true));
@@ -389,12 +519,17 @@ fn a_portrait_searches_from_the_view_centre_when_it_is_given() {
         ends.push(hash_without_frames(&fx.world));
     }
     assert!(ends.windows(2).all(|w| w[0] == w[1]));
-    // From a centre indoors it ends indoors and marks room 1 occupied natively.
-    let (mut fx, _, record) = visitors();
-    rooms(&mut fx);
-    assert_eq!(inform_from(&mut fx, 2, record, Some([4, 2])), Ok(true));
-    assert_eq!(fx.world.portraits, [WIDGET].into());
-    assert!(fx.world.rooms.rooms[&1].occupied);
+    for centre in [[0, 0], [2, 60], [4, 2]] {
+        let (mut fx, _, record) = visitors();
+        rooms(&mut fx);
+        assert_eq!(
+            inform_from(&mut fx, 2, record, Some(centre)),
+            Ok(true),
+            "{centre:?}"
+        );
+        assert_eq!(fx.world.portraits, [WIDGET].into(), "{centre:?}");
+        assert!(fx.world.rooms.rooms[&1].occupied, "{centre:?}");
+    }
     // From a centre no tile is found from, the original removes the temporary
     // person unput (0x4e9706), leaves the portrait uncached, keeps Init/RNG
     // side effects, and completes the dialog nonfatally.
@@ -908,21 +1043,19 @@ fn a_dialogs_text_can_show_the_stack_objects_neighbor_instead() {
 #[test]
 fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
     // `$Object` is replaced by the stack object's catalog name (0x44c1ca,
-    // 0x4573d9), and the `$Neighbor` pass after it reads the text with the
-    // name in it: a name holding `$Neighbor`, or making it with the text
-    // around it, shows the neighbor's type. The entry 0x4061e3 picks is not
-    // ported, so every entry is tried; the names are not known when the
-    // table has no entry in language 1, an entry is empty (which falls
-    // back to the definition's own name, 0x457db4), or there is no table.
-    // Where the names do not agree on the portrait, the dialog fails; names
-    // not known fail too, since one may never end (0x4558a0).
-    for (names, message, fault_at) in [
-        (None, 3, "not known"),
-        (Some(vec![(1, "Grim"), (2, "$Neighbor")]), 3, "0x4061e3"),
-        (Some(vec![(1, "")]), 3, "not known"),
-        (Some(vec![(2, "Grim")]), 3, "not known"),
-        (Some(vec![(1, "Neighbor"), (2, "Grim")]), 5, "0x4061e3"),
-        (None, 5, "not known"),
+    // 0x4573d9, 0x4061e3), and the `$Neighbor` pass after it reads the text
+    // with the name in it: a name holding `$Neighbor`, or making it with
+    // the text around it, shows the neighbor's type. `0x4061e3` loads US
+    // English via `0x470ca7(0, 0)` and reads slot 1 (`0x471411(1, -1)`):
+    // the name is not known when the table has no entry in language 1, slot
+    // 1 is empty (which falls back to every language for a person or the
+    // definition's own name, 0x457db4), or there is no table. Names not
+    // known fail loudly, since one may never end (0x4558a0).
+    for (names, message) in [
+        (None, 3),
+        (Some(vec![(1, "")]), 3),
+        (Some(vec![(2, "Grim")]), 3),
+        (None, 5),
     ] {
         for strings in [(2, message, 0), (0, 0, message)] {
             let mut fx = text_dialog(strings, names.clone());
@@ -930,29 +1063,33 @@ fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
                 .run_with(LAMP, 4096, SIM as i16, &[], 1000)
                 .unwrap_err()
                 .to_string();
-            assert!(fault.contains(fault_at), "{names:?} {strings:?}: {fault}");
+            assert!(
+                fault.contains("not known"),
+                "{names:?} {strings:?}: {fault}"
+            );
             assert!(fx.world.portraits.is_empty());
         }
-        // Where the neighbor is found after the name, the name does not
-        // matter to the portrait. A name not known may hold `$Object` past
-        // its first character, which never ends.
+        // Even where the neighbor is found after the name, a name not known
+        // may hold `$Object` past its first character, which never ends.
         let mut fx = text_dialog((message, 0, 2), names.clone());
-        let ran = fx.run_with(LAMP, 4096, SIM as i16, &[], 1000);
-        if fault_at == "not known" {
-            let fault = ran.unwrap_err().to_string();
-            assert!(
-                fault.contains("0x44c1ca") && fault.contains("not known"),
-                "{names:?}: {fault}"
-            );
-        } else {
-            assert_eq!(ran, Ok(true));
-            assert_eq!(fx.world.portraits, [WIDGET].into(), "{names:?}");
-        }
+        let fault = fx
+            .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            fault.contains("0x44c1ca") && fault.contains("not known"),
+            "{names:?}: {fault}"
+        );
     }
-    // Where every name gives the same, it is used: each holds `$Neighbor`,
-    // or makes it with the `$` before the token, or none does.
+    // `0x4061e3` picks slot 1 in US English (`0x470ca7(0, 0)` + `0x471343`):
+    // slot 2 (the description) and other languages are ignored, and a later
+    // US English run overwrites slot 1.
     for (names, message, shown) in [
         (vec![(1, "Grim $Neighbor")], 3, WIDGET),
+        (vec![(1, "Grim"), (1, "$Neighbor")], 3, SIM_GUID),
+        (vec![(1, "Grim"), (2, "$Neighbor")], 3, SIM_GUID),
+        (vec![(1, "Grim"), (2, "Other"), (1, "$Neighbor")], 3, WIDGET),
+        (vec![(1, "Neighbor"), (2, "Grim")], 5, WIDGET),
         (vec![(1, "Neighbor"), (2, "Neighbors")], 5, WIDGET),
         (vec![(1, "Grim"), (2, "Grimm")], 5, SIM_GUID),
     ] {
@@ -1501,6 +1638,8 @@ fn me_is_replaced_by_the_running_objects_name_before_object_is() {
     };
     for (names, shown) in [
         (vec![(1, "Lamp"), (2, "Lampe")], WIDGET),
+        (vec![(1, "Lamp"), (2, "$Object")], WIDGET),
+        (vec![(1, "Lamp"), (2, "$$Me")], WIDGET),
         (vec![(1, "the $Object")], SIM_GUID),
         (vec![(1, "the $Object $Neighbor")], WIDGET),
     ] {
@@ -1520,14 +1659,15 @@ fn me_is_replaced_by_the_running_objects_name_before_object_is() {
     let mut fx = with_lamp_names(Some(vec![(1, "$Me $Object")]));
     assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
     assert_eq!(fx.world.portraits, [SIM_GUID].into());
-    // Names that disagree fail where they decide the portrait. A name that
-    // holds `$Me` past its first character puts it back past each place
-    // the search goes on from, so the pass never ends; names not known may
-    // be one. Both fail whatever the portrait.
+    // A name that holds `$Me` past its first character puts it back past
+    // each place the search goes on from, so the pass never ends; names
+    // not known may be one. Both fail whatever the portrait.
     for (names, fault_at) in [
-        (Some(vec![(1, "Lamp"), (2, "$Object")]), "0x4061e3"),
         (Some(vec![(1, "my $Me")]), "never ends"),
-        (Some(vec![(1, "Lamp"), (2, "$$Me")]), "never ends"),
+        (
+            Some(vec![(1, "Lamp"), (2, "Other"), (1, "$$Me")]),
+            "never ends",
+        ),
         (None, "not known"),
     ] {
         let mut fx = with_lamp_names(names.clone());
@@ -1720,4 +1860,604 @@ fn a_neighbor_local_the_original_left_unknown_fails_loudly() {
         fault.contains("0x44c5f4") && fault.contains("half of a pointer"),
         "{fault}"
     );
+}
+
+#[test]
+fn a_portrait_view_centre_pick_is_bounds_checked_and_unrotated() {
+    // On a 6-tile lot, tiles with x < 3 are outdoors (room 2) and x >= 3
+    // are indoors (room 1). At view rotation 1, lot tile (x, y) rotates to
+    // (63 - y, x) so the rotated interior is [59..=62, 1..=4].
+    // View-rotated pick [60, 2] un-rotates to lot tile (2, 3) (outdoors -> Ok).
+    // View-rotated pick [60, 4] un-rotates to lot tile (4, 3) (indoors -> fails).
+    // Out-of-bounds pick [2, 2] falls back to rotated midpoint (61, 3), which
+    // un-rotates to lot tile (3, 2) (indoors -> fails).
+    for (rot, pick, should_pass) in [
+        (1u8, [60i8, 2], true),
+        (1, [60, 4], false),
+        (1, [2, 2], false),
+        (3, [2, 60], false), // un-rotates to (3, 2), indoors
+        (3, [2, 61], true),  // un-rotates to (2, 2), outdoors
+        (3, [2, 2], true),   // out-of-bounds fallback (3, 61) -> un-rotates to (2, 3), outdoors
+    ] {
+        let (mut fx, _, record) = visitors();
+        indoors_and_out(&mut fx);
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                DIALOG,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+            )]),
+        );
+        let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.view_rotation = rot;
+        interpreter.view_centre = Some(pick);
+        let res = interpreter.run_tree(&mut fx.world, LAMP, 4096, record, &[], 1000);
+        assert_eq!(res, Ok(true), "rot {rot} pick {pick:?}");
+        assert_eq!(
+            fx.world.rooms.rooms[&1].occupied, !should_pass,
+            "rot {rot} pick {pick:?}"
+        );
+    }
+}
+
+#[test]
+fn a_clean_portrait_with_bmp_2002_loads_without_creating_a_person() {
+    // 0x4e92e5 → 0x4e9338: a clean, empty slot with BMP_ 2002 loads the
+    // bitmap straight into slot 1 and never calls 0x4e8c5d (0 builds: no
+    // temporary person, no Init sounds, no skeleton read, no RNG draws).
+    let (mut fx, widget_file, record) = visitors();
+    fx.program
+        .libraries
+        .get_mut(&widget_file)
+        .unwrap()
+        .sounds
+        .insert(5, "init_ping".into());
+    fx.add(
+        widget_file,
+        4096,
+        tree(vec![ins(23, RETURN_TRUE, ERROR, [5, 0, 0, 0, 0, 0, 0, 0])]),
+    );
+    fx.program
+        .libraries
+        .get_mut(&widget_file)
+        .unwrap()
+        .has_portrait_bitmap = true;
+
+    let before = as_with_no_portrait(&fx, record);
+    let sounds = std::cell::RefCell::new(Vec::new());
+    assert_eq!(
+        inform_hearing(&mut fx, 2, record, Some([1, 1]), &sounds),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(fx.world.dirty_portraits.is_empty());
+    assert!(
+        !fx.world.skeleton_files.contains("widget.bcf"),
+        "clean slot with BMP_ 2002 never creates a temporary person"
+    );
+    assert!(sounds.borrow().is_empty(), "{:?}", sounds.borrow());
+    assert_eq!(rest(&fx), before);
+
+    // Writing person data words 68, 74, or 84 calls 0x45810c(1) on [esi+0x11c]
+    // (0x4539c7) — the running object's definition (`me`), even in scope 19
+    // (Stack Person Data) when targeting another person.
+    for word in [68i16, 74, 84] {
+        // 1. SIM writing My Person Data dirties SIM_GUID.
+        let mut fx = Fixture::new();
+        fx.world.people = vec![SIM];
+        fx.world.portraits.insert(SIM_GUID);
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![assign(
+                scope::MY_PERSON,
+                word,
+                scope::LITERAL,
+                0,
+                RETURN_TRUE,
+            )]),
+        );
+        assert_eq!(fx.run_with(SIM, 4096, 0, &[], 1000), Ok(true));
+        assert!(
+            !fx.world.portraits.contains(&SIM_GUID),
+            "SIM writing My Person Data[{word}] releases cached portrait"
+        );
+        assert!(
+            fx.world.dirty_portraits.contains(&SIM_GUID),
+            "SIM writing My Person Data[{word}] marks slot 1 dirty"
+        );
+
+        // 2. A non-person (LAMP) writing Stack Person Data targeting SIM does
+        //    NOT dirty SIM_GUID because [esi+0x11c] is LAMP's definition.
+        let mut fx = Fixture::new();
+        fx.world.people = vec![SIM];
+        fx.world.portraits.insert(SIM_GUID);
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![assign(
+                scope::STACK_PERSON,
+                word,
+                scope::LITERAL,
+                0,
+                RETURN_TRUE,
+            )]),
+        );
+        assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+        assert!(
+            fx.world.portraits.contains(&SIM_GUID),
+            "LAMP writing Stack Person Data[{word}] keeps SIM's cached portrait"
+        );
+        assert!(
+            fx.world.dirty_portraits.is_empty(),
+            "LAMP writing Stack Person Data[{word}] does not dirty SIM"
+        );
+
+        // 3. SIM writing Stack Person Data targeting another person (WIDGET)
+        //    dirties SIM_GUID ([esi+0x11c]), NOT WIDGET.
+        let (mut fx, _, _) = visitors();
+        let mut other = object(40, WIDGET);
+        other.person = Some(person_data());
+        fx.world.objects.insert(40, other);
+        fx.world.people.push(40);
+        fx.world.portraits.insert(SIM_GUID);
+        fx.world.portraits.insert(WIDGET);
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![assign(
+                scope::STACK_PERSON,
+                word,
+                scope::LITERAL,
+                0,
+                RETURN_TRUE,
+            )]),
+        );
+        assert_eq!(fx.run_with(SIM, 4096, 40, &[], 1000), Ok(true));
+        assert!(
+            !fx.world.portraits.contains(&SIM_GUID) && fx.world.dirty_portraits.contains(&SIM_GUID),
+            "SIM writing Stack Person Data[{word}] on WIDGET dirties SIM"
+        );
+        assert!(
+            fx.world.portraits.contains(&WIDGET) && !fx.world.dirty_portraits.contains(&WIDGET),
+            "SIM writing Stack Person Data[{word}] on WIDGET leaves WIDGET clean"
+        );
+    }
+}
+
+#[test]
+fn a_dirty_portrait_with_bmp_2002_removes_unput_when_no_tile_is_found() {
+    // When slot 1 is dirty (0x4e92e5), no tile is found (0x4e9706), and the
+    // type has BMP_ 2002 (0x4e9260), the original runs 0x4e92f2 once, removes
+    // the person unput (skipping virtual function 0x88 and placed_from_outside),
+    // loads BMP_ 2002 into slot 1 (clearing dirty), and skips 0x4e938c.
+    let (mut fx, widget_file, record) = visitors();
+    fx.world.size = 2;
+    fx.world.dirty_portraits.insert(WIDGET);
+    // Even without indicators and with function 9 set to trap, the unput path
+    // never calls virtual function 0x88, so it succeeds when BMP_ 2002 is present.
+    fx.world.indicators = [0, 0];
+    crate::visits::function(&mut fx, widget_file, 9, 4098);
+    fx.add(
+        widget_file,
+        4098,
+        tree(vec![ins(254, RETURN_TRUE, ERROR, [0; 8])]),
+    );
+    fx.program
+        .libraries
+        .get_mut(&widget_file)
+        .unwrap()
+        .sounds
+        .insert(5, "init_ping".into());
+    fx.add(
+        widget_file,
+        4096,
+        tree(vec![ins(23, RETURN_TRUE, ERROR, [5, 0, 0, 0, 0, 0, 0, 0])]),
+    );
+    fx.program
+        .libraries
+        .get_mut(&widget_file)
+        .unwrap()
+        .has_portrait_bitmap = true;
+
+    let people_before = fx.world.people.clone();
+    let objects_before = fx.world.objects.len();
+    let sounds = std::cell::RefCell::new(Vec::new());
+    assert_eq!(
+        inform_hearing(&mut fx, 2, record, Some([1, 1]), &sounds),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(fx.world.dirty_portraits.is_empty());
+    assert_eq!(fx.world.people, people_before);
+    assert_eq!(fx.world.objects.len(), objects_before);
+    let pings = || {
+        sounds
+            .borrow()
+            .iter()
+            .filter(|e| matches!(e, sims_vm::SoundEvent::Play { name, .. } if name == "init_ping"))
+            .count()
+    };
+    // One build (create_person + delete's reset each run Init once = 2 pings;
+    // a second build at 0x4e938c would have produced 4).
+    assert_eq!(pings(), 2);
+    // A second dialog hits World::portraits and does not rebuild.
+    assert_eq!(
+        inform_hearing(&mut fx, 2, record, Some([1, 1]), &sounds),
+        Ok(true)
+    );
+    assert_eq!(pings(), 2);
+}
+
+#[test]
+fn a_dirty_portrait_with_mixed_starts_and_bmp_2002_checks_placement_on_found_tiles() {
+    // Make tile (1, 1) its own unreachable room (room 9) full of a solid
+    // object so starting at (1, 1) finds no tile while all other starts
+    // land in room 1. With slot 1 dirty and BMP_ 2002, view_centre = None
+    // succeeds whenever `portrait_place(&World)` passes on the found tiles
+    // (statically proving placing and removing unput leave identical state)
+    // and fails loudly if placement would have side effects.
+    let setup = |indicators: [u16; 2]| {
+        let (mut fx, widget_file, record) = visitors();
+        fx.world.indicators = indicators;
+        fx.world.dirty_portraits.insert(WIDGET);
+        fx.program
+            .libraries
+            .get_mut(&widget_file)
+            .unwrap()
+            .has_portrait_bitmap = true;
+        // Put room 9 on tile (1, 1) and occupy tile (1, 1) in the object grid.
+        fx.world.rooms.map[0][64 + 1] = 9;
+        let grid = &mut fx.world.arrays.get_mut(&3).unwrap().data;
+        grid[(64 + 1) * 2..((64 + 1) * 2 + 2)].copy_from_slice(&(LAMP as i16).to_le_bytes());
+        (fx, record)
+    };
+    let (mut fx_ok, record) = setup([99, 0]);
+    assert_eq!(inform_from(&mut fx_ok, 2, record, None), Ok(true));
+    assert_eq!(fx_ok.world.portraits, [WIDGET].into());
+    assert!(fx_ok.world.dirty_portraits.is_empty());
+
+    // Without indicators, the placed branch differs from the unput branch
+    // (creating indicators vs not), so view_centre = None fails loudly.
+    let (mut fx_no_ind, record) = setup([0, 0]);
+    let fault = inform_from(&mut fx_no_ind, 2, record, None)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x4e96dd"), "{fault}");
+
+    // When a room's occupant mark would change on the found tiles, placement
+    // differs from the unput branch and fails loudly rather than silently
+    // taking the unput branch.
+    let (mut fx_room, record) = setup([99, 0]);
+    fx_room.world.neighbors.slots[record as usize - 1]
+        .as_mut()
+        .unwrap()
+        .data[65] = 0;
+    fx_room
+        .world
+        .rooms
+        .rooms
+        .insert(1, sims_sim::rooms::Room::default());
+    let fault = inform_from(&mut fx_room, 2, record, None)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x4e96dd"), "{fault}");
+
+    // Without BMP_ 2002, mixed starts fail loudly on 0x4e96dd / 0x4e9706.
+    let (mut fx_no_bmp, _widget_file, record) = visitors();
+    fx_no_bmp.world.rooms.map[0][64 + 1] = 9;
+    let grid = &mut fx_no_bmp.world.arrays.get_mut(&3).unwrap().data;
+    grid[(64 + 1) * 2..((64 + 1) * 2 + 2)].copy_from_slice(&(LAMP as i16).to_le_bytes());
+    let fault = inform_from(&mut fx_no_bmp, 2, record, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        fault.contains("0x4e96dd") && fault.contains("0x4e9706"),
+        "{fault}"
+    );
+}
+
+#[test]
+fn a_read_only_off_lot_portrait_never_creates_a_temporary_person() {
+    // 0x4e8cc6 checks resource writability before calling 0x4e9652: a dirty
+    // off-lot read-only resource with BMP_ 2002 skips 0x4e9652 and loads BMP_
+    // 2002 at 0x4e9338 (zero builds, zero RNG draws, clearing dirty).
+    let (mut fx, widget_file, record) = visitors();
+    fx.world.size = 2; // would hit no-tile if it tried to build
+    fx.world.dirty_portraits.insert(WIDGET);
+    let lib = fx.program.libraries.get_mut(&widget_file).unwrap();
+    lib.writable = false;
+    lib.has_portrait_bitmap = true;
+    lib.sounds.insert(5, "init_ping".into());
+    fx.add(
+        widget_file,
+        4096,
+        tree(vec![ins(23, RETURN_TRUE, ERROR, [5, 0, 0, 0, 0, 0, 0, 0])]),
+    );
+    let before = as_with_no_portrait(&fx, record);
+    let sounds = std::cell::RefCell::new(Vec::new());
+    assert_eq!(
+        inform_hearing(&mut fx, 2, record, Some([1, 1]), &sounds),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(fx.world.dirty_portraits.is_empty());
+    assert!(fx.world.saved_portraits.is_empty());
+    assert!(sounds.borrow().is_empty(), "{:?}", sounds.borrow());
+    assert_eq!(rest(&fx), before);
+
+    // Without BMP_ 2002, a read-only off-lot resource skips 0x4e9652 on both
+    // 0x4e92f2 and 0x4e938c, leaving slot 1 empty and dirty unchanged.
+    let (mut fx, widget_file, record) = visitors();
+    fx.world.size = 2;
+    fx.world.dirty_portraits.insert(WIDGET);
+    fx.program.libraries.get_mut(&widget_file).unwrap().writable = false;
+    let before = as_with_no_portrait(&fx, record);
+    assert_eq!(inform_from(&mut fx, 2, record, Some([1, 1])), Ok(true));
+    assert!(fx.world.portraits.is_empty());
+    assert_eq!(fx.world.dirty_portraits, [WIDGET].into());
+    assert!(fx.world.saved_portraits.is_empty());
+    assert_eq!(rest(&fx), before);
+}
+
+#[test]
+fn a_successful_clean_build_saves_bmp_2002_for_a_later_no_tile_fallback() {
+    // Start with a writable character file lacking BMP_ 2002.
+    // 1. Clean-slot dialog succeeds -> 0x4e938c passes save = 1 -> 0x4e8d2e →
+    //    0x4e9000 saves BMP_ 2002 (`saved_portraits`).
+    let (mut fx, _, record) = visitors();
+    assert_eq!(inform_from(&mut fx, 2, record, Some([1, 1])), Ok(true));
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert_eq!(fx.world.saved_portraits, [WIDGET].into());
+
+    // 2. Invalidate portrait (as 0x4539cf → 0x4eb0eb does) and shrink the lot
+    //    so no free tile exists. The next dialog runs one build at 0x4e92f2,
+    //    removes unput at 0x4e9706, and falls back to the saved BMP_ 2002 at
+    //    0x4e9338 without failing.
+    fx.world.portraits.remove(&WIDGET);
+    fx.world.dirty_portraits.insert(WIDGET);
+    fx.world.dialogs.records.clear();
+    fx.world.size = 2;
+    assert_eq!(inform_from(&mut fx, 2, record, Some([1, 1])), Ok(true));
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(fx.world.dirty_portraits.is_empty());
+    assert_eq!(fx.world.saved_portraits, [WIDGET].into());
+
+    // Contrast: a dirty-slot build (0x4e92f2) passes save = 0 and does NOT
+    // write BMP_ 2002, so on a later blocked lot both 0x4e92f2 and 0x4e938c
+    // find no tile, remove unput at 0x4e9706, and leave slot 1 empty and dirty.
+    let (mut fx, _, record) = visitors();
+    fx.world.dirty_portraits.insert(WIDGET);
+    assert_eq!(inform_from(&mut fx, 2, record, Some([1, 1])), Ok(true));
+    assert!(fx.world.saved_portraits.is_empty());
+    fx.world.portraits.remove(&WIDGET);
+    fx.world.dirty_portraits.insert(WIDGET);
+    fx.world.dialogs.records.clear();
+    fx.world.size = 2;
+    assert_eq!(inform_from(&mut fx, 2, record, Some([1, 1])), Ok(true));
+    assert!(fx.world.portraits.is_empty());
+    // Construction's `0x588930 -> 0x58d4e1 -> 0x4eb0cc -> 0x4e897e` clears the
+    // dirty flag on an unbound head slot even when placement finds no tile.
+    assert!(fx.world.dirty_portraits.is_empty());
+    assert!(fx.world.saved_portraits.is_empty());
+}
+
+#[test]
+fn a_saved_bmp_2002_applies_to_every_definition_in_the_same_file() {
+    // 0x4e904e..0x4e90ab writes BMP_ 2002 into the type's resource file, and
+    // 0x4e926a..0x4e9287 reads BMP_ 2002 back from that file. A clean build
+    // for one person definition in a shared writable file therefore makes
+    // BMP_ 2002 available to another person definition in that same file.
+    const SIBLING: u32 = 0x5555_0002;
+    let (mut fx, widget_file, widget_record) = visitors();
+    let index = fx.catalog.objects.len();
+    fx.catalog.objects.push(sims_content::Object {
+        guid: SIBLING,
+        resource: widget_file,
+        chunk: 129,
+        kind: 2,
+        master: 0,
+    });
+    fx.catalog.by_guid.insert(SIBLING, index);
+    let lib = fx.program.libraries.get_mut(&widget_file).unwrap();
+    let words = *lib.definitions.get(&128).unwrap();
+    lib.definitions.insert(129, words);
+    let callbacks = lib.callbacks.get(&128).unwrap().clone();
+    lib.callbacks.insert(129, callbacks);
+    crate::person_factory::equip(&mut fx, SIBLING, "sibling", 12);
+    let sibling_record = fx.world.neighbors.slots.len() as i16;
+
+    // 1. Clean off-lot build for WIDGET writes BMP_ 2002 into `widget_file`.
+    assert_eq!(
+        inform_from(&mut fx, 2, widget_record, Some([1, 1])),
+        Ok(true)
+    );
+    assert_eq!(fx.world.saved_portraits, [WIDGET].into());
+
+    // 2. Clean off-lot dialog for SIBLING (in `widget_file`) now loads that
+    //    BMP_ 2002 directly with zero builds even on a blocked lot.
+    fx.world.dialogs.records.clear();
+    fx.world.size = 2;
+    let before = as_with_no_portrait(&fx, sibling_record);
+    assert_eq!(
+        inform_from(&mut fx, 2, sibling_record, Some([1, 1])),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.contains(&SIBLING));
+    assert_eq!(rest(&fx), before);
+
+    // 3. Dirty off-lot dialog for SIBLING on the blocked lot falls back to
+    //    the shared file's saved BMP_ 2002 cleanly at 0x4e9338.
+    fx.world.portraits.remove(&SIBLING);
+    fx.world.dirty_portraits.insert(SIBLING);
+    fx.world.dialogs.records.clear();
+    assert_eq!(
+        inform_from(&mut fx, 2, sibling_record, Some([1, 1])),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.contains(&SIBLING));
+    assert!(!fx.world.dirty_portraits.contains(&SIBLING));
+}
+
+#[test]
+fn a_temporary_persons_reset_invalidating_pd_68_leaves_slot_1_empty_and_dirty() {
+    // 0x4e8d2e (save BMP_ 2002) and 0x4e8d6d (populate slot 1, clearing dirty)
+    // run BEFORE 0x4e8fdb removes the temporary person. If Reset writes person
+    // data word 68, 74, or 84, it invalidates the freshly populated slot.
+    let setup = |has_bmp: bool, dirty: bool| {
+        let (mut fx, widget_file, record) = visitors();
+        // Register a Reset callback (OBJf entry 3, tree 4100) that writes
+        // My Person Data 68 := 1. remove_now runs Reset at 0x4e8fdb AFTER
+        // 0x4e8d2e (save BMP_ 2002) and 0x4e8d6d (populate slot 1).
+        crate::visits::function(&mut fx, widget_file, 3, 4100);
+        fx.add(
+            widget_file,
+            4100,
+            tree(vec![assign(
+                scope::MY_PERSON,
+                68,
+                scope::LITERAL,
+                1,
+                RETURN_TRUE,
+            )]),
+        );
+        fx.program
+            .libraries
+            .get_mut(&widget_file)
+            .unwrap()
+            .has_portrait_bitmap = has_bmp;
+        if dirty {
+            fx.world.dirty_portraits.insert(WIDGET);
+        }
+        (fx, record)
+    };
+
+    // 1. Clean slot without BMP_ 2002 (0x4e938c -> 0x4e8c5d(index, 1, 1)):
+    //    BMP_ 2002 is saved before remove_now, then Reset invalidates slot 1,
+    //    leaving slot 1 empty and dirty.
+    let (mut fx_clean, record) = setup(false, false);
+    assert_eq!(
+        inform_from(&mut fx_clean, 2, record, Some([1, 1])),
+        Ok(true)
+    );
+    assert_eq!(fx_clean.world.saved_portraits, [WIDGET].into());
+    assert!(!fx_clean.world.portraits.contains(&WIDGET));
+    assert!(fx_clean.world.dirty_portraits.contains(&WIDGET));
+
+    // 2. Dirty slot WITH BMP_ 2002 (0x4e92f2 -> Reset invalidates slot 1 ->
+    //    0x4e9315 sees empty slot 1 -> 0x4e9338 reloads BMP_ 2002, clearing
+    //    dirty).
+    let (mut fx_dirty_bmp, record) = setup(true, true);
+    assert_eq!(
+        inform_from(&mut fx_dirty_bmp, 2, record, Some([1, 1])),
+        Ok(true)
+    );
+    assert!(fx_dirty_bmp.world.portraits.contains(&WIDGET));
+    assert!(!fx_dirty_bmp.world.dirty_portraits.contains(&WIDGET));
+
+    // 3. Dirty slot WITHOUT BMP_ 2002 (0x4e92f2 -> Reset invalidates slot 1 ->
+    //    0x4e9315 sees empty slot 1 -> 0x4e938c runs a second build with
+    //    save = 1, saving BMP_ 2002 before Reset invalidates slot 1 again).
+    let (mut fx_dirty_nobmp, record) = setup(false, true);
+    assert_eq!(
+        inform_from(&mut fx_dirty_nobmp, 2, record, Some([1, 1])),
+        Ok(true)
+    );
+    assert_eq!(fx_dirty_nobmp.world.saved_portraits, [WIDGET].into());
+    assert!(!fx_dirty_nobmp.world.portraits.contains(&WIDGET));
+    assert!(fx_dirty_nobmp.world.dirty_portraits.contains(&WIDGET));
+}
+
+#[test]
+fn a_dirty_build_whose_reset_saves_a_siblings_bmp_2002_loads_it_at_0x4e9338() {
+    // 0x4e9338 looks up BMP_ 2002 in the resource file AFTER 0x4e92f2 returns:
+    // if WIDGET's Reset invalidates slot 1 AND triggers a clean dialog for a
+    // sibling person definition in the same writable IFF (saving BMP_ 2002 into
+    // that file), 0x4e9338 loads that newly saved bitmap cleanly.
+    const SIBLING: u32 = 0x5555_0003;
+    let (mut fx, widget_file, widget_record) = visitors();
+    let index = fx.catalog.objects.len();
+    fx.catalog.objects.push(sims_content::Object {
+        guid: SIBLING,
+        resource: widget_file,
+        chunk: 129,
+        kind: 2,
+        master: 0,
+    });
+    fx.catalog.by_guid.insert(SIBLING, index);
+    let lib = fx.program.libraries.get_mut(&widget_file).unwrap();
+    let words = *lib.definitions.get(&128).unwrap();
+    lib.definitions.insert(129, words);
+    let callbacks = lib.callbacks.get(&128).unwrap().clone();
+    lib.callbacks.insert(129, callbacks);
+    crate::person_factory::equip(&mut fx, SIBLING, "sibling", 12);
+    let sibling_record = fx.world.neighbors.slots.len() as i16;
+
+    // Give WIDGET a Reset callback (OBJf entry 3, tree 4100) that writes
+    // pd[68] := 1 (invalidating WIDGET's freshly built slot 1) and runs an
+    // informing dialog for SIBLING (saving BMP_ 2002 into `widget_file`).
+    crate::visits::function(&mut fx, widget_file, 3, 4100);
+    fx.add(
+        widget_file,
+        4100,
+        tree(vec![
+            assign(scope::MY_PERSON, 68, scope::LITERAL, 1, 1),
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, sibling_record, 2),
+            ins(
+                DIALOG,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+            ),
+        ]),
+    );
+    fx.world.dirty_portraits.insert(WIDGET);
+    assert_eq!(
+        inform_from(&mut fx, 2, widget_record, Some([1, 1])),
+        Ok(true)
+    );
+    assert!(fx.world.saved_portraits.contains(&SIBLING));
+    assert!(fx.world.portraits.contains(&WIDGET));
+    assert!(!fx.world.dirty_portraits.contains(&WIDGET));
+}
+
+#[test]
+fn a_dirty_no_tile_build_succeeds_when_reset_populates_slot_1() {
+    // 0x4e9706 removes the temporary person unput, running Reset while the
+    // person is still registered. If Reset requests a portrait of that same
+    // person (populating slot 1 from the on-lot temporary person), 0x4e9315
+    // sees slot 1 non-null and succeeds with no BMP_ 2002 on disk.
+    let (mut fx, widget_file, widget_record) = visitors();
+    fx.world.size = 2; // no free tile -> NotFound -> 0x4e9706
+    fx.world.dirty_portraits.insert(WIDGET);
+    // Reset callback (OBJf entry 3, tree 4100): show a mode-2 informing dialog
+    // naming WIDGET's own neighbor record while the temporary person is still
+    // registered in `world.people`, populating slot 1 via the on-lot path.
+    crate::visits::function(&mut fx, widget_file, 3, 4100);
+    fx.add(
+        widget_file,
+        4100,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, widget_record, 1),
+            ins(
+                DIALOG,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+            ),
+        ]),
+    );
+    assert_eq!(
+        inform_from(&mut fx, 2, widget_record, Some([1, 1])),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.contains(&WIDGET));
+    assert!(!fx.world.dirty_portraits.contains(&WIDGET));
+    // Construction's `0x588930 -> 0x58d4e1 -> 0x4eb0cc -> 0x4e897e` clears the
+    // dirty flag before Reset runs, so Reset's nested dialog takes the clean
+    // `0x4e938c` (`save = 1`) path and saves `BMP_` 2002.
+    assert_eq!(fx.world.saved_portraits, [WIDGET].into());
 }

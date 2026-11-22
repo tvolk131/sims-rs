@@ -255,8 +255,10 @@ fn scope_24_field_9_reads_the_first_family_of_the_records_id() {
 
 #[test]
 fn the_family_panel_caches_the_selected_familys_count_for_later_reads() {
-    // The Goths (family 5) are the selected family.
+    // The Goths (family 5) are the selected family on a residential lot.
     let mut fx = friends();
+    let lot = fx.world.globals[10];
+    fx.program.zoning.insert(lot, 1);
     fx.world.globals[9] = 5;
     let refresh = |fx: &mut Fixture| {
         Interpreter::new(&fx.program, &fx.catalog, fx.stream).refresh_family_panel(&mut fx.world)

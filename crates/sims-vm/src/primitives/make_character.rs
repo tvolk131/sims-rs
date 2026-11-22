@@ -224,6 +224,29 @@ impl Machine<'_, '_> {
             _ => {}
         }
 
+        let apply_dialog_name = |this: &Self, guid: u32| {
+            // `0x44b0a8..0x44b0fc` / `0x44b18a..0x44b1cc`: read global
+            // `[0x6e4ac0]` (last kind 3 dialog text); when empty, fall back
+            // to localized `UIText.iff STR# 142[5]` (`0x44b0bf..0x44b0d6`,
+            // `0x44b1a1..0x44b1b8`).
+            if let Some(names) = this.character_names {
+                let submitted = this
+                    .dialog_text
+                    .map(|slot| slot.borrow().clone())
+                    .unwrap_or_default();
+                let chosen = if !submitted.is_empty() {
+                    Some(submitted)
+                } else {
+                    this.default_character_name
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                };
+                if let Some(name) = chosen {
+                    names.borrow_mut().insert(guid, name);
+                }
+            }
+        };
+
         if species == 0 {
             let (bodies, heads) = self.suit_counts(&tone, female, child)?;
             if bodies == 0 || heads == 0 {
@@ -232,7 +255,7 @@ impl Machine<'_, '_> {
             }
             // The head, then the body (0x44b151, 0x44b167). Record the exact
             // chosen suits/rows in World::made_outfits (out of snapshot format
-            // 31) so portrait rendering (0x4e7824) and later negative-age
+            // 32) so portrait rendering (0x4e7824) and later negative-age
             // copies use the specific wardrobe entries native code writes at
             // 0x40d4e7 and 0x40d183.
             let head_idx = (self.draw() % heads) as usize;
@@ -283,6 +306,7 @@ impl Machine<'_, '_> {
                 None,
             );
             self.world.made_portrait_head.insert(guid, head_status);
+            apply_dialog_name(self, guid);
             self.frame_mut()?.stack_object = record;
             Ok(true)
         } else {
@@ -349,6 +373,7 @@ impl Machine<'_, '_> {
                 .or_default()
                 .extend(outfit_rows);
             self.world.made_portrait_head.insert(guid, head_status);
+            apply_dialog_name(self, guid);
             self.frame_mut()?.stack_object = record;
             // 0x44b111..0x44b12b: pet creation immediately calls
             // 0x4e8c5d(index, 0x1f, 1), rendering and caching the portrait
@@ -775,6 +800,7 @@ impl Machine<'_, '_> {
                 .generated_portrait_2002
                 .remove(&sims_sim::PortraitFile::Made(removed.file));
         }
+        self.world.saved_portraits.remove(&guid);
         self.world.made_portrait_head.remove(&guid);
         self.world.made_outfits.remove(&guid);
         self.world.ambiguous_portraits.remove(&guid);
@@ -877,7 +903,11 @@ impl Machine<'_, '_> {
                  registers it over that type (0x43bda9), which is not ported"
             )));
         }
-        let inherited_portrait_2002 = self.has_portrait_2002(template);
+        let template_has_saved_bitmap = self.file_has_saved_portrait(template)
+            || self
+                .portrait_file(template)
+                .is_some_and(|file| self.world.generated_portrait_2002.contains(&file));
+        let inherited_portrait_2002 = template_has_saved_bitmap || self.has_portrait_2002(template);
         self.world.characters.made.insert(
             guid,
             Character {
@@ -886,13 +916,16 @@ impl Machine<'_, '_> {
                 strings: Default::default(),
             },
         );
-        // 0x42629e copies the template's current IFF resources into
-        // `Characters/User%05d.iff`, including any BMP_ 2002 written to the
-        // template earlier in this session.
+        // 0x472356..0x472519 enumerates and copies every resource currently in
+        // the template's file into `User%05d.iff`, including any BMP_ 2002
+        // written to the template during play.
         if inherited_portrait_2002 {
             self.world
                 .generated_portrait_2002
                 .insert(sims_sim::PortraitFile::Made(file));
+        }
+        if template_has_saved_bitmap {
+            self.world.saved_portraits.insert(guid);
         }
         let record = self
             .world

@@ -134,6 +134,29 @@ impl WallPool {
     }
 }
 
+/// Borrowed view of one wall table image inside [`Pools`]: avoids copying
+/// up to 19 KB per lamp per wall segment on the render hot path.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WallPoolRef<'a> {
+    pub width: usize,
+    pub height: usize,
+    bytes: &'a [u8],
+}
+
+impl WallPoolRef<'_> {
+    /// The light the image adds at pixel (`x`, `y`), 0 off it.
+    #[inline]
+    pub(crate) fn at(&self, x: i64, y: i64) -> u8 {
+        let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y)) else {
+            return 0;
+        };
+        if x >= self.width || y >= self.height {
+            return 0;
+        }
+        self.bytes[y * self.width + x]
+    }
+}
+
 impl Pools {
     /// Reads the pool maps out of the bytes of `lightMap.dat`, or None if
     /// its size is not the one the layout gives.
@@ -162,11 +185,14 @@ impl Pools {
         Some(Self { maps, walls })
     }
 
-    /// The wall table image for a lamp `along` and `out` tiles from a
-    /// wall along view y (`along_y`, direction 1, kind 0) or view x
-    /// (direction 2, kind 1), at zoom index `zoom` (0 far to 2 near), as
-    /// [`wall_lamp`] gives them. None if the tables have no such image.
-    pub fn wall(&self, along_y: bool, zoom: usize, along: i32, out: usize) -> Option<WallPool> {
+    /// Borrowed slice of one wall table image ([`Pools::wall`] without copying).
+    pub(crate) fn wall_ref(
+        &self,
+        along_y: bool,
+        zoom: usize,
+        along: i32,
+        out: usize,
+    ) -> Option<WallPoolRef<'_>> {
         let half = *DISTANCES.get(out)? - 1;
         if zoom > 2 || along.unsigned_abs() as usize > half {
             return None;
@@ -186,11 +212,24 @@ impl Pools {
         let (width, height) = wall_size(zoom);
         let index = (along + half as i32) as usize;
         let start = kind * per_kind + before_zoom + before_out + index * width * height;
-        let bytes = self.walls.get(start..start + width * height)?.to_vec();
-        Some(WallPool {
+        let bytes = self.walls.get(start..start + width * height)?;
+        Some(WallPoolRef {
             width,
             height,
             bytes,
+        })
+    }
+
+    /// The wall table image for a lamp `along` and `out` tiles from a
+    /// wall along view y (`along_y`, direction 1, kind 0) or view x
+    /// (direction 2, kind 1), at zoom index `zoom` (0 far to 2 near), as
+    /// [`wall_lamp`] gives them. None if the tables have no such image.
+    pub fn wall(&self, along_y: bool, zoom: usize, along: i32, out: usize) -> Option<WallPool> {
+        let r = self.wall_ref(along_y, zoom, along, out)?;
+        Some(WallPool {
+            width: r.width,
+            height: r.height,
+            bytes: r.bytes.to_vec(),
         })
     }
 

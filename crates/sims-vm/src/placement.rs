@@ -1295,7 +1295,67 @@ impl Interpreter<'_> {
         }
         Ok(())
     }
+}
 
+/// Resolves the house view's centre tile pick (`0x4a7b58` cut to a tile by
+/// `0x433067`: view-rotated `[x, y]`) into the unturned lot fine point that
+/// `0x4347f0` clamps at `0x4349e5` (`start_tile`):
+///
+/// 1. Bounds check (`0x434891` → `0x434cb7`): test `pick` against the
+///    rotated lot's interior bounds (`[min_x + 1..=max_x - 1, min_y + 1..=max_y - 1]`,
+///    set by `0x4791a6` from the 64-tile turn table `0x407704`).
+/// 2. Fallback (`0x43489e` to `0x4348fa`): if outside, replace with the
+///    rotated lot's midpoint tile `[(size / 2) + min_x, (size / 2) + min_y]`
+///    (byte-wrapping addition, `0x434c85`), converted to tile centre
+///    `((t << 4) | 8)` (`0x434c98`).
+/// 3. Inverse view turn (`0x4348fd` to `0x43491c`): turn the fine point
+///    within the 1024-unit square (`0x47bc1f`) by `(-rotation) & 3`.
+///
+/// Any sub-tile offset `0..=15` from `0x4a99f9` maps identically after
+/// `0x47bc1f` and `>> 4` at `0x4349e5` (`(1023 - ((t << 4) | f)) >> 4 == 63 - t`),
+/// so the tile pick determines the start tile losslessly.
+pub(crate) fn portrait_start(size: i32, rotation: u8, pick: [i8; 2]) -> Result<[i32; 2], Trap> {
+    if size < 1 {
+        return Err(Trap::Unsupported(format!(
+            "a dialog's portrait search on a lot {size} tiles wide: the rotated bounds \
+             table (0x4791a6, 0x434f58) requires a positive lot size"
+        )));
+    }
+    if size > FULL && rotation & 3 != 0 {
+        return Err(Trap::Unsupported(format!(
+            "a dialog's portrait search on a lot {size} tiles wide, turned: its corners \
+             are past the table of turns (0x434f58)"
+        )));
+    }
+    let far_min = FULL - size;
+    let [min_x, min_y] = match rotation & 3 {
+        1 => [far_min, 0],
+        2 => [far_min, far_min],
+        3 => [0, far_min],
+        _ => [0, 0],
+    };
+    let [max_x, max_y] = [min_x + size - 1, min_y + size - 1];
+    let [tx, ty] = [i32::from(pick[0]), i32::from(pick[1])];
+    let in_bounds = tx > min_x && tx < max_x && ty > min_y && ty < max_y;
+    let [a, b] = if in_bounds {
+        [(tx << 4) | 8, (ty << 4) | 8]
+    } else {
+        let half = (size / 2) as u8;
+        let fx = i32::from(half.wrapping_add(min_x as u8) as i8);
+        let fy = i32::from(half.wrapping_add(min_y as u8) as i8);
+        [(fx << 4) | 8, (fy << 4) | 8]
+    };
+    // 0x47bc1f with square 0x400 (SPAN = 0x3ff) and (-rotation) & 3.
+    const SPAN: i32 = 0x3ff;
+    Ok(match (4 - i32::from(rotation & 3)) & 3 {
+        1 => [SPAN.wrapping_sub(b), a],
+        2 => [SPAN.wrapping_sub(a), SPAN.wrapping_sub(b)],
+        3 => [b, SPAN.wrapping_sub(a)],
+        _ => [a, b],
+    })
+}
+
+impl Interpreter<'_> {
     /// Plans how `UI Effect`, `Dialog`, and pet portrait creation (`0x4e9652`
     /// → `0x4e96fe`) places its temporary person on the lot.
     ///
@@ -1326,8 +1386,13 @@ impl Interpreter<'_> {
         };
         let rules = PORTRAIT_SEARCH_RULES;
         let tiles: Vec<[i8; 2]> = match self.view_centre {
-            Some([x, y]) => {
-                let from = [(i32::from(x) << 4) | 8, (i32::from(y) << 4) | 8];
+            Some(pick) => {
+                let from = portrait_start(i32::from(world.size), self.view_rotation, pick)
+                    .map_err(|trap| Fault {
+                        object: id,
+                        at: None,
+                        trap,
+                    })?;
                 let Some(pos) = self.search(world, id, from, 1, rules)? else {
                     return Ok(PortraitPutPlan::NoTile);
                 };
@@ -2235,4 +2300,46 @@ fn forward(at: [i8; 3], facing: i16) -> Result<[i8; 3], Trap> {
         at[1].wrapping_add(*second),
         at[2],
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portrait_start_checks_rotated_bounds_falls_back_and_unrotates() {
+        // 64-tile lot: in-bounds pick [32, 32] stays [32, 32] at view 0,
+        // and turns to [32, 31], [31, 31], [31, 32] at views 1, 2, 3.
+        for (rot, tile) in [(0, [32, 32]), (1, [32, 31]), (2, [31, 31]), (3, [31, 32])] {
+            let pt = portrait_start(64, rot, [32, 32]).unwrap();
+            assert_eq!(pt.map(|n| (n >> 4) as i8), tile, "in-bounds rot {rot}");
+            // Out-of-bounds pick [0, 0] triggers the midpoint fallback (half=32,
+            // min=[0,0]), then un-rotates to the same tile.
+            let fb = portrait_start(64, rot, [0, 0]).unwrap();
+            assert_eq!(fb.map(|n| (n >> 4) as i8), tile, "fallback rot {rot}");
+        }
+        // 6-tile lot: rotated interior is [59..=62, 1..=4] at view 1 and
+        // [1..=4, 59..=62] at view 3.
+        let p1 = portrait_start(6, 1, [60, 2]).unwrap();
+        assert_eq!(p1.map(|n| (n >> 4) as i8), [2, 3]);
+        // Out-of-bounds pick at view 1 falls back to (58+3, 0+3)=(61,3),
+        // un-rotated by 3 to tile (3, 2).
+        let fb1 = portrait_start(6, 1, [2, 2]).unwrap();
+        assert_eq!(fb1.map(|n| (n >> 4) as i8), [3, 2]);
+        let p3 = portrait_start(6, 3, [2, 60]).unwrap();
+        assert_eq!(p3.map(|n| (n >> 4) as i8), [3, 2]);
+        let fb3 = portrait_start(6, 3, [2, 2]).unwrap();
+        assert_eq!(fb3.map(|n| (n >> 4) as i8), [2, 3]);
+        // Size 2 falls back cleanly; size 0 and turned size > 64 trap.
+        assert!(portrait_start(2, 0, [7, 7]).is_ok());
+        assert!(portrait_start(2, 1, [7, 7]).is_ok());
+        assert!(matches!(
+            portrait_start(0, 0, [1, 1]),
+            Err(Trap::Unsupported(_))
+        ));
+        assert!(matches!(
+            portrait_start(65, 1, [1, 1]),
+            Err(Trap::Unsupported(_))
+        ));
+    }
 }

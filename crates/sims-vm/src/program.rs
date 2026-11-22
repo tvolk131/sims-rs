@@ -51,22 +51,29 @@ pub struct Library {
     /// language, in order.
     pub strings: BTreeMap<u16, Vec<String>>,
     /// Each catalog string table (CTSS) by chunk ID: every entry, with its
-    /// language. A definition's word 41 names its table, whose name the
-    /// dialog formatter writes for `$Object` (0x44c1ca, 0x457d3b).
+    /// language, from the resource the loader finds (`Iff::get`). A
+    /// definition's word 41 names its table, whose US English slot 1
+    /// (`0x4061e3`, `0x470ca7(0, 0)`, `0x471411(1, -1)`) the formatter writes
+    /// for `$Me`, `$Object`, and `$Neighbor` (`0x457d3b`).
     pub catalog_strings: BTreeMap<u16, Vec<(u8, String)>>,
+    /// The catalog string tables (CTSS) whose resource the loader (`0x470ca7`)
+    /// reads in a way not ported, by ID, each with why ([`unported_strings`]).
+    pub unported_catalog_strings: BTreeMap<u16, &'static str>,
     /// The string tables (STR#) as the original's loader finds them
     /// (0x46feac), by ID, where that differs from [`Library::strings`]
     /// (the chunks in file order, the last of an ID kept, each table's
     /// first-language entries in file order): the resource of the ID
     /// ([`Iff::get`]: deleted chunks skipped, 0x41c542), with its
     /// first-language entries in the loader's order ([`loaded_order`]), or
-    /// None when the file has chunks of the ID but no resource. Only the
-    /// dialog's strings read it; whether the other readers of
-    /// [`Library::strings`] load through the same loader is **unverified**.
+    /// None when the file has chunks of the ID but no resource. Dialogs
+    /// (0x43601c) and Add/Change Action String (0x44cc07) read it through
+    /// 0x47028b; whether the other readers of [`Library::strings`] load
+    /// through the same loader is **unverified**.
     pub loaded_strings: BTreeMap<u16, Option<Vec<String>>>,
     /// The string tables (STR#) whose resource the loader (0x46feac, the
-    /// dialog's call with argument 3 zero) reads in a way not ported, by
-    /// ID, each with why ([`unported_strings`]). Only the dialog reads it.
+    /// 0x47028b call with argument 3 zero) reads in a way not ported, by
+    /// ID, each with why ([`unported_strings`]). Dialogs and Add/Change
+    /// Action String read it.
     pub unported_strings: BTreeMap<u16, &'static str>,
     /// The IDs of the file's legacy string tables (CST resources), which
     /// are not read: the original's string loader falls back to one when
@@ -76,26 +83,29 @@ pub struct Library {
     /// is `\0CST`.
     pub legacy_strings: BTreeSet<u16>,
     /// The IDs of the file's legacy catalog string tables (CATS), which
-    /// are not read: the catalog's name lookup (0x4061e3) checks for one
-    /// before the CTSS table (**unverified**, from a reading of the
-    /// disassembly not checked here).
+    /// are not read: the catalog's name lookup (`0x4061e3`) checks for a
+    /// `CATS` resource of the table's ID before reading `CTSS`.
     pub legacy_catalog_strings: BTreeSet<u16>,
     /// The sound event each FWAV chunk names, by chunk ID: what Play
     /// Sound Event plays (0x582c57). The name is the chunk's bytes up to
     /// the first zero, read as Latin-1.
     pub sounds: BTreeMap<u16, String>,
     /// Whether the file holds a decodable neutral-language `BMP_` 2002
-    /// (`0x7d2`, high byte of flags 0) portrait image that `0x4e92a8` →
-    /// `0x4e9260` → `0x4dece6` → `0x41cb2f` → `0x41bab1` can load without
-    /// calling `0x4e8c5d`.
-    pub has_portrait_2002: bool,
-    /// Whether the underlying resource file is read-only (e.g. a `.far`
-    /// archive member or a read-only file on disk). `0x4e8c5d` checks
-    /// writability at `0x4e8cc6` (`0x4067b3` → `0x4174dc`) before calling
-    /// `0x4e9652` for an off-lot person, and `0x4e9000` only persists a
-    /// generated `BMP_` 2002 to a writable file.
-    pub read_only: bool,
+    /// (`0x7d2`, high byte of flags 0) portrait image ("faces", `0x4e9260` →
+    /// `0x4dece6` → `0x4ded4a` → `0x41cb2f` → `0x41bab1`) that `0x4e92a8` can
+    /// load without calling `0x4e8c5d`.
+    pub has_portrait_bitmap: bool,
+    /// Whether the original opens this file writable (`iResFile::CanWrite`,
+    /// `vtable[+0x20]`, checked at `0x4e8cc6` and `0x4e9031`): true only for
+    /// loose `.iff` files under the neighborhood's `Characters` mount
+    /// (`0x43c6b9`, `0x43c2c1`, `0x43c5bf`, `0x43e48a`, `0x465970`,
+    /// `0x413083`). FAR archive members (`ResolveResFile`, `0x5cfb38`) and
+    /// files from other mounts (`0x43aa03`) are read-only.
+    pub writable: bool,
 }
+
+/// The `BMP_` chunk ID of a person file's portrait faces (`0x4e9260`).
+const PORTRAIT_BITMAP: u16 = 2002;
 
 /// The string table Run Tree By Name instructions name their trees in.
 pub const TREE_NAMES: u16 = 303;
@@ -316,18 +326,10 @@ impl Program {
                         library.legacy_strings.insert(chunk.id);
                     }
                 }
-                b"CTSS" => {
-                    let table = sims_formats::strings::StringTable::parse(data)
-                        .map_err(|e| format("CTSS", chunk.id, e))?;
-                    let entries = table
-                        .entries
-                        .iter()
-                        .map(|entry| (entry.language, entry.text.clone()))
-                        .collect();
-                    library.catalog_strings.insert(chunk.id, entries);
-                }
                 b"CATS" => {
-                    library.legacy_catalog_strings.insert(chunk.id);
+                    if iff.get(b"CATS", chunk.id).is_some() {
+                        library.legacy_catalog_strings.insert(chunk.id);
+                    }
                 }
                 b"FWAV" => {
                     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
@@ -357,6 +359,26 @@ impl Program {
                 _ => {}
             }
         }
+        // Portrait bitmap 2002 (0x7d2) read by 0x4e92a8 -> 0x4e9260 -> 0x4dece6
+        // -> 0x4ded4a -> 0x41cb2f -> 0x41bab1: 0x41bad8 zeros the lookup key's
+        // high byte, so only a neutral-language (high byte 0) BMP_ 2002 matches.
+        library.has_portrait_bitmap = iff
+            .get(b"BMP_", PORTRAIT_BITMAP)
+            .is_some_and(|chunk| is_native_portrait_bmp(iff.data(chunk)));
+        // 0x43c6b9/0x43c2c1/0x43c5bf → 0x43e48a → 0x465970 → 0x413094..0x4130dd:
+        // only loose files under `Characters` are opened with writable = 1, and
+        // `FlatFile::Open` sets `CanWrite()` (byte +8) only if the read-write
+        // open actually succeeds (falling back to read-only on failure).
+        library.writable = file.member.is_none()
+            && index
+                .mounts
+                .get(file.mount)
+                .is_some_and(|m| m.path == Index::CHARACTERS)
+            && std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file.path)
+                .is_ok();
         // The string tables as the original's loader finds them.
         let ids: BTreeSet<u16> = iff
             .chunks
@@ -392,18 +414,31 @@ impl Program {
                 library.loaded_strings.insert(id, Some(loaded));
             }
         }
-        // Portrait bitmap 2002 (0x7d2) read by 0x4e92a8 -> 0x4e9260 -> 0x4dece6
-        // -> 0x4ded4a -> 0x41cb2f -> 0x41bab1: 0x41bad8 zeros the lookup key's
-        // high byte, so only a neutral-language (high byte 0) BMP_ 2002 matches.
-        library.has_portrait_2002 = iff
-            .get(b"BMP_", 2002)
-            .is_some_and(|chunk| is_native_portrait_bmp(iff.data(chunk)));
-        // Archive members (.far) and read-only loose files report IsWritable ==
-        // false at 0x4067b3 -> 0x4174dc.
-        library.read_only = file.member.is_some()
-            || std::fs::metadata(&file.path)
-                .map(|m| m.permissions().readonly())
-                .unwrap_or(true);
+        // Catalog string tables (CTSS) as `0x4061e3` / `0x470ca7` loads them.
+        let ctss_ids: BTreeSet<u16> = iff
+            .chunks
+            .iter()
+            .filter(|chunk| &chunk.tag == b"CTSS")
+            .map(|chunk| chunk.id)
+            .collect();
+        for id in ctss_ids {
+            let Some(chunk) = iff.get(b"CTSS", id) else {
+                continue;
+            };
+            let data = iff.data(chunk);
+            if let Some(why) = unported_strings(iff.resource_flags(chunk), data) {
+                library.unported_catalog_strings.insert(id, why);
+                continue;
+            }
+            let table = sims_formats::strings::StringTable::parse(data)
+                .map_err(|e| format("CTSS", id, e))?;
+            let entries = table
+                .entries
+                .iter()
+                .map(|entry| (entry.language, entry.text.clone()))
+                .collect();
+            library.catalog_strings.insert(id, entries);
+        }
         // The native resource order (the rsmp map when there is one), as the
         // catalog registers definitions. The old prototype kept physical
         // file order instead (legacy/crates/sims-content/src/vm.rs:187).

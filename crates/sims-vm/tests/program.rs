@@ -1175,7 +1175,7 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
     dir.file("GameData/Behavior.iff", &iff_bytes(&[]));
     dir.file("GameData/Global/Global.iff", &iff_bytes(&[]));
 
-    // 1. Loose file with neutral (high byte 0) BMP_ 2002 -> has_portrait_2002 = true, read_only = false.
+    // 1. Loose file with neutral (high byte 0) BMP_ 2002 -> has_portrait_bitmap = true.
     let neutral_guid = 0x9000_0001u32;
     dir.file(
         "GameData/Objects/neutral.iff",
@@ -1185,7 +1185,7 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
         ]),
     );
 
-    // 2. Loose file with English-only (high byte 1) BMP_ 2002 -> has_portrait_2002 = false
+    // 2. Loose file with English-only (high byte 1) BMP_ 2002 -> has_portrait_bitmap = false
     // because 0x41bab1 -> 0x41bad8 forces the lookup key's high byte to 0.
     let lang1_guid = 0x9000_0002u32;
     dir.file(
@@ -1196,7 +1196,7 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
         ]),
     );
 
-    // 3. Archive (.far) member without BMP_ 2002 -> read_only = true, has_portrait_2002 = false.
+    // 3. Archive (.far) member without BMP_ 2002 -> writable = false, has_portrait_bitmap = false.
     let archived_guid = 0x9000_0003u32;
     let archived_iff = iff_bytes(&[(b"OBJD", 128, 0x0010, objd(archived_guid, 0, 0))]);
     dir.file(
@@ -1204,7 +1204,7 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
         &far_archive("Archived.iff", &archived_iff),
     );
 
-    // 4. Loose file with uncompressed 32-bit 1x1 BMP_ 2002 -> has_portrait_2002 = true
+    // 4. Loose file with uncompressed 32-bit 1x1 BMP_ 2002 -> has_portrait_bitmap = true
     // because the native decoder (`0x4ded4a` -> `0x4df06a..0x4df122`) accepts it.
     let bmp32_guid = 0x9000_0004u32;
     let mut bmp32 = tiny_bmp();
@@ -1218,7 +1218,7 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
     );
 
     // 5. Loose file with 57-byte 1x1 24-bit BMP_ 2002 (missing unused final-row
-    // padding byte) -> has_portrait_2002 = true because `0x4df117` advances
+    // padding byte) -> has_portrait_bitmap = true because `0x4df117` advances
     // past padding and exits at `0x4df122` without reading it.
     let bmp57_guid = 0x9000_0005u32;
     dir.file(
@@ -1229,7 +1229,7 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
         ]),
     );
 
-    // 6. Loose file with truncated (55-byte) BMP_ 2002 -> has_portrait_2002 = false.
+    // 6. Loose file with truncated (55-byte) BMP_ 2002 -> has_portrait_bitmap = false.
     let truncated_guid = 0x9000_0006u32;
     dir.file(
         "GameData/Objects/truncated.iff",
@@ -1398,23 +1398,72 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
         let obj = catalog.object(guid).unwrap();
         &program.libraries[&obj.resource]
     };
-    assert!(lib(neutral_guid).has_portrait_2002);
-    assert!(!lib(neutral_guid).read_only);
-    assert!(!lib(lang1_guid).has_portrait_2002);
-    assert!(!lib(lang1_guid).read_only);
-    assert!(!lib(archived_guid).has_portrait_2002);
-    assert!(lib(archived_guid).read_only);
-    assert!(lib(bmp32_guid).has_portrait_2002);
-    assert!(!lib(bmp32_guid).read_only);
-    assert!(lib(bmp57_guid).has_portrait_2002);
-    assert!(!lib(truncated_guid).has_portrait_2002);
-    assert!(lib(pal57_guid).has_portrait_2002);
-    assert!(lib(rle_eol_guid).has_portrait_2002);
-    assert!(lib(rle_delta_guid).has_portrait_2002);
-    assert!(lib(rle_td_wrap_guid).has_portrait_2002);
-    assert!(lib(rle_bu_wrap_guid).has_portrait_2002);
-    assert!(!lib(rle_td_oob_guid).has_portrait_2002);
-    assert!(!lib(rle_bu_oob_guid).has_portrait_2002);
-    assert!(lib(rle_1x1_pitch_ok_guid).has_portrait_2002);
-    assert!(!lib(rle_1x1_pitch_oob_guid).has_portrait_2002);
+    assert!(lib(neutral_guid).has_portrait_bitmap);
+    assert!(!lib(neutral_guid).writable);
+    assert!(!lib(lang1_guid).has_portrait_bitmap);
+    assert!(!lib(lang1_guid).writable);
+    assert!(!lib(archived_guid).has_portrait_bitmap);
+    assert!(!lib(archived_guid).writable);
+    assert!(lib(bmp32_guid).has_portrait_bitmap);
+    assert!(!lib(bmp32_guid).writable);
+    assert!(lib(bmp57_guid).has_portrait_bitmap);
+    assert!(!lib(truncated_guid).has_portrait_bitmap);
+    assert!(lib(pal57_guid).has_portrait_bitmap);
+    assert!(lib(rle_eol_guid).has_portrait_bitmap);
+    assert!(lib(rle_delta_guid).has_portrait_bitmap);
+    assert!(lib(rle_td_wrap_guid).has_portrait_bitmap);
+    assert!(lib(rle_bu_wrap_guid).has_portrait_bitmap);
+    assert!(!lib(rle_td_oob_guid).has_portrait_bitmap);
+    assert!(!lib(rle_bu_oob_guid).has_portrait_bitmap);
+    assert!(lib(rle_1x1_pitch_ok_guid).has_portrait_bitmap);
+    assert!(!lib(rle_1x1_pitch_oob_guid).has_portrait_bitmap);
+}
+
+#[test]
+fn characters_library_writability_checks_read_write_open() {
+    // 0x413094..0x4130dd: FlatFile::Open sets CanWrite() only when opening a
+    // loose Characters file read-write actually succeeds.
+    let dir = Dir::new("characters-writable");
+    let (_, _) = setup(&dir);
+    let mut person_a = objd(0x9001, 4096, 4096);
+    person_a[0x08..0x0a].copy_from_slice(&2i16.to_le_bytes());
+    let mut person_b = objd(0x9002, 4096, 4096);
+    person_b[0x08..0x0a].copy_from_slice(&2i16.to_le_bytes());
+    dir.file(
+        "UserData/Characters/Writable.iff",
+        &iff(&[(b"OBJD", 128, person_a), (b"BHAV", 4096, bhav(1, &[]))]),
+    )
+    .file(
+        "UserData/Characters/ReadOnly.iff",
+        &iff(&[(b"OBJD", 128, person_b), (b"BHAV", 4096, bhav(1, &[]))]),
+    );
+    let ro_path = dir.0.join("UserData/Characters/ReadOnly.iff");
+    let mut ro_perms = std::fs::metadata(&ro_path).unwrap().permissions();
+    ro_perms.set_readonly(true);
+    std::fs::set_permissions(&ro_path, ro_perms).unwrap();
+
+    let mut index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+    index
+        .add_characters(&dir.0.join("UserData/Characters"))
+        .unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    let program = Program::link(&index, &catalog, [0x1111, 0x9001, 0x9002]).unwrap();
+    let lamp = catalog.object(0x1111).unwrap().resource;
+    let writable = catalog.object(0x9001).unwrap().resource;
+    let read_only = catalog.object(0x9002).unwrap().resource;
+
+    assert!(!program.libraries[&lamp].writable);
+    assert!(program.libraries[&writable].writable);
+    assert!(!program.libraries[&read_only].writable);
+
+    // Restore write permission so Dir::drop can clean up on every platform.
+    let mut rw_perms = std::fs::metadata(&ro_path).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        rw_perms.set_mode(0o644);
+    }
+    #[cfg(not(unix))]
+    rw_perms.set_readonly(false);
+    std::fs::set_permissions(&ro_path, rw_perms).unwrap();
 }

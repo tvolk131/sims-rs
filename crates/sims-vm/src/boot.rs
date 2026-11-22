@@ -17,7 +17,8 @@ pub mod save;
 use crate::play::Play;
 use crate::selection::publish_waited_for;
 use crate::{
-    Answer, Answers, Callback, Interpreter, Program, SkippedFrame, Stream, TickError, Update,
+    Answer, Answers, BuyCursor, Callback, Interpreter, PanelMode, Program, SkippedFrame, Stream,
+    TickError, Update,
 };
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
 use sims_core::CrtRng;
@@ -25,11 +26,74 @@ use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Anything that stops a boot, with a message that says where.
 pub type BootError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Loads the localized default baby/character name from
+/// `GameData/UIText.iff STR# 142` entry 5 (`0x44b0bf..0x44b0d6` -> `0x435f4e`).
+fn read_default_character_name(install: &Install) -> String {
+    let Ok(path) = install.file("GameData/UIText.iff") else {
+        return String::new();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return String::new();
+    };
+    let Ok(iff) = sims_formats::iff::Iff::parse(bytes) else {
+        return String::new();
+    };
+    let Some(chunk) = iff.get(b"STR#", 142) else {
+        return String::new();
+    };
+    let Ok(table) = sims_formats::strings::StringTable::parse(iff.data(chunk)) else {
+        return String::new();
+    };
+    table.get(4, 1).unwrap_or_default().to_owned()
+}
+
+/// Loads initial `(lot_name, lot_description)` for `lot_id` from the
+/// neighborhood's `Houses/*Desc.iff` `STR# (2000 + lot_id)` entries 1 and 2
+/// (`cWinEditLotInfo` at `0x50e14b..0x50e253`):
+/// - `21..=30` (`0x15..=0x1e`): `DTDesc.iff` (Downtown)
+/// - `40..=48` (`0x28..=0x30`): `VIDesc.iff` (Vacation Island)
+/// - `81..=89` (`0x51..=0x59`): `STDesc.iff` (Studio Town)
+/// - `90..=99` (`0x5a..=0x63`): `MTDesc.iff` (Magic Town)
+/// - otherwise, only when `0x42b9e3` zoning is nonzero (lot 0 returns 1):
+///   `NeighborhoodDesc.iff` (`0x50e19b..0x50e1b2`)
+fn read_lot_info(house: &Path, lot_id: u32, zoning: Option<i32>) -> (String, String) {
+    let Some(houses_dir) = house.parent() else {
+        return (String::new(), String::new());
+    };
+    let desc_file = match lot_id {
+        21..=30 => "DTDesc.iff",
+        40..=48 => "VIDesc.iff",
+        81..=89 => "STDesc.iff",
+        90..=99 => "MTDesc.iff",
+        _ if lot_id == 0 || zoning.unwrap_or(0) != 0 => "NeighborhoodDesc.iff",
+        _ => return (String::new(), String::new()),
+    };
+    let path = houses_dir.join(desc_file);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return (String::new(), String::new());
+    };
+    let Ok(iff) = sims_formats::iff::Iff::parse(bytes) else {
+        return (String::new(), String::new());
+    };
+    let Ok(table_id) = u16::try_from(2000u32.saturating_add(lot_id)) else {
+        return (String::new(), String::new());
+    };
+    let Some(chunk) = iff.get(b"STR#", table_id) else {
+        return (String::new(), String::new());
+    };
+    let Ok(table) = sims_formats::strings::StringTable::parse(iff.data(chunk)) else {
+        return (String::new(), String::new());
+    };
+    let name = table.get(0, 1).unwrap_or_default().to_owned();
+    let desc = table.get(1, 1).unwrap_or_default().to_owned();
+    (name, desc)
+}
 
 /// The level the house view shows: the ground.
 /// Global 11: set by Special Effect's first state (0x44aad6), cleared
@@ -225,13 +289,76 @@ pub struct Lot {
 
     /// The house view's rotation, 0 to 3 ([`Lot::set_view_rotation`]).
     view_rotation: u8,
+    /// The saved house's opening camera direction, 0 to 3
+    /// ([`opening_rotation`]): the rotation that level 1's road-dash floor
+    /// tiles (`10` and `11`) in `world` are oriented for (`0x4a8042`,
+    /// `0x4a861f`, `0x4a87b1`–`0x4a87dc`).
+    floor_rotation: u8,
     /// The tile at the house view's centre, if known
     /// ([`Lot::set_view_centre`]).
     view_centre: Option<[i8; 2]>,
+    /// The view rotation and centre frozen when a tick paused on an
+    /// unanswered dialog (`Stop::Asks`), so moving the camera while a
+    /// dialog is showing does not alter the tick's replay once answered.
+    replay_view: Option<(u8, Option<[i8; 2]>)>,
+    /// The text entered in the last kind 3 text-prompt dialog
+    /// (`0x451a6b..0x451a85` -> global `[0x6e4ac0]`).
+    last_dialog_text: String,
+    /// Catalog names assigned to characters created by Make New Character
+    /// (`0x44b0a8..0x44b0fc`), keyed by new character GUID.
+    character_names: BTreeMap<u32, String>,
+    /// Localized fallback name from `GameData/UIText.iff STR# 142[5]` for
+    /// empty kind-3 Make New Character submissions (`0x44b0bf..0x44b0d6`).
+    default_character_name: String,
+    /// Editable lot name (`cWinEditLotInfo`, `0x50e1f8..0x50e42c`), loaded
+    /// from the neighborhood's `*Desc.iff` `STR# (2000 + lot_id)` and persisted
+    /// in [`save::Saved`].
+    lot_name: String,
+    /// Editable lot description (`cWinEditLotInfo`, `0x50e1f8..0x50e42c`),
+    /// loaded from `*Desc.iff` `STR# (2000 + lot_id)` and persisted in
+    /// [`save::Saved`].
+    lot_description: String,
     /// The world's hash as the load left it, which a save carries so it
     /// goes back only into a lot loaded from the same files
     /// ([`save`]).
     loaded: [u8; 32],
+    /// Committed Buy Mode purchases available for Undo (`0x493259`, `0x4932fa`).
+    /// Cleared when leaving a non-Live mode (`0x4cea5d` → `0x4933dc`) or
+    /// restoring a save.
+    buy_undo: Vec<crate::BuyPurchase>,
+    /// Undone Buy Mode purchases available for Redo (`0x493338`).
+    buy_redo: Vec<crate::BuyPurchase>,
+    /// Detached Buy Mode objects whose history cleanup (`0x48c20e`) faulted,
+    /// tracked so [`Lot::save`] and mode switches never leak them silently.
+    buy_orphans: Vec<crate::BuyPurchase>,
+    /// The single live Buy Mode cursor currently owned by this lot, enforcing
+    /// native single-cursor ownership and preventing retired/cross-lot
+    /// [`BuyCursor`] handles from touching objects owned by this lot.
+    active_buy_cursor: Option<ActiveBuyCursor>,
+}
+
+/// Process-wide monotonic token allocator for [`BuyCursor`] handles so no two
+/// cursors across any [`Lot`] instances ever share a token.
+static NEXT_BUY_CURSOR_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn alloc_buy_cursor_token() -> u64 {
+    loop {
+        let token = NEXT_BUY_CURSOR_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if token != 0 {
+            return token;
+        }
+    }
+}
+
+/// Lifecycle state tracked by [`Lot`] for the active [`BuyCursor`] handle.
+#[derive(Debug, Clone)]
+pub(super) struct ActiveBuyCursor {
+    pub(super) token: u64,
+    pub(super) cursor_lead: u16,
+    pub(super) held_lead: u16,
+    pub(super) existing: bool,
+    pub(super) owned_ids: BTreeSet<u16>,
+    pub(super) cursor: BuyCursor,
 }
 
 /// A dialog the lot waits on ([`Lot::asking`]). The tick that showed it
@@ -425,10 +552,11 @@ fn residential(world: &World, program: &Program) -> bool {
 }
 
 /// The rotation a house opens at: the camera direction its file saved
-/// (the HOUS chunk), as the render track opens the view
-/// (`sims_render::open_house`). That the original's load turns the scene
-/// (0x6e5528, +0x84) to it is not traced; the comparison harness saw the
-/// Goth house (`House05.iff`, which saved 0) open at rotation 0.
+/// (`HOUS 0`, `0x4a87b1`–`0x4a87dc`), as the render track opens the view
+/// (`sims_render::open_house`). On load, the original calls `0x4a7dfe` at
+/// `0x4a861f` with `force_no_swap = 1`, which turns the scene
+/// (`[0x6e5528] + 0x84` via `0x4791a6`) to that direction without swapping
+/// road-dash floors.
 pub fn opening_rotation(file: &House) -> u8 {
     file.view
         .as_ref()
@@ -693,6 +821,9 @@ impl Lot {
             let interpreter = Interpreter {
                 view_rotation,
                 view_centre,
+                // `0x42a2b4..0x42a2e5`: during load after `clear_family()` and
+                // on unoccupied lots, `game + 0x10` holds an empty family.
+                active_family: Some(&[]),
                 ..Interpreter::new(&program, &catalog, Stream::Global)
             };
             // The lot the game holds before the load: empty, with the
@@ -781,10 +912,55 @@ impl Lot {
                     .ok_or("the house file has no HOUS 1 chunk, which holds its model")?,
             );
             world.apply_context(context)?;
-            load.created = interpreter.resize(&mut world)?.created.len();
+            // Step 5 (`0x415e20..0x415e67`): shrink the bare lot to the house's
+            // requested size, rebuild its bare-lot rooms and tile flags
+            // (`0x415e48`), and reconcile lot-wide controllers before clearing.
+            // Vacation lots (40..=48) run `Find Location For` inside controller
+            // init here, which reads the bare-lot room map and architecture
+            // arrays (`0, 1/101, 2/102, 3/103, 8/108`) that 1.91 holds from
+            // startup.
+            let requested = match world.globals.get(23).copied().unwrap_or(0) {
+                0 => sims_sim::FULL_SIZE,
+                size => size,
+            };
+            if requested >= 4 && requested < world.size {
+                let full = usize::from(sims_sim::FULL_SIZE as u16);
+                let bare = |stride, fill| sims_formats::lot::Array {
+                    width: full,
+                    height: full,
+                    stride,
+                    encoding: 0,
+                    data: vec![fill; full * full * stride],
+                };
+                for (id, stride, fill) in [
+                    (0u16, 4usize, 0u8),
+                    (1, 2, 0),
+                    (2, 14, 0),
+                    (3, 2, 0),
+                    (4, 1, 0),
+                    (6, 1, 0),
+                    (7, 1, 0),
+                    (8, 1, 0),
+                    (9, 1, 0xff),
+                    (10, 1, 0xff),
+                    (101, 2, 0),
+                    (102, 14, 0),
+                    (103, 2, 0),
+                    (108, 1, 0),
+                ] {
+                    world.arrays.insert(id, bare(stride, fill));
+                }
+                world.size = requested;
+                world.rebuild_rooms()?;
+                world.globals[27] = 0;
+                load.created = interpreter.reconcile_controllers(&mut world)?.created.len();
+            } else {
+                load.created = interpreter.resize(&mut world)?.created.len();
+            }
             world.clear_family()?;
             load.queued = world.removals.len();
             load.removed = interpreter.clear(&mut world)?.len();
+            world.arrays.clear();
             // 6a and 6b: the lot arrays, then the saved floor and wall IDs.
             let version = file
                 .version()
@@ -873,9 +1049,17 @@ impl Lot {
                 .find(|(_, path)| path.file_name() == house.file_name())
                 .map(|(number, _)| number)
                 .ok_or("the house file's name does not give a house number")?;
-            let (family, record) = neighborhood.family_in(number).ok_or(
-                "no family lives in the house; selecting none is not checked against the original",
-            )?;
+            let occupied = neighborhood.family_in(number);
+            let (family, budget, flags, members, magic_history) = match occupied {
+                Some((family, record)) => (
+                    family,
+                    record.budget,
+                    record.flags,
+                    record.members.as_slice(),
+                    record.magic_history()?,
+                ),
+                None => (0u16, 0i32, 0u32, &[][..], None),
+            };
             load.family = family;
             load.house = number;
             // 0x42821a: the people who are not visitors, noted before the
@@ -884,8 +1068,8 @@ impl Lot {
             world.select_family(
                 i16::try_from(family)?,
                 i16::try_from(number)?,
-                record.budget,
-                record.magic_history()?,
+                budget,
+                magic_history,
             )?;
             // 13: every object is visited in registration order. The step
             // stops at the first visit that is not ported, with the lot as
@@ -908,15 +1092,14 @@ impl Lot {
                 let made = interpreter.ensure_indicators(&mut world)?.is_some();
                 world.finish_selection(&Household {
                     house: i32::try_from(number)?,
-                    flags: record.flags,
-                    members: &record.members,
+                    flags,
+                    members,
                     characters: &program.characters,
                     residents: &residents,
                     zoning: &program.zoning,
                 })?;
                 let made_again = interpreter.announce_house(&mut world)?.is_some();
-                let sim =
-                    interpreter.select_resident(&mut world, record.budget, &record.members)?;
+                let sim = interpreter.select_resident(&mut world, budget, members)?;
                 interpreter.go_live(&mut world)?;
                 let counted = interpreter.before_frame(&mut world)?.len();
                 load.finished = Some(Finished {
@@ -933,6 +1116,15 @@ impl Lot {
         load.libraries = program.libraries.len();
         let start = world.ticks;
         let loaded = world.hash();
+        let default_character_name = read_default_character_name(&install);
+        let zoning = if load.house == 0 {
+            Some(1)
+        } else {
+            i16::try_from(load.house)
+                .ok()
+                .and_then(|id| program.zoning.get(&id).copied())
+        };
+        let (lot_name, lot_description) = read_lot_info(house, load.house, zoning);
         Ok(Self {
             program,
             catalog,
@@ -951,8 +1143,19 @@ impl Lot {
             asking: None,
 
             view_rotation,
+            floor_rotation: view_rotation,
             view_centre,
+            replay_view: None,
+            last_dialog_text: String::new(),
+            character_names: BTreeMap::new(),
+            default_character_name,
+            lot_name,
+            lot_description,
             loaded,
+            buy_undo: Vec::new(),
+            buy_redo: Vec::new(),
+            buy_orphans: Vec::new(),
+            active_buy_cursor: None,
         })
     }
 
@@ -1006,9 +1209,11 @@ impl Lot {
             // takes input again after this step, as the saved lot would.
             self.answered = false;
             let result = self.advance(play).map_err(Stop::into_step);
+            self.replay_view = None;
             if result.is_err() {
                 self.halted = true;
             }
+            self.sync_active_buy_cursor();
             return result;
         }
         if self.asking.is_some() {
@@ -1017,7 +1222,9 @@ impl Lot {
             });
         }
         // The tick may stop at a dialog the player has not answered; it
-        // then runs again from here once they have.
+        // then runs again from here once they have, using the original
+        // camera view (`replay_view`) even if the player moved the camera
+        // while the dialog was showing.
         let before = (
             self.world.clone(),
             self.play.clone(),
@@ -1032,6 +1239,8 @@ impl Lot {
                 self.play = play;
                 self.ticks = ticks;
                 self.player = player;
+                self.replay_view
+                    .get_or_insert((self.view_rotation, self.view_centre));
                 self.asking = Some(Box::new(Asking {
                     shown,
                     world: partway,
@@ -1039,10 +1248,12 @@ impl Lot {
                 Err(StepError::Asking { tick })
             }
             result => {
+                self.replay_view = None;
                 let result = result.map_err(Stop::into_step);
                 if result.is_err() {
                     self.halted = true;
                 }
+                self.sync_active_buy_cursor();
                 result
             }
         }
@@ -1055,18 +1266,28 @@ impl Lot {
         let sounds = RefCell::new(Vec::new());
         let ui_effects = RefCell::new(Vec::new());
         let masks_rebuilt = Cell::new(0);
+        let dialog_text = RefCell::new(self.last_dialog_text.clone());
+        let character_names = RefCell::new(self.character_names.clone());
+        let (view_rotation, view_centre) = self
+            .replay_view
+            .unwrap_or((self.view_rotation, self.view_centre));
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             ui_effects: Some(&ui_effects),
             masks_rebuilt: Some(&masks_rebuilt),
-            view_rotation: self.view_rotation,
-            view_centre: self.view_centre,
+            view_rotation,
+            view_centre,
+            dialog_text: Some(&dialog_text),
+            character_names: Some(&character_names),
+            default_character_name: Some(&self.default_character_name),
+            active_family: (self.load.house != 0 && self.load.family == 0).then_some(&[][..]),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut frame_errors = Vec::new();
+        let mode = crate::panel_mode(&self.world);
         if self.ticks == 0
             && self.frames.after(0)
-            && let Err(error) = interpreter.draw_frame(&mut self.world, VIEW_LEVEL)
+            && let Err(error) = interpreter.draw_frame_in(&mut self.world, VIEW_LEVEL, mode)
         {
             if !play {
                 return Err(StepError::Frame {
@@ -1151,7 +1372,10 @@ impl Lot {
         // redraws the family panel.
         interpreter.refresh_family_panel(&mut self.world);
         let frame = if self.frames.after(tick) {
-            interpreter.draw_frame(&mut self.world, VIEW_LEVEL).err()
+            let mode = crate::panel_mode(&self.world);
+            interpreter
+                .draw_frame_in(&mut self.world, VIEW_LEVEL, mode)
+                .err()
         } else {
             None
         };
@@ -1160,6 +1384,8 @@ impl Lot {
         update.sounds = sounds.into_inner();
         update.ui_effects = ui_effects.into_inner();
         update.masks_rebuilt = masks_rebuilt.get();
+        self.last_dialog_text = dialog_text.into_inner();
+        self.character_names = character_names.into_inner();
         if let Some(error) = frame {
             if play {
                 update.frame_errors.push(SkippedFrame {
@@ -1195,9 +1421,11 @@ impl Lot {
         menu: u32,
     ) -> Result<Option<i32>, OrderError> {
         self.ready()?;
+        let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            character_names: Some(&character_names),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1220,10 +1448,12 @@ impl Lot {
     pub fn pie_menu(&mut self, person: u16, object: u16) -> Result<Menu, OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
+        let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            character_names: Some(&character_names),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1251,10 +1481,12 @@ impl Lot {
     ) -> Result<Highlight, OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
+        let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            character_names: Some(&character_names),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1282,9 +1514,11 @@ impl Lot {
         action: sims_formats::saved_objects::Interaction,
     ) -> Result<Option<i32>, OrderError> {
         self.ready()?;
+        let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            character_names: Some(&character_names),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1304,10 +1538,12 @@ impl Lot {
     pub fn cancel(&mut self, person: u16, uid: i32) -> Result<Cancelled, OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
+        let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            character_names: Some(&character_names),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1347,6 +1583,10 @@ impl Lot {
         interpreter
             .select(&mut world, Some(person))
             .map_err(OrderError::Refused)?;
+        // Selection triggers a control-panel redraw (0x53a01f -> 0x4cfcdb),
+        // refreshing the selected Sim's family-friends cache on non-residential
+        // lots (and global 9's family on residential lots).
+        interpreter.refresh_family_panel(&mut world);
         self.world = world;
         Ok(sounds.into_inner())
     }
@@ -1388,6 +1628,904 @@ impl Lot {
     pub fn unpause(&mut self) -> Result<bool, OrderError> {
         self.ready()?;
         Ok(self.world.unpause())
+    }
+
+    /// The simulation's active panel mode from global 19 (`0x4ce44f`).
+    pub fn mode(&self) -> PanelMode {
+        crate::panel_mode(&self.world)
+    }
+
+    /// Switches the simulation's active panel mode between ticks
+    /// (`0x4cea5d` + `0x4ce44f`). Leaving a non-Live mode back to
+    /// [`PanelMode::Live`] marks all rooms uncounted, updates lot
+    /// statistics, and clears global 19 (`0x416534`). Leaving any non-Live
+    /// mode clears the Buy Mode Undo/Redo stacks and deletes any detached
+    /// off-lot redo instances (`0x4cea5d` → `0x4933dc` → `0x48c20e`).
+    pub fn set_mode(&mut self, mode: PanelMode) -> Result<(), OrderError> {
+        self.set_mode_releasing_buy_cursor(mode, None)
+    }
+
+    /// Switches the simulation's active panel mode while tearing down an
+    /// active Buy Mode `cursor` in exact native `0x4cea5d` order:
+    /// 1. `0x4cea9e` → `0x416534` (`go_live` / `set_mode`),
+    /// 2. `0x4ceac2` → `0x40726a` (`update_comeandsee`, while detached
+    ///    history objects and the active Buy cursor/preview are still
+    ///    registered so marker IDs and positions match native),
+    /// 3. `0x4ceaf5` → `0x4933dc` → `0x48c20e` (`buy_purge_detached`,
+    ///    keeping objects owned by `cursor` alive for step 4),
+    /// 4. `0x4cec3a` → `0x4cef9b` → `0x487191` / `0x487105` (`buy_cancel` on
+    ///    `cursor`, deleting unpaid previews or snapping back held existing
+    ///    objects). If snapback is refused, the entire mode switch rolls back
+    ///    atomically.
+    pub fn set_mode_releasing_buy_cursor(
+        &mut self,
+        mode: PanelMode,
+        cursor: Option<&BuyCursor>,
+    ) -> Result<(), OrderError> {
+        self.ready()?;
+        let previous = self.mode();
+        let clearing = previous != PanelMode::Live && mode != previous;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let release_cursor = cursor
+            .filter(|c| self.is_active_buy_cursor(c))
+            .cloned()
+            .or_else(|| {
+                clearing
+                    .then(|| self.active_buy_cursor.as_ref().map(|a| a.cursor.clone()))
+                    .flatten()
+            });
+        let mut world = self.world.clone();
+        interpreter
+            .set_mode(&mut world, mode)
+            .map_err(OrderError::Refused)?;
+        if previous != PanelMode::Live && mode == PanelMode::Live {
+            interpreter
+                .update_comeandsee(&mut world)
+                .map_err(OrderError::Refused)?;
+        }
+        if clearing {
+            let mut keep = BTreeSet::new();
+            if let Some(cur) = release_cursor.as_ref() {
+                crate::buy::collect_cursor_ids(cur, &mut keep);
+                keep.insert(interpreter.lead_object(&world, cur.cursor));
+                keep.insert(interpreter.lead_object(&world, cur.held));
+                // Protect any detached ancestor container holding `cur.held`
+                // (e.g. an unpaid preview sitting in an undone table's slot)
+                // until `buy_cancel` unlinks `cur.held` cleanly; a final pass
+                // below purges any deferred off-lot container afterwards.
+                let mut probe: Vec<u16> = keep.iter().copied().collect();
+                while let Some(id) = probe.pop() {
+                    if let Some(cid) = world
+                        .objects
+                        .get(&id)
+                        .and_then(|o| o.data.get(2).copied())
+                        .and_then(|c| u16::try_from(c).ok())
+                        .filter(|&c| c != 0)
+                    {
+                        let lead = interpreter.lead_object(&world, cid);
+                        if keep.insert(cid) {
+                            probe.push(cid);
+                        }
+                        if keep.insert(lead) {
+                            probe.push(lead);
+                        }
+                    }
+                }
+            }
+            interpreter
+                .buy_purge_detached(&mut world, &self.buy_redo, &keep)
+                .map_err(OrderError::Refused)?;
+            interpreter
+                .buy_purge_detached(&mut world, &self.buy_undo, &keep)
+                .map_err(OrderError::Refused)?;
+            interpreter
+                .buy_purge_detached(&mut world, &self.buy_orphans, &keep)
+                .map_err(OrderError::Refused)?;
+        }
+        if let Some(cur) = release_cursor.as_ref() {
+            let live = self.strip_detached_origin_children(cur);
+            interpreter
+                .buy_cancel(&mut world, &live)
+                .map_err(OrderError::Refused)?;
+            if clearing {
+                let empty = BTreeSet::new();
+                interpreter
+                    .buy_purge_detached(&mut world, &self.buy_redo, &empty)
+                    .map_err(OrderError::Refused)?;
+                interpreter
+                    .buy_purge_detached(&mut world, &self.buy_undo, &empty)
+                    .map_err(OrderError::Refused)?;
+                interpreter
+                    .buy_purge_detached(&mut world, &self.buy_orphans, &empty)
+                    .map_err(OrderError::Refused)?;
+            }
+            self.active_buy_cursor = None;
+        } else {
+            let clear = self.reconcile_active_buy_cursor(&interpreter, &mut world, None);
+            if clear {
+                self.active_buy_cursor = None;
+            }
+        }
+        self.world = world;
+        if clearing {
+            self.buy_undo.clear();
+            self.buy_redo.clear();
+            self.buy_orphans.clear();
+        }
+        Ok(())
+    }
+
+    /// Starts placing a newly purchased catalog object of catalog master GUID
+    /// `guid` (`0x486f5a` → `0x421986` → `0x4215e6` → `0x4226bc`), wrapped
+    /// in a `"Tile Cursor"` (`0x00000437`). Returns `Ok(None)` if the
+    /// household cannot afford it.
+    pub fn buy_start(
+        &mut self,
+        guid: u32,
+        level: i32,
+        direction: i16,
+    ) -> Result<Option<BuyCursor>, OrderError> {
+        self.ready()?;
+        if self.active_buy_cursor.is_some() {
+            return Ok(None);
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut cursor = interpreter
+            .buy_start(&mut world, guid, level, direction)
+            .map_err(OrderError::Refused)?;
+        if let Some(cur) = &mut cursor {
+            let token = alloc_buy_cursor_token();
+            cur.token = token;
+            let cursor_lead = interpreter.lead_object(&world, cur.cursor);
+            let held_lead = interpreter.lead_object(&world, cur.held);
+            let mut owned_ids = BTreeSet::new();
+            crate::buy::collect_cursor_ids(cur, &mut owned_ids);
+            owned_ids.insert(held_lead);
+            owned_ids.remove(&cur.cursor);
+            owned_ids.remove(&cursor_lead);
+            self.active_buy_cursor = Some(ActiveBuyCursor {
+                token,
+                cursor_lead,
+                held_lead,
+                existing: false,
+                owned_ids,
+                cursor: cur.clone(),
+            });
+        }
+        self.world = world;
+        Ok(cursor)
+    }
+
+    /// Whether existing lot object `id` (or its multi-tile group) can be
+    /// picked up with the Buy Mode Hand Tool (`0x4352e8` / `0x422fdc`).
+    pub fn can_pick_up(&self, id: u16) -> Result<bool, OrderError> {
+        self.ready()?;
+        let interpreter = Interpreter {
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        interpreter
+            .can_pick_up(&self.world, id)
+            .map_err(OrderError::Refused)
+    }
+
+    /// Whether existing lot object `id` (or its multi-tile group) can be sold
+    /// or deleted in Buy Mode (`0x435440` / `0x423135`).
+    pub fn can_delete(&self, id: u16) -> Result<bool, OrderError> {
+        self.ready()?;
+        let interpreter = Interpreter {
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        interpreter
+            .can_delete(&self.world, id)
+            .map_err(OrderError::Refused)
+    }
+
+    /// Resale/depreciation value of `id` (`0x43219a`: lead `data[41]`, halved
+    /// if any part has `data[15] != 0`).
+    pub fn resale_value(&self, id: u16) -> Result<i32, OrderError> {
+        self.ready()?;
+        let interpreter = Interpreter {
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        interpreter
+            .resale_value(&self.world, id)
+            .map_err(OrderError::Refused)
+    }
+
+    /// Picks up an existing lot object with the Buy Mode Hand Tool
+    /// (`0x485f98` → `0x486960` → `0x4215e6` → `0x48ba19`). Returns `Ok(None)`
+    /// without changing the lot if `can_pick_up` refuses `id`.
+    pub fn buy_pick_up(&mut self, id: u16) -> Result<Option<BuyCursor>, OrderError> {
+        self.ready()?;
+        if self.active_buy_cursor.is_some() {
+            return Ok(None);
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let lead = interpreter.lead_object(&self.world, id);
+        let mut world = self.world.clone();
+        let mut cursor = interpreter
+            .buy_pick_up(&mut world, id)
+            .map_err(OrderError::Refused)?;
+        if let Some(cur) = &mut cursor {
+            let token = alloc_buy_cursor_token();
+            cur.token = token;
+            let cursor_lead = interpreter.lead_object(&world, cur.cursor);
+            let mut owned_ids = BTreeSet::new();
+            crate::buy::collect_cursor_ids(cur, &mut owned_ids);
+            owned_ids.insert(lead);
+            owned_ids.remove(&cur.cursor);
+            owned_ids.remove(&cursor_lead);
+            self.active_buy_cursor = Some(ActiveBuyCursor {
+                token,
+                cursor_lead,
+                held_lead: lead,
+                existing: true,
+                owned_ids,
+                cursor: cur.clone(),
+            });
+            self.world = world;
+        }
+        Ok(cursor)
+    }
+
+    /// Reconciles the active [`BuyCursor`] against `world` (and optional
+    /// history-mutated IDs `affected`): if the held object or any owned origin
+    /// child was detached, deleted, or mutated by Undo/Redo, or if its `"Tile
+    /// Cursor"` disappeared, immediately removes any orphaned `"Tile Cursor"`
+    /// on `world` and returns `true` so the caller retires `active_buy_cursor`.
+    fn reconcile_active_buy_cursor(
+        &self,
+        interpreter: &Interpreter<'_>,
+        world: &mut World,
+        affected: Option<&BTreeSet<u16>>,
+    ) -> bool {
+        let Some(active) = self.active_buy_cursor.as_ref() else {
+            return false;
+        };
+        let cursor_missing = world
+            .objects
+            .get(&active.cursor_lead)
+            .is_none_or(|o| o.guid != crate::TILE_CURSOR_GUID);
+        let held_missing = !world.objects.contains_key(&active.held_lead);
+        let affected_hit = affected.is_some_and(|ids| !ids.is_disjoint(&active.owned_ids));
+        let detached_hit =
+            active.existing && self.is_detached_history_object_in(world, active.held_lead);
+        if cursor_missing || held_missing || affected_hit || detached_hit {
+            if !cursor_missing {
+                let _ = interpreter.buy_discard_tile_cursor_id(world, active.cursor_lead);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Reconciles `self.active_buy_cursor` against `self.world` directly.
+    fn sync_active_buy_cursor(&mut self) {
+        if self.active_buy_cursor.is_none() {
+            return;
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let clear = self.reconcile_active_buy_cursor(&interpreter, &mut world, None);
+        if clear {
+            self.active_buy_cursor = None;
+            self.world = world;
+        }
+    }
+
+    /// Whether `cursor` matches the lot's single currently active [`BuyCursor`].
+    pub(super) fn is_active_buy_cursor(&self, cursor: &BuyCursor) -> bool {
+        cursor.token != 0
+            && self.active_buy_cursor.as_ref().is_some_and(|active| {
+                active.token == cursor.token
+                    && active.cursor.cursor == cursor.cursor
+                    && active.cursor.held == cursor.held
+                    && active.existing == cursor.is_existing()
+            })
+    }
+
+    /// Whether `cursor` is still an active [`BuyCursor`].
+    fn is_live_buy_cursor(&self, cursor: &BuyCursor) -> bool {
+        self.is_active_buy_cursor(cursor)
+    }
+
+    /// Whether `id` is currently detached/refunded (`!placed` and off-lot in
+    /// `world`) in Buy Mode history (`buy_undo`, `buy_redo`, or `buy_orphans`).
+    fn is_detached_history_object_in(&self, world: &World, id: u16) -> bool {
+        self.buy_undo
+            .iter()
+            .chain(self.buy_redo.iter())
+            .chain(self.buy_orphans.iter())
+            .any(|p| {
+                !p.placed
+                    && p.object == id
+                    && world.objects.get(&id).is_none_or(|o| o.position[0] < 0)
+            })
+    }
+
+    /// Whether `id` is currently detached/refunded (`!placed` and off-lot) in
+    /// Buy Mode history (`buy_undo`, `buy_redo`, or `buy_orphans`).
+    fn is_detached_history_object(&self, id: u16) -> bool {
+        self.is_detached_history_object_in(&self.world, id)
+    }
+
+    /// Returns a copy of `cursor` whose `origin.children` exclude any surface
+    /// children that have already been detached/refunded by an intervening
+    /// Undo/Sell so snapback never resurrects refunded children for free.
+    pub(super) fn strip_detached_origin_children(&self, cursor: &BuyCursor) -> BuyCursor {
+        fn prune(lot: &Lot, placement: &mut crate::BuyPlacement) {
+            placement
+                .children
+                .retain(|c| !lot.is_detached_history_object(c.object));
+            for child in &mut placement.children {
+                prune(lot, child);
+            }
+        }
+        let mut out = cursor.clone();
+        if let Some(origin) = &mut out.origin {
+            prune(self, origin);
+        }
+        out
+    }
+
+    /// Sells or deletes the held Buy Mode object (`0x487e18`):
+    /// - Returns `Ok(false)` without mutating `world` if `can_delete` refuses
+    ///   (or if `cursor` is a stale existing-object cursor whose held object
+    ///   was already detached/refunded by Undo/Sell).
+    /// - For an unpaid catalog preview, deletes both objects with `0` refund.
+    /// - For a picked-up existing object, refunds `resale_value`, deletes only
+    ///   `"Tile Cursor"`, leaves the sold object detached off-lot for Undo,
+    ///   pushes a `BuyActionKind::Sell` undo record, and purges `buy_redo`.
+    pub fn buy_sell(&mut self, cursor: &BuyCursor) -> Result<bool, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        if !self.is_live_buy_cursor(cursor) {
+            return Ok(false);
+        }
+        let mut world = self.world.clone();
+        let Some(record) = interpreter
+            .buy_sell(&mut world, cursor)
+            .map_err(OrderError::Refused)?
+        else {
+            return Ok(false);
+        };
+        if let Some(sell_record) = record {
+            let mut keep = BTreeSet::new();
+            crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
+            crate::buy::collect_buy_ids(std::slice::from_ref(&sell_record), &mut keep);
+            interpreter
+                .buy_purge_detached(&mut world, &self.buy_redo, &keep)
+                .map_err(OrderError::Refused)?;
+            self.world = world;
+            self.buy_undo.push(sell_record);
+            self.buy_redo.clear();
+        } else {
+            self.world = world;
+        }
+        self.active_buy_cursor = None;
+        Ok(true)
+    }
+
+    /// Moves an active Buy Mode cursor and its held object to fine lot
+    /// coordinates `fine` on `level` (`0x485a2e` → `0x421e72`).
+    pub fn buy_move(
+        &mut self,
+        cursor: &mut BuyCursor,
+        fine: [i32; 2],
+        level: i32,
+    ) -> Result<bool, OrderError> {
+        self.ready()?;
+        if !self.is_live_buy_cursor(cursor) {
+            return Ok(false);
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        let valid = interpreter
+            .buy_move(&mut world, &mut next, fine, level)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        if let Some(active) = self.active_buy_cursor.as_mut() {
+            active.cursor = next.clone();
+        }
+        *cursor = next;
+        Ok(valid)
+    }
+
+    /// Rotates an active Buy Mode cursor's held object to `direction`
+    /// (`0x4226bc` → `0x421be4`) and re-evaluates placement.
+    /// Turns the held Buy Mode object by signed `steps` of its turn step in
+    /// one `cTSTileCursor::Turn(steps)` call (`0x486cb8` → `0x421be4`).
+    pub fn buy_turn(&mut self, cursor: &mut BuyCursor, steps: i32) -> Result<bool, OrderError> {
+        self.ready()?;
+        if !self.is_live_buy_cursor(cursor) {
+            return Ok(false);
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        let valid = interpreter
+            .buy_turn(&mut world, &mut next, steps)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        if let Some(active) = self.active_buy_cursor.as_mut() {
+            active.cursor = next.clone();
+        }
+        *cursor = next;
+        Ok(valid)
+    }
+
+    pub fn buy_rotate(
+        &mut self,
+        cursor: &mut BuyCursor,
+        direction: i16,
+    ) -> Result<bool, OrderError> {
+        self.ready()?;
+        if !self.is_live_buy_cursor(cursor) {
+            return Ok(false);
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        let valid = interpreter
+            .buy_rotate(&mut world, &mut next, direction)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        if let Some(active) = self.active_buy_cursor.as_mut() {
+            active.cursor = next.clone();
+        }
+        *cursor = next;
+        Ok(valid)
+    }
+
+    /// Hides an active Buy Mode cursor off the lot when the pointer leaves
+    /// the house view (`0x487d4e`).
+    pub fn buy_hide(&mut self, cursor: &mut BuyCursor) -> Result<(), OrderError> {
+        self.ready()?;
+        if !self.is_live_buy_cursor(cursor) {
+            return Ok(());
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        interpreter
+            .buy_hide(&mut world, &mut next)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        if let Some(active) = self.active_buy_cursor.as_mut() {
+            active.cursor = next.clone();
+        }
+        *cursor = next;
+        Ok(())
+    }
+
+    /// Re-evaluates Buy Mode placement directly at the `"Tile Cursor"`'s
+    /// physical `(x, y)` on `level` (`0x485b62..0x485bda` → `0x421e72`).
+    pub fn buy_recheck(&mut self, cursor: &mut BuyCursor, level: i32) -> Result<bool, OrderError> {
+        self.ready()?;
+        if !self.is_live_buy_cursor(cursor) {
+            return Ok(false);
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        let valid = interpreter
+            .buy_recheck(&mut world, &mut next, level)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        if let Some(active) = self.active_buy_cursor.as_mut() {
+            active.cursor = next.clone();
+        }
+        *cursor = next;
+        Ok(valid)
+    }
+
+    /// Checks `Tile Cursor` fit in place on `level` and, if it fits, places at
+    /// the cursor's physical `(x, y)` without an extra take-off (`0x485e59` →
+    /// `0x485e72`).
+    pub fn buy_put_if_fits(
+        &mut self,
+        cursor: &mut BuyCursor,
+        level: i32,
+    ) -> Result<bool, OrderError> {
+        self.ready()?;
+        if !self.is_live_buy_cursor(cursor) {
+            return Ok(false);
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        let valid = interpreter
+            .buy_put_if_fits(&mut world, &mut next, level)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        if let Some(active) = self.active_buy_cursor.as_mut() {
+            active.cursor = next.clone();
+        }
+        *cursor = next;
+        Ok(valid)
+    }
+
+    /// Commits a valid Buy Mode placement (`0x486ada` → `0x421a0e`, `0x46d91c`):
+    /// deletes the `"Tile Cursor"`, places the held object permanently, runs
+    /// OBJf function 11 (`USER_PLACEMENT`), deducts its price from household
+    /// funds, and pushes an undo record (`0x486ada` → `0x493259`, clearing the
+    /// redo stack and deleting any detached off-lot redo instances via
+    /// `0x48c20e`). Returns the placed object's ID. On error, the lot is left
+    /// unchanged so the caller still owns `cursor`.
+    pub fn buy_commit(&mut self, cursor: &BuyCursor) -> Result<u16, OrderError> {
+        self.ready()?;
+        if !self.is_live_buy_cursor(cursor) {
+            return Err(OrderError::Refused(crate::Fault {
+                object: cursor.held,
+                at: None,
+                trap: crate::Trap::Invalid("cannot commit stale cursor for detached object".into()),
+            }));
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let purchase = interpreter
+            .buy_commit_record(&mut world, cursor)
+            .map_err(OrderError::Refused)?;
+        let mut keep = BTreeSet::new();
+        crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
+        crate::buy::collect_buy_ids(std::slice::from_ref(&purchase), &mut keep);
+        interpreter
+            .buy_purge_detached(&mut world, &self.buy_redo, &keep)
+            .map_err(OrderError::Refused)?;
+        let id = purchase.object;
+        self.world = world;
+        self.buy_undo.push(purchase);
+        self.buy_redo.clear();
+        self.active_buy_cursor = None;
+        Ok(id)
+    }
+
+    /// Whether there is a committed Buy Mode purchase to undo (`0x4cf074`).
+    pub fn can_buy_undo(&self) -> bool {
+        !self.buy_undo.is_empty()
+    }
+
+    /// Whether there is an undone Buy Mode purchase to redo (`0x4cf08c`).
+    pub fn can_buy_redo(&self) -> bool {
+        !self.buy_redo.is_empty()
+    }
+
+    /// Deletes any detached (off-lot) instances referenced by `dropped` from
+    /// `self.world` one by one (`0x48c20e` / `0x48c258`). Any still-registered
+    /// off-lot instance whose deletion faults is retained in `self.buy_orphans`
+    /// so [`Lot::save`] never silently serializes a detached object.
+    fn purge_buy_history(&mut self, dropped: &[crate::BuyPurchase], keep: &BTreeSet<u16>) {
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        for purchase in dropped {
+            let mut next = self.world.clone();
+            match interpreter.buy_purge_detached(&mut next, std::slice::from_ref(purchase), keep) {
+                Ok(()) => self.world = next,
+                Err(_) => {
+                    if self
+                        .world
+                        .objects
+                        .get(&purchase.object)
+                        .is_some_and(|o| o.position[0] < 0)
+                        && !self.buy_orphans.iter().any(|p| p.object == purchase.object)
+                    {
+                        self.buy_orphans.push(purchase.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Undoes the most recent committed Buy Mode purchase (`0x4cf2e0` / event
+    /// `0xec` → `0x4932fa` → `0x48bd21`): runs OBJf 12 (`USER_PICKUP`), takes
+    /// the purchased object off-lot while keeping it registered for Redo
+    /// (`0x435751` / `0x422ff5`), refunds its price to household funds and
+    /// today's budget category, and pushes it onto the redo stack. Returns
+    /// `Ok(false)` when nothing can be undone (clearing the undo stack if the
+    /// top record could not be applied, matching `0x4932fa` → `0x493376`).
+    pub fn buy_undo(&mut self) -> Result<bool, OrderError> {
+        self.ready()?;
+        if self.buy_undo.is_empty() {
+            return Ok(false);
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let after_snap =
+            if let Some(active) = self.active_buy_cursor.as_ref().filter(|a| a.existing) {
+                let live = self.strip_detached_origin_children(&active.cursor);
+                interpreter
+                    .buy_cancel(&mut world, &live)
+                    .map_err(OrderError::Refused)?;
+                Some(world.clone())
+            } else {
+                None
+            };
+        let snapped_existing = after_snap.is_some();
+        let mut purchase = self.buy_undo.pop().expect("checked non-empty");
+        match interpreter.buy_undo_purchase(&mut world, &mut purchase) {
+            Ok(true) => {
+                let mut affected = BTreeSet::new();
+                crate::buy::collect_buy_ids(std::slice::from_ref(&purchase), &mut affected);
+                let clear = snapped_existing
+                    || self.reconcile_active_buy_cursor(&interpreter, &mut world, Some(&affected));
+                self.buy_redo.push(purchase);
+                if clear {
+                    self.active_buy_cursor = None;
+                }
+                self.world = world;
+                Ok(true)
+            }
+            Ok(false) => {
+                if let Some(snapped) = after_snap {
+                    self.world = snapped;
+                    self.active_buy_cursor = None;
+                }
+                let mut dropped = std::mem::take(&mut self.buy_undo);
+                dropped.push(purchase);
+                let mut keep = BTreeSet::new();
+                crate::buy::collect_buy_ids(&self.buy_redo, &mut keep);
+                self.purge_buy_history(&dropped, &keep);
+                self.sync_active_buy_cursor();
+                Ok(false)
+            }
+            Err(fault) => {
+                if let Some(snapped) = after_snap {
+                    self.world = snapped;
+                    self.active_buy_cursor = None;
+                }
+                let mut dropped = std::mem::take(&mut self.buy_undo);
+                dropped.push(purchase);
+                let mut keep = BTreeSet::new();
+                crate::buy::collect_buy_ids(&self.buy_redo, &mut keep);
+                self.purge_buy_history(&dropped, &keep);
+                self.sync_active_buy_cursor();
+                Err(OrderError::Refused(fault))
+            }
+        }
+    }
+
+    /// Redoes the most recently undone Buy Mode purchase (`0x4cf317` / event
+    /// `0xed` → `0x493338` → `0x48bdfe`): reuses the detached registered
+    /// instance (`0x48c07b..0x48c082`), runs `USER_PICKUP` (`0x48bfcb`),
+    /// places it, runs `USER_PLACEMENT`, re-deducts its price, and pushes it
+    /// back onto the undo stack. When placement is refused (`Ok(false)`),
+    /// transfers the refused record to Undo while preserving remaining Redo
+    /// entries (`0x48be72` → `0x493353`); on a VM fault (`Err`), clears the
+    /// redo stack and deletes detached redo instances (`0x4933a9` → `0x48c20e`).
+    pub fn buy_redo(&mut self) -> Result<bool, OrderError> {
+        self.ready()?;
+        if self.buy_redo.is_empty() {
+            return Ok(false);
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let after_snap =
+            if let Some(active) = self.active_buy_cursor.as_ref().filter(|a| a.existing) {
+                let live = self.strip_detached_origin_children(&active.cursor);
+                interpreter
+                    .buy_cancel(&mut world, &live)
+                    .map_err(OrderError::Refused)?;
+                Some(world.clone())
+            } else {
+                None
+            };
+        let snapped_existing = after_snap.is_some();
+        let mut purchase = self.buy_redo.pop().expect("checked non-empty");
+        match interpreter.buy_redo_purchase(&mut world, &mut purchase) {
+            Ok(true) => {
+                let mut affected = BTreeSet::new();
+                crate::buy::collect_buy_ids(std::slice::from_ref(&purchase), &mut affected);
+                let clear = snapped_existing
+                    || self.reconcile_active_buy_cursor(&interpreter, &mut world, Some(&affected));
+                self.buy_undo.push(purchase);
+                if clear {
+                    self.active_buy_cursor = None;
+                }
+                self.world = world;
+                Ok(true)
+            }
+            Ok(false) => {
+                // For a refused `Move` Redo (destination blocked), do NOT
+                // publish the detached intermediate world: keep the owned
+                // object safely on-lot at `before` so leaving Buy Mode never
+                // deletes paid furniture. For a refused `Buy` Redo (`0x48be72`
+                // -> `0x493353`), publish the world (which ran `0x48c0ea`) and
+                // transfer the record to Undo while leaving remaining Redo
+                // entries intact.
+                let is_move = purchase.kind == crate::BuyActionKind::Move;
+                if !is_move {
+                    let clear = snapped_existing
+                        || self.reconcile_active_buy_cursor(&interpreter, &mut world, None);
+                    self.buy_undo.push(purchase);
+                    if clear {
+                        self.active_buy_cursor = None;
+                    }
+                    self.world = world;
+                } else {
+                    if let Some(snapped) = after_snap {
+                        self.world = snapped;
+                        self.active_buy_cursor = None;
+                    }
+                    self.buy_undo.push(purchase);
+                    self.sync_active_buy_cursor();
+                }
+                Ok(false)
+            }
+            Err(fault) => {
+                if let Some(snapped) = after_snap {
+                    self.world = snapped;
+                    self.active_buy_cursor = None;
+                }
+                let mut dropped = std::mem::take(&mut self.buy_redo);
+                dropped.push(purchase);
+                let mut keep = BTreeSet::new();
+                crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
+                self.purge_buy_history(&dropped, &keep);
+                self.sync_active_buy_cursor();
+                Err(OrderError::Refused(fault))
+            }
+        }
+    }
+
+    /// Cancels an active Buy Mode cursor (`0x487191` / `0x487105`): deletes
+    /// both `"Tile Cursor"` and an unpaid catalog object, or deletes `"Tile
+    /// Cursor"` and snaps a picked-up existing object back to its pre-pickup
+    /// placement (clearing the redo stack per `0x487191` → `0x4933a9`). On
+    /// error, the lot is left unchanged so the caller still owns `cursor`.
+    pub fn buy_cancel(&mut self, cursor: &BuyCursor) -> Result<(), OrderError> {
+        self.ready()?;
+        if !self.is_active_buy_cursor(cursor) {
+            return Ok(());
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let live = self.strip_detached_origin_children(cursor);
+        interpreter
+            .buy_cancel(&mut world, &live)
+            .map_err(OrderError::Refused)?;
+        if cursor.is_existing() {
+            let mut keep = BTreeSet::new();
+            crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
+            keep.insert(interpreter.lead_object(&world, cursor.held));
+            interpreter
+                .buy_purge_detached(&mut world, &self.buy_redo, &keep)
+                .map_err(OrderError::Refused)?;
+        }
+        self.world = world;
+        if cursor.is_existing() {
+            self.buy_redo.clear();
+        }
+        self.active_buy_cursor = None;
+        Ok(())
+    }
+
+    /// Snaps a picked-up existing Buy Mode object back to its pre-pickup
+    /// placement and deletes `"Tile Cursor"` WITHOUT clearing `self.buy_redo`,
+    /// used before executing Undo/Redo (`Game::apply_buy_history`) so the Hand
+    /// Tool never shares ownership with an Undo/Redo record.
+    pub fn buy_snap_back(&mut self, cursor: &BuyCursor) -> Result<(), OrderError> {
+        self.ready()?;
+        if !self.is_active_buy_cursor(cursor) {
+            return Ok(());
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let live = self.strip_detached_origin_children(cursor);
+        interpreter
+            .buy_cancel(&mut world, &live)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        self.active_buy_cursor = None;
+        Ok(())
     }
 
     /// Replace the pending answers with an explicit replay, one entry
@@ -1477,6 +2615,97 @@ impl Lot {
         residential(&self.world, &self.program)
     }
 
+    /// Editable lot name shown in the edit-mode Save Card (`cWinEditLotInfo`,
+    /// `0x50e1f8..0x50e42c`), loaded from `*Desc.iff` `STR# (2000 + lot_id)`
+    /// and persisted in [`save::Saved`].
+    pub fn lot_name(&self) -> &str {
+        &self.lot_name
+    }
+
+    /// Editable lot description shown in the edit-mode Save Card
+    /// (`cWinEditLotInfo`, `0x50e1f8..0x50e42c`), loaded from `*Desc.iff`
+    /// `STR# (2000 + lot_id)` and persisted in [`save::Saved`].
+    pub fn lot_description(&self) -> &str {
+        &self.lot_description
+    }
+
+    /// Updates the lot's name and description after accepting the edit-mode
+    /// Save Card (`0x50e28f..0x50e42c`), so [`Lot::save`] persists both edits.
+    pub fn set_lot_info(&mut self, name: String, description: String) {
+        self.lot_name = name;
+        self.lot_description = description;
+    }
+
+    /// The current lot number (`world.globals[10]`, house `+0x24`).
+    pub fn lot_id(&self) -> i16 {
+        self.world.globals.get(10).copied().unwrap_or(0)
+    }
+
+    /// The current lot's zoning code (`0x42b9e3`: 1 residential, 2 community/
+    /// Studio Town, 0 unzoned; lot 0 returns 1).
+    pub fn lot_zoning(&self) -> Option<i32> {
+        let lot = self.lot_id();
+        if lot == 0 {
+            Some(1)
+        } else {
+            self.program.zoning.get(&lot).copied()
+        }
+    }
+
+    /// Updates lot global 30 (`Free Will`, `0x432220..0x432242` ->
+    /// `0x46d9c4(0x1e, al)`). Unlike gameplay orders, Free Will is a direct
+    /// preference write that also applies while waiting on or replaying an
+    /// answered dialog snapshot.
+    pub fn set_free_will(&mut self, enabled: bool) -> Result<(), OrderError> {
+        if self.halted {
+            return Err(OrderError::Halted);
+        }
+        if self.load.finished.is_none() {
+            return Err(OrderError::Incomplete);
+        }
+        let value = i16::from(enabled);
+        if let Some(slot) = self.world.globals.get_mut(30) {
+            *slot = value;
+        }
+        if let Some(asking) = &mut self.asking
+            && let Some(slot) = asking.world.globals.get_mut(30)
+        {
+            *slot = value;
+        }
+        Ok(())
+    }
+
+    /// Sets lot global 32 (`BUDGET_MODE` / `[lot + 0x50]`, `0x4f1bd9..0x4f1be5`)
+    /// so edit-mode lots receive the native §999,999 budget (`0x46d8c9`).
+    pub fn set_edit_budget(&mut self, enabled: bool) {
+        let value = i16::from(enabled);
+        if let Some(slot) = self.world.globals.get_mut(32) {
+            *slot = value;
+        }
+        if let Some(asking) = &mut self.asking
+            && let Some(slot) = asking.world.globals.get_mut(32)
+        {
+            *slot = value;
+        }
+    }
+
+    /// The text entered in the last answered kind 3 text-prompt dialog
+    /// (`0x451a6b..0x451a85` -> global `[0x6e4ac0]`).
+    pub fn last_dialog_text(&self) -> &str {
+        &self.last_dialog_text
+    }
+
+    /// The catalog name assigned to a Make New Character GUID (`0x44b0a8..0x44b0fc`).
+    pub fn character_name(&self, guid: u32) -> Option<&str> {
+        self.character_names.get(&guid).map(String::as_str)
+    }
+
+    /// All runtime catalog names assigned to Make New Character GUIDs
+    /// (`0x44b0a8..0x44b0fc`, `0x44b18a..0x44b1cc`), for HUD face/name sync.
+    pub fn character_names(&self) -> &BTreeMap<u32, String> {
+        &self.character_names
+    }
+
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
@@ -1485,6 +2714,15 @@ impl Lot {
     /// which Generic Sims Call routine 12 reads (0x44fdb8, 0x434f58).
     pub fn view_rotation(&self) -> u8 {
         self.view_rotation
+    }
+
+    /// The house file's saved `HOUS 0` camera direction, 0 to 3
+    /// ([`opening_rotation`]), which pairs with level 1's stored road-dash
+    /// floor IDs (`10` and `11`, `0x4a861f`, `0x4a87b1`–`0x4a87dc`). Unlike
+    /// [`Lot::view_rotation`], this does not change when the camera turns
+    /// because the lot's floor array is not mutated on rotation.
+    pub fn floor_rotation(&self) -> u8 {
+        self.floor_rotation
     }
 
     /// Turns the house view to `rotation` (taken modulo 4). It is the
@@ -1503,17 +2741,18 @@ impl Lot {
         self.view_centre
     }
 
-    /// Sets the tile at the house view's centre, `None` for not known: the
-    /// tile a dialog's portrait searches from for a tile to put a person on
-    /// (0x4e96dd, 0x4347f0, 0x4a677c, 0x4a7b58), after the interface's
-    /// work on the view's pick ([`crate::Interpreter::view_centre`]), so
-    /// the simulation reads it, and it is an input like [`Lot::set_view_rotation`]: the view
-    /// that shows the lot would set it whenever its camera moves, and a
-    /// recording of play must note each change. Where it is not known and
-    /// the tile searched from would change what the portrait does, the
-    /// step fails as an unported branch does.
-    /// [`Lot::load`] leaves it not known (which camera the original opens a
-    /// house with is not traced); [`Lot::load_viewed`] takes it.
+    /// Sets the view-rotated tile pick at the house view's centre, `None`
+    /// for not known: the pick a dialog's portrait resolves into its search
+    /// start (`0x4e96dd`, `0x4347f0`, `0x4a677c`, `0x4a7b58`, bounds-checked
+    /// at `0x434891` and un-rotated at `0x43491c`;
+    /// [`crate::Interpreter::view_centre`]). Because the simulation reads it,
+    /// it is an input like [`Lot::set_view_rotation`]: the view that shows
+    /// the lot sets it whenever its camera moves, and a recording of play
+    /// must note each change. Where it is not known and the tile searched
+    /// from would change what the portrait does, the step fails as an
+    /// unported branch does. [`Lot::load`] leaves it not known (which camera
+    /// the original opens a house with is not traced); [`Lot::load_viewed`]
+    /// takes it.
     pub fn set_view_centre(&mut self, centre: Option<[i8; 2]>) {
         self.view_centre = centre;
     }
@@ -1592,8 +2831,19 @@ mod tests {
             asking: None,
 
             view_rotation: 0,
+            floor_rotation: 0,
             view_centre: None,
+            replay_view: None,
+            last_dialog_text: String::new(),
+            character_names: BTreeMap::new(),
+            default_character_name: String::new(),
+            lot_name: String::new(),
+            lot_description: String::new(),
             loaded,
+            buy_undo: Vec::new(),
+            buy_redo: Vec::new(),
+            buy_orphans: Vec::new(),
+            active_buy_cursor: None,
         }
     }
 
@@ -1766,5 +3016,633 @@ mod tests {
         let frames = Frames::parse("0+2,1+3").unwrap();
         let drawn: Vec<u32> = (0..=10).filter(|&t| frames.after(t)).collect();
         assert_eq!(drawn, [0, 1, 2, 4, 6, 7, 8, 10]);
+    }
+
+    #[test]
+    fn restore_rejects_a_snapshot_with_a_different_floor_rotation_baseline() {
+        let mut source = lot(World::empty(), true, Frames::default());
+        source.floor_rotation = 0;
+        source.set_view_rotation(1);
+        let saved = source.save().unwrap();
+        let bytes = saved.encode();
+
+        // A lot loaded with a different saved HOUS 0 floor rotation rejects
+        // the snapshot even when the loaded world hash matches.
+        let mut mismatched = lot(World::empty(), true, Frames::default());
+        mismatched.floor_rotation = 1;
+        assert_eq!(
+            mismatched.restore(super::save::Saved::decode(&bytes).unwrap()),
+            Err(super::save::SaveError::OtherLoad)
+        );
+
+        // A lot with the matching floor rotation restores cleanly, keeping
+        // the snapshot's view_rotation and its own floor_rotation.
+        let mut matching = lot(World::empty(), true, Frames::default());
+        matching.floor_rotation = 0;
+        matching
+            .restore(super::save::Saved::decode(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(matching.floor_rotation(), 0);
+        assert_eq!(matching.view_rotation(), 1);
+    }
+
+    #[test]
+    fn a_dialog_tick_replays_with_its_frozen_view_even_when_the_view_affects_the_tick() {
+        use sims_formats::behavior::{Behavior, Instruction};
+        use sims_formats::saved_objects::{Frame, Interaction, Person, Slot};
+        use sims_sim::Object;
+
+        const GUID: u32 = 0x1111;
+        const SIM_GUID: u32 = 0x2222;
+        let mut def = [0i16; crate::DEFINITION_WORDS];
+        def[9] = 4; // non-person object
+        def[14] = GUID as u16 as i16;
+        def[15] = (GUID >> 16) as u16 as i16;
+
+        // Node 0: Generic Sims Call 12 (tile_depth: reads view_rotation into temp 0).
+        // Node 1: two-button Dialog (yields and asks the player on tick 1).
+        // Node 2: Generic Sims Call 12 again on tick 2 (reads the moved view_rotation).
+        let behavior = Behavior {
+            format: 0x8002,
+            kind: 0,
+            args: 0,
+            locals: 0,
+            revision: 0,
+            instructions: vec![
+                Instruction {
+                    opcode: 1,
+                    on_true: 1,
+                    on_false: 253,
+                    operands: [12, 0, 0, 0, 0, 0, 0, 0],
+                },
+                Instruction {
+                    opcode: 36,
+                    on_true: 2,
+                    on_false: 2,
+                    operands: [0, 0, 0, 0, 0, 1, 0, 0],
+                },
+                Instruction {
+                    opcode: 1,
+                    on_true: 3,
+                    on_false: 253,
+                    operands: [12, 0, 0, 0, 0, 0, 0, 0],
+                },
+                Instruction {
+                    opcode: 0,
+                    on_true: 3,
+                    on_false: 253,
+                    operands: [0; 8],
+                },
+            ],
+        };
+        let mut library = crate::Library::default();
+        library.definitions.insert(128, def);
+        library.definition_order.push(128);
+        library.behaviors.insert(4096, behavior);
+
+        let interaction = Interaction {
+            join: 0,
+            uid: 0,
+            caller: 0,
+            target: 0,
+            icon: 0,
+            table_index: 0,
+            args: [0; 4],
+            priority: 0,
+            action: 0,
+            attenuation: 0.0,
+            flags: 0,
+        };
+        let mut world = World::empty();
+        world.size = 64;
+        world.globals[3] = 2;
+        world.order = vec![1, 2];
+        world.people = vec![2];
+        world.types.insert(1, GUID);
+        world.types.insert(2, SIM_GUID);
+        world.objects.insert(
+            1,
+            Object {
+                id: 1,
+                guid: GUID,
+                footprint: [0; 4],
+                position: [10 << 4, 20 << 4, 0],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 72],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: vec![Frame {
+                    stack_object: 1,
+                    tree: 4096,
+                    node: 0,
+                    parameters: vec![1, 0, 0, 0],
+                    locals: Vec::new(),
+                    primitive_state: 0,
+                    code_owner_type: 1,
+                }],
+                relationship_flag: -1,
+                relationships: Vec::new(),
+                slots: vec![Slot {
+                    unknown: 0,
+                    object: 0,
+                }],
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: Some((1 << 16) | 0xffff),
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+        world.objects.insert(
+            2,
+            Object {
+                id: 2,
+                guid: SIM_GUID,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 72],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: -1,
+                relationships: Vec::new(),
+                slots: vec![Slot {
+                    unknown: 0,
+                    object: 0,
+                }],
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: Some(Person {
+                    animation_events: 0,
+                    engaged: 0,
+                    appearance: Default::default(),
+                    accessories: Vec::new(),
+                    animations: Default::default(),
+                    routing_state: 0,
+                    floats: [0.0; 9],
+                    previous_motives: [0.0; 16],
+                    motives: [0.0; 16],
+                    data: vec![0; 256],
+                    routing_frames: 0,
+                    active: interaction.clone(),
+                    last: interaction,
+                    queue: Vec::new(),
+                    object_uses: Vec::new(),
+                    motive_deltas: Vec::new(),
+                }),
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: true,
+            },
+        );
+        let make_lot = || {
+            let mut l = lot(world.clone(), true, Frames::parse("none").unwrap());
+            l.tuning = Some(tuning());
+            l.program.labels_hold_no_token = true;
+            l.program.libraries.insert(0, crate::Library::default());
+            l.program.libraries.insert(1, library.clone());
+            l.program.semi_globals.insert(1, None);
+            l.catalog.objects.push(sims_content::Object {
+                guid: GUID,
+                resource: 1,
+                chunk: 128,
+                kind: 4,
+                master: 0,
+            });
+            l.catalog.by_guid.insert(GUID, 0);
+            l.catalog.semi_globals.insert(1, None);
+            l
+        };
+
+        let mut asked = make_lot();
+        asked.wait_for_answers();
+        asked.set_view_rotation(0);
+        asked.set_view_centre(Some([10, 12]));
+        // Tick 1 pauses on the dialog and freezes (0, Some([10, 12])).
+        assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 1 });
+        // Moving the camera while waiting updates the live view, not the frozen replay view.
+        asked.set_view_rotation(2);
+        asked.set_view_centre(Some([40, 42]));
+        asked.answer(2).unwrap();
+        let bytes = asked.save().unwrap().encode();
+
+        let mut restored = make_lot();
+        restored.wait_for_answers();
+        restored
+            .restore(super::save::Saved::decode(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(restored.view_rotation(), 2);
+        assert_eq!(restored.view_centre(), Some([40, 42]));
+        // Replaying tick 1 must use rotation 0: -(10 + 20) = -30, not rotation 2: -(53 + 43) = -96.
+        restored.step().unwrap();
+        assert_eq!(restored.world().objects[&1].temps[0], -30);
+        // After the dialog tick finishes, tick 2 uses the moved rotation 2: -(53 + 43) = -96.
+        restored.step().unwrap();
+        assert_eq!(restored.world().objects[&1].temps[0], -96);
+    }
+
+    #[test]
+    fn a_dialog_tick_replays_with_its_frozen_view_centre_across_save_and_restore() {
+        use sims_content::{Profile, Skeleton};
+        use sims_formats::behavior::{Behavior, Instruction};
+        use sims_formats::execution::ObjectFunction;
+        use sims_formats::lot::Array;
+        use sims_formats::saved_objects::{Frame, Interaction, Person, Slot};
+        use sims_formats::tuning::{Constant, Constants};
+        use sims_sim::Object;
+        use sims_sim::neighbors::Neighbor;
+
+        const LAMP_GUID: u32 = 0x1111;
+        const SIM_GUID: u32 = 0x2222;
+        const PERSON_A: u32 = 0x3333_0001;
+        const PERSON_B: u32 = 0x3333_0002;
+
+        let array = |stride: usize, fill: u8| Array {
+            width: 64,
+            height: 64,
+            stride,
+            encoding: 0,
+            data: vec![fill; 64 * 64 * stride],
+        };
+        let assign = |left_scope: u8, left: i16, right_scope: u8, right: i16, next: u8| {
+            let [l0, l1] = left.to_le_bytes();
+            let [r0, r1] = right.to_le_bytes();
+            Instruction {
+                opcode: 2,
+                on_true: next,
+                on_false: next,
+                operands: [l0, l1, r0, r1, 0, 5, left_scope, right_scope],
+            }
+        };
+        let person_def = |guid: u32| {
+            let mut def = [0i16; crate::DEFINITION_WORDS];
+            def[9] = 2;
+            def[14] = guid as u16 as i16;
+            def[15] = (guid >> 16) as u16 as i16;
+            def
+        };
+        let mut lamp_def = [0i16; crate::DEFINITION_WORDS];
+        lamp_def[9] = 4;
+        lamp_def[14] = LAMP_GUID as u16 as i16;
+        lamp_def[15] = (LAMP_GUID >> 16) as u16 as i16;
+
+        // Object 1's script:
+        // Node 0..1: show two-button dialog with neighbor 1's portrait (PERSON_A).
+        // Node 2..3: on the next tick, show two-button dialog with neighbor 2's portrait (PERSON_B).
+        let lamp_bhav = Behavior {
+            format: 0x8002,
+            kind: 0,
+            args: 0,
+            locals: 0,
+            revision: 0,
+            instructions: vec![
+                assign(10, 0, 7, 1, 1), // Stack Object := 1 (neighbor 1 = PERSON_A)
+                Instruction {
+                    opcode: 36,
+                    on_true: 2,
+                    on_false: 2,
+                    operands: [0, 0, 0, 0, 0, 1, 0, 2 << 1],
+                },
+                assign(10, 0, 7, 2, 3), // Stack Object := 2 (neighbor 2 = PERSON_B)
+                Instruction {
+                    opcode: 36,
+                    on_true: 4,
+                    on_false: 4,
+                    operands: [0, 0, 0, 0, 0, 1, 0, 2 << 1],
+                },
+                Instruction {
+                    opcode: 0,
+                    on_true: 4,
+                    on_false: 253,
+                    operands: [0; 8],
+                },
+            ],
+        };
+        // Person Init: allow ground level (data[4] = 1) and no-floor placement (data[42] = 2).
+        let person_init = Behavior {
+            format: 0x8002,
+            kind: 0,
+            args: 0,
+            locals: 0,
+            revision: 0,
+            instructions: vec![assign(3, 4, 7, 1, 1), assign(3, 42, 7, 2, 254)],
+        };
+
+        let mut global = crate::Library::default();
+        for id in [1, 5, 6] {
+            global.tuning.insert(
+                id,
+                Constants {
+                    version: 0,
+                    entries: Vec::<Constant>::new(),
+                },
+            );
+        }
+        for id in [502, 504] {
+            global
+                .strings
+                .insert(id, vec!["(-100;1)(100;1)".to_owned(); 7]);
+        }
+
+        let mut lamp_lib = crate::Library::default();
+        lamp_lib.definitions.insert(128, lamp_def);
+        lamp_lib.definition_order.push(128);
+        lamp_lib.behaviors.insert(4096, lamp_bhav);
+
+        let make_person_lib = |guid: u32| {
+            let mut lib = crate::Library {
+                writable: true,
+                ..Default::default()
+            };
+            lib.definitions.insert(128, person_def(guid));
+            lib.definition_order.push(128);
+            lib.behaviors.insert(4096, person_init.clone());
+            lib.behaviors.insert(
+                4097,
+                Behavior {
+                    format: 0x8002,
+                    kind: 0,
+                    args: 1,
+                    locals: 0,
+                    revision: 0,
+                    instructions: vec![
+                        assign(9, 0, 7, 10, 1),
+                        Instruction {
+                            opcode: 0,
+                            on_true: 0,
+                            on_false: 253,
+                            operands: [0; 8],
+                        },
+                    ],
+                },
+            );
+            lib.callbacks.insert(
+                128,
+                vec![
+                    ObjectFunction {
+                        condition: 0,
+                        action: 4096,
+                    },
+                    ObjectFunction {
+                        condition: 0,
+                        action: 4097,
+                    },
+                ],
+            );
+            lib
+        };
+
+        let interaction = Interaction {
+            join: 0,
+            uid: 0,
+            caller: 0,
+            target: 0,
+            icon: 0,
+            table_index: 0,
+            args: [0; 4],
+            priority: 0,
+            action: 0,
+            attenuation: 0.0,
+            flags: 0,
+        };
+        let mut world = World::empty();
+        world.size = 6;
+        world.globals[3] = 2;
+        world.globals[9] = 1;
+        world.families.push(sims_sim::neighbors::Family {
+            id: 1,
+            house: 0,
+            members: vec![SIM_GUID],
+            friends: 0,
+            stale: false,
+        });
+        world.indicators = [1, 2];
+        world.order = vec![1, 2];
+        world.people = vec![2];
+        world.types.insert(1, LAMP_GUID);
+        world.types.insert(2, SIM_GUID);
+        world.types.insert(3, PERSON_A);
+        world.types.insert(4, PERSON_B);
+        world.arrays.insert(0, array(4, 0));
+        for (floors, walls, flags) in [(1, 2, 8), (101, 102, 108)] {
+            world.arrays.insert(floors, array(2, 0));
+            world.arrays.insert(walls, array(14, 0));
+            world.arrays.insert(flags, array(1, 0));
+        }
+        world.arrays.insert(3, array(2, 0));
+        world.arrays.insert(103, array(2, 0));
+        world.arrays.insert(9, array(1, 0xff));
+        world.arrays.insert(10, array(1, 0xff));
+        // Room 1 everywhere, except tile (2, 2) is isolated in room 9 and occupied by object 1.
+        // Searching from [1, 1] succeeds in room 1; searching from [2, 2] finds no tile in room 9.
+        world.rooms.map[0] = vec![1; 64 * 64];
+        world.rooms.map[1] = vec![1024; 64 * 64];
+        world.rooms.map[0][2 * 64 + 2] = 9;
+        let grid = &mut world.arrays.get_mut(&3).unwrap().data;
+        grid[(2 * 64 + 2) * 2..(2 * 64 + 2) * 2 + 2].copy_from_slice(&1i16.to_le_bytes());
+
+        world.neighbors.slots = vec![
+            Some(Neighbor {
+                id: 1,
+                guid: PERSON_A,
+                revision: 7,
+                data: vec![12; 256],
+                relationships: Vec::new(),
+                friends: 0,
+                stale: false,
+            }),
+            Some(Neighbor {
+                id: 2,
+                guid: PERSON_B,
+                revision: 7,
+                data: vec![12; 256],
+                relationships: Vec::new(),
+                friends: 0,
+                stale: false,
+            }),
+        ];
+        world.objects.insert(
+            1,
+            Object {
+                id: 1,
+                guid: LAMP_GUID,
+                footprint: [0; 4],
+                position: [2 << 4, 2 << 4, 0],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 72],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: vec![Frame {
+                    stack_object: 1,
+                    tree: 4096,
+                    node: 0,
+                    parameters: vec![1, 0, 0, 0],
+                    locals: Vec::new(),
+                    primitive_state: 0,
+                    code_owner_type: 1,
+                }],
+                relationship_flag: -1,
+                relationships: Vec::new(),
+                slots: vec![Slot {
+                    unknown: 0,
+                    object: 0,
+                }],
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: Some((1 << 16) | 0xffff),
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+        world.objects.insert(
+            2,
+            Object {
+                id: 2,
+                guid: SIM_GUID,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 72],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: -1,
+                relationships: Vec::new(),
+                slots: vec![Slot {
+                    unknown: 0,
+                    object: 0,
+                }],
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: Some(Person {
+                    animation_events: 0,
+                    engaged: 0,
+                    appearance: Default::default(),
+                    accessories: Vec::new(),
+                    animations: Default::default(),
+                    routing_state: 0,
+                    floats: [0.0; 9],
+                    previous_motives: [0.0; 16],
+                    motives: [0.0; 16],
+                    data: vec![0; 256],
+                    routing_frames: 0,
+                    active: interaction.clone(),
+                    last: interaction,
+                    queue: Vec::new(),
+                    object_uses: Vec::new(),
+                    motive_deltas: Vec::new(),
+                }),
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: true,
+            },
+        );
+
+        let make_lot = || {
+            let mut l = lot(world.clone(), true, Frames::parse("none").unwrap());
+            l.tuning = Some(tuning());
+            l.program.labels_hold_no_token = true;
+            l.program.libraries.insert(0, global.clone());
+            l.program.libraries.insert(1, lamp_lib.clone());
+            l.program.libraries.insert(2, make_person_lib(PERSON_A));
+            l.program.libraries.insert(3, make_person_lib(PERSON_B));
+            for res in [1, 2, 3] {
+                l.program.semi_globals.insert(res, None);
+                l.catalog.semi_globals.insert(res, None);
+            }
+            for (idx, (guid, res, kind)) in [(LAMP_GUID, 1, 4), (PERSON_A, 2, 2), (PERSON_B, 3, 2)]
+                .into_iter()
+                .enumerate()
+            {
+                l.catalog.objects.push(sims_content::Object {
+                    guid,
+                    resource: res,
+                    chunk: 128,
+                    kind,
+                    master: 0,
+                });
+                l.catalog.by_guid.insert(guid, idx);
+            }
+            for (guid, name) in [(PERSON_A, "person_a"), (PERSON_B, "person_b")] {
+                l.program.people.skeletons.insert(
+                    guid,
+                    Skeleton {
+                        name: name.into(),
+                        file: format!("{name}.bcf"),
+                        place: 0,
+                        scales: vec![vec![1]],
+                        bones: Vec::new(),
+                    },
+                );
+                l.program.people.profiles.insert(
+                    guid,
+                    Profile {
+                        gender: None,
+                        age: None,
+                        skin: None,
+                        tones: Vec::new(),
+                        rig: Default::default(),
+                        body: None,
+                        head: None,
+                        suit_rows: Default::default(),
+                    },
+                );
+            }
+            l
+        };
+
+        let mut asked = make_lot();
+        asked.wait_for_answers();
+        asked.set_view_rotation(0);
+        // Start with [1, 1] (free room 1): PERSON_A's portrait search succeeds and
+        // tick 1 pauses on the dialog, freezing replay_view = Some((0, Some([1, 1]))).
+        asked.set_view_centre(Some([1, 1]));
+        assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 1 });
+
+        // Move the camera to [2, 2] (blocked room 9) while the dialog waits, then
+        // answer and round-trip through save/restore.
+        asked.set_view_centre(Some([2, 2]));
+        asked.answer(2).unwrap();
+        let bytes = asked.save().unwrap().encode();
+
+        let mut restored = make_lot();
+        restored.wait_for_answers();
+        restored
+            .restore(super::save::Saved::decode(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(restored.view_centre(), Some([2, 2]));
+        // Tick 1 replay MUST use frozen [1, 1] so PERSON_A's portrait succeeds
+        // (using the moved [2, 2] would hit the no-tile trap).
+        restored.step().unwrap();
+        assert!(restored.world().portraits.contains(&PERSON_A));
+        assert!(restored.world().saved_portraits.contains(&PERSON_A));
+
+        // Tick 2 runs after replay_view is cleared, so PERSON_B's portrait search
+        // MUST use the moved live [2, 2], find no tile, remove unput (`0x4e9706`)
+        // without caching or saving PERSON_B, and pause on tick 2's dialog.
+        assert_eq!(restored.step().unwrap_err(), StepError::Asking { tick: 2 });
+        restored.answer(2).unwrap();
+        restored.step().unwrap();
+        assert!(!restored.world().portraits.contains(&PERSON_B));
+        assert!(!restored.world().saved_portraits.contains(&PERSON_B));
     }
 }
