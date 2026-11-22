@@ -256,6 +256,23 @@ fn text_editing_bounds_caret_blink_and_compact_reflow() {
     ctrl.draw(&mut small, &art, None);
     ctrl.begin_add_sim();
     ctrl.draw(&mut small, &art, None);
+
+    // Extremely narrow viewport must not panic when clipping text fields.
+    let mut tiny = Frame::new(80, 60, [0, 0, 0]);
+    ctrl.draw(&mut tiny, &art, None);
+
+    // Oversized initial family is truncated to MAX_MEMBERS, and raw >8 draft cannot finish.
+    let mut oversized = FamilyDraft {
+        last_name: "Big".into(),
+        bio: String::new(),
+        members: (0..=MAX_MEMBERS).map(|_| SimDraft::default()).collect(),
+    };
+    assert!(!oversized.can_finish());
+    let capped = CafController::with_family(CafTexts::default(), oversized.clone());
+    assert_eq!(capped.family().members.len(), MAX_MEMBERS);
+    assert!(capped.family().can_finish());
+    oversized.members.truncate(MAX_MEMBERS);
+    assert!(oversized.can_finish());
 }
 
 #[test]

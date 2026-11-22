@@ -289,10 +289,11 @@ pub struct SimAppearance {
     pub skin_tone: SkinTone,
     pub head_index: usize,
     pub body_index: usize,
-    /// Available heads for the current age/gender/skin filter (at least 1 when
-    /// populated by the host; 0 means unknown/unbounded cycling).
+    /// Available heads for the current age/gender/skin filter (`0` means no
+    /// catalog entries are available and cycling is disabled).
     pub head_count: usize,
-    /// Available bodies for the current age/gender/skin filter.
+    /// Available bodies for the current age/gender/skin filter (`0` means no
+    /// catalog entries are available and cycling is disabled).
     pub body_count: usize,
     /// Turntable preview yaw in degrees (`0.0..360.0`).
     pub preview_yaw_deg: f32,
@@ -390,9 +391,12 @@ pub struct FamilyDraft {
 
 impl FamilyDraft {
     /// Whether the household can be committed (`Done` enabled): requires a
-    /// non-empty family last name and at least one adult human Sim.
+    /// non-empty family last name, at most [`MAX_MEMBERS`] members, and at
+    /// least one adult human Sim.
     pub fn can_finish(&self) -> bool {
-        !self.last_name.trim().is_empty() && self.members.iter().any(SimDraft::is_adult_human)
+        !self.last_name.trim().is_empty()
+            && self.members.len() <= MAX_MEMBERS
+            && self.members.iter().any(SimDraft::is_adult_human)
     }
 
     /// Whether another member can be added (`members.len() < MAX_MEMBERS`).
@@ -613,8 +617,8 @@ impl CafTexts {
         Ok(texts)
     }
 
-    /// Formats the bio heading above the Sim bio field (`"BIO"` when unnamed,
-    /// or `"Bio for %s"` with the Sim's name).
+    /// Formats the bio heading above the Sim bio field using `bio_label` when
+    /// unnamed, or substituting the Sim's name into `bio_for_fmt`.
     pub fn format_bio_heading(&self, first_name: &str, last_name: &str) -> String {
         let first = first_name.trim();
         if first.is_empty() {
@@ -707,7 +711,7 @@ pub enum ControlId {
 /// Commands emitted by [`CafController`] to the host / game loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CafCommand {
-    /// Player confirmed "Finished?" on the Family screen with a valid household.
+    /// Player confirmed completion on the Family screen with a valid household.
     CommitFamily(FamilyDraft),
     /// Player cancelled Create-a-Family and returned to the Family Bin.
     CancelFamily,
@@ -1024,7 +1028,10 @@ impl CafController {
     }
 
     /// Starts Create-a-Family pre-populated with an existing [`FamilyDraft`].
-    pub fn with_family(texts: CafTexts, family: FamilyDraft) -> Self {
+    /// Members past [`MAX_MEMBERS`] are truncated so the roster matches what
+    /// the screen renders and commits.
+    pub fn with_family(texts: CafTexts, mut family: FamilyDraft) -> Self {
+        family.members.truncate(MAX_MEMBERS);
         let mut ctrl = Self::new(texts);
         let name_len = family.last_name.chars().count();
         ctrl.selected_member = (!family.members.is_empty()).then_some(0);
@@ -1041,8 +1048,13 @@ impl CafController {
         &self.family
     }
 
-    pub fn family_mut(&mut self) -> &mut FamilyDraft {
-        &mut self.family
+    /// Updates the rendered portrait bitmap for household member `index`.
+    pub fn set_member_portrait(&mut self, index: usize, portrait: Option<Image>) -> bool {
+        let Some(member) = self.family.members.get_mut(index) else {
+            return false;
+        };
+        member.portrait = portrait;
+        true
     }
 
     pub const fn selected_member(&self) -> Option<usize> {
@@ -1119,11 +1131,18 @@ impl CafController {
         })
     }
 
+    fn clear_pointer_capture(&mut self) {
+        self.pressed = None;
+        self.active_slider = None;
+        self.dragging_preview_x = None;
+    }
+
     /// Opens the Create-a-Sim screen for a new Sim (if under [`MAX_MEMBERS`]).
     pub fn begin_add_sim(&mut self) -> Option<CafCommand> {
         if !self.family.can_add_member() {
             return None;
         }
+        self.clear_pointer_capture();
         self.editing_sim = Some((None, SimDraft::default()));
         self.screen = CafScreen::EditSim;
         self.confirm = None;
@@ -1138,6 +1157,7 @@ impl CafController {
         if member.kind != MemberKind::Sim {
             return None;
         }
+        self.clear_pointer_capture();
         let name_len = member.first_name.chars().count();
         self.editing_sim = Some((Some(index), member));
         self.screen = CafScreen::EditSim;
@@ -1154,6 +1174,10 @@ impl CafController {
     pub fn pointer_move(&mut self, x: i32, y: i32, frame_size: [u32; 2]) -> Option<CafCommand> {
         let layout = CafLayout::compute(frame_size[0], frame_size[1]);
         self.hovered = self.hit_test(x, y, &layout);
+
+        if self.confirm.is_some() {
+            return None;
+        }
 
         if let Some(trait_) = self.active_slider {
             self.apply_slider_at(trait_, x, &layout);
@@ -1447,23 +1471,31 @@ impl CafController {
             Some(ControlId::SimFemale) => self.set_gender(Gender::Female),
             Some(ControlId::HeadPrev) => {
                 let (_, sim) = self.editing_sim.as_mut()?;
+                let prev = sim.appearance.head_index;
                 sim.appearance.prev_head();
-                Some(CafCommand::AppearanceChanged(sim.appearance.clone()))
+                (sim.appearance.head_index != prev)
+                    .then(|| CafCommand::AppearanceChanged(sim.appearance.clone()))
             }
             Some(ControlId::HeadNext) => {
                 let (_, sim) = self.editing_sim.as_mut()?;
+                let prev = sim.appearance.head_index;
                 sim.appearance.next_head();
-                Some(CafCommand::AppearanceChanged(sim.appearance.clone()))
+                (sim.appearance.head_index != prev)
+                    .then(|| CafCommand::AppearanceChanged(sim.appearance.clone()))
             }
             Some(ControlId::BodyPrev) => {
                 let (_, sim) = self.editing_sim.as_mut()?;
+                let prev = sim.appearance.body_index;
                 sim.appearance.prev_body();
-                Some(CafCommand::AppearanceChanged(sim.appearance.clone()))
+                (sim.appearance.body_index != prev)
+                    .then(|| CafCommand::AppearanceChanged(sim.appearance.clone()))
             }
             Some(ControlId::BodyNext) => {
                 let (_, sim) = self.editing_sim.as_mut()?;
+                let prev = sim.appearance.body_index;
                 sim.appearance.next_body();
-                Some(CafCommand::AppearanceChanged(sim.appearance.clone()))
+                (sim.appearance.body_index != prev)
+                    .then(|| CafCommand::AppearanceChanged(sim.appearance.clone()))
             }
             Some(ControlId::RotateLeft) => {
                 let (_, sim) = self.editing_sim.as_mut()?;
@@ -1545,6 +1577,7 @@ impl CafController {
             return None;
         }
         if sim.personality.remaining() > 0 {
+            self.clear_pointer_capture();
             self.confirm = Some(ConfirmKind::MorePersonality);
             return None;
         }
@@ -1552,6 +1585,7 @@ impl CafController {
     }
 
     fn commit_sim(&mut self) -> Option<CafCommand> {
+        self.clear_pointer_capture();
         let (slot, sim) = self.editing_sim.take()?;
         let (index, is_new) = match slot {
             Some(i) if i < self.family.members.len() => {
@@ -1575,6 +1609,7 @@ impl CafController {
     }
 
     fn cancel_sim(&mut self) -> Option<CafCommand> {
+        self.clear_pointer_capture();
         self.editing_sim = None;
         self.screen = CafScreen::Family;
         self.confirm = None;
@@ -1583,6 +1618,7 @@ impl CafController {
     }
 
     fn request_cancel_family(&mut self) -> Option<CafCommand> {
+        self.clear_pointer_capture();
         if self.family.has_changes() {
             self.confirm = Some(ConfirmKind::CancelFamily);
             None
@@ -2130,7 +2166,9 @@ impl CafController {
             draw_scaled_or_direct(frame, img, layout.preview_rect, true);
         }
 
-        // Head & body prev/next arrows over the turntable viewport.
+        // Head & body prev/next arrows and turntable rotate controls over the preview viewport.
+        let heads_enabled = sim.appearance.head_count > 1;
+        let bodies_enabled = sim.appearance.body_count > 1;
         self.draw_strip_button(
             frame,
             art,
@@ -2138,7 +2176,7 @@ impl CafController {
             4,
             layout.head_prev,
             ControlId::HeadPrev,
-            true,
+            heads_enabled,
             false,
             layout.compact,
         );
@@ -2149,7 +2187,7 @@ impl CafController {
             4,
             layout.head_next,
             ControlId::HeadNext,
-            true,
+            heads_enabled,
             false,
             layout.compact,
         );
@@ -2160,7 +2198,7 @@ impl CafController {
             4,
             layout.body_prev,
             ControlId::BodyPrev,
-            true,
+            bodies_enabled,
             false,
             layout.compact,
         );
@@ -2171,9 +2209,31 @@ impl CafController {
             4,
             layout.body_next,
             ControlId::BodyNext,
-            true,
+            bodies_enabled,
             false,
             layout.compact,
+        );
+        self.draw_strip_button(
+            frame,
+            art,
+            id::CHAR_SKINS_LEFT,
+            4,
+            layout.rotate_left,
+            ControlId::RotateLeft,
+            true,
+            false,
+            true,
+        );
+        self.draw_strip_button(
+            frame,
+            art,
+            id::CHAR_SKINS_RIGHT,
+            4,
+            layout.rotate_right,
+            ControlId::RotateRight,
+            true,
+            false,
+            true,
         );
 
         // Bio heading + multiline bio input.
@@ -2256,13 +2316,19 @@ impl CafController {
         }
 
         if let Some(font) = art.font(12).or_else(|| art.font(11)) {
-            let pad_x = 18;
-            let mut y = layout.dialog_rect.y + 18;
-            font.draw(frame, title, [layout.dialog_rect.x + pad_x, y], LABEL);
-            y += font.line_height + 10;
+            let pad_x = (layout.dialog_rect.width / 20).clamp(6, 18);
+            let mut y = layout.dialog_rect.y + (layout.dialog_rect.height / 10).clamp(6, 18);
+            let body_bottom = layout.dialog_primary.y - 4;
+            if y + font.line_height <= body_bottom {
+                font.draw(frame, title, [layout.dialog_rect.x + pad_x, y], LABEL);
+                y += font.line_height + (layout.dialog_rect.height / 18).clamp(4, 10);
+            }
 
             let max_w = (layout.dialog_rect.width - pad_x * 2).max(20);
             for line in font.break_lines(body, max_w) {
+                if y + font.line_height > body_bottom {
+                    break;
+                }
                 let lw = font.width(&line);
                 let lx = layout.dialog_rect.x + (layout.dialog_rect.width - lw) / 2;
                 font.draw(frame, &line, [lx, y], LABEL);
@@ -2485,41 +2551,78 @@ fn draw_text_box(
     let Some(font) = font else {
         return;
     };
-    let pad = 6;
-    let inner_w = (rect.width - pad * 2).max(1);
-
-    if !multiline {
-        let y = rect.y + (rect.height - font.line_height) / 2;
-        let caret_chars = state.caret.min(text.chars().count());
-        let prefix_byte = char_byte_index(text, caret_chars);
-        let caret_px = font.width(&text[..prefix_byte]);
-        let scroll = (caret_px + 2 - inner_w).max(0);
-        let draw_x = rect.x + pad - scroll;
-        font.draw(frame, text, [draw_x, y], LABEL);
-        if focused && state.caret_visible {
-            let cx = (draw_x + caret_px).clamp(rect.x + 2, rect.x + rect.width - 2);
-            frame.fill(Rect::new(cx, y, 1, font.line_height.max(8)), LABEL);
-        }
+    let inside = Rect::new(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        (rect.width - 2).max(0),
+        (rect.height - 2).max(0),
+    );
+    let (Ok(w), Ok(h)) = (u32::try_from(inside.width), u32::try_from(inside.height)) else {
+        return;
+    };
+    if w == 0 || h == 0 {
         return;
     }
 
-    let lines = font.break_lines(text, inner_w);
-    let mut y = rect.y + 4;
-    let max_y = rect.y + rect.height - font.line_height - 2;
-    let mut last_line_w = 0;
-    let mut last_y = y;
-    for line in &lines {
-        if y > max_y {
-            break;
+    let mut scratch = Frame::new(w, h, ENTRY_FILL);
+    let pad = 5.min(inside.width / 4);
+    let inner_w = (inside.width - pad * 2).max(1);
+
+    if !multiline {
+        let y = (inside.height - font.line_height) / 2;
+        let caret_chars = state.caret.min(text.chars().count());
+        let prefix_byte = char_byte_index(text, caret_chars);
+        let caret_px = font.width(&text[..prefix_byte]);
+        let scroll = if focused {
+            (caret_px + 2 - inner_w).max(0)
+        } else {
+            0
+        };
+        let draw_x = pad - scroll;
+        font.draw(&mut scratch, text, [draw_x, y], LABEL);
+        if focused && state.caret_visible {
+            let cx = (draw_x + caret_px).clamp(0, inside.width - 1);
+            scratch.fill(
+                Rect::new(cx, y.max(0), 1, font.line_height.clamp(1, inside.height)),
+                LABEL,
+            );
         }
-        font.draw(frame, line, [rect.x + pad, y], LABEL);
-        last_line_w = font.width(line);
-        last_y = y;
-        y += font.line_height + 2;
+    } else {
+        let lines = font.break_lines(text, inner_w);
+        let mut y = 3;
+        let max_y = inside.height - font.line_height - 1;
+        let mut last_line_w = 0;
+        let mut last_y = y;
+        for line in &lines {
+            if y > max_y {
+                break;
+            }
+            font.draw(&mut scratch, line, [pad, y], LABEL);
+            last_line_w = font.width(line);
+            last_y = y;
+            y += font.line_height + 2;
+        }
+        if focused && state.caret_visible && inside.width > 0 {
+            let cx = (pad + last_line_w).clamp(0, inside.width - 1);
+            scratch.fill(
+                Rect::new(
+                    cx,
+                    last_y.clamp(0, inside.height - 1),
+                    1,
+                    font.line_height.clamp(1, inside.height),
+                ),
+                LABEL,
+            );
+        }
     }
-    if focused && state.caret_visible {
-        let cx = (rect.x + pad + last_line_w).min(rect.x + rect.width - 3);
-        frame.fill(Rect::new(cx, last_y, 1, font.line_height.max(8)), LABEL);
+
+    for dy in 0..h {
+        let fy = inside.y.saturating_add(dy as i32);
+        for dx in 0..w {
+            if let Some(px) = scratch.pixel(dx as i32, dy as i32) {
+                frame.blend(inside.x.saturating_add(dx as i32), fy, px, 255);
+            }
+        }
     }
 }
 
