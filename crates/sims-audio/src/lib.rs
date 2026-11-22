@@ -24,6 +24,8 @@
 //!   playback rate.
 //! - [`stations`]: the radio, television and music hit lists the
 //!   original builds from directories.
+//! - [`music`]: streaming Neighborhood, Buy, Build, Load and expansion
+//!   mode music playback.
 //! - [`player`]: the HIT virtual machine and a mixer. It takes
 //!   [`SoundEvent`]s, the simulation's only link to sound, and renders
 //!   PCM.
@@ -42,6 +44,7 @@ pub mod hsm;
 pub mod levels;
 pub mod module;
 pub mod mp3;
+pub mod music;
 mod pcm;
 pub mod placement;
 pub mod player;

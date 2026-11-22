@@ -1,6 +1,8 @@
 //! The game's interface, drawn from the original artwork.
 //!
 //! - [`hud`]: the live-mode control panel.
+//! - [`neighborhood`]: the neighborhood top controls bar and lot hover popup card.
+//! - [`family_bin`]: the Select a Family / Family Bin picker screen.
 //! - [`dialog`]: the dialogs scripts show.
 //! - [`balloon`]: the help balloons the panels open over the lot.
 //! - [`pie`]: the pie menu of what a Sim can do with an object.
@@ -21,11 +23,13 @@ pub mod balloon;
 pub mod buy;
 pub mod command;
 pub mod dialog;
+pub mod family_bin;
 pub mod font;
 pub mod frame;
 pub mod house;
 pub mod household;
 pub mod hud;
+pub mod neighborhood;
 pub mod options;
 pub mod pie;
 pub mod queue;
