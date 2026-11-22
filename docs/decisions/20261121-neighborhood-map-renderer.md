@@ -24,12 +24,15 @@ share the native `cWinLot` (`0x54dd4d`, vtable `0x670204`) widget pipeline:
 
 ## Verified against `Sims.exe` (Complete Collection 1.91)
 
-- **Viewport framing & clipping (`0x556d78..0x556e23`, `0x5571e4..0x557201`):**
-  The map backdrop is always `800×600`. When the viewport exceeds `800×600`,
-  the outer `1024×768` frame (`kLargeMask = 5001` or `kLargeMaskSS = 5002`)
-  draws at `(0, 0)`, the map centers at `((w - 800) / 2, (h - 600) / 2)`
-  (`(112, 84)` at `1024×768`), and every lot draw clips to
-  `[ox, oy, ox + 800, oy + 600]`.
+- **Viewport framing & clipping (`0x556d78..0x556e23`, `0x5571e4..0x557201`, `0x568fa7..0x56929a`):**
+  The stock map backdrops are `800×600`, while neighborhood-local custom JPEG
+  backdrops (`neighborhood.jpg`, `neighborhoodul.jpg`, `downtown.jpg`,
+  `island.jpg`) center using their decoded dimensions (`((vw - bw) / 2, (vh - bh) / 2)`
+  when the viewport exceeds the backdrop). When the viewport width exceeds
+  `800` (`0x556d89`, `0x569025`), the outer `1024×768` frame (`kLargeMask = 5001`
+  or `kLargeMaskSS = 5002`) draws at `(0, 0)`. Every lot draw clips to
+  `[ox, oy, ox + 800, oy + 600]` from that centered origin (`(112, 84)` at
+  `1024×768` for stock `800×600` backdrops).
 - **Two-cell lot thumbnails (`0x4e261f..0x4e2987`, `0x54e35b..0x54e8fb`):**
   `BMP_ 512`/`1024` is the roofs-off interior view and `BMP_ 513`/`1025` is the
   roofs-on view. Cell 0 (idle) composites `512/1024` at `(max(0, -dx), max(0, -dy))`

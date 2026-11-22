@@ -558,6 +558,7 @@ pub struct MapLot {
     /// dimensions. Selected on hover when [`RenderOptions::show_vacation_badges`]
     /// is enabled and the lot has a vacation stay (`0x54ec48..0x54ec75`).
     pub vacation_badged: Option<Surface565>,
+    backdrop_size: [u32; 2],
 }
 
 impl MapLot {
@@ -567,9 +568,13 @@ impl MapLot {
     }
 
     /// Screen-space bounding rectangle `[left, top, right, bottom]` inside a
-    /// viewport of size `viewport`.
+    /// viewport of size `viewport`, using the loaded backdrop's centered origin
+    /// (`0x568fa7..0x568fe6`).
     pub fn screen_rect(&self, viewport: [u32; 2]) -> [i32; 4] {
-        let origin = map_origin(viewport);
+        self.screen_rect_at(map_origin_for_backdrop(viewport, self.backdrop_size))
+    }
+
+    fn screen_rect_at(&self, origin: [i32; 2]) -> [i32; 4] {
         let left = origin[0].saturating_add(self.cell_origin[0]);
         let top = origin[1].saturating_add(self.cell_origin[1]);
         let right = left.saturating_add(i32::try_from(self.normal.width).unwrap_or(i32::MAX));
@@ -657,6 +662,10 @@ pub struct NeighborhoodMap {
     pub large_frame: Option<Surface565>,
     /// Numbered water wave animation slots (`None` when a slot is absent, `0x56bb7a..0x56bb8d`).
     pub waves: Vec<Option<Surface565>>,
+    /// True when the backdrop and companion wave/port/tree overlays were loaded
+    /// from neighborhood-local JPEGs (`0x4b8285`), which leave source color-keying
+    /// disabled rather than treating `0xf81f` magenta as transparent.
+    pub opaque_overlays: bool,
     pub vacation_port: Option<Surface565>,
     pub vacation_trees: Option<Surface565>,
     pub vacation_logo: Option<Surface565>,
@@ -699,42 +708,54 @@ impl NeighborhoodMap {
         non_us: bool,
     ) -> Result<Self> {
         let ui = UiGraphics::open(install)?;
-        let load_ui = |id: i32| -> Result<Option<Surface565>> {
-            Ok(ui
-                .bitmap(id, US_ENGLISH)?
-                .map(|img| Surface565::from_bitmap(&img)))
+        let load_ui_opt = |id: i32| -> Option<Surface565> {
+            ui.bitmap(id, US_ENGLISH)
+                .ok()
+                .flatten()
+                .map(|img| Surface565::from_bitmap(&img))
         };
 
         let local_art = load_local_map_artwork(install, user_dir, kind);
-        let (backdrop, waves, vacation_port, vacation_trees) = if let Some(local) = local_art {
-            (
-                local.backdrop,
-                local.waves,
-                local.vacation_port,
-                local.vacation_trees,
-            )
-        } else {
-            let backdrop = load_ui(kind.backdrop_id(non_us))?.ok_or_else(|| {
-                Error::new(format!(
-                    "missing neighborhood backdrop resource {}",
-                    kind.backdrop_id(non_us)
-                ))
-            })?;
-            let mut waves = Vec::with_capacity(kind.wave_ids(non_us).len());
-            for &wave_id in kind.wave_ids(non_us) {
-                waves.push(load_ui(wave_id)?);
-            }
-            let (port, trees) = if kind == NeighborhoodKind::Vacation {
-                (load_ui(res::VACATION_PORT)?, load_ui(res::VACATION_TREES)?)
+        let (backdrop, waves, vacation_port, vacation_trees, opaque_overlays) =
+            if let Some(local) = local_art {
+                (
+                    local.backdrop,
+                    local.waves,
+                    local.vacation_port,
+                    local.vacation_trees,
+                    true,
+                )
             } else {
-                (None, None)
+                let backdrop = ui
+                    .bitmap(kind.backdrop_id(non_us), US_ENGLISH)?
+                    .map(|img| Surface565::from_bitmap(&img))
+                    .ok_or_else(|| {
+                        Error::new(format!(
+                            "missing neighborhood backdrop resource {}",
+                            kind.backdrop_id(non_us)
+                        ))
+                    })?;
+                // Missing or unreadable bundled wave slots stay `None` and are
+                // skipped at draw time rather than aborting map load (0x56bb7a).
+                let waves = kind
+                    .wave_ids(non_us)
+                    .iter()
+                    .map(|&wave_id| load_ui_opt(wave_id))
+                    .collect();
+                let (port, trees) = if kind == NeighborhoodKind::Vacation {
+                    (
+                        load_ui_opt(res::VACATION_PORT),
+                        load_ui_opt(res::VACATION_TREES),
+                    )
+                } else {
+                    (None, None)
+                };
+                (backdrop, waves, port, trees, false)
             };
-            (backdrop, waves, port, trees)
-        };
-        let large_frame = load_ui(kind.large_frame_id())?;
-        let vacation_logo = load_ui(res::VACATION_LOGO)?;
+        let large_frame = load_ui_opt(kind.large_frame_id());
+        let vacation_logo = load_ui_opt(res::VACATION_LOGO);
         let vacation_no_vacancy = if kind == NeighborhoodKind::Vacation {
-            load_ui(res::VACATION_NO_VACANCY)?
+            load_ui_opt(res::VACATION_NO_VACANCY)
         } else {
             None
         };
@@ -742,7 +763,7 @@ impl NeighborhoodMap {
         let mut filter_badges = BTreeMap::new();
         for filter in CommunityFilter::ALL {
             if kind.supports_filter(filter)
-                && let Some(surf) = load_ui(filter.badge_id())?
+                && let Some(surf) = load_ui_opt(filter.badge_id())
             {
                 filter_badges.insert(filter, surf);
             }
@@ -832,6 +853,7 @@ impl NeighborhoodMap {
                 let cell_origin =
                     compute_cell_origin(anchor, metrics, [normal.width, normal.height]);
 
+                let backdrop_size = [backdrop.width as u32, backdrop.height as u32];
                 lots.push(MapLot {
                     id: lot_id,
                     anchor,
@@ -845,6 +867,7 @@ impl NeighborhoodMap {
                     normal,
                     roofs_off,
                     vacation_badged,
+                    backdrop_size,
                 });
             }
         }
@@ -856,6 +879,7 @@ impl NeighborhoodMap {
             backdrop,
             large_frame,
             waves,
+            opaque_overlays,
             vacation_port,
             vacation_trees,
             vacation_logo,
@@ -899,32 +923,30 @@ impl NeighborhoodMap {
     /// dimensions (`0x568fa7..0x568fe6`). Matches [`map_origin`] for standard
     /// `800×600` backdrops.
     pub fn map_origin_for(&self, viewport: [u32; 2]) -> [i32; 2] {
-        let bw = self.backdrop.width as u32;
-        let bh = self.backdrop.height as u32;
-        let ox = if viewport[0] > bw {
-            ((viewport[0] - bw) / 2) as i32
-        } else {
-            0
-        };
-        let oy = if viewport[1] > bh {
-            ((viewport[1] - bh) / 2) as i32
-        } else {
-            0
-        };
-        [ox, oy]
+        map_origin_for_backdrop(
+            viewport,
+            [self.backdrop.width as u32, self.backdrop.height as u32],
+        )
     }
 
-    fn map_clip_for(&self, viewport: [u32; 2]) -> [i32; 4] {
+    /// Screen-space bounding rectangle `[left, top, right, bottom]` of `lot`
+    /// inside `viewport`, using this map's backdrop-derived origin.
+    pub fn lot_screen_rect(&self, lot: &MapLot, viewport: [u32; 2]) -> [i32; 4] {
+        lot.screen_rect_at(self.map_origin_for(viewport))
+    }
+
+    /// Lot clip rectangle (`[ox, oy, ox + 800, oy + 600]` clamped to `viewport`),
+    /// matching native `cWinLot` clip initialization at `0x5571e4..0x557201`
+    /// and `0x56928b..0x56929a`: always `800×600` from the centered backdrop origin.
+    fn lot_clip_for(&self, viewport: [u32; 2]) -> [i32; 4] {
         let [ox, oy] = self.map_origin_for(viewport);
-        let bw = self.backdrop.width.min(i32::MAX as usize) as i32;
-        let bh = self.backdrop.height.min(i32::MAX as usize) as i32;
         let vw = viewport[0].min(i32::MAX as u32) as i32;
         let vh = viewport[1].min(i32::MAX as u32) as i32;
         [
             ox,
             oy,
-            ox.saturating_add(bw).min(vw),
-            oy.saturating_add(bh).min(vh),
+            ox.saturating_add(MAP_WIDTH as i32).min(vw),
+            oy.saturating_add(MAP_HEIGHT as i32).min(vh),
         ]
     }
 
@@ -932,31 +954,27 @@ impl NeighborhoodMap {
     ///
     /// Sets `canvas.set_id(Some(lot.id))` for each lot's opaque pixels so
     /// [`Canvas::id_at`] agrees with [`Self::hit_test_with_options`] inside
-    /// the clipped backdrop rectangle.
+    /// the clipped `800×600` lot rectangle from the centered backdrop origin.
     pub fn render_into(&self, canvas: &mut Canvas, options: &RenderOptions) {
         let viewport = [canvas.width as u32, canvas.height as u32];
         let origin = self.map_origin_for(viewport);
-        let map_clip = self.map_clip_for(viewport);
+        let full_clip = [0, 0, canvas.width as i32, canvas.height as i32];
+        let map_clip = self.lot_clip_for(viewport);
+        let overlay_keyed = !self.opaque_overlays;
 
         canvas.clear([0, 0, 0]);
         canvas.set_id(None);
 
-        // 1. 1024×768 outer frame when viewport exceeds backdrop size (0x556d8c..0x557031).
-        if (viewport[0] > self.backdrop.width as u32 || viewport[1] > self.backdrop.height as u32)
+        // 1. 1024×768 outer frame only when viewport width exceeds 800
+        //    (`cmp eax, 0x320; jle` at 0x556d89, 0x569025).
+        if viewport[0] > MAP_WIDTH
             && let Some(frame) = &self.large_frame
         {
-            blit_surface_to_canvas(
-                canvas,
-                frame,
-                [0, 0],
-                [0, 0, canvas.width as i32, canvas.height as i32],
-                false,
-                None,
-            );
+            blit_surface_to_canvas(canvas, frame, [0, 0], full_clip, false, None);
         }
 
         // 2. Map backdrop at centered origin (0x556db7..0x556ddc, 0x568fa7..0x568fe6).
-        blit_surface_to_canvas(canvas, &self.backdrop, origin, map_clip, false, None);
+        blit_surface_to_canvas(canvas, &self.backdrop, origin, full_clip, false, None);
 
         // 3. Pre-lot water wave overlay for Unleashed (0x5570c1) and Classic.
         if !self.kind.waves_draw_after_lots()
@@ -966,11 +984,11 @@ impl NeighborhoodMap {
         {
             let [wx, wy] = self.kind.wave_offset();
             let at = [origin[0].saturating_add(wx), origin[1].saturating_add(wy)];
-            blit_surface_to_canvas(canvas, wave, at, map_clip, true, None);
+            blit_surface_to_canvas(canvas, wave, at, full_clip, overlay_keyed, None);
         }
 
-        // 4. Lots in back-to-front Z-order, clipped strictly to the map rect
-        //    (cWinLot + 0x230..0x240, 0x5571e4..0x557201).
+        // 4. Lots in back-to-front Z-order, clipped strictly to the 800×600 rect
+        //    at `origin` (cWinLot + 0x230..0x240, 0x5571e4..0x557201, 0x56928b..0x56929a).
         for lot in &self.lots {
             let draw_at = [
                 origin[0].saturating_add(lot.cell_origin[0]),
@@ -996,8 +1014,8 @@ impl NeighborhoodMap {
             && self.kind == NeighborhoodKind::Vacation
             && let (Some(port), Some(trees)) = (&self.vacation_port, &self.vacation_trees)
         {
-            blit_color_only(canvas, port, origin, map_clip);
-            blit_color_only(canvas, trees, origin, map_clip);
+            blit_color_only_mode(canvas, port, origin, full_clip, overlay_keyed);
+            blit_color_only_mode(canvas, trees, origin, full_clip, overlay_keyed);
         }
 
         // 6. Post-lot water wave overlay for Downtown (0x54cb21), Vacation
@@ -1009,7 +1027,7 @@ impl NeighborhoodMap {
         {
             let [wx, wy] = self.kind.wave_offset();
             let at = [origin[0].saturating_add(wx), origin[1].saturating_add(wy)];
-            blit_color_only(canvas, wave, at, map_clip);
+            blit_color_only_mode(canvas, wave, at, full_clip, overlay_keyed);
         }
 
         // 7. Optional residential occupied/vacant status markers.
@@ -1198,20 +1216,26 @@ impl NeighborhoodMap {
     }
 }
 
-/// Computes the top-left origin of the `800×600` map inside `viewport`
-/// (`0x556db7..0x556ddc`): `[0, 0]` at `800×600`, `[112, 84]` at `1024×768`.
-pub fn map_origin(viewport: [u32; 2]) -> [i32; 2] {
-    let ox = if viewport[0] > MAP_WIDTH {
-        ((viewport[0] - MAP_WIDTH) / 2) as i32
+/// Computes the centered top-left origin for a backdrop of size `backdrop_size`
+/// inside `viewport` (`0x568fa7..0x568fe6`).
+pub fn map_origin_for_backdrop(viewport: [u32; 2], backdrop_size: [u32; 2]) -> [i32; 2] {
+    let ox = if viewport[0] > backdrop_size[0] {
+        ((viewport[0] - backdrop_size[0]) / 2) as i32
     } else {
         0
     };
-    let oy = if viewport[1] > MAP_HEIGHT {
-        ((viewport[1] - MAP_HEIGHT) / 2) as i32
+    let oy = if viewport[1] > backdrop_size[1] {
+        ((viewport[1] - backdrop_size[1]) / 2) as i32
     } else {
         0
     };
     [ox, oy]
+}
+
+/// Computes the top-left origin of the stock `800×600` map inside `viewport`
+/// (`0x556db7..0x556ddc`): `[0, 0]` at `800×600`, `[112, 84]` at `1024×768`.
+pub fn map_origin(viewport: [u32; 2]) -> [i32; 2] {
+    map_origin_for_backdrop(viewport, [MAP_WIDTH, MAP_HEIGHT])
 }
 
 /// Computes the map clip rectangle `[left, top, right, bottom]` inside
@@ -1857,13 +1881,14 @@ impl FamilyOccupancy {
         });
     }
 
-    /// Synthesizes default family `0` when absent (`0x424c65..0x424cb5`) and
-    /// sorts the list descending by `(number, id)` (`0x425209`).
+    /// Synthesizes default family `0` when absent (`0x424c65..0x424cb5`, with
+    /// default `number = -1` from `0x410083`) and sorts the list descending by
+    /// `(number, id)` (`0x425209`).
     fn finalize_native(&mut self) {
         if !self.families.iter().any(|f| f.id == 0) {
             self.families.push(FamilyRecord {
                 id: 0,
-                number: 0,
+                number: -1,
                 house: 0,
                 secondary_house: 0,
             });
@@ -1912,14 +1937,15 @@ impl FamilyOccupancy {
             return;
         };
         let house = s.i32().unwrap_or(0);
+        // 0x410083 initializes family `number` to -1; version 0 leaves it at -1 (0x4104f9).
         if version < 5 && s.skip_cstr_padded().is_none() {
-            self.record_family_houses(family_id, 0, house, 0);
+            self.record_family_houses(family_id, -1, house, 0);
             return;
         }
         let number = if version >= 1 {
-            s.i32().unwrap_or(0)
+            s.i32().unwrap_or(-1)
         } else {
-            0
+            -1
         };
         if version >= 2 {
             let _ = s.i32(); // budget (+0x118)
@@ -3463,15 +3489,26 @@ fn mark_surface_ids(
 }
 
 fn blit_color_only(canvas: &mut Canvas, surface: &Surface565, at: [i32; 2], clip: [i32; 4]) {
+    blit_color_only_mode(canvas, surface, at, clip, true);
+}
+
+fn blit_color_only_mode(
+    canvas: &mut Canvas,
+    surface: &Surface565,
+    at: [i32; 2],
+    clip: [i32; 4],
+    keyed: bool,
+) {
     if !surface.is_valid() {
         return;
     }
-    blit_subrect_to_canvas(
+    blit_subrect_to_canvas_mode(
         canvas,
         surface,
         [0, 0, surface.width, surface.height],
         at,
         clip,
+        keyed,
     );
 }
 
@@ -3481,6 +3518,17 @@ fn blit_subrect_to_canvas(
     src_rect: [usize; 4],
     at: [i32; 2],
     clip: [i32; 4],
+) {
+    blit_subrect_to_canvas_mode(canvas, surface, src_rect, at, clip, true);
+}
+
+fn blit_subrect_to_canvas_mode(
+    canvas: &mut Canvas,
+    surface: &Surface565,
+    src_rect: [usize; 4],
+    at: [i32; 2],
+    clip: [i32; 4],
+    keyed: bool,
 ) {
     let [rx, ry, rw, rh] = src_rect;
     if !surface.is_valid()
@@ -3509,7 +3557,7 @@ fn blit_subrect_to_canvas(
         for px in x0..x1 {
             let sx = rx + (px - ax) as usize;
             let pixel = row[sx];
-            if pixel == COLOR_KEY_565 {
+            if keyed && pixel == COLOR_KEY_565 {
                 continue;
             }
             canvas.plot_color(px as i32, py as i32, widen_565(pixel));
@@ -3564,6 +3612,7 @@ mod tests {
             normal: surface,
             roofs_off: None,
             vacation_badged: None,
+            backdrop_size: [MAP_WIDTH, MAP_HEIGHT],
         }
     }
 
@@ -3579,6 +3628,7 @@ mod tests {
             ),
             large_frame: None,
             waves: Vec::new(),
+            opaque_overlays: false,
             vacation_port: None,
             vacation_trees: None,
             vacation_logo: None,
@@ -4253,14 +4303,25 @@ mod tests {
         let wave2_c = pack_565([200, 200, 20]);
         let port_c = pack_565([240, 40, 240]);
         custom_vac.backdrop = Surface565::filled(600, 400, bg_c);
+        custom_vac.lots[0].backdrop_size = [600, 400];
+        custom_vac.large_frame = Some(Surface565::filled(800, 600, pack_565([240, 0, 0])));
         custom_vac.waves = vec![
-            Some(Surface565::filled(600, 400, pack_565([10, 10, 240]))),
+            Some(Surface565::filled(600, 400, COLOR_KEY_565)),
             None,
             Some(Surface565::filled(600, 400, wave2_c)),
         ];
+        custom_vac.opaque_overlays = true;
         custom_vac.vacation_port = Some(Surface565::filled(600, 400, port_c));
         custom_vac.vacation_trees = None;
         assert_eq!(custom_vac.map_origin_for([800, 600]), [100, 100]);
+        assert_eq!(
+            custom_vac.lots[0].screen_rect([800, 600]),
+            [100, 100, 104, 104]
+        );
+        assert_eq!(
+            custom_vac.lot_screen_rect(&custom_vac.lots[0], [800, 600]),
+            [100, 100, 104, 104]
+        );
         assert_eq!(custom_vac.hit_test([800, 600], [100, 100]), Some(40));
         assert_eq!(custom_vac.hit_test([800, 600], [0, 0]), None);
         let vac_frame1 = custom_vac.render(&RenderOptions {
@@ -4269,9 +4330,20 @@ mod tests {
             show_vacation_overlays: true,
             ..RenderOptions::default()
         });
+        // Outer frame requires viewport width > 800 (0x569025), so (0, 0) stays black.
+        assert_eq!(vac_frame1.color[0], [0, 0, 0]);
         // Frame 1 is None (not shifted to frame 2) and port alone is suppressed,
         // so (110, 110) stays backdrop color rather than wave2_c or port_c.
         assert_eq!(vac_frame1.color[110 * 800 + 110], widen_565(bg_c));
+        // Local JPEG overlays keep color-keying disabled (0x4b8285), so solid
+        // magenta (0xf81f) in frame 0 draws opaquely rather than transparent.
+        let vac_frame0 = custom_vac.render(&RenderOptions {
+            viewport: [800, 600],
+            water_frame: Some(0),
+            show_vacation_overlays: true,
+            ..RenderOptions::default()
+        });
+        assert_eq!(vac_frame0.color[110 * 800 + 110], widen_565(COLOR_KEY_565));
         let vac_frame2 = custom_vac.render(&RenderOptions {
             viewport: [800, 600],
             water_frame: Some(2),
@@ -4279,6 +4351,56 @@ mod tests {
             ..RenderOptions::default()
         });
         assert_eq!(vac_frame2.color[110 * 800 + 110], widen_565(wave2_c));
+
+        // On a 900px-wide backdrop, lot clip remains 800×600 from origin (0x56928b).
+        let mut wide_map = make_test_map(
+            NeighborhoodKind::Vacation,
+            vec![make_lot(
+                40,
+                [850, 10],
+                Surface565::filled(10, 10, pack_565([250, 250, 0])),
+            )],
+        );
+        wide_map.backdrop = Surface565::filled(900, 600, bg_c);
+        let wide_canvas = wide_map.render(&RenderOptions {
+            viewport: [900, 600],
+            ..RenderOptions::default()
+        });
+        assert_eq!(wide_canvas.color[15 * 900 + 855], widen_565(bg_c));
+
+        // Version-0 FAMI retains default number = -1 (0x410083, 0x4104f9), so a
+        // version-1 family #9 with number 0 beats version-0 family #10 on lot 5.
+        let mut v0_fami = Vec::new();
+        v0_fami.extend_from_slice(&0u32.to_le_bytes());
+        v0_fami.extend_from_slice(&0i32.to_le_bytes()); // version 0
+        v0_fami.extend_from_slice(b"IMAF");
+        v0_fami.extend_from_slice(&5i32.to_le_bytes()); // house 5
+        v0_fami.extend_from_slice(&[0u8, 0u8]); // empty NUL name + pad
+        v0_fami.extend_from_slice(&0i32.to_le_bytes()); // 0 members
+        let mut v1_fami = Vec::new();
+        v1_fami.extend_from_slice(&0u32.to_le_bytes());
+        v1_fami.extend_from_slice(&1i32.to_le_bytes()); // version 1
+        v1_fami.extend_from_slice(b"IMAF");
+        v1_fami.extend_from_slice(&5i32.to_le_bytes()); // house 5
+        v1_fami.extend_from_slice(&[0u8, 0u8]); // empty NUL name + pad
+        v1_fami.extend_from_slice(&0i32.to_le_bytes()); // number = 0
+        v1_fami.extend_from_slice(&0i32.to_le_bytes()); // 0 members
+        let mut legacy_occ = FamilyOccupancy::default();
+        legacy_occ.record_fami_chunk(10, &v0_fami, 0x0010);
+        legacy_occ.record_fami_chunk(9, &v1_fami, 0x0010);
+        legacy_occ.finalize_native();
+        assert_eq!(
+            resolve_lot_status(
+                5,
+                NeighborhoodKind::Unleashed,
+                LotZoning::Residential,
+                &legacy_occ
+            ),
+            LotStatus::Occupied {
+                family_id: 9,
+                vacation_lot: None,
+            }
+        );
 
         // Verify vacation badge draws unhighlighted (0x54ec5a) while picking
         // tests the regular thumbnail (0x5e40b4), and works on Magic Town homes (0x54eb49).
