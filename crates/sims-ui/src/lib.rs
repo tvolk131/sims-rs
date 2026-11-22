@@ -1,10 +1,15 @@
 //! The game's interface, drawn from the original artwork.
 //!
 //! - [`hud`]: the live-mode control panel.
+//! - [`caf`]: the Create-a-Family and Create-a-Sim screens.
 //! - [`neighborhood`]: the neighborhood top controls bar and lot hover popup card.
 //! - [`loading`]: the startup splash and neighborhood/lot/travel loading screen.
 //! - [`travel`]: travel destination top chrome, filters, and travel-confirm dialogs.
 //! - [`family_bin`]: the Select a Family / Family Bin picker screen.
+//! - [`coop`]: the co-op multiplayer Host/Join lobby dialog and in-lot HUD overlay.
+//! - [`saves`]: the Save & rotating autosave slot picker dialog.
+//! - [`shop`]: the travel shop, wardrobe, pet adoption, and Magic Town vendor picker.
+//! - [`cheat_console`]: the classic Sims 1 `Ctrl+Shift+C` cheat console overlay and parser.
 //! - [`dialog`]: the dialogs scripts show.
 //! - [`balloon`]: the help balloons the panels open over the lot.
 //! - [`pie`]: the pie menu of what a Sim can do with an object.
@@ -24,7 +29,10 @@ pub mod art;
 pub mod balloon;
 pub mod build;
 pub mod buy;
+pub mod caf;
+pub mod cheat_console;
 pub mod command;
+pub mod coop;
 pub mod dialog;
 pub mod family_bin;
 pub mod font;
@@ -37,6 +45,8 @@ pub mod neighborhood;
 pub mod options;
 pub mod pie;
 pub mod queue;
+pub mod saves;
+pub mod shop;
 pub mod thumbnail;
 pub mod travel;
 

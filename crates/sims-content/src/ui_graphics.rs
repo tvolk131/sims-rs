@@ -11,14 +11,16 @@
 //! loose files are the tables and headers, and they are identical to the
 //! archive's copies.
 
-use crate::install::resolve;
+use crate::index::sorted_entries;
+use crate::pool::ArchivePool;
 use crate::{Error, Install, Result};
 use sims_formats::bitmap::{self, Image};
 use sims_formats::{far, ui_table};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 /// The tables the interface reads, all in the archive's top level.
 pub const TABLES: [&str; 4] = [
@@ -46,7 +48,15 @@ struct Stored {
 #[derive(Debug, Clone)]
 pub struct UiGraphics {
     root: PathBuf,
+    ui_root: PathBuf,
     archive: Option<PathBuf>,
+    /// On-demand cache of sorted directory listings under `UIGraphics`,
+    /// preserving exact component-by-component case resolution without touching
+    /// unreferenced subdirectories or repeating `read_dir` on every bitmap.
+    dir_cache: Arc<RwLock<BTreeMap<PathBuf, Vec<PathBuf>>>>,
+    /// Cached open archive handles so reading hundreds of UI bitmaps avoids
+    /// re-opening `UIGraphics.far` on every bitmap.
+    pool: Arc<ArchivePool>,
     /// Members by lower-case path with `/` separators.
     members: BTreeMap<String, Stored>,
     /// Bitmap paths by (resource ID, language).
@@ -63,15 +73,23 @@ fn normal(path: &str) -> String {
 impl UiGraphics {
     /// Opens the install's `UIGraphics` and reads its four tables.
     pub fn open(install: &Install) -> Result<Self> {
-        let root = install.file("UIGraphics")?;
+        Self::open_with_pool(install, Arc::new(ArchivePool::new()))
+    }
+
+    /// Opens `UIGraphics` reusing open archive handles from `pool`.
+    pub fn open_with_pool(install: &Install, pool: Arc<ArchivePool>) -> Result<Self> {
+        let ui_root = install.file("UIGraphics")?;
         let mut ui = Self {
             root: install.root.clone(),
+            ui_root,
             archive: None,
+            dir_cache: Arc::new(RwLock::new(BTreeMap::new())),
+            pool,
             members: BTreeMap::new(),
             bitmaps: BTreeMap::new(),
             unresolved: Vec::new(),
         };
-        if let Some(path) = resolve(&root, "UIGraphics.far")? {
+        if let Some(path) = ui.resolve_cached("UIGraphics.far")? {
             ui.read_directory(path)?;
         }
         for name in TABLES {
@@ -126,19 +144,69 @@ impl UiGraphics {
         Ok(())
     }
 
+    fn cached_entries(&self, dir: &Path) -> Result<Vec<PathBuf>> {
+        if let Ok(guard) = self.dir_cache.read()
+            && let Some(entries) = guard.get(dir)
+        {
+            return Ok(entries.clone());
+        }
+        let entries = sorted_entries(dir)?;
+        if let Ok(mut guard) = self.dir_cache.write() {
+            guard
+                .entry(dir.to_path_buf())
+                .or_insert_with(|| entries.clone());
+        }
+        Ok(entries)
+    }
+
+    /// Component-by-component case-insensitive path resolution under `ui_root`
+    /// matching [`crate::install::resolve`], caching each visited directory's
+    /// sorted listing on demand.
+    fn resolve_cached(&self, relative: &str) -> Result<Option<PathBuf>> {
+        let mut path = self.ui_root.clone();
+        for component in relative.split('/').filter(|c| !c.is_empty()) {
+            if component == "." || component == ".." {
+                path.push(component);
+                path.symlink_metadata().map_err(|e| Error::io(&path, e))?;
+                continue;
+            }
+            let entries = self.cached_entries(&path)?;
+            let name = |p: &PathBuf| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .as_encoded_bytes()
+                    .to_vec()
+            };
+            let found = entries
+                .iter()
+                .find(|p| name(p) == component.as_bytes())
+                .or_else(|| {
+                    entries
+                        .iter()
+                        .find(|p| name(p).eq_ignore_ascii_case(component.as_bytes()))
+                });
+            match found {
+                Some(next) => path = next.clone(),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(path))
+    }
+
     /// Reads a file by its path below `UIGraphics`.
     ///
     /// The path must stay below `UIGraphics` (no `..`, no absolute path),
     /// and the file must be at most 32 MiB.
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let relative = format!("UIGraphics/{}", path.replace('\\', "/"));
+        let rel_slash = path.replace('\\', "/");
+        let relative = format!("UIGraphics/{rel_slash}");
         if !ui_table::valid_path(path) {
             return Err(Error::Unsupported(format!(
                 "{relative} is not a path below UIGraphics"
             )));
         }
         let too_large = || Error::Unsupported(format!("{relative} is larger than 32 MiB"));
-        if let Some(loose) = resolve(&self.root, &relative)?
+        if let Some(loose) = self.resolve_cached(&rel_slash)?
             && loose.is_file()
         {
             let io = |e| Error::io(&loose, e);
@@ -154,18 +222,13 @@ impl UiGraphics {
             root: self.root.clone(),
             path: relative.clone(),
         };
-        let stored = self.members.get(&normal(path)).ok_or_else(missing)?;
+        let norm = normal(path);
+        let stored = self.members.get(&norm).ok_or_else(missing)?;
         let archive = self.archive.as_ref().ok_or_else(missing)?;
-        let io = |e| Error::io(archive, e);
-        let mut file = File::open(archive).map_err(io)?;
-        file.seek(SeekFrom::Start(stored.offset)).map_err(io)?;
         if stored.size > MAX_FILE {
             return Err(too_large());
         }
-        let size = stored.size as usize;
-        let mut bytes = vec![0; size];
-        file.read_exact(&mut bytes).map_err(io)?;
-        Ok(bytes)
+        self.pool.read_range(archive, stored.offset, stored.size)
     }
 
     fn text(&self, path: &str) -> Result<String> {

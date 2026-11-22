@@ -26,6 +26,8 @@
 //!   original builds from directories.
 //! - [`music`]: streaming Neighborhood, Buy, Build, Load and expansion
 //!   mode music playback.
+//! - [`radio`]: streaming in-lot stereo radio and television stations
+//!   with spatial attenuation and custom MP3 station discovery.
 //! - [`voices`]: Simlish voice bank index, resolver, and pitch-shifted PCM
 //!   streaming across base and expansion voice archives.
 //! - [`player`]: the HIT virtual machine and a mixer. It takes
@@ -50,6 +52,7 @@ pub mod music;
 mod pcm;
 pub mod placement;
 pub mod player;
+pub mod radio;
 pub mod registry;
 pub mod sources;
 pub mod stations;

@@ -345,8 +345,9 @@ pub fn draw_shaded<T: Target + ?Sized>(
 }
 
 /// Like [`draw_shaded`], culling counter-clockwise screen-space back faces
-/// (`edge(a, b, c) < 0.0`) as Direct3D 6 `D3DCULL_CCW` does (`0x49b097`,
-/// `0x5ce97d`–`0x5ce989`).
+/// (`edge(a, b, c) < 0.0`) as Direct3D 6's default `D3DRENDERSTATE_CULLMODE`
+/// (`D3DCULL_CCW`, never overridden in `0x5ce911`–`0x5cea52`,
+/// `0x5d34c6`–`0x5d37f1`, or `0x5d38d5`–`0x5d3c69`) does.
 pub fn draw_shaded_culled<T: Target + ?Sized>(
     target: &mut T,
     part: &Part,
@@ -832,5 +833,78 @@ mod tests {
             (ahead - Vec3::new(0.0, 0.0, 1.0)).length() < 1e-5,
             "{ahead:?}"
         );
+    }
+
+    #[test]
+    fn draw_shaded_culled_drops_counter_clockwise_back_faces() {
+        use sims_formats::avatar::{Mesh, MeshBinding, Vertex};
+
+        let make_part = |triangles: Vec<[u32; 3]>, color: [u8; 4]| Part {
+            appearance: "tri".into(),
+            bone: 0,
+            bones: vec![0],
+            mesh: Mesh {
+                name: "tri".into(),
+                texture: String::new(),
+                bones: vec!["ROOT".into()],
+                bindings: vec![MeshBinding {
+                    bone: 0,
+                    first_vertex: 0,
+                    vertex_count: 3,
+                    first_blend: 0,
+                    blend_count: 0,
+                }],
+                triangles,
+                vertices: vec![
+                    Vertex {
+                        position: [1.0, 1.0, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        uv: [0.5, 0.5],
+                        bone: 0,
+                    },
+                    Vertex {
+                        position: [7.0, 1.0, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        uv: [0.5, 0.5],
+                        bone: 0,
+                    },
+                    Vertex {
+                        position: [4.0, 7.0, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        uv: [0.5, 0.5],
+                        bone: 0,
+                    },
+                ],
+                blends: Vec::new(),
+            },
+            texture_name: None,
+            texture: crate::texture::Texture::solid(color),
+            censor: 0,
+        };
+        // Screen-space clockwise (y grows downward): edge(a, b, c) > 0 (front).
+        let front = make_part(vec![[0, 1, 2]], [200, 50, 50, 255]);
+        // Reversed winding: edge(a, b, c) < 0 (back face).
+        let back = make_part(vec![[0, 2, 1]], [50, 200, 50, 255]);
+        let skinned = |z: f32| Skinned {
+            positions: vec![
+                Vec3::new(1.0, 1.0, z),
+                Vec3::new(7.0, 1.0, z),
+                Vec3::new(4.0, 7.0, z),
+            ],
+            normals: vec![Vec3::new(0.0, 0.0, 1.0); 3],
+        };
+        let shade = [Shade::Grey(1.0); 3];
+
+        // Unculled: the nearer back face overwrites the front face.
+        let mut unculled = Canvas::new(8, 8, [0, 0, 0, 255]);
+        draw_shaded(&mut unculled, &front, &skinned(5.0), &shade, |p| p);
+        draw_shaded(&mut unculled, &back, &skinned(1.0), &shade, |p| p);
+        assert_eq!(pixel(&unculled, 4, 3), [50, 200, 50, 255]);
+
+        // Culled (`D3DCULL_CCW`): the nearer back face is dropped, keeping the front face.
+        let mut culled = Canvas::new(8, 8, [0, 0, 0, 255]);
+        draw_shaded_culled(&mut culled, &front, &skinned(5.0), &shade, |p| p);
+        draw_shaded_culled(&mut culled, &back, &skinned(1.0), &shade, |p| p);
+        assert_eq!(pixel(&culled, 4, 3), [200, 50, 50, 255]);
     }
 }

@@ -42,11 +42,51 @@ pub(crate) fn hash(name: &[u8]) -> u32 {
 }
 
 /// One directory's names, in the original's table layout.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Table {
     /// Each bucket's chain, head first.
     buckets: Vec<Vec<Vec<u8>>>,
     len: usize,
+}
+
+/// The avatar registry's appearance hash table (`[AvatarRegistry + 0x28]`,
+/// `0x5a1f67` → `0x5a1fb1` → `0x409255`), preserving the original SGI STL
+/// bucket layout, Jenkins hash (`0x5b8ef9`), growth primes (`0x402a88`), and
+/// bucket-chain walk order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SuitTable(Table);
+
+impl SuitTable {
+    /// Whether `key` is already registered in this table (byte-exact).
+    pub fn contains(&self, key: &[u8]) -> bool {
+        self.0.contains(key)
+    }
+
+    /// Inserts `key` using the suit registry's `insert_unique` sequence
+    /// (`0x5a1fb1`: grows on `len + 1 > buckets` before testing duplicates,
+    /// prepending to the bucket head).
+    pub fn insert_name(&mut self, key: Vec<u8>) -> bool {
+        self.0.insert_name(key)
+    }
+
+    /// Whether the table holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.0.len == 0
+    }
+
+    /// Walks the table as `0x409255` builds `0x6e48a0`: bucket order, chain
+    /// head to tail, skipping keys starting with `"suit-"` (`0x409296`), and
+    /// truncating each entry to the 63-byte `StackString<64>` limit.
+    pub fn scan_names(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .filter(|name| !name.starts_with(b"suit-"))
+            .map(|name| {
+                let capped = &name[..name.len().min(63)];
+                sims_formats::strings::decode(capped, 1)
+            })
+            .collect()
+    }
 }
 
 impl Default for Table {

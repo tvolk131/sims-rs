@@ -105,7 +105,7 @@ use crate::bob::{self, Bob};
 use crate::house::Cast;
 use crate::math::{Transform, Vec3};
 use crate::person::{Player, UNITS_PER_TILE, base_clip, placement};
-use crate::raster::{Lamp, Lighting, Shade, Target, draw_part, draw_shaded};
+use crate::raster::{Lamp, Lighting, Shade, Target, draw_shaded_culled};
 use crate::rig;
 use crate::skin::skin;
 use crate::suit::{AGE, Clothes, GENDER, JOB, JOB_LEVEL, SUIT, Wardrobe, dress};
@@ -590,7 +590,10 @@ impl<T: Target + ?Sized> Target for Packed565<'_, T> {
 }
 
 /// Draws one skinned part of a person on the lot into `target`, with or
-/// without room lamps.
+/// without room lamps, culling counter-clockwise screen-space back faces
+/// as Direct3D 6's default `D3DRENDERSTATE_CULLMODE` (`D3DCULL_CCW`, never
+/// overridden in `0x5ce911`–`0x5cea52`, `0x5d34c6`–`0x5d37f1`, or
+/// `0x5d38d5`–`0x5d3c69`) does.
 fn draw_lot_part<T: Target + ?Sized>(
     target: &mut T,
     part: &crate::appearance::Part,
@@ -599,17 +602,21 @@ fn draw_lot_part<T: Target + ?Sized>(
     lamps: &[Lamp],
     project: impl Fn(Vec3) -> Vec3,
 ) {
-    if lamps.is_empty() {
-        draw_part(target, part, skinned, lighting, project);
+    let towards = lighting.towards.normalize();
+    let shade: Vec<Shade> = if lamps.is_empty() {
+        skinned
+            .normals
+            .iter()
+            .map(|&n| Shade::Grey(lighting.shade_unit(n, towards)))
+            .collect()
     } else {
-        let towards = lighting.towards.normalize();
-        let shade: Vec<Shade> = skinned
+        skinned
             .normals
             .iter()
             .map(|&n| lighting.shade_with_unit(n, towards, lamps))
-            .collect();
-        draw_shaded(target, part, skinned, &shade, project);
-    }
+            .collect()
+    };
+    draw_shaded_culled(target, part, skinned, &shade, project);
 }
 
 /// Projects a world point for lot rasterization: [`View::place_on`] and
@@ -1053,7 +1060,7 @@ impl People {
                     .iter()
                     .map(|&n| Shade::Colour(bob::shade(colour, n, bob_light)))
                     .collect();
-                draw_shaded(target, part, &skinned, &shade, project);
+                draw_shaded_culled(target, part, &skinned, &shade, project);
             }
         }
         target.set_id(None);
@@ -1361,6 +1368,7 @@ mod tests {
     #[test]
     fn direct3d_integer_pixel_centers_shift_projected_triangles_half_a_pixel() {
         use crate::appearance::Part;
+        use crate::raster::draw_part;
         use crate::skin::Skinned;
         use crate::texture::Texture;
         use sims_formats::avatar::{Mesh, MeshBinding, Vertex};
@@ -1459,6 +1467,66 @@ mod tests {
         );
         assert_eq!(unshifted.color[3 * 6 + 3], [0, 0, 0]);
         assert_eq!(d3d6.color[3 * 6 + 3], [248, 252, 248]);
+    }
+
+    /// `draw_lot_part` culls counter-clockwise screen-space back faces so a
+    /// nearer back-facing triangle (such as hair or limb interior geometry)
+    /// never overwrites a front-facing triangle, matching Direct3D 6's
+    /// default `D3DCULL_CCW`.
+    #[test]
+    fn draw_lot_part_culls_counter_clockwise_back_faces() {
+        use crate::appearance::Part;
+        use crate::skin::Skinned;
+        use crate::texture::Texture;
+        use sims_formats::avatar::{Mesh, MeshBinding, Vertex};
+        use sims_render::Canvas as LotCanvas;
+
+        let make_part = |triangles: Vec<[u32; 3]>, color: [u8; 4]| Part {
+            appearance: "tri".into(),
+            bone: 0,
+            bones: vec![0],
+            mesh: Mesh {
+                name: "tri".into(),
+                texture: String::new(),
+                bones: vec!["ROOT".into()],
+                bindings: vec![MeshBinding {
+                    bone: 0,
+                    first_vertex: 0,
+                    vertex_count: 3,
+                    first_blend: 0,
+                    blend_count: 0,
+                }],
+                triangles,
+                vertices: vec![
+                    Vertex {
+                        position: [0.0; 3],
+                        normal: [0.0, 0.0, 1.0],
+                        uv: [0.5, 0.5],
+                        bone: 0,
+                    };
+                    3
+                ],
+                blends: Vec::new(),
+            },
+            texture_name: None,
+            texture: Texture::solid(color),
+            censor: 0,
+        };
+        let lighting = Lighting::standard(Vec3::new(0.0, 0.0, 1.0), 1.0);
+        let front = make_part(vec![[0, 1, 2]], [200, 100, 50, 255]);
+        let back = make_part(vec![[0, 2, 1]], [50, 200, 100, 255]);
+        let skinned = |z: f32| Skinned {
+            positions: vec![
+                Vec3::new(1.0, 1.0, z),
+                Vec3::new(7.0, 1.0, z),
+                Vec3::new(4.0, 7.0, z),
+            ],
+            normals: vec![Vec3::new(0.0, 0.0, 1.0); 3],
+        };
+        let mut canvas = LotCanvas::new(8, 8, [0, 0, 0]);
+        draw_lot_part(&mut canvas, &front, &skinned(100.0), lighting, &[], |p| p);
+        draw_lot_part(&mut canvas, &back, &skinned(50.0), lighting, &[], |p| p);
+        assert_eq!(canvas.color[3 * 8 + 4], [200, 100, 50]);
     }
 
     /// The light keeps its place relative to the viewer as the view
