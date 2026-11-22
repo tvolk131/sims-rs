@@ -540,6 +540,9 @@ pub struct NeighborhoodShell {
     album_snapshot: Option<AlbumSnapshot>,
     album_token: Option<AlbumFamilyToken>,
     album_neighborhood_id: Option<String>,
+    album_has_image: BTreeSet<PhotoId>,
+    album_strip_scroll: usize,
+    album_strip_pressed: Option<i32>,
     // Crash-safe Save & Rotating Autosave Manager dialog (overlay over Lot/Neighborhood).
     save_manager: SaveManagerDialog,
     save_manager_snapshot: Option<SaveManagerSnapshot>,
@@ -761,6 +764,9 @@ impl NeighborhoodShell {
             album_snapshot: None,
             album_token: None,
             album_neighborhood_id: None,
+            album_has_image: BTreeSet::new(),
+            album_strip_scroll: 0,
+            album_strip_pressed: None,
             save_manager: SaveManagerDialog::new(),
             save_manager_snapshot: None,
             save_manager_target_lot: None,
@@ -912,6 +918,15 @@ impl NeighborhoodShell {
             session.game.set_note(text);
         } else {
             self.note = Some(text);
+        }
+    }
+
+    /// Returns the active status note on the current Lot or Neighborhood screen, if any.
+    pub fn note(&self) -> Option<&str> {
+        if let ActiveScreen::Lot(session) = &self.screen {
+            session.game.note()
+        } else {
+            self.note.as_deref()
         }
     }
 
@@ -1624,9 +1639,27 @@ impl NeighborhoodShell {
                 return false;
             };
             if let Some(snapshot) = &self.album_snapshot {
+                let layout = self.album_dialog.layout(self.size[0], self.size[1]);
+                let in_caption = self
+                    .pointer
+                    .is_some_and(|p| layout.caption_box.contains(p[0], p[1]));
                 self.album_dialog
                     .handle_scroll(delta, self.size, snapshot, &self.album_art);
-                self.hydrate_album_images_around_selection();
+                if !in_caption {
+                    let max_scroll = snapshot
+                        .entries
+                        .len()
+                        .saturating_sub(layout.thumb_slots.len());
+                    if delta > 0 {
+                        self.album_strip_scroll =
+                            (self.album_strip_scroll + delta as usize).min(max_scroll);
+                    } else {
+                        self.album_strip_scroll = self
+                            .album_strip_scroll
+                            .saturating_sub(delta.unsigned_abs() as usize);
+                    }
+                }
+                self.hydrate_album_images();
                 return true;
             }
             return false;
@@ -1685,6 +1718,14 @@ impl NeighborhoodShell {
         }
         if self.album_dialog.is_open() {
             if let Some(snapshot) = &self.album_snapshot {
+                let layout = self.album_dialog.layout(self.size[0], self.size[1]);
+                self.album_strip_pressed = if layout.strip_prev.contains(point[0], point[1]) {
+                    Some(-1)
+                } else if layout.strip_next.contains(point[0], point[1]) {
+                    Some(1)
+                } else {
+                    None
+                };
                 let changed = self
                     .album_dialog
                     .handle_pointer_down(point, self.size, snapshot);
@@ -1847,13 +1888,24 @@ impl NeighborhoodShell {
             };
         }
         if self.album_dialog.is_open() {
+            let strip_pressed = self.album_strip_pressed.take();
+            let layout = self.album_dialog.layout(self.size[0], self.size[1]);
             let cmds = self
                 .album_snapshot
                 .clone()
                 .map(|snap| self.album_dialog.handle_pointer_up(point, self.size, &snap))
                 .unwrap_or_default();
+            if let Some(snap) = &self.album_snapshot {
+                let max_scroll = snap.entries.len().saturating_sub(layout.thumb_slots.len());
+                if strip_pressed == Some(-1) && layout.strip_prev.contains(point[0], point[1]) {
+                    self.album_strip_scroll = self.album_strip_scroll.saturating_sub(1);
+                } else if strip_pressed == Some(1) && layout.strip_next.contains(point[0], point[1])
+                {
+                    self.album_strip_scroll = (self.album_strip_scroll + 1).min(max_scroll);
+                }
+            }
             let out = self.execute_album_commands(cmds);
-            self.hydrate_album_images_around_selection();
+            self.hydrate_album_images();
             return out;
         }
         if let ActiveScreen::Lot(session) = &mut self.screen {
@@ -2722,19 +2774,29 @@ impl NeighborhoodShell {
                     .into(),
             );
         }
-        if let Ok(Some(trip)) =
-            vm_travel::inspect_active_trip(&self.store, &self.neighborhood_id, lot_id)
-        {
-            return Err(format!(
-                "lot {lot_id} has an active travel trip to lot {}; resume or abort the trip before restoring a save slot",
-                trip.destination_house
-            ));
-        }
         let snapshot = self
             .store
             .load_lot_snapshot(&self.neighborhood_id, lot_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
+        let has_trvl_envelope = snapshot
+            .saved_lot
+            .as_deref()
+            .is_some_and(|bytes| bytes.len() >= 4 && &bytes[0..4] == b"TRVL");
+        let secondary_dest = snapshot
+            .neighborhood
+            .family_in(lot_id)
+            .map(|(_, f)| f.secondary_house())
+            .filter(|&d| d != 0);
+        if has_trvl_envelope || secondary_dest.is_some() {
+            let dest_detail = match secondary_dest {
+                Some(dest) => format!(" to lot {dest}"),
+                None => String::new(),
+            };
+            return Err(format!(
+                "lot {lot_id} has an active travel trip{dest_detail}; resume or abort the trip before restoring a save slot"
+            ));
+        }
         let real_instance_id = snapshot.neighborhood.instance_id;
         let real_revision = snapshot.neighborhood.revision;
 
@@ -4170,9 +4232,12 @@ impl NeighborhoodShell {
             .family_token(&nh_id, family_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("family {family_id} not found in neighborhood {nh_id:?}"))?;
-        let snapshot = self.build_album_snapshot(&nh_id, family_id, None)?;
+        let (snapshot, has_image) = self.build_album_snapshot(&nh_id, family_id, None)?;
         self.album_token = Some(token);
         self.album_neighborhood_id = Some(nh_id);
+        self.album_has_image = has_image;
+        self.album_strip_scroll = 0;
+        self.album_strip_pressed = None;
         self.album_dialog.open(&snapshot);
         self.album_snapshot = Some(snapshot);
         Ok(())
@@ -4184,6 +4249,9 @@ impl NeighborhoodShell {
         self.album_snapshot = None;
         self.album_token = None;
         self.album_neighborhood_id = None;
+        self.album_has_image.clear();
+        self.album_strip_scroll = 0;
+        self.album_strip_pressed = None;
     }
 
     fn build_album_snapshot(
@@ -4191,7 +4259,7 @@ impl NeighborhoodShell {
         nh_id: &str,
         family_id: u16,
         selected_hint: Option<PhotoId>,
-    ) -> Result<AlbumSnapshot, String> {
+    ) -> Result<(AlbumSnapshot, BTreeSet<PhotoId>), String> {
         let summaries = self
             .store
             .albums()
@@ -4207,10 +4275,28 @@ impl NeighborhoodShell {
             .and_then(|sel| summaries.iter().position(|s| s.id == sel.0))
             .unwrap_or(0);
         let (win_start, win_end) = album_hydration_window(summaries.len(), focus_idx);
+        let visible_slots = self
+            .album_dialog
+            .layout(self.size[0], self.size[1])
+            .thumb_slots
+            .len();
+        let strip_start = self
+            .album_strip_scroll
+            .min(summaries.len().saturating_sub(visible_slots));
+        let strip_end = (strip_start + visible_slots + 2).min(summaries.len());
         let mut entries = Vec::with_capacity(summaries.len());
+        let mut has_image = BTreeSet::new();
         for (idx, s) in summaries.into_iter().enumerate() {
-            let image = if s.image_dimensions.is_some() && idx >= win_start && idx < win_end {
-                self.store
+            let pid = PhotoId(s.id);
+            let entry_has_img = s.image_dimensions.is_some();
+            if entry_has_img {
+                has_image.insert(pid);
+            }
+            let in_sel = idx >= win_start && idx < win_end;
+            let in_strip = idx >= strip_start && idx < strip_end;
+            let (image, thumbnail) = if entry_has_img && (in_sel || in_strip) {
+                let loaded = self
+                    .store
                     .albums()
                     .get(nh_id, family_id, s.id)
                     .map_err(|e| e.to_string())?
@@ -4219,56 +4305,130 @@ impl NeighborhoodShell {
                         width: img.width,
                         height: img.height,
                         rgba: img.to_rgba(),
-                    })
+                    });
+                let thumb = loaded
+                    .as_ref()
+                    .map(|img| downscale_album_thumbnail(img, 78, 60));
+                if in_sel {
+                    (loaded, thumb)
+                } else {
+                    (None, thumb)
+                }
             } else {
-                None
+                (None, None)
             };
             entries.push(AlbumEntry {
-                id: PhotoId(s.id),
+                id: pid,
                 title: s.title,
                 caption: s.caption,
                 image,
-                thumbnail: None,
+                thumbnail,
                 sim_day: s.sim_day,
             });
         }
-        Ok(AlbumSnapshot {
-            family_name,
-            entries,
-            can_capture_snapshot: matches!(self.screen, ActiveScreen::Lot(_)),
-        })
+        Ok((
+            AlbumSnapshot {
+                family_name,
+                entries,
+                can_capture_snapshot: matches!(self.screen, ActiveScreen::Lot(_)),
+            },
+            has_image,
+        ))
     }
 
-    fn hydrate_album_images_around_selection(&mut self) {
+    fn sync_album_strip_scroll_to_selection(&mut self) {
+        let Some(selected) = self.album_dialog.selected_id() else {
+            return;
+        };
+        let Some(snapshot) = &self.album_snapshot else {
+            return;
+        };
+        let total = snapshot.entries.len();
+        let visible_slots = self
+            .album_dialog
+            .layout(self.size[0], self.size[1])
+            .thumb_slots
+            .len();
+        if visible_slots == 0 || total == 0 {
+            self.album_strip_scroll = 0;
+            return;
+        }
+        let max_scroll = total.saturating_sub(visible_slots);
+        if let Some(idx) = snapshot.entries.iter().position(|e| e.id == selected) {
+            if idx < self.album_strip_scroll {
+                self.album_strip_scroll = idx;
+            } else if idx >= self.album_strip_scroll + visible_slots {
+                self.album_strip_scroll = idx + 1 - visible_slots;
+            }
+        }
+        self.album_strip_scroll = self.album_strip_scroll.min(max_scroll);
+    }
+
+    fn hydrate_album_images(&mut self) {
         let (Some(nh_id), Some(token)) = (self.album_neighborhood_id.clone(), self.album_token)
         else {
             return;
         };
-        let Some(selected) = self.album_dialog.selected_id() else {
-            return;
-        };
+        let visible_slots = self
+            .album_dialog
+            .layout(self.size[0], self.size[1])
+            .thumb_slots
+            .len();
+        let selected = self.album_dialog.selected_id();
         let Some(snapshot) = self.album_snapshot.as_mut() else {
             return;
         };
-        let Some(focus_idx) = snapshot.entries.iter().position(|e| e.id == selected) else {
+        let total = snapshot.entries.len();
+        if total == 0 {
+            self.album_strip_scroll = 0;
             return;
-        };
-        let (win_start, win_end) = album_hydration_window(snapshot.entries.len(), focus_idx);
+        }
+        let focus_idx = selected
+            .and_then(|sel| snapshot.entries.iter().position(|e| e.id == sel))
+            .unwrap_or(0);
+        let (win_start, win_end) = album_hydration_window(total, focus_idx);
+        let max_scroll = total.saturating_sub(visible_slots);
+        self.album_strip_scroll = self.album_strip_scroll.min(max_scroll);
+        let strip_start = self.album_strip_scroll.saturating_sub(1);
+        let strip_end = (self.album_strip_scroll + visible_slots + 2).min(total);
         for (idx, entry) in snapshot.entries.iter_mut().enumerate() {
-            if idx >= win_start && idx < win_end {
-                if entry.image.is_none()
+            let in_sel = idx >= win_start && idx < win_end;
+            let in_strip = idx >= strip_start && idx < strip_end;
+            let has_img = self.album_has_image.contains(&entry.id);
+            if in_sel {
+                if has_img
+                    && entry.image.is_none()
                     && let Ok(Some(photo)) =
                         self.store.albums().get(&nh_id, token.family_id, entry.id.0)
+                    && let Some(img) = photo.image
                 {
-                    entry.image = photo.image.map(|img| Image {
+                    let full = Image {
                         width: img.width,
                         height: img.height,
                         rgba: img.to_rgba(),
-                    });
+                    };
+                    if entry.thumbnail.is_none() {
+                        entry.thumbnail = Some(downscale_album_thumbnail(&full, 78, 60));
+                    }
+                    entry.image = Some(full);
                 }
             } else {
-                // Keep memory bounded even for large albums.
+                // Keep full-resolution memory bounded even for large albums.
                 entry.image = None;
+                if in_strip
+                    && has_img
+                    && entry.thumbnail.is_none()
+                    && let Ok(Some(photo)) =
+                        self.store.albums().get(&nh_id, token.family_id, entry.id.0)
+                    && let Some(img) = photo.image
+                {
+                    let full = Image {
+                        width: img.width,
+                        height: img.height,
+                        rgba: img.to_rgba(),
+                    };
+                    entry.thumbnail = Some(downscale_album_thumbnail(&full, 78, 60));
+                }
             }
         }
     }
@@ -4278,12 +4438,16 @@ impl NeighborhoodShell {
         else {
             return Err("Photo Album is not open".into());
         };
-        let snapshot = self.build_album_snapshot(&nh_id, token.family_id, select_id)?;
+        let (snapshot, has_image) =
+            self.build_album_snapshot(&nh_id, token.family_id, select_id)?;
+        self.album_has_image = has_image;
         self.album_dialog.sync_snapshot(&snapshot);
         if let Some(id) = select_id {
             self.album_dialog.select_entry(&snapshot, id);
         }
         self.album_snapshot = Some(snapshot);
+        self.sync_album_strip_scroll_to_selection();
+        self.hydrate_album_images();
         Ok(())
     }
 
@@ -4297,7 +4461,8 @@ impl NeighborhoodShell {
             })
             .unwrap_or_default();
         let out = self.execute_album_commands(cmds);
-        self.hydrate_album_images_around_selection();
+        self.sync_album_strip_scroll_to_selection();
+        self.hydrate_album_images();
         out
     }
 
@@ -4324,7 +4489,8 @@ impl NeighborhoodShell {
                 if let Some(snap) = &self.album_snapshot {
                     self.album_dialog.select_entry(snap, id);
                 }
-                self.hydrate_album_images_around_selection();
+                self.sync_album_strip_scroll_to_selection();
+                self.hydrate_album_images();
                 ShellOutcome::redraw()
             }
             AlbumCommand::CaptureSnapshot => {
@@ -4500,17 +4666,30 @@ impl NeighborhoodShell {
         if self.kind != NeighborhoodKind::MagicTown {
             return None;
         }
-        // Place the Family Bin button in the open left margin of `TravelChrome`'s top bar
-        // (left_pad is 78px on native viewports) so Magic Town residential move-in remains
-        // directly reachable from the map without overlapping any TravelChrome control.
-        let btn_w = if layout.compact { 32 } else { 53 };
-        let btn_h = (layout.bar_rect.height - 6).clamp(0, 56);
-        let x = layout.bar_rect.x + if layout.compact { 2 } else { 12 };
-        let y = (layout.bar_rect.height - btn_h) / 2;
-        if btn_w <= 0 || btn_h <= 0 {
-            return None;
-        }
-        let rect = Rect::new(x, y, btn_w, btn_h);
+        // On native viewports (>= 800px), place the Family Bin button in the open
+        // 78px left margin of `TravelChrome`'s top bar. On compact viewports
+        // (< 800px), top bar controls start at x=4, so dock the compact button on
+        // the open right side of `filter_strip_rect` (Magic Town only has 2 filter
+        // chips on the left) so Family Bin stays reachable at every viewport width.
+        let rect = if layout.compact {
+            let btn_w = 54.min((layout.filter_strip_rect.width - 8).max(0));
+            let btn_h = (layout.filter_strip_rect.height - 4).clamp(0, 26);
+            let x = layout.filter_strip_rect.x + layout.filter_strip_rect.width - btn_w - 4;
+            let y = layout.filter_strip_rect.y + (layout.filter_strip_rect.height - btn_h) / 2;
+            if btn_w <= 0 || btn_h <= 0 {
+                return None;
+            }
+            Rect::new(x, y, btn_w, btn_h)
+        } else {
+            let btn_w = 53;
+            let btn_h = (layout.bar_rect.height - 6).clamp(0, 56);
+            let x = layout.bar_rect.x + 12;
+            let y = (layout.bar_rect.height - btn_h) / 2;
+            if btn_w <= 0 || btn_h <= 0 {
+                return None;
+            }
+            Rect::new(x, y, btn_w, btn_h)
+        };
         // Never overlap any TravelChrome control.
         if layout.controls.iter().any(|c| {
             rect.x < c.rect.x + c.rect.width
@@ -4535,11 +4714,13 @@ impl NeighborhoodShell {
         } else {
             0
         };
-        if let Some(img) = self
-            .chrome_art
-            .image(sims_ui::neighborhood::art_id::SELECT_FAMILY)
+        if !layout.compact
+            && let Some(img) = self
+                .chrome_art
+                .image(sims_ui::neighborhood::art_id::SELECT_FAMILY)
             && img.width >= 4
             && img.height > 0
+            && rect.height >= img.height as i32
         {
             let sw = (img.width / 4) as i32;
             let sh = img.height as i32;
@@ -4557,7 +4738,8 @@ impl NeighborhoodShell {
             };
             frame.fill(rect, fill);
             if let Some(font) = self.chrome_art.font(10) {
-                font.draw(frame, "Fam", [rect.x + 6, rect.y + 18], [245, 245, 255]);
+                let text_y = rect.y + ((rect.height - 10) / 2).max(2);
+                font.draw(frame, "Fam", [rect.x + 12, text_y], [245, 245, 255]);
             }
         }
     }
@@ -4771,14 +4953,11 @@ impl NeighborhoodShell {
                 .get(&home_family_id)
                 .map(|f| f.members.clone())
                 .unwrap_or_default();
-            let selected_guid = {
-                let sel = world.globals.get(1).copied().unwrap_or(0) as u16;
-                world
-                    .objects
-                    .get(&sel)
-                    .map(|o| o.guid)
-                    .filter(|g| fam_members.contains(g))
-            };
+            let selected_guid = world
+                .selected()
+                .and_then(|sel| world.objects.get(&sel))
+                .map(|o| o.guid)
+                .filter(|g| fam_members.contains(g));
             selected_guid
                 .or_else(|| fam_members.first().copied())
                 .ok_or_else(|| format!("household {home_family_id} has no living members"))?
@@ -4939,7 +5118,7 @@ impl NeighborhoodShell {
                     if let Err(err) = self.depart_to_destination(pending.request) {
                         if let ActiveScreen::Lot(session) = &mut self.screen {
                             session.game.set_note(format!("Travel failed: {err}"));
-                        } else {
+                        } else if self.note.is_none() {
                             self.note = Some(format!("Travel failed: {err}"));
                         }
                     }
@@ -4956,6 +5135,7 @@ impl NeighborhoodShell {
         &mut self,
         request: TravelRequest,
     ) -> Result<TravelSession, String> {
+        self.note = None;
         self.flush_background_saves();
         let nh_id = match &self.screen {
             ActiveScreen::Lot(session) => {
@@ -5092,6 +5272,7 @@ impl NeighborhoodShell {
     /// Returns the traveling household from the active destination lot back to
     /// their reconciled home lot via [`vm_travel::return_from_destination`].
     pub fn return_from_destination(&mut self) -> Result<ReturnReport, String> {
+        self.note = None;
         let (nh_id, trip) = match &self.screen {
             ActiveScreen::Lot(session) => {
                 let Some(trip) = session.active_trip.clone() else {
@@ -5371,6 +5552,32 @@ fn album_hydration_window(total: usize, focus_idx: usize) -> (usize, usize) {
         .saturating_sub(half)
         .min(total - ALBUM_IMAGE_WINDOW);
     (start, start + ALBUM_IMAGE_WINDOW)
+}
+
+fn downscale_album_thumbnail(src: &Image, max_w: u32, max_h: u32) -> Image {
+    if src.width == 0 || src.height == 0 || (src.width <= max_w && src.height <= max_h) {
+        return src.clone();
+    }
+    let scale = (max_w as f32 / src.width as f32).min(max_h as f32 / src.height as f32);
+    let dst_w = ((src.width as f32 * scale).round() as u32).clamp(1, max_w);
+    let dst_h = ((src.height as f32 * scale).round() as u32).clamp(1, max_h);
+    let mut rgba = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    for dy in 0..dst_h {
+        let sy = ((u64::from(dy) * u64::from(src.height)) / u64::from(dst_h))
+            .min(u64::from(src.height.saturating_sub(1))) as usize;
+        for dx in 0..dst_w {
+            let sx = ((u64::from(dx) * u64::from(src.width)) / u64::from(dst_w))
+                .min(u64::from(src.width.saturating_sub(1))) as usize;
+            let s = (sy * src.width as usize + sx) * 4;
+            let d = (dy as usize * dst_w as usize + dx as usize) * 4;
+            rgba[d..d + 4].copy_from_slice(&src.rgba[s..s + 4]);
+        }
+    }
+    Image {
+        width: dst_w,
+        height: dst_h,
+        rgba,
+    }
 }
 
 fn vacation_lot_matches_lodging(lot: &MapLot, lodging: sims_ui::travel::VacationLodging) -> bool {

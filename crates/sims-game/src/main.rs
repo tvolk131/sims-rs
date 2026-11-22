@@ -744,6 +744,8 @@ struct App {
     /// shortcuts (`Ctrl/Cmd+Z` Undo, `Ctrl+Y`/`Ctrl/Cmd+Shift+Z` Redo).
     ctrl_or_cmd_held: bool,
     shift_held: bool,
+    /// Fatal background startup error propagated as a nonzero exit status from `run()`.
+    startup_error: Option<String>,
 }
 
 /// Filters startup `WindowEvent::Focused` notifications so ordinary window
@@ -1295,7 +1297,9 @@ impl App {
                             if let Session::Shell(shell) = &mut self.session
                                 && shell.active_trip().is_some()
                             {
-                                if let Err(err) = shell.return_from_destination() {
+                                if let Err(err) = shell.return_from_destination()
+                                    && (shell.screen() == ScreenKind::Lot || shell.note().is_none())
+                                {
                                     shell.set_note(format!("Could not return home: {err}"));
                                 }
                                 self.drain_shell_audio();
@@ -1386,10 +1390,13 @@ impl App {
                 }
                 Ok(Err(err)) => {
                     eprintln!("sims-game: startup failed: {err}");
+                    self.startup_error = Some(err);
                     event_loop.exit();
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    eprintln!("sims-game: startup worker disconnected");
+                    let err = "startup worker disconnected".to_owned();
+                    eprintln!("sims-game: {err}");
+                    self.startup_error = Some(err);
                     event_loop.exit();
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -2486,6 +2493,7 @@ fn run() -> Result<(), String> {
             saves: config.saves,
             ctrl_or_cmd_held: false,
             shift_held: false,
+            startup_error: None,
         };
         let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
         return event_loop.run_app(&mut app).map_err(|e| e.to_string());
@@ -2576,9 +2584,14 @@ fn run() -> Result<(), String> {
         saves: config.saves,
         ctrl_or_cmd_held: false,
         shift_held: false,
+        startup_error: None,
     };
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
-    event_loop.run_app(&mut app).map_err(|e| e.to_string())
+    event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
+    if let Some(err) = app.startup_error {
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// The name of `house`'s save in the saves file: its full path, so houses

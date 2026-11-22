@@ -716,10 +716,45 @@ fn wave2_travel_shell_shop_picker_crash_recovery_and_community_edit() {
         "immediate return_from_destination must reconcile MagiCoins debit onto home lot"
     );
 
-    // Desktop shortcut helper: open_default_travel_dialog + cycle_travel_destination + confirm!
+    // Desktop shortcut helper: select the second adult household member (`Bella`),
+    // verify `open_default_travel_dialog` picks THAT selected Sim (via `World::selected()`),
+    // and verify `cycle_travel_destination` switches destinations cleanly.
+    let second_adult_guid = {
+        let game = shell.game_mut().expect("home game");
+        let world = game.lot().world();
+        let (&obj_id, obj) = world
+            .objects
+            .iter()
+            .find(|(_, o)| {
+                o.person.is_some()
+                    && goth_members.contains(&o.guid)
+                    && o.guid != goth_members[0]
+                    && o.person
+                        .as_ref()
+                        .is_some_and(|p| p.data.get(58).copied().unwrap_or(27) >= 18)
+            })
+            .expect("Goth household has a second adult member (Bella)");
+        let guid = obj.guid;
+        game.select(obj_id);
+        assert_eq!(
+            game.lot().world().selected(),
+            Some(obj_id),
+            "Game::select must mark Bella as World::selected()"
+        );
+        guid
+    };
     let default_plan = shell
         .open_default_travel_dialog()
         .expect("desktop open_default_travel_dialog on occupied home lot");
+    assert_eq!(
+        default_plan
+            .members
+            .iter()
+            .map(|m| m.guid)
+            .collect::<Vec<_>>(),
+        vec![second_adult_guid],
+        "desktop solo travel shortcut must send the currently selected Sim, not always member 0"
+    );
     assert!(shell.travel_dialog_open());
     assert!(shell.cycle_travel_destination(1));
     let cycled_dest = shell.travel_dialog_state().unwrap().destination;
@@ -735,6 +770,31 @@ fn wave2_travel_shell_shop_picker_crash_recovery_and_community_edit() {
         "cycling destination in TravelDialog must switch to another eligible destination"
     );
     shell.close_travel_dialog();
+
+    // Verify Magic Town Family Bin button stays reachable at compact widths (< 800px).
+    shell.leave_lot(false).expect("leave Goth lot 5");
+    shell.handle_travel_command(TravelCommand::SwitchDestination(Destination::MagicTown));
+    shell.resize([640, 480]);
+    shell.render();
+    let compact_layout = sims_ui::travel::TravelLayout::compute(640, 480, shell.travel_state());
+    assert!(compact_layout.compact);
+    let compact_fb_pt = [
+        compact_layout.filter_strip_rect.x + compact_layout.filter_strip_rect.width - 20,
+        compact_layout.filter_strip_rect.y + compact_layout.filter_strip_rect.height / 2,
+    ];
+    shell.press(compact_fb_pt);
+    shell.release(compact_fb_pt);
+    assert_eq!(
+        shell.screen(),
+        ScreenKind::FamilyBin,
+        "Magic Town Family Bin button must remain clickable at compact widths (< 800px)"
+    );
+    shell.close_family_bin();
+    shell.resize([800, 600]);
+    shell.handle_travel_command(TravelCommand::ReturnToNeighborhood);
+    shell
+        .enter_lot(5)
+        .expect("re-enter Goth lot 5 for crash-recovery test");
 
     // --- 3D. Crash recovery across restart (`inspect_active_trip` + `resume_active_trip`) ---
     shell
@@ -1054,6 +1114,22 @@ fn wave2_large_photo_album_60_snapshots_and_loading_presenter() {
         "selected entry 0 must have hydrated image"
     );
     let last_id = snap.entries[59].id;
+    // Scroll the thumbnail strip forward by 20 entries WITHOUT changing selection,
+    // verifying visible strip entries receive downscaled thumbnails (never blank)
+    // while selection stays on entry 0.
+    shell.hover([100, 100]);
+    for _ in 0..20 {
+        assert!(shell.wheel(-1.0));
+    }
+    let after_scroll = shell.album_snapshot().expect("scrolled snapshot");
+    assert!(
+        after_scroll.entries[0].image.is_some(),
+        "selection image must remain hydrated while scrolling strip"
+    );
+    assert!(
+        after_scroll.entries[20].thumbnail.is_some(),
+        "scrolled visible thumbnail slot must have a hydrated thumbnail"
+    );
     shell.execute_album_command(AlbumCommand::SelectEntry(last_id));
     let after_select = shell.album_snapshot().expect("hydrated snapshot");
     assert!(
@@ -1066,4 +1142,45 @@ fn wave2_large_photo_album_60_snapshots_and_loading_presenter() {
         59
     );
     shell.close_photo_album();
+
+    // Verify Save Manager refuses to restore over a lot holding a persisted (even corrupt) `TRVL` envelope.
+    shell
+        .enter_lot(5)
+        .expect("enter Goth lot 5 to save a manual slot");
+    shell
+        .enqueue_background_lot_save(sims_sim::autosave::SaveTarget::Manual)
+        .expect("enqueue manual lot save");
+    shell.flush_background_saves();
+    shell.leave_lot(true).expect("leave Goth lot 5");
+    let nbhd = shell.stored_neighborhood().clone();
+    shell
+        .store()
+        .save_lot_and_neighborhood(
+            "UserData",
+            5,
+            b"TRVL\x01\x00\x00\x00corrupt-envelope",
+            &nbhd,
+        )
+        .expect("plant corrupt TRVL envelope on lot 5");
+    assert!(shell.open_save_manager(None));
+    shell.handle_save_manager_command(sims_ui::saves::SaveManagerCommand::LoadSlot {
+        slot_id: "manual".into(),
+    });
+    assert_eq!(
+        shell.screen(),
+        ScreenKind::Neighborhood,
+        "Save Manager must refuse restoring a slot over any TRVL-prefixed saved lot"
+    );
+    let still_trvl = shell
+        .store()
+        .load_lot_snapshot("UserData", 5)
+        .expect("reload lot 5")
+        .expect("snapshot")
+        .saved_lot
+        .expect("saved lot");
+    assert!(
+        still_trvl.starts_with(b"TRVL"),
+        "refused restore must preserve the persisted TRVL envelope untouched"
+    );
+    shell.close_save_manager();
 }
