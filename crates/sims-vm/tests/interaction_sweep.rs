@@ -1077,7 +1077,24 @@ fn studio_town_house81_celebrity_pooled_stars_and_downtown_house21_bar_avoid_uns
         let active_family = (lot.world().globals.get(10).copied().unwrap_or(0) != 0
             && lot.world().globals.get(9).copied().unwrap_or(0) == 0)
             .then_some(family_zero.as_slice());
+        let str130_clips: BTreeSet<String> = lot
+            .program()
+            .libraries
+            .get(&lot.program().global)
+            .and_then(|lib| lib.strings.get(&130))
+            .map(|list| {
+                list.iter()
+                    .filter(|name| !name.is_empty())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !str130_clips.is_empty(),
+            "Global.iff STR# 130 (PersonAnimations) must be loaded"
+        );
         let mut tested_bar_orders = 0usize;
+        let mut saw_source2_clip = false;
         for guid in [DTS_BAR_GUID, BARTENDER_GUID] {
             let Some(target_id) = lot
                 .world()
@@ -1136,12 +1153,31 @@ fn studio_town_house81_celebrity_pooled_stars_and_downtown_house21_bar_avoid_uns
                 if let Err(err) = res {
                     panic!("House21 bar 0x{guid:08X} failed at tick {tick}: {err}");
                 }
+                if world.animators.values().any(|a| {
+                    a.foreground
+                        .as_ref()
+                        .is_some_and(|l| str130_clips.contains(&l.clip))
+                        || a.carry
+                            .as_ref()
+                            .is_some_and(|l| str130_clips.contains(&l.clip))
+                        || matches!(
+                            &a.base,
+                            sims_sim::animator::Base::Script { clip, .. }
+                                if str130_clips.contains(clip)
+                        )
+                }) {
+                    saw_source2_clip = true;
+                }
             }
             tested_bar_orders += 1;
         }
         assert!(
             tested_bar_orders >= 1,
             "House21 must exercise at least one bar Order Drink interaction"
+        );
+        assert!(
+            saw_source2_clip,
+            "House21 Order Drink must start at least one Global.iff STR# 130 (source 2) animation clip"
         );
     }
 }
@@ -1315,6 +1351,21 @@ fn complete_collection_interactive_object_sweep() {
     eprintln!(
         "\nTOTAL: objects={tot_obj} entries={tot_ent} clean={tot_clean} unsupported={tot_unsup} pie_unsup={tot_pie} distinct_unsupported={}",
         ranked.len()
+    );
+    for s in &all_stats {
+        if !s.lot_name.contains("House90") {
+            assert!(
+                s.skipped_reason.is_none() && s.entries_tested > 0,
+                "expected active lot {} to contribute swept interactions (skipped={:?}, entries={})",
+                s.lot_name,
+                s.skipped_reason,
+                s.entries_tested
+            );
+        }
+    }
+    assert!(
+        tot_ent >= 1800,
+        "expected >= 1800 swept interactions across Complete Collection lots (baseline 1833), got {tot_ent}"
     );
     assert_eq!(
         tot_unsup, 0,

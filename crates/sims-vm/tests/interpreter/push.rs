@@ -637,34 +637,110 @@ fn the_temps_the_check_tree_changes_are_put_back() {
 }
 
 #[test]
-fn idle_for_input_missing_action_tree_wakes_and_cancels_cleanly() {
-    let mut fx = ordered();
-    fx.sim_mut().person.as_mut().unwrap().queue[0].action = 0x10ff;
-    // Set a positive sleep countdown to verify wake (0x452b98 -> 0x44574b)
-    // clears it before 0x47484a rejects the missing tree.
-    fx.sim_mut().set_countdown(5);
-    let initial_count = fx.sim().stack[0].parameters[0];
-    let before_uses = fx.world.objects[&LAMP].data[62];
-    let (status, asked) = idle_turn(&mut fx);
-    assert_eq!(status, Status::Yielded);
-    assert_eq!(fx.sim().countdown(), None);
-    assert_eq!(
-        asked
-            .iter()
-            .map(|a| (a.object, a.function))
-            .collect::<Vec<_>>(),
-        [(LAMP, 4)]
-    );
-    // Count parameter and primitive_state are untouched; action is removed
-    // from the queue and never becomes active or counted as an object use.
-    assert_eq!(fx.sim().stack.len(), 1);
-    assert_eq!(fx.sim().stack[0].parameters[0], initial_count);
-    assert_eq!(fx.sim().stack[0].primitive_state, 0);
-    assert_ne!(fx.sim().data[8] & 0x40, 0);
-    assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
-    assert_eq!(fx.sim().person.as_ref().unwrap().active.target, 0);
-    assert!(fx.sim().person.as_ref().unwrap().object_uses.is_empty());
-    assert_eq!(fx.world.objects[&LAMP].data[62], before_uses);
+fn idle_for_input_declined_action_push_wakes_and_cancels_with_actor_stack_object() {
+    // 0x47484a returns 0 (causing 0x45dcb2 -> 0x45dcb6 cancellation) for:
+    // 1. missing tree (0x4748b0),
+    // 2. empty BHAV (0x474921),
+    // 3. kind-4 indexed BHAV with negative entry argument (0x474917).
+    const CANCEL_TREE: u16 = 4310;
+    const EMPTY_TREE: u16 = 4311;
+    const KIND4_TREE: u16 = 4312;
+
+    for (label, action_tree, arg0) in [
+        ("missing tree", 0x10ffu16, 0i16),
+        ("empty BHAV", EMPTY_TREE, 0i16),
+        ("negative kind-4 entry", KIND4_TREE, -1i16),
+    ] {
+        let mut fx = ordered();
+        // Attach a real function 4 (cancelled) callback on LAMP that records
+        // its `stack_object` into LAMP's attribute 0.
+        fx.add(
+            LAMP_FILE,
+            CANCEL_TREE,
+            tree(vec![assign(
+                scope::MY_ATTRIBUTES,
+                0,
+                scope::STACK_OBJECT,
+                0,
+                RETURN_TRUE,
+            )]),
+        );
+        let lamp_chunk = fx
+            .catalog
+            .object(fx.world.objects[&LAMP].guid)
+            .unwrap()
+            .chunk;
+        let callbacks = fx
+            .program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .callbacks
+            .entry(lamp_chunk)
+            .or_default();
+        if callbacks.len() <= 4 {
+            callbacks.resize(
+                5,
+                sims_formats::execution::ObjectFunction {
+                    condition: 0,
+                    action: 0,
+                },
+            );
+        }
+        callbacks[4].action = CANCEL_TREE;
+        fx.add(LAMP_FILE, EMPTY_TREE, tree(vec![]));
+        let mut kind4 = tree(vec![assign(
+            scope::TEMPS,
+            0,
+            scope::LITERAL,
+            1,
+            RETURN_TRUE,
+        )]);
+        kind4.kind = 4;
+        fx.add(LAMP_FILE, KIND4_TREE, kind4);
+
+        let queued = &mut fx.sim_mut().person.as_mut().unwrap().queue[0];
+        queued.action = action_tree;
+        queued.args[0] = arg0;
+        // Set a positive sleep countdown to verify wake (0x452b98 -> 0x44574b)
+        // clears it before 0x47484a rejects the push.
+        fx.sim_mut().set_countdown(5);
+        let initial_count = fx.sim().stack[0].parameters[0];
+        let before_uses = fx.world.objects[&LAMP].data[62];
+        let (status, asked) = idle_turn(&mut fx);
+        assert_eq!(status, Status::Yielded, "{label}");
+        assert_eq!(fx.sim().countdown(), None, "{label}");
+        assert_eq!(
+            asked
+                .iter()
+                .map(|a| (a.object, a.function))
+                .collect::<Vec<_>>(),
+            [(LAMP, 4)],
+            "{label}"
+        );
+        assert_eq!(
+            fx.world.objects[&LAMP].attributes[0], SIM as i16,
+            "{label}: cancel callback must see actor as stack_object"
+        );
+        assert_eq!(fx.sim().stack.len(), 1, "{label}");
+        assert_eq!(fx.sim().stack[0].parameters[0], initial_count, "{label}");
+        assert_eq!(fx.sim().stack[0].primitive_state, 0, "{label}");
+        assert_ne!(fx.sim().data[8] & 0x40, 0, "{label}");
+        assert!(
+            fx.sim().person.as_ref().unwrap().queue.is_empty(),
+            "{label}"
+        );
+        assert_eq!(
+            fx.sim().person.as_ref().unwrap().active.target,
+            0,
+            "{label}"
+        );
+        assert!(
+            fx.sim().person.as_ref().unwrap().object_uses.is_empty(),
+            "{label}"
+        );
+        assert_eq!(fx.world.objects[&LAMP].data[62], before_uses, "{label}");
+    }
 }
 
 #[test]

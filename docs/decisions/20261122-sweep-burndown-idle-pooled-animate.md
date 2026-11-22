@@ -77,11 +77,13 @@ calls `0x452b98`:
 
 ## Decision
 
-1. **`crates/sims-vm/src/primitives/idle.rs`:** Wake `me`, attempt `enter_on`,
-   and on `Err(Trap::MissingTree { .. })` cancel via `callback(target, 4, me)`
-   and return `Flow::Yield` (with `put_back_temps` still running in
-   `start_queued`). Other traps (e.g., `StackOverflow`, `Invalid`) still
-   propagate.
+1. **`crates/sims-vm/src/primitives/idle.rs`, `interpreter.rs`:** Wake `me`,
+   attempt `try_enter_on` (returning `Ok(false)` on the three non-throwing
+   rejections of `0x47484a`: missing tree `0x4748b0`, empty BHAV `0x474921`,
+   and negative kind-4 entry `0x474917`), and on `Ok(false)` cancel via
+   `callback(target, 4, me)` and return `Flow::Yield` (with `put_back_temps`
+   still running in `start_queued`). Other traps (e.g., `StackOverflow`,
+   `Invalid`) still propagate.
 2. **`crates/sims-vm/src/placement.rs`, `selection.rs`, `removal.rs`:** Derive
    the star-marker pool directly from `World::objects` + `World::order` (no
    `sims-sim` schema or `Saved` format change needed): an off-lot uncontained
@@ -89,7 +91,9 @@ calls `0x452b98`:
    `create` prepends to `world.order`, scanning `world.order` front-to-back
    matches `Sims.exe`'s LIFO `pool_avail.back()` order and persists across
    save/restore automatically. Gate `PortraitPutPlan::FastPlaced` when a person
-   would take a head marker so portrait placement always uses a real tile.
+   would take a head marker so portrait placement always uses a real tile, and
+   use `off_lot` (`0x422632`) in `move_indicators` (`0x446727`) and `mark_star`
+   so border-tile Sims on smaller lots keep their head slot untouched.
 3. **`crates/sims-vm/src/primitives/animate.rs`:** Add `GLOBAL_CLIPS = 128`
    (source `1`) and `PERSON_CLIPS = 130` (source `2`) in `Machine::clip`.
 4. **Verification & regression floor (`crates/sims-vm/tests/interaction_sweep.rs`):**

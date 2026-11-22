@@ -178,29 +178,26 @@ impl Machine<'_, '_> {
             let tree = action.action;
             // 0x45e59b -> 0x452b98: wakes the person (0x44574b) before trying
             // to push the target's tree (0x47484a). When the tree is missing,
-            // 0x47484a returns 0 without touching object_uses or active, and
-            // 0x45dcb2 falls through to the cancel branch at 0x45dcb6.
+            // empty, or has a negative kind-4 entry, 0x47484a returns 0 without
+            // touching object_uses or active, and 0x45dcb2 falls through to the
+            // cancel branch at 0x45dcb6.
             self.wake(me)?;
-            match self.enter_on(target, tree, &action.args) {
-                Ok(()) => {
-                    self.count_use(target, false)?;
-                    let last_result = self.me()?.last_result;
-                    self.set_action(action, last_result)?;
-                    let object = self.me_mut()?;
-                    let idle = &mut object.stack[frame];
-                    idle.parameters[index] = 0;
-                    idle.primitive_state = STARTED;
-                    if let Some(top) = object.stack.last_mut() {
-                        top.stack_object = target as i16;
-                    }
-                    self.flags_mut()?[FLAGS] |= INTERRUPTED;
-                    Flow::Pushed
+            if self.try_enter_on(target, tree, &action.args)? {
+                self.count_use(target, false)?;
+                let last_result = self.me()?.last_result;
+                self.set_action(action, last_result)?;
+                let object = self.me_mut()?;
+                let idle = &mut object.stack[frame];
+                idle.parameters[index] = 0;
+                idle.primitive_state = STARTED;
+                if let Some(top) = object.stack.last_mut() {
+                    top.stack_object = target as i16;
                 }
-                Err(Trap::MissingTree { .. }) => {
-                    self.cancel_queued_action(target, me)?;
-                    Flow::Yield
-                }
-                Err(trap) => return Err(trap),
+                self.flags_mut()?[FLAGS] |= INTERRUPTED;
+                Flow::Pushed
+            } else {
+                self.cancel_queued_action(target, me)?;
+                Flow::Yield
             }
         } else {
             self.cancel_queued_action(target, me)?;

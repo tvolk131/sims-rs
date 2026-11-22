@@ -289,6 +289,35 @@ fn a_famous_sim_deselected_takes_and_releases_a_star_marker() {
         4
     );
 
+    // Selecting a Sim on a lot smaller than 64 tiles whose position is on the
+    // outer border tile (0x446727 -> 0x422632) leaves its head slot untouched
+    // and does not attach indicator 0.
+    let mut fx = two_residents();
+    fx.program.expansions = 0x40;
+    register_star(&mut fx);
+    fx.world
+        .objects
+        .get_mut(&PERSON)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[81] = 10;
+    asking(&mut fx, |i, world| {
+        i.select(world, Some(PERSON + 1)).unwrap()
+    });
+    let border_star = fx.world.objects[&PERSON].slots[2].object as u16;
+    assert_ne!(border_star, 0);
+    fx.world.size = 32;
+    fx.world.objects.get_mut(&PERSON).unwrap().position = [31 * 16 + 8, 3 * 16 + 8, 1];
+    let first = fx.world.indicators[0];
+    asking(&mut fx, |i, world| i.select(world, Some(PERSON)).unwrap());
+    assert_eq!(
+        fx.world.objects[&PERSON].slots[2].object, border_star as i16,
+        "border-tile Sim on smaller lot must keep its star marker untouched"
+    );
+    assert_eq!(fx.world.objects[&first].data[2], 0);
+
     // A Sim that is not a person still cannot be selected, after the
     // deselection.
     let mut fx = lot_with_person();

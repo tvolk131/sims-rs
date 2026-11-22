@@ -16,7 +16,7 @@
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
-use crate::placement::{Place, capture, head_slot_redraw, on_lot};
+use crate::placement::{Place, capture, head_slot_redraw, off_lot};
 use sims_sim::World;
 
 /// Global 3: the selected Sim's ID, or 0.
@@ -364,7 +364,9 @@ impl Interpreter<'_> {
         }
         let person = world.objects.get(&sim).ok_or_else(missing)?;
         let position = person.position;
-        let on_lot = on_lot([position[0], position[1]]);
+        // 0x446727 -> 0x422632: skip head-slot release and indicator placement
+        // when the Sim stands on or outside the lot's outer border tiles.
+        let on_inner_lot = !off_lot(world, [position[0], position[1]]);
         // Slot 1 as scripts count it is the third the object has: the
         // first names the next object on its tile. The original also
         // asks that the slot's flag 2 is set. A person's constructor sets
@@ -372,7 +374,7 @@ impl Interpreter<'_> {
         // person with the slot is taken to have it. In the trace's memory
         // the two Goths whose slots it holds have the flag there and on
         // no other slot. **Unverified** for any other person.
-        if on_lot && let Some(slot) = person.slots.get(2) {
+        if on_inner_lot && let Some(slot) = person.slots.get(2) {
             let held = u16::try_from(slot.object)
                 .ok()
                 .filter(|&id| id != 0 && world.objects.contains_key(&id));

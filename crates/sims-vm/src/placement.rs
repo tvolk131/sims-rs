@@ -1783,12 +1783,7 @@ impl Interpreter<'_> {
             return Ok(());
         };
         let [p0, p1, level] = position(world, id).map_err(fail)?;
-        let size = i32::from(world.size);
-        let border = |p: i32| {
-            let t = i32::from((p >> 4) as i8);
-            t < 1 || t >= size - 1
-        };
-        if border(p0) || border(p1) {
+        if off_lot(world, [p0, p1]) {
             return Ok(());
         }
         let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
@@ -1861,12 +1856,7 @@ impl Interpreter<'_> {
             self.take_off(world, indicator, true)?;
         }
         let [p0, p1, level] = position(world, id).map_err(fail)?;
-        let size = i32::from(world.size);
-        let border = |p: i32| {
-            let t = i32::from((p >> 4) as i8);
-            t < 1 || t >= size - 1
-        };
-        if border(p0) || border(p1) {
+        if off_lot(world, [p0, p1]) {
             return Ok(());
         }
         let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
