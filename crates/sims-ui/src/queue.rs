@@ -49,6 +49,7 @@ use crate::household::Faces;
 use crate::thumbnail::Thumbnails;
 use sims_formats::saved_objects::Interaction;
 use sims_sim::World;
+use std::collections::BTreeMap;
 
 /// `kIconFrame` and `kQueueCancelOverlay` (`UIGraphics/Res_CPanel.h`,
 /// `Res_Other.h`).
@@ -62,6 +63,10 @@ pub const RESOURCES: [i32; 2] = [FRAME, CANCEL_OVERLAY];
 pub const SIZE: i32 = 45;
 pub const FIRST: [i32; 2] = [32, 32];
 pub const STEP: i32 = 50;
+
+/// Default duration in milliseconds of an action-queue icon slide (`0x4cb1ea`
+/// `[0x6c7834]` = 500 ms, `0x4cb1df..0x4cb30b`).
+pub const SLIDE_DURATION_MS: u32 = 500;
 
 /// The action flag a cancel sets on the running action.
 pub const CANCELLED: u32 = 0x100;
@@ -149,6 +154,19 @@ impl Queue {
             .find(|icon| icon.rect.contains(point[0], point[1]))
     }
 
+    /// Like [`Self::at`], ignoring any icon currently mid-slide (`0x4cb406`:
+    /// `cmp byte ptr [ecx + 0xf0], 0; jne skip`).
+    pub fn at_clickable(
+        &self,
+        point: [i32; 2],
+        slide: &QueueSlideState,
+        now_ms: u32,
+    ) -> Option<&Icon> {
+        self.icons.iter().find(|icon| {
+            !slide.is_sliding(icon.uid, now_ms) && icon.rect.contains(point[0], point[1])
+        })
+    }
+
     /// The GUIDs of the object types whose catalog pictures the icons
     /// show, for [`Thumbnails::read`].
     pub fn objects(&self) -> impl Iterator<Item = u32> + '_ {
@@ -162,6 +180,167 @@ impl Queue {
     pub fn draw(&self, frame: &mut Frame, art: &Art, faces: &Faces, thumbnails: &Thumbnails) {
         for icon in &self.icons {
             draw_icon(frame, art, faces, thumbnails, icon);
+        }
+    }
+}
+
+/// Per-icon linear slide ramp (`0x4cb190..0x4cb30b`, `cRZLinearRamp` at
+/// `[esi + 0xe0]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IconSlide {
+    start: [i32; 2],
+    target: [i32; 2],
+    start_ms: u32,
+    end_ms: u32,
+}
+
+impl IconSlide {
+    fn pos(&self, now_ms: u32) -> [i32; 2] {
+        if now_ms >= self.end_ms || self.end_ms <= self.start_ms {
+            return self.target;
+        }
+        if now_ms <= self.start_ms {
+            return self.start;
+        }
+        let dur = (self.end_ms - self.start_ms) as f64;
+        let rem = (self.end_ms - now_ms) as f64;
+        let t = (1.0 - rem / dur).clamp(0.0, 1.0);
+        // 0x4cb2b4..0x4cb2f5: `round((1 - t) * start + t * target)`
+        let interp = |s: i32, e: i32| -> i32 {
+            ((1.0 - t) * f64::from(s) + t * f64::from(e) + 0.5).floor() as i32
+        };
+        [
+            interp(self.start[0], self.target[0]),
+            interp(self.start[1], self.target[1]),
+        ]
+    }
+
+    fn is_sliding(&self, now_ms: u32) -> bool {
+        now_ms < self.end_ms && self.end_ms > self.start_ms
+    }
+}
+
+/// Pure-state action-queue icon slide-in & slot-shift animator matching
+/// `cWinActionQueueIcon` (`0x4cb190..0x4cb30b`, `0x4cb406`).
+///
+/// Tracks each queued action by its [`Icon::uid`]:
+/// - New actions can slide in from the pie-menu screen position over
+///   [`SLIDE_DURATION_MS`] (500 ms) via [`Self::sync`].
+/// - Existing actions whose target slot shifts left (when the front action
+///   finishes or an earlier action is cancelled) smoothly slide from their
+///   current position to the new slot over [`SLIDE_DURATION_MS`].
+/// - Switching to a different selected Sim snaps all icons immediately
+///   (`0x4cb190`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueSlideState {
+    person: Option<u16>,
+    icons: BTreeMap<i32, IconSlide>,
+}
+
+impl QueueSlideState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Places `uid` immediately at `pos` without sliding (`0x4cb190`).
+    pub fn snap(&mut self, uid: i32, pos: [i32; 2]) {
+        self.icons.insert(
+            uid,
+            IconSlide {
+                start: pos,
+                target: pos,
+                start_ms: 0,
+                end_ms: 0,
+            },
+        );
+    }
+
+    /// Starts a linear slide for `uid` from `from` to `to` over `duration_ms`
+    /// (`0` selects [`SLIDE_DURATION_MS`], matching `0x4cb1e4..0x4cb1ea`).
+    pub fn slide_to(
+        &mut self,
+        uid: i32,
+        from: [i32; 2],
+        to: [i32; 2],
+        now_ms: u32,
+        duration_ms: u32,
+    ) {
+        let dur = if duration_ms == 0 {
+            SLIDE_DURATION_MS
+        } else {
+            duration_ms
+        };
+        if from == to {
+            self.snap(uid, to);
+            return;
+        }
+        self.icons.insert(
+            uid,
+            IconSlide {
+                start: from,
+                target: to,
+                start_ms: now_ms,
+                end_ms: now_ms.saturating_add(dur),
+            },
+        );
+    }
+
+    /// Synchronizes slide ramps with the latest `queue` snapshot at `now_ms`.
+    ///
+    /// When `origin_for_new` is `Some(pos)` (e.g. the pie-menu click position)
+    /// and the selected Sim has not changed, newly added icons slide from `pos`
+    /// to their target slot over [`SLIDE_DURATION_MS`]; otherwise they snap.
+    pub fn sync(&mut self, queue: &Queue, origin_for_new: Option<[i32; 2]>, now_ms: u32) {
+        let same_person = self.person == queue.person && queue.person.is_some();
+        self.person = queue.person;
+        if !same_person {
+            self.icons.clear();
+            for icon in &queue.icons {
+                self.snap(icon.uid, [icon.rect.x, icon.rect.y]);
+            }
+            return;
+        }
+
+        let live_uids: Vec<i32> = queue.icons.iter().map(|i| i.uid).collect();
+        self.icons.retain(|uid, _| live_uids.contains(uid));
+
+        for icon in &queue.icons {
+            let target = [icon.rect.x, icon.rect.y];
+            if let Some(existing) = self.icons.get(&icon.uid).copied() {
+                if existing.target != target {
+                    let cur = existing.pos(now_ms);
+                    self.slide_to(icon.uid, cur, target, now_ms, SLIDE_DURATION_MS);
+                }
+            } else if let Some(from) = origin_for_new {
+                self.slide_to(icon.uid, from, target, now_ms, SLIDE_DURATION_MS);
+            } else {
+                self.snap(icon.uid, target);
+            }
+        }
+    }
+
+    /// Returns the interpolated `[x, y]` top-left position of `uid` at `now_ms`.
+    pub fn position(&self, uid: i32, now_ms: u32) -> Option<[i32; 2]> {
+        self.icons.get(&uid).map(|s| s.pos(now_ms))
+    }
+
+    /// Whether `uid` is still sliding at `now_ms` (`0x4cb406`).
+    pub fn is_sliding(&self, uid: i32, now_ms: u32) -> bool {
+        self.icons.get(&uid).is_some_and(|s| s.is_sliding(now_ms))
+    }
+
+    /// Whether any tracked icon is currently mid-slide at `now_ms`.
+    pub fn is_animating(&self, now_ms: u32) -> bool {
+        self.icons.values().any(|s| s.is_sliding(now_ms))
+    }
+
+    /// Writes each tracked icon's interpolated `[x, y]` into `queue.icons`.
+    pub fn apply_to(&self, queue: &mut Queue, now_ms: u32) {
+        for icon in &mut queue.icons {
+            if let Some([x, y]) = self.position(icon.uid, now_ms) {
+                icon.rect.x = x;
+                icon.rect.y = y;
+            }
         }
     }
 }
@@ -351,5 +530,49 @@ mod tests {
         assert_eq!(queue.at([81, 50]), None);
         assert_eq!(queue.at([126, 76]).map(|i| i.rect.x), Some(82));
         assert_eq!(queue.at([127, 50]), None);
+    }
+
+    #[test]
+    fn queue_slide_state_slides_over_500ms_and_blocks_clicks_while_moving() {
+        let mut slide = QueueSlideState::default();
+        let mut q1 = Queue {
+            person: Some(1),
+            pet: false,
+            icons: vec![icon(32, true, false), {
+                let mut i = icon(82, false, false);
+                i.uid = 2;
+                i
+            }],
+        };
+        // First sync for person 1 snaps icons to their slots without sliding.
+        slide.sync(&q1, None, 1000);
+        assert!(!slide.is_animating(1000));
+        assert_eq!(slide.position(1, 1000), Some([32, 32]));
+        assert_eq!(slide.position(2, 1000), Some([82, 32]));
+
+        // Front icon finishes -> icon 2 shifts from x=82 to x=32 over 500 ms.
+        q1.icons.remove(0);
+        q1.icons[0].rect.x = 32;
+        slide.sync(&q1, None, 2000);
+        assert!(slide.is_animating(2000));
+        assert!(slide.is_sliding(2, 2250));
+        assert_eq!(slide.position(2, 2000), Some([82, 32]));
+        assert_eq!(slide.position(2, 2250), Some([57, 32]));
+        assert_eq!(slide.position(2, 2500), Some([32, 32]));
+        assert!(!slide.is_sliding(2, 2500));
+
+        // While sliding (`0x4cb406`), `at_clickable` ignores the moving icon.
+        let mut moving = q1.clone();
+        slide.apply_to(&mut moving, 2250);
+        assert_eq!(moving.icons[0].rect.x, 57);
+        assert_eq!(moving.at_clickable([65, 40], &slide, 2250), None);
+        // Once settled, `at_clickable` hits it normally.
+        let mut settled = q1.clone();
+        slide.apply_to(&mut settled, 2500);
+        assert_eq!(settled.icons[0].rect.x, 32);
+        assert_eq!(
+            settled.at_clickable([40, 40], &slide, 2500).map(|i| i.uid),
+            Some(2)
+        );
     }
 }

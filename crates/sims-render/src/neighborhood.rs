@@ -29,7 +29,7 @@
 //! and color-key silhouette hit-testing (`0x5e4071` -> `0x5dd79a`) operate on
 //! CPU surfaces and write directly into [`Canvas`].
 
-use crate::canvas::{Canvas, quantize565};
+use crate::canvas::{Canvas, blend565, quantize565};
 use crate::{Error, Result};
 use sims_content::Install;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
@@ -60,8 +60,19 @@ pub const COLOR_KEY_565: u16 = 0xf81f;
 /// Native lot highlight RGB (`0x54e91c`, `0x54f1f6`: `push 0x1d; push 0xff; push 0xf2`).
 pub const DEFAULT_HIGHLIGHT_RGB: [u8; 3] = [0xf2, 0xff, 0x1d];
 
-/// Native blue community-filter highlight RGB (`0x54f520`: `push 0xff; push 0; push 0`).
+/// Native blue community-filter / Rezone highlight RGB (`0x54f520`: `push 0xff; push 0; push 0`).
 pub const COMMUNITY_FILTER_HIGHLIGHT_RGB: [u8; 3] = [0x00, 0x00, 0xff];
+
+/// Native green vacant-residential highlight RGB (`0x54f535`: `push 0; push 0xc8; push 0`,
+/// used in Move-In mode for available lots).
+pub const VACANT_HIGHLIGHT_RGB: [u8; 3] = [0x00, 0xc8, 0x00];
+
+/// Native red occupied / unavailable highlight RGB (`0x54f54a`: `push 0; push 0; push 0xf2`).
+pub const OCCUPIED_HIGHLIGHT_RGB: [u8; 3] = [0xf2, 0x00, 0x00];
+
+/// Native `cWinLot` roof cross-fade duration in milliseconds (`0x54eae8`,
+/// `0x54eb28`: `push 0x12c` = 300 ms `cRZLinearRamp` at `[esi + 0x21c]`).
+pub const HOVER_FADE_DURATION_MS: u64 = 300;
 
 /// Native YIQ luminance offset added to highlighted lot pixels (`[0x6703bc]`).
 const HIGHLIGHT_Y_OFFSET: f32 = f32::from_bits(0x3db8_51ec); // 0.09f
@@ -601,12 +612,30 @@ pub struct RenderOptions {
     pub viewport: [u32; 2],
     /// Lot currently under the cursor, if any.
     pub hovered_lot: Option<u16>,
-    /// When `true` and [`Self::hovered_lot`] has a roofs-off cell (and is not
-    /// displaying its vacation-badged surface), render its cutaway interior
+    /// When `true` and [`Self::hovered_lot`] (or an entry in
+    /// [`Self::lot_roof_fades`]) has a roofs-off cell (and is not displaying
+    /// its vacation-badged surface), cross-fade toward its cutaway interior
     /// cell (`0x54ebcb`, `BMP_ 512/1024`).
     pub hover_roofs_off: bool,
+    /// Cross-fade factor in `0.0..=1.0` for [`Self::hovered_lot`]: `0.0` draws
+    /// the roof-on `normal` cell, `1.0` draws the roofs-off cutaway (or
+    /// vacation-badged) cell, and intermediate values blend in 5-6-5 via
+    /// [`blend565`] (`0x54ee52..0x54f120`). Defaults to `1.0` for backwards
+    /// compatibility with callers that toggle hover without animating.
+    pub hover_roof_fade: f32,
+    /// Per-lot roof fade overrides (`lot_id -> 0.0..=1.0`). Used by
+    /// [`HoverFadeState::apply_to`] so a previously hovered lot can fade its
+    /// roof back in while the newly hovered lot simultaneously fades its roof
+    /// out (`cWinLot + 0x21c`, 300 ms).
+    pub lot_roof_fades: BTreeMap<u16, f32>,
     /// When `true`, apply the native `0x54f28f` brighten + edge outline to
     /// [`Self::hovered_lot`] as well as [`Self::highlighted_lots`].
+    ///
+    /// Defaults to `false` to match Complete Collection 1.91 (`0x54ebcb`):
+    /// plain residential hover smoothly fades the roof out without drawing a
+    /// yellow outline. Mode-specific screens (Move-In, Bulldoze, Rezone, or
+    /// active community filters) explicitly populate [`Self::highlighted_lots`]
+    /// or enable `highlight_hovered`.
     pub highlight_hovered: bool,
     /// Additional selected or filtered lots to render with the native
     /// `0x54f28f` brighten + horizontal edge outline.
@@ -647,7 +676,9 @@ impl Default for RenderOptions {
             viewport: [MAP_WIDTH, MAP_HEIGHT],
             hovered_lot: None,
             hover_roofs_off: true,
-            highlight_hovered: true,
+            hover_roof_fade: 1.0,
+            lot_roof_fades: BTreeMap::new(),
+            highlight_hovered: false,
             highlighted_lots: BTreeSet::new(),
             highlight_rgb: DEFAULT_HIGHLIGHT_RGB,
             water_frame: None,
@@ -657,6 +688,186 @@ impl Default for RenderOptions {
             show_vacation_badges: true,
             show_occupancy_markers: false,
         }
+    }
+}
+
+/// Pure-state per-lot roof cross-fade tracker matching `cWinLot`'s 300 ms
+/// `cRZLinearRamp` (`0x54ea7f..0x54eb3d`, `0x4733b7`, `0x473390`).
+///
+/// Each lot smoothly fades from `0.0` (roof on / `normal`) to `1.0` (roof off /
+/// `roofs_off` or `vacation_badged`) over [`HOVER_FADE_DURATION_MS`] (300 ms)
+/// when hovered, and fades back from its current progress to `0.0` over 300 ms
+/// when unhovered. Mid-fade reversals start continuously from the current
+/// progress (equivalent to `Sims.exe`'s `1.0 - cur` ramp start at `0x54eaf3`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HoverFadeState {
+    hovered: Option<u16>,
+    ramps: BTreeMap<u16, LotFadeRamp>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LotFadeRamp {
+    start_ms: u64,
+    end_ms: u64,
+    start_fade: f32,
+    target_fade: f32,
+}
+
+impl LotFadeRamp {
+    fn eval(self, now_ms: u64) -> f32 {
+        if now_ms <= self.start_ms || self.end_ms <= self.start_ms {
+            if now_ms >= self.end_ms {
+                return self.target_fade;
+            }
+            return self.start_fade;
+        }
+        if now_ms >= self.end_ms {
+            return self.target_fade;
+        }
+        let elapsed = (now_ms - self.start_ms) as f32;
+        let duration = (self.end_ms - self.start_ms) as f32;
+        let t = (elapsed / duration).clamp(0.0, 1.0);
+        (self.start_fade + (self.target_fade - self.start_fade) * t).clamp(0.0, 1.0)
+    }
+
+    fn is_running(self, now_ms: u64) -> bool {
+        now_ms < self.end_ms
+    }
+}
+
+impl HoverFadeState {
+    /// Creates an idle hover-fade tracker with no hovered lot.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the currently hovered lot ID, if any.
+    pub fn hovered(&self) -> Option<u16> {
+        self.hovered
+    }
+
+    /// Updates the hovered lot at `now_ms`. Changing from lot `A` to lot `B`
+    /// starts `A`'s roof fading back in (`cur -> 0.0` over 300 ms) and `B`'s
+    /// roof fading out (`cur -> 1.0` over 300 ms) simultaneously.
+    pub fn set_hovered(&mut self, lot: Option<u16>, now_ms: u64) {
+        if lot == self.hovered {
+            return;
+        }
+        if let Some(prev) = self.hovered {
+            let cur = self.fade_for(prev, now_ms);
+            self.ramps.insert(
+                prev,
+                LotFadeRamp {
+                    start_ms: now_ms,
+                    end_ms: now_ms.saturating_add(HOVER_FADE_DURATION_MS),
+                    start_fade: cur,
+                    target_fade: 0.0,
+                },
+            );
+        }
+        if let Some(next) = lot {
+            let cur = self.fade_for(next, now_ms);
+            self.ramps.insert(
+                next,
+                LotFadeRamp {
+                    start_ms: now_ms,
+                    end_ms: now_ms.saturating_add(HOVER_FADE_DURATION_MS),
+                    start_fade: cur,
+                    target_fade: 1.0,
+                },
+            );
+        }
+        self.hovered = lot;
+    }
+
+    /// Returns the roof cross-fade factor in `0.0..=1.0` for `lot_id` at `now_ms`.
+    pub fn fade_for(&self, lot_id: u16, now_ms: u64) -> f32 {
+        self.ramps
+            .get(&lot_id)
+            .map_or(0.0, |ramp| ramp.eval(now_ms))
+    }
+
+    /// Returns the quantized 8-bit cross-fade alpha (`0..=255`) for `lot_id`
+    /// at `now_ms`, matching `0x54ee52..0x54ee76`.
+    pub fn alpha_for(&self, lot_id: u16, now_ms: u64) -> u8 {
+        fade_to_alpha(self.fade_for(lot_id, now_ms))
+    }
+
+    /// Returns `true` while any lot is actively fading in or out at `now_ms`.
+    pub fn is_animating(&self, now_ms: u64) -> bool {
+        self.ramps.values().any(|ramp| ramp.is_running(now_ms))
+    }
+
+    /// Removes completed fade-out-to-zero ramps for unhovered lots.
+    pub fn prune(&mut self, now_ms: u64) {
+        let hovered = self.hovered;
+        self.ramps
+            .retain(|&id, ramp| Some(id) == hovered || ramp.is_running(now_ms));
+    }
+
+    /// Populates `options.hovered_lot`, `options.hover_roof_fade`, and
+    /// `options.lot_roof_fades` with the evaluated cross-fade weights at `now_ms`.
+    pub fn apply_to(&self, options: &mut RenderOptions, now_ms: u64) {
+        options.hovered_lot = self.hovered;
+        options.hover_roof_fade = self.hovered.map_or(0.0, |id| self.fade_for(id, now_ms));
+        options.lot_roof_fades.clear();
+        for (&id, &ramp) in &self.ramps {
+            let fade = ramp.eval(now_ms);
+            if fade > 0.0 || Some(id) == self.hovered {
+                options.lot_roof_fades.insert(id, fade);
+            }
+        }
+    }
+
+    /// Clears all hover and animation state immediately.
+    pub fn reset(&mut self) {
+        self.hovered = None;
+        self.ramps.clear();
+    }
+}
+
+#[inline]
+fn sanitize_fade(fade: f32) -> f32 {
+    if fade.is_finite() {
+        fade.clamp(0.0, 1.0)
+    } else if fade.is_sign_positive() && fade.is_infinite() {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Converts a normalized fade factor `0.0..=1.0` to the 8-bit alpha passed to
+/// `Sims.exe`'s 5-6-5 blend routine (`0x54ee52..0x54ee76`).
+#[inline]
+pub fn fade_to_alpha(fade: f32) -> u8 {
+    (sanitize_fade(fade) * 255.0).round() as u8
+}
+
+#[inline]
+fn effective_roof_fade(lot_id: u16, options: &RenderOptions) -> f32 {
+    if !options.hover_roofs_off {
+        return 0.0;
+    }
+    if let Some(&fade) = options.lot_roof_fades.get(&lot_id) {
+        return sanitize_fade(fade);
+    }
+    if options.hovered_lot == Some(lot_id) {
+        sanitize_fade(options.hover_roof_fade)
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn effective_vacation_fade(lot_id: u16, options: &RenderOptions) -> f32 {
+    if let Some(&fade) = options.lot_roof_fades.get(&lot_id) {
+        return sanitize_fade(fade);
+    }
+    if options.hovered_lot == Some(lot_id) {
+        sanitize_fade(options.hover_roof_fade)
+    } else {
+        0.0
     }
 }
 
@@ -1078,17 +1289,41 @@ impl NeighborhoodMap {
                 origin[0].saturating_add(lot.cell_origin[0]),
                 origin[1].saturating_add(lot.cell_origin[1]),
             ];
-            if let Some(badged) = self.vacation_badged_for_draw(lot, options) {
-                // 0x54ec5a: native draws [esi + 0x264] directly without
-                // applying highlight; picking (0x5e40b4) still tests the
+            if let Some((badged, alpha)) = self.vacation_badged_for_draw(lot, options) {
+                // 0x54ec5a: native draws (or cross-fades) [esi + 0x264] directly
+                // without applying highlight; picking (0x5e40b4) still tests the
                 // regular thumbnail [esi + 0xd8], so record pick IDs from the
-                // regular pick surface.
-                blit_color_only(canvas, badged, draw_at, map_clip);
-                let pick_surf = self.resolved_pick_surface(lot, options);
-                mark_surface_ids(canvas, &pick_surf, draw_at, map_clip, lot.id);
+                // regular pick surface(s).
+                if (alpha >> 3) >= 31 {
+                    blit_color_only(canvas, badged, draw_at, map_clip);
+                } else {
+                    let from = self.resolved_pick_surface_for(lot, options, false);
+                    blit_crossfade_to_canvas(canvas, &from, badged, draw_at, map_clip, alpha, None);
+                }
+                self.mark_lot_pick_ids(canvas, lot, options, draw_at, map_clip);
             } else {
-                let surface = self.resolved_pick_surface(lot, options);
-                blit_surface_to_canvas(canvas, &surface, draw_at, map_clip, true, Some(lot.id));
+                let fade = effective_roof_fade(lot.id, options);
+                let alpha = fade_to_alpha(fade);
+                let a5 = alpha >> 3;
+                if a5 == 0 || lot.roofs_off.is_none() {
+                    let surface = self.resolved_pick_surface_for(lot, options, false);
+                    blit_surface_to_canvas(canvas, &surface, draw_at, map_clip, true, Some(lot.id));
+                } else if a5 >= 31 {
+                    let surface = self.resolved_pick_surface_for(lot, options, true);
+                    blit_surface_to_canvas(canvas, &surface, draw_at, map_clip, true, Some(lot.id));
+                } else {
+                    let from = self.resolved_pick_surface_for(lot, options, false);
+                    let to = self.resolved_pick_surface_for(lot, options, true);
+                    blit_crossfade_to_canvas(
+                        canvas,
+                        &from,
+                        &to,
+                        draw_at,
+                        map_clip,
+                        alpha,
+                        Some(lot.id),
+                    );
+                }
             }
         }
 
@@ -1217,25 +1452,36 @@ impl NeighborhoodMap {
     pub fn hit_test_with_options(&self, options: &RenderOptions, point: [i32; 2]) -> Option<u16> {
         let origin = self.map_origin_for(options.viewport);
         for lot in self.lots.iter().rev() {
-            let is_hovered = options.hovered_lot == Some(lot.id);
-            let show_cutaway = is_hovered && options.hover_roofs_off;
-            let base = lot.active_surface(show_cutaway);
-            if !base.is_valid() {
-                continue;
-            }
+            let fade = effective_roof_fade(lot.id, options);
+            let a5 = fade_to_alpha(fade) >> 3;
+            let highlight_565 = self.highlight_rgb_for(lot, options).map(pack_565);
             let draw_x = i64::from(origin[0]) + i64::from(lot.cell_origin[0]);
             let draw_y = i64::from(origin[1]) + i64::from(lot.cell_origin[1]);
             let lx = i64::from(point[0]) - draw_x;
             let ly = i64::from(point[1]) - draw_y;
-            if lx < 0 || ly < 0 || lx >= base.width as i64 || ly >= base.height as i64 {
+            if lx < 0 || ly < 0 {
                 continue;
             }
             let (ux, uy) = (lx as usize, ly as usize);
-            let pixel = match self.highlight_rgb_for(lot, options) {
-                Some(rgb) => highlight_lot_row_pixel(lot, uy, ux, show_cutaway, pack_565(rgb)),
-                None => base.pixels[uy * base.width + ux],
+            let sample = |show_cutaway: bool| -> bool {
+                let base = lot.active_surface(show_cutaway);
+                if !base.is_valid() || ux >= base.width || uy >= base.height {
+                    return false;
+                }
+                let pixel = match highlight_565 {
+                    Some(rgb565) => highlight_lot_row_pixel(lot, uy, ux, show_cutaway, rgb565),
+                    None => base.pixels[uy * base.width + ux],
+                };
+                pixel != COLOR_KEY_565
             };
-            if pixel != COLOR_KEY_565 {
+            let hit = if a5 == 0 || lot.roofs_off.is_none() {
+                sample(false)
+            } else if a5 >= 31 {
+                sample(true)
+            } else {
+                sample(false) || sample(true)
+            };
+            if hit {
                 return Some(lot.id);
             }
         }
@@ -1254,18 +1500,47 @@ impl NeighborhoodMap {
             || (self.kind == NeighborhoodKind::Vacation && lot.has_vacation_occupancy)
     }
 
-    /// Returns the unhighlighted `[esi + 0x264]` vacation-badged surface when
-    /// it replaces `[esi + 0xd8]` for drawing (`0x54ec48..0x54ec75`).
+    /// Returns the unhighlighted `[esi + 0x264]` vacation-badged surface and
+    /// its cross-fade alpha (`1..=255`) when it replaces or cross-fades over
+    /// `[esi + 0xd8]` for drawing (`0x54ec48..0x54ec91`).
     fn vacation_badged_for_draw<'a>(
         &'a self,
         lot: &'a MapLot,
         options: &RenderOptions,
-    ) -> Option<&'a Surface565> {
-        let is_hovered = options.hovered_lot == Some(lot.id);
-        if is_hovered && options.show_vacation_badges && self.has_vacation_badge(lot) {
-            lot.vacation_badged.as_ref()
+    ) -> Option<(&'a Surface565, u8)> {
+        if !options.show_vacation_badges || !self.has_vacation_badge(lot) {
+            return None;
+        }
+        let badged = lot.vacation_badged.as_ref()?;
+        let alpha = fade_to_alpha(effective_vacation_fade(lot.id, options));
+        if (alpha >> 3) > 0 {
+            Some((badged, alpha))
         } else {
             None
+        }
+    }
+
+    /// Marks `Canvas` pick IDs for `lot` consistent with [`Self::hit_test_with_options`].
+    fn mark_lot_pick_ids(
+        &self,
+        canvas: &mut Canvas,
+        lot: &MapLot,
+        options: &RenderOptions,
+        draw_at: [i32; 2],
+        map_clip: [i32; 4],
+    ) {
+        let a5 = fade_to_alpha(effective_roof_fade(lot.id, options)) >> 3;
+        if a5 == 0 || lot.roofs_off.is_none() {
+            let pick = self.resolved_pick_surface_for(lot, options, false);
+            mark_surface_ids(canvas, &pick, draw_at, map_clip, lot.id);
+        } else if a5 >= 31 {
+            let pick = self.resolved_pick_surface_for(lot, options, true);
+            mark_surface_ids(canvas, &pick, draw_at, map_clip, lot.id);
+        } else {
+            let from = self.resolved_pick_surface_for(lot, options, false);
+            let to = self.resolved_pick_surface_for(lot, options, true);
+            mark_surface_ids(canvas, &from, draw_at, map_clip, lot.id);
+            mark_surface_ids(canvas, &to, draw_at, map_clip, lot.id);
         }
     }
 
@@ -1289,14 +1564,13 @@ impl NeighborhoodMap {
 
     /// Resolves `lot`'s regular thumbnail surface `[esi + 0xd8]` (possibly
     /// highlighted across its full native two-cell strip width per
-    /// `0x54f347..0x54f3e1`) under `options`, matching `0x54f2af` + `0x5e40b4`.
-    fn resolved_pick_surface<'a>(
+    /// `0x54f347..0x54f3e1`) for the requested `show_cutaway` cell.
+    fn resolved_pick_surface_for<'a>(
         &'a self,
         lot: &'a MapLot,
         options: &RenderOptions,
+        show_cutaway: bool,
     ) -> Cow<'a, Surface565> {
-        let is_hovered = options.hovered_lot == Some(lot.id);
-        let show_cutaway = is_hovered && options.hover_roofs_off;
         match self.highlight_rgb_for(lot, options) {
             Some(rgb) => Cow::Owned(highlight_lot_cell(lot, show_cutaway, rgb)),
             None => Cow::Borrowed(lot.active_surface(show_cutaway)),
@@ -3546,6 +3820,106 @@ fn blit_surface_to_canvas(
     }
 }
 
+/// Cross-fades `from` (roof-on `normal`) toward `to` (`roofs_off` or
+/// `vacation_badged`) at 8-bit `alpha` (`0..=255`) using the original's 5-6-5
+/// blend LUT (`0x6e5eac` via [`blend565`]) and backdrop substitution when one
+/// side is [`COLOR_KEY_565`] (`0x54ef8b..0x54f120`).
+fn blit_crossfade_to_canvas(
+    canvas: &mut Canvas,
+    from: &Surface565,
+    to: &Surface565,
+    at: [i32; 2],
+    clip: [i32; 4],
+    alpha: u8,
+    lot_id: Option<u16>,
+) {
+    let from_valid = from.is_valid();
+    let to_valid = to.is_valid();
+    if !from_valid && !to_valid {
+        return;
+    }
+    let a5 = alpha >> 3;
+    if a5 == 0 {
+        if from_valid {
+            if lot_id.is_some() {
+                blit_surface_to_canvas(canvas, from, at, clip, true, lot_id);
+            } else {
+                blit_color_only(canvas, from, at, clip);
+            }
+        }
+        return;
+    }
+    if a5 >= 31 {
+        if to_valid {
+            if lot_id.is_some() {
+                blit_surface_to_canvas(canvas, to, at, clip, true, lot_id);
+            } else {
+                blit_color_only(canvas, to, at, clip);
+            }
+        }
+        return;
+    }
+    let union_w = if from_valid { from.width } else { 0 }.max(if to_valid { to.width } else { 0 });
+    let union_h =
+        if from_valid { from.height } else { 0 }.max(if to_valid { to.height } else { 0 });
+
+    let cw = canvas.width as i64;
+    let ch = canvas.height as i64;
+    let clip_x0 = i64::from(clip[0]).clamp(0, cw);
+    let clip_y0 = i64::from(clip[1]).clamp(0, ch);
+    let clip_x1 = i64::from(clip[2]).clamp(clip_x0, cw);
+    let clip_y1 = i64::from(clip[3]).clamp(clip_y0, ch);
+
+    let ax = i64::from(at[0]);
+    let ay = i64::from(at[1]);
+    let x0 = ax.clamp(clip_x0, clip_x1);
+    let y0 = ay.clamp(clip_y0, clip_y1);
+    let x1 = ax.saturating_add(union_w as i64).clamp(x0, clip_x1);
+    let y1 = ay.saturating_add(union_h as i64).clamp(y0, clip_y1);
+
+    if lot_id.is_some() {
+        canvas.set_id(lot_id);
+    }
+    for py in y0..y1 {
+        let sy = (py - ay) as usize;
+        let from_row = (from_valid && sy < from.height)
+            .then(|| &from.pixels[sy * from.width..(sy + 1) * from.width]);
+        let to_row =
+            (to_valid && sy < to.height).then(|| &to.pixels[sy * to.width..(sy + 1) * to.width]);
+        let canvas_row = py as usize * canvas.width;
+        for px in x0..x1 {
+            let sx = (px - ax) as usize;
+            let p_from = from_row
+                .and_then(|r| r.get(sx).copied())
+                .unwrap_or(COLOR_KEY_565);
+            let p_to = to_row
+                .and_then(|r| r.get(sx).copied())
+                .unwrap_or(COLOR_KEY_565);
+            let rgb = match (p_from == COLOR_KEY_565, p_to == COLOR_KEY_565) {
+                (true, true) => continue,
+                (false, false) => blend565(widen_565(p_to), widen_565(p_from), alpha),
+                // Overhanging roof pixel (present in `from`, keyed in `to`):
+                // substitute the backdrop pixel for `to` (`0x54ef8b..0x54f120`).
+                (false, true) => {
+                    let bg = canvas.color[canvas_row + px as usize];
+                    blend565(bg, widen_565(p_from), alpha)
+                }
+                // Newly exposed interior/badge pixel (keyed in `from`, present in `to`):
+                // fade in from the underlying backdrop pixel.
+                (true, false) => {
+                    let bg = canvas.color[canvas_row + px as usize];
+                    blend565(widen_565(p_to), bg, alpha)
+                }
+            };
+            if lot_id.is_some() {
+                canvas.plot(px as i32, py as i32, 0, rgb);
+            } else {
+                canvas.plot_color(px as i32, py as i32, rgb);
+            }
+        }
+    }
+}
+
 fn mark_surface_ids(
     canvas: &mut Canvas,
     surface: &Surface565,
@@ -5029,5 +5403,123 @@ mod tests {
         let direct_rgb_decoded =
             decode_jpeg_to_surface565(direct_rgb_1x1_jpeg).expect("decode direct-RGB JPEG");
         assert_eq!(direct_rgb_decoded.pixels[0], 0x4fe3);
+    }
+
+    #[test]
+    fn default_render_options_do_not_highlight_hovered_lot_and_fade_crossblends_565() {
+        // Complete Collection 1.91 plain hover does not draw a yellow outline.
+        let defaults = RenderOptions::default();
+        assert!(!defaults.highlight_hovered);
+        assert_eq!(defaults.hover_roof_fade, 1.0);
+
+        // Lot with roof overhang at (0, 0) (opaque in `normal`, keyed in `roofs_off`)
+        // and interior pixel at (1, 0) (blue in `normal`, red in `roofs_off`).
+        let bg_rgb = [24, 120, 24];
+        let roof_rgb = [200, 160, 40];
+        let wall_rgb = [40, 80, 200];
+        let interior_rgb = [200, 40, 40];
+
+        let mut normal = Surface565::filled(2, 1, COLOR_KEY_565);
+        normal.pixels[0] = pack_565(roof_rgb);
+        normal.pixels[1] = pack_565(wall_rgb);
+
+        let mut cutaway = Surface565::filled(2, 1, COLOR_KEY_565);
+        cutaway.pixels[0] = COLOR_KEY_565;
+        cutaway.pixels[1] = pack_565(interior_rgb);
+
+        let mut lot = make_lot(5, [10, 10], normal.clone());
+        lot.roofs_off = Some(cutaway.clone());
+        let mut map = make_test_map(NeighborhoodKind::Unleashed, vec![lot]);
+        map.backdrop = Surface565::filled(800, 600, pack_565(bg_rgb));
+
+        // fade = 0.0 matches roof-on `normal`.
+        let c0 = map.render(&RenderOptions {
+            hovered_lot: Some(5),
+            hover_roof_fade: 0.0,
+            ..RenderOptions::default()
+        });
+        assert_eq!(c0.color[10 * 800 + 10], widen_565(pack_565(roof_rgb)));
+        assert_eq!(c0.color[10 * 800 + 11], widen_565(pack_565(wall_rgb)));
+
+        // fade = 1.0 matches `roofs_off` with zero yellow outline pixels.
+        let c1 = map.render(&RenderOptions {
+            hovered_lot: Some(5),
+            hover_roof_fade: 1.0,
+            ..RenderOptions::default()
+        });
+        assert_eq!(c1.color[10 * 800 + 10], widen_565(pack_565(bg_rgb)));
+        assert_eq!(c1.color[10 * 800 + 11], widen_565(pack_565(interior_rgb)));
+        assert_ne!(
+            c1.color[10 * 800 + 11],
+            quantize565(DEFAULT_HIGHLIGHT_RGB),
+            "default hover must not draw a yellow outline"
+        );
+
+        // fade = 0.5 blends interior pixel AND dissolves overhanging roof into backdrop.
+        let mid_opts = RenderOptions {
+            hovered_lot: Some(5),
+            hover_roof_fade: 0.5,
+            ..RenderOptions::default()
+        };
+        let cmid = map.render(&mid_opts);
+        let alpha = fade_to_alpha(0.5);
+        assert_eq!(
+            cmid.color[10 * 800 + 10],
+            blend565(
+                widen_565(pack_565(bg_rgb)),
+                widen_565(pack_565(roof_rgb)),
+                alpha
+            )
+        );
+        assert_eq!(
+            cmid.color[10 * 800 + 11],
+            blend565(
+                widen_565(pack_565(interior_rgb)),
+                widen_565(pack_565(wall_rgb)),
+                alpha
+            )
+        );
+        // Mid-fade picking agrees with Canvas::id_at on both overhanging and interior pixels.
+        assert_eq!(cmid.id_at(10, 10), Some(5));
+        assert_eq!(map.hit_test_with_options(&mid_opts, [10, 10]), Some(5));
+        assert_eq!(cmid.id_at(11, 10), Some(5));
+        assert_eq!(map.hit_test_with_options(&mid_opts, [11, 10]), Some(5));
+    }
+
+    #[test]
+    fn hover_fade_state_ramps_300ms_reverses_mid_fade_and_tracks_multiple_lots() {
+        let mut state = HoverFadeState::new();
+        assert_eq!(state.hovered(), None);
+        assert!(!state.is_animating(0));
+
+        // Hover lot 5 at t=1000 ms -> ramps 0.0 -> 1.0 over 300 ms.
+        state.set_hovered(Some(5), 1000);
+        assert_eq!(state.hovered(), Some(5));
+        assert!(state.is_animating(1000));
+        assert!((state.fade_for(5, 1000) - 0.0).abs() < 1e-6);
+        assert!((state.fade_for(5, 1150) - 0.5).abs() < 1e-6);
+        assert!((state.fade_for(5, 1300) - 1.0).abs() < 1e-6);
+        assert!(!state.is_animating(1300));
+
+        // Switch hover mid-fade: move from lot 5 (fade 1.0) to lot 6 at t=2000,
+        // then reverse off lot 6 at t=2120 (fade 0.4) -> lot 6 continues smoothly
+        // from 0.4 -> 0.0 over 300 ms without popping.
+        state.set_hovered(Some(6), 2000);
+        assert!((state.fade_for(5, 2150) - 0.5).abs() < 1e-6);
+        assert!((state.fade_for(6, 2150) - 0.5).abs() < 1e-6);
+
+        let mut opts = RenderOptions::default();
+        state.apply_to(&mut opts, 2150);
+        assert_eq!(opts.hovered_lot, Some(6));
+        assert!((opts.hover_roof_fade - 0.5).abs() < 1e-6);
+        assert!((opts.lot_roof_fades[&5] - 0.5).abs() < 1e-6);
+        assert!((opts.lot_roof_fades[&6] - 0.5).abs() < 1e-6);
+
+        state.set_hovered(None, 2120);
+        assert!((state.fade_for(6, 2120) - 0.4).abs() < 1e-5);
+        assert!((state.fade_for(6, 2270) - 0.2).abs() < 1e-5);
+        assert!((state.fade_for(6, 2420) - 0.0).abs() < 1e-6);
+        state.prune(2420);
+        assert!(!state.is_animating(2420));
     }
 }

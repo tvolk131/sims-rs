@@ -386,6 +386,143 @@ fn neighborhood_1_matches_live_oracle_capture_if_provided() {
     );
 }
 
+/// Optional pixel-level ratchet against Track 2's real 1.91 Neighborhood 1
+/// captures (`01-nb-clean.png` and `02-nb-hover-goth.png` in `SIMS_NB_ORACLE`
+/// or `/Users/tommyvolk/Desktop/sims-rs/cache/nb-save-movein-evict-20261121/shots`).
+///
+/// Verifies:
+/// 1. Clean Neighborhood 1 map (`y = 52..600`, all 41 lots) matches `01-nb-clean.png`.
+/// 2. Plain hover on Goth Lot 5 with default [`RenderOptions`] (`highlight_hovered: false`,
+///    `hover_roof_fade: 1.0`) matches `02-nb-hover-goth.png` with zero yellow outline pixels.
+/// 3. [`sims_render::neighborhood::HoverFadeState`] smoothly cross-fades roofs
+///    between `normal` and `roofs_off` over 300 ms.
+#[test]
+fn neighborhood_hover_cutaway_and_crossfade_match_191_oracle() {
+    const DEFAULT_NB_ORACLE: &str =
+        "/Users/tommyvolk/Desktop/sims-rs/cache/nb-save-movein-evict-20261121/shots";
+    let Some(install) = install() else {
+        return;
+    };
+    let oracle_dir = std::env::var_os("SIMS_NB_ORACLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_NB_ORACLE));
+    if !oracle_dir.join("01-nb-clean.png").is_file()
+        || !oracle_dir.join("02-nb-hover-goth.png").is_file()
+    {
+        return;
+    }
+
+    let map = NeighborhoodMap::load(&install, 1, NeighborhoodKind::Unleashed, false)
+        .expect("load Neighborhood 1");
+
+    // 1. Clean map matches `01-nb-clean.png` across all 41 lot silhouettes.
+    let clean_bytes = std::fs::read(oracle_dir.join("01-nb-clean.png")).expect("read clean PNG");
+    let (_, _, clean_oracle) =
+        decode_png_rgb(&clean_bytes, Some((800, 600))).expect("decode clean");
+    let clean_canvas = map.render(&RenderOptions::default());
+    let mut clean_lot_exact = 0usize;
+    let mut clean_lot_total = 0usize;
+    for y in 52..600usize {
+        for x in 0..800usize {
+            if clean_canvas.id_at(x as i32, y as i32).is_some() {
+                clean_lot_total += 1;
+                let idx = y * 800 + x;
+                if sims_render::neighborhood::pack_565(clean_canvas.color[idx])
+                    == sims_render::neighborhood::pack_565(clean_oracle[idx])
+                {
+                    clean_lot_exact += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        clean_lot_total > 170_000,
+        "unexpected lot-pixel count {clean_lot_total}"
+    );
+    assert_eq!(
+        clean_lot_exact, clean_lot_total,
+        "all 41 lots on clean Neighborhood 1 must match 01-nb-clean.png 100% ({clean_lot_exact}/{clean_lot_total})"
+    );
+
+    // 2. Plain hover on Goth Lot 5 uses default `highlight_hovered: false` (zero
+    //    yellow outline pixels) and matches `02-nb-hover-goth.png` inside Lot 5's
+    //    unobstructed cutaway silhouette (above the Goth popup card at `y = 259`).
+    let hover_bytes =
+        std::fs::read(oracle_dir.join("02-nb-hover-goth.png")).expect("read hover PNG");
+    let (_, _, hover_oracle) =
+        decode_png_rgb(&hover_bytes, Some((800, 600))).expect("decode hover");
+    let hover_opts = RenderOptions {
+        hovered_lot: Some(5),
+        ..RenderOptions::default()
+    };
+    assert!(
+        !hover_opts.highlight_hovered,
+        "plain hover must default to highlight_hovered = false"
+    );
+    let hover_canvas = map.render(&hover_opts);
+    let rect5 = map.lot(5).unwrap().screen_rect([800, 600]);
+    let yellow_565 = sims_render::neighborhood::pack_565(DEFAULT_HIGHLIGHT_RGB);
+    let mut added_yellow = 0usize;
+    let mut lot5_exact = 0usize;
+    let mut lot5_total = 0usize;
+    for y in rect5[1].max(52)..rect5[3].min(259) {
+        for x in rect5[0].max(0)..rect5[2].min(800) {
+            if hover_canvas.id_at(x, y) != Some(5) {
+                continue;
+            }
+            let idx = y as usize * 800 + x as usize;
+            let got = sims_render::neighborhood::pack_565(hover_canvas.color[idx]);
+            let base = sims_render::neighborhood::pack_565(clean_canvas.color[idx]);
+            let want = sims_render::neighborhood::pack_565(hover_oracle[idx]);
+            if got == yellow_565 && base != yellow_565 {
+                added_yellow += 1;
+            }
+            lot5_total += 1;
+            if got == want {
+                lot5_exact += 1;
+            }
+        }
+    }
+    assert_eq!(
+        added_yellow, 0,
+        "default hover on Goth Lot 5 must not add yellow outline pixels"
+    );
+    assert!(
+        lot5_total > 4_000,
+        "unexpected Goth Lot 5 cutaway silhouette count {lot5_total}"
+    );
+    let lot5_pct = 100.0 * lot5_exact as f64 / lot5_total as f64;
+    assert!(
+        lot5_pct >= 98.5,
+        "Goth Lot 5 hover cutaway drifted below 98.5% ratchet vs 02-nb-hover-goth.png: {lot5_exact}/{lot5_total} ({lot5_pct:.2}%)"
+    );
+
+    // 3. Smooth 300 ms `HoverFadeState` produces a distinct intermediate cross-fade
+    //    frame at t = 150 ms between roof-on (`clean_canvas`) and cutaway (`hover_canvas`).
+    let mut fade_state = sims_render::neighborhood::HoverFadeState::new();
+    fade_state.set_hovered(Some(5), 1000);
+    let mut mid_opts = RenderOptions::default();
+    fade_state.apply_to(&mut mid_opts, 1150);
+    let mid_canvas = map.render(&mid_opts);
+    let mut diff_from_clean = 0usize;
+    let mut diff_from_full = 0usize;
+    for y in rect5[1].max(52)..rect5[3].min(600) {
+        for x in rect5[0].max(0)..rect5[2].min(800) {
+            let idx = y as usize * 800 + x as usize;
+            if mid_canvas.color[idx] != clean_canvas.color[idx] {
+                diff_from_clean += 1;
+            }
+            if mid_canvas.color[idx] != hover_canvas.color[idx] {
+                diff_from_full += 1;
+            }
+        }
+    }
+    assert!(
+        diff_from_clean > 500 && diff_from_full > 500,
+        "150 ms cross-fade must be intermediate between normal and cutaway (diff_clean={diff_from_clean}, diff_full={diff_from_full})"
+    );
+}
+
 #[test]
 fn test_png_decoder_rejects_short_and_corrupted_inputs() {
     assert!(decode_png_rgb(&[0; 7], None).is_err());
