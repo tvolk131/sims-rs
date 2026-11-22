@@ -17,6 +17,7 @@ use crate::autosave_worker::{
     validate_save_payload,
 };
 use crate::caf_screen::{CafOutcome, CafSession};
+use crate::coop::default_player_name;
 use crate::game::Game;
 use crate::hud::DialogKey;
 use crate::sound::{self, Input};
@@ -46,6 +47,7 @@ use sims_ui::album::{
 };
 use sims_ui::art::Art;
 use sims_ui::command::Command;
+use sims_ui::coop::{CoopCommand, CoopLobbyDialog, CoopSnapshot, LobbyTab};
 use sims_ui::dialog::{self, DialogState, FrameStyle, Labels, Message};
 use sims_ui::family_bin::{
     FamilyBin, FamilyBinCommand, FamilyBinMode, FamilyBinStrings, FamilyBinView, FamilyEntry,
@@ -548,6 +550,12 @@ pub struct NeighborhoodShell {
     save_manager_snapshot: Option<SaveManagerSnapshot>,
     save_manager_target_lot: Option<u32>,
     last_save_completions: Vec<SaveCompletion>,
+    // Co-op lobby modal over Neighborhood screen (delegates to Game when in a Lot).
+    coop_art: Art,
+    coop_lobby: CoopLobbyDialog,
+    coop_error: Option<String>,
+    coop_player_name: String,
+    coop_iroh_config: sims_net::IrohConfig,
     note: Option<String>,
 
     // Pending sound inputs to be drained by the host.
@@ -625,6 +633,9 @@ impl NeighborhoodShell {
         let travel_art = sims_ui::travel::load_art(&ui, US_ENGLISH)
             .or_else(|_| Art::load_with_optional(&ui, US_ENGLISH, &[], &sims_ui::travel::RESOURCES))
             .map_err(|e| e.to_string())?;
+        let coop_art = sims_ui::coop::load_art(&ui, US_ENGLISH)
+            .or_else(|_| Art::load_with_optional(&ui, US_ENGLISH, &[], &sims_ui::coop::RESOURCES))
+            .unwrap_or_default();
         let travel_strings = TravelStrings::load(&install, US_ENGLISH).unwrap_or_default();
         let dialogs = DialogStrings::load(&install);
         let arch_multiplier = load_arch_multiplier(&install);
@@ -771,6 +782,11 @@ impl NeighborhoodShell {
             save_manager_snapshot: None,
             save_manager_target_lot: None,
             last_save_completions: Vec::new(),
+            coop_art,
+            coop_lobby: CoopLobbyDialog::new(),
+            coop_error: None,
+            coop_player_name: default_player_name("Player"),
+            coop_iroh_config: sims_net::IrohConfig::P2pDefault,
             note: startup_note,
             audio_queue,
         };
@@ -1089,6 +1105,7 @@ impl NeighborhoodShell {
         if self.save_manager.is_open()
             || self.album_dialog.is_open()
             || self.travel_dialog_state.is_some()
+            || self.coop_lobby.is_open()
         {
             return true;
         }
@@ -1148,6 +1165,7 @@ impl NeighborhoodShell {
         if self.save_manager.is_open()
             || self.album_dialog.is_open()
             || self.travel_dialog_state.is_some()
+            || self.coop_lobby.is_open()
         {
             return true;
         }
@@ -1237,6 +1255,9 @@ impl NeighborhoodShell {
         let mut redraw = self.poll_background_saves();
         if self.album_dialog.is_open() {
             self.album_dialog.advance_time(delta_us);
+            redraw = true;
+        }
+        if self.coop_lobby.is_open() && self.coop_lobby.sync_blink(self.clock_us) {
             redraw = true;
         }
         match &mut self.screen {
@@ -1468,6 +1489,10 @@ impl NeighborhoodShell {
                 );
             }
         }
+        if self.coop_lobby.is_open() {
+            let snap = self.shell_coop_snapshot();
+            self.coop_lobby.draw(frame, &snap, &self.coop_art);
+        }
     }
 
     fn family_bin_view(&self) -> FamilyBinView<'_> {
@@ -1494,6 +1519,12 @@ impl NeighborhoodShell {
                 self.save_manager
                     .pointer_move(frame_size, snapshot, point[0], point[1]);
             }
+            return true;
+        }
+        if self.coop_lobby.is_open() {
+            let snap = self.shell_coop_snapshot();
+            self.coop_lobby
+                .pointer_move(frame_size, &snap, point[0], point[1]);
             return true;
         }
         if self.travel_dialog_state.is_some() {
@@ -1584,6 +1615,7 @@ impl NeighborhoodShell {
         if self.save_manager.is_open()
             || self.album_dialog.is_open()
             || self.travel_dialog_state.is_some()
+            || self.coop_lobby.is_open()
         {
             return true;
         }
@@ -1705,6 +1737,16 @@ impl NeighborhoodShell {
                 };
             }
             return ShellOutcome::default();
+        }
+        if self.coop_lobby.is_open() {
+            let snap = self.shell_coop_snapshot();
+            let changed = self
+                .coop_lobby
+                .pointer_down(frame_size, &snap, point[0], point[1]);
+            return ShellOutcome {
+                redraw: changed,
+                ..ShellOutcome::default()
+            };
         }
         if let Some(td_state) = &self.travel_dialog_state {
             let layout = TravelDialogLayout::compute(frame_size[0], frame_size[1]);
@@ -1874,6 +1916,16 @@ impl NeighborhoodShell {
             });
             return match cmd {
                 Some(cmd) => self.handle_save_manager_command(cmd),
+                None => ShellOutcome::redraw(),
+            };
+        }
+        if self.coop_lobby.is_open() {
+            let snap = self.shell_coop_snapshot();
+            let cmd = self
+                .coop_lobby
+                .pointer_up(frame_size, &snap, point[0], point[1]);
+            return match cmd {
+                Some(cmd) => self.handle_shell_coop_command(cmd),
                 None => ShellOutcome::redraw(),
             };
         }
@@ -2089,6 +2141,19 @@ impl NeighborhoodShell {
             }
             return ShellOutcome::redraw();
         }
+        if self.coop_lobby.is_open() {
+            let snap = self.shell_coop_snapshot();
+            if let Some(cmd) = self.coop_lobby.escape(&snap) {
+                return self.handle_shell_coop_command(cmd);
+            }
+            return ShellOutcome::redraw();
+        }
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.coop_lobby_open()
+        {
+            let out = session.game.coop_lobby_escape();
+            return self.handle_lot_outcome(out);
+        }
         if let Some(td_state) = self.travel_dialog_state.clone() {
             if let Some(cmd) = self.travel_dialog.key_press("Escape", &td_state) {
                 return self.handle_travel_dialog_command(cmd);
@@ -2140,6 +2205,20 @@ impl NeighborhoodShell {
     }
 
     pub fn key_char(&mut self, ch: char) -> ShellOutcome {
+        if self.coop_lobby.is_open() {
+            return ShellOutcome {
+                redraw: self.coop_lobby.insert_char(ch),
+                ..ShellOutcome::default()
+            };
+        }
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.coop_lobby_open()
+        {
+            return ShellOutcome {
+                redraw: session.game.coop_lobby_char(ch),
+                ..ShellOutcome::default()
+            };
+        }
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::Char(ch));
         }
@@ -2152,6 +2231,20 @@ impl NeighborhoodShell {
     }
 
     pub fn key_backspace(&mut self) -> ShellOutcome {
+        if self.coop_lobby.is_open() {
+            return ShellOutcome {
+                redraw: self.coop_lobby.backspace(),
+                ..ShellOutcome::default()
+            };
+        }
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.coop_lobby_open()
+        {
+            return ShellOutcome {
+                redraw: session.game.coop_lobby_backspace(),
+                ..ShellOutcome::default()
+            };
+        }
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::Backspace);
         }
@@ -2276,6 +2369,22 @@ impl NeighborhoodShell {
     }
 
     pub fn key_tab(&mut self) -> ShellOutcome {
+        if self.coop_lobby.is_open() {
+            let next = match self.coop_lobby.tab() {
+                LobbyTab::Host => LobbyTab::Join,
+                LobbyTab::Join => LobbyTab::Host,
+            };
+            self.coop_lobby.set_tab(next);
+            return ShellOutcome::redraw();
+        }
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.coop_lobby_open()
+        {
+            return ShellOutcome {
+                redraw: session.game.coop_lobby_toggle_tab(),
+                ..ShellOutcome::default()
+            };
+        }
         if self.travel_dialog_state.is_some() {
             return ShellOutcome {
                 redraw: self.cycle_travel_destination(1),
@@ -2324,6 +2433,19 @@ impl NeighborhoodShell {
                 None => ShellOutcome::default(),
             };
         }
+        if self.coop_lobby.is_open() {
+            let snap = self.shell_coop_snapshot();
+            return match self.coop_lobby.submit(&snap) {
+                Some(cmd) => self.handle_shell_coop_command(cmd),
+                None => ShellOutcome::default(),
+            };
+        }
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.coop_lobby_open()
+        {
+            let out = session.game.coop_lobby_submit();
+            return self.handle_lot_outcome(out);
+        }
         if let Some(td_state) = self.travel_dialog_state.clone() {
             if let Some(cmd) = self.travel_dialog.key_press("Enter", &td_state) {
                 return self.handle_travel_dialog_command(cmd);
@@ -2359,6 +2481,13 @@ impl NeighborhoodShell {
         };
         if outcome.open_save_manager {
             self.open_save_manager(None);
+            out.redraw = true;
+            return out;
+        }
+        if outcome.open_coop_lobby {
+            if let ActiveScreen::Lot(session) = &mut self.screen {
+                session.game.open_coop_lobby(None);
+            }
             out.redraw = true;
             return out;
         }
@@ -2403,6 +2532,7 @@ impl NeighborhoodShell {
             out.redraw = true;
         }
         if outcome.quit && saved_ok {
+            self.leave_coop_if_active();
             self.flush_background_saves();
             out.quit = true;
         }
@@ -2415,6 +2545,9 @@ impl NeighborhoodShell {
         let ActiveScreen::Lot(session) = &self.screen else {
             return Err("no lot is currently open".into());
         };
+        if session.game.coop_blocks_local_save() {
+            return Err("Only the co-op host can save the lot.".into());
+        }
         if session.active_trip.is_some() {
             return Err(
                 "cannot save directly while visiting a travel destination; return home first"
@@ -2440,6 +2573,9 @@ impl NeighborhoodShell {
         let ActiveScreen::Lot(session) = &self.screen else {
             return Err("no lot is currently open".into());
         };
+        if session.game.coop_blocks_local_save() {
+            return Err("Only the co-op host can save the lot.".into());
+        }
         if session.active_trip.is_some() {
             return Err(
                 "cannot save directly while visiting a travel destination; return home first"
@@ -2546,7 +2682,9 @@ impl NeighborhoodShell {
                 .get(28)
                 .copied()
                 .unwrap_or(0);
-            let turned = session.active_trip.is_none() && days_played > session.last_days_played;
+            let turned = session.active_trip.is_none()
+                && !session.game.coop_blocks_local_save()
+                && days_played > session.last_days_played;
             session.last_days_played = days_played;
             turned
         } else {
@@ -2768,6 +2906,9 @@ impl NeighborhoodShell {
         lot_id: u32,
         loaded: &sims_sim::autosave::LoadedSave,
     ) -> Result<u64, String> {
+        if matches!(&self.screen, ActiveScreen::Lot(s) if s.game.coop_active()) {
+            return Err("Leave the co-op session before loading a local save slot.".into());
+        }
         if self.active_trip().is_some() {
             return Err(
                 "cannot restore a save slot while visiting a travel destination; return home first"
@@ -2925,6 +3066,11 @@ impl NeighborhoodShell {
             let ActiveScreen::Lot(session) = &mut self.screen else {
                 return Err("no lot is currently open".into());
             };
+            if session.game.coop_blocks_local_save() {
+                let msg = "Only the co-op host can save the lot.";
+                session.game.set_note(msg);
+                return Err(msg.into());
+            }
             if session.active_trip.is_some() {
                 let msg =
                     "Cannot save directly while visiting a travel destination; return home first.";
@@ -3072,6 +3218,11 @@ impl NeighborhoodShell {
         self.flush_background_saves();
         let (neighborhood_id, house) = match &mut self.screen {
             ActiveScreen::Lot(session) => {
+                if session.game.coop_active() {
+                    let msg = "Leave the co-op session before restoring a local save.";
+                    session.game.set_note(msg);
+                    return Err(msg.into());
+                }
                 if session.active_trip.is_some() {
                     let msg = "Cannot restore directly while visiting a travel destination; return home first.";
                     session.game.set_note(msg);
@@ -3472,6 +3623,8 @@ impl NeighborhoodShell {
         if self.options_file.is_file() {
             let _ = game.load_options(&self.options_file);
         }
+        game.coop_set_player_name(self.coop_player_name.clone());
+        game.coop_set_iroh_config(self.coop_iroh_config);
         game.set_album_button_enabled(true);
         game.resize(self.size);
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
@@ -3489,6 +3642,8 @@ impl NeighborhoodShell {
         }));
         self.lot_generation = self.lot_generation.wrapping_add(1);
         self.dialog = None;
+        self.coop_lobby.close();
+        self.coop_error = None;
         self.close_photo_album();
         self.close_travel_dialog();
         self.save_manager.close();
@@ -3512,13 +3667,23 @@ impl NeighborhoodShell {
     /// community lot templates are never overwritten and the home lot is
     /// reconciled before returning to the neighborhood map.
     pub fn leave_lot(&mut self, save_first: bool) -> Result<(), String> {
+        let mut effective_save_first = save_first;
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            if session.game.coop_blocks_local_save() {
+                // Peers (and disconnected guest worlds) never overwrite local REDB slots.
+                effective_save_first = false;
+            }
+            if session.game.coop_active() {
+                session.game.leave_coop();
+            }
+        }
         if self.active_trip().is_some() {
             self.return_from_destination()?;
         }
         self.start_load_audio();
         self.present_loading_step(LoadingKind::Neighborhood, None, 0.2);
         let mut autosave_warning: Option<String> = None;
-        if save_first {
+        if effective_save_first {
             if let Err(err) = self.save_current_lot() {
                 let fallback = self.desired_music_mode();
                 self.stop_load_audio(fallback);
@@ -4869,6 +5034,9 @@ impl NeighborhoodShell {
         if self.options_file.is_file() {
             let _ = game.load_options(&self.options_file);
         }
+        game.coop_set_player_name(self.coop_player_name.clone());
+        game.coop_set_iroh_config(self.coop_iroh_config);
+        game.coop_set_travel_blocked(true);
         game.set_album_button_enabled(true);
         game.resize(self.size);
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
@@ -5040,6 +5208,9 @@ impl NeighborhoodShell {
             let ActiveScreen::Lot(session) = &self.screen else {
                 return Err("enter a home lot before traveling".into());
             };
+            if session.game.coop_active() {
+                return Err("Leave the co-op session before traveling to a destination.".into());
+            }
             if session.active_trip.is_some() {
                 return Err("household is already visiting a travel destination".into());
             }
@@ -5139,6 +5310,9 @@ impl NeighborhoodShell {
         self.flush_background_saves();
         let nh_id = match &self.screen {
             ActiveScreen::Lot(session) => {
+                if session.game.coop_active() {
+                    return Err("Leave the co-op session before traveling to a destination.".into());
+                }
                 if session.active_trip.is_some() {
                     return Err("already on an active travel trip".into());
                 }
@@ -5240,6 +5414,9 @@ impl NeighborhoodShell {
         if self.options_file.is_file() {
             let _ = game.load_options(&self.options_file);
         }
+        game.coop_set_player_name(self.coop_player_name.clone());
+        game.coop_set_iroh_config(self.coop_iroh_config);
+        game.coop_set_travel_blocked(true);
         game.set_album_button_enabled(true);
         game.resize(self.size);
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
@@ -5487,6 +5664,9 @@ impl NeighborhoodShell {
         if self.options_file.is_file() {
             let _ = game.load_options(&self.options_file);
         }
+        game.coop_set_player_name(self.coop_player_name.clone());
+        game.coop_set_iroh_config(self.coop_iroh_config);
+        game.coop_set_travel_blocked(true);
         game.set_album_button_enabled(true);
         game.resize(self.size);
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
@@ -5530,6 +5710,316 @@ impl NeighborhoodShell {
         .map_err(|e| e.to_string())?;
         self.refresh_from_store()?;
         Ok(restored.report.home_house)
+    }
+
+    // -------------------------------------------------------------------------
+    // Co-op Multiplayer Lobby & Session Helpers
+    // -------------------------------------------------------------------------
+
+    /// Whether the co-op lobby modal is currently open (either on the active
+    /// lot or over the Neighborhood shell).
+    pub fn coop_lobby_open(&self) -> bool {
+        if self.coop_lobby.is_open() {
+            return true;
+        }
+        matches!(&self.screen, ActiveScreen::Lot(session) if session.game.coop_lobby_open())
+    }
+
+    /// Sets the local player display name used when hosting or joining co-op.
+    pub fn coop_set_player_name(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            self.coop_player_name = trimmed.to_owned();
+            if let ActiveScreen::Lot(session) = &mut self.screen {
+                session
+                    .game
+                    .coop_set_player_name(self.coop_player_name.clone());
+            }
+        }
+    }
+
+    /// Configures the `iroh` binding mode (`P2pDefault` or `Loopback`) for
+    /// future co-op sessions.
+    pub fn coop_set_iroh_config(&mut self, config: sims_net::IrohConfig) {
+        self.coop_iroh_config = config;
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            session.game.coop_set_iroh_config(config);
+        }
+    }
+
+    /// Opens the co-op lobby dialog on the active lot or over the Neighborhood
+    /// screen.
+    pub fn open_coop_lobby(&mut self, tab: Option<LobbyTab>) {
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            session.game.open_coop_lobby(tab);
+            return;
+        }
+        self.coop_error = None;
+        self.coop_lobby.open(tab.unwrap_or(LobbyTab::Join));
+    }
+
+    /// Toggles the co-op lobby dialog open or closed (`F6` / `Ctrl+M`).
+    pub fn toggle_coop_lobby(&mut self) -> bool {
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            return session.game.toggle_coop_lobby();
+        }
+        if self.coop_lobby.is_open() {
+            self.coop_lobby.close();
+        } else {
+            self.coop_error = None;
+            self.coop_lobby.open(LobbyTab::Join);
+        }
+        true
+    }
+
+    /// Pastes a ticket into the open co-op lobby dialog (`Ctrl/Cmd+V`), using
+    /// the OS clipboard when `text` is `None`.
+    pub fn coop_lobby_paste(&mut self, text: Option<&str>) -> bool {
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.coop_lobby_open()
+        {
+            return session.game.coop_lobby_paste(text);
+        }
+        if !self.coop_lobby.is_open() {
+            return false;
+        }
+        let pasted = match text {
+            Some(s) => s.to_owned(),
+            None => crate::coop::clipboard_paste().unwrap_or_default(),
+        };
+        if pasted.is_empty() {
+            return false;
+        }
+        self.coop_lobby.paste_text(&pasted)
+    }
+
+    /// Cleanly leaves any active co-op session and shuts down its background
+    /// transport runtime. Safe to call when offline.
+    pub fn leave_coop_if_active(&mut self) {
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.coop_active()
+        {
+            session.game.leave_coop();
+        }
+    }
+
+    /// Picks a default residential home lot in the current neighborhood for
+    /// CLI/shell co-op host or join bootstrapping (prefers lot 5 / Goth house,
+    /// then first occupied home lot `1..=10`, then lot 5).
+    fn default_coop_home_lot(&self) -> u32 {
+        if self.stored.family_in(5).is_some() {
+            return 5;
+        }
+        for house in 1..=10 {
+            if self.stored.family_in(house).is_some() {
+                return house;
+            }
+        }
+        5
+    }
+
+    /// Hosts a co-op session on the currently open home lot, or enters the
+    /// default residential lot first when called from Neighborhood view.
+    pub fn coop_host_current_or_default(&mut self) -> Result<(), String> {
+        if !matches!(self.screen, ActiveScreen::Lot(_)) {
+            let house = self.default_coop_home_lot();
+            self.enter_lot(house)?;
+        }
+        let ActiveScreen::Lot(session) = &mut self.screen else {
+            return Err("could not open a home lot to host co-op".into());
+        };
+        session.game.open_coop_lobby(Some(LobbyTab::Host));
+        session.game.coop_start_host_async(None)
+    }
+
+    /// Validates `ticket`, enters a local host-compatible lot shell if on the
+    /// Neighborhood screen, and starts joining the remote co-op host via
+    /// non-blocking `IrohTransport` + `"SCOP"` v2 snapshot restore.
+    pub fn coop_join_from_shell(&mut self, ticket: String) -> Result<(), String> {
+        let trimmed = ticket.trim().to_owned();
+        if trimmed.is_empty() {
+            return Err("Paste a simscoop1... invite ticket first.".into());
+        }
+        sims_net::InviteTicket::decode_string(&trimmed)
+            .map_err(|e| format!("Invalid invite ticket: {e}"))?;
+        if !matches!(self.screen, ActiveScreen::Lot(_)) {
+            let house = self.default_coop_home_lot();
+            self.enter_lot(house)?;
+        }
+        let ActiveScreen::Lot(session) = &mut self.screen else {
+            return Err("could not open lot shell to join co-op".into());
+        };
+        session.game.open_coop_lobby(Some(LobbyTab::Join));
+        session.game.coop_start_join_async(trimmed, None)
+    }
+
+    /// Checks if the active lot's co-op session parked a verified `"SCOP"` v2
+    /// snapshot for a different `(host_house, host_family)` than the currently
+    /// loaded guest lot, re-stages the matching local lot seamlessly, and
+    /// completes verified restore + host ACK. Returns `true` if handled.
+    pub fn pump_coop_restage(&mut self) -> bool {
+        let Some((host_house, host_family)) = (match &self.screen {
+            ActiveScreen::Lot(session) => session.game.pending_coop_restage(),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let (mut coop, lobby_open) = {
+            let ActiveScreen::Lot(session) = &mut self.screen else {
+                return false;
+            };
+            let was_open = session.game.coop_lobby_open();
+            (session.game.take_coop_controller(), was_open)
+        };
+
+        // Try ordered candidate sources (REDB store first, then installed
+        // `HouseNN.iff`) so an `OtherLoad` mismatch on the store copy falls
+        // back seamlessly to the matching installed base house before failing.
+        let mut candidates: Vec<Game> = Vec::new();
+        let store_matches = self
+            .stored
+            .family_in(host_house)
+            .is_some_and(|(fid, _)| u32::from(fid) == host_family);
+        if store_matches
+            && let Ok(game) = Game::open_from_store(
+                &self.install_root,
+                &self.store,
+                &self.neighborhood_id,
+                host_house,
+                &self.answers,
+                self.play,
+                self.frames.clone(),
+            )
+        {
+            candidates.push(game);
+        }
+        let base_house = self
+            .install_root
+            .join("UserData")
+            .join("Houses")
+            .join(format!("House{host_house:02}.iff"));
+        if base_house.is_file()
+            && let Ok(game) = Game::open(&crate::game::Options {
+                install: self.install_root.clone(),
+                house: base_house,
+                answers: self.answers.clone(),
+                play: self.play,
+                frames: self.frames.clone(),
+            })
+        {
+            candidates.push(game);
+        }
+
+        let mut last_err = format!(
+            "Host is playing Lot {host_house} (family {host_family}), which is not available \
+             in this neighborhood or install."
+        );
+        for mut new_game in candidates {
+            if self.options_file.is_file() {
+                let _ = new_game.load_options(&self.options_file);
+            }
+            new_game.coop_set_player_name(self.coop_player_name.clone());
+            new_game.coop_set_iroh_config(self.coop_iroh_config);
+            new_game.set_album_button_enabled(true);
+            new_game.resize(self.size);
+            new_game.install_coop_controller(coop, true);
+            if lobby_open {
+                new_game.open_coop_lobby(Some(LobbyTab::Join));
+            }
+            match new_game.try_complete_pending_coop_restage() {
+                Ok(()) => {
+                    let initial_days_played =
+                        new_game.lot().world().globals.get(28).copied().unwrap_or(0);
+                    if let ActiveScreen::Lot(session) = &mut self.screen {
+                        session.game = new_game;
+                        session.house = host_house;
+                        session.last_days_played = initial_days_played;
+                    }
+                    self.lot_generation = self.lot_generation.wrapping_add(1);
+                    return true;
+                }
+                Err(crate::coop::RestageAttemptError::Mismatch(err)) => {
+                    // Snapshot remains parked; take controller back and try next candidate.
+                    coop = new_game.take_coop_controller();
+                    last_err = err;
+                }
+                Err(crate::coop::RestageAttemptError::Fatal(err)) => {
+                    let failed_coop = new_game.take_coop_controller();
+                    if let ActiveScreen::Lot(session) = &mut self.screen {
+                        session.game.install_coop_controller(failed_coop, false);
+                        session.game.set_note(err);
+                        if lobby_open {
+                            session.game.open_coop_lobby(Some(LobbyTab::Join));
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            coop.fail_pending_restage(session.game.lot_mut(), last_err.clone());
+            session.game.install_coop_controller(coop, false);
+            session.game.set_note(last_err);
+            if lobby_open {
+                session.game.open_coop_lobby(Some(LobbyTab::Join));
+            }
+        }
+        true
+    }
+
+    fn shell_coop_snapshot(&self) -> CoopSnapshot {
+        CoopSnapshot {
+            role: sims_ui::coop::CoopRole::Offline,
+            connection: match &self.coop_error {
+                Some(err) => sims_ui::coop::ConnectionState::Error(err.clone()),
+                None => sims_ui::coop::ConnectionState::Disconnected,
+            },
+            players: Vec::new(),
+            host_only_time_control: false,
+            pause_reasons: Vec::new(),
+            time_toast: None,
+            resync: None,
+        }
+    }
+
+    fn handle_shell_coop_command(&mut self, cmd: CoopCommand) -> ShellOutcome {
+        match cmd {
+            CoopCommand::CloseDialog => {
+                self.coop_lobby.close();
+                self.coop_error = None;
+                ShellOutcome::redraw()
+            }
+            CoopCommand::StartHosting => {
+                if let Err(err) = self.coop_host_current_or_default() {
+                    self.coop_error = Some(err);
+                } else {
+                    self.coop_lobby.close();
+                    self.coop_error = None;
+                }
+                ShellOutcome::redraw()
+            }
+            CoopCommand::JoinSession { ticket } => {
+                if let Err(err) = self.coop_join_from_shell(ticket) {
+                    self.coop_error = Some(err);
+                } else {
+                    self.coop_lobby.close();
+                    self.coop_error = None;
+                }
+                ShellOutcome::redraw()
+            }
+            CoopCommand::CopyInviteTicket(ticket) => {
+                let _ = crate::coop::clipboard_copy(&ticket);
+                self.note = Some("Copied co-op invite ticket to clipboard.".into());
+                ShellOutcome::redraw()
+            }
+            CoopCommand::Disconnect | CoopCommand::CancelConnect => {
+                self.coop_error = None;
+                ShellOutcome::redraw()
+            }
+            CoopCommand::SetHostOnlyTimeControl(_) => ShellOutcome::redraw(),
+        }
     }
 }
 

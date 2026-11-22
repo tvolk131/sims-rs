@@ -3591,12 +3591,14 @@ dependencies = [
  "sims-content",
  "sims-core",
  "sims-formats",
+ "sims-net",
  "sims-people",
  "sims-render",
  "sims-sim",
  "sims-ui",
  "sims-vm",
  "softbuffer",
+ "tokio",
  "winit",
 ]
 

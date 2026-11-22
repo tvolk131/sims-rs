@@ -172,6 +172,11 @@ pub struct Hud {
     /// Last laid-out screen rect of the Options-strip "Saves" button (present only
     /// while `Mode::Options` is expanded).
     saves_button_rect: Option<Rect>,
+    /// Whether the Options-strip "Co-op" multiplayer button is currently pressed.
+    pressed_coop_button: bool,
+    /// Last laid-out screen rect of the Options-strip "Co-op" button (present only
+    /// while `Mode::Options` is expanded).
+    coop_button_rect: Option<Rect>,
     /// Whether the Camera-panel Photo Album button (`CamViewAlbum`, resource `1105`)
     /// is shown beside the snapshot button (enabled in `NeighborhoodShell` lots,
     /// disabled for standalone/ratchet renders so static Live frames stay bit-exact).
@@ -533,6 +538,8 @@ impl Hud {
             pressed_options_action: None,
             pressed_saves_button: false,
             saves_button_rect: None,
+            pressed_coop_button: false,
+            coop_button_rect: None,
             album_button_enabled: false,
             pressed_album_button: false,
             album_button_rect: None,
@@ -575,6 +582,8 @@ impl Hud {
         self.pressed_options_action = None;
         self.pressed_saves_button = false;
         self.saves_button_rect = None;
+        self.pressed_coop_button = false;
+        self.coop_button_rect = None;
         self.pressed_album_button = false;
         self.album_button_rect = None;
         self.roof_view = false;
@@ -1045,6 +1054,28 @@ impl Hud {
         self.pressed_saves_button = false;
         let activated = point.is_some_and(|[x, y]| {
             self.saves_button_rect
+                .is_some_and(|rect| rect.contains(x, y))
+        });
+        if activated {
+            self.play(CLICK);
+        }
+        (true, activated)
+    }
+
+    /// Screen rectangle of the Options-strip "Co-op" button (present only while
+    /// Options mode is expanded).
+    pub fn options_coop_button_rect(&self) -> Option<Rect> {
+        self.coop_button_rect
+    }
+
+    /// Releases a held Options-strip "Co-op" button, returning `(changed, activated)`.
+    pub fn release_coop_button(&mut self, point: Option<[i32; 2]>) -> (bool, bool) {
+        if !self.pressed_coop_button {
+            return (false, false);
+        }
+        self.pressed_coop_button = false;
+        let activated = point.is_some_and(|[x, y]| {
+            self.coop_button_rect
                 .is_some_and(|rect| rect.contains(x, y))
         });
         if activated {
@@ -1635,7 +1666,11 @@ impl Hud {
         );
         self.saves_button_rect = self.compute_options_saves_button_rect(view.size);
         if let Some(rect) = self.saves_button_rect {
-            self.draw_options_saves_button(&mut frame, rect);
+            self.draw_options_strip_button(&mut frame, rect, "Saves", self.pressed_saves_button);
+        }
+        self.coop_button_rect = self.compute_options_coop_button_rect(view.size);
+        if let Some(rect) = self.coop_button_rect {
+            self.draw_options_strip_button(&mut frame, rect, "Co-op", self.pressed_coop_button);
         }
         self.album_button_rect = self.compute_camera_album_button_rect();
         if let Some(rect) = self.album_button_rect {
@@ -1760,8 +1795,10 @@ impl Hud {
             .map(|i| i.rect.x)?;
         let left = quit.rect.x + quit.rect.width + 4;
         let avail = divider_x - left - 3;
-        if avail >= 42 {
-            Some(Rect::new(left, quit.rect.y + 6, avail.min(48), 28))
+        if avail >= 98 {
+            Some(Rect::new(left, quit.rect.y + 6, 46, 28))
+        } else if avail >= 42 {
+            Some(Rect::new(left, quit.rect.y + 2, avail.min(48), 22))
         } else {
             // Compact window fallback: sit neatly in the bottom-right corner of the strip.
             let x = (size[0] - 54).max(divider_x + 4);
@@ -1770,12 +1807,43 @@ impl Hud {
         }
     }
 
-    fn draw_options_saves_button(&self, frame: &mut Frame, rect: Rect) {
+    fn compute_options_coop_button_rect(&self, size: [i32; 2]) -> Option<Rect> {
+        if self.controls.mode != Mode::Options || !self.controls.expanded {
+            return None;
+        }
+        let quit = self
+            .items
+            .iter()
+            .find(|i| i.command == Some(Command::OptionsAction(OptionsAction::Quit)))?;
+        let divider_x = self
+            .items
+            .iter()
+            .find(|i| {
+                matches!(
+                    i.kind,
+                    hud::Kind::Image(id) if id == options::id::TOOTHPICK_VERT
+                )
+            })
+            .map(|i| i.rect.x)?;
+        let left = quit.rect.x + quit.rect.width + 4;
+        let avail = divider_x - left - 3;
+        if avail >= 98 {
+            Some(Rect::new(left + 50, quit.rect.y + 6, 46, 28))
+        } else if avail >= 42 {
+            Some(Rect::new(left, quit.rect.y + 26, avail.min(48), 22))
+        } else {
+            let saves_x = (size[0] - 54).max(divider_x + 4);
+            let y = (size[1] - 26).max(0);
+            Some(Rect::new((saves_x - 52).max(0), y, 48, 22))
+        }
+    }
+
+    fn draw_options_strip_button(&self, frame: &mut Frame, rect: Rect, label: &str, pressed: bool) {
         let hovered = self
             .controls
             .pointer
             .is_some_and(|[px, py]| rect.contains(px, py));
-        let (bg, border, text_rgb) = if self.pressed_saves_button && hovered {
+        let (bg, border, text_rgb) = if pressed && hovered {
             ([30, 88, 176], [0, 255, 255], [0, 255, 255])
         } else if hovered {
             ([26, 62, 146], [136, 178, 232], [255, 255, 255])
@@ -1794,7 +1862,6 @@ impl Hud {
             border,
         );
         if let Some(font) = self.art.font(10).or_else(|| self.art.font(12)) {
-            let label = "Saves";
             let tw = font.width(label);
             let tx = rect.x + (rect.width - tw) / 2;
             let ty = rect.y + (rect.height - font.line_height) / 2;
@@ -1909,6 +1976,12 @@ impl Hud {
         self.has_dialog()
             || self.menu.is_some()
             || self.band.is_some_and(|b| b.contains(point[0], point[1]))
+            || self
+                .saves_button_rect
+                .is_some_and(|r| r.contains(point[0], point[1]))
+            || self
+                .coop_button_rect
+                .is_some_and(|r| r.contains(point[0], point[1]))
             || self
                 .album_button_rect
                 .is_some_and(|r| r.contains(point[0], point[1]))
@@ -2049,9 +2122,11 @@ impl Hud {
         let over_saves = |pointer: Option<[i32; 2]>| {
             let s = pointer
                 .is_some_and(|[x, y]| self.saves_button_rect.is_some_and(|r| r.contains(x, y)));
+            let c = pointer
+                .is_some_and(|[x, y]| self.coop_button_rect.is_some_and(|r| r.contains(x, y)));
             let a = pointer
                 .is_some_and(|[x, y]| self.album_button_rect.is_some_and(|r| r.contains(x, y)));
-            (s, a)
+            (s, c, a)
         };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
@@ -2192,6 +2267,13 @@ impl Hud {
             .is_some_and(|r| r.contains(point[0], point[1]))
         {
             self.pressed_saves_button = true;
+            return None;
+        }
+        if self
+            .coop_button_rect
+            .is_some_and(|r| r.contains(point[0], point[1]))
+        {
+            self.pressed_coop_button = true;
             return None;
         }
         if self

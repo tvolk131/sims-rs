@@ -24,6 +24,7 @@
 
 pub mod autosave_worker;
 pub mod caf_screen;
+pub mod coop;
 pub mod game;
 pub mod hud;
 pub mod menu;

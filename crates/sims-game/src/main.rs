@@ -388,6 +388,15 @@ struct Still {
     size: [i32; 2],
 }
 
+/// Pending CLI co-op action applied once startup completes.
+#[derive(Debug, Clone, Default)]
+struct CoopCliConfig {
+    host: bool,
+    join: Option<String>,
+    player_name: Option<String>,
+    loopback: bool,
+}
+
 /// Parsed CLI launch configuration.
 struct LaunchConfig {
     install: PathBuf,
@@ -399,6 +408,7 @@ struct LaunchConfig {
     still: Option<Still>,
     mute: bool,
     saves: PathBuf,
+    coop: CoopCliConfig,
 }
 
 fn parse_launch_args<I>(args: I, env_install: Option<PathBuf>) -> Result<LaunchConfig, String>
@@ -406,7 +416,8 @@ where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
     let usage = "usage: sims-game [<install>] [<house file>] [--neighborhood] [--answers A,B,...] \
-                 [--mute] [--play] [--saves <file>] [--png <file> [--ticks N] [--size WxH]]";
+                 [--mute] [--play] [--saves <file>] [--host | --join <ticket>] [--player-name <name>] \
+                 [--coop-loopback] [--png <file> [--ticks N] [--size WxH]]";
     let mut paths = Vec::new();
     let mut answers = None;
     let mut png = None;
@@ -416,6 +427,7 @@ where
     let mut play = false;
     let mut neighborhood_flag = false;
     let mut saves = PathBuf::from("sims-game-saves.redb");
+    let mut coop = CoopCliConfig::default();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut text = |name: &str| -> Result<String, String> {
@@ -429,6 +441,23 @@ where
             play = true;
         } else if arg == "--neighborhood" {
             neighborhood_flag = true;
+        } else if arg == "--host" {
+            coop.host = true;
+        } else if arg == "--join" {
+            let ticket = text("--join")?;
+            let trimmed = ticket.trim().to_owned();
+            sims_net::InviteTicket::decode_string(&trimmed)
+                .map_err(|e| format!("--join invalid invite ticket: {e}"))?;
+            coop.join = Some(trimmed);
+        } else if arg == "--player-name" {
+            let name = text("--player-name")?;
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                return Err("--player-name cannot be empty".into());
+            }
+            coop.player_name = Some(trimmed.to_owned());
+        } else if arg == "--coop-loopback" {
+            coop.loopback = true;
         } else if arg == "--saves" {
             saves = PathBuf::from(text("--saves")?);
         } else if arg == "--png" {
@@ -458,6 +487,12 @@ where
         } else {
             paths.push(PathBuf::from(arg));
         }
+    }
+    if coop.host && coop.join.is_some() {
+        return Err("--host and --join cannot be combined".into());
+    }
+    if png.is_some() && (coop.host || coop.join.is_some()) {
+        return Err("--png cannot be combined with --host or --join".into());
     }
     let mut paths = paths.into_iter();
     let install = match paths.next() {
@@ -496,6 +531,7 @@ where
         still,
         mute,
         saves,
+        coop,
     })
 }
 
@@ -648,6 +684,14 @@ impl Session {
         }
     }
 
+    fn coop_lobby_open(&self) -> bool {
+        match self {
+            Self::Starting(_) => false,
+            Self::Standalone { game, .. } => game.coop_lobby_open(),
+            Self::Shell(shell) => shell.coop_lobby_open(),
+        }
+    }
+
     fn is_actively_interacting(&self) -> bool {
         match self {
             Self::Starting(_) => false,
@@ -746,6 +790,8 @@ struct App {
     shift_held: bool,
     /// Fatal background startup error propagated as a nonzero exit status from `run()`.
     startup_error: Option<String>,
+    /// Deferred CLI co-op action applied once the Neighborhood shell finishes loading.
+    pending_coop: CoopCliConfig,
 }
 
 /// Filters startup `WindowEvent::Focused` notifications so ordinary window
@@ -991,6 +1037,22 @@ impl App {
         self.session.persist_options();
     }
 
+    fn shutdown_session(&mut self) {
+        self.persist_options();
+        match &mut self.session {
+            Session::Starting(_) => {}
+            Session::Standalone { game, .. } => {
+                if game.coop_active() {
+                    game.leave_coop();
+                }
+            }
+            Session::Shell(shell) => {
+                shell.leave_coop_if_active();
+                shell.flush_background_saves();
+            }
+        }
+    }
+
     fn slider_release_point(&mut self) -> Option<[i32; 2]> {
         let scale = self.scale.get();
         #[cfg(target_os = "macos")]
@@ -1143,6 +1205,12 @@ impl App {
         if outcome.photo {
             self.photo();
         }
+        if outcome.open_coop_lobby
+            && let Some(game) = self.session.game_mut()
+        {
+            game.open_coop_lobby(None);
+            self.changed(true, true);
+        }
         if outcome.open_save_manager
             && let Some(game) = self.session.game_mut()
         {
@@ -1169,6 +1237,7 @@ impl App {
             self.changed(true, true);
         }
         if outcome.quit && saved_ok {
+            self.shutdown_session();
             event_loop.exit();
         }
     }
@@ -1181,10 +1250,7 @@ impl App {
             self.photo();
         }
         if outcome.quit {
-            self.persist_options();
-            if let Session::Shell(shell) = &mut self.session {
-                shell.flush_background_saves();
-            }
+            self.shutdown_session();
             event_loop.exit();
         }
     }
@@ -1382,6 +1448,24 @@ impl App {
                         Sound::start(&install, mute)
                     };
                     *self.sound.borrow_mut() = next_sound;
+                    let pending_coop = std::mem::take(&mut self.pending_coop);
+                    if let Some(name) = pending_coop.player_name {
+                        shell.coop_set_player_name(name);
+                    }
+                    if pending_coop.loopback {
+                        shell.coop_set_iroh_config(sims_net::IrohConfig::Loopback);
+                    }
+                    if pending_coop.host {
+                        if let Err(err) = shell.coop_host_current_or_default() {
+                            eprintln!("sims-game: co-op host failed: {err}");
+                            shell.set_note(format!("Co-op host failed: {err}"));
+                        }
+                    } else if let Some(ticket) = pending_coop.join
+                        && let Err(err) = shell.coop_join_from_shell(ticket)
+                    {
+                        eprintln!("sims-game: co-op join failed: {err}");
+                        shell.set_note(format!("Co-op join failed: {err}"));
+                    }
                     self.session = Session::Shell(Box::new(shell));
                     self.attach_loading_presenter();
                     self.drain_shell_audio();
@@ -1415,11 +1499,26 @@ impl App {
                     || shell.travel_dialog_open()
         );
         if shell_modal_open {
-            self.wake_clock.finish(now, Instant::now(), false);
-            let redraw = match &mut self.session {
+            let mut redraw = match &mut self.session {
                 Session::Shell(shell) => shell.tick_shell(clock_us),
                 Session::Standalone { .. } | Session::Starting(_) => false,
             };
+            // Keep co-op lockstep & peer ACKs running beneath presentation
+            // modals (Save Manager / Photo Album) so neither side stalls.
+            if let Some(game) = self.session.game_mut()
+                && game.coop_active()
+            {
+                let (ran, capped) = game.advance_while(clock_us, step_us, |ran| {
+                    within_step_budget(ran, now.elapsed(), SIM_BUDGET)
+                });
+                self.wake_clock.finish(now, Instant::now(), capped);
+                redraw |= ran > 0 || game.blink_due();
+            } else {
+                self.wake_clock.finish(now, Instant::now(), false);
+            }
+            if let Session::Shell(shell) = &mut self.session {
+                redraw |= shell.pump_coop_restage();
+            }
             self.changed(redraw, false);
             return;
         }
@@ -1458,7 +1557,17 @@ impl App {
             redraw = true;
         }
         if let Session::Shell(shell) = &mut self.session {
+            redraw |= shell.pump_coop_restage();
             redraw |= shell.poll_background_saves();
+        } else if let Session::Standalone { game, .. } = &mut self.session
+            && let Some((host_house, host_family)) = game.pending_coop_restage()
+        {
+            game.fail_pending_coop_restage(format!(
+                "Host is playing Lot {host_house} (family {host_family}), which does not match \
+                 this standalone house file. Relaunch with House{host_house:02}.iff or in \
+                 Neighborhood mode and rejoin."
+            ));
+            redraw = true;
         }
         // Edge-scrolling and active 400 ms pie animations use display-refresh cadence,
         // while pure simulation ticks / plumb-bob spin / pause blink are passive (60 FPS cap).
@@ -1733,10 +1842,7 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                self.persist_options();
-                if let Session::Shell(shell) = &mut self.session {
-                    shell.flush_background_saves();
-                }
+                self.shutdown_session();
                 event_loop.exit();
             }
             WindowEvent::Focused(focused) => {
@@ -1793,6 +1899,11 @@ impl ApplicationHandler for App {
                     && self.ctrl_or_cmd_held
                     && self.shift_held
                     && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("c"));
+                let is_coop_toggle = !event.repeat
+                    && (event.logical_key == Key::Named(NamedKey::F6)
+                        || (self.ctrl_or_cmd_held
+                            && !self.shift_held
+                            && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("m"))));
                 let save_manager_open = matches!(
                     &self.session,
                     Session::Shell(shell) if shell.save_manager_open()
@@ -1806,6 +1917,103 @@ impl ApplicationHandler for App {
                     Session::Shell(shell) if shell.travel_dialog_open()
                 );
                 let shop_open = self.session.game().is_some_and(Game::shop_open);
+                let coop_lobby_open = self.session.coop_lobby_open();
+                if is_coop_toggle
+                    && !save_manager_open
+                    && !album_open
+                    && !travel_dialog_open
+                    && !shop_open
+                    && self.session.screen_kind() != ScreenKind::CreateFamily
+                    && (coop_lobby_open || !self.session.has_dialog())
+                {
+                    let toggled = match &mut self.session {
+                        Session::Starting(_) => false,
+                        Session::Standalone { game, .. } => game.toggle_coop_lobby(),
+                        Session::Shell(shell) => shell.toggle_coop_lobby(),
+                    };
+                    self.changed(toggled, true);
+                    return;
+                }
+                if coop_lobby_open {
+                    let is_paste = !event.repeat
+                        && self.ctrl_or_cmd_held
+                        && !self.shift_held
+                        && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("v"));
+                    match &mut self.session {
+                        Session::Starting(_) => {}
+                        Session::Standalone { game, .. } => {
+                            let out = if is_paste {
+                                sims_game::game::Outcome {
+                                    redraw: game.coop_lobby_paste(None),
+                                    ..sims_game::game::Outcome::default()
+                                }
+                            } else {
+                                match &event.logical_key {
+                                    Key::Named(NamedKey::Escape) if !event.repeat => {
+                                        game.coop_lobby_escape()
+                                    }
+                                    Key::Named(NamedKey::Enter) if !event.repeat => {
+                                        game.coop_lobby_submit()
+                                    }
+                                    Key::Named(NamedKey::Backspace) => sims_game::game::Outcome {
+                                        redraw: game.coop_lobby_backspace(),
+                                        ..sims_game::game::Outcome::default()
+                                    },
+                                    Key::Named(NamedKey::Tab) => sims_game::game::Outcome {
+                                        redraw: game.coop_lobby_toggle_tab(),
+                                        ..sims_game::game::Outcome::default()
+                                    },
+                                    _ => {
+                                        let mut changed = false;
+                                        if !self.ctrl_or_cmd_held
+                                            && let Some(text) = &event.text
+                                        {
+                                            for ch in text.chars() {
+                                                changed |= game.coop_lobby_char(ch);
+                                            }
+                                        }
+                                        sims_game::game::Outcome {
+                                            redraw: changed,
+                                            ..sims_game::game::Outcome::default()
+                                        }
+                                    }
+                                }
+                            };
+                            self.handle_standalone_outcome(event_loop, out);
+                        }
+                        Session::Shell(shell) => {
+                            let out = if is_paste {
+                                ShellOutcome {
+                                    redraw: shell.coop_lobby_paste(None),
+                                    ..ShellOutcome::default()
+                                }
+                            } else {
+                                match &event.logical_key {
+                                    Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
+                                    Key::Named(NamedKey::Enter) if !event.repeat => {
+                                        shell.key_enter()
+                                    }
+                                    Key::Named(NamedKey::Backspace) => shell.key_backspace(),
+                                    Key::Named(NamedKey::Tab) => shell.key_tab(),
+                                    _ => {
+                                        let mut combined = ShellOutcome::default();
+                                        if !self.ctrl_or_cmd_held
+                                            && let Some(text) = &event.text
+                                        {
+                                            for ch in text.chars() {
+                                                let o = shell.key_char(ch);
+                                                combined.redraw |= o.redraw;
+                                            }
+                                        }
+                                        combined
+                                    }
+                                }
+                            };
+                            self.handle_shell_outcome(event_loop, out);
+                        }
+                    }
+                    return;
+                }
                 if is_cheat_toggle
                     && !save_manager_open
                     && !album_open
@@ -2148,7 +2356,7 @@ impl ApplicationHandler for App {
                                 if !escaped_options
                                     && escape_exits(closed, cancelled, game.buy_cursor().is_some())
                                 {
-                                    self.persist_options();
+                                    self.shutdown_session();
                                     event_loop.exit();
                                 } else {
                                     self.changed(true, true);
@@ -2167,8 +2375,7 @@ impl ApplicationHandler for App {
                                             game.buy_cursor().is_some(),
                                         )
                                     {
-                                        shell.flush_background_saves();
-                                        self.persist_options();
+                                        self.shutdown_session();
                                         event_loop.exit();
                                     } else {
                                         self.changed(true, true);
@@ -2203,7 +2410,7 @@ impl ApplicationHandler for App {
                     self.changed(redraw, true);
                     return;
                 }
-                if self.session.has_dialog() {
+                if self.session.has_dialog() || self.session.coop_lobby_open() {
                     return;
                 }
                 if let Some(game) = self.session.game_mut() {
@@ -2275,7 +2482,10 @@ impl ApplicationHandler for App {
                     }
                 }
                 (MouseButton::Right, ElementState::Pressed) => {
-                    if self.session.game().is_some() && !self.session.has_dialog() {
+                    if self.session.game().is_some()
+                        && !self.session.has_dialog()
+                        && !self.session.coop_lobby_open()
+                    {
                         self.drag = self.live_point().and(self.cursor);
                     }
                 }
@@ -2352,7 +2562,10 @@ impl ApplicationHandler for App {
                     }
                     self.changed(redraw, true);
                 }
-                if self.session.has_dialog() || self.session.game().is_none() {
+                if self.session.has_dialog()
+                    || self.session.coop_lobby_open()
+                    || self.session.game().is_none()
+                {
                     self.drag = None;
                 }
                 if let Some(start) = self.drag {
@@ -2456,6 +2669,25 @@ fn run() -> Result<(), String> {
             eprintln!("sims-game: {}: {e}", options_file.display());
         }
         let saved_optn = game.options().to_optn();
+        if let Some(name) = config.coop.player_name.clone() {
+            game.coop_set_player_name(name);
+        }
+        if config.coop.loopback {
+            game.coop_set_iroh_config(sims_net::IrohConfig::Loopback);
+        }
+        if config.coop.host {
+            game.open_coop_lobby(Some(sims_ui::coop::LobbyTab::Host));
+            if let Err(err) = game.coop_start_host_async(None) {
+                eprintln!("sims-game: co-op host failed: {err}");
+                game.set_note(format!("Co-op host failed: {err}"));
+            }
+        } else if let Some(ticket) = config.coop.join.clone() {
+            game.open_coop_lobby(Some(sims_ui::coop::LobbyTab::Join));
+            if let Err(err) = game.coop_start_join_async(ticket, None) {
+                eprintln!("sims-game: co-op join failed: {err}");
+                game.set_note(format!("Co-op join failed: {err}"));
+            }
+        }
         #[cfg(any(target_os = "macos", feature = "sound"))]
         let sound = match preloaded_mixer {
             Some(mixer) => Sound::from_mixer(mixer),
@@ -2494,6 +2726,7 @@ fn run() -> Result<(), String> {
             ctrl_or_cmd_held: false,
             shift_held: false,
             startup_error: None,
+            pending_coop: CoopCliConfig::default(),
         };
         let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
         return event_loop.run_app(&mut app).map_err(|e| e.to_string());
@@ -2585,6 +2818,7 @@ fn run() -> Result<(), String> {
         ctrl_or_cmd_held: false,
         shift_held: false,
         startup_error: None,
+        pending_coop: config.coop,
     };
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
@@ -3035,5 +3269,77 @@ mod tests {
         assert_eq!(cfg.house, Some(goth_house(std::path::Path::new("/sims"))));
         assert_eq!(cfg.answers, vec![3]);
         assert!(cfg.still.is_some());
+    }
+
+    #[test]
+    fn cli_parses_coop_host_join_and_rejects_invalid_combinations() {
+        let env = Some(PathBuf::from("/sims"));
+
+        let host_cfg = parse_launch_args(
+            [
+                OsString::from("--host"),
+                OsString::from("--player-name"),
+                OsString::from("Alice"),
+                OsString::from("--coop-loopback"),
+            ],
+            env.clone(),
+        )
+        .unwrap();
+        assert!(host_cfg.coop.host);
+        assert!(host_cfg.coop.join.is_none());
+        assert_eq!(host_cfg.coop.player_name.as_deref(), Some("Alice"));
+        assert!(host_cfg.coop.loopback);
+
+        // Generate a real canonical simscoop1... invite ticket via loopback IrohBridge.
+        let mut bridge =
+            sims_game::coop::IrohBridge::bind_blocking(sims_net::IrohConfig::Loopback).unwrap();
+        let ticket = bridge.invite_ticket_string().to_owned();
+        bridge.shutdown();
+        let join_cfg = parse_launch_args(
+            [
+                OsString::from("--join"),
+                OsString::from(&ticket),
+                OsString::from("--player-name"),
+                OsString::from("Bob"),
+            ],
+            env.clone(),
+        )
+        .unwrap();
+        assert!(!join_cfg.coop.host);
+        assert_eq!(join_cfg.coop.join.as_deref(), Some(ticket.as_str()));
+        assert_eq!(join_cfg.coop.player_name.as_deref(), Some("Bob"));
+
+        // Invalid ticket fails immediately.
+        assert!(
+            parse_launch_args(
+                [OsString::from("--join"), OsString::from("not-a-ticket")],
+                env.clone(),
+            )
+            .is_err()
+        );
+        // --host + --join rejected.
+        assert!(
+            parse_launch_args(
+                [
+                    OsString::from("--host"),
+                    OsString::from("--join"),
+                    OsString::from(&ticket),
+                ],
+                env.clone(),
+            )
+            .is_err()
+        );
+        // --png + --host rejected.
+        assert!(
+            parse_launch_args(
+                [
+                    OsString::from("--png"),
+                    OsString::from("out.png"),
+                    OsString::from("--host"),
+                ],
+                env,
+            )
+            .is_err()
+        );
     }
 }

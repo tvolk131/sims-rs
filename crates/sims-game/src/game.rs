@@ -12,6 +12,10 @@
 //! caught is logged and shown across the top for a while, and only a
 //! failure play mode does not catch stops the lot.
 
+use crate::coop::{
+    CoopController, CoopPollOutput, CoopPumpStats, CoopStartOptions, CoopTransport, clipboard_copy,
+    clipboard_paste, default_player_name, player_badge_color,
+};
 use crate::hud::{DialogKey, Hud, HudShared, HudStatic, OptionsDialog};
 use crate::menu::{self, Listing, Menu};
 use crate::pace::{self, Pace};
@@ -25,6 +29,10 @@ use sims_content::{
     Animations, ArchivePool, AvatarRegistry, Catalog, House, Index, Install, Neighborhood,
     People as ContentPeople, Surfaces, Wardrobe,
 };
+use sims_net::{
+    BuyBuildEdit, CameraRotation, Command as NetCommand, IrohConfig, ManifestDigest, PeerAddress,
+    PlayerId as NetPlayerId, PlayerMode as NetPlayerMode, SimSpeed as NetSimSpeed,
+};
 use sims_people::{Cast, Library as PeopleLibrary, PreloadedCast};
 use sims_render::build_preview::{
     self as render_build, RoofCatalog, RoofPitch as RenderRoofPitch, RoofPreviewConfig, RoofStyle,
@@ -37,6 +45,10 @@ use sims_ui::build::{BuildSubtoolAction, RoofPitchPreset, TerrainSubtool, WaterS
 use sims_ui::command::{
     BuildItemId, BuildTool, Camera as UiCamera, Command, Mode, OptionsAction, OptionsToggle, Speed,
     VolumeChannel, Walls as UiWalls,
+};
+use sims_ui::coop::{
+    ConnectionState as CoopConnectionState, CoopCommand, CoopHudOverlay, CoopLobbyDialog,
+    CoopSnapshot, LobbyTab,
 };
 use sims_ui::options::{LotVisibility, OptionsState};
 use sims_ui::shop::{
@@ -116,6 +128,8 @@ pub struct Outcome {
     pub neighborhood: bool,
     /// The player clicked the Options → Saves ("Load / Manage Saves") button.
     pub open_save_manager: bool,
+    /// The player clicked the Options → Co-op button.
+    pub open_coop_lobby: bool,
     /// The player clicked the Camera-panel Photo Album button (`CamViewAlbum`).
     pub open_photo_album: bool,
 }
@@ -288,6 +302,29 @@ pub struct Game {
     /// Monotonic counter bumped whenever `Game::restore` resets `self.errors`
     /// and live lot state, so `App` resets its error-log index and audio feed.
     restore_generation: u64,
+    /// Authoritative frame draw schedule configured when this lot booted.
+    frames: Frames,
+    /// Live co-op multiplayer session controller (`Idle` in single-player).
+    coop: CoopController,
+    /// Host / Join co-op lobby modal dialog (`sims_ui::coop::CoopLobbyDialog`).
+    coop_lobby: CoopLobbyDialog,
+    /// Lazily loaded 9-slice / button art for the co-op lobby and HUD overlay.
+    coop_art: Option<Art>,
+    /// Local player display name used when hosting or joining co-op.
+    coop_player_name: String,
+    /// `iroh` binding mode for co-op sessions (`P2pDefault` or `Loopback`).
+    coop_iroh_config: IrohConfig,
+    /// Set by `NeighborhoodShell` while on an away-from-home travel visit or
+    /// destination edit lot so v1 home-lot co-op refuses cleanly.
+    coop_travel_blocked: bool,
+    /// Latched `true` once this `Game` joins as a co-op peer or restores a
+    /// remote host's `"SCOP"` v2 snapshot. Stays `true` even after disconnect
+    /// so a remote host's world can NEVER overwrite local saves or autosaves.
+    coop_remote_world: bool,
+    /// Compact quick-action buttons rendered beneath `CoopHudOverlay` (`Co-op` / `Copy` / `Leave`).
+    coop_overlay_buttons: CoopOverlayButtons,
+    /// Local-only Buy/Move placement preview in co-op mode (never mutates `self.lot.world()`).
+    coop_buy_preview: Option<CoopBuyPreview>,
 }
 
 impl Game {
@@ -664,6 +701,16 @@ impl Game {
             cheat_sim_speed: None,
             world_mutated_via_restore: false,
             restore_generation: 0,
+            frames: options.frames.clone(),
+            coop: CoopController::new(),
+            coop_lobby: CoopLobbyDialog::new(),
+            coop_art: None,
+            coop_player_name: default_player_name("Player"),
+            coop_iroh_config: IrohConfig::P2pDefault,
+            coop_travel_blocked: false,
+            coop_remote_world: false,
+            coop_overlay_buttons: CoopOverlayButtons::default(),
+            coop_buy_preview: None,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -760,7 +807,7 @@ impl Game {
                     neighborhood_id,
                     house,
                     answers,
-                    frames,
+                    frames.clone(),
                 )
                 .map_err(|e| format!("{neighborhood_id} House{house:02}: {e}"));
                 (
@@ -927,6 +974,16 @@ impl Game {
             cheat_sim_speed: None,
             world_mutated_via_restore: false,
             restore_generation: 0,
+            frames,
+            coop: CoopController::new(),
+            coop_lobby: CoopLobbyDialog::new(),
+            coop_art: None,
+            coop_player_name: default_player_name("Player"),
+            coop_iroh_config: IrohConfig::P2pDefault,
+            coop_travel_blocked: false,
+            coop_remote_world: false,
+            coop_overlay_buttons: CoopOverlayButtons::default(),
+            coop_buy_preview: None,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -1158,6 +1215,16 @@ impl Game {
             cheat_sim_speed: None,
             world_mutated_via_restore: false,
             restore_generation: 0,
+            frames: Frames::default(),
+            coop: CoopController::new(),
+            coop_lobby: CoopLobbyDialog::new(),
+            coop_art: None,
+            coop_player_name: default_player_name("Player"),
+            coop_iroh_config: IrohConfig::P2pDefault,
+            coop_travel_blocked: false,
+            coop_remote_world: false,
+            coop_overlay_buttons: CoopOverlayButtons::default(),
+            coop_buy_preview: None,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -1176,6 +1243,11 @@ impl Game {
         store: &sims_sim::neighborhood_store::NeighborhoodStore,
         neighborhood_id: &str,
     ) -> Result<sims_vm::lifecycle::SaveReport, String> {
+        if self.coop_blocks_local_save() {
+            let msg = "Only the co-op host can save a local lot (remote guest lots are read-only).";
+            self.note = Some(msg.into());
+            return Err(msg.into());
+        }
         let result = match self.buy_cursor.as_ref() {
             Some(cursor) => sims_vm::lifecycle::save_and_leave_lot_without_buy_cursor(
                 install_root,
@@ -1212,9 +1284,11 @@ impl Game {
     /// slider, or modal dialog that benefits from display-refresh redraws.
     pub fn is_actively_interacting(&self) -> bool {
         self.buy_cursor.is_some()
+            || self.coop_buy_preview.is_some()
             || self.build_drag.is_some()
             || self.wall_cursor.is_some()
             || self.shop_dialog.is_open()
+            || self.coop_lobby.is_open()
             || self.hud.dragging_slider()
             || self.hud.dragging_dialog_entry()
             || self.has_dialog()
@@ -1282,6 +1356,11 @@ impl Game {
     /// Screen rectangle of the Options-strip "Saves" button when visible.
     pub fn options_saves_button_rect(&self) -> Option<sims_ui::frame::Rect> {
         self.hud.options_saves_button_rect()
+    }
+
+    /// Screen rectangle of the Options-strip "Co-op" button when visible.
+    pub fn options_coop_button_rect(&self) -> Option<sims_ui::frame::Rect> {
+        self.hud.options_coop_button_rect()
     }
 
     /// Read-only access to the classic top-left cheat console (`Ctrl+Shift+C`).
@@ -1360,6 +1439,14 @@ impl Game {
     /// cleanly against `self` and updates console feedback.
     pub fn execute_cheat_commands(&mut self, commands: &[sims_ui::cheat_console::CheatCommand]) {
         use sims_ui::cheat_console::{CheatCommand, FeedbackKind};
+
+        if self.coop.is_active_or_starting() {
+            self.hud.cheat_console.set_feedback(
+                FeedbackKind::Error,
+                "Cheats are disabled during co-op multiplayer sessions.",
+            );
+            return;
+        }
 
         let mut total_funds_delta: i32 = 0;
         let mut target_hour: Option<u8> = None;
@@ -2058,7 +2145,10 @@ impl Game {
                 self.hide_buy_cursor()
             }
         } else if self.hud.controls.mode == Mode::Build {
-            if self.buy_selected.is_some() || self.buy_cursor.is_some() {
+            if self.buy_selected.is_some()
+                || self.buy_cursor.is_some()
+                || self.coop_buy_preview.is_some()
+            {
                 if !self.hud.covers(point) || self.buy_dragging.is_some() {
                     self.hover_buy(point)
                 } else {
@@ -2138,6 +2228,24 @@ impl Game {
     /// top says why.
     pub fn set_speed(&mut self, speed: Speed) {
         let level = pace::level(speed);
+        if self.coop.is_active() {
+            if self.coop.session().is_some_and(|s| s.time.explicit_pause)
+                && let Err(e) = self
+                    .coop
+                    .submit_command(NetCommand::SetPaused { paused: false })
+            {
+                self.note = Some(format!("The pause was not changed: {e}"));
+                return;
+            }
+            if let Err(e) = self.coop.submit_command(NetCommand::SetSpeed {
+                speed: NetSimSpeed::new(level),
+            }) {
+                self.note = Some(format!("The speed was not changed: {e}"));
+            } else if self.hud.controls.mode == sims_ui::command::Mode::Live {
+                self.hud.set_idle_speed(false);
+            }
+            return;
+        }
         let result = if self.paused() {
             self.lot.unpause().map(|_| self.pace.restart())
         } else {
@@ -2178,6 +2286,15 @@ impl Game {
     /// does. A paused lot goes on ticking, with its clock standing
     /// ([`Lot::pause`]).
     pub fn toggle_pause(&mut self) {
+        if self.coop.is_active() {
+            let next_paused = !self.coop.session().is_some_and(|s| s.time.explicit_pause);
+            if let Err(e) = self.coop.submit_command(NetCommand::SetPaused {
+                paused: next_paused,
+            }) {
+                self.note = Some(format!("The pause was not changed: {e}"));
+            }
+            return;
+        }
         let result = if self.paused() {
             self.lot.unpause().map(|_| self.pace.restart())
         } else {
@@ -2251,8 +2368,12 @@ impl Game {
         self.clock_us = self.clock_us.saturating_add(clock_elapsed_us);
         if self.hud.sync_clock_blink(self.lot.world(), self.clock_us)
             || self.hud.sync_dialog_blink(self.clock_us)
+            || self.coop_lobby.sync_blink(self.clock_us)
         {
             self.blink_dirty = true;
+        }
+        if self.coop.is_active_or_starting() {
+            return self.advance_coop_while(clock_elapsed_us, step_elapsed_us, keep_going);
         }
         if self.hud.controls.mode != Mode::Live
             || self.hud.has_ui_dialog()
@@ -2509,12 +2630,22 @@ impl Game {
         }
         let sell = self.buy_sell_info();
         let world = self.lot.world();
-        // The cutaway also opens the room the selected Sim is in.
-        self.view.camera.focus.selected = world.selected_whereabouts().map(|w| Selected {
-            tile: [i32::from(w.tile[0]), i32::from(w.tile[1])],
-            level: w.level,
-            room: w.room.unwrap_or(NO_ROOM),
-        });
+        // The cutaway also opens the room the local player's selected Sim is in.
+        self.view.camera.focus.selected = if self.coop.is_active() {
+            self.local_selected_sim()
+                .and_then(|id| world.objects.get(&id))
+                .map(|o| Selected {
+                    tile: [o.position[0].div_euclid(16), o.position[1].div_euclid(16)],
+                    level: o.position[2],
+                    room: o.data.get(29).copied().unwrap_or(NO_ROOM),
+                })
+        } else {
+            world.selected_whereabouts().map(|w| Selected {
+                tile: [i32::from(w.tile[0]), i32::from(w.tile[1])],
+                level: w.level,
+                room: w.room.unwrap_or(NO_ROOM),
+            })
+        };
         let viewport = self.house_viewport_size();
         let render_options = sims_render::RenderOptions {
             shadows: self.hud.controls.options.graphics.shadows,
@@ -2585,7 +2716,29 @@ impl Game {
         {
             self.draw_roof_preview();
         }
-        let world = self.lot.world();
+        if self.coop.is_active() {
+            self.draw_coop_remote_indicators(viewport);
+            self.draw_coop_buy_preview(viewport);
+        }
+        let hud_world_override = if self.coop.is_active() {
+            let local_sel = self.local_selected_sim();
+            if local_sel != self.lot.world().selected() {
+                let mut cloned = self.lot.world().clone();
+                for obj in cloned.objects.values_mut() {
+                    if obj.person.is_some() {
+                        obj.selected = local_sel == Some(obj.id);
+                    }
+                }
+                Some(cloned)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let world = hud_world_override
+            .as_ref()
+            .unwrap_or_else(|| self.lot.world());
         let status = self.status();
         // A dialog the lot waits on is in the lot as the tick left it when
         // it was shown. Read it before the pie menu so a newly opened dialog
@@ -2691,6 +2844,7 @@ impl Game {
         );
         self.draw_build_cost_label();
         self.draw_shop_dialog();
+        self.draw_coop_hud_and_lobby();
         // The help balloon closed by the selection's going.
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
@@ -2708,6 +2862,9 @@ impl Game {
     /// column `camera.origin[0] + pick::ORIGIN_COLUMN`, cut to a tile via
     /// `0x433067`) into the simulation.
     fn sync_view_centre(&mut self) {
+        if self.coop.is_active() {
+            return;
+        }
         let (w, h) = self.house_viewport_size();
         let mut camera = self.view.camera;
         camera.origin[0] = camera.origin[0].saturating_add(pick::ORIGIN_COLUMN);
@@ -2720,6 +2877,9 @@ impl Game {
     /// Passes the house view's rotation and screen-centre pick into the
     /// simulation.
     fn sync_view(&mut self) {
+        if self.coop.is_active() {
+            return;
+        }
         self.lot.set_view_rotation(self.view.camera.rotation);
         self.sync_view_centre();
     }
@@ -2775,6 +2935,11 @@ impl Game {
             _ => self.view.apply_in(command, viewport, pick::ORIGIN_COLUMN),
         };
         let after = self.view.camera;
+        if after.rotation != before.rotation && self.coop.is_active() {
+            let _ = self.coop.submit_command(NetCommand::SetCameraRotation {
+                rotation: CameraRotation::new(after.rotation),
+            });
+        }
         if after.origin != before.origin
             || after.zoom != before.zoom
             || after.rotation != before.rotation
@@ -2787,7 +2952,10 @@ impl Game {
 
     /// Whether the panel takes presses at `point`.
     pub fn over_panel(&self, point: [i32; 2]) -> bool {
-        self.has_dialog() || self.hud.covers(point)
+        self.coop_lobby.is_open()
+            || self.coop_overlay_buttons.contains(point)
+            || self.has_dialog()
+            || self.hud.covers(point)
     }
 
     /// Whether `point` lies inside the canvas (`[0..width, 0..height)`).
@@ -2810,6 +2978,16 @@ impl Game {
             return self.leave();
         }
         self.pointer = Some(point);
+        if self.coop_lobby.is_open() {
+            let snap = self.coop_snapshot();
+            let size = [
+                self.view.size[0].max(1) as u32,
+                self.view.size[1].max(1) as u32,
+            ];
+            self.coop_lobby
+                .pointer_move(size, &snap, point[0], point[1]);
+            return true;
+        }
         if self.shop_dialog.is_open() {
             if let Some(snapshot) = &self.shop_snapshot {
                 let size = [
@@ -2846,6 +3024,25 @@ impl Game {
     /// (0x5eb3d1 with `+0x170` clear); the entry is chosen, or the menu
     /// closed, on the matching [`Game::release`] (0x5eb433).
     pub fn press(&mut self, point: [i32; 2]) -> Outcome {
+        if self.coop_lobby.is_open() {
+            self.pointer = Some(point);
+            let snap = self.coop_snapshot();
+            let size = [
+                self.view.size[0].max(1) as u32,
+                self.view.size[1].max(1) as u32,
+            ];
+            let changed = self
+                .coop_lobby
+                .pointer_down(size, &snap, point[0], point[1]);
+            return Outcome {
+                redraw: changed,
+                ..Outcome::default()
+            };
+        }
+        if self.coop_overlay_buttons.press(point) {
+            self.pointer = Some(point);
+            return Outcome::redraw();
+        }
         if self.shop_dialog.is_open() {
             self.pointer = Some(point);
             if let Some(snapshot) = &self.shop_snapshot {
@@ -2931,12 +3128,19 @@ impl Game {
                 self.note = Some("The lot has stopped, so it takes no orders.".into());
                 return Outcome::redraw();
             }
-            if self.buy_selected.is_some() || self.buy_cursor.is_some() {
+            if self.buy_selected.is_some()
+                || self.buy_cursor.is_some()
+                || self.coop_buy_preview.is_some()
+            {
                 self.pointer = Some(point);
                 self.hover_buy(point);
                 self.buy_dragging = Some(point);
                 self.buy_commit_on_release = true;
-                let valid = self.buy_cursor.as_ref().is_some_and(|c| c.valid);
+                let valid = if self.coop.is_active() {
+                    self.coop_buy_preview.is_some()
+                } else {
+                    self.buy_cursor.as_ref().is_some_and(|c| c.valid)
+                };
                 self.hud.play(if valid {
                     "UI_object_move_place"
                 } else {
@@ -2949,6 +3153,9 @@ impl Game {
             // Hand Tool pickup of an existing lot object (`0x485f98` →
             // `0x486960` → `0x4215e6`).
             if let Some(target) = self.under(point) {
+                if self.coop.is_active() {
+                    return self.coop_pick_up_preview(target, point);
+                }
                 match self.lot.buy_pick_up(target) {
                     Ok(Some(cursor)) => {
                         let screen = lot_point(&self.view.camera, &self.lot_shape, cursor.position);
@@ -2993,12 +3200,19 @@ impl Game {
                 self.note = Some("The lot has stopped, so it takes no orders.".into());
                 return Outcome::redraw();
             }
-            if self.buy_selected.is_some() || self.buy_cursor.is_some() {
+            if self.buy_selected.is_some()
+                || self.buy_cursor.is_some()
+                || self.coop_buy_preview.is_some()
+            {
                 self.pointer = Some(point);
                 self.hover_buy(point);
                 self.buy_dragging = Some(point);
                 self.buy_commit_on_release = true;
-                let valid = self.buy_cursor.as_ref().is_some_and(|c| c.valid);
+                let valid = if self.coop.is_active() {
+                    self.coop_buy_preview.is_some()
+                } else {
+                    self.buy_cursor.as_ref().is_some_and(|c| c.valid)
+                };
                 self.hud.play(if valid {
                     "UI_object_move_place"
                 } else {
@@ -3010,6 +3224,9 @@ impl Game {
             }
             if self.hud.build_state.tool == Some(BuildTool::Hand) {
                 if let Some(target) = self.under(point) {
+                    if self.coop.is_active() {
+                        return self.coop_pick_up_preview(target, point);
+                    }
                     match self.lot.buy_pick_up(target) {
                         Ok(Some(cursor)) => {
                             let screen =
@@ -3076,6 +3293,25 @@ impl Game {
     ///   it only when `point` is still inside that button.
     /// - Commits a Buy Mode drag or updates/chooses an open pie menu entry.
     pub fn release(&mut self, point: [i32; 2]) -> Outcome {
+        if self.coop_lobby.is_open() {
+            self.pointer = Some(point);
+            let snap = self.coop_snapshot();
+            let size = [
+                self.view.size[0].max(1) as u32,
+                self.view.size[1].max(1) as u32,
+            ];
+            let cmd = self.coop_lobby.pointer_up(size, &snap, point[0], point[1]);
+            return match cmd {
+                Some(cmd) => self.execute_coop_ui_command(cmd),
+                None => Outcome::redraw(),
+            };
+        }
+        if let Some(action) = self.coop_overlay_buttons.release(Some(point)) {
+            self.hud.play(crate::hud::CLICK);
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+            return self.execute_coop_overlay_action(action);
+        }
         if self.shop_dialog.is_open() {
             self.pointer = Some(point);
             let cmd = self.shop_snapshot.as_ref().and_then(|snap| {
@@ -3098,6 +3334,17 @@ impl Game {
             return Outcome {
                 redraw: true,
                 open_save_manager: true,
+                ..Outcome::default()
+            };
+        }
+        let (released_coop, open_coop) = self.hud.release_coop_button(Some(point));
+        if open_coop {
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+            self.open_coop_lobby(None);
+            return Outcome {
+                redraw: true,
+                open_coop_lobby: true,
                 ..Outcome::default()
             };
         }
@@ -3135,6 +3382,7 @@ impl Game {
             let mut out = self.release_outside();
             out.redraw |= released_slider
                 || released_saves
+                || released_coop
                 || released_album
                 || released_action
                 || released_dialog;
@@ -3147,7 +3395,7 @@ impl Game {
             // (`0x50d04d` → `0x4cf97a` → `0x487e18`).
             if self.hud.controls.mode == Mode::Buy
                 && self.hud.over_buy_catalog(self.view.size, point)
-                && self.buy_cursor.is_some()
+                && (self.buy_cursor.is_some() || self.coop_buy_preview.is_some())
             {
                 self.buy_dragging = None;
                 self.buy_commit_on_release = false;
@@ -3177,6 +3425,7 @@ impl Game {
             return Outcome {
                 redraw: released_slider
                     || released_saves
+                    || released_coop
                     || released_album
                     || released_action
                     || released_dialog,
@@ -3235,8 +3484,10 @@ impl Game {
     /// a Buy Mode drag, settles an opening press on a moved menu, or closes the
     /// pie without checking or choosing any entry.
     pub fn release_outside(&mut self) -> Outcome {
+        let _ = self.coop_overlay_buttons.release(None);
         let released_slider = self.hud.release_slider(None);
         let (released_saves, _) = self.hud.release_saves_button(None);
+        let (released_coop, _) = self.hud.release_coop_button(None);
         let (released_album, _) = self.hud.release_album_button(None);
         let (released_action, _) = self.hud.release_options_action(None);
         let (released_dialog, _) = self.hud.release_dialog(None);
@@ -3245,6 +3496,7 @@ impl Game {
             let redraw = self.hide_buy_cursor()
                 || released_slider
                 || released_saves
+                || released_coop
                 || released_album
                 || released_action
                 || released_dialog;
@@ -3262,6 +3514,7 @@ impl Game {
             return Outcome {
                 redraw: released_slider
                     || released_saves
+                    || released_coop
                     || released_album
                     || released_action
                     || released_dialog,
@@ -3366,6 +3619,12 @@ impl Game {
     /// (0x48df28, `Lot::highlight`), keeping the action the check leaves
     /// for choosing it. True if the check ran.
     fn check_entry(&mut self, i: usize) -> bool {
+        if self.coop.is_active() {
+            // Co-op never mutates the shared simulation on local pie hover;
+            // `Lot::apply_coop_batch` re-validates on a throwaway probe when
+            // `SimActionPick` executes deterministically on every peer.
+            return false;
+        }
         let Some(menu) = &self.hud.menu else {
             return false;
         };
@@ -3405,6 +3664,21 @@ impl Game {
     /// which changes the lot), keeping its sounds for the host. True if
     /// the simulation listed it, and so may have changed the lot.
     fn list(&mut self, object: u16) -> bool {
+        if self.coop.is_active() {
+            let Some(player_id) = self.coop.local_player_id() else {
+                return false;
+            };
+            let Some(person) = self.local_selected_sim() else {
+                return false;
+            };
+            let listing = menu::coop_entries(&self.lot, &self.assets, player_id, object);
+            if let Ok(listing) = &listing {
+                self.keep_sounds(listing.sounds.clone());
+            }
+            self.listed = Some((person, object, listing));
+            // Throwaway co-op pie probe never mutates the shared lot.
+            return false;
+        }
         let Some(person) = self.lot.world().selected() else {
             return false;
         };
@@ -3426,7 +3700,7 @@ impl Game {
             self.note = Some("The lot has stopped, so it takes no orders.".into());
             return;
         }
-        let Some(person) = self.lot.world().selected() else {
+        let Some(person) = self.local_selected_sim() else {
             self.note = Some("Nobody is selected to do anything.".into());
             return;
         };
@@ -3573,6 +3847,29 @@ impl Game {
             .as_ref()
             .and_then(|a| u16::try_from(a.caller).ok())
             .unwrap_or(person);
+        if self.coop.is_active() {
+            let cmd = match &entry.action {
+                Some(action) => NetCommand::SimActionPick {
+                    sim_id: action.caller as u16,
+                    target_id: action.target as u16,
+                    menu_index: action.table_index as i16,
+                    joining: action.join != 0,
+                    args: action.args,
+                },
+                None => NetCommand::SimActionPick {
+                    sim_id: person,
+                    target_id: object,
+                    menu_index: entry.menu as i16,
+                    joining: false,
+                    args: [0; 4],
+                },
+            };
+            self.note = Some(match self.coop.submit_command(cmd) {
+                Ok(()) => format!("Sent \"{label}\" for person {on}."),
+                Err(e) => format!("\"{label}\" was not sent: {e}"),
+            });
+            return;
+        }
         let queued = match &entry.action {
             Some(action) => self.lot.pick(person, action.clone()),
             None => self.lot.queue_interaction(person, object, entry.menu),
@@ -3598,6 +3895,20 @@ impl Game {
         if self.stopped.is_some() {
             self.note = Some("The lot has stopped, so it takes no orders.".into());
             self.hud.release(action);
+            return;
+        }
+        if self.coop.is_active() {
+            let cmd = NetCommand::SimActionCancel {
+                sim_id: sim,
+                interaction_uid: sims_vm::coop::cancel_uid_to_wire(action),
+            };
+            match self.coop.submit_command(cmd) {
+                Ok(()) => self.hud.play(crate::hud::QUEUE_DELETE),
+                Err(e) => {
+                    self.hud.release(action);
+                    self.note = Some(format!("The action cancel was not sent: {e}"));
+                }
+            }
             return;
         }
         match self.lot.cancel(sim, action) {
@@ -3645,6 +3956,31 @@ impl Game {
             return;
         };
         let text = self.hud.active_dialog_entry().map(str::to_owned);
+        if self.coop.is_active() {
+            let dialog_id = self.lot.coop().and_then(|c| c.active_dialog).or_else(|| {
+                self.coop
+                    .session()
+                    .and_then(|s| s.open_dialogs.keys().next().copied())
+            });
+            let Some(dialog_id) = dialog_id else {
+                self.note = Some("No co-op blocking dialog is active.".into());
+                return;
+            };
+            let cmd = NetCommand::AnswerBlockingDialog {
+                dialog_id,
+                answer: sims_net::DialogAnswer {
+                    status: answer,
+                    bitmap_id: Some(sims_ui::dialog::BUTTON as i16),
+                    text,
+                },
+            };
+            if let Err(e) = self.coop.submit_command(cmd) {
+                self.note = Some(format!("The answer was not sent: {e}"));
+            } else {
+                self.hud.clear_vm_dialog();
+            }
+            return;
+        }
         if let Err(e) = self.lot.answer(sims_vm::Answer {
             status: answer,
             bitmap_id: Some(sims_ui::dialog::BUTTON as i16),
@@ -3679,9 +4015,9 @@ impl Game {
     /// check of global 0x6f6bac) whose effect has not been read.
     pub fn select(&mut self, sim: u16) {
         let world = self.lot.world();
-        let same_neighbor = world.selected() == Some(sim)
-            || world
-                .selected()
+        let current_selected = self.local_selected_sim();
+        let same_neighbor = current_selected == Some(sim)
+            || current_selected
                 .and_then(|id| world.objects.get(&id))
                 .zip(world.objects.get(&sim))
                 .is_some_and(|(selected, target)| selected.guid == target.guid);
@@ -3695,6 +4031,24 @@ impl Game {
                 .map_or(sim, |o| o.id);
             self.centre_on(target);
             self.hud.play(crate::hud::CLICK);
+            return;
+        }
+        if self.coop.is_active() {
+            match self
+                .coop
+                .submit_command(NetCommand::SelectPerson { sim_id: Some(sim) })
+            {
+                Ok(()) => {
+                    self.close_menu();
+                    self.reached = None;
+                    self.listed = None;
+                    self.highlighted = None;
+                    self.hud.play(crate::hud::CLICK);
+                }
+                Err(e) => {
+                    self.note = Some(format!("Person {sim} was not selected: {e}"));
+                }
+            }
             return;
         }
         match self.lot.select(sim) {
@@ -3835,6 +4189,10 @@ impl Game {
     /// that went. Returns `true` if the save succeeded (`0x4f26cf`, checked by
     /// `0x4f29cc` before exiting).
     pub fn save_to(&mut self, store: &sims_sim::Snapshots, slot: &str) -> bool {
+        if self.coop_blocks_local_save() {
+            self.note = Some("Cannot save a remote host's co-op lot to a local save slot.".into());
+            return false;
+        }
         let saved = self.save().and_then(|saved| {
             store
                 .save_lot(slot, &saved.encode())
@@ -3858,6 +4216,10 @@ impl Game {
     /// Goes back to the lot saved in `store` under `slot`, saying across
     /// the top how that went. False if nothing changed.
     pub fn restore_from(&mut self, store: &sims_sim::Snapshots, slot: &str) -> bool {
+        if self.coop.is_active_or_starting() {
+            self.note = Some("Leave the co-op session before restoring a local save.".into());
+            return false;
+        }
         let saved = match store.load_lot(slot) {
             Ok(Some(bytes)) => Saved::decode(&bytes).map_err(|e| e.to_string()),
             Ok(None) => Err("nothing is saved for this house".into()),
@@ -4232,6 +4594,15 @@ impl Game {
                 Outcome::redraw()
             }
             Command::OptionsAction(action) => {
+                if self.coop.is_peer()
+                    && matches!(action, OptionsAction::Save | OptionsAction::Neighborhood)
+                {
+                    self.note = Some(
+                        "Only the host can save or return to Neighborhood; use Co-op -> Leave to disconnect."
+                            .into(),
+                    );
+                    return Outcome::redraw();
+                }
                 let can_save = self.lot_visibility().can_save;
                 match action {
                     // `0x516874`: calls `0x517c03(0)` (shows the save card only
@@ -4312,7 +4683,14 @@ impl Game {
                 if toggle == OptionsToggle::FreeWill {
                     // `0x432220..0x432242` -> `0x46d9c4(0x1e, al)`: write global 30.
                     let enabled = self.hud.controls.options.play.free_will;
-                    if let Err(e) = self.lot.set_free_will(enabled) {
+                    if self.coop.is_active() {
+                        if let Err(e) = self
+                            .coop
+                            .submit_command(NetCommand::SetFreeWill { enabled })
+                        {
+                            self.note = Some(format!("Free Will was not changed: {e}"));
+                        }
+                    } else if let Err(e) = self.lot.set_free_will(enabled) {
                         self.note = Some(format!("Free Will was not changed: {e}"));
                     } else {
                         self.dirty = true;
@@ -4492,6 +4870,30 @@ impl Game {
         if !matches!(self.hud.controls.mode, Mode::Buy | Mode::Build) || self.stopped.is_some() {
             return false;
         }
+        if self.coop.is_active() {
+            let Some(preview) = self.coop_buy_preview.take() else {
+                return false;
+            };
+            self.buy_dragging = None;
+            self.buy_commit_on_release = false;
+            self.buy_in_house = false;
+            self.buy_selected = None;
+            self.hud.buy_state.selected = None;
+            if let Some(object_id) = preview.existing_object_id {
+                if let Err(e) = self
+                    .coop
+                    .submit_command(NetCommand::BuyBuild(BuyBuildEdit::SellObject { object_id }))
+                {
+                    self.note = Some(format!("Could not send Sell command: {e}"));
+                    self.hud.play(crate::hud::ERROR);
+                } else {
+                    self.hud.play(crate::hud::MONEYBACK);
+                }
+            }
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+            return true;
+        }
         let Some(cursor) = self.buy_cursor.take() else {
             return false;
         };
@@ -4574,6 +4976,10 @@ impl Game {
     /// undone/redone object; unpaid new catalog previews stay armed
     /// (`0x4a8545`, `0x4a856a`).
     fn apply_buy_history(&mut self, undo: bool) -> bool {
+        if self.coop.is_active() {
+            self.note = Some("Undo/Redo is disabled during co-op multiplayer sessions.".into());
+            return false;
+        }
         let allowed = if undo {
             self.can_undo()
         } else {
@@ -4726,7 +5132,21 @@ impl Game {
         // -> `0x487191` / `0x487105`). Execute all four steps atomically so
         // marker IDs match native and any snapback refusal leaves the mode and
         // held cursor intact.
-        if let Err(e) = self
+        if self.coop.is_active() {
+            if let Some(net_mode) = match mode {
+                Mode::Live => Some(NetPlayerMode::Live),
+                Mode::Buy => Some(NetPlayerMode::Buy),
+                Mode::Build => Some(NetPlayerMode::Build),
+                Mode::Options => None,
+            } && let Err(e) = self
+                .coop
+                .submit_command(NetCommand::SetMode { mode: net_mode })
+            {
+                self.note = Some(format!("The mode was not changed: {e}"));
+                return;
+            }
+            self.coop_buy_preview = None;
+        } else if let Err(e) = self
             .lot
             .set_mode_releasing_buy_cursor(panel_mode_for(mode), self.buy_cursor.as_ref())
         {
@@ -4833,6 +5253,7 @@ impl Game {
         self.buy_grab_offset = [0, 0];
         self.buy_commit_on_release = false;
         self.buy_in_house = false;
+        let had_coop_preview = self.coop_buy_preview.take().is_some();
         let had_cursor = if let Some(cursor) = self.buy_cursor.take() {
             match self.lot.buy_cancel(&cursor) {
                 Ok(()) => {
@@ -4854,7 +5275,7 @@ impl Game {
         }
         let had_selection = self.buy_selected.take().is_some();
         let had_hud = self.hud.buy_state.selected.take().is_some();
-        if had_selection || had_hud || had_cursor || had_build_drag {
+        if had_selection || had_hud || had_cursor || had_build_drag || had_coop_preview {
             if self.hud.controls.mode == Mode::Buy {
                 self.layout_buy();
             } else if self.hud.controls.mode == Mode::Build {
@@ -4869,6 +5290,15 @@ impl Game {
     /// Rotates the held Buy Mode object by one signed turn step (`0x486cb8` →
     /// `0x421be4(±1)`), returning `true` if a Buy cursor was active.
     pub fn rotate_held(&mut self, clockwise: bool) -> bool {
+        if self.coop.is_active() {
+            let Some(preview) = self.coop_buy_preview.as_mut() else {
+                return false;
+            };
+            let delta = if clockwise { 2 } else { -2 };
+            preview.facing = (preview.facing + delta).rem_euclid(8);
+            self.buy_facing = Some(preview.facing);
+            return true;
+        }
         let Some(mut cursor) = self.buy_cursor.take() else {
             return false;
         };
@@ -4892,6 +5322,9 @@ impl Game {
     fn hover_buy(&mut self, point: [i32; 2]) -> bool {
         if self.stopped.is_some() {
             return false;
+        }
+        if self.coop.is_active() {
+            return self.hover_buy_coop(point);
         }
         if !self.buy_in_house {
             self.buy_in_house = true;
@@ -5028,6 +5461,9 @@ impl Game {
     /// OBJD word 96 == 1 outside tutorial), immediately starts another copy
     /// with the placed item's facing (`0x4864d0` → `0x486f5a`) if affordable.
     fn commit_buy(&mut self, point: [i32; 2]) -> Outcome {
+        if self.coop.is_active() {
+            return self.commit_buy_coop();
+        }
         let Some(cursor) = self.buy_cursor.take() else {
             return Outcome::default();
         };
@@ -5155,6 +5591,23 @@ impl Game {
         self.water_hover_overlay = None;
         let catalog = self.hud.ensure_build_catalog(&self.assets).clone();
         self.hud.build_state.select_tool(tool, &catalog);
+        if self.coop.is_active() {
+            // Never open or close the VM `"Wall Cursor"` object out-of-band in
+            // co-op mode; Build previews remain purely local until lockstep commit.
+            if matches!(
+                tool,
+                BuildTool::Terrain | BuildTool::Water | BuildTool::Roof
+            ) {
+                self.note = Some(
+                    "Terrain, Water/Pool, and Roof tools are not yet supported in co-op mode."
+                        .into(),
+                );
+            } else if tool == BuildTool::Roof {
+                self.sync_build_roof_ui();
+            }
+            self.layout_build();
+            return;
+        }
         match tool {
             BuildTool::Wall => {
                 let mode = self.current_wall_drag_mode().cursor_mode();
@@ -5182,6 +5635,22 @@ impl Game {
             return false;
         }
         let catalog = self.hud.ensure_build_catalog(&self.assets).clone();
+        if self.coop.is_active()
+            && matches!(
+                action,
+                BuildSubtoolAction::RoofPitch(_)
+                    | BuildSubtoolAction::RoofPattern(_)
+                    | BuildSubtoolAction::Terrain(_)
+                    | BuildSubtoolAction::Water(_)
+            )
+        {
+            self.note = Some(
+                "Terrain, Water/Pool, and Roof tools are not yet supported in co-op mode.".into(),
+            );
+            self.hud.play(crate::hud::ERROR);
+            self.layout_build();
+            return false;
+        }
         let state_changed = self.hud.build_state.apply_subtool(action, &catalog);
         match action {
             BuildSubtoolAction::Terrain(_) | BuildSubtoolAction::Water(_) => {
@@ -5412,6 +5881,9 @@ impl Game {
     }
 
     fn open_wall_cursor(&mut self, mode: i16) {
+        if self.coop.is_active_or_starting() {
+            return;
+        }
         if let Some(mut cur) = self.wall_cursor.take() {
             if cur.mode != mode {
                 let pos = cur.position;
@@ -5427,6 +5899,10 @@ impl Game {
     }
 
     fn close_wall_cursor(&mut self) {
+        if self.coop.is_active() {
+            self.wall_cursor = None;
+            return;
+        }
         if let Some(cursor) = self.wall_cursor.take() {
             if let Err(e) = self.lot.build_cursor_close(&cursor) {
                 self.note = Some(format!("Could not close Wall Cursor: {e}"));
@@ -5724,7 +6200,9 @@ impl Game {
                     let corner = sims_vm::snap_wall_corner(fine, active);
                     *end_corner = corner;
                     *mode = self.current_wall_drag_mode();
-                    if let Some(mut cur) = self.wall_cursor.take() {
+                    if !self.coop.is_active()
+                        && let Some(mut cur) = self.wall_cursor.take()
+                    {
                         let cfine = sims_vm::wall_cursor_fine(corner, level);
                         let _ = self.lot.build_cursor_move(
                             &mut cur,
@@ -5800,7 +6278,9 @@ impl Game {
                     self.water_hover_overlay = None;
                     *mode = self.current_wallpaper_drag_mode();
                     if let Some(face) = self.pick_wall_face(point) {
-                        if let Some(mut cur) = self.wall_cursor.take() {
+                        if !self.coop.is_active()
+                            && let Some(mut cur) = self.wall_cursor.take()
+                        {
                             let cfine = sims_vm::wallpaper_cursor_fine(face, level);
                             let facing =
                                 sims_vm::wallpaper_cursor_facing(face, self.view.camera.rotation);
@@ -5928,7 +6408,9 @@ impl Game {
                 let fine = self.unproject_build_fine(point);
                 let corner = sims_vm::snap_wall_corner(fine, active);
                 let mode = self.current_wall_drag_mode().cursor_mode();
-                if let Some(mut cur) = self.wall_cursor.take() {
+                if !self.coop.is_active()
+                    && let Some(mut cur) = self.wall_cursor.take()
+                {
                     let cfine = sims_vm::wall_cursor_fine(corner, level);
                     let _ = self
                         .lot
@@ -5939,7 +6421,9 @@ impl Game {
             }
             Some(BuildTool::Wallpaper) => {
                 if let Some(face) = self.pick_wall_face(point) {
-                    if let Some(mut cur) = self.wall_cursor.take() {
+                    if !self.coop.is_active()
+                        && let Some(mut cur) = self.wall_cursor.take()
+                    {
                         let cfine = sims_vm::wallpaper_cursor_fine(face, level);
                         let facing =
                             sims_vm::wallpaper_cursor_facing(face, self.view.camera.rotation);
@@ -6042,6 +6526,10 @@ impl Game {
         let had_overlay = self.build_preview_shape.take().is_some()
             || self.terrain_hover_overlay.take().is_some()
             || self.water_hover_overlay.take().is_some();
+        if self.coop.is_active() {
+            self.wall_cursor = None;
+            return had_overlay;
+        }
         let Some(mut cur) = self.wall_cursor.take() else {
             return had_overlay;
         };
@@ -6066,7 +6554,9 @@ impl Game {
                 let style = WallStyle::from_style_id(self.hud.build_state.last_wall_style)
                     .unwrap_or(WallStyle::Standard);
                 let mode = self.current_wall_drag_mode();
-                if let Some(mut cur) = self.wall_cursor.take() {
+                if !self.coop.is_active()
+                    && let Some(mut cur) = self.wall_cursor.take()
+                {
                     let cfine = sims_vm::wall_cursor_fine(corner, level);
                     let _ = self.lot.build_cursor_move(
                         &mut cur,
@@ -6137,7 +6627,9 @@ impl Game {
                     self.keep_sounds(sounds);
                     return Outcome::redraw();
                 };
-                if let Some(mut cur) = self.wall_cursor.take() {
+                if !self.coop.is_active()
+                    && let Some(mut cur) = self.wall_cursor.take()
+                {
                     let cfine = sims_vm::wallpaper_cursor_fine(face, level);
                     let facing = sims_vm::wallpaper_cursor_facing(face, self.view.camera.rotation);
                     let _ = self.lot.build_cursor_move(&mut cur, cfine, facing, Some(2));
@@ -6284,6 +6776,9 @@ impl Game {
         self.build_preview_shape = None;
         self.terrain_hover_overlay = None;
         self.water_hover_overlay = None;
+        if self.coop.is_active() {
+            return self.commit_build_coop(drag);
+        }
         match drag {
             BuildDrag::Wall {
                 start_corner,
@@ -6845,6 +7340,1368 @@ impl Game {
         };
         self.shop_dialog.draw(&mut frame, snapshot, &strings, art);
         self.canvas.color = frame.into_rgb();
+    }
+
+    // -------------------------------------------------------------------------
+    // Co-op Multiplayer Live Shell (Wave 3)
+    // -------------------------------------------------------------------------
+
+    /// Whether the Host / Join Co-op Lobby modal dialog is currently open.
+    pub fn coop_lobby_open(&self) -> bool {
+        self.coop_lobby.is_open()
+    }
+
+    /// Opens the Host / Join Co-op Lobby dialog on `tab` (defaulting to Host
+    /// if offline/hosting or Join if currently a client).
+    pub fn open_coop_lobby(&mut self, tab: Option<LobbyTab>) {
+        let target_tab = tab.unwrap_or(if self.coop.is_peer() {
+            LobbyTab::Join
+        } else {
+            LobbyTab::Host
+        });
+        self.coop_lobby.open(target_tab);
+    }
+
+    /// Closes the Host / Join Co-op Lobby dialog.
+    pub fn close_coop_lobby(&mut self) {
+        self.coop_lobby.close();
+    }
+
+    /// Toggles the Host / Join Co-op Lobby dialog (`F6` / `Ctrl+M`).
+    pub fn toggle_coop_lobby(&mut self) -> bool {
+        if self.coop_lobby.is_open() {
+            self.coop_lobby.close();
+        } else {
+            self.open_coop_lobby(None);
+        }
+        true
+    }
+
+    /// Switches between Host and Join tabs in the open Co-op Lobby dialog.
+    pub fn coop_lobby_switch_tab(&mut self) -> bool {
+        if !self.coop_lobby.is_open() {
+            return false;
+        }
+        let next = match self.coop_lobby.tab() {
+            LobbyTab::Host => LobbyTab::Join,
+            LobbyTab::Join => LobbyTab::Host,
+        };
+        self.coop_lobby.set_tab(next);
+        true
+    }
+
+    /// Types a character into the Co-op Lobby Join ticket box.
+    pub fn coop_lobby_char(&mut self, ch: char) -> bool {
+        self.coop_lobby.insert_char(ch)
+    }
+
+    /// Pastes text (or system clipboard when `text` is `None`) into the Co-op
+    /// Lobby Join ticket box.
+    pub fn coop_lobby_paste(&mut self, text: Option<&str>) -> bool {
+        match text {
+            Some(s) => self.coop_lobby.paste_text(s),
+            None => clipboard_paste().is_some_and(|s| self.coop_lobby.paste_text(&s)),
+        }
+    }
+
+    /// Deletes the last character from the Co-op Lobby Join ticket box.
+    pub fn coop_lobby_backspace(&mut self) -> bool {
+        self.coop_lobby.backspace()
+    }
+
+    /// Switches between the Host and Join tabs in the open Co-op Lobby (`Tab`).
+    pub fn coop_lobby_toggle_tab(&mut self) -> bool {
+        if !self.coop_lobby.is_open() {
+            return false;
+        }
+        let next = match self.coop_lobby.tab() {
+            LobbyTab::Host => LobbyTab::Join,
+            LobbyTab::Join => LobbyTab::Host,
+        };
+        self.coop_lobby.set_tab(next);
+        true
+    }
+
+    /// Submits the active Co-op Lobby tab (`Enter`).
+    pub fn coop_lobby_submit(&mut self) -> Outcome {
+        let snap = self.coop_snapshot();
+        match self.coop_lobby.submit(&snap) {
+            Some(cmd) => self.execute_coop_ui_command(cmd),
+            None => Outcome::default(),
+        }
+    }
+
+    /// Handles `Escape` while the Co-op Lobby dialog is open.
+    pub fn coop_lobby_escape(&mut self) -> Outcome {
+        let snap = self.coop_snapshot();
+        match self.coop_lobby.escape(&snap) {
+            Some(cmd) => self.execute_coop_ui_command(cmd),
+            None => Outcome::default(),
+        }
+    }
+
+    /// Whether a co-op session is active or asynchronously starting up.
+    pub fn coop_active(&self) -> bool {
+        self.coop.is_active_or_starting()
+    }
+
+    /// Whether the local player is currently the authoritative co-op Host.
+    pub fn coop_is_host(&self) -> bool {
+        self.coop.is_host()
+    }
+
+    /// Whether the local player is currently a joined/connecting co-op Peer.
+    pub fn coop_is_peer(&self) -> bool {
+        self.coop.is_peer()
+    }
+
+    /// Whether local saves/autosaves must be blocked because this `Game` is
+    /// currently connected as a peer OR holds a remote host's restored world
+    /// (persists even after disconnect so a host's world never overwrites a
+    /// guest's local REDB/standalone save slots).
+    pub fn coop_blocks_local_save(&self) -> bool {
+        self.coop.is_peer() || self.coop_remote_world
+    }
+
+    /// Returns `(host_house, host_family)` if a verified `"SCOP"` v2 snapshot
+    /// is parked awaiting guest shell restaging onto the host's matching lot.
+    pub fn pending_coop_restage(&self) -> Option<(u32, u32)> {
+        self.coop.pending_restage_target()
+    }
+
+    /// Detaches and returns the live [`CoopController`] (used when the shell
+    /// re-stages a fresh `Game` for a remote host's lot before completing a
+    /// parked snapshot restore).
+    pub fn take_coop_controller(&mut self) -> CoopController {
+        std::mem::take(&mut self.coop)
+    }
+
+    /// Installs a transferred [`CoopController`] onto a freshly staged `Game`.
+    pub fn install_coop_controller(&mut self, coop: CoopController, mark_remote: bool) {
+        self.coop = coop;
+        if mark_remote {
+            self.coop_remote_world = true;
+        }
+    }
+
+    /// Attempts to complete a parked host-lot snapshot restore onto this
+    /// candidate `Game`, preserving the parked snapshot on `OtherHouse` /
+    /// `OtherLoad` mismatches so the shell can try fallback local candidates.
+    pub fn try_complete_pending_coop_restage(
+        &mut self,
+    ) -> Result<(), crate::coop::RestageAttemptError> {
+        let note = self.coop.try_complete_pending_restage(&mut self.lot)?;
+        self.coop_remote_world = true;
+        self.sync_after_coop_snapshot_restore();
+        self.note = Some(note);
+        Ok(())
+    }
+
+    /// Completes a parked host-lot snapshot restore onto this newly staged
+    /// `Game`, verifying the snapshot transactionally BEFORE sending the
+    /// completion ACK to the host.
+    pub fn complete_pending_coop_restage(&mut self) -> Result<(), String> {
+        let note = self.coop.complete_pending_restage(&mut self.lot)?;
+        self.coop_remote_world = true;
+        self.sync_after_coop_snapshot_restore();
+        self.note = Some(note);
+        Ok(())
+    }
+
+    /// Fails and cleans up a parked host-lot restage with an actionable message.
+    pub fn fail_pending_coop_restage(&mut self, reason: String) {
+        self.coop
+            .fail_pending_restage(&mut self.lot, reason.clone());
+        self.note = Some(reason);
+    }
+
+    /// Local assigned [`sims_net::PlayerId`], once hosting or joined.
+    pub fn coop_local_player_id(&self) -> Option<NetPlayerId> {
+        self.coop.local_player_id()
+    }
+
+    /// Currently selected Sim for the local player (their per-player selection
+    /// in co-op, or `lot.world().selected()` in single-player).
+    pub fn local_selected_sim(&self) -> Option<u16> {
+        if self.coop.is_active() {
+            self.coop.local_selected_sim()
+        } else {
+            self.lot.world().selected()
+        }
+    }
+
+    /// Shareable `simscoop1...` invite ticket when hosting over `iroh`.
+    pub fn coop_invite_ticket(&self) -> Option<&str> {
+        self.coop.invite_ticket()
+    }
+
+    /// Read-only access to the live [`CoopController`].
+    pub fn coop_controller(&self) -> &CoopController {
+        &self.coop
+    }
+
+    /// Sets the local player display name for subsequent co-op sessions.
+    pub fn coop_set_player_name(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        if !name.trim().is_empty() {
+            self.coop_player_name = name;
+        }
+    }
+
+    /// Configures `iroh` binding mode (`P2pDefault` or `Loopback`) for async
+    /// co-op startup.
+    pub fn coop_set_iroh_config(&mut self, config: IrohConfig) {
+        self.coop_iroh_config = config;
+    }
+
+    /// Marks whether this lot is an away-from-home travel visit or community
+    /// destination edit lot (refused for v1 home-lot co-op).
+    pub fn coop_set_travel_blocked(&mut self, blocked: bool) {
+        self.coop_travel_blocked = blocked;
+    }
+
+    /// Checks v1 home-lot co-op eligibility per `docs/vision.md`:
+    /// refuses tutorial lots (`Global 26 != 0`) and away-from-home travel /
+    /// community destination lots cleanly with an explicit message.
+    pub fn coop_preflight_check(&self) -> Result<(), String> {
+        if self.stopped.is_some() {
+            return Err("cannot start co-op while the lot is stopped".into());
+        }
+        if self.lot.world().globals.get(26).copied().unwrap_or(0) != 0 {
+            return Err(
+                "Tutorial lots are single-player only and cannot be played in co-op mode.".into(),
+            );
+        }
+        if self.coop_travel_blocked || !self.lot.residential() {
+            return Err(
+                "Co-op multiplayer v1 is only available on home lots (return home from travel first)."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Starts hosting a co-op session over real `iroh` asynchronously without
+    /// blocking the UI thread.
+    pub fn coop_start_host_async(
+        &mut self,
+        options: Option<CoopStartOptions>,
+    ) -> Result<(), String> {
+        if let Err(err) = self.coop_preflight_check() {
+            self.coop.set_error(err.clone());
+            self.note = Some(err.clone());
+            return Err(err);
+        }
+        self.cancel_active_buy_build_tools();
+        self.close_menu();
+        let opts = options.unwrap_or_else(|| CoopStartOptions {
+            player_name: self.coop_player_name.clone(),
+            iroh_config: self.coop_iroh_config,
+            ..CoopStartOptions::default()
+        });
+        let install_root = self.hud.install().root.clone();
+        if let Err(err) = self.coop.start_host_iroh_async(install_root, opts) {
+            self.coop.set_error(err.clone());
+            self.note = Some(err.clone());
+            return Err(err);
+        }
+        self.note = Some("Starting co-op host over iroh...".into());
+        Ok(())
+    }
+
+    /// Validates `ticket` and joins a co-op session over real `iroh`
+    /// asynchronously without blocking the UI thread.
+    pub fn coop_start_join_async(
+        &mut self,
+        ticket: String,
+        options: Option<CoopStartOptions>,
+    ) -> Result<(), String> {
+        if let Err(err) = self.coop_preflight_check() {
+            self.coop.set_error(err.clone());
+            self.note = Some(err.clone());
+            return Err(err);
+        }
+        self.cancel_active_buy_build_tools();
+        self.close_menu();
+        let opts = options.unwrap_or_else(|| CoopStartOptions {
+            player_name: self.coop_player_name.clone(),
+            iroh_config: self.coop_iroh_config,
+            ..CoopStartOptions::default()
+        });
+        let install_root = self.hud.install().root.clone();
+        if let Err(err) = self.coop.start_join_iroh_async(install_root, ticket, opts) {
+            self.note = Some(err.clone());
+            return Err(err);
+        }
+        self.note = Some("Connecting to co-op host...".into());
+        Ok(())
+    }
+
+    /// Synchronously starts hosting on this lot over `transport`
+    /// (`CoopTransport::Memory` or pre-bound `CoopTransport::Iroh`).
+    pub fn coop_start_host_with_transport(
+        &mut self,
+        transport: CoopTransport,
+        manifest: ManifestDigest,
+        options: CoopStartOptions,
+    ) -> Result<(), String> {
+        if let Err(err) = self.coop_preflight_check() {
+            self.coop.set_error(err.clone());
+            self.note = Some(err.clone());
+            return Err(err);
+        }
+        self.cancel_active_buy_build_tools();
+        self.close_menu();
+        let install = self.hud.install().clone();
+        let frames = self.frames.clone();
+        self.coop.start_host_with_transport(
+            &mut self.lot,
+            &install,
+            self.play,
+            frames,
+            transport,
+            manifest,
+            options,
+        )?;
+        self.refresh_world();
+        Ok(())
+    }
+
+    /// Synchronously starts joining a host at `host_addr` over `transport`
+    /// (`CoopTransport::Memory` or pre-bound `CoopTransport::Iroh`).
+    pub fn coop_start_join_with_transport(
+        &mut self,
+        transport: CoopTransport,
+        host_addr: PeerAddress,
+        manifest: ManifestDigest,
+        player_name: impl Into<String>,
+    ) -> Result<(), String> {
+        if let Err(err) = self.coop_preflight_check() {
+            self.coop.set_error(err.clone());
+            self.note = Some(err.clone());
+            return Err(err);
+        }
+        self.cancel_active_buy_build_tools();
+        self.close_menu();
+        self.coop
+            .start_join_with_transport(transport, host_addr, manifest, player_name)?;
+        Ok(())
+    }
+
+    /// Submits a raw [`sims_net::Command`] through the active co-op
+    /// [`LockstepNode`](sims_net::LockstepNode).
+    pub fn coop_submit_command(&mut self, command: NetCommand) -> Result<(), String> {
+        self.coop.submit_command(command)
+    }
+
+    /// Submits a [`sims_net::BuyBuildEdit`] through the active co-op lockstep
+    /// session.
+    pub fn coop_submit_buy_build(&mut self, edit: BuyBuildEdit) -> Result<(), String> {
+        self.coop.submit_command(NetCommand::BuyBuild(edit))
+    }
+
+    /// Polls pending async co-op startup and network/snapshot events.
+    pub fn coop_poll(&mut self) -> CoopPollOutput {
+        // Ensure no lingering VM Buy/Build cursors (e.g. Wall Cursor) survive
+        // into the moment async startup finishes and attaches co-op to `Lot`.
+        if self.coop.is_starting() && (self.wall_cursor.is_some() || self.buy_cursor.is_some()) {
+            self.cancel_active_buy_build_tools();
+        }
+        let install = self.hud.install().clone();
+        let frames = self.frames.clone();
+        let out = self
+            .coop
+            .poll_and_handle(&mut self.lot, &install, self.play, frames);
+        if out.snapshot_restored {
+            self.sync_after_coop_snapshot_restore();
+        }
+        if let Some(note) = &out.note {
+            self.note = Some(note.clone());
+        }
+        out
+    }
+
+    /// Deterministic headless co-op pump step (polls network/snapshots,
+    /// optionally schedules one host tick, and steps all ready lockstep
+    /// batches). Used by integration tests for both `MemoryMesh` and real
+    /// `IrohTransport` loopback.
+    pub fn coop_pump(
+        &mut self,
+        schedule_host_tick: bool,
+        flush_peer: bool,
+    ) -> Result<CoopPumpStats, String> {
+        let mut stats = CoopPumpStats::default();
+        let poll = self.coop_poll();
+        if poll.snapshot_restored {
+            stats.snapshots_restored += 1;
+        }
+        stats.drift_events += poll.drift_events as u32;
+
+        if schedule_host_tick
+            && self.coop.is_host()
+            && let Some(sims_net::HostStepResult::Scheduled(_)) = self.coop.advance_host_tick()?
+        {
+            stats.host_scheduled = true;
+        }
+
+        let flush = self.coop.is_host() || flush_peer;
+        while let Some(report) = self.coop.step_next_batch(&mut self.lot, flush)? {
+            stats.batches_applied += 1;
+            if report.stepped {
+                stats.sim_ticks_stepped += 1;
+            }
+            self.apply_coop_batch_side_effects(&report);
+        }
+
+        let poll2 = self.coop_poll();
+        if poll2.snapshot_restored {
+            stats.snapshots_restored += 1;
+        }
+        stats.drift_events += poll2.drift_events as u32;
+        Ok(stats)
+    }
+
+    /// Gracefully leaves any active co-op session, detaching `Lot::coop` and
+    /// closing any `iroh` endpoint and background Tokio runtime cleanly.
+    pub fn leave_coop(&mut self) {
+        let was_remote = self.coop_remote_world;
+        self.coop_buy_preview = None;
+        self.coop_overlay_buttons = CoopOverlayButtons::default();
+        self.coop.leave_and_shutdown(&mut self.lot);
+        self.note = Some(if was_remote {
+            "Disconnected from co-op session (read-only remote lot; return to Neighborhood for local saves)."
+                .into()
+        } else {
+            "Disconnected from co-op session.".into()
+        });
+    }
+
+    /// Non-blocking interactive Leave/Cancel for UI buttons so endpoint drain
+    /// and runtime shutdown never stall the `winit` UI thread.
+    pub fn leave_coop_nonblocking(&mut self) {
+        let was_remote = self.coop_remote_world;
+        self.coop_buy_preview = None;
+        self.coop_overlay_buttons = CoopOverlayButtons::default();
+        self.coop.leave_nonblocking(&mut self.lot);
+        self.note = Some(if was_remote {
+            "Disconnected from co-op session (read-only remote lot; return to Neighborhood for local saves)."
+                .into()
+        } else {
+            "Disconnected from co-op session.".into()
+        });
+    }
+
+    /// Builds a read-only [`CoopSnapshot`] for the Co-op Lobby & HUD Overlay.
+    pub fn coop_snapshot(&self) -> CoopSnapshot {
+        let lot = &self.lot;
+        let hud = &self.hud;
+        self.coop.ui_snapshot(lot, |sim_id| {
+            let obj = lot.world().objects.get(&sim_id)?;
+            lot.character_names()
+                .get(&obj.guid)
+                .cloned()
+                .or_else(|| hud.name(obj.guid).map(str::to_owned))
+                .or_else(|| Some(format!("Sim #{sim_id}")))
+        })
+    }
+
+    fn execute_coop_ui_command(&mut self, cmd: CoopCommand) -> Outcome {
+        self.hud.play(crate::hud::CLICK);
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        match cmd {
+            CoopCommand::StartHosting => {
+                let _ = self.coop_start_host_async(None);
+            }
+            CoopCommand::Disconnect | CoopCommand::CancelConnect => {
+                self.leave_coop_nonblocking();
+            }
+            CoopCommand::CopyInviteTicket(ticket) => match clipboard_copy(&ticket) {
+                Ok(()) => {
+                    self.note = Some("Invite ticket copied to clipboard.".into());
+                }
+                Err(err) => {
+                    self.note = Some(format!("Could not copy invite ticket: {err}"));
+                }
+            },
+            CoopCommand::SetHostOnlyTimeControl(locked) => {
+                if let Err(err) = self
+                    .coop
+                    .submit_command(NetCommand::SetHostSpeedLock { locked })
+                {
+                    self.note = Some(format!("Could not toggle host time lock: {err}"));
+                }
+            }
+            CoopCommand::JoinSession { ticket } => {
+                let _ = self.coop_start_join_async(ticket, None);
+            }
+            CoopCommand::CloseDialog => {
+                self.coop_lobby.close();
+            }
+        }
+        Outcome::redraw()
+    }
+
+    fn execute_coop_overlay_action(&mut self, action: CoopOverlayAction) -> Outcome {
+        match action {
+            CoopOverlayAction::OpenLobby => {
+                self.open_coop_lobby(None);
+            }
+            CoopOverlayAction::CopyTicket => {
+                if let Some(ticket) = self.coop.invite_ticket().map(str::to_owned) {
+                    match clipboard_copy(&ticket) {
+                        Ok(()) => {
+                            self.coop_overlay_buttons.copied_flash = true;
+                            self.note = Some("Invite ticket copied to clipboard.".into());
+                        }
+                        Err(err) => {
+                            self.note = Some(format!("Could not copy invite ticket: {err}"));
+                        }
+                    }
+                }
+            }
+            CoopOverlayAction::Leave => {
+                self.leave_coop_nonblocking();
+            }
+        }
+        Outcome::redraw()
+    }
+
+    fn advance_coop_while(
+        &mut self,
+        clock_elapsed_us: u64,
+        step_elapsed_us: u64,
+        mut keep_going: impl FnMut(u32) -> bool,
+    ) -> (u32, bool) {
+        let toast_expired = self
+            .coop
+            .tick_toasts((clock_elapsed_us / 1_000).min(u64::from(u32::MAX)) as u32);
+        if toast_expired {
+            self.blink_dirty = true;
+        }
+        let poll = self.coop_poll();
+        if poll.redraw {
+            self.blink_dirty = true;
+        }
+        if !self.coop.is_active() {
+            return (0, false);
+        }
+
+        let is_host = self.coop.is_host();
+        if is_host {
+            self.coop.accumulate_host_elapsed(step_elapsed_us, 8);
+        }
+
+        let mut ran = 0u32;
+        let mut capped = false;
+        let mut any_batch = false;
+
+        // Interleave host tick scheduling and stepping 1-for-1 inside the budget
+        // loop so the host never yields with scheduled-but-unapplied batches
+        // that would create a tick gap for a mid-game joiner.
+        while self.stopped.is_none() {
+            if !keep_going(ran) {
+                capped = true;
+                break;
+            }
+            match self.coop.step_next_batch(&mut self.lot, is_host) {
+                Ok(Some(report)) => {
+                    any_batch = true;
+                    if report.stepped {
+                        ran += 1;
+                    }
+                    self.apply_coop_batch_side_effects(&report);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.note = Some(err);
+                    break;
+                }
+            }
+            if is_host {
+                match self.coop.schedule_one_host_tick_if_due() {
+                    Ok(true) => match self.coop.step_next_batch(&mut self.lot, true) {
+                        Ok(Some(report)) => {
+                            any_batch = true;
+                            if report.stepped {
+                                ran += 1;
+                            }
+                            self.apply_coop_batch_side_effects(&report);
+                            continue;
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            self.note = Some(err);
+                            break;
+                        }
+                    },
+                    Ok(false) => break,
+                    Err(err) => {
+                        self.note = Some(err);
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        if any_batch || poll.snapshot_restored {
+            self.dirty = true;
+            self.blink_dirty = true;
+            if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
+                self.blink_dirty = true;
+            }
+        }
+        (ran, capped)
+    }
+
+    fn apply_coop_batch_side_effects(&mut self, report: &sims_vm::coop::CoopBatchReport) {
+        if let Some(update) = &report.update {
+            let at = self.lot.ticks();
+            for line in in_order(at, &update.errors, &update.frame_errors) {
+                self.errors.push(at, line);
+            }
+            self.view.masks_rebuilt(update.masks_rebuilt);
+            self.keep_sounds(update.sounds.clone());
+            self.keep_ui_effects(update.ui_effects.clone());
+        }
+        if report.opened_dialog.is_some() {
+            self.hud.clear_vm_dialog();
+        }
+        let mut visual_changed = report.stepped || report.opened_dialog.is_some();
+        for (stamped, status) in &report.command_results {
+            match status {
+                sims_vm::coop::CoopCommandStatus::BuyBuildApplied
+                | sims_vm::coop::CoopCommandStatus::QueuedInteraction { .. }
+                | sims_vm::coop::CoopCommandStatus::CancelledInteraction { .. }
+                | sims_vm::coop::CoopCommandStatus::DialogAnswered { .. }
+                | sims_vm::coop::CoopCommandStatus::Applied => {
+                    visual_changed = true;
+                }
+                sims_vm::coop::CoopCommandStatus::Refused(reason)
+                    if Some(stamped.issuer) == self.coop.local_player_id() =>
+                {
+                    self.note = Some(format!("Co-op command refused: {reason}"));
+                }
+                sims_vm::coop::CoopCommandStatus::RejectedBySession(reason)
+                    if Some(stamped.issuer) == self.coop.local_player_id() =>
+                {
+                    self.note = Some(format!("Co-op command rejected: {reason:?}"));
+                }
+                _ => {}
+            }
+        }
+        if visual_changed {
+            self.hud.sync_character_names(self.lot.character_names());
+            let world = self.lot.world();
+            self.people.refresh(world);
+            if let Ok(shape) = sims_render::Lot::from_world(world) {
+                self.lot_shape = shape.with_floor_rotation(self.lot.floor_rotation());
+            }
+            if self.hud.controls.mode == Mode::Buy {
+                self.layout_buy();
+            } else if self.hud.controls.mode == Mode::Build {
+                self.layout_build();
+            }
+        }
+    }
+
+    fn sync_after_coop_snapshot_restore(&mut self) {
+        if self.coop.is_peer() {
+            self.coop_remote_world = true;
+        }
+        self.stopped = None;
+        self.errors = Errors::default();
+        self.buy_cursor = None;
+        self.coop_buy_preview = None;
+        self.buy_selected = None;
+        self.buy_dragging = None;
+        self.buy_commit_on_release = false;
+        self.wall_cursor = None;
+        self.build_drag = None;
+        self.build_preview_shape = None;
+        self.terrain_hover_overlay = None;
+        self.water_hover_overlay = None;
+        self.close_menu();
+        self.reached = None;
+        self.listed = None;
+        self.highlighted = None;
+        self.hud.clear_vm_dialog();
+        self.hud.sync_character_names(self.lot.character_names());
+        self.people.refresh(self.lot.world());
+        if let Ok(shape) = sims_render::Lot::from_world(self.lot.world()) {
+            self.lot_shape = shape.with_floor_rotation(self.lot.floor_rotation());
+        }
+        self.lot_cache.clear();
+        self.restore_generation = self.restore_generation.wrapping_add(1);
+        self.blink_dirty = true;
+    }
+
+    /// Presentation-only Hand Tool pickup preview for Buy/Build modes in co-op
+    /// (never calls `Lot::buy_pick_up`, keeping the shared world immutable until
+    /// `BuyBuildEdit::MoveObject` / `SellObject` commits via lockstep).
+    fn coop_pick_up_preview(&mut self, target: u16, point: [i32; 2]) -> Outcome {
+        if let Some(obj) = self.lot.world().objects.get(&target)
+            && obj.person.is_none()
+        {
+            self.coop_buy_preview = Some(CoopBuyPreview {
+                guid: obj.guid,
+                existing_object_id: Some(target),
+                position: obj.position,
+                facing: obj.data.get(1).copied().unwrap_or(0).rem_euclid(8),
+            });
+            self.buy_in_house = true;
+            self.buy_dragging = Some(point);
+            self.buy_commit_on_release = false;
+            self.pointer = Some(point);
+            self.hud.play("UI_object_move");
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+            return Outcome::redraw();
+        }
+        self.hud.play(crate::hud::ERROR);
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        Outcome::redraw()
+    }
+
+    fn hover_buy_coop(&mut self, point: [i32; 2]) -> bool {
+        let at = [point[0] - pick::ORIGIN_COLUMN, point[1]];
+        let fine = sims_render::unproject_terrain(&self.lot_shape, &self.view.camera, at)
+            .unwrap_or_else(|| self.view.camera.unproject_fine(at));
+        let snapped = [
+            (fine[0] & !15) + 8,
+            (fine[1] & !15) + 8,
+            self.view.camera.level,
+        ];
+        if let Some(preview) = self.coop_buy_preview.as_mut() {
+            if let Some(anchor) = self.buy_dragging {
+                let dx = point[0] - anchor[0];
+                let dy = point[1] - anchor[1];
+                if dx * dx + dy * dy > 36 {
+                    let quad = if dy < 0 {
+                        if dx < 0 { 6 } else { 4 }
+                    } else if dx < 0 {
+                        0
+                    } else {
+                        2
+                    };
+                    let desired =
+                        (quad - 2 * i16::from(self.view.camera.rotation & 3)).rem_euclid(8);
+                    preview.facing = desired;
+                    self.buy_facing = Some(desired);
+                    return true;
+                }
+            }
+            preview.position = snapped;
+            return true;
+        }
+        if let Some(guid) = self.buy_selected {
+            let facing = self
+                .buy_facing
+                .unwrap_or_else(|| sims_vm::default_buy_direction(self.view.camera.rotation));
+            self.coop_buy_preview = Some(CoopBuyPreview {
+                guid,
+                existing_object_id: None,
+                position: snapped,
+                facing,
+            });
+            self.buy_in_house = true;
+            return true;
+        }
+        false
+    }
+
+    fn commit_buy_coop(&mut self) -> Outcome {
+        let Some(preview) = self.coop_buy_preview.take() else {
+            return Outcome::default();
+        };
+        let edit = match preview.existing_object_id {
+            Some(object_id) => BuyBuildEdit::MoveObject {
+                object_id,
+                position: preview.position,
+                facing: preview.facing,
+                container: None,
+            },
+            None => BuyBuildEdit::BuyObject {
+                guid: preview.guid,
+                position: preview.position,
+                facing: preview.facing,
+                container: None,
+            },
+        };
+        match self.coop.submit_command(NetCommand::BuyBuild(edit)) {
+            Ok(()) => {
+                self.buy_facing = Some(preview.facing);
+                self.buy_last_guid = Some(preview.guid);
+                if preview.existing_object_id.is_some() || !self.shift_held {
+                    self.buy_selected = None;
+                    self.hud.buy_state.selected = None;
+                }
+                self.hud.play("UI_object_move_place");
+            }
+            Err(e) => {
+                self.note = Some(format!("Co-op placement not sent: {e}"));
+                self.hud.play(crate::hud::ERROR);
+            }
+        }
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        Outcome::redraw()
+    }
+
+    fn commit_build_coop(&mut self, drag: BuildDrag) -> Outcome {
+        // Stay strictly below `LockstepNode`'s 64-command per-player queue cap
+        // so a single Build drag never silently drops trailing commands.
+        const MAX_COOP_BUILD_DRAG_COMMANDS: usize = 48;
+        // `sims_vm::build::cell_index(x, y) = x * 64 + y` (column-major stride 64).
+        const FULL_GRID_STRIDE: usize = 64;
+        let level = self.view.camera.level.clamp(1, 2) as u8;
+        let mut sent = 0usize;
+        let mut err_msg: Option<String> = None;
+        match drag {
+            BuildDrag::Wall {
+                start_corner,
+                end_corner,
+                style,
+                mode,
+                plan,
+            } => {
+                if let Some(plan) = plan
+                    && plan.valid
+                    && plan.affordable
+                {
+                    let (x0, x1) = (
+                        start_corner[0].min(end_corner[0]),
+                        start_corner[0].max(end_corner[0]),
+                    );
+                    let y = start_corner[1] as i16;
+                    let count = usize::try_from(x1.saturating_sub(x0)).unwrap_or(0);
+                    if count > MAX_COOP_BUILD_DRAG_COMMANDS {
+                        err_msg = Some(format!(
+                            "Co-op wall drag ({count} segments) exceeds {MAX_COOP_BUILD_DRAG_COMMANDS}-segment limit; drag a smaller section."
+                        ));
+                    } else if x1 > x0 {
+                        for x in x0..x1 {
+                            let edit = if mode.is_demolish() {
+                                BuyBuildEdit::RemoveWall {
+                                    x: x as i16,
+                                    y,
+                                    level,
+                                }
+                            } else {
+                                BuyBuildEdit::PlaceWall {
+                                    x: x as i16,
+                                    y,
+                                    level,
+                                    style: style.style_id(),
+                                    pattern: style.default_pattern(),
+                                }
+                            };
+                            if let Err(e) = self.coop.submit_command(NetCommand::BuyBuild(edit)) {
+                                err_msg = Some(e);
+                                break;
+                            }
+                            sent += 1;
+                        }
+                    } else {
+                        err_msg = Some(
+                            "Co-op wall edits currently support horizontal wall segments.".into(),
+                        );
+                    }
+                }
+            }
+            BuildDrag::Floor {
+                floor_id,
+                mode,
+                plan,
+                ..
+            } => {
+                if let Some(plan) = plan
+                    && plan.valid
+                    && plan.affordable
+                {
+                    if plan.floor_changes.len() > MAX_COOP_BUILD_DRAG_COMMANDS {
+                        err_msg = Some(format!(
+                            "Co-op floor drag ({} tiles) exceeds {MAX_COOP_BUILD_DRAG_COMMANDS}-tile limit; drag a smaller area.",
+                            plan.floor_changes.len()
+                        ));
+                    } else {
+                        let pattern = if mode.is_remove() { 0 } else { floor_id };
+                        for &(idx, _before, _after) in &plan.floor_changes {
+                            let x = (idx / FULL_GRID_STRIDE) as i16;
+                            let y = (idx % FULL_GRID_STRIDE) as i16;
+                            let edit = BuyBuildEdit::SetFloorTile {
+                                x,
+                                y,
+                                level,
+                                pattern,
+                            };
+                            if let Err(e) = self.coop.submit_command(NetCommand::BuyBuild(edit)) {
+                                err_msg = Some(e);
+                                break;
+                            }
+                            sent += 1;
+                        }
+                    }
+                }
+            }
+            BuildDrag::Wallpaper {
+                faces,
+                pattern_id,
+                mode,
+                plan,
+            } => {
+                if let Some(plan) = plan
+                    && plan.valid
+                    && plan.affordable
+                {
+                    if faces.len() > MAX_COOP_BUILD_DRAG_COMMANDS {
+                        err_msg = Some(format!(
+                            "Co-op wallpaper drag ({} faces) exceeds {MAX_COOP_BUILD_DRAG_COMMANDS}-face limit; drag a smaller section.",
+                            faces.len()
+                        ));
+                    } else {
+                        let pattern = if mode.is_strip() { 0 } else { pattern_id };
+                        for face in faces {
+                            let side = match face.bit {
+                                WALL_NORTH => 0,
+                                WALL_EAST => 1,
+                                WALL_SOUTH => 2,
+                                WALL_WEST => 3,
+                                _ => continue,
+                            };
+                            let edit = BuyBuildEdit::SetWallpaper {
+                                x: i16::from(face.tile[0]),
+                                y: i16::from(face.tile[1]),
+                                level,
+                                side,
+                                pattern,
+                            };
+                            if let Err(e) = self.coop.submit_command(NetCommand::BuyBuild(edit)) {
+                                err_msg = Some(e);
+                                break;
+                            }
+                            sent += 1;
+                        }
+                    }
+                }
+            }
+            BuildDrag::Terrain { .. } | BuildDrag::Water { .. } | BuildDrag::Pool { .. } => {
+                err_msg = Some(
+                    "Terrain, Water, and Pool tools are not yet supported in co-op mode.".into(),
+                );
+            }
+        }
+        if let Some(msg) = err_msg {
+            self.note = Some(msg);
+            self.hud.play(crate::hud::ERROR);
+        } else if sent > 0 {
+            self.hud.play(crate::hud::BLD_DRAG_UP);
+        }
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        Outcome::redraw()
+    }
+
+    fn ensure_coop_art(&mut self) {
+        if self.coop_art.is_none()
+            && let Ok(ui) = UiGraphics::open(self.hud.install())
+            && let Ok(art) = sims_ui::coop::load_art(&ui, US_ENGLISH)
+        {
+            self.coop_art = Some(art);
+        }
+    }
+
+    /// Draws distinct colored faceted diamond plumbob indicators above Sims
+    /// selected by remote teammates (and above the local peer's own selected
+    /// Sim when it differs from the host's native plumbob). Never runs in
+    /// single-player (`coop == None`).
+    fn draw_coop_remote_indicators(&mut self, viewport: (u32, u32)) {
+        let Some(session) = self.coop.session() else {
+            return;
+        };
+        let host_selected = session
+            .players
+            .get(&session.host_id)
+            .and_then(|p| p.selected_sim);
+        let local_id = self.coop.local_player_id();
+        let world = self.lot.world();
+        let vp_w = i32::try_from(viewport.0)
+            .unwrap_or(i32::MAX)
+            .min(self.canvas.width as i32);
+        let vp_h = i32::try_from(viewport.1)
+            .unwrap_or(i32::MAX)
+            .min(self.canvas.height as i32);
+        if vp_w <= 0 || vp_h <= 0 {
+            return;
+        }
+
+        // Group players by selected Sim so co-selected Sims fan out badges cleanly.
+        type RemotePlumbobEntry = (NetPlayerId, String, [u8; 3], bool);
+        let mut by_sim: BTreeMap<u16, Vec<RemotePlumbobEntry>> = BTreeMap::new();
+        for player in session.players.values() {
+            let Some(sim_id) = player.selected_sim else {
+                continue;
+            };
+            // The host's selected Sim already has the native 3D plumbob when we
+            // are the host (or when it is the host's own Sim); draw colored
+            // accents for every remote player AND for the local peer when they
+            // select a different Sim from the host.
+            let is_local = Some(player.player_id) == local_id;
+            if is_local && Some(sim_id) == host_selected && player.player_id == session.host_id {
+                continue;
+            }
+            by_sim.entry(sim_id).or_default().push((
+                player.player_id,
+                player.name.clone(),
+                player_badge_color(player.player_id),
+                is_local,
+            ));
+        }
+        if by_sim.is_empty() {
+            return;
+        }
+
+        let (head_lift, half_w, half_h) = match self.view.camera.zoom {
+            sims_render::Zoom::Far => (34i32, 4i32, 7i32),
+            sims_render::Zoom::Medium => (68i32, 6i32, 11i32),
+            sims_render::Zoom::Near => (132i32, 9i32, 16i32),
+        };
+        // Gentle vertical bob driven by `clock_us` (pure presentation).
+        let phase = ((self.clock_us / 120_000) % 4) as i32;
+        let bob = match phase {
+            1 => -2,
+            2 => -1,
+            3 => 1,
+            _ => 0,
+        };
+
+        for (sim_id, markers) in by_sim {
+            let Some(obj) = world.objects.get(&sim_id) else {
+                continue;
+            };
+            if obj.position[2] > self.view.camera.level
+                || (obj.position[0] == 0 && obj.position[1] == 0)
+            {
+                continue;
+            }
+            let base = lot_point(&self.view.camera, &self.lot_shape, obj.position);
+            let base_x = base[0] + pick::ORIGIN_COLUMN;
+            let base_y = base[1] - head_lift + bob;
+            let spacing = half_w * 2 + 6;
+            let start_x = base_x - ((markers.len() as i32 - 1) * spacing) / 2;
+            for (idx, (pid, _name, color, is_local)) in markers.iter().enumerate() {
+                let cx = start_x + (idx as i32) * spacing;
+                let cy = base_y;
+                draw_coop_plumbob_diamond(
+                    &mut self.canvas,
+                    cx,
+                    cy,
+                    half_w,
+                    half_h,
+                    *color,
+                    *is_local,
+                    (vp_w, vp_h),
+                );
+                let _ = pid;
+            }
+        }
+    }
+
+    fn draw_coop_buy_preview(&mut self, viewport: (u32, u32)) {
+        let Some(preview) = &self.coop_buy_preview else {
+            return;
+        };
+        let vp_w = i32::try_from(viewport.0)
+            .unwrap_or(i32::MAX)
+            .min(self.canvas.width as i32);
+        let vp_h = i32::try_from(viewport.1)
+            .unwrap_or(i32::MAX)
+            .min(self.canvas.height as i32);
+        let pt = lot_point(&self.view.camera, &self.lot_shape, preview.position);
+        let cx = pt[0] + pick::ORIGIN_COLUMN;
+        let cy = pt[1];
+        draw_coop_plumbob_diamond(
+            &mut self.canvas,
+            cx,
+            cy,
+            10,
+            6,
+            [64, 224, 255],
+            true,
+            (vp_w, vp_h),
+        );
+    }
+
+    fn draw_coop_hud_and_lobby(&mut self) {
+        let show_overlay = self.coop.is_active_or_starting();
+        let show_lobby = self.coop_lobby.is_open();
+        if !show_overlay && !show_lobby {
+            self.coop_overlay_buttons.clear_rects();
+            return;
+        }
+        self.ensure_coop_art();
+        let snapshot = self.coop_snapshot();
+        let art = self.coop_art.as_ref().unwrap_or(&self.hud.art);
+        let (w, h) = (
+            u32::try_from(self.canvas.width).unwrap_or(0),
+            u32::try_from(self.canvas.height).unwrap_or(0),
+        );
+        let Ok(mut frame) =
+            sims_ui::frame::Frame::from_rgb(w, h, std::mem::take(&mut self.canvas.color))
+        else {
+            return;
+        };
+        if show_overlay {
+            CoopHudOverlay::draw(&mut frame, &snapshot, art);
+            let overlay_layout = CoopHudOverlay::layout([w, h], &snapshot, art);
+            if let Some(panel) = overlay_layout.status_panel {
+                let hosting = matches!(snapshot.connection, CoopConnectionState::Hosting { .. });
+                self.coop_overlay_buttons.layout_and_draw(
+                    &mut frame,
+                    art,
+                    panel,
+                    hosting,
+                    self.pointer,
+                );
+            } else {
+                self.coop_overlay_buttons.clear_rects();
+            }
+        } else {
+            self.coop_overlay_buttons.clear_rects();
+        }
+        if show_lobby {
+            self.coop_lobby.draw(&mut frame, &snapshot, art);
+        }
+        self.canvas.color = frame.into_rgb();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoopOverlayAction {
+    OpenLobby,
+    CopyTicket,
+    Leave,
+}
+
+#[derive(Debug, Default)]
+struct CoopOverlayButtons {
+    lobby_rect: Option<sims_ui::frame::Rect>,
+    copy_rect: Option<sims_ui::frame::Rect>,
+    leave_rect: Option<sims_ui::frame::Rect>,
+    pressed: Option<CoopOverlayAction>,
+    copied_flash: bool,
+}
+
+impl CoopOverlayButtons {
+    fn clear_rects(&mut self) {
+        self.lobby_rect = None;
+        self.copy_rect = None;
+        self.leave_rect = None;
+        self.pressed = None;
+    }
+
+    fn hit(&self, point: [i32; 2]) -> Option<CoopOverlayAction> {
+        if self
+            .lobby_rect
+            .is_some_and(|r| r.contains(point[0], point[1]))
+        {
+            return Some(CoopOverlayAction::OpenLobby);
+        }
+        if self
+            .copy_rect
+            .is_some_and(|r| r.contains(point[0], point[1]))
+        {
+            return Some(CoopOverlayAction::CopyTicket);
+        }
+        if self
+            .leave_rect
+            .is_some_and(|r| r.contains(point[0], point[1]))
+        {
+            return Some(CoopOverlayAction::Leave);
+        }
+        None
+    }
+
+    fn contains(&self, point: [i32; 2]) -> bool {
+        self.hit(point).is_some()
+    }
+
+    fn press(&mut self, point: [i32; 2]) -> bool {
+        let hit = self.hit(point);
+        self.pressed = hit;
+        hit.is_some()
+    }
+
+    fn release(&mut self, point: Option<[i32; 2]>) -> Option<CoopOverlayAction> {
+        let pressed = self.pressed.take()?;
+        let hit = point.and_then(|p| self.hit(p));
+        (hit == Some(pressed)).then_some(pressed)
+    }
+
+    fn layout_and_draw(
+        &mut self,
+        frame: &mut sims_ui::frame::Frame,
+        art: &Art,
+        panel: sims_ui::frame::Rect,
+        hosting: bool,
+        pointer: Option<[i32; 2]>,
+    ) {
+        let bar_y = panel.y + panel.height + 4;
+        let btn_h = 20;
+        let gap = 4;
+        let fh = i32::try_from(frame.height()).unwrap_or(600);
+        if bar_y + btn_h >= fh - 4 {
+            self.clear_rects();
+            return;
+        }
+        if hosting {
+            let btn_w = ((panel.width - gap * 2) / 3).max(40);
+            self.lobby_rect = Some(sims_ui::frame::Rect::new(panel.x, bar_y, btn_w, btn_h));
+            self.copy_rect = Some(sims_ui::frame::Rect::new(
+                panel.x + btn_w + gap,
+                bar_y,
+                btn_w,
+                btn_h,
+            ));
+            let leave_x = panel.x + (btn_w + gap) * 2;
+            let leave_w = (panel.x + panel.width - leave_x).max(40);
+            self.leave_rect = Some(sims_ui::frame::Rect::new(leave_x, bar_y, leave_w, btn_h));
+        } else {
+            let btn_w = ((panel.width - gap) / 2).max(48);
+            self.lobby_rect = Some(sims_ui::frame::Rect::new(panel.x, bar_y, btn_w, btn_h));
+            self.copy_rect = None;
+            let leave_x = panel.x + btn_w + gap;
+            let leave_w = (panel.x + panel.width - leave_x).max(48);
+            self.leave_rect = Some(sims_ui::frame::Rect::new(leave_x, bar_y, leave_w, btn_h));
+        }
+
+        let draw_btn = |frame: &mut sims_ui::frame::Frame,
+                        rect: sims_ui::frame::Rect,
+                        label: &str,
+                        action: CoopOverlayAction,
+                        danger: bool| {
+            let hovered = pointer.is_some_and(|[px, py]| rect.contains(px, py));
+            let active = self.pressed == Some(action) && hovered;
+            let (bg, border, fg) = if danger {
+                if active {
+                    ([138, 36, 48], [255, 160, 160], [255, 255, 255])
+                } else if hovered {
+                    ([110, 30, 42], [230, 120, 130], [255, 232, 232])
+                } else {
+                    ([74, 22, 34], [176, 86, 98], [235, 200, 205])
+                }
+            } else if active {
+                ([30, 88, 176], [0, 255, 255], [0, 255, 255])
+            } else if hovered {
+                ([26, 62, 146], [136, 178, 232], [255, 255, 255])
+            } else {
+                ([16, 36, 108], [88, 120, 204], [195, 205, 205])
+            };
+            frame.fill(rect, bg);
+            frame.fill(
+                sims_ui::frame::Rect::new(rect.x, rect.y, rect.width, 1),
+                border,
+            );
+            frame.fill(
+                sims_ui::frame::Rect::new(rect.x, rect.y + rect.height - 1, rect.width, 1),
+                border,
+            );
+            frame.fill(
+                sims_ui::frame::Rect::new(rect.x, rect.y, 1, rect.height),
+                border,
+            );
+            frame.fill(
+                sims_ui::frame::Rect::new(rect.x + rect.width - 1, rect.y, 1, rect.height),
+                border,
+            );
+            if let Some(font) = art.font(10).or_else(|| art.font(12)) {
+                let tw = font.width(label);
+                let tx = rect.x + (rect.width - tw) / 2;
+                let ty = rect.y + (rect.height - font.line_height) / 2;
+                font.draw(frame, label, [tx, ty], fg);
+            }
+        };
+
+        if let Some(r) = self.lobby_rect {
+            draw_btn(frame, r, "Lobby", CoopOverlayAction::OpenLobby, false);
+        }
+        if let Some(r) = self.copy_rect {
+            let label = if self.copied_flash { "Copied" } else { "Copy" };
+            draw_btn(frame, r, label, CoopOverlayAction::CopyTicket, false);
+        }
+        if let Some(r) = self.leave_rect {
+            draw_btn(frame, r, "Leave", CoopOverlayAction::Leave, true);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CoopBuyPreview {
+    guid: u32,
+    existing_object_id: Option<u16>,
+    position: [i32; 3],
+    facing: i16,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_coop_plumbob_diamond(
+    canvas: &mut Canvas,
+    cx: i32,
+    cy: i32,
+    half_w: i32,
+    half_h: i32,
+    color: [u8; 3],
+    bright_ring: bool,
+    viewport: (i32, i32),
+) {
+    if half_w <= 0 || half_h <= 0 {
+        return;
+    }
+    let width = canvas.width as i32;
+    let light = [
+        color[0].saturating_add(55),
+        color[1].saturating_add(55),
+        color[2].saturating_add(55),
+    ];
+    let shadow = [
+        (u16::from(color[0]) * 3 / 5) as u8,
+        (u16::from(color[1]) * 3 / 5) as u8,
+        (u16::from(color[2]) * 3 / 5) as u8,
+    ];
+    let outline = if bright_ring {
+        [255, 255, 255]
+    } else {
+        [14, 22, 34]
+    };
+
+    for dy in -half_h..=half_h {
+        let py = cy + dy;
+        if py < 0 || py >= viewport.1 {
+            continue;
+        }
+        let span = ((half_h - dy.abs()) * half_w) / half_h;
+        let row = py as usize * width as usize;
+        for dx in -span..=span {
+            let px = cx + dx;
+            if px < 0 || px >= viewport.0 {
+                continue;
+            }
+            let is_edge = dx == -span || dx == span || dy.abs() == half_h;
+            let rgb = if is_edge {
+                outline
+            } else if dx < 0 && dy < 0 {
+                light
+            } else if dx > 0 && dy > 0 {
+                shadow
+            } else {
+                color
+            };
+            canvas.color[row + px as usize] = rgb;
+        }
     }
 }
 
