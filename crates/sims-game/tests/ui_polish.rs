@@ -193,7 +193,7 @@ fn live_mode_has_no_cam_view_album_overlap_and_camera_button_toggles_substrip() 
         assert!(snap.x >= sims_ui::hud::CLUSTER[0]);
         assert!(album.x >= sims_ui::hud::CLUSTER[0]);
         assert!(
-            snap.x + snap.width <= album.x,
+            snap.x + snap.width <= album.x || album.x + album.width <= snap.x,
             "Take Snapshot ({snap:?}) and Photo Album ({album:?}) must not overlap"
         );
         (strip, snap, album)

@@ -1585,24 +1585,29 @@ impl App {
         }
         let Some(game) = self.session.game_mut() else {
             self.wake_clock.finish(now, Instant::now(), false);
-            let redraw = match &mut self.session {
-                Session::Shell(shell) => shell.tick_shell(clock_us),
-                Session::Standalone { .. } | Session::Starting(_) => false,
+            let (redraw, interactive) = match &mut self.session {
+                Session::Shell(shell) => {
+                    let r = shell.tick_shell(clock_us);
+                    (r, shell.has_active_fades())
+                }
+                Session::Standalone { .. } | Session::Starting(_) => (false, false),
             };
-            self.changed(redraw, false);
+            self.changed(redraw, interactive);
             return;
         };
 
-        let waited = game.asking().is_some();
+        let waited = game.asking().is_some() || game.asking_special_panel().is_some();
         let (ran, capped) = game.advance_while(clock_us, step_us, |ran| {
             within_step_budget(ran, now.elapsed(), SIM_BUDGET)
         });
         self.wake_clock.finish(now, Instant::now(), capped);
-        let mut redraw = ran > 0 || (!waited && game.asking().is_some());
+        let asking_now = game.asking().is_some() || game.asking_special_panel().is_some();
+        let mut redraw = ran > 0 || (!waited && asking_now);
         let scrolled = self.drag.is_none() && game.edge_scroll(clock_us);
         let pie_anim = game.pie_animating();
+        let ui_anim = game.ui_animating();
         let panning = game.take_camera_pan_moved() || game.camera_panning();
-        redraw |= scrolled || pie_anim || panning || game.spin_due() || game.blink_due();
+        redraw |= scrolled || pie_anim || ui_anim || panning || game.spin_due() || game.blink_due();
         let sound_rc = Rc::clone(&self.sound);
         self.sound_feed
             .update(game, |input| sound_rc.borrow().send(input));
@@ -1636,10 +1641,10 @@ impl App {
             game.show_notice("Co-op", msg);
             redraw = true;
         }
-        // Edge-scrolling, smooth camera pan, and active 400 ms pie animations use
-        // display-refresh cadence, while pure simulation ticks / plumb-bob spin /
+        // Edge-scrolling, smooth camera pan, and active UI / 400 ms pie animations
+        // use display-refresh cadence, while pure simulation ticks / plumb-bob spin /
         // pause blink are passive (60 FPS cap).
-        self.changed(redraw, scrolled || pie_anim || panning);
+        self.changed(redraw, scrolled || pie_anim || ui_anim || panning);
     }
 
     fn redraw(&mut self) {
