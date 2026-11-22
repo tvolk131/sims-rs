@@ -92,12 +92,13 @@ pub fn compile_object_from_sources(
     let mut strings = lowered.strings;
 
     // Private object IFFs are only addressed via private BCON range 4096..=4159 by sims-vm
-    // (`Program::constant` maps 256..=319 to Global.iff and 8192..=8255 to semi-globals).
+    // (`Program::constant` maps 256..=319 to Global.iff, 8192..=8255 to semi-globals, and
+    // cannot address any chunk ID outside 4096..=4159 in a private object IFF).
     for &bcon_id in constants.keys() {
-        if matches!(bcon_id, 256..=319 | 8192..=8255) {
+        if !(4096..=4159).contains(&bcon_id) {
             return Err(Error::new(format!(
-                "object '{}' declares non-private BCON id {bcon_id} (global 256..=319 and \
-                 semi-global 8192..=8255 tables are not read from private object IFFs; use 4096..=4159)",
+                "object '{}' declares unreachable private BCON id {bcon_id} (private object \
+                 BCON tables must use IDs in 4096..=4159)",
                 manifest.name
             )));
         }
@@ -266,6 +267,68 @@ pub fn compile_object_from_sources(
             data: encode_objf(&master_objf)?,
         });
 
+        // Pass 1: Register all per-tile sprite shapes first so shared tile DGRP references
+        // are independent of [[tile]] declaration order.
+        let mut resolved_tile_dgrps: Vec<Option<u16>> = vec![None; manifest.tiles.len()];
+        for (idx, tile) in manifest.tiles.iter().enumerate() {
+            let tile_label = tile
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{} Tile {}", manifest.name, idx));
+            match (tile.dgrp_id, tile.shape) {
+                (Some(dgrp_id), Some(shape)) => {
+                    if dgrp_id == 0 {
+                        return Err(Error::new(format!(
+                            "tile '{tile_label}' cannot combine dgrp_id = 0 with a sprite shape"
+                        )));
+                    }
+                    if !emitted_dgrp_ids.insert(dgrp_id)
+                        || !emitted_spr2_ids.insert(dgrp_id)
+                        || !emitted_palt_ids.insert(dgrp_id)
+                    {
+                        return Err(Error::new(format!(
+                            "tile '{tile_label}' dgrp_id {dgrp_id} collides with an existing PALT/SPR2/DGRP chunk id"
+                        )));
+                    }
+                    extra_tile_sprites.push((
+                        dgrp_id,
+                        tile_label,
+                        SpriteSpec {
+                            shape,
+                            ..manifest.sprite
+                        },
+                    ));
+                    resolved_tile_dgrps[idx] = Some(dgrp_id);
+                }
+                (None, Some(shape)) => {
+                    let dgrp_id = manifest
+                        .dgrp_id
+                        .checked_add(1 + idx as u16)
+                        .ok_or_else(|| Error::new("multi-tile dgrp_id overflow"))?;
+                    if !emitted_dgrp_ids.insert(dgrp_id)
+                        || !emitted_spr2_ids.insert(dgrp_id)
+                        || !emitted_palt_ids.insert(dgrp_id)
+                    {
+                        return Err(Error::new(format!(
+                            "auto-assigned tile dgrp_id {dgrp_id} for '{tile_label}' collides with an existing sprite chunk id"
+                        )));
+                    }
+                    extra_tile_sprites.push((
+                        dgrp_id,
+                        tile_label,
+                        SpriteSpec {
+                            shape,
+                            ..manifest.sprite
+                        },
+                    ));
+                    resolved_tile_dgrps[idx] = Some(dgrp_id);
+                }
+                (Some(_), None) | (None, None) => {}
+            }
+        }
+
+        // Pass 2: Validate every tile's DGRP/TTAB/SLOT references against all emitted chunks
+        // and emit per-tile OBJD + OBJf chunks.
         for (idx, tile) in manifest.tiles.iter().enumerate() {
             if !seen_guids.insert(tile.guid) {
                 return Err(Error::new(format!(
@@ -297,65 +360,18 @@ pub fn compile_object_from_sources(
                 .clone()
                 .unwrap_or_else(|| format!("{} Tile {}", manifest.name, idx));
 
-            // Validate / register per-tile DGRP/sprite overrides.
-            let tile_dgrp_id = match (tile.dgrp_id, tile.shape) {
-                (Some(dgrp_id), Some(shape)) => {
-                    if dgrp_id == 0 {
-                        return Err(Error::new(format!(
-                            "tile '{tile_label}' cannot combine dgrp_id = 0 with a sprite shape"
-                        )));
-                    }
-                    if !emitted_dgrp_ids.insert(dgrp_id)
-                        || !emitted_spr2_ids.insert(dgrp_id)
-                        || !emitted_palt_ids.insert(dgrp_id)
-                    {
-                        return Err(Error::new(format!(
-                            "tile '{tile_label}' dgrp_id {dgrp_id} collides with an existing PALT/SPR2/DGRP chunk id"
-                        )));
-                    }
-                    extra_tile_sprites.push((
-                        dgrp_id,
-                        tile_label.clone(),
-                        SpriteSpec {
-                            shape,
-                            ..manifest.sprite
-                        },
-                    ));
-                    dgrp_id
+            let tile_dgrp_id = if let Some(dgrp_id) = resolved_tile_dgrps[idx] {
+                dgrp_id
+            } else if let Some(dgrp_id) = tile.dgrp_id {
+                if dgrp_id != 0 && !emitted_dgrp_ids.contains(&dgrp_id) {
+                    return Err(Error::new(format!(
+                        "tile '{tile_label}' references unemitted dgrp_id {dgrp_id} (set [[tile]].shape to emit a distinct tile sprite, or use 0 / {})",
+                        manifest.dgrp_id
+                    )));
                 }
-                (None, Some(shape)) => {
-                    let dgrp_id = manifest
-                        .dgrp_id
-                        .checked_add(1 + idx as u16)
-                        .ok_or_else(|| Error::new("multi-tile dgrp_id overflow"))?;
-                    if !emitted_dgrp_ids.insert(dgrp_id)
-                        || !emitted_spr2_ids.insert(dgrp_id)
-                        || !emitted_palt_ids.insert(dgrp_id)
-                    {
-                        return Err(Error::new(format!(
-                            "auto-assigned tile dgrp_id {dgrp_id} for '{tile_label}' collides with an existing sprite chunk id"
-                        )));
-                    }
-                    extra_tile_sprites.push((
-                        dgrp_id,
-                        tile_label.clone(),
-                        SpriteSpec {
-                            shape,
-                            ..manifest.sprite
-                        },
-                    ));
-                    dgrp_id
-                }
-                (Some(dgrp_id), None) => {
-                    if dgrp_id != 0 && !emitted_dgrp_ids.contains(&dgrp_id) {
-                        return Err(Error::new(format!(
-                            "tile '{tile_label}' references unemitted dgrp_id {dgrp_id} (set [[tile]].shape to emit a distinct tile sprite, or use 0 / {})",
-                            manifest.dgrp_id
-                        )));
-                    }
-                    dgrp_id
-                }
-                (None, None) => manifest.dgrp_id,
+                dgrp_id
+            } else {
+                manifest.dgrp_id
             };
 
             let tile_ttab_id = match tile.ttab_id {
@@ -433,11 +449,11 @@ pub fn compile_object_from_sources(
         }
     }
 
-    // Merge manifest [[constant]] tables into BCON map (rejecting duplicates and non-private IDs).
+    // Merge manifest [[constant]] tables into BCON map (rejecting duplicates and unreachable IDs).
     for c in &manifest.constants {
-        if matches!(c.id, 256..=319 | 8192..=8255) {
+        if !(4096..=4159).contains(&c.id) {
             return Err(Error::new(format!(
-                "[[constant]] id {} in '{}' falls in global/semi-global range; private objects must use 4096..=4159",
+                "[[constant]] id {} in '{}' is outside private BCON range 4096..=4159",
                 c.id, manifest.name
             )));
         }
@@ -761,17 +777,42 @@ fn ensure_contained_path(
 }
 
 fn read_contained_file(root: &Path, root_canon: &Path, rel_components: &[&str]) -> Result<String> {
+    use std::io::Read;
+
     let canon = ensure_contained_path(root, root_canon, rel_components)?;
-    let meta = std::fs::symlink_metadata(&canon)
+    let pre_meta = std::fs::symlink_metadata(&canon)
         .map_err(|e| Error::new(format!("failed to inspect {}: {e}", canon.display())))?;
-    if !meta.file_type().is_file() {
+    if pre_meta.file_type().is_symlink() || !pre_meta.file_type().is_file() {
         return Err(Error::new(format!(
             "expected regular file at {}",
             canon.display()
         )));
     }
-    std::fs::read_to_string(&canon)
-        .map_err(|e| Error::new(format!("failed to read {}: {e}", canon.display())))
+    let mut file = std::fs::File::open(&canon)
+        .map_err(|e| Error::new(format!("failed to open {}: {e}", canon.display())))?;
+    let open_meta = file
+        .metadata()
+        .map_err(|e| Error::new(format!("failed to stat open {}: {e}", canon.display())))?;
+    if !open_meta.file_type().is_file() {
+        return Err(Error::new(format!(
+            "expected regular file at {}",
+            canon.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if open_meta.dev() != pre_meta.dev() || open_meta.ino() != pre_meta.ino() {
+            return Err(Error::new(format!(
+                "path {} changed between validation and open",
+                canon.display()
+            )));
+        }
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|e| Error::new(format!("failed to read {}: {e}", canon.display())))?;
+    Ok(text)
 }
 
 /// Compiles an `object.toml` and its referenced `.antics` scripts from a directory on disk,

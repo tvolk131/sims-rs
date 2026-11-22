@@ -711,6 +711,50 @@ fn vm_migrated_starter_objects_run_via_pie_menu_and_sim_queue() {
         20.0
     );
 
+    // Cot: Native player cancellation via `vm.cancel` exits early and clears occupancy!
+    fx.world
+        .objects
+        .get_mut(&sim)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .motives[MOTIVE_ENERGY] = -40.0;
+    let cot_entries = vm.pie_menu(&mut fx.world, sim, cot).unwrap();
+    let cot_uid = vm
+        .pick(&mut fx.world, sim, cot_entries[0].action.clone())
+        .unwrap()
+        .unwrap();
+    let mut cot_cancelled = false;
+    let mut cot_cancel_yields = 0usize;
+    for _ in 0..32 {
+        fx.world.objects.get_mut(&sim).unwrap().data[25] = 1;
+        let status = vm.turn(&mut fx.world, sim, 4_000).unwrap();
+        if fx.world.objects[&sim].stack.len() > 1 && matches!(status, Status::Yielded) {
+            cot_cancel_yields += 1;
+            if cot_cancel_yields == 1 {
+                assert_eq!(fx.world.objects[&cot].attributes[0], 1);
+                assert!(vm.cancel(&mut fx.world, sim, cot_uid).unwrap());
+                cot_cancelled = true;
+            }
+        } else if cot_cancelled && fx.world.objects[&sim].stack.len() == 1 {
+            break;
+        }
+    }
+    assert!(cot_cancelled);
+    assert_eq!(cot_cancel_yields, 2);
+    assert_eq!(
+        fx.world.objects[&sim].person.as_ref().unwrap().motives[MOTIVE_ENERGY],
+        -40.0
+    );
+    assert_eq!(fx.world.objects[&cot].attributes[0], 0);
+    if let Some(person) = fx.world.objects.get_mut(&sim).unwrap().person.as_mut() {
+        person.active.uid = 0;
+        person.active.flags = 0;
+        person.data[33] = 0;
+        person.object_uses.clear();
+    }
+
     // Basin: Use Basin sets bladder = 100 and hygiene += 25!
     PackVmFixture::run_pie_interaction(&mut vm, &mut fx.world, sim, basin, 0, 32, |_, _| {});
     let p = fx.world.objects[&sim].person.as_ref().unwrap();
@@ -721,7 +765,12 @@ fn vm_migrated_starter_objects_run_via_pie_menu_and_sim_queue() {
 
     assert_eq!(
         played_sounds(&sounds),
-        vec!["open_bench_creak", "open_cot_settle", "open_basin_flush"]
+        vec![
+            "open_bench_creak",
+            "open_cot_settle",
+            "open_cot_settle",
+            "open_basin_flush",
+        ]
     );
 }
 
@@ -1449,6 +1498,62 @@ tree 4096 "Init" { my.attr[0] := bcon.v; return true; }
         )
         .is_err()
     );
+    // Unreachable private BCON IDs outside 4096..=4159 (e.g. 5000) are rejected in both scripts and manifest.
+    assert!(
+        compile_object_from_sources(
+            r#"
+[object]
+name = "BadHighBcon"
+guid = 0x7F00_0096
+[[constant]]
+id = 5000
+label = "OutOfRange"
+values = [1]
+"#,
+            &[]
+        )
+        .is_err()
+    );
+    assert!(
+        compile_object_from_sources(
+            r#"
+[object]
+name = "BadHighScriptBcon"
+guid = 0x7F00_0097
+"#,
+            &[(
+                "bad_high.antics",
+                r#"
+bcon 5000 "OutOfRange" { v = 1 }
+tree 4096 "Init" { return true; }
+"#
+            )]
+        )
+        .is_err()
+    );
+    // Order-independent tile DGRP sharing: tile 0 may reference dgrp_id 102 defined by tile 1.
+    let forward_tile = compile_object_from_sources(
+        r#"
+[object]
+name = "ForwardSharedTile"
+guid = 0x7F00_0098
+master_id = 2
+[[tile]]
+guid = 0x7F00_009A
+lead = true
+sub_index = [0, 0]
+dgrp_id = 102
+[[tile]]
+guid = 0x7F00_009B
+sub_index = [1, 0]
+dgrp_id = 102
+shape = "double_bed_right"
+"#,
+        &[],
+    )
+    .expect("forward-ordered tile DGRP reference should succeed");
+    let forward_iff = Iff::parse(forward_tile.iff_bytes).unwrap();
+    assert!(forward_iff.get(b"DGRP", 102).is_some());
     assert!(
         compile_object_from_sources(
             r#"
@@ -1603,6 +1708,42 @@ fn pack_compiler_rejects_normalized_filename_collisions_and_symlink_escapes() {
             "CLI build should reject pre-existing output symlink"
         );
         assert_eq!(std::fs::read(&outside_far).unwrap(), b"sentinel");
+
+        // Symlinked ancestor directory under `--out` must also be rejected!
+        let outside_target_dir = root.join("outside-target-dir");
+        std::fs::create_dir_all(&outside_target_dir).unwrap();
+        let sym_ancestor = root.join("sym-ancestor");
+        symlink(&outside_target_dir, &sym_ancestor).unwrap();
+        let nested_out = sym_ancestor.join("nested-out");
+        let output_ancestor = std::process::Command::new(bin)
+            .args(["build"])
+            .arg(open_pack_dir())
+            .args(["--out"])
+            .arg(&nested_out)
+            .output()
+            .expect("failed to execute sims-antics CLI");
+        assert!(
+            !output_ancestor.status.success(),
+            "CLI build should reject symlinked ancestor directory under --out"
+        );
+        assert!(!outside_target_dir.join("nested-out").exists());
+
+        // Normal clean `--out` directory succeeds and writes open-pack.far, objects/, sounds/.
+        let clean_out = root.join("clean-out/sub");
+        let output_ok = std::process::Command::new(bin)
+            .args(["build"])
+            .arg(open_pack_dir())
+            .args(["--out"])
+            .arg(&clean_out)
+            .output()
+            .expect("failed to execute sims-antics CLI");
+        assert!(
+            output_ok.status.success(),
+            "clean CLI build failed: {}",
+            String::from_utf8_lossy(&output_ok.stderr)
+        );
+        assert!(clean_out.join("open-pack.far").is_file());
+        assert!(clean_out.join("objects/open_double_bed.iff").is_file());
     }
 
     let _ = std::fs::remove_dir_all(&root);
