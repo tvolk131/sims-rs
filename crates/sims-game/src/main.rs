@@ -49,8 +49,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-/// How often the loop wakes to step the lot when nothing else happens.
-const WAKE: Duration = Duration::from_millis(5);
+/// Splash animation and worker-completion poll interval while `StartupLoading`
+/// is on screen (~60 FPS). Once startup completes, `about_to_wait` uses exact
+/// next-event deadlines (`ControlFlow::Wait` / `ControlFlow::WaitUntil`).
+const STARTUP_POLL: Duration = Duration::from_millis(16);
 
 /// Wall-clock simulation budget per event-loop wake. Keeps Ultra/Idle speeds
 /// responsive on the UI thread instead of running a full catch-up burst before
@@ -643,7 +645,16 @@ impl StartupLoading {
             destination_label: None,
             caption_override: None,
         };
-        let mut frame = Frame::new(w, h, [0, 0, 0]);
+        let mut frame = match Frame::from_rgb(w, h, std::mem::take(&mut self.canvas.color)) {
+            Ok(mut frame) => {
+                frame.fill(
+                    sims_ui::frame::Rect::new(0, 0, w as i32, h as i32),
+                    [0, 0, 0],
+                );
+                frame
+            }
+            Err(_) => Frame::new(w, h, [0, 0, 0]),
+        };
         self.loading_screen
             .draw(&mut frame, &state, &self.loading_art, &self.loading_strings);
         self.canvas.width = w as usize;
@@ -1754,6 +1765,42 @@ impl App {
         }
         self.redraw_pacer.on_present(Instant::now());
     }
+
+    /// Exact next wakeup instant for the OS event loop, or `None` when the
+    /// active screen is completely idle (allowing `ControlFlow::Wait` with zero
+    /// periodic timer wakeups until an input, co-op, or autosave event arrives).
+    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let continuous = self.continuous_interaction();
+        let anim_interval_us = u64::try_from(
+            self.redraw_pacer
+                .target_interval(now, continuous)
+                .as_micros(),
+        )
+        .unwrap_or(16_667)
+        .max(1_000);
+        let dragging = self.drag.is_some();
+        let session_deadline = match &self.session {
+            Session::Starting(_) => Some(now + STARTUP_POLL),
+            Session::Standalone { game, .. } => game
+                .next_wake_us(dragging, anim_interval_us)
+                .map(|us| now + Duration::from_micros(us)),
+            Session::Shell(shell) => shell
+                .next_wake_us(dragging, anim_interval_us)
+                .map(|us| now + Duration::from_micros(us)),
+        };
+        let redraw_deadline = if self.window_drawable() {
+            self.redraw_pacer
+                .next_redraw_deadline(now, self.dirty, continuous)
+        } else {
+            None
+        };
+        match (session_deadline, redraw_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
 }
 
 #[inline(always)]
@@ -1907,15 +1954,10 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.tick(event_loop);
         let now = Instant::now();
-        let wake_deadline = now + WAKE;
-        let next_deadline = if self.window_drawable() {
-            self.redraw_pacer
-                .next_redraw_deadline(now, self.dirty, self.continuous_interaction())
-                .map_or(wake_deadline, |d| d.min(wake_deadline))
-        } else {
-            wake_deadline
-        };
-        event_loop.set_control_flow(ControlFlow::WaitUntil(next_deadline));
+        match self.next_deadline(now) {
+            Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {

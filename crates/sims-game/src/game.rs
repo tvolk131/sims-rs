@@ -27,7 +27,7 @@ use sims_content::assets::Assets as ContentAssets;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{
     Animations, ArchivePool, AvatarRegistry, Catalog, House, Index, Install, Neighborhood,
-    People as ContentPeople, Surfaces, Wardrobe,
+    People as ContentPeople, SurfacePlugin, Surfaces, Wardrobe,
 };
 use sims_net::{
     BuyBuildEdit, CameraRotation, Command as NetCommand, DialogId as NetDialogId, IrohConfig,
@@ -424,6 +424,126 @@ pub struct Game {
     coop_overlay_buttons: CoopOverlayButtons,
     /// Local-only Buy/Move placement preview in co-op mode (never mutates `self.lot.world()`).
     coop_buy_preview: Option<CoopBuyPreview>,
+    /// Monotonic counter bumped on world-mutating operations so
+    /// [`sound::Feed::update`] can dirty-gate `Snapshot` rebuilds in O(1).
+    world_sound_rev: u64,
+}
+
+/// Immutable install-wide assets cached on [`crate::neighborhood::NeighborhoodShell`]
+/// across lot entries and travel transitions so switching or re-entering lots
+/// avoids re-scanning `SIMS_INSTALL` (`Index`, `Catalog`, `ArchivePool`,
+/// surface plug-ins, `HudStatic`, `HudShared`, `ContentAssets`, and
+/// `PeopleLibrary`).
+pub struct InstallAssets {
+    pub(crate) install: Install,
+    pub(crate) pool: Arc<ArchivePool>,
+    pub(crate) base_index: Arc<Index>,
+    pub(crate) base_catalog: Arc<Catalog>,
+    pub(crate) floor_plugins: BTreeMap<u16, SurfacePlugin>,
+    pub(crate) wall_plugins: BTreeMap<u16, SurfacePlugin>,
+    pub(crate) hud_static: HudStatic,
+    pub(crate) hud_shared: HudShared,
+    pub(crate) content_assets: ContentAssets,
+    pub(crate) people_library: PeopleLibrary,
+    pub(crate) avatar_registry: Option<Arc<AvatarRegistry>>,
+    pub(crate) base_preloaded_cast: Option<PreloadedCast>,
+}
+
+impl InstallAssets {
+    /// Loads all immutable install-wide assets in parallel, optionally reusing
+    /// an already-opened [`ArchivePool`] and base [`Index`] (e.g. from
+    /// [`crate::neighborhood::NeighborhoodShell::open`]).
+    pub fn load(
+        install: &Install,
+        pool: Arc<ArchivePool>,
+        existing_base_index: Option<Arc<Index>>,
+        existing_base_catalog: Option<Arc<Catalog>>,
+    ) -> Result<Self, String> {
+        let (idx_cat_shared_res, plugins, hud_static_res, people_res, registry_res) =
+            std::thread::scope(|scope| {
+                let plugins_handle = scope.spawn(|| Surfaces::plugins_with_pool(install, &pool));
+                let hud_handle = scope.spawn(|| HudStatic::load(install, Arc::clone(&pool)));
+                let people_handle = scope.spawn(|| -> Result<_, String> {
+                    let content_assets = ContentAssets::scan(&install.root)?;
+                    let people_library = PeopleLibrary::scan_with_pool(&content_assets, &pool)?;
+                    Ok((content_assets, people_library))
+                });
+                let registry_handle =
+                    scope.spawn(|| AvatarRegistry::load_with_pool(install, &pool));
+                let idx_cat_shared_res = (|| -> Result<_, String> {
+                    let base_index = match existing_base_index {
+                        Some(idx) => idx,
+                        None => Arc::new(Index::build(install).map_err(|e| e.to_string())?),
+                    };
+                    let base_catalog = match existing_base_catalog {
+                        Some(cat) => cat,
+                        None => Arc::new(
+                            Catalog::build_with_pool(&base_index, &pool)
+                                .map_err(|e| e.to_string())?,
+                        ),
+                    };
+                    let hud_shared = HudShared::load(&base_index, &base_catalog, &pool)?;
+                    Ok((base_index, base_catalog, hud_shared))
+                })();
+                (
+                    idx_cat_shared_res,
+                    plugins_handle
+                        .join()
+                        .expect("install assets surface plugins worker panicked"),
+                    hud_handle
+                        .join()
+                        .expect("install assets hud static worker panicked"),
+                    people_handle
+                        .join()
+                        .expect("install assets people worker panicked"),
+                    registry_handle
+                        .join()
+                        .expect("install assets avatar registry worker panicked"),
+                )
+            });
+        let (base_index, base_catalog, hud_shared) = idx_cat_shared_res?;
+        let (floor_plugins, wall_plugins) = plugins;
+        let hud_static = hud_static_res?;
+        let (content_assets, people_library) = people_res?;
+        let avatar_registry = registry_res.ok().map(Arc::new);
+        let base_preloaded_cast = avatar_registry.as_ref().and_then(|registry| {
+            let person_types = base_catalog
+                .objects
+                .iter()
+                .filter(|o| o.kind == 2)
+                .map(|o| o.guid);
+            ContentPeople::load_each_with_registry(
+                &base_index,
+                &base_catalog,
+                person_types,
+                registry,
+                &pool,
+            )
+            .ok()
+            .map(|(people_types, unresolved_people)| PreloadedCast {
+                skeleton_names: people_types
+                    .skeletons
+                    .into_iter()
+                    .map(|(guid, skel)| (guid, skel.name))
+                    .collect(),
+                unresolved: unresolved_people,
+            })
+        });
+        Ok(Self {
+            install: install.clone(),
+            pool,
+            base_index,
+            base_catalog,
+            floor_plugins,
+            wall_plugins,
+            hud_static,
+            hud_shared,
+            content_assets,
+            people_library,
+            avatar_registry,
+            base_preloaded_cast,
+        })
+    }
 }
 
 impl Game {
@@ -821,6 +941,7 @@ impl Game {
             coop_remote_world: false,
             coop_overlay_buttons: CoopOverlayButtons::default(),
             coop_buy_preview: None,
+            world_sound_rev: 0,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -846,6 +967,31 @@ impl Game {
         play: bool,
         frames: Frames,
     ) -> Result<Self, String> {
+        Self::open_from_store_cached(
+            install_root,
+            store,
+            neighborhood_id,
+            house,
+            answers,
+            play,
+            frames,
+            None,
+        )
+    }
+
+    /// Like [`Game::open_from_store`], reusing preloaded install-wide
+    /// [`InstallAssets`] across lot transitions when `cached` is `Some`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_from_store_cached(
+        install_root: &Path,
+        store: &sims_sim::neighborhood_store::NeighborhoodStore,
+        neighborhood_id: &str,
+        house: u32,
+        answers: &[u8],
+        play: bool,
+        frames: Frames,
+        cached: Option<&Arc<InstallAssets>>,
+    ) -> Result<Self, String> {
         let snapshot = store
             .load_lot_snapshot(neighborhood_id, house)
             .map_err(|e| e.to_string())?
@@ -855,11 +1001,49 @@ impl Game {
             .family_in(house)
             .map(|(_, f)| f.members.clone())
             .unwrap_or_default();
-        let pool = Arc::new(ArchivePool::new());
+        let pool = cached.map_or_else(|| Arc::new(ArchivePool::new()), |c| Arc::clone(&c.pool));
         let character_files = &snapshot.character_files;
         let (lot_res, render_and_index_res, hud_static_res, people_assets_res) =
             std::thread::scope(|scope| {
                 let assets_handle = scope.spawn(|| -> Result<_, String> {
+                    if let Some(shared) = cached {
+                        let (idx_cat_res, base_res) = std::thread::scope(|inner| {
+                            let base_handle = inner.spawn(|| {
+                                BaseAssets::load(&shared.install).map_err(|e| e.to_string())
+                            });
+                            let idx_cat_res = if character_files.is_empty() {
+                                Ok((
+                                    Arc::clone(&shared.base_index),
+                                    Arc::clone(&shared.base_catalog),
+                                ))
+                            } else {
+                                (|| -> Result<_, String> {
+                                    let mut index = (*shared.base_index).clone();
+                                    index
+                                        .add_character_files(character_files)
+                                        .map_err(|e| e.to_string())?;
+                                    let catalog = Catalog::build_with_pool(&index, &shared.pool)
+                                        .map_err(|e| e.to_string())?;
+                                    Ok((Arc::new(index), Arc::new(catalog)))
+                                })()
+                            };
+                            (
+                                idx_cat_res,
+                                base_handle.join().expect("base assets worker panicked"),
+                            )
+                        });
+                        let (index, catalog) = idx_cat_res?;
+                        let base = base_res?;
+                        return Ok((
+                            shared.install.clone(),
+                            index,
+                            catalog,
+                            Ok(shared.hud_shared.clone()),
+                            base,
+                            shared.floor_plugins.clone(),
+                            shared.wall_plugins.clone(),
+                        ));
+                    }
                     let install = Install::detect(install_root).map_err(|e| e.to_string())?;
                     let (idx_cat_res, base_res, (floor_plugins, wall_plugins)) =
                         std::thread::scope(|inner| {
@@ -903,10 +1087,16 @@ impl Game {
                     ))
                 });
                 let hud_handle = scope.spawn(|| -> Result<HudStatic, String> {
+                    if let Some(shared) = cached {
+                        return Ok(shared.hud_static.clone());
+                    }
                     let install = Install::detect(install_root).map_err(|e| e.to_string())?;
                     HudStatic::load(&install, Arc::clone(&pool))
                 });
                 let people_handle = scope.spawn(|| -> Result<_, String> {
+                    if let Some(shared) = cached {
+                        return Ok((shared.content_assets.clone(), shared.people_library.clone()));
+                    }
                     let content_assets = ContentAssets::scan(install_root)?;
                     let people_library = PeopleLibrary::scan_with_pool(&content_assets, &pool)?;
                     Ok((content_assets, people_library))
@@ -952,11 +1142,42 @@ impl Game {
         let (hud_res, people_open_res) = std::thread::scope(|scope| {
             let people_handle = scope.spawn(|| -> Result<People, String> {
                 let (content_assets, people_library) = people_assets_res?;
+                let preloaded_cast = cached.and_then(|shared| {
+                    let mut preloaded = shared.base_preloaded_cast.clone()?;
+                    if !character_files.is_empty() {
+                        let registry = shared.avatar_registry.as_ref()?;
+                        let inline_people: Vec<u32> = catalog
+                            .objects
+                            .iter()
+                            .filter(|o| o.kind == 2 && index.resources[o.resource].is_inline())
+                            .map(|o| o.guid)
+                            .collect();
+                        if !inline_people.is_empty() {
+                            let (extra, unresolved) = ContentPeople::load_each_with_registry(
+                                &index,
+                                &catalog,
+                                inline_people,
+                                registry,
+                                &pool,
+                            )
+                            .ok()?;
+                            for (guid, skel) in extra.skeletons {
+                                preloaded.unresolved.remove(&guid);
+                                preloaded.skeleton_names.insert(guid, skel.name);
+                            }
+                            for (guid, reason) in unresolved {
+                                preloaded.skeleton_names.remove(&guid);
+                                preloaded.unresolved.insert(guid, reason);
+                            }
+                        }
+                    }
+                    Some(preloaded)
+                });
                 let cast = Cast::from_shared(
                     install.clone(),
                     Arc::clone(&index),
                     Arc::clone(&catalog),
-                    None,
+                    preloaded_cast,
                     Arc::clone(&pool),
                 )?;
                 let mut people = People::from_inner(sims_people::People::new(
@@ -992,8 +1213,7 @@ impl Game {
         if lot.world().globals.get(30).copied().unwrap_or(1) != i16::from(free_will) {
             let _ = lot.set_free_will(free_will);
         }
-        let mut people = people_open_res?;
-        people.refresh(lot.world());
+        let people = people_open_res?;
         let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
         let drawn_camera = view.camera;
         let has_family = lot.world().globals.get(9).copied().unwrap_or(0) != 0;
@@ -1105,6 +1325,7 @@ impl Game {
             coop_remote_world: false,
             coop_overlay_buttons: CoopOverlayButtons::default(),
             coop_buy_preview: None,
+            world_sound_rev: 0,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -1119,11 +1340,34 @@ impl Game {
     /// into a live [`Game`] session without re-booting the VM.
     pub fn from_loaded_lot(
         install_root: &Path,
+        lot: Lot,
+        members: Vec<u32>,
+        character_files: &BTreeMap<String, Vec<u8>>,
+        base_house_bytes: Option<&[u8]>,
+        play: bool,
+    ) -> Result<Self, String> {
+        Self::from_loaded_lot_cached(
+            install_root,
+            lot,
+            members,
+            character_files,
+            base_house_bytes,
+            play,
+            None,
+        )
+    }
+
+    /// Like [`Game::from_loaded_lot`], reusing preloaded install-wide
+    /// [`InstallAssets`] when `cached` is `Some`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_loaded_lot_cached(
+        install_root: &Path,
         mut lot: Lot,
         members: Vec<u32>,
         character_files: &BTreeMap<String, Vec<u8>>,
         base_house_bytes: Option<&[u8]>,
         play: bool,
+        cached: Option<&Arc<InstallAssets>>,
     ) -> Result<Self, String> {
         lot.wait_for_answers();
         let stopped = lot
@@ -1131,10 +1375,48 @@ impl Game {
             .stopped
             .as_ref()
             .map(|s| format!("The load stopped, so the lot cannot run: {s}"));
-        let pool = Arc::new(ArchivePool::new());
+        let pool = cached.map_or_else(|| Arc::new(ArchivePool::new()), |c| Arc::clone(&c.pool));
         let (render_and_index_res, hud_static_res, people_assets_res) =
             std::thread::scope(|scope| {
                 let assets_handle = scope.spawn(|| -> Result<_, String> {
+                    if let Some(shared) = cached {
+                        let (idx_cat_res, base_res) = std::thread::scope(|inner| {
+                            let base_handle = inner.spawn(|| {
+                                BaseAssets::load(&shared.install).map_err(|e| e.to_string())
+                            });
+                            let idx_cat_res = if character_files.is_empty() {
+                                Ok((
+                                    Arc::clone(&shared.base_index),
+                                    Arc::clone(&shared.base_catalog),
+                                ))
+                            } else {
+                                (|| -> Result<_, String> {
+                                    let mut index = (*shared.base_index).clone();
+                                    index
+                                        .add_character_files(character_files)
+                                        .map_err(|e| e.to_string())?;
+                                    let catalog = Catalog::build_with_pool(&index, &shared.pool)
+                                        .map_err(|e| e.to_string())?;
+                                    Ok((Arc::new(index), Arc::new(catalog)))
+                                })()
+                            };
+                            (
+                                idx_cat_res,
+                                base_handle.join().expect("base assets worker panicked"),
+                            )
+                        });
+                        let (index, catalog) = idx_cat_res?;
+                        let base = base_res?;
+                        return Ok((
+                            shared.install.clone(),
+                            index,
+                            catalog,
+                            Ok(shared.hud_shared.clone()),
+                            base,
+                            shared.floor_plugins.clone(),
+                            shared.wall_plugins.clone(),
+                        ));
+                    }
                     let install = Install::detect(install_root).map_err(|e| e.to_string())?;
                     let (idx_cat_res, base_res, (floor_plugins, wall_plugins)) =
                         std::thread::scope(|inner| {
@@ -1178,10 +1460,16 @@ impl Game {
                     ))
                 });
                 let hud_handle = scope.spawn(|| -> Result<HudStatic, String> {
+                    if let Some(shared) = cached {
+                        return Ok(shared.hud_static.clone());
+                    }
                     let install = Install::detect(install_root).map_err(|e| e.to_string())?;
                     HudStatic::load(&install, Arc::clone(&pool))
                 });
                 let people_handle = scope.spawn(|| -> Result<_, String> {
+                    if let Some(shared) = cached {
+                        return Ok((shared.content_assets.clone(), shared.people_library.clone()));
+                    }
                     let content_assets = ContentAssets::scan(install_root)?;
                     let people_library = PeopleLibrary::scan_with_pool(&content_assets, &pool)?;
                     Ok((content_assets, people_library))
@@ -1212,11 +1500,42 @@ impl Game {
         let (hud_res, people_open_res) = std::thread::scope(|scope| {
             let people_handle = scope.spawn(|| -> Result<People, String> {
                 let (content_assets, people_library) = people_assets_res?;
+                let preloaded_cast = cached.and_then(|shared| {
+                    let mut preloaded = shared.base_preloaded_cast.clone()?;
+                    if !character_files.is_empty() {
+                        let registry = shared.avatar_registry.as_ref()?;
+                        let inline_people: Vec<u32> = catalog
+                            .objects
+                            .iter()
+                            .filter(|o| o.kind == 2 && index.resources[o.resource].is_inline())
+                            .map(|o| o.guid)
+                            .collect();
+                        if !inline_people.is_empty() {
+                            let (extra, unresolved) = ContentPeople::load_each_with_registry(
+                                &index,
+                                &catalog,
+                                inline_people,
+                                registry,
+                                &pool,
+                            )
+                            .ok()?;
+                            for (guid, skel) in extra.skeletons {
+                                preloaded.unresolved.remove(&guid);
+                                preloaded.skeleton_names.insert(guid, skel.name);
+                            }
+                            for (guid, reason) in unresolved {
+                                preloaded.skeleton_names.remove(&guid);
+                                preloaded.unresolved.insert(guid, reason);
+                            }
+                        }
+                    }
+                    Some(preloaded)
+                });
                 let cast = Cast::from_shared(
                     install.clone(),
                     Arc::clone(&index),
                     Arc::clone(&catalog),
-                    None,
+                    preloaded_cast,
                     Arc::clone(&pool),
                 )?;
                 let mut people = People::from_inner(sims_people::People::new(
@@ -1252,8 +1571,7 @@ impl Game {
         if lot.world().globals.get(30).copied().unwrap_or(1) != i16::from(free_will) {
             let _ = lot.set_free_will(free_will);
         }
-        let mut people = people_open_res?;
-        people.refresh(lot.world());
+        let people = people_open_res?;
         let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
         let drawn_camera = view.camera;
         let has_family = lot.world().globals.get(9).copied().unwrap_or(0) != 0;
@@ -1357,6 +1675,7 @@ impl Game {
             coop_remote_world: false,
             coop_overlay_buttons: CoopOverlayButtons::default(),
             coop_buy_preview: None,
+            world_sound_rev: 0,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -1796,6 +2115,7 @@ impl Game {
             } else {
                 let _ = self.lot.buy_cancel(&cursor);
             }
+            self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
         }
         self.buy_selected = None;
         self.buy_in_house = false;
@@ -1836,6 +2156,7 @@ impl Game {
         let patched = Saved::decode(&rebuilt).map_err(|e| e.to_string())?;
         self.lot.restore(patched).map_err(|e| e.to_string())?;
         self.world_mutated_via_restore = true;
+        self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
         self.dirty = true;
         self.lot_cache.clear();
         let world = self.lot.world();
@@ -1865,6 +2186,7 @@ impl Game {
 
     /// Mutable access to the active [`Lot`] (used by travel departure/return).
     pub fn lot_mut(&mut self) -> &mut Lot {
+        self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
         &mut self.lot
     }
 
@@ -2068,6 +2390,35 @@ impl Game {
         let mut snapshot = sound::sources(world);
         snapshot.screen = sound::screen(world, &self.lot_shape, &self.view.camera, self.view.size);
         snapshot
+    }
+
+    /// Screen-space sound projections alone, used by [`sound::Feed`] on pure
+    /// camera pans to avoid rebuilding `objects` and `positions`.
+    pub(crate) fn sound_screen(&self) -> BTreeMap<i32, sims_audio::placement::Projection> {
+        sound::screen(
+            self.lot.world(),
+            &self.lot_shape,
+            &self.view.camera,
+            self.view.size,
+        )
+    }
+
+    /// Lightweight O(1) dirty-tracking key for [`sound::Feed::update`].
+    pub(crate) fn sound_world_key(&self) -> sound::SoundWorldKey {
+        let world = self.lot.world();
+        sound::SoundWorldKey {
+            ticks: self.lot.ticks(),
+            restore_gen: self.restore_generation,
+            sound_rev: self.world_sound_rev,
+            error_count: self.errors.lines.len(),
+            object_count: world.objects.len(),
+            hour: world.globals.first().copied().unwrap_or(0),
+            lot_id: world.globals.get(10).copied().unwrap_or(0),
+            buy_held_pos: self
+                .buy_cursor
+                .as_ref()
+                .and_then(|c| world.objects.get(&c.held).map(|o| (c.held, o.position))),
+        }
     }
 
     /// The Options panel's current state (active tab, graphics, sound, and play settings).
@@ -2607,6 +2958,79 @@ impl Game {
         }
     }
 
+    /// Whether the pointer is currently inside an active edge-scrolling band
+    /// (without mutating accumulator state), used to schedule display-refresh
+    /// wakeups.
+    pub fn is_edge_scrolling(&self, dragging: bool) -> bool {
+        if dragging
+            || !self.hud.controls.options.play.edge_scrolling
+            || self.hud.has_ui_dialog()
+            || self.lot.asking().is_some()
+            || self.lot.asking_special_panel().is_some()
+            || self.shop_dialog.is_open()
+            || self.hud.menu.is_some()
+            || self.cheat_console_open()
+        {
+            return false;
+        }
+        let Some([px, py]) = self.pointer else {
+            return false;
+        };
+        let (vw, vh) = self.house_viewport_size();
+        let (w, h) = (vw as i32, vh as i32);
+        const EDGE: i32 = 32;
+        if w <= EDGE * 2 || h <= EDGE * 2 || px < 0 || py < 0 || px >= w || py >= h {
+            return false;
+        }
+        px < EDGE || px >= w - EDGE || py < EDGE || py >= h - EDGE
+    }
+
+    /// Exact microseconds until the lot next needs an event-loop wakeup, or
+    /// `None` when completely idle (allowing `ControlFlow::Wait`).
+    pub fn next_wake_us(&self, dragging: bool, anim_interval_us: u64) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        let mut consider = |us: u64| {
+            best = Some(best.map_or(us, |prev| prev.min(us)));
+        };
+        if self.coop.is_active_or_starting() || self.pending_coop_restage().is_some() {
+            consider(5_000);
+        }
+        if self.is_edge_scrolling(dragging)
+            || self.pie_animating()
+            || self.ui_animating()
+            || self.ui_animating_prev
+            || self.camera_panning()
+        {
+            consider(anim_interval_us.max(1_000));
+        }
+        let ticks_active = self.hud.controls.mode == Mode::Live
+            && !self.hud.has_ui_dialog()
+            && self.lot.asking().is_none()
+            && self.lot.asking_special_panel().is_none()
+            && self.stopped.is_none();
+        if ticks_active {
+            consider(self.pace.remaining_us(self.lot.world().speed()));
+        }
+        if self
+            .lot
+            .world()
+            .objects
+            .values()
+            .any(|o| o.guid == sims_people::bob::STANDARD)
+        {
+            let elapsed = self.clock_us.saturating_sub(self.drawn_us);
+            consider(SPIN_FRAME_US.saturating_sub(elapsed));
+        }
+        if let Some(us) = self.hud.next_blink_us(self.clock_us) {
+            consider(us);
+        }
+        if self.coop_lobby.is_open() {
+            let rem = sims_ui::hud::PAUSE_BLINK_US - (self.clock_us % sims_ui::hud::PAUSE_BLINK_US);
+            consider(rem.max(1));
+        }
+        best
+    }
+
     /// Whether the pause button's 500 ms blink phase changed since the
     /// frame was last drawn.
     pub fn blink_due(&self) -> bool {
@@ -2869,6 +3293,9 @@ impl Game {
                 break;
             }
         }
+        if ticks > 0 && self.stopped.is_none() {
+            self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
+        }
         if ran > 0 || self.stopped.is_some() {
             self.hud.sync_character_names(self.lot.character_names());
             let world = self.lot.world();
@@ -3055,19 +3482,9 @@ impl Game {
             self.draw_coop_remote_indicators(viewport);
             self.draw_coop_buy_preview(viewport);
         }
-        let hud_world_override = if self.coop.is_active() {
+        let selected_override = if self.coop.is_active() {
             let local_sel = self.local_selected_sim();
-            if local_sel != self.lot.world().selected() {
-                let mut cloned = self.lot.world().clone();
-                for obj in cloned.objects.values_mut() {
-                    if obj.person.is_some() {
-                        obj.selected = local_sel == Some(obj.id);
-                    }
-                }
-                Some(cloned)
-            } else {
-                None
-            }
+            (local_sel != self.lot.world().selected()).then_some(local_sel)
         } else {
             None
         };
@@ -3075,9 +3492,7 @@ impl Game {
         self.hud.set_clock_us(self.clock_us);
         self.sync_special_panel();
         let status = self.debug.then(|| self.status()).flatten();
-        let world = hud_world_override
-            .as_ref()
-            .unwrap_or_else(|| self.lot.world());
+        let world = self.lot.world();
         // A dialog the lot waits on is in the lot as the tick left it when
         // it was shown. Read it before the pie menu so a newly opened dialog
         // suppresses the pie's dark backdrop and head on the frame it closes
@@ -3162,7 +3577,7 @@ impl Game {
             );
             self.hud.ensure_build_swatches(&mut self.assets);
         }
-        self.hud.draw_for_lot_at(
+        self.hud.draw_for_lot_at_with_selection(
             world,
             self.lot.residential(),
             self.lot_visibility(),
@@ -3172,6 +3587,7 @@ impl Game {
             status.as_deref(),
             sell.as_ref(),
             self.clock_us,
+            selected_override,
             &mut self.canvas,
         );
         self.ui_animating_prev = self.hud.is_ui_animating(self.clock_us);
@@ -5449,6 +5865,7 @@ impl Game {
         } else {
             self.lot.buy_redo()
         };
+        self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
         if let Some(cursor) = self.buy_cursor.as_mut() {
             let held_on_lot = self
                 .lot
@@ -7439,6 +7856,7 @@ impl Game {
 
     /// Refreshes the cached render lot shape and people from `self.lot.world()`.
     fn refresh_world(&mut self) {
+        self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
         let world = self.lot.world();
         self.people.refresh(world);
         match sims_render::Lot::from_world(world) {

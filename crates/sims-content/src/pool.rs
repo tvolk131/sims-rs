@@ -39,6 +39,7 @@ struct OpenArchive {
     file: File,
     #[cfg(not(unix))]
     file: Mutex<File>,
+    file_len: u64,
     last_used: AtomicU64,
 }
 
@@ -46,26 +47,15 @@ impl OpenArchive {
     fn open(path: &Path, stamp: u64) -> Result<Self> {
         let io = |e| Error::io(path, e);
         let file = File::open(path).map_err(io)?;
+        let file_len = file.metadata().map_err(io)?.len();
         Ok(Self {
             #[cfg(unix)]
             file,
             #[cfg(not(unix))]
             file: Mutex::new(file),
+            file_len,
             last_used: AtomicU64::new(stamp),
         })
-    }
-
-    fn len(&self, path: &Path) -> Result<u64> {
-        let io = |e| Error::io(path, e);
-        #[cfg(unix)]
-        {
-            Ok(self.file.metadata().map_err(io)?.len())
-        }
-        #[cfg(not(unix))]
-        {
-            let guard = self.file.lock().unwrap_or_else(|e| e.into_inner());
-            Ok(guard.metadata().map_err(io)?.len())
-        }
     }
 
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
@@ -87,10 +77,12 @@ impl OpenArchive {
 /// On Unix, archive members are read via lock-free positional `pread`
 /// (`FileExt::read_exact_at`), eliminating thousands of redundant
 /// `open`/`lseek`/`close` syscalls per launch while remaining 100% safe Rust
-/// (`unsafe_code = "forbid"`). Each read validates bounds against the live open
-/// file length (`metadata().len()`) so post-open truncation is caught even on
-/// partial header peeks, and open handles are bounded to [`MAX_OPEN_ARCHIVES`]
-/// with LRU eviction to avoid exhausting OS file descriptors.
+/// (`unsafe_code = "forbid"`). Each open descriptor caches its `file_len` on
+/// open so `read_slice` avoids a redundant `fstat` syscall before every
+/// `pread`, validating member bounds against the cached file length while
+/// relying on `read_exact_at`'s `UnexpectedEof` check to catch post-open
+/// truncation. Open handles are bounded to [`MAX_OPEN_ARCHIVES`] with LRU
+/// eviction to avoid exhausting OS file descriptors.
 #[derive(Debug)]
 pub struct ArchivePool {
     archives: RwLock<BTreeMap<PathBuf, Arc<OpenArchive>>>,
@@ -186,6 +178,78 @@ impl ArchivePool {
         Ok(bytes)
     }
 
+    /// Streams chunk headers of a FAR member IFF directly through the cached
+    /// open descriptor, extracting only chunks whose tags are in `tags`.
+    ///
+    /// Members up to 256 KiB are read in a single `pread` into `scratch`
+    /// (avoiding per-chunk syscall overhead and per-file heap allocations);
+    /// larger members stream headers via [`Iff::scan_types_from_reader`] so
+    /// multi-megabyte `SPR2` payloads are skipped without reading them.
+    pub(crate) fn scan_iff_member(
+        &self,
+        path: &Path,
+        location: &str,
+        member: &Member,
+        tags: &[[u8; 4]],
+        scratch: &mut Vec<u8>,
+    ) -> Result<sims_formats::iff::ScannedIff> {
+        const SINGLE_READ_THRESHOLD: u64 = 256 * 1024;
+        let archive = self.get_or_open(path)?;
+        let len = archive.file_len;
+        let invalid = |message: String| {
+            Error::io(
+                path,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            )
+        };
+        if member
+            .offset
+            .checked_add(member.size)
+            .is_none_or(|end| end > len)
+        {
+            return Err(invalid(format!("FAR member {} outside file", member.name)));
+        }
+        if member.size > far::MAX_MEMBER {
+            return Err(invalid(format!(
+                "{} exceeds the 128 MiB resource limit",
+                member.name
+            )));
+        }
+        let base = member.offset;
+        let member_size = member.size as usize;
+        let name = &member.name;
+        if member.size <= SINGLE_READ_THRESHOLD {
+            scratch.resize(member_size, 0);
+            if let Err(err) = archive.read_exact_at(base, scratch) {
+                if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return Err(invalid(format!("{name} ends early")));
+                }
+                return Err(Error::io(path, err));
+            }
+            return sims_formats::iff::Iff::scan_types(scratch, tags)
+                .map_err(|e| Error::format(location, e));
+        }
+        sims_formats::iff::Iff::scan_types_from_reader(
+            member_size,
+            |rel_offset, buf| {
+                archive
+                    .read_exact_at(base + rel_offset as u64, buf)
+                    .map_err(|err| {
+                        if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                            invalid(format!("{name} ends early"))
+                        } else {
+                            Error::io(path, err)
+                        }
+                    })
+            },
+            tags,
+        )
+        .map_err(|err| match err {
+            sims_formats::iff::ScanError::Io(e) => e,
+            sims_formats::iff::ScanError::Format(e) => Error::format(location, e),
+        })
+    }
+
     fn read_slice(
         &self,
         path: &Path,
@@ -195,7 +259,7 @@ impl ArchivePool {
         to_read: u64,
     ) -> Result<Vec<u8>> {
         let archive = self.get_or_open(path)?;
-        let len = archive.len(path)?;
+        let len = archive.file_len;
         let invalid = |message: String| {
             Error::io(
                 path,
@@ -298,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn head_peek_rejects_member_truncated_after_handle_cached() {
+    fn read_member_rejects_member_truncated_after_handle_cached() {
         let path = temp_file(&[0u8; 32]);
         let pool = ArchivePool::new();
         let member = Member {
@@ -319,10 +383,10 @@ mod tests {
         drop(file);
 
         let err = pool
-            .read_member_head(&path, &member, 8)
-            .expect_err("post-open truncation must be rejected even on 8-byte peek");
+            .read_member(&path, &member)
+            .expect_err("post-open truncation must be rejected via read_exact_at EOF");
         assert!(
-            err.to_string().contains("outside file"),
+            err.to_string().contains("ends early"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_dir_all(path.parent().expect("temp parent"));

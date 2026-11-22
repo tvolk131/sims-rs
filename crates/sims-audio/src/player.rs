@@ -220,7 +220,8 @@ use crate::placement::{self, Projection};
 use crate::registry::Registry;
 use crate::stations::StationLists;
 use crate::{Pcm, SoundEvent};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 /// The output sample rate: that of nearly every sample in the install.
 pub const RATE: u32 = 22_050;
@@ -451,6 +452,13 @@ impl Samples for SoundFiles {
     }
 }
 
+impl Samples for Arc<SoundFiles> {
+    fn load(&mut self, path: &str) -> Option<Pcm> {
+        let bytes = self.get(path)?.read().ok()?;
+        crate::decode::decode(&bytes)?.ok()
+    }
+}
+
 impl Samples for BTreeMap<String, Pcm> {
     fn load(&mut self, path: &str) -> Option<Pcm> {
         self.get(path).cloned()
@@ -609,7 +617,7 @@ struct Note {
     /// Left and right gains, 16.16 fixed point.
     gains: [i32; 2],
     /// Patches to play after this one, without a gap, first first.
-    chain: Vec<u32>,
+    chain: VecDeque<u32>,
     /// Whether it starts again from its beginning when it ends (an
     /// ambience cell's looping sample).
     looping: bool,
@@ -2640,7 +2648,7 @@ impl<S: Samples> Player<S> {
         if self.notes[note].chain.len() >= CHAIN {
             self.report(format!("track {track}: more than {CHAIN} chained"));
         } else {
-            self.notes[note].chain.push(patch);
+            self.notes[note].chain.push_back(patch);
         }
     }
 
@@ -3131,21 +3139,33 @@ impl<S: Samples> Player<S> {
     /// Renders `frames` frames of interleaved stereo (left, then right):
     /// the player's own output. [`Player::render`] is its mono mix.
     pub fn render_stereo(&mut self, frames: usize, sources: &dyn Sources) -> Vec<i16> {
+        let mut out = Vec::new();
+        self.render_stereo_into(frames, sources, &mut out);
+        out
+    }
+
+    /// Renders `frames` frames of interleaved stereo (left, then right) into
+    /// `out`, clearing any previous contents and reusing `out`'s allocation.
+    /// Produces bit-for-bit identical PCM samples to [`Player::render_stereo`].
+    pub fn render_stereo_into(&mut self, frames: usize, sources: &dyn Sources, out: &mut Vec<i16>) {
+        out.clear();
         let Some(samples) = frames.checked_mul(2).filter(|_| frames <= RENDER_LIMIT) else {
             self.report(format!("cannot render {frames} frames at once"));
-            return Vec::new();
+            return;
         };
-        let mut out = Vec::with_capacity(samples.min(2 * RATE as usize));
+        let target_cap = samples.min(2 * RATE as usize);
+        if out.capacity() < target_cap {
+            out.reserve(target_cap - out.len());
+        }
         while out.len() < samples {
             self.step_timer(sources);
             self.step_ambience();
             let until_timer = TIMER_FRAMES - (self.frame % TIMER_FRAMES as u64) as usize;
             let until_block = BLOCK - (self.frame % BLOCK as u64) as usize;
             let count = until_timer.min(until_block).min(frames - out.len() / 2);
-            self.mix(count, &mut out);
+            self.mix(count, out);
             self.frame += count as u64;
         }
-        out
     }
 
     /// Renders until nothing runs or plays, at most `limit` frames (and
@@ -3210,14 +3230,21 @@ impl<S: Samples> Player<S> {
     /// voices onto `out` (see [`mix_note`]).
     fn mix(&mut self, frames: usize, out: &mut Vec<i16>) {
         let start = out.len();
-        let mut sums = vec![0i64; 2 * frames];
+        let mut stack_sums = [0i64; 2 * BLOCK];
+        let mut heap_sums;
+        let sums: &mut [i64] = if frames <= BLOCK {
+            &mut stack_sums[..2 * frames]
+        } else {
+            heap_sums = vec![0i64; 2 * frames];
+            &mut heap_sums
+        };
         let cache = &self.cache;
         let ambient_cache = &self.ambient_cache;
         let held = &self.held;
         // A held track's running-thread notes keep their place and are not
         // heard; idle kind-53 voices (thread == 0) are never held (0x57dc3d).
         self.notes.retain_mut(|note| {
-            (note.thread != 0 && held.contains(&note.track)) || mix_note(note, cache, &mut sums)
+            (note.thread != 0 && held.contains(&note.track)) || mix_note(note, cache, sums)
         });
         let notes = &self.notes;
         self.idle.retain(|track, _| {
@@ -3226,7 +3253,7 @@ impl<S: Samples> Player<S> {
                 .any(|note| note.thread == 0 && note.track == *track)
         });
         self.voices
-            .retain_mut(|voice| mix_note(&mut voice.note, ambient_cache, &mut sums));
+            .retain_mut(|voice| mix_note(&mut voice.note, ambient_cache, sums));
         out.extend(sums.iter().map(|&s| s.clamp(-32768, 32767) as i16));
         debug_assert_eq!(out.len(), start + 2 * frames);
     }
@@ -3880,7 +3907,7 @@ impl<S: Samples> Player<S> {
             position: 0,
             step: rate_step,
             gains,
-            chain: Vec::new(),
+            chain: VecDeque::new(),
             looping: false,
         });
         id
@@ -4253,11 +4280,11 @@ fn mix_note(note: &mut Note, cache: &BTreeMap<u32, Option<Pcm>>, sums: &mut [i64
                 continue;
             }
             // Patches are loaded when chained, so each is cached.
-            if note.chain.is_empty() {
+            let Some(next_patch) = note.chain.pop_front() else {
                 return false;
-            }
+            };
             note.position -= length << 16;
-            note.patch = note.chain.remove(0);
+            note.patch = next_patch;
             continue;
         }
         let sample = |frame: usize, channel: usize| -> i64 {
@@ -4364,7 +4391,7 @@ impl<S: Samples> Host for AmbientHost<'_, S> {
                 position: 0,
                 step: step(voice.rate),
                 gains: ambient_gains(voice.volume, voice.pan, self.master),
-                chain: Vec::new(),
+                chain: VecDeque::new(),
                 looping: voice.looping,
             },
         });

@@ -106,6 +106,12 @@ impl Pace {
         self.owed -= ticks * period;
         ticks as u32
     }
+
+    /// Microseconds remaining until the next simulation tick is owed at
+    /// simulation speed `level`. Returns `0` if a tick is already owed.
+    pub fn remaining_us(&self, level: i16) -> u64 {
+        period_us(level).saturating_sub(self.owed)
+    }
 }
 
 #[cfg(test)]

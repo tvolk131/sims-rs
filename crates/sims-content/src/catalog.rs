@@ -1,7 +1,17 @@
 use crate::pool::{ArchivePool, worker_count};
-use crate::{Error, Index, Result};
-use sims_formats::{behavior::ObjectDefinition, execution::global_link, iff::Iff};
+use crate::{Error, Index, Resource, Result};
+use sims_formats::{
+    behavior::ObjectDefinition,
+    execution::global_link,
+    far,
+    iff::{Iff, ScanError, ScannedIff},
+};
 use std::collections::BTreeMap;
+use std::fs::File;
+#[cfg(not(unix))]
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 /// One registered object definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,13 +57,98 @@ enum ScannedResource {
     },
 }
 
-fn scan_iff_resource(index: &Index, number: usize, pool: &ArchivePool) -> (usize, ScannedResource) {
+const CATALOG_TAGS: [[u8; 4]; 2] = [*b"OBJD", *b"GLOB"];
+
+fn scan_loose_iff(
+    resource: &Resource,
+    location: &str,
+    scratch: &mut Vec<u8>,
+) -> Result<ScannedIff> {
+    const SINGLE_READ_THRESHOLD: u64 = 256 * 1024;
+    let io = |e| Error::io(&resource.path, e);
+    let invalid = |message: String| {
+        Error::io(
+            &resource.path,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+        )
+    };
+    #[cfg(unix)]
+    let file = File::open(&resource.path).map_err(io)?;
+    #[cfg(not(unix))]
+    let mut file = File::open(&resource.path).map_err(io)?;
+    let len = file.metadata().map_err(io)?.len();
+    if len > far::MAX_MEMBER {
+        return Err(invalid(format!(
+            "{} exceeds the 128 MiB resource limit",
+            resource.name()
+        )));
+    }
+    let name = resource.name();
+    if len <= SINGLE_READ_THRESHOLD {
+        scratch.resize(len as usize, 0);
+        #[cfg(unix)]
+        let res = file.read_exact_at(scratch, 0);
+        #[cfg(not(unix))]
+        let res = file.read_exact(scratch);
+        if let Err(err) = res {
+            if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Err(invalid(format!("{name} ends early")));
+            }
+            return Err(Error::io(&resource.path, err));
+        }
+        return Iff::scan_types(scratch, &CATALOG_TAGS).map_err(|e| Error::format(location, e));
+    }
+    Iff::scan_types_from_reader(
+        len as usize,
+        |offset, buf| {
+            #[cfg(unix)]
+            let res = file.read_exact_at(buf, offset as u64);
+            #[cfg(not(unix))]
+            let res = file
+                .seek(SeekFrom::Start(offset as u64))
+                .and_then(|_| file.read_exact(buf));
+            res.map_err(|err| {
+                if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                    invalid(format!("{name} ends early"))
+                } else {
+                    Error::io(&resource.path, err)
+                }
+            })
+        },
+        &CATALOG_TAGS,
+    )
+    .map_err(|err| match err {
+        ScanError::Io(e) => e,
+        ScanError::Format(e) => Error::format(location, e),
+    })
+}
+
+fn scan_iff_resource(
+    index: &Index,
+    number: usize,
+    pool: &ArchivePool,
+    scratch: &mut Vec<u8>,
+) -> (usize, ScannedResource) {
     let resource = &index.resources[number];
     let location = resource.location(&index.root);
-    let iff = match resource
-        .read_with(pool)
-        .and_then(|bytes| Iff::parse(bytes).map_err(|e| Error::format(&location, e)))
-    {
+    let scanned_res = if let Some(bytes) = &resource.inline {
+        if bytes.len() as u64 > far::MAX_MEMBER {
+            Err(Error::io(
+                &resource.path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{} exceeds the 128 MiB resource limit", resource.name()),
+                ),
+            ))
+        } else {
+            Iff::scan_types(bytes, &CATALOG_TAGS).map_err(|e| Error::format(&location, e))
+        }
+    } else if let Some(member) = &resource.member {
+        pool.scan_iff_member(&resource.path, &location, member, &CATALOG_TAGS, scratch)
+    } else {
+        scan_loose_iff(resource, &location, scratch)
+    };
+    let iff = match scanned_res {
         Ok(iff) => iff,
         Err(error) => return (number, ScannedResource::Error(error.to_string())),
     };
@@ -69,7 +164,7 @@ fn scan_iff_resource(index: &Index, number: usize, pool: &ArchivePool) -> (usize
     let definitions = chunks
         .into_iter()
         .map(|chunk| {
-            ObjectDefinition::parse(iff.data(chunk))
+            ObjectDefinition::parse(&chunk.data)
                 .map(|def| (chunk.id, def))
                 .map_err(|e| (chunk.id, e))
         })
@@ -77,7 +172,7 @@ fn scan_iff_resource(index: &Index, number: usize, pool: &ArchivePool) -> (usize
     let glob = iff
         .all(b"GLOB")
         .next()
-        .map(|link| global_link(iff.data(link)).map_err(|e| (link.id, e)));
+        .map(|link| global_link(&link.data).map_err(|e| (link.id, e)));
     (
         number,
         ScannedResource::Parsed {
@@ -118,9 +213,10 @@ impl Catalog {
             .collect();
         let workers = worker_count(iff_indices.len());
         let scanned: Vec<(usize, ScannedResource)> = if workers <= 1 {
+            let mut scratch = Vec::new();
             iff_indices
                 .iter()
-                .map(|&number| scan_iff_resource(index, number, pool))
+                .map(|&number| scan_iff_resource(index, number, pool, &mut scratch))
                 .collect()
         } else {
             let chunk_size = iff_indices.len().div_ceil(workers);
@@ -129,9 +225,10 @@ impl Catalog {
                     .chunks(chunk_size)
                     .map(|chunk| {
                         scope.spawn(move || {
+                            let mut scratch = Vec::new();
                             chunk
                                 .iter()
-                                .map(|&number| scan_iff_resource(index, number, pool))
+                                .map(|&number| scan_iff_resource(index, number, pool, &mut scratch))
                                 .collect::<Vec<_>>()
                         })
                     })

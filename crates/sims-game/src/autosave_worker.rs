@@ -31,7 +31,14 @@ pub struct SaveCompletion {
 }
 
 enum WorkerMessage {
-    Job(SaveJob),
+    Job {
+        job: SaveJob,
+        /// True for caller-supplied external jobs that need full payload decode;
+        /// false for self-encoded `World` / `Saved::encode` payloads where
+        /// header + envelope SHA-256 verification avoids a redundant round-trip
+        /// `Saved::decode`.
+        full_validate: bool,
+    },
     SavedLot {
         neighborhood_id: String,
         expected_instance_id: u128,
@@ -46,8 +53,8 @@ enum WorkerMessage {
     Shutdown,
 }
 
-/// Validates autosave/manual-save payload bytes before commit and during listing
-/// or fallback loads.
+/// Validates autosave/manual-save payload bytes in full (decoding `Saved` or
+/// `World`) for slot loads, external imports, and corruption recovery.
 pub fn validate_save_payload(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(), String> {
     match kind {
         SavePayloadKind::SavedLot => Saved::decode(bytes)
@@ -57,6 +64,46 @@ pub fn validate_save_payload(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(),
             .map(|_| ())
             .map_err(|e| format!("invalid World snapshot payload: {e}")),
         SavePayloadKind::Custom(_) => Ok(()),
+    }
+}
+
+/// Fast header-only payload validator for Save Manager listing and self-encoded
+/// background commits.
+///
+/// `AutosaveStore` already verifies the full REDB envelope (magic, schema
+/// version, 32-byte record SHA-256 checksum, key binding, and payload SHA-256).
+/// This check verifies the `Saved` 8-byte format/world-snapshot header without
+/// synchronously deserializing every slot's entire `World`; full `Saved::decode`
+/// still runs whenever a slot is actually loaded or imported.
+pub fn validate_save_payload_header(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(), String> {
+    match kind {
+        SavePayloadKind::SavedLot => {
+            if bytes.len() <= 8 {
+                return Err(format!(
+                    "invalid Saved lot payload: shorter than 8-byte header ({} bytes)",
+                    bytes.len()
+                ));
+            }
+            let format = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes"));
+            if !(sims_vm::boot::save::MIN_FORMAT..=sims_vm::boot::save::FORMAT).contains(&format) {
+                return Err(format!(
+                    "invalid Saved lot payload: unsupported save format {format} (expected {}..={})",
+                    sims_vm::boot::save::MIN_FORMAT,
+                    sims_vm::boot::save::FORMAT
+                ));
+            }
+            let world_format = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
+            if world_format != sims_sim::SNAPSHOT_FORMAT {
+                return Err(format!(
+                    "invalid Saved lot payload: snapshot format {world_format} (expected {})",
+                    sims_sim::SNAPSHOT_FORMAT
+                ));
+            }
+            Ok(())
+        }
+        // `AutosaveStore` already runs built-in envelope + `World::decode` checks
+        // for `WorldSnapshot`, so avoid decoding `World` a second time here.
+        SavePayloadKind::WorldSnapshot | SavePayloadKind::Custom(_) => Ok(()),
     }
 }
 
@@ -153,22 +200,23 @@ pub fn build_save_manager_snapshot(
 ) -> SaveManagerSnapshot {
     let lot_u16 = u16::try_from(lot_id).unwrap_or(u16::MAX);
     let lot_label = lot_label.into();
-    let entries = match store.list_saves_validated(neighborhood_id, lot_id, validate_save_payload) {
-        Ok(entries) => entries,
-        Err(err) => {
-            let merged_err = match active_error {
-                Some(prev) if !prev.trim().is_empty() => format!("{prev} ({err})"),
-                _ => err.to_string(),
-            };
-            return SaveManagerSnapshot {
-                neighborhood: neighborhood_slot,
-                lot: lot_u16,
-                lot_label,
-                slots: Vec::new(),
-                active_error: Some(merged_err),
-            };
-        }
-    };
+    let entries =
+        match store.list_saves_validated(neighborhood_id, lot_id, validate_save_payload_header) {
+            Ok(entries) => entries,
+            Err(err) => {
+                let merged_err = match active_error {
+                    Some(prev) if !prev.trim().is_empty() => format!("{prev} ({err})"),
+                    _ => err.to_string(),
+                };
+                return SaveManagerSnapshot {
+                    neighborhood: neighborhood_slot,
+                    lot: lot_u16,
+                    lot_label,
+                    slots: Vec::new(),
+                    active_error: Some(merged_err),
+                };
+            }
+        };
 
     let mut slots = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -277,19 +325,23 @@ impl AutosaveWorker {
         }
     }
 
-    /// Enqueues an already-constructed [`SaveJob`] (such as a CoW
-    /// `SavePayload::World(Box<World>)` snapshot with `expected_instance_id`
-    /// fencing) for asynchronous REDB commit.
-    pub fn enqueue_job(&self, job: SaveJob) -> Result<(), String> {
+    fn enqueue_job_inner(&self, job: SaveJob, full_validate: bool) -> Result<(), String> {
         let Some(tx) = &self.tx else {
             return Err("autosave worker is shut down".into());
         };
         self.pending.fetch_add(1, Ordering::AcqRel);
-        if tx.send(WorkerMessage::Job(job)).is_err() {
+        if tx.send(WorkerMessage::Job { job, full_validate }).is_err() {
             self.pending.fetch_sub(1, Ordering::AcqRel);
             return Err("autosave worker channel closed".into());
         }
         Ok(())
+    }
+
+    /// Enqueues an already-constructed [`SaveJob`] (such as a CoW
+    /// `SavePayload::World(Box<World>)` snapshot with `expected_instance_id`
+    /// fencing) for asynchronous REDB commit.
+    pub fn enqueue_job(&self, job: SaveJob) -> Result<(), String> {
+        self.enqueue_job_inner(job, true)
     }
 
     /// Enqueues a cheap CoW [`World`] snapshot (`SavePayload::World`) fenced to
@@ -333,7 +385,7 @@ impl AutosaveWorker {
         if let Some(ts) = unix_timestamp_secs() {
             job = job.with_saved_at_unix_secs(ts);
         }
-        self.enqueue_job(job)
+        self.enqueue_job_inner(job, false)
     }
 
     /// Enqueues a cheap CoW [`Saved`] lot snapshot whose `Saved::encode()` runs
@@ -412,7 +464,7 @@ impl AutosaveWorker {
         if let Some(ts) = unix_timestamp_secs() {
             job = job.with_saved_at_unix_secs(ts);
         }
-        self.enqueue_job(job)
+        self.enqueue_job_inner(job, false)
     }
 
     /// Non-blocking drain of all completed background save jobs.
@@ -462,12 +514,16 @@ fn worker_loop(
 ) {
     while let Ok(msg) = rx.recv() {
         match msg {
-            WorkerMessage::Job(job) => {
+            WorkerMessage::Job { job, full_validate } => {
                 let neighborhood_id = job.neighborhood_id.clone();
                 let lot_id = job.lot_id;
                 let target = job.target;
                 let sim_tick = job.sim_tick;
-                let result = store.commit_job_validated(job, validate_save_payload);
+                let result = if full_validate {
+                    store.commit_job_validated(job, validate_save_payload)
+                } else {
+                    store.commit_job_validated(job, validate_save_payload_header)
+                };
                 pending.fetch_sub(1, Ordering::AcqRel);
                 let _ = done_tx.send(SaveCompletion {
                     neighborhood_id,
@@ -516,7 +572,9 @@ fn worker_loop(
                 if let Some(ts) = saved_at_unix_secs {
                     job = job.with_saved_at_unix_secs(ts);
                 }
-                let result = store.commit_job_validated(job, validate_save_payload);
+                // `saved.encode()` just serialized this payload; verify envelope
+                // SHA-256 + header metadata without a redundant round-trip `Saved::decode`.
+                let result = store.commit_job_validated(job, validate_save_payload_header);
                 pending.fetch_sub(1, Ordering::AcqRel);
                 let _ = done_tx.send(SaveCompletion {
                     neighborhood_id,
