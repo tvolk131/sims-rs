@@ -139,8 +139,10 @@ fn the_edge_on_strip_starts_on_the_originals_row_and_shows_its_colours() {
         return;
     };
     let mean = |y: usize| mean(&canvas, 557..561, y);
-    // The colours don't show where depth is read: on this tile the strip
-    // wins the depth test either way. So its depth is pinned: read at
+    // Through row 100 the colours don't show where depth is read: on rows
+    // 80 to 100 the strip wins the depth test either way (from row 101 to
+    // 111, corner (27, 24)'s standing trim drawn through 0x53e38f–0x53e3b4
+    // wins over it). So rows 80, 90, and 100 pin depth directly: read at
     // the row drawn (0x49a5d3), as the decision records. Read at the
     // unlifted row, 24 rows lower, each value would be 347 more.
     for (row, want) in [(80, 44471), (90, 44615), (100, 44760)] {

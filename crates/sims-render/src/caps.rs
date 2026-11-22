@@ -913,6 +913,23 @@ mod tests {
         ]);
         let mid = &rising_fence.corners[&[27, 24]];
         assert_eq!((mid.standing, mid.cut), (0x40, 0));
+
+        // Two cut Rising segments meeting a standing +x wall at the far record
+        // corner (28, 25): step 2 (0x53ca67) marks segment 1 with bit 2, and
+        // running mid-run trims after step 2 lets (27, 24) see that mark and
+        // drop 0x40 -> 0x10 at 0x53df39.
+        let rising_record_marked = Corners::new(vec![
+            styled_wall([26, 23], [27, 24], 1, true),
+            styled_wall([27, 24], [28, 25], 1, true),
+            styled_wall([28, 25], [29, 25], 1, false),
+        ]);
+        let mid = &rising_record_marked.corners[&[27, 24]];
+        assert!(!mid.record);
+        assert!(rising_record_marked.corners[&[28, 25]].record);
+        assert_eq!(rising_record_marked.flags[0], 1);
+        assert_eq!(rising_record_marked.flags[1], 1 | 2);
+        assert_eq!((mid.standing, mid.cut), (0, 0x10));
+        assert_eq!(mid.run_trims, vec![(0x10, true)]);
     }
 
     #[test]

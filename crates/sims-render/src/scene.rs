@@ -1227,10 +1227,14 @@ impl<'a> Painter<'a> {
     ) {
         let index = (level - 1) as usize;
         let zoom = self.camera.zoom.index();
-        // Draw walls in the original's back-to-front view order (`0x54045b` →
-        // `0x540809` → `0x54088d` → `0x44054c`: `(vx + vy, vx - vy)` ascending)
-        // so that on depth ties (`d <= dst + 1` at `0x4c49f2`), front walls
-        // overwrite back walls rather than the reverse on rotated views.
+        // Sort individual wall segments back-to-front by their normalized
+        // rotated endpoints `(lo, hi)` in `(vx + vy, vx - vy)` order,
+        // approximating the original's view-sorted run traversal (`0x54045b` →
+        // `0x540809` → `0x54088d` → `0x44054c`) so that on depth ties
+        // (`d <= dst + 1` at `0x4c49f2`), front walls overwrite back walls on
+        // rotated views. (Whole-run completion across crossing runs and
+        // mid-run trim/cap interleaving at `0x53e335`/`0x53e3c0` remain
+        // separate passes.)
         let mut ordered = Vec::new();
         for x in 0..self.lot.size as i32 {
             for y in 0..self.lot.size as i32 {
@@ -3673,17 +3677,40 @@ mod tests {
                     rotation,
                     ..camera(rotation)
                 };
-                let flat_at = shadow_origin(&cam, &flat, [10, 12], 1, floor_w);
-                let sloped_at = shadow_origin(&cam, &lot, [10, 12], 1, floor_w);
-                // On a flat tile, shadow_origin matches the top corner minus
-                // half floor_w identically across all zooms and rotations.
+                let depth = Depth::new(&cam);
                 let view = cam.rotate_tile([10, 12]);
-                let top_p = cam.project(view, 1, 0);
-                assert_eq!(flat_at, [top_p[0] - floor_w as i32 / 2, top_p[1]]);
-                // On the sloped tile, the shadow lifts by 1 terrain step
-                // (2 << zoom pixels) with x unchanged.
-                assert_eq!(sloped_at[0], flat_at[0]);
-                assert_eq!(flat_at[1] - sloped_at[1], 2 << zoom.level());
+                for level in [1, 2] {
+                    let flat_at = shadow_origin(&cam, &flat, [10, 12], level, floor_w);
+                    let sloped_at = shadow_origin(&cam, &lot, [10, 12], level, floor_w);
+                    // On a flat tile, shadow_origin matches the top corner minus
+                    // half floor_w identically across all zooms, rotations, and levels.
+                    let top_p = cam.project(view, level, 0);
+                    assert_eq!(flat_at, [top_p[0] - floor_w as i32 / 2, top_p[1]]);
+                    // On the sloped tile, the shadow lifts by 1 terrain step
+                    // (2 << zoom pixels) with x unchanged.
+                    assert_eq!(sloped_at[0], flat_at[0]);
+                    assert_eq!(flat_at[1] - sloped_at[1], 2 << zoom.level());
+                    // Depth anchors from the top corner with level offset and
+                    // rebases from the mask's own first row (0x4ae93e..0x4ae9ab).
+                    let (base_d, first_row) = depth.floor_base(view, 0, level, sloped_at[1]);
+                    assert_eq!(
+                        depth
+                            .floor_row(base_d, first_row, sloped_at[1])
+                            .saturating_sub(65),
+                        depth.shadow(view, 0, level, sloped_at[1], sloped_at[1]),
+                    );
+                }
+                // Level 2 lifts by one storey height and shifts depth nearer by LEVEL_DEPTH.
+                let l1 = shadow_origin(&cam, &flat, [10, 12], 1, floor_w);
+                let l2 = shadow_origin(&cam, &flat, [10, 12], 2, floor_w);
+                assert_eq!(l2[0], l1[0]);
+                assert!(l2[1] < l1[1]);
+                let (b1, f1) = depth.floor_base(view, 0, 1, l1[1]);
+                let (b2, f2) = depth.floor_base(view, 0, 2, l2[1]);
+                assert_eq!(
+                    depth.floor_row(b2, f2, l2[1]) - depth.floor_row(b1, f1, l1[1]),
+                    -967
+                );
             }
         }
     }
@@ -3692,18 +3719,31 @@ mod tests {
     fn wall_draw_key_orders_back_to_front_at_every_rotation() {
         // At corner (26, 24), tile (26, 24)'s WEST wall runs (26,24)-(26,25)
         // and tile (25, 24)'s NORTH wall runs (25,24)-(26,24).
-        // At rotation 0, (25,24)-(26,24) is behind (26,24)-(26,25).
-        // At rotation 2, (26,24)-(26,25) is behind (25,24)-(26,24).
         let west = ([26, 24], [26, 25]);
         let north = ([25, 24], [26, 24]);
+        // Rotation 0: north's start (49, 1) < west's start (50, 2).
         let cam0 = camera(0);
         assert!(wall_draw_key(&cam0, north.0, north.1) < wall_draw_key(&cam0, west.0, west.1));
+        // Rotation 1: west's start (65, 13) < north's start (65, 15).
+        let cam1 = camera(1);
+        assert!(wall_draw_key(&cam1, west.0, west.1) < wall_draw_key(&cam1, north.0, north.1));
+        // Rotation 2: west's start (77, -1) < north's start (78, -2).
         let cam2 = camera(2);
         assert!(wall_draw_key(&cam2, west.0, west.1) < wall_draw_key(&cam2, north.0, north.1));
-        // Regardless of endpoint order, the key is invariant.
-        assert_eq!(
-            wall_draw_key(&cam2, west.0, west.1),
-            wall_draw_key(&cam2, west.1, west.0)
-        );
+        // Rotation 3: both share start (62, -14); endpoint tie-break orders
+        // north's far end (63, -15) before west's far end (63, -13).
+        let cam3 = camera(3);
+        let k_north = wall_draw_key(&cam3, north.0, north.1);
+        let k_west = wall_draw_key(&cam3, west.0, west.1);
+        assert_eq!(k_north.0, k_west.0);
+        assert!(k_north < k_west);
+        // Regardless of endpoint order, the key is invariant at every rotation.
+        for rot in 0..4 {
+            let cam = camera(rot);
+            assert_eq!(
+                wall_draw_key(&cam, west.0, west.1),
+                wall_draw_key(&cam, west.1, west.0)
+            );
+        }
     }
 }

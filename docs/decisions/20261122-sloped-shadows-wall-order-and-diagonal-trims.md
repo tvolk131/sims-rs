@@ -25,13 +25,19 @@ remaining surface, shadow, and House02 diagonal-trim mismatches:
 
 2. **Walls draw back-to-front in view order**
    (`0x54045b` → `0x540809` → `0x54088d` → `0x44054c`).
-   `Sims.exe` sorts wall runs by `(vx + vy, vx - vy)` ascending so that on
-   depth ties (`d <= dst + 1` in `0x4c49f2` / `Canvas::draw_wall_masked`),
-   nearer walls overwrite farther walls at shared corner columns. Previously
-   `Painter::walls_with_openings` iterated unrotated `(x, y)` order, which
-   drew walls front-to-back at rotation 2 (and reversed along one axis at
-   rotations 1 and 3), leaving 1-pixel vertical seam stripes at corners on
-   `near-r2-0712-bench`, `near-r2-0805`, and `near-r3-down-0816`.
+   `Sims.exe` normalizes each run's endpoints (`0x53d93a`–`0x53da17`), sorts
+   wall runs by their start corner `(vx + vy, vx - vy)` ascending, and
+   completes each run (interleaving mid-run trims/caps at `0x53e335`/`0x53e3c0`
+   before each face) so that on depth ties (`d <= dst + 1` in `0x4c49f2` /
+   `Canvas::draw_wall_masked`), nearer walls overwrite farther walls at shared
+   corner columns. Previously `Painter::walls_with_openings` iterated unrotated
+   `(x, y)` order, which drew walls front-to-back at rotation 2 (and reversed
+   along one axis at rotations 1 and 3), leaving 1-pixel vertical seam stripes
+   at corners on `near-r2-0712-bench`, `near-r2-0805`, and `near-r3-down-0816`.
+   Sorting individual segments by normalized `(lo, hi)` rotated endpoints
+   closes all observed corner-seam mismatches across the fixtures (whole-run
+   completion across crossing runs and mid-run trim/cap interleaving remain a
+   separate pass).
 
 3. **Mid-run diagonal wall trims follow `0x53df39`–`0x53df90` and
    `0x53e184`–`0x53e1a8`.**
