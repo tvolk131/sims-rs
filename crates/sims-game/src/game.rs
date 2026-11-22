@@ -29,9 +29,9 @@ use sims_vm::boot::save::Saved;
 use sims_vm::boot::{Frames, Lot, StepError};
 use sims_vm::play::{Recovery, ScriptError};
 use sims_vm::{
-    BuyCursor, FloorDragMode, FloorPlan, PanelMode, SkippedFrame, SoundEvent, WALL_ASCENDING,
-    WALL_DESCENDING, WALL_EAST, WALL_NORTH, WALL_SOUTH, WALL_WEST, WallCursor, WallDragMode,
-    WallFace, WallPlan, WallStyle, WallpaperDragMode, WallpaperPlan,
+    BuyCursor, FloorDragMode, FloorPlan, PanelMode, SkippedFrame, SoundEvent, UiEffectEvent,
+    WALL_ASCENDING, WALL_DESCENDING, WALL_EAST, WALL_NORTH, WALL_SOUTH, WALL_WEST, WallCursor,
+    WallDragMode, WallFace, WallPlan, WallStyle, WallpaperDragMode, WallpaperPlan,
 };
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -89,15 +89,15 @@ pub struct Outcome {
     pub save: bool,
     /// The player accepted Quit from the Options panel (`0x516866..0x51686c`).
     pub quit: bool,
+    /// The player accepted returning to the Neighborhood screen (`0x5170f0..0x51713c`).
+    pub neighborhood: bool,
 }
 
 impl Outcome {
     fn redraw() -> Self {
         Self {
             redraw: true,
-            photo: false,
-            save: false,
-            quit: false,
+            ..Self::default()
         }
     }
 }
@@ -121,6 +121,12 @@ pub struct Game {
     errors: Errors,
     /// The steps' sound requests, in order, until the host takes them.
     sounds: VecDeque<SoundEvent>,
+    /// UI Effect highlight requests from steps not yet taken by the host.
+    ui_effects: VecDeque<UiEffectEvent>,
+    /// Active UI Effect highlights (opcode 34, `0x476485`/`0x47690d`/`0x4769c3`).
+    highlighted_buttons: BTreeSet<i16>,
+    highlighted_portraits: BTreeSet<u32>,
+    highlighted_relationships: BTreeSet<u32>,
     /// A short message about the last press, until the next one.
     note: Option<String>,
     /// Where the pointer is on the canvas, while it is over the window.
@@ -229,11 +235,22 @@ impl Game {
     pub fn open(options: &Options) -> Result<Self, String> {
         let house = &options.house;
         let opened = open_house(&options.install, house).map_err(|e| e.to_string())?;
-        let mut lot = Lot::load(
+        let initial_centre = sims_render::Lot::from_world(&opened.world)
+            .ok()
+            .and_then(|shape| {
+                let shape = shape.with_floor_rotation(opened.rotation);
+                let view = View::new([800, 600], shape.built_center(), opened.rotation);
+                let mut camera = view.camera;
+                camera.origin[0] = camera.origin[0].saturating_add(pick::ORIGIN_COLUMN);
+                sims_render::screen_centre_pick(&shape, &camera, [800, 600])
+                    .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8])
+            });
+        let mut lot = Lot::load_viewed(
             &options.install,
             house,
             &options.answers,
             options.frames.clone(),
+            initial_centre,
         )
         .map_err(|e| format!("{}: {e}", house.display()))?;
         // The player answers a dialog when it is shown.
@@ -286,6 +303,10 @@ impl Game {
             stopped,
             errors: Errors::default(),
             sounds: VecDeque::new(),
+            ui_effects: VecDeque::new(),
+            highlighted_buttons: BTreeSet::new(),
+            highlighted_portraits: BTreeSet::new(),
+            highlighted_relationships: BTreeSet::new(),
             pointer: None,
             reached: None,
             listed: None,
@@ -330,6 +351,210 @@ impl Game {
             game.set_mode(Mode::Buy);
         }
         Ok(game)
+    }
+
+    /// Boots `house` from a REDB [`sims_sim::neighborhood_store::NeighborhoodStore`]
+    /// via [`sims_vm::lifecycle::enter_lot`], without reading or mutating any
+    /// `UserData` house files on disk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_from_store(
+        install_root: &Path,
+        store: &sims_sim::neighborhood_store::NeighborhoodStore,
+        neighborhood_id: &str,
+        house: u32,
+        answers: &[u8],
+        play: bool,
+        frames: Frames,
+    ) -> Result<Self, String> {
+        let snapshot = store
+            .load_lot_snapshot(neighborhood_id, house)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {neighborhood_id:?} not found in store"))?;
+        let members = snapshot
+            .neighborhood
+            .family_in(house)
+            .map(|(_, f)| f.members.clone())
+            .unwrap_or_default();
+        let mut lot = sims_vm::lifecycle::enter_lot(
+            install_root,
+            store,
+            neighborhood_id,
+            house,
+            answers,
+            frames,
+        )
+        .map_err(|e| format!("{neighborhood_id} House{house:02}: {e}"))?;
+        lot.wait_for_answers();
+        let stopped = lot
+            .load_report()
+            .stopped
+            .as_ref()
+            .map(|s| format!("The load stopped, so the lot cannot run: {s}"));
+        let install = sims_content::Install::detect(install_root).map_err(|e| e.to_string())?;
+        let mut index = sims_content::Index::build(&install).map_err(|e| e.to_string())?;
+        if !snapshot.character_files.is_empty() {
+            index
+                .add_character_files(&snapshot.character_files)
+                .map_err(|e| e.to_string())?;
+        }
+        let catalog = sims_content::Catalog::build(&index).map_err(|e| e.to_string())?;
+        let assets =
+            sims_render::Assets::new(&install, index, catalog).map_err(|e| e.to_string())?;
+        let lot_shape = sims_render::Lot::from_world(lot.world())
+            .map_err(|e| e.to_string())?
+            .with_floor_rotation(lot.floor_rotation());
+        let mut hud = Hud::open_with_members(
+            install_root,
+            members,
+            &assets,
+            lot.world(),
+            lot.program().autonomy_constants().friendship_threshold,
+        )?;
+        hud.sync_clock_blink(lot.world(), 0);
+        let free_will = hud.controls.options.play.free_will;
+        if lot.world().globals.get(30).copied().unwrap_or(1) != i16::from(free_will) {
+            let _ = lot.set_free_will(free_will);
+        }
+        let mut people =
+            People::open_from_character_files(install_root, &snapshot.character_files)?;
+        people.refresh(lot.world());
+        let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
+        let drawn_camera = view.camera;
+        let has_family = lot.world().globals.get(9).copied().unwrap_or(0) != 0;
+        let is_residential = lot.lot_zoning().unwrap_or(1) == 1
+            && !matches!(lot.lot_id(), 21..=30 | 40..=48 | 81..=89 | 93..=98);
+        let edit_mode = if has_family && is_residential {
+            false
+        } else {
+            lot.world().globals.get(32).copied().unwrap_or(0) == 1
+                || (!has_family
+                    && (lot.lot_zoning().unwrap_or(0) != 0
+                        || matches!(lot.lot_id(), 21..=30 | 40..=48 | 81..=99)))
+        };
+        let mut pace = Pace::default();
+        if let Some(speed) = pace::shown(lot.world()) {
+            pace.speed = speed;
+        }
+        let mut game = Self {
+            lot,
+            lot_shape,
+            assets,
+            view,
+            people,
+            hud,
+            pace,
+            play,
+            stopped,
+            errors: Errors::default(),
+            sounds: VecDeque::new(),
+            ui_effects: VecDeque::new(),
+            highlighted_buttons: BTreeSet::new(),
+            highlighted_portraits: BTreeSet::new(),
+            highlighted_relationships: BTreeSet::new(),
+            pointer: None,
+            reached: None,
+            listed: None,
+            highlighted: None,
+            buy_selected: None,
+            buy_cursor: None,
+            buy_in_house: false,
+            buy_last_guid: None,
+            buy_facing: None,
+            buy_dragging: None,
+            buy_grab_offset: [0, 0],
+            buy_commit_on_release: false,
+            live_panel_expanded: true,
+            shift_held: false,
+            ctrl_held: false,
+            wall_cursor: None,
+            build_drag: None,
+            build_preview_shape: None,
+            buy_moneyback_us: None,
+            buy_delete_us: None,
+            note: None,
+            clock_us: 0,
+            drawn_us: 0,
+            blink_dirty: false,
+            dirty: false,
+            restore_dirty_on_quit_cancel: false,
+            pending_after_save_note: None,
+            edit_mode,
+            edge_scroll_rem: [0, 0],
+            canvas: Canvas::new(1, 1, [0, 0, 0]),
+            lot_cache: sims_render::LotCache::new(),
+            drawn_camera,
+            lot_depth: Vec::new(),
+            people_ids: sims_render::Ids::default(),
+        };
+        game.sync_view();
+        if edit_mode && game.stopped.is_none() {
+            game.lot.set_edit_budget(true);
+            game.set_mode(Mode::Buy);
+        }
+        Ok(game)
+    }
+
+    /// Saves the active lot back to its REDB [`sims_sim::neighborhood_store::NeighborhoodStore`]
+    /// via [`sims_vm::lifecycle::save_and_leave_lot`] (stripping any unpaid
+    /// Buy Mode placement cursor first).
+    pub fn save_to_neighborhood(
+        &mut self,
+        install_root: &Path,
+        store: &sims_sim::neighborhood_store::NeighborhoodStore,
+        neighborhood_id: &str,
+    ) -> Result<sims_vm::lifecycle::SaveReport, String> {
+        let result = match self.buy_cursor.as_ref() {
+            Some(cursor) => sims_vm::lifecycle::save_and_leave_lot_without_buy_cursor(
+                install_root,
+                store,
+                neighborhood_id,
+                &mut self.lot,
+                cursor,
+            ),
+            None => sims_vm::lifecycle::save_and_leave_lot(
+                install_root,
+                store,
+                neighborhood_id,
+                &mut self.lot,
+            ),
+        }
+        .map_err(|e| e.to_string());
+        let followup = self.pending_after_save_note.take();
+        match &result {
+            Ok(_) => {
+                self.dirty = false;
+                self.note = Some(match followup {
+                    Some(extra) => format!("Saved after tick {}. {extra}", self.lot.ticks()),
+                    None => format!("Saved after tick {}.", self.lot.ticks()),
+                });
+            }
+            Err(e) => {
+                self.note = Some(format!("The lot was not saved: {e}"));
+            }
+        }
+        result
+    }
+
+    /// Whether the player is currently holding an interactive tool, drag,
+    /// slider, or modal dialog that benefits from display-refresh redraws.
+    pub fn is_actively_interacting(&self) -> bool {
+        self.buy_cursor.is_some()
+            || self.build_drag.is_some()
+            || self.wall_cursor.is_some()
+            || self.hud.dragging_slider()
+            || self.hud.dragging_dialog_entry()
+            || self.has_dialog()
+    }
+
+    /// Current lot geometry and render assets for capturing map thumbnails on save.
+    pub fn render_parts_mut(
+        &mut self,
+    ) -> (
+        &sims_sim::World,
+        &sims_render::Lot,
+        &mut sims_render::Assets,
+    ) {
+        (self.lot.world(), &self.lot_shape, &mut self.assets)
     }
 
     /// The lot, for reading.
@@ -752,6 +977,29 @@ impl Game {
         self.sounds.drain(..).collect()
     }
 
+    /// The HUD highlight requests emitted by UI Effect (opcode 34, `0x44acff`)
+    /// since the last call, in order.
+    pub fn take_ui_effects(&mut self) -> Vec<UiEffectEvent> {
+        self.ui_effects.drain(..).collect()
+    }
+
+    /// Control IDs currently highlighted by UI Effect mode 0 (`0x476485`).
+    pub fn highlighted_buttons(&self) -> &BTreeSet<i16> {
+        &self.highlighted_buttons
+    }
+
+    /// Person GUIDs whose portrait button is currently highlighted by UI Effect
+    /// mode 1 (`0x47690d`).
+    pub fn highlighted_portraits(&self) -> &BTreeSet<u32> {
+        &self.highlighted_portraits
+    }
+
+    /// Neighbor GUIDs whose relationship control is currently highlighted by
+    /// UI Effect mode 2 (`0x4769c3`).
+    pub fn highlighted_relationships(&self) -> &BTreeSet<u32> {
+        &self.highlighted_relationships
+    }
+
     /// How many errors play mode caught.
     pub fn caught(&self) -> u64 {
         self.errors.count
@@ -989,6 +1237,7 @@ impl Game {
                     }
                     self.view.masks_rebuilt(update.masks_rebuilt);
                     self.keep_sounds(update.sounds);
+                    self.keep_ui_effects(update.ui_effects);
                 }
                 // The tick shows a dialog: it runs once it is answered,
                 // and no time is owed from before the wait.
@@ -1006,6 +1255,7 @@ impl Game {
                         } => {
                             self.view.masks_rebuilt(update.masks_rebuilt);
                             self.keep_sounds(update.sounds.clone());
+                            self.keep_ui_effects(update.ui_effects.clone());
                         }
                         // A play step whose tick failed hands back what
                         // it caught and made before the failure.
@@ -1019,6 +1269,7 @@ impl Game {
                             }
                             self.view.masks_rebuilt(update.masks_rebuilt);
                             self.keep_sounds(update.sounds.clone());
+                            self.keep_ui_effects(update.ui_effects.clone());
                         }
                         _ => {}
                     }
@@ -1064,6 +1315,38 @@ impl Game {
     /// [`SOUNDS_KEPT`], the oldest dropped first.
     fn keep_sounds(&mut self, sounds: Vec<SoundEvent>) {
         keep(&mut self.sounds, sounds, SOUNDS_KEPT);
+    }
+
+    /// Applies and queues a step's UI Effect highlight requests.
+    fn keep_ui_effects(&mut self, effects: Vec<UiEffectEvent>) {
+        for &effect in &effects {
+            match effect {
+                UiEffectEvent::Button { id, highlight } => {
+                    if highlight {
+                        self.highlighted_buttons.insert(id);
+                    } else {
+                        self.highlighted_buttons.remove(&id);
+                    }
+                }
+                UiEffectEvent::Portrait { guid, highlight } => {
+                    if highlight {
+                        self.highlighted_portraits.insert(guid);
+                    } else {
+                        self.highlighted_portraits.remove(&guid);
+                    }
+                }
+                UiEffectEvent::Relationship { guid, highlight } => {
+                    // `0x4769ca` resolves the first `cWinRelationship` control
+                    // without comparing neighbor identity, so a clear for any
+                    // valid neighbor clears the single active highlight.
+                    self.highlighted_relationships.clear();
+                    if highlight {
+                        self.highlighted_relationships.insert(guid);
+                    }
+                }
+            }
+        }
+        keep(&mut self.ui_effects, effects, SOUNDS_KEPT);
     }
 
     fn stop(&mut self, error: &StepError) {
@@ -1230,6 +1513,13 @@ impl Game {
             &self.pace,
             status.as_deref(),
             sell.as_ref(),
+            &mut self.canvas,
+        );
+        draw_ui_effect_highlights(
+            self.hud.items(),
+            &self.highlighted_buttons,
+            &self.highlighted_portraits,
+            !self.highlighted_relationships.is_empty(),
             &mut self.canvas,
         );
         self.draw_build_cost_label();
@@ -2345,6 +2635,10 @@ impl Game {
         self.stopped = None;
         self.errors = Errors::default();
         self.sounds.clear();
+        self.ui_effects.clear();
+        self.highlighted_buttons.clear();
+        self.highlighted_portraits.clear();
+        self.highlighted_relationships.clear();
         self.reached = None;
         self.listed = None;
         self.highlighted = None;
@@ -2474,10 +2768,8 @@ impl Game {
                     Outcome::redraw()
                 }
                 UiCamera::Photo => Outcome {
-                    redraw: false,
                     photo: true,
-                    save: false,
-                    quit: false,
+                    ..Outcome::default()
                 },
                 UiCamera::Roof => {
                     self.note = Some("Roofs are not drawn yet.".into());
@@ -2559,8 +2851,7 @@ impl Game {
                                 return Outcome {
                                     redraw: true,
                                     save: true,
-                                    quit: false,
-                                    photo: false,
+                                    ..Outcome::default()
                                 };
                             }
                             (OptionsDialog::SaveCardQuit, 1) => {
@@ -2578,7 +2869,7 @@ impl Game {
                                     redraw: true,
                                     save: true,
                                     quit: true,
-                                    photo: false,
+                                    ..Outcome::default()
                                 };
                             }
                             (OptionsDialog::ConfirmSaveBeforeQuit, 1) => {
@@ -2590,22 +2881,24 @@ impl Game {
                             }
                             (OptionsDialog::SaveCardNeighborhood, 0) => {
                                 apply_save_card(&mut self.lot, &mut self.dirty);
-                                let note = "Neighborhood view is not ported yet.";
+                                let note = "Returning to Neighborhood.";
                                 self.pending_after_save_note = Some(note);
                                 self.note = Some(note.into());
                                 return Outcome {
                                     redraw: true,
                                     save: true,
+                                    neighborhood: true,
                                     ..Outcome::default()
                                 };
                             }
                             (OptionsDialog::ConfirmSaveBeforeNeighborhood, 0) => {
-                                let note = "Neighborhood view is not ported yet.";
+                                let note = "Returning to Neighborhood.";
                                 self.pending_after_save_note = Some(note);
                                 self.note = Some(note.into());
                                 return Outcome {
                                     redraw: true,
                                     save: true,
+                                    neighborhood: true,
                                     ..Outcome::default()
                                 };
                             }
@@ -2615,7 +2908,12 @@ impl Game {
                                 1,
                             ) => {
                                 self.pending_after_save_note = None;
-                                self.note = Some("Neighborhood view is not ported yet.".into());
+                                self.note = None;
+                                return Outcome {
+                                    redraw: true,
+                                    neighborhood: true,
+                                    ..Outcome::default()
+                                };
                             }
                             (OptionsDialog::ConfirmResetTutorial, 0) => {
                                 // `0x4f25ea -> 0x4f1a11..0x4f1ac6`: confirming
@@ -2724,10 +3022,11 @@ impl Game {
                     // `0x5170f0..0x51713c`: prompts only when `dirty && can_save`;
                     // edit mode uses the save card (`0x517c03(1)`), ordinary lots
                     // fall back to `0x4f1a11` (`STR# 153[3..4]`).
-                    OptionsAction::Neighborhood if !self.dirty || !can_save => {
-                        self.note = Some("Neighborhood view is not ported yet.".into());
-                        Outcome::redraw()
-                    }
+                    OptionsAction::Neighborhood if !self.dirty || !can_save => Outcome {
+                        redraw: true,
+                        neighborhood: true,
+                        ..Outcome::default()
+                    },
                     OptionsAction::Neighborhood => {
                         let dialog = if self.edit_mode {
                             OptionsDialog::SaveCardNeighborhood
@@ -4585,10 +4884,91 @@ impl Errors {
     }
 }
 
-/// Adds `sounds` to the requests the host has yet to take, keeping at
+/// Highlight colour drawn around HUD controls targeted by UI Effect (opcode 34,
+/// `0x476485` / `0x47690d` / `0x4769c3` → `0x5de13f`).
+const UI_EFFECT_HIGHLIGHT_RGB: [u8; 3] = [255, 224, 64];
+
+/// Outlines any laid-out HUD items currently highlighted by UI Effect
+/// (opcode 34, `0x44acff`). Returns immediately when no highlight is active so
+/// ordinary frames and ratchet captures are untouched.
+fn draw_ui_effect_highlights(
+    items: &[sims_ui::hud::Item],
+    highlighted_buttons: &BTreeSet<i16>,
+    highlighted_portraits: &BTreeSet<u32>,
+    highlight_relationship: bool,
+    canvas: &mut Canvas,
+) {
+    if highlighted_buttons.is_empty() && highlighted_portraits.is_empty() && !highlight_relationship
+    {
+        return;
+    }
+    let mut relationship_drawn = false;
+    for item in items {
+        let matched = match &item.kind {
+            sims_ui::hud::Kind::Button { id, .. }
+            | sims_ui::hud::Kind::Toggle { id, .. }
+            | sims_ui::hud::Kind::Cell { id, .. } => {
+                i16::try_from(*id).is_ok_and(|k| highlighted_buttons.contains(&k))
+            }
+            sims_ui::hud::Kind::Pause { .. } => i16::try_from(sims_ui::hud::id::PAUSE)
+                .is_ok_and(|k| highlighted_buttons.contains(&k)),
+            sims_ui::hud::Kind::Portrait { guid, .. } => highlighted_portraits.contains(guid),
+            sims_ui::hud::Kind::Relation { .. }
+                if highlight_relationship && !relationship_drawn =>
+            {
+                relationship_drawn = true;
+                true
+            }
+            _ => false,
+        };
+        if matched {
+            draw_highlight_rect(canvas, item.rect, UI_EFFECT_HIGHLIGHT_RGB);
+        }
+    }
+}
+
+/// Draws a 2-pixel rectangular outline around `rect` clipped to `canvas`.
+fn draw_highlight_rect(canvas: &mut Canvas, rect: sims_ui::frame::Rect, rgb: [u8; 3]) {
+    if rect.width <= 0 || rect.height <= 0 || canvas.width == 0 || canvas.height == 0 {
+        return;
+    }
+    let cw = canvas.width as i32;
+    let ch = canvas.height as i32;
+    let x0 = rect.x;
+    let y0 = rect.y;
+    let x1 = rect.x.saturating_add(rect.width).saturating_sub(1);
+    let y1 = rect.y.saturating_add(rect.height).saturating_sub(1);
+    let mut put = |x: i32, y: i32| {
+        if x >= 0 && x < cw && y >= 0 && y < ch {
+            let idx = y as usize * canvas.width + x as usize;
+            if let Some(px) = canvas.color.get_mut(idx) {
+                *px = rgb;
+            }
+        }
+    };
+    for inset in 0..2 {
+        let lx = x0.saturating_add(inset);
+        let rx = x1.saturating_sub(inset);
+        let ty = y0.saturating_add(inset);
+        let by = y1.saturating_sub(inset);
+        if lx > rx || ty > by {
+            break;
+        }
+        for x in lx.max(0)..=rx.min(cw - 1) {
+            put(x, ty);
+            put(x, by);
+        }
+        for y in ty.max(0)..=by.min(ch - 1) {
+            put(lx, y);
+            put(rx, y);
+        }
+    }
+}
+
+/// Adds `items` to the requests the host has yet to take, keeping at
 /// most `kept`: the oldest go first.
-fn keep(queue: &mut VecDeque<SoundEvent>, sounds: Vec<SoundEvent>, kept: usize) {
-    queue.extend(sounds);
+fn keep<T>(queue: &mut VecDeque<T>, items: Vec<T>, kept: usize) {
+    queue.extend(items);
     let over = queue.len().saturating_sub(kept);
     queue.drain(..over);
 }
@@ -5495,5 +5875,79 @@ mod tests {
             lot_point(&near, &lot, [424, 392, 1]),
             lot_point(&near, &lot, [4520, 392, 1])
         );
+    }
+
+    #[test]
+    fn ui_effect_highlights_outline_buttons_portraits_and_first_relationship_control() {
+        let relation = |guid: u32, id: i16| sims_ui::household::Relation {
+            guid,
+            id,
+            daily: 10,
+            lifetime: 5,
+            friends: false,
+            pink_heart: false,
+            red_heart: false,
+            star: false,
+            family: false,
+        };
+        let items = vec![
+            sims_ui::hud::Item {
+                rect: sims_ui::frame::Rect::new(2, 2, 10, 10),
+                kind: sims_ui::hud::Kind::Button {
+                    id: sims_ui::hud::id::LIVE,
+                    cells: 4,
+                    selected: false,
+                },
+                command: None,
+            },
+            sims_ui::hud::Item {
+                rect: sims_ui::frame::Rect::new(16, 2, 10, 10),
+                kind: sims_ui::hud::Kind::Portrait {
+                    guid: 0x1111_2222,
+                    selected: false,
+                },
+                command: None,
+            },
+            sims_ui::hud::Item {
+                rect: sims_ui::frame::Rect::new(30, 2, 10, 10),
+                kind: sims_ui::hud::Kind::Relation {
+                    relation: relation(0xAAAA_0001, 1),
+                    lit: false,
+                },
+                command: None,
+            },
+            sims_ui::hud::Item {
+                rect: sims_ui::frame::Rect::new(44, 2, 10, 10),
+                kind: sims_ui::hud::Kind::Relation {
+                    relation: relation(0xAAAA_0002, 2),
+                    lit: false,
+                },
+                command: None,
+            },
+        ];
+
+        // Empty highlight sets leave the canvas untouched.
+        let mut canvas = Canvas::new(64, 20, [0, 0, 0]);
+        draw_ui_effect_highlights(
+            &items,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+            &mut canvas,
+        );
+        assert!(canvas.color.iter().all(|&px| px == [0, 0, 0]));
+
+        // Active highlights draw the outline on the matching button, portrait,
+        // and only the first relationship control (matching 0x4769ca).
+        let buttons = BTreeSet::from([sims_ui::hud::id::LIVE as i16]);
+        let portraits = BTreeSet::from([0x1111_2222u32]);
+        draw_ui_effect_highlights(&items, &buttons, &portraits, true, &mut canvas);
+        let pixel = |c: &Canvas, x: usize, y: usize| c.color[y * c.width + x];
+        assert_eq!(pixel(&canvas, 2, 2), UI_EFFECT_HIGHLIGHT_RGB);
+        assert_eq!(pixel(&canvas, 16, 2), UI_EFFECT_HIGHLIGHT_RGB);
+        assert_eq!(pixel(&canvas, 30, 2), UI_EFFECT_HIGHLIGHT_RGB);
+        assert_eq!(pixel(&canvas, 44, 2), [0, 0, 0]);
+        // Interior pixels stay untouched.
+        assert_eq!(pixel(&canvas, 6, 6), [0, 0, 0]);
     }
 }

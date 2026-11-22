@@ -223,6 +223,203 @@ pub struct World {
     /// had none at load. Kept apart so that the encodings of the states before
     /// it was kept stay a prefix of the new ones.
     pub saved_portraits: BTreeSet<u32>,
+    /// Which IFF files had `BMP_` 2002 (`0x7d2`) generated and persisted by
+    /// `0x4e938c` → `0x4e8c5d(index, 1, 1)` → `0x4e9000` during this session.
+    /// Keyed by IFF file ([`PortraitFile`]) rather than GUID because `0x4e9000`
+    /// writes resource `BMP_` 2002 into the definition's IFF file, so any other
+    /// person definition in the same file sees it at `0x4e9338` → `0x4e9260`.
+    /// Kept out of [`World::encode`] so snapshot format 32's wire bytes stay
+    /// unchanged; `sims_vm::boot::save::Saved` preserves it across lot
+    /// save/restore.
+    #[serde(skip)]
+    pub generated_portrait_2002: BTreeSet<PortraitFile>,
+    /// Whether each runtime-made character (`Make New Character`, opcode 19)
+    /// has an exact `"HEAD"` bone binding (`0x4e7824`): `Some(true)` when
+    /// every candidate wardrobe pick binds `"HEAD"`, `Some(false)` when none
+    /// does, or `None` when the wardrobe mixes both (depends on unmodeled
+    /// wardrobe order). Kept out of [`World::encode`] so snapshot format 32's
+    /// wire bytes stay unchanged; `sims_vm::boot::save::Saved` preserves it
+    /// across lot save/restore.
+    #[serde(skip)]
+    pub made_portrait_head: BTreeMap<u32, Option<bool>>,
+    /// Runtime-made pet GUIDs whose immediate `0x44b126` (`0x4e8c5d`) render
+    /// placed the pet and reached `0x4e7824` while [`World::made_portrait_head`]
+    /// was `None`, leaving whether `0x44b126` cached the portrait or wrote
+    /// `BMP_` 2002 unknown until a later `UI Effect` or `Dialog` queries it.
+    /// Kept out of [`World::encode`] so snapshot format 32's wire bytes stay
+    /// unchanged; `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub ambiguous_portraits: BTreeSet<u32>,
+    /// Lazy `.ndx`-indexed skeletons populated at runtime (`0x5a0384` →
+    /// `0x59f18c`–`0x59f19f` / `0x5a389b`): maps skeleton name to
+    /// `Some(catalog_location)` when loaded directly or filled as a sibling by
+    /// another catalog's load, or `None` when a lazy lookup failed so later
+    /// catalog loads cannot overwrite it. Kept out of [`World::encode`] to
+    /// preserve snapshot format 32; `sims_vm::boot::save::Saved` preserves it.
+    #[serde(skip)]
+    pub loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
+    /// Lazy `.ndx`-indexed appearances populated at runtime (`0x5a044d` →
+    /// `0x5a38da` → `0x59f35f`): maps lowercased appearance name to
+    /// `Some(has_head)` when loaded directly or filled as a sibling by another
+    /// catalog's load, or `None` when a lazy lookup failed so later catalog
+    /// loads cannot overwrite it. Kept out of [`World::encode`] to preserve
+    /// snapshot format 32; `sims_vm::boot::save::Saved` preserves it.
+    #[serde(skip)]
+    pub loaded_indexed_suits: BTreeMap<String, Option<bool>>,
+    /// Per-suit required `"HEAD"` mesh bone lists from the first `.ndx` `.bcf`
+    /// catalog that registered each runtime-loaded suit (`0x59f34c..0x59f35f`),
+    /// so duplicate suit names across catalogs preserve the winning catalog's
+    /// mesh requirements (`0x599f8a..0x59a01c`). Kept out of [`World::encode`]
+    /// to preserve snapshot format 32; `sims_vm::boot::save::Saved` preserves it.
+    #[serde(skip)]
+    pub loaded_indexed_suit_bones: BTreeMap<String, Vec<Vec<String>>>,
+    /// `STR# 200` outfit rows rewritten by `Make New Character` (`0x40d183`,
+    /// `0x40d4e7`, `0x40a5e2` rows 2 and 30–34, `0x40a667` rows 30 and 34,
+    /// `0x40ac57` rows 1, 2, and 15–18) for runtime-made characters, kept out
+    /// of [`World::characters`] / [`World::encode`] to preserve snapshot format
+    /// 32; `sims_vm::boot::save::Saved` preserves it.
+    #[serde(skip)]
+    pub made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
+    /// Per-person live `cTSPerson` attachment slots (`[ebx + 0x258]` head,
+    /// `[ebx + 0x25c]` body & body_alt, `[ebx + 0x268]` left & right extras,
+    /// `[ebx + 0x274]` accessories), cached dressing guard (`[ebx + 0x1b0..0x1bc]`),
+    /// and cached career workwear (`[esi + 0xb2c..0xbc8]`).
+    /// Kept out of [`World::encode`] to preserve snapshot format 32;
+    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub person_outfits: BTreeMap<u16, PersonOutfit>,
+    /// Objects whose scratch destination pointer (`[object + 0x128]`, zeroed
+    /// at `0x431a77`) has been populated by `Expression` (`0x452c85`),
+    /// `Random Number` (`0x451e8d`), `Get Direction To` (`0x45202b`),
+    /// `Relationship`/`Old Relationship` (`0x44d513`), or `Set To Next`
+    /// (`0x44eb9d`). Once set, `UI Effect` reading global 34 (`0x4541d5`)
+    /// writes through that pointer and succeeds instead of dereferencing null.
+    /// Kept out of [`World::encode`] to preserve snapshot format 32;
+    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub scratch_ptr_set: BTreeSet<u16>,
+    /// Live objects whose last `[object + 0x128]` write was `Set To Next`
+    /// (`0x44eb9d`). That pointer addresses an allocated local inside a
+    /// subsequent `Expression`'s right-hand Global 34 read (`0x452c76` →
+    /// `0x4541db`, which therefore succeeds), while still overlapping
+    /// `UI Effect`'s return address (`0x44ad70`, which traps). Kept out of
+    /// [`World::encode`] to preserve snapshot format 32;
+    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub scratch_ptr_set_to_next: BTreeSet<u16>,
+    /// Live objects whose last `[object + 0x128]` write was `Expression`
+    /// (`0x452c85` → `&[ebp - 0x04]`). In a subsequent `Expression` at the
+    /// same dispatch depth, reading Global 34 on the right-hand side
+    /// (`0x452c76` → `0x4541db`) writes `&globals[34]` into `[ebp - 0x04]`,
+    /// which takes priority over `[ebp - 0x08]` (motives) and read-only LHS
+    /// destinations at `0x452e84..0x4530c5`. Kept out of [`World::encode`] to
+    /// preserve snapshot format 32; `sims_vm::boot::save::Saved` preserves it.
+    #[serde(skip)]
+    pub scratch_ptr_expression: BTreeSet<u16>,
+    /// Live objects whose last `[object + 0x128]` write was `Random Number`
+    /// (`0x451e8d`) or `Get Direction To` (`0x45202b`), both 2-argument
+    /// primitives storing `&[ebp + 0x0c]`. In a subsequent 1-argument
+    /// `Expression` at the same dispatch depth, that address aliases
+    /// `[ebp + 0x08]` (the LHS `write` flag), so reading Global 34 on the RHS
+    /// (`0x452c76` → `0x4541db`) overwrites `[ebp + 0x08]` with `&globals[34]`
+    /// (nonzero low byte) before `0x452c7b` passes it to `0x453141` (`resolve`)
+    /// and before `0x452d01` checks it for the motive clamp. Kept out of
+    /// [`World::encode`] to preserve snapshot format 32;
+    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub scratch_ptr_arg_slot: BTreeSet<u16>,
+    /// Appearance names newly inserted into `AvatarRegistry`'s hash table by
+    /// runtime `.bcf` catalog loads (`0x59f320` → `0x5a1fb1`) that were not
+    /// already present in startup eager or `.ndx` registrations, in exact
+    /// insertion order. Kept out of [`World::encode`] to preserve snapshot
+    /// format 32; `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub runtime_added_suits: Vec<String>,
+    /// First-call snapshot of `AvatarRegistry`'s appearance hash-table walk
+    /// (`0x409255` → `0x6e48a0`, skipping `"suit-*"`), cached for the rest of
+    /// the session once any generated-outfit matcher runs. Kept out of
+    /// [`World::encode`] to preserve snapshot format 32;
+    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub suit_scan_cache: Option<Vec<String>>,
+}
+
+/// One appearance attachment slot on `cTSPerson` (`0x583559`: suit name at
+/// `[slot + 4]`, texture string at `[slot + 0x10]`, and whether the bound
+/// appearance defines a valid `"HEAD"` mesh binding).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BoundSlot {
+    pub suit: String,
+    pub texture: String,
+    pub has_head: Option<bool>,
+}
+
+/// Cached career workwear descriptor on `cXPerson` (`0x45ee5f`: `[esi + 0xb2c]`
+/// job type, `[esi + 0xb2e]` job level, `[esi + 0xb30]` body suit,
+/// `[esi + 0xb7c]` body texture, `[esi + 0xbc8]` body_alt suit).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkwearCache {
+    pub job_type: i16,
+    pub job_level: i16,
+    pub body_suit: String,
+    pub body_tex: String,
+    pub body_alt_suit: String,
+}
+
+/// Live outfit attachment slots and cached dressing guard on `cTSPerson`
+/// (`0x587dfa`, `0x58a178`, `0x591a30`, `0x45ee5f`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonOutfit {
+    /// `[ebx + 0x258]` (head slot).
+    pub head: Option<BoundSlot>,
+    /// `[ebx + 0x25c][0]` (primary body slot).
+    pub body: Option<BoundSlot>,
+    /// `[ebx + 0x25c][1]` (secondary body slot, e.g. workwear hat/prop).
+    pub body_alt: Option<BoundSlot>,
+    /// `[ebx + 0x268][0]` (left hand / extra slot).
+    pub extra_left: Option<BoundSlot>,
+    /// `[ebx + 0x268][1]` (right hand / extra slot).
+    pub extra_right: Option<BoundSlot>,
+    /// `[ebx + 0x274]` (actually bound accessory attachments).
+    pub accessories: Vec<BoundSlot>,
+    /// `[ebx + 0x1b0..0x1bc]` (`data[8], data[21], data[22], data[23]`),
+    /// initialized to `[-1, -1, -1, -1]` in `cTSPerson::cTSPerson` (`0x587dfa`).
+    pub last_dressed: [i32; 4],
+    /// `[esi + 0xb2c..0xbc8]` cached workwear descriptors (`0x45ee5f`).
+    pub workwear_cache: Option<WorkwearCache>,
+}
+
+impl PersonOutfit {
+    /// Freshly constructed `cTSPerson` attachment state (`0x587dfa`): all slots
+    /// unbound and cached suit/variant/hand words at `-1`.
+    pub const fn new() -> Self {
+        Self {
+            head: None,
+            body: None,
+            body_alt: None,
+            extra_left: None,
+            extra_right: None,
+            accessories: Vec::new(),
+            last_dressed: [-1; 4],
+            workwear_cache: None,
+        }
+    }
+}
+
+impl Default for PersonOutfit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Which IFF file holds a portrait bitmap persisted by `0x4e9000`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PortraitFile {
+    /// A catalog resource file (index into `sims_content::Index::resources`).
+    Resource(usize),
+    /// A runtime-made character file (`Characters/User%05d.iff`,
+    /// [`crate::characters::Character::file`]).
+    Made(i32),
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -586,6 +783,20 @@ impl World {
             portraits: BTreeSet::new(),
             dirty_portraits: BTreeSet::new(),
             saved_portraits: BTreeSet::new(),
+            generated_portrait_2002: BTreeSet::new(),
+            made_portrait_head: BTreeMap::new(),
+            ambiguous_portraits: BTreeSet::new(),
+            loaded_indexed_skeletons: BTreeMap::new(),
+            loaded_indexed_suits: BTreeMap::new(),
+            loaded_indexed_suit_bones: BTreeMap::new(),
+            made_outfits: BTreeMap::new(),
+            person_outfits: BTreeMap::new(),
+            scratch_ptr_set: BTreeSet::new(),
+            scratch_ptr_set_to_next: BTreeSet::new(),
+            scratch_ptr_expression: BTreeSet::new(),
+            scratch_ptr_arg_slot: BTreeSet::new(),
+            runtime_added_suits: Vec::new(),
+            suit_scan_cache: None,
         }
     }
 
