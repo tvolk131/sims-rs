@@ -8,10 +8,12 @@
 //! Safety & liveness invariants:
 //! - Deterministic simultaneous-dial tie-breaking: both endpoints select the
 //!   same winning connection using total order on canonical `EndpointId`s.
-//! - Generation-gated event publication: messages and disconnects from a
-//!   superseded connection generation are discarded.
+//! - Atomic generation-fenced event publication: `peers`, `dialing`, and
+//!   `events` share one short-lived mutex so a superseded connection can never
+//!   interleave messages or disconnects after its replacement registers.
 //! - Bounded global and per-connection inbound byte/event budgets applying
-//!   natural QUIC flow-control backpressure to senders.
+//!   natural QUIC flow-control backpressure to senders, plus bounded control
+//!   event storage.
 //! - Graceful writer drain on disconnect so `Goodbye` frames flush cleanly.
 
 use crate::error::TransportError;
@@ -39,8 +41,12 @@ const STREAM_MAGIC: &[u8; 4] = b"SIM1";
 /// Bounded outbound frame queue depth per connected peer.
 const OUTBOUND_CHANNEL_CAP: usize = 256;
 
-/// Maximum buffered decoded inbound events across all connections.
+/// Maximum buffered decoded inbound message events across all connections.
 const MAX_INBOUND_EVENTS: usize = 1024;
+
+/// Maximum buffered control events (`PeerConnected` / `PeerDisconnected`) so
+/// connection churn cannot grow the event queue without bound between drains.
+const MAX_CONTROL_EVENTS: usize = 1024;
 
 /// Maximum aggregate inbound decoded payload bytes buffered before applying
 /// QUIC stream backpressure (16 MiB).
@@ -72,20 +78,61 @@ struct PeerHandle {
 
 struct QueuedEvent {
     event: TransportEvent,
+    is_control: bool,
     _global_event_permit: Option<OwnedSemaphorePermit>,
     _global_byte_permit: Option<OwnedSemaphorePermit>,
     _peer_byte_permit: Option<OwnedSemaphorePermit>,
 }
 
+struct TransportInner {
+    peers: BTreeMap<PeerAddress, PeerHandle>,
+    dialing: BTreeSet<PeerAddress>,
+    events: VecDeque<QueuedEvent>,
+    control_event_count: usize,
+}
+
+impl TransportInner {
+    fn push_control(&mut self, event: TransportEvent) {
+        if self.control_event_count >= MAX_CONTROL_EVENTS {
+            // Evict the oldest control event to keep aggregate memory strictly bounded.
+            if let Some(pos) = self.events.iter().position(|e| e.is_control) {
+                self.events.remove(pos);
+                self.control_event_count = self.control_event_count.saturating_sub(1);
+            }
+        }
+        self.events.push_back(QueuedEvent {
+            event,
+            is_control: true,
+            _global_event_permit: None,
+            _global_byte_permit: None,
+            _peer_byte_permit: None,
+        });
+        self.control_event_count = self.control_event_count.saturating_add(1);
+    }
+}
+
 struct SharedState {
     local_addr: PeerAddress,
     next_conn_id: AtomicU64,
-    peers: Mutex<BTreeMap<PeerAddress, PeerHandle>>,
-    dialing: Mutex<BTreeSet<PeerAddress>>,
-    events: Mutex<VecDeque<QueuedEvent>>,
+    inner: Mutex<TransportInner>,
     event_notify: Notify,
     global_event_budget: Arc<Semaphore>,
     global_byte_budget: Arc<Semaphore>,
+}
+
+/// RAII guard ensuring an in-flight dial reservation is cleared on completion,
+/// error, or task cancellation.
+struct DialGuard {
+    shared: Arc<SharedState>,
+    peer: PeerAddress,
+}
+
+impl Drop for DialGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.shared.inner.lock() {
+            inner.dialing.remove(&self.peer);
+        }
+    }
 }
 
 impl SharedState {
@@ -93,9 +140,12 @@ impl SharedState {
         Self {
             local_addr,
             next_conn_id: AtomicU64::new(1),
-            peers: Mutex::new(BTreeMap::new()),
-            dialing: Mutex::new(BTreeSet::new()),
-            events: Mutex::new(VecDeque::new()),
+            inner: Mutex::new(TransportInner {
+                peers: BTreeMap::new(),
+                dialing: BTreeSet::new(),
+                events: VecDeque::new(),
+                control_event_count: 0,
+            }),
             event_notify: Notify::new(),
             global_event_budget: Arc::new(Semaphore::new(MAX_INBOUND_EVENTS)),
             global_byte_budget: Arc::new(Semaphore::new(MAX_GLOBAL_INBOUND_BYTES)),
@@ -107,17 +157,14 @@ impl SharedState {
     }
 
     fn push_control_event(&self, event: TransportEvent) {
-        if let Ok(mut q) = self.events.lock() {
-            q.push_back(QueuedEvent {
-                event,
-                _global_event_permit: None,
-                _global_byte_permit: None,
-                _peer_byte_permit: None,
-            });
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.push_control(event);
         }
         self.event_notify.notify_waiters();
     }
 
+    /// Atomically checks that `conn_id` is still the active generation for
+    /// `peer` AND enqueues the message under the same lock.
     fn push_message_for_conn(
         &self,
         peer: &PeerAddress,
@@ -127,39 +174,39 @@ impl SharedState {
         global_byte_permit: OwnedSemaphorePermit,
         peer_byte_permit: OwnedSemaphorePermit,
     ) -> bool {
-        let is_active = self
-            .peers
-            .lock()
-            .ok()
-            .is_some_and(|map| map.get(peer).is_some_and(|h| h.conn_id == conn_id));
-        if !is_active {
-            return false;
+        let pushed = if let Ok(mut inner) = self.inner.lock() {
+            let is_active = inner.peers.get(peer).is_some_and(|h| h.conn_id == conn_id);
+            if !is_active {
+                false
+            } else {
+                inner.events.push_back(QueuedEvent {
+                    event: TransportEvent::Message {
+                        from: peer.clone(),
+                        message,
+                    },
+                    is_control: false,
+                    _global_event_permit: Some(global_event_permit),
+                    _global_byte_permit: Some(global_byte_permit),
+                    _peer_byte_permit: Some(peer_byte_permit),
+                });
+                true
+            }
+        } else {
+            false
+        };
+        if pushed {
+            self.event_notify.notify_waiters();
         }
-        if let Ok(mut q) = self.events.lock() {
-            q.push_back(QueuedEvent {
-                event: TransportEvent::Message {
-                    from: peer.clone(),
-                    message,
-                },
-                _global_event_permit: Some(global_event_permit),
-                _global_byte_permit: Some(global_byte_permit),
-                _peer_byte_permit: Some(peer_byte_permit),
-            });
-        }
-        self.event_notify.notify_waiters();
-        true
+        pushed
     }
 
-    /// Registers a peer connection using deterministic simultaneous-dial
-    /// tie-breaking so both endpoints always keep the same QUIC connection.
-    ///
-    /// Returns `true` if `handle` was installed as the active connection, or
-    /// `false` if an existing higher-priority connection won the tie-break (in
-    /// which case `handle.conn` is closed).
+    /// Atomically registers a peer connection using deterministic
+    /// simultaneous-dial tie-breaking and emits `PeerConnected` under the same
+    /// lock so no displaced generation can interleave events after it.
     fn register_peer(&self, peer: PeerAddress, handle: PeerHandle) -> bool {
-        let mut emit_connected = false;
-        let accepted = if let Ok(mut map) = self.peers.lock() {
-            if let Some(existing) = map.get(&peer) {
+        let mut notify = false;
+        let accepted = if let Ok(mut inner) = self.inner.lock() {
+            if let Some(existing) = inner.peers.get(&peer) {
                 let local_wins_tie = self.local_addr < peer;
                 let incoming_wins = if existing.initiator_is_local == handle.initiator_is_local {
                     // Same initiator reconnecting: newer replaces older.
@@ -170,7 +217,7 @@ impl SharedState {
                     handle.initiator_is_local == local_wins_tie
                 };
                 if incoming_wins {
-                    if let Some(old) = map.insert(peer.clone(), handle) {
+                    if let Some(old) = inner.peers.insert(peer.clone(), handle) {
                         old.conn.close(0u32.into(), b"replaced");
                     }
                     true
@@ -179,23 +226,32 @@ impl SharedState {
                     false
                 }
             } else {
-                map.insert(peer.clone(), handle);
-                emit_connected = true;
+                inner.peers.insert(peer.clone(), handle);
+                inner.push_control(TransportEvent::PeerConnected { peer });
+                notify = true;
                 true
             }
         } else {
             false
         };
-        if emit_connected {
-            self.push_control_event(TransportEvent::PeerConnected { peer });
+        if notify {
+            self.event_notify.notify_waiters();
         }
         accepted
     }
 
+    /// Atomically checks that `conn_id` is still active, removes the peer, and
+    /// enqueues `PeerDisconnected` under the same lock so a displaced
+    /// connection can never tear down or emit a disconnect after a replacement.
     fn remove_peer(&self, peer: &PeerAddress, conn_id: u64, reason: String) {
-        let removed = if let Ok(mut map) = self.peers.lock() {
-            if map.get(peer).is_some_and(|h| h.conn_id == conn_id) {
-                map.remove(peer).is_some()
+        let removed = if let Ok(mut inner) = self.inner.lock() {
+            if inner.peers.get(peer).is_some_and(|h| h.conn_id == conn_id) {
+                inner.peers.remove(peer);
+                inner.push_control(TransportEvent::PeerDisconnected {
+                    peer: peer.clone(),
+                    reason,
+                });
+                true
             } else {
                 false
             }
@@ -203,10 +259,7 @@ impl SharedState {
             false
         };
         if removed {
-            self.push_control_event(TransportEvent::PeerDisconnected {
-                peer: peer.clone(),
-                reason,
-            });
+            self.event_notify.notify_waiters();
         }
     }
 }
@@ -271,7 +324,8 @@ impl IrohTransport {
     }
 
     /// Asynchronously connects to a host/peer using an [`InviteTicket`] and
-    /// returns the remote peer's canonical [`PeerAddress`].
+    /// returns the remote peer's canonical [`PeerAddress`], sharing in-flight
+    /// dial deduplication with [`Transport::connect`].
     pub async fn connect_ticket(
         &mut self,
         ticket: &InviteTicket,
@@ -281,15 +335,29 @@ impl IrohTransport {
         }
         let remote_addr = ticket.endpoint_addr().clone();
         let peer_addr = PeerAddress(remote_addr.id.to_string());
-        if self
-            .shared
-            .peers
-            .lock()
-            .ok()
-            .is_some_and(|m| m.contains_key(&peer_addr))
-        {
-            return Ok(peer_addr);
+
+        let reserved = if let Ok(mut inner) = self.shared.inner.lock() {
+            if inner.peers.contains_key(&peer_addr) {
+                return Ok(peer_addr);
+            }
+            if !inner.dialing.insert(peer_addr.clone()) {
+                return Err(TransportError::Backpressure(format!(
+                    "dial already in flight for {peer_addr}"
+                )));
+            }
+            true
+        } else {
+            false
+        };
+        if !reserved {
+            return Err(TransportError::Backend(
+                "transport lock poisoned".to_string(),
+            ));
         }
+        let _guard = DialGuard {
+            shared: Arc::clone(&self.shared),
+            peer: peer_addr.clone(),
+        };
 
         let conn = self
             .endpoint
@@ -328,10 +396,10 @@ impl IrohTransport {
             notified.as_mut().enable();
             if self
                 .shared
-                .events
+                .inner
                 .lock()
                 .ok()
-                .is_some_and(|q| !q.is_empty())
+                .is_some_and(|inner| !inner.events.is_empty())
             {
                 return;
             }
@@ -346,10 +414,10 @@ impl IrohTransport {
         self.closed = true;
         let handles: Vec<PeerHandle> = self
             .shared
-            .peers
+            .inner
             .lock()
             .ok()
-            .map(|mut map| std::mem::take(&mut *map).into_values().collect())
+            .map(|mut inner| std::mem::take(&mut inner.peers).into_values().collect())
             .unwrap_or_default();
         // Drop `tx` senders first so writer tasks flush queued frames + `send.finish()`.
         let conns: Vec<Connection> = handles.into_iter().map(|h| h.conn).collect();
@@ -397,26 +465,25 @@ impl Transport for IrohTransport {
             .map_err(|e| TransportError::InvalidAddress(e.to_string()))?;
         let remote_addr = ticket.endpoint_addr().clone();
         let peer_addr = PeerAddress(remote_addr.id.to_string());
-        if self
-            .shared
-            .peers
-            .lock()
-            .ok()
-            .is_some_and(|m| m.contains_key(&peer_addr))
-        {
-            return Ok(());
-        }
-        // Deduplicate concurrent in-flight dials to the same peer.
-        if let Ok(mut dialing) = self.shared.dialing.lock()
-            && !dialing.insert(peer_addr.clone())
-        {
-            return Ok(());
+
+        if let Ok(mut inner) = self.shared.inner.lock() {
+            if inner.peers.contains_key(&peer_addr) || !inner.dialing.insert(peer_addr.clone()) {
+                return Ok(());
+            }
+        } else {
+            return Err(TransportError::Backend(
+                "transport lock poisoned".to_string(),
+            ));
         }
 
         let endpoint = self.endpoint.clone();
         let shared = Arc::clone(&self.shared);
         let runtime = self.runtime.clone();
         self.runtime.spawn(async move {
+            let _guard = DialGuard {
+                shared: Arc::clone(&shared),
+                peer: peer_addr.clone(),
+            };
             let outcome: Result<(Connection, SendStream, RecvStream), String> = async {
                 let conn = endpoint
                     .connect(remote_addr, ALPN)
@@ -433,20 +500,16 @@ impl Transport for IrohTransport {
             }
             .await;
 
-            if let Ok(mut dialing) = shared.dialing.lock() {
-                dialing.remove(&peer_addr);
-            }
-
             match outcome {
                 Ok((conn, send, recv)) => {
                     spawn_peer_io(&runtime, shared, peer_addr, true, conn, send, recv);
                 }
                 Err(reason) => {
                     let already_connected = shared
-                        .peers
+                        .inner
                         .lock()
                         .ok()
-                        .is_some_and(|m| m.contains_key(&peer_addr));
+                        .is_some_and(|inner| inner.peers.contains_key(&peer_addr));
                     if !already_connected {
                         shared.push_control_event(TransportEvent::PeerDisconnected {
                             peer: peer_addr,
@@ -461,13 +524,20 @@ impl Transport for IrohTransport {
 
     fn disconnect(&mut self, peer: &PeerAddress) -> Result<(), TransportError> {
         let key = Self::resolve_peer_key(peer);
-        let removed = self
-            .shared
-            .peers
-            .lock()
-            .ok()
-            .and_then(|mut map| map.remove(&key));
+        let removed = if let Ok(mut inner) = self.shared.inner.lock() {
+            let handle = inner.peers.remove(&key);
+            if handle.is_some() {
+                inner.push_control(TransportEvent::PeerDisconnected {
+                    peer: key,
+                    reason: "disconnected".to_string(),
+                });
+            }
+            handle
+        } else {
+            None
+        };
         if let Some(handle) = removed {
+            self.shared.event_notify.notify_waiters();
             // Drop `handle.tx` so the writer task finishes flushing any queued
             // frames (such as `Goodbye`) and calls `send.finish()`, then close
             // the QUIC connection after a bounded drain window.
@@ -477,11 +547,6 @@ impl Transport for IrohTransport {
                 tokio::time::sleep(GRACEFUL_DRAIN_TIMEOUT).await;
                 conn.close(0u32.into(), b"disconnect");
             });
-            self.shared
-                .push_control_event(TransportEvent::PeerDisconnected {
-                    peer: key,
-                    reason: "disconnected".to_string(),
-                });
         }
         Ok(())
     }
@@ -494,10 +559,10 @@ impl Transport for IrohTransport {
         let key = Self::resolve_peer_key(to);
         let tx = self
             .shared
-            .peers
+            .inner
             .lock()
             .ok()
-            .and_then(|map| map.get(&key).map(|h| h.tx.clone()))
+            .and_then(|inner| inner.peers.get(&key).map(|h| h.tx.clone()))
             .ok_or_else(|| TransportError::NotConnected(key.0.clone()))?;
 
         tx.try_send(framed).map_err(|err| match err {
@@ -508,19 +573,22 @@ impl Transport for IrohTransport {
 
     fn drain_events(&mut self) -> Vec<TransportEvent> {
         self.shared
-            .events
+            .inner
             .lock()
             .ok()
-            .map(|mut q| q.drain(..).map(|item| item.event).collect())
+            .map(|mut inner| {
+                inner.control_event_count = 0;
+                inner.events.drain(..).map(|item| item.event).collect()
+            })
             .unwrap_or_default()
     }
 
     fn connected_peers(&self) -> Vec<PeerAddress> {
         self.shared
-            .peers
+            .inner
             .lock()
             .ok()
-            .map(|map| map.keys().cloned().collect())
+            .map(|inner| inner.peers.keys().cloned().collect())
             .unwrap_or_default()
     }
 }

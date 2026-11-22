@@ -372,6 +372,11 @@ impl Default for SessionConfig {
 }
 
 impl SessionConfig {
+    /// Maximum number of future [`TickBatch`]es a peer buffers locally.
+    pub fn max_buffered_batches(&self) -> usize {
+        self.retained_batch_history.max(64).saturating_mul(2)
+    }
+
     /// Validates lockstep delay, pacing, and capacity bounds so startup cannot
     /// panic or deadlock.
     pub fn validate(&self) -> Result<(), crate::error::SessionError> {
@@ -379,6 +384,13 @@ impl SessionConfig {
             return Err(crate::error::SessionError::InvalidConfig(format!(
                 "min_tick_delay ({}) > max_tick_delay ({})",
                 self.min_tick_delay, self.max_tick_delay
+            )));
+        }
+        let max_buf = self.max_buffered_batches();
+        if (self.max_tick_delay as usize) > max_buf {
+            return Err(crate::error::SessionError::InvalidConfig(format!(
+                "max_tick_delay ({}) exceeds peer receive buffer capacity ({max_buf})",
+                self.max_tick_delay
             )));
         }
         if self.tick_delay < self.min_tick_delay || self.tick_delay > self.max_tick_delay {
@@ -409,6 +421,9 @@ impl SessionConfig {
 
     /// Returns a defensively sanitized copy guaranteed to satisfy [`Self::validate`].
     pub fn sanitized(mut self) -> Self {
+        let max_buf = self.max_buffered_batches().min(u32::MAX as usize) as u32;
+        self.min_tick_delay = self.min_tick_delay.min(max_buf);
+        self.max_tick_delay = self.max_tick_delay.min(max_buf);
         if self.min_tick_delay > self.max_tick_delay {
             self.max_tick_delay = self.min_tick_delay;
         }

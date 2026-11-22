@@ -45,6 +45,12 @@ const BATCH_FRAME_HEADROOM: usize = 1024;
 /// Maximum consecutive snapshot verification/overflow retries before giving up.
 const MAX_SNAPSHOT_RETRIES: u8 = 3;
 
+/// Maximum UTF-8 byte length of a player display name accepted on `Hello`.
+const MAX_PLAYER_NAME_BYTES: usize = 64;
+
+/// Maximum byte length of an `endpoint_hint` accepted on `Hello`.
+const MAX_ENDPOINT_HINT_BYTES: usize = 2048;
+
 /// Outcome of calling [`LockstepNode::advance_host_tick`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStepResult {
@@ -235,6 +241,7 @@ pub struct LockstepNode {
     host_addr: Option<PeerAddress>,
     peer_phase: PeerConnectionPhase,
     failed_host_candidates: BTreeSet<PlayerId>,
+    peer_outbound: VecDeque<WireMessage>,
     next_command_seq: CommandSeq,
     active_snapshot_rx: Option<SnapshotReceiver>,
     pending_snapshot_install: Option<PendingSnapshotInstall>,
@@ -292,6 +299,7 @@ impl LockstepNode {
             host_addr: None,
             peer_phase: PeerConnectionPhase::Joined,
             failed_host_candidates: BTreeSet::new(),
+            peer_outbound: VecDeque::new(),
             next_command_seq: CommandSeq(1),
             active_snapshot_rx: None,
             pending_snapshot_install: None,
@@ -341,6 +349,7 @@ impl LockstepNode {
             host_addr: Some(host_addr),
             peer_phase: PeerConnectionPhase::Connecting,
             failed_host_candidates: BTreeSet::new(),
+            peer_outbound: VecDeque::new(),
             next_command_seq: CommandSeq(1),
             active_snapshot_rx: None,
             pending_snapshot_install: None,
@@ -446,27 +455,27 @@ impl LockstepNode {
         match self.role {
             PlayerRole::Host => {
                 let id = self.local_player_id.ok_or(SessionError::UnassignedPlayer)?;
-                self.enqueue_host_command(id, command);
+                if !self.enqueue_host_command(id, command) {
+                    return Err(
+                        TransportError::Backpressure(format!("host queue full for {id}")).into(),
+                    );
+                }
                 Ok(())
             }
             PlayerRole::Peer => {
                 if self.local_player_id.is_none() {
                     return Err(SessionError::UnassignedPlayer);
                 }
-                let Some(host_addr) = self.host_addr.clone() else {
-                    return Err(SessionError::NotPeer);
-                };
                 let seq = self.next_command_seq;
                 self.next_command_seq = seq.next();
-                transport.send(
-                    &host_addr,
+                self.enqueue_peer_to_host(
+                    transport,
                     WireMessage::SubmitCommand {
                         epoch: self.session.epoch,
                         seq,
                         command,
                     },
-                )?;
-                Ok(())
+                )
             }
         }
     }
@@ -505,17 +514,17 @@ impl LockstepNode {
         self.snapshot_retry_count = 0;
         self.primed = false;
 
-        if let Some(host_addr) = self.host_addr.clone() {
-            let _ = transport.send(
-                &host_addr,
-                WireMessage::SnapshotAck {
-                    epoch: self.session.epoch,
-                    snapshot_id,
-                    received_chunks: pending.total_chunks,
-                    complete: true,
-                },
-            );
-        }
+        // Queue completion ACK onto the peer's ordered retry pipeline so
+        // transient backpressure can never drop it and strand the host in Syncing.
+        let _ = self.enqueue_peer_to_host(
+            transport,
+            WireMessage::SnapshotAck {
+                epoch: self.session.epoch,
+                snapshot_id,
+                received_chunks: pending.total_chunks,
+                complete: true,
+            },
+        );
         Ok(())
     }
 
@@ -584,6 +593,8 @@ impl LockstepNode {
         if self.role == PlayerRole::Host {
             self.pump_snapshot_txs(transport);
             self.flush_all_peer_outbound(transport);
+        } else {
+            self.flush_peer_to_host(transport);
         }
     }
 
@@ -649,19 +660,32 @@ impl LockstepNode {
         let mut seq = 0u32;
         let max_batch_bytes = MAX_WIRE_FRAME_BYTES.saturating_sub(BATCH_FRAME_HEADROOM);
 
-        // 1. Host system membership/failover commands first, in FIFO order.
+        // 1. Host system membership/failover commands first, in FIFO order,
+        //    also budgeted against `max_batch_bytes` so a batch can never exceed
+        //    the wire frame limit even under simultaneous tick-0 joins.
         let host_id = self.session.host_id;
         let mut stamped_joins: Vec<PlayerId> = Vec::new();
         while let Some(cmd) = self.host_system_commands.pop_front() {
-            if let Command::PlayerJoined { player_id, .. } = &cmd {
-                stamped_joins.push(*player_id);
-            }
+            let join_pid = match &cmd {
+                Command::PlayerJoined { player_id, .. } => Some(*player_id),
+                _ => None,
+            };
             batch.commands.push(StampedCommand {
                 tick,
                 sequence: seq,
                 issuer: host_id,
                 command: cmd,
             });
+            let encoded_ok = encode_payload(&WireMessage::TickBatch(batch.clone()))
+                .is_ok_and(|bytes| bytes.len() <= max_batch_bytes);
+            if !encoded_ok && batch.commands.len() > 1 {
+                let popped = batch.commands.pop().expect("just pushed");
+                self.host_system_commands.push_front(popped.command);
+                break;
+            }
+            if let Some(pid) = join_pid {
+                stamped_joins.push(pid);
+            }
             seq = seq.saturating_add(1);
         }
 
@@ -840,13 +864,10 @@ impl LockstepNode {
             }
         }
 
-        if self.role == PlayerRole::Peer
-            && self.peer_phase == PeerConnectionPhase::Joined
-            && let Some(host_addr) = self.host_addr.clone()
-        {
+        if self.role == PlayerRole::Peer && self.peer_phase == PeerConnectionPhase::Joined {
             let ack_fp = if is_fp_tick { fingerprint } else { None };
-            transport.send(
-                &host_addr,
+            self.enqueue_peer_to_host(
+                transport,
                 WireMessage::TickAck {
                     epoch: self.session.epoch,
                     tick,
@@ -1189,7 +1210,7 @@ impl LockstepNode {
             );
             return;
         }
-        if player_name.trim().is_empty() {
+        if player_name.trim().is_empty() || player_name.len() > MAX_PLAYER_NAME_BYTES {
             let _ = transport.send(
                 &from,
                 WireMessage::Reject {
@@ -1198,9 +1219,9 @@ impl LockstepNode {
             );
             return;
         }
-        // Bind `endpoint_hint` to the cryptographically authenticated sender.
+        // Bind `endpoint_hint` to the cryptographically authenticated sender and cap its size.
         if let Some(hint) = endpoint_hint.as_deref()
-            && !peer_matches_hint(&from, hint)
+            && (hint.len() > MAX_ENDPOINT_HINT_BYTES || !peer_matches_hint(&from, hint))
         {
             let _ = transport.send(
                 &from,
@@ -1322,7 +1343,7 @@ impl LockstepNode {
         host_id: PlayerId,
         config: SessionConfig,
         _current_tick: Tick,
-        mut session_state: SessionState,
+        session_state: SessionState,
         snapshot_id: Option<SnapshotId>,
     ) {
         if self.role != PlayerRole::Peer || self.peer_phase != PeerConnectionPhase::Connecting {
@@ -1342,13 +1363,9 @@ impl LockstepNode {
                 .push_back(NodeEvent::JoinRejected(RejectReason::InvalidConfig));
             return;
         }
-        // Bind host's authenticated transport identity in local session copy if absent.
-        if let Some(host_player) = session_state.players.get_mut(&host_id)
-            && host_player.transport_addr.is_none()
-        {
-            host_player.transport_addr = Some(from.0.clone());
-        }
 
+        // Keep authenticated host address in `self.host_addr` WITHOUT mutating
+        // `session_state.players` so peer and host `SessionState` fingerprints stay identical.
         self.host_addr = Some(from);
         self.local_player_id = Some(assigned_player);
         self.target_buffer_delay = config.tick_delay;
@@ -1395,23 +1412,12 @@ impl LockstepNode {
             return;
         }
         let player_id = track.player_id;
-        let max_queued = self
-            .session
-            .config
-            .max_commands_per_peer_per_tick
-            .saturating_mul(4)
-            .max(32);
-        let current_queued = self
-            .host_peer_queued_counts
-            .get(&player_id)
-            .copied()
-            .unwrap_or(0);
-        if current_queued >= max_queued {
-            // Bounded ingress cap: drop excess commands without growing memory.
+        if !self.enqueue_host_command(player_id, command) {
             return;
         }
-        track.last_command_seq = Some(seq);
-        self.enqueue_host_command(player_id, command);
+        if let Some(track) = self.host_peers_by_addr.get_mut(&from) {
+            track.last_command_seq = Some(seq);
+        }
     }
 
     fn on_tick_batch<T: Transport>(
@@ -1448,8 +1454,8 @@ impl LockstepNode {
             }
             if !self.resync_requested {
                 self.resync_requested = true;
-                let _ = transport.send(
-                    &from,
+                let _ = self.enqueue_peer_to_host(
+                    transport,
                     WireMessage::RequestSnapshot {
                         epoch: self.session.epoch,
                         reason: ResyncReason::DriftDetected,
@@ -1460,12 +1466,7 @@ impl LockstepNode {
         }
 
         if batch.tick > self.session.current_tick {
-            let max_buffered = self
-                .session
-                .config
-                .retained_batch_history
-                .max(64)
-                .saturating_mul(2);
+            let max_buffered = self.session.config.max_buffered_batches();
             if self.pending_batches.len() >= max_buffered
                 && !self.pending_batches.contains_key(&batch.tick)
             {
@@ -1536,17 +1537,15 @@ impl LockstepNode {
         let Some(track) = self.host_peers_by_addr.get(&from) else {
             return;
         };
-        // Allow retry if the previous snapshot finished streaming (no active tx/pending req),
-        // while avoiding duplicate concurrent requests while one is still queued/streaming.
-        let sid_in_flight = match track.status {
-            PeerStatus::Syncing { snapshot_id, .. } => {
-                self.pending_snapshots.contains_key(&snapshot_id)
-                    || self.active_snapshot_txs.contains_key(&snapshot_id)
+        // Deduplicate if an unanswered SnapshotNeeded request is already pending
+        // for this peer; if an earlier transfer is actively streaming chunks
+        // (e.g. peer overflowed or dropped its receiver), cancel the stale stream
+        // and queue a fresh snapshot request!
+        if let PeerStatus::Syncing { snapshot_id, .. } = track.status {
+            if self.pending_snapshots.contains_key(&snapshot_id) {
+                return;
             }
-            PeerStatus::Ready => false,
-        };
-        if sid_in_flight {
-            return;
+            self.active_snapshot_txs.remove(&snapshot_id);
         }
         let player_id = track.player_id;
         self.queue_host_resync(from, player_id, reason);
@@ -1645,6 +1644,17 @@ impl LockstepNode {
         let total_chunks = rx.header().total_chunks;
         match rx.finish_envelope() {
             Ok(completed) => {
+                if let Err(cfg_err) = completed.envelope.session.config.validate() {
+                    self.awaiting_snapshot_id = None;
+                    self.events.push_back(NodeEvent::SnapshotFailed {
+                        snapshot_id: sid,
+                        error: SnapshotError::Envelope(crate::error::ProtocolError::Decode(
+                            cfg_err.to_string(),
+                        )),
+                    });
+                    self.retry_or_abort_snapshot(transport, "invalid session config in snapshot");
+                    return;
+                }
                 let at_tick = completed.at_tick;
                 let state_fingerprint = completed.state_fingerprint;
                 // Keep peer syncing until caller installs `redb_bytes` and calls
@@ -1688,16 +1698,14 @@ impl LockstepNode {
             });
             return;
         }
-        if let Some(host_addr) = self.host_addr.clone() {
-            let _ = transport.send(
-                &host_addr,
-                WireMessage::RequestSnapshot {
-                    epoch: self.session.epoch,
-                    reason: ResyncReason::DriftDetected,
-                    last_known_tick: self.session.current_tick,
-                },
-            );
-        }
+        let _ = self.enqueue_peer_to_host(
+            transport,
+            WireMessage::RequestSnapshot {
+                epoch: self.session.epoch,
+                reason: ResyncReason::DriftDetected,
+                last_known_tick: self.session.current_tick,
+            },
+        );
     }
 
     fn on_snapshot_ack(
@@ -1738,9 +1746,65 @@ impl LockstepNode {
         resume_fingerprint: Option<StateFingerprint>,
         new_host_session: SessionState,
     ) {
-        if self.role != PlayerRole::Peer {
+        if new_host_session.config.validate().is_err() {
             return;
         }
+        // Split-brain resolution: if we promoted to Host during an asymmetric
+        // partition, a strictly higher epoch OR an equal epoch with a lower
+        // authenticated `PlayerId` deterministically wins; demote cleanly back
+        // to Peer and resync via snapshot!
+        if self.role == PlayerRole::Host {
+            let higher_authority = new_epoch > self.session.epoch
+                || (new_epoch == self.session.epoch && new_host < self.session.host_id);
+            if !higher_authority {
+                return;
+            }
+            let sender_authenticated = new_host_session
+                .players
+                .get(&new_host)
+                .is_some_and(|p| peer_matches_player(&from, p))
+                && self
+                    .session
+                    .players
+                    .get(&new_host)
+                    .is_none_or(|p| peer_matches_player(&from, p));
+            if !sender_authenticated {
+                return;
+            }
+            self.role = PlayerRole::Peer;
+            self.host_peers_by_addr.clear();
+            self.host_pending_commands.clear();
+            self.host_peer_queued_counts.clear();
+            self.host_system_commands.clear();
+            self.pending_snapshots.clear();
+            self.active_snapshot_txs.clear();
+            self.host_addr = Some(from);
+            self.peer_phase = PeerConnectionPhase::Joined;
+            self.failed_host_candidates.clear();
+            self.peer_outbound.clear();
+            self.pending_batches.clear();
+            self.session.epoch = new_epoch;
+            self.session.host_id = new_host;
+            self.awaiting_snapshot_id = None;
+            self.active_snapshot_rx = None;
+            self.pending_snapshot_install = None;
+            self.resync_requested = true;
+            self.snapshot_retry_count = 0;
+            let _ = self.enqueue_peer_to_host(
+                transport,
+                WireMessage::RequestSnapshot {
+                    epoch: new_epoch,
+                    reason: ResyncReason::HostFailover,
+                    last_known_tick: self.session.current_tick,
+                },
+            );
+            self.events.push_back(NodeEvent::HostChanged {
+                new_host,
+                new_epoch,
+            });
+            return;
+        }
+
         // Only accept failover from the deterministically expected host and epoch,
         // AND verify the authenticated transport identity of `new_host`.
         let expected_next_host = match self.peer_phase {
@@ -1780,9 +1844,10 @@ impl LockstepNode {
         }
 
         let old_host = self.session.host_id;
-        self.host_addr = Some(from.clone());
+        self.host_addr = Some(from);
         self.peer_phase = PeerConnectionPhase::Joined;
         self.failed_host_candidates.clear();
+        self.peer_outbound.clear();
         // Discard any stale old-epoch batches.
         self.pending_batches.retain(|_, b| b.epoch >= new_epoch);
 
@@ -1803,8 +1868,8 @@ impl LockstepNode {
 
         if session_matches && world_fp_matches {
             self.session = candidate_session;
-            let _ = transport.send(
-                &from,
+            let _ = self.enqueue_peer_to_host(
+                transport,
                 WireMessage::TickAck {
                     epoch: new_epoch,
                     tick: self.session.current_tick,
@@ -1823,8 +1888,8 @@ impl LockstepNode {
             self.pending_snapshot_install = None;
             self.resync_requested = true;
             self.snapshot_retry_count = 0;
-            let _ = transport.send(
-                &from,
+            let _ = self.enqueue_peer_to_host(
+                transport,
                 WireMessage::RequestSnapshot {
                     epoch: new_epoch,
                     reason: ResyncReason::HostFailover,
@@ -2260,10 +2325,62 @@ impl LockstepNode {
         });
     }
 
-    fn enqueue_host_command(&mut self, player_id: PlayerId, command: Command) {
-        let count = self.host_peer_queued_counts.entry(player_id).or_insert(0);
-        *count = count.saturating_add(1);
+    fn enqueue_peer_to_host<T: Transport>(
+        &mut self,
+        transport: &mut T,
+        msg: WireMessage,
+    ) -> Result<(), SessionError> {
+        let Some(host_addr) = self.host_addr.clone() else {
+            return Err(SessionError::NotPeer);
+        };
+        if self.peer_outbound.len() >= MAX_PEER_OUTBOUND_QUEUE {
+            return Err(TransportError::Backpressure(host_addr.0).into());
+        }
+        self.peer_outbound.push_back(msg);
+        self.flush_peer_to_host(transport);
+        Ok(())
+    }
+
+    fn flush_peer_to_host<T: Transport>(&mut self, transport: &mut T) {
+        let Some(host_addr) = self.host_addr.clone() else {
+            return;
+        };
+        while let Some(msg) = self.peer_outbound.pop_front() {
+            match transport.send(&host_addr, msg.clone()) {
+                Ok(()) => {}
+                Err(TransportError::Backpressure(_)) => {
+                    self.peer_outbound.push_front(msg);
+                    break;
+                }
+                Err(_) => {
+                    // Preserve un-sent message only if still connected; otherwise clear.
+                    if transport.connected_peers().contains(&host_addr) {
+                        self.peer_outbound.push_front(msg);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn enqueue_host_command(&mut self, player_id: PlayerId, command: Command) -> bool {
+        let max_queued = self
+            .session
+            .config
+            .max_commands_per_peer_per_tick
+            .saturating_mul(4)
+            .max(32);
+        let current = self
+            .host_peer_queued_counts
+            .get(&player_id)
+            .copied()
+            .unwrap_or(0);
+        if current >= max_queued {
+            return false;
+        }
+        self.host_peer_queued_counts.insert(player_id, current + 1);
         self.host_pending_commands.push_back((player_id, command));
+        true
     }
 
     fn allocate_provisional_player_id(&mut self) -> PlayerId {

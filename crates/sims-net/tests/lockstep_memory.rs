@@ -1613,3 +1613,96 @@ fn join_capacity_ghost_prevention_dialog_receipt_order_and_failover_fallback() {
     );
     assert_eq!(b.role(), PlayerRole::Host);
 }
+
+#[test]
+fn round2_host_without_hint_delay_cap_split_brain_and_peer_ack_backpressure() {
+    // 1. Host without endpoint_hint produces identical SessionState fingerprint on joiner.
+    let mesh = MemoryMesh::new(1111);
+    let manifest = sample_manifest(b"nohint-v1");
+    let host_addr = PeerAddress::new("mem:host");
+    let mut host_t = mesh.add_node("mem:host");
+    let mut peer_t = mesh.add_node("mem:peer");
+    peer_t.connect(&host_addr).unwrap();
+    let mut host = LockstepNode::new_host("Host", None, manifest, SessionConfig::default());
+    let mut peer = LockstepNode::new_peer("Peer", None, manifest, host_addr.clone());
+    for _ in 0..4 {
+        peer.poll(&mut peer_t);
+        host.poll(&mut host_t);
+        mesh.step();
+    }
+    assert_eq!(
+        host.session().session_fingerprint(),
+        peer.session().session_fingerprint()
+    );
+
+    // 2. SessionConfig rejects tick_delay exceeding peer receive buffer capacity.
+    let too_deep = SessionConfig {
+        tick_delay: 129,
+        max_tick_delay: 129,
+        max_ticks_ahead_of_slowest: 129,
+        retained_batch_history: 64,
+        ..SessionConfig::default()
+    };
+    assert!(too_deep.validate().is_err());
+    assert!(too_deep.sanitized().validate().is_ok());
+
+    // 3. Split-brain resolution: if P2 and P3 both promote to Host in Epoch(2),
+    //    P3 deterministically demotes to Peer when P2's HostTakeover arrives!
+    let mesh_sb = MemoryMesh::new(2222);
+    let mut p2_t = mesh_sb.add_node("mem:p2");
+    let mut p3_t = mesh_sb.add_node("mem:p3");
+    let p2_addr = PeerAddress::new("mem:p2");
+    let p3_addr = PeerAddress::new("mem:p3");
+    p2_t.connect(&p3_addr).unwrap();
+
+    // Construct two hosts in Epoch 2 (simulating asymmetric failover split-brain).
+    let mut h_p2 = LockstepNode::new_host(
+        "P2",
+        Some("mem:p2".to_string()),
+        manifest,
+        SessionConfig::default(),
+    );
+    let mut h_p3 = LockstepNode::new_host(
+        "P3",
+        Some("mem:p3".to_string()),
+        manifest,
+        SessionConfig::default(),
+    );
+    h_p2.session_mut().epoch = Epoch(2);
+    h_p2.session_mut().host_id = PlayerId(2);
+    h_p2.session_mut().players.clear();
+    h_p2.session_mut().players.insert(
+        PlayerId(2),
+        sims_net::PerPlayerState {
+            player_id: PlayerId(2),
+            name: "P2".to_string(),
+            role: PlayerRole::Host,
+            mode: PlayerMode::Live,
+            selected_sim: None,
+            camera_rotation: CameraRotation::NORTH,
+            endpoint_hint: Some("mem:p2".to_string()),
+            transport_addr: Some("mem:p2".to_string()),
+        },
+    );
+    h_p3.session_mut().epoch = Epoch(2);
+    h_p3.session_mut().host_id = PlayerId(3);
+
+    p2_t.send(
+        &p3_addr,
+        WireMessage::HostTakeover {
+            new_epoch: Epoch(2),
+            new_host: PlayerId(2),
+            resume_tick: Tick::ZERO,
+            resume_fingerprint: None,
+            session_state: Box::new(h_p2.session().clone()),
+            roster: Vec::new(),
+        },
+    )
+    .unwrap();
+    mesh_sb.step();
+    h_p3.poll(&mut p3_t);
+    assert_eq!(h_p3.role(), PlayerRole::Peer);
+    assert_eq!(h_p3.session().host_id, PlayerId(2));
+    assert!(h_p3.is_syncing());
+    let _ = p2_addr;
+}
