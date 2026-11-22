@@ -1,7 +1,8 @@
 use sims_audio::Pcm;
 use sims_audio::levels::BASE_RATE;
 use sims_audio::voices::{
-    VoiceAgeGender, VoiceCatalog, VoicePitch, VoiceQuery, VoiceStream, resample_pitched,
+    MAX_OUTPUT_RATE, VoiceAgeGender, VoiceCatalog, VoicePitch, VoiceQuery, VoiceStream,
+    resample_pitched,
 };
 use std::path::PathBuf;
 
@@ -42,6 +43,11 @@ fn voice_pitch_semitones_and_resample_behave_deterministically() {
     // Octave down doubles duration (plays half as fast).
     let slower = resample_pitched(&pcm, octave_down, BASE_RATE);
     assert_eq!(slower.frames(), pcm.frames() * 2);
+
+    // Extreme output_rate clamps to MAX_OUTPUT_RATE instead of attempting GiB allocation.
+    let bounded = resample_pitched(&pcm, VoicePitch::NATIVE, u32::MAX);
+    assert_eq!(bounded.rate, MAX_OUTPUT_RATE);
+    assert!(bounded.samples.len() <= 25_000);
 }
 
 #[test]
@@ -181,4 +187,15 @@ fn complete_collection_voice_catalog_indexes_and_decodes_all_voice_banks() {
         !laugh_clips.is_empty(),
         "expected AdultFemale laugh clips in SoundData"
     );
+
+    // Magic Town dragon NPC clips stay in the NPC bucket (not pet Cat/Dog buckets).
+    for dragon_path in [
+        "ExpansionPack7\\Sound\\npc\\dragon_cat_vox1.XA",
+        "ExpansionPack7\\Sound\\npc\\dragon_dog_vox1.XA",
+    ] {
+        let clip = catalog
+            .resolve_path(dragon_path)
+            .unwrap_or_else(|| panic!("expected {dragon_path} in catalog"));
+        assert_eq!(clip.voice, VoiceAgeGender::Npc);
+    }
 }

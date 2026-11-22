@@ -203,16 +203,40 @@ fn travel_confirm_dialog_enforces_fares_and_handles_taxi_shuttle_magic_hole() {
         })
     );
 
-    // Empty traveler list blocks confirmation even if fare is 0.
+    // Empty or whitespace-only traveler list blocks confirmation even if fare is 0.
     let empty_shuttle = TravelDialogState::for_destination(Destination::StudioTown, Vec::new());
     assert!(!empty_shuttle.can_confirm());
+    let blank_shuttle =
+        TravelDialogState::for_destination(Destination::StudioTown, vec!["   ".into()]);
+    assert!(!blank_shuttle.can_confirm());
 
-    // Drawing dialog with fallback art does not panic at compact size.
+    // Negative fares still draw cleanly at tiny viewports (120x100) without panicking.
+    let mut neg_fare =
+        TravelDialogState::for_destination(Destination::MagicTown, vec!["Sim".into()]);
+    neg_fare.fare_simoleons = -50;
+    assert!(neg_fare.can_confirm());
+
     let art = Art::default();
     let strings = TravelStrings::default();
-    let mut frame = Frame::new(320, 240, [0, 0, 0]);
-    let compact_layout = dialog.draw(&mut frame, &hole, &art, &strings);
-    assert!(compact_layout.panel_rect.width > 0);
+    for (w, h) in [(320u32, 240u32), (120, 100)] {
+        let mut frame = Frame::new(w, h, [0, 0, 0]);
+        let compact_layout = dialog.draw(&mut frame, &neg_fare, &art, &strings);
+        assert!(compact_layout.panel_rect.width > 0);
+    }
+
+    // Releasing pointer outside any control clears hovered state so no stale tooltip lingers.
+    let bar_state = TravelState::default();
+    let bar_layout = TravelLayout::compute(800, 600, &bar_state);
+    let mut chrome = TravelChrome::new();
+    let home = bar_layout
+        .controls
+        .iter()
+        .find(|c| c.control == TravelControl::ReturnHome)
+        .expect("ReturnHome");
+    chrome.pointer_move(home.rect.x + 2, home.rect.y + 2, &bar_layout);
+    assert_eq!(chrome.hovered(), Some(TravelControl::ReturnHome));
+    assert_eq!(chrome.pointer_up(799, 599, &bar_layout, &bar_state), None);
+    assert_eq!(chrome.hovered(), None);
 }
 
 #[test]
@@ -269,5 +293,20 @@ fn complete_collection_loads_travel_art_and_localized_tooltips() {
                 TravelControl::ToggleFilter(LotFilter::Music)
             )
             .is_some()
+    );
+    assert_ne!(
+        strings.tooltip(Destination::Downtown, TravelControl::Bulldoze),
+        strings.downtown_tips.get(1).map(String::as_str),
+        "Bulldoze tooltip must map to STR# entry 4, not entry 1"
+    );
+    assert_ne!(
+        strings.tooltip(
+            Destination::VacationIsland,
+            TravelControl::ToggleFilter(LotFilter::Lodging)
+        ),
+        strings.tooltip(
+            Destination::VacationIsland,
+            TravelControl::ToggleFilter(LotFilter::DogCat)
+        )
     );
 }

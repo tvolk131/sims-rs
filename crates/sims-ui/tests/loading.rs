@@ -185,6 +185,24 @@ fn draw_animates_progress_bar_across_progress_and_time() {
 }
 
 #[test]
+fn compact_draw_survives_truncated_host_image_without_panicking() {
+    let mut art = Art::default();
+    art.insert(
+        art_id::STARTUP_SPLASH,
+        Image {
+            width: 800,
+            height: 600,
+            rgba: vec![255, 0, 0, 255], // Intentionally truncated.
+        },
+    );
+    let screen = LoadingScreen::new();
+    let state = LoadingState::default();
+    let mut frame = Frame::new(320, 240, [0, 0, 0]);
+    let layout = screen.draw(&mut frame, &state, &art, &LoadingStrings::default());
+    assert!(layout.compact);
+}
+
+#[test]
 fn complete_collection_loads_splash_art_and_localized_captions() {
     let Some(root) = sims_install() else {
         return;

@@ -164,8 +164,11 @@ pub const RESOURCES: [i32; 39] = [
 /// Native top control bar dimensions (`800×52`).
 pub const NATIVE_WIDTH: i32 = 800;
 pub const BAR_HEIGHT: i32 = 52;
-/// Secondary filter / legend strip height below the top bar.
-pub const FILTER_STRIP_HEIGHT: i32 = 34;
+/// Secondary filter / legend strip height below the top bar (accommodates 52 px
+/// native filter button strips on >= 800 px viewports).
+pub const FILTER_STRIP_HEIGHT: i32 = 56;
+/// Compact filter strip height on viewports narrower than 800 px.
+pub const COMPACT_FILTER_STRIP_HEIGHT: i32 = 30;
 
 /// Loads all travel chrome bitmaps and UI fonts from `ui`.
 pub fn load_art(ui: &UiGraphics, language: u8) -> Result<Art> {
@@ -356,13 +359,13 @@ impl LotFilter {
     /// 0-based index into `UIText.iff STR# 171` (`Filter Bar`).
     pub const fn tooltip_index(self) -> usize {
         match self {
-            Self::Lodging => 0,
-            Self::Food => 1,
-            Self::Gardening => 2,
-            Self::Shopping => 3,
-            Self::DogCat => 4,
-            Self::SmallAnimal => 5,
-            Self::Recreation => 6,
+            Self::DogCat => 0,
+            Self::SmallAnimal => 1,
+            Self::Shopping => 2,
+            Self::Gardening => 3,
+            Self::Food => 4,
+            Self::Recreation => 5,
+            Self::Lodging => 6,
             Self::Spa => 7,
             Self::Movie => 8,
             Self::Model => 9,
@@ -557,8 +560,8 @@ impl TravelStrings {
         };
         match control {
             TravelControl::ReturnHome => screen_tips.first().map(String::as_str),
-            TravelControl::Bulldoze => screen_tips.get(1).map(String::as_str),
             TravelControl::ImportLot => screen_tips.get(3).map(String::as_str),
+            TravelControl::Bulldoze => screen_tips.get(4).map(String::as_str),
             TravelControl::ToggleFilter(f) => {
                 self.filter_tips.get(f.tooltip_index()).map(String::as_str)
             }
@@ -600,7 +603,12 @@ impl TravelLayout {
         let bar_h = BAR_HEIGHT.min(h);
         let bar_rect = Rect::new(bar_x, 0, bar_w, bar_h);
 
-        let strip_h = FILTER_STRIP_HEIGHT.min((h - bar_h).max(0));
+        let desired_strip_h = if compact {
+            COMPACT_FILTER_STRIP_HEIGHT
+        } else {
+            FILTER_STRIP_HEIGHT
+        };
+        let strip_h = desired_strip_h.min((h - bar_h).max(0));
         let filter_strip_rect = Rect::new(bar_x, bar_h, bar_w, strip_h);
 
         let mut controls = Vec::new();
@@ -694,7 +702,11 @@ impl TravelLayout {
                 let max_chip_w = if compact { 58 } else { 76 };
                 let chip_w = (((avail_w - chip_gap * (total_chips - 1)).max(0)) / total_chips)
                     .min(max_chip_w);
-                let chip_h = (strip_h - 8).max(10);
+                let chip_h = if compact {
+                    (strip_h - 6).max(10)
+                } else {
+                    (strip_h - 4).max(10)
+                };
                 let chip_y = filter_strip_rect.y + (strip_h - chip_h) / 2;
                 let mut cursor_x = bar_x + strip_pad;
 
@@ -791,8 +803,10 @@ impl TravelChrome {
         state: &TravelState,
     ) -> Option<TravelCommand> {
         self.pointer = [x, y];
+        let hit = layout.hit(x, y);
+        self.hovered = hit.map(|c| c.control);
         let pressed = self.pressed.take()?;
-        let hit = layout.hit(x, y)?;
+        let hit = hit?;
         if !hit.enabled || hit.control != pressed {
             return None;
         }
@@ -858,6 +872,24 @@ impl TravelChrome {
         // Secondary filter & legend strip.
         if layout.filter_strip_rect.height > 0 {
             fill_alpha(frame, layout.filter_strip_rect, STRIP_BG, 225);
+            if !layout.compact {
+                let toolbar_id = if state.destination == Destination::StudioTown {
+                    art_id::FILTER_TOOLBAR_ST
+                } else {
+                    art_id::FILTER_TOOLBAR
+                };
+                if let Some(toolbar) = art.image(toolbar_id) {
+                    let ty = layout.filter_strip_rect.y
+                        + (layout.filter_strip_rect.height - toolbar.height as i32) / 2;
+                    frame.draw_all(
+                        toolbar,
+                        [
+                            layout.filter_strip_rect.x,
+                            ty.max(layout.filter_strip_rect.y),
+                        ],
+                    );
+                }
+            }
             draw_border(frame, layout.filter_strip_rect, STRIP_BORDER);
         }
 
@@ -1061,9 +1093,9 @@ impl TravelDialogState {
         }
     }
 
-    /// Whether the household can afford the trip and has at least one traveler.
+    /// Whether the household can afford the trip and has at least one non-blank traveler.
     pub fn can_confirm(&self) -> bool {
-        !self.travelers.is_empty()
+        self.travelers.iter().any(|t| !t.trim().is_empty())
             && self.household_simoleons >= self.fare_simoleons.max(0)
             && self.household_magic_coins >= self.fare_magic_coins.max(0)
     }
@@ -1205,8 +1237,7 @@ impl TravelDialog {
                 Destination::VacationIsland => {
                     strings.go_vacation_dialog.first().map(String::as_str)
                 }
-                Destination::MagicTown => strings.visit_magic_town.first().map(String::as_str),
-                Destination::StudioTown => strings.visit_neighborhood.first().map(String::as_str),
+                Destination::StudioTown | Destination::MagicTown => None,
             })
             .unwrap_or_else(|| state.destination.short_label());
 
@@ -1220,47 +1251,58 @@ impl TravelDialog {
             draw_centered_text(frame, f, title_rect, title, TEXT_GOLD);
         }
 
-        // Transport icon.
+        // Transport icon fitted cleanly inside `layout.icon_rect` (aspect-preserving).
         let icon_id = state.transport.icon_art_id(state.destination);
         if let Some(icon) = art.image(icon_id) {
-            let ix = layout.icon_rect.x + (layout.icon_rect.width - icon.width as i32) / 2;
-            let iy = layout.icon_rect.y + (layout.icon_rect.height - icon.height as i32) / 2;
-            frame.draw_all(
-                icon,
-                [ix.max(layout.panel_rect.x), iy.max(layout.panel_rect.y)],
-            );
+            draw_fitted_image(frame, icon, layout.icon_rect);
         } else {
             frame.fill(layout.icon_rect, CHIP_BG);
             draw_border(frame, layout.icon_rect, DIALOG_BORDER);
         }
 
-        // Summary text (transport, traveler count, fare).
+        // Summary text (transport, traveler count, fare), clipped above buttons.
         if let Some(f) = pick_font(art, 9) {
             let text_x = layout.icon_rect.x + layout.icon_rect.width + 12;
             let text_w = (layout.panel_rect.x + layout.panel_rect.width - 12 - text_x).max(0);
-            if text_w > 20 {
+            let max_y =
+                (layout.confirm_rect.y - 4).min(layout.panel_rect.y + layout.panel_rect.height - 4);
+            if text_w > 20 && f.line_height > 0 {
+                let valid_travelers = state
+                    .travelers
+                    .iter()
+                    .filter(|t| !t.trim().is_empty())
+                    .count();
+                let fare_sim = state.fare_simoleons.max(0);
+                let fare_mc = state.fare_magic_coins.max(0);
                 let line1 = format!(
                     "{} -> {}",
                     state.transport.label(),
                     state.destination.short_label()
                 );
-                let line2 = format!("Travelers: {}", state.travelers.len());
-                let line3 = if state.fare_magic_coins > 0 {
-                    format!(
-                        "Fare: ${} / MC {}",
-                        state.fare_simoleons, state.fare_magic_coins
-                    )
+                let line2 = format!("Travelers: {valid_travelers}");
+                let line3 = if fare_mc > 0 {
+                    format!("Fare: ${fare_sim} / MC {fare_mc}")
                 } else {
-                    format!("Fare: ${}", state.fare_simoleons)
+                    format!("Fare: ${fare_sim}")
                 };
-                f.draw(frame, &line1, [text_x, layout.icon_rect.y], TEXT_LIGHT);
-                f.draw(frame, &line2, [text_x, layout.icon_rect.y + 16], TEXT_LIGHT);
                 let fare_color = if state.can_confirm() {
                     TEXT_GOLD
                 } else {
                     [255, 128, 128]
                 };
-                f.draw(frame, &line3, [text_x, layout.icon_rect.y + 32], fare_color);
+                let lines = [
+                    (line1, TEXT_LIGHT),
+                    (line2, TEXT_LIGHT),
+                    (line3, fare_color),
+                ];
+                let step = (f.line_height + 2).max(12);
+                for (i, (text, color)) in lines.into_iter().enumerate() {
+                    let ly = layout.icon_rect.y + i as i32 * step;
+                    if ly + f.line_height <= max_y {
+                        let clipped = clip_text_to_width(f, &text, text_w);
+                        f.draw(frame, &clipped, [text_x, ly], color);
+                    }
+                }
             }
         }
 
@@ -1331,15 +1373,52 @@ fn fill_alpha(frame: &mut Frame, rect: Rect, color: [u8; 3], alpha: u8) {
     }
 }
 
+fn clip_text_to_width(font: &Font, text: &str, max_w: i32) -> String {
+    let mut fitted = text.to_owned();
+    while !fitted.is_empty() && font.width(&fitted) > max_w {
+        fitted.pop();
+    }
+    fitted
+}
+
+fn draw_fitted_image(frame: &mut Frame, img: &sims_formats::bitmap::Image, dst: Rect) {
+    if img.width == 0 || img.height == 0 || dst.width <= 0 || dst.height <= 0 {
+        return;
+    }
+    let scale_w = dst.width as f64 / img.width as f64;
+    let scale_h = dst.height as f64 / img.height as f64;
+    let scale = scale_w.min(scale_h).min(1.0);
+    let draw_w = ((img.width as f64 * scale).round() as i32).clamp(1, dst.width);
+    let draw_h = ((img.height as f64 * scale).round() as i32).clamp(1, dst.height);
+    let ox = dst.x + (dst.width - draw_w) / 2;
+    let oy = dst.y + (dst.height - draw_h) / 2;
+    let fw = frame.width() as i32;
+    let fh = frame.height() as i32;
+    let x0 = ox.max(0);
+    let y0 = oy.max(0);
+    let x1 = (ox + draw_w).min(fw);
+    let y1 = (oy + draw_h).min(fh);
+    for y in y0..y1 {
+        let sy = (((y - oy) as u64 * img.height as u64) / draw_h as u64).min(img.height as u64 - 1)
+            as u32;
+        for x in x0..x1 {
+            let sx = (((x - ox) as u64 * img.width as u64) / draw_w as u64)
+                .min(img.width as u64 - 1) as u32;
+            if let Some([r, g, b, a]) = img.pixel(sx, sy)
+                && a > 0
+            {
+                frame.blend(x, y, [r, g, b], a);
+            }
+        }
+    }
+}
+
 fn draw_centered_text(frame: &mut Frame, font: &Font, rect: Rect, text: &str, color: [u8; 3]) {
     let max_w = (rect.width - 4).max(0);
     if max_w == 0 {
         return;
     }
-    let mut fitted = text.to_owned();
-    while !fitted.is_empty() && font.width(&fitted) > max_w {
-        fitted.pop();
-    }
+    let fitted = clip_text_to_width(font, text, max_w);
     let tx = rect.x + (rect.width - font.width(&fitted)) / 2;
     let ty = rect.y + (rect.height - font.line_height) / 2;
     font.draw(frame, &fitted, [tx, ty], color);

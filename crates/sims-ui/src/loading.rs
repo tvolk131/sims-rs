@@ -658,19 +658,14 @@ fn draw_scaled_nearest(frame: &mut Frame, img: &sims_formats::bitmap::Image, dst
     let y1 = (dst.y + dst.height).min(fh);
     for y in y0..y1 {
         let sy = (((y - dst.y) as u64 * img.height as u64) / dst.height as u64)
-            .min(img.height as u64 - 1) as usize;
+            .min(img.height as u64 - 1) as u32;
         for x in x0..x1 {
             let sx = (((x - dst.x) as u64 * img.width as u64) / dst.width as u64)
-                .min(img.width as u64 - 1) as usize;
-            let idx = (sy * img.width as usize + sx) * 4;
-            let a = img.rgba[idx + 3];
-            if a > 0 {
-                frame.blend(
-                    x,
-                    y,
-                    [img.rgba[idx], img.rgba[idx + 1], img.rgba[idx + 2]],
-                    a,
-                );
+                .min(img.width as u64 - 1) as u32;
+            if let Some([r, g, b, a]) = img.pixel(sx, sy)
+                && a > 0
+            {
+                frame.blend(x, y, [r, g, b], a);
             }
         }
     }

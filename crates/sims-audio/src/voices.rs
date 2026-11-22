@@ -443,12 +443,17 @@ impl VoiceStream {
     }
 }
 
+/// Maximum output sample rate accepted by [`resample_pitched`] (192 kHz).
+pub const MAX_OUTPUT_RATE: u32 = 192_000;
+/// Maximum total interleaved samples allocated by [`resample_pitched`] (~32 MiB).
+pub const MAX_RESAMPLED_SAMPLES: usize = 16_000_000;
+
 /// Deterministically resamples `pcm` according to `pitch` (relative to
-/// [`BASE_RATE`]) and target `output_rate`.
+/// [`BASE_RATE`]) and target `output_rate` (clamped to `1..=MAX_OUTPUT_RATE`).
 pub fn resample_pitched(pcm: &Pcm, pitch: VoicePitch, output_rate: u32) -> Pcm {
     let ch = usize::from(pcm.channels);
     let in_frames = pcm.frames();
-    let target_rate = output_rate.max(1);
+    let target_rate = output_rate.clamp(1, MAX_OUTPUT_RATE);
     if ch == 0 || in_frames == 0 || pcm.rate == 0 {
         return Pcm {
             rate: target_rate,
@@ -466,8 +471,15 @@ pub fn resample_pitched(pcm: &Pcm, pitch: VoicePitch, output_rate: u32) -> Pcm {
         return pcm.clone();
     }
 
-    let out_frames = ((in_frames as f64) / step).ceil().max(1.0) as usize;
-    let mut samples = Vec::with_capacity(out_frames * ch);
+    let max_frames = MAX_RESAMPLED_SAMPLES / ch;
+    let raw_frames = ((in_frames as f64) / step).ceil();
+    let out_frames = if raw_frames.is_finite() && raw_frames >= 1.0 {
+        (raw_frames as usize).min(max_frames)
+    } else {
+        1.min(max_frames)
+    };
+    let total_samples = out_frames.saturating_mul(ch);
+    let mut samples = Vec::with_capacity(total_samples);
     for f in 0..out_frames {
         let pos = f as f64 * step;
         let i0 = (pos.floor() as usize).min(in_frames - 1);
@@ -566,21 +578,8 @@ fn extract_category(norm: &str, stem: &str) -> String {
 /// Classifies a voice clip into [`VoiceAgeGender`] using Complete Collection's
 /// directory and suffix conventions.
 fn classify_voice(norm: &str, category: &str, stem: &str) -> VoiceAgeGender {
-    // 1. Species & baby directories first (highest specificity).
-    if category == "voxdog" || stem.starts_with("voxdog") || stem.contains("_dog_") {
-        return VoiceAgeGender::Dog;
-    }
-    if category == "voxcat" || stem.starts_with("voxcat") || stem.contains("_cat_") {
-        return VoiceAgeGender::Cat;
-    }
-    if category == "baby" || stem.starts_with("baby_") {
-        // Note: `VOX_BABYTALKF1.XA` is an adult talking to a baby; check suffix first.
-        if stem.starts_with("baby_") {
-            return VoiceAgeGender::Baby;
-        }
-    }
-
-    // 2. Explicit NPC directories or known NPC filename prefixes.
+    // 1. Explicit NPC directories and known NPC prefixes first so Magic Town
+    //    `npc\dragon_cat_vox*` and `npc\dragon_dog_vox*` stay in the NPC bank.
     if category == "npc"
         || category == "ghost"
         || norm.contains("\\npc\\")
@@ -599,6 +598,18 @@ fn classify_voice(norm: &str, category: &str, stem: &str) -> VoiceAgeGender {
         || stem.contains("voxnm")
     {
         return VoiceAgeGender::Npc;
+    }
+
+    // 2. Pet species & baby directories.
+    if category == "voxdog" || stem.starts_with("voxdog") || stem.contains("_dog_") {
+        return VoiceAgeGender::Dog;
+    }
+    if category == "voxcat" || stem.starts_with("voxcat") || stem.contains("_cat_") {
+        return VoiceAgeGender::Cat;
+    }
+    if (category == "baby" || stem.starts_with("baby_")) && stem.starts_with("baby_") {
+        // Note: `VOX_BABYTALKF1.XA` is an adult talking to a baby; fall through to suffix check.
+        return VoiceAgeGender::Baby;
     }
 
     // 3. Standard Simlish voice suffix before trailing digits:
