@@ -211,6 +211,10 @@ pub struct Interpreter<'a> {
     /// Optional precomputed dense semi-global and duplicate-GUID index owned
     /// by [`crate::boot::Lot`].
     pub(crate) fast: Option<&'a ProgramFast>,
+    /// Buy Mode `move_objects` cheat override (`false` by default). Only
+    /// consulted by Buy Mode pickup/placement/delete operations (`crate::buy`);
+    /// normal simulation ticks never set this.
+    pub move_objects: bool,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -255,6 +259,7 @@ impl<'a> Interpreter<'a> {
             in_both_ways: false,
             global_lib: program.libraries.get(&program.global),
             fast: None,
+            move_objects: false,
         }
     }
 
@@ -633,6 +638,7 @@ impl<'a> Machine<'a, '_> {
             special_panels: self.special_panels,
             inline_special_panel: self.inline_special_panel,
             in_both_ways: self.in_both_ways,
+            move_objects: false,
             global_lib: self.global_lib,
             fast: self.fast,
         }

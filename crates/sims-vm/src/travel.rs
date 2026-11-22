@@ -3284,6 +3284,7 @@ fn boot_destination_for_edit(
             revision: origin_revision,
         }),
         coop: None,
+        move_objects: false,
     })
 }
 
@@ -4027,6 +4028,7 @@ fn boot_destination_lot(
         active_wall_cursor: None,
         neighborhood_origin: None,
         coop: None,
+        move_objects: false,
     };
     Ok((lot, traveler_records))
 }
@@ -4416,6 +4418,7 @@ fn reconcile_frozen_home_lot(
             revision: origin_revision,
         }),
         coop: None,
+        move_objects: false,
     };
 
     Ok((lot, returning_travelers))
@@ -5624,6 +5627,7 @@ mod tests {
         let stored = StoredNeighborhood {
             name: "Test".into(),
             families,
+            family_surnames: BTreeMap::new(),
             neighbors: Vec::new(),
             inventories: Vec::new(),
             data: [0; 16],

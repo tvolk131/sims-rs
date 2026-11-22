@@ -134,6 +134,7 @@ fn empty_stored_neighborhood(name: &str) -> StoredNeighborhood {
     StoredNeighborhood {
         name: name.into(),
         families,
+        family_surnames: BTreeMap::new(),
         neighbors: Vec::new(),
         inventories: Vec::new(),
         data: [0; 16],
@@ -916,6 +917,11 @@ fn end_to_end_create_family_move_in_500_ticks_save_and_delete_bin_family() {
 
     // Check Family Bin visibility and exported .FAM round-trip.
     let nh_after_create = store.load_neighborhood("UserData").unwrap().unwrap();
+    assert_eq!(
+        nh_after_create.family_surname(created.family_id),
+        Some("Alice"),
+        "CAF commit must persist household surname natively in StoredNeighborhood"
+    );
     assert!(
         nh_after_create
             .family_bin()
@@ -1004,6 +1010,15 @@ fn end_to_end_create_family_move_in_500_ticks_save_and_delete_bin_family() {
     let temp_guid = temp.members[0].guid;
     let deleted = delete_bin_family(&store, "UserData", temp.family_id).unwrap();
     assert_eq!(deleted.deleted_guids, vec![temp_guid]);
+    assert_eq!(
+        store
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .family_surname(temp.family_id),
+        None,
+        "delete_bin_family must clear the deleted household's persisted surname"
+    );
 
     let mut goth = enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
     assert!(
@@ -1069,6 +1084,15 @@ fn oracle_alice_fam_imports_and_boots_cleanly() {
     let mut rng = CrtRng::from_state(0xface_b00c);
     let imported = import_family_fam(&ctx, &store, "UserData", &fam_bytes, 1, &mut rng).unwrap();
     assert_eq!(imported.family_name, "Alice");
+    assert_eq!(
+        store
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .family_surname(imported.family_id),
+        Some("Alice"),
+        "import_family_fam must persist the imported household surname natively"
+    );
     assert_eq!(imported.family.budget, 20_000);
     assert_eq!(imported.members.len(), 1);
     assert_eq!(imported.members[0].first_name, "Alice");

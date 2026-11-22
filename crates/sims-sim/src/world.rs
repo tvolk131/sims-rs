@@ -573,6 +573,11 @@ pub struct World {
     #[doc(hidden)]
     #[serde(skip)]
     pub dirty_frames: CowBox<BTreeMap<u16, u64>>,
+    /// Per-family `FAMI` flags (`+0x138`, keyed by family ID) read by scope 24
+    /// fields 7 (`0x425c5e`, bit 0) and 8 (`0x425cb4`, bit 1). Kept out of
+    /// [`World::encode`] to preserve snapshot format 32.
+    #[serde(skip)]
+    pub family_flags: BTreeMap<i32, u32>,
 }
 
 /// One appearance attachment slot on `cTSPerson` (`0x583559`: suit name at
@@ -1027,6 +1032,7 @@ impl World {
             suit_scan_cache: None,
             types_by_guid: TypesByGuidCache(None),
             dirty_frames: CowBox::default(),
+            family_flags: BTreeMap::new(),
         }
     }
 

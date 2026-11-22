@@ -749,7 +749,11 @@ impl Lot {
             return Err(SaveError::OtherLoad);
         }
         validate_world_object_ids(&saved.world)?;
+        let prev_family_flags = std::mem::take(&mut self.world.family_flags);
         self.world = saved.world;
+        if self.world.family_flags.is_empty() {
+            self.world.family_flags = prev_family_flags;
+        }
         self.ticks = saved.ticks;
         self.start = saved.start;
         self.player = saved.answers;

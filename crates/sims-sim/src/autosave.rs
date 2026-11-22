@@ -782,21 +782,23 @@ fn decompress_v2_payload(
 
 fn noop_payload_validator(
     _kind: &SavePayloadKind,
+    _payload_sha256: &[u8; 32],
     _bytes: &[u8],
 ) -> std::result::Result<(), String> {
     Ok(())
 }
 
-fn validate_payload_bytes<F>(
+fn validate_payload_bytes_with_sha256<F>(
     neighborhood_id: &str,
     lot_id: u32,
     slot: SaveSlot,
     kind: &SavePayloadKind,
+    payload_sha256: &[u8; 32],
     payload: &[u8],
     validator: &F,
 ) -> std::result::Result<(), SaveError>
 where
-    F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+    F: Fn(&SavePayloadKind, &[u8; 32], &[u8]) -> std::result::Result<(), String>,
 {
     if *kind == SavePayloadKind::WorldSnapshot {
         World::decode(payload).map_err(|error| SaveError::DecodeFailed {
@@ -806,7 +808,7 @@ where
             detail: format!("invalid world snapshot payload: {error}"),
         })?;
     }
-    validator(kind, payload).map_err(|detail| SaveError::DecodeFailed {
+    validator(kind, payload_sha256, payload).map_err(|detail| SaveError::DecodeFailed {
         neighborhood_id: neighborhood_id.to_owned(),
         lot_id,
         slot,
@@ -921,7 +923,7 @@ fn decode_record_metadata(
     }
 }
 
-fn decode_record_validated<F>(
+fn decode_record_validated_with_sha256<F>(
     neighborhood_id: &str,
     lot_id: u32,
     slot: SaveSlot,
@@ -929,7 +931,7 @@ fn decode_record_validated<F>(
     validator: &F,
 ) -> std::result::Result<LoadedSave, SaveError>
 where
-    F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+    F: Fn(&SavePayloadKind, &[u8; 32], &[u8]) -> std::result::Result<(), String>,
 {
     let (version, body_bytes) = verify_envelope(neighborhood_id, lot_id, slot, bytes)?;
     match version {
@@ -960,11 +962,12 @@ where
                 lot_id,
                 slot,
             )?;
-            validate_payload_bytes(
+            validate_payload_bytes_with_sha256(
                 neighborhood_id,
                 lot_id,
                 slot,
                 &body.payload_kind,
+                &actual_payload_sha,
                 &body.payload,
                 validator,
             )?;
@@ -1028,11 +1031,12 @@ where
                     actual: actual_payload_sha,
                 });
             }
-            validate_payload_bytes(
+            validate_payload_bytes_with_sha256(
                 neighborhood_id,
                 lot_id,
                 slot,
                 &header.payload_kind,
+                &actual_payload_sha,
                 &payload,
                 validator,
             )?;
@@ -1196,7 +1200,7 @@ impl AutosaveStore {
     /// hashing happen *before* acquiring the REDB write transaction so
     /// background workers hold the write lock for minimal duration.
     pub fn commit_job(&self, job: SaveJob) -> std::result::Result<SaveMetadata, SaveError> {
-        self.commit_job_validated(job, noop_payload_validator)
+        self.commit_job_validated_with_sha256(job, noop_payload_validator)
     }
 
     /// Executes an owned [`SaveJob`] atomically, validating both the incoming
@@ -1214,6 +1218,22 @@ impl AutosaveStore {
     ) -> std::result::Result<SaveMetadata, SaveError>
     where
         F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+    {
+        self.commit_job_validated_with_sha256(job, |kind, _sha256, bytes| {
+            payload_validator(kind, bytes)
+        })
+    }
+
+    /// Like [`Self::commit_job_validated`], passing the already-computed
+    /// `payload_sha256` digest alongside each payload slice so callers with
+    /// digest-keyed validation caches do not re-hash payloads.
+    pub fn commit_job_validated_with_sha256<F>(
+        &self,
+        job: SaveJob,
+        payload_validator: F,
+    ) -> std::result::Result<SaveMetadata, SaveError>
+    where
+        F: Fn(&SavePayloadKind, &[u8; 32], &[u8]) -> std::result::Result<(), String>,
     {
         validate_neighborhood_id(&job.neighborhood_id)?;
         if self.policy.max_autosaves == 0 {
@@ -1239,19 +1259,20 @@ impl AutosaveStore {
                 payload_bytes.len()
             )));
         }
+        let payload_sha256 = sha256_bytes(&payload_bytes);
         let validation_slot = match job.target {
             SaveTarget::Manual | SaveTarget::ManualForceReplace => SaveSlot::Manual,
             SaveTarget::Autosave => SaveSlot::Autosave(0),
         };
-        validate_payload_bytes(
+        validate_payload_bytes_with_sha256(
             &job.neighborhood_id,
             job.lot_id,
             validation_slot,
             &payload_kind,
+            &payload_sha256,
             &payload_bytes,
             &payload_validator,
         )?;
-        let payload_sha256 = sha256_bytes(&payload_bytes);
         let payload_len = payload_bytes.len();
 
         match job.target {
@@ -1369,7 +1390,7 @@ impl AutosaveStore {
         payload_validator: &F,
     ) -> std::result::Result<SaveMetadata, SaveError>
     where
-        F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+        F: Fn(&SavePayloadKind, &[u8; 32], &[u8]) -> std::result::Result<(), String>,
     {
         let header = AutosaveHeaderV2 {
             slot: SaveSlot::Manual,
@@ -1396,7 +1417,7 @@ impl AutosaveStore {
                     .map_err(store_err)?
             {
                 // Refuse to silently replace a corrupt or future-version manual save.
-                let _ = decode_record_validated(
+                let _ = decode_record_validated_with_sha256(
                     &neighborhood_id,
                     lot_id,
                     SaveSlot::Manual,
@@ -1440,7 +1461,7 @@ impl AutosaveStore {
         payload_validator: &F,
     ) -> std::result::Result<SaveMetadata, SaveError>
     where
-        F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+        F: Fn(&SavePayloadKind, &[u8; 32], &[u8]) -> std::result::Result<(), String>,
     {
         let txn = self.db.begin_write().map_err(store_err)?;
         let assigned_seq;
@@ -1474,7 +1495,7 @@ impl AutosaveStore {
                 if seq > max_existing_seq {
                     max_existing_seq = seq;
                 }
-                if decode_record_validated(
+                if decode_record_validated_with_sha256(
                     &neighborhood_id,
                     lot_id,
                     SaveSlot::Autosave(seq),
@@ -1621,7 +1642,7 @@ impl AutosaveStore {
         neighborhood_id: &str,
         lot_id: u32,
     ) -> std::result::Result<Vec<SaveSlotEntry>, SaveError> {
-        self.list_saves_validated(neighborhood_id, lot_id, noop_payload_validator)
+        self.list_saves_validated_with_sha256(neighborhood_id, lot_id, noop_payload_validator)
     }
 
     /// Lists all save slots using `payload_validator` in addition to built-in
@@ -1635,6 +1656,22 @@ impl AutosaveStore {
     where
         F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
     {
+        self.list_saves_validated_with_sha256(neighborhood_id, lot_id, |kind, _sha256, bytes| {
+            payload_validator(kind, bytes)
+        })
+    }
+
+    /// Like [`Self::list_saves_validated`], passing the already-verified
+    /// `payload_sha256` digest alongside each payload slice.
+    pub fn list_saves_validated_with_sha256<F>(
+        &self,
+        neighborhood_id: &str,
+        lot_id: u32,
+        payload_validator: F,
+    ) -> std::result::Result<Vec<SaveSlotEntry>, SaveError>
+    where
+        F: Fn(&SavePayloadKind, &[u8; 32], &[u8]) -> std::result::Result<(), String>,
+    {
         validate_neighborhood_id(neighborhood_id)?;
         let txn = self.db.begin_read().map_err(store_err)?;
         let mut entries = Vec::new();
@@ -1642,7 +1679,7 @@ impl AutosaveStore {
         match txn.open_table(AUTOSAVE_MANUAL) {
             Ok(table) => {
                 if let Some(value) = table.get((neighborhood_id, lot_id)).map_err(store_err)? {
-                    match decode_record_validated(
+                    match decode_record_validated_with_sha256(
                         neighborhood_id,
                         lot_id,
                         SaveSlot::Manual,
@@ -1671,7 +1708,7 @@ impl AutosaveStore {
                     let (key, value) = item.map_err(store_err)?;
                     let seq = key.value().2;
                     let slot = SaveSlot::Autosave(seq);
-                    match decode_record_validated(
+                    match decode_record_validated_with_sha256(
                         neighborhood_id,
                         lot_id,
                         slot,
@@ -1739,7 +1776,7 @@ impl AutosaveStore {
         lot_id: u32,
         slot: SaveSlot,
     ) -> std::result::Result<LoadedSave, SaveError> {
-        self.load_save_validated(neighborhood_id, lot_id, slot, noop_payload_validator)
+        self.load_save_validated_with_sha256(neighborhood_id, lot_id, slot, noop_payload_validator)
     }
 
     /// Loads one specific save slot using `payload_validator` in addition to
@@ -1753,6 +1790,26 @@ impl AutosaveStore {
     ) -> std::result::Result<LoadedSave, SaveError>
     where
         F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+    {
+        self.load_save_validated_with_sha256(
+            neighborhood_id,
+            lot_id,
+            slot,
+            |kind, _sha256, bytes| payload_validator(kind, bytes),
+        )
+    }
+
+    /// Like [`Self::load_save_validated`], passing the already-verified
+    /// `payload_sha256` digest alongside the payload slice.
+    pub fn load_save_validated_with_sha256<F>(
+        &self,
+        neighborhood_id: &str,
+        lot_id: u32,
+        slot: SaveSlot,
+        payload_validator: F,
+    ) -> std::result::Result<LoadedSave, SaveError>
+    where
+        F: Fn(&SavePayloadKind, &[u8; 32], &[u8]) -> std::result::Result<(), String>,
     {
         validate_neighborhood_id(neighborhood_id)?;
         let txn = self.db.begin_read().map_err(store_err)?;
@@ -1776,7 +1833,7 @@ impl AutosaveStore {
                         slot: Some(slot),
                     });
                 };
-                decode_record_validated(
+                decode_record_validated_with_sha256(
                     neighborhood_id,
                     lot_id,
                     slot,
@@ -1806,7 +1863,7 @@ impl AutosaveStore {
                         slot: Some(slot),
                     });
                 };
-                decode_record_validated(
+                decode_record_validated_with_sha256(
                     neighborhood_id,
                     lot_id,
                     slot,
@@ -1834,7 +1891,11 @@ impl AutosaveStore {
         neighborhood_id: &str,
         lot_id: u32,
     ) -> std::result::Result<RecoveryLoad, SaveError> {
-        self.load_latest_intact_autosave_validated(neighborhood_id, lot_id, noop_payload_validator)
+        self.load_latest_intact_autosave_validated_with_sha256(
+            neighborhood_id,
+            lot_id,
+            noop_payload_validator,
+        )
     }
 
     /// Streams rotating autosaves newest-first in a single REDB read
@@ -1848,6 +1909,24 @@ impl AutosaveStore {
     ) -> std::result::Result<RecoveryLoad, SaveError>
     where
         F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+    {
+        self.load_latest_intact_autosave_validated_with_sha256(
+            neighborhood_id,
+            lot_id,
+            |kind, _sha256, bytes| payload_validator(kind, bytes),
+        )
+    }
+
+    /// Like [`Self::load_latest_intact_autosave_validated`], passing the
+    /// already-verified `payload_sha256` digest alongside each payload slice.
+    pub fn load_latest_intact_autosave_validated_with_sha256<F>(
+        &self,
+        neighborhood_id: &str,
+        lot_id: u32,
+        payload_validator: F,
+    ) -> std::result::Result<RecoveryLoad, SaveError>
+    where
+        F: Fn(&SavePayloadKind, &[u8; 32], &[u8]) -> std::result::Result<(), String>,
     {
         validate_neighborhood_id(neighborhood_id)?;
         let txn = self.db.begin_read().map_err(store_err)?;
@@ -1873,7 +1952,7 @@ impl AutosaveStore {
         {
             let (key, value) = item.map_err(store_err)?;
             let slot = SaveSlot::Autosave(key.value().2);
-            match decode_record_validated(
+            match decode_record_validated_with_sha256(
                 neighborhood_id,
                 lot_id,
                 slot,
@@ -1916,7 +1995,7 @@ impl AutosaveStore {
         lot_id: u32,
         preferred: SaveSlot,
     ) -> std::result::Result<RecoveryLoad, SaveError> {
-        self.load_with_fallback_validated(
+        self.load_with_fallback_validated_with_sha256(
             neighborhood_id,
             lot_id,
             preferred,
@@ -1937,6 +2016,26 @@ impl AutosaveStore {
     where
         F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
     {
+        self.load_with_fallback_validated_with_sha256(
+            neighborhood_id,
+            lot_id,
+            preferred,
+            |kind, _sha256, bytes| payload_validator(kind, bytes),
+        )
+    }
+
+    /// Like [`Self::load_with_fallback_validated`], passing the
+    /// already-verified `payload_sha256` digest alongside each payload slice.
+    pub fn load_with_fallback_validated_with_sha256<F>(
+        &self,
+        neighborhood_id: &str,
+        lot_id: u32,
+        preferred: SaveSlot,
+        payload_validator: F,
+    ) -> std::result::Result<RecoveryLoad, SaveError>
+    where
+        F: Fn(&SavePayloadKind, &[u8; 32], &[u8]) -> std::result::Result<(), String>,
+    {
         validate_neighborhood_id(neighborhood_id)?;
         let txn = self.db.begin_read().map_err(store_err)?;
 
@@ -1944,8 +2043,13 @@ impl AutosaveStore {
         let mut first_error: Option<SaveError> = None;
 
         let mut try_candidate = |slot: SaveSlot, bytes: &[u8]| -> Option<LoadedSave> {
-            match decode_record_validated(neighborhood_id, lot_id, slot, bytes, &payload_validator)
-            {
+            match decode_record_validated_with_sha256(
+                neighborhood_id,
+                lot_id,
+                slot,
+                bytes,
+                &payload_validator,
+            ) {
                 Ok(loaded) => Some(loaded),
                 Err(error) => {
                     if first_error.is_none() {

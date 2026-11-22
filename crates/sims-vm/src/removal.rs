@@ -406,20 +406,13 @@ impl Interpreter<'_> {
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
         let person = object.person.is_some();
         let selected = object.selected;
-        // A route context holds a pointer to its slot's object
-        // (context +0x48); what the original does with it when the object
-        // goes is not known.
-        if let Some((&other, _)) = world
-            .routing
-            .routes
-            .iter()
-            .find(|(_, r)| r.contexts.iter().any(|c| c.target == id))
-        {
-            return Err(fail(Trap::Unsupported(format!(
-                "person {other} has a route to object {id}; deleting an object a route \
-                 leads to is not ported"
-            ))));
-        }
+        // Native `0x440fff` never refuses deletion when another person holds a
+        // route context targeting `id`: `0x441096` (`drop_references` ->
+        // `0x45e791`) resets any person using `id` or displaying its icon
+        // (clearing its route contexts at `0x45e8aa`), and any surviving route
+        // context targeting `id` transitions cleanly through `LOST` /
+        // `LOST_UNDER_WAY` (`0x45ae8d`) when `Go To Routing Slot` next ticks
+        // and observes `frame.stack_object` absent from `world.objects`.
         if world.event_owner == id {
             world.event_owner = 0;
         }

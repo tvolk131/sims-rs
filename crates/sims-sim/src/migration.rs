@@ -15,6 +15,9 @@
 //!   saved lots (`deletion_epoch == 0`) still strip stale instances if a deleted
 //!   GUID is later reused, and normalizing any zero `instance_id` to a
 //!   deterministic non-zero value.
+//! - `v3 -> v4`: adds `family_surnames` (`BTreeMap<u16, String>`, empty on
+//!   upgrade) so Create-A-Family and imported `FAMs` surnames persist natively
+//!   inside REDB without an external sidecar file.
 
 use crate::characters::Characters;
 use crate::neighborhood_store::{NEIGHBORHOOD_FORMAT, StoredNeighborhood};
@@ -363,6 +366,37 @@ impl StoredNeighborhoodV2 {
     }
 }
 
+/// Historical schema v3 for [`StoredNeighborhood`] (added `deletion_epoch` and
+/// `deleted_at_epoch`, before `family_surnames`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredNeighborhoodV3 {
+    pub name: String,
+    pub families: BTreeMap<u16, Family>,
+    pub neighbors: Vec<Option<Neighbor>>,
+    pub inventories: Vec<Option<Inventory>>,
+    pub data: [i16; 16],
+    pub options: Option<[bool; 11]>,
+    pub type_attributes: Option<Tatt>,
+    pub zoning: BTreeMap<i16, i32>,
+    pub lot_rows: Vec<i32>,
+    pub made_characters: Characters,
+    pub deleted_characters: BTreeSet<u32>,
+    pub deletion_epoch: u64,
+    pub deleted_at_epoch: BTreeMap<u32, u64>,
+    pub instance_id: u128,
+    pub revision: u64,
+}
+
+impl StoredNeighborhoodV3 {
+    /// Encodes a version-3 neighborhood record (`3u32.to_le_bytes()` + postcard).
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = 3u32.to_le_bytes().to_vec();
+        out.extend(postcard::to_allocvec(self).expect("encoding to memory cannot fail"));
+        out
+    }
+}
+
 /// Deterministically derives a non-zero 128-bit `instance_id` for a legacy
 /// record that predated `instance_id` (or recorded `0`).
 ///
@@ -440,7 +474,7 @@ fn migrate_v2_to_v3(record: &str, body: &[u8]) -> std::result::Result<Vec<u8>, M
             } else {
                 v2.instance_id
             };
-            StoredNeighborhood {
+            StoredNeighborhoodV3 {
                 name: v2.name,
                 families: v2.families,
                 neighbors: v2.neighbors,
@@ -464,8 +498,8 @@ fn migrate_v2_to_v3(record: &str, body: &[u8]) -> std::result::Result<Vec<u8>, M
             // postcard decoding the two layouts are strictly disjoint, so
             // preserve existing epoch fields verbatim (backfilling epoch 1 only
             // if deleted_characters was non-empty with zeroed epoch metadata).
-            let mut legacy =
-                decode_postcard_exact::<StoredNeighborhood>(record, 2, body).map_err(|_| v2_err)?;
+            let mut legacy = decode_postcard_exact::<StoredNeighborhoodV3>(record, 2, body)
+                .map_err(|_| v2_err)?;
             if !legacy.deleted_characters.is_empty()
                 && legacy.deletion_epoch == 0
                 && legacy.deleted_at_epoch.is_empty()
@@ -491,7 +525,35 @@ fn migrate_v2_to_v3(record: &str, body: &[u8]) -> std::result::Result<Vec<u8>, M
     })
 }
 
-fn validate_neighborhood_v3(record: &str, body: &[u8]) -> std::result::Result<(), MigrationError> {
+fn migrate_v3_to_v4(record: &str, body: &[u8]) -> std::result::Result<Vec<u8>, MigrationError> {
+    let v3: StoredNeighborhoodV3 = decode_postcard_exact(record, 3, body)?;
+    let v4 = StoredNeighborhood {
+        name: v3.name,
+        families: v3.families,
+        family_surnames: BTreeMap::new(),
+        neighbors: v3.neighbors,
+        inventories: v3.inventories,
+        data: v3.data,
+        options: v3.options,
+        type_attributes: v3.type_attributes,
+        zoning: v3.zoning,
+        lot_rows: v3.lot_rows,
+        made_characters: v3.made_characters,
+        deleted_characters: v3.deleted_characters,
+        deletion_epoch: v3.deletion_epoch,
+        deleted_at_epoch: v3.deleted_at_epoch,
+        instance_id: v3.instance_id,
+        revision: v3.revision,
+    };
+    postcard::to_allocvec(&v4).map_err(|error| MigrationError::StepFailed {
+        record: record.to_owned(),
+        from: 3,
+        to: 4,
+        detail: error.to_string(),
+    })
+}
+
+fn validate_neighborhood_v4(record: &str, body: &[u8]) -> std::result::Result<(), MigrationError> {
     let _: StoredNeighborhood = decode_postcard_exact(record, NEIGHBORHOOD_FORMAT, body)?;
     Ok(())
 }
@@ -509,18 +571,24 @@ static NEIGHBORHOOD_STEPS: &[MigrationStep] = &[
         description: "add deletion_epoch and deleted_at_epoch backfill for deleted_characters",
         apply: migrate_v2_to_v3,
     },
+    MigrationStep {
+        from: 3,
+        to: 4,
+        description: "add native family_surnames map for CAF and FAMs persistence",
+        apply: migrate_v3_to_v4,
+    },
 ];
 
-/// Registered forward migration chain for [`StoredNeighborhood`] (`v1 -> v2 -> v3`).
+/// Registered forward migration chain for [`StoredNeighborhood`] (`v1 -> v2 -> v3 -> v4`).
 pub const NEIGHBORHOOD_MIGRATIONS: MigrationRegistry = MigrationRegistry {
     min_version: NEIGHBORHOOD_MIN_FORMAT,
     current_version: NEIGHBORHOOD_FORMAT,
     steps: NEIGHBORHOOD_STEPS,
-    validate_current: validate_neighborhood_v3,
+    validate_current: validate_neighborhood_v4,
 };
 
 /// Decodes a [`StoredNeighborhood`] record from any supported version
-/// (`v1..=v3`), applying forward migrations in memory and returning both the
+/// (`v1..=v4`), applying forward migrations in memory and returning both the
 /// decoded neighborhood and its [`MigrationReport`].
 pub fn decode_neighborhood_with_report(
     name: &str,

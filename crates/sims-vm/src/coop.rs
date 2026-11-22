@@ -3879,6 +3879,7 @@ mod tests {
             active_wall_cursor: None,
             neighborhood_origin: None,
             coop: None,
+            move_objects: false,
         }
     }
 

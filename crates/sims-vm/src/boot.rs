@@ -420,6 +420,9 @@ pub struct Lot {
     /// Optional co-op multiplayer VM context (`crate::coop`). `None` in
     /// single-player, preserving 100% bit-for-bit identical behavior.
     pub(crate) coop: Option<crate::coop::CoopVmContext>,
+    /// Buy Mode `move_objects` cheat override (`false` by default). Does not
+    /// affect normal simulation ticks.
+    pub(crate) move_objects: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1491,6 +1494,7 @@ impl Lot {
             active_wall_cursor: None,
             neighborhood_origin: None,
             coop: None,
+            move_objects: false,
         })
     }
 
@@ -2040,6 +2044,81 @@ impl Lot {
         Ok(self.world.unpause())
     }
 
+    /// Enables or disables the Buy Mode `move_objects` cheat override on this
+    /// live lot (default `false`). When enabled, Buy Mode Hand tool pickup,
+    /// placement, rotation, and deletion bypass normal occupancy/in-use/locked
+    /// guards while still enforcing lot coordinate bounds and protecting
+    /// persons, reserved sentinels, global controllers, and surface children.
+    /// Does not affect normal simulation ticks.
+    pub fn set_move_objects(&mut self, enabled: bool) {
+        self.move_objects = enabled;
+    }
+
+    /// Whether the Buy Mode `move_objects` cheat override is currently enabled.
+    pub fn move_objects(&self) -> bool {
+        self.move_objects
+    }
+
+    /// Adjusts household funds by signed `delta` directly on the live
+    /// [`World`] without invoking [`Lot::restore`], preserving Buy/Build undo
+    /// history and `neighborhood_origin`. Updates globals 13 and 14 via
+    /// [`World::set_funds`] (respecting budget mode `global[32]`) and returns
+    /// the resulting `world.budget.funds`.
+    pub fn add_funds(&mut self, delta: i32) -> Result<i32, OrderError> {
+        self.ready()?;
+        let next = self.world.budget.funds.saturating_add(delta);
+        self.world.set_funds(next).map_err(|error| {
+            OrderError::Refused(crate::Fault {
+                object: 0,
+                at: None,
+                trap: crate::Trap::Invalid(error.to_string()),
+            })
+        })?;
+        Ok(self.world.budget.funds)
+    }
+
+    /// Sets the live lot clock to `hour:00:00` (`0..24`) directly on the live
+    /// [`World`] without invoking [`Lot::restore`], preserving Buy/Build undo
+    /// history and `neighborhood_origin`. Updates global 0 (hour), clears
+    /// globals 5 and 6 (minute/second), and updates global 4 (time-of-day
+    /// period, marking all rooms for light recount when the period changes,
+    /// matching `0x46d86f` / `0x46d525`).
+    pub fn set_hour(&mut self, hour: u8) -> Result<(), OrderError> {
+        self.ready()?;
+        if hour >= 24 {
+            return Err(OrderError::Refused(crate::Fault {
+                object: 0,
+                at: None,
+                trap: crate::Trap::Invalid(format!("hour {hour} out of range 0..24")),
+            }));
+        }
+        if self.world.globals.len() <= 6 {
+            return Err(OrderError::Refused(crate::Fault {
+                object: 0,
+                at: None,
+                trap: crate::Trap::Invalid(format!(
+                    "lot has only {} globals; cannot set hour",
+                    self.world.globals.len()
+                )),
+            }));
+        }
+        self.world.globals[0] = i16::from(hour);
+        self.world.globals[5] = 0;
+        self.world.globals[6] = 0;
+        let tod = match hour {
+            0..=5 => 2,
+            6 => 3,
+            7..=17 => 0,
+            18 => 1,
+            _ => 2,
+        };
+        if self.world.globals[4] != tod {
+            self.world.globals[4] = tod;
+            self.world.mark_all_rooms();
+        }
+        Ok(())
+    }
+
     /// The simulation's active panel mode from global 19 (`0x4ce44f`).
     pub fn mode(&self) -> PanelMode {
         crate::panel_mode(&self.world)
@@ -2081,6 +2160,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let release_cursor = cursor
@@ -2216,6 +2296,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -2252,6 +2333,7 @@ impl Lot {
         let interpreter = Interpreter {
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         interpreter
@@ -2266,6 +2348,7 @@ impl Lot {
         let interpreter = Interpreter {
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         interpreter
@@ -2301,6 +2384,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let lead = interpreter.lead_object(&self.world, id);
@@ -2453,6 +2537,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         if !self.is_live_buy_cursor(cursor) {
@@ -2510,6 +2595,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -2540,6 +2626,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -2570,6 +2657,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -2598,6 +2686,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -2626,6 +2715,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -2659,6 +2749,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -2696,6 +2787,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -2786,6 +2878,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -2874,6 +2967,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -2973,6 +3067,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -3020,6 +3115,7 @@ impl Lot {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            move_objects: self.move_objects,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -3870,6 +3966,7 @@ mod tests {
             active_wall_cursor: None,
             neighborhood_origin: None,
             coop: None,
+            move_objects: false,
         }
     }
 
@@ -4665,5 +4762,76 @@ mod tests {
         restored.step().unwrap();
         assert!(!restored.world().portraits.contains(&PERSON_B));
         assert!(!restored.world().saved_portraits.contains(&PERSON_B));
+    }
+
+    #[test]
+    fn synthetic_cheats_add_funds_set_hour_and_move_objects_flag() {
+        let mut world = World::empty();
+        world.globals[13] = 1000;
+        world.globals[14] = 0;
+        world.budget.funds = 1000;
+        world.globals[0] = 8;
+        world.globals[4] = 0;
+        world.globals[5] = 42;
+        world.globals[6] = 17;
+        world.rooms.pending = 0;
+        let mut lot = lot(world, true, Frames::default());
+
+        // move_objects defaults to false and toggles cleanly.
+        assert!(!lot.move_objects());
+        lot.set_move_objects(true);
+        assert!(lot.move_objects());
+        lot.set_move_objects(false);
+        assert!(!lot.move_objects());
+
+        // add_funds updates budget + globals 13/14 and saturates safely.
+        assert_eq!(lot.add_funds(500).unwrap(), 1500);
+        assert_eq!(lot.world().budget.funds, 1500);
+        assert_eq!(lot.world().globals[13], 1500);
+        assert_eq!(lot.world().globals[14], 0);
+        assert_eq!(lot.add_funds(-2000).unwrap(), -500);
+        assert_eq!(lot.world().budget.funds, -500);
+        assert_eq!(lot.add_funds(i32::MIN).unwrap(), i32::MIN);
+
+        // Budget mode (global 32 == 1): World::set_funds is a no-op, preserving
+        // both budget.funds and globals 13/14.
+        lot.world.globals[32] = 1;
+        lot.world.budget.funds = 250;
+        let g13_before = lot.world().globals[13];
+        let g14_before = lot.world().globals[14];
+        assert_eq!(lot.add_funds(750).unwrap(), 250);
+        assert_eq!(lot.world().budget.funds, 250);
+        assert_eq!(lot.world().globals[13], g13_before);
+        assert_eq!(lot.world().globals[14], g14_before);
+
+        // set_hour rejects >= 24 and updates globals 0/4/5/6 + marks room lighting on period change.
+        // Sims.exe 0x46d525 periods: 0..=5 => 2 (night), 6 => 3 (dawn),
+        // 7..=17 => 0 (day), 18 => 1 (dusk), 19..=23 => 2 (night).
+        assert!(matches!(lot.set_hour(24), Err(OrderError::Refused(_))));
+        assert!(matches!(lot.set_hour(255), Err(OrderError::Refused(_))));
+        lot.world.rooms.pending = 0;
+        lot.set_hour(18).unwrap();
+        assert_eq!(lot.world().globals[0], 18);
+        assert_eq!(lot.world().globals[4], 1);
+        assert_eq!(lot.world().globals[5], 0);
+        assert_eq!(lot.world().globals[6], 0);
+        assert_eq!(
+            lot.world().rooms.pending,
+            3,
+            "period change must mark rooms for light recount"
+        );
+        lot.set_hour(22).unwrap();
+        assert_eq!(lot.world().globals[4], 2);
+        lot.set_hour(6).unwrap();
+        assert_eq!(lot.world().globals[4], 3);
+        lot.set_hour(12).unwrap();
+        assert_eq!(lot.world().globals[4], 0);
+        lot.set_hour(3).unwrap();
+        assert_eq!(lot.world().globals[4], 2);
+
+        // Halted lot refuses add_funds and set_hour.
+        lot.halted = true;
+        assert!(matches!(lot.add_funds(10), Err(OrderError::Halted)));
+        assert!(matches!(lot.set_hour(10), Err(OrderError::Halted)));
     }
 }

@@ -42,6 +42,7 @@ fn sample_neighborhood(name: &str) -> StoredNeighborhood {
     StoredNeighborhood {
         name: name.to_owned(),
         families: BTreeMap::new(),
+        family_surnames: BTreeMap::new(),
         neighbors: Vec::new(),
         inventories: Vec::new(),
         data: [0; 16],
@@ -1067,4 +1068,113 @@ fn autosave_v2_rejects_oversized_writes_trailing_deflate_bytes_and_bad_payload_s
         store.load_manual("UserData", 5),
         Err(SaveError::CorruptChecksum { .. })
     ));
+}
+
+#[test]
+fn validated_with_sha256_fast_path_supplies_exact_digest_across_v2_and_v1() {
+    use sha2::{Digest, Sha256};
+    use std::cell::RefCell;
+
+    let db = TempDb::new("validated-sha256-fast-path");
+    let store = AutosaveStore::open_with_policy(&db.0, AutosavePolicy::new(2).unwrap()).unwrap();
+
+    let seen_digests = RefCell::new(Vec::<[u8; 32]>::new());
+    let validator = |kind: &SavePayloadKind, sha: &[u8; 32], bytes: &[u8]| -> Result<(), String> {
+        let computed: [u8; 32] = Sha256::digest(bytes).into();
+        if sha != &computed {
+            return Err("digest mismatch passed to validator".into());
+        }
+        seen_digests.borrow_mut().push(*sha);
+        if *kind == SavePayloadKind::SavedLot && !bytes.starts_with(b"LOT!") {
+            return Err("bad magic".into());
+        }
+        Ok(())
+    };
+
+    // 1. commit_job_validated_with_sha256
+    let good_bytes = b"LOT!sha256-good-1".to_vec();
+    let expected_sha1: [u8; 32] = Sha256::digest(&good_bytes).into();
+    let meta1 = store
+        .commit_job_validated_with_sha256(
+            SaveJob::autosave(
+                "UserData",
+                5,
+                10,
+                SavePayload::saved_lot(good_bytes.clone()),
+            ),
+            validator,
+        )
+        .unwrap();
+    assert_eq!(meta1.payload_sha256, expected_sha1);
+    assert_eq!(*seen_digests.borrow().last().unwrap(), expected_sha1);
+
+    // Rejects invalid payload before touching REDB.
+    assert!(matches!(
+        store.commit_job_validated_with_sha256(
+            SaveJob::autosave("UserData", 5, 20, SavePayload::saved_lot(b"NOPE".to_vec())),
+            validator,
+        ),
+        Err(SaveError::DecodeFailed { .. })
+    ));
+
+    // Write a newer unvalidated unusable autosave into slot 2 and a valid manual save.
+    store
+        .save_autosave(
+            "UserData",
+            5,
+            30,
+            None,
+            "BadSlot2",
+            SavePayload::saved_lot(b"BAD-SLOT-2".to_vec()),
+        )
+        .unwrap();
+    let manual_bytes = b"LOT!manual-sha".to_vec();
+    let expected_manual_sha: [u8; 32] = Sha256::digest(&manual_bytes).into();
+    store
+        .commit_job_validated_with_sha256(
+            SaveJob::manual(
+                "UserData",
+                5,
+                40,
+                SavePayload::saved_lot(manual_bytes.clone()),
+            ),
+            validator,
+        )
+        .unwrap();
+
+    // 2. list_saves_validated_with_sha256
+    let listed = store
+        .list_saves_validated_with_sha256("UserData", 5, validator)
+        .unwrap();
+    assert_eq!(listed.len(), 3);
+    assert!(listed[0].metadata().is_some()); // Manual
+    assert!(listed[1].metadata().is_none()); // Autosave(2) rejected by validator
+    assert!(listed[2].metadata().is_some()); // Autosave(1)
+
+    // 3. load_save_validated_with_sha256
+    let loaded_manual = store
+        .load_save_validated_with_sha256("UserData", 5, SaveSlot::Manual, validator)
+        .unwrap();
+    assert_eq!(loaded_manual.payload, manual_bytes);
+    assert_eq!(loaded_manual.metadata.payload_sha256, expected_manual_sha);
+    assert!(matches!(
+        store.load_save_validated_with_sha256("UserData", 5, SaveSlot::Autosave(2), validator),
+        Err(SaveError::DecodeFailed { .. })
+    ));
+
+    // 4. load_latest_intact_autosave_validated_with_sha256 skips bad slot 2 -> slot 1
+    let latest = store
+        .load_latest_intact_autosave_validated_with_sha256("UserData", 5, validator)
+        .unwrap();
+    assert_eq!(latest.loaded.metadata.slot, SaveSlot::Autosave(1));
+    assert_eq!(latest.loaded.payload, good_bytes);
+    assert_eq!(latest.skipped_corrupt.len(), 1);
+
+    // 5. load_with_fallback_validated_with_sha256 falls back from bad slot 2 -> slot 1
+    let fallback = store
+        .load_with_fallback_validated_with_sha256("UserData", 5, SaveSlot::Autosave(2), validator)
+        .unwrap();
+    assert_eq!(fallback.loaded.metadata.slot, SaveSlot::Autosave(1));
+    assert_eq!(fallback.loaded.payload, good_bytes);
+    assert_eq!(fallback.skipped_corrupt.len(), 1);
 }

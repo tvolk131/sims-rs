@@ -60,7 +60,7 @@ pub use migration::{
     MigratedBytes, MigratedRecord, MigrationError, MigrationRegistry, MigrationReport,
     MigrationStep, NEIGHBORHOOD_MIGRATIONS, NEIGHBORHOOD_MIN_FORMAT, NeighborhoodSchemaStatus,
     StoreMigrationError, StoreMigrationReport, StoredNeighborhoodV1, StoredNeighborhoodV2,
-    decode_postcard_exact,
+    StoredNeighborhoodV3, decode_postcard_exact,
 };
 pub use neighborhood_store::{
     CheckedCommitError, DEFAULT_ARCH_VALUE_MULTIPLIER, DEFAULT_LAYOUT_HISTORY_FILL,

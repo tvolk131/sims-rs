@@ -263,11 +263,6 @@ impl Machine<'_, '_> {
             let id = i32::from(record.data[sims_sim::neighbors::FAMILY]);
             families.iter().position(|f| id != 0 && f.id == id)
         };
-        let unsupported = |address: u32, what: &str| {
-            Err(Trap::Unsupported(format!(
-                "scope 24 field {index} (0x{address:x}) reads {what}, which is not kept"
-            )))
-        };
         Ok(match index {
             0 => {
                 let guid = record.guid;
@@ -329,8 +324,28 @@ impl Machine<'_, '_> {
                 .iter()
                 .find(|f| f.members.contains(&record.guid))
                 .map_or(0, |f| f.house as i16),
-            7 => return unsupported(0x425c5e, "the family's flags (+0x138)"),
-            8 => return unsupported(0x425cb4, "the family's flags (+0x138)"),
+            7 => family()
+                .filter(|&place| families[place].house != 0)
+                .map_or(0, |place| {
+                    let flags = self
+                        .world
+                        .family_flags
+                        .get(&families[place].id)
+                        .copied()
+                        .unwrap_or(0);
+                    i16::from((flags & 1) != 0)
+                }),
+            8 => family()
+                .filter(|&place| families[place].house != 0)
+                .map_or(0, |place| {
+                    let flags = self
+                        .world
+                        .family_flags
+                        .get(&families[place].id)
+                        .copied()
+                        .unwrap_or(0);
+                    i16::from(((flags >> 1) & 1) != 0)
+                }),
             9 => match family() {
                 Some(place) => {
                     let threshold = self.program.autonomy_constants().friendship_threshold;

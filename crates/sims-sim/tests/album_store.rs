@@ -56,6 +56,7 @@ fn sample_neighborhood(name: &str, family_ids: &[u16]) -> StoredNeighborhood {
     StoredNeighborhood {
         name: name.to_owned(),
         families,
+        family_surnames: BTreeMap::new(),
         neighbors: Vec::new(),
         inventories: Vec::new(),
         data: [0; 16],

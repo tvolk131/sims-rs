@@ -6,7 +6,8 @@ use sims_formats::neighborhood::Family;
 use sims_sim::characters::{Character, Characters};
 use sims_sim::migration::{
     MigrationError, NEIGHBORHOOD_MIGRATIONS, NEIGHBORHOOD_MIN_FORMAT, NeighborhoodSchemaStatus,
-    StoreMigrationError, StoredNeighborhoodV1, StoredNeighborhoodV2, derive_legacy_instance_id,
+    StoreMigrationError, StoredNeighborhoodV1, StoredNeighborhoodV2, StoredNeighborhoodV3,
+    derive_legacy_instance_id,
 };
 use sims_sim::neighbors::{Inventory, Item, Neighbor, PERSON_WORDS, Row};
 use sims_sim::{
@@ -78,6 +79,7 @@ fn sample_neighborhood(name: &str) -> StoredNeighborhood {
     StoredNeighborhood {
         name: name.to_owned(),
         families,
+        family_surnames: BTreeMap::new(),
         neighbors: vec![None],
         inventories: Vec::new(),
         data: [0; 16],
@@ -138,8 +140,8 @@ fn lot_total_value_and_net_worth_match_sims_exe_191_formula() {
 #[test]
 fn stored_neighborhood_decode_rejects_short_corrupt_and_unsupported_versions() {
     assert_eq!(NEIGHBORHOOD_MIN_FORMAT, 1);
-    assert_eq!(NEIGHBORHOOD_FORMAT, 3);
-    assert_eq!(NEIGHBORHOOD_MIGRATIONS.steps().len(), 2);
+    assert_eq!(NEIGHBORHOOD_FORMAT, 4);
+    assert_eq!(NEIGHBORHOOD_MIGRATIONS.steps().len(), 3);
 
     // Truncated header (< 4 bytes).
     assert!(matches!(
@@ -156,23 +158,23 @@ fn stored_neighborhood_decode_rejects_short_corrupt_and_unsupported_versions() {
             Err(MigrationError::UnsupportedVersion {
                 found,
                 min_supported: 1,
-                max_supported: 3,
+                max_supported: 4,
                 ..
             }) if found == unsupported
         ));
     }
 
-    // Tampering a v3 body's header down to v1 fails strict payload decoding
+    // Tampering a v4 body's header down to v1 fails strict payload decoding
     // (schema mismatch / trailing bytes) instead of silently misreading fields.
-    let mut v3_as_v1 = sample_neighborhood("UserData").encode();
-    v3_as_v1[0..4].copy_from_slice(&1u32.to_le_bytes());
+    let mut v4_as_v1 = sample_neighborhood("UserData").encode();
+    v4_as_v1[0..4].copy_from_slice(&1u32.to_le_bytes());
     assert!(matches!(
-        StoredNeighborhood::decode_with_report("UserData", &v3_as_v1),
+        StoredNeighborhood::decode_with_report("UserData", &v4_as_v1),
         Err(MigrationError::CorruptPayload { version: 1, .. })
     ));
 
     // Truncated payloads fail cleanly at their declared version.
-    for ver in [1u32, 2u32, 3u32] {
+    for ver in [1u32, 2u32, 3u32, 4u32] {
         let mut truncated = ver.to_le_bytes().to_vec();
         truncated.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
         assert!(matches!(
@@ -181,12 +183,12 @@ fn stored_neighborhood_decode_rejects_short_corrupt_and_unsupported_versions() {
         ));
     }
 
-    // Trailing garbage appended to a valid v3 payload is rejected.
+    // Trailing garbage appended to a valid v4 payload is rejected.
     let mut with_trailing = sample_neighborhood("UserData").encode();
     with_trailing.push(0xAA);
     assert!(matches!(
         StoredNeighborhood::decode_with_report("UserData", &with_trailing),
-        Err(MigrationError::CorruptPayload { version: 3, .. })
+        Err(MigrationError::CorruptPayload { version: 4, .. })
     ));
 }
 
@@ -217,8 +219,8 @@ fn historical_0c25ad21_and_1719402e_layouts_migrate_losslessly() {
     let (decoded_0c, rep_0c) =
         StoredNeighborhood::decode_with_report("HistV1", &hist_0c25ad21).unwrap();
     assert_eq!(rep_0c.original_version, 1);
-    assert_eq!(rep_0c.final_version, 3);
-    assert_eq!(rep_0c.steps_applied, 2);
+    assert_eq!(rep_0c.final_version, 4);
+    assert_eq!(rep_0c.steps_applied, 3);
     assert_eq!(decoded_0c.instance_id, 0xCAFE_BABE_1234_5678);
     assert_eq!(decoded_0c.revision, 5);
     assert_eq!(
@@ -230,10 +232,28 @@ fn historical_0c25ad21_and_1719402e_layouts_migrate_losslessly() {
         decoded_0c.deleted_at_epoch,
         BTreeMap::from([(0xAAAA_0001, 1), (0xBBBB_0002, 1)])
     );
+    assert!(decoded_0c.family_surnames.is_empty());
 
     // 2. Historical commit `1719402e` wrote header `2` with the full v3 body
     //    (`deletion_epoch` + `deleted_at_epoch` already populated).
-    let legacy_v2_epochs = StoredNeighborhood {
+    let legacy_v2_epochs_v3 = StoredNeighborhoodV3 {
+        name: "HistV2".to_owned(),
+        families: base.families.clone(),
+        neighbors: base.neighbors.clone(),
+        inventories: base.inventories.clone(),
+        data: base.data,
+        options: base.options,
+        type_attributes: base.type_attributes.clone(),
+        zoning: base.zoning.clone(),
+        lot_rows: base.lot_rows.clone(),
+        made_characters: base.made_characters.clone(),
+        deleted_characters: BTreeSet::from([0xCCCC_0003]),
+        deletion_epoch: 4,
+        deleted_at_epoch: BTreeMap::from([(0xCCCC_0003, 4), (0xDDDD_0004, 2)]),
+        instance_id: 0xFEED_FACE_8765_4321,
+        revision: 9,
+    };
+    let expected_v2_epochs = StoredNeighborhood {
         name: "HistV2".to_owned(),
         deleted_characters: BTreeSet::from([0xCCCC_0003]),
         deletion_epoch: 4,
@@ -243,14 +263,14 @@ fn historical_0c25ad21_and_1719402e_layouts_migrate_losslessly() {
         ..base.clone()
     };
     let mut hist_1719402e = 2u32.to_le_bytes().to_vec();
-    hist_1719402e.extend(postcard::to_allocvec(&legacy_v2_epochs).unwrap());
+    hist_1719402e.extend(postcard::to_allocvec(&legacy_v2_epochs_v3).unwrap());
 
     let (decoded_17, rep_17) =
         StoredNeighborhood::decode_with_report("HistV2", &hist_1719402e).unwrap();
     assert_eq!(rep_17.original_version, 2);
-    assert_eq!(rep_17.final_version, 3);
-    assert_eq!(rep_17.steps_applied, 1);
-    assert_eq!(decoded_17, legacy_v2_epochs);
+    assert_eq!(rep_17.final_version, 4);
+    assert_eq!(rep_17.steps_applied, 2);
+    assert_eq!(decoded_17, expected_v2_epochs);
 
     // 3. Both historical layouts migrate cleanly inside `migrate_all`.
     let db = TempDb::new("hist-layouts");
@@ -277,7 +297,7 @@ fn historical_0c25ad21_and_1719402e_layouts_migrate_losslessly() {
     );
     assert_eq!(
         store.load_neighborhood("HistV2").unwrap().unwrap(),
-        legacy_v2_epochs
+        expected_v2_epochs
     );
 }
 
@@ -285,7 +305,7 @@ fn historical_0c25ad21_and_1719402e_layouts_migrate_losslessly() {
 fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
     let base = sample_neighborhood("UserData");
 
-    // 1. Authentic v1 fixture -> migrates v1 -> v2 -> v3 losslessly & deterministically.
+    // 1. Authentic v1 fixture -> migrates v1 -> v2 -> v3 -> v4 losslessly & deterministically.
     let v1 = StoredNeighborhoodV1 {
         name: base.name.clone(),
         families: base.families.clone(),
@@ -304,19 +324,20 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
         StoredNeighborhood::decode_strict("UserData", &v1_bytes),
         Err(MigrationError::UnsupportedVersion {
             found: 1,
-            min_supported: 3,
-            max_supported: 3,
+            min_supported: 4,
+            max_supported: 4,
             ..
         })
     ));
     let (migrated_v1, report_v1) =
         StoredNeighborhood::decode_with_report("UserData", &v1_bytes).unwrap();
     assert_eq!(report_v1.original_version, 1);
-    assert_eq!(report_v1.final_version, 3);
-    assert_eq!(report_v1.steps_applied, 2);
+    assert_eq!(report_v1.final_version, 4);
+    assert_eq!(report_v1.steps_applied, 3);
     assert!(report_v1.was_migrated());
     assert_eq!(migrated_v1.name, v1.name);
     assert_eq!(migrated_v1.families, v1.families);
+    assert!(migrated_v1.family_surnames.is_empty());
     assert_eq!(migrated_v1.data, v1.data);
     assert_eq!(migrated_v1.options, v1.options);
     assert_eq!(migrated_v1.zoning, v1.zoning);
@@ -331,7 +352,7 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
         derive_legacy_instance_id("UserData", &v1_bytes[4..])
     );
 
-    // 2. Authentic v2 fixture with deleted_characters -> migrates v2 -> v3,
+    // 2. Authentic v2 fixture with deleted_characters -> migrates v2 -> v3 -> v4,
     //    preserving instance_id and backfilling deletion_epoch = 1.
     let v2 = StoredNeighborhoodV2 {
         name: "UserData2".to_owned(),
@@ -352,8 +373,8 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
     let (migrated_v2, report_v2) =
         StoredNeighborhood::decode_with_report("UserData2", &v2_bytes).unwrap();
     assert_eq!(report_v2.original_version, 2);
-    assert_eq!(report_v2.final_version, 3);
-    assert_eq!(report_v2.steps_applied, 1);
+    assert_eq!(report_v2.final_version, 4);
+    assert_eq!(report_v2.steps_applied, 2);
     assert_eq!(migrated_v2.instance_id, 0x1234_5678_9ABC_DEF0);
     assert_eq!(migrated_v2.revision, 11);
     assert_eq!(
@@ -365,6 +386,36 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
         migrated_v2.deleted_at_epoch,
         BTreeMap::from([(0xDEAD_0001, 1), (0xBEEF_0002, 1)])
     );
+    assert!(migrated_v2.family_surnames.is_empty());
+
+    // 2b. Authentic v3 fixture -> migrates v3 -> v4 cleanly with empty family_surnames.
+    let v3 = StoredNeighborhoodV3 {
+        name: "UserDataV3".to_owned(),
+        families: base.families.clone(),
+        neighbors: base.neighbors.clone(),
+        inventories: base.inventories.clone(),
+        data: base.data,
+        options: base.options,
+        type_attributes: base.type_attributes.clone(),
+        zoning: base.zoning.clone(),
+        lot_rows: base.lot_rows.clone(),
+        made_characters: base.made_characters.clone(),
+        deleted_characters: BTreeSet::from([0xCAFE_0001]),
+        deletion_epoch: 3,
+        deleted_at_epoch: BTreeMap::from([(0xCAFE_0001, 3)]),
+        instance_id: 0x0BAD_F00D_1234_5678,
+        revision: 14,
+    };
+    let v3_fixture_bytes = v3.encode();
+    let (migrated_v3, report_v3) =
+        StoredNeighborhood::decode_with_report("UserDataV3", &v3_fixture_bytes).unwrap();
+    assert_eq!(report_v3.original_version, 3);
+    assert_eq!(report_v3.final_version, 4);
+    assert_eq!(report_v3.steps_applied, 1);
+    assert_eq!(migrated_v3.instance_id, 0x0BAD_F00D_1234_5678);
+    assert_eq!(migrated_v3.deletion_epoch, 3);
+    assert_eq!(migrated_v3.revision, 14);
+    assert!(migrated_v3.family_surnames.is_empty());
 
     // 3. v2 fixture with instance_id == 0 and no deleted_characters -> normalizes
     //    instance_id to deterministic non-zero and keeps deletion_epoch == 0.
@@ -383,7 +434,7 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
     // 4. Atomic REDB migration: a single bad/future record aborts `migrate_all`
     //    with zero partial mutations across all rows.
     let db = TempDb::new("atomic-migrations");
-    let v3_bytes = sample_neighborhood("UserData3").encode();
+    let v4_bytes = sample_neighborhood("UserData3").encode();
     let mut future_bytes = sample_neighborhood("UserData4").encode();
     future_bytes[0..4].copy_from_slice(&99u32.to_le_bytes());
 
@@ -396,7 +447,7 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
             let mut t = w.open_table(NH_TABLE).unwrap();
             t.insert("UserData", v1_bytes.as_slice()).unwrap();
             t.insert("UserData2", v2_bytes.as_slice()).unwrap();
-            t.insert("UserData3", v3_bytes.as_slice()).unwrap();
+            t.insert("UserData3", v4_bytes.as_slice()).unwrap();
             t.insert("UserData4", future_bytes.as_slice()).unwrap();
         }
         w.commit().unwrap();
@@ -410,16 +461,16 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
             NeighborhoodSchemaStatus::NeedsMigration {
                 id: "UserData".to_owned(),
                 from_version: 1,
-                target_version: 3,
+                target_version: 4,
             },
             NeighborhoodSchemaStatus::NeedsMigration {
                 id: "UserData2".to_owned(),
                 from_version: 2,
-                target_version: 3,
+                target_version: 4,
             },
             NeighborhoodSchemaStatus::Current {
                 id: "UserData3".to_owned(),
-                version: 3,
+                version: 4,
             },
             NeighborhoodSchemaStatus::Invalid {
                 id: "UserData4".to_owned(),
@@ -427,7 +478,7 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
                     record: "UserData4".to_owned(),
                     found: 99,
                     min_supported: 1,
-                    max_supported: 3,
+                    max_supported: 4,
                 },
             },
         ]
@@ -466,7 +517,7 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
         );
         assert_eq!(
             t.get("UserData3").unwrap().unwrap().value(),
-            v3_bytes.as_slice()
+            v4_bytes.as_slice()
         );
         assert_eq!(
             t.get("UserData4").unwrap().unwrap().value(),
@@ -483,8 +534,8 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
     );
     let single = store.migrate_neighborhood("UserData").unwrap().unwrap();
     assert_eq!(single.from_version, 1);
-    assert_eq!(single.to_version, 3);
-    assert_eq!(single.steps_applied, 2);
+    assert_eq!(single.to_version, 4);
+    assert_eq!(single.steps_applied, 3);
 
     // Checked save on unmigrated v2 row succeeds because read-time and write-time
     // migration derive the exact same (instance_id, revision).
@@ -520,14 +571,14 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
 
     let store = NeighborhoodStore::open(&db.0).unwrap();
     let report = store.migrate_all().unwrap();
-    assert_eq!(report.target_version, 3);
+    assert_eq!(report.target_version, 4);
     assert_eq!(report.inspected, 3);
     assert_eq!(report.already_current, 2);
     assert_eq!(report.migrated.len(), 1);
     assert_eq!(report.migrated[0].id, "UserData2");
     assert_eq!(report.migrated[0].from_version, 2);
-    assert_eq!(report.migrated[0].to_version, 3);
-    assert_eq!(store.recorded_schema_version().unwrap(), Some(3));
+    assert_eq!(report.migrated[0].to_version, 4);
+    assert_eq!(store.recorded_schema_version().unwrap(), Some(4));
 
     // Second `migrate_all` is a clean idempotent no-op.
     let second = store.migrate_all().unwrap();
@@ -535,7 +586,7 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
     assert_eq!(second.already_current, 3);
     assert!(second.migrated.is_empty());
 
-    // Raw rows on disk are now strictly v3.
+    // Raw rows on disk are now strictly v4.
     drop(store);
     {
         let raw_db = redb::Database::open(&db.0).unwrap();
@@ -1746,4 +1797,51 @@ fn lot_thumbnail_v2_roundtrip_compression_and_v1_backwards_compatibility() {
     }
     let store = NeighborhoodStore::open(&db.0).unwrap();
     assert!(store.load_lot_thumbnail("NH1", 7).is_err());
+}
+
+#[test]
+fn family_surnames_persist_in_redb_prune_on_writeback_and_import_from_fams() {
+    let db = TempDb::new("family-surnames");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    let mut stored = sample_neighborhood("UserData");
+    stored.set_family_surname(5, "Goth");
+    stored.set_family_surname(2, "Newbie");
+    stored.set_family_surname(999, "Orphan");
+    store.save_neighborhood("UserData", &stored).unwrap();
+
+    let reloaded = store.load_neighborhood("UserData").unwrap().unwrap();
+    assert_eq!(reloaded.family_surname(5), Some("Goth"));
+    assert_eq!(reloaded.family_surname(2), Some("Newbie"));
+    assert_eq!(reloaded.family_surname(999), Some("Orphan"));
+
+    // `write_back_world` prunes surnames whose family ID no longer exists.
+    let mut pruned = reloaded.clone();
+    let world = World::empty();
+    pruned.write_back_world(&world, 5, 5, 10_000, None, 50);
+    assert_eq!(pruned.family_surname(5), Some("Goth"));
+    assert_eq!(pruned.family_surname(2), Some("Newbie"));
+    assert_eq!(pruned.family_surname(999), None);
+
+    // Setting an empty/whitespace surname removes it; remove_family_surname returns previous.
+    pruned.set_family_surname(2, "   ");
+    assert_eq!(pruned.family_surname(2), None);
+    assert_eq!(pruned.remove_family_surname(5).as_deref(), Some("Goth"));
+    assert_eq!(pruned.family_surname(5), None);
+
+    // Live install import: `Neighborhood.iff` `FAMs` chunks populate surnames natively.
+    if let Some(root) = install() {
+        let live_db = TempDb::new("family-surnames-live");
+        let live_store = NeighborhoodStore::open(&live_db.0).unwrap();
+        live_store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let nh = live_store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(nh.family_surname(1), Some("Newbie"));
+        assert_eq!(nh.family_surname(5), Some("Goth"));
+        assert!(
+            nh.family_surnames.len() >= 10,
+            "expected Complete Collection UserData FAMs import to populate >=10 surnames, got {}",
+            nh.family_surnames.len()
+        );
+    }
 }

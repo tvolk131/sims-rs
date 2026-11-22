@@ -439,6 +439,138 @@ impl Program {
             characters: BTreeSet::new(),
         })
     }
+
+    /// Like [`Program::link_with_pool`], reusing immutable install-wide
+    /// libraries, careers, and text flags from `base` when `index` was formed
+    /// by splicing `inserted_range` (typically neighborhood `Characters`) into
+    /// the base index. Only resources inside `inserted_range` (or absent from
+    /// `base.libraries`) are read and parsed.
+    pub fn link_with_base_cache(
+        index: &Index,
+        catalog: &Catalog,
+        guids: impl IntoIterator<Item = u32>,
+        pool: &ArchivePool,
+        base: &Program,
+        inserted_range: std::ops::Range<usize>,
+    ) -> Result<Self> {
+        let mut semi_globals: BTreeMap<usize, Option<usize>> = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        let mut resources_to_load: Vec<usize> = Vec::new();
+        if seen.insert(catalog.global) {
+            resources_to_load.push(catalog.global);
+        }
+        let mut missing_guid: Option<u32> = None;
+        for guid in guids {
+            let Some(object) = catalog.object(guid) else {
+                missing_guid = Some(guid);
+                break;
+            };
+            if seen.insert(object.resource) {
+                resources_to_load.push(object.resource);
+            }
+            let semi_global = catalog
+                .semi_globals
+                .get(&object.resource)
+                .copied()
+                .flatten();
+            semi_globals.insert(object.resource, semi_global);
+            if let Some(resource) = semi_global
+                && seen.insert(resource)
+            {
+                resources_to_load.push(resource);
+            }
+        }
+
+        let delta = inserted_range.len();
+        let mut libraries = BTreeMap::new();
+        let mut to_parse: Vec<usize> = Vec::new();
+        for &res in &resources_to_load {
+            let base_res = if res < inserted_range.start {
+                Some(res)
+            } else if res >= inserted_range.end {
+                Some(res - delta)
+            } else {
+                None
+            };
+            if let Some(orig) = base_res
+                && let Some(cached) = base.libraries.get(&orig)
+            {
+                libraries.insert(res, cached.clone());
+            } else {
+                to_parse.push(res);
+            }
+        }
+
+        let workers = if to_parse.len() <= 1 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+                .clamp(1, 8)
+                .min(to_parse.len())
+        };
+        let global_res = catalog.global;
+        let parsed: Vec<(usize, Result<Library>)> = if workers <= 1 {
+            to_parse
+                .iter()
+                .map(|&res| {
+                    (
+                        res,
+                        load_library_with_pool(index, res, res == global_res, pool),
+                    )
+                })
+                .collect()
+        } else {
+            let chunk_size = to_parse.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = to_parse
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|&res| {
+                                    (
+                                        res,
+                                        load_library_with_pool(index, res, res == global_res, pool),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(to_parse.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("program link worker panicked"));
+                }
+                out
+            })
+        };
+        for (resource, library) in parsed {
+            libraries.insert(resource, library?);
+        }
+        if let Some(guid) = missing_guid {
+            return Err(Error::MissingDefinition(guid));
+        }
+        Ok(Self {
+            global: catalog.global,
+            libraries,
+            semi_globals,
+            careers: base.careers.clone(),
+            career_texts_end: base.career_texts_end,
+            labels_hold_no_token: base.labels_hold_no_token,
+            zoning: BTreeMap::new(),
+            animations: Animations::default(),
+            people: People::default(),
+            icon_frames: None,
+            wardrobe: None,
+            ordered_wardrobe: None,
+            character_files: Default::default(),
+            expansions: 0,
+            characters: BTreeSet::new(),
+        })
+    }
 }
 
 fn load_library_with_pool(
