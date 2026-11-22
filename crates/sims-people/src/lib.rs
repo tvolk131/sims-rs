@@ -19,6 +19,7 @@ pub mod appearance;
 /// The person files of an install, found by [`sims_content::assets`].
 pub use sims_content::assets;
 pub mod bob;
+pub mod caf_preview;
 pub mod house;
 pub mod lot;
 pub mod math;
