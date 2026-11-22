@@ -50,6 +50,7 @@ mod frame;
 mod group_factory;
 mod head;
 mod interpreter;
+pub mod lifecycle;
 mod load;
 mod memory;
 pub mod neighborhood_open;

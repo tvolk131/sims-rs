@@ -217,7 +217,7 @@ impl Interpreter<'_> {
 impl Interpreter<'_> {
     /// The skin's update at clock `now` (0x5992b3): unless `force`d, only
     /// when its layers changed or it was last updated at another clock.
-    fn update_skin(
+    pub(crate) fn update_skin(
         &self,
         world: &mut World,
         id: u16,

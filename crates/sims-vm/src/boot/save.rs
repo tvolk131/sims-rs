@@ -39,37 +39,45 @@ use std::collections::{BTreeMap, BTreeSet};
 /// floor rotation baseline (`HOUS 0` `camera_direction & 3`); layout 5
 /// keeps the view-rotated screen-centre tile pick (`0x4a7b58` cut via
 /// `0x433067`) and any frozen dialog-replay view; layout 6 keeps each
-/// pending dialog answer's text-entry string ([`crate::Answer::text`]).
-pub const FORMAT: u32 = 6;
+/// pending dialog answer's text-entry string ([`crate::Answer::text`]),
+/// last kind 3 dialog text, Make New Character catalog names, and Save Card
+/// lot name & description; layout 7 keeps choice-only follow-up answers
+/// (`Answers::choices_after`) separately from explicit dialog replay queues
+/// and records the neighborhood's `deletion_epoch` at save time so reusing a
+/// deleted character GUID never revives stale instances on older saved lots.
+pub const FORMAT: u32 = 7;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Saved {
-    world: World,
-    ticks: u32,
-    start: u32,
-    answers: Answers,
-    fresh: BTreeSet<u16>,
-    view_rotation: u8,
-    answered: bool,
-    house: u32,
-    family: u16,
-    loaded: [u8; 32],
+    pub(crate) world: World,
+    pub(crate) ticks: u32,
+    pub(crate) start: u32,
+    pub(crate) answers: Answers,
+    pub(crate) fresh: BTreeSet<u16>,
+    pub(crate) view_rotation: u8,
+    pub(crate) answered: bool,
+    pub(crate) house: u32,
+    pub(crate) family: u16,
+    pub(crate) loaded: [u8; 32],
     /// Format 3 on (view-rotated screen-centre tile pick from format 5).
-    view_centre: Option<[i8; 2]>,
+    pub(crate) view_centre: Option<[i8; 2]>,
     /// Format 4 on: the saved house's opening camera rotation (`0..=3`)
     /// paired with its level-1 road-dash floor IDs (`0x4a87b1`–`0x4a87dc`).
-    floor_rotation: u8,
+    pub(crate) floor_rotation: u8,
     /// Format 5 on: frozen `(view_rotation, view_centre)` while a dialog tick
     /// awaits replay.
-    replay_view: Option<(u8, Option<[i8; 2]>)>,
+    pub(crate) replay_view: Option<(u8, Option<[i8; 2]>)>,
     /// Format 6 on: last kind 3 dialog text (`[0x6e4ac0]`), Make New Character
     /// catalog names (`0x44b0e8`), and Save Card lot name & description
     /// (`0x50e1f8..0x50e42c`).
-    last_dialog_text: String,
-    character_names: BTreeMap<u32, String>,
-    lot_name: String,
-    lot_description: String,
+    pub(crate) last_dialog_text: String,
+    pub(crate) character_names: BTreeMap<u32, String>,
+    pub(crate) lot_name: String,
+    pub(crate) lot_description: String,
+    /// Format 7 on: neighborhood `deletion_epoch` at the time this lot was
+    /// saved (`0` for non-REDB saves).
+    pub(crate) deletion_epoch: u64,
 }
 
 /// Why a lot could not be saved or restored.
@@ -257,6 +265,7 @@ impl Lot {
             character_names: self.character_names.clone(),
             lot_name: self.lot_name.clone(),
             lot_description: self.lot_description.clone(),
+            deletion_epoch: 0,
         })
     }
 
@@ -305,6 +314,10 @@ impl Lot {
         self.undo_order.clear();
         self.redo_order.clear();
         self.active_wall_cursor = None;
+        // Restoring an external snapshot replaces `self.world` (including its
+        // cached `families` and `neighbors`), so it is no longer a live
+        // continuation of the store revision this `Lot` was opened from.
+        self.neighborhood_origin = None;
         Ok(())
     }
 }

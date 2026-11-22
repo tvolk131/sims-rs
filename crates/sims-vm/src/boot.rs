@@ -34,7 +34,7 @@ pub type BootError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Loads the localized default baby/character name from
 /// `GameData/UIText.iff STR# 142` entry 5 (`0x44b0bf..0x44b0d6` -> `0x435f4e`).
-fn read_default_character_name(install: &Install) -> String {
+pub(crate) fn read_default_character_name(install: &Install) -> String {
     let Ok(path) = install.file("GameData/UIText.iff") else {
         return String::new();
     };
@@ -255,101 +255,116 @@ pub struct Handoff {
 
 /// A booted house: its linked code, its catalog and its lot.
 pub struct Lot {
-    program: Program,
-    catalog: Catalog,
+    pub(crate) program: Program,
+    pub(crate) catalog: Catalog,
     /// The floor and wall catalogs the load renumbered the lot's patterns
     /// by (load step 6b).
-    surfaces: Surfaces,
-    world: World,
+    pub(crate) surfaces: Surfaces,
+    pub(crate) world: World,
     /// The motive constants, worked out at the first step: a load that
     /// runs no tick does not need them.
-    tuning: Option<Tuning>,
-    player: Answers,
-    frames: Frames,
+    pub(crate) tuning: Option<Tuning>,
+    pub(crate) player: Answers,
+    pub(crate) frames: Frames,
     /// Ticks run, and the lot's tick count when the first one started.
-    ticks: u32,
-    start: u32,
-    load: LoadReport,
+    pub(crate) ticks: u32,
+    pub(crate) start: u32,
+    pub(crate) load: LoadReport,
     /// Set when a tick or a frame failed. The lot is then as the failure
     /// left it, partway through a tick or a frame, so no later step runs.
-    halted: bool,
+    pub(crate) halted: bool,
     /// Play mode's own state ([`crate::play`]), used by
     /// [`Lot::step_play`] only.
-    play: Play,
+    pub(crate) play: Play,
     /// Whether a dialog that offers a choice, with no answer left in the
     /// list given at load, waits for the player ([`Lot::wait_for_answers`])
     /// rather than halting the lot.
-    asks: bool,
+    pub(crate) asks: bool,
     /// The dialog the lot waits on, while it waits.
-    asking: Option<Box<Asking>>,
+    pub(crate) asking: Option<Box<Asking>>,
     /// The dialog is answered and the tick that showed it has not run
     /// again yet: the lot is as it was before that tick, so it takes no
     /// input until the next step.
-    answered: bool,
+    pub(crate) answered: bool,
 
     /// The house view's rotation, 0 to 3 ([`Lot::set_view_rotation`]).
-    view_rotation: u8,
+    pub(crate) view_rotation: u8,
     /// The saved house's opening camera direction, 0 to 3
     /// ([`opening_rotation`]): the rotation that level 1's road-dash floor
     /// tiles (`10` and `11`) in `world` are oriented for (`0x4a8042`,
     /// `0x4a861f`, `0x4a87b1`–`0x4a87dc`).
-    floor_rotation: u8,
+    pub(crate) floor_rotation: u8,
     /// The tile at the house view's centre, if known
     /// ([`Lot::set_view_centre`]).
-    view_centre: Option<[i8; 2]>,
+    pub(crate) view_centre: Option<[i8; 2]>,
     /// The view rotation and centre frozen when a tick paused on an
     /// unanswered dialog (`Stop::Asks`), so moving the camera while a
     /// dialog is showing does not alter the tick's replay once answered.
-    replay_view: Option<(u8, Option<[i8; 2]>)>,
+    pub(crate) replay_view: Option<(u8, Option<[i8; 2]>)>,
     /// The text entered in the last kind 3 text-prompt dialog
     /// (`0x451a6b..0x451a85` -> global `[0x6e4ac0]`).
-    last_dialog_text: String,
+    pub(crate) last_dialog_text: String,
     /// Catalog names assigned to characters created by Make New Character
     /// (`0x44b0a8..0x44b0fc`), keyed by new character GUID.
-    character_names: BTreeMap<u32, String>,
+    pub(crate) character_names: BTreeMap<u32, String>,
     /// Localized fallback name from `GameData/UIText.iff STR# 142[5]` for
     /// empty kind-3 Make New Character submissions (`0x44b0bf..0x44b0d6`).
-    default_character_name: String,
+    pub(crate) default_character_name: String,
     /// Editable lot name (`cWinEditLotInfo`, `0x50e1f8..0x50e42c`), loaded
     /// from the neighborhood's `*Desc.iff` `STR# (2000 + lot_id)` and persisted
     /// in [`save::Saved`].
-    lot_name: String,
+    pub(crate) lot_name: String,
     /// Editable lot description (`cWinEditLotInfo`, `0x50e1f8..0x50e42c`),
     /// loaded from `*Desc.iff` `STR# (2000 + lot_id)` and persisted in
     /// [`save::Saved`].
-    lot_description: String,
+    pub(crate) lot_description: String,
     /// The world's hash as the load left it, which a save carries so it
     /// goes back only into a lot loaded from the same files
     /// ([`save`]).
-    loaded: [u8; 32],
+    pub(crate) loaded: [u8; 32],
     /// Committed Buy Mode purchases available for Undo (`0x493259`, `0x4932fa`).
     /// Cleared when leaving a non-Live mode (`0x4cea5d` → `0x4933dc`) or
     /// restoring a save.
-    buy_undo: Vec<crate::BuyPurchase>,
+    pub(crate) buy_undo: Vec<crate::BuyPurchase>,
     /// Undone Buy Mode purchases available for Redo (`0x493338`).
-    buy_redo: Vec<crate::BuyPurchase>,
+    pub(crate) buy_redo: Vec<crate::BuyPurchase>,
     /// Detached Buy Mode objects whose history cleanup (`0x48c20e`) faulted,
     /// tracked so [`Lot::save`] and mode switches never leak them silently.
-    buy_orphans: Vec<crate::BuyPurchase>,
+    pub(crate) buy_orphans: Vec<crate::BuyPurchase>,
     /// The single live Buy Mode cursor currently owned by this lot, enforcing
     /// native single-cursor ownership and preventing retired/cross-lot
     /// [`BuyCursor`] handles from touching objects owned by this lot.
-    active_buy_cursor: Option<ActiveBuyCursor>,
+    pub(crate) active_buy_cursor: Option<ActiveBuyCursor>,
     /// Committed Build Mode operations available for Undo.
-    build_undo: Vec<crate::BuildHistory>,
+    pub(crate) build_undo: Vec<crate::BuildHistory>,
     /// Undone Build Mode operations available for Redo.
-    build_redo: Vec<crate::BuildHistory>,
+    pub(crate) build_redo: Vec<crate::BuildHistory>,
     /// Chronological order of Buy vs Build entries on the Undo/Redo stacks.
-    undo_order: Vec<HistoryKind>,
-    redo_order: Vec<HistoryKind>,
+    pub(crate) undo_order: Vec<HistoryKind>,
+    pub(crate) redo_order: Vec<HistoryKind>,
     /// The single live Build Mode `"Wall Cursor"` (`0x00000439`) owned by this lot.
-    active_wall_cursor: Option<crate::WallCursor>,
+    pub(crate) active_wall_cursor: Option<crate::WallCursor>,
+    /// When opened via [`crate::lifecycle::enter_lot`], records the store,
+    /// neighborhood ID, neighborhood instance identity, and revision this lot
+    /// was loaded from so Save & Leave rejects cross-store saves,
+    /// cross-neighborhood saves, re-imported same-ID overwrites, and
+    /// stale-revision overwrites. Cleared by [`Lot::restore`].
+    pub(crate) neighborhood_origin: Option<NeighborhoodOrigin>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HistoryKind {
+pub(crate) enum HistoryKind {
     Buy,
     Build,
+}
+
+/// Store-backed origin of a live [`Lot`] opened via [`crate::lifecycle::enter_lot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NeighborhoodOrigin {
+    pub store_id: u128,
+    pub neighborhood_id: String,
+    pub instance_id: u128,
+    pub revision: u64,
 }
 
 /// Process-wide monotonic token allocator for [`BuyCursor`] handles so no two
@@ -367,7 +382,7 @@ fn alloc_buy_cursor_token() -> u64 {
 
 /// Lifecycle state tracked by [`Lot`] for the active [`BuyCursor`] handle.
 #[derive(Debug, Clone)]
-pub(super) struct ActiveBuyCursor {
+pub(crate) struct ActiveBuyCursor {
     pub(super) token: u64,
     pub(super) cursor_lead: u16,
     pub(super) held_lead: u16,
@@ -1130,6 +1145,7 @@ impl Lot {
             undo_order: Vec::new(),
             redo_order: Vec::new(),
             active_wall_cursor: None,
+            neighborhood_origin: None,
         })
     }
 
@@ -3065,7 +3081,7 @@ impl Lot {
                 offered,
             });
         }
-        self.player.queue.push_back(answer);
+        self.player.push_back_answer(answer);
         self.asking = None;
         self.answered = true;
         Ok(())
@@ -3341,6 +3357,7 @@ mod tests {
             undo_order: Vec::new(),
             redo_order: Vec::new(),
             active_wall_cursor: None,
+            neighborhood_origin: None,
         }
     }
 
@@ -3362,17 +3379,7 @@ mod tests {
         let mut lot = lot(world, true, Frames::default());
         lot.tuning = Some(tuning());
         assert!(super::residential(&lot.world, &lot.program));
-        // The update itself fails on an empty lot, after the idle loop
-        // set its speed.
-        // A strict step hands back nothing with the failure.
-        assert!(matches!(
-            lot.step(),
-            Err(StepError::Tick {
-                tick: 1,
-                update: None,
-                ..
-            })
-        ));
+        lot.step().expect("empty residential lot steps cleanly");
         assert_eq!(lot.world.speed(), 1000);
         assert_eq!(lot.world.globals[18], 760);
         // A lot with no zoning is not residential: the idle loop leaves
@@ -3402,9 +3409,10 @@ mod tests {
 
     #[test]
     fn a_failed_tick_halts_the_lot() {
-        // An empty lot has no selected Sim at the end of its update, which
-        // stops the tick partway.
-        let mut lot = lot(World::empty(), true, Frames::default());
+        // Truncated globals stop the lot update outside any object's tick.
+        let mut world = World::empty();
+        world.globals.truncate(15);
+        let mut lot = lot(world, true, Frames::default());
         lot.tuning = Some(tuning());
         let Err(StepError::Tick { tick: 1, .. }) = lot.step() else {
             panic!("the tick should fail");
@@ -3431,7 +3439,9 @@ mod tests {
 
     #[test]
     fn play_mode_still_halts_on_a_failure_outside_an_objects_tick() {
-        let mut lot = lot(World::empty(), true, Frames::default());
+        let mut world = World::empty();
+        world.globals.truncate(15);
+        let mut lot = lot(world, true, Frames::default());
         lot.tuning = Some(tuning());
         let Err(StepError::Tick {
             tick: 1,

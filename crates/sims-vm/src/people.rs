@@ -300,6 +300,26 @@ pub fn curve_table(age: i16, custom: u16) -> (bool, u16) {
     }
 }
 
+/// Decrements data word 62 (`USERS`) on every target object currently listed in
+/// `person_id`'s `object_uses` and clears `person_id`'s `object_uses`.
+pub(crate) fn clear_person_uses_and_counts(world: &mut World, person_id: u16) {
+    let targets: Vec<i16> = world
+        .objects
+        .get_mut(&person_id)
+        .and_then(|o| o.person.as_mut())
+        .map(|p| p.object_uses.drain(..).map(|u| u.target).collect())
+        .unwrap_or_default();
+    for target in targets {
+        if let Ok(target_id) = u16::try_from(target)
+            && let Some(obj) = world.objects.get_mut(&target_id)
+            && let Some(users) = obj.data.get_mut(62)
+            && *users > 0
+        {
+            *users -= 1;
+        }
+    }
+}
+
 impl Interpreter<'_> {
     /// Gives a person the fields its neighborhood record keeps for it
     /// (0x4258a3): the record's ID goes into person data word 31; then, if
@@ -499,6 +519,67 @@ impl Interpreter<'_> {
     ) -> Result<(), Fault> {
         let deleting = self.being_deleted(id);
         self.reset_marked_fully(world, id, &self.program.people, deleting, Some(named))
+    }
+
+    /// Recovers a surviving person after an orphaned visitor it was interacting
+    /// with was purged on saved-lot re-entry.
+    ///
+    /// Uses `reset_person_letting_go` so unrelated player orders already queued
+    /// in `person.queue` are preserved (`0x45eac7`). When the person is in a
+    /// state whose full reset is not ported (for example seated inside a chair,
+    /// off-lot, or with word 73 set), performs an in-place action/stack reset
+    /// via `install_main` while preserving both the person's seat and its
+    /// surviving queue.
+    pub(crate) fn reset_person_after_purge(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let in_container = capture(world, id).map_err(fail)?.container.is_some();
+        if !in_container {
+            let busy = RefCell::new(BTreeSet::new());
+            busy.borrow_mut().insert(id);
+            let outer = Interpreter {
+                letting_go: Some(&busy),
+                ..*self
+            };
+            match outer.reset_person_letting_go(world, id, id) {
+                Ok(()) => return Ok(()),
+                Err(Fault {
+                    trap: Trap::Unsupported(_),
+                    ..
+                }) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        if let Some(route) = world.routing.routes.get_mut(&id) {
+            route.contexts.clear();
+        }
+        world.headlines.remove(&id);
+        clear_person_uses_and_counts(world, id);
+        {
+            let obj = world
+                .objects
+                .get_mut(&id)
+                .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
+            obj.data[34] = 0;
+            obj.data[9] = 0;
+            let person = obj
+                .person
+                .as_mut()
+                .ok_or_else(|| fail(Trap::native(0x1c, "object is not a person")))?;
+            person.active = no_action();
+            person.motive_deltas.clear();
+            for word in [0, 30, 33, 40, 59, 71, 72] {
+                if let Some(slot) = person.data.get_mut(word) {
+                    *slot = 0;
+                }
+            }
+        }
+        self.machine(world, id, 0, false)
+            .install_main()
+            .map_err(fail)
     }
 
     /// The reset of a person marked as resetting (object flag 0x800):
