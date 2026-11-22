@@ -86,9 +86,337 @@ pub const AMBIENT_IDLE: f32 = 0.8;
 /// `0x5eb8a7`).
 pub const DEAD_ZONE: f32 = 35.0;
 
+/// Duration of the pie-menu backdrop pop-in, submenu center/radius glide, and
+/// head scale/`Y_OFFSET` ramp, in milliseconds (`[0x6c4700] = 400`,
+/// `0x4621e3`–`0x462273`, `0x4625e1`–`0x46260d`).
+pub const POP_IN_MS: u32 = 400;
+
+/// Duration of the pie head's direction-change ease-out curve, in milliseconds
+/// (`[0x6c4704] = 400`, `0x46277a`–`0x4627d2`).
+pub const DIRECTION_EASE_MS: u32 = 400;
+
+/// Steady-state radius of the dark radial pie-menu backdrop in pixels
+/// (`[0x6c4708] = 100`, `0x4621db`).
+pub const BACKDROP_RADIUS: i32 = 100;
+
+/// Ease-out curve coefficients (`0x462799`–`0x4627b0`):
+/// `u(t) = sqrt(DIRECTION_EASE_BASE + DIRECTION_EASE_SPAN * t)` where
+/// `[0x666a38] = 0.1` and `[0x667444] = 0.9`.
+pub const DIRECTION_EASE_BASE: f32 = 0.1;
+pub const DIRECTION_EASE_SPAN: f32 = 0.9;
+
 /// Largest face side accepted by [`draw_body`], matching `sims_ui::pie`'s
 /// face-bitmap cap and preventing `u32` area overflow in [`Canvas::new`].
 pub const MAX_SIDE: u32 = 4096;
+
+/// Animated circular backdrop state evaluated by [`PieAnimState::backdrop`]
+/// (`0x46216e`–`0x46228d`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackdropState {
+    pub center: [i32; 2],
+    pub radius: i32,
+}
+
+/// Animated pie-head pose evaluated by [`PieAnimState::head_pose`]
+/// (`0x4625ae`–`0x462822`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeadPose {
+    pub pitch: f32,
+    pub yaw: f32,
+    /// Head scale multiplier (`0.0..=1.0`, ramping linearly over [`POP_IN_MS`]).
+    pub scale: f32,
+    /// Vertical offset below the main pie center (`0.0..=Y_OFFSET`, ramping
+    /// linearly over [`POP_IN_MS`]).
+    pub y_offset: f32,
+    /// Ambient light factor ([`AMBIENT_HIGHLIGHTED`] or [`AMBIENT_IDLE`]).
+    pub ambient: f32,
+}
+
+impl HeadPose {
+    /// Steady-state pose matching [`draw_body`] and [`draw_body_in_viewport`]
+    /// bit-for-bit once all 400 ms transitions finish.
+    pub fn steady(look: Look) -> Self {
+        let [pitch, yaw] = look.angles();
+        Self {
+            pitch,
+            yaw,
+            scale: 1.0,
+            y_offset: Y_OFFSET,
+            ambient: look.ambient(),
+        }
+    }
+}
+
+/// Pure `Sims.exe` 400 ms pie-menu transition curve helpers
+/// (`0x4621e3`–`0x462273`, `0x4625e1`–`0x46260d`, `0x462799`–`0x4627d2`).
+pub struct PieTransition;
+
+impl PieTransition {
+    /// Linear progress `t ∈ [0.0, 1.0]` over [`POP_IN_MS`] (400 ms).
+    pub fn pop_in_progress(elapsed_ms: u32) -> f32 {
+        if elapsed_ms >= POP_IN_MS {
+            1.0
+        } else {
+            elapsed_ms as f32 / POP_IN_MS as f32
+        }
+    }
+
+    /// Head scale multiplier during the 400 ms pop-in (`0x4625e1`–`0x46260d`).
+    pub fn head_scale(elapsed_ms: u32) -> f32 {
+        Self::pop_in_progress(elapsed_ms)
+    }
+
+    /// Head vertical offset below the main pie center during the 400 ms pop-in
+    /// (`0x4625ff`–`0x46260a`: `_ftol(t * 14.0)` while `elapsed_ms < 400`,
+    /// `Y_OFFSET` once settled).
+    pub fn head_y_offset(elapsed_ms: u32) -> f32 {
+        if elapsed_ms >= POP_IN_MS {
+            Y_OFFSET
+        } else {
+            (Self::pop_in_progress(elapsed_ms) * Y_OFFSET).trunc()
+        }
+    }
+
+    /// Native direction-change ease-out factor (`0x462799`–`0x4627b0`):
+    /// `sqrt(0.1 + 0.9 * (elapsed_ms / 400.0))` for `elapsed_ms < 400`, and
+    /// `1.0` once `elapsed_ms >= 400`.
+    pub fn direction_ease(elapsed_ms: u32) -> f32 {
+        if elapsed_ms >= DIRECTION_EASE_MS {
+            1.0
+        } else {
+            let t = elapsed_ms as f32 / DIRECTION_EASE_MS as f32;
+            (DIRECTION_EASE_BASE + DIRECTION_EASE_SPAN * t).sqrt()
+        }
+    }
+
+    /// Linear integer interpolation matching `0x46222f`–`0x462267`
+    /// (`_ftol((1.0 - t) * from + t * to)` for `t < 1.0`, exact `to` at `1.0`).
+    pub fn lerp_i32(from: i32, to: i32, t: f32) -> i32 {
+        if !t.is_finite() || t >= 1.0 {
+            return to;
+        }
+        if t <= 0.0 {
+            return from;
+        }
+        let tf = f64::from(t);
+        ((1.0 - tf) * f64::from(from) + tf * f64::from(to)).trunc() as i32
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastDirection {
+    /// Initial sentinel `[esi + 0x50] = -2` (`0x4620ca`) before the first frame.
+    Unset,
+    /// Nothing highlighted (`-1`).
+    None,
+    /// Highlighted compass direction (`0..=7`).
+    Dir(u8),
+}
+
+impl LastDirection {
+    fn from_opt(dir: Option<u8>) -> Self {
+        match dir {
+            Some(d) => Self::Dir(d),
+            None => Self::None,
+        }
+    }
+}
+
+/// Tracks `Sims.exe`'s three 400 ms pie-menu transition animations
+/// (`0x462078`–`0x462822`):
+///
+/// 1. Backdrop pop-in from radius `0` to `100` (`[0x6c4708]`) and submenu /
+///    parent center-and-radius linear interpolation (`0x462106`, `0x46213e`,
+///    `0x46216e`–`0x46228d`).
+/// 2. Head pop-in scale (`0.0 -> 1.0`) and `Y_OFFSET` (`0 -> 14 px`) linear
+///    ramp (`0x4625c1`–`0x46260d`).
+/// 3. Head direction-change ease-out (`0x46269b`–`0x46281e`,
+///    `sqrt(0.1 + 0.9 * t)` over `400 ms`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PieAnimState {
+    main_center: [i32; 2],
+    /// `[esi + 0x10]`: true during initial open pop-in until `400 ms` elapses
+    /// or a submenu opens (`0x4620d1`, `0x462117`, `0x462216`).
+    is_pop_in: bool,
+    /// `[esi + 0x48]`: timestamp (ms) when the current backdrop/pop-in started.
+    backdrop_start_ms: u32,
+    backdrop_from: BackdropState,
+    backdrop_to: BackdropState,
+    backdrop_cur: BackdropState,
+    /// `[esi + 0x50]`: previously observed highlight direction.
+    last_direction: LastDirection,
+    /// `[esi + 0x4c]`: timestamp (ms) when the active direction ease started.
+    dir_start_ms: Option<u32>,
+    /// `[esi + 0x70]` (pitch) and `[esi + 0x6c]` (yaw) snapshotted on direction
+    /// change (`0x4626cf`–`0x4626d8`).
+    dir_from_angles: [f32; 2],
+}
+
+impl PieAnimState {
+    /// Starts a new pie-menu open transition centered at `main_center` at
+    /// `now_ms` (`0x462078`, `0x462175`–`0x4621e0`).
+    pub fn open(main_center: [i32; 2], now_ms: u32) -> Self {
+        let from = BackdropState {
+            center: main_center,
+            radius: 0,
+        };
+        let to = BackdropState {
+            center: main_center,
+            radius: BACKDROP_RADIUS,
+        };
+        Self {
+            main_center,
+            is_pop_in: true,
+            backdrop_start_ms: now_ms,
+            backdrop_from: from,
+            backdrop_to: to,
+            backdrop_cur: from,
+            last_direction: LastDirection::Unset,
+            dir_start_ms: None,
+            dir_from_angles: [0.0, 0.0],
+        }
+    }
+
+    /// Starts a 400 ms submenu backdrop transition from the current
+    /// interpolated backdrop to `(submenu_center, BACKDROP_RADIUS)` and
+    /// finishes the initial head pop-in (`0x462106`–`0x46213b`).
+    pub fn open_submenu(&mut self, submenu_center: [i32; 2], now_ms: u32) {
+        let cur = self.backdrop(now_ms);
+        self.is_pop_in = false;
+        self.backdrop_start_ms = now_ms;
+        self.backdrop_from = cur;
+        self.backdrop_to = BackdropState {
+            center: submenu_center,
+            radius: BACKDROP_RADIUS,
+        };
+    }
+
+    /// Starts a 400 ms transition returning the backdrop from the active
+    /// submenu back to `main_center` (`0x46213e`–`0x46216d`).
+    pub fn close_submenu(&mut self, now_ms: u32) {
+        let cur = self.backdrop(now_ms);
+        self.is_pop_in = false;
+        self.backdrop_start_ms = now_ms;
+        self.backdrop_from = cur;
+        self.backdrop_to = BackdropState {
+            center: self.main_center,
+            radius: BACKDROP_RADIUS,
+        };
+    }
+
+    /// Evaluates the circular radial backdrop's center and radius at `now_ms`
+    /// (`0x46216e`–`0x46228d`).
+    pub fn backdrop(&mut self, now_ms: u32) -> BackdropState {
+        let elapsed = now_ms.saturating_sub(self.backdrop_start_ms);
+        if elapsed >= POP_IN_MS {
+            self.is_pop_in = false;
+            self.backdrop_cur = self.backdrop_to;
+        } else {
+            let t = PieTransition::pop_in_progress(elapsed);
+            self.backdrop_cur = BackdropState {
+                center: [
+                    PieTransition::lerp_i32(
+                        self.backdrop_from.center[0],
+                        self.backdrop_to.center[0],
+                        t,
+                    ),
+                    PieTransition::lerp_i32(
+                        self.backdrop_from.center[1],
+                        self.backdrop_to.center[1],
+                        t,
+                    ),
+                ],
+                radius: PieTransition::lerp_i32(
+                    self.backdrop_from.radius,
+                    self.backdrop_to.radius,
+                    t,
+                ),
+            };
+        }
+        self.backdrop_cur
+    }
+
+    /// Evaluates the 3D pie head's animated [`HeadPose`] for `look` at
+    /// `now_ms`, applying both the 400 ms pop-in scale/`Y_OFFSET` ramp
+    /// (`0x4625c1`–`0x46260d`) and the 400 ms direction-change ease-out
+    /// (`0x462688`–`0x462822`).
+    pub fn head_pose(&mut self, look: Look, now_ms: u32) -> HeadPose {
+        let pop_elapsed = now_ms.saturating_sub(self.backdrop_start_ms);
+        let (scale, y_offset) = if self.is_pop_in && pop_elapsed < POP_IN_MS {
+            (
+                PieTransition::head_scale(pop_elapsed),
+                PieTransition::head_y_offset(pop_elapsed),
+            )
+        } else {
+            if pop_elapsed >= POP_IN_MS {
+                self.is_pop_in = false;
+            }
+            (1.0, Y_OFFSET)
+        };
+
+        let raw = look.pointer_angles();
+        let target = look.angles();
+        let next_dir = LastDirection::from_opt(look.direction);
+        if next_dir != self.last_direction {
+            self.last_direction = next_dir;
+            if look.direction.is_some() {
+                self.dir_start_ms = Some(now_ms);
+                // 0x4626cf..0x4626d8: snapshot pointer-tracked angles without
+                // the new compass turn as the ease-out start state.
+                self.dir_from_angles = raw;
+            } else {
+                // With no highlighted direction, target == raw so the ease
+                // curve is an exact identity; avoid spurious redraw ticks.
+                self.dir_start_ms = None;
+                self.dir_from_angles = raw;
+            }
+        }
+
+        let [pitch, yaw] = if let Some(start_ms) = self.dir_start_ms {
+            let elapsed = now_ms.saturating_sub(start_ms);
+            if elapsed < DIRECTION_EASE_MS {
+                let u = PieTransition::direction_ease(elapsed);
+                let inv = 1.0 - u;
+                [
+                    inv * self.dir_from_angles[0] + u * target[0],
+                    inv * self.dir_from_angles[1] + u * target[1],
+                ]
+            } else {
+                // 0x4627d4..0x46281e: clear timer once 2 * 400 ms have passed.
+                if elapsed >= DIRECTION_EASE_MS.saturating_mul(2) {
+                    self.dir_start_ms = None;
+                }
+                target
+            }
+        } else {
+            target
+        };
+
+        HeadPose {
+            pitch,
+            yaw,
+            scale,
+            y_offset,
+            ambient: look.ambient(),
+        }
+    }
+
+    /// Whether any 400 ms backdrop, pop-in, or direction-ease transition is
+    /// still actively changing at `now_ms`.
+    pub fn is_animating(&self, now_ms: u32) -> bool {
+        let backdrop_active = now_ms.saturating_sub(self.backdrop_start_ms) < POP_IN_MS
+            && (self.is_pop_in || self.backdrop_cur != self.backdrop_to);
+        let dir_active = self
+            .dir_start_ms
+            .is_some_and(|start| now_ms.saturating_sub(start) < DIRECTION_EASE_MS);
+        backdrop_active || dir_active
+    }
+
+    /// The parent pie menu's anchor center.
+    pub const fn main_center(&self) -> [i32; 2] {
+        self.main_center
+    }
+}
 
 /// Where the pie-menu head is looking and how brightly it is lit.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -153,9 +481,9 @@ impl Look {
         }
     }
 
-    /// The steady-state `[pitch, yaw]` angles in radians (`0x4623c5`–`0x4623f3`,
-    /// `0x462688`–`0x462778`).
-    pub fn angles(&self) -> [f32; 2] {
+    /// Pointer-tracked `[pitch, yaw]` angles in radians before adding the
+    /// 8-way compass offset (`0x4623c5`–`0x4623f3`, `0x462688`–`0x4626bf`).
+    pub fn pointer_angles(&self) -> [f32; 2] {
         let dist = if self.distance.is_finite() {
             self.distance.max(0.0)
         } else {
@@ -168,8 +496,13 @@ impl Look {
         };
         let r = (dist * CURSOR_DIST_SCALE).sqrt();
         let (sin_a, cos_a) = angle.sin_cos();
-        let mut pitch = cos_a * r + IDLE_BIAS;
-        let mut yaw = -sin_a * r + IDLE_BIAS;
+        [cos_a * r + IDLE_BIAS, -sin_a * r + IDLE_BIAS]
+    }
+
+    /// The steady-state `[pitch, yaw]` angles in radians (`0x4623c5`–`0x4623f3`,
+    /// `0x462688`–`0x462778`).
+    pub fn angles(&self) -> [f32; 2] {
+        let [mut pitch, mut yaw] = self.pointer_angles();
         if let Some(dir) = self.direction {
             match dir {
                 0 => pitch += CARDINAL_TURN,
@@ -255,15 +588,18 @@ fn rot_z(v: Vec3, angle: f32) -> Vec3 {
 /// camera `0x49b0de` → `0x5d0595` → `0x5d0672`:
 /// `RotY(0.05π + pitch) * RotZ(π/2) * RotY(yaw + π) * RotX(-π/6)`.
 pub fn project(point: Vec3, origin: [f32; 2], pitch: f32, yaw: f32) -> Vec3 {
+    project_scaled(point, origin, pitch, yaw, 1.0)
+}
+
+/// Like [`project`], scaling the HEAD-bone coordinates by `scale` (`0.0..=1.0`
+/// during the 400 ms pop-in at `0x4625e1`–`0x46260d`).
+pub fn project_scaled(point: Vec3, origin: [f32; 2], pitch: f32, yaw: f32, scale: f32) -> Vec3 {
     let v = rot_y(point, BASE_PITCH + pitch);
     let v = rot_z(v, FRAC_PI_2);
     let v = rot_y(v, yaw + PI);
     let v = rot_x(v, -FRAC_PI_6);
-    Vec3::new(
-        origin[0] + v.x * SCALE_PIXELS,
-        origin[1] - v.y * SCALE_PIXELS,
-        v.z,
-    )
+    let px_scale = SCALE_PIXELS * scale;
+    Vec3::new(origin[0] + v.x * px_scale, origin[1] - v.y * px_scale, v.z)
 }
 
 /// Target wrapper matching Direct3D 6's half-up 8-bit modulation rounding
@@ -427,6 +763,13 @@ fn skinned_head_parts(
 /// Returns an error if `size` exceeds [`MAX_SIDE`] on either axis, or if
 /// `body`'s skeleton has no `HEAD` bone or no visible parts are bound to it.
 pub fn draw_body(body: &Body, size: [u32; 2], look: Look) -> Result<Canvas, String> {
+    draw_body_pose(body, size, HeadPose::steady(look))
+}
+
+/// Like [`draw_body`], rendering an animated [`HeadPose`] from
+/// [`PieAnimState::head_pose`] (400 ms pop-in scale/`y_offset` and eased
+/// `pitch`/`yaw`).
+pub fn draw_body_pose(body: &Body, size: [u32; 2], pose: HeadPose) -> Result<Canvas, String> {
     let [width, height] = size;
     if width > MAX_SIDE || height > MAX_SIDE || width.checked_mul(height).is_none() {
         return Err(format!(
@@ -435,18 +778,45 @@ pub fn draw_body(body: &Body, size: [u32; 2], look: Look) -> Result<Canvas, Stri
     }
     let parts = skinned_head_parts(body)?;
     let mut canvas = Canvas::new(width, height, [0; 4]);
-    let [pitch, yaw] = look.angles();
-    // 0x4625ae + 0x462621: bone origin sits 14 px below the face center
+    let scale = if pose.scale.is_finite() {
+        pose.scale.max(0.0)
+    } else {
+        0.0
+    };
+    if scale == 0.0 {
+        return Ok(canvas);
+    }
+    let pitch = if pose.pitch.is_finite() {
+        pose.pitch
+    } else {
+        IDLE_BIAS
+    };
+    let yaw = if pose.yaw.is_finite() {
+        pose.yaw
+    } else {
+        IDLE_BIAS
+    };
+    let y_offset = if pose.y_offset.is_finite() {
+        pose.y_offset
+    } else {
+        Y_OFFSET
+    };
+    let ambient_level = if pose.ambient.is_finite() {
+        pose.ambient.clamp(0.0, 1.0)
+    } else {
+        AMBIENT_IDLE
+    };
+    // 0x4625ae + 0x462621: bone origin sits `y_offset` px below the face center
     // (width/2, height/2), with (+0.5, +0.5) for D3D6 integer pixel centres.
     let origin = [
         (width / 2) as f32 + 0.5,
-        (height / 2) as f32 + Y_OFFSET + 0.5,
+        (height / 2) as f32 + y_offset + 0.5,
     ];
-    let ambient = Shade::Grey(look.ambient());
+    let ambient = Shade::Grey(ambient_level);
     let mut target = PieTarget(&mut canvas);
     for (part, skinned) in &parts {
         let shade = vec![ambient; skinned.positions.len()];
-        let proj = |p| project(p, origin, pitch, yaw);
+        let proj = |p| project_scaled(p, origin, pitch, yaw, scale);
         if part.texture_name.is_some() {
             let mut packed = Packed565(&mut target);
             draw_shaded_culled(&mut packed, part, skinned, &shade, proj);
@@ -470,24 +840,61 @@ pub fn draw_body_in_viewport(
     zoom: sims_render::Zoom,
     look: Look,
 ) -> Result<DrawnHead, String> {
+    draw_body_in_viewport_pose(body, viewport, center, zoom, HeadPose::steady(look))
+}
+
+/// Like [`draw_body_in_viewport`], rendering an animated [`HeadPose`] from
+/// [`PieAnimState::head_pose`] with `head_scale` applied to both screen
+/// projection and 16-bit depth (`0x4625e1`–`0x46260d`).
+pub fn draw_body_in_viewport_pose(
+    body: &Body,
+    viewport: [u32; 2],
+    center: [i32; 2],
+    zoom: sims_render::Zoom,
+    pose: HeadPose,
+) -> Result<DrawnHead, String> {
     let parts = skinned_head_parts(body)?;
     let [vp_w, vp_h] = viewport;
-    if vp_w == 0 || vp_h == 0 {
+    let scale = if pose.scale.is_finite() {
+        pose.scale.max(0.0)
+    } else {
+        0.0
+    };
+    if vp_w == 0 || vp_h == 0 || scale == 0.0 {
         return Ok(DrawnHead {
             origin: [0, 0],
             canvas: Canvas::new(0, 0, [0; 4]),
             depth: Vec::new(),
         });
     }
-    let [pitch, yaw] = look.angles();
-    let origin = [center[0] as f32 + 0.5, center[1] as f32 + Y_OFFSET + 0.5];
+    let pitch = if pose.pitch.is_finite() {
+        pose.pitch
+    } else {
+        IDLE_BIAS
+    };
+    let yaw = if pose.yaw.is_finite() {
+        pose.yaw
+    } else {
+        IDLE_BIAS
+    };
+    let y_offset = if pose.y_offset.is_finite() {
+        pose.y_offset
+    } else {
+        Y_OFFSET
+    };
+    let ambient_level = if pose.ambient.is_finite() {
+        pose.ambient.clamp(0.0, 1.0)
+    } else {
+        AMBIENT_IDLE
+    };
+    let origin = [center[0] as f32 + 0.5, center[1] as f32 + y_offset + 0.5];
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
     for (_, skinned) in &parts {
         for &p in &skinned.positions {
-            let v = project(p, origin, pitch, yaw);
+            let v = project_scaled(p, origin, pitch, yaw, scale);
             if v.x.is_finite() && v.y.is_finite() {
                 min_x = min_x.min(v.x);
                 min_y = min_y.min(v.y);
@@ -530,9 +937,10 @@ pub fn draw_body_in_viewport(
         ));
     }
     let (z_origin, z_per_unit) = screen_depth_scale(zoom);
+    let scaled_z_per_unit = z_per_unit * scale;
     let mut canvas = Canvas::new(rw, rh, [0; 4]);
     let mut depth = vec![sims_render::depth::EMPTY; (rw * rh) as usize];
-    let ambient = Shade::Grey(look.ambient());
+    let ambient = Shade::Grey(ambient_level);
     let mut target = ViewportPieTarget {
         viewport: (vp_w, vp_h),
         origin: (rx0, ry0),
@@ -542,8 +950,8 @@ pub fn draw_body_in_viewport(
     for (part, skinned) in &parts {
         let shade = vec![ambient; skinned.positions.len()];
         let proj = |p| {
-            let v = project(p, origin, pitch, yaw);
-            Vec3::new(v.x, v.y, z_origin + v.z * z_per_unit)
+            let v = project_scaled(p, origin, pitch, yaw, scale);
+            Vec3::new(v.x, v.y, z_origin + v.z * scaled_z_per_unit)
         };
         if part.texture_name.is_some() {
             let mut packed = Packed565(&mut target);
@@ -737,5 +1145,211 @@ mod tests {
         )
         .expect("extreme finite coordinates must clamp cleanly without overflow");
         assert!(drawn.canvas.width <= 800 && drawn.canvas.height <= 500);
+    }
+
+    #[test]
+    fn pie_transition_400ms_pop_in_backdrop_and_submenu_glide_match_native() {
+        let mut anim = PieAnimState::open([300, 200], 1000);
+        assert!(anim.is_animating(1000));
+        assert_eq!(
+            anim.backdrop(1000),
+            BackdropState {
+                center: [300, 200],
+                radius: 0,
+            }
+        );
+        // Halfway through 400 ms pop-in: radius = 50, head scale = 0.5, y_offset = 7.
+        assert_eq!(
+            anim.backdrop(1200),
+            BackdropState {
+                center: [300, 200],
+                radius: 50,
+            }
+        );
+        let mid_pose = anim.head_pose(Look::neutral(), 1200);
+        assert!((mid_pose.scale - 0.5).abs() < 1e-6);
+        assert_eq!(mid_pose.y_offset, 7.0);
+
+        // At 400 ms: pop-in settles cleanly at radius = 100, scale = 1.0, y_offset = 14.
+        assert_eq!(
+            anim.backdrop(1400),
+            BackdropState {
+                center: [300, 200],
+                radius: BACKDROP_RADIUS,
+            }
+        );
+        let settled_pose = anim.head_pose(Look::neutral(), 1400);
+        assert_eq!(settled_pose.scale, 1.0);
+        assert_eq!(settled_pose.y_offset, Y_OFFSET);
+
+        // Open submenu at [420, 280]: glides linearly from [300, 200] over 400 ms
+        // without re-triggering head pop-in scale ramp (`0x462117`).
+        anim.open_submenu([420, 280], 2000);
+        assert_eq!(
+            anim.backdrop(2200),
+            BackdropState {
+                center: [360, 240],
+                radius: BACKDROP_RADIUS,
+            }
+        );
+        let sub_pose = anim.head_pose(Look::neutral(), 2200);
+        assert_eq!(sub_pose.scale, 1.0);
+        assert_eq!(sub_pose.y_offset, Y_OFFSET);
+
+        // Close submenu mid-flight (at 2200 ms -> [360, 240]): glides back to [300, 200].
+        anim.close_submenu(2200);
+        assert_eq!(
+            anim.backdrop(2400),
+            BackdropState {
+                center: [330, 220],
+                radius: BACKDROP_RADIUS,
+            }
+        );
+        assert_eq!(
+            anim.backdrop(2600),
+            BackdropState {
+                center: [300, 200],
+                radius: BACKDROP_RADIUS,
+            }
+        );
+    }
+
+    #[test]
+    fn pie_transition_400ms_direction_ease_out_matches_sqrt_curve() {
+        let mut anim = PieAnimState::open([300, 200], 0);
+        // Settle initial pop-in at 500 ms with neutral look.
+        let _ = anim.backdrop(500);
+        let _ = anim.head_pose(Look::neutral(), 500);
+        assert!(!anim.is_animating(500));
+
+        // Hover north option (direction 0 -> pitch += 0.6) at t = 1000 ms.
+        let north = Look {
+            distance: 0.0,
+            angle: 0.0,
+            direction: Some(0),
+        };
+        let p0 = anim.head_pose(north, 1000);
+        assert!(anim.is_animating(1000));
+        let u0 = 0.1_f32.sqrt();
+        assert!((p0.pitch - (IDLE_BIAS + u0 * CARDINAL_TURN)).abs() < 1e-5);
+        assert!((p0.yaw - IDLE_BIAS).abs() < 1e-6);
+
+        // At +200 ms (t = 0.5): u = sqrt(0.1 + 0.45) = sqrt(0.55).
+        let p_mid = anim.head_pose(north, 1200);
+        let u_mid = (0.1_f32 + 0.9_f32 * 0.5_f32).sqrt();
+        assert!((p_mid.pitch - (IDLE_BIAS + u_mid * CARDINAL_TURN)).abs() < 1e-5);
+        assert!(p_mid.pitch > p0.pitch);
+
+        // At +400 ms: settles identically to steady-state Look::angles().
+        let p_done = anim.head_pose(north, 1400);
+        assert_eq!([p_done.pitch, p_done.yaw], north.angles());
+        assert!(!anim.is_animating(1400));
+    }
+
+    #[test]
+    fn draw_body_pose_handles_zero_scale_and_matches_steady_bit_for_bit() {
+        use crate::appearance::Part;
+        use crate::texture::Texture;
+        use sims_formats::avatar::{Bone, Mesh, MeshBinding, Skeleton, Vertex, Wiggle};
+
+        let body = Body {
+            skeleton: Skeleton {
+                name: "test".into(),
+                bones: vec![Bone {
+                    name: "HEAD".into(),
+                    parent: None,
+                    translation: [0.0; 3],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    properties: Vec::new(),
+                    flags: [0; 3],
+                    wiggle: Wiggle::default(),
+                }],
+            },
+            parts: vec![Part {
+                appearance: "tri".into(),
+                bone: 0,
+                bones: vec![0],
+                mesh: Mesh {
+                    name: "tri-HEAD".into(),
+                    texture: String::new(),
+                    bones: vec!["HEAD".into()],
+                    bindings: vec![MeshBinding {
+                        bone: 0,
+                        first_vertex: 0,
+                        vertex_count: 3,
+                        first_blend: 0,
+                        blend_count: 0,
+                    }],
+                    triangles: vec![[0, 1, 2]],
+                    vertices: vec![
+                        Vertex {
+                            position: [0.6, 0.0, 0.4],
+                            normal: [0.0, 0.0, 1.0],
+                            uv: [0.0, 0.0],
+                            bone: 0,
+                        },
+                        Vertex {
+                            position: [-0.3, -0.5, 0.4],
+                            normal: [0.0, 0.0, 1.0],
+                            uv: [1.0, 0.0],
+                            bone: 0,
+                        },
+                        Vertex {
+                            position: [-0.3, 0.5, 0.4],
+                            normal: [0.0, 0.0, 1.0],
+                            uv: [0.0, 1.0],
+                            bone: 0,
+                        },
+                    ],
+                    blends: Vec::new(),
+                },
+                texture_name: None,
+                texture: Texture::solid([180, 140, 120, 255]),
+                censor: 0,
+            }],
+        };
+
+        let look = Look::from_menu([200, 200], Some([200, 120]), Some(0), 4);
+        let steady_a = draw_body(&body, [128, 128], look).unwrap();
+        let steady_b = draw_body_pose(&body, [128, 128], HeadPose::steady(look)).unwrap();
+        assert_eq!(steady_a.rgba, steady_b.rgba);
+
+        let vp_a = draw_body_in_viewport(
+            &body,
+            [400, 300],
+            [200, 150],
+            sims_render::Zoom::Medium,
+            look,
+        )
+        .unwrap();
+        let vp_b = draw_body_in_viewport_pose(
+            &body,
+            [400, 300],
+            [200, 150],
+            sims_render::Zoom::Medium,
+            HeadPose::steady(look),
+        )
+        .unwrap();
+        assert_eq!(vp_a.origin, vp_b.origin);
+        assert_eq!(vp_a.canvas.rgba, vp_b.canvas.rgba);
+        assert_eq!(vp_a.depth, vp_b.depth);
+
+        // Zero scale (t = 0 on initial open) produces an empty transparent result.
+        let zero_pose = HeadPose {
+            scale: 0.0,
+            y_offset: 0.0,
+            ..HeadPose::steady(look)
+        };
+        let zero_canvas = draw_body_pose(&body, [128, 128], zero_pose).unwrap();
+        assert!(zero_canvas.rgba.iter().all(|&b| b == 0));
+        let zero_vp = draw_body_in_viewport_pose(
+            &body,
+            [400, 300],
+            [200, 150],
+            sims_render::Zoom::Medium,
+            zero_pose,
+        )
+        .unwrap();
+        assert_eq!((zero_vp.canvas.width, zero_vp.canvas.height), (0, 0));
     }
 }
