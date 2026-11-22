@@ -1940,16 +1940,20 @@ fn special_dialog_informs_precheck_kind13_gate_and_pet_picker_speed_hold() {
         ),
         (
             13,
-            SpecialPanelRequest::MagicTownLotPicker { via_blimp: false },
+            SpecialPanelRequest::MagicTownLotPicker { via_blimp: true },
             SpecialPanelResponse::Lot(Some(93)),
         ),
     ] {
+        // Set operand 7 = 0x81 (bit 0 = informs, bit 7 = non-modal) AND global[34] = 0:
+        // `0x4443ab` passes literal `0` to the dedicated constructors, ignoring bit 7,
+        // and `0x551285` initializes `[dialog+0xec] = 1` (`via_blimp: true`)!
         let mut fx = lot(tree(vec![
-            ins(36, 1, 2, [0, 0, 0, 0, 0, kind, 0, 1]), // operand 7 bit 0 = informs!
+            ins(36, 1, 2, [0, 0, 0, 0, 0, kind, 0, 0x81]),
             assign(scope::MY_DATA, 0, scope::LITERAL, 1, 3),
             assign(scope::MY_DATA, 0, scope::LITERAL, 2, 3),
             ins(0, 3, 3, [0; 8]),
         ]));
+        fx.world.globals[34] = 0;
         fx.world.dialogs.records.push(sims_sim::Dialog {
             caller: LAMP,
             operands: dialog(0, 0),

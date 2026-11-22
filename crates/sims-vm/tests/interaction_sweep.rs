@@ -253,7 +253,13 @@ fn sweep_one_lot(
             break;
         }
         match lot.step_play() {
-            Ok(_) => {}
+            Ok(update) => {
+                for err in &update.errors {
+                    stats
+                        .warmup_errors
+                        .push(format!("tick {tick} (recovered): {}", err.fault));
+                }
+            }
             Err(StepError::Asking { .. }) => {
                 if let Some(asking) = lot.asking() {
                     let ans = asking.shown.answers[0];

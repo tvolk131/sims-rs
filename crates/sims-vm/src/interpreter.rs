@@ -201,6 +201,10 @@ pub struct Interpreter<'a> {
     /// (`Dialog` kinds 12 & 15, `0x4518e2`, `0x451946`) during `lot_update`.
     pub(crate) inline_special_panel:
         Option<&'a (dyn crate::primitives::dialog::InlinePanelSink + 'a)>,
+    /// True inside speculative `both_ways` probes (`crate::both_ways::Cells::on`)
+    /// where `inline_special_panel` is cleared so side-effectful inline books
+    /// refuse loudly instead of silently skipping `Player::special_panel`.
+    pub(crate) in_both_ways: bool,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -242,6 +246,7 @@ impl<'a> Interpreter<'a> {
             coop: None,
             special_panels: None,
             inline_special_panel: None,
+            in_both_ways: false,
         }
     }
 
@@ -408,6 +413,7 @@ impl<'a> Interpreter<'a> {
             coop: self.coop,
             special_panels: self.special_panels,
             inline_special_panel: self.inline_special_panel,
+            in_both_ways: self.in_both_ways,
         }
     }
 }
@@ -540,6 +546,8 @@ pub(crate) struct Machine<'a, 'w> {
     /// See [`Interpreter::inline_special_panel`].
     pub(crate) inline_special_panel:
         Option<&'a (dyn crate::primitives::dialog::InlinePanelSink + 'a)>,
+    /// See [`Interpreter::in_both_ways`].
+    pub(crate) in_both_ways: bool,
 }
 
 impl<'a> Machine<'a, '_> {
@@ -573,6 +581,7 @@ impl<'a> Machine<'a, '_> {
             coop: self.coop,
             special_panels: self.special_panels,
             inline_special_panel: self.inline_special_panel,
+            in_both_ways: self.in_both_ways,
         }
     }
 

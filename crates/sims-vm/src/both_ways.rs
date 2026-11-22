@@ -152,6 +152,7 @@ impl Cells {
             coop: self.coop.as_ref(),
             special_panels: self.special_panels.as_ref(),
             inline_special_panel: None,
+            in_both_ways: true,
             ..*interpreter
         }
     }
@@ -351,6 +352,7 @@ impl<'a> Machine<'a, '_> {
             coop: interpreter.coop,
             special_panels: interpreter.special_panels,
             inline_special_panel: interpreter.inline_special_panel,
+            in_both_ways: interpreter.in_both_ways,
         }
     }
 
@@ -622,5 +624,109 @@ mod tests {
         e.ambiguous_portraits.insert(0x1234_5678);
         assert_eq!(a.encode(), e.encode(), "ambiguous_portraits is not encoded");
         assert!(!same_lot(&a, &e));
+    }
+
+    #[test]
+    fn inline_reference_book_refuses_silently_skipping_under_both_ways() {
+        let mut behaviors = BTreeMap::new();
+        behaviors.insert(
+            4096,
+            sims_formats::behavior::Behavior {
+                format: 0x8002,
+                kind: 0,
+                args: 0,
+                locals: 0,
+                revision: 0,
+                instructions: vec![sims_formats::behavior::Instruction {
+                    opcode: 36,
+                    on_true: 0xfe,
+                    on_false: 0xff,
+                    operands: [0, 0, 0, 0, 0, 12, 0, 0],
+                }],
+            },
+        );
+        let mut libraries = BTreeMap::new();
+        libraries.insert(
+            0,
+            crate::Library {
+                behaviors,
+                ..crate::Library::default()
+            },
+        );
+        let program = crate::Program {
+            global: 0,
+            libraries,
+            semi_globals: BTreeMap::new(),
+            careers: None,
+            career_texts_end: false,
+            labels_hold_no_token: false,
+            zoning: BTreeMap::new(),
+            animations: Default::default(),
+            people: Default::default(),
+            icon_frames: None,
+            wardrobe: None,
+            ordered_wardrobe: None,
+            character_files: Default::default(),
+            expansions: 0,
+            characters: Default::default(),
+        };
+        let catalog = sims_content::Catalog {
+            global: 0,
+            objects: vec![sims_content::Object {
+                guid: 0x2001,
+                resource: 0,
+                chunk: 1,
+                kind: 4,
+                master: 0,
+            }],
+            by_guid: [(0x2001, 0)].into_iter().collect(),
+            semi_globals: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut world = World::empty();
+        world.types.insert(1, 0x2001);
+        world.objects.insert(
+            1,
+            sims_sim::Object {
+                id: 1,
+                guid: 0x2001,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 64],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: vec![sims_formats::saved_objects::Frame {
+                    tree: 4096,
+                    node: 0,
+                    stack_object: 0,
+                    parameters: Vec::new(),
+                    locals: Vec::new(),
+                    primitive_state: 0,
+                    code_owner_type: 1,
+                }],
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+        let interpreter = Interpreter::new(&program, &catalog, crate::Stream::Lot);
+        let cells = Cells::of(&interpreter);
+        let probe = cells.on(&interpreter);
+        assert!(probe.in_both_ways);
+        let err = probe
+            .step(&mut world, 1)
+            .expect_err("Spellbook under both_ways must trap Unsupported rather than skipping");
+        assert!(matches!(err.trap, crate::Trap::Unsupported(_)), "{err:?}");
     }
 }

@@ -893,6 +893,13 @@ impl Machine<'_, '_> {
     /// modal `0x5107dc(person, mode)` synchronously inside `Dialog` and always
     /// take the true branch on the same tick.
     fn dialog_reference_book(&mut self, request: SpecialPanelRequest) -> Result<Flow, Trap> {
+        if self.in_both_ways {
+            return Err(Trap::Unsupported(format!(
+                "Dialog kind {} (inline reference book) while an animator refresh is pending \
+                 cannot run speculatively in both-ways mode (0x4518e2, 0x451946)",
+                request.kind()
+            )));
+        }
         if let Some(inline) = self.inline_special_panel {
             self.interpreter().refresh_family_panel(self.world);
             if inline.ask_inline(request) {

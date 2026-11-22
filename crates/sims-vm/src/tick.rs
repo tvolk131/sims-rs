@@ -1260,15 +1260,10 @@ impl Interpreter<'_> {
             let kind = record.operands[5] & 0x7f;
             if dialog::informs(&record.operands) && matches!(kind, 5 | 7 | 8 | 11 | 13) {
                 // `0x4443ab` constructed a dedicated neighborhood-picker dialog
-                // for an `informs` Dialog call. Show it through `special_panel`
-                // and mark it `DONE` immediately (no registry result slot).
-                if !dialog::modal(&record.operands) {
-                    return Err(TickError::Unsupported(format!(
-                        "object {} shows a dialog that does not stop the game; answering one \
-                         while the game runs is not ported (0x436da0)",
-                        record.caller
-                    )));
-                }
+                // with literal `0` (ignoring operand 7 bit 7 and portrait
+                // formatting). For kind 13, `0x551285` initializes
+                // `[dialog + 0xec] = 1` (`via_blimp: true`) without the
+                // blocking path's global-34 override (`0x4421e3..0x442219`).
                 let req = match kind {
                     5 => SpecialPanelRequest::DowntownLotPicker,
                     7 => {
@@ -1281,9 +1276,7 @@ impl Interpreter<'_> {
                         unleashed: self.program.expansions & 0x20 != 0,
                     },
                     11 => SpecialPanelRequest::StudioTownLotPicker { star_limo: false },
-                    13 => SpecialPanelRequest::MagicTownLotPicker {
-                        via_blimp: world.globals.get(34).copied().unwrap_or(0) != 0,
-                    },
+                    13 => SpecialPanelRequest::MagicTownLotPicker { via_blimp: true },
                     _ => unreachable!(),
                 };
                 let shown = ShownSpecialPanel {

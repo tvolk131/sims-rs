@@ -20,11 +20,12 @@ modal dialogs (kinds `0..=4`) and trapped on all eleven special panel kinds
 Before switching on `kind = operand[5] & 0x7f` (`0x4515ae..0x4515b1`), `Dialog`
 runs the common pre-check (`0x451562..0x45158d`): if the running object already
 owns a dialog record (`0x44435c`) whose status is `1` (shown, unanswered), it
-closes it (`0x437058`, setting status `5`). Next, if `informs` (operand `7` bit
-`0`, `0x451593..0x4515a9`) is set, it routes through `0x4443ab` and takes the
-True branch immediately; `0x4443ab` has dedicated neighborhood-picker
-constructors for kinds `5, 7, 8, 11, 13` (skipping `0x43601c` / portrait
-formatting) in addition to ordinary kinds `0..=4`. Blocking special kinds
+closes it (`0x437058`, setting status `5`). Next, if `informs` (operand `7` bit `0`, `0x451593..0x4515a9`) is set, it routes
+through `0x4443ab` and takes the True branch immediately; `0x4443ab` has
+dedicated neighborhood-picker constructors for kinds `5, 7, 8, 11, 13` (passing
+literal `0`, ignoring operand `7` bit `7` and skipping `0x43601c` / portrait
+formatting; kind `13`'s constructor `0x551285` initializes `[dialog + 0xec] = 1`,
+i.e., `via_blimp: true`) in addition to ordinary kinds `0..=4`. Blocking special kinds
 `5..=15` never create a dialog record; instead they communicate through
 `cObjectRegistry` (`reg`) slots read by `end_of_update` (`0x4413e1..0x442320`),
 except kinds `12` and `15` which open synchronously inline inside `Dialog`.
@@ -109,6 +110,9 @@ through to Kind 5 (`+0xea < 0`), which falls through to a **mutually exclusive**
   `0x549dae`, `0x551285`, `0x556721`, `0x5644b5`, `0x5686e9`, `0x5107dc`) beyond
   the registry slot writes modeled here (**unverified** by live trace; read from
   disassembly).
-- Follow-up wiring in `sims-game` connecting `Lot::asking_special_panel()` to
+- Follow-up wiring in `sims-game` (Track 1) connecting both single-player
+  `Lot::asking_special_panel()` -> `Lot::answer_special_panel(...)` and co-op
+  `CoopBatchReport::opened_special_panel` -> `special_panel_answer_command(...)`
+  (at `crates/sims-game/src/game.rs:3942` and `:7970`) to
   `sims_vm::travel::depart_to_destination`, phone neighbor picker UI, wardrobe /
   shop / pet / charm pickers, and spellbook / cookbook overlays.
