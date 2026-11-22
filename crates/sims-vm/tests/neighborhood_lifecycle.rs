@@ -895,6 +895,53 @@ fn bulldozed_made_and_far_tombstones_never_reappear_and_inline_chars_are_writabl
 }
 
 #[test]
+fn copied_redb_and_save_neighborhood_writes_invalidate_open_lots() {
+    let Some(root) = install() else {
+        return;
+    };
+    let no_frames = Frames::parse("none").unwrap();
+
+    // 1. Copy an imported REDB on disk: opening from the original and saving
+    //    into the copy must fail with NeighborhoodMismatch and leave copy intact.
+    let db_orig = TempDb::new("copied-orig");
+    let db_copy = TempDb::new("copied-clone");
+    {
+        let s = NeighborhoodStore::open(&db_orig.0).unwrap();
+        s.import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+    }
+    std::fs::copy(&db_orig.0, &db_copy.0).unwrap();
+    let store_orig = NeighborhoodStore::open(&db_orig.0).unwrap();
+    let store_copy = NeighborhoodStore::open(&db_copy.0).unwrap();
+    let mut goth_orig =
+        enter_lot(&root, &store_orig, "UserData", 5, &[3], no_frames.clone()).unwrap();
+    assert!(matches!(
+        save_and_leave_lot(&root, &store_copy, "UserData", &mut goth_orig),
+        Err(LifecycleError::NeighborhoodMismatch { .. })
+    ));
+    assert!(store_copy.load_saved_lot("UserData", 5).unwrap().is_none());
+
+    // 2. Public `save_neighborhood` overwriting an existing neighborhood bumps
+    //    its revision so an already-open lot cannot overwrite it.
+    let mut nh = store_orig.load_neighborhood("UserData").unwrap().unwrap();
+    nh.families.get_mut(&2).unwrap().house = 4;
+    store_orig.save_neighborhood("UserData", &nh).unwrap();
+    assert!(matches!(
+        save_and_leave_lot(&root, &store_orig, "UserData", &mut goth_orig),
+        Err(LifecycleError::StaleNeighborhood { .. })
+    ));
+    assert_eq!(
+        store_orig
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .families[&2]
+            .house,
+        4
+    );
+}
+
+#[test]
 fn bulldoze_occupied_newbie_house_7_evicts_and_clears_lot_atomically() {
     let Some(root) = install() else {
         return;

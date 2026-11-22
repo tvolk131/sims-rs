@@ -130,7 +130,15 @@ fn lot_total_value_and_net_worth_match_sims_exe_191_formula() {
 
 #[test]
 fn stored_neighborhood_decode_rejects_short_or_wrong_version() {
+    assert_eq!(NEIGHBORHOOD_FORMAT, 2);
     assert!(StoredNeighborhood::decode("bad", &[1, 2]).is_err());
+    let mut old_v1 = sample_neighborhood("UserData").encode();
+    old_v1[0..4].copy_from_slice(&1u32.to_le_bytes());
+    let err_v1 = StoredNeighborhood::decode("UserData", &old_v1)
+        .unwrap_err()
+        .to_string();
+    assert!(err_v1.contains("neighborhood format 1, expected 2"));
+
     let mut wrong = sample_neighborhood("UserData").encode();
     wrong[0..4].copy_from_slice(&(NEIGHBORHOOD_FORMAT + 99).to_le_bytes());
     let err = StoredNeighborhood::decode("UserData", &wrong)
@@ -169,9 +177,11 @@ fn multi_neighborhood_crud_and_active_switching_round_trip() {
         Some("UserData2")
     );
     store.set_active_neighborhood("UserData").unwrap();
+    let mut expected_nh1 = nh1.clone();
+    expected_nh1.revision = 1;
     assert_eq!(
         store.load_neighborhood("UserData").unwrap().as_ref(),
-        Some(&nh1)
+        Some(&expected_nh1)
     );
     assert_eq!(
         store.load_saved_lot("UserData", 5).unwrap().as_deref(),
@@ -513,9 +523,12 @@ fn add_character_files_matches_disk_for_subdirs_far_and_win1252_names() {
     far.extend_from_slice(&(member_name.len() as u32).to_le_bytes());
     far.extend_from_slice(member_name);
     std::fs::write(dir.join("pack.far"), &far).unwrap();
-    // An empty directory with the same name as a FAR member must hide that
-    // member in both the disk index and the inline index.
-    std::fs::create_dir_all(dir.join("archived.iff")).unwrap();
+    // A non-empty directory `archived.iff/` holding a loose file must shadow
+    // the same-named FAR member `archived.iff` BOTH before AND after its loose
+    // file is deleted (preserving directory precedence on bulldoze).
+    let shadow_dir = dir.join("archived.iff");
+    std::fs::create_dir_all(&shadow_dir).unwrap();
+    std::fs::write(shadow_dir.join("inner.iff"), &bytes_b).unwrap();
 
     let install = Install::detect(&root).unwrap();
     let mut disk_index = Index::build(&install).unwrap();
@@ -524,9 +537,11 @@ fn add_character_files_matches_disk_for_subdirs_far_and_win1252_names() {
 
     let mut files = BTreeMap::new();
     files.insert("caf\u{00e9}.iff".to_owned(), bytes_a);
-    files.insert("SubDir/nested.iff".to_owned(), bytes_b);
-    files.insert("pack.far".to_owned(), far);
+    files.insert("SubDir/".to_owned(), Vec::new());
+    files.insert("SubDir/nested.iff".to_owned(), bytes_b.clone());
+    files.insert("pack.far".to_owned(), far.clone());
     files.insert("archived.iff/".to_owned(), Vec::new());
+    files.insert("archived.iff/inner.iff".to_owned(), bytes_b);
     let mut inline_index = Index::build(&install).unwrap();
     inline_index.add_character_files(&files).unwrap();
     let inline_catalog = Catalog::build(&inline_index).unwrap();
@@ -534,5 +549,64 @@ fn add_character_files_matches_disk_for_subdirs_far_and_win1252_names() {
     let disk_guids: Vec<u32> = disk_catalog.objects.iter().map(|o| o.guid).collect();
     let inline_guids: Vec<u32> = inline_catalog.objects.iter().map(|o| o.guid).collect();
     assert_eq!(inline_guids, disk_guids);
+
+    // Deleting the last loose file inside `archived.iff/` keeps `archived.iff/`
+    // present, so `pack.far/archived.iff` remains shadowed.
+    std::fs::remove_file(shadow_dir.join("inner.iff")).unwrap();
+    files.remove("archived.iff/inner.iff");
+    let mut disk_after = Index::build(&install).unwrap();
+    disk_after.add_characters(&dir).unwrap();
+    let mut inline_after = Index::build(&install).unwrap();
+    inline_after.add_character_files(&files).unwrap();
+    let disk_guids_after: Vec<u32> = Catalog::build(&disk_after)
+        .unwrap()
+        .objects
+        .iter()
+        .map(|o| o.guid)
+        .collect();
+    let inline_guids_after: Vec<u32> = Catalog::build(&inline_after)
+        .unwrap()
+        .objects
+        .iter()
+        .map(|o| o.guid)
+        .collect();
+    assert_eq!(inline_guids_after, disk_guids_after);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn copied_store_gets_distinct_store_id_and_save_neighborhood_advances_revision() {
+    let orig = TempDb::new("copy-orig");
+    let copy = TempDb::new("copy-clone");
+    let store_orig = NeighborhoodStore::open(&orig.0).unwrap();
+    let nh = sample_neighborhood("UserData");
+    store_orig.save_neighborhood("UserData", &nh).unwrap();
+    assert_eq!(
+        store_orig
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .revision,
+        0
+    );
+
+    // Overwriting via public `save_neighborhood` strictly advances revision.
+    store_orig.save_neighborhood("UserData", &nh).unwrap();
+    assert_eq!(
+        store_orig
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .revision,
+        1
+    );
+
+    // Copying the `.redb` file on disk yields a distinct file-bound `store_id`.
+    let orig_id = store_orig.store_id();
+    drop(store_orig);
+    std::fs::copy(&orig.0, &copy.0).unwrap();
+    let reopened_orig = NeighborhoodStore::open(&orig.0).unwrap();
+    let opened_copy = NeighborhoodStore::open(&copy.0).unwrap();
+    assert_eq!(reopened_orig.store_id(), orig_id);
+    assert_ne!(opened_copy.store_id(), orig_id);
 }

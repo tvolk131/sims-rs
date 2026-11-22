@@ -888,21 +888,129 @@ fn remove_person_cleanly(
         .map_err(|e| LifecycleError::Lot(format!("removing person {id}: {e}")))
 }
 
+/// Removes an orphaned live person whose neighborhood record (and possibly its
+/// character file in `NEIGHBORHOOD_CHARACTERS`) was deleted while another lot
+/// was saved (e.g. a visitor whose home lot was bulldozed via `0x426fcd`).
+///
+/// Always tears down the person's lot state directly rather than running
+/// `remove_now` / BHAV Reset callbacks, because the person's neighborhood
+/// record is already gone and its character `.iff` file may have been removed.
+fn purge_orphaned_person(
+    interpreter: &Interpreter<'_>,
+    world: &mut World,
+    id: u16,
+) -> Result<(), LifecycleError> {
+    if !world.objects.contains_key(&id) {
+        return Ok(());
+    }
+    if world.event_owner == id {
+        world.event_owner = 0;
+    }
+    if selected(world) == Some(id) {
+        if let Some(obj) = world.objects.get_mut(&id) {
+            obj.selected = false;
+        }
+        if let Some(slot) = world.globals.get_mut(3) {
+            *slot = 0;
+        }
+    }
+    let held_ids: Vec<u16> = world
+        .objects
+        .get(&id)
+        .map(|o| {
+            o.slots
+                .iter()
+                .skip(1)
+                .filter_map(|s| u16::try_from(s.object).ok())
+                .filter(|&held| held != 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    for held in held_ids {
+        if !world.objects.contains_key(&held) {
+            continue;
+        }
+        if world.indicators.contains(&held) {
+            if let Some(ind) = world.objects.get_mut(&held) {
+                ind.position = [-16, -16, 1];
+                if let Some(slot0) = ind.slots.first_mut() {
+                    slot0.object = 0;
+                }
+            }
+            continue;
+        }
+        let held_guid = world.objects[&held].guid;
+        if world.types.values().any(|&g| g == held_guid)
+            && crate::interpreter::object_definition(interpreter.catalog, world, held_guid)
+                .is_some()
+        {
+            let _ = interpreter.remove_now(world, held);
+        } else if let Some(obj) = world.objects.get_mut(&held)
+            && let Some(slot0) = obj.slots.first_mut()
+        {
+            slot0.object = 0;
+        }
+    }
+    let id_i16 = id as i16;
+    for obj in world.objects.values_mut() {
+        for slot in &mut obj.slots {
+            if slot.object == id_i16 {
+                slot.object = 0;
+            }
+        }
+        if let Some(person) = obj.person.as_mut() {
+            person.object_uses.retain(|used| used.target != id_i16);
+            person
+                .queue
+                .retain(|action| action.target != id_i16 && action.caller != id_i16);
+        }
+    }
+    world.objects.remove(&id);
+    world.frame_storage.remove(&id);
+    world.headlines.remove(&id);
+    world.fires.retain(|&other| other != id);
+    world.order.retain(|&other| other != id);
+    world.people.retain(|&other| other != id);
+    world.removals.retain(|&other| other != id);
+    for instances in world.instances.values_mut() {
+        instances.retain(|&other| other != id);
+    }
+    world.animators.remove(&id);
+    world.base_layers.remove(&id);
+    world.translated_bones.remove(&id);
+    world.held_poses.remove(&id);
+    world.stops_asked.remove(&id);
+    world.person_ticks.remove(&id);
+    world.routing.routes.remove(&id);
+    for route in world.routing.routes.values_mut() {
+        route.contexts.retain(|c| c.target != id);
+    }
+    world.routing.slot_flags.retain(|&(obj, _), _| obj != id);
+    world.routing.slots.retain(|&(obj, _), _| obj != id);
+    world.routing.unknown_words.retain(|&(obj, _)| obj != id);
+    let target = i32::from(id_i16);
+    for obj in world.objects.values_mut() {
+        obj.relationships.retain(|row| row.target != target);
+    }
+    world.repair_grid().map_err(|e| {
+        LifecycleError::Lot(format!("repairing grid after purging person {id}: {e}"))
+    })?;
+    Ok(())
+}
+
 /// Computes the purchase price of `house` in `neighborhood_id` (`0x427f78`):
 /// reads the latest saved lot if present in REDB, otherwise reads the base
-/// `HouseXX.iff`'s `SIMI` chunk.
+/// `HouseXX.iff`'s `SIMI` chunk, from a single atomic REDB read snapshot.
 pub fn lot_price(
     store: &NeighborhoodStore,
     neighborhood_id: &str,
     house: u32,
     arch_multiplier: f32,
 ) -> Result<i32, LifecycleError> {
-    if store.load_neighborhood(neighborhood_id)?.is_none() {
-        return Err(LifecycleError::NeighborhoodNotFound(
-            neighborhood_id.to_owned(),
-        ));
-    }
-    if let Some(saved_bytes) = store.load_saved_lot(neighborhood_id, house)? {
+    let snapshot = store
+        .load_lot_snapshot(neighborhood_id, house)?
+        .ok_or_else(|| LifecycleError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    if let Some(saved_bytes) = snapshot.saved_lot {
         let saved = Saved::decode(&saved_bytes)
             .map_err(|e| LifecycleError::Lot(format!("decoding saved house {house}: {e}")))?;
         let budget = &saved.world.budget;
@@ -913,12 +1021,31 @@ pub fn lot_price(
             arch_multiplier,
         ));
     }
-    store
-        .base_house_lot_price(neighborhood_id, house, arch_multiplier)?
-        .ok_or_else(|| LifecycleError::HouseNotFound {
+    let Some(base_bytes) = snapshot.base_house else {
+        return Err(LifecycleError::HouseNotFound {
             neighborhood: neighborhood_id.to_owned(),
             house,
-        })
+        });
+    };
+    let iff = Iff::parse(base_bytes)
+        .map_err(|e| LifecycleError::Lot(format!("{neighborhood_id} House{house:02}: {e}")))?;
+    let chunk = iff
+        .chunks
+        .iter()
+        .find(|c| &c.tag == b"SIMI")
+        .ok_or_else(|| {
+            LifecycleError::Lot(format!(
+                "{neighborhood_id} House{house:02}: missing SIMI chunk"
+            ))
+        })?;
+    let sim = sims_formats::lot::Simulator::parse(iff.data(chunk))
+        .map_err(|e| LifecycleError::Lot(format!("{neighborhood_id} House{house:02} SIMI: {e}")))?;
+    Ok(lot_total_value(
+        sim.lot_value,
+        sim.objects_value,
+        sim.architecture_value,
+        arch_multiplier,
+    ))
 }
 
 /// Moves a Family Bin household (`house == 0`) onto an unoccupied residential
@@ -1056,21 +1183,17 @@ struct StoreRuntime {
 }
 
 impl StoreRuntime {
-    fn build(
+    fn from_snapshot(
         install_root: &Path,
-        store: &NeighborhoodStore,
-        neighborhood_id: &str,
+        stored: StoredNeighborhood,
+        character_files: &BTreeMap<String, Vec<u8>>,
     ) -> Result<Self, LifecycleError> {
-        let stored = store
-            .load_neighborhood(neighborhood_id)?
-            .ok_or_else(|| LifecycleError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
-        let character_files = store.load_character_files(neighborhood_id)?;
         let install =
             Install::detect(install_root).map_err(|e| LifecycleError::Lot(e.to_string()))?;
         let mut index = Index::build(&install).map_err(|e| LifecycleError::Lot(e.to_string()))?;
         if !character_files.is_empty() {
             index
-                .add_character_files(&character_files)
+                .add_character_files(character_files)
                 .map_err(|e| LifecycleError::Lot(e.to_string()))?;
         }
         let catalog = Catalog::build(&index).map_err(|e| LifecycleError::Lot(e.to_string()))?;
@@ -1201,16 +1324,21 @@ pub fn enter_lot_with(
     crt: CrtRng,
     view_centre: Option<[i8; 2]>,
 ) -> Result<Lot, LifecycleError> {
-    let runtime = StoreRuntime::build(install_root, store, neighborhood_id)?;
-    let saved_lot = store.load_saved_lot(neighborhood_id, house)?;
-    let base_house = store.load_base_house(neighborhood_id, house)?;
-    if saved_lot.is_none() && base_house.is_none() {
+    let snapshot = store
+        .load_lot_snapshot(neighborhood_id, house)?
+        .ok_or_else(|| LifecycleError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    if snapshot.saved_lot.is_none() && snapshot.base_house.is_none() {
         return Err(LifecycleError::HouseNotFound {
             neighborhood: neighborhood_id.to_owned(),
             house,
         });
     }
-    if let Some(saved_bytes) = saved_lot {
+    let runtime = StoreRuntime::from_snapshot(
+        install_root,
+        snapshot.neighborhood,
+        &snapshot.character_files,
+    )?;
+    if let Some(saved_bytes) = snapshot.saved_lot {
         boot_from_saved_lot(
             runtime,
             store.store_id(),
@@ -1227,7 +1355,7 @@ pub fn enter_lot_with(
             store.store_id(),
             neighborhood_id,
             house,
-            base_house.expect("checked above"),
+            snapshot.base_house.expect("checked above"),
             answers,
             frames,
             crt,
@@ -1336,6 +1464,25 @@ fn boot_from_saved_lot(
                 family_magic,
             )
             .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+
+        // Purge any live person whose neighborhood record was deleted while
+        // this lot was saved (for example a visitor whose home lot was
+        // bulldozed via `0x426fcd`) before re-attaching remaining persons.
+        let orphaned_people: Vec<u16> = world
+            .people
+            .iter()
+            .copied()
+            .filter(|&person_id| {
+                world.objects.get(&person_id).is_some_and(|o| {
+                    o.person.is_some()
+                        && (stored.deleted_characters.contains(&o.guid)
+                            || world.neighbors.first_of(o.guid).is_none())
+                })
+            })
+            .collect();
+        for person_id in orphaned_people {
+            purge_orphaned_person(&interpreter, &mut world, person_id)?;
+        }
 
         // Re-attach every live person's persistent fields from the latest NBRS
         // records (0x4258a3) so cross-lot edits propagate cleanly.
@@ -1983,7 +2130,20 @@ fn evict_or_bulldoze(
     house: u32,
     bulldoze: bool,
 ) -> Result<BulldozeReport, LifecycleError> {
-    let mut runtime = StoreRuntime::build(install_root, store, neighborhood_id)?;
+    let snapshot = store
+        .load_lot_snapshot(neighborhood_id, house)?
+        .ok_or_else(|| LifecycleError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    if snapshot.saved_lot.is_none() && snapshot.base_house.is_none() {
+        return Err(LifecycleError::HouseNotFound {
+            neighborhood: neighborhood_id.to_owned(),
+            house,
+        });
+    }
+    let mut runtime = StoreRuntime::from_snapshot(
+        install_root,
+        snapshot.neighborhood,
+        &snapshot.character_files,
+    )?;
     let origin_instance_id = runtime.stored.instance_id;
     let origin_revision = runtime.stored.revision;
     let evicted = runtime
@@ -1993,15 +2153,8 @@ fn evict_or_bulldoze(
     if evicted.is_none() && !bulldoze {
         return Err(LifecycleError::LotUnoccupied { house });
     }
-
-    let saved_lot = store.load_saved_lot(neighborhood_id, house)?;
-    let base_house = store.load_base_house(neighborhood_id, house)?;
-    if saved_lot.is_none() && base_house.is_none() {
-        return Err(LifecycleError::HouseNotFound {
-            neighborhood: neighborhood_id.to_owned(),
-            house,
-        });
-    }
+    let saved_lot = snapshot.saved_lot;
+    let base_house = snapshot.base_house;
 
     // Map loose `Characters` files to their catalog GUIDs before `runtime` is
     // consumed so bulldoze tombstone deletion (`0x426fcd` → `0x46b42a`) can
@@ -2812,5 +2965,67 @@ mod tests {
                 .all(|o| o.id != lead_id && o.id != non_lead_id && o.guid != lead_guid),
             "multi-tile group whose non-lead tile qualifies must be removed on bulldoze"
         );
+    }
+
+    #[test]
+    fn saved_lot_with_deleted_bulldozed_visitor_reopens_and_steps_cleanly() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let db = TempDb::new("deleted-visitor-purge");
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let no_frames = Frames::parse("none").unwrap();
+        let chars_before = store.load_character_files("UserData").unwrap().len();
+
+        // Save House 7 containing a live visitor with GUID `0x7757D9EE`
+        // (Goth House 5 tombstone whose loose `.iff` is deleted on bulldoze).
+        let mut house7 = enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
+        let template_id = house7.world.people[0];
+        let visitor_id = house7.world.objects.keys().copied().max().unwrap_or(100) + 1;
+        let mut visitor = house7.world.objects[&template_id].clone();
+        visitor.id = visitor_id;
+        visitor.guid = 0x7757_D9EE;
+        visitor.selected = false;
+        let tomb_nbr = house7.world.neighbors.first_of(0x7757_D9EE).unwrap().id;
+        if let Some(person) = visitor.person.as_mut() {
+            person.data[31] = tomb_nbr;
+            person.data[PERSON_HOME] = 5;
+            person.data[61] = 0;
+        }
+        let next_type = house7.world.types.keys().copied().max().unwrap_or(0) + 1;
+        house7.world.types.insert(next_type, 0x7757_D9EE);
+        house7.world.objects.insert(visitor_id, visitor);
+        house7.world.order.push(visitor_id);
+        house7.world.people.push(visitor_id);
+        save_and_leave_lot(&root, &store, "UserData", &mut house7).unwrap();
+
+        // Bulldoze House 5: deletes `0x7757D9EE` from NBRS and its loose `.iff`.
+        let report = bulldoze(&root, &store, "UserData", 5).unwrap();
+        assert!(report.deleted_tombstones >= 1);
+        let nh_after = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert!(nh_after.deleted_characters.contains(&0x7757_D9EE));
+        assert!(
+            nh_after
+                .neighbors
+                .iter()
+                .flatten()
+                .all(|n| n.guid != 0x7757_D9EE)
+        );
+        assert!(
+            store.load_character_files("UserData").unwrap().len() < chars_before,
+            "bulldozing House 5 must remove deleted tombstone character files from REDB"
+        );
+
+        // Reopening House 7 must purge the deleted visitor cleanly and step!
+        let mut house7_after = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
+        assert!(!house7_after.world.objects.contains_key(&visitor_id));
+        assert!(!house7_after.world.people.contains(&visitor_id));
+        for _ in 0..3 {
+            house7_after.step().unwrap();
+        }
+        save_and_leave_lot(&root, &store, "UserData", &mut house7_after).unwrap();
     }
 }

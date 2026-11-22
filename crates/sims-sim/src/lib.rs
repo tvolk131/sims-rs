@@ -41,8 +41,8 @@ pub use error::Error;
 pub use neighborhood_store::{
     CheckedCommitError, DEFAULT_ARCH_VALUE_MULTIPLIER, DEFAULT_LAYOUT_HISTORY_FILL,
     DEFAULT_NEW_FAMILY_START_HOUR, FAMILY_FLAG_BIT_3, FAMILY_FLAG_HAS_CATEGORY_1,
-    FAMILY_FLAG_HAS_CATEGORY_9, FAMILY_FLAG_NEW_MOVE_IN, ImportSummary, NEIGHBORHOOD_FORMAT,
-    NeighborhoodStore, StoredNeighborhood, family_net_worth, lot_total_value,
+    FAMILY_FLAG_HAS_CATEGORY_9, FAMILY_FLAG_NEW_MOVE_IN, ImportSummary, LotSnapshot,
+    NEIGHBORHOOD_FORMAT, NeighborhoodStore, StoredNeighborhood, family_net_worth, lot_total_value,
 };
 pub use snapshot::{FORMAT as SNAPSHOT_FORMAT, ReadOnlySnapshots, Snapshots};
 pub use world::{

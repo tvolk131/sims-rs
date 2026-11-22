@@ -121,20 +121,19 @@ impl Neighborhood {
             .collect())
     }
 
-    /// Regular files and empty directories in the neighborhood's `Characters`
-    /// folder, recursively, returning `(relative_slash_path, disk_path)` pairs
-    /// in `sorted_entries` traversal order. Empty directories are emitted with
-    /// a trailing `/` so inline mounts preserve `MountedFiles::scan` directory
-    /// precedence (e.g. an empty directory shadowing a same-named FAR member).
-    /// Empty when there is no such folder.
+    /// Regular files and directories in the neighborhood's `Characters` folder,
+    /// recursively, returning `(relative_slash_path, disk_path)` pairs in
+    /// `sorted_entries` traversal order. Every directory is emitted with a
+    /// trailing `/` so inline mounts preserve `MountedFiles::scan` directory
+    /// precedence (e.g. a directory shadowing a same-named FAR member even if
+    /// all loose files inside it are later deleted). Empty when there is no
+    /// such folder.
     pub fn character_tree(&self) -> Result<Vec<(String, PathBuf)>> {
         fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
-            let entries = sorted_entries(dir)?;
-            if entries.is_empty() && !prefix.is_empty() {
+            if !prefix.is_empty() {
                 out.push((format!("{prefix}/"), dir.to_path_buf()));
-                return Ok(());
             }
-            for path in entries {
+            for path in sorted_entries(dir)? {
                 let name = path
                     .file_name()
                     .unwrap_or_default()

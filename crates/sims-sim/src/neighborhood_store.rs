@@ -98,7 +98,7 @@ const ACTIVE_KEY: &str = "active";
 
 /// Bumped whenever [`StoredNeighborhood`]'s postcard layout changes so an older
 /// record is refused cleanly instead of misread.
-pub const NEIGHBORHOOD_FORMAT: u32 = 1;
+pub const NEIGHBORHOOD_FORMAT: u32 = 2;
 
 /// Default `"architecture value multiplier"` from `Global.far` `FCNS #4`
 /// (`0x6e4a88`, `0x3f333333`).
@@ -156,6 +156,17 @@ pub fn lot_total_value(
 #[must_use]
 pub fn family_net_worth(family: &Family) -> i32 {
     family.budget.wrapping_add(family.architecture_value)
+}
+
+/// Consistent point-in-time snapshot of a neighborhood and one house read in a
+/// single REDB read transaction, preventing lot entry from mixing two
+/// committed revisions.
+#[derive(Debug, Clone)]
+pub struct LotSnapshot {
+    pub neighborhood: StoredNeighborhood,
+    pub character_files: BTreeMap<String, Vec<u8>>,
+    pub saved_lot: Option<Vec<u8>>,
+    pub base_house: Option<Vec<u8>>,
 }
 
 /// Summary returned by [`NeighborhoodStore::import_directory`].
@@ -521,12 +532,34 @@ fn store(error: impl std::fmt::Display) -> Error {
     Error::Store(error.to_string())
 }
 
+/// Mixes a store's persisted database ID with its canonical path and OS file
+/// identity (device + inode on Unix) so copying a `.redb` file on disk yields a
+/// distinct store identity while reopening the same file preserves it.
+fn bind_store_file_identity(persisted_id: u128, canonical_path: &Path) -> u128 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"store-file-identity");
+    hasher.update(persisted_id.to_le_bytes());
+    hasher.update(canonical_path.to_string_lossy().as_bytes());
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(canonical_path) {
+        use std::os::unix::fs::MetadataExt;
+        hasher.update(meta.dev().to_le_bytes());
+        hasher.update(meta.ino().to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    let bytes: [u8; 16] = digest[..16].try_into().expect("sha256 is 32 bytes");
+    let id = u128::from_le_bytes(bytes);
+    if id == 0 { 1 } else { id }
+}
+
 impl NeighborhoodStore {
     /// Opens an existing REDB neighborhood store or creates a new one,
-    /// ensuring a persistent 128-bit store identity exists in
-    /// [`NEIGHBORHOOD_META`].
+    /// ensuring a persistent 128-bit store identity bound to both the database
+    /// metadata and the underlying file identity (canonical path and Unix
+    /// device/inode) so copied database files never share a store identity.
     pub fn open(path: &Path) -> Result<Self> {
         let db = Database::create(path).map_err(store)?;
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let existing = {
             let txn = db.begin_read().map_err(store)?;
             match txn.open_table(NEIGHBORHOOD_META) {
@@ -539,10 +572,9 @@ impl NeighborhoodStore {
                 Err(error) => return Err(store(error)),
             }
         };
-        let store_id = match existing {
+        let persisted_id = match existing {
             Some(id) => id,
             None => {
-                let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
                 let candidate = fresh_unique_id("store", 0, canon.to_string_lossy().as_bytes());
                 let txn = db.begin_write().map_err(store)?;
                 let committed_id = {
@@ -565,6 +597,7 @@ impl NeighborhoodStore {
                 committed_id
             }
         };
+        let store_id = bind_store_file_identity(persisted_id, &canon);
         Ok(Self { db, store_id })
     }
 
@@ -819,12 +852,89 @@ impl NeighborhoodStore {
         StoredNeighborhood::decode(id, value.value()).map(Some)
     }
 
+    /// Loads a consistent point-in-time snapshot of neighborhood `id`, its
+    /// character files, and `(saved_lot, base_house)` for `house` inside a
+    /// single REDB read transaction.
+    pub fn load_lot_snapshot(&self, id: &str, house: u32) -> Result<Option<LotSnapshot>> {
+        let txn = self.db.begin_read().map_err(store)?;
+        let nh_table = match txn.open_table(NEIGHBORHOODS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(store(error)),
+        };
+        let Some(nh_value) = nh_table.get(id).map_err(store)? else {
+            return Ok(None);
+        };
+        let neighborhood = StoredNeighborhood::decode(id, nh_value.value())?;
+
+        let mut character_files = BTreeMap::new();
+        match txn.open_table(NEIGHBORHOOD_CHARACTERS) {
+            Ok(table) => {
+                for entry in table.range((id, "")..).map_err(store)? {
+                    let (key, value) = entry.map_err(store)?;
+                    let (nh_key, name) = key.value();
+                    if nh_key != id {
+                        break;
+                    }
+                    character_files.insert(name.to_owned(), value.value().to_vec());
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(store(error)),
+        }
+
+        let saved_lot = match txn.open_table(NEIGHBORHOOD_LOTS) {
+            Ok(table) => table
+                .get((id, house))
+                .map_err(store)?
+                .map(|value| value.value().to_vec()),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(error) => return Err(store(error)),
+        };
+
+        let base_house = match txn.open_table(NEIGHBORHOOD_HOUSES) {
+            Ok(table) => table
+                .get((id, house))
+                .map_err(store)?
+                .map(|value| value.value().to_vec()),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(error) => return Err(store(error)),
+        };
+
+        Ok(Some(LotSnapshot {
+            neighborhood,
+            character_files,
+            saved_lot,
+            base_house,
+        }))
+    }
+
     /// Saves `state` for neighborhood `id`, replacing any previous state.
+    ///
+    /// When overwriting an existing neighborhood record, strictly advances the
+    /// committed `revision` past the previously stored revision so any already-
+    /// open lot session cannot silently overwrite the new state on Save & Leave.
     pub fn save_neighborhood(&self, id: &str, state: &StoredNeighborhood) -> Result<()> {
-        let encoded = state.encode();
         let txn = self.db.begin_write().map_err(store)?;
         {
             let mut table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
+            let previous = table
+                .get(id)
+                .map_err(store)?
+                .and_then(|v| StoredNeighborhood::decode(id, v.value()).ok());
+            let mut committed = state.clone();
+            if let Some(prev) = previous {
+                if committed.revision <= prev.revision {
+                    committed.revision = prev.revision.saturating_add(1);
+                }
+                if committed.instance_id == 0 {
+                    committed.instance_id = prev.instance_id;
+                }
+            }
+            if committed.instance_id == 0 {
+                committed.instance_id = fresh_unique_id("neighborhood", 0, id.as_bytes());
+            }
+            let encoded = committed.encode();
             table.insert(id, encoded.as_slice()).map_err(store)?;
         }
         txn.commit().map_err(store)
@@ -996,11 +1106,10 @@ impl NeighborhoodStore {
         state: &StoredNeighborhood,
         remove_character_files: &[String],
     ) -> Result<std::result::Result<(), CheckedCommitError>> {
-        let encoded = state.encode();
         let txn = self.db.begin_write().map_err(store)?;
         {
             let mut nh_table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
-            if let Some((expected_instance_id, expected_revision)) = expected {
+            let committed = if let Some((expected_instance_id, expected_revision)) = expected {
                 let Some(existing) = nh_table.get(id).map_err(store)? else {
                     return Err(Error::Store(format!("neighborhood {id:?} does not exist")));
                 };
@@ -1017,7 +1126,27 @@ impl NeighborhoodStore {
                         current: current.revision,
                     }));
                 }
-            }
+                state.clone()
+            } else {
+                let previous = nh_table
+                    .get(id)
+                    .map_err(store)?
+                    .and_then(|v| StoredNeighborhood::decode(id, v.value()).ok());
+                let mut next = state.clone();
+                if let Some(prev) = previous {
+                    if next.revision <= prev.revision {
+                        next.revision = prev.revision.saturating_add(1);
+                    }
+                    if next.instance_id == 0 {
+                        next.instance_id = prev.instance_id;
+                    }
+                }
+                if next.instance_id == 0 {
+                    next.instance_id = fresh_unique_id("neighborhood", 0, id.as_bytes());
+                }
+                next
+            };
+            let encoded = committed.encode();
             let mut lot_table = txn.open_table(NEIGHBORHOOD_LOTS).map_err(store)?;
             lot_table.insert((id, house), lot_bytes).map_err(store)?;
             nh_table.insert(id, encoded.as_slice()).map_err(store)?;

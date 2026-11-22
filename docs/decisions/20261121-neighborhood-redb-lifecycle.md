@@ -14,9 +14,10 @@ any install files.
 using five tables:
 
 - `neighborhoods` (`&str -> &[u8]`): versioned `StoredNeighborhood`
-  (`NEIGHBORHOOD_FORMAT = 1` little-endian `u32` + postcard payload) holding
+  (`NEIGHBORHOOD_FORMAT = 2` little-endian `u32` + postcard payload) holding
   `FAMI`, `NBRS`, `NGBH` data/inventories/options, `TATT`, resolved
-  `LotZoning`, lot row order, runtime-created `World::characters`, and a
+  `LotZoning`, lot row order, runtime-created `World::characters`, permanently
+  deleted character GUIDs (`deleted_characters`), unique `instance_id`, and a
   monotonic `revision`.
 - `neighborhood_characters` (`(&str, &str) -> &[u8]`): raw immutable
   `Characters/*.iff` blobs imported from `UserData*/Characters`.
@@ -60,14 +61,19 @@ recursive directory / inline `.far` mounting, Windows-1252 key encoding, and
 
 ### Save & Leave Writeback (`0x428687` → `0x41615d` → `0x43fb1b` → `0x4252cc`)
 
-1. Verify `lot.neighborhood_origin` matches the store's persistent 128-bit
-   `store_id`, `neighborhood_id`, and `instance_id`
-   (`LifecycleError::NeighborhoodMismatch`), and matches the store's current
-   `revision` both before serialization and inside the REDB write transaction
-   (`LifecycleError::StaleNeighborhood`), preventing cross-store writes,
-   same-ID re-import overwrites, or silent lost updates from stale open lots.
-   `Lot::restore` clears `neighborhood_origin` so restoring an older snapshot
-   cannot bypass the revision guard. `move_in` likewise commits via an
+1. Verify `lot.neighborhood_origin` matches the store's file-identity-bound
+   128-bit `store_id` (combining persisted metadata with canonical path and OS
+   file identity so copied `.redb` files never share a `store_id`),
+   `neighborhood_id`, and `instance_id` (`LifecycleError::NeighborhoodMismatch`),
+   and matches the store's current `revision` both before serialization and
+   inside the REDB write transaction (`LifecycleError::StaleNeighborhood`),
+   preventing cross-store or copied-DB writes, same-ID re-import overwrites, or
+   silent lost updates from stale open lots. `Lot::restore` clears
+   `neighborhood_origin` so restoring an older snapshot cannot bypass the
+   revision guard, `save_neighborhood` strictly advances `revision` when
+   overwriting an existing neighborhood record, and `enter_lot`/`evict`/
+   `bulldoze`/`lot_price` all read from a single MVCC REDB read transaction via
+   `NeighborhoodStore::load_lot_snapshot`. `move_in` likewise commits via an
    in-transaction `(instance_id, revision)` check.
 2. Flush every live person on the lot into its neighborhood record via
    `people::save_to_record` (`0x459d8b` → `0x425a69`, revision 9 persistent
