@@ -37,7 +37,7 @@ use sims_formats::bitmap::{self, Image as BitmapImage};
 use sims_formats::iff::Iff;
 use sims_formats::lot::Simulator;
 use sims_formats::neighborhood::Family;
-use sims_formats::strings::StringTable;
+use sims_formats::strings::{Format as StringTableFormat, StringTable, TextEntry};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -740,9 +740,9 @@ impl NeighborhoodMap {
             }
         }
 
-        let locations = load_lot_locations(install, user_dir)?;
-        let zoning_table = load_lot_zoning(install, user_dir)?;
-        let occupancy = load_family_occupancy(install, user_dir)?;
+        let locations = load_lot_locations(install, user_dir);
+        let zoning_table = load_lot_zoning(install, user_dir);
+        let occupancy = load_family_occupancy(install, user_dir);
 
         // 0x557122..0x557128: Unleashed walks LotZoning in file order and stops
         // at the first entry whose signed 32-bit lot ID exceeds 80 (0x50).
@@ -756,12 +756,7 @@ impl NeighborhoodMap {
                 .collect(),
         };
 
-        let houses_dir = resolve_child(install, user_dir, "Houses").ok_or_else(|| {
-            Error::new(format!(
-                "missing Houses directory inside {}",
-                user_dir.display()
-            ))
-        })?;
+        let houses_dir = resolve_child(install, user_dir, "Houses");
 
         let badge_sprite = if kind == NeighborhoodKind::Vacation {
             vacation_no_vacancy.as_ref()
@@ -770,67 +765,72 @@ impl NeighborhoodMap {
         };
 
         let mut lots = Vec::with_capacity(lot_ids.len());
-        for lot_id in lot_ids {
-            // 0x4e20a9..0x4e257c: dispatch by lot ID across STR# 1/2/3/4/5/7,
-            // defaulting to [0, 0] when the table or row is absent.
-            let anchor = locations.anchor_for(lot_id, kind.uses_half_scale());
-            let house_name = format!("House{lot_id:02}.iff");
-            let Some(house_path) = resolve_child(install, &houses_dir, &house_name) else {
-                continue;
-            };
-            let iff_bytes = fs::read(&house_path)
-                .map_err(|e| Error::new(format!("reading {}: {e}", house_path.display())))?;
-            let iff = Iff::parse(iff_bytes)?;
+        if let Some(houses_dir) = houses_dir {
+            for lot_id in lot_ids {
+                // 0x4e20a9..0x4e257c: dispatch by lot ID across STR# 1/2/3/4/5/7,
+                // defaulting to [0, 0] when the table or row is absent.
+                let anchor = locations.anchor_for(lot_id, kind.uses_half_scale());
+                let house_name = format!("House{lot_id:02}.iff");
+                let Some(house_path) = resolve_child(install, &houses_dir, &house_name) else {
+                    continue;
+                };
+                // 0x4e1e04..0x4e1e0f: an unreadable or invalid HouseNN.iff exits
+                // only this lot's load and lets the map continue with remaining lots.
+                let Some(iff) = open_iff(&house_path) else {
+                    continue;
+                };
 
-            let Some(BuiltLotCells {
-                metrics,
-                normal,
-                roofs_off,
-                vacation_badged,
-            }) = build_lot_cells(&iff, kind.uses_half_scale(), badge_sprite)?
-            else {
-                continue;
-            };
+                let Ok(Some(BuiltLotCells {
+                    metrics,
+                    normal,
+                    roofs_off,
+                    vacation_badged,
+                })) = build_lot_cells(&iff, kind.uses_half_scale(), badge_sprite)
+                else {
+                    continue;
+                };
 
-            let filter_mask = read_lot_filter_mask(&iff);
-            let zoning = zoning_table
-                .first_zone
-                .get(&i32::from(lot_id))
-                .copied()
-                .unwrap_or(match kind {
-                    NeighborhoodKind::Classic => LotZoning::Residential,
-                    NeighborhoodKind::Downtown
-                    | NeighborhoodKind::Vacation
-                    | NeighborhoodKind::StudioTown => LotZoning::Community,
-                    NeighborhoodKind::MagicTown => {
-                        if lot_id <= 92 {
-                            LotZoning::Residential
-                        } else {
-                            LotZoning::Community
+                let filter_mask = read_lot_filter_mask(&iff);
+                let zoning = zoning_table
+                    .first_zone
+                    .get(&i32::from(lot_id))
+                    .copied()
+                    .unwrap_or(match kind {
+                        NeighborhoodKind::Classic => LotZoning::Residential,
+                        NeighborhoodKind::Downtown
+                        | NeighborhoodKind::Vacation
+                        | NeighborhoodKind::StudioTown => LotZoning::Community,
+                        NeighborhoodKind::MagicTown => {
+                            if lot_id <= 92 {
+                                LotZoning::Residential
+                            } else {
+                                LotZoning::Community
+                            }
                         }
-                    }
-                    NeighborhoodKind::Unleashed => LotZoning::Unknown,
-                });
-            let status = resolve_lot_status(lot_id, kind, zoning, &occupancy);
-            let lot_i32 = i32::from(lot_id);
-            let has_primary_vacation_stay = occupancy.primary_vacation_stays.contains(&lot_i32);
-            let has_vacation_occupancy = occupancy.any_house_matches.contains(&lot_i32);
-            let cell_origin = compute_cell_origin(anchor, metrics, [normal.width, normal.height]);
+                        NeighborhoodKind::Unleashed => LotZoning::Unknown,
+                    });
+                let status = resolve_lot_status(lot_id, kind, zoning, &occupancy);
+                let lot_i32 = i32::from(lot_id);
+                let has_primary_vacation_stay = occupancy.primary_vacation_stays.contains(&lot_i32);
+                let has_vacation_occupancy = occupancy.any_house_matches.contains(&lot_i32);
+                let cell_origin =
+                    compute_cell_origin(anchor, metrics, [normal.width, normal.height]);
 
-            lots.push(MapLot {
-                id: lot_id,
-                anchor,
-                metrics,
-                cell_origin,
-                zoning,
-                status,
-                has_primary_vacation_stay,
-                has_vacation_occupancy,
-                filter_mask,
-                normal,
-                roofs_off,
-                vacation_badged,
-            });
+                lots.push(MapLot {
+                    id: lot_id,
+                    anchor,
+                    metrics,
+                    cell_origin,
+                    zoning,
+                    status,
+                    has_primary_vacation_stay,
+                    has_vacation_occupancy,
+                    filter_mask,
+                    normal,
+                    roofs_off,
+                    vacation_badged,
+                });
+            }
         }
 
         Ok(Self {
@@ -1748,14 +1748,12 @@ impl FamilyOccupancy {
     }
 }
 
-fn load_family_occupancy(install: &Install, user_dir: &Path) -> Result<FamilyOccupancy> {
+fn load_family_occupancy(install: &Install, user_dir: &Path) -> FamilyOccupancy {
     let mut occ = FamilyOccupancy::default();
-    let Some(path) = resolve_child(install, user_dir, "Neighborhood.iff") else {
-        return Ok(occ);
+    let Some(iff) = resolve_child(install, user_dir, "Neighborhood.iff").and_then(|p| open_iff(&p))
+    else {
+        return occ;
     };
-    let bytes =
-        fs::read(&path).map_err(|e| Error::new(format!("reading {}: {e}", path.display())))?;
-    let iff = Iff::parse(bytes)?;
     for chunk in iff.all(b"FAMI") {
         let Ok(family) = Family::parse(iff.data(chunk)) else {
             continue;
@@ -1763,7 +1761,7 @@ fn load_family_occupancy(install: &Install, user_dir: &Path) -> Result<FamilyOcc
         // 0x410673 / 0x4e1e73: native family ID is the FAMI chunk ID, not payload `number`.
         occ.record_family(i32::from(chunk.id), &family);
     }
-    Ok(occ)
+    occ
 }
 
 fn resolve_lot_status(
@@ -1831,41 +1829,110 @@ impl LotLocations {
     }
 }
 
-fn load_lot_locations(install: &Install, user_dir: &Path) -> Result<LotLocations> {
-    // 0x4e1f7c..0x4e2098: prefer UserDataN/LotLocations.iff; if absent, fall
-    // back to GameData/LotLocations.iff. Missing files or missing STR# chunks
-    // leave the corresponding table(s) empty so anchors default to [0, 0].
-    let Some(path) = resolve_child(install, user_dir, "LotLocations.iff")
-        .or_else(|| install.file("GameData/LotLocations.iff").ok())
+fn open_iff(path: &Path) -> Option<Iff> {
+    let bytes = fs::read(path).ok()?;
+    Iff::parse(bytes).ok()
+}
+
+/// Parses a legacy `\0CST` string-table chunk (`0x470178..0x470209`),
+/// extracting `^...^`-delimited strings in file order.
+fn parse_cst_chunk(data: &[u8]) -> StringTable {
+    let mut entries = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, &b) in data.iter().enumerate() {
+        if b == b'^' {
+            if let Some(s) = start.take() {
+                let raw = &data[s..i];
+                entries.push(TextEntry {
+                    language: US_ENGLISH,
+                    text: sims_formats::strings::decode(raw, US_ENGLISH),
+                    comment: String::new(),
+                    raw_text: raw.to_vec(),
+                    raw_comment: Vec::new(),
+                });
+            } else {
+                start = Some(i + 1);
+            }
+        }
+    }
+    StringTable {
+        format: StringTableFormat::Terminated,
+        entries,
+    }
+}
+
+/// Loads a string table chunk matching `0x4702f9..0x47034b`: tries `STR#` first,
+/// then falls back to legacy `\0CST` (`0x00435354`) with the same resource ID.
+fn load_native_string_table(iff: &Iff, id: u16) -> Option<StringTable> {
+    if let Some(chunk) = iff.get(b"STR#", id)
+        && let Ok(table) = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk))
+    {
+        return Some(table);
+    }
+    iff.get(b"\0CST", id)
+        .map(|chunk| parse_cst_chunk(iff.data(chunk)))
+}
+
+/// Reproduces the native `STR#` US English entry vector order (`0x46ffd5..0x470069`,
+/// `0x470482`): for version `-3` (`Format::Localized`) tables, each language
+/// transition resets the insertion cursor to 0 and inserts subsequent entries
+/// ahead of earlier blocks of the same language.
+fn native_us_entries(table: &StringTable) -> Vec<&TextEntry> {
+    let mut out = Vec::new();
+    if table.format != StringTableFormat::Localized {
+        out.extend(table.entries.iter().filter(|e| e.language == US_ENGLISH));
+        return out;
+    }
+    let mut prev_lang: Option<u8> = None;
+    let mut idx: usize = 0;
+    for entry in &table.entries {
+        if prev_lang != Some(entry.language) {
+            idx = 0;
+            prev_lang = Some(entry.language);
+        }
+        if entry.language != US_ENGLISH {
+            continue;
+        }
+        let pos = idx.min(out.len());
+        out.insert(pos, entry);
+        idx += 1;
+    }
+    out
+}
+
+fn load_lot_locations(install: &Install, user_dir: &Path) -> LotLocations {
+    // 0x4e1f7c..0x4e2098: attempt to open UserDataN/LotLocations.iff first; if
+    // missing or rejected by the IFF opener, fall back to GameData/LotLocations.iff.
+    // Missing files or missing STR#/\0CST tables leave empty maps ([0, 0] anchors).
+    let Some(iff) = resolve_child(install, user_dir, "LotLocations.iff")
+        .and_then(|p| open_iff(&p))
+        .or_else(|| {
+            install
+                .file("GameData/LotLocations.iff")
+                .ok()
+                .and_then(|p| open_iff(&p))
+        })
     else {
-        return Ok(LotLocations::default());
+        return LotLocations::default();
     };
-    let bytes =
-        fs::read(&path).map_err(|e| Error::new(format!("reading {}: {e}", path.display())))?;
-    let iff = Iff::parse(bytes)?;
-    let read_table = |str_id: u16, last_match_wins: bool, max_bytes: Option<usize>| -> Result<_> {
-        let Some(chunk) = iff.get(b"STR#", str_id) else {
-            return Ok(BTreeMap::new());
-        };
-        let table = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk))?;
-        Ok(parse_lot_locations_table_with(
-            &table,
-            last_match_wins,
-            max_bytes,
-        ))
+    let read_table = |str_id: u16, last_match_wins: bool, max_bytes: Option<usize>| {
+        load_native_string_table(&iff, str_id)
+            .map(|table| parse_lot_locations_table_with(&table, last_match_wins, max_bytes))
+            .unwrap_or_default()
     };
-    Ok(LotLocations {
-        classic: read_table(1, false, None)?,
-        downtown: read_table(2, true, Some(49))?,
-        vacation: read_table(3, true, None)?,
-        unleashed: read_table(4, false, None)?,
-        studio_town: read_table(5, true, None)?,
-        magic_town: read_table(7, true, None)?,
-    })
+    LotLocations {
+        classic: read_table(1, false, None),
+        downtown: read_table(2, true, Some(49)),
+        vacation: read_table(3, true, None),
+        unleashed: read_table(4, false, None),
+        studio_town: read_table(5, true, None),
+        magic_town: read_table(7, true, None),
+    }
 }
 
 /// Parses a main-map `LotLocations.iff` `STR#` table (`STR# 1` or `STR# 4`,
 /// `"lot_id, x, y"` rows in US English), matching `0x4e2501..0x4e257c`:
+/// - iterates entries in native `STR#` insertion order (`0x470002`, `0x470482`),
 /// - stops each row at its first NUL byte,
 /// - splits on the first two commas (rows with fewer than two commas are skipped),
 /// - parses signed 32-bit `id`, `x`, and `y` via C `atoi` (`0x636029`),
@@ -1880,10 +1947,7 @@ fn parse_lot_locations_table_with(
     max_bytes: Option<usize>,
 ) -> BTreeMap<u16, [i32; 2]> {
     let mut map = BTreeMap::new();
-    for entry in &table.entries {
-        if entry.language != US_ENGLISH {
-            continue;
-        }
+    for entry in native_us_entries(table) {
         let raw = if !entry.raw_text.is_empty() {
             entry.raw_text.as_slice()
         } else {
@@ -1917,29 +1981,28 @@ fn parse_lot_locations_table_with(
 /// Parsed `LotZoning.iff` `STR# 1` table preserving every row in file order
 /// with signed 32-bit lot IDs (`0x425016..0x425064`) and recording the first
 /// matching zone per lot ID (`0x42b9fc`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LotZoningTable {
     pub rows: Vec<(i32, LotZoning)>,
     pub first_zone: BTreeMap<i32, LotZoning>,
 }
 
-fn load_lot_zoning(install: &Install, user_dir: &Path) -> Result<LotZoningTable> {
-    // 0x424f1c..0x424f27: native reload opens the neighborhood's local
-    // LotZoning.iff and fails rather than substituting GameData/MasterLotZoning.iff.
-    let path = resolve_child(install, user_dir, "LotZoning.iff")
-        .ok_or_else(|| Error::new(format!("missing LotZoning.iff in {}", user_dir.display())))?;
-    let bytes =
-        fs::read(&path).map_err(|e| Error::new(format!("reading {}: {e}", path.display())))?;
-    let iff = Iff::parse(bytes)?;
-    let chunk = iff
-        .get(b"STR#", 1)
-        .ok_or_else(|| Error::new(format!("{} missing STR# 1", path.display())))?;
-    let table = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk))?;
-    Ok(parse_lot_zoning_table(&table))
+fn load_lot_zoning(install: &Install, user_dir: &Path) -> LotZoningTable {
+    // 0x424f1c..0x424f42: native reload opens only the neighborhood's local
+    // LotZoning.iff (never GameData/MasterLotZoning.iff) and tries STR# 1 then
+    // \0CST 1; failure leaves the zoning table empty rather than aborting maps.
+    let Some(iff) = resolve_child(install, user_dir, "LotZoning.iff").and_then(|p| open_iff(&p))
+    else {
+        return LotZoningTable::default();
+    };
+    load_native_string_table(&iff, 1)
+        .map(|table| parse_lot_zoning_table(&table))
+        .unwrap_or_default()
 }
 
 /// Parses a `LotZoning.iff` `STR# 1` table (`"lot_id, residential|community"`),
 /// following `0x424fb9..0x425064`:
+/// - iterates entries in native `STR#` insertion order (`0x470002`, `0x470482`),
 /// - truncates each row at the first NUL byte and deterministically caps it at
 ///   99 bytes (native `strncpy(buf, s, 0x63)` at `0x424fb9..0x424fcb` copies at
 ///   most 99 bytes and may leave a full 99-byte copy unterminated; Rust always
@@ -1950,16 +2013,13 @@ fn load_lot_zoning(install: &Install, user_dir: &Path) -> Result<LotZoningTable>
 /// - searches the ASCII-lowercased bytes after the comma for `"residential"`
 ///   first (`0x6c25a4`), then `"community"` (`0x6c2598`), defaulting to
 ///   [`LotZoning::Residential`] (`0x425052..0x42505e`),
-/// - preserves every row in file order (`0x425064`) and records the first
-///   matching zone per lot ID (`0x42b9fc..0x42ba09`).
+/// - preserves every row in native table order (`0x425064`) and records the
+///   first matching zone per lot ID (`0x42b9fc..0x42ba09`).
 pub fn parse_lot_zoning_table(table: &StringTable) -> LotZoningTable {
     const NATIVE_BUF_LIMIT: usize = 99;
     let mut rows = Vec::new();
     let mut first_zone = BTreeMap::new();
-    for entry in &table.entries {
-        if entry.language != US_ENGLISH {
-            continue;
-        }
+    for entry in native_us_entries(table) {
         let raw = if !entry.raw_text.is_empty() {
             entry.raw_text.as_slice()
         } else {
@@ -2560,6 +2620,33 @@ mod tests {
         // Missing STR# 7 (Magic Town) or unmapped lot ID retains [0, 0].
         assert_eq!(all_locs.anchor_for(90, false), [0, 0]);
         assert_eq!(all_locs.anchor_for(15, true), [0, 0]);
+
+        // Legacy \0CST caret-delimited string table parsing (0x470178..0x470209).
+        let cst = parse_cst_chunk(b"ignored^21, 410, 315^noise^22, 10, 20^unclosed");
+        let cst_dt = parse_lot_locations_table_with(&cst, true, Some(49));
+        assert_eq!(cst_dt.get(&21), Some(&[410, 315]));
+        assert_eq!(cst_dt.get(&22), Some(&[10, 20]));
+
+        // Interleaved language blocks in version -3 (Format::Localized) reset
+        // insertion index on language change, putting later English blocks ahead
+        // of earlier ones (0x470002, 0x470482).
+        let entry_lang = |lang: u8, s: &str| TextEntry {
+            language: lang,
+            text: s.to_string(),
+            comment: String::new(),
+            raw_text: s.as_bytes().to_vec(),
+            raw_comment: Vec::new(),
+        };
+        let interleaved = StringTable {
+            format: Format::Localized,
+            entries: vec![
+                entry_lang(US_ENGLISH, "1, 235, 245"),
+                entry_lang(2, "1, 999, 999"),
+                entry_lang(US_ENGLISH, "1, 435, 445"),
+            ],
+        };
+        let interleaved_locs = parse_lot_locations_table(&interleaved);
+        assert_eq!(interleaved_locs.get(&1), Some(&[435, 445]));
     }
 
     #[test]
