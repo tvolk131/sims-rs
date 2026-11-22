@@ -613,12 +613,12 @@ impl Interpreter<'_> {
         };
         // Above the ground the level's rise is added (0x5922ad); see
         // docs/decisions/20261115-snap-offset-order.md.
-        head::placement_on_level(a.position, height, level, self.view_rotation).ok_or_else(|| {
+        let rotation = self.view_rotation_for_object(world, id);
+        head::placement_on_level(a.position, height, level, rotation).ok_or_else(|| {
             unsupported(
                 "0x5c3a20",
                 &format!(
-                    "person {id}'s model matrix on level {level} with the view turned to {}",
-                    self.view_rotation
+                    "person {id}'s model matrix on level {level} with the view turned to {rotation}"
                 ),
             )
         })

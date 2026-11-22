@@ -350,6 +350,9 @@ pub struct Lot {
     /// cross-neighborhood saves, re-imported same-ID overwrites, and
     /// stale-revision overwrites. Cleared by [`Lot::restore`].
     pub(crate) neighborhood_origin: Option<NeighborhoodOrigin>,
+    /// Optional co-op multiplayer VM context (`crate::coop`). `None` in
+    /// single-player, preserving 100% bit-for-bit identical behavior.
+    pub(crate) coop: Option<crate::coop::CoopVmContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1192,6 +1195,7 @@ impl Lot {
             redo_order: Vec::new(),
             active_wall_cursor: None,
             neighborhood_origin: None,
+            coop: None,
         })
     }
 
@@ -1226,7 +1230,7 @@ impl Lot {
         self.step_in(true)
     }
 
-    fn step_in(&mut self, play: bool) -> Result<Update, StepError> {
+    pub(crate) fn step_in(&mut self, play: bool) -> Result<Update, StepError> {
         if self.halted {
             return Err(StepError::Halted);
         }
@@ -1266,15 +1270,17 @@ impl Lot {
             self.play.clone(),
             self.ticks,
             self.player.clone(),
+            self.coop.clone(),
         );
         self.answered = false;
         match self.advance(play) {
             Err(Stop::Asks { tick, shown }) => {
-                let (world, play, ticks, player) = before;
+                let (world, play, ticks, player, coop) = before;
                 let partway = std::mem::replace(&mut self.world, world);
                 self.play = play;
                 self.ticks = ticks;
                 self.player = player;
+                self.coop = coop;
                 self.replay_view
                     .get_or_insert((self.view_rotation, self.view_centre));
                 self.asking = Some(Box::new(Asking {
@@ -1297,6 +1303,20 @@ impl Lot {
 
     /// The tick and its frames, for a lot that can step.
     fn advance(&mut self, play: bool) -> Result<Update, Stop> {
+        let coop_cell = self.coop.take().map(RefCell::new);
+        let result = self.advance_with_coop(play, coop_cell.as_ref());
+        self.coop = coop_cell.map(RefCell::into_inner);
+        result
+    }
+
+    /// Inner tick execution with an optional co-op context cell so `self.coop`
+    /// is unconditionally restored on every exit path (including `Stop::Asks`
+    /// and errors).
+    fn advance_with_coop(
+        &mut self,
+        play: bool,
+        coop: Option<&RefCell<crate::coop::CoopVmContext>>,
+    ) -> Result<Update, Stop> {
         let tuning = self.tuning.as_ref().ok_or(StepError::Incomplete)?;
         let asks = self.asks;
         let sounds = RefCell::new(Vec::new());
@@ -1317,6 +1337,7 @@ impl Lot {
             character_names: Some(&character_names),
             default_character_name: Some(&self.default_character_name),
             active_family: (self.load.house != 0 && self.load.family == 0).then_some(&[][..]),
+            coop,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut frame_errors = Vec::new();
@@ -3138,7 +3159,7 @@ impl Lot {
     }
 
     /// Whether the lot takes a player's input.
-    fn ready(&self) -> Result<(), OrderError> {
+    pub(crate) fn ready(&self) -> Result<(), OrderError> {
         if self.halted {
             return Err(OrderError::Halted);
         }
@@ -3409,6 +3430,7 @@ mod tests {
             redo_order: Vec::new(),
             active_wall_cursor: None,
             neighborhood_origin: None,
+            coop: None,
         }
     }
 

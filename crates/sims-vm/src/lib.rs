@@ -41,6 +41,7 @@ mod build;
 mod buy;
 mod cancel;
 mod clip_events;
+pub mod coop;
 mod daily;
 mod error;
 mod factory;
@@ -87,6 +88,10 @@ pub use build::{
 pub use buy::{
     BuyActionKind, BuyCursor, BuyPlacement, BuyPurchase, COMEANDSEE_GUID, TILE_CURSOR_GUID,
     available_funds, default_buy_direction, panel_mode, snap_to_tile_centre,
+};
+pub use coop::{
+    CoopBatchReport, CoopCommandStatus, CoopError, CoopVmContext, menu_entry_to_pick_command,
+    player_mode_to_panel_mode,
 };
 pub use error::Error;
 pub use factory::TURN_BUDGET;

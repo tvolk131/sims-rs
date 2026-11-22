@@ -649,10 +649,12 @@ impl Machine<'_, '_> {
         };
         // Only global 34 always comes back with a word pointer, and global
         // 36 with write intent; the other globals resolve to values
-        // (legacy memory.rs:519).
+        // (legacy memory.rs:519). In co-op mode, global 3 (Selected Person ID)
+        // is also writable for script-driven selection changes
+        // (`docs/vision.md`: e.g. *Magic – Kid To Adult Backfire*).
         let writable = match cell {
             Cell::Literal(_) => false,
-            Cell::Global(i) => i == 34 || (write && i == 36),
+            Cell::Global(i) => i == 34 || (write && (i == 36 || (i == 3 && self.coop.is_some()))),
             _ => write,
         };
         Ok((cell, writable))
@@ -688,6 +690,17 @@ impl Machine<'_, '_> {
             }
             Cell::Temp(id, i) => get(&object(id)?.temps, i),
             Cell::DynamicSprite(id, i) => get(&object(id)?.dynamic_sprites, i),
+            Cell::Global(3) if self.coop.is_some() => {
+                // Bounds-check against `world.globals` first, then apply the
+                // multiplayer Global 3 policy (`docs/vision.md`).
+                let _ = get(&self.world.globals, 3)?;
+                let stack_object = self.frame()?.stack_object;
+                Ok(self
+                    .coop
+                    .expect("checked is_some")
+                    .borrow()
+                    .resolve_global_3(self.world, self.me, stack_object))
+            }
             Cell::Global(i) => get(&self.world.globals, i),
             Cell::TypeAttribute(record, i) => self
                 .world
@@ -767,6 +780,25 @@ impl Machine<'_, '_> {
                 .get_mut(i)
                 .ok_or_else(|| Trap::Invalid("no advertisement".into()))?;
             *ad.field_mut(field) = value;
+            return Ok(true);
+        }
+        if let Cell::Global(3) = cell
+            && let Some(coop) = self.coop
+        {
+            let stack_object = self.frame()?.stack_object;
+            let host_selected = {
+                let mut ctx = coop.borrow_mut();
+                ctx.write_global_3(self.world, me, stack_object, value);
+                ctx.session
+                    .selected_sim_for_activity(None)
+                    .map_or(0, |id| id as i16)
+            };
+            let slot = self
+                .world
+                .globals
+                .get_mut(3)
+                .ok_or_else(|| Trap::Invalid("word out of range".into()))?;
+            *slot = host_selected;
             return Ok(true);
         }
         let world = &mut *self.world;

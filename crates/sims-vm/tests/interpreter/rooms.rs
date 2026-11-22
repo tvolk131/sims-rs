@@ -169,7 +169,7 @@ fn a_function_7_that_names_no_tree_runs_nothing() {
     assert_eq!(interpreter.create(&mut fx.world, WIDGET), Ok(3));
     let before = format!("{:?}", fx.world.objects[&3]);
     let done = assign_rooms(&mut fx).unwrap();
-    assert_eq!(done.asked, []);
+    assert_eq!(done.asked, [0u16; 0]);
     assert_eq!(format!("{:?}", fx.world.objects[&3]), before);
 }
 

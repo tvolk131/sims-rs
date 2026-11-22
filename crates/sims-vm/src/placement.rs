@@ -1413,11 +1413,14 @@ impl Interpreter<'_> {
         let rules = PORTRAIT_SEARCH_RULES;
         let tiles: Vec<[i8; 2]> = match self.view_centre {
             Some(pick) => {
-                let from = portrait_start(i32::from(world.size), self.view_rotation, pick)
-                    .map_err(|trap| Fault {
-                        object: id,
-                        at: None,
-                        trap,
+                let rotation = self.view_rotation_for_object(world, id);
+                let from =
+                    portrait_start(i32::from(world.size), rotation, pick).map_err(|trap| {
+                        Fault {
+                            object: id,
+                            at: None,
+                            trap,
+                        }
                     })?;
                 let Some(pos) = self.search(world, id, from, 1, rules)? else {
                     return Ok(PortraitPutPlan::NoTile);

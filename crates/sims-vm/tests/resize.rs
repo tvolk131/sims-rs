@@ -80,7 +80,7 @@ fn with_goth_people(
     world.read_house_model(house.model.as_ref().unwrap());
     world.apply_context(context).unwrap();
     let resized = interpreter.resize(&mut world).unwrap();
-    assert_eq!(resized.removed, []);
+    assert_eq!(resized.removed, [0u16; 0]);
     let created = resized.created;
     let guids = house.objects.instances.values().map(|o| o.guid);
     let people = People::load(&install, &index, &catalog, guids).unwrap();
@@ -1604,7 +1604,7 @@ fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
             let before = world.clone();
             // Step 8.
             let done = interpreter.reconcile_controllers(world).unwrap();
-            assert_eq!(done.removed, []);
+            assert_eq!(done.removed, [0u16; 0]);
             assert_eq!(done.created.len(), 137);
             // New objects take the lowest unused IDs, so the first four
             // fill the gaps the house left.

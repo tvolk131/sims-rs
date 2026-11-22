@@ -135,7 +135,21 @@ impl Interpreter<'_> {
         mode: PanelMode,
     ) -> Result<(), Fault> {
         if mode == PanelMode::Live {
-            list_queue(world);
+            if let Some(coop) = self.coop {
+                let sims = coop.borrow().selected_sims();
+                if sims.is_empty() {
+                    list_queue(world);
+                } else {
+                    for sim in sims {
+                        list_queue_for(world, sim);
+                    }
+                    if let Some(sim) = world.selected() {
+                        list_queue_for(world, sim);
+                    }
+                }
+            } else {
+                list_queue(world);
+            }
         }
         self.update_pending_rooms(world)?;
         let people: Vec<u16> = world
@@ -246,6 +260,10 @@ fn list_queue(world: &mut World) {
     let Some(sim) = world.selected() else {
         return;
     };
+    list_queue_for(world, sim);
+}
+
+fn list_queue_for(world: &mut World, sim: u16) {
     let Some(person) = world.objects.get_mut(&sim).and_then(|o| o.person.as_mut()) else {
         return;
     };

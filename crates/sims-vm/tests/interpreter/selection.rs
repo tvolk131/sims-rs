@@ -364,7 +364,7 @@ fn the_familys_first_member_is_selected_if_the_lot_allows_it() {
     // A first member who is not on the lot, or no member: nobody.
     let mut fx = household(5, Some(1), 0, 7);
     assert_eq!(select_resident(&mut fx, &[0x7777, SIM_GUID]), (None, 99));
-    assert_eq!(fx.world.instances[&0x7777], []);
+    assert_eq!(fx.world.instances[&0x7777], [0u16; 0]);
     let mut fx = household(5, Some(1), 0, 7);
     assert_eq!(select_resident(&mut fx, &[]), (None, 99));
     // A selected Sim that belongs to a family stays selected, whoever
