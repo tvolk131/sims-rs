@@ -592,7 +592,8 @@ impl<T: Target + ?Sized> Target for Packed565<'_, T> {
 /// Draws one skinned part of a person on the lot into `target`, with or
 /// without room lamps, culling counter-clockwise screen-space back faces
 /// as Direct3D 6's default `D3DRENDERSTATE_CULLMODE` (`D3DCULL_CCW`, never
-/// overridden in `0x5ce911`–`0x5cea52` or `0x5d3540`–`0x5d3c40`) does.
+/// overridden in `0x5ce911`–`0x5cea52`, `0x5d34c6`–`0x5d37f1`, or
+/// `0x5d38d5`–`0x5d3c69`) does.
 fn draw_lot_part<T: Target + ?Sized>(
     target: &mut T,
     part: &crate::appearance::Part,

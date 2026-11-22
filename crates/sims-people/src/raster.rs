@@ -346,8 +346,8 @@ pub fn draw_shaded<T: Target + ?Sized>(
 
 /// Like [`draw_shaded`], culling counter-clockwise screen-space back faces
 /// (`edge(a, b, c) < 0.0`) as Direct3D 6's default `D3DRENDERSTATE_CULLMODE`
-/// (`D3DCULL_CCW`, never overridden in `0x5ce911`–`0x5cea52` or
-/// `0x5d3540`–`0x5d3c40`) does.
+/// (`D3DCULL_CCW`, never overridden in `0x5ce911`–`0x5cea52`,
+/// `0x5d34c6`–`0x5d37f1`, or `0x5d38d5`–`0x5d3c69`) does.
 pub fn draw_shaded_culled<T: Target + ?Sized>(
     target: &mut T,
     part: &Part,
