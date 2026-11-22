@@ -254,21 +254,20 @@ pub struct Lot {
     /// Monotonic token allocator for [`BuyCursor`] handles so retired handles
     /// can never alias newly created objects that reuse an old numeric ID.
     next_buy_cursor_token: u64,
-    /// Live Buy Mode cursors (`token -> ActiveBuyCursor`), preventing unpaid
-    /// previews or already-held objects from being picked up as existing
-    /// furniture and preventing retired/invalidated handles from aliasing
-    /// newly created objects that reuse an old numeric ID.
-    active_buy_cursors: std::collections::BTreeMap<u64, ActiveBuyCursor>,
+    /// The single live Buy Mode cursor currently owned by this lot, enforcing
+    /// native single-cursor ownership and preventing retired/invalidated
+    /// [`BuyCursor`] handles from aliasing newly created objects after ID reuse.
+    active_buy_cursor: Option<ActiveBuyCursor>,
 }
 
-/// Lifecycle state tracked by [`Lot`] for each issued [`BuyCursor`] handle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Lifecycle state tracked by [`Lot`] for the active [`BuyCursor`] handle.
+#[derive(Debug, Clone)]
 pub(super) struct ActiveBuyCursor {
+    pub(super) token: u64,
     pub(super) cursor_lead: u16,
     pub(super) held_lead: u16,
     pub(super) existing: bool,
-    pub(super) invalidated: bool,
-    pub(super) cursor_dead: bool,
+    pub(super) owned_ids: BTreeSet<u16>,
 }
 
 /// A dialog the lot waits on ([`Lot::asking`]). The tick that showed it
@@ -951,7 +950,7 @@ impl Lot {
             buy_redo: Vec::new(),
             buy_orphans: Vec::new(),
             next_buy_cursor_token: 1,
-            active_buy_cursors: std::collections::BTreeMap::new(),
+            active_buy_cursor: None,
         })
     }
 
@@ -1009,7 +1008,7 @@ impl Lot {
             if result.is_err() {
                 self.halted = true;
             }
-            self.sync_active_buy_cursors();
+            self.sync_active_buy_cursor();
             return result;
         }
         if self.asking.is_some() {
@@ -1049,7 +1048,7 @@ impl Lot {
                 if result.is_err() {
                     self.halted = true;
                 }
-                self.sync_active_buy_cursors();
+                self.sync_active_buy_cursor();
                 result
             }
         }
@@ -1446,7 +1445,7 @@ impl Lot {
             view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
-        let active_cursor = cursor.and_then(|c| self.active_cursor_entry(c).map(|e| (c, e)));
+        let cursor = cursor.filter(|c| self.is_active_buy_cursor(c));
         let mut world = self.world.clone();
         interpreter
             .set_mode(&mut world, mode)
@@ -1458,35 +1457,29 @@ impl Lot {
         }
         if clearing {
             let mut keep = BTreeSet::new();
-            if let Some((cur, entry)) = active_cursor {
-                if entry.invalidated {
-                    if !entry.cursor_dead {
-                        keep.insert(entry.cursor_lead);
-                    }
-                } else {
-                    crate::buy::collect_cursor_ids(cur, &mut keep);
-                    keep.insert(interpreter.lead_object(&world, cur.cursor));
-                    keep.insert(interpreter.lead_object(&world, cur.held));
-                    // Protect any detached ancestor container holding `cur.held`
-                    // (e.g. an unpaid preview sitting in an undone table's slot)
-                    // until `buy_cancel` unlinks `cur.held` cleanly; a final pass
-                    // below purges any deferred off-lot container afterwards.
-                    let mut probe: Vec<u16> = keep.iter().copied().collect();
-                    while let Some(id) = probe.pop() {
-                        if let Some(cid) = world
-                            .objects
-                            .get(&id)
-                            .and_then(|o| o.data.get(2).copied())
-                            .and_then(|c| u16::try_from(c).ok())
-                            .filter(|&c| c != 0)
-                        {
-                            let lead = interpreter.lead_object(&world, cid);
-                            if keep.insert(cid) {
-                                probe.push(cid);
-                            }
-                            if keep.insert(lead) {
-                                probe.push(lead);
-                            }
+            if let Some(cur) = cursor {
+                crate::buy::collect_cursor_ids(cur, &mut keep);
+                keep.insert(interpreter.lead_object(&world, cur.cursor));
+                keep.insert(interpreter.lead_object(&world, cur.held));
+                // Protect any detached ancestor container holding `cur.held`
+                // (e.g. an unpaid preview sitting in an undone table's slot)
+                // until `buy_cancel` unlinks `cur.held` cleanly; a final pass
+                // below purges any deferred off-lot container afterwards.
+                let mut probe: Vec<u16> = keep.iter().copied().collect();
+                while let Some(id) = probe.pop() {
+                    if let Some(cid) = world
+                        .objects
+                        .get(&id)
+                        .and_then(|o| o.data.get(2).copied())
+                        .and_then(|c| u16::try_from(c).ok())
+                        .filter(|&c| c != 0)
+                    {
+                        let lead = interpreter.lead_object(&world, cid);
+                        if keep.insert(cid) {
+                            probe.push(cid);
+                        }
+                        if keep.insert(lead) {
+                            probe.push(lead);
                         }
                     }
                 }
@@ -1501,19 +1494,11 @@ impl Lot {
                 .buy_purge_detached(&mut world, &self.buy_orphans, &keep)
                 .map_err(OrderError::Refused)?;
         }
-        if let Some((cur, entry)) = active_cursor {
-            if entry.invalidated {
-                if !entry.cursor_dead {
-                    interpreter
-                        .buy_discard_tile_cursor(&mut world, cur)
-                        .map_err(OrderError::Refused)?;
-                }
-            } else {
-                let live = self.strip_detached_origin_children(cur);
-                interpreter
-                    .buy_cancel(&mut world, &live)
-                    .map_err(OrderError::Refused)?;
-            }
+        if let Some(cur) = cursor {
+            let live = self.strip_detached_origin_children(cur);
+            interpreter
+                .buy_cancel(&mut world, &live)
+                .map_err(OrderError::Refused)?;
             if clearing {
                 let empty = BTreeSet::new();
                 interpreter
@@ -1526,17 +1511,19 @@ impl Lot {
                     .buy_purge_detached(&mut world, &self.buy_orphans, &empty)
                     .map_err(OrderError::Refused)?;
             }
+            self.active_buy_cursor = None;
+        } else {
+            let clear = self.reconcile_active_buy_cursor(&interpreter, &mut world, None);
+            if clear {
+                self.active_buy_cursor = None;
+            }
         }
         self.world = world;
-        if let Some((cur, _)) = active_cursor {
-            self.active_buy_cursors.remove(&cur.token);
-        }
         if clearing {
             self.buy_undo.clear();
             self.buy_redo.clear();
             self.buy_orphans.clear();
         }
-        self.sync_active_buy_cursors();
         Ok(())
     }
 
@@ -1551,6 +1538,9 @@ impl Lot {
         direction: i16,
     ) -> Result<Option<BuyCursor>, OrderError> {
         self.ready()?;
+        if self.active_buy_cursor.is_some() {
+            return Ok(None);
+        }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
@@ -1568,25 +1558,18 @@ impl Lot {
             cur.token = token;
             let cursor_lead = interpreter.lead_object(&world, cur.cursor);
             let held_lead = interpreter.lead_object(&world, cur.held);
-            for prev in self.active_buy_cursors.values_mut() {
-                if prev.cursor_lead == cursor_lead || prev.cursor_lead == held_lead {
-                    prev.cursor_dead = true;
-                    prev.invalidated = true;
-                }
-                if prev.held_lead == held_lead || prev.held_lead == cursor_lead {
-                    prev.invalidated = true;
-                }
-            }
-            self.active_buy_cursors.insert(
+            let mut owned_ids = BTreeSet::new();
+            crate::buy::collect_cursor_ids(cur, &mut owned_ids);
+            owned_ids.insert(held_lead);
+            owned_ids.remove(&cur.cursor);
+            owned_ids.remove(&cursor_lead);
+            self.active_buy_cursor = Some(ActiveBuyCursor {
                 token,
-                ActiveBuyCursor {
-                    cursor_lead,
-                    held_lead,
-                    existing: false,
-                    invalidated: false,
-                    cursor_dead: false,
-                },
-            );
+                cursor_lead,
+                held_lead,
+                existing: false,
+                owned_ids,
+            });
         }
         self.world = world;
         Ok(cursor)
@@ -1639,6 +1622,9 @@ impl Lot {
     /// without changing the lot if `can_pick_up` refuses `id`.
     pub fn buy_pick_up(&mut self, id: u16) -> Result<Option<BuyCursor>, OrderError> {
         self.ready()?;
+        if self.active_buy_cursor.is_some() {
+            return Ok(None);
+        }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
@@ -1647,11 +1633,6 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let lead = interpreter.lead_object(&self.world, id);
-        if self.active_buy_cursors.values().any(|e| {
-            (!e.invalidated && e.held_lead == lead) || (!e.cursor_dead && e.cursor_lead == lead)
-        }) {
-            return Ok(None);
-        }
         let mut world = self.world.clone();
         let mut cursor = interpreter
             .buy_pick_up(&mut world, id)
@@ -1661,89 +1642,91 @@ impl Lot {
             self.next_buy_cursor_token = self.next_buy_cursor_token.wrapping_add(1).max(1);
             cur.token = token;
             let cursor_lead = interpreter.lead_object(&world, cur.cursor);
-            for prev in self.active_buy_cursors.values_mut() {
-                if prev.cursor_lead == cursor_lead {
-                    prev.cursor_dead = true;
-                    prev.invalidated = true;
-                }
-                if prev.held_lead == lead {
-                    prev.invalidated = true;
-                }
-            }
-            self.active_buy_cursors.insert(
+            let mut owned_ids = BTreeSet::new();
+            crate::buy::collect_cursor_ids(cur, &mut owned_ids);
+            owned_ids.insert(lead);
+            owned_ids.remove(&cur.cursor);
+            owned_ids.remove(&cursor_lead);
+            self.active_buy_cursor = Some(ActiveBuyCursor {
                 token,
-                ActiveBuyCursor {
-                    cursor_lead,
-                    held_lead: lead,
-                    existing: true,
-                    invalidated: false,
-                    cursor_dead: false,
-                },
-            );
+                cursor_lead,
+                held_lead: lead,
+                existing: true,
+                owned_ids,
+            });
             self.world = world;
         }
         Ok(cursor)
     }
 
-    /// Reconciles active [`BuyCursor`] entries against `self.world` and Buy
-    /// Mode history immediately after a world/history mutation so any cursor
-    /// whose held object was detached/deleted or whose `"Tile Cursor"` was
-    /// removed is permanently invalidated before its numeric ID can be reused.
-    fn sync_active_buy_cursors(&mut self) {
-        if self.active_buy_cursors.is_empty() {
+    /// Reconciles the active [`BuyCursor`] against `world` (and optional
+    /// history-mutated IDs `affected`): if the held object or any owned origin
+    /// child was detached, deleted, or mutated by Undo/Redo, or if its `"Tile
+    /// Cursor"` disappeared, immediately removes any orphaned `"Tile Cursor"`
+    /// on `world` and returns `true` so the caller retires `active_buy_cursor`.
+    fn reconcile_active_buy_cursor(
+        &self,
+        interpreter: &Interpreter<'_>,
+        world: &mut World,
+        affected: Option<&BTreeSet<u16>>,
+    ) -> bool {
+        let Some(active) = self.active_buy_cursor.as_ref() else {
+            return false;
+        };
+        let cursor_missing = world
+            .objects
+            .get(&active.cursor_lead)
+            .is_none_or(|o| o.guid != crate::TILE_CURSOR_GUID);
+        let held_missing = !world.objects.contains_key(&active.held_lead);
+        let affected_hit = affected.is_some_and(|ids| !ids.is_disjoint(&active.owned_ids));
+        let detached_hit =
+            active.existing && self.is_detached_history_object_in(world, active.held_lead);
+        if cursor_missing || held_missing || affected_hit || detached_hit {
+            if !cursor_missing {
+                let _ = interpreter.buy_discard_tile_cursor_id(world, active.cursor_lead);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Reconciles `self.active_buy_cursor` against `self.world` directly.
+    fn sync_active_buy_cursor(&mut self) {
+        if self.active_buy_cursor.is_none() {
             return;
         }
-        let detached: BTreeSet<u16> = self
-            .buy_undo
-            .iter()
-            .chain(self.buy_redo.iter())
-            .chain(self.buy_orphans.iter())
-            .filter(|p| {
-                !p.placed
-                    && self
-                        .world
-                        .objects
-                        .get(&p.object)
-                        .is_none_or(|o| o.position[0] < 0)
-            })
-            .map(|p| p.object)
-            .collect();
-        for entry in self.active_buy_cursors.values_mut() {
-            if self
-                .world
-                .objects
-                .get(&entry.cursor_lead)
-                .is_none_or(|o| o.guid != crate::TILE_CURSOR_GUID)
-            {
-                entry.cursor_dead = true;
-                entry.invalidated = true;
-            }
-            if !self.world.objects.contains_key(&entry.held_lead) {
-                entry.invalidated = true;
-            }
-            if entry.existing && detached.contains(&entry.held_lead) {
-                entry.invalidated = true;
-            }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let clear = self.reconcile_active_buy_cursor(&interpreter, &mut world, None);
+        if clear {
+            self.active_buy_cursor = None;
+            self.world = world;
         }
     }
 
-    /// Returns the tracked lifecycle entry for `cursor` if it has not yet been
-    /// retired by commit, sell, cancel, snapback, or mode switch.
-    pub(super) fn active_cursor_entry(&self, cursor: &BuyCursor) -> Option<ActiveBuyCursor> {
-        (cursor.token != 0)
-            .then(|| self.active_buy_cursors.get(&cursor.token).copied())
-            .flatten()
+    /// Whether `cursor` matches the lot's single currently active [`BuyCursor`].
+    pub(super) fn is_active_buy_cursor(&self, cursor: &BuyCursor) -> bool {
+        cursor.token != 0
+            && self
+                .active_buy_cursor
+                .as_ref()
+                .is_some_and(|active| active.token == cursor.token)
     }
 
-    /// Whether `cursor` is still an active, non-invalidated [`BuyCursor`].
+    /// Whether `cursor` is still an active [`BuyCursor`].
     fn is_live_buy_cursor(&self, cursor: &BuyCursor) -> bool {
-        self.active_cursor_entry(cursor)
-            .is_some_and(|e| !e.invalidated)
+        self.is_active_buy_cursor(cursor)
     }
 
-    /// Whether `id` is currently detached/refunded (`!placed` and off-lot) in
-    /// Buy Mode history (`buy_undo`, `buy_redo`, or `buy_orphans`).
-    fn is_detached_history_object(&self, id: u16) -> bool {
+    /// Whether `id` is currently detached/refunded (`!placed` and off-lot in
+    /// `world`) in Buy Mode history (`buy_undo`, `buy_redo`, or `buy_orphans`).
+    fn is_detached_history_object_in(&self, world: &World, id: u16) -> bool {
         self.buy_undo
             .iter()
             .chain(self.buy_redo.iter())
@@ -1751,12 +1734,14 @@ impl Lot {
             .any(|p| {
                 !p.placed
                     && p.object == id
-                    && self
-                        .world
-                        .objects
-                        .get(&id)
-                        .is_none_or(|o| o.position[0] < 0)
+                    && world.objects.get(&id).is_none_or(|o| o.position[0] < 0)
             })
+    }
+
+    /// Whether `id` is currently detached/refunded (`!placed` and off-lot) in
+    /// Buy Mode history (`buy_undo`, `buy_redo`, or `buy_orphans`).
+    fn is_detached_history_object(&self, id: u16) -> bool {
+        self.is_detached_history_object_in(&self.world, id)
     }
 
     /// Returns a copy of `cursor` whose `origin.children` exclude any surface
@@ -1818,8 +1803,7 @@ impl Lot {
         } else {
             self.world = world;
         }
-        self.active_buy_cursors.remove(&cursor.token);
-        self.sync_active_buy_cursors();
+        self.active_buy_cursor = None;
         Ok(true)
     }
 
@@ -2018,8 +2002,7 @@ impl Lot {
         self.world = world;
         self.buy_undo.push(purchase);
         self.buy_redo.clear();
-        self.active_buy_cursors.remove(&cursor.token);
-        self.sync_active_buy_cursors();
+        self.active_buy_cursor = None;
         Ok(id)
     }
 
@@ -2088,14 +2071,13 @@ impl Lot {
             Ok(true) => {
                 let mut affected = BTreeSet::new();
                 crate::buy::collect_buy_ids(std::slice::from_ref(&purchase), &mut affected);
-                for entry in self.active_buy_cursors.values_mut() {
-                    if affected.contains(&entry.held_lead) {
-                        entry.invalidated = true;
-                    }
+                let clear =
+                    self.reconcile_active_buy_cursor(&interpreter, &mut world, Some(&affected));
+                self.buy_redo.push(purchase);
+                if clear {
+                    self.active_buy_cursor = None;
                 }
                 self.world = world;
-                self.buy_redo.push(purchase);
-                self.sync_active_buy_cursors();
                 Ok(true)
             }
             Ok(false) => {
@@ -2104,7 +2086,7 @@ impl Lot {
                 let mut keep = BTreeSet::new();
                 crate::buy::collect_buy_ids(&self.buy_redo, &mut keep);
                 self.purge_buy_history(&dropped, &keep);
-                self.sync_active_buy_cursors();
+                self.sync_active_buy_cursor();
                 Ok(false)
             }
             Err(fault) => {
@@ -2113,7 +2095,7 @@ impl Lot {
                 let mut keep = BTreeSet::new();
                 crate::buy::collect_buy_ids(&self.buy_redo, &mut keep);
                 self.purge_buy_history(&dropped, &keep);
-                self.sync_active_buy_cursors();
+                self.sync_active_buy_cursor();
                 Err(OrderError::Refused(fault))
             }
         }
@@ -2144,14 +2126,13 @@ impl Lot {
             Ok(true) => {
                 let mut affected = BTreeSet::new();
                 crate::buy::collect_buy_ids(std::slice::from_ref(&purchase), &mut affected);
-                for entry in self.active_buy_cursors.values_mut() {
-                    if affected.contains(&entry.held_lead) {
-                        entry.invalidated = true;
-                    }
+                let clear =
+                    self.reconcile_active_buy_cursor(&interpreter, &mut world, Some(&affected));
+                self.buy_undo.push(purchase);
+                if clear {
+                    self.active_buy_cursor = None;
                 }
                 self.world = world;
-                self.buy_undo.push(purchase);
-                self.sync_active_buy_cursors();
                 Ok(true)
             }
             Ok(false) => {
@@ -2162,11 +2143,18 @@ impl Lot {
                 // -> `0x493353`), publish the world (which ran `0x48c0ea`) and
                 // transfer the record to Undo while leaving remaining Redo
                 // entries intact.
-                if purchase.kind != crate::BuyActionKind::Move {
+                let is_move = purchase.kind == crate::BuyActionKind::Move;
+                if !is_move {
+                    let clear = self.reconcile_active_buy_cursor(&interpreter, &mut world, None);
+                    self.buy_undo.push(purchase);
+                    if clear {
+                        self.active_buy_cursor = None;
+                    }
                     self.world = world;
+                } else {
+                    self.buy_undo.push(purchase);
+                    self.sync_active_buy_cursor();
                 }
-                self.buy_undo.push(purchase);
-                self.sync_active_buy_cursors();
                 Ok(false)
             }
             Err(fault) => {
@@ -2175,7 +2163,7 @@ impl Lot {
                 let mut keep = BTreeSet::new();
                 crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
                 self.purge_buy_history(&dropped, &keep);
-                self.sync_active_buy_cursors();
+                self.sync_active_buy_cursor();
                 Err(OrderError::Refused(fault))
             }
         }
@@ -2188,9 +2176,9 @@ impl Lot {
     /// error, the lot is left unchanged so the caller still owns `cursor`.
     pub fn buy_cancel(&mut self, cursor: &BuyCursor) -> Result<(), OrderError> {
         self.ready()?;
-        let Some(entry) = self.active_cursor_entry(cursor) else {
+        if !self.is_active_buy_cursor(cursor) {
             return Ok(());
-        };
+        }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
@@ -2199,19 +2187,11 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
-        if entry.invalidated {
-            if !entry.cursor_dead {
-                interpreter
-                    .buy_discard_tile_cursor(&mut world, cursor)
-                    .map_err(OrderError::Refused)?;
-            }
-        } else {
-            let live = self.strip_detached_origin_children(cursor);
-            interpreter
-                .buy_cancel(&mut world, &live)
-                .map_err(OrderError::Refused)?;
-        }
-        if !entry.invalidated && cursor.is_existing() {
+        let live = self.strip_detached_origin_children(cursor);
+        interpreter
+            .buy_cancel(&mut world, &live)
+            .map_err(OrderError::Refused)?;
+        if cursor.is_existing() {
             let mut keep = BTreeSet::new();
             crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
             keep.insert(interpreter.lead_object(&world, cursor.held));
@@ -2220,11 +2200,10 @@ impl Lot {
                 .map_err(OrderError::Refused)?;
         }
         self.world = world;
-        if !entry.invalidated && cursor.is_existing() {
+        if cursor.is_existing() {
             self.buy_redo.clear();
         }
-        self.active_buy_cursors.remove(&cursor.token);
-        self.sync_active_buy_cursors();
+        self.active_buy_cursor = None;
         Ok(())
     }
 
@@ -2234,9 +2213,9 @@ impl Lot {
     /// Tool never shares ownership with an Undo/Redo record.
     pub fn buy_snap_back(&mut self, cursor: &BuyCursor) -> Result<(), OrderError> {
         self.ready()?;
-        let Some(entry) = self.active_cursor_entry(cursor) else {
+        if !self.is_active_buy_cursor(cursor) {
             return Ok(());
-        };
+        }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
@@ -2245,21 +2224,12 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
-        if entry.invalidated {
-            if !entry.cursor_dead {
-                interpreter
-                    .buy_discard_tile_cursor(&mut world, cursor)
-                    .map_err(OrderError::Refused)?;
-            }
-        } else {
-            let live = self.strip_detached_origin_children(cursor);
-            interpreter
-                .buy_cancel(&mut world, &live)
-                .map_err(OrderError::Refused)?;
-        }
+        let live = self.strip_detached_origin_children(cursor);
+        interpreter
+            .buy_cancel(&mut world, &live)
+            .map_err(OrderError::Refused)?;
         self.world = world;
-        self.active_buy_cursors.remove(&cursor.token);
-        self.sync_active_buy_cursors();
+        self.active_buy_cursor = None;
         Ok(())
     }
 
@@ -2482,7 +2452,7 @@ mod tests {
             buy_redo: Vec::new(),
             buy_orphans: Vec::new(),
             next_buy_cursor_token: 1,
-            active_buy_cursors: std::collections::BTreeMap::new(),
+            active_buy_cursor: None,
         }
     }
 

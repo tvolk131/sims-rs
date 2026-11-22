@@ -1328,6 +1328,22 @@ impl Interpreter<'_> {
                 "cannot commit Buy Mode placement at an invalid location".into(),
             )));
         }
+        if !world
+            .objects
+            .get(&cursor.held)
+            .is_some_and(|o| on_lot([o.position[0], o.position[1]]))
+            || cursor.container.is_some_and(|(cid, _)| {
+                !world
+                    .objects
+                    .get(&cid)
+                    .is_some_and(|o| on_lot([o.position[0], o.position[1]]))
+            })
+        {
+            return Err(fail(Trap::Invalid(
+                "cannot commit Buy Mode placement: held object or surface container is off-lot"
+                    .into(),
+            )));
+        }
         if cursor.price > 0 && cursor.price > available_funds(world) {
             return Err(fail(Trap::Invalid(
                 "cannot commit Buy Mode placement: insufficient funds".into(),
@@ -1347,6 +1363,11 @@ impl Interpreter<'_> {
         let held_lead = self.lead_object(world, cursor.held);
         self.run_user_placement(world, held_lead)?;
         if !cursor.is_existing() {
+            if cursor.price > 0 && cursor.price > available_funds(world) {
+                return Err(fail(Trap::Invalid(
+                    "cannot commit Buy Mode placement: insufficient funds".into(),
+                )));
+            }
             spend(world, cursor.budget_category, cursor.price).map_err(fail)?;
         }
         let after = self.capture_placement(world, held_lead)?;
@@ -1742,15 +1763,14 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// Deletes only `"Tile Cursor"` for a stale existing-object cursor whose
-    /// held object was already detached/refunded by an intervening Undo/Sell,
-    /// without resurrecting the detached object back onto the lot.
-    pub fn buy_discard_tile_cursor(
+    /// Deletes only `"Tile Cursor"` by object ID (when it still refers to a
+    /// `TILE_CURSOR_GUID` object), leaving any other object untouched.
+    pub fn buy_discard_tile_cursor_id(
         &self,
         world: &mut World,
-        cursor: &BuyCursor,
+        cursor_id: u16,
     ) -> Result<(), Fault> {
-        let cur_lead = self.lead_object(world, cursor.cursor);
+        let cur_lead = self.lead_object(world, cursor_id);
         if let Some(obj) = world.objects.get(&cur_lead)
             && obj.guid == TILE_CURSOR_GUID
         {
@@ -1760,6 +1780,17 @@ impl Interpreter<'_> {
             self.remove_now(world, cur_lead)?;
         }
         Ok(())
+    }
+
+    /// Deletes only `"Tile Cursor"` for a stale existing-object cursor whose
+    /// held object was already detached/refunded by an intervening Undo/Sell,
+    /// without resurrecting the detached object back onto the lot.
+    pub fn buy_discard_tile_cursor(
+        &self,
+        world: &mut World,
+        cursor: &BuyCursor,
+    ) -> Result<(), Fault> {
+        self.buy_discard_tile_cursor_id(world, cursor.cursor)
     }
 
     /// Cancels an active Buy Mode cursor (`0x487191` / `0x487105`):
