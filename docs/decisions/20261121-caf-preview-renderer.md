@@ -39,9 +39,19 @@ against the Complete Collection CAF oracle capture (`User00172.iff` — Alice,
   filters out NPC/townie `ct*` heads). For each matched 6-byte prefix `P`, pair
   the appearance with every texture stem beginning with `P + skin_tone` as
   `HEAD-HEAD=<texture>`.
-- **Default CAF open hands** (`0x40b050`–`0x40b298`): `hulo`/`huro` for
-  children, `hflo`/`hfro` for adult females, and `hmlo`/`hmro` for adult males,
-  bound with `HAND=huao<tone>`.
+- **Default CAF open hands** (`0x40b050`–`0x40b40a`): `hulo`/`huro` for
+  children, `hflo`/`hfro` for adult females, and `hmlo`/`hmro` for adult males.
+  When loading via `SimConfig::load_body` / `resolve_hands`, if the selected
+  body texture carries a suffix after byte 12 (e.g. `b024masknlgt_mads` →
+  `_mads`) and `huao<tone><suffix>.bmp` exists in `Assets`, the body-specific
+  hand texture is chosen (matching native longest-match hand selection);
+  otherwise it falls back to `HAND=huao<tone>`.
+- **Known approximations vs `Sims.exe`**: catalog enumeration inherits
+  lexicographic ordering and BMP-only texture indexing from `Wardrobe::of`
+  (stock Complete Collection has no CAF-matching TGA stems; native registry
+  load order differs from lexicographic order), and prefix offsets use UTF-8
+  rather than Windows-1252 single-byte indexing (identical for all ASCII
+  stock names).
 
 ### 2. 3D CAF Turntable Preview (`cWin3DView`, `0x56cbfb`–`0x56d039`)
 

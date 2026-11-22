@@ -6,9 +6,10 @@
 
 use sims_people::caf_preview::{
     ADULT_IDLE_CLIPS, Age, BodyType, CHILD_IDLE_CLIPS, FACES_2002_BG_565, FACES_2002_STRIP_SIZE,
-    Gender, PREVIEW_SIZE, PortraitKind, REL_2003_STRIP_SIZE, SimConfig, SkinTone, TurntableParams,
-    default_hands, enumerate_catalog, render_portrait, render_portrait_transparent,
-    render_turntable, render_turntable_clip, turntable_yaw, unpack_rgb565,
+    Gender, PREVIEW_SIZE, PortraitKind, REL_2003_STRIP_SIZE, SPEECH_BG_565, SimConfig, SkinTone,
+    TurntableParams, WEB_IMAGE_2007_BG_565, default_hands, enumerate_catalog, render_portrait,
+    render_portrait_transparent, render_turntable, render_turntable_clip, resolve_hands,
+    turntable_yaw, unpack_rgb565,
 };
 use sims_people::{Assets, Library};
 use std::path::PathBuf;
@@ -123,6 +124,33 @@ fn caf_catalog_enumerates_all_demographics_and_finds_alice() {
         let body = cfg.load_body(&assets).unwrap();
         assert!(body.parts.len() >= 4, "expected body + 2 hands + head");
     }
+
+    // Verify body-specific hand texture suffix matching (e.g. b024masknlgt_mads -> huaolgt_mads).
+    let mads_hands = resolve_hands(
+        &assets,
+        Age::Adult,
+        Gender::Male,
+        SkinTone::Light,
+        "BODY=b024masknlgt_mads",
+    );
+    assert_eq!(
+        mads_hands,
+        [
+            ("hmlo".into(), "HAND=huaolgt_mads".into()),
+            ("hmro".into(), "HAND=huaolgt_mads".into()),
+        ]
+    );
+    // Bodies without a matching hand suffix fall back to generic huao<tone>.
+    assert_eq!(
+        resolve_hands(
+            &assets,
+            Age::Adult,
+            Gender::Female,
+            SkinTone::Medium,
+            "BODY=b002fafitmed_mom02",
+        ),
+        default_hands(Age::Adult, Gender::Female, SkinTone::Medium)
+    );
 }
 
 #[test]
@@ -273,14 +301,39 @@ fn caf_portraits_render_all_bmp_variants_and_transparent_alpha() {
         &[0, 0, 0, 255]
     );
 
+    let non_bg_count = |canvas: &sims_people::raster::Canvas, bg: [u8; 3]| -> usize {
+        canvas
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[0] != bg[0] || px[1] != bg[1] || px[2] != bg[2])
+            .count()
+    };
+
     let bmp2005 = render_portrait(&body, PortraitKind::SpeechMed2005).unwrap();
     assert_eq!([bmp2005.width, bmp2005.height], [16, 16]);
+    let speech_bg = unpack_rgb565(SPEECH_BG_565);
+    assert!(
+        non_bg_count(&bmp2005, speech_bg) > 100,
+        "BMP_ 2005 should contain visible head pixels"
+    );
 
     let bmp2006 = render_portrait(&body, PortraitKind::SpeechLarge2006).unwrap();
     assert_eq!([bmp2006.width, bmp2006.height], [32, 32]);
+    assert!(
+        non_bg_count(&bmp2006, speech_bg) > 400,
+        "BMP_ 2006 should contain visible head pixels"
+    );
 
     let bmp2007 = render_portrait(&body, PortraitKind::WebImage2007).unwrap();
     assert_eq!([bmp2007.width, bmp2007.height], [45, 45]);
+    let web_bg = unpack_rgb565(WEB_IMAGE_2007_BG_565);
+    assert_eq!(&bmp2007.rgba[0..4], &[web_bg[0], web_bg[1], web_bg[2], 255]);
+    assert!(
+        non_bg_count(&bmp2007, web_bg) > 600,
+        "BMP_ 2007 should contain visible head pixels inside the 45x45 matte"
+    );
 
     // Transparent alpha portrait has clean 0-alpha corners and opaque head core.
     let alpha = render_portrait_transparent(&body, [35, 41], 0.0, 0.0).unwrap();

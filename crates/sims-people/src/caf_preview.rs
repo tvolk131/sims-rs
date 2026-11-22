@@ -330,15 +330,56 @@ pub struct CafCatalog {
     pub bodies: Vec<CatalogEntry>,
 }
 
-/// Returns the native CAF default open hands `[(left_app, left_tex), (right_app, right_tex)]`
-/// matching `0x40b050`–`0x40b298` and `User00172.iff` (`STR# 200` rows 17–18).
+/// Returns the generic CAF default open hands
+/// `[(left_app, left_tex), (right_app, right_tex)]` matching `0x40b050`–`0x40b298`
+/// and `User00172.iff` (`STR# 200` rows 17–18).
+///
+/// For body-specific hand textures (e.g. `huaolgt_mads` for `b024masknlgt_mads`),
+/// use [`resolve_hands`].
 pub fn default_hands(age: Age, gender: Gender, skin_tone: SkinTone) -> [(String, String); 2] {
-    let (left, right) = match (age, gender) {
+    let (left, right) = hand_appearances(age, gender);
+    let tex = format!("HAND=huao{}", skin_tone.code());
+    [(left.to_owned(), tex.clone()), (right.to_owned(), tex)]
+}
+
+const fn hand_appearances(age: Age, gender: Gender) -> (&'static str, &'static str) {
+    match (age, gender) {
         (Age::Child, _) => ("hulo", "huro"),
         (Age::Adult, Gender::Female) => ("hflo", "hfro"),
         (Age::Adult, Gender::Male) => ("hmlo", "hmro"),
+    }
+}
+
+/// Resolves CAF open hands for `(age, gender, skin_tone)` and an optional
+/// `body_texture` stem (or `BODY=<stem>` binding), preferring a matching
+/// body-specific suffix hand texture (`huao<tone><suffix>`, e.g. `huaolgt_mads`
+/// for `b024masknlgt_mads`) when present in `assets`, and falling back to
+/// `huao<tone>` (`0x40b050`–`0x40b40a`).
+pub fn resolve_hands(
+    assets: &Assets,
+    age: Age,
+    gender: Gender,
+    skin_tone: SkinTone,
+    body_texture: &str,
+) -> [(String, String); 2] {
+    let (left, right) = hand_appearances(age, gender);
+    let stem = body_texture
+        .split_once('=')
+        .map_or(body_texture, |(_, v)| v)
+        .trim();
+    let base = format!("huao{}", skin_tone.code());
+    let chosen = if stem.len() > 12 && stem.is_char_boundary(12) {
+        let suffix = stem[12..].to_ascii_lowercase();
+        let specific = format!("{base}{suffix}");
+        if assets.contains(&format!("{specific}.bmp")) {
+            specific
+        } else {
+            base
+        }
+    } else {
+        base
     };
-    let tex = format!("HAND=huao{}", skin_tone.code());
+    let tex = format!("HAND={chosen}");
     [(left.to_owned(), tex.clone()), (right.to_owned(), tex)]
 }
 
@@ -419,9 +460,30 @@ impl SimConfig {
         Outfit { parts }
     }
 
+    /// Resolves this configuration into an [`Outfit`] using `assets` to pick
+    /// body-specific hand textures (`huao<tone><suffix>`) when available and
+    /// `self.hands` is `None`.
+    pub fn outfit_for_assets(&self, assets: &Assets) -> Outfit {
+        let hands = self.hands.clone().unwrap_or_else(|| {
+            resolve_hands(assets, self.age, self.gender, self.skin_tone, &self.body.1)
+        });
+        let mut parts = vec![
+            self.body.clone(),
+            hands[0].clone(),
+            hands[1].clone(),
+            self.head.clone(),
+        ];
+        parts.retain(|(name, _)| !name.is_empty());
+        Outfit { parts }
+    }
+
     /// Loads this Sim's 3D [`Body`] (skeleton, meshes, and textures) from `assets`.
     pub fn load_body(&self, assets: &Assets) -> Result<Body, String> {
-        Body::load(assets, self.age.skeleton_name(), &self.outfit())
+        Body::load(
+            assets,
+            self.age.skeleton_name(),
+            &self.outfit_for_assets(assets),
+        )
     }
 }
 
@@ -730,9 +792,12 @@ pub fn render_turntable(
             "CAF preview size {width}x{height} exceeds {MAX_SIDE}x{MAX_SIDE}"
         ));
     }
+    let ppu = params.pixels_per_unit();
     if !params.yaw.is_finite()
         || !params.scale.is_finite()
         || params.scale <= 0.0
+        || !ppu.is_finite()
+        || ppu <= 0.0
         || !params.foot_margin.is_finite()
         || !params.ambient.is_finite()
     {
@@ -771,7 +836,6 @@ pub fn render_turntable(
         (width / 2) as f32 + 0.5,
         (height as f32 - params.foot_margin) + 0.5,
     ];
-    let ppu = params.pixels_per_unit();
     let ambient = Shade::Grey(params.ambient.clamp(0.0, 1.0));
     let mut target = D3D6Target(&mut canvas);
 
@@ -940,34 +1004,34 @@ pub fn fit_crop_aspect(crop: [u32; 4], src_size: [u32; 2], dst_size: [u32; 2]) -
     let lhs = u64::from(crop_w) * u64::from(dst_h);
     let rhs = u64::from(dst_w) * u64::from(crop_h);
     if lhs < rhs {
-        // Narrower than target aspect: widen horizontally.
+        // Narrower than target aspect: widen horizontally in symmetric pairs
+        // while both edges have room, then spend a final odd pixel on right
+        // (`0x4e7d6c`–`0x4e7dac`).
         let target_w = (((f64::from(crop_h) * f64::from(dst_w)) / f64::from(dst_h)).round() as u32)
             .clamp(crop_w, src_w);
-        let need = target_w - crop_w;
-        let half = need / 2;
-        let take_left = half.min(left);
-        left -= take_left;
-        let rem_after_left = need - take_left;
-        let take_right = rem_after_left.min(src_w - right);
-        right += take_right;
-        let rem = rem_after_left - take_right;
-        if rem > 0 {
-            left = left.saturating_sub(rem);
+        let mut need = target_w - crop_w;
+        while need >= 2 && left > 0 && right < src_w {
+            left -= 1;
+            right += 1;
+            need -= 2;
+        }
+        if need == 1 && right < src_w {
+            right += 1;
         }
     } else if lhs > rhs {
-        // Wider than target aspect: heighten vertically.
+        // Wider than target aspect: heighten vertically in symmetric pairs
+        // while both edges have room, then spend a final odd pixel on bottom
+        // (`0x4e7dbe`–`0x4e7e1c`).
         let target_h = (((f64::from(crop_w) * f64::from(dst_h)) / f64::from(dst_w)).round() as u32)
             .clamp(crop_h, src_h);
-        let need = target_h - crop_h;
-        let half = need / 2;
-        let take_top = half.min(top);
-        top -= take_top;
-        let rem_after_top = need - take_top;
-        let take_bottom = rem_after_top.min(src_h - bottom);
-        bottom += take_bottom;
-        let rem = rem_after_top - take_bottom;
-        if rem > 0 {
-            top = top.saturating_sub(rem);
+        let mut need = target_h - crop_h;
+        while need >= 2 && top > 0 && bottom < src_h {
+            top -= 1;
+            bottom += 1;
+            need -= 2;
+        }
+        if need == 1 && bottom < src_h {
+            bottom += 1;
         }
     }
     [left, top, right, bottom]
@@ -1041,30 +1105,50 @@ fn build_hermite_taps(src_len: u32, dst_len: u32) -> Vec<Vec<(usize, f64)>> {
 /// `src` into a `dst_size` RGBA [`Canvas`] using `Sims.exe`'s two-pass
 /// separable cubic Hermite filter (`0x4ba79c`–`0x4bb4a0`).
 ///
-/// When `quantize_565` is `true`, channels are filtered in 5-6-5 integer space
-/// and unpacked via [`unpack_rgb565`] to match `User00172.iff` `BMP_` files.
+/// When `quantize_565` is `true`, channels are filtered in 8-bit unpacked 5-6-5
+/// space (`r5<<3, g6<<2, b5<<3`), rounded (`+0.5`), and repacked to 5-6-5 after
+/// each pass to match `User00172.iff` `BMP_` files.
 /// When `premultiplied_alpha` is `true`, filtering runs in premultiplied RGBA
 /// so transparent backgrounds do not bleed colour fringes into the silhouette.
+///
+/// Returns an error if `crop` exceeds `src`'s bounds or `dst_size` exceeds
+/// [`MAX_SIDE`] on either axis.
 pub fn hermite_resample(
     src: &Canvas,
     crop: [u32; 4],
     dst_size: [u32; 2],
     quantize_565: bool,
     premultiplied_alpha: bool,
-) -> Canvas {
+) -> Result<Canvas, String> {
     let [left, top, right, bottom] = crop;
     let [dst_w, dst_h] = dst_size;
-    let crop_w = right.saturating_sub(left);
-    let crop_h = bottom.saturating_sub(top);
-    if crop_w == 0 || crop_h == 0 || dst_w == 0 || dst_h == 0 {
-        return Canvas::new(dst_w, dst_h, [0; 4]);
+    if dst_w > MAX_SIDE || dst_h > MAX_SIDE || dst_w.checked_mul(dst_h).is_none() {
+        return Err(format!(
+            "resample destination {dst_w}x{dst_h} exceeds {MAX_SIDE}x{MAX_SIDE}"
+        ));
     }
+    if left > right || top > bottom || right > src.width || bottom > src.height {
+        return Err(format!(
+            "crop [{left}, {top}, {right}, {bottom}] is out of bounds for {}x{} source",
+            src.width, src.height
+        ));
+    }
+    let crop_w = right - left;
+    let crop_h = bottom - top;
+    if crop_w == 0 || crop_h == 0 || dst_w == 0 || dst_h == 0 {
+        return Ok(Canvas::new(dst_w, dst_h, [0; 4]));
+    }
+    let Some(temp_len) = (crop_h as usize).checked_mul(dst_w as usize) else {
+        return Err(format!(
+            "intermediate resample buffer {crop_h}x{dst_w} overflows"
+        ));
+    };
 
     let x_taps = build_hermite_taps(crop_w, dst_w);
     let y_taps = build_hermite_taps(crop_h, dst_h);
 
     // Horizontal pass: crop_h rows × dst_w columns.
-    let mut temp = vec![[0.0f64; 4]; (crop_h * dst_w) as usize];
+    let mut temp = vec![[0.0f64; 4]; temp_len];
     for sy in 0..crop_h {
         let src_row = ((top + sy) * src.width) as usize;
         let tmp_row = (sy * dst_w) as usize;
@@ -1151,7 +1235,7 @@ pub fn hermite_resample(
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Scans the tight bounding box `[left, top, right, bottom]` of covered
@@ -1268,14 +1352,25 @@ pub fn render_portrait_frame(body: &Body, spec: &PortraitFrameSpec) -> Result<Ca
         PortraitCrop::Auto { pad } => auto_crop_bounds(&hi, quant_bg, pad),
     };
     let crop = fit_crop_aspect(raw_crop, [ss, ss], [width, height]);
+    if crop[2] <= crop[0] || crop[3] <= crop[1] {
+        let fill = spec.background.map_or([0, 0, 0, 0], |rgb| {
+            let out_rgb = if spec.quantize_565 {
+                unpack_rgb565(pack_rgb565(rgb))
+            } else {
+                rgb
+            };
+            [out_rgb[0], out_rgb[1], out_rgb[2], 255]
+        });
+        return Ok(Canvas::new(width, height, fill));
+    }
     let premul = spec.background.is_none();
-    Ok(hermite_resample(
+    hermite_resample(
         &hi,
         crop,
         [width, height],
         spec.quantize_565 && !premul,
         premul,
-    ))
+    )
 }
 
 /// Blits `src` onto `dst` at `(dst_x, dst_y)`, clipping to `dst`'s bounds.
@@ -1648,6 +1743,11 @@ mod tests {
             fit_crop_aspect(PORTRAIT_FIXED_CROP, [200, 200], [40, 40]),
             [59, 45, 139, 125]
         );
+        // Right/bottom edge saturation stops symmetric expansion (0x4e7d6c..0x4e7e1c).
+        assert_eq!(
+            fit_crop_aspect([180, 45, 200, 125], [200, 200], [40, 40]),
+            [180, 45, 200, 125]
+        );
     }
 
     #[test]
@@ -1680,14 +1780,38 @@ mod tests {
             "transparent portrait should have opaque head pixels"
         );
 
-        // Guardrails: oversized canvases & non-finite angles return Err.
+        // Guardrails: oversized canvases, scale overflow, OOB crops, & non-finite angles return Err.
         let bad = TurntableParams {
             size: [MAX_SIDE + 1, 100],
             ..TurntableParams::default()
         };
         assert!(render_turntable(&body, None, &bad).is_err());
 
+        let huge_scale = TurntableParams {
+            scale: f32::MAX,
+            ..TurntableParams::default()
+        };
+        assert!(render_turntable(&body, None, &huge_scale).is_err());
+
         assert!(render_portrait_transparent(&body, [35, 41], f32::NAN, 0.0).is_err());
+
+        let tiny = Canvas::new(1, 1, [0, 0, 0, 255]);
+        assert!(hermite_resample(&tiny, [0, 0, 2, 1], [2, 1], false, false).is_err());
+        assert!(hermite_resample(&tiny, [0, 0, 1, 1], [MAX_SIDE + 1, 1], false, false).is_err());
+
+        // Empty fixed crop preserves the caller's requested opaque background.
+        let empty_crop = render_portrait_frame(
+            &body,
+            &PortraitFrameSpec {
+                size: [8, 8],
+                crop: PortraitCrop::Fixed([10, 10, 10, 10]),
+                background: Some([16, 32, 48]),
+                quantize_565: false,
+                ..PortraitFrameSpec::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&empty_crop.rgba[0..4], &[16, 32, 48, 255]);
     }
 
     #[test]
