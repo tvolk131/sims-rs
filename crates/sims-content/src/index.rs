@@ -23,10 +23,13 @@ pub struct Member {
 pub struct Resource {
     /// Index into [`Index::mounts`].
     pub mount: usize,
-    /// The file on disk.
+    /// The file on disk (or a virtual path for in-memory character files).
     pub path: PathBuf,
     /// Set when this resource is a member of the archive at `path`.
     pub member: Option<Member>,
+    /// In-memory bytes for resources loaded from a persistence store rather
+    /// than disk (e.g. REDB-stored neighborhood character IFFs).
+    pub(crate) inline: Option<Vec<u8>>,
 }
 
 impl Resource {
@@ -63,6 +66,14 @@ impl Resource {
         }
     }
 
+    /// Whether this resource's bytes are held in memory rather than read from a
+    /// path on disk (for example, neighborhood character files loaded from a
+    /// persistence store).
+    #[must_use]
+    pub fn is_inline(&self) -> bool {
+        self.inline.is_some()
+    }
+
     /// Reads the resource. A resource larger than [`far::MAX_MEMBER`] and a
     /// member that no longer lies inside
     /// its archive (the file changed since it was indexed) fail.
@@ -74,6 +85,15 @@ impl Resource {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, message),
             )
         };
+        if let Some(bytes) = &self.inline {
+            if bytes.len() as u64 > far::MAX_MEMBER {
+                return Err(invalid(format!(
+                    "{} exceeds the 128 MiB resource limit",
+                    self.name()
+                )));
+            }
+            return Ok(bytes.clone());
+        }
         let mut file = File::open(&self.path).map_err(io)?;
         let len = file.metadata().map_err(io)?.len();
         let (offset, size) = match &self.member {
@@ -182,6 +202,133 @@ impl Index {
         Ok(())
     }
 
+    /// Adds a neighborhood's `Characters` files from in-memory bytes (such as
+    /// those imported into a REDB store) as a mount named `Characters`, in the
+    /// exact same mount position, recursive directory / FAR archive traversal,
+    /// case-folded ordering, Windows-1252 key encoding, and file-table hash
+    /// order as [`Index::add_characters`].
+    pub fn add_character_files(&mut self, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+        let number = self
+            .mounts
+            .iter()
+            .position(|m| m.path == Install::USER_OBJECTS)
+            .map_or(self.mounts.len(), |n| n + 1);
+        self.mounts.insert(
+            number,
+            Mount {
+                path: Self::CHARACTERS.to_owned(),
+                recursive: true,
+            },
+        );
+        let at = self
+            .resources
+            .iter()
+            .position(|r| r.mount >= number)
+            .unwrap_or(self.resources.len());
+        let later = self.resources.split_off(at);
+
+        // Rebuild the exact directory hierarchy from `/`-separated keys so
+        // subdirectories, `.far` archives, case-folded ordering, and
+        // Windows-1252 file-table hashing match `MountedFiles::scan`.
+        #[derive(Default)]
+        struct InlineNode<'a> {
+            subdirs: BTreeMap<&'a str, InlineNode<'a>>,
+            files: BTreeMap<&'a str, &'a [u8]>,
+        }
+        let mut root_node = InlineNode::default();
+        for (rel_path, bytes) in files {
+            let is_dir = rel_path.ends_with('/') || rel_path.ends_with('\\');
+            let parts: Vec<&str> = rel_path
+                .split(['/', '\\'])
+                .filter(|s| !s.is_empty())
+                .collect();
+            if is_dir {
+                let mut node = &mut root_node;
+                for &dir in &parts {
+                    node = node.subdirs.entry(dir).or_default();
+                }
+                continue;
+            }
+            let Some((&file_name, dirs)) = parts.split_last() else {
+                continue;
+            };
+            let mut node = &mut root_node;
+            for &dir in dirs {
+                node = node.subdirs.entry(dir).or_default();
+            }
+            node.files.insert(file_name, bytes.as_slice());
+        }
+
+        fn scan_inline<'a>(
+            directories: &mut Directories,
+            diagnostics: &mut Vec<String>,
+            at: &[u8],
+            virtual_dir: &Path,
+            node: &'a InlineNode<'a>,
+        ) {
+            directories.entry(at.to_vec()).or_default();
+            enum Kind<'a> {
+                Dir(&'a InlineNode<'a>),
+                File(&'a [u8]),
+            }
+            let mut items: Vec<(&str, Kind<'a>)> = Vec::new();
+            for (&name, sub) in &node.subdirs {
+                items.push((name, Kind::Dir(sub)));
+            }
+            for (&name, &bytes) in &node.files {
+                items.push((name, Kind::File(bytes)));
+            }
+            // Match `sorted_entries`: ASCII upper-case, then raw bytes.
+            items.sort_by_cached_key(|&(name, _)| {
+                let raw = name.as_bytes();
+                (raw.to_ascii_uppercase(), raw.to_vec())
+            });
+            for (entry_name, kind) in items {
+                let name = key(&disk_name(std::ffi::OsStr::new(entry_name)));
+                let path = virtual_dir.join(entry_name);
+                let here = directories.get_mut(at).expect("inserted above");
+                match kind {
+                    Kind::Dir(sub) => {
+                        here.put(name.clone(), Entry::Directory);
+                        let child = [at, &name, b"\\"].concat();
+                        scan_inline(directories, diagnostics, &child, &path, sub);
+                    }
+                    Kind::File(bytes) if name.ends_with(b"far") => {
+                        here.add(name, Entry::Archive);
+                        match archive_members_from_bytes(&path, bytes) {
+                            Ok((members, skipped)) => {
+                                diagnostics.extend(skipped);
+                                mount_inline_archive(directories, at, &path, bytes, members);
+                            }
+                            Err(error) => diagnostics.push(error.to_string()),
+                        }
+                    }
+                    Kind::File(bytes) => {
+                        here.put(name, Entry::InlineFile(path, bytes.to_vec()));
+                    }
+                }
+            }
+        }
+
+        let mut directories = Directories::new();
+        let mut diagnostics = Vec::new();
+        scan_inline(
+            &mut directories,
+            &mut diagnostics,
+            &[],
+            Path::new(Self::CHARACTERS),
+            &root_node,
+        );
+        Self::list(&mut self.resources, number, &directories, &[]);
+        self.diagnostics.extend(diagnostics);
+
+        self.resources.extend(later.into_iter().map(|mut r| {
+            r.mount += 1;
+            r
+        }));
+        Ok(())
+    }
+
     /// Resources whose name matches, ignoring ASCII case, in load order,
     /// with their positions in [`Index::resources`]. A name without a
     /// directory matches a resource's file name, the last component of its
@@ -225,12 +372,31 @@ impl Index {
                 mount: 0,
                 path: path.clone(),
                 member: member.cloned(),
+                inline: None,
             };
             match here.entries.get(name) {
                 Some(Entry::File(path)) => listed.push((name.to_vec(), resource(path, None))),
                 Some(Entry::Member(path, member)) => {
                     listed.push((name.to_vec(), resource(path, Some(member))))
                 }
+                Some(Entry::InlineFile(path, bytes)) => listed.push((
+                    name.to_vec(),
+                    Resource {
+                        mount: 0,
+                        path: path.clone(),
+                        member: None,
+                        inline: Some(bytes.clone()),
+                    },
+                )),
+                Some(Entry::InlineMember(path, member, bytes)) => listed.push((
+                    name.to_vec(),
+                    Resource {
+                        mount: 0,
+                        path: path.clone(),
+                        member: Some(member.clone()),
+                        inline: Some(bytes.clone()),
+                    },
+                )),
                 Some(Entry::Directory) => {
                     Self::list_all(directories, &[at, name, b"\\"].concat(), listed)
                 }
@@ -267,11 +433,25 @@ impl Index {
                     mount,
                     path: path.clone(),
                     member: None,
+                    inline: None,
                 }),
                 Some(Entry::Member(path, member)) => resources.push(Resource {
                     mount,
                     path: path.clone(),
                     member: Some(member.clone()),
+                    inline: None,
+                }),
+                Some(Entry::InlineFile(path, bytes)) => resources.push(Resource {
+                    mount,
+                    path: path.clone(),
+                    member: None,
+                    inline: Some(bytes.clone()),
+                }),
+                Some(Entry::InlineMember(path, member, bytes)) => resources.push(Resource {
+                    mount,
+                    path: path.clone(),
+                    member: Some(member.clone()),
+                    inline: Some(bytes.clone()),
                 }),
                 // An archive file itself.
                 Some(Entry::Archive) | None => {}
@@ -339,9 +519,13 @@ impl MountedFiles {
             .table()
             .iter()
             .filter_map(|name| {
-                let (path, member) = match &dir.entries[name] {
-                    Entry::File(path) => (path.clone(), None),
-                    Entry::Member(path, member) => (path.clone(), Some(member.clone())),
+                let (path, member, inline) = match &dir.entries[name] {
+                    Entry::File(path) => (path.clone(), None, None),
+                    Entry::Member(path, member) => (path.clone(), Some(member.clone()), None),
+                    Entry::InlineFile(path, bytes) => (path.clone(), None, Some(bytes.clone())),
+                    Entry::InlineMember(path, member, bytes) => {
+                        (path.clone(), Some(member.clone()), Some(bytes.clone()))
+                    }
                     Entry::Directory | Entry::Archive => return None,
                 };
                 Some((
@@ -350,6 +534,7 @@ impl MountedFiles {
                         mount: 0,
                         path,
                         member,
+                        inline,
                     },
                 ))
             })
@@ -387,11 +572,25 @@ impl MountedFiles {
                 mount: 0,
                 path: path.clone(),
                 member: None,
+                inline: None,
             }),
             Entry::Member(path, member) => Some(Resource {
                 mount: 0,
                 path: path.clone(),
                 member: Some(member.clone()),
+                inline: None,
+            }),
+            Entry::InlineFile(path, bytes) => Some(Resource {
+                mount: 0,
+                path: path.clone(),
+                member: None,
+                inline: Some(bytes.clone()),
+            }),
+            Entry::InlineMember(path, member, bytes) => Some(Resource {
+                mount: 0,
+                path: path.clone(),
+                member: Some(member.clone()),
+                inline: Some(bytes.clone()),
             }),
             Entry::Directory | Entry::Archive => None,
         })
@@ -530,8 +729,128 @@ enum Entry {
     Directory,
     File(PathBuf),
     Member(PathBuf, Member),
+    InlineFile(PathBuf, Vec<u8>),
+    InlineMember(PathBuf, Member, Vec<u8>),
     /// An archive file. Its members are entries of their own.
     Archive,
+}
+
+fn mount_inline_archive(
+    directories: &mut Directories,
+    at: &[u8],
+    archive: &Path,
+    archive_bytes: &[u8],
+    members: Vec<RawMember>,
+) {
+    let split = |path: &[u8]| path.iter().rposition(|&b| b == b'\\').map_or(0, |n| n + 1);
+    for (member, raw_name) in members {
+        let Ok(start) = usize::try_from(member.offset) else {
+            continue;
+        };
+        let Ok(size) = usize::try_from(member.size) else {
+            continue;
+        };
+        let Some(slice) = start
+            .checked_add(size)
+            .and_then(|end| archive_bytes.get(start..end))
+        else {
+            continue;
+        };
+        let full = [at, &key(&raw_name)].concat();
+        let (directory, name) = full.split_at(split(&full));
+        let entry = Entry::InlineMember(archive.to_path_buf(), member, slice.to_vec());
+        if !directories
+            .entry(directory.to_vec())
+            .or_default()
+            .add(name.to_vec(), entry)
+        {
+            continue;
+        }
+        let mut child = directory;
+        while child.len() > at.len() {
+            let trimmed = &child[..child.len() - 1];
+            let (parent, name) = trimmed.split_at(split(trimmed));
+            directories
+                .entry(parent.to_vec())
+                .or_default()
+                .add(name.to_vec(), Entry::Directory);
+            child = parent;
+        }
+    }
+}
+
+fn archive_members_from_bytes(path: &Path, bytes: &[u8]) -> Result<(Vec<RawMember>, Vec<String>)> {
+    let len = bytes.len() as u64;
+    let invalid = |e: sims_formats::Error| {
+        Error::io(
+            path,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+        )
+    };
+    let header: [u8; 16] = bytes
+        .get(..16)
+        .ok_or_else(|| {
+            Error::io(
+                path,
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short FAR header"),
+            )
+        })?
+        .try_into()
+        .unwrap();
+    let offset = far::manifest_offset(&header, len).map_err(invalid)?;
+    let directory_len = far::directory_len(offset, len).map_err(invalid)?;
+    let start = usize::try_from(offset).map_err(|_| {
+        Error::io(
+            path,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "FAR offset overflow"),
+        )
+    })?;
+    let directory = start
+        .checked_add(directory_len)
+        .and_then(|end| bytes.get(start..end))
+        .ok_or_else(|| {
+            Error::io(
+                path,
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated FAR directory"),
+            )
+        })?;
+    let entries = far::directory(directory, len).map_err(invalid)?;
+    let mut members = Vec::with_capacity(entries.len());
+    let mut skipped = Vec::new();
+    for entry in entries {
+        let depth = entry
+            .raw_name
+            .iter()
+            .filter(|&&b| b == b'\\' || b == b'/')
+            .count();
+        if depth > MAX_MEMBER_DEPTH || entry.raw_name.len() > MAX_MEMBER_NAME {
+            skipped.push(format!(
+                "{}: member name of {} bytes in {depth} directories is too long",
+                path.display(),
+                entry.raw_name.len(),
+            ));
+            continue;
+        }
+        if entry.stored_size != entry.unpacked_size {
+            skipped.push(format!(
+                "{}: compressed member {} ({} bytes stored, {} unpacked) is not supported",
+                path.display(),
+                entry.name,
+                entry.stored_size,
+                entry.unpacked_size
+            ));
+            continue;
+        }
+        members.push((
+            Member {
+                name: entry.name,
+                offset: u64::from(entry.offset),
+                size: u64::from(entry.stored_size),
+            },
+            entry.raw_name,
+        ));
+    }
+    Ok((members, skipped))
 }
 
 /// Adds an archive's members (0x5b9dbc). A member's name may hold a path,
