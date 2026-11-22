@@ -238,9 +238,12 @@ fn the_player_answers_the_help_dialog_from_the_window() {
     let layout = game.dialog().expect("the dialog is drawn");
     assert_eq!(layout.caller, shown.object);
     assert_eq!(layout.buttons.len(), 2);
-    // No, the second button: as `--answers 3`.
+    // No, the second button: as `--answers 3` (activates on mouse-up, `0x5e4599`).
     let no = layout.buttons[1];
-    game.press([no.x + no.width / 2, no.y + no.height / 2]);
+    let pt = [no.x + no.width / 2, no.y + no.height / 2];
+    game.press(pt);
+    assert!(game.asking().is_some());
+    game.release(pt);
     assert!(game.asking().is_none(), "{:?}", game.stopped());
     // The answered tick ran at once, and the 49.999 ms owed when the
     // dialog came were dropped.

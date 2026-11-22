@@ -16,7 +16,9 @@ use crate::canvas::Canvas;
 use crate::cutaway::Mask;
 use crate::grass::Grass;
 use crate::lot::{Lot, WallCell};
-use crate::scene::{Stats, background, holds_person, paint_lot_precomputed, shadow_of_chain};
+use crate::scene::{
+    RenderOptions, Stats, background, holds_person, paint_lot_precomputed, shadow_of_chain,
+};
 use sims_sim::{Object, World};
 use std::collections::BTreeSet;
 
@@ -148,6 +150,7 @@ struct LotKey {
     camera: Camera,
     cut_mask: Option<Mask>,
     preview: Option<(u16, u16)>,
+    options: RenderOptions,
     time_of_day: i16,
     house: i16,
     show_grid: bool,
@@ -309,6 +312,32 @@ impl LotCache {
         preview: Option<(u16, u16)>,
         canvas: &mut Canvas,
     ) -> Stats {
+        self.draw_lot_with_preview_and_options(
+            world,
+            lot,
+            assets,
+            camera,
+            viewport,
+            preview,
+            RenderOptions::default(),
+            canvas,
+        )
+    }
+
+    /// Like [`LotCache::draw_lot_with_preview`], applying [`RenderOptions`]
+    /// (`shadows` and `lighting`) and invalidating the cache when they change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_lot_with_preview_and_options(
+        &mut self,
+        world: &World,
+        lot: &Lot,
+        assets: &mut Assets,
+        camera: &Camera,
+        viewport: (u32, u32),
+        preview: Option<(u16, u16)>,
+        options: RenderOptions,
+        canvas: &mut Canvas,
+    ) -> Stats {
         let assets_id = assets.instance_id();
         let width = canvas.width;
         let height = canvas.height;
@@ -341,6 +370,7 @@ impl LotCache {
                 && k.camera.origin == camera.origin
                 && k.camera.walls == camera.walls
                 && k.preview == preview
+                && k.options == options
                 && k.time_of_day == time_of_day
                 && k.house == house
                 && k.show_grid == show_grid
@@ -362,17 +392,19 @@ impl LotCache {
 
                 if mask_match && objects_match(&k.objects, world, assets, preview) {
                     let mut shadows_ok = true;
-                    for level_index in 0..top {
-                        if !level_shadows_match(
-                            &k.shadows[level_index],
-                            world,
-                            assets,
-                            camera.rotation,
-                            lot.size,
-                            level_index,
-                        ) {
-                            shadows_ok = false;
-                            break;
+                    if options.shadows {
+                        for level_index in 0..top {
+                            if !level_shadows_match(
+                                &k.shadows[level_index],
+                                world,
+                                assets,
+                                camera.rotation,
+                                lot.size,
+                                level_index,
+                            ) {
+                                shadows_ok = false;
+                                break;
+                            }
                         }
                     }
                     if shadows_ok {
@@ -413,6 +445,7 @@ impl LotCache {
             camera,
             viewport,
             preview,
+            options,
             canvas,
             grass,
             held.clone(),
@@ -423,14 +456,18 @@ impl LotCache {
             return stats;
         }
 
-        let shadows = [
-            collect_level_shadows(world, assets, camera.rotation, lot.size, 0),
-            if top >= 2 {
-                collect_level_shadows(world, assets, camera.rotation, lot.size, 1)
-            } else {
-                Vec::new()
-            },
-        ];
+        let shadows = if options.shadows {
+            [
+                collect_level_shadows(world, assets, camera.rotation, lot.size, 0),
+                if top >= 2 {
+                    collect_level_shadows(world, assets, camera.rotation, lot.size, 1)
+                } else {
+                    Vec::new()
+                },
+            ]
+        } else {
+            [Vec::new(), Vec::new()]
+        };
         let key = LotKey {
             assets_id,
             width,
@@ -439,6 +476,7 @@ impl LotCache {
             camera: *camera,
             cut_mask,
             preview,
+            options,
             time_of_day,
             house,
             show_grid,

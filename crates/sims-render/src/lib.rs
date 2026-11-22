@@ -34,7 +34,9 @@ pub use light::Light;
 pub use lot::Lot;
 pub use open::{Opened, open_house};
 pub use scene::{
-    Stats, draw, draw_held, draw_lot, draw_lot_in_viewport, draw_lot_with_preview, holds_person,
+    RenderOptions, Stats, draw, draw_held, draw_held_with_options, draw_lot, draw_lot_in_viewport,
+    draw_lot_in_viewport_with_options, draw_lot_with_preview, draw_lot_with_preview_and_options,
+    holds_person,
 };
 
 /// An error with a message saying what failed.

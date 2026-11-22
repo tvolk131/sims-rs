@@ -18,10 +18,11 @@
 //!    three-button dialog, and sets registry word 0x100 to -1; the third
 //!    (4) takes the false branch and sets that temp to 1.
 //!
-//! Operand 5 (bits 0 to 6) is the kind of dialog. Kinds 0 and 4 have one
-//! button, kind 1 two and kind 2 three; these are ported. Kind 3 asks for
-//! text, and kinds 5 to 15 are the game's special panels (careers,
-//! neighbors, the phone and others); they fail loudly. What a dialog
+//! Operand 5 (bits 0 to 6) is the kind of dialog. Kinds 0, 3, and 4 have one
+//! button (kind 3 also asks for text and copies it to `[0x6e4ac0]` at
+//! `0x451a6b..0x451a85`), kind 1 two and kind 2 three; these are ported.
+//! Kinds 5 to 15 are the game's special panels (careers, neighbors, the phone
+//! and others); they fail loudly. What a dialog
 //! says and shows (its text, pictures and buttons' labels) is
 //! presentation and is not modeled, except where showing a person's
 //! portrait builds it ([`Machine::dialog_portrait`]): building one for a
@@ -254,7 +255,11 @@ pub const DONE: u8 = 5;
 /// (legacy/crates/sims-vm/src/dialog/presentation.rs, `buttons`).
 pub fn answers(kind: u8) -> Option<&'static [u8]> {
     match kind & 0x7f {
-        0 | 4 => Some(&[FIRST]),
+        // Kind 3 asks for text (`0x436a52`, `0x436c43..0x436c76`): one button
+        // (FIRST / OK) plus a single-line text entry field; accepting copies
+        // the text to global `[0x6e4ac0]` (`0x451a6b..0x451a85`) and takes
+        // the true branch.
+        0 | 3 | 4 => Some(&[FIRST]),
         1 => Some(&[FIRST, SECOND]),
         2 => Some(&[FIRST, SECOND, THIRD]),
         _ => None,
@@ -1060,6 +1065,14 @@ impl Machine<'_, '_> {
     /// name (`0x457db4`): none of those fallbacks nor `CATS` are ported, so
     /// they return `None` and fail loudly when a token needs the name.
     fn catalog_name(&self, guid: u32) -> Result<Option<String>, Trap> {
+        // `0x44b0a8..0x44b0fc`: characters created by Make New Character take
+        // their name from global `[0x6e4ac0]` (the last kind 3 text dialog).
+        if let Some(names) = self.character_names
+            && let Some(name) = names.borrow().get(&guid)
+            && !name.is_empty()
+        {
+            return Ok(Some(name.clone()));
+        }
         let table = self.definition_words(guid)?[CATALOG_STRINGS] as u16;
         let definition = self.definition(guid)?;
         let Some(library) = self.program.libraries.get(&definition.resource) else {

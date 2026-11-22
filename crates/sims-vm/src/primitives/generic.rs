@@ -188,7 +188,7 @@ impl Machine<'_, '_> {
         }
         let family = &mut self.world.families[place];
         family.members.remove(member);
-        crate::person_factory::visitor_pass(self.program, self.world)?;
+        crate::person_factory::visitor_pass(self.program, self.world, self.active_family)?;
         self.world.families[place].stale = true;
         Ok(true)
     }
