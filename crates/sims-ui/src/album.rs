@@ -1414,9 +1414,8 @@ impl PhotoAlbumDialog {
         self.sync_snapshot(snapshot);
         let layout = self.layout(frame.width() as i32, frame.height() as i32);
         let visible_slots = layout.thumb_slots.len();
-        if let Some(idx) = self.selected_index(snapshot) {
-            self.ensure_strip_visible(idx, visible_slots, snapshot.entries.len());
-        }
+        let max_scroll = snapshot.entries.len().saturating_sub(visible_slots);
+        self.strip_scroll = self.strip_scroll.min(max_scroll);
 
         // 1. Subtle modal backdrop dimming
         dim_backdrop(frame);

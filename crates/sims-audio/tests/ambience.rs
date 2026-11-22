@@ -775,3 +775,76 @@ fn catalog_indexes_complete_collection_zones_and_streams_real_xa() {
         "real Complete Collection night loop should decode non-zero PCM"
     );
 }
+
+#[test]
+fn mixer_preserves_crossfade_across_eof_and_avoids_retrying_unplayable_bucket() {
+    use sims_audio::ambience::{
+        AmbienceCatalog, AmbienceMixer, AmbienceZone, TimeOfDay, ZoomLevel,
+    };
+    use sims_audio::music::TrackSource;
+
+    // 1. Outgoing & incoming clips hit EOF mid-crossfade: energy stays constant (no dip).
+    let mut catalog = AmbienceCatalog::empty();
+    catalog.insert(
+        AmbienceZone::Residential,
+        TimeOfDay::Day,
+        vec!["a.wav".to_owned()],
+    );
+    catalog.insert(
+        AmbienceZone::Residential,
+        TimeOfDay::Night,
+        vec!["b.wav".to_owned()],
+    );
+    let mut sources = BTreeMap::new();
+    sources.insert("a.wav".to_owned(), synth_wav(1000, &[4000; 32]));
+    sources.insert("b.wav".to_owned(), synth_wav(1000, &[4000; 8]));
+
+    let mut mixer = AmbienceMixer::with_rate(catalog, sources, 1000);
+    mixer.set_crossfade_ms(20);
+    mixer.set_zoom(ZoomLevel::Near);
+    mixer.set_outdoor_percent(100);
+    let _ = mixer.render_stereo(200);
+
+    mixer.set_environment(AmbienceZone::Residential, TimeOfDay::Day);
+    let _ = mixer.render_stereo(31); // 1 frame left before EOF on outgoing clip
+    mixer.set_time_of_day(TimeOfDay::Night); // 8-frame incoming clip also loops mid-20ms fade
+    let xfade = mixer.render_stereo(25);
+    assert!(
+        xfade
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|lr| lr[0] >= 3500 && lr[1] >= 3500),
+        "crossfade across EOF must not dip when both clips are equal amplitude"
+    );
+
+    // 2. Unplayable bucket should be attempted once, not on every output frame.
+    let attempts = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    struct CountingMissingSource(std::rc::Rc<std::cell::Cell<usize>>);
+    impl TrackSource for CountingMissingSource {
+        fn read_bytes(&mut self, _path: &str) -> Option<Vec<u8>> {
+            self.0.set(self.0.get() + 1);
+            None
+        }
+    }
+
+    let mut bad_cat = AmbienceCatalog::empty();
+    bad_cat.insert(
+        AmbienceZone::MagicTown,
+        TimeOfDay::Day,
+        vec!["missing.wav".to_owned()],
+    );
+    let mut bad_mixer =
+        AmbienceMixer::with_rate(bad_cat, CountingMissingSource(attempts.clone()), 1000);
+    bad_mixer.set_environment(AmbienceZone::MagicTown, TimeOfDay::Day);
+    let silence = bad_mixer.render_stereo(100);
+    assert!(silence.iter().all(|&s| s == 0));
+    assert_eq!(
+        attempts.get(),
+        1,
+        "unplayable bucket must not retry on every output frame"
+    );
+    // Verify TimeOfDay::from_hour matches HOUR_COLUMNS at hour 5.
+    assert_eq!(TimeOfDay::from_hour(4), TimeOfDay::Night);
+    assert_eq!(TimeOfDay::from_hour(5), TimeOfDay::Day);
+}

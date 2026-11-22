@@ -120,6 +120,44 @@ fn browse_prev_next_first_last_and_thumbnail_strip() {
 }
 
 #[test]
+fn thumbnail_strip_scroll_persists_across_draw_without_snapping_back() {
+    let screen = [800, 600];
+    let art = Art::default();
+    let mut frame = Frame::new(800, 600, [20, 30, 50]);
+    let snapshot = AlbumSnapshot {
+        family_name: "LargeAlbum".to_owned(),
+        can_capture_snapshot: true,
+        entries: (0..12)
+            .map(|i| AlbumEntry {
+                id: PhotoId(100 + i),
+                title: format!("Photo {i}"),
+                caption: String::new(),
+                image: None,
+                thumbnail: None,
+                sim_day: Some(i as u32 + 1),
+            })
+            .collect(),
+    };
+
+    let mut dialog = PhotoAlbumDialog::default();
+    dialog.open(&snapshot);
+    let layout = dialog.layout(screen[0], screen[1]);
+    let slots = layout.thumb_slots.len();
+    assert!(slots < snapshot.entries.len());
+
+    // Scroll strip right while entry 0 remains selected, then draw.
+    assert!(click(&mut dialog, layout.strip_next, screen, &snapshot).is_empty());
+    dialog.draw(&mut frame, &snapshot, &art);
+
+    // Clicking the first visible slot must select entry 1 (PhotoId(101)), proving
+    // draw did not snap strip_scroll back to entry 0.
+    assert_eq!(
+        click(&mut dialog, layout.thumb_slots[0], screen, &snapshot),
+        vec![AlbumCommand::SelectEntry(PhotoId(101))]
+    );
+}
+
+#[test]
 fn edit_title_and_wrapped_caption_and_auto_commit_on_nav_or_done() {
     let screen = [800, 600];
     let snapshot = sample_snapshot();

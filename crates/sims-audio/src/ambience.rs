@@ -1044,13 +1044,14 @@ pub enum TimeOfDay {
 }
 
 impl TimeOfDay {
-    /// Maps an in-game hour (`0..24`) to [`TimeOfDay::Day`] (`6..=19`) or
-    /// [`TimeOfDay::Night`] (`20..=23` and `0..=5`), matching the nighttime
-    /// plateau in [`HOUR_COLUMNS`].
+    /// Maps an in-game hour (`0..24`) to [`TimeOfDay::Day`] (`5..=19`) or
+    /// [`TimeOfDay::Night`] (`20..=23` and `0..=4`), derived directly from the
+    /// nighttime plateau (`12`) in [`HOUR_COLUMNS`].
     pub const fn from_hour(hour: u8) -> Self {
-        match hour % 24 {
-            6..=19 => Self::Day,
-            _ => Self::Night,
+        if HOUR_COLUMNS[(hour % 24) as usize] == 12 {
+            Self::Night
+        } else {
+            Self::Day
         }
     }
 }
@@ -1310,6 +1311,12 @@ impl AmbienceCatalog {
     }
 }
 
+struct FadingDeck {
+    deck: crate::music::StreamDeck,
+    key: (AmbienceZone, TimeOfDay),
+    frames_left: u32,
+}
+
 /// Streaming environmental lot & expansion ambience mixer.
 ///
 /// Streams and seamlessly loops environmental background beds from
@@ -1327,7 +1334,9 @@ pub struct AmbienceMixer<S> {
     time_of_day: TimeOfDay,
     active_key: Option<(AmbienceZone, TimeOfDay)>,
     current: Option<crate::music::StreamDeck>,
-    fading_out: Vec<crate::music::StreamDeck>,
+    active_fade_frames_left: u32,
+    active_unplayable: bool,
+    fading_out: Vec<FadingDeck>,
     track_cursor: std::collections::BTreeMap<(AmbienceZone, TimeOfDay), usize>,
     crossfade_ms: u32,
     /// FX / Ambience volume (`0..=1024`, scaled via `VOLUME_STEPS`).
@@ -1368,6 +1377,8 @@ impl<S: crate::music::TrackSource> AmbienceMixer<S> {
             time_of_day: TimeOfDay::Day,
             active_key: None,
             current: None,
+            active_fade_frames_left: 0,
+            active_unplayable: false,
             fading_out: Vec::new(),
             track_cursor: std::collections::BTreeMap::new(),
             crossfade_ms: DEFAULT_AMBIENCE_CROSSFADE_MS,
@@ -1525,6 +1536,8 @@ impl<S: crate::music::TrackSource> AmbienceMixer<S> {
         self.started = false;
         self.active_key = None;
         self.current = None;
+        self.active_fade_frames_left = 0;
+        self.active_unplayable = false;
         self.fading_out.clear();
     }
 
@@ -1555,14 +1568,15 @@ impl<S: crate::music::TrackSource> AmbienceMixer<S> {
                 right = right.saturating_add(sample[1]);
             }
 
-            // Crossfading outgoing decks.
+            // Crossfading outgoing decks (seamlessly loop through EOF while fading).
             let mut i = 0;
             while i < self.fading_out.len() {
-                if let Some([l, r]) = self.fading_out[i].next_frame() {
+                let sample = self.next_fading_frame(i);
+                if let Some([l, r]) = sample {
                     left = left.saturating_add(l);
                     right = right.saturating_add(r);
                 }
-                if self.fading_out[i].is_finished() {
+                if self.fading_out[i].frames_left == 0 || self.fading_out[i].deck.is_finished() {
                     self.fading_out.swap_remove(i);
                 } else {
                     i += 1;
@@ -1637,26 +1651,52 @@ impl<S: crate::music::TrackSource> AmbienceMixer<S> {
 
     fn transition_to(&mut self, key: (AmbienceZone, TimeOfDay)) {
         let fade_frames = self.crossfade_frames();
+        let prev_key = self.active_key.unwrap_or(key);
         let had_active = if let Some(mut prev) = self.current.take() {
             if fade_frames > 0 {
                 prev.start_fade(0, fade_frames, true);
                 if self.fading_out.len() >= 8 {
                     self.fading_out.remove(0);
                 }
-                self.fading_out.push(prev);
+                self.fading_out.push(FadingDeck {
+                    deck: prev,
+                    key: prev_key,
+                    frames_left: fade_frames,
+                });
             }
             true
         } else {
             false
         };
         self.active_key = Some(key);
-        self.open_next_track(key, had_active && fade_frames > 0);
+        self.active_fade_frames_left = 0;
+        self.active_unplayable = false;
+        let should_fade_in = had_active && fade_frames > 0;
+        if let Some(deck) = self.open_deck_for(
+            key,
+            if should_fade_in {
+                Some((0, crate::music::MAX_VOLUME, fade_frames, false))
+            } else {
+                None
+            },
+        ) {
+            self.current = Some(deck);
+            if should_fade_in {
+                self.active_fade_frames_left = fade_frames;
+            }
+        } else {
+            self.active_unplayable = true;
+        }
     }
 
-    fn open_next_track(&mut self, key: (AmbienceZone, TimeOfDay), fade_in: bool) -> bool {
+    fn open_deck_for(
+        &mut self,
+        key: (AmbienceZone, TimeOfDay),
+        fade: Option<(i64, i32, u32, bool)>,
+    ) -> Option<crate::music::StreamDeck> {
         let count = self.catalog.tracks(key.0, key.1).len();
         if count == 0 {
-            return false;
+            return None;
         }
         let start = *self.track_cursor.get(&key).unwrap_or(&0) % count;
         for attempt in 0..count {
@@ -1668,43 +1708,115 @@ impl<S: crate::music::TrackSource> AmbienceMixer<S> {
             if let Ok(mut deck) =
                 crate::music::StreamDeck::open_media(path, media, self.output_rate)
             {
-                if fade_in {
-                    let fade_frames = self.crossfade_frames();
-                    if fade_frames > 0 {
-                        deck.gain_fp = 0;
-                        deck.start_fade(crate::music::MAX_VOLUME, fade_frames, false);
-                    }
+                if let Some((start_gain_fp, target_vol, frames, stop_at_zero)) = fade
+                    && frames > 0
+                {
+                    deck.gain_fp = start_gain_fp;
+                    deck.start_fade(target_vol, frames, stop_at_zero);
                 }
                 self.track_cursor.insert(key, (idx + 1) % count);
-                self.current = Some(deck);
-                return true;
+                return Some(deck);
             }
         }
-        false
+        None
     }
 
     fn next_active_frame(&mut self) -> Option<[i32; 2]> {
         if let Some(deck) = self.current.as_mut() {
             if let Some(frame) = deck.next_frame() {
+                self.active_fade_frames_left = self.active_fade_frames_left.saturating_sub(1);
                 if deck.is_finished() {
+                    let gain_fp = deck.gain_fp;
                     let key = self.active_key;
+                    let fade_left = self.active_fade_frames_left;
                     self.current = None;
                     if let Some(k) = key {
-                        self.open_next_track(k, false);
+                        let fade = (fade_left > 0).then_some((
+                            gain_fp,
+                            crate::music::MAX_VOLUME,
+                            fade_left,
+                            false,
+                        ));
+                        self.current = self.open_deck_for(k, fade);
+                        if self.current.is_none() {
+                            self.active_unplayable = true;
+                        }
                     }
                 }
                 return Some(frame);
             }
             // Deck hit EOF before yielding a frame: immediately loop next track
-            // so there is zero silent-sample gap across loop boundaries.
+            // preserving any active fade-in state.
+            let gain_fp = deck.gain_fp;
             self.current = None;
+            let key = self.active_key?;
+            let fade = (self.active_fade_frames_left > 0).then_some((
+                gain_fp,
+                crate::music::MAX_VOLUME,
+                self.active_fade_frames_left,
+                false,
+            ));
+            self.current = self.open_deck_for(key, fade);
+            if self.current.is_none() {
+                self.active_unplayable = true;
+                return None;
+            }
+            let frame = self
+                .current
+                .as_mut()
+                .and_then(crate::music::StreamDeck::next_frame);
+            if frame.is_some() {
+                self.active_fade_frames_left = self.active_fade_frames_left.saturating_sub(1);
+            }
+            return frame;
+        }
+        if self.active_unplayable {
+            return None;
         }
         let key = self.active_key?;
-        if !self.open_next_track(key, false) {
+        self.current = self.open_deck_for(key, None);
+        if self.current.is_none() {
+            self.active_unplayable = true;
             return None;
         }
         self.current
             .as_mut()
             .and_then(crate::music::StreamDeck::next_frame)
+    }
+
+    fn next_fading_frame(&mut self, index: usize) -> Option<[i32; 2]> {
+        if let Some(frame) = self.fading_out[index].deck.next_frame() {
+            self.fading_out[index].frames_left =
+                self.fading_out[index].frames_left.saturating_sub(1);
+            if self.fading_out[index].deck.is_finished() && self.fading_out[index].frames_left > 0 {
+                let key = self.fading_out[index].key;
+                let gain_fp = self.fading_out[index].deck.gain_fp;
+                let left = self.fading_out[index].frames_left;
+                if let Some(replacement) = self.open_deck_for(key, Some((gain_fp, 0, left, true))) {
+                    self.fading_out[index].deck = replacement;
+                } else {
+                    self.fading_out[index].frames_left = 0;
+                }
+            }
+            return Some(frame);
+        }
+        let left = self.fading_out[index].frames_left;
+        if left == 0 {
+            return None;
+        }
+        let key = self.fading_out[index].key;
+        let gain_fp = self.fading_out[index].deck.gain_fp;
+        if let Some(replacement) = self.open_deck_for(key, Some((gain_fp, 0, left, true))) {
+            self.fading_out[index].deck = replacement;
+            let frame = self.fading_out[index].deck.next_frame();
+            if frame.is_some() {
+                self.fading_out[index].frames_left =
+                    self.fading_out[index].frames_left.saturating_sub(1);
+            }
+            frame
+        } else {
+            self.fading_out[index].frames_left = 0;
+            None
+        }
     }
 }
