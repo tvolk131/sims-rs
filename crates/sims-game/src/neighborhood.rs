@@ -1511,11 +1511,6 @@ impl NeighborhoodShell {
             house,
         )
         .map_err(|e| e.to_string())?;
-        let after = self
-            .store
-            .load_neighborhood(&self.neighborhood_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
         match self.enter_lot(house) {
             Ok(()) => {
                 self.nbhd_state.mode = NeighborhoodMode::Normal;
@@ -1528,8 +1523,8 @@ impl NeighborhoodShell {
                     .store
                     .save_neighborhood_checked(
                         &self.neighborhood_id,
-                        after.instance_id,
-                        after.revision,
+                        report.committed_instance_id,
+                        report.committed_revision,
                         &before,
                     )
                     .map_err(|e| e.to_string())
@@ -1900,7 +1895,7 @@ impl NeighborhoodShell {
                 let cost = meta.map_or(0, |m| m.house_cost);
                 let magic_cost = self.magic_cost_for_lot(lot_id);
                 let has_house = meta.is_some_and(|m| m.has_house);
-                if family_funds < cost || family_magic_coins < magic_cost {
+                if family_funds < cost || (magic_cost > 0 && family_magic_coins < magic_cost) {
                     // Hover card already explains insufficient Simoleons or MagiCoins.
                     return ShellOutcome::redraw();
                 }

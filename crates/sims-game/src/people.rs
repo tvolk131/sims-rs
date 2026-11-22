@@ -19,7 +19,7 @@ use sims_people::pie_head::Look;
 use sims_render::{Camera, Canvas};
 use sims_sim::World;
 use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Radius of the dark radial shading circle behind the pie menu (`[0x6c4708]`,
@@ -213,20 +213,25 @@ impl Drop for TempCastDir {
     }
 }
 
-/// Joins a relative REDB character key under `base`, rejecting absolute paths,
-/// parent traversal (`..`), or Windows prefixes.
+/// Joins a relative REDB character key under `base`, splitting on both `/` and
+/// `\` (matching `sims_content::Index::add_character_files` on Unix and
+/// Windows) and rejecting absolute paths, parent traversal (`..`), or drive
+/// prefixes.
 fn safe_relative_path(base: &Path, rel: &str) -> Option<PathBuf> {
+    if rel.starts_with('/') || rel.starts_with('\\') {
+        return None;
+    }
     let mut out = base.to_path_buf();
     let mut has_component = false;
-    for comp in Path::new(rel).components() {
-        match comp {
-            Component::Normal(part) => {
-                out.push(part);
-                has_component = true;
-            }
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+    for part in rel.split(['/', '\\']) {
+        if part.is_empty() || part == "." {
+            continue;
         }
+        if part == ".." || part.contains(':') || part.contains('\0') {
+            return None;
+        }
+        out.push(part);
+        has_component = true;
     }
     has_component.then_some(out)
 }
@@ -508,5 +513,22 @@ mod tests {
         assert_eq!(edge.color[0], [5, 110, 15]);
         assert_eq!(edge.color[3 * 10 + 3], [200, 40, 20]);
         assert_eq!(edge.color[4 * 10 + 4], [10, 20, 30]);
+    }
+
+    #[test]
+    fn safe_relative_path_normalizes_both_separators_and_rejects_traversal() {
+        let base = Path::new("/tmp/cast/Characters");
+        assert_eq!(
+            safe_relative_path(base, r"ignored.dir\Sim.iff"),
+            Some(base.join("ignored.dir").join("Sim.iff"))
+        );
+        assert_eq!(
+            safe_relative_path(base, "sub/User00001.iff"),
+            Some(base.join("sub").join("User00001.iff"))
+        );
+        assert_eq!(safe_relative_path(base, r"..\escape.iff"), None);
+        assert_eq!(safe_relative_path(base, "/abs.iff"), None);
+        assert_eq!(safe_relative_path(base, r"\abs.iff"), None);
+        assert_eq!(safe_relative_path(base, r"C:\drive.iff"), None);
     }
 }

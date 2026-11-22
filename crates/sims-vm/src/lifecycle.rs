@@ -269,6 +269,8 @@ pub struct MoveInReport {
     pub budget_before: i32,
     pub budget_after: i32,
     pub architecture_value: i32,
+    pub committed_instance_id: u128,
+    pub committed_revision: u64,
 }
 
 /// Summary of [`evict`].
@@ -1654,13 +1656,13 @@ fn move_in_inner(
     }
     stored.revision = stored.revision.saturating_add(1);
 
-    match store.save_neighborhood_checked(
+    let (committed_instance_id, committed_revision) = match store.save_neighborhood_checked(
         neighborhood_id,
         origin_instance_id,
         origin_revision,
         &stored,
     )? {
-        Ok((_, _)) => {}
+        Ok(version) => version,
         Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
             return Err(LifecycleError::NeighborhoodMismatch {
                 expected: format!("{neighborhood_id}#{expected:032x}"),
@@ -1674,7 +1676,7 @@ fn move_in_inner(
                 current_revision: current,
             });
         }
-    }
+    };
     Ok(MoveInReport {
         family: family_id,
         house,
@@ -1682,6 +1684,8 @@ fn move_in_inner(
         budget_before,
         budget_after,
         architecture_value: required,
+        committed_instance_id,
+        committed_revision,
     })
 }
 

@@ -14,7 +14,7 @@ With the three Neighborhood pillars landed on `main` — `sims-render::neighborh
 - On `save_current_lot` (F5, Options → Save, and Save & Leave) and `execute_bulldoze`, map thumbnails (`MapLot.normal` / `roofs_off`) and REDB occupancy/Family Bin state refresh immediately.
 - Entering an occupied residential lot clears `global[32]` (`BUDGET_MODE`) before household selection in `sims_vm::lifecycle` so moving into a previously edited vacant lot (or Magic Town base house `90..=92`) applies the arriving household's funds and enters Live mode rather than staying locked in edit mode.
 - `Game::open_from_store` builds `People`'s character cast from REDB's `snapshot.character_files` via an RAII temporary staging directory (`People::open_from_character_files`), matching the VM and HUD without touching `crates/sims-people/` or reading loose `UserData` files on disk, and synchronizes `Pace::speed` from the restored world.
-- `NeighborhoodShell::execute_move_in` snapshots the pre-Move-In `StoredNeighborhood` and rolls back the checked REDB commit if opening the newly occupied lot fails.
+- `NeighborhoodShell::execute_move_in` snapshots the pre-Move-In `StoredNeighborhood` and rolls back using the committed `(instance_id, revision)` returned in `MoveInReport` if opening the newly occupied lot fails.
 - Magic Town residential Move-In (`90..=92`) validates and deducts MagiCoins across member inventories in member order (`0x410282`, `0x5500c5..0x550124`, `0x556467`).
 
 ### 2. Streaming Mode Music Wiring (`crates/sims-game/src/sound.rs`)
@@ -28,7 +28,7 @@ With the three Neighborhood pillars landed on `main` — `sims-render::neighborh
   - During active user interaction (pointer move/click/wheel/key within a 250 ms hold, right-drag pan, edge-scrolling, slider/dialog drags, Buy/Build placement cursors, or modal dialogs), visual redraws run up to the physical monitor refresh rate (e.g. 120 Hz on ProMotion, 60 Hz on 60 Hz displays).
   - During passive simulation-only updates (hands-off Fast/Ultra ticks, neighborhood water animation), visual redraws + `softbuffer::present()` are capped at 60 FPS (`PASSIVE_FPS_INTERVAL = 16.67 ms`, or the monitor's own interval on sub-60 Hz displays), eliminating 200+ FPS busy-spinning while keeping input silky-smooth.
   - `ControlFlow::WaitUntil` schedules the next wake at `min(now + WAKE, next_redraw_deadline)` so deferred frames present on time, breaking the `winit` zero-sleep `about_to_wait` → `request_redraw` → `redraw` feedback loop at Ultra speed.
-  - `RedrawPacer::on_redraw_consumed()` clears `redraw_requested` at the start of `App::redraw()` before any early returns (zero-sized window, surface resize, buffer acquisition, or present error), preserving `dirty = true` on failure so future wakes retry instead of wedging presentation.
+  - `RedrawPacer::on_redraw_consumed()` clears `redraw_requested` at the start of `App::redraw()`, zero-sized windows defer redraw requests until resize (`window_drawable()`), and surface/present failures pace retries via `on_redraw_failed()` (`retry_after`) rather than spinning unpaced or wedging presentation.
 
 ## Verification
 - Unit tests in `main.rs`, `neighborhood.rs`, and `sound.rs` cover `RedrawPacer` (60 Hz, 120 Hz, 30 Hz, fallback, monitor switch, interactive vs passive transitions, skipped/failed redraw recovery), CLI launch-mode compatibility, `StreetNames` formatting, and vacant thumbnails.

@@ -97,6 +97,7 @@ fn refresh_interval_from_millihertz(millihertz: Option<u32>) -> Duration {
 struct RedrawPacer {
     display_interval: Duration,
     last_present: Option<Instant>,
+    retry_after: Option<Instant>,
     last_interaction: Option<Instant>,
     redraw_requested: bool,
 }
@@ -106,6 +107,7 @@ impl RedrawPacer {
         Self {
             display_interval: refresh_interval_from_millihertz(refresh_millihertz),
             last_present: None,
+            retry_after: None,
             last_interaction: None,
             redraw_requested: false,
         }
@@ -128,6 +130,7 @@ impl RedrawPacer {
     /// resize, scale change, or screen transition).
     fn request_immediate(&mut self) {
         self.last_present = None;
+        self.retry_after = None;
     }
 
     fn is_interactive(&self, now: Instant, continuous_interaction: bool) -> bool {
@@ -146,6 +149,17 @@ impl RedrawPacer {
         }
     }
 
+    fn due_instant(&self, now: Instant, continuous_interaction: bool) -> Option<Instant> {
+        let interval = self.target_interval(now, continuous_interaction);
+        let present_due = self.last_present.map(|prev| prev + interval);
+        match (present_due, self.retry_after) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
     /// Returns `true` when `window.request_redraw()` should be emitted now.
     fn should_request_redraw(
         &mut self,
@@ -156,10 +170,9 @@ impl RedrawPacer {
         if !dirty || self.redraw_requested {
             return false;
         }
-        let interval = self.target_interval(now, continuous_interaction);
         let due = self
-            .last_present
-            .is_none_or(|prev| now.saturating_duration_since(prev) >= interval);
+            .due_instant(now, continuous_interaction)
+            .is_none_or(|at| now >= at);
         if due {
             self.redraw_requested = true;
             true
@@ -178,19 +191,27 @@ impl RedrawPacer {
         if !dirty || self.redraw_requested {
             return None;
         }
-        let interval = self.target_interval(now, continuous_interaction);
-        self.last_present.map(|prev| prev + interval)
+        self.due_instant(now, continuous_interaction)
     }
 
     /// Clears the pending redraw request as soon as the window event is
-    /// consumed, before any early returns (e.g. zero-sized window or surface
-    /// failure), so a skipped redraw can never wedge future presentation.
+    /// consumed, before any early returns (e.g. zero-sized window), so a
+    /// skipped redraw can never wedge future presentation.
     fn on_redraw_consumed(&mut self) {
         self.redraw_requested = false;
     }
 
+    /// Paces retries after a surface resize, buffer acquisition, or present
+    /// failure separately from `last_present`, preventing an unpaced busy loop
+    /// while preserving retry behavior.
+    fn on_redraw_failed(&mut self, now: Instant) {
+        self.redraw_requested = false;
+        self.retry_after = Some(now + PASSIVE_FPS_INTERVAL.max(self.display_interval));
+    }
+
     fn on_present(&mut self, now: Instant) {
         self.last_present = Some(now);
+        self.retry_after = None;
         self.redraw_requested = false;
     }
 }
@@ -710,7 +731,16 @@ impl App {
         self.drag.is_some() || self.session.is_actively_interacting()
     }
 
+    fn window_drawable(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|w| canvas_size(w.inner_size(), self.scale.max(1)).is_some())
+    }
+
     fn maybe_request_redraw(&mut self, now: Instant) {
+        if !self.window_drawable() {
+            return;
+        }
         let continuous = self.continuous_interaction();
         if self
             .redraw_pacer
@@ -1135,12 +1165,14 @@ impl App {
         }
         let Some(surface) = &mut self.surface else {
             self.dirty = true;
+            self.redraw_pacer.on_redraw_failed(Instant::now());
             return;
         };
         if self.surface_size != Some((w, h)) {
             if surface.resize(w, h).is_err() {
                 self.surface_size = None;
                 self.dirty = true;
+                self.redraw_pacer.on_redraw_failed(Instant::now());
                 return;
             }
             self.surface_size = Some((w, h));
@@ -1148,6 +1180,7 @@ impl App {
         let Ok(mut buffer) = surface.buffer_mut() else {
             self.surface_size = None;
             self.dirty = true;
+            self.redraw_pacer.on_redraw_failed(Instant::now());
             return;
         };
         let canvas = self.session.canvas();
@@ -1156,6 +1189,7 @@ impl App {
         if buffer.present().is_err() {
             self.surface_size = None;
             self.dirty = true;
+            self.redraw_pacer.on_redraw_failed(Instant::now());
             return;
         }
         self.redraw_pacer.on_present(Instant::now());
@@ -1312,10 +1346,13 @@ impl ApplicationHandler for App {
         self.tick();
         let now = Instant::now();
         let wake_deadline = now + WAKE;
-        let next_deadline = self
-            .redraw_pacer
-            .next_redraw_deadline(now, self.dirty, self.continuous_interaction())
-            .map_or(wake_deadline, |d| d.min(wake_deadline));
+        let next_deadline = if self.window_drawable() {
+            self.redraw_pacer
+                .next_redraw_deadline(now, self.dirty, self.continuous_interaction())
+                .map_or(wake_deadline, |d| d.min(wake_deadline))
+        } else {
+            wake_deadline
+        };
         event_loop.set_control_flow(ControlFlow::WaitUntil(next_deadline));
     }
 
@@ -2232,20 +2269,32 @@ mod tests {
         assert!(!pacer.should_request_redraw(t0 + Duration::from_millis(1), true, false));
         assert_eq!(pacer.next_redraw_deadline(t0, true, false), None);
 
-        // Redraw event is consumed, then aborts early (e.g. minimized / zero size
-        // or surface resize/buffer failure) without calling `on_present`.
+        // Redraw event is consumed, then skipped (e.g. minimized / zero size):
+        // once resized back to drawable, a fresh request succeeds immediately.
         pacer.on_redraw_consumed();
-
-        // Future dirty wakes must be able to request a retry immediately (since
-        // no frame was presented yet), and after a successful present, a later
-        // skipped redraw still schedules deadlines instead of wedging forever.
         assert!(pacer.should_request_redraw(t0 + Duration::from_millis(2), true, false));
         pacer.on_present(t0 + Duration::from_millis(2));
 
-        let t_next = t0 + Duration::from_millis(20);
-        assert!(pacer.should_request_redraw(t_next, true, false));
-        pacer.on_redraw_consumed(); // surface failure before present
-        assert!(pacer.should_request_redraw(t_next + Duration::from_millis(1), true, false));
+        // A surface resize / buffer / present failure clears `redraw_requested`
+        // AND paces retries separately so failed attempts cannot busy-spin.
+        let t_fail = t0 + Duration::from_millis(20);
+        assert!(pacer.should_request_redraw(t_fail, true, false));
+        pacer.on_redraw_consumed();
+        pacer.on_redraw_failed(t_fail);
+        assert!(!pacer.should_request_redraw(t_fail + Duration::from_millis(1), true, false));
+        assert_eq!(
+            pacer.next_redraw_deadline(t_fail + Duration::from_millis(1), true, false),
+            Some(t_fail + PASSIVE_FPS_INTERVAL)
+        );
+        // Once backoff elapses (or resize calls `request_immediate`), retry succeeds.
+        assert!(pacer.should_request_redraw(t_fail + Duration::from_millis(17), true, false));
+        pacer.on_present(t_fail + Duration::from_millis(17));
+        // Even while in failure backoff, `request_immediate` (e.g. on Resize) wakes immediately.
+        let t_fail2 = t_fail + Duration::from_millis(40);
+        assert!(pacer.should_request_redraw(t_fail2, true, false));
+        pacer.on_redraw_failed(t_fail2);
+        pacer.request_immediate();
+        assert!(pacer.should_request_redraw(t_fail2 + Duration::from_millis(1), true, false));
     }
 
     #[test]
