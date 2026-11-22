@@ -14,13 +14,13 @@ use crate::ir::{
     StringEntry, StringFormat, StringTableChunk, TtabChunk,
 };
 use crate::lower::{LoweredModule, lower_module};
-use crate::manifest::{ObjectManifest, PackManifest, TreeRef};
+use crate::manifest::{ObjectManifest, PackManifest, SpriteSpec, TreeRef};
 use crate::parser::parse_module;
 use sims_formats::behavior::{Interaction, MotiveAdvertisement};
 use sims_formats::execution::{ObjectFunction, Slot};
 use sims_formats::iff::ChunkData;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Compiled standalone `.antics` module.
 pub type CompiledModule = LoweredModule;
@@ -91,6 +91,18 @@ pub fn compile_object_from_sources(
     let mut constants = lowered.constants;
     let mut strings = lowered.strings;
 
+    // Private object IFFs are only addressed via private BCON range 4096..=4159 by sims-vm
+    // (`Program::constant` maps 256..=319 to Global.iff and 8192..=8255 to semi-globals).
+    for &bcon_id in constants.keys() {
+        if matches!(bcon_id, 256..=319 | 8192..=8255) {
+            return Err(Error::new(format!(
+                "object '{}' declares non-private BCON id {bcon_id} (global 256..=319 and \
+                 semi-global 8192..=8255 tables are not read from private object IFFs; use 4096..=4159)",
+                manifest.name
+            )));
+        }
+    }
+
     let resolve_tree = |r: &TreeRef| -> Result<u16> {
         match r {
             TreeRef::Id(id) => Ok(*id),
@@ -142,6 +154,13 @@ pub fn compile_object_from_sources(
         }
         Ok(entries)
     };
+
+    // Track per-tile sprite sets so each multi-tile sub-object can emit its own distinct
+    // PALT/SPR2/DGRP while validating every tile resource reference against emitted chunks.
+    let mut extra_tile_sprites: Vec<(u16, String, SpriteSpec)> = Vec::new();
+    let mut emitted_dgrp_ids = BTreeSet::from([manifest.dgrp_id]);
+    let mut emitted_spr2_ids = BTreeSet::from([manifest.spr2_id]);
+    let mut emitted_palt_ids = BTreeSet::from([manifest.palt_id]);
 
     // 1. OBJD + OBJf (single-tile or multi-tile master + tile definitions)
     let mut tile_guids = Vec::with_capacity(manifest.tiles.len());
@@ -273,6 +292,94 @@ pub fn compile_object_from_sources(
                     tile.sub_index, tile.level, manifest.name
                 )));
             }
+            let tile_label = tile
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{} Tile {}", manifest.name, idx));
+
+            // Validate / register per-tile DGRP/sprite overrides.
+            let tile_dgrp_id = match (tile.dgrp_id, tile.shape) {
+                (Some(dgrp_id), Some(shape)) => {
+                    if dgrp_id == 0 {
+                        return Err(Error::new(format!(
+                            "tile '{tile_label}' cannot combine dgrp_id = 0 with a sprite shape"
+                        )));
+                    }
+                    if !emitted_dgrp_ids.insert(dgrp_id)
+                        || !emitted_spr2_ids.insert(dgrp_id)
+                        || !emitted_palt_ids.insert(dgrp_id)
+                    {
+                        return Err(Error::new(format!(
+                            "tile '{tile_label}' dgrp_id {dgrp_id} collides with an existing PALT/SPR2/DGRP chunk id"
+                        )));
+                    }
+                    extra_tile_sprites.push((
+                        dgrp_id,
+                        tile_label.clone(),
+                        SpriteSpec {
+                            shape,
+                            ..manifest.sprite
+                        },
+                    ));
+                    dgrp_id
+                }
+                (None, Some(shape)) => {
+                    let dgrp_id = manifest
+                        .dgrp_id
+                        .checked_add(1 + idx as u16)
+                        .ok_or_else(|| Error::new("multi-tile dgrp_id overflow"))?;
+                    if !emitted_dgrp_ids.insert(dgrp_id)
+                        || !emitted_spr2_ids.insert(dgrp_id)
+                        || !emitted_palt_ids.insert(dgrp_id)
+                    {
+                        return Err(Error::new(format!(
+                            "auto-assigned tile dgrp_id {dgrp_id} for '{tile_label}' collides with an existing sprite chunk id"
+                        )));
+                    }
+                    extra_tile_sprites.push((
+                        dgrp_id,
+                        tile_label.clone(),
+                        SpriteSpec {
+                            shape,
+                            ..manifest.sprite
+                        },
+                    ));
+                    dgrp_id
+                }
+                (Some(dgrp_id), None) => {
+                    if dgrp_id != 0 && !emitted_dgrp_ids.contains(&dgrp_id) {
+                        return Err(Error::new(format!(
+                            "tile '{tile_label}' references unemitted dgrp_id {dgrp_id} (set [[tile]].shape to emit a distinct tile sprite, or use 0 / {})",
+                            manifest.dgrp_id
+                        )));
+                    }
+                    dgrp_id
+                }
+                (None, None) => manifest.dgrp_id,
+            };
+
+            let tile_ttab_id = match tile.ttab_id {
+                None => manifest.ttab_id,
+                Some(id) if id == 0 || id == 0xFFFF || id == manifest.ttab_id => id,
+                Some(id) => {
+                    return Err(Error::new(format!(
+                        "tile '{tile_label}' references unemitted ttab_id {id} (valid: 0, 0xFFFF, or {})",
+                        manifest.ttab_id
+                    )));
+                }
+            };
+
+            let tile_slot_id = match tile.slot_id {
+                None => manifest.slot_id,
+                Some(id) if id == 0 || id == manifest.slot_id => id,
+                Some(id) => {
+                    return Err(Error::new(format!(
+                        "tile '{tile_label}' references unemitted slot_id {id} (valid: 0 or {})",
+                        manifest.slot_id
+                    )));
+                }
+            };
+
             let tile_init = match &tile.init {
                 Some(r) => resolve_tree(r)?,
                 None => init_id,
@@ -283,17 +390,13 @@ pub fn compile_object_from_sources(
             };
             let is_lead =
                 tile.lead || (explicit_leads == 0 && tile.sub_index == 0 && tile.level == 0);
-            let tile_label = tile
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("{} Tile {}", manifest.name, idx));
             let mut tile_spec = ObjdSpec::new(tile_objd_id, &tile_label, tile.guid);
             tile_spec.price = 0;
             tile_spec.object_type = manifest.object_type;
-            tile_spec.base_graphic_id = tile.dgrp_id.unwrap_or(manifest.dgrp_id);
-            tile_spec.num_graphics = 1;
-            tile_spec.tree_table_id = tile.ttab_id.unwrap_or(manifest.ttab_id);
-            tile_spec.slots_id = tile.slot_id.unwrap_or(manifest.slot_id);
+            tile_spec.base_graphic_id = tile_dgrp_id;
+            tile_spec.num_graphics = u16::from(tile_dgrp_id != 0);
+            tile_spec.tree_table_id = tile_ttab_id;
+            tile_spec.slots_id = tile_slot_id;
             tile_spec.catalog_strings_id = manifest.ctss_id;
             tile_spec.init_id = tile_init;
             tile_spec.main_id = tile_main;
@@ -330,8 +433,14 @@ pub fn compile_object_from_sources(
         }
     }
 
-    // Merge manifest [[constant]] tables into BCON map (rejecting duplicates).
+    // Merge manifest [[constant]] tables into BCON map (rejecting duplicates and non-private IDs).
     for c in &manifest.constants {
+        if matches!(c.id, 256..=319 | 8192..=8255) {
+            return Err(Error::new(format!(
+                "[[constant]] id {} in '{}' falls in global/semi-global range; private objects must use 4096..=4159",
+                c.id, manifest.name
+            )));
+        }
         let chunk = BconChunk {
             id: c.id,
             label: c.label.clone(),
@@ -421,7 +530,6 @@ pub fn compile_object_from_sources(
             Some(t) => resolve_tree(t)?,
             None => 0,
         };
-        // Motive table is indexed by motive ID (0..=max_motive_index).
         let max_motive = inter
             .motives
             .iter()
@@ -518,7 +626,7 @@ pub fn compile_object_from_sources(
         data: encode_slot(&slot_chunk)?,
     });
 
-    // 8. Procedural isometric sprites: PALT + SPR2 + DGRP
+    // 8. Procedural isometric sprites: PALT + SPR2 + DGRP (base + any per-tile overrides)
     let sprites = generate_furniture_sprites(
         &manifest.sprite,
         manifest.palt_id,
@@ -547,15 +655,52 @@ pub fn compile_object_from_sources(
         label: sprites.dgrp.label.clone(),
         data: encode_dgrp(&sprites.dgrp)?,
     });
+    for (tile_sprite_id, tile_label, tile_sprite_spec) in &extra_tile_sprites {
+        let tile_sprites = generate_furniture_sprites(
+            tile_sprite_spec,
+            *tile_sprite_id,
+            *tile_sprite_id,
+            *tile_sprite_id,
+            tile_label,
+        );
+        chunks.push(ChunkData {
+            tag: *b"PALT",
+            id: tile_sprites.palt.id,
+            flags: IFF_CONVERTED_FLAG,
+            label: tile_sprites.palt.label.clone(),
+            data: encode_palt(&tile_sprites.palt)?,
+        });
+        chunks.push(ChunkData {
+            tag: *b"SPR2",
+            id: tile_sprites.spr2.id,
+            flags: IFF_CONVERTED_FLAG,
+            label: tile_sprites.spr2.label.clone(),
+            data: encode_spr2(&tile_sprites.spr2)?,
+        });
+        chunks.push(ChunkData {
+            tag: *b"DGRP",
+            id: tile_sprites.dgrp.id,
+            flags: IFF_CONVERTED_FLAG,
+            label: tile_sprites.dgrp.label.clone(),
+            data: encode_dgrp(&tile_sprites.dgrp)?,
+        });
+    }
 
     // 9. FWAV + synthesized WAV audio assets (rejecting duplicate IDs or names)
     let mut sounds_wav = BTreeMap::new();
     let mut seen_sound_ids = BTreeSet::new();
+    let mut seen_sound_lower = BTreeSet::new();
     for sound in &manifest.sounds {
         if !seen_sound_ids.insert(sound.id) {
             return Err(Error::new(format!(
                 "duplicate [[sound]] id {} in '{}'",
                 sound.id, manifest.name
+            )));
+        }
+        if !seen_sound_lower.insert(sound.name.to_ascii_lowercase()) {
+            return Err(Error::new(format!(
+                "duplicate/case-colliding [[sound]] name '{}' in '{}'",
+                sound.name, manifest.name
             )));
         }
         let fwav = FwavChunk {
@@ -570,15 +715,7 @@ pub fn compile_object_from_sources(
             label: fwav.label.clone(),
             data: encode_fwav(&fwav)?,
         });
-        if sounds_wav
-            .insert(sound.name.clone(), synthesize_preset(sound.preset))
-            .is_some()
-        {
-            return Err(Error::new(format!(
-                "duplicate [[sound]] name '{}' in '{}'",
-                sound.name, manifest.name
-            )));
-        }
+        sounds_wav.insert(sound.name.clone(), synthesize_preset(sound.preset));
     }
 
     let iff_bytes = encode_iff_with_rsmp(&chunks)?;
@@ -592,18 +729,70 @@ pub fn compile_object_from_sources(
     })
 }
 
-/// Compiles an `object.toml` and its referenced `.antics` scripts from a directory on disk.
+/// Verifies that `child` inside `root` has no symlink along the relative path and
+/// canonicalizes strictly within `root_canon`.
+fn ensure_contained_path(
+    root: &Path,
+    root_canon: &Path,
+    rel_components: &[&str],
+) -> Result<PathBuf> {
+    let mut current = root.to_path_buf();
+    for &comp in rel_components {
+        current.push(comp);
+        let meta = std::fs::symlink_metadata(&current)
+            .map_err(|e| Error::new(format!("failed to access {}: {e}", current.display())))?;
+        if meta.file_type().is_symlink() {
+            return Err(Error::new(format!(
+                "refusing to follow symlink inside pack root: {}",
+                current.display()
+            )));
+        }
+    }
+    let canon = std::fs::canonicalize(&current)
+        .map_err(|e| Error::new(format!("failed to resolve {}: {e}", current.display())))?;
+    if !canon.starts_with(root_canon) {
+        return Err(Error::new(format!(
+            "path {} escapes root {}",
+            current.display(),
+            root_canon.display()
+        )));
+    }
+    Ok(canon)
+}
+
+fn read_contained_file(root: &Path, root_canon: &Path, rel_components: &[&str]) -> Result<String> {
+    let canon = ensure_contained_path(root, root_canon, rel_components)?;
+    let meta = std::fs::symlink_metadata(&canon)
+        .map_err(|e| Error::new(format!("failed to inspect {}: {e}", canon.display())))?;
+    if !meta.file_type().is_file() {
+        return Err(Error::new(format!(
+            "expected regular file at {}",
+            canon.display()
+        )));
+    }
+    std::fs::read_to_string(&canon)
+        .map_err(|e| Error::new(format!("failed to read {}: {e}", canon.display())))
+}
+
+/// Compiles an `object.toml` and its referenced `.antics` scripts from a directory on disk,
+/// enforcing symlink-free containment within `dir`.
 pub fn compile_object_dir(dir: &Path) -> Result<CompiledObject> {
-    let manifest_path = dir.join("object.toml");
-    let manifest_toml = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| Error::new(format!("failed to read {}: {e}", manifest_path.display())))?;
+    let root_meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| Error::new(format!("failed to access {}: {e}", dir.display())))?;
+    if root_meta.file_type().is_symlink() || !root_meta.file_type().is_dir() {
+        return Err(Error::new(format!(
+            "object directory {} must be a real directory, not a symlink",
+            dir.display()
+        )));
+    }
+    let root_canon = std::fs::canonicalize(dir)
+        .map_err(|e| Error::new(format!("failed to resolve {}: {e}", dir.display())))?;
+    let manifest_toml = read_contained_file(dir, &root_canon, &["object.toml"])?;
     let parsed = ObjectManifest::parse(&manifest_toml)
-        .map_err(|e| e.with_context(manifest_path.display()))?;
+        .map_err(|e| e.with_context(dir.join("object.toml").display()))?;
     let mut owned_scripts = Vec::with_capacity(parsed.scripts.len());
     for script in &parsed.scripts {
-        let path = dir.join(script);
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::new(format!("failed to read {}: {e}", path.display())))?;
+        let text = read_contained_file(dir, &root_canon, &[script.as_str()])?;
         owned_scripts.push((script.clone(), text));
     }
     let refs: Vec<(&str, &str)> = owned_scripts
@@ -622,18 +811,34 @@ pub fn compile_object_from_dir(dir: &Path) -> Result<CompiledObject> {
 /// `objects/<slug>/{object.toml, *.antics}` into a packaged `FAR!byAZ` archive
 /// and deterministic synthesized WAV sound bank.
 pub fn compile_pack_dir(dir: &Path) -> Result<CompiledPack> {
-    let pack_path = dir.join("pack.toml");
-    let pack_toml = std::fs::read_to_string(&pack_path)
-        .map_err(|e| Error::new(format!("failed to read {}: {e}", pack_path.display())))?;
-    let manifest =
-        PackManifest::parse(&pack_toml).map_err(|e| e.with_context(pack_path.display()))?;
+    let root_meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| Error::new(format!("failed to access {}: {e}", dir.display())))?;
+    if root_meta.file_type().is_symlink() || !root_meta.file_type().is_dir() {
+        return Err(Error::new(format!(
+            "pack directory {} must be a real directory, not a symlink",
+            dir.display()
+        )));
+    }
+    let root_canon = std::fs::canonicalize(dir)
+        .map_err(|e| Error::new(format!("failed to resolve {}: {e}", dir.display())))?;
+    let pack_toml = read_contained_file(dir, &root_canon, &["pack.toml"])?;
+    let manifest = PackManifest::parse(&pack_toml)
+        .map_err(|e| e.with_context(dir.join("pack.toml").display()))?;
 
     let mut objects = Vec::with_capacity(manifest.objects.len());
     let mut seen_guids = BTreeMap::new();
+    let mut seen_iff_lower = BTreeSet::new();
     let mut sounds_wav: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut seen_sound_lower: BTreeMap<String, String> = BTreeMap::new();
 
     for slug in &manifest.objects {
-        let obj_dir = dir.join("objects").join(slug);
+        let iff_name = format!("{}.iff", slug.replace('-', "_"));
+        if !seen_iff_lower.insert(iff_name.to_ascii_lowercase()) {
+            return Err(Error::new(format!(
+                "object slug '{slug}' produces colliding IFF filename '{iff_name}'"
+            )));
+        }
+        let obj_dir = ensure_contained_path(dir, &root_canon, &["objects", slug.as_str()])?;
         let compiled =
             compile_object_dir(&obj_dir).map_err(|e| e.with_context(format!("object '{slug}'")))?;
         for guid in std::iter::once(compiled.guid).chain(compiled.tile_guids.iter().copied()) {
@@ -644,6 +849,15 @@ pub fn compile_pack_dir(dir: &Path) -> Result<CompiledPack> {
             }
         }
         for (sound_name, wav_bytes) in &compiled.sounds_wav {
+            let lower = sound_name.to_ascii_lowercase();
+            if let Some(prev_name) = seen_sound_lower.get(&lower)
+                && prev_name != sound_name
+            {
+                return Err(Error::new(format!(
+                    "case-colliding sound names '{prev_name}' and '{sound_name}' in '{slug}'"
+                )));
+            }
+            seen_sound_lower.insert(lower, sound_name.clone());
             if let Some(existing) = sounds_wav.get(sound_name) {
                 if existing != wav_bytes {
                     return Err(Error::new(format!(
@@ -654,7 +868,6 @@ pub fn compile_pack_dir(dir: &Path) -> Result<CompiledPack> {
                 sounds_wav.insert(sound_name.clone(), wav_bytes.clone());
             }
         }
-        let iff_name = format!("{}.iff", slug.replace('-', "_"));
         objects.push(CompiledPackObject {
             slug: slug.clone(),
             iff_name,

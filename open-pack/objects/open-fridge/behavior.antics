@@ -1,7 +1,9 @@
 // Open Frost Fridge (0x7F00_0020) — initiates the multi-object cooking chain:
-// Fridge (funds + stock) -> Counter (prep) -> Stove (cook + skill scaling) -> Meal Plate.
+// Fridge (verify Counter + Stove, then debit funds + stock) -> Counter (prep)
+// -> Stove (cook + skill scaling + on-lot plate creation) -> Meal Plate.
+// TTAB guards & interactions run on the Sim (`my`) with this fridge in `stack_obj`.
 //
-// Attributes:
+// Fridge attributes (`stack.attr`):
 //   attr[0] = pantry stock count (starts at 5; restocked by Open Wall Phone)
 //   attr[1] = total meals prepared
 //   attr[2] = object ID of the most recently created Open Meal Plate
@@ -25,10 +27,10 @@ tree 4097 "Main" {
 }
 
 tree 4098 "CanCookMeal" {
-    if my.attr[0] <= 0 {
+    if stack.attr[0] <= 0 {
         return false;
     }
-    if stack.motive.hunger >= bcon.max_entry_hunger {
+    if my.motive.hunger >= bcon.max_entry_hunger {
         return false;
     }
     if !alter_budget(bcon.meal_cost, category: 0, test_only: true) {
@@ -38,49 +40,64 @@ tree 4098 "CanCookMeal" {
 }
 
 interaction 4099 "CookMeal" {
-    let sim_id = stack_obj;
+    let fridge_id = stack_obj;
 
-    if my.attr[0] <= 0 {
+    if stack.attr[0] <= 0 {
         return false;
     }
+
+    // Locate both Counter (prep) and Stove (cook) BEFORE debiting funds or stock
+    // so missing appliances never consume household money or ingredients.
+    if !find_best_object(prep) {
+        stack_obj := fridge_id;
+        return false;
+    }
+    let counter_id = stack_obj;
+
+    if !find_best_object(cook) {
+        stack_obj := fridge_id;
+        return false;
+    }
+    let stove_id = stack_obj;
+
+    // Debit meal cost and decrement fridge stock.
     if !alter_budget(bcon.meal_cost, category: 0) {
+        stack_obj := fridge_id;
         return false;
     }
-
-    my.attr[0] -= 1;
-    play_sound(1);
+    stack_obj := fridge_id;
+    stack.attr[0] -= 1;
+    play_sound(1, stack_obj);
 
     // Pass Sim's cooking skill (temp[0]), Sim ID (temp[1]), plate output slot (temp[2]),
     // and counter prep bonus (temp[3]) into downstream functional trees.
-    temp[0] := stack.person.cooking;
-    temp[1] := sim_id;
+    temp[0] := my.person.cooking;
+    temp[1] := my.id;
     temp[2] := 0;
     temp[3] := 0;
 
-    // Step 1: Locate best Counter (function 0 / prep) and run its PrepIngredients callback.
-    if !find_best_object(prep) {
-        stack_obj := sim_id;
-        return false;
-    }
+    // Step 1: Prep ingredients on the located Counter.
+    stack_obj := counter_id;
     if !run_functional_tree(prep) {
-        stack_obj := sim_id;
+        stack_obj := fridge_id;
+        stack.attr[0] += 1;
+        alter_budget(bcon.meal_cost, category: 0, income: true);
         return false;
     }
 
-    // Step 2: Locate best Stove (function 1 / cook) and run its CookOnStove callback.
-    if !find_best_object(cook) {
-        stack_obj := sim_id;
-        return false;
-    }
+    // Step 2: Cook on the located Stove and place the Open Meal Plate on the lot.
+    stack_obj := stove_id;
     if !run_functional_tree(cook) {
-        stack_obj := sim_id;
+        stack_obj := fridge_id;
+        stack.attr[0] += 1;
+        alter_budget(bcon.meal_cost, category: 0, income: true);
         return false;
     }
 
     // Step 3: Record newly created Meal Plate ID and award Cooking skill experience.
-    my.attr[2] := temp[2];
-    my.attr[1] += 1;
-    stack_obj := sim_id;
-    stack.person.cooking += bcon.cooking_xp;
+    stack_obj := fridge_id;
+    stack.attr[2] := temp[2];
+    stack.attr[1] += 1;
+    my.person.cooking += bcon.cooking_xp;
     return true;
 }

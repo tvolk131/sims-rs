@@ -1,10 +1,10 @@
 // Open Double Bed (master 0x7F00_0012, lead 0x7F00_0010, slave 0x7F00_0011)
 // Multi-tile double bed with shared occupancy attribute synced across lead & slave
-// tiles, Energy + Comfort sleep loop, full-rest wake, and mid-cancel cleanup.
+// tiles, Energy + Comfort sleep loop, full-rest wake, and native VM cancel cleanup
+// (`my.person.priority == 0` when the player cancels the running interaction).
 //
-// Attributes:
+// Bed attributes (on `stack` inside TTAB guards/interactions):
 //   attr[0] = occupancy bitmask (flag 1 = left side, flag 2 = right side)
-//   attr[1] = cancel request flag (nonzero interrupts sleep loop cleanly)
 //   attr[2] = completed sleep cycles counter
 
 bcon 4096 "DoubleBedTuning" {
@@ -27,42 +27,42 @@ tree 4097 "Main" {
     return true;
 }
 
-// Synchronizes my.attr[0] (occupancy bitmask) to every linked tile in the multi-tile group.
+// Synchronizes stack.attr[0] (lead occupancy bitmask) to every linked tile in the group.
 tree 4098 "SyncOccupancy" {
-    let saved_stack = stack_obj;
-    let occ = my.attr[0];
-    let cursor = my.id;
+    let lead_id = stack_obj;
+    let occ = stack.attr[0];
+    let cursor = lead_id;
     let steps = 0;
     while steps < 4 {
         if !set_to_next(part, dest: cursor) {
             break;
         }
-        if cursor == my.id {
+        if cursor == lead_id {
             break;
         }
         stack_obj := cursor;
         stack.attr[0] := occ;
         steps += 1;
     }
-    stack_obj := saved_stack;
+    stack_obj := lead_id;
     return true;
 }
 
 tree 4099 "CanSleepLeft" {
-    if my.attr[0] flag_test 1 {
+    if stack.attr[0] flag_test 1 {
         return false;
     }
-    if stack.motive.energy >= bcon.max_entry_energy {
+    if my.motive.energy >= bcon.max_entry_energy {
         return false;
     }
     return true;
 }
 
 tree 4100 "CanSleepRight" {
-    if my.attr[0] flag_test 2 {
+    if stack.attr[0] flag_test 2 {
         return false;
     }
-    if stack.motive.energy >= bcon.max_entry_energy {
+    if my.motive.energy >= bcon.max_entry_energy {
         return false;
     }
     return true;
@@ -71,34 +71,32 @@ tree 4100 "CanSleepRight" {
 // Shared sleep loop parameterized by param[0] = side flag index (1 = left, 2 = right).
 tree 4101 "SleepSide" (args: 1) {
     let side_flag = param[0];
-    my.attr[0] flag_set side_flag;
-    my.attr[1] := 0;
+    stack.attr[0] flag_set side_flag;
     call SyncOccupancy();
-    play_sound(1);
+    play_sound(1, stack_obj);
 
     let cycles = 0;
     while cycles < bcon.max_cycles {
-        if my.attr[1] != 0 {
+        if my.person.priority == 0 {
             break;
         }
         idle(bcon.sleep_ticks);
-        if my.attr[1] != 0 {
+        if my.person.priority == 0 {
             break;
         }
-        stack.motive.energy += bcon.energy_step;
-        stack.motive.comfort += bcon.comfort_step;
+        my.motive.energy += bcon.energy_step;
+        my.motive.comfort += bcon.comfort_step;
         cycles += 1;
-        my.attr[2] += 1;
-        if stack.motive.energy >= bcon.wake_energy {
+        stack.attr[2] += 1;
+        if my.motive.energy >= bcon.wake_energy {
             break;
         }
     }
 
     // Wake and mid-cancel cleanup always releases the claimed side across all tiles.
-    my.attr[0] flag_clear side_flag;
-    my.attr[1] := 0;
+    stack.attr[0] flag_clear side_flag;
     call SyncOccupancy();
-    play_sound(2);
+    play_sound(2, stack_obj);
     return true;
 }
 

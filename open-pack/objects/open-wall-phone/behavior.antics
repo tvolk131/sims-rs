@@ -1,6 +1,7 @@
 // Open Wall Phone (0x7F00_0030) — interactive dialog branching & FWAV phone SFX.
+// TTAB guards & interactions run on the Sim (`my`) with this phone in `stack_obj`.
 //
-// Attributes:
+// Phone attributes (`stack.attr`):
 //   attr[0] = in-use lock
 //   attr[1] = last menu outcome (1=groceries ordered, 2=chatted, 3=info, 4=declined/canceled, 5=insufficient funds)
 //   attr[2] = total completed calls
@@ -39,7 +40,7 @@ tree 4097 "Main" {
 }
 
 tree 4098 "CanUsePhone" {
-    if my.attr[0] != 0 {
+    if stack.attr[0] != 0 {
         return false;
     }
     return true;
@@ -47,35 +48,35 @@ tree 4098 "CanUsePhone" {
 
 // Restocks any Open Fridge (0x7F00_0020) on the lot when groceries are delivered.
 tree 4099 "RestockFridges" {
-    let saved_stack = stack_obj;
+    let phone_id = stack_obj;
     let fridge = 0;
     while set_to_next(guid, 0x7F00_0020, dest: fridge) {
         stack_obj := fridge;
         stack.attr[0] += bcon.grocery_stock_bonus;
     }
-    stack_obj := saved_stack;
+    stack_obj := phone_id;
     return true;
 }
 
 tree 4100 "DeliverGroceries" {
     if alter_budget(bcon.grocery_cost, category: 0) {
         call RestockFridges();
-        stack.motive.comfort += bcon.grocery_comfort_gain;
-        play_sound(3);
-        my.attr[1] := 1;
-        my.attr[2] += 1;
+        my.motive.comfort += bcon.grocery_comfort_gain;
+        play_sound(3, stack_obj);
+        stack.attr[1] := 1;
+        stack.attr[2] += 1;
         return true;
     } else {
-        my.attr[1] := 5;
+        stack.attr[1] := 5;
         return false;
     }
 }
 
 // 3-choice dialog: Button 1 = Order Groceries, Button 2 = Chat with Neighbor, Button 3 = Call for Info.
 interaction 4101 "UsePhone" {
-    my.attr[0] := 1;
-    play_sound(1);
-    play_sound(2);
+    stack.attr[0] := 1;
+    play_sound(1, stack_obj);
+    play_sound(2, stack_obj);
 
     if dialog(
         kind: yes_no_cancel,
@@ -88,18 +89,18 @@ interaction 4101 "UsePhone" {
         icon_mode: 1
     ) {
         if !call DeliverGroceries() {
-            my.attr[0] := 0;
+            stack.attr[0] := 0;
             return false;
         }
     } else {
         if temp[0] == 0 {
             // Button 2: Chat with Neighbor
             idle(bcon.chat_ticks);
-            stack.motive.social += bcon.chat_social_gain;
-            stack.motive.fun += bcon.chat_fun_gain;
-            play_sound(3);
-            my.attr[1] := 2;
-            my.attr[2] += 1;
+            my.motive.social += bcon.chat_social_gain;
+            my.motive.fun += bcon.chat_fun_gain;
+            play_sound(3, stack_obj);
+            stack.attr[1] := 2;
+            stack.attr[2] += 1;
         } else {
             // Button 3: Call for Info (non-blocking info bulletin)
             dialog(
@@ -109,21 +110,21 @@ interaction 4101 "UsePhone" {
                 inform: true,
                 icon_mode: 1
             );
-            stack.motive.fun += bcon.info_fun_gain;
-            play_sound(3);
-            my.attr[1] := 3;
-            my.attr[2] += 1;
+            my.motive.fun += bcon.info_fun_gain;
+            play_sound(3, stack_obj);
+            stack.attr[1] := 3;
+            stack.attr[2] += 1;
         }
     }
 
-    my.attr[0] := 0;
+    stack.attr[0] := 0;
     return true;
 }
 
 // 2-choice Yes/Cancel dialog for ordering groceries directly.
 interaction 4102 "QuickOrderGroceries" {
-    my.attr[0] := 1;
-    play_sound(2);
+    stack.attr[0] := 1;
+    play_sound(2, stack_obj);
     if dialog(
         kind: yes_no,
         title: str.title,
@@ -133,12 +134,12 @@ interaction 4102 "QuickOrderGroceries" {
         icon_mode: 1
     ) {
         if !call DeliverGroceries() {
-            my.attr[0] := 0;
+            stack.attr[0] := 0;
             return false;
         }
     } else {
-        my.attr[1] := 4;
+        stack.attr[1] := 4;
     }
-    my.attr[0] := 0;
+    stack.attr[0] := 0;
     return true;
 }

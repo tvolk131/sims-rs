@@ -234,7 +234,7 @@ fn scan_tree_usage(stmts: &[Stmt]) -> TreeUsage {
 
 fn scan_operand(op: &OperandRef, usage: &mut TreeUsage) {
     if let OperandRef::Direct(direct) = op {
-        if direct.scope == 9 && direct.index == 0 {
+        if matches!(direct.scope, 9 | 22) && direct.index == 0 {
             usage.uses_param0 = true;
         } else if direct.scope == 25 && direct.index >= 0 {
             let idx = direct.index as usize;
@@ -522,7 +522,7 @@ impl<'a> TreeBuilder<'a> {
                 ));
             }
             self.max_local_needed = self.max_local_needed.max(needed);
-        } else if op.scope == 9 {
+        } else if matches!(op.scope, 9 | 22) {
             let idx = usize::try_from(op.index).map_err(|_| {
                 Error::at(
                     span,
@@ -782,6 +782,7 @@ impl<'a> TreeBuilder<'a> {
                 button1,
                 button2,
                 button3,
+                mode4_str,
                 flags,
             } => {
                 // Dialog operand layout (`sims-vm/src/primitives/dialog.rs:712`):
@@ -792,11 +793,12 @@ impl<'a> TreeBuilder<'a> {
                 let button1 = self.resolve_dialog_string(button1, span)?;
                 let button2 = self.resolve_dialog_string(button2, span)?;
                 let button3 = self.resolve_dialog_string(button3, span)?;
+                let mode4_str = self.resolve_dialog_string(mode4_str, span)?;
                 Ok((
                     36,
                     [
                         button3,
-                        0,
+                        mode4_str,
                         message,
                         button1,
                         button2,
@@ -919,8 +921,15 @@ impl<'a> TreeBuilder<'a> {
         next_target: PendingTarget,
     ) -> Result<PendingTarget> {
         let start_node = self.nodes.len();
-        for (idx, stmt) in stmts.iter().enumerate() {
-            let is_last = idx + 1 == stmts.len();
+        // Filter out zero-instruction uninitialized `let name;` declarations before
+        // computing fallthrough targets so a trailing declaration never leaves a
+        // dangling branch to `nodes.len()`.
+        let active: Vec<&Stmt> = stmts
+            .iter()
+            .filter(|s| !matches!(s, Stmt::Let { init: None, .. }))
+            .collect();
+        for (idx, &stmt) in active.iter().enumerate() {
+            let is_last = idx + 1 == active.len();
             let fallthrough = if is_last {
                 next_target.clone()
             } else {

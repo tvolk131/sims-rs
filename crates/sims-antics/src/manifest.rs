@@ -585,6 +585,7 @@ pub struct TileSpec {
     pub lead: bool,
     pub interaction_group: Option<i16>,
     pub dgrp_id: Option<u16>,
+    pub shape: Option<FurnitureShape>,
     pub slot_id: Option<u16>,
     pub ttab_id: Option<u16>,
     pub init: Option<TreeRef>,
@@ -676,17 +677,45 @@ fn validate_slug(slug: &str) -> Result<()> {
 }
 
 fn validate_relative_filename(name: &str, field: &str) -> Result<()> {
-    if name.is_empty()
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains("..")
-        || name.starts_with('.')
-    {
+    let valid_chars = !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+    if !valid_chars {
         return Err(Error::new(format!(
-            "invalid filename '{name}' in {field} (must be a plain relative filename)"
+            "invalid filename '{name}' in {field} (allowed: plain relative ASCII filename using letters, digits, '.', '-', '_')"
         )));
     }
-    Ok(())
+    let mut comps = std::path::Path::new(name).components();
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => Err(Error::new(format!(
+            "invalid filename '{name}' in {field} (must be a single normal path component)"
+        ))),
+    }
+}
+
+fn parse_furniture_shape(name: &str, field: &str) -> Result<FurnitureShape> {
+    match name {
+        "bench" => Ok(FurnitureShape::Bench),
+        "cot" | "bed" => Ok(FurnitureShape::Cot),
+        "basin" | "toilet" => Ok(FurnitureShape::Basin),
+        "table" => Ok(FurnitureShape::Table),
+        "chair" => Ok(FurnitureShape::Chair),
+        "double_bed" => Ok(FurnitureShape::DoubleBed),
+        "double_bed_left" => Ok(FurnitureShape::DoubleBedLeft),
+        "double_bed_right" => Ok(FurnitureShape::DoubleBedRight),
+        "fridge" => Ok(FurnitureShape::Fridge),
+        "counter" => Ok(FurnitureShape::Counter),
+        "stove" => Ok(FurnitureShape::Stove),
+        "meal_plate" | "plate" => Ok(FurnitureShape::MealPlate),
+        "wall_phone" | "phone" => Ok(FurnitureShape::WallPhone),
+        "shower" => Ok(FurnitureShape::Shower),
+        "box" => Ok(FurnitureShape::Box),
+        other => Err(Error::new(format!("unknown {field} '{other}'"))),
+    }
 }
 
 /// Typed `object.toml` manifest bundling metadata, scripts, interactions, slots,
@@ -785,22 +814,8 @@ impl ObjectManifest {
         let sprite = match get_table(&root, "sprite") {
             Some(t) => SpriteSpec {
                 shape: match opt_str(t, "shape").as_deref() {
-                    Some("bench") => FurnitureShape::Bench,
-                    Some("cot") | Some("bed") => FurnitureShape::Cot,
-                    Some("basin") | Some("toilet") => FurnitureShape::Basin,
-                    Some("table") => FurnitureShape::Table,
-                    Some("chair") => FurnitureShape::Chair,
-                    Some("double_bed") => FurnitureShape::DoubleBed,
-                    Some("fridge") => FurnitureShape::Fridge,
-                    Some("counter") => FurnitureShape::Counter,
-                    Some("stove") => FurnitureShape::Stove,
-                    Some("meal_plate") | Some("plate") => FurnitureShape::MealPlate,
-                    Some("wall_phone") | Some("phone") => FurnitureShape::WallPhone,
-                    Some("shower") => FurnitureShape::Shower,
-                    Some("box") | None => FurnitureShape::Box,
-                    Some(other) => {
-                        return Err(Error::new(format!("unknown [sprite].shape '{other}'")));
-                    }
+                    Some(name) => parse_furniture_shape(name, "[sprite].shape")?,
+                    None => FurnitureShape::Box,
                 },
                 primary_rgb: opt_rgb(t, "primary_rgb")?.unwrap_or([152, 112, 76]),
                 accent_rgb: opt_rgb(t, "accent_rgb")?.unwrap_or([204, 172, 132]),
@@ -945,6 +960,7 @@ impl ObjectManifest {
         }
 
         let mut callbacks = Vec::new();
+        let mut seen_callback_indices = std::collections::BTreeSet::new();
         if let Some(TomlValue::Array(arr)) = root.get("callback") {
             for item in arr {
                 let TomlValue::Table(t) = item else {
@@ -955,6 +971,14 @@ impl ObjectManifest {
                     return Err(Error::new(format!(
                         "[[callback]].index {index} exceeds reasonable OBJf table bound (64)"
                     )));
+                }
+                if index <= 1 {
+                    return Err(Error::new(format!(
+                        "[[callback]].index {index} is reserved for Init (0) / Main (1); set 'init' or 'main' on [object] or [[tile]] instead"
+                    )));
+                }
+                if !seen_callback_indices.insert(index) {
+                    return Err(Error::new(format!("duplicate [[callback]].index {index}")));
                 }
                 let action = opt_tree_ref(t, "action")?;
                 let condition = opt_tree_ref(t, "condition")?;
@@ -980,6 +1004,10 @@ impl ObjectManifest {
                 let lead = opt_bool(t, "lead")?.unwrap_or(false);
                 let tile_interaction_group = opt_i16(t, "interaction_group")?;
                 let tile_dgrp_id = opt_u16(t, "dgrp_id")?;
+                let tile_shape = match opt_str(t, "shape").as_deref() {
+                    Some(name) => Some(parse_furniture_shape(name, "[[tile]].shape")?),
+                    None => None,
+                };
                 let tile_slot_id = opt_u16(t, "slot_id")?;
                 let tile_ttab_id = opt_u16(t, "ttab_id")?;
                 let tile_init = opt_tree_ref(t, "init")?;
@@ -994,6 +1022,7 @@ impl ObjectManifest {
                     lead,
                     interaction_group: tile_interaction_group,
                     dgrp_id: tile_dgrp_id,
+                    shape: tile_shape,
                     slot_id: tile_slot_id,
                     ttab_id: tile_ttab_id,
                     init: tile_init,

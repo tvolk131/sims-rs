@@ -1,6 +1,6 @@
 [object]
 name = "Open Double Bed"
-description = "A clean-room two-tile double bed with left/right entry slots, shared occupancy tracking, and mid-sleep cancel cleanup."
+description = "A clean-room two-tile double bed with left/right entry slots, shared occupancy tracking, and player cancel cleanup."
 guid = 0x7F00_0012
 price = 680
 master_id = 1
@@ -22,6 +22,8 @@ objd_id = 129
 sub_index = [0, 0]
 lead = true
 interaction_group = -1
+dgrp_id = 101
+shape = "double_bed_left"
 
 [[tile]]
 name = "Open Double Bed (Right Slave)"
@@ -30,6 +32,8 @@ objd_id = 130
 sub_index = [1, 0]
 lead = false
 interaction_group = 1
+dgrp_id = 102
+shape = "double_bed_right"
 
 [[interaction]]
 name = "Sleep (Left Side)"

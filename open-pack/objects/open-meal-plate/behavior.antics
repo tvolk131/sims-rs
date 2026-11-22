@@ -1,6 +1,7 @@
-// Open Meal Plate (0x7F00_0023) — cooked meal plate spawned by Open Hearth Stove.
+// Open Meal Plate (0x7F00_0023) — cooked meal plate spawned on-lot by Open Hearth Stove.
+// TTAB guards & interactions run on the Sim (`my`) with this plate in `stack_obj`.
 //
-// Attributes:
+// Plate attributes (`stack.attr`):
 //   attr[0] = hunger nutrition value (set by stove based on Cooking skill)
 //   attr[1] = full flag (1 = ready to eat, 0 = empty plate)
 
@@ -11,6 +12,9 @@ bcon 4096 "PlateTuning" {
 }
 
 tree 4096 "Init" {
+    // Allow ground/floor height (data[4] bit 0) and both floor & terrain placement (data[42] bits 0..1).
+    my.data[4] := 1;
+    my.data[42] := 3;
     my.attr[0] := bcon.default_nutrition;
     my.attr[1] := 1;
     return true;
@@ -21,42 +25,42 @@ tree 4097 "Main" {
 }
 
 tree 4098 "CanEat" {
-    if my.attr[1] == 1 {
+    if stack.attr[1] == 1 {
         return true;
     }
     return false;
 }
 
 tree 4099 "CanClean" {
-    if my.attr[1] == 0 {
+    if stack.attr[1] == 0 {
         return true;
     }
     return false;
 }
 
 interaction 4100 "DisposePlate" {
-    play_sound(2);
-    remove_object(me, no_yield: true);
+    play_sound(2, stack_obj);
+    remove_object(stack_obj);
     return true;
 }
 
 interaction 4101 "EatMeal" {
-    let per_bite = my.attr[0];
+    let per_bite = stack.attr[0];
     per_bite /= bcon.bites;
-    let remainder = my.attr[0];
+    let remainder = stack.attr[0];
     remainder %= bcon.bites;
 
     let eaten = 0;
     while eaten < bcon.bites {
         idle(bcon.bite_ticks);
-        stack.motive.hunger += per_bite;
+        my.motive.hunger += per_bite;
         eaten += 1;
     }
-    stack.motive.hunger += remainder;
-    play_sound(1);
+    my.motive.hunger += remainder;
+    play_sound(1, stack_obj);
 
-    // Mark plate empty and dispose cleanly.
-    my.attr[1] := 0;
+    // Mark plate empty and dispose cleanly from the lot.
+    stack.attr[1] := 0;
     call DisposePlate();
     return true;
 }

@@ -1,4 +1,5 @@
 // Open Ceramic Basin (0x7F00_0003) — clean-room porcelain fixture.
+// TTAB guards & interactions run on the Sim (`my`) with this basin in `stack_obj`.
 
 bcon 4096 "BasinTuning" {
     max_bladder = 90,
@@ -15,21 +16,21 @@ tree 4097 "Main" {
 }
 
 tree 4098 "CanUse" {
-    if stack.motive.bladder >= bcon.max_bladder {
+    if my.motive.bladder >= bcon.max_bladder {
         return false;
     }
     return true;
 }
 
 tree 4100 "WashHands" {
-    stack.motive.hygiene += bcon.hygiene_gain;
-    play_sound(1);
+    my.motive.hygiene += bcon.hygiene_gain;
+    play_sound(1, stack_obj);
     return true;
 }
 
 interaction 4099 "UseBasin" {
-    my.attr[0] += 1;
-    stack.motive.bladder := 100;
+    stack.attr[0] += 1;
+    my.motive.bladder := 100;
     call WashHands();
     return true;
 }

@@ -1,4 +1,5 @@
 // Open Pine Bench (0x7F00_0001) — clean-room comfort bench.
+// TTAB guards & interactions run on the Sim (`my`) with this bench in `stack_obj`.
 
 bcon 4096 "BenchTuning" {
     rest_cycles = 4,
@@ -16,23 +17,23 @@ tree 4097 "Main" {
 }
 
 tree 4098 "CanSit" {
-    if my.attr[0] != 0 {
+    if stack.attr[0] != 0 {
         return false;
     }
-    if stack.motive.comfort >= bcon.max_comfort {
+    if my.motive.comfort >= bcon.max_comfort {
         return false;
     }
     return true;
 }
 
 interaction 4099 "SitAndRest" {
-    my.attr[0] := 1;
-    play_sound(1);
+    stack.attr[0] := 1;
+    play_sound(1, stack_obj);
     let cycles = 0;
     while cycles < bcon.rest_cycles {
-        stack.motive.comfort += bcon.comfort_step;
+        my.motive.comfort += bcon.comfort_step;
         cycles += 1;
     }
-    my.attr[0] := 0;
+    stack.attr[0] := 0;
     return true;
 }

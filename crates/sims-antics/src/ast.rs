@@ -314,6 +314,7 @@ pub enum PrimitiveCall {
         button1: StringRef,
         button2: StringRef,
         button3: StringRef,
+        mode4_str: StringRef,
         flags: u8,
     },
     CreateObject {

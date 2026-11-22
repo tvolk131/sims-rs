@@ -1,4 +1,5 @@
 // Open Camp Cot (0x7F00_0002) — clean-room single folding cot.
+// TTAB guards & interactions run on the Sim (`my`) with this cot in `stack_obj`.
 
 bcon 4096 "CotTuning" {
     nap_cycles = 3,
@@ -18,7 +19,7 @@ tree 4097 "Main" {
 }
 
 tree 4098 "CanSleep" {
-    if stack.motive.energy < bcon.max_energy {
+    if my.motive.energy < bcon.max_energy {
         return true;
     } else {
         return false;
@@ -26,15 +27,21 @@ tree 4098 "CanSleep" {
 }
 
 interaction 4099 "TakeNap" {
-    my.attr[0] := 1;
-    play_sound(1);
+    stack.attr[0] := 1;
+    play_sound(1, stack_obj);
     let cycles = 0;
     while cycles < bcon.nap_cycles {
+        if my.person.priority == 0 {
+            break;
+        }
         idle(bcon.nap_ticks);
-        stack.motive.energy += bcon.energy_step;
-        stack.motive.comfort += bcon.comfort_step;
+        if my.person.priority == 0 {
+            break;
+        }
+        my.motive.energy += bcon.energy_step;
+        my.motive.comfort += bcon.comfort_step;
         cycles += 1;
     }
-    my.attr[0] := 0;
+    stack.attr[0] := 0;
     return true;
 }

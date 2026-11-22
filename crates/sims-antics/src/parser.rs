@@ -1201,6 +1201,7 @@ impl Parser {
                 let mut button1 = StringRef::Index(0);
                 let mut button2 = StringRef::Index(0);
                 let mut button3 = StringRef::Index(0);
+                let mut mode4_str = StringRef::Index(0);
                 let mut flags = 0u8;
                 let mut positional = 0usize;
                 let mut saw_named = false;
@@ -1220,6 +1221,9 @@ impl Parser {
                             "button1" => button1 = self.parse_string_ref("dialog button1 index")?,
                             "button2" => button2 = self.parse_string_ref("dialog button2 index")?,
                             "button3" => button3 = self.parse_string_ref("dialog button3 index")?,
+                            "mode4_str" | "icon_str" => {
+                                mode4_str = self.parse_string_ref("dialog mode4 string index")?;
+                            }
                             "flags" => flags |= self.expect_u8("dialog flags")?,
                             "inform" => {
                                 if self.parse_bool()? {
@@ -1290,6 +1294,7 @@ impl Parser {
                     button1,
                     button2,
                     button3,
+                    mode4_str,
                     flags,
                 }
             }
@@ -1700,15 +1705,16 @@ impl Parser {
             "person" => {
                 let scope = if is_my { 18 } else { 19 };
                 if self.eat(&TokenKind::Dot) {
-                    let (sname, sspan) = self.expect_ident("person skill name")?;
-                    let id = skill_by_name(&sname).ok_or_else(|| {
-                        Error::at(sspan, format!("unknown person skill '{sname}'"))
+                    let (sname, sspan) = self.expect_ident("person data field name")?;
+                    let id = person_field_by_name(&sname).ok_or_else(|| {
+                        Error::at(sspan, format!("unknown person data field '{sname}'"))
                     })?;
                     Ok(Operand::new(scope, i16::from(id)))
                 } else {
                     Ok(Operand::new(scope, self.parse_bracket_index()?))
                 }
             }
+            "priority" => Ok(Operand::new(if is_my { 18 } else { 19 }, 33)),
             "skill" => {
                 let scope = if is_my { 18 } else { 19 };
                 self.expect(&TokenKind::Dot, "'.'")?;
@@ -1802,5 +1808,14 @@ pub fn skill_by_name(name: &str) -> Option<u8> {
         "body" => Some(17),
         "logic" => Some(18),
         _ => None,
+    }
+}
+
+/// Maps human-readable `person.data` field names (skills + action priority) to indices.
+#[must_use]
+pub fn person_field_by_name(name: &str) -> Option<u8> {
+    match name {
+        "priority" => Some(33),
+        other => skill_by_name(other),
     }
 }

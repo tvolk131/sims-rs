@@ -29,10 +29,10 @@ tree 4098 "CanPrep" {
     return true;
 }
 
-// Functional callback 18 (0x12): stack_obj is this counter, temp[3] carries prep bonus back.
+// Functional callback 18 (0x12): me is Sim, stack_obj is this counter.
 tree 4099 "PrepIngredients" {
     stack.attr[0] += 1;
     temp[3] := bcon.prep_nutrition_bonus;
-    play_sound(1);
+    play_sound(1, stack_obj);
     return true;
 }

@@ -5,11 +5,58 @@
 //! - `sims-antics build <pack_dir> --out <dir>`
 
 use sims_antics::compile_pack_dir;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn print_usage() {
     eprintln!("Usage:\n  sims-antics check <pack_dir>\n  sims-antics build <pack_dir> --out <dir>");
+}
+
+fn ensure_real_dir(path: &Path, expected_parent_canon: Option<&Path>) -> Result<PathBuf, String> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return Err(format!(
+                "refusing to write through non-directory or symlink path {}",
+                path.display()
+            ));
+        }
+    } else {
+        std::fs::create_dir_all(path)
+            .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+    }
+    let canon = std::fs::canonicalize(path)
+        .map_err(|e| format!("failed to resolve {}: {e}", path.display()))?;
+    if let Some(parent) = expected_parent_canon
+        && !canon.starts_with(parent)
+    {
+        return Err(format!(
+            "output directory {} escapes root {}",
+            canon.display(),
+            parent.display()
+        ));
+    }
+    Ok(canon)
+}
+
+fn write_contained_file(parent_canon: &Path, filename: &str, bytes: &[u8]) -> Result<(), String> {
+    let path = parent_canon.join(filename);
+    if let Ok(meta) = std::fs::symlink_metadata(&path)
+        && (meta.file_type().is_symlink() || !meta.file_type().is_file())
+    {
+        return Err(format!(
+            "refusing to overwrite symlink or non-regular file {}",
+            path.display()
+        ));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
 fn run() -> Result<(), String> {
@@ -73,26 +120,18 @@ fn run() -> Result<(), String> {
             let out_dir = out_dir.ok_or_else(|| "build requires --out <dir>".to_owned())?;
 
             let compiled = compile_pack_dir(&pack_dir).map_err(|e| e.to_string())?;
-            let objects_out = out_dir.join("objects");
-            let sounds_out = out_dir.join("sounds");
-            std::fs::create_dir_all(&objects_out)
-                .map_err(|e| format!("failed to create {}: {e}", objects_out.display()))?;
-            std::fs::create_dir_all(&sounds_out)
-                .map_err(|e| format!("failed to create {}: {e}", sounds_out.display()))?;
+            let out_canon = ensure_real_dir(&out_dir, None)?;
+            let objects_canon = ensure_real_dir(&out_canon.join("objects"), Some(&out_canon))?;
+            let sounds_canon = ensure_real_dir(&out_canon.join("sounds"), Some(&out_canon))?;
 
-            let far_path = out_dir.join(&compiled.archive_name);
-            std::fs::write(&far_path, &compiled.far_bytes)
-                .map_err(|e| format!("failed to write {}: {e}", far_path.display()))?;
+            write_contained_file(&out_canon, &compiled.archive_name, &compiled.far_bytes)?;
 
             for entry in &compiled.objects {
-                let iff_path = objects_out.join(&entry.iff_name);
-                std::fs::write(&iff_path, &entry.object.iff_bytes)
-                    .map_err(|e| format!("failed to write {}: {e}", iff_path.display()))?;
+                write_contained_file(&objects_canon, &entry.iff_name, &entry.object.iff_bytes)?;
             }
             for (name, wav) in &compiled.sounds_wav {
-                let wav_path = sounds_out.join(format!("{name}.wav"));
-                std::fs::write(&wav_path, wav)
-                    .map_err(|e| format!("failed to write {}: {e}", wav_path.display()))?;
+                let wav_name = format!("{name}.wav");
+                write_contained_file(&sounds_canon, &wav_name, wav)?;
             }
 
             println!(
