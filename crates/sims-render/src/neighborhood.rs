@@ -995,16 +995,29 @@ impl NeighborhoodMap {
         // 2. Map backdrop at centered origin (0x556db7..0x556ddc, 0x568fa7..0x568fe6).
         blit_surface_to_canvas(canvas, &self.backdrop, origin, backdrop_clip, false, None);
 
-        // 3. Pre-lot water wave overlay for Unleashed (0x5570c1) and Classic
-        //    (clipped to the centered backdrop rectangle per 0x55f95f..0x55f98a).
+        // 3. Pre-lot water wave overlay:
+        //    - Classic (0x55f95f..0x55f98a -> DirectDraw Blt 0x605091) stretches
+        //      the full wave into the centered backdrop rectangle.
+        //    - Unleashed (0x5570c1) blits 1:1 at origin with a null clip.
         if !self.kind.waves_draw_after_lots()
             && let Some(frame_idx) = options.water_frame
             && !self.waves.is_empty()
             && let Some(wave) = &self.waves[frame_idx % self.waves.len()]
         {
-            let [wx, wy] = self.kind.wave_offset();
-            let at = [origin[0].saturating_add(wx), origin[1].saturating_add(wy)];
-            blit_surface_to_canvas(canvas, wave, at, backdrop_clip, overlay_keyed, None);
+            if self.kind == NeighborhoodKind::Classic {
+                blit_surface_stretched_to_canvas(
+                    canvas,
+                    wave,
+                    origin,
+                    [self.backdrop.width, self.backdrop.height],
+                    full_clip,
+                    overlay_keyed,
+                );
+            } else {
+                let [wx, wy] = self.kind.wave_offset();
+                let at = [origin[0].saturating_add(wx), origin[1].saturating_add(wy)];
+                blit_surface_to_canvas(canvas, wave, at, full_clip, overlay_keyed, None);
+            }
         }
 
         // 4. Lots in back-to-front Z-order, clipped strictly to the 800×600 rect
@@ -1029,17 +1042,20 @@ impl NeighborhoodMap {
         }
 
         // 5. Vacation Island foreground port & trees overlays (5442, 5443)
-        //    at 0x56bac8..0x56bb5d: drawn only when BOTH port and trees are present.
+        //    at 0x56bac8..0x56bb5d: drawn only when BOTH port and trees are
+        //    present, using each overlay's own dimensions with a null clip
+        //    (0x56baf4, 0x56bb29).
         if options.show_vacation_overlays
             && self.kind == NeighborhoodKind::Vacation
             && let (Some(port), Some(trees)) = (&self.vacation_port, &self.vacation_trees)
         {
-            blit_color_only_mode(canvas, port, origin, backdrop_clip, overlay_keyed);
-            blit_color_only_mode(canvas, trees, origin, backdrop_clip, overlay_keyed);
+            blit_color_only_mode(canvas, port, origin, full_clip, overlay_keyed);
+            blit_color_only_mode(canvas, trees, origin, full_clip, overlay_keyed);
         }
 
-        // 6. Post-lot water wave overlay for Downtown (0x54cb21), Vacation
-        //    (0x56bb7a..0x56bb8d, skipping missing slots), and Magic Town (0x554ff6 at (0, 62)).
+        // 6. Post-lot water wave overlay for Downtown (0x54cb21, null clip at
+        //    0x54cb3e), Vacation (0x56bb7a..0x56bb92, null clip, skipping
+        //    missing slots), and Magic Town (0x554ff6 at (0, 62)).
         if self.kind.waves_draw_after_lots()
             && let Some(frame_idx) = options.water_frame
             && !self.waves.is_empty()
@@ -1047,7 +1063,7 @@ impl NeighborhoodMap {
         {
             let [wx, wy] = self.kind.wave_offset();
             let at = [origin[0].saturating_add(wx), origin[1].saturating_add(wy)];
-            blit_color_only_mode(canvas, wave, at, backdrop_clip, overlay_keyed);
+            blit_color_only_mode(canvas, wave, at, full_clip, overlay_keyed);
         }
 
         // 7. Optional residential occupied/vacant status markers.
@@ -2933,7 +2949,7 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
                     || width
                         .checked_mul(height)
                         .is_none_or(|p| p > MAX_SURFACE_PIXELS)
-                    || (ncomp != 1 && ncomp != 3)
+                    || !matches!(ncomp, 1 | 3 | 4)
                     || seg.len() < 6 + ncomp * 3
                 {
                     return None;
@@ -3260,31 +3276,68 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
     let mut pixels = vec![0u16; width * height];
     for y in 0..height {
         for x in 0..width {
-            let rgb = if comps.len() == 1 {
-                let (pw, _, ref p0) = planes[0];
-                let v = p0[y * pw + x];
-                [v, v, v]
-            } else {
-                let sample = |ci: usize| -> i32 {
-                    let (pw, ph, ref p) = planes[ci];
-                    let sx = (x * comps[ci].h_samp / h_max).min(pw - 1);
-                    let sy = (y * comps[ci].v_samp / v_max).min(ph - 1);
-                    i32::from(p[sy * pw + sx])
-                };
-                let c0 = sample(0);
-                let c1 = sample(1);
-                let c2 = sample(2);
-                if is_rgb {
-                    [c0 as u8, c1 as u8, c2 as u8]
-                } else {
-                    let cb = c1 - 128;
-                    let cr = c2 - 128;
-                    let r = (c0 + ((91_881 * cr + 32_768) >> 16)).clamp(0, 255) as u8;
-                    let g =
-                        (c0 + ((-22_554 * cb - 46_802 * cr + 32_768) >> 16)).clamp(0, 255) as u8;
-                    let b = (c0 + ((116_130 * cb + 32_768) >> 16)).clamp(0, 255) as u8;
-                    [r, g, b]
+            let sample = |ci: usize| -> i32 {
+                let (pw, ph, ref p) = planes[ci];
+                let sx = (x * comps[ci].h_samp / h_max).min(pw - 1);
+                let sy = (y * comps[ci].v_samp / v_max).min(ph - 1);
+                i32::from(p[sy * pw + sx])
+            };
+            let rgb = match comps.len() {
+                1 => {
+                    let v = sample(0) as u8;
+                    [v, v, v]
                 }
+                3 => {
+                    let c0 = sample(0);
+                    let c1 = sample(1);
+                    let c2 = sample(2);
+                    if is_rgb {
+                        [c0 as u8, c1 as u8, c2 as u8]
+                    } else {
+                        let cb = c1 - 128;
+                        let cr = c2 - 128;
+                        let r = (c0 + ((91_881 * cr + 32_768) >> 16)).clamp(0, 255) as u8;
+                        let g = (c0 + ((-22_554 * cb - 46_802 * cr + 32_768) >> 16)).clamp(0, 255)
+                            as u8;
+                        let b = (c0 + ((116_130 * cb + 32_768) >> 16)).clamp(0, 255) as u8;
+                        [r, g, b]
+                    }
+                }
+                4 => {
+                    let c0 = sample(0);
+                    let c1 = sample(1);
+                    let c2 = sample(2);
+                    let c3 = sample(3);
+                    if adobe_transform == Some(2) {
+                        // Adobe YCCK: (Y, Cb, Cr) encodes inverted CMY, c3 is inverted K.
+                        let cb = c1 - 128;
+                        let cr = c2 - 128;
+                        let r0 = (c0 + ((91_881 * cr + 32_768) >> 16)).clamp(0, 255);
+                        let g0 = (c0 + ((-22_554 * cb - 46_802 * cr + 32_768) >> 16)).clamp(0, 255);
+                        let b0 = (c0 + ((116_130 * cb + 32_768) >> 16)).clamp(0, 255);
+                        [
+                            ((r0 * c3 + 127) / 255) as u8,
+                            ((g0 * c3 + 127) / 255) as u8,
+                            ((b0 * c3 + 127) / 255) as u8,
+                        ]
+                    } else if adobe_transform == Some(0) {
+                        // Adobe CMYK: inverted (255-C, 255-M, 255-Y, 255-K).
+                        [
+                            ((c0 * c3 + 127) / 255) as u8,
+                            ((c1 * c3 + 127) / 255) as u8,
+                            ((c2 * c3 + 127) / 255) as u8,
+                        ]
+                    } else {
+                        // Non-Adobe CMYK: standard (C, M, Y, K) ink channels.
+                        let k_inv = 255 - c3;
+                        [
+                            (((255 - c0) * k_inv + 127) / 255) as u8,
+                            (((255 - c1) * k_inv + 127) / 255) as u8,
+                            (((255 - c2) * k_inv + 127) / 255) as u8,
+                        ]
+                    }
+                }
+                _ => return None,
             };
             pixels[y * width + x] = pack_565(rgb);
         }
@@ -3516,6 +3569,50 @@ fn mark_surface_ids(
             }
             let existing = canvas.color[canvas_row + px as usize];
             canvas.plot(px as i32, py as i32, 0, existing);
+        }
+    }
+}
+
+fn blit_surface_stretched_to_canvas(
+    canvas: &mut Canvas,
+    surface: &Surface565,
+    dst_rect: [i32; 2],
+    dst_size: [usize; 2],
+    clip: [i32; 4],
+    keyed: bool,
+) {
+    let [dw, dh] = dst_size;
+    if !surface.is_valid() || surface.width == 0 || surface.height == 0 || dw == 0 || dh == 0 {
+        return;
+    }
+    if surface.width == dw && surface.height == dh {
+        blit_surface_to_canvas(canvas, surface, dst_rect, clip, keyed, None);
+        return;
+    }
+    let cw = canvas.width as i64;
+    let ch = canvas.height as i64;
+    let clip_x0 = i64::from(clip[0]).clamp(0, cw);
+    let clip_y0 = i64::from(clip[1]).clamp(0, ch);
+    let clip_x1 = i64::from(clip[2]).clamp(clip_x0, cw);
+    let clip_y1 = i64::from(clip[3]).clamp(clip_y0, ch);
+
+    let ax = i64::from(dst_rect[0]);
+    let ay = i64::from(dst_rect[1]);
+    let x0 = ax.clamp(clip_x0, clip_x1);
+    let y0 = ay.clamp(clip_y0, clip_y1);
+    let x1 = ax.saturating_add(dw as i64).clamp(x0, clip_x1);
+    let y1 = ay.saturating_add(dh as i64).clamp(y0, clip_y1);
+
+    for py in y0..y1 {
+        let sy = (((py - ay) as usize) * surface.height / dh).min(surface.height - 1);
+        let row = &surface.pixels[sy * surface.width..(sy + 1) * surface.width];
+        for px in x0..x1 {
+            let sx = (((px - ax) as usize) * surface.width / dw).min(surface.width - 1);
+            let pixel = row[sx];
+            if keyed && pixel == COLOR_KEY_565 {
+                continue;
+            }
+            canvas.plot_color(px as i32, py as i32, widen_565(pixel));
         }
     }
 }
@@ -4415,21 +4512,74 @@ mod tests {
 
         let mut classic_small = make_test_map(NeighborhoodKind::Classic, Vec::new());
         let frame_c = pack_565([40, 40, 40]);
+        let left_c = pack_565([20, 200, 20]);
+        let right_c = pack_565([200, 20, 200]);
         classic_small.backdrop = Surface565::filled(600, 400, bg_c);
         classic_small.large_frame = Some(Surface565::filled(1024, 768, frame_c));
-        classic_small.waves = vec![Some(Surface565::filled(800, 600, COLOR_KEY_565))];
+        // Classic stretches the full wave into the centered 600×400 backdrop
+        // (0x55f95f..0x55f98a -> 0x605091), so a 2-pixel-wide [left_c, right_c]
+        // wave maps to x=212..512 (left_c) and x=512..812 (right_c), leaving
+        // x=850 as outer frame.
+        classic_small.waves = vec![Some(Surface565 {
+            width: 2,
+            height: 1,
+            pixels: vec![left_c, right_c],
+        })];
         classic_small.opaque_overlays = true;
         let classic_1024 = classic_small.render(&RenderOptions {
             viewport: [1024, 768],
             water_frame: Some(0),
             ..RenderOptions::default()
         });
-        // Centered 600×400 backdrop spans x=212..812, so (850, 200) keeps outer frame.
         assert_eq!(classic_1024.color[200 * 1024 + 850], widen_565(frame_c));
-        assert_eq!(
-            classic_1024.color[200 * 1024 + 500],
-            widen_565(COLOR_KEY_565)
-        );
+        assert_eq!(classic_1024.color[200 * 1024 + 300], widen_565(left_c));
+        assert_eq!(classic_1024.color[200 * 1024 + 700], widen_565(right_c));
+
+        // Downtown and Vacation overlays pass a null clip and use their own
+        // dimensions (0x54cb3e, 0x56baf4, 0x56bb29, 0x56bb92), so an 800×600
+        // wave over a 600×400 backdrop at origin (212, 184) draws at (850, 200).
+        let mut dt_small = make_test_map(NeighborhoodKind::Downtown, Vec::new());
+        dt_small.backdrop = Surface565::filled(600, 400, bg_c);
+        dt_small.large_frame = Some(Surface565::filled(1024, 768, frame_c));
+        dt_small.waves = vec![Some(Surface565::filled(800, 600, wave2_c))];
+        dt_small.opaque_overlays = true;
+        let dt_1024 = dt_small.render(&RenderOptions {
+            viewport: [1024, 768],
+            water_frame: Some(0),
+            ..RenderOptions::default()
+        });
+        assert_eq!(dt_1024.color[200 * 1024 + 850], widen_565(wave2_c));
+
+        // 4-component CMYK baseline JPEG decodes cleanly instead of falling back.
+        // 1×1 Adobe CMYK (transform=0, inverted C=255, M=0, Y=0, K=255 => red).
+        let cmyk_1x1_jpeg: &[u8] = &[
+            0xff, 0xd8, // SOI
+            0xff, 0xee, 0x00, 0x0e, b'A', b'd', b'o', b'b', b'e', 0x00, 0x64, 0x00, 0x00, 0x00,
+            0x00, 0x00, // Adobe APP14 transform=0 (CMYK)
+            0xff, 0xdb, 0x00, 0x43, 0x00, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            // SOF0: 8-bit, 1×1, 4 components (ids 1..=4, 1×1, qt=0)
+            0xff, 0xc0, 0x00, 0x14, 0x08, 0x00, 0x01, 0x00, 0x01, 0x04, 0x01, 0x11, 0x00, 0x02,
+            0x11, 0x00, 0x03, 0x11, 0x00, 0x04, 0x11, 0x00,
+            // DHT DC 0: 1 symbol length 1 (0 -> size 10)
+            0xff, 0xc4, 0x00, 0x14, 0x00, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a,
+            // DHT AC 0: 1 symbol length 1 (0 -> EOB)
+            0xff, 0xc4, 0x00, 0x14, 0x10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00,
+            // SOS: 4 components (all dc=0, ac=0)
+            0xff, 0xda, 0x00, 0x0e, 0x04, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00,
+            0x3f, 0x00,
+            // 4 blocks: (+1016 => 255), (-1024 => 0), (-1024 => 0), (+1016 => 255)
+            // C: '0' + '1111111000' + '0' (12 bits: 0111_1111 1000_0...)
+            // M: '0' + '0000000000' + '0' (12 bits)
+            // Y: '0' + '0000000000' + '0' (12 bits)
+            // K: '0' + '1111111000' + '0' (12 bits)
+            // Total 48 bits = 6 bytes: 7f 80 00 00 07 f8 (with trailing bit 0 -> 07 f8)
+            0x7f, 0x80, 0x00, 0x00, 0x07, 0xf8, 0xff, 0xd9,
+        ];
+        let cmyk_decoded = decode_jpeg_to_surface565(cmyk_1x1_jpeg).expect("decode 4-comp CMYK");
+        assert_eq!((cmyk_decoded.width, cmyk_decoded.height), (1, 1));
+        assert_eq!(cmyk_decoded.pixels[0], pack_565([255, 0, 0]));
 
         // Header-only JPEG with zero SOS image scans must be rejected so the
         // loader falls back to bundled artwork rather than drawing gray.
