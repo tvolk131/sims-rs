@@ -1424,14 +1424,24 @@ impl Interpreter<'_> {
         .iter()
         .any(|&f| self.function_tree(world, id, f) != 0);
         // 0x433517 -> 0x433612 -> 0x4337d8 walks objects held in the person's
-        // slots too, so any held object skips the O(1) shortcut and runs full
-        // `put_person` on each candidate tile.
+        // slots too, and 0x433366 / 0x4335b9..0x4335cc skips arrival
+        // notifications (`placed_from_outside`) when Init already placed the
+        // person on the lot, so either case skips the O(1) shortcut and runs
+        // full `put_person` on each candidate tile.
         let holds_objects = world
             .objects
             .get(&id)
             .is_some_and(|o| o.slots.iter().any(|slot| slot.object != 0));
+        let already_on_lot = capture_raw(world, id)
+            .map_err(|trap| Fault {
+                object: id,
+                at: None,
+                trap,
+            })?
+            .on_lot;
         let tile_sensitive = has_callback
             || holds_objects
+            || already_on_lot
             || datum(world, data::LIGHTS_ROOM)? != 0
             || datum(world, data::FLAGS_2)? as u16 & 0x400 != 0
             || world.indicators[0] == 0;

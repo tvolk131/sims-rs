@@ -1468,16 +1468,37 @@ fn is_native_portrait_bmp(data: &[u8]) -> bool {
         return false;
     };
     if compression == 1 {
-        let (mut pos, mut x, mut y) = (0usize, 0usize, 0usize);
+        // 0x4def0c..0x4df014 decodes RLE8 directly into a linear 16-bit
+        // DirectDraw surface (`row_step = +pitch_px` for top-down,
+        // `-pitch_px` for bottom-up, starting at row `0` or `h - 1`). Runs
+        // advance `edx` linearly without checking logical row width, so a run
+        // that crosses a scanline still succeeds whenever every written pixel
+        // stays within `[0, w * h)`.
+        let Some(total) = w.checked_mul(h).and_then(|n| isize::try_from(n).ok()) else {
+            return false;
+        };
+        let Ok(w_isize) = isize::try_from(w) else {
+            return false;
+        };
+        let top_down = raw_height < 0;
+        let row_step = if top_down { w_isize } else { -w_isize };
+        let mut row_start = if top_down {
+            0
+        } else {
+            (h as isize - 1) * w_isize
+        };
+        let mut cursor = row_start;
+        let mut pos = 0usize;
         while pos + 2 <= body.len() {
             let count = usize::from(body[pos]);
             let val = body[pos + 1];
             pos += 2;
             if count > 0 {
-                if y >= h || x.checked_add(count).is_none_or(|nx| nx > w) {
+                let n = count as isize;
+                if cursor < 0 || cursor.checked_add(n).is_none_or(|end| end > total) {
                     return false;
                 }
-                x += count;
+                cursor += n;
             } else {
                 match val {
                     // 0x4def84 (EOL) and 0x4def97..0x4defab (delta) only adjust
@@ -1485,21 +1506,25 @@ fn is_native_portrait_bmp(data: &[u8]) -> bool {
                     // delta past row width before `00 01` (EOF) succeeds at
                     // 0x4df122 as long as no subsequent run writes out of bounds.
                     0 => {
-                        x = 0;
-                        y = y.saturating_add(1);
+                        row_start = row_start.saturating_add(row_step);
+                        cursor = row_start;
                     }
                     1 => return true,
                     2 => {
                         if pos + 2 > body.len() {
                             return false;
                         }
-                        x = x.saturating_add(usize::from(body[pos]));
-                        y = y.saturating_add(usize::from(body[pos + 1]));
+                        let dx = isize::from(body[pos]);
+                        let dy = isize::from(body[pos + 1]);
                         pos += 2;
+                        let dy_off = dy.saturating_mul(row_step);
+                        row_start = row_start.saturating_add(dy_off);
+                        cursor = cursor.saturating_add(dx).saturating_add(dy_off);
                     }
                     n => {
                         let n = usize::from(n);
-                        if y >= h || x.checked_add(n).is_none_or(|nx| nx > w) {
+                        let n_isize = n as isize;
+                        if cursor < 0 || cursor.checked_add(n_isize).is_none_or(|end| end > total) {
                             return false;
                         }
                         let advance = n + (n & 1);
@@ -1507,7 +1532,7 @@ fn is_native_portrait_bmp(data: &[u8]) -> bool {
                             return false;
                         }
                         pos += advance;
-                        x += n;
+                        cursor += n_isize;
                     }
                 }
             }

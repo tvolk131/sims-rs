@@ -242,10 +242,10 @@ impl Machine<'_, '_> {
             let head_status = match (
                 picked_head
                     .as_ref()
-                    .and_then(|(s, _)| self.classify_written_wardrobe_suit(s)),
+                    .and_then(|(s, _)| self.classify_written_wardrobe_suit(guid, s)),
                 picked_body
                     .as_ref()
-                    .and_then(|(s, _)| self.classify_written_wardrobe_suit(s)),
+                    .and_then(|(s, _)| self.classify_written_wardrobe_suit(guid, s)),
             ) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
@@ -313,7 +313,7 @@ impl Machine<'_, '_> {
                 let picked = self.pick_pet_suit(species == 2, idx);
                 let status = picked
                     .as_ref()
-                    .and_then(|(s, _)| self.classify_written_wardrobe_suit(s));
+                    .and_then(|(s, _)| self.classify_written_wardrobe_suit(guid, s));
                 if let Some((_, row)) = picked {
                     outfit_rows.insert(1, row);
                 }
@@ -335,7 +335,7 @@ impl Machine<'_, '_> {
                     if let Some(row) = tpl_body {
                         outfit_rows.insert(1, row);
                     }
-                    self.classify_written_wardrobe_suit(&suit)
+                    self.classify_written_wardrobe_suit(guid, &suit)
                 } else {
                     for row in [1usize, 2, 15, 16, 17, 18] {
                         outfit_rows.insert(row, String::new());
@@ -542,11 +542,11 @@ impl Machine<'_, '_> {
                         }
                     }
                     let body_status = match &body_hit {
-                        Some((suit, _)) => self.classify_written_wardrobe_suit(suit),
+                        Some((suit, _)) => self.classify_written_wardrobe_suit(guid, suit),
                         None => Some(false),
                     };
                     let head_only_status = match &head_hit {
-                        Some((suit, _)) => self.classify_written_wardrobe_suit(suit),
+                        Some((suit, _)) => self.classify_written_wardrobe_suit(guid, suit),
                         None => Some(false),
                     };
                     let combined = match (body_status, head_only_status) {
@@ -654,11 +654,11 @@ impl Machine<'_, '_> {
                                         return Some(false);
                                     };
                                     if suits.iter().all(|s| {
-                                        self.classify_written_wardrobe_suit(s) == Some(true)
+                                        self.classify_written_wardrobe_suit(guid, s) == Some(true)
                                     }) {
                                         Some(true)
                                     } else if suits.iter().all(|s| {
-                                        self.classify_written_wardrobe_suit(s) == Some(false)
+                                        self.classify_written_wardrobe_suit(guid, s) == Some(false)
                                     }) {
                                         Some(false)
                                     } else {
@@ -1029,12 +1029,18 @@ impl Machine<'_, '_> {
         }
     }
 
-    /// Classifies one wardrobe suit name: `Some(true)` if it binds `"HEAD"`,
-    /// `Some(false)` if confirmed not to, or `None` if an earlier suit decode
-    /// error left it unknown.
-    fn classify_suit_head(&self, suit: &str) -> Option<bool> {
+    /// Classifies one wardrobe suit name for character `guid`: `Some(true)` if
+    /// it binds `"HEAD"` with a mesh whose required bones exist in `guid`'s
+    /// skeleton (`0x599f8a..0x59a01c`), `Some(false)` if confirmed not to, or
+    /// `None` if an earlier suit decode error left it unknown.
+    fn classify_suit_head(&self, guid: u32, suit: &str) -> Option<bool> {
         if self.program.people.head_suits.contains(suit) {
-            Some(true)
+            let skel = crate::people::skeleton(&self.program.people, self.world, guid).ok();
+            Some(
+                self.program
+                    .people
+                    .suit_head_matches_skeleton(suit, true, skel),
+            )
         } else if !self.program.people.suit_errors.is_empty()
             && !self.program.people.suits.contains(suit)
         {
@@ -1050,9 +1056,9 @@ impl Machine<'_, '_> {
     /// `Some(true)` if the written 63-byte name binds `"HEAD"`, `Some(false)`
     /// if confirmed not to, or `None` if an earlier suit decode error left it
     /// unknown.
-    fn classify_written_wardrobe_suit(&self, suit: &str) -> Option<bool> {
+    fn classify_written_wardrobe_suit(&self, guid: u32, suit: &str) -> Option<bool> {
         let written: String = suit.chars().take(63).collect();
-        self.classify_suit_head(&written)
+        self.classify_suit_head(guid, &written)
     }
 
     /// Whether `raw` is guaranteed to miss in `0x40d0a4`/`0x40d408` even if

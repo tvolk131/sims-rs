@@ -1289,6 +1289,56 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
         ]),
     );
 
+    // 9. 2x2 RLE8 scanline-crossing runs (`0x4def0c..0x4df014`):
+    // - top-down (`raw_height = -2`) 3-pixel run stays in `[0, 4)` -> true
+    // - bottom-up (`raw_height = 2`) EOL + 3-pixel run stays in `[0, 4)` -> true
+    // - top-down 5-pixel run exceeds `[0, 4)` -> false
+    // - bottom-up immediate 3-pixel run starts at row 1 (offset 2) and exceeds 4 -> false
+    let make_2x2_rle = |height: i32, rle: &[u8]| {
+        let mut bmp = vec![0u8; 54 + 4 + rle.len()];
+        bmp[0..54].copy_from_slice(&tiny_bmp()[..54]);
+        bmp[10..14].copy_from_slice(&58u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&2i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&height.to_le_bytes());
+        bmp[28..30].copy_from_slice(&8u16.to_le_bytes());
+        bmp[30..34].copy_from_slice(&1u32.to_le_bytes()); // RLE8
+        bmp[46..50].copy_from_slice(&1u32.to_le_bytes()); // 1 palette color
+        bmp[58..].copy_from_slice(rle);
+        bmp
+    };
+    let rle_td_wrap_guid = 0x9000_000au32;
+    dir.file(
+        "GameData/Objects/rle_td_wrap.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_td_wrap_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, make_2x2_rle(-2, &[3, 0, 0, 1])),
+        ]),
+    );
+    let rle_bu_wrap_guid = 0x9000_000bu32;
+    dir.file(
+        "GameData/Objects/rle_bu_wrap.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_bu_wrap_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, make_2x2_rle(2, &[0, 0, 3, 0, 0, 1])),
+        ]),
+    );
+    let rle_td_oob_guid = 0x9000_000cu32;
+    dir.file(
+        "GameData/Objects/rle_td_oob.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_td_oob_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, make_2x2_rle(-2, &[5, 0, 0, 1])),
+        ]),
+    );
+    let rle_bu_oob_guid = 0x9000_000du32;
+    dir.file(
+        "GameData/Objects/rle_bu_oob.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_bu_oob_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, make_2x2_rle(2, &[3, 0, 0, 1])),
+        ]),
+    );
+
     let install = Install::detect(&dir.0).unwrap();
     let index = Index::build(&install).unwrap();
     let catalog = Catalog::build(&index).unwrap();
@@ -1305,6 +1355,10 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
             pal57_guid,
             rle_eol_guid,
             rle_delta_guid,
+            rle_td_wrap_guid,
+            rle_bu_wrap_guid,
+            rle_td_oob_guid,
+            rle_bu_oob_guid,
         ],
     )
     .unwrap();
@@ -1326,4 +1380,8 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
     assert!(lib(pal57_guid).has_portrait_2002);
     assert!(lib(rle_eol_guid).has_portrait_2002);
     assert!(lib(rle_delta_guid).has_portrait_2002);
+    assert!(lib(rle_td_wrap_guid).has_portrait_2002);
+    assert!(lib(rle_bu_wrap_guid).has_portrait_2002);
+    assert!(!lib(rle_td_oob_guid).has_portrait_2002);
+    assert!(!lib(rle_bu_oob_guid).has_portrait_2002);
 }

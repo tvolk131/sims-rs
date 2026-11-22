@@ -7576,3 +7576,149 @@ fn round_27_held_object_callback_and_grouped_type2() {
         assert!(!fx.world.portraits.contains(&MASTER_GUID));
     }
 }
+
+#[test]
+fn round_28_init_placed_arrival_and_mesh_required_bones() {
+    // 1. P2 #1 (`placement.rs:1472`): when a temporary Sim's Init already
+    // places the Sim on-lot (`was_outside = false` at `0x433366`), portrait
+    // placement must NOT take `FastPlaced` and re-invoke `placed_from_outside`
+    // (`0x4335b9..0x4335cc`). Setting person word 77 > 0 after Init places the
+    // Sim must succeed identically with `view_centre = None` and `Some([2, 2])`
+    // in both UI Effect and Dialog.
+    for use_dialog in [false, true] {
+        for view_centre in [None, Some([2i8, 2i8])] {
+            let (mut fx, file, record) = visitors();
+            fx.add(
+                file,
+                4096,
+                tree(vec![
+                    assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                    assign(scope::MY_DATA, 42, scope::LITERAL, 2, 2),
+                    assign(scope::STACK_OBJECT, 0, scope::MY_DATA, 11, 3),
+                    ins(16, 4, RETURN_FALSE, [0; 8]),
+                    assign(
+                        18, // My Person Data
+                        77,
+                        scope::LITERAL,
+                        LAMP as i16,
+                        RETURN_TRUE,
+                    ),
+                ]),
+            );
+            let [lo, hi] = record.to_le_bytes();
+            let ran = if use_dialog {
+                fx.add(
+                    LAMP_FILE,
+                    4096,
+                    tree(vec![ins(
+                        36,
+                        RETURN_TRUE,
+                        RETURN_FALSE,
+                        [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+                    )]),
+                );
+                let mut interpreter =
+                    sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+                interpreter.view_centre = view_centre;
+                interpreter.run_tree(&mut fx.world, LAMP, 4096, record, &[], 1000)
+            } else {
+                fx.add(
+                    LAMP_FILE,
+                    4096,
+                    tree(vec![ins(
+                        UI_EFFECT,
+                        RETURN_TRUE,
+                        RETURN_FALSE,
+                        [1, scope::LITERAL, lo, hi, 1, 0, 0, 0],
+                    )]),
+                );
+                let mut interpreter =
+                    sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+                interpreter.view_centre = view_centre;
+                interpreter.run_tree(&mut fx.world, LAMP, 4096, 0, &[], 1000)
+            };
+            assert_eq!(
+                ran,
+                Ok(true),
+                "Init-placed temporary Sim with person word 77 must not re-fire arrival \
+                 (dialog={use_dialog}, view_centre={view_centre:?})"
+            );
+        }
+    }
+
+    // 2. P2 #2 (`people.rs:1136`, `ui_effect.rs:179`): a `"HEAD"` binding whose
+    // mesh requires a bone absent from the Sim's skeleton fails to bind at
+    // `0x599f8a..0x59a01c` and does not render/cache/write `BMP_ 2002`. Once
+    // the skeleton defines that bone, rendering succeeds.
+    let bone = |name: &str, parent: Option<usize>| sims_content::Bone {
+        name: name.into(),
+        parent,
+        translation: [0; 3],
+        rotation: [0, 0, 0, 1.0f32.to_bits()],
+        blends: false,
+    };
+    for has_extra_bone in [false, true] {
+        let (mut fx, file, record) = visitors();
+        let mut bones = vec![bone("PELVIS", None), bone("HEAD", Some(0))];
+        if has_extra_bone {
+            bones.push(bone("NECK_EXTRA", Some(1)));
+        }
+        let scales = vec![0i32; bones.len()];
+        fx.program.people.skeletons.insert(
+            WIDGET,
+            sims_content::Skeleton {
+                name: "adult".into(),
+                file: "adult.bcf".into(),
+                place: 0,
+                scales: vec![scales],
+                bones,
+            },
+        );
+        fx.program.people.profiles.insert(
+            WIDGET,
+            sims_content::Profile {
+                head: Some("extra_bone_head,tex".into()),
+                ..Default::default()
+            },
+        );
+        fx.program.people.suits.insert("extra_bone_head".into());
+        fx.program
+            .people
+            .head_suits
+            .insert("extra_bone_head".into());
+        fx.program.people.head_mesh_bones.insert(
+            "extra_bone_head".into(),
+            vec![vec!["HEAD".into(), "NECK_EXTRA".into()]],
+        );
+
+        let [lo, hi] = record.to_le_bytes();
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                UI_EFFECT,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [1, scope::LITERAL, lo, hi, 1, 0, 0, 0],
+            )]),
+        );
+        let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.view_centre = Some([2i8, 2i8]);
+        let ran = interpreter.run_tree(&mut fx.world, LAMP, 4096, 0, &[], 1000);
+        assert_eq!(ran, Ok(true));
+        assert_eq!(
+            fx.world.portraits.contains(&WIDGET),
+            has_extra_bone,
+            "portrait cache must match whether skeleton defines all required mesh bones \
+             (has_extra_bone={has_extra_bone})"
+        );
+        assert_eq!(
+            fx.world
+                .generated_portrait_2002
+                .contains(&PortraitFile::Resource(file)),
+            has_extra_bone,
+            "BMP_ 2002 writeback must match whether skeleton defines all required mesh bones \
+             (has_extra_bone={has_extra_bone})"
+        );
+    }
+}

@@ -102,13 +102,18 @@ fn portrait_head_status_in(
     guid: u32,
 ) -> Option<bool> {
     if let Some(made) = world.characters.made.get(&guid) {
+        let skel = crate::people::skeleton(&program.people, world, guid).ok();
         let mut has_suit_override = false;
         for row in [1usize, 2] {
             if let Some(raw) = made.strings.get(&row) {
                 has_suit_override = true;
-                if extract_suit_name(raw)
-                    .is_some_and(|suit| program.people.head_suits.contains(&suit))
-                {
+                if extract_suit_name(raw).is_some_and(|suit| {
+                    program.people.suit_head_matches_skeleton(
+                        &suit,
+                        program.people.head_suits.contains(&suit),
+                        skel,
+                    )
+                }) {
                     return Some(true);
                 }
             }
@@ -173,10 +178,12 @@ pub(crate) fn can_render_person_portrait(
 
     // 0x595674..0x595699 (checked at 0x4e7824 AFTER 0x4e7801 -> 0x58a178): a
     // "HEAD" binding attaches only when the Sim's skeleton defines a bone named
-    // "HEAD". A decoded zero-bone skeleton (`scales[place].is_empty()`) has no
-    // "HEAD" bone and returns false; synthetic fixtures with non-empty scales
-    // and omitted `bones` skip this check.
-    if let Ok(skel) = crate::people::skeleton(&program.people, world, guid)
+    // "HEAD" AND every bone required by the binding's mesh (`0x599f8a..0x59a01c`).
+    // A decoded zero-bone skeleton (`scales[place].is_empty()`) has no "HEAD"
+    // bone and returns false; synthetic fixtures with non-empty scales and
+    // omitted `bones` skip this check.
+    let skel = crate::people::skeleton(&program.people, world, guid).ok();
+    if let Some(skel) = skel
         && (!skel.bones.is_empty() || skel.scales.get(skel.place).is_some_and(Vec::is_empty))
         && !skel.bones.iter().any(|b| b.name == "HEAD")
     {
@@ -201,7 +208,12 @@ pub(crate) fn can_render_person_portrait(
         .chain(&outfit.accessories)
         {
             any_slot_bound = true;
-            status = combine_head_status(status, bound.has_head);
+            let bound_head = bound.has_head.map(|h| {
+                program
+                    .people
+                    .suit_head_matches_skeleton(&bound.suit.to_ascii_lowercase(), h, skel)
+            });
+            status = combine_head_status(status, bound_head);
         }
         has_bound_accessories = !outfit.accessories.is_empty();
     }
@@ -221,7 +233,9 @@ pub(crate) fn can_render_person_portrait(
             }
             let lower = acc.name.to_ascii_lowercase();
             let acc_status = match crate::people::peek_suit_head(&program.people, world, &lower) {
-                crate::people::ResolvedSuit::Found(h) => Some(h),
+                crate::people::ResolvedSuit::Found(h) => {
+                    Some(program.people.suit_head_matches_skeleton(&lower, h, skel))
+                }
                 crate::people::ResolvedSuit::Missing => Some(false),
                 crate::people::ResolvedSuit::Unknown => None,
             };
