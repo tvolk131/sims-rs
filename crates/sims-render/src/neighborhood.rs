@@ -780,6 +780,11 @@ impl NeighborhoodMap {
                     continue;
                 };
 
+                // 0x427f21 / 0x464e6d / 0x4e1e58..0x4e1e62: SIMI 1 is required
+                // for a lot to load; missing or unreadable SIMI 1 skips the lot.
+                let Some(filter_mask) = read_lot_filter_mask(&iff) else {
+                    continue;
+                };
                 let Ok(Some(BuiltLotCells {
                     metrics,
                     normal,
@@ -789,8 +794,6 @@ impl NeighborhoodMap {
                 else {
                     continue;
                 };
-
-                let filter_mask = read_lot_filter_mask(&iff);
                 let zoning = zoning_table
                     .first_zone
                     .get(&i32::from(lot_id))
@@ -1641,29 +1644,31 @@ fn build_lot_cells(
     half_scale: bool,
     badge_sprite: Option<&Surface565>,
 ) -> Result<Option<BuiltLotCells>> {
-    let decode_bmp_chunk = |id: u16| -> Result<Option<Surface565>> {
-        let Some(chunk) = iff.get(b"BMP_", id) else {
-            return Ok(None);
-        };
-        let img = bitmap::bmp(iff.data(chunk))?;
-        Ok(Some(Surface565::from_bitmap(&img)))
+    // 0x4ded62..0x4ded72: a missing or corrupt BMP_ resource returns null rather
+    // than aborting the lot, so optional roofs-on bitmaps (513/1025) degrade to
+    // a single roofs-off cell (0x54e685..0x54e6a7) and corrupt 1024 falls back
+    // to 512 (0x4e2692..0x4e26de).
+    let decode_bmp_chunk = |id: u16| -> Option<Surface565> {
+        let chunk = iff.get(b"BMP_", id)?;
+        let img = bitmap::bmp(iff.data(chunk)).ok()?;
+        Some(Surface565::from_bitmap(&img))
     };
 
     let (metrics, roofs_off, roofs_on) = if half_scale {
         // 0x4e2676..0x4e288e: try 1024/1025 + THMB 1024 first; if absent, load
         // 512/513 + THMB 512, downsample by 0.5×, and halve THMB toward zero.
-        if let Some(bmp_1024) = decode_bmp_chunk(1024)? {
-            let bmp_1025 = decode_bmp_chunk(1025)?;
+        if let Some(bmp_1024) = decode_bmp_chunk(1024) {
+            let bmp_1025 = decode_bmp_chunk(1025);
             let metrics = match iff.get(b"THMB", 1024) {
                 Some(chunk) => ThmbMetrics::parse(iff.data(chunk))?,
                 None => ThmbMetrics::CENTERED,
             };
             (metrics, bmp_1024, bmp_1025)
         } else {
-            let Some(bmp_512) = decode_bmp_chunk(512)? else {
+            let Some(bmp_512) = decode_bmp_chunk(512) else {
                 return Ok(None);
             };
-            let bmp_513 = decode_bmp_chunk(513)?;
+            let bmp_513 = decode_bmp_chunk(513);
             let half_512 = resample_half_565(&bmp_512);
             let half_513 = bmp_513.as_ref().map(resample_half_565);
             let metrics = match iff.get(b"THMB", 512) {
@@ -1673,10 +1678,10 @@ fn build_lot_cells(
             (metrics, half_512, half_513)
         }
     } else {
-        let Some(bmp_512) = decode_bmp_chunk(512)? else {
+        let Some(bmp_512) = decode_bmp_chunk(512) else {
             return Ok(None);
         };
-        let bmp_513 = decode_bmp_chunk(513)?;
+        let bmp_513 = decode_bmp_chunk(513);
         let metrics = match iff.get(b"THMB", 512) {
             Some(chunk) => ThmbMetrics::parse(iff.data(chunk))?,
             None => ThmbMetrics::CENTERED,
@@ -1699,16 +1704,14 @@ fn build_lot_cells(
     }))
 }
 
-fn read_lot_filter_mask(iff: &Iff) -> u16 {
-    let Some(chunk) = iff.get(b"SIMI", 1).or_else(|| iff.all(b"SIMI").next()) else {
-        return 0;
-    };
-    let Ok(sim) = Simulator::parse(iff.data(chunk)) else {
-        return 0;
-    };
+fn read_lot_filter_mask(iff: &Iff) -> Option<u16> {
+    // 0x427f21 / 0x464e6d: requires SIMI 1; missing or corrupt SIMI 1 fails
+    // the lot load at 0x4e1e58..0x4e1e62.
+    let chunk = iff.get(b"SIMI", 1)?;
+    let sim = Simulator::parse(iff.data(chunk)).ok()?;
     // 0x427f46: SIMI globals[37] holds the lot's community amenity bitmask
     // (present on SIMI version >= 0x41 which stores 64 globals).
-    sim.globals.get(37).copied().unwrap_or(0) as u16
+    Some(sim.globals.get(37).copied().unwrap_or(0) as u16)
 }
 
 #[derive(Default)]
@@ -1830,8 +1833,32 @@ impl LotLocations {
 }
 
 fn open_iff(path: &Path) -> Option<Iff> {
-    let bytes = fs::read(path).ok()?;
-    Iff::parse(bytes).ok()
+    open_iff_bytes(fs::read(path).ok()?)
+}
+
+/// Validates and parses an IFF byte buffer with the native opener's header and
+/// resource-map checks (`0x41c2d6..0x41c345`, `0x41c3c3..0x41c4f7`).
+fn open_iff_bytes(bytes: Vec<u8>) -> Option<Iff> {
+    // 0x6c2128: 64-byte wildcard signature template (`*` at 9, 11, 60..64).
+    const HEADER_TEMPLATE: &[u8; 64] =
+        b"IFF FILE *.*:TYPE FOLLOWED BY SIZE\0 JAMIE DOORNBOS & MAXIS 1****";
+    let header = bytes.get(..64)?;
+    for (&expected, &actual) in HEADER_TEMPLATE.iter().zip(header.iter()) {
+        if expected != b'*' && expected != actual {
+            return None;
+        }
+    }
+    let version_ok =
+        (header[9] == b'2' && header[11] == b'0') || (header[9] == b'2' && header[11] == b'5');
+    if !version_ok {
+        return None;
+    }
+    let iff = Iff::parse(bytes).ok()?;
+    // 0x41c3c3..0x41c4f7: reject a 2.5 file whose nonzero rsmp offset is invalid.
+    if iff.map_error().is_some() {
+        return None;
+    }
+    Some(iff)
 }
 
 /// Parses a legacy `\0CST` string-table chunk (`0x470178..0x470209`),
@@ -2647,6 +2674,59 @@ mod tests {
         };
         let interleaved_locs = parse_lot_locations_table(&interleaved);
         assert_eq!(interleaved_locs.get(&1), Some(&[435, 445]));
+
+        // Native IFF opener rejects damaged header bytes after "IFF FILE 2.5:"
+        // and invalid nonzero resource-map offsets (0x41c2d6..0x41c4f7).
+        let valid_iff = sims_formats::iff::write(&[]).expect("write empty IFF");
+        assert!(open_iff_bytes(valid_iff.clone()).is_some());
+        let mut bad_sig = valid_iff.clone();
+        bad_sig[20] ^= 0xff;
+        assert!(open_iff_bytes(bad_sig).is_none());
+        let mut bad_rsmp = valid_iff;
+        bad_rsmp[60..64].copy_from_slice(&0x1234u32.to_be_bytes());
+        assert!(open_iff_bytes(bad_rsmp).is_none());
+
+        // Missing SIMI 1 rejects the lot (0x427f21), while a corrupt optional
+        // BMP_ 513 still leaves an intact BMP_ 512 drawable as a single cell
+        // (0x4ded62..0x4ded72, 0x54e685..0x54e6a7).
+        let bmp_1x1 = {
+            // Minimal valid uncompressed 24-bit 1×1 BMP.
+            let mut b = vec![0u8; 58];
+            b[0..2].copy_from_slice(b"BM");
+            b[2..6].copy_from_slice(&58u32.to_le_bytes());
+            b[10..14].copy_from_slice(&54u32.to_le_bytes());
+            b[14..18].copy_from_slice(&40u32.to_le_bytes());
+            b[18..22].copy_from_slice(&1i32.to_le_bytes());
+            b[22..26].copy_from_slice(&1i32.to_le_bytes());
+            b[26..28].copy_from_slice(&1u16.to_le_bytes());
+            b[28..30].copy_from_slice(&24u16.to_le_bytes());
+            b[54..57].copy_from_slice(&[0x10, 0x20, 0x30]);
+            b
+        };
+        let house_bytes = sims_formats::iff::write(&[
+            sims_formats::iff::ChunkData {
+                tag: *b"BMP_",
+                id: 512,
+                flags: 0,
+                label: String::new(),
+                data: bmp_1x1,
+            },
+            sims_formats::iff::ChunkData {
+                tag: *b"BMP_",
+                id: 513,
+                flags: 0,
+                label: String::new(),
+                data: b"corrupt".to_vec(),
+            },
+        ])
+        .expect("write synthetic house IFF");
+        let house_iff = open_iff_bytes(house_bytes).expect("synthetic house opens");
+        assert_eq!(read_lot_filter_mask(&house_iff), None);
+        let built = build_lot_cells(&house_iff, false, None)
+            .expect("corrupt optional BMP_ 513 does not error")
+            .expect("intact BMP_ 512 remains drawable");
+        assert_eq!((built.normal.width, built.normal.height), (1, 1));
+        assert!(built.roofs_off.is_none());
     }
 
     #[test]
