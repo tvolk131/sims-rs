@@ -130,6 +130,16 @@ impl Saved {
         &self.world
     }
 
+    /// Save Card lot name (`0x50e1f8..0x50e42c`).
+    pub fn lot_name(&self) -> &str {
+        &self.lot_name
+    }
+
+    /// Save Card lot description (`0x50e1f8..0x50e42c`).
+    pub fn lot_description(&self) -> &str {
+        &self.lot_description
+    }
+
     /// The bytes a save store keeps: [`FORMAT`] and the world's snapshot
     /// format (each a little-endian u32), then the canonical encoding
     /// (postcard, as [`World::encode`]).

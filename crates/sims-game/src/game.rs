@@ -394,19 +394,26 @@ impl Game {
         if lot.world().globals.get(30).copied().unwrap_or(1) != i16::from(free_will) {
             let _ = lot.set_free_will(free_will);
         }
-        let user_dir = install
-            .file(neighborhood_id)
-            .or_else(|_| install.file("UserData"))
-            .map_err(|e| e.to_string())?;
-        let mut people = People::open_neighborhood(install_root, &user_dir)?;
+        let mut people =
+            People::open_from_character_files(install_root, &snapshot.character_files)?;
         people.refresh(lot.world());
         let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
         let drawn_camera = view.camera;
         let has_family = lot.world().globals.get(9).copied().unwrap_or(0) != 0;
-        let edit_mode = lot.world().globals.get(32).copied().unwrap_or(0) == 1
-            || (!has_family
-                && (lot.lot_zoning().unwrap_or(0) != 0
-                    || matches!(lot.lot_id(), 21..=30 | 40..=48 | 81..=99)));
+        let is_residential = lot.lot_zoning().unwrap_or(1) == 1
+            && !matches!(lot.lot_id(), 21..=30 | 40..=48 | 81..=89 | 93..=98);
+        let edit_mode = if has_family && is_residential {
+            false
+        } else {
+            lot.world().globals.get(32).copied().unwrap_or(0) == 1
+                || (!has_family
+                    && (lot.lot_zoning().unwrap_or(0) != 0
+                        || matches!(lot.lot_id(), 21..=30 | 40..=48 | 81..=99)))
+        };
+        let mut pace = Pace::default();
+        if let Some(speed) = pace::shown(lot.world()) {
+            pace.speed = speed;
+        }
         let mut game = Self {
             lot,
             lot_shape,
@@ -414,7 +421,7 @@ impl Game {
             view,
             people,
             hud,
-            pace: Pace::default(),
+            pace,
             play,
             stopped,
             errors: Errors::default(),

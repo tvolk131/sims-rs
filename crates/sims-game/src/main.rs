@@ -182,6 +182,13 @@ impl RedrawPacer {
         self.last_present.map(|prev| prev + interval)
     }
 
+    /// Clears the pending redraw request as soon as the window event is
+    /// consumed, before any early returns (e.g. zero-sized window or surface
+    /// failure), so a skipped redraw can never wedge future presentation.
+    fn on_redraw_consumed(&mut self) {
+        self.redraw_requested = false;
+    }
+
     fn on_present(&mut self, now: Instant) {
         self.last_present = Some(now);
         self.redraw_requested = false;
@@ -890,6 +897,15 @@ impl App {
             game.after_save_failed();
             self.changed(true, true);
         }
+        if outcome.neighborhood
+            && saved_ok
+            && let Some(game) = self.session.game_mut()
+        {
+            game.set_note(
+                "Neighborhood view requires launching without a house file (or with --neighborhood).",
+            );
+            self.changed(true, true);
+        }
         if outcome.quit && saved_ok {
             event_loop.exit();
         }
@@ -1057,6 +1073,7 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        self.redraw_pacer.on_redraw_consumed();
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -1117,22 +1134,30 @@ impl App {
             }
         }
         let Some(surface) = &mut self.surface else {
+            self.dirty = true;
             return;
         };
         if self.surface_size != Some((w, h)) {
             if surface.resize(w, h).is_err() {
+                self.surface_size = None;
+                self.dirty = true;
                 return;
             }
             self.surface_size = Some((w, h));
         }
         let Ok(mut buffer) = surface.buffer_mut() else {
             self.surface_size = None;
+            self.dirty = true;
             return;
         };
         let canvas = self.session.canvas();
         let (bw, bh) = (size.width as usize, size.height as usize);
         blit_canvas(canvas, &mut buffer, bw, bh, scale as usize);
-        let _ = buffer.present();
+        if buffer.present().is_err() {
+            self.surface_size = None;
+            self.dirty = true;
+            return;
+        }
         self.redraw_pacer.on_present(Instant::now());
     }
 }
@@ -2195,6 +2220,32 @@ mod tests {
         assert_eq!(pacer.display_interval(), Duration::from_nanos(8_333_333));
         pacer.request_immediate();
         assert!(pacer.should_request_redraw(t0 + Duration::from_millis(35), true, false));
+    }
+
+    #[test]
+    fn redraw_pacer_recovers_after_skipped_or_failed_redraw() {
+        let t0 = Instant::now();
+        let mut pacer = RedrawPacer::new(Some(60_000));
+
+        // Request initial redraw; duplicate request while in flight is suppressed.
+        assert!(pacer.should_request_redraw(t0, true, false));
+        assert!(!pacer.should_request_redraw(t0 + Duration::from_millis(1), true, false));
+        assert_eq!(pacer.next_redraw_deadline(t0, true, false), None);
+
+        // Redraw event is consumed, then aborts early (e.g. minimized / zero size
+        // or surface resize/buffer failure) without calling `on_present`.
+        pacer.on_redraw_consumed();
+
+        // Future dirty wakes must be able to request a retry immediately (since
+        // no frame was presented yet), and after a successful present, a later
+        // skipped redraw still schedules deadlines instead of wedging forever.
+        assert!(pacer.should_request_redraw(t0 + Duration::from_millis(2), true, false));
+        pacer.on_present(t0 + Duration::from_millis(2));
+
+        let t_next = t0 + Duration::from_millis(20);
+        assert!(pacer.should_request_redraw(t_next, true, false));
+        pacer.on_redraw_consumed(); // surface failure before present
+        assert!(pacer.should_request_redraw(t_next + Duration::from_millis(1), true, false));
     }
 
     #[test]

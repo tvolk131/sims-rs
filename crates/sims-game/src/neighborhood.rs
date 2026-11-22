@@ -58,8 +58,7 @@ const NEIGHBORHOOD_DIALOG_STRINGS: u16 = 131;
 const MOVE_IN_DIALOG_STRINGS: u16 = 132;
 const STREET_NAMES_TABLE: u16 = 2000;
 const LOT_ASSIGNMENTS_TABLE: u16 = 2001;
-const DESC_NAMES_TABLE: u16 = 2002;
-const DESC_TEXT_TABLE: u16 = 2003;
+const LOT_DESC_BASE_TABLE: u16 = 2000;
 /// Water wave animation cadence on the neighborhood map (250 ms per step).
 const WATER_STEP_US: u64 = 250_000;
 /// `Global.far` `FCNS #4` tuning chunk ID.
@@ -216,54 +215,77 @@ impl StreetNames {
     }
 }
 
-/// Parsed `NeighborhoodDesc.iff` lot names and descriptions.
+/// Parsed `Houses/*Desc.iff` lot names and descriptions (`0x50e14b..0x50e253`),
+/// matching `sims_vm::boot::read_lot_info`: reads `STR# (2000 + lot_id)`
+/// entries 0 (name) and 1 (description) from `DTDesc.iff`, `VIDesc.iff`,
+/// `STDesc.iff`, `MTDesc.iff`, or `NeighborhoodDesc.iff`.
 #[derive(Debug, Clone, Default)]
 struct NeighborhoodDescriptions {
-    names: Vec<String>,
-    descriptions: Vec<String>,
+    houses_dirs: Vec<PathBuf>,
 }
 
 impl NeighborhoodDescriptions {
-    fn load(user_dir: &Path) -> Self {
-        let Some(path) = resolve_child_case_insensitive(user_dir, "NeighborhoodDesc.iff") else {
-            return Self::default();
-        };
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Self::default();
-        };
-        let Ok(iff) = Iff::parse(bytes) else {
-            return Self::default();
-        };
-        let read_vec = |id: u16| -> Vec<String> {
-            let Some(chunk) = iff.get(b"STR#", id) else {
-                return Vec::new();
-            };
-            let Ok(table) = StringTable::parse(iff.data(chunk)) else {
-                return Vec::new();
-            };
-            (0..table.entries.len())
-                .map(|i| {
-                    table
-                        .get(i, US_ENGLISH)
-                        .or_else(|| table.get(i, 1))
-                        .unwrap_or("")
-                        .to_owned()
-                })
-                .collect()
-        };
-        Self {
-            names: read_vec(DESC_NAMES_TABLE),
-            descriptions: read_vec(DESC_TEXT_TABLE),
+    fn load(install: &Install, user_dir: &Path) -> Self {
+        let mut houses_dirs = Vec::new();
+        for dir in [
+            Some(user_dir.to_path_buf()),
+            install.file("UserData").ok(),
+            install.file("TemplateUserData").ok(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(houses) = resolve_dir_case_insensitive(&dir, "Houses")
+                && !houses_dirs.contains(&houses)
+            {
+                houses_dirs.push(houses);
+            }
         }
+        Self { houses_dirs }
     }
 
     fn lot_info(&self, lot_number: u16) -> (String, String) {
-        let Some(idx) = usize::from(lot_number).checked_sub(1) else {
+        let desc_file = match lot_number {
+            21..=30 => "DTDesc.iff",
+            40..=48 => "VIDesc.iff",
+            81..=89 => "STDesc.iff",
+            90..=99 => "MTDesc.iff",
+            _ => "NeighborhoodDesc.iff",
+        };
+        let Some(table_id) = LOT_DESC_BASE_TABLE.checked_add(lot_number) else {
             return (String::new(), String::new());
         };
-        let name = self.names.get(idx).cloned().unwrap_or_default();
-        let desc = self.descriptions.get(idx).cloned().unwrap_or_default();
-        (name, desc)
+        for houses_dir in &self.houses_dirs {
+            let Some(path) = resolve_child_case_insensitive(houses_dir, desc_file) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(iff) = Iff::parse(bytes) else {
+                continue;
+            };
+            let Some(chunk) = iff.get(b"STR#", table_id) else {
+                continue;
+            };
+            let Ok(table) = StringTable::parse(iff.data(chunk)) else {
+                continue;
+            };
+            let name = table
+                .get(0, US_ENGLISH)
+                .or_else(|| table.get(0, 1))
+                .unwrap_or_default()
+                .to_owned();
+            let desc = table
+                .get(1, US_ENGLISH)
+                .or_else(|| table.get(1, 1))
+                .unwrap_or_default()
+                .to_owned();
+            if !name.is_empty() || !desc.is_empty() {
+                return (name, desc);
+            }
+        }
+        (String::new(), String::new())
     }
 }
 
@@ -362,6 +384,8 @@ pub struct NeighborhoodShell {
     answers: Vec<u8>,
     frames: Frames,
     arch_multiplier: f32,
+    magic_lot_91_cost: i32,
+    magic_lot_other_cost: i32,
 
     screen: ActiveScreen,
     size: [i32; 2],
@@ -443,6 +467,8 @@ impl NeighborhoodShell {
             Art::load(&ui, US_ENGLISH, &dialog::RESOURCES).map_err(|e| e.to_string())?;
         let dialogs = DialogStrings::load(&install);
         let arch_multiplier = load_arch_multiplier(&install);
+        let magic_lot_91_cost = lifecycle::magic_town_lot_cost(Some(&install_root), 91);
+        let magic_lot_other_cost = lifecycle::magic_town_lot_cost(Some(&install_root), 90);
 
         let slot = slot.clamp(MIN_NEIGHBORHOOD, MAX_NEIGHBORHOOD);
         let kind = default_map_kind(&install, slot);
@@ -454,7 +480,7 @@ impl NeighborhoodShell {
         let user_dir = resolve_user_dir(&install, slot)?;
         let family_names = load_family_names(&user_dir);
         let street_names = StreetNames::load(&install, &user_dir);
-        let descriptions = NeighborhoodDescriptions::load(&user_dir);
+        let descriptions = NeighborhoodDescriptions::load(&install, &user_dir);
         let faces = load_neighborhood_faces(&install, &store, &neighborhood_id, &stored);
         let lot_meta = build_lot_meta(
             &store,
@@ -478,7 +504,7 @@ impl NeighborhoodShell {
             mode: NeighborhoodMode::Normal,
             expansions: sims_ui::neighborhood::ExpansionFlags::ALL,
             has_importable_family: false,
-            show_credits_button: true,
+            show_credits_button: false,
             hovered_lot: None,
         };
 
@@ -505,6 +531,8 @@ impl NeighborhoodShell {
             answers,
             frames,
             arch_multiplier,
+            magic_lot_91_cost,
+            magic_lot_other_cost,
             screen: ActiveScreen::Neighborhood,
             size: [800, 600],
             canvas: Canvas::new(800, 600, [0, 0, 0]),
@@ -1012,11 +1040,8 @@ impl NeighborhoodShell {
 
     pub fn double_click(&mut self, point: [i32; 2]) -> ShellOutcome {
         self.pointer = Some(point);
-        if self.dialog.is_some() {
-            return ShellOutcome::default();
-        }
-        if !matches!(self.screen, ActiveScreen::FamilyBin) {
-            return ShellOutcome::default();
+        if self.dialog.is_some() || !matches!(self.screen, ActiveScreen::FamilyBin) {
+            return self.press(point);
         }
         let frame_size = self.frame_size_u32();
         let view = FamilyBinView {
@@ -1033,7 +1058,9 @@ impl NeighborhoodShell {
         {
             return self.handle_family_bin_command(cmd);
         }
-        ShellOutcome::default()
+        // Rapid repeat clicks on non-row controls (scrollbar arrows, action
+        // buttons) fall through to `press` so their release activates normally.
+        self.press(point)
     }
 
     pub fn release(&mut self, point: [i32; 2]) -> ShellOutcome {
@@ -1225,17 +1252,35 @@ impl NeighborhoodShell {
         out
     }
 
-    /// Saves the currently open lot to REDB (F5 or Options → Save).
+    /// Saves the currently open lot to REDB (F5 or Options → Save) and updates
+    /// its cached neighborhood map thumbnail immediately.
     pub fn save_current_lot(&mut self) -> Result<SaveReport, String> {
-        let ActiveScreen::Lot(session) = &mut self.screen else {
-            return Err("no lot is currently open".into());
+        let report = {
+            let ActiveScreen::Lot(session) = &mut self.screen else {
+                return Err("no lot is currently open".into());
+            };
+            session.game.save_to_neighborhood(
+                &self.install_root,
+                &self.store,
+                &session.neighborhood_id,
+            )?
         };
-        let report = session.game.save_to_neighborhood(
-            &self.install_root,
-            &self.store,
-            &session.neighborhood_id,
-        )?;
+        self.capture_active_lot_thumbnail();
         Ok(report)
+    }
+
+    fn capture_active_lot_thumbnail(&mut self) {
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && let Ok(lot_id) = u16::try_from(session.house)
+            && let Some(map_lot) = self.map.lot(lot_id)
+        {
+            let normal_size = [map_lot.normal.width, map_lot.normal.height];
+            let has_cutaway = map_lot.roofs_off.is_some();
+            let (world, lot_shape, assets) = session.game.render_parts_mut();
+            let thumb = capture_lot_thumbnail(world, lot_shape, assets, normal_size, has_cutaway);
+            self.custom_thumbs
+                .insert((session.neighborhood_id.clone(), lot_id), thumb);
+        }
     }
 
     /// Reloads the currently open lot from its latest REDB save (F9).
@@ -1278,7 +1323,7 @@ impl NeighborhoodShell {
         let user_dir = resolve_user_dir(&self.install, slot)?;
         let family_names = load_family_names(&user_dir);
         let street_names = StreetNames::load(&self.install, &user_dir);
-        let descriptions = NeighborhoodDescriptions::load(&user_dir);
+        let descriptions = NeighborhoodDescriptions::load(&self.install, &user_dir);
         let faces = load_neighborhood_faces(&self.install, &self.store, &id, &stored);
         let lot_meta = build_lot_meta(&self.store, &id, &map, &descriptions, self.arch_multiplier);
         sync_map_with_store(&mut map, &stored, &lot_meta, &id, &self.custom_thumbs);
@@ -1379,11 +1424,7 @@ impl NeighborhoodShell {
             .get(&family_id)
             .cloned()
             .unwrap_or_else(|| format!("Family {family_id}"));
-        let family_magic_coins = fam
-            .magic_history()
-            .ok()
-            .flatten()
-            .map_or(0, |h| i32::from(h[0]));
+        let family_magic_coins = lifecycle::family_magic_coins(&self.stored, family_id);
         self.move_in_family_id = Some(family_id);
         self.nbhd_state.mode = NeighborhoodMode::MoveIn {
             family_name,
@@ -1434,18 +1475,6 @@ impl NeighborhoodShell {
     pub fn leave_lot(&mut self, save_first: bool) -> Result<(), String> {
         if save_first {
             let _ = self.save_current_lot()?;
-            if let ActiveScreen::Lot(session) = &mut self.screen
-                && let Ok(lot_id) = u16::try_from(session.house)
-                && let Some(map_lot) = self.map.lot(lot_id)
-            {
-                let normal_size = [map_lot.normal.width, map_lot.normal.height];
-                let has_cutaway = map_lot.roofs_off.is_some();
-                let (world, lot_shape, assets) = session.game.render_parts_mut();
-                let thumb =
-                    capture_lot_thumbnail(world, lot_shape, assets, normal_size, has_cutaway);
-                self.custom_thumbs
-                    .insert((session.neighborhood_id.clone(), lot_id), thumb);
-            }
         }
         self.persist_options();
         self.screen = ActiveScreen::Neighborhood;
@@ -1465,8 +1494,15 @@ impl NeighborhoodShell {
     }
 
     /// Executes Move-In for `family_id` onto `house`, refreshes REDB state, and
-    /// immediately enters the newly occupied lot.
+    /// immediately enters the newly occupied lot. If opening the lot fails,
+    /// rolls back the neighborhood commit so the household is not left charged
+    /// and moved out of the bin.
     pub fn execute_move_in(&mut self, family_id: u16, house: u32) -> Result<MoveInReport, String> {
+        let before = self
+            .store
+            .load_neighborhood(&self.neighborhood_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
         let report = lifecycle::move_in(
             &self.install_root,
             &self.store,
@@ -1475,11 +1511,48 @@ impl NeighborhoodShell {
             house,
         )
         .map_err(|e| e.to_string())?;
-        self.nbhd_state.mode = NeighborhoodMode::Normal;
-        self.move_in_family_id = None;
-        self.refresh_from_store()?;
-        self.enter_lot(house)?;
-        Ok(report)
+        let after = self
+            .store
+            .load_neighborhood(&self.neighborhood_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
+        match self.enter_lot(house) {
+            Ok(()) => {
+                self.nbhd_state.mode = NeighborhoodMode::Normal;
+                self.move_in_family_id = None;
+                let _ = self.refresh_from_store();
+                Ok(report)
+            }
+            Err(enter_err) => {
+                let rollback = self
+                    .store
+                    .save_neighborhood_checked(
+                        &self.neighborhood_id,
+                        after.instance_id,
+                        after.revision,
+                        &before,
+                    )
+                    .map_err(|e| e.to_string())
+                    .and_then(|res| res.map(|_| ()).map_err(|e| format!("{e:?}")));
+                match rollback {
+                    Ok(()) => {
+                        let _ = self.refresh_from_store();
+                        Err(format!(
+                            "could not open lot {house} (move-in rolled back): {enter_err}"
+                        ))
+                    }
+                    Err(rb_err) => {
+                        self.nbhd_state.mode = NeighborhoodMode::Normal;
+                        self.move_in_family_id = None;
+                        let _ = self.refresh_from_store();
+                        Err(format!(
+                            "family moved into lot {house}, but opening the lot failed \
+                             (rollback failed: {rb_err}): {enter_err}"
+                        ))
+                    }
+                }
+            }
+        }
     }
 
     /// Executes Evict for the household occupying `house`, returning them to
@@ -1590,6 +1663,14 @@ impl NeighborhoodShell {
         self.nbhd_state.hovered_lot = self.hovered_lot_id.and_then(|id| self.build_lot_info(id));
     }
 
+    fn magic_cost_for_lot(&self, lot_id: u16) -> i32 {
+        match lot_id {
+            91 => self.magic_lot_91_cost,
+            90 | 92 => self.magic_lot_other_cost,
+            _ => 0,
+        }
+    }
+
     fn build_lot_info(&self, lot_id: u16) -> Option<LotInfo> {
         let map_lot = self.map.lot(lot_id)?;
         let origin = self.map.map_origin_for(self.frame_size_u32());
@@ -1624,11 +1705,7 @@ impl NeighborhoodShell {
                     .iter()
                     .filter_map(|guid| self.faces.face(*guid).cloned())
                     .collect();
-                let magic_coins = fam
-                    .magic_history()
-                    .ok()
-                    .flatten()
-                    .map_or(0, |h| i32::from(h[0]));
+                let magic_coins = lifecycle::family_magic_coins(&self.stored, fam_id);
                 LotOccupant {
                     family_name,
                     funds: fam.budget,
@@ -1648,7 +1725,7 @@ impl NeighborhoodShell {
             kind,
             has_house: meta.is_some_and(|m| m.has_house),
             house_cost: meta.map_or(0, |m| m.house_cost),
-            magic_cost: 0,
+            magic_cost: self.magic_cost_for_lot(lot_id),
             occupant,
             anchor,
         })
@@ -1711,10 +1788,22 @@ impl NeighborhoodShell {
                 self.open_quit_dialog();
                 ShellOutcome::redraw()
             }
-            NeighborhoodCommand::ToggleRezone
-            | NeighborhoodCommand::ImportFamily
-            | NeighborhoodCommand::OpenWeb
-            | NeighborhoodCommand::OpenCredits => ShellOutcome::redraw(),
+            NeighborhoodCommand::ToggleRezone => {
+                self.note = Some("Rezone mode is not ported yet.".into());
+                ShellOutcome::redraw()
+            }
+            NeighborhoodCommand::ImportFamily => {
+                self.note = Some("Family import is not ported yet.".into());
+                ShellOutcome::redraw()
+            }
+            NeighborhoodCommand::OpenWeb => {
+                self.note = Some("Web browser links are not available in this build.".into());
+                ShellOutcome::redraw()
+            }
+            NeighborhoodCommand::OpenCredits => {
+                self.note = Some("Credits screen is not ported yet.".into());
+                ShellOutcome::redraw()
+            }
         }
     }
 
@@ -1777,7 +1866,11 @@ impl NeighborhoodShell {
                 }
                 ShellOutcome::redraw()
             }
-            NeighborhoodMode::MoveIn { family_funds, .. } => {
+            NeighborhoodMode::MoveIn {
+                family_funds,
+                family_magic_coins,
+                ..
+            } => {
                 let Some(family_id) = self.move_in_family_id else {
                     self.nbhd_state.mode = NeighborhoodMode::Normal;
                     return ShellOutcome::redraw();
@@ -1805,9 +1898,10 @@ impl NeighborhoodShell {
                 }
                 let meta = self.lot_meta.get(&lot_id);
                 let cost = meta.map_or(0, |m| m.house_cost);
+                let magic_cost = self.magic_cost_for_lot(lot_id);
                 let has_house = meta.is_some_and(|m| m.has_house);
-                if family_funds < cost {
-                    // Hover card already explains insufficient funds.
+                if family_funds < cost || family_magic_coins < magic_cost {
+                    // Hover card already explains insufficient Simoleons or MagiCoins.
                     return ShellOutcome::redraw();
                 }
                 let (title_idx, body_idx) = if has_house { (0, 1) } else { (6, 7) };
@@ -1930,6 +2024,25 @@ impl NeighborhoodShell {
             ShellDialogKind::Notice => ShellOutcome::redraw(),
         }
     }
+}
+
+fn resolve_dir_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {
+    let direct = dir.join(name);
+    if direct.is_dir() {
+        return Some(direct);
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            && entry.path().is_dir()
+        {
+            return Some(entry.path());
+        }
+    }
+    None
 }
 
 fn resolve_child_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {
@@ -2103,14 +2216,24 @@ fn build_lot_meta(
             let built_flag = world.globals.get(22).copied().unwrap_or(0) != 0;
             let has_house = built_flag || b.architecture_value > 0 || b.objects_value > 0;
             let filter_mask = world.globals.get(37).copied().map(|v| v as u16);
+            let lot_name = if saved.lot_name().is_empty() {
+                default_name
+            } else {
+                saved.lot_name().to_owned()
+            };
+            let lot_description = if saved.lot_description().is_empty() {
+                default_desc
+            } else {
+                saved.lot_description().to_owned()
+            };
             out.insert(
                 lot.id,
                 LotMeta {
                     house_cost,
                     has_house,
                     from_saved_lot: true,
-                    lot_name: default_name,
-                    lot_description: default_desc,
+                    lot_name,
+                    lot_description,
                     filter_mask,
                 },
             );
@@ -2232,11 +2355,7 @@ fn build_family_bin_entries(
                     portrait: faces.face(guid).cloned(),
                 })
                 .collect();
-            let magic_coins = fam
-                .magic_history()
-                .ok()
-                .flatten()
-                .map_or(0, |h| i32::from(h[0]));
+            let magic_coins = lifecycle::family_magic_coins(stored, fam_id);
             FamilyEntry {
                 id: u32::from(fam_id),
                 name,
