@@ -1105,11 +1105,11 @@ fn compare(
             if let Some(d) = diff.as_deref_mut() {
                 let [r, g, b] = ours[i];
                 let grey = ((u32::from(r) + u32::from(g) + u32::from(b)) / 6) as u8;
-                d.color[i] = if same {
+                d.color[i] = sims_render::pack_rgb(if same {
                     [grey, grey, grey]
                 } else {
                     [255, 0, 255]
-                };
+                });
             }
         }
     }
@@ -1421,7 +1421,7 @@ fn run(config: &Config) -> Result<(), Vec<String>> {
             failures.push(format!("{name}: every pixel is left out"));
             continue;
         }
-        let ours = sha256(&canvas.color.concat());
+        let ours = sha256(&canvas.color_rgb().concat());
         if ours != scene.ours_sha256 {
             if config.update || starting {
                 lines[scene.ours_line] = format!("ours = {ours}");

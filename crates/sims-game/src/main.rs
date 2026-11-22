@@ -645,7 +645,7 @@ impl StartupLoading {
             destination_label: None,
             caption_override: None,
         };
-        let mut frame = match Frame::from_rgb(w, h, std::mem::take(&mut self.canvas.color)) {
+        let mut frame = match Frame::from_packed(w, h, std::mem::take(&mut self.canvas.color)) {
             Ok(mut frame) => {
                 frame.fill(
                     sims_ui::frame::Rect::new(0, 0, w as i32, h as i32),
@@ -659,11 +659,11 @@ impl StartupLoading {
             .draw(&mut frame, &state, &self.loading_art, &self.loading_strings);
         self.canvas.width = w as usize;
         self.canvas.height = h as usize;
-        self.canvas.color = frame.into_rgb();
+        self.canvas.color = frame.into_packed();
     }
 }
 
-type LocalLoadingPresenter = Box<dyn FnMut(&[[u8; 3]], [i32; 2], Vec<Input>)>;
+type LocalLoadingPresenter = Box<dyn FnMut(&[u32], [i32; 2], Vec<Input>)>;
 
 thread_local! {
     static MAIN_THREAD_LOADING_PRESENTER: RefCell<Option<LocalLoadingPresenter>> =
@@ -758,6 +758,22 @@ impl Session {
         }
     }
 
+    fn peek_present_damage(&self) -> Option<&[sims_render::canvas::Rect]> {
+        match self {
+            Self::Starting(_) => None,
+            Self::Standalone { game, .. } => game.peek_present_damage(),
+            Self::Shell(shell) => shell.peek_present_damage(),
+        }
+    }
+
+    fn on_presented(&mut self) {
+        match self {
+            Self::Starting(_) => {}
+            Self::Standalone { game, .. } => game.on_presented(),
+            Self::Shell(shell) => shell.on_presented(),
+        }
+    }
+
     fn persist_options(&mut self) {
         match self {
             Self::Starting(_) => {}
@@ -782,6 +798,8 @@ impl Session {
 
 type SharedSurface = Rc<RefCell<Option<Surface<Rc<Window>, Rc<Window>>>>>;
 type SharedSurfaceSize = Rc<Cell<Option<(NonZeroU32, NonZeroU32)>>>;
+type PresentSig = (usize, usize, usize, usize, usize, ScreenKind);
+type SharedPresentSig = Rc<Cell<Option<PresentSig>>>;
 
 struct App {
     session: Session,
@@ -790,6 +808,7 @@ struct App {
     window: Option<Rc<Window>>,
     surface: SharedSurface,
     surface_size: SharedSurfaceSize,
+    last_present_sig: SharedPresentSig,
     title_throttle: TitleThrottle,
     redraw_pacer: RedrawPacer,
     scale: Rc<Cell<u32>>,
@@ -953,11 +972,13 @@ impl App {
         let window = self.window.clone()?;
         let surface = Rc::clone(&self.surface);
         let surface_size = Rc::clone(&self.surface_size);
+        let last_present_sig = Rc::clone(&self.last_present_sig);
         let scale_cell = Rc::clone(&self.scale);
         let sound = Rc::clone(&self.sound);
         MAIN_THREAD_LOADING_PRESENTER.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(
-                move |pixels: &[[u8; 3]], size: [i32; 2], audio: Vec<Input>| {
+                move |pixels: &[u32], size: [i32; 2], audio: Vec<Input>| {
+                    last_present_sig.set(None);
                     {
                         let snd = sound.borrow();
                         for input in audio {
@@ -1740,6 +1761,7 @@ impl App {
             return;
         };
         if self.surface_size.get() != Some((w, h)) {
+            self.last_present_sig.set(None);
             if surface.resize(w, h).is_err() {
                 self.surface_size.set(None);
                 self.dirty = true;
@@ -1750,19 +1772,52 @@ impl App {
         }
         let Ok(mut buffer) = surface.buffer_mut() else {
             self.surface_size.set(None);
+            self.last_present_sig.set(None);
             self.dirty = true;
             self.redraw_pacer.on_redraw_failed(Instant::now());
             return;
         };
         let canvas = self.session.canvas();
         let (bw, bh) = (size.width as usize, size.height as usize);
-        blit_canvas(canvas, &mut buffer, bw, bh, scale as usize);
-        if buffer.present().is_err() {
+        let scale = scale as usize;
+        let cur_sig: PresentSig = (
+            bw,
+            bh,
+            scale,
+            canvas.width,
+            canvas.height,
+            self.session.screen_kind(),
+        );
+        let presented = if buffer.age() == 1
+            && self.last_present_sig.get() == Some(cur_sig)
+            && let Some(dirty_rects) = self.session.peek_present_damage()
+            && !dirty_rects.is_empty()
+        {
+            let mut damage = Vec::with_capacity(dirty_rects.len());
+            for &rect in dirty_rects {
+                if let Some(sb_rect) = blit_canvas_rect(canvas, &mut buffer, bw, bh, scale, rect) {
+                    damage.push(sb_rect);
+                }
+            }
+            if damage.is_empty() {
+                blit_canvas(canvas, &mut buffer, bw, bh, scale);
+                buffer.present()
+            } else {
+                buffer.present_with_damage(&damage)
+            }
+        } else {
+            blit_canvas(canvas, &mut buffer, bw, bh, scale);
+            buffer.present()
+        };
+        if presented.is_err() {
             self.surface_size.set(None);
+            self.last_present_sig.set(None);
             self.dirty = true;
             self.redraw_pacer.on_redraw_failed(Instant::now());
             return;
         }
+        self.last_present_sig.set(Some(cur_sig));
+        self.session.on_presented();
         self.redraw_pacer.on_present(Instant::now());
     }
 
@@ -1804,46 +1859,37 @@ impl App {
     }
 }
 
-#[inline(always)]
-fn pack_rgb([r, g, b]: [u8; 3]) -> u32 {
-    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
-}
-
 #[inline]
-fn blit_row_1x(src_row: &[[u8; 3]], dst_row: &mut [u32]) {
+fn blit_row_1x(src_row: &[u32], dst_row: &mut [u32]) {
     let copy_w = dst_row.len().min(src_row.len());
-    for (d, &rgb) in dst_row[..copy_w].iter_mut().zip(&src_row[..copy_w]) {
-        *d = pack_rgb(rgb);
-    }
+    dst_row[..copy_w].copy_from_slice(&src_row[..copy_w]);
     if dst_row.len() > copy_w {
-        let last = pack_rgb(src_row[copy_w - 1]);
-        dst_row[copy_w..].fill(last);
+        dst_row[copy_w..].fill(src_row[copy_w - 1]);
     }
 }
 
 #[inline]
-fn blit_row_2x(src_row: &[[u8; 3]], dst_row: &mut [u32]) {
+fn blit_row_2x(src_row: &[u32], dst_row: &mut [u32]) {
     let pairs = (dst_row.len() / 2).min(src_row.len());
     let (head, tail) = dst_row.split_at_mut(pairs * 2);
-    for (pair, &rgb) in head
+    for (pair, &px) in head
         .as_chunks_mut::<2>()
         .0
         .iter_mut()
         .zip(&src_row[..pairs])
     {
-        let px = pack_rgb(rgb);
         *pair = [px, px];
     }
     if !tail.is_empty() {
         let cx = pairs.min(src_row.len() - 1);
-        tail.fill(pack_rgb(src_row[cx]));
+        tail.fill(src_row[cx]);
     }
 }
 
 /// Blits `canvas` into the `bw × bh` `softbuffer` pixel buffer scaled up by
 /// integer `scale`, matching `(y / scale).min(h - 1)` / `(x / scale).min(w - 1)`
-/// bit-for-bit, with specialized zero-division paths for `scale == 1` and
-/// `scale == 2`.
+/// bit-for-bit, with specialized `memcpy` (`scale == 1`) and pure-`u32`
+/// auto-vectorizable (`scale == 2`) paths.
 fn blit_canvas(
     canvas: &sims_render::Canvas,
     buffer: &mut [u32],
@@ -1869,6 +1915,10 @@ fn blit_canvas(
     let max_cx = canvas.width - 1;
     match scale {
         1 => {
+            if bw == canvas.width && bh <= canvas.height {
+                buffer[..total].copy_from_slice(&canvas.color[..total]);
+                return;
+            }
             for y in 0..bh {
                 let cy = y.min(max_cy);
                 if y > 0 && cy == (y - 1).min(max_cy) {
@@ -1903,12 +1953,113 @@ fn blit_canvas(
                     let dst_row = &mut buffer[y * bw..(y + 1) * bw];
                     for (x, dst) in dst_row.iter_mut().enumerate() {
                         let cx = (x / scale).min(max_cx);
-                        *dst = pack_rgb(src_row[cx]);
+                        *dst = src_row[cx];
                     }
                 }
             }
         }
     }
+}
+
+/// Blits only the canvas-space half-open rectangle `rect = [rx0, ry0, rx1, ry1)`
+/// into `buffer` at integer `scale`, returning the exact `softbuffer::Rect`
+/// updated (including any trailing edge-clamped columns/rows when `rect`
+/// touches the right or bottom edge of `canvas`).
+fn blit_canvas_rect(
+    canvas: &sims_render::Canvas,
+    buffer: &mut [u32],
+    bw: usize,
+    bh: usize,
+    scale: usize,
+    rect: sims_render::canvas::Rect,
+) -> Option<softbuffer::Rect> {
+    let scale = scale.max(1);
+    let total = bw.checked_mul(bh)?;
+    if total == 0
+        || buffer.len() < total
+        || canvas.width == 0
+        || canvas.height == 0
+        || canvas.color.len() < canvas.width.saturating_mul(canvas.height)
+    {
+        return None;
+    }
+    let cw = canvas.width;
+    let ch = canvas.height;
+    let cw_i = i32::try_from(cw).unwrap_or(i32::MAX);
+    let ch_i = i32::try_from(ch).unwrap_or(i32::MAX);
+    let cx0 = rect[0].clamp(0, cw_i) as usize;
+    let cy0 = rect[1].clamp(0, ch_i) as usize;
+    let cx1 = rect[2].clamp(cx0 as i32, cw_i) as usize;
+    let cy1 = rect[3].clamp(cy0 as i32, ch_i) as usize;
+    if cx0 >= cx1 || cy0 >= cy1 {
+        return None;
+    }
+    let bx0 = cx0.saturating_mul(scale).min(bw);
+    let bx1 = if cx1 >= cw {
+        bw
+    } else {
+        cx1.saturating_mul(scale).min(bw)
+    };
+    let by0 = cy0.saturating_mul(scale).min(bh);
+    let by1 = if cy1 >= ch {
+        bh
+    } else {
+        cy1.saturating_mul(scale).min(bh)
+    };
+    if bx0 >= bx1 || by0 >= by1 {
+        return None;
+    }
+    let row_w = bx1 - bx0;
+    let max_cy = ch - 1;
+    let max_cx = cw - 1;
+    match scale {
+        1 => {
+            for by in by0..by1 {
+                let cy = by.min(max_cy);
+                if by > by0 && cy == (by - 1).min(max_cy) {
+                    let prev = (by - 1) * bw + bx0;
+                    buffer.copy_within(prev..prev + row_w, by * bw + bx0);
+                } else {
+                    let src_row = &canvas.color[cy * cw + cx0..cy * cw + cx1];
+                    blit_row_1x(src_row, &mut buffer[by * bw + bx0..by * bw + bx1]);
+                }
+            }
+        }
+        2 => {
+            for by in by0..by1 {
+                let cy = (by >> 1).min(max_cy);
+                if by > by0 && cy == ((by - 1) >> 1).min(max_cy) {
+                    let prev = (by - 1) * bw + bx0;
+                    buffer.copy_within(prev..prev + row_w, by * bw + bx0);
+                } else {
+                    let src_row = &canvas.color[cy * cw + cx0..cy * cw + cx1];
+                    blit_row_2x(src_row, &mut buffer[by * bw + bx0..by * bw + bx1]);
+                }
+            }
+        }
+        _ => {
+            for by in by0..by1 {
+                let cy = (by / scale).min(max_cy);
+                if by > by0 && cy == ((by - 1) / scale).min(max_cy) {
+                    let prev = (by - 1) * bw + bx0;
+                    buffer.copy_within(prev..prev + row_w, by * bw + bx0);
+                } else {
+                    let src_row = &canvas.color[cy * cw..(cy + 1) * cw];
+                    let dst_row = &mut buffer[by * bw + bx0..by * bw + bx1];
+                    for (i, dst) in dst_row.iter_mut().enumerate() {
+                        let cx = ((bx0 + i) / scale).min(max_cx);
+                        *dst = src_row[cx];
+                    }
+                }
+            }
+        }
+    }
+    Some(softbuffer::Rect {
+        x: u32::try_from(bx0).ok()?,
+        y: u32::try_from(by0).ok()?,
+        width: NonZeroU32::new(u32::try_from(row_w).ok()?)?,
+        height: NonZeroU32::new(u32::try_from(by1 - by0).ok()?)?,
+    })
 }
 
 impl ApplicationHandler for App {
@@ -2848,6 +2999,7 @@ fn run() -> Result<(), String> {
             window: None,
             surface: Rc::new(RefCell::new(None)),
             surface_size: Rc::new(Cell::new(None)),
+            last_present_sig: Rc::new(Cell::new(None)),
             title_throttle: TitleThrottle::default(),
             redraw_pacer: RedrawPacer::new(None),
             scale: Rc::new(Cell::new(1)),
@@ -2951,6 +3103,7 @@ fn run() -> Result<(), String> {
         window: None,
         surface: Rc::new(RefCell::new(None)),
         surface_size: Rc::new(Cell::new(None)),
+        last_present_sig: Rc::new(Cell::new(None)),
         title_throttle: TitleThrottle::default(),
         redraw_pacer: RedrawPacer::new(None),
         scale: Rc::new(Cell::new(1)),
@@ -3075,8 +3228,7 @@ mod tests {
             let row = &canvas.color[cy * canvas.width..(cy + 1) * canvas.width];
             for x in 0..bw {
                 let cx = (x / scale).min(canvas.width.saturating_sub(1));
-                let [r, g, b] = row.get(cx).copied().unwrap_or([0, 0, 0]);
-                buffer[y * bw + x] = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+                buffer[y * bw + x] = row.get(cx).copied().unwrap_or(0);
             }
         }
     }
@@ -3086,11 +3238,11 @@ mod tests {
         let mut canvas = sims_render::Canvas::new(11, 7, [0, 0, 0]);
         for y in 0..canvas.height {
             for x in 0..canvas.width {
-                canvas.color[y * canvas.width + x] = [
+                canvas.color[y * canvas.width + x] = sims_render::pack_rgb([
                     ((x * 23 + y * 7) & 0xff) as u8,
                     ((x * 11 + y * 31) & 0xff) as u8,
                     ((x * 5 + y * 19 + 42) & 0xff) as u8,
-                ];
+                ]);
             }
         }
         let sizes = [
@@ -3114,6 +3266,105 @@ mod tests {
                 assert_eq!(got, want, "scale={scale} bw={bw} bh={bh}");
             }
         }
+    }
+
+    #[test]
+    fn blit_canvas_rect_matches_full_blit_across_scales_and_edges() {
+        let mut base = sims_render::Canvas::new(11, 7, [0, 0, 0]);
+        let mut updated = sims_render::Canvas::new(11, 7, [0, 0, 0]);
+        for y in 0..base.height {
+            for x in 0..base.width {
+                let px = sims_render::pack_rgb([
+                    ((x * 17 + y * 9) & 0xff) as u8,
+                    ((x * 5 + y * 29) & 0xff) as u8,
+                    ((x * 13 + y * 3 + 7) & 0xff) as u8,
+                ]);
+                base.color[y * base.width + x] = px;
+                updated.color[y * updated.width + x] = px;
+            }
+        }
+        let rects: &[[i32; 4]] = &[
+            [0, 0, 3, 2],   // top-left corner
+            [3, 2, 7, 5],   // interior
+            [8, 4, 11, 7],  // right + bottom edge (exercises trailing clamp)
+            [-2, 1, 2, 10], // partially out-of-bounds
+        ];
+        for &[x0, y0, x1, y1] in rects {
+            for y in y0.clamp(0, 7)..y1.clamp(0, 7) {
+                for x in x0.clamp(0, 11)..x1.clamp(0, 11) {
+                    updated.color[y as usize * 11 + x as usize] ^= 0x005A_A53C;
+                }
+            }
+        }
+        let sizes = [
+            (11, 7),
+            (22, 14),
+            (23, 15),
+            (21, 13),
+            (25, 17),
+            (33, 21),
+            (35, 22),
+            (7, 5),
+            (15, 10),
+        ];
+        for scale in [1usize, 2, 3, 4] {
+            for (bw, bh) in sizes {
+                let mut partial = vec![0u32; bw * bh];
+                let mut full = vec![0u32; bw * bh];
+                blit_canvas(&base, &mut partial, bw, bh, scale);
+                blit_canvas(&updated, &mut full, bw, bh, scale);
+                for &rect in rects {
+                    let _ = blit_canvas_rect(&updated, &mut partial, bw, bh, scale, rect);
+                }
+                assert_eq!(
+                    partial, full,
+                    "partial rect mismatch scale={scale} bw={bw} bh={bh}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    #[allow(clippy::disallowed_methods)]
+    fn bench_blit_canvas() {
+        let (cw, ch) = (1024usize, 768usize);
+        let mut canvas = sims_render::Canvas::new(cw, ch, [0, 0, 0]);
+        for y in 0..ch {
+            for x in 0..cw {
+                canvas.color[y * cw + x] = sims_render::pack_rgb([
+                    ((x * 23 + y * 7) & 0xff) as u8,
+                    ((x * 11 + y * 31) & 0xff) as u8,
+                    ((x * 5 + y * 19 + 42) & 0xff) as u8,
+                ]);
+            }
+        }
+        let mut buf_1x = vec![0u32; cw * ch];
+        let mut buf_2x = vec![0u32; (cw * 2) * (ch * 2)];
+        // Warmup
+        blit_canvas(&canvas, &mut buf_1x, cw, ch, 1);
+        blit_canvas(&canvas, &mut buf_2x, cw * 2, ch * 2, 2);
+
+        let iters = 200usize;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            blit_canvas(&canvas, &mut buf_1x, cw, ch, 1);
+            std::hint::black_box(&buf_1x);
+        }
+        let ms_1x = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            blit_canvas(&canvas, &mut buf_2x, cw * 2, ch * 2, 2);
+            std::hint::black_box(&buf_2x);
+        }
+        let ms_2x = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        println!(
+            "BENCH_BLIT 1024x768 1x: {ms_1x:.4} ms/frame, 2x (2048x1536): {ms_2x:.4} ms/frame ({iters} iters, checksum={:08x}/{:08x})",
+            buf_1x[0] ^ buf_1x[cw * ch - 1],
+            buf_2x[0] ^ buf_2x[(cw * 2) * (ch * 2) - 1],
+        );
     }
 
     #[test]

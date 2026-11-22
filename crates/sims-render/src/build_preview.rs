@@ -22,7 +22,7 @@
 //! [`Canvas`] without altering static lot rendering.
 
 use crate::camera::Camera;
-use crate::canvas::{Canvas, EMPTY, quantize565};
+use crate::canvas::{Canvas, clamp_depth, pack_rgb, quantize565, unpack_rgb};
 use crate::depth::Depth;
 use crate::light;
 use crate::lot::{self, Lot};
@@ -2017,13 +2017,13 @@ fn raster_tri_blended(
             let z = (w0 * a.z + w1 * b.z + w2 * c.z) * inv_area;
             let zi = z.round() as i32;
             let idx = row + px;
-            if zi > canvas.depth[idx] {
+            if zi > i32::from(canvas.depth[idx]) {
                 continue;
             }
             if write_depth {
-                canvas.depth[idx] = zi.clamp(0, EMPTY);
+                canvas.depth[idx] = clamp_depth(zi);
             }
-            canvas.color[idx] = blend_overlay(canvas.color[idx], rgb, alpha);
+            canvas.color[idx] = pack_rgb(blend_overlay(unpack_rgb(canvas.color[idx]), rgb, alpha));
             written += 1;
         }
     }
@@ -2090,7 +2090,7 @@ fn raster_roof_triangle(
             let z = (w0 * a.z + w1 * b.z + w2 * c.z) * inv_area;
             let zi = z.round() as i32;
             let idx = row + px;
-            if zi > canvas.depth[idx] {
+            if zi > i32::from(canvas.depth[idx]) {
                 continue;
             }
             let u = (w0 * a.u + w1 * b.u + w2 * c.u) * inv_area;
@@ -2101,8 +2101,8 @@ fn raster_roof_triangle(
                 (f32::from(tex[1]) * shade + 0.5).clamp(0.0, 255.0) as u8,
                 (f32::from(tex[2]) * shade + 0.5).clamp(0.0, 255.0) as u8,
             ];
-            canvas.color[idx] = quantize565(lit);
-            canvas.depth[idx] = zi.clamp(0, EMPTY);
+            canvas.color[idx] = pack_rgb(quantize565(lit));
+            canvas.depth[idx] = clamp_depth(zi);
             written += 1;
         }
     }
@@ -2233,10 +2233,10 @@ fn blend_depth_pixel(
         return 0;
     }
     let idx = py * canvas.width + px;
-    if depth > canvas.depth[idx] {
+    if depth > i32::from(canvas.depth[idx]) {
         return 0;
     }
-    canvas.color[idx] = blend_overlay(canvas.color[idx], rgb, alpha);
+    canvas.color[idx] = pack_rgb(blend_overlay(unpack_rgb(canvas.color[idx]), rgb, alpha));
     1
 }
 
@@ -2261,6 +2261,7 @@ pub fn roof_daylight_cap(time_of_day: i16) -> f32 {
 mod tests {
     use super::*;
     use crate::camera::{Walls, Zoom};
+    use crate::canvas::EMPTY_DEPTH;
     use crate::cutaway::Focus;
     use sims_formats::lot::Array;
 
@@ -2487,7 +2488,7 @@ mod tests {
             stats.pixels_written, 0,
             "foreground wall at depth 0 must occlude overlay"
         );
-        assert!(occluded.color.iter().all(|&c| c == [10, 10, 10]));
+        assert!(occluded.color.iter().all(|&c| c == pack_rgb([10, 10, 10])));
     }
 
     #[test]
@@ -2527,7 +2528,7 @@ mod tests {
                 assert!(stats.triangles_drawn > 0);
                 assert!(stats.pixels_written > 200, "{style:?} {pitch:?}");
                 assert!(
-                    canvas.depth.iter().any(|&d| d < EMPTY),
+                    canvas.depth.iter().any(|&d| d < EMPTY_DEPTH),
                     "roof should write 16-bit depth"
                 );
                 if style == RoofStyle::Hip && pitch == RoofPitch::Steep {
@@ -2540,7 +2541,7 @@ mod tests {
         // Steep roof must rise visibly higher on screen than a flat roof.
         let top_row = |c: &Canvas| {
             (0..c.height)
-                .find(|&y| (0..c.width).any(|x| c.depth[y * c.width + x] < EMPTY))
+                .find(|&y| (0..c.width).any(|x| c.depth[y * c.width + x] < EMPTY_DEPTH))
                 .unwrap()
         };
         assert!(
@@ -2674,7 +2675,7 @@ mod tests {
         let mut cam = camera_for(&sloped_lot, Zoom::Near, 0);
         cam.center_on([6 * 16 + 8, 6 * 16 + 8], [160, 140]);
         let d = Depth::new(&cam);
-        let grass_z = d.grass(rotate_corner(cam.rotation, [6, 6]), 5);
+        let grass_z = clamp_depth(d.grass(rotate_corner(cam.rotation, [6, 6]), 5));
         let mut grass_canvas = Canvas::new(320, 280, [40, 90, 40]);
         grass_canvas.depth.fill(grass_z);
         let mut empty_canvas = Canvas::new(320, 280, [40, 90, 40]);
@@ -2737,7 +2738,7 @@ mod tests {
         draw_roof_preview(&terrace_lot, &cam_high, &pattern, &cfg_flat, &mut c_high);
         let top_at_center = |c: &Canvas| {
             (0..c.height)
-                .find(|&y| c.depth[y * c.width + 160] < EMPTY)
+                .find(|&y| c.depth[y * c.width + 160] < EMPTY_DEPTH)
                 .unwrap()
         };
         // 8 terrain steps at Far zoom = 8 * 4 = 32 px higher on screen.
@@ -2808,7 +2809,7 @@ mod tests {
                 assert!(
                     diag_canvas.depth
                         [indoor_pt[1] as usize * diag_canvas.width + indoor_pt[0] as usize]
-                        < EMPTY,
+                        < EMPTY_DEPTH,
                     "indoor diagonal probe {indoor_off:?} for {halves:?} must be covered"
                 );
             }
@@ -2818,7 +2819,7 @@ mod tests {
                 assert_eq!(
                     diag_canvas.depth
                         [outdoor_pt[1] as usize * diag_canvas.width + outdoor_pt[0] as usize],
-                    EMPTY,
+                    EMPTY_DEPTH,
                     "outdoor diagonal probe {outdoor_off:?} for {halves:?} must have zero overhang"
                 );
             }
@@ -2854,7 +2855,7 @@ mod tests {
             assert_eq!(
                 gable_canvas.depth
                     [outdoor_pt[1] as usize * gable_canvas.width + outdoor_pt[0] as usize],
-                EMPTY,
+                EMPTY_DEPTH,
                 "nonzero-pitch split Gable roof must not leak wall/roof pixels onto outdoor probe {outdoor_off:?}"
             );
         }

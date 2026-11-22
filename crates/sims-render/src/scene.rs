@@ -898,7 +898,7 @@ enum DrawCmdKind {
         bottom: i32,
         zoom: u32,
         depth: i32,
-        depth_clamped: i32,
+        depth_clamped: u16,
         clip_bottom: i32,
     },
     TerrainGrid {
@@ -972,7 +972,7 @@ enum ResolvedCmdKind<'a> {
         bottom: i32,
         zoom: u32,
         depth: i32,
-        depth_clamped: i32,
+        depth_clamped: u16,
         clip_bottom: i32,
     },
     TerrainGrid {
@@ -2216,7 +2216,7 @@ impl<'a> Painter<'a> {
             return;
         }
         let depth = self.depth.grass(view, i32::from(heights[1]));
-        let depth_clamped = depth.clamp(0, crate::depth::EMPTY);
+        let depth_clamped = crate::canvas::clamp_depth(depth);
         self.commands.push(DrawCmd {
             y0,
             y1,
@@ -3535,7 +3535,7 @@ fn draw_grass_tile(
         return;
     }
     let depth = depth_table.grass(view, i32::from(heights[1]));
-    let depth_clamped = depth.clamp(0, crate::depth::EMPTY);
+    let depth_clamped = crate::canvas::clamp_depth(depth);
     let left = corner[0] + GRASS_COLUMN;
     let canvas_w = i64::try_from(canvas.width).unwrap_or(i64::MAX);
     grass::for_each_column(
@@ -4770,7 +4770,7 @@ mod tests {
         assert!(
             (500..600)
                 .flat_map(|y| (0..800).map(move |x| (x, y)))
-                .all(|(x, y)| strip.color[y * 800 + x] == bg),
+                .all(|(x, y)| strip.color[y * 800 + x] == crate::canvas::pack_rgb(bg)),
             "viewport clip at 500 should draw no grass or blades in rows 500..600"
         );
     }

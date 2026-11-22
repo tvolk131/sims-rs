@@ -126,7 +126,7 @@ fn neighborhood_1_unleashed_renders_800x600_and_1024x768_and_hits_all_41_lots() 
     });
     assert_eq!((c1024.width, c1024.height), (1024, 768));
     assert!(
-        c1024.color[0..1024 * 80].iter().any(|&c| c != [0, 0, 0]),
+        c1024.color[0..1024 * 80].iter().any(|&c| c != 0),
         "1024×768 outer frame should be drawn"
     );
     let [ox, oy] = map_origin([1024, 768]);
@@ -179,7 +179,8 @@ fn hover_cutaway_highlight_and_community_filter_badges_modify_expected_pixels() 
     let mut changed_in_rect = 0usize;
     let mut changed_outside = 0usize;
     let mut outline_pixels = 0usize;
-    let expected_outline = sims_render::canvas::quantize565(DEFAULT_HIGHLIGHT_RGB);
+    let expected_outline =
+        sims_render::pack_rgb(sims_render::canvas::quantize565(DEFAULT_HIGHLIGHT_RGB));
     for y in 0..600i32 {
         for x in 0..800i32 {
             let idx = y as usize * 800 + x as usize;
@@ -218,7 +219,7 @@ fn hover_cutaway_highlight_and_community_filter_badges_modify_expected_pixels() 
         ..RenderOptions::default()
     });
     assert_eq!(
-        sims_render::neighborhood::pack_565(lot1_hi.color[83 * 800 + 559]),
+        sims_render::neighborhood::pack_565(lot1_hi.pixel_rgb(559, 83)),
         0xf7e3,
         "Unleashed Lot 1 two-cell strip boundary at (559, 83) must be outlined"
     );
@@ -324,7 +325,7 @@ fn all_eight_neighborhoods_and_all_sub_neighborhood_maps_load_and_render() {
         ..RenderOptions::default()
     });
     assert_eq!(
-        sims_render::neighborhood::pack_565(vac_c.color[559 * 800 + 179]),
+        sims_render::neighborhood::pack_565(vac_c.pixel_rgb(179, 559)),
         0x3a4d,
         "Vacation wave frame 5414 should draw after port and trees"
     );
@@ -379,7 +380,7 @@ fn neighborhood_1_matches_live_oracle_capture_if_provided() {
     for y in 80..600usize {
         for x in 0..800usize {
             let i = y * 800 + x;
-            let got = sims_render::neighborhood::pack_565(canvas.color[i]);
+            let got = sims_render::neighborhood::pack_565(sims_render::unpack_rgb(canvas.color[i]));
             let want = sims_render::neighborhood::pack_565(oracle_rgb[i]);
             all_total += 1;
             if got == want {
@@ -452,8 +453,9 @@ fn neighborhood_hover_cutaway_and_crossfade_match_191_oracle() {
             if clean_canvas.id_at(x as i32, y as i32).is_some() {
                 clean_lot_total += 1;
                 let idx = y * 800 + x;
-                if sims_render::neighborhood::pack_565(clean_canvas.color[idx])
-                    == sims_render::neighborhood::pack_565(clean_oracle[idx])
+                if sims_render::neighborhood::pack_565(sims_render::unpack_rgb(
+                    clean_canvas.color[idx],
+                )) == sims_render::neighborhood::pack_565(clean_oracle[idx])
                 {
                     clean_lot_exact += 1;
                 }
@@ -496,8 +498,12 @@ fn neighborhood_hover_cutaway_and_crossfade_match_191_oracle() {
                 continue;
             }
             let idx = y as usize * 800 + x as usize;
-            let got = sims_render::neighborhood::pack_565(hover_canvas.color[idx]);
-            let base = sims_render::neighborhood::pack_565(clean_canvas.color[idx]);
+            let got = sims_render::neighborhood::pack_565(sims_render::unpack_rgb(
+                hover_canvas.color[idx],
+            ));
+            let base = sims_render::neighborhood::pack_565(sims_render::unpack_rgb(
+                clean_canvas.color[idx],
+            ));
             let want = sims_render::neighborhood::pack_565(hover_oracle[idx]);
             if got == yellow_565 && base != yellow_565 {
                 added_yellow += 1;

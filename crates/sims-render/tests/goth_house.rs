@@ -233,7 +233,7 @@ fn off_lot_void_colour_follows_time_of_day_and_house_99() {
         // colour used for blending is verified to be 5-6-5 quantized.
         for [x, y] in [[10usize, 10], [790, 10]] {
             assert_eq!(
-                canvas.color[y * 800 + x],
+                canvas.pixel_rgb(x, y),
                 want,
                 "time_of_day={time_of_day} house={house_no} at ({x}, {y})"
             );

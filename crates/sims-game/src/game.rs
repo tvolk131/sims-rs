@@ -215,6 +215,29 @@ struct ActiveSpecialPanel {
     responses: BTreeMap<String, SpecialPanelResponse>,
 }
 
+/// Conservative invariant key for steady-state Tier-2 lot frames where all
+/// non-people pixels (lot surface, HUD, overlays) are guaranteed unchanged and
+/// pixel differences are strictly bounded by `prev_dynamic_rects ∪ cur_dynamic_rects`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SteadyFrameKey {
+    width: usize,
+    height: usize,
+    viewport: (u32, u32),
+    camera: Camera,
+    ticks: u32,
+    restore_generation: u64,
+    world_sound_rev: u64,
+    controls: sims_ui::hud::Controls,
+    selected: Option<u16>,
+    funds: i32,
+    paused: bool,
+    speed: i16,
+    return_speed: i16,
+    clock_nonzero: bool,
+    queue: sims_ui::queue::Queue,
+    hud_items_len: usize,
+}
+
 pub struct Game {
     lot: Lot,
     lot_shape: sims_render::Lot,
@@ -371,8 +394,27 @@ pub struct Game {
     /// people were drawn, before the objects holding them: what the
     /// pointer picks from ([`Game::under`]).
     drawn_camera: Camera,
-    lot_depth: Vec<i32>,
+    /// Fallback lot depth buffer used only when `lot_depth_from_cache` is
+    /// false (uncached/zero-area canvas or after `clear_lot_cache()`). On
+    /// normal cached draws, [`Game::under`] borrows `&[u16]` directly from
+    /// [`LotCache::last_lot_depth`] with zero per-frame copy.
+    lot_depth: Vec<u16>,
+    lot_depth_from_cache: bool,
     people_ids: sims_render::Ids,
+    /// Reusable per-frame tight bounding rects `[x0, y0, x1, y1)` written by
+    /// `People::draw_in_viewport_tracked` (used for sparse `people_ids` capture
+    /// and safe partial-damage presentation).
+    people_rects: Vec<sims_render::canvas::Rect>,
+    /// Dynamic rects (`people_rects` + any `draw_held` rects) from the last
+    /// completed `Game::draw`.
+    prev_dynamic_rects: Vec<sims_render::canvas::Rect>,
+    /// Key describing all non-people inputs to `Game::draw` for proving that a
+    /// steady-state Tier-2 frame only changed pixels inside
+    /// `prev_dynamic_rects ∪ cur_dynamic_rects`.
+    prev_steady_key: Option<SteadyFrameKey>,
+    /// Accumulated canvas-space damage rects since the last successful window
+    /// present, or `None` when a full blit/present is required.
+    present_damage: Option<Vec<sims_render::canvas::Rect>>,
     /// Explicit override enabling 400 ms pie-menu animations even at `clock_us == 0`.
     /// Also enabled automatically whenever `clock_us > 0` (live window / `advance`).
     pie_animations: bool,
@@ -982,7 +1024,12 @@ impl Game {
             lot_cache: sims_render::LotCache::new(),
             drawn_camera,
             lot_depth: Vec::new(),
+            lot_depth_from_cache: false,
             people_ids: sims_render::Ids::default(),
+            people_rects: Vec::new(),
+            prev_dynamic_rects: Vec::new(),
+            prev_steady_key: None,
+            present_damage: None,
             pie_animations: false,
             debug: false,
             last_debug_logged_note: None,
@@ -1338,7 +1385,12 @@ impl Game {
             lot_cache: sims_render::LotCache::new(),
             drawn_camera,
             lot_depth: Vec::new(),
+            lot_depth_from_cache: false,
             people_ids: sims_render::Ids::default(),
+            people_rects: Vec::new(),
+            prev_dynamic_rects: Vec::new(),
+            prev_steady_key: None,
+            present_damage: None,
             pie_animations: false,
             debug: false,
             last_debug_logged_note: None,
@@ -1660,7 +1712,12 @@ impl Game {
             lot_cache: sims_render::LotCache::new(),
             drawn_camera,
             lot_depth: Vec::new(),
+            lot_depth_from_cache: false,
             people_ids: sims_render::Ids::default(),
+            people_rects: Vec::new(),
+            prev_dynamic_rects: Vec::new(),
+            prev_steady_key: None,
+            present_damage: None,
             pie_animations: false,
             debug: false,
             last_debug_logged_note: None,
@@ -2033,7 +2090,7 @@ impl Game {
                     self.build_drag = None;
                     self.build_preview_shape = None;
                     self.refresh_world();
-                    self.lot_cache.clear();
+                    self.clear_lot_cache();
                     messages.push("Lot prepared".into());
                 }
                 CheatCommand::Help => {
@@ -2167,7 +2224,7 @@ impl Game {
         self.world_mutated_via_restore = true;
         self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
         self.dirty = true;
-        self.lot_cache.clear();
+        self.clear_lot_cache();
         let world = self.lot.world();
         self.people.refresh(world);
         if let Ok(shape) = sims_render::Lot::from_world(world) {
@@ -3410,9 +3467,71 @@ impl Game {
     pub fn render(&mut self) -> &Canvas {
         self.draw();
         if self.follow() {
+            self.prev_steady_key = None;
+            self.present_damage = None;
             self.draw();
         }
         &self.canvas
+    }
+
+    /// Clears `lot_cache` while preserving the last drawn lot depth in
+    /// `self.lot_depth` so `Game::under` stays exact until the next `draw()`.
+    fn clear_lot_cache(&mut self) {
+        if self.lot_depth_from_cache {
+            if let Some(cached) = self.lot_cache.last_lot_depth() {
+                self.lot_depth.clear();
+                self.lot_depth.extend_from_slice(cached);
+            }
+            self.lot_depth_from_cache = false;
+        }
+        self.lot_cache.clear();
+        self.prev_steady_key = None;
+        self.present_damage = None;
+    }
+
+    /// Read-only view of the lot depth buffer for the frame last drawn
+    /// (borrowing directly from [`LotCache::last_lot_depth`] on cached draws
+    /// with zero per-frame copy, or falling back to `self.lot_depth`).
+    pub fn lot_depth_slice(&self) -> &[u16] {
+        if self.lot_depth_from_cache
+            && let Some(cached) = self
+                .lot_cache
+                .last_lot_depth()
+                .filter(|d| d.len() == self.canvas.width.saturating_mul(self.canvas.height))
+        {
+            return cached;
+        }
+        &self.lot_depth
+    }
+
+    /// Whether `Game::under` is currently borrowing lot depth directly from
+    /// [`LotCache`] without a per-frame clone.
+    pub fn lot_depth_from_cache(&self) -> bool {
+        self.lot_depth_from_cache
+    }
+
+    /// Number of pixels currently stored in the sparse `people_ids` buffer.
+    pub fn people_ids_stored_pixels(&self) -> usize {
+        self.people_ids.stored_pixels()
+    }
+
+    /// Canvas-space dirty rects accumulated since the last successful window
+    /// present, or `None` when a full blit/present is required.
+    pub fn peek_present_damage(&self) -> Option<&[sims_render::canvas::Rect]> {
+        self.present_damage.as_deref()
+    }
+
+    /// Marks the current canvas as successfully presented to the window
+    /// backbuffer so subsequent steady-state frames can accumulate bounded
+    /// partial damage relative to it.
+    pub fn on_presented(&mut self) {
+        self.present_damage = Some(Vec::new());
+    }
+
+    /// Forces the next present of this lot to perform a full blit (e.g. when a
+    /// shell-level modal overlay was composited over the lot canvas).
+    pub fn invalidate_present_damage(&mut self) {
+        self.present_damage = None;
     }
 
     /// Draws the frame.
@@ -3458,8 +3577,18 @@ impl Game {
             render_options,
             &mut self.canvas,
         );
+        let lot_hit = self.lot_cache.last_hit();
         self.drawn_camera = self.view.camera;
-        self.lot_depth.clone_from(&self.canvas.depth);
+        if self
+            .lot_cache
+            .last_lot_depth()
+            .is_some_and(|d| d.len() == self.canvas.width.saturating_mul(self.canvas.height))
+        {
+            self.lot_depth_from_cache = true;
+        } else {
+            self.lot_depth.clone_from(&self.canvas.depth);
+            self.lot_depth_from_cache = false;
+        }
         // The plumb bob spins by the game's clock in milliseconds (the
         // original's 0x6e54e0); here the time passed in, which runs on
         // while the lot is paused or a dialog waits (**unverified**
@@ -3467,11 +3596,24 @@ impl Game {
         self.drawn_us = self.clock_us;
         let milliseconds = (self.clock_us / 1000) as u32;
         self.people.set_clock(milliseconds);
-        self.people
-            .draw_in_viewport(world, &self.view.camera, viewport, &mut self.canvas);
+        self.people_rects.clear();
+        self.people.draw_in_viewport_tracked(
+            world,
+            &self.view.camera,
+            viewport,
+            &mut self.canvas,
+            &mut self.people_rects,
+        );
+        for (&id, obj) in &world.objects {
+            if (obj.person.is_some() || obj.guid == sims_people::bob::STANDARD)
+                && let Some(rect) = self.canvas.drawn(id)
+            {
+                self.people_rects.push(rect);
+            }
+        }
         // Who the pick notes: the people as drawn, before a bench they sit
-        // on draws over them.
-        self.people_ids.take(&self.canvas);
+        // on draws over them, captured only within their tight drawn rects.
+        self.people_ids.take_rects(&self.canvas, &self.people_rects);
         sims_render::draw_held_with_options(
             world,
             draw_shape,
@@ -3480,6 +3622,12 @@ impl Game {
             render_options,
             &mut self.canvas,
         );
+        let mut cur_dynamic_rects = self.people_rects.clone();
+        for id in sims_render::holds_person(world) {
+            if let Some(rect) = self.canvas.drawn(id) {
+                cur_dynamic_rects.push(rect);
+            }
+        }
         // Build Mode Part 2 previews (Terrain overlay, Water/Pool digging preview
         // with coping border, and isometric Roof preview). Never drawn during static
         // Live Mode frames when `roof_view` is false, keeping ratchet frames bit-exact.
@@ -3595,7 +3743,8 @@ impl Game {
                 }
             }
         }
-        self.hud.sync_clock_blink(world, self.clock_us);
+        let was_ui_animating = self.ui_animating_prev;
+        let blink_changed = self.hud.sync_clock_blink(world, self.clock_us);
         self.hud.sync_character_names(self.lot.character_names());
         self.blink_dirty = false;
         if self.hud.controls.mode == Mode::Build && self.hud.controls.expanded {
@@ -3637,6 +3786,70 @@ impl Game {
         self.keep_sounds(sounds);
         let problems = self.hud.take_problems();
         self.people.note(problems);
+
+        let steady_eligible = lot_hit == sims_render::CacheHit::Full
+            && self.hud.controls.mode == Mode::Live
+            && self.hud.controls.help.is_none()
+            && !blink_changed
+            && !was_ui_animating
+            && !self.ui_animating_prev
+            && !self.debug
+            && !self.roof_view
+            && self.terrain_hover_overlay.is_none()
+            && self.water_hover_overlay.is_none()
+            && self.build_preview_shape.is_none()
+            && self.buy_cursor.is_none()
+            && self.buy_selected.is_none()
+            && !self.coop.is_active()
+            && !self.coop_lobby.is_open()
+            && self.hud.menu.is_none()
+            && self.hud.dialog().is_none()
+            && !self.hud.has_ui_dialog()
+            && self.lot.asking().is_none()
+            && self.lot.asking_special_panel().is_none()
+            && !self.hud.camera_strip_open()
+            && !self.cheat_console_open()
+            && !self.shop_dialog.is_open()
+            && self.highlighted_buttons.is_empty()
+            && self.highlighted_portraits.is_empty()
+            && self.highlighted_relationships.is_empty()
+            && sell.is_none();
+        let cur_steady_key = if steady_eligible {
+            let world = self.lot.world();
+            Some(SteadyFrameKey {
+                width: self.canvas.width,
+                height: self.canvas.height,
+                viewport,
+                camera: self.view.camera,
+                ticks: self.lot.ticks(),
+                restore_generation: self.restore_generation,
+                world_sound_rev: self.world_sound_rev,
+                controls: self.hud.controls,
+                selected: world.selected(),
+                funds: world.budget.funds,
+                paused: world.paused(),
+                speed: world.speed(),
+                return_speed: world.return_speed(),
+                clock_nonzero: self.clock_us > 0,
+                queue: self.hud.queue().clone(),
+                hud_items_len: self.hud.items().len(),
+            })
+        } else {
+            None
+        };
+        if cur_steady_key.is_some() && self.prev_steady_key == cur_steady_key {
+            if let Some(dmg) = &mut self.present_damage {
+                dmg.extend_from_slice(&self.prev_dynamic_rects);
+                dmg.extend_from_slice(&cur_dynamic_rects);
+                if dmg.len() > 32 {
+                    self.present_damage = None;
+                }
+            }
+        } else {
+            self.present_damage = None;
+        }
+        self.prev_dynamic_rects = cur_dynamic_rects;
+        self.prev_steady_key = cur_steady_key;
     }
 
     /// The canvas last drawn.
@@ -4494,7 +4707,7 @@ impl Game {
             &self.lot,
             &self.drawn_camera,
             &self.canvas,
-            &self.lot_depth,
+            self.lot_depth_slice(),
             &self.people_ids,
             point,
         )
@@ -4970,7 +5183,7 @@ impl Game {
     /// `(width, height - STRIP)` (`height - 150 + 50` from the shared
     /// 150-pixel panel container at `0x4f4b43`) while the strip is open in
     /// Live, Build, Buy, or Options mode.
-    fn house_viewport_size(&self) -> (u32, u32) {
+    pub fn house_viewport_size(&self) -> (u32, u32) {
         viewport_for_controls(self.view.size, &self.hud.controls)
     }
 
@@ -5107,7 +5320,7 @@ impl Game {
         self.lot.restore(saved).map_err(|e| e.to_string())?;
         self.world_mutated_via_restore = true;
         self.restore_generation = self.restore_generation.wrapping_add(1);
-        self.lot_cache.clear();
+        self.clear_lot_cache();
         self.stopped = None;
         self.errors = Errors::default();
         self.sounds.clear();
@@ -7873,7 +8086,7 @@ impl Game {
             u32::try_from(self.canvas.height).unwrap_or(0),
         );
         let Ok(mut frame) =
-            sims_ui::frame::Frame::from_rgb(w, h, std::mem::take(&mut self.canvas.color))
+            sims_ui::frame::Frame::from_packed(w, h, std::mem::take(&mut self.canvas.color))
         else {
             return;
         };
@@ -7896,7 +8109,7 @@ impl Game {
         };
         frame.fill(sims_ui::frame::Rect::new(bx, by, box_w, box_h), bg);
         font.draw(&mut frame, &label, [bx + 5, by + 3], fg);
-        self.canvas.color = frame.into_rgb();
+        self.canvas.color = frame.into_packed();
     }
 
     /// Refreshes the cached render lot shape and people from `self.lot.world()`.
@@ -8231,12 +8444,12 @@ impl Game {
             u32::try_from(self.canvas.height).unwrap_or(0),
         );
         let Ok(mut frame) =
-            sims_ui::frame::Frame::from_rgb(w, h, std::mem::take(&mut self.canvas.color))
+            sims_ui::frame::Frame::from_packed(w, h, std::mem::take(&mut self.canvas.color))
         else {
             return;
         };
         self.shop_dialog.draw(&mut frame, snapshot, &strings, art);
-        self.canvas.color = frame.into_rgb();
+        self.canvas.color = frame.into_packed();
     }
 
     // -------------------------------------------------------------------------
@@ -9955,7 +10168,7 @@ impl Game {
         if let Ok(shape) = sims_render::Lot::from_world(self.lot.world()) {
             self.lot_shape = shape.with_floor_rotation(self.lot.floor_rotation());
         }
-        self.lot_cache.clear();
+        self.clear_lot_cache();
         self.restore_generation = self.restore_generation.wrapping_add(1);
         self.blink_dirty = true;
     }
@@ -10372,7 +10585,7 @@ impl Game {
             u32::try_from(self.canvas.height).unwrap_or(0),
         );
         let Ok(mut frame) =
-            sims_ui::frame::Frame::from_rgb(w, h, std::mem::take(&mut self.canvas.color))
+            sims_ui::frame::Frame::from_packed(w, h, std::mem::take(&mut self.canvas.color))
         else {
             return;
         };
@@ -10397,7 +10610,7 @@ impl Game {
         if show_lobby {
             self.coop_lobby.draw(&mut frame, &snapshot, art);
         }
-        self.canvas.color = frame.into_rgb();
+        self.canvas.color = frame.into_packed();
     }
 }
 
@@ -10621,7 +10834,7 @@ fn draw_coop_plumbob_diamond(
             } else {
                 color
             };
-            canvas.color[row + px as usize] = rgb;
+            canvas.color[row + px as usize] = sims_render::pack_rgb(rgb);
         }
     }
 }
@@ -11136,11 +11349,12 @@ fn draw_highlight_rect(canvas: &mut Canvas, rect: sims_ui::frame::Rect, rgb: [u8
     let y0 = rect.y;
     let x1 = rect.x.saturating_add(rect.width).saturating_sub(1);
     let y1 = rect.y.saturating_add(rect.height).saturating_sub(1);
+    let packed = sims_render::pack_rgb(rgb);
     let mut put = |x: i32, y: i32| {
         if x >= 0 && x < cw && y >= 0 && y < ch {
             let idx = y as usize * canvas.width + x as usize;
             if let Some(px) = canvas.color.get_mut(idx) {
-                *px = rgb;
+                *px = packed;
             }
         }
     };
@@ -12133,14 +12347,14 @@ mod tests {
             false,
             &mut canvas,
         );
-        assert!(canvas.color.iter().all(|&px| px == [0, 0, 0]));
+        assert!(canvas.color.iter().all(|&px| px == 0));
 
         // Active highlights draw the outline on the matching button, portrait,
         // and only the first relationship control (matching 0x4769ca).
         let buttons = BTreeSet::from([sims_ui::hud::id::LIVE as i16]);
         let portraits = BTreeSet::from([0x1111_2222u32]);
         draw_ui_effect_highlights(&items, &buttons, &portraits, true, &mut canvas);
-        let pixel = |c: &Canvas, x: usize, y: usize| c.color[y * c.width + x];
+        let pixel = |c: &Canvas, x: usize, y: usize| c.pixel_rgb(x, y);
         assert_eq!(pixel(&canvas, 2, 2), UI_EFFECT_HIGHLIGHT_RGB);
         assert_eq!(pixel(&canvas, 16, 2), UI_EFFECT_HIGHLIGHT_RGB);
         assert_eq!(pixel(&canvas, 30, 2), UI_EFFECT_HIGHLIGHT_RGB);

@@ -81,13 +81,26 @@ impl Rect {
 /// The largest frame side.
 pub const MAX_SIDE: u32 = 16384;
 
+/// Packs 8-bit `[r, g, b]` into `0x00RRGGBB` (matching `sims_render::Canvas`
+/// and `softbuffer` directly).
+#[inline(always)]
+pub const fn pack_rgb([r, g, b]: [u8; 3]) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+/// Unpacks `0x00RRGGBB` back into 8-bit `[r, g, b]`.
+#[inline(always)]
+pub const fn unpack_rgb(pixel: u32) -> [u8; 3] {
+    [(pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8]
+}
+
 /// An RGB image, row by row from the top. The buffer always holds exactly
-/// `width * height` pixels.
+/// `width * height` packed `0x00RRGGBB` pixels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     width: u32,
     height: u32,
-    rgb: Vec<[u8; 3]>,
+    pixels: Vec<u32>,
 }
 
 impl Frame {
@@ -98,13 +111,31 @@ impl Frame {
         Self {
             width,
             height,
-            rgb: vec![background; width as usize * height as usize],
+            pixels: vec![pack_rgb(background); width as usize * height as usize],
         }
     }
 
-    /// A frame over an existing buffer, as a host's canvas. The buffer is
-    /// handed back if its length is not `width * height` or a side is
-    /// above [`MAX_SIDE`].
+    /// A zero-copy frame over an existing packed `0x00RRGGBB` buffer, as a
+    /// host's `Canvas::color`. The buffer is handed back if its length is not
+    /// `width * height` or a side is above [`MAX_SIDE`].
+    pub fn from_packed(
+        width: u32,
+        height: u32,
+        pixels: Vec<u32>,
+    ) -> std::result::Result<Self, Vec<u32>> {
+        if width > MAX_SIDE || height > MAX_SIDE || pixels.len() != width as usize * height as usize
+        {
+            return Err(pixels);
+        }
+        Ok(Self {
+            width,
+            height,
+            pixels,
+        })
+    }
+
+    /// A frame from an `[r, g, b]` pixel buffer. The buffer is handed back if
+    /// its length is not `width * height` or a side is above [`MAX_SIDE`].
     pub fn from_rgb(
         width: u32,
         height: u32,
@@ -113,7 +144,11 @@ impl Frame {
         if width > MAX_SIDE || height > MAX_SIDE || rgb.len() != width as usize * height as usize {
             return Err(rgb);
         }
-        Ok(Self { width, height, rgb })
+        Ok(Self {
+            width,
+            height,
+            pixels: rgb.into_iter().map(pack_rgb).collect(),
+        })
     }
 
     pub fn width(&self) -> u32 {
@@ -124,14 +159,24 @@ impl Frame {
         self.height
     }
 
-    /// The pixels, row by row from the top.
-    pub fn rgb(&self) -> &[[u8; 3]] {
-        &self.rgb
+    /// The packed `0x00RRGGBB` pixels, row by row from the top.
+    pub fn packed(&self) -> &[u32] {
+        &self.pixels
     }
 
-    /// The buffer, handed back to the host.
+    /// The packed `0x00RRGGBB` buffer, handed back to the host with zero copy.
+    pub fn into_packed(self) -> Vec<u32> {
+        self.pixels
+    }
+
+    /// The pixels unpacked as `[r, g, b]`, row by row from the top.
+    pub fn rgb(&self) -> Vec<[u8; 3]> {
+        self.pixels.iter().map(|&p| unpack_rgb(p)).collect()
+    }
+
+    /// The buffer unpacked as `[r, g, b]`.
     pub fn into_rgb(self) -> Vec<[u8; 3]> {
-        self.rgb
+        self.pixels.into_iter().map(unpack_rgb).collect()
     }
 
     fn index(&self, x: i32, y: i32) -> Option<usize> {
@@ -140,7 +185,7 @@ impl Frame {
     }
 
     pub fn pixel(&self, x: i32, y: i32) -> Option<[u8; 3]> {
-        self.index(x, y).map(|i| self.rgb[i])
+        self.index(x, y).map(|i| unpack_rgb(self.pixels[i]))
     }
 
     /// Blends `rgb` over one pixel with coverage `alpha` (255 opaque),
@@ -153,24 +198,25 @@ impl Frame {
         let Some(i) = self.index(x, y) else {
             return;
         };
-        let pixel = &mut self.rgb[i];
+        let pixel = &mut self.pixels[i];
         if alpha <= 7 {
             return;
         }
         if alpha >= 248 {
-            *pixel = rgb;
+            *pixel = pack_rgb(rgb);
             return;
         }
         let table = blend_table();
+        let d = *pixel;
         let a5 = usize::from(alpha >> 3) << 10;
-        let r5 = table[a5 | (usize::from(rgb[0] >> 3) << 5) | usize::from(pixel[0] >> 3)];
-        let g5 = table[a5 | (usize::from(rgb[1] >> 3) << 5) | usize::from(pixel[1] >> 3)];
-        let b5 = table[a5 | (usize::from(rgb[2] >> 3) << 5) | usize::from(pixel[2] >> 3)];
-        *pixel = [
+        let r5 = table[a5 | (usize::from(rgb[0] >> 3) << 5) | (((d >> 19) & 31) as usize)];
+        let g5 = table[a5 | (usize::from(rgb[1] >> 3) << 5) | (((d >> 11) & 31) as usize)];
+        let b5 = table[a5 | (usize::from(rgb[2] >> 3) << 5) | (((d >> 3) & 31) as usize)];
+        *pixel = pack_rgb([
             (r5 << 3) | (r5 >> 2),
             (g5 << 3) | (g5 >> 3),
             (b5 << 3) | (b5 >> 2),
-        ];
+        ]);
     }
 
     /// Fills `rect` (clipped to the frame) with `rgb`.
@@ -181,10 +227,11 @@ impl Frame {
             let (start, end) = (i64::from(start).clamp(0, size), end.min(size));
             start as usize..end.max(start) as usize
         };
+        let packed = pack_rgb(rgb);
         let xs = clip(rect.x, rect.width, self.width);
         for y in clip(rect.y, rect.height, self.height) {
             let row = y * self.width as usize;
-            self.rgb[row + xs.start..row + xs.end].fill(rgb);
+            self.pixels[row + xs.start..row + xs.end].fill(packed);
         }
     }
 
@@ -234,25 +281,26 @@ impl Frame {
             let src_start = (iy * img_w + src_x0) * 4;
             let src_row = &rgba[src_start..src_start + len * 4];
             let dst_start = dy * dst_w + dst_x0;
-            let dst_row = &mut self.rgb[dst_start..dst_start + len];
+            let dst_row = &mut self.pixels[dst_start..dst_start + len];
             for (src, dst) in src_row.as_chunks::<4>().0.iter().zip(dst_row.iter_mut()) {
                 let a = src[3];
                 if a <= 7 {
                     continue;
                 }
                 if a >= 248 {
-                    *dst = [src[0], src[1], src[2]];
+                    *dst = pack_rgb([src[0], src[1], src[2]]);
                     continue;
                 }
+                let d = *dst;
                 let a5 = usize::from(a >> 3) << 10;
-                let r5 = table[a5 | (usize::from(src[0] >> 3) << 5) | usize::from(dst[0] >> 3)];
-                let g5 = table[a5 | (usize::from(src[1] >> 3) << 5) | usize::from(dst[1] >> 3)];
-                let b5 = table[a5 | (usize::from(src[2] >> 3) << 5) | usize::from(dst[2] >> 3)];
-                *dst = [
+                let r5 = table[a5 | (usize::from(src[0] >> 3) << 5) | (((d >> 19) & 31) as usize)];
+                let g5 = table[a5 | (usize::from(src[1] >> 3) << 5) | (((d >> 11) & 31) as usize)];
+                let b5 = table[a5 | (usize::from(src[2] >> 3) << 5) | (((d >> 3) & 31) as usize)];
+                *dst = pack_rgb([
                     (r5 << 3) | (r5 >> 2),
                     (g5 << 3) | (g5 >> 3),
                     (b5 << 3) | (b5 >> 2),
-                ];
+                ]);
             }
         }
     }
@@ -278,8 +326,8 @@ impl Frame {
         );
         for y in 0..out.height {
             for x in 0..out.width {
-                out.rgb[(y * out.width + x) as usize] =
-                    self.rgb[((y / scale) * self.width + x / scale) as usize];
+                out.pixels[(y * out.width + x) as usize] =
+                    self.pixels[((y / scale) * self.width + x / scale) as usize];
             }
         }
         out
@@ -290,18 +338,19 @@ impl Frame {
     /// `sims_render::Canvas::rgb565` does. Comparisons with screenshots of
     /// the original are made on this.
     pub fn quantized(&self) -> Self {
-        let q = |[r, g, b]: [u8; 3]| {
+        let q = |p: u32| {
+            let [r, g, b] = unpack_rgb(p);
             let (r, g, b) = (r >> 3, g >> 2, b >> 3);
-            [
+            pack_rgb([
                 (r << 3) | (r >> 2),
                 (g << 2) | (g >> 4),
                 (b << 3) | (b >> 2),
-            ]
+            ])
         };
         Self {
             width: self.width,
             height: self.height,
-            rgb: self.rgb.iter().map(|&c| q(c)).collect(),
+            pixels: self.pixels.iter().map(|&c| q(c)).collect(),
         }
     }
 
@@ -309,9 +358,11 @@ impl Frame {
     /// The same writer as `crates/sims-render/src/png.rs`.
     pub fn png(&self) -> Vec<u8> {
         let mut raw = Vec::with_capacity((self.width as usize * 3 + 1) * self.height as usize);
-        for row in self.rgb.chunks(self.width.max(1) as usize) {
+        for row in self.pixels.chunks(self.width.max(1) as usize) {
             raw.push(0);
-            raw.extend(row.iter().flatten());
+            for &p in row {
+                raw.extend_from_slice(&unpack_rgb(p));
+            }
         }
         let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
         let mut header = Vec::new();

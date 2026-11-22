@@ -602,6 +602,138 @@ impl Target for sims_render::Canvas {
     }
 }
 
+/// Wraps a [`sims_render::Canvas`] as a [`Target`], recording the tight
+/// bounding rectangle `[x0, y0, x1, y1)` of every pixel actually written
+/// between [`Target::set_id`] transitions (one tight rect per drawn Sim and
+/// per drawn plumb bob).
+struct TrackedLotCanvas<'a> {
+    canvas: &'a mut sims_render::Canvas,
+    rects: &'a mut Vec<sims_render::canvas::Rect>,
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+    has_pixels: bool,
+}
+
+impl<'a> TrackedLotCanvas<'a> {
+    fn new(
+        canvas: &'a mut sims_render::Canvas,
+        rects: &'a mut Vec<sims_render::canvas::Rect>,
+    ) -> Self {
+        rects.clear();
+        Self {
+            canvas,
+            rects,
+            min_x: i32::MAX,
+            min_y: i32::MAX,
+            max_x: i32::MIN,
+            max_y: i32::MIN,
+            has_pixels: false,
+        }
+    }
+
+    #[inline(always)]
+    fn expand(&mut self, x: i32, y: i32) {
+        if self.has_pixels {
+            self.min_x = self.min_x.min(x);
+            self.min_y = self.min_y.min(y);
+            self.max_x = self.max_x.max(x);
+            self.max_y = self.max_y.max(y);
+        } else {
+            self.min_x = x;
+            self.min_y = y;
+            self.max_x = x;
+            self.max_y = y;
+            self.has_pixels = true;
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self) {
+        if self.has_pixels {
+            self.rects.push([
+                self.min_x,
+                self.min_y,
+                self.max_x.saturating_add(1),
+                self.max_y.saturating_add(1),
+            ]);
+            self.has_pixels = false;
+        }
+    }
+}
+
+impl Target for TrackedLotCanvas<'_> {
+    fn size(&self) -> (u32, u32) {
+        (self.canvas.width as u32, self.canvas.height as u32)
+    }
+
+    fn passes(&self, x: u32, y: u32, z: f32) -> bool {
+        sims_render::Canvas::passes(self.canvas, x as i32, y as i32, z as i32)
+    }
+
+    fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
+        self.write_coloured(x, y, z, texel, [shade; 3]);
+    }
+
+    fn write_coloured(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: [f32; 3]) {
+        let lit = |c: u8, s: f32| (f32::from(c) * s + 0.5).clamp(0.0, 255.0) as u8;
+        let [r, g, b, a] = texel;
+        if self.canvas.put(
+            x as i32,
+            y as i32,
+            [lit(r, shade[0]), lit(g, shade[1]), lit(b, shade[2]), a],
+            z as i32,
+        ) {
+            self.expand(x as i32, y as i32);
+        }
+    }
+
+    fn set_id(&mut self, id: Option<u16>) {
+        self.flush();
+        sims_render::Canvas::set_id(self.canvas, id);
+    }
+
+    #[inline]
+    fn row_index(&self, y: u32) -> usize {
+        (y as usize).saturating_mul(self.canvas.width)
+    }
+
+    #[inline]
+    fn passes_at(&self, row: usize, x: u32, y: u32, z: f32) -> bool {
+        (y as usize) < self.canvas.height && self.canvas.depth_passes_at(row, x as usize, z as i32)
+    }
+
+    #[inline]
+    fn write_passed_at(&mut self, row: usize, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
+        self.write_coloured_passed_at(row, x, y, z, texel, [shade; 3]);
+    }
+
+    #[inline]
+    fn write_coloured_passed_at(
+        &mut self,
+        row: usize,
+        x: u32,
+        y: u32,
+        z: f32,
+        texel: [u8; 4],
+        shade: [f32; 3],
+    ) {
+        if (x as usize) >= self.canvas.width || (y as usize) >= self.canvas.height {
+            return;
+        }
+        let lit = |c: u8, s: f32| (f32::from(c) * s + 0.5).clamp(0.0, 255.0) as u8;
+        let [r, g, b, a] = texel;
+        if self.canvas.put_passed_at(
+            row.saturating_add(x as usize),
+            [lit(r, shade[0]), lit(g, shade[1]), lit(b, shade[2]), a],
+            z as i32,
+        ) {
+            self.expand(x as i32, y as i32);
+        }
+    }
+}
+
 /// Packs a texel's RGB channels to 16-bit 5-6-5 by truncation (verified in
 /// `Sims.exe`'s texture surface upload at `0x5ca0d3` / `0x5ca1f8` for
 /// indexed 8-bit skins and `0x5ca55f` for 24-bit BMPs → `0x5ca635` →
@@ -1360,6 +1492,30 @@ impl People {
         })
     }
 
+    /// Like [`People::draw_on_lot_in_viewport`], additionally populating
+    /// `written_rects` with the exact tight bounding rectangles `[x0, y0, x1, y1)`
+    /// of every pixel written for each drawn person and plumb bob.
+    pub fn draw_on_lot_in_viewport_tracked(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        viewport: (u32, u32),
+        canvas: &mut sims_render::Canvas,
+        written_rects: &mut Vec<sims_render::canvas::Rect>,
+    ) -> Drawn {
+        let depth = Depth::new(camera);
+        let mut tracked = TrackedLotCanvas::new(canvas, written_rects);
+        let drawn = self.draw_in_viewport(
+            world,
+            camera,
+            viewport,
+            &mut tracked,
+            |fine, elevation, level| depth.point(fine, elevation, level),
+        );
+        tracked.flush();
+        drawn
+    }
+
     /// Draws every placed person on the camera's levels into `target`,
     /// far to near. `depth` gives the target's depth for a point: its fine
     /// view position, elevation above its level in near-zoom pixels, and
@@ -1661,8 +1817,8 @@ mod tests {
             [200, 100, 50, sims_render::canvas::FAINT - 1],
             1.0,
         );
-        assert_eq!(canvas.color, vec![[100, 50, 25], [0, 0, 0]]);
-        assert_eq!(canvas.depth, vec![100, sims_render::depth::EMPTY]);
+        assert_eq!(canvas.color_rgb(), vec![[100, 50, 25], [0, 0, 0]]);
+        assert_eq!(canvas.depth, vec![100, sims_render::EMPTY_DEPTH]);
         // The pixel taken names the person; the one left out names nobody.
         assert_eq!([canvas.id_at(0, 0), canvas.id_at(1, 0)], [Some(5), None]);
     }
@@ -1697,7 +1853,7 @@ mod tests {
         // Untextured plumb bob modulated at full 255 without 5-6-5 packing.
         target.write_coloured(4, 0, 0.0, [255, 255, 255, 255], [0.5, 1.0, 0.25]);
         assert_eq!(
-            canvas.color,
+            canvas.color_rgb(),
             vec![
                 [206, 199, 49],
                 [206, 100, 25],
@@ -1932,8 +2088,8 @@ mod tests {
             Lighting::standard(Vec3::new(0.0, 0.0, 1.0), 1.0),
             |p| project_lot_vertex(&view, p, 1, &|_, _, _| 0.0),
         );
-        assert_eq!(unshifted.color[3 * 6 + 3], [0, 0, 0]);
-        assert_eq!(d3d6.color[3 * 6 + 3], [248, 252, 248]);
+        assert_eq!(unshifted.pixel_rgb(3, 3), [0, 0, 0]);
+        assert_eq!(d3d6.pixel_rgb(3, 3), [248, 252, 248]);
     }
 
     /// `draw_lot_part` culls counter-clockwise screen-space back faces so a
@@ -1993,7 +2149,7 @@ mod tests {
         let mut canvas = LotCanvas::new(8, 8, [0, 0, 0]);
         draw_lot_part(&mut canvas, &front, &skinned(100.0), lighting, &[], |p| p);
         draw_lot_part(&mut canvas, &back, &skinned(50.0), lighting, &[], |p| p);
-        assert_eq!(canvas.color[3 * 8 + 4], [200, 100, 50]);
+        assert_eq!(canvas.pixel_rgb(4, 3), [200, 100, 50]);
     }
 
     /// The light keeps its place relative to the viewer as the view

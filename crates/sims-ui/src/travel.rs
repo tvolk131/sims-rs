@@ -773,6 +773,10 @@ impl TravelChrome {
         self.hovered
     }
 
+    pub fn pressed(&self) -> Option<TravelControl> {
+        self.pressed
+    }
+
     /// Updates hover state for a pointer move at `(x, y)`.
     pub fn pointer_move(&mut self, x: i32, y: i32, layout: &TravelLayout) {
         self.pointer = [x, y];

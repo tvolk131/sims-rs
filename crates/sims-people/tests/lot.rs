@@ -475,7 +475,7 @@ fn the_lot_hides_the_people_behind_it() {
                     // real 16-bit depths (which `Canvas::put` clamps to
                     // `0..=65535`) so self-occlusion matches `on`.
                     let mut over = base.clone();
-                    over.depth.fill(sims_render::depth::EMPTY);
+                    over.depth.fill(sims_render::EMPTY_DEPTH);
                     people.draw_on_lot(&solo, &camera, &mut over);
                     // The feet: a band a few pixels above the point the
                     // person stands on.
@@ -573,7 +573,7 @@ fn a_person_upstairs_stands_on_the_upper_floor() {
     assert!(report.problems.is_empty(), "{:?}", report.problems);
     assert_eq!(report.people, 1);
     let mut over = base.clone();
-    over.depth.fill(sims_render::depth::EMPTY);
+    over.depth.fill(sims_render::EMPTY_DEPTH);
     people.draw_on_lot(&solo, &camera, &mut over);
     let [shown, laid] = [changed(&base, &on, None), changed(&base, &over, None)];
     assert!(laid > 200, "{laid}");
@@ -624,7 +624,7 @@ fn the_plumb_bob_floats_over_the_selected_persons_head() {
         assert!(drawn.problems.is_empty(), "{:?}", drawn.problems);
         let found: Vec<(i32, i32)> = pixels(&canvas)
             .filter(|&(x, y)| (400..470).contains(&x) && (50..130).contains(&y))
-            .filter(|&(x, y)| bob_green(canvas.color[y as usize * canvas.width + x as usize]))
+            .filter(|&(x, y)| bob_green(canvas.pixel_rgb(x as usize, y as usize)))
             .collect();
         (found, canvas)
     };
@@ -654,7 +654,7 @@ fn the_plumb_bob_floats_over_the_selected_persons_head() {
         let g: Vec<u32> = found
             .iter()
             .filter(|p| side(p.0))
-            .map(|&(x, y)| u32::from(canvas.color[y as usize * canvas.width + x as usize][1]))
+            .map(|&(x, y)| u32::from(canvas.pixel_rgb(x as usize, y as usize)[1]))
             .collect();
         g.iter().sum::<u32>() / g.len() as u32
     };
@@ -775,7 +775,12 @@ fn the_lamps_of_a_persons_room_light_them() {
     let sum = |canvas: &sims_render::Canvas| -> u64 {
         changed
             .iter()
-            .map(|&i| canvas.color[i].iter().map(|&c| u64::from(c)).sum::<u64>())
+            .map(|&i| {
+                sims_render::unpack_rgb(canvas.color[i])
+                    .iter()
+                    .map(|&c| u64::from(c))
+                    .sum::<u64>()
+            })
             .sum()
     };
     assert!(sum(&lit) > sum(&unlit) + changed.len() as u64 * 6);

@@ -2129,10 +2129,10 @@ impl Hud {
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
             u32::try_from(canvas.height).unwrap_or(u32::MAX),
         );
-        let mut frame = match Frame::from_rgb(width, height, std::mem::take(&mut canvas.color)) {
+        let mut frame = match Frame::from_packed(width, height, std::mem::take(&mut canvas.color)) {
             Ok(frame) => frame,
-            Err(rgb) => {
-                canvas.color = rgb;
+            Err(pixels) => {
+                canvas.color = pixels;
                 return;
             }
         };
@@ -2336,7 +2336,7 @@ impl Hud {
         if self.cheat_console.is_open() {
             self.cheat_console.draw(&mut frame, &self.art);
         }
-        canvas.color = frame.into_rgb();
+        canvas.color = frame.into_packed();
     }
 
     fn compute_options_saves_button_rect(&self, size: [i32; 2]) -> Option<Rect> {

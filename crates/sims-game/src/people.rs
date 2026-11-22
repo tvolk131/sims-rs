@@ -16,7 +16,7 @@
 
 use sims_formats::bitmap::Image;
 use sims_people::pie_head::{HeadPose, Look};
-use sims_render::{Camera, Canvas};
+use sims_render::{Camera, Canvas, clamp_depth, pack_rgb, unpack_rgb};
 use sims_sim::World;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -81,14 +81,14 @@ pub fn shade_pie_face_with_radius(
             let idx = row + x as usize;
             // 0x4ac8e7 passes threshold 0; 0x4aca76..0x4aca7a skips pixels
             // whose 16-bit depth is <= 0 (empty sky is EMPTY = 65535 > 0).
-            if canvas.depth[idx] <= 0 {
+            if canvas.depth[idx] == 0 {
                 continue;
             }
-            let pixel = &mut canvas.color[idx];
+            let [pr, pg, pb] = unpack_rgb(canvas.color[idx]);
             // 0x438ef6 unpacks 5-6-5 pixels with zero-filled low bits.
-            let r = i32::from(pixel[0] & 0xf8);
-            let g = i32::from(pixel[1] & 0xfc);
-            let b = i32::from(pixel[2] & 0xf8);
+            let r = i32::from(pr & 0xf8);
+            let g = i32::from(pg & 0xfc);
+            let b = i32::from(pb & 0xf8);
             let grey = (r + g + b) / 6 + 8;
             let (out_r, out_g, out_b) = if d2 <= inner2 {
                 (grey, grey, grey)
@@ -106,11 +106,11 @@ pub fn shade_pie_face_with_radius(
             let r5 = (out_r.clamp(0, 255) as u8) >> 3;
             let g6 = (out_g.clamp(0, 255) as u8) >> 2;
             let b5 = (out_b.clamp(0, 255) as u8) >> 3;
-            *pixel = [
+            canvas.color[idx] = pack_rgb([
                 (r5 << 3) | (r5 >> 2),
                 (g6 << 2) | (g6 >> 4),
                 (b5 << 3) | (b5 >> 2),
-            ];
+            ]);
         }
     }
 }
@@ -165,20 +165,22 @@ pub fn composite_pie_head(
             };
             let dx = (face_origin[0] + sx) as usize;
             let dst_idx = dst_row + dx;
-            if z > canvas.depth[dst_idx] {
+            if z > i32::from(canvas.depth[dst_idx]) {
                 continue;
             }
-            canvas.depth[dst_idx] = z;
-            let dst = &mut canvas.color[dst_idx];
+            canvas.depth[dst_idx] = clamp_depth(z);
             if a == 255 {
-                *dst = [head.rgba[p], head.rgba[p + 1], head.rgba[p + 2]];
+                canvas.color[dst_idx] =
+                    pack_rgb([head.rgba[p], head.rgba[p + 1], head.rgba[p + 2]]);
             } else {
                 let alpha = u16::from(a);
                 let inv = 255 - alpha;
-                for (channel, &src) in dst.iter_mut().zip(&head.rgba[p..p + 3]) {
+                let mut rgb = unpack_rgb(canvas.color[dst_idx]);
+                for (channel, &src) in rgb.iter_mut().zip(&head.rgba[p..p + 3]) {
                     *channel =
                         ((u16::from(src) * alpha + u16::from(*channel) * inv + 127) / 255) as u8;
                 }
+                canvas.color[dst_idx] = pack_rgb(rgb);
             }
         }
     }
@@ -372,6 +374,27 @@ impl People {
         self.note(drawn.problems);
     }
 
+    /// Like [`People::draw_in_viewport`], additionally recording the tight
+    /// screen bounding rectangles `[x0, y0, x1, y1)` of every pixel written
+    /// for each drawn person and plumb bob into `written_rects`.
+    pub fn draw_in_viewport_tracked(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        viewport: (u32, u32),
+        canvas: &mut Canvas,
+        written_rects: &mut Vec<sims_render::canvas::Rect>,
+    ) {
+        let drawn = self.people.draw_on_lot_in_viewport_tracked(
+            world,
+            camera,
+            viewport,
+            canvas,
+            written_rects,
+        );
+        self.note(drawn.problems);
+    }
+
     /// The head of `person` for the middle of the pie menu in neutral pose
     /// ([`People::head_looking`] with [`Look::neutral`]).
     pub fn head(&mut self, world: &World, person: u16, size: [u32; 2]) -> Result<Image, String> {
@@ -502,28 +525,28 @@ mod tests {
         // Drawn scene pixel (depth > 0), empty sky pixel (EMPTY = 65535 > 0),
         // and native threshold pixel (depth <= 0, skipped by 0x4aca76..0x4aca7a).
         canvas.depth[130 * 260 + 130] = 1000;
-        canvas.depth[130 * 260 + 131] = sims_render::depth::EMPTY;
+        canvas.depth[130 * 260 + 131] = sims_render::EMPTY_DEPTH;
         canvas.depth[130 * 260 + 132] = 0;
-        canvas.depth[130 * 260 + 133] = -5;
+        canvas.depth[130 * 260 + 133] = clamp_depth(-5);
         shade_pie_face(&mut canvas, [130, 130], (260, 200));
 
         // Inside inner radius 67 with depth > 0 (both drawn depth and EMPTY):
         // desaturated to grey = (200 + 120 + 40) / 6 + 8 = 68, quantized to
         // 5-6-5 with MSB bit-replication:
         // r5 = 68 >> 3 = 8 -> 66, g6 = 68 >> 2 = 17 -> 69, b5 = 8 -> 66.
-        assert_eq!(canvas.color[130 * 260 + 130], [66, 69, 66]);
-        assert_eq!(canvas.color[130 * 260 + 131], [66, 69, 66]);
+        assert_eq!(canvas.pixel_rgb(130, 130), [66, 69, 66]);
+        assert_eq!(canvas.pixel_rgb(131, 130), [66, 69, 66]);
         // Pixels with depth <= 0 are skipped.
-        assert_eq!(canvas.color[130 * 260 + 132], [200, 120, 40]);
-        assert_eq!(canvas.color[130 * 260 + 133], [200, 120, 40]);
+        assert_eq!(canvas.pixel_rgb(132, 130), [200, 120, 40]);
+        assert_eq!(canvas.pixel_rgb(133, 130), [200, 120, 40]);
         // Outer ring (d = 85): partway between desaturated grey and original.
-        let ring = canvas.color[130 * 260 + (130 + 85)];
+        let ring = canvas.pixel_rgb(130 + 85, 130);
         assert!(ring[0] > 66 && ring[0] < 200, "ring red {ring:?}");
         assert!(ring[2] < 66 && ring[2] > 40, "ring blue {ring:?}");
         // Outside radius 100: untouched.
-        assert_eq!(canvas.color[130 * 260 + (130 + 100)], [200, 120, 40]);
+        assert_eq!(canvas.pixel_rgb(130 + 100, 130), [200, 120, 40]);
         // Below viewport height 200 (even inside circle radius 100): untouched.
-        assert_eq!(canvas.color[205 * 260 + 130], [200, 120, 40]);
+        assert_eq!(canvas.pixel_rgb(130, 205), [200, 120, 40]);
     }
 
     #[test]
@@ -553,29 +576,29 @@ mod tests {
         canvas.depth[9 * 20 + 7] = 12_000;
         composite_pie_head(&mut canvas, [4, 9], &head, &depth, (20, 12));
         // Transparent pixel at (4, 9) leaves canvas untouched.
-        assert_eq!(canvas.color[9 * 20 + 4], [10, 20, 30]);
+        assert_eq!(canvas.pixel_rgb(4, 9), [10, 20, 30]);
         // Opaque pixels inside y < 12 with depth <= scene depth are written and
         // update the scene depth buffer.
-        assert_eq!(canvas.color[9 * 20 + 5], [200, 40, 20]);
+        assert_eq!(canvas.pixel_rgb(5, 9), [200, 40, 20]);
         assert_eq!(canvas.depth[9 * 20 + 5], 12_000);
         // Nearer foreground at (6, 9) rejects the head pixel; equal depth at (7, 9) passes.
-        assert_eq!(canvas.color[9 * 20 + 6], [10, 20, 30]);
+        assert_eq!(canvas.pixel_rgb(6, 9), [10, 20, 30]);
         assert_eq!(canvas.depth[9 * 20 + 6], 8_000);
-        assert_eq!(canvas.color[9 * 20 + 7], [200, 40, 20]);
-        assert_eq!(canvas.color[11 * 20 + 6], [5, 110, 15]);
+        assert_eq!(canvas.pixel_rgb(7, 9), [200, 40, 20]);
+        assert_eq!(canvas.pixel_rgb(6, 11), [5, 110, 15]);
         // Rows y >= 12 are clipped out of the house viewport.
         for y in 12..20 {
             for x in 0..20 {
-                assert_eq!(canvas.color[y * 20 + x], [10, 20, 30], "({x}, {y})");
+                assert_eq!(canvas.pixel_rgb(x, y), [10, 20, 30], "({x}, {y})");
             }
         }
 
         // Negative origin clips cleanly to x >= 0, y >= 0 without panicking.
         let mut edge = Canvas::new(10, 10, [10, 20, 30]);
         composite_pie_head(&mut edge, [-2, -2], &head, &depth, (10, 10));
-        assert_eq!(edge.color[0], [5, 110, 15]);
-        assert_eq!(edge.color[3 * 10 + 3], [200, 40, 20]);
-        assert_eq!(edge.color[4 * 10 + 4], [10, 20, 30]);
+        assert_eq!(edge.pixel_rgb(0, 0), [5, 110, 15]);
+        assert_eq!(edge.pixel_rgb(3, 3), [200, 40, 20]);
+        assert_eq!(edge.pixel_rgb(4, 4), [10, 20, 30]);
     }
 
     #[test]

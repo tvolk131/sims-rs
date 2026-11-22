@@ -166,9 +166,29 @@ enum ShellDialogKind {
 }
 
 /// Optional desktop host hook called immediately before blocking lot/travel
-/// transitions with the rendered native [`LoadingScreen`] RGB buffer, canvas
-/// size, and drained audio queue (starting [`MusicMode::Load`]).
-pub type LoadingPresenter = Box<dyn FnMut(&[[u8; 3]], [i32; 2], Vec<Input>) + Send>;
+/// transitions with the rendered native [`LoadingScreen`] packed `0x00RRGGBB`
+/// pixel buffer, canvas size, and drained audio queue (starting [`MusicMode::Load`]).
+pub type LoadingPresenter = Box<dyn FnMut(&[u32], [i32; 2], Vec<Input>) + Send>;
+
+/// Conservative invariant key for steady-state Neighborhood hover-fade frames
+/// where only dynamic lot rects changed on the cached map layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NeighborhoodSteadyKey {
+    size: [i32; 2],
+    slot: u8,
+    kind: NeighborhoodKind,
+    water_frame: usize,
+    pointer: Option<[i32; 2]>,
+    nbhd_state: NeighborhoodState,
+    travel_state: TravelState,
+    chrome_hovered: Option<sims_ui::neighborhood::BarButton>,
+    chrome_pressed: Option<sims_ui::neighborhood::BarButton>,
+    travel_hovered: Option<sims_ui::travel::TravelControl>,
+    travel_pressed: Option<sims_ui::travel::TravelControl>,
+    pressed_lot_id: Option<u16>,
+    magic_family_bin_hovered: bool,
+    magic_family_bin_pressed: bool,
+}
 
 /// Maximum number of full-resolution album images kept hydrated around the
 /// currently selected page (well under `PhotoAlbumStore`'s 32 MiB bulk limit).
@@ -617,6 +637,11 @@ pub struct NeighborhoodShell {
 
     // Pending sound inputs to be drained by the host.
     audio_queue: Vec<Input>,
+
+    // Safe partial-damage tracking for steady-state Neighborhood hover fades.
+    prev_nb_steady_key: Option<NeighborhoodSteadyKey>,
+    prev_nb_dynamic_rects: Vec<sims_render::canvas::Rect>,
+    present_damage: Option<Vec<sims_render::canvas::Rect>>,
 }
 
 impl NeighborhoodShell {
@@ -961,6 +986,9 @@ impl NeighborhoodShell {
             coop_iroh_config: sims_net::IrohConfig::P2pDefault,
             note: startup_note,
             audio_queue,
+            prev_nb_steady_key: None,
+            prev_nb_dynamic_rects: Vec::new(),
+            present_damage: None,
         };
         let active_trips = shell.inspect_any_active_trips();
         if !active_trips.is_empty() && shell.note.is_none() {
@@ -1087,7 +1115,7 @@ impl NeighborhoodShell {
         self.loading_screen
             .draw(&mut frame, state, &self.loading_art, &self.loading_strings);
         let mut canvas = Canvas::new(w as usize, h as usize, [0, 0, 0]);
-        canvas.color = frame.into_rgb();
+        canvas.color = frame.into_packed();
         canvas
     }
 
@@ -1746,17 +1774,65 @@ impl NeighborhoodShell {
         }
     }
 
+    /// Canvas-space dirty rects accumulated since the last successful window
+    /// present, or `None` when a full blit/present is required.
+    pub fn peek_present_damage(&self) -> Option<&[sims_render::canvas::Rect]> {
+        if self.save_manager.is_open()
+            || self.album_dialog.is_open()
+            || self.travel_dialog_state.is_some()
+        {
+            return None;
+        }
+        match &self.screen {
+            ActiveScreen::Lot(session) => session.game.peek_present_damage(),
+            ActiveScreen::Neighborhood => self.present_damage.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Marks the active screen's current canvas as successfully presented to
+    /// the window backbuffer.
+    pub fn on_presented(&mut self) {
+        if self.save_manager.is_open()
+            || self.album_dialog.is_open()
+            || self.travel_dialog_state.is_some()
+        {
+            self.present_damage = None;
+            if let ActiveScreen::Lot(session) = &mut self.screen {
+                session.game.invalidate_present_damage();
+            }
+            return;
+        }
+        match &mut self.screen {
+            ActiveScreen::Lot(session) => {
+                session.game.on_presented();
+                self.present_damage = None;
+            }
+            ActiveScreen::Neighborhood => {
+                self.present_damage = Some(Vec::new());
+            }
+            _ => {
+                self.present_damage = None;
+            }
+        }
+    }
+
     pub fn render(&mut self) {
         if let ActiveScreen::Lot(session) = &mut self.screen {
+            self.prev_nb_steady_key = None;
+            self.prev_nb_dynamic_rects.clear();
+            self.present_damage = None;
             session.game.render();
             let has_overlay = self.save_manager.is_open()
                 || self.album_dialog.is_open()
                 || self.travel_dialog_state.is_some();
             if has_overlay {
+                session.game.invalidate_present_damage();
                 let lot_canvas = session.game.canvas();
                 let w = lot_canvas.width;
                 let h = lot_canvas.height;
-                if let Ok(mut frame) = Frame::from_rgb(w as u32, h as u32, lot_canvas.color.clone())
+                if let Ok(mut frame) =
+                    Frame::from_packed(w as u32, h as u32, lot_canvas.color.clone())
                 {
                     if self.album_dialog.is_open()
                         && let Some(snapshot) = &self.album_snapshot
@@ -1779,7 +1855,7 @@ impl NeighborhoodShell {
                             .draw(&mut frame, snapshot, &self.save_manager_art);
                     }
                     let mut composed = Canvas::new(w, h, [0, 0, 0]);
-                    composed.color = frame.into_rgb();
+                    composed.color = frame.into_packed();
                     self.canvas = composed;
                 }
             }
@@ -1793,17 +1869,20 @@ impl NeighborhoodShell {
 
         match &mut self.screen {
             ActiveScreen::Loading(state) => {
-                let rgb = std::mem::take(&mut self.canvas.color);
-                if let Ok(mut frame) = Frame::from_rgb(w as u32, h as u32, rgb) {
+                self.prev_nb_steady_key = None;
+                self.prev_nb_dynamic_rects.clear();
+                self.present_damage = None;
+                let packed = std::mem::take(&mut self.canvas.color);
+                if let Ok(mut frame) = Frame::from_packed(w as u32, h as u32, packed) {
                     self.loading_screen.draw(
                         &mut frame,
                         state,
                         &self.loading_art,
                         &self.loading_strings,
                     );
-                    self.canvas.color = frame.into_rgb();
+                    self.canvas.color = frame.into_packed();
                 } else {
-                    self.canvas.color = vec![[0, 0, 0]; w * h];
+                    self.canvas.color = vec![0u32; w * h];
                 }
             }
             ActiveScreen::Neighborhood => {
@@ -1852,9 +1931,9 @@ impl NeighborhoodShell {
                         opts.lot_roof_fades.insert(lot, 1.0);
                     }
                 }
-                self.map.render_into(&mut self.canvas, &opts);
-                let rgb = std::mem::take(&mut self.canvas.color);
-                if let Ok(mut frame) = Frame::from_rgb(w as u32, h as u32, rgb) {
+                let map_damage = self.map.render_into_with_damage(&mut self.canvas, &opts);
+                let packed = std::mem::take(&mut self.canvas.color);
+                if let Ok(mut frame) = Frame::from_packed(w as u32, h as u32, packed) {
                     if is_travel_map {
                         self.travel_chrome.draw(
                             &mut frame,
@@ -1894,14 +1973,57 @@ impl NeighborhoodShell {
                         self.save_manager
                             .draw(&mut frame, snapshot, &self.save_manager_art);
                     }
-                    self.canvas.color = frame.into_rgb();
+                    self.canvas.color = frame.into_packed();
                 } else {
-                    self.canvas.color = vec![[0, 0, 0]; w * h];
+                    self.canvas.color = vec![0u32; w * h];
                 }
+
+                let steady_eligible = map_damage.is_some()
+                    && !self.debug
+                    && self.dialog.is_none()
+                    && !self.album_dialog.is_open()
+                    && self.travel_dialog_state.is_none()
+                    && !self.save_manager.is_open()
+                    && !self.coop_lobby.is_open()
+                    && opts.active_filter.is_none()
+                    && !opts.show_occupancy_markers;
+                let cur_key = steady_eligible.then(|| NeighborhoodSteadyKey {
+                    size: self.size,
+                    slot: self.slot,
+                    kind: self.kind,
+                    water_frame: self.water_frame,
+                    pointer: self.pointer,
+                    nbhd_state: self.nbhd_state.clone(),
+                    travel_state: self.travel_state.clone(),
+                    chrome_hovered: self.chrome.hovered(),
+                    chrome_pressed: self.chrome.pressed(),
+                    travel_hovered: self.travel_chrome.hovered(),
+                    travel_pressed: self.travel_chrome.pressed(),
+                    pressed_lot_id: self.pressed_lot_id,
+                    magic_family_bin_hovered: self.magic_family_bin_hovered,
+                    magic_family_bin_pressed: self.magic_family_bin_pressed,
+                });
+                let cur_rects = map_damage.unwrap_or_default();
+                if cur_key.is_some() && self.prev_nb_steady_key == cur_key {
+                    if let Some(dmg) = &mut self.present_damage {
+                        dmg.extend_from_slice(&self.prev_nb_dynamic_rects);
+                        dmg.extend_from_slice(&cur_rects);
+                        if dmg.len() > 32 {
+                            self.present_damage = None;
+                        }
+                    }
+                } else {
+                    self.present_damage = None;
+                }
+                self.prev_nb_dynamic_rects = cur_rects;
+                self.prev_nb_steady_key = cur_key;
             }
             ActiveScreen::FamilyBin => {
-                let rgb = std::mem::take(&mut self.canvas.color);
-                if let Ok(mut frame) = Frame::from_rgb(w as u32, h as u32, rgb) {
+                self.prev_nb_steady_key = None;
+                self.prev_nb_dynamic_rects.clear();
+                self.present_damage = None;
+                let packed = std::mem::take(&mut self.canvas.color);
+                if let Ok(mut frame) = Frame::from_packed(w as u32, h as u32, packed) {
                     let view = self.family_bin_view();
                     self.family_bin.draw(
                         &mut frame,
@@ -1910,14 +2032,17 @@ impl NeighborhoodShell {
                         &self.dialogs.family_bin,
                     );
                     self.draw_overlay_note_and_dialog(&mut frame);
-                    self.canvas.color = frame.into_rgb();
+                    self.canvas.color = frame.into_packed();
                 } else {
-                    self.canvas.color = vec![[0, 0, 0]; w * h];
+                    self.canvas.color = vec![0u32; w * h];
                 }
             }
             ActiveScreen::CreateFamily(caf) => {
-                let rgb = std::mem::take(&mut self.canvas.color);
-                if let Ok(mut frame) = Frame::from_rgb(w as u32, h as u32, rgb) {
+                self.prev_nb_steady_key = None;
+                self.prev_nb_dynamic_rects.clear();
+                self.present_damage = None;
+                let packed = std::mem::take(&mut self.canvas.color);
+                if let Ok(mut frame) = Frame::from_packed(w as u32, h as u32, packed) {
                     caf.draw(&mut frame);
                     if self.debug
                         && let Some(note) = caf.note().or(self.note.as_deref())
@@ -1930,9 +2055,9 @@ impl NeighborhoodShell {
                         frame.fill(Rect::new(0, 0, frame.width() as i32, bar_h), [96, 24, 24]);
                         font.draw(&mut frame, note, [8, 3], [255, 255, 255]);
                     }
-                    self.canvas.color = frame.into_rgb();
+                    self.canvas.color = frame.into_packed();
                 } else {
-                    self.canvas.color = vec![[0, 0, 0]; w * h];
+                    self.canvas.color = vec![0u32; w * h];
                 }
             }
             ActiveScreen::Lot(_) => unreachable!(),
@@ -7029,7 +7154,7 @@ fn capture_canvas_to_album_image(canvas: &Canvas) -> Result<AlbumImage, String> 
         let sy = (y * canvas.height / th).min(canvas.height - 1);
         for x in 0..tw {
             let sx = (x * canvas.width / tw).min(canvas.width - 1);
-            let [r, g, b] = canvas.color[sy * canvas.width + sx];
+            let [r, g, b] = sims_render::unpack_rgb(canvas.color[sy * canvas.width + sx]);
             rgba.extend_from_slice(&[r, g, b, 255]);
         }
     }
@@ -7791,10 +7916,10 @@ fn downsample_canvas_to_565(canvas: &Canvas, tw: usize, th: usize) -> Surface565
         for x in 0..tw {
             let sx = (x * canvas.width / tw).min(canvas.width - 1);
             let idx = sy * canvas.width + sx;
-            if canvas.depth[idx] == sims_render::depth::EMPTY {
+            if canvas.depth[idx] == sims_render::EMPTY_DEPTH {
                 continue;
             }
-            let px = pack_565(canvas.color[idx]);
+            let px = pack_565(sims_render::unpack_rgb(canvas.color[idx]));
             surf.pixels[y * tw + x] = if px == COLOR_KEY_565 { px ^ 1 } else { px };
         }
     }

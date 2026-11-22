@@ -780,10 +780,14 @@ fn lot_cache_matches_uncached_across_house05_states_and_mutations() {
     );
     {
         let mut padded_cached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
-        padded_cached.color.push([0x11, 0x22, 0x33]);
+        padded_cached
+            .color
+            .push(sims_render::pack_rgb([0x11, 0x22, 0x33]));
         padded_cached.depth.push(42);
         let mut padded_uncached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
-        padded_uncached.color.push([0x11, 0x22, 0x33]);
+        padded_uncached
+            .color
+            .push(sims_render::pack_rgb([0x11, 0x22, 0x33]));
         padded_uncached.depth.push(42);
         let s_cached = cache.draw_lot_with_preview(
             &world,
@@ -816,10 +820,14 @@ fn lot_cache_matches_uncached_across_house05_states_and_mutations() {
     cache.clear();
     {
         let mut padded_miss = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
-        padded_miss.color.push([0x44, 0x55, 0x66]);
+        padded_miss
+            .color
+            .push(sims_render::pack_rgb([0x44, 0x55, 0x66]));
         padded_miss.depth.push(99);
         let mut uncached_miss = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
-        uncached_miss.color.push([0x44, 0x55, 0x66]);
+        uncached_miss
+            .color
+            .push(sims_render::pack_rgb([0x44, 0x55, 0x66]));
         uncached_miss.depth.push(99);
         let s_cached = cache.draw_lot_with_preview(
             &world,
@@ -884,8 +892,8 @@ fn lot_cache_matches_uncached_across_house05_states_and_mutations() {
                 let mut cached = Canvas::new(zw, zh, [0xaa, 0xbb, 0xcc]);
                 let mut uncached = Canvas::new(zw, zh, [0xaa, 0xbb, 0xcc]);
                 if padded {
-                    cached.color.push([1, 2, 3]);
-                    uncached.color.push([1, 2, 3]);
+                    cached.color.push(sims_render::pack_rgb([1, 2, 3]));
+                    uncached.color.push(sims_render::pack_rgb([1, 2, 3]));
                 }
                 let sc = zcache.draw_lot_with_preview(
                     &world,
@@ -1464,10 +1472,14 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         world.objects.get(&anim_id).unwrap().data[0].wrapping_add(1);
     {
         let mut padded_cached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
-        padded_cached.color.push([0x11, 0x22, 0x33]);
+        padded_cached
+            .color
+            .push(sims_render::pack_rgb([0x11, 0x22, 0x33]));
         padded_cached.depth.push(42);
         let mut padded_uncached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
-        padded_uncached.color.push([0x11, 0x22, 0x33]);
+        padded_uncached
+            .color
+            .push(sims_render::pack_rgb([0x11, 0x22, 0x33]));
         padded_uncached.depth.push(42);
         let sc = cache.draw_lot_with_preview(
             &world,

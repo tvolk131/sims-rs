@@ -201,7 +201,7 @@ fn people_stand_where_a_click_finds_them() {
     // Behind a lot nearer than everyone, nobody is drawn, and a click
     // where they stand finds nobody.
     let mut covered = Canvas::new(800, 600, [0, 0, 0]);
-    covered.depth.fill(i32::MIN);
+    covered.depth.fill(0);
     people.draw(world, camera, &mut covered);
     let covered = covered.ids();
     for &point in changed.iter().step_by(7) {
@@ -945,7 +945,7 @@ impl Thumbnails {
                 )
                 .unwrap();
             assert_eq!(
-                canvas.color[y * canvas.width + x],
+                canvas.pixel_rgb(x, y),
                 [r, g, b],
                 "type 0x{guid:08X} at ({dx}, {dy})"
             );
@@ -5862,7 +5862,7 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     game.render();
     assert_eq!(game.run(60), 60);
     game.render();
-    let live_top350: Vec<[u8; 3]> = game.canvas().color[..800 * 350].to_vec();
+    let live_top350: Vec<u32> = game.canvas().color[..800 * 350].to_vec();
     // Clicking the lot in Build or Options mode (`0x4cea5d`) must NOT open a
     // Live Mode pie menu or mutate simulation state.
     for non_live in [Mode::Build, Mode::Options] {
@@ -5882,11 +5882,11 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     // unfloored buildable terrain immediately (`0x4ce44f` -> `0x4c4222`,
     // `0x4c42f0`, `0x4c37f2`), even before selecting an item.
     game.render();
-    let buy_top350: Vec<[u8; 3]> = game.canvas().color[..800 * 350].to_vec();
+    let buy_top350: Vec<u32> = game.canvas().color[..800 * 350].to_vec();
     let added_grid_pixels = live_top350
         .iter()
         .zip(buy_top350.iter())
-        .filter(|&(before, after)| *before != [0, 0, 0] && *after == [0, 0, 0])
+        .filter(|&(before, after)| *before != 0 && *after == 0)
         .count();
     assert!(
         added_grid_pixels > 500,
@@ -6267,7 +6267,7 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
         for x in 0..canvas.width as i32 {
             if canvas.id_at(x, y) == Some(blocked_cur.held) {
                 drew_held += 1;
-                let [r, g, b] = canvas.color[y as usize * canvas.width + x as usize];
+                let [r, g, b] = canvas.pixel_rgb(x as usize, y as usize);
                 if r > g + 20 && r > b + 20 && (i32::from(g) - i32::from(b)).abs() <= 4 {
                     exact_red_gray += 1;
                 }
@@ -6399,7 +6399,7 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
     let rating_pixels = (rating_band_top..rating_band_bottom)
         .flat_map(|y| (popup.rect.x + 178..popup.rect.x + popup.rect.width).map(move |x| (x, y)))
         .filter(|&(x, y)| {
-            let [r, g, b] = canvas.color[y as usize * canvas.width + x as usize];
+            let [r, g, b] = canvas.pixel_rgb(x as usize, y as usize);
             r > 120 && g > 110 && r > b
         })
         .count();
@@ -6562,9 +6562,9 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
     let mut portrait_max_y = 0;
     let mut portrait_pixels = 0usize;
     for y in 505..597 {
-        let bg = canvas.color[y as usize * canvas.width + 245];
+        let bg = canvas.pixel_rgb(245, y as usize);
         for x in 252..390 {
-            let [r, g, b] = canvas.color[y as usize * canvas.width + x as usize];
+            let [r, g, b] = canvas.pixel_rgb(x as usize, y as usize);
             let diff =
                 r.abs_diff(bg[0]) as u32 + g.abs_diff(bg[1]) as u32 + b.abs_diff(bg[2]) as u32;
             if diff > 45 {
@@ -6592,7 +6592,7 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
     let mut prompt_text_pixels = 0usize;
     for y in 505..595 {
         for x in 395..780 {
-            let [r, g, b] = canvas.color[y as usize * canvas.width + x as usize];
+            let [r, g, b] = canvas.pixel_rgb(x as usize, y as usize);
             if r > 180 && g > 180 && b > 200 {
                 prompt_text_pixels += 1;
                 text_min_x = text_min_x.min(x);
@@ -8130,7 +8130,8 @@ fn pie_head_is_clipped_to_house_viewport_above_the_bottom_strip() {
                 continue;
             }
             let idx = dy as usize * 800 + dx as usize;
-            let expected_head = [head.rgba[p], head.rgba[p + 1], head.rgba[p + 2]];
+            let expected_head =
+                sims_render::pack_rgb([head.rgba[p], head.rgba[p + 1], head.rgba[p + 2]]);
             if frame[idx] == expected_head {
                 drawn_above += 1;
             }
@@ -8351,7 +8352,11 @@ fn pie_submenu_keeps_parent_head_frozen_and_draws_submenu_labels_above_it() {
             if sub_head.rgba[p + 3] != 255 {
                 continue;
             }
-            let head_rgb = [sub_head.rgba[p], sub_head.rgba[p + 1], sub_head.rgba[p + 2]];
+            let head_rgb = sims_render::pack_rgb([
+                sub_head.rgba[p],
+                sub_head.rgba[p + 1],
+                sub_head.rgba[p + 2],
+            ]);
             let actual = sub_frame[dy as usize * 800 + dx as usize];
             if about.contains(dx, dy) {
                 head_under_about += 1;
@@ -8474,20 +8479,21 @@ fn pie_head_respects_house_depth_buffer_lessequal() {
     );
 
     // 1. Foreground scene nearer than every head vertex rejects all 1,940 pixels.
+    let bg_px = sims_render::pack_rgb([1, 2, 3]);
     let fg_depth = sims_render::depth::Depth::new(&game.view.camera).grass([62, 62], 200);
     assert!(fg_depth < min_d, "fg_depth={fg_depth} min_d={min_d}");
     let mut fg_canvas = Canvas::new(800, 500, [1, 2, 3]);
-    fg_canvas.depth.fill(fg_depth);
+    fg_canvas.depth.fill(sims_render::clamp_depth(fg_depth));
     sims_game::people::composite_pie_head(&mut fg_canvas, origin, head, head_depth, (800, 500));
-    let fg_written = fg_canvas.color.iter().filter(|p| **p != [1, 2, 3]).count();
+    let fg_written = fg_canvas.color.iter().filter(|p| **p != bg_px).count();
     assert_eq!(fg_written, 0, "nearer foreground must occlude the pie head");
 
     // 2. Mid-head depth draws only the nearer half of visible pixels (z <= mid_d).
     let mid_d = (min_d + max_d) / 2;
     let mut mid_canvas = Canvas::new(800, 500, [1, 2, 3]);
-    mid_canvas.depth.fill(mid_d);
+    mid_canvas.depth.fill(sims_render::clamp_depth(mid_d));
     sims_game::people::composite_pie_head(&mut mid_canvas, origin, head, head_depth, (800, 500));
-    let mid_written = mid_canvas.color.iter().filter(|p| **p != [1, 2, 3]).count();
+    let mid_written = mid_canvas.color.iter().filter(|p| **p != bg_px).count();
     let expected_mid = opaque_depths.iter().filter(|&&d| d <= mid_d).count();
     assert!(expected_mid > 500 && expected_mid < 1_940);
     assert_eq!(mid_written, expected_mid);
@@ -8495,12 +8501,12 @@ fn pie_head_respects_house_depth_buffer_lessequal() {
     // 3. Empty/far scene depth draws all 1,940 pixels and updates canvas.depth.
     let mut far_canvas = Canvas::new(800, 500, [1, 2, 3]);
     sims_game::people::composite_pie_head(&mut far_canvas, origin, head, head_depth, (800, 500));
-    let far_written = far_canvas.color.iter().filter(|p| **p != [1, 2, 3]).count();
+    let far_written = far_canvas.color.iter().filter(|p| **p != bg_px).count();
     assert_eq!(far_written, 1_940);
     let updated_depths = far_canvas
         .depth
         .iter()
-        .filter(|&&d| d != sims_render::depth::EMPTY)
+        .filter(|&&d| d != sims_render::EMPTY_DEPTH)
         .count();
     assert_eq!(updated_depths, 1_940);
 }
