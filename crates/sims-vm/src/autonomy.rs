@@ -557,13 +557,17 @@ impl Machine<'_, '_> {
         saved: &mut Option<Vec<i16>>,
         candidates: &mut Vec<Candidate>,
     ) -> Result<(), Trap> {
+        let mut maybe_mutated = false;
         for &id in ids {
-            if !self.world.objects.keys().copied().eq(ids.iter().copied()) {
-                return Err(Trap::Unsupported(
-                    "a check tree made or removed an object during Find Best Interaction's \
-                     scan"
-                        .into(),
-                ));
+            if maybe_mutated {
+                if !self.world.objects.keys().copied().eq(ids.iter().copied()) {
+                    return Err(Trap::Unsupported(
+                        "a check tree made or removed an object during Find Best Interaction's \
+                         scan"
+                            .into(),
+                    ));
+                }
+                maybe_mutated = false;
             }
             let object = &self.world.objects[&id];
             let words = self.definition_words(object.guid)?;
@@ -585,6 +589,7 @@ impl Machine<'_, '_> {
             let zero = words[TYPE] == 7;
             let distance = distance(position, object.position, zero).to_f32();
             for entry in entries {
+                maybe_mutated = true;
                 let allows = self.autonomy_allows(chooser, entry, saved)?;
                 let Some(ads) = allows else {
                     continue;
@@ -593,14 +598,11 @@ impl Machine<'_, '_> {
                 let factor = (one
                     / ((entry.attenuation.ext() * distance.ext()).single() + one).single())
                 .to_f32();
-                let words = &self.me()?.person.as_ref().map(|p| p.data.clone());
-                let words = words.as_deref().unwrap_or(&[]);
-                let motives = self
-                    .me()?
-                    .person
-                    .as_ref()
-                    .map(|p| p.motives.map(F32::from_f32))
-                    .unwrap_or([F32::ZERO; 16]);
+                let me = self.me()?;
+                let (words, motives) = match me.person.as_ref() {
+                    Some(p) => (p.data.as_slice(), p.motives.map(F32::from_f32)),
+                    None => (&[][..], [F32::ZERO; 16]),
+                };
                 let prospective = score(curves, &motives, words, Some(&ads))?;
                 if matches!(
                     prospective.partial_cmp(&Ext::ZERO),

@@ -22,6 +22,7 @@
 
 pub mod animator;
 pub mod characters;
+mod cow;
 mod error;
 pub mod grass;
 pub mod head;
@@ -36,6 +37,7 @@ mod snapshot;
 pub mod speed;
 mod world;
 
+pub use cow::{CowBox, CowMap};
 pub use error::Error;
 pub use snapshot::{FORMAT as SNAPSHOT_FORMAT, ReadOnlySnapshots, Snapshots};
 pub use world::{
