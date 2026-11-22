@@ -15,7 +15,7 @@
 //! "People's meshes go into the lot renderer's canvas").
 
 use sims_formats::bitmap::Image;
-use sims_people::pie_head::Look;
+use sims_people::pie_head::{HeadPose, Look};
 use sims_render::{Camera, Canvas};
 use sims_sim::World;
 use std::collections::BTreeMap;
@@ -35,20 +35,31 @@ pub const PIE_SHADE_RADIUS: i32 = 100;
 /// `0x438ef6` does); between `67` and `100` it blends linearly in squared
 /// distance back to the original colour and quantizes to 5-6-5 (`0x49f0ae`).
 pub fn shade_pie_face(canvas: &mut Canvas, center: [i32; 2], viewport: (u32, u32)) {
+    shade_pie_face_with_radius(canvas, center, PIE_SHADE_RADIUS, viewport);
+}
+
+/// Like [`shade_pie_face`], with an explicit animated `radius` in pixels
+/// (`0..=PIE_SHADE_RADIUS`, matching `PieAnimState::backdrop` during the
+/// 400 ms pop-in and submenu center/radius glide).
+pub fn shade_pie_face_with_radius(
+    canvas: &mut Canvas,
+    center: [i32; 2],
+    radius: i32,
+    viewport: (u32, u32),
+) {
     let vp_w = i32::try_from(viewport.0)
         .unwrap_or(i32::MAX)
         .min(canvas.width as i32);
     let vp_h = i32::try_from(viewport.1)
         .unwrap_or(i32::MAX)
         .min(canvas.height as i32);
-    if vp_w <= 0 || vp_h <= 0 {
+    if vp_w <= 0 || vp_h <= 0 || radius <= 0 {
         return;
     }
-    let radius = PIE_SHADE_RADIUS;
     let r2 = radius * radius;
     let inner = radius - radius / 3;
     let inner2 = inner * inner;
-    let span = r2 - inner2;
+    let span = (r2 - inner2).max(1);
     let x0 = center[0].saturating_sub(radius).max(0);
     let y0 = center[1].saturating_sub(radius).max(0);
     let x1 = center[0].saturating_add(radius).min(vp_w);
@@ -412,6 +423,54 @@ impl People {
             zoom,
             look,
         )?;
+        Ok((
+            drawn.origin,
+            Image {
+                width: drawn.canvas.width,
+                height: drawn.canvas.height,
+                rgba: drawn.canvas.rgba,
+            },
+            drawn.depth,
+        ))
+    }
+
+    /// Renders `person`'s pie-menu 3D head using an animated [`HeadPose`] from
+    /// [`sims_people::pie_head::PieAnimState::head_pose`] (`0x4625ae`–`0x462822`).
+    pub fn head_in_viewport_pose(
+        &mut self,
+        world: &World,
+        person: u16,
+        viewport: (u32, u32),
+        center: [i32; 2],
+        zoom: sims_render::Zoom,
+        pose: HeadPose,
+    ) -> Result<([i32; 2], Image, Vec<i32>), String> {
+        self.refresh(world);
+        if pose.scale <= 0.0 {
+            return Ok((
+                center,
+                Image {
+                    width: 0,
+                    height: 0,
+                    rgba: Vec::new(),
+                },
+                Vec::new(),
+            ));
+        }
+        let (posed, problems) = self.people.posed(world, i32::MAX);
+        let body = posed
+            .iter()
+            .find(|p| p.id == person)
+            .map(|p| p.body)
+            .ok_or_else(|| format!("person {person} has no loaded body"))?;
+        let drawn = sims_people::pie_head::draw_body_in_viewport_pose(
+            body,
+            [viewport.0, viewport.1],
+            center,
+            zoom,
+            pose,
+        )?;
+        self.note(problems);
         Ok((
             drawn.origin,
             Image {

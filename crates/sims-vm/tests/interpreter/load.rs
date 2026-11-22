@@ -326,7 +326,7 @@ fn every_catalog_definition_must_be_linked() {
 fn resize(fx: &mut Fixture) -> Result<Vec<u16>, sims_vm::Fault> {
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     interpreter.resize(&mut fx.world).map(|done| {
-        assert_eq!(done.removed, []);
+        assert_eq!(done.removed, [0u16; 0]);
         done.created
     })
 }

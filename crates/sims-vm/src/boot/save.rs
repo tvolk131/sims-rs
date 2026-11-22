@@ -24,18 +24,27 @@
 //! which is not ported.
 
 use super::Lot;
-use crate::Answers;
+use crate::{Answer, Answers};
 use serde::{Deserialize, Serialize};
-use sims_sim::{PersonOutfit, PortraitFile, World};
-use std::collections::{BTreeMap, BTreeSet};
+use sims_sim::{
+    MigrationError, MigrationRegistry, MigrationReport, MigrationStep, PersonOutfit, PortraitFile,
+    World, decode_postcard_exact,
+};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// Earliest [`Saved::encode`] layout version supported by the explicit forward
+/// schema migration chain ([`SAVED_MIGRATIONS`]: `6 -> 7 -> 8`).
+pub const MIN_FORMAT: u32 = 6;
 
 /// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
 /// their order and their types (postcard is not self-describing). Bump it
 /// in the commit that changes any of them. The world inside is versioned
-/// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. A save of
-/// another version is refused, not migrated. Layout 2 keeps each pending
-/// dialog answer's bitmap ID ([`crate::Answer`]); layout 3 kept the
-/// pre-resolved house view centre; layout 4 keeps the house file's saved
+/// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. Formats in
+/// [`MIN_FORMAT`]..=[`FORMAT`] (`6..=8`) with matching [`sims_sim::SNAPSHOT_FORMAT`]
+/// are upgraded deterministically through [`SAVED_MIGRATIONS`]; older (`< 6`),
+/// future (`> 8`), or mismatched world-format saves are refused cleanly. Layout 2
+/// keeps each pending dialog answer's bitmap ID ([`crate::Answer`]); layout 3
+/// kept the pre-resolved house view centre; layout 4 keeps the house file's saved
 /// floor rotation baseline (`HOUS 0` `camera_direction & 3`); layout 5
 /// keeps the view-rotated screen-centre tile pick (`0x4a7b58` cut via
 /// `0x433067`) and any frozen dialog-replay view; layout 6 keeps each
@@ -48,6 +57,172 @@ use std::collections::{BTreeMap, BTreeSet};
 /// layout 8 keeps the unencoded auxiliary portrait, outfit, lazy-index,
 /// and scratch-pointer tables omitted from [`World::encode`].
 pub const FORMAT: u32 = 8;
+
+/// Historical `Answers` layout in [`Saved`] format 6 (before `choices_after`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnswersV6 {
+    queue: VecDeque<Answer>,
+    include_single_button: bool,
+}
+
+/// Historical [`Saved`] layout 6 (before `Answers::choices_after`,
+/// `deletion_epoch`, and the format-8 auxiliary tables).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedV6 {
+    world: World,
+    ticks: u32,
+    start: u32,
+    answers: AnswersV6,
+    fresh: BTreeSet<u16>,
+    view_rotation: u8,
+    answered: bool,
+    house: u32,
+    family: u16,
+    loaded: [u8; 32],
+    view_centre: Option<[i8; 2]>,
+    floor_rotation: u8,
+    replay_view: Option<(u8, Option<[i8; 2]>)>,
+    last_dialog_text: String,
+    character_names: BTreeMap<u32, String>,
+    lot_name: String,
+    lot_description: String,
+}
+
+/// Historical [`Saved`] layout 7 (added `Answers::choices_after` and
+/// `deletion_epoch`, before the format-8 auxiliary tables).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedV7 {
+    world: World,
+    ticks: u32,
+    start: u32,
+    answers: Answers,
+    fresh: BTreeSet<u16>,
+    view_rotation: u8,
+    answered: bool,
+    house: u32,
+    family: u16,
+    loaded: [u8; 32],
+    view_centre: Option<[i8; 2]>,
+    floor_rotation: u8,
+    replay_view: Option<(u8, Option<[i8; 2]>)>,
+    last_dialog_text: String,
+    character_names: BTreeMap<u32, String>,
+    lot_name: String,
+    lot_description: String,
+    deletion_epoch: u64,
+}
+
+fn migrate_v6_to_v7(record: &str, body: &[u8]) -> Result<Vec<u8>, MigrationError> {
+    let mut v6: SavedV6 = decode_postcard_exact(record, 6, body)?;
+    let answers = if v6.answers.include_single_button {
+        Answers::replay(v6.answers.queue.make_contiguous())
+    } else {
+        let mut a = Answers::default();
+        a.queue = v6.answers.queue;
+        a
+    };
+    let v7 = SavedV7 {
+        world: v6.world,
+        ticks: v6.ticks,
+        start: v6.start,
+        answers,
+        fresh: v6.fresh,
+        view_rotation: v6.view_rotation,
+        answered: v6.answered,
+        house: v6.house,
+        family: v6.family,
+        loaded: v6.loaded,
+        view_centre: v6.view_centre,
+        floor_rotation: v6.floor_rotation,
+        replay_view: v6.replay_view,
+        last_dialog_text: v6.last_dialog_text,
+        character_names: v6.character_names,
+        lot_name: v6.lot_name,
+        lot_description: v6.lot_description,
+        deletion_epoch: 0,
+    };
+    postcard::to_allocvec(&v7).map_err(|error| MigrationError::StepFailed {
+        record: record.to_owned(),
+        from: 6,
+        to: 7,
+        detail: error.to_string(),
+    })
+}
+
+fn migrate_v7_to_v8(record: &str, body: &[u8]) -> Result<Vec<u8>, MigrationError> {
+    let v7: SavedV7 = decode_postcard_exact(record, 7, body)?;
+    let v8 = Saved {
+        world: v7.world,
+        ticks: v7.ticks,
+        start: v7.start,
+        answers: v7.answers,
+        fresh: v7.fresh,
+        view_rotation: v7.view_rotation,
+        answered: v7.answered,
+        house: v7.house,
+        family: v7.family,
+        loaded: v7.loaded,
+        view_centre: v7.view_centre,
+        floor_rotation: v7.floor_rotation,
+        replay_view: v7.replay_view,
+        last_dialog_text: v7.last_dialog_text,
+        character_names: v7.character_names,
+        lot_name: v7.lot_name,
+        lot_description: v7.lot_description,
+        deletion_epoch: v7.deletion_epoch,
+        generated_portrait_2002: BTreeSet::new(),
+        made_portrait_head: BTreeMap::new(),
+        ambiguous_portraits: BTreeSet::new(),
+        loaded_indexed_skeletons: BTreeMap::new(),
+        loaded_indexed_suits: BTreeMap::new(),
+        loaded_indexed_suit_bones: BTreeMap::new(),
+        made_outfits: BTreeMap::new(),
+        person_outfits: BTreeMap::new(),
+        scratch_ptr_set: BTreeSet::new(),
+        scratch_ptr_set_to_next: BTreeSet::new(),
+        scratch_ptr_expression: BTreeSet::new(),
+        scratch_ptr_arg_slot: BTreeSet::new(),
+        runtime_added_suits: Vec::new(),
+        suit_scan_cache: None,
+    };
+    postcard::to_allocvec(&v8).map_err(|error| MigrationError::StepFailed {
+        record: record.to_owned(),
+        from: 7,
+        to: 8,
+        detail: error.to_string(),
+    })
+}
+
+fn validate_saved_v8(record: &str, body: &[u8]) -> Result<(), MigrationError> {
+    let _: Saved = decode_postcard_exact(record, FORMAT, body)?;
+    Ok(())
+}
+
+static SAVED_STEPS: &[MigrationStep] = &[
+    MigrationStep {
+        from: 6,
+        to: 7,
+        description: "add Answers::choices_after (None) and deletion_epoch (0)",
+        apply: migrate_v6_to_v7,
+    },
+    MigrationStep {
+        from: 7,
+        to: 8,
+        description: "initialize unencoded format-8 auxiliary portrait/outfit/index/scratch tables",
+        apply: migrate_v7_to_v8,
+    },
+];
+
+/// Registered forward schema migration chain for [`Saved`] (`v6 -> v7 -> v8`).
+///
+/// Expects bytes framed with `[layout: u32 LE][postcard body]` (i.e. after
+/// verifying the 4-byte `world_format == sims_sim::SNAPSHOT_FORMAT` header).
+pub const SAVED_MIGRATIONS: MigrationRegistry = MigrationRegistry {
+    min_version: MIN_FORMAT,
+    current_version: FORMAT,
+    steps: SAVED_STEPS,
+    validate_current: validate_saved_v8,
+};
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,10 +348,103 @@ impl Saved {
         out
     }
 
-    /// Reads [`Saved::encode`]'s bytes. A save of another layout or world
-    /// format is refused rather than misread.
+    fn hydrate_world_aux(&mut self) {
+        self.world.generated_portrait_2002 = self.generated_portrait_2002.clone();
+        self.world.made_portrait_head = self.made_portrait_head.clone();
+        self.world.ambiguous_portraits = self.ambiguous_portraits.clone();
+        self.world.loaded_indexed_skeletons = self.loaded_indexed_skeletons.clone();
+        self.world.loaded_indexed_suits = self.loaded_indexed_suits.clone();
+        self.world.loaded_indexed_suit_bones = self.loaded_indexed_suit_bones.clone();
+        self.world.made_outfits = self.made_outfits.clone();
+        self.world.person_outfits = self.person_outfits.clone();
+        self.world.scratch_ptr_set = self.scratch_ptr_set.clone();
+        self.world.scratch_ptr_set_to_next = self.scratch_ptr_set_to_next.clone();
+        self.world.scratch_ptr_expression = self.scratch_ptr_expression.clone();
+        self.world.scratch_ptr_arg_slot = self.scratch_ptr_arg_slot.clone();
+        self.world.runtime_added_suits = self.runtime_added_suits.clone();
+        self.world.suit_scan_cache = self.suit_scan_cache.clone();
+    }
+
+    /// Reads [`Saved::encode`]'s bytes, deterministically migrating supported
+    /// older layouts ([`MIN_FORMAT`]..=[`FORMAT`], i.e. `6 -> 7 -> 8`) forward
+    /// through [`SAVED_MIGRATIONS`]. Truncated payloads, trailing bytes,
+    /// unsupported layout versions, and mismatched world formats are refused.
     pub fn decode(bytes: &[u8]) -> Result<Self, SaveError> {
-        let format = |reason: String| SaveError::Format(reason);
+        Self::decode_with_report(bytes).map(|(saved, _)| saved)
+    }
+
+    /// Reads [`Saved::encode`]'s bytes from any supported layout version
+    /// ([`MIN_FORMAT`]..=[`FORMAT`]) and returns both the decoded [`Saved`]
+    /// and its [`MigrationReport`].
+    pub fn decode_with_report(bytes: &[u8]) -> Result<(Self, MigrationReport), SaveError> {
+        let format = SaveError::Format;
+        let (header, body) = bytes
+            .split_first_chunk::<8>()
+            .ok_or_else(|| format("shorter than its header".into()))?;
+        let layout = u32::from_le_bytes(header[..4].try_into().unwrap());
+        let world = u32::from_le_bytes(header[4..].try_into().unwrap());
+        if world != sims_sim::SNAPSHOT_FORMAT {
+            return Err(format(format!(
+                "save format {layout} with world format {world}, expected {MIN_FORMAT}..={FORMAT} with {}",
+                sims_sim::SNAPSHOT_FORMAT
+            )));
+        }
+
+        let (mut saved, report) = if layout == FORMAT {
+            let decoded: Self = decode_postcard_exact("saved-lot", FORMAT, body)
+                .map_err(|e| format(e.to_string()))?;
+            (
+                decoded,
+                MigrationReport {
+                    original_version: FORMAT,
+                    final_version: FORMAT,
+                    steps_applied: 0,
+                },
+            )
+        } else {
+            let mut versioned = Vec::with_capacity(4 + body.len());
+            versioned.extend_from_slice(&layout.to_le_bytes());
+            versioned.extend_from_slice(body);
+            let migrated = SAVED_MIGRATIONS
+                .migrate_bytes("saved-lot", &versioned)
+                .map_err(|error| match error {
+                    MigrationError::UnsupportedVersion {
+                        found,
+                        min_supported,
+                        max_supported,
+                        ..
+                    } => format(format!(
+                        "save format {found} with world format {world}, supported \
+                         {min_supported}..={max_supported} with {}",
+                        sims_sim::SNAPSHOT_FORMAT
+                    )),
+                    other => format(other.to_string()),
+                })?;
+            let (_, migrated_body) = migrated
+                .encoded
+                .split_first_chunk::<4>()
+                .expect("migrated bytes always carry 4-byte header");
+            let decoded: Self =
+                decode_postcard_exact("saved-lot", migrated.final_version, migrated_body)
+                    .map_err(|e| format(e.to_string()))?;
+            (
+                decoded,
+                MigrationReport {
+                    original_version: migrated.original_version,
+                    final_version: migrated.final_version,
+                    steps_applied: migrated.steps_applied,
+                },
+            )
+        };
+        saved.hydrate_world_aux();
+        Ok((saved, report))
+    }
+
+    /// Reads [`Saved::encode`]'s bytes strictly at [`FORMAT`] without running
+    /// older-version forward migrations, still rejecting truncated payloads and
+    /// trailing bytes.
+    pub fn decode_strict(bytes: &[u8]) -> Result<Self, SaveError> {
+        let format = SaveError::Format;
         let (header, body) = bytes
             .split_first_chunk::<8>()
             .ok_or_else(|| format("shorter than its header".into()))?;
@@ -188,21 +456,9 @@ impl Saved {
                 sims_sim::SNAPSHOT_FORMAT
             )));
         }
-        let mut saved: Self = postcard::from_bytes(body).map_err(|e| format(e.to_string()))?;
-        saved.world.generated_portrait_2002 = saved.generated_portrait_2002.clone();
-        saved.world.made_portrait_head = saved.made_portrait_head.clone();
-        saved.world.ambiguous_portraits = saved.ambiguous_portraits.clone();
-        saved.world.loaded_indexed_skeletons = saved.loaded_indexed_skeletons.clone();
-        saved.world.loaded_indexed_suits = saved.loaded_indexed_suits.clone();
-        saved.world.loaded_indexed_suit_bones = saved.loaded_indexed_suit_bones.clone();
-        saved.world.made_outfits = saved.made_outfits.clone();
-        saved.world.person_outfits = saved.person_outfits.clone();
-        saved.world.scratch_ptr_set = saved.scratch_ptr_set.clone();
-        saved.world.scratch_ptr_set_to_next = saved.scratch_ptr_set_to_next.clone();
-        saved.world.scratch_ptr_expression = saved.scratch_ptr_expression.clone();
-        saved.world.scratch_ptr_arg_slot = saved.scratch_ptr_arg_slot.clone();
-        saved.world.runtime_added_suits = saved.runtime_added_suits.clone();
-        saved.world.suit_scan_cache = saved.suit_scan_cache.clone();
+        let mut saved: Self =
+            decode_postcard_exact("saved-lot", FORMAT, body).map_err(|e| format(e.to_string()))?;
+        saved.hydrate_world_aux();
         Ok(saved)
     }
 }
@@ -394,6 +650,7 @@ impl Lot {
         // cached `families` and `neighbors`), so it is no longer a live
         // continuation of the store revision this `Lot` was opened from.
         self.neighborhood_origin = None;
+        self.coop = None;
         Ok(())
     }
 }
@@ -523,5 +780,422 @@ mod tests {
             decoded.world().suit_scan_cache,
             Some(vec!["suit_a".to_owned(), "late_suit".to_owned()])
         );
+    }
+
+    fn encode_v6(v6: &SavedV6) -> Vec<u8> {
+        let mut out = 6u32.to_le_bytes().to_vec();
+        out.extend(sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
+        out.extend(postcard::to_allocvec(v6).unwrap());
+        out
+    }
+
+    fn encode_v7(v7: &SavedV7) -> Vec<u8> {
+        let mut out = 7u32.to_le_bytes().to_vec();
+        out.extend(sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
+        out.extend(postcard::to_allocvec(v7).unwrap());
+        out
+    }
+
+    #[test]
+    fn saved_forward_migrations_v6_and_v7_to_v8_preserve_state_and_reject_corruption() {
+        let mut v6_replay_queue = VecDeque::new();
+        v6_replay_queue.push_back(Answer {
+            status: 3,
+            bitmap_id: Some(42),
+            text: Some("Goth Manor".into()),
+        });
+        let v6_replay = SavedV6 {
+            world: World::empty(),
+            ticks: 123,
+            start: 10,
+            answers: AnswersV6 {
+                queue: v6_replay_queue.clone(),
+                include_single_button: true,
+            },
+            fresh: BTreeSet::from([7, 9]),
+            view_rotation: 2,
+            answered: true,
+            house: 5,
+            family: 1,
+            loaded: [0x5a; 32],
+            view_centre: Some([12, 34]),
+            floor_rotation: 1,
+            replay_view: Some((2, Some([12, 34]))),
+            last_dialog_text: "Hello!".into(),
+            character_names: BTreeMap::from([(0x1111_2222, "Mortimer".into())]),
+            lot_name: "5 Sim Lane".into(),
+            lot_description: "Spooky house".into(),
+        };
+        let bytes_v6_replay = encode_v6(&v6_replay);
+
+        // Strict decode refuses format 6.
+        assert!(matches!(
+            Saved::decode_strict(&bytes_v6_replay),
+            Err(SaveError::Format(_))
+        ));
+
+        // Migrating decode upgrades 6 -> 7 -> 8 deterministically.
+        let (migrated_v6, report_v6) = Saved::decode_with_report(&bytes_v6_replay).unwrap();
+        assert_eq!(report_v6.original_version, 6);
+        assert_eq!(report_v6.final_version, FORMAT);
+        assert_eq!(report_v6.steps_applied, 2);
+        assert!(report_v6.was_migrated());
+        assert_eq!(migrated_v6.ticks, 123);
+        assert_eq!(migrated_v6.start, 10);
+        assert_eq!(
+            migrated_v6.answers,
+            Answers::replay(&[Answer {
+                status: 3,
+                bitmap_id: Some(42),
+                text: Some("Goth Manor".into()),
+            }])
+        );
+        assert_eq!(migrated_v6.fresh, BTreeSet::from([7, 9]));
+        assert_eq!(migrated_v6.view_rotation, 2);
+        assert!(migrated_v6.answered);
+        assert_eq!(migrated_v6.house, 5);
+        assert_eq!(migrated_v6.family, 1);
+        assert_eq!(migrated_v6.loaded, [0x5a; 32]);
+        assert_eq!(migrated_v6.view_centre, Some([12, 34]));
+        assert_eq!(migrated_v6.floor_rotation, 1);
+        assert_eq!(migrated_v6.replay_view, Some((2, Some([12, 34]))));
+        assert_eq!(migrated_v6.last_dialog_text, "Hello!");
+        assert_eq!(
+            migrated_v6
+                .character_names
+                .get(&0x1111_2222)
+                .map(String::as_str),
+            Some("Mortimer")
+        );
+        assert_eq!(migrated_v6.lot_name(), "5 Sim Lane");
+        assert_eq!(migrated_v6.lot_description(), "Spooky house");
+        assert_eq!(migrated_v6.deletion_epoch, 0);
+
+        // Also test v6 with include_single_button = false (choices mode).
+        let mut v6_choices = v6_replay;
+        v6_choices.answers.include_single_button = false;
+        let bytes_v6_choices = encode_v6(&v6_choices);
+        let (migrated_choices, _) = Saved::decode_with_report(&bytes_v6_choices).unwrap();
+        let mut expected_choices = Answers::default();
+        expected_choices.queue = v6_replay_queue;
+        assert_eq!(migrated_choices.answers, expected_choices);
+
+        // Test v7 -> v8 preserving `choices_after` and non-zero `deletion_epoch`.
+        let mut v7_answers = Answers::replay(&[Answer::from(2)]);
+        v7_answers.extend_choices_after(&[3, 4]);
+        let v7 = SavedV7 {
+            world: World::empty(),
+            ticks: 456,
+            start: 12,
+            answers: v7_answers.clone(),
+            fresh: BTreeSet::from([3]),
+            view_rotation: 1,
+            answered: false,
+            house: 7,
+            family: 2,
+            loaded: [0xaa; 32],
+            view_centre: None,
+            floor_rotation: 3,
+            replay_view: None,
+            last_dialog_text: String::new(),
+            character_names: BTreeMap::new(),
+            lot_name: "7 Sim Lane".into(),
+            lot_description: "Newbie home".into(),
+            deletion_epoch: 19,
+        };
+        let bytes_v7 = encode_v7(&v7);
+        assert!(matches!(
+            Saved::decode_strict(&bytes_v7),
+            Err(SaveError::Format(_))
+        ));
+        let (migrated_v7, report_v7) = Saved::decode_with_report(&bytes_v7).unwrap();
+        assert_eq!(report_v7.original_version, 7);
+        assert_eq!(report_v7.final_version, FORMAT);
+        assert_eq!(report_v7.steps_applied, 1);
+        assert_eq!(migrated_v7.answers, v7_answers);
+        assert_eq!(migrated_v7.deletion_epoch, 19);
+        assert_eq!(migrated_v7.lot_name(), "7 Sim Lane");
+
+        // Re-encoding a migrated save emits canonical format 8 accepted by `decode_strict`.
+        let canonical_v8 = migrated_v7.encode();
+        let (redecoded, report_v8) = Saved::decode_with_report(&canonical_v8).unwrap();
+        assert_eq!(report_v8.original_version, FORMAT);
+        assert_eq!(report_v8.steps_applied, 0);
+        assert_eq!(redecoded.deletion_epoch, 19);
+        assert!(Saved::decode_strict(&canonical_v8).is_ok());
+
+        // Reject trailing bytes and truncated payloads across v6, v7, and v8.
+        for valid in [&bytes_v6_replay, &bytes_v7, &canonical_v8] {
+            let mut with_trailing = valid.clone();
+            with_trailing.push(0x00);
+            assert!(
+                matches!(Saved::decode(&with_trailing), Err(SaveError::Format(_))),
+                "trailing byte must be rejected"
+            );
+            let truncated = &valid[..valid.len() - 1];
+            assert!(
+                matches!(Saved::decode(truncated), Err(SaveError::Format(_))),
+                "truncated body must be rejected"
+            );
+        }
+
+        // Direct SAVED_MIGRATIONS check on v6 -> v8, v8 -> v8, v5, v9.
+        let mut raw_v6 = 6u32.to_le_bytes().to_vec();
+        raw_v6.extend_from_slice(&bytes_v6_replay[8..]);
+        let direct_v6 = SAVED_MIGRATIONS.migrate_bytes("test", &raw_v6).unwrap();
+        assert_eq!(direct_v6.original_version, 6);
+        assert_eq!(direct_v6.final_version, FORMAT);
+        assert_eq!(direct_v6.steps_applied, 2);
+
+        let mut raw_v8 = FORMAT.to_le_bytes().to_vec();
+        raw_v8.extend_from_slice(&canonical_v8[8..]);
+        let direct_v8 = SAVED_MIGRATIONS.migrate_bytes("test", &raw_v8).unwrap();
+        assert_eq!(direct_v8.steps_applied, 0);
+        assert_eq!(&direct_v8.encoded[4..], &canonical_v8[8..]);
+
+        assert!(matches!(
+            SAVED_MIGRATIONS.migrate_bytes("test", &5u32.to_le_bytes()),
+            Err(MigrationError::UnsupportedVersion { found: 5, .. })
+        ));
+        assert!(matches!(
+            SAVED_MIGRATIONS.migrate_bytes("test", &(FORMAT + 1).to_le_bytes()),
+            Err(MigrationError::UnsupportedVersion { found, .. }) if found == FORMAT + 1
+        ));
+    }
+
+    #[test]
+    fn goth_house_migrated_from_v6_and_v7_steps_identically_to_live_lot() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let house = root.join("UserData/Houses/House05.iff");
+        let mut live = Lot::load(&root, &house, &[3], super::super::Frames::default()).unwrap();
+        for _ in 0..500 {
+            live.step().unwrap();
+        }
+        let saved_v8 = live.save().unwrap();
+
+        // Build authentic Format 6 and Format 7 byte representations of tick 500.
+        let v6_bytes = encode_v6(&SavedV6 {
+            world: saved_v8.world.clone(),
+            ticks: saved_v8.ticks,
+            start: saved_v8.start,
+            answers: AnswersV6 {
+                queue: saved_v8.answers.queue.clone(),
+                include_single_button: false,
+            },
+            fresh: saved_v8.fresh.clone(),
+            view_rotation: saved_v8.view_rotation,
+            answered: saved_v8.answered,
+            house: saved_v8.house,
+            family: saved_v8.family,
+            loaded: saved_v8.loaded,
+            view_centre: saved_v8.view_centre,
+            floor_rotation: saved_v8.floor_rotation,
+            replay_view: saved_v8.replay_view,
+            last_dialog_text: saved_v8.last_dialog_text.clone(),
+            character_names: saved_v8.character_names.clone(),
+            lot_name: saved_v8.lot_name.clone(),
+            lot_description: saved_v8.lot_description.clone(),
+        });
+        let v7_bytes = encode_v7(&SavedV7 {
+            world: saved_v8.world.clone(),
+            ticks: saved_v8.ticks,
+            start: saved_v8.start,
+            answers: saved_v8.answers.clone(),
+            fresh: saved_v8.fresh.clone(),
+            view_rotation: saved_v8.view_rotation,
+            answered: saved_v8.answered,
+            house: saved_v8.house,
+            family: saved_v8.family,
+            loaded: saved_v8.loaded,
+            view_centre: saved_v8.view_centre,
+            floor_rotation: saved_v8.floor_rotation,
+            replay_view: saved_v8.replay_view,
+            last_dialog_text: saved_v8.last_dialog_text.clone(),
+            character_names: saved_v8.character_names.clone(),
+            lot_name: saved_v8.lot_name.clone(),
+            lot_description: saved_v8.lot_description.clone(),
+            deletion_epoch: saved_v8.deletion_epoch,
+        });
+
+        let (dec_v6, rep_v6) = Saved::decode_with_report(&v6_bytes).unwrap();
+        let (dec_v7, rep_v7) = Saved::decode_with_report(&v7_bytes).unwrap();
+        assert_eq!(rep_v6.steps_applied, 2);
+        assert_eq!(rep_v7.steps_applied, 1);
+
+        let mut from_v6 = Lot::load(&root, &house, &[], super::super::Frames::default()).unwrap();
+        let mut from_v7 = Lot::load(&root, &house, &[], super::super::Frames::default()).unwrap();
+        from_v6.restore(dec_v6).unwrap();
+        from_v7.restore(dec_v7).unwrap();
+
+        for tick in 501..=700 {
+            live.step().unwrap();
+            from_v6.step().unwrap();
+            from_v7.step().unwrap();
+            assert_eq!(
+                from_v6.world().hash(),
+                live.world().hash(),
+                "v6 tick {tick}"
+            );
+            assert_eq!(
+                from_v7.world().hash(),
+                live.world().hash(),
+                "v7 tick {tick}"
+            );
+        }
+    }
+
+    /// Independent raw-postcard wire-byte golden test derived directly from the
+    /// historical field declarations of commits `2ddea688` (FORMAT 6) and
+    /// `50106efb` (FORMAT 7), without using `SavedV6` or `SavedV7` to build the
+    /// input bytes. Catches any field-order or type drift between the historical
+    /// commits and our migration structs.
+    #[test]
+    fn golden_raw_wire_bytes_from_2ddea688_and_50106efb_migrate_losslessly() {
+        fn push_varint_u64(out: &mut Vec<u8>, mut v: u64) {
+            loop {
+                let mut byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v != 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if v == 0 {
+                    break;
+                }
+            }
+        }
+        fn push_zigzag_i16(out: &mut Vec<u8>, v: i16) {
+            let zz = ((v << 1) ^ (v >> 15)) as u16;
+            push_varint_u64(out, u64::from(zz));
+        }
+        fn push_str(out: &mut Vec<u8>, s: &str) {
+            push_varint_u64(out, s.len() as u64);
+            out.extend_from_slice(s.as_bytes());
+        }
+
+        // `World::encode()` is the canonical `postcard` encoding of `World` at `SNAPSHOT_FORMAT`.
+        let world_postcard = World::empty().encode();
+        let loaded_fingerprint: [u8; 32] =
+            std::array::from_fn(|i| (i as u8).wrapping_mul(7) ^ 0xa5);
+
+        // --- Golden FORMAT 6 bytes (commit `2ddea688`) ---
+        assert_eq!(sims_sim::SNAPSHOT_FORMAT, 32);
+        let mut raw_2ddea688 = Vec::new();
+        raw_2ddea688.extend_from_slice(&6u32.to_le_bytes()); // FORMAT = 6
+        raw_2ddea688.extend_from_slice(&32u32.to_le_bytes()); // SNAPSHOT_FORMAT = 32
+        raw_2ddea688.extend_from_slice(&world_postcard); // 1. world: World
+        push_varint_u64(&mut raw_2ddea688, 777); // 2. ticks: u32
+        push_varint_u64(&mut raw_2ddea688, 33); // 3. start: u32
+        // 4. answers: Answers (2ddea688: { queue: VecDeque<Answer>, include_single_button: bool })
+        push_varint_u64(&mut raw_2ddea688, 1); // queue.len = 1
+        raw_2ddea688.push(3); // Answer.status = 3
+        raw_2ddea688.push(1); // Answer.bitmap_id = Some(-17)
+        push_zigzag_i16(&mut raw_2ddea688, -17);
+        raw_2ddea688.push(1); // Answer.text = Some("Bella")
+        push_str(&mut raw_2ddea688, "Bella");
+        raw_2ddea688.push(1); // include_single_button = true
+        // 5. fresh: BTreeSet<u16> = {4, 19}
+        push_varint_u64(&mut raw_2ddea688, 2);
+        push_varint_u64(&mut raw_2ddea688, 4);
+        push_varint_u64(&mut raw_2ddea688, 19);
+        raw_2ddea688.push(3); // 6. view_rotation: u8
+        raw_2ddea688.push(1); // 7. answered: bool = true
+        push_varint_u64(&mut raw_2ddea688, 5); // 8. house: u32
+        push_varint_u64(&mut raw_2ddea688, 1); // 9. family: u16
+        raw_2ddea688.extend_from_slice(&loaded_fingerprint); // 10. loaded: [u8; 32]
+        raw_2ddea688.extend_from_slice(&[1, 21, 42]); // 11. view_centre: Some([21, 42])
+        raw_2ddea688.push(2); // 12. floor_rotation: u8
+        raw_2ddea688.extend_from_slice(&[1, 3, 1, 21, 42]); // 13. replay_view: Some((3, Some([21, 42])))
+        push_str(&mut raw_2ddea688, "Last prompt text"); // 14. last_dialog_text
+        push_varint_u64(&mut raw_2ddea688, 1); // 15. character_names len = 1
+        push_varint_u64(&mut raw_2ddea688, 0x1234_5678);
+        push_str(&mut raw_2ddea688, "Cassandra");
+        push_str(&mut raw_2ddea688, "5 Sim Lane"); // 16. lot_name
+        push_str(&mut raw_2ddea688, "Historic Goth estate"); // 17. lot_description
+
+        let (dec6, rep6) = Saved::decode_with_report(&raw_2ddea688).unwrap();
+        assert_eq!(rep6.original_version, 6);
+        assert_eq!(rep6.final_version, FORMAT);
+        assert_eq!(rep6.steps_applied, 2);
+        assert_eq!(dec6.ticks, 777);
+        assert_eq!(dec6.start, 33);
+        assert_eq!(
+            dec6.answers,
+            Answers::replay(&[Answer {
+                status: 3,
+                bitmap_id: Some(-17),
+                text: Some("Bella".into()),
+            }])
+        );
+        assert_eq!(dec6.fresh, BTreeSet::from([4, 19]));
+        assert_eq!(dec6.view_rotation, 3);
+        assert!(dec6.answered);
+        assert_eq!(dec6.house, 5);
+        assert_eq!(dec6.family, 1);
+        assert_eq!(dec6.loaded, loaded_fingerprint);
+        assert_eq!(dec6.view_centre, Some([21, 42]));
+        assert_eq!(dec6.floor_rotation, 2);
+        assert_eq!(dec6.replay_view, Some((3, Some([21, 42]))));
+        assert_eq!(dec6.last_dialog_text, "Last prompt text");
+        assert_eq!(
+            dec6.character_names.get(&0x1234_5678).map(String::as_str),
+            Some("Cassandra")
+        );
+        assert_eq!(dec6.lot_name(), "5 Sim Lane");
+        assert_eq!(dec6.lot_description(), "Historic Goth estate");
+        assert_eq!(dec6.deletion_epoch, 0);
+
+        // --- Golden FORMAT 7 bytes (commit `50106efb`) ---
+        let mut raw_50106efb = Vec::new();
+        raw_50106efb.extend_from_slice(&7u32.to_le_bytes()); // FORMAT = 7
+        raw_50106efb.extend_from_slice(&32u32.to_le_bytes()); // SNAPSHOT_FORMAT = 32
+        raw_50106efb.extend_from_slice(&world_postcard); // 1. world: World
+        push_varint_u64(&mut raw_50106efb, 888); // 2. ticks: u32
+        push_varint_u64(&mut raw_50106efb, 33); // 3. start: u32
+        // 4. answers: Answers (50106efb: adds `choices_after: Option<VecDeque<Answer>>`)
+        push_varint_u64(&mut raw_50106efb, 1); // queue.len = 1
+        raw_50106efb.push(2); // Answer.status = 2
+        raw_50106efb.push(0); // bitmap_id = None
+        raw_50106efb.push(0); // text = None
+        raw_50106efb.push(1); // include_single_button = true
+        raw_50106efb.push(1); // choices_after = Some(...)
+        push_varint_u64(&mut raw_50106efb, 2); // 2 follow-up choices
+        raw_50106efb.extend_from_slice(&[3, 0, 0]);
+        raw_50106efb.extend_from_slice(&[4, 0, 0]);
+        push_varint_u64(&mut raw_50106efb, 1); // 5. fresh = {11}
+        push_varint_u64(&mut raw_50106efb, 11);
+        raw_50106efb.push(1); // 6. view_rotation
+        raw_50106efb.push(0); // 7. answered = false
+        push_varint_u64(&mut raw_50106efb, 7); // 8. house
+        push_varint_u64(&mut raw_50106efb, 2); // 9. family
+        raw_50106efb.extend_from_slice(&loaded_fingerprint); // 10. loaded
+        raw_50106efb.push(0); // 11. view_centre = None
+        raw_50106efb.push(0); // 12. floor_rotation
+        raw_50106efb.push(0); // 13. replay_view = None
+        push_str(&mut raw_50106efb, "Dialog v7"); // 14. last_dialog_text
+        push_varint_u64(&mut raw_50106efb, 0); // 15. character_names = {}
+        push_str(&mut raw_50106efb, "7 Sim Lane"); // 16. lot_name
+        push_str(&mut raw_50106efb, "Newbie house"); // 17. lot_description
+        push_varint_u64(&mut raw_50106efb, 42); // 18. deletion_epoch = 42
+
+        let (dec7, rep7) = Saved::decode_with_report(&raw_50106efb).unwrap();
+        assert_eq!(rep7.original_version, 7);
+        assert_eq!(rep7.final_version, FORMAT);
+        assert_eq!(rep7.steps_applied, 1);
+        let mut expected_ans7 = Answers::replay(&[Answer::from(2)]);
+        expected_ans7.extend_choices_after(&[3, 4]);
+        assert_eq!(dec7.ticks, 888);
+        assert_eq!(dec7.answers, expected_ans7);
+        assert_eq!(dec7.fresh, BTreeSet::from([11]));
+        assert_eq!(dec7.house, 7);
+        assert_eq!(dec7.family, 2);
+        assert_eq!(dec7.loaded, loaded_fingerprint);
+        assert_eq!(dec7.last_dialog_text, "Dialog v7");
+        assert_eq!(dec7.lot_name(), "7 Sim Lane");
+        assert_eq!(dec7.lot_description(), "Newbie house");
+        assert_eq!(dec7.deletion_epoch, 42);
     }
 }

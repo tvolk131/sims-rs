@@ -168,9 +168,9 @@ fn a_halted_lot_is_not_saved() {
 #[test]
 fn bytes_of_another_layout_are_refused() {
     assert!(matches!(Saved::decode(&[1, 0]), Err(SaveError::Format(_))));
-    // A save of the layout before this one (format 2 had no view centre),
-    // and one from a future format.
-    let older = sims_vm::boot::save::FORMAT - 1;
+    // A save of a layout older than MIN_FORMAT (format 5) and one from a future
+    // format (FORMAT + 1) are both refused cleanly.
+    let older = sims_vm::boot::save::MIN_FORMAT - 1;
     let mut header = older.to_le_bytes().to_vec();
     header.extend(sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
     let refused = Saved::decode(&header).unwrap_err().to_string();
@@ -186,11 +186,40 @@ fn bytes_of_another_layout_are_refused() {
         refused.contains(&format!("save format {future}")),
         "{refused}"
     );
+    // A truncated payload on a supported older format (e.g. format 7) is refused cleanly.
+    let mut truncated_v7 = 7u32.to_le_bytes().to_vec();
+    truncated_v7.extend(sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
+    assert!(matches!(
+        Saved::decode(&truncated_v7),
+        Err(SaveError::Format(_))
+    ));
     // The world's encoding is checked as well.
     let mut header = sims_vm::boot::save::FORMAT.to_le_bytes().to_vec();
     header.extend((sims_sim::SNAPSHOT_FORMAT - 1).to_le_bytes());
     let refused = Saved::decode(&header).unwrap_err().to_string();
     assert!(refused.contains("world format"), "{refused}");
+}
+
+#[test]
+fn trailing_bytes_on_format_8_save_are_refused() {
+    let Some((root, house)) = goth_house() else {
+        return;
+    };
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    lot.step().unwrap();
+    let mut bytes = lot.save().unwrap().encode();
+    let (_, report) = Saved::decode_with_report(&bytes).unwrap();
+    assert_eq!(report.original_version, sims_vm::boot::save::FORMAT);
+    assert_eq!(report.final_version, sims_vm::boot::save::FORMAT);
+    assert_eq!(report.steps_applied, 0);
+    assert!(Saved::decode_strict(&bytes).is_ok());
+
+    bytes.push(0xaa);
+    assert!(matches!(Saved::decode(&bytes), Err(SaveError::Format(_))));
+    assert!(matches!(
+        Saved::decode_strict(&bytes),
+        Err(SaveError::Format(_))
+    ));
 }
 
 #[test]

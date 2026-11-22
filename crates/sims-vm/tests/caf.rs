@@ -1087,3 +1087,302 @@ fn oracle_alice_fam_imports_and_boots_cleanly() {
     assert_eq!(lot4.ticks(), 50);
     let _ = Path::new(&db.0);
 }
+
+/// Regression test for single-transaction atomic CAF commits:
+/// 1. Committing a household advances `StoredNeighborhood::revision` by exactly
+///    +1 (single write transaction instead of multi-phase staging).
+/// 2. Racing concurrent `commit_family_with_context` / `import_family_fam`
+///    against concurrent neighborhood replacement (`delete_neighborhood` +
+///    `save_neighborhood`, or `import_directory` when `SIMS_INSTALL` is present)
+///    never leaves orphaned `User%05d.iff` character files or half-committed
+///    tombstones in the store: every character file present in the final
+///    neighborhood corresponds to a committed `NBRS` member of that exact
+///    neighborhood instance.
+/// 3. `delete_bin_family` purges the deleted family's persisted photo album.
+#[test]
+fn atomic_caf_commit_survives_concurrent_reimport_and_purges_album() {
+    use sims_sim::NewAlbumPhoto;
+    use std::sync::Barrier;
+
+    let db = TempDb::new("atomic-caf-concurrency");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .save_neighborhood("RaceNH", &empty_stored_neighborhood("RaceNH"))
+        .unwrap();
+    let ctx = CafContext::synthetic(
+        synthetic_template_iff(),
+        BTreeSet::from([TEMPLATE_PERSON_GUID]),
+        DEFAULT_STARTING_FUNDS,
+    );
+
+    // 1. Single-transaction commit bumps revision by exactly +1 for a 3-Sim household.
+    let before = store.load_neighborhood("RaceNH").unwrap().unwrap();
+    let three_sims = FamilySpec::new(
+        "Atomic",
+        "Single txn",
+        vec![
+            alice_sim_spec(None),
+            alice_sim_spec(None),
+            alice_sim_spec(None),
+        ],
+    );
+    let mut rng = CrtRng::from_state(0x1234_5678);
+    let created =
+        commit_family_with_context(&ctx, &store, "RaceNH", &three_sims, &mut rng).unwrap();
+    assert_eq!(created.revision, before.revision + 1);
+    let after = store.load_neighborhood("RaceNH").unwrap().unwrap();
+    assert_eq!(after.revision, before.revision + 1);
+    assert!(after.deleted_characters.is_empty());
+
+    // Prepare a valid `.FAM` archive for concurrent import_family_fam racing too.
+    let chars_for_export = store.load_character_files("RaceNH").unwrap();
+    let fam_bytes = export_family_fam(
+        &after,
+        &chars_for_export,
+        created.family_id,
+        "Atomic",
+        1,
+        true,
+    )
+    .unwrap();
+
+    // Seed a photo album for `created.family_id`, capture its household token,
+    // then delete the bin family and confirm its album is purged atomically and
+    // any stale token is rejected even after a replacement family reuses ID 1!
+    let orig_token = store
+        .albums()
+        .family_token("RaceNH", created.family_id)
+        .unwrap()
+        .expect("created household must have an album family token");
+    let orig_photo = store
+        .albums()
+        .add(
+            "RaceNH",
+            orig_token,
+            NewAlbumPhoto::blank("Pre-Delete", "Should be purged"),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .albums()
+            .list("RaceNH", created.family_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    delete_bin_family(&store, "RaceNH", created.family_id).unwrap();
+    assert!(
+        store
+            .albums()
+            .list("RaceNH", created.family_id)
+            .unwrap()
+            .is_empty()
+    );
+    // Delayed add while the family is absent must be rejected.
+    assert!(matches!(
+        store
+            .albums()
+            .add("RaceNH", orig_token, NewAlbumPhoto::blank("Ghost", "")),
+        Err(sims_sim::AlbumError::StaleFamilyToken {
+            current_epoch: None,
+            ..
+        })
+    ));
+    // Re-create a replacement household reusing `created.family_id` and photo #1;
+    // replaying stale `update_text`/`delete` from the original household must fail!
+    let replacement =
+        commit_family_with_context(&ctx, &store, "RaceNH", &three_sims, &mut rng).unwrap();
+    assert_eq!(replacement.family_id, created.family_id);
+    let repl_token = store
+        .albums()
+        .family_token("RaceNH", replacement.family_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(repl_token.family_epoch, orig_token.family_epoch);
+    let repl_photo = store
+        .albums()
+        .add(
+            "RaceNH",
+            repl_token,
+            NewAlbumPhoto::blank("Replacement Photo", "Keep intact"),
+        )
+        .unwrap();
+    assert_eq!(repl_photo.id, orig_photo.id);
+    assert!(matches!(
+        store.albums().update_text(
+            "RaceNH",
+            orig_token,
+            orig_photo.id,
+            "Hijacked",
+            "Should fail"
+        ),
+        Err(sims_sim::AlbumError::StaleFamilyToken {
+            current_epoch: Some(cur),
+            ..
+        }) if cur == repl_token.family_epoch
+    ));
+    assert!(matches!(
+        store.albums().delete("RaceNH", orig_token, orig_photo.id),
+        Err(sims_sim::AlbumError::StaleFamilyToken { .. })
+    ));
+    assert_eq!(
+        store
+            .albums()
+            .list("RaceNH", replacement.family_id)
+            .unwrap()[0]
+            .title,
+        "Replacement Photo"
+    );
+    delete_bin_family(&store, "RaceNH", replacement.family_id).unwrap();
+
+    // 2. Race CAF commits and FAM imports against concurrent neighborhood
+    //    replacements (using real `import_directory` if `SIMS_INSTALL` is set,
+    //    plus synthetic `delete_neighborhood` + `save_neighborhood`).
+    let barrier = Barrier::new(3);
+    std::thread::scope(|scope| {
+        let store_a = &store;
+        let ctx_a = &ctx;
+        let barrier_a = &barrier;
+        let t_commit = scope.spawn(move || {
+            barrier_a.wait();
+            let mut local_rng = CrtRng::from_state(0xaaaa_1111);
+            for i in 0..12u32 {
+                let mut sim = alice_sim_spec(None);
+                sim.first_name = format!("RaceA{i}");
+                let spec = FamilySpec::new(format!("FamA{i}"), "", vec![sim.clone(), sim]);
+                match commit_family_with_context(ctx_a, store_a, "RaceNH", &spec, &mut local_rng) {
+                    Ok(_)
+                    | Err(CafError::NeighborhoodMismatch { .. })
+                    | Err(CafError::StaleNeighborhood { .. })
+                    | Err(CafError::NeighborhoodNotFound(_))
+                    | Err(CafError::Store(_)) => {}
+                    Err(other) => panic!("unexpected CAF commit error under race: {other}"),
+                }
+            }
+        });
+
+        let store_b = &store;
+        let ctx_b = &ctx;
+        let fam_b = &fam_bytes;
+        let barrier_b = &barrier;
+        let t_import = scope.spawn(move || {
+            barrier_b.wait();
+            let mut local_rng = CrtRng::from_state(0xbbbb_2222);
+            for _ in 0..8u32 {
+                match import_family_fam(ctx_b, store_b, "RaceNH", fam_b, 1, &mut local_rng) {
+                    Ok(_)
+                    | Err(CafError::NeighborhoodMismatch { .. })
+                    | Err(CafError::StaleNeighborhood { .. })
+                    | Err(CafError::NeighborhoodNotFound(_))
+                    | Err(CafError::Store(_)) => {}
+                    Err(other) => panic!("unexpected FAM import error under race: {other}"),
+                }
+            }
+        });
+
+        let store_c = &store;
+        let barrier_c = &barrier;
+        let t_replace = scope.spawn(move || {
+            barrier_c.wait();
+            for _ in 0..10u32 {
+                let _ = store_c.delete_neighborhood("RaceNH");
+                store_c
+                    .save_neighborhood("RaceNH", &empty_stored_neighborhood("RaceNH"))
+                    .unwrap();
+            }
+        });
+
+        t_commit.join().unwrap();
+        t_import.join().unwrap();
+        t_replace.join().unwrap();
+    });
+
+    // After the race settles, EVERY character file in `RaceNH` must correspond
+    // to a live `NBRS` entry in `RaceNH` — zero orphaned files and zero
+    // lingering staging tombstones!
+    let final_snap = store.load_lot_snapshot("RaceNH", 0).unwrap().unwrap();
+    assert!(
+        final_snap.neighborhood.deleted_characters.is_empty(),
+        "atomic CAF commits must never leave staging tombstones"
+    );
+    let expected_files: BTreeSet<String> = final_snap
+        .neighborhood
+        .neighbors
+        .iter()
+        .flatten()
+        .map(|n| format!("U{}.iff", &n.name[1..]))
+        .collect();
+    let actual_files: BTreeSet<String> = final_snap.character_files.keys().cloned().collect();
+    assert_eq!(
+        actual_files, expected_files,
+        "character files must exactly match committed NBRS entries with zero orphans"
+    );
+
+    // 3. Also race against real `NeighborhoodStore::import_directory` when SIMS_INSTALL is available.
+    if let Some(root) = install() {
+        let ud_dir = root.join("UserData");
+        let db_imp = TempDb::new("atomic-caf-vs-import-dir");
+        let store_imp = NeighborhoodStore::open(&db_imp.0).unwrap();
+        store_imp
+            .import_directory("UserData", &ud_dir, 0xff)
+            .unwrap();
+        let baseline_chars: BTreeSet<String> = store_imp
+            .load_character_files("UserData")
+            .unwrap()
+            .into_keys()
+            .collect();
+        let install_ctx = CafContext::from_install(&root).unwrap();
+        let barrier2 = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let s1 = &store_imp;
+            let c1 = &install_ctx;
+            let b1 = &barrier2;
+            let h1 = scope.spawn(move || {
+                b1.wait();
+                let mut local_rng = CrtRng::from_state(0xcccc_3333);
+                for i in 0..6u32 {
+                    let mut sim = alice_sim_spec(None);
+                    sim.first_name = format!("ImpRace{i}");
+                    let spec = FamilySpec::new(format!("ImpFam{i}"), "", vec![sim]);
+                    match commit_family_with_context(c1, s1, "UserData", &spec, &mut local_rng) {
+                        Ok(_)
+                        | Err(CafError::NeighborhoodMismatch { .. })
+                        | Err(CafError::StaleNeighborhood { .. }) => {}
+                        Err(other) => panic!("unexpected error racing import_directory: {other}"),
+                    }
+                }
+            });
+            let s2 = &store_imp;
+            let ud_ref = &ud_dir;
+            let b2 = &barrier2;
+            let h2 = scope.spawn(move || {
+                b2.wait();
+                for _ in 0..3u32 {
+                    s2.import_directory("UserData", ud_ref, 0xff).unwrap();
+                }
+            });
+            h1.join().unwrap();
+            h2.join().unwrap();
+        });
+
+        let post = store_imp.load_lot_snapshot("UserData", 0).unwrap().unwrap();
+        assert!(post.neighborhood.deleted_characters.is_empty());
+        let nbr_files: BTreeSet<String> = post
+            .neighborhood
+            .neighbors
+            .iter()
+            .flatten()
+            .filter_map(|n| {
+                n.name
+                    .strip_prefix("user")
+                    .map(|digits| format!("User{digits}.iff"))
+            })
+            .collect();
+        for file in post.character_files.keys() {
+            assert!(
+                baseline_chars.contains(file) || nbr_files.contains(file),
+                "leaked orphan character file {file:?} after concurrent import_directory"
+            );
+        }
+    }
+}

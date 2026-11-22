@@ -180,7 +180,7 @@ fn an_object_without_a_reset_tree_is_deleted_without_running_anything() {
     assert_eq!(world.people, [2]);
     // The instance list outlives its last instance.
     assert_eq!(interpreter.remove_now(&mut world, 2), Ok(()));
-    assert_eq!(world.instances[&WIDGET], []);
+    assert_eq!(world.instances[&WIDGET], [0u16; 0]);
     assert!(world.objects.is_empty());
     // A missing object is the original's error 10.
     let fault = interpreter.delete(&mut world, 2).unwrap_err();
@@ -263,7 +263,7 @@ fn the_clear_takes_the_indicators_first_and_then_the_head_of_the_list() {
     assert_eq!((world.globals[34], world.globals[36]), (1, 5));
     assert!(world.objects.is_empty() && world.order.is_empty());
     assert_eq!(world.indicators, [0, 0]);
-    assert_eq!(world.instances[&WIDGET], []);
+    assert_eq!(world.instances[&WIDGET], [0u16; 0]);
     // The queued removals wait for a later load step.
     assert_eq!(world.removals, [3, 9]);
     assert_eq!((world.ticks, world.size), (before.ticks, before.size));
