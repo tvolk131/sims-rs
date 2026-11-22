@@ -48,5 +48,6 @@ mod snap;
 mod special_effect;
 mod support;
 mod tick;
+mod ui_effect;
 mod visits;
 mod worst_motives;

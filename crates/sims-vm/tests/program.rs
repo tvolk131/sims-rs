@@ -1121,6 +1121,304 @@ fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_do
     std::fs::remove_dir(dir.0.join("GameData/UIFAR")).unwrap();
 }
 
+/// Minimal valid 1x1 24-bit Windows BMP (58 bytes), decodable by
+/// `sims_formats::bitmap::bmp`.
+fn tiny_bmp() -> Vec<u8> {
+    let mut bmp = vec![0u8; 58];
+    bmp[0..2].copy_from_slice(b"BM");
+    bmp[2..6].copy_from_slice(&58u32.to_le_bytes()); // file size
+    bmp[10..14].copy_from_slice(&54u32.to_le_bytes()); // pixel offset
+    bmp[14..18].copy_from_slice(&40u32.to_le_bytes()); // DIB header size
+    bmp[18..22].copy_from_slice(&1i32.to_le_bytes()); // width = 1
+    bmp[22..26].copy_from_slice(&1i32.to_le_bytes()); // height = 1
+    bmp[26..28].copy_from_slice(&1u16.to_le_bytes()); // planes = 1
+    bmp[28..30].copy_from_slice(&24u16.to_le_bytes()); // bpp = 24
+    bmp[34..38].copy_from_slice(&4u32.to_le_bytes()); // image size
+    bmp
+}
+
+/// Raw IFF bytes for a single object definition plus extra flagged chunks.
+fn iff_bytes(chunks: &[(&[u8; 4], u16, u16, Vec<u8>)]) -> Vec<u8> {
+    let mut bytes = vec![0; 64];
+    bytes[..13].copy_from_slice(b"IFF FILE 2.5:");
+    for (tag, id, flags, data) in chunks {
+        bytes.extend(*tag);
+        bytes.extend((76 + data.len() as u32).to_be_bytes());
+        bytes.extend(id.to_be_bytes());
+        bytes.extend(flags.to_be_bytes());
+        bytes.extend([0; 64]);
+        bytes.extend(data);
+    }
+    bytes
+}
+
+/// Minimal 1-entry FAR v1 archive holding `(name, bytes)`.
+fn far_archive(name: &str, payload: &[u8]) -> Vec<u8> {
+    let manifest_offset = 16u32 + payload.len() as u32;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FAR!byAZ");
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&manifest_offset.to_le_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&1u32.to_le_bytes()); // entry count
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out
+}
+
+#[test]
+fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
+    let dir = Dir::new("portrait-2002");
+    dir.file("GameData/Behavior.iff", &iff_bytes(&[]));
+    dir.file("GameData/Global/Global.iff", &iff_bytes(&[]));
+
+    // 1. Loose file with neutral (high byte 0) BMP_ 2002 -> has_portrait_bitmap = true.
+    let neutral_guid = 0x9000_0001u32;
+    dir.file(
+        "GameData/Objects/neutral.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(neutral_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, tiny_bmp()),
+        ]),
+    );
+
+    // 2. Loose file with English-only (high byte 1) BMP_ 2002 -> has_portrait_bitmap = false
+    // because 0x41bab1 -> 0x41bad8 forces the lookup key's high byte to 0.
+    let lang1_guid = 0x9000_0002u32;
+    dir.file(
+        "GameData/Objects/lang1.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(lang1_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0110, tiny_bmp()),
+        ]),
+    );
+
+    // 3. Archive (.far) member without BMP_ 2002 -> writable = false, has_portrait_bitmap = false.
+    let archived_guid = 0x9000_0003u32;
+    let archived_iff = iff_bytes(&[(b"OBJD", 128, 0x0010, objd(archived_guid, 0, 0))]);
+    dir.file(
+        "GameData/Objects/Archived.far",
+        &far_archive("Archived.iff", &archived_iff),
+    );
+
+    // 4. Loose file with uncompressed 32-bit 1x1 BMP_ 2002 -> has_portrait_bitmap = true
+    // because the native decoder (`0x4ded4a` -> `0x4df06a..0x4df122`) accepts it.
+    let bmp32_guid = 0x9000_0004u32;
+    let mut bmp32 = tiny_bmp();
+    bmp32[28..30].copy_from_slice(&32u16.to_le_bytes());
+    dir.file(
+        "GameData/Objects/bmp32.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(bmp32_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, bmp32),
+        ]),
+    );
+
+    // 5. Loose file with 57-byte 1x1 24-bit BMP_ 2002 (missing unused final-row
+    // padding byte) -> has_portrait_bitmap = true because `0x4df117` advances
+    // past padding and exits at `0x4df122` without reading it.
+    let bmp57_guid = 0x9000_0005u32;
+    dir.file(
+        "GameData/Objects/bmp57.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(bmp57_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, tiny_bmp()[..57].to_vec()),
+        ]),
+    );
+
+    // 6. Loose file with truncated (55-byte) BMP_ 2002 -> has_portrait_bitmap = false.
+    let truncated_guid = 0x9000_0006u32;
+    dir.file(
+        "GameData/Objects/truncated.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(truncated_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, tiny_bmp()[..55].to_vec()),
+        ]),
+    );
+
+    // 7. Loose file with 57-byte 1x1 8-bit BMP_ 2002 (1 palette entry at 54..57
+    // with unread 4th reserved byte omitted, pixel offset 54) -> true per
+    // `0x4dee73..0x4deea6` / `0x4deec1..0x4deef3`.
+    let pal57_guid = 0x9000_0007u32;
+    let mut pal57 = tiny_bmp()[..57].to_vec();
+    pal57[28..30].copy_from_slice(&8u16.to_le_bytes());
+    pal57[46..50].copy_from_slice(&1u32.to_le_bytes());
+    dir.file(
+        "GameData/Objects/pal57.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(pal57_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, pal57),
+        ]),
+    );
+
+    // 8. Loose file with 1x1 RLE8 BMP_ 2002 having an extra EOL (`00 00`) or
+    // delta past row width (`00 02 05 00`) right before EOF (`00 01`) -> true
+    // per `0x4def84` and `0x4def97..0x4defab`.
+    let rle_eol_guid = 0x9000_0008u32;
+    let mut rle_eol = vec![0u8; 54 + 4 + 6];
+    rle_eol[0..54].copy_from_slice(&tiny_bmp()[..54]);
+    rle_eol[10..14].copy_from_slice(&58u32.to_le_bytes());
+    rle_eol[28..30].copy_from_slice(&8u16.to_le_bytes());
+    rle_eol[30..34].copy_from_slice(&1u32.to_le_bytes()); // RLE8
+    rle_eol[46..50].copy_from_slice(&1u32.to_le_bytes()); // 1 palette color
+    rle_eol[58..64].copy_from_slice(&[0, 0, 0, 0, 0, 1]); // extra EOLs + EOF
+    dir.file(
+        "GameData/Objects/rle_eol.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_eol_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, rle_eol),
+        ]),
+    );
+
+    let rle_delta_guid = 0x9000_0009u32;
+    let mut rle_delta = vec![0u8; 54 + 4 + 6];
+    rle_delta[0..54].copy_from_slice(&tiny_bmp()[..54]);
+    rle_delta[10..14].copy_from_slice(&58u32.to_le_bytes());
+    rle_delta[28..30].copy_from_slice(&8u16.to_le_bytes());
+    rle_delta[30..34].copy_from_slice(&1u32.to_le_bytes()); // RLE8
+    rle_delta[46..50].copy_from_slice(&1u32.to_le_bytes()); // 1 palette color
+    rle_delta[58..64].copy_from_slice(&[0, 2, 5, 0, 0, 1]); // delta past width + EOF
+    dir.file(
+        "GameData/Objects/rle_delta.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_delta_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, rle_delta),
+        ]),
+    );
+
+    // 9. 2x2 RLE8 scanline-crossing runs (`0x4def0c..0x4df014`):
+    // - top-down (`raw_height = -2`) 3-pixel run stays in `[0, 4)` -> true
+    // - bottom-up (`raw_height = 2`) EOL + 3-pixel run stays in `[0, 4)` -> true
+    // - top-down 5-pixel run exceeds `[0, 4)` -> false
+    // - bottom-up immediate 3-pixel run starts at row 1 (offset 2) and exceeds 4 -> false
+    let make_2x2_rle = |height: i32, rle: &[u8]| {
+        let mut bmp = vec![0u8; 54 + 4 + rle.len()];
+        bmp[0..54].copy_from_slice(&tiny_bmp()[..54]);
+        bmp[10..14].copy_from_slice(&58u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&2i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&height.to_le_bytes());
+        bmp[28..30].copy_from_slice(&8u16.to_le_bytes());
+        bmp[30..34].copy_from_slice(&1u32.to_le_bytes()); // RLE8
+        bmp[46..50].copy_from_slice(&1u32.to_le_bytes()); // 1 palette color
+        bmp[58..].copy_from_slice(rle);
+        bmp
+    };
+    let rle_td_wrap_guid = 0x9000_000au32;
+    dir.file(
+        "GameData/Objects/rle_td_wrap.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_td_wrap_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, make_2x2_rle(-2, &[3, 0, 0, 1])),
+        ]),
+    );
+    let rle_bu_wrap_guid = 0x9000_000bu32;
+    dir.file(
+        "GameData/Objects/rle_bu_wrap.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_bu_wrap_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, make_2x2_rle(2, &[0, 0, 3, 0, 0, 1])),
+        ]),
+    );
+    let rle_td_oob_guid = 0x9000_000cu32;
+    dir.file(
+        "GameData/Objects/rle_td_oob.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_td_oob_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, make_2x2_rle(-2, &[5, 0, 0, 1])),
+        ]),
+    );
+    let rle_bu_oob_guid = 0x9000_000du32;
+    dir.file(
+        "GameData/Objects/rle_bu_oob.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_bu_oob_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, make_2x2_rle(2, &[3, 0, 0, 1])),
+        ]),
+    );
+    // 10. 1x1 RLE8 with a 2-pixel run fits a 4-byte DWORD-aligned 16-bit
+    // surface pitch (`pitch = 2` pixels at `0x4def16`/`0x4def3d`), while a
+    // 3-pixel run overflows it.
+    let make_1x1_rle = |rle: &[u8]| {
+        let mut bmp = vec![0u8; 54 + 4 + rle.len()];
+        bmp[0..54].copy_from_slice(&tiny_bmp()[..54]);
+        bmp[10..14].copy_from_slice(&58u32.to_le_bytes());
+        bmp[28..30].copy_from_slice(&8u16.to_le_bytes());
+        bmp[30..34].copy_from_slice(&1u32.to_le_bytes());
+        bmp[46..50].copy_from_slice(&1u32.to_le_bytes());
+        bmp[58..].copy_from_slice(rle);
+        bmp
+    };
+    let rle_1x1_pitch_ok_guid = 0x9000_000eu32;
+    dir.file(
+        "GameData/Objects/rle_1x1_pitch_ok.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_1x1_pitch_ok_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, make_1x1_rle(&[2, 0, 0, 1])),
+        ]),
+    );
+    let rle_1x1_pitch_oob_guid = 0x9000_000fu32;
+    dir.file(
+        "GameData/Objects/rle_1x1_pitch_oob.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_1x1_pitch_oob_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, make_1x1_rle(&[3, 0, 0, 1])),
+        ]),
+    );
+
+    let install = Install::detect(&dir.0).unwrap();
+    let index = Index::build(&install).unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    let program = Program::link(
+        &index,
+        &catalog,
+        [
+            neutral_guid,
+            lang1_guid,
+            archived_guid,
+            bmp32_guid,
+            bmp57_guid,
+            truncated_guid,
+            pal57_guid,
+            rle_eol_guid,
+            rle_delta_guid,
+            rle_td_wrap_guid,
+            rle_bu_wrap_guid,
+            rle_td_oob_guid,
+            rle_bu_oob_guid,
+            rle_1x1_pitch_ok_guid,
+            rle_1x1_pitch_oob_guid,
+        ],
+    )
+    .unwrap();
+
+    let lib = |guid| {
+        let obj = catalog.object(guid).unwrap();
+        &program.libraries[&obj.resource]
+    };
+    assert!(lib(neutral_guid).has_portrait_bitmap);
+    assert!(!lib(neutral_guid).writable);
+    assert!(!lib(lang1_guid).has_portrait_bitmap);
+    assert!(!lib(lang1_guid).writable);
+    assert!(!lib(archived_guid).has_portrait_bitmap);
+    assert!(!lib(archived_guid).writable);
+    assert!(lib(bmp32_guid).has_portrait_bitmap);
+    assert!(!lib(bmp32_guid).writable);
+    assert!(lib(bmp57_guid).has_portrait_bitmap);
+    assert!(!lib(truncated_guid).has_portrait_bitmap);
+    assert!(lib(pal57_guid).has_portrait_bitmap);
+    assert!(lib(rle_eol_guid).has_portrait_bitmap);
+    assert!(lib(rle_delta_guid).has_portrait_bitmap);
+    assert!(lib(rle_td_wrap_guid).has_portrait_bitmap);
+    assert!(lib(rle_bu_wrap_guid).has_portrait_bitmap);
+    assert!(!lib(rle_td_oob_guid).has_portrait_bitmap);
+    assert!(!lib(rle_bu_oob_guid).has_portrait_bitmap);
+    assert!(lib(rle_1x1_pitch_ok_guid).has_portrait_bitmap);
+    assert!(!lib(rle_1x1_pitch_oob_guid).has_portrait_bitmap);
+}
+
 #[test]
 fn characters_library_writability_checks_read_write_open() {
     // 0x413094..0x4130dd: FlatFile::Open sets CanWrite() only when opening a

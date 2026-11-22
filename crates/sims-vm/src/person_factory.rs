@@ -104,8 +104,33 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        let skeleton =
-            crate::people::skeleton(&self.program.people, world, guid).map_err(|t| fail(0, t))?;
+        let early_name = self.early_skeleton_name(world, guid).map(str::to_owned);
+        if !pets_allowed(self.program.expansions)
+            && early_name.as_deref().is_some_and(|name| {
+                ["dog", "kat"]
+                    .iter()
+                    .any(|pet| name.eq_ignore_ascii_case(pet))
+            })
+        {
+            return Err(fail(
+                0,
+                Trap::Unsupported(format!(
+                    "0x440dd5: the person type 0x{guid:08X} is a pet ({:?}) and the \
+                     installed-expansions mask 0x{:04X} has neither Unleashed (0x20) nor \
+                     Makin' Magic (0x80), so the factory makes no person; what its caller does \
+                     then is not ported",
+                    early_name.as_deref().unwrap_or(""),
+                    self.program.expansions
+                )),
+            ));
+        }
+        let skeleton = crate::people::resolve_skeleton(
+            &self.program.people,
+            world,
+            guid,
+            early_name.as_deref(),
+        )
+        .map_err(|t| fail(0, t))?;
         if !pets_allowed(self.program.expansions)
             && ["dog", "kat"]
                 .iter()
@@ -125,6 +150,68 @@ impl Interpreter<'_> {
         self.construct_person(world, guid, skeleton)
     }
 
+    /// Reads body row 0 (skeleton name, `0x440d63` → `0x457f60` → `0x46ff01` →
+    /// `0x4704fa`) without requiring the `.bcf` skeleton itself to be loaded,
+    /// checking runtime-made overrides first, then the loader-ordered `STR#`
+    /// body table (`loaded_strings`, which skips deleted chunks per `0x41c542`
+    /// and orders split US-English runs per `0x470002`–`0x470049`), then
+    /// `People::skeleton_names` / `Library::strings` / `People::skeletons`.
+    fn early_skeleton_name<'s>(&'s self, world: &'s World, guid: u32) -> Option<&'s str> {
+        if let Some(name) = world
+            .characters
+            .string(guid, sims_sim::characters::SKELETON)
+        {
+            return Some(name);
+        }
+        let template = world.characters.definition(guid);
+        if let Some(def) = crate::interpreter::object_definition(self.catalog, world, guid)
+            && let Some(library) = self.program.libraries.get(&def.resource)
+            && let Some(words) = library.definitions.get(&def.chunk)
+        {
+            let table = words[19] as u16;
+            if let Some(loaded) = library.loaded_strings.get(&table) {
+                return loaded
+                    .as_deref()
+                    .and_then(|rows| rows.first())
+                    .filter(|row| !row.is_empty())
+                    .map(String::as_str);
+            }
+            if let Some(name) = self.program.people.skeleton_names.get(&template) {
+                return Some(name.as_str());
+            }
+            if let Some(row0) = library
+                .strings
+                .get(&table)
+                .and_then(|rows| rows.first())
+                .filter(|row| !row.is_empty())
+            {
+                return Some(row0.as_str());
+            }
+        } else if let Some(name) = self.program.people.skeleton_names.get(&template) {
+            return Some(name.as_str());
+        }
+        self.program
+            .people
+            .skeletons
+            .get(&template)
+            .map(|s| s.name.as_str())
+    }
+
+    /// Whether the native person factory refuses `guid` before constructing a
+    /// person (`0x440d63` → `0x440dd5` returning null): body string 0 (or
+    /// fallback skeleton name) is `"dog"` or `"kat"` and neither Unleashed
+    /// (`0x20`) nor Makin' Magic (`0x80`) is installed.
+    pub(crate) fn is_refused_pet(&self, world: &World, guid: u32) -> bool {
+        if pets_allowed(self.program.expansions) {
+            return false;
+        }
+        self.early_skeleton_name(world, guid).is_some_and(|name| {
+            ["dog", "kat"]
+                .iter()
+                .any(|pet| name.eq_ignore_ascii_case(pet))
+        })
+    }
+
     /// Like [`Self::create_person`], but returns `Ok(None)` when the native
     /// factory refuses a pet because neither Unleashed nor Makin' Magic is
     /// installed (`0x440dd5`).
@@ -138,9 +225,31 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        let skeleton =
-            crate::people::skeleton(&self.program.people, world, guid).map_err(|t| fail(0, t))?;
+        // 0x440d63..0x440dd8 checks body string 0 ("dog" / "kat") for both
+        // runtime-made and catalog pets before constructing cXPerson or
+        // loading the skeleton, and 0x58833c binds that same loader-ordered
+        // skeleton name.
+        let early_name = self.early_skeleton_name(world, guid).map(str::to_owned);
         if !pets_allowed(self.program.expansions)
+            && early_name.as_deref().is_some_and(|name| {
+                ["dog", "kat"]
+                    .iter()
+                    .any(|pet| name.eq_ignore_ascii_case(pet))
+            })
+        {
+            return Ok(None);
+        }
+        // 0x58833c -> 0x5a0384 -> 0x5a280f resolves skeleton names with
+        // byte-exact comparison and runtime-ordered lazy `.ndx` catalog loads.
+        let skeleton = crate::people::resolve_skeleton(
+            &self.program.people,
+            world,
+            guid,
+            early_name.as_deref(),
+        )
+        .map_err(|t| fail(0, t))?;
+        if early_name.is_none()
+            && !pets_allowed(self.program.expansions)
             && ["dog", "kat"]
                 .iter()
                 .any(|pet| skeleton.name.eq_ignore_ascii_case(pet))
@@ -300,20 +409,30 @@ impl Interpreter<'_> {
             .get(&id)
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?
             .guid;
+        {
+            let person = world
+                .objects
+                .get_mut(&id)
+                .and_then(|object| object.person.as_mut())
+                .ok_or_else(|| fail(Trap::native(0x1c, "object is not a person")))?;
+            let kept = person::KEPT.map(|word| person.data[word]);
+            person.data.fill(0);
+            for (word, value) in person::KEPT.into_iter().zip(kept) {
+                person.data[word] = value;
+            }
+        }
+        // 0x5888d3 -> 0x588914..0x588930 -> 0x58a178(0): run initial everyday
+        // dressing with `data[22] = 0, data[23] = 0` AFTER
+        // `default_traits_if_low` and BEFORE `reload_profile` (`0x588935`).
+        crate::outfits::dress_person(self.catalog, self.program, world, id, false).map_err(fail)?;
         // Looked up before the person is borrowed; a missing profile still
         // fails where it is read.
-        let profile = crate::people::profile(&self.program.people, world, guid);
+        let profile = crate::people::profile(&self.program.people, world, guid).map_err(fail)?;
         let person = world
             .objects
             .get_mut(&id)
             .and_then(|object| object.person.as_mut())
             .ok_or_else(|| fail(Trap::native(0x1c, "object is not a person")))?;
-        let kept = person::KEPT.map(|word| person.data[word]);
-        person.data.fill(0);
-        for (word, value) in person::KEPT.into_iter().zip(kept) {
-            person.data[word] = value;
-        }
-        let profile = profile.map_err(fail)?;
         reload_profile(&mut person.data, &profile).map_err(fail)?;
         let low = interests_low(&person.data);
         self.attach_neighbor(world, id).map_err(fail)?;

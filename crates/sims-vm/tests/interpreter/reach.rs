@@ -91,16 +91,10 @@ fn lot(operands: [u8; 8]) -> (Fixture, u16) {
     }
     fx.program.animations.insert_samples(SKILL);
     fx.world.types.insert(8, SIM_GUID);
-    fx.program.people.profiles.insert(
-        SIM_GUID,
-        Profile {
-            gender: None,
-            age: None,
-            skin: None,
-            tones: Vec::new(),
-            rig: Default::default(),
-        },
-    );
+    fx.program
+        .people
+        .profiles
+        .insert(SIM_GUID, Profile::default());
     fx.add(
         SIM_FILE,
         4096,

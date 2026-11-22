@@ -166,6 +166,347 @@ impl Wardrobe {
             })
             .sum()
     }
+
+    /// The distinct suit names that contribute at least one entry to
+    /// [`Wardrobe::count`].
+    pub fn matching_suits(&self, head: bool, female: bool, child: bool, skin: &str) -> Vec<&str> {
+        let (first, length) = if head { ('c', 6) } else { ('b', 9) };
+        let sex = if female { 'f' } else { 'm' };
+        let age = if child { 'c' } else { 'a' };
+        let skin = skin.to_ascii_lowercase();
+        self.suits
+            .iter()
+            .filter(|suit| {
+                let chars: Vec<char> = suit.chars().take(length).collect();
+                let matches = chars.len() == length
+                    && chars[0] == first
+                    && (chars[4] == sex || chars[4] == 'u')
+                    && chars[5] == age
+                    && !(head && chars[1] == 't');
+                if !matches {
+                    return false;
+                }
+                let part: String = chars.into_iter().collect();
+                let prefix = format!("{part}{skin}");
+                self.textures.iter().any(|t| t.starts_with(&prefix))
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// The distinct pet suit names that contribute at least one entry to
+    /// [`Wardrobe::count_pet`].
+    pub fn matching_pet_suits(&self, cat: bool) -> Vec<&str> {
+        let species = if cat {
+            ['c', 'a', 't']
+        } else {
+            ['d', 'o', 'g']
+        };
+        self.suits
+            .iter()
+            .filter(|suit| {
+                let chars: Vec<char> = suit.chars().take(7).collect();
+                if !(chars.len() == 7 && chars[0] == 'b' && chars[4..7] == species) {
+                    return false;
+                }
+                let prefix: String = chars.into_iter().collect();
+                self.textures.iter().any(|t| t.starts_with(&prefix))
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Whether `self.textures` contains any texture that could pair with a
+    /// matching human suit for `(head, female, child, skin)`.
+    pub fn has_any_texture(&self, head: bool, female: bool, child: bool, skin: &str) -> bool {
+        let (first, length) = if head { ('c', 6) } else { ('b', 9) };
+        let sex = if female { 'f' } else { 'm' };
+        let age = if child { 'c' } else { 'a' };
+        let skin = skin.to_ascii_lowercase();
+        let skin_len = skin.chars().count();
+        self.textures.iter().any(|tex| {
+            let chars: Vec<char> = tex.chars().take(length + skin_len).collect();
+            chars.len() == length + skin_len
+                && chars[0] == first
+                && (chars[4] == sex || chars[4] == 'u')
+                && chars[5] == age
+                && !(head && chars[1] == 't')
+                && chars[length..].iter().collect::<String>() == skin
+        })
+    }
+
+    /// Picks the `index`-th human body (`head == false`) or head (`head == true`)
+    /// entry matching [`Wardrobe::count`], returning
+    /// `(suit_name_63, formatted_row)`.
+    pub fn pick(
+        &self,
+        head: bool,
+        female: bool,
+        child: bool,
+        skin: &str,
+        mut index: usize,
+    ) -> Option<(String, String)> {
+        let (first, length, tag) = if head {
+            ('c', 6, "HEAD-HEAD")
+        } else {
+            ('b', 9, "BODY")
+        };
+        let sex = if female { 'f' } else { 'm' };
+        let age = if child { 'c' } else { 'a' };
+        let skin = skin.to_ascii_lowercase();
+        for suit in &self.suits {
+            let chars: Vec<char> = suit.chars().take(length).collect();
+            let matches = chars.len() == length
+                && chars[0] == first
+                && (chars[4] == sex || chars[4] == 'u')
+                && chars[5] == age
+                && !(head && chars[1] == 't');
+            if !matches {
+                continue;
+            }
+            let part: String = chars.into_iter().collect();
+            let prefix = format!("{part}{skin}");
+            for tex in &self.textures {
+                if tex.starts_with(&prefix) {
+                    if index == 0 {
+                        let suit_63: String = suit.chars().take(63).collect();
+                        let stem = tex
+                            .strip_suffix(".bmp")
+                            .or_else(|| tex.strip_suffix(".tga"))
+                            .unwrap_or(tex);
+                        // 0x409843/0x409851/0x472f41 caps the complete
+                        // `BODY=<tex>` / `HEAD-HEAD=<tex>` descriptor at 63 bytes.
+                        let desc_63: String = format!("{tag}={stem}").chars().take(63).collect();
+                        let row = format!("{suit_63},{desc_63}");
+                        return Some((suit_63, row));
+                    }
+                    index -= 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Picks the `index`-th pet body entry matching [`Wardrobe::count_pet`],
+    /// returning `(suit_name_63, formatted_row)`.
+    pub fn pick_pet(&self, cat: bool, mut index: usize) -> Option<(String, String)> {
+        let species = if cat {
+            ['c', 'a', 't']
+        } else {
+            ['d', 'o', 'g']
+        };
+        for suit in &self.suits {
+            let chars: Vec<char> = suit.chars().take(7).collect();
+            if !(chars.len() == 7 && chars[0] == 'b' && chars[4..7] == species) {
+                continue;
+            }
+            let prefix: String = chars.into_iter().collect();
+            for tex in &self.textures {
+                if tex.starts_with(&prefix) {
+                    if index == 0 {
+                        let suit_63: String = suit.chars().take(63).collect();
+                        let stem = tex
+                            .strip_suffix(".bmp")
+                            .or_else(|| tex.strip_suffix(".tga"))
+                            .unwrap_or(tex);
+                        let desc_63: String = format!("BODY={stem}").chars().take(63).collect();
+                        let row = format!("{suit_63},{desc_63}");
+                        return Some((suit_63, row));
+                    }
+                    index -= 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether the pet body wardrobe list (`0x409663`) for `cat` (`true` = cat,
+    /// `false` = dog) contains an entry matching `raw_row` under `0x472ec4` →
+    /// `0x5874ca` and `0x472f92` (63-byte suit and `BODY=` descriptor buffers),
+    /// returning `(suit_name_63, formatted_row)` when found.
+    pub fn find_pet_outfit(&self, cat: bool, raw_row: &str) -> Option<(String, String)> {
+        let row_255: String = raw_row.chars().take(255).collect();
+        let before_semi = row_255.split(';').next().unwrap_or(&row_255);
+        let (raw_suit, raw_tex) = before_semi.split_once(',')?;
+        let row_suit: String = raw_suit.to_ascii_lowercase().chars().take(63).collect();
+        let row_tex: String = raw_tex.to_ascii_lowercase().chars().take(63).collect();
+        let species = if cat {
+            ['c', 'a', 't']
+        } else {
+            ['d', 'o', 'g']
+        };
+        for suit in &self.suits {
+            let chars: Vec<char> = suit.chars().take(7).collect();
+            if !(chars.len() == 7 && chars[0] == 'b' && chars[4..7] == species) {
+                continue;
+            }
+            let suit_63: String = suit.to_ascii_lowercase().chars().take(63).collect();
+            if suit_63 != row_suit {
+                continue;
+            }
+            let prefix: String = chars.into_iter().collect();
+            for tex in &self.textures {
+                if tex.starts_with(&prefix) {
+                    let stem = tex
+                        .strip_suffix(".bmp")
+                        .or_else(|| tex.strip_suffix(".tga"))
+                        .unwrap_or(tex);
+                    let desc_63: String = format!("BODY={stem}").chars().take(63).collect();
+                    if desc_63.to_ascii_lowercase() == row_tex {
+                        return Some((suit_63.clone(), format!("{suit_63},{desc_63}")));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Parses a `STR# 200` body (`head == false`, `0x40d0a4`) or head
+    /// (`head == true`, `0x40d408`) outfit row under `0x472ec4` → `0x5874ca`
+    /// (255-char row buffer at `0x587511`–`0x58752c`, strip `;...`, split on
+    /// `,`, 63-char suit/texture buffers at `0x472ed2`/`0x472ee2`/`0x46f79a`)
+    /// and validates that the suit prefix and texture descriptor can match a
+    /// human wardrobe entry for `(head, female, child, skin)`.
+    ///
+    /// Returns `(row_suit_63, row_tex_63, tex_prefix, tag)` when the row is
+    /// structurally eligible to match the wardrobe list.
+    fn parse_outfit_row(
+        head: bool,
+        female: bool,
+        child: bool,
+        skin: &str,
+        raw_row: &str,
+    ) -> Option<(String, String, String, &'static str)> {
+        let row_255: String = raw_row.chars().take(255).collect();
+        let before_semi = row_255.split(';').next().unwrap_or(&row_255);
+        let (raw_suit, raw_tex) = before_semi.split_once(',')?;
+        let row_suit: String = raw_suit.to_ascii_lowercase().chars().take(63).collect();
+        let row_tex: String = raw_tex.to_ascii_lowercase().chars().take(63).collect();
+        let tag = if head { "head-head=" } else { "body=" };
+        if !row_tex.starts_with(tag) {
+            return None;
+        }
+        let (first, length) = if head { ('c', 6) } else { ('b', 9) };
+        let sex = if female { 'f' } else { 'm' };
+        let age = if child { 'c' } else { 'a' };
+        let chars: Vec<char> = row_suit.chars().take(length).collect();
+        let matches = chars.len() == length
+            && chars[0] == first
+            && (chars[4] == sex || chars[4] == 'u')
+            && chars[5] == age
+            && !(head && chars[1] == 't');
+        if !matches {
+            return None;
+        }
+        let part: String = chars.into_iter().collect();
+        let tex_prefix = format!("{part}{}", skin.to_ascii_lowercase());
+        let expected_tex: String = format!("{tag}{tex_prefix}").chars().take(63).collect();
+        if !row_tex.starts_with(&expected_tex) {
+            return None;
+        }
+        Some((row_suit, row_tex, tex_prefix, tag))
+    }
+
+    /// Whether `raw_row` is structurally eligible to match any human wardrobe
+    /// entry for `(head, female, child, skin)` under `0x5874ca` and `0x472f92`.
+    pub fn can_match_outfit_row(
+        head: bool,
+        female: bool,
+        child: bool,
+        skin: &str,
+        raw_row: &str,
+    ) -> bool {
+        Self::parse_outfit_row(head, female, child, skin, raw_row).is_some()
+    }
+
+    /// Whether [`Wardrobe::textures`] contains a `.bmp` / `.tga` texture
+    /// matching `raw_row`'s texture descriptor (`0x40982d` / `0x40a502` and
+    /// `0x472f92`). Since `.cmx`/`.bcf` suit decode errors cannot add missing
+    /// textures, `false` guarantees a miss when texture enumeration succeeded.
+    pub fn has_outfit_texture(
+        &self,
+        head: bool,
+        female: bool,
+        child: bool,
+        skin: &str,
+        raw_row: &str,
+    ) -> bool {
+        let Some((_, row_tex, tex_prefix, tag)) =
+            Self::parse_outfit_row(head, female, child, skin, raw_row)
+        else {
+            return false;
+        };
+        self.textures.iter().any(|tex| {
+            tex.starts_with(&tex_prefix)
+                && tex
+                    .strip_suffix(".bmp")
+                    .or_else(|| tex.strip_suffix(".tga"))
+                    .is_some_and(|stem| {
+                        let full: String = format!("{tag}{stem}").chars().take(63).collect();
+                        full == row_tex
+                    })
+        })
+    }
+
+    /// The distinct suit names from [`Wardrobe::suits`] whose human wardrobe
+    /// entry (`0x409663` body / `0x40a364` head) matches a `STR# 200` outfit
+    /// row (`raw_row`) under `0x472ec4` → `0x5874ca` (255-byte row cap, strip
+    /// `;...`, split on `,`) and `0x472f92` → `0x46f874` (ASCII
+    /// case-insensitive match against `(suit, "BODY=" + stem)` or
+    /// `(suit, "HEAD-HEAD=" + stem)`), including the native 64-byte fixed
+    /// buffers (63 text characters + NUL at `0x472e7e`, `0x472ed2`,
+    /// `0x472ee2`, `0x46f79a`).
+    pub fn matching_outfits(
+        &self,
+        head: bool,
+        female: bool,
+        child: bool,
+        skin: &str,
+        raw_row: &str,
+    ) -> Vec<&str> {
+        let Some((row_suit, row_tex, tex_prefix, tag)) =
+            Self::parse_outfit_row(head, female, child, skin, raw_row)
+        else {
+            return Vec::new();
+        };
+        let has_tex = self.textures.iter().any(|tex| {
+            tex.starts_with(&tex_prefix)
+                && tex
+                    .strip_suffix(".bmp")
+                    .or_else(|| tex.strip_suffix(".tga"))
+                    .is_some_and(|stem| {
+                        let full: String = format!("{tag}{stem}").chars().take(63).collect();
+                        full == row_tex
+                    })
+        });
+        if !has_tex {
+            return Vec::new();
+        }
+        self.suits
+            .iter()
+            .filter(|suit| {
+                let s63: String = suit.chars().take(63).collect();
+                s63 == row_suit
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Whether a `STR# 200` body (`head == false`, `0x40d0a4`) or head
+    /// (`head == true`, `0x40d408`) outfit row matches any entry in the human
+    /// wardrobe list built by `0x409663` / `0x40a364`.
+    pub fn contains_outfit(
+        &self,
+        head: bool,
+        female: bool,
+        child: bool,
+        skin: &str,
+        raw_row: &str,
+    ) -> bool {
+        !self
+            .matching_outfits(head, female, child, skin, raw_row)
+            .is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -251,5 +592,74 @@ mod tests {
         );
         assert_eq!(w.count_pet(false), 3);
         assert_eq!(w.count_pet(true), 1);
+    }
+
+    #[test]
+    fn contains_outfit_matches_body_and_head_rows_like_0x472f92() {
+        let w = wardrobe(
+            &["b006fafat_01", "c001fa_mercedes"],
+            &["b006fafatlgt_tt1.bmp", "c001falgt_shannon01.tga"],
+        );
+        assert!(w.contains_outfit(
+            false,
+            true,
+            false,
+            "lgt",
+            "b006fafat_01,BODY=B006FAFatlgt_TT1"
+        ));
+        assert!(w.contains_outfit(
+            true,
+            true,
+            false,
+            "LGT",
+            "c001fa_mercedes,HEAD-HEAD=C001FAlgt_Shannon01;extra"
+        ));
+        // Wrong tag, wrong skin tone, missing comma, or NPC suit not in wardrobe.
+        assert!(!w.contains_outfit(
+            true,
+            true,
+            false,
+            "lgt",
+            "c001fa_mercedes,BODY=C001FAlgt_Shannon01"
+        ));
+        assert!(!w.contains_outfit(
+            true,
+            true,
+            false,
+            "drk",
+            "c001fa_mercedes,HEAD-HEAD=C001FAlgt_Shannon01"
+        ));
+        assert!(!w.contains_outfit(true, true, false, "lgt", "c001fa_mercedes"));
+        assert!(!w.contains_outfit(
+            true,
+            true,
+            false,
+            "lgt",
+            "c999fa_masseuse,HEAD-HEAD=c999falgt_masseuse"
+        ));
+
+        // 64-byte fixed buffers (63 text bytes + NUL at 0x472e7e / 0x472ee2):
+        // body and head texture names differing only past byte 63 still match.
+        let long_body_tex = format!("b006fafatlgt_{}_aaa.bmp", "x".repeat(50));
+        let long_body_row = format!("b006fafat_01,BODY=b006fafatlgt_{}_bbb", "x".repeat(50));
+        let long_head_tex = format!("c001falgt_{}_aaa.bmp", "y".repeat(50));
+        let long_head_row = format!("c001fa_mercedes,HEAD-HEAD=c001falgt_{}_bbb", "y".repeat(50));
+        let w_long = wardrobe(
+            &["b006fafat_01", "c001fa_mercedes"],
+            &[&long_body_tex, &long_head_tex],
+        );
+        assert!(w_long.contains_outfit(false, true, false, "lgt", &long_body_row));
+        assert!(w_long.contains_outfit(true, true, false, "lgt", &long_head_row));
+
+        // 256-byte row buffer (255 text bytes + NUL at 0x587511..0x58752c):
+        // a comma past byte 255 is truncated away before the split at 0x58759f.
+        let suit_63 = format!("c001fa_{}", "a".repeat(56));
+        let past_255 = format!("{suit_63}{},HEAD-HEAD=c001falgt_shannon01", "x".repeat(194));
+        assert_eq!(past_255.find(','), Some(257));
+        let w_255 = wardrobe(&[&suit_63], &["c001falgt_shannon01.bmp"]);
+        assert!(!Wardrobe::can_match_outfit_row(
+            true, true, false, "lgt", &past_255
+        ));
+        assert!(!w_255.contains_outfit(true, true, false, "lgt", &past_255));
     }
 }
