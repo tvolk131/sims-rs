@@ -1316,82 +1316,91 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
     );
 
     // 6. TV / appliance dynamic sprite animation (`dynamic_sprites`) hits Tier 1
-    //    and visibly changes pixels on an object with dynamic sprite parts.
-    let dyn_id = world
+    //    and visibly changes pixels on a real dynamic-sprite object on House05.
+    let (dyn_id, dyn_cam, dyn_target) = world
         .objects
         .iter()
-        .find(|&(&id, o)| {
-            if o.person.is_none()
-                && o.position[2] == 1
-                && night_base.drawn(id).is_some()
-                && assets
+        .find_map(|(&id, o)| {
+            if o.person.is_some()
+                || o.position[2] != 1
+                || o.position[0] < 0
+                || o.position[1] < 0
+                || !assets
                     .definition(o.guid)
                     .is_some_and(|d| !d.shapes_wall() && d.dynamic_base > 0)
             {
+                return None;
+            }
+            let mut cam = camera;
+            cam.origin = [0, 0];
+            let p = cam.project_fine(cam.rotate_fine([o.position[0], o.position[1]]), 1, 0);
+            cam.origin = [size[0] as i32 / 2 - p[0], size[1] as i32 / 2 - p[1]];
+            let mut before = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+            draw_lot_with_preview(&world, &lot, assets, &cam, (400, 300), None, &mut before);
+            for candidate in [vec![0i16; 16], vec![1i16; 16]] {
+                if o.dynamic_sprites == candidate {
+                    continue;
+                }
                 let mut probe_world = world.clone();
-                let target_dyn = if o.dynamic_sprites.is_empty() {
-                    vec![0; 16]
-                } else {
-                    Vec::new()
-                };
-                probe_world.objects.get_mut(&id).unwrap().dynamic_sprites = target_dyn;
+                probe_world.objects.get_mut(&id).unwrap().dynamic_sprites = candidate.clone();
                 let mut probe = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
                 draw_lot_with_preview(
                     &probe_world,
                     &lot,
                     assets,
-                    &camera,
+                    &cam,
                     (400, 300),
                     None,
                     &mut probe,
                 );
-                probe.color != after_lamp_pool.color
-            } else {
-                false
+                if probe.color != before.color {
+                    return Some((id, cam, candidate));
+                }
             }
+            None
         })
-        .map(|(&id, _)| id);
-    let after_dyn = if let Some(dyn_id) = dyn_id {
-        let obj = world.objects.get_mut(&dyn_id).unwrap();
-        obj.dynamic_sprites = if obj.dynamic_sprites.is_empty() {
-            vec![0; 16]
-        } else {
-            Vec::new()
-        };
-        let canvas = assert_parity_with_hit(
-            &mut cache,
-            &world,
-            &lot,
-            assets,
-            &camera,
-            (400, 300),
-            None,
-            size,
-            CacheHit::Environment,
-            "appliance dynamic_sprites toggle",
-        );
-        assert_ne!(
-            canvas.color, after_lamp_pool.color,
-            "dynamic_sprites toggle must visibly change pixels"
-        );
-        canvas
-    } else {
-        // Fallback if House05 has no dynamic-sprite object on screen: toggle
-        // `dynamic_sprites` on `anim_id` to still exercise the Tier-1 key path.
-        world.objects.get_mut(&anim_id).unwrap().dynamic_sprites = vec![1, 2];
-        assert_parity_with_hit(
-            &mut cache,
-            &world,
-            &lot,
-            assets,
-            &camera,
-            (400, 300),
-            None,
-            size,
-            CacheHit::Environment,
-            "appliance dynamic_sprites toggle",
-        )
-    };
+        .expect("placed House05 dynamic-sprite object whose dynamic_sprites visibly change pixels");
+    let before_dyn = assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &dyn_cam,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Miss,
+        "dynamic-sprite object framed cold",
+    );
+    world.objects.get_mut(&dyn_id).unwrap().dynamic_sprites = dyn_target;
+    let after_dyn_framed = assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &dyn_cam,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Environment,
+        "appliance dynamic_sprites toggle",
+    );
+    assert_ne!(
+        after_dyn_framed.color, before_dyn.color,
+        "dynamic_sprites toggle must visibly change pixels"
+    );
+    let after_dyn = assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Miss,
+        "restore main camera after dynamic-sprite check",
+    );
 
     // 7. Buy Mode preview moving (cursor + visible off-lot held object, no
     //    shadow/wall change) hits Tier 1 (`Environment`) and visibly moves the
