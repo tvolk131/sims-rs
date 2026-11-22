@@ -470,9 +470,13 @@ fn the_lot_hides_the_people_behind_it() {
                         };
                         assert_eq!(on.id_at(x, y), expected, "{x}, {y}");
                     }
-                    // Laid over everything: nearer than any depth there is.
+                    // Laid over everything: clear the lot's depth buffer so
+                    // nothing on the lot hides the person while keeping their
+                    // real 16-bit depths (which `Canvas::put` clamps to
+                    // `0..=65535`) so self-occlusion matches `on`.
                     let mut over = base.clone();
-                    people.draw(&solo, &camera, &mut over, |_, _, _| -1.0e9);
+                    over.depth.fill(sims_render::depth::EMPTY);
+                    people.draw_on_lot(&solo, &camera, &mut over);
                     // The feet: a band a few pixels above the point the
                     // person stands on.
                     let [x, y] = feet;
