@@ -704,30 +704,41 @@ impl NeighborhoodMap {
                 .map(|img| Surface565::from_bitmap(&img)))
         };
 
-        let backdrop = load_ui(kind.backdrop_id(non_us))?.ok_or_else(|| {
-            Error::new(format!(
-                "missing neighborhood backdrop resource {}",
-                kind.backdrop_id(non_us)
-            ))
-        })?;
-        let large_frame = load_ui(kind.large_frame_id())?;
-        let mut waves = Vec::new();
-        for &wave_id in kind.wave_ids(non_us) {
-            if let Some(surf) = load_ui(wave_id)? {
-                waves.push(surf);
+        let local_art = load_local_map_artwork(install, user_dir, kind);
+        let (backdrop, waves, vacation_port, vacation_trees) = if let Some(local) = local_art {
+            (
+                local.backdrop,
+                local.waves,
+                local.vacation_port,
+                local.vacation_trees,
+            )
+        } else {
+            let backdrop = load_ui(kind.backdrop_id(non_us))?.ok_or_else(|| {
+                Error::new(format!(
+                    "missing neighborhood backdrop resource {}",
+                    kind.backdrop_id(non_us)
+                ))
+            })?;
+            let mut waves = Vec::new();
+            for &wave_id in kind.wave_ids(non_us) {
+                if let Some(surf) = load_ui(wave_id)? {
+                    waves.push(surf);
+                }
             }
-        }
-        let (vacation_port, vacation_trees, vacation_logo, vacation_no_vacancy) =
-            if kind == NeighborhoodKind::Vacation {
-                (
-                    load_ui(res::VACATION_PORT)?,
-                    load_ui(res::VACATION_TREES)?,
-                    load_ui(res::VACATION_LOGO)?,
-                    load_ui(res::VACATION_NO_VACANCY)?,
-                )
+            let (port, trees) = if kind == NeighborhoodKind::Vacation {
+                (load_ui(res::VACATION_PORT)?, load_ui(res::VACATION_TREES)?)
             } else {
-                (None, None, load_ui(res::VACATION_LOGO)?, None)
+                (None, None)
             };
+            (backdrop, waves, port, trees)
+        };
+        let large_frame = load_ui(kind.large_frame_id())?;
+        let vacation_logo = load_ui(res::VACATION_LOGO)?;
+        let vacation_no_vacancy = if kind == NeighborhoodKind::Vacation {
+            load_ui(res::VACATION_NO_VACANCY)?
+        } else {
+            None
+        };
 
         let mut filter_badges = BTreeMap::new();
         for filter in CommunityFilter::ALL {
@@ -817,9 +828,8 @@ impl NeighborhoodMap {
                         })
                 };
                 let status = resolve_lot_status(lot_id, kind, zoning, &occupancy);
-                let lot_i32 = i32::from(lot_id);
-                let has_primary_vacation_stay = occupancy.primary_vacation_stays.contains(&lot_i32);
-                let has_vacation_occupancy = occupancy.any_house_matches.contains(&lot_i32);
+                let has_primary_vacation_stay = occupancy.has_primary_vacation_stay(lot_id);
+                let has_vacation_occupancy = occupancy.has_vacation_occupancy(lot_id);
                 let cell_origin =
                     compute_cell_origin(anchor, metrics, [normal.width, normal.height]);
 
@@ -1797,34 +1807,60 @@ fn read_lot_filter_mask(iff: &NativeIff) -> Option<u16> {
     Some(s.i16().unwrap_or(0) as u16)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FamilyRecord {
+    id: i32,
+    house: i32,
+    secondary_house: i32,
+}
+
 #[derive(Default)]
 struct FamilyOccupancy {
-    primary_lot: BTreeMap<u16, (i32, Option<u16>)>,
-    vacation_lot: BTreeMap<u16, i32>,
-    /// Primary houses with at least one `FAMI` record whose 32-bit secondary
-    /// house is nonzero (`0x54f20e`), accumulated across every `FAMI` chunk.
-    primary_vacation_stays: BTreeSet<i32>,
-    /// Every house ID referenced as primary or secondary by any `FAMI` record
-    /// (`0x54f24f`), accumulated across every `FAMI` chunk.
-    any_house_matches: BTreeSet<i32>,
+    /// Variant-0 `FAMI` records sorted in ascending family ID order, matching
+    /// native `0x424b75..0x424c65` (`IFFResFile3` tree order) and `0x425d95`.
+    families: Vec<FamilyRecord>,
 }
 
 impl FamilyOccupancy {
-    fn record_family_houses(&mut self, family_id: i32, house: i32, secondary_raw: i32) {
-        // 0x54f20e & 0x54f24f compare house and secondary_raw directly against
-        // the lot ID without excluding lot 0.
-        self.any_house_matches.insert(house);
-        self.any_house_matches.insert(secondary_raw);
-        if secondary_raw != 0 {
-            self.primary_vacation_stays.insert(house);
+    fn record_family_houses(&mut self, family_id: i32, house: i32, secondary_house: i32) {
+        self.families.push(FamilyRecord {
+            id: family_id,
+            house,
+            secondary_house,
+        });
+    }
+
+    /// Native `GetFamilyByLot` (`0x425d95..0x425de0`):
+    /// - for lot `0`, selects the first family whose `id == 0`,
+    /// - for any other lot, selects the first family whose primary or secondary
+    ///   house equals `lot_id`.
+    fn occupant_for_lot(&self, lot_id: u16) -> Option<&FamilyRecord> {
+        let lot = i32::from(lot_id);
+        if lot == 0 {
+            self.families.iter().find(|f| f.id == 0)
+        } else {
+            self.families
+                .iter()
+                .find(|f| f.house == lot || f.secondary_house == lot)
         }
-        let secondary_u16 = u16::try_from(secondary_raw).ok().filter(|&lot| lot > 0);
-        if let Some(primary) = u16::try_from(house).ok().filter(|&lot| lot > 0) {
-            self.primary_lot.insert(primary, (family_id, secondary_u16));
-        }
-        if let Some(vac_lot) = secondary_u16 {
-            self.vacation_lot.insert(vac_lot, family_id);
-        }
+    }
+
+    /// Native `0x54f20e`: true if any family has `primary_house == lot_id` and
+    /// nonzero 32-bit `secondary_house`.
+    fn has_primary_vacation_stay(&self, lot_id: u16) -> bool {
+        let lot = i32::from(lot_id);
+        self.families
+            .iter()
+            .any(|f| f.house == lot && f.secondary_house != 0)
+    }
+
+    /// Native `0x54f24f`: true if any family references `lot_id` as its primary
+    /// or secondary house.
+    fn has_vacation_occupancy(&self, lot_id: u16) -> bool {
+        let lot = i32::from(lot_id);
+        self.families
+            .iter()
+            .any(|f| f.house == lot || f.secondary_house == lot)
     }
 
     /// Parses a raw `FAMI` chunk payload matching `0x4104ce..0x41064e` (with no
@@ -1890,8 +1926,9 @@ fn load_family_occupancy(install: &Install, user_dir: &Path) -> FamilyOccupancy 
     else {
         return occ;
     };
-    for (id, data, flags) in iff.all(b"FAMI") {
-        // 0x410673 / 0x4e1e73: native family ID is the FAMI chunk ID, not payload `number`.
+    // 0x424b75..0x424c0b + 0x41031b + 0x41bad8: native family loading resolves
+    // each non-negative signed 16-bit FAMI ID through variant 0 in ascending ID order.
+    for (id, data, flags) in iff.all_variant_zero_sorted(b"FAMI") {
         occ.record_fami_chunk(i32::from(id), data, flags);
     }
     occ
@@ -1903,18 +1940,15 @@ fn resolve_lot_status(
     zoning: LotZoning,
     occ: &FamilyOccupancy,
 ) -> LotStatus {
+    let occupant = occ.occupant_for_lot(lot_id);
     if kind == NeighborhoodKind::Vacation || zoning == LotZoning::Community {
-        // 0x54f270..0x54f27e: Vacation occupancy matches primary OR secondary house.
-        let occupied_by_family = occ
-            .vacation_lot
-            .get(&lot_id)
-            .copied()
-            .or_else(|| occ.primary_lot.get(&lot_id).map(|&(fid, _)| fid));
-        LotStatus::Community { occupied_by_family }
-    } else if let Some(&(family_id, vacation_lot)) = occ.primary_lot.get(&lot_id) {
+        LotStatus::Community {
+            occupied_by_family: occupant.map(|f| f.id),
+        }
+    } else if let Some(fam) = occupant {
         LotStatus::Occupied {
-            family_id,
-            vacation_lot,
+            family_id: fam.id,
+            vacation_lot: u16::try_from(fam.secondary_house).ok().filter(|&v| v > 0),
         }
     } else {
         LotStatus::Vacant
@@ -1979,7 +2013,6 @@ struct NativeResource {
 ///   4-byte type tag and bounds (`0x41d32a..0x41d341`), matching native lookup.
 struct NativeIff {
     bytes: Vec<u8>,
-    order: BTreeMap<[u8; 4], Vec<NativeResource>>,
     by_key: BTreeMap<([u8; 4], u16, u8), NativeResource>,
 }
 
@@ -2002,7 +2035,6 @@ impl NativeIff {
             _ => return None,
         };
 
-        let mut order: BTreeMap<[u8; 4], Vec<NativeResource>> = BTreeMap::new();
         let mut by_key: BTreeMap<([u8; 4], u16, u8), NativeResource> = BTreeMap::new();
         let mut used_map = false;
 
@@ -2028,11 +2060,9 @@ impl NativeIff {
                         bytes.get(rsmp_offset + CHUNK_HEADER_SIZE..rsmp_offset.checked_add(length)?)
                     });
                 if let Some(payload) = payload
-                    && let Some((parsed_order, parsed_by_key, lists_self)) =
-                        parse_native_rsmp(payload)
+                    && let Some((parsed_by_key, lists_self)) = parse_native_rsmp(payload)
                     && !lists_self
                 {
-                    order = parsed_order;
                     by_key = parsed_by_key;
                     used_map = true;
                 }
@@ -2062,15 +2092,7 @@ impl NativeIff {
                         id,
                         flags,
                     };
-                    if let Some(prev) = by_key.insert(key, res) {
-                        if let Some(list) = order.get_mut(&tag)
-                            && let Some(slot) = list.iter_mut().find(|r| r.offset == prev.offset)
-                        {
-                            *slot = res;
-                        }
-                    } else {
-                        order.entry(tag).or_default().push(res);
-                    }
+                    by_key.insert(key, res);
                 }
                 let Some(next) = pos.checked_add(length) else {
                     break;
@@ -2079,11 +2101,7 @@ impl NativeIff {
             }
         }
 
-        Some(Self {
-            bytes,
-            order,
-            by_key,
-        })
+        Some(Self { bytes, by_key })
     }
 
     /// Reads the payload for `res`, verifying only bounds and matching chunk
@@ -2111,22 +2129,19 @@ impl NativeIff {
         Some((self.payload(res)?, res.flags))
     }
 
-    fn all(&self, tag: &[u8; 4]) -> Vec<(u16, &[u8], u16)> {
-        let Some(entries) = self.order.get(tag) else {
-            return Vec::new();
-        };
-        entries
-            .iter()
-            .filter_map(|&res| Some((res.id, self.payload(res)?, res.flags)))
+    /// Returns every variant-0 (`(flags >> 8) == 0`) resource of `tag` with a
+    /// non-negative signed 16-bit ID (`0..=32767`), sorted by ascending ID
+    /// (`0x424b75..0x424c0b`, `0x41031b`, `0x41bad8`).
+    fn all_variant_zero_sorted(&self, tag: &[u8; 4]) -> Vec<(u16, &[u8], u16)> {
+        self.by_key
+            .range((*tag, 0, 0)..=(*tag, i16::MAX as u16, 0))
+            .filter(|&(&(_, _, variant), _)| variant == 0)
+            .filter_map(|(_, &res)| Some((res.id, self.payload(res)?, res.flags)))
             .collect()
     }
 }
 
-type ParsedRsmp = (
-    BTreeMap<[u8; 4], Vec<NativeResource>>,
-    BTreeMap<([u8; 4], u16, u8), NativeResource>,
-    bool,
-);
+type ParsedRsmp = (BTreeMap<([u8; 4], u16, u8), NativeResource>, bool);
 
 /// Parses a native `rsmp` stream (`0x41be90..0x41c04c`, `0x41b7cb..0x41b826`),
 /// stopping immediately after the declared type/entry counts so trailing
@@ -2136,11 +2151,10 @@ fn parse_native_rsmp(payload: &[u8]) -> Option<ParsedRsmp> {
     let (mut s, _version) = NativeStream::open(payload, 0x10, false)?;
     let _unused_bytes = s.i32()?;
     let type_count = s.i32()?;
-    let mut order: BTreeMap<[u8; 4], Vec<NativeResource>> = BTreeMap::new();
     let mut by_key: BTreeMap<([u8; 4], u16, u8), NativeResource> = BTreeMap::new();
     let mut lists_self = false;
     if type_count <= 0 {
-        return Some((order, by_key, false));
+        return Some((by_key, false));
     }
     let type_count = type_count as usize;
     if type_count.saturating_mul(8) > s.remaining() {
@@ -2153,7 +2167,9 @@ fn parse_native_rsmp(payload: &[u8]) -> Option<ParsedRsmp> {
             continue;
         }
         let entry_count = entry_count as usize;
-        if entry_count.saturating_mul(10) > s.remaining() {
+        // Each entry holds 8 fixed bytes + NUL-terminated label (at least 1 byte;
+        // 0x464c3e advances past the optional alignment byte without reading past EOF).
+        if entry_count.saturating_mul(9) > s.remaining() {
             return None;
         }
         for _ in 0..entry_count {
@@ -2168,20 +2184,15 @@ fn parse_native_rsmp(payload: &[u8]) -> Option<ParsedRsmp> {
                 continue;
             }
             let key = (entry_tag, id, (flags >> 8) as u8);
-            if by_key.contains_key(&key) {
-                continue;
-            }
-            let res = NativeResource {
+            by_key.entry(key).or_insert(NativeResource {
                 offset,
                 tag: entry_tag,
                 id,
                 flags,
-            };
-            by_key.insert(key, res);
-            order.entry(entry_tag).or_default().push(res);
+            });
         }
     }
-    Some((order, by_key, lists_self))
+    Some((by_key, lists_self))
 }
 
 fn open_iff(path: &Path) -> Option<NativeIff> {
@@ -2426,6 +2437,897 @@ fn resolve_child(install: &Install, dir: &Path, name: &str) -> Option<PathBuf> {
         return Some(upper);
     }
     None
+}
+
+struct LocalMapArtwork {
+    backdrop: Surface565,
+    waves: Vec<Surface565>,
+    vacation_port: Option<Surface565>,
+    vacation_trees: Option<Surface565>,
+}
+
+/// Attempts to load neighborhood-local custom JPEG map artwork before falling
+/// back to bundled `UIGraphics`, matching native `0x55e976` (Classic),
+/// `0x556a18` (Unleashed), `0x54a2ad` (Downtown), and `0x568bfd` (Vacation).
+fn load_local_map_artwork(
+    install: &Install,
+    user_dir: &Path,
+    kind: NeighborhoodKind,
+) -> Option<LocalMapArtwork> {
+    let (backdrop_name, wave_names, port_name, trees_name): (
+        &str,
+        &[&str],
+        Option<&str>,
+        Option<&str>,
+    ) = match kind {
+        NeighborhoodKind::Classic => (
+            "neighborhood.jpg",
+            &[
+                "neighborhood0.jpg",
+                "neighborhood1.jpg",
+                "neighborhood2.jpg",
+            ],
+            None,
+            None,
+        ),
+        NeighborhoodKind::Unleashed => (
+            "neighborhoodul.jpg",
+            &[
+                "neighborhoodul0.jpg",
+                "neighborhoodul1.jpg",
+                "neighborhoodul2.jpg",
+                "neighborhoodul3.jpg",
+                "neighborhoodul4.jpg",
+                "neighborhoodul5.jpg",
+            ],
+            None,
+            None,
+        ),
+        NeighborhoodKind::Downtown => (
+            "downtown.jpg",
+            &[
+                "downtown0.jpg",
+                "downtown1.jpg",
+                "downtown2.jpg",
+                "downtown3.jpg",
+                "downtown4.jpg",
+                "downtown5.jpg",
+            ],
+            None,
+            None,
+        ),
+        NeighborhoodKind::Vacation => (
+            "island.jpg",
+            &[
+                "island0.jpg",
+                "island1.jpg",
+                "island2.jpg",
+                "island3.jpg",
+                "island4.jpg",
+                "island5.jpg",
+            ],
+            Some("islandPort.jpg"),
+            Some("islandTrees.jpg"),
+        ),
+        NeighborhoodKind::StudioTown | NeighborhoodKind::MagicTown => return None,
+    };
+
+    let load_jpg = |name: &str| -> Option<Surface565> {
+        let path = resolve_child(install, user_dir, name)?;
+        let bytes = fs::read(&path).ok()?;
+        decode_jpeg_to_surface565(&bytes)
+    };
+
+    let backdrop = load_jpg(backdrop_name)?;
+    let mut waves = Vec::new();
+    for &name in wave_names {
+        if let Some(surf) = load_jpg(name) {
+            waves.push(surf);
+        }
+    }
+    let vacation_port = port_name.and_then(load_jpg);
+    let vacation_trees = trees_name.and_then(load_jpg);
+    Some(LocalMapArtwork {
+        backdrop,
+        waves,
+        vacation_port,
+        vacation_trees,
+    })
+}
+
+const JPEG_ZIGZAG: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+#[derive(Clone, Default)]
+struct JpegHuffTable {
+    values: Vec<u8>,
+    max_code: [i32; 17],
+    val_offset: [i32; 17],
+}
+
+impl JpegHuffTable {
+    fn build(counts: &[u8; 16], symbols: &[u8]) -> Option<Self> {
+        let total: usize = counts.iter().map(|&c| usize::from(c)).sum();
+        if total != symbols.len() || total > 256 {
+            return None;
+        }
+        let mut code: u32 = 0;
+        let mut max_code = [-1i32; 17];
+        let mut val_offset = [0i32; 17];
+        let mut k = 0i32;
+        for (len_idx, &count) in counts.iter().enumerate() {
+            let bits = len_idx + 1;
+            if count > 0 {
+                val_offset[bits] = k - code as i32;
+                code += u32::from(count);
+                k += i32::from(count);
+                max_code[bits] = (code - 1) as i32;
+            }
+            code <<= 1;
+        }
+        Some(Self {
+            values: symbols.to_vec(),
+            max_code,
+            val_offset,
+        })
+    }
+}
+
+struct JpegBitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    bit_buf: u32,
+    bit_count: u8,
+    pending_marker: Option<u8>,
+}
+
+impl<'a> JpegBitReader<'a> {
+    fn new(data: &'a [u8], pos: usize) -> Self {
+        Self {
+            data,
+            pos,
+            bit_buf: 0,
+            bit_count: 0,
+            pending_marker: None,
+        }
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        if self.pending_marker.is_some() {
+            return Some(0);
+        }
+        let &b = self.data.get(self.pos)?;
+        self.pos += 1;
+        if b == 0xff {
+            while self.data.get(self.pos) == Some(&0xff) {
+                self.pos += 1;
+            }
+            let &next = self.data.get(self.pos)?;
+            self.pos += 1;
+            if next == 0x00 {
+                return Some(0xff);
+            }
+            self.pending_marker = Some(next);
+            return Some(0);
+        }
+        Some(b)
+    }
+
+    fn read_bit(&mut self) -> Option<u32> {
+        if self.bit_count == 0 {
+            let b = self.next_byte()?;
+            self.bit_buf = u32::from(b);
+            self.bit_count = 8;
+        }
+        self.bit_count -= 1;
+        Some((self.bit_buf >> self.bit_count) & 1)
+    }
+
+    fn read_bits(&mut self, n: u8) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            v = (v << 1) | self.read_bit()?;
+        }
+        Some(v)
+    }
+
+    fn decode_huff(&mut self, table: &JpegHuffTable) -> Option<u8> {
+        let mut code = 0i32;
+        for bits in 1..=16usize {
+            code = (code << 1) | (self.read_bit()? as i32);
+            if code <= table.max_code[bits] {
+                let idx = (code + table.val_offset[bits]) as usize;
+                return table.values.get(idx).copied();
+            }
+        }
+        None
+    }
+
+    fn receive_extend(&mut self, n: u8) -> Option<i32> {
+        if n == 0 {
+            return Some(0);
+        }
+        if n > 15 {
+            return None;
+        }
+        let v = self.read_bits(n)? as i32;
+        let vt = 1i32 << (n - 1);
+        Some(if v < vt { v + (-1 << n) + 1 } else { v })
+    }
+
+    fn consume_restart(&mut self) {
+        self.bit_buf = 0;
+        self.bit_count = 0;
+        if let Some(m) = self.pending_marker {
+            if (0xd0..=0xd7).contains(&m) {
+                self.pending_marker = None;
+            }
+            return;
+        }
+        while self.pos + 1 < self.data.len() && self.data[self.pos] == 0xff {
+            let m = self.data[self.pos + 1];
+            if m == 0xff {
+                self.pos += 1;
+            } else if (0xd0..=0xd7).contains(&m) {
+                self.pos += 2;
+                break;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn finish_scan_pos(&self) -> usize {
+        if self.pending_marker.is_some() {
+            self.pos.saturating_sub(2)
+        } else {
+            self.pos
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct JpegComponent {
+    id: u8,
+    h_samp: usize,
+    v_samp: usize,
+    qt_id: usize,
+    blocks_x: usize,
+    blocks_y: usize,
+    coeffs: Vec<[i32; 64]>,
+}
+
+/// Decodes a baseline (`SOF0`), extended sequential (`SOF1`), or progressive
+/// (`SOF2`) 8-bit JPEG image directly into a 5-6-5 [`Surface565`] using
+/// IJG-compatible integer 8×8 IDCT and YCbCr-to-RGB conversion (`0x4b8285`).
+fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
+    if data.len() < 4 || data[0] != 0xff || data[1] != 0xd8 {
+        return None;
+    }
+    let mut pos = 2usize;
+    let mut qtables: [Option<[i32; 64]>; 4] = [None, None, None, None];
+    let mut dc_tables: [Option<JpegHuffTable>; 4] = [None, None, None, None];
+    let mut ac_tables: [Option<JpegHuffTable>; 4] = [None, None, None, None];
+    let mut width = 0usize;
+    let mut height = 0usize;
+    let mut progressive = false;
+    let mut comps: Vec<JpegComponent> = Vec::new();
+    let mut h_max = 1usize;
+    let mut v_max = 1usize;
+    let mut mcu_cols = 0usize;
+    let mut mcu_rows = 0usize;
+    let mut restart_interval = 0usize;
+    let mut adobe_transform: Option<u8> = None;
+
+    while pos + 1 < data.len() {
+        while pos < data.len() && data[pos] != 0xff {
+            pos += 1;
+        }
+        while pos < data.len() && data[pos] == 0xff {
+            pos += 1;
+        }
+        if pos >= data.len() {
+            break;
+        }
+        let marker = data[pos];
+        pos += 1;
+        if marker == 0xd9 {
+            break;
+        }
+        if marker == 0x00 || marker == 0x01 || (0xd0..=0xd8).contains(&marker) {
+            continue;
+        }
+        if pos + 2 > data.len() {
+            return None;
+        }
+        let seg_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        if seg_len < 2 || pos + seg_len > data.len() {
+            return None;
+        }
+        let seg = &data[pos + 2..pos + seg_len];
+        pos += seg_len;
+
+        match marker {
+            0xdb => {
+                // DQT
+                let mut i = 0;
+                while i < seg.len() {
+                    let pq_tq = seg[i];
+                    i += 1;
+                    let pq = pq_tq >> 4;
+                    let tq = (pq_tq & 0x0f) as usize;
+                    if tq >= 4 {
+                        return None;
+                    }
+                    let mut qt = [0i32; 64];
+                    if pq == 0 {
+                        if i + 64 > seg.len() {
+                            return None;
+                        }
+                        for k in 0..64 {
+                            qt[k] = i32::from(seg[i + k]);
+                        }
+                        i += 64;
+                    } else if pq == 1 {
+                        if i + 128 > seg.len() {
+                            return None;
+                        }
+                        for k in 0..64 {
+                            qt[k] =
+                                i32::from(u16::from_be_bytes([seg[i + k * 2], seg[i + k * 2 + 1]]));
+                        }
+                        i += 128;
+                    } else {
+                        return None;
+                    }
+                    qtables[tq] = Some(qt);
+                }
+            }
+            0xc4 => {
+                // DHT
+                let mut i = 0;
+                while i < seg.len() {
+                    if i + 17 > seg.len() {
+                        return None;
+                    }
+                    let tc_th = seg[i];
+                    let tc = tc_th >> 4;
+                    let th = (tc_th & 0x0f) as usize;
+                    if th >= 4 || tc > 1 {
+                        return None;
+                    }
+                    let counts: [u8; 16] = seg[i + 1..i + 17].try_into().ok()?;
+                    let total: usize = counts.iter().map(|&c| usize::from(c)).sum();
+                    if i + 17 + total > seg.len() {
+                        return None;
+                    }
+                    let table = JpegHuffTable::build(&counts, &seg[i + 17..i + 17 + total])?;
+                    if tc == 0 {
+                        dc_tables[th] = Some(table);
+                    } else {
+                        ac_tables[th] = Some(table);
+                    }
+                    i += 17 + total;
+                }
+            }
+            0xdd => {
+                // DRI
+                if seg.len() < 2 {
+                    return None;
+                }
+                restart_interval = usize::from(u16::from_be_bytes([seg[0], seg[1]]));
+            }
+            0xee => {
+                // Adobe APP14
+                if seg.len() >= 12 && &seg[0..5] == b"Adobe" {
+                    adobe_transform = Some(seg[11]);
+                }
+            }
+            0xc0..=0xc2 => {
+                // SOF0 / SOF1 / SOF2
+                if seg.len() < 6 || seg[0] != 8 {
+                    return None;
+                }
+                progressive = marker == 0xc2;
+                height = usize::from(u16::from_be_bytes([seg[1], seg[2]]));
+                width = usize::from(u16::from_be_bytes([seg[3], seg[4]]));
+                let ncomp = usize::from(seg[5]);
+                if width == 0
+                    || height == 0
+                    || width
+                        .checked_mul(height)
+                        .is_none_or(|p| p > MAX_SURFACE_PIXELS)
+                    || (ncomp != 1 && ncomp != 3)
+                    || seg.len() < 6 + ncomp * 3
+                {
+                    return None;
+                }
+                comps.clear();
+                h_max = 1;
+                v_max = 1;
+                for c in 0..ncomp {
+                    let id = seg[6 + c * 3];
+                    let hv = seg[6 + c * 3 + 1];
+                    let h = usize::from(hv >> 4);
+                    let v = usize::from(hv & 0x0f);
+                    let qt_id = usize::from(seg[6 + c * 3 + 2]);
+                    if !(1..=4).contains(&h) || !(1..=4).contains(&v) || qt_id >= 4 {
+                        return None;
+                    }
+                    h_max = h_max.max(h);
+                    v_max = v_max.max(v);
+                    comps.push(JpegComponent {
+                        id,
+                        h_samp: h,
+                        v_samp: v,
+                        qt_id,
+                        blocks_x: 0,
+                        blocks_y: 0,
+                        coeffs: Vec::new(),
+                    });
+                }
+                mcu_cols = width.div_ceil(h_max * 8);
+                mcu_rows = height.div_ceil(v_max * 8);
+                for comp in &mut comps {
+                    comp.blocks_x = mcu_cols.checked_mul(comp.h_samp)?;
+                    comp.blocks_y = mcu_rows.checked_mul(comp.v_samp)?;
+                    let total_blocks = comp.blocks_x.checked_mul(comp.blocks_y)?;
+                    if total_blocks > MAX_SURFACE_PIXELS / 16 + 4096 {
+                        return None;
+                    }
+                    comp.coeffs = vec![[0i32; 64]; total_blocks];
+                }
+            }
+            0xda => {
+                // SOS
+                if comps.is_empty() || seg.is_empty() {
+                    return None;
+                }
+                let ns = usize::from(seg[0]);
+                if ns == 0 || ns > comps.len() || seg.len() < 1 + ns * 2 + 3 {
+                    return None;
+                }
+                let mut scan_comps = Vec::with_capacity(ns);
+                for i in 0..ns {
+                    let cs = seg[1 + i * 2];
+                    let td_ta = seg[1 + i * 2 + 1];
+                    let comp_idx = comps.iter().position(|c| c.id == cs)?;
+                    scan_comps.push((comp_idx, usize::from(td_ta >> 4), usize::from(td_ta & 0x0f)));
+                }
+                let ss = usize::from(seg[1 + ns * 2]);
+                let se = usize::from(seg[1 + ns * 2 + 1]);
+                let approx = seg[1 + ns * 2 + 2];
+                let ah = approx >> 4;
+                let al = approx & 0x0f;
+                if ss > se || se >= 64 || ah > 15 || al > 15 {
+                    return None;
+                }
+
+                let mut br = JpegBitReader::new(data, pos);
+                let mut dc_pred = [0i32; 4];
+                let mut eobrun = 0u32;
+                let mut mcus_done = 0usize;
+
+                let decode_block = |br: &mut JpegBitReader<'_>,
+                                    block: &mut [i32; 64],
+                                    dc_pred: &mut [i32; 4],
+                                    eobrun: &mut u32,
+                                    comp_idx: usize,
+                                    td: usize,
+                                    ta: usize|
+                 -> Option<()> {
+                    if !progressive {
+                        let dc_t = dc_tables.get(td)?.as_ref()?;
+                        let ac_t = ac_tables.get(ta)?.as_ref()?;
+                        let s = br.decode_huff(dc_t)?;
+                        let diff = br.receive_extend(s)?;
+                        dc_pred[comp_idx] += diff;
+                        block[0] = dc_pred[comp_idx];
+                        let mut k = 1usize;
+                        while k < 64 {
+                            let rs = br.decode_huff(ac_t)?;
+                            let r = usize::from(rs >> 4);
+                            let s = rs & 0x0f;
+                            if s == 0 {
+                                if r == 15 {
+                                    k += 16;
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                k += r;
+                                if k >= 64 {
+                                    return None;
+                                }
+                                block[k] = br.receive_extend(s)?;
+                                k += 1;
+                            }
+                        }
+                    } else if ss == 0 && se == 0 {
+                        if ah == 0 {
+                            let dc_t = dc_tables.get(td)?.as_ref()?;
+                            let s = br.decode_huff(dc_t)?;
+                            let diff = br.receive_extend(s)?;
+                            dc_pred[comp_idx] += diff;
+                            block[0] = dc_pred[comp_idx] << al;
+                        } else {
+                            let bit = br.read_bit()? as i32;
+                            block[0] |= bit << al;
+                        }
+                    } else {
+                        let ac_t = ac_tables.get(ta)?.as_ref()?;
+                        let p1 = 1i32 << al;
+                        let m1 = -1i32 << al;
+                        if ah == 0 {
+                            if *eobrun > 0 {
+                                *eobrun -= 1;
+                            } else {
+                                let mut k = ss;
+                                while k <= se {
+                                    let rs = br.decode_huff(ac_t)?;
+                                    let r = usize::from(rs >> 4);
+                                    let s = rs & 0x0f;
+                                    if s == 0 {
+                                        if r == 15 {
+                                            k += 16;
+                                        } else {
+                                            *eobrun = (1u32 << r) + br.read_bits(r as u8)? - 1;
+                                            break;
+                                        }
+                                    } else {
+                                        k += r;
+                                        if k > se {
+                                            return None;
+                                        }
+                                        block[k] = br.receive_extend(s)? << al;
+                                        k += 1;
+                                    }
+                                }
+                            }
+                        } else {
+                            let mut k = ss;
+                            if *eobrun == 0 {
+                                while k <= se {
+                                    let rs = br.decode_huff(ac_t)?;
+                                    let mut r = usize::from(rs >> 4);
+                                    let s = rs & 0x0f;
+                                    let new_val = if s == 0 {
+                                        if r != 15 {
+                                            *eobrun = (1u32 << r) + br.read_bits(r as u8)?;
+                                            break;
+                                        }
+                                        0
+                                    } else if s == 1 {
+                                        if br.read_bit()? == 1 { p1 } else { m1 }
+                                    } else {
+                                        return None;
+                                    };
+                                    while k <= se {
+                                        if block[k] != 0 {
+                                            if br.read_bit()? == 1 && (block[k] & p1) == 0 {
+                                                block[k] += if block[k] > 0 { p1 } else { m1 };
+                                            }
+                                        } else {
+                                            if r == 0 {
+                                                break;
+                                            }
+                                            r -= 1;
+                                        }
+                                        k += 1;
+                                    }
+                                    if s != 0 {
+                                        if k > se {
+                                            return None;
+                                        }
+                                        block[k] = new_val;
+                                        k += 1;
+                                    }
+                                }
+                            }
+                            if *eobrun > 0 {
+                                while k <= se {
+                                    if block[k] != 0 && br.read_bit()? == 1 && (block[k] & p1) == 0
+                                    {
+                                        block[k] += if block[k] > 0 { p1 } else { m1 };
+                                    }
+                                    k += 1;
+                                }
+                                *eobrun -= 1;
+                            }
+                        }
+                    }
+                    Some(())
+                };
+
+                if ns == 1 {
+                    let (ci, td, ta) = scan_comps[0];
+                    let comp_w = (width * comps[ci].h_samp).div_ceil(h_max);
+                    let comp_h = (height * comps[ci].v_samp).div_ceil(v_max);
+                    let bw = comp_w.div_ceil(8).min(comps[ci].blocks_x);
+                    let bh = comp_h.div_ceil(8).min(comps[ci].blocks_y);
+                    let stride = comps[ci].blocks_x;
+                    let total_mcus = bw * bh;
+                    for by in 0..bh {
+                        for bx in 0..bw {
+                            if restart_interval > 0
+                                && mcus_done > 0
+                                && mcus_done.is_multiple_of(restart_interval)
+                            {
+                                br.consume_restart();
+                                dc_pred = [0; 4];
+                                eobrun = 0;
+                            }
+                            let idx = by * stride + bx;
+                            decode_block(
+                                &mut br,
+                                &mut comps[ci].coeffs[idx],
+                                &mut dc_pred,
+                                &mut eobrun,
+                                ci,
+                                td,
+                                ta,
+                            )?;
+                            mcus_done += 1;
+                            if mcus_done >= total_mcus {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    for my in 0..mcu_rows {
+                        for mx in 0..mcu_cols {
+                            if restart_interval > 0
+                                && mcus_done > 0
+                                && mcus_done.is_multiple_of(restart_interval)
+                            {
+                                br.consume_restart();
+                                dc_pred = [0; 4];
+                                eobrun = 0;
+                            }
+                            for &(ci, td, ta) in &scan_comps {
+                                let hs = comps[ci].h_samp;
+                                let vs = comps[ci].v_samp;
+                                let stride = comps[ci].blocks_x;
+                                for dy in 0..vs {
+                                    for dx in 0..hs {
+                                        let idx = (my * vs + dy) * stride + (mx * hs + dx);
+                                        decode_block(
+                                            &mut br,
+                                            &mut comps[ci].coeffs[idx],
+                                            &mut dc_pred,
+                                            &mut eobrun,
+                                            ci,
+                                            td,
+                                            ta,
+                                        )?;
+                                    }
+                                }
+                            }
+                            mcus_done += 1;
+                        }
+                    }
+                }
+                pos = br.finish_scan_pos();
+            }
+            _ => {}
+        }
+    }
+
+    if comps.is_empty() || width == 0 || height == 0 {
+        return None;
+    }
+
+    // Dequantize + integer 8×8 IDCT for every component plane.
+    let mut planes: Vec<(usize, usize, Vec<u8>)> = Vec::with_capacity(comps.len());
+    for comp in &comps {
+        let qt = qtables[comp.qt_id]?;
+        let pw = comp.blocks_x * 8;
+        let ph = comp.blocks_y * 8;
+        let mut plane = vec![0u8; pw * ph];
+        for by in 0..comp.blocks_y {
+            for bx in 0..comp.blocks_x {
+                let mut deq = [0i32; 64];
+                let raw = &comp.coeffs[by * comp.blocks_x + bx];
+                for k in 0..64 {
+                    deq[JPEG_ZIGZAG[k]] = raw[k].saturating_mul(qt[k]);
+                }
+                let out = jpeg_idct_8x8(&deq);
+                for r in 0..8 {
+                    let dst = (by * 8 + r) * pw + bx * 8;
+                    plane[dst..dst + 8].copy_from_slice(&out[r * 8..r * 8 + 8]);
+                }
+            }
+        }
+        planes.push((pw, ph, plane));
+    }
+
+    let is_rgb = comps.len() == 3
+        && (adobe_transform == Some(0)
+            || (comps[0].id == b'R' && comps[1].id == b'G' && comps[2].id == b'B'));
+
+    let mut pixels = vec![0u16; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let rgb = if comps.len() == 1 {
+                let (pw, _, ref p0) = planes[0];
+                let v = p0[y * pw + x];
+                [v, v, v]
+            } else {
+                let sample = |ci: usize| -> i32 {
+                    let (pw, ph, ref p) = planes[ci];
+                    let sx = (x * comps[ci].h_samp / h_max).min(pw - 1);
+                    let sy = (y * comps[ci].v_samp / v_max).min(ph - 1);
+                    i32::from(p[sy * pw + sx])
+                };
+                let c0 = sample(0);
+                let c1 = sample(1);
+                let c2 = sample(2);
+                if is_rgb {
+                    [c0 as u8, c1 as u8, c2 as u8]
+                } else {
+                    let cb = c1 - 128;
+                    let cr = c2 - 128;
+                    let r = (c0 + ((91_881 * cr + 32_768) >> 16)).clamp(0, 255) as u8;
+                    let g =
+                        (c0 + ((-22_554 * cb - 46_802 * cr + 32_768) >> 16)).clamp(0, 255) as u8;
+                    let b = (c0 + ((116_130 * cb + 32_768) >> 16)).clamp(0, 255) as u8;
+                    [r, g, b]
+                }
+            };
+            pixels[y * width + x] = pack_565(rgb);
+        }
+    }
+
+    Some(Surface565 {
+        width,
+        height,
+        pixels,
+    })
+}
+
+/// IJG 13-bit fixed-point separable 8×8 inverse DCT (`jidctint.c`), returning
+/// level-shifted (`+128`) samples clamped to `0..=255`. Uses `i64` intermediates
+/// so adversarial quantization/coefficient combinations never overflow in debug builds.
+fn jpeg_idct_8x8(block: &[i32; 64]) -> [u8; 64] {
+    const CONST_BITS: u32 = 13;
+    const PASS1_BITS: u32 = 2;
+    const FIX_0_298631336: i64 = 2446;
+    const FIX_0_390180644: i64 = 3196;
+    const FIX_0_541196100: i64 = 4433;
+    const FIX_0_765366865: i64 = 6270;
+    const FIX_0_899976223: i64 = 7373;
+    const FIX_1_175875602: i64 = 9633;
+    const FIX_1_501321110: i64 = 12299;
+    const FIX_1_847759065: i64 = 15137;
+    const FIX_1_961570560: i64 = 16069;
+    const FIX_2_053119869: i64 = 16819;
+    const FIX_2_562915447: i64 = 20995;
+    const FIX_3_072711026: i64 = 25172;
+    let descale = |x: i64, n: u32| x.saturating_add(1i64 << (n - 1)) >> n;
+
+    let mut ws = [0i64; 64];
+    for c in 0..8 {
+        let d0 = i64::from(block[c]);
+        let d1 = i64::from(block[8 + c]);
+        let d2 = i64::from(block[16 + c]);
+        let d3 = i64::from(block[24 + c]);
+        let d4 = i64::from(block[32 + c]);
+        let d5 = i64::from(block[40 + c]);
+        let d6 = i64::from(block[48 + c]);
+        let d7 = i64::from(block[56 + c]);
+        if (d1 | d2 | d3 | d4 | d5 | d6 | d7) == 0 {
+            let dc = d0.saturating_mul(1 << PASS1_BITS);
+            for r in 0..8 {
+                ws[r * 8 + c] = dc;
+            }
+            continue;
+        }
+        let z1 = (d2 + d6) * FIX_0_541196100;
+        let tmp2 = z1 + d6 * -FIX_1_847759065;
+        let tmp3 = z1 + d2 * FIX_0_765366865;
+        let tmp0 = (d0 + d4) << CONST_BITS;
+        let tmp1 = (d0 - d4) << CONST_BITS;
+        let tmp10 = tmp0 + tmp3;
+        let tmp13 = tmp0 - tmp3;
+        let tmp11 = tmp1 + tmp2;
+        let tmp12 = tmp1 - tmp2;
+
+        let mut tmp0 = d7;
+        let mut tmp1 = d5;
+        let mut tmp2 = d3;
+        let mut tmp3 = d1;
+        let z1 = tmp0 + tmp3;
+        let z2 = tmp1 + tmp2;
+        let mut z3 = tmp0 + tmp2;
+        let mut z4 = tmp1 + tmp3;
+        let z5 = (z3 + z4) * FIX_1_175875602;
+        tmp0 *= FIX_0_298631336;
+        tmp1 *= FIX_2_053119869;
+        tmp2 *= FIX_3_072711026;
+        tmp3 *= FIX_1_501321110;
+        let z1 = z1 * -FIX_0_899976223;
+        let z2 = z2 * -FIX_2_562915447;
+        z3 = z3 * -FIX_1_961570560 + z5;
+        z4 = z4 * -FIX_0_390180644 + z5;
+        tmp0 += z1 + z3;
+        tmp1 += z2 + z4;
+        tmp2 += z2 + z3;
+        tmp3 += z1 + z4;
+
+        let shift = CONST_BITS - PASS1_BITS;
+        ws[c] = descale(tmp10 + tmp3, shift);
+        ws[56 + c] = descale(tmp10 - tmp3, shift);
+        ws[8 + c] = descale(tmp11 + tmp2, shift);
+        ws[48 + c] = descale(tmp11 - tmp2, shift);
+        ws[16 + c] = descale(tmp12 + tmp1, shift);
+        ws[40 + c] = descale(tmp12 - tmp1, shift);
+        ws[24 + c] = descale(tmp13 + tmp0, shift);
+        ws[32 + c] = descale(tmp13 - tmp0, shift);
+    }
+
+    let mut out = [0u8; 64];
+    let shift = CONST_BITS + PASS1_BITS + 3;
+    let clamp = |v: i64| (descale(v, shift).saturating_add(128)).clamp(0, 255) as u8;
+    for r in 0..8 {
+        let base = r * 8;
+        let w0 = ws[base];
+        let w1 = ws[base + 1];
+        let w2 = ws[base + 2];
+        let w3 = ws[base + 3];
+        let w4 = ws[base + 4];
+        let w5 = ws[base + 5];
+        let w6 = ws[base + 6];
+        let w7 = ws[base + 7];
+        if (w1 | w2 | w3 | w4 | w5 | w6 | w7) == 0 {
+            let dc = (descale(w0, PASS1_BITS + 3).saturating_add(128)).clamp(0, 255) as u8;
+            out[base..base + 8].fill(dc);
+            continue;
+        }
+        let z1 = (w2 + w6) * FIX_0_541196100;
+        let tmp2 = z1 + w6 * -FIX_1_847759065;
+        let tmp3 = z1 + w2 * FIX_0_765366865;
+        let tmp10 = (w0 + w4) << CONST_BITS;
+        let tmp11 = (w0 - w4) << CONST_BITS;
+        let t10 = tmp10 + tmp3;
+        let t13 = tmp10 - tmp3;
+        let t11 = tmp11 + tmp2;
+        let t12 = tmp11 - tmp2;
+
+        let mut tmp0 = w7;
+        let mut tmp1 = w5;
+        let mut tmp2 = w3;
+        let mut tmp3 = w1;
+        let z1 = tmp0 + tmp3;
+        let z2 = tmp1 + tmp2;
+        let mut z3 = tmp0 + tmp2;
+        let mut z4 = tmp1 + tmp3;
+        let z5 = (z3 + z4) * FIX_1_175875602;
+        tmp0 *= FIX_0_298631336;
+        tmp1 *= FIX_2_053119869;
+        tmp2 *= FIX_3_072711026;
+        tmp3 *= FIX_1_501321110;
+        let z1 = z1 * -FIX_0_899976223;
+        let z2 = z2 * -FIX_2_562915447;
+        z3 = z3 * -FIX_1_961570560 + z5;
+        z4 = z4 * -FIX_0_390180644 + z5;
+        tmp0 += z1 + z3;
+        tmp1 += z2 + z4;
+        tmp2 += z2 + z3;
+        tmp3 += z1 + z4;
+
+        out[base] = clamp(t10 + tmp3);
+        out[base + 7] = clamp(t10 - tmp3);
+        out[base + 1] = clamp(t11 + tmp2);
+        out[base + 6] = clamp(t11 - tmp2);
+        out[base + 2] = clamp(t12 + tmp1);
+        out[base + 5] = clamp(t12 - tmp1);
+        out[base + 3] = clamp(t13 + tmp0);
+        out[base + 4] = clamp(t13 - tmp0);
+    }
+    out
 }
 
 fn blit_surface_to_canvas(
@@ -3113,6 +4015,42 @@ mod tests {
         .expect("SIMI 0x4a IFF opens");
         assert_eq!(read_lot_filter_mask(&simi_iff), Some(0x0005));
 
+        // Also verify an unpadded final rsmp entry (8 fixed bytes + single NUL
+        // byte, no trailing pad byte past EOF) still opens (0x464c3e).
+        let mut unpadded_rsmp = Vec::new();
+        unpadded_rsmp.extend_from_slice(&[0u8; 8]);
+        unpadded_rsmp.extend_from_slice(b"pmsr");
+        unpadded_rsmp.extend_from_slice(&0u32.to_le_bytes());
+        unpadded_rsmp.extend_from_slice(&1u32.to_le_bytes());
+        unpadded_rsmp.extend_from_slice(&u32::from_be_bytes(*b"STR#").to_le_bytes());
+        unpadded_rsmp.extend_from_slice(&1u32.to_le_bytes());
+        unpadded_rsmp.extend_from_slice(&64u32.to_le_bytes());
+        unpadded_rsmp.extend_from_slice(&4u16.to_le_bytes());
+        unpadded_rsmp.extend_from_slice(&0x0010u16.to_le_bytes());
+        unpadded_rsmp.push(0u8); // NUL with no alignment pad byte
+        let mut unpadded_iff = sims_formats::iff::write(&[
+            sims_formats::iff::ChunkData {
+                tag: *b"STR#",
+                id: 99,
+                flags: 0x0010,
+                label: String::new(),
+                data: b"\xff\xff\x01\x005, 481, 84\0".to_vec(),
+            },
+            sims_formats::iff::ChunkData {
+                tag: *b"rsmp",
+                id: 0,
+                flags: 0,
+                label: String::new(),
+                data: unpadded_rsmp,
+            },
+        ])
+        .expect("write unpadded rsmp IFF");
+        let unpadded_off = 64 + 76 + b"\xff\xff\x01\x005, 481, 84\0".len();
+        unpadded_iff[60..64].copy_from_slice(&(unpadded_off as u32).to_be_bytes());
+        let parsed_unpadded = NativeIff::parse(unpadded_iff).expect("unpadded rsmp opens");
+        let utbl = load_native_string_table(&parsed_unpadded, 4).expect("STR# 4 via unpadded rsmp");
+        assert_eq!(parse_lot_locations_table(&utbl).get(&5), Some(&[481, 84]));
+
         // Big-endian SIMI 1 (byte[0] = 1) with non-IMIS bytes 8..12 (0x464edd, 0x464936).
         let mut simi_be = vec![0u8; 12 + 64 * 2];
         simi_be[0] = 1;
@@ -3196,12 +4134,21 @@ mod tests {
         assert_eq!(badged.get(11, 5), Some(badge_c));
         assert_ne!(badged.get(7, 4), Some(badge_c));
 
-        // Occupancy: primary house 40 matches Vacation lot 40 (0x54f270..0x54f27e),
-        // and secondary house 41 matches Vacation lot 41.
+        // Occupancy: native GetFamilyByLot (0x425d95) selects the first family
+        // in ascending ID order matching primary or secondary house, and looks
+        // up family ID 0 specifically for lot 0.
         let mut occ = FamilyOccupancy::default();
-        occ.primary_lot.insert(40, (9, None));
-        occ.primary_lot.insert(5, (5, Some(41)));
-        occ.vacation_lot.insert(41, 5);
+        occ.record_family_houses(0, 0, 0);
+        occ.record_family_houses(5, 5, 41);
+        occ.record_family_houses(9, 40, 0);
+        occ.record_family_houses(12, 5, 0); // later family on lot 5 loses to family 5
+        assert_eq!(
+            resolve_lot_status(0, NeighborhoodKind::Unleashed, LotZoning::Residential, &occ),
+            LotStatus::Occupied {
+                family_id: 0,
+                vacation_lot: None,
+            }
+        );
         assert_eq!(
             resolve_lot_status(40, NeighborhoodKind::Vacation, LotZoning::Community, &occ),
             LotStatus::Community {
@@ -3258,8 +4205,9 @@ mod tests {
 
         // Multiple FAMI records sharing lot 5 (secondary 41 followed by 0),
         // negative nonzero secondary (-1), lot 0, and FAMI version 10 (no upper
-        // version check at 0x410602) all preserve vacation stay eligibility (0x54f20e).
-        let make_fami_chunk = |version: i32, house: i32, secondary: i32| {
+        // version check at 0x410602) all preserve vacation stay eligibility (0x54f20e),
+        // while non-default FAMI variants (flags >> 8 != 0) are ignored (0x41bad8).
+        let make_fami_chunk = |version: i32, family_id: i32, house: i32, secondary: i32| {
             let mut b = Vec::new();
             b.extend_from_slice(&0u32.to_le_bytes()); // LE marker
             b.extend_from_slice(&version.to_le_bytes());
@@ -3270,21 +4218,170 @@ mod tests {
             b.extend_from_slice(&0i32.to_le_bytes()); // arch
             b.extend_from_slice(&0i32.to_le_bytes()); // friends
             b.extend_from_slice(&0u32.to_le_bytes()); // flags
-            b.extend_from_slice(&0i32.to_le_bytes()); // 0 members
-            b.extend_from_slice(&secondary.to_le_bytes());
+            if family_id != 0 {
+                b.extend_from_slice(&0i32.to_le_bytes()); // 0 members
+            }
+            if version >= 8 {
+                b.extend_from_slice(&secondary.to_le_bytes());
+            }
+            if version >= 9 {
+                // Six trailing magic-history shorts consumed at 0x41063d.
+                b.extend_from_slice(&[0u8; 12]);
+            }
             b
         };
+        let fami_iff = NativeIff::parse(
+            sims_formats::iff::write(&[
+                sims_formats::iff::ChunkData {
+                    tag: *b"FAMI",
+                    id: 5,
+                    flags: 0x0110, // variant 1: must be ignored (0x41bad8)
+                    label: String::new(),
+                    data: make_fami_chunk(9, 5, 5, 45),
+                },
+                sims_formats::iff::ChunkData {
+                    tag: *b"FAMI",
+                    id: 1,
+                    flags: 0x0010,
+                    label: String::new(),
+                    data: make_fami_chunk(8, 1, 5, 41),
+                },
+                sims_formats::iff::ChunkData {
+                    tag: *b"FAMI",
+                    id: 2,
+                    flags: 0x0010,
+                    label: String::new(),
+                    data: make_fami_chunk(8, 2, 5, 0),
+                },
+                sims_formats::iff::ChunkData {
+                    tag: *b"FAMI",
+                    id: 3,
+                    flags: 0x0010,
+                    label: String::new(),
+                    data: make_fami_chunk(9, 3, 6, -1),
+                },
+                sims_formats::iff::ChunkData {
+                    tag: *b"FAMI",
+                    id: 4,
+                    flags: 0x0010,
+                    label: String::new(),
+                    data: make_fami_chunk(9, 4, 0, 41),
+                },
+                sims_formats::iff::ChunkData {
+                    tag: *b"FAMI",
+                    id: 6,
+                    flags: 0x0010,
+                    label: String::new(),
+                    data: make_fami_chunk(10, 6, 7, 42),
+                },
+            ])
+            .expect("write FAMI test IFF"),
+        )
+        .expect("FAMI test IFF opens");
         let mut multi_occ = FamilyOccupancy::default();
-        multi_occ.record_fami_chunk(1, &make_fami_chunk(8, 5, 41), 0x0010);
-        multi_occ.record_fami_chunk(2, &make_fami_chunk(8, 5, 0), 0x0010);
-        multi_occ.record_fami_chunk(3, &make_fami_chunk(9, 6, -1), 0x0010);
-        multi_occ.record_fami_chunk(4, &make_fami_chunk(9, 0, 41), 0x0010);
-        multi_occ.record_fami_chunk(5, &make_fami_chunk(10, 7, 42), 0x0010);
-        assert!(multi_occ.primary_vacation_stays.contains(&5));
-        assert!(multi_occ.primary_vacation_stays.contains(&6));
-        assert!(multi_occ.primary_vacation_stays.contains(&0));
-        assert!(multi_occ.primary_vacation_stays.contains(&7));
-        assert!(multi_occ.any_house_matches.contains(&41));
-        assert!(multi_occ.any_house_matches.contains(&42));
+        for (id, data, flags) in fami_iff.all_variant_zero_sorted(b"FAMI") {
+            multi_occ.record_fami_chunk(i32::from(id), data, flags);
+        }
+        assert!(multi_occ.has_primary_vacation_stay(5));
+        assert!(multi_occ.has_primary_vacation_stay(6));
+        assert!(multi_occ.has_primary_vacation_stay(0));
+        assert!(multi_occ.has_primary_vacation_stay(7));
+        assert!(multi_occ.has_vacation_occupancy(41));
+        assert!(multi_occ.has_vacation_occupancy(42));
+        // Variant-1 FAMI #5 referencing lot 45 was ignored.
+        assert!(!multi_occ.has_vacation_occupancy(45));
+
+        // Verify pure-Rust JPEG decoder handles a valid baseline 1×1 white JPEG.
+        // Minimal standard baseline JFIF 1×1 grayscale JPEG (DC = +127 => white 255).
+        let white_1x1_jpeg: &[u8] = &[
+            0xff, 0xd8, // SOI
+            0xff, 0xdb, 0x00, 0x43, 0x00, // DQT table 0 (all 1s)
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, // SOF0: 8-bit, 1×1, 1 component (id=1, 1×1, qt=0)
+            0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00,
+            // DHT DC table 0: 1 symbol of length 1 (code 0 -> size 10)
+            0xff, 0xc4, 0x00, 0x14, 0x00, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a,
+            // DHT AC table 0: 1 symbol of length 1 (code 0 -> EOB 0x00)
+            0xff, 0xc4, 0x00, 0x14, 0x10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00,
+            // SOS: 1 comp (id=1, dc=0, ac=0), ss=0, se=63, ah/al=0
+            0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00,
+            // Entropy bits: DC code '0' + 10 bits '1111111000' (+1016 => 1016/8 + 128 = 255)
+            // + AC EOB '0' + 4 pad bits '1111' => 0111_1111 1000_0111 = 0x7f, 0x87
+            0x7f, 0x87, // EOI
+            0xff, 0xd9,
+        ];
+        let decoded = decode_jpeg_to_surface565(white_1x1_jpeg).expect("decode 1×1 JPEG");
+        assert_eq!((decoded.width, decoded.height), (1, 1));
+        assert_eq!(decoded.pixels[0], pack_565([255, 255, 255]));
+
+        // Real 16×16 3-component YCbCr 4:2:0 solid-red baseline JPEG (with DRI=1).
+        let red_16x16_jpeg: &[u8] = &[
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x48, 0x00, 0x48, 0x00, 0x00, 0xff, 0xe1, 0x00, 0x4c, 0x45, 0x78, 0x69, 0x66,
+            0x00, 0x00, 0x4d, 0x4d, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08, 0x00, 0x01, 0x87, 0x69,
+            0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x03, 0xa0, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+            0xa0, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0xa0, 0x03,
+            0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+            0xff, 0xed, 0x00, 0x38, 0x50, 0x68, 0x6f, 0x74, 0x6f, 0x73, 0x68, 0x6f, 0x70, 0x20,
+            0x33, 0x2e, 0x30, 0x00, 0x38, 0x42, 0x49, 0x4d, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x38, 0x42, 0x49, 0x4d, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+            0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+            0x42, 0x7e, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x22,
+            0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xff, 0xc4, 0x00, 0x1f, 0x00, 0x00, 0x01,
+            0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0xff, 0xc4,
+            0x00, 0xb5, 0x10, 0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03, 0x05, 0x05, 0x04,
+            0x04, 0x00, 0x00, 0x01, 0x7d, 0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21,
+            0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1,
+            0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82,
+            0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x34,
+            0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a,
+            0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+            0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86,
+            0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2,
+            0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
+            0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3,
+            0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7,
+            0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xff,
+            0xc4, 0x00, 0x1f, 0x01, 0x00, 0x03, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0xff, 0xc4, 0x00, 0xb5, 0x11, 0x00, 0x02, 0x01, 0x02, 0x04,
+            0x04, 0x03, 0x04, 0x07, 0x05, 0x04, 0x04, 0x00, 0x01, 0x02, 0x77, 0x00, 0x01, 0x02,
+            0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71, 0x13,
+            0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52,
+            0xf0, 0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18,
+            0x19, 0x1a, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43,
+            0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
+            0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77,
+            0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93,
+            0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8,
+            0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4,
+            0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9,
+            0xda, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5,
+            0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x02, 0x02, 0x02, 0x02,
+            0x02, 0x02, 0x03, 0x02, 0x02, 0x03, 0x05, 0x03, 0x03, 0x03, 0x05, 0x06, 0x05, 0x05,
+            0x05, 0x05, 0x06, 0x08, 0x06, 0x06, 0x06, 0x06, 0x06, 0x08, 0x0a, 0x08, 0x08, 0x08,
+            0x08, 0x08, 0x08, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0c, 0x0c, 0x0c,
+            0x0c, 0x0c, 0x0c, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f,
+            0x0f, 0x0f, 0x0f, 0x0f, 0xff, 0xdb, 0x00, 0x43, 0x01, 0x02, 0x02, 0x02, 0x04, 0x04,
+            0x04, 0x07, 0x04, 0x04, 0x07, 0x10, 0x0b, 0x09, 0x0b, 0x10, 0x10, 0x10, 0x10, 0x10,
+            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+            0x10, 0x10, 0x10, 0xff, 0xdd, 0x00, 0x04, 0x00, 0x01, 0xff, 0xda, 0x00, 0x0c, 0x03,
+            0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3f, 0x00, 0xf8, 0xbe, 0x8a, 0x28, 0xaf,
+            0xe5, 0x33, 0xfd, 0xfc, 0x3f, 0xff, 0xd9,
+        ];
+        let red_decoded = decode_jpeg_to_surface565(red_16x16_jpeg).expect("decode 16×16 red JPEG");
+        assert_eq!((red_decoded.width, red_decoded.height), (16, 16));
+        assert!(
+            red_decoded.pixels.iter().all(|&p| {
+                let [r, g, b] = widen_565(p);
+                r >= 240 && g <= 8 && b <= 8
+            }),
+            "expected solid red pixels"
+        );
     }
 }
