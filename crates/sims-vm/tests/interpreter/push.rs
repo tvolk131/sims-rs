@@ -616,16 +616,55 @@ fn the_temps_the_check_tree_changes_are_put_back() {
     assert_eq!(idle_turn(&mut fx).0, Status::Yielded);
     assert_eq!(fx.sim().stack.len(), 2);
     assert_eq!(fx.sim().temps[0], 11);
-    // And when the start then fails: an action tree the file lacks.
+    // And when the action tree is missing (0x45e59b -> 0x452b98 -> 0x47484a
+    // returning 0): the action is cancelled via target function 4, the thread
+    // yields without pushing a frame, and temps are still put back (0x4582dd).
     let mut fx = ordered();
     temp_writing_check(&mut fx);
     entry_trees(&mut fx, 4300, ACTION);
     fx.sim_mut().person.as_mut().unwrap().queue[0].action = 4999;
     fx.sim_mut().temps[0] = 11;
-    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
-    assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
+    let (status, asked) = idle_turn(&mut fx);
+    assert_eq!(status, Status::Yielded);
+    let functions: Vec<_> = asked.iter().map(|a| (a.object, a.function)).collect();
+    assert_eq!(functions, [(LAMP, 4)]);
+    assert_eq!(fx.sim().stack.len(), 1);
+    assert_eq!(fx.sim().stack[0].primitive_state, 0);
+    assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
+    assert_eq!(fx.sim().person.as_ref().unwrap().active.target, 0);
+    assert!(fx.sim().person.as_ref().unwrap().object_uses.is_empty());
     assert_eq!(fx.sim().temps[0], 11);
+}
+
+#[test]
+fn idle_for_input_missing_action_tree_wakes_and_cancels_cleanly() {
+    let mut fx = ordered();
+    fx.sim_mut().person.as_mut().unwrap().queue[0].action = 0x10ff;
+    // Set a positive sleep countdown to verify wake (0x452b98 -> 0x44574b)
+    // clears it before 0x47484a rejects the missing tree.
+    fx.sim_mut().set_countdown(5);
+    let initial_count = fx.sim().stack[0].parameters[0];
+    let before_uses = fx.world.objects[&LAMP].data[62];
+    let (status, asked) = idle_turn(&mut fx);
+    assert_eq!(status, Status::Yielded);
+    assert_eq!(fx.sim().countdown(), None);
+    assert_eq!(
+        asked
+            .iter()
+            .map(|a| (a.object, a.function))
+            .collect::<Vec<_>>(),
+        [(LAMP, 4)]
+    );
+    // Count parameter and primitive_state are untouched; action is removed
+    // from the queue and never becomes active or counted as an object use.
+    assert_eq!(fx.sim().stack.len(), 1);
+    assert_eq!(fx.sim().stack[0].parameters[0], initial_count);
+    assert_eq!(fx.sim().stack[0].primitive_state, 0);
+    assert_ne!(fx.sim().data[8] & 0x40, 0);
+    assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
+    assert_eq!(fx.sim().person.as_ref().unwrap().active.target, 0);
+    assert!(fx.sim().person.as_ref().unwrap().object_uses.is_empty());
+    assert_eq!(fx.world.objects[&LAMP].data[62], before_uses);
 }
 
 #[test]

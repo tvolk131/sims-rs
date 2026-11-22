@@ -466,9 +466,56 @@ fn end_clip(fx: &mut Fixture) {
 }
 
 #[test]
+fn global_sources_1_and_2_read_global_str_128_and_130() {
+    // 0x59defc (source 1) reads Global.iff STR# 128 ("Animations"), and
+    // 0x59deb4 (source 2) reads Global.iff STR# 130 ("PersonAnimations"),
+    // independent of the person's age (unlike source 3's 156/157 split).
+    for (source, table, clip_name) in [
+        (1u8, 128u16, "a2o-src1-clip"),
+        (2u8, 130u16, "a2o-src2-clip"),
+    ] {
+        for age in [30i16, 10i16] {
+            let mut fx = sim_animates(animate(1, source, 0, 0, 0));
+            fx.sim_mut().person.as_mut().unwrap().data[58] = age;
+            fx.program
+                .libraries
+                .get_mut(&GLOBAL)
+                .unwrap()
+                .strings
+                .insert(table, vec![String::new(), clip_name.to_owned()]);
+            fx.program.animations.insert(
+                "test.far",
+                Clip {
+                    name: clip_name.to_owned(),
+                    skill: SKILL.into(),
+                    duration: HUNDRED,
+                    distance: 0,
+                    moving: false,
+                    frames: 4,
+                    motions: 1,
+                    tracks: Vec::new(),
+                    channels: Vec::new(),
+                    samples: [0, 0],
+                },
+            );
+            assert_eq!(
+                turn(&mut fx).unwrap(),
+                Status::Yielded,
+                "source {source} age {age}"
+            );
+            let fg = fx.world.animators[&SIM]
+                .foreground
+                .as_ref()
+                .expect("foreground clip must start");
+            assert_eq!(fg.clip, clip_name);
+        }
+    }
+}
+
+#[test]
 fn what_animate_sim_does_not_port_fails_loudly() {
     for (operands, what) in [
-        (animate(1, 1, 0, 0, 0), "source 1"),
+        (animate(1, 4, 0, 0, 0), "source 4"),
         (animate(2, 3, 0, 0, 0), "not listed"),
     ] {
         let mut fx = sim_animates(operands);

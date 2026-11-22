@@ -41,8 +41,10 @@
 //!      yields; the instruction runs again next turn.
 //!
 //!   Either way the person's temps, if the check tree's run saved them,
-//!   are put back last (0x4582dd). A tree that cannot be pushed in step 3
-//!   (the original then takes step 4) fails loudly.
+//!   are put back last (0x4582dd). When step 3 cannot push the action's
+//!   tree because the tree is missing (0x45e59b -> 0x452b98 -> 0x47484a
+//!   returning 0 after waking the person), the original falls through to
+//!   step 4 (0x45dcb6) to cancel the action on the target and yield.
 //!
 //! Ported from the original's code (above) and checked against the old
 //! prototype's `idle_for_input`, `idle_decision` and `should_interrupt`
@@ -174,36 +176,50 @@ impl Machine<'_, '_> {
         let flow = if action.flags & checked::PASSED != 0 && action.action != 0 {
             let frame = self.me()?.stack.len() - 1;
             let tree = action.action;
+            // 0x45e59b -> 0x452b98: wakes the person (0x44574b) before trying
+            // to push the target's tree (0x47484a). When the tree is missing,
+            // 0x47484a returns 0 without touching object_uses or active, and
+            // 0x45dcb2 falls through to the cancel branch at 0x45dcb6.
             self.wake(me)?;
-            self.enter_on(target, tree, &action.args).map_err(|fault| {
-                Trap::Unsupported(format!(
-                    "Idle For Input could not push tree {tree:#06x} of object {target}, where \
-                     the original cancels the action: {fault}"
-                ))
-            })?;
-            self.count_use(target, false)?;
-            let last_result = self.me()?.last_result;
-            self.set_action(action, last_result)?;
-            let object = self.me_mut()?;
-            let idle = &mut object.stack[frame];
-            idle.parameters[index] = 0;
-            idle.primitive_state = STARTED;
-            if let Some(top) = object.stack.last_mut() {
-                top.stack_object = target as i16;
+            match self.enter_on(target, tree, &action.args) {
+                Ok(()) => {
+                    self.count_use(target, false)?;
+                    let last_result = self.me()?.last_result;
+                    self.set_action(action, last_result)?;
+                    let object = self.me_mut()?;
+                    let idle = &mut object.stack[frame];
+                    idle.parameters[index] = 0;
+                    idle.primitive_state = STARTED;
+                    if let Some(top) = object.stack.last_mut() {
+                        top.stack_object = target as i16;
+                    }
+                    self.flags_mut()?[FLAGS] |= INTERRUPTED;
+                    Flow::Pushed
+                }
+                Err(Trap::MissingTree { .. }) => {
+                    self.cancel_queued_action(target, me)?;
+                    Flow::Yield
+                }
+                Err(trap) => return Err(trap),
             }
-            self.flags_mut()?[FLAGS] |= INTERRUPTED;
-            Flow::Pushed
         } else {
-            self.interpreter()
-                .callback(self.world, target, CANCELLED, me as i16)
-                .map_err(|fault: crate::fault::Fault| {
-                    fault.unsupported_in(format!(
-                        "cancelling a queued action on object {target} (0x45dcc8)"
-                    ))
-                })?;
+            self.cancel_queued_action(target, me)?;
             Flow::Yield
         };
         Ok(flow)
+    }
+
+    /// Runs the target's function 4 (action cancelled) with `me` as stack
+    /// object (0x45dcb6 to 0x45dccd).
+    fn cancel_queued_action(&mut self, target: u16, me: u16) -> Result<(), Trap> {
+        self.interpreter()
+            .callback(self.world, target, CANCELLED, me as i16)
+            .map(|_| ())
+            .map_err(|fault: crate::fault::Fault| {
+                fault.unsupported_in(format!(
+                    "cancelling a queued action on object {target} (0x45dcc8)"
+                ))
+            })
     }
 
     fn flags_mut(&mut self) -> Result<&mut Vec<i16>, Trap> {
