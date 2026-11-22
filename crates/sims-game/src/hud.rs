@@ -45,6 +45,10 @@ pub const ERROR: &str = "UI_error";
 pub const CLICK: &str = "UI_click";
 /// A help balloon opening or closing (0x50fa95, 0x50fb7f).
 pub const WHOOSH: &str = "UI_whoosh";
+/// Selling an object with nonzero refund (`0x487e18` → `0x492ad4`).
+pub const MONEYBACK: &str = "UI_moneyback";
+/// Disposing of a zero-value object (`0x487e18` → `0x492b05`).
+pub const ARCHTOOL_DELETE: &str = "UI_archtool_delete";
 
 pub struct Hud {
     pub art: Art,
@@ -255,16 +259,21 @@ impl Hud {
         &self.buy_layout
     }
 
-    /// Whether `point` lies over the expanded Buy Mode catalog strip
-    /// (`cWinCatalog`, `x >= CLUSTER[0]` and `y >= height - TALL_STRIP`), where
-    /// clicking or dropping a held object sells it (`0x50d04d` → `0x4cf97a` →
-    /// `0x487e18`).
+    /// Whether `point` lies over the expanded Buy Mode catalog / sell strip
+    /// (`cWinCatalog`, `x >= 240` and `y >= height - STRIP`), where clicking or
+    /// dropping a held object sells it (`0x50d04d` → `0x4cf97a` → `0x487e18`).
+    /// Uses the 100 px strip height (`hud::STRIP`), NOT the 150 px left-cluster
+    /// container (`hud::TALL_STRIP`), so releasing in the house viewport above
+    /// `y = height - 100` never triggers a sale.
     pub fn over_buy_catalog(&self, size: [i32; 2], point: [i32; 2]) -> bool {
         if self.controls.mode != Mode::Buy || !self.controls.expanded {
             return false;
         }
-        let top = size[1] - hud::TALL_STRIP;
-        point[0] >= hud::CLUSTER[0] && point[0] < size[0] && point[1] >= top && point[1] < size[1]
+        if let Some(prompt) = &self.buy_layout.sell_prompt {
+            return prompt.rect.contains(point[0], point[1]);
+        }
+        let top = size[1] - hud::STRIP;
+        point[0] >= 240 && point[0] < size[0] && point[1] >= top && point[1] < size[1]
     }
 
     /// Lays out the Buy Mode catalog strip (or active Hand Tool sell prompt)

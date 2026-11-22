@@ -155,6 +155,10 @@ pub struct Game {
     /// Whether Shift is currently held (`VK_SHIFT`, `0x4864f9`), which rearms
     /// any Buy Mode item for repeat purchase on placement (`0x48680f`).
     shift_held: bool,
+    /// Last `clock_us` when `UI_moneyback` (`0x492ad4`) or `UI_archtool_delete`
+    /// (`0x492b05`) played, enforcing the native 400 ms sound cooldown.
+    buy_moneyback_us: Option<u64>,
+    buy_delete_us: Option<u64>,
     /// The time the window has passed in, in microseconds: the clock
     /// that spins the plumb bob and drives the pause button's 500 ms blink.
     clock_us: u64,
@@ -236,6 +240,8 @@ impl Game {
             buy_commit_on_release: false,
             live_panel_expanded: true,
             shift_held: false,
+            buy_moneyback_us: None,
+            buy_delete_us: None,
             note: None,
             clock_us: 0,
             drawn_us: 0,
@@ -1935,8 +1941,30 @@ impl Game {
         let Some(cursor) = self.buy_cursor.take() else {
             return false;
         };
+        let was_existing = cursor.is_existing();
+        let funds_before = self.lot.world().budget.funds;
         match self.lot.buy_sell(&cursor) {
             Ok(true) => {
+                if was_existing {
+                    let refund = self.lot.world().budget.funds - funds_before;
+                    // Native `0x487e18` -> `0x492ad4` (`UI_moneyback`) /
+                    // `0x492b05` (`UI_archtool_delete`) with 400 ms cooldown.
+                    if refund != 0 {
+                        if self
+                            .buy_moneyback_us
+                            .is_none_or(|t| self.clock_us.saturating_sub(t) > 400_000)
+                        {
+                            self.hud.play(crate::hud::MONEYBACK);
+                            self.buy_moneyback_us = Some(self.clock_us);
+                        }
+                    } else if self
+                        .buy_delete_us
+                        .is_none_or(|t| self.clock_us.saturating_sub(t) > 400_000)
+                    {
+                        self.hud.play(crate::hud::ARCHTOOL_DELETE);
+                        self.buy_delete_us = Some(self.clock_us);
+                    }
+                }
                 self.buy_dragging = None;
                 self.buy_grab_offset = [0, 0];
                 self.buy_commit_on_release = false;

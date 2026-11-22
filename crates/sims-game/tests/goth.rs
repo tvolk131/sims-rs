@@ -6581,7 +6581,9 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
     );
     let mut text_min_x = i32::MAX;
     let mut text_min_y = i32::MAX;
+    let mut line1_max_y = 0;
     let mut line2_min_y = i32::MAX;
+    let mut line2_max_y = 0;
     let mut prompt_text_pixels = 0usize;
     for y in 505..595 {
         for x in 395..780 {
@@ -6590,8 +6592,11 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
                 prompt_text_pixels += 1;
                 text_min_x = text_min_x.min(x);
                 text_min_y = text_min_y.min(y);
-                if y >= 532 {
+                if y < 532 {
+                    line1_max_y = line1_max_y.max(y);
+                } else {
                     line2_min_y = line2_min_y.min(y);
+                    line2_max_y = line2_max_y.max(y);
                 }
             }
         }
@@ -6600,14 +6605,26 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
         prompt_text_pixels > 80
             && (397..=402).contains(&text_min_x)
             && (515..=520).contains(&text_min_y)
-            && (534..=539).contains(&line2_min_y),
-        "expected sell prompt text line 1 near (399, 517) and line 2 near y=536, got {prompt_text_pixels} bright px starting at ({text_min_x}, {text_min_y}) and line2 y={line2_min_y}"
+            && (524..=527).contains(&line1_max_y)
+            && (534..=539).contains(&line2_min_y)
+            && (546..=550).contains(&line2_max_y),
+        "expected 10pt sell prompt text line 1 near (399, 517..526) and line 2 near y=536..548, got {prompt_text_pixels} bright px at x={text_min_x}, line1={text_min_y}..{line1_max_y}, line2={line2_min_y}..{line2_max_y}"
     );
 
     // Delete sells porch bench 173/174 before u=844: refunds $250 (2462 -> 2712),
-    // deletes 2-tile Tile Cursor, detaches 173/174 to [-16, -16, 1] (`n_obj=346`).
+    // deletes 2-tile Tile Cursor, detaches 173/174 to [-16, -16, 1] (`n_obj=346`),
+    // and plays `UI_moneyback` (`0x487e18` -> `0x492ad4`).
     run_to(&mut game, &schedule, 843);
+    let _ = game.take_sounds();
     assert!(game.sell_held());
+    let sell_sounds = game.take_sounds();
+    assert!(
+        sell_sounds.contains(&SoundEvent::Play {
+            object: -4,
+            name: "UI_moneyback".into(),
+        }),
+        "expected UI_moneyback on nonzero sale, got {sell_sounds:?}"
+    );
     run_to(&mut game, &schedule, 844);
     assert!(game.buy_cursor().is_none());
     assert!(!game.lot().world().objects.contains_key(&bench_cur.cursor));
@@ -7608,7 +7625,7 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
 
         // P2 #1: F1 with an unpaid lamp preview sitting on an undone end table
         // must switch to Live Mode cleanly without failing `missing object`.
-        let mut g5 = Game::open(&options(install)).expect("open Goth house");
+        let mut g5 = Game::open(&options(install.clone())).expect("open Goth house");
         g5.resize([800, 600]);
         g5.render();
         assert_eq!(g5.run(60), 60);
@@ -7640,6 +7657,130 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
         assert!(!g5.lot().world().objects.contains_key(&table_id));
         assert!(!g5.lot().world().objects.contains_key(&lamp_prev.held));
         assert!(!g5.lot().world().objects.contains_key(&lamp_prev.cursor));
+    }
+
+    // --- 6. Sol Round 5 regressions: drag release above 100px Buy strip must
+    //        not sell, Buy Redo affordability guard, and off-lot buy_pick_up
+    //        refusal ---
+    {
+        // P1: dragging the Goth porch bench and releasing at (350, 470) in the
+        // house viewport (above the 100px Buy strip at y=500..600) must NOT
+        // sell it.
+        let mut g6 = Game::open(&options(install.clone())).expect("open Goth house");
+        g6.resize([800, 600]);
+        g6.render();
+        assert_eq!(g6.run(60), 60);
+        g6.set_mode(Mode::Buy);
+        g6.render();
+        let funds_before_drag = g6.lot().world().budget.funds;
+        let bench_pt = recorded([432, 230]);
+        g6.press(bench_pt);
+        assert!(g6.buy_cursor().is_some_and(sims_vm::BuyCursor::is_existing));
+        g6.hover([350, 470]);
+        g6.release([350, 470]);
+        assert_eq!(
+            g6.lot().world().budget.funds,
+            funds_before_drag,
+            "releasing inside house viewport at y=470 must not sell bench"
+        );
+        g6.set_mode(Mode::Live);
+        assert!(g6.lot().world().objects.contains_key(&173));
+        assert!(g6.lot().world().objects.contains_key(&174));
+
+        // P2 #1 & P2 #2: Buy Redo must refuse rather than overdraw household
+        // funds when an earlier Sell Redo was refused, and `Lot::buy_pick_up`
+        // must reject detached off-lot history instances.
+        let mut lot5 = Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+        for _ in 0..60 {
+            lot5.step().unwrap();
+        }
+        lot5.set_mode(sims_vm::PanelMode::Buy).unwrap();
+        let chair_guid = 0x26bf_bb29u32;
+        let desk = catalog
+            .all()
+            .iter()
+            .find(|i| i.name.contains("Mesquite") && i.name.contains("Desk"))
+            .expect("Mesquite Desk");
+        let lamp = catalog
+            .all()
+            .iter()
+            .find(|i| i.name.contains("Gloominator"))
+            .expect("Gloominator Desk Lamp");
+
+        // P2 #2: selling a chair detaches it; `buy_pick_up` on that ID must
+        // return `Ok(None)` instead of allowing a second sale.
+        let mut ch = lot5.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+        assert!(lot5.buy_move(&mut ch, [600, 440], 1).unwrap());
+        let ch_id = lot5.buy_commit(&ch).unwrap();
+        let ch_pick = lot5.buy_pick_up(ch_id).unwrap().unwrap();
+        assert!(lot5.buy_sell(&ch_pick).unwrap());
+        let funds_after_first_sell = lot5.world().budget.funds;
+        assert!(lot5.world().objects[&ch_id].position[0] < 0);
+        assert!(
+            lot5.buy_pick_up(ch_id).unwrap().is_none(),
+            "detached sold chair must not be pickable again"
+        );
+        assert_eq!(lot5.world().budget.funds, funds_after_first_sell);
+
+        // P2 #1: Buy Redo affordability check after a refused Sell Redo.
+        let mut ch_keep = lot5.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+        assert!(lot5.buy_move(&mut ch_keep, [600, 440], 1).unwrap());
+        lot5.buy_commit(&ch_keep).unwrap();
+        let mut d1 = lot5.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot5.buy_move(&mut d1, [584, 472], 1).unwrap());
+        let desk1 = lot5.buy_commit(&d1).unwrap();
+        let mut d2 = lot5.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot5.buy_move(&mut d2, [552, 472], 1).unwrap());
+        let desk2 = lot5.buy_commit(&d2).unwrap();
+        let mut l1 = lot5.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot5.buy_move(&mut l1, [584, 472], 1).unwrap());
+        let lamp_id = lot5.buy_commit(&l1).unwrap();
+        let mut lm = lot5.buy_pick_up(lamp_id).unwrap().unwrap();
+        assert!(lot5.buy_move(&mut lm, [552, 472], 1).unwrap());
+        assert_eq!(lm.container.map(|(c, _)| c), Some(desk2));
+        lot5.buy_commit(&lm).unwrap();
+        let funds_before_desk_sell = lot5.world().budget.funds;
+        let d1_pick = lot5.buy_pick_up(desk1).unwrap().unwrap();
+        assert!(lot5.buy_sell(&d1_pick).unwrap());
+        let funds_after_desk_sell = lot5.world().budget.funds;
+        assert!(funds_after_desk_sell > funds_before_desk_sell);
+        // Find a floor item priced strictly between `funds_before_desk_sell`
+        // and `funds_after_desk_sell` so it is affordable only if desk1 was sold.
+        let mut tested_overdraw = false;
+        for item in catalog
+            .all()
+            .iter()
+            .filter(|i| i.price > funds_before_desk_sell && i.price <= funds_after_desk_sell)
+        {
+            let Some(mut exp_cur) = lot5.buy_start(item.guid, 1, 2).unwrap() else {
+                continue;
+            };
+            if !lot5.buy_move(&mut exp_cur, [584, 424], 1).unwrap() {
+                lot5.buy_cancel(&exp_cur).unwrap();
+                continue;
+            }
+            let exp_id = lot5.buy_commit(&exp_cur).unwrap();
+            assert!(lot5.buy_undo().unwrap()); // undo expensive item
+            assert!(lot5.buy_undo().unwrap()); // undo desk1 sell
+            assert!(lot5.buy_undo().unwrap()); // undo lamp move
+            assert_eq!(lot5.world().budget.funds, funds_before_desk_sell);
+            let mut blocker = lot5.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+            assert!(lot5.buy_move(&mut blocker, [552, 472], 1).unwrap());
+            assert!(!lot5.buy_redo().unwrap()); // lamp move refused
+            assert!(!lot5.buy_redo().unwrap()); // desk1 sell refused
+            // Expensive item Buy Redo must refuse instead of overdrawing funds!
+            assert!(!lot5.buy_redo().unwrap());
+            assert!(lot5.world().objects[&exp_id].position[0] < 0);
+            assert_eq!(lot5.world().budget.funds, funds_before_desk_sell);
+            assert!(lot5.world().budget.funds >= 0);
+            lot5.buy_cancel(&blocker).unwrap();
+            tested_overdraw = true;
+            break;
+        }
+        assert!(
+            tested_overdraw,
+            "expected an item priced between {funds_before_desk_sell} and {funds_after_desk_sell}"
+        );
     }
 }
 

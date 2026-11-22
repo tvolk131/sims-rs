@@ -1047,18 +1047,17 @@ pub fn draw(
                 [box_x + (box_w - half as i32) / 2, dst_y],
             );
         }
-        if let Some(font) = art.font(12) {
-            // Native `after-sell.png`: first glyph pixel sits at `(399, 517)`
-            // and second line at `y = 536` (`19` px step); `art.font(12)` has
-            // 6 px top ascent padding and `line_height = 23`.
+        if let Some(font) = art.font(10) {
+            // Native `after-sell.png`: 10pt text starts at `(399, 517)`..`526`
+            // on line 1 and `(399, 536)`..`548` on line 2 (`19` px line step).
             let text_x = prompt.rect.x + 158;
             let max_w = (prompt.rect.width - 170).max(40);
             let mut wrapped = Vec::new();
             for line in &prompt.lines {
                 wrapped.extend(font.wrap(line, max_w));
             }
-            let line_step = (font.line_height - 4).max(16);
-            let mut y = prompt.rect.y + 11;
+            let line_step = 19;
+            let mut y = prompt.rect.y + 12;
             for line in wrapped {
                 if y + font.line_height <= prompt.rect.y + prompt.rect.height {
                     font.draw(frame, &line, [text_x, y], [235, 240, 255]);

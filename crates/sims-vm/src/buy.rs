@@ -776,7 +776,16 @@ impl Interpreter<'_> {
     /// original tile/container with `origin` saving the group lead's original
     /// placement.
     pub fn buy_pick_up(&self, world: &mut World, id: u16) -> Result<Option<BuyCursor>, Fault> {
+        let Some(picked_pos) = world.objects.get(&id).map(|o| o.position) else {
+            return Ok(None);
+        };
         let lead = self.lead_object(world, id);
+        let Some(lead_pos) = world.objects.get(&lead).map(|o| o.position) else {
+            return Ok(None);
+        };
+        if !on_lot([picked_pos[0], picked_pos[1]]) || !on_lot([lead_pos[0], lead_pos[1]]) {
+            return Ok(None);
+        }
         if !self.can_pick_up(world, lead)? {
             return Ok(None);
         }
@@ -785,11 +794,6 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        let picked_pos = world
-            .objects
-            .get(&id)
-            .ok_or_else(|| fail(Trap::native(10, "missing picked object")))?
-            .position;
         let origin = self.capture_placement(world, lead)?;
         let guid = origin.guid;
         let words = self
@@ -1556,7 +1560,9 @@ impl Interpreter<'_> {
                 Ok(true)
             }
             BuyActionKind::Sell => {
-                if purchase.placed {
+                if purchase.placed
+                    || (purchase.price > 0 && available_funds(world) < purchase.price)
+                {
                     return Ok(false);
                 }
                 let target = purchase.before.clone().unwrap_or(BuyPlacement {
@@ -1604,7 +1610,9 @@ impl Interpreter<'_> {
         };
         match purchase.kind {
             BuyActionKind::Buy => {
-                if purchase.placed {
+                if purchase.placed
+                    || (purchase.price > 0 && available_funds(world) < purchase.price)
+                {
                     return Ok(false);
                 }
                 let target = purchase.after.clone().unwrap_or(BuyPlacement {
