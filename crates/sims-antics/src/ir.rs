@@ -70,6 +70,11 @@ pub struct ObjdSpec {
     pub catalog_sort_flags: u16,
     pub room_flags: u16,
     pub function_flags: u16,
+    pub data_58: i16,
+    pub level: i16,
+    pub num_attributes: u16,
+    pub lead_tile: u16,
+    pub dynamic_sprites: u16,
 }
 
 impl ObjdSpec {
@@ -103,6 +108,11 @@ impl ObjdSpec {
             catalog_sort_flags: 0,
             room_flags: 0,
             function_flags: 0,
+            data_58: 0,
+            level: 0,
+            num_attributes: 0,
+            lead_tile: 0,
+            dynamic_sprites: 0,
         }
     }
 
@@ -137,6 +147,11 @@ impl ObjdSpec {
         words[43] = self.init_id;
         words[44] = self.room_flags;
         words[45] = self.function_flags;
+        words[49] = self.data_58 as u16;
+        words[56] = self.level as u16;
+        words[58] = self.num_attributes;
+        words[63] = self.lead_tile;
+        words[65] = self.dynamic_sprites;
         ObjdChunk {
             id: self.id,
             label: self.label.clone(),

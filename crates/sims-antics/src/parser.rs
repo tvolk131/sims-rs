@@ -1,8 +1,9 @@
 //! Recursive-descent parser for the two-tier `.antics` language.
 
 use crate::ast::{
-    AssignOp, BconDecl, Branches, CallTarget, CompareOp, Condition, Item, Module, Operand,
-    PrimitiveCall, Stmt, Target, TreeDecl, TreeHeader,
+    AssignOp, BconDecl, Branches, CallTarget, CompareOp, Condition, Item, LocalRef, Module,
+    Operand, OperandRef, PrimitiveCall, Stmt, StrDecl, StrEntryDecl, StringRef, Target, TreeDecl,
+    TreeHeader,
 };
 use crate::error::{Error, Result, Span};
 use crate::lexer::{Token, TokenKind, tokenize};
@@ -85,6 +86,17 @@ impl Parser {
         }
     }
 
+    fn expect_string(&mut self, description: &str) -> Result<(String, Span)> {
+        let tok = self.bump();
+        match tok.kind {
+            TokenKind::Str(s) => Ok((s, tok.span)),
+            other => Err(Error::at(
+                tok.span,
+                format!("expected {description}, found {other:?}"),
+            )),
+        }
+    }
+
     fn expect_int(&mut self, description: &str) -> Result<(i64, Span)> {
         let tok = self.bump();
         match tok.kind {
@@ -125,11 +137,12 @@ impl Parser {
         let mut items = Vec::new();
         while self.peek().kind != TokenKind::Eof {
             let (kw, span) =
-                self.expect_ident("top-level keyword ('tree', 'interaction', 'bcon')")?;
+                self.expect_ident("top-level keyword ('tree', 'interaction', 'bcon', 'str')")?;
             match kw.as_str() {
                 "tree" => items.push(Item::Tree(self.parse_tree(span, false)?)),
                 "interaction" => items.push(Item::Tree(self.parse_tree(span, true)?)),
                 "bcon" => items.push(Item::Bcon(self.parse_bcon(span)?)),
+                "str" => items.push(Item::Str(self.parse_str_table(span)?)),
                 other => {
                     return Err(Error::at(
                         span,
@@ -167,23 +180,104 @@ impl Parser {
                 }
             }
         }
-        self.expect(&TokenKind::Assign, "'='")?;
-        self.expect(&TokenKind::LBracket, "'['")?;
         let mut values = Vec::new();
-        while !self.eat(&TokenKind::RBracket) {
-            values.push(self.expect_i16("BCON constant value")?);
-            if !self.eat(&TokenKind::Comma) {
-                self.expect(&TokenKind::RBracket, "']'")?;
-                break;
+        let mut entry_names = Vec::new();
+        if self.eat(&TokenKind::LBrace) {
+            while !self.eat(&TokenKind::RBrace) {
+                let (name, _nspan) = self.expect_ident("named BCON constant")?;
+                self.expect(&TokenKind::Assign, "'='")?;
+                let val = self.expect_i16("BCON constant value")?;
+                values.push(val);
+                entry_names.push(Some(name));
+                if !self.eat(&TokenKind::Comma) {
+                    self.expect(&TokenKind::RBrace, "'}'")?;
+                    break;
+                }
             }
+            self.eat(&TokenKind::Semicolon);
+        } else {
+            self.expect(&TokenKind::Assign, "'='")?;
+            self.expect(&TokenKind::LBracket, "'['")?;
+            while !self.eat(&TokenKind::RBracket) {
+                values.push(self.expect_i16("BCON constant value")?);
+                entry_names.push(None);
+                if !self.eat(&TokenKind::Comma) {
+                    self.expect(&TokenKind::RBracket, "']'")?;
+                    break;
+                }
+            }
+            self.eat(&TokenKind::Semicolon);
         }
-        self.eat(&TokenKind::Semicolon);
         Ok(BconDecl {
             span,
             id,
             label,
             flags,
             values,
+            entry_names,
+        })
+    }
+
+    fn parse_str_table(&mut self, span: Span) -> Result<StrDecl> {
+        let id = self.expect_u16("STR# chunk id")?;
+        let label = if let TokenKind::Str(s) = &self.peek().kind {
+            let s = s.clone();
+            self.bump();
+            s
+        } else {
+            format!("STR_{id}")
+        };
+        let mut entries = Vec::new();
+        if self.eat(&TokenKind::LBrace) {
+            while !self.eat(&TokenKind::RBrace) {
+                if let TokenKind::Str(_) = &self.peek().kind {
+                    let (text, espan) = self.expect_string("string table entry")?;
+                    entries.push(StrEntryDecl {
+                        span: espan,
+                        name: None,
+                        text,
+                        comment: String::new(),
+                    });
+                } else {
+                    let (name, nspan) = self.expect_ident("named string entry")?;
+                    self.expect(&TokenKind::Assign, "'='")?;
+                    let (text, _) = self.expect_string("string entry value")?;
+                    entries.push(StrEntryDecl {
+                        span: nspan,
+                        name: Some(name),
+                        text,
+                        comment: String::new(),
+                    });
+                }
+                if !self.eat(&TokenKind::Comma) {
+                    self.expect(&TokenKind::RBrace, "'}'")?;
+                    break;
+                }
+            }
+            self.eat(&TokenKind::Semicolon);
+        } else {
+            self.expect(&TokenKind::Assign, "'='")?;
+            self.expect(&TokenKind::LBracket, "'['")?;
+            while !self.eat(&TokenKind::RBracket) {
+                let (text, espan) = self.expect_string("string table entry")?;
+                entries.push(StrEntryDecl {
+                    span: espan,
+                    name: None,
+                    text,
+                    comment: String::new(),
+                });
+                if !self.eat(&TokenKind::Comma) {
+                    self.expect(&TokenKind::RBracket, "']'")?;
+                    break;
+                }
+            }
+            self.eat(&TokenKind::Semicolon);
+        }
+        Ok(StrDecl {
+            span,
+            id,
+            label,
+            entries,
         })
     }
 
@@ -289,8 +383,20 @@ impl Parser {
                 }
                 match ident.as_str() {
                     "op" => self.parse_raw_op(),
+                    "let" => self.parse_let_stmt(),
+                    "local" if self.peek_at(1).kind != TokenKind::LBracket => self.parse_let_stmt(),
                     "if" => self.parse_if(),
                     "while" => self.parse_while(),
+                    "break" => {
+                        self.bump();
+                        self.expect(&TokenKind::Semicolon, "';'")?;
+                        Ok(Stmt::Break { span: tok.span })
+                    }
+                    "continue" => {
+                        self.bump();
+                        self.expect(&TokenKind::Semicolon, "';'")?;
+                        Ok(Stmt::Continue { span: tok.span })
+                    }
                     "return" => self.parse_return(),
                     "idle" => self.parse_idle(),
                     "call" | "subroutine" => self.parse_call_stmt(),
@@ -300,12 +406,16 @@ impl Parser {
                     | "random"
                     | "find_best_object"
                     | "idle_for_input"
+                    | "remove_object"
+                    | "run_functional_tree"
                     | "play_sound"
+                    | "alter_budget"
                     | "stop_all_sounds"
                     | "set_motive_change"
                     | "clear_motive_changes"
                     | "set_to_next"
                     | "dialog"
+                    | "create_object"
                     | "animate"
                     | "route"
                     | "route_to"
@@ -318,6 +428,24 @@ impl Parser {
                 format!("unexpected token {other:?} at start of statement"),
             )),
         }
+    }
+
+    fn parse_let_stmt(&mut self) -> Result<Stmt> {
+        let (_, span) = self.expect_ident("'let' or 'local'")?;
+        let (name, nspan) = self.expect_ident("local variable name")?;
+        if is_reserved_ident(&name) {
+            return Err(Error::at(
+                nspan,
+                format!("cannot use reserved keyword '{name}' as a local variable name"),
+            ));
+        }
+        let init = if self.eat(&TokenKind::Assign) {
+            Some(self.parse_operand()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Semicolon, "';'")?;
+        Ok(Stmt::Let { span, name, init })
     }
 
     fn parse_raw_op(&mut self) -> Result<Stmt> {
@@ -593,20 +721,178 @@ impl Parser {
         })
     }
 
+    fn parse_string_ref(&mut self, description: &str) -> Result<StringRef> {
+        match &self.peek().kind {
+            TokenKind::Int(_) => Ok(StringRef::Index(self.expect_u8(description)?)),
+            TokenKind::Ident(s) if s == "str" => {
+                self.bump();
+                self.expect(&TokenKind::Dot, "'.'")?;
+                let (name, _) = self.expect_ident("string entry name")?;
+                Ok(StringRef::Named(name))
+            }
+            other => Err(Error::at(
+                self.span(),
+                format!("expected {description} (u8 or str.<name>), found {other:?}"),
+            )),
+        }
+    }
+
+    fn parse_local_ref(&mut self, description: &str) -> Result<LocalRef> {
+        match &self.peek().kind {
+            TokenKind::Int(_) => Ok(LocalRef::Index(self.expect_u8(description)?)),
+            TokenKind::Ident(s) if s == "local" && self.peek_at(1).kind == TokenKind::LBracket => {
+                self.bump();
+                self.expect(&TokenKind::LBracket, "'['")?;
+                let idx = self.expect_u8(description)?;
+                self.expect(&TokenKind::RBracket, "']'")?;
+                Ok(LocalRef::Index(idx))
+            }
+            TokenKind::Ident(_) => {
+                let (name, _) = self.expect_ident(description)?;
+                Ok(LocalRef::Named(name))
+            }
+            other => Err(Error::at(
+                self.span(),
+                format!("expected {description}, found {other:?}"),
+            )),
+        }
+    }
+
+    fn parse_function_index(&mut self) -> Result<u16> {
+        match &self.peek().kind {
+            TokenKind::Int(_) => self.expect_u16("function index"),
+            TokenKind::Ident(s) => {
+                let name = s.clone();
+                let span = self.span();
+                self.bump();
+                match name.as_str() {
+                    "prep" => Ok(0),
+                    "cook" => Ok(1),
+                    "surface" => Ok(2),
+                    "dispose" => Ok(3),
+                    "eat" => Ok(6),
+                    "pick_up" => Ok(7),
+                    "sit" => Ok(8),
+                    "clean" => Ok(10),
+                    "repair" => Ok(11),
+                    "serve" => Ok(12),
+                    "rest" => Ok(14),
+                    "category4" => Ok(15),
+                    other => Err(Error::at(span, format!("unknown function name '{other}'"))),
+                }
+            }
+            other => Err(Error::at(
+                self.span(),
+                format!("expected function index or name, found {other:?}"),
+            )),
+        }
+    }
+
+    fn parse_set_to_next_mode(&mut self) -> Result<u8> {
+        match &self.peek().kind {
+            TokenKind::Int(_) => self.expect_u8("set_to_next mode"),
+            TokenKind::Ident(s) => {
+                let name = s.clone();
+                let span = self.span();
+                self.bump();
+                match name.as_str() {
+                    "all" => Ok(0),
+                    "person" => Ok(1),
+                    "non_person" => Ok(2),
+                    "part" | "tile" => Ok(3),
+                    "guid" => Ok(4),
+                    "neighbor" => Ok(5),
+                    "category" => Ok(6),
+                    "neighbor_guid" => Ok(7),
+                    "on_tile" => Ok(8),
+                    "beside" => Ok(9),
+                    "career" => Ok(10),
+                    "family" => Ok(12),
+                    other => Err(Error::at(
+                        span,
+                        format!("unknown set_to_next mode '{other}'"),
+                    )),
+                }
+            }
+            other => Err(Error::at(
+                self.span(),
+                format!("expected set_to_next mode, found {other:?}"),
+            )),
+        }
+    }
+
+    fn parse_create_mode(&mut self) -> Result<u8> {
+        match &self.peek().kind {
+            TokenKind::Int(_) => self.expect_u8("create_object mode"),
+            TokenKind::Ident(s) => {
+                let name = s.clone();
+                let span = self.span();
+                self.bump();
+                match name.as_str() {
+                    "ahead" => Ok(0),
+                    "my_slot" => Ok(1),
+                    "stack_ahead" => Ok(3),
+                    "stack_slot" => Ok(4),
+                    "here" => Ok(5),
+                    "off_lot" => Ok(6),
+                    "param_pos" => Ok(7),
+                    "local_pos" => Ok(8),
+                    "turned" => Ok(9),
+                    other => Err(Error::at(
+                        span,
+                        format!("unknown create_object mode '{other}'"),
+                    )),
+                }
+            }
+            other => Err(Error::at(
+                self.span(),
+                format!("expected create_object mode, found {other:?}"),
+            )),
+        }
+    }
+
+    fn parse_dialog_kind(&mut self) -> Result<u8> {
+        match &self.peek().kind {
+            TokenKind::Int(_) => self.expect_u8("dialog kind"),
+            TokenKind::Ident(s) => {
+                let name = s.clone();
+                let span = self.span();
+                self.bump();
+                match name.as_str() {
+                    "ok" | "message" => Ok(0),
+                    "yes_no" => Ok(1),
+                    "yes_no_cancel" | "three_choice" => Ok(2),
+                    "text_entry" => Ok(3),
+                    other => Err(Error::at(span, format!("unknown dialog kind '{other}'"))),
+                }
+            }
+            other => Err(Error::at(
+                self.span(),
+                format!("expected dialog kind, found {other:?}"),
+            )),
+        }
+    }
+
     fn parse_primitive_call(&mut self) -> Result<PrimitiveCall> {
         let (name, span) = self.expect_ident("primitive name")?;
         self.expect(&TokenKind::LParen, "'('")?;
         let prim = match name.as_str() {
             "sleep" => {
                 let op = self.parse_operand()?;
-                if op.scope != 9 && op.scope != 7 {
+                let OperandRef::Direct(direct) = op else {
+                    return Err(Error::at(
+                        span,
+                        "sleep() expects a parameter index (param[N] or integer N)",
+                    ));
+                };
+                if direct.scope != 9 && direct.scope != 7 {
                     return Err(Error::at(
                         span,
                         "sleep() expects a parameter index (param[N] or integer N)",
                     ));
                 }
                 PrimitiveCall::Sleep {
-                    param_index: op.index,
+                    param_index: direct.index,
                 }
             }
             "generic_call" => {
@@ -626,24 +912,117 @@ impl Parser {
                 PrimitiveCall::Random { dst, range }
             }
             "find_best_object" => {
-                let function = self.expect_u16("function index")?;
-                let flags = if self.eat(&TokenKind::Comma) {
-                    self.expect_u8("find_best_object flags")?
-                } else {
-                    0
-                };
+                let function = self.parse_function_index()?;
+                let mut flags = 0u8;
+                if self.eat(&TokenKind::Comma) {
+                    if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "flags")
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        self.bump();
+                        self.bump();
+                    }
+                    flags = self.expect_u8("find_best_object flags")?;
+                }
                 PrimitiveCall::FindBestObject { function, flags }
             }
             "idle_for_input" => {
                 let op = self.parse_operand()?;
+                let OperandRef::Direct(direct) = op else {
+                    return Err(Error::at(
+                        span,
+                        "idle_for_input() expects a parameter index (param[N] or integer N)",
+                    ));
+                };
+                if direct.scope != 9 && direct.scope != 7 {
+                    return Err(Error::at(
+                        span,
+                        "idle_for_input() expects a parameter index (param[N] or integer N)",
+                    ));
+                }
                 let allow_push = if self.eat(&TokenKind::Comma) {
                     self.expect_u16("allow_push flag")?
                 } else {
                     0
                 };
                 PrimitiveCall::IdleForInput {
-                    param_index: op.index,
+                    param_index: direct.index,
                     allow_push,
+                }
+            }
+            "remove_object" => {
+                let target = match &self.peek().kind {
+                    TokenKind::Int(_) => self.expect_u16("remove_object target")?,
+                    TokenKind::Ident(s) => {
+                        let name = s.clone();
+                        let tspan = self.span();
+                        self.bump();
+                        match name.as_str() {
+                            "me" | "self" => 0,
+                            "stack_obj" => 1,
+                            other => {
+                                return Err(Error::at(
+                                    tspan,
+                                    format!(
+                                        "unknown remove_object target '{other}' (expected me, stack_obj, 0, 1, or 2)"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(Error::at(
+                            self.span(),
+                            format!("expected remove_object target, found {other:?}"),
+                        ));
+                    }
+                };
+                let mut flags = 0u8;
+                while self.eat(&TokenKind::Comma) {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        let (k, kspan) = self.expect_ident("remove_object option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "flags" => flags |= self.expect_u8("remove_object flags")?,
+                            "no_yield" => {
+                                if self.parse_bool()? {
+                                    flags |= 1;
+                                }
+                            }
+                            "skip_resets" => {
+                                if self.parse_bool()? {
+                                    flags |= 2;
+                                }
+                            }
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown remove_object parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        flags = self.expect_u8("remove_object flags")?;
+                    }
+                }
+                PrimitiveCall::RemoveObject { target, flags }
+            }
+            "run_functional_tree" => {
+                let function = self.parse_function_index()?;
+                let mut change_icon = false;
+                if self.eat(&TokenKind::Comma) {
+                    if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "change_icon")
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        self.bump();
+                        self.bump();
+                    }
+                    change_icon = self.parse_bool()?;
+                }
+                PrimitiveCall::RunFunctionalTree {
+                    function,
+                    change_icon,
                 }
             }
             "play_sound" => {
@@ -664,6 +1043,40 @@ impl Parser {
                 PrimitiveCall::PlaySound {
                     sound_id,
                     use_stack_object,
+                }
+            }
+            "alter_budget" => {
+                let amount = self.parse_operand()?;
+                let mut category = 0u8;
+                let mut flags = 0u8;
+                while self.eat(&TokenKind::Comma) {
+                    let (k, kspan) = self.expect_ident("alter_budget option")?;
+                    self.expect(&TokenKind::Colon, "':'")?;
+                    match k.as_str() {
+                        "category" => category = self.expect_u8("budget category")?,
+                        "flags" => flags |= self.expect_u8("alter_budget flags")?,
+                        "test_only" => {
+                            if self.parse_bool()? {
+                                flags |= 1;
+                            }
+                        }
+                        "income" => {
+                            if self.parse_bool()? {
+                                flags |= 2;
+                            }
+                        }
+                        other => {
+                            return Err(Error::at(
+                                kspan,
+                                format!("unknown alter_budget parameter '{other}'"),
+                            ));
+                        }
+                    }
+                }
+                PrimitiveCall::AlterBudget {
+                    amount,
+                    category,
+                    flags,
                 }
             }
             "stop_all_sounds" => {
@@ -688,21 +1101,107 @@ impl Parser {
             }
             "clear_motive_changes" => PrimitiveCall::ClearMotiveChanges,
             "set_to_next" => {
-                let mode = self.expect_u8("set_to_next mode")?;
-                let guid = if self.eat(&TokenKind::Comma) {
-                    self.expect_u32("GUID")?
-                } else {
-                    0
-                };
-                PrimitiveCall::SetToNext { mode, guid }
+                let mode = self.parse_set_to_next_mode()?;
+                let mut guid = 0u32;
+                let mut dest = None;
+                let mut local = LocalRef::Index(0);
+                let mut saw_named = false;
+                while self.eat(&TokenKind::Comma) {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("set_to_next option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "guid" => guid = self.expect_u32("GUID")?,
+                            "dest" | "into" => dest = Some(self.parse_operand()?),
+                            "local" => local = self.parse_local_ref("set_to_next local")?,
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown set_to_next parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in set_to_next()",
+                            ));
+                        }
+                        guid = self.expect_u32("GUID")?;
+                    }
+                }
+                PrimitiveCall::SetToNext {
+                    mode,
+                    guid,
+                    dest,
+                    local,
+                }
+            }
+            "create_object" => {
+                let guid = self.expect_u32("object GUID")?;
+                let mut mode = 5u8;
+                let mut flags = 0u8;
+                let mut local = LocalRef::Index(0);
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.eat(&TokenKind::Comma) {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("create_object option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "mode" => mode = self.parse_create_mode()?,
+                            "flags" => flags = self.expect_u8("create_object flags")?,
+                            "local" => local = self.parse_local_ref("create_object local")?,
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown create_object parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in create_object()",
+                            ));
+                        }
+                        match positional {
+                            0 => mode = self.parse_create_mode()?,
+                            1 => flags = self.expect_u8("create_object flags")?,
+                            2 => local = self.parse_local_ref("create_object local")?,
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to create_object()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                }
+                PrimitiveCall::CreateObject {
+                    guid,
+                    mode,
+                    flags,
+                    local,
+                }
             }
             "dialog" => {
                 let mut kind = 0u8;
-                let mut message = 0u8;
-                let mut title = 0u8;
-                let mut button1 = 0u8;
-                let mut button2 = 0u8;
-                let mut button3 = 0u8;
+                let mut message = StringRef::Index(0);
+                let mut title = StringRef::Index(0);
+                let mut button1 = StringRef::Index(0);
+                let mut button2 = StringRef::Index(0);
+                let mut button3 = StringRef::Index(0);
+                let mut mode4_str = StringRef::Index(0);
                 let mut flags = 0u8;
                 let mut positional = 0usize;
                 let mut saw_named = false;
@@ -714,15 +1213,45 @@ impl Parser {
                         let (k, kspan) = self.expect_ident("dialog option")?;
                         self.expect(&TokenKind::Colon, "':'")?;
                         match k.as_str() {
-                            "kind" => kind = self.expect_u8("dialog kind")?,
+                            "kind" => kind = self.parse_dialog_kind()?,
                             "message" | "text" => {
-                                message = self.expect_u8("dialog message index")?
+                                message = self.parse_string_ref("dialog message index")?;
                             }
-                            "title" => title = self.expect_u8("dialog title index")?,
-                            "button1" => button1 = self.expect_u8("dialog button1 index")?,
-                            "button2" => button2 = self.expect_u8("dialog button2 index")?,
-                            "button3" => button3 = self.expect_u8("dialog button3 index")?,
-                            "flags" => flags = self.expect_u8("dialog flags")?,
+                            "title" => title = self.parse_string_ref("dialog title index")?,
+                            "button1" => button1 = self.parse_string_ref("dialog button1 index")?,
+                            "button2" => button2 = self.parse_string_ref("dialog button2 index")?,
+                            "button3" => button3 = self.parse_string_ref("dialog button3 index")?,
+                            "mode4_str" | "icon_str" => {
+                                mode4_str = self.parse_string_ref("dialog mode4 string index")?;
+                            }
+                            "flags" => flags |= self.expect_u8("dialog flags")?,
+                            "inform" => {
+                                if self.parse_bool()? {
+                                    flags |= 1;
+                                }
+                            }
+                            "non_modal" => {
+                                if self.parse_bool()? {
+                                    flags |= 0x80;
+                                }
+                            }
+                            "icon_mode" => {
+                                let mode = self.expect_u8("dialog icon_mode")?;
+                                if mode > 7 {
+                                    return Err(Error::at(
+                                        kspan,
+                                        "dialog icon_mode must be in 0..=7",
+                                    ));
+                                }
+                                flags = (flags & !(7 << 1)) | (mode << 1);
+                            }
+                            "temp" => {
+                                let t = self.expect_u8("dialog temp index")?;
+                                if t > 7 {
+                                    return Err(Error::at(kspan, "dialog temp must be in 0..=7"));
+                                }
+                                flags = (flags & !(7 << 4)) | (t << 4);
+                            }
                             other => {
                                 return Err(Error::at(
                                     kspan,
@@ -738,13 +1267,13 @@ impl Parser {
                             ));
                         }
                         match positional {
-                            0 => kind = self.expect_u8("dialog kind")?,
-                            1 => message = self.expect_u8("dialog message index")?,
+                            0 => kind = self.parse_dialog_kind()?,
+                            1 => message = self.parse_string_ref("dialog message index")?,
                             2 => flags = self.expect_u8("dialog flags")?,
-                            3 => title = self.expect_u8("dialog title index")?,
-                            4 => button1 = self.expect_u8("dialog button1 index")?,
-                            5 => button2 = self.expect_u8("dialog button2 index")?,
-                            6 => button3 = self.expect_u8("dialog button3 index")?,
+                            3 => title = self.parse_string_ref("dialog title index")?,
+                            4 => button1 = self.parse_string_ref("dialog button1 index")?,
+                            5 => button2 = self.parse_string_ref("dialog button2 index")?,
+                            6 => button3 = self.parse_string_ref("dialog button3 index")?,
                             _ => {
                                 return Err(Error::at(
                                     self.span(),
@@ -765,6 +1294,7 @@ impl Parser {
                     button1,
                     button2,
                     button3,
+                    mode4_str,
                     flags,
                 }
             }
@@ -773,7 +1303,7 @@ impl Parser {
                 let mut table = 0u8;
                 let mut flags = 0u8;
                 let mut events = 0i8;
-                let mut local_index = 0u8;
+                let mut local_index = LocalRef::Index(0);
                 let mut positional = 0usize;
                 while self.peek().kind != TokenKind::RParen {
                     if matches!(&self.peek().kind, TokenKind::Ident(_))
@@ -786,7 +1316,7 @@ impl Parser {
                             "table" => table = self.expect_u8("animation table")?,
                             "flags" => flags = self.expect_u8("animation flags")?,
                             "events" => events = self.expect_i8("animation event count")?,
-                            "local" => local_index = self.expect_u8("event local")?,
+                            "local" => local_index = self.parse_local_ref("event local")?,
                             other => {
                                 return Err(Error::at(
                                     kspan,
@@ -800,7 +1330,7 @@ impl Parser {
                             1 => table = self.expect_u8("animation table")?,
                             2 => flags = self.expect_u8("animation flags")?,
                             3 => events = self.expect_i8("animation event count")?,
-                            4 => local_index = self.expect_u8("event local")?,
+                            4 => local_index = self.parse_local_ref("event local")?,
                             _ => {
                                 return Err(Error::at(
                                     self.span(),
@@ -992,8 +1522,18 @@ impl Parser {
                         pass_temps,
                     }
                 }
-                "route" | "route_to" | "find_best_object" | "dialog" | "animate" | "snap"
-                | "set_to_next" | "play_sound" => {
+                "route"
+                | "route_to"
+                | "find_best_object"
+                | "dialog"
+                | "animate"
+                | "snap"
+                | "set_to_next"
+                | "play_sound"
+                | "create_object"
+                | "remove_object"
+                | "run_functional_tree"
+                | "alter_budget" => {
                     let prim = self.parse_primitive_call()?;
                     Condition::Primitive { span, prim }
                 }
@@ -1040,12 +1580,12 @@ impl Parser {
         Ok(index)
     }
 
-    fn parse_operand(&mut self) -> Result<Operand> {
+    fn parse_operand(&mut self) -> Result<OperandRef> {
         let tok = self.peek().clone();
         match &tok.kind {
             TokenKind::Int(_) => {
                 let val = self.expect_i16("integer literal")?;
-                Ok(Operand::literal(val))
+                Ok(OperandRef::Direct(Operand::literal(val)))
             }
             TokenKind::Ident(root) => {
                 let root = root.clone();
@@ -1056,7 +1596,7 @@ impl Parser {
                         self.expect(&TokenKind::LParen, "'('")?;
                         let v = self.expect_i16("literal value")?;
                         self.expect(&TokenKind::RParen, "')'")?;
-                        Ok(Operand::literal(v))
+                        Ok(OperandRef::Direct(Operand::literal(v)))
                     }
                     "scope" => {
                         self.expect(&TokenKind::LParen, "'('")?;
@@ -1064,15 +1604,31 @@ impl Parser {
                         self.expect(&TokenKind::Comma, "','")?;
                         let i = self.expect_i16("scope index")?;
                         self.expect(&TokenKind::RParen, "')'")?;
-                        Ok(Operand::new(s, i))
+                        Ok(OperandRef::Direct(Operand::new(s, i)))
                     }
-                    "global" => Ok(Operand::new(6, self.parse_bracket_index()?)),
-                    "temp" => Ok(Operand::new(8, self.parse_bracket_index()?)),
-                    "param" => Ok(Operand::new(9, self.parse_bracket_index()?)),
-                    "stack_obj" => Ok(Operand::new(10, 0)),
-                    "local" => Ok(Operand::new(25, self.parse_bracket_index()?)),
+                    "global" => Ok(OperandRef::Direct(Operand::new(
+                        6,
+                        self.parse_bracket_index()?,
+                    ))),
+                    "temp" => Ok(OperandRef::Direct(Operand::new(
+                        8,
+                        self.parse_bracket_index()?,
+                    ))),
+                    "param" => Ok(OperandRef::Direct(Operand::new(
+                        9,
+                        self.parse_bracket_index()?,
+                    ))),
+                    "stack_obj" => Ok(OperandRef::Direct(Operand::new(10, 0))),
+                    "local" => Ok(OperandRef::Direct(Operand::new(
+                        25,
+                        self.parse_bracket_index()?,
+                    ))),
                     "bcon" | "const" => {
-                        self.expect(&TokenKind::LBracket, "'['")?;
+                        if self.eat(&TokenKind::Dot) {
+                            let (name, _) = self.expect_ident("BCON constant name")?;
+                            return Ok(OperandRef::NamedBcon(name));
+                        }
+                        self.expect(&TokenKind::LBracket, "'[' or '.'")?;
                         let first = self.expect_i16("constant index")?;
                         let index = if self.eat(&TokenKind::Colon) || self.eat(&TokenKind::Comma) {
                             let entry = self.expect_u8("constant entry index")?;
@@ -1098,11 +1654,21 @@ impl Parser {
                             first
                         };
                         self.expect(&TokenKind::RBracket, "']'")?;
-                        Ok(Operand::new(26, index))
+                        Ok(OperandRef::Direct(Operand::new(26, index)))
                     }
-                    "my" => self.parse_scoped_member(span, true),
-                    "stack" => self.parse_scoped_member(span, false),
-                    other => Err(Error::at(span, format!("unknown operand '{other}'"))),
+                    "str" => {
+                        self.expect(&TokenKind::Dot, "'.'")?;
+                        let (name, _) = self.expect_ident("string entry name")?;
+                        Ok(OperandRef::NamedStr(name))
+                    }
+                    "my" => self.parse_scoped_member(span, true).map(OperandRef::Direct),
+                    "stack" => self
+                        .parse_scoped_member(span, false)
+                        .map(OperandRef::Direct),
+                    other if is_reserved_ident(other) => {
+                        Err(Error::at(span, format!("unexpected keyword '{other}'")))
+                    }
+                    other => Ok(OperandRef::NamedLocal(other.to_owned())),
                 }
             }
             other => Err(Error::at(
@@ -1114,8 +1680,9 @@ impl Parser {
 
     fn parse_scoped_member(&mut self, span: Span, is_my: bool) -> Result<Operand> {
         self.expect(&TokenKind::Dot, "'.'")?;
-        let (field, fspan) =
-            self.expect_ident("member name (attr, data, motive, person, slot, temp)")?;
+        let (field, fspan) = self.expect_ident(
+            "member name (attr, data, motive, person, skill, slot, temp, id, in_use, room, prep_score, cook_score)",
+        )?;
         match field.as_str() {
             "attr" => Ok(Operand::new(
                 if is_my { 0 } else { 1 },
@@ -1125,15 +1692,37 @@ impl Parser {
                 if is_my { 3 } else { 4 },
                 self.parse_bracket_index()?,
             )),
+            "id" => Ok(Operand::new(if is_my { 3 } else { 4 }, 11)),
+            "in_use" => Ok(Operand::new(if is_my { 3 } else { 4 }, 25)),
+            "room" => Ok(Operand::new(if is_my { 3 } else { 4 }, 29)),
+            "prep_score" => Ok(Operand::new(if is_my { 3 } else { 4 }, 31)),
+            "cook_score" => Ok(Operand::new(if is_my { 3 } else { 4 }, 32)),
             "temp" if !is_my => Ok(Operand::new(13, self.parse_bracket_index()?)),
             "slot" => Ok(Operand::new(
                 if is_my { 20 } else { 16 },
                 self.parse_bracket_index()?,
             )),
-            "person" => Ok(Operand::new(
-                if is_my { 18 } else { 19 },
-                self.parse_bracket_index()?,
-            )),
+            "person" => {
+                let scope = if is_my { 18 } else { 19 };
+                if self.eat(&TokenKind::Dot) {
+                    let (sname, sspan) = self.expect_ident("person data field name")?;
+                    let id = person_field_by_name(&sname).ok_or_else(|| {
+                        Error::at(sspan, format!("unknown person data field '{sname}'"))
+                    })?;
+                    Ok(Operand::new(scope, i16::from(id)))
+                } else {
+                    Ok(Operand::new(scope, self.parse_bracket_index()?))
+                }
+            }
+            "priority" => Ok(Operand::new(if is_my { 18 } else { 19 }, 33)),
+            "skill" => {
+                let scope = if is_my { 18 } else { 19 };
+                self.expect(&TokenKind::Dot, "'.'")?;
+                let (sname, sspan) = self.expect_ident("skill name")?;
+                let id = skill_by_name(&sname)
+                    .ok_or_else(|| Error::at(sspan, format!("unknown skill '{sname}'")))?;
+                Ok(Operand::new(scope, i16::from(id)))
+            }
             "motive" => {
                 let scope = if is_my { 14 } else { 15 };
                 if self.eat(&TokenKind::Dot) {
@@ -1156,6 +1745,40 @@ impl Parser {
     }
 }
 
+fn is_reserved_ident(name: &str) -> bool {
+    matches!(
+        name,
+        "tree"
+            | "interaction"
+            | "bcon"
+            | "const"
+            | "str"
+            | "let"
+            | "local"
+            | "if"
+            | "else"
+            | "while"
+            | "break"
+            | "continue"
+            | "return"
+            | "idle"
+            | "call"
+            | "subroutine"
+            | "op"
+            | "my"
+            | "stack"
+            | "stack_obj"
+            | "global"
+            | "temp"
+            | "param"
+            | "literal"
+            | "scope"
+            | "true"
+            | "false"
+            | "error"
+    )
+}
+
 /// Maps human-readable Sims 1 motive names to their canonical `sims-vm` indices.
 #[must_use]
 pub fn motive_by_name(name: &str) -> Option<u8> {
@@ -1171,5 +1794,28 @@ pub fn motive_by_name(name: &str) -> Option<u8> {
         "social" => Some(14),
         "fun" => Some(15),
         _ => None,
+    }
+}
+
+/// Maps human-readable Sims 1 skill names to their canonical `person.data` indices.
+#[must_use]
+pub fn skill_by_name(name: &str) -> Option<u8> {
+    match name {
+        "cooking" => Some(10),
+        "charisma" => Some(11),
+        "mechanical" | "mechanic" => Some(12),
+        "creativity" => Some(15),
+        "body" => Some(17),
+        "logic" => Some(18),
+        _ => None,
+    }
+}
+
+/// Maps human-readable `person.data` field names (skills + action priority) to indices.
+#[must_use]
+pub fn person_field_by_name(name: &str) -> Option<u8> {
+    match name {
+        "priority" => Some(33),
+        other => skill_by_name(other),
     }
 }

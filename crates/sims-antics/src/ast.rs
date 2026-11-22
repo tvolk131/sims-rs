@@ -13,6 +13,7 @@ pub struct Module {
 pub enum Item {
     Tree(TreeDecl),
     Bcon(BconDecl),
+    Str(StrDecl),
 }
 
 /// A `BCON` integer constant table declaration in `.antics`.
@@ -23,6 +24,26 @@ pub struct BconDecl {
     pub label: String,
     pub flags: u8,
     pub values: Vec<i16>,
+    /// Optional symbolic names parallel to `values` (for `bcon.name` lookups).
+    pub entry_names: Vec<Option<String>>,
+}
+
+/// One entry inside a `str` (`STR#`) declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrEntryDecl {
+    pub span: Span,
+    pub name: Option<String>,
+    pub text: String,
+    pub comment: String,
+}
+
+/// A `STR#` string table declaration in `.antics`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrDecl {
+    pub span: Span,
+    pub id: u16,
+    pub label: String,
+    pub entries: Vec<StrEntryDecl>,
 }
 
 /// Header options for a `tree` or `interaction` block.
@@ -77,7 +98,7 @@ pub struct Branches {
     pub on_false: Target,
 }
 
-/// Memory operand (scope + 16-bit index) usable in expressions and primitives.
+/// Resolved concrete memory operand (scope + 16-bit index) in SimAntics bytecode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Operand {
     pub scope: u8,
@@ -97,6 +118,35 @@ impl Operand {
             index: value,
         }
     }
+}
+
+/// Symbolic or direct operand reference prior to lowering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperandRef {
+    Direct(Operand),
+    NamedLocal(String),
+    NamedBcon(String),
+    NamedStr(String),
+}
+
+impl From<Operand> for OperandRef {
+    fn from(op: Operand) -> Self {
+        Self::Direct(op)
+    }
+}
+
+/// Reference to a 1-based `STR#` entry index (either integer or `str.<name>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StringRef {
+    Index(u8),
+    Named(String),
+}
+
+/// Reference to a local variable slot (either explicit `u8` index or named local).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalRef {
+    Index(u8),
+    Named(String),
 }
 
 /// Assignment / arithmetic mutation operators in SimAntics Expression (opcode 2).
@@ -179,9 +229,9 @@ pub enum CallTarget {
 pub enum Condition {
     Compare {
         span: Span,
-        lhs: Operand,
+        lhs: OperandRef,
         op: CompareOp,
-        rhs: Operand,
+        rhs: OperandRef,
     },
     Call {
         span: Span,
@@ -207,13 +257,13 @@ pub enum PrimitiveCall {
         routine: u16,
     },
     ExprRaw {
-        lhs: Operand,
+        lhs: OperandRef,
         operator: u8,
-        rhs: Operand,
+        rhs: OperandRef,
     },
     Random {
-        dst: Operand,
-        range: Operand,
+        dst: OperandRef,
+        range: OperandRef,
     },
     FindBestObject {
         function: u16,
@@ -223,38 +273,62 @@ pub enum PrimitiveCall {
         param_index: i16,
         allow_push: u16,
     },
+    RemoveObject {
+        /// 0 = me, 1 = stack_obj, 2 = 0
+        target: u16,
+        flags: u8,
+    },
+    RunFunctionalTree {
+        function: u16,
+        change_icon: bool,
+    },
     PlaySound {
         sound_id: u16,
         use_stack_object: bool,
+    },
+    AlterBudget {
+        amount: OperandRef,
+        category: u8,
+        /// Bit 0 = test only, bit 1 = income (negate amount).
+        flags: u8,
     },
     StopAllSounds {
         use_stack_object: bool,
     },
     SetMotiveChange {
         motive: u8,
-        delta_per_hour: Operand,
-        stop_at: Operand,
+        delta_per_hour: OperandRef,
+        stop_at: OperandRef,
     },
     ClearMotiveChanges,
     SetToNext {
         mode: u8,
         guid: u32,
+        dest: Option<OperandRef>,
+        local: LocalRef,
     },
     Dialog {
         kind: u8,
-        message: u8,
-        title: u8,
-        button1: u8,
-        button2: u8,
-        button3: u8,
+        message: StringRef,
+        title: StringRef,
+        button1: StringRef,
+        button2: StringRef,
+        button3: StringRef,
+        mode4_str: StringRef,
         flags: u8,
+    },
+    CreateObject {
+        guid: u32,
+        mode: u8,
+        flags: u8,
+        local: LocalRef,
     },
     Animate {
         clip_id: u16,
         table: u8,
         flags: u8,
         events: i8,
-        local_index: u8,
+        local_index: LocalRef,
     },
     RouteTo {
         slot: u16,
@@ -272,6 +346,11 @@ pub enum Stmt {
     Label {
         span: Span,
         name: String,
+    },
+    Let {
+        span: Span,
+        name: String,
+        init: Option<OperandRef>,
     },
     RawOp {
         span: Span,
@@ -293,13 +372,13 @@ pub enum Stmt {
     },
     Assign {
         span: Span,
-        lhs: Operand,
+        lhs: OperandRef,
         op: AssignOp,
-        rhs: Operand,
+        rhs: OperandRef,
     },
     Idle {
         span: Span,
-        ticks: Operand,
+        ticks: OperandRef,
     },
     If {
         span: Span,
@@ -311,6 +390,12 @@ pub enum Stmt {
         span: Span,
         cond: Condition,
         body: Vec<Stmt>,
+    },
+    Break {
+        span: Span,
+    },
+    Continue {
+        span: Span,
     },
     Return {
         span: Span,

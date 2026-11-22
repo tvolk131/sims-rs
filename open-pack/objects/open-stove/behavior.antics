@@ -1,0 +1,71 @@
+// Open Hearth Stove (0x7F00_0022) — cooking range (OBJf callback 19 / 0x13).
+// Scales meal nutrition from caller's Cooking skill (param[0]) + counter prep bonus (param[3]),
+// yields across cook ticks, and spawns an Open Meal Plate (0x7F00_0023) on the lot tile ahead.
+//
+// Data/Attributes:
+//   data[32] (cook_score) = 60 (advertised to find_best_object(cook))
+//   attr[0] = total meals cooked on this stove
+//   attr[1] = occupied flag (0 = ready)
+
+bcon 4096 "StoveTuning" {
+    cook_score = 60,
+    cook_ticks = 2,
+    base_hunger_value = 30,
+    skill_divisor = 20,
+    max_nutrition = 95,
+}
+
+tree 4096 "Init" {
+    my.cook_score := bcon.cook_score;
+    my.attr[0] := 0;
+    my.attr[1] := 0;
+    return true;
+}
+
+tree 4097 "Main" {
+    return true;
+}
+
+// Check tree run by find_best_object(cook): stack_obj is this stove.
+tree 4098 "CanCook" {
+    if stack.attr[1] != 0 {
+        return false;
+    }
+    return true;
+}
+
+// Functional callback 19 (0x13): me is Sim, stack_obj is this stove,
+// param[0] = Sim cooking skill, param[3] = counter prep bonus.
+tree 4099 "CookOnStove" (args: 4) {
+    let stove_id = stack_obj;
+    let cooking_skill = param[0];
+    let prep_bonus = param[3];
+
+    play_sound(1, stack_obj);
+    idle(bcon.cook_ticks);
+
+    // Compute skill-scaled meal nutrition value.
+    let nutrition = cooking_skill;
+    nutrition /= bcon.skill_divisor;
+    nutrition += bcon.base_hunger_value;
+    nutrition += prep_bonus;
+    if nutrition > bcon.max_nutrition {
+        nutrition := bcon.max_nutrition;
+    }
+
+    // Spawn Open Meal Plate (0x7F00_0023) on the tile directly ahead of the stove.
+    // Fails cleanly if no reachable on-lot tile is free (Fridge refunds cost & stock).
+    if !create_object(0x7F00_0023, mode: stack_ahead, flags: 0x40) {
+        return false;
+    }
+
+    // Configure created plate (now stack_obj), increment stove cook count, and return plate ID.
+    let plate_id = stack_obj;
+    stack.attr[0] := nutrition;
+    stack.attr[1] := 1;
+    stack_obj := stove_id;
+    stack.attr[0] += 1;
+    stack_obj := plate_id;
+    temp[2] := plate_id;
+    return true;
+}

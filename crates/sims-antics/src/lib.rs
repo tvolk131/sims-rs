@@ -18,7 +18,8 @@ pub mod manifest;
 pub mod parser;
 
 pub use compile::{
-    CompiledModule, CompiledObject, compile_antics, compile_object_from_dir,
-    compile_object_from_sources, package_far,
+    CompiledModule, CompiledObject, CompiledPack, CompiledPackObject, compile_antics,
+    compile_object_dir, compile_object_from_dir, compile_object_from_sources, compile_pack_dir,
+    package_far,
 };
 pub use error::{Error, Result, Span};
