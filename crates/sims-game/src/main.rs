@@ -1,61 +1,31 @@
 //! The game's window.
 //!
 //! ```text
-//! sims-game [<install>] [<house file>] [--answers A,B,...] [--mute]
+//! sims-game [<install>] [<house file>] [--neighborhood] [--answers A,B,...] [--mute]
 //!           [--play] [--saves <file>] [--png <file> [--ticks N] [--size WxH]]
 //! ```
 //!
-//! The install defaults to `SIMS_INSTALL`, and the house to the Goths'
-//! (`UserData/Houses/House05.iff`). `--answers` answers the dialogs that
-//! offer a choice, in order, as `sims boot` does. Once they run out, a
-//! dialog waits for the player, as the original's does, and a press on
-//! one of its buttons answers it. `--png` has nobody to answer, so there
-//! the Goths' house defaults to `3` (No to the Help System).
+//! The install defaults to `SIMS_INSTALL`. Without a house file (or with
+//! `--neighborhood`), the window opens on the Neighborhood map screen
+//! (`NeighborhoodShell`), importing `UserData`..`UserData8` into the REDB
+//! `--saves` file on demand without modifying `SIMS_INSTALL`. Giving an
+//! explicit `<house file>` (or `--png`) boots directly into that house
+//! (defaulting `--png` to the Goths' `UserData/Houses/House05.iff` with
+//! `--answers 3`), keeping direct house launch and headless PNG rendering
+//! backwards-compatible.
 //!
 //! The lot runs at the original's pace: a tick every 42 milliseconds at
-//! normal speed, 14 at fast and 2 at ultra. The panel's speed, pause and
-//! camera buttons work; a paused lot goes on ticking with its clock
-//! standing, as the original's does. Keys: `+`/`-` or the
-//! wheel zoom, `[`/`]` or `,`/`.` rotate, Page Up and Page Down change the
-//! floor, `1`/`2`/`3` walls up, cutaway and down, the arrows or a
-//! right-button drag scroll, space pauses, Escape quits.
-//!
-//! F5 saves the lot and F9 goes back to the save (`sims_vm::boot::save`),
-//! one save for each house, kept in the REDB file `--saves` (default
-//! `sims-game-saves.redb` in the current directory). This is this
-//! reimplementation's save, not the original's house file: the original
-//! cannot open it. A save made while a dialog waits shows the dialog
-//! again when restored.
-//!
-//! A press on a portrait selects that Sim.
-//!
-//! A left click on a person or an object opens its pie menu for the
-//! selected Sim (`sims_ui::pie`, around the click); a click on an entry
-//! queues it, one on a submenu's entry opens the submenu, and a click
-//! anywhere else, or Escape, closes the menu. The pointer moves to the
-//! middle of a submenu that opens, and of a menu that had to move to
-//! stay in the window, as the original moves it. Escape quits only when no menu is open, and a
-//! held Escape's repeats do nothing.
-//!
-//! The lot runs in strict mode: the first error stops it, and the error
-//! is written across the top. `--play` runs it in play mode instead: an
-//! object whose tick fails is reset and the lot goes on, and each new
-//! error is printed and shown across the top for a while.
-//!
-//! Sound plays on the default output device (on macOS, or built with the
-//! `sound` feature) unless `--mute` is given.
-//!
-//! `--png` opens no window: it runs `--ticks` ticks (default 0) as fast as
-//! they go, draws one frame of `--size` (default 800x600) and saves it.
-//!
-//! The window is drawn at the original's pixel size and scaled up by
-//! whole pixels on high-DPI screens.
+//! normal speed, 14 at fast and 2 at ultra. Visual presentation uses a hybrid
+//! redraw cadence: matching the physical monitor's refresh rate during active
+//! user input/interaction and capping passive simulation-only redraws to 60 FPS
+//! while keeping simulation ticks running at full speed inside `SIM_BUDGET`.
 
 // A window shell: it reads the wall clock to pace the lot.
 #![allow(clippy::disallowed_methods)]
 
 use sims_game::game::goth_house;
 use sims_game::hud::DialogKey;
+use sims_game::neighborhood::{NeighborhoodShell, ScreenKind, ShellOutcome};
 use sims_game::sound::{self, Input};
 use sims_game::view::Move;
 use sims_game::{Game, Options};
@@ -84,6 +54,140 @@ const SIM_BUDGET: Duration = Duration::from_millis(8);
 /// avoiding per-frame AppKit/WM `set_title` IPC churn at Fast/Ultra speed.
 const TITLE_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Target redraw interval for passive simulation-only updates (60 FPS).
+const PASSIVE_FPS_INTERVAL: Duration = Duration::from_nanos(16_666_667);
+
+/// Fallback monitor refresh rate (60 Hz in millihertz) when winit reports none.
+const FALLBACK_REFRESH_MILLIHERTZ: u32 = 60_000;
+
+/// Minimum sane monitor refresh rate accepted from the OS (10 Hz).
+const MIN_REFRESH_MILLIHERTZ: u32 = 10_000;
+
+/// Maximum sane monitor refresh rate accepted from the OS (500 Hz).
+const MAX_REFRESH_MILLIHERTZ: u32 = 500_000;
+
+/// How long after the last discrete input event (pointer move, click, wheel,
+/// key press) the redraw pacer stays at the physical display refresh rate
+/// before settling back to 60 FPS passive cadence.
+const INTERACTIVE_HOLD: Duration = Duration::from_millis(250);
+
+/// Double-click detection window (400 ms, 4 canvas pixels).
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+const DOUBLE_CLICK_DISTANCE_SQ: i32 = 16;
+
+/// Converts a monitor refresh rate in millihertz (`window.current_monitor()
+/// .and_then(|m| m.refresh_rate_millihertz())`) into a frame interval,
+/// falling back to 60 Hz when absent or outside `[10 Hz, 500 Hz]`.
+fn refresh_interval_from_millihertz(millihertz: Option<u32>) -> Duration {
+    let mhz = millihertz
+        .filter(|&v| (MIN_REFRESH_MILLIHERTZ..=MAX_REFRESH_MILLIHERTZ).contains(&v))
+        .unwrap_or(FALLBACK_REFRESH_MILLIHERTZ);
+    let nanos = (1_000_000_000_000u64 / u64::from(mhz)).max(1);
+    Duration::from_nanos(nanos)
+}
+
+/// Hybrid visual redraw cadence pacer:
+/// - Matches the physical monitor refresh rate (e.g. 120 Hz on ProMotion,
+///   60 Hz on 60 Hz displays) during active user input or ongoing interaction
+///   (dragging, panning, edge-scrolling, dialogs, Buy/Build cursors).
+/// - Caps passive simulation-only redraws to 60 FPS (`PASSIVE_FPS_INTERVAL`),
+///   preventing 200+ FPS single-core busy-spin during Fast/Ultra speed while
+///   allowing `tick()` to advance the simulation at full pace.
+#[derive(Debug, Clone)]
+struct RedrawPacer {
+    display_interval: Duration,
+    last_present: Option<Instant>,
+    last_interaction: Option<Instant>,
+    redraw_requested: bool,
+}
+
+impl RedrawPacer {
+    fn new(refresh_millihertz: Option<u32>) -> Self {
+        Self {
+            display_interval: refresh_interval_from_millihertz(refresh_millihertz),
+            last_present: None,
+            last_interaction: None,
+            redraw_requested: false,
+        }
+    }
+
+    fn set_refresh_millihertz(&mut self, refresh_millihertz: Option<u32>) {
+        self.display_interval = refresh_interval_from_millihertz(refresh_millihertz);
+    }
+
+    #[cfg(test)]
+    fn display_interval(&self) -> Duration {
+        self.display_interval
+    }
+
+    fn note_interaction(&mut self, now: Instant) {
+        self.last_interaction = Some(now);
+    }
+
+    /// Forces the next dirty redraw to be requested immediately (e.g. after
+    /// resize, scale change, or screen transition).
+    fn request_immediate(&mut self) {
+        self.last_present = None;
+    }
+
+    fn is_interactive(&self, now: Instant, continuous_interaction: bool) -> bool {
+        continuous_interaction
+            || self
+                .last_interaction
+                .is_some_and(|t| now.saturating_duration_since(t) < INTERACTIVE_HOLD)
+    }
+
+    /// Active target frame interval at `now`.
+    fn target_interval(&self, now: Instant, continuous_interaction: bool) -> Duration {
+        if self.is_interactive(now, continuous_interaction) {
+            self.display_interval
+        } else {
+            PASSIVE_FPS_INTERVAL.max(self.display_interval)
+        }
+    }
+
+    /// Returns `true` when `window.request_redraw()` should be emitted now.
+    fn should_request_redraw(
+        &mut self,
+        now: Instant,
+        dirty: bool,
+        continuous_interaction: bool,
+    ) -> bool {
+        if !dirty || self.redraw_requested {
+            return false;
+        }
+        let interval = self.target_interval(now, continuous_interaction);
+        let due = self
+            .last_present
+            .is_none_or(|prev| now.saturating_duration_since(prev) >= interval);
+        if due {
+            self.redraw_requested = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Earliest instant when a deferred dirty frame becomes due to present.
+    fn next_redraw_deadline(
+        &self,
+        now: Instant,
+        dirty: bool,
+        continuous_interaction: bool,
+    ) -> Option<Instant> {
+        if !dirty || self.redraw_requested {
+            return None;
+        }
+        let interval = self.target_interval(now, continuous_interaction);
+        self.last_present.map(|prev| prev + interval)
+    }
+
+    fn on_present(&mut self, now: Instant) {
+        self.last_present = Some(now);
+        self.redraw_requested = false;
+    }
+}
+
 /// Whether the interactive wake loop should start another owed simulation tick
 /// after `ran` ticks have already completed in `spent` wall-clock time.
 ///
@@ -96,12 +200,6 @@ fn within_step_budget(ran: u32, spent: Duration, budget: Duration) -> bool {
 /// Tracks wall-clock time for the interactive wake loop with separate anchors
 /// for presentation (`clock_us`: plumb bob spin, pause-button blink) and
 /// simulation pacing (`Pace::due`).
-///
-/// When all owed ticks fit inside [`SIM_BUDGET`], both anchors advance to the
-/// wake start (`wake_start`) for zero-drift pacing. When a batch hits the
-/// wall-clock cap, `last_step` re-anchors to `wake_end` so the next wake does
-/// not inherit this wake's simulation time as a catch-up spiral, while
-/// `last_clock` stays at `wake_start` so presentation time never slows down.
 struct WakeClock {
     last_clock: Instant,
     last_step: Instant,
@@ -140,10 +238,11 @@ enum TitleState {
     Running,
     Paused,
     Stopped,
+    Shell,
 }
 
 /// Rate-limits window title updates while running, while flushing immediately
-/// on the first draw and whenever the paused/stopped status changes.
+/// on the first draw and whenever the paused/stopped/shell status changes.
 #[derive(Default)]
 struct TitleThrottle {
     last_title: String,
@@ -170,9 +269,20 @@ impl TitleThrottle {
             TitleState::Running => "",
             TitleState::Paused => ", paused",
             TitleState::Stopped => ", stopped",
+            TitleState::Shell => "",
         };
         let next = format!("sims-game: tick {ticks}{suffix}");
         self.last_state = Some(state);
+        if next == self.last_title {
+            return None;
+        }
+        self.last_title = next;
+        self.last_update = Some(now);
+        Some(&self.last_title)
+    }
+
+    fn update_custom(&mut self, next: String, now: Instant) -> Option<&str> {
+        self.last_state = Some(TitleState::Shell);
         if next == self.last_title {
             return None;
         }
@@ -232,9 +342,25 @@ struct Still {
     size: [i32; 2],
 }
 
-fn options() -> Result<(Options, Option<Still>, bool, PathBuf), String> {
-    let usage = "usage: sims-game [<install>] [<house file>] [--answers A,B,...] [--mute] \
-                 [--play] [--saves <file>] [--png <file> [--ticks N] [--size WxH]]";
+/// Parsed CLI launch configuration.
+struct LaunchConfig {
+    install: PathBuf,
+    /// `Some(house)` for direct house launch or `--png`; `None` for the
+    /// Neighborhood screen shell.
+    house: Option<PathBuf>,
+    answers: Vec<u8>,
+    play: bool,
+    still: Option<Still>,
+    mute: bool,
+    saves: PathBuf,
+}
+
+fn parse_launch_args<I>(args: I, env_install: Option<PathBuf>) -> Result<LaunchConfig, String>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let usage = "usage: sims-game [<install>] [<house file>] [--neighborhood] [--answers A,B,...] \
+                 [--mute] [--play] [--saves <file>] [--png <file> [--ticks N] [--size WxH]]";
     let mut paths = Vec::new();
     let mut answers = None;
     let mut png = None;
@@ -242,8 +368,9 @@ fn options() -> Result<(Options, Option<Still>, bool, PathBuf), String> {
     let mut size = [800, 600];
     let mut mute = false;
     let mut play = false;
+    let mut neighborhood_flag = false;
     let mut saves = PathBuf::from("sims-game-saves.redb");
-    let mut args = std::env::args_os().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut text = |name: &str| -> Result<String, String> {
             args.next()
@@ -254,6 +381,8 @@ fn options() -> Result<(Options, Option<Still>, bool, PathBuf), String> {
             mute = true;
         } else if arg == "--play" {
             play = true;
+        } else if arg == "--neighborhood" {
+            neighborhood_flag = true;
         } else if arg == "--saves" {
             saves = PathBuf::from(text("--saves")?);
         } else if arg == "--png" {
@@ -287,44 +416,150 @@ fn options() -> Result<(Options, Option<Still>, bool, PathBuf), String> {
     let mut paths = paths.into_iter();
     let install = match paths.next() {
         Some(path) => path,
-        None => std::env::var_os("SIMS_INSTALL")
-            .map(PathBuf::from)
-            .ok_or("give the install, or set SIMS_INSTALL")?,
+        None => env_install.ok_or("give the install, or set SIMS_INSTALL")?,
     };
-    let goths = goth_house(&install);
-    let house = paths.next().unwrap_or_else(|| goths.clone());
+    let explicit_house = paths.next();
     if paths.next().is_some() {
         return Err(usage.into());
     }
+    let goths = goth_house(&install);
+    let house = if neighborhood_flag && png.is_none() {
+        if explicit_house.is_some() {
+            return Err("--neighborhood cannot be combined with a house file".into());
+        }
+        None
+    } else if png.is_some() {
+        Some(explicit_house.unwrap_or_else(|| goths.clone()))
+    } else {
+        explicit_house
+    };
     // In the window the player answers; a still has nobody to.
     let answers = answers.unwrap_or_else(|| {
-        if house == goths && png.is_some() {
+        if house.as_ref() == Some(&goths) && png.is_some() {
             vec![3]
         } else {
             Vec::new()
         }
     });
     let still = png.map(|file| Still { file, ticks, size });
-    Ok((
-        Options {
-            install,
-            house,
-            answers,
-            play,
-            frames: sims_game::Frames::default(),
-        },
+    Ok(LaunchConfig {
+        install,
+        house,
+        answers,
+        play,
         still,
         mute,
         saves,
-    ))
+    })
+}
+
+fn options() -> Result<LaunchConfig, String> {
+    parse_launch_args(
+        std::env::args_os().skip(1),
+        std::env::var_os("SIMS_INSTALL").map(PathBuf::from),
+    )
+}
+
+/// Active desktop session: either a standalone explicit house launch or the
+/// full Neighborhood ↔ Family Bin ↔ Lot shell.
+enum Session {
+    Standalone {
+        game: Box<Game>,
+        slot: String,
+        options_file: PathBuf,
+        saved_optn: Vec<u8>,
+    },
+    Shell(Box<NeighborhoodShell>),
+}
+
+impl Session {
+    fn game(&self) -> Option<&Game> {
+        match self {
+            Self::Standalone { game, .. } => Some(game),
+            Self::Shell(shell) => shell.game(),
+        }
+    }
+
+    fn game_mut(&mut self) -> Option<&mut Game> {
+        match self {
+            Self::Standalone { game, .. } => Some(game),
+            Self::Shell(shell) => shell.game_mut(),
+        }
+    }
+
+    fn screen_kind(&self) -> ScreenKind {
+        match self {
+            Self::Standalone { .. } => ScreenKind::Lot,
+            Self::Shell(shell) => shell.screen(),
+        }
+    }
+
+    fn has_dialog(&self) -> bool {
+        match self {
+            Self::Standalone { game, .. } => game.has_dialog(),
+            Self::Shell(shell) => shell.has_dialog(),
+        }
+    }
+
+    fn is_actively_interacting(&self) -> bool {
+        match self {
+            Self::Standalone { game, .. } => game.is_actively_interacting(),
+            Self::Shell(shell) => shell.is_actively_interacting(),
+        }
+    }
+
+    fn resize(&mut self, size: [i32; 2]) -> bool {
+        match self {
+            Self::Standalone { game, .. } => game.resize(size),
+            Self::Shell(shell) => shell.resize(size),
+        }
+    }
+
+    fn render(&mut self) {
+        match self {
+            Self::Standalone { game, .. } => {
+                let _ = game.render();
+            }
+            Self::Shell(shell) => shell.render(),
+        }
+    }
+
+    fn canvas(&self) -> &sims_render::Canvas {
+        match self {
+            Self::Standalone { game, .. } => game.canvas(),
+            Self::Shell(shell) => shell.canvas(),
+        }
+    }
+
+    fn persist_options(&mut self) {
+        match self {
+            Self::Standalone {
+                game,
+                options_file,
+                saved_optn,
+                ..
+            } => {
+                let current = game.options().to_optn();
+                if current != *saved_optn {
+                    match game.save_options(options_file) {
+                        Ok(()) => *saved_optn = current,
+                        Err(e) => eprintln!("sims-game: {}: {e}", options_file.display()),
+                    }
+                }
+            }
+            Self::Shell(shell) => shell.persist_options(),
+        }
+    }
 }
 
 struct App {
-    game: Game,
+    session: Session,
+    last_screen: ScreenKind,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     surface_size: Option<(NonZeroU32, NonZeroU32)>,
     title_throttle: TitleThrottle,
+    redraw_pacer: RedrawPacer,
     scale: u32,
     cursor: Option<PhysicalPosition<f64>>,
     /// Most recent cursor position reported by winit (including outside the
@@ -332,6 +567,7 @@ struct App {
     /// release coordinates (`0x5f62ba..0x5f62de`).
     last_cursor: Option<PhysicalPosition<f64>>,
     drag: Option<PhysicalPosition<f64>>,
+    last_left_press: Option<(Instant, [i32; 2])>,
     wake_clock: WakeClock,
     dirty: bool,
     photos: usize,
@@ -346,13 +582,8 @@ struct App {
     /// (notably macOS `WindowEvent::Focused(false)` queued during
     /// `create_window` before `makeKeyAndOrderFront`).
     focus_filter: FocusFilter,
-    /// The REDB file of saves, and this house's name in it.
+    /// The REDB file of saves (used directly in Standalone mode).
     saves: PathBuf,
-    slot: String,
-    /// User Options preference file (`Optn` 128 IFF) persisted beside `--saves`,
-    /// plus the last serialized `Optn` body to avoid redundant writes.
-    options_file: PathBuf,
-    saved_optn: Vec<u8>,
     /// Modifier keys tracked from `WindowEvent::ModifiersChanged` for Buy Mode
     /// shortcuts (`Ctrl/Cmd+Z` Undo, `Ctrl+Y`/`Ctrl/Cmd+Shift+Z` Redo).
     ctrl_or_cmd_held: bool,
@@ -360,11 +591,7 @@ struct App {
 }
 
 /// Filters startup `WindowEvent::Focused` notifications so ordinary window
-/// launch sends no kind 25 (matching `0x4eee14` + `0x4f7610`). Winit 0.30 on
-/// macOS queues a synthetic `Focused(false)` when creating the window delegate
-/// before `makeKeyAndOrderFront` emits `Focused(true)`; dropping pre-activation
-/// events until the window first becomes active prevents a spurious
-/// off/on pair that would pause ambience and arm the 2-second nudge countdown.
+/// launch sends no kind 25 (matching `0x4eee14` + `0x4f7610`).
 #[derive(Default)]
 struct FocusFilter {
     activated: bool,
@@ -463,14 +690,50 @@ fn options_path(saves: &std::path::Path) -> PathBuf {
 }
 
 impl App {
-    fn persist_options(&mut self) {
-        let current = self.game.options().to_optn();
-        if current != self.saved_optn {
-            match self.game.save_options(&self.options_file) {
-                Ok(()) => self.saved_optn = current,
-                Err(e) => eprintln!("sims-game: {}: {e}", self.options_file.display()),
+    fn refresh_monitor_rate(&mut self) {
+        let rate = self
+            .window
+            .as_ref()
+            .and_then(|w| w.current_monitor())
+            .and_then(|m| m.refresh_rate_millihertz());
+        self.redraw_pacer.set_refresh_millihertz(rate);
+    }
+
+    fn continuous_interaction(&self) -> bool {
+        self.drag.is_some() || self.session.is_actively_interacting()
+    }
+
+    fn maybe_request_redraw(&mut self, now: Instant) {
+        let continuous = self.continuous_interaction();
+        if self
+            .redraw_pacer
+            .should_request_redraw(now, self.dirty, continuous)
+            && let Some(w) = &self.window
+        {
+            w.request_redraw();
+        }
+    }
+
+    fn drain_shell_audio(&mut self) {
+        let screen_now = self.session.screen_kind();
+        if screen_now != self.last_screen {
+            self.last_screen = screen_now;
+            self.sound_feed.reset_for_lot();
+            self.drag = None;
+            self.printed = 0;
+            self.reported = false;
+            self.wake_clock.reset(Instant::now());
+            self.redraw_pacer.request_immediate();
+        }
+        if let Session::Shell(shell) = &mut self.session {
+            for input in shell.take_audio_inputs() {
+                self.sound.send(input);
             }
         }
+    }
+
+    fn persist_options(&mut self) {
+        self.session.persist_options();
     }
 
     fn slider_release_point(&mut self) -> Option<[i32; 2]> {
@@ -487,23 +750,27 @@ impl App {
             .as_ref()
             .and_then(|w| unclamped_canvas_point(self.last_cursor?, w.inner_size(), self.scale))
     }
+
     fn sync_size(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         if let Some(canvas) = canvas_size(size, self.scale) {
-            self.game.resize(canvas);
+            self.session.resize(canvas);
         }
         if self
             .cursor
             .is_some_and(|c| canvas_point(c, size, self.scale).is_none())
         {
             self.cursor = None;
-            let _ = self.game.leave();
+            let _ = match &mut self.session {
+                Session::Standalone { game, .. } => game.leave(),
+                Session::Shell(shell) => shell.leave(),
+            };
         }
     }
 
     fn live_point(&mut self) -> Option<[i32; 2]> {
         let size = self.window.as_ref()?.inner_size();
         if let Some(canvas) = canvas_size(size, self.scale) {
-            self.game.resize(canvas);
+            self.session.resize(canvas);
         }
         let cursor = self.cursor?;
         let point = canvas_point(cursor, size, self.scale);
@@ -516,39 +783,41 @@ impl App {
     /// Moves the pointer where the game asks, as the original moves it
     /// to the middle of a pie menu.
     fn move_pointer(&mut self) {
-        let Some([x, y]) = self.game.take_pointer() else {
+        let Some([x, y]) = self.session.game_mut().and_then(Game::take_pointer) else {
             return;
         };
-        // The middle of that canvas pixel, so it reads back as the same.
         let scale = f64::from(self.scale.max(1));
         let position =
             PhysicalPosition::new((f64::from(x) + 0.5) * scale, (f64::from(y) + 0.5) * scale);
-        if let Some(w) = &self.window {
-            // Not every platform lets a program move the pointer; the
-            // menu still works where it is.
-            if w.set_cursor_position(position).is_ok() {
-                self.cursor = Some(position);
-            }
+        if let Some(w) = &self.window
+            && w.set_cursor_position(position).is_ok()
+        {
+            self.cursor = Some(position);
         }
         if let Some(point) = self.live_point() {
-            let redraw = self.game.hover(point);
-            self.changed(redraw);
+            let redraw = match &mut self.session {
+                Session::Standalone { game, .. } => game.hover(point),
+                Session::Shell(shell) => shell.hover(point),
+            };
+            self.changed(redraw, true);
         }
     }
 
-    fn changed(&mut self, redraw: bool) {
+    fn changed(&mut self, redraw: bool, interactive: bool) {
+        let now = Instant::now();
+        if interactive {
+            self.redraw_pacer.note_interaction(now);
+        }
         if redraw {
             self.dirty = true;
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
         }
+        self.maybe_request_redraw(now);
     }
 
     fn photo(&mut self) {
         let path = PathBuf::from(format!("sims-game-{}.png", self.photos));
         self.photos += 1;
-        match std::fs::write(&path, png::encode(self.game.canvas())) {
+        match std::fs::write(&path, png::encode(self.session.canvas())) {
             Ok(()) => eprintln!("saved {}", path.display()),
             Err(e) => eprintln!("could not save {}: {e}", path.display()),
         }
@@ -557,54 +826,92 @@ impl App {
     /// Saves the lot (F5) or goes back to its save (F9). Returns `true` when
     /// the operation succeeded (`0x4f26cf`, checked by `0x4f29cc` before quit).
     fn save(&mut self, restore: bool) -> bool {
-        let store = match sims_sim::Snapshots::open(&self.saves) {
-            Ok(store) => store,
-            Err(e) => {
-                eprintln!("sims-game: {}: {e}", self.saves.display());
-                let msg = if restore {
-                    format!("The save was not restored: {e}")
-                } else {
-                    format!("The lot was not saved: {e}")
+        let ok = match &mut self.session {
+            Session::Standalone { game, slot, .. } => {
+                let store = match sims_sim::Snapshots::open(&self.saves) {
+                    Ok(store) => store,
+                    Err(e) => {
+                        eprintln!("sims-game: {}: {e}", self.saves.display());
+                        let msg = if restore {
+                            format!("The save was not restored: {e}")
+                        } else {
+                            format!("The lot was not saved: {e}")
+                        };
+                        game.set_note(msg);
+                        self.changed(true, true);
+                        return false;
+                    }
                 };
-                self.game.set_note(msg);
-                self.changed(true);
-                return false;
+                if !restore {
+                    game.save_to(&store, slot)
+                } else if game.restore_from(&store, slot) {
+                    self.printed = 0;
+                    self.reported = false;
+                    self.wake_clock.reset(Instant::now());
+                    true
+                } else {
+                    false
+                }
+            }
+            Session::Shell(shell) => {
+                if !restore {
+                    shell.save_current_lot().is_ok()
+                } else if shell.restore_current_lot().is_ok() {
+                    self.printed = 0;
+                    self.reported = false;
+                    self.wake_clock.reset(Instant::now());
+                    true
+                } else {
+                    false
+                }
             }
         };
-        let ok = if !restore {
-            self.game.save_to(&store, &self.slot)
-        } else if self.game.restore_from(&store, &self.slot) {
-            // The errors and the stop are the restored lot's.
-            self.printed = 0;
-            self.reported = false;
-            self.wake_clock.reset(Instant::now());
-            true
-        } else {
-            false
-        };
-        self.changed(true);
+        self.drain_shell_audio();
+        self.changed(true, true);
         ok
     }
 
-    fn handle_outcome(&mut self, event_loop: &ActiveEventLoop, outcome: sims_game::game::Outcome) {
+    fn handle_standalone_outcome(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        outcome: sims_game::game::Outcome,
+    ) {
         self.persist_options();
-        self.changed(outcome.redraw);
+        self.changed(outcome.redraw, true);
         self.move_pointer();
         if outcome.photo {
             self.photo();
         }
         let saved_ok = if outcome.save { self.save(false) } else { true };
-        if outcome.save && !saved_ok {
-            self.game.after_save_failed();
-            self.changed(true);
+        if outcome.save
+            && !saved_ok
+            && let Some(game) = self.session.game_mut()
+        {
+            game.after_save_failed();
+            self.changed(true, true);
         }
-        // `0x4f29cc..0x4f29d1`: Save & Quit exits only if saving succeeded.
         if outcome.quit && saved_ok {
             event_loop.exit();
         }
     }
 
+    fn handle_shell_outcome(&mut self, event_loop: &ActiveEventLoop, outcome: ShellOutcome) {
+        self.drain_shell_audio();
+        self.changed(outcome.redraw, true);
+        self.move_pointer();
+        if outcome.photo {
+            self.photo();
+        }
+        if outcome.quit {
+            self.persist_options();
+            event_loop.exit();
+        }
+    }
+
     fn key(&mut self, key: &Key) {
+        let Some(game) = self.session.game_mut() else {
+            return;
+        };
         let step = 64;
         let command = match key {
             Key::Named(NamedKey::ArrowLeft) => Move::Scroll([step, 0]),
@@ -614,23 +921,23 @@ impl App {
             Key::Named(NamedKey::PageUp) => Move::LevelUp,
             Key::Named(NamedKey::PageDown) => Move::LevelDown,
             Key::Named(NamedKey::Space) => {
-                self.game.toggle_pause();
-                self.changed(true);
+                game.toggle_pause();
+                self.changed(true, true);
                 return;
             }
             Key::Named(NamedKey::F1) => {
-                self.game.set_mode(sims_ui::command::Mode::Live);
-                self.changed(true);
+                game.set_mode(sims_ui::command::Mode::Live);
+                self.changed(true, true);
                 return;
             }
             Key::Named(NamedKey::F2) => {
-                self.game.set_mode(sims_ui::command::Mode::Buy);
-                self.changed(true);
+                game.set_mode(sims_ui::command::Mode::Buy);
+                self.changed(true, true);
                 return;
             }
             Key::Named(NamedKey::F3) => {
-                self.game.set_mode(sims_ui::command::Mode::Build);
-                self.changed(true);
+                game.set_mode(sims_ui::command::Mode::Build);
+                self.changed(true, true);
                 return;
             }
             Key::Named(NamedKey::F5) => {
@@ -642,8 +949,8 @@ impl App {
                 return;
             }
             Key::Named(NamedKey::Delete | NamedKey::Backspace) => {
-                if self.game.sell_held() {
-                    self.changed(true);
+                if game.sell_held() {
+                    self.changed(true, true);
                 }
                 return;
             }
@@ -651,14 +958,14 @@ impl App {
                 if self.ctrl_or_cmd_held {
                     match c.as_str() {
                         "z" | "Z" if !self.shift_held => {
-                            if self.game.undo_buy() {
-                                self.changed(true);
+                            if game.undo_buy() {
+                                self.changed(true, true);
                             }
                             return;
                         }
                         "z" | "Z" | "y" | "Y" => {
-                            if self.game.redo_buy() {
-                                self.changed(true);
+                            if game.redo_buy() {
+                                self.changed(true, true);
                             }
                             return;
                         }
@@ -671,28 +978,28 @@ impl App {
                     "[" => Move::Rotate(false),
                     "]" => Move::Rotate(true),
                     "," | "<" => {
-                        if self.game.rotate_held(false) {
-                            self.changed(true);
+                        if game.rotate_held(false) {
+                            self.changed(true, true);
                             return;
                         }
                         Move::Rotate(false)
                     }
                     "." | ">" => {
-                        if self.game.rotate_held(true) {
-                            self.changed(true);
+                        if game.rotate_held(true) {
+                            self.changed(true, true);
                             return;
                         }
                         Move::Rotate(true)
                     }
                     "x" | "X" => {
-                        if self.game.page_buy(1) {
-                            self.changed(true);
+                        if game.page_buy(1) {
+                            self.changed(true, true);
                         }
                         return;
                     }
                     "z" | "Z" => {
-                        if self.game.page_buy(-1) {
-                            self.changed(true);
+                        if game.page_buy(-1) {
+                            self.changed(true, true);
                         }
                         return;
                     }
@@ -704,43 +1011,49 @@ impl App {
             }
             _ => return,
         };
-        let redraw = self.game.apply(command);
-        self.changed(redraw);
+        let redraw = game.apply(command);
+        self.changed(redraw, true);
     }
 
-    /// Steps the lot for the time since the last call.
+    /// Steps the active lot (or neighborhood animation timer) for the time
+    /// since the last call.
     fn tick(&mut self) {
         let now = Instant::now();
         let (clock_us, step_us) = self.wake_clock.elapsed_us(now);
-        let waited = self.game.asking().is_some();
-        let (ran, capped) = self.game.advance_while(clock_us, step_us, |ran| {
+        self.drain_shell_audio();
+        let Some(game) = self.session.game_mut() else {
+            self.wake_clock.finish(now, Instant::now(), false);
+            let redraw = match &mut self.session {
+                Session::Shell(shell) => shell.tick_shell(clock_us),
+                Session::Standalone { .. } => false,
+            };
+            self.changed(redraw, false);
+            return;
+        };
+
+        let waited = game.asking().is_some();
+        let (ran, capped) = game.advance_while(clock_us, step_us, |ran| {
             within_step_budget(ran, now.elapsed(), SIM_BUDGET)
         });
         self.wake_clock.finish(now, Instant::now(), capped);
-        // A dialog shown at the first tick due is drawn though none ran.
-        let mut redraw = ran > 0 || (!waited && self.game.asking().is_some());
-        // The plumb bob spins, the Live-mode pause button blinks, and edge
-        // scrolling pans independently (`0x4d4af8..0x4d4b06` must not be
-        // short-circuited by animation redraw flags, and active right-drag
-        // panning bypasses edge scrolling at `0x4d46bd..0x4d4704`).
-        let scrolled = self.drag.is_none() && self.game.edge_scroll(clock_us);
-        redraw |= scrolled || self.game.spin_due() || self.game.blink_due();
-        self.sound_feed
-            .update(&mut self.game, |input| self.sound.send(input));
-        for error in &self.game.errors()[self.printed..] {
+        let mut redraw = ran > 0 || (!waited && game.asking().is_some());
+        let scrolled = self.drag.is_none() && game.edge_scroll(clock_us);
+        redraw |= scrolled || game.spin_due() || game.blink_due();
+        self.sound_feed.update(game, |input| self.sound.send(input));
+        for error in &game.errors()[self.printed..] {
             eprintln!("sims-game: error caught: {error}");
         }
-        self.printed = self.game.errors().len();
+        self.printed = game.errors().len();
         if !self.reported
-            && let Some(stop) = self.game.stopped()
+            && let Some(stop) = game.stopped()
         {
             eprintln!("sims-game: {stop}");
             self.reported = true;
-            // The failed step may have changed the lot, and the banner
-            // shows now.
             redraw = true;
         }
-        self.changed(redraw);
+        // Edge-scrolling counts as active user interaction (display-refresh cadence),
+        // while pure simulation ticks / plumb-bob spin / pause blink are passive (60 FPS cap).
+        self.changed(redraw, scrolled);
     }
 
     fn redraw(&mut self) {
@@ -755,26 +1068,52 @@ impl App {
         let Some(canvas_size) = canvas_size(size, scale) else {
             return;
         };
-        if self.game.resize(canvas_size) {
+        if self.session.resize(canvas_size) {
             self.dirty = true;
         }
         if self.dirty {
-            self.game.render();
+            self.session.render();
             self.dirty = false;
-            let state = if self.game.stopped().is_some() {
-                TitleState::Stopped
-            } else if self.game.paused() {
-                TitleState::Paused
-            } else {
-                TitleState::Running
-            };
-            if let Some(title) = self.title_throttle.update(
-                self.game.lot().ticks(),
-                state,
-                Instant::now(),
-                TITLE_INTERVAL,
-            ) {
-                window.set_title(title);
+            let now = Instant::now();
+            match &self.session {
+                Session::Standalone { game, .. } => {
+                    let state = if game.stopped().is_some() {
+                        TitleState::Stopped
+                    } else if game.paused() {
+                        TitleState::Paused
+                    } else {
+                        TitleState::Running
+                    };
+                    if let Some(title) =
+                        self.title_throttle
+                            .update(game.lot().ticks(), state, now, TITLE_INTERVAL)
+                    {
+                        window.set_title(title);
+                    }
+                }
+                Session::Shell(shell) => {
+                    if let Some(game) = shell.game() {
+                        let state = if game.stopped().is_some() {
+                            TitleState::Stopped
+                        } else if game.paused() {
+                            TitleState::Paused
+                        } else {
+                            TitleState::Running
+                        };
+                        if let Some(title) = self.title_throttle.update(
+                            game.lot().ticks(),
+                            state,
+                            now,
+                            TITLE_INTERVAL,
+                        ) {
+                            window.set_title(title);
+                        }
+                    } else if let Some(title) =
+                        self.title_throttle.update_custom(shell.window_title(), now)
+                    {
+                        window.set_title(title);
+                    }
+                }
             }
         }
         let Some(surface) = &mut self.surface else {
@@ -790,10 +1129,11 @@ impl App {
             self.surface_size = None;
             return;
         };
-        let canvas = self.game.canvas();
+        let canvas = self.session.canvas();
         let (bw, bh) = (size.width as usize, size.height as usize);
         blit_canvas(canvas, &mut buffer, bw, bh, scale as usize);
         let _ = buffer.present();
+        self.redraw_pacer.on_present(Instant::now());
     }
 }
 
@@ -935,14 +1275,23 @@ impl ApplicationHandler for App {
         }
         self.scale = window.scale_factor().round().max(1.0) as u32;
         self.window = Some(window.clone());
+        self.refresh_monitor_rate();
+        self.drain_shell_audio();
         self.wake_clock.reset(Instant::now());
         self.dirty = true;
-        window.request_redraw();
+        self.redraw_pacer.request_immediate();
+        self.maybe_request_redraw(Instant::now());
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.tick();
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + WAKE));
+        let now = Instant::now();
+        let wake_deadline = now + WAKE;
+        let next_deadline = self
+            .redraw_pacer
+            .next_redraw_deadline(now, self.dirty, self.continuous_interaction())
+            .map_or(wake_deadline, |d| d.min(wake_deadline));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(next_deadline));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -952,82 +1301,152 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Focused(focused) => {
-                if let Some(focused) = self.focus_filter.filter(focused)
-                    && self
-                        .sound_feed
-                        .set_focused(focused, &mut self.game, |input| self.sound.send(input))
-                {
-                    // Drop any wall-clock time spent paused or stalled while
-                    // unfocused so the first tick after resume does not catch up.
-                    self.wake_clock.reset(Instant::now());
-                    self.changed(true);
+                if focused {
+                    self.refresh_monitor_rate();
+                }
+                if let Some(focused) = self.focus_filter.filter(focused) {
+                    if let Some(game) = self.session.game_mut() {
+                        if self
+                            .sound_feed
+                            .set_focused(focused, game, |input| self.sound.send(input))
+                        {
+                            self.wake_clock.reset(Instant::now());
+                            self.changed(true, true);
+                        }
+                    } else {
+                        self.sound_feed
+                            .set_shell_focused(focused, |input| self.sound.send(input));
+                    }
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::Moved(_) => {
+                self.refresh_monitor_rate();
+            }
             WindowEvent::Resized(size) => {
+                self.refresh_monitor_rate();
                 self.sync_size(size);
-                self.changed(true);
+                self.redraw_pacer.request_immediate();
+                self.changed(true, true);
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor.round().max(1.0) as u32;
                 self.surface_size = None;
+                self.refresh_monitor_rate();
                 if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
                     self.sync_size(size);
                 }
-                self.changed(true);
+                self.redraw_pacer.request_immediate();
+                self.changed(true, true);
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
                 self.shift_held = state.shift_key();
                 self.ctrl_or_cmd_held = state.control_key() || state.super_key();
-                self.game.set_shift(self.shift_held);
-                self.game.set_ctrl(state.control_key());
+                if let Some(game) = self.session.game_mut() {
+                    game.set_shift(self.shift_held);
+                    game.set_ctrl(state.control_key());
+                }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if self.game.has_dialog() {
-                    // Any active modal dialog blocks global shortcuts (Escape,
-                    // F5, F9, Space, camera, Buy Undo/Redo). Text-entry dialogs
-                    // route typing/editing/Tab/Enter/Escape into `cTSWinTextEdit2`,
-                    // while confirmation dialogs handle Enter, Escape, and
-                    // localized Yes/No keys (`0x5e5b3b..0x5e5bfd`, `0x6d7530`).
-                    if self.game.has_dialog_entry() {
-                        let changed = match &event.logical_key {
-                            Key::Named(NamedKey::Backspace) => self.game.dialog_backspace(),
-                            Key::Named(NamedKey::Delete) => self.game.dialog_delete(),
-                            Key::Named(NamedKey::ArrowLeft) => self.game.dialog_move_left(),
-                            Key::Named(NamedKey::ArrowRight) => self.game.dialog_move_right(),
-                            Key::Named(NamedKey::ArrowUp) => self.game.dialog_move_up(),
-                            Key::Named(NamedKey::ArrowDown) => self.game.dialog_move_down(),
-                            Key::Named(NamedKey::Home) => self.game.dialog_home(),
-                            Key::Named(NamedKey::End) => self.game.dialog_end(),
-                            Key::Named(NamedKey::Tab) => self.game.dialog_switch_field(),
-                            Key::Named(NamedKey::Enter) if self.game.dialog_enter_is_newline() => {
-                                // `0x5f28b6..0x5f28f9`: Return inserts a newline
-                                // in the multiline Save Card Lot Description field.
-                                self.game.type_dialog_char('\n')
+                if self.session.has_dialog() {
+                    let has_entry = self.session.game().is_some_and(Game::has_dialog_entry);
+                    if has_entry {
+                        let mut changed = false;
+                        let mut standalone_out = None;
+                        let mut shell_out = None;
+                        match &event.logical_key {
+                            Key::Named(NamedKey::Backspace) => {
+                                changed =
+                                    self.session.game_mut().is_some_and(Game::dialog_backspace);
                             }
-                            Key::Named(NamedKey::Enter) if !event.repeat => {
-                                let outcome = self.game.dialog_submit();
-                                self.handle_outcome(event_loop, outcome);
-                                false
+                            Key::Named(NamedKey::Delete) => {
+                                changed = self.session.game_mut().is_some_and(Game::dialog_delete);
                             }
-                            Key::Named(NamedKey::Escape) if !event.repeat => {
-                                let outcome = self.game.dialog_confirm_key(DialogKey::Escape);
-                                self.handle_outcome(event_loop, outcome);
-                                false
+                            Key::Named(NamedKey::ArrowLeft) => {
+                                changed =
+                                    self.session.game_mut().is_some_and(Game::dialog_move_left);
                             }
-                            Key::Named(NamedKey::Space) => self.game.type_dialog_char(' '),
-                            _ => {
-                                let mut typed = false;
-                                if let Some(text) = &event.text {
-                                    for ch in text.chars() {
-                                        typed |= self.game.type_dialog_char(ch);
+                            Key::Named(NamedKey::ArrowRight) => {
+                                changed =
+                                    self.session.game_mut().is_some_and(Game::dialog_move_right);
+                            }
+                            Key::Named(NamedKey::ArrowUp) => {
+                                changed = self.session.game_mut().is_some_and(Game::dialog_move_up);
+                            }
+                            Key::Named(NamedKey::ArrowDown) => {
+                                changed =
+                                    self.session.game_mut().is_some_and(Game::dialog_move_down);
+                            }
+                            Key::Named(NamedKey::Home) => {
+                                changed = self.session.game_mut().is_some_and(Game::dialog_home);
+                            }
+                            Key::Named(NamedKey::End) => {
+                                changed = self.session.game_mut().is_some_and(Game::dialog_end);
+                            }
+                            Key::Named(NamedKey::Tab) => {
+                                changed = self
+                                    .session
+                                    .game_mut()
+                                    .is_some_and(Game::dialog_switch_field);
+                            }
+                            Key::Named(NamedKey::Enter)
+                                if self
+                                    .session
+                                    .game()
+                                    .is_some_and(Game::dialog_enter_is_newline) =>
+                            {
+                                changed = self
+                                    .session
+                                    .game_mut()
+                                    .is_some_and(|g| g.type_dialog_char('\n'));
+                            }
+                            Key::Named(NamedKey::Enter) if !event.repeat => match &mut self.session
+                            {
+                                Session::Standalone { game, .. } => {
+                                    standalone_out = Some(game.dialog_submit());
+                                }
+                                Session::Shell(shell) => {
+                                    if let Some(game) = shell.game_mut() {
+                                        let o = game.dialog_submit();
+                                        shell_out = Some(shell.handle_lot_outcome(o));
                                     }
                                 }
-                                typed
+                            },
+                            Key::Named(NamedKey::Escape) if !event.repeat => {
+                                match &mut self.session {
+                                    Session::Standalone { game, .. } => {
+                                        standalone_out =
+                                            Some(game.dialog_confirm_key(DialogKey::Escape));
+                                    }
+                                    Session::Shell(shell) => {
+                                        shell_out = Some(shell.key_dialog(DialogKey::Escape));
+                                    }
+                                }
                             }
-                        };
-                        self.changed(changed);
+                            Key::Named(NamedKey::Space) => {
+                                changed = self
+                                    .session
+                                    .game_mut()
+                                    .is_some_and(|g| g.type_dialog_char(' '));
+                            }
+                            _ => {
+                                if let Some(text) = &event.text
+                                    && let Some(game) = self.session.game_mut()
+                                {
+                                    for ch in text.chars() {
+                                        changed |= game.type_dialog_char(ch);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(out) = standalone_out {
+                            self.handle_standalone_outcome(event_loop, out);
+                        } else if let Some(out) = shell_out {
+                            self.handle_shell_outcome(event_loop, out);
+                        } else {
+                            self.changed(changed, true);
+                        }
                     } else if !event.repeat {
                         let dialog_key = match &event.logical_key {
                             Key::Named(NamedKey::Enter) => Some(DialogKey::Enter),
@@ -1040,28 +1459,58 @@ impl ApplicationHandler for App {
                                 .map(DialogKey::Char),
                         };
                         if let Some(key) = dialog_key {
-                            let outcome = self.game.dialog_confirm_key(key);
-                            self.handle_outcome(event_loop, outcome);
+                            match &mut self.session {
+                                Session::Standalone { game, .. } => {
+                                    let out = game.dialog_confirm_key(key);
+                                    self.handle_standalone_outcome(event_loop, out);
+                                }
+                                Session::Shell(shell) => {
+                                    let out = shell.key_dialog(key);
+                                    self.handle_shell_outcome(event_loop, out);
+                                }
+                            }
                         }
                     }
                 } else if event.logical_key == Key::Named(NamedKey::Escape) {
-                    // Escape closes the pie menu, cancels Buy placement, or
-                    // closes the active Options tab (`0x517904..0x517954`,
-                    // consuming Escape while in Options mode); else quits. A
-                    // repeat does none of these, and a refused Buy snapback
-                    // keeps the cursor open so the user sees the error instead
-                    // of exiting.
                     if !event.repeat {
-                        let closed = self.game.close_menu();
-                        let cancelled = !closed && self.game.cancel_buy();
-                        let escaped_options = !closed && !cancelled && self.game.escape_options();
-                        if !escaped_options
-                            && escape_exits(closed, cancelled, self.game.buy_cursor().is_some())
-                        {
-                            self.persist_options();
-                            event_loop.exit();
-                        } else {
-                            self.changed(true);
+                        match &mut self.session {
+                            Session::Standalone { game, .. } => {
+                                let closed = game.close_menu();
+                                let cancelled = !closed && game.cancel_buy();
+                                let escaped_options =
+                                    !closed && !cancelled && game.escape_options();
+                                if !escaped_options
+                                    && escape_exits(closed, cancelled, game.buy_cursor().is_some())
+                                {
+                                    self.persist_options();
+                                    event_loop.exit();
+                                } else {
+                                    self.changed(true, true);
+                                }
+                            }
+                            Session::Shell(shell) => {
+                                if let Some(game) = shell.game_mut() {
+                                    let closed = game.close_menu();
+                                    let cancelled = !closed && game.cancel_buy();
+                                    let escaped_options =
+                                        !closed && !cancelled && game.escape_options();
+                                    if !escaped_options
+                                        && escape_exits(
+                                            closed,
+                                            cancelled,
+                                            game.buy_cursor().is_some(),
+                                        )
+                                    {
+                                        self.persist_options();
+                                        event_loop.exit();
+                                    } else {
+                                        self.changed(true, true);
+                                    }
+                                } else {
+                                    let out = shell.escape();
+                                    self.handle_shell_outcome(event_loop, out);
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1069,66 +1518,104 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.game.has_dialog() {
+                if self.session.has_dialog() {
                     return;
                 }
                 let y = match delta {
                     MouseScrollDelta::LineDelta(_, y) => f64::from(y),
                     MouseScrollDelta::PixelDelta(p) => p.y,
                 };
-                let command = if y > 0.0 {
-                    Move::ZoomIn
-                } else if y < 0.0 {
-                    Move::ZoomOut
-                } else {
-                    return;
-                };
-                let redraw = self.game.apply(command);
-                self.changed(redraw);
+                if let Some(game) = self.session.game_mut() {
+                    let command = if y > 0.0 {
+                        Move::ZoomIn
+                    } else if y < 0.0 {
+                        Move::ZoomOut
+                    } else {
+                        return;
+                    };
+                    let redraw = game.apply(command);
+                    self.changed(redraw, true);
+                } else if let Session::Shell(shell) = &mut self.session {
+                    let redraw = shell.wheel(y);
+                    self.changed(redraw, true);
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Left, ElementState::Pressed) => {
                     if let Some(point) = self.live_point() {
-                        let outcome = self.game.press(point);
-                        self.handle_outcome(event_loop, outcome);
+                        let now = Instant::now();
+                        let is_double = self.last_left_press.is_some_and(|(prev_t, prev_p)| {
+                            let dx = point[0] - prev_p[0];
+                            let dy = point[1] - prev_p[1];
+                            now.saturating_duration_since(prev_t) <= DOUBLE_CLICK_WINDOW
+                                && dx * dx + dy * dy <= DOUBLE_CLICK_DISTANCE_SQ
+                        });
+                        self.last_left_press = if is_double { None } else { Some((now, point)) };
+                        match &mut self.session {
+                            Session::Standalone { game, .. } => {
+                                let out = game.press(point);
+                                self.handle_standalone_outcome(event_loop, out);
+                            }
+                            Session::Shell(shell) => {
+                                let out = if is_double && shell.screen() == ScreenKind::FamilyBin {
+                                    shell.double_click(point)
+                                } else {
+                                    shell.press(point)
+                                };
+                                self.handle_shell_outcome(event_loop, out);
+                            }
+                        }
                     }
                 }
                 (MouseButton::Left, ElementState::Released) => {
-                    let outcome = if self.game.dragging_slider() {
-                        // `0x5f62ba..0x5f62de`: captured slider release evaluates
-                        // the live pointer x-coordinate (including outside the
-                        // window on macOS) before releasing capture.
-                        if let Some(point) = self.slider_release_point() {
-                            self.game.release(point)
-                        } else {
-                            self.game.release_outside()
-                        }
-                    } else if let Some(point) = self.live_point() {
-                        self.game.release(point)
+                    let dragging_slider = self.session.game().is_some_and(Game::dragging_slider);
+                    let point = if dragging_slider {
+                        self.slider_release_point()
                     } else {
-                        self.game.release_outside()
+                        self.live_point()
                     };
-                    self.handle_outcome(event_loop, outcome);
+                    match &mut self.session {
+                        Session::Standalone { game, .. } => {
+                            let out = match point {
+                                Some(pt) => game.release(pt),
+                                None => game.release_outside(),
+                            };
+                            self.handle_standalone_outcome(event_loop, out);
+                        }
+                        Session::Shell(shell) => {
+                            let out = match point {
+                                Some(pt) => shell.release(pt),
+                                None => shell.release_outside(),
+                            };
+                            self.handle_shell_outcome(event_loop, out);
+                        }
+                    }
                 }
                 (MouseButton::Right, ElementState::Pressed) => {
-                    if !self.game.has_dialog() {
+                    if self.session.game().is_some() && !self.session.has_dialog() {
                         self.drag = self.live_point().and(self.cursor);
                     }
                 }
                 (MouseButton::Right, ElementState::Released) => {
                     self.drag = None;
-                    let redraw = match self.live_point() {
-                        Some(point) => self.game.hover(point),
-                        None => self.game.leave(),
+                    let pt = self.live_point();
+                    let redraw = match (&mut self.session, pt) {
+                        (Session::Standalone { game, .. }, Some(p)) => game.hover(p),
+                        (Session::Standalone { game, .. }, None) => game.leave(),
+                        (Session::Shell(shell), Some(p)) => shell.hover(p),
+                        (Session::Shell(shell), None) => shell.leave(),
                     };
-                    self.changed(redraw);
+                    self.changed(redraw, true);
                 }
                 _ => {}
             },
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = None;
-                let redraw = self.game.leave();
-                self.changed(redraw);
+                let redraw = match &mut self.session {
+                    Session::Standalone { game, .. } => game.leave(),
+                    Session::Shell(shell) => shell.leave(),
+                };
+                self.changed(redraw, true);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_cursor = Some(position);
@@ -1138,7 +1625,7 @@ impl ApplicationHandler for App {
                     .map(|w| {
                         let size = w.inner_size();
                         if let Some(canvas) = canvas_size(size, self.scale) {
-                            self.game.resize(canvas);
+                            self.session.resize(canvas);
                         }
                         (
                             canvas_point(position, size, self.scale),
@@ -1148,26 +1635,36 @@ impl ApplicationHandler for App {
                     .unwrap_or((None, None));
                 if let Some(point) = point {
                     self.cursor = Some(position);
-                    let redraw = self.drag.is_none() && self.game.hover(point);
-                    self.changed(redraw);
+                    let redraw = self.drag.is_none()
+                        && match &mut self.session {
+                            Session::Standalone { game, .. } => game.hover(point),
+                            Session::Shell(shell) => shell.hover(point),
+                        };
+                    self.changed(redraw, true);
                 } else {
                     self.cursor = None;
-                    let mut redraw = self.drag.is_none() && self.game.leave();
+                    let mut redraw = self.drag.is_none()
+                        && match &mut self.session {
+                            Session::Standalone { game, .. } => game.leave(),
+                            Session::Shell(shell) => shell.leave(),
+                        };
                     if self.drag.is_none()
-                        && self.game.dragging_slider()
-                        && let Some([x, _]) = unclamped
+                        && let Some(game) = self.session.game_mut()
                     {
-                        redraw |= self.game.drag_slider(x);
+                        if game.dragging_slider()
+                            && let Some([x, _]) = unclamped
+                        {
+                            redraw |= game.drag_slider(x);
+                        }
+                        if game.dragging_dialog_entry()
+                            && let Some(pt) = unclamped
+                        {
+                            redraw |= game.drag_dialog_entry(pt);
+                        }
                     }
-                    if self.drag.is_none()
-                        && self.game.dragging_dialog_entry()
-                        && let Some(pt) = unclamped
-                    {
-                        redraw |= self.game.drag_dialog_entry(pt);
-                    }
-                    self.changed(redraw);
+                    self.changed(redraw, true);
                 }
-                if self.game.has_dialog() {
+                if self.session.has_dialog() || self.session.game().is_none() {
                     self.drag = None;
                 }
                 if let Some(start) = self.drag {
@@ -1179,8 +1676,11 @@ impl ApplicationHandler for App {
                             start.x + f64::from(dx) * scale,
                             start.y + f64::from(dy) * scale,
                         ));
-                        let redraw = self.game.apply(Move::Scroll([dx, dy]));
-                        self.changed(redraw);
+                        let redraw = self
+                            .session
+                            .game_mut()
+                            .is_some_and(|g| g.apply(Move::Scroll([dx, dy])));
+                        self.changed(redraw, true);
                     }
                 }
             }
@@ -1197,73 +1697,135 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let (options, still, mute, saves) = options()?;
-    eprintln!("sims-game: booting {}", options.house.display());
-    let started = Instant::now();
-    let mut game = Game::open(&options)?;
-    eprintln!(
-        "sims-game: booted in {:.1} s",
-        started.elapsed().as_secs_f32()
-    );
-    for problem in game.problems() {
-        eprintln!("sims-game: {problem}");
-    }
-    if let Some(still) = still {
+    let config = options()?;
+    if let Some(house) = config.house {
+        let game_options = Options {
+            install: config.install.clone(),
+            house: house.clone(),
+            answers: config.answers,
+            play: config.play,
+            frames: sims_game::Frames::default(),
+        };
+        eprintln!("sims-game: booting {}", game_options.house.display());
         let started = Instant::now();
-        let ran = game.run(still.ticks);
+        let mut game = Game::open(&game_options)?;
         eprintln!(
-            "sims-game: ran {ran} ticks in {:.1} s",
+            "sims-game: booted in {:.1} s",
             started.elapsed().as_secs_f32()
         );
-        for error in game.errors() {
-            eprintln!("sims-game: error caught: {error}");
+        for problem in game.problems() {
+            eprintln!("sims-game: {problem}");
         }
-        let sounds = game.take_sounds();
-        if !sounds.is_empty() {
-            eprintln!("sims-game: {} sound requests, not played", sounds.len());
+        if let Some(still) = config.still {
+            let started = Instant::now();
+            let ran = game.run(still.ticks);
+            eprintln!(
+                "sims-game: ran {ran} ticks in {:.1} s",
+                started.elapsed().as_secs_f32()
+            );
+            for error in game.errors() {
+                eprintln!("sims-game: error caught: {error}");
+            }
+            let sounds = game.take_sounds();
+            if !sounds.is_empty() {
+                eprintln!("sims-game: {} sound requests, not played", sounds.len());
+            }
+            if let Some(stop) = game.stopped() {
+                eprintln!("sims-game: {stop}");
+            }
+            game.resize(still.size);
+            let started = Instant::now();
+            game.render();
+            eprintln!(
+                "sims-game: drew the frame in {} ms",
+                started.elapsed().as_millis()
+            );
+            return std::fs::write(&still.file, png::encode(game.canvas()))
+                .map_err(|e| format!("{}: {e}", still.file.display()));
         }
-        if let Some(stop) = game.stopped() {
-            eprintln!("sims-game: {stop}");
+        let options_file = options_path(&config.saves);
+        if options_file.is_file()
+            && let Err(e) = game.load_options(&options_file)
+        {
+            eprintln!("sims-game: {}: {e}", options_file.display());
         }
-        game.resize(still.size);
-        let started = Instant::now();
-        game.render();
-        eprintln!(
-            "sims-game: drew the frame in {} ms",
-            started.elapsed().as_millis()
-        );
-        return std::fs::write(&still.file, png::encode(game.canvas()))
-            .map_err(|e| format!("{}: {e}", still.file.display()));
+        let saved_optn = game.options().to_optn();
+        let sound = Sound::start(&config.install, config.mute);
+        let mut app = App {
+            session: Session::Standalone {
+                game: Box::new(game),
+                slot: slot(&house),
+                options_file,
+                saved_optn,
+            },
+            last_screen: ScreenKind::Lot,
+            window: None,
+            surface: None,
+            surface_size: None,
+            title_throttle: TitleThrottle::default(),
+            redraw_pacer: RedrawPacer::new(None),
+            scale: 1,
+            cursor: None,
+            last_cursor: None,
+            drag: None,
+            last_left_press: None,
+            wake_clock: WakeClock::new(Instant::now()),
+            dirty: true,
+            photos: 0,
+            reported: false,
+            printed: 0,
+            sound,
+            sound_feed: sound::Feed::default(),
+            focus_filter: FocusFilter::default(),
+            saves: config.saves,
+            ctrl_or_cmd_held: false,
+            shift_held: false,
+        };
+        let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
+        return event_loop.run_app(&mut app).map_err(|e| e.to_string());
     }
-    let options_file = options_path(&saves);
-    if options_file.is_file()
-        && let Err(e) = game.load_options(&options_file)
-    {
-        eprintln!("sims-game: {}: {e}", options_file.display());
-    }
-    let saved_optn = game.options().to_optn();
+
+    eprintln!(
+        "sims-game: opening Neighborhood shell ({})",
+        config.install.display()
+    );
+    let started = Instant::now();
+    let shell = NeighborhoodShell::open(
+        config.install.clone(),
+        config.saves.clone(),
+        1,
+        config.play,
+        config.answers,
+        sims_game::Frames::default(),
+    )?;
+    eprintln!(
+        "sims-game: opened Neighborhood {} in {:.1} s",
+        shell.neighborhood_slot(),
+        started.elapsed().as_secs_f32()
+    );
+    let sound = Sound::start(&config.install, config.mute);
     let mut app = App {
-        game,
+        session: Session::Shell(Box::new(shell)),
+        last_screen: ScreenKind::Neighborhood,
         window: None,
         surface: None,
         surface_size: None,
         title_throttle: TitleThrottle::default(),
+        redraw_pacer: RedrawPacer::new(None),
         scale: 1,
         cursor: None,
         last_cursor: None,
         drag: None,
+        last_left_press: None,
         wake_clock: WakeClock::new(Instant::now()),
         dirty: true,
         photos: 0,
         reported: false,
         printed: 0,
-        sound: Sound::start(&options.install, mute),
+        sound,
         sound_feed: sound::Feed::default(),
         focus_filter: FocusFilter::default(),
-        saves,
-        slot: slot(&options.house),
-        options_file,
-        saved_optn,
+        saves: config.saves,
         ctrl_or_cmd_held: false,
         shift_held: false,
     };
@@ -1288,6 +1850,7 @@ fn escape_exits(closed_menu: bool, cancelled_buy: bool, has_buy_cursor: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use winit::dpi::PhysicalSize;
 
     #[test]
@@ -1342,15 +1905,12 @@ mod tests {
 
     #[test]
     fn focus_filter_drops_macos_startup_false_then_forwards_transitions() {
-        // Winit 0.30 on macOS queues synthetic Focused(false) during window
-        // creation before makeKeyAndOrderFront emits Focused(true).
         let mut filter = FocusFilter::default();
         assert_eq!(filter.filter(false), None);
         assert_eq!(filter.filter(true), None);
         assert_eq!(filter.filter(false), Some(false));
         assert_eq!(filter.filter(true), Some(true));
 
-        // Platforms starting directly with Focused(true) also send no startup kind 25.
         let mut direct = FocusFilter::default();
         assert_eq!(direct.filter(true), None);
         assert_eq!(direct.filter(false), Some(false));
@@ -1420,10 +1980,8 @@ mod tests {
     #[test]
     fn within_step_budget_allows_first_tick_and_stops_at_cap() {
         let budget = Duration::from_millis(8);
-        // First owed tick always runs even if elapsed already exceeds budget.
         assert!(within_step_budget(0, Duration::ZERO, budget));
         assert!(within_step_budget(0, Duration::from_millis(20), budget));
-        // Subsequent ticks continue strictly below budget and stop at/above budget.
         assert!(within_step_budget(1, Duration::from_millis(7), budget));
         assert!(within_step_budget(3, Duration::from_micros(7_999), budget));
         assert!(!within_step_budget(1, Duration::from_millis(8), budget));
@@ -1435,20 +1993,16 @@ mod tests {
         let t0 = Instant::now();
         let mut clock = WakeClock::new(t0);
 
-        // Uncapped wake: both presentation and scheduler anchor to wake_start.
         let w1_start = t0 + Duration::from_millis(16);
         let w1_end = w1_start + Duration::from_millis(2);
         assert_eq!(clock.elapsed_us(w1_start), (16_000, 16_000));
         clock.finish(w1_start, w1_end, false);
 
-        // Capped wake: takes 9 ms; next wake arrives 5 ms after it ends.
         let w2_start = w1_start + Duration::from_millis(16);
         let w2_end = w2_start + Duration::from_millis(9);
         assert_eq!(clock.elapsed_us(w2_start), (16_000, 16_000));
         clock.finish(w2_start, w2_end, true);
 
-        // Presentation clock must advance by the full 9 + 5 = 14 ms while
-        // scheduler pacing advances only by the 5 ms since w2_end.
         let w3_start = w2_end + Duration::from_millis(5);
         assert_eq!(clock.elapsed_us(w3_start), (14_000, 5_000));
     }
@@ -1459,12 +2013,10 @@ mod tests {
         let interval = Duration::from_millis(250);
         let t0 = Instant::now();
 
-        // First call always emits.
         assert_eq!(
             throttle.update(0, TitleState::Running, t0, interval),
             Some("sims-game: tick 0")
         );
-        // Running tick updates within interval are suppressed.
         assert_eq!(
             throttle.update(
                 5,
@@ -1483,7 +2035,6 @@ mod tests {
             ),
             None
         );
-        // Once interval elapses, emits latest tick.
         assert_eq!(
             throttle.update(
                 10,
@@ -1493,8 +2044,6 @@ mod tests {
             ),
             Some("sims-game: tick 10")
         );
-        // Same tick after another interval emits nothing, and does not push back
-        // the next tick change.
         assert_eq!(
             throttle.update(
                 10,
@@ -1513,8 +2062,6 @@ mod tests {
             ),
             Some("sims-game: tick 11")
         );
-        // State transitions (Paused, Running, Stopped) flush immediately even
-        // 1 ms after the previous update.
         assert_eq!(
             throttle.update(
                 11,
@@ -1551,7 +2098,6 @@ mod tests {
             ),
             Some("sims-game: tick 12, stopped")
         );
-        // Redundant stopped redraws emit nothing.
         assert_eq!(
             throttle.update(
                 12,
@@ -1561,5 +2107,134 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn refresh_interval_handles_60hz_120hz_fallback_and_out_of_range() {
+        assert_eq!(
+            refresh_interval_from_millihertz(None),
+            Duration::from_nanos(16_666_666)
+        );
+        assert_eq!(
+            refresh_interval_from_millihertz(Some(60_000)),
+            Duration::from_nanos(16_666_666)
+        );
+        assert_eq!(
+            refresh_interval_from_millihertz(Some(120_000)),
+            Duration::from_nanos(8_333_333)
+        );
+        // Zero / bogus OS values fall back safely to 60 Hz.
+        assert_eq!(
+            refresh_interval_from_millihertz(Some(0)),
+            Duration::from_nanos(16_666_666)
+        );
+        assert_eq!(
+            refresh_interval_from_millihertz(Some(5_000_000)),
+            Duration::from_nanos(16_666_666)
+        );
+    }
+
+    #[test]
+    fn redraw_pacer_caps_passive_to_60fps_and_unlocks_display_refresh_on_input() {
+        let t0 = Instant::now();
+        // 120 Hz ProMotion monitor.
+        let mut pacer = RedrawPacer::new(Some(120_000));
+        assert_eq!(pacer.display_interval(), Duration::from_nanos(8_333_333));
+
+        // First dirty frame always presents immediately.
+        assert!(pacer.should_request_redraw(t0, true, false));
+        // Duplicate request while redraw is already in flight is suppressed.
+        assert!(!pacer.should_request_redraw(t0 + Duration::from_millis(1), true, false));
+        pacer.on_present(t0);
+
+        // Passive sim-only tick at +9 ms is suppressed (60 FPS passive cap = 16.67 ms).
+        let t_9ms = t0 + Duration::from_millis(9);
+        assert!(!pacer.should_request_redraw(t_9ms, true, false));
+        assert_eq!(
+            pacer.next_redraw_deadline(t_9ms, true, false),
+            Some(t0 + PASSIVE_FPS_INTERVAL)
+        );
+        // Passive sim-only tick at +17 ms is allowed.
+        let t_17ms = t0 + Duration::from_millis(17);
+        assert!(pacer.should_request_redraw(t_17ms, true, false));
+        pacer.on_present(t_17ms);
+
+        // User interaction switches immediately to 120 Hz (8.33 ms interval).
+        let t_interact = t_17ms + Duration::from_millis(9);
+        pacer.note_interaction(t_interact);
+        assert!(pacer.should_request_redraw(t_interact, true, false));
+        pacer.on_present(t_interact);
+
+        // Still inside 250 ms hold: 5 ms is throttled, 9 ms is allowed.
+        assert!(!pacer.should_request_redraw(t_interact + Duration::from_millis(5), true, false));
+        let t_next = t_interact + Duration::from_millis(9);
+        assert!(pacer.should_request_redraw(t_next, true, false));
+        pacer.on_present(t_next);
+
+        // After 250 ms hold expires without continuous interaction, returns to 60 FPS cap.
+        let t_quiet = t_interact + INTERACTIVE_HOLD + Duration::from_millis(1);
+        pacer.on_present(t_quiet);
+        assert!(!pacer.should_request_redraw(t_quiet + Duration::from_millis(10), true, false));
+        // Continuous interaction (e.g. Buy/Build cursor or drag) keeps 120 Hz active.
+        assert!(pacer.should_request_redraw(t_quiet + Duration::from_millis(10), true, true));
+    }
+
+    #[test]
+    fn redraw_pacer_respects_low_refresh_display_and_monitor_changes() {
+        let t0 = Instant::now();
+        // 30 Hz display: even passive mode never exceeds 30 Hz (33.3 ms).
+        let mut pacer = RedrawPacer::new(Some(30_000));
+        assert!(pacer.should_request_redraw(t0, true, false));
+        pacer.on_present(t0);
+        assert!(!pacer.should_request_redraw(t0 + Duration::from_millis(20), true, false));
+        assert!(pacer.should_request_redraw(t0 + Duration::from_millis(34), true, false));
+        pacer.on_present(t0 + Duration::from_millis(34));
+
+        // Moving window to a 120 Hz monitor updates display_interval cleanly.
+        pacer.set_refresh_millihertz(Some(120_000));
+        assert_eq!(pacer.display_interval(), Duration::from_nanos(8_333_333));
+        pacer.request_immediate();
+        assert!(pacer.should_request_redraw(t0 + Duration::from_millis(35), true, false));
+    }
+
+    #[test]
+    fn cli_defaults_to_neighborhood_while_keeping_house_and_png_backwards_compatible() {
+        let env = Some(PathBuf::from("/sims"));
+
+        // Default with no house arg -> Neighborhood shell.
+        let cfg = parse_launch_args(Vec::<OsString>::new(), env.clone()).unwrap();
+        assert_eq!(cfg.install, PathBuf::from("/sims"));
+        assert!(cfg.house.is_none());
+        assert!(cfg.still.is_none());
+
+        // Explicit --neighborhood -> Neighborhood shell.
+        let cfg = parse_launch_args([OsString::from("--neighborhood")], env.clone()).unwrap();
+        assert!(cfg.house.is_none());
+
+        // Explicit <install> <house> -> direct house launch.
+        let cfg = parse_launch_args(
+            [
+                OsString::from("/sims"),
+                OsString::from("/sims/UserData/Houses/House05.iff"),
+                OsString::from("--play"),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.house,
+            Some(PathBuf::from("/sims/UserData/Houses/House05.iff"))
+        );
+        assert!(cfg.play);
+
+        // --png without house -> defaults to Goth house with answers = [3].
+        let cfg = parse_launch_args(
+            [OsString::from("--png"), OsString::from("out.png")],
+            env.clone(),
+        )
+        .unwrap();
+        assert_eq!(cfg.house, Some(goth_house(std::path::Path::new("/sims"))));
+        assert_eq!(cfg.answers, vec![3]);
+        assert!(cfg.still.is_some());
     }
 }

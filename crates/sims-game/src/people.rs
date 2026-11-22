@@ -192,6 +192,19 @@ impl People {
         })
     }
 
+    /// Reads the people's files from the install at `root`, and the cast
+    /// of `neighborhood_dir` (`UserData`, `UserData2`..`UserData8`), without
+    /// requiring a house file on disk.
+    pub fn open_neighborhood(root: &Path, neighborhood_dir: &Path) -> Result<Self, String> {
+        let assets = sims_people::Assets::scan(root)?;
+        let library = sims_people::Library::scan(&assets)?;
+        let cast = sims_people::Cast::open(root, neighborhood_dir)?;
+        Ok(Self {
+            people: sims_people::People::new(assets, library, cast),
+            problems: Vec::new(),
+        })
+    }
+
     /// Follows `world`: loads the people who appeared or changed clothes
     /// and forgets those who left.
     pub fn refresh(&mut self, world: &World) {
