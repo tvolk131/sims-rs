@@ -1,5 +1,6 @@
 use crate::file_table::{Table, key};
 use crate::install::resolve;
+use crate::pool::{ArchivePool, worker_count};
 use crate::{Error, Install, Mount, Result};
 use sims_formats::far;
 use std::collections::BTreeMap;
@@ -123,6 +124,62 @@ impl Resource {
         }
         Ok(bytes)
     }
+
+    /// Reads the resource using `pool` to reuse open FAR archive file handles.
+    pub fn read_with(&self, pool: &ArchivePool) -> Result<Vec<u8>> {
+        if self.inline.is_some() {
+            return self.read();
+        }
+        match &self.member {
+            Some(member) => pool.read_member(&self.path, member),
+            None => self.read(),
+        }
+    }
+
+    /// Reads at most `max_len` leading bytes of the resource using `pool`,
+    /// still performing full size and bounds checks for archive members.
+    pub fn read_head_with(&self, pool: &ArchivePool, max_len: usize) -> Result<Vec<u8>> {
+        if let Some(bytes) = &self.inline {
+            if bytes.len() as u64 > far::MAX_MEMBER {
+                return Err(Error::io(
+                    &self.path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{} exceeds the 128 MiB resource limit", self.name()),
+                    ),
+                ));
+            }
+            let take = bytes.len().min(max_len);
+            return Ok(bytes[..take].to_vec());
+        }
+        match &self.member {
+            Some(member) => pool.read_member_head(&self.path, member, max_len),
+            None => {
+                let io = |e| Error::io(&self.path, e);
+                let invalid = |message: String| {
+                    Error::io(
+                        &self.path,
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+                    )
+                };
+                let file = File::open(&self.path).map_err(io)?;
+                let len = file.metadata().map_err(io)?.len();
+                if len > far::MAX_MEMBER {
+                    return Err(invalid(format!(
+                        "{} exceeds the 128 MiB resource limit",
+                        self.name()
+                    )));
+                }
+                let to_read = len.min(max_len as u64);
+                let mut bytes = Vec::with_capacity(to_read as usize);
+                file.take(to_read).read_to_end(&mut bytes).map_err(io)?;
+                if bytes.len() as u64 != to_read {
+                    return Err(invalid(format!("{} ends early", self.name())));
+                }
+                Ok(bytes)
+            }
+        }
+    }
 }
 
 /// Every file and archive member under an install's mounts, in load order.
@@ -153,20 +210,74 @@ impl Index {
     /// an archive's members are entries of the directory the archive is in.
     /// A mount that does not exist contributes nothing.
     pub fn build(install: &Install) -> Result<Self> {
+        let mounts = install.mounts();
+        type MountScan = Result<Option<(Vec<Resource>, Vec<String>)>>;
+        let scan_one = |(number, mount): (usize, &Mount)| -> MountScan {
+            let Some(path) = resolve(&install.root, &mount.path)? else {
+                return Ok(None);
+            };
+            if !path.is_dir() {
+                return Ok(None);
+            }
+            Self::scan_mount(number, &path, mount.recursive).map(Some)
+        };
+        let indexed_mounts: Vec<(usize, &Mount)> = mounts.iter().enumerate().collect();
+        let workers = worker_count(indexed_mounts.len());
+        let per_mount: Vec<MountScan> = if workers <= 1 {
+            indexed_mounts.into_iter().map(scan_one).collect()
+        } else {
+            let chunk_size = indexed_mounts.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = indexed_mounts
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || chunk.iter().copied().map(scan_one).collect::<Vec<_>>())
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(indexed_mounts.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("index mount worker panicked"));
+                }
+                out
+            })
+        };
         let mut index = Self {
             root: install.root.clone(),
-            mounts: install.mounts(),
+            mounts,
             resources: Vec::new(),
             diagnostics: Vec::new(),
         };
-        for (number, mount) in index.mounts.clone().iter().enumerate() {
-            if let Some(path) = resolve(&install.root, &mount.path)?
-                && path.is_dir()
-            {
-                index.walk(number, &path, mount.recursive)?;
+        for batch in per_mount {
+            if let Some((resources, diagnostics)) = batch? {
+                index.resources.extend(resources);
+                index.diagnostics.extend(diagnostics);
             }
         }
         Ok(index)
+    }
+
+    fn scan_mount(
+        mount: usize,
+        directory: &Path,
+        recursive: bool,
+    ) -> Result<(Vec<Resource>, Vec<String>)> {
+        let mut files = MountedFiles::default();
+        files.scan(&[], directory, recursive, sorted_entries)?;
+        let mut resources = Vec::new();
+        Self::list(&mut resources, mount, &files.directories, &[]);
+        Ok((resources, files.diagnostics))
+    }
+
+    /// Maps each lowercased resource [`Resource::file_name`] to the first
+    /// matching index in [`Index::resources`], matching `index.named(name).next()`
+    /// for unqualified file names in O(log N).
+    pub fn first_by_file_name(&self) -> BTreeMap<String, usize> {
+        let mut map = BTreeMap::new();
+        for (i, resource) in self.resources.iter().enumerate() {
+            map.entry(resource.file_name().to_ascii_lowercase())
+                .or_insert(i);
+        }
+        map
     }
 
     /// Adds a neighborhood's `Characters` directory as a mount named

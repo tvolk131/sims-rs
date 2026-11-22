@@ -19,6 +19,7 @@
 //! copies (see the gated tests). Appearance catalogs are loaded in the
 //! original's own order instead (see sims-people's `load_appearance`).
 
+use crate::pool::worker_count;
 use crate::{Member, Resource};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -65,16 +66,13 @@ impl Assets {
     /// Lists the person files under `root` ([`SOURCES`]). A source that is
     /// missing adds nothing; an archive that cannot be read is an error.
     pub fn scan(root: &Path) -> Result<Self, String> {
-        let mut assets = Self {
-            root: root.to_path_buf(),
-            ..Self::default()
-        };
-        for (mount, source) in SOURCES.iter().enumerate() {
+        let scan_one = |(mount, source): (usize, &str)| -> Result<Vec<Resource>, String> {
             let Some(directory) = resolve(root, source) else {
-                continue;
+                return Ok(Vec::new());
             };
             let mut paths = Vec::new();
             list(&directory, &mut paths)?;
+            let mut found = Vec::new();
             for path in paths {
                 let name = path
                     .file_name()
@@ -82,7 +80,7 @@ impl Assets {
                     .unwrap_or_default();
                 if name.ends_with(".far") {
                     for member in far_members(&path)? {
-                        assets.add(Resource {
+                        found.push(Resource {
                             mount,
                             path: path.clone(),
                             member: Some(member),
@@ -90,13 +88,43 @@ impl Assets {
                         });
                     }
                 } else {
-                    assets.add(Resource {
+                    found.push(Resource {
                         mount,
                         path,
                         member: None,
                         inline: None,
                     });
                 }
+            }
+            Ok(found)
+        };
+        let indexed: Vec<(usize, &str)> = SOURCES.iter().copied().enumerate().collect();
+        let workers = worker_count(indexed.len());
+        let per_source: Vec<Result<Vec<Resource>, String>> = if workers <= 1 {
+            indexed.into_iter().map(scan_one).collect()
+        } else {
+            let chunk_size = indexed.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = indexed
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || chunk.iter().copied().map(scan_one).collect::<Vec<_>>())
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(indexed.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("assets scan worker panicked"));
+                }
+                out
+            })
+        };
+        let mut assets = Self {
+            root: root.to_path_buf(),
+            ..Self::default()
+        };
+        for batch in per_source {
+            for resource in batch? {
+                assets.add(resource);
             }
         }
         Ok(assets)

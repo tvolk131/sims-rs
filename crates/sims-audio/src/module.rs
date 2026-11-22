@@ -73,19 +73,45 @@ impl Module {
             let stem = &key[..key.len() - extension.len() - 1];
             parts.entry(stem.to_owned()).or_default()[slot] = Some(entry);
         }
-        parts
-            .into_iter()
-            .map(|(name, [hit, hsm, hot])| {
-                let module_error = |message: String| Error::Module {
-                    name: name.clone(),
-                    message,
-                };
-                let missing = |what: &str| module_error(format!("no {what} file"));
-                let hit = hit.ok_or_else(|| missing("HIT"))?.read()?;
-                let hsm = hsm.ok_or_else(|| missing("HSM"))?.read()?;
-                let hot = hot.ok_or_else(|| missing("HOT"))?.read()?;
-                Self::parse(&name, &hit, &hsm, &hot).map_err(|e| module_error(e.to_string()))
+        let list: Vec<(String, [Option<&Entry>; 3])> = parts.into_iter().collect();
+        let load_one = |(name, [hit, hsm, hot]): &(String, [Option<&Entry>; 3])| -> Result<Self> {
+            let module_error = |message: String| Error::Module {
+                name: name.clone(),
+                message,
+            };
+            let missing = |what: &str| module_error(format!("no {what} file"));
+            let hit = hit.ok_or_else(|| missing("HIT"))?.read()?;
+            let hsm = hsm.ok_or_else(|| missing("HSM"))?.read()?;
+            let hot = hot.ok_or_else(|| missing("HOT"))?.read()?;
+            Self::parse(name, &hit, &hsm, &hot).map_err(|e| module_error(e.to_string()))
+        };
+        let workers = if list.len() <= 1 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+                .clamp(1, 8)
+                .min(list.len())
+        };
+        let loaded: Vec<Result<Self>> = if workers <= 1 {
+            list.iter().map(load_one).collect()
+        } else {
+            let chunk_size = list.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = list
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || chunk.iter().map(load_one).collect::<Vec<_>>())
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(list.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("sound module worker panicked"));
+                }
+                out
             })
-            .collect()
+        };
+        loaded.into_iter().collect()
     }
 }

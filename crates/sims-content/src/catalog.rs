@@ -1,3 +1,4 @@
+use crate::pool::{ArchivePool, worker_count};
 use crate::{Error, Index, Result};
 use sims_formats::{behavior::ObjectDefinition, execution::global_link, iff::Iff};
 use std::collections::BTreeMap;
@@ -35,8 +36,67 @@ pub struct Catalog {
     pub diagnostics: Vec<String>,
 }
 
+/// Per-resource extracted registration data computed independently on worker
+/// threads before deterministic sequential registration.
+enum ScannedResource {
+    Error(String),
+    Parsed {
+        location: String,
+        definitions: Vec<std::result::Result<(u16, ObjectDefinition), (u16, sims_formats::Error)>>,
+        glob: Option<std::result::Result<Option<String>, (u16, sims_formats::Error)>>,
+    },
+}
+
+fn scan_iff_resource(index: &Index, number: usize, pool: &ArchivePool) -> (usize, ScannedResource) {
+    let resource = &index.resources[number];
+    let location = resource.location(&index.root);
+    let iff = match resource
+        .read_with(pool)
+        .and_then(|bytes| Iff::parse(bytes).map_err(|e| Error::format(&location, e)))
+    {
+        Ok(iff) => iff,
+        Err(error) => return (number, ScannedResource::Error(error.to_string())),
+    };
+    let chunks = match iff.resource_order(b"OBJD") {
+        Ok(chunks) => chunks,
+        Err(error) => {
+            return (
+                number,
+                ScannedResource::Error(format!("{location}: {error}")),
+            );
+        }
+    };
+    let definitions = chunks
+        .into_iter()
+        .map(|chunk| {
+            ObjectDefinition::parse(iff.data(chunk))
+                .map(|def| (chunk.id, def))
+                .map_err(|e| (chunk.id, e))
+        })
+        .collect();
+    let glob = iff
+        .all(b"GLOB")
+        .next()
+        .map(|link| global_link(iff.data(link)).map_err(|e| (link.id, e)));
+    (
+        number,
+        ScannedResource::Parsed {
+            location,
+            definitions,
+            glob,
+        },
+    )
+}
+
 impl Catalog {
     pub fn build(index: &Index) -> Result<Self> {
+        Self::build_with_pool(index, &ArchivePool::new())
+    }
+
+    /// Builds the catalog using a shared [`ArchivePool`] for archive reads and
+    /// parallelizing IFF reads/parses across worker threads while registering
+    /// every definition and diagnostic in exact [`Index::resources`] order.
+    pub fn build_with_pool(index: &Index, pool: &ArchivePool) -> Result<Self> {
         let global = index
             .resources
             .iter()
@@ -45,6 +105,45 @@ impl Catalog {
                 root: index.root.clone(),
                 path: "GameData/Global/Global.iff".into(),
             })?;
+        let iff_indices: Vec<usize> = index
+            .resources
+            .iter()
+            .enumerate()
+            .filter_map(|(number, resource)| {
+                let name = resource.name();
+                let bytes = name.as_bytes();
+                (bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".iff"))
+                    .then_some(number)
+            })
+            .collect();
+        let workers = worker_count(iff_indices.len());
+        let scanned: Vec<(usize, ScannedResource)> = if workers <= 1 {
+            iff_indices
+                .iter()
+                .map(|&number| scan_iff_resource(index, number, pool))
+                .collect()
+        } else {
+            let chunk_size = iff_indices.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = iff_indices
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|&number| scan_iff_resource(index, number, pool))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(iff_indices.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("catalog worker panicked"));
+                }
+                out
+            })
+        };
+        let first_by_name = index.first_by_file_name();
         let mut catalog = Self {
             global,
             objects: Vec::new(),
@@ -52,22 +151,8 @@ impl Catalog {
             semi_globals: BTreeMap::new(),
             diagnostics: Vec::new(),
         };
-        for (number, resource) in index.resources.iter().enumerate() {
-            if !resource.name().to_ascii_lowercase().ends_with(".iff") {
-                continue;
-            }
-            let location = resource.location(&index.root);
-            let iff = match resource
-                .read()
-                .and_then(|bytes| Iff::parse(bytes).map_err(|e| Error::format(&location, e)))
-            {
-                Ok(iff) => iff,
-                Err(error) => {
-                    catalog.diagnostics.push(error.to_string());
-                    continue;
-                }
-            };
-            catalog.register(index, number, &location, &iff);
+        for (number, entry) in scanned {
+            catalog.register_scanned(index, &first_by_name, number, entry);
         }
         Ok(catalog)
     }
@@ -78,46 +163,55 @@ impl Catalog {
         self.by_guid.get(&guid).map(|&n| &self.objects[n])
     }
 
-    fn register(&mut self, index: &Index, resource: usize, location: &str, iff: &Iff) {
-        let definitions = match iff.resource_order(b"OBJD") {
-            Ok(definitions) => definitions,
-            Err(error) => {
-                self.diagnostics.push(format!("{location}: {error}"));
+    fn register_scanned(
+        &mut self,
+        index: &Index,
+        first_by_name: &BTreeMap<String, usize>,
+        resource: usize,
+        entry: ScannedResource,
+    ) {
+        let (location, definitions, glob) = match entry {
+            ScannedResource::Error(message) => {
+                self.diagnostics.push(message);
                 return;
             }
+            ScannedResource::Parsed {
+                location,
+                definitions,
+                glob,
+            } => (location, definitions, glob),
         };
-        for chunk in definitions {
-            match ObjectDefinition::parse(iff.data(chunk)) {
-                Ok(definition) => {
+        for item in definitions {
+            match item {
+                Ok((chunk_id, definition)) => {
                     let number = self.objects.len();
                     self.objects.push(Object {
                         guid: definition.guid,
                         resource,
-                        chunk: chunk.id,
+                        chunk: chunk_id,
                         kind: definition.object_type,
                         master: definition.master_id,
                     });
                     if let Some(previous) = self.by_guid.insert(definition.guid, number) {
                         let previous = &self.objects[previous];
                         self.diagnostics.push(format!(
-                            "GUID 0x{:08X} in {location} OBJD #{} replaces {} OBJD #{}",
+                            "GUID 0x{:08X} in {location} OBJD #{chunk_id} replaces {} OBJD #{}",
                             definition.guid,
-                            chunk.id,
                             index.resources[previous.resource].location(&index.root),
                             previous.chunk,
                         ));
                     }
                 }
-                Err(error) => self
+                Err((chunk_id, error)) => self
                     .diagnostics
-                    .push(format!("{location} OBJD #{}: {error}", chunk.id)),
+                    .push(format!("{location} OBJD #{chunk_id}: {error}")),
             }
         }
         // An object file links at most one semi-global file.
-        let Some(link) = iff.all(b"GLOB").next() else {
+        let Some(glob) = glob else {
             return;
         };
-        match global_link(iff.data(link)) {
+        match glob {
             Ok(None) => {
                 self.semi_globals.insert(resource, None);
             }
@@ -125,8 +219,13 @@ impl Catalog {
                 let file = format!("{name}.iff");
                 // The first file of that name in load order. Whether the
                 // original picks the first is unverified.
-                match index.named(&file).next() {
-                    Some((target, _)) => {
+                let found = if file.contains(['\\', '/']) {
+                    index.named(&file).next().map(|(target, _)| target)
+                } else {
+                    first_by_name.get(&file.to_ascii_lowercase()).copied()
+                };
+                match found {
+                    Some(target) => {
                         self.semi_globals.insert(resource, Some(target));
                     }
                     None => self
@@ -134,9 +233,9 @@ impl Catalog {
                         .push(format!("{location}: semi-global {file} not found")),
                 }
             }
-            Err(error) => self
+            Err((link_id, error)) => self
                 .diagnostics
-                .push(format!("{location} GLOB #{}: {error}", link.id)),
+                .push(format!("{location} GLOB #{link_id}: {error}")),
         }
     }
 }

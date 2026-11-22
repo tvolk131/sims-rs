@@ -48,7 +48,7 @@
 
 use crate::fault::Trap;
 use crate::interpreter::Interpreter;
-use crate::primitives::change_suit::{put_on, undress};
+use crate::primitives::change_suit::{put_on, undress_person};
 use sims_content::People;
 use sims_sim::World;
 use sims_sim::animator::{Advance, Animator, Layer};
@@ -159,16 +159,10 @@ fn timed_event(
                 )));
             }
             "dress" | "undress" => {
-                let accessories = &mut world
-                    .objects
-                    .get_mut(&id)
-                    .and_then(|o| o.person.as_mut())
-                    .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?
-                    .accessories;
                 if key == "dress" {
-                    put_on(people, accessories, value.clone())?;
+                    put_on(people, world, id, value.clone())?;
                 } else {
-                    undress(accessories, value);
+                    undress_person(world, id, value)?;
                 }
                 continue;
             }

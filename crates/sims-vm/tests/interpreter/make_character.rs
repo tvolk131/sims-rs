@@ -392,6 +392,10 @@ fn add_pet_templates(fx: &mut Fixture) {
     w.textures.insert("b001dog_lab_02.bmp".into());
     w.suits.insert("b001cat_tabby".into());
     w.textures.insert("b001cat_tabby_01.bmp".into());
+    for suit in ["b001dog_lab", "b001cat_tabby"] {
+        fx.program.people.suits.insert(suit.into());
+        fx.program.people.head_suits.insert(suit.into());
+    }
 }
 
 #[test]
@@ -427,7 +431,11 @@ fn pets_force_adult_age_set_pet_strings_and_use_declined_or_draw() {
         lot.next_u32();
         assert_eq!(fx.world.lot_rng, lot);
         assert_eq!(fx.world.dialogs.declined, -1);
-        assert_eq!(fx.world.portraits, [guid].into());
+        // 0x44b126 calls 0x4e8c5d(index, 0x1f, 1): bit 0x01 renders & saves
+        // BMP_ 2002 (`saved_portraits`), then bits 0x08/0x02/0x04/0x10 run
+        // forced dresses (`0x58d4e1 -> 0x4eb0cc -> 0x4e897e`) which clear the
+        // in-memory portrait slot when the pet's head slot is empty ("NONE").
+        assert!(fx.world.portraits.is_empty());
         assert_eq!(fx.world.saved_portraits, [guid].into());
         assert!(fx.world.dirty_portraits.is_empty());
         assert_eq!(fx.world.people, people_before);
@@ -444,7 +452,7 @@ fn pets_force_adult_age_set_pet_strings_and_use_declined_or_draw() {
         assert_eq!(fx.run(), Ok(true));
         assert_eq!(fx.world.lot_rng, lot_before);
         assert_eq!(fx.world.dialogs.declined, -1);
-        assert_eq!(fx.world.portraits, [guid].into());
+        assert!(fx.world.portraits.is_empty());
         assert_eq!(fx.world.saved_portraits, [guid].into());
     }
 }
@@ -713,7 +721,7 @@ fn pet_creation_runs_0x4e8c5d_portrait_build_even_when_template_has_bmp_2002() {
     assert_eq!(res, Ok(true));
     assert_eq!(count_pings(&sounds.borrow()), 2);
     let guid = expected_guid();
-    assert_eq!(fx.world.portraits, [guid].into());
+    assert!(fx.world.portraits.is_empty());
     assert_eq!(fx.world.saved_portraits, [guid].into());
 
     // 2. Blocked lot (size = 2, no free tile): 0x4e9706 removes unput and

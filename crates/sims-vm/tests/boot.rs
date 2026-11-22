@@ -94,7 +94,8 @@ const GOTH_VIEW_CENTRE: [i8; 2] = [32, 32];
 
 /// Steps `lot` once from every tile the portrait's search may start from
 /// (inside the lot's border) and from `view_centre = None`, each from the
-/// same save, and checks that all of them succeed and reach one state hash.
+/// same save, and checks that all of them succeed and reach one state hash
+/// (matching both the encoded world hash and the full `Saved` digest).
 /// The lot is left as it was, with its view centre.
 fn every_start_gives_one_state(lot: &mut Lot) {
     let saved = lot.save().unwrap();
@@ -106,13 +107,19 @@ fn every_start_gives_one_state(lot: &mut Lot) {
             lot.restore(saved.clone()).unwrap();
             lot.set_view_centre(Some([x, y]));
             lot.step().unwrap_or_else(|e| panic!("{x},{y}: {e}"));
-            *states.entry(lot.world().hash_hex()).or_insert(0) += 1;
+            let world_hash = lot.world().hash_hex();
+            lot.set_view_centre(centre);
+            let full_hash = digest(&lot.save().unwrap().encode());
+            *states.entry((world_hash, full_hash)).or_insert(0) += 1;
         }
     }
     lot.restore(saved.clone()).unwrap();
     lot.set_view_centre(None);
     lot.step().unwrap_or_else(|e| panic!("None: {e}"));
-    *states.entry(lot.world().hash_hex()).or_insert(0) += 1;
+    let world_hash = lot.world().hash_hex();
+    lot.set_view_centre(centre);
+    let full_hash = digest(&lot.save().unwrap().encode());
+    *states.entry((world_hash, full_hash)).or_insert(0) += 1;
     assert_eq!(states.len(), 1, "{states:?}");
     lot.restore(saved).unwrap();
     lot.set_view_centre(centre);
@@ -357,7 +364,7 @@ const UD1_DIALOGS: [(u8, Option<i16>); 6] = [
 /// UserData1's House 69 at entry (format 32), a regression pin of our
 /// run. It differs from track 2's recording only in object 2's last
 /// result; see `20261120-ud1-house-69-matches-the-recording.md`.
-const OLD_TOWN_69: &str = "e9484416b362e561a08b610f0907172b40cc1000d5580ee6bb5ecb33ec3205e4";
+const OLD_TOWN_69: &str = "172352ec8506772dc53c275a815a04bcda552163e24aa4b2b851c7a164d03429";
 /// The same state's hash under snapshot format 31, which had no dirty
 /// portrait types ([`sims_sim::World::dirty_portraits`]) at the end.
 const OLD_TOWN_69_31: &str = "cdf5e94eb507086c61bdd5e1d18d64327e5dbba897130a7de54ee87ef99c9945";
@@ -655,7 +662,7 @@ fn an_opened_neighborhood_matches_the_originals_import() {
     // Run 2's handoff, as fitted: the adult skeleton read and the
     // indicators made before the lot load.
     let handoff = Handoff {
-        skeletons_read: ["adult".to_owned()].into(),
+        skeletons_read: vec!["adult".to_owned()],
         indicators_made: true,
     };
     let lot =
@@ -1480,7 +1487,7 @@ const RECORDED_FRAMES: &str = "0,1,2,29,59,89,101,102,123+30";
 /// differs at entry in object 2's last result; see the decision
 /// `20261120-ud2-house-69-boots-from-the-originals-import.md` for what
 /// the comparison reads and skips.
-const IMPORTED_69: &str = "fffff4c0c0ef8ebe192ffdcaf3f22190bd072332efed7acfd1d2c919e1c5fc06";
+const IMPORTED_69: &str = "ffd020edb61f09e4953b7efb5f5019cb0553148dfd23e5112071c8f411fb8ff6";
 /// The same state's hash under snapshot format 31, which had no dirty
 /// portrait types ([`sims_sim::World::dirty_portraits`]) at the end.
 const IMPORTED_69_31: &str = "1bc128440944c2a9bfd8dc189aaa51249ee96b3eb0187dc721dcad28e4519447";
@@ -1499,7 +1506,7 @@ const IMPORTED_69_1000_31: &str =
 const IMPORTED_69_1000_30: &str =
     "8d0258ba3e1a8922a59f365ad4a4031d76a9365d97d20a264c1e039cd829a921";
 /// The same at tick 43200, a whole day from the load.
-const TICK_43200: &str = "48440355df84c6963b8e634c29c6a379e85e33d86a14d08a9aebb1d51bf85586";
+const TICK_43200: &str = "df6eb544be87b93233011f355999ac9abb0c36dc5e914f2f7c0fe2f49967b19a";
 /// The same state's hash under snapshot format 31.
 const TICK_43200_31: &str = "c3b7a6b9a8180d9e5e6463ba4e3638313cdec8d52bdaae28918bb05ce987e915";
 /// The same state's hash under snapshot format 30, which had no person
