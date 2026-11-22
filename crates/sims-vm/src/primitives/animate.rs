@@ -52,8 +52,7 @@
 //! alone) play their clips on their own, as `Machine::animate_carry` and
 //! `Machine::animate_base` describe.
 //!
-//! **Not ported**, failing loudly: names listed anywhere but the global
-//! animation tables and an object's own (byte 4 other than 3 and 0), a
+//! **Not ported**, failing loudly: clip source numbers outside 0..=3, a
 //! clip that is missing, and the timed events `clip_events.rs` does not
 //! port. The original also notes an unexpected
 //! event in its log when logging is on (0x6f2a44); that is not modeled.
@@ -70,9 +69,14 @@ use sims_sim::animator::{Animator, Base, LOADED, Layer};
 const POSTURE: usize = 0;
 const PICKUP_WORD: usize = 19;
 
-/// The global file's tables of clip names (0x59dd16): an adult's, and a
-/// child's (person word 58 at most 17). The original indexes its table of
-/// string tables from 0x6f7698 with 8 and 9, which hold these.
+/// The global file's tables of clip names loaded into `[0x6f7698]`
+/// (0x59d8a0..0x59d970):
+/// - source 1 (0x59defc, +0x2f4): `STR# 128` (0x80, "Animations")
+/// - source 2 (0x59deb4, +0x288): `STR# 130` (0x82, "PersonAnimations")
+/// - source 3 (0x59dd16, +0x360/+0x3cc): `STR# 156` (0x9c, "MiscAdult")
+///   and `STR# 157` (0x9d, "MiscChild", person word 58 at most 17).
+const GLOBAL_CLIPS: u16 = 128;
+const PERSON_CLIPS: u16 = 130;
 const ADULT_CLIPS: u16 = 156;
 const CHILD_CLIPS: u16 = 157;
 
@@ -304,13 +308,17 @@ impl Machine<'_, '_> {
     ///   a person (type 2), the icon person's age picks instead: 131 for
     ///   an adult with a child, 132 for a child with an adult.
     ///
+    /// - 1, the global animations table (0x59defc, `Global.iff` STR# 128).
+    /// - 2, the legacy global person animations table (0x59deb4, `Global.iff`
+    ///   STR# 130).
+    ///
     /// That every motion of the clip binds to a bone of the person's
     /// skeleton is **unverified**; a clip with motions is taken to bind at
     /// least one.
     ///
-    /// Fails for what is not ported: the other sources (1 and 2,
-    /// 0x59defc and 0x59deb4), and a name that is not listed (the original
-    /// reports a missing animation and plays its stand-in, 0x4f6e5b).
+    /// Fails for what is not ported: source numbers outside 0..=3, and a name
+    /// that is not listed (the original reports a missing animation and plays
+    /// its stand-in, 0x4f6e5b).
     /// Animate Sim on the carry slot (flag 0x10 alone, 0x589683). It never
     /// yields and always takes the true branch; the script's events are
     /// not followed.
@@ -456,6 +464,8 @@ impl Machine<'_, '_> {
         };
         let me_child = child(self.me)?;
         let (resource, table) = match source {
+            1 => (self.program.global, GLOBAL_CLIPS),
+            2 => (self.program.global, PERSON_CLIPS),
             3 => (
                 self.program.global,
                 if me_child { CHILD_CLIPS } else { ADULT_CLIPS },

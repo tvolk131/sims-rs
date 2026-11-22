@@ -125,9 +125,9 @@ impl Interpreter<'_> {
     /// For the Goth house this was compared with a capture of the original
     /// at the moment the clear returns; see `docs/decisions/`.
     ///
-    /// Not modeled: the interface is switched off for the duration, each
-    /// indicator's graphics are released, and the lot's pools of spare
-    /// indicators are emptied. None of that is simulation state we hold.
+    /// Not modeled: the interface is switched off for the duration and each
+    /// indicator's graphics are released. Pooled star markers (`STAR_MARKER`,
+    /// `0x44602d..0x446133`) are cleared right after `world.indicators`.
     pub fn clear(&self, world: &mut World) -> Result<Vec<u16>, Fault> {
         let mut removed = Vec::new();
         for slot in 0..world.indicators.len() {
@@ -138,6 +138,27 @@ impl Interpreter<'_> {
                 self.remove_now(world, id)?;
                 removed.push(id);
                 world.indicators[slot] = 0;
+            }
+        }
+        // 0x44602d..0x446133: after the two indicators, clear pooled star
+        // markers (in-use first, then available).
+        let mut stars_in_use = Vec::new();
+        let mut stars_avail = Vec::new();
+        for &id in world.order.iter().rev() {
+            if let Some(obj) = world.objects.get(&id)
+                && obj.guid == crate::placement::STAR_MARKER
+            {
+                if obj.data.get(2).copied().unwrap_or(0) != 0 {
+                    stars_in_use.push(id);
+                } else {
+                    stars_avail.push(id);
+                }
+            }
+        }
+        for id in stars_in_use.into_iter().chain(stars_avail) {
+            if world.objects.contains_key(&id) {
+                self.remove_now(world, id)?;
+                removed.push(id);
             }
         }
         while let Some(&id) = world.order.first() {
