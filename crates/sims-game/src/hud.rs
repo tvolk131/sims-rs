@@ -13,7 +13,7 @@ use sims_content::{ArchivePool, Catalog, Index, Install, Neighborhood};
 use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
-use sims_ui::balloon::Texts;
+use sims_ui::balloon::{self, Balloon, BalloonFadeState, Texts};
 use sims_ui::build::{
     self, BuildCatalog, BuildLayout, BuildState, BuildSubtoolAction, BuildSwatches,
     BuildWidgetKind, TerrainSubtool,
@@ -21,18 +21,21 @@ use sims_ui::build::{
 use sims_ui::buy::{
     self, BuyCatalog, BuyLayout, BuyState, BuyWidgetKind, RatingLabels, SellInfo, SellLabels,
 };
+use sims_ui::camera::{
+    self, CameraButton, CameraCommand, CameraLayout, CameraPanel, CameraState, CameraStrings,
+};
 use sims_ui::cheat_console::CheatConsole;
 use sims_ui::command::{
     BuildItemId, Command, Mode, OptionsAction, Panel as UiPanel, VolumeChannel, Walls as UiWalls,
 };
-use sims_ui::dialog::{self, DialogState, Labels, Message};
+use sims_ui::dialog::{self, DialogFadeState, DialogState, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::house;
 use sims_ui::household::{Acquaintances, Careers, Faces, Fame, Snapshot};
 use sims_ui::hud::{self, Controls, Item, Selected};
 use sims_ui::options::{self, OptionsTexts};
 use sims_ui::pie;
-use sims_ui::queue::Queue;
+use sims_ui::queue::{Queue, QueueSlideState};
 use sims_ui::thumbnail::{self, Thumbnails};
 use sims_vm::SoundEvent;
 use std::collections::BTreeSet;
@@ -114,9 +117,16 @@ pub enum OptionsDialog {
     ConfirmSaveBeforeResetTutorial,
     /// Genuine user-facing error or confirmation notice (`cTSWinMsgBox` + OK).
     Notice,
+    /// Inline reference book modal (`Dialog` kind 12 Spellbook or kind 15 Cookbook,
+    /// `0x4518e2`/`0x451946 -> 0x5107dc`), dismissed with OK / Enter / Escape.
+    SpecialBook,
 }
 
-/// Interactive button inside the bottom Camera sub-strip (toggled by the
+/// Duration in milliseconds for native modal dialog fade-in (`cTSWinFade`,
+/// `0x5e8c93..0x5e8e10`).
+pub const DIALOG_FADE_DURATION_MS: u32 = 200;
+
+/// Interactive button inside the bottom Camera subpanel (toggled by the
 /// cluster's Camera button, `Command::Camera(Photo)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraStripAction {
@@ -189,21 +199,26 @@ pub struct Hud {
     /// Last laid-out screen rect of the Options-strip "Co-op" button (present only
     /// while `Mode::Options` is expanded).
     coop_button_rect: Option<Rect>,
-    /// Whether the Camera sub-strip's Photo Album action (`CamViewAlbum`, `1105`)
+    /// Whether the Camera subpanel's Photo Album action (`CamViewAlbum`, `1105`)
     /// is enabled (true in `NeighborhoodShell` lots, false in standalone launches).
     album_button_enabled: bool,
-    /// Whether the Camera sub-strip is currently toggled open inside the bottom
-    /// panel strip area (`x >= hud::CLUSTER[0]`).
+    /// Whether the native Complete Collection Camera subpanel (`cWinCamera`)
+    /// is currently toggled open inside the bottom panel strip (`x >= hud::CLUSTER[0]`).
     camera_strip_open: bool,
-    /// Camera sub-strip button currently held down for mouse-up dispatch.
-    pressed_camera_action: Option<CameraStripAction>,
-    /// Last laid-out bounding rect of the Camera sub-strip when open.
+    /// Native `cWinCamera` interactive controller (`sims_ui::camera::CameraPanel`).
+    camera_panel: CameraPanel,
+    /// Snapshot size, JPEG quality, custom dimensions, album availability, and Quick Tips state.
+    camera_state: CameraState,
+    /// Localized coordinates, tooltips, and Quick Tips help balloons from `UIText.iff STR# 140`.
+    camera_strings: CameraStrings,
+    /// Last laid-out native `CameraLayout` while Camera Mode is open.
+    camera_layout: Option<CameraLayout>,
+    /// Whether the auxiliary Take Snapshot button beside `CamViewAlbum` is pressed.
+    pressed_camera_snapshot: bool,
+    /// Last laid-out bounding rect of the Camera subpanel strip when open.
     camera_strip_rect: Option<Rect>,
-    /// Last laid-out screen rect of the Camera sub-strip's "Take Snapshot" button.
+    /// Last laid-out screen rect of the Take Snapshot button (`CamSnap`), when wide enough to display.
     camera_snapshot_rect: Option<Rect>,
-    /// Last laid-out screen rect of the Camera sub-strip's "Photo Album" button
-    /// (populated only while the Camera sub-strip is open and Photo Album is enabled).
-    camera_album_rect: Option<Rect>,
     /// Whether the Roof camera toggle (`Camera::Roof`) is active.
     roof_view: bool,
     /// Classic Sims 1 top-left cheat console (`Ctrl+Shift+C` / `Cmd+Shift+C`).
@@ -216,6 +231,18 @@ pub struct Hud {
     queue: Queue,
     /// The actions whose icons were pressed while they show.
     pressed: Pressed,
+    /// 500 ms action-queue icon slide-in & slot-shift animator (`cWinActionQueueIcon`).
+    queue_slide: QueueSlideState,
+    /// Pending pie-menu screen click origin for newly queued icons `(person, click_pos, clock_us)`.
+    pending_queue_origin: Option<(Option<u16>, [i32; 2], u64)>,
+    /// 250 ms fade-in / fade-out animator for Live help balloons (`cWinHelpBalloon`).
+    balloon_fade: BalloonFadeState,
+    /// Most recently laid-out help balloon retained during 250 ms fade-out.
+    last_balloon: Option<Balloon>,
+    /// Opacity fade-in state for native modal dialogs (`cTSWinFade`).
+    dialog_fade: DialogFadeState,
+    /// Last presentation clock timestamp in microseconds (`0` for static/headless frames).
+    last_clock_us: u64,
     /// The clock controls' shared 500 ms blink timer (`0x53b4b0..0x53b7e7`):
     /// state 2 blinks Pause (row 0 <-> row 1) and state 3 blinks Ultra
     /// (`selected` false <-> true) during idle speed when return speed != Ultra.
@@ -262,6 +289,7 @@ pub(crate) struct HudStatic {
     fame: Fame,
     options_texts: OptionsTexts,
     options_state: options::OptionsState,
+    camera_strings: CameraStrings,
 }
 
 impl HudStatic {
@@ -271,12 +299,13 @@ impl HudStatic {
                 let labels = Labels::load(install).map_err(|e| e.to_string())?;
                 let rating_labels = RatingLabels::load(install);
                 let sell_labels = SellLabels::load(install);
-                // Without the balloons' or options' strings the HUD still opens with defaults.
+                // Without the balloons', options', or camera strings the HUD still opens with defaults.
                 let texts = Texts::load(install).unwrap_or_default();
                 let fame = Fame::load(install).unwrap_or_default();
                 let options_texts = OptionsTexts::load(install).unwrap_or_default();
                 let options_state =
                     options::OptionsState::load_install(install).unwrap_or_default();
+                let camera_strings = CameraStrings::load(install, US_ENGLISH).unwrap_or_default();
                 Ok((
                     labels,
                     rating_labels,
@@ -285,6 +314,7 @@ impl HudStatic {
                     fame,
                     options_texts,
                     options_state,
+                    camera_strings,
                 ))
             });
             let art_res = (|| -> Result<Art, String> {
@@ -301,6 +331,8 @@ impl HudStatic {
                 let optional: Vec<i32> = hud::OPTIONAL_RESOURCES
                     .iter()
                     .chain(&options::HELP_RESOURCES)
+                    .chain(&camera::RESOURCES)
+                    .chain(&camera::HELP_RESOURCES)
                     .chain(&[
                         options::id::SAVE_CARD,
                         sims_ui::neighborhood::art_id::POPUP_TILER,
@@ -319,8 +351,16 @@ impl HudStatic {
             )
         });
         let art = art_res?;
-        let (labels, rating_labels, sell_labels, texts, fame, options_texts, options_state) =
-            text_res?;
+        let (
+            labels,
+            rating_labels,
+            sell_labels,
+            texts,
+            fame,
+            options_texts,
+            options_state,
+            camera_strings,
+        ) = text_res?;
         Ok(Self {
             art,
             labels,
@@ -330,6 +370,7 @@ impl HudStatic {
             fame,
             options_texts,
             options_state,
+            camera_strings,
         })
     }
 }
@@ -561,16 +602,28 @@ impl Hud {
             coop_button_rect: None,
             album_button_enabled: false,
             camera_strip_open: false,
-            pressed_camera_action: None,
+            camera_panel: CameraPanel::new(),
+            camera_state: CameraState {
+                album_enabled: false,
+                ..CameraState::default()
+            },
+            camera_strings: static_part.camera_strings,
+            camera_layout: None,
+            pressed_camera_snapshot: false,
             camera_strip_rect: None,
             camera_snapshot_rect: None,
-            camera_album_rect: None,
             roof_view: false,
             cheat_console: CheatConsole::new(),
             menu: None,
             band: None,
             queue: Queue::default(),
             pressed: Pressed::default(),
+            queue_slide: QueueSlideState::new(),
+            pending_queue_origin: None,
+            balloon_fade: BalloonFadeState::new(),
+            last_balloon: None,
+            dialog_fade: DialogFadeState::hidden(),
+            last_clock_us: 0,
             clock_blink: ClockBlink::default(),
             idle_speed: false,
             buy_catalog: None,
@@ -607,10 +660,11 @@ impl Hud {
         self.pressed_coop_button = false;
         self.coop_button_rect = None;
         self.camera_strip_open = false;
-        self.pressed_camera_action = None;
+        self.camera_panel.clear_pointer();
+        self.camera_layout = None;
+        self.pressed_camera_snapshot = false;
         self.camera_strip_rect = None;
         self.camera_snapshot_rect = None;
-        self.camera_album_rect = None;
         self.roof_view = false;
         self.controls.pressed_options_action = None;
         self.controls.help = None;
@@ -618,6 +672,11 @@ impl Hud {
         self.controls.options.help = None;
         self.items.clear();
         self.pressed = Pressed::default();
+        self.queue_slide = QueueSlideState::new();
+        self.pending_queue_origin = None;
+        self.balloon_fade = BalloonFadeState::new();
+        self.last_balloon = None;
+        self.dialog_fade = DialogFadeState::hidden();
         self.clock_blink.reset();
         self.idle_speed = false;
         self.controls.pause_lit = false;
@@ -758,23 +817,58 @@ impl Hud {
         self.build_layout.press_subtool(point)
     }
 
-    /// Enables or disables the Camera sub-strip's Photo Album action (`CamViewAlbum`, `1105`).
+    /// Enables or disables the Camera subpanel's Photo Album action (`CamViewAlbum`, `1105`).
     pub fn set_album_button_enabled(&mut self, enabled: bool) {
         self.album_button_enabled = enabled;
+        self.camera_state.album_enabled = enabled;
         if !enabled {
-            self.camera_album_rect = None;
-            if self.pressed_camera_action == Some(CameraStripAction::PhotoAlbum) {
-                self.pressed_camera_action = None;
-            }
+            self.camera_panel.clear_pointer();
         }
     }
 
-    /// Whether the bottom Camera sub-strip is currently toggled open.
+    /// Current native Camera Mode settings (`SnapshotSize`, `SnapshotQuality`,
+    /// `album_enabled`, `quick_tips`).
+    pub fn camera_state(&self) -> CameraState {
+        let mut state = self.camera_state;
+        state.album_enabled = self.album_button_enabled;
+        state.quick_tips = self.controls.options.play.quick_tips;
+        state
+    }
+
+    /// Mutable access to the Camera Mode settings (for tests or Quick Tips overrides).
+    pub fn camera_state_mut(&mut self) -> &mut CameraState {
+        &mut self.camera_state
+    }
+
+    /// Active native `cWinCamera` panel controller.
+    pub fn camera_panel(&self) -> &CameraPanel {
+        &self.camera_panel
+    }
+
+    /// Loaded `STR# 140` Camera Mode strings (button coordinates, tooltips, Quick Tips).
+    pub fn camera_strings(&self) -> &CameraStrings {
+        &self.camera_strings
+    }
+
+    /// Last laid-out native [`CameraLayout`] when Camera Mode is open.
+    pub fn camera_layout(&self) -> Option<&CameraLayout> {
+        self.camera_layout.as_ref()
+    }
+
+    /// Screen rectangle of a specific native `cWinCamera` button when Camera Mode is open.
+    pub fn camera_button_rect(&self, button: CameraButton) -> Option<Rect> {
+        self.camera_layout
+            .as_ref()
+            .and_then(|layout| layout.button(button))
+            .map(|placement| placement.rect)
+    }
+
+    /// Whether the bottom native Camera subpanel (`cWinCamera`) is currently open.
     pub fn camera_strip_open(&self) -> bool {
         self.camera_strip_open
     }
 
-    /// Toggles the bottom Camera sub-strip open or closed, returning the new state.
+    /// Toggles the bottom native Camera subpanel open or closed, returning the new state.
     pub fn toggle_camera_strip(&mut self, size: [i32; 2]) -> bool {
         self.camera_strip_open = !self.camera_strip_open;
         if self.camera_strip_open {
@@ -786,7 +880,7 @@ impl Hud {
         self.camera_strip_open
     }
 
-    /// Closes the bottom Camera sub-strip if open. Returns `true` if it was open.
+    /// Closes the bottom Camera subpanel if open. Returns `true` if it was open.
     pub fn close_camera_strip(&mut self) -> bool {
         if !self.camera_strip_open {
             return false;
@@ -797,48 +891,152 @@ impl Hud {
     }
 
     fn clear_camera_strip_layout(&mut self) {
-        self.pressed_camera_action = None;
+        self.camera_panel.clear_pointer();
+        self.camera_layout = None;
+        self.pressed_camera_snapshot = false;
         self.camera_strip_rect = None;
         self.camera_snapshot_rect = None;
-        self.camera_album_rect = None;
     }
 
-    /// Bounding rectangle of the Camera sub-strip inside the bottom panel strip
+    /// Bounding rectangle of the Camera subpanel inside the bottom panel strip
     /// area, when open.
     pub fn camera_strip_rect(&self) -> Option<Rect> {
         self.camera_strip_rect
     }
 
-    /// Screen rectangle of the Camera sub-strip's "Take Snapshot" button, when open.
+    /// Screen rectangle of the Camera subpanel's "Take Snapshot" button (`CamSnap`),
+    /// when open and wide enough to display beside `CamViewAlbum`.
     pub fn camera_snapshot_button_rect(&self) -> Option<Rect> {
         self.camera_snapshot_rect
     }
 
-    /// Screen rectangle of the Camera sub-strip's "Photo Album" button, when
-    /// the Camera sub-strip is open and Photo Album is enabled.
+    /// Screen rectangle of the native `CamViewAlbum` (`1105`) button, when the
+    /// Camera subpanel is open and Photo Album is enabled.
     pub fn album_button_rect(&self) -> Option<Rect> {
-        self.camera_album_rect
+        if !self.album_button_enabled {
+            return None;
+        }
+        self.camera_button_rect(CameraButton::ViewAlbum)
     }
 
-    /// Releases a held Camera sub-strip button, returning `(changed, activated_action)`.
+    /// Releases a held native `cWinCamera` button or Take Snapshot button,
+    /// returning `(changed, Option<CameraCommand>)`.
+    ///
+    /// Size and quality toggles update `self.camera_state` in place while
+    /// keeping the Camera subpanel open; `TakeSnapshot` and `OpenPhotoAlbum`
+    /// close the subpanel cleanly before returning so PNG capture never
+    /// includes the Camera strip.
     pub fn release_camera_strip(
         &mut self,
         point: Option<[i32; 2]>,
-    ) -> (bool, Option<CameraStripAction>) {
-        let Some(action) = self.pressed_camera_action.take() else {
+    ) -> (bool, Option<CameraCommand>) {
+        if self.pressed_camera_snapshot {
+            self.pressed_camera_snapshot = false;
+            let activated = point
+                .is_some_and(|[x, y]| self.camera_snapshot_rect.is_some_and(|r| r.contains(x, y)));
+            if activated {
+                self.play(CLICK);
+                self.close_camera_strip();
+                return (true, Some(CameraCommand::TakeSnapshot));
+            }
+            return (true, None);
+        }
+        if self.camera_panel.pressed().is_none() {
             return (false, None);
+        }
+        let Some([x, y]) = point else {
+            self.camera_panel.clear_pointer();
+            return (true, None);
         };
-        let target_rect = match action {
-            CameraStripAction::TakeSnapshot => self.camera_snapshot_rect,
-            CameraStripAction::PhotoAlbum => self.camera_album_rect,
+        let Some(strip) = self.camera_strip_rect else {
+            self.camera_panel.clear_pointer();
+            return (true, None);
         };
-        let activated = point.is_some_and(|[x, y]| target_rect.is_some_and(|r| r.contains(x, y)));
-        if activated {
-            self.play(CLICK);
-            self.close_camera_strip();
-            (true, Some(action))
+        // Keep Quick Tips hover balloons active in `draw()`/`hover()`, while
+        // allowing clicks on size/quality controls to apply the chosen setting
+        // even when `Options.iff` enables `play.quick_tips` by default.
+        let mut release_state = self.camera_state();
+        release_state.quick_tips = false;
+        let cmd =
+            self.camera_panel
+                .release(x, y, strip, &release_state, &self.camera_strings, &self.art);
+        match cmd {
+            Some(CameraCommand::SetSize(size)) => {
+                self.camera_state.size = size;
+                self.play(CLICK);
+                (true, Some(CameraCommand::SetSize(size)))
+            }
+            Some(CameraCommand::SetQuality(quality)) => {
+                self.camera_state.quality = quality;
+                self.play(CLICK);
+                (true, Some(CameraCommand::SetQuality(quality)))
+            }
+            Some(CameraCommand::OpenPhotoAlbum) => {
+                self.play(CLICK);
+                self.close_camera_strip();
+                (true, Some(CameraCommand::OpenPhotoAlbum))
+            }
+            Some(CameraCommand::TakeSnapshot) => {
+                self.play(CLICK);
+                self.close_camera_strip();
+                (true, Some(CameraCommand::TakeSnapshot))
+            }
+            Some(CameraCommand::Help(topic)) => {
+                self.play(WHOOSH);
+                (true, Some(CameraCommand::Help(topic)))
+            }
+            None => (true, None),
+        }
+    }
+
+    /// Updates the HUD's cached presentation clock in microseconds (`0` for
+    /// static/headless deterministic frames).
+    pub fn set_clock_us(&mut self, clock_us: u64) {
+        self.last_clock_us = clock_us;
+    }
+
+    /// Records the screen click origin of a pie-menu interaction choice so the
+    /// newly queued action icon slides smoothly into its slot over 500 ms.
+    pub fn set_queue_origin(&mut self, person: Option<u16>, origin: [i32; 2]) {
+        self.pending_queue_origin = Some((person, origin, self.last_clock_us));
+    }
+
+    /// Whether any temporal UI animation (250 ms help-balloon fade, modal
+    /// dialog fade-in, or 500 ms action-queue icon slide) is actively in flight
+    /// at `clock_us`. Always `false` when `clock_us == 0`.
+    pub fn is_ui_animating(&self, clock_us: u64) -> bool {
+        if clock_us == 0 {
+            return false;
+        }
+        let now_ms = (clock_us / 1_000) as u32;
+        self.balloon_fade.is_animating(now_ms)
+            || self.dialog_fade.is_animating(now_ms)
+            || self.queue_slide.is_animating(now_ms)
+    }
+
+    /// Current Live help-balloon fade state (`BalloonFadeState`).
+    pub fn balloon_fade(&self) -> &BalloonFadeState {
+        &self.balloon_fade
+    }
+
+    /// Current modal dialog fade state (`DialogFadeState`).
+    pub fn dialog_fade(&self) -> &DialogFadeState {
+        &self.dialog_fade
+    }
+
+    /// Current action-queue icon slide state (`QueueSlideState`).
+    pub fn queue_slide(&self) -> &QueueSlideState {
+        &self.queue_slide
+    }
+
+    fn start_dialog_fade(&mut self) {
+        if self.last_clock_us > 0 {
+            let now_ms = (self.last_clock_us / 1_000) as u32;
+            self.dialog_fade = DialogFadeState::hidden();
+            self.dialog_fade
+                .fade_to(1.0, now_ms, DIALOG_FADE_DURATION_MS);
         } else {
-            (true, None)
+            self.dialog_fade = DialogFadeState::opaque();
         }
     }
 
@@ -1054,13 +1252,14 @@ impl Hud {
                 vec![yes, no],
             )
             .with_frame(dialog::FrameStyle::Generic),
-            OptionsDialog::Notice => {
+            OptionsDialog::Notice | OptionsDialog::SpecialBook => {
                 Message::notice("", "", ok).with_frame(dialog::FrameStyle::Generic)
             }
         };
         self.dialog_state = DialogState::for_message(&message);
         self.dialog = dialog::layout(view_size, &message, &self.art);
         self.ui_dialog = Some((kind, message));
+        self.start_dialog_fade();
         self.menu = None;
         self.close_camera_strip();
     }
@@ -1079,8 +1278,44 @@ impl Hud {
         self.dialog_state = DialogState::for_message(&message);
         self.dialog = dialog::layout(view_size, &message, &self.art);
         self.ui_dialog = Some((OptionsDialog::Notice, message));
+        self.start_dialog_fade();
         self.menu = None;
         self.close_camera_strip();
+    }
+
+    /// Opens a native inline reference book modal (`Dialog` kind 12 Spellbook or
+    /// kind 15 Cookbook) displaying real caller spell/recipe data until the
+    /// player dismisses it with OK / Enter / Escape.
+    pub fn open_special_book_dialog(
+        &mut self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        view_size: [i32; 2],
+    ) {
+        let ok = self.labels.get(1).to_owned();
+        let message = Message::notice(title, body, ok).with_frame(dialog::FrameStyle::Popup);
+        self.dialog_state = DialogState::for_message(&message);
+        self.dialog = dialog::layout(view_size, &message, &self.art);
+        self.ui_dialog = Some((OptionsDialog::SpecialBook, message));
+        self.start_dialog_fade();
+        self.menu = None;
+        self.close_camera_strip();
+    }
+
+    /// Closes an open `OptionsDialog::SpecialBook` modal without emitting a button command
+    /// (used when a co-op peer dismisses the book first or on snapshot restore).
+    pub fn close_special_book_dialog(&mut self) {
+        if matches!(self.ui_dialog, Some((OptionsDialog::SpecialBook, _))) {
+            self.ui_dialog = None;
+            self.dialog = None;
+            if let Some((vm_msg, _)) = &self.message {
+                self.dialog_state = DialogState::for_message(vm_msg);
+                self.start_dialog_fade();
+            } else {
+                self.dialog_state = DialogState::default();
+                self.dialog_fade = DialogFadeState::hidden();
+            }
+        }
     }
 
     /// The current text inside the active modal dialog's primary text entry
@@ -1473,7 +1708,13 @@ impl Hud {
     ) -> Option<(OptionsDialog, u8, Option<String>, Option<String>)> {
         let (kind, message) = self.ui_dialog.take()?;
         self.dialog = None;
-        self.dialog_state = DialogState::default();
+        if let Some((vm_msg, _)) = &self.message {
+            self.dialog_state = DialogState::for_message(vm_msg);
+            self.start_dialog_fade();
+        } else {
+            self.dialog_state = DialogState::default();
+            self.dialog_fade = DialogFadeState::hidden();
+        }
         Some((kind, button, message.entry, message.secondary_entry))
     }
 
@@ -1553,6 +1794,7 @@ impl Hud {
         if self.ui_dialog.is_none() {
             self.dialog = None;
             self.dialog_state = DialogState::default();
+            self.dialog_fade = DialogFadeState::hidden();
         }
     }
 
@@ -1561,14 +1803,16 @@ impl Hud {
     /// it when it showed the dialog.
     pub fn read_dialog(&mut self, world: &World, assets: &Assets) {
         let Some(pending) = dialog::pending(world) else {
-            self.message = None;
+            if self.message.take().is_some() && self.ui_dialog.is_none() {
+                self.dialog_fade = DialogFadeState::hidden();
+            }
             return;
         };
         let key = (pending.caller, pending.operands);
         if self.message.as_ref().is_some_and(|(_, k)| *k == key) {
             return;
         }
-        self.message = Message::read(
+        let read = Message::read(
             world,
             assets.index(),
             assets.catalog(),
@@ -1576,13 +1820,16 @@ impl Hud {
             pending,
         )
         .ok()
-        .flatten()
-        .map(|m| {
+        .flatten();
+        if let Some(m) = read {
             if self.ui_dialog.is_none() {
                 self.dialog_state = DialogState::for_message(&m);
+                self.start_dialog_fade();
             }
-            (m, key)
-        });
+            self.message = Some((m, key));
+        } else {
+            self.message = None;
+        }
     }
 
     /// What the panel shows of `world`: the household with what the next
@@ -1678,11 +1925,46 @@ impl Hud {
         visibility: options::LotVisibility,
         assets: &Assets,
         view: &View,
-        _pace: &Pace,
+        pace: &Pace,
         status: Option<&str>,
         sell: Option<&SellInfo>,
         canvas: &mut Canvas,
     ) {
+        self.draw_for_lot_at(
+            world,
+            residential,
+            visibility,
+            assets,
+            view,
+            pace,
+            status,
+            sell,
+            0,
+            canvas,
+        );
+    }
+
+    /// Like [`Hud::draw_for_lot`], advancing temporal UI animations
+    /// (`BalloonFadeState`, `DialogFadeState`, `QueueSlideState`) at
+    /// presentation clock `clock_us`. When `clock_us == 0`, all animations
+    /// snap instantaneously so headless and static pixel-ratchet frames remain
+    /// 100% bit-exact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_for_lot_at(
+        &mut self,
+        world: &World,
+        residential: bool,
+        visibility: options::LotVisibility,
+        assets: &Assets,
+        view: &View,
+        _pace: &Pace,
+        status: Option<&str>,
+        sell: Option<&SellInfo>,
+        clock_us: u64,
+        canvas: &mut Canvas,
+    ) {
+        self.last_clock_us = clock_us;
+        let now_ms = (clock_us / 1_000) as u32;
         let camera = &view.camera;
         self.controls.camera = hud::CameraState {
             floor: u8::try_from(camera.level).unwrap_or(1),
@@ -1732,6 +2014,28 @@ impl Hud {
         );
         hud::fit(&mut self.items, &self.art, &self.texts);
         self.queue = Queue::read(world, snapshot.selected);
+        if clock_us > 0 {
+            let origin = self.pending_queue_origin.and_then(|(person, pos, ts)| {
+                if person == self.queue.person && clock_us.saturating_sub(ts) <= 2_000_000 {
+                    Some(pos)
+                } else {
+                    None
+                }
+            });
+            let has_new_icon = self
+                .queue
+                .icons
+                .iter()
+                .any(|icon| self.queue_slide.position(icon.uid, now_ms).is_none());
+            self.queue_slide.sync(&self.queue, origin, now_ms);
+            if has_new_icon || origin.is_none() {
+                self.pending_queue_origin = None;
+            }
+            self.queue_slide.apply_to(&mut self.queue, now_ms);
+        } else {
+            self.pending_queue_origin = None;
+            self.queue_slide.sync(&self.queue, None, 0);
+        }
         self.pressed.keep(&self.queue);
         let queue_objects: Vec<u32> = self.queue.objects().collect();
         for guid in queue_objects {
@@ -1763,14 +2067,91 @@ impl Hud {
                 return;
             }
         };
-        hud::draw_with_thumbnails(
-            &mut frame,
-            &self.art,
-            &self.faces,
-            Some(&self.thumbnails),
-            &self.items,
-            &self.controls,
-        );
+        let current_balloon = self.items.iter().find_map(|item| match &item.kind {
+            hud::Kind::Balloon(b) => Some(b.clone()),
+            _ => None,
+        });
+        if clock_us == 0 {
+            if let Some(b) = current_balloon {
+                self.balloon_fade = BalloonFadeState::visible();
+                self.last_balloon = Some(b);
+            } else {
+                self.balloon_fade = BalloonFadeState::new();
+                self.last_balloon = None;
+            }
+            hud::draw_with_thumbnails(
+                &mut frame,
+                &self.art,
+                &self.faces,
+                Some(&self.thumbnails),
+                &self.items,
+                &self.controls,
+            );
+        } else {
+            if let Some(b) = &current_balloon {
+                self.last_balloon = Some(b.clone());
+                if !self.balloon_fade.is_open() {
+                    self.balloon_fade.open(now_ms);
+                }
+            } else if self.balloon_fade.is_open() {
+                self.balloon_fade.close(now_ms);
+            }
+            let animate_balloon = self.balloon_fade.is_animating(now_ms)
+                || (current_balloon.is_none() && self.balloon_fade.is_visible(now_ms));
+            if animate_balloon {
+                let non_balloons: Vec<Item> = self
+                    .items
+                    .iter()
+                    .filter(|item| !matches!(item.kind, hud::Kind::Balloon(_)))
+                    .cloned()
+                    .collect();
+                hud::draw_with_thumbnails(
+                    &mut frame,
+                    &self.art,
+                    &self.faces,
+                    Some(&self.thumbnails),
+                    &non_balloons,
+                    &self.controls,
+                );
+                if let Some(balloon) = current_balloon.as_ref().or(self.last_balloon.as_ref()) {
+                    if self.controls.options.graphics.interface_effects {
+                        let alpha = self.balloon_fade.alpha(now_ms);
+                        balloon::draw_with_alpha(
+                            &mut frame,
+                            &self.art,
+                            Some(&self.thumbnails),
+                            balloon,
+                            alpha,
+                        );
+                    } else {
+                        let dy = self
+                            .balloon_fade
+                            .slide_offset_y(now_ms, balloon.rect.height);
+                        let mut shifted = balloon.clone();
+                        shifted.rect.y = shifted.rect.y.saturating_add(dy);
+                        balloon::draw_with_alpha(
+                            &mut frame,
+                            &self.art,
+                            Some(&self.thumbnails),
+                            &shifted,
+                            255,
+                        );
+                    }
+                }
+            } else {
+                if !self.balloon_fade.is_visible(now_ms) {
+                    self.last_balloon = None;
+                }
+                hud::draw_with_thumbnails(
+                    &mut frame,
+                    &self.art,
+                    &self.faces,
+                    Some(&self.thumbnails),
+                    &self.items,
+                    &self.controls,
+                );
+            }
+        }
         self.saves_button_rect = self.compute_options_saves_button_rect(view.size);
         if let Some(rect) = self.saves_button_rect {
             self.draw_options_strip_button(&mut frame, rect, "Saves", self.pressed_saves_button);
@@ -1847,7 +2228,7 @@ impl Hud {
         }
         self.layout_camera_strip(view.size);
         if self.camera_strip_open {
-            self.draw_camera_strip(&mut frame);
+            self.draw_camera_strip(&mut frame, view.size);
         }
         if self.controls.mode == Mode::Live {
             self.queue
@@ -1863,13 +2244,19 @@ impl Hud {
             self.close_camera_strip();
         }
         if let (Some(message), Some(layout)) = (self.active_message(), &self.dialog) {
-            dialog::draw_with_state(
+            let alpha = if clock_us == 0 {
+                255
+            } else {
+                self.dialog_fade.alpha(now_ms)
+            };
+            dialog::draw_with_state_alpha(
                 &mut frame,
                 &self.art,
                 message,
                 layout,
                 self.controls.pointer,
                 &self.dialog_state,
+                alpha,
             );
         }
         if let Some(menu) = &mut self.menu {
@@ -1977,148 +2364,73 @@ impl Hud {
         }
     }
 
-    /// Computes the Camera sub-strip layout strictly inside the bottom panel
-    /// strip area (`x >= hud::CLUSTER[0]`), guaranteeing zero overlap with the
-    /// Live Mode cluster, clock readout, speed buttons, or Camera icon.
+    /// Computes the native Complete Collection Camera subpanel (`cWinCamera`)
+    /// layout strictly inside the bottom panel strip area (`x >= hud::CLUSTER[0]`),
+    /// guaranteeing zero overlap with the Live Mode cluster, clock readout,
+    /// speed buttons, or Camera icon.
     pub fn layout_camera_strip(&mut self, size: [i32; 2]) {
         if !self.camera_strip_open {
             self.clear_camera_strip_layout();
             return;
         }
-        let x = hud::CLUSTER[0];
-        let avail_w = (size[0] - x).max(0);
+        let avail_w = (size[0] - hud::CLUSTER[0]).max(0);
         if avail_w < 84 || size[1] < hud::STRIP {
             self.camera_strip_open = false;
             self.clear_camera_strip_layout();
             return;
         }
-        let strip_h = if self.controls.expanded && self.controls.mode == Mode::Buy {
-            hud::TALL_STRIP
+        let strip = CameraPanel::strip_rect([size[0].max(0) as u32, size[1].max(0) as u32]);
+        let state = self.camera_state();
+        let layout = CameraLayout::compute(strip, &state, &self.camera_strings, &self.art);
+        // Place the Take Snapshot (`CamSnap`) button cleanly to the right of
+        // `CamViewAlbum` (`226 + 61 = 287`) when strip width permits, never
+        // overlapping any of the 8 native `cWinCamera` buttons or toothpicks.
+        let snap_rect = if !layout.compact && strip.width >= CameraLayout::MIN_NATIVE_WIDTH + 56 {
+            let x = strip.x.saturating_add(304);
+            let right_room = strip.x.saturating_add(strip.width).saturating_sub(x + 8);
+            let w = right_room.clamp(48, 132);
+            Some(Rect::new(x, strip.y.saturating_add(34), w, 36))
         } else {
-            hud::STRIP
-        }
-        .min(size[1]);
-        let y = (size[1] - strip_h).max(0);
-        self.camera_strip_rect = Some(Rect::new(x, y, avail_w, strip_h));
-
-        let band_y = (size[1] - hud::STRIP).max(0);
-        let pad_x = if avail_w >= 200 { 16 } else { 6 };
-        let gap = if avail_w >= 200 { 14 } else { 6 };
-        let btn_w = ((avail_w - pad_x * 2 - gap) / 2).clamp(32, 184);
-        let btn_h = 46;
-        let btn_y = band_y + 36;
-        self.camera_snapshot_rect = Some(Rect::new(x + pad_x, btn_y, btn_w, btn_h));
-        let album_rect = Rect::new(x + pad_x + btn_w + gap, btn_y, btn_w, btn_h);
-        self.camera_album_rect = self.album_button_enabled.then_some(album_rect);
+            None
+        };
+        self.camera_strip_rect = Some(strip);
+        self.camera_snapshot_rect = snap_rect;
+        self.camera_layout = Some(layout);
     }
 
-    fn draw_camera_strip(&self, frame: &mut Frame) {
+    fn draw_camera_strip(&mut self, frame: &mut Frame, size: [i32; 2]) {
         let Some(strip) = self.camera_strip_rect else {
             return;
         };
-        let bg_id = if strip.height > hud::STRIP {
-            4918
-        } else {
-            hud::id::STRIP
-        };
-        if let Some(bg) = self.art.image(bg_id)
-            && bg.width > 0
-            && bg.height > 0
-        {
-            let bw = bg.width as i32;
-            let bh = bg.height as i32;
-            let draw_w = strip.width.min(bw);
-            let draw_h = strip.height.min(bh);
-            frame.draw(bg, Rect::new(0, 0, draw_w, draw_h), [strip.x, strip.y]);
-            if strip.width > bw {
-                // Stretch the rightmost column to the window edge just like `sims_ui::hud`.
-                let last_col = Rect::new(bw - 1, 0, 1, draw_h);
-                for col in bw..strip.width {
-                    frame.draw(bg, last_col, [strip.x + col, strip.y]);
-                }
-            }
-        } else {
-            frame.fill(strip, [16, 32, 92]);
-        }
-        // Subtle top separator accent line inside the strip.
-        frame.fill(Rect::new(strip.x, strip.y, strip.width, 1), [88, 120, 204]);
+        // Native `0x53a1a9..0x53a1c3`: draw `kCameraPatch` (`CameraPatch.bmp`,
+        // `2035`) over the control-panel cluster at `(165, 83)` while Camera Mode
+        // is active.
+        let cluster_origin = [0, size[1].saturating_sub(hud::CLUSTER[1])];
+        CameraPanel::draw_cluster_patch(frame, cluster_origin, &self.art);
 
-        let band_y = (strip.y + strip.height - hud::STRIP).max(strip.y);
-        if let Some(font) = self.art.font(12).or_else(|| self.art.font(10)) {
-            font.draw(
-                frame,
-                "Camera",
-                [strip.x + 16, band_y + 10],
-                [235, 242, 255],
-            );
-        }
+        let state = self.camera_state();
+        let layout =
+            self.camera_panel
+                .draw(frame, strip, &state, &self.camera_strings, &self.art, true);
+        self.camera_layout = Some(layout);
+
         if let Some(snap_rect) = self.camera_snapshot_rect {
-            self.draw_camera_strip_button(
-                frame,
-                snap_rect,
-                hud::id::PHOTO,
-                if snap_rect.width >= 132 {
-                    "Take Snapshot"
-                } else {
-                    "Snapshot"
-                },
-                None,
-                true,
-                self.pressed_camera_action == Some(CameraStripAction::TakeSnapshot),
-            );
-            let gap = if strip.width >= 200 { 14 } else { 6 };
-            let album_rect = self.camera_album_rect.unwrap_or_else(|| {
-                Rect::new(
-                    snap_rect.x + snap_rect.width + gap,
-                    snap_rect.y,
-                    snap_rect.width,
-                    snap_rect.height,
-                )
-            });
-            self.draw_camera_strip_button(
-                frame,
-                album_rect,
-                sims_ui::album::CAM_VIEW_ALBUM,
-                if album_rect.width >= 132 {
-                    "Photo Album"
-                } else {
-                    "Album"
-                },
-                if album_rect.width >= 132 {
-                    Some("F10")
-                } else {
-                    None
-                },
-                self.album_button_enabled,
-                self.pressed_camera_action == Some(CameraStripAction::PhotoAlbum),
-            );
+            self.draw_camera_snapshot_button(frame, snap_rect);
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn draw_camera_strip_button(
-        &self,
-        frame: &mut Frame,
-        rect: Rect,
-        icon_id: i32,
-        label: &str,
-        shortcut: Option<&str>,
-        enabled: bool,
-        pressed: bool,
-    ) {
-        let hovered = enabled
-            && self
-                .controls
-                .pointer
-                .is_some_and(|[px, py]| rect.contains(px, py));
-        let (bg, border, fg) = if !enabled {
-            ([14, 24, 68], [52, 72, 128], [0x40, 0x5d, 0x5f])
-        } else if pressed && hovered {
-            ([30, 88, 176], [0, 255, 255], [0, 255, 255])
+    fn draw_camera_snapshot_button(&self, frame: &mut Frame, rect: Rect) {
+        let hovered = self
+            .controls
+            .pointer
+            .is_some_and(|[px, py]| rect.contains(px, py));
+        let pressed = self.pressed_camera_snapshot;
+        let (bg, border) = if pressed && hovered {
+            ([30, 88, 176], [0, 255, 255])
         } else if hovered {
-            ([26, 62, 146], [136, 178, 232], [255, 255, 255])
+            ([26, 62, 146], [136, 178, 232])
         } else {
-            ([16, 36, 108], [88, 120, 204], [195, 205, 205])
+            ([16, 36, 108], [88, 120, 204])
         };
         frame.fill(rect, bg);
         frame.fill(Rect::new(rect.x, rect.y, rect.width, 1), border);
@@ -2131,16 +2443,12 @@ impl Hud {
             Rect::new(rect.x + rect.width - 1, rect.y, 1, rect.height),
             border,
         );
-        let mut text_left = rect.x + 10;
-        if let Some(strip) = self.art.image(icon_id)
+        if let Some(strip) = self.art.image(hud::id::PHOTO)
             && strip.width >= 4
             && strip.height > 0
-            && rect.width >= 84
         {
             let cell_w = strip.width / 4;
-            let state = if !enabled {
-                0
-            } else if pressed && hovered {
+            let state = if pressed && hovered {
                 2
             } else if hovered {
                 3
@@ -2153,29 +2461,9 @@ impl Hud {
                 cell_w as i32,
                 strip.height as i32,
             );
-            let dx = rect.x + 8;
+            let dx = rect.x + (rect.width - cell_w as i32) / 2;
             let dy = rect.y + (rect.height - strip.height as i32) / 2;
             frame.draw(strip, src, [dx, dy]);
-            text_left = dx + cell_w as i32 + 8;
-        }
-        if let Some(font) = self.art.font(10).or_else(|| self.art.font(12)) {
-            if let Some(hint) = shortcut {
-                let ty = rect.y + (rect.height - font.line_height * 2 - 2) / 2;
-                font.draw(frame, label, [text_left, ty], fg);
-                font.draw(
-                    frame,
-                    hint,
-                    [text_left, ty + font.line_height + 2],
-                    if enabled {
-                        [132, 152, 186]
-                    } else {
-                        [0x40, 0x5d, 0x5f]
-                    },
-                );
-            } else {
-                let ty = rect.y + (rect.height - font.line_height) / 2;
-                font.draw(frame, label, [text_left, ty], fg);
-            }
         }
     }
 
@@ -2203,6 +2491,11 @@ impl Hud {
     /// The first name of people of type `guid`, from their file.
     pub fn name(&self, guid: u32) -> Option<&str> {
         self.faces.name(guid)
+    }
+
+    /// The cached portrait bitmap of people of type `guid`, if loaded.
+    pub fn face(&self, guid: u32) -> Option<&sims_formats::bitmap::Image> {
+        self.faces.face(guid)
     }
 
     /// Where the dialog drawn last is, and its buttons.
@@ -2268,7 +2561,15 @@ impl Hud {
     /// plays `UI_error`; an icon already pressed, or whose action is
     /// already cancelled, does nothing.
     fn press_queue(&mut self, point: [i32; 2]) -> Option<Option<Command>> {
-        let icon = self.queue.at(point)?;
+        let icon = if self.last_clock_us > 0 {
+            self.queue.at_clickable(
+                point,
+                &self.queue_slide,
+                (self.last_clock_us / 1_000) as u32,
+            )?
+        } else {
+            self.queue.at(point)?
+        };
         let (uid, cancelled) = (icon.uid, icon.cancelled);
         let person = self.queue.person?;
         if self.queue.pet {
@@ -2366,10 +2667,9 @@ impl Hud {
                 .is_some_and(|[x, y]| self.coop_button_rect.is_some_and(|r| r.contains(x, y)));
             let snap = pointer
                 .is_some_and(|[x, y]| self.camera_snapshot_rect.is_some_and(|r| r.contains(x, y)));
-            let album = pointer
-                .is_some_and(|[x, y]| self.camera_album_rect.is_some_and(|r| r.contains(x, y)));
-            (s, c, snap, album)
+            (s, c, snap)
         };
+        let prev_camera_hover = self.camera_panel.hovered();
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
             hud::lit_relation(&self.items, self.controls.pointer),
@@ -2380,6 +2680,22 @@ impl Hud {
             over_saves(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
+        let camera_hover_changed = if self.camera_strip_open
+            && let Some(strip) = self.camera_strip_rect
+        {
+            let state = self.camera_state();
+            let next = self.camera_panel.hover(
+                point[0],
+                point[1],
+                strip,
+                &state,
+                &self.camera_strings,
+                &self.art,
+            );
+            next != prev_camera_hover
+        } else {
+            false
+        };
         let hovered_changed = (
             hud::hovered(&self.items, self.controls.pointer),
             hud::lit_relation(&self.items, self.controls.pointer),
@@ -2388,7 +2704,8 @@ impl Hud {
             buy_widget(self.controls.pointer),
             build_widget(self.controls.pointer),
             over_saves(self.controls.pointer),
-        ) != before;
+        ) != before
+            || camera_hover_changed;
         let dismissed_live = self.controls.help.is_some()
             && !hud::in_subpanel(&self.items, point)
             && self.dismiss_live_help();
@@ -2406,8 +2723,10 @@ impl Hud {
     /// is preserved until mouse release. True if the frame changes.
     pub fn leave(&mut self) -> bool {
         let left = self.controls.pointer.take().is_some();
+        let cam_hovered = self.camera_panel.hovered().is_some();
+        self.camera_panel.clear_pointer();
         let dismissed = self.dismiss_help();
-        left || dismissed
+        left || cam_hovered || dismissed
     }
 
     /// Where the pointer is to be moved, as the original moves it when a
@@ -2428,6 +2747,12 @@ impl Hud {
     /// Dismisses any open live-mode help balloon (`0x50fb7f`) and plays `UI_whoosh`.
     fn dismiss_live_help(&mut self) -> bool {
         if self.controls.help.take().is_some() {
+            if self.last_clock_us > 0 {
+                self.balloon_fade.close((self.last_clock_us / 1_000) as u32);
+            } else {
+                self.balloon_fade = BalloonFadeState::new();
+                self.last_balloon = None;
+            }
             self.play(WHOOSH);
             true
         } else {
@@ -2450,6 +2775,14 @@ impl Hud {
     /// `UI_whoosh`. Returns true if a balloon was open.
     pub fn dismiss_help(&mut self) -> bool {
         let live = self.controls.help.take().is_some();
+        if live {
+            if self.last_clock_us > 0 {
+                self.balloon_fade.close((self.last_clock_us / 1_000) as u32);
+            } else {
+                self.balloon_fade = BalloonFadeState::new();
+                self.last_balloon = None;
+            }
+        }
         let opts = self.controls.options.help.take().is_some();
         if live || opts {
             self.play(WHOOSH);
@@ -2504,26 +2837,28 @@ impl Hud {
             self.dismiss_help();
             return None;
         }
-        if self
-            .camera_snapshot_rect
-            .is_some_and(|r| r.contains(point[0], point[1]))
-        {
-            self.pressed_camera_action = Some(CameraStripAction::TakeSnapshot);
-            return None;
-        }
-        if self
-            .camera_album_rect
-            .is_some_and(|r| r.contains(point[0], point[1]))
-        {
-            self.pressed_camera_action = Some(CameraStripAction::PhotoAlbum);
-            return None;
-        }
-        if self
-            .camera_strip_rect
-            .is_some_and(|r| r.contains(point[0], point[1]))
-        {
-            self.dismiss_help();
-            return None;
+        if self.camera_strip_open {
+            if self
+                .camera_snapshot_rect
+                .is_some_and(|r| r.contains(point[0], point[1]))
+            {
+                self.pressed_camera_snapshot = true;
+                return None;
+            }
+            if let Some(strip) = self.camera_strip_rect {
+                let state = self.camera_state();
+                if self.camera_panel.press(
+                    point[0],
+                    point[1],
+                    strip,
+                    &state,
+                    &self.camera_strings,
+                    &self.art,
+                ) {
+                    self.dismiss_help();
+                    return None;
+                }
+            }
         }
         if self
             .saves_button_rect

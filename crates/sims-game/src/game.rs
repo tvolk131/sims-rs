@@ -16,7 +16,7 @@ use crate::coop::{
     CoopController, CoopPollOutput, CoopPumpStats, CoopStartOptions, CoopTransport, clipboard_copy,
     clipboard_paste, default_player_name, player_badge_color,
 };
-use crate::hud::{CameraStripAction, DialogKey, Hud, HudShared, HudStatic, OptionsDialog};
+use crate::hud::{DialogKey, Hud, HudShared, HudStatic, OptionsDialog};
 use crate::menu::{self, Listing, Menu};
 use crate::pace::{self, Pace};
 use crate::people::People;
@@ -30,8 +30,9 @@ use sims_content::{
     People as ContentPeople, Surfaces, Wardrobe,
 };
 use sims_net::{
-    BuyBuildEdit, CameraRotation, Command as NetCommand, IrohConfig, ManifestDigest, PeerAddress,
-    PlayerId as NetPlayerId, PlayerMode as NetPlayerMode, SimSpeed as NetSimSpeed,
+    BuyBuildEdit, CameraRotation, Command as NetCommand, DialogId as NetDialogId, IrohConfig,
+    ManifestDigest, PeerAddress, PlayerId as NetPlayerId, PlayerMode as NetPlayerMode,
+    SimSpeed as NetSimSpeed,
 };
 use sims_people::{Cast, Library as PeopleLibrary, PreloadedCast};
 use sims_render::build_preview::{
@@ -41,7 +42,11 @@ use sims_render::build_preview::{
 };
 use sims_render::{BaseAssets, Camera, Canvas, Selected, Walls};
 use sims_ui::art::Art;
+use sims_ui::balloon::BalloonFadeState;
 use sims_ui::build::{BuildSubtoolAction, RoofPitchPreset, TerrainSubtool, WaterSubtool};
+use sims_ui::camera::{
+    CameraButton, CameraCommand, CameraLayout, CameraPanel, CameraState, CameraStrings,
+};
 use sims_ui::command::{
     BuildItemId, BuildTool, Camera as UiCamera, Command, Mode, OptionsAction, OptionsToggle, Speed,
     VolumeChannel, Walls as UiWalls,
@@ -50,7 +55,9 @@ use sims_ui::coop::{
     ConnectionState as CoopConnectionState, CoopCommand, CoopHudOverlay, CoopLobbyDialog,
     CoopSnapshot, LobbyTab,
 };
+use sims_ui::dialog::DialogFadeState;
 use sims_ui::options::{LotVisibility, OptionsState};
+use sims_ui::queue::QueueSlideState;
 use sims_ui::shop::{
     CurrencyKind, ShopCommand, ShopItem, ShopKind, ShopPickerDialog, ShopSnapshot, ShopStrings,
     Wallet, WardrobeCategory,
@@ -58,14 +65,16 @@ use sims_ui::shop::{
 use sims_vm::Program;
 use sims_vm::boot::save::Saved;
 use sims_vm::boot::{
-    Frames, Lot, PreloadedBoot, StepError, default_character_name, load_ordered_wardrobe,
+    AskingSpecialPanel, Frames, Lot, PreloadedBoot, StepError, default_character_name,
+    load_ordered_wardrobe,
 };
 use sims_vm::play::{Recovery, ScriptError};
 use sims_vm::{
     BuyCursor, FloorDragMode, FloorPlan, PanelMode, PoolMode, PoolPlan, RoofPitch as VmRoofPitch,
-    RoofState, SkippedFrame, SoundEvent, TerrainMode, TerrainPlan, UiEffectEvent, WALL_ASCENDING,
-    WALL_DESCENDING, WALL_EAST, WALL_NORTH, WALL_SOUTH, WALL_WEST, WallCursor, WallDragMode,
-    WallFace, WallPlan, WallStyle, WallpaperDragMode, WallpaperPlan, WaterMode, WaterPlan,
+    RoofState, SkippedFrame, SoundEvent, SpecialPanelRequest, SpecialPanelResponse, TerrainMode,
+    TerrainPlan, UiEffectEvent, WALL_ASCENDING, WALL_DESCENDING, WALL_EAST, WALL_NORTH, WALL_SOUTH,
+    WALL_WEST, WallCursor, WallDragMode, WallFace, WallPlan, WallStyle, WallpaperDragMode,
+    WallpaperPlan, WaterMode, WaterPlan,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -185,6 +194,27 @@ impl CameraPan {
     }
 }
 
+/// Real neighborhood / destination lot metadata supplied to destination lot
+/// pickers (`Dialog` kinds `5, 7, 8, 11, 13`) so picker rows show real installed
+/// lot names, street addresses, and descriptions with zero hardcoded game prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecialLotEntry {
+    pub lot_id: u16,
+    pub name: String,
+    pub address: Option<String>,
+    pub description: String,
+    pub zoning: i16,
+}
+
+/// Active VM special panel (`Dialog` kinds `5..=15`) currently presented in UI.
+#[derive(Debug, Clone)]
+struct ActiveSpecialPanel {
+    tick: u32,
+    request: SpecialPanelRequest,
+    coop_dialog_id: Option<NetDialogId>,
+    responses: BTreeMap<String, SpecialPanelResponse>,
+}
+
 pub struct Game {
     lot: Lot,
     lot_shape: sims_render::Lot,
@@ -280,6 +310,25 @@ pub struct Game {
     shop_strings: Option<ShopStrings>,
     shop_snapshot: Option<ShopSnapshot>,
     purchased_shop_items: BTreeSet<String>,
+    /// Currently presented VM special panel (`Dialog` kinds `5..=15`), if any.
+    active_special_panel: Option<ActiveSpecialPanel>,
+    /// Co-op special-panel dialog ID already answered locally plus pump count
+    /// elapsed since submission; cleared when the lockstep commit resolves or
+    /// rejects the panel, or after a bounded retry wait if host ingress drops
+    /// the command.
+    submitted_coop_special_panel: Option<(NetDialogId, u32)>,
+    /// Lazily cached native ordered wardrobe (`ImportWardrobe`) matching
+    /// `sims-vm` pet/human skin indices for special pickers (kinds 6, 9, 14).
+    ordered_wardrobe: Option<sims_content::ImportWardrobe>,
+    /// Destination lot chosen via a VM special lot picker (`5, 7, 8, 11, 13`)
+    /// awaiting `NeighborhoodShell` travel transition (`depart_to_destination`).
+    pending_travel_lot: Option<(SpecialPanelRequest, u32)>,
+    /// Neighborhood / destination lot metadata passed by `NeighborhoodShell`
+    /// (populated lazily from `Install` on standalone launches).
+    special_lot_catalog: Vec<SpecialLotEntry>,
+    /// Tracks whether temporal UI animations were running on the previous tick
+    /// so crossing settlement always emits one final landed redraw frame.
+    ui_animating_prev: bool,
     /// Pending Simlish voice requests to be drained by `sound::Feed::update`.
     voice_inputs: VecDeque<sound::Input>,
     /// Last `clock_us` when `UI_moneyback` (`0x492ad4`) or `UI_archtool_delete`
@@ -727,6 +776,12 @@ impl Game {
             shop_strings: None,
             shop_snapshot: None,
             purchased_shop_items: BTreeSet::new(),
+            active_special_panel: None,
+            submitted_coop_special_panel: None,
+            ordered_wardrobe: None,
+            pending_travel_lot: None,
+            special_lot_catalog: Vec::new(),
+            ui_animating_prev: false,
             voice_inputs: VecDeque::new(),
             buy_moneyback_us: None,
             buy_delete_us: None,
@@ -1005,6 +1060,12 @@ impl Game {
             shop_strings: None,
             shop_snapshot: None,
             purchased_shop_items: BTreeSet::new(),
+            active_special_panel: None,
+            submitted_coop_special_panel: None,
+            ordered_wardrobe: None,
+            pending_travel_lot: None,
+            special_lot_catalog: Vec::new(),
+            ui_animating_prev: false,
             voice_inputs: VecDeque::new(),
             buy_moneyback_us: None,
             buy_delete_us: None,
@@ -1251,6 +1312,12 @@ impl Game {
             shop_strings: None,
             shop_snapshot: None,
             purchased_shop_items: BTreeSet::new(),
+            active_special_panel: None,
+            submitted_coop_special_panel: None,
+            ordered_wardrobe: None,
+            pending_travel_lot: None,
+            special_lot_catalog: Vec::new(),
+            ui_animating_prev: false,
             voice_inputs: VecDeque::new(),
             buy_moneyback_us: None,
             buy_delete_us: None,
@@ -1359,7 +1426,30 @@ impl Game {
             || self.has_dialog()
             || self.pie_animating()
             || self.camera_panning()
+            || self.ui_animating()
             || self.cheat_console_open()
+    }
+
+    /// Whether any temporal UI animation (250 ms help-balloon fade, modal
+    /// dialog fade-in, or 500 ms action-queue icon slide) is currently in flight.
+    /// Always `false` when `clock_us == 0` (static/headless frames).
+    pub fn ui_animating(&self) -> bool {
+        self.hud.is_ui_animating(self.clock_us)
+    }
+
+    /// Current Live help-balloon fade state (`BalloonFadeState`).
+    pub fn balloon_fade(&self) -> &BalloonFadeState {
+        self.hud.balloon_fade()
+    }
+
+    /// Current modal dialog fade state (`DialogFadeState`).
+    pub fn dialog_fade(&self) -> &DialogFadeState {
+        self.hud.dialog_fade()
+    }
+
+    /// Current action-queue icon slide state (`QueueSlideState`).
+    pub fn queue_slide(&self) -> &QueueSlideState {
+        self.hud.queue_slide()
     }
 
     /// Enables or disables smooth camera pan interpolation on portrait
@@ -1778,34 +1868,73 @@ impl Game {
         &mut self.lot
     }
 
-    /// Enables or disables the Camera sub-strip's Photo Album action (`CamViewAlbum`, `1105`).
+    /// Enables or disables the Camera subpanel's Photo Album action (`CamViewAlbum`, `1105`).
     pub fn set_album_button_enabled(&mut self, enabled: bool) {
         self.hud.set_album_button_enabled(enabled);
     }
 
-    /// Whether the bottom Camera sub-strip is currently toggled open.
+    /// Current native Camera Mode settings (`SnapshotSize`, `SnapshotQuality`,
+    /// `album_enabled`, `quick_tips`).
+    pub fn camera_state(&self) -> CameraState {
+        self.hud.camera_state()
+    }
+
+    /// Active native `cWinCamera` panel controller.
+    pub fn camera_panel(&self) -> &CameraPanel {
+        self.hud.camera_panel()
+    }
+
+    /// Loaded `STR# 140` Camera Mode strings (button coordinates, tooltips, Quick Tips).
+    pub fn camera_strings(&self) -> &CameraStrings {
+        self.hud.camera_strings()
+    }
+
+    /// Last laid-out native [`CameraLayout`] when Camera Mode is open.
+    pub fn camera_layout(&self) -> Option<&CameraLayout> {
+        self.hud.camera_layout()
+    }
+
+    /// Screen rectangle of a specific native `cWinCamera` button when Camera Mode is open.
+    pub fn camera_button_rect(&self, button: CameraButton) -> Option<sims_ui::frame::Rect> {
+        self.hud.camera_button_rect(button)
+    }
+
+    /// Whether the bottom native Camera subpanel (`cWinCamera`) is currently open.
     pub fn camera_strip_open(&self) -> bool {
         self.hud.camera_strip_open()
     }
 
-    /// Closes the bottom Camera sub-strip if open. Returns `true` if it was open.
+    /// Closes the bottom Camera subpanel if open. Returns `true` if it was open.
     pub fn close_camera_strip(&mut self) -> bool {
         self.hud.close_camera_strip()
     }
 
-    /// Bounding rectangle of the bottom Camera sub-strip when open.
+    /// Bounding rectangle of the bottom Camera subpanel when open.
     pub fn camera_strip_rect(&self) -> Option<sims_ui::frame::Rect> {
         self.hud.camera_strip_rect()
     }
 
-    /// Screen rectangle of the Camera sub-strip's "Take Snapshot" button when open.
+    /// Screen rectangle of the Camera subpanel's "Take Snapshot" button (`CamSnap`),
+    /// when open and wide enough to display beside `CamViewAlbum`.
     pub fn camera_snapshot_button_rect(&self) -> Option<sims_ui::frame::Rect> {
         self.hud.camera_snapshot_button_rect()
     }
 
-    /// Screen rectangle of the Camera sub-strip's "Photo Album" button, if open and enabled.
+    /// Screen rectangle of the native `CamViewAlbum` (`1105`) button, if open and enabled.
     pub fn album_button_rect(&self) -> Option<sims_ui::frame::Rect> {
         self.hud.album_button_rect()
+    }
+
+    /// Supplies real installed neighborhood/destination lot metadata (names,
+    /// addresses, zoning) to destination lot pickers (`Dialog` kinds `5, 7, 8, 11, 13`).
+    pub fn set_special_lot_catalog(&mut self, lots: Vec<SpecialLotEntry>) {
+        self.special_lot_catalog = lots;
+    }
+
+    /// Takes any destination lot chosen in a VM special lot picker (`5, 7, 8, 11, 13`)
+    /// so `NeighborhoodShell` can cleanly transition via `depart_to_destination`.
+    pub fn take_pending_travel_lot(&mut self) -> Option<(SpecialPanelRequest, u32)> {
+        self.pending_travel_lot.take()
     }
 
     /// Enables or disables `--debug` mode (which shows the maroon top
@@ -1957,9 +2086,13 @@ impl Game {
         self.hud.has_ui_dialog()
     }
 
-    /// Whether any modal dialog (UI confirmation or simulation prompt) is open.
+    /// Whether any modal dialog (UI confirmation, simulation prompt, or special
+    /// panel `Dialog` kinds `5..=15`) is open.
     pub fn has_dialog(&self) -> bool {
-        self.hud.has_dialog() || self.lot.asking().is_some()
+        self.hud.has_dialog()
+            || self.lot.asking().is_some()
+            || self.lot.asking_special_panel().is_some()
+            || self.active_special_panel.is_some()
     }
 
     /// Loads persisted Options preferences from an `Options.iff` (`Optn` 128)
@@ -2222,6 +2355,8 @@ impl Game {
         if !self.hud.controls.options.play.edge_scrolling
             || self.hud.has_ui_dialog()
             || self.lot.asking().is_some()
+            || self.lot.asking_special_panel().is_some()
+            || self.shop_dialog.is_open()
             || self.hud.menu.is_some()
             || self.cheat_console_open()
         {
@@ -2530,9 +2665,15 @@ impl Game {
         mut keep_going: impl FnMut(u32) -> bool,
     ) -> (u32, bool) {
         self.clock_us = self.clock_us.saturating_add(clock_elapsed_us);
+        self.hud.set_clock_us(self.clock_us);
         if self.step_camera_pan() {
             self.blink_dirty = true;
         }
+        let ui_anim_now = self.hud.is_ui_animating(self.clock_us);
+        if ui_anim_now || self.ui_animating_prev {
+            self.blink_dirty = true;
+        }
+        self.ui_animating_prev = ui_anim_now;
         if self.hud.sync_clock_blink(self.lot.world(), self.clock_us)
             || self.hud.sync_dialog_blink(self.clock_us)
             || self.coop_lobby.sync_blink(self.clock_us)
@@ -2545,6 +2686,7 @@ impl Game {
         if self.hud.controls.mode != Mode::Live
             || self.hud.has_ui_dialog()
             || self.lot.asking().is_some()
+            || self.lot.asking_special_panel().is_some()
         {
             self.pace.restart();
             return (0, false);
@@ -2588,6 +2730,17 @@ impl Game {
     /// The dialog the lot waits on, if it waits for the player.
     pub fn asking(&self) -> Option<&sims_vm::boot::Asking> {
         self.lot.asking()
+    }
+
+    /// The special panel (`Dialog` kinds `5..=15`) the lot waits on, if it waits
+    /// for the player.
+    pub fn asking_special_panel(&self) -> Option<&AskingSpecialPanel> {
+        self.lot.asking_special_panel()
+    }
+
+    /// The active [`SpecialPanelRequest`] currently presented in the UI, if any.
+    pub fn active_special_panel_request(&self) -> Option<&SpecialPanelRequest> {
+        self.active_special_panel.as_ref().map(|a| &a.request)
     }
 
     /// Where the dialog shown in the last frame drawn is, and its buttons.
@@ -2644,11 +2797,26 @@ impl Game {
                     self.view.masks_rebuilt(update.masks_rebuilt);
                     self.keep_sounds(update.sounds);
                     self.keep_ui_effects(update.ui_effects);
+                    for (req, resp) in update.special_panels_answered {
+                        if matches!(
+                            req,
+                            SpecialPanelRequest::DowntownLotPicker
+                                | SpecialPanelRequest::VacationLotPicker { .. }
+                                | SpecialPanelRequest::OldTownLotPicker { .. }
+                                | SpecialPanelRequest::StudioTownLotPicker { .. }
+                                | SpecialPanelRequest::MagicTownLotPicker { .. }
+                        ) && let SpecialPanelResponse::Lot(Some(lot_id)) = resp
+                            && lot_id > 0
+                        {
+                            self.pending_travel_lot = Some((req, lot_id as u32));
+                        }
+                    }
                 }
-                // The tick shows a dialog: it runs once it is answered,
-                // and no time is owed from before the wait.
+                // The tick shows a dialog or special panel: it runs once it is
+                // answered, and no time is owed from before the wait.
                 Err(StepError::Asking { .. }) => {
                     self.pace.restart();
+                    self.sync_special_panel();
                     break;
                 }
                 Err(error) => {
@@ -2904,6 +3072,8 @@ impl Game {
             None
         };
         self.log_debug_note_if_new();
+        self.hud.set_clock_us(self.clock_us);
+        self.sync_special_panel();
         let status = self.debug.then(|| self.status()).flatten();
         let world = hud_world_override
             .as_ref()
@@ -2992,7 +3162,7 @@ impl Game {
             );
             self.hud.ensure_build_swatches(&mut self.assets);
         }
-        self.hud.draw_for_lot(
+        self.hud.draw_for_lot_at(
             world,
             self.lot.residential(),
             self.lot_visibility(),
@@ -3001,8 +3171,10 @@ impl Game {
             &self.pace,
             status.as_deref(),
             sell.as_ref(),
+            self.clock_us,
             &mut self.canvas,
         );
+        self.ui_animating_prev = self.hud.is_ui_animating(self.clock_us);
         draw_ui_effect_highlights(
             self.hud.items(),
             &self.highlighted_buttons,
@@ -3301,6 +3473,19 @@ impl Game {
         let dismissed = self.hud.dismiss_help();
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
+        // Native `cWinCamera`: clicking inside the house viewport while Camera
+        // Mode is open closes the Camera subpanel and captures a clean snapshot.
+        if self.hud.camera_strip_open() {
+            self.hud.close_camera_strip();
+            self.hud.play(crate::hud::CLICK);
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+            return Outcome {
+                redraw: true,
+                photo: true,
+                ..Outcome::default()
+            };
+        }
         if self.hud.controls.mode == Mode::Buy {
             if self.stopped.is_some() {
                 self.note = Some("The lot has stopped, so it takes no orders.".into());
@@ -3526,23 +3711,26 @@ impl Game {
                 ..Outcome::default()
             };
         }
-        let (released_camera, camera_action) = self
+        let (released_camera, camera_cmd) = self
             .hud
             .release_camera_strip((!self.has_dialog()).then_some(point));
-        if let Some(action) = camera_action {
+        if let Some(cmd) = camera_cmd {
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
-            return match action {
-                CameraStripAction::TakeSnapshot => Outcome {
+            return match cmd {
+                CameraCommand::TakeSnapshot => Outcome {
                     redraw: true,
                     photo: true,
                     ..Outcome::default()
                 },
-                CameraStripAction::PhotoAlbum => Outcome {
+                CameraCommand::OpenPhotoAlbum => Outcome {
                     redraw: true,
                     open_photo_album: true,
                     ..Outcome::default()
                 },
+                CameraCommand::SetSize(_)
+                | CameraCommand::SetQuality(_)
+                | CameraCommand::Help(_) => Outcome::redraw(),
             };
         }
         let (released_action, action_cmd) = self.hud.release_options_action(Some(point));
@@ -3664,7 +3852,13 @@ impl Game {
         }
         self.highlighted = None;
         let outcome = match command {
-            Some(command) => self.command(command, menu.as_ref()),
+            Some(command) => {
+                if let Command::ChooseInteraction { sim, .. } = &command {
+                    let origin = menu.as_ref().and_then(Menu::main_center).unwrap_or(point);
+                    self.hud.set_queue_origin(Some(*sim), origin);
+                }
+                self.command(command, menu.as_ref())
+            }
             None => Outcome::redraw(),
         };
         if let Some(failed) = failed {
@@ -4488,6 +4682,10 @@ impl Game {
         self.build_drag = None;
         self.build_preview_shape = None;
         self.live_panel_expanded = true;
+        self.submitted_coop_special_panel = None;
+        self.close_special_panel_ui();
+        self.pending_travel_lot = None;
+        self.ui_animating_prev = false;
         self.hud.forget();
         self.hud.controls.mode = ui_mode(self.lot.mode());
         self.blink_dirty = false;
@@ -4804,6 +5002,14 @@ impl Game {
                             ) => {
                                 self.pending_after_save_note = None;
                                 self.note = Some("Tutorial reset is not ported yet.".into());
+                            }
+                            (OptionsDialog::SpecialBook, _) => {
+                                if !self.answer_special_panel(SpecialPanelResponse::Dismissed) {
+                                    // Restore the book modal if co-op submission failed so
+                                    // the blocking panel never becomes invisible.
+                                    self.active_special_panel = None;
+                                    self.sync_special_panel();
+                                }
                             }
                             _ => {
                                 self.note = None;
@@ -7378,9 +7584,13 @@ impl Game {
         }
     }
 
-    /// Executes a [`ShopCommand`] emitted by [`ShopPickerDialog`], deducting
-    /// Simoleons or MagiCoins atomically from the live household state.
+    /// Executes a [`ShopCommand`] emitted by [`ShopPickerDialog`], either
+    /// answering an active VM special panel (`Dialog` kinds `5..=15`) or
+    /// deducting Simoleons / MagiCoins atomically for an interactive community shop.
     pub fn execute_shop_command(&mut self, cmd: ShopCommand) -> Outcome {
+        if let Some(active) = self.active_special_panel.clone() {
+            return self.execute_special_panel_shop_command(active, cmd);
+        }
         match cmd {
             ShopCommand::Cancel => {
                 self.close_shop();
@@ -7564,6 +7774,974 @@ impl Game {
         };
         self.shop_dialog.draw(&mut frame, snapshot, &strings, art);
         self.canvas.color = frame.into_rgb();
+    }
+
+    // -------------------------------------------------------------------------
+    // Special Dialog Panels (`Dialog` kinds `5..=15`, single-player & co-op)
+    // -------------------------------------------------------------------------
+
+    /// Closes any local UI modal opened for a VM special panel without sending
+    /// an answer to the VM (used after answering, on co-op peer dismissal, or on
+    /// restore).
+    fn close_special_panel_ui(&mut self) {
+        if self.active_special_panel.take().is_some() {
+            self.shop_dialog.close();
+            self.shop_snapshot = None;
+            self.hud.close_special_book_dialog();
+        }
+    }
+
+    /// Synchronizes local modal UI with `Lot::asking_special_panel()` so all
+    /// eleven special `Dialog` kinds (`5..=15`) — destination lot pickers,
+    /// interactive wardrobe/pet/neighbor/charm pickers, and inline reference
+    /// books (Spellbook 12 & Cookbook 15) — present clean native modals in both
+    /// single-player and co-op sessions.
+    pub fn sync_special_panel(&mut self) {
+        // Borrow first to avoid cloning the paused VM world on unchanged frames.
+        let coop_dialog_id = self
+            .lot
+            .coop()
+            .and_then(|c| c.active_special_panel.as_ref().map(|(id, _)| *id));
+        let unchanged = {
+            let Some(asking) = self.lot.asking_special_panel() else {
+                self.submitted_coop_special_panel = None;
+                self.close_special_panel_ui();
+                return;
+            };
+            if coop_dialog_id.is_some()
+                && self.submitted_coop_special_panel.map(|(id, _)| id) == coop_dialog_id
+            {
+                return;
+            }
+            self.active_special_panel.as_ref().is_some_and(|a| {
+                a.tick == asking.shown.tick
+                    && a.request == asking.shown.request
+                    && a.coop_dialog_id == coop_dialog_id
+            })
+        };
+        if unchanged {
+            return;
+        }
+        self.submitted_coop_special_panel = None;
+        let Some(asking) = self.lot.asking_special_panel().cloned() else {
+            return;
+        };
+        let tick = asking.shown.tick;
+        let request = asking.shown.request.clone();
+        self.close_menu();
+        self.hud.close_camera_strip();
+        self.hud.close_special_book_dialog();
+        self.shop_dialog.close();
+        self.shop_snapshot = None;
+
+        match &request {
+            SpecialPanelRequest::SpellBook { caller }
+            | SpecialPanelRequest::CookBook { caller } => {
+                let is_cookbook = matches!(request, SpecialPanelRequest::CookBook { .. });
+                let (title, body) =
+                    self.build_reference_book_content(&asking.world, *caller, is_cookbook);
+                self.hud
+                    .open_special_book_dialog(title, body, self.view.size);
+                self.active_special_panel = Some(ActiveSpecialPanel {
+                    tick,
+                    request,
+                    coop_dialog_id,
+                    responses: BTreeMap::new(),
+                });
+            }
+            SpecialPanelRequest::DowntownLotPicker
+            | SpecialPanelRequest::VacationLotPicker { .. }
+            | SpecialPanelRequest::OldTownLotPicker { .. }
+            | SpecialPanelRequest::StudioTownLotPicker { .. }
+            | SpecialPanelRequest::MagicTownLotPicker { .. } => {
+                let (shop_kind, title, items, responses) =
+                    self.build_destination_lot_picker(&request, &asking.world);
+                self.open_special_picker(
+                    tick,
+                    request,
+                    coop_dialog_id,
+                    shop_kind,
+                    title,
+                    None,
+                    items,
+                    responses,
+                );
+            }
+            SpecialPanelRequest::WardrobeShop { person, mode } => {
+                let category = match *mode {
+                    0 => WardrobeCategory::Everyday,
+                    1 => WardrobeCategory::Swimwear,
+                    2 => WardrobeCategory::Formal,
+                    3 => WardrobeCategory::Pajamas,
+                    4 => WardrobeCategory::Winterwear,
+                    _ => WardrobeCategory::Formal,
+                };
+                let shop_kind = if *mode == 5 {
+                    ShopKind::StudioWardrobe
+                } else {
+                    ShopKind::DowntownBoutique(category)
+                };
+                let shopper = self.person_display_name(&asking.world, *person);
+                let (items, responses) =
+                    self.build_wardrobe_picker_items(&asking.world, *person, *mode);
+                self.open_special_picker(
+                    tick,
+                    request,
+                    coop_dialog_id,
+                    shop_kind,
+                    None,
+                    shopper,
+                    items,
+                    responses,
+                );
+            }
+            SpecialPanelRequest::PetPicker { pet } => {
+                let shopper = self.person_display_name(&asking.world, *pet);
+                let (items, responses) = self.build_pet_picker_items(&asking.world, *pet);
+                self.open_special_picker(
+                    tick,
+                    request,
+                    coop_dialog_id,
+                    ShopKind::PetAdoption,
+                    None,
+                    shopper,
+                    items,
+                    responses,
+                );
+            }
+            SpecialPanelRequest::CallNeighbor { caller_neighbor } => {
+                let caller_name = asking
+                    .world
+                    .neighbors
+                    .slots
+                    .iter()
+                    .flatten()
+                    .find(|r| r.id == *caller_neighbor)
+                    .and_then(|r| {
+                        self.lot
+                            .character_names()
+                            .get(&r.guid)
+                            .cloned()
+                            .or_else(|| self.hud.name(r.guid).map(str::to_owned))
+                    });
+                let (items, responses) =
+                    self.build_call_neighbor_items(&asking.world, *caller_neighbor);
+                self.open_special_picker(
+                    tick,
+                    request,
+                    coop_dialog_id,
+                    ShopKind::DowntownBoutique(WardrobeCategory::Everyday),
+                    caller_name,
+                    None,
+                    items,
+                    responses,
+                );
+            }
+            SpecialPanelRequest::CharmTransform { person } => {
+                let shopper = self.person_display_name(&asking.world, *person);
+                let (items, responses) = self.build_charm_transform_items(&asking.world, *person);
+                self.open_special_picker(
+                    tick,
+                    request,
+                    coop_dialog_id,
+                    ShopKind::MagicVendor,
+                    None,
+                    shopper,
+                    items,
+                    responses,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_special_picker(
+        &mut self,
+        tick: u32,
+        request: SpecialPanelRequest,
+        coop_dialog_id: Option<NetDialogId>,
+        kind: ShopKind,
+        title_override: Option<String>,
+        shopper_name: Option<String>,
+        items: Vec<ShopItem>,
+        responses: BTreeMap<String, SpecialPanelResponse>,
+    ) {
+        self.ensure_shop_assets();
+        let wallet = self.current_shop_wallet();
+        self.shop_snapshot = Some(ShopSnapshot {
+            kind,
+            title_override,
+            shopper_name,
+            wallet,
+            items,
+            tried_on_item_id: None,
+        });
+        self.shop_dialog.open();
+        self.active_special_panel = Some(ActiveSpecialPanel {
+            tick,
+            request,
+            coop_dialog_id,
+            responses,
+        });
+    }
+
+    /// Delivers `response` to the currently waiting VM special panel (`Dialog`
+    /// kinds `5..=15`) in either single-player (`Lot::answer_special_panel` +
+    /// tick replay) or co-op lockstep (`sims_vm::coop::special_panel_answer_command`).
+    pub fn answer_special_panel(&mut self, response: SpecialPanelResponse) -> bool {
+        let Some(asking) = self.lot.asking_special_panel() else {
+            self.close_special_panel_ui();
+            self.note = Some("No special panel waits for a response.".into());
+            return false;
+        };
+        let request = asking.shown.request.clone();
+        if !request.accepts(&response) {
+            self.note = Some(format!(
+                "Special panel kind {} does not accept {response:?}.",
+                request.kind()
+            ));
+            return false;
+        }
+        if self.coop.is_active() {
+            let dialog_id = self
+                .lot
+                .coop()
+                .and_then(|c| c.active_special_panel.as_ref().map(|(id, _)| *id))
+                .or_else(|| {
+                    self.active_special_panel
+                        .as_ref()
+                        .and_then(|a| a.coop_dialog_id)
+                })
+                .or_else(|| {
+                    self.coop
+                        .session()
+                        .and_then(|s| s.open_dialogs.keys().next().copied())
+                });
+            let Some(dialog_id) = dialog_id else {
+                self.note = Some("No co-op blocking special panel is active.".into());
+                return false;
+            };
+            let cmd = sims_vm::coop::special_panel_answer_command(dialog_id, &response);
+            if let Err(e) = self.coop.submit_command(cmd) {
+                self.note = Some(format!("Special panel response was not sent: {e}"));
+                return false;
+            }
+            self.submitted_coop_special_panel = Some((dialog_id, 0));
+            self.close_special_panel_ui();
+            return true;
+        }
+        if let Err(e) = self.lot.answer_special_panel(response) {
+            self.note = Some(format!("Special panel response was not taken: {e}"));
+            return false;
+        }
+        self.close_special_panel_ui();
+        // Replay the paused tick immediately with the chosen response, just
+        // like `Game::answer` does for ordinary dialogs. Committed destination
+        // lot picks are recorded into `pending_travel_lot` inside `run_while`
+        // from `Update::special_panels_answered` only when the tick commits.
+        self.run(1);
+        self.sync_special_panel();
+        true
+    }
+
+    fn execute_special_panel_shop_command(
+        &mut self,
+        active: ActiveSpecialPanel,
+        cmd: ShopCommand,
+    ) -> Outcome {
+        match cmd {
+            ShopCommand::Cancel => {
+                let cancel = special_panel_cancel_response(&active.request);
+                if self.answer_special_panel(cancel) {
+                    self.hud.play(crate::hud::CLICK);
+                } else {
+                    self.hud.play(crate::hud::ERROR);
+                    // Re-open the picker if co-op submission failed so the
+                    // blocking special panel never stays hidden.
+                    if self.shop_snapshot.is_some() {
+                        self.shop_dialog.open();
+                    } else {
+                        self.active_special_panel = None;
+                        self.sync_special_panel();
+                    }
+                }
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+            ShopCommand::TryOn { item_id } => {
+                let mut tried_name = item_id.clone();
+                if let Some(snap) = &mut self.shop_snapshot {
+                    snap.tried_on_item_id = Some(item_id.clone());
+                    if let Some(item) = snap.items.iter().find(|i| i.id == item_id) {
+                        tried_name = item.name.clone();
+                    }
+                }
+                self.note = Some(format!("Previewing {tried_name}."));
+                self.hud.play(crate::hud::CLICK);
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+            ShopCommand::Buy { item_id, .. } => {
+                if let Some(resp) = active.responses.get(&item_id).cloned() {
+                    if self.answer_special_panel(resp) {
+                        self.hud.play(crate::hud::CLICK);
+                    } else {
+                        self.hud.play(crate::hud::ERROR);
+                        if self.shop_snapshot.is_some() {
+                            self.shop_dialog.open();
+                        } else {
+                            self.active_special_panel = None;
+                            self.sync_special_panel();
+                        }
+                    }
+                } else {
+                    self.hud.play(crate::hud::ERROR);
+                }
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+        }
+    }
+
+    fn person_display_name(&self, world: &sims_sim::World, object_id: u16) -> Option<String> {
+        let obj = world.objects.get(&object_id)?;
+        self.lot
+            .character_names()
+            .get(&obj.guid)
+            .cloned()
+            .or_else(|| self.hud.name(obj.guid).map(str::to_owned))
+    }
+
+    fn build_reference_book_content(
+        &self,
+        world: &sims_sim::World,
+        caller: Option<u16>,
+        is_cookbook: bool,
+    ) -> (String, String) {
+        let base_title = if is_cookbook { "Cookbook" } else { "Spellbook" };
+        let caller_name = caller.and_then(|id| self.person_display_name(world, id));
+        let title = match &caller_name {
+            Some(name) => format!("{base_title} — {name}"),
+            None => base_title.to_owned(),
+        };
+        let neighbor_id = caller
+            .and_then(|id| world.objects.get(&id))
+            .and_then(|o| o.person.as_ref())
+            .and_then(|p| p.data.get(31).copied())
+            .filter(|&nid| nid > 0);
+        let mut entries: Vec<String> = Vec::new();
+        if let Some(nid) = neighbor_id
+            && let Some(inv) = world
+                .neighbors
+                .inventories
+                .iter()
+                .find(|i| i.neighbor == nid)
+        {
+            for item in &inv.items {
+                if item.count == 0 {
+                    continue;
+                }
+                // Kind 7 holds magic tokens/spells/ingredients; kind 8/9 hold recipes/charms.
+                let relevant = if is_cookbook {
+                    matches!(item.kind, 7..=9)
+                } else {
+                    matches!(item.kind, 7 | 8)
+                };
+                if !relevant {
+                    continue;
+                }
+                let label = self
+                    .catalog_object_name(item.guid)
+                    .unwrap_or_else(|| format!("0x{:08X}", item.guid));
+                if item.count > 1 {
+                    entries.push(format!("{label} (x{})", item.count));
+                } else {
+                    entries.push(label);
+                }
+            }
+        }
+        const MAX_BOOK_LINES: usize = 6;
+        const MAX_LINE_CHARS: usize = 36;
+        let clamp_line = |s: &str| -> String {
+            let mut chars = s.chars();
+            let head: String = chars.by_ref().take(MAX_LINE_CHARS).collect();
+            if chars.next().is_some() {
+                format!("{head}...")
+            } else {
+                head
+            }
+        };
+        let body = if entries.is_empty() {
+            "—".to_owned()
+        } else if entries.len() > MAX_BOOK_LINES {
+            let remaining = entries.len() - (MAX_BOOK_LINES - 1);
+            let mut shown: Vec<String> = entries[..(MAX_BOOK_LINES - 1)]
+                .iter()
+                .map(|e| clamp_line(e))
+                .collect();
+            shown.push(format!("+{remaining}"));
+            shown.join("\n")
+        } else {
+            entries
+                .iter()
+                .map(|e| clamp_line(e))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        (title, body)
+    }
+
+    fn catalog_object_name(&self, guid: u32) -> Option<String> {
+        let catalog = self.assets.catalog();
+        let obj = catalog
+            .by_guid
+            .get(&guid)
+            .and_then(|&idx| catalog.objects.get(idx))?;
+        let bytes = self
+            .assets
+            .index()
+            .resources
+            .get(obj.resource)?
+            .read()
+            .ok()?;
+        let iff = sims_formats::iff::Iff::parse(bytes).ok()?;
+        if let Some(chunk) = iff.get(b"OBJD", obj.chunk) {
+            if let Ok(def) = sims_formats::behavior::ObjectDefinition::parse(iff.data(chunk)) {
+                let ctss_id = def.catalog;
+                if ctss_id > 0
+                    && let Some(ctss) = iff.get(b"CTSS", ctss_id)
+                    && let Ok(table) = sims_formats::strings::StringTable::parse(iff.data(ctss))
+                    && let Some(name) = table
+                        .get(0, US_ENGLISH)
+                        .or_else(|| table.get(0, 1))
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                {
+                    return Some(name.to_owned());
+                }
+            }
+            let chunk_label = chunk.label.trim();
+            if !chunk_label.is_empty() {
+                return Some(chunk_label.to_owned());
+            }
+        }
+        None
+    }
+
+    fn resolve_special_lot_entries(&self) -> Vec<SpecialLotEntry> {
+        if !self.special_lot_catalog.is_empty() {
+            return self.special_lot_catalog.clone();
+        }
+        let install = self.hud.install();
+        let user_dir = install
+            .file("UserData")
+            .or_else(|_| install.file("TemplateUserData"))
+            .unwrap_or_else(|_| install.root.clone());
+        let street_names = crate::neighborhood::StreetNames::load(install, &user_dir);
+        let descriptions = crate::neighborhood::NeighborhoodDescriptions::load(install, &user_dir);
+        let mut zoning: BTreeMap<u16, i16> = BTreeMap::new();
+        let mut discovered: BTreeSet<u16> = BTreeSet::new();
+        let expansions = u16::from(install.expansions.0);
+        if let Ok(nb) = Neighborhood::open(&user_dir) {
+            if let Ok(houses) = nb.houses() {
+                for (num, _) in houses {
+                    if let Ok(id) = u16::try_from(num) {
+                        discovered.insert(id);
+                    }
+                }
+            }
+            if let Ok(nb_zoning) = nb.zoning(expansions) {
+                for (lot, zone) in nb_zoning {
+                    if let Ok(id) = u16::try_from(lot) {
+                        zoning.insert(id, zone as i16);
+                    }
+                }
+            }
+        }
+        if let Ok(tpl_dir) = install.file("TemplateUserData")
+            && let Ok(nb) = Neighborhood::open(&tpl_dir)
+            && let Ok(houses) = nb.houses()
+        {
+            for (num, _) in houses {
+                if let Ok(id) = u16::try_from(num) {
+                    discovered.insert(id);
+                }
+            }
+            if let Ok(nb_zoning) = nb.zoning(expansions) {
+                for (lot, zone) in nb_zoning {
+                    if let Ok(id) = u16::try_from(lot) {
+                        zoning.entry(id).or_insert(zone as i16);
+                    }
+                }
+            }
+        }
+        discovered
+            .into_iter()
+            .map(|lot_id| {
+                let (name, description) = descriptions.lot_info(lot_id);
+                let address = street_names.address_for(lot_id);
+                let z = zoning.get(&lot_id).copied().unwrap_or(match lot_id {
+                    21..=30 | 40..=48 | 81..=89 | 93..=98 => 2,
+                    _ => 1,
+                });
+                SpecialLotEntry {
+                    lot_id,
+                    name,
+                    address,
+                    description,
+                    zoning: z,
+                }
+            })
+            .collect()
+    }
+
+    fn build_destination_lot_picker(
+        &self,
+        request: &SpecialPanelRequest,
+        _world: &sims_sim::World,
+    ) -> (
+        ShopKind,
+        Option<String>,
+        Vec<ShopItem>,
+        BTreeMap<String, SpecialPanelResponse>,
+    ) {
+        let entries = self.resolve_special_lot_entries();
+        let shop_kind = match request {
+            SpecialPanelRequest::DowntownLotPicker => {
+                ShopKind::DowntownBoutique(WardrobeCategory::Formal)
+            }
+            SpecialPanelRequest::VacationLotPicker { .. } => ShopKind::VacationKiosk,
+            SpecialPanelRequest::OldTownLotPicker { .. } => ShopKind::PetAdoption,
+            SpecialPanelRequest::StudioTownLotPicker { .. } => ShopKind::StudioWardrobe,
+            SpecialPanelRequest::MagicTownLotPicker { .. } => ShopKind::MagicVendor,
+            _ => ShopKind::MagicVendor,
+        };
+        let travel_strings =
+            sims_ui::travel::TravelStrings::load(self.hud.install(), US_ENGLISH).ok();
+        let non_empty = |s: Option<&String>| -> Option<String> {
+            s.map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        let title_override = match request {
+            SpecialPanelRequest::DowntownLotPicker => travel_strings
+                .as_ref()
+                .and_then(|ts| non_empty(ts.go_downtown_dialog.first()))
+                .or_else(|| Some("21-30".into())),
+            SpecialPanelRequest::VacationLotPicker { .. } => travel_strings
+                .as_ref()
+                .and_then(|ts| non_empty(ts.go_vacation_dialog.first())),
+            SpecialPanelRequest::OldTownLotPicker { .. } => travel_strings
+                .as_ref()
+                .and_then(|ts| non_empty(ts.visit_neighborhood.first()))
+                .or_else(|| Some("58-68".into())),
+            SpecialPanelRequest::StudioTownLotPicker { .. } => None,
+            SpecialPanelRequest::MagicTownLotPicker { .. } => travel_strings
+                .as_ref()
+                .and_then(|ts| non_empty(ts.visit_magic_town.first())),
+            _ => None,
+        };
+
+        let filtered: Vec<SpecialLotEntry> = entries
+            .into_iter()
+            .filter(|e| match request {
+                SpecialPanelRequest::DowntownLotPicker => (21..=30).contains(&e.lot_id),
+                SpecialPanelRequest::VacationLotPicker { .. } => (40..=48).contains(&e.lot_id),
+                SpecialPanelRequest::OldTownLotPicker { .. } => {
+                    e.zoning == 2
+                        && !(21..=30).contains(&e.lot_id)
+                        && !(40..=48).contains(&e.lot_id)
+                        && !(81..=89).contains(&e.lot_id)
+                        && !(90..=98).contains(&e.lot_id)
+                }
+                SpecialPanelRequest::StudioTownLotPicker { .. } => (81..=89).contains(&e.lot_id),
+                SpecialPanelRequest::MagicTownLotPicker { .. } => (93..=98).contains(&e.lot_id),
+                _ => false,
+            })
+            .collect();
+
+        let mut items = Vec::with_capacity(filtered.len());
+        let mut responses = BTreeMap::new();
+        for entry in filtered {
+            let id = format!("special_lot:{}", entry.lot_id);
+            let display_name = if !entry.name.trim().is_empty() {
+                entry.name.trim().to_owned()
+            } else if let Some(addr) = entry.address.as_deref().filter(|a| !a.trim().is_empty()) {
+                addr.trim().to_owned()
+            } else {
+                format!("#{}", entry.lot_id)
+            };
+            let description = if !entry.description.trim().is_empty() {
+                entry.description.trim().to_owned()
+            } else if let Some(addr) = entry.address.as_deref().filter(|a| !a.trim().is_empty()) {
+                addr.trim().to_owned()
+            } else {
+                format!("#{}", entry.lot_id)
+            };
+            items.push(ShopItem {
+                id: id.clone(),
+                name: display_name,
+                description,
+                price: 0,
+                currency: CurrencyKind::Simoleons,
+                icon: None,
+                supports_try_on: false,
+                owned: false,
+                available: true,
+            });
+            responses.insert(id, SpecialPanelResponse::Lot(Some(entry.lot_id as i16)));
+        }
+        (shop_kind, title_override, items, responses)
+    }
+
+    fn format_wardrobe_row_label(suit: &str, row: &str) -> String {
+        if let Some((_, desc)) = row.split_once(',')
+            && let Some((_, tex)) = desc.split_once('=')
+        {
+            let tex = tex.trim();
+            if !tex.is_empty() && !tex.eq_ignore_ascii_case(suit) {
+                return format!("{suit} ({tex})");
+            }
+        }
+        suit.to_owned()
+    }
+
+    fn person_skin_tone(&self, world: &sims_sim::World, person: u16) -> String {
+        let Some(obj) = world.objects.get(&person) else {
+            return "lgt".into();
+        };
+        let normalize = |raw: &str| -> Option<String> {
+            let prefix: String = raw.trim().chars().take(3).collect();
+            if prefix.eq_ignore_ascii_case("lgt")
+                || prefix.eq_ignore_ascii_case("med")
+                || prefix.eq_ignore_ascii_case("drk")
+            {
+                Some(prefix.to_ascii_lowercase())
+            } else {
+                None
+            }
+        };
+        if let Some(outfits) = world.made_outfits.get(&obj.guid)
+            && let Some(raw) = outfits.get(&14)
+            && let Some(tone) = normalize(raw)
+        {
+            return tone;
+        }
+        let catalog = self.assets.catalog();
+        if let Some(entry) = catalog
+            .by_guid
+            .get(&obj.guid)
+            .and_then(|&idx| catalog.objects.get(idx))
+            && let Some(res) = self.assets.index().resources.get(entry.resource)
+            && let Ok(bytes) = res.read()
+            && let Ok(iff) = sims_formats::iff::Iff::parse(bytes)
+            && let Some(chunk) = iff.get(b"STR#", 200)
+            && let Ok(table) = sims_formats::strings::StringTable::parse(iff.data(chunk))
+            && let Some(raw) = table.get(14, US_ENGLISH).or_else(|| table.get(14, 1))
+            && let Some(tone) = normalize(raw)
+        {
+            return tone;
+        }
+        "lgt".into()
+    }
+
+    fn ensure_ordered_wardrobe(&mut self) -> Option<&sims_content::ImportWardrobe> {
+        if self.ordered_wardrobe.is_none()
+            && let Ok((wardrobe, _)) =
+                sims_content::ImportWardrobe::load_lenient(self.hud.install())
+        {
+            self.ordered_wardrobe = Some(wardrobe);
+        }
+        self.ordered_wardrobe.as_ref()
+    }
+
+    fn build_wardrobe_picker_items(
+        &mut self,
+        world: &sims_sim::World,
+        person: u16,
+        mode: i16,
+    ) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
+        let mut entries: Vec<(usize, String)> = Vec::new();
+        if mode == 0 {
+            let (female, child) = world
+                .objects
+                .get(&person)
+                .and_then(|o| o.person.as_ref())
+                .map(|p| {
+                    let kind = p.data.get(sims_sim::neighbors::KIND).copied().unwrap_or(0);
+                    let age = p.data.get(58).copied().unwrap_or(27);
+                    ((kind & 1) == 1, age < 18)
+                })
+                .unwrap_or((false, false));
+            let skin = self.person_skin_tone(world, person);
+            if let Some(wardrobe) = self.ensure_ordered_wardrobe() {
+                let count = wardrobe.count(false, female, child, &skin).min(32);
+                for idx in 0..count {
+                    if let Some((suit, row)) = wardrobe.pick(false, female, child, &skin, idx) {
+                        entries.push((idx, Self::format_wardrobe_row_label(&suit, &row)));
+                    }
+                }
+            }
+        }
+        if entries.is_empty() {
+            let prefix = match mode {
+                1 => "s",
+                2 => "f",
+                3 => "l",
+                4 => "w",
+                5 => "h",
+                _ => "b",
+            };
+            let names = self.scan_install_skin_names(
+                &["ExpansionShared/SkinsBuy", "GameData/Skins"],
+                Some(prefix),
+                32,
+            );
+            entries = names.into_iter().enumerate().collect();
+        }
+        let mut items = Vec::with_capacity(entries.len());
+        let mut responses = BTreeMap::new();
+        for (idx, name) in entries {
+            let id = format!("special_wardrobe:{idx}");
+            items.push(ShopItem {
+                id: id.clone(),
+                name,
+                description: format!("#{idx}"),
+                price: 0,
+                currency: CurrencyKind::Simoleons,
+                icon: None,
+                supports_try_on: true,
+                owned: false,
+                available: true,
+            });
+            responses.insert(
+                id,
+                SpecialPanelResponse::Selection {
+                    accepted: true,
+                    index: idx as i16,
+                },
+            );
+        }
+        (items, responses)
+    }
+
+    fn build_pet_picker_items(
+        &mut self,
+        world: &sims_sim::World,
+        pet: u16,
+    ) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
+        let is_cat = world
+            .objects
+            .get(&pet)
+            .and_then(|o| o.person.as_ref())
+            .and_then(|p| p.data.get(sims_sim::neighbors::KIND).copied())
+            .is_some_and(|kind| {
+                sims_ui::household::PetKind::from_kind(kind)
+                    == Some(sims_ui::household::PetKind::Cat)
+            });
+        // Match `sims-vm`'s exact native `ImportWardrobe::pick_pet(is_cat, idx)` ordering.
+        let mut entries: Vec<(usize, String)> = Vec::new();
+        if let Some(wardrobe) = self.ensure_ordered_wardrobe() {
+            let count = wardrobe.count_pet(is_cat).min(64);
+            for idx in 0..count {
+                if let Some((suit, row)) = wardrobe.pick_pet(is_cat, idx) {
+                    let label = Self::format_wardrobe_row_label(&suit, &row);
+                    entries.push((idx, label));
+                }
+            }
+        }
+        let mut items = Vec::with_capacity(entries.len());
+        let mut responses = BTreeMap::new();
+        for (idx, name) in entries {
+            let id = format!("special_pet:{idx}");
+            items.push(ShopItem {
+                id: id.clone(),
+                name,
+                description: format!("#{idx}"),
+                price: 0,
+                currency: CurrencyKind::Simoleons,
+                icon: None,
+                supports_try_on: false,
+                owned: false,
+                available: true,
+            });
+            responses.insert(
+                id,
+                SpecialPanelResponse::Selection {
+                    accepted: true,
+                    index: idx as i16,
+                },
+            );
+        }
+        (items, responses)
+    }
+
+    fn build_charm_transform_items(
+        &mut self,
+        world: &sims_sim::World,
+        person: u16,
+    ) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
+        let _ = (world, person);
+        let names = self.scan_install_skin_names(
+            &[
+                "ExpansionPack7/Skins",
+                "ExpansionShared/SkinsBuy",
+                "GameData/Skins",
+            ],
+            Some("b"),
+            24,
+        );
+        let mut items = Vec::with_capacity(names.len());
+        let mut responses = BTreeMap::new();
+        for (idx, name) in names.into_iter().enumerate() {
+            let id = format!("special_charm:{idx}");
+            items.push(ShopItem {
+                id: id.clone(),
+                name,
+                description: format!("#{idx}"),
+                price: 0,
+                currency: CurrencyKind::MagiCoins,
+                icon: None,
+                supports_try_on: true,
+                owned: false,
+                available: true,
+            });
+            responses.insert(
+                id,
+                SpecialPanelResponse::Selection {
+                    accepted: true,
+                    index: idx as i16,
+                },
+            );
+        }
+        (items, responses)
+    }
+
+    fn build_call_neighbor_items(
+        &self,
+        world: &sims_sim::World,
+        caller_neighbor: i16,
+    ) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
+        let caller_rels: BTreeMap<i32, (i32, i32)> = world
+            .neighbors
+            .slots
+            .iter()
+            .flatten()
+            .find(|r| r.id == caller_neighbor)
+            .map(|r| {
+                r.relationships
+                    .iter()
+                    .map(|row| {
+                        let daily = row.values.first().copied().unwrap_or(0);
+                        let life = row.values.get(1).copied().unwrap_or(0);
+                        (row.target, (daily, life))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut items = Vec::new();
+        let mut responses = BTreeMap::new();
+        for record in world.neighbors.slots.iter().flatten() {
+            if record.id <= 0 || record.id == caller_neighbor {
+                continue;
+            }
+            let name = self
+                .lot
+                .character_names()
+                .get(&record.guid)
+                .cloned()
+                .or_else(|| self.hud.name(record.guid).map(str::to_owned))
+                .unwrap_or_else(|| format!("#{}", record.id));
+            let (daily, life) = caller_rels
+                .get(&i32::from(record.id))
+                .copied()
+                .unwrap_or((0, 0));
+            let id = format!("special_neighbor:{}", record.id);
+            items.push(ShopItem {
+                id: id.clone(),
+                name,
+                description: format!("{daily} / {life}"),
+                price: 0,
+                currency: CurrencyKind::Simoleons,
+                icon: self.hud.face(record.guid).cloned(),
+                supports_try_on: false,
+                owned: false,
+                available: true,
+            });
+            responses.insert(id, SpecialPanelResponse::Neighbor(Some(record.id)));
+        }
+        (items, responses)
+    }
+
+    fn scan_install_skin_names(
+        &self,
+        dirs: &[&str],
+        prefix: Option<&str>,
+        limit: usize,
+    ) -> Vec<String> {
+        let install = self.hud.install();
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
+        for rel in dirs {
+            let Ok(dir) = install.file(rel) else {
+                continue;
+            };
+            let Ok(read_dir) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                    continue;
+                };
+                if !ext.eq_ignore_ascii_case("bmp") && !ext.eq_ignore_ascii_case("cmx") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let lower = stem.to_ascii_lowercase();
+                if let Some(p) = prefix
+                    && !lower.starts_with(p)
+                {
+                    continue;
+                }
+                seen.entry(lower).or_insert_with(|| stem.to_owned());
+            }
+        }
+        // Sort deterministically across the full scan before applying `limit`.
+        seen.into_values().take(limit).collect()
+    }
+
+    /// Crops the rendered lot canvas to the active Camera Mode `SnapshotSize`
+    /// centered on the frame (clamped to canvas bounds) so selecting Small,
+    /// Medium, Large, or Custom changes the saved PNG snapshot dimensions.
+    pub fn capture_snapshot_canvas(&self) -> Canvas {
+        let state = self.hud.camera_state();
+        let [req_w, req_h] = state.size.dimensions(state.custom_dimensions);
+        let src_w = self.canvas.width;
+        let src_h = self.canvas.height;
+        if src_w == 0 || src_h == 0 || req_w == 0 || req_h == 0 {
+            return self.canvas.clone();
+        }
+        let crop_w = (req_w as usize).min(src_w);
+        let crop_h = (req_h as usize).min(src_h);
+        if crop_w == src_w && crop_h == src_h {
+            return self.canvas.clone();
+        }
+        let x0 = (src_w - crop_w) / 2;
+        let y0 = (src_h - crop_h) / 2;
+        let mut out = Canvas::new(crop_w, crop_h, [0, 0, 0]);
+        for y in 0..crop_h {
+            let src_row = (y0 + y) * src_w + x0;
+            let dst_row = y * crop_w;
+            out.color[dst_row..dst_row + crop_w]
+                .copy_from_slice(&self.canvas.color[src_row..src_row + crop_w]);
+        }
+        out
     }
 
     // -------------------------------------------------------------------------
@@ -7982,7 +9160,35 @@ impl Game {
             stats.snapshots_restored += 1;
         }
         stats.drift_events += poll2.drift_events as u32;
+        self.tick_coop_special_panel_retry();
         Ok(stats)
+    }
+
+    /// Bounded retry guard shared by both headless (`coop_pump`) and live
+    /// (`advance_coop_while`) co-op loops: if a peer's special-panel answer was
+    /// dropped by full host ingress while the same dialog ID remains active,
+    /// reopen the modal so the client can retry instead of waiting forever.
+    fn tick_coop_special_panel_retry(&mut self) -> bool {
+        const COOP_SPECIAL_PANEL_RETRY_PUMPS: u32 = 120;
+        let Some((submitted_id, ref mut pumps)) = self.submitted_coop_special_panel else {
+            return false;
+        };
+        let still_active = self
+            .lot
+            .coop()
+            .and_then(|c| c.active_special_panel.as_ref().map(|(id, _)| *id))
+            == Some(submitted_id);
+        if still_active {
+            *pumps = pumps.saturating_add(1);
+            if *pumps >= COOP_SPECIAL_PANEL_RETRY_PUMPS {
+                self.submitted_coop_special_panel = None;
+                self.sync_special_panel();
+                return true;
+            }
+        } else {
+            self.submitted_coop_special_panel = None;
+        }
+        false
     }
 
     /// Gracefully leaves any active co-op session, detaching `Lot::coop` and
@@ -7991,6 +9197,7 @@ impl Game {
         let was_remote = self.coop_remote_world;
         self.coop_buy_preview = None;
         self.coop_overlay_buttons = CoopOverlayButtons::default();
+        self.submitted_coop_special_panel = None;
         self.coop.leave_and_shutdown(&mut self.lot);
         self.note = Some(if was_remote {
             "Disconnected from co-op session (read-only remote lot; return to Neighborhood for local saves)."
@@ -8006,6 +9213,7 @@ impl Game {
         let was_remote = self.coop_remote_world;
         self.coop_buy_preview = None;
         self.coop_overlay_buttons = CoopOverlayButtons::default();
+        self.submitted_coop_special_panel = None;
         self.coop.leave_nonblocking(&mut self.lot);
         self.note = Some(if was_remote {
             "Disconnected from co-op session (read-only remote lot; return to Neighborhood for local saves)."
@@ -8171,6 +9379,9 @@ impl Game {
             }
         }
 
+        if self.tick_coop_special_panel_retry() {
+            self.blink_dirty = true;
+        }
         if any_batch || poll.snapshot_restored {
             self.dirty = true;
             self.blink_dirty = true;
@@ -8194,7 +9405,14 @@ impl Game {
         if report.opened_dialog.is_some() {
             self.hud.clear_vm_dialog();
         }
-        let mut visual_changed = report.stepped || report.opened_dialog.is_some();
+        if report.opened_special_panel.is_some() {
+            self.submitted_coop_special_panel = None;
+            self.close_special_panel_ui();
+            self.sync_special_panel();
+        }
+        let mut visual_changed = report.stepped
+            || report.opened_dialog.is_some()
+            || report.opened_special_panel.is_some();
         for (stamped, status) in &report.command_results {
             match status {
                 sims_vm::coop::CoopCommandStatus::BuyBuildApplied
@@ -8207,17 +9425,27 @@ impl Game {
                 sims_vm::coop::CoopCommandStatus::Refused(reason)
                     if Some(stamped.issuer) == self.coop.local_player_id() =>
                 {
+                    self.submitted_coop_special_panel = None;
+                    visual_changed = true;
                     self.note = Some(format!("Co-op command refused: {reason}"));
                 }
                 sims_vm::coop::CoopCommandStatus::RejectedBySession(reason)
                     if Some(stamped.issuer) == self.coop.local_player_id() =>
                 {
+                    self.submitted_coop_special_panel = None;
+                    visual_changed = true;
                     self.note = Some(format!("Co-op command rejected: {reason:?}"));
                 }
                 _ => {}
             }
         }
         if visual_changed {
+            if self.lot.asking_special_panel().is_none() {
+                self.submitted_coop_special_panel = None;
+                self.close_special_panel_ui();
+            } else {
+                self.sync_special_panel();
+            }
             self.hud.sync_character_names(self.lot.character_names());
             let world = self.lot.world();
             self.people.refresh(world);
@@ -8252,7 +9480,11 @@ impl Game {
         self.reached = None;
         self.listed = None;
         self.highlighted = None;
+        self.submitted_coop_special_panel = None;
+        self.close_special_panel_ui();
+        self.pending_travel_lot = None;
         self.hud.clear_vm_dialog();
+        self.sync_special_panel();
         self.hud.sync_character_names(self.lot.character_names());
         self.people.refresh(self.lot.world());
         if let Ok(shape) = sims_render::Lot::from_world(self.lot.world()) {
@@ -9066,6 +10298,26 @@ fn terrain_overlay_for_drag(start: [i32; 2], end: [i32; 2], mode: TerrainMode) -
                 TerrainTarget::Rect { start, end }
             },
         },
+    }
+}
+
+fn special_panel_cancel_response(request: &SpecialPanelRequest) -> SpecialPanelResponse {
+    match request {
+        SpecialPanelRequest::DowntownLotPicker
+        | SpecialPanelRequest::VacationLotPicker { .. }
+        | SpecialPanelRequest::OldTownLotPicker { .. }
+        | SpecialPanelRequest::StudioTownLotPicker { .. }
+        | SpecialPanelRequest::MagicTownLotPicker { .. } => SpecialPanelResponse::Lot(None),
+        SpecialPanelRequest::CallNeighbor { .. } => SpecialPanelResponse::Neighbor(None),
+        SpecialPanelRequest::WardrobeShop { .. }
+        | SpecialPanelRequest::PetPicker { .. }
+        | SpecialPanelRequest::CharmTransform { .. } => SpecialPanelResponse::Selection {
+            accepted: false,
+            index: 0,
+        },
+        SpecialPanelRequest::SpellBook { .. } | SpecialPanelRequest::CookBook { .. } => {
+            SpecialPanelResponse::Dismissed
+        }
     }
 }
 

@@ -18,8 +18,8 @@ use crate::autosave_worker::{
 };
 use crate::caf_screen::{CafOutcome, CafSession};
 use crate::coop::default_player_name;
-use crate::game::Game;
-use crate::hud::DialogKey;
+use crate::game::{Game, SpecialLotEntry};
+use crate::hud::{DIALOG_FADE_DURATION_MS, DialogKey};
 use crate::sound::{self, Input};
 use sims_audio::SoundEvent;
 use sims_audio::music::MusicMode;
@@ -30,7 +30,7 @@ use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 use sims_render::camera::{Camera, Walls, Zoom};
 use sims_render::neighborhood::{
-    COLOR_KEY_565, CommunityFilter, LotStatus, LotZoning, MapLot, NeighborhoodKind,
+    COLOR_KEY_565, CommunityFilter, HoverFadeState, LotStatus, LotZoning, MapLot, NeighborhoodKind,
     NeighborhoodMap, RenderOptions, Surface565, pack_565,
 };
 use sims_render::{Canvas, Focus};
@@ -48,7 +48,7 @@ use sims_ui::album::{
 use sims_ui::art::Art;
 use sims_ui::command::Command;
 use sims_ui::coop::{CoopCommand, CoopLobbyDialog, CoopSnapshot, LobbyTab};
-use sims_ui::dialog::{self, DialogState, FrameStyle, Labels, Message};
+use sims_ui::dialog::{self, DialogFadeState, DialogState, FrameStyle, Labels, Message};
 use sims_ui::family_bin::{
     FamilyBin, FamilyBinCommand, FamilyBinMode, FamilyBinStrings, FamilyBinView, FamilyEntry,
     FamilyMemberPortrait,
@@ -200,13 +200,13 @@ struct CustomThumb {
 
 /// Parsed `StreetNames.iff` street templates and lot assignments.
 #[derive(Debug, Clone, Default)]
-struct StreetNames {
+pub(crate) struct StreetNames {
     streets: Vec<String>,
     assignments: Vec<Option<usize>>,
 }
 
 impl StreetNames {
-    fn load(install: &Install, user_dir: &Path) -> Self {
+    pub(crate) fn load(install: &Install, user_dir: &Path) -> Self {
         let candidate = resolve_child_case_insensitive(user_dir, "StreetNames.iff")
             .or_else(|| install.file("TemplateUserData/StreetNames.iff").ok());
         let Some(path) = candidate else {
@@ -257,7 +257,7 @@ impl StreetNames {
 
     /// Formats the street address for 1-based `lot_number` if `StreetNames.iff`
     /// assigns a street to it.
-    fn address_for(&self, lot_number: u16) -> Option<String> {
+    pub(crate) fn address_for(&self, lot_number: u16) -> Option<String> {
         let idx = usize::from(lot_number).checked_sub(1)?;
         let street_idx = (*self.assignments.get(idx)?)?;
         let template = self.streets.get(street_idx).filter(|s| !s.is_empty())?;
@@ -271,12 +271,12 @@ impl StreetNames {
 /// entries 0 (name) and 1 (description) from `DTDesc.iff`, `VIDesc.iff`,
 /// `STDesc.iff`, `MTDesc.iff`, or `NeighborhoodDesc.iff`.
 #[derive(Debug, Clone, Default)]
-struct NeighborhoodDescriptions {
+pub(crate) struct NeighborhoodDescriptions {
     houses_dirs: Vec<PathBuf>,
 }
 
 impl NeighborhoodDescriptions {
-    fn load(install: &Install, user_dir: &Path) -> Self {
+    pub(crate) fn load(install: &Install, user_dir: &Path) -> Self {
         let mut houses_dirs = Vec::new();
         for dir in [
             Some(user_dir.to_path_buf()),
@@ -295,7 +295,7 @@ impl NeighborhoodDescriptions {
         Self { houses_dirs }
     }
 
-    fn lot_info(&self, lot_number: u16) -> (String, String) {
+    pub(crate) fn lot_info(&self, lot_number: u16) -> (String, String) {
         let desc_file = match lot_number {
             21..=30 => "DTDesc.iff",
             40..=48 => "VIDesc.iff",
@@ -527,6 +527,11 @@ pub struct NeighborhoodShell {
     hovered_lot_since_us: Option<u64>,
     /// Lot ID whose House Info card is currently popped in `nbhd_state.hovered_lot`.
     hover_card_shown_for: Option<u16>,
+    /// 300 ms native per-lot roof cross-fade state (`cWinLot`, `0x54ea7f..0x54eb3d`).
+    hover_fade: HoverFadeState,
+    /// Tracks whether any roof cross-fade was actively animating on the last tick
+    /// so the final landed frame is always drawn before idle wakes stop.
+    hover_fade_was_animating: bool,
     pressed_lot_id: Option<u16>,
     move_in_family_id: Option<u16>,
 
@@ -546,6 +551,9 @@ pub struct NeighborhoodShell {
 
     // Modal confirmation / notice dialog over Neighborhood or Family Bin.
     dialog: Option<ShellDialog>,
+    /// Opacity fade-in state for shell confirmation / notice dialogs (`cTSWinFade`).
+    dialog_fade: DialogFadeState,
+    dialog_fade_was_animating: bool,
     // Household Photo Album / Storybook modal (overlay over Lot or Neighborhood).
     album_dialog: PhotoAlbumDialog,
     album_snapshot: Option<AlbumSnapshot>,
@@ -770,6 +778,8 @@ impl NeighborhoodShell {
             hovered_lot_id: None,
             hovered_lot_since_us: None,
             hover_card_shown_for: None,
+            hover_fade: HoverFadeState::new(),
+            hover_fade_was_animating: false,
             pressed_lot_id: None,
             move_in_family_id: None,
             travel_chrome: TravelChrome::new(),
@@ -783,6 +793,8 @@ impl NeighborhoodShell {
             family_bin: FamilyBin::new(),
             family_bin_entries,
             dialog: None,
+            dialog_fade: DialogFadeState::hidden(),
+            dialog_fade_was_animating: false,
             album_dialog: PhotoAlbumDialog::new(album_strings),
             album_snapshot: None,
             album_token: None,
@@ -1152,6 +1164,50 @@ impl NeighborhoodShell {
         self.hovered_lot_id
     }
 
+    fn now_ms(&self) -> u64 {
+        self.clock_us / 1_000
+    }
+
+    fn update_hover_fade(&mut self, prev_lot: Option<u16>, hovered: Option<u16>) {
+        if self.clock_us > 0 {
+            let now_ms = self.clock_us / 1_000;
+            // If `prev_lot` was hovered at `clock_us == 0` (rendered settled at
+            // 1.0 without starting a hidden ramp), seed it as settled before
+            // transitioning so moving away fades its roof back in smoothly.
+            if self.hover_fade.hovered().is_none()
+                && let Some(prev) = prev_lot
+                && prev_lot != hovered
+            {
+                let seed_ms =
+                    now_ms.saturating_sub(sims_render::neighborhood::HOVER_FADE_DURATION_MS);
+                self.hover_fade.set_hovered(Some(prev), seed_ms);
+            }
+            self.hover_fade.set_hovered(hovered, now_ms);
+            self.hover_fade_was_animating = self.hover_fade.is_animating(now_ms);
+        } else {
+            self.hover_fade.reset();
+            self.hover_fade_was_animating = false;
+        }
+    }
+
+    /// Whether any Neighborhood lot roof cross-fade (300 ms `cWinLot` ramp) is
+    /// actively transitioning at the current presentation clock.
+    pub fn has_active_fades(&self) -> bool {
+        self.clock_us > 0
+            && matches!(self.screen, ActiveScreen::Neighborhood)
+            && self.hover_fade.is_animating(self.now_ms())
+    }
+
+    /// Current Neighborhood hover roof cross-fade tracker (`HoverFadeState`).
+    pub fn hover_fade_state(&self) -> &HoverFadeState {
+        &self.hover_fade
+    }
+
+    /// Current shell modal dialog fade state (`DialogFadeState`).
+    pub fn dialog_fade_state(&self) -> &DialogFadeState {
+        &self.dialog_fade
+    }
+
     /// Current water ripple animation frame index on the Neighborhood map.
     pub fn water_frame(&self) -> usize {
         self.water_frame
@@ -1249,6 +1305,8 @@ impl NeighborhoodShell {
             ActiveScreen::Lot(session) => session.game.is_actively_interacting(),
             ActiveScreen::Neighborhood => {
                 self.dialog.is_some()
+                    || self.has_active_fades()
+                    || (self.clock_us > 0 && self.dialog_fade.is_animating(self.now_ms() as u32))
                     || !matches!(self.nbhd_state.mode, NeighborhoodMode::Normal)
                     || self.pressed_lot_id.is_some()
             }
@@ -1335,6 +1393,16 @@ impl NeighborhoodShell {
         if self.coop_lobby.is_open() && self.coop_lobby.sync_blink(self.clock_us) {
             redraw = true;
         }
+        if self.dialog.is_some() {
+            let now_ms = self.now_ms() as u32;
+            let anim = self.clock_us > 0 && self.dialog_fade.is_animating(now_ms);
+            if anim || self.dialog_fade_was_animating {
+                redraw = true;
+            }
+            self.dialog_fade_was_animating = anim;
+        } else {
+            self.dialog_fade_was_animating = false;
+        }
         match &mut self.screen {
             ActiveScreen::Loading(_) => {
                 let ms = (delta_us / 1_000).max(u64::from(delta_us > 0));
@@ -1342,6 +1410,14 @@ impl NeighborhoodShell {
                 redraw = true;
             }
             ActiveScreen::Neighborhood => {
+                let now_ms = self.clock_us / 1_000;
+                let fade_anim_now = self.hover_fade.is_animating(now_ms);
+                if fade_anim_now || self.hover_fade_was_animating {
+                    redraw = true;
+                }
+                self.hover_fade_was_animating = fade_anim_now;
+                self.hover_fade.prune(now_ms);
+
                 let next_wave = (self.clock_us / WATER_STEP_US) as usize;
                 if next_wave != self.water_frame {
                     self.water_frame = next_wave;
@@ -1467,7 +1543,7 @@ impl NeighborhoodShell {
                 } else {
                     None
                 };
-                let opts = RenderOptions {
+                let mut opts = RenderOptions {
                     viewport: [w as u32, h as u32],
                     hovered_lot: self.hovered_lot_id,
                     hover_roofs_off: true,
@@ -1482,6 +1558,20 @@ impl NeighborhoodShell {
                     ),
                     ..RenderOptions::default()
                 };
+                if self.clock_us > 0 {
+                    let now_ms = self.clock_us / 1_000;
+                    self.hover_fade.prune(now_ms);
+                    self.hover_fade.apply_to(&mut opts, now_ms);
+                    // Preserve a zero-clock hover as already settled at 1.0 if
+                    // the clock starts advancing before the pointer moves.
+                    if let Some(lot) = self.hovered_lot_id
+                        && self.hover_fade.hovered() != Some(lot)
+                    {
+                        opts.hovered_lot = Some(lot);
+                        opts.hover_roof_fade = 1.0;
+                        opts.lot_roof_fades.insert(lot, 1.0);
+                    }
+                }
                 self.map.render_into(&mut self.canvas, &opts);
                 let rgb = std::mem::take(&mut self.canvas.color);
                 if let Ok(mut frame) = Frame::from_rgb(w as u32, h as u32, rgb) {
@@ -1588,13 +1678,19 @@ impl NeighborhoodShell {
                 dlg.layout = dialog::layout(self.size, &dlg.message, &self.dialog_art);
             }
             if let Some(layout) = &dlg.layout {
-                dialog::draw_with_state(
+                let alpha = if self.clock_us == 0 {
+                    255
+                } else {
+                    self.dialog_fade.alpha((self.clock_us / 1_000) as u32)
+                };
+                dialog::draw_with_state_alpha(
                     frame,
                     &self.dialog_art,
                     &dlg.message,
                     layout,
                     self.pointer,
                     &dlg.state,
+                    alpha,
                 );
             }
         }
@@ -1697,6 +1793,7 @@ impl NeighborhoodShell {
                     self.hovered_lot_since_us = next_lot.map(|_| self.clock_us);
                     self.hover_card_shown_for = None;
                     self.nbhd_state.hovered_lot = None;
+                    self.update_hover_fade(prev_lot, next_lot);
                 }
                 chrome_changed || next_lot != prev_lot
             }
@@ -1744,11 +1841,12 @@ impl NeighborhoodShell {
                 self.chrome.clear_pointer();
                 self.magic_family_bin_hovered = false;
                 self.magic_family_bin_pressed = false;
-                self.hovered_lot_id = None;
+                let prev_lot = self.hovered_lot_id.take();
                 self.hovered_lot_since_us = None;
                 self.hover_card_shown_for = None;
                 self.pressed_lot_id = None;
                 self.nbhd_state.hovered_lot = None;
+                self.update_hover_fade(prev_lot, None);
                 had_state
             }
             ActiveScreen::FamilyBin => {
@@ -1935,10 +2033,12 @@ impl NeighborhoodShell {
                     };
                     self.pressed_lot_id = hit;
                     if hit != self.hovered_lot_id {
+                        let prev_lot = self.hovered_lot_id;
                         self.hovered_lot_id = hit;
                         self.hovered_lot_since_us = hit.map(|_| self.clock_us);
                         self.hover_card_shown_for = None;
                         self.nbhd_state.hovered_lot = None;
+                        self.update_hover_fade(prev_lot, hit);
                     }
                     return ShellOutcome {
                         redraw: hit.is_some(),
@@ -1960,10 +2060,12 @@ impl NeighborhoodShell {
                         .hit_test_with_state(frame_size, point, self.hovered_lot_id, true);
                 self.pressed_lot_id = hit;
                 if hit != self.hovered_lot_id {
+                    let prev_lot = self.hovered_lot_id;
                     self.hovered_lot_id = hit;
                     self.hovered_lot_since_us = hit.map(|_| self.clock_us);
                     self.hover_card_shown_for = None;
                     self.nbhd_state.hovered_lot = None;
+                    self.update_hover_fade(prev_lot, hit);
                 }
                 ShellOutcome {
                     redraw: hit.is_some(),
@@ -2600,6 +2702,15 @@ impl NeighborhoodShell {
             quit: false,
             photo: outcome.photo,
         };
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.asking().is_none()
+            && session.game.asking_special_panel().is_none()
+            && let Some((request, dest_lot)) = session.game.take_pending_travel_lot()
+        {
+            self.handle_special_panel_travel(request, dest_lot);
+            out.redraw = true;
+            return out;
+        }
         if outcome.open_save_manager {
             self.open_save_manager(None);
             out.redraw = true;
@@ -3153,6 +3264,7 @@ impl NeighborhoodShell {
             let _ = game.load_options(&self.options_file);
         }
         game.set_album_button_enabled(true);
+        game.set_special_lot_catalog(self.build_special_lot_catalog());
         game.set_debug(self.debug);
         game.resize(self.size);
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
@@ -3182,6 +3294,8 @@ impl NeighborhoodShell {
         self.hovered_lot_id = None;
         self.hovered_lot_since_us = None;
         self.hover_card_shown_for = None;
+        self.hover_fade.reset();
+        self.hover_fade_was_animating = false;
         self.pressed_lot_id = None;
         self.nbhd_state.hovered_lot = None;
         self.audio_queue
@@ -3502,6 +3616,8 @@ impl NeighborhoodShell {
         self.hovered_lot_id = None;
         self.hovered_lot_since_us = None;
         self.hover_card_shown_for = None;
+        self.hover_fade.reset();
+        self.hover_fade_was_animating = false;
         self.pressed_lot_id = None;
         self.move_in_family_id = None;
         self.dialog = None;
@@ -3545,6 +3661,8 @@ impl NeighborhoodShell {
         self.hovered_lot_id = None;
         self.hovered_lot_since_us = None;
         self.hover_card_shown_for = None;
+        self.hover_fade.reset();
+        self.hover_fade_was_animating = false;
         self.pressed_lot_id = None;
         self.move_in_family_id = None;
         self.travel_state.active_filter = None;
@@ -3764,6 +3882,7 @@ impl NeighborhoodShell {
         game.coop_set_player_name(self.coop_player_name.clone());
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.set_album_button_enabled(true);
+        game.set_special_lot_catalog(self.build_special_lot_catalog());
         game.set_debug(self.debug);
         game.resize(self.size);
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
@@ -3792,6 +3911,8 @@ impl NeighborhoodShell {
         self.hovered_lot_id = None;
         self.hovered_lot_since_us = None;
         self.hover_card_shown_for = None;
+        self.hover_fade.reset();
+        self.hover_fade_was_animating = false;
         self.pressed_lot_id = None;
         self.nbhd_state.hovered_lot = None;
         self.stop_load_audio(next_music);
@@ -3854,6 +3975,8 @@ impl NeighborhoodShell {
         self.hovered_lot_id = None;
         self.hovered_lot_since_us = None;
         self.hover_card_shown_for = None;
+        self.hover_fade.reset();
+        self.hover_fade_was_animating = false;
         self.pressed_lot_id = None;
         self.move_in_family_id = None;
         self.dialog = None;
@@ -4389,6 +4512,8 @@ impl NeighborhoodShell {
         self.hovered_lot_since_us = None;
         self.hover_card_shown_for = None;
         self.nbhd_state.hovered_lot = None;
+        self.hover_fade.reset();
+        self.hover_fade_was_animating = false;
     }
 
     fn open_dialog(&mut self, kind: ShellDialogKind, message: Message) {
@@ -4401,6 +4526,16 @@ impl NeighborhoodShell {
             state,
             layout,
         });
+        if self.clock_us > 0 {
+            let now_ms = (self.clock_us / 1_000) as u32;
+            self.dialog_fade = DialogFadeState::hidden();
+            self.dialog_fade
+                .fade_to(1.0, now_ms, DIALOG_FADE_DURATION_MS);
+            self.dialog_fade_was_animating = true;
+        } else {
+            self.dialog_fade = DialogFadeState::opaque();
+            self.dialog_fade_was_animating = false;
+        }
     }
 
     fn relayout_dialog(&mut self) {
@@ -4413,6 +4548,8 @@ impl NeighborhoodShell {
         let Some(dlg) = self.dialog.take() else {
             return ShellOutcome::default();
         };
+        self.dialog_fade = DialogFadeState::hidden();
+        self.dialog_fade_was_animating = false;
         if let ShellDialogKind::ConfirmResumeOrAbortTrip {
             home_house,
             destination_house,
@@ -5196,6 +5333,7 @@ impl NeighborhoodShell {
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.coop_set_travel_blocked(true);
         game.set_album_button_enabled(true);
+        game.set_special_lot_catalog(self.build_special_lot_catalog());
         game.set_debug(self.debug);
         game.resize(self.size);
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
@@ -5223,6 +5361,8 @@ impl NeighborhoodShell {
         self.hovered_lot_id = None;
         self.hovered_lot_since_us = None;
         self.hover_card_shown_for = None;
+        self.hover_fade.reset();
+        self.hover_fade_was_animating = false;
         self.pressed_lot_id = None;
         self.nbhd_state.hovered_lot = None;
         self.stop_load_audio(next_music);
@@ -5463,6 +5603,179 @@ impl NeighborhoodShell {
         }
     }
 
+    /// Builds real neighborhood / destination lot entries (names, street
+    /// addresses, descriptions, and zoning) from the live neighborhood store
+    /// and installed `*Desc.iff` / `StreetNames.iff` tables for VM special lot
+    /// pickers (`Dialog` kinds `5, 7, 8, 11, 13`).
+    fn build_special_lot_catalog(&self) -> Vec<SpecialLotEntry> {
+        let mut lot_ids: BTreeSet<u16> = BTreeSet::new();
+        // Single key-scan over stored houses (no character-file copying), so
+        // only lots that actually exist in the neighborhood store are offered
+        // (never unbacked map metadata entries).
+        if let Ok(stored_houses) = self.store.list_houses(&self.neighborhood_id) {
+            for house in stored_houses {
+                if let Ok(id) = u16::try_from(house) {
+                    lot_ids.insert(id);
+                }
+            }
+        }
+        lot_ids
+            .into_iter()
+            .map(|lot_id| {
+                let (name, description) = if let Some(meta) = self.lot_meta.get(&lot_id) {
+                    (meta.lot_name.clone(), meta.lot_description.clone())
+                } else {
+                    self.descriptions.lot_info(lot_id)
+                };
+                let address = self.street_names.address_for(lot_id);
+                let zoning =
+                    self.stored
+                        .zoning
+                        .get(&(lot_id as i16))
+                        .copied()
+                        .unwrap_or(match lot_id {
+                            21..=30 | 40..=48 | 81..=89 | 93..=98 => 2,
+                            _ => 1,
+                        }) as i16;
+                SpecialLotEntry {
+                    lot_id,
+                    name,
+                    address,
+                    description,
+                    zoning,
+                }
+            })
+            .collect()
+    }
+
+    /// Executes a destination travel transition requested by answering a VM
+    /// special lot picker (`Dialog` kinds `5, 7, 8, 11, 13`). Never halts or
+    /// strands: when departure is ineligible (e.g., co-op active, already away,
+    /// or missing destination snapshot), stays cleanly on the current lot and
+    /// surfaces a native notice dialog without overwriting active VM dialogs.
+    fn handle_special_panel_travel(
+        &mut self,
+        request: sims_vm::SpecialPanelRequest,
+        dest_house: u32,
+    ) {
+        let report_ineligible = |screen: &mut ActiveScreen, msg: String| {
+            if let ActiveScreen::Lot(session) = screen {
+                if !session.game.has_dialog() {
+                    session.game.show_notice("Travel", msg);
+                } else {
+                    session.game.set_note(msg);
+                }
+            }
+        };
+        let Some(destination) = TravelDestination::classify(dest_house, &self.stored.zoning) else {
+            report_ineligible(
+                &mut self.screen,
+                format!("Lot {dest_house} is not a travel destination."),
+            );
+            return;
+        };
+        let leader_guid = {
+            let ActiveScreen::Lot(session) = &self.screen else {
+                return;
+            };
+            if session.game.coop_active() {
+                report_ineligible(
+                    &mut self.screen,
+                    "Leave the co-op session before traveling to a destination.".into(),
+                );
+                return;
+            }
+            if session.active_trip.is_some() {
+                report_ineligible(
+                    &mut self.screen,
+                    "Return home before starting another destination trip.".into(),
+                );
+                return;
+            }
+            if session.is_destination_edit {
+                report_ineligible(
+                    &mut self.screen,
+                    "Travel is unavailable while editing a destination lot.".into(),
+                );
+                return;
+            }
+            let world = session.game.lot().world();
+            let home_family_id = self
+                .stored
+                .family_in(session.house)
+                .map(|(id, _)| id)
+                .or_else(|| {
+                    u16::try_from(world.globals.get(9).copied().unwrap_or(0))
+                        .ok()
+                        .filter(|&id| id != 0)
+                });
+            let Some(home_family_id) = home_family_id else {
+                report_ineligible(
+                    &mut self.screen,
+                    "No resident household is active on this lot for travel.".into(),
+                );
+                return;
+            };
+            let fam_members: Vec<u32> = self
+                .stored
+                .families
+                .get(&home_family_id)
+                .map(|f| f.members.clone())
+                .unwrap_or_default();
+            let selected_guid = world
+                .selected()
+                .and_then(|sel| world.objects.get(&sel))
+                .map(|o| o.guid)
+                .filter(|g| fam_members.contains(g));
+            let Some(guid) = selected_guid.or_else(|| fam_members.first().copied()) else {
+                report_ineligible(
+                    &mut self.screen,
+                    "No household member is available to travel.".into(),
+                );
+                return;
+            };
+            guid
+        };
+        let party = match destination {
+            TravelDestination::VacationIsland
+            | TravelDestination::OldTown
+            | TravelDestination::MagicTown => vm_travel::TravelParty::WholeFamily { leader_guid },
+            TravelDestination::Downtown | TravelDestination::StudioTown => {
+                vm_travel::TravelParty::Single {
+                    sim_guid: leader_guid,
+                }
+            }
+        };
+        let transport = match request {
+            sims_vm::SpecialPanelRequest::MagicTownLotPicker { via_blimp: false } => {
+                Some(vm_travel::TravelTransport::MagicHole)
+            }
+            sims_vm::SpecialPanelRequest::MagicTownLotPicker { via_blimp: true } => {
+                Some(vm_travel::TravelTransport::MagicBlimp)
+            }
+            sims_vm::SpecialPanelRequest::StudioTownLotPicker { star_limo: true } => {
+                Some(vm_travel::TravelTransport::StudioLimo)
+            }
+            _ => None,
+        };
+        let travel_req = TravelRequest {
+            destination_house: dest_house,
+            party,
+            transport,
+            accommodation: vm_travel::VacationAccommodation::None,
+            fare_override: None,
+            answers: self.answers.clone(),
+            frames: self.frames.clone(),
+            view_centre: None,
+        };
+        if let Err(err) = self.depart_to_destination(travel_req) {
+            report_ineligible(
+                &mut self.screen,
+                format!("Could not travel to lot {dest_house}: {err}"),
+            );
+        }
+    }
+
     /// Departs from the currently open home lot to a travel destination via
     /// [`vm_travel::depart_to_destination`], driving [`LoadingScreen`] audio
     /// cues and wrapping the booted destination lot into the active session.
@@ -5492,8 +5805,9 @@ impl NeighborhoodShell {
             .ok_or_else(|| format!("neighborhood {nh_id:?} not found before departure"))?;
 
         self.start_load_audio();
+        let load_kind = loading_kind_for_travel(request.destination_house, request.transport);
         self.present_loading_step(
-            loading_kind_for_house(request.destination_house),
+            load_kind,
             Some(format!("Destination Lot {}", request.destination_house)),
             0.2,
         );
@@ -5519,7 +5833,7 @@ impl NeighborhoodShell {
             }
         };
         self.present_loading_step(
-            loading_kind_for_house(departure.session.destination_house),
+            loading_kind_for_travel(departure.session.destination_house, request.transport),
             Some(format!(
                 "Destination Lot {}",
                 departure.session.destination_house
@@ -5582,6 +5896,7 @@ impl NeighborhoodShell {
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.coop_set_travel_blocked(true);
         game.set_album_button_enabled(true);
+        game.set_special_lot_catalog(self.build_special_lot_catalog());
         game.set_debug(self.debug);
         game.resize(self.size);
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
@@ -5714,6 +6029,7 @@ impl NeighborhoodShell {
             let _ = game.load_options(&self.options_file);
         }
         game.set_album_button_enabled(true);
+        game.set_special_lot_catalog(self.build_special_lot_catalog());
         game.set_debug(self.debug);
         game.resize(self.size);
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
@@ -5834,6 +6150,7 @@ impl NeighborhoodShell {
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.coop_set_travel_blocked(true);
         game.set_album_button_enabled(true);
+        game.set_special_lot_catalog(self.build_special_lot_catalog());
         game.set_debug(self.debug);
         game.resize(self.size);
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
@@ -6091,6 +6408,7 @@ impl NeighborhoodShell {
             new_game.coop_set_player_name(self.coop_player_name.clone());
             new_game.coop_set_iroh_config(self.coop_iroh_config);
             new_game.set_album_button_enabled(true);
+            new_game.set_special_lot_catalog(self.build_special_lot_catalog());
             new_game.set_debug(self.debug);
             new_game.resize(self.size);
             new_game.install_coop_controller(coop, true);
@@ -6194,11 +6512,20 @@ impl NeighborhoodShell {
 }
 
 fn loading_kind_for_house(house: u32) -> LoadingKind {
+    loading_kind_for_travel(house, None)
+}
+
+fn loading_kind_for_travel(
+    house: u32,
+    transport: Option<vm_travel::TravelTransport>,
+) -> LoadingKind {
     match house {
         21..=30 => LoadingKind::Downtown,
         40..=48 => LoadingKind::Vacation { alternate: false },
         81..=89 => LoadingKind::StudioTown { fan_bus: false },
-        90..=98 => LoadingKind::MagicTown { via_hole: false },
+        90..=98 => LoadingKind::MagicTown {
+            via_hole: matches!(transport, Some(vm_travel::TravelTransport::MagicHole)),
+        },
         _ => LoadingKind::Lot,
     }
 }
