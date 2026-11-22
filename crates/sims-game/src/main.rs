@@ -2163,6 +2163,11 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(focused) => {
                 if focused {
                     self.refresh_monitor_rate();
+                    if let Session::Shell(shell) = &mut self.session
+                        && shell.refresh_importable_families()
+                    {
+                        self.changed(true, true);
+                    }
                 }
                 if let Some(focused) = self.focus_filter.filter(focused) {
                     let sound_rc = Rc::clone(&self.sound);
@@ -2413,6 +2418,14 @@ impl ApplicationHandler for App {
                         Session::Starting(_) => {}
                         Session::Standalone { game, .. } => {
                             let out = match &event.logical_key {
+                                Key::Named(NamedKey::ArrowUp) => sims_game::Outcome {
+                                    redraw: game.book_scroll_lines(-3),
+                                    ..sims_game::Outcome::default()
+                                },
+                                Key::Named(NamedKey::ArrowDown) => sims_game::Outcome {
+                                    redraw: game.book_scroll_lines(3),
+                                    ..sims_game::Outcome::default()
+                                },
                                 Key::Named(NamedKey::ArrowLeft | NamedKey::PageUp) => {
                                     sims_game::Outcome {
                                         redraw: game.book_prev_page(),
@@ -2434,6 +2447,8 @@ impl ApplicationHandler for App {
                         }
                         Session::Shell(shell) => {
                             let out = match &event.logical_key {
+                                Key::Named(NamedKey::ArrowUp) => shell.key_up(),
+                                Key::Named(NamedKey::ArrowDown) => shell.key_down(),
                                 Key::Named(NamedKey::ArrowLeft) => shell.key_left(),
                                 Key::Named(NamedKey::ArrowRight) => shell.key_right(),
                                 Key::Named(NamedKey::PageUp) => shell.key_page_up(),

@@ -178,6 +178,9 @@ enum ShellDialogKind {
     ConfirmRezone {
         lot_id: u16,
         target_zone: i32,
+        expected_instance_id: u128,
+        expected_revision: u64,
+        expected_occupant: Option<u16>,
     },
     Notice,
 }
@@ -2445,7 +2448,16 @@ impl NeighborhoodShell {
             } else {
                 return false;
             };
+            let frame_size = self.frame_size_u32();
             if let Some(snapshot) = &self.credits_snapshot {
+                if self.credits_dialog.scroll_vertical(
+                    delta * 3,
+                    frame_size,
+                    snapshot,
+                    &self.save_manager_art,
+                ) {
+                    return true;
+                }
                 return self.credits_dialog.scroll(delta, snapshot).is_some();
             }
             return false;
@@ -2769,6 +2781,17 @@ impl NeighborhoodShell {
             return match cmd {
                 Some(BookCommand::Close) => {
                     self.close_credits_modal();
+                    ShellOutcome::redraw()
+                }
+                Some(BookCommand::ScrollLines(delta)) => {
+                    if let Some(snap) = &self.credits_snapshot {
+                        let _ = self.credits_dialog.scroll_vertical(
+                            delta,
+                            frame_size,
+                            snap,
+                            &self.save_manager_art,
+                        );
+                    }
                     ShellOutcome::redraw()
                 }
                 Some(BookCommand::PageChanged(_)) | None => ShellOutcome::redraw(),
@@ -3222,16 +3245,36 @@ impl NeighborhoodShell {
                 ..ShellOutcome::default()
             };
         }
+        if self.credits_dialog.is_open()
+            && let Some(snapshot) = &self.credits_snapshot
+        {
+            let frame_size = self.frame_size_u32();
+            return ShellOutcome {
+                redraw: self.credits_dialog.scroll_vertical(
+                    -3,
+                    frame_size,
+                    snapshot,
+                    &self.save_manager_art,
+                ),
+                ..ShellOutcome::default()
+            };
+        }
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::Up);
         }
-        if let ActiveScreen::Lot(session) = &mut self.screen
-            && session.game.shop_open()
-        {
-            return ShellOutcome {
-                redraw: session.game.shop_select_prev(),
-                ..ShellOutcome::default()
-            };
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            if session.game.book_open() {
+                return ShellOutcome {
+                    redraw: session.game.book_scroll_lines(-3),
+                    ..ShellOutcome::default()
+                };
+            }
+            if session.game.shop_open() {
+                return ShellOutcome {
+                    redraw: session.game.shop_select_prev(),
+                    ..ShellOutcome::default()
+                };
+            }
         }
         ShellOutcome::default()
     }
@@ -3253,16 +3296,36 @@ impl NeighborhoodShell {
                 ..ShellOutcome::default()
             };
         }
+        if self.credits_dialog.is_open()
+            && let Some(snapshot) = &self.credits_snapshot
+        {
+            let frame_size = self.frame_size_u32();
+            return ShellOutcome {
+                redraw: self.credits_dialog.scroll_vertical(
+                    3,
+                    frame_size,
+                    snapshot,
+                    &self.save_manager_art,
+                ),
+                ..ShellOutcome::default()
+            };
+        }
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::Down);
         }
-        if let ActiveScreen::Lot(session) = &mut self.screen
-            && session.game.shop_open()
-        {
-            return ShellOutcome {
-                redraw: session.game.shop_select_next(),
-                ..ShellOutcome::default()
-            };
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            if session.game.book_open() {
+                return ShellOutcome {
+                    redraw: session.game.book_scroll_lines(3),
+                    ..ShellOutcome::default()
+                };
+            }
+            if session.game.shop_open() {
+                return ShellOutcome {
+                    redraw: session.game.shop_select_next(),
+                    ..ShellOutcome::default()
+                };
+            }
         }
         ShellOutcome::default()
     }
@@ -3833,22 +3896,63 @@ impl NeighborhoodShell {
                             .to_owned(),
                     )
                 } else {
-                    parse_slot_id(&slot_id)
+                    let preferred_slot = parse_slot_id(&slot_id);
+                    let preferred_res = preferred_slot
                         .ok_or_else(|| format!("unknown fallback slot {slot_id:?}"))
-                        .and_then(|slot| self.load_autosave_slot_into_lot(lot_id, slot))
-                        .or_else(|_| {
-                            let recovered = self
+                        .and_then(|slot| self.load_autosave_slot_into_lot(lot_id, slot));
+                    match preferred_res {
+                        Ok(tick) => Ok(tick),
+                        Err(first_err) => {
+                            // Explicitly validate remaining candidates in descending
+                            // `(sim_tick, saved_at_unix_secs, slot)` order so a corrupt
+                            // newest autosave falls back to the true next-newest intact
+                            // slot rather than jumping straight to an older manual save.
+                            let mut candidates: Vec<sims_sim::autosave::SaveMetadata> = self
                                 .store
                                 .autosaves()
-                                .load_with_fallback_validated(
-                                    &self.neighborhood_id,
-                                    lot_id,
-                                    SaveSlot::Manual,
-                                    validate_save_payload,
-                                )
-                                .map_err(|e| e.to_string())?;
-                            self.apply_loaded_save_into_lot(lot_id, &recovered.loaded)
-                        })
+                                .list_saves_metadata(&self.neighborhood_id, lot_id)
+                                .map_err(|e| e.to_string())
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter_map(|entry| match entry {
+                                    sims_sim::autosave::SaveSlotEntry::Intact(meta)
+                                        if Some(meta.slot) != preferred_slot =>
+                                    {
+                                        Some(meta)
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            candidates.sort_by(|a, b| {
+                                let key_a = match a.slot {
+                                    SaveSlot::Manual => (1u8, 0u64),
+                                    SaveSlot::Autosave(seq) => (0u8, seq),
+                                };
+                                let key_b = match b.slot {
+                                    SaveSlot::Manual => (1u8, 0u64),
+                                    SaveSlot::Autosave(seq) => (0u8, seq),
+                                };
+                                b.sim_tick
+                                    .cmp(&a.sim_tick)
+                                    .then_with(|| b.saved_at_unix_secs.cmp(&a.saved_at_unix_secs))
+                                    .then_with(|| key_b.cmp(&key_a))
+                            });
+                            let mut recovered_tick = None;
+                            let mut last_err = first_err;
+                            for meta in candidates {
+                                match self.load_autosave_slot_into_lot(lot_id, meta.slot) {
+                                    Ok(tick) => {
+                                        recovered_tick = Some(tick);
+                                        break;
+                                    }
+                                    Err(err) => {
+                                        last_err = err;
+                                    }
+                                }
+                            }
+                            recovered_tick.ok_or(last_err)
+                        }
+                    }
                 };
                 match result {
                     Ok(tick) => {
@@ -5419,10 +5523,18 @@ impl NeighborhoodShell {
             ShellDialogKind::ConfirmRezone {
                 lot_id,
                 target_zone,
+                expected_instance_id,
+                expected_revision,
+                expected_occupant,
             } => {
-                match self.execute_rezone(lot_id, target_zone) {
+                match self.execute_rezone_checked(
+                    lot_id,
+                    target_zone,
+                    Some((expected_instance_id, expected_revision, expected_occupant)),
+                ) {
                     Ok(_) => {}
                     Err(e) => {
+                        let _ = self.refresh_from_store();
                         self.open_dialog(
                             ShellDialogKind::Notice,
                             Message::notice(
@@ -5458,6 +5570,35 @@ impl NeighborhoodShell {
         }
     }
 
+    fn active_trip_blocking_rezone(
+        &self,
+        stored: &StoredNeighborhood,
+        house: u32,
+        saved_lot: Option<&[u8]>,
+    ) -> Option<String> {
+        let house_i32 = i32::try_from(house).unwrap_or(-1);
+        for fam in stored.families.values() {
+            let sec = fam.secondary_house();
+            if fam.house == house_i32 && sec != 0 {
+                return Some(format!(
+                    "Lot {house} has an active travel trip to lot {sec}; resume or abort the trip before rezoning."
+                ));
+            }
+            if sec == house_i32 && sec != 0 {
+                return Some(format!(
+                    "Lot {house} is the destination of an active travel trip from lot {}; resume or abort the trip before rezoning.",
+                    fam.house
+                ));
+            }
+        }
+        if saved_lot.is_some_and(|bytes| bytes.len() >= 4 && &bytes[0..4] == b"TRVL") {
+            return Some(format!(
+                "Lot {house} has an active travel trip in progress; resume or abort the trip before rezoning."
+            ));
+        }
+        None
+    }
+
     fn prompt_rezone_lot(&mut self, lot_id: u16) -> ShellOutcome {
         let title = DialogStrings::get(&self.dialogs.rezone, 0, "Rezone").to_owned();
         if !self.is_lot_rezonable(lot_id) {
@@ -5472,6 +5613,22 @@ impl NeighborhoodShell {
             );
             return ShellOutcome::redraw();
         }
+        let _ = self.refresh_from_store();
+        let house = u32::from(lot_id);
+        let saved_lot = self
+            .store
+            .load_saved_lot(&self.neighborhood_id, house)
+            .ok()
+            .flatten();
+        if let Some(reason) =
+            self.active_trip_blocking_rezone(&self.stored, house, saved_lot.as_deref())
+        {
+            self.open_dialog(
+                ShellDialogKind::Notice,
+                Message::notice(title, reason, self.dialogs.ok()).with_frame(FrameStyle::Generic),
+            );
+            return ShellOutcome::redraw();
+        }
         let current_zone = self
             .stored
             .zoning
@@ -5483,7 +5640,13 @@ impl NeighborhoodShell {
         let target_label = self.zoning_label(target_zone).to_owned();
         let base_tmpl = DialogStrings::get(&self.dialogs.rezone, 1, "Rezone %s to %s?");
         let mut body = format_template(base_tmpl, &[&current_label, &target_label]);
-        if let Some((fam_id, _)) = self.stored.family_in(u32::from(lot_id)) {
+        let expected_occupant = self
+            .stored
+            .families
+            .iter()
+            .find(|(_, f)| f.house == i32::from(lot_id))
+            .map(|(&id, _)| id);
+        if let Some(fam_id) = expected_occupant {
             let fam_name = self
                 .family_names
                 .get(&fam_id)
@@ -5497,6 +5660,9 @@ impl NeighborhoodShell {
             ShellDialogKind::ConfirmRezone {
                 lot_id,
                 target_zone,
+                expected_instance_id: self.stored.instance_id,
+                expected_revision: self.stored.revision,
+                expected_occupant,
             },
             Message::confirm(title, body, vec![self.dialogs.yes(), self.dialogs.no()])
                 .with_frame(FrameStyle::Generic),
@@ -5505,9 +5671,19 @@ impl NeighborhoodShell {
     }
 
     /// Toggles `lot_id` zoning in REDB (`1` = Residential, `2` = Community),
-    /// evicting any occupying household cleanly to the Family Bin first, and
-    /// refreshes map metadata and hover overlays immediately.
+    /// atomically staging any household eviction and zoning update together
+    /// under strict `(instance_id, revision)` fencing, and refreshes map
+    /// metadata and hover overlays immediately.
     pub fn execute_rezone(&mut self, lot_id: u16, target_zone: i32) -> Result<i32, String> {
+        self.execute_rezone_checked(lot_id, target_zone, None)
+    }
+
+    fn execute_rezone_checked(
+        &mut self,
+        lot_id: u16,
+        target_zone: i32,
+        expected: Option<(u128, u64, Option<u16>)>,
+    ) -> Result<i32, String> {
         if !self.is_lot_rezonable(lot_id) {
             return Err(format!("lot {lot_id} is not eligible for rezoning"));
         }
@@ -5515,27 +5691,119 @@ impl NeighborhoodShell {
             return Err(format!("unsupported zoning code {target_zone}"));
         }
         let house = u32::from(lot_id);
-        if self.stored.family_in(house).is_some() {
-            self.execute_evict(house)?;
-        }
-        let mut updated = self
+        let snapshot = self
             .store
-            .load_neighborhood(&self.neighborhood_id)
+            .load_lot_snapshot(&self.neighborhood_id, house)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
-        let expected_instance_id = updated.instance_id;
-        let expected_revision = updated.revision;
-        updated.zoning.insert(lot_id as i16, target_zone);
-        updated.revision = updated.revision.saturating_add(1);
-        self.store
-            .save_neighborhood_checked(
+
+        if let Some(reason) = self.active_trip_blocking_rezone(
+            &snapshot.neighborhood,
+            house,
+            snapshot.saved_lot.as_deref(),
+        ) {
+            return Err(reason);
+        }
+
+        let live_occupant = snapshot
+            .neighborhood
+            .families
+            .iter()
+            .find(|(_, f)| f.house == i32::from(lot_id))
+            .map(|(&id, _)| id);
+
+        let (fence_instance_id, fence_revision) =
+            if let Some((exp_inst, exp_rev, exp_occ)) = expected {
+                if snapshot.neighborhood.instance_id != exp_inst
+                    || snapshot.neighborhood.revision != exp_rev
+                    || live_occupant != exp_occ
+                {
+                    return Err(
+                    "neighborhood state or lot occupancy changed since confirmation; please retry"
+                        .into(),
+                );
+                }
+                (exp_inst, exp_rev)
+            } else {
+                (
+                    snapshot.neighborhood.instance_id,
+                    snapshot.neighborhood.revision,
+                )
+            };
+
+        if live_occupant.is_some() {
+            // Stage the eviction in an ephemeral NeighborhoodStore so the
+            // evicted lot blob and updated zoning commit together in one
+            // fenced REDB transaction (never leaving a partial eviction behind).
+            let staging_dir = TempStagingDir::new("rezone-evict")?;
+            let staging_store = NeighborhoodStore::open(&staging_dir.path().join("stage.redb"))
+                .map_err(|e| e.to_string())?;
+            for (file_name, bytes) in &snapshot.character_files {
+                staging_store
+                    .save_character_file(&self.neighborhood_id, file_name, bytes)
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(base_house) = &snapshot.base_house {
+                staging_store
+                    .save_base_house(&self.neighborhood_id, house, base_house)
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(saved_lot) = &snapshot.saved_lot {
+                staging_store
+                    .save_lot_and_neighborhood(
+                        &self.neighborhood_id,
+                        house,
+                        saved_lot,
+                        &snapshot.neighborhood,
+                    )
+                    .map_err(|e| e.to_string())?;
+            } else {
+                staging_store
+                    .save_neighborhood(&self.neighborhood_id, &snapshot.neighborhood)
+                    .map_err(|e| e.to_string())?;
+            }
+            lifecycle::evict(
+                &self.install_root,
+                &staging_store,
                 &self.neighborhood_id,
-                expected_instance_id,
-                expected_revision,
-                &updated,
+                house,
             )
-            .map_err(|e| e.to_string())?
-            .map_err(|conflict| format!("neighborhood modified concurrently ({conflict:?})"))?;
+            .map_err(|e| e.to_string())?;
+            let evicted_lot_bytes = staging_store
+                .load_saved_lot(&self.neighborhood_id, house)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "staged eviction lot missing after evict".to_owned())?;
+            let mut evicted_nh = staging_store
+                .load_neighborhood(&self.neighborhood_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "staged neighborhood missing after evict".to_owned())?;
+            evicted_nh.zoning.insert(lot_id as i16, target_zone);
+            self.store
+                .save_lot_and_neighborhood_checked(
+                    &self.neighborhood_id,
+                    house,
+                    Some((fence_instance_id, fence_revision)),
+                    &evicted_lot_bytes,
+                    &evicted_nh,
+                    &[],
+                )
+                .map_err(|e| e.to_string())?
+                .map_err(|conflict| format!("neighborhood modified concurrently ({conflict:?})"))?;
+        } else {
+            let mut updated = snapshot.neighborhood;
+            updated.zoning.insert(lot_id as i16, target_zone);
+            updated.revision = updated.revision.saturating_add(1);
+            self.store
+                .save_neighborhood_checked(
+                    &self.neighborhood_id,
+                    fence_instance_id,
+                    fence_revision,
+                    &updated,
+                )
+                .map_err(|e| e.to_string())?
+                .map_err(|conflict| format!("neighborhood modified concurrently ({conflict:?})"))?;
+        }
+
         self.refresh_from_store()?;
         self.note = Some(format!(
             "Rezoned lot {lot_id} to {}.",
@@ -5661,8 +5929,17 @@ impl NeighborhoodShell {
         out
     }
 
-    fn refresh_importable_families(&mut self) {
-        self.nbhd_state.has_importable_family = !self.scan_importable_families().is_empty();
+    /// Rescans configured `Import/` and `Export/` folders for `.FAM` archives
+    /// and updates the top-bar Import button enabled state. Returns `true` if
+    /// availability changed.
+    pub fn refresh_importable_families(&mut self) -> bool {
+        let next = !self.scan_importable_families().is_empty();
+        if next != self.nbhd_state.has_importable_family {
+            self.nbhd_state.has_importable_family = next;
+            true
+        } else {
+            false
+        }
     }
 
     /// Scans installed `Import/` and `Export/` `.FAM` archives and opens the
@@ -5798,23 +6075,39 @@ impl NeighborhoodShell {
             }
             let fami_id = parsed.export_info.family_id;
             let fami_bytes = encode_fami(&bin_family);
+            // Rewrite ONLY the IFF's effective resources in `resource_order`
+            // (preserving native `rsmp` lookup semantics and omitting stale,
+            // unlisted physical chunks so reparse never exposes shadowed data).
+            let tags: BTreeSet<[u8; 4]> = parsed
+                .iff
+                .chunks
+                .iter()
+                .map(|c| c.tag)
+                .filter(|tag| tag != b"rsmp" && tag != b"XXXX")
+                .collect();
             let mut chunks: Vec<ChunkData> = Vec::with_capacity(parsed.iff.chunks.len());
-            for chunk in &parsed.iff.chunks {
-                if &chunk.tag == b"rsmp" {
-                    continue;
+            for tag in tags {
+                let effective: Vec<&sims_formats::iff::Chunk> =
+                    match parsed.iff.resource_order(&tag) {
+                        Ok(list) => list,
+                        Err(_) => parsed.iff.all(&tag).collect(),
+                    };
+                for chunk in effective {
+                    let eff_flags = parsed.iff.resource_flags(chunk);
+                    let data =
+                        if &chunk.tag == b"FAMI" && chunk.id == fami_id && (eff_flags >> 8) == 0 {
+                            fami_bytes.clone()
+                        } else {
+                            parsed.iff.data(chunk).to_vec()
+                        };
+                    chunks.push(ChunkData {
+                        tag: chunk.tag,
+                        id: chunk.id,
+                        flags: eff_flags,
+                        label: chunk.label.clone(),
+                        data,
+                    });
                 }
-                let data = if &chunk.tag == b"FAMI" && chunk.id == fami_id {
-                    fami_bytes.clone()
-                } else {
-                    parsed.iff.data(chunk).to_vec()
-                };
-                chunks.push(ChunkData {
-                    tag: chunk.tag,
-                    id: chunk.id,
-                    flags: chunk.flags,
-                    label: chunk.label.clone(),
-                    data,
-                });
             }
             write_iff(&chunks).map_err(|e| e.to_string())?
         };

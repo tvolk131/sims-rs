@@ -103,8 +103,9 @@ fn fast_save_manager_listing_beats_full_decode_and_preserves_corruption_checks()
         return;
     };
     let (_tmp, saves) = temp_dir_and_redb("fast-saves");
-    let mut shell = NeighborhoodShell::open(root, saves, 1, true, vec![3], Frames::default())
-        .expect("open NeighborhoodShell");
+    let mut shell =
+        NeighborhoodShell::open(root.clone(), saves, 1, true, vec![3], Frames::default())
+            .expect("open NeighborhoodShell");
     shell.resize([800, 600]);
     shell.enter_lot(5).expect("enter Goth house");
     let instance_id = load_ud1(&shell).instance_id;
@@ -189,6 +190,80 @@ fn fast_save_manager_listing_beats_full_decode_and_preserves_corruption_checks()
         .load_save_validated("UserData", 5, SaveSlot::Manual, validate_save_payload)
         .expect("load_save_validated manual slot succeeds");
     assert_eq!(loaded.metadata.sim_tick, 10);
+
+    // Sol P2 regression: "Newest Intact" fallback must walk candidates in
+    // descending tick/timestamp order rather than jumping straight to an older
+    // manual save when the highest-tick autosave passes metadata check but fails
+    // full `Saved::decode`!
+    let (_tmp2, saves2) = temp_dir_and_redb("fast-saves-fallback");
+    let mut shell2 = NeighborhoodShell::open(root, saves2, 1, true, vec![3], Frames::default())
+        .expect("open shell2");
+    shell2.resize([800, 600]);
+    shell2.enter_lot(5).expect("enter lot 5");
+    let inst2 = load_ud1(&shell2).instance_id;
+    let autosaves2 = shell2.store().autosaves();
+    // 1) Valid manual save at tick 100.
+    let saved_100 = shell2.game().unwrap().lot().save().expect("save 100");
+    let manual_job = sims_sim::autosave::SaveJob::manual_for_instance(
+        "UserData",
+        inst2,
+        5,
+        100,
+        sims_sim::autosave::SavePayload::saved_lot(saved_100.encode()),
+    )
+    .with_saved_at_unix_secs(1_000)
+    .with_label(format_save_label(Some("Goth"), 1, 8, 10));
+    autosaves2
+        .commit_job_validated(manual_job, validate_save_payload)
+        .expect("commit manual 100");
+    // 2) Valid autosave at tick 200.
+    shell2.game_mut().unwrap().run(4);
+    let expected_tick_200 = shell2.game().unwrap().lot().ticks();
+    let saved_200 = shell2.game().unwrap().lot().save().expect("save 200");
+    let auto200_job = sims_sim::autosave::SaveJob::autosave_for_instance(
+        "UserData",
+        inst2,
+        5,
+        200,
+        sims_sim::autosave::SavePayload::saved_lot(saved_200.encode()),
+    )
+    .with_saved_at_unix_secs(2_000)
+    .with_label(format_save_label(Some("Goth"), 1, 8, 20));
+    autosaves2
+        .commit_job_validated(auto200_job, validate_save_payload)
+        .expect("commit auto 200");
+    // 3) Corrupt-body autosave at tick 300 (valid envelope/metadata, bad Saved bytes).
+    let corrupt300_job = sims_sim::autosave::SaveJob::autosave_for_instance(
+        "UserData",
+        inst2,
+        5,
+        300,
+        sims_sim::autosave::SavePayload::saved_lot(b"corrupt-saved-body".to_vec()),
+    )
+    .with_saved_at_unix_secs(3_000)
+    .with_label(format_save_label(Some("Goth"), 1, 8, 30));
+    let meta300 = autosaves2
+        .commit_job(corrupt300_job)
+        .expect("commit corrupt-body 300");
+    let corrupt300_id = sims_game::autosave_worker::slot_id_for(meta300.slot);
+
+    // Advance lot past tick 200, then trigger FallbackToNewestIntact pointing at tick 300.
+    shell2.game_mut().unwrap().run(6);
+    assert!(shell2.open_save_manager(Some("Simulated load failure".into())));
+    let _ = shell2.handle_save_manager_command(
+        sims_ui::saves::SaveManagerCommand::FallbackToNewestIntact {
+            slot_id: corrupt300_id,
+        },
+    );
+    assert!(
+        !shell2.save_manager_open(),
+        "fallback must recover from tick-200 autosave and close Save Manager"
+    );
+    assert_eq!(
+        shell2.game().unwrap().lot().ticks(),
+        expected_tick_200,
+        "Newest Intact fallback must restore tick-200 autosave, not older tick-100 manual save"
+    );
 }
 
 #[test]
@@ -287,7 +362,13 @@ fn wardrobe_try_on_renders_live_3d_sim_preview_rotates_and_falls_back_gracefully
         "rotating the 3D Try-On Sim preview by 45 degrees must re-render from the new yaw"
     );
 
-    // Graceful fallback: trying on an item with no backing asset never panics.
+    // Large rotation deltas (e.g., i16::MAX) must normalize cleanly without overflow.
+    let big_rot = game.shop_rotate_preview(i16::MAX);
+    assert!(big_rot.redraw);
+    assert!((0..360).contains(&game.shop_preview_yaw_deg()));
+
+    // Graceful fallback: trying on an item with no backing asset shows unavailable
+    // state (`preview_image.is_none()`) rather than an unrelated everyday body.
     let fallback_out = game.execute_shop_command(ShopCommand::TryOn {
         item_id: "missing_asset_id".into(),
     });
@@ -296,6 +377,14 @@ fn wardrobe_try_on_renders_live_3d_sim_preview_rotates_and_falls_back_gracefully
     assert_eq!(
         snap_fb.tried_on_item_id.as_deref(),
         Some("missing_asset_id")
+    );
+    assert!(
+        snap_fb.preview_image.is_none(),
+        "unbound/missing item must never render an unrelated everyday body"
+    );
+    assert_eq!(
+        snap_fb.preview_label.as_deref(),
+        Some("Preview unavailable")
     );
     game.render();
 }
@@ -323,8 +412,9 @@ fn paginated_spellbook_and_cookbook_load_installed_catalog_and_highlight_held_it
         .and_then(|p| p.data.get(31).copied())
         .expect("caller neighbor id");
 
-    // Seed a real magic inventory token (kind 7) on the caller so the Spellbook
-    // highlights held tokens in the summary strip.
+    // Seed the real Adult Magic Wand token (`0x1fec_6005`, kind 7) on the caller
+    // so both the Spellbook summary strip highlights it AND `SpellBook.iff`'s
+    // live `0x1009` ("Look Up Spells") BHAV opens Dialog kind 12 cleanly.
     let saved = game.lot().save().expect("save lot");
     let orig_world_body = saved.world().encode();
     let encoded = saved.encode();
@@ -332,7 +422,7 @@ fn paginated_spellbook_and_cookbook_load_installed_catalog_and_highlight_held_it
         .strip_prefix(orig_world_body.as_slice())
         .expect("saved world prefix");
     let mut world = saved.world().clone();
-    sims_vm::travel::set_neighbor_token_count(&mut world, neighbor_id, 7, 0x1234_5678, 3);
+    sims_vm::travel::set_neighbor_token_count(&mut world, neighbor_id, 7, 0x1fec_6005, 1);
     let new_world_body = world.encode();
     let mut rebuilt = Vec::with_capacity(8 + new_world_body.len() + tail.len());
     rebuilt.extend_from_slice(&encoded[..8]);
@@ -385,8 +475,135 @@ fn paginated_spellbook_and_cookbook_load_installed_catalog_and_highlight_held_it
     assert!(game.book_next_page());
     assert_eq!(game.book_dialog().page(), 1);
     game.render();
-    let _ = game.book_close();
+    // Close via pointer click on the Close button (Sol P1 regression check).
+    let close_pt = {
+        let snap = game.book_snapshot().expect("cookbook snapshot").clone();
+        let layout = game.book_dialog().layout([800, 600], &snap);
+        [
+            layout.close_btn.x + layout.close_btn.width / 2,
+            layout.close_btn.y + layout.close_btn.height / 2,
+        ]
+    };
+    let _ = game.press(close_pt);
+    let closed_click = game.release(close_pt);
+    assert!(closed_click.redraw);
     assert!(!game.book_open());
+
+    // Live VM SpecialPanel pointer-driven Close test for BOTH kind 12 (SpellBook)
+    // and kind 15 (CookBook): clicking the modal's Close button must dismiss the
+    // modal AND deliver `SpecialPanelResponse::Dismissed` so the lot never stalls!
+    for (label, guid_candidates, expected_is_cookbook) in [
+        (
+            "SpellBook (kind 12)",
+            &[0x8ec5_750du32, 0xce36_15a5][..],
+            false,
+        ),
+        ("CookBook (kind 15)", &[0x2a3d_8714u32][..], true),
+    ] {
+        let sim_id = game.lot().world().selected().expect("selected Sim");
+        let sim_pos = game.lot().world().objects[&sim_id].position;
+        let lot = game.lot_mut();
+        lot.set_mode(sims_vm::PanelMode::Buy).expect("Buy mode");
+        let mut placed_obj = None;
+        'guid_loop: for &guid in guid_candidates {
+            let Ok(Some(mut cursor)) = lot.buy_start(guid, 0, 0) else {
+                continue;
+            };
+            let held = cursor.held;
+            let bx = sim_pos[0] / 16;
+            let by = sim_pos[1] / 16;
+            for r in 1..=12i32 {
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        let tx = bx + dx;
+                        let ty = by + dy;
+                        if !(4..=60).contains(&tx) || !(4..=60).contains(&ty) {
+                            continue;
+                        }
+                        if lot
+                            .buy_move(&mut cursor, [tx * 16 + 8, ty * 16 + 8], 1)
+                            .unwrap_or(false)
+                            && cursor.valid
+                            && lot.buy_commit(&cursor).is_ok()
+                        {
+                            placed_obj = Some(held);
+                            break 'guid_loop;
+                        }
+                    }
+                }
+            }
+            let _ = lot.buy_cancel(&cursor);
+        }
+        lot.set_mode(sims_vm::PanelMode::Live).expect("Live mode");
+        let obj_id = placed_obj.unwrap_or_else(|| panic!("must place {label} on Goth lot"));
+        lot.select(sim_id).expect("select Sim");
+        let menu = lot
+            .pie_menu(sim_id, obj_id)
+            .unwrap_or_else(|e| panic!("pie_menu failed for {label}: {e}"));
+        let entry = menu
+            .entries
+            .iter()
+            .find(|e| e.action.action == 0x1009)
+            .or_else(|| menu.entries.first())
+            .unwrap_or_else(|| panic!("expected Read (0x1009) interaction on {label}"));
+        let picked_action = entry.action.action;
+        let menu_actions: Vec<(u16, Option<String>)> = menu
+            .entries
+            .iter()
+            .map(|e| (e.action.action, e.name.clone()))
+            .collect();
+        lot.pick(sim_id, entry.action.clone())
+            .unwrap_or_else(|e| panic!("pick failed for {label}: {e}"));
+        let mut opened = false;
+        let mut seen_reqs = Vec::new();
+        for _ in 0..800 {
+            game.run(1);
+            if let Some(asking) = game.asking() {
+                let caller = asking.shown.object;
+                game.answer(caller, 0);
+                continue;
+            }
+            if let Some(req) = game.active_special_panel_request() {
+                seen_reqs.push(format!("{req:?}"));
+                let matches_kind = if expected_is_cookbook {
+                    matches!(req, sims_vm::SpecialPanelRequest::CookBook { .. })
+                } else {
+                    matches!(req, sims_vm::SpecialPanelRequest::SpellBook { .. })
+                };
+                if matches_kind {
+                    opened = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            opened,
+            "{label} interaction must open VM special panel (picked={picked_action:#x}, menu={menu_actions:?}, seen={seen_reqs:?}, asking_sp={:?})",
+            game.asking_special_panel().map(|a| &a.shown.request)
+        );
+        assert!(game.book_open(), "{label} must open ReferenceBookDialog");
+        game.render();
+        let close_pt = {
+            let snap = game.book_snapshot().expect("snapshot").clone();
+            let layout = game.book_dialog().layout([800, 600], &snap);
+            [
+                layout.close_btn.x + layout.close_btn.width / 2,
+                layout.close_btn.y + layout.close_btn.height / 2,
+            ]
+        };
+        let _ = game.press(close_pt);
+        let out = game.release(close_pt);
+        assert!(out.redraw, "{label} Close click must redraw");
+        assert!(!game.book_open(), "{label} Close click must close modal");
+        assert!(
+            game.asking_special_panel().is_none(),
+            "{label} Close click must answer the VM so the lot does not stall"
+        );
+        assert!(
+            game.run(2) >= 1,
+            "{label} lot must resume stepping after Close click"
+        );
+    }
 }
 
 #[test]
@@ -433,7 +650,95 @@ fn neighborhood_rezone_import_family_credits_and_web_actions_work_end_to_end() {
         .family_in(5)
         .expect("Goth occupies lot 5 initially")
         .0;
+    // Rezone confirmation fence regression (Sol P1): if the neighborhood revision
+    // changes between opening the Rezone confirmation and pressing Enter, the
+    // stale confirmation must be rejected cleanly without evicting or rezoning!
     let lot5_pt = find_lot_hit_point(&shell, 5).expect("lot 5 hit point");
+    shell.press(lot5_pt);
+    shell.release(lot5_pt);
+    assert!(
+        shell.has_dialog(),
+        "rezoning occupied lot 5 must open confirmation dialog"
+    );
+    {
+        let mut bumped = load_ud1(&shell);
+        let inst = bumped.instance_id;
+        let rev = bumped.revision;
+        bumped.revision = rev + 1;
+        shell
+            .store()
+            .save_neighborhood_checked("UserData", inst, rev, &bumped)
+            .expect("bump revision")
+            .expect("revision bump succeeds");
+    }
+    shell.key_dialog(DialogKey::Enter);
+    assert!(
+        shell.has_dialog(),
+        "stale Rezone confirmation must open an error notice instead of committing"
+    );
+    shell.key_dialog(DialogKey::Enter);
+    let after_stale = load_ud1(&shell);
+    assert_ne!(
+        after_stale.zoning.get(&5),
+        Some(&2),
+        "stale confirmation must not rezone lot 5"
+    );
+    assert!(
+        after_stale.family_in(5).is_some(),
+        "stale confirmation must not evict lot 5"
+    );
+
+    // Sol P2 active-trip regression: rezoning either endpoint (home or secondary
+    // destination) of an active Old Town trip must be refused cleanly!
+    {
+        let mut with_trip = load_ud1(&shell);
+        let inst = with_trip.instance_id;
+        let rev = with_trip.revision;
+        let fam = with_trip
+            .families
+            .get_mut(&goth_fam_id)
+            .expect("Goth family");
+        if fam.version < 8 {
+            fam.version = 9;
+        }
+        if fam.tail.len() < 4 {
+            fam.tail.resize(16, 0);
+        }
+        fam.tail[0..4].copy_from_slice(&2i32.to_le_bytes());
+        with_trip.revision = rev + 1;
+        shell
+            .store()
+            .save_neighborhood_checked("UserData", inst, rev, &with_trip)
+            .expect("inject active trip")
+            .expect("trip commit succeeds");
+        shell.refresh_from_store().expect("refresh with trip");
+    }
+    assert!(
+        shell.execute_rezone(5, 2).is_err(),
+        "rezoning home lot 5 during an active trip must be refused"
+    );
+    assert!(
+        shell.execute_rezone(2, 1).is_err(),
+        "rezoning destination lot 2 during an active trip must be refused"
+    );
+    // Clear the synthetic active trip before testing atomic occupied rezone.
+    {
+        let mut cleared = load_ud1(&shell);
+        let inst = cleared.instance_id;
+        let rev = cleared.revision;
+        let fam = cleared.families.get_mut(&goth_fam_id).expect("Goth family");
+        fam.tail[0..4].fill(0);
+        cleared.revision = rev + 1;
+        shell
+            .store()
+            .save_neighborhood_checked("UserData", inst, rev, &cleared)
+            .expect("clear synthetic trip")
+            .expect("clear trip succeeds");
+        shell.refresh_from_store().expect("refresh cleared trip");
+    }
+
+    // Rezone occupied lot 5 (Goth household): must show confirmation & atomically
+    // evict Goth to Family Bin + commit Community zoning under the confirmation fence!
     shell.press(lot5_pt);
     shell.release(lot5_pt);
     assert!(

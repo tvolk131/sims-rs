@@ -387,7 +387,11 @@ pub struct ReferenceBookSnapshot {
 pub enum BookCommand {
     /// Active page index changed (`0`-based).
     PageChanged(usize),
-    /// Close / dismiss the book modal.
+    /// Request to scroll the current page vertically by the signed line delta
+    /// (positive scrolls down, negative scrolls up).
+    ScrollLines(i32),
+    /// Request to close / dismiss the book modal (the host closes the dialog
+    /// and answers any backing VM special panel).
     Close,
 }
 
@@ -396,6 +400,8 @@ pub enum BookCommand {
 pub enum BookHit {
     PrevPage,
     NextPage,
+    ScrollUp,
+    ScrollDown,
     Close,
 }
 
@@ -406,6 +412,8 @@ pub struct BookLayout {
     pub title_bar: Rect,
     pub held_bar: Option<Rect>,
     pub content_area: Rect,
+    pub scroll_up_btn: Rect,
+    pub scroll_down_btn: Rect,
     pub prev_btn: Rect,
     pub page_label: Rect,
     pub next_btn: Rect,
@@ -415,6 +423,12 @@ pub struct BookLayout {
 impl BookLayout {
     /// Returns the interactive control under `(x, y)`, if any.
     pub fn hit(&self, x: i32, y: i32) -> Option<BookHit> {
+        if self.scroll_up_btn.contains(x, y) {
+            return Some(BookHit::ScrollUp);
+        }
+        if self.scroll_down_btn.contains(x, y) {
+            return Some(BookHit::ScrollDown);
+        }
         if self.prev_btn.contains(x, y) {
             return Some(BookHit::PrevPage);
         }
@@ -433,6 +447,7 @@ impl BookLayout {
 pub struct ReferenceBookDialog {
     open: bool,
     page: usize,
+    scroll_lines: usize,
     hovered: Option<BookHit>,
     pressed: Option<BookHit>,
 }
@@ -451,10 +466,16 @@ impl ReferenceBookDialog {
         self.page
     }
 
-    /// Opens the modal on page `0`.
+    /// Current vertical line scroll offset within the active page.
+    pub fn scroll_lines(&self) -> usize {
+        self.scroll_lines
+    }
+
+    /// Opens the modal on page `0` at scroll offset `0`.
     pub fn open(&mut self) {
         self.open = true;
         self.page = 0;
+        self.scroll_lines = 0;
         self.hovered = None;
         self.pressed = None;
     }
@@ -462,6 +483,7 @@ impl ReferenceBookDialog {
     /// Closes the modal and clears transient pointer state.
     pub fn close(&mut self) {
         self.open = false;
+        self.scroll_lines = 0;
         self.hovered = None;
         self.pressed = None;
     }
@@ -495,6 +517,7 @@ impl ReferenceBookDialog {
             return None;
         }
         self.page = cur - 1;
+        self.scroll_lines = 0;
         Some(BookCommand::PageChanged(self.page))
     }
 
@@ -509,6 +532,7 @@ impl ReferenceBookDialog {
             return None;
         }
         self.page = cur + 1;
+        self.scroll_lines = 0;
         Some(BookCommand::PageChanged(self.page))
     }
 
@@ -524,9 +548,53 @@ impl ReferenceBookDialog {
         let clamped = index.min(snapshot.pages.len() - 1);
         if clamped != self.page {
             self.page = clamped;
+            self.scroll_lines = 0;
             Some(BookCommand::PageChanged(self.page))
         } else {
             None
+        }
+    }
+
+    /// Maximum vertical line scroll offset for the active page at `frame_size`.
+    pub fn max_scroll_lines(
+        &self,
+        frame_size: [u32; 2],
+        snapshot: &ReferenceBookSnapshot,
+        art: &Art,
+    ) -> usize {
+        let layout = self.layout(frame_size, snapshot);
+        let page_idx = self.effective_page(snapshot);
+        let Some(page) = snapshot.pages.get(page_idx) else {
+            return 0;
+        };
+        measure_page_max_scroll(&layout, page, art)
+    }
+
+    /// Scrolls vertically within the active page by `delta_lines` (positive
+    /// scrolls down), clamped to `max_scroll_lines`. Returns `true` if the
+    /// visible scroll offset changed.
+    pub fn scroll_vertical(
+        &mut self,
+        delta_lines: i32,
+        frame_size: [u32; 2],
+        snapshot: &ReferenceBookSnapshot,
+        art: &Art,
+    ) -> bool {
+        if !self.open || delta_lines == 0 {
+            return false;
+        }
+        let max_scroll = self.max_scroll_lines(frame_size, snapshot, art);
+        let current = self.scroll_lines.min(max_scroll);
+        let next = if delta_lines > 0 {
+            current.saturating_add(delta_lines as usize).min(max_scroll)
+        } else {
+            current.saturating_sub(delta_lines.unsigned_abs() as usize)
+        };
+        if next != self.scroll_lines {
+            self.scroll_lines = next;
+            true
+        } else {
+            false
         }
     }
 
@@ -545,12 +613,12 @@ impl ReferenceBookDialog {
         }
     }
 
-    /// Dismisses the dialog (`Escape` / `Enter`).
+    /// Emits a close request (`Escape` / `Enter`) so the host can dismiss the
+    /// modal and answer any backing VM panel cleanly.
     pub fn escape(&mut self) -> Option<BookCommand> {
         if !self.open {
             return None;
         }
-        self.close();
         Some(BookCommand::Close)
     }
 
@@ -600,13 +668,27 @@ impl ReferenceBookDialog {
             hb.y + hb.height + 6
         });
         let content_h = (footer_y - content_y - 10).max(60);
-        let content_area = Rect::new(inner_x, content_y, inner_w, content_h);
+        let scroll_btn_w = 22;
+        let scroll_gap = 4;
+        let content_w = (inner_w - scroll_btn_w - scroll_gap).max(96);
+        let content_area = Rect::new(inner_x, content_y, content_w, content_h);
+        let scroll_x = content_area.x + content_area.width + scroll_gap;
+        let scroll_btn_h = (content_h / 2 - 2).clamp(18, 28);
+        let scroll_up_btn = Rect::new(scroll_x, content_y, scroll_btn_w, scroll_btn_h);
+        let scroll_down_btn = Rect::new(
+            scroll_x,
+            content_y + content_h - scroll_btn_h,
+            scroll_btn_w,
+            scroll_btn_h,
+        );
 
         BookLayout {
             dialog,
             title_bar,
             held_bar,
             content_area,
+            scroll_up_btn,
+            scroll_down_btn,
             prev_btn,
             page_label,
             next_btn,
@@ -666,10 +748,9 @@ impl ReferenceBookDialog {
         match pressed {
             BookHit::PrevPage => self.prev_page(snapshot),
             BookHit::NextPage => self.next_page(snapshot),
-            BookHit::Close => {
-                self.close();
-                Some(BookCommand::Close)
-            }
+            BookHit::ScrollUp => Some(BookCommand::ScrollLines(-3)),
+            BookHit::ScrollDown => Some(BookCommand::ScrollLines(3)),
+            BookHit::Close => Some(BookCommand::Close),
         }
     }
 
@@ -772,7 +853,10 @@ impl ReferenceBookDialog {
         draw_outline(frame, layout.content_area, PAGE_BORDER);
 
         let page_idx = self.effective_page(snapshot);
+        let mut max_scroll = 0usize;
         if let Some(page) = snapshot.pages.get(page_idx) {
+            max_scroll = measure_page_max_scroll(&layout, page, art);
+            let skip_lines = self.scroll_lines.min(max_scroll);
             let mut y = layout.content_area.y + 8;
             let x = layout.content_area.x + 10;
             let content_w = (layout.content_area.width - 20).max(40);
@@ -895,7 +979,14 @@ impl ReferenceBookDialog {
                     && ey < emax_y
                 {
                     let body_rect = Rect::new(ex, ey, ew, (emax_y - ey).max(0));
-                    draw_multiline_wrapped_text(frame, font, &entry.body, body_rect, TEXT_NORMAL);
+                    draw_multiline_wrapped_text(
+                        frame,
+                        font,
+                        &entry.body,
+                        body_rect,
+                        skip_lines,
+                        TEXT_NORMAL,
+                    );
                 }
 
                 y += card_h + gap;
@@ -910,6 +1001,23 @@ impl ReferenceBookDialog {
                 TEXT_NORMAL,
             );
         }
+
+        // Within-page vertical scroll buttons (enabled whenever page text wraps past card height).
+        let clamped_scroll = self.scroll_lines.min(max_scroll);
+        draw_button(
+            frame,
+            art,
+            layout.scroll_up_btn,
+            "^",
+            self.button_state(BookHit::ScrollUp, clamped_scroll > 0),
+        );
+        draw_button(
+            frame,
+            art,
+            layout.scroll_down_btn,
+            "v",
+            self.button_state(BookHit::ScrollDown, clamped_scroll < max_scroll),
+        );
 
         // Footer navigation: Prev, Page X of Y, Next, Close.
         draw_button(
@@ -1164,25 +1272,14 @@ fn draw_clipped_text(
     font.draw(frame, &clipped, at, color);
 }
 
-fn draw_multiline_wrapped_text(
-    frame: &mut Frame,
-    font: &Font,
-    text: &str,
-    rect: Rect,
-    color: [u8; 3],
-) {
-    if rect.width <= 0 || rect.height <= 0 {
-        return;
+fn wrap_multiline_lines(font: &Font, text: &str, max_width: i32) -> Vec<String> {
+    if max_width <= 0 || text.is_empty() {
+        return Vec::new();
     }
-    let lh = font.line_height.max(1);
-    let mut y = rect.y;
-    let max_y = rect.y + rect.height;
+    let mut lines = Vec::new();
     for raw_line in text.split('\n') {
         if raw_line.trim().is_empty() {
-            y += lh;
-            if y + lh > max_y {
-                return;
-            }
+            lines.push(String::new());
             continue;
         }
         let mut line = String::new();
@@ -1192,24 +1289,115 @@ fn draw_multiline_wrapped_text(
             } else {
                 format!("{line} {word}")
             };
-            if !line.is_empty() && font.width(&candidate) > rect.width {
-                if y + lh > max_y {
-                    return;
-                }
-                draw_clipped_text(frame, font, &line, [rect.x, y], rect.width, color);
-                y += lh;
-                line.clear();
+            if !line.is_empty() && font.width(&candidate) > max_width {
+                lines.push(std::mem::take(&mut line));
                 line.push_str(word);
             } else {
                 line = candidate;
             }
         }
         if !line.is_empty() {
-            if y + lh > max_y {
-                return;
-            }
-            draw_clipped_text(frame, font, &line, [rect.x, y], rect.width, color);
-            y += lh;
+            lines.push(line);
         }
+    }
+    lines
+}
+
+fn measure_page_max_scroll(layout: &BookLayout, page: &BookPage, art: &Art) -> usize {
+    let title_font = art.font(12).or_else(|| art.font(10));
+    let body_font = art.font(10).or_else(|| art.font(12));
+    let small_font = art.font(9).or_else(|| art.font(10));
+    let Some(body_font) = body_font else {
+        return 0;
+    };
+    let lh = body_font.line_height.max(1);
+    let mut y = layout.content_area.y + 8;
+    let content_w = (layout.content_area.width - 20).max(40);
+    let max_y = layout.content_area.y + layout.content_area.height - 8;
+
+    if page
+        .heading
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        && let Some(font) = title_font
+        && y + font.line_height <= max_y
+    {
+        y += font.line_height + 6;
+    }
+
+    let entry_count = page.entries.len().max(1);
+    let avail_h = (max_y - y).max(20);
+    let gap = 6;
+    let per_entry_h = if entry_count == 1 {
+        avail_h
+    } else {
+        ((avail_h - gap * (entry_count as i32 - 1)) / entry_count as i32).max(48)
+    };
+
+    let mut max_overflow = 0usize;
+    for entry in &page.entries {
+        if y + 24 > max_y {
+            break;
+        }
+        let card_h = per_entry_h.min(max_y - y);
+        let mut ey = y + 8;
+        let ew = (content_w - 20).max(24);
+        let emax_y = y + card_h - 6;
+
+        if !entry.title.is_empty()
+            && let Some(font) = title_font
+            && ey + font.line_height <= emax_y
+        {
+            ey += font.line_height + 3;
+        }
+        if entry
+            .subtitle
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            && let Some(font) = small_font
+            && ey + font.line_height <= emax_y
+        {
+            ey += font.line_height + 4;
+        }
+        if !entry.badges.is_empty()
+            && let Some(font) = small_font
+            && ey + font.line_height + 6 <= emax_y
+        {
+            ey += font.line_height + 10;
+        }
+        if !entry.body.is_empty() && ey < emax_y {
+            let body_h = (emax_y - ey).max(0);
+            let visible = (body_h / lh).max(1) as usize;
+            let total = wrap_multiline_lines(body_font, &entry.body, ew).len();
+            max_overflow = max_overflow.max(total.saturating_sub(visible));
+        }
+        y += card_h + gap;
+    }
+    max_overflow
+}
+
+fn draw_multiline_wrapped_text(
+    frame: &mut Frame,
+    font: &Font,
+    text: &str,
+    rect: Rect,
+    skip_lines: usize,
+    color: [u8; 3],
+) {
+    if rect.width <= 0 || rect.height <= 0 {
+        return;
+    }
+    let lh = font.line_height.max(1);
+    let mut y = rect.y;
+    let max_y = rect.y + rect.height;
+    let lines = wrap_multiline_lines(font, text, rect.width);
+    for line in lines.into_iter().skip(skip_lines) {
+        if y + lh > max_y {
+            return;
+        }
+        if !line.is_empty() {
+            draw_clipped_text(frame, font, &line, [rect.x, y], rect.width, color);
+        }
+        y += lh;
     }
 }
