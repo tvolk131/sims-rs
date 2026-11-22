@@ -526,7 +526,8 @@ impl Surface565 {
 /// Prepared thumbnail and metadata for one lot on a neighborhood map.
 #[derive(Debug, Clone)]
 pub struct MapLot {
-    /// Lot number (`1..=98`).
+    /// Lot number (stock maps use `1..=98`; custom Unleashed `LotZoning.iff`
+    /// rows can include `0`).
     pub id: u16,
     /// Map anchor point from `LotLocations.iff` in `800×600` map coordinates.
     pub anchor: [i32; 2],
@@ -739,7 +740,7 @@ impl NeighborhoodMap {
             }
         }
 
-        let locations = load_lot_locations(install, user_dir, kind.locations_str_id())?;
+        let locations = load_lot_locations(install, user_dir)?;
         let zoning_table = load_lot_zoning(install, user_dir)?;
         let occupancy = load_family_occupancy(install, user_dir)?;
 
@@ -770,8 +771,9 @@ impl NeighborhoodMap {
 
         let mut lots = Vec::with_capacity(lot_ids.len());
         for lot_id in lot_ids {
-            // 0x4e2501..0x4e257c: missing LotLocations row retains [0, 0] anchor.
-            let anchor = locations.get(&lot_id).copied().unwrap_or([0, 0]);
+            // 0x4e20a9..0x4e257c: dispatch by lot ID across STR# 1/2/3/4/5/7,
+            // defaulting to [0, 0] when the table or row is absent.
+            let anchor = locations.anchor_for(lot_id, kind.uses_half_scale());
             let house_name = format!("House{lot_id:02}.iff");
             let Some(house_path) = resolve_child(install, &houses_dir, &house_name) else {
                 continue;
@@ -1788,36 +1790,95 @@ fn resolve_lot_status(
     }
 }
 
-fn load_lot_locations(
-    install: &Install,
-    user_dir: &Path,
-    str_id: u16,
-) -> Result<BTreeMap<u16, [i32; 2]>> {
-    let path = resolve_child(install, user_dir, "LotLocations.iff")
+/// All six `LotLocations.iff` `STR#` tables loaded by `0x4e1f5e..0x4e2098`.
+///
+/// Missing `LotLocations.iff` files or missing `STR#` chunks leave their table
+/// empty rather than aborting map load, so lookups retain `[0, 0]` (`0x4e20a9`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct LotLocations {
+    /// `STR# 1` — Classic neighborhood (`0..=11`, `50..=80` when not Unleashed; first match wins).
+    classic: BTreeMap<u16, [i32; 2]>,
+    /// `STR# 2` — Downtown (`21..=30`; last match wins, 49-byte `strncpy` cap at `0x4e2104`).
+    downtown: BTreeMap<u16, [i32; 2]>,
+    /// `STR# 3` — Vacation Island (`40..=48`; last match wins at `0x4e218f..0x4e2262`).
+    vacation: BTreeMap<u16, [i32; 2]>,
+    /// `STR# 4` — Unleashed (`0..=11`, `50..=80` when Unleashed; first match wins).
+    unleashed: BTreeMap<u16, [i32; 2]>,
+    /// `STR# 5` — Studio Town (`81..=89`; last match wins at `0x4e2273..0x4e233e`).
+    studio_town: BTreeMap<u16, [i32; 2]>,
+    /// `STR# 7` — Magic Town (`90..=99`; last match wins at `0x4e234f..0x4e241a`).
+    magic_town: BTreeMap<u16, [i32; 2]>,
+}
+
+impl LotLocations {
+    /// Dispatches a lot anchor lookup by lot ID, matching `0x4e20a9..0x4e2585`.
+    fn anchor_for(&self, lot_id: u16, use_unleashed_table: bool) -> [i32; 2] {
+        let table = match lot_id {
+            21..=30 => Some(&self.downtown),
+            40..=48 => Some(&self.vacation),
+            81..=89 => Some(&self.studio_town),
+            90..=99 => Some(&self.magic_town),
+            0..=11 | 50..=80 => Some(if use_unleashed_table {
+                &self.unleashed
+            } else {
+                &self.classic
+            }),
+            _ => None,
+        };
+        table
+            .and_then(|map| map.get(&lot_id).copied())
+            .unwrap_or([0, 0])
+    }
+}
+
+fn load_lot_locations(install: &Install, user_dir: &Path) -> Result<LotLocations> {
+    // 0x4e1f7c..0x4e2098: prefer UserDataN/LotLocations.iff; if absent, fall
+    // back to GameData/LotLocations.iff. Missing files or missing STR# chunks
+    // leave the corresponding table(s) empty so anchors default to [0, 0].
+    let Some(path) = resolve_child(install, user_dir, "LotLocations.iff")
         .or_else(|| install.file("GameData/LotLocations.iff").ok())
-        .ok_or_else(|| {
-            Error::new(format!(
-                "missing LotLocations.iff in {} or GameData",
-                user_dir.display()
-            ))
-        })?;
+    else {
+        return Ok(LotLocations::default());
+    };
     let bytes =
         fs::read(&path).map_err(|e| Error::new(format!("reading {}: {e}", path.display())))?;
     let iff = Iff::parse(bytes)?;
-    let chunk = iff
-        .get(b"STR#", str_id)
-        .ok_or_else(|| Error::new(format!("{} missing STR# {str_id}", path.display())))?;
-    let table = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk))?;
-    Ok(parse_lot_locations_table(&table))
+    let read_table = |str_id: u16, last_match_wins: bool, max_bytes: Option<usize>| -> Result<_> {
+        let Some(chunk) = iff.get(b"STR#", str_id) else {
+            return Ok(BTreeMap::new());
+        };
+        let table = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk))?;
+        Ok(parse_lot_locations_table_with(
+            &table,
+            last_match_wins,
+            max_bytes,
+        ))
+    };
+    Ok(LotLocations {
+        classic: read_table(1, false, None)?,
+        downtown: read_table(2, true, Some(49))?,
+        vacation: read_table(3, true, None)?,
+        unleashed: read_table(4, false, None)?,
+        studio_town: read_table(5, true, None)?,
+        magic_town: read_table(7, true, None)?,
+    })
 }
 
-/// Parses a `LotLocations.iff` `STR#` table (`"lot_id, x, y"` rows in US English),
-/// matching `0x4e2501..0x4e257c`:
+/// Parses a main-map `LotLocations.iff` `STR#` table (`STR# 1` or `STR# 4`,
+/// `"lot_id, x, y"` rows in US English), matching `0x4e2501..0x4e257c`:
 /// - stops each row at its first NUL byte,
 /// - splits on the first two commas (rows with fewer than two commas are skipped),
 /// - parses signed 32-bit `id`, `x`, and `y` via C `atoi` (`0x636029`),
 /// - keeps the first matching row for each lot ID.
 pub fn parse_lot_locations_table(table: &StringTable) -> BTreeMap<u16, [i32; 2]> {
+    parse_lot_locations_table_with(table, false, None)
+}
+
+fn parse_lot_locations_table_with(
+    table: &StringTable,
+    last_match_wins: bool,
+    max_bytes: Option<usize>,
+) -> BTreeMap<u16, [i32; 2]> {
     let mut map = BTreeMap::new();
     for entry in &table.entries {
         if entry.language != US_ENGLISH {
@@ -1829,7 +1890,8 @@ pub fn parse_lot_locations_table(table: &StringTable) -> BTreeMap<u16, [i32; 2]>
             entry.text.as_bytes()
         };
         let nul_end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-        let cstr = &raw[..nul_end];
+        let cap_end = max_bytes.map_or(nul_end, |cap| nul_end.min(cap));
+        let cstr = &raw[..cap_end];
         let Some(c1) = cstr.iter().position(|&b| b == b',') else {
             continue;
         };
@@ -1843,7 +1905,11 @@ pub fn parse_lot_locations_table(table: &StringTable) -> BTreeMap<u16, [i32; 2]>
         };
         let x = sims_content::atoi(&rest1[..c2]);
         let y = sims_content::atoi(&rest1[c2 + 1..]);
-        map.entry(lot_id).or_insert([x, y]);
+        if last_match_wins {
+            map.insert(lot_id, [x, y]);
+        } else {
+            map.entry(lot_id).or_insert([x, y]);
+        }
     }
     map
 }
@@ -2470,6 +2536,30 @@ mod tests {
         assert_eq!(locs.get(&7), Some(&[100, 200]));
         assert_eq!(locs.get(&0), Some(&[50, 60]));
         assert_eq!(locs.get(&8), None);
+
+        // Expansion tables (Downtown/Vacation/StudioTown/MagicTown) keep the
+        // last matching row (0x4e215a..0x4e241a), and lookup dispatches by lot
+        // ID across all six STR# tables with [0, 0] fallback (0x4e20a9..0x4e2440).
+        let dt_table = StringTable {
+            format: Format::Pascal,
+            entries: vec![entry("21, 187, 236"), entry("21, 359, 152")],
+        };
+        let all_locs = LotLocations {
+            classic: parse_lot_locations_table(&StringTable {
+                format: Format::Pascal,
+                entries: vec![entry("5, 11, 22")],
+            }),
+            downtown: parse_lot_locations_table_with(&dt_table, true, Some(49)),
+            unleashed: locs,
+            ..LotLocations::default()
+        };
+        // Unleashed screen listing Lot 21 still resolves via STR# 2 (last match).
+        assert_eq!(all_locs.anchor_for(21, true), [359, 152]);
+        assert_eq!(all_locs.anchor_for(5, true), [300, 120]);
+        assert_eq!(all_locs.anchor_for(5, false), [11, 22]);
+        // Missing STR# 7 (Magic Town) or unmapped lot ID retains [0, 0].
+        assert_eq!(all_locs.anchor_for(90, false), [0, 0]);
+        assert_eq!(all_locs.anchor_for(15, true), [0, 0]);
     }
 
     #[test]
