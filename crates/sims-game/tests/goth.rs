@@ -7800,6 +7800,82 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
             tested_overdraw,
             "expected an item priced between {funds_before_desk_sell} and {funds_after_desk_sell}"
         );
+
+        // --- 7. Sol Round 6b regressions: ID-reuse retired cursor protection,
+        //        desk sale after lamp sale does not restore refunded lamp, and
+        //        unpaid preview cannot be picked up & sold for cash ---
+        {
+            let mut lot6 =
+                Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+            for _ in 0..60 {
+                lot6.step().unwrap();
+            }
+            lot6.set_mode(sims_vm::PanelMode::Buy).unwrap();
+
+            // P2 #3: unpaid preview must NOT be pickable as existing furniture
+            // and sold for cash.
+            let funds_start = lot6.world().budget.funds;
+            let mut prev = lot6.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+            assert!(lot6.buy_move(&mut prev, [600, 440], 1).unwrap());
+            assert!(
+                lot6.buy_pick_up(prev.held).unwrap().is_none(),
+                "unpaid preview must not be pickable as existing furniture"
+            );
+            lot6.buy_cancel(&prev).unwrap();
+            assert_eq!(lot6.world().budget.funds, funds_start);
+
+            // P2 #1: retired cursor handle after ID reuse must NOT delete a
+            // newly bought chair via buy_cancel, buy_sell, save, or set_mode.
+            let mut c1 = lot6.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+            assert!(lot6.buy_move(&mut c1, [600, 440], 1).unwrap());
+            let chair1 = lot6.buy_commit(&c1).unwrap();
+            let old_pick = lot6.buy_pick_up(chair1).unwrap().unwrap();
+            let old_cursor_id = old_pick.cursor;
+            assert!(lot6.buy_sell(&old_pick).unwrap());
+            let mut c2 = lot6.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+            assert!(lot6.buy_move(&mut c2, [584, 424], 1).unwrap());
+            let chair2 = lot6.buy_commit(&c2).unwrap();
+            assert_eq!(
+                chair2, old_cursor_id,
+                "verify ID reuse of old Tile Cursor ID"
+            );
+            // None of these may delete chair2!
+            assert!(!lot6.buy_sell(&old_pick).unwrap());
+            lot6.buy_cancel(&old_pick).unwrap();
+            assert!(lot6.world().objects.contains_key(&chair2));
+            let saved = lot6.save_without_buy_cursor(&old_pick).unwrap();
+            assert!(saved.world().objects.contains_key(&chair2));
+
+            // P2 #2: selling a desk via a retained pickup cursor after its
+            // lamp was already sold separately must NOT restore the refunded
+            // lamp on Undo.
+            let mut dk = lot6.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+            assert!(lot6.buy_move(&mut dk, [584, 472], 1).unwrap());
+            let desk_id = lot6.buy_commit(&dk).unwrap();
+            let mut lp = lot6.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+            assert!(lot6.buy_move(&mut lp, [584, 472], 1).unwrap());
+            let lamp_id = lot6.buy_commit(&lp).unwrap();
+            let desk_pick = lot6.buy_pick_up(desk_id).unwrap().unwrap();
+            // Pick up and sell the lamp separately.
+            let lamp_pick = lot6.buy_pick_up(lamp_id).unwrap().unwrap();
+            assert!(lot6.buy_sell(&lamp_pick).unwrap());
+            let funds_after_lamp_sell = lot6.world().budget.funds;
+            // Now sell the desk through the retained desk cursor and Undo once.
+            assert!(lot6.buy_sell(&desk_pick).unwrap());
+            assert!(lot6.buy_undo().unwrap());
+            assert_eq!(lot6.world().budget.funds, funds_after_lamp_sell);
+            assert!(lot6.world().objects[&desk_id].position[0] >= 0);
+            assert!(
+                lot6.world().objects[&lamp_id].position[0] < 0,
+                "undoing desk sale must not restore already-refunded lamp"
+            );
+
+            // Also verify set_mode_releasing_buy_cursor with retired old_pick
+            // does NOT delete chair2.
+            lot6.set_mode_releasing_buy_cursor(sims_vm::PanelMode::Live, Some(&old_pick))
+                .unwrap();
+            assert!(lot6.world().objects.contains_key(&chair2));
+        }
     }
 }
 

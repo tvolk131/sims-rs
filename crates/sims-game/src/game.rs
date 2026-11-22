@@ -1942,13 +1942,18 @@ impl Game {
             return false;
         };
         let was_existing = cursor.is_existing();
-        let funds_before = self.lot.world().budget.funds;
+        let refund = if was_existing {
+            self.lot.resale_value(cursor.held).unwrap_or(0)
+        } else {
+            0
+        };
         match self.lot.buy_sell(&cursor) {
             Ok(true) => {
                 if was_existing {
-                    let refund = self.lot.world().budget.funds - funds_before;
                     // Native `0x487e18` -> `0x492ad4` (`UI_moneyback`) /
-                    // `0x492b05` (`UI_archtool_delete`) with 400 ms cooldown.
+                    // `0x492b05` (`UI_archtool_delete`) with 400 ms cooldown,
+                    // keyed off `resale_value` even when unlimited budget
+                    // (`global[32] != 0`) keeps household funds flat.
                     if refund != 0 {
                         if self
                             .buy_moneyback_us

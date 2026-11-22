@@ -134,6 +134,9 @@ pub struct BuyCursor {
     /// Original placement before pickup when holding an existing lot object
     /// (`0x486960` → `0x48ba19`), or `None` for a new unpaid catalog purchase.
     pub origin: Option<BuyPlacement>,
+    /// Monotonic token stamped by `Lot` so retired cursor handles can never
+    /// alias newly created objects that reuse a numeric ID.
+    pub(crate) token: u64,
 }
 
 impl BuyCursor {
@@ -506,6 +509,7 @@ impl Interpreter<'_> {
             position: [-16, -16, level],
             container: None,
             origin: None,
+            token: 0,
         };
         self.buy_rotate(world, &mut out, direction)?;
         Ok(Some(out))
@@ -780,10 +784,14 @@ impl Interpreter<'_> {
             return Ok(None);
         };
         let lead = self.lead_object(world, id);
-        let Some(lead_pos) = world.objects.get(&lead).map(|o| o.position) else {
+        let Some(lead_obj) = world.objects.get(&lead) else {
             return Ok(None);
         };
-        if !on_lot([picked_pos[0], picked_pos[1]]) || !on_lot([lead_pos[0], lead_pos[1]]) {
+        let lead_pos = lead_obj.position;
+        if lead_obj.guid == TILE_CURSOR_GUID
+            || !on_lot([picked_pos[0], picked_pos[1]])
+            || !on_lot([lead_pos[0], lead_pos[1]])
+        {
             return Ok(None);
         }
         if !self.can_pick_up(world, lead)? {
@@ -820,6 +828,7 @@ impl Interpreter<'_> {
             position: picked_pos,
             container: origin.container,
             origin: Some(origin),
+            token: 0,
         };
         let retained = out.container;
         if on_lot([px, py])
@@ -1405,7 +1414,7 @@ impl Interpreter<'_> {
         let refund = self.resale_value(world, held_lead)?;
         spend(world, cursor.budget_category, -refund).map_err(fail)?;
         self.remove_now(world, self.lead_object(world, cursor.cursor))?;
-        let origin = cursor.origin.clone().unwrap_or(BuyPlacement {
+        let mut origin = cursor.origin.clone().unwrap_or(BuyPlacement {
             object: held_lead,
             guid: cursor.guid,
             position: cursor.position,
@@ -1418,6 +1427,10 @@ impl Interpreter<'_> {
             container: cursor.container,
             children: Vec::new(),
         });
+        // `can_delete` already verified all surface slots on `held_lead` are
+        // empty right now, so a `Sell` record owns only the sold object itself
+        // and never any previously-present children that were moved or sold.
+        origin.children.clear();
         Ok(Some(Some(BuyPurchase {
             kind: BuyActionKind::Sell,
             object: held_lead,
@@ -1578,9 +1591,14 @@ impl Interpreter<'_> {
                 {
                     return Ok(false);
                 }
+                let before_restore = world.clone();
                 let Some(id) = self.restore_placement(world, &target, true)? else {
                     return Ok(false);
                 };
+                if purchase.price > 0 && available_funds(world) < purchase.price {
+                    *world = before_restore;
+                    return Ok(false);
+                }
                 spend(world, purchase.budget_category, purchase.price).map_err(fail)?;
                 purchase.object = id;
                 purchase.placed = true;
@@ -1628,9 +1646,14 @@ impl Interpreter<'_> {
                 {
                     return Ok(false);
                 }
+                let before_restore = world.clone();
                 let Some(id) = self.restore_placement(world, &target, true)? else {
                     return Ok(false);
                 };
+                if purchase.price > 0 && available_funds(world) < purchase.price {
+                    *world = before_restore;
+                    return Ok(false);
+                }
                 spend(world, purchase.budget_category, purchase.price).map_err(fail)?;
                 purchase.object = id;
                 purchase.placed = true;
@@ -1728,7 +1751,9 @@ impl Interpreter<'_> {
         cursor: &BuyCursor,
     ) -> Result<(), Fault> {
         let cur_lead = self.lead_object(world, cursor.cursor);
-        if let Some(obj) = world.objects.get(&cur_lead) {
+        if let Some(obj) = world.objects.get(&cur_lead)
+            && obj.guid == TILE_CURSOR_GUID
+        {
             if on_lot([obj.position[0], obj.position[1]]) {
                 self.take_off(world, cur_lead, true)?;
             }

@@ -170,6 +170,7 @@ impl Lot {
         if self.halted {
             return Err(SaveError::Halted);
         }
+        let cursor = cursor.filter(|c| self.is_active_buy_cursor(c));
         let mut world = self.world.clone();
         let has_history =
             !self.buy_redo.is_empty() || !self.buy_undo.is_empty() || !self.buy_orphans.is_empty();
@@ -271,6 +272,7 @@ impl Lot {
         self.buy_undo.clear();
         self.buy_redo.clear();
         self.buy_orphans.clear();
+        self.active_buy_cursors.clear();
         Ok(())
     }
 }
