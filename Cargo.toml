@@ -9,6 +9,7 @@ members = [
     "crates/sims-core",
     "crates/sims-formats",
     "crates/sims-game",
+    "crates/sims-net",
     "crates/sims-people",
     "crates/sims-render",
     "crates/sims-viewer",
@@ -27,6 +28,8 @@ repository = "https://github.com/tvolk131/sims-rs"
 
 [workspace.dependencies]
 encoding_rs = "0.8"
+flate2 = "1.1"
+iroh = "1.4"
 libm = "0.2.15"
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 redb = "4.3"
@@ -36,8 +39,10 @@ sha2 = "0.10"
 sims-content = { path = "crates/sims-content" }
 sims-core = { path = "crates/sims-core" }
 sims-formats = { path = "crates/sims-formats" }
+sims-net = { path = "crates/sims-net" }
 sims-sim = { path = "crates/sims-sim" }
 sims-vm = { path = "crates/sims-vm" }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
