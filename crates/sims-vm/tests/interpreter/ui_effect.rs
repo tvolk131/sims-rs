@@ -7044,3 +7044,200 @@ fn round_24_search_callback_invariance_expr_g34_redirect_and_formal_skip() {
         );
     }
 }
+
+#[test]
+fn round_25_mixed_camera_starts_neighbor_clamp_and_arg_slot() {
+    use sims_content::Profile;
+    // 1. P2 #1 (`placement.rs:1379`): when some camera starts find no tile
+    // (`0x4e9706`) and others place the temporary Sim (`0x4e96fe`), both UI
+    // Effect and Dialog must compare the post-removal outcomes before trapping.
+    // When the temporary Sim cannot render (missing HEAD binding), every start
+    // produces identical state, so both succeed with `view_centre = None`.
+    for use_dialog in [false, true] {
+        let (mut fx, _, record) = visitors();
+        // Put LAMP on (1,1) in isolated room 99 so start (1,1) finds no tile
+        // while all other interior starts find a tile.
+        fx.world.rooms.map[0][64 + 1] = 99;
+        fx.world.objects.get_mut(&LAMP).unwrap().position = [1, 1, 1];
+        fx.world.objects.get_mut(&LAMP).unwrap().data[29] = 99;
+        fx.world.arrays.get_mut(&3).unwrap().data[(64 + 1) * 2..(64 + 1) * 2 + 2]
+            .copy_from_slice(&(LAMP as i16).to_le_bytes());
+        // Give WIDGET a profile whose head suit does not exist so rendering
+        // returns false on placed starts, making placed (0x4e96fe) and unput
+        // (0x4e9706) outcomes identical after removal.
+        equip(&mut fx, WIDGET, "adult", 12);
+        fx.program.people.profiles.insert(
+            WIDGET,
+            Profile {
+                body: Some("missing_body,BODY=missing_body".into()),
+                head: Some("missing_head,HEAD-HEAD=missing_head".into()),
+                ..Default::default()
+            },
+        );
+        let ran = if use_dialog {
+            fx.add(
+                LAMP_FILE,
+                4096,
+                tree(vec![ins(
+                    36,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+                )]),
+            );
+            fx.run_with(LAMP, 4096, record, &[], 1000)
+        } else {
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1)
+        };
+        assert_eq!(
+            ran,
+            Ok(true),
+            "mixed placed/no-tile starts with identical post-removal state must succeed (dialog={use_dialog})"
+        );
+        assert!(!fx.world.portraits.contains(&WIDGET));
+    }
+
+    // 2. P3 #1 (`expression.rs:74`): scope 24 (`Neighbor`) clears `[ebp - 0x04]`
+    // via `0x453399 -> 0x425b8e`, so after a prior Expression, `Neighbor[0] +=
+    // Global[34]` raises native error `0x13` instead of mutating Global 34.
+    {
+        let (mut fx, _, record) = visitors();
+        fx.world.globals[34] = 37;
+        let mut add_neighbor_g34 = [0u8; 8];
+        add_neighbor_g34[0..2].copy_from_slice(&0i16.to_le_bytes()); // Neighbor[0]
+        add_neighbor_g34[2..4].copy_from_slice(&34i16.to_le_bytes()); // Global[34]
+        add_neighbor_g34[5] = 3; // +=
+        add_neighbor_g34[6] = 24; // Neighbor scope
+        add_neighbor_g34[7] = scope::GLOBAL;
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![
+                assign(scope::TEMPS, 0, scope::LITERAL, 0, 1),
+                ins(2, RETURN_TRUE, RETURN_FALSE, add_neighbor_g34),
+            ]),
+        );
+        let err = fx.run_with(SIM, 4096, record, &[], 1000).unwrap_err();
+        assert!(
+            matches!(err.trap, sims_vm::Trap::Native { code: 0x13, .. }),
+            "Neighbor[0] += Global[34] after Expression must raise native 0x13, got {err}"
+        );
+        assert_eq!(fx.world.globals[34], 37);
+    }
+
+    // 3. P3 #2 (`expression.rs:84`): after a prior Expression, `My Motive[1] +=
+    // Global[34]` redirects the write to Global 34 (`37 -> 74`) AND still runs
+    // the native `[-100.0, 100.0]` motive clamp at `0x452d22..0x452d4d`.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.world.globals[34] = 37;
+        let sim_obj = fx.world.objects.get_mut(&SIM).unwrap();
+        sim_obj.data[11] = SIM as i16;
+        sim_obj.person.as_mut().unwrap().motives[1] = 125.0;
+        let mut add_motive_g34 = [0u8; 8];
+        add_motive_g34[0..2].copy_from_slice(&1i16.to_le_bytes()); // Motive[1]
+        add_motive_g34[2..4].copy_from_slice(&34i16.to_le_bytes()); // Global[34]
+        add_motive_g34[5] = 3; // +=
+        add_motive_g34[6] = 14; // My Motive
+        add_motive_g34[7] = scope::GLOBAL;
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![
+                assign(scope::TEMPS, 0, scope::LITERAL, 0, 1),
+                ins(2, RETURN_TRUE, RETURN_FALSE, add_motive_g34),
+            ]),
+        );
+        assert_eq!(fx.run_with(SIM, 4096, 0, &[], 1000), Ok(true));
+        assert_eq!(fx.world.globals[34], 74);
+        let motive = fx.world.objects[&SIM].person.as_ref().unwrap().motives[1];
+        assert_eq!(
+            motive, 100.0,
+            "redirected motive write must still clamp motive to 100.0 (0x452d22..0x452d4d)"
+        );
+    }
+
+    // 4. P3 #3 (`expression.rs:53`): after Random Number (`0x451e8d`) or Get
+    // Direction To (`0x45202b`), a same-depth Expression comparison reading
+    // Global 34 on the RHS overwrites `[ebp + 0x08]` (`write` flag) before
+    // `0x452c7b`, so comparing against `My Person Data[68]` dirties the
+    // running Sim's cached portrait (`0x4539c7`), and comparing against
+    // `My Motive[1]` clamps the motive (`0x452d01..0x452d4d`).
+    for use_direction in [false, true] {
+        let (mut fx, _, _) = visitors();
+        fx.world.globals[34] = 0;
+        fx.world.portraits.insert(SIM_GUID);
+        fx.world.dirty_portraits.remove(&SIM_GUID);
+        let sim_obj = fx.world.objects.get_mut(&SIM).unwrap();
+        sim_obj.data[11] = SIM as i16;
+        sim_obj.person.as_mut().unwrap().motives[1] = 125.0;
+        let setup_ins = if use_direction {
+            // Get Direction To (opcode 12): dest temp[0], from my ID (flags 0).
+            let mut op = [0u8; 8];
+            op[0..2].copy_from_slice(&0i16.to_le_bytes());
+            op[2..4].copy_from_slice(&(scope::TEMPS as i16).to_le_bytes());
+            ins(12, 1, RETURN_FALSE, op)
+        } else {
+            // Random Number (opcode 8): dest temp[0], range literal 10.
+            let mut op = [0u8; 8];
+            op[0..2].copy_from_slice(&0i16.to_le_bytes());
+            op[2..4].copy_from_slice(&(scope::TEMPS as i16).to_le_bytes());
+            op[4..6].copy_from_slice(&10i16.to_le_bytes());
+            op[6..8].copy_from_slice(&(scope::LITERAL as i16).to_le_bytes());
+            ins(8, 1, RETURN_FALSE, op)
+        };
+        // Node 1: `My Person Data[68] == Global[34]` (comparison -> dirties portrait!)
+        let mut cmp_pd68 = [0u8; 8];
+        cmp_pd68[0..2].copy_from_slice(&68i16.to_le_bytes());
+        cmp_pd68[2..4].copy_from_slice(&34i16.to_le_bytes());
+        cmp_pd68[5] = 2; // ==
+        cmp_pd68[6] = 18; // My Person Data
+        cmp_pd68[7] = scope::GLOBAL;
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![
+                setup_ins.clone(),
+                ins(2, RETURN_TRUE, RETURN_TRUE, cmp_pd68),
+            ]),
+        );
+        assert_eq!(fx.run_with(SIM, 4096, LAMP as i16, &[], 1000), Ok(true));
+        assert!(
+            !fx.world.portraits.contains(&SIM_GUID) && fx.world.dirty_portraits.contains(&SIM_GUID),
+            "Global 34 comparison after {} must dirty SIM portrait at 0x4539c7",
+            if use_direction {
+                "Get Direction To"
+            } else {
+                "Random Number"
+            }
+        );
+
+        // Also check motive clamp on comparison after Random Number / Get Direction To.
+        let mut cmp_motive = [0u8; 8];
+        cmp_motive[0..2].copy_from_slice(&1i16.to_le_bytes());
+        cmp_motive[2..4].copy_from_slice(&34i16.to_le_bytes());
+        cmp_motive[5] = 2; // ==
+        cmp_motive[6] = 14; // My Motive
+        cmp_motive[7] = scope::GLOBAL;
+        fx.add(
+            SIM_FILE,
+            4097,
+            tree(vec![
+                setup_ins,
+                ins(2, RETURN_TRUE, RETURN_TRUE, cmp_motive),
+            ]),
+        );
+        assert_eq!(fx.run_with(SIM, 4097, LAMP as i16, &[], 1000), Ok(true));
+        let motive = fx.world.objects[&SIM].person.as_ref().unwrap().motives[1];
+        assert_eq!(
+            motive,
+            100.0,
+            "Global 34 motive comparison after {} must clamp motive at 0x452d01..0x452d4d",
+            if use_direction {
+                "Get Direction To"
+            } else {
+                "Random Number"
+            }
+        );
+    }
+}

@@ -299,6 +299,18 @@ pub struct World {
     /// preserve snapshot format 31; `sims_vm::boot::save::Saved` preserves it.
     #[serde(skip)]
     pub scratch_ptr_expression: BTreeSet<u16>,
+    /// Live objects whose last `[object + 0x128]` write was `Random Number`
+    /// (`0x451e8d`) or `Get Direction To` (`0x45202b`), both 2-argument
+    /// primitives storing `&[ebp + 0x0c]`. In a subsequent 1-argument
+    /// `Expression` at the same dispatch depth, that address aliases
+    /// `[ebp + 0x08]` (the LHS `write` flag), so reading Global 34 on the RHS
+    /// (`0x452c76` → `0x4541db`) overwrites `[ebp + 0x08]` with `&globals[34]`
+    /// (nonzero low byte) before `0x452c7b` passes it to `0x453141` (`resolve`)
+    /// and before `0x452d01` checks it for the motive clamp. Kept out of
+    /// [`World::encode`] to preserve snapshot format 31;
+    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub scratch_ptr_arg_slot: BTreeSet<u16>,
     /// Appearance names newly inserted into `AvatarRegistry`'s hash table by
     /// runtime `.bcf` catalog loads (`0x59f320` → `0x5a1fb1`) that were not
     /// already present in startup eager or `.ndx` registrations, in exact
@@ -763,6 +775,7 @@ impl World {
             scratch_ptr_set: BTreeSet::new(),
             scratch_ptr_set_to_next: BTreeSet::new(),
             scratch_ptr_expression: BTreeSet::new(),
+            scratch_ptr_arg_slot: BTreeSet::new(),
             runtime_added_suits: Vec::new(),
             suit_scan_cache: None,
         }

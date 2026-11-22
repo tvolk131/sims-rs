@@ -115,6 +115,7 @@ impl Machine<'_, '_> {
         // right-hand Global 34 read (`0x452c76` → `0x4541db`).
         self.world.scratch_ptr_set.remove(&self.me);
         self.world.scratch_ptr_expression.remove(&self.me);
+        self.world.scratch_ptr_arg_slot.remove(&self.me);
         self.world.scratch_ptr_set_to_next.insert(self.me);
         let (scope, index) = if operands[4] & 0x80 == 0 {
             (10, 0)

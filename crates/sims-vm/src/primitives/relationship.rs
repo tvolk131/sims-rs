@@ -173,6 +173,7 @@ impl Machine<'_, '_> {
         if sets_scratch_ptr {
             self.world.scratch_ptr_set_to_next.remove(&self.me);
             self.world.scratch_ptr_expression.remove(&self.me);
+            self.world.scratch_ptr_arg_slot.remove(&self.me);
             self.world.scratch_ptr_set.insert(self.me);
         }
         // The operand is resolved for writing in both directions.

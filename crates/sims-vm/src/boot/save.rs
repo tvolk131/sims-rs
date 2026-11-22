@@ -74,6 +74,7 @@ pub struct Saved {
     scratch_ptr_set: BTreeSet<u16>,
     scratch_ptr_set_to_next: BTreeSet<u16>,
     scratch_ptr_expression: BTreeSet<u16>,
+    scratch_ptr_arg_slot: BTreeSet<u16>,
     runtime_added_suits: Vec<String>,
     suit_scan_cache: Option<Vec<String>>,
 }
@@ -165,6 +166,7 @@ impl Saved {
         saved.world.scratch_ptr_set = saved.scratch_ptr_set.clone();
         saved.world.scratch_ptr_set_to_next = saved.scratch_ptr_set_to_next.clone();
         saved.world.scratch_ptr_expression = saved.scratch_ptr_expression.clone();
+        saved.world.scratch_ptr_arg_slot = saved.scratch_ptr_arg_slot.clone();
         saved.world.runtime_added_suits = saved.runtime_added_suits.clone();
         saved.world.suit_scan_cache = saved.suit_scan_cache.clone();
         Ok(saved)
@@ -208,6 +210,7 @@ impl Lot {
             scratch_ptr_set: self.world.scratch_ptr_set.clone(),
             scratch_ptr_set_to_next: self.world.scratch_ptr_set_to_next.clone(),
             scratch_ptr_expression: self.world.scratch_ptr_expression.clone(),
+            scratch_ptr_arg_slot: self.world.scratch_ptr_arg_slot.clone(),
             runtime_added_suits: self.world.runtime_added_suits.clone(),
             suit_scan_cache: self.world.suit_scan_cache.clone(),
         })
@@ -278,6 +281,7 @@ mod tests {
         world.scratch_ptr_set.insert(42);
         world.scratch_ptr_set_to_next.insert(43);
         world.scratch_ptr_expression.insert(42);
+        world.scratch_ptr_arg_slot.insert(44);
         world.runtime_added_suits.push("late_suit".into());
         world.suit_scan_cache = Some(vec!["suit_a".into(), "late_suit".into()]);
         let saved = Saved {
@@ -292,6 +296,7 @@ mod tests {
             scratch_ptr_set: world.scratch_ptr_set.clone(),
             scratch_ptr_set_to_next: world.scratch_ptr_set_to_next.clone(),
             scratch_ptr_expression: world.scratch_ptr_expression.clone(),
+            scratch_ptr_arg_slot: world.scratch_ptr_arg_slot.clone(),
             runtime_added_suits: world.runtime_added_suits.clone(),
             suit_scan_cache: world.suit_scan_cache.clone(),
             world,
@@ -348,6 +353,7 @@ mod tests {
             BTreeSet::from([43])
         );
         assert_eq!(decoded.world().scratch_ptr_expression, BTreeSet::from([42]));
+        assert_eq!(decoded.world().scratch_ptr_arg_slot, BTreeSet::from([44]));
         assert_eq!(
             decoded.world().runtime_added_suits,
             vec!["late_suit".to_owned()]

@@ -108,7 +108,10 @@ fn truncate_cp1252(s: &str, max_bytes: usize) -> &str {
 /// Copies at most 255 Windows-1252 bytes (`0x5874fa`–`0x58752c`) before
 /// splitting on `;` (`second_half == false` takes the first half, `true` takes
 /// the second half when `;` is present), then splits on `,`:
-/// - `suit` (before `,`) is lowercased in ASCII (`0x46f8f7`);
+/// - `suit` (before `,`, or the whole half when `,` is absent) is lowercased in
+///   ASCII (`0x5875d7` → `0x46f8f7` with a comma; `0x5875bc` loads `ecx = [ebp + 0xc]`
+///   and jumps directly to `0x587670: call 0x46f8f7`, skipping `0x58766d`, so bare
+///   suit names are lowercased too);
 /// - `texture` (after `,`): when it contains `=`, the prefix through `=` keeps
 ///   its original case while the value after `=` is lowercased (`0x587612`–
 ///   `0x58765c`); otherwise the whole texture is lowercased (`0x587670`).

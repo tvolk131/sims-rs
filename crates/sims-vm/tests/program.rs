@@ -1204,11 +1204,44 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
         &far_archive("Archived.iff", &archived_iff),
     );
 
+    // 4. Loose file with uncompressed 32-bit 1x1 BMP_ 2002 -> has_portrait_2002 = true
+    // because the native decoder (`0x4ded4a` -> `0x4df06a..0x4df122`) accepts it.
+    let bmp32_guid = 0x9000_0004u32;
+    let mut bmp32 = tiny_bmp();
+    bmp32[28..30].copy_from_slice(&32u16.to_le_bytes());
+    dir.file(
+        "GameData/Objects/bmp32.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(bmp32_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, bmp32),
+        ]),
+    );
+
+    // 5. Loose file with truncated BMP_ 2002 -> has_portrait_2002 = false.
+    let truncated_guid = 0x9000_0005u32;
+    dir.file(
+        "GameData/Objects/truncated.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(truncated_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, tiny_bmp()[..55].to_vec()),
+        ]),
+    );
+
     let install = Install::detect(&dir.0).unwrap();
     let index = Index::build(&install).unwrap();
     let catalog = Catalog::build(&index).unwrap();
-    let program =
-        Program::link(&index, &catalog, [neutral_guid, lang1_guid, archived_guid]).unwrap();
+    let program = Program::link(
+        &index,
+        &catalog,
+        [
+            neutral_guid,
+            lang1_guid,
+            archived_guid,
+            bmp32_guid,
+            truncated_guid,
+        ],
+    )
+    .unwrap();
 
     let lib = |guid| {
         let obj = catalog.object(guid).unwrap();
@@ -1220,4 +1253,7 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
     assert!(!lib(lang1_guid).read_only);
     assert!(!lib(archived_guid).has_portrait_2002);
     assert!(lib(archived_guid).read_only);
+    assert!(lib(bmp32_guid).has_portrait_2002);
+    assert!(!lib(bmp32_guid).read_only);
+    assert!(!lib(truncated_guid).has_portrait_2002);
 }

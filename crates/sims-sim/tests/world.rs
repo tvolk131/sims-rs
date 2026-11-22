@@ -286,6 +286,7 @@ fn world() -> World {
         scratch_ptr_set: BTreeSet::new(),
         scratch_ptr_set_to_next: BTreeSet::new(),
         scratch_ptr_expression: BTreeSet::new(),
+        scratch_ptr_arg_slot: BTreeSet::new(),
         runtime_added_suits: Vec::new(),
         suit_scan_cache: None,
     }

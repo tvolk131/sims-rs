@@ -393,11 +393,11 @@ impl Program {
             }
         }
         // Portrait bitmap 2002 (0x7d2) read by 0x4e92a8 -> 0x4e9260 -> 0x4dece6
-        // -> 0x41cb2f -> 0x41bab1: 0x41bad8 zeros the lookup key's high byte,
-        // so only a neutral-language (high byte 0) BMP_ 2002 matches.
+        // -> 0x4ded4a -> 0x41cb2f -> 0x41bab1: 0x41bad8 zeros the lookup key's
+        // high byte, so only a neutral-language (high byte 0) BMP_ 2002 matches.
         library.has_portrait_2002 = iff
             .get(b"BMP_", 2002)
-            .is_some_and(|chunk| sims_formats::bitmap::bmp(iff.data(chunk)).is_ok());
+            .is_some_and(|chunk| is_native_portrait_bmp(iff.data(chunk)));
         // Archive members (.far) and read-only loose files report IsWritable ==
         // false at 0x4067b3 -> 0x4174dc.
         library.read_only = file.member.is_some()
@@ -1413,6 +1413,118 @@ fn string_table(
 ) -> sims_formats::Result<sims_formats::strings::StringTable> {
     use sims_formats::strings::StringTable;
     StringTable::parse(data).or_else(|_| StringTable::parse_chunk(data, flags))
+}
+
+/// Whether a raw `BMP_` 2002 resource decodes cleanly through the original's
+/// portrait bitmap reader (`0x4dece6` → `0x4ded4a..0x4df13d`).
+///
+/// Unlike `sims_formats::bitmap::bmp`, the original decoder does not reject
+/// uncompressed 32-bit BMPs: `0x4ded62..0x4dedc9` checks only `"BM"`, non-zero
+/// dimensions, and an optional `<= 256`-entry palette (where `used == 0` computes
+/// `1u32.wrapping_shl((planes * bpp) as u32)`, matching x86 `shl eax, cl` at
+/// `0x4dedb7`), and `0x4def5b..0x4df122` decodes RLE8 (`compression == 1`),
+/// 8-bit plain (`bpp == 8`), or 3-bytes-per-pixel rows padded by `width & 3`
+/// (`0x4df06a..0x4df11c`, which accepts 24-bit and 32-bit uncompressed BMPs).
+fn is_native_portrait_bmp(data: &[u8]) -> bool {
+    const MAX_PIXELS: u64 = 4096 * 4096;
+    if data.len() < 54 || &data[0..2] != b"BM" {
+        return false;
+    }
+    let offset = u32::from_le_bytes(data[10..14].try_into().unwrap()) as usize;
+    let width = i32::from_le_bytes(data[18..22].try_into().unwrap());
+    let raw_height = i32::from_le_bytes(data[22..26].try_into().unwrap());
+    if width <= 0 || raw_height == 0 || raw_height == i32::MIN {
+        return false;
+    }
+    let w = width as usize;
+    let h = raw_height.unsigned_abs() as usize;
+    if (w as u64).saturating_mul(h as u64) > MAX_PIXELS {
+        return false;
+    }
+    let planes = u16::from_le_bytes(data[26..28].try_into().unwrap());
+    let bpp = u16::from_le_bytes(data[28..30].try_into().unwrap());
+    let compression = u32::from_le_bytes(data[30..34].try_into().unwrap());
+    let used_raw = u32::from_le_bytes(data[46..50].try_into().unwrap());
+    let used = if used_raw != 0 {
+        used_raw
+    } else {
+        1u32.wrapping_shl(u32::from(planes.wrapping_mul(bpp)))
+    };
+    if used <= 256 {
+        let Some(pal_end) = (used as usize)
+            .checked_mul(4)
+            .and_then(|n| 54usize.checked_add(n))
+        else {
+            return false;
+        };
+        if pal_end > data.len() {
+            return false;
+        }
+    }
+    let Some(body) = data.get(offset..) else {
+        return false;
+    };
+    if compression == 1 {
+        let (mut pos, mut x, mut y) = (0usize, 0usize, 0usize);
+        while pos + 2 <= body.len() {
+            let count = usize::from(body[pos]);
+            let val = body[pos + 1];
+            pos += 2;
+            if count > 0 {
+                if y >= h || x.checked_add(count).is_none_or(|nx| nx > w) {
+                    return false;
+                }
+                x += count;
+            } else {
+                match val {
+                    0 => {
+                        if y >= h {
+                            return false;
+                        }
+                        x = 0;
+                        y += 1;
+                    }
+                    1 => return true,
+                    2 => {
+                        if pos + 2 > body.len() {
+                            return false;
+                        }
+                        x = x.saturating_add(usize::from(body[pos]));
+                        y = y.saturating_add(usize::from(body[pos + 1]));
+                        pos += 2;
+                        if y >= h || x > w {
+                            return false;
+                        }
+                    }
+                    n => {
+                        let n = usize::from(n);
+                        if y >= h || x.checked_add(n).is_none_or(|nx| nx > w) {
+                            return false;
+                        }
+                        let advance = n + (n & 1);
+                        if pos.checked_add(advance).is_none_or(|end| end > body.len()) {
+                            return false;
+                        }
+                        pos += advance;
+                        x += n;
+                    }
+                }
+            }
+        }
+        false
+    } else if bpp == 8 {
+        let Some(stride) = w.checked_add(3).map(|n| n & !3) else {
+            return false;
+        };
+        stride.checked_mul(h).is_some_and(|need| need <= body.len())
+    } else {
+        let Some(row_bytes) = w.checked_mul(3).and_then(|n| n.checked_add(w & 3)) else {
+            return false;
+        };
+        row_bytes
+            .checked_mul(h)
+            .is_some_and(|need| need <= body.len())
+    }
 }
 
 #[cfg(test)]

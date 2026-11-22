@@ -1317,14 +1317,6 @@ impl Interpreter<'_> {
         id: u16,
         caller: &str,
     ) -> Result<PortraitPutPlan, Fault> {
-        let fail = |what: String| Fault {
-            object: id,
-            at: None,
-            trap: Trap::Unsupported(format!(
-                "{caller} puts a person on a tile searched for from the house view's \
-                 centre (0x4e96dd, 0x4347f0, 0x4a677c; `Lot::set_view_centre`), and {what}"
-            )),
-        };
         let datum = |world: &World, index: usize| {
             datum(world, id, index).map_err(|trap| Fault {
                 object: id,
@@ -1385,14 +1377,33 @@ impl Interpreter<'_> {
                         .take(8)
                         .map(|[x, y]| format!("{x},{y}"))
                         .collect();
-                    return Err(fail(format!(
-                        "no view centre is given, and from {} of the starts ({}{}) no tile is \
-                         found while other starts find one: the outcome (placed vs unput removal \
-                         at 0x4e9706) depends on the missing view centre",
+                    let reason = format!(
+                        "{caller} puts a person on a tile searched for from the house view's \
+                         centre (0x4e96dd, 0x4347f0, 0x4a677c; `Lot::set_view_centre`), and no \
+                         view centre is given, and from {} of the starts ({}{}) no tile is found \
+                         while other starts find one: the outcome (placed vs unput removal at \
+                         0x4e9706) depends on the missing view centre",
                         starts.len(),
                         listed.join("; "),
                         if starts.len() > 8 { "; ..." } else { "" },
-                    )));
+                    );
+                    // Because `search_from_anywhere` proved overlap callbacks
+                    // are pure for every interior start, one representative
+                    // start for `None` plus one per distinct reachable tile
+                    // covers every distinct (0x4e96fe vs 0x4e9706) outcome.
+                    let mut rep_starts = Vec::with_capacity(1 + ends.len());
+                    if let Some(&[x, y]) = starts.first() {
+                        rep_starts.push([(i32::from(x) << 4) | 8, (i32::from(y) << 4) | 8]);
+                    }
+                    for tile_starts in ends.values() {
+                        if let Some(&[x, y]) = tile_starts.first() {
+                            rep_starts.push([(i32::from(x) << 4) | 8, (i32::from(y) << 4) | 8]);
+                        }
+                    }
+                    return Ok(PortraitPutPlan::Starts {
+                        starts: rep_starts,
+                        reason,
+                    });
                 }
                 ends.into_keys().flatten().collect()
             }

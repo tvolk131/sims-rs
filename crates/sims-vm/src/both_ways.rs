@@ -226,6 +226,7 @@ pub(crate) struct LotSnapshot {
     scratch_ptr_set: BTreeSet<u16>,
     scratch_ptr_set_to_next: BTreeSet<u16>,
     scratch_ptr_expression: BTreeSet<u16>,
+    scratch_ptr_arg_slot: BTreeSet<u16>,
     runtime_added_suits: Vec<String>,
     suit_scan_cache: Option<Vec<String>>,
 }
@@ -250,6 +251,7 @@ impl LotSnapshot {
             scratch_ptr_set: w.scratch_ptr_set.clone(),
             scratch_ptr_set_to_next: w.scratch_ptr_set_to_next.clone(),
             scratch_ptr_expression: w.scratch_ptr_expression.clone(),
+            scratch_ptr_arg_slot: w.scratch_ptr_arg_slot.clone(),
             runtime_added_suits: w.runtime_added_suits.clone(),
             suit_scan_cache: w.suit_scan_cache.clone(),
         }
@@ -281,6 +283,7 @@ pub(crate) fn same_lot(a: &World, b: &World) -> bool {
         && a.scratch_ptr_set == b.scratch_ptr_set
         && a.scratch_ptr_set_to_next == b.scratch_ptr_set_to_next
         && a.scratch_ptr_expression == b.scratch_ptr_expression
+        && a.scratch_ptr_arg_slot == b.scratch_ptr_arg_slot
         && a.runtime_added_suits == b.runtime_added_suits
         && a.suit_scan_cache == b.suit_scan_cache
 }
