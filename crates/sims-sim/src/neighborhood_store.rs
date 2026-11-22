@@ -1038,14 +1038,18 @@ impl NeighborhoodStore {
     /// `(instance_id, revision)` strictly past the committed version (rotating
     /// `instance_id` on `u64::MAX` rollover) so no caller can saturate revision
     /// or let a concurrent/open lot session silently overwrite the commit.
+    ///
+    /// On success, returns the exact `(instance_id, revision)` committed by
+    /// this transaction so callers never need to reread the row afterward.
     pub fn save_neighborhood_checked(
         &self,
         id: &str,
         expected_instance_id: u128,
         expected_revision: u64,
         state: &StoredNeighborhood,
-    ) -> Result<std::result::Result<(), CheckedCommitError>> {
+    ) -> Result<std::result::Result<(u128, u64), CheckedCommitError>> {
         let txn = self.db.begin_write().map_err(store)?;
+        let committed_version;
         {
             let mut table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
             let current = {
@@ -1076,11 +1080,12 @@ impl NeighborhoodStore {
             )?;
             committed.instance_id = next_instance;
             committed.revision = next_rev;
+            committed_version = (next_instance, next_rev);
             let encoded = committed.encode();
             table.insert(id, encoded.as_slice()).map_err(store)?;
         }
         txn.commit().map_err(store)?;
-        Ok(Ok(()))
+        Ok(Ok(committed_version))
     }
 
     /// Loads all character `.iff` files stored for neighborhood `id`.
@@ -1207,8 +1212,9 @@ impl NeighborhoodStore {
     /// neighborhood's `instance_id` and `revision` still match; if the
     /// neighborhood was re-imported or another operation committed a newer
     /// revision meanwhile, aborts the transaction cleanly and returns
-    /// `Ok(Err(CheckedCommitError))`. Always preserves `instance_id` and
-    /// strictly advances `revision` past the previously committed revision.
+    /// `Ok(Err(CheckedCommitError))`. Always advances `(instance_id, revision)`
+    /// strictly past the previously committed version and returns the exact
+    /// committed `(instance_id, revision)` from the transaction.
     pub fn save_lot_and_neighborhood_checked(
         &self,
         id: &str,
@@ -1217,8 +1223,9 @@ impl NeighborhoodStore {
         lot_bytes: &[u8],
         state: &StoredNeighborhood,
         remove_character_files: &[String],
-    ) -> Result<std::result::Result<(), CheckedCommitError>> {
+    ) -> Result<std::result::Result<(u128, u64), CheckedCommitError>> {
         let txn = self.db.begin_write().map_err(store)?;
+        let committed_version;
         {
             let mut nh_table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
             let committed = if let Some((expected_instance_id, expected_revision)) = expected {
@@ -1267,6 +1274,7 @@ impl NeighborhoodStore {
                 }
                 next
             };
+            committed_version = (committed.instance_id, committed.revision);
             let encoded = committed.encode();
             let mut lot_table = txn.open_table(NEIGHBORHOOD_LOTS).map_err(store)?;
             lot_table.insert((id, house), lot_bytes).map_err(store)?;
@@ -1279,7 +1287,7 @@ impl NeighborhoodStore {
             }
         }
         txn.commit().map_err(store)?;
-        Ok(Ok(()))
+        Ok(Ok(committed_version))
     }
 
     /// Computes a base house's total lot price directly from its `SIMI` chunk

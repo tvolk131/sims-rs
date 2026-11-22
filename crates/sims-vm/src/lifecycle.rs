@@ -1215,7 +1215,7 @@ pub fn move_in_with_multiplier(
         origin_revision,
         &stored,
     )? {
-        Ok(()) => {}
+        Ok((_, _)) => {}
         Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
             return Err(LifecycleError::NeighborhoodMismatch {
                 expected: format!("{neighborhood_id}#{expected:032x}"),
@@ -1583,7 +1583,7 @@ fn boot_from_saved_lot(
                 .is_some_and(|o| o.person.is_some())
             {
                 interpreter
-                    .reset_person(&mut world, person_id, &program.people)
+                    .reset_person_after_purge(&mut world, person_id)
                     .map_err(|e| {
                         LifecycleError::Lot(format!(
                             "resetting person {person_id} after orphaned visitor purge: {e}"
@@ -2140,7 +2140,7 @@ fn save_and_leave_lot_inner(
         tuning.friendship_threshold,
     );
     let lot_bytes = saved.encode();
-    match store.save_lot_and_neighborhood_checked(
+    let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
         neighborhood_id,
         house,
         Some((origin.instance_id, origin.revision)),
@@ -2148,7 +2148,7 @@ fn save_and_leave_lot_inner(
         &stored,
         &[],
     )? {
-        Ok(()) => {}
+        Ok(version) => version,
         Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
             return Err(LifecycleError::NeighborhoodMismatch {
                 expected: format!("{neighborhood_id}#{expected:032x}"),
@@ -2162,12 +2162,6 @@ fn save_and_leave_lot_inner(
                 current_revision: current,
             });
         }
-    }
-    let (committed_instance, committed_revision) = match origin.revision.checked_add(1) {
-        Some(next_rev) => (origin.instance_id, next_rev),
-        None => store
-            .load_neighborhood(neighborhood_id)?
-            .map_or((stored.instance_id, 0), |nh| (nh.instance_id, nh.revision)),
     };
     lot.neighborhood_origin = Some(NeighborhoodOrigin {
         store_id: store.store_id(),
@@ -2566,7 +2560,7 @@ fn evict_or_bulldoze(
         &stored,
         &removed_character_files,
     )? {
-        Ok(()) => {}
+        Ok((_, _)) => {}
         Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
             return Err(LifecycleError::NeighborhoodMismatch {
                 expected: format!("{neighborhood_id}#{expected:032x}"),
@@ -3198,9 +3192,17 @@ mod tests {
         house7.world.order.push(visitor_upstairs_id);
         house7.world.people.push(visitor_upstairs_id);
 
-        // 3. Stage the resident `template_id` actively executing BHAV 4096
-        //    owned by `next_type` (`0x7757D9EE`) targeting `visitor_ground_id`
-        //    so re-entry must reset the resident's action & frame cleanly.
+        // 3. Stage the standing resident `template_id` actively executing BHAV
+        //    4096 owned by `next_type` (`0x7757D9EE`) targeting
+        //    `visitor_ground_id`, WITH an unrelated player order queued on
+        //    `survivor_id` (must survive visitor cleanup!).
+        let unrelated_order = sims_formats::saved_objects::Interaction {
+            target: survivor_id as i16,
+            icon: survivor_id as i16,
+            action: 4096,
+            priority: 50,
+            ..crate::object_uses::no_action()
+        };
         {
             let resident = house7.world.objects.get_mut(&template_id).unwrap();
             resident.stack.push(sims_formats::saved_objects::Frame {
@@ -3216,8 +3218,63 @@ mod tests {
                 person.active.target = visitor_ground_id as i16;
                 person.active.icon = visitor_ground_id as i16;
                 person.active.action = 4096;
+                person.queue.push(unrelated_order.clone());
             }
             house7.world.frame_storage.remove(&template_id);
+        }
+
+        // 4. Also test a SEATED resident (placed in a container slot of an
+        //    object on the lot) running BHAV 4096 owned by `0x7757D9EE` with an
+        //    unrelated queued order: `enter_lot` must recover the seated
+        //    resident cleanly without tripping `reset_person`'s container trap.
+        let seated_resident_id = house7
+            .world
+            .people
+            .iter()
+            .copied()
+            .find(|&pid| {
+                pid != template_id && pid != visitor_ground_id && pid != visitor_upstairs_id
+            })
+            .expect("House 7 has a second resident (Betty Newbie)");
+        let container_id = house7
+            .world
+            .order
+            .iter()
+            .copied()
+            .find(|&oid| {
+                oid != survivor_id
+                    && !house7.world.indicators.contains(&oid)
+                    && house7.world.objects[&oid].person.is_none()
+                    && house7.world.objects[&oid].slots.len() > 1
+            })
+            .expect("House 7 has a furniture object with a container slot");
+        {
+            let _ = crate::placement::unlink_off_lot(&mut house7.world, seated_resident_id);
+            house7.world.objects.get_mut(&container_id).unwrap().slots[1].object =
+                seated_resident_id as i16;
+            let container_pos = house7.world.objects[&container_id].position;
+            let seated = house7.world.objects.get_mut(&seated_resident_id).unwrap();
+            seated.position = container_pos;
+            seated.data[2] = container_id as i16; // CONTAINER
+            seated.data[3] = 0; // CONTAINER_SLOT (slot 1 - 1)
+            seated.data[14] = 1; // SLOT (physical slot 1)
+            seated.data[26] = container_id as i16; // BEFORE
+            seated.stack.push(sims_formats::saved_objects::Frame {
+                stack_object: visitor_ground_id as i16,
+                tree: 4096,
+                node: 0,
+                parameters: Vec::new(),
+                locals: Vec::new(),
+                primitive_state: 0,
+                code_owner_type: next_type as i16,
+            });
+            if let Some(person) = seated.person.as_mut() {
+                person.active.target = visitor_ground_id as i16;
+                person.active.icon = visitor_ground_id as i16;
+                person.active.action = 4096;
+                person.queue.push(unrelated_order);
+            }
+            house7.world.frame_storage.remove(&seated_resident_id);
         }
         save_and_leave_lot(&root, &store, "UserData", &mut house7).unwrap();
 
@@ -3240,7 +3297,8 @@ mod tests {
 
         // Reopening House 7 must purge both deleted visitors cleanly, promote
         // `survivor_id` back to the ground-floor tile head, clear the upstairs
-        // grid cell, and step cleanly!
+        // grid cell, preserve both residents' unrelated queued orders, recover
+        // the seated resident cleanly, and step cleanly!
         let mut house7_after = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
         assert!(!house7_after.world.objects.contains_key(&visitor_ground_id));
         assert!(!house7_after.world.people.contains(&visitor_ground_id));
@@ -3263,6 +3321,26 @@ mod tests {
             crate::placement::head(&house7_after.world, upstairs_tile),
             None,
             "upper-floor grid must not retain purged visitor ID"
+        );
+        assert!(
+            house7_after.world.objects[&template_id]
+                .person
+                .as_ref()
+                .unwrap()
+                .queue
+                .iter()
+                .any(|a| a.target == survivor_id as i16),
+            "standing resident's unrelated queued player order must survive visitor purge"
+        );
+        assert!(
+            house7_after.world.objects[&seated_resident_id]
+                .person
+                .as_ref()
+                .unwrap()
+                .queue
+                .iter()
+                .any(|a| a.target == survivor_id as i16),
+            "seated resident's unrelated queued player order must survive visitor purge"
         );
         for _ in 0..3 {
             house7_after.step().unwrap();

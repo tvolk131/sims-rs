@@ -686,29 +686,69 @@ fn copied_store_gets_distinct_store_id_and_save_neighborhood_advances_revision()
         .unwrap();
     let mut attempted_max = before_max.clone();
     attempted_max.revision = u64::MAX;
-    assert!(
-        reopened_renamed
-            .save_neighborhood_checked(
-                "UserData",
-                before_max.instance_id,
-                before_max.revision,
-                &attempted_max,
-            )
-            .unwrap()
-            .is_ok()
-    );
+    let after_max_ver = reopened_renamed
+        .save_neighborhood_checked(
+            "UserData",
+            before_max.instance_id,
+            before_max.revision,
+            &attempted_max,
+        )
+        .unwrap()
+        .unwrap();
     let after_max = reopened_renamed
         .load_neighborhood("UserData")
         .unwrap()
         .unwrap();
+    assert_eq!(after_max_ver, (after_max.instance_id, after_max.revision));
     assert_eq!(after_max.instance_id, before_max.instance_id);
     assert_eq!(after_max.revision, before_max.revision + 1);
 
-    assert!(reopened_renamed.delete_neighborhood("UserData").unwrap());
-    reopened_renamed
+    // Seed a raw `u64::MAX` revision row directly in REDB and verify that
+    // `save_lot_and_neighborhood_checked` rolls over to a fresh `instance_id`
+    // at `revision = 0` AND returns that exact `(new_instance_id, 0)` token.
+    let mut raw_max = after_max.clone();
+    raw_max.revision = u64::MAX;
+    drop(reopened_renamed);
+    {
+        let raw_db = redb::Database::open(&renamed.0).unwrap();
+        let w = raw_db.begin_write().unwrap();
+        {
+            const NH_TABLE: redb::TableDefinition<&str, &[u8]> =
+                redb::TableDefinition::new("neighborhoods");
+            let mut t = w.open_table(NH_TABLE).unwrap();
+            let enc = raw_max.encode();
+            t.insert("UserData", enc.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    let reopened_rollover = NeighborhoodStore::open(&renamed.0).unwrap();
+    let (rolled_inst, rolled_rev) = reopened_rollover
+        .save_lot_and_neighborhood_checked(
+            "UserData",
+            5,
+            Some((raw_max.instance_id, u64::MAX)),
+            b"rolled-lot",
+            &raw_max,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_ne!(rolled_inst, raw_max.instance_id);
+    assert_eq!(rolled_rev, 0);
+    let stored_rolled = reopened_rollover
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (stored_rolled.instance_id, stored_rolled.revision),
+        (rolled_inst, 0)
+    );
+
+    assert!(reopened_rollover.delete_neighborhood("UserData").unwrap());
+    reopened_rollover
         .save_neighborhood("UserData", &after_max)
         .unwrap();
-    let recreated = reopened_renamed
+    let recreated = reopened_rollover
         .load_neighborhood("UserData")
         .unwrap()
         .unwrap();
