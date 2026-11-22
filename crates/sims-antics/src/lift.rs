@@ -115,17 +115,7 @@ pub fn format_bcon_antics(chunk: &BconChunk) -> String {
 
 /// Lifts a raw `OBJD` chunk payload into an [`ObjdChunk`] IR.
 pub fn lift_objd(id: u16, label: &str, data: &[u8]) -> Result<ObjdChunk> {
-    // Validate with sims_formats::behavior::ObjectDefinition when length is sufficient,
-    // or fall back to checking the 4-byte version header for short legacy definitions.
-    if data.len() < 4 {
-        return Err(Error::new("OBJD chunk shorter than 4-byte version"));
-    }
-    let version = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if data.len() >= 84 {
-        let _ = sims_formats::behavior::ObjectDefinition::parse(data)?;
-    } else if !matches!(version, 136..=142) {
-        return Err(Error::new(format!("unsupported OBJD version {version}")));
-    }
+    let parsed = sims_formats::behavior::ObjectDefinition::parse(data)?;
     let word_count = data.len() / 2;
     let mut words = Vec::with_capacity(word_count);
     for pair in data[..word_count * 2].as_chunks::<2>().0 {
@@ -139,7 +129,7 @@ pub fn lift_objd(id: u16, label: &str, data: &[u8]) -> Result<ObjdChunk> {
     Ok(ObjdChunk {
         id,
         label: label.to_owned(),
-        version,
+        version: parsed.version,
         words,
         trailing_byte,
     })

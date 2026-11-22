@@ -26,10 +26,10 @@ We enforce a strict separation between **interoperable binary wire formats** and
 `sims-antics` obeys all workspace determinism and safety rules (`unsafe_code = "forbid"`, `BTreeMap`/`BTreeSet` only, `libm` for transcendental math, zero new third-party dependencies).
 
 ### 3.1 Binary IFF & Chunk Encoders (`encode.rs`, `ir.rs`)
-- Reuses `sims_formats::iff` and `sims_formats::iff_write` for IFF 2.5 header and version-0 `rsmp` resource map framing.
+- Emits fresh Maxis IFF 2.5 containers with authentic version-0 `rsmp` resource maps preserving exact caller-supplied flags and distinct `(tag, id, variant)` entries while rejecting duplicates.
 - Checked little-endian/bit-packed encoders for:
-  - `BHAV` (formats `0x8000`, `0x8001`, `0x8002`, `0x8003`: 12-byte header + 12-byte instructions)
-  - `OBJD` (versioned word arrays `136..=142`, plus typed `ObjdSpec` builder emitting canonical 216-byte definitions)
+  - `BHAV` (formats `0x8000`, `0x8001`, `0x8002`: 12-byte header + 12-byte instructions, matching `sims-formats` and `sims-vm`; `0x8003` is explicitly rejected until end-to-end reader/VM semantics are added)
+  - `OBJD` (versioned word arrays `136 | 138..=142`, minimum 84 bytes matching `ObjectDefinition::parse`, plus typed `ObjdSpec` builder emitting canonical 216-byte definitions)
   - `OBJf` (callback tables)
   - `BCON` (8-bit counted `i16` constant tables)
   - `STR#` / `CTSS` / `TTAs` (all formats: `0x0000` Pascal, `0xFFFF` Terminated, `0xFFFE` Commented, `0xFFFD` Localized, and classic big-endian `MacResource`)

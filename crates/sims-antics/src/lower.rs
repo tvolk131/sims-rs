@@ -24,7 +24,7 @@ pub struct LoweredModule {
 }
 
 /// Lowers a parsed `.antics` [`Module`] into deterministic [`BhavChunk`]s and
-/// [`BconChunk`]s with full jump target validation.
+/// [`BconChunk`]s with full jump target and frame-dimension validation.
 pub fn lower_module(module: &Module) -> Result<LoweredModule> {
     let mut tree_ids_by_name = BTreeMap::new();
     for item in &module.items {
@@ -102,35 +102,188 @@ struct PendingNode {
     on_false: PendingTarget,
 }
 
+#[derive(Debug, Default)]
+struct TreeUsage {
+    only_raw_ops: bool,
+    uses_idle: bool,
+    uses_param0: bool,
+    max_user_local: Option<usize>,
+}
+
+fn scan_tree_usage(stmts: &[Stmt]) -> TreeUsage {
+    let mut usage = TreeUsage {
+        only_raw_ops: true,
+        ..TreeUsage::default()
+    };
+    scan_stmts(stmts, &mut usage);
+    usage
+}
+
+fn scan_operand(op: Operand, usage: &mut TreeUsage) {
+    if op.scope == 9 && op.index == 0 {
+        usage.uses_param0 = true;
+    } else if op.scope == 25 && op.index >= 0 {
+        let idx = op.index as usize;
+        usage.max_user_local = Some(usage.max_user_local.map_or(idx, |m| m.max(idx)));
+    }
+}
+
+fn scan_primitive(prim: &PrimitiveCall, usage: &mut TreeUsage) {
+    match prim {
+        PrimitiveCall::Sleep { param_index } | PrimitiveCall::IdleForInput { param_index, .. } => {
+            if *param_index == 0 {
+                usage.uses_param0 = true;
+            }
+        }
+        PrimitiveCall::ExprRaw { lhs, rhs, .. } => {
+            scan_operand(*lhs, usage);
+            scan_operand(*rhs, usage);
+        }
+        PrimitiveCall::Random { dst, range } => {
+            scan_operand(*dst, usage);
+            scan_operand(*range, usage);
+        }
+        PrimitiveCall::SetMotiveChange {
+            delta_per_hour,
+            stop_at,
+            ..
+        } => {
+            scan_operand(*delta_per_hour, usage);
+            scan_operand(*stop_at, usage);
+        }
+        PrimitiveCall::Animate {
+            flags, local_index, ..
+        } if flags & 0x20 != 0 => {
+            // Flag bit 0x20 stores animation events in `local_index`.
+            let idx = usize::from(*local_index);
+            usage.max_user_local = Some(usage.max_user_local.map_or(idx, |m| m.max(idx)));
+        }
+        _ => {}
+    }
+}
+
+fn scan_condition(cond: &Condition, usage: &mut TreeUsage) {
+    match cond {
+        Condition::Not(inner) => scan_condition(inner, usage),
+        Condition::Compare { lhs, rhs, .. } => {
+            scan_operand(*lhs, usage);
+            scan_operand(*rhs, usage);
+        }
+        Condition::Call { .. } => {}
+        Condition::Primitive { prim, .. } => scan_primitive(prim, usage),
+    }
+}
+
+fn scan_stmts(stmts: &[Stmt], usage: &mut TreeUsage) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Label { .. } | Stmt::RawOp { .. } => {}
+            Stmt::Primitive { prim, .. } => {
+                usage.only_raw_ops = false;
+                scan_primitive(prim, usage);
+            }
+            Stmt::Call { .. } => {
+                usage.only_raw_ops = false;
+            }
+            Stmt::Assign { lhs, rhs, .. } => {
+                usage.only_raw_ops = false;
+                scan_operand(*lhs, usage);
+                scan_operand(*rhs, usage);
+            }
+            Stmt::Idle { ticks, .. } => {
+                usage.only_raw_ops = false;
+                usage.uses_idle = true;
+                scan_operand(*ticks, usage);
+            }
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+                ..
+            } => {
+                usage.only_raw_ops = false;
+                scan_condition(cond, usage);
+                scan_stmts(then_body, usage);
+                scan_stmts(else_body, usage);
+            }
+            Stmt::While { cond, body, .. } => {
+                usage.only_raw_ops = false;
+                scan_condition(cond, usage);
+                scan_stmts(body, usage);
+            }
+            Stmt::Return { .. } => {
+                usage.only_raw_ops = false;
+            }
+        }
+    }
+}
+
 struct TreeBuilder<'a> {
     tree_ids: &'a BTreeMap<String, u16>,
     nodes: Vec<PendingNode>,
     labels: BTreeMap<String, usize>,
-    max_local_used: Option<u16>,
-    max_param_used: Option<u8>,
-    uses_idle: bool,
+    max_local_needed: usize,
+    max_param_needed: usize,
+    idle_scratch_local: Option<usize>,
+    max_allowed_args: usize,
+    max_allowed_locals: usize,
 }
 
 impl<'a> TreeBuilder<'a> {
-    fn new(tree_ids: &'a BTreeMap<String, u16>) -> Self {
+    fn new(
+        tree_ids: &'a BTreeMap<String, u16>,
+        idle_scratch_local: Option<usize>,
+        max_allowed_args: usize,
+        max_allowed_locals: usize,
+    ) -> Self {
         Self {
             tree_ids,
             nodes: Vec::new(),
             labels: BTreeMap::new(),
-            max_local_used: None,
-            max_param_used: None,
-            uses_idle: false,
+            max_local_needed: 0,
+            max_param_needed: 0,
+            idle_scratch_local,
+            max_allowed_args,
+            max_allowed_locals,
         }
     }
 
-    fn note_operand(&mut self, op: Operand) {
-        if op.scope == 25 && op.index >= 0 {
-            let idx = op.index as u16;
-            self.max_local_used = Some(self.max_local_used.map_or(idx, |m| m.max(idx)));
-        } else if op.scope == 9 && op.index >= 0 && op.index <= 255 {
-            let idx = op.index as u8;
-            self.max_param_used = Some(self.max_param_used.map_or(idx, |m| m.max(idx)));
+    fn note_operand(&mut self, op: Operand, span: Span) -> Result<()> {
+        if op.scope == 25 {
+            let idx = usize::try_from(op.index).map_err(|_| {
+                Error::at(span, format!("local index {} cannot be negative", op.index))
+            })?;
+            let needed = idx + 1;
+            if needed > self.max_allowed_locals {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "local[{idx}] exceeds format limit of {} locals",
+                        self.max_allowed_locals
+                    ),
+                ));
+            }
+            self.max_local_needed = self.max_local_needed.max(needed);
+        } else if op.scope == 9 {
+            let idx = usize::try_from(op.index).map_err(|_| {
+                Error::at(
+                    span,
+                    format!("parameter index {} cannot be negative", op.index),
+                )
+            })?;
+            let needed = idx + 1;
+            if needed > self.max_allowed_args {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "param[{idx}] exceeds format limit of {} arguments",
+                        self.max_allowed_args
+                    ),
+                ));
+            }
+            self.max_param_needed = self.max_param_needed.max(needed);
         }
+        Ok(())
     }
 
     fn emit(
@@ -156,6 +309,11 @@ impl<'a> TreeBuilder<'a> {
             on_false,
         });
         Ok(idx)
+    }
+
+    fn emit_return_node(&mut self, span: Span, ret: PendingTarget) -> Result<usize> {
+        let noop_ops = encode_expr_operands(Operand::literal(0), 2, Operand::literal(0));
+        self.emit(span, 2, noop_ops, ret.clone(), ret)
     }
 
     fn target_from_ast(&self, target: &Target, span: Span) -> PendingTarget {
@@ -196,7 +354,7 @@ impl<'a> TreeBuilder<'a> {
     fn encode_primitive(&mut self, prim: &PrimitiveCall, span: Span) -> Result<(u16, [u8; 8])> {
         match prim {
             PrimitiveCall::Sleep { param_index } => {
-                self.note_operand(Operand::new(9, *param_index));
+                self.note_operand(Operand::new(9, *param_index), span)?;
                 let [p0, p1] = param_index.to_le_bytes();
                 Ok((0, [p0, p1, 0, 0, 0, 0, 0, 0]))
             }
@@ -205,13 +363,13 @@ impl<'a> TreeBuilder<'a> {
                 Ok((1, [r0, r1, 0, 0, 0, 0, 0, 0]))
             }
             PrimitiveCall::ExprRaw { lhs, operator, rhs } => {
-                self.note_operand(*lhs);
-                self.note_operand(*rhs);
+                self.note_operand(*lhs, span)?;
+                self.note_operand(*rhs, span)?;
                 Ok((2, encode_expr_operands(*lhs, *operator, *rhs)))
             }
             PrimitiveCall::Random { dst, range } => {
-                self.note_operand(*dst);
-                self.note_operand(*range);
+                self.note_operand(*dst, span)?;
+                self.note_operand(*range, span)?;
                 let [d0, d1] = dst.index.to_le_bytes();
                 let [ds0, ds1] = u16::from(dst.scope).to_le_bytes();
                 let [r0, r1] = range.index.to_le_bytes();
@@ -226,7 +384,7 @@ impl<'a> TreeBuilder<'a> {
                 param_index,
                 allow_push,
             } => {
-                self.note_operand(Operand::new(9, *param_index));
+                self.note_operand(Operand::new(9, *param_index), span)?;
                 let [p0, p1] = param_index.to_le_bytes();
                 let [a0, a1] = allow_push.to_le_bytes();
                 Ok((17, [p0, p1, a0, a1, 0, 0, 0, 0]))
@@ -255,8 +413,8 @@ impl<'a> TreeBuilder<'a> {
                         format!("motive {motive} cannot be modified by set_motive_change"),
                     ));
                 }
-                self.note_operand(*delta_per_hour);
-                self.note_operand(*stop_at);
+                self.note_operand(*delta_per_hour, span)?;
+                self.note_operand(*stop_at, span)?;
                 let [a0, a1] = delta_per_hour.index.to_le_bytes();
                 let [s0, s1] = stop_at.index.to_le_bytes();
                 Ok((
@@ -280,11 +438,29 @@ impl<'a> TreeBuilder<'a> {
             }
             PrimitiveCall::Dialog {
                 kind,
-                text_id,
+                message,
+                title,
+                button1,
+                button2,
+                button3,
                 flags,
             } => {
-                let [t0, t1] = text_id.to_le_bytes();
-                Ok((36, [t0, t1, 0, 0, 0, *kind & 0x7F, 0, *flags]))
+                // Dialog operand layout (`sims-vm/src/primitives/dialog.rs:712`):
+                // [0]=button3, [1]=mode4_str, [2]=message, [3]=button1,
+                // [4]=button2, [5]=kind, [6]=title, [7]=flags.
+                Ok((
+                    36,
+                    [
+                        *button3,
+                        0,
+                        *message,
+                        *button1,
+                        *button2,
+                        *kind & 0x7F,
+                        *title,
+                        *flags,
+                    ],
+                ))
             }
             PrimitiveCall::Animate {
                 clip_id,
@@ -293,6 +469,12 @@ impl<'a> TreeBuilder<'a> {
                 events,
                 local_index,
             } => {
+                if flags & 0x20 != 0 {
+                    self.note_operand(Operand::new(25, i16::from(*local_index)), span)?;
+                }
+                if flags & 0x04 != 0 {
+                    self.note_operand(Operand::new(9, *clip_id as i16), span)?;
+                }
                 let [c0, c1] = clip_id.to_le_bytes();
                 Ok((
                     44,
@@ -300,12 +482,16 @@ impl<'a> TreeBuilder<'a> {
                 ))
             }
             PrimitiveCall::RouteTo { slot, flags } => {
+                // Go To Routing Slot (opcode 45): word 0 = slot, word 1 = source
+                // (1 = literal object routing slot; 0 = parameter index), byte 4 = flags.
                 let [s0, s1] = slot.to_le_bytes();
-                Ok((45, [s0, s1, 0, 0, *flags, 0, 0, 0]))
+                Ok((45, [s0, s1, 1, 0, *flags, 0, 0, 0]))
             }
             PrimitiveCall::Snap { slot, flags } => {
+                // Snap (opcode 46): word 0 = slot, word 1 = mode
+                // (3 = literal object routing slot; 0 = parameter index), byte 4 = flags.
                 let [s0, s1] = slot.to_le_bytes();
-                Ok((46, [s0, s1, 0, 0, *flags, 0, 0, 0]))
+                Ok((46, [s0, s1, 3, 0, *flags, 0, 0, 0]))
             }
         }
     }
@@ -326,13 +512,19 @@ impl<'a> TreeBuilder<'a> {
             operands[i * 2] = lo;
             operands[i * 2 + 1] = hi;
         }
+        if operands == [0xFF; 8] {
+            return Err(Error::at(
+                span,
+                "four literal -1 call arguments collide with the VM's all-0xFF 'temps' sentinel; \
+                 pass them via temps instead",
+            ));
+        }
         Ok(operands)
     }
 
     /// Lowers a sequence of statements whose fallthrough exits to `next_target`.
     /// Returns the entry target of this statement sequence.
     fn lower_block(&mut self, stmts: &[Stmt], next_target: PendingTarget) -> Result<PendingTarget> {
-        // Check if this block uses explicit labels (low-level mode) vs structured control flow.
         let has_labels_or_raw = stmts
             .iter()
             .any(|s| matches!(s, Stmt::Label { .. } | Stmt::RawOp { .. }));
@@ -355,7 +547,6 @@ impl<'a> TreeBuilder<'a> {
             let fallthrough = if is_last {
                 next_target.clone()
             } else {
-                // Placeholder patched right after emitting this statement.
                 PendingTarget::Resolved(TARGET_TRUE)
             };
             let before = self.nodes.len();
@@ -374,6 +565,12 @@ impl<'a> TreeBuilder<'a> {
                     let on_true = self.target_from_ast(&branches.on_true, *span);
                     let on_false = self.target_from_ast(&branches.on_false, *span);
                     self.emit(*span, *opcode, *operands, on_true, on_false)?;
+                }
+                Stmt::Return { span, target } => {
+                    // Emit a concrete terminating node so any preceding label points to
+                    // this return and execution never falls through into later statements.
+                    let ret = self.target_from_ast(target, *span);
+                    self.emit_return_node(*span, ret)?;
                 }
                 Stmt::Primitive {
                     span,
@@ -409,12 +606,11 @@ impl<'a> TreeBuilder<'a> {
                     self.emit(*span, opcode, operands, on_true, on_false)?;
                 }
                 _ => {
-                    // Structured statement nested inside a labeled tree.
                     let after_placeholder = PendingTarget::Node {
                         index: usize::MAX,
                         span: Span::default(),
                     };
-                    self.lower_structured_stmt(
+                    let entry = self.lower_structured_stmt(
                         stmt,
                         if is_last {
                             next_target.clone()
@@ -422,6 +618,11 @@ impl<'a> TreeBuilder<'a> {
                             after_placeholder
                         },
                     )?;
+                    if self.nodes.len() == before
+                        && let PendingTarget::Resolved(ret) = entry
+                    {
+                        self.emit_return_node(Span::default(), PendingTarget::Resolved(ret))?;
+                    }
                     if !is_last {
                         let next_idx = self.nodes.len();
                         for node in &mut self.nodes[before..] {
@@ -432,24 +633,24 @@ impl<'a> TreeBuilder<'a> {
                     continue;
                 }
             }
-            if !is_last && self.nodes.len() > before {
-                // Only patch implicit fallthrough when no explicit branches were given.
-                if matches!(
+            if !is_last
+                && self.nodes.len() > before
+                && matches!(
                     stmt,
                     Stmt::Primitive { branches: None, .. } | Stmt::Call { branches: None, .. }
-                ) {
-                    let next_idx = self.nodes.len();
-                    let last_node = self.nodes.last_mut().unwrap();
-                    last_node.on_true = PendingTarget::Node {
+                )
+            {
+                let next_idx = self.nodes.len();
+                let last_node = self.nodes.last_mut().unwrap();
+                last_node.on_true = PendingTarget::Node {
+                    index: next_idx,
+                    span: last_node.span,
+                };
+                if matches!(stmt, Stmt::Primitive { branches: None, .. }) {
+                    last_node.on_false = PendingTarget::Node {
                         index: next_idx,
                         span: last_node.span,
                     };
-                    if matches!(stmt, Stmt::Primitive { branches: None, .. }) {
-                        last_node.on_false = PendingTarget::Node {
-                            index: next_idx,
-                            span: last_node.span,
-                        };
-                    }
                 }
             }
         }
@@ -486,13 +687,11 @@ impl<'a> TreeBuilder<'a> {
             let after = if is_last {
                 next_target.clone()
             } else if let Stmt::Return { span, target } = &stmts[i + 1] {
-                // Directly route this statement's fallthrough to the return target!
                 let ret = self.target_from_ast(target, *span);
                 let stmt_entry = self.lower_structured_stmt(stmt, ret)?;
                 if entry.is_none() {
                     entry = Some(stmt_entry);
                 }
-                // Stop after the return statement.
                 break;
             } else {
                 PendingTarget::Node {
@@ -525,8 +724,8 @@ impl<'a> TreeBuilder<'a> {
         match stmt {
             Stmt::Return { span, target } => Ok(self.target_from_ast(target, *span)),
             Stmt::Assign { span, lhs, op, rhs } => {
-                self.note_operand(*lhs);
-                self.note_operand(*rhs);
+                self.note_operand(*lhs, *span)?;
+                self.note_operand(*rhs, *span)?;
                 let operands = encode_expr_operands(*lhs, op.code(), *rhs);
                 let idx = self.emit(*span, 2, operands, next_target.clone(), next_target)?;
                 Ok(PendingTarget::Node {
@@ -535,28 +734,58 @@ impl<'a> TreeBuilder<'a> {
                 })
             }
             Stmt::Idle { span, ticks } => {
-                self.uses_idle = true;
-                self.note_operand(*ticks);
-                self.note_operand(Operand::new(9, 0));
-                // 1. param[0] := ticks
-                // 2. sleep(param[0]) -> next_target
-                let sleep_idx_placeholder = PendingTarget::Node {
-                    index: self.nodes.len() + 1,
-                    span: *span,
-                };
-                let set_ops = encode_expr_operands(Operand::new(9, 0), 5, *ticks);
-                let first = self.emit(
-                    *span,
-                    2,
-                    set_ops,
-                    sleep_idx_placeholder.clone(),
-                    sleep_idx_placeholder,
-                )?;
-                self.emit(*span, 0, [0; 8], next_target.clone(), next_target)?;
-                Ok(PendingTarget::Node {
-                    index: first,
-                    span: *span,
-                })
+                self.note_operand(*ticks, *span)?;
+                self.note_operand(Operand::new(9, 0), *span)?;
+                if let Some(scratch) = self.idle_scratch_local {
+                    // Preserve caller's param[0] around Sleep (opcode 0 counts param[0] down to 0).
+                    let scratch_op = Operand::new(25, scratch as i16);
+                    self.note_operand(scratch_op, *span)?;
+                    let save_idx = self.nodes.len();
+                    let set_idx = save_idx + 1;
+                    let sleep_idx = save_idx + 2;
+                    let restore_idx = save_idx + 3;
+                    let save_ops = encode_expr_operands(scratch_op, 5, Operand::new(9, 0));
+                    let set_ops = encode_expr_operands(Operand::new(9, 0), 5, *ticks);
+                    let restore_ops = encode_expr_operands(Operand::new(9, 0), 5, scratch_op);
+                    let to_set = PendingTarget::Node {
+                        index: set_idx,
+                        span: *span,
+                    };
+                    let to_sleep = PendingTarget::Node {
+                        index: sleep_idx,
+                        span: *span,
+                    };
+                    let to_restore = PendingTarget::Node {
+                        index: restore_idx,
+                        span: *span,
+                    };
+                    self.emit(*span, 2, save_ops, to_set.clone(), to_set)?;
+                    self.emit(*span, 2, set_ops, to_sleep.clone(), to_sleep)?;
+                    self.emit(*span, 0, [0; 8], to_restore.clone(), to_restore)?;
+                    self.emit(*span, 2, restore_ops, next_target.clone(), next_target)?;
+                    Ok(PendingTarget::Node {
+                        index: save_idx,
+                        span: *span,
+                    })
+                } else {
+                    let sleep_idx_placeholder = PendingTarget::Node {
+                        index: self.nodes.len() + 1,
+                        span: *span,
+                    };
+                    let set_ops = encode_expr_operands(Operand::new(9, 0), 5, *ticks);
+                    let first = self.emit(
+                        *span,
+                        2,
+                        set_ops,
+                        sleep_idx_placeholder.clone(),
+                        sleep_idx_placeholder,
+                    )?;
+                    self.emit(*span, 0, [0; 8], next_target.clone(), next_target)?;
+                    Ok(PendingTarget::Node {
+                        index: first,
+                        span: *span,
+                    })
+                }
             }
             Stmt::Primitive {
                 span,
@@ -605,7 +834,6 @@ impl<'a> TreeBuilder<'a> {
                 then_body,
                 else_body,
             } => {
-                // Emit condition first with placeholders, then bodies, then patch.
                 let cond_idx = self.emit_condition(
                     cond,
                     PendingTarget::Resolved(TARGET_TRUE),
@@ -666,14 +894,19 @@ impl<'a> TreeBuilder<'a> {
         match cond {
             Condition::Not(inner) => self.emit_condition(inner, on_false, on_true),
             Condition::Compare { span, lhs, op, rhs } => {
-                self.note_operand(*lhs);
-                self.note_operand(*rhs);
+                self.note_operand(*lhs, *span)?;
+                self.note_operand(*rhs, *span)?;
                 let operands = encode_expr_operands(*lhs, op.code(), *rhs);
                 self.emit(*span, 2, operands, on_true, on_false)
             }
-            Condition::Call { span, target, args } => {
+            Condition::Call {
+                span,
+                target,
+                args,
+                pass_temps,
+            } => {
                 let opcode = self.resolve_call_target(target, *span)?;
-                let operands = self.encode_call_operands(args, false, *span)?;
+                let operands = self.encode_call_operands(args, *pass_temps, *span)?;
                 self.emit(*span, opcode, operands, on_true, on_false)
             }
             Condition::Primitive { span, prim } => {
@@ -737,15 +970,52 @@ fn encode_expr_operands(lhs: Operand, operator: u8, rhs: Operand) -> [u8; 8] {
     [l0, l1, r0, r1, 0, operator, lhs.scope, rhs.scope]
 }
 
-fn lower_tree(tree: &TreeDecl, tree_ids: &BTreeMap<String, u16>) -> Result<BhavChunk> {
-    if !matches!(tree.header.format, 0x8000..=0x8003) {
-        return Err(Error::at(
-            tree.span,
-            format!("unsupported BHAV format {:#06x}", tree.header.format),
-        ));
+fn format_limits(format: u16) -> Option<(usize, usize)> {
+    // Matches `sims-vm/src/interpreter.rs:1340` (`dimensions`).
+    match format {
+        0x8000 => Some((4, 0)),
+        0x8001 => Some((4, 4)),
+        0x8002 => Some((255, 255)),
+        _ => None,
     }
+}
 
-    let mut builder = TreeBuilder::new(tree_ids);
+fn lower_tree(tree: &TreeDecl, tree_ids: &BTreeMap<String, u16>) -> Result<BhavChunk> {
+    let (max_allowed_args, max_allowed_locals) =
+        format_limits(tree.header.format).ok_or_else(|| {
+            Error::at(
+                tree.span,
+                format!(
+                    "unsupported BHAV format {:#06x} (supported: 0x8000, 0x8001, 0x8002)",
+                    tree.header.format
+                ),
+            )
+        })?;
+
+    let usage = scan_tree_usage(&tree.body);
+    let idle_scratch_local = if usage.uses_idle && usage.uses_param0 {
+        let scratch = usage.max_user_local.map_or(0, |m| m + 1);
+        if scratch >= max_allowed_locals {
+            return Err(Error::at(
+                tree.span,
+                format!(
+                    "tree '{}' uses both param[0] and idle(), requiring a scratch local[{scratch}] \
+                     which exceeds format {:#06x}'s limit of {max_allowed_locals} locals",
+                    tree.label, tree.header.format
+                ),
+            ));
+        }
+        Some(scratch)
+    } else {
+        None
+    };
+
+    let mut builder = TreeBuilder::new(
+        tree_ids,
+        idle_scratch_local,
+        max_allowed_args,
+        max_allowed_locals,
+    );
     let entry = builder.lower_block(&tree.body, PendingTarget::Resolved(TARGET_TRUE))?;
 
     // If a high-level tree consisted solely of `return true/false/error`, emit a
@@ -756,14 +1026,7 @@ fn lower_tree(tree: &TreeDecl, tree_ids: &BTreeMap<String, u16>) -> Result<BhavC
             PendingTarget::Resolved(b) => b,
             _ => TARGET_TRUE,
         };
-        let noop_ops = encode_expr_operands(Operand::literal(0), 2, Operand::literal(0));
-        builder.emit(
-            tree.span,
-            2,
-            noop_ops,
-            PendingTarget::Resolved(ret_code),
-            PendingTarget::Resolved(ret_code),
-        )?;
+        builder.emit_return_node(tree.span, PendingTarget::Resolved(ret_code))?;
     }
 
     let count = builder.nodes.len();
@@ -779,43 +1042,73 @@ fn lower_tree(tree: &TreeDecl, tree_ids: &BTreeMap<String, u16>) -> Result<BhavC
         });
     }
 
-    let inferred_locals = builder.max_local_used.map_or(0, |m| m + 1);
-    let locals = match tree.header.locals {
-        Some(declared) => {
-            if declared < inferred_locals {
-                return Err(Error::at(
-                    tree.span,
-                    format!(
-                        "tree '{}' declares {declared} locals but references local[{}]",
-                        tree.label,
-                        inferred_locals - 1
-                    ),
-                ));
+    // Verbatim raw-op trees (such as lifted original BHAVs) preserve exact header args/locals.
+    let (args, locals) = if usage.only_raw_ops {
+        (
+            tree.header.args.unwrap_or(0),
+            tree.header.locals.unwrap_or(0),
+        )
+    } else {
+        let locals = match tree.header.locals {
+            Some(declared) => {
+                if usize::from(declared) > max_allowed_locals {
+                    return Err(Error::at(
+                        tree.span,
+                        format!(
+                            "tree '{}' declares {declared} locals, exceeding format {:#06x}'s \
+                             limit of {max_allowed_locals}",
+                            tree.label, tree.header.format
+                        ),
+                    ));
+                }
+                if usize::from(declared) < builder.max_local_needed {
+                    return Err(Error::at(
+                        tree.span,
+                        format!(
+                            "tree '{}' declares {declared} locals but requires at least {}",
+                            tree.label, builder.max_local_needed
+                        ),
+                    ));
+                }
+                declared
             }
-            declared
-        }
-        None => inferred_locals,
-    };
+            None => builder.max_local_needed as u16,
+        };
 
-    let inferred_args = match (builder.max_param_used, builder.uses_idle) {
-        (Some(m), _) => m.saturating_add(1),
-        (None, true) => 1,
-        (None, false) => 0,
-    };
-    let args = match tree.header.args {
-        Some(declared) => {
-            if declared < inferred_args && tree.header.format != 0x8000 {
-                return Err(Error::at(
-                    tree.span,
-                    format!(
-                        "tree '{}' declares {declared} args but requires at least {inferred_args}",
-                        tree.label
-                    ),
-                ));
+        let args = match tree.header.args {
+            Some(declared) => {
+                if tree.header.format != 0x8000 {
+                    if usize::from(declared) > max_allowed_args {
+                        return Err(Error::at(
+                            tree.span,
+                            format!(
+                                "tree '{}' declares {declared} args, exceeding format {:#06x}'s \
+                                 limit of {max_allowed_args}",
+                                tree.label, tree.header.format
+                            ),
+                        ));
+                    }
+                    if usize::from(declared) < builder.max_param_needed {
+                        return Err(Error::at(
+                            tree.span,
+                            format!(
+                                "tree '{}' declares {declared} args but requires at least {}",
+                                tree.label, builder.max_param_needed
+                            ),
+                        ));
+                    }
+                }
+                declared
             }
-            declared
-        }
-        None => inferred_args,
+            None => {
+                if tree.header.format == 0x8000 {
+                    0
+                } else {
+                    builder.max_param_needed as u8
+                }
+            }
+        };
+        (args, locals)
     };
 
     Ok(BhavChunk {

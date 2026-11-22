@@ -1,15 +1,19 @@
 use sims_antics::art::{DGRP_DIRECTIONS, DGRP_ZOOMS, FurnitureShape, generate_furniture_sprites};
-use sims_antics::audio::{SAMPLE_RATE, SoundPreset, synthesize_preset};
-use sims_antics::compile::{compile_antics, package_far};
+use sims_antics::audio::{
+    MAX_SAMPLE_RATE, SAMPLE_RATE, SoundPreset, SynthSpec, encode_pcm16_wav, synthesize_preset,
+    synthesize_wav,
+};
+use sims_antics::compile::{compile_antics, compile_object_from_sources, package_far};
 use sims_antics::encode::{
-    encode_bcon, encode_bhav, encode_dgrp, encode_iff_with_rsmp, encode_objd, encode_objf,
-    encode_palt, encode_slot, encode_spr2, encode_string_table, encode_ttab,
+    encode_bcon, encode_bhav, encode_dgrp, encode_fwav, encode_iff_with_rsmp, encode_objd,
+    encode_objf, encode_palt, encode_slot, encode_spr2, encode_string_table, encode_ttab,
 };
 use sims_antics::ir::{
-    BconChunk, BhavChunk, DgrpChunk, IFF_CONVERTED_FLAG, ObjdSpec, ObjfChunk, PaltChunk, SlotChunk,
-    Spr2Chunk, Spr2Frame, Spr2Pixel, StringEntry, StringFormat, StringTableChunk, TtabChunk,
+    BconChunk, BhavChunk, DgrpChunk, FwavChunk, IFF_CONVERTED_FLAG, ObjdChunk, ObjdSpec, ObjfChunk,
+    PaltChunk, SlotChunk, Spr2Chunk, Spr2Frame, Spr2Pixel, StringEntry, StringFormat,
+    StringTableChunk, TtabChunk,
 };
-use sims_antics::lift::{format_bhav_antics, lift_bhav};
+use sims_antics::lift::{format_bhav_antics, lift_bhav, lift_ttab};
 use sims_antics::manifest::{ObjectManifest, SpriteSpec, parse_toml};
 use sims_formats::behavior::{
     Behavior, Instruction, Interaction, InteractionTable, MotiveAdvertisement, ObjectDefinition,
@@ -21,14 +25,14 @@ use sims_formats::sprite::{DrawGroup, DrawSprite, DrawView, Palette, SpriteSet, 
 use sims_formats::strings::{Format, StringTable};
 
 #[test]
-fn bhav_formats_8000_through_8003_encode_cleanly() {
+fn bhav_formats_8000_through_8002_encode_and_8003_is_rejected() {
     let ins = Instruction {
         opcode: 2,
         on_true: 0xFE,
         on_false: 0xFF,
         operands: [1, 0, 2, 0, 0, 2, 7, 7],
     };
-    for format in [0x8000u16, 0x8001, 0x8002, 0x8003] {
+    for format in [0x8000u16, 0x8001, 0x8002] {
         let mut chunk = BhavChunk::new(4096, "Test", vec![ins.clone()]);
         chunk.format = format;
         chunk.kind = 1;
@@ -38,17 +42,20 @@ fn bhav_formats_8000_through_8003_encode_cleanly() {
         let bytes = encode_bhav(&chunk).unwrap();
         assert_eq!(bytes.len(), 24);
         assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), format);
-        if format <= 0x8002 {
-            let parsed = Behavior::parse(&bytes).unwrap();
-            assert_eq!(parsed.format, format);
-            assert_eq!(parsed.kind, 1);
-            assert_eq!(parsed.args, 2);
-            assert_eq!(parsed.locals, 3);
-            assert_eq!(parsed.revision, 0x1234_5678);
-            assert_eq!(parsed.instructions.len(), 1);
-            assert_eq!(parsed.instructions[0].opcode, 2);
-        }
+        let parsed = Behavior::parse(&bytes).unwrap();
+        assert_eq!(parsed.format, format);
+        assert_eq!(parsed.kind, 1);
+        assert_eq!(parsed.args, 2);
+        assert_eq!(parsed.locals, 3);
+        assert_eq!(parsed.revision, 0x1234_5678);
+        assert_eq!(parsed.instructions.len(), 1);
+        assert_eq!(parsed.instructions[0].opcode, 2);
     }
+
+    let mut unsupported = BhavChunk::new(4096, "Unsupported", vec![ins]);
+    unsupported.format = 0x8003;
+    assert!(encode_bhav(&unsupported).is_err());
+    assert!(compile_antics(r#"tree 4096 "BadFmt" (format: 0x8003) { return true; }"#).is_err());
 }
 
 #[test]
@@ -588,4 +595,313 @@ preset = "wood_creak"
     assert_eq!(manifest.interactions[0].motives[0].motive_index, 6);
     assert_eq!(manifest.slots.len(), 1);
     assert_eq!(manifest.sounds.len(), 1);
+}
+
+#[test]
+fn sol_round1_compiler_and_encoder_regressions() {
+    // 1. P0: Label before `return false;` must return false (0xFF), never fall through or return true.
+    let labeled_ret = compile_antics(
+        r#"
+tree 4096 "LabeledReturn" {
+    @start:
+    return false;
+    my.attr[0] := 99;
+}
+"#,
+    )
+    .unwrap();
+    let bhav = &labeled_ret.behaviors[&4096];
+    assert_eq!(bhav.instructions[0].on_true, 0xFF);
+    assert_eq!(bhav.instructions[0].on_false, 0xFF);
+
+    // 2. P0: Two-part BCON addressing uses (table << 7) | entry and validates bounds.
+    let bcon_tree = compile_antics(
+        r#"
+tree 4096 "ReadBcon" {
+    my.attr[0] := bcon[1:0];
+    my.attr[1] := bcon[64:5];
+    return true;
+}
+"#,
+    )
+    .unwrap();
+    let ops0 = bcon_tree.behaviors[&4096].instructions[0].operands;
+    let ops1 = bcon_tree.behaviors[&4096].instructions[1].operands;
+    assert_eq!(u16::from_le_bytes([ops0[2], ops0[3]]), 128);
+    assert_eq!(u16::from_le_bytes([ops1[2], ops1[3]]), (64 << 7) | 5);
+    assert!(compile_antics(r#"tree 4096 "Bad" { my.attr[0] := bcon[192:0]; }"#).is_err());
+    assert!(compile_antics(r#"tree 4096 "Bad" { my.attr[0] := bcon[0:128]; }"#).is_err());
+
+    // 3. P0: Stale compressed TTAB hints must not corrupt mutated fields.
+    let mut base_ttab = TtabChunk::new(
+        128,
+        "T",
+        vec![Interaction {
+            action: 4, // fits in 5-bit signed hint
+            test: 0,
+            string_index: 0,
+            flags: 0,
+            autonomy: 50,
+            attenuation_code: 0,
+            attenuation: 0.0,
+            joining_index: -1,
+            motives: Vec::new(),
+            flags2: 0,
+        }],
+    );
+    base_ttab.version = 10;
+    base_ttab.compressed = true;
+    let bytes = encode_ttab(&base_ttab).unwrap();
+    let mut lifted = lift_ttab(128, "T", &bytes).unwrap();
+    lifted.interactions[0].action = 4096; // no longer fits in 5-bit hint!
+    let reencoded = encode_ttab(&lifted).unwrap();
+    let reparsed = InteractionTable::parse(&reencoded).unwrap();
+    assert_eq!(reparsed.interactions[0].action, 4096);
+
+    // 4. P0 & P1: Fresh IFF rejects duplicate resources, preserves distinct variants & flags == 0.
+    let mac_str = encode_string_table(&StringTableChunk::new(
+        *b"STR#",
+        300,
+        "Mac",
+        StringFormat::MacResource,
+        vec![StringEntry::english("OnlyOne")],
+    ))
+    .unwrap();
+    let iff_bytes = encode_iff_with_rsmp(&[
+        ChunkData {
+            tag: *b"STR#",
+            id: 300,
+            flags: 0, // big-endian Mac resource: must NOT be mutated to 0x10!
+            label: "Mac".into(),
+            data: mac_str,
+        },
+        ChunkData {
+            tag: *b"BMP_",
+            id: 1,
+            flags: IFF_CONVERTED_FLAG,
+            label: "V0".into(),
+            data: vec![1, 2],
+        },
+        ChunkData {
+            tag: *b"BMP_",
+            id: 1,
+            flags: 0x0210, // distinct variant 2: must NOT replace variant 0!
+            label: "V2".into(),
+            data: vec![3, 4],
+        },
+    ])
+    .unwrap();
+    let iff = Iff::parse(iff_bytes).unwrap();
+    assert!(iff.map_error().is_none());
+    let str_chunk = iff.get(b"STR#", 300).unwrap();
+    assert_eq!(iff.resource_flags(str_chunk), 0);
+    let parsed_mac =
+        StringTable::parse_chunk(iff.data(str_chunk), iff.resource_flags(str_chunk)).unwrap();
+    assert_eq!(parsed_mac.entries.len(), 1);
+    assert_eq!(parsed_mac.entries[0].text, "OnlyOne");
+    assert_eq!(iff.resource_order(b"BMP_").unwrap().len(), 2);
+
+    // Duplicate resource identity rejected
+    assert!(
+        encode_iff_with_rsmp(&[
+            ChunkData {
+                tag: *b"FWAV",
+                id: 1,
+                flags: IFF_CONVERTED_FLAG,
+                label: "A".into(),
+                data: b"a\0".to_vec(),
+            },
+            ChunkData {
+                tag: *b"FWAV",
+                id: 1,
+                flags: IFF_CONVERTED_FLAG,
+                label: "B".into(),
+                data: b"b\0".to_vec(),
+            },
+        ])
+        .is_err()
+    );
+
+    // 5. P1: Frame inference rejects unaddressable indices and format limits.
+    assert!(compile_antics(r#"tree 4096 "P" { my.attr[0] := param[255]; }"#).is_err());
+    assert!(compile_antics(r#"tree 4096 "L" { local[255] := 1; }"#).is_err());
+    assert!(compile_antics(r#"tree 4096 "L8000" (format: 0x8000) { local[0] := 1; }"#).is_err());
+    assert!(compile_antics(r#"tree 4096 "L8001" (format: 0x8001) { local[4] := 1; }"#).is_err());
+    assert!(
+        compile_antics(r#"tree 4096 "L256" (format: 0x8002, locals: 256) { return true; }"#)
+            .is_err()
+    );
+
+    // 6. P1: Call syntax preserves `temps` in conditions & rejects sentinel collision.
+    let cond_temps = compile_antics(
+        r#"
+tree 4096 "CondTemps" {
+    if call 4097(temps) {
+        return true;
+    }
+    return false;
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cond_temps.behaviors[&4096].instructions[0].operands,
+        [0xFF; 8]
+    );
+    assert!(compile_antics(r#"tree 4096 "Mix" { call 4097(1, temps); }"#).is_err());
+    assert!(compile_antics(r#"tree 4096 "MixSub" { subroutine(4097, temps, 1); }"#).is_err());
+    assert!(compile_antics(r#"tree 4096 "Coll" { call 4097(-1, -1, -1, -1); }"#).is_err());
+
+    // 7. P1: Dialog operand layout places message in byte 2 and title/buttons in bytes 0,3,4,6.
+    let dlg = compile_antics(
+        r#"
+tree 4096 "Dlg" {
+    dialog(0, 1);
+    dialog(kind: 1, message: 2, title: 3, button1: 4, button2: 5, button3: 6, flags: 1);
+    return true;
+}
+"#,
+    )
+    .unwrap();
+    let d0 = dlg.behaviors[&4096].instructions[0].operands;
+    assert_eq!(d0, [0, 0, 1, 0, 0, 0, 0, 0]);
+    let d1 = dlg.behaviors[&4096].instructions[1].operands;
+    assert_eq!(d1, [6, 0, 2, 4, 5, 1, 3, 1]);
+
+    // 8. P1: Manifest validates sections and compiles [[constant]] and [[callback]].
+    assert!(
+        ObjectManifest::parse(
+            r#"
+[object]
+name = "Bad"
+guid = 0x7F00_0099
+[interaction]
+name = "WrongSectionType"
+action = 4096
+"#
+        )
+        .is_err()
+    );
+    assert!(
+        ObjectManifest::parse(
+            r#"
+[object]
+name = "Bad"
+guid = 0x7F00_0099
+[unknown_section]
+foo = 1
+"#
+        )
+        .is_err()
+    );
+    let obj_with_consts = compile_object_from_sources(
+        r#"
+[object]
+name = "With Consts"
+guid = 0x7F00_0098
+init = "Init"
+
+[[constant]]
+id = 4096
+label = "Rates"
+values = [10, 20, 30]
+
+[[callback]]
+index = 7
+action = "RoomsChanged"
+"#,
+        &[(
+            "s.antics",
+            r#"
+tree 4096 "Init" { return true; }
+tree 4097 "RoomsChanged" { return true; }
+"#,
+        )],
+    )
+    .unwrap();
+    let compiled_iff = Iff::parse(obj_with_consts.iff_bytes).unwrap();
+    assert_eq!(
+        constants(compiled_iff.data(compiled_iff.get(b"BCON", 4096).unwrap())).unwrap(),
+        vec![10, 20, 30]
+    );
+    let objf =
+        ObjectFunctions::parse(compiled_iff.data(compiled_iff.get(b"OBJf", 128).unwrap())).unwrap();
+    assert_eq!(objf.entries[0].action, 4096);
+    assert_eq!(objf.entries[7].action, 4097);
+
+    // 9. P1: Depth limits & iterative negation prevent stack overflow.
+    let deep_not = format!(
+        "tree 4096 \"N\" {{ if {}my.attr[0] == 1 {{ return true; }} return false; }}",
+        "!".repeat(512)
+    );
+    assert!(compile_antics(&deep_not).is_ok());
+    let deep_if = format!(
+        "tree 4096 \"Deep\" {{ {} return true; {} }}",
+        "if my.attr[0] == 1 { ".repeat(80),
+        "}".repeat(80)
+    );
+    assert!(compile_antics(&deep_if).is_err());
+    let deep_toml = format!("a = {}{}", "[".repeat(80), "]".repeat(80));
+    assert!(parse_toml(&deep_toml).is_err());
+
+    // 10. P1: Encoder & audio bounds.
+    let bad_objd_v137 = ObjdChunk {
+        id: 128,
+        label: "Bad".into(),
+        version: 137,
+        words: vec![0; 108],
+        trailing_byte: None,
+    };
+    assert!(encode_objd(&bad_objd_v137).is_err());
+    let short_objd = ObjdChunk {
+        id: 128,
+        label: "Short".into(),
+        version: 138,
+        words: vec![0; 10],
+        trailing_byte: None,
+    };
+    assert!(encode_objd(&short_objd).is_err());
+    let huge_spr2 = Spr2Chunk {
+        id: 100,
+        label: "Huge".into(),
+        version: 1001,
+        default_palette: 100,
+        frames: vec![Spr2Frame {
+            width: 5000,
+            height: 5000,
+            flags: 7,
+            palette_id: 100,
+            transparent_index: 0,
+            x: 0,
+            y: 0,
+            pixels: Vec::new(),
+        }],
+    };
+    assert!(encode_spr2(&huge_spr2).is_err());
+    // FWAV rejects non-Latin-1 (e.g. '€') so sims-vm decoding matches sounds_wav keys.
+    assert!(
+        encode_fwav(&FwavChunk {
+            id: 1,
+            label: "Euro".into(),
+            sound_name: "price_€".into(),
+        })
+        .is_err()
+    );
+    // Custom WAV bounds reject huge durations & invalid rates before allocating.
+    assert!(
+        synthesize_wav(&SynthSpec {
+            sample_rate: MAX_SAMPLE_RATE,
+            duration_ms: u32::MAX,
+            start_hz: 440.0,
+            end_hz: 440.0,
+            harmonic_mix: 0.0,
+            noise_mix: 0.0,
+            attack_ms: 1,
+            decay_rate: 1.0,
+            amplitude: 0.5,
+            seed: 1,
+        })
+        .is_err()
+    );
+    assert!(encode_pcm16_wav(u32::MAX, &[0, 1]).is_err());
 }

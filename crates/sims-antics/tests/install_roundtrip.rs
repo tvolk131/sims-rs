@@ -3,8 +3,9 @@
 //! Legal boundary: reads original `.iff` files from `$SIMS_INSTALL` strictly in
 //! memory, lifts chunks into `sims-antics` IR / `.antics` source text in memory,
 //! parses + lowers + re-encodes back to raw chunk bytes in memory, asserts 100%
-//! byte-for-byte parity in memory, and drops all buffers without ever writing
-//! anything derived from commercial assets to disk.
+//! byte-for-byte parity in memory using metadata-only diagnostics (never
+//! printing commercial payload bytes), and drops all buffers without ever
+//! writing anything derived from commercial assets to disk.
 
 use sims_antics::compile::compile_antics;
 use sims_antics::encode::{
@@ -16,9 +17,40 @@ use sims_antics::lift::{
     lift_string_table, lift_ttab,
 };
 use sims_content::{ArchivePool, Index, Install};
+use sims_formats::behavior::{Behavior, InteractionTable, ObjectDefinition};
+use sims_formats::execution::{ObjectFunctions, Slots, constants};
 use sims_formats::iff::{DELETED, Iff};
-use std::collections::BTreeSet;
+use sims_formats::strings::StringTable;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+
+/// Compares two byte buffers without ever formatting payload bytes into panic messages.
+fn assert_bytes_equal(actual: &[u8], expected: &[u8], context: &str) {
+    if actual == expected {
+        return;
+    }
+    let first_diff = actual
+        .iter()
+        .zip(expected.iter())
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| actual.len().min(expected.len()));
+    panic!(
+        "round-trip byte mismatch in {context}: actual_len={} expected_len={} first_diff_offset={first_diff}",
+        actual.len(),
+        expected.len()
+    );
+}
+
+#[derive(Default)]
+struct TagStats {
+    attempted: usize,
+    compared: usize,
+    /// Chunks that `sims_formats` itself refuses to parse (e.g. legacy/non-standard
+    /// resources the reader rejects), tracked explicitly rather than silently ignored.
+    reader_rejected: usize,
+    /// Chunks that `sims_formats` parsed but `sims-antics` failed to lift/encode.
+    unexpected_skips: usize,
+}
 
 #[test]
 fn complete_collection_in_memory_chunk_roundtrip_parity() {
@@ -37,17 +69,13 @@ fn complete_collection_in_memory_chunk_roundtrip_parity() {
     let pool = ArchivePool::new();
 
     let mut iff_files = 0usize;
-    let mut bhav_count = 0usize;
+    let mut iff_read_or_parse_failed = 0usize;
     let mut bhav_text_roundtrips = 0usize;
-    let mut bcon_count = 0usize;
-    let mut str_count = 0usize;
-    let mut ctss_count = 0usize;
-    let mut ttas_count = 0usize;
-    let mut ttab_count = 0usize;
+    let mut bhav_text_skipped_invalid_targets = 0usize;
     let mut ttab_compressed_count = 0usize;
-    let mut slot_count = 0usize;
-    let mut objd_count = 0usize;
-    let mut objf_count = 0usize;
+
+    let mut stats: BTreeMap<&'static str, TagStats> = BTreeMap::new();
+    let mut unexpected_notes: Vec<String> = Vec::new();
 
     let mut bhav_formats = BTreeSet::new();
     let mut primitive_opcodes = BTreeSet::new();
@@ -61,12 +89,15 @@ fn complete_collection_in_memory_chunk_roundtrip_parity() {
             continue;
         }
         let Ok(bytes) = resource.read_with(&pool) else {
+            iff_read_or_parse_failed += 1;
             continue;
         };
         let Ok(iff) = Iff::parse(bytes) else {
+            iff_read_or_parse_failed += 1;
             continue;
         };
         iff_files += 1;
+        let loc = resource.location(&index.root);
 
         for chunk in &iff.chunks {
             if chunk.flags & DELETED != 0 {
@@ -75,8 +106,19 @@ fn complete_collection_in_memory_chunk_roundtrip_parity() {
             let data = iff.data(chunk);
             match &chunk.tag {
                 b"BHAV" => {
-                    let Ok(lifted) = lift_bhav(chunk.id, &chunk.label, data) else {
+                    let s = stats.entry("BHAV").or_default();
+                    s.attempted += 1;
+                    if Behavior::parse(data).is_err() {
+                        s.reader_rejected += 1;
                         continue;
+                    }
+                    let lifted = match lift_bhav(chunk.id, &chunk.label, data) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            s.unexpected_skips += 1;
+                            unexpected_notes.push(format!("{loc} BHAV #{}: {e}", chunk.id));
+                            continue;
+                        }
                     };
                     bhav_formats.insert(lifted.format);
                     for ins in &lifted.instructions {
@@ -85,20 +127,14 @@ fn complete_collection_in_memory_chunk_roundtrip_parity() {
                         }
                     }
 
-                    // 1. Direct IR -> encode byte parity
                     let encoded_ir = encode_bhav(&lifted).expect("encode_bhav failed");
-                    assert_eq!(
-                        encoded_ir,
+                    assert_bytes_equal(
+                        &encoded_ir,
                         data,
-                        "BHAV IR mismatch in {} chunk #{}",
-                        resource.location(&index.root),
-                        chunk.id
+                        &format!("{loc} BHAV #{} (IR)", chunk.id),
                     );
-                    bhav_count += 1;
+                    s.compared += 1;
 
-                    // 2. Full text pipeline: lift -> .antics text -> parse -> lower -> encode
-                    // Verify every well-formed BHAV (<= 251 nodes with valid in-range targets)
-                    // round-trips identically through the `.antics` lexer, parser, and lowerer!
                     let valid_targets = lifted.instructions.len() <= 251
                         && lifted.instructions.iter().all(|ins| {
                             let ok = |t: u8| {
@@ -111,155 +147,208 @@ fn complete_collection_in_memory_chunk_roundtrip_parity() {
                         let source_text = format_bhav_antics(&lifted);
                         let compiled = compile_antics(&source_text).unwrap_or_else(|e| {
                             panic!(
-                                "compile_antics failed on lifted BHAV {} #{}: {e}",
-                                resource.location(&index.root),
+                                "compile_antics failed on lifted BHAV {loc} #{}: {e}",
                                 chunk.id
                             )
                         });
                         let mut re_bhav = compiled.behaviors[&chunk.id].clone();
                         re_bhav.trailing = lifted.trailing.clone();
                         let encoded_text = encode_bhav(&re_bhav).expect("encode_bhav text failed");
-                        assert_eq!(
-                            encoded_text,
+                        assert_bytes_equal(
+                            &encoded_text,
                             data,
-                            "BHAV .antics text round-trip mismatch in {} #{}",
-                            resource.location(&index.root),
-                            chunk.id
+                            &format!("{loc} BHAV #{} (.antics text)", chunk.id),
                         );
                         bhav_text_roundtrips += 1;
+                    } else {
+                        bhav_text_skipped_invalid_targets += 1;
                     }
                 }
                 b"BCON" => {
-                    let Ok(lifted) = lift_bcon(chunk.id, &chunk.label, data) else {
+                    let s = stats.entry("BCON").or_default();
+                    s.attempted += 1;
+                    if constants(data).is_err() {
+                        s.reader_rejected += 1;
                         continue;
+                    }
+                    let lifted = match lift_bcon(chunk.id, &chunk.label, data) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            s.unexpected_skips += 1;
+                            unexpected_notes.push(format!("{loc} BCON #{}: {e}", chunk.id));
+                            continue;
+                        }
                     };
                     let encoded = encode_bcon(&lifted).expect("encode_bcon failed");
-                    assert_eq!(
-                        encoded,
-                        data,
-                        "BCON mismatch in {} #{}",
-                        resource.location(&index.root),
-                        chunk.id
-                    );
-                    // Also verify `.antics` text round-trip for BCON
+                    assert_bytes_equal(&encoded, data, &format!("{loc} BCON #{} (IR)", chunk.id));
                     let text = format_bcon_antics(&lifted);
                     let compiled = compile_antics(&text).unwrap_or_else(|e| {
                         panic!(
-                            "compile_antics failed on lifted BCON {} #{}: {e}",
-                            resource.location(&index.root),
+                            "compile_antics failed on lifted BCON {loc} #{}: {e}",
                             chunk.id
                         )
                     });
                     let mut re_bcon = compiled.constants[&chunk.id].clone();
                     re_bcon.trailing = lifted.trailing.clone();
-                    assert_eq!(encode_bcon(&re_bcon).unwrap(), data);
-                    bcon_count += 1;
+                    let encoded_text = encode_bcon(&re_bcon).expect("encode_bcon text failed");
+                    assert_bytes_equal(
+                        &encoded_text,
+                        data,
+                        &format!("{loc} BCON #{} (.antics text)", chunk.id),
+                    );
+                    s.compared += 1;
                 }
                 b"STR#" | b"CTSS" | b"TTAs" => {
-                    let Ok(lifted) = lift_string_table(chunk.tag, chunk.id, &chunk.label, data)
-                    else {
+                    let tag_key = match &chunk.tag {
+                        b"STR#" => "STR#",
+                        b"CTSS" => "CTSS",
+                        b"TTAs" => "TTAs",
+                        _ => unreachable!(),
+                    };
+                    let s = stats.entry(tag_key).or_default();
+                    s.attempted += 1;
+                    if StringTable::parse(data).is_err() {
+                        s.reader_rejected += 1;
                         continue;
+                    }
+                    let lifted = match lift_string_table(chunk.tag, chunk.id, &chunk.label, data) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            s.unexpected_skips += 1;
+                            unexpected_notes.push(format!("{loc} {tag_key} #{}: {e}", chunk.id));
+                            continue;
+                        }
                     };
                     str_formats.insert(format!("{:?}", lifted.format));
                     let encoded = encode_string_table(&lifted).expect("encode_string_table failed");
-                    assert_eq!(
-                        encoded,
-                        data,
-                        "{} mismatch in {} #{}",
-                        chunk.kind(),
-                        resource.location(&index.root),
-                        chunk.id
-                    );
-                    match &chunk.tag {
-                        b"STR#" => str_count += 1,
-                        b"CTSS" => ctss_count += 1,
-                        b"TTAs" => ttas_count += 1,
-                        _ => unreachable!(),
-                    }
+                    assert_bytes_equal(&encoded, data, &format!("{loc} {tag_key} #{}", chunk.id));
+                    s.compared += 1;
                 }
                 b"TTAB" => {
-                    let Ok(lifted) = lift_ttab(chunk.id, &chunk.label, data) else {
+                    let s = stats.entry("TTAB").or_default();
+                    s.attempted += 1;
+                    if InteractionTable::parse(data).is_err() {
+                        s.reader_rejected += 1;
                         continue;
+                    }
+                    let lifted = match lift_ttab(chunk.id, &chunk.label, data) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            s.unexpected_skips += 1;
+                            unexpected_notes.push(format!("{loc} TTAB #{}: {e}", chunk.id));
+                            continue;
+                        }
                     };
                     ttab_versions.insert(lifted.version);
                     if lifted.compressed {
                         ttab_compressed_count += 1;
                     }
                     let encoded = encode_ttab(&lifted).expect("encode_ttab failed");
-                    assert_eq!(
-                        encoded,
-                        data,
-                        "TTAB mismatch in {} #{}",
-                        resource.location(&index.root),
-                        chunk.id
-                    );
-                    ttab_count += 1;
+                    assert_bytes_equal(&encoded, data, &format!("{loc} TTAB #{}", chunk.id));
+                    s.compared += 1;
                 }
                 b"SLOT" => {
-                    let Ok(lifted) = lift_slot(chunk.id, &chunk.label, data) else {
+                    let s = stats.entry("SLOT").or_default();
+                    s.attempted += 1;
+                    if Slots::parse(data).is_err() {
+                        s.reader_rejected += 1;
                         continue;
+                    }
+                    let lifted = match lift_slot(chunk.id, &chunk.label, data) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            s.unexpected_skips += 1;
+                            unexpected_notes.push(format!("{loc} SLOT #{}: {e}", chunk.id));
+                            continue;
+                        }
                     };
                     slot_versions.insert(lifted.version);
                     let encoded = encode_slot(&lifted).expect("encode_slot failed");
-                    assert_eq!(
-                        encoded,
-                        data,
-                        "SLOT mismatch in {} #{}",
-                        resource.location(&index.root),
-                        chunk.id
-                    );
-                    slot_count += 1;
+                    assert_bytes_equal(&encoded, data, &format!("{loc} SLOT #{}", chunk.id));
+                    s.compared += 1;
                 }
                 b"OBJD" => {
-                    let Ok(lifted) = lift_objd(chunk.id, &chunk.label, data) else {
+                    let s = stats.entry("OBJD").or_default();
+                    s.attempted += 1;
+                    if ObjectDefinition::parse(data).is_err() {
+                        s.reader_rejected += 1;
                         continue;
+                    }
+                    let lifted = match lift_objd(chunk.id, &chunk.label, data) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            s.unexpected_skips += 1;
+                            unexpected_notes.push(format!("{loc} OBJD #{}: {e}", chunk.id));
+                            continue;
+                        }
                     };
                     let encoded = encode_objd(&lifted).expect("encode_objd failed");
-                    assert_eq!(
-                        encoded,
-                        data,
-                        "OBJD mismatch in {} #{}",
-                        resource.location(&index.root),
-                        chunk.id
-                    );
-                    objd_count += 1;
+                    assert_bytes_equal(&encoded, data, &format!("{loc} OBJD #{}", chunk.id));
+                    s.compared += 1;
                 }
                 b"OBJf" => {
-                    let Ok(lifted) = lift_objf(chunk.id, &chunk.label, data) else {
+                    let s = stats.entry("OBJf").or_default();
+                    s.attempted += 1;
+                    if ObjectFunctions::parse(data).is_err() {
+                        s.reader_rejected += 1;
                         continue;
+                    }
+                    let lifted = match lift_objf(chunk.id, &chunk.label, data) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            s.unexpected_skips += 1;
+                            unexpected_notes.push(format!("{loc} OBJf #{}: {e}", chunk.id));
+                            continue;
+                        }
                     };
                     let encoded = encode_objf(&lifted).expect("encode_objf failed");
-                    assert_eq!(
-                        encoded,
-                        data,
-                        "OBJf mismatch in {} #{}",
-                        resource.location(&index.root),
-                        chunk.id
-                    );
-                    objf_count += 1;
+                    assert_bytes_equal(&encoded, data, &format!("{loc} OBJf #{}", chunk.id));
+                    s.compared += 1;
                 }
                 _ => {}
             }
         }
     }
 
+    let get = |tag: &str| stats.get(tag).map_or(0, |s| s.compared);
+    let summary: Vec<String> = stats
+        .iter()
+        .map(|(tag, s)| {
+            format!(
+                "{tag}={}/{} (reader_rej={}, unexp={})",
+                s.compared, s.attempted, s.reader_rejected, s.unexpected_skips
+            )
+        })
+        .collect();
     eprintln!(
         "install_roundtrip (100% in-memory, 0 bytes written to disk): \
-         {iff_files} IFFs | BHAV={bhav_count} (.antics text={bhav_text_roundtrips}, formats={bhav_formats:?}, distinct_primitives={}) | \
-         BCON={bcon_count} | STR#={str_count} CTSS={ctss_count} TTAs={ttas_count} (formats={str_formats:?}) | \
-         TTAB={ttab_count} (compressed={ttab_compressed_count}, versions={ttab_versions:?}) | \
-         SLOT={slot_count} (versions={slot_versions:?}) | OBJD={objd_count} | OBJf={objf_count}",
+         {iff_files} IFFs (read/parse_err={iff_read_or_parse_failed}) | {} | \
+         BHAV .antics text={bhav_text_roundtrips} (nonstandard_targets={bhav_text_skipped_invalid_targets}, \
+         formats={bhav_formats:?}, distinct_primitives={}) | \
+         STR formats={str_formats:?} | TTAB compressed={ttab_compressed_count} versions={ttab_versions:?} | \
+         SLOT versions={slot_versions:?}",
+        summary.join(" | "),
         primitive_opcodes.len()
     );
 
-    // Broad coverage assertions against the Complete Collection corpus.
+    assert!(
+        unexpected_notes.is_empty(),
+        "unexpected lift/encode skips on sims_formats-valid chunks ({} total), first few: {:?}",
+        unexpected_notes.len(),
+        &unexpected_notes[..unexpected_notes.len().min(10)]
+    );
+    assert!(
+        iff_read_or_parse_failed == 0,
+        "expected 0 IFF read/parse failures, got {iff_read_or_parse_failed}"
+    );
     assert!(
         iff_files >= 500,
         "expected >= 500 IFF files, got {iff_files}"
     );
     assert!(
-        bhav_count >= 10_000,
-        "expected >= 10,000 BHAVs, got {bhav_count}"
+        get("BHAV") >= 10_000,
+        "expected >= 10,000 BHAVs, got {}",
+        get("BHAV")
     );
     assert!(
         bhav_text_roundtrips >= 10_000,
@@ -276,11 +365,11 @@ fn complete_collection_in_memory_chunk_roundtrip_parity() {
         "expected >= 40 distinct SimAntics primitive opcodes, saw {}",
         primitive_opcodes.len()
     );
-    assert!(bcon_count >= 500);
-    assert!(str_count >= 1_000);
-    assert!(ttab_count >= 500);
+    assert!(get("BCON") >= 500);
+    assert!(get("STR#") >= 1_000);
+    assert!(get("TTAB") >= 500);
     assert!(ttab_compressed_count >= 100);
-    assert!(slot_count >= 500);
-    assert!(objd_count >= 1_000);
-    assert!(objf_count >= 500);
+    assert!(get("SLOT") >= 500);
+    assert!(get("OBJD") >= 1_000);
+    assert!(get("OBJf") >= 500);
 }

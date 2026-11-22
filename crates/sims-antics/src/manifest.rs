@@ -209,11 +209,15 @@ fn needs_continuation(s: &str) -> bool {
     brackets > 0 || braces > 0
 }
 
+/// Maximum nesting depth for inline arrays and inline tables in TOML values.
+const MAX_TOML_DEPTH: usize = 64;
+
 struct ValueParser<'a> {
     src: &'a str,
     bytes: &'a [u8],
     pos: usize,
     line: usize,
+    depth: usize,
 }
 
 impl<'a> ValueParser<'a> {
@@ -223,6 +227,7 @@ impl<'a> ValueParser<'a> {
             bytes: src.as_bytes(),
             pos: 0,
             line,
+            depth: 0,
         }
     }
 
@@ -372,15 +377,25 @@ impl<'a> ValueParser<'a> {
 
     fn parse_array(&mut self) -> Result<Vec<TomlValue>> {
         let span = self.span();
+        if self.depth >= MAX_TOML_DEPTH {
+            return Err(Error::at(
+                span,
+                format!("TOML value nesting exceeds maximum depth of {MAX_TOML_DEPTH}"),
+            ));
+        }
+        self.depth += 1;
         self.bump(); // [
         let mut items = Vec::new();
-        loop {
+        let res = loop {
             self.skip_ws();
             if self.peek() == Some(b']') {
                 self.bump();
-                return Ok(items);
+                break Ok(items);
             }
-            items.push(self.parse_value()?);
+            match self.parse_value() {
+                Ok(v) => items.push(v),
+                Err(e) => break Err(e),
+            }
             self.skip_ws();
             match self.peek() {
                 Some(b',') => {
@@ -388,24 +403,33 @@ impl<'a> ValueParser<'a> {
                 }
                 Some(b']') => {
                     self.bump();
-                    return Ok(items);
+                    break Ok(items);
                 }
                 _ => {
-                    return Err(Error::at(span, "expected ',' or ']' in TOML array"));
+                    break Err(Error::at(span, "expected ',' or ']' in TOML array"));
                 }
             }
-        }
+        };
+        self.depth -= 1;
+        res
     }
 
     fn parse_inline_table(&mut self) -> Result<BTreeMap<String, TomlValue>> {
         let span = self.span();
+        if self.depth >= MAX_TOML_DEPTH {
+            return Err(Error::at(
+                span,
+                format!("TOML value nesting exceeds maximum depth of {MAX_TOML_DEPTH}"),
+            ));
+        }
+        self.depth += 1;
         self.bump(); // {
         let mut map = BTreeMap::new();
-        loop {
+        let res = loop {
             self.skip_ws();
             if self.peek() == Some(b'}') {
                 self.bump();
-                return Ok(map);
+                break Ok(map);
             }
             let key_start = self.pos;
             while let Some(b) = self.peek() {
@@ -416,17 +440,22 @@ impl<'a> ValueParser<'a> {
                 }
             }
             let key = &self.src[key_start..self.pos];
-            validate_key(key, self.span())?;
+            if let Err(e) = validate_key(key, self.span()) {
+                break Err(e);
+            }
             self.skip_ws();
             if self.bump() != Some(b'=') {
-                return Err(Error::at(
+                break Err(Error::at(
                     self.span(),
                     format!("expected '=' after inline table key '{key}'"),
                 ));
             }
-            let val = self.parse_value()?;
+            let val = match self.parse_value() {
+                Ok(v) => v,
+                Err(e) => break Err(e),
+            };
             if map.insert(key.to_owned(), val).is_some() {
-                return Err(Error::at(
+                break Err(Error::at(
                     span,
                     format!("duplicate key '{key}' in inline table"),
                 ));
@@ -438,13 +467,15 @@ impl<'a> ValueParser<'a> {
                 }
                 Some(b'}') => {
                     self.bump();
-                    return Ok(map);
+                    break Ok(map);
                 }
                 _ => {
-                    return Err(Error::at(span, "expected ',' or '}' in inline table"));
+                    break Err(Error::at(span, "expected ',' or '}' in inline table"));
                 }
             }
-        }
+        };
+        self.depth -= 1;
+        res
     }
 }
 
@@ -525,8 +556,25 @@ pub struct SoundSpec {
     pub preset: SoundPreset,
 }
 
+/// Tuning constant table entry in `[[constant]]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstantSpec {
+    pub id: u16,
+    pub label: String,
+    pub flags: u8,
+    pub values: Vec<i16>,
+}
+
+/// Explicit `OBJf` object callback entry in `[[callback]]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallbackSpec {
+    pub index: usize,
+    pub action: Option<TreeRef>,
+    pub condition: Option<TreeRef>,
+}
+
 /// Typed `object.toml` manifest bundling metadata, scripts, interactions, slots,
-/// procedural sprites, and synthesized audio.
+/// constants, callbacks, procedural sprites, and synthesized audio.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectManifest {
     pub name: String,
@@ -548,12 +596,39 @@ pub struct ObjectManifest {
     pub interactions: Vec<InteractionSpec>,
     pub slots: Vec<SlotSpec>,
     pub sounds: Vec<SoundSpec>,
+    pub constants: Vec<ConstantSpec>,
+    pub callbacks: Vec<CallbackSpec>,
 }
 
 impl ObjectManifest {
-    /// Parses an `object.toml` document.
+    /// Parses an `object.toml` document, strictly validating section names and types.
     pub fn parse(source: &str) -> Result<Self> {
         let root = parse_toml(source)?;
+        for (key, value) in &root {
+            match (key.as_str(), value) {
+                ("object" | "sprite", TomlValue::Table(_)) => {}
+                (
+                    "interaction" | "slot" | "sound" | "constant" | "callback",
+                    TomlValue::Array(_),
+                ) => {}
+                ("object" | "sprite", _) => {
+                    return Err(Error::new(format!(
+                        "section '[{key}]' must be a table, not an array of tables"
+                    )));
+                }
+                ("interaction" | "slot" | "sound" | "constant" | "callback", _) => {
+                    return Err(Error::new(format!(
+                        "section '{key}' must be declared as an array of tables '[[{key}]]'"
+                    )));
+                }
+                (other, _) => {
+                    return Err(Error::new(format!(
+                        "unknown top-level key or section '{other}' in object.toml"
+                    )));
+                }
+            }
+        }
+
         let obj = get_table(&root, "object")
             .ok_or_else(|| Error::new("object.toml requires an [object] section"))?;
 
@@ -610,7 +685,10 @@ impl ObjectManifest {
                 let attenuation = opt_f32(t, "attenuation")?.unwrap_or(0.02);
                 let joining_index = opt_i32(t, "joining_index")?.unwrap_or(-1);
                 let mut motives = Vec::new();
-                if let Some(TomlValue::Array(m_arr)) = t.get("motives") {
+                if let Some(m_field) = t.get("motives") {
+                    let TomlValue::Array(m_arr) = m_field else {
+                        return Err(Error::new("[[interaction]].motives must be an array"));
+                    };
                     for m_val in m_arr {
                         let TomlValue::Table(mt) = m_val else {
                             return Err(Error::new("interaction motive entries must be tables"));
@@ -688,6 +766,52 @@ impl ObjectManifest {
             }
         }
 
+        let mut constants = Vec::new();
+        if let Some(TomlValue::Array(arr)) = root.get("constant") {
+            for item in arr {
+                let TomlValue::Table(t) = item else {
+                    return Err(Error::new("[[constant]] entries must be tables"));
+                };
+                let id = req_u16(t, "id")?;
+                let label = opt_str(t, "label")
+                    .or_else(|| opt_str(t, "name"))
+                    .unwrap_or_else(|| format!("BCON_{id}"));
+                let flags = opt_u8(t, "flags")?.unwrap_or(0);
+                let values = req_i16_array(t, "values")?;
+                if values.len() > 255 {
+                    return Err(Error::new("[[constant]].values cannot exceed 255 entries"));
+                }
+                constants.push(ConstantSpec {
+                    id,
+                    label,
+                    flags,
+                    values,
+                });
+            }
+        }
+
+        let mut callbacks = Vec::new();
+        if let Some(TomlValue::Array(arr)) = root.get("callback") {
+            for item in arr {
+                let TomlValue::Table(t) = item else {
+                    return Err(Error::new("[[callback]] entries must be tables"));
+                };
+                let index = usize::from(req_u16(t, "index")?);
+                if index > 64 {
+                    return Err(Error::new(format!(
+                        "[[callback]].index {index} exceeds reasonable OBJf table bound (64)"
+                    )));
+                }
+                let action = opt_tree_ref(t, "action")?;
+                let condition = opt_tree_ref(t, "condition")?;
+                callbacks.push(CallbackSpec {
+                    index,
+                    action,
+                    condition,
+                });
+            }
+        }
+
         Ok(Self {
             name,
             description,
@@ -708,6 +832,8 @@ impl ObjectManifest {
             interactions,
             slots,
             sounds,
+            constants,
+            callbacks,
         })
     }
 }
@@ -730,6 +856,31 @@ fn opt_str(t: &BTreeMap<String, TomlValue>, key: &str) -> Option<String> {
     match t.get(key) {
         Some(TomlValue::String(s)) => Some(s.clone()),
         _ => None,
+    }
+}
+
+fn opt_u8(t: &BTreeMap<String, TomlValue>, key: &str) -> Result<Option<u8>> {
+    match t.get(key) {
+        None => Ok(None),
+        Some(TomlValue::Int(v)) => u8::try_from(*v)
+            .map(Some)
+            .map_err(|_| Error::new(format!("key '{key}' value {v} out of u8 range"))),
+        Some(_) => Err(Error::new(format!("key '{key}' must be an integer"))),
+    }
+}
+
+fn req_i16_array(t: &BTreeMap<String, TomlValue>, key: &str) -> Result<Vec<i16>> {
+    match t.get(key) {
+        Some(TomlValue::Array(items)) => items
+            .iter()
+            .map(|v| match v {
+                TomlValue::Int(n) => i16::try_from(*n)
+                    .map_err(|_| Error::new(format!("'{key}' entry {n} out of i16 range"))),
+                _ => Err(Error::new(format!("'{key}' array must contain integers"))),
+            })
+            .collect(),
+        Some(_) => Err(Error::new(format!("'{key}' must be an array of integers"))),
+        None => Err(Error::new(format!("missing required array key '{key}'"))),
     }
 }
 

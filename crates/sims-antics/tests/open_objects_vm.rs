@@ -716,3 +716,265 @@ fn starter_objects_compile_package_and_execute_live_in_sims_vm() {
         vec!["open_bench_creak", "open_cot_settle", "open_basin_flush"]
     );
 }
+
+#[test]
+fn vm_verifies_idle_preserves_param0_bcon_table_and_literal_slot_modes() {
+    use sims_antics::compile::compile_antics;
+    use sims_formats::execution::Slot;
+
+    let script = r#"
+bcon 4096 "Table0" = [111];
+bcon 4097 "Table1" = [222];
+bcon 4098 "Table2" = [333];
+
+tree 4096 "PreserveParamAcrossIdle" (args: 1) {
+    idle(2);
+    my.attr[0] := param[0];
+    my.attr[1] := bcon[1:0];
+    return true;
+}
+
+tree 4097 "SnapLiteralSlot2" (args: 3) {
+    snap(2) -> true: true, false: false;
+}
+
+tree 4098 "RouteLiteralSlot2" (args: 3) {
+    route_to(slot: 2) -> true: true, false: false;
+}
+"#;
+    let compiled = compile_antics(script).unwrap();
+
+    // Verify encoded literal modes directly: Snap mode 3, Go To Routing Slot source 1.
+    assert_eq!(compiled.behaviors[&4097].instructions[0].opcode, 46);
+    assert_eq!(
+        &compiled.behaviors[&4097].instructions[0].operands[..4],
+        &[2, 0, 3, 0]
+    );
+    assert_eq!(compiled.behaviors[&4098].instructions[0].opcode, 45);
+    assert_eq!(
+        &compiled.behaviors[&4098].instructions[0].operands[..4],
+        &[2, 0, 1, 0]
+    );
+
+    const GLOBAL_RES: usize = 0;
+    const OBJ_RES: usize = 1;
+    const SIM_RES: usize = 2;
+    const OBJ_GUID: u32 = 0x7F00_0050;
+
+    let mut obj_lib = Library::default();
+    for (&id, bhav) in &compiled.behaviors {
+        let raw = sims_antics::encode::encode_bhav(bhav).unwrap();
+        obj_lib.behaviors.insert(id, Behavior::parse(&raw).unwrap());
+    }
+    for (&id, bcon) in &compiled.constants {
+        obj_lib.constants.insert(id, bcon.values.clone());
+    }
+    // 3 routing slots (indices 0, 1, 2) with distinct offsets so slot 2 (+48) is
+    // clearly distinguishable from slot 0 (+16) and slot 1 (+32).
+    let mk_slot = |dx: f32| Slot {
+        kind: 3,
+        offset: [dx, 0.0, 0.0],
+        standing: 1,
+        sitting: 0,
+        ground: 1,
+        flags: 0x0800, // skip may_stand check
+        snap_target: -1,
+        proximity: [16, 16, 16],
+        max_size: 100,
+        unknown: 0,
+        gradient: 0.0,
+        height: 5,
+        facing: -2,
+        resolution: 16,
+    };
+    obj_lib
+        .slots
+        .insert(128, vec![mk_slot(3.0), mk_slot(6.0), mk_slot(9.0)]);
+    let mut obj_words = [0i16; DEFINITION_WORDS];
+    obj_words[9] = 4;
+    obj_words[14] = OBJ_GUID as u16 as i16;
+    obj_words[15] = (OBJ_GUID >> 16) as u16 as i16;
+    obj_words[20] = 128; // slots chunk ID
+    obj_lib.definitions.insert(128, obj_words);
+    obj_lib.definition_order.push(128);
+
+    let mut sim_lib = Library::default();
+    let mut sim_words = [0i16; DEFINITION_WORDS];
+    sim_words[9] = 2;
+    sim_words[14] = SIM_GUID as u16 as i16;
+    sim_words[15] = (SIM_GUID >> 16) as u16 as i16;
+    sim_lib.definitions.insert(128, sim_words);
+    sim_lib.definition_order.push(128);
+
+    let program = Program {
+        global: GLOBAL_RES,
+        libraries: BTreeMap::from([
+            (GLOBAL_RES, Library::default()),
+            (OBJ_RES, obj_lib),
+            (SIM_RES, sim_lib),
+        ]),
+        semi_globals: BTreeMap::from([(OBJ_RES, None), (SIM_RES, None)]),
+        careers: None,
+        career_texts_end: true,
+        labels_hold_no_token: true,
+        zoning: BTreeMap::new(),
+        animations: Default::default(),
+        people: Default::default(),
+        icon_frames: None,
+        wardrobe: None,
+        ordered_wardrobe: None,
+        character_files: Default::default(),
+        expansions: 0,
+        characters: Default::default(),
+    };
+    let catalog = Catalog {
+        global: GLOBAL_RES,
+        objects: vec![
+            sims_content::Object {
+                guid: OBJ_GUID,
+                resource: OBJ_RES,
+                chunk: 128,
+                kind: 4,
+                master: 0,
+            },
+            sims_content::Object {
+                guid: SIM_GUID,
+                resource: SIM_RES,
+                chunk: 128,
+                kind: 2,
+                master: 0,
+            },
+        ],
+        by_guid: BTreeMap::from([(OBJ_GUID, 0), (SIM_GUID, 1)]),
+        semi_globals: BTreeMap::new(),
+        diagnostics: Vec::new(),
+    };
+
+    let mut obj = make_object(1, OBJ_GUID, false);
+    obj.position = [136, 136, 1]; // center of tile (8, 8), level 1
+    obj.data[25] = 1; // lockout so Sleep steps per turn
+    let mut sim = make_object(2, SIM_GUID, true);
+    sim.position = [72, 72, 1]; // center of tile (4, 4), level 1
+    sim.data[4] = 1; // allowed on level 1
+    sim.data[8] = 8; // bit 3: routable person flag (0x45afc4)
+    sim.data[42] = 2; // may stand on a tile without floor
+    let mk_array = |stride: usize, fill: u8| sims_formats::lot::Array {
+        width: 64,
+        height: 64,
+        stride,
+        encoding: 0,
+        data: vec![fill; 64 * 64 * stride],
+    };
+    let mut world = World {
+        size: 16,
+        globals: vec![0; 64],
+        lot_rng: GameRng::from_state(1),
+        global_rng: GameRng::from_state(2),
+        order: vec![1, 2],
+        people: vec![2],
+        types: BTreeMap::from([(1, OBJ_GUID), (2, SIM_GUID)]),
+        objects: BTreeMap::from([(1, obj), (2, sim)]).into(),
+        indicators: [1, 2],
+        ..World::empty()
+    };
+    world.arrays.insert(0, mk_array(4, 0));
+    for (floors, walls, flags) in [(1, 2, 8), (101, 102, 108)] {
+        world.arrays.insert(floors, mk_array(2, 0));
+        world.arrays.insert(walls, mk_array(14, 0));
+        world.arrays.insert(flags, mk_array(1, 0));
+    }
+    world.arrays.insert(3, mk_array(2, 0));
+    world.arrays.insert(103, mk_array(2, 0));
+    world.arrays.insert(9, mk_array(1, 0xff));
+    world.arrays.insert(10, mk_array(1, 0xff));
+    world.rebuild_rooms().unwrap();
+    // Place object 1 on tile (8, 8) in the level-1 object grid (array 3) so stands_on_lot() is true.
+    let grid = &mut world.arrays.get_mut(&3).unwrap().data;
+    grid[(8 * 64 + 8) * 2..(8 * 64 + 8) * 2 + 2].copy_from_slice(&1u16.to_le_bytes());
+    grid[(4 * 64 + 4) * 2..(4 * 64 + 4) * 2 + 2].copy_from_slice(&2u16.to_le_bytes());
+
+    let vm = Interpreter::new(&program, &catalog, Stream::Lot);
+
+    // 1. Verify `idle(2)` preserves caller's `param[0] == 77` AND `bcon[1:0] == 222` (not 333!).
+    let locals_len = usize::from(compiled.behaviors[&4096].locals);
+    assert!(
+        locals_len >= 1,
+        "scratch local must be allocated for idle()+param[0]"
+    );
+    world.objects.get_mut(&1).unwrap().stack = vec![Frame {
+        stack_object: 0,
+        tree: 4096,
+        node: 0,
+        parameters: vec![77],
+        locals: vec![0; locals_len],
+        primitive_state: 0,
+        code_owner_type: 1,
+    }];
+    let mut yields = 0usize;
+    let mut done = None;
+    for _ in 0..16 {
+        match vm.turn(&mut world, 1, 500).unwrap() {
+            Status::Yielded => yields += 1,
+            Status::Returned(v) => {
+                done = Some(v);
+                break;
+            }
+            Status::Running => {}
+        }
+    }
+    assert_eq!(done, Some(true));
+    assert_eq!(yields, 2);
+    assert_eq!(
+        world.objects[&1].attributes[0], 77,
+        "param[0] must survive idle(2) unchanged"
+    );
+    assert_eq!(
+        world.objects[&1].attributes[1], 222,
+        "bcon[1:0] must read BCON 4097[0] (222), not BCON 4098[0] (333)"
+    );
+
+    // 2. Verify `snap(2)` uses literal slot 2 (offset[0]=9.0 -> x = 136 + 9 = 145)
+    // even when param[2] == 0 (which would have placed at offset[0]=3.0 -> x = 139)!
+    world.frame_storage.remove(&2);
+    world.objects.get_mut(&2).unwrap().stack = vec![Frame {
+        stack_object: 1,
+        tree: 4097,
+        node: 0,
+        parameters: vec![0, 0, 0], // param[2] = 0 != literal slot 2!
+        locals: Vec::new(),
+        primitive_state: 0,
+        code_owner_type: 1,
+    }];
+    let snap_res = vm.turn(&mut world, 2, 500).unwrap();
+    assert_eq!(snap_res, Status::Returned(true));
+    assert_eq!(
+        world.objects[&2].position,
+        [145, 136, 1],
+        "snap(2) must snap to literal slot 2 ([145, 136, 1]), not param[2]=0 ([139, 136, 1])"
+    );
+
+    // 3. Verify `route_to(slot: 2)` uses literal slot 2 even when param[2] == 99 (out of bounds):
+    // mode 0 (parameter) would fail with native error 0x1b; mode 1 (literal) resolves slot 2!
+    world.frame_storage.remove(&2);
+    world.objects.get_mut(&2).unwrap().stack = vec![Frame {
+        stack_object: 1,
+        tree: 4098,
+        node: 0,
+        parameters: vec![99, 99, 99], // param[2] = 99 != literal slot 2!
+        locals: Vec::new(),
+        primitive_state: 0,
+        code_owner_type: 1,
+    }];
+    let route_res = vm.step(&mut world, 2);
+    assert!(
+        route_res.is_ok(),
+        "route_to(slot: 2) with param[2]=99 must resolve literal slot 2, got: {route_res:?}"
+    );
+    // Verify Go To Routing Slot resolved literal slot index 2 (not param[2]=99!).
+    assert!(
+        world.routing.slot_flags.contains_key(&(1, 2)),
+        "expected routing slot flag key (object=1, slot=2) in world.routing.slot_flags, got {:?}",
+        world.routing.slot_flags.keys().collect::<Vec<_>>()
+    );
+    assert!(!world.routing.slot_flags.contains_key(&(1, 99)));
+}

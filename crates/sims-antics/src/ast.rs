@@ -187,6 +187,7 @@ pub enum Condition {
         span: Span,
         target: CallTarget,
         args: Vec<i16>,
+        pass_temps: bool,
     },
     Primitive {
         span: Span,
@@ -241,7 +242,11 @@ pub enum PrimitiveCall {
     },
     Dialog {
         kind: u8,
-        text_id: u16,
+        message: u8,
+        title: u8,
+        button1: u8,
+        button2: u8,
+        button3: u8,
         flags: u8,
     },
     Animate {

@@ -10,8 +10,8 @@ use crate::encode::{
 };
 use crate::error::{Error, Result};
 use crate::ir::{
-    FarEntry, FwavChunk, IFF_CONVERTED_FLAG, ObjdSpec, ObjfChunk, SlotChunk, StringEntry,
-    StringFormat, StringTableChunk, TtabChunk,
+    BconChunk, FarEntry, FwavChunk, IFF_CONVERTED_FLAG, ObjdSpec, ObjfChunk, SlotChunk,
+    StringEntry, StringFormat, StringTableChunk, TtabChunk,
 };
 use crate::lower::{LoweredModule, lower_module};
 use crate::manifest::{ObjectManifest, TreeRef};
@@ -124,20 +124,52 @@ pub fn compile_object_from_sources(
         data: encode_objd(&objd_spec.to_chunk())?,
     });
 
-    // 2. OBJf (Init = index 0, Main = index 1)
+    // Merge manifest [[constant]] tables into BCON map (rejecting duplicates).
+    for c in &manifest.constants {
+        let chunk = BconChunk {
+            id: c.id,
+            label: c.label.clone(),
+            flags: c.flags,
+            values: c.values.clone(),
+            trailing: Vec::new(),
+        };
+        if constants.insert(chunk.id, chunk).is_some() {
+            return Err(Error::new(format!(
+                "duplicate BCON id {} between scripts and [[constant]] in '{}'",
+                c.id, manifest.name
+            )));
+        }
+    }
+
+    // 2. OBJf (Init = index 0, Main = index 1, plus any explicit [[callback]] overrides)
+    let min_callbacks = manifest
+        .callbacks
+        .iter()
+        .map(|cb| cb.index + 1)
+        .max()
+        .unwrap_or(0)
+        .max(2);
+    let mut objf_entries = vec![
+        ObjectFunction {
+            condition: 0,
+            action: 0,
+        };
+        min_callbacks
+    ];
+    objf_entries[0].action = init_id;
+    objf_entries[1].action = main_id;
+    for cb in &manifest.callbacks {
+        if let Some(action) = &cb.action {
+            objf_entries[cb.index].action = resolve_tree(action)?;
+        }
+        if let Some(condition) = &cb.condition {
+            objf_entries[cb.index].condition = resolve_tree(condition)?;
+        }
+    }
     let objf = ObjfChunk::new(
         manifest.objd_id,
         format!("{} Functions", manifest.name),
-        vec![
-            ObjectFunction {
-                condition: 0,
-                action: init_id,
-            },
-            ObjectFunction {
-                condition: 0,
-                action: main_id,
-            },
-        ],
+        objf_entries,
     );
     chunks.push(ChunkData {
         tag: *b"OBJf",
@@ -324,9 +356,16 @@ pub fn compile_object_from_sources(
         data: encode_dgrp(&sprites.dgrp)?,
     });
 
-    // 9. FWAV + synthesized WAV audio assets
+    // 9. FWAV + synthesized WAV audio assets (rejecting duplicate IDs or names)
     let mut sounds_wav = BTreeMap::new();
+    let mut seen_sound_ids = std::collections::BTreeSet::new();
     for sound in &manifest.sounds {
+        if !seen_sound_ids.insert(sound.id) {
+            return Err(Error::new(format!(
+                "duplicate [[sound]] id {} in '{}'",
+                sound.id, manifest.name
+            )));
+        }
         let fwav = FwavChunk {
             id: sound.id,
             label: sound.name.clone(),
@@ -339,7 +378,15 @@ pub fn compile_object_from_sources(
             label: fwav.label.clone(),
             data: encode_fwav(&fwav)?,
         });
-        sounds_wav.insert(sound.name.clone(), synthesize_preset(sound.preset));
+        if sounds_wav
+            .insert(sound.name.clone(), synthesize_preset(sound.preset))
+            .is_some()
+        {
+            return Err(Error::new(format!(
+                "duplicate [[sound]] name '{}' in '{}'",
+                sound.name, manifest.name
+            )));
+        }
     }
 
     let iff_bytes = encode_iff_with_rsmp(&chunks)?;

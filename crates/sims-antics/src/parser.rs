@@ -7,16 +7,24 @@ use crate::ast::{
 use crate::error::{Error, Result, Span};
 use crate::lexer::{Token, TokenKind, tokenize};
 
+/// Maximum structural nesting depth for blocks and control flow in `.antics`.
+const MAX_NESTING_DEPTH: usize = 64;
+
 /// Parses a `.antics` source string into a [`Module`] AST.
 pub fn parse_module(source: &str) -> Result<Module> {
     let tokens = tokenize(source)?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+    };
     parser.parse_module()
 }
 
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
@@ -234,14 +242,29 @@ impl Parser {
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>> {
-        self.expect(&TokenKind::LBrace, "'{'")?;
+        let span = self.expect(&TokenKind::LBrace, "'{'")?;
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(Error::at(
+                span,
+                format!("block nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
+            ));
+        }
+        self.depth += 1;
         let mut stmts = Vec::new();
         while !self.eat(&TokenKind::RBrace) {
             if self.peek().kind == TokenKind::Eof {
+                self.depth -= 1;
                 return Err(Error::at(self.span(), "unexpected EOF inside block"));
             }
-            stmts.push(self.parse_stmt()?);
+            match self.parse_stmt() {
+                Ok(stmt) => stmts.push(stmt),
+                Err(err) => {
+                    self.depth -= 1;
+                    return Err(err);
+                }
+            }
         }
+        self.depth -= 1;
         Ok(stmts)
     }
 
@@ -377,24 +400,35 @@ impl Parser {
 
     fn parse_if(&mut self) -> Result<Stmt> {
         let (_, span) = self.expect_ident("'if'")?;
-        let cond = self.parse_condition()?;
-        let then_body = self.parse_block()?;
-        let else_body = if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "else") {
-            self.bump();
-            if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "if") {
-                vec![self.parse_if()?]
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(Error::at(
+                span,
+                format!("conditional nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
+            ));
+        }
+        self.depth += 1;
+        let result = (|| {
+            let cond = self.parse_condition()?;
+            let then_body = self.parse_block()?;
+            let else_body = if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "else") {
+                self.bump();
+                if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "if") {
+                    vec![self.parse_if()?]
+                } else {
+                    self.parse_block()?
+                }
             } else {
-                self.parse_block()?
-            }
-        } else {
-            Vec::new()
-        };
-        Ok(Stmt::If {
-            span,
-            cond,
-            then_body,
-            else_body,
-        })
+                Vec::new()
+            };
+            Ok(Stmt::If {
+                span,
+                cond,
+                then_body,
+                else_body,
+            })
+        })();
+        self.depth -= 1;
+        result
     }
 
     fn parse_while(&mut self) -> Result<Stmt> {
@@ -464,6 +498,13 @@ impl Parser {
         if self.eat(&TokenKind::LParen) {
             while !self.eat(&TokenKind::RParen) {
                 if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "temps") {
+                    let tspan = self.span();
+                    if !args.is_empty() {
+                        return Err(Error::at(
+                            tspan,
+                            "'temps' cannot be mixed with literal call arguments",
+                        ));
+                    }
                     self.bump();
                     pass_temps = true;
                     self.expect(&TokenKind::RParen, "')' after 'temps'")?;
@@ -504,10 +545,23 @@ impl Parser {
             let mut args = Vec::new();
             let mut pass_temps = false;
             while self.eat(&TokenKind::Comma) {
+                if pass_temps {
+                    return Err(Error::at(
+                        self.span(),
+                        "'temps' cannot be followed by additional subroutine arguments",
+                    ));
+                }
                 if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "temps") {
+                    let tspan = self.span();
+                    if !args.is_empty() {
+                        return Err(Error::at(
+                            tspan,
+                            "'temps' cannot be mixed with literal subroutine arguments",
+                        ));
+                    }
                     self.bump();
                     pass_temps = true;
-                    break;
+                    continue;
                 }
                 args.push(self.expect_i16("subroutine argument")?);
             }
@@ -643,17 +697,74 @@ impl Parser {
                 PrimitiveCall::SetToNext { mode, guid }
             }
             "dialog" => {
-                let kind = self.expect_u8("dialog kind")?;
-                self.expect(&TokenKind::Comma, "','")?;
-                let text_id = self.expect_u16("dialog text index")?;
-                let flags = if self.eat(&TokenKind::Comma) {
-                    self.expect_u8("dialog flags")?
-                } else {
-                    0
-                };
+                let mut kind = 0u8;
+                let mut message = 0u8;
+                let mut title = 0u8;
+                let mut button1 = 0u8;
+                let mut button2 = 0u8;
+                let mut button3 = 0u8;
+                let mut flags = 0u8;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("dialog option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "kind" => kind = self.expect_u8("dialog kind")?,
+                            "message" | "text" => {
+                                message = self.expect_u8("dialog message index")?
+                            }
+                            "title" => title = self.expect_u8("dialog title index")?,
+                            "button1" => button1 = self.expect_u8("dialog button1 index")?,
+                            "button2" => button2 = self.expect_u8("dialog button2 index")?,
+                            "button3" => button3 = self.expect_u8("dialog button3 index")?,
+                            "flags" => flags = self.expect_u8("dialog flags")?,
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown dialog parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in dialog()",
+                            ));
+                        }
+                        match positional {
+                            0 => kind = self.expect_u8("dialog kind")?,
+                            1 => message = self.expect_u8("dialog message index")?,
+                            2 => flags = self.expect_u8("dialog flags")?,
+                            3 => title = self.expect_u8("dialog title index")?,
+                            4 => button1 = self.expect_u8("dialog button1 index")?,
+                            5 => button2 = self.expect_u8("dialog button2 index")?,
+                            6 => button3 = self.expect_u8("dialog button3 index")?,
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to dialog()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
                 PrimitiveCall::Dialog {
                     kind,
-                    text_id,
+                    message,
+                    title,
+                    button1,
+                    button2,
+                    button3,
                     flags,
                 }
             }
@@ -863,25 +974,42 @@ impl Parser {
     }
 
     fn parse_condition(&mut self) -> Result<Condition> {
-        if self.eat(&TokenKind::Bang) {
-            return Ok(Condition::Not(Box::new(self.parse_condition()?)));
+        // Parse consecutive `!` iteratively so deep negation chains cannot overflow the stack.
+        let mut negated = false;
+        while self.eat(&TokenKind::Bang) {
+            negated = !negated;
         }
         let span = self.span();
-        if let TokenKind::Ident(ident) = &self.peek().kind {
+        let base = if let TokenKind::Ident(ident) = &self.peek().kind {
             match ident.as_str() {
                 "call" => {
                     self.bump();
-                    let (target, args, _) = self.parse_call_args_and_target()?;
-                    return Ok(Condition::Call { span, target, args });
+                    let (target, args, pass_temps) = self.parse_call_args_and_target()?;
+                    Condition::Call {
+                        span,
+                        target,
+                        args,
+                        pass_temps,
+                    }
                 }
                 "route" | "route_to" | "find_best_object" | "dialog" | "animate" | "snap"
                 | "set_to_next" | "play_sound" => {
                     let prim = self.parse_primitive_call()?;
-                    return Ok(Condition::Primitive { span, prim });
+                    Condition::Primitive { span, prim }
                 }
-                _ => {}
+                _ => self.parse_compare_condition(span)?,
             }
-        }
+        } else {
+            self.parse_compare_condition(span)?
+        };
+        Ok(if negated {
+            Condition::Not(Box::new(base))
+        } else {
+            base
+        })
+    }
+
+    fn parse_compare_condition(&mut self, span: Span) -> Result<Condition> {
         let lhs = self.parse_operand()?;
         let op_tok = self.bump();
         let op = match op_tok.kind {
@@ -948,10 +1076,24 @@ impl Parser {
                         let first = self.expect_i16("constant index")?;
                         let index = if self.eat(&TokenKind::Colon) || self.eat(&TokenKind::Comma) {
                             let entry = self.expect_u8("constant entry index")?;
-                            let table = u8::try_from(first).map_err(|_| {
-                                Error::at(span, "BCON table offset must be in 0..=255")
-                            })?;
-                            i16::from_le_bytes([entry, table])
+                            // sims-vm resolves BCON addresses as table = addr >> 7 (0..=191),
+                            // entry = addr & 127 (0..=127).
+                            let table = u16::try_from(first)
+                                .ok()
+                                .filter(|&t| t <= 191)
+                                .ok_or_else(|| {
+                                    Error::at(
+                                        span,
+                                        format!("BCON table index {first} out of 0..=191 range"),
+                                    )
+                                })?;
+                            if entry > 127 {
+                                return Err(Error::at(
+                                    span,
+                                    format!("BCON entry index {entry} out of 0..=127 range"),
+                                ));
+                            }
+                            ((table << 7) | u16::from(entry)) as i16
                         } else {
                             first
                         };

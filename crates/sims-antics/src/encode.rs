@@ -1,20 +1,28 @@
-//! Checked binary encoders for Sims 1 IFF chunks, IFF 2.5 containers (reusing
-//! `sims_formats::iff_write` for `rsmp` framing), and `FAR!byAZ` archives.
+//! Checked binary encoders for Sims 1 IFF chunks, IFF 2.5 containers (with
+//! version-0 `rsmp` resource maps), and `FAR!byAZ` archives.
 
 use crate::error::{Error, Result};
 use crate::ir::{
-    BconChunk, BhavChunk, DgrpChunk, FarEntry, FwavChunk, IFF_CONVERTED_FLAG, ObjdChunk, ObjfChunk,
-    PaltChunk, SlotChunk, Spr2Chunk, Spr2Frame, Spr2Pixel, StringFormat, StringTableChunk,
-    TtabChunk,
+    BconChunk, BhavChunk, DgrpChunk, FarEntry, FwavChunk, ObjdChunk, ObjfChunk, PaltChunk,
+    SlotChunk, Spr2Chunk, Spr2Frame, Spr2Pixel, StringFormat, StringTableChunk, TtabChunk,
 };
-use sims_formats::iff::ChunkData;
-use sims_formats::iff_write::{self, ChunkWrite};
+use sims_formats::far::{MAX_DIRECTORY, MAX_MEMBER};
+use sims_formats::iff::{ChunkData, DELETED};
+use std::collections::BTreeSet;
 
-/// Encodes a `BHAV` chunk (formats `0x8000`, `0x8001`, `0x8002`, `0x8003`).
+/// Maximum sprite frame pixel count matching `sims_formats::sprite::MAX_PIXELS`.
+const MAX_SPR2_PIXELS: usize = 16 * 1024 * 1024;
+const IFF_FILE_HEADER_SIZE: usize = 64;
+const IFF_CHUNK_HEADER_SIZE: usize = 76;
+const IFF_SIGNATURE_25: &[u8; 60] =
+    b"IFF FILE 2.5:TYPE FOLLOWED BY SIZE\0 JAMIE DOORNBOS & MAXIS 1";
+const IFF_CONVERTED: u16 = 0x0010;
+
+/// Encodes a `BHAV` chunk (formats `0x8000`, `0x8001`, `0x8002`).
 pub fn encode_bhav(chunk: &BhavChunk) -> Result<Vec<u8>> {
-    if !matches!(chunk.format, 0x8000..=0x8003) {
+    if !matches!(chunk.format, 0x8000..=0x8002) {
         return Err(Error::new(format!(
-            "unsupported BHAV format {:#06x}",
+            "unsupported BHAV format {:#06x} (supported: 0x8000, 0x8001, 0x8002)",
             chunk.format
         )));
     }
@@ -37,16 +45,21 @@ pub fn encode_bhav(chunk: &BhavChunk) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Encodes an `OBJD` chunk.
+/// Encodes an `OBJD` chunk (versions `136 | 138 | 139 | 140 | 141 | 142`,
+/// matching `sims_formats::behavior::ObjectDefinition::parse`).
 pub fn encode_objd(chunk: &ObjdChunk) -> Result<Vec<u8>> {
-    if !matches!(chunk.version, 136..=142) {
+    if !matches!(chunk.version, 136 | 138 | 139 | 140 | 141 | 142) {
         return Err(Error::new(format!(
-            "unsupported OBJD version {}",
+            "unsupported OBJD version {} (supported: 136, 138..=142)",
             chunk.version
         )));
     }
-    if chunk.words.len() < 2 {
-        return Err(Error::new("OBJD must contain at least the 4-byte version"));
+    if chunk.words.len() < 42 {
+        return Err(Error::new(format!(
+            "OBJD has {} words ({} bytes), below minimum 42 words (84 bytes) required by ObjectDefinition::parse",
+            chunk.words.len(),
+            chunk.words.len() * 2
+        )));
     }
     let mut out =
         Vec::with_capacity(chunk.words.len() * 2 + usize::from(chunk.trailing_byte.is_some()));
@@ -258,43 +271,59 @@ impl BitWriter {
         }
     }
 
+    /// Reconstructs the decoded value produced by `sims_formats::behavior::Fields::read`
+    /// for a given bit width and field size (16 or 32 bits).
+    fn reconstruct_signed(raw_bits: u32, width: usize, size: usize) -> u32 {
+        let signed = if width < 32 && raw_bits & (1u32 << (width - 1)) != 0 {
+            raw_bits | (!0u32 << width)
+        } else {
+            raw_bits
+        };
+        if size == 16 { signed & 0xFFFF } else { signed }
+    }
+
     fn write_field(&mut self, value: u32, size: usize, width_hint: Option<u8>) {
         let widths = if size == 16 {
             [5usize, 8, 13, 16]
         } else {
             [6usize, 11, 21, 32]
         };
+        let target_val = if size == 16 { value & 0xFFFF } else { value };
+
+        // Honor a preserved width hint ONLY when it losslessly reconstructs `target_val`.
         if let Some(hint) = width_hint {
-            if hint == 255 && value == 0 {
+            if hint == 255 && target_val == 0 {
                 self.push_bits(0, 1);
                 return;
             }
             if let Some(&width) = widths.get(usize::from(hint)) {
-                self.push_bits(1, 1);
-                self.push_bits(u32::from(hint), 2);
                 let mask = if width == 32 {
                     u32::MAX
                 } else {
                     (1u32 << width) - 1
                 };
-                self.push_bits(value & mask, width);
-                return;
+                let raw_bits = target_val & mask;
+                if Self::reconstruct_signed(raw_bits, width, size) == target_val {
+                    self.push_bits(1, 1);
+                    self.push_bits(u32::from(hint), 2);
+                    self.push_bits(raw_bits, width);
+                    return;
+                }
             }
         }
-        if value == 0 {
+
+        if target_val == 0 {
             self.push_bits(0, 1);
             return;
         }
-        let signed: i64 = if size == 16 {
-            i64::from(value as u16 as i16)
-        } else {
-            i64::from(value as i32)
-        };
         let mut chosen_code = 3u32;
         for (code, &width) in widths.iter().enumerate() {
-            let min = -(1i64 << (width - 1));
-            let max = (1i64 << (width - 1)) - 1;
-            if signed >= min && signed <= max {
+            let mask = if width == 32 {
+                u32::MAX
+            } else {
+                (1u32 << width) - 1
+            };
+            if Self::reconstruct_signed(target_val & mask, width, size) == target_val {
                 chosen_code = code as u32;
                 break;
             }
@@ -307,7 +336,7 @@ impl BitWriter {
         } else {
             (1u32 << width) - 1
         };
-        self.push_bits(value & mask, width);
+        self.push_bits(target_val & mask, width);
     }
 
     fn finish(mut self, trailing_bits: u8) -> Vec<u8> {
@@ -490,6 +519,11 @@ fn encode_spr2_frame(frame: &Spr2Frame) -> Result<Vec<u8>> {
     let expected = width
         .checked_mul(height)
         .ok_or_else(|| Error::new("SPR2 frame dimensions overflow"))?;
+    if expected > MAX_SPR2_PIXELS {
+        return Err(Error::new(format!(
+            "SPR2 frame pixel count {expected} exceeds 16 megapixel reader limit"
+        )));
+    }
     if frame.pixels.len() != expected {
         return Err(Error::new(format!(
             "SPR2 frame expected {expected} pixels, got {}",
@@ -740,82 +774,213 @@ pub fn encode_dgrp(chunk: &DgrpChunk) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Encodes an `FWAV` sound event name chunk (NUL-terminated Windows-1252).
+/// Encodes an `FWAV` sound event name chunk (NUL-terminated Latin-1 bytes matching
+/// `sims-vm/src/program.rs:416`, which decodes FWAV bytes via `char::from(b)`).
 pub fn encode_fwav(chunk: &FwavChunk) -> Result<Vec<u8>> {
-    let mut bytes = encode_string_bytes(&chunk.sound_name, 1)?;
+    let mut bytes = Vec::with_capacity(chunk.sound_name.len() + 1);
+    for ch in chunk.sound_name.chars() {
+        let code = u32::from(ch);
+        if code == 0 || code > 0xFF {
+            return Err(Error::new(format!(
+                "FWAV sound name '{}' contains unsupported character {:?}",
+                chunk.sound_name, ch
+            )));
+        }
+        bytes.push(code as u8);
+    }
     bytes.push(0);
     Ok(bytes)
 }
 
-/// Encodes chunks into a Maxis IFF 2.5 container with an authentic version-0
-/// `rsmp` resource map by reusing [`sims_formats::iff_write::write_chunk_with_residue`].
+/// Encodes chunks into a fresh Maxis IFF 2.5 container with an authentic
+/// version-0 `rsmp` resource map.
+///
+/// Preserves exact caller-supplied `flags` (including `0` for big-endian
+/// resources), preserves distinct `(tag, id, flags >> 8)` variants, and
+/// rejects duplicate resource identities instead of silently replacing them.
 pub fn encode_iff_with_rsmp(chunks: &[ChunkData]) -> Result<Vec<u8>> {
-    static ZERO_PAD: [u8; 76] = [0u8; 76];
-    let mut bytes = sims_formats::iff::write(&[])?;
+    struct MapEntry {
+        offset: u32,
+        id: u16,
+        flags: u16,
+        label: Vec<u8>,
+    }
+
+    let mut seen_keys = BTreeSet::new();
+    let mut type_order: Vec<[u8; 4]> = Vec::new();
+    let mut groups: Vec<([u8; 4], Vec<MapEntry>)> = Vec::new();
+
+    let mut bytes = Vec::with_capacity(IFF_FILE_HEADER_SIZE);
+    bytes.extend_from_slice(IFF_SIGNATURE_25);
+    bytes.resize(IFF_FILE_HEADER_SIZE, 0);
+
     for chunk in chunks {
+        if chunk.tag == *b"rsmp" {
+            return Err(Error::new("cannot explicitly supply an 'rsmp' chunk"));
+        }
+        if chunk.flags & DELETED != 0 {
+            return Err(Error::new(
+                "cannot encode a chunk marked DELETED into a fresh IFF",
+            ));
+        }
+        if chunk.flags & !(0xFF00 | IFF_CONVERTED) != 0 {
+            return Err(Error::new(format!(
+                "unsupported IFF chunk flags {:#06x} on {} #{}",
+                chunk.flags,
+                String::from_utf8_lossy(&chunk.tag),
+                chunk.id
+            )));
+        }
+        let key = (chunk.tag, chunk.id, (chunk.flags >> 8) as u8);
+        if !seen_keys.insert(key) {
+            return Err(Error::new(format!(
+                "duplicate IFF resource {} #{} (variant {})",
+                String::from_utf8_lossy(&chunk.tag),
+                chunk.id,
+                key.2
+            )));
+        }
         let label = sims_formats::far::encode_name(&chunk.label)
             .filter(|b| b.len() <= 63 && !b.contains(&0))
             .ok_or_else(|| Error::new(format!("invalid IFF chunk label '{}'", chunk.label)))?;
-        let flags = if chunk.flags == 0 {
-            IFF_CONVERTED_FLAG
-        } else {
-            chunk.flags
+
+        let offset = bytes.len();
+        let offset_u32 = u32::try_from(offset)
+            .ok()
+            .filter(|&o| o <= i32::MAX as u32)
+            .ok_or_else(|| Error::new("IFF file offset exceeds 2 GiB limit"))?;
+        let chunk_size = u32::try_from(chunk.data.len())
+            .ok()
+            .and_then(|n| n.checked_add(IFF_CHUNK_HEADER_SIZE as u32))
+            .filter(|&n| n <= i32::MAX as u32)
+            .ok_or_else(|| Error::new("IFF chunk size exceeds 2 GiB limit"))?;
+
+        bytes.extend_from_slice(&chunk.tag);
+        bytes.extend_from_slice(&chunk_size.to_be_bytes());
+        bytes.extend_from_slice(&chunk.id.to_be_bytes());
+        bytes.extend_from_slice(&chunk.flags.to_be_bytes());
+        bytes.extend_from_slice(&label);
+        bytes.resize(offset + IFF_CHUNK_HEADER_SIZE, 0);
+        bytes.extend_from_slice(&chunk.data);
+
+        let entry = MapEntry {
+            offset: offset_u32,
+            id: chunk.id,
+            flags: chunk.flags,
+            label,
         };
-        bytes = iff_write::write_chunk_with_residue(
-            &bytes,
-            ChunkWrite {
-                tag: chunk.tag,
-                id: chunk.id,
-                flags,
-                label: &label,
-                payload: &chunk.data,
-            },
-            |range| ZERO_PAD.get(..range.len()),
-        )?;
+        if let Some(pos) = type_order.iter().position(|&t| t == chunk.tag) {
+            groups[pos].1.push(entry);
+        } else {
+            type_order.push(chunk.tag);
+            groups.push((chunk.tag, vec![entry]));
+        }
     }
+
+    // Build version-0 rsmp payload matching `sims_formats::iff::ResourceMap::parse`.
+    let mut map = Vec::from(*b"\0\0\0\0\0\0\0\0pmsr");
+    map.extend_from_slice(&0u32.to_le_bytes()); // unused_bytes = 0
+    map.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+    for (tag, entries) in &groups {
+        map.extend_from_slice(&u32::from_be_bytes(*tag).to_le_bytes());
+        map.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for entry in entries {
+            map.extend_from_slice(&entry.offset.to_le_bytes());
+            map.extend_from_slice(&entry.id.to_le_bytes());
+            map.extend_from_slice(&entry.flags.to_le_bytes());
+            map.extend_from_slice(&entry.label);
+            map.push(0);
+            if map.len() & 1 != 0 {
+                map.push(0);
+            }
+        }
+    }
+
+    let map_offset = bytes.len();
+    let map_offset_u32 = u32::try_from(map_offset)
+        .ok()
+        .filter(|&o| o <= i32::MAX as u32)
+        .ok_or_else(|| Error::new("IFF rsmp offset exceeds 2 GiB limit"))?;
+    let map_chunk_size = u32::try_from(map.len())
+        .ok()
+        .and_then(|n| n.checked_add(IFF_CHUNK_HEADER_SIZE as u32))
+        .filter(|&n| n <= i32::MAX as u32)
+        .ok_or_else(|| Error::new("IFF rsmp chunk exceeds 2 GiB limit"))?;
+
+    bytes.extend_from_slice(b"rsmp");
+    bytes.extend_from_slice(&map_chunk_size.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&IFF_CONVERTED.to_be_bytes());
+    bytes.resize(map_offset + IFF_CHUNK_HEADER_SIZE, 0);
+    bytes.extend_from_slice(&map);
+    bytes[60..IFF_FILE_HEADER_SIZE].copy_from_slice(&map_offset_u32.to_be_bytes());
     Ok(bytes)
 }
 
 /// Encodes multiple files into a `FAR!byAZ` version 1 archive compatible with
-/// [`sims_formats::far`].
+/// [`sims_formats::far`], enforcing the reader's 128 MiB member limit and
+/// 64 MiB directory limit prior to allocation.
 pub fn encode_far(entries: &[FarEntry<'_>]) -> Result<Vec<u8>> {
-    const HEADER_LEN: usize = 16;
-    let mut payload = Vec::new();
-    let mut directory_records = Vec::with_capacity(entries.len());
+    const HEADER_LEN: u64 = 16;
+
+    // Pre-validate names, member sizes, payload offsets, and directory size before allocating.
+    let mut encoded_names = Vec::with_capacity(entries.len());
+    let mut total_payload: u64 = 0;
+    let mut dir_bytes: u64 = 4; // u32 entry count
 
     for entry in entries {
         let raw_name = sims_formats::far::encode_name(entry.name)
             .filter(|b| !b.is_empty() && b.len() <= 32768 && !b.contains(&0))
             .ok_or_else(|| Error::new(format!("invalid FAR member name '{}'", entry.name)))?;
-        let offset = u32::try_from(
-            HEADER_LEN
-                .checked_add(payload.len())
-                .ok_or_else(|| Error::new("FAR archive payload offset overflow"))?,
-        )
-        .map_err(|_| Error::new("FAR archive payload exceeds 4 GiB"))?;
-        let size =
-            u32::try_from(entry.data.len()).map_err(|_| Error::new("FAR member exceeds 4 GiB"))?;
-        payload.extend_from_slice(entry.data);
-        directory_records.push((size, offset, raw_name));
+        let member_len = entry.data.len() as u64;
+        if member_len > MAX_MEMBER {
+            return Err(Error::new(format!(
+                "FAR member '{}' ({member_len} bytes) exceeds 128 MiB limit",
+                entry.name
+            )));
+        }
+        total_payload = total_payload
+            .checked_add(member_len)
+            .ok_or_else(|| Error::new("FAR archive payload length overflow"))?;
+        dir_bytes = dir_bytes
+            .checked_add(16)
+            .and_then(|n| n.checked_add(raw_name.len() as u64))
+            .ok_or_else(|| Error::new("FAR directory size overflow"))?;
+        if dir_bytes > MAX_DIRECTORY {
+            return Err(Error::new("FAR directory exceeds 64 MiB reader limit"));
+        }
+        encoded_names.push(raw_name);
     }
 
-    let manifest_offset = u32::try_from(
-        HEADER_LEN
-            .checked_add(payload.len())
-            .ok_or_else(|| Error::new("FAR manifest offset overflow"))?,
+    let manifest_offset_u64 = HEADER_LEN
+        .checked_add(total_payload)
+        .ok_or_else(|| Error::new("FAR manifest offset overflow"))?;
+    let manifest_offset = u32::try_from(manifest_offset_u64)
+        .map_err(|_| Error::new("FAR manifest offset exceeds u32"))?;
+    let total_len = usize::try_from(
+        manifest_offset_u64
+            .checked_add(dir_bytes)
+            .ok_or_else(|| Error::new("FAR total archive size overflow"))?,
     )
-    .map_err(|_| Error::new("FAR manifest offset exceeds u32"))?;
+    .map_err(|_| Error::new("FAR archive exceeds addressable memory"))?;
 
-    let mut out = Vec::with_capacity(HEADER_LEN + payload.len() + entries.len() * 32);
+    let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(b"FAR!byAZ");
     out.extend_from_slice(&1u32.to_le_bytes());
     out.extend_from_slice(&manifest_offset.to_le_bytes());
-    out.extend_from_slice(&payload);
 
-    let count = u32::try_from(directory_records.len())
-        .map_err(|_| Error::new("FAR entry count exceeds u32"))?;
+    let mut offsets = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let offset = out.len() as u32;
+        offsets.push(offset);
+        out.extend_from_slice(entry.data);
+    }
+
+    let count =
+        u32::try_from(entries.len()).map_err(|_| Error::new("FAR entry count exceeds u32"))?;
     out.extend_from_slice(&count.to_le_bytes());
-    for (size, offset, raw_name) in directory_records {
+    for ((entry, raw_name), offset) in entries.iter().zip(encoded_names).zip(offsets) {
+        let size = entry.data.len() as u32;
         out.extend_from_slice(&size.to_le_bytes());
         out.extend_from_slice(&size.to_le_bytes());
         out.extend_from_slice(&offset.to_le_bytes());
