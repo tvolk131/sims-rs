@@ -34,8 +34,7 @@ use crate::{Error, Result};
 use sims_content::Install;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_formats::bitmap::{self, Image as BitmapImage};
-use sims_formats::iff::Iff;
-use sims_formats::lot::Simulator;
+use sims_formats::iff::{DELETED as IFF_DELETED, ResourceMap};
 use sims_formats::neighborhood::Family;
 use sims_formats::strings::{Format as StringTableFormat, StringTable, TextEntry};
 use std::borrow::Cow;
@@ -794,24 +793,30 @@ impl NeighborhoodMap {
                 else {
                     continue;
                 };
-                let zoning = zoning_table
-                    .first_zone
-                    .get(&i32::from(lot_id))
-                    .copied()
-                    .unwrap_or(match kind {
-                        NeighborhoodKind::Classic => LotZoning::Residential,
-                        NeighborhoodKind::Downtown
-                        | NeighborhoodKind::Vacation
-                        | NeighborhoodKind::StudioTown => LotZoning::Community,
-                        NeighborhoodKind::MagicTown => {
-                            if lot_id <= 92 {
-                                LotZoning::Residential
-                            } else {
-                                LotZoning::Community
+                let zoning = if lot_id == 0 {
+                    // 0x42b9e3..0x42b9ee: GetLotZoning(0) always returns
+                    // Residential (1), overriding any `0, community` row.
+                    LotZoning::Residential
+                } else {
+                    zoning_table
+                        .first_zone
+                        .get(&i32::from(lot_id))
+                        .copied()
+                        .unwrap_or(match kind {
+                            NeighborhoodKind::Classic => LotZoning::Residential,
+                            NeighborhoodKind::Downtown
+                            | NeighborhoodKind::Vacation
+                            | NeighborhoodKind::StudioTown => LotZoning::Community,
+                            NeighborhoodKind::MagicTown => {
+                                if lot_id <= 92 {
+                                    LotZoning::Residential
+                                } else {
+                                    LotZoning::Community
+                                }
                             }
-                        }
-                        NeighborhoodKind::Unleashed => LotZoning::Unknown,
-                    });
+                            NeighborhoodKind::Unleashed => LotZoning::Unknown,
+                        })
+                };
                 let status = resolve_lot_status(lot_id, kind, zoning, &occupancy);
                 let lot_i32 = i32::from(lot_id);
                 let has_primary_vacation_stay = occupancy.primary_vacation_stays.contains(&lot_i32);
@@ -1640,7 +1645,7 @@ struct BuiltLotCells {
 }
 
 fn build_lot_cells(
-    iff: &Iff,
+    iff: &NativeIff,
     half_scale: bool,
     badge_sprite: Option<&Surface565>,
 ) -> Result<Option<BuiltLotCells>> {
@@ -1649,8 +1654,8 @@ fn build_lot_cells(
     // a single roofs-off cell (0x54e685..0x54e6a7) and corrupt 1024 falls back
     // to 512 (0x4e2692..0x4e26de).
     let decode_bmp_chunk = |id: u16| -> Option<Surface565> {
-        let chunk = iff.get(b"BMP_", id)?;
-        let img = bitmap::bmp(iff.data(chunk)).ok()?;
+        let (data, _flags) = iff.get(b"BMP_", id)?;
+        let img = bitmap::bmp(data).ok()?;
         Some(Surface565::from_bitmap(&img))
     };
 
@@ -1660,7 +1665,7 @@ fn build_lot_cells(
         if let Some(bmp_1024) = decode_bmp_chunk(1024) {
             let bmp_1025 = decode_bmp_chunk(1025);
             let metrics = match iff.get(b"THMB", 1024) {
-                Some(chunk) => ThmbMetrics::parse(iff.data(chunk))?,
+                Some((data, _)) => ThmbMetrics::parse(data)?,
                 None => ThmbMetrics::CENTERED,
             };
             (metrics, bmp_1024, bmp_1025)
@@ -1672,7 +1677,7 @@ fn build_lot_cells(
             let half_512 = resample_half_565(&bmp_512);
             let half_513 = bmp_513.as_ref().map(resample_half_565);
             let metrics = match iff.get(b"THMB", 512) {
-                Some(chunk) => ThmbMetrics::parse(iff.data(chunk))?.halved(),
+                Some((data, _)) => ThmbMetrics::parse(data)?.halved(),
                 None => ThmbMetrics::CENTERED,
             };
             (metrics, half_512, half_513)
@@ -1683,7 +1688,7 @@ fn build_lot_cells(
         };
         let bmp_513 = decode_bmp_chunk(513);
         let metrics = match iff.get(b"THMB", 512) {
-            Some(chunk) => ThmbMetrics::parse(iff.data(chunk))?,
+            Some((data, _)) => ThmbMetrics::parse(data)?,
             None => ThmbMetrics::CENTERED,
         };
         (metrics, bmp_512, bmp_513)
@@ -1704,14 +1709,25 @@ fn build_lot_cells(
     }))
 }
 
-fn read_lot_filter_mask(iff: &Iff) -> Option<u16> {
-    // 0x427f21 / 0x464e6d: requires SIMI 1; missing or corrupt SIMI 1 fails
-    // the lot load at 0x4e1e58..0x4e1e62.
-    let chunk = iff.get(b"SIMI", 1)?;
-    let sim = Simulator::parse(iff.data(chunk)).ok()?;
-    // 0x427f46: SIMI globals[37] holds the lot's community amenity bitmask
-    // (present on SIMI version >= 0x41 which stores 64 globals).
-    Some(sim.globals.get(37).copied().unwrap_or(0) as u16)
+fn read_lot_filter_mask(iff: &NativeIff) -> Option<u16> {
+    // 0x427f21 / 0x464e6d / 0x4e1e58..0x4e1e62: requires SIMI 1 to be present;
+    // once found, 0x46cfb3 deserializes globals with no 0x49 version ceiling
+    // (16 globals for v < 0x12, 32 for v < 0x41, 64 for v >= 0x41) and
+    // 0x427f46 reads globals[37].
+    let (data, _flags) = iff.get(b"SIMI", 1)?;
+    if data.len() < 12 || &data[8..12] != b"IMIS" {
+        return Some(0);
+    }
+    let version = i32::from_le_bytes(data[4..8].try_into().unwrap());
+    if version < 0x41 {
+        return Some(0);
+    }
+    let off = 12 + 37 * 2;
+    let mask = data
+        .get(off..off + 2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as u16)
+        .unwrap_or(0);
+    Some(mask)
 }
 
 #[derive(Default)]
@@ -1757,12 +1773,12 @@ fn load_family_occupancy(install: &Install, user_dir: &Path) -> FamilyOccupancy 
     else {
         return occ;
     };
-    for chunk in iff.all(b"FAMI") {
-        let Ok(family) = Family::parse(iff.data(chunk)) else {
+    for (id, data) in iff.all(b"FAMI") {
+        let Ok(family) = Family::parse(data) else {
             continue;
         };
         // 0x410673 / 0x4e1e73: native family ID is the FAMI chunk ID, not payload `number`.
-        occ.record_family(i32::from(chunk.id), &family);
+        occ.record_family(i32::from(id), &family);
     }
     occ
 }
@@ -1832,33 +1848,188 @@ impl LotLocations {
     }
 }
 
-fn open_iff(path: &Path) -> Option<Iff> {
-    open_iff_bytes(fs::read(path).ok()?)
+#[derive(Debug, Clone, Copy)]
+struct NativeResource {
+    offset: usize,
+    tag: [u8; 4],
+    id: u16,
+    flags: u16,
 }
 
-/// Validates and parses an IFF byte buffer with the native opener's header and
-/// resource-map checks (`0x41c2d6..0x41c345`, `0x41c3c3..0x41c4f7`).
-fn open_iff_bytes(bytes: Vec<u8>) -> Option<Iff> {
-    // 0x6c2128: 64-byte wildcard signature template (`*` at 9, 11, 60..64).
-    const HEADER_TEMPLATE: &[u8; 64] =
-        b"IFF FILE *.*:TYPE FOLLOWED BY SIZE\0 JAMIE DOORNBOS & MAXIS 1****";
-    let header = bytes.get(..64)?;
-    for (&expected, &actual) in HEADER_TEMPLATE.iter().zip(header.iter()) {
-        if expected != b'*' && expected != actual {
+/// Native IFF 2.0/2.5 reader matching `0x41c2d6..0x41c601` and `0x41d316..0x41d36e`:
+/// - checks all 64 header bytes against the wildcard template at `0x6c2128` and
+///   requires version `2.0` or `2.5`,
+/// - for 2.5 with a nonzero resource-map offset, reads the `rsmp` chunk at that
+///   offset and skips the physical scan (`0x41c500`), rejecting invalid offsets,
+/// - on resource lookup, seeks to the entry's offset and checks only the chunk's
+///   4-byte type tag and bounds (`0x41d32a..0x41d341`), matching native lookup.
+struct NativeIff {
+    bytes: Vec<u8>,
+    order: BTreeMap<[u8; 4], Vec<NativeResource>>,
+    by_key: BTreeMap<([u8; 4], u16, u8), NativeResource>,
+}
+
+impl NativeIff {
+    fn parse(bytes: Vec<u8>) -> Option<Self> {
+        const HEADER_TEMPLATE: &[u8; 64] =
+            b"IFF FILE *.*:TYPE FOLLOWED BY SIZE\0 JAMIE DOORNBOS & MAXIS 1****";
+        const CHUNK_HEADER_SIZE: usize = 76;
+        const MAX_PAYLOAD_SIZE: usize = 0x4000_0000;
+
+        let header = bytes.get(..64)?;
+        for (&expected, &actual) in HEADER_TEMPLATE.iter().zip(header.iter()) {
+            if expected != b'*' && expected != actual {
+                return None;
+            }
+        }
+        let is_25 = match (header[9], header[11]) {
+            (b'2', b'0') => false,
+            (b'2', b'5') => true,
+            _ => return None,
+        };
+
+        let mut order: BTreeMap<[u8; 4], Vec<NativeResource>> = BTreeMap::new();
+        let mut by_key: BTreeMap<([u8; 4], u16, u8), NativeResource> = BTreeMap::new();
+        let mut used_map = false;
+
+        if is_25 {
+            let rsmp_offset = u32::from_be_bytes(header[60..64].try_into().unwrap()) as usize;
+            if rsmp_offset != 0 {
+                // 0x41c3c3..0x41c3dd: rsmp chunk header must exist at rsmp_offset,
+                // be live (not deleted), and carry tag `rsmp`.
+                let hdr = bytes.get(rsmp_offset..rsmp_offset.checked_add(CHUNK_HEADER_SIZE)?)?;
+                let tag: [u8; 4] = hdr[0..4].try_into().unwrap();
+                let length = u32::from_be_bytes(hdr[4..8].try_into().unwrap()) as usize;
+                let flags = u16::from_be_bytes(hdr[10..12].try_into().unwrap());
+                if tag != *b"rsmp" || (flags & IFF_DELETED) != 0 {
+                    return None;
+                }
+                // 0x41c468..0x41c4dd: reading or parsing the rsmp payload may
+                // succeed (skipping physical scan) or fall back to physical scan
+                // when the map payload is unusable or lists `rsmp` ID 0.
+                let payload_len = length.checked_sub(CHUNK_HEADER_SIZE);
+                let payload = payload_len
+                    .filter(|&n| n <= MAX_PAYLOAD_SIZE)
+                    .and_then(|_| {
+                        bytes.get(rsmp_offset + CHUNK_HEADER_SIZE..rsmp_offset.checked_add(length)?)
+                    });
+                if let Some(payload) = payload
+                    && let Ok(map) = ResourceMap::parse(payload)
+                {
+                    let lists_self = map.types.get(b"rsmp").is_some_and(|entries| {
+                        entries.iter().any(|e| e.id == 0 && e.flags >> 8 == 0)
+                    });
+                    if !lists_self {
+                        for (&entry_tag, entries) in &map.types {
+                            if entry_tag == *b"rsmp" {
+                                continue;
+                            }
+                            for entry in entries {
+                                let key = (entry_tag, entry.id, (entry.flags >> 8) as u8);
+                                if by_key.contains_key(&key) {
+                                    continue;
+                                }
+                                let res = NativeResource {
+                                    offset: entry.offset as usize,
+                                    tag: entry_tag,
+                                    id: entry.id,
+                                    flags: entry.flags,
+                                };
+                                by_key.insert(key, res);
+                                order.entry(entry_tag).or_default().push(res);
+                            }
+                        }
+                        used_map = true;
+                    }
+                }
+            }
+        }
+
+        if !used_map {
+            // 0x41c510..0x41c5f8: physical chunk scan from offset 64 until EOF
+            // or invalid chunk size; deleted chunks are skipped and `rsmp` is dropped.
+            let mut pos = 64usize;
+            while let Some(hdr) = pos
+                .checked_add(CHUNK_HEADER_SIZE)
+                .and_then(|end| bytes.get(pos..end))
+            {
+                let tag: [u8; 4] = hdr[0..4].try_into().unwrap();
+                let length = u32::from_be_bytes(hdr[4..8].try_into().unwrap()) as usize;
+                let id = u16::from_be_bytes(hdr[8..10].try_into().unwrap());
+                let flags = u16::from_be_bytes(hdr[10..12].try_into().unwrap());
+                if !(CHUNK_HEADER_SIZE..=MAX_PAYLOAD_SIZE).contains(&length) {
+                    break;
+                }
+                if (flags & IFF_DELETED) == 0 && tag != *b"rsmp" {
+                    let key = (tag, id, (flags >> 8) as u8);
+                    let res = NativeResource {
+                        offset: pos,
+                        tag,
+                        id,
+                        flags,
+                    };
+                    if let Some(prev) = by_key.insert(key, res) {
+                        if let Some(list) = order.get_mut(&tag)
+                            && let Some(slot) = list.iter_mut().find(|r| r.offset == prev.offset)
+                        {
+                            *slot = res;
+                        }
+                    } else {
+                        order.entry(tag).or_default().push(res);
+                    }
+                }
+                let Some(next) = pos.checked_add(length) else {
+                    break;
+                };
+                pos = next;
+            }
+        }
+
+        Some(Self {
+            bytes,
+            order,
+            by_key,
+        })
+    }
+
+    /// Reads the payload for `res`, verifying only bounds and matching chunk
+    /// tag (`0x41d316..0x41d36e`), without requiring physical chunk ID parity.
+    fn payload(&self, res: NativeResource) -> Option<&[u8]> {
+        const CHUNK_HEADER_SIZE: usize = 76;
+        const MAX_PAYLOAD_SIZE: usize = 0x4000_0000;
+
+        let hdr_end = res.offset.checked_add(CHUNK_HEADER_SIZE)?;
+        let hdr = self.bytes.get(res.offset..hdr_end)?;
+        if &hdr[0..4] != res.tag.as_slice() {
             return None;
         }
+        let length = u32::from_be_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        let payload_len = length.checked_sub(CHUNK_HEADER_SIZE)?;
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return None;
+        }
+        let end = res.offset.checked_add(length)?;
+        self.bytes.get(hdr_end..end)
     }
-    let version_ok =
-        (header[9] == b'2' && header[11] == b'0') || (header[9] == b'2' && header[11] == b'5');
-    if !version_ok {
-        return None;
+
+    fn get(&self, tag: &[u8; 4], id: u16) -> Option<(&[u8], u16)> {
+        let &res = self.by_key.get(&(*tag, id, 0))?;
+        Some((self.payload(res)?, res.flags))
     }
-    let iff = Iff::parse(bytes).ok()?;
-    // 0x41c3c3..0x41c4f7: reject a 2.5 file whose nonzero rsmp offset is invalid.
-    if iff.map_error().is_some() {
-        return None;
+
+    fn all(&self, tag: &[u8; 4]) -> Vec<(u16, &[u8])> {
+        let Some(entries) = self.order.get(tag) else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .filter_map(|&res| Some((res.id, self.payload(res)?)))
+            .collect()
     }
-    Some(iff)
+}
+
+fn open_iff(path: &Path) -> Option<NativeIff> {
+    NativeIff::parse(fs::read(path).ok()?)
 }
 
 /// Parses a legacy `\0CST` string-table chunk (`0x470178..0x470209`),
@@ -1890,14 +2061,13 @@ fn parse_cst_chunk(data: &[u8]) -> StringTable {
 
 /// Loads a string table chunk matching `0x4702f9..0x47034b`: tries `STR#` first,
 /// then falls back to legacy `\0CST` (`0x00435354`) with the same resource ID.
-fn load_native_string_table(iff: &Iff, id: u16) -> Option<StringTable> {
-    if let Some(chunk) = iff.get(b"STR#", id)
-        && let Ok(table) = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk))
+fn load_native_string_table(iff: &NativeIff, id: u16) -> Option<StringTable> {
+    if let Some((data, flags)) = iff.get(b"STR#", id)
+        && let Ok(table) = StringTable::parse_chunk(data, flags)
     {
         return Some(table);
     }
-    iff.get(b"\0CST", id)
-        .map(|chunk| parse_cst_chunk(iff.data(chunk)))
+    iff.get(b"\0CST", id).map(|(data, _)| parse_cst_chunk(data))
 }
 
 /// Reproduces the native `STR#` US English entry vector order (`0x46ffd5..0x470069`,
@@ -2676,17 +2846,58 @@ mod tests {
         assert_eq!(interleaved_locs.get(&1), Some(&[435, 445]));
 
         // Native IFF opener rejects damaged header bytes after "IFF FILE 2.5:"
-        // and invalid nonzero resource-map offsets (0x41c2d6..0x41c4f7).
+        // and invalid nonzero resource-map offsets (0x41c2d6..0x41c4f7), while
+        // keeping indexed files with trailing bytes or differing physical chunk
+        // IDs (0x41c500, 0x41d33b).
         let valid_iff = sims_formats::iff::write(&[]).expect("write empty IFF");
-        assert!(open_iff_bytes(valid_iff.clone()).is_some());
+        assert!(NativeIff::parse(valid_iff.clone()).is_some());
         let mut bad_sig = valid_iff.clone();
         bad_sig[20] ^= 0xff;
-        assert!(open_iff_bytes(bad_sig).is_none());
+        assert!(NativeIff::parse(bad_sig).is_none());
         let mut bad_rsmp = valid_iff;
         bad_rsmp[60..64].copy_from_slice(&0x1234u32.to_be_bytes());
-        assert!(open_iff_bytes(bad_rsmp).is_none());
+        assert!(NativeIff::parse(bad_rsmp).is_none());
 
-        // Missing SIMI 1 rejects the lot (0x427f21), while a corrupt optional
+        // Build an indexed IFF 2.5 where rsmp maps STR# 4 to offset 64 even
+        // though the physical chunk at 64 carries ID 99, plus 1 trailing byte.
+        let str_payload = b"\xff\xff\x01\x001, 481, 84\0".to_vec();
+        let mut rsmp_payload = Vec::new();
+        rsmp_payload.extend_from_slice(&[0u8; 8]);
+        rsmp_payload.extend_from_slice(b"pmsr");
+        rsmp_payload.extend_from_slice(&0u32.to_le_bytes());
+        rsmp_payload.extend_from_slice(&1u32.to_le_bytes()); // 1 type
+        rsmp_payload.extend_from_slice(&u32::from_be_bytes(*b"STR#").to_le_bytes());
+        rsmp_payload.extend_from_slice(&1u32.to_le_bytes()); // 1 entry
+        rsmp_payload.extend_from_slice(&64u32.to_le_bytes()); // offset 64
+        rsmp_payload.extend_from_slice(&4u16.to_le_bytes()); // map ID = 4
+        rsmp_payload.extend_from_slice(&0x0010u16.to_le_bytes()); // flags
+        rsmp_payload.extend_from_slice(&[0u8, 0u8]); // empty NUL label + pad
+        let rsmp_offset = 64 + 76 + str_payload.len();
+        let mut indexed = sims_formats::iff::write(&[
+            sims_formats::iff::ChunkData {
+                tag: *b"STR#",
+                id: 99, // differs from rsmp entry ID 4
+                flags: 0x0010,
+                label: String::new(),
+                data: str_payload,
+            },
+            sims_formats::iff::ChunkData {
+                tag: *b"rsmp",
+                id: 0,
+                flags: 0,
+                label: String::new(),
+                data: rsmp_payload,
+            },
+        ])
+        .expect("write indexed IFF");
+        indexed[60..64].copy_from_slice(&(rsmp_offset as u32).to_be_bytes());
+        indexed.push(0xaa); // trailing byte ignored when rsmp skips physical scan
+        let parsed_indexed = NativeIff::parse(indexed).expect("indexed IFF opens");
+        let tbl = load_native_string_table(&parsed_indexed, 4).expect("STR# 4 via rsmp");
+        assert_eq!(parse_lot_locations_table(&tbl).get(&1), Some(&[481, 84]));
+
+        // Missing SIMI 1 rejects the lot (0x427f21), SIMI version 0x4a is
+        // accepted with globals[37] read (0x46cfb3), and a corrupt optional
         // BMP_ 513 still leaves an intact BMP_ 512 drawable as a single cell
         // (0x4ded62..0x4ded72, 0x54e685..0x54e6a7).
         let bmp_1x1 = {
@@ -2720,13 +2931,30 @@ mod tests {
             },
         ])
         .expect("write synthetic house IFF");
-        let house_iff = open_iff_bytes(house_bytes).expect("synthetic house opens");
+        let house_iff = NativeIff::parse(house_bytes).expect("synthetic house opens");
         assert_eq!(read_lot_filter_mask(&house_iff), None);
         let built = build_lot_cells(&house_iff, false, None)
             .expect("corrupt optional BMP_ 513 does not error")
             .expect("intact BMP_ 512 remains drawable");
         assert_eq!((built.normal.width, built.normal.height), (1, 1));
         assert!(built.roofs_off.is_none());
+
+        let mut simi_4a = vec![0u8; 12 + 64 * 2];
+        simi_4a[4..8].copy_from_slice(&0x4au32.to_le_bytes());
+        simi_4a[8..12].copy_from_slice(b"IMIS");
+        simi_4a[12 + 37 * 2..12 + 38 * 2].copy_from_slice(&0x0005u16.to_le_bytes());
+        let simi_iff = NativeIff::parse(
+            sims_formats::iff::write(&[sims_formats::iff::ChunkData {
+                tag: *b"SIMI",
+                id: 1,
+                flags: 0,
+                label: String::new(),
+                data: simi_4a,
+            }])
+            .expect("write SIMI 0x4a IFF"),
+        )
+        .expect("SIMI 0x4a IFF opens");
+        assert_eq!(read_lot_filter_mask(&simi_iff), Some(0x0005));
     }
 
     #[test]
