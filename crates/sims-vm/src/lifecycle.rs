@@ -1163,6 +1163,157 @@ fn purge_orphaned_person(
     Ok((people_to_reset, objects_to_reset))
 }
 
+/// Removes any saved `ObjM` instance from a base house file whose character
+/// GUID was permanently deleted when another lot was bulldozed (`0x426fcd`) and
+/// no longer has a catalog definition, promoting any `slot 0` tile/chain
+/// successor, decrementing `data[62]` use counts on surviving objects it used,
+/// and scrubbing references in surviving instances.
+fn strip_deleted_base_instances(
+    world: &mut World,
+    objects: &mut sims_formats::saved_objects::Objects,
+    catalog: &Catalog,
+    deleted_characters: &BTreeSet<u32>,
+) -> (BTreeSet<u16>, BTreeSet<u16>) {
+    let deleted_ids: Vec<u16> = objects
+        .order
+        .iter()
+        .copied()
+        .filter(|id| {
+            objects.instances.get(id).is_some_and(|inst| {
+                deleted_characters.contains(&inst.guid) && catalog.object(inst.guid).is_none()
+            })
+        })
+        .collect();
+    let mut people_to_reset = BTreeSet::new();
+    let mut objects_to_reset = BTreeSet::new();
+    if deleted_ids.is_empty() {
+        return (people_to_reset, objects_to_reset);
+    }
+    let full = FULL_SIZE as usize;
+    for id in deleted_ids {
+        let Some(removed) = objects.instances.remove(&id) else {
+            continue;
+        };
+        objects.order.retain(|&other| other != id);
+        objects.types_by_id.remove(&id);
+        let id_i16 = id as i16;
+        let deleted_type_id = removed.type_id as i16;
+
+        // Decrement data[62] on any surviving object marked in use by `removed`.
+        if let Some(person) = &removed.person {
+            for used in &person.object_uses {
+                if let Ok(target_id) = u16::try_from(used.target)
+                    && let Some(target_obj) = objects.instances.get_mut(&target_id)
+                    && let Some(users) = target_obj.data.get_mut(62)
+                    && *users > 0
+                {
+                    *users -= 1;
+                }
+            }
+        }
+
+        // Promote any surviving `slot 0` successor into `removed`'s tile grid
+        // cell or predecessor slot.
+        let next_id = removed
+            .slots
+            .first()
+            .and_then(|s| u16::try_from(s.object).ok())
+            .filter(|&n| n != 0 && objects.instances.contains_key(&n));
+        let slot_word = removed.data.get(14).copied().unwrap_or(-1);
+        let before_word = removed.data.get(26).copied().unwrap_or(0);
+        if slot_word >= 0
+            && let Ok(parent_id) = u16::try_from(before_word)
+            && let Some(parent) = objects.instances.get_mut(&parent_id)
+            && let Some(slot_entry) = parent.slots.get_mut(slot_word as usize)
+            && slot_entry.object == id_i16
+        {
+            slot_entry.object = next_id.map_or(0, |n| n as i16);
+        } else {
+            let level = if removed.position[2] == 2 { 1 } else { 0 };
+            let grid_id = crate::placement::LEVEL_GRIDS[level];
+            let tx = removed.position[0].div_euclid(16);
+            let ty = removed.position[1].div_euclid(16);
+            if tx >= 0
+                && ty >= 0
+                && (tx as usize) < full
+                && (ty as usize) < full
+                && let Some(grid) = world.arrays.get_mut(&grid_id)
+                && grid.stride == 2
+            {
+                let cell = (tx as usize * full + ty as usize) * 2;
+                if let Some(bytes) = grid.data.get_mut(cell..cell + 2)
+                    && bytes == id_i16.to_le_bytes()
+                {
+                    let replacement = next_id.unwrap_or(0u16);
+                    bytes.copy_from_slice(&replacement.to_le_bytes());
+                }
+            }
+        }
+        if let Some(next) = next_id
+            && let Some(next_obj) = objects.instances.get_mut(&next)
+        {
+            if let Some(s) = next_obj.data.get_mut(14) {
+                *s = slot_word;
+            }
+            if let Some(b) = next_obj.data.get_mut(26) {
+                *b = before_word;
+            }
+        }
+
+        // Scrub any remaining references to `id` or its deleted type in
+        // surviving saved instances.
+        let target_i32 = i32::from(id_i16);
+        for (&other_id, inst) in &mut objects.instances {
+            for slot in &mut inst.slots {
+                if slot.object == id_i16 {
+                    slot.object = 0;
+                }
+            }
+            inst.relationships.retain(|r| r.target != target_i32);
+            let stack_hits = inst
+                .stack
+                .iter()
+                .any(|f| f.stack_object == id_i16 || f.code_owner_type == deleted_type_id);
+            if let Some(person) = inst.person.as_mut() {
+                let uses_hit = person.object_uses.iter().any(|u| u.target == id_i16);
+                let active_hit = person.active.target == id_i16
+                    || person.active.icon == id_i16
+                    || person.active.caller == id_i16;
+                if uses_hit || active_hit || stack_hits {
+                    people_to_reset.insert(other_id);
+                    person.active = crate::object_uses::no_action();
+                }
+                person.object_uses.retain(|u| u.target != id_i16);
+                person
+                    .queue
+                    .retain(|a| a.target != id_i16 && a.icon != id_i16 && a.caller != id_i16);
+                if person.last.target == id_i16 || person.last.caller == id_i16 {
+                    person.last = crate::object_uses::no_action();
+                } else if person.last.icon == id_i16 {
+                    person.last.icon = 0;
+                }
+            } else if stack_hits {
+                objects_to_reset.insert(other_id);
+            }
+        }
+
+        // Clear any lingering grid cell on either floor pointing to `id`.
+        let id_bytes = id_i16.to_le_bytes();
+        for grid_id in crate::placement::LEVEL_GRIDS {
+            if let Some(grid) = world.arrays.get_mut(&grid_id)
+                && grid.stride == 2
+            {
+                for cell in grid.data.as_chunks_mut::<2>().0 {
+                    if *cell == id_bytes {
+                        *cell = [0, 0];
+                    }
+                }
+            }
+        }
+    }
+    (people_to_reset, objects_to_reset)
+}
+
 /// Computes the purchase price of `house` in `neighborhood_id` (`0x427f78`):
 /// reads the latest saved lot if present in REDB, otherwise reads the base
 /// `HouseXX.iff`'s `SIMI` chunk, from a single atomic REDB read snapshot.
@@ -1851,8 +2002,9 @@ fn boot_from_base_house(
     let origin_revision = stored.revision;
 
     let virtual_path = PathBuf::from(format!("{neighborhood_id}/Houses/House{house:02}.iff"));
-    let file = House::parse_bytes(bytes, &virtual_path, &catalog)
-        .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+    let mut file =
+        House::parse_bytes_with_deleted(bytes, &virtual_path, &catalog, &stored.deleted_characters)
+            .map_err(|e| LifecycleError::Lot(e.to_string()))?;
     let view_rotation = opening_rotation(&file);
     let context = Context::COMPLETE_COLLECTION;
     let mut world = World::empty();
@@ -1931,16 +2083,10 @@ fn boot_from_base_house(
         for entry in types {
             let Some(object) = catalog.object(entry.guid) else {
                 // If a character file was permanently deleted when another lot
-                // was bulldozed (`0x426fcd`), an unused `objt` entry for that
-                // GUID in another imported house file is harmless (`read_types`
-                // already skips entries missing from the catalog).
-                if stored.deleted_characters.contains(&entry.guid)
-                    && !file
-                        .objects
-                        .instances
-                        .values()
-                        .any(|o| o.guid == entry.guid)
-                {
+                // was bulldozed (`0x426fcd`), `read_types` skips the missing
+                // catalog entry and `strip_deleted_base_instances` removes any
+                // stale saved instance before object read.
+                if stored.deleted_characters.contains(&entry.guid) {
                     continue;
                 }
                 return Err(LifecycleError::Lot(format!(
@@ -1972,6 +2118,12 @@ fn boot_from_base_house(
             .clear(&mut world)
             .map_err(|e| LifecycleError::Lot(e.to_string()))?
             .len();
+        let (stripped_people_to_reset, stripped_objects_to_reset) = strip_deleted_base_instances(
+            &mut world,
+            &mut file.objects,
+            &catalog,
+            &stored.deleted_characters,
+        );
         let people = People::load(
             &install,
             &index,
@@ -2041,14 +2193,85 @@ fn boot_from_base_house(
             .map_err(|e| LifecycleError::Lot(e.to_string()))?;
 
         load.to_visit = world.order.len();
-        let visited = interpreter.visit_objects(&mut world, &people);
-        load.visited = visited.objects.len();
-        load.reset = visited.reset.len();
-        load.stopped = visited.stopped.map(|fault| fault.to_string());
-        if let Some(reason) = &load.stopped {
-            return Err(LifecycleError::Lot(format!(
-                "house {house} load did not finish: {reason}"
-            )));
+        if enter_live {
+            let visited = interpreter.visit_objects(&mut world, &people);
+            load.visited = visited.objects.len();
+            load.reset = visited.reset.len();
+            load.stopped = visited.stopped.map(|fault| fault.to_string());
+            if let Some(reason) = &load.stopped {
+                return Err(LifecycleError::Lot(format!(
+                    "house {house} load did not finish: {reason}"
+                )));
+            }
+        } else {
+            // During `evict`/`bulldoze` (`enter_live == false`), visit every
+            // object so people attach their neighbor records and positions are
+            // restored; if a stock furniture object's Load callback hits an
+            // empty/unported BHAV (e.g. Complete Collection House 56 object
+            // 302 tree `0x100e`), still restore its position and continue so
+            // the household can be evicted cleanly.
+            let mut current = world.order.first().copied();
+            while let Some(id) = current {
+                let is_person = world.objects.get(&id).is_some_and(|o| o.person.is_some());
+                let changed = world
+                    .objects
+                    .get(&id)
+                    .is_some_and(|o| world.changed_types.contains(&o.guid));
+                let mut next = world.clone();
+                match interpreter.visit(&mut next, id, &people) {
+                    Ok(()) => {
+                        world = next;
+                        load.visited += 1;
+                        if changed {
+                            load.reset += 1;
+                        }
+                    }
+                    Err(fault) if is_person => {
+                        return Err(LifecycleError::Lot(format!(
+                            "house {house} load did not finish: {fault}"
+                        )));
+                    }
+                    Err(_) => {
+                        if let Some(mut pos) = world.objects.get(&id).map(|o| o.position) {
+                            if pos[2] == 0 {
+                                pos[2] = 1;
+                            }
+                            let _ = interpreter.move_tree(&mut world, id, pos);
+                        }
+                    }
+                }
+                current = world
+                    .order
+                    .iter()
+                    .position(|&other| other == id)
+                    .and_then(|place| world.order.get(place + 1).copied());
+            }
+        }
+        for person_id in stripped_people_to_reset {
+            if world
+                .objects
+                .get(&person_id)
+                .is_some_and(|o| o.person.is_some())
+            {
+                interpreter
+                    .reset_person_after_purge(&mut world, person_id)
+                    .map_err(|e| {
+                        LifecycleError::Lot(format!(
+                            "resetting person {person_id} after stripped base character: {e}"
+                        ))
+                    })?;
+            }
+        }
+        for object_id in stripped_objects_to_reset {
+            if world.objects.contains_key(&object_id) {
+                interpreter
+                    .reset(&mut world, object_id, false)
+                    .map_err(|e| {
+                        LifecycleError::Lot(format!(
+                            "resetting object {object_id} after stripped base character: {e}"
+                        ))
+                    })?;
+            }
         }
 
         let made = interpreter
@@ -3926,5 +4149,214 @@ mod tests {
             Some(3),
             "second dialog must receive caller-supplied choice 3"
         );
+
+        // 3. Interactive `push_back_answer` after reopening an explicit-replay
+        //    save with `[3]` must append onto `choices_after` (NOT `queue`),
+        //    so retrying `[Choice1, Notice, Choice2, Choice3]` applies
+        //    `[2, 2, 3, 3]` cleanly instead of feeding `3` into `Notice`.
+        let mut replay_plus_interactive = Answers::replay(&[crate::Answer::from(2)]);
+        replay_plus_interactive.extend_choices_after(&[3]);
+        replay_plus_interactive.push_back_answer(crate::Answer::from(3));
+        assert_eq!(
+            replay_plus_interactive
+                .answer(&choice_dialog)
+                .map(|a| a.status),
+            Some(2)
+        );
+        assert_eq!(
+            replay_plus_interactive
+                .answer(&one_button_notice)
+                .map(|a| a.status),
+            Some(2),
+            "interactive answer appended after replay+choices must NOT intercept the earlier one-button notice"
+        );
+        assert_eq!(
+            replay_plus_interactive
+                .answer(&choice_dialog)
+                .map(|a| a.status),
+            Some(3)
+        );
+        assert_eq!(
+            replay_plus_interactive
+                .answer(&choice_dialog)
+                .map(|a| a.status),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn recreating_deleted_made_character_guid_leaves_neighborhood_loadable() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let db = TempDb::new("reuse-deleted-made-guid");
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let no_frames = Frames::parse("none").unwrap();
+
+        // 1. Add a runtime-made character `0x61520029` homed on House 5
+        //    (non-member), save House 5, then bulldoze House 5 (deleting it).
+        let guid = 0x6152_0029u32;
+        let mut house5 = enter_lot(&root, &store, "UserData", 5, &[3], no_frames.clone()).unwrap();
+        let template_guid = house5.world.objects[&house5.world.people[0]].guid;
+        let next_file = house5
+            .world
+            .characters
+            .made
+            .values()
+            .map(|c| c.file)
+            .max()
+            .unwrap_or(900)
+            + 1;
+        house5.world.characters.made.insert(
+            guid,
+            sims_sim::characters::Character {
+                template: template_guid,
+                file: next_file,
+                strings: BTreeMap::new(),
+            },
+        );
+        let new_nbr_id = (house5.world.neighbors.slots.len() as i16) + 1;
+        let mut data = vec![0i16; sims_sim::neighbors::PERSON_WORDS];
+        data[PERSON_HOME] = 5;
+        house5
+            .world
+            .neighbors
+            .slots
+            .push(Some(sims_sim::neighbors::Neighbor {
+                id: new_nbr_id,
+                guid,
+                revision: 9,
+                data,
+                relationships: Vec::new(),
+                friends: 0,
+                stale: false,
+            }));
+        save_and_leave_lot(&root, &store, "UserData", &mut house5).unwrap();
+
+        let dozed = bulldoze(&root, &store, "UserData", 5).unwrap();
+        assert!(dozed.deleted_tombstones >= 1);
+        assert!(
+            store
+                .load_neighborhood("UserData")
+                .unwrap()
+                .unwrap()
+                .deleted_characters
+                .contains(&guid)
+        );
+
+        // 2. Recreate the exact same GUID `0x61520029` on House 7 and save.
+        let mut house7 = enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
+        house7.world.characters.made.insert(
+            guid,
+            sims_sim::characters::Character {
+                template: template_guid,
+                file: next_file + 1,
+                strings: BTreeMap::new(),
+            },
+        );
+        let nbr_id2 = (house7.world.neighbors.slots.len() as i16) + 1;
+        let mut data2 = vec![0i16; sims_sim::neighbors::PERSON_WORDS];
+        data2[PERSON_HOME] = 7;
+        house7
+            .world
+            .neighbors
+            .slots
+            .push(Some(sims_sim::neighbors::Neighbor {
+                id: nbr_id2,
+                guid,
+                revision: 9,
+                data: data2,
+                relationships: Vec::new(),
+                friends: 0,
+                stale: false,
+            }));
+        save_and_leave_lot(&root, &store, "UserData", &mut house7).unwrap();
+
+        // 3. `deleted_characters` no longer suppresses `guid`, and unrelated
+        //    House 4 opens cleanly!
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert!(!nh.deleted_characters.contains(&guid));
+        assert!(nh.made_characters.made.contains_key(&guid));
+        let _house4 = enter_lot(&root, &store, "UserData", 4, &[3], no_frames).unwrap();
+    }
+
+    #[test]
+    fn bulldozing_lot_strips_deleted_character_instance_from_another_imported_base_house() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let db = TempDb::new("bulldoze-strips-base-instance");
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let no_frames = Frames::parse("none").unwrap();
+
+        // Remove Bob Newbie (`0x32AA2056`) from family 1 and set his NBRS home
+        // to House 5 while leaving imported base `House07.iff` untouched.
+        let bob_guid = 0x32AA_2056u32;
+        let mut nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        nh.families
+            .get_mut(&1)
+            .unwrap()
+            .members
+            .retain(|&g| g != bob_guid);
+        for nbr in nh.neighbors.iter_mut().flatten() {
+            if nbr.guid == bob_guid {
+                nbr.person_data[PERSON_HOME] = 5;
+            }
+        }
+        store.save_neighborhood("UserData", &nh).unwrap();
+
+        // House 7 opens before bulldozing House 5.
+        let _before = enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
+
+        // Bulldoze House 5: deletes Bob Newbie's loose `.iff` and NBRS record.
+        let _ = bulldoze(&root, &store, "UserData", 5).unwrap();
+        let nh_after = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert!(nh_after.deleted_characters.contains(&bob_guid));
+
+        // Base `House07.iff` (still containing Bob's `ObjM` instance) must
+        // strip Bob cleanly and open + step without error!
+        let mut after = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
+        assert!(after.world.objects.values().all(|o| o.guid != bob_guid));
+        after.step().unwrap();
+    }
+
+    #[test]
+    fn stock_house_56_can_be_evicted_and_bulldozed() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        for do_bulldoze in [false, true] {
+            let db = TempDb::new(if do_bulldoze {
+                "stock-house-56-bulldoze"
+            } else {
+                "stock-house-56-evict"
+            });
+            let store = NeighborhoodStore::open(&db.0).unwrap();
+            store
+                .import_directory("UserData", &root.join("UserData"), 0xff)
+                .unwrap();
+            let before = store.load_neighborhood("UserData").unwrap().unwrap();
+            let (fam_id, fam_before) = before.family_in(56).expect("House 56 is occupied");
+            let expected_net_worth = fam_before.budget + fam_before.architecture_value;
+
+            if do_bulldoze {
+                let report = bulldoze(&root, &store, "UserData", 56).unwrap();
+                assert_eq!(report.evicted_family, Some(fam_id));
+            } else {
+                let report = evict(&root, &store, "UserData", 56).unwrap();
+                assert_eq!(report.family, fam_id);
+            }
+            let after = store.load_neighborhood("UserData").unwrap().unwrap();
+            assert!(after.family_in(56).is_none());
+            assert_eq!(after.families[&fam_id].house, 0);
+            assert_eq!(after.families[&fam_id].architecture_value, 0);
+            assert_eq!(after.families[&fam_id].budget, expected_net_worth);
+        }
     }
 }

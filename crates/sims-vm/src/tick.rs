@@ -236,6 +236,17 @@ impl Answers {
         let extra = self.choices_after.get_or_insert_with(VecDeque::new);
         extra.extend(list.iter().copied().map(Answer::from));
     }
+
+    /// Appends an interactive answer at the end of the pending answer stream
+    /// (onto `choices_after` when choice-only follow-up answers are staged
+    /// behind an explicit replay prefix, otherwise onto `queue`).
+    pub(crate) fn push_back_answer(&mut self, answer: Answer) {
+        if let Some(extra) = self.choices_after.as_mut() {
+            extra.push_back(answer);
+        } else {
+            self.queue.push_back(answer);
+        }
+    }
 }
 
 impl Player for Answers {

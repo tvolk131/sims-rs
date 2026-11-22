@@ -1832,7 +1832,7 @@ impl Lot {
                 offered,
             });
         }
-        self.player.queue.push_back(answer);
+        self.player.push_back_answer(answer);
         self.asking = None;
         self.answered = true;
         Ok(())

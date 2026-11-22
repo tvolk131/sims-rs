@@ -327,6 +327,19 @@ impl House {
     /// through `catalog`, which must already include the neighborhood's
     /// characters.
     pub fn parse_bytes(bytes: Vec<u8>, path: &Path, catalog: &Catalog) -> Result<Self> {
+        Self::parse_bytes_with_deleted(bytes, path, catalog, &std::collections::BTreeSet::new())
+    }
+
+    /// Like [`House::parse_bytes`], treating any character GUID listed in
+    /// `deleted_characters` whose loose `.iff` file was deleted on bulldoze as
+    /// single-tile (`multipart = false`) during `ObjM` decoding so callers can
+    /// strip or purge the deleted character cleanly instead of aborting load.
+    pub fn parse_bytes_with_deleted(
+        bytes: Vec<u8>,
+        path: &Path,
+        catalog: &Catalog,
+        deleted_characters: &std::collections::BTreeSet<u32>,
+    ) -> Result<Self> {
         let iff = Iff::parse(bytes).map_err(|e| Error::format(&path.display().to_string(), e))?;
         let location = |tag: &str, id: u16| format!("{} {tag} #{id}", path.display());
         let one = |tag: &'static [u8; 4]| {
@@ -357,7 +370,12 @@ impl House {
             }
         }
         let chunk = one(b"ObjM")?;
-        let multipart = |guid| catalog.object(guid).map(|o| o.master != 0);
+        let multipart = |guid| {
+            catalog
+                .object(guid)
+                .map(|o| o.master != 0)
+                .or_else(|| deleted_characters.contains(&guid).then_some(false))
+        };
         let objects = Objects::parse(iff.data(chunk), &types, multipart)
             .map_err(|e| Error::format(&location("ObjM", chunk.id), e))?;
         let mut arrays = BTreeMap::new();

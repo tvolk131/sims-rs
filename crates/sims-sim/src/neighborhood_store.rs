@@ -520,8 +520,12 @@ impl StoredNeighborhood {
         }
 
         // 5. Runtime-made characters: replace from the authoritative live world
-        // so bulldozed deletions are never resurrected by older lot saves.
+        // so bulldozed deletions are never resurrected by older lot saves, and
+        // clear any deletion tombstone superseded by a newly re-allocated GUID.
         self.made_characters = world.characters.clone();
+        for guid in self.made_characters.made.keys() {
+            self.deleted_characters.remove(guid);
+        }
 
         self.revision = self.revision.saturating_add(1);
     }
