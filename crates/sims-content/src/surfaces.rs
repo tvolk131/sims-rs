@@ -103,6 +103,30 @@ pub struct SurfaceFile {
     pub price: Option<i32>,
 }
 
+/// One plug-in floor (`.flr`) or wallpaper (`.wll`) pattern indexed by its
+/// catalog key, carrying its [`Resource`] and localized `STR# 0` metadata for
+/// rendering and the Build Mode catalog (`0x4a0cdc`, `0x4c5bbf`).
+#[derive(Debug, Clone)]
+pub struct SurfacePlugin {
+    /// Catalog key assigned during the original's scan (`30..=254` / `31..=247`
+    /// or `256..=65534`).
+    pub key: u16,
+    /// 1-based pattern number inside the `.flr` / `.wll` file.
+    pub local: u16,
+    /// Lower-case file name without directory.
+    pub file_name: String,
+    /// Underlying loose file or FAR archive member.
+    pub resource: Resource,
+    /// Pattern display name (string 0 of `STR# 0`, US English), if present.
+    pub name: Option<String>,
+    /// Raw Windows-1252 name bytes (for native `0x4cd9a5` sort comparison).
+    pub raw_name: Option<Vec<u8>>,
+    /// Pattern price (string 1 of `STR# 0`, parsed as C `atoi`), if present.
+    pub price: Option<i32>,
+    /// Pattern description (string 2 of `STR# 0`, US English), if present.
+    pub description: Option<String>,
+}
+
 /// One kind's catalog: its pattern files by index.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SurfaceCatalog {
@@ -112,6 +136,23 @@ pub struct SurfaceCatalog {
 impl SurfaceCatalog {
     /// Builds the catalog of `kind` for an install.
     pub fn build(install: &Install, kind: SurfaceKind) -> Result<Self> {
+        let (catalog, _) = Self::scan(install, kind, false)?;
+        Ok(catalog)
+    }
+
+    /// Scans the plug-in floor (`.flr`) or wall (`.wll`) patterns of `kind`
+    /// for `install`, keyed by their exact catalog keys (`0x4a01cb`,
+    /// `0x4c512d`).
+    pub fn plugins(install: &Install, kind: SurfaceKind) -> Result<BTreeMap<u16, SurfacePlugin>> {
+        let (_, plugins) = Self::scan(install, kind, true)?;
+        Ok(plugins)
+    }
+
+    fn scan(
+        install: &Install,
+        kind: SurfaceKind,
+        collect_plugins: bool,
+    ) -> Result<(Self, BTreeMap<u16, SurfacePlugin>)> {
         let Profile {
             builtin,
             suffix,
@@ -125,6 +166,7 @@ impl SurfaceCatalog {
             keys: BTreeMap::new(),
             price: None,
         }];
+        let mut plugins = BTreeMap::new();
         // The free list: 0x58055b puts each range at the front, and a key
         // is taken from the front range (0x4a1a08).
         let mut free: Vec<(u16, u16)> = seeds.iter().rev().copied().collect();
@@ -153,12 +195,22 @@ impl SurfaceCatalog {
                 if !name.ends_with(suffix) {
                     continue;
                 }
-                if let Some(file) = Self::add(&resource, name, sprite, &mut free, &install.root)? {
+                if let Some((file, file_plugins)) = Self::add(
+                    &resource,
+                    name,
+                    sprite,
+                    &mut free,
+                    &install.root,
+                    collect_plugins,
+                )? {
                     files.push(file);
+                    for plugin in file_plugins {
+                        plugins.insert(plugin.key, plugin);
+                    }
                 }
             }
         }
-        Ok(Self { files })
+        Ok((Self { files }, plugins))
     }
 
     /// Reads one pattern file (0x4a0744, 0x4c552e), or None for a file the
@@ -169,7 +221,8 @@ impl SurfaceCatalog {
         sprite: [u8; 4],
         free: &mut Vec<(u16, u16)>,
         root: &std::path::Path,
-    ) -> Result<Option<SurfaceFile>> {
+        collect_plugins: bool,
+    ) -> Result<Option<(SurfaceFile, Vec<SurfacePlugin>)>> {
         let location = resource.location(root);
         // A file the original cannot open is left out too. Which files our
         // reader refuses that the original opens, or the reverse, is not
@@ -192,13 +245,32 @@ impl SurfaceCatalog {
                 keys.insert(number, low);
             }
         }
-        let price = price(&iff);
-        Ok(Some(SurfaceFile {
-            name: sims_formats::far::decode_name(&name),
-            location,
-            keys,
-            price,
-        }))
+        let meta = metadata(&iff);
+        let file_name = sims_formats::far::decode_name(&name);
+        let mut file_plugins = Vec::new();
+        if collect_plugins {
+            for (&local, &key) in &keys {
+                file_plugins.push(SurfacePlugin {
+                    key,
+                    local,
+                    file_name: file_name.clone(),
+                    resource: resource.clone(),
+                    name: meta.name.clone(),
+                    raw_name: meta.raw_name.clone(),
+                    price: meta.price,
+                    description: meta.description.clone(),
+                });
+            }
+        }
+        Ok(Some((
+            SurfaceFile {
+                name: file_name,
+                location,
+                keys,
+                price: meta.price,
+            },
+            file_plugins,
+        )))
     }
 
     /// The first file whose name is `name`, ignoring ASCII case, as the
@@ -231,6 +303,39 @@ impl Surfaces {
     }
 }
 
+#[derive(Default)]
+struct FileMetadata {
+    name: Option<String>,
+    raw_name: Option<Vec<u8>>,
+    price: Option<i32>,
+    description: Option<String>,
+}
+
+fn metadata(iff: &Iff) -> FileMetadata {
+    let Some(chunk) = iff.get(b"STR#", 0) else {
+        return FileMetadata::default();
+    };
+    let Ok(table) = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)) else {
+        return FileMetadata::default();
+    };
+    let name_entry = table.entry(0, US_ENGLISH);
+    let name = name_entry.map(|e| e.text.clone()).filter(|s| !s.is_empty());
+    let raw_name = name_entry
+        .map(|e| e.raw_text.clone())
+        .filter(|b| !b.is_empty());
+    let price = table.entry(1, US_ENGLISH).map(|e| atoi(&e.raw_text));
+    let description = table
+        .entry(2, US_ENGLISH)
+        .map(|e| e.text.clone())
+        .filter(|s| !s.is_empty());
+    FileMetadata {
+        name,
+        raw_name,
+        price,
+        description,
+    }
+}
+
 /// A pattern file's own price (see [`SurfaceFile::price`]), in US
 /// English (language 1), as everything here reads: the original takes
 /// the game's language (0x47028b, 0x470256).
@@ -238,10 +343,9 @@ impl Surfaces {
 /// The table is the `STR#` with ID 0 and a flags' high byte of 0, as the
 /// original's string loader looks it up (through 0x46ff01 and 0x41bab1,
 /// which matches the key's ID and high byte at 0x41d94f to 0x41d95b).
+#[cfg(test)]
 fn price(iff: &Iff) -> Option<i32> {
-    let chunk = iff.get(b"STR#", 0)?;
-    let table = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)).ok()?;
-    Some(atoi(&table.entry(1, US_ENGLISH)?.raw_text))
+    metadata(iff).price
 }
 
 /// A number read from the start of a string's bytes as C's `atoi` reads
