@@ -233,6 +233,7 @@ impl Machine<'_, '_> {
     fn random_start(&mut self, from: [i32; 2]) -> Result<[i32; 2], Trap> {
         let size = i32::from(self.world.size);
         let [mut x, mut y] = from;
+        let rotation = self.effective_view_rotation();
         if [x, y] == [1, 1] {
             if size <= 0 {
                 return Err(Trap::Unsupported(format!(
@@ -249,13 +250,13 @@ impl Machine<'_, '_> {
                      bounds, so the random start never ends (0x434951)"
                 )));
             }
-            if size > 64 && self.view_rotation & 3 != 0 {
+            if size > 64 && rotation & 3 != 0 {
                 return Err(Trap::Unsupported(format!(
                     "Find Location For mode 5 on a lot {size} tiles wide, turned: its corners are \
                      past the table of turns (0x434f58)"
                 )));
             }
-            let [across, down] = interior(size, self.view_rotation);
+            let [across, down] = interior(size, rotation);
             let tile = |n: i32| i32::from((n >> 4) as i8);
             loop {
                 let first = (self.draw() % 10) as i32 - 5;
@@ -267,7 +268,7 @@ impl Machine<'_, '_> {
                 }
             }
         }
-        Ok(turn([x, y], self.view_rotation))
+        Ok(turn([x, y], rotation))
     }
 
     /// Modes 3 and 4 (0x44b676 to 0x44b716): a search along a line

@@ -70,7 +70,7 @@ fn generic_call_43_raises_the_magic_controller_to_the_familys_history() {
     (fx.world.globals[9], fx.world.globals[10]) = (5, 0);
     // No controller on the lot: the type's instance list is made, empty.
     assert_eq!(generic(&mut fx, 43), Ok(true));
-    assert_eq!(fx.world.instances[&MAGIC_CONTROLLER], []);
+    assert_eq!(fx.world.instances[&MAGIC_CONTROLLER], [0u16; 0]);
     // With one, each of its first six attributes becomes the larger of
     // itself and the family's word.
     fx.world.instances.clear();
@@ -97,7 +97,7 @@ fn generic_call_43_raises_the_magic_controller_to_the_familys_history() {
 fn generic_calls_10_and_11_keep_the_list_of_fires() {
     let mut fx = Fixture::new();
     assert_eq!(generic(&mut fx, 11), Ok(true));
-    assert_eq!(fx.world.fires, []);
+    assert_eq!(fx.world.fires, [0u16; 0]);
     assert_eq!(generic(&mut fx, 10), Ok(true));
     assert_eq!(generic(&mut fx, 10), Ok(true));
     assert_eq!(fx.world.fires, [LAMP, LAMP]);

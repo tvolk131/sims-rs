@@ -2202,6 +2202,7 @@ fn boot_from_saved_lot(
             instance_id: origin_instance_id,
             revision: origin_revision,
         }),
+        coop: None,
     })
 }
 
@@ -2617,6 +2618,7 @@ fn boot_from_base_house(
             instance_id: origin_instance_id,
             revision: origin_revision,
         }),
+        coop: None,
     })
 }
 

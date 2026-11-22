@@ -165,7 +165,7 @@ impl WallStyle {
 }
 
 /// Architecture pricing lookup for walls, floors, and wallpapers.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BuildPrices {
     pub styles: BTreeMap<u16, i32>,
     pub floors: BTreeMap<u16, i32>,

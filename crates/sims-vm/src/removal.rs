@@ -405,6 +405,9 @@ impl Interpreter<'_> {
         if selected {
             self.select(world, None)?;
         }
+        if let Some(coop) = self.coop {
+            coop.borrow_mut().remove_object(id);
+        }
         if let Some(marks) = self.deleting {
             marks.borrow_mut().insert(id);
         }
