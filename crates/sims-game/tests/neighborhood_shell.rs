@@ -108,15 +108,20 @@ fn end_to_end_neighborhood_lot_save_move_in_evict_bulldoze_loop() {
     shell.render();
     assert!(shell.canvas().color.iter().any(|&px| px != [0, 0, 0]));
 
-    // 2. Hover Goth lot (House 5) and verify StreetNames.iff address & popup metadata.
+    // 2. Hover Goth lot (House 5) and verify debounced StreetNames.iff address & popup metadata.
     let goth_pt = find_lot_hit_point(&shell, 5).expect("Goth lot 5 is hit-testable on map");
     assert!(shell.hover(goth_pt));
     assert_eq!(shell.hovered_lot_id(), Some(5));
+    assert!(
+        shell.neighborhood_state().hovered_lot.is_none(),
+        "hover card must wait for the steady-hover debounce delay before popping"
+    );
+    assert!(shell.tick_shell(sims_game::neighborhood::HOVER_CARD_DELAY_US));
     let hovered = shell
         .neighborhood_state()
         .hovered_lot
         .as_ref()
-        .expect("hovered lot popup populated");
+        .expect("hovered lot popup populated after steady hover");
     assert_eq!(hovered.lot_number, 5);
     assert!(
         hovered
@@ -581,11 +586,13 @@ fn move_in_rollback_magic_town_magicoins_pace_sync_and_family_bin_clicks() {
         .expect("switch to Magic Town");
     let lot92_pt = find_lot_hit_point(&shell, 92).expect("Magic Town lot 92 hit point");
     shell.hover(lot92_pt);
+    assert!(shell.neighborhood_state().hovered_lot.is_none());
+    shell.tick_shell(sims_game::neighborhood::HOVER_CARD_DELAY_US);
     let hovered92 = shell
         .neighborhood_state()
         .hovered_lot
         .as_ref()
-        .expect("lot 92 hover card");
+        .expect("lot 92 hover card after steady hover");
     assert_eq!(hovered92.magic_cost, 1000);
     assert!(
         !hovered92.house_name.is_empty(),
