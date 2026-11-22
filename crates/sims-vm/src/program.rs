@@ -1513,16 +1513,27 @@ fn is_native_portrait_bmp(data: &[u8]) -> bool {
         }
         false
     } else if bpp == 8 {
+        // 0x4df050..0x4df063 advances `esi` past the final row's padding and
+        // immediately exits without dereferencing those padding bytes.
         let Some(stride) = w.checked_add(3).map(|n| n & !3) else {
             return false;
         };
-        stride.checked_mul(h).is_some_and(|need| need <= body.len())
+        stride
+            .checked_mul(h - 1)
+            .and_then(|n| n.checked_add(w))
+            .is_some_and(|need| need <= body.len())
     } else {
-        let Some(row_bytes) = w.checked_mul(3).and_then(|n| n.checked_add(w & 3)) else {
+        // 0x4df10e..0x4df122 advances `esi` past `width & 3` on the final row
+        // and immediately exits without reading the unused trailing padding.
+        let Some(pixel_bytes) = w.checked_mul(3) else {
+            return false;
+        };
+        let Some(row_bytes) = pixel_bytes.checked_add(w & 3) else {
             return false;
         };
         row_bytes
-            .checked_mul(h)
+            .checked_mul(h - 1)
+            .and_then(|n| n.checked_add(pixel_bytes))
             .is_some_and(|need| need <= body.len())
     }
 }

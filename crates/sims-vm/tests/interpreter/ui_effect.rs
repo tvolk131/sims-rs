@@ -7241,3 +7241,76 @@ fn round_25_mixed_camera_starts_neighbor_clamp_and_arg_slot() {
         );
     }
 }
+
+#[test]
+fn round_26_dirty_reset_invalidation_mixed_starts() {
+    // P2 (`ui_effect.rs:719`, `dialog.rs:610`): on a dirty portrait (`save_bitmap
+    // = false`), a placed temporary Sim can render/cache the portrait and then
+    // immediately invalidate it again during removal `Reset` (writing My Person
+    // Data[68] via `0x4539c7`), while an unplaced start (`0x4e9706`) skips
+    // rendering and leaves the portrait dirty too. Both paths produce identical
+    // post-removal `(LotSnapshot, Cells)` before `0x4e9338` loads embedded
+    // `BMP_` 2002, so BOTH UI Effect and Dialog must succeed with `view_centre =
+    // None` instead of trapping on the discarded render bool.
+    for use_dialog in [false, true] {
+        let (mut fx, file, record) = visitors();
+        // Put LAMP on (1,1) in isolated room 99 so start (1,1) finds no tile
+        // while other interior starts find a tile.
+        fx.world.rooms.map[0][64 + 1] = 99;
+        fx.world.objects.get_mut(&LAMP).unwrap().position = [1, 1, 1];
+        fx.world.objects.get_mut(&LAMP).unwrap().data[29] = 99;
+        fx.world.arrays.get_mut(&3).unwrap().data[(64 + 1) * 2..(64 + 1) * 2 + 2]
+            .copy_from_slice(&(LAMP as i16).to_le_bytes());
+        // Embedded BMP_ 2002 + dirty portrait slot.
+        fx.program
+            .libraries
+            .get_mut(&file)
+            .unwrap()
+            .has_portrait_2002 = true;
+        fx.world.dirty_portraits.insert(WIDGET);
+        // Removal callback (`BEFORE_REMOVAL`, function 5 -> Wait: use `Reset` /
+        // function 5 `BEFORE_REMOVAL` which runs during `remove_now` on BOTH
+        // placed and unplaced paths!) writing My Person Data[68] = 0 so placed
+        // render's cached portrait is immediately dirtied again on removal.
+        fx.add(
+            file,
+            4200,
+            tree(vec![assign(18, 68, scope::LITERAL, 0, RETURN_TRUE)]),
+        );
+        let library = fx.program.libraries.get_mut(&file).unwrap();
+        for table in library.callbacks.values_mut() {
+            table.resize(
+                27,
+                sims_formats::execution::ObjectFunction {
+                    condition: 0,
+                    action: 0,
+                },
+            );
+            // Function 3 (`RESET`) runs during `remove_now` on both placed and
+            // unplaced paths, writing My Person Data[68] to re-dirty the slot.
+            table[3].action = 4200;
+        }
+        let ran = if use_dialog {
+            fx.add(
+                LAMP_FILE,
+                4096,
+                tree(vec![ins(
+                    36,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+                )]),
+            );
+            fx.run_with(LAMP, 4096, record, &[], 1000)
+        } else {
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1)
+        };
+        assert_eq!(
+            ran,
+            Ok(true),
+            "dirty mixed starts with identical post-removal state must succeed (dialog={use_dialog})"
+        );
+        assert!(fx.world.portraits.contains(&WIDGET));
+        assert!(!fx.world.dirty_portraits.contains(&WIDGET));
+    }
+}

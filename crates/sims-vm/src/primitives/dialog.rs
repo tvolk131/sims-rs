@@ -410,7 +410,7 @@ impl Machine<'_, '_> {
         // 0x4e92e5 -> 0x4e92f2: a dirty slot runs 0x4e8c5d(index, 1, 0)
         // (save flag 0) before falling through to 0x4e9338 / 0x4e938c.
         if self.world.dirty_portraits.contains(&guid) {
-            let _ = self.dialog_render_catalog_portrait(guid, false)?;
+            self.dialog_render_catalog_portrait(guid, false)?;
         }
         if self.world.portraits.contains(&guid) {
             return Ok(());
@@ -420,7 +420,7 @@ impl Machine<'_, '_> {
             self.world.dirty_portraits.remove(&guid);
             return Ok(());
         }
-        let _ = self.dialog_render_catalog_portrait(guid, true)?;
+        self.dialog_render_catalog_portrait(guid, true)?;
         Ok(())
     }
 
@@ -430,11 +430,7 @@ impl Machine<'_, '_> {
     /// appearance/bone metadata is supplied, and `0x4e8d2e` → `0x4e9000`
     /// `BMP_` 2002 persistence before `remove_now`, while preserving the
     /// household and no-tile safety checks for synthetic tests.
-    fn dialog_render_catalog_portrait(
-        &mut self,
-        guid: u32,
-        save_bitmap: bool,
-    ) -> Result<bool, Trap> {
+    fn dialog_render_catalog_portrait(&mut self, guid: u32, save_bitmap: bool) -> Result<(), Trap> {
         let on_lot_id = self.world.people.iter().copied().find(|id| {
             self.world
                 .objects
@@ -454,7 +450,7 @@ impl Machine<'_, '_> {
                 )?
                 .unwrap_or(false);
                 if !can_render {
-                    return Ok(false);
+                    return Ok(());
                 }
             }
             self.world.portraits.insert(guid);
@@ -465,17 +461,17 @@ impl Machine<'_, '_> {
             {
                 self.world.generated_portrait_2002.insert(file_key);
             }
-            return Ok(true);
+            return Ok(());
         }
         // 0x4e8cc6 -> 0x4067b3 -> 0x4174dc: off-lot rendering only calls
         // 0x4e9652 when the winning definition's file is writable.
         if !self.is_portrait_file_writable(guid) {
-            return Ok(false);
+            return Ok(());
         }
         // 0x440d63 -> 0x440dd5 -> 0x4e969d: a pet disallowed by the installed
         // expansions mask is refused before any construction.
         if self.interpreter().is_refused_pet(self.world, guid) {
-            return Ok(false);
+            return Ok(());
         }
         let interpreter = self.interpreter();
         let unsupported = |fault| {
@@ -497,7 +493,7 @@ impl Machine<'_, '_> {
             .map_err(unsupported)?
         else {
             // 0x4e969d: factory returned 0 (e.g. refused pet). Keep any side
-            // effects, leave portrait uncached, return false.
+            // effects, leave portrait uncached, return.
             if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
                 return Err(Trap::Unsupported(format!(
                     "making a person of type 0x{guid:08X} for a dialog's portrait (0x4e9652) \
@@ -505,7 +501,7 @@ impl Machine<'_, '_> {
                 )));
             }
             cells.keep(&interpreter, self.world, copy);
-            return Ok(false);
+            return Ok(());
         };
         let plan = built
             .portrait_put_plan(&mut copy, id, "a dialog's portrait")
@@ -514,7 +510,7 @@ impl Machine<'_, '_> {
                          placed: bool,
                          mut lot: sims_sim::World,
                          run_cells: crate::both_ways::Cells|
-         -> Result<(bool, sims_sim::World, crate::both_ways::Cells), Trap> {
+         -> Result<(sims_sim::World, crate::both_ways::Cells), Trap> {
             let run = run_cells.on(&interpreter);
             if let Some(pos) = tile {
                 run.put_person(&mut lot, id, pos, 1)?;
@@ -535,8 +531,7 @@ impl Machine<'_, '_> {
             } else {
                 true
             };
-            let rendered = placed && can_render;
-            if rendered {
+            if placed && can_render {
                 // 0x4e8d14 caches the portrait and clears dirty, and 0x4e8d2e ->
                 // 0x4e9000 stages BMP_ 2002 BEFORE removing the temporary person.
                 lot.portraits.insert(guid);
@@ -557,9 +552,9 @@ impl Machine<'_, '_> {
                      changed the refresh pending, which is not ported"
                 )));
             }
-            Ok((rendered, lot, run_cells))
+            Ok((lot, run_cells))
         };
-        let (rendered, final_world, final_cells) = match plan {
+        let (final_world, final_cells) = match plan {
             crate::placement::PortraitPutPlan::NoTile => finish_at(None, false, copy, cells)?,
             crate::placement::PortraitPutPlan::FastPlaced => finish_at(None, true, copy, cells)?,
             crate::placement::PortraitPutPlan::Exact(pos) => {
@@ -567,12 +562,11 @@ impl Machine<'_, '_> {
             }
             crate::placement::PortraitPutPlan::Candidates(positions) => {
                 let first = finish_at(Some(positions[0]), true, copy.clone(), cells.copy())?;
-                let first_lot = crate::both_ways::LotSnapshot::of(&first.1);
+                let first_lot = crate::both_ways::LotSnapshot::of(&first.0);
                 for &pos in &positions[1..] {
                     let next = finish_at(Some(pos), true, copy.clone(), cells.copy())?;
-                    if next.0 != first.0
-                        || crate::both_ways::LotSnapshot::of(&next.1) != first_lot
-                        || !first.2.same(&next.2)
+                    if crate::both_ways::LotSnapshot::of(&next.0) != first_lot
+                        || !first.1.same(&next.1)
                     {
                         return Err(Trap::Unsupported(
                             "a dialog's portrait puts a person on a tile searched for from the \
@@ -602,14 +596,13 @@ impl Machine<'_, '_> {
                     finish_at(tile, tile.is_some(), lot, run_cells)
                 };
                 let first = run_start(starts[0])?;
-                let first_lot = crate::both_ways::LotSnapshot::of(&first.1);
+                let first_lot = crate::both_ways::LotSnapshot::of(&first.0);
                 for &from in &starts[1..] {
                     let Ok(next) = run_start(from) else {
                         return Err(Trap::Unsupported(reason));
                     };
-                    if next.0 != first.0
-                        || crate::both_ways::LotSnapshot::of(&next.1) != first_lot
-                        || !first.2.same(&next.2)
+                    if crate::both_ways::LotSnapshot::of(&next.0) != first_lot
+                        || !first.1.same(&next.1)
                     {
                         return Err(Trap::Unsupported(reason));
                     }
@@ -618,7 +611,7 @@ impl Machine<'_, '_> {
             }
         };
         final_cells.keep(&interpreter, self.world, final_world);
-        Ok(rendered)
+        Ok(())
     }
 
     /// Whether type `guid` is in the interface's table of person types

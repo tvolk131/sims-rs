@@ -355,7 +355,7 @@ impl Machine<'_, '_> {
             // and persisting BMP_ 2002 before opcode 19 returns (ignoring the
             // renderer's bool return at 0x44b12b).
             if self.in_portrait_table(guid)? {
-                let _ = self.try_render_pet_portrait(guid)?;
+                self.try_render_pet_portrait(guid)?;
             }
             Ok(true)
         }

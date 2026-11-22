@@ -1217,8 +1217,20 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
         ]),
     );
 
-    // 5. Loose file with truncated BMP_ 2002 -> has_portrait_2002 = false.
-    let truncated_guid = 0x9000_0005u32;
+    // 5. Loose file with 57-byte 1x1 24-bit BMP_ 2002 (missing unused final-row
+    // padding byte) -> has_portrait_2002 = true because `0x4df117` advances
+    // past padding and exits at `0x4df122` without reading it.
+    let bmp57_guid = 0x9000_0005u32;
+    dir.file(
+        "GameData/Objects/bmp57.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(bmp57_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, tiny_bmp()[..57].to_vec()),
+        ]),
+    );
+
+    // 6. Loose file with truncated (55-byte) BMP_ 2002 -> has_portrait_2002 = false.
+    let truncated_guid = 0x9000_0006u32;
     dir.file(
         "GameData/Objects/truncated.iff",
         &iff_bytes(&[
@@ -1238,6 +1250,7 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
             lang1_guid,
             archived_guid,
             bmp32_guid,
+            bmp57_guid,
             truncated_guid,
         ],
     )
@@ -1255,5 +1268,6 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
     assert!(lib(archived_guid).read_only);
     assert!(lib(bmp32_guid).has_portrait_2002);
     assert!(!lib(bmp32_guid).read_only);
+    assert!(lib(bmp57_guid).has_portrait_2002);
     assert!(!lib(truncated_guid).has_portrait_2002);
 }

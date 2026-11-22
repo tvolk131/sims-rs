@@ -35,12 +35,16 @@ use std::collections::{BTreeMap, BTreeSet};
 /// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. A save of
 /// another version is refused, not migrated. Layout 2 keeps each pending
 /// dialog answer's bitmap ID ([`crate::Answer`]); layout 3 keeps the
-/// house view's centre; layout 8 keeps [`World::dirty_portraits`],
+/// house view's centre; layout 9 keeps [`World::dirty_portraits`],
 /// [`World::generated_portrait_2002`] keyed by [`PortraitFile`],
 /// [`World::made_portrait_head`], [`World::ambiguous_portraits`],
-/// [`World::loaded_indexed_skeletons`], and [`World::made_outfits`]
-/// (superseding pre-merge layouts 4–7).
-pub const FORMAT: u32 = 8;
+/// [`World::loaded_indexed_skeletons`], [`World::loaded_indexed_suits`],
+/// [`World::made_outfits`], [`World::person_outfits`],
+/// [`World::scratch_ptr_set`], [`World::scratch_ptr_set_to_next`],
+/// [`World::scratch_ptr_expression`], [`World::scratch_ptr_arg_slot`],
+/// [`World::runtime_added_suits`], and [`World::suit_scan_cache`]
+/// (superseding pre-merge layouts 4–8).
+pub const FORMAT: u32 = 9;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]

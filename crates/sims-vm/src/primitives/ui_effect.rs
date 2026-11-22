@@ -326,7 +326,7 @@ impl Machine<'_, '_> {
         // 0x4e92e5: when the slot's dirty flag ([entry + 0x18], set by
         // 0x4e895e) is set, call 0x4e8c5d(index, 1, 0) first (save flag 0).
         if self.world.dirty_portraits.contains(&guid) {
-            let _ = self.try_render_ui_effect_portrait(guid, false, caller)?;
+            self.try_render_ui_effect_portrait(guid, false, caller)?;
         }
         // 0x4e931c: if the slot now holds a cached bitmap, done.
         if self.world.portraits.contains(&guid) {
@@ -349,7 +349,7 @@ impl Machine<'_, '_> {
         }
         // 0x4e938c: BMP_ 2002 absent or invalid -> call 0x4e8c5d(index, 1, 1)
         // (save flag 1: persists BMP_ 2002 via 0x4e9000 on success when writable).
-        let _ = self.try_render_ui_effect_portrait(guid, true, caller)?;
+        self.try_render_ui_effect_portrait(guid, true, caller)?;
         Ok(())
     }
 
@@ -477,16 +477,13 @@ impl Machine<'_, '_> {
     }
 
     /// Runs `0x4e8c5d(index, 1, save_bitmap)` for a `guid` already verified
-    /// to be in `0x6f2698`. Returns `true` when the portrait was rendered and
-    /// cached, `false` when `0x4e8cc6` skipped a read-only off-lot definition,
-    /// `0x4e9652` returned null, or `0x4e725f` failed (`0x4e8d08`, e.g.
-    /// missing `"HEAD"` binding at `0x4e7824`).
+    /// to be in `0x6f2698`.
     pub(crate) fn try_render_ui_effect_portrait(
         &mut self,
         guid: u32,
         save_bitmap: bool,
         caller: &str,
-    ) -> Result<bool, Trap> {
+    ) -> Result<(), Trap> {
         self.render_portrait(guid, save_bitmap, false, 0, caller)
     }
 
@@ -496,7 +493,7 @@ impl Machine<'_, '_> {
     /// `0x10` (`0x4e8400`) run 5 additional forced dresses (`0x4e77c6` →
     /// `0x4e7801` → `0x58a178(1)`), which can clear the portrait cache via
     /// `0x58d4e1` → `0x4eb0cc` → `0x4e897e` when the pet's head slot is empty.
-    pub(crate) fn try_render_pet_portrait(&mut self, guid: u32) -> Result<bool, Trap> {
+    pub(crate) fn try_render_pet_portrait(&mut self, guid: u32) -> Result<(), Trap> {
         self.render_portrait(guid, true, true, 5, "Make New Character's portrait")
     }
 
@@ -507,10 +504,10 @@ impl Machine<'_, '_> {
         defer_unknown_head: bool,
         extra_passes: usize,
         caller: &str,
-    ) -> Result<bool, Trap> {
+    ) -> Result<(), Trap> {
         // 0x4e8c92 -> 0x4e893e -> 0x43ac10: resolve the winning definition.
         let Some(file_key) = self.portrait_file(guid) else {
-            return Ok(false);
+            return Ok(());
         };
         // 0x4e9608: reuse the first on-lot person matching `guid` (skips the
         // 0x4e8cc6 writability check; 0x4e8d02 still checks 0x4e725f ->
@@ -556,12 +553,12 @@ impl Machine<'_, '_> {
                     true,
                 )?;
             }
-            return Ok(can_render);
+            return Ok(());
         }
         // 0x4e8cc6 -> 0x4067b3 -> 0x4174dc: off-lot rendering only calls
         // 0x4e9652 when the winning definition's file is writable.
         if !self.is_portrait_file_writable(guid) {
-            return Ok(false);
+            return Ok(());
         }
         // 0x4e9652: no on-lot person -> create a temporary instance via
         // 0x440b2d (no household-membership guard in native code).
@@ -588,14 +585,14 @@ impl Machine<'_, '_> {
                 )));
             }
             cells.keep(&interpreter, self.world, copy);
-            return Ok(false);
+            return Ok(());
         }
         let Some(id) = built
             .try_create_person(&mut copy, guid)
             .map_err(unsupported)?
         else {
             // 0x4e969d: factory returned 0 (e.g. refused pet). Keep any
-            // side effects, leave portrait uncached, return false.
+            // side effects, leave portrait uncached, return.
             if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
                 return Err(Trap::Unsupported(format!(
                     "making a person of type 0x{guid:08X} for {caller} (0x4e9652) changed the \
@@ -603,7 +600,7 @@ impl Machine<'_, '_> {
                 )));
             }
             cells.keep(&interpreter, self.world, copy);
-            return Ok(false);
+            return Ok(());
         };
         let plan = built
             .portrait_put_plan(&mut copy, id, caller)
@@ -612,7 +609,7 @@ impl Machine<'_, '_> {
                          placed: bool,
                          mut lot: sims_sim::World,
                          run_cells: crate::both_ways::Cells|
-         -> Result<(bool, sims_sim::World, crate::both_ways::Cells), Trap> {
+         -> Result<(sims_sim::World, crate::both_ways::Cells), Trap> {
             let run = run_cells.on(&interpreter);
             if let Some(pos) = tile {
                 run.put_person(&mut lot, id, pos, 1)?;
@@ -636,8 +633,7 @@ impl Machine<'_, '_> {
                     }
                 }
             };
-            let rendered = placed && can_render;
-            if rendered {
+            if placed && can_render {
                 // 0x4e8d14 -> 0x4e899e caches the portrait and clears dirty, and
                 // 0x4e8d2e -> 0x4e9000 stages BMP_ 2002 BEFORE removing the
                 // temporary person at 0x4e8fdb (so a Reset callback during removal
@@ -667,9 +663,9 @@ impl Machine<'_, '_> {
                      refresh pending, which is not ported"
                 )));
             }
-            Ok((rendered, lot, run_cells))
+            Ok((lot, run_cells))
         };
-        let (rendered, final_world, final_cells) = match plan {
+        let (final_world, final_cells) = match plan {
             crate::placement::PortraitPutPlan::NoTile => finish_at(None, false, copy, cells)?,
             crate::placement::PortraitPutPlan::FastPlaced => finish_at(None, true, copy, cells)?,
             crate::placement::PortraitPutPlan::Exact(pos) => {
@@ -677,12 +673,11 @@ impl Machine<'_, '_> {
             }
             crate::placement::PortraitPutPlan::Candidates(positions) => {
                 let first = finish_at(Some(positions[0]), true, copy.clone(), cells.copy())?;
-                let first_lot = crate::both_ways::LotSnapshot::of(&first.1);
+                let first_lot = crate::both_ways::LotSnapshot::of(&first.0);
                 for &pos in &positions[1..] {
                     let next = finish_at(Some(pos), true, copy.clone(), cells.copy())?;
-                    if next.0 != first.0
-                        || crate::both_ways::LotSnapshot::of(&next.1) != first_lot
-                        || !first.2.same(&next.2)
+                    if crate::both_ways::LotSnapshot::of(&next.0) != first_lot
+                        || !first.1.same(&next.1)
                     {
                         return Err(Trap::Unsupported(format!(
                             "{caller} puts a person on a tile searched for from the house view's \
@@ -711,14 +706,13 @@ impl Machine<'_, '_> {
                     finish_at(tile, tile.is_some(), lot, run_cells)
                 };
                 let first = run_start(starts[0])?;
-                let first_lot = crate::both_ways::LotSnapshot::of(&first.1);
+                let first_lot = crate::both_ways::LotSnapshot::of(&first.0);
                 for &from in &starts[1..] {
                     let Ok(next) = run_start(from) else {
                         return Err(Trap::Unsupported(reason));
                     };
-                    if next.0 != first.0
-                        || crate::both_ways::LotSnapshot::of(&next.1) != first_lot
-                        || !first.2.same(&next.2)
+                    if crate::both_ways::LotSnapshot::of(&next.0) != first_lot
+                        || !first.1.same(&next.1)
                     {
                         return Err(Trap::Unsupported(reason));
                     }
@@ -727,6 +721,6 @@ impl Machine<'_, '_> {
             }
         };
         final_cells.keep(&interpreter, self.world, final_world);
-        Ok(rendered)
+        Ok(())
     }
 }
