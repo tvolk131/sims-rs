@@ -925,27 +925,28 @@ impl<S: TrackSource> ModeMusicPlayer<S> {
         if count == 0 {
             return false;
         }
-        // Try every unique candidate index at most once (avoiding re-attempting
-        // already-failed indices across a shuffle boundary).
+        let prev_played = self.playlists.get(&mode).and_then(|p| p.last_played);
+        // Try every unique candidate index at most once, avoiding immediate
+        // repeats when another untried track exists.
         let mut tried = vec![false; count];
         let mut unique_tried = 0usize;
         while unique_tried < count {
-            let idx = self.next_playlist_index(mode, count);
-            if tried[idx] {
-                // Find the first untried index deterministically.
-                let Some(fallback) = tried.iter().position(|&t| !t) else {
-                    break;
-                };
-                tried[fallback] = true;
-                unique_tried += 1;
-                if self.try_open_track(mode, fallback, fade_in) {
-                    return true;
-                }
-                continue;
-            }
+            let candidate = self.next_playlist_index(mode, count);
+            let idx = if !tried[candidate] {
+                candidate
+            } else if let Some(other) = (0..count).find(|&i| !tried[i] && Some(i) != prev_played) {
+                other
+            } else if let Some(any) = (0..count).find(|&i| !tried[i]) {
+                any
+            } else {
+                break;
+            };
             tried[idx] = true;
             unique_tried += 1;
             if self.try_open_track(mode, idx, fade_in) {
+                if let Some(state) = self.playlists.get_mut(&mode) {
+                    state.last_played = Some(idx);
+                }
                 return true;
             }
         }

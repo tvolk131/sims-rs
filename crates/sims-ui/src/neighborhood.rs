@@ -1147,7 +1147,7 @@ fn draw_lot_popup(frame: &mut Frame, popup: &LotPopupLayout, lot: &LotInfo, art:
                 .text_rect
                 .y
                 .saturating_add((i as i32).saturating_mul(lh));
-            if y >= max_y {
+            if y.saturating_add(lh) > max_y {
                 break;
             }
             font.draw(frame, line, [popup.text_rect.x, y], TEXT_NORMAL);
