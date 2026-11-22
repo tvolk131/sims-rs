@@ -18,12 +18,24 @@
 //!    three-button dialog, and sets registry word 0x100 to -1; the third
 //!    (4) takes the false branch and sets that temp to 1.
 //!
-//! Operand 5 (bits 0 to 6) is the kind of dialog. Kinds 0, 3, and 4 have one
-//! button (kind 3 also asks for text and copies it to `[0x6e4ac0]` at
-//! `0x451a6b..0x451a85`), kind 1 two and kind 2 three; these are ported.
-//! Kinds 5 to 15 are the game's special panels (careers, neighbors, the phone
-//! and others); they fail loudly. What a dialog
-//! says and shows (its text, pictures and buttons' labels) is
+//! Operand 5 (bits 0 to 6) is the kind of dialog:
+//! - Kinds 0, 3, and 4 have one button (kind 3 also asks for text and copies
+//!   it to `[0x6e4ac0]` at `0x451a6b..0x451a85`), kind 1 two, and kind 2 three.
+//! - Kinds 5 to 15 are the game's special panels (`0x4515ae..0x4519ad` in
+//!   `Dialog`, paired with `0x4413e1..0x442320` in `end_of_update`):
+//!   - 5 (`reg+0xea`, `0x4515b3`, `0x4414cd`): Downtown lot picker (`21..=30`);
+//!   - 6 (`reg+0xf4`/`+0xf6`/`+0xf8`, `0x451657`, `0x4417b3`): Wardrobe / shop;
+//!   - 7 (`reg+0xec`, `0x4515f0`, `0x441df2`): Vacation Island lot picker (`40..=48`);
+//!   - 8 (`reg+0xf2`, `0x4515df`, `0x4415fd`): Old Town / Community lot picker (`zoning == 2`);
+//!   - 9 (`reg+0x100`/`+0x104`/`+0x108`, `0x45181c`, `0x441b8b`): Pet Adoption picker;
+//!   - 10 (`reg+0xe8`, `0x45179a`, `0x4413e1`): Phone / Call Neighbor picker;
+//!   - 11 (`reg+0xee`/`+0x10c`, `0x451601`, `0x441f72`): Studio Town lot picker (`81..=89`);
+//!   - 12 (`0x4518e2` -> `0x5107dc(person, 0)`): Magic Spellbook (inline modal);
+//!   - 13 (`reg+0xf0`, `0x451612`, `0x44216e`): Magic Town lot picker (`90..=98`);
+//!   - 14 (`reg+0xf4`/`+0xf6`/`+0xfc`, `0x4516f9`, `0x4419a6`): Magic Charm Transform picker;
+//!   - 15 (`0x451946` -> `0x5107dc(person, 1)`): Cookbook (inline modal).
+//!
+//! What an ordinary dialog says and shows (its text, pictures and buttons' labels) is
 //! presentation and is not modeled, except where showing a person's
 //! portrait builds it ([`Machine::dialog_portrait`]): building one for a
 //! person type with nobody on the lot makes a person and removes it at
@@ -249,9 +261,176 @@ pub const THIRD: u8 = 4;
 /// Done: the registry destroys it at the end of the lot update.
 pub const DONE: u8 = 5;
 
-/// The answers a dialog of this kind (operand 5) offers, as statuses, or
-/// None for a kind that is not ported. From the original's button setup
-/// (0x43601c, 0x436a52), as the old prototype read it
+/// Sentinel written to `reg+0xe8` (`SpecialPanels::call_neighbor`) when the
+/// player cancels the Call Neighbor picker (`0x4414b4`: `0xd8f1` = `-9999`).
+pub const CALL_NEIGHBOR_CANCELLED: i16 = -9999;
+/// Low-word status returned by modal 3D preview pickers (kinds 6, 9, 14) when
+/// accepted (`0x5098bd`, `0x522073`, `0x5373ee`: `0xfffe` = `-2`).
+pub const SPECIAL_PANEL_ACCEPTED: i16 = -2;
+/// Low-word status returned by modal 3D preview pickers (kinds 6, 9, 14) when
+/// cancelled (`0x5098db`, `0x522091`, `0x53740b`: `0xffff` = `-1`).
+pub const SPECIAL_PANEL_CANCELLED: i16 = -1;
+
+/// Person data word 31 (`+0x5ca`): the person's neighbor ID (`0x4517e4`).
+const PERSON_NEIGHBOR: usize = 31;
+
+/// Registry special-panel fields (`cObjectRegistry` offsets `+0xe8..=+0x10c`,
+/// initialized in `0x43f628..0x43f72d`).
+///
+/// Note: registry word `+0x100` (pet picker result / declined sentinel) lives
+/// in [`sims_sim::Dialogs::declined`] so `Make New Character` (`0x44b064`)
+/// shares it directly with `Dialog` kind 9 (`0x451899`, `0x441d95`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpecialPanels {
+    /// `+0xe8`: kind 10 (Phone / Call Neighbor). `0` idle; `< 0` (except
+    /// `-9999`) pending (`-caller_neighbor`); `> 0` chosen neighbor ID;
+    /// `-9999` (`0xd8f1`) cancelled.
+    pub call_neighbor: i16,
+    /// `+0xea`: kind 5 (Downtown lot picker). `0` idle; `-1` pending; `21..=30` picked lot.
+    pub downtown_lot: i16,
+    /// `+0xec`: kind 7 (Vacation Island lot picker). `0` idle; `-1` pending; `40..=48` picked lot.
+    pub vacation_lot: i16,
+    /// `+0xee`: kind 11 (Studio Town lot picker). `0` idle; `-1` pending; `81..=89` picked lot.
+    pub studio_lot: i16,
+    /// `+0xf0`: kind 13 (Magic Town lot picker). `0` idle; `-1` pending; `90..=98` picked lot.
+    pub magic_lot: i16,
+    /// `+0xf2`: kind 8 (Old Town / Community lot picker). `0` idle; `-1` pending; community lot ID.
+    pub old_town_lot: i16,
+    /// `+0xf4`: kind 6 input wardrobe mode / kind 6 & 14 modal status (`-2` accepted).
+    pub wardrobe_status: i16,
+    /// `+0xf6`: kind 14 input `temp 0` / kind 6 & 14 modal result index.
+    pub wardrobe_index: i16,
+    /// `+0xf8`: kind 6 pending person object ID.
+    pub wardrobe_caller: Option<u16>,
+    /// `+0xfc`: kind 14 pending person object ID.
+    pub charm_caller: Option<u16>,
+    /// `+0x104`: kind 9 pending pet person object ID (from `stack_object`).
+    pub pet_target: Option<u16>,
+    /// `+0x108`: kind 9 modal status (`-2` accepted).
+    pub pet_status: i16,
+    /// `+0x10c`: kind 11 Studio Town star-limo subject person ID (set by
+    /// Generic Sims Call routine 35 at `0x451197`, cleared on valid pick at `0x442152`).
+    pub studio_caller: Option<u16>,
+}
+
+/// Typed special panel request surfaced by `Dialog` kinds `5..=15` (`0x451552`
+/// and `0x4413e1..0x442320`) so `sims-game` can display the appropriate native
+/// panel or trigger travel (`sims_vm::travel::depart_to_destination`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SpecialPanelRequest {
+    /// Kind 5 (`reg+0xea`, `0x4414cd` -> `0x549dae`): Hot Date Downtown lot picker (`21..=30`).
+    DowntownLotPicker,
+    /// Kind 6 (`reg+0xf4`/`+0xf6`/`+0xf8`, `0x4417b3` -> `0x508f22`): Wardrobe /
+    /// clothing shop picker. `mode` is the input `temp 0` (`0` everyday, `1` swimwear,
+    /// `2` formal, `3` pajamas, `4` winter, `5` high-fashion at `0x5097c9`).
+    WardrobeShop { person: u16, mode: i16 },
+    /// Kind 7 (`reg+0xec`, `0x441df2` -> `0x5686e9`): Vacation Island lot picker (`40..=48`).
+    /// `on_residential` mirrors `0x40745f` (`0x441f34`, loading transition 2 vs 1).
+    VacationLotPicker { on_residential: bool },
+    /// Kind 8 (`reg+0xf2`, `0x4415fd` -> `0x556721`/`0x4425a8`): Old Town / Community lot
+    /// picker (any lot with `LotZoning == 2` per `0x42b9e3`).
+    OldTownLotPicker { unleashed: bool },
+    /// Kind 9 (`reg+0x100`/`+0x104`/`+0x108`, `0x441b8b` -> `0x521788`): Unleashed Pet
+    /// Adoption / Buy Pet picker for stack-object person `pet`.
+    PetPicker { pet: u16 },
+    /// Kind 10 (`reg+0xe8`, `0x4413e1` -> `0x5221d0`): Phone / Call Neighbor picker.
+    /// `caller_neighbor` is the calling Sim's `person.data[31]` (`PERSON_NEIGHBOR`).
+    CallNeighbor { caller_neighbor: i16 },
+    /// Kind 11 (`reg+0xee`/`+0x10c`, `0x441f72` -> `0x5644b5`): Superstar Studio Town lot
+    /// picker (`81..=89`). `star_limo` reflects `reg+0x10c` (`person.data[80] > 0 &&
+    /// person.data[56] == 0` at `0x441f94..0x441ffa`).
+    StudioTownLotPicker { star_limo: bool },
+    /// Kind 12 (`0x4518e2` -> `0x5107dc(person, 0)`): Makin' Magic Spellbook reference
+    /// modal, opened synchronously inside `Dialog` and always taking the True branch.
+    SpellBook { caller: u16 },
+    /// Kind 13 (`reg+0xf0`, `0x44216e` -> `0x551285`): Makin' Magic Town lot picker
+    /// (`90..=98`). `via_blimp` reflects `world.globals[34] != 0` (`0x4421e3..0x442219`,
+    /// written to `[dialog + 0xec]` and read at `0x5545ee`: `false` for the Magic Hole
+    /// `ClownPortal.iff` node 64, `true` for the Magic Blimp `phonepluginmagiclots.iff`
+    /// node 98).
+    MagicTownLotPicker { via_blimp: bool },
+    /// Kind 14 (`reg+0xf4`/`+0xf6`/`+0xfc`, `0x4419a6` -> `0x536a6b`): Makin' Magic
+    /// Charm Transform picker for `person`.
+    CharmTransform { person: u16 },
+    /// Kind 15 (`0x451946` -> `0x5107dc(person, 1)`): Makin' Magic Cookbook reference
+    /// modal, opened synchronously inside `Dialog` and always taking the True branch.
+    CookBook { caller: u16 },
+}
+
+impl SpecialPanelRequest {
+    /// The `Dialog` operand 5 kind (`5..=15`) corresponding to this panel.
+    #[must_use]
+    pub const fn kind(&self) -> u8 {
+        match self {
+            Self::DowntownLotPicker => 5,
+            Self::WardrobeShop { .. } => 6,
+            Self::VacationLotPicker { .. } => 7,
+            Self::OldTownLotPicker { .. } => 8,
+            Self::PetPicker { .. } => 9,
+            Self::CallNeighbor { .. } => 10,
+            Self::StudioTownLotPicker { .. } => 11,
+            Self::SpellBook { .. } => 12,
+            Self::MagicTownLotPicker { .. } => 13,
+            Self::CharmTransform { .. } => 14,
+            Self::CookBook { .. } => 15,
+        }
+    }
+
+    /// Whether this panel is a dismiss-only reference modal (Spellbook / Cookbook).
+    #[must_use]
+    pub const fn is_dismiss_only(&self) -> bool {
+        matches!(self, Self::SpellBook { .. } | Self::CookBook { .. })
+    }
+
+    /// Whether `response` is the matching response variant for this panel request.
+    #[must_use]
+    pub const fn accepts(&self, response: &SpecialPanelResponse) -> bool {
+        match self {
+            Self::DowntownLotPicker
+            | Self::VacationLotPicker { .. }
+            | Self::OldTownLotPicker { .. }
+            | Self::StudioTownLotPicker { .. }
+            | Self::MagicTownLotPicker { .. } => matches!(response, SpecialPanelResponse::Lot(_)),
+            Self::CallNeighbor { .. } => matches!(response, SpecialPanelResponse::Neighbor(_)),
+            Self::WardrobeShop { .. } | Self::PetPicker { .. } | Self::CharmTransform { .. } => {
+                matches!(response, SpecialPanelResponse::Selection { .. })
+            }
+            Self::SpellBook { .. } | Self::CookBook { .. } => {
+                matches!(response, SpecialPanelResponse::Dismissed)
+            }
+        }
+    }
+}
+
+/// The player's response to a [`SpecialPanelRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SpecialPanelResponse {
+    /// Lot chosen in a neighborhood destination picker (kinds 5, 7, 8, 11, 13),
+    /// or `None` if cancelled / closed without picking a valid lot.
+    Lot(Option<i16>),
+    /// Neighbor ID chosen in the Phone / Call Neighbor picker (kind 10), or
+    /// `None` (or `<= 0`) if cancelled.
+    Neighbor(Option<i16>),
+    /// Outfit, charm costume, or pet body index chosen in a 3D preview picker
+    /// (kinds 6, 9, 14). `accepted == true` packs `-2` (`0xfffe`, True branch);
+    /// `accepted == false` packs `-1` (`0xffff`, False branch).
+    Selection { accepted: bool, index: i16 },
+    /// Reference book modal closed (kinds 12 Spellbook and 15 Cookbook).
+    Dismissed,
+}
+
+/// Transient per-turn coordination slot allowing inline reference modals
+/// (kinds 12 & 15) inside `Machine::dialog` to pause for `Player::special_panel`
+/// without tripping `play`-mode script error recovery or consuming an extra tick.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct InlineSpecialPanel {
+    pub(crate) waiting: Option<SpecialPanelRequest>,
+    pub(crate) pre_approved: bool,
+}
+
+/// The answers an ordinary dialog of this kind (operand 5) offers, as statuses,
+/// or None for special panels (kinds 5..=15) and unknown kinds. From the
+/// original's button setup (0x43601c, 0x436a52), as the old prototype read it
 /// (legacy/crates/sims-vm/src/dialog/presentation.rs, `buttons`).
 pub fn answers(kind: u8) -> Option<&'static [u8]> {
     match kind & 0x7f {
@@ -281,17 +460,19 @@ pub fn informs(operands: &[u8; 8]) -> bool {
 impl Machine<'_, '_> {
     pub(crate) fn dialog(&mut self, operands: &[u8; 8]) -> Result<Flow, Trap> {
         let kind = operands[5] & 0x7f;
-        if answers(kind).is_none() {
+        if kind > 15 {
             return Err(Trap::Unsupported(format!(
-                "Dialog kind {kind} (operand 5) is {}, which is not ported (0x451552)",
-                if kind == 3 {
-                    "a dialog that asks for text"
-                } else {
-                    "one of the game's special panels"
-                }
+                "Dialog kind {kind} (operand 5) is unknown, which is not ported (0x451552)"
+            )));
+        }
+        if informs(operands) && answers(kind).is_none() {
+            return Err(Trap::Unsupported(format!(
+                "Dialog kind {kind} (operand 5) with informs flag (operand 7 bit 0) is not ported \
+                 (0x451552)"
             )));
         }
         let me = self.me;
+        // 0x451562..0x45158d runs before the informs and kind dispatches.
         let records = &mut self.world.dialogs.records;
         let mut found = records.iter().position(|record| record.caller == me);
         if let Some(index) = found {
@@ -304,16 +485,35 @@ impl Machine<'_, '_> {
                 _ => {}
             }
         }
+        if informs(operands) {
+            let record = Dialog {
+                caller: me,
+                operands: *operands,
+                status: NEW,
+            };
+            self.dialog_portrait(operands)?;
+            self.world.dialogs.records.push(record);
+            return Ok(Flow::Branch(true));
+        }
+        match kind {
+            5 => return self.dialog_lot_picker(5, |sp| &mut sp.downtown_lot),
+            7 => return self.dialog_lot_picker(7, |sp| &mut sp.vacation_lot),
+            8 => return self.dialog_lot_picker(8, |sp| &mut sp.old_town_lot),
+            11 => return self.dialog_lot_picker(11, |sp| &mut sp.studio_lot),
+            13 => return self.dialog_lot_picker(13, |sp| &mut sp.magic_lot),
+            6 => return self.dialog_wardrobe(),
+            14 => return self.dialog_charm_transform(),
+            10 => return self.dialog_call_neighbor(),
+            9 => return self.dialog_pet_picker(),
+            12 => return self.dialog_reference_book(SpecialPanelRequest::SpellBook { caller: me }),
+            15 => return self.dialog_reference_book(SpecialPanelRequest::CookBook { caller: me }),
+            _ => {}
+        }
         let record = Dialog {
             caller: me,
             operands: *operands,
             status: NEW,
         };
-        if informs(operands) {
-            self.dialog_portrait(operands)?;
-            self.world.dialogs.records.push(record);
-            return Ok(Flow::Branch(true));
-        }
         let Some(index) = found else {
             self.dialog_portrait(operands)?;
             self.world.dialogs.records.push(record);
@@ -343,6 +543,233 @@ impl Machine<'_, '_> {
             }
             _ => Flow::Branch(true),
         })
+    }
+
+    /// Kinds 5 (`reg+0xea`), 7 (`reg+0xec`), 8 (`reg+0xf2`), 11 (`reg+0xee`),
+    /// and 13 (`reg+0xf0`) at `0x4515b3..0x451656`: if the slot is 0, arm it
+    /// to -1 and yield; otherwise copy the picked lot into `temp 0`, clear the
+    /// slot to 0, and take the true branch.
+    fn dialog_lot_picker(
+        &mut self,
+        kind: u8,
+        slot: impl FnOnce(&mut SpecialPanels) -> &mut i16,
+    ) -> Result<Flow, Trap> {
+        let Some(panels) = self.special_panels else {
+            return Err(Trap::Unsupported(format!(
+                "Dialog kind {kind} (operand 5) requires Interpreter::special_panels (0x451552)"
+            )));
+        };
+        let value = {
+            let mut panels = panels.borrow_mut();
+            let field = slot(&mut panels);
+            let value = *field;
+            if value == 0 {
+                *field = -1;
+                return Ok(Flow::Yield);
+            }
+            *field = 0;
+            value
+        };
+        self.set_temp(0, value)?;
+        Ok(Flow::Branch(true))
+    }
+
+    /// Kind 6 (`0x451657..0x4516f8`): Wardrobe / Clothing Shop picker
+    /// (`reg+0xf4`, `+0xf6`, `+0xf8`).
+    fn dialog_wardrobe(&mut self) -> Result<Flow, Trap> {
+        if self.me()?.person.is_none() {
+            return Err(Trap::native(0x1c, "object is not a person"));
+        }
+        let Some(panels) = self.special_panels else {
+            return Err(Trap::Unsupported(
+                "Dialog kind 6 (operand 5) requires Interpreter::special_panels (0x451657)".into(),
+            ));
+        };
+        let me = self.me;
+        let mode = *self
+            .me()?
+            .temps
+            .first()
+            .ok_or(Trap::native(2, "temp out of range"))?;
+        let outcome = {
+            let mut sp = panels.borrow_mut();
+            match sp.wardrobe_caller {
+                None => {
+                    sp.wardrobe_status = mode;
+                    sp.wardrobe_caller = Some(me);
+                    None
+                }
+                Some(owner) if owner == me => {
+                    let index = sp.wardrobe_index;
+                    let accepted = sp.wardrobe_status == SPECIAL_PANEL_ACCEPTED;
+                    sp.wardrobe_status = 0;
+                    sp.wardrobe_caller = None;
+                    Some((index, accepted))
+                }
+                Some(_) => {
+                    sp.wardrobe_status = 0;
+                    sp.wardrobe_caller = None;
+                    Some((0, false))
+                }
+            }
+        };
+        match outcome {
+            None => Ok(Flow::Yield),
+            Some((index, accepted)) => {
+                self.set_temp(0, index)?;
+                Ok(Flow::Branch(accepted))
+            }
+        }
+    }
+
+    /// Kind 14 (`0x4516f9..0x451799`): Magic Charm Transform picker
+    /// (`reg+0xf4`, `+0xf6`, `+0xfc`).
+    fn dialog_charm_transform(&mut self) -> Result<Flow, Trap> {
+        if self.me()?.person.is_none() {
+            return Err(Trap::native(0x1c, "object is not a person"));
+        }
+        let Some(panels) = self.special_panels else {
+            return Err(Trap::Unsupported(
+                "Dialog kind 14 (operand 5) requires Interpreter::special_panels (0x4516f9)".into(),
+            ));
+        };
+        let me = self.me;
+        let input = *self
+            .me()?
+            .temps
+            .first()
+            .ok_or(Trap::native(2, "temp out of range"))?;
+        let outcome = {
+            let mut sp = panels.borrow_mut();
+            match sp.charm_caller {
+                None => {
+                    sp.wardrobe_index = input;
+                    sp.charm_caller = Some(me);
+                    None
+                }
+                Some(owner) if owner == me => {
+                    let index = sp.wardrobe_index;
+                    let accepted = sp.wardrobe_status == SPECIAL_PANEL_ACCEPTED;
+                    sp.wardrobe_index = 0;
+                    sp.charm_caller = None;
+                    Some((index, accepted))
+                }
+                Some(_) => {
+                    sp.wardrobe_index = 0;
+                    sp.charm_caller = None;
+                    Some((0, false))
+                }
+            }
+        };
+        match outcome {
+            None => Ok(Flow::Yield),
+            Some((index, accepted)) => {
+                self.set_temp(0, index)?;
+                Ok(Flow::Branch(accepted))
+            }
+        }
+    }
+
+    /// Kind 10 (`0x45179a..0x45181b`): Phone / Call Neighbor picker (`reg+0xe8`).
+    fn dialog_call_neighbor(&mut self) -> Result<Flow, Trap> {
+        let neighbor_id = self
+            .me()?
+            .person
+            .as_ref()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .data
+            .get(PERSON_NEIGHBOR)
+            .copied()
+            .unwrap_or(0);
+        let Some(panels) = self.special_panels else {
+            return Err(Trap::Unsupported(
+                "Dialog kind 10 (operand 5) requires Interpreter::special_panels (0x45179a)".into(),
+            ));
+        };
+        let value = {
+            let mut sp = panels.borrow_mut();
+            let v = sp.call_neighbor;
+            if v == 0 {
+                sp.call_neighbor = neighbor_id.wrapping_neg();
+                return Ok(Flow::Yield);
+            }
+            sp.call_neighbor = 0;
+            v
+        };
+        if value > 0 {
+            self.set_temp(0, value)?;
+            Ok(Flow::Branch(true))
+        } else {
+            Ok(Flow::Branch(false))
+        }
+    }
+
+    /// Kind 9 (`0x45181c..0x4518e1`): Unleashed Pet Adoption / Buy Pet picker
+    /// (`reg+0x100` in [`sims_sim::Dialogs::declined`], `reg+0x104`, `reg+0x108`).
+    fn dialog_pet_picker(&mut self) -> Result<Flow, Trap> {
+        let stack_object = self.frame()?.stack_object;
+        let pet_id = u16::try_from(stack_object)
+            .ok()
+            .filter(|&id| {
+                id > 0
+                    && self
+                        .world
+                        .objects
+                        .get(&id)
+                        .is_some_and(|o| o.person.is_some())
+            })
+            .ok_or(Trap::native(0x1c, "stack object is not a person"))?;
+        let Some(panels) = self.special_panels else {
+            return Err(Trap::Unsupported(
+                "Dialog kind 9 (operand 5) requires Interpreter::special_panels (0x45181c)".into(),
+            ));
+        };
+        let outcome = {
+            let mut sp = panels.borrow_mut();
+            match sp.pet_target {
+                None => {
+                    sp.pet_target = Some(pet_id);
+                    None
+                }
+                Some(owner) if owner == pet_id => {
+                    let index = self.world.dialogs.declined;
+                    let accepted = sp.pet_status == SPECIAL_PANEL_ACCEPTED;
+                    sp.pet_target = None;
+                    if !accepted {
+                        self.world.dialogs.declined = -1;
+                    }
+                    Some((index, accepted))
+                }
+                Some(_) => {
+                    sp.pet_target = None;
+                    self.world.dialogs.declined = -1;
+                    Some((0, false))
+                }
+            }
+        };
+        match outcome {
+            None => Ok(Flow::Yield),
+            Some((index, accepted)) => {
+                self.set_temp(0, index)?;
+                Ok(Flow::Branch(accepted))
+            }
+        }
+    }
+
+    /// Kinds 12 (Spellbook, `0x4518e2`) and 15 (Cookbook, `0x451946`): open
+    /// modal `0x5107dc(person, mode)` synchronously inside `Dialog` and always
+    /// take the true branch on the same tick.
+    fn dialog_reference_book(&mut self, request: SpecialPanelRequest) -> Result<Flow, Trap> {
+        if let Some(inline) = self.inline_special_panel {
+            let mut state = inline.borrow_mut();
+            if state.pre_approved {
+                state.pre_approved = false;
+                return Ok(Flow::Branch(true));
+            }
+            state.waiting = Some(request);
+            return Ok(Flow::Yield);
+        }
+        Ok(Flow::Branch(true))
     }
 
     /// The portrait an ordinary dialog's record shows, built as the

@@ -17,8 +17,9 @@ pub mod save;
 use crate::play::Play;
 use crate::selection::publish_waited_for;
 use crate::{
-    Answer, Answers, BuyCursor, Callback, Interpreter, PanelMode, Program, SkippedFrame, Stream,
-    TickError, Update,
+    Answer, Answers, BuyCursor, Callback, Interpreter, PanelMode, Player, Program, Shown,
+    ShownSpecialPanel, SkippedFrame, SpecialPanelResponse, SpecialPanels, Stream, TickError,
+    Update,
 };
 use sims_content::{
     Animations, ArchivePool, AvatarRegistry, Catalog, House, Index, Install, Neighborhood, People,
@@ -29,7 +30,7 @@ use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -340,6 +341,13 @@ pub struct Lot {
     pub(crate) asks: bool,
     /// The dialog the lot waits on, while it waits.
     pub(crate) asking: Option<Box<Asking>>,
+    /// The special panel (`Dialog` kinds `5..=15`) the lot waits on, while it waits.
+    pub(crate) asking_special_panel: Option<Box<AskingSpecialPanel>>,
+    /// Registry special-panel slots (`cObjectRegistry +0xe8..=+0x10c`) carried
+    /// across ticks (`0x451552`, `0x4413e1..0x442320`).
+    pub(crate) special_panels: SpecialPanels,
+    /// Queued player responses for special panels (`Dialog` kinds `5..=15`).
+    pub(crate) special_panel_responses: VecDeque<SpecialPanelResponse>,
     /// The dialog is answered and the tick that showed it has not run
     /// again yet: the lot is as it was before that tick, so it takes no
     /// input until the next step.
@@ -465,11 +473,25 @@ pub struct Asking {
     pub world: World,
 }
 
-/// How [`Lot::advance`] stopped: a failure, or a dialog that waits for
-/// the player.
+/// A special panel (`Dialog` kinds `5..=15`) the lot waits on
+/// ([`Lot::asking_special_panel`]). The tick that showed it has not happened:
+/// the lot is as it was before that tick, and [`Lot::answer_special_panel`]
+/// then a step runs the tick again with the supplied [`SpecialPanelResponse`].
+#[derive(Debug, Clone)]
+pub struct AskingSpecialPanel {
+    pub shown: ShownSpecialPanel,
+    /// The lot partway through the tick when the special panel was requested,
+    /// for rendering picker state (portraits, outfits, neighbors, lots). Not
+    /// the lot's committed state.
+    pub world: World,
+}
+
+/// How [`Lot::advance`] stopped: a failure, or a dialog / special panel that
+/// waits for the player.
 enum Stop {
     Step(StepError),
     Asks { tick: u32, shown: crate::Shown },
+    AsksSpecialPanel { tick: u32, shown: ShownSpecialPanel },
 }
 
 impl From<StepError> for Stop {
@@ -483,8 +505,63 @@ impl Stop {
     fn into_step(self) -> StepError {
         match self {
             Self::Step(error) => error,
-            Self::Asks { tick, .. } => StepError::Asking { tick },
+            Self::Asks { tick, .. } | Self::AsksSpecialPanel { tick, .. } => {
+                StepError::Asking { tick }
+            }
         }
+    }
+}
+
+/// Why a special panel response was not taken ([`Lot::answer_special_panel`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecialPanelAnswerError {
+    /// No special panel waits for a response.
+    NotAsked,
+    /// The response variant does not match the requested special panel kind.
+    WrongResponse {
+        expected_kind: u8,
+        given: SpecialPanelResponse,
+    },
+}
+
+impl std::fmt::Display for SpecialPanelAnswerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAsked => write!(f, "no special panel waits for a response"),
+            Self::WrongResponse {
+                expected_kind,
+                given,
+            } => write!(
+                f,
+                "special panel kind {expected_kind} does not accept response {given:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SpecialPanelAnswerError {}
+
+/// Player adapter used by [`Lot`] to feed both ordinary dialog [`Answers`] and
+/// queued [`SpecialPanelResponse`]s into [`Interpreter::lot_update_kept`].
+struct LotPlayer<'a> {
+    answers: &'a mut Answers,
+    special_panels: &'a mut VecDeque<SpecialPanelResponse>,
+    wait_for_books: bool,
+}
+
+impl Player for LotPlayer<'_> {
+    fn answer(&mut self, shown: &Shown) -> Option<Answer> {
+        self.answers.answer(shown)
+    }
+
+    fn special_panel(&mut self, shown: &ShownSpecialPanel) -> Option<SpecialPanelResponse> {
+        if let Some(resp) = self.special_panels.pop_front() {
+            return Some(resp);
+        }
+        if shown.request.is_dismiss_only() && !self.wait_for_books {
+            return Some(SpecialPanelResponse::Dismissed);
+        }
+        None
     }
 }
 
@@ -1383,6 +1460,9 @@ impl Lot {
             asks: false,
             answered: false,
             asking: None,
+            asking_special_panel: None,
+            special_panels: crate::SpecialPanels::default(),
+            special_panel_responses: std::collections::VecDeque::new(),
 
             view_rotation,
             floor_rotation: view_rotation,
@@ -1465,7 +1545,7 @@ impl Lot {
             self.sync_active_buy_cursor();
             return result;
         }
-        if self.asking.is_some() {
+        if self.asking.is_some() || self.asking_special_panel.is_some() {
             return Err(StepError::Asking {
                 tick: self.ticks + 1,
             });
@@ -1479,20 +1559,43 @@ impl Lot {
             self.play.clone(),
             self.ticks,
             self.player.clone(),
+            self.special_panels.clone(),
+            self.special_panel_responses.clone(),
             self.coop.clone(),
         );
         self.answered = false;
         match self.advance(play) {
             Err(Stop::Asks { tick, shown }) => {
-                let (world, play, ticks, player, coop) = before;
+                let (world, play, ticks, player, special_panels, special_panel_responses, coop) =
+                    before;
                 let partway = std::mem::replace(&mut self.world, world);
                 self.play = play;
                 self.ticks = ticks;
                 self.player = player;
+                self.special_panels = special_panels;
+                self.special_panel_responses = special_panel_responses;
                 self.coop = coop;
                 self.replay_view
                     .get_or_insert((self.view_rotation, self.view_centre));
                 self.asking = Some(Box::new(Asking {
+                    shown,
+                    world: partway,
+                }));
+                Err(StepError::Asking { tick })
+            }
+            Err(Stop::AsksSpecialPanel { tick, shown }) => {
+                let (world, play, ticks, player, special_panels, special_panel_responses, coop) =
+                    before;
+                let partway = std::mem::replace(&mut self.world, world);
+                self.play = play;
+                self.ticks = ticks;
+                self.player = player;
+                self.special_panels = special_panels;
+                self.special_panel_responses = special_panel_responses;
+                self.coop = coop;
+                self.replay_view
+                    .get_or_insert((self.view_rotation, self.view_centre));
+                self.asking_special_panel = Some(Box::new(AskingSpecialPanel {
                     shown,
                     world: partway,
                 }));
@@ -1533,6 +1636,7 @@ impl Lot {
         let masks_rebuilt = Cell::new(0);
         let dialog_text = RefCell::new(self.last_dialog_text.clone());
         let character_names = RefCell::new(self.character_names.clone());
+        let special_panels = RefCell::new(self.special_panels.clone());
         let (view_rotation, view_centre) = if let Some(coop_cell) = coop {
             // In co-op mode, local camera panning (`self.view_centre`) is UI-only
             // and never feeds the shared simulation (`docs/vision.md`); portrait
@@ -1566,6 +1670,7 @@ impl Lot {
             active_family: (self.load.house != 0 && self.load.family == 0)
                 .then_some(family_zero_members.as_slice()),
             coop,
+            special_panels: Some(&special_panels),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut frame_errors = Vec::new();
@@ -1607,10 +1712,15 @@ impl Lot {
             }
             .into());
         }
+        let mut lot_player = LotPlayer {
+            answers: &mut self.player,
+            special_panels: &mut self.special_panel_responses,
+            wait_for_books: asks,
+        };
         let (update, result) = interpreter.lot_update_kept(
             &mut self.world,
             tuning,
-            &mut self.player,
+            &mut lot_player,
             play.then_some(&mut self.play),
         );
         let mut update = Update {
@@ -1621,6 +1731,9 @@ impl Lot {
             return Err(match error {
                 // Nobody has answered: the player is asked.
                 TickError::Unanswered { shown, given: None } if asks => Stop::Asks { tick, shown },
+                TickError::UnansweredSpecialPanel { shown, given: None } if asks => {
+                    Stop::AsksSpecialPanel { tick, shown }
+                }
                 error => {
                     // In play mode what came before the failure goes with
                     // it: the errors caught, a skipped first frame, and
@@ -1671,6 +1784,7 @@ impl Lot {
         update.masks_rebuilt = masks_rebuilt.get();
         self.last_dialog_text = dialog_text.into_inner();
         self.character_names = character_names.into_inner();
+        self.special_panels = special_panels.into_inner();
         if let Some(error) = frame {
             if play {
                 update.frame_errors.push(SkippedFrame {
@@ -3365,6 +3479,16 @@ impl Lot {
         self.asking.as_deref()
     }
 
+    /// The special panel (`Dialog` kinds `5..=15`) the lot waits on, if it waits.
+    pub fn asking_special_panel(&self) -> Option<&AskingSpecialPanel> {
+        self.asking_special_panel.as_deref()
+    }
+
+    /// Registry special-panel slots (`cObjectRegistry +0xe8..=+0x10c`).
+    pub fn special_panels(&self) -> &SpecialPanels {
+        &self.special_panels
+    }
+
     /// Answers the dialog the lot waits on with `answer` (the status its
     /// button gives: 2 the first, 3 the second, 4 the third). The window
     /// can include the activated button's bitmap ID in an [`Answer`].
@@ -3386,12 +3510,47 @@ impl Lot {
         Ok(())
     }
 
+    /// Answers the special panel (`Dialog` kinds `5..=15`) the lot waits on.
+    /// The next step replays that tick and supplies `response` where the
+    /// original modal panel waited (`0x4413e1..0x442320` or `0x4518e2`/`0x451946`).
+    pub fn answer_special_panel(
+        &mut self,
+        response: SpecialPanelResponse,
+    ) -> Result<(), SpecialPanelAnswerError> {
+        let asking = self
+            .asking_special_panel
+            .as_ref()
+            .ok_or(SpecialPanelAnswerError::NotAsked)?;
+        if !asking.shown.request.accepts(&response) {
+            return Err(SpecialPanelAnswerError::WrongResponse {
+                expected_kind: asking.shown.request.kind(),
+                given: response,
+            });
+        }
+        self.special_panel_responses.push_back(response);
+        self.asking_special_panel = None;
+        self.answered = true;
+        Ok(())
+    }
+
+    /// Appends scripted responses for upcoming special panels (`Dialog` kinds
+    /// `5..=15`), for headless stepping and automated sweeps.
+    pub fn queue_special_panel_responses(
+        &mut self,
+        responses: &[SpecialPanelResponse],
+    ) -> Result<(), OrderError> {
+        self.ready()?;
+        self.special_panel_responses
+            .extend(responses.iter().cloned());
+        Ok(())
+    }
+
     /// Whether the lot takes a player's input.
     pub(crate) fn ready(&self) -> Result<(), OrderError> {
         if self.halted {
             return Err(OrderError::Halted);
         }
-        if self.asking.is_some() || self.answered {
+        if self.asking.is_some() || self.asking_special_panel.is_some() || self.answered {
             return Err(OrderError::Asking);
         }
         if self.load.finished.is_none() {
@@ -3480,6 +3639,11 @@ impl Lot {
         {
             *slot = value;
         }
+        if let Some(asking) = &mut self.asking_special_panel
+            && let Some(slot) = asking.world.globals.get_mut(30)
+        {
+            *slot = value;
+        }
         Ok(())
     }
 
@@ -3491,6 +3655,11 @@ impl Lot {
             *slot = value;
         }
         if let Some(asking) = &mut self.asking
+            && let Some(slot) = asking.world.globals.get_mut(32)
+        {
+            *slot = value;
+        }
+        if let Some(asking) = &mut self.asking_special_panel
             && let Some(slot) = asking.world.globals.get_mut(32)
         {
             *slot = value;
@@ -3637,6 +3806,9 @@ mod tests {
             asks: false,
             answered: false,
             asking: None,
+            asking_special_panel: None,
+            special_panels: crate::SpecialPanels::default(),
+            special_panel_responses: std::collections::VecDeque::new(),
 
             view_rotation: 0,
             floor_rotation: 0,

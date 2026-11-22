@@ -94,7 +94,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Magic prefix and format version for persisted active-trip envelopes stored
 /// in `NEIGHBORHOOD_LOTS[(neighborhood_id, home_house)]` while a household is
-/// away from home. Because `Saved::decode` expects `FORMAT = 8u32` LE, this
+/// away from home. Because `Saved::decode` expects `Saved::FORMAT` (`9u32`) LE, this
 /// envelope simultaneously persists the authoritative trip record atomically
 /// with `secondary_house` AND prevents `lifecycle::enter_lot` from opening or
 /// overwriting the frozen home lot while the trip is active.
@@ -3250,6 +3250,9 @@ fn boot_destination_for_edit(
         asks: false,
         answered: false,
         asking: None,
+        asking_special_panel: None,
+        special_panels: crate::SpecialPanels::default(),
+        special_panel_responses: std::collections::VecDeque::new(),
         view_rotation,
         floor_rotation,
         view_centre,
@@ -3993,6 +3996,9 @@ fn boot_destination_lot(
         asks: false,
         answered: false,
         asking: None,
+        asking_special_panel: None,
+        special_panels: crate::SpecialPanels::default(),
+        special_panel_responses: std::collections::VecDeque::new(),
         view_rotation,
         floor_rotation,
         view_centre: effective_view_centre,
@@ -4371,6 +4377,9 @@ fn reconcile_frozen_home_lot(
         play: Play { fresh: saved.fresh },
         asks: false,
         asking: None,
+        asking_special_panel: None,
+        special_panels: saved.special_panels,
+        special_panel_responses: saved.special_panel_responses,
         answered: saved.answered,
         view_rotation: saved.view_rotation,
         floor_rotation: saved.floor_rotation,

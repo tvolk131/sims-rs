@@ -113,6 +113,10 @@ pub use load::{INDICATORS, Reconciled, Roomed};
 pub use memory::scope_name;
 pub use objects::{READ_BEFORE_THE_FIRST_LOAD, SavedRead, read_before_the_first_load};
 pub use people::{curve_table, persistent_fields, reload_profile};
+pub use primitives::dialog::{
+    CALL_NEIGHBOR_CANCELLED, SPECIAL_PANEL_ACCEPTED, SPECIAL_PANEL_CANCELLED, SpecialPanelRequest,
+    SpecialPanelResponse, SpecialPanels,
+};
 pub use primitives::primitive_name;
 pub use primitives::ui_effect::UiEffectEvent;
 pub use program::{
@@ -121,7 +125,10 @@ pub use program::{
 };
 pub use selection::selected;
 pub use sounds::SoundEvent;
-pub use tick::{Answer, Answers, Player, Shown, SkippedFrame, TICK_BUDGET, TickError, Update};
+pub use tick::{
+    Answer, Answers, Player, ScriptedPlayer, Shown, ShownSpecialPanel, SkippedFrame, TICK_BUDGET,
+    TickError, Update,
+};
 pub use visits::Visited;
 
 pub type Result<T> = std::result::Result<T, Error>;

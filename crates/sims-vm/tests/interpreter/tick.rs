@@ -7,7 +7,12 @@ use sims_core::F32;
 use sims_sim::motives::{Curve, Rates, Tuning};
 use sims_sim::{Dialog, HouseUsage, PersonTick, Usage};
 use sims_vm::play::{Play, Recovery};
-use sims_vm::{Answer, Answers, Interpreter, Player, Shown, SoundEvent, TickError, Trap, Update};
+use sims_vm::{
+    Answer, Answers, CALL_NEIGHBOR_CANCELLED, Interpreter, Player, ScriptedPlayer, Shown,
+    ShownSpecialPanel, SoundEvent, SpecialPanelRequest, SpecialPanelResponse, SpecialPanels,
+    TickError, Trap, Update,
+};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 /// Dialog (opcode 36) operands of `kind`, waiting for an answer, with the
@@ -233,8 +238,9 @@ fn a_choice_without_an_answer_and_unported_dialogs_fail_loudly() {
         update(&mut fx, &mut answers(&[])),
         Err(TickError::Unsupported(_))
     ));
-    // Special panels remain unported and fail loudly.
-    for kind in [5, 15] {
+    // Unknown Dialog kinds (> 15) fail loudly; stateful special panels also
+    // fail loudly when `Interpreter::special_panels` is not attached.
+    for kind in [5, 16, 127] {
         let mut fx = lot(asking(kind, 0));
         assert!(matches!(
             update(&mut fx, &mut answers(&[])),
@@ -1333,4 +1339,398 @@ fn a_person_queued_for_removal_after_a_partial_pass_fails_loudly() {
             .contains("stays queued for removal after a partial pass"),
         "{error}"
     );
+}
+
+fn update_with_panels(
+    fx: &mut Fixture,
+    panels: &RefCell<SpecialPanels>,
+    player: &mut dyn Player,
+) -> Result<Update, TickError> {
+    let tuning = tuning();
+    let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.special_panels = Some(panels);
+    interpreter.lot_update(&mut fx.world, &tuning, player)
+}
+
+/// Runs a tree on `SIM` (a person) instead of `LAMP`, storing 1 on True and 2 on
+/// False in `SIM`'s data word 0.
+fn person_lot(tree: sims_formats::behavior::Behavior) -> Fixture {
+    let mut fx = lot(sleeper());
+    fx.add(SIM_FILE, 4096, tree);
+    fx.thread(SIM, 4096, &[1]);
+    fx
+}
+
+#[test]
+fn special_dialog_travel_lot_pickers_kinds_5_7_8_11_13() {
+    // Kind 5 (Downtown, 21..=30): valid lot -> temp 0 = 25, True; out-of-range -> resets to 0 and re-prompts.
+    let mut fx = lot(asking(5, 0));
+    let panels = RefCell::new(SpecialPanels::default());
+    let mut player = ScriptedPlayer::new(
+        answers(&[]),
+        &[
+            SpecialPanelResponse::Lot(Some(99)), // out of 21..=30 -> resets downtown_lot = 0
+            SpecialPanelResponse::Lot(Some(25)),
+        ],
+    );
+    let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(
+        u1.special_panels_answered,
+        vec![(
+            SpecialPanelRequest::DowntownLotPicker,
+            SpecialPanelResponse::Lot(Some(99))
+        )]
+    );
+    assert_eq!(panels.borrow().downtown_lot, 0);
+    // Tick 2 re-arms and receives lot 25.
+    let u2 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(
+        u2.special_panels_answered,
+        vec![(
+            SpecialPanelRequest::DowntownLotPicker,
+            SpecialPanelResponse::Lot(Some(25))
+        )]
+    );
+    assert_eq!(panels.borrow().downtown_lot, 25);
+    // Tick 3 consumes 25 into temp 0 and takes True (data[0] = 1).
+    update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!((fx.lamp().data[0], fx.lamp().temps[0]), (1, 25));
+    assert_eq!(panels.borrow().downtown_lot, 0);
+
+    // Kind 7 (Vacation Island, 40..=48) checks on_residential (`0x40745f`).
+    let mut fx = lot(asking(7, 0));
+    fx.world.globals[10] = 40;
+    fx.program.zoning.insert(40, 2);
+    let panels = RefCell::new(SpecialPanels::default());
+    let mut player = ScriptedPlayer::new(answers(&[]), &[SpecialPanelResponse::Lot(Some(44))]);
+    let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(
+        u1.special_panels_answered,
+        vec![(
+            SpecialPanelRequest::VacationLotPicker {
+                on_residential: false
+            },
+            SpecialPanelResponse::Lot(Some(44))
+        )]
+    );
+    update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!((fx.lamp().data[0], fx.lamp().temps[0]), (1, 44));
+
+    // Kind 8 (Old Town / Community): requires LotZoning == 2 (`0x42b9e3`).
+    let mut fx = lot(asking(8, 0));
+    fx.program.expansions = 0x20;
+    fx.program.zoning.insert(5, 1);
+    fx.program.zoning.insert(58, 2);
+    let panels = RefCell::new(SpecialPanels::default());
+    let mut player = ScriptedPlayer::new(
+        answers(&[]),
+        &[
+            SpecialPanelResponse::Lot(Some(5)), // residential -> rejected, resets to 0
+            SpecialPanelResponse::Lot(Some(58)),
+        ],
+    );
+    let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(
+        u1.special_panels_answered[0].0,
+        SpecialPanelRequest::OldTownLotPicker { unleashed: true }
+    );
+    assert_eq!(panels.borrow().old_town_lot, 0);
+    update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(panels.borrow().old_town_lot, 58);
+    update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!((fx.lamp().data[0], fx.lamp().temps[0]), (1, 58));
+
+    // Kind 11 (Studio Town, 81..=89) + Generic Sims Call 35 (`reg+0x10c` star limo).
+    let mut fx = person_lot(tree(vec![
+        ins(1, 1, 2, [35, 0, 0, 0, 0, 0, 0, 0]), // Generic Sims Call 35 -> sets studio_caller
+        ins(36, 2, 3, dialog(11, 0)),
+        assign(scope::MY_DATA, 0, scope::LITERAL, 1, 4),
+        assign(scope::MY_DATA, 0, scope::LITERAL, 2, 4),
+        ins(0, 4, 4, [0; 8]),
+    ]));
+    {
+        let p = fx.sim_mut().person.as_mut().unwrap();
+        p.data[80] = 5; // fame/star > 0
+        p.data[56] = 0;
+    }
+    let panels = RefCell::new(SpecialPanels::default());
+    let mut player = ScriptedPlayer::new(answers(&[]), &[SpecialPanelResponse::Lot(Some(81))]);
+    let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(
+        u1.special_panels_answered,
+        vec![(
+            SpecialPanelRequest::StudioTownLotPicker { star_limo: true },
+            SpecialPanelResponse::Lot(Some(81))
+        )]
+    );
+    assert_eq!(panels.borrow().studio_caller, None);
+    update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!((fx.sim().data[0], fx.sim().temps[0]), (1, 81));
+
+    // Kind 13 (Magic Town, 90..=98): `via_blimp` follows global[34] != 0.
+    for (g34, via_blimp) in [(0, false), (1, true)] {
+        let mut fx = lot(asking(13, 0));
+        fx.world.globals[34] = g34;
+        let panels = RefCell::new(SpecialPanels::default());
+        let mut player = ScriptedPlayer::new(answers(&[]), &[SpecialPanelResponse::Lot(Some(93))]);
+        let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+        assert_eq!(
+            u1.special_panels_answered,
+            vec![(
+                SpecialPanelRequest::MagicTownLotPicker { via_blimp },
+                SpecialPanelResponse::Lot(Some(93))
+            )]
+        );
+        update_with_panels(&mut fx, &panels, &mut player).unwrap();
+        assert_eq!((fx.lamp().data[0], fx.lamp().temps[0]), (1, 93));
+    }
+}
+
+#[test]
+fn special_dialog_wardrobe_kind6_and_charm_kind14() {
+    // Non-person calling kind 6 or 14 throws native error 0x1c.
+    for kind in [6, 14] {
+        let mut fx = lot(asking(kind, 0));
+        let panels = RefCell::new(SpecialPanels::default());
+        let err = update_with_panels(&mut fx, &panels, &mut answers(&[])).unwrap_err();
+        assert!(
+            matches!(err, TickError::Fault(f) if matches!(f.trap, Trap::Native { code: 0x1c, .. })),
+            "kind {kind} on non-person must throw 0x1c"
+        );
+    }
+
+    // Kind 6: passes input temp 0 as mode, accepts (True) and cancels (False).
+    for (accepted, expected_branch, idx) in [(true, 1, 7), (false, 2, 3)] {
+        let mut fx = person_lot(asking(6, 0));
+        fx.sim_mut().temps[0] = 2; // formal wear mode
+        let panels = RefCell::new(SpecialPanels::default());
+        let mut player = ScriptedPlayer::new(
+            answers(&[]),
+            &[SpecialPanelResponse::Selection {
+                accepted,
+                index: idx,
+            }],
+        );
+        let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+        assert_eq!(
+            u1.special_panels_answered,
+            vec![(
+                SpecialPanelRequest::WardrobeShop {
+                    person: SIM,
+                    mode: 2
+                },
+                SpecialPanelResponse::Selection {
+                    accepted,
+                    index: idx
+                }
+            )]
+        );
+        update_with_panels(&mut fx, &panels, &mut player).unwrap();
+        assert_eq!(
+            (fx.sim().data[0], fx.sim().temps[0]),
+            (expected_branch, idx)
+        );
+        assert_eq!(panels.borrow().wardrobe_caller, None);
+    }
+
+    // Kind 14: Charm Transform accept & cancel.
+    for (accepted, expected_branch, idx) in [(true, 1, 4), (false, 2, 1)] {
+        let mut fx = person_lot(asking(14, 0));
+        let panels = RefCell::new(SpecialPanels::default());
+        let mut player = ScriptedPlayer::new(
+            answers(&[]),
+            &[SpecialPanelResponse::Selection {
+                accepted,
+                index: idx,
+            }],
+        );
+        let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+        assert_eq!(
+            u1.special_panels_answered,
+            vec![(
+                SpecialPanelRequest::CharmTransform { person: SIM },
+                SpecialPanelResponse::Selection {
+                    accepted,
+                    index: idx
+                }
+            )]
+        );
+        update_with_panels(&mut fx, &panels, &mut player).unwrap();
+        assert_eq!(
+            (fx.sim().data[0], fx.sim().temps[0]),
+            (expected_branch, idx)
+        );
+        assert_eq!(panels.borrow().charm_caller, None);
+    }
+}
+
+#[test]
+fn special_dialog_call_neighbor_kind10_and_pet_picker_kind9() {
+    // Kind 10: Call Neighbor (accept sets temp 0 & True; cancel writes -9999, leaves temp 0 untouched & False).
+    let mut fx = person_lot(asking(10, 0));
+    fx.sim_mut().person.as_mut().unwrap().data[31] = 12;
+    fx.sim_mut().temps[0] = 77;
+    let panels = RefCell::new(SpecialPanels::default());
+    let mut player = ScriptedPlayer::new(answers(&[]), &[SpecialPanelResponse::Neighbor(Some(5))]);
+    let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(
+        u1.special_panels_answered,
+        vec![(
+            SpecialPanelRequest::CallNeighbor {
+                caller_neighbor: 12
+            },
+            SpecialPanelResponse::Neighbor(Some(5))
+        )]
+    );
+    update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!((fx.sim().data[0], fx.sim().temps[0]), (1, 5));
+    assert_eq!(panels.borrow().call_neighbor, 0);
+
+    // Kind 10 cancel:
+    let mut fx = person_lot(asking(10, 0));
+    fx.sim_mut().person.as_mut().unwrap().data[31] = 12;
+    fx.sim_mut().temps[0] = 77;
+    let panels = RefCell::new(SpecialPanels::default());
+    let mut player = ScriptedPlayer::new(answers(&[]), &[SpecialPanelResponse::Neighbor(None)]);
+    update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(panels.borrow().call_neighbor, CALL_NEIGHBOR_CANCELLED);
+    update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!((fx.sim().data[0], fx.sim().temps[0]), (2, 77));
+    assert_eq!(panels.borrow().call_neighbor, 0);
+
+    // Kind 9: Pet Picker reads stack_object as a person; accept preserves world.dialogs.declined
+    // for Make New Character (`0x44b064`), cancel resets declined to -1.
+    for (accepted, expected_branch, idx, expected_declined) in [(true, 1, 9, 9), (false, 2, 4, -1)]
+    {
+        let mut fx = lot(asking(9, 0));
+        fx.lamp_mut().stack[0].stack_object = SIM as i16;
+        let panels = RefCell::new(SpecialPanels::default());
+        let mut player = ScriptedPlayer::new(
+            answers(&[]),
+            &[SpecialPanelResponse::Selection {
+                accepted,
+                index: idx,
+            }],
+        );
+        let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+        assert_eq!(
+            u1.special_panels_answered,
+            vec![(
+                SpecialPanelRequest::PetPicker { pet: SIM },
+                SpecialPanelResponse::Selection {
+                    accepted,
+                    index: idx
+                }
+            )]
+        );
+        update_with_panels(&mut fx, &panels, &mut player).unwrap();
+        assert_eq!(
+            (
+                fx.lamp().data[0],
+                fx.lamp().temps[0],
+                fx.world.dialogs.declined
+            ),
+            (expected_branch, idx, expected_declined)
+        );
+    }
+
+    // Kind 9 with non-person stack_object throws native error 0x1c.
+    let mut fx = lot(asking(9, 0));
+    fx.lamp_mut().stack[0].stack_object = LAMP as i16;
+    let panels = RefCell::new(SpecialPanels::default());
+    let err = update_with_panels(&mut fx, &panels, &mut answers(&[])).unwrap_err();
+    assert!(
+        matches!(err, TickError::Fault(f) if matches!(f.trap, Trap::Native { code: 0x1c, .. }))
+    );
+}
+
+#[test]
+fn special_dialog_reference_books_kind12_and_kind15_run_inline_on_same_tick() {
+    for (kind, expected_req) in [
+        (12, SpecialPanelRequest::SpellBook { caller: SIM }),
+        (15, SpecialPanelRequest::CookBook { caller: SIM }),
+    ] {
+        // Headless auto-dismiss completes on tick 1 without yielding!
+        let mut fx = person_lot(asking(kind, 0));
+        let panels = RefCell::new(SpecialPanels::default());
+        let mut player = ScriptedPlayer::new(answers(&[]), &[]);
+        let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+        assert_eq!(fx.sim().data[0], 1, "kind {kind} must take True on tick 1");
+        assert_eq!(
+            u1.special_panels_answered,
+            vec![(expected_req.clone(), SpecialPanelResponse::Dismissed)]
+        );
+
+        // Interactive (`wait_for_books = true`) pauses cleanly BEFORE play-mode recovery.
+        let mut fx = person_lot(asking(kind, 0));
+        let panels = RefCell::new(SpecialPanels::default());
+        let mut player = ScriptedPlayer {
+            answers: answers(&[]),
+            special_panels: std::collections::VecDeque::new(),
+            wait_for_books: true,
+        };
+        let mut play = Play::default();
+        let tuning = tuning();
+        let mut interp = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interp.special_panels = Some(&panels);
+        let (u, res) = interp.lot_update_kept(&mut fx.world, &tuning, &mut player, Some(&mut play));
+        assert!(
+            u.errors.is_empty(),
+            "kind {kind} pause must not trip play-mode recovery"
+        );
+        assert_eq!(
+            res,
+            Err(TickError::UnansweredSpecialPanel {
+                shown: ShownSpecialPanel {
+                    tick: 2,
+                    request: expected_req.clone(),
+                },
+                given: None,
+            })
+        );
+    }
+}
+
+#[test]
+fn special_panel_end_of_update_order_and_mutual_exclusion() {
+    // 0x4413e1..0x442320: Kind 10 (call_neighbor) falls through to Kind 5 (downtown_lot),
+    // which falls through to the mutually exclusive chain (8 -> 6 -> 14 -> 9 -> 7 -> 11 -> 13).
+    let mut fx = lot(sleeper());
+    fx.program.zoning.insert(58, 2);
+    let panels = RefCell::new(SpecialPanels {
+        call_neighbor: -7,
+        downtown_lot: -1,
+        old_town_lot: -1,
+        magic_lot: -1,
+        ..SpecialPanels::default()
+    });
+    let mut player = ScriptedPlayer::new(
+        answers(&[]),
+        &[
+            SpecialPanelResponse::Neighbor(Some(3)),
+            SpecialPanelResponse::Lot(Some(22)),
+            SpecialPanelResponse::Lot(Some(58)),
+            SpecialPanelResponse::Lot(Some(93)),
+        ],
+    );
+    // Tick 1 fires Kind 10, Kind 5, and Kind 8 (jumping past Kind 13!).
+    let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(
+        u1.special_panels_answered
+            .iter()
+            .map(|(r, _)| r.kind())
+            .collect::<Vec<_>>(),
+        vec![10, 5, 8]
+    );
+    assert_eq!(panels.borrow().magic_lot, -1);
+    // Tick 2 fires the remaining Kind 13!
+    let u2 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(
+        u2.special_panels_answered
+            .iter()
+            .map(|(r, _)| r.kind())
+            .collect::<Vec<_>>(),
+        vec![13]
+    );
+    assert_eq!(panels.borrow().magic_lot, 93);
 }

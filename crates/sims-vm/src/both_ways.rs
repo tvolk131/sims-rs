@@ -54,6 +54,8 @@ pub(crate) struct Cells {
     refreshing: Option<RefCell<Refreshing>>,
     taken_off: Option<RefCell<BTreeMap<u16, Pending>>>,
     coop: Option<RefCell<crate::coop::CoopVmContext>>,
+    special_panels: Option<RefCell<crate::primitives::dialog::SpecialPanels>>,
+    inline_special_panel: Option<RefCell<crate::primitives::dialog::InlineSpecialPanel>>,
 }
 
 /// A copy of what one cell holds.
@@ -125,6 +127,8 @@ impl Cells {
             refreshing: copy(interpreter.refreshing),
             taken_off: copy(interpreter.taken_off),
             coop: copy(interpreter.coop),
+            special_panels: copy(interpreter.special_panels),
+            inline_special_panel: copy(interpreter.inline_special_panel),
         }
     }
 
@@ -148,6 +152,8 @@ impl Cells {
             refreshing: self.refreshing.as_ref(),
             taken_off: self.taken_off.as_ref(),
             coop: self.coop.as_ref(),
+            special_panels: self.special_panels.as_ref(),
+            inline_special_panel: self.inline_special_panel.as_ref(),
             ..*interpreter
         }
     }
@@ -167,6 +173,8 @@ impl Cells {
             refreshing: copy(self.refreshing.as_ref()),
             taken_off: copy(self.taken_off.as_ref()),
             coop: copy(self.coop.as_ref()),
+            special_panels: copy(self.special_panels.as_ref()),
+            inline_special_panel: copy(self.inline_special_panel.as_ref()),
         }
     }
 
@@ -185,6 +193,12 @@ impl Cells {
             && self.same_refresh(other)
             && alike(&self.taken_off, &other.taken_off, PartialEq::eq)
             && alike(&self.coop, &other.coop, PartialEq::eq)
+            && alike(&self.special_panels, &other.special_panels, PartialEq::eq)
+            && alike(
+                &self.inline_special_panel,
+                &other.inline_special_panel,
+                PartialEq::eq,
+            )
     }
 
     /// Whether these cells hold the same refresh as `other`'s.
@@ -207,6 +221,8 @@ impl Cells {
         let deleting = take(interpreter.deleting);
         let taken_off = take(interpreter.taken_off);
         let coop = take(interpreter.coop);
+        let special_panels = take(interpreter.special_panels);
+        let inline_special_panel = take(interpreter.inline_special_panel);
         *world = lot;
         put(asked, self.asked);
         put(deleted, self.deleted);
@@ -221,6 +237,8 @@ impl Cells {
         put(deleting, self.deleting);
         put(taken_off, self.taken_off);
         put(coop, self.coop);
+        put(special_panels, self.special_panels);
+        put(inline_special_panel, self.inline_special_panel);
     }
 }
 
@@ -341,6 +359,8 @@ impl<'a> Machine<'a, '_> {
             default_character_name: self.default_character_name,
             active_family: self.active_family,
             coop: interpreter.coop,
+            special_panels: interpreter.special_panels,
+            inline_special_panel: interpreter.inline_special_panel,
         }
     }
 
@@ -454,6 +474,8 @@ mod tests {
             refreshing: None,
             taken_off: None,
             coop: None,
+            special_panels: None,
+            inline_special_panel: None,
         };
         let (nan, other_nan) = (0x7fc0_0001, 0x7fc0_0002);
         assert!(!cells(0, 0).same(&cells(0x8000_0000, 0)), "0.0 and -0.0");

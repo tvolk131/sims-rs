@@ -22,6 +22,9 @@
 //!   instance list if it has none (0x445857), and each of the first
 //!   instance's first six attributes becomes the larger of itself and the
 //!   family's word.
+//! - 14 (0x44fe22): write `temp[0]` (`object +0x3a`) into global 31 (`0x1f`,
+//!   via `0x46d9c4`, used by stereos/boom boxes to track the active station)
+//!   and take the true branch.
 //! - 15: the running object, which must be a person (else the original's
 //!   cast throws, error 0x1c), copies temp 0 (object +0x3a) into person
 //!   data word 72 and clears word 73 (0x44fe72 to 0x44fe7d). When temp 0
@@ -104,6 +107,21 @@ impl Machine<'_, '_> {
                     .ok_or_else(|| Trap::Invalid("object has no temps".into()))? = depth;
                 Ok(true)
             }
+            14 => {
+                // `0x44fe22..0x44fe37`: write `temp[0]` (`object +0x3a`) into
+                // global 31 (`0x1f`) via `0x46d9c4`, then take the true branch.
+                let value = *self
+                    .me()?
+                    .temps
+                    .first()
+                    .ok_or_else(|| Trap::Invalid("object has no temps".into()))?;
+                *self
+                    .world
+                    .globals
+                    .get_mut(31)
+                    .ok_or_else(|| Trap::Invalid("world has no global 31".into()))? = value;
+                Ok(true)
+            }
             15 => {
                 self.copy_temp_to_person()?;
                 Ok(true)
@@ -119,6 +137,19 @@ impl Machine<'_, '_> {
             }
             26 => {
                 self.controlled_family_info()?;
+                Ok(true)
+            }
+            35 => {
+                // `0x451142..0x4511a1`: casts caller to cXPerson (native error
+                // `0x1c` if not a person) and records it in registry `+0x10c`
+                // for Studio Town lot picker (Dialog kind 11, `0x441f94`) star-limo
+                // detection.
+                if self.me()?.person.is_none() {
+                    return Err(Trap::native(0x1c, "object is not a person"));
+                }
+                if let Some(panels) = self.special_panels {
+                    panels.borrow_mut().studio_caller = Some(self.me);
+                }
                 Ok(true)
             }
             routine => Err(Trap::Unsupported(format!(

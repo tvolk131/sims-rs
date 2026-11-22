@@ -709,6 +709,9 @@ struct CoopWorldFingerprintTail<'a> {
     view_rotation: u8,
     answered: bool,
     asking: Option<(u32, u16)>,
+    asking_special_panel: Option<(u32, u8)>,
+    special_panels: &'a crate::SpecialPanels,
+    special_panel_responses: &'a std::collections::VecDeque<crate::SpecialPanelResponse>,
     answers: &'a Answers,
     replay_view_rotation: Option<u8>,
     frames: &'a Frames,
@@ -2713,6 +2716,12 @@ impl Lot {
             view_rotation: effective_view_rotation,
             answered: self.answered,
             asking: self.asking.as_ref().map(|a| (a.shown.tick, a.shown.object)),
+            asking_special_panel: self
+                .asking_special_panel
+                .as_ref()
+                .map(|a| (a.shown.tick, a.shown.request.kind())),
+            special_panels: &self.special_panels,
+            special_panel_responses: &self.special_panel_responses,
             answers: &self.player,
             replay_view_rotation: self.replay_view.map(|(rot, _)| rot),
             frames: self.coop.as_ref().map_or(&self.frames, |c| &c.frames),
@@ -2912,6 +2921,9 @@ impl Lot {
         let backup_lot_description = self.lot_description.clone();
         let backup_halted = self.halted;
         let backup_asking = self.asking.clone();
+        let backup_asking_special_panel = self.asking_special_panel.clone();
+        let backup_special_panels = self.special_panels.clone();
+        let backup_special_panel_responses = self.special_panel_responses.clone();
         let backup_answered = self.answered;
         let backup_buy_undo = self.buy_undo.clone();
         let backup_buy_redo = self.buy_redo.clone();
@@ -3030,6 +3042,9 @@ impl Lot {
             self.lot_description = backup_lot_description;
             self.halted = backup_halted;
             self.asking = backup_asking;
+            self.asking_special_panel = backup_asking_special_panel;
+            self.special_panels = backup_special_panels;
+            self.special_panel_responses = backup_special_panel_responses;
             self.answered = backup_answered;
             self.buy_undo = backup_buy_undo;
             self.buy_redo = backup_buy_redo;
@@ -3615,6 +3630,9 @@ mod tests {
             asks: false,
             answered: false,
             asking: None,
+            asking_special_panel: None,
+            special_panels: crate::SpecialPanels::default(),
+            special_panel_responses: std::collections::VecDeque::new(),
             view_rotation: 0,
             floor_rotation: 0,
             view_centre: None,
