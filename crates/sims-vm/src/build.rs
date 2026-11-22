@@ -1827,9 +1827,65 @@ impl Interpreter<'_> {
         }
         // Re-validate live buildability/support for every tile gaining or
         // changing to a non-empty floor (rejecting stale plans after support
-        // below was removed).
-        for &(idx, _before, after) in &plan.floor_changes {
-            if after != 0 {
+        // below was removed, while always allowing full or half-tile removals).
+        let level_idx = usize::from(plan.level - 1);
+        let floor_after_map: BTreeMap<usize, (u16, u16)> = plan
+            .floor_changes
+            .iter()
+            .map(|&(idx, before, after)| (idx, (before, after)))
+            .collect();
+        let wall_after_map: BTreeMap<usize, ([u8; WALL_CELL], [u8; WALL_CELL])> = plan
+            .wall_changes
+            .iter()
+            .map(|&(idx, before, after)| (idx, (before, after)))
+            .collect();
+        let mut checked_tiles = BTreeSet::new();
+        for &(idx, _, _) in &plan.floor_changes {
+            checked_tiles.insert(idx);
+        }
+        for &(idx, _, _) in &plan.wall_changes {
+            checked_tiles.insert(idx);
+        }
+        for idx in checked_tiles {
+            let cur_floor = world
+                .arrays
+                .get(&FLOORS[level_idx])
+                .and_then(|f| f.data.get(idx * 2..idx * 2 + 2))
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .unwrap_or(0);
+            let (before_floor, after_floor) = floor_after_map
+                .get(&idx)
+                .copied()
+                .unwrap_or((cur_floor, cur_floor));
+            let laying = if after_floor == 0 {
+                false
+            } else if after_floor == SPLIT_FLOOR_ID {
+                let (before_w, after_w) = wall_after_map.get(&idx).copied().unwrap_or_else(|| {
+                    let mut raw = [0u8; WALL_CELL];
+                    if let Some(s) = world
+                        .arrays
+                        .get(&WALLS[level_idx])
+                        .and_then(|w| w.data.get(idx * WALL_CELL..idx * WALL_CELL + WALL_CELL))
+                    {
+                        raw.copy_from_slice(s);
+                    }
+                    (raw, raw)
+                });
+                let (bh0, bh1) = if before_floor == SPLIT_FLOOR_ID {
+                    (
+                        u16::from_le_bytes([before_w[2], before_w[3]]),
+                        u16::from_le_bytes([before_w[6], before_w[7]]),
+                    )
+                } else {
+                    (before_floor, before_floor)
+                };
+                let ah0 = u16::from_le_bytes([after_w[2], after_w[3]]);
+                let ah1 = u16::from_le_bytes([after_w[6], after_w[7]]);
+                (ah0 != bh0 && ah0 != 0) || (ah1 != bh1 && ah1 != 0)
+            } else {
+                after_floor != before_floor
+            };
+            if laying {
                 let x = idx / FULL_SIZE;
                 let y = idx % FULL_SIZE;
                 if !tile_supports_build(world, x, y, plan.level) {
@@ -1837,20 +1893,12 @@ impl Interpreter<'_> {
                 }
             }
         }
-        for &(idx, before, after) in &plan.wall_changes {
-            let h0_after = u16::from_le_bytes([after[2], after[3]]);
-            let h1_after = u16::from_le_bytes([after[6], after[7]]);
-            let h0_before = u16::from_le_bytes([before[2], before[3]]);
-            let h1_before = u16::from_le_bytes([before[6], before[7]]);
-            let laying_half = (h0_after != h0_before && h0_after != 0)
-                || (h1_after != h1_before && h1_after != 0);
-            if laying_half {
-                let x = idx / FULL_SIZE;
-                let y = idx % FULL_SIZE;
-                if !tile_supports_build(world, x, y, plan.level) {
-                    return Ok(None);
-                }
-            }
+        if plan.net_cost != 0 {
+            spend(world, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
+                object: 0,
+                at: None,
+                trap,
+            })?;
         }
         apply_cell_diffs(
             world,
@@ -1861,13 +1909,6 @@ impl Interpreter<'_> {
         )?;
         if plan.level == 2 {
             self.rebuild_architecture_rooms(world)?;
-        }
-        if plan.net_cost != 0 {
-            spend(world, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
-                object: 0,
-                at: None,
-                trap,
-            })?;
         }
         Ok(Some(BuildHistory::Floor {
             level: plan.level,
@@ -1891,7 +1932,6 @@ impl Interpreter<'_> {
         {
             return Ok(None);
         }
-        apply_cell_diffs(world, plan.level, &plan.wall_changes, &[], true)?;
         if plan.net_cost != 0 {
             spend(world, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
                 object: 0,
@@ -1899,6 +1939,7 @@ impl Interpreter<'_> {
                 trap,
             })?;
         }
+        apply_cell_diffs(world, plan.level, &plan.wall_changes, &[], true)?;
         Ok(Some(BuildHistory::Wallpaper {
             level: plan.level,
             wall_changes: plan.wall_changes.clone(),

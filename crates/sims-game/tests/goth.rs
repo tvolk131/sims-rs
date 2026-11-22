@@ -9301,11 +9301,12 @@ fn build_mode_walls_floors_wallpaper_doors_windows_and_undo_redo() {
             "Shift room-fill wallpaper must paint both faces of freestanding diagonal"
         );
 
-        // P2 #8: Budget write failure (`world.budget.days[0] = None`) must
-        // return `Err` instead of committing the edit without deducting funds.
+        // P2 #8 & Sol Round 2 P2 #2: Budget write failure (`world.budget.days[0] = None`)
+        // must return `Err` without mutating the world on direct `Interpreter` calls.
         {
             let mut bad_world = rlot.world().clone();
             bad_world.budget.days[0] = None;
+            let orig_floor_bytes = bad_world.arrays[&sims_sim::load::FLOORS[0]].data.clone();
             let f_plan = plan_floor_edit(
                 &bad_world,
                 [24, 38],
@@ -9322,6 +9323,55 @@ fn build_mode_walls_floors_wallpaper_doors_windows_and_undo_redo() {
             assert!(
                 interp.build_commit_floor(&mut bad_world, &f_plan).is_err(),
                 "budget write failure must propagate an error"
+            );
+            assert_eq!(
+                bad_world.arrays[&sims_sim::load::FLOORS[0]].data,
+                orig_floor_bytes,
+                "direct Interpreter floor commit must leave world unchanged on budget error"
+            );
+        }
+
+        // Sol Round 2 P2 #1: Removing half-flooring on a diagonal tile must
+        // succeed even if the tile is marked unbuildable (e.g. sloped/pool).
+        {
+            let mut diag_world = rlot.world().clone();
+            let lay0 = plan_floor_edit(
+                &diag_world,
+                [22, 38],
+                [22, 38],
+                1,
+                1,
+                FloorDragMode::Lay,
+                &prices,
+                Some(0),
+            );
+            let interp =
+                sims_vm::Interpreter::new(rlot.program(), rlot.catalog(), sims_vm::Stream::Global);
+            assert!(
+                interp
+                    .build_commit_floor(&mut diag_world, &lay0)
+                    .unwrap()
+                    .is_some()
+            );
+            // Mark tile [22, 38] as pool (unbuildable for laying, still removable).
+            diag_world.arrays.get_mut(&9).unwrap().data[22 * 64 + 38] = 0;
+            let rem0 = plan_floor_edit(
+                &diag_world,
+                [22, 38],
+                [22, 38],
+                1,
+                0,
+                FloorDragMode::Remove,
+                &prices,
+                Some(0),
+            );
+            assert!(rem0.valid);
+            assert!(
+                interp
+                    .build_commit_floor(&mut diag_world, &rem0)
+                    .unwrap()
+                    .is_some(),
+                "half-tile floor removal must succeed on unbuildable diagonal tile"
             );
         }
 
