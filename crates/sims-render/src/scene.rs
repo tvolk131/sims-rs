@@ -2,9 +2,9 @@
 
 use crate::assets::Assets;
 use crate::camera::{self, Camera, Walls, Zoom};
-use crate::canvas::Canvas;
 #[cfg(test)]
 use crate::canvas::Image;
+use crate::canvas::{Canvas, CanvasBand, Image as CanvasImage, RowSpans, clip_span, clip_x};
 use crate::caps::{self, Cap, Corners, Line, solid};
 use crate::cutaway::{self, Mask};
 use crate::depth::{Anchor, Depth};
@@ -237,6 +237,45 @@ pub fn draw_lot_with_preview_and_options(
     )
 }
 
+/// Draws the lot like [`draw_lot_with_preview_and_options`] using an explicit
+/// horizontal-band worker count (`bands.max(1)`), used by parity tests to prove
+/// 0-pixel-diff equivalence between single-threaded (`1`) and multi-threaded
+/// band rasterization.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn draw_lot_with_band_count(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    preview: Option<(u16, u16)>,
+    options: RenderOptions,
+    canvas: &mut Canvas,
+    bands: usize,
+) -> Stats {
+    let grass = Grass::new(lot, camera);
+    let held = holds_person(world);
+    paint_with_precomputed(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        preview,
+        options,
+        canvas,
+        Pass::Lot,
+        &grass,
+        held,
+        None,
+        None,
+        Some(bands.max(1)),
+        false,
+        |_, _| {},
+    )
+}
+
 /// Draws the objects [`draw_lot`] left out, over a canvas that holds the
 /// lot and then the people, each pixel tested against the depth there:
 /// the original's per-frame pass draws its moving objects after its
@@ -279,12 +318,14 @@ pub fn draw_held_with_options(
         Pass::Held,
         None,
         held,
+        Some(1),
     );
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
         let cut = cut(lot, camera, level, top, None);
         painter.objects(level, &cut);
     }
+    painter.flush_commands();
     painter.stats
 }
 
@@ -331,6 +372,8 @@ fn paint(
         held,
         None,
         None,
+        None,
+        false,
         |_, _| {},
     )
 }
@@ -365,6 +408,8 @@ pub(crate) fn paint_lot_with_env_hook(
         held,
         cut_mask,
         level1_openings,
+        None,
+        true,
         after_level1_env,
     )
 }
@@ -399,6 +444,7 @@ pub(crate) fn paint_lot_from_env(
         Pass::Lot,
         None,
         held,
+        None,
     );
     painter.stats = env_stats;
     let top = camera.level.clamp(1, 2);
@@ -412,6 +458,7 @@ pub(crate) fn paint_lot_from_env(
         painter.trims(2, &corners2);
         painter.objects(2, &cut2);
     }
+    painter.flush_commands();
     painter.stats
 }
 
@@ -430,6 +477,8 @@ fn paint_with_precomputed(
     held: BTreeSet<u16>,
     cut_mask: Option<&Mask>,
     level1_openings: Option<&BTreeMap<Edge, (usize, u16)>>,
+    band_override: Option<usize>,
+    flush_for_env_hook: bool,
     mut after_level1_env: impl FnMut(&Canvas, Stats),
 ) -> Stats {
     let time_of_day = world.globals.get(4).copied().unwrap_or(lot.time_of_day);
@@ -447,6 +496,7 @@ fn paint_with_precomputed(
         pass,
         Some(grass),
         held,
+        band_override,
     );
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
@@ -461,11 +511,13 @@ fn paint_with_precomputed(
             painter.walls(level, &cut, &corners);
         }
         painter.trims(level, &corners);
-        if level == 1 {
+        if level == 1 && flush_for_env_hook {
+            painter.flush_commands();
             after_level1_env(painter.canvas, painter.stats);
         }
         painter.objects(level, &cut);
     }
+    painter.flush_commands();
     painter.stats
 }
 
@@ -737,6 +789,566 @@ fn wall_side(s: &Segment, side: usize) -> [i32; 2] {
     [0, 1].map(|i| (s.from[i] + s.to[i]) * 8 + sign * s.normal[i])
 }
 
+#[derive(Clone, Copy)]
+enum SpriteRef {
+    Floor(u16, usize),
+    PoolTile(u8, usize),
+    PoolCorner(u8, usize),
+    Water(u8, usize),
+    Pattern(u16, usize, u8),
+    Shape(u16, bool, usize, u8),
+    ObjectShape(usize, u16, bool, usize, u8),
+    Trim(bool, usize, u16),
+    GroupPart(usize, u16, u32, usize, usize),
+}
+
+impl SpriteRef {
+    fn resolve(self, assets: &Assets) -> Option<(&CanvasImage, &RowSpans)> {
+        match self {
+            SpriteRef::Floor(id, zoom) => assets.floor_cached(id, zoom),
+            SpriteRef::PoolTile(mask, zoom) => assets.pool_tile_cached(mask, zoom),
+            SpriteRef::PoolCorner(corner, zoom) => assets.pool_corner_cached(corner, zoom),
+            SpriteRef::Water(mask, zoom) => assets.water_tile_cached(mask, zoom),
+            SpriteRef::Pattern(id, zoom, frame) => assets.pattern_cached(id, zoom, frame as usize),
+            SpriteRef::Shape(style, cut, zoom, frame) => {
+                assets.shape_cached(style, cut, zoom, frame as usize)
+            }
+            SpriteRef::ObjectShape(res, ws, cut, zoom, frame) => {
+                assets.object_shape_cached(res, ws, cut, zoom, frame as usize)
+            }
+            SpriteRef::Trim(cut, zoom, frame) => assets.trim_cached(cut, zoom, frame as usize),
+            SpriteRef::GroupPart(res, group, dir, zoom, idx) => {
+                assets.group_part_cached(res, group, dir, zoom, idx)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RowLight {
+    Flat(Light),
+    FloorPools {
+        base: u32,
+        zoom: usize,
+        origins: [Option<[i32; 2]>; 2],
+        offset: [i32; 2],
+    },
+}
+
+#[derive(Clone, Copy)]
+enum RowDepthMode {
+    Floor {
+        base_d: i32,
+        first_row: i32,
+    },
+    FlatTrim {
+        view: [i32; 2],
+        ground: i32,
+        level: i32,
+        flat_offset: i32,
+        top_y: i32,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum WallLight {
+    Flat(Light),
+    WallPools {
+        base: u32,
+        zoom: usize,
+        along_y: bool,
+        rise: i64,
+        lamps: [Option<(i32, usize)>; 2],
+    },
+}
+
+#[derive(Clone, Copy)]
+enum WallDepthMode {
+    Straight {
+        anchor: Anchor,
+        first: i32,
+        sprite_left: i32,
+    },
+    Diagonal {
+        anchor: Anchor,
+        edge_on: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum SpriteShading {
+    Flat(Light),
+    Blocked,
+}
+
+#[derive(Clone, Copy)]
+enum PixelDepthMode {
+    Flat(i32),
+    Sprite(Anchor),
+    Trim { anchor: Anchor, left: i32 },
+}
+
+enum DrawCmdKind {
+    GrassTile {
+        view: [i32; 2],
+        heights: [u8; 4],
+        shades: [u8; 4],
+        colors: [u8; 4],
+        left: i32,
+        bottom: i32,
+        zoom: u32,
+        depth: i32,
+        depth_clamped: i32,
+        clip_bottom: i32,
+    },
+    TerrainGrid {
+        left: i32,
+        y_left: i32,
+        y_top: i32,
+        y_right: i32,
+        half_w: i32,
+        step: i32,
+        mask: u8,
+        clip_bottom: i32,
+    },
+    RowDepthSprite {
+        sprite: SpriteRef,
+        at: [i32; 2],
+        columns: Option<[i32; 2]>,
+        sub_rect: Option<[usize; 4]>,
+        clip_bottom: Option<i32>,
+        light: RowLight,
+        depth: RowDepthMode,
+    },
+    WaterOverlay {
+        sprite: SpriteRef,
+        at: [i32; 2],
+        clip_bottom: i32,
+        light: Light,
+        water_base: i32,
+        first_row: i32,
+    },
+    ShadowMask {
+        zoom: usize,
+        code: u8,
+        at: [i32; 2],
+        strength: i32,
+        base_d: i32,
+        first_row: i32,
+    },
+    MaskedWall {
+        pattern: SpriteRef,
+        mask: SpriteRef,
+        at: [i32; 2],
+        columns: Option<[i32; 2]>,
+        light: WallLight,
+        depth: WallDepthMode,
+    },
+    DepthSprite {
+        sprite: SpriteRef,
+        at: [i32; 2],
+        flip: bool,
+        slack: i32,
+        columns: Option<[i32; 2]>,
+        pen: Option<u16>,
+        shading: SpriteShading,
+        depth: PixelDepthMode,
+    },
+}
+
+struct DrawCmd {
+    y0: usize,
+    y1: usize,
+    kind: DrawCmdKind,
+}
+
+enum ResolvedCmdKind<'a> {
+    GrassTile {
+        view: [i32; 2],
+        heights: [u8; 4],
+        shades: [u8; 4],
+        colors: [u8; 4],
+        left: i32,
+        bottom: i32,
+        zoom: u32,
+        depth: i32,
+        depth_clamped: i32,
+        clip_bottom: i32,
+    },
+    TerrainGrid {
+        left: i32,
+        y_left: i32,
+        y_top: i32,
+        y_right: i32,
+        half_w: i32,
+        step: i32,
+        mask: u8,
+        clip_bottom: i32,
+    },
+    RowDepthSprite {
+        image: &'a CanvasImage,
+        spans: &'a RowSpans,
+        at: [i32; 2],
+        columns: Option<[i32; 2]>,
+        sub_rect: Option<[usize; 4]>,
+        clip_bottom: Option<i32>,
+        light: RowLight,
+        depth: RowDepthMode,
+    },
+    WaterOverlay {
+        image: &'a CanvasImage,
+        spans: &'a RowSpans,
+        at: [i32; 2],
+        clip_bottom: i32,
+        light: Light,
+        water_base: i32,
+        first_row: i32,
+    },
+    ShadowMask {
+        mask: &'a crate::shadows::Mask,
+        at: [i32; 2],
+        strength: i32,
+        base_d: i32,
+        first_row: i32,
+    },
+    MaskedWall {
+        pattern: &'a CanvasImage,
+        pat_spans: &'a RowSpans,
+        mask: &'a CanvasImage,
+        mask_spans: &'a RowSpans,
+        at: [i32; 2],
+        columns: Option<[i32; 2]>,
+        light: ResolvedWallLight<'a>,
+        depth: WallDepthMode,
+    },
+    DepthSprite {
+        image: &'a CanvasImage,
+        spans: &'a RowSpans,
+        at: [i32; 2],
+        flip: bool,
+        slack: i32,
+        columns: Option<[i32; 2]>,
+        pen: Option<u16>,
+        shading: SpriteShading,
+        depth: PixelDepthMode,
+    },
+}
+
+enum ResolvedWallLight<'a> {
+    Flat(Light),
+    WallPools {
+        base: u32,
+        rise: i64,
+        pools: [Option<pools::WallPoolRef<'a>>; 2],
+    },
+}
+
+struct ResolvedCmd<'a> {
+    y0: usize,
+    y1: usize,
+    kind: ResolvedCmdKind<'a>,
+}
+
+const MAX_BAND_WORKERS: usize = 8;
+
+fn default_band_count(width: usize, height: usize, cmd_count: usize) -> usize {
+    if height < 128 || width.saturating_mul(height) < 64 * 64 || cmd_count < 32 {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, MAX_BAND_WORKERS)
+}
+
+fn rasterize_band(
+    band: &mut CanvasBand<'_>,
+    cmds: &[ResolvedCmd<'_>],
+    depth_table: &Depth,
+    pools: Option<&Pools>,
+    grass: Option<&Grass>,
+) {
+    let by0 = band.y0;
+    let by1 = band.y1;
+    for cmd in cmds {
+        if cmd.y1 <= by0 || cmd.y0 >= by1 {
+            continue;
+        }
+        match &cmd.kind {
+            ResolvedCmdKind::GrassTile {
+                view,
+                heights,
+                shades,
+                colors,
+                left,
+                bottom,
+                zoom,
+                depth,
+                depth_clamped,
+                clip_bottom,
+            } => {
+                let Some(grass) = grass else {
+                    continue;
+                };
+                let canvas_w = i64::try_from(band.width).unwrap_or(i64::MAX);
+                let by0_i32 = by0 as i32;
+                let by1_i32 = by1 as i32;
+                grass::for_each_column(
+                    *left,
+                    *bottom,
+                    *heights,
+                    *shades,
+                    *colors,
+                    *zoom,
+                    |column| {
+                        if i64::from(column.x) + 4 <= 0 || i64::from(column.x) >= canvas_w {
+                            return;
+                        }
+                        let clipped = column.clipped(0, *clip_bottom);
+                        for (row, pixels) in clipped.rows_rgb_in_band(by0_i32, by1_i32) {
+                            band.plot_grass_span(column.x, row, *depth, *depth_clamped, pixels);
+                        }
+                        let index = ((column.x - *left) / 4) as usize;
+                        grass.for_each_blade(*view, &column, index, |bx, foot, height, color| {
+                            let top = foot.saturating_sub(height - 1).max(0);
+                            let bottom = foot.min(*clip_bottom - 1);
+                            if bottom >= by0_i32 && top < by1_i32 {
+                                band.plot_grass_blade(
+                                    bx,
+                                    top,
+                                    bottom,
+                                    *depth,
+                                    *depth_clamped,
+                                    color,
+                                );
+                            }
+                        });
+                    },
+                );
+            }
+            ResolvedCmdKind::TerrainGrid {
+                left,
+                y_left,
+                y_top,
+                y_right,
+                half_w,
+                step,
+                mask,
+                clip_bottom,
+            } => {
+                let by0_i32 = by0 as i32;
+                let by1_i32 = (by1 as i32).min(*clip_bottom);
+                if (*mask & 1) != 0 {
+                    let dy = y_top.wrapping_sub(*y_left).wrapping_shl(16) / *half_w;
+                    let mut y_fp = y_left.wrapping_shl(16);
+                    let mut px = *left;
+                    while px < *left + *half_w {
+                        let py = y_fp >> 16;
+                        if py >= by0_i32 && py < by1_i32 {
+                            band.plot_color(px, py, [0, 0, 0]);
+                        }
+                        px = px.wrapping_add(*step);
+                        y_fp = y_fp.wrapping_add(dy.wrapping_mul(*step));
+                    }
+                }
+                if (*mask & 2) != 0 {
+                    let dy = y_right.wrapping_sub(*y_top).wrapping_shl(16) / *half_w;
+                    let mut y_fp = y_top.wrapping_shl(16);
+                    let mut px = *left + *half_w;
+                    while px < *left + *half_w * 2 {
+                        let py = y_fp >> 16;
+                        if py >= by0_i32 && py < by1_i32 {
+                            band.plot_color(px, py, [0, 0, 0]);
+                        }
+                        px = px.wrapping_add(*step);
+                        y_fp = y_fp.wrapping_add(dy.wrapping_mul(*step));
+                    }
+                }
+            }
+            ResolvedCmdKind::RowDepthSprite {
+                image,
+                spans,
+                at,
+                columns,
+                sub_rect,
+                clip_bottom,
+                light,
+                depth,
+            } => {
+                let row_depth = |sy: i32| match *depth {
+                    RowDepthMode::Floor { base_d, first_row } => {
+                        depth_table.floor_row(base_d, first_row, sy)
+                    }
+                    RowDepthMode::FlatTrim {
+                        view,
+                        ground,
+                        level,
+                        flat_offset,
+                        top_y,
+                    } => depth_table.flat(view, ground, level, flat_offset, top_y, sy),
+                };
+                match *light {
+                    RowLight::Flat(flat_light) => {
+                        band.blit_row_depth_flat(
+                            image,
+                            spans,
+                            *at,
+                            flat_light,
+                            *columns,
+                            *sub_rect,
+                            *clip_bottom,
+                            None,
+                            row_depth,
+                        );
+                    }
+                    RowLight::FloorPools {
+                        base,
+                        zoom,
+                        origins,
+                        offset,
+                    } => {
+                        if let Some(pools) = pools {
+                            band.blit_row_depth_shaded(
+                                image,
+                                spans,
+                                *at,
+                                |ix, iy| {
+                                    let mut sum = base;
+                                    for o in origins.into_iter().flatten() {
+                                        sum += u32::from(pools.at(
+                                            zoom,
+                                            o[0] + offset[0] + ix as i32,
+                                            o[1] + offset[1] + iy as i32,
+                                        ));
+                                    }
+                                    Light::from_sum(sum)
+                                },
+                                *columns,
+                                *sub_rect,
+                                *clip_bottom,
+                                None,
+                                row_depth,
+                            );
+                        }
+                    }
+                }
+            }
+            ResolvedCmdKind::WaterOverlay {
+                image,
+                spans,
+                at,
+                clip_bottom,
+                light,
+                water_base,
+                first_row,
+            } => {
+                band.draw_water_overlay(image, spans, *at, *clip_bottom, *light, None, |sy| {
+                    depth_table.floor_row(*water_base, *first_row, sy)
+                });
+            }
+            ResolvedCmdKind::ShadowMask {
+                mask,
+                at,
+                strength,
+                base_d,
+                first_row,
+            } => {
+                band.shade_mask(mask, *at, *strength, |row| {
+                    depth_table
+                        .floor_row(*base_d, *first_row, row)
+                        .saturating_sub(65)
+                });
+            }
+            ResolvedCmdKind::MaskedWall {
+                pattern,
+                pat_spans,
+                mask,
+                mask_spans,
+                at,
+                columns,
+                light,
+                depth,
+            } => {
+                let depth_fn = |sx: i32, sy: i32| match *depth {
+                    WallDepthMode::Straight {
+                        anchor,
+                        first,
+                        sprite_left,
+                    } => depth_table.wall(anchor, sy, first, sx.saturating_sub(sprite_left)),
+                    WallDepthMode::Diagonal { anchor, edge_on } => {
+                        depth_table.diagonal(anchor, sy, edge_on)
+                    }
+                };
+                match *light {
+                    ResolvedWallLight::Flat(plain) => {
+                        band.draw_wall_masked_flat(
+                            pattern, pat_spans, mask, mask_spans, *at, *columns, plain, None,
+                            depth_fn,
+                        );
+                    }
+                    ResolvedWallLight::WallPools {
+                        base,
+                        rise,
+                        pools: wall_pools,
+                    } => {
+                        band.draw_wall_masked_shaded(
+                            pattern,
+                            pat_spans,
+                            mask,
+                            mask_spans,
+                            *at,
+                            *columns,
+                            |x, y| {
+                                let mut sum = base;
+                                let py = y as i64 - rise;
+                                for p in wall_pools.into_iter().flatten() {
+                                    sum += u32::from(p.at(x as i64, py));
+                                }
+                                Light::from_sum(sum)
+                            },
+                            None,
+                            depth_fn,
+                        );
+                    }
+                }
+            }
+            ResolvedCmdKind::DepthSprite {
+                image,
+                spans,
+                at,
+                flip,
+                slack,
+                columns,
+                pen,
+                shading,
+                depth,
+            } => {
+                let depth_fn = |sx: i32, sy: i32, byte: u8| match *depth {
+                    PixelDepthMode::Flat(d) => Some(d),
+                    PixelDepthMode::Sprite(anchor) => depth_table.sprite(anchor, byte),
+                    PixelDepthMode::Trim { anchor, left } => {
+                        depth_table.trim(anchor, sy, sx.saturating_sub(left), byte)
+                    }
+                };
+                match *shading {
+                    SpriteShading::Flat(light) => {
+                        band.blit_depth_sprite_flat(
+                            image, spans, *at, *flip, light, *slack, *columns, *pen, depth_fn,
+                        );
+                    }
+                    SpriteShading::Blocked => {
+                        band.blit_depth_sprite_tinted(
+                            image, spans, *at, *flip, *slack, *columns, *pen, depth_fn,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+type ObjectEntry<'a> = (Anchor, [i32; 2], u16, &'a Object, [f32; 3], [i32; 2], bool);
+
 struct Painter<'a> {
     pass: Pass,
     /// The objects that hold a person, for passes other than `All`.
@@ -757,6 +1369,9 @@ struct Painter<'a> {
     grass: Option<&'a Grass>,
     depth: Depth,
     stats: Stats,
+    band_override: Option<usize>,
+    commands: Vec<DrawCmd>,
+    object_scratch: Vec<ObjectEntry<'a>>,
 }
 
 impl<'a> Painter<'a> {
@@ -773,6 +1388,7 @@ impl<'a> Painter<'a> {
         pass: Pass,
         grass: Option<&'a Grass>,
         held: BTreeSet<u16>,
+        band_override: Option<usize>,
     ) -> Self {
         let clip_bottom = (viewport.1 as usize).min(canvas.height) as i32;
         Painter {
@@ -789,7 +1405,261 @@ impl<'a> Painter<'a> {
             grass,
             depth: Depth::new(camera),
             stats: Stats::default(),
+            band_override,
+            commands: Vec::with_capacity(512),
+            object_scratch: Vec::new(),
         }
+    }
+
+    fn flush_commands(&mut self) {
+        if self.commands.is_empty() {
+            return;
+        }
+        if self.canvas.width == 0 || self.canvas.height == 0 {
+            self.commands.clear();
+            return;
+        }
+        let assets: &Assets = self.assets;
+        let pools = assets.pools();
+        let mut resolved = Vec::with_capacity(self.commands.len());
+        for cmd in self.commands.drain(..) {
+            let kind = match cmd.kind {
+                DrawCmdKind::GrassTile {
+                    view,
+                    heights,
+                    shades,
+                    colors,
+                    left,
+                    bottom,
+                    zoom,
+                    depth,
+                    depth_clamped,
+                    clip_bottom,
+                } => ResolvedCmdKind::GrassTile {
+                    view,
+                    heights,
+                    shades,
+                    colors,
+                    left,
+                    bottom,
+                    zoom,
+                    depth,
+                    depth_clamped,
+                    clip_bottom,
+                },
+                DrawCmdKind::TerrainGrid {
+                    left,
+                    y_left,
+                    y_top,
+                    y_right,
+                    half_w,
+                    step,
+                    mask,
+                    clip_bottom,
+                } => ResolvedCmdKind::TerrainGrid {
+                    left,
+                    y_left,
+                    y_top,
+                    y_right,
+                    half_w,
+                    step,
+                    mask,
+                    clip_bottom,
+                },
+                DrawCmdKind::RowDepthSprite {
+                    sprite,
+                    at,
+                    columns,
+                    sub_rect,
+                    clip_bottom,
+                    light,
+                    depth,
+                } => {
+                    let Some((image, spans)) = sprite.resolve(assets) else {
+                        continue;
+                    };
+                    ResolvedCmdKind::RowDepthSprite {
+                        image,
+                        spans,
+                        at,
+                        columns,
+                        sub_rect,
+                        clip_bottom,
+                        light,
+                        depth,
+                    }
+                }
+                DrawCmdKind::WaterOverlay {
+                    sprite,
+                    at,
+                    clip_bottom,
+                    light,
+                    water_base,
+                    first_row,
+                } => {
+                    let Some((image, spans)) = sprite.resolve(assets) else {
+                        continue;
+                    };
+                    ResolvedCmdKind::WaterOverlay {
+                        image,
+                        spans,
+                        at,
+                        clip_bottom,
+                        light,
+                        water_base,
+                        first_row,
+                    }
+                }
+                DrawCmdKind::ShadowMask {
+                    zoom,
+                    code,
+                    at,
+                    strength,
+                    base_d,
+                    first_row,
+                } => {
+                    let Some(mask) = assets.shadow_mask_cached(zoom, code) else {
+                        continue;
+                    };
+                    ResolvedCmdKind::ShadowMask {
+                        mask,
+                        at,
+                        strength,
+                        base_d,
+                        first_row,
+                    }
+                }
+                DrawCmdKind::MaskedWall {
+                    pattern,
+                    mask,
+                    at,
+                    columns,
+                    light,
+                    depth,
+                } => {
+                    let (Some((pat, pat_spans)), Some((msk, mask_spans))) =
+                        (pattern.resolve(assets), mask.resolve(assets))
+                    else {
+                        continue;
+                    };
+                    let light = match light {
+                        WallLight::Flat(plain) => ResolvedWallLight::Flat(plain),
+                        WallLight::WallPools {
+                            base,
+                            zoom,
+                            along_y,
+                            rise,
+                            lamps,
+                        } => {
+                            let resolved_pools = lamps.map(|item| {
+                                let (along, dist) = item?;
+                                pools?.wall_ref(along_y, zoom, along, dist)
+                            });
+                            ResolvedWallLight::WallPools {
+                                base,
+                                rise,
+                                pools: resolved_pools,
+                            }
+                        }
+                    };
+                    ResolvedCmdKind::MaskedWall {
+                        pattern: pat,
+                        pat_spans,
+                        mask: msk,
+                        mask_spans,
+                        at,
+                        columns,
+                        light,
+                        depth,
+                    }
+                }
+                DrawCmdKind::DepthSprite {
+                    sprite,
+                    at,
+                    flip,
+                    slack,
+                    columns,
+                    pen,
+                    shading,
+                    depth,
+                } => {
+                    let Some((image, spans)) = sprite.resolve(assets) else {
+                        continue;
+                    };
+                    ResolvedCmdKind::DepthSprite {
+                        image,
+                        spans,
+                        at,
+                        flip,
+                        slack,
+                        columns,
+                        pen,
+                        shading,
+                        depth,
+                    }
+                }
+            };
+            resolved.push(ResolvedCmd {
+                y0: cmd.y0,
+                y1: cmd.y1,
+                kind,
+            });
+        }
+        if resolved.is_empty() {
+            return;
+        }
+        let num_bands = self
+            .band_override
+            .map(|b| b.clamp(1, MAX_BAND_WORKERS))
+            .unwrap_or_else(|| {
+                default_band_count(self.canvas.width, self.canvas.height, resolved.len())
+            });
+        let depth_table = &self.depth;
+        let grass = self.grass;
+        let mut bands = self.canvas.split_bands(num_bands);
+        if bands.len() <= 1 {
+            if let Some(band) = bands.first_mut() {
+                rasterize_band(band, &resolved, depth_table, pools, grass);
+            }
+        } else {
+            let cmds = &resolved;
+            let mut iter = bands.into_iter();
+            let Some(mut first) = iter.next() else {
+                return;
+            };
+            let rest_slots: Vec<std::sync::Mutex<Option<CanvasBand<'_>>>> =
+                iter.map(|b| std::sync::Mutex::new(Some(b))).collect();
+            std::thread::scope(|scope| {
+                let mut fallback = Vec::new();
+                for (i, slot) in rest_slots.iter().enumerate() {
+                    if std::thread::Builder::new()
+                        .spawn_scoped(scope, move || {
+                            if let Some(mut band) =
+                                slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+                            {
+                                rasterize_band(&mut band, cmds, depth_table, pools, grass);
+                            }
+                        })
+                        .is_err()
+                    {
+                        fallback.push(i);
+                    }
+                }
+                rasterize_band(&mut first, cmds, depth_table, pools, grass);
+                for i in fallback {
+                    if let Some(mut band) = rest_slots[i]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    {
+                        rasterize_band(&mut band, cmds, depth_table, pools, grass);
+                    }
+                }
+            });
+        }
+        self.canvas.rasterize_partial_tail_row(|band| {
+            rasterize_band(band, &resolved, depth_table, pools, grass);
+        });
     }
 
     /// The elevation of a lot corner in near-zoom pixels: 16 per terrain
@@ -832,17 +1702,16 @@ impl<'a> Painter<'a> {
         })
     }
 
-    /// The pools of light on a straight wall face along view y
-    /// (`along_y`) or x from the lamps marked on lot tile `[x, y]`, the
-    /// one on its seen side, borrowed directly from `pools` without copying.
-    fn wall_pools_ref<'p>(
+    /// Returns `(along, dist)` lamp table keys for a straight wall face along
+    /// view y (`along_y`) or x from the lamps marked on lot tile `[x, y]`.
+    fn wall_lamp_coords(
         lot: &Lot,
         camera: &Camera,
-        pools: Option<&'p Pools>,
+        pools: Option<&Pools>,
         level: usize,
         along_y: bool,
         [x, y]: [i32; 2],
-    ) -> [Option<pools::WallPoolRef<'p>>; 2] {
+    ) -> [Option<(i32, usize)>; 2] {
         let Some(pools) = pools else {
             return [None, None];
         };
@@ -859,9 +1728,9 @@ impl<'a> Painter<'a> {
         for lamp in record.0.into_iter().flatten() {
             let offset = rotate_direction(camera.rotation, lamp.map(i32::from));
             if let Some((along, dist)) = pools::wall_lamp(along_y, offset)
-                && let Some(pool) = pools.wall_ref(along_y, zoom, along, dist)
+                && pools.wall_ref(along_y, zoom, along, dist).is_some()
             {
-                out[count] = Some(pool);
+                out[count] = Some((along, dist));
                 count += 1;
             }
         }
@@ -920,18 +1789,22 @@ impl<'a> Painter<'a> {
         }
         let index = (level - 1) as usize;
         let zoom = self.camera.zoom.index();
+        // Constant rotation-indexed top corner offset (the corner with minimum
+        // rotated `v[0] + v[1]` is strictly invariant across all tiles).
+        let top_offset = match self.camera.rotation & 3 {
+            1 => [0, 1],
+            2 => [1, 1],
+            3 => [1, 0],
+            _ => [0, 0],
+        };
+        let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+        let canvas_w_wide = wide(self.canvas.width);
+        let canvas_h_wide = wide(self.canvas.height);
         for x in 0..self.lot.size as i32 {
             for y in 0..self.lot.size as i32 {
                 let cell = Lot::cell(x as usize, y as usize);
                 let floor = self.lot.levels[index].floors[cell];
-                // The tile's top corner in the view.
-                let top = [[x, y], [x + 1, y], [x + 1, y + 1], [x, y + 1]]
-                    .into_iter()
-                    .min_by_key(|&c| {
-                        let v = self.rotate_corner(c);
-                        v[0] + v[1]
-                    })
-                    .unwrap_or([x, y]);
+                let top = [x + top_offset[0], y + top_offset[1]];
                 let p = self.corner_screen(top, level);
                 let (view, height) = (self.rotate_corner(top), self.corner_elevation(top) / 16);
                 if floor == 0 {
@@ -963,21 +1836,36 @@ impl<'a> Painter<'a> {
                     let Some((image, pools)) = self.assets.floor_with_pools(id, zoom) else {
                         continue;
                     };
-                    let at = [p[0] - image.width as i32 / 2, p[1]];
-                    let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+                    let img_w = image.width;
+                    let img_h = image.height;
+                    let has_pools = pools.is_some();
+                    let at = [p[0] - img_w as i32 / 2, p[1]];
                     let ax = i64::from(at[0]);
                     let ay = i64::from(at[1]);
-                    if ax.saturating_add(wide(image.width)) <= 0
-                        || ax >= wide(self.canvas.width)
-                        || ay.saturating_add(wide(image.height)) <= 0
-                        || ay >= wide(self.canvas.height)
+                    if ax.saturating_add(wide(img_w)) <= 0
+                        || ax >= canvas_w_wide
+                        || ay.saturating_add(wide(img_h)) <= 0
+                        || ay >= canvas_h_wide
                     {
                         self.stats.floors += 1;
                         continue;
                     }
-                    let sub_rect = (floor == lot::SPLIT_FLOOR).then(|| {
-                        split_half_rect(self.camera, image.width, image.height, wall.segments, half)
-                    });
+                    let sub_rect = (floor == lot::SPLIT_FLOOR)
+                        .then(|| split_half_rect(self.camera, img_w, img_h, wall.segments, half));
+                    let (mut y0, mut y1, ay_clip) = clip_span(at[1], img_h, self.canvas.height);
+                    if let Some([ix0, iy0, ix1, iy1]) = sub_rect {
+                        if ix0 >= ix1 || iy0 >= iy1 {
+                            self.stats.floors += 1;
+                            continue;
+                        }
+                        let lim_y = canvas_h_wide;
+                        y0 = y0.max(ay_clip.saturating_add(wide(iy0)).clamp(0, lim_y) as usize);
+                        y1 = y1.min(ay_clip.saturating_add(wide(iy1)).clamp(0, lim_y) as usize);
+                    }
+                    if y0 >= y1 {
+                        self.stats.floors += 1;
+                        continue;
+                    }
                     // A point inside the half, for its room's light.
                     let inside = match (floor == lot::SPLIT_FLOOR, wall.segments, half) {
                         (false, _, _) => [8, 8],
@@ -994,39 +1882,34 @@ impl<'a> Painter<'a> {
                     } else {
                         [None; 2]
                     };
-                    let depth = &self.depth;
-                    let (base_d, first_row) = depth.floor_base(view, height, level, at[1]);
-                    let row_depth = |y| depth.floor_row(base_d, first_row, y);
-                    match (Light::drawn_byte(byte, self.lot.brightest()), pools) {
+                    let (base_d, first_row) = self.depth.floor_base(view, height, level, at[1]);
+                    let light = match (Light::drawn_byte(byte, self.lot.brightest()), has_pools) {
                         // A room in full light shows no pools (0x4c83d4).
-                        (Some(base), Some(pools)) if lamps.iter().any(Option::is_some) => {
+                        (Some(base), true) if lamps.iter().any(Option::is_some) => {
                             let tile = self.camera.zoom.tile_width();
                             let origins = lamps.map(|lamp| lamp.map(|a| Pools::origin(tile, a)));
-                            let light = |ix: usize, iy: usize| {
-                                let mut sum = base;
-                                for o in origins.into_iter().flatten() {
-                                    sum += u32::from(pools.at(
-                                        zoom,
-                                        o[0] + ix as i32,
-                                        o[1] + iy as i32,
-                                    ));
-                                }
-                                Light::from_sum(sum)
-                            };
-                            self.canvas
-                                .draw_floor_shaded(image, at, sub_rect, light, row_depth);
+                            RowLight::FloorPools {
+                                base,
+                                zoom,
+                                origins,
+                                offset: [0, 0],
+                            }
                         }
-                        _ => {
-                            let flat_light = Light::from_byte(byte, self.lot.brightest());
-                            self.canvas.draw_floor_shaded(
-                                image,
-                                at,
-                                sub_rect,
-                                |_, _| flat_light,
-                                row_depth,
-                            );
-                        }
-                    }
+                        _ => RowLight::Flat(Light::from_byte(byte, self.lot.brightest())),
+                    };
+                    self.commands.push(DrawCmd {
+                        y0,
+                        y1,
+                        kind: DrawCmdKind::RowDepthSprite {
+                            sprite: SpriteRef::Floor(id, zoom),
+                            at,
+                            columns: None,
+                            sub_rect,
+                            clip_bottom: None,
+                            light,
+                            depth: RowDepthMode::Floor { base_d, first_row },
+                        },
+                    });
                     self.stats.floors += 1;
                 }
                 if level == 1 {
@@ -1062,46 +1945,57 @@ impl<'a> Painter<'a> {
         };
         let tile_px = self.camera.zoom.tile_width();
         let brightest = self.lot.brightest();
-        let depth = &self.depth;
-        let (base_d, first_row) = depth.floor_base(view, height, 1, at[1]);
-        let main = if rot_val < 0x10 {
-            self.assets.pool_tile_with_pools(rot_val, zoom)
-        } else {
-            self.assets.floor_with_pools(12, zoom)
-        };
+        let (base_d, first_row) = self.depth.floor_base(view, height, 1, at[1]);
         let clip_bottom = self.clip_bottom;
-        if let Some((image, pools)) = main {
-            let row_depth = |sy| depth.floor_row(base_d, first_row, sy);
-            match (Light::drawn_byte(byte, brightest), pools) {
-                (Some(base), Some(pools)) if lamps.iter().any(Option::is_some) => {
-                    let origins = lamps.map(|lamp| lamp.map(|a| Pools::origin(tile_px, a)));
-                    let light = |ix: usize, iy: usize| {
-                        let mut sum = base;
-                        for o in origins.into_iter().flatten() {
-                            sum += u32::from(pools.at(zoom, o[0] + ix as i32, o[1] + iy as i32));
+        let max_h = self.canvas.height.min(clip_bottom.max(0) as usize);
+        let (main_sprite, main_dims, main_has_pools) = if rot_val < 0x10 {
+            match self.assets.pool_tile_with_pools(rot_val, zoom) {
+                Some((img, pools)) => (
+                    Some(SpriteRef::PoolTile(rot_val, zoom)),
+                    (img.width, img.height),
+                    pools.is_some(),
+                ),
+                None => (None, (0, 0), false),
+            }
+        } else {
+            match self.assets.floor_with_pools(12, zoom) {
+                Some((img, pools)) => (
+                    Some(SpriteRef::Floor(12, zoom)),
+                    (img.width, img.height),
+                    pools.is_some(),
+                ),
+                None => (None, (0, 0), false),
+            }
+        };
+        if let Some(sprite) = main_sprite {
+            let (x0, x1, _) = clip_span(at[0], main_dims.0, self.canvas.width);
+            let (y0, y1, _) = clip_span(at[1], main_dims.1, max_h);
+            if x0 < x1 && y0 < y1 {
+                let light = match (Light::drawn_byte(byte, brightest), main_has_pools) {
+                    (Some(base), true) if lamps.iter().any(Option::is_some) => {
+                        let origins = lamps.map(|lamp| lamp.map(|a| Pools::origin(tile_px, a)));
+                        RowLight::FloorPools {
+                            base,
+                            zoom,
+                            origins,
+                            offset: [0, 0],
                         }
-                        Light::from_sum(sum)
-                    };
-                    self.canvas.draw_floor_shaded_clipped(
-                        image,
+                    }
+                    _ => RowLight::Flat(Light::from_byte(byte, brightest)),
+                };
+                self.commands.push(DrawCmd {
+                    y0,
+                    y1,
+                    kind: DrawCmdKind::RowDepthSprite {
+                        sprite,
                         at,
-                        None,
-                        clip_bottom,
+                        columns: None,
+                        sub_rect: None,
+                        clip_bottom: Some(clip_bottom),
                         light,
-                        row_depth,
-                    );
-                }
-                _ => {
-                    let flat_light = Light::from_byte(byte, brightest);
-                    self.canvas.draw_floor_shaded_clipped(
-                        image,
-                        at,
-                        None,
-                        clip_bottom,
-                        |_, _| flat_light,
-                        row_depth,
-                    );
-                }
+                        depth: RowDepthMode::Floor { base_d, first_row },
+                    },
+                });
             }
         }
         // Inner-corner coping patches (`0x4ae710`–`0x4ae83e` -> `0x461e39`):
@@ -1120,46 +2014,46 @@ impl<'a> Painter<'a> {
             let Some((image, offset, pools)) = self.assets.pool_corner_with_pools(ci, zoom) else {
                 continue;
             };
+            let img_w = image.width;
+            let img_h = image.height;
+            let has_pools = pools.is_some();
             let cat = [
                 at[0].saturating_add(offset[0]),
                 at[1].saturating_add(offset[1]),
             ];
-            let row_depth = |sy| depth.floor_row(corner_base, first_row, sy);
-            match (Light::drawn_byte(byte, brightest), pools) {
-                (Some(base), Some(pools)) if lamps.iter().any(Option::is_some) => {
-                    let origins = lamps.map(|lamp| lamp.map(|a| Pools::origin(tile_px, a)));
-                    let light = |ix: usize, iy: usize| {
-                        let mut sum = base;
-                        for o in origins.into_iter().flatten() {
-                            sum += u32::from(pools.at(
-                                zoom,
-                                o[0] + offset[0] + ix as i32,
-                                o[1] + offset[1] + iy as i32,
-                            ));
-                        }
-                        Light::from_sum(sum)
-                    };
-                    self.canvas.draw_floor_shaded_clipped(
-                        image,
-                        cat,
-                        None,
-                        clip_bottom,
-                        light,
-                        row_depth,
-                    );
-                }
-                _ => {
-                    let flat_light = Light::from_byte(byte, brightest);
-                    self.canvas.draw_floor_shaded_clipped(
-                        image,
-                        cat,
-                        None,
-                        clip_bottom,
-                        |_, _| flat_light,
-                        row_depth,
-                    );
-                }
+            let (x0, x1, _) = clip_span(cat[0], img_w, self.canvas.width);
+            let (y0, y1, _) = clip_span(cat[1], img_h, max_h);
+            if x0 >= x1 || y0 >= y1 {
+                continue;
             }
+            let light = match (Light::drawn_byte(byte, brightest), has_pools) {
+                (Some(base), true) if lamps.iter().any(Option::is_some) => {
+                    let origins = lamps.map(|lamp| lamp.map(|a| Pools::origin(tile_px, a)));
+                    RowLight::FloorPools {
+                        base,
+                        zoom,
+                        origins,
+                        offset,
+                    }
+                }
+                _ => RowLight::Flat(Light::from_byte(byte, brightest)),
+            };
+            self.commands.push(DrawCmd {
+                y0,
+                y1,
+                kind: DrawCmdKind::RowDepthSprite {
+                    sprite: SpriteRef::PoolCorner(ci, zoom),
+                    at: cat,
+                    columns: None,
+                    sub_rect: None,
+                    clip_bottom: Some(clip_bottom),
+                    light,
+                    depth: RowDepthMode::Floor {
+                        base_d: corner_base,
+                        first_row,
+                    },
+                },
+            });
         }
     }
 
@@ -1187,23 +2081,37 @@ impl<'a> Painter<'a> {
         let Some(image) = self.assets.water_tile(rot_val, zoom) else {
             return;
         };
+        let img_w = image.width;
+        let img_h = image.height;
         // `0x4afaac`–`0x4afad6`: `y` shifts up by 4 at Near zoom and 1 at
         // Far/Medium zoom; `x` shifts left by 1 relative to normal floors.
         let y_adj = if self.camera.zoom == Zoom::Near { 4 } else { 1 };
         let at = [top_screen[0] - half_w - 1, top_screen[1] - y_adj];
+        let max_h = self.canvas.height.min(self.clip_bottom.max(0) as usize);
+        let (x0, x1, _) = clip_span(at[0], img_w, self.canvas.width);
+        let (y0, y1, _) = clip_span(at[1], img_h, max_h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
         let center = [x * 16 + 8, y * 16 + 8];
         let byte = self.lot.light_at(0, center);
         let light = Light::from_byte(byte, self.lot.brightest());
         // `0x4c1f9d`–`0x4c1fb1`: ground depth + 0x50 (80 = `floor_base + 15`),
         // stepping row-by-row through `R[y - origin_y]` anchored at `at[1]`.
-        let depth = &self.depth;
-        let (floor_base, first_row) = depth.floor_base(view, height, 1, at[1]);
+        let (floor_base, first_row) = self.depth.floor_base(view, height, 1, at[1]);
         let water_base = floor_base.saturating_add(15);
-        let clip_bottom = self.clip_bottom;
-        self.canvas
-            .draw_water_overlay(image, at, clip_bottom, light, |sy| {
-                depth.floor_row(water_base, first_row, sy)
-            });
+        self.commands.push(DrawCmd {
+            y0,
+            y1,
+            kind: DrawCmdKind::WaterOverlay {
+                sprite: SpriteRef::Water(rot_val, zoom),
+                at,
+                clip_bottom: self.clip_bottom,
+                light,
+                water_base,
+                first_row,
+            },
+        });
     }
 
     /// Casts the floor shadow of tile (`x`, `y`) on `level`, whose view top
@@ -1237,17 +2145,25 @@ impl<'a> Painter<'a> {
         let Some(mask) = self.assets.shadow_mask(zoom, code) else {
             return;
         };
-        let at = shadow_origin(
-            self.camera,
-            self.lot,
-            [x, y],
-            level,
-            tile.unwrap_or(mask.width),
-        );
-        let depth = &self.depth;
-        let (base_d, first_row) = depth.floor_base(view, height, level, at[1]);
-        self.canvas.shade_mask(mask, at, strength, |row| {
-            depth.floor_row(base_d, first_row, row).saturating_sub(65)
+        let (mask_w, mask_h) = (mask.width, mask.height);
+        let at = shadow_origin(self.camera, self.lot, [x, y], level, tile.unwrap_or(mask_w));
+        let (x0, x1, _) = clip_span(at[0], mask_w, self.canvas.width);
+        let (y0, y1, _) = clip_span(at[1], mask_h, self.canvas.height);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let (base_d, first_row) = self.depth.floor_base(view, height, level, at[1]);
+        self.commands.push(DrawCmd {
+            y0,
+            y1,
+            kind: DrawCmdKind::ShadowMask {
+                zoom,
+                code,
+                at,
+                strength,
+                base_d,
+                first_row,
+            },
         });
     }
 
@@ -1258,15 +2174,65 @@ impl<'a> Painter<'a> {
         let Some(grass) = self.grass else {
             return;
         };
-        draw_grass_tile(
-            self.lot,
-            grass,
-            &self.depth,
-            self.camera,
-            tile,
-            self.clip_bottom,
-            self.canvas,
-        );
+        let view = self.camera.rotate_tile(tile);
+        let Some((shades, colors)) = grass.tile(view) else {
+            return;
+        };
+        let rotation = usize::from(self.camera.rotation & 3);
+        let h = self.lot.heights[Lot::cell(tile[0] as usize, tile[1] as usize)];
+        let heights: [u8; 4] = std::array::from_fn(|n| h[(n + 4 - rotation) & 3]);
+        // The left corner, at height 0; columns start a row above it.
+        let corner = self.camera.project([view[0], view[1] + 1], 1, 0);
+        let zoom = self.camera.zoom.level();
+        let width = 16 << zoom;
+        // Skip a tile wholly off the canvas, even on the highest ground.
+        let reach = width + (255 << (zoom + 1));
+        let size = [self.canvas.width, self.canvas.height].map(|n| n as i32);
+        if (0..2).any(|i| corner[i] < -reach || corner[i] > size[i].saturating_add(reach)) {
+            return;
+        }
+        let left = corner[0] + GRASS_COLUMN;
+        let bottom = corner[1] + GRASS_ROW;
+        let canvas_w = i64::try_from(self.canvas.width).unwrap_or(i64::MAX);
+        if i64::from(left) + i64::from(width) <= 0 || i64::from(left) >= canvas_w {
+            return;
+        }
+        let shift = zoom + 1;
+        let y_left = bottom.saturating_sub(i32::from(heights[0]) << shift);
+        let y_top = bottom.saturating_sub((i32::from(heights[1]) + 2) << shift);
+        let y_right = bottom.saturating_sub(i32::from(heights[2]) << shift);
+        let y_bot = bottom.saturating_sub((i32::from(heights[3]) - 2) << shift);
+        let min_y = y_left.min(y_top).min(y_right).min(y_bot).saturating_sub(8);
+        let max_y = y_left
+            .max(y_top)
+            .max(y_right)
+            .max(y_bot)
+            .saturating_add(4 << shift)
+            .saturating_add(8);
+        let max_h = self.canvas.height.min(self.clip_bottom.max(0) as usize);
+        let y0 = min_y.clamp(0, max_h as i32) as usize;
+        let y1 = max_y.clamp(y0 as i32, max_h as i32) as usize;
+        if y0 >= y1 {
+            return;
+        }
+        let depth = self.depth.grass(view, i32::from(heights[1]));
+        let depth_clamped = depth.clamp(0, crate::depth::EMPTY);
+        self.commands.push(DrawCmd {
+            y0,
+            y1,
+            kind: DrawCmdKind::GrassTile {
+                view,
+                heights,
+                shades,
+                colors,
+                left,
+                bottom,
+                zoom,
+                depth,
+                depth_clamped,
+                clip_bottom: self.clip_bottom,
+            },
+        });
     }
 
     /// Whether view tile `[vx, vy]` is buildable for the Buy/Build Mode lot
@@ -1331,32 +2297,36 @@ impl<'a> Painter<'a> {
         let y_right = base_y - (i32::from(heights[2]) << shift);
         let flat = heights[0] == heights[1] && heights[0] == heights[2] && heights[0] == heights[3];
         let step = if flat { 2 } else { 4 };
-        if (mask & 1) != 0 {
-            let dy = ((y_top - y_left) << 16) / half_w;
-            let mut y_fp = y_left << 16;
-            let mut px = left;
-            while px < left + half_w {
-                let py = y_fp >> 16;
-                if py < self.clip_bottom {
-                    self.canvas.plot_color(px, py, [0, 0, 0]);
-                }
-                px += step;
-                y_fp += dy * step;
-            }
+        let max_h = self.canvas.height.min(self.clip_bottom.max(0) as usize);
+        let fixed_safe = [y_left, y_top, y_right]
+            .into_iter()
+            .all(|v| (-32768..=32767).contains(&v));
+        let (y0, y1) = if fixed_safe {
+            let min_y = y_left.min(y_top).min(y_right).saturating_sub(2);
+            let max_y = y_left.max(y_top).max(y_right).saturating_add(3);
+            let y0 = min_y.clamp(0, max_h as i32) as usize;
+            let y1 = max_y.clamp(y0 as i32, max_h as i32) as usize;
+            (y0, y1)
+        } else {
+            (0, max_h)
+        };
+        if y0 >= y1 {
+            return;
         }
-        if (mask & 2) != 0 {
-            let dy = ((y_right - y_top) << 16) / half_w;
-            let mut y_fp = y_top << 16;
-            let mut px = left + half_w;
-            while px < left + half_w * 2 {
-                let py = y_fp >> 16;
-                if py < self.clip_bottom {
-                    self.canvas.plot_color(px, py, [0, 0, 0]);
-                }
-                px += step;
-                y_fp += dy * step;
-            }
-        }
+        self.commands.push(DrawCmd {
+            y0,
+            y1,
+            kind: DrawCmdKind::TerrainGrid {
+                left,
+                y_left,
+                y_top,
+                y_right,
+                half_w,
+                step,
+                mask,
+                clip_bottom: self.clip_bottom,
+            },
+        });
     }
 
     /// The wallpaper on each side of a wall, first along its normal (the
@@ -1585,70 +2555,99 @@ impl<'a> Painter<'a> {
         else {
             return false;
         };
+        let fills = |image: &CanvasImage| {
+            image
+                .width
+                .checked_mul(image.height)
+                .and_then(|n| n.checked_mul(4))
+                == Some(image.rgba.len())
+        };
+        if (pat.width, pat.height) != (shp.width, shp.height) || !fills(pat) || !fills(shp) {
+            return false;
+        }
+        if pat.is_empty() || self.canvas.color.is_empty() {
+            return true;
+        }
+        let pat_w = pat.width;
+        let pat_h = pat.height;
         let (at, anchor) = wall_placement(
             self.camera,
             &self.depth,
-            pat.width,
-            pat.height,
+            pat_w,
+            pat_h,
             frame,
             ends,
             heights,
             level,
             raise,
         );
+        let Some((x0, x1, _, _, _, _)) = clip_x(at[0], pat_w, self.canvas.width, columns) else {
+            return true;
+        };
+        let (y0, y1, _) = clip_span(at[1], pat_h, self.canvas.height);
+        if x0 >= x1 || y0 >= y1 {
+            return true;
+        }
         let sprite_left = at[0];
-        let depth = &self.depth;
-        let first = depth.wall_start(frame == 0);
+        let first = self.depth.wall_start(frame == 0);
         let brightest = self.lot.brightest();
         let plain = light.map_or(Light::FULL, |f| Light::from_fraction(f, brightest));
         let index = (level - 1) as usize;
         let drawn_base = light.and_then(|f| Light::drawn_fraction(f, brightest));
         // `0x4c7c1a`: `[0x6f018a]` skips only dynamic wall lamp pools while
         // preserving base room shading.
-        let wall_pools = match (self.options.lighting, drawn_base, seen) {
-            (true, Some(_), Some((along_y, tile))) => {
-                Self::wall_pools_ref(self.lot, self.camera, pools, index, along_y, tile)
-            }
-            _ => [None, None],
-        };
-        let has_pools = wall_pools[0].is_some();
-        let rise = pools::wall_rise(zoom) as i64;
-        if let Some(base) = drawn_base
-            && has_pools
-        {
-            self.canvas.draw_wall_masked(
-                pat,
-                shp,
-                false,
-                at,
-                columns,
-                |x, y| {
-                    let mut sum = base;
-                    let py = y as i64 - rise;
-                    for p in wall_pools.into_iter().flatten() {
-                        sum += u32::from(p.at(x as i64, py));
+        let wall_light = match (self.options.lighting, drawn_base, seen) {
+            (true, Some(base), Some((along_y, tile))) => {
+                let lamps =
+                    Self::wall_lamp_coords(self.lot, self.camera, pools, index, along_y, tile);
+                if lamps[0].is_some() {
+                    WallLight::WallPools {
+                        base,
+                        zoom,
+                        along_y,
+                        rise: pools::wall_rise(zoom) as i64,
+                        lamps,
                     }
-                    Light::from_sum(sum)
-                },
-                |sx, sy| match frame {
-                    0 | 1 => depth.wall(anchor, sy, first, sx.saturating_sub(sprite_left)),
-                    _ => depth.diagonal(anchor, sy, frame == 3),
-                },
-            )
+                } else {
+                    WallLight::Flat(plain)
+                }
+            }
+            _ => WallLight::Flat(plain),
+        };
+        let use_plain_cut = cut && style == 22;
+        let use_object = !use_plain_cut && matches!(style, 22 | 23) && opening.is_some();
+        let mask_ref = if use_object {
+            let (resource, wall_shape) = opening.expect("opening checked");
+            SpriteRef::ObjectShape(resource, wall_shape, false, zoom, frame as u8)
+        } else if use_plain_cut {
+            SpriteRef::Shape(1, true, zoom, frame as u8)
         } else {
-            self.canvas.draw_wall_masked(
-                pat,
-                shp,
-                false,
+            SpriteRef::Shape(style, cut, zoom, frame as u8)
+        };
+        let depth_mode = match frame {
+            0 | 1 => WallDepthMode::Straight {
+                anchor,
+                first,
+                sprite_left,
+            },
+            _ => WallDepthMode::Diagonal {
+                anchor,
+                edge_on: frame == 3,
+            },
+        };
+        self.commands.push(DrawCmd {
+            y0,
+            y1,
+            kind: DrawCmdKind::MaskedWall {
+                pattern: SpriteRef::Pattern(pattern, zoom, frame as u8),
+                mask: mask_ref,
                 at,
                 columns,
-                |_, _| plain,
-                |sx, sy| match frame {
-                    0 | 1 => depth.wall(anchor, sy, first, sx.saturating_sub(sprite_left)),
-                    _ => depth.diagonal(anchor, sy, frame == 3),
-                },
-            )
-        }
+                light: wall_light,
+                depth: depth_mode,
+            },
+        });
+        true
     }
 
     /// Places the edge-on diagonal cap strip (pattern 252 masked top-left by
@@ -1665,28 +2664,55 @@ impl<'a> Painter<'a> {
         let Some((pat, shp)) = self.assets.edge_on_strip_parts(zoom) else {
             return;
         };
+        let fills = |image: &CanvasImage| {
+            image
+                .width
+                .checked_mul(image.height)
+                .and_then(|n| n.checked_mul(4))
+                == Some(image.rgba.len())
+        };
+        if shp.width < pat.width || shp.height < pat.height || !fills(pat) || !fills(shp) {
+            return;
+        }
+        if pat.is_empty() || self.canvas.color.is_empty() {
+            return;
+        }
+        let pat_w = pat.width;
+        let pat_h = pat.height;
         let (at, anchor) = wall_placement(
             self.camera,
             &self.depth,
-            pat.width,
-            pat.height,
+            pat_w,
+            pat_h,
             3,
             ends,
             heights,
             level,
             raise,
         );
-        let depth = &self.depth;
+        let Some((x0, x1, _, _, _, _)) = clip_x(at[0], pat_w, self.canvas.width, None) else {
+            return;
+        };
+        let (y0, y1, _) = clip_span(at[1], pat_h, self.canvas.height);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
         let light = Light::from_fraction(outdoor_light, self.lot.brightest());
-        self.canvas.draw_wall_masked(
-            pat,
-            shp,
-            true,
-            at,
-            None,
-            |_, _| light,
-            |_, sy| depth.diagonal(anchor, sy, true),
-        );
+        self.commands.push(DrawCmd {
+            y0,
+            y1,
+            kind: DrawCmdKind::MaskedWall {
+                pattern: SpriteRef::Pattern(252, zoom, 3),
+                mask: SpriteRef::Shape(9, false, zoom, 3),
+                at,
+                columns: None,
+                light: WallLight::Flat(light),
+                depth: WallDepthMode::Diagonal {
+                    anchor,
+                    edge_on: true,
+                },
+            },
+        });
     }
 
     /// A level's walls as the original's corner pass sees them (see
@@ -1813,29 +2839,62 @@ impl<'a> Painter<'a> {
                     let Some(image) = self.assets.trim(set, zoom).get(frame) else {
                         continue;
                     };
-                    let depth = &self.depth;
+                    let img_w = image.width;
+                    let img_h = image.height;
+                    let has_depth = image.depth.is_some();
+                    if set && !has_depth {
+                        continue;
+                    }
+                    let Some((x0, x1, _, _, _, _)) = clip_x(x, img_w, self.canvas.width, columns)
+                    else {
+                        continue;
+                    };
+                    let (y0, y1, _) = clip_span(y, img_h, self.canvas.height);
+                    if x0 >= x1 || y0 >= y1 {
+                        continue;
+                    }
+                    let sprite = SpriteRef::Trim(set, zoom.index(), frame as u16);
                     if set {
                         // A cut trim takes its depth from its depth sprite,
                         // by column from the whole sprite's left, and is
                         // not drawn without one (0x4c8b1f).
-                        if image.depth.is_none() {
-                            continue;
-                        }
-                        self.canvas.draw_layered_clipped(
-                            image,
-                            [x, y],
-                            light,
-                            columns,
-                            |sx, sy, byte| depth.trim(anchor, sy, sx.saturating_sub(left), byte),
-                        );
+                        self.commands.push(DrawCmd {
+                            y0,
+                            y1,
+                            kind: DrawCmdKind::DepthSprite {
+                                sprite,
+                                at: [x, y],
+                                flip: false,
+                                slack: 1,
+                                columns,
+                                pen: None,
+                                shading: SpriteShading::Flat(light),
+                                depth: PixelDepthMode::Trim { anchor, left },
+                            },
+                        });
                         continue;
                     }
                     // The trim lies on the wall tops, one depth a row
                     // (0x4c8849, with `flat_offset` for diagonal trims).
-                    self.canvas
-                        .draw_flat_clipped(image, [x, y], light, columns, |sy| {
-                            depth.flat(view, ground, level, flat_offset, y, sy)
-                        });
+                    self.commands.push(DrawCmd {
+                        y0,
+                        y1,
+                        kind: DrawCmdKind::RowDepthSprite {
+                            sprite,
+                            at: [x, y],
+                            columns,
+                            sub_rect: None,
+                            clip_bottom: None,
+                            light: RowLight::Flat(light),
+                            depth: RowDepthMode::FlatTrim {
+                                view,
+                                ground,
+                                level,
+                                flat_offset,
+                                top_y: y,
+                            },
+                        },
+                    });
                 }
             }
             if c.record {
@@ -1989,7 +3048,8 @@ impl<'a> Painter<'a> {
 
     fn objects(&mut self, level: i32, cut: &Cut) {
         let zoom = self.camera.zoom.index();
-        let mut list = Vec::new();
+        let mut list = std::mem::take(&mut self.object_scratch);
+        list.clear();
         for (&id, o) in &self.world.objects {
             let preview_at = self.preview_overrides.get(&id).copied();
             let [x, y, z] = preview_at.map_or(o.position, |(pos, _)| pos);
@@ -2051,12 +3111,11 @@ impl<'a> Painter<'a> {
                 };
                 (pose, screen, anchor)
             };
-            list.push((anchor, screen, id, pose, [x, y], preview_at.is_some()));
+            list.push((anchor, screen, id, o, pose, [x, y], preview_at.is_some()));
         }
         // Far objects first, so soft edges blend over what is behind them.
         list.sort_by_key(|&(a, _, id, ..)| (std::cmp::Reverse(a.depth), id));
-        for (base_anchor, base_screen, id, pose, pos, blocked_preview) in list {
-            let o = &self.world.objects[&id];
+        for &(base_anchor, base_screen, id, o, pose, pos, blocked_preview) in &list {
             let Some(definition) = self.assets.definition_ref(o.guid) else {
                 self.stats.missing_objects += 1;
                 continue;
@@ -2120,10 +3179,12 @@ impl<'a> Painter<'a> {
                     self.lot.brightest(),
                 )
             };
-            // Each pixel the object draws names it, for a click
-            // (`Canvas::id_at`).
-            self.canvas.set_id(Some(id));
-            for part in parts {
+            let shading = if blocked_preview {
+                SpriteShading::Blocked
+            } else {
+                SpriteShading::Flat(light)
+            };
+            for (part_idx, part) in parts.iter().enumerate() {
                 if !sprite_visible(part.sprite, def_dynamic_base, &o.dynamic_sprites) {
                     continue;
                 }
@@ -2151,30 +3212,52 @@ impl<'a> Painter<'a> {
                         .saturating_add(part.offset[1])
                         .saturating_sub(height),
                 ];
-                let depth = &self.depth;
-                // A frame without a depth channel stands flat at its
-                // anchor's depth. None of the base game's objects has one,
-                // and this is not read from the original: it keeps such a
-                // frame drawn rather than lost to byte 255.
-                let flat = part.image.depth.is_none();
-                let depth_fn = |_: i32, _: i32, byte: u8| {
-                    if flat {
-                        Some(anchor.depth)
-                    } else {
-                        depth.sprite(anchor, byte)
-                    }
-                };
-                if blocked_preview {
-                    self.canvas
-                        .draw_tinted(&part.image, at, part.flip, depth_fn);
-                } else {
-                    self.canvas
-                        .draw_lit(&part.image, at, part.flip, light, depth_fn);
+                let pixels = part.image.width.checked_mul(part.image.height);
+                if pixels.and_then(|n| n.checked_mul(4)) != Some(part.image.rgba.len())
+                    || pixels == Some(0)
+                    || self.canvas.color.is_empty()
+                {
+                    continue;
                 }
+                let Some((x0, x1, _, _, rect_x, rect_w)) =
+                    clip_x(at[0], part.image.width, self.canvas.width, None)
+                else {
+                    continue;
+                };
+                // Record the object's full drawn rectangle on the main thread
+                // (preserving exact `Canvas::drawn(id)` semantics even for
+                // off-screen parts).
+                self.canvas
+                    .record_rect_for(id, rect_x, at[1], rect_w, part.image.height);
+                let (y0, y1, _) = clip_span(at[1], part.image.height, self.canvas.height);
+                if x0 >= x1 || y0 >= y1 {
+                    continue;
+                }
+                let depth_mode = if part.image.depth.is_none() {
+                    PixelDepthMode::Flat(anchor.depth)
+                } else {
+                    PixelDepthMode::Sprite(anchor)
+                };
+                self.commands.push(DrawCmd {
+                    y0,
+                    y1,
+                    kind: DrawCmdKind::DepthSprite {
+                        sprite: SpriteRef::GroupPart(resource, group, direction, zoom, part_idx),
+                        at,
+                        flip: part.flip,
+                        slack: 0,
+                        columns: None,
+                        pen: Some(id),
+                        shading,
+                        depth: depth_mode,
+                    },
+                });
             }
             self.canvas.set_id(None);
             self.stats.objects += 1;
         }
+        list.clear();
+        self.object_scratch = list;
     }
 }
 
@@ -2426,6 +3509,7 @@ fn sprite_rise(object: [f32; 3], zoom: Zoom) -> i32 {
 /// Draws one grass tile (`0x49dacd`, `0x49da21`, `0x49d8fb`), clipping its
 /// columns and blades vertically to `[0, clip_bottom)` (the active house
 /// viewport bottom `word ptr [0x6f0c14]`).
+#[cfg(test)]
 fn draw_grass_tile(
     lot: &Lot,
     grass: &Grass,
@@ -2442,17 +3526,14 @@ fn draw_grass_tile(
     let rotation = usize::from(camera.rotation & 3);
     let h = lot.heights[Lot::cell(x as usize, y as usize)];
     let heights: [u8; 4] = std::array::from_fn(|n| h[(n + 4 - rotation) & 3]);
-    // The left corner, at height 0; columns start a row above it.
     let corner = camera.project([view[0], view[1] + 1], 1, 0);
     let zoom = camera.zoom.level();
     let width = 16 << zoom;
-    // Skip a tile wholly off the canvas, even on the highest ground.
     let reach = width + (255 << (zoom + 1));
     let size = [canvas.width, canvas.height].map(|n| n as i32);
     if (0..2).any(|i| corner[i] < -reach || corner[i] > size[i].saturating_add(reach)) {
         return;
     }
-    // The whole tile takes one depth, from its top corner.
     let depth = depth_table.grass(view, i32::from(heights[1]));
     let depth_clamped = depth.clamp(0, crate::depth::EMPTY);
     let left = corner[0] + GRASS_COLUMN;
@@ -2468,7 +3549,10 @@ fn draw_grass_tile(
             if i64::from(column.x) + 4 <= 0 || i64::from(column.x) >= canvas_w {
                 return;
             }
-            for (row, pixels) in column.clipped(0, clip_bottom).rows_rgb() {
+            for (row, pixels) in column
+                .clipped(0, clip_bottom)
+                .rows_rgb_in_band(i32::MIN, i32::MAX)
+            {
                 canvas.plot_grass_span(column.x, row, depth, depth_clamped, pixels);
             }
             let index = ((column.x - left) / 4) as usize;

@@ -13,33 +13,45 @@ use crate::rig;
 
 /// A mesh's vertices on the posed body: positions and unit normals, in
 /// the mesh's vertex order.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Skinned {
     pub positions: Vec<Vec3>,
     pub normals: Vec<Vec3>,
 }
 
 /// Places `part`'s vertices on the bones `world` (one per skeleton bone,
-/// from [`rig::Pose::world`]).
-pub fn skin(part: &Part, world: &[Transform]) -> Skinned {
+/// from [`rig::Pose::world`]), reusing `out`'s allocations.
+pub(crate) fn skin_into(part: &Part, world: &[Transform], out: &mut Skinned) {
     let mesh = &part.mesh;
     let bone = |b: usize| world[part.bones[b]];
-    let mut positions = Vec::with_capacity(mesh.vertices.len());
-    let mut normals = Vec::with_capacity(mesh.vertices.len());
+    out.positions.clear();
+    out.normals.clear();
+    out.positions.reserve(mesh.vertices.len());
+    out.normals.reserve(mesh.vertices.len());
     for v in &mesh.vertices {
         let m = bone(v.bone);
-        positions.push(m.point(rig::position(v.position)));
-        normals.push(m.vector(rig::position(v.normal)));
+        out.positions.push(m.point(rig::position(v.position)));
+        out.normals.push(m.vector(rig::position(v.normal)));
     }
     for b in &mesh.blends {
         let m = bone(b.bone);
         let p = m.point(rig::position(b.position));
         let n = m.vector(rig::position(b.normal));
-        positions[b.vertex] = positions[b.vertex].lerp(p, b.weight);
-        normals[b.vertex] = normals[b.vertex].lerp(n, b.weight);
+        out.positions[b.vertex] = out.positions[b.vertex].lerp(p, b.weight);
+        out.normals[b.vertex] = out.normals[b.vertex].lerp(n, b.weight);
     }
-    for n in &mut normals {
+    for n in &mut out.normals {
         *n = n.normalize();
     }
-    Skinned { positions, normals }
+}
+
+/// Places `part`'s vertices on the bones `world` (one per skeleton bone,
+/// from [`rig::Pose::world`]).
+pub fn skin(part: &Part, world: &[Transform]) -> Skinned {
+    let mut out = Skinned {
+        positions: Vec::new(),
+        normals: Vec::new(),
+    };
+    skin_into(part, world, &mut out);
+    out
 }

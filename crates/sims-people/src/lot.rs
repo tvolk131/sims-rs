@@ -105,15 +105,16 @@ use crate::bob::{self, Bob};
 use crate::house::Cast;
 use crate::math::{Transform, Vec3};
 use crate::person::{Player, UNITS_PER_TILE, base_clip, placement};
-use crate::raster::{Lamp, Lighting, Shade, Target, draw_shaded_culled};
+use crate::raster::{Lamp, Lighting, Shade, Target, draw_shaded_culled_scratch};
 use crate::rig;
-use crate::skin::skin;
+use crate::skin::{Skinned, skin_into};
 use crate::suit::{AGE, Clothes, GENDER, JOB, JOB_LEVEL, SUIT, Wardrobe, dress};
 use sims_core::F32;
 use sims_formats::saved_objects::Person;
 use sims_render::Camera;
 use sims_render::depth::Depth;
 use sims_sim::World;
+use sims_sim::animator::{Animator, Base, Layer};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -345,19 +346,39 @@ const ROOM_LAMPS: usize = 6;
 const FULL_SIDE: usize = sims_sim::FULL_SIZE as usize;
 
 /// Indexed view of every lit lamp (`sims_render::lot::gives_light`) in a
-/// [`World`], built once per frame so [`lamps`] never rescans `world.objects`
-/// for each tile in a room.
-struct LitLamps<'a> {
-    by_tile: BTreeMap<[i32; 3], Vec<&'a sims_sim::Object>>,
+/// [`World`], reused across frames so [`lamps`] never rescans `world.objects`
+/// for each tile in a room and avoids per-frame heap allocations.
+#[derive(Debug)]
+struct LitLamps {
+    /// Flat `(tile, fine_position)` entries in `world.objects` ID order.
+    entries: Vec<([i32; 3], [i32; 3])>,
     mask: [[u64; FULL_SIDE]; 2],
     has_other: bool,
+    selected: Vec<[i32; 3]>,
 }
 
-impl<'a> LitLamps<'a> {
-    fn from_world(world: &'a World) -> Self {
-        let mut by_tile: BTreeMap<[i32; 3], Vec<&'a sims_sim::Object>> = BTreeMap::new();
-        let mut mask = [[0u64; FULL_SIDE]; 2];
-        let mut has_other = false;
+impl Default for LitLamps {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            mask: [[0u64; FULL_SIDE]; 2],
+            has_other: false,
+            selected: Vec::with_capacity(ROOM_LAMPS),
+        }
+    }
+}
+
+impl LitLamps {
+    fn from_world(world: &World) -> Self {
+        let mut lit = Self::default();
+        lit.populate(world);
+        lit
+    }
+
+    fn populate(&mut self, world: &World) {
+        self.entries.clear();
+        self.mask = [[0u64; FULL_SIDE]; 2];
+        self.has_other = false;
         let full = sims_sim::FULL_SIZE as i32;
         for o in world.objects.values() {
             if !sims_render::lot::gives_light(o) {
@@ -368,29 +389,32 @@ impl<'a> LitLamps<'a> {
                 && (0..full).contains(&tile[0])
                 && (0..full).contains(&tile[1])
             {
-                mask[(tile[2] - 1) as usize][tile[0] as usize] |= 1u64 << tile[1];
+                self.mask[(tile[2] - 1) as usize][tile[0] as usize] |= 1u64 << tile[1];
             } else {
-                has_other = true;
+                self.has_other = true;
             }
-            by_tile.entry(tile).or_default().push(o);
-        }
-        Self {
-            by_tile,
-            mask,
-            has_other,
+            self.entries.push((tile, o.position));
         }
     }
 
-    fn lamps_for(&self, world: &World, level: i32, at: Vec3, eye: Vec3) -> Vec<Lamp> {
-        if self.by_tile.is_empty() {
-            return Vec::new();
+    fn lamps_for_into(
+        &mut self,
+        world: &World,
+        level: i32,
+        at: Vec3,
+        eye: Vec3,
+        out: &mut Vec<Lamp>,
+    ) {
+        out.clear();
+        if self.entries.is_empty() {
+            return;
         }
         let fine = [-at.z, -at.x].map(|u| (u * FINE_PER_UNIT).round() as i32);
         let [x, y] = fine.map(|f| f.div_euclid(16));
         let full = sims_sim::FULL_SIZE as i32;
         let inner = |n: i32| n >= 1 && n < full - 1;
         if !inner(x) || !inner(y) {
-            return Vec::new();
+            return;
         }
         let room = usize::try_from(level - 1)
             .ok()
@@ -398,9 +422,9 @@ impl<'a> LitLamps<'a> {
             .and_then(|map| map.get((x * full + y) as usize).copied())
             .filter(|&room| room >= 0);
         let Some(room) = room.and_then(|room| world.rooms.rooms.get(&room)) else {
-            return Vec::new();
+            return;
         };
-        let mut selected: Vec<&sims_sim::Object> = Vec::with_capacity(ROOM_LAMPS);
+        self.selected.clear();
         'tiles: for &tile in &room.tiles {
             let tile = tile.map(i32::from);
             let present = if (1..=2).contains(&tile[2])
@@ -414,37 +438,41 @@ impl<'a> LitLamps<'a> {
             if !present {
                 continue;
             }
-            if let Some(objects) = self.by_tile.get(&tile) {
-                for &lamp in objects {
-                    selected.push(lamp);
-                    if selected.len() == ROOM_LAMPS {
+            for &(entry_tile, pos) in &self.entries {
+                if entry_tile == tile {
+                    self.selected.push(pos);
+                    if self.selected.len() == ROOM_LAMPS {
                         break 'tiles;
                     }
                 }
             }
         }
-        selected
-            .into_iter()
-            .filter_map(|lamp| {
-                let [fx, fy, _] = lamp.position;
-                let ground = sims_sim::head::ground_height(
-                    world,
-                    [F32::from_f32(fx as f32), F32::from_f32(fy as f32)],
-                )
-                .map_or(0.0, F32::to_f32);
-                // The drawing frame: fine (x, y) at (−3y/16, height, −3x/16).
-                let light = Vec3::new(
-                    -(fy as f32) / FINE_PER_UNIT,
-                    ground + LAMP_HEIGHT,
-                    -(fx as f32) / FINE_PER_UNIT,
-                );
-                let from = at - light;
-                Some(Lamp {
+        for &[fx, fy, _] in &self.selected {
+            let ground = sims_sim::head::ground_height(
+                world,
+                [F32::from_f32(fx as f32), F32::from_f32(fy as f32)],
+            )
+            .map_or(0.0, F32::to_f32);
+            // The drawing frame: fine (x, y) at (−3y/16, height, −3x/16).
+            let light = Vec3::new(
+                -(fy as f32) / FINE_PER_UNIT,
+                ground + LAMP_HEIGHT,
+                -(fx as f32) / FINE_PER_UNIT,
+            );
+            let from = at - light;
+            if let Some(strength) = lamp_strength(from.dot(from)) {
+                out.push(Lamp {
                     towards: (light - eye).normalize(),
-                    strength: lamp_strength(from.dot(from))?,
-                })
-            })
-            .collect()
+                    strength,
+                });
+            }
+        }
+    }
+
+    fn lamps_for(&mut self, world: &World, level: i32, at: Vec3, eye: Vec3) -> Vec<Lamp> {
+        let mut out = Vec::new();
+        self.lamps_for_into(world, level, at, eye, &mut out);
+        out
     }
 }
 
@@ -535,6 +563,43 @@ impl Target for sims_render::Canvas {
     fn set_id(&mut self, id: Option<u16>) {
         sims_render::Canvas::set_id(self, id);
     }
+
+    #[inline]
+    fn row_index(&self, y: u32) -> usize {
+        (y as usize).saturating_mul(self.width)
+    }
+
+    #[inline]
+    fn passes_at(&self, row: usize, x: u32, y: u32, z: f32) -> bool {
+        (y as usize) < self.height && self.depth_passes_at(row, x as usize, z as i32)
+    }
+
+    #[inline]
+    fn write_passed_at(&mut self, row: usize, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
+        self.write_coloured_passed_at(row, x, y, z, texel, [shade; 3]);
+    }
+
+    #[inline]
+    fn write_coloured_passed_at(
+        &mut self,
+        row: usize,
+        x: u32,
+        y: u32,
+        z: f32,
+        texel: [u8; 4],
+        shade: [f32; 3],
+    ) {
+        if (x as usize) >= self.width || (y as usize) >= self.height {
+            return;
+        }
+        let lit = |c: u8, s: f32| (f32::from(c) * s + 0.5).clamp(0.0, 255.0) as u8;
+        let [r, g, b, a] = texel;
+        self.put_passed_at(
+            row.saturating_add(x as usize),
+            [lit(r, shade[0]), lit(g, shade[1]), lit(b, shade[2]), a],
+            z as i32,
+        );
+    }
 }
 
 /// Packs a texel's RGB channels to 16-bit 5-6-5 by truncation (verified in
@@ -587,6 +652,36 @@ impl<T: Target + ?Sized> Target for Packed565<'_, T> {
     fn set_id(&mut self, id: Option<u16>) {
         self.0.set_id(id);
     }
+
+    #[inline]
+    fn row_index(&self, y: u32) -> usize {
+        self.0.row_index(y)
+    }
+
+    #[inline]
+    fn passes_at(&self, row: usize, x: u32, y: u32, z: f32) -> bool {
+        self.0.passes_at(row, x, y, z)
+    }
+
+    #[inline]
+    fn write_passed_at(&mut self, row: usize, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
+        self.0
+            .write_passed_at(row, x, y, z, expand_565(texel), shade);
+    }
+
+    #[inline]
+    fn write_coloured_passed_at(
+        &mut self,
+        row: usize,
+        x: u32,
+        y: u32,
+        z: f32,
+        texel: [u8; 4],
+        shade: [f32; 3],
+    ) {
+        self.0
+            .write_coloured_passed_at(row, x, y, z, expand_565(texel), shade);
+    }
 }
 
 /// Draws one skinned part of a person on the lot into `target`, with or
@@ -594,6 +689,38 @@ impl<T: Target + ?Sized> Target for Packed565<'_, T> {
 /// as Direct3D 6's default `D3DRENDERSTATE_CULLMODE` (`D3DCULL_CCW`, never
 /// overridden in `0x5ce911`–`0x5cea52`, `0x5d34c6`–`0x5d37f1`, or
 /// `0x5d38d5`–`0x5d3c69`) does.
+#[allow(clippy::too_many_arguments)]
+fn draw_lot_part_scratch<T: Target + ?Sized>(
+    target: &mut T,
+    part: &crate::appearance::Part,
+    skinned: &crate::skin::Skinned,
+    lighting: Lighting,
+    lamps: &[Lamp],
+    project: impl Fn(Vec3) -> Vec3,
+    shades: &mut Vec<Shade>,
+    screen: &mut Vec<Vec3>,
+) {
+    let towards = lighting.towards.normalize();
+    shades.clear();
+    if lamps.is_empty() {
+        shades.extend(
+            skinned
+                .normals
+                .iter()
+                .map(|&n| Shade::Grey(lighting.shade_unit(n, towards))),
+        );
+    } else {
+        shades.extend(
+            skinned
+                .normals
+                .iter()
+                .map(|&n| lighting.shade_with_unit(n, towards, lamps)),
+        );
+    }
+    draw_shaded_culled_scratch(target, part, skinned, shades, project, screen);
+}
+
+#[cfg(test)]
 fn draw_lot_part<T: Target + ?Sized>(
     target: &mut T,
     part: &crate::appearance::Part,
@@ -602,21 +729,18 @@ fn draw_lot_part<T: Target + ?Sized>(
     lamps: &[Lamp],
     project: impl Fn(Vec3) -> Vec3,
 ) {
-    let towards = lighting.towards.normalize();
-    let shade: Vec<Shade> = if lamps.is_empty() {
-        skinned
-            .normals
-            .iter()
-            .map(|&n| Shade::Grey(lighting.shade_unit(n, towards)))
-            .collect()
-    } else {
-        skinned
-            .normals
-            .iter()
-            .map(|&n| lighting.shade_with_unit(n, towards, lamps))
-            .collect()
-    };
-    draw_shaded_culled(target, part, skinned, &shade, project);
+    let mut shades = Vec::new();
+    let mut screen = Vec::new();
+    draw_lot_part_scratch(
+        target,
+        part,
+        skinned,
+        lighting,
+        lamps,
+        project,
+        &mut shades,
+        &mut screen,
+    );
 }
 
 /// Projects a world point for lot rasterization: [`View::place_on`] and
@@ -671,6 +795,206 @@ impl Key {
                 .map(|n| person.data.get(n).copied().unwrap_or(0)),
         }
     }
+
+    fn matches(&self, guid: u32, person: &sims_formats::saved_objects::Person) -> bool {
+        if self.guid != guid {
+            return false;
+        }
+        let suit =
+            [SUIT, JOB, JOB_LEVEL, AGE, GENDER].map(|n| person.data.get(n).copied().unwrap_or(0));
+        if self.suit != suit {
+            return false;
+        }
+        if self
+            .appearance
+            .iter()
+            .zip(&person.appearance)
+            .any(|(a, b)| a != b)
+        {
+            return false;
+        }
+        self.accessories.len() == person.accessories.len()
+            && self
+                .accessories
+                .iter()
+                .zip(&person.accessories)
+                .all(|((n, b), a)| n == &a.name && b == &a.binding)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LayerKey {
+    clip: String,
+    phase: F32,
+    mode: i32,
+    frames: u32,
+    weight: F32,
+}
+
+impl LayerKey {
+    fn from_layer(layer: &Layer) -> Self {
+        Self {
+            clip: layer.clip.clone(),
+            phase: layer.phase,
+            mode: layer.mode,
+            frames: layer.frames,
+            weight: layer.weight,
+        }
+    }
+
+    fn matches(&self, layer: &Layer) -> bool {
+        self.phase == layer.phase
+            && self.mode == layer.mode
+            && self.frames == layer.frames
+            && self.weight == layer.weight
+            && self.clip == layer.clip
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BasePoseKey {
+    Empty,
+    Layer(LayerKey),
+    FallbackScript {
+        clip: String,
+        reverse: bool,
+        start: i32,
+        clock: i32,
+    },
+    FallbackPosture {
+        saved_base: String,
+        clock: i32,
+    },
+}
+
+impl BasePoseKey {
+    fn from_state(animator: &Animator, layer: Option<&Layer>, person: &Person) -> Self {
+        match (&animator.base, layer) {
+            (Base::Empty, _) => Self::Empty,
+            (_, Some(layer)) => Self::Layer(LayerKey::from_layer(layer)),
+            (
+                Base::Script {
+                    clip,
+                    reverse,
+                    start,
+                },
+                None,
+            ) => Self::FallbackScript {
+                clip: clip.clone(),
+                reverse: *reverse,
+                start: *start,
+                clock: animator.clock,
+            },
+            (_, None) => Self::FallbackPosture {
+                saved_base: person.animations[2].clone(),
+                clock: animator.clock,
+            },
+        }
+    }
+
+    fn matches(&self, animator: &Animator, layer: Option<&Layer>, person: &Person) -> bool {
+        match (self, &animator.base, layer) {
+            (Self::Empty, Base::Empty, _) => true,
+            (Self::Layer(k), base, Some(layer)) if !matches!(base, Base::Empty) => k.matches(layer),
+            (
+                Self::FallbackScript {
+                    clip,
+                    reverse,
+                    start,
+                    clock,
+                },
+                Base::Script {
+                    clip: a_clip,
+                    reverse: a_reverse,
+                    start: a_start,
+                },
+                None,
+            ) => {
+                *reverse == *a_reverse
+                    && *start == *a_start
+                    && *clock == animator.clock
+                    && clip == a_clip
+            }
+            (Self::FallbackPosture { saved_base, clock }, base, None)
+                if !matches!(base, Base::Empty | Base::Script { .. }) =>
+            {
+                *clock == animator.clock && saved_base == &person.animations[2]
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PoseCacheKey {
+    position: [F32; 3],
+    ground_bits: u32,
+    head_turn: F32,
+    base: BasePoseKey,
+    foreground: Option<LayerKey>,
+    carry: Option<LayerKey>,
+}
+
+impl PoseCacheKey {
+    fn from_state(
+        animator: &Animator,
+        ground_bits: u32,
+        base_layer: Option<&Layer>,
+        person: &Person,
+    ) -> Self {
+        Self {
+            position: animator.position,
+            ground_bits,
+            head_turn: animator.head.turn,
+            base: BasePoseKey::from_state(animator, base_layer, person),
+            foreground: animator.foreground.as_ref().map(LayerKey::from_layer),
+            carry: animator.carry.as_ref().map(LayerKey::from_layer),
+        }
+    }
+
+    fn matches(
+        &self,
+        animator: &Animator,
+        ground_bits: u32,
+        base_layer: Option<&Layer>,
+        person: &Person,
+    ) -> bool {
+        let opt_matches = |cached: &Option<LayerKey>, live: &Option<Layer>| match (cached, live) {
+            (None, None) => true,
+            (Some(k), Some(l)) => k.matches(l),
+            _ => false,
+        };
+        self.position == animator.position
+            && self.ground_bits == ground_bits
+            && self.head_turn == animator.head.turn
+            && opt_matches(&self.foreground, &animator.foreground)
+            && opt_matches(&self.carry, &animator.carry)
+            && self.base.matches(animator, base_layer, person)
+    }
+}
+
+/// Cached posed bones and skinned parts for a single Sim so steady-state
+/// frames between simulation ticks skip re-posing and re-skinning, and dynamic
+/// frames reuse `Skinned` vertex/normal buffers in place.
+#[derive(Debug)]
+struct CachedPose {
+    key: PoseCacheKey,
+    root: Transform,
+    bones: Vec<Transform>,
+    skinned_parts: Vec<Skinned>,
+    skinned_ready: bool,
+}
+
+/// Reusable per-frame scratch buffers for [`People::draw_in_viewport`].
+#[derive(Debug, Default)]
+struct PeopleScratch {
+    shades: Vec<Shade>,
+    screen: Vec<Vec3>,
+    bob_skinned: Skinned,
+    lamps: Vec<Lamp>,
+    lit_lamps: LitLamps,
+    ready: Vec<(u16, i32)>,
+    draw_order: Vec<(u16, i32, f32)>,
 }
 
 /// One person as last loaded: the body, or why it could not be loaded
@@ -679,6 +1003,7 @@ impl Key {
 struct Loaded {
     key: Key,
     body: Result<(Body, String), String>,
+    cached_pose: Option<CachedPose>,
 }
 
 /// A person posed for this frame.
@@ -721,6 +1046,8 @@ pub struct People {
     bob: Option<Result<Bob, String>>,
     /// The game's clock in milliseconds, which spins the plumb bob.
     clock: u32,
+    /// Reusable per-frame scratch buffers for posing, lighting, and rasterization.
+    scratch: PeopleScratch,
 }
 
 impl People {
@@ -743,6 +1070,7 @@ impl People {
             wardrobe: None,
             bob: None,
             clock: 0,
+            scratch: PeopleScratch::default(),
         }
     }
 
@@ -766,10 +1094,14 @@ impl People {
             let Some(person) = &object.person else {
                 continue;
             };
-            let key = Key::of(object.guid, person);
-            if self.people.get(&id).is_some_and(|l| l.key == key) {
+            if self
+                .people
+                .get(&id)
+                .is_some_and(|l| l.key.matches(object.guid, person))
+            {
                 continue;
             }
+            let key = Key::of(object.guid, person);
             let body = self
                 .cast
                 .residents([(id, object.guid, person)])
@@ -795,7 +1127,14 @@ impl People {
             if let Err(e) = &body {
                 problems.push(e.clone());
             }
-            self.people.insert(id, Loaded { key, body });
+            self.people.insert(
+                id,
+                Loaded {
+                    key,
+                    body,
+                    cached_pose: None,
+                },
+            );
         }
         problems
     }
@@ -820,58 +1159,128 @@ impl People {
         Ok(Some(clothes.wear(person, &rows)))
     }
 
-    /// Each placed person whose body is loaded, posed as the world has
-    /// them now, in object ID order. A person on a level above `top`, or
-    /// whose object is off the lot, is left out. Call [`People::update`] first, so new people are loaded.
-    pub fn posed(&mut self, world: &World, top: i32) -> (Vec<Posed<'_>>, Vec<String>) {
+    /// Updates each eligible placed Sim's cached pose (and optionally skins
+    /// uncensored parts) in place, populating `self.scratch.ready` and
+    /// returning any posing problems.
+    fn refresh_poses(&mut self, world: &World, top: i32, skin_parts: bool) -> Vec<String> {
         let mut player =
             Player::with_clips(&self.assets, &self.library, std::mem::take(&mut self.clips));
-        let mut posed = Vec::new();
+        self.scratch.ready.clear();
         let mut problems = Vec::new();
+        let size = i32::from(world.size);
         for (&id, animator) in &world.animators {
-            let (
-                Some(Loaded {
-                    body: Ok((body, skeleton)),
-                    ..
-                }),
-                Some(object),
-            ) = (self.people.get(&id), world.objects.get(&id))
+            let (Some(loaded), Some(object)) = (self.people.get_mut(&id), world.objects.get(&id))
             else {
+                continue;
+            };
+            let Ok((body, skeleton)) = &loaded.body else {
                 continue;
             };
             let Some(person) = &object.person else {
                 continue;
             };
-            let Some(mut root) = placement(animator) else {
-                continue;
-            };
-            // An object taken off the lot is at tile (-1, -1); a person
-            // there is not drawn, wherever their animator was left.
             let [x, y, level] = World::tile(object.position).map(i32::from);
-            let size = i32::from(world.size);
             if !(0..size).contains(&x) || !(0..size).contains(&y) || level > top {
                 continue;
             }
+            let Some(mut root) = placement(animator) else {
+                continue;
+            };
             // The terrain lifts a person on every level, as it lifts the
             // floors the renderer draws there (0x592132 adds the altitude
             // whatever the level).
             let at = [animator.position[0], animator.position[1]];
-            root.translation.y = sims_sim::head::ground_height(world, at)
+            let ground = sims_sim::head::ground_height(world, at)
                 .map(F32::to_f32)
                 .unwrap_or(0.0);
-            let base = base_clip(person, skeleton);
-            match player.pose(&body.skeleton, animator, world.base_layers.get(&id), &base) {
-                Ok(pose) => posed.push(Posed {
-                    id,
-                    level,
-                    root,
-                    bones: pose.world(&body.skeleton, root),
-                    body,
-                }),
-                Err(e) => problems.push(format!("person {id} is not posed: {e}")),
+            root.translation.y = ground;
+            let ground_bits = ground.to_bits();
+            let base_layer = world.base_layers.get(&id);
+
+            let pose_hit = loaded
+                .cached_pose
+                .as_ref()
+                .is_some_and(|c| c.key.matches(animator, ground_bits, base_layer, person));
+
+            if !pose_hit {
+                let base = base_clip(person, skeleton);
+                match player.pose(&body.skeleton, animator, base_layer, &base) {
+                    Ok(pose) => {
+                        let key =
+                            PoseCacheKey::from_state(animator, ground_bits, base_layer, person);
+                        let bones = pose.world(&body.skeleton, root);
+                        if let Some(cached) = &mut loaded.cached_pose {
+                            cached.key = key;
+                            cached.root = root;
+                            cached.bones = bones;
+                            cached.skinned_ready = false;
+                        } else {
+                            loaded.cached_pose = Some(CachedPose {
+                                key,
+                                root,
+                                bones,
+                                skinned_parts: Vec::new(),
+                                skinned_ready: false,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        loaded.cached_pose = None;
+                        problems.push(format!("person {id} is not posed: {e}"));
+                        continue;
+                    }
+                }
             }
+
+            if skin_parts
+                && let Some(cached) = &mut loaded.cached_pose
+                && !cached.skinned_ready
+            {
+                let uncensored = body.parts.iter().filter(|p| p.censor == 0).count();
+                if cached.skinned_parts.len() < uncensored {
+                    cached.skinned_parts.resize_with(uncensored, || Skinned {
+                        positions: Vec::new(),
+                        normals: Vec::new(),
+                    });
+                } else {
+                    cached.skinned_parts.truncate(uncensored);
+                }
+                for (part, out) in body
+                    .parts
+                    .iter()
+                    .filter(|p| p.censor == 0)
+                    .zip(&mut cached.skinned_parts)
+                {
+                    skin_into(part, &cached.bones, out);
+                }
+                cached.skinned_ready = true;
+            }
+            self.scratch.ready.push((id, level));
         }
         self.clips = player.into_clips();
+        problems
+    }
+
+    /// Each placed person whose body is loaded, posed as the world has
+    /// them now, in object ID order. A person on a level above `top`, or
+    /// whose object is off the lot, is left out. Call [`People::update`] first, so new people are loaded.
+    pub fn posed(&mut self, world: &World, top: i32) -> (Vec<Posed<'_>>, Vec<String>) {
+        let problems = self.refresh_poses(world, top, false);
+        let mut posed = Vec::with_capacity(self.scratch.ready.len());
+        for &(id, level) in &self.scratch.ready {
+            if let Some(loaded) = self.people.get(&id)
+                && let Ok((body, _)) = &loaded.body
+                && let Some(cached) = &loaded.cached_pose
+            {
+                posed.push(Posed {
+                    id,
+                    level,
+                    root: cached.root,
+                    bones: cached.bones.clone(),
+                    body,
+                });
+            }
+        }
         (posed, problems)
     }
 
@@ -988,35 +1397,82 @@ impl People {
         }
         let spin = bob::spin(self.clock);
         let bob_light = bob::light(camera.rotation);
-        let (mut posed, mut problems) = self.posed(world, camera.level);
+        let mut problems = self.refresh_poses(world, camera.level, true);
+        let People {
+            people: loaded_people,
+            scratch,
+            ..
+        } = self;
         // Far to near by the root's depth, then by ID, so nearer soft
         // edges blend over farther people.
-        let far = |p: &Posed| {
-            let (fine, elevation) = view.place_on(p.root.translation, p.level);
-            depth(fine, elevation, p.level)
-        };
-        posed.sort_by(|a, b| far(b).total_cmp(&far(a)).then(a.id.cmp(&b.id)));
-        let lit_lamps = (!posed.is_empty()).then(|| LitLamps::from_world(world));
-        for person in &posed {
-            let project = |p| project_lot_vertex(&view, p, person.level, &depth);
+        scratch.draw_order.clear();
+        for &(id, person_level) in &scratch.ready {
+            if let Some(loaded) = loaded_people.get(&id)
+                && let Some(cached) = &loaded.cached_pose
+            {
+                let (fine, elevation) = view.place_on(cached.root.translation, person_level);
+                let far = depth(fine, elevation, person_level);
+                scratch.draw_order.push((id, person_level, far));
+            }
+        }
+        scratch
+            .draw_order
+            .sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+        if !scratch.draw_order.is_empty() {
+            scratch.lit_lamps.populate(world);
+        }
+        let drawn_count = scratch.draw_order.len();
+        for i in 0..drawn_count {
+            let (person_id, person_level, _) = scratch.draw_order[i];
+            let Some(loaded) = loaded_people.get(&person_id) else {
+                continue;
+            };
+            let Ok((body, _)) = &loaded.body else {
+                continue;
+            };
+            let Some(cached) = &loaded.cached_pose else {
+                continue;
+            };
+            let project = |p| project_lot_vertex(&view, p, person_level, &depth);
             // Each pixel the person draws names them, for a click.
-            target.set_id(Some(person.id));
-            let lighting = Lighting::standard(light, level(world, person.id));
-            let lamps = lit_lamps.as_ref().map_or_else(Vec::new, |lit| {
-                lit.lamps_for(
-                    world,
-                    person.level,
-                    person.root.translation + view.level_lift(person.level),
-                    eye,
-                )
-            });
-            for part in person.body.parts.iter().filter(|p| p.censor == 0) {
-                let skinned = skin(part, &person.bones);
+            target.set_id(Some(person_id));
+            let lighting = Lighting::standard(light, level(world, person_id));
+            scratch.lit_lamps.lamps_for_into(
+                world,
+                person_level,
+                cached.root.translation + view.level_lift(person_level),
+                eye,
+                &mut scratch.lamps,
+            );
+            for (part, skinned) in body
+                .parts
+                .iter()
+                .filter(|p| p.censor == 0)
+                .zip(&cached.skinned_parts)
+            {
                 if part.texture_name.is_some() {
                     let mut packed = Packed565(target);
-                    draw_lot_part(&mut packed, part, &skinned, lighting, &lamps, project);
+                    draw_lot_part_scratch(
+                        &mut packed,
+                        part,
+                        skinned,
+                        lighting,
+                        &scratch.lamps,
+                        project,
+                        &mut scratch.shades,
+                        &mut scratch.screen,
+                    );
                 } else {
-                    draw_lot_part(target, part, &skinned, lighting, &lamps, project);
+                    draw_lot_part_scratch(
+                        target,
+                        part,
+                        skinned,
+                        lighting,
+                        &scratch.lamps,
+                        project,
+                        &mut scratch.shades,
+                        &mut scratch.screen,
+                    );
                 }
             }
             // The plumb bob over their head, if they hold it. Its pixels
@@ -1025,20 +1481,20 @@ impl People {
             // graphic under the pointer when it changes the depth there
             // (0x586455), and the house view then lists the bob's pie
             // (0x48ca2c → 0x48c834).
-            let Some(bob_id) = bob::held_by(world, person.id) else {
+            let Some(bob_id) = bob::held_by(world, person_id) else {
                 continue;
             };
             let Some(head) =
-                rig::bone(&person.body.skeleton, bob::HEAD_BONE).and_then(|i| person.bones.get(i))
+                rig::bone(&body.skeleton, bob::HEAD_BONE).and_then(|i| cached.bones.get(i))
             else {
                 continue;
             };
-            let loaded = match &bob {
+            let loaded_bob = match &bob {
                 Some(Ok(loaded)) => loaded,
                 Some(Err(e)) => {
                     problems.push(format!(
                         "person {}'s plumb bob is not drawn: {e}",
-                        person.id
+                        person_id
                     ));
                     continue;
                 }
@@ -1047,27 +1503,38 @@ impl People {
             // The mood, cut to an integer as the original's `_ftol` does.
             let mood = world
                 .objects
-                .get(&person.id)
+                .get(&person_id)
                 .and_then(|o| o.person.as_ref())
                 .map_or(0, |p| p.motives[sims_sim::motives::MOOD] as i32);
             let colour = bob::colour(mood);
             target.set_id(Some(bob_id));
-            let bones = [bob::root(*head, person.root, spin)];
-            for part in &loaded.parts {
-                let skinned = skin(part, &bones);
-                let shade: Vec<Shade> = skinned
-                    .normals
-                    .iter()
-                    .map(|&n| Shade::Colour(bob::shade(colour, n, bob_light)))
-                    .collect();
-                draw_shaded_culled(target, part, &skinned, &shade, project);
+            let bones = [bob::root(*head, cached.root, spin)];
+            for part in &loaded_bob.parts {
+                skin_into(part, &bones, &mut scratch.bob_skinned);
+                scratch.shades.clear();
+                scratch.shades.extend(
+                    scratch
+                        .bob_skinned
+                        .normals
+                        .iter()
+                        .map(|&n| Shade::Colour(bob::shade(colour, n, bob_light))),
+                );
+                draw_shaded_culled_scratch(
+                    target,
+                    part,
+                    &scratch.bob_skinned,
+                    &scratch.shades,
+                    project,
+                    &mut scratch.screen,
+                );
             }
         }
         target.set_id(None);
-        let people = posed.len();
-        drop(posed);
         self.bob = bob;
-        Drawn { people, problems }
+        Drawn {
+            people: drawn_count,
+            problems,
+        }
     }
 }
 

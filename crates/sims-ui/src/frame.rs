@@ -203,13 +203,56 @@ impl Frame {
             low..high.max(low)
         };
         let xs = range(source.x, source.width, image.width, at[0], self.width);
-        for sy in range(source.y, source.height, image.height, at[1], self.height) {
-            for sx in xs.clone() {
-                let (ix, iy) = (i64::from(source.x) + sx, i64::from(source.y) + sy);
-                if let Some([r, g, b, a]) = image.pixel(ix as u32, iy as u32) {
-                    let (x, y) = (i64::from(at[0]) + sx, i64::from(at[1]) + sy);
-                    self.blend(x as i32, y as i32, [r, g, b], a);
+        let ys = range(source.y, source.height, image.height, at[1], self.height);
+        if xs.is_empty() || ys.is_empty() {
+            return;
+        }
+        let img_w = image.width as usize;
+        let img_h = image.height as usize;
+        let expected_bytes = img_w.checked_mul(img_h).and_then(|n| n.checked_mul(4));
+        if expected_bytes.is_none_or(|n| image.rgba.len() < n) {
+            for sy in ys {
+                for sx in xs.clone() {
+                    let (ix, iy) = (i64::from(source.x) + sx, i64::from(source.y) + sy);
+                    if let Some([r, g, b, a]) = image.pixel(ix as u32, iy as u32) {
+                        let (x, y) = (i64::from(at[0]) + sx, i64::from(at[1]) + sy);
+                        self.blend(x as i32, y as i32, [r, g, b], a);
+                    }
                 }
+            }
+            return;
+        }
+        let table = blend_table();
+        let dst_w = self.width as usize;
+        let src_x0 = (i64::from(source.x) + xs.start) as usize;
+        let dst_x0 = (i64::from(at[0]) + xs.start) as usize;
+        let len = (xs.end - xs.start) as usize;
+        let rgba = &image.rgba;
+        for sy in ys {
+            let iy = (i64::from(source.y) + sy) as usize;
+            let dy = (i64::from(at[1]) + sy) as usize;
+            let src_start = (iy * img_w + src_x0) * 4;
+            let src_row = &rgba[src_start..src_start + len * 4];
+            let dst_start = dy * dst_w + dst_x0;
+            let dst_row = &mut self.rgb[dst_start..dst_start + len];
+            for (src, dst) in src_row.as_chunks::<4>().0.iter().zip(dst_row.iter_mut()) {
+                let a = src[3];
+                if a <= 7 {
+                    continue;
+                }
+                if a >= 248 {
+                    *dst = [src[0], src[1], src[2]];
+                    continue;
+                }
+                let a5 = usize::from(a >> 3) << 10;
+                let r5 = table[a5 | (usize::from(src[0] >> 3) << 5) | usize::from(dst[0] >> 3)];
+                let g5 = table[a5 | (usize::from(src[1] >> 3) << 5) | usize::from(dst[1] >> 3)];
+                let b5 = table[a5 | (usize::from(src[2] >> 3) << 5) | usize::from(dst[2] >> 3)];
+                *dst = [
+                    (r5 << 3) | (r5 >> 2),
+                    (g5 << 3) | (g5 >> 3),
+                    (b5 << 3) | (b5 >> 2),
+                ];
             }
         }
     }
@@ -418,5 +461,39 @@ mod tests {
         let f = Frame::from_rgb(2, 1, vec![[1, 2, 3]; 2]).unwrap();
         assert_eq!(f.pixel(1, 0), Some([1, 2, 3]));
         assert_eq!(f.into_rgb().len(), 2);
+    }
+
+    #[test]
+    #[ignore]
+    #[allow(clippy::disallowed_methods)]
+    fn bench_frame_draw() {
+        let mut f = Frame::new(1024, 768, [40, 80, 120]);
+        let mut rgba = vec![0u8; 800 * 120 * 4];
+        for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let m = i % 10;
+            px[0] = ((i * 7) & 0xff) as u8;
+            px[1] = ((i * 13) & 0xff) as u8;
+            px[2] = ((i * 29) & 0xff) as u8;
+            px[3] = if m < 3 {
+                0
+            } else if m < 8 {
+                255
+            } else {
+                128
+            };
+        }
+        let img = Image {
+            width: 800,
+            height: 120,
+            rgba,
+        };
+        f.draw_all(&img, [112, 648]);
+        let iters = 200usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            f.draw_all(&img, [112, 648]);
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!("BENCH_UI Frame::draw 800x120 mixed-alpha: {ms:.4} ms/call ({iters} calls)");
     }
 }

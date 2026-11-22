@@ -5,10 +5,35 @@ use sha2::{Digest, Sha256};
 use sims_content::Install;
 use sims_render::neighborhood::{
     COLOR_KEY_565, CommunityFilter, DEFAULT_HIGHLIGHT_RGB, LotStatus, LotZoning, MAP_HEIGHT,
-    MAP_WIDTH, NeighborhoodKind, NeighborhoodMap, RenderOptions, map_origin,
+    MAP_WIDTH, NeighborhoodKind, NeighborhoodMap, RenderOptions, Surface565, map_origin, pack_565,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+
+#[test]
+fn neighborhood_map_supports_external_struct_literals() {
+    let map = NeighborhoodMap {
+        kind: NeighborhoodKind::Unleashed,
+        neighborhood: 1,
+        non_us: false,
+        backdrop: Surface565::filled(
+            MAP_WIDTH as usize,
+            MAP_HEIGHT as usize,
+            pack_565([0, 64, 0]),
+        ),
+        large_frame: None,
+        waves: Vec::new(),
+        opaque_overlays: false,
+        vacation_port: None,
+        vacation_trees: None,
+        vacation_logo: None,
+        vacation_no_vacancy: None,
+        filter_badges: BTreeMap::new(),
+        lots: Vec::new(),
+    };
+    let canvas = map.render(&RenderOptions::default());
+    assert_eq!((canvas.width, canvas.height), (800, 600));
+}
 
 fn install() -> Option<Install> {
     let root = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
