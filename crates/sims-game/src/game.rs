@@ -20,17 +20,29 @@ use crate::pick;
 use crate::sound;
 use crate::view::{Move, View};
 use sims_content::assets::Assets as ContentAssets;
+use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{
     Animations, ArchivePool, AvatarRegistry, Catalog, House, Index, Install, Neighborhood,
     People as ContentPeople, Surfaces, Wardrobe,
 };
 use sims_people::{Cast, Library as PeopleLibrary, PreloadedCast};
+use sims_render::build_preview::{
+    self as render_build, RoofCatalog, RoofPitch as RenderRoofPitch, RoofPreviewConfig, RoofStyle,
+    TerrainOverlay, TerrainTarget, TerrainTool as RenderTerrainTool, WaterAction, WaterOverlay,
+    WaterTool as RenderWaterTool,
+};
 use sims_render::{BaseAssets, Camera, Canvas, Selected, Walls};
+use sims_ui::art::Art;
+use sims_ui::build::{BuildSubtoolAction, RoofPitchPreset, TerrainSubtool, WaterSubtool};
 use sims_ui::command::{
     BuildItemId, BuildTool, Camera as UiCamera, Command, Mode, OptionsAction, OptionsToggle, Speed,
     VolumeChannel, Walls as UiWalls,
 };
 use sims_ui::options::{LotVisibility, OptionsState};
+use sims_ui::shop::{
+    CurrencyKind, ShopCommand, ShopItem, ShopKind, ShopPickerDialog, ShopSnapshot, ShopStrings,
+    Wallet, WardrobeCategory,
+};
 use sims_vm::Program;
 use sims_vm::boot::save::Saved;
 use sims_vm::boot::{
@@ -38,11 +50,12 @@ use sims_vm::boot::{
 };
 use sims_vm::play::{Recovery, ScriptError};
 use sims_vm::{
-    BuyCursor, FloorDragMode, FloorPlan, PanelMode, SkippedFrame, SoundEvent, UiEffectEvent,
-    WALL_ASCENDING, WALL_DESCENDING, WALL_EAST, WALL_NORTH, WALL_SOUTH, WALL_WEST, WallCursor,
-    WallDragMode, WallFace, WallPlan, WallStyle, WallpaperDragMode, WallpaperPlan,
+    BuyCursor, FloorDragMode, FloorPlan, PanelMode, PoolMode, PoolPlan, RoofPitch as VmRoofPitch,
+    RoofState, SkippedFrame, SoundEvent, TerrainMode, TerrainPlan, UiEffectEvent, WALL_ASCENDING,
+    WALL_DESCENDING, WALL_EAST, WALL_NORTH, WALL_SOUTH, WALL_WEST, WallCursor, WallDragMode,
+    WallFace, WallPlan, WallStyle, WallpaperDragMode, WallpaperPlan, WaterMode, WaterPlan,
 };
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -103,6 +116,8 @@ pub struct Outcome {
     pub neighborhood: bool,
     /// The player clicked the Options → Saves ("Load / Manage Saves") button.
     pub open_save_manager: bool,
+    /// The player clicked the Camera-panel Photo Album button (`CamViewAlbum`).
+    pub open_photo_album: bool,
 }
 
 impl Outcome {
@@ -194,10 +209,28 @@ pub struct Game {
     /// Active Build Mode `"Wall Cursor"` (`0x00000439`) when the Wall or
     /// Wallpaper tool is active.
     wall_cursor: Option<WallCursor>,
-    /// Active Build Mode drag operation (Wall, Floor, or Wallpaper).
+    /// Active Build Mode drag operation (Wall, Floor, Wallpaper, Terrain, Water, or Pool).
     build_drag: Option<BuildDrag>,
     /// Temporary rendered lot shape showing live Build Mode drag/Shift preview.
     build_preview_shape: Option<sims_render::Lot>,
+    /// Baseline roof state parsed from the house's `HOUS 0` chunk (`RoofState::from_house_view`).
+    base_roof: RoofState,
+    /// Lazily loaded `GameData/Roofs/` texture catalog for isometric roof previews.
+    roof_catalog: Option<RoofCatalog>,
+    /// Whether the Camera Roof preview toggle (`UiCamera::Roof`) is active.
+    roof_view: bool,
+    /// Active Terrain tool hover/drag overlay rendered by `sims_render::build_preview`.
+    terrain_hover_overlay: Option<TerrainOverlay>,
+    /// Active Water / Pool tool hover/drag overlay rendered by `sims_render::build_preview`.
+    water_hover_overlay: Option<WaterOverlay>,
+    /// Travel / community-lot Shop, Wardrobe, Pet Adoption & Magic Vendor picker.
+    shop_dialog: ShopPickerDialog,
+    shop_art: Option<Art>,
+    shop_strings: Option<ShopStrings>,
+    shop_snapshot: Option<ShopSnapshot>,
+    purchased_shop_items: BTreeSet<String>,
+    /// Pending Simlish voice requests to be drained by `sound::Feed::update`.
+    voice_inputs: VecDeque<sound::Input>,
     /// Last `clock_us` when `UI_moneyback` (`0x492ad4`) or `UI_archtool_delete`
     /// (`0x492b05`) played, enforcing the native 400 ms sound cooldown.
     buy_moneyback_us: Option<u64>,
@@ -384,6 +417,11 @@ impl Game {
 
         let (neighborhood, characters, index, catalog, house_file, initial_centre) =
             index_catalog_res?;
+        let base_roof = house_file
+            .view
+            .as_ref()
+            .map(RoofState::from_house_view)
+            .unwrap_or_default();
         let index = Arc::new(index);
         let catalog = Arc::new(catalog);
         let (surfaces_res, floor_plugins, wall_plugins) = match surfaces_res {
@@ -592,6 +630,17 @@ impl Game {
             wall_cursor: None,
             build_drag: None,
             build_preview_shape: None,
+            base_roof,
+            roof_catalog: None,
+            roof_view: false,
+            terrain_hover_overlay: None,
+            water_hover_overlay: None,
+            shop_dialog: ShopPickerDialog::new(),
+            shop_art: None,
+            shop_strings: None,
+            shop_snapshot: None,
+            purchased_shop_items: BTreeSet::new(),
+            voice_inputs: VecDeque::new(),
             buy_moneyback_us: None,
             buy_delete_us: None,
             note: None,
@@ -805,6 +854,11 @@ impl Game {
         if let Some(speed) = pace::shown(lot.world()) {
             pace.speed = speed;
         }
+        let base_roof = snapshot
+            .base_house
+            .as_deref()
+            .and_then(parse_base_roof_from_house_bytes)
+            .unwrap_or_default();
         let mut game = Self {
             lot,
             lot_shape,
@@ -839,6 +893,248 @@ impl Game {
             wall_cursor: None,
             build_drag: None,
             build_preview_shape: None,
+            base_roof,
+            roof_catalog: None,
+            roof_view: false,
+            terrain_hover_overlay: None,
+            water_hover_overlay: None,
+            shop_dialog: ShopPickerDialog::new(),
+            shop_art: None,
+            shop_strings: None,
+            shop_snapshot: None,
+            purchased_shop_items: BTreeSet::new(),
+            voice_inputs: VecDeque::new(),
+            buy_moneyback_us: None,
+            buy_delete_us: None,
+            note: None,
+            clock_us: 0,
+            drawn_us: 0,
+            blink_dirty: false,
+            dirty: false,
+            restore_dirty_on_quit_cancel: false,
+            pending_after_save_note: None,
+            edit_mode,
+            edge_scroll_rem: [0, 0],
+            canvas: Canvas::new(1, 1, [0, 0, 0]),
+            lot_cache: sims_render::LotCache::new(),
+            drawn_camera,
+            lot_depth: Vec::new(),
+            people_ids: sims_render::Ids::default(),
+            pie_animations: false,
+            cheat_move_objects: false,
+            cheat_map_edit: false,
+            cheat_autonomy: None,
+            cheat_sim_speed: None,
+            world_mutated_via_restore: false,
+            restore_generation: 0,
+        };
+        game.sync_view();
+        if edit_mode && game.stopped.is_none() {
+            game.lot.set_edit_budget(true);
+            game.set_mode(Mode::Buy);
+        }
+        Ok(game)
+    }
+
+    /// Wraps an already-booted [`Lot`] (e.g. from `sims_vm::travel::depart_to_destination`,
+    /// `resume_active_trip`, `return_from_destination`, or `open_destination_for_edit`)
+    /// into a live [`Game`] session without re-booting the VM.
+    pub fn from_loaded_lot(
+        install_root: &Path,
+        mut lot: Lot,
+        members: Vec<u32>,
+        character_files: &BTreeMap<String, Vec<u8>>,
+        base_house_bytes: Option<&[u8]>,
+        play: bool,
+    ) -> Result<Self, String> {
+        lot.wait_for_answers();
+        let stopped = lot
+            .load_report()
+            .stopped
+            .as_ref()
+            .map(|s| format!("The load stopped, so the lot cannot run: {s}"));
+        let pool = Arc::new(ArchivePool::new());
+        let (render_and_index_res, hud_static_res, people_assets_res) =
+            std::thread::scope(|scope| {
+                let assets_handle = scope.spawn(|| -> Result<_, String> {
+                    let install = Install::detect(install_root).map_err(|e| e.to_string())?;
+                    let (idx_cat_res, base_res, (floor_plugins, wall_plugins)) =
+                        std::thread::scope(|inner| {
+                            let plugins_handle =
+                                inner.spawn(|| Surfaces::plugins_with_pool(&install, &pool));
+                            let base_handle = inner
+                                .spawn(|| BaseAssets::load(&install).map_err(|e| e.to_string()));
+                            let idx_cat_res = (|| -> Result<_, String> {
+                                let mut index =
+                                    Index::build(&install).map_err(|e| e.to_string())?;
+                                if !character_files.is_empty() {
+                                    index
+                                        .add_character_files(character_files)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                                let catalog = Catalog::build_with_pool(&index, &pool)
+                                    .map_err(|e| e.to_string())?;
+                                let index = Arc::new(index);
+                                let catalog = Arc::new(catalog);
+                                let hud_shared_res = HudShared::load(&index, &catalog, &pool);
+                                Ok((index, catalog, hud_shared_res))
+                            })();
+                            (
+                                idx_cat_res,
+                                base_handle.join().expect("base assets worker panicked"),
+                                plugins_handle
+                                    .join()
+                                    .expect("surface plugins worker panicked"),
+                            )
+                        });
+                    let (index, catalog, hud_shared_res) = idx_cat_res?;
+                    let base = base_res?;
+                    Ok((
+                        install,
+                        index,
+                        catalog,
+                        hud_shared_res,
+                        base,
+                        floor_plugins,
+                        wall_plugins,
+                    ))
+                });
+                let hud_handle = scope.spawn(|| -> Result<HudStatic, String> {
+                    let install = Install::detect(install_root).map_err(|e| e.to_string())?;
+                    HudStatic::load(&install, Arc::clone(&pool))
+                });
+                let people_handle = scope.spawn(|| -> Result<_, String> {
+                    let content_assets = ContentAssets::scan(install_root)?;
+                    let people_library = PeopleLibrary::scan_with_pool(&content_assets, &pool)?;
+                    Ok((content_assets, people_library))
+                });
+                (
+                    assets_handle
+                        .join()
+                        .expect("loaded lot assets worker panicked"),
+                    hud_handle.join().expect("hud static worker panicked"),
+                    people_handle.join().expect("people assets worker panicked"),
+                )
+            });
+        let (install, index, catalog, hud_shared_res, base_assets, floor_plugins, wall_plugins) =
+            render_and_index_res?;
+        let assets = sims_render::Assets::from_base(
+            base_assets,
+            floor_plugins,
+            wall_plugins,
+            Arc::clone(&index),
+            Arc::clone(&catalog),
+            Arc::clone(&pool),
+        );
+        let lot_shape = sims_render::Lot::from_world(lot.world())
+            .map_err(|e| e.to_string())?
+            .with_floor_rotation(lot.floor_rotation());
+        let friendship = lot.program().autonomy_constants().friendship_threshold;
+        let world = lot.world();
+        let (hud_res, people_open_res) = std::thread::scope(|scope| {
+            let people_handle = scope.spawn(|| -> Result<People, String> {
+                let (content_assets, people_library) = people_assets_res?;
+                let cast = Cast::from_shared(
+                    install.clone(),
+                    Arc::clone(&index),
+                    Arc::clone(&catalog),
+                    None,
+                    Arc::clone(&pool),
+                )?;
+                let mut people = People::from_inner(sims_people::People::new(
+                    content_assets,
+                    people_library,
+                    cast,
+                ));
+                people.refresh(world);
+                Ok(people)
+            });
+            let hud_res = hud_static_res.and_then(|hud_static| {
+                Hud::from_preloaded_with_members(
+                    &install,
+                    members,
+                    &assets,
+                    world,
+                    friendship,
+                    hud_static,
+                    hud_shared_res,
+                    &pool,
+                )
+            });
+            (
+                hud_res,
+                people_handle
+                    .join()
+                    .expect("people refresh worker panicked"),
+            )
+        });
+        let mut hud = hud_res?;
+        hud.sync_clock_blink(lot.world(), 0);
+        let free_will = hud.controls.options.play.free_will;
+        if lot.world().globals.get(30).copied().unwrap_or(1) != i16::from(free_will) {
+            let _ = lot.set_free_will(free_will);
+        }
+        let mut people = people_open_res?;
+        people.refresh(lot.world());
+        let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
+        let drawn_camera = view.camera;
+        let has_family = lot.world().globals.get(9).copied().unwrap_or(0) != 0;
+        let edit_mode = lot.world().globals.get(32).copied().unwrap_or(0) == 1
+            || (!has_family
+                && (lot.lot_zoning().unwrap_or(0) != 0
+                    || matches!(lot.lot_id(), 21..=30 | 40..=48 | 81..=99)));
+        let mut pace = Pace::default();
+        if let Some(speed) = pace::shown(lot.world()) {
+            pace.speed = speed;
+        }
+        let base_roof = base_house_bytes
+            .and_then(parse_base_roof_from_house_bytes)
+            .unwrap_or_default();
+        let mut game = Self {
+            lot,
+            lot_shape,
+            assets,
+            view,
+            people,
+            hud,
+            pace,
+            play,
+            stopped,
+            errors: Errors::default(),
+            sounds: VecDeque::new(),
+            ui_effects: VecDeque::new(),
+            highlighted_buttons: BTreeSet::new(),
+            highlighted_portraits: BTreeSet::new(),
+            highlighted_relationships: BTreeSet::new(),
+            pointer: None,
+            reached: None,
+            listed: None,
+            highlighted: None,
+            buy_selected: None,
+            buy_cursor: None,
+            buy_in_house: false,
+            buy_last_guid: None,
+            buy_facing: None,
+            buy_dragging: None,
+            buy_grab_offset: [0, 0],
+            buy_commit_on_release: false,
+            live_panel_expanded: true,
+            shift_held: false,
+            ctrl_held: false,
+            wall_cursor: None,
+            build_drag: None,
+            build_preview_shape: None,
+            base_roof,
+            roof_catalog: None,
+            roof_view: false,
+            terrain_hover_overlay: None,
+            water_hover_overlay: None,
+            shop_dialog: ShopPickerDialog::new(),
+            shop_art: None,
+            shop_strings: None,
+            shop_snapshot: None,
+            purchased_shop_items: BTreeSet::new(),
+            voice_inputs: VecDeque::new(),
             buy_moneyback_us: None,
             buy_delete_us: None,
             note: None,
@@ -918,6 +1214,7 @@ impl Game {
         self.buy_cursor.is_some()
             || self.build_drag.is_some()
             || self.wall_cursor.is_some()
+            || self.shop_dialog.is_open()
             || self.hud.dragging_slider()
             || self.hud.dragging_dialog_entry()
             || self.has_dialog()
@@ -1226,6 +1523,8 @@ impl Game {
         }
         self.build_drag = None;
         self.build_preview_shape = None;
+        self.terrain_hover_overlay = None;
+        self.water_hover_overlay = None;
     }
 
     /// Applies an in-place mutation to the live `World` via lossless `Saved`
@@ -1279,6 +1578,73 @@ impl Game {
     /// The lot, for reading.
     pub fn lot(&self) -> &Lot {
         &self.lot
+    }
+
+    /// Mutable access to the active [`Lot`] (used by travel departure/return).
+    pub fn lot_mut(&mut self) -> &mut Lot {
+        &mut self.lot
+    }
+
+    /// Enables or disables the Camera-panel Photo Album button (`CamViewAlbum`, `1105`).
+    pub fn set_album_button_enabled(&mut self, enabled: bool) {
+        self.hud.set_album_button_enabled(enabled);
+    }
+
+    /// Screen rectangle of the Camera-panel Photo Album button, if visible.
+    pub fn album_button_rect(&self) -> Option<sims_ui::frame::Rect> {
+        self.hud.album_button_rect()
+    }
+
+    /// House baseline roof state read from `HOUS 0`.
+    pub fn base_roof(&self) -> &RoofState {
+        &self.base_roof
+    }
+
+    /// Active roof state (live `ROOF_META_ARRAY` edit or `HOUS 0` baseline).
+    pub fn current_roof_state(&self) -> RoofState {
+        self.lot.roof_state_with_base(&self.base_roof)
+    }
+
+    /// Whether the Camera Roof preview toggle (`Camera::Roof`) is active.
+    pub fn roof_view(&self) -> bool {
+        self.roof_view
+    }
+
+    /// Sets the Camera Roof preview toggle (`Camera::Roof`).
+    pub fn set_roof_view(&mut self, on: bool) {
+        self.roof_view = on;
+        self.hud.set_roof_view(on);
+    }
+
+    /// Queues a Simlish voice clip for live person `sim_id` (using its person
+    /// data age/gender/pet flags) to be mixed on the next [`sound::Feed::update`].
+    pub fn play_sim_voice(&mut self, sim_id: u16, category: Option<&str>, seed: u64) -> bool {
+        let Some(person) = self
+            .lot
+            .world()
+            .objects
+            .get(&sim_id)
+            .and_then(|o| o.person.as_ref())
+        else {
+            return false;
+        };
+        let age = person.data.get(58).copied().unwrap_or(27);
+        let gender = person.data.get(65).copied().unwrap_or(0);
+        let flags = person.data.get(74).copied().unwrap_or(0);
+        let voice = sound::voice_for_person(age, gender, flags);
+        self.voice_inputs.push_back(sound::Input::PlayVoice {
+            voice,
+            category: category.map(str::to_owned),
+            pitch: sims_audio::voices::VoicePitch::NATIVE,
+            seed,
+            object: Some(u32::from(sim_id)),
+        });
+        true
+    }
+
+    /// Drains queued Simlish voice mixer inputs (called by [`sound::Feed::update`]).
+    pub fn take_voice_inputs(&mut self) -> Vec<sound::Input> {
+        self.voice_inputs.drain(..).collect()
     }
 
     /// The hour of the game's clock (global 0), 0 to 23.
@@ -2190,6 +2556,36 @@ impl Game {
             render_options,
             &mut self.canvas,
         );
+        // Build Mode Part 2 previews (Terrain overlay, Water/Pool digging preview
+        // with coping border, and isometric Roof preview). Never drawn during static
+        // Live Mode frames when `roof_view` is false, keeping ratchet frames bit-exact.
+        if self.hud.controls.mode == Mode::Build {
+            if let Some(overlay) = self.terrain_hover_overlay {
+                let _ = render_build::draw_terrain_preview(
+                    &self.lot_shape,
+                    Some(world),
+                    &self.view.camera,
+                    &overlay,
+                    &mut self.canvas,
+                );
+            }
+            if let Some(overlay) = self.water_hover_overlay {
+                let _ = render_build::draw_water_preview(
+                    &self.lot_shape,
+                    Some(world),
+                    &self.view.camera,
+                    &overlay,
+                    &mut self.canvas,
+                );
+            }
+        }
+        if self.roof_view
+            || (self.hud.controls.mode == Mode::Build
+                && self.hud.build_state.tool == Some(BuildTool::Roof))
+        {
+            self.draw_roof_preview();
+        }
+        let world = self.lot.world();
         let status = self.status();
         // A dialog the lot waits on is in the lot as the tick left it when
         // it was shown. Read it before the pie menu so a newly opened dialog
@@ -2294,6 +2690,7 @@ impl Game {
             &mut self.canvas,
         );
         self.draw_build_cost_label();
+        self.draw_shop_dialog();
         // The help balloon closed by the selection's going.
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
@@ -2413,6 +2810,17 @@ impl Game {
             return self.leave();
         }
         self.pointer = Some(point);
+        if self.shop_dialog.is_open() {
+            if let Some(snapshot) = &self.shop_snapshot {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                self.shop_dialog
+                    .pointer_move(size, snapshot, point[0], point[1]);
+            }
+            return true;
+        }
         let mut redraw = self.hud.hover(point);
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
@@ -2438,6 +2846,23 @@ impl Game {
     /// (0x5eb3d1 with `+0x170` clear); the entry is chosen, or the menu
     /// closed, on the matching [`Game::release`] (0x5eb433).
     pub fn press(&mut self, point: [i32; 2]) -> Outcome {
+        if self.shop_dialog.is_open() {
+            self.pointer = Some(point);
+            if let Some(snapshot) = &self.shop_snapshot {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                let changed = self
+                    .shop_dialog
+                    .pointer_down(size, snapshot, point[0], point[1]);
+                return Outcome {
+                    redraw: changed,
+                    ..Outcome::default()
+                };
+            }
+            return Outcome::default();
+        }
         if !self.has_dialog() && self.hud.menu.is_some() {
             self.pointer = Some(point);
             let mut redraw = self.hud.hover(point);
@@ -2469,6 +2894,15 @@ impl Game {
                     || self.hud.buy_layout().press(point).is_none())
             {
                 self.sell_held();
+                return Outcome::redraw();
+            }
+            if !self.has_dialog()
+                && self.hud.controls.mode == Mode::Build
+                && let Some(action) = self.hud.press_build_subtool(point)
+            {
+                self.apply_build_subtool(action);
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
                 return Outcome::redraw();
             }
             // The menu, whose entries a choice is an index into.
@@ -2642,6 +3076,20 @@ impl Game {
     ///   it only when `point` is still inside that button.
     /// - Commits a Buy Mode drag or updates/chooses an open pie menu entry.
     pub fn release(&mut self, point: [i32; 2]) -> Outcome {
+        if self.shop_dialog.is_open() {
+            self.pointer = Some(point);
+            let cmd = self.shop_snapshot.as_ref().and_then(|snap| {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                self.shop_dialog.pointer_up(size, snap, point[0], point[1])
+            });
+            return match cmd {
+                Some(cmd) => self.execute_shop_command(cmd),
+                None => Outcome::redraw(),
+            };
+        }
         let released_slider = self.hud.release_slider(Some(point));
         let (released_saves, open_saves) = self.hud.release_saves_button(Some(point));
         if open_saves {
@@ -2650,6 +3098,16 @@ impl Game {
             return Outcome {
                 redraw: true,
                 open_save_manager: true,
+                ..Outcome::default()
+            };
+        }
+        let (released_album, open_album) = self.hud.release_album_button(Some(point));
+        if open_album {
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+            return Outcome {
+                redraw: true,
+                open_photo_album: true,
                 ..Outcome::default()
             };
         }
@@ -2675,7 +3133,11 @@ impl Game {
         }
         if !self.in_view(point) {
             let mut out = self.release_outside();
-            out.redraw |= released_slider || released_saves || released_action || released_dialog;
+            out.redraw |= released_slider
+                || released_saves
+                || released_album
+                || released_action
+                || released_dialog;
             return out;
         }
         if matches!(self.hud.controls.mode, Mode::Buy | Mode::Build)
@@ -2713,7 +3175,11 @@ impl Game {
         }
         if self.has_dialog() || self.hud.menu.is_none() {
             return Outcome {
-                redraw: released_slider || released_saves || released_action || released_dialog,
+                redraw: released_slider
+                    || released_saves
+                    || released_album
+                    || released_action
+                    || released_dialog,
                 ..Outcome::default()
             };
         }
@@ -2771,6 +3237,7 @@ impl Game {
     pub fn release_outside(&mut self) -> Outcome {
         let released_slider = self.hud.release_slider(None);
         let (released_saves, _) = self.hud.release_saves_button(None);
+        let (released_album, _) = self.hud.release_album_button(None);
         let (released_action, _) = self.hud.release_options_action(None);
         let (released_dialog, _) = self.hud.release_dialog(None);
         if self.buy_dragging.take().is_some() {
@@ -2778,6 +3245,7 @@ impl Game {
             let redraw = self.hide_buy_cursor()
                 || released_slider
                 || released_saves
+                || released_album
                 || released_action
                 || released_dialog;
             return Outcome {
@@ -2792,7 +3260,11 @@ impl Game {
         }
         if self.has_dialog() || self.hud.menu.is_none() {
             return Outcome {
-                redraw: released_slider || released_saves || released_action || released_dialog,
+                redraw: released_slider
+                    || released_saves
+                    || released_album
+                    || released_action
+                    || released_dialog,
                 ..Outcome::default()
             };
         }
@@ -3553,7 +4025,9 @@ impl Game {
                     ..Outcome::default()
                 },
                 UiCamera::Roof => {
-                    self.note = Some("Roofs are not drawn yet.".into());
+                    self.roof_view = !self.roof_view;
+                    self.hud.set_roof_view(self.roof_view);
+                    self.hud.play(crate::hud::CLICK);
                     Outcome::redraw()
                 }
             },
@@ -4156,6 +4630,7 @@ impl Game {
                 self.dirty = true;
                 self.refresh_world();
                 if self.hud.controls.mode == Mode::Build {
+                    self.sync_build_roof_ui();
                     self.layout_build();
                 } else {
                     self.layout_buy();
@@ -4267,6 +4742,8 @@ impl Game {
         self.wall_cursor = None;
         self.build_drag = None;
         self.build_preview_shape = None;
+        self.terrain_hover_overlay = None;
+        self.water_hover_overlay = None;
         self.hud.buy_state.selected = None;
         self.close_menu();
         self.reached = None;
@@ -4310,6 +4787,7 @@ impl Game {
             None,
         );
         if mode == Mode::Build {
+            self.sync_build_roof_ui();
             self.layout_build();
         }
     }
@@ -4673,6 +5151,8 @@ impl Game {
         self.cancel_buy();
         self.build_drag = None;
         self.build_preview_shape = None;
+        self.terrain_hover_overlay = None;
+        self.water_hover_overlay = None;
         let catalog = self.hud.ensure_build_catalog(&self.assets).clone();
         self.hud.build_state.select_tool(tool, &catalog);
         match tool {
@@ -4683,12 +5163,197 @@ impl Game {
             BuildTool::Wallpaper => {
                 self.open_wall_cursor(2);
             }
+            BuildTool::Roof => {
+                self.close_wall_cursor();
+                self.sync_build_roof_ui();
+            }
             _ => {
                 self.close_wall_cursor();
             }
         }
         self.layout_build();
         self.refresh_world();
+    }
+
+    /// Applies a Build Mode Part 2 subtool button or roof pattern/pitch selection
+    /// (`Terrain`, `Water`/`Pool`, `RoofPitch`, `RoofPattern`, or narrow-viewport `ToolPage`).
+    pub fn apply_build_subtool(&mut self, action: BuildSubtoolAction) -> bool {
+        if self.hud.controls.mode != Mode::Build {
+            return false;
+        }
+        let catalog = self.hud.ensure_build_catalog(&self.assets).clone();
+        let state_changed = self.hud.build_state.apply_subtool(action, &catalog);
+        match action {
+            BuildSubtoolAction::Terrain(_) | BuildSubtoolAction::Water(_) => {
+                self.cancel_buy();
+                self.build_drag = None;
+                self.build_preview_shape = None;
+                self.terrain_hover_overlay = None;
+                self.water_hover_overlay = None;
+                self.close_wall_cursor();
+                self.hud.play(crate::hud::CLICK);
+            }
+            BuildSubtoolAction::RoofPitch(preset) => {
+                self.cancel_buy();
+                self.build_drag = None;
+                self.build_preview_shape = None;
+                self.terrain_hover_overlay = None;
+                self.water_hover_overlay = None;
+                self.close_wall_cursor();
+                let plan = sims_vm::plan_roof_pitch_with_base(
+                    self.lot.world(),
+                    &self.base_roof,
+                    vm_roof_pitch(preset),
+                );
+                if plan.valid {
+                    match self.lot.build_commit_roof(&plan) {
+                        Ok(true) => {
+                            self.dirty = true;
+                            self.hud.play(crate::hud::CLICK);
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            self.note = Some(format!("Roof pitch change failed: {e}"));
+                            self.hud.play(crate::hud::ERROR);
+                        }
+                    }
+                } else {
+                    self.hud.play(crate::hud::CLICK);
+                }
+                self.sync_build_roof_ui();
+            }
+            BuildSubtoolAction::RoofPattern(idx) => {
+                self.cancel_buy();
+                self.build_drag = None;
+                self.build_preview_shape = None;
+                self.terrain_hover_overlay = None;
+                self.water_hover_overlay = None;
+                self.close_wall_cursor();
+                if let Some(pat) = catalog.roof_patterns().get(idx) {
+                    let plan = sims_vm::plan_roof_pattern_with_base(
+                        self.lot.world(),
+                        &self.base_roof,
+                        &pat.stem,
+                    );
+                    if plan.valid {
+                        match self.lot.build_commit_roof(&plan) {
+                            Ok(true) => {
+                                self.dirty = true;
+                                self.hud.play(crate::hud::CLICK);
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                self.note = Some(format!("Roof pattern change failed: {e}"));
+                                self.hud.play(crate::hud::ERROR);
+                            }
+                        }
+                    } else {
+                        self.hud.play(crate::hud::CLICK);
+                    }
+                }
+                self.sync_build_roof_ui();
+            }
+            BuildSubtoolAction::ToolPage(_) => {
+                self.hud.play(crate::hud::CLICK);
+            }
+        }
+        self.layout_build();
+        state_changed
+    }
+
+    /// Synchronizes `hud.build_state`'s Roof pitch & pattern index from the lot's
+    /// live roof state (or `HOUS 0` baseline) so the UI and Undo/Redo always match.
+    fn sync_build_roof_ui(&mut self) {
+        let state = self.lot.roof_state_with_base(&self.base_roof);
+        self.hud.build_state.roof_pitch = ui_roof_pitch_preset(state.pitch);
+        let catalog = self.hud.ensure_build_catalog(&self.assets);
+        let target = state.pattern.trim().to_ascii_lowercase();
+        let target_stem = target.strip_suffix(".bmp").unwrap_or(target.as_str());
+        if let Some(idx) = catalog.roof_patterns().iter().position(|p| {
+            let stem = p.stem.trim().to_ascii_lowercase();
+            let s = stem.strip_suffix(".bmp").unwrap_or(stem.as_str());
+            s == target_stem
+        }) {
+            self.hud.build_state.roof_pattern = idx;
+        }
+    }
+
+    fn draw_roof_preview(&mut self) {
+        if self.roof_catalog.is_none() {
+            if let Ok(cat) = RoofCatalog::load(self.hud.install()) {
+                self.roof_catalog = Some(cat);
+            } else {
+                return;
+            }
+        }
+        let Some(catalog) = self.roof_catalog.as_ref() else {
+            return;
+        };
+        let state = self.lot.roof_state_with_base(&self.base_roof);
+        let config = RoofPreviewConfig {
+            pattern_name: state.pattern,
+            style: RoofStyle::Hip,
+            pitch: render_roof_pitch(state.pitch),
+            custom_slope: None,
+            level: None,
+            footprint: None,
+        };
+        let _ = render_build::draw_roof_preview_from_catalog(
+            &self.lot_shape,
+            &self.view.camera,
+            catalog,
+            &config,
+            &mut self.canvas,
+        );
+    }
+
+    fn current_terrain_mode(&self) -> TerrainMode {
+        match self.hud.build_state.terrain_subtool {
+            TerrainSubtool::Raise => {
+                if self.ctrl_held {
+                    TerrainMode::Lower
+                } else {
+                    TerrainMode::Raise
+                }
+            }
+            TerrainSubtool::Lower => {
+                if self.ctrl_held {
+                    TerrainMode::Raise
+                } else {
+                    TerrainMode::Lower
+                }
+            }
+            TerrainSubtool::Level => {
+                if self.shift_held {
+                    TerrainMode::LevelAverage
+                } else {
+                    TerrainMode::Level
+                }
+            }
+            TerrainSubtool::Grass => {
+                if self.ctrl_held {
+                    TerrainMode::RemoveGrass
+                } else {
+                    TerrainMode::RestoreGrass
+                }
+            }
+        }
+    }
+
+    fn current_water_mode(&self) -> WaterMode {
+        if self.ctrl_held {
+            WaterMode::Remove
+        } else {
+            WaterMode::Paint
+        }
+    }
+
+    fn current_pool_mode(&self) -> PoolMode {
+        if self.ctrl_held {
+            PoolMode::Demolish
+        } else {
+            PoolMode::Dig
+        }
     }
 
     /// Steps the Build Mode catalog grid page by `delta`.
@@ -5044,6 +5709,7 @@ impl Game {
         // 1. Update active drag if one is in progress.
         if let Some(mut drag) = self.build_drag.take() {
             let prices = self.hud.build_prices(&self.assets);
+            let tool_prices = self.hud.tool_prices(&self.assets);
             match &mut drag {
                 BuildDrag::Wall {
                     start_corner,
@@ -5052,6 +5718,8 @@ impl Game {
                     mode,
                     plan,
                 } => {
+                    self.terrain_hover_overlay = None;
+                    self.water_hover_overlay = None;
                     let fine = self.unproject_build_fine(point);
                     let corner = sims_vm::snap_wall_corner(fine, active);
                     *end_corner = corner;
@@ -5094,6 +5762,8 @@ impl Game {
                     split_half,
                     plan,
                 } => {
+                    self.terrain_hover_overlay = None;
+                    self.water_hover_overlay = None;
                     let fine = self.unproject_build_fine(point);
                     let tile = [fine[0] >> 4, fine[1] >> 4];
                     *end_tile = tile;
@@ -5126,6 +5796,8 @@ impl Game {
                     mode,
                     plan,
                 } => {
+                    self.terrain_hover_overlay = None;
+                    self.water_hover_overlay = None;
                     *mode = self.current_wallpaper_drag_mode();
                     if let Some(face) = self.pick_wall_face(point) {
                         if let Some(mut cur) = self.wall_cursor.take() {
@@ -5158,13 +5830,99 @@ impl Game {
                     }
                     *plan = Some(computed);
                 }
+                BuildDrag::Terrain {
+                    start,
+                    end,
+                    mode,
+                    plan,
+                } => {
+                    self.water_hover_overlay = None;
+                    self.build_preview_shape = None;
+                    *mode = self.current_terrain_mode();
+                    let fine = self.unproject_build_fine(point);
+                    *end = terrain_coord_for_mode(fine, active, *mode);
+                    let computed = sims_vm::plan_terrain_edit(
+                        self.lot.world(),
+                        *start,
+                        *end,
+                        *mode,
+                        &tool_prices,
+                    );
+                    self.terrain_hover_overlay =
+                        Some(terrain_overlay_for_drag(*start, *end, *mode));
+                    *plan = Some(computed);
+                }
+                BuildDrag::Water {
+                    start_tile,
+                    end_tile,
+                    mode,
+                    plan,
+                } => {
+                    self.terrain_hover_overlay = None;
+                    self.build_preview_shape = None;
+                    *mode = self.current_water_mode();
+                    let fine = self.unproject_build_fine(point);
+                    let tile = [fine[0] >> 4, fine[1] >> 4];
+                    *end_tile = tile;
+                    let computed = sims_vm::plan_water_edit(
+                        self.lot.world(),
+                        *start_tile,
+                        *end_tile,
+                        *mode,
+                        &tool_prices,
+                    );
+                    self.water_hover_overlay = Some(WaterOverlay {
+                        tool: RenderWaterTool::Pond,
+                        action: if *mode == WaterMode::Remove {
+                            WaterAction::Remove
+                        } else {
+                            WaterAction::Dig
+                        },
+                        start: *start_tile,
+                        end: *end_tile,
+                    });
+                    *plan = Some(computed);
+                }
+                BuildDrag::Pool {
+                    start_tile,
+                    end_tile,
+                    mode,
+                    plan,
+                } => {
+                    self.terrain_hover_overlay = None;
+                    self.build_preview_shape = None;
+                    *mode = self.current_pool_mode();
+                    let fine = self.unproject_build_fine(point);
+                    let tile = [fine[0] >> 4, fine[1] >> 4];
+                    *end_tile = tile;
+                    let computed = sims_vm::plan_pool_edit(
+                        self.lot.world(),
+                        *start_tile,
+                        *end_tile,
+                        *mode,
+                        &tool_prices,
+                    );
+                    self.water_hover_overlay = Some(WaterOverlay {
+                        tool: RenderWaterTool::Pool,
+                        action: if *mode == PoolMode::Demolish {
+                            WaterAction::Remove
+                        } else {
+                            WaterAction::Dig
+                        },
+                        start: *start_tile,
+                        end: *end_tile,
+                    });
+                    *plan = Some(computed);
+                }
             }
             self.build_drag = Some(drag);
             return true;
         }
 
-        // 2. Non-dragging hover: move `"Wall Cursor"` and preview Shift room-fills.
+        // 2. Non-dragging hover: move `"Wall Cursor"`, Terrain/Water overlays, and Shift room-fills.
         self.build_preview_shape = None;
+        self.terrain_hover_overlay = None;
+        self.water_hover_overlay = None;
         match tool {
             Some(BuildTool::Wall) => {
                 let fine = self.unproject_build_fine(point);
@@ -5240,21 +5998,59 @@ impl Game {
                 }
                 false
             }
+            Some(BuildTool::Terrain) => {
+                let mode = self.current_terrain_mode();
+                let fine = self.unproject_build_fine(point);
+                let coord = terrain_coord_for_mode(fine, active, mode);
+                self.terrain_hover_overlay = Some(terrain_overlay_for_drag(coord, coord, mode));
+                true
+            }
+            Some(BuildTool::Water) => {
+                let fine = self.unproject_build_fine(point);
+                let tile = [fine[0] >> 4, fine[1] >> 4];
+                let (wtool, action) = match self.hud.build_state.water_subtool {
+                    WaterSubtool::Pool => (
+                        RenderWaterTool::Pool,
+                        if self.ctrl_held {
+                            WaterAction::Remove
+                        } else {
+                            WaterAction::Dig
+                        },
+                    ),
+                    WaterSubtool::Water => (
+                        RenderWaterTool::Pond,
+                        if self.ctrl_held {
+                            WaterAction::Remove
+                        } else {
+                            WaterAction::Dig
+                        },
+                    ),
+                };
+                self.water_hover_overlay = Some(WaterOverlay {
+                    tool: wtool,
+                    action,
+                    start: tile,
+                    end: tile,
+                });
+                true
+            }
             _ => false,
         }
     }
 
     fn hide_build_cursor(&mut self) -> bool {
-        self.build_preview_shape = None;
+        let had_overlay = self.build_preview_shape.take().is_some()
+            || self.terrain_hover_overlay.take().is_some()
+            || self.water_hover_overlay.take().is_some();
         let Some(mut cur) = self.wall_cursor.take() else {
-            return false;
+            return had_overlay;
         };
         let was_on_lot = cur.position[0] >= 0;
         if was_on_lot {
             let _ = self.lot.build_cursor_hide(&mut cur);
         }
         self.wall_cursor = Some(cur);
-        was_on_lot
+        was_on_lot || had_overlay
     }
 
     fn press_build(&mut self, point: [i32; 2]) -> Outcome {
@@ -5385,6 +6181,88 @@ impl Game {
                 self.keep_sounds(sounds);
                 Outcome::redraw()
             }
+            Some(BuildTool::Terrain) => {
+                let mode = self.current_terrain_mode();
+                let fine = self.unproject_build_fine(point);
+                let coord = terrain_coord_for_mode(fine, active, mode);
+                let tool_prices = self.hud.tool_prices(&self.assets);
+                let plan =
+                    sims_vm::plan_terrain_edit(self.lot.world(), coord, coord, mode, &tool_prices);
+                self.terrain_hover_overlay = Some(terrain_overlay_for_drag(coord, coord, mode));
+                self.build_drag = Some(BuildDrag::Terrain {
+                    start: coord,
+                    end: coord,
+                    mode,
+                    plan: Some(plan),
+                });
+                self.hud.play(crate::hud::BLD_DRAG_DOWN);
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+            Some(BuildTool::Water) => {
+                let fine = self.unproject_build_fine(point);
+                let tile = [fine[0] >> 4, fine[1] >> 4];
+                let tool_prices = self.hud.tool_prices(&self.assets);
+                match self.hud.build_state.water_subtool {
+                    WaterSubtool::Pool => {
+                        let mode = self.current_pool_mode();
+                        let plan = sims_vm::plan_pool_edit(
+                            self.lot.world(),
+                            tile,
+                            tile,
+                            mode,
+                            &tool_prices,
+                        );
+                        self.water_hover_overlay = Some(WaterOverlay {
+                            tool: RenderWaterTool::Pool,
+                            action: if mode == PoolMode::Demolish {
+                                WaterAction::Remove
+                            } else {
+                                WaterAction::Dig
+                            },
+                            start: tile,
+                            end: tile,
+                        });
+                        self.build_drag = Some(BuildDrag::Pool {
+                            start_tile: tile,
+                            end_tile: tile,
+                            mode,
+                            plan: Some(plan),
+                        });
+                    }
+                    WaterSubtool::Water => {
+                        let mode = self.current_water_mode();
+                        let plan = sims_vm::plan_water_edit(
+                            self.lot.world(),
+                            tile,
+                            tile,
+                            mode,
+                            &tool_prices,
+                        );
+                        self.water_hover_overlay = Some(WaterOverlay {
+                            tool: RenderWaterTool::Pond,
+                            action: if mode == WaterMode::Remove {
+                                WaterAction::Remove
+                            } else {
+                                WaterAction::Dig
+                            },
+                            start: tile,
+                            end: tile,
+                        });
+                        self.build_drag = Some(BuildDrag::Water {
+                            start_tile: tile,
+                            end_tile: tile,
+                            mode,
+                            plan: Some(plan),
+                        });
+                    }
+                }
+                self.hud.play(crate::hud::BLD_DRAG_DOWN);
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
             _ => Outcome::default(),
         }
     }
@@ -5393,6 +6271,8 @@ impl Game {
         if self.hud.covers(point) {
             self.build_drag = None;
             self.build_preview_shape = None;
+            self.terrain_hover_overlay = None;
+            self.water_hover_overlay = None;
             self.hide_build_cursor();
             return Outcome::redraw();
         }
@@ -5402,6 +6282,8 @@ impl Game {
             return Outcome::default();
         };
         self.build_preview_shape = None;
+        self.terrain_hover_overlay = None;
+        self.water_hover_overlay = None;
         match drag {
             BuildDrag::Wall {
                 start_corner,
@@ -5490,6 +6372,79 @@ impl Game {
                     }
                 }
             }
+            BuildDrag::Terrain { plan, .. } => {
+                if let Some(plan) = plan {
+                    if plan.valid && plan.affordable {
+                        match self.lot.build_commit_terrain(&plan) {
+                            Ok(true) => {
+                                self.dirty = true;
+                                self.hud.play(crate::hud::BLD_DRAG_UP);
+                            }
+                            Ok(false) => self.hud.play(crate::hud::ERROR),
+                            Err(e) => {
+                                self.note = Some(format!("Terrain edit failed: {e}"));
+                                self.hud.play(crate::hud::ERROR);
+                            }
+                        }
+                    } else if !plan.affordable {
+                        self.hud.play(crate::hud::ERROR);
+                    }
+                }
+            }
+            BuildDrag::Water { mode, plan, .. } => {
+                if let Some(plan) = plan {
+                    if plan.valid && plan.affordable {
+                        match self.lot.build_commit_water(&plan) {
+                            Ok(true) => {
+                                self.dirty = true;
+                                if mode == WaterMode::Remove {
+                                    self.hud.play(if plan.net_cost < 0 {
+                                        crate::hud::MONEYBACK
+                                    } else {
+                                        crate::hud::ARCHTOOL_DELETE
+                                    });
+                                } else {
+                                    self.hud.play(crate::hud::BLD_DRAG_UP);
+                                }
+                            }
+                            Ok(false) => self.hud.play(crate::hud::ERROR),
+                            Err(e) => {
+                                self.note = Some(format!("Water edit failed: {e}"));
+                                self.hud.play(crate::hud::ERROR);
+                            }
+                        }
+                    } else if !plan.affordable {
+                        self.hud.play(crate::hud::ERROR);
+                    }
+                }
+            }
+            BuildDrag::Pool { mode, plan, .. } => {
+                if let Some(plan) = plan {
+                    if plan.valid && plan.affordable {
+                        match self.lot.build_commit_pool(&plan) {
+                            Ok(true) => {
+                                self.dirty = true;
+                                if mode == PoolMode::Demolish {
+                                    self.hud.play(if plan.net_cost < 0 {
+                                        crate::hud::MONEYBACK
+                                    } else {
+                                        crate::hud::ARCHTOOL_DELETE
+                                    });
+                                } else {
+                                    self.hud.play(crate::hud::BLD_DRAG_UP);
+                                }
+                            }
+                            Ok(false) => self.hud.play(crate::hud::ERROR),
+                            Err(e) => {
+                                self.note = Some(format!("Pool edit failed: {e}"));
+                                self.hud.play(crate::hud::ERROR);
+                            }
+                        }
+                    } else if !plan.affordable {
+                        self.hud.play(crate::hud::ERROR);
+                    }
+                }
+            }
         }
         self.refresh_world();
         self.layout_build();
@@ -5499,7 +6454,7 @@ impl Game {
     }
 
     /// Draws the floating Architecture cost/refund tag next to the cursor while
-    /// dragging a wall, floor, or wallpaper edit.
+    /// dragging a wall, floor, wallpaper, terrain, water, or pool edit.
     fn draw_build_cost_label(&mut self) {
         let Some([px, py]) = self.pointer else {
             return;
@@ -5510,6 +6465,9 @@ impl Game {
             Some(BuildDrag::Wallpaper { plan: Some(p), .. }) if p.valid => {
                 (p.net_cost, p.affordable)
             }
+            Some(BuildDrag::Terrain { plan: Some(p), .. }) if p.valid => (p.net_cost, p.affordable),
+            Some(BuildDrag::Water { plan: Some(p), .. }) if p.valid => (p.net_cost, p.affordable),
+            Some(BuildDrag::Pool { plan: Some(p), .. }) if p.valid => (p.net_cost, p.affordable),
             _ => return,
         };
         if cost == 0 {
@@ -5565,6 +6523,312 @@ impl Game {
                 .note(vec![format!("the lot is not redrawn: {e}")]),
         }
     }
+
+    /// Whether the travel / community-lot [`ShopPickerDialog`] is open.
+    pub fn shop_open(&self) -> bool {
+        self.shop_dialog.is_open()
+    }
+
+    /// Active [`ShopPickerDialog`] controller.
+    pub fn shop_dialog(&self) -> &ShopPickerDialog {
+        &self.shop_dialog
+    }
+
+    /// Active [`ShopSnapshot`], when the shop picker is open.
+    pub fn shop_snapshot(&self) -> Option<&ShopSnapshot> {
+        self.shop_snapshot.as_ref()
+    }
+
+    /// Default [`ShopKind`] matching the active lot's expansion / community zoning.
+    pub fn shop_kind_for_lot(&self) -> Option<ShopKind> {
+        let lot_id = self.lot.lot_id();
+        match lot_id {
+            21..=30 => Some(ShopKind::DowntownBoutique(WardrobeCategory::Formal)),
+            40..=48 => Some(ShopKind::VacationKiosk),
+            81..=89 => Some(ShopKind::StudioWardrobe),
+            90..=98 => Some(ShopKind::MagicVendor),
+            _ if !self.lot.residential() => Some(ShopKind::PetAdoption),
+            _ => None,
+        }
+    }
+
+    /// Opens the community-lot [`ShopPickerDialog`] for `kind` with curated
+    /// destination items and the active household's live Simoleons & MagiCoins wallet.
+    pub fn open_shop(&mut self, kind: ShopKind) -> bool {
+        let items = build_default_shop_items(kind, &self.purchased_shop_items);
+        self.open_shop_with_items(kind, items)
+    }
+
+    /// Opens [`ShopPickerDialog`] with explicit `items` and the live household wallet.
+    pub fn open_shop_with_items(&mut self, kind: ShopKind, mut items: Vec<ShopItem>) -> bool {
+        self.ensure_shop_assets();
+        for item in &mut items {
+            if self.purchased_shop_items.contains(&item.id) {
+                item.owned = true;
+            }
+        }
+        let wallet = self.current_shop_wallet();
+        let shopper_name = self.lot.world().selected_whereabouts().and_then(|_| {
+            let sel = self.lot.world().globals.get(1).copied().unwrap_or(0) as u16;
+            self.lot
+                .world()
+                .objects
+                .get(&sel)
+                .and_then(|o| self.hud.name(o.guid))
+                .map(str::to_owned)
+        });
+        self.shop_snapshot = Some(ShopSnapshot {
+            kind,
+            title_override: None,
+            shopper_name,
+            wallet,
+            items,
+            tried_on_item_id: None,
+        });
+        self.shop_dialog.open();
+        self.close_menu();
+        true
+    }
+
+    /// Closes the open [`ShopPickerDialog`].
+    pub fn close_shop(&mut self) {
+        self.shop_dialog.close();
+        self.shop_snapshot = None;
+    }
+
+    pub fn shop_select_prev(&mut self) -> bool {
+        self.shop_snapshot
+            .as_ref()
+            .is_some_and(|snap| self.shop_dialog.select_prev(snap))
+    }
+
+    pub fn shop_select_next(&mut self) -> bool {
+        self.shop_snapshot
+            .as_ref()
+            .is_some_and(|snap| self.shop_dialog.select_next(snap))
+    }
+
+    pub fn shop_wheel(&mut self, delta_y: f64) -> bool {
+        let delta = if delta_y > 0.0 {
+            -1
+        } else if delta_y < 0.0 {
+            1
+        } else {
+            return false;
+        };
+        let size = [
+            self.view.size[0].max(1) as u32,
+            self.view.size[1].max(1) as u32,
+        ];
+        self.shop_snapshot
+            .as_ref()
+            .is_some_and(|snap| self.shop_dialog.scroll(delta, size, snap))
+    }
+
+    pub fn shop_submit(&mut self) -> Outcome {
+        let cmd = self
+            .shop_snapshot
+            .as_ref()
+            .and_then(|snap| self.shop_dialog.submit(snap));
+        match cmd {
+            Some(cmd) => self.execute_shop_command(cmd),
+            None => Outcome::default(),
+        }
+    }
+
+    pub fn shop_escape(&mut self) -> Outcome {
+        match self.shop_dialog.escape() {
+            Some(cmd) => self.execute_shop_command(cmd),
+            None => Outcome::default(),
+        }
+    }
+
+    /// Executes a [`ShopCommand`] emitted by [`ShopPickerDialog`], deducting
+    /// Simoleons or MagiCoins atomically from the live household state.
+    pub fn execute_shop_command(&mut self, cmd: ShopCommand) -> Outcome {
+        match cmd {
+            ShopCommand::Cancel => {
+                self.close_shop();
+                self.hud.play(crate::hud::CLICK);
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+            ShopCommand::TryOn { item_id } => {
+                let mut tried_name = item_id.clone();
+                if let Some(snap) = &mut self.shop_snapshot {
+                    snap.tried_on_item_id = Some(item_id.clone());
+                    if let Some(item) = snap.items.iter().find(|i| i.id == item_id) {
+                        tried_name = item.name.clone();
+                    }
+                }
+                self.note = Some(format!("Trying on {tried_name}."));
+                self.hud.play(crate::hud::CLICK);
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+            ShopCommand::Buy {
+                item_id,
+                currency,
+                price,
+            } => {
+                if price < 0 {
+                    self.hud.play(crate::hud::ERROR);
+                    let sounds = self.hud.take_sounds();
+                    self.keep_sounds(sounds);
+                    return Outcome::redraw();
+                }
+                let wallet = self.current_shop_wallet();
+                if !wallet.can_afford(price, currency) {
+                    self.note = Some(format!(
+                        "Insufficient funds for purchase ({}).",
+                        currency.format_price(price)
+                    ));
+                    self.hud.play(crate::hud::ERROR);
+                    let sounds = self.hud.take_sounds();
+                    self.keep_sounds(sounds);
+                    return Outcome::redraw();
+                }
+                let deduct_res = self.deduct_shop_currency(currency, price);
+                match deduct_res {
+                    Ok(()) => {
+                        self.purchased_shop_items.insert(item_id.clone());
+                        let next_wallet = self.current_shop_wallet();
+                        let mut bought_name = item_id.clone();
+                        if let Some(snap) = &mut self.shop_snapshot {
+                            snap.wallet = next_wallet;
+                            if let Some(item) = snap.items.iter_mut().find(|i| i.id == item_id) {
+                                item.owned = true;
+                                bought_name = item.name.clone();
+                            }
+                        }
+                        self.note = Some(format!(
+                            "Purchased {bought_name} for {}.",
+                            currency.format_price(price)
+                        ));
+                        self.hud.play(crate::hud::MONEYBACK);
+                    }
+                    Err(e) => {
+                        self.note = Some(format!("Purchase failed: {e}"));
+                        self.hud.play(crate::hud::ERROR);
+                    }
+                }
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+        }
+    }
+
+    fn current_shop_wallet(&self) -> Wallet {
+        let world = self.lot.world();
+        let simoleons = sims_vm::available_funds(world).max(0);
+        let fam_id = i32::from(world.globals.get(9).copied().unwrap_or(0));
+        let members: Vec<u32> = world
+            .families
+            .iter()
+            .find(|f| f.id == fam_id)
+            .map(|f| f.members.clone())
+            .unwrap_or_default();
+        let magic_coins = sims_vm::travel::family_magic_coins(world, &members).max(0);
+        Wallet {
+            simoleons,
+            magic_coins,
+        }
+    }
+
+    fn deduct_shop_currency(&mut self, currency: CurrencyKind, price: i32) -> Result<(), String> {
+        if price == 0 {
+            return Ok(());
+        }
+        self.mutate_world_via_saved(|world| {
+            let fam_id = i32::from(world.globals.get(9).copied().unwrap_or(0));
+            match currency {
+                CurrencyKind::Simoleons => {
+                    world.budget.funds = world.budget.funds.saturating_sub(price).max(0);
+                }
+                CurrencyKind::MagiCoins => {
+                    let members: Vec<u32> = world
+                        .families
+                        .iter()
+                        .find(|f| f.id == fam_id)
+                        .map(|f| f.members.clone())
+                        .unwrap_or_default();
+                    let mut remaining = price.max(0);
+                    for guid in members {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let Some(nid) = world
+                            .neighbors
+                            .slots
+                            .iter()
+                            .flatten()
+                            .find(|r| r.guid == guid)
+                            .map(|r| r.id)
+                        else {
+                            continue;
+                        };
+                        let have = i32::from(sims_vm::travel::neighbor_token_count(
+                            world,
+                            nid,
+                            sims_vm::travel::MAGICOIN_TOKEN_KIND,
+                            sims_vm::travel::MAGICOIN_TOKEN_GUID,
+                        ));
+                        if have > 0 {
+                            let take = have.min(remaining);
+                            let next = u16::try_from((have - take).max(0)).unwrap_or(0);
+                            sims_vm::travel::set_neighbor_token_count(
+                                world,
+                                nid,
+                                sims_vm::travel::MAGICOIN_TOKEN_KIND,
+                                sims_vm::travel::MAGICOIN_TOKEN_GUID,
+                                next,
+                            );
+                            remaining -= take;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn ensure_shop_assets(&mut self) {
+        if self.shop_strings.is_none() {
+            let strings = ShopStrings::load(self.hud.install(), US_ENGLISH).unwrap_or_default();
+            self.shop_strings = Some(strings);
+        }
+        if self.shop_art.is_none()
+            && let Ok(ui) = UiGraphics::open(self.hud.install())
+            && let Ok(art) = sims_ui::shop::load_art(&ui, US_ENGLISH)
+        {
+            self.shop_art = Some(art);
+        }
+    }
+
+    fn draw_shop_dialog(&mut self) {
+        if !self.shop_dialog.is_open() {
+            return;
+        }
+        self.ensure_shop_assets();
+        let Some(snapshot) = self.shop_snapshot.as_ref() else {
+            return;
+        };
+        let strings = self.shop_strings.clone().unwrap_or_default();
+        let art = self.shop_art.as_ref().unwrap_or(&self.hud.art);
+        let (w, h) = (
+            u32::try_from(self.canvas.width).unwrap_or(0),
+            u32::try_from(self.canvas.height).unwrap_or(0),
+        );
+        let Ok(mut frame) =
+            sims_ui::frame::Frame::from_rgb(w, h, std::mem::take(&mut self.canvas.color))
+        else {
+            return;
+        };
+        self.shop_dialog.draw(&mut frame, snapshot, &strings, art);
+        self.canvas.color = frame.into_rgb();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5590,6 +6854,330 @@ enum BuildDrag {
         mode: WallpaperDragMode,
         plan: Option<WallpaperPlan>,
     },
+    Terrain {
+        start: [i32; 2],
+        end: [i32; 2],
+        mode: TerrainMode,
+        plan: Option<TerrainPlan>,
+    },
+    Water {
+        start_tile: [i32; 2],
+        end_tile: [i32; 2],
+        mode: WaterMode,
+        plan: Option<WaterPlan>,
+    },
+    Pool {
+        start_tile: [i32; 2],
+        end_tile: [i32; 2],
+        mode: PoolMode,
+        plan: Option<PoolPlan>,
+    },
+}
+
+fn parse_base_roof_from_house_bytes(bytes: &[u8]) -> Option<RoofState> {
+    let iff = sims_formats::iff::Iff::parse(bytes.to_vec()).ok()?;
+    let chunk = iff.get(b"HOUS", 0)?;
+    let view = sims_formats::lot::HouseView::parse(iff.data(chunk)).ok()?;
+    Some(RoofState::from_house_view(&view))
+}
+
+const fn vm_roof_pitch(preset: RoofPitchPreset) -> VmRoofPitch {
+    match preset {
+        RoofPitchPreset::Flat => VmRoofPitch::Flat,
+        RoofPitchPreset::Shallow => VmRoofPitch::Shallow,
+        RoofPitchPreset::Medium => VmRoofPitch::Medium,
+        RoofPitchPreset::Steep => VmRoofPitch::Steep,
+    }
+}
+
+const fn ui_roof_pitch_preset(pitch: VmRoofPitch) -> RoofPitchPreset {
+    match pitch {
+        VmRoofPitch::Flat => RoofPitchPreset::Flat,
+        VmRoofPitch::Shallow => RoofPitchPreset::Shallow,
+        VmRoofPitch::Medium => RoofPitchPreset::Medium,
+        VmRoofPitch::Steep => RoofPitchPreset::Steep,
+    }
+}
+
+const fn render_roof_pitch(pitch: VmRoofPitch) -> RenderRoofPitch {
+    match pitch {
+        VmRoofPitch::Flat => RenderRoofPitch::Flat,
+        VmRoofPitch::Shallow => RenderRoofPitch::Shallow,
+        VmRoofPitch::Medium => RenderRoofPitch::Medium,
+        VmRoofPitch::Steep => RenderRoofPitch::Steep,
+    }
+}
+
+fn terrain_coord_for_mode(fine: [i32; 2], active: usize, mode: TerrainMode) -> [i32; 2] {
+    match mode {
+        TerrainMode::RestoreGrass | TerrainMode::RemoveGrass => [fine[0] >> 4, fine[1] >> 4],
+        TerrainMode::Raise
+        | TerrainMode::Lower
+        | TerrainMode::Level
+        | TerrainMode::LevelAverage => sims_vm::snap_wall_corner(fine, active),
+    }
+}
+
+fn terrain_overlay_for_drag(start: [i32; 2], end: [i32; 2], mode: TerrainMode) -> TerrainOverlay {
+    match mode {
+        TerrainMode::Raise => TerrainOverlay {
+            tool: RenderTerrainTool::Raise,
+            target: TerrainTarget::Vertex(end),
+        },
+        TerrainMode::Lower => TerrainOverlay {
+            tool: RenderTerrainTool::Lower,
+            target: TerrainTarget::Vertex(end),
+        },
+        TerrainMode::Level | TerrainMode::LevelAverage => TerrainOverlay {
+            tool: RenderTerrainTool::Level,
+            target: TerrainTarget::Rect { start, end },
+        },
+        TerrainMode::RestoreGrass => TerrainOverlay {
+            tool: RenderTerrainTool::Grass,
+            target: if start == end {
+                TerrainTarget::Brush {
+                    center: end,
+                    radius: 0,
+                }
+            } else {
+                TerrainTarget::Rect { start, end }
+            },
+        },
+        TerrainMode::RemoveGrass => TerrainOverlay {
+            tool: RenderTerrainTool::Soil,
+            target: if start == end {
+                TerrainTarget::Brush {
+                    center: end,
+                    radius: 0,
+                }
+            } else {
+                TerrainTarget::Rect { start, end }
+            },
+        },
+    }
+}
+
+fn build_default_shop_items(kind: ShopKind, purchased: &BTreeSet<String>) -> Vec<ShopItem> {
+    let make = |id: &str,
+                name: &str,
+                desc: &str,
+                price: i32,
+                currency: CurrencyKind,
+                supports_try_on: bool| ShopItem {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        description: desc.to_owned(),
+        price,
+        currency,
+        icon: None,
+        supports_try_on,
+        owned: purchased.contains(id),
+        available: true,
+    };
+    match kind {
+        ShopKind::DowntownBoutique(WardrobeCategory::Formal) => vec![
+            make(
+                "dt_formal_1",
+                "Evening Suit",
+                "Formal outfit",
+                250,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+            make(
+                "dt_formal_2",
+                "Gala Gown",
+                "Formal outfit",
+                350,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+            make(
+                "dt_formal_3",
+                "Classic Tuxedo",
+                "Formal outfit",
+                425,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+        ],
+        ShopKind::DowntownBoutique(WardrobeCategory::Swimwear) => vec![
+            make(
+                "dt_swim_1",
+                "Poolside Swimsuit",
+                "Swimwear",
+                120,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+            make(
+                "dt_swim_2",
+                "Resort Trunks",
+                "Swimwear",
+                150,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+        ],
+        ShopKind::DowntownBoutique(WardrobeCategory::Pajamas) => vec![
+            make(
+                "dt_pj_1",
+                "Silk Sleepwear",
+                "Pajamas",
+                140,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+            make(
+                "dt_pj_2",
+                "Lounge Set",
+                "Pajamas",
+                180,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+        ],
+        ShopKind::DowntownBoutique(WardrobeCategory::Winterwear) => vec![
+            make(
+                "dt_winter_1",
+                "Alpine Parka",
+                "Winterwear",
+                220,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+            make(
+                "dt_winter_2",
+                "Wool Overcoat",
+                "Winterwear",
+                275,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+        ],
+        ShopKind::DowntownBoutique(WardrobeCategory::Everyday) => vec![
+            make(
+                "dt_day_1",
+                "Casual Ensemble",
+                "Everyday outfit",
+                160,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+            make(
+                "dt_day_2",
+                "City Jacket",
+                "Everyday outfit",
+                210,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+        ],
+        ShopKind::VacationKiosk => vec![
+            make(
+                "vac_souvenir_1",
+                "Island Tiki",
+                "Vacation souvenir",
+                75,
+                CurrencyKind::Simoleons,
+                false,
+            ),
+            make(
+                "vac_souvenir_2",
+                "Snow Globe",
+                "Vacation souvenir",
+                95,
+                CurrencyKind::Simoleons,
+                false,
+            ),
+            make(
+                "vac_rental_1",
+                "Volleyball Set",
+                "Resort rental",
+                125,
+                CurrencyKind::Simoleons,
+                false,
+            ),
+        ],
+        ShopKind::PetAdoption => vec![
+            make(
+                "pet_dog_1",
+                "Adopt Dog",
+                "Household dog",
+                399,
+                CurrencyKind::Simoleons,
+                false,
+            ),
+            make(
+                "pet_cat_1",
+                "Adopt Cat",
+                "Household cat",
+                399,
+                CurrencyKind::Simoleons,
+                false,
+            ),
+            make(
+                "pet_collar_1",
+                "Pet Collar",
+                "Pet accessory",
+                50,
+                CurrencyKind::Simoleons,
+                false,
+            ),
+        ],
+        ShopKind::StudioWardrobe => vec![
+            make(
+                "st_wardrobe_1",
+                "Red Carpet Look",
+                "Studio wardrobe",
+                400,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+            make(
+                "st_wardrobe_2",
+                "Stage Outfit",
+                "Studio wardrobe",
+                550,
+                CurrencyKind::Simoleons,
+                true,
+            ),
+        ],
+        ShopKind::MagicVendor => vec![
+            make(
+                "mt_ing_1",
+                "Spell Reagent I",
+                "Magic ingredient",
+                21,
+                CurrencyKind::MagiCoins,
+                false,
+            ),
+            make(
+                "mt_ing_2",
+                "Spell Reagent II",
+                "Magic ingredient",
+                31,
+                CurrencyKind::MagiCoins,
+                false,
+            ),
+            make(
+                "mt_ing_3",
+                "Spell Reagent III",
+                "Magic ingredient",
+                27,
+                CurrencyKind::MagiCoins,
+                false,
+            ),
+            make(
+                "mt_ing_4",
+                "Spell Reagent IV",
+                "Magic ingredient",
+                21,
+                CurrencyKind::MagiCoins,
+                false,
+            ),
+        ],
+    }
 }
 
 fn panel_mode_for(mode: Mode) -> PanelMode {

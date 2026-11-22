@@ -14,7 +14,10 @@ use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
 use sims_ui::balloon::Texts;
-use sims_ui::build::{self, BuildCatalog, BuildLayout, BuildState, BuildSwatches, BuildWidgetKind};
+use sims_ui::build::{
+    self, BuildCatalog, BuildLayout, BuildState, BuildSubtoolAction, BuildSwatches,
+    BuildWidgetKind, TerrainSubtool,
+};
 use sims_ui::buy::{
     self, BuyCatalog, BuyLayout, BuyState, BuyWidgetKind, RatingLabels, SellInfo, SellLabels,
 };
@@ -169,6 +172,16 @@ pub struct Hud {
     /// Last laid-out screen rect of the Options-strip "Saves" button (present only
     /// while `Mode::Options` is expanded).
     saves_button_rect: Option<Rect>,
+    /// Whether the Camera-panel Photo Album button (`CamViewAlbum`, resource `1105`)
+    /// is shown beside the snapshot button (enabled in `NeighborhoodShell` lots,
+    /// disabled for standalone/ratchet renders so static Live frames stay bit-exact).
+    album_button_enabled: bool,
+    /// Whether the Camera-panel Photo Album button is currently pressed.
+    pressed_album_button: bool,
+    /// Last laid-out screen rect of the Camera-panel Photo Album button.
+    album_button_rect: Option<Rect>,
+    /// Whether the Roof camera toggle (`Camera::Roof`) is active.
+    roof_view: bool,
     /// Classic Sims 1 top-left cheat console (`Ctrl+Shift+C` / `Cmd+Shift+C`).
     pub cheat_console: CheatConsole,
     /// The pie menu, while one is open.
@@ -267,6 +280,7 @@ impl HudStatic {
                     .chain(&[
                         options::id::SAVE_CARD,
                         sims_ui::neighborhood::art_id::POPUP_TILER,
+                        sims_ui::album::CAM_VIEW_ALBUM,
                     ])
                     .copied()
                     .chain(buy::resource_ids())
@@ -519,6 +533,10 @@ impl Hud {
             pressed_options_action: None,
             pressed_saves_button: false,
             saves_button_rect: None,
+            album_button_enabled: false,
+            pressed_album_button: false,
+            album_button_rect: None,
+            roof_view: false,
             cheat_console: CheatConsole::new(),
             menu: None,
             band: None,
@@ -557,6 +575,9 @@ impl Hud {
         self.pressed_options_action = None;
         self.pressed_saves_button = false;
         self.saves_button_rect = None;
+        self.pressed_album_button = false;
+        self.album_button_rect = None;
+        self.roof_view = false;
         self.controls.pressed_options_action = None;
         self.controls.help = None;
         self.controls.options.tab = None;
@@ -671,13 +692,80 @@ impl Hud {
         }
     }
 
+    /// Returns Terrain / Water / Pool pricing tables for `sims_vm` Build Mode Part 2 edits.
+    pub fn tool_prices(&mut self, assets: &Assets) -> sims_vm::ToolPrices {
+        let catalog = self.ensure_build_catalog(assets);
+        sims_vm::ToolPrices {
+            terrain_raise: catalog.terrain_price(TerrainSubtool::Raise),
+            terrain_lower: catalog.terrain_price(TerrainSubtool::Lower),
+            terrain_level: catalog.terrain_price(TerrainSubtool::Level),
+            grass: catalog.terrain_price(TerrainSubtool::Grass),
+            pool: catalog.pool_price(),
+            water: catalog.water_price(),
+        }
+    }
+
+    /// The Build Mode catalog, once loaded.
+    pub fn build_catalog(&self) -> Option<&BuildCatalog> {
+        self.build_catalog.as_ref()
+    }
+
+    /// Install handle owned by the HUD (used for lazy `RoofCatalog` and shop strings).
+    pub fn install(&self) -> &Install {
+        &self.install
+    }
+
+    /// Hit-tests Build Mode Part 2 subtools (Terrain / Water / Roof pitch &
+    /// pattern slots and narrow-viewport tool pagination).
+    pub fn press_build_subtool(&self, point: [i32; 2]) -> Option<BuildSubtoolAction> {
+        if self.controls.mode != Mode::Build || !self.controls.expanded {
+            return None;
+        }
+        self.build_layout.press_subtool(point)
+    }
+
+    /// Enables or disables the Camera-panel Photo Album button (`CamViewAlbum`, `1105`).
+    pub fn set_album_button_enabled(&mut self, enabled: bool) {
+        self.album_button_enabled = enabled;
+        if !enabled {
+            self.album_button_rect = None;
+            self.pressed_album_button = false;
+        }
+    }
+
+    /// Screen rectangle of the Camera-panel Photo Album button, when shown.
+    pub fn album_button_rect(&self) -> Option<Rect> {
+        self.album_button_rect
+    }
+
+    /// Releases a held Camera-panel Photo Album button, returning `(changed, activated)`.
+    pub fn release_album_button(&mut self, point: Option<[i32; 2]>) -> (bool, bool) {
+        if !self.pressed_album_button {
+            return (false, false);
+        }
+        self.pressed_album_button = false;
+        let activated = point.is_some_and(|[x, y]| {
+            self.album_button_rect
+                .is_some_and(|rect| rect.contains(x, y))
+        });
+        if activated {
+            self.play(CLICK);
+        }
+        (true, activated)
+    }
+
+    /// Updates the highlighted state of the Roof camera toggle (`Camera::Roof`).
+    pub fn set_roof_view(&mut self, on: bool) {
+        self.roof_view = on;
+    }
+
     /// The Build Mode catalog strip layout as last built.
     pub fn build_layout(&self) -> &BuildLayout {
         &self.build_layout
     }
 
     /// Lays out the Build Mode strip (`cWinArch`) for `size` and `world`,
-    /// syncing `self.build_state.page` to the clamped page number.
+    /// syncing `self.build_state.page` and `tool_page` to the clamped page numbers.
     pub fn layout_build(
         &mut self,
         size: [i32; 2],
@@ -716,6 +804,7 @@ impl Hud {
             self.controls.pointer,
         );
         self.build_state.page = layout.page;
+        self.build_state.tool_page = layout.tool_page;
         self.build_layout = layout;
     }
 
@@ -1464,7 +1553,7 @@ impl Hud {
                 Walls::Cutaway => UiWalls::Cutaway,
                 Walls::Down => UiWalls::Down,
             },
-            roof: false,
+            roof: self.roof_view,
             zoom_in: camera.zoom != Zoom::Near,
             zoom_out: camera.zoom != Zoom::Far,
         };
@@ -1548,6 +1637,10 @@ impl Hud {
         if let Some(rect) = self.saves_button_rect {
             self.draw_options_saves_button(&mut frame, rect);
         }
+        self.album_button_rect = self.compute_camera_album_button_rect();
+        if let Some(rect) = self.album_button_rect {
+            self.draw_camera_album_button(&mut frame, rect);
+        }
         if self.controls.mode == Mode::Buy && self.controls.expanded {
             self.layout_buy(view.size, world, assets, sell);
             let mut guids: Vec<u32> = self
@@ -1602,11 +1695,12 @@ impl Hud {
             for guid in guids {
                 let _ = self.thumbnails.read(assets.index(), assets.catalog(), guid);
             }
-            build::draw(
+            build::draw_with_catalog(
                 &mut frame,
                 &self.art,
                 &self.thumbnails,
                 &self.build_swatches,
+                self.build_catalog.as_ref(),
                 &self.build_layout,
                 self.controls.pointer,
             );
@@ -1708,6 +1802,76 @@ impl Hud {
         }
     }
 
+    fn compute_camera_album_button_rect(&self) -> Option<Rect> {
+        if !self.album_button_enabled || !self.controls.expanded {
+            return None;
+        }
+        let photo = self
+            .items
+            .iter()
+            .find(|i| i.command == Some(Command::Camera(sims_ui::command::Camera::Photo)))?;
+        Some(Rect::new(
+            (photo.rect.x - 33).max(0),
+            photo.rect.y,
+            photo.rect.width,
+            photo.rect.height,
+        ))
+    }
+
+    fn draw_camera_album_button(&self, frame: &mut Frame, rect: Rect) {
+        let hovered = self
+            .controls
+            .pointer
+            .is_some_and(|[px, py]| rect.contains(px, py));
+        if let Some(strip) = self.art.image(sims_ui::album::CAM_VIEW_ALBUM)
+            && strip.width >= 4
+            && strip.height > 0
+        {
+            let cell_w = strip.width / 4;
+            let state = if self.pressed_album_button && hovered {
+                2
+            } else if hovered {
+                3
+            } else {
+                1
+            };
+            let src = Rect::new(
+                (cell_w * state) as i32,
+                0,
+                cell_w as i32,
+                strip.height as i32,
+            );
+            let dx = rect.x + (rect.width - cell_w as i32) / 2;
+            let dy = rect.y + (rect.height - strip.height as i32) / 2;
+            frame.draw(strip, src, [dx, dy]);
+            return;
+        }
+        let (bg, border, fg) = if self.pressed_album_button && hovered {
+            ([30, 88, 176], [0, 255, 255], [0, 255, 255])
+        } else if hovered {
+            ([26, 62, 146], [136, 178, 232], [255, 255, 255])
+        } else {
+            ([16, 36, 108], [88, 120, 204], [195, 205, 205])
+        };
+        frame.fill(rect, bg);
+        frame.fill(Rect::new(rect.x, rect.y, rect.width, 1), border);
+        frame.fill(
+            Rect::new(rect.x, rect.y + rect.height - 1, rect.width, 1),
+            border,
+        );
+        frame.fill(Rect::new(rect.x, rect.y, 1, rect.height), border);
+        frame.fill(
+            Rect::new(rect.x + rect.width - 1, rect.y, 1, rect.height),
+            border,
+        );
+        if let Some(font) = self.art.font(10) {
+            let label = "A";
+            let tx = rect.x + (rect.width - font.width(label)) / 2;
+            let ty = rect.y + (rect.height - font.line_height) / 2;
+            font.draw(frame, label, [tx, ty], fg);
+        }
+    }
+
     /// A line of text on a band across the top of the frame; the band.
     fn status(&self, frame: &mut Frame, text: &str) -> Option<Rect> {
         let font = self.art.font(STATUS_SIZE)?;
@@ -1745,6 +1909,9 @@ impl Hud {
         self.has_dialog()
             || self.menu.is_some()
             || self.band.is_some_and(|b| b.contains(point[0], point[1]))
+            || self
+                .album_button_rect
+                .is_some_and(|r| r.contains(point[0], point[1]))
             || hud::covers(&self.items, point)
             || (self.controls.mode == Mode::Buy
                 && self.controls.expanded
@@ -1867,13 +2034,24 @@ impl Hud {
         };
         let build_widget = |pointer: Option<[i32; 2]>| {
             let [x, y] = pointer?;
-            self.build_layout
+            let w = self
+                .build_layout
                 .widgets
                 .iter()
-                .rposition(|w| w.rect.contains(x, y))
+                .rposition(|w| w.rect.contains(x, y));
+            let s = self
+                .build_layout
+                .subtools
+                .iter()
+                .rposition(|w| w.rect.contains(x, y));
+            Some((w, s))
         };
         let over_saves = |pointer: Option<[i32; 2]>| {
-            pointer.is_some_and(|[x, y]| self.saves_button_rect.is_some_and(|r| r.contains(x, y)))
+            let s = pointer
+                .is_some_and(|[x, y]| self.saves_button_rect.is_some_and(|r| r.contains(x, y)));
+            let a = pointer
+                .is_some_and(|[x, y]| self.album_button_rect.is_some_and(|r| r.contains(x, y)));
+            (s, a)
         };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
@@ -2014,6 +2192,13 @@ impl Hud {
             .is_some_and(|r| r.contains(point[0], point[1]))
         {
             self.pressed_saves_button = true;
+            return None;
+        }
+        if self
+            .album_button_rect
+            .is_some_and(|r| r.contains(point[0], point[1]))
+        {
+            self.pressed_album_button = true;
             return None;
         }
         if self.controls.mode == Mode::Live

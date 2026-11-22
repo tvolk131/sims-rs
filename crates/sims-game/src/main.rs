@@ -1022,8 +1022,23 @@ impl App {
                 let _ = self.save(false);
                 return;
             }
+            Key::Named(NamedKey::F8) => {
+                if let Some(kind) = game.shop_kind_for_lot()
+                    && game.open_shop(kind)
+                {
+                    self.changed(true, true);
+                }
+                return;
+            }
             Key::Named(NamedKey::F9) => {
                 let _ = self.save(true);
+                return;
+            }
+            Key::Named(NamedKey::F10) => {
+                if let Session::Shell(shell) = &mut self.session {
+                    let _ = shell.open_photo_album();
+                    self.changed(true, true);
+                }
                 return;
             }
             Key::Named(NamedKey::Delete | NamedKey::Backspace) => {
@@ -1051,6 +1066,16 @@ impl App {
                             if let Session::Shell(shell) = &mut self.session
                                 && shell.open_save_manager(None)
                             {
+                                self.changed(true, true);
+                            }
+                            return;
+                        }
+                        "h" | "H" if !self.shift_held => {
+                            if let Session::Shell(shell) = &mut self.session
+                                && shell.active_trip().is_some()
+                            {
+                                let _ = shell.return_from_destination();
+                                self.drain_shell_audio();
                                 self.changed(true, true);
                             }
                             return;
@@ -1107,14 +1132,17 @@ impl App {
         let now = Instant::now();
         let (clock_us, step_us) = self.wake_clock.elapsed_us(now);
         self.drain_shell_audio();
-        let save_manager_open = matches!(
+        let shell_modal_open = matches!(
             &self.session,
-            Session::Shell(shell) if shell.save_manager_open()
+            Session::Shell(shell)
+                if shell.save_manager_open()
+                    || shell.album_open()
+                    || shell.travel_dialog_open()
         );
-        if save_manager_open {
+        if shell_modal_open {
             self.wake_clock.finish(now, Instant::now(), false);
             let redraw = match &mut self.session {
-                Session::Shell(shell) => shell.poll_background_saves(),
+                Session::Shell(shell) => shell.tick_shell(clock_us),
                 Session::Standalone { .. } => false,
             };
             self.changed(redraw, false);
@@ -1480,8 +1508,20 @@ impl ApplicationHandler for App {
                     &self.session,
                     Session::Shell(shell) if shell.save_manager_open()
                 );
+                let album_open = matches!(
+                    &self.session,
+                    Session::Shell(shell) if shell.album_open()
+                );
+                let travel_dialog_open = matches!(
+                    &self.session,
+                    Session::Shell(shell) if shell.travel_dialog_open()
+                );
+                let shop_open = self.session.game().is_some_and(Game::shop_open);
                 if is_cheat_toggle
                     && !save_manager_open
+                    && !album_open
+                    && !travel_dialog_open
+                    && !shop_open
                     && !self.session.has_dialog()
                     && let Some(game) = self.session.game_mut()
                 {
@@ -1498,6 +1538,92 @@ impl ApplicationHandler for App {
                         _ => ShellOutcome::default(),
                     };
                     self.handle_shell_outcome(event_loop, out);
+                    return;
+                }
+                if travel_dialog_open && let Session::Shell(shell) = &mut self.session {
+                    let out = match &event.logical_key {
+                        Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
+                        Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
+                        _ => ShellOutcome::default(),
+                    };
+                    self.handle_shell_outcome(event_loop, out);
+                    return;
+                }
+                if album_open && let Session::Shell(shell) = &mut self.session {
+                    let out = match &event.logical_key {
+                        Key::Named(NamedKey::Backspace) => shell.key_backspace(),
+                        Key::Named(NamedKey::Delete) => shell.key_delete(),
+                        Key::Named(NamedKey::ArrowLeft) => shell.key_left(),
+                        Key::Named(NamedKey::ArrowRight) => shell.key_right(),
+                        Key::Named(NamedKey::ArrowUp) => shell.key_up(),
+                        Key::Named(NamedKey::ArrowDown) => shell.key_down(),
+                        Key::Named(NamedKey::Home) => shell.key_home(),
+                        Key::Named(NamedKey::End) => shell.key_end(),
+                        Key::Named(NamedKey::Tab) => shell.key_tab(),
+                        Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
+                        Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
+                        Key::Named(NamedKey::Space) => shell.key_char(' '),
+                        _ => {
+                            let mut combined = ShellOutcome::default();
+                            if !self.ctrl_or_cmd_held
+                                && let Some(text) = &event.text
+                            {
+                                for ch in text.chars() {
+                                    let o = shell.key_char(ch);
+                                    combined.redraw |= o.redraw;
+                                }
+                            }
+                            combined
+                        }
+                    };
+                    self.handle_shell_outcome(event_loop, out);
+                    return;
+                }
+                if shop_open {
+                    match &mut self.session {
+                        Session::Standalone { game, .. } => {
+                            let out = match &event.logical_key {
+                                Key::Named(NamedKey::ArrowUp) => {
+                                    let r = game.shop_select_prev();
+                                    sims_game::Outcome {
+                                        redraw: r,
+                                        ..sims_game::Outcome::default()
+                                    }
+                                }
+                                Key::Named(NamedKey::ArrowDown) => {
+                                    let r = game.shop_select_next();
+                                    sims_game::Outcome {
+                                        redraw: r,
+                                        ..sims_game::Outcome::default()
+                                    }
+                                }
+                                Key::Named(NamedKey::Enter) if !event.repeat => game.shop_submit(),
+                                Key::Named(NamedKey::Escape) if !event.repeat => game.shop_escape(),
+                                _ => sims_game::Outcome::default(),
+                            };
+                            self.handle_standalone_outcome(event_loop, out);
+                        }
+                        Session::Shell(shell) => {
+                            let out = match &event.logical_key {
+                                Key::Named(NamedKey::ArrowUp) => shell.key_up(),
+                                Key::Named(NamedKey::ArrowDown) => shell.key_down(),
+                                Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
+                                Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
+                                _ => ShellOutcome::default(),
+                            };
+                            self.handle_shell_outcome(event_loop, out);
+                        }
+                    }
+                    return;
+                }
+                if !event.repeat
+                    && event.logical_key == Key::Named(NamedKey::F10)
+                    && !self.session.has_dialog()
+                    && self.session.screen_kind() == ScreenKind::Neighborhood
+                    && let Session::Shell(shell) = &mut self.session
+                {
+                    let _ = shell.open_photo_album();
+                    self.changed(true, true);
                     return;
                 }
                 if self.session.screen_kind() == ScreenKind::CreateFamily
@@ -1758,9 +1884,16 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(p) => p.y,
                 };
                 if let Session::Shell(shell) = &mut self.session
-                    && shell.save_manager_open()
+                    && (shell.save_manager_open() || shell.album_open())
                 {
                     let redraw = shell.wheel(y);
+                    self.changed(redraw, true);
+                    return;
+                }
+                if let Some(game) = self.session.game_mut()
+                    && game.shop_open()
+                {
+                    let redraw = game.shop_wheel(y);
                     self.changed(redraw, true);
                     return;
                 }
