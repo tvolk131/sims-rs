@@ -8013,6 +8013,34 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
                 .unwrap()
                 .expect("Buy Mode must not stay blocked after plain set_mode Live -> Buy");
             lot6.buy_cancel(&fresh).unwrap();
+
+            // Sol Round 9 P2: refused `Lot::buy_undo()` while a paid chair is
+            // picked up and hidden off-lot must purge against the post-snapback
+            // world so the paid chair is snapped back on-lot instead of deleted.
+            let mut r9_c1 = lot6.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+            assert!(lot6.buy_move(&mut r9_c1, [552, 472], 1).unwrap());
+            let r9_chair1 = lot6.buy_commit(&r9_c1).unwrap();
+            let mut r9_c2 = lot6.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+            assert!(lot6.buy_move(&mut r9_c2, [520, 472], 1).unwrap());
+            let r9_chair2 = lot6.buy_commit(&r9_c2).unwrap();
+            assert!(lot6.buy_undo().unwrap()); // undoes r9_chair2
+            let mut r9_block = lot6.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+            assert!(lot6.buy_move(&mut r9_block, [520, 472], 1).unwrap());
+            assert!(!lot6.buy_redo().unwrap()); // refused Buy Redo pushed to Undo
+            lot6.buy_cancel(&r9_block).unwrap();
+            let funds_before_r9_undo = lot6.world().budget.funds;
+            let mut r9_pick1 = lot6.buy_pick_up(r9_chair1).unwrap().unwrap();
+            lot6.buy_hide(&mut r9_pick1).unwrap();
+            assert!(lot6.world().objects[&r9_chair1].position[0] < 0);
+            assert!(!lot6.buy_undo().unwrap());
+            assert_eq!(lot6.world().budget.funds, funds_before_r9_undo);
+            assert_eq!(
+                lot6.world().objects[&r9_chair1].position,
+                [552, 472, 1],
+                "refused buy_undo must snap back and preserve hidden paid chair"
+            );
+            assert!(!lot6.world().objects.contains_key(&r9_pick1.cursor));
+            assert!(!lot6.world().objects.contains_key(&r9_chair2));
         }
     }
 }

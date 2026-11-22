@@ -2104,16 +2104,17 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
-        let snapped_existing =
+        let after_snap =
             if let Some(active) = self.active_buy_cursor.as_ref().filter(|a| a.existing) {
                 let live = self.strip_detached_origin_children(&active.cursor);
                 interpreter
                     .buy_cancel(&mut world, &live)
                     .map_err(OrderError::Refused)?;
-                true
+                Some(world.clone())
             } else {
-                false
+                None
             };
+        let snapped_existing = after_snap.is_some();
         let mut purchase = self.buy_undo.pop().expect("checked non-empty");
         match interpreter.buy_undo_purchase(&mut world, &mut purchase) {
             Ok(true) => {
@@ -2129,6 +2130,10 @@ impl Lot {
                 Ok(true)
             }
             Ok(false) => {
+                if let Some(snapped) = after_snap {
+                    self.world = snapped;
+                    self.active_buy_cursor = None;
+                }
                 let mut dropped = std::mem::take(&mut self.buy_undo);
                 dropped.push(purchase);
                 let mut keep = BTreeSet::new();
@@ -2138,6 +2143,10 @@ impl Lot {
                 Ok(false)
             }
             Err(fault) => {
+                if let Some(snapped) = after_snap {
+                    self.world = snapped;
+                    self.active_buy_cursor = None;
+                }
                 let mut dropped = std::mem::take(&mut self.buy_undo);
                 dropped.push(purchase);
                 let mut keep = BTreeSet::new();
@@ -2170,16 +2179,17 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
-        let snapped_existing =
+        let after_snap =
             if let Some(active) = self.active_buy_cursor.as_ref().filter(|a| a.existing) {
                 let live = self.strip_detached_origin_children(&active.cursor);
                 interpreter
                     .buy_cancel(&mut world, &live)
                     .map_err(OrderError::Refused)?;
-                true
+                Some(world.clone())
             } else {
-                false
+                None
             };
+        let snapped_existing = after_snap.is_some();
         let mut purchase = self.buy_redo.pop().expect("checked non-empty");
         match interpreter.buy_redo_purchase(&mut world, &mut purchase) {
             Ok(true) => {
@@ -2212,12 +2222,20 @@ impl Lot {
                     }
                     self.world = world;
                 } else {
+                    if let Some(snapped) = after_snap {
+                        self.world = snapped;
+                        self.active_buy_cursor = None;
+                    }
                     self.buy_undo.push(purchase);
                     self.sync_active_buy_cursor();
                 }
                 Ok(false)
             }
             Err(fault) => {
+                if let Some(snapped) = after_snap {
+                    self.world = snapped;
+                    self.active_buy_cursor = None;
+                }
                 let mut dropped = std::mem::take(&mut self.buy_redo);
                 dropped.push(purchase);
                 let mut keep = BTreeSet::new();
