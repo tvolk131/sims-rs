@@ -566,7 +566,14 @@ impl BarLayout {
             let ox = (w - NATIVE_WIDTH) / 2;
             let bar_rect = Rect::new(ox, 0, NATIVE_WIDTH, bar_h);
             let logo_rect = Some(Rect::new(ox + 5, 0, 70, bar_h));
-            let badge_rect = Rect::new(ox + 125, 3, 23, 30.min(bar_h));
+            // 0x556e2b..0x556e8c: `Current.bmp` (23×30) is loaded solely to size
+            // `[0x6f5890..0x6f589c]` for centering the neighborhood number text.
+            // `[0x6cdddc]` = 124 places the 23 px box between Previous (106..132)
+            // and Next (141..167), putting `'1'` bit-exact at `x=133..=137, y=12..=23`.
+            let (bw, bh) = art
+                .image(art_id::CURRENT_BADGE)
+                .map_or((23, 30), |img| (img.width as i32, img.height as i32));
+            let badge_rect = Rect::new(ox + 124, 3, bw, bh.min(bar_h));
 
             for &button in &BarButton::TOP_BAR {
                 let [bx, by] = button.native_origin();
@@ -957,12 +964,10 @@ impl NeighborhoodChrome {
             );
         }
 
-        // 3. Current neighborhood badge + number (`1..=8`, `0x55d062..0x55d102`).
-        if let Some(badge) = art.image(art_id::CURRENT_BADGE) {
-            let bx = layout.badge_rect.x + (layout.badge_rect.width - badge.width as i32) / 2;
-            let by = layout.badge_rect.y + (layout.badge_rect.height - badge.height as i32) / 2;
-            frame.draw_all(badge, [bx, by]);
-        }
+        // 3. Current neighborhood number (`1..=8`, `0x55d062..0x55d102`).
+        //    `cWinNeighborhood::DoDraw` never blits `Current.bmp` (`[esi+0x138]`);
+        //    it only uses its 23×30 dimensions to center the white digit directly
+        //    over `banner_neighborhood.bmp` between the Previous and Next arrows.
         let num_text = state.clamped_neighborhood().to_string();
         if let Some(font) = art.font(12).or_else(|| art.font(10)) {
             let tw = font.width(&num_text);

@@ -1728,16 +1728,54 @@ fn char_byte_index(text: &str, char_pos: usize) -> usize {
         .map_or(text.len(), |(idx, _)| idx)
 }
 
-/// Draws a 3×3 tiled 9-slice bitmap (`PopupInfoTiles.bmp` 3008 or
-/// `GenDlg.bmp` 22) across `rect`, matching `cTSWinMsgBox::OnDraw`
-/// (`0x524603..0x524645`: tile width `bmp.width / 3`, tile height
-/// `bmp.height / 3`, four fixed corners, tiled edges, tiled center).
+/// Draws a 3×3 tiled 9-slice bitmap (`PopupInfoTiles.bmp` 3008, `GenDlg.bmp`
+/// 22, or `HotspotPopupTiler.TGA` 5107) across `rect`, matching
+/// `cTSWinMsgBox::OnDraw` (`0x524603..0x524645`) and `cTSWinGenDlg::OnDraw`
+/// (`0x5e5a33..0x5e5a77`).
 pub fn draw_nine_slice(frame: &mut Frame, sheet: &Image, rect: Rect) {
+    draw_nine_slice_alpha(frame, sheet, rect, 255);
+}
+
+/// Like [`draw_nine_slice`], modulating every pixel's alpha (including all four
+/// corners, edges, and tiled interior) by `alpha` (`0..=255`) through
+/// [`Frame::blend`]'s native 5-bit blend table (`0x6e5eac`, matching
+/// `cTSWinFade` at `0x5e8c93..0x5e8e10`).
+pub fn draw_nine_slice_alpha(frame: &mut Frame, sheet: &Image, rect: Rect, alpha: u8) {
+    if alpha <= 7 {
+        return;
+    }
     let tw = i32::try_from(sheet.width / 3).unwrap_or(0);
     let th = i32::try_from(sheet.height / 3).unwrap_or(0);
     if tw <= 0 || th <= 0 || rect.width <= 0 || rect.height <= 0 {
         return;
     }
+    let draw_part = |frame: &mut Frame, src: Rect, at: [i32; 2]| {
+        if alpha >= 248 {
+            frame.draw(sheet, src, at);
+            return;
+        }
+        let range = |start: i32, length: i32, size: u32, target: i32, limit: u32| {
+            let (start, target) = (i64::from(start), i64::from(target));
+            let low = 0.max(-start).max(-target);
+            let high = i64::from(length)
+                .min(i64::from(size) - start)
+                .min(i64::from(limit) - target);
+            low..high.max(low)
+        };
+        let xs = range(src.x, src.width, sheet.width, at[0], frame.width());
+        for sy in range(src.y, src.height, sheet.height, at[1], frame.height()) {
+            for sx in xs.clone() {
+                let (ix, iy) = (i64::from(src.x) + sx, i64::from(src.y) + sy);
+                if let Some([r, g, b, pa]) = sheet.pixel(ix as u32, iy as u32) {
+                    let eff = ((u16::from(pa) * u16::from(alpha) + 127) / 255) as u8;
+                    if eff > 7 {
+                        let (dx, dy) = (i64::from(at[0]) + sx, i64::from(at[1]) + sy);
+                        frame.blend(dx as i32, dy as i32, [r, g, b], eff);
+                    }
+                }
+            }
+        }
+    };
     let frame_w = i64::from(frame.width());
     let frame_h = i64::from(frame.height());
     let left_w = tw.min(rect.width);
@@ -1750,24 +1788,24 @@ pub fn draw_nine_slice(frame: &mut Frame, sheet: &Image, rect: Rect) {
     let y_mid_start = i64::from(rect.y) + i64::from(top_h);
     let y_mid_end = i64::from(rect.y) + i64::from(rect.height) - i64::from(bottom_h);
 
-    // 4 corners.
-    frame.draw(sheet, Rect::new(0, 0, left_w, top_h), [rect.x, rect.y]);
+    // 4 corners (preserving per-pixel corner alpha & global alpha modulation).
+    draw_part(frame, Rect::new(0, 0, left_w, top_h), [rect.x, rect.y]);
     if right_w > 0 {
-        frame.draw(
-            sheet,
+        draw_part(
+            frame,
             Rect::new(tw * 2 + (tw - right_w), 0, right_w, top_h),
             [rect.x.saturating_add(rect.width - right_w), rect.y],
         );
     }
     if bottom_h > 0 {
-        frame.draw(
-            sheet,
+        draw_part(
+            frame,
             Rect::new(0, th * 2 + (th - bottom_h), left_w, bottom_h),
             [rect.x, rect.y.saturating_add(rect.height - bottom_h)],
         );
         if right_w > 0 {
-            frame.draw(
-                sheet,
+            draw_part(
+                frame,
                 Rect::new(
                     tw * 2 + (tw - right_w),
                     th * 2 + (th - bottom_h),
@@ -1796,14 +1834,14 @@ pub fn draw_nine_slice(frame: &mut Frame, sheet: &Image, rect: Rect) {
         while x < vis_x1 {
             let phase = ((x - x_mid_start).rem_euclid(tw64)) as i32;
             let step = (tw - phase).min((vis_x1 - x) as i32);
-            frame.draw(
-                sheet,
+            draw_part(
+                frame,
                 Rect::new(tw + phase, 0, step, top_h),
                 [x as i32, rect.y],
             );
             if bottom_h > 0 {
-                frame.draw(
-                    sheet,
+                draw_part(
+                    frame,
                     Rect::new(tw + phase, th * 2 + (th - bottom_h), step, bottom_h),
                     [x as i32, rect.y.saturating_add(rect.height - bottom_h)],
                 );
@@ -1818,14 +1856,14 @@ pub fn draw_nine_slice(frame: &mut Frame, sheet: &Image, rect: Rect) {
         while y < vis_y1 {
             let phase = ((y - y_mid_start).rem_euclid(th64)) as i32;
             let step = (th - phase).min((vis_y1 - y) as i32);
-            frame.draw(
-                sheet,
+            draw_part(
+                frame,
                 Rect::new(0, th + phase, left_w, step),
                 [rect.x, y as i32],
             );
             if right_w > 0 {
-                frame.draw(
-                    sheet,
+                draw_part(
+                    frame,
                     Rect::new(tw * 2 + (tw - right_w), th + phase, right_w, step),
                     [rect.x.saturating_add(rect.width - right_w), y as i32],
                 );
@@ -1844,14 +1882,157 @@ pub fn draw_nine_slice(frame: &mut Frame, sheet: &Image, rect: Rect) {
             while x < vis_x1 {
                 let px = ((x - x_mid_start).rem_euclid(tw64)) as i32;
                 let sx = (tw - px).min((vis_x1 - x) as i32);
-                frame.draw(
-                    sheet,
+                draw_part(
+                    frame,
                     Rect::new(tw + px, th + py, sx, sy),
                     [x as i32, y as i32],
                 );
                 x += i64::from(sx);
             }
             y += i64::from(sy);
+        }
+    }
+}
+
+/// Pure-state translucent dialog / overlay fade helper matching `cTSWinFade`
+/// (`0x5e8c93..0x5e8e10`, converting normalized opacity `0.0..=1.0` to `0..=255`
+/// via `round(t * 255.0)` at `0x5e8ddb..0x5e8e0d`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DialogFadeState {
+    start_value: f32,
+    target_value: f32,
+    start_ms: u32,
+    end_ms: u32,
+}
+
+impl DialogFadeState {
+    pub const fn hidden() -> Self {
+        Self {
+            start_value: 0.0,
+            target_value: 0.0,
+            start_ms: 0,
+            end_ms: 0,
+        }
+    }
+
+    pub const fn opaque() -> Self {
+        Self {
+            start_value: 1.0,
+            target_value: 1.0,
+            start_ms: 0,
+            end_ms: 0,
+        }
+    }
+
+    /// Starts a linear opacity ramp to `target` (`0.0..=1.0`) over `duration_ms`.
+    pub fn fade_to(&mut self, target: f32, now_ms: u32, duration_ms: u32) {
+        let cur = self.progress(now_ms);
+        self.start_value = cur;
+        self.target_value = if target.is_finite() {
+            target.clamp(0.0, 1.0)
+        } else if target.is_sign_positive() && target.is_infinite() {
+            1.0
+        } else {
+            0.0
+        };
+        self.start_ms = now_ms;
+        self.end_ms = now_ms.saturating_add(duration_ms);
+    }
+
+    pub fn progress(&self, now_ms: u32) -> f32 {
+        if now_ms >= self.end_ms || self.end_ms <= self.start_ms {
+            return self.target_value.clamp(0.0, 1.0);
+        }
+        if now_ms <= self.start_ms {
+            return self.start_value.clamp(0.0, 1.0);
+        }
+        let dur = (self.end_ms - self.start_ms) as f64;
+        let rem = (self.end_ms - now_ms) as f64;
+        let rate = f64::from(self.target_value - self.start_value) / dur;
+        (f64::from(self.target_value) - rem * rate).clamp(0.0, 1.0) as f32
+    }
+
+    /// Quantized 8-bit alpha `0..=255` matching `0x5e8ddb..0x5e8e0d`.
+    pub fn alpha(&self, now_ms: u32) -> u8 {
+        ((f64::from(self.progress(now_ms)) * 255.0 + 0.5).trunc() as i32).clamp(0, 255) as u8
+    }
+
+    pub fn is_animating(&self, now_ms: u32) -> bool {
+        now_ms < self.end_ms && self.end_ms > self.start_ms
+    }
+}
+
+/// Like [`draw_with_state`], compositing the entire dialog (including its
+/// 9-slice corners, border, text, and buttons) at global opacity `alpha`
+/// (`0..=255`) via the native 5-bit blend table (`0x6e5eac`).
+pub fn draw_with_state_alpha(
+    frame: &mut Frame,
+    art: &Art,
+    message: &Message,
+    layout: &Layout,
+    pointer: Option<[i32; 2]>,
+    state: &DialogState,
+    alpha: u8,
+) {
+    if alpha <= 7 || layout.rect.width <= 0 || layout.rect.height <= 0 {
+        return;
+    }
+    if alpha >= 248 {
+        draw_with_state(frame, art, message, layout, pointer, state);
+        return;
+    }
+    let fw = i32::try_from(frame.width()).unwrap_or(i32::MAX);
+    let fh = i32::try_from(frame.height()).unwrap_or(i32::MAX);
+    let r = layout.rect;
+    let x0 = r.x.clamp(0, fw);
+    let y0 = r.y.clamp(0, fh);
+    let x1 = r.x.saturating_add(r.width).clamp(x0, fw);
+    let y1 = r.y.saturating_add(r.height).clamp(y0, fh);
+    let w = (x1 - x0) as u32;
+    let h = (y1 - y0) as u32;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut scratch = Frame::new(w, h, [0, 0, 0]);
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            if let Some(bg) = frame.pixel(x0 + x, y0 + y) {
+                scratch.blend(x, y, bg, 255);
+            }
+        }
+    }
+    let dx = -x0;
+    let dy = -y0;
+    let shifted = Layout {
+        caller: layout.caller,
+        rect: r.offset(dx, dy),
+        icon: layout
+            .icon
+            .map(|[x, y]| [x.saturating_add(dx), y.saturating_add(dy)]),
+        title: [
+            layout.title[0].saturating_add(dx),
+            layout.title[1].saturating_add(dy),
+        ],
+        lines: layout
+            .lines
+            .iter()
+            .map(|(s, [x, y])| (s.clone(), [x.saturating_add(dx), y.saturating_add(dy)]))
+            .collect(),
+        entry: layout.entry.map(|e| e.offset(dx, dy)),
+        secondary_entry: layout.secondary_entry.map(|e| e.offset(dx, dy)),
+        buttons: layout.buttons.iter().map(|b| b.offset(dx, dy)).collect(),
+    };
+    let shifted_ptr = pointer.map(|[x, y]| [x.saturating_add(dx), y.saturating_add(dy)]);
+    draw_with_state(&mut scratch, art, message, &shifted, shifted_ptr, state);
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let fx = x0 + x;
+            let fy = y0 + y;
+            if let (Some(rgb), Some(bg)) = (scratch.pixel(x, y), frame.pixel(fx, fy))
+                && rgb != bg
+            {
+                frame.blend(fx, fy, rgb, alpha);
+            }
         }
     }
 }
@@ -2856,5 +3037,55 @@ mod tests {
         let mut left = Frame::new(800, 600, [0, 0, 0]);
         draw_with_state(&mut left, &art, &msg, &laid, None, &state);
         assert_eq!(left.pixel(btn.x + 1, btn.y + 1), Some([10, 0, 0]));
+    }
+
+    #[test]
+    fn draw_nine_slice_alpha_and_dialog_fade_state_blend_corners_cleanly() {
+        let mut fade = DialogFadeState::hidden();
+        assert_eq!(fade.alpha(0), 0);
+        assert!(!fade.is_animating(0));
+        fade.fade_to(1.0, 100, 200);
+        assert!(fade.is_animating(100));
+        assert_eq!(fade.alpha(100), 0);
+        assert_eq!(fade.alpha(200), 128);
+        assert_eq!(fade.alpha(300), 255);
+        assert!(!fade.is_animating(300));
+        fade.fade_to(0.0, 400, 200);
+        assert_eq!(fade.alpha(500), 128);
+        assert_eq!(fade.alpha(600), 0);
+        assert!(!fade.is_animating(600));
+
+        // 36x36 nine-slice with corner pixel [200, 100, 50, 128] and opaque fill [200, 100, 50, 255].
+        let mut rgba = [200, 100, 50, 255].repeat(36 * 36);
+        rgba[3] = 128; // top-left corner half-alpha
+        let sheet = Image {
+            width: 36,
+            height: 36,
+            rgba,
+        };
+        let mut frame = Frame::new(60, 60, [0, 0, 0]);
+        draw_nine_slice_alpha(&mut frame, &sheet, Rect::new(10, 10, 40, 40), 128);
+        let corner = frame.pixel(10, 10).unwrap();
+        let center = frame.pixel(25, 25).unwrap();
+        // Corner combines sheet alpha (128) with global alpha (128) -> ~64/255.
+        assert!(corner[0] > 0 && corner[0] < center[0]);
+        assert!(center[0] > 80 && center[0] < 120);
+
+        // `draw_with_state_alpha` at 0 is a no-op and at 255 matches `draw_with_state`.
+        let msg = Message::notice("Title", "Body", "OK");
+        let art = art();
+        let laid = layout([800, 600], &msg, &art).unwrap();
+        let state = DialogState::default();
+        let mut f0 = Frame::new(800, 600, [10, 20, 30]);
+        draw_with_state_alpha(&mut f0, &art, &msg, &laid, None, &state, 0);
+        assert_eq!(
+            f0.pixel(laid.rect.x + 15, laid.rect.y + 15),
+            Some([10, 20, 30])
+        );
+        let mut f255 = Frame::new(800, 600, [10, 20, 30]);
+        let mut direct = Frame::new(800, 600, [10, 20, 30]);
+        draw_with_state_alpha(&mut f255, &art, &msg, &laid, None, &state, 255);
+        draw_with_state(&mut direct, &art, &msg, &laid, None, &state);
+        assert_eq!(f255.rgb(), direct.rgb());
     }
 }
