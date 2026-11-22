@@ -40,10 +40,10 @@ use std::collections::BTreeSet;
 /// keeps the view-rotated screen-centre tile pick (`0x4a7b58` cut via
 /// `0x433067`) and any frozen dialog-replay view; layout 6 keeps choice-only
 /// follow-up answers (`Answers::choices_after`) separately from explicit
-/// dialog replay queues and records the neighborhood's `deletion_epoch` at save
-/// time so reusing a deleted character GUID never revives stale instances on
-/// older saved lots.
-pub const FORMAT: u32 = 6;
+/// dialog replay queues; layout 7 records the neighborhood's `deletion_epoch`
+/// at save time so reusing a deleted character GUID never revives stale
+/// instances on older saved lots.
+pub const FORMAT: u32 = 7;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]

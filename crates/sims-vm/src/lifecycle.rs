@@ -2011,9 +2011,18 @@ fn boot_from_base_house(
     let origin_revision = stored.revision;
 
     let virtual_path = PathBuf::from(format!("{neighborhood_id}/Houses/House{house:02}.iff"));
-    let mut file =
-        House::parse_bytes_with_deleted(bytes, &virtual_path, &catalog, &stored.deleted_characters)
-            .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+    // Include any GUID ever deleted via Bulldoze (`deleted_characters` union
+    // `deleted_at_epoch` keys) so even if a replacement runtime-made character
+    // later reused a deleted loose character's GUID, `ObjM` parsing succeeds
+    // and `strip_deleted_base_instances` strips the stale base-house instance.
+    let stripped_guids: BTreeSet<u32> = stored
+        .deleted_characters
+        .iter()
+        .copied()
+        .chain(stored.deleted_at_epoch.keys().copied())
+        .collect();
+    let mut file = House::parse_bytes_with_deleted(bytes, &virtual_path, &catalog, &stripped_guids)
+        .map_err(|e| LifecycleError::Lot(e.to_string()))?;
     let view_rotation = opening_rotation(&file);
     let context = Context::COMPLETE_COLLECTION;
     let mut world = World::empty();
@@ -2092,10 +2101,11 @@ fn boot_from_base_house(
         for entry in types {
             let Some(object) = catalog.object(entry.guid) else {
                 // If a character file was permanently deleted when another lot
-                // was bulldozed (`0x426fcd`), `read_types` skips the missing
+                // was bulldozed (`0x426fcd`), even if a runtime-made character
+                // later reused that GUID, `read_types` skips the missing
                 // catalog entry and `strip_deleted_base_instances` removes any
                 // stale saved instance before object read.
-                if stored.deleted_characters.contains(&entry.guid) {
+                if stripped_guids.contains(&entry.guid) {
                     continue;
                 }
                 return Err(LifecycleError::Lot(format!(
@@ -4337,9 +4347,54 @@ mod tests {
 
         // Base `House07.iff` (still containing Bob's `ObjM` instance) must
         // strip Bob cleanly and open + step without error!
-        let mut after = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
+        let mut after = enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
         assert!(after.world.objects.values().all(|o| o.guid != bob_guid));
         after.step().unwrap();
+
+        // Now save a runtime-made replacement reusing Bob's deleted loose GUID
+        // (`0x32AA2056`) on House 4 (clearing `deleted_characters` while
+        // `deleted_at_epoch` retains the deletion epoch): untouched imported
+        // base `House07.iff` MUST STILL parse, strip the stale base instance,
+        // and open + step cleanly!
+        move_in(&root, &store, "UserData", 2, 4).unwrap();
+        let mut house4 = enter_lot(&root, &store, "UserData", 4, &[3], no_frames.clone()).unwrap();
+        let template_guid = house4.world.objects[&house4.world.people[0]].guid;
+        house4.world.characters.made.insert(
+            bob_guid,
+            sims_sim::characters::Character {
+                template: template_guid,
+                file: 905,
+                strings: BTreeMap::new(),
+            },
+        );
+        let new_nbr_id = (house4.world.neighbors.slots.len() as i16) + 1;
+        let mut new_data = vec![0i16; sims_sim::neighbors::PERSON_WORDS];
+        new_data[PERSON_HOME] = 4;
+        new_data[61] = 2;
+        house4
+            .world
+            .neighbors
+            .slots
+            .push(Some(sims_sim::neighbors::Neighbor {
+                id: new_nbr_id,
+                guid: bob_guid,
+                revision: 9,
+                data: new_data,
+                relationships: Vec::new(),
+                friends: 0,
+                stale: false,
+            }));
+        save_and_leave_lot(&root, &store, "UserData", &mut house4).unwrap();
+
+        let mut after_reuse = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
+        assert!(
+            after_reuse
+                .world
+                .objects
+                .values()
+                .all(|o| o.guid != bob_guid)
+        );
+        after_reuse.step().unwrap();
     }
 
     #[test]

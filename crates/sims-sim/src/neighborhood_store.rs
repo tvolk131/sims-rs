@@ -102,8 +102,10 @@ const ACTIVE_KEY: &str = "active";
 const INSTANCE_SEQ_KEY: &str = "instance_seq";
 
 /// Bumped whenever [`StoredNeighborhood`]'s postcard layout changes so an older
-/// record is refused cleanly instead of misread.
-pub const NEIGHBORHOOD_FORMAT: u32 = 2;
+/// record is refused cleanly instead of misread (format 2 added `instance_id`
+/// and `deleted_characters`; format 3 added `deletion_epoch` and
+/// `deleted_at_epoch`).
+pub const NEIGHBORHOOD_FORMAT: u32 = 3;
 
 /// Default `"architecture value multiplier"` from `Global.far` `FCNS #4`
 /// (`0x6e4a88`, `0x3f333333`).

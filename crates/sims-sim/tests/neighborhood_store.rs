@@ -132,14 +132,16 @@ fn lot_total_value_and_net_worth_match_sims_exe_191_formula() {
 
 #[test]
 fn stored_neighborhood_decode_rejects_short_or_wrong_version() {
-    assert_eq!(NEIGHBORHOOD_FORMAT, 2);
+    assert_eq!(NEIGHBORHOOD_FORMAT, 3);
     assert!(StoredNeighborhood::decode("bad", &[1, 2]).is_err());
-    let mut old_v1 = sample_neighborhood("UserData").encode();
-    old_v1[0..4].copy_from_slice(&1u32.to_le_bytes());
-    let err_v1 = StoredNeighborhood::decode("UserData", &old_v1)
-        .unwrap_err()
-        .to_string();
-    assert!(err_v1.contains("neighborhood format 1, expected 2"));
+    for old in [1u32, 2u32] {
+        let mut old_bytes = sample_neighborhood("UserData").encode();
+        old_bytes[0..4].copy_from_slice(&old.to_le_bytes());
+        let err_old = StoredNeighborhood::decode("UserData", &old_bytes)
+            .unwrap_err()
+            .to_string();
+        assert!(err_old.contains(&format!("neighborhood format {old}, expected 3")));
+    }
 
     let mut wrong = sample_neighborhood("UserData").encode();
     wrong[0..4].copy_from_slice(&(NEIGHBORHOOD_FORMAT + 99).to_le_bytes());
