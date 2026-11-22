@@ -20,7 +20,10 @@ use crate::{
     Answer, Answers, BuyCursor, Callback, Interpreter, PanelMode, Program, SkippedFrame, Stream,
     TickError, Update,
 };
-use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
+use sims_content::{
+    Animations, ArchivePool, AvatarRegistry, Catalog, House, Index, Install, Neighborhood, People,
+    Surfaces,
+};
 use sims_core::CrtRng;
 use sims_sim::World;
 use sims_sim::load::{Context, Household};
@@ -28,9 +31,16 @@ use sims_sim::motives::Tuning;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Anything that stops a boot, with a message that says where.
 pub type BootError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Loads the localized default baby/character name from
+/// `GameData/UIText.iff STR# 142` entry 5 (`0x44b0bf..0x44b0d6` -> `0x435f4e`).
+pub fn default_character_name(install: &Install) -> String {
+    read_default_character_name(install)
+}
 
 /// Loads the localized default baby/character name from
 /// `GameData/UIText.iff STR# 142` entry 5 (`0x44b0bf..0x44b0d6` -> `0x435f4e`).
@@ -253,10 +263,39 @@ pub struct Handoff {
     pub indicators_made: bool,
 }
 
+/// Preloaded catalog person types: `((resolved, unresolved_by_guid), registry_order_independent)`.
+pub type PreloadedPeople = ((People, BTreeMap<u32, String>), bool);
+
+/// Pre-loaded content shared by a host (such as `sims-game`) so [`Lot::load_preloaded`]
+/// reuses the same [`Install`], [`Neighborhood`], [`Index`], [`Catalog`],
+/// [`Program`], [`Animations`], [`People`], [`Surfaces`], and [`sims_content::Wardrobe`]
+/// without scanning or parsing game archives twice.
+///
+/// Parallel stage results are passed as `Result`s so [`Lot::load_preloaded`]
+/// checks every error at the exact original sequential point (`House::load` ->
+/// `Program::link` -> `Neighborhood::zoning` -> `Animations::load` ->
+/// `People::load_each` -> `icon_frames` -> `Surfaces::build` at step 6b).
+pub struct PreloadedBoot<'a> {
+    pub install: &'a Install,
+    pub neighborhood: &'a Neighborhood,
+    pub characters: Option<&'a Path>,
+    pub index: &'a Index,
+    pub catalog: Arc<Catalog>,
+    pub pool: &'a ArchivePool,
+    pub file: Option<House>,
+    pub program: crate::Result<Program>,
+    pub animations: sims_content::Result<Animations>,
+    pub people: sims_content::Result<PreloadedPeople>,
+    pub icon_frames: crate::Result<Option<BTreeMap<u16, i32>>>,
+    pub wardrobe: sims_content::Wardrobe,
+    pub surfaces: sims_content::Result<Surfaces>,
+    pub default_character_name: String,
+}
+
 /// A booted house: its linked code, its catalog and its lot.
 pub struct Lot {
     pub(crate) program: Program,
-    pub(crate) catalog: Catalog,
+    pub(crate) catalog: Arc<Catalog>,
     /// The floor and wall catalogs the load renumbered the lot's patterns
     /// by (load step 6b).
     pub(crate) surfaces: Surfaces,
@@ -772,6 +811,28 @@ impl Lot {
         )
     }
 
+    /// Boots `house` from already-loaded content ([`PreloadedBoot`]), skipping
+    /// duplicate `Install`, `Index`, `Catalog`, `Program`, `Animations`,
+    /// `People`, `Wardrobe`, and `Surfaces` loading while running the exact
+    /// original lot load sequence.
+    pub fn load_preloaded(
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        preloaded: PreloadedBoot<'_>,
+    ) -> Result<Self, BootError> {
+        Self::boot_preloaded(
+            house,
+            answers,
+            frames,
+            CrtRng::from_state(1),
+            &BTreeSet::new(),
+            None,
+            None,
+            preloaded,
+        )
+    }
+
     /// The load itself, with every input the loaders above take.
     #[allow(clippy::too_many_arguments)]
     fn boot(
@@ -786,18 +847,157 @@ impl Lot {
         view_centre: Option<[i8; 2]>,
     ) -> Result<Self, BootError> {
         let install = Install::detect(root)?;
-        let mut index = Index::build(&install)?;
-        let characters = neighborhood.characters()?;
-        if let Some(characters) = &characters {
-            index.add_characters(characters)?;
-        }
-        let catalog = Catalog::build(&index)?;
+        let pool = ArchivePool::new();
+
+        // Stage A: build Index+Catalog alongside install-only loaders that do
+        // not depend on Index or Catalog. Errors are deferred until their
+        // original sequential check points in `boot_preloaded`.
+        let (
+            index_and_catalog,
+            registry_res,
+            surfaces_res,
+            wardrobe,
+            icon_frames_res,
+            default_name,
+        ) = std::thread::scope(|scope| {
+            let idx_handle = scope.spawn(
+                || -> Result<(Option<std::path::PathBuf>, Index, Catalog), BootError> {
+                    let mut index = Index::build(&install)?;
+                    let characters = neighborhood.characters()?;
+                    if let Some(characters) = &characters {
+                        index.add_characters(characters)?;
+                    }
+                    let catalog = Catalog::build_with_pool(&index, &pool)?;
+                    Ok((characters, index, catalog))
+                },
+            );
+            let reg_handle = scope.spawn(|| AvatarRegistry::load_with_pool(&install, &pool));
+            let surf_handle = scope.spawn(|| Surfaces::build_with_pool(&install, &pool));
+            let ward_handle = scope.spawn(|| match sims_content::Assets::scan(&install.root) {
+                Ok(assets) => sims_content::Wardrobe::load_with_pool(&assets, &pool),
+                Err(error) => sims_content::Wardrobe::unread(error),
+            });
+            let icon_handle = scope.spawn(|| crate::program::icon_frames(&install));
+            let name = read_default_character_name(&install);
+            (
+                idx_handle
+                    .join()
+                    .expect("boot index/catalog worker panicked"),
+                reg_handle.join().expect("boot registry worker panicked"),
+                surf_handle.join().expect("boot surfaces worker panicked"),
+                ward_handle.join().expect("boot wardrobe worker panicked"),
+                icon_handle
+                    .join()
+                    .expect("boot icon_frames worker panicked"),
+                name,
+            )
+        });
+
+        let (characters, index, catalog) = index_and_catalog?;
+        let catalog = Arc::new(catalog);
+        // Check `House::load` right after `Catalog::build`, matching the
+        // original boot sequence before any Program/Animation/People/Surface errors.
         let file = House::load(house, &catalog)?;
+
+        // Stage B: link Program, load Animations, and resolve person types in
+        // parallel now that Index, Catalog, and AvatarRegistry are ready.
+        let (program_res, animations_res, people_res) = std::thread::scope(|scope| {
+            let prog_handle = scope.spawn(|| {
+                // The original has every definition registered, and the resize
+                // step walks them all, so the whole catalog is linked.
+                Program::link_with_pool(
+                    &index,
+                    &catalog,
+                    catalog.objects.iter().map(|o| o.guid),
+                    &pool,
+                )
+            });
+            let anim_handle = scope.spawn(|| Animations::load_with_pool(&install, &index, &pool));
+            let person_types = catalog
+                .objects
+                .iter()
+                .filter(|o| o.kind == 2)
+                .map(|o| o.guid);
+            // Every person type's skeleton and appearance, for the people a
+            // script makes. A type whose skeleton cannot be chosen is left
+            // out; making a person of it fails.
+            let people_res = People::load_each_with_registry_result(
+                &index,
+                &catalog,
+                person_types,
+                registry_res,
+                &pool,
+            )
+            .map(|(loaded, registry)| (loaded, registry.is_order_independent()));
+            (
+                prog_handle.join().expect("boot program worker panicked"),
+                anim_handle.join().expect("boot animations worker panicked"),
+                people_res,
+            )
+        });
+
+        Self::boot_preloaded(
+            house,
+            answers,
+            frames,
+            crt,
+            frame_tree_bits,
+            handoff,
+            view_centre,
+            PreloadedBoot {
+                install: &install,
+                neighborhood: &neighborhood,
+                characters: characters.as_deref(),
+                index: &index,
+                catalog,
+                pool: &pool,
+                file: Some(file),
+                program: program_res,
+                animations: animations_res,
+                people: people_res,
+                icon_frames: icon_frames_res,
+                wardrobe,
+                surfaces: surfaces_res,
+                default_character_name: default_name,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn boot_preloaded(
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
+        frame_tree_bits: &BTreeSet<(u16, usize)>,
+        handoff: Option<&Handoff>,
+        view_centre: Option<[i8; 2]>,
+        preloaded: PreloadedBoot<'_>,
+    ) -> Result<Self, BootError> {
+        let PreloadedBoot {
+            install,
+            neighborhood,
+            characters,
+            index,
+            catalog,
+            pool,
+            file,
+            program,
+            animations,
+            people,
+            icon_frames,
+            wardrobe,
+            surfaces: surfaces_res,
+            default_character_name,
+        } = preloaded;
+
+        let file = match file {
+            Some(file) => file,
+            None => House::load(house, &catalog)?,
+        };
         let view_rotation = opening_rotation(&file);
         let context = Context::COMPLETE_COLLECTION;
-        // The original has every definition registered, and the resize
-        // step walks them all, so the whole catalog is linked.
-        let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))?;
+        let mut program = program?;
         program.zoning = neighborhood.zoning(context.expansions)?;
         program.expansions = context.expansions;
         // The types registered from the neighborhood's Characters folder,
@@ -812,27 +1012,13 @@ impl Lot {
                 })
             })
             .collect();
-        program.animations = Animations::load(&install, &index)?;
-        let person_types = || {
-            catalog
-                .objects
-                .iter()
-                .filter(|o| o.kind == 2)
-                .map(|o| o.guid)
-        };
-        // Every person type's skeleton and appearance, for the people a
-        // script makes. A type whose skeleton cannot be chosen is left
-        // out; making a person of it fails.
-        program.people = People::load_each(&install, &index, &catalog, person_types())?.0;
-        program.icon_frames = crate::program::icon_frames(&install)?;
-        // A person file that cannot be listed fails Make New Character,
-        // not the boot, which never reads the names otherwise.
-        program.wardrobe = Some(match sims_content::Assets::scan(&install.root) {
-            Ok(assets) => sims_content::Wardrobe::load(&assets),
-            Err(error) => sims_content::Wardrobe::unread(error),
-        });
-        if let Some(characters) = &characters {
-            program.character_files = crate::program::character_files(&index, characters);
+        program.animations = animations?;
+        let ((catalog_people, unresolved_people), registry_order_independent) = people?;
+        program.people = catalog_people;
+        program.icon_frames = icon_frames?;
+        program.wardrobe = Some(wardrobe);
+        if let Some(characters) = characters {
+            program.character_files = crate::program::character_files(index, characters);
         }
         let mut world = World::empty();
         world.crt_rng = crt;
@@ -871,8 +1057,8 @@ impl Lot {
                 world.skeleton_files.insert(file.clone());
             }
             world.read_neighbors(
-                &neighborhood,
-                &sims_sim::neighbors::registry(&index, &catalog),
+                neighborhood,
+                &sims_sim::neighbors::registry(index, &catalog),
             )?;
             world.drop_empty_families()?;
             world.type_attributes = program.type_attributes(&catalog)?;
@@ -950,9 +1136,7 @@ impl Lot {
                 .version()
                 .ok_or("the house file has no HOUS 1 chunk, which holds its version")?;
             world.read_arrays(&file.arrays, version)?;
-            // The floor and wall catalogs, which the original builds at
-            // start-up.
-            surfaces = Surfaces::build(&install)?;
+            surfaces = surfaces_res?;
             load.renumbered = world.renumber_surfaces(
                 file.floor_map.as_deref(),
                 file.wall_map.as_deref(),
@@ -988,12 +1172,57 @@ impl Lot {
             }
             // 6d: the second clear, then 6e: the saved objects.
             load.cleared_again = interpreter.clear(&mut world)?.len();
-            let people = People::load(
-                &install,
-                &index,
-                &catalog,
-                file.objects.instances.values().map(|o| o.guid),
-            )?;
+            // Reuse the already-resolved catalog person types instead of
+            // rebuilding AvatarRegistry a second time whenever lookups are
+            // order-independent (no skeleton decode error and no lazy `.ndx`
+            // skeleton mutation).
+            let people = if registry_order_independent {
+                let saved_guids: BTreeSet<u32> =
+                    file.objects.instances.values().map(|o| o.guid).collect();
+                for &guid in &saved_guids {
+                    if let Some(reason) = unresolved_people.get(&guid) {
+                        return Err(sims_content::Error::Unsupported(reason.clone()).into());
+                    }
+                }
+                let skeletons = saved_guids
+                    .iter()
+                    .filter_map(|guid| {
+                        program
+                            .people
+                            .skeletons
+                            .get(guid)
+                            .map(|s| (*guid, s.clone()))
+                    })
+                    .collect();
+                let profiles = saved_guids
+                    .iter()
+                    .filter_map(|guid| {
+                        program
+                            .people
+                            .profiles
+                            .get(guid)
+                            .map(|p| (*guid, p.clone()))
+                    })
+                    .collect();
+                People {
+                    skeletons,
+                    profiles,
+                    suits: program.people.suits.clone(),
+                    suit_errors: program.people.suit_errors.clone(),
+                }
+            } else {
+                let (loaded, mut unresolved) = People::load_each_with_pool(
+                    install,
+                    index,
+                    &catalog,
+                    file.objects.instances.values().map(|o| o.guid),
+                    pool,
+                )?;
+                if let Some((_, reason)) = unresolved.pop_first() {
+                    return Err(sims_content::Error::Unsupported(reason).into());
+                }
+                loaded
+            };
             let read = interpreter.read_objects_with_frame_tree_bits(
                 &mut world,
                 &file.objects,
@@ -1100,7 +1329,6 @@ impl Lot {
         load.libraries = program.libraries.len();
         let start = world.ticks;
         let loaded = world.hash();
-        let default_character_name = read_default_character_name(&install);
         let zoning = if load.house == 0 {
             Some(1)
         } else {
@@ -3317,13 +3545,13 @@ mod tests {
                 expansions: 0,
                 characters: Default::default(),
             },
-            catalog: Catalog {
+            catalog: std::sync::Arc::new(Catalog {
                 global: 0,
                 objects: Vec::new(),
                 by_guid: BTreeMap::new(),
                 semi_globals: BTreeMap::new(),
                 diagnostics: Vec::new(),
-            },
+            }),
             surfaces: sims_content::Surfaces::default(),
             world,
             tuning: None,
@@ -3719,15 +3947,16 @@ mod tests {
             l.program.libraries.insert(0, crate::Library::default());
             l.program.libraries.insert(1, library.clone());
             l.program.semi_globals.insert(1, None);
-            l.catalog.objects.push(sims_content::Object {
+            let cat = std::sync::Arc::make_mut(&mut l.catalog);
+            cat.objects.push(sims_content::Object {
                 guid: GUID,
                 resource: 1,
                 chunk: 128,
                 kind: 4,
                 master: 0,
             });
-            l.catalog.by_guid.insert(GUID, 0);
-            l.catalog.semi_globals.insert(1, None);
+            cat.by_guid.insert(GUID, 0);
+            cat.semi_globals.insert(1, None);
             l
         };
 
@@ -4072,22 +4301,23 @@ mod tests {
             l.program.libraries.insert(1, lamp_lib.clone());
             l.program.libraries.insert(2, make_person_lib(PERSON_A));
             l.program.libraries.insert(3, make_person_lib(PERSON_B));
+            let cat = std::sync::Arc::make_mut(&mut l.catalog);
             for res in [1, 2, 3] {
                 l.program.semi_globals.insert(res, None);
-                l.catalog.semi_globals.insert(res, None);
+                cat.semi_globals.insert(res, None);
             }
             for (idx, (guid, res, kind)) in [(LAMP_GUID, 1, 4), (PERSON_A, 2, 2), (PERSON_B, 3, 2)]
                 .into_iter()
                 .enumerate()
             {
-                l.catalog.objects.push(sims_content::Object {
+                cat.objects.push(sims_content::Object {
                     guid,
                     resource: res,
                     chunk: 128,
                     kind,
                     master: 0,
                 });
-                l.catalog.by_guid.insert(guid, idx);
+                cat.by_guid.insert(guid, idx);
             }
             for (guid, name) in [(PERSON_A, "person_a"), (PERSON_B, "person_b")] {
                 l.program.people.skeletons.insert(

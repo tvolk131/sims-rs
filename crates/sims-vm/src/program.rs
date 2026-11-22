@@ -1,5 +1,5 @@
 use crate::{Error, Result};
-use sims_content::{Animations, Catalog, Index, Object, People};
+use sims_content::{Animations, ArchivePool, Catalog, Index, Object, People};
 use sims_formats::behavior::{Behavior, InteractionTable};
 use sims_formats::career::Level;
 use sims_formats::execution::{self, ObjectFunction, ObjectFunctions, Slots};
@@ -241,13 +241,114 @@ impl Program {
         catalog: &Catalog,
         guids: impl IntoIterator<Item = u32>,
     ) -> Result<Self> {
-        let mut program = Self {
+        Self::link_with_pool(index, catalog, guids, &ArchivePool::new())
+    }
+
+    /// Like [`Program::link`], reusing open archive handles from `pool` and
+    /// parsing libraries in parallel while preserving exact sequential error
+    /// priority and deterministic `BTreeMap` layout.
+    pub fn link_with_pool(
+        index: &Index,
+        catalog: &Catalog,
+        guids: impl IntoIterator<Item = u32>,
+        pool: &ArchivePool,
+    ) -> Result<Self> {
+        let mut semi_globals: BTreeMap<usize, Option<usize>> = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        let mut resources_to_load: Vec<usize> = Vec::new();
+        if seen.insert(catalog.global) {
+            resources_to_load.push(catalog.global);
+        }
+        let mut missing_guid: Option<u32> = None;
+        for guid in guids {
+            let Some(object) = catalog.object(guid) else {
+                missing_guid = Some(guid);
+                break;
+            };
+            if seen.insert(object.resource) {
+                resources_to_load.push(object.resource);
+            }
+            let semi_global = catalog
+                .semi_globals
+                .get(&object.resource)
+                .copied()
+                .flatten();
+            semi_globals.insert(object.resource, semi_global);
+            if let Some(resource) = semi_global
+                && seen.insert(resource)
+            {
+                resources_to_load.push(resource);
+            }
+        }
+
+        let workers = if resources_to_load.len() <= 1 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+                .clamp(1, 8)
+                .min(resources_to_load.len())
+        };
+
+        let (careers_res, career_texts_res, labels_res, loaded_libs) =
+            std::thread::scope(|scope| {
+                let careers_handle = scope.spawn(|| careers_with_pool(index, pool));
+                let texts_handle = scope.spawn(|| career_texts_end_with_pool(index, pool));
+                let labels_handle = scope.spawn(|| labels_hold_no_token(&index.root));
+                let libs: Vec<(usize, Result<Library>)> = if workers <= 1 {
+                    resources_to_load
+                        .iter()
+                        .map(|&res| (res, load_library_with_pool(index, res, pool)))
+                        .collect()
+                } else {
+                    let chunk_size = resources_to_load.len().div_ceil(workers);
+                    let handles: Vec<_> = resources_to_load
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            scope.spawn(move || {
+                                chunk
+                                    .iter()
+                                    .map(|&res| (res, load_library_with_pool(index, res, pool)))
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                    let mut out = Vec::with_capacity(resources_to_load.len());
+                    for handle in handles {
+                        out.extend(handle.join().expect("program link worker panicked"));
+                    }
+                    out
+                };
+                (
+                    careers_handle.join().expect("careers worker panicked"),
+                    texts_handle
+                        .join()
+                        .expect("career_texts_end worker panicked"),
+                    labels_handle
+                        .join()
+                        .expect("labels_hold_no_token worker panicked"),
+                    libs,
+                )
+            });
+
+        let careers = careers_res?;
+        let career_texts_end = career_texts_res?;
+        let labels_hold_no_token = labels_res?;
+        let mut libraries = BTreeMap::new();
+        for (resource, library) in loaded_libs {
+            libraries.insert(resource, library?);
+        }
+        if let Some(guid) = missing_guid {
+            return Err(Error::MissingDefinition(guid));
+        }
+        Ok(Self {
             global: catalog.global,
-            libraries: BTreeMap::new(),
-            semi_globals: BTreeMap::new(),
-            careers: careers(index)?,
-            career_texts_end: career_texts_end(index)?,
-            labels_hold_no_token: labels_hold_no_token(&index.root)?,
+            libraries,
+            semi_globals,
+            careers,
+            career_texts_end,
+            labels_hold_no_token,
             zoning: BTreeMap::new(),
             animations: Animations::default(),
             people: People::default(),
@@ -256,215 +357,195 @@ impl Program {
             character_files: Default::default(),
             expansions: 0,
             characters: BTreeSet::new(),
-        };
-        program.load(index, catalog.global)?;
-        for guid in guids {
-            let object = catalog.object(guid).ok_or(Error::MissingDefinition(guid))?;
-            program.load(index, object.resource)?;
-            let semi_global = catalog
-                .semi_globals
-                .get(&object.resource)
-                .copied()
-                .flatten();
-            program.semi_globals.insert(object.resource, semi_global);
-            if let Some(resource) = semi_global {
-                program.load(index, resource)?;
-            }
-        }
-        Ok(program)
+        })
     }
+}
 
-    fn load(&mut self, index: &Index, resource: usize) -> Result<()> {
-        if self.libraries.contains_key(&resource) {
-            return Ok(());
-        }
-        let file = &index.resources[resource];
-        let location = file.location(&index.root);
-        let format = |tag: &str, id: u16, e| {
-            sims_content::Error::format(&format!("{location} {tag} #{id}"), e)
-        };
-        let iff =
-            Iff::parse(file.read()?).map_err(|e| sims_content::Error::format(&location, e))?;
-        let mut library = Library::default();
-        for chunk in &iff.chunks {
-            let data = iff.data(chunk);
-            match &chunk.tag {
-                b"BHAV" => {
-                    let behavior =
-                        Behavior::parse(data).map_err(|e| format("BHAV", chunk.id, e))?;
-                    library.behaviors.insert(chunk.id, behavior);
-                    library.names.insert(chunk.id, chunk.label.clone());
-                }
-                b"STR#" => {
-                    let table = match string_table(data, iff.resource_flags(chunk)) {
-                        Ok(table) => table,
-                        // The loader skips a deleted chunk (0x41c542), so
-                        // one that does not parse does not stop the link.
-                        Err(_) if chunk.flags & sims_formats::iff::DELETED != 0 => continue,
-                        Err(e) => return Err(format("STR#", chunk.id, e).into()),
-                    };
-                    let entries: Vec<String> = table
-                        .entries
-                        .iter()
-                        .filter(|entry| entry.language == 1)
-                        .map(|entry| entry.text.clone())
-                        .collect();
-                    if chunk.id == TREE_NAMES {
-                        library.tree_names.clone_from(&entries);
-                    }
-                    library.strings.insert(chunk.id, entries);
-                }
-                b"\0CST" => {
-                    if iff.get(b"\0CST", chunk.id).is_some() {
-                        library.legacy_strings.insert(chunk.id);
-                    }
-                }
-                b"CATS" => {
-                    if iff.get(b"CATS", chunk.id).is_some() {
-                        library.legacy_catalog_strings.insert(chunk.id);
-                    }
-                }
-                b"FWAV" => {
-                    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-                    let name = data[..end].iter().map(|&b| char::from(b)).collect();
-                    library.sounds.insert(chunk.id, name);
-                }
-                b"BCON" => {
-                    let constants =
-                        execution::constants(data).map_err(|e| format("BCON", chunk.id, e))?;
-                    library.constants.insert(chunk.id, constants);
-                }
-                b"FCNS" => {
-                    let table = sims_formats::tuning::Constants::parse(data)
-                        .map_err(|e| format("FCNS", chunk.id, e))?;
-                    library.tuning.insert(chunk.id, table);
-                }
-                b"TTAB" => {
-                    let table = InteractionTable::parse(data).ok();
-                    library.interactions.insert(chunk.id, table);
-                }
-                b"SLOT" => {
-                    let slots = Slots::parse(data).map_err(|e| format("SLOT", chunk.id, e))?;
-                    let count = slots.entries.iter().filter(|s| s.kind == 0).count();
-                    library.containers.insert(chunk.id, count);
-                    library.slots.insert(chunk.id, slots.entries);
-                }
-                _ => {}
+fn load_library_with_pool(index: &Index, resource: usize, pool: &ArchivePool) -> Result<Library> {
+    let file = &index.resources[resource];
+    let location = file.location(&index.root);
+    let format =
+        |tag: &str, id: u16, e| sims_content::Error::format(&format!("{location} {tag} #{id}"), e);
+    let iff =
+        Iff::parse(file.read_with(pool)?).map_err(|e| sims_content::Error::format(&location, e))?;
+    let mut library = Library::default();
+    for chunk in &iff.chunks {
+        let data = iff.data(chunk);
+        match &chunk.tag {
+            b"BHAV" => {
+                let behavior = Behavior::parse(data).map_err(|e| format("BHAV", chunk.id, e))?;
+                library.behaviors.insert(chunk.id, behavior);
+                library.names.insert(chunk.id, chunk.label.clone());
             }
-        }
-        library.has_portrait_bitmap = iff
-            .get(b"BMP_", PORTRAIT_BITMAP)
-            .is_some_and(|chunk| sims_formats::bitmap::bmp(iff.data(chunk)).is_ok());
-        // 0x43c6b9/0x43c2c1/0x43c5bf → 0x43e48a → 0x465970 → 0x413094..0x4130dd:
-        // only loose files under `Characters` are opened with writable = 1, and
-        // `FlatFile::Open` sets `CanWrite()` (byte +8) only if the read-write
-        // open actually succeeds (falling back to read-only on failure). Inline
-        // loose character files from a persistence store are logically writable
-        // without probing the host process's working directory.
-        library.writable = file.member.is_none()
-            && index
-                .mounts
-                .get(file.mount)
-                .is_some_and(|m| m.path == Index::CHARACTERS)
-            && (file.is_inline()
-                || std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&file.path)
-                    .is_ok());
-        // The string tables as the original's loader finds them.
-        let ids: BTreeSet<u16> = iff
-            .chunks
-            .iter()
-            .filter(|chunk| &chunk.tag == b"STR#")
-            .map(|chunk| chunk.id)
-            .collect();
-        for id in ids {
-            let Some(chunk) = iff.get(b"STR#", id) else {
-                library.loaded_strings.insert(id, None);
-                continue;
-            };
-            // A file whose resource map does not match its chunks, which
-            // the original reads as the map has it (0x41bfdd to 0x41c032),
-            // fails the link below (`resource_order`).
-            let data = iff.data(chunk);
-            if let Some(why) = unported_strings(iff.resource_flags(chunk), data) {
-                library.unported_strings.insert(id, why);
-                continue;
-            }
-            let table = sims_formats::strings::StringTable::parse(data)
-                .map_err(|e| format("STR#", id, e))?;
-            if english_fallback(&table.entries) {
-                library.unported_strings.insert(
-                    id,
-                    "has entries with a language and none in US English, which the loader \
-                     reads again for English (0x47006b to 0x4700d0)",
-                );
-                continue;
-            }
-            let loaded = loaded_order(&table.entries);
-            if library.strings.get(&id) != Some(&loaded) {
-                library.loaded_strings.insert(id, Some(loaded));
-            }
-        }
-        // Catalog string tables (CTSS) as `0x4061e3` / `0x470ca7` loads them.
-        let ctss_ids: BTreeSet<u16> = iff
-            .chunks
-            .iter()
-            .filter(|chunk| &chunk.tag == b"CTSS")
-            .map(|chunk| chunk.id)
-            .collect();
-        for id in ctss_ids {
-            let Some(chunk) = iff.get(b"CTSS", id) else {
-                continue;
-            };
-            let data = iff.data(chunk);
-            if let Some(why) = unported_strings(iff.resource_flags(chunk), data) {
-                library.unported_catalog_strings.insert(id, why);
-                continue;
-            }
-            let table = sims_formats::strings::StringTable::parse(data)
-                .map_err(|e| format("CTSS", id, e))?;
-            let entries = table
-                .entries
-                .iter()
-                .map(|entry| (entry.language, entry.text.clone()))
-                .collect();
-            library.catalog_strings.insert(id, entries);
-        }
-        // The native resource order (the rsmp map when there is one), as the
-        // catalog registers definitions. The old prototype kept physical
-        // file order instead (legacy/crates/sims-content/src/vm.rs:187).
-        let definitions = iff
-            .resource_order(b"OBJD")
-            .map_err(|e| sims_content::Error::format(&location, e))?;
-        for chunk in definitions {
-            let words =
-                definition_words(iff.data(chunk)).map_err(|e| format("OBJD", chunk.id, e))?;
-            library.definition_order.push(chunk.id);
-            library.definitions.insert(chunk.id, words);
-            let callbacks = match iff.get(b"OBJf", chunk.id) {
-                Some(table) => {
-                    ObjectFunctions::parse(iff.data(table))
-                        .map_err(|e| format("OBJf", table.id, e))?
-                        .entries
-                }
-                // The fallback reads the normalized record
-                // (legacy/crates/sims-content/src/vm.rs:351-370).
-                None => DEFINITION_CALLBACKS
+            b"STR#" => {
+                let table = match string_table(data, iff.resource_flags(chunk)) {
+                    Ok(table) => table,
+                    // The loader skips a deleted chunk (0x41c542), so
+                    // one that does not parse does not stop the link.
+                    Err(_) if chunk.flags & sims_formats::iff::DELETED != 0 => continue,
+                    Err(e) => return Err(format("STR#", chunk.id, e).into()),
+                };
+                let entries: Vec<String> = table
+                    .entries
                     .iter()
-                    .map(|&offset| ObjectFunction {
-                        condition: 0,
-                        action: words[offset / 2] as u16,
-                    })
-                    .collect(),
-            };
-            library.callbacks.insert(chunk.id, callbacks);
+                    .filter(|entry| entry.language == 1)
+                    .map(|entry| entry.text.clone())
+                    .collect();
+                if chunk.id == TREE_NAMES {
+                    library.tree_names.clone_from(&entries);
+                }
+                library.strings.insert(chunk.id, entries);
+            }
+            b"\0CST" => {
+                if iff.get(b"\0CST", chunk.id).is_some() {
+                    library.legacy_strings.insert(chunk.id);
+                }
+            }
+            b"CATS" => {
+                if iff.get(b"CATS", chunk.id).is_some() {
+                    library.legacy_catalog_strings.insert(chunk.id);
+                }
+            }
+            b"FWAV" => {
+                let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+                let name = data[..end].iter().map(|&b| char::from(b)).collect();
+                library.sounds.insert(chunk.id, name);
+            }
+            b"BCON" => {
+                let constants =
+                    execution::constants(data).map_err(|e| format("BCON", chunk.id, e))?;
+                library.constants.insert(chunk.id, constants);
+            }
+            b"FCNS" => {
+                let table = sims_formats::tuning::Constants::parse(data)
+                    .map_err(|e| format("FCNS", chunk.id, e))?;
+                library.tuning.insert(chunk.id, table);
+            }
+            b"TTAB" => {
+                let table = InteractionTable::parse(data).ok();
+                library.interactions.insert(chunk.id, table);
+            }
+            b"SLOT" => {
+                let slots = Slots::parse(data).map_err(|e| format("SLOT", chunk.id, e))?;
+                let count = slots.entries.iter().filter(|s| s.kind == 0).count();
+                library.containers.insert(chunk.id, count);
+                library.slots.insert(chunk.id, slots.entries);
+            }
+            _ => {}
         }
-        self.libraries.insert(resource, library);
-        Ok(())
     }
+    library.has_portrait_bitmap = iff
+        .get(b"BMP_", PORTRAIT_BITMAP)
+        .is_some_and(|chunk| sims_formats::bitmap::bmp(iff.data(chunk)).is_ok());
+    // 0x43c6b9/0x43c2c1/0x43c5bf → 0x43e48a → 0x465970 → 0x413094..0x4130dd:
+    // only loose files under `Characters` are opened with writable = 1, and
+    // `FlatFile::Open` sets `CanWrite()` (byte +8) only if the read-write
+    // open actually succeeds (falling back to read-only on failure). Inline
+    // loose character files from a persistence store are logically writable
+    // without probing the host process's working directory.
+    library.writable = file.member.is_none()
+        && index
+            .mounts
+            .get(file.mount)
+            .is_some_and(|m| m.path == Index::CHARACTERS)
+        && (file.is_inline()
+            || std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file.path)
+                .is_ok());
+    // The string tables as the original's loader finds them.
+    let ids: BTreeSet<u16> = iff
+        .chunks
+        .iter()
+        .filter(|chunk| &chunk.tag == b"STR#")
+        .map(|chunk| chunk.id)
+        .collect();
+    for id in ids {
+        let Some(chunk) = iff.get(b"STR#", id) else {
+            library.loaded_strings.insert(id, None);
+            continue;
+        };
+        // A file whose resource map does not match its chunks, which
+        // the original reads as the map has it (0x41bfdd to 0x41c032),
+        // fails the link below (`resource_order`).
+        let data = iff.data(chunk);
+        if let Some(why) = unported_strings(iff.resource_flags(chunk), data) {
+            library.unported_strings.insert(id, why);
+            continue;
+        }
+        let table =
+            sims_formats::strings::StringTable::parse(data).map_err(|e| format("STR#", id, e))?;
+        if english_fallback(&table.entries) {
+            library.unported_strings.insert(
+                id,
+                "has entries with a language and none in US English, which the loader \
+                 reads again for English (0x47006b to 0x4700d0)",
+            );
+            continue;
+        }
+        let loaded = loaded_order(&table.entries);
+        if library.strings.get(&id) != Some(&loaded) {
+            library.loaded_strings.insert(id, Some(loaded));
+        }
+    }
+    // Catalog string tables (CTSS) as `0x4061e3` / `0x470ca7` loads them.
+    let ctss_ids: BTreeSet<u16> = iff
+        .chunks
+        .iter()
+        .filter(|chunk| &chunk.tag == b"CTSS")
+        .map(|chunk| chunk.id)
+        .collect();
+    for id in ctss_ids {
+        let Some(chunk) = iff.get(b"CTSS", id) else {
+            continue;
+        };
+        let data = iff.data(chunk);
+        if let Some(why) = unported_strings(iff.resource_flags(chunk), data) {
+            library.unported_catalog_strings.insert(id, why);
+            continue;
+        }
+        let table =
+            sims_formats::strings::StringTable::parse(data).map_err(|e| format("CTSS", id, e))?;
+        let entries = table
+            .entries
+            .iter()
+            .map(|entry| (entry.language, entry.text.clone()))
+            .collect();
+        library.catalog_strings.insert(id, entries);
+    }
+    // The native resource order (the rsmp map when there is one), as the
+    // catalog registers definitions. The old prototype kept physical
+    // file order instead (legacy/crates/sims-content/src/vm.rs:187).
+    let definitions = iff
+        .resource_order(b"OBJD")
+        .map_err(|e| sims_content::Error::format(&location, e))?;
+    for chunk in definitions {
+        let words = definition_words(iff.data(chunk)).map_err(|e| format("OBJD", chunk.id, e))?;
+        library.definition_order.push(chunk.id);
+        library.definitions.insert(chunk.id, words);
+        let callbacks = match iff.get(b"OBJf", chunk.id) {
+            Some(table) => {
+                ObjectFunctions::parse(iff.data(table))
+                    .map_err(|e| format("OBJf", table.id, e))?
+                    .entries
+            }
+            // The fallback reads the normalized record
+            // (legacy/crates/sims-content/src/vm.rs:351-370).
+            None => DEFINITION_CALLBACKS
+                .iter()
+                .map(|&offset| ObjectFunction {
+                    condition: 0,
+                    action: words[offset / 2] as u16,
+                })
+                .collect(),
+        };
+        library.callbacks.insert(chunk.id, callbacks);
+    }
+    Ok(library)
+}
 
+impl Program {
     /// The constants the room scores are worked out with (0x4665d1): the
     /// global file's tuning table 3, read by name, with the original's
     /// default for each name the table lacks.
@@ -1050,7 +1131,7 @@ fn group_master<'a>(
         .find(|parent| parent[10] == words[10] && parent[11] == -1)
 }
 
-fn careers(index: &Index) -> Result<Option<Vec<Career>>> {
+fn careers_with_pool(index: &Index, pool: &ArchivePool) -> Result<Option<Vec<Career>>> {
     if index.named("Careers.txt").next().is_some() {
         return Ok(None);
     }
@@ -1058,7 +1139,8 @@ fn careers(index: &Index) -> Result<Option<Vec<Career>>> {
         return Ok(None);
     };
     let location = file.location(&index.root);
-    let iff = Iff::parse(file.read()?).map_err(|e| sims_content::Error::format(&location, e))?;
+    let iff =
+        Iff::parse(file.read_with(pool)?).map_err(|e| sims_content::Error::format(&location, e))?;
     let chunks = iff
         .resource_order(b"CARR")
         .map_err(|e| sims_content::Error::format(&location, e))?;
@@ -1166,7 +1248,7 @@ pub fn loaded_order(entries: &[sims_formats::strings::TextEntry]) -> Vec<String>
 /// 0x406a29). Only one component is ported, so this is false unless that
 /// directory holds exactly one entry or archive member named `work` with
 /// any extension ([`resource_set`]), `work.iff`, and it is the index's
-/// only `work.iff`, which [`careers`] reads. (A `.dir` that is a file or
+/// only `work.iff`, which [`careers_with_pool`] reads. (A `.dir` that is a file or
 /// an archive member, which the original does not open as one, makes it
 /// false too: a check stricter than need be, not a port.) So do
 /// a `Careers.txt` (0x403e31). Every string table of it (STR#, and CST,
@@ -1176,8 +1258,8 @@ pub fn loaded_order(entries: &[sims_formats::strings::TextEntry]) -> Vec<String>
 /// career's name and level strings must hold no career token
 /// ([`crate::primitives::dialog::may_hold_career_token`]): its suit names
 /// hold `$`. A career that does not parse makes it false here, though
-/// [`careers`] fails the link first.
-fn career_texts_end(index: &Index) -> Result<bool> {
+/// [`careers_with_pool`] fails the link first.
+fn career_texts_end_with_pool(index: &Index, pool: &ArchivePool) -> Result<bool> {
     if index.named("Careers.txt").next().is_some() {
         return Ok(false);
     }
@@ -1206,7 +1288,8 @@ fn career_texts_end(index: &Index) -> Result<bool> {
         return Ok(false);
     }
     let location = file.location(&index.root);
-    let iff = Iff::parse(file.read()?).map_err(|e| sims_content::Error::format(&location, e))?;
+    let iff =
+        Iff::parse(file.read_with(pool)?).map_err(|e| sims_content::Error::format(&location, e))?;
     if !strings_read_as_ported(&iff, None) {
         return Ok(false);
     }
@@ -1245,7 +1328,7 @@ pub const LABEL_FILE: &str = "GameData/UIText.iff";
 /// Whether the default button labels a dialog may show hold no `$`
 /// ([`Program::labels_hold_no_token`]), for the install at `root`. They
 /// come from the `UIText` resource set of `GameData`, which the composite
-/// opener makes as it makes `Work`'s ([`career_texts_end`]), so this is
+/// opener makes as it makes `Work`'s ([`career_texts_end_with_pool`]), so this is
 /// false unless that directory holds exactly one entry or archive member
 /// named `UIText` with any extension (a `.dir` that is not a directory
 /// included, as there), the file [`LABEL_FILE`], and every

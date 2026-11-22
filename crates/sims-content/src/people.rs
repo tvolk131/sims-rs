@@ -3,6 +3,7 @@
 //! skeletons and the profiles their resets read.
 
 use crate::import_wardrobe::{AvatarPaths, mount_avatar_paths, resources_with_dir};
+use crate::pool::{ArchivePool, worker_count};
 use crate::{Catalog, Error, Index, Install, Resource, Result};
 use sims_formats::avatar::Cmx;
 use sims_formats::avatar::catalog::{Asset, Binary};
@@ -160,6 +161,7 @@ pub struct AvatarRegistry {
     paths: AvatarPaths,
     skeletons: BTreeMap<String, (usize, SkeletonEntry)>,
     first_skeleton_error: Option<(usize, String)>,
+    used_indexed_skeleton: bool,
     suits: BTreeSet<String>,
     suit_errors: BTreeMap<String, String>,
 }
@@ -167,7 +169,14 @@ pub struct AvatarRegistry {
 impl AvatarRegistry {
     /// Builds the startup avatar registry for `install`.
     pub fn load(install: &Install) -> Result<Self> {
-        let paths = mount_avatar_paths(install, false)?;
+        Self::load_with_pool(install, &ArchivePool::new())
+    }
+
+    /// Builds the startup avatar registry using `pool` for archive reads and
+    /// parallelizing `.cmx`/`.bcf` catalog decoding while applying every
+    /// registration and diagnostic in exact startup precedence order.
+    pub fn load_with_pool(install: &Install, pool: &ArchivePool) -> Result<Self> {
+        let paths = mount_avatar_paths(install, false, pool)?;
         let mut skeletons: BTreeMap<String, (usize, SkeletonEntry)> = BTreeMap::new();
         let mut first_skeleton_error: Option<(usize, String)> = None;
         let mut suits = BTreeSet::new();
@@ -175,10 +184,47 @@ impl AvatarRegistry {
         let mut step = 0usize;
 
         // 0x59f844: all eager `.cmx` catalogs first, then all eager `.bcf`.
-        for (_, _, source) in resources_with_dir(&paths.files, &paths.appearance, b".cmx")? {
+        let cmx_sources = resources_with_dir(&paths.files, &paths.appearance, b".cmx")?;
+        type CmxResult = Result<(
+            String,
+            BTreeSet<String>,
+            std::result::Result<(), (bool, sims_formats::Error)>,
+        )>;
+        let parse_cmx = |source: &Resource| -> CmxResult {
             let location = source.location(&install.root);
-            let bytes = source.read()?;
-            if let Err((blocks_skeletons, error)) = read_cmx_catalog(&bytes, &mut suits) {
+            let bytes = source.read_with(pool)?;
+            let mut local_suits = BTreeSet::new();
+            let status = read_cmx_catalog(&bytes, &mut local_suits);
+            Ok((location, local_suits, status))
+        };
+        let cmx_workers = worker_count(cmx_sources.len());
+        let cmx_decoded: Vec<CmxResult> = if cmx_workers <= 1 {
+            cmx_sources.iter().map(|(_, _, s)| parse_cmx(s)).collect()
+        } else {
+            let chunk_size = cmx_sources.len().div_ceil(cmx_workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = cmx_sources
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|(_, _, s)| parse_cmx(s))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(cmx_sources.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("cmx worker panicked"));
+                }
+                out
+            })
+        };
+        for item in cmx_decoded {
+            let (location, local_suits, status) = item?;
+            suits.extend(local_suits);
+            if let Err((blocks_skeletons, error)) = status {
                 suit_errors.insert(location.clone(), error.to_string());
                 if blocks_skeletons && first_skeleton_error.is_none() {
                     step += 1;
@@ -190,11 +236,66 @@ impl AvatarRegistry {
             }
         }
 
-        for (_, _, source) in resources_with_dir(&paths.files, &paths.appearance, b".bcf")? {
+        let bcf_sources = resources_with_dir(&paths.files, &paths.appearance, b".bcf")?;
+        type BcfResult = Result<(
+            String,
+            DecodedSkeletons,
+            Option<sims_formats::Error>,
+            BTreeSet<String>,
+            Option<sims_formats::Error>,
+        )>;
+        let parse_bcf = |source: &Resource| -> BcfResult {
             let location = source.location(&install.root);
-            let bytes = source.read()?;
+            // Animation-only `.bcf` files start with 0 skeletons and 0
+            // appearances (`[0; 8]`); neither `read_bcf_skeletons` nor
+            // `read_bcf_appearances` reads past byte 8 in that case.
+            let head = source.read_head_with(pool, 8)?;
+            if head.len() == 8 && head == [0; 8] {
+                return Ok((location, Vec::new(), None, BTreeSet::new(), None));
+            }
+            let bytes = source.read_with(pool)?;
             let mut binary = Binary::new(&bytes);
             let (decoded, skeleton_error) = read_bcf_skeletons(&mut binary);
+            let mut local_suits = BTreeSet::new();
+            let appearance_error = if skeleton_error.is_none() {
+                read_bcf_appearances(&mut binary, &mut local_suits).err()
+            } else {
+                None
+            };
+            Ok((
+                location,
+                decoded,
+                skeleton_error,
+                local_suits,
+                appearance_error,
+            ))
+        };
+        let bcf_workers = worker_count(bcf_sources.len());
+        let bcf_decoded: Vec<BcfResult> = if bcf_workers <= 1 {
+            bcf_sources.iter().map(|(_, _, s)| parse_bcf(s)).collect()
+        } else {
+            let chunk_size = bcf_sources.len().div_ceil(bcf_workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = bcf_sources
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|(_, _, s)| parse_bcf(s))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(bcf_sources.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("bcf worker panicked"));
+                }
+                out
+            })
+        };
+        for item in bcf_decoded {
+            let (location, decoded, skeleton_error, local_suits, appearance_error) = item?;
             let all_scales: Vec<Vec<i32>> = decoded
                 .iter()
                 .map(|(_, scales, _)| scales.clone())
@@ -224,7 +325,8 @@ impl AvatarRegistry {
                 }
                 continue;
             }
-            if let Err(error) = read_bcf_appearances(&mut binary, &mut suits) {
+            suits.extend(local_suits);
+            if let Some(error) = appearance_error {
                 suit_errors.insert(location, error.to_string());
             }
         }
@@ -235,7 +337,7 @@ impl AvatarRegistry {
         let mut indexed_suits: BTreeMap<String, (String, String, Vec<u8>)> = BTreeMap::new();
         for (directory, _, source) in resources_with_dir(&paths.files, &paths.indexed, b".ndx")? {
             let location = source.location(&install.root);
-            let bytes = source.read()?;
+            let bytes = source.read_with(pool)?;
             let mut reader = IndexReader::new(&bytes);
             while let Some(item) = reader.next() {
                 match item {
@@ -311,29 +413,59 @@ impl AvatarRegistry {
                 }
             }
         }
-        for (location, (resource, names)) in by_catalog {
-            let bytes = match resource.read() {
+        let catalog_entries: Vec<(String, Resource, Vec<String>)> = by_catalog
+            .into_iter()
+            .map(|(location, (resource, names))| (location, resource, names))
+            .collect();
+        let verify_catalog = |(location, resource, names): &(String, Resource, Vec<String>)| -> (
+            String,
+            Option<String>,
+            Vec<String>,
+        ) {
+            let bytes = match resource.read_with(pool) {
                 Ok(bytes) => bytes,
-                Err(error) => {
-                    suit_errors.insert(location, error.to_string());
-                    continue;
-                }
+                Err(error) => return (location.clone(), Some(error.to_string()), Vec::new()),
             };
             let mut binary = Binary::new(&bytes);
             let (_, skeleton_error) = read_bcf_skeletons(&mut binary);
             if let Some(error) = skeleton_error {
-                suit_errors.insert(location, error.to_string());
-                continue;
+                return (location.clone(), Some(error.to_string()), Vec::new());
             }
             let mut catalog_suits = BTreeSet::new();
-            if let Err(error) = read_bcf_appearances(&mut binary, &mut catalog_suits) {
-                suit_errors.insert(location, error.to_string());
-            }
-            for name in names {
-                if catalog_suits.contains(&name) {
-                    suits.insert(name);
+            let app_err = read_bcf_appearances(&mut binary, &mut catalog_suits)
+                .err()
+                .map(|e| e.to_string());
+            let confirmed = names
+                .iter()
+                .filter(|name| catalog_suits.contains(name.as_str()))
+                .cloned()
+                .collect();
+            (location.clone(), app_err, confirmed)
+        };
+        let cat_workers = worker_count(catalog_entries.len());
+        let verified: Vec<(String, Option<String>, Vec<String>)> = if cat_workers <= 1 {
+            catalog_entries.iter().map(verify_catalog).collect()
+        } else {
+            let chunk_size = catalog_entries.len().div_ceil(cat_workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = catalog_entries
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || chunk.iter().map(verify_catalog).collect::<Vec<_>>())
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(catalog_entries.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("ndx catalog worker panicked"));
                 }
+                out
+            })
+        };
+        for (location, err, confirmed) in verified {
+            if let Some(error) = err {
+                suit_errors.insert(location, error);
             }
+            suits.extend(confirmed);
         }
 
         Ok(Self {
@@ -341,9 +473,19 @@ impl AvatarRegistry {
             paths,
             skeletons,
             first_skeleton_error,
+            used_indexed_skeleton: false,
             suits,
             suit_errors,
         })
+    }
+
+    /// Whether every skeleton lookup performed so far on this registry is
+    /// order-independent: no earlier eager catalog or `.ndx` file failed to
+    /// decode its skeletons, and no lazy `.ndx` skeleton load mutated the
+    /// registry table. When true, reusing resolved person types for a subset
+    /// of GUIDs is identical to loading those GUIDs from a fresh registry.
+    pub fn is_order_independent(&self) -> bool {
+        self.first_skeleton_error.is_none() && !self.used_indexed_skeleton
     }
 
     /// Resolves the skeleton named `name` byte-for-byte (`0x5a0384`,
@@ -393,6 +535,7 @@ impl AvatarRegistry {
                 catalog_bcf,
             } => (ndx_location.clone(), directory.clone(), catalog_bcf.clone()),
         };
+        self.used_indexed_skeleton = true;
 
         let Some(resource) = self.paths.files.lookup(&directory, &catalog_bcf)? else {
             let catalog = decode(&catalog_bcf, 1);
@@ -505,23 +648,143 @@ impl People {
         catalog: &Catalog,
         guids: impl IntoIterator<Item = u32>,
     ) -> Result<(Self, BTreeMap<u32, String>)> {
-        let mut unresolved = BTreeMap::new();
-        let mut names = BTreeMap::new();
-        let mut profiles = BTreeMap::new();
-        for guid in guids {
+        let pool = ArchivePool::new();
+        Self::load_each_with_pool(install, index, catalog, guids, &pool)
+    }
+
+    /// Like [`People::load_each`], reusing open archive handles from `pool`
+    /// and running body-string/skin-tone parsing in parallel with
+    /// [`AvatarRegistry::load_with_pool`] while preserving exact original
+    /// error order (`body_strings` -> `skin_tones` -> skeleton name ->
+    /// `AvatarRegistry::load` -> `registry.skeleton`).
+    pub fn load_each_with_pool(
+        install: &Install,
+        index: &Index,
+        catalog: &Catalog,
+        guids: impl IntoIterator<Item = u32>,
+        pool: &ArchivePool,
+    ) -> Result<(Self, BTreeMap<u32, String>)> {
+        let guids: Vec<u32> = guids.into_iter().collect();
+        let (rows_res, registry_res) = std::thread::scope(|scope| {
+            let reg_handle = scope.spawn(|| AvatarRegistry::load_with_pool(install, pool));
+            let rows_res = Self::load_body_rows(index, catalog, &guids, pool);
+            (
+                rows_res,
+                reg_handle.join().expect("avatar registry worker panicked"),
+            )
+        });
+        let (profiles, names) = rows_res?;
+        let mut registry = registry_res?;
+        Self::resolve_rows(profiles, names, &mut registry)
+    }
+
+    /// Like [`People::load_each`], resolving skeletons through a preloaded
+    /// `Result<AvatarRegistry>` so body-string and skin-tone errors are always
+    /// reported before any registry-load error, matching [`People::load_each`].
+    #[allow(clippy::type_complexity)]
+    pub fn load_each_with_registry_result(
+        index: &Index,
+        catalog: &Catalog,
+        guids: impl IntoIterator<Item = u32>,
+        registry_res: Result<AvatarRegistry>,
+        pool: &ArchivePool,
+    ) -> Result<((Self, BTreeMap<u32, String>), AvatarRegistry)> {
+        let guids: Vec<u32> = guids.into_iter().collect();
+        let (profiles, names) = Self::load_body_rows(index, catalog, &guids, pool)?;
+        let mut registry = registry_res?;
+        let loaded = Self::resolve_rows(profiles, names, &mut registry)?;
+        Ok((loaded, registry))
+    }
+
+    /// Like [`People::load_each`], resolving skeletons through an already
+    /// built [`AvatarRegistry`] and reusing `pool` for archive reads while
+    /// caching semi-global skin-tone tables and reading character files in
+    /// parallel.
+    pub fn load_each_with_registry(
+        index: &Index,
+        catalog: &Catalog,
+        guids: impl IntoIterator<Item = u32>,
+        registry: &mut AvatarRegistry,
+        pool: &ArchivePool,
+    ) -> Result<(Self, BTreeMap<u32, String>)> {
+        let guids: Vec<u32> = guids.into_iter().collect();
+        let (profiles, names) = Self::load_body_rows(index, catalog, &guids, pool)?;
+        Self::resolve_rows(profiles, names, registry)
+    }
+
+    fn load_body_rows(
+        index: &Index,
+        catalog: &Catalog,
+        guids: &[u32],
+        pool: &ArchivePool,
+    ) -> Result<(BTreeMap<u32, Profile>, BTreeMap<u32, String>)> {
+        let mut seen = BTreeSet::new();
+        let mut targets: Vec<(u32, usize, u16, Option<usize>)> = Vec::new();
+        for &guid in guids {
             let Some(object) = catalog.object(guid) else {
                 continue;
             };
-            if object.kind != 2 || names.contains_key(&guid) {
+            if object.kind != 2 || !seen.insert(guid) {
                 continue;
             }
-            let resource = &index.resources[object.resource];
-            let body = body_strings(index, resource, object.chunk)?;
-            let row = |n: usize| body.get(n, 1).map(str::to_owned);
-            let tones = match catalog.semi_globals.get(&object.resource) {
-                Some(&Some(semi_global)) => skin_tones(index, &index.resources[semi_global])?,
-                _ => Vec::new(),
+            let semi_global = catalog
+                .semi_globals
+                .get(&object.resource)
+                .copied()
+                .flatten();
+            targets.push((guid, object.resource, object.chunk, semi_global));
+        }
+
+        // Pre-load each unique semi-global's STR# 8192 skin tones once, keeping
+        // `None` on failure so any earlier GUID's bad body strings are reported
+        // before a later semi-global error (matching original sequential order).
+        let unique_semis: Vec<usize> = targets
+            .iter()
+            .filter_map(|&(_, _, _, sg)| sg)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut semi_tones: BTreeMap<usize, Option<Vec<String>>> = BTreeMap::new();
+        for semi in unique_semis {
+            let tones = skin_tones_with_pool(index, &index.resources[semi], pool).ok();
+            semi_tones.insert(semi, tones);
+        }
+
+        let parse_body = |&(_, res_idx, chunk, _): &(u32, usize, u16, Option<usize>)| {
+            body_strings_with_pool(index, &index.resources[res_idx], chunk, pool)
+        };
+        let workers = worker_count(targets.len());
+        let bodies: Vec<Result<StringTable>> = if workers <= 1 {
+            targets.iter().map(parse_body).collect()
+        } else {
+            let chunk_size = targets.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = targets
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || chunk.iter().map(parse_body).collect::<Vec<_>>())
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(targets.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("people body worker panicked"));
+                }
+                out
+            })
+        };
+
+        let mut names = BTreeMap::new();
+        let mut profiles = BTreeMap::new();
+        for ((guid, res_idx, _, semi_global), body_res) in targets.into_iter().zip(bodies) {
+            let body = body_res?;
+            let tones = match semi_global {
+                Some(sg) => match semi_tones.get(&sg) {
+                    Some(Some(cached)) => cached.clone(),
+                    _ => skin_tones_with_pool(index, &index.resources[sg], pool)?,
+                },
+                None => Vec::new(),
             };
+            let row = |n: usize| body.get(n, 1).map(str::to_owned);
             profiles.insert(
                 guid,
                 Profile {
@@ -532,7 +795,7 @@ impl People {
                     rig: std::array::from_fn(|i| row(RIG + i)),
                 },
             );
-            let location = resource.location(&index.root);
+            let location = index.resources[res_idx].location(&index.root);
             let name = body
                 .get(0, 1)
                 .filter(|name| !name.is_empty())
@@ -544,7 +807,15 @@ impl People {
                 })?;
             names.insert(guid, name);
         }
-        let mut registry = AvatarRegistry::load(install)?;
+        Ok((profiles, names))
+    }
+
+    fn resolve_rows(
+        mut profiles: BTreeMap<u32, Profile>,
+        names: BTreeMap<u32, String>,
+        registry: &mut AvatarRegistry,
+    ) -> Result<(Self, BTreeMap<u32, String>)> {
+        let mut unresolved = BTreeMap::new();
         let mut skeletons = BTreeMap::new();
         for (guid, name) in names {
             match registry.skeleton(&name) {
@@ -562,8 +833,8 @@ impl People {
             Self {
                 skeletons,
                 profiles,
-                suits: registry.suits,
-                suit_errors: registry.suit_errors,
+                suits: registry.suits.clone(),
+                suit_errors: registry.suit_errors.clone(),
             },
             unresolved,
         ))
@@ -601,8 +872,17 @@ pub fn skeleton_scales(install: &Install, name: &str) -> Result<Vec<i32>> {
 /// The body strings of the person definition `chunk` of a character
 /// file.
 fn body_strings(index: &Index, resource: &Resource, chunk: u16) -> Result<StringTable> {
+    body_strings_with_pool(index, resource, chunk, &ArchivePool::new())
+}
+
+fn body_strings_with_pool(
+    index: &Index,
+    resource: &Resource,
+    chunk: u16,
+    pool: &ArchivePool,
+) -> Result<StringTable> {
     let location = resource.location(&index.root);
-    let iff = Iff::parse(resource.read()?).map_err(|e| Error::format(&location, e))?;
+    let iff = Iff::parse(resource.read_with(pool)?).map_err(|e| Error::format(&location, e))?;
     let missing = |what: &str| Error::Unsupported(format!("{location}: {what}"));
     let definition = iff
         .get(b"OBJD", chunk)
@@ -620,9 +900,13 @@ fn body_strings(index: &Index, resource: &Resource, chunk: u16) -> Result<String
 }
 
 /// The skin tone names of a semi-global file: its string table 8192.
-fn skin_tones(index: &Index, resource: &Resource) -> Result<Vec<String>> {
+fn skin_tones_with_pool(
+    index: &Index,
+    resource: &Resource,
+    pool: &ArchivePool,
+) -> Result<Vec<String>> {
     let location = resource.location(&index.root);
-    let iff = Iff::parse(resource.read()?).map_err(|e| Error::format(&location, e))?;
+    let iff = Iff::parse(resource.read_with(pool)?).map_err(|e| Error::format(&location, e))?;
     let Some(chunk) = iff.get(b"STR#", SKIN_TONES) else {
         return Ok(Vec::new());
     };

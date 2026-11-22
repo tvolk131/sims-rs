@@ -3,13 +3,18 @@
 
 use crate::appearance::Outfit;
 use crate::suit::Careers;
-use sims_content::{Catalog, House, Index, Install, Neighborhood, People};
+use sims_content::{
+    ArchivePool, AvatarRegistry, Catalog, House, Index, Install, Neighborhood, People,
+};
 use sims_formats::career::Career;
 use sims_formats::iff::Iff;
 use sims_formats::saved_objects::Person;
 use sims_formats::strings::StringTable;
 use sims_sim::World;
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// A person to draw.
 #[derive(Debug, Clone)]
@@ -26,17 +31,44 @@ pub struct Resident {
     pub person: Person,
 }
 
+/// Pre-resolved person skeleton names shared from a booted lot's catalog scan
+/// so [`Cast::residents`] does not rebuild [`AvatarRegistry`] on refresh.
+#[derive(Debug, Clone)]
+pub struct PreloadedCast {
+    pub skeleton_names: BTreeMap<u32, String>,
+    pub unresolved: BTreeMap<u32, String>,
+}
+
 /// The person types of an install and of one neighborhood's characters:
 /// what is needed to turn a person object into a [`Resident`].
-#[derive(Debug)]
 pub struct Cast {
     install: Install,
-    index: Index,
-    catalog: Catalog,
+    index: Arc<Index>,
+    catalog: Arc<Catalog>,
+    pool: Arc<ArchivePool>,
+    /// Pre-resolved person types (skeletons + unresolved diagnostics), when
+    /// supplied by a caller that already loaded them (e.g. `Game::open`).
+    preloaded: Option<PreloadedCast>,
+    /// Lazily initialized avatar registry reused across [`Cast::residents`]
+    /// calls when `preloaded` is absent or misses a GUID.
+    registry: Mutex<Option<AvatarRegistry>>,
+    /// Cached language-1 body strings by GUID.
+    body_strings_cache: Mutex<BTreeMap<u32, Vec<String>>>,
     /// The careers of `work.iff`, or None when the install has a
     /// `Careers.txt`, which the original reads in their place (not
     /// ported, as in `sims_vm::program::Program::careers`).
     careers: Option<Careers>,
+}
+
+impl fmt::Debug for Cast {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cast")
+            .field("install", &self.install)
+            .field("index", &self.index)
+            .field("catalog", &self.catalog)
+            .field("careers", &self.careers)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The word of a person type's definition that names its body strings
@@ -51,16 +83,34 @@ impl Cast {
         let fail = |e: &dyn std::fmt::Display| e.to_string();
         let install = Install::detect(root).map_err(|e| fail(&e))?;
         let neighborhood = Neighborhood::open(neighborhood).map_err(|e| fail(&e))?;
+        let pool = Arc::new(ArchivePool::new());
         let mut index = Index::build(&install).map_err(|e| fail(&e))?;
         if let Some(characters) = neighborhood.characters().map_err(|e| fail(&e))? {
             index.add_characters(&characters).map_err(|e| fail(&e))?;
         }
-        let catalog = Catalog::build(&index).map_err(|e| fail(&e))?;
-        let careers = careers(&index)?;
+        let catalog = Catalog::build_with_pool(&index, &pool).map_err(|e| fail(&e))?;
+        Self::from_shared(install, Arc::new(index), Arc::new(catalog), None, pool)
+    }
+
+    /// Builds a [`Cast`] from already-loaded shared content (`install`,
+    /// `index`, `catalog`, optional `preloaded` person types, and `pool`),
+    /// avoiding duplicate `Index`/`Catalog`/`AvatarRegistry` construction.
+    pub fn from_shared(
+        install: Install,
+        index: Arc<Index>,
+        catalog: Arc<Catalog>,
+        preloaded: Option<PreloadedCast>,
+        pool: Arc<ArchivePool>,
+    ) -> Result<Self, String> {
+        let careers = careers_with_pool(&index, &pool)?;
         Ok(Self {
             install,
             index,
             catalog,
+            pool,
+            preloaded,
+            registry: Mutex::new(None),
+            body_strings_cache: Mutex::new(BTreeMap::new()),
             careers,
         })
     }
@@ -94,23 +144,75 @@ impl Cast {
         people: impl IntoIterator<Item = (u16, u32, &'a Person)>,
     ) -> Result<Vec<Resident>, String> {
         let people: Vec<_> = people.into_iter().collect();
-        let (types, unresolved) = People::load_each(
-            &self.install,
-            &self.index,
-            &self.catalog,
-            people.iter().map(|&(_, guid, _)| guid),
-        )
-        .map_err(|e| e.to_string())?;
+        let all_in_preloaded = self.preloaded.as_ref().is_some_and(|pre| {
+            people.iter().all(|&(_, guid, _)| {
+                pre.skeleton_names.contains_key(&guid)
+                    || pre.unresolved.contains_key(&guid)
+                    || self.catalog.object(guid).is_none_or(|o| o.kind != 2)
+            })
+        });
+        let loaded_fallback = if all_in_preloaded {
+            None
+        } else {
+            let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            let cached = guard.take();
+            let result = match cached {
+                Some(mut registry) => {
+                    let loaded = People::load_each_with_registry(
+                        &self.index,
+                        &self.catalog,
+                        people.iter().map(|&(_, guid, _)| guid),
+                        &mut registry,
+                        &self.pool,
+                    )
+                    .map_err(|e| e.to_string());
+                    // Retain the cached registry across refreshes only while it
+                    // remains order-independent (no skeleton decode error and no
+                    // lazy `.ndx` skeleton load mutating its table).
+                    if registry.is_order_independent() {
+                        *guard = Some(registry);
+                    }
+                    loaded?
+                }
+                None => {
+                    let registry_res = AvatarRegistry::load_with_pool(&self.install, &self.pool);
+                    let (loaded, registry) = People::load_each_with_registry_result(
+                        &self.index,
+                        &self.catalog,
+                        people.iter().map(|&(_, guid, _)| guid),
+                        registry_res,
+                        &self.pool,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    if registry.is_order_independent() {
+                        *guard = Some(registry);
+                    }
+                    loaded
+                }
+            };
+            Some(result)
+        };
         let mut out = Vec::new();
         for (id, guid, person) in people {
-            let skeleton =
-                types
+            let skeleton_name: &str = match (&self.preloaded, &loaded_fallback) {
+                (Some(pre), None) => pre
+                    .skeleton_names
+                    .get(&guid)
+                    .map(String::as_str)
+                    .ok_or_else(|| match pre.unresolved.get(&guid) {
+                        Some(reason) => format!("person {id}: {reason}"),
+                        None => format!("person {id} has no skeleton (type {guid:#010x})"),
+                    })?,
+                (_, Some((types, unresolved))) => types
                     .skeletons
                     .get(&guid)
+                    .map(|s| s.name.as_str())
                     .ok_or_else(|| match unresolved.get(&guid) {
                         Some(reason) => format!("person {id}: {reason}"),
                         None => format!("person {id} has no skeleton (type {guid:#010x})"),
-                    })?;
+                    })?,
+                (None, None) => unreachable!("fallback populated when preloaded is absent"),
+            };
             // A record whose body is empty has had no clothes chosen.
             let outfit = if person.appearance[0].trim().is_empty() {
                 Outfit::from_body_strings(&self.body_strings(guid)?)
@@ -120,7 +222,7 @@ impl Cast {
             out.push(Resident {
                 id,
                 guid,
-                skeleton: skeleton.name.clone(),
+                skeleton: skeleton_name.to_owned(),
                 outfit,
                 person: person.clone(),
             });
@@ -131,13 +233,18 @@ impl Cast {
     /// The body strings of the person type `guid`, in their order
     /// (language 1, the first a string table gives).
     pub fn body_strings(&self, guid: u32) -> Result<Vec<String>, String> {
+        if let Ok(cache) = self.body_strings_cache.lock()
+            && let Some(cached) = cache.get(&guid)
+        {
+            return Ok(cached.clone());
+        }
         let object = self
             .catalog
             .object(guid)
             .ok_or_else(|| format!("no object type has the GUID {guid:#010x}"))?;
         let resource = &self.index.resources[object.resource];
         let location = resource.location(&self.index.root);
-        let iff = Iff::parse(resource.read().map_err(|e| e.to_string())?)
+        let iff = Iff::parse(resource.read_with(&self.pool).map_err(|e| e.to_string())?)
             .map_err(|e| format!("{location}: {e}"))?;
         let table = iff
             .get(b"OBJD", object.chunk)
@@ -149,18 +256,22 @@ impl Cast {
             .ok_or_else(|| format!("{location}: body strings {table} are missing"))?;
         let strings =
             StringTable::parse(iff.data(strings)).map_err(|e| format!("{location}: {e}"))?;
-        Ok(strings
+        let rows: Vec<String> = strings
             .entries
             .into_iter()
             .filter(|e| e.language == 1)
             .map(|e| e.text)
-            .collect())
+            .collect();
+        if let Ok(mut cache) = self.body_strings_cache.lock() {
+            cache.insert(guid, rows.clone());
+        }
+        Ok(rows)
     }
 }
 
 /// Every CARR of the install's `work.iff` (none without the file), or
 /// None when the install has a `Careers.txt`.
-fn careers(index: &Index) -> Result<Option<Careers>, String> {
+fn careers_with_pool(index: &Index, pool: &ArchivePool) -> Result<Option<Careers>, String> {
     if index.named("Careers.txt").next().is_some() {
         return Ok(None);
     }
@@ -169,7 +280,7 @@ fn careers(index: &Index) -> Result<Option<Careers>, String> {
         return Ok(Some(careers));
     };
     let location = file.location(&index.root);
-    let iff = Iff::parse(file.read().map_err(|e| e.to_string())?)
+    let iff = Iff::parse(file.read_with(pool).map_err(|e| e.to_string())?)
         .map_err(|e| format!("{location}: {e}"))?;
     for chunk in iff
         .resource_order(b"CARR")

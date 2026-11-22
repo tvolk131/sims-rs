@@ -4,7 +4,7 @@
 use crate::art::Art;
 use crate::house::{self, House};
 use crate::{Error, Result};
-use sims_content::{Catalog, Expansions, Index, Install};
+use sims_content::{ArchivePool, Catalog, Expansions, Index, Install};
 use sims_formats::bitmap::{self, Image};
 use sims_formats::career::{Career, Level};
 use sims_formats::iff::Iff;
@@ -727,11 +727,17 @@ impl Careers {
     /// careers, by the game's expansion level (0x403f53); here every
     /// career's, which is all 21 of the full install's.
     pub fn load(index: &Index) -> Result<Self> {
+        Self::load_with_pool(index, &ArchivePool::new())
+    }
+
+    /// Like [`Careers::load`], reusing open archive handles from `pool`.
+    pub fn load_with_pool(index: &Index, pool: &ArchivePool) -> Result<Self> {
         let mut out = Self::default();
         let Some((_, file)) = index.named("work.iff").next() else {
             return Ok(out);
         };
-        let iff = Iff::parse(file.read().map_err(Error::Content)?).map_err(Error::Format)?;
+        let iff =
+            Iff::parse(file.read_with(pool).map_err(Error::Content)?).map_err(Error::Format)?;
         if let Some(chunk) = iff.get(b"STR#", GRADE_STRINGS) {
             let table = StringTable::parse(iff.data(chunk)).map_err(Error::Format)?;
             out.grades = (0..table.entries.len())
@@ -1189,34 +1195,88 @@ impl Faces {
     /// character file. A type with no file, no faces or no name is left
     /// out of what it lacks; a face that does not decode is an error.
     pub fn load(index: &Index, catalog: &Catalog, guids: &[u32]) -> Result<Self> {
+        Self::load_with_pool(index, catalog, guids, &ArchivePool::new())
+    }
+
+    /// Like [`Faces::load`], reusing open archive handles from `pool` and
+    /// decoding character portraits in parallel while inserting in exact
+    /// `guids` order.
+    pub fn load_with_pool(
+        index: &Index,
+        catalog: &Catalog,
+        guids: &[u32],
+        pool: &ArchivePool,
+    ) -> Result<Self> {
+        type FaceRow = Result<Option<(u32, Option<String>, Option<Image>, Option<Image>)>>;
+        let decode_one = |&guid: &u32| -> FaceRow {
+            let Some(object) = catalog.object(guid) else {
+                return Ok(None);
+            };
+            let Some(resource) = index.resources.get(object.resource) else {
+                return Ok(None);
+            };
+            let iff = Iff::parse(resource.read_with(pool).map_err(Error::Content)?)
+                .map_err(Error::Format)?;
+            let name = first_name(&iff, object.chunk);
+            let mood = match iff.get(b"BMP_", MOODS) {
+                Some(chunk) => Some(bitmap::bmp(iff.data(chunk)).map_err(Error::Format)?),
+                None => None,
+            };
+            let face = match iff.get(b"BMP_", FACES) {
+                Some(chunk) => {
+                    let image = bitmap::bmp(iff.data(chunk)).map_err(Error::Format)?;
+                    image.crop(
+                        0,
+                        0,
+                        (image.width / 3).min(FACE[2]),
+                        image.height.min(FACE[3]),
+                    )
+                }
+                None => None,
+            };
+            Ok(Some((guid, name, mood, face)))
+        };
+        let workers = if guids.len() <= 2 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+                .clamp(1, 8)
+                .min(guids.len())
+        };
+        let rows: Vec<FaceRow> = if workers <= 1 {
+            guids.iter().map(decode_one).collect()
+        } else {
+            let chunk_size = guids.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = guids
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || chunk.iter().map(decode_one).collect::<Vec<_>>())
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(guids.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("faces worker panicked"));
+                }
+                out
+            })
+        };
         let mut faces = BTreeMap::new();
         let mut moods = BTreeMap::new();
         let mut names = BTreeMap::new();
-        for &guid in guids {
-            let Some(object) = catalog.object(guid) else {
+        for row in rows {
+            let Some((guid, name, mood, face)) = row? else {
                 continue;
             };
-            let Some(resource) = index.resources.get(object.resource) else {
-                continue;
-            };
-            let iff =
-                Iff::parse(resource.read().map_err(Error::Content)?).map_err(Error::Format)?;
-            if let Some(name) = first_name(&iff, object.chunk) {
+            if let Some(name) = name {
                 names.insert(guid, name);
             }
-            if let Some(chunk) = iff.get(b"BMP_", MOODS) {
-                moods.insert(guid, bitmap::bmp(iff.data(chunk)).map_err(Error::Format)?);
+            if let Some(mood) = mood {
+                moods.insert(guid, mood);
             }
-            let Some(chunk) = iff.get(b"BMP_", FACES) else {
-                continue;
-            };
-            let image = bitmap::bmp(iff.data(chunk)).map_err(Error::Format)?;
-            if let Some(face) = image.crop(
-                0,
-                0,
-                (image.width / 3).min(FACE[2]),
-                image.height.min(FACE[3]),
-            ) {
+            if let Some(face) = face {
                 faces.insert(guid, face);
             }
         }

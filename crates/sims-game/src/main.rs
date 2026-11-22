@@ -188,12 +188,8 @@ struct Sound(Option<sims_game::output::Output>);
 
 #[cfg(any(target_os = "macos", feature = "sound"))]
 impl Sound {
-    fn start(install: &std::path::Path, mute: bool) -> Self {
-        if mute {
-            return Self(None);
-        }
-        let started =
-            sims_game::sound::Mixer::open(install).and_then(sims_game::output::Output::start);
+    fn from_mixer(mixer: Result<sims_game::sound::Mixer, String>) -> Self {
+        let started = mixer.and_then(sims_game::output::Output::start);
         match started {
             Ok(output) => Self(Some(output)),
             Err(e) => {
@@ -201,6 +197,13 @@ impl Sound {
                 Self(None)
             }
         }
+    }
+
+    fn start(install: &std::path::Path, mute: bool) -> Self {
+        if mute {
+            return Self(None);
+        }
+        Self::from_mixer(sims_game::sound::Mixer::open(install))
     }
 
     fn send(&self, input: Input) {
@@ -1200,6 +1203,23 @@ fn run() -> Result<(), String> {
     let (options, still, mute, saves) = options()?;
     eprintln!("sims-game: booting {}", options.house.display());
     let started = Instant::now();
+    #[cfg(any(target_os = "macos", feature = "sound"))]
+    let (mut game, preloaded_mixer) = if still.is_none() && !mute {
+        let (game_res, mixer_res) = std::thread::scope(|scope| {
+            let mixer_handle = scope.spawn(|| sims_game::sound::Mixer::open(&options.install));
+            let game_res = Game::open(&options);
+            (
+                game_res,
+                mixer_handle
+                    .join()
+                    .unwrap_or_else(|_| Err("sound mixer worker panicked".to_owned())),
+            )
+        });
+        (game_res?, Some(mixer_res))
+    } else {
+        (Game::open(&options)?, None)
+    };
+    #[cfg(not(any(target_os = "macos", feature = "sound")))]
     let mut game = Game::open(&options)?;
     eprintln!(
         "sims-game: booted in {:.1} s",
@@ -1242,6 +1262,13 @@ fn run() -> Result<(), String> {
         eprintln!("sims-game: {}: {e}", options_file.display());
     }
     let saved_optn = game.options().to_optn();
+    #[cfg(any(target_os = "macos", feature = "sound"))]
+    let sound = match preloaded_mixer {
+        Some(mixer) => Sound::from_mixer(mixer),
+        None => Sound::start(&options.install, mute),
+    };
+    #[cfg(not(any(target_os = "macos", feature = "sound")))]
+    let sound = Sound::start(&options.install, mute);
     let mut app = App {
         game,
         window: None,
@@ -1257,7 +1284,7 @@ fn run() -> Result<(), String> {
         photos: 0,
         reported: false,
         printed: 0,
-        sound: Sound::start(&options.install, mute),
+        sound,
         sound_feed: sound::Feed::default(),
         focus_filter: FocusFilter::default(),
         saves,

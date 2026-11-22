@@ -15,6 +15,7 @@
 
 use crate::assets::Assets;
 use crate::rig::{self, Pose};
+use sims_content::ArchivePool;
 use sims_formats::animation::{Animation, Samples, read_bcf, read_cfp};
 use sims_formats::avatar::Skeleton;
 use std::collections::BTreeMap;
@@ -36,16 +37,65 @@ impl Library {
     /// file's bytes are the first source's ([`Assets::read`]); which copy
     /// the original reads when two sources differ is **unverified**.
     pub fn scan(assets: &Assets) -> Result<Self, String> {
-        let mut library = Self::default();
-        for name in assets.names().filter(|n| n.ends_with(".bcf")) {
-            let bytes = assets.read(name)?;
-            if bytes.get(..8).is_none_or(|head| head != [0; 8]) {
-                continue;
+        Self::scan_with_pool(assets, &ArchivePool::new())
+    }
+
+    /// Like [`Library::scan`], reusing open archive handles from `pool` and
+    /// decoding animation `.bcf` files in parallel while inserting clips in
+    /// exact sorted file-name order.
+    pub fn scan_with_pool(assets: &Assets, pool: &ArchivePool) -> Result<Self, String> {
+        let names: Vec<&str> = assets.names().filter(|n| n.ends_with(".bcf")).collect();
+        let decode_one = |name: &str| -> Result<Vec<Animation>, String> {
+            let resource = assets
+                .find(name)
+                .ok_or_else(|| format!("no person file is named {name:?}"))?;
+            let head = resource
+                .read_head_with(pool, 8)
+                .map_err(|e| e.to_string())?;
+            if head.len() < 8 || head != [0; 8] {
+                return Ok(Vec::new());
             }
+            let bytes = resource.read_with(pool).map_err(|e| e.to_string())?;
             let Ok(animations) = read_bcf(&bytes) else {
-                continue;
+                return Ok(Vec::new());
             };
-            for animation in animations {
+            Ok(animations)
+        };
+        let workers = if names.len() <= 1 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+                .clamp(1, 8)
+                .min(names.len())
+        };
+        let decoded: Vec<Result<Vec<Animation>, String>> = if workers <= 1 {
+            names.iter().map(|&name| decode_one(name)).collect()
+        } else {
+            let chunk_size = names.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = names
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|&name| decode_one(name))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(names.len());
+                for handle in handles {
+                    out.extend(handle.join().expect("people animation worker panicked"));
+                }
+                out
+            })
+        };
+        let mut library = Self::default();
+        for batch in decoded {
+            for animation in batch? {
                 library
                     .clips
                     .entry(animation.name.to_ascii_lowercase())

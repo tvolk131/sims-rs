@@ -1,6 +1,7 @@
 //! The ordered suit and texture names used by family import.
 use crate::file_table::Table;
 use crate::index::MountedFiles;
+use crate::pool::ArchivePool;
 use crate::{Error, Expansions, Install, Resource, Result};
 use sims_formats::avatar::catalog::Binary;
 use sims_formats::avatar::index::{IndexReader, Kind};
@@ -35,7 +36,11 @@ pub(crate) struct AvatarPaths {
 /// [`crate::people::AvatarRegistry`]. When `strict_archives` is false,
 /// unreadable FAR archives are skipped during directory scanning as at
 /// `0x5ba8d6`.
-pub(crate) fn mount_avatar_paths(install: &Install, strict_archives: bool) -> Result<AvatarPaths> {
+pub(crate) fn mount_avatar_paths(
+    install: &Install,
+    strict_archives: bool,
+    pool: &ArchivePool,
+) -> Result<AvatarPaths> {
     let mut files = MountedFiles::default();
     let root = &install.root;
     for directory in ["GameData/Global", "GameData/Objects", Install::USER_OBJECTS] {
@@ -51,7 +56,7 @@ pub(crate) fn mount_avatar_paths(install: &Install, strict_archives: bool) -> Re
         files.register(root, "TemplateNPCs", false, strict_archives)?;
     }
     files.register(root, "Downloads", true, strict_archives)?;
-    let providers = download_providers(&files, root)?;
+    let providers = download_providers(&files, root, pool)?;
     let mut texture_paths = texture_paths(&mut files, install, strict_archives)?;
     for path in &providers {
         files.register(&install.root, path, true, strict_archives)?;
@@ -70,19 +75,20 @@ impl ImportWardrobe {
     /// Replays the startup file tables (0x43ae81), avatar catalogs (0x5835ed)
     /// and texture cache (0x414633, 0x40895a).
     pub fn load(install: &Install) -> Result<Self> {
+        let pool = ArchivePool::new();
         let AvatarPaths {
             files,
             appearance,
             indexed,
             texture_paths,
-        } = mount_avatar_paths(install, true)?;
+        } = mount_avatar_paths(install, true, &pool)?;
 
         // 0x59f844 loads all CMX before BCF. 0x584562 then adds the indexed
         // names, including entries whose catalog has yet to be opened.
         let mut registry = Table::default();
         for extension in [b".cmx", b".bcf"] {
             for (_, source) in resources(&files, &appearance, extension)? {
-                let bytes = source.read()?;
+                let bytes = source.read_with(&pool)?;
                 let register = |name: &str, registry: &mut Table| {
                     let name = encode_name(name).ok_or_else(|| {
                         Error::Unsupported(format!(
@@ -163,7 +169,11 @@ fn catalog_error(
 /// directory when category & 3 is 2. Only Downloads has that category
 /// (0x43c609). A resource contributes once if any OBJD survived the +0x20
 /// filter at registration, so its directory first appears in file walk order.
-fn download_providers(files: &MountedFiles, root: &Path) -> Result<Vec<String>> {
+fn download_providers(
+    files: &MountedFiles,
+    root: &Path,
+    pool: &ArchivePool,
+) -> Result<Vec<String>> {
     let mut providers = Vec::new();
     let mut seen = BTreeSet::new();
     for source in files.objects("Downloads")? {
@@ -171,7 +181,7 @@ fn download_providers(files: &MountedFiles, root: &Path) -> Result<Vec<String>> 
             continue;
         }
         let fail = |error| Error::format(&format!("0x43b89c {}", source.location(root)), error);
-        let iff = Iff::parse(source.read()?).map_err(fail)?;
+        let iff = Iff::parse(source.read_with(pool)?).map_err(fail)?;
         let definitions = iff.resource_order(b"OBJD").map_err(fail)?;
         if definitions.len() >= i16::MAX as usize {
             return Err(Error::Unsupported(format!(
