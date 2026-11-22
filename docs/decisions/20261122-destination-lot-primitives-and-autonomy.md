@@ -104,13 +104,17 @@ a read-only `Cell::Literal` (tail `0x453b51`, no word pointer).
   `cTSPerson::Place` (`0x5921f0`) leaves `a.position` unshifted and adds
   `+0x8c..+0x94` when computing terrain altitude and the model matrix; `head.rs`
   derives this offset from `(object.data[2], object.data[3])` while the person
-  is contained so `sims-sim` and `boot/save.rs` stay unchanged. To guarantee
-  this derivation never silently diverges from the stored `0x58933b` offset,
-  the VM guards all three transitions that could break the invariant with
-  `Trap::Unsupported`: rotating a container holding a person in a
-  horizontal-offset slot (`memory.rs::store` and `snap.rs`), placing a person
-  into such a slot outside `Snap`, and moving a person out of such a slot
-  outside `Snap`/reset (`placement.rs::put_one`).
+  is contained so `sims-sim` and `boot/save.rs` stay unchanged. To prevent this
+  derivation from silently diverging from the stored `0x58933b` offset, the VM
+  guards the divergent transitions with `Trap::Unsupported`: rotating a
+  container when the facing change shifts a held person's computed offset
+  (`memory.rs::store`, `primitives/snap.rs`, `placement.rs::turn_one`, and
+  `placement.rs::turn_group`), writing a person's `data[2]`/`data[3]` directly
+  (`memory.rs::store`), placing a person into or moving a person out of a
+  nonzero-offset container slot outside `Snap` (`placement.rs::put_one`), and
+  taking a person off the lot from such a slot (`placement.rs::take_self_off`
+  and `placement.rs::take_off_to_remove`, before `0x4332ed` refreshes the
+  animator).
 - **Family 0 active roster (`0x415fcf..0x415fd7`, `crates/sims-vm/src/boot.rs`)**:
   When `self.load.house != 0 && self.load.family == 0`, `boot.rs` passes the
   actual members of family `0` if present in `world.families` (else `&[]`) as
@@ -141,9 +145,12 @@ without relaxing `check_local`.
   synthetic unit tests, and live Complete Collection multi-destination stepping.
 - Deriving the container-slot animator offset from `(object.data[2],
   object.data[3])` in `head::model` is guarded against container facing writes
-  and non-`Snap` container entry/exit via `Trap::Unsupported`, so any case
-  where stored `0x58933b` state would diverge fails loudly instead of silently
-  drifting.
+  and turns (`memory.rs::store`, `primitives/snap.rs`, `placement.rs::turn_one`,
+  `placement.rs::turn_group`), direct container/slot writes, non-`Snap`
+  container entry/exit (`placement.rs::put_one`), and person take-off from a
+  nonzero-offset slot (`placement.rs::take_self_off`,
+  `placement.rs::take_off_to_remove`) via `Trap::Unsupported`, so divergent
+  cases fail loudly instead of silently drifting.
 - Residential lot determinism is verified against the existing 43,200-tick Goth
   day hash (`df6eb544be87b93233011f355999ac9abb0c36dc5e914f2f7c0fe2f49967b19a`)
   and 8/8 ratchet suite; note that previously unported error paths (such as

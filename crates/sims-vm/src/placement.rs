@@ -1270,9 +1270,15 @@ impl Interpreter<'_> {
                     )));
                 }
                 if let Some(parent) = to.container
-                    && usize::try_from(to.slot)
-                        .ok()
-                        .is_some_and(|s| self.slot_has_horizontal_offset(world, parent, s))
+                    && let Some(parent_facing) = world
+                        .objects
+                        .get(&parent)
+                        .and_then(|o| o.data.get(data::FACING).copied())
+                        .map(i32::from)
+                    && usize::try_from(to.slot).ok().is_some_and(|s| {
+                        self.slot_animator_offset(world, parent, s, parent_facing)
+                            .is_some()
+                    })
                 {
                     return Err(fail(Trap::Unsupported(
                         "placing a person into a horizontal-offset container slot outside Snap \
@@ -1976,6 +1982,14 @@ impl Interpreter<'_> {
         if object.multipart.is_some() {
             return Err(fail(Trap::Invalid("a person with several tiles".into())));
         }
+        if self.container_animator_offset(world, object).is_some() {
+            return Err(fail(Trap::Unsupported(
+                "a person taking itself off the lot from a horizontal-offset container slot \
+                 (0x4332ed / 0x454ceb / 0x5921f0), whose stored animator offset is retained by \
+                 the take-off refresh"
+                    .into(),
+            )));
+        }
         // The refresh comes after the callbacks below, so its head slot
         // redraw reads the slot there ([`head_slot_redraw`]); it is read
         // before them too, which can only add stops. A person whose hand
@@ -2108,6 +2122,18 @@ impl Interpreter<'_> {
                 trap: Trap::Invalid("a person with several tiles".into()),
             });
         }
+        if self.container_animator_offset(world, object).is_some() {
+            return Err(Fault {
+                object: id,
+                at: None,
+                trap: Trap::Unsupported(
+                    "removing a person from a horizontal-offset container slot \
+                     (0x4332ed / 0x454ceb / 0x5921f0), whose stored animator offset is retained \
+                     by the take-off refresh"
+                        .into(),
+                ),
+            });
+        }
         self.take_off_one(world, id, notify)
     }
 
@@ -2221,6 +2247,29 @@ impl Interpreter<'_> {
             trap,
         };
         let [x, y, level] = position(world, id).map_err(fail)?;
+        let preview_step = (i32::from(datum(world, id, data::TURN_STEP).map_err(fail)?)
+            .wrapping_mul(steps)
+            & 7) as i16;
+        if preview_step != 0 {
+            let parts = self.parts(world, id).map_err(fail)?;
+            for &part in &parts {
+                let facing = datum(world, part, data::FACING).map_err(fail)?;
+                let next_facing = facing.wrapping_add(preview_step) & 7;
+                if self.facing_change_shifts_held_person_offset(
+                    world,
+                    part,
+                    i32::from(facing),
+                    i32::from(next_facing),
+                ) {
+                    return Err(fail(Trap::Unsupported(
+                        "turning a multi-tile container holding a person in a slot with \
+                         horizontal offset (0x422991 / 0x454ceb / 0x5921f0), whose stored \
+                         animator offset is not kept"
+                            .into(),
+                    )));
+                }
+            }
+        }
         self.take_off(world, id, true)?;
         let step = (i32::from(datum(world, id, data::TURN_STEP).map_err(fail)?).wrapping_mul(steps)
             & 7) as i16;
@@ -2231,7 +2280,21 @@ impl Interpreter<'_> {
         let turn = |world: &mut World, by: i16| -> Result<(), Fault> {
             for &part in &parts {
                 let facing = datum(world, part, data::FACING).map_err(fail)?;
-                set_datum(world, part, data::FACING, facing.wrapping_add(by) & 7).map_err(fail)?;
+                let next_facing = facing.wrapping_add(by) & 7;
+                if self.facing_change_shifts_held_person_offset(
+                    world,
+                    part,
+                    i32::from(facing),
+                    i32::from(next_facing),
+                ) {
+                    return Err(fail(Trap::Unsupported(
+                        "turning a multi-tile container holding a person in a slot with \
+                         horizontal offset (0x422991 / 0x454ceb / 0x5921f0), whose stored \
+                         animator offset is not kept"
+                            .into(),
+                    )));
+                }
+                set_datum(world, part, data::FACING, next_facing).map_err(fail)?;
             }
             self.update_offsets(world, id).map_err(fail)
         };
@@ -2288,6 +2351,13 @@ impl Interpreter<'_> {
             .wrapping_mul(steps)
             .wrapping_add(i32::from(old))
             & 7) as i16;
+        if self.facing_change_shifts_held_person_offset(world, id, i32::from(old), i32::from(new)) {
+            return Err(fail(Trap::Unsupported(
+                "turning a container holding a person in a slot with horizontal offset \
+                 (0x433fa1 / 0x454ceb / 0x5921f0), whose stored animator offset is not kept"
+                    .into(),
+            )));
+        }
         set_datum(world, id, data::FACING, new).map_err(fail)?;
         if self.has_function(world, id, SEAT) {
             let at = tile(position(world, id).map_err(fail)?);

@@ -837,14 +837,56 @@ impl Machine<'_, '_> {
                 .objects
                 .get(&id)
                 .and_then(|o| o.data.get(1).copied());
-            if old.is_some_and(|prev| prev != value)
-                && self
-                    .interpreter()
-                    .container_holds_horizontal_offset_person(self.world, id)
+            if let Some(prev) = old
+                && self.interpreter().facing_change_shifts_held_person_offset(
+                    self.world,
+                    id,
+                    i32::from(prev),
+                    i32::from(value),
+                )
             {
                 return Err(Trap::Unsupported(
                     "writing facing of a container holding a person in a slot with horizontal \
                      offset (0x454ceb / 0x5921f0), whose stored animator offset is not kept"
+                        .into(),
+                ));
+            }
+        } else if let Cell::Data(id, index @ (2 | 3)) = cell
+            && let Some(object) = self.world.objects.get(&id)
+            && object.person.is_some()
+        {
+            let interpreter = self.interpreter();
+            let old_offset = interpreter.container_animator_offset(self.world, object);
+            let new_container_word = if index == 2 {
+                value
+            } else {
+                object.data.get(2).copied().unwrap_or(0)
+            };
+            let new_slot_word = if index == 3 {
+                value
+            } else {
+                object.data.get(3).copied().unwrap_or(-1)
+            };
+            let new_offset = u16::try_from(new_container_word)
+                .ok()
+                .filter(|&c| c > 0)
+                .and_then(|container_id| {
+                    let slot_index = usize::try_from(new_slot_word).ok()?;
+                    let facing = i32::from(
+                        self.world
+                            .objects
+                            .get(&container_id)?
+                            .data
+                            .get(1)
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                    interpreter.slot_animator_offset(self.world, container_id, slot_index, facing)
+                });
+            if old_offset != new_offset {
+                return Err(Trap::Unsupported(
+                    "writing container/slot data directly on a person in a horizontal-offset slot \
+                     (0x454ceb / 0x5921f0), whose stored animator offset is not kept"
                         .into(),
                 ));
             }

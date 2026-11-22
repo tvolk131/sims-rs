@@ -334,10 +334,9 @@ impl Machine<'_, '_> {
             return Ok(false);
         }
         let old_facing = self.facing(me)?;
-        if direction != old_facing
-            && self
-                .interpreter()
-                .container_holds_horizontal_offset_person(self.world, me)
+        if self
+            .interpreter()
+            .facing_change_shifts_held_person_offset(self.world, me, old_facing, direction)
         {
             return Err(Trap::Unsupported(
                 "Snap rotating a container holding a person in a slot with horizontal offset \

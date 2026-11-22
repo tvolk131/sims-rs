@@ -635,42 +635,41 @@ impl Interpreter<'_> {
         })
     }
 
-    /// Whether `container_id`'s container slot `slot_index` has a nonzero
-    /// horizontal offset (`entry.offset[..2]`, ignoring `-0.0`).
-    pub(crate) fn slot_has_horizontal_offset(
+    /// Computed container-slot animator offset (`0x454ceb..0x454d5e`) for
+    /// `container_id`'s container slot `slot_index` at container facing
+    /// `facing`, or `None` when the slot does not exist or the truncated
+    /// offset is zero.
+    pub(crate) fn slot_animator_offset(
         &self,
         world: &World,
         container_id: u16,
         slot_index: usize,
-    ) -> bool {
-        let Some(container) = world.objects.get(&container_id) else {
-            return false;
-        };
-        let Some(definition) =
-            crate::interpreter::object_definition(self.catalog, world, container.guid)
-        else {
-            return false;
-        };
-        self.program
+        facing: i32,
+    ) -> Option<[F32; 3]> {
+        let container = world.objects.get(&container_id)?;
+        let definition =
+            crate::interpreter::object_definition(self.catalog, world, container.guid)?;
+        let entry = self
+            .program
             .slots(definition.resource, definition.chunk)
             .iter()
             .filter(|entry| entry.kind == 0)
-            .nth(slot_index)
-            .is_some_and(|entry| {
-                entry.offset[..2]
-                    .iter()
-                    .any(|n| n.to_bits() & 0x7fff_ffff != 0)
-            })
+            .nth(slot_index)?;
+        let offset = container_slot_animator_offset(entry.offset, facing);
+        (offset != [F32::ZERO; 3]).then_some(offset)
     }
 
-    /// Whether `container_id` currently holds a person in any container slot
-    /// whose horizontal offset is nonzero (`0x454ceb`). Rotating the container
-    /// while such a person is held would make the derived offset diverge from
-    /// the offset `0x58933b` stored at `Snap` time.
-    pub(crate) fn container_holds_horizontal_offset_person(
+    /// Whether changing `container_id`'s facing from `old_facing` to
+    /// `new_facing` would change the derived container-slot animator offset
+    /// (`0x454ceb -> 0x5921f0`) for any person currently held in one of its
+    /// container slots. Changing facing in that state would make the derived
+    /// offset diverge from the value `0x58933b` stored at `Snap` time.
+    pub(crate) fn facing_change_shifts_held_person_offset(
         &self,
         world: &World,
         container_id: u16,
+        old_facing: i32,
+        new_facing: i32,
     ) -> bool {
         let Some(container) = world.objects.get(&container_id) else {
             return false;
@@ -688,13 +687,14 @@ impl Interpreter<'_> {
                     .objects
                     .get(&occupant_id)
                     .is_some_and(|o| o.person.is_some())
-                    && self.slot_has_horizontal_offset(world, container_id, slot_index)
+                    && self.slot_animator_offset(world, container_id, slot_index, old_facing)
+                        != self.slot_animator_offset(world, container_id, slot_index, new_facing)
             })
     }
 
     /// Container-slot animator offset (`0x454ceb..0x454d5e`) for a person
     /// currently held in a container slot, or `None` when not contained or the
-    /// offset is zero.
+    /// truncated offset is zero.
     pub(crate) fn container_animator_offset(
         &self,
         world: &World,
@@ -705,21 +705,8 @@ impl Interpreter<'_> {
             .filter(|&c| c > 0)?;
         let slot_index = usize::try_from(object.data.get(3).copied().unwrap_or(-1)).ok()?;
         let container = world.objects.get(&container_id)?;
-        let definition =
-            crate::interpreter::object_definition(self.catalog, world, container.guid)?;
-        let entry = self
-            .program
-            .slots(definition.resource, definition.chunk)
-            .iter()
-            .filter(|entry| entry.kind == 0)
-            .nth(slot_index)?;
         let facing = i32::from(container.data.get(1).copied().unwrap_or(0));
-        let offset = container_slot_animator_offset(entry.offset, facing);
-        if offset == [F32::ZERO; 3] {
-            None
-        } else {
-            Some(offset)
-        }
+        self.slot_animator_offset(world, container_id, slot_index, facing)
     }
 }
 
