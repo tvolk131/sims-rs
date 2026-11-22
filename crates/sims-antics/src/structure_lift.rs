@@ -557,6 +557,12 @@ pub fn lift_bhav_structured(chunk: &BhavChunk) -> StructuredLiftOutcome {
     };
     let eff_locals = usize::from(chunk.locals).min(max_locals) as u16;
 
+    // Indexed-entry trees (kind 4) can enter at caller-selected PCs (`interpreter.rs:1786`),
+    // so renumbering or pruning unreachable-from-0 nodes would alter semantics.
+    if chunk.kind == 4 {
+        return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
+    }
+
     // Header (preserves exact format, kind, effective args/locals, revision with clean placeholder label).
     let header = format!(
         "tree {} \"Tree_{}\" (format: {:#06x}, kind: {}, args: {}, locals: {}, revision: {:#010x}) {{\n",
@@ -644,8 +650,8 @@ pub fn lift_bhav_structured(chunk: &BhavChunk) -> StructuredLiftOutcome {
     let dom = compute_dominators(n, &reachable, &succs);
     let ipdom = compute_immediate_postdominators(n, &reachable, &succs, &has_terminal_edge);
 
-    // Detect natural loop headers (nodes targeted by a back-edge `u -> h` where `h` dominates `u`).
-    let mut loop_bodies: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    // Build the full predecessor graph BEFORE collecting natural loops so loop discovery
+    // is completely independent of instruction storage order.
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
     for u in 0..n {
         if !reachable[u] {
@@ -653,6 +659,16 @@ pub fn lift_bhav_structured(chunk: &BhavChunk) -> StructuredLiftOutcome {
         }
         for &v in &succs[u] {
             preds[v].push(u);
+        }
+    }
+
+    // Detect natural loop headers (nodes targeted by a back-edge `u -> h` where `h` dominates `u`).
+    let mut loop_bodies: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for u in 0..n {
+        if !reachable[u] {
+            continue;
+        }
+        for &v in &succs[u] {
             if dom[u].contains(&v) {
                 // Collect natural loop nodes for back-edge u -> v.
                 let body = loop_bodies.entry(v).or_default();
@@ -748,21 +764,9 @@ fn compute_immediate_postdominators(
 ) -> Vec<Option<usize>> {
     let exit = n;
     let total = n + 1;
-    let all: BTreeSet<usize> = (0..n).filter(|&i| reachable[i]).chain([exit]).collect();
-    let mut pdom: Vec<BTreeSet<usize>> = (0..total)
-        .map(|i| {
-            if i == exit {
-                BTreeSet::from([exit])
-            } else if reachable[i] {
-                all.clone()
-            } else {
-                BTreeSet::new()
-            }
-        })
-        .collect();
-
     // Reverse graph: virtual exit is successor of any node with an actual terminal edge (0xFD..=0xFF).
     let mut rsuccs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut rpreds: Vec<Vec<usize>> = vec![Vec::new(); total];
     for u in 0..n {
         if !reachable[u] {
             continue;
@@ -771,17 +775,53 @@ fn compute_immediate_postdominators(
         if has_terminal_edge[u] {
             rsuccs[u].push(exit);
         }
+        for &v in &rsuccs[u] {
+            rpreds[v].push(u);
+        }
     }
+
+    // Identify nodes that can actually reach the virtual exit; leave exitless components
+    // without synthetic post-dominator candidates.
+    let mut can_reach_exit = vec![false; total];
+    let mut back_q = VecDeque::new();
+    can_reach_exit[exit] = true;
+    back_q.push_back(exit);
+    while let Some(v) = back_q.pop_front() {
+        for &u in &rpreds[v] {
+            if !can_reach_exit[u] {
+                can_reach_exit[u] = true;
+                back_q.push_back(u);
+            }
+        }
+    }
+
+    let all: BTreeSet<usize> = (0..n)
+        .filter(|&i| reachable[i] && can_reach_exit[i])
+        .chain([exit])
+        .collect();
+    let mut pdom: Vec<BTreeSet<usize>> = (0..total)
+        .map(|i| {
+            if i == exit {
+                BTreeSet::from([exit])
+            } else if reachable[i] && can_reach_exit[i] {
+                all.clone()
+            } else {
+                BTreeSet::new()
+            }
+        })
+        .collect();
 
     let mut changed = true;
     while changed {
         changed = false;
         for u in (0..n).rev() {
-            if !reachable[u] || rsuccs[u].is_empty() {
+            if !reachable[u] || !can_reach_exit[u] || rsuccs[u].is_empty() {
                 continue;
             }
-            let mut iter = rsuccs[u].iter().copied();
-            let first = iter.next().unwrap();
+            let mut iter = rsuccs[u].iter().copied().filter(|&v| can_reach_exit[v]);
+            let Some(first) = iter.next() else {
+                continue;
+            };
             let mut inter = pdom[first].clone();
             for s in iter {
                 inter.retain(|x| pdom[s].contains(x));

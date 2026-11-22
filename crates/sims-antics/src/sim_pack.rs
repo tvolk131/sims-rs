@@ -9,8 +9,9 @@
 use crate::compile::{CompiledPack, compile_pack_dir};
 use crate::error::{Error, Result};
 use crate::house::{
-    CompiledSurfaces, PlacedObjectInfo, StarterHouseManifest, StarterPlacementSpec, StarterSimSpec,
-    SurfacesManifest, build_starter_house_iff, build_starter_neighborhood_iff, compile_surfaces,
+    CompiledSurfaces, PlacedObjectInfo, PlacedTileInfo, StarterHouseManifest, StarterPlacementSpec,
+    StarterSimSpec, SurfacesManifest, build_starter_house_iff, build_starter_neighborhood_iff,
+    build_starter_sim_iff, compile_surfaces,
 };
 use crate::lift::lift_objd;
 use sims_formats::iff::Iff;
@@ -24,6 +25,7 @@ pub struct StandalonePack {
     pub pack: CompiledPack,
     pub floors: BTreeMap<String, Vec<u8>>,
     pub walls: BTreeMap<String, Vec<u8>>,
+    pub characters: BTreeMap<String, Vec<u8>>,
     pub house_iff_name: String,
     pub house_iff: Vec<u8>,
     pub neighborhood_iff: Vec<u8>,
@@ -106,15 +108,13 @@ pub fn compile_standalone_pack_dir(dir: &Path) -> Result<StandalonePack> {
     let house_manifest = StarterHouseManifest::parse(&house_toml)
         .map_err(|e| e.with_context("starter-house.toml"))?;
 
-    // Extract object placement metadata directly from the compiled IFFs.
+    // Extract object placement metadata (including all tiles of multi-tile objects) from the IFFs.
     let mut catalog = BTreeMap::new();
     for entry in &pack.objects {
         let iff = Iff::parse(entry.object.iff_bytes.clone())?;
         let mut price = 100u16;
-        let mut attributes = 0usize;
-        let mut placed_guid = entry.object.guid;
         let is_multipart = !entry.object.tile_guids.is_empty();
-        // For multi-tile objects, place the lead tile GUID (`sub_index == 0` / `lead_tile != 0`).
+        let mut tiles: Vec<PlacedTileInfo> = Vec::new();
         if is_multipart {
             for chunk in iff.all(b"OBJD") {
                 if let Ok(objd) = lift_objd(chunk.id, &chunk.label, iff.data(chunk)) {
@@ -122,34 +122,58 @@ pub fn compile_standalone_pack_dir(dir: &Path) -> Result<StandalonePack> {
                     let sub_index = w(11) as i16;
                     let guid = u32::from(w(14)) | (u32::from(w(15)) << 16);
                     let obj_price = w(18);
+                    let level_word = w(41) as i16;
                     let num_attributes = w(58);
                     let lead_tile = w(63);
                     if sub_index == -1 {
                         price = obj_price;
-                    } else if lead_tile != 0 {
-                        placed_guid = guid;
-                        attributes = usize::from(num_attributes);
+                    } else {
+                        tiles.push(PlacedTileInfo {
+                            name: chunk.label.clone(),
+                            guid,
+                            attributes: usize::from(num_attributes),
+                            group: [
+                                i32::from(sub_index >> 8),
+                                i32::from(sub_index as u16 & 0xff),
+                                i32::from(level_word),
+                            ],
+                            is_lead: lead_tile != 0,
+                        });
                     }
                 }
             }
+            // Ensure lead tile is emitted first so slave parent IDs match lead_id.
+            tiles.sort_by_key(|t| !t.is_lead);
         } else if let Some(chunk) = iff.all(b"OBJD").next()
             && let Ok(objd) = lift_objd(chunk.id, &chunk.label, iff.data(chunk))
         {
             let w = |i: usize| objd.words.get(i).copied().unwrap_or(0);
             price = w(18);
-            attributes = usize::from(w(58));
+            tiles.push(PlacedTileInfo {
+                name: entry.object.name.clone(),
+                guid: entry.object.guid,
+                attributes: usize::from(w(58)),
+                group: [0, 0, 0],
+                is_lead: true,
+            });
         }
         catalog.insert(
             entry.slug.clone(),
             PlacedObjectInfo {
                 slug: entry.slug.clone(),
                 name: entry.object.name.clone(),
-                guid: placed_guid,
                 price,
-                attributes,
                 is_multipart,
+                tiles,
             },
         );
+    }
+
+    let mut characters = BTreeMap::new();
+    for sim in &house_manifest.sims {
+        let char_iff = build_starter_sim_iff(sim)?;
+        let char_name = format!("open_sim_{:02}.iff", sim.neighbor_id);
+        characters.insert(char_name, char_iff);
     }
 
     let house_iff = build_starter_house_iff(&house_manifest, &compiled_surfaces, &catalog)?;
@@ -162,6 +186,7 @@ pub fn compile_standalone_pack_dir(dir: &Path) -> Result<StandalonePack> {
         pack,
         floors: compiled_surfaces.floors,
         walls: compiled_surfaces.walls,
+        characters,
         house_iff_name,
         house_iff,
         neighborhood_iff,

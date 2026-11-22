@@ -31,5 +31,6 @@ pub use sim_pack::{StandalonePack, compile_standalone_pack_dir};
 pub use structure_lift::{StructuredLiftOutcome, lift_bhav_structured};
 pub use verify::{
     EquivOptions, EquivResult, PackSafetyReport, SafetyCategory, SafetyReport, SafetyViolation,
-    TraceStep, check_bhav_equivalent, verify_iff_safety, verify_object_safety, verify_pack_safety,
+    TraceStep, check_bhav_equivalent, check_bhav_equivalent_with_arities, verify_iff_safety,
+    verify_object_safety, verify_pack_safety,
 };

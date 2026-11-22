@@ -5,15 +5,19 @@
 //! `SpriteSet`, `LegacySpriteSet`, `Array`, `House`, `HouseView`, `Simulator`,
 //! `surface_map`, `ObjectTypes`, `Objects`, `Family`, `Neighbors`, `Neighborhood`).
 
+use crate::art::{FurnitureShape, generate_furniture_sprites};
+use crate::compile::compile_antics;
 use crate::encode::{
-    encode_iff_with_rsmp, encode_legacy_spr, encode_palt, encode_spr2, encode_string_table,
+    encode_bhav, encode_dgrp, encode_iff_with_rsmp, encode_legacy_spr, encode_objd, encode_objf,
+    encode_palt, encode_spr2, encode_string_table,
 };
 use crate::error::{Error, Result};
 use crate::ir::{
-    IFF_CONVERTED_FLAG, LegacySprChunk, LegacySprFrame, PaltChunk, Spr2Chunk, Spr2Frame, Spr2Pixel,
-    StringEntry, StringFormat, StringTableChunk,
+    IFF_CONVERTED_FLAG, LegacySprChunk, LegacySprFrame, ObjdSpec, ObjfChunk, PaltChunk, Spr2Chunk,
+    Spr2Frame, Spr2Pixel, StringEntry, StringFormat, StringTableChunk,
 };
-use crate::manifest::{TomlValue, parse_toml};
+use crate::manifest::{SpriteSpec, TomlValue, parse_toml};
+use sims_formats::execution::ObjectFunction;
 use sims_formats::iff::ChunkData;
 use std::collections::BTreeMap;
 
@@ -584,6 +588,21 @@ pub struct StarterSimSpec {
     pub nice: i16,
 }
 
+/// Wall edge for an interior or exterior doorway opening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoorwaySide {
+    West,
+    North,
+}
+
+/// One traversable wall opening punched through a room boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StarterDoorwaySpec {
+    pub x: usize,
+    pub y: usize,
+    pub side: DoorwaySide,
+}
+
 /// Parsed `starter-house.toml` manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StarterHouseManifest {
@@ -595,6 +614,7 @@ pub struct StarterHouseManifest {
     pub camera_direction: i16,
     pub roof: String,
     pub rooms: Vec<StarterRoomSpec>,
+    pub doorways: Vec<StarterDoorwaySpec>,
     pub placements: Vec<StarterPlacementSpec>,
     pub sims: Vec<StarterSimSpec>,
 }
@@ -606,7 +626,7 @@ impl StarterHouseManifest {
         for (key, value) in &root {
             match (key.as_str(), value) {
                 ("house", TomlValue::Table(_)) => {}
-                ("room" | "placement" | "sim", TomlValue::Array(_)) => {}
+                ("room" | "doorway" | "placement" | "sim", TomlValue::Array(_)) => {}
                 (other, _) => {
                     return Err(Error::new(format!(
                         "unknown or invalid section '{other}' in starter-house.toml"
@@ -667,6 +687,30 @@ impl StarterHouseManifest {
             }
         }
 
+        let mut doorways = Vec::new();
+        if let Some(TomlValue::Array(arr)) = root.get("doorway") {
+            for item in arr {
+                let TomlValue::Table(t) = item else {
+                    return Err(Error::new("[[doorway]] entries must be tables"));
+                };
+                let x = usize::from(req_u16(t, "x")?);
+                let y = usize::from(req_u16(t, "y")?);
+                if x >= 64 || y >= 64 {
+                    return Err(Error::new(format!("[[doorway]] ({x}, {y}) outside 0..64")));
+                }
+                let side = match req_str(t, "side")?.as_str() {
+                    "west" => DoorwaySide::West,
+                    "north" => DoorwaySide::North,
+                    other => {
+                        return Err(Error::new(format!(
+                            "unknown [[doorway]].side '{other}' (expected 'west' or 'north')"
+                        )));
+                    }
+                };
+                doorways.push(StarterDoorwaySpec { x, y, side });
+            }
+        }
+
         let mut placements = Vec::new();
         if let Some(TomlValue::Array(arr)) = root.get("placement") {
             for item in arr {
@@ -682,7 +726,17 @@ impl StarterHouseManifest {
                     )));
                 }
                 let level = opt_i32(t, "level")?.unwrap_or(1);
+                if !(1..=2).contains(&level) {
+                    return Err(Error::new(format!(
+                        "[[placement]] for '{object_slug}' level {level} must be 1 or 2"
+                    )));
+                }
                 let direction = opt_i16(t, "direction")?.unwrap_or(0);
+                if !(0..8).contains(&direction) {
+                    return Err(Error::new(format!(
+                        "[[placement]] for '{object_slug}' direction {direction} must be in 0..=7"
+                    )));
+                }
                 placements.push(StarterPlacementSpec {
                     object_slug,
                     x,
@@ -741,6 +795,17 @@ impl StarterHouseManifest {
                 });
             }
         }
+        sims.sort_by_key(|s| s.neighbor_id);
+        for (idx, sim) in sims.iter().enumerate() {
+            let expected = (idx + 1) as i16;
+            if sim.neighbor_id != expected {
+                return Err(Error::new(format!(
+                    "[[sim]] neighbor_ids must be contiguous 1..={} (expected {expected}, got {})",
+                    sims.len(),
+                    sim.neighbor_id
+                )));
+            }
+        }
 
         Ok(Self {
             house_name,
@@ -751,10 +816,21 @@ impl StarterHouseManifest {
             camera_direction,
             roof,
             rooms,
+            doorways,
             placements,
             sims,
         })
     }
+}
+
+/// Metadata for a single tile (or the sole tile of a single-tile object) inside [`PlacedObjectInfo`].
+#[derive(Debug, Clone)]
+pub struct PlacedTileInfo {
+    pub name: String,
+    pub guid: u32,
+    pub attributes: usize,
+    pub group: [i32; 3],
+    pub is_lead: bool,
 }
 
 /// Metadata for a compiled object passed into [`build_starter_house_iff`].
@@ -762,10 +838,9 @@ impl StarterHouseManifest {
 pub struct PlacedObjectInfo {
     pub slug: String,
     pub name: String,
-    pub guid: u32,
     pub price: u16,
-    pub attributes: usize,
     pub is_multipart: bool,
+    pub tiles: Vec<PlacedTileInfo>,
 }
 
 /// Builds a complete clean-room `House01.iff` containing `HOUS` (#0, #1), `SIMI`,
@@ -859,8 +934,33 @@ pub fn build_starter_house_iff(
         }
     }
 
-    // 2. Build OBJT + OBJM + ground object grid (ARRY #3).
+    let clear_wall_west = |grid: &mut [u8], x: usize, y: usize| {
+        let c = (x * SIZE + y) * 14;
+        grid[c] &= !1;
+        if x > 0 {
+            let w = ((x - 1) * SIZE + y) * 14;
+            grid[w] &= !4;
+        }
+    };
+    let clear_wall_north = |grid: &mut [u8], x: usize, y: usize| {
+        let c = (x * SIZE + y) * 14;
+        grid[c] &= !2;
+        if y > 0 {
+            let n = (x * SIZE + (y - 1)) * 14;
+            grid[n] &= !8;
+        }
+    };
+
+    for dw in &manifest.doorways {
+        match dw.side {
+            DoorwaySide::West => clear_wall_west(&mut ground_walls, dw.x, dw.y),
+            DoorwaySide::North => clear_wall_north(&mut ground_walls, dw.x, dw.y),
+        }
+    }
+
+    // 2. Build objt + ObjM + ground/upper object grids (Arry #3, #103).
     let mut ground_grid = vec![0u8; SIZE * SIZE * 2];
+    let mut upper_grid = vec![0u8; SIZE * SIZE * 2];
     let mut type_entries: Vec<(u32, u16, u16, String)> = Vec::new(); // (guid, type_id, kind, name)
     let mut guid_to_type_id: BTreeMap<u32, u16> = BTreeMap::new();
     let mut next_type_id = 1u16;
@@ -873,7 +973,7 @@ pub fn build_starter_house_iff(
         level: i32,
         direction: i16,
         attributes: usize,
-        is_multipart: bool,
+        multipart: Option<([i32; 3], [i32; 3], i16)>, // (offset, group, parent)
         sim: Option<StarterSimSpec>,
     }
 
@@ -888,26 +988,69 @@ pub fn build_starter_house_iff(
                 pl.object_slug
             ))
         })?;
-        let type_id = *guid_to_type_id.entry(info.guid).or_insert_with(|| {
-            let tid = next_type_id;
-            next_type_id += 1;
-            type_entries.push((info.guid, tid, 4, info.name.clone()));
-            tid
-        });
-        let id = next_obj_id;
-        next_obj_id += 1;
+        if info.tiles.is_empty() {
+            return Err(Error::new(format!(
+                "object '{}' has no placeable tile definitions",
+                pl.object_slug
+            )));
+        }
         objects_value += i32::from(info.price);
-        plans.push(SavedInstancePlan {
-            id,
-            type_id,
-            x: pl.x,
-            y: pl.y,
-            level: pl.level,
-            direction: pl.direction,
-            attributes: info.attributes,
-            is_multipart: info.is_multipart,
-            sim: None,
-        });
+        let lead_group = info
+            .tiles
+            .iter()
+            .find(|t| t.is_lead)
+            .unwrap_or(&info.tiles[0])
+            .group;
+        let lead_id = next_obj_id;
+        for tile in &info.tiles {
+            let dx = tile.group[0].wrapping_sub(lead_group[0]);
+            let dy = tile.group[1].wrapping_sub(lead_group[1]);
+            let dz = tile.group[2].wrapping_sub(lead_group[2]);
+            let (rx, ry) = match pl.direction & 7 {
+                0 => (dx, dy),
+                2 => (dy.wrapping_neg(), dx),
+                4 => (dx.wrapping_neg(), dy.wrapping_neg()),
+                6 => (dy, dx.wrapping_neg()),
+                _ => (dx, dy),
+            };
+            let tile_x = pl.x + rx;
+            let tile_y = pl.y + ry;
+            let tile_level = pl.level + dz;
+            if !(0..64).contains(&tile_x)
+                || !(0..64).contains(&tile_y)
+                || !(1..=2).contains(&tile_level)
+            {
+                return Err(Error::new(format!(
+                    "multi-tile placement '{}' tile '{}' at ({tile_x}, {tile_y}, L{tile_level}) outside lot bounds",
+                    pl.object_slug, tile.name
+                )));
+            }
+            let type_id = *guid_to_type_id.entry(tile.guid).or_insert_with(|| {
+                let tid = next_type_id;
+                next_type_id += 1;
+                type_entries.push((tile.guid, tid, 4, tile.name.clone()));
+                tid
+            });
+            let id = next_obj_id;
+            next_obj_id += 1;
+            let multipart = if info.is_multipart {
+                let parent = if tile.is_lead { 0 } else { lead_id as i16 };
+                Some(([rx, ry, dz], tile.group, parent))
+            } else {
+                None
+            };
+            plans.push(SavedInstancePlan {
+                id,
+                type_id,
+                x: tile_x,
+                y: tile_y,
+                level: tile_level,
+                direction: pl.direction,
+                attributes: tile.attributes,
+                multipart,
+                sim: None,
+            });
+        }
     }
 
     for sim in &manifest.sims {
@@ -927,24 +1070,32 @@ pub fn build_starter_house_iff(
             level: 1,
             direction: 0,
             attributes: 0,
-            is_multipart: false,
+            multipart: None,
             sim: Some(sim.clone()),
         });
     }
 
-    // Link objects occupying the same tile via slot[0] chaining and write head ID to ARRY #3.
+    // Link objects occupying the same (level, x, y) tile via slot[0] chaining and write
+    // head IDs to Arry #3 (ground) and Arry #103 (upper).
     let mut next_on_tile: BTreeMap<u16, i16> = BTreeMap::new();
-    let mut tile_head: BTreeMap<(i32, i32), u16> = BTreeMap::new();
+    let mut tile_head: BTreeMap<(i32, i32, i32), u16> = BTreeMap::new();
     for plan in plans.iter().rev() {
-        let prev = tile_head.insert((plan.x, plan.y), plan.id).unwrap_or(0);
+        let prev = tile_head
+            .insert((plan.level, plan.x, plan.y), plan.id)
+            .unwrap_or(0);
         next_on_tile.insert(plan.id, prev as i16);
     }
-    for (&(x, y), &head_id) in &tile_head {
+    for (&(level, x, y), &head_id) in &tile_head {
         let at = (x as usize * SIZE + y as usize) * 2;
-        ground_grid[at..at + 2].copy_from_slice(&(head_id as i16).to_le_bytes());
+        let grid = if level == 2 {
+            &mut upper_grid
+        } else {
+            &mut ground_grid
+        };
+        grid[at..at + 2].copy_from_slice(&(head_id as i16).to_le_bytes());
     }
 
-    // Encode OBJT #1.
+    // Encode objt #1.
     let mut objt = Vec::new();
     objt.extend_from_slice(&0u32.to_le_bytes());
     objt.extend_from_slice(&3u32.to_le_bytes());
@@ -959,7 +1110,7 @@ pub fn build_starter_house_iff(
         objt.extend_from_slice(&0u32.to_le_bytes()); // v3 extra
     }
 
-    // Encode OBJM #1.
+    // Encode ObjM #1.
     let mut objm = Vec::new();
     objm.extend_from_slice(&0u32.to_le_bytes());
     objm.extend_from_slice(&HOUSE_VERSION.to_le_bytes());
@@ -977,12 +1128,14 @@ pub fn build_starter_house_iff(
         let origin = objm.len() + 4;
         let mut fw = FieldWriter::new(origin);
         // footprint [min_y, min_x, max_y, max_x], position [x, y, level] in subtile units (16/tile).
+        // Standing Sims have a 6-unit footprint (`sims-vm/src/placement.rs:786`); furniture uses 16.
         let px = plan.x * 16 + 8;
         let py = plan.y * 16 + 8;
-        fw.i32(py - 8);
-        fw.i32(px - 8);
-        fw.i32(py + 8);
-        fw.i32(px + 8);
+        let half = if plan.sim.is_some() { 3 } else { 8 };
+        fw.i32(py - half);
+        fw.i32(px - half);
+        fw.i32(py + half);
+        fw.i32(px + half);
         fw.i32(px);
         fw.i32(py);
         fw.i32(plan.level);
@@ -996,7 +1149,7 @@ pub fn build_starter_house_iff(
         }
         for w_idx in 0..72usize {
             let val = match w_idx {
-                0 => plan.direction,
+                1 => plan.direction,
                 11 => plan.id as i16,
                 14 => -1,
                 29 => 1, // room 1
@@ -1014,11 +1167,14 @@ pub fn build_starter_house_iff(
         fw.i16(0);
         fw.i16(next_on_tile.get(&plan.id).copied().unwrap_or(0));
         fw.i16(0); // dynamic_sprites count
-        if plan.is_multipart {
-            for _ in 0..6 {
-                fw.i32(0);
+        if let Some((offset, group, parent)) = plan.multipart {
+            for v in offset {
+                fw.i32(v);
             }
-            fw.i16(0);
+            for v in group {
+                fw.i32(v);
+            }
+            fw.i16(parent);
         }
         if let Some(sim) = &plan.sim {
             fw.i32(0); // animation_events
@@ -1085,8 +1241,7 @@ pub fn build_starter_house_iff(
     hous0.extend_from_slice(&0i16.to_le_bytes());
     hous0.extend_from_slice(&0i16.to_le_bytes());
     hous0.extend_from_slice(&0u32.to_le_bytes());
-    hous0.extend_from_slice(manifest.roof.as_bytes());
-    hous0.push(0);
+    write_win1252_cstr(&mut hous0, &manifest.roof)?;
     chunks.push(ChunkData {
         tag: *b"HOUS",
         id: 0,
@@ -1200,9 +1355,11 @@ pub fn build_starter_house_iff(
         data: walm,
     });
 
-    // ARRY chunks (all 14 arrays read by `sims_sim::load`).
+    // Arry chunks (all 14 arrays read by `sims_sim::load`, with native case-sensitive tags,
+    // 4-byte height array #0, and dry 0xff pool/water arrays #9/#10).
+    let dry_surface = vec![0xffu8; SIZE * SIZE];
     let arry_specs: &[(u16, usize, Option<&[u8]>)] = &[
-        (0, 1, None),
+        (0, 4, None),
         (4, 1, None),
         (11, 2, Some(&ground_floors)),
         (12, 14, Some(&ground_walls)),
@@ -1210,12 +1367,12 @@ pub fn build_starter_house_iff(
         (8, 1, None),
         (111, 2, None),
         (112, 14, None),
-        (103, 2, None),
+        (103, 2, Some(&upper_grid)),
         (108, 1, None),
         (6, 1, None),
         (7, 1, None),
-        (9, 1, None),
-        (10, 1, None),
+        (9, 1, Some(&dry_surface)),
+        (10, 1, Some(&dry_surface)),
     ];
     for &(id, stride, maybe_data) in arry_specs {
         let mut buf = Vec::with_capacity(20 + SIZE * SIZE * stride);
@@ -1229,7 +1386,7 @@ pub fn build_starter_house_iff(
             None => buf.resize(20 + SIZE * SIZE * stride, 0),
         }
         chunks.push(ChunkData {
-            tag: *b"ARRY",
+            tag: *b"Arry",
             id,
             flags: IFF_CONVERTED_FLAG,
             label: format!("Array {id}"),
@@ -1238,18 +1395,138 @@ pub fn build_starter_house_iff(
     }
 
     chunks.push(ChunkData {
-        tag: *b"OBJT",
+        tag: *b"objt",
         id: 1,
         flags: IFF_CONVERTED_FLAG,
         label: "Object Types".to_owned(),
         data: objt,
     });
     chunks.push(ChunkData {
-        tag: *b"OBJM",
+        tag: *b"ObjM",
         id: 1,
         flags: IFF_CONVERTED_FLAG,
         label: "Saved Objects".to_owned(),
         data: objm,
+    });
+
+    encode_iff_with_rsmp(&chunks)
+}
+
+/// Builds a self-contained clean-room character `.iff` (`OBJD` kind=2, `OBJf`,
+/// `BHAV` Init + `IdleForInput` Main, `CTSS`, `PALT`/`SPR2`/`DGRP`) for a starter Sim
+/// so `House01.iff` resolves every saved GUID from the emitted bundle.
+pub fn build_starter_sim_iff(sim: &StarterSimSpec) -> Result<Vec<u8>> {
+    let script = r#"
+tree 4096 "Init" {
+    return true;
+}
+
+tree 4097 "Main" (args: 1) {
+    while 0 == 0 {
+        param[0] := 1;
+        idle_for_input(param[0], 1);
+    }
+}
+"#;
+    let compiled = compile_antics(script)?;
+    let mut chunks = Vec::new();
+
+    let mut objd_spec = ObjdSpec::new(128, &sim.name, sim.guid);
+    objd_spec.object_type = 2; // Person
+    objd_spec.price = 0;
+    objd_spec.base_graphic_id = 100;
+    objd_spec.num_graphics = 1;
+    objd_spec.tree_table_id = 0;
+    objd_spec.slots_id = 0;
+    objd_spec.catalog_strings_id = 128;
+    objd_spec.init_id = 4096;
+    objd_spec.main_id = 4097;
+    objd_spec.num_attributes = 0;
+    chunks.push(ChunkData {
+        tag: *b"OBJD",
+        id: 128,
+        flags: IFF_CONVERTED_FLAG,
+        label: sim.name.clone(),
+        data: encode_objd(&objd_spec.to_chunk())?,
+    });
+
+    let objf = ObjfChunk::new(
+        128,
+        format!("{} Functions", sim.name),
+        vec![
+            ObjectFunction {
+                condition: 0,
+                action: 4096,
+            },
+            ObjectFunction {
+                condition: 0,
+                action: 4097,
+            },
+        ],
+    );
+    chunks.push(ChunkData {
+        tag: *b"OBJf",
+        id: 128,
+        flags: IFF_CONVERTED_FLAG,
+        label: objf.label.clone(),
+        data: encode_objf(&objf)?,
+    });
+
+    for (&id, bhav) in &compiled.behaviors {
+        chunks.push(ChunkData {
+            tag: *b"BHAV",
+            id,
+            flags: IFF_CONVERTED_FLAG,
+            label: bhav.label.clone(),
+            data: encode_bhav(bhav)?,
+        });
+    }
+
+    let ctss = StringTableChunk::new(
+        *b"CTSS",
+        128,
+        sim.name.clone(),
+        StringFormat::Localized,
+        vec![
+            StringEntry::english(&sim.name),
+            StringEntry::english("Clean-room starter household Sim."),
+        ],
+    );
+    chunks.push(ChunkData {
+        tag: *b"CTSS",
+        id: 128,
+        flags: IFF_CONVERTED_FLAG,
+        label: ctss.label.clone(),
+        data: encode_string_table(&ctss)?,
+    });
+
+    let spec = SpriteSpec {
+        shape: FurnitureShape::FloorLamp,
+        primary_rgb: [104, 148, 198],
+        accent_rgb: [228, 192, 160],
+        trim_rgb: [66, 78, 96],
+    };
+    let art = generate_furniture_sprites(&spec, 100, 100, 100, &sim.name);
+    chunks.push(ChunkData {
+        tag: *b"PALT",
+        id: art.palt.id,
+        flags: IFF_CONVERTED_FLAG,
+        label: art.palt.label.clone(),
+        data: encode_palt(&art.palt)?,
+    });
+    chunks.push(ChunkData {
+        tag: *b"SPR2",
+        id: art.spr2.id,
+        flags: IFF_CONVERTED_FLAG,
+        label: art.spr2.label.clone(),
+        data: encode_spr2(&art.spr2)?,
+    });
+    chunks.push(ChunkData {
+        tag: *b"DGRP",
+        id: art.dgrp.id,
+        flags: IFF_CONVERTED_FLAG,
+        label: art.dgrp.label.clone(),
+        data: encode_dgrp(&art.dgrp)?,
     });
 
     encode_iff_with_rsmp(&chunks)
@@ -1486,11 +1763,29 @@ impl FieldWriter {
     }
 }
 
-fn write_padded_cstr(out: &mut Vec<u8>, s: &str) -> Result<()> {
+fn encode_win1252_checked(s: &str) -> Result<Vec<u8>> {
     if s.as_bytes().contains(&0) {
         return Err(Error::new(format!("C-string '{s}' contains embedded NUL")));
     }
-    out.extend_from_slice(s.as_bytes());
+    let (bytes, _, had_errors) = encoding_rs::WINDOWS_1252.encode(s);
+    if had_errors {
+        return Err(Error::new(format!(
+            "string '{s}' contains characters not representable in Windows-1252"
+        )));
+    }
+    Ok(bytes.into_owned())
+}
+
+fn write_win1252_cstr(out: &mut Vec<u8>, s: &str) -> Result<()> {
+    let encoded = encode_win1252_checked(s)?;
+    out.extend_from_slice(&encoded);
+    out.push(0);
+    Ok(())
+}
+
+fn write_padded_cstr(out: &mut Vec<u8>, s: &str) -> Result<()> {
+    let encoded = encode_win1252_checked(s)?;
+    out.extend_from_slice(&encoded);
     out.push(0);
     if out.len() & 1 != 0 {
         out.push(0);

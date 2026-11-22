@@ -33,6 +33,7 @@ pub enum SafetyCategory {
     InvalidResourceRef,
     PotentialTrap,
     LockLeak,
+    InconclusiveProof,
 }
 
 /// One concrete safety finding detected during static or symbolic verification.
@@ -156,6 +157,7 @@ struct ObjectModel {
     ttas: BTreeMap<u16, usize>,
     ttabs: BTreeMap<u16, InteractionTable>,
     slots: BTreeMap<u16, usize>,
+    routing_slots: BTreeMap<u16, usize>,
     fwavs: BTreeSet<u16>,
     dgrps: BTreeMap<u16, DrawGroup>,
     spr2s: BTreeMap<u16, SpriteSet>,
@@ -194,6 +196,7 @@ pub fn verify_iff_safety(name: &str, guid: u32, iff_bytes: &[u8]) -> Result<Safe
         ttas: BTreeMap::new(),
         ttabs: BTreeMap::new(),
         slots: BTreeMap::new(),
+        routing_slots: BTreeMap::new(),
         fwavs: BTreeSet::new(),
         dgrps: BTreeMap::new(),
         spr2s: BTreeMap::new(),
@@ -242,7 +245,13 @@ pub fn verify_iff_safety(name: &str, guid: u32, iff_bytes: &[u8]) -> Result<Safe
             },
             b"STR#" => match StringTable::parse(data) {
                 Ok(st) => {
-                    model.strings.insert(chunk.id, st.entries.len());
+                    // Match `sims-vm` US English loading: language 0 (non-localized) or 1 (US English).
+                    let en_count = st
+                        .entries
+                        .iter()
+                        .filter(|e| e.language == 0 || e.language == 1)
+                        .count();
+                    model.strings.insert(chunk.id, en_count);
                 }
                 Err(e) => violations.push(SafetyViolation {
                     object: model.name.clone(),
@@ -298,7 +307,9 @@ pub fn verify_iff_safety(name: &str, guid: u32, iff_bytes: &[u8]) -> Result<Safe
             },
             b"SLOT" => match Slots::parse(data) {
                 Ok(sl) => {
+                    let routing_count = sl.entries.iter().filter(|s| s.kind == 3).count();
                     model.slots.insert(chunk.id, sl.entries.len());
+                    model.routing_slots.insert(chunk.id, routing_count);
                 }
                 Err(e) => violations.push(SafetyViolation {
                     object: model.name.clone(),
@@ -346,14 +357,25 @@ pub fn verify_iff_safety(name: &str, guid: u32, iff_bytes: &[u8]) -> Result<Safe
     verify_resource_links(&model, &mut violations);
 
     // 2. Validate every BHAV's CFG reachability, jumps, operand bounds, opcodes, and arity.
-    let total_slots = model.slots.values().copied().max().unwrap_or(0);
+    // Match `sims-vm/src/program.rs:1019`: Route/Snap use the definition's linked SLOT table
+    // filtered to kind-3 routing entries.
+    let mut linked_routing_counts: Vec<usize> = Vec::new();
+    for objd in model.objds.values() {
+        let slots_id = objd.words.get(20).copied().unwrap_or(0);
+        if slots_id != 0 {
+            linked_routing_counts.push(model.routing_slots.get(&slots_id).copied().unwrap_or(0));
+        }
+    }
+    let routing_slot_count = linked_routing_counts.into_iter().min().unwrap_or(0);
+    let caller_param_consts = compute_private_helper_param_consts(&model);
     for (&tree_id, (tree_name, bhav)) in &model.behaviors {
         verify_bhav_static(
             &model,
             tree_id,
             tree_name,
             bhav,
-            total_slots,
+            routing_slot_count,
+            caller_param_consts.get(&tree_id),
             &mut violations,
         );
     }
@@ -576,11 +598,249 @@ fn reachable_nodes(instructions: &[Instruction]) -> Vec<bool> {
     visited
 }
 
+/// Returns true iff `opcode` is implemented in `sims-vm/src/primitives.rs` (0..=37, 41..=51).
 fn is_known_primitive(opcode: u16) -> bool {
-    matches!(
-        opcode,
-        0..=51 | 64..=66
-    )
+    matches!(opcode, 0..=37 | 41..=51)
+}
+
+/// Returns true iff `scope` is a valid SimAntics memory scope implemented in `sims-vm/src/memory.rs`.
+fn is_valid_memory_scope(scope: u8) -> bool {
+    matches!(scope, 0..=4 | 6..=38)
+}
+
+/// Returns true iff `scope` is read-only in `sims-vm/src/memory.rs` (writes trap with 0x13).
+fn is_read_only_scope(scope: u8) -> bool {
+    matches!(scope, 7 | 21 | 23 | 24 | 26 | 32 | 33 | 34 | 35 | 38)
+}
+
+/// For private helper BHAVs that are NOT external entry points (OBJD/OBJf/TTAB) and are
+/// invoked exclusively via inline constant calls (`operands != [0xFF; 8]`), computes the
+/// exact finite set of constant values each parameter `0..4` can take across all callers.
+fn compute_private_helper_param_consts(
+    model: &ObjectModel,
+) -> BTreeMap<u16, [Option<BTreeSet<i16>>; 4]> {
+    let mut entry_points = BTreeSet::new();
+    for objd in model.objds.values() {
+        for idx in [5usize, 43] {
+            let id = objd.words.get(idx).copied().unwrap_or(0);
+            if id >= 4096 {
+                entry_points.insert(id);
+            }
+        }
+    }
+    for objf in model.objfs.values() {
+        for e in &objf.entries {
+            if e.condition >= 4096 {
+                entry_points.insert(e.condition);
+            }
+            if e.action >= 4096 {
+                entry_points.insert(e.action);
+            }
+        }
+    }
+    for ttab in model.ttabs.values() {
+        for inter in &ttab.interactions {
+            if inter.action >= 4096 {
+                entry_points.insert(inter.action);
+            }
+            if inter.test >= 4096 {
+                entry_points.insert(inter.test);
+            }
+        }
+    }
+
+    let mut result: BTreeMap<u16, [Option<BTreeSet<i16>>; 4]> = BTreeMap::new();
+    let mut poisoned: BTreeSet<u16> = entry_points;
+    let mut called: BTreeSet<u16> = BTreeSet::new();
+
+    for (_, bhav) in model.behaviors.values() {
+        let reach = if bhav.kind == 4 {
+            vec![true; bhav.instructions.len()]
+        } else {
+            reachable_nodes(&bhav.instructions)
+        };
+        for (i, ins) in bhav.instructions.iter().enumerate() {
+            if !reach[i] || !(4096..=8191).contains(&ins.opcode) {
+                continue;
+            }
+            called.insert(ins.opcode);
+            if ins.operands == [0xFF; 8] {
+                poisoned.insert(ins.opcode);
+                continue;
+            }
+            let entry = result
+                .entry(ins.opcode)
+                .or_insert_with(|| std::array::from_fn(|_| Some(BTreeSet::new())));
+            for (p, slot) in entry.iter_mut().enumerate() {
+                if let Some(set) = slot {
+                    set.insert(word_i16(&ins.operands, p * 2));
+                    if set.len() > 16 {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+    }
+
+    result.retain(|id, _| called.contains(id) && !poisoned.contains(id));
+    result
+}
+
+type SlotConstMap = BTreeMap<i16, Option<BTreeSet<i16>>>;
+
+/// Forward constant-set dataflow over reachable CFG nodes for sound static trap checking.
+fn compute_node_const_sets(
+    model: &ObjectModel,
+    bhav: &Behavior,
+    reachable: &[bool],
+    init_params: Option<&[Option<BTreeSet<i16>>; 4]>,
+) -> Vec<(SlotConstMap, SlotConstMap)> {
+    let n = bhav.instructions.len();
+    let mut in_states: Vec<Option<(SlotConstMap, SlotConstMap)>> = vec![None; n];
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mut init_p = BTreeMap::new();
+    if let Some(pconsts) = init_params {
+        for (i, slot) in pconsts.iter().enumerate() {
+            if let Some(set) = slot {
+                init_p.insert(i as i16, Some(set.clone()));
+            }
+        }
+    }
+    let init_l = BTreeMap::new(); // Uninitialized locals are Top (None) — never assumed 0!
+    let mut work = VecDeque::new();
+    if bhav.kind == 4 {
+        for (i, state) in in_states.iter_mut().enumerate() {
+            *state = Some((init_p.clone(), init_l.clone()));
+            work.push_back(i);
+        }
+    } else {
+        in_states[0] = Some((init_p, init_l));
+        work.push_back(0usize);
+    }
+
+    let join_slot = |dst: &mut BTreeMap<i16, Option<BTreeSet<i16>>>,
+                     src: &BTreeMap<i16, Option<BTreeSet<i16>>>|
+     -> bool {
+        let mut changed = false;
+        let keys: BTreeSet<i16> = dst.keys().chain(src.keys()).copied().collect();
+        for k in keys {
+            let a = dst.get(&k).and_then(|v| v.as_ref());
+            let b = src.get(&k).and_then(|v| v.as_ref());
+            let merged = match (a, b) {
+                (Some(sa), Some(sb)) => {
+                    let mut u = sa.clone();
+                    u.extend(sb.iter().copied());
+                    if u.len() <= 16 { Some(u) } else { None }
+                }
+                _ => None,
+            };
+            if dst.get(&k) != Some(&merged) {
+                dst.insert(k, merged);
+                changed = true;
+            }
+        }
+        changed
+    };
+
+    while let Some(u) = work.pop_front() {
+        if !reachable[u] {
+            continue;
+        }
+        let Some((mut cur_p, mut cur_l)) = in_states[u].clone() else {
+            continue;
+        };
+        let ins = &bhav.instructions[u];
+        let ops = &ins.operands;
+        match ins.opcode {
+            0 => {
+                cur_p.insert(word_i16(ops, 0), Some(BTreeSet::from([0])));
+            }
+            2 => {
+                let lhs_idx = word_i16(ops, 0);
+                let rhs_idx = word_i16(ops, 2);
+                let op = ops[5];
+                let lhs_scope = ops[6];
+                let rhs_scope = ops[7];
+                if matches!(op, 3..=7 | 9..=13 | 17..=20) && matches!(lhs_scope, 9 | 25) {
+                    let rhs_vals = if op == 5 {
+                        match rhs_scope {
+                            7 => Some(BTreeSet::from([rhs_idx])),
+                            9 => cur_p.get(&rhs_idx).and_then(|v| v.clone()),
+                            25 => cur_l.get(&rhs_idx).and_then(|v| v.clone()),
+                            26 => lookup_bcon(model, rhs_idx).map(|v| BTreeSet::from([v])),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if lhs_scope == 9 {
+                        cur_p.insert(lhs_idx, rhs_vals);
+                    } else {
+                        cur_l.insert(lhs_idx, rhs_vals);
+                    }
+                }
+            }
+            8 => {
+                let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
+                let dst_idx = word_i16(ops, 0);
+                if dst_scope == 9 {
+                    cur_p.insert(dst_idx, None);
+                } else if dst_scope == 25 {
+                    cur_l.insert(dst_idx, None);
+                }
+            }
+            17 => {
+                cur_p.insert(word_i16(ops, 0), None);
+            }
+            31 if ops[4] & 0x80 != 0 => {
+                if ops[5] == 9 {
+                    cur_p.insert(i16::from(ops[7]), None);
+                } else if ops[5] == 25 {
+                    cur_l.insert(i16::from(ops[7]), None);
+                }
+            }
+            44 => {
+                if ops[5] & 0x20 != 0 {
+                    cur_l.insert(i16::from(ops[2]), None);
+                } else {
+                    cur_p.insert(0, None);
+                }
+            }
+            _ => {}
+        }
+
+        let succs: &[u8] = if is_always_true_instruction(ins) {
+            &[ins.on_true]
+        } else {
+            &[ins.on_true, ins.on_false]
+        };
+        for &t in succs {
+            if !matches!(t, TARGET_ERROR..=TARGET_FALSE) && usize::from(t) < n {
+                let v = usize::from(t);
+                match &mut in_states[v] {
+                    None => {
+                        in_states[v] = Some((cur_p.clone(), cur_l.clone()));
+                        work.push_back(v);
+                    }
+                    Some((vp, vl)) => {
+                        let cp = join_slot(vp, &cur_p);
+                        let cl = join_slot(vl, &cur_l);
+                        if cp || cl {
+                            work.push_back(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    in_states
+        .into_iter()
+        .map(|s| s.unwrap_or_default())
+        .collect()
 }
 
 fn verify_bhav_static(
@@ -589,6 +849,7 @@ fn verify_bhav_static(
     tree_name: &str,
     bhav: &Behavior,
     total_slots: usize,
+    init_params: Option<&[Option<BTreeSet<i16>>; 4]>,
     violations: &mut Vec<SafetyViolation>,
 ) {
     let n = bhav.instructions.len();
@@ -627,7 +888,13 @@ fn verify_bhav_static(
         check_target(ins.on_false, "on_false", violations);
     }
 
-    let reachable = reachable_nodes(&bhav.instructions);
+    // Kind-4 indexed trees can enter at any node (`interpreter.rs:1786`), so all nodes are reachable.
+    let reachable = if bhav.kind == 4 {
+        vec![true; n]
+    } else {
+        reachable_nodes(&bhav.instructions)
+    };
+    let node_consts = compute_node_const_sets(model, bhav, &reachable, init_params);
     for (idx, &is_reach) in reachable.iter().enumerate() {
         if !is_reach {
             add_err(
@@ -642,22 +909,43 @@ fn verify_bhav_static(
         let ins = &bhav.instructions[idx];
         let ops = &ins.operands;
 
+        // Reachable TARGET_ERROR (0xFD) exits fault the VM thread.
+        if ins.on_true == TARGET_ERROR
+            || (!is_always_true_instruction(ins) && ins.on_false == TARGET_ERROR)
+        {
+            add_err(
+                violations,
+                SafetyCategory::PotentialTrap,
+                idx,
+                "reachable instruction targets error exit (0xFD)".to_owned(),
+            );
+        }
+
         // Helper to validate a (scope, index) operand reference.
         let check_operand = |scope: u8,
                              index: i16,
                              is_write: bool,
                              violations: &mut Vec<SafetyViolation>| {
+            if !is_valid_memory_scope(scope) {
+                add_err(
+                    violations,
+                    SafetyCategory::PotentialTrap,
+                    idx,
+                    format!("invalid memory scope {scope} (index {index})"),
+                );
+                return;
+            }
+            if is_write && is_read_only_scope(scope) {
+                add_err(
+                    violations,
+                    SafetyCategory::PotentialTrap,
+                    idx,
+                    format!("cannot write to read-only memory scope {scope}"),
+                );
+                return;
+            }
             match scope {
-                7 => {
-                    if is_write {
-                        add_err(
-                            violations,
-                            SafetyCategory::PotentialTrap,
-                            idx,
-                            "cannot write to read-only literal operand (scope 7)".to_owned(),
-                        );
-                    }
-                }
+                7 => {}
                 9 | 22 => {
                     if index < 0 || index as usize >= param_limit {
                         add_err(
@@ -683,14 +971,6 @@ fn verify_bhav_static(
                     }
                 }
                 26 => {
-                    if is_write {
-                        add_err(
-                            violations,
-                            SafetyCategory::PotentialTrap,
-                            idx,
-                            "cannot write to read-only BCON constant (scope 26)".to_owned(),
-                        );
-                    }
                     let raw = index as u16;
                     let table = raw >> 7;
                     let entry = usize::from(raw & 127);
@@ -755,24 +1035,78 @@ fn verify_bhav_static(
                         let writes_lhs = matches!(operator, 3..=7 | 9..=13 | 17..=20);
                         check_operand(lhs_scope, lhs_idx, writes_lhs, violations);
                         check_operand(rhs_scope, rhs_idx, false, violations);
-                        if matches!(operator, 7 | 12) && rhs_scope == 7 && rhs_idx == 0 {
-                            add_err(
-                                violations,
-                                SafetyCategory::PotentialTrap,
-                                idx,
-                                "Expression division/modulo by constant 0".to_owned(),
-                            );
+                        let (ref cur_p, ref cur_l) = node_consts[idx];
+                        let static_rhs_vals: Option<BTreeSet<i16>> = match rhs_scope {
+                            7 => Some(BTreeSet::from([rhs_idx])),
+                            9 => cur_p.get(&rhs_idx).and_then(|v| v.clone()),
+                            25 => cur_l.get(&rhs_idx).and_then(|v| v.clone()),
+                            26 => lookup_bcon(model, rhs_idx).map(|v| BTreeSet::from([v])),
+                            _ => None,
+                        };
+                        if matches!(operator, 7 | 12) {
+                            match static_rhs_vals.as_ref() {
+                                Some(vals) if !vals.is_empty() && vals.iter().all(|&v| v != 0) => {}
+                                Some(vals) if vals.contains(&0) => add_err(
+                                    violations,
+                                    SafetyCategory::PotentialTrap,
+                                    idx,
+                                    "Expression division/modulo by constant 0".to_owned(),
+                                ),
+                                _ => add_err(
+                                    violations,
+                                    SafetyCategory::PotentialTrap,
+                                    idx,
+                                    "Expression division/modulo by unproved non-constant divisor"
+                                        .to_owned(),
+                                ),
+                            }
                         }
-                        if matches!(operator, 8..=10)
-                            && rhs_scope == 7
-                            && !(0..=16).contains(&rhs_idx)
-                        {
-                            add_err(
-                                violations,
-                                SafetyCategory::PotentialTrap,
-                                idx,
-                                format!("Expression flag bit {rhs_idx} out of 0..=16 range"),
-                            );
+                        if matches!(operator, 8..=10) {
+                            match static_rhs_vals.as_ref() {
+                                Some(vals)
+                                    if !vals.is_empty()
+                                        && vals.iter().all(|&b| (0..=16).contains(&b)) => {}
+                                Some(vals) => {
+                                    let bad = vals
+                                        .iter()
+                                        .copied()
+                                        .find(|b| !(0..=16).contains(b))
+                                        .unwrap_or(-1);
+                                    add_err(
+                                        violations,
+                                        SafetyCategory::PotentialTrap,
+                                        idx,
+                                        format!("Expression flag bit {bad} out of 0..=16 range"),
+                                    );
+                                }
+                                None => add_err(
+                                    violations,
+                                    SafetyCategory::PotentialTrap,
+                                    idx,
+                                    "Expression flag bit is non-constant and unproved in 0..=16"
+                                        .to_owned(),
+                                ),
+                            }
+                        }
+                        if operator == 20 {
+                            match static_rhs_vals.as_ref() {
+                                Some(vals) if !vals.is_empty() && vals.iter().all(|&v| v >= 0) => {}
+                                Some(vals) => {
+                                    let bad = vals.iter().copied().find(|&v| v < 0).unwrap_or(-1);
+                                    add_err(
+                                        violations,
+                                        SafetyCategory::PotentialTrap,
+                                        idx,
+                                        format!("Expression sqrt of negative constant {bad}"),
+                                    );
+                                }
+                                None => add_err(
+                                    violations,
+                                    SafetyCategory::PotentialTrap,
+                                    idx,
+                                    "Expression sqrt of unproved non-constant operand".to_owned(),
+                                ),
+                            }
                         }
                     }
                 }
@@ -781,11 +1115,45 @@ fn verify_bhav_static(
                     let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
                     let rng_idx = word_i16(ops, 4);
                     let rng_scope = u16::from_le_bytes([ops[6], ops[7]]);
-                    if dst_scope <= 255 {
+                    if dst_scope > 255 {
+                        add_err(
+                            violations,
+                            SafetyCategory::PotentialTrap,
+                            idx,
+                            format!("Random destination scope {dst_scope} exceeds 255"),
+                        );
+                    } else {
                         check_operand(dst_scope as u8, dst_idx, true, violations);
                     }
-                    if rng_scope <= 255 {
+                    if rng_scope > 255 {
+                        add_err(
+                            violations,
+                            SafetyCategory::PotentialTrap,
+                            idx,
+                            format!("Random range scope {rng_scope} exceeds 255"),
+                        );
+                    } else {
                         check_operand(rng_scope as u8, rng_idx, false, violations);
+                        let static_rng = match rng_scope as u8 {
+                            7 => Some(rng_idx),
+                            26 => lookup_bcon(model, rng_idx),
+                            _ => None,
+                        };
+                        match static_rng {
+                            Some(0) => add_err(
+                                violations,
+                                SafetyCategory::PotentialTrap,
+                                idx,
+                                "Random range is constant 0".to_owned(),
+                            ),
+                            None => add_err(
+                                violations,
+                                SafetyCategory::PotentialTrap,
+                                idx,
+                                "Random range is unproved non-constant (could be 0)".to_owned(),
+                            ),
+                            Some(_) => {}
+                        }
                     }
                 }
                 17 => {
@@ -1126,60 +1494,76 @@ fn collect_tree_lock_ops(
     let Some((_, bhav)) = model.behaviors.get(&root_tree) else {
         return;
     };
-    let mut local_consts: BTreeMap<i16, i16> = BTreeMap::new();
-    let resolve_val = |scope: u8, idx: i16, locals: &BTreeMap<i16, i16>| -> Option<i16> {
+    let reachable = if bhav.kind == 4 {
+        vec![true; bhav.instructions.len()]
+    } else {
+        reachable_nodes(&bhav.instructions)
+    };
+    let resolve_val = |scope: u8, idx: i16| -> Option<i16> {
         match scope {
             7 => Some(idx),
-            9 | 22 => match initial_params.get(idx as usize).copied() {
+            9 => match initial_params.get(idx as usize).copied() {
                 Some(SymWord::Const(v)) => Some(v),
                 _ => None,
             },
-            25 => locals.get(&idx).copied(),
             26 => lookup_bcon(model, idx),
             _ => None,
         }
     };
 
-    for ins in &bhav.instructions {
+    for (idx, ins) in bhav.instructions.iter().enumerate() {
+        if !reachable[idx] {
+            continue;
+        }
         if ins.opcode == 2 {
             let lhs_idx = word_i16(&ins.operands, 0);
             let rhs_idx = word_i16(&ins.operands, 2);
             let op = ins.operands[5];
             let lhs_scope = ins.operands[6];
             let rhs_scope = ins.operands[7];
-            if lhs_scope == 25 && op == 5 {
-                if let Some(v) = resolve_val(rhs_scope, rhs_idx, &local_consts) {
-                    local_consts.insert(lhs_idx, v);
-                } else {
-                    local_consts.remove(&lhs_idx);
-                }
-            }
             if lhs_scope == 1 {
                 match op {
                     5 => {
-                        if let Some(v) = resolve_val(rhs_scope, rhs_idx, &local_consts) {
+                        if let Some(v) = resolve_val(rhs_scope, rhs_idx) {
                             if v == 0 {
                                 releases.insert(LockKey::Scalar(lhs_idx));
                             } else {
                                 acquires.insert(LockKey::Scalar(lhs_idx));
                             }
+                        } else {
+                            // Unknown/symbolic write to stack.attr[lhs_idx] can acquire it.
+                            acquires.insert(LockKey::Scalar(lhs_idx));
                         }
                     }
                     9 => {
-                        if let Some(b) = resolve_val(rhs_scope, rhs_idx, &local_consts)
+                        if let Some(b) = resolve_val(rhs_scope, rhs_idx)
                             && (1..=16).contains(&b)
                         {
                             acquires.insert(LockKey::Bit(lhs_idx, b as u8));
+                        } else {
+                            acquires.insert(LockKey::Scalar(lhs_idx));
                         }
                     }
                     10 => {
-                        if let Some(b) = resolve_val(rhs_scope, rhs_idx, &local_consts)
+                        if let Some(b) = resolve_val(rhs_scope, rhs_idx)
                             && (1..=16).contains(&b)
                         {
                             releases.insert(LockKey::Bit(lhs_idx, b as u8));
                         }
                     }
+                    3 | 4 | 6 | 7 | 12 | 13 | 18 | 19 | 20 => {
+                        acquires.insert(LockKey::Scalar(lhs_idx));
+                    }
                     _ => {}
+                }
+            } else if lhs_scope == 22 && matches!(op, 3..=7 | 9..=13 | 17..=20) {
+                // Scope 22 writes `stack.attr[param[lhs_idx]]`.
+                if let Some(attr_idx) = resolve_val(9, lhs_idx) {
+                    if op == 5 && resolve_val(rhs_scope, rhs_idx) == Some(0) {
+                        releases.insert(LockKey::Scalar(attr_idx));
+                    } else {
+                        acquires.insert(LockKey::Scalar(attr_idx));
+                    }
                 }
             }
         } else if (4096..=8191).contains(&ins.opcode) {
@@ -1200,6 +1584,18 @@ fn collect_tree_lock_ops(
             );
         }
     }
+}
+
+enum LockProofFailure {
+    Leak {
+        lock: LockKey,
+        exit_label: &'static str,
+        trace: Vec<String>,
+    },
+    Inconclusive {
+        reason: String,
+        trace: Vec<String>,
+    },
 }
 
 fn lookup_bcon(model: &ObjectModel, addr: i16) -> Option<i16> {
@@ -1240,6 +1636,18 @@ fn verify_object_locks(model: &ObjectModel, violations: &mut Vec<SafetyViolation
         per_inter_ops.push((acq, rel, guard_mutexes));
     }
 
+    // Identify attributes that act as scoped mutexes anywhere on this object (acquired AND released
+    // within at least one interaction). A persistent multi-interaction toggle (like TV power or
+    // lamp on/off) has separate TurnOn (only sets) and TurnOff (only clears) interactions.
+    let mut scoped_mutexes: BTreeSet<LockKey> = BTreeSet::new();
+    for (acq, rel, _) in &per_inter_ops {
+        for &lock in acq {
+            if rel.contains(&lock) {
+                scoped_mutexes.insert(lock);
+            }
+        }
+    }
+
     let mut locks_verified = 0usize;
     let mut checked_actions = BTreeSet::new();
 
@@ -1250,17 +1658,20 @@ fn verify_object_locks(model: &ObjectModel, violations: &mut Vec<SafetyViolation
         let (acq, rel, guard_mutexes) = &per_inter_ops[idx];
         let mut tracked_locks = BTreeSet::new();
         for &lock in acq {
-            if rel.contains(&lock) {
-                // Acquired and released within the same interaction -> scoped lock.
+            if rel.contains(&lock) || scoped_mutexes.contains(&lock) {
+                // Acquired and released in this interaction (or a known scoped mutex on this object).
                 tracked_locks.insert(lock);
             } else if guard_mutexes.contains(&lock) {
-                // Guarded as mutex and acquired here; unless another interaction on this object
-                // explicitly releases it (persistent toggle like TurnOn/TurnOff), it's a lock leak!
-                let released_elsewhere = per_inter_ops
-                    .iter()
-                    .enumerate()
-                    .any(|(j, (_, other_rel, _))| j != idx && other_rel.contains(&lock));
-                if !released_elsewhere {
+                // Guarded as mutex and acquired here; only exempt if another interaction
+                // acts strictly as a dedicated release toggle (releases without acquiring).
+                let is_persistent_toggle =
+                    per_inter_ops
+                        .iter()
+                        .enumerate()
+                        .any(|(j, (other_acq, other_rel, _))| {
+                            j != idx && other_rel.contains(&lock) && !other_acq.contains(&lock)
+                        });
+                if !is_persistent_toggle {
                     tracked_locks.insert(lock);
                 }
             }
@@ -1275,7 +1686,11 @@ fn verify_object_locks(model: &ObjectModel, violations: &mut Vec<SafetyViolation
             Ok(verified_count) => {
                 locks_verified += verified_count;
             }
-            Err((leaked, exit_label, trace)) => {
+            Err(LockProofFailure::Leak {
+                lock: leaked,
+                exit_label,
+                trace,
+            }) => {
                 violations.push(SafetyViolation {
                     object: model.name.clone(),
                     tree_id: Some(action),
@@ -1285,6 +1700,17 @@ fn verify_object_locks(model: &ObjectModel, violations: &mut Vec<SafetyViolation
                     message: format!(
                         "occupancy lock {leaked} remains held on reachable {exit_label} exit"
                     ),
+                    path: trace,
+                });
+            }
+            Err(LockProofFailure::Inconclusive { reason, trace }) => {
+                violations.push(SafetyViolation {
+                    object: model.name.clone(),
+                    tree_id: Some(action),
+                    tree_name: tree_name.clone(),
+                    category: SafetyCategory::InconclusiveProof,
+                    node: None,
+                    message: format!("lock safety proof incomplete: {reason}"),
                     path: trace,
                 });
             }
@@ -1303,12 +1729,25 @@ fn eval_sym_operand(model: &ObjectModel, state: &LockState, scope: u8, idx: i16)
             .get(idx as usize)
             .copied()
             .unwrap_or(SymWord::Unknown),
-        9 | 22 => frame
+        9 => frame
             .params
             .get(idx as usize)
             .copied()
             .unwrap_or(SymWord::Unknown),
         10 => frame.stack_obj,
+        22 => {
+            // Scope 22 is `stack.attr[param[idx]]` (`sims-vm/src/memory.rs:461`).
+            if frame.stack_obj == SymWord::InitialTarget
+                && let Some(SymWord::Const(attr_idx)) = frame.params.get(idx as usize).copied()
+            {
+                match state.target_attrs.get(&attr_idx) {
+                    Some(LockVal::Concrete(v)) => SymWord::Const(*v),
+                    _ => SymWord::Unknown,
+                }
+            } else {
+                SymWord::Unknown
+            }
+        }
         25 => frame
             .locals
             .get(idx as usize)
@@ -1331,7 +1770,7 @@ fn write_sym_operand(state: &mut LockState, scope: u8, idx: i16, val: SymWord) {
                 *slot = val;
             }
         }
-        9 | 22 => {
+        9 => {
             if let Some(slot) = frame.params.get_mut(idx as usize) {
                 *slot = val;
             }
@@ -1352,7 +1791,7 @@ fn prove_interaction_lock_safety(
     model: &ObjectModel,
     root_tree: u16,
     tracked_locks: &BTreeSet<LockKey>,
-) -> std::result::Result<usize, (LockKey, &'static str, Vec<String>)> {
+) -> std::result::Result<usize, LockProofFailure> {
     const MAX_EXPLORED_STATES: usize = 8192;
 
     let Some((_, root_bhav)) = model.behaviors.get(&root_tree) else {
@@ -1381,7 +1820,8 @@ fn prove_interaction_lock_safety(
             pc: 0,
             stack_obj: SymWord::InitialTarget,
             params: vec![SymWord::Unknown; bhav_param_limit(root_bhav).max(4)],
-            locals: vec![SymWord::Const(0); bhav_local_limit(root_bhav)],
+            // Frame locals can inherit nonzero values from prior frames (`interpreter.rs:1210`).
+            locals: vec![SymWord::Unknown; bhav_local_limit(root_bhav)],
         }],
         temps: [SymWord::Unknown; 8],
         target_attrs: initial_attrs,
@@ -1398,7 +1838,10 @@ fn prove_interaction_lock_safety(
 
     while let Some((state, trace)) = queue.pop_front() {
         if visited.len() > MAX_EXPLORED_STATES {
-            break;
+            return Err(LockProofFailure::Inconclusive {
+                reason: format!("exceeded symbolic state limit ({MAX_EXPLORED_STATES})"),
+                trace,
+            });
         }
         let frame = state.frames.last().expect("frame stack non-empty");
         let cur_tree = frame.tree_id;
@@ -1420,7 +1863,7 @@ fn prove_interaction_lock_safety(
                        step_note: String,
                        visited: &mut BTreeSet<LockState>,
                        queue: &mut VecDeque<(LockState, Vec<String>)>|
-         -> std::result::Result<(), (LockKey, &'static str, Vec<String>)> {
+         -> std::result::Result<(), LockProofFailure> {
             let mut next_trace = trace.clone();
             next_trace.push(step_note);
             if widen_counters {
@@ -1466,7 +1909,11 @@ fn prove_interaction_lock_safety(
                                         .is_released_bit(b),
                                 };
                                 if !released {
-                                    return Err((lock, exit_label, next_trace));
+                                    return Err(LockProofFailure::Leak {
+                                        lock,
+                                        exit_label,
+                                        trace: next_trace,
+                                    });
                                 }
                             }
                             return Ok(());
@@ -1493,6 +1940,18 @@ fn prove_interaction_lock_safety(
         };
 
         let ops = &ins.operands;
+        let mark_attr_unknown_acquired = |next: &mut LockState, attr_idx: i16| {
+            next.target_attrs.insert(attr_idx, LockVal::Unknown);
+            for &lock in tracked_locks {
+                match lock {
+                    LockKey::Scalar(a) | LockKey::Bit(a, _) if a == attr_idx => {
+                        next.acquired.insert(lock);
+                    }
+                    _ => {}
+                }
+            }
+        };
+
         match ins.opcode {
             2 => {
                 let lhs_idx = word_i16(ops, 0);
@@ -1503,59 +1962,111 @@ fn prove_interaction_lock_safety(
                 let lhs_val = eval_sym_operand(model, &state, lhs_scope, lhs_idx);
                 let rhs_val = eval_sym_operand(model, &state, rhs_scope, rhs_idx);
 
+                // Model potential trap edges (div/mod by unproved/zero, invalid flag bit, negative sqrt)
+                // so a trap while holding a lock is caught as a Leak on error exit!
+                let may_trap = match op {
+                    7 | 12 => !matches!(rhs_val, SymWord::Const(r) if r != 0),
+                    8..=10 => !matches!(rhs_val, SymWord::Const(b) if (0..=16).contains(&b)),
+                    20 => !matches!(rhs_val, SymWord::Const(v) if v >= 0),
+                    _ => !is_valid_memory_scope(lhs_scope) || !is_valid_memory_scope(rhs_scope),
+                };
+                if may_trap {
+                    advance(
+                        state.clone(),
+                        TARGET_ERROR,
+                        format!("tree#{cur_tree}@n{cur_pc}:expr(op={op})->trap"),
+                        &mut visited,
+                        &mut queue,
+                    )?;
+                }
+
                 let is_assign = matches!(op, 3..=7 | 9 | 10 | 12 | 13 | 18 | 19 | 20);
                 if is_assign {
                     let mut next = state.clone();
                     let on_initial_target =
                         next.frames.last().expect("frame").stack_obj == SymWord::InitialTarget;
 
-                    if lhs_scope == 1 && on_initial_target {
-                        match op {
-                            5 => {
-                                if let SymWord::Const(v) = rhs_val {
-                                    next.target_attrs.insert(lhs_idx, LockVal::Concrete(v));
-                                    if v != 0 && tracked_locks.contains(&LockKey::Scalar(lhs_idx)) {
-                                        next.acquired.insert(LockKey::Scalar(lhs_idx));
+                    // Resolve direct `stack.attr[lhs_idx]` (scope 1) or indirect `stack.attr[param[lhs_idx]]` (scope 22).
+                    let resolved_target_attr = if on_initial_target && lhs_scope == 1 {
+                        Some(Some(lhs_idx))
+                    } else if on_initial_target && lhs_scope == 22 {
+                        match next
+                            .frames
+                            .last()
+                            .expect("frame")
+                            .params
+                            .get(lhs_idx as usize)
+                            .copied()
+                        {
+                            Some(SymWord::Const(a)) => Some(Some(a)),
+                            _ => Some(None), // unknown target attribute index -> aliases all tracked attrs!
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(maybe_attr) = resolved_target_attr {
+                        if let Some(attr_idx) = maybe_attr {
+                            match op {
+                                5 => {
+                                    if let SymWord::Const(v) = rhs_val {
+                                        next.target_attrs.insert(attr_idx, LockVal::Concrete(v));
+                                        if v != 0
+                                            && tracked_locks.contains(&LockKey::Scalar(attr_idx))
+                                        {
+                                            next.acquired.insert(LockKey::Scalar(attr_idx));
+                                        }
+                                    } else {
+                                        mark_attr_unknown_acquired(&mut next, attr_idx);
                                     }
-                                } else {
-                                    next.target_attrs.insert(lhs_idx, LockVal::Unknown);
                                 }
-                            }
-                            9 => {
-                                if let SymWord::Const(b) = rhs_val
-                                    && (1..=16).contains(&b)
-                                {
-                                    let b = b as u8;
-                                    let cur = next
-                                        .target_attrs
-                                        .get(&lhs_idx)
-                                        .copied()
-                                        .unwrap_or(LockVal::Unknown);
-                                    next.target_attrs.insert(lhs_idx, cur.with_flag_set(b));
-                                    if tracked_locks.contains(&LockKey::Bit(lhs_idx, b)) {
-                                        next.acquired.insert(LockKey::Bit(lhs_idx, b));
+                                9 => {
+                                    if let SymWord::Const(b) = rhs_val
+                                        && (1..=16).contains(&b)
+                                    {
+                                        let b = b as u8;
+                                        let cur = next
+                                            .target_attrs
+                                            .get(&attr_idx)
+                                            .copied()
+                                            .unwrap_or(LockVal::Unknown);
+                                        next.target_attrs.insert(attr_idx, cur.with_flag_set(b));
+                                        if tracked_locks.contains(&LockKey::Bit(attr_idx, b)) {
+                                            next.acquired.insert(LockKey::Bit(attr_idx, b));
+                                        }
+                                    } else {
+                                        mark_attr_unknown_acquired(&mut next, attr_idx);
                                     }
-                                } else {
-                                    next.target_attrs.insert(lhs_idx, LockVal::Unknown);
+                                }
+                                10 => {
+                                    if let SymWord::Const(b) = rhs_val
+                                        && (1..=16).contains(&b)
+                                    {
+                                        let b = b as u8;
+                                        let cur = next
+                                            .target_attrs
+                                            .get(&attr_idx)
+                                            .copied()
+                                            .unwrap_or(LockVal::Unknown);
+                                        next.target_attrs.insert(attr_idx, cur.with_flag_clear(b));
+                                    } else {
+                                        mark_attr_unknown_acquired(&mut next, attr_idx);
+                                    }
+                                }
+                                _ => {
+                                    mark_attr_unknown_acquired(&mut next, attr_idx);
                                 }
                             }
-                            10 => {
-                                if let SymWord::Const(b) = rhs_val
-                                    && (1..=16).contains(&b)
-                                {
-                                    let b = b as u8;
-                                    let cur = next
-                                        .target_attrs
-                                        .get(&lhs_idx)
-                                        .copied()
-                                        .unwrap_or(LockVal::Unknown);
-                                    next.target_attrs.insert(lhs_idx, cur.with_flag_clear(b));
-                                } else {
-                                    next.target_attrs.insert(lhs_idx, LockVal::Unknown);
-                                }
-                            }
-                            _ => {
-                                next.target_attrs.insert(lhs_idx, LockVal::Unknown);
+                        } else {
+                            // Indirect write to unknown `stack.attr[?]` can alias any tracked attribute.
+                            let attrs: Vec<i16> = tracked_locks
+                                .iter()
+                                .map(|k| match *k {
+                                    LockKey::Scalar(a) | LockKey::Bit(a, _) => a,
+                                })
+                                .collect();
+                            for a in attrs {
+                                mark_attr_unknown_acquired(&mut next, a);
                             }
                         }
                     } else {
@@ -1582,7 +2093,13 @@ fn prove_interaction_lock_safety(
                             _ => SymWord::Unknown,
                         };
                         pre_lhs = updated;
-                        write_sym_operand(&mut next, lhs_scope, lhs_idx, updated);
+                        if next.frames.last().expect("frame").stack_obj == SymWord::InitialTarget
+                            && lhs_scope == 1
+                        {
+                            mark_attr_unknown_acquired(&mut next, lhs_idx);
+                        } else {
+                            write_sym_operand(&mut next, lhs_scope, lhs_idx, updated);
+                        }
                     }
                     let known_truth = match (pre_lhs, rhs_val) {
                         (SymWord::Const(l), SymWord::Const(r)) => eval_expr_compare(l, op, r),
@@ -1610,21 +2127,12 @@ fn prove_interaction_lock_safety(
             }
             opcode if (4096..=8191).contains(&opcode) && model.behaviors.contains_key(&opcode) => {
                 if state.frames.len() >= 8 {
-                    // Bounded call depth: conservatively branch both outcomes.
-                    advance(
-                        state.clone(),
-                        ins.on_true,
-                        format!("tree#{cur_tree}@n{cur_pc}:call#{opcode}(depth-cap)->true"),
-                        &mut visited,
-                        &mut queue,
-                    )?;
-                    advance(
-                        state,
-                        ins.on_false,
-                        format!("tree#{cur_tree}@n{cur_pc}:call#{opcode}(depth-cap)->false"),
-                        &mut visited,
-                        &mut queue,
-                    )?;
+                    return Err(LockProofFailure::Inconclusive {
+                        reason: format!(
+                            "exceeded call depth limit (8) calling private BHAV #{opcode}"
+                        ),
+                        trace,
+                    });
                 } else {
                     let callee = &model.behaviors[&opcode].1;
                     if callee.instructions.is_empty() {
@@ -1654,7 +2162,8 @@ fn prove_interaction_lock_safety(
                             pc: 0,
                             stack_obj: caller_stack_obj,
                             params,
-                            locals: vec![SymWord::Const(0); bhav_local_limit(callee)],
+                            // Frame locals can inherit nonzero values from prior frames.
+                            locals: vec![SymWord::Unknown; bhav_local_limit(callee)],
                         });
                         if visited.insert(next.clone()) {
                             let mut next_trace = trace.clone();
@@ -1826,29 +2335,73 @@ enum CanonEvent {
 enum CanonOperand {
     /// Concrete known `i16` value (literal or constant-propagated frame-private slot).
     Const(i16),
-    /// Frame-private symbolic value token (identifies shared initial param/local or post-event value).
+    /// Initial frame parameter `param[i]`.
+    InitParam(u16),
+    /// Initial (possibly inherited/nonzero) frame local `local[i]`.
+    InitLocal(u16),
+    /// Interned symbolic expression or post-event value (disjoint from widened tokens).
     Sym(u32),
+    /// Widened loop-header local `local[i]` (distinct namespace, never collides with `Sym`).
+    WidenedLocal(u16),
+    /// Widened loop-header parameter `param[i]` (distinct namespace, never collides with `Sym`).
+    WidenedParam(u16),
     /// External/shared memory operand `(scope, index)`.
     Mem(u8, i16),
 }
 
+impl CanonOperand {
+    fn is_pure(self) -> bool {
+        !matches!(self, Self::Mem(..))
+    }
+}
+
 /// Canonicalized pure comparison predicate `(lhs op rhs)` normalized so equivalent
-/// formulations (`a != b` vs `!(a == b)`, `a > b` vs `b < a`, `a >= c` vs `a > c-1`,
-/// `a == b` vs `b == a`) map to the exact same canonical predicate.
+/// formulations (`a != b` vs `!(a == b)`, `a >= b` vs `!(a < b)`, `a <= b` vs `!(a > b)`,
+/// `a >= c` vs `a > c-1`) map to the exact same canonical predicate without reordering
+/// external memory reads or erasing `LOCKOUT`/fault side effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum CanonPred {
     /// Always true or always false (constant-folded pure comparison).
     Const(bool),
-    /// `lhs == rhs` (with `lhs <= rhs` when commuting is safe).
+    /// `lhs == rhs` (commuted only when both operands are pure/side-effect-free).
     Eq(CanonOperand, CanonOperand),
-    /// `lhs < rhs` (canonicalized integer inequality).
+    /// `lhs < rhs`.
     Lt(CanonOperand, CanonOperand),
+    /// `lhs > rhs` (preserved without operand swap when an external memory operand is involved).
+    Gt(CanonOperand, CanonOperand),
     /// `lhs flag_test rhs`.
     FlagTest(CanonOperand, CanonOperand),
 }
 
+impl CanonPred {
+    fn touches_mem(self) -> bool {
+        match self {
+            Self::Const(_) => false,
+            Self::Eq(a, b) | Self::Lt(a, b) | Self::Gt(a, b) | Self::FlagTest(a, b) => {
+                !a.is_pure() || !b.is_pure()
+            }
+        }
+    }
+}
+
 fn is_global_34(scope: u8, idx: i16) -> bool {
     scope == 6 && idx == 34
+}
+
+fn bhav_uses_global_34(bhav: &BhavChunk) -> bool {
+    bhav.instructions.iter().any(|ins| match ins.opcode {
+        2 => {
+            is_global_34(ins.operands[6], word_i16(&ins.operands, 0))
+                || is_global_34(ins.operands[7], word_i16(&ins.operands, 2))
+        }
+        8 => {
+            (u16::from_le_bytes([ins.operands[2], ins.operands[3]]) == 6
+                && word_i16(&ins.operands, 0) == 34)
+                || (u16::from_le_bytes([ins.operands[6], ins.operands[7]]) == 6
+                    && word_i16(&ins.operands, 4) == 34)
+        }
+        _ => false,
+    })
 }
 
 fn canonicalize_compare(
@@ -1859,9 +2412,10 @@ fn canonicalize_compare(
     on_false: u8,
     can_commute: bool,
 ) -> Option<(CanonPred, u8, u8)> {
-    // Check if both sides are concrete i16 constants -> constant-fold!
+    let both_pure = can_commute && lhs.is_pure() && rhs.is_pure();
+    // Constant-fold only when both sides are concrete pure constants.
     if let (CanonOperand::Const(l), CanonOperand::Const(r)) = (lhs, rhs)
-        && can_commute
+        && both_pure
         && let Some(val) = eval_expr_compare(l, op, r)
     {
         return Some((CanonPred::Const(val), on_true, on_false));
@@ -1870,10 +2424,10 @@ fn canonicalize_compare(
     match op {
         // lhs == rhs
         2 => {
-            if lhs == rhs && can_commute {
+            if lhs == rhs && both_pure {
                 return Some((CanonPred::Const(true), on_true, on_false));
             }
-            let (a, b) = if can_commute && rhs < lhs {
+            let (a, b) = if both_pure && rhs < lhs {
                 (rhs, lhs)
             } else {
                 (lhs, rhs)
@@ -1882,10 +2436,10 @@ fn canonicalize_compare(
         }
         // lhs != rhs  <=>  !(lhs == rhs)
         16 => {
-            if lhs == rhs && can_commute {
+            if lhs == rhs && both_pure {
                 return Some((CanonPred::Const(false), on_true, on_false));
             }
-            let (a, b) = if can_commute && rhs < lhs {
+            let (a, b) = if both_pure && rhs < lhs {
                 (rhs, lhs)
             } else {
                 (lhs, rhs)
@@ -1893,29 +2447,29 @@ fn canonicalize_compare(
             Some((CanonPred::Eq(a, b), on_false, on_true))
         }
         // lhs < rhs
-        1 => Some(canonicalize_lt(lhs, rhs, on_true, on_false)),
+        1 => Some(canonicalize_lt(lhs, rhs, on_true, on_false, both_pure)),
         // lhs >= rhs  <=>  !(lhs < rhs)
-        14 => Some(canonicalize_lt(lhs, rhs, on_false, on_true)),
-        // lhs > rhs  <=>  rhs < lhs (when commuting is safe)
+        14 => Some(canonicalize_lt(lhs, rhs, on_false, on_true, both_pure)),
+        // lhs > rhs
         0 => {
-            if can_commute {
-                Some(canonicalize_lt(rhs, lhs, on_true, on_false))
+            if both_pure {
+                Some(canonicalize_lt(rhs, lhs, on_true, on_false, true))
             } else {
-                // Keep exact direction if global 34 is involved.
+                // Keep exact LHS/RHS evaluation order for external memory operands.
                 match rhs {
                     CanonOperand::Const(c) if c < i16::MAX => Some((
                         CanonPred::Lt(lhs, CanonOperand::Const(c + 1)),
                         on_false,
                         on_true,
                     )),
-                    _ => None,
+                    _ => Some((CanonPred::Gt(lhs, rhs), on_true, on_false)),
                 }
             }
         }
-        // lhs <= rhs  <=>  !(rhs < lhs)
+        // lhs <= rhs  <=>  !(lhs > rhs)
         15 => {
-            if can_commute {
-                Some(canonicalize_lt(rhs, lhs, on_false, on_true))
+            if both_pure {
+                Some(canonicalize_lt(rhs, lhs, on_false, on_true, true))
             } else {
                 match rhs {
                     CanonOperand::Const(c) if c < i16::MAX => Some((
@@ -1923,7 +2477,7 @@ fn canonicalize_compare(
                         on_true,
                         on_false,
                     )),
-                    _ => None,
+                    _ => Some((CanonPred::Gt(lhs, rhs), on_false, on_true)),
                 }
             }
         }
@@ -1933,19 +2487,20 @@ fn canonicalize_compare(
     }
 }
 
-/// Normalizes integer `<` inequalities with literal bounds so e.g. `x >= 1` (`!(x < 1)`)
-/// and `x > 0` (`0 < x`) canonicalize to the exact same form: `x < c` (literal on RHS when possible).
+/// Normalizes integer `<` inequalities with literal bounds without reordering external memory reads.
 fn canonicalize_lt(
     lhs: CanonOperand,
     rhs: CanonOperand,
     on_true: u8,
     on_false: u8,
+    both_pure: bool,
 ) -> (CanonPred, u8, u8) {
-    if lhs == rhs {
+    if lhs == rhs && both_pure {
         return (CanonPred::Const(false), on_true, on_false);
     }
-    // `Const(c) < x` <=> `x > c` <=> `!(x < c + 1)` when `c < i16::MAX`!
-    if let CanonOperand::Const(c) = lhs
+    // `Const(c) < x` <=> `x > c` <=> `!(x < c + 1)` when both are pure and `c < i16::MAX`.
+    if both_pure
+        && let CanonOperand::Const(c) = lhs
         && !matches!(rhs, CanonOperand::Const(_))
         && c < i16::MAX
     {
@@ -1955,8 +2510,8 @@ fn canonicalize_lt(
             on_true,
         );
     }
-    // `x < Const(i16::MIN)` is always false.
-    if let CanonOperand::Const(i16::MIN) = rhs {
+    // `x < Const(i16::MIN)` is always false (only fold when `lhs` is pure so faults/LOCKOUT aren't dropped).
+    if both_pure && matches!(rhs, CanonOperand::Const(i16::MIN)) {
         return (CanonPred::Const(false), on_true, on_false);
     }
     (CanonPred::Lt(lhs, rhs), on_true, on_false)
@@ -2022,11 +2577,12 @@ impl LocalEnv {
     fn new(arg_count: usize, local_count: usize) -> Self {
         let mut params = BTreeMap::new();
         for i in 0..arg_count {
-            params.insert(i as i16, CanonOperand::Sym(1 + i as u32));
+            params.insert(i as i16, CanonOperand::InitParam(i as u16));
         }
         let mut locals = BTreeMap::new();
         for i in 0..local_count {
-            locals.insert(i as i16, CanonOperand::Const(0));
+            // Frame locals can inherit nonzero values from prior frames (`interpreter.rs:1210`).
+            locals.insert(i as i16, CanonOperand::InitLocal(i as u16));
         }
         Self { params, locals }
     }
@@ -2034,7 +2590,7 @@ impl LocalEnv {
     fn read(&self, scope: u8, idx: i16) -> CanonOperand {
         match scope {
             7 => CanonOperand::Const(idx),
-            9 | 22 => self
+            9 => self
                 .params
                 .get(&idx)
                 .copied()
@@ -2044,13 +2600,14 @@ impl LocalEnv {
                 .get(&idx)
                 .copied()
                 .unwrap_or(CanonOperand::Mem(scope, idx)),
+            // Scope 22 (`stack.attr[param[idx]]`) is external memory, NOT frame-private.
             _ => CanonOperand::Mem(scope, idx),
         }
     }
 
     fn write(&mut self, scope: u8, idx: i16, val: CanonOperand) {
         match scope {
-            9 | 22 => {
+            9 => {
                 self.params.insert(idx, val);
             }
             25 => {
@@ -2062,7 +2619,7 @@ impl LocalEnv {
 
     fn is_frame_private(&self, scope: u8, idx: i16) -> bool {
         match scope {
-            9 | 22 => self.params.contains_key(&idx),
+            9 => self.params.contains_key(&idx),
             25 => self.locals.contains_key(&idx),
             _ => false,
         }
@@ -2140,13 +2697,17 @@ fn eval_canon_assign(
 
 /// Checks whether a node is a pure silent step (a no-op comparison like `0 == 0`
 /// or a non-trapping write to a frame-private local/param).
+///
+/// Disabled when `uses_global_34` is true because every `Expression` initializes the
+/// VM scratch pointer (`expression.rs:51`), which is observable to subsequent Global 34 reads.
 fn try_silent_step(
     bhav: &BhavChunk,
     pc: u8,
     env: &mut LocalEnv,
     interner: &mut SymInterner,
+    uses_global_34: bool,
 ) -> Option<u8> {
-    if matches!(pc, TARGET_ERROR..=TARGET_FALSE) {
+    if uses_global_34 || matches!(pc, TARGET_ERROR..=TARGET_FALSE) {
         return None;
     }
     let ins = bhav.instructions.get(usize::from(pc))?;
@@ -2159,12 +2720,11 @@ fn try_silent_step(
     let lhs_scope = ins.operands[6];
     let rhs_scope = ins.operands[7];
 
-    if is_global_34(lhs_scope, lhs_idx) || is_global_34(rhs_scope, rhs_idx) {
-        return None;
-    }
-
     // 1. Constant-folded pure comparison (e.g., `0 == 0` jump node emitted by `lower.rs`).
-    if matches!(op, 0 | 1 | 2 | 8 | 14 | 15 | 16) {
+    if matches!(op, 0 | 1 | 2 | 8 | 14 | 15 | 16)
+        && (lhs_scope == 7 || env.is_frame_private(lhs_scope, lhs_idx))
+        && (rhs_scope == 7 || env.is_frame_private(rhs_scope, rhs_idx))
+    {
         let lhs = env.read(lhs_scope, lhs_idx);
         let rhs = env.read(rhs_scope, rhs_idx);
         if let Some((CanonPred::Const(b), t, f)) =
@@ -2174,8 +2734,6 @@ fn try_silent_step(
         }
         // Non-trapping pure comparison with identical targets is a pure jump.
         if ins.on_true == ins.on_false
-            && matches!(lhs_scope, 7 | 9 | 22 | 25)
-            && matches!(rhs_scope, 7 | 9 | 22 | 25)
             && (op != 8 || matches!(rhs, CanonOperand::Const(r) if (0..=16).contains(&r)))
         {
             return Some(ins.on_true);
@@ -2213,9 +2771,10 @@ fn advance_silent(
     env: &mut LocalEnv,
     interner: &mut SymInterner,
     limit: usize,
+    uses_global_34: bool,
 ) -> std::result::Result<u8, String> {
     for _ in 0..limit {
-        let Some(next) = try_silent_step(bhav, pc, env, interner) else {
+        let Some(next) = try_silent_step(bhav, pc, env, interner, uses_global_34) else {
             return Ok(pc);
         };
         pc = next;
@@ -2231,6 +2790,7 @@ struct ProductState {
     pc_b: u8,
     env_a: LocalEnv,
     env_b: LocalEnv,
+    constraints: BTreeMap<CanonPred, bool>,
 }
 
 /// Checks whether two BHAV chunks `a` and `b` are behaviorally trace-equivalent
@@ -2241,9 +2801,31 @@ struct ProductState {
 /// - Models pure `Expression` (`0x0002`) arithmetic and comparisons over symbolic/concrete `i16`.
 /// - Models world-interacting primitives and subroutines as canonical trace events.
 /// - Never reports false positives: returns [`EquivResult::Inconclusive`] if
-///   bounds are exceeded.
+///   bounds are exceeded or a layout-dependent call's callee arity is unknown.
 #[must_use]
 pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) -> EquivResult {
+    check_bhav_equivalent_with_arities(a, b, opts, None)
+}
+
+/// Like [`check_bhav_equivalent`], additionally accepting a known `(tree_id -> arg_count)`
+/// map so inline subroutine calls (`opcode >= 256`) can be verified soundly even when
+/// callers are reordered or pass >4 inline arguments across adjacent instruction bytes.
+#[must_use]
+pub fn check_bhav_equivalent_with_arities(
+    a: &BhavChunk,
+    b: &BhavChunk,
+    opts: &EquivOptions,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+) -> EquivResult {
+    if a.kind != b.kind {
+        return EquivResult::Counterexample {
+            path: Vec::new(),
+            divergence: format!(
+                "BHAV kind mismatch: A has kind {} vs B has kind {}",
+                a.kind, b.kind
+            ),
+        };
+    }
     if a.instructions.is_empty() && b.instructions.is_empty() {
         return EquivResult::Equivalent {
             states_checked: 1,
@@ -2255,6 +2837,18 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
             path: Vec::new(),
             divergence: format!(
                 "instruction emptiness mismatch: a has {} nodes, b has {} nodes",
+                a.instructions.len(),
+                b.instructions.len()
+            ),
+        };
+    }
+    // Kind-4 indexed-entry trees can be entered at any node (`interpreter.rs:1786`),
+    // so both trees must have identical entry-table length and match from every entry PC.
+    if a.kind == 4 && a.instructions.len() != b.instructions.len() {
+        return EquivResult::Counterexample {
+            path: Vec::new(),
+            divergence: format!(
+                "kind-4 indexed tree length mismatch: A has {} entries vs B has {}",
                 a.instructions.len(),
                 b.instructions.len()
             ),
@@ -2282,19 +2876,25 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
         _ => usize::from(b.locals),
     };
 
+    let uses_global_34 = bhav_uses_global_34(a) || bhav_uses_global_34(b);
     let mut interner = SymInterner::new();
-    let init = ProductState {
-        pc_a: 0,
-        pc_b: 0,
-        env_a: LocalEnv::new(args_a, locals_a),
-        env_b: LocalEnv::new(args_b, locals_b),
-    };
-
     let mut visited: BTreeSet<ProductState> = BTreeSet::new();
     let mut pc_pair_visits: BTreeMap<(u8, u8), usize> = BTreeMap::new();
     let mut queue: VecDeque<(ProductState, Vec<TraceStep>)> = VecDeque::new();
-    visited.insert(init.clone());
-    queue.push_back((init, Vec::new()));
+
+    let entry_count = if a.kind == 4 { a.instructions.len() } else { 1 };
+    for entry_pc in 0..entry_count {
+        let init = ProductState {
+            pc_a: entry_pc as u8,
+            pc_b: entry_pc as u8,
+            env_a: LocalEnv::new(args_a, locals_a),
+            env_b: LocalEnv::new(args_b, locals_b),
+            constraints: BTreeMap::new(),
+        };
+        if visited.insert(init.clone()) {
+            queue.push_back((init, Vec::new()));
+        }
+    }
 
     let mut states_checked = 0usize;
     let mut paths_verified = 0usize;
@@ -2319,6 +2919,7 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
             &mut state.env_a,
             &mut interner,
             opts.max_silent_steps,
+            uses_global_34,
         ) {
             Ok(pc) => pc,
             Err(reason) => return EquivResult::Inconclusive { reason },
@@ -2329,6 +2930,7 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
             &mut state.env_b,
             &mut interner,
             opts.max_silent_steps,
+            uses_global_34,
         ) {
             Ok(pc) => pc,
             Err(reason) => return EquivResult::Inconclusive { reason },
@@ -2355,20 +2957,21 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
         }
 
         // If we hit the same (pc_a, pc_b) loop header multiple times with identical
-        // frame-local environments on A and B, widen both sides symmetrically to shared
-        // symbolic tokens so unbounded identical loops prove equivalent in O(N) states!
+        // frame-local environments on A and B, widen both sides symmetrically to distinct
+        // `WidenedLocal`/`WidenedParam` tokens (never colliding with `Sym`) so unbounded
+        // identical loops prove equivalent in O(N) states!
         let pair_hits = pc_pair_visits.entry((pc_a, pc_b)).or_insert(0);
         *pair_hits += 1;
         if *pair_hits > 4 && state.env_a == state.env_b {
             let mut widened_a = state.env_a.clone();
             let mut widened_b = state.env_b.clone();
             for (&k, val_a) in &mut widened_a.locals {
-                let sym = CanonOperand::Sym(100_000 + u32::from(k as u16));
+                let sym = CanonOperand::WidenedLocal(k as u16);
                 *val_a = sym;
                 widened_b.locals.insert(k, sym);
             }
             for (&k, val_a) in &mut widened_a.params {
-                let sym = CanonOperand::Sym(200_000 + u32::from(k as u16));
+                let sym = CanonOperand::WidenedParam(k as u16);
                 *val_a = sym;
                 widened_b.params.insert(k, sym);
             }
@@ -2377,6 +2980,7 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
                 pc_b,
                 env_a: widened_a,
                 env_b: widened_b,
+                constraints: BTreeMap::new(),
             };
             if !visited.insert(widened.clone()) {
                 paths_verified += 1;
@@ -2402,6 +3006,13 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
         let pure_cmp_a = ins_a.opcode == 2 && matches!(ins_a.operands[5], 0 | 1 | 2 | 8 | 14..=16);
         let pure_cmp_b = ins_b.opcode == 2 && matches!(ins_b.operands[5], 0 | 1 | 2 | 8 | 14..=16);
         if pure_cmp_a && pure_cmp_b {
+            // Verify indirect scope-22 parameter indices match on both sides.
+            if let Err(msg) = check_expr_indirect_params(ins_a, ins_b, &state.env_a, &state.env_b) {
+                return EquivResult::Counterexample {
+                    path,
+                    divergence: format!("{msg} at A@n{pc_a} vs B@n{pc_b}"),
+                };
+            }
             let la = state
                 .env_a
                 .read(ins_a.operands[6], word_i16(&ins_a.operands, 0));
@@ -2437,12 +3048,20 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
             );
             match (norm_a, norm_b) {
                 (Some((pred_a, ta, fa)), Some((pred_b, tb, fb))) if pred_a == pred_b => {
-                    let mut enqueue = |na: u8, nb: u8, branch: bool| {
+                    let mut enqueue = |na: u8, nb: u8, branch: bool, record_pred: Option<bool>| {
+                        let mut next_constraints = state.constraints.clone();
+                        if let Some(outcome) = record_pred
+                            && !matches!(pred_a, CanonPred::Const(_))
+                            && next_constraints.len() < 16
+                        {
+                            next_constraints.insert(pred_a, outcome);
+                        }
                         let next = ProductState {
                             pc_a: na,
                             pc_b: nb,
                             env_a: state.env_a.clone(),
                             env_b: state.env_b.clone(),
+                            constraints: next_constraints,
                         };
                         if visited.insert(next.clone()) {
                             let mut next_path = path.clone();
@@ -2458,11 +3077,18 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
                         }
                     };
                     match pred_a {
-                        CanonPred::Const(true) => enqueue(ta, tb, true),
-                        CanonPred::Const(false) => enqueue(fa, fb, false),
+                        CanonPred::Const(true) => enqueue(ta, tb, true, None),
+                        CanonPred::Const(false) => enqueue(fa, fb, false, None),
                         _ => {
-                            enqueue(ta, tb, true);
-                            enqueue(fa, fb, false);
+                            // Prune contradictory branch outcomes on unchanged predicates.
+                            match state.constraints.get(&pred_a).copied() {
+                                Some(true) => enqueue(ta, tb, true, None),
+                                Some(false) => enqueue(fa, fb, false, None),
+                                None => {
+                                    enqueue(ta, tb, true, Some(true));
+                                    enqueue(fa, fb, false, Some(false));
+                                }
+                            }
                         }
                     }
                     continue;
@@ -2481,6 +3107,12 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
 
         // Case 2: Both are Expression assignments (or mutating comparisons 11/17).
         if ins_a.opcode == 2 && ins_b.opcode == 2 {
+            if let Err(msg) = check_expr_indirect_params(ins_a, ins_b, &state.env_a, &state.env_b) {
+                return EquivResult::Counterexample {
+                    path,
+                    divergence: format!("{msg} at A@n{pc_a} vs B@n{pc_b}"),
+                };
+            }
             let op_a = ins_a.operands[5];
             let op_b = ins_b.operands[5];
             let lhs_scope_a = ins_a.operands[6];
@@ -2530,13 +3162,17 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
                 }
             }
 
-            // Apply identical symbolic update to frame-private targets if applicable.
+            // Apply identical symbolic update to frame-private targets and invalidate any
+            // cached memory constraints when writing to external memory.
             let mut next_env_a = state.env_a.clone();
             let mut next_env_b = state.env_b.clone();
+            let mut next_constraints = state.constraints.clone();
             if next_env_a.is_frame_private(lhs_scope_a, lhs_idx_a) {
                 let sym = interner.fresh_event();
                 next_env_a.write(lhs_scope_a, lhs_idx_a, sym);
                 next_env_b.write(lhs_scope_b, lhs_idx_b, sym);
+            } else {
+                next_constraints.retain(|pred, _| !pred.touches_mem());
             }
 
             let mut enqueue = |na: u8, nb: u8, branch: Option<bool>| {
@@ -2545,6 +3181,7 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
                     pc_b: nb,
                     env_a: next_env_a.clone(),
                     env_b: next_env_b.clone(),
+                    constraints: next_constraints.clone(),
                 };
                 if visited.insert(next.clone()) {
                     let mut next_path = path.clone();
@@ -2591,6 +3228,43 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
             };
         }
 
+        // Verify layout-dependent inline subroutine calls (`opcode >= 256` with non-0xFF operands).
+        // Callees with >4 args read bytes from instructions following the call (`interpreter.rs:1542`).
+        if ins_a.opcode >= 256 && ins_a.operands != [0xFF; 8] {
+            match callee_arities.and_then(|m| m.get(&ins_a.opcode).copied()) {
+                Some(arity) if arity <= 4 => {}
+                Some(arity) => {
+                    let need = arity * 2;
+                    let bytes_a = collect_inline_call_arg_bytes(a, usize::from(pc_a), need);
+                    let bytes_b = collect_inline_call_arg_bytes(b, usize::from(pc_b), need);
+                    if bytes_a != bytes_b {
+                        return EquivResult::Counterexample {
+                            path,
+                            divergence: format!(
+                                "subroutine call #{} ({arity} inline args) extended argument bytes differ at A@n{pc_a} vs B@n{pc_b}",
+                                ins_a.opcode
+                            ),
+                        };
+                    }
+                }
+                None => {
+                    // Callee arity unknown: sound only if following instruction bytes match identically.
+                    let key =
+                        |ins: &Instruction| (ins.opcode, ins.on_true, ins.on_false, ins.operands);
+                    let next_a = a.instructions.get(usize::from(pc_a) + 1).map(key);
+                    let next_b = b.instructions.get(usize::from(pc_b) + 1).map(key);
+                    if next_a != next_b {
+                        return EquivResult::Inconclusive {
+                            reason: format!(
+                                "subroutine call #{} at A@n{pc_a}/B@n{pc_b} has unknown callee arity and differing following instruction layout",
+                                ins_a.opcode
+                            ),
+                        };
+                    }
+                }
+            }
+        }
+
         // Verify any frame-private operands read by this primitive evaluate identically on A and B.
         if let Err(msg) =
             check_primitive_frame_reads(ins_a.opcode, &ins_a.operands, &state.env_a, &state.env_b)
@@ -2601,49 +3275,86 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
             };
         }
 
-        // Update any frame-private slots mutated by this primitive identically on both sides.
-        let mut next_env_a = state.env_a.clone();
-        let mut next_env_b = state.env_b.clone();
+        // Random (opcode 8): when range resolves to Global 34, the VM redirects the store
+        // to the range cell (`random.rs:38`), so treat that aliasing pattern as Inconclusive.
+        if ins_a.opcode == 8 {
+            let dst_scope = u16::from_le_bytes([ins_a.operands[2], ins_a.operands[3]]);
+            let rng_scope = u16::from_le_bytes([ins_a.operands[6], ins_a.operands[7]]);
+            let rng_idx = word_i16(&ins_a.operands, 4);
+            if (rng_scope == 6 && rng_idx == 34) || dst_scope == 22 {
+                return EquivResult::Inconclusive {
+                    reason: format!(
+                        "Random instruction at A@n{pc_a}/B@n{pc_b} uses unmodeled Global 34 / scope 22 aliasing"
+                    ),
+                };
+            }
+        }
+
+        // Any world-interacting step may mutate external memory; retain only pure frame constraints.
+        let mut base_constraints = state.constraints.clone();
+        base_constraints.retain(|pred, _| !pred.touches_mem());
+
+        // Compute branch-specific frame-private updates (`Animate` only stores an event on `false`!).
+        let mut env_true_a = state.env_a.clone();
+        let mut env_true_b = state.env_b.clone();
+        let mut env_false_a = state.env_a.clone();
+        let mut env_false_b = state.env_b.clone();
         match ins_a.opcode {
             0 => {
                 let p = word_i16(&ins_a.operands, 0);
-                next_env_a.write(9, p, CanonOperand::Const(0));
-                next_env_b.write(9, p, CanonOperand::Const(0));
+                env_true_a.write(9, p, CanonOperand::Const(0));
+                env_true_b.write(9, p, CanonOperand::Const(0));
+                env_false_a.write(9, p, CanonOperand::Const(0));
+                env_false_b.write(9, p, CanonOperand::Const(0));
             }
             17 => {
                 let p = word_i16(&ins_a.operands, 0);
                 let sym = interner.fresh_event();
-                next_env_a.write(9, p, sym);
-                next_env_b.write(9, p, sym);
+                env_true_a.write(9, p, sym);
+                env_true_b.write(9, p, sym);
+                env_false_a.write(9, p, sym);
+                env_false_b.write(9, p, sym);
             }
             8 => {
                 let dst_scope = u16::from_le_bytes([ins_a.operands[2], ins_a.operands[3]]);
                 let dst_idx = word_i16(&ins_a.operands, 0);
-                if dst_scope <= 255 {
+                if matches!(dst_scope, 9 | 25) {
                     let sym = interner.fresh_event();
-                    next_env_a.write(dst_scope as u8, dst_idx, sym);
-                    next_env_b.write(dst_scope as u8, dst_idx, sym);
+                    env_true_a.write(dst_scope as u8, dst_idx, sym);
+                    env_true_b.write(dst_scope as u8, dst_idx, sym);
+                    env_false_a.write(dst_scope as u8, dst_idx, sym);
+                    env_false_b.write(dst_scope as u8, dst_idx, sym);
                 }
             }
             31 if ins_a.operands[4] & 0x80 != 0 => {
                 let sym = interner.fresh_event();
-                next_env_a.write(ins_a.operands[5], i16::from(ins_a.operands[7]), sym);
-                next_env_b.write(ins_b.operands[5], i16::from(ins_b.operands[7]), sym);
+                env_true_a.write(ins_a.operands[5], i16::from(ins_a.operands[7]), sym);
+                env_true_b.write(ins_b.operands[5], i16::from(ins_b.operands[7]), sym);
+                env_false_a.write(ins_a.operands[5], i16::from(ins_a.operands[7]), sym);
+                env_false_b.write(ins_b.operands[5], i16::from(ins_b.operands[7]), sym);
             }
-            44 if ins_a.operands[5] & 0x20 != 0 => {
+            44 => {
+                // `Animate` (`animate.rs:139-289`): `on_true` finishes without calling `store_event`;
+                // `on_false` stores the event into `local[ops[2]]` (flag 0x20) or `param[0]`.
                 let sym = interner.fresh_event();
-                next_env_a.write(25, i16::from(ins_a.operands[2]), sym);
-                next_env_b.write(25, i16::from(ins_b.operands[2]), sym);
+                if ins_a.operands[5] & 0x20 != 0 {
+                    env_false_a.write(25, i16::from(ins_a.operands[2]), sym);
+                    env_false_b.write(25, i16::from(ins_b.operands[2]), sym);
+                } else {
+                    env_false_a.write(9, 0, sym);
+                    env_false_b.write(9, 0, sym);
+                }
             }
             _ => {}
         }
 
-        let mut enqueue = |na: u8, nb: u8, branch: Option<bool>| {
+        let mut enqueue = |na: u8, nb: u8, ea: LocalEnv, eb: LocalEnv, branch: Option<bool>| {
             let next = ProductState {
                 pc_a: na,
                 pc_b: nb,
-                env_a: next_env_a.clone(),
-                env_b: next_env_b.clone(),
+                env_a: ea,
+                env_b: eb,
+                constraints: base_constraints.clone(),
             };
             if visited.insert(next.clone()) {
                 let mut next_path = path.clone();
@@ -2660,16 +3371,72 @@ pub fn check_bhav_equivalent(a: &BhavChunk, b: &BhavChunk, opts: &EquivOptions) 
         };
 
         if is_always_true_instruction(ins_a) {
-            enqueue(ins_a.on_true, ins_b.on_true, None);
+            enqueue(ins_a.on_true, ins_b.on_true, env_true_a, env_true_b, None);
         } else {
-            enqueue(ins_a.on_true, ins_b.on_true, Some(true));
-            enqueue(ins_a.on_false, ins_b.on_false, Some(false));
+            enqueue(
+                ins_a.on_true,
+                ins_b.on_true,
+                env_true_a,
+                env_true_b,
+                Some(true),
+            );
+            enqueue(
+                ins_a.on_false,
+                ins_b.on_false,
+                env_false_a,
+                env_false_b,
+                Some(false),
+            );
         }
     }
 
     EquivResult::Equivalent {
         states_checked,
         paths_verified,
+    }
+}
+
+fn check_expr_indirect_params(
+    ins_a: &Instruction,
+    ins_b: &Instruction,
+    env_a: &LocalEnv,
+    env_b: &LocalEnv,
+) -> std::result::Result<(), String> {
+    if ins_a.operands[6] == 22 || ins_b.operands[6] == 22 {
+        let ia = word_i16(&ins_a.operands, 0);
+        let ib = word_i16(&ins_b.operands, 0);
+        if ins_a.operands[6] != ins_b.operands[6] || env_a.read(9, ia) != env_b.read(9, ib) {
+            return Err("scope 22 LHS indirect parameter index divergence".to_owned());
+        }
+    }
+    if ins_a.operands[7] == 22 || ins_b.operands[7] == 22 {
+        let ia = word_i16(&ins_a.operands, 2);
+        let ib = word_i16(&ins_b.operands, 2);
+        if ins_a.operands[7] != ins_b.operands[7] || env_a.read(9, ia) != env_b.read(9, ib) {
+            return Err("scope 22 RHS indirect parameter index divergence".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn collect_inline_call_arg_bytes(bhav: &BhavChunk, call_pc: usize, need: usize) -> Option<Vec<u8>> {
+    let call = bhav.instructions.get(call_pc)?;
+    let mut buf = Vec::with_capacity(need.max(8));
+    buf.extend_from_slice(&call.operands);
+    for next in bhav.instructions.iter().skip(call_pc + 1) {
+        if buf.len() >= need {
+            break;
+        }
+        buf.extend_from_slice(&next.opcode.to_le_bytes());
+        buf.push(next.on_true);
+        buf.push(next.on_false);
+        buf.extend_from_slice(&next.operands);
+    }
+    if buf.len() < need {
+        None
+    } else {
+        buf.truncate(need);
+        Some(buf)
     }
 }
 
@@ -2680,9 +3447,10 @@ fn check_primitive_frame_reads(
     env_b: &LocalEnv,
 ) -> std::result::Result<(), String> {
     let check_op = |scope: u8, idx: i16, label: &str| -> std::result::Result<(), String> {
-        if matches!(scope, 9 | 22 | 25) {
-            let va = env_a.read(scope, idx);
-            let vb = env_b.read(scope, idx);
+        let effective_scope = if scope == 22 { 9 } else { scope };
+        if matches!(effective_scope, 9 | 25) {
+            let va = env_a.read(effective_scope, idx);
+            let vb = env_b.read(effective_scope, idx);
             if va != vb {
                 return Err(format!("{label} value divergence: {va:?} != {vb:?}"));
             }
@@ -2782,14 +3550,30 @@ fn format_pc(pc: u8) -> String {
     }
 }
 
-/// Convenience helper for CLI `sims-antics equiv`: parses a raw IFF file in memory and
-/// extracts a single [`BhavChunk`] by tree ID.
+/// Convenience helper for CLI `sims-antics equiv`: parses a raw IFF file in memory,
+/// extracts a single [`BhavChunk`] by tree ID, and also collects all BHAV arities present
+/// in that IFF for sound inline-call checking.
 pub fn extract_bhav_from_iff(iff_bytes: &[u8], tree_id: u16) -> Result<BhavChunk> {
     let iff = Iff::parse(iff_bytes.to_vec())?;
     let chunk = iff
         .get(b"BHAV", tree_id)
         .ok_or_else(|| Error::new(format!("IFF does not contain BHAV #{tree_id}")))?;
     crate::lift::lift_bhav(chunk.id, &chunk.label, iff.data(chunk))
+}
+
+/// Extracts `(tree_id -> arg_count)` for every valid BHAV chunk inside a raw IFF.
+pub fn extract_bhav_arities_from_iff(iff_bytes: &[u8]) -> Result<BTreeMap<u16, usize>> {
+    let iff = Iff::parse(iff_bytes.to_vec())?;
+    let mut arities = BTreeMap::new();
+    for chunk in iff.all(b"BHAV") {
+        if chunk.flags & DELETED != 0 {
+            continue;
+        }
+        if let Ok(bhav) = Behavior::parse(iff.data(chunk)) {
+            arities.insert(chunk.id, bhav_param_limit(&bhav));
+        }
+    }
+    Ok(arities)
 }
 
 #[cfg(test)]
@@ -3026,6 +3810,210 @@ mod tests {
                 .any(|v| v.category == SafetyCategory::LockLeak),
             "expected LockLeak in {:?}",
             report.violations
+        );
+    }
+
+    #[test]
+    fn sol_round1_verifier_soundness_regressions() {
+        // 1. Opcode 38 (unimplemented in sims-vm), reachable TARGET_ERROR, invalid scope 255,
+        //    and dynamic divisor `/` must all be rejected by the safety prover.
+        let manifest = r#"
+            [object]
+            name = "TrapTester"
+            guid = 0x7F00_9992
+            init = "Init"
+            main = "Main"
+            scripts = ["behavior.antics"]
+        "#;
+        let trap_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4097 "Main" (args: 1) {
+                op 0x0026 (0, 0, 0, 0, 0, 0, 0, 0) -> true: 1, false: error;
+                op 0x0002 (0, 0, 0, 0, 0, 7, 0, 9) -> true: 2, false: true;
+                op 0x0002 (0, 0, 0, 0, 0, 2, 255, 7) -> true: true, false: false;
+            }
+        "#;
+        let compiled =
+            compile_object_from_sources(manifest, &[("behavior.antics", trap_script)]).unwrap();
+        let report = verify_object_safety(&compiled).unwrap();
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::InvalidOpcode),
+            "opcode 38 must be rejected: {:?}",
+            report.violations
+        );
+        let trap_count = report
+            .violations
+            .iter()
+            .filter(|v| v.category == SafetyCategory::PotentialTrap)
+            .count();
+        assert!(
+            trap_count >= 3,
+            "expected >=3 PotentialTrap violations (TARGET_ERROR, dynamic div, scope 255), got {trap_count}: {:?}",
+            report.violations
+        );
+
+        // 2. Unknown-value write to a guarded lock attribute followed by priority==0 cancel exit
+        //    must be caught as LockLeak!
+        let unknown_lock_manifest = r#"
+            [object]
+            name = "UnknownLockObj"
+            guid = 0x7F00_9993
+            init = "Init"
+            main = "Main"
+            scripts = ["behavior.antics"]
+
+            [[interaction]]
+            name = "Use"
+            action = "Use"
+            guard = "CanUse"
+        "#;
+        let unknown_lock_script = r#"
+            tree 4096 "Init" { my.attr[0] := 0; return true; }
+            tree 4097 "Main" { return true; }
+            tree 4098 "CanUse" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            interaction 4099 "Use" (args: 1) {
+                stack.attr[0] := param[0];
+                if my.person.priority == 0 {
+                    return false;
+                }
+                stack.attr[0] := 0;
+                return true;
+            }
+        "#;
+        let ul_obj = compile_object_from_sources(
+            unknown_lock_manifest,
+            &[("behavior.antics", unknown_lock_script)],
+        )
+        .unwrap();
+        let ul_report = verify_object_safety(&ul_obj).unwrap();
+        assert!(
+            ul_report
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::LockLeak),
+            "unknown write to lock attr + cancel exit must trigger LockLeak: {:?}",
+            ul_report.violations
+        );
+
+        // 3. `0 == 0` before a Global 34 RHS read must NOT be silently erased (scratch ptr init!).
+        let g34_a = &compile_antics(
+            r#"
+            tree 4096 "WithInit" {
+                op 0x0002 (0, 0, 0, 0, 0, 2, 7, 7) -> true: 1, false: 1;
+                op 0x0002 (0, 0, 34, 0, 0, 5, 8, 6) -> true: true, false: true;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let g34_b = &compile_antics(
+            r#"
+            tree 4096 "WithoutInit" {
+                op 0x0002 (0, 0, 34, 0, 0, 5, 8, 6) -> true: true, false: true;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        assert!(
+            matches!(
+                check_bhav_equivalent(g34_a, g34_b, &EquivOptions::default()),
+                EquivResult::Counterexample { .. }
+            ),
+            "0==0 before Global 34 read must not be folded away"
+        );
+
+        // 4. Scope 22 (`stack.attr[param[0]]`) write must NOT be silently erased as frame-private!
+        let s22_a = &compile_antics(
+            r#"
+            tree 4096 "Scope22Write" (args: 1) {
+                op 0x0002 (0, 0, 1, 0, 0, 5, 22, 7) -> true: true, false: true;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let s22_b = &compile_antics(
+            r#"
+            tree 4096 "EmptyReturn" (args: 1) {
+                return true;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        assert!(
+            matches!(
+                check_bhav_equivalent(s22_a, s22_b, &EquivOptions::default()),
+                EquivResult::Counterexample { .. }
+            ),
+            "scope 22 write must not be erased as frame-private"
+        );
+
+        // 5. Animate `on_true` branch must NOT fabricate equality for pre-existing local values!
+        let anim_a = &compile_antics(
+            r#"
+            tree 4096 "AnimA" (locals: 1) {
+                op 0x0002 (0, 0, 1, 0, 0, 5, 25, 7) -> true: 1, false: 1;
+                op 0x002c (0, 0, 0, 0, 0, 32, 0, 0) -> true: 2, false: false;
+                op 0x0002 (0, 0, 0, 0, 0, 5, 8, 25) -> true: true, false: true;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let anim_b = &compile_antics(
+            r#"
+            tree 4096 "AnimB" (locals: 1) {
+                op 0x0002 (0, 0, 2, 0, 0, 5, 25, 7) -> true: 1, false: 1;
+                op 0x002c (0, 0, 0, 0, 0, 32, 0, 0) -> true: 2, false: false;
+                op 0x0002 (0, 0, 0, 0, 0, 5, 8, 25) -> true: true, false: true;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        assert!(
+            matches!(
+                check_bhav_equivalent(anim_a, anim_b, &EquivOptions::default()),
+                EquivResult::Counterexample { .. }
+            ),
+            "Animate on_true does not overwrite local[0]; divergent values must be caught"
+        );
+
+        // 6. Kind-4 indexed tree entry mismatch must be caught!
+        let k4_a = &compile_antics(
+            r#"
+            tree 4096 "Kind4A" (kind: 4) {
+                op 0x0002 (0, 0, 1, 0, 0, 5, 8, 7) -> true: true, false: true;
+                op 0x0002 (0, 0, 2, 0, 0, 5, 8, 7) -> true: true, false: true;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let k4_b = &compile_antics(
+            r#"
+            tree 4096 "Kind4B" (kind: 4) {
+                op 0x0002 (0, 0, 1, 0, 0, 5, 8, 7) -> true: true, false: true;
+                op 0x0002 (0, 0, 9, 0, 0, 5, 8, 7) -> true: true, false: true;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        assert!(
+            matches!(
+                check_bhav_equivalent(k4_a, k4_b, &EquivOptions::default()),
+                EquivResult::Counterexample { .. }
+            ),
+            "kind-4 indexed entry divergence at node 1 must be caught"
         );
     }
 }

@@ -69,6 +69,27 @@ wall_pattern = 32
 wall_style = 1
 enclose_walls = false
 
+# Traversable doorways connecting every room and the front porch
+[[doorway]]
+x = 30
+y = 27
+side = "west"
+
+[[doorway]]
+x = 25
+y = 24
+side = "north"
+
+[[doorway]]
+x = 29
+y = 21
+side = "west"
+
+[[doorway]]
+x = 26
+y = 31
+side = "north"
+
 # Starter Cottage Furniture Placements (all household essentials)
 [[placement]]
 object = "open-double-bed"

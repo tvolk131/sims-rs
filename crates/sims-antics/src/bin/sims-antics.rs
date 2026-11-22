@@ -8,8 +8,10 @@
 //! - `sims-antics build <pack_dir> --out <dir>`
 
 use sims_antics::{
-    EquivOptions, EquivResult, check_bhav_equivalent, compile_antics, compile_pack_dir,
-    compile_standalone_pack_dir, verify::extract_bhav_from_iff, verify_pack_safety,
+    EquivOptions, EquivResult, check_bhav_equivalent_with_arities, compile_antics,
+    compile_pack_dir, compile_standalone_pack_dir,
+    verify::{extract_bhav_arities_from_iff, extract_bhav_from_iff},
+    verify_pack_safety,
 };
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -124,7 +126,8 @@ fn ensure_real_dir(path: &Path, expected_parent_canon: Option<&Path>) -> Result<
 }
 
 /// Writes `bytes` into `parent_canon/<filename>` via an exclusive temp file (`O_CREAT | O_EXCL`)
-/// followed by atomic rename, refusing to create or overwrite any symlink or non-regular file.
+/// followed by atomic rename, refusing to create or overwrite any symlink or non-regular file and
+/// verifying parent directory identity `(dev, ino)` before commit.
 fn write_contained_file(parent_canon: &Path, filename: &str, bytes: &[u8]) -> Result<(), String> {
     let mut comps = Path::new(filename).components();
     match (comps.next(), comps.next()) {
@@ -134,6 +137,52 @@ fn write_contained_file(parent_canon: &Path, filename: &str, bytes: &[u8]) -> Re
         }
     }
 
+    let parent_pin = std::fs::File::open(parent_canon).map_err(|e| {
+        format!(
+            "failed to pin output directory {}: {e}",
+            parent_canon.display()
+        )
+    })?;
+    let parent_meta = parent_pin.metadata().map_err(|e| {
+        format!(
+            "failed to stat output directory {}: {e}",
+            parent_canon.display()
+        )
+    })?;
+    if !parent_meta.file_type().is_dir() {
+        return Err(format!(
+            "output parent {} is not a directory",
+            parent_canon.display()
+        ));
+    }
+
+    let verify_parent_unchanged = || -> Result<(), String> {
+        let cur_meta = std::fs::symlink_metadata(parent_canon).map_err(|e| {
+            format!(
+                "failed to re-inspect output directory {}: {e}",
+                parent_canon.display()
+            )
+        })?;
+        if cur_meta.file_type().is_symlink() || !cur_meta.file_type().is_dir() {
+            return Err(format!(
+                "output directory {} was replaced by a symlink or non-directory",
+                parent_canon.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if cur_meta.dev() != parent_meta.dev() || cur_meta.ino() != parent_meta.ino() {
+                return Err(format!(
+                    "output directory {} changed during write",
+                    parent_canon.display()
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    verify_parent_unchanged()?;
     let dest = parent_canon.join(filename);
     if let Ok(meta) = std::fs::symlink_metadata(&dest)
         && (meta.file_type().is_symlink() || !meta.file_type().is_file())
@@ -159,8 +208,11 @@ fn write_contained_file(parent_canon: &Path, filename: &str, bytes: &[u8]) -> Re
     }
     drop(tmp_file);
 
-    // Re-check destination immediately before atomic rename (rename itself never follows a
-    // destination symlink target, and this rejects pre-existing symlinks/directories cleanly).
+    // Re-verify parent identity and destination immediately before atomic rename.
+    if let Err(e) = verify_parent_unchanged() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
     if let Ok(meta) = std::fs::symlink_metadata(&dest)
         && (meta.file_type().is_symlink() || !meta.file_type().is_file())
     {
@@ -291,8 +343,22 @@ fn run() -> Result<(), String> {
             let iff_bytes = std::fs::read(&iff_path)
                 .map_err(|e| format!("failed to read {}: {e}", iff_path.display()))?;
             let bhav_b = extract_bhav_from_iff(&iff_bytes, tree_id).map_err(|e| e.to_string())?;
+            let mut arities = extract_bhav_arities_from_iff(&iff_bytes).unwrap_or_default();
+            for (&id, bhav) in &compiled.behaviors {
+                let argc = match bhav.format {
+                    0x8000 => 4,
+                    0x8001 => usize::from(bhav.args).min(4),
+                    _ => usize::from(bhav.args),
+                };
+                arities.entry(id).or_insert(argc);
+            }
 
-            match check_bhav_equivalent(bhav_a, &bhav_b, &EquivOptions::default()) {
+            match check_bhav_equivalent_with_arities(
+                bhav_a,
+                &bhav_b,
+                &EquivOptions::default(),
+                Some(&arities),
+            ) {
                 EquivResult::Equivalent {
                     states_checked,
                     paths_verified,
@@ -339,17 +405,29 @@ fn run() -> Result<(), String> {
             let pack_dir = pack_dir.ok_or_else(|| "build requires <pack_dir>".to_owned())?;
             let out_dir = out_dir.ok_or_else(|| "build requires --out <dir>".to_owned())?;
 
-            let has_world = std::fs::symlink_metadata(pack_dir.join("surfaces.toml"))
-                .is_ok_and(|m| m.file_type().is_file())
-                && std::fs::symlink_metadata(pack_dir.join("starter-house.toml"))
-                    .is_ok_and(|m| m.file_type().is_file());
-            let out_canon = ensure_real_dir(&out_dir, None)?;
-            let objects_canon = ensure_real_dir(&out_canon.join("objects"), Some(&out_canon))?;
-            let sounds_canon = ensure_real_dir(&out_canon.join("sounds"), Some(&out_canon))?;
+            let surfaces_stat = std::fs::symlink_metadata(pack_dir.join("surfaces.toml"));
+            let house_stat = std::fs::symlink_metadata(pack_dir.join("starter-house.toml"));
+            let has_world = !matches!(
+                (&surfaces_stat, &house_stat),
+                (Err(e1), Err(e2))
+                    if e1.kind() == std::io::ErrorKind::NotFound
+                        && e2.kind() == std::io::ErrorKind::NotFound
+            );
 
             if has_world {
+                // Compile and validate world manifests BEFORE creating any output directories.
                 let standalone =
                     compile_standalone_pack_dir(&pack_dir).map_err(|e| e.to_string())?;
+                let out_canon = ensure_real_dir(&out_dir, None)?;
+                let objects_canon = ensure_real_dir(&out_canon.join("objects"), Some(&out_canon))?;
+                let sounds_canon = ensure_real_dir(&out_canon.join("sounds"), Some(&out_canon))?;
+                let floors_canon = ensure_real_dir(&out_canon.join("floors"), Some(&out_canon))?;
+                let walls_canon = ensure_real_dir(&out_canon.join("walls"), Some(&out_canon))?;
+                let chars_canon = ensure_real_dir(&out_canon.join("characters"), Some(&out_canon))?;
+                let houses_canon = ensure_real_dir(&out_canon.join("houses"), Some(&out_canon))?;
+                let nbhd_canon =
+                    ensure_real_dir(&out_canon.join("neighborhood"), Some(&out_canon))?;
+
                 write_contained_file(
                     &out_canon,
                     &standalone.pack.archive_name,
@@ -361,16 +439,14 @@ fn run() -> Result<(), String> {
                 for (name, wav) in &standalone.pack.sounds_wav {
                     write_contained_file(&sounds_canon, &format!("{name}.wav"), wav)?;
                 }
-                let floors_canon = ensure_real_dir(&out_canon.join("floors"), Some(&out_canon))?;
-                let walls_canon = ensure_real_dir(&out_canon.join("walls"), Some(&out_canon))?;
-                let houses_canon = ensure_real_dir(&out_canon.join("houses"), Some(&out_canon))?;
-                let nbhd_canon =
-                    ensure_real_dir(&out_canon.join("neighborhood"), Some(&out_canon))?;
                 for (name, bytes) in &standalone.floors {
                     write_contained_file(&floors_canon, name, bytes)?;
                 }
                 for (name, bytes) in &standalone.walls {
                     write_contained_file(&walls_canon, name, bytes)?;
+                }
+                for (name, bytes) in &standalone.characters {
+                    write_contained_file(&chars_canon, name, bytes)?;
                 }
                 write_contained_file(
                     &houses_canon,
@@ -383,13 +459,14 @@ fn run() -> Result<(), String> {
                     &standalone.neighborhood_iff,
                 )?;
                 println!(
-                    "Built standalone {} v{} -> {} ({} objects, {} floors, {} walls, {}, {} sims, {} bytes FAR, {} WAVs)",
+                    "Built standalone {} v{} -> {} ({} objects, {} floors, {} walls, {} chars, {}, {} sims, {} bytes FAR, {} WAVs)",
                     standalone.pack.name,
                     standalone.pack.version,
                     out_dir.display(),
                     standalone.pack.objects.len(),
                     standalone.floors.len(),
                     standalone.walls.len(),
+                    standalone.characters.len(),
                     standalone.house_iff_name,
                     standalone.starter_sims.len(),
                     standalone.pack.far_bytes.len(),
@@ -398,6 +475,9 @@ fn run() -> Result<(), String> {
                 Ok(())
             } else {
                 let compiled = compile_pack_dir(&pack_dir).map_err(|e| e.to_string())?;
+                let out_canon = ensure_real_dir(&out_dir, None)?;
+                let objects_canon = ensure_real_dir(&out_canon.join("objects"), Some(&out_canon))?;
+                let sounds_canon = ensure_real_dir(&out_canon.join("sounds"), Some(&out_canon))?;
                 write_contained_file(&out_canon, &compiled.archive_name, &compiled.far_bytes)?;
 
                 for entry in &compiled.objects {

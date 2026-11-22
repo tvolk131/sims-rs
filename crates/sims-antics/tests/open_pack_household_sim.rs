@@ -11,17 +11,17 @@
 //!    Mechanical skill study, `alter_budget` bill payment, and mid-loop native
 //!    `vm.cancel` cleanup with **0 VM traps**!
 
-use sims_antics::{compile_antics, compile_standalone_pack_dir, verify_pack_safety};
+use sims_antics::{compile_standalone_pack_dir, verify_pack_safety};
 use sims_content::Catalog;
 use sims_core::GameRng;
 use sims_formats::behavior::{Behavior, InteractionTable};
-use sims_formats::execution::{ObjectFunction, ObjectFunctions, Slots, constants};
+use sims_formats::execution::{ObjectFunctions, Slots, constants};
 use sims_formats::far;
 use sims_formats::iff::Iff;
-use sims_formats::lot::{Array as LotArray, House, HouseView, ObjectTypes, Simulator, surface_map};
+use sims_formats::lot::Array as LotArray;
 use sims_formats::neighborhood::{Family, Neighborhood, Neighbors};
 use sims_formats::saved_objects::{
-    Frame, Interaction as SavedInteraction, Objects as SavedObjects, Person, Slot as SavedSlot,
+    Frame, Interaction as SavedInteraction, Person, Slot as SavedSlot,
 };
 use sims_formats::sprite::{DrawGroup, LegacySpriteSet, Palette, SpriteSet, render};
 use sims_formats::strings::StringTable;
@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 const SIM_GUID: u32 = 0x7F00_0101;
+const SIM2_GUID: u32 = 0x7F00_0102;
 const TOILET_GUID: u32 = 0x7F00_0050;
 const SOFA_GUID: u32 = 0x7F00_0051;
 const TV_GUID: u32 = 0x7F00_0052;
@@ -412,59 +413,181 @@ fn standalone_open_pack_builds_verifies_safety_and_validates_all_formats() {
         }
     }
 
-    // 6. Validate House01.iff through sims_formats::lot & saved_objects.
-    let house_iff = Iff::parse(standalone.house_iff.clone()).expect("House01.iff parse failed");
-    let view = HouseView::parse(house_iff.data(house_iff.get(b"HOUS", 0).unwrap())).unwrap();
-    assert_eq!(view.roof, "open_shingle");
-    let model = House::parse(house_iff.data(house_iff.get(b"HOUS", 1).unwrap())).unwrap();
-    assert_eq!(model.name, "Open Starter Cottage");
-    let simi = Simulator::parse(house_iff.data(house_iff.get(b"SIMI", 1).unwrap())).unwrap();
-    assert_eq!(simi.funds, 20_000);
-    assert_eq!(simi.globals.len(), 64);
-    let flrm = surface_map(house_iff.data(house_iff.get(b"FLRm", 1).unwrap()), 1, true).unwrap();
-    assert_eq!(flrm.len(), 4);
-    let walm = surface_map(house_iff.data(house_iff.get(b"WALm", 1).unwrap()), 1, false).unwrap();
-    assert_eq!(walm.len(), 4);
-    for arry_id in [0u16, 4, 11, 12, 3, 8, 111, 112, 103, 108, 6, 7, 9, 10] {
-        let arr =
-            LotArray::parse(house_iff.data(house_iff.get(b"ARRY", arry_id).unwrap())).unwrap();
-        assert_eq!((arr.width, arr.height), (64, 64));
+    // 6. Validate House01.iff through the REAL `sims_content::House::parse_bytes` loader
+    //    (using a real Catalog built strictly from `standalone.pack.objects` +
+    //    `standalone.characters`), `World::read_arrays`, and `World::rebuild_rooms`!
+    assert_eq!(standalone.characters.len(), 2);
+    let mut real_catalog = Catalog {
+        global: 0,
+        objects: Vec::new(),
+        by_guid: BTreeMap::new(),
+        semi_globals: BTreeMap::new(),
+        diagnostics: Vec::new(),
+    };
+    let mut res_idx = 1usize;
+    for entry in &standalone.pack.objects {
+        let iff = Iff::parse(entry.object.iff_bytes.clone()).unwrap();
+        let _ = load_iff_into_vm(&iff, res_idx, &mut real_catalog);
+        res_idx += 1;
     }
-    let objt = ObjectTypes::parse(house_iff.data(house_iff.get(b"OBJT", 1).unwrap())).unwrap();
-    let multi_guids: BTreeSet<u32> = standalone
-        .pack
-        .objects
-        .iter()
-        .filter(|o| !o.object.tile_guids.is_empty())
-        .flat_map(|o| std::iter::once(o.object.guid).chain(o.object.tile_guids.iter().copied()))
-        .collect();
-    let objm = SavedObjects::parse(
-        house_iff.data(house_iff.get(b"OBJM", 1).unwrap()),
-        &objt,
-        |guid| Some(multi_guids.contains(&guid)),
+    for char_bytes in standalone.characters.values() {
+        let iff = Iff::parse(char_bytes.clone()).unwrap();
+        let _ = load_iff_into_vm(&iff, res_idx, &mut real_catalog);
+        res_idx += 1;
+    }
+
+    let parsed_house = sims_content::House::parse_bytes(
+        standalone.house_iff.clone(),
+        std::path::Path::new("House01.iff"),
+        &real_catalog,
     )
-    .expect("OBJM parse failed");
+    .expect("sims_content::House::parse_bytes failed on generated House01.iff");
+    assert_eq!(parsed_house.view.as_ref().unwrap().roof, "open_shingle");
     assert_eq!(
-        objm.instances.len(),
-        standalone.placements.len() + standalone.starter_sims.len()
+        parsed_house.model.as_ref().unwrap().name,
+        "Open Starter Cottage"
     );
-    let saved_persons = objm
+    assert_eq!(parsed_house.simulator.funds, 20_000);
+    assert_eq!(parsed_house.simulator.globals.len(), 64);
+    assert_eq!(parsed_house.floor_map.as_ref().unwrap().len(), 4);
+    assert_eq!(parsed_house.wall_map.as_ref().unwrap().len(), 4);
+    assert_eq!(parsed_house.arrays.len(), 14);
+    assert_eq!(
+        parsed_house.arrays[&0].stride, 4,
+        "height array stride must be 4"
+    );
+    assert!(
+        parsed_house.arrays[&9].data.iter().all(|&b| b == 0xff),
+        "pool array #9 must be dry (0xff)"
+    );
+    assert!(
+        parsed_house.arrays[&10].data.iter().all(|&b| b == 0xff),
+        "water array #10 must be dry (0xff)"
+    );
+
+    // Multi-tile double bed has 2 tile instances (lead 0x7F00_0010 + slave 0x7F00_0011 with parent).
+    let expected_instances = standalone.placements.len() + 1 + standalone.starter_sims.len();
+    assert_eq!(parsed_house.objects.instances.len(), expected_instances);
+    let bed_lead = parsed_house
+        .objects
+        .instances
+        .values()
+        .find(|i| i.guid == 0x7F00_0010)
+        .expect("missing double bed lead tile");
+    let bed_slave = parsed_house
+        .objects
+        .instances
+        .values()
+        .find(|i| i.guid == 0x7F00_0011)
+        .expect("missing double bed slave tile");
+    assert_eq!(bed_lead.multipart.as_ref().unwrap().parent, 0);
+    assert_eq!(
+        bed_slave.multipart.as_ref().unwrap().parent,
+        bed_lead.id as i16
+    );
+    assert_eq!(
+        World::tile(bed_slave.position),
+        [
+            World::tile(bed_lead.position)[0] + 1,
+            World::tile(bed_lead.position)[1],
+            1
+        ]
+    );
+
+    let saved_persons: Vec<_> = parsed_house
+        .objects
         .instances
         .values()
         .filter(|inst| inst.person.is_some())
-        .count();
+        .collect();
     assert_eq!(
-        saved_persons, 2,
+        saved_persons.len(),
+        2,
         "expected 2 saved starter Sims in House01.iff"
     );
-    // Verify subtile OBJM positions match ARRY #3 tile grid (`World::tile(pos)`).
-    let grid_arr = LotArray::parse(house_iff.data(house_iff.get(b"ARRY", 3).unwrap())).unwrap();
-    for inst in objm.instances.values() {
+    for sim_inst in &saved_persons {
+        assert_eq!(
+            sim_inst.footprint[2] - sim_inst.footprint[0],
+            6,
+            "standing Sim footprint must be 6 subtile units wide"
+        );
+        assert_eq!(
+            sim_inst.footprint[3] - sim_inst.footprint[1],
+            6,
+            "standing Sim footprint must be 6 subtile units wide"
+        );
+    }
+
+    // Pass House01.iff arrays into real `World::read_arrays` and `World::rebuild_rooms`
+    // and verify traversable doorway connectivity across Living Room, Kitchen, Bedroom,
+    // Bathroom, and Front Porch!
+    let mut loaded_world = World::empty();
+    loaded_world.size = 64;
+    let house_ver = parsed_house.model.as_ref().unwrap().version;
+    loaded_world
+        .read_arrays(&parsed_house.arrays, house_ver)
+        .expect("World::read_arrays failed on House01.iff");
+    loaded_world
+        .rebuild_rooms()
+        .expect("World::rebuild_rooms failed on House01.iff");
+    assert!(
+        !loaded_world.rooms.rooms.is_empty(),
+        "rebuild_rooms produced no rooms"
+    );
+
+    // BFS tile walkability on ground-level walls (Arry #2 in loaded_world): verify all 5 room
+    // centers are mutually reachable through the punched [[doorway]] openings!
+    let wall_data = &loaded_world.arrays[&2].data;
+    let can_step = |x0: usize, y0: usize, dx: isize, dy: isize| -> bool {
+        let nx = x0 as isize + dx;
+        let ny = y0 as isize + dy;
+        if !(0..64).contains(&nx) || !(0..64).contains(&ny) {
+            return false;
+        }
+        let (nx, ny) = (nx as usize, ny as usize);
+        match (dx, dy) {
+            (1, 0) => wall_data[(nx * 64 + ny) * 14] & 1 == 0,
+            (-1, 0) => wall_data[(x0 * 64 + y0) * 14] & 1 == 0,
+            (0, 1) => wall_data[(nx * 64 + ny) * 14] & 2 == 0,
+            (0, -1) => wall_data[(x0 * 64 + y0) * 14] & 2 == 0,
+            _ => false,
+        }
+    };
+    let mut seen_tiles = BTreeSet::new();
+    let mut q = std::collections::VecDeque::new();
+    seen_tiles.insert((26usize, 27usize)); // Alex Sunvale in Living Room
+    q.push_back((26usize, 27usize));
+    while let Some((x, y)) = q.pop_front() {
+        for (dx, dy) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
+            if can_step(x, y, dx, dy) {
+                let next = ((x as isize + dx) as usize, (y as isize + dy) as usize);
+                if seen_tiles.insert(next) {
+                    q.push_back(next);
+                }
+            }
+        }
+    }
+    for (room_name, tile) in [
+        ("Living Room", (26usize, 27usize)),
+        ("Kitchen", (32, 27)),
+        ("Bedroom", (25, 21)),
+        ("Bathroom", (32, 21)),
+        ("Front Porch", (26, 32)),
+    ] {
+        assert!(
+            seen_tiles.contains(&tile),
+            "{room_name} tile {tile:?} is unreachable from Living Room!"
+        );
+    }
+
+    // Verify subtile ObjM positions match Arry #3 tile grid (`World::tile(pos)`).
+    let grid_arr = &parsed_house.arrays[&3];
+    for inst in parsed_house.objects.instances.values() {
         let [tx, ty, level] = World::tile(inst.position);
         assert!((0..64).contains(&tx) && (0..64).contains(&ty) && level == 1);
         let at = (tx as usize * 64 + ty as usize) * 2;
         let head = i16::from_le_bytes([grid_arr.data[at], grid_arr.data[at + 1]]) as u16;
-        assert!(head > 0, "ARRY #3 tile ({tx}, {ty}) missing head object");
+        assert!(head > 0, "Arry #3 tile ({tx}, {ty}) missing head object");
     }
 
     // 7. Validate Neighborhood.iff through sims_formats::neighborhood.
@@ -511,54 +634,15 @@ fn household_sim_exercises_all_eight_motives_skills_bills_and_cancel_zero_traps(
         semi_globals.insert(res_id, None);
     }
 
-    // Synthetic starter Sim with real IdleForInput Main loop.
-    let sim_res = standalone.pack.objects.len() + 1;
-    let sim_module = compile_antics(
-        r#"
-tree 4097 "SimMain" (args: 1) {
-    while 0 == 0 {
-        param[0] := 1;
-        idle_for_input(param[0], 1);
+    // Load BOTH real compiled starter Sim character `.iff`s from `standalone.characters`.
+    for (next_res, char_bytes) in
+        (standalone.pack.objects.len() + 1..).zip(standalone.characters.values())
+    {
+        let iff = Iff::parse(char_bytes.clone()).unwrap();
+        let lib = load_iff_into_vm(&iff, next_res, &mut catalog);
+        libraries.insert(next_res, lib);
+        semi_globals.insert(next_res, None);
     }
-}
-"#,
-    )
-    .unwrap();
-    let mut sim_lib = Library::default();
-    for (&id, bhav) in &sim_module.behaviors {
-        let raw = sims_antics::encode::encode_bhav(bhav).unwrap();
-        sim_lib.behaviors.insert(id, Behavior::parse(&raw).unwrap());
-    }
-    let mut sim_words = [0i16; DEFINITION_WORDS];
-    sim_words[9] = 2;
-    sim_words[14] = SIM_GUID as u16 as i16;
-    sim_words[15] = (SIM_GUID >> 16) as u16 as i16;
-    sim_lib.definitions.insert(128, sim_words);
-    sim_lib.definition_order.push(128);
-    sim_lib.callbacks.insert(
-        128,
-        vec![
-            ObjectFunction {
-                condition: 0,
-                action: 0,
-            },
-            ObjectFunction {
-                condition: 0,
-                action: 4097,
-            },
-        ],
-    );
-    libraries.insert(sim_res, sim_lib);
-    semi_globals.insert(sim_res, None);
-    let sim_cat_idx = catalog.objects.len();
-    catalog.objects.push(sims_content::Object {
-        guid: SIM_GUID,
-        resource: sim_res,
-        chunk: 128,
-        kind: 2,
-        master: 0,
-    });
-    catalog.by_guid.insert(SIM_GUID, sim_cat_idx);
 
     let program = Program {
         global: GLOBAL_RES,
@@ -611,12 +695,19 @@ tree 4097 "SimMain" (args: 1) {
     );
 
     let sim_id = 1u16;
+    let sim2_id = 2u16;
     world.order.push(sim_id);
+    world.order.push(sim2_id);
     world.people.push(sim_id);
+    world.people.push(sim2_id);
     world.types.insert(1, SIM_GUID);
+    world.types.insert(2, SIM2_GUID);
     world
         .objects
         .insert(sim_id, make_sim_object(sim_id, SIM_GUID));
+    world
+        .objects
+        .insert(sim2_id, make_sim_object(sim2_id, SIM2_GUID));
     world.indicators = [u16::MAX, u16::MAX];
 
     let sound_log: RefCell<Vec<SoundEvent>> = RefCell::new(Vec::new());
@@ -919,6 +1010,19 @@ tree 4097 "SimMain" (args: 1) {
         "mid-loop vm.cancel must cleanly release bookshelf occupancy lock"
     );
 
+    // Exercise second starter Sim (Sam Sunvale, 0x7F00_0102) on sofa & bookshelf too!
+    let sim2_before_fun = world.objects[&sim2_id].person.as_ref().unwrap().motives[MOTIVE_FUN];
+    run_pie_interaction_by_name(
+        &mut vm,
+        &mut world,
+        &ttas_by_guid,
+        sim2_id,
+        bookshelf,
+        "Read Novel",
+        60,
+    );
+    assert!(world.objects[&sim2_id].person.as_ref().unwrap().motives[MOTIVE_FUN] > sim2_before_fun);
+
     let played_count = sound_log
         .borrow()
         .iter()
@@ -999,6 +1103,8 @@ fn cli_verify_build_and_equiv_subcommands_work_end_to_end() {
             .join("open_cream_plaster.wll")
             .is_file()
     );
+    assert!(out_dir.join("characters").join("open_sim_01.iff").is_file());
+    assert!(out_dir.join("characters").join("open_sim_02.iff").is_file());
     assert!(out_dir.join("houses").join("House01.iff").is_file());
     assert!(
         out_dir
