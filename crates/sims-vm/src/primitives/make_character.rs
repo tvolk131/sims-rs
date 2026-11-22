@@ -222,6 +222,29 @@ impl Machine<'_, '_> {
             _ => {}
         }
 
+        let apply_dialog_name = |this: &Self, guid: u32| {
+            // `0x44b0a8..0x44b0fc` / `0x44b18a..0x44b1cc`: read global
+            // `[0x6e4ac0]` (last kind 3 dialog text); when empty, fall back
+            // to localized `UIText.iff STR# 142[5]` (`0x44b0bf..0x44b0d6`,
+            // `0x44b1a1..0x44b1b8`).
+            if let Some(names) = this.character_names {
+                let submitted = this
+                    .dialog_text
+                    .map(|slot| slot.borrow().clone())
+                    .unwrap_or_default();
+                let chosen = if !submitted.is_empty() {
+                    Some(submitted)
+                } else {
+                    this.default_character_name
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                };
+                if let Some(name) = chosen {
+                    names.borrow_mut().insert(guid, name);
+                }
+            }
+        };
+
         if species == 0 {
             let (bodies, heads) = self.suit_counts(&tone, female, child)?;
             if bodies == 0 || heads == 0 {
@@ -232,6 +255,7 @@ impl Machine<'_, '_> {
             // is presentation (body strings 2 and 1, 0x40d46f, 0x40d10b).
             let _head = self.draw() % heads;
             let _body = self.draw() % bodies;
+            apply_dialog_name(self, guid);
             self.frame_mut()?.stack_object = record;
             Ok(true)
         } else {
@@ -247,6 +271,7 @@ impl Machine<'_, '_> {
                 let _body = self.draw() % bodies;
             }
             self.world.dialogs.declined = -1;
+            apply_dialog_name(self, guid);
             self.frame_mut()?.stack_object = record;
             // 0x44b111..0x44b126: calls 0x4e8c5d(index, 0x1f, 1) unconditionally
             // to build and save the new pet's portraits, regardless of whether

@@ -15,82 +15,160 @@
 //! "People's meshes go into the lot renderer's canvas").
 
 use sims_formats::bitmap::Image;
-use sims_people::{math::Vec3, skin};
+use sims_people::pie_head::Look;
 use sims_render::{Camera, Canvas};
 use sims_sim::World;
 use std::path::Path;
 
-/// How much of the pie's face the head fills, across or down, whichever
-/// is reached first.
-pub const HEAD_FILL: f32 = 0.8;
+/// Radius of the dark radial shading circle behind the pie menu (`[0x6c4708]`,
+/// `0x4ac8ff`).
+pub const PIE_SHADE_RADIUS: i32 = 100;
 
-/// The direction a skeleton's face looks, in the root's frame: the root
-/// turns it to the person's direction ([`sims_people::placement`]).
-const FACE_FORWARD: Vec3 = Vec3::new(0.0, 0.0, 1.0);
-
-/// How far down the pie's camera looks at the head: sin and cos of 10
-/// degrees, this crate's choice.
-const HEAD_PITCH: [f32; 2] = [0.173_648_18, 0.984_807_7];
-
-/// `posed`'s head (the person `person`) drawn as [`People::head`] says.
-fn head(
-    posed: Option<&sims_people::lot::Posed>,
-    person: u16,
-    [width, height]: [u32; 2],
-) -> Result<Image, String> {
-    let posed = posed.ok_or_else(|| format!("person {person} is not posed on the lot"))?;
-    let bone = sims_people::rig::bone(&posed.body.skeleton, "HEAD")
-        .ok_or_else(|| format!("person {person}'s skeleton has no HEAD bone"))?;
-    let parts: Vec<_> = posed
-        .body
-        .parts
-        .iter()
-        .filter(|p| p.censor == 0 && p.bone == bone)
-        .map(|p| (p, skin(p, &posed.bones)))
-        .collect();
-    let count: usize = parts.iter().map(|(_, s)| s.positions.len()).sum();
-    if count == 0 {
-        return Err(format!("person {person} has no head to draw"));
+/// Shades the circular backdrop behind an open pie menu directly in `canvas`,
+/// clipped to the active 3D house `viewport` (`0x4a94ec` → `0x4ac8c1` →
+/// `0x4ac8ff`).
+///
+/// Inside radius `67` (`radius - radius / 3`), each pixel is desaturated to
+/// `grey = (r + g + b) / 6 + 8` (reading the 5-6-5 zero-filled channels as
+/// `0x438ef6` does); between `67` and `100` it blends linearly in squared
+/// distance back to the original colour and quantizes to 5-6-5 (`0x49f0ae`).
+pub fn shade_pie_face(canvas: &mut Canvas, center: [i32; 2], viewport: (u32, u32)) {
+    let vp_w = i32::try_from(viewport.0)
+        .unwrap_or(i32::MAX)
+        .min(canvas.width as i32);
+    let vp_h = i32::try_from(viewport.1)
+        .unwrap_or(i32::MAX)
+        .min(canvas.height as i32);
+    if vp_w <= 0 || vp_h <= 0 {
+        return;
     }
-    // The camera looks the face in the eye: along the face's direction,
-    // turned back.
-    let face = posed.root.rotation.rotate(FACE_FORWARD);
-    let flat = Vec3::new(face.x, 0.0, face.z).normalize();
-    let mut camera = sims_people::raster::Camera {
-        yaw: [-flat.x, -flat.z],
-        pitch: HEAD_PITCH,
-        scale: 1.0,
-        center: Vec3::ZERO,
-    };
-    // Centred on the head as the camera sees it, and scaled to fill.
-    let (mut low, mut high) = ([f32::MAX; 2], [f32::MIN; 2]);
-    for (_, skinned) in &parts {
-        for &p in &skinned.positions {
-            let v = camera.view(p);
-            low = [low[0].min(v.x), low[1].min(v.y)];
-            high = [high[0].max(v.x), high[1].max(v.y)];
+    let radius = PIE_SHADE_RADIUS;
+    let r2 = radius * radius;
+    let inner = radius - radius / 3;
+    let inner2 = inner * inner;
+    let span = r2 - inner2;
+    let x0 = center[0].saturating_sub(radius).max(0);
+    let y0 = center[1].saturating_sub(radius).max(0);
+    let x1 = center[0].saturating_add(radius).min(vp_w);
+    let y1 = center[1].saturating_add(radius).min(vp_h);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let width = canvas.width;
+    for y in y0..y1 {
+        let dy = y - center[1];
+        let dy2 = dy * dy;
+        let row = y as usize * width;
+        for x in x0..x1 {
+            let dx = x - center[0];
+            let d2 = dx * dx + dy2;
+            if d2 >= r2 {
+                continue;
+            }
+            let idx = row + x as usize;
+            // 0x4ac8e7 passes threshold 0; 0x4aca76..0x4aca7a skips pixels
+            // whose 16-bit depth is <= 0 (empty sky is EMPTY = 65535 > 0).
+            if canvas.depth[idx] <= 0 {
+                continue;
+            }
+            let pixel = &mut canvas.color[idx];
+            // 0x438ef6 unpacks 5-6-5 pixels with zero-filled low bits.
+            let r = i32::from(pixel[0] & 0xf8);
+            let g = i32::from(pixel[1] & 0xfc);
+            let b = i32::from(pixel[2] & 0xf8);
+            let grey = (r + g + b) / 6 + 8;
+            let (out_r, out_g, out_b) = if d2 <= inner2 {
+                (grey, grey, grey)
+            } else {
+                let t = (((d2 - inner2) << 8) / span).clamp(0, 255);
+                let inv = 255 - t;
+                (
+                    (r * t + grey * inv) >> 8,
+                    (g * t + grey * inv) >> 8,
+                    (b * t + grey * inv) >> 8,
+                )
+            };
+            // 0x49f0ae truncates back to 5-6-5; expand via MSB bit-replication
+            // to match the rest of the 8-bit framebuffer.
+            let r5 = (out_r.clamp(0, 255) as u8) >> 3;
+            let g6 = (out_g.clamp(0, 255) as u8) >> 2;
+            let b5 = (out_b.clamp(0, 255) as u8) >> 3;
+            *pixel = [
+                (r5 << 3) | (r5 >> 2),
+                (g6 << 2) | (g6 >> 4),
+                (b5 << 3) | (b5 >> 2),
+            ];
         }
     }
-    let middle = [(low[0] + high[0]) / 2.0, (low[1] + high[1]) / 2.0];
-    // A view-space point back in the world: the camera's right and up.
-    let [sy, cy] = camera.yaw;
-    let [sp, cp] = camera.pitch;
-    let right = Vec3::new(cy, 0.0, -sy);
-    let up = Vec3::new(sy * sp, cp, cy * sp);
-    camera.center = right * middle[0] + up * middle[1];
-    let extent = [(high[0] - low[0]).max(1e-6), (high[1] - low[1]).max(1e-6)];
-    camera.scale = HEAD_FILL * (width as f32 / extent[0]).min(height as f32 / extent[1]);
-    let mut canvas = sims_people::raster::Canvas::new(width, height, [0; 4]);
-    let forward = camera.forward();
-    let light = Vec3::new(-forward.x, 1.0, -forward.z);
-    for (part, skinned) in &parts {
-        canvas.draw(&camera, part, skinned, light);
+}
+
+/// Composites a rendered pie-menu 3D `head` into `canvas` at `face_origin`,
+/// clipped to the active 3D house `viewport` and depth-tested (`LESSEQUAL`)
+/// against `canvas.depth` using each pixel's native 16-bit depth in
+/// `head_depth` (`0x4a9500`, `0x5ce959`–`0x5ce977`, `0x4a953e` → `0x587cf1` →
+/// `0x462290`). Running this in the house pass before the 2D HUD ensures
+/// nearer scene geometry occludes the head, the bottom control strip hides any
+/// part below `viewport.1`, and pie labels drawn later still appear on top.
+pub fn composite_pie_head(
+    canvas: &mut Canvas,
+    face_origin: [i32; 2],
+    head: &Image,
+    head_depth: &[i32],
+    viewport: (u32, u32),
+) {
+    let vp_w = i32::try_from(viewport.0)
+        .unwrap_or(i32::MAX)
+        .min(canvas.width as i32);
+    let vp_h = i32::try_from(viewport.1)
+        .unwrap_or(i32::MAX)
+        .min(canvas.height as i32);
+    let hw = i32::try_from(head.width).unwrap_or(0);
+    let hh = i32::try_from(head.height).unwrap_or(0);
+    if vp_w <= 0 || vp_h <= 0 || hw <= 0 || hh <= 0 {
+        return;
     }
-    Ok(Image {
-        width,
-        height,
-        rgba: canvas.rgba,
-    })
+    let sx0 = (-face_origin[0]).max(0);
+    let sy0 = (-face_origin[1]).max(0);
+    let sx1 = (vp_w - face_origin[0]).min(hw);
+    let sy1 = (vp_h - face_origin[1]).min(hh);
+    if sx0 >= sx1 || sy0 >= sy1 {
+        return;
+    }
+    let head_w = head.width as usize;
+    let canvas_w = canvas.width;
+    for sy in sy0..sy1 {
+        let dy = (face_origin[1] + sy) as usize;
+        let dst_row = dy * canvas_w;
+        let src_row = sy as usize * head_w;
+        for sx in sx0..sx1 {
+            let src_idx = src_row + sx as usize;
+            let p = src_idx * 4;
+            let a = head.rgba[p + 3];
+            if a == 0 {
+                continue;
+            }
+            let Some(&z) = head_depth.get(src_idx) else {
+                continue;
+            };
+            let dx = (face_origin[0] + sx) as usize;
+            let dst_idx = dst_row + dx;
+            if z > canvas.depth[dst_idx] {
+                continue;
+            }
+            canvas.depth[dst_idx] = z;
+            let dst = &mut canvas.color[dst_idx];
+            if a == 255 {
+                *dst = [head.rgba[p], head.rgba[p + 1], head.rgba[p + 2]];
+            } else {
+                let alpha = u16::from(a);
+                let inv = 255 - alpha;
+                for (channel, &src) in dst.iter_mut().zip(&head.rgba[p..p + 3]) {
+                    *channel =
+                        ((u16::from(src) * alpha + u16::from(*channel) * inv + 127) / 255) as u8;
+                }
+            }
+        }
+    }
 }
 
 /// How many different problems are kept; later ones are dropped.
@@ -152,21 +230,66 @@ impl People {
         self.note(drawn.problems);
     }
 
-    /// The head of `person` as posed now, seen from in front, for the
-    /// middle of the pie menu: an image of `size` pixels, clear where the
-    /// head is not. The parts bound to the `HEAD` bone are drawn (the head
-    /// with its hair, and glasses and the like), filling [`HEAD_FILL`] of
-    /// the image, lit from the front and above.
-    ///
-    /// The original renders the head live into the face bitmap; its camera,
-    /// light and size there are not ported, and the head here is **not**
-    /// compared with the original's.
+    /// The head of `person` for the middle of the pie menu in neutral pose
+    /// ([`People::head_looking`] with [`Look::neutral`]).
     pub fn head(&mut self, world: &World, person: u16, size: [u32; 2]) -> Result<Image, String> {
-        let (posed, problems) = self.people.posed(world, i32::MAX);
-        let result = head(posed.iter().find(|p| p.id == person), person, size);
-        drop(posed);
-        self.note(problems);
-        result
+        self.head_looking(world, person, size, Look::neutral())
+    }
+
+    /// The head of `person` for the middle of the pie menu, rendered as
+    /// `Sims.exe` renders it (`0x462290`, [`sims_people::pie_head`]):
+    /// bind-pose `HEAD` parts, zoom- and rotation-invariant `56√2` px/unit
+    /// orthographic projection through the house camera's 30° tilt, origin
+    /// 14 px below center, pointer-tracking pitch/yaw and 8-way compass
+    /// highlight turn, ambient-only lighting (`1.0` highlighted / `0.8` idle),
+    /// and 5-6-5 texel expansion.
+    pub fn head_looking(
+        &mut self,
+        world: &World,
+        person: u16,
+        size: [u32; 2],
+        look: Look,
+    ) -> Result<Image, String> {
+        self.refresh(world);
+        let canvas = self.people.pie_head(person, size, look)?;
+        Ok(Image {
+            width: canvas.width,
+            height: canvas.height,
+            rgba: canvas.rgba,
+        })
+    }
+
+    /// Renders `person`'s pie-menu 3D head positioned at `center` inside the
+    /// active house `viewport` (`0x462621` → `0x462985`), returning its
+    /// top-left viewport origin, tightly bounded RGBA image, and per-pixel
+    /// native 16-bit screen depths clipped to the house viewport and native
+    /// near/far frustum for `zoom` (never cropped by the 201×201 face bitmap).
+    pub fn head_in_viewport(
+        &mut self,
+        world: &World,
+        person: u16,
+        viewport: (u32, u32),
+        center: [i32; 2],
+        zoom: sims_render::Zoom,
+        look: Look,
+    ) -> Result<([i32; 2], Image, Vec<i32>), String> {
+        self.refresh(world);
+        let drawn = self.people.pie_head_in_viewport(
+            person,
+            [viewport.0, viewport.1],
+            center,
+            zoom,
+            look,
+        )?;
+        Ok((
+            drawn.origin,
+            Image {
+                width: drawn.canvas.width,
+                height: drawn.canvas.height,
+                rgba: drawn.canvas.rgba,
+            },
+            drawn.depth,
+        ))
     }
 
     /// Keeps the problems not kept yet, up to `KEPT` (256).
@@ -176,5 +299,92 @@ impl People {
                 self.problems.push(line);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shade_pie_face_desaturates_inner_disk_fades_outer_ring_and_clips_to_viewport() {
+        let mut canvas = Canvas::new(260, 260, [200, 120, 40]);
+        // Drawn scene pixel (depth > 0), empty sky pixel (EMPTY = 65535 > 0),
+        // and native threshold pixel (depth <= 0, skipped by 0x4aca76..0x4aca7a).
+        canvas.depth[130 * 260 + 130] = 1000;
+        canvas.depth[130 * 260 + 131] = sims_render::depth::EMPTY;
+        canvas.depth[130 * 260 + 132] = 0;
+        canvas.depth[130 * 260 + 133] = -5;
+        shade_pie_face(&mut canvas, [130, 130], (260, 200));
+
+        // Inside inner radius 67 with depth > 0 (both drawn depth and EMPTY):
+        // desaturated to grey = (200 + 120 + 40) / 6 + 8 = 68, quantized to
+        // 5-6-5 with MSB bit-replication:
+        // r5 = 68 >> 3 = 8 -> 66, g6 = 68 >> 2 = 17 -> 69, b5 = 8 -> 66.
+        assert_eq!(canvas.color[130 * 260 + 130], [66, 69, 66]);
+        assert_eq!(canvas.color[130 * 260 + 131], [66, 69, 66]);
+        // Pixels with depth <= 0 are skipped.
+        assert_eq!(canvas.color[130 * 260 + 132], [200, 120, 40]);
+        assert_eq!(canvas.color[130 * 260 + 133], [200, 120, 40]);
+        // Outer ring (d = 85): partway between desaturated grey and original.
+        let ring = canvas.color[130 * 260 + (130 + 85)];
+        assert!(ring[0] > 66 && ring[0] < 200, "ring red {ring:?}");
+        assert!(ring[2] < 66 && ring[2] > 40, "ring blue {ring:?}");
+        // Outside radius 100: untouched.
+        assert_eq!(canvas.color[130 * 260 + (130 + 100)], [200, 120, 40]);
+        // Below viewport height 200 (even inside circle radius 100): untouched.
+        assert_eq!(canvas.color[205 * 260 + 130], [200, 120, 40]);
+    }
+
+    #[test]
+    fn composite_pie_head_clips_to_house_viewport_and_handles_negative_origins() {
+        let mut canvas = Canvas::new(20, 20, [10, 20, 30]);
+        let mut head = Image {
+            width: 6,
+            height: 6,
+            rgba: vec![0; 6 * 6 * 4],
+        };
+        // Fill head with opaque red, except (0, 0) transparent and (2, 2) half-alpha green.
+        for y in 0..6usize {
+            for x in 0..6usize {
+                let p = (y * 6 + x) * 4;
+                head.rgba[p..p + 4].copy_from_slice(&[200, 40, 20, 255]);
+            }
+        }
+        head.rgba[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        let mid = (2 * 6 + 2) * 4;
+        head.rgba[mid..mid + 4].copy_from_slice(&[0, 200, 0, 128]);
+
+        let depth = vec![12_000; 6 * 6];
+        // Place across the bottom of a 20×12 house viewport.
+        // Put a nearer foreground pixel at (6, 9) (depth 8,000 < 12,000) and a
+        // tie at (7, 9) (depth 12,000 == 12,000, LESSEQUAL passes).
+        canvas.depth[9 * 20 + 6] = 8_000;
+        canvas.depth[9 * 20 + 7] = 12_000;
+        composite_pie_head(&mut canvas, [4, 9], &head, &depth, (20, 12));
+        // Transparent pixel at (4, 9) leaves canvas untouched.
+        assert_eq!(canvas.color[9 * 20 + 4], [10, 20, 30]);
+        // Opaque pixels inside y < 12 with depth <= scene depth are written and
+        // update the scene depth buffer.
+        assert_eq!(canvas.color[9 * 20 + 5], [200, 40, 20]);
+        assert_eq!(canvas.depth[9 * 20 + 5], 12_000);
+        // Nearer foreground at (6, 9) rejects the head pixel; equal depth at (7, 9) passes.
+        assert_eq!(canvas.color[9 * 20 + 6], [10, 20, 30]);
+        assert_eq!(canvas.depth[9 * 20 + 6], 8_000);
+        assert_eq!(canvas.color[9 * 20 + 7], [200, 40, 20]);
+        assert_eq!(canvas.color[11 * 20 + 6], [5, 110, 15]);
+        // Rows y >= 12 are clipped out of the house viewport.
+        for y in 12..20 {
+            for x in 0..20 {
+                assert_eq!(canvas.color[y * 20 + x], [10, 20, 30], "({x}, {y})");
+            }
+        }
+
+        // Negative origin clips cleanly to x >= 0, y >= 0 without panicking.
+        let mut edge = Canvas::new(10, 10, [10, 20, 30]);
+        composite_pie_head(&mut edge, [-2, -2], &head, &depth, (10, 10));
+        assert_eq!(edge.color[0], [5, 110, 15]);
+        assert_eq!(edge.color[3 * 10 + 3], [200, 40, 20]);
+        assert_eq!(edge.color[4 * 10 + 4], [10, 20, 30]);
     }
 }
