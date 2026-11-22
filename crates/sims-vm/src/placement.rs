@@ -1411,17 +1411,44 @@ impl Interpreter<'_> {
             })
         };
         let rules = PORTRAIT_SEARCH_RULES;
-        let tiles: Vec<[i8; 2]> = match self.view_centre {
-            Some(pick) => {
-                let rotation = self.view_rotation_for_object(world, id);
-                let from =
-                    portrait_start(i32::from(world.size), rotation, pick).map_err(|trap| {
-                        Fault {
-                            object: id,
-                            at: None,
-                            trap,
-                        }
-                    })?;
+        let explicit_start = if let Some(coop) = self.coop {
+            // In co-op mode, portrait placement NEVER reads local camera
+            // panning (`self.view_centre`). An optional authoritative
+            // lot-coordinate `portrait_anchor` searches directly from that lot
+            // tile without rotation-dependent un-rotation.
+            if let Some([tx, ty]) = coop.borrow().portrait_anchor {
+                let size = i32::from(world.size);
+                let x = i32::from(tx);
+                let y = i32::from(ty);
+                if x < 1 || y < 1 || x >= size - 1 || y >= size - 1 {
+                    return Err(Fault {
+                        object: id,
+                        at: None,
+                        trap: Trap::Invalid(format!(
+                            "co-op portrait anchor ({tx}, {ty}) is outside lot bounds 1..{}",
+                            size - 1
+                        )),
+                    });
+                }
+                Some([(x << 4) | 8, (y << 4) | 8])
+            } else {
+                None
+            }
+        } else if let Some(pick) = self.view_centre {
+            Some(
+                portrait_start(i32::from(world.size), self.view_rotation, pick).map_err(
+                    |trap| Fault {
+                        object: id,
+                        at: None,
+                        trap,
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let tiles: Vec<[i8; 2]> = match explicit_start {
+            Some(from) => {
                 let Some(pos) = self.search(world, id, from, 1, rules)? else {
                     return Ok(PortraitPutPlan::NoTile);
                 };

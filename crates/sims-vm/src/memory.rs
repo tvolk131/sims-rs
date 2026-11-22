@@ -789,16 +789,26 @@ impl Machine<'_, '_> {
             let host_selected = {
                 let mut ctx = coop.borrow_mut();
                 ctx.write_global_3(self.world, me, stack_object, value);
-                ctx.session
-                    .selected_sim_for_activity(None)
-                    .map_or(0, |id| id as i16)
+                ctx.session.selected_sim_for_activity(None).filter(|id| {
+                    self.world
+                        .objects
+                        .get(id)
+                        .is_some_and(|o| o.person.is_some())
+                })
             };
-            let slot = self
-                .world
-                .globals
-                .get_mut(3)
-                .ok_or_else(|| Trap::Invalid("word out of range".into()))?;
-            *slot = host_selected;
+            if self.world.selected() != host_selected {
+                let interpreter = self.interpreter();
+                interpreter
+                    .select(self.world, host_selected)
+                    .map_err(|fault| fault.trap)?;
+            } else {
+                let slot = self
+                    .world
+                    .globals
+                    .get_mut(3)
+                    .ok_or_else(|| Trap::Invalid("word out of range".into()))?;
+                *slot = host_selected.map_or(0, |id| id as i16);
+            }
             return Ok(true);
         }
         let world = &mut *self.world;

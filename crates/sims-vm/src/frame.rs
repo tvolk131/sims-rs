@@ -136,16 +136,13 @@ impl Interpreter<'_> {
     ) -> Result<(), Fault> {
         if mode == PanelMode::Live {
             if let Some(coop) = self.coop {
-                let sims = coop.borrow().selected_sims();
-                if sims.is_empty() {
-                    list_queue(world);
-                } else {
-                    for sim in sims {
-                        list_queue_for(world, sim);
-                    }
-                    if let Some(sim) = world.selected() {
-                        list_queue_for(world, sim);
-                    }
+                let mut sims: std::collections::BTreeSet<u16> =
+                    coop.borrow().selected_sims().into_iter().collect();
+                if let Some(sim) = world.selected() {
+                    sims.insert(sim);
+                }
+                for sim in sims {
+                    list_queue_for(world, sim);
                 }
             } else {
                 list_queue(world);

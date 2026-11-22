@@ -15,46 +15,55 @@
 //!     Sim.
 //!   - Script-driven Global 3 writes (e.g. *Magic – Kid To Adult Backfire*)
 //!     update the player(s) who had the affected Sim selected, falling back to
-//!     the activity owner or host.
-//! - **Per-player `camera_rotation`:**
+//!     the activity owner or host, and reconcile `world.selected()` immediately.
+//! - **Per-player `camera_rotation` & isolated local camera panning:**
 //!   - `Look Towards`, `Generic Sims Call 12` (tile depth), `Find Location`
-//!     mode 5, head model placement, and portrait tile placement resolve the
-//!     camera rotation of the player who has the asking Sim selected (or owns
-//!     its activity), falling back to the host's rotation.
-//! - **Shared Mode Global 19, multi-reason pause, and fixed session globals:**
-//!   - Maps [`PlayerMode`] (`Build` > `Buy` > `Live`) onto the simulator's
-//!     [`PanelMode`] / Global 19 (`0x4ce44f`: `0` Live, `1` Build, `2` Buy).
-//!   - Syncs Global 30 (`Free Will`), fixed Global 33 (`Machine Level`), host
-//!     Global 15 (`Current Language`), Global 16/18 (`Speed`), and Global 17
-//!     (`Paused`) from [`SessionState`].
-//!   - Respects multi-reason pause ([`SessionState::is_paused`]) and
-//!     first-answer-wins blocking modal dialogs.
-//! - **Throwaway per-player pie-menu checks:**
-//!   - [`Lot::coop_pie_menu`] takes `&self` and runs check scripts against a
-//!     throwaway CoW clone of [`World`] with that player's selected Sim and
-//!     camera rotation, never mutating shared RNG or simulation state.
-//! - **Deterministic fingerprints & REDB snapshot resync:**
-//!   - [`Lot::coop_world_hash`] and [`Lot::coop_state_fingerprint`] produce
-//!     canonical SHA-256 digests matching [`sims_net::StateFingerprint`].
-//!   - [`Lot::coop_snapshot_bytes`] and [`Lot::restore_coop_snapshot`] bundle
-//!     [`crate::boot::save::Saved`] bytes with co-op VM metadata so mid-game
-//!     join and drift recovery resume bit-for-bit identically.
+//!     mode 5, and head model placement resolve the camera rotation of the
+//!     player selecting `me` (for person scripts, strictly falling back to the
+//!     host) or the player selecting `stack_object` / owning the activity (for
+//!     non-person scripts).
+//!   - Local camera panning (`Lot::view_centre`) NEVER feeds the co-op
+//!     simulation; portrait search uses an authoritative lot-coordinate
+//!     `portrait_anchor` (or tile-independent search when `None`).
+//! - **Authoritative co-op `Frames` schedule & Tutorial/Help suppression:**
+//!   - One authoritative [`Frames`] schedule is installed on attach, serialized
+//!     in co-op snapshots, and hashed in [`Lot::coop_world_hash`].
+//!   - Tutorial lots (`Global 26 != 0`) are refused on co-op attach, and
+//!     Tutorial / Help System controllers (libraries using opcode 10 or 34) are
+//!     deterministically parked so single-player help never pauses a co-op lot.
+//! - **Sequential command execution, frozen dialog replay & atomic Buy/Build:**
+//!   - Commands in a batch execute sequentially in exact host-stamped order,
+//!     validating selections and dialog button statuses before mutating session
+//!     state and enforcing mode gates at each command's position.
+//!   - Interrupted ticks freeze their pre-tick `(session, activity_owners,
+//!     free_will)` across all dialogs in the tick and through answered-but-paused
+//!     snapshots, replaying identically on live peers and snapshot joiners.
+//!   - `SimActionPick` resolves against a throwaway issuer-specific `pie_menu`
+//!     probe and commits staged `world` + ownership only when queued/executed.
+//!   - `BuyBuild` edits execute atomically on a staged `(World, CoopVmContext)`
+//!     using catalog [`BuildPrices`], enforcing exact facing/container/style/
+//!     pattern and purging all detached history before committing.
 
 use crate::boot::save::{SaveError, Saved};
-use crate::boot::{AnswerError, Lot, Menu, OrderError, StepError};
+use crate::boot::{AnswerError, Frames, Lot, Menu, OrderError, StepError};
 use crate::build::{
     BuildPrices, FloorDragMode, WALL_EAST, WALL_NORTH, WALL_SOUTH, WALL_WEST, WallDragMode,
     WallFace, WallStyle, WallpaperDragMode, plan_floor_edit, plan_wall_drag, plan_wallpaper_edit,
 };
+use crate::buy::snap_to_tile_centre;
 use crate::interpreter::{Interpreter, Stream};
 use crate::orders::MenuEntry;
-use crate::{Answer, PanelMode, Shown, Update};
+use crate::{Answer, Answers, PanelMode, Shown, Update};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sims_content::ui_graphics::US_ENGLISH;
+use sims_content::{Install, Surfaces, atoi};
+use sims_formats::iff::Iff;
+use sims_formats::strings::StringTable;
 use sims_net::{
-    AppliedBatch, BuyBuildEdit, CameraRotation, Command, CommandIgnoreReason, CommandOutcome,
-    CommandRejectReason, DialogAnswer, DialogId, PlayerId, PlayerMode, SessionError, SessionState,
-    SimSpeed, StampedCommand, StateFingerprint, Tick, TickBatch,
+    AppliedBatch, BuyBuildEdit, CameraRotation, Command, CommandIgnoreReason, CommandRejectReason,
+    DialogId, PlayerId, PlayerMode, PlayerRole, SessionError, SessionState, SimSpeed,
+    StampedCommand, StateFingerprint, Tick, TickBatch,
 };
 use sims_sim::World;
 use std::cell::RefCell;
@@ -67,10 +76,23 @@ const GLOBAL_SELECTED: usize = 3;
 const GLOBAL_LANGUAGE: usize = 15;
 /// Global 17: simulation paused flag (`0x46d813`).
 const GLOBAL_PAUSED: usize = 17;
+/// Global 26: tutorial flag (`0x4878f3`, single-player only).
+const GLOBAL_TUTORIAL: usize = 26;
 /// Global 30: Free Will (`0x432220`).
 const GLOBAL_FREE_WILL: usize = 30;
 /// Global 33: Machine Level (fixed per session for determinism).
 const GLOBAL_MACHINE_LEVEL: usize = 33;
+
+/// Object data word 1: facing (`0..=7`).
+const DATA_FACING: usize = 1;
+
+/// SimAntics opcode 10 (`Tutorial` / `own_events`) and opcode 34 (`UI Effect`),
+/// used exclusively by the single-player Tutorial and Help System controllers.
+const OPCODE_TUTORIAL: u16 = 10;
+const OPCODE_UI_EFFECT: u16 = 34;
+/// Scheduler flag 1 (`READY`): cleared to park single-player Help System
+/// controllers in co-op mode.
+const SCHEDULER_READY: u16 = 1;
 
 /// Domain separator for [`Lot::coop_world_hash`].
 const COOP_WORLD_HASH_DOMAIN: &[u8] = b"sims-vm/coop-world/v1\0";
@@ -78,6 +100,23 @@ const COOP_WORLD_HASH_DOMAIN: &[u8] = b"sims-vm/coop-world/v1\0";
 const COOP_SNAPSHOT_MAGIC: &[u8; 4] = b"SCOP";
 /// Wire version of [`CoopSnapshotEnvelope`].
 const COOP_SNAPSHOT_VERSION: u32 = 1;
+
+/// `GameData/Build.iff` `STR#` chunk IDs (`0x4cd453`, `0x4cd696`, `0x4cd71b`).
+const STR_WALLS: u16 = 129;
+const STR_FLOORS: u16 = 130;
+const STR_WALLPAPERS: u16 = 131;
+const STR_PLUGIN_FLOOR: u16 = 134;
+const STR_PLUGIN_WALL: u16 = 135;
+
+/// Built-in wall/fence style table matching `cWinArch` (`0x4cd464..0x4cd608`):
+/// `(style_id, str_entry_1based, default_price)`.
+const BUILTIN_WALL_STYLES: [(u16, usize, i32); 5] = [
+    (1, 1, 70),
+    (2, 2, 10),
+    (12, 4, 35),
+    (13, 3, 45),
+    (14, 5, 45),
+];
 
 /// Maps [`sims_net::PlayerMode`] onto the simulator's [`PanelMode`].
 ///
@@ -107,6 +146,148 @@ pub fn menu_entry_to_pick_command(entry: &MenuEntry) -> Command {
     }
 }
 
+/// Encodes a 32-bit interaction UID returned by [`CoopCommandStatus::QueuedInteraction`]
+/// into the `i16` wire field of [`Command::SimActionCancel`].
+///
+/// [`Lot::apply_coop_batch`] resolves the wire `i16` back to the exact `i32`
+/// UID on the target Sim's active/queued interaction list (at most 9 entries),
+/// supporting serials beyond `32767` cleanly while deterministically refusing
+/// any ambiguous 16-bit wrap collision.
+pub const fn cancel_uid_to_wire(uid: i32) -> i16 {
+    uid as i16
+}
+
+/// Builds the full catalog [`BuildPrices`] table (wall style overrides,
+/// built-in floors/wallpapers from `GameData/Build.iff`, and plug-in
+/// `.flr`/`.wll` prices from `surfaces`) matching `cArchCatalog`
+/// (`0x4cd149..0x4cd9a5`).
+pub fn build_prices_from_install(install: &Install, surfaces: &Surfaces) -> BuildPrices {
+    let build_iff = install
+        .file("GameData/Build.iff")
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| Iff::parse(bytes).ok());
+
+    let str_price = |chunk_id: u16, entry_1based: usize| -> Option<i32> {
+        let iff = build_iff.as_ref()?;
+        let chunk = iff.get(b"STR#", chunk_id)?;
+        let table = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)).ok()?;
+        let base = entry_1based.checked_sub(1)? * 3;
+        let name = table.entry(base, US_ENGLISH)?.text.as_str();
+        if name.is_empty() {
+            return None;
+        }
+        let price_entry = table.entry(base + 1, US_ENGLISH)?;
+        Some(atoi(&price_entry.raw_text))
+    };
+
+    let mut prices = BuildPrices::default();
+
+    // 1. Wall & fence styles (`STR# 129`).
+    for (style_id, entry_1based, fallback_price) in BUILTIN_WALL_STYLES {
+        let price = str_price(STR_WALLS, entry_1based).unwrap_or(fallback_price);
+        prices.styles.insert(style_id, price);
+    }
+    let std_price = prices.styles.get(&1).copied().unwrap_or(70);
+    prices.styles.insert(22, std_price);
+    prices.styles.insert(23, std_price);
+
+    // 2. Built-in & plug-in floors (`STR# 130` & `STR# 134`).
+    let def_floor_price = str_price(STR_PLUGIN_FLOOR, 1).unwrap_or(20);
+    for key in 1u16..=29 {
+        if (9..=13).contains(&key) {
+            continue;
+        }
+        if let Some(price) = str_price(STR_FLOORS, usize::from(key)) {
+            prices.floors.insert(key, price);
+        }
+    }
+    for file in &surfaces.floors.files {
+        let price = file.price.unwrap_or(def_floor_price);
+        for &key in file.keys.values() {
+            prices.floors.insert(key, price);
+        }
+    }
+
+    // 3. Built-in & plug-in wallpapers (`STR# 131` & `STR# 135`).
+    let def_wall_price = str_price(STR_PLUGIN_WALL, 1).unwrap_or(5);
+    for key in 1u16..=30 {
+        if let Some(price) = str_price(STR_WALLPAPERS, usize::from(key)) {
+            prices.walls.insert(key, price);
+        }
+    }
+    for file in &surfaces.walls.files {
+        let price = file.price.unwrap_or(def_wall_price);
+        for &key in file.keys.values() {
+            if (248..=255).contains(&key) {
+                continue;
+            }
+            prices.walls.insert(key, price);
+        }
+    }
+
+    prices
+}
+
+/// Builds a fallback [`BuildPrices`] from `surfaces` alone when no `Install`
+/// handle is available (e.g. synthetic unit tests or default attach).
+fn default_build_prices_from_surfaces(surfaces: &Surfaces) -> BuildPrices {
+    let mut prices = BuildPrices::default();
+    for (style_id, _, fallback_price) in BUILTIN_WALL_STYLES {
+        prices.styles.insert(style_id, fallback_price);
+    }
+    prices.styles.insert(22, 70);
+    prices.styles.insert(23, 70);
+    for file in &surfaces.floors.files {
+        let price = file.price.unwrap_or(20);
+        for &key in file.keys.values() {
+            prices.floors.insert(key, price);
+        }
+    }
+    for file in &surfaces.walls.files {
+        let price = file.price.unwrap_or(5);
+        for &key in file.keys.values() {
+            if (248..=255).contains(&key) {
+                continue;
+            }
+            prices.walls.insert(key, price);
+        }
+    }
+    prices
+}
+
+/// Complete frozen pre-tick co-op inputs preserved across every blocking modal
+/// dialog in an interrupted tick (and through answered-but-paused states and
+/// snapshots) so live replay and snapshot restore always execute the exact
+/// same interrupted tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FrozenDialogTick {
+    pub session: SessionState,
+    pub activity_owners: BTreeMap<u16, PlayerId>,
+    pub free_will: bool,
+}
+
+impl FrozenDialogTick {
+    fn digest(&self) -> [u8; 32] {
+        #[derive(Serialize)]
+        struct Canonical<'a> {
+            session_fp: StateFingerprint,
+            activity_owners: &'a BTreeMap<u16, PlayerId>,
+            free_will: bool,
+        }
+        let body = postcard::to_allocvec(&Canonical {
+            session_fp: self.session.session_fingerprint(),
+            activity_owners: &self.activity_owners,
+            free_will: self.free_will,
+        })
+        .expect("FrozenDialogTick postcard serialization is infallible");
+        let mut h = Sha256::new();
+        h.update(b"sims-vm/coop-frozen-dialog/v1\0");
+        h.update(&body);
+        h.finalize().into()
+    }
+}
+
 /// Co-op multiplayer context attached to a [`Lot`] / [`Interpreter`].
 ///
 /// Always `None` in single-player so single-player execution stays 100%
@@ -123,14 +304,22 @@ pub struct CoopVmContext {
     pub next_dialog_id: u64,
     /// Currently open blocking modal dialog awaiting first-answer-wins, if any.
     pub active_dialog: Option<DialogId>,
-    /// Snapshot of [`SessionState`] at the moment `active_dialog` opened, used
-    /// by [`Lot::restore_coop_snapshot`] to re-probe `Lot::asking` deterministically
-    /// even if players changed selections or camera rotations while the dialog
-    /// remained open.
-    pub(crate) dialog_open_session: Option<SessionState>,
+    /// Frozen pre-tick inputs for an interrupted dialog tick (preserved across
+    /// every dialog in the tick and through answered-but-paused states until
+    /// replay completes).
+    pub(crate) frozen_dialog: Option<FrozenDialogTick>,
     /// Deferred `Command::SetSpeed` received while a blocking dialog froze
     /// `self.world`, applied as soon as the dialog replay completes.
     pub(crate) pending_speed_sync: bool,
+    /// Authoritative co-op frame draw schedule installed on every peer so
+    /// animator/room/outfit side effects of drawing never diverge after resync.
+    pub frames: Frames,
+    /// Optional authoritative lot-coordinate tile `[tx, ty]` used as the
+    /// portrait search start in co-op mode (never influenced by local camera
+    /// panning or per-player rotation). `None` uses tile-independent search.
+    pub portrait_anchor: Option<[i8; 2]>,
+    /// Shared Architecture pricing table used for co-op Build Mode edits.
+    pub build_prices: BuildPrices,
     /// Whether [`Lot::apply_coop_batch`] steps in play mode (`Lot::step_play`)
     /// instead of strict mode (`Lot::step`). Defaults to `false`.
     pub play_mode: bool,
@@ -141,15 +330,19 @@ pub struct CoopVmContext {
 }
 
 impl CoopVmContext {
-    /// Creates a new co-op VM context wrapping `session`.
+    /// Creates a new co-op VM context wrapping `session` with the authoritative
+    /// default [`Frames`] schedule.
     pub fn new(session: SessionState) -> Self {
         Self {
             session,
             activity_owners: BTreeMap::new(),
             next_dialog_id: 1,
             active_dialog: None,
-            dialog_open_session: None,
+            frozen_dialog: None,
             pending_speed_sync: false,
+            frames: Frames::default(),
+            portrait_anchor: None,
+            build_prices: BuildPrices::default(),
             play_mode: false,
             active_player_override: None,
         }
@@ -158,6 +351,25 @@ impl CoopVmContext {
     /// Configures whether [`Lot::apply_coop_batch`] runs in play mode.
     pub fn with_play_mode(mut self, play_mode: bool) -> Self {
         self.play_mode = play_mode;
+        self
+    }
+
+    /// Sets the authoritative co-op [`Frames`] draw schedule.
+    pub fn with_frames(mut self, frames: Frames) -> Self {
+        self.frames = frames;
+        self
+    }
+
+    /// Sets the authoritative lot-coordinate portrait search anchor `[tx, ty]`.
+    pub fn with_portrait_anchor(mut self, anchor: Option<[i8; 2]>) -> Self {
+        self.portrait_anchor = anchor;
+        self
+    }
+
+    /// Sets the authoritative catalog [`BuildPrices`] table for co-op Build
+    /// Mode edits (e.g. from [`build_prices_from_install`]).
+    pub fn with_build_prices(mut self, prices: BuildPrices) -> Self {
+        self.build_prices = prices;
         self
     }
 
@@ -249,7 +461,9 @@ impl CoopVmContext {
         stack_object: i16,
         value: i16,
     ) -> Vec<PlayerId> {
-        let new_sim = u16::try_from(value).ok().filter(|&id| id != 0);
+        let new_sim = u16::try_from(value)
+            .ok()
+            .filter(|&id| id != 0 && world.objects.get(&id).is_some_and(|o| o.person.is_some()));
         if let Some(player_id) = self.active_player_override {
             if let Some(player) = self.session.players.get_mut(&player_id) {
                 player.selected_sim = new_sim;
@@ -299,10 +513,13 @@ impl CoopVmContext {
     /// Resolves per-player `camera_rotation` (`0..=3`) for a script or
     /// simulation query on behalf of `me` (`docs/vision.md` lines 130–134).
     ///
-    /// Uses the rotation of the player who has `me` selected (lowest
-    /// [`PlayerId`] tie-breaker), or for non-Sim scripts the player who
-    /// selects `stack_object` or owns the activity on `me`/`stack_object`,
-    /// falling back to the host's rotation.
+    /// - For a **person** (`me` is a Sim): strictly resolves via
+    ///   [`SessionState::camera_rotation_for_sim`], using the rotation of the
+    ///   player selecting `me` (lowest [`PlayerId`] tie-breaker) and falling
+    ///   back directly to the host's rotation if `me` is unselected.
+    /// - For a **non-person** script: resolves via the player selecting
+    ///   `stack_object` or owning the activity on `me`/`stack_object`, falling
+    ///   back to the host's rotation.
     pub fn resolve_camera_rotation(&self, world: &World, me: u16, stack_object: Option<i16>) -> u8 {
         if let Some(player_id) = self.active_player_override {
             if let Some(player) = self.session.players.get(&player_id) {
@@ -311,9 +528,7 @@ impl CoopVmContext {
             return self.host_camera_rotation();
         }
 
-        if world.objects.get(&me).is_some_and(|o| o.person.is_some())
-            && self.session.is_sim_selected_by_any(me)
-        {
+        if world.objects.get(&me).is_some_and(|o| o.person.is_some()) {
             return self.session.camera_rotation_for_sim(me).quarter_turns();
         }
 
@@ -361,7 +576,8 @@ impl CoopVmContext {
 pub enum CoopCommandStatus {
     /// Command executed cleanly against session/lot state.
     Applied,
-    /// `SimActionPick` queued an interaction (or queue was full -> `None`).
+    /// `SimActionPick` queued an interaction (or queue was full / at-once
+    /// declined -> `None`).
     QueuedInteraction { uid: Option<i32> },
     /// `SimActionCancel` executed (`counted` indicates whether an action matched).
     CancelledInteraction { counted: bool },
@@ -398,8 +614,8 @@ pub struct CoopBatchReport {
     pub opened_dialog: Option<(DialogId, Shown)>,
     /// Per-command deterministic outcomes in exact batch sequence order.
     pub command_results: Vec<(StampedCommand, CoopCommandStatus)>,
-    /// Any player selections altered by scripts or end-of-update reselection
-    /// during this tick.
+    /// Any player selections altered by scripts (including immediate at-once /
+    /// cancel callbacks and end-of-update reselection) during this batch.
     pub script_selection_changes: Vec<(PlayerId, Option<u16>)>,
     /// Deterministic VM world hash after this batch (pass to
     /// `LockstepNode::report_local_tick`).
@@ -413,7 +629,8 @@ pub struct CoopBatchReport {
 pub enum CoopError {
     /// [`Lot::attach_coop`] has not been called on this lot.
     NotAttached,
-    /// Lockstep [`SessionState::apply_batch`] rejected the batch.
+    /// Lockstep [`SessionState::apply_batch`] or continuity validation rejected
+    /// the batch.
     Session(SessionError),
     /// Simulation tick failed fatally.
     Step(StepError),
@@ -459,8 +676,11 @@ struct CoopSnapshotMeta {
     activity_owners: BTreeMap<u16, PlayerId>,
     next_dialog_id: u64,
     active_dialog: Option<DialogId>,
-    dialog_open_session: Option<SessionState>,
+    frozen_dialog: Option<FrozenDialogTick>,
     pending_speed_sync: bool,
+    frames: Frames,
+    portrait_anchor: Option<[i8; 2]>,
+    build_prices: BuildPrices,
     play_mode: bool,
 }
 
@@ -473,7 +693,7 @@ struct CoopSnapshotEnvelope {
 }
 
 /// Canonical subset of format-8 unencoded `World` fields plus `Lot`/co-op
-/// metadata hashed into [`Lot::coop_world_hash`].
+/// continuation inputs hashed into [`Lot::coop_world_hash`].
 #[derive(Serialize)]
 struct CoopWorldFingerprintTail<'a> {
     world_hash: [u8; 32],
@@ -481,6 +701,13 @@ struct CoopWorldFingerprintTail<'a> {
     view_rotation: u8,
     answered: bool,
     asking: Option<(u32, u16)>,
+    answers: &'a Answers,
+    replay_view_rotation: Option<u8>,
+    frames: &'a Frames,
+    portrait_anchor: Option<[i8; 2]>,
+    build_prices: Option<&'a BuildPrices>,
+    play_mode: bool,
+    play_fresh: &'a BTreeSet<u16>,
     last_dialog_text: &'a str,
     character_names: &'a BTreeMap<u32, String>,
     generated_portrait_2002: &'a BTreeSet<sims_sim::PortraitFile>,
@@ -500,6 +727,7 @@ struct CoopWorldFingerprintTail<'a> {
     activity_owners: Option<&'a BTreeMap<u16, PlayerId>>,
     next_dialog_id: Option<u64>,
     active_dialog: Option<DialogId>,
+    frozen_dialog_digest: Option<[u8; 32]>,
     pending_speed_sync: bool,
 }
 
@@ -523,8 +751,201 @@ fn sync_pause_global(world: &mut World, paused: bool) {
     }
 }
 
-fn build_prices_default() -> BuildPrices {
-    BuildPrices::default()
+/// Applies one non-dialog/non-selection [`StampedCommand`] to `session`
+/// matching [`SessionState::apply_batch`] semantics in exact stamped order.
+fn apply_session_command(
+    session: &mut SessionState,
+    stamped: &StampedCommand,
+) -> Result<(), CoopCommandStatus> {
+    let issuer = stamped.issuer;
+    match &stamped.command {
+        Command::PlayerJoined {
+            player_id,
+            name,
+            selected_sim,
+            camera_rotation,
+            endpoint_hint,
+            transport_addr,
+        } => {
+            if issuer != session.host_id {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::HostOnly,
+                ));
+            }
+            if session.players.contains_key(player_id) {
+                return Err(CoopCommandStatus::IgnoredBySession(
+                    CommandIgnoreReason::RedundantMembershipChange,
+                ));
+            }
+            if player_id.0 >= session.next_player_id {
+                session.next_player_id = player_id.0.saturating_add(1);
+            }
+            let canonical_transport = transport_addr.clone().or_else(|| {
+                endpoint_hint
+                    .as_deref()
+                    .map(|hint| hint.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+            session.players.insert(
+                *player_id,
+                sims_net::PerPlayerState {
+                    player_id: *player_id,
+                    name: name.clone(),
+                    role: PlayerRole::Peer,
+                    mode: PlayerMode::Live,
+                    selected_sim: *selected_sim,
+                    camera_rotation: camera_rotation.normalized(),
+                    endpoint_hint: endpoint_hint.clone(),
+                    transport_addr: canonical_transport,
+                },
+            );
+            Ok(())
+        }
+        Command::PlayerLeft { player_id, .. } => {
+            if issuer != session.host_id {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::HostOnly,
+                ));
+            }
+            if session.players.remove(player_id).is_none() {
+                return Err(CoopCommandStatus::IgnoredBySession(
+                    CommandIgnoreReason::RedundantMembershipChange,
+                ));
+            }
+            Ok(())
+        }
+        Command::HostChanged { new_host, epoch } => {
+            if issuer != session.host_id && issuer != *new_host {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::HostOnly,
+                ));
+            }
+            if !session.players.contains_key(new_host) {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::UnknownIssuer,
+                ));
+            }
+            for player in session.players.values_mut() {
+                player.role = if player.player_id == *new_host {
+                    PlayerRole::Host
+                } else {
+                    PlayerRole::Peer
+                };
+            }
+            session.host_id = *new_host;
+            if *epoch > session.epoch {
+                session.epoch = *epoch;
+            }
+            Ok(())
+        }
+        Command::SetHostSpeedLock { locked } => {
+            if issuer != session.host_id {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::HostOnly,
+                ));
+            }
+            session.time.host_speed_lock = *locked;
+            session.config.host_speed_lock = *locked;
+            Ok(())
+        }
+        Command::SetSpeed { speed } => {
+            if !session.players.contains_key(&issuer) {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::UnknownIssuer,
+                ));
+            }
+            if session.time.host_speed_lock && issuer != session.host_id {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::SpeedLockedByHost,
+                ));
+            }
+            session.time.speed = SimSpeed::new(speed.value());
+            session.time.last_speed_change_by = Some(issuer);
+            Ok(())
+        }
+        Command::SetPaused { paused } => {
+            if !session.players.contains_key(&issuer) {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::UnknownIssuer,
+                ));
+            }
+            if session.time.host_speed_lock && issuer != session.host_id {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::SpeedLockedByHost,
+                ));
+            }
+            session.time.explicit_pause = *paused;
+            session.time.explicit_pause_by = Some(issuer);
+            Ok(())
+        }
+        Command::SetFreeWill { enabled } => {
+            if !session.players.contains_key(&issuer) {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::UnknownIssuer,
+                ));
+            }
+            session.config.free_will = *enabled;
+            Ok(())
+        }
+        Command::SetCameraRotation { rotation } => {
+            let Some(player) = session.players.get_mut(&issuer) else {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::UnknownIssuer,
+                ));
+            };
+            player.camera_rotation = rotation.normalized();
+            Ok(())
+        }
+        Command::SetMode { mode } => {
+            let Some(player) = session.players.get_mut(&issuer) else {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::UnknownIssuer,
+                ));
+            };
+            player.mode = *mode;
+            Ok(())
+        }
+        Command::SelectPerson { .. }
+        | Command::AnswerBlockingDialog { .. }
+        | Command::SimActionPick { .. }
+        | Command::SimActionCancel { .. }
+        | Command::BuyBuild(_) => {
+            if !session.players.contains_key(&issuer) {
+                return Err(CoopCommandStatus::RejectedBySession(
+                    CommandRejectReason::UnknownIssuer,
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Resolves a 16-bit wire cancel UID to the exact `i32` UID on `sim_id`'s
+/// active/queued interactions (at most 9 actions), supporting `action_serial >
+/// 32767` cleanly while deterministically refusing any ambiguous 16-bit wrap
+/// collision.
+fn resolve_cancel_uid(world: &World, sim_id: u16, wire_uid: i16) -> Result<Option<i32>, String> {
+    let Some(person) = world.objects.get(&sim_id).and_then(|o| o.person.as_ref()) else {
+        return Err(format!("object {sim_id} is not a person on the lot"));
+    };
+    let mut matches = Vec::new();
+    let mut check = |uid: i32| {
+        if uid != 0 && (uid as i16) == wire_uid && !matches.contains(&uid) {
+            matches.push(uid);
+        }
+    };
+    check(person.active.uid);
+    for queued in &person.queue {
+        check(queued.uid);
+    }
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches[0])),
+        _ => Err(format!(
+            "ambiguous 16-bit cancel UID {wire_uid} matches multiple interactions {matches:?} on \
+             Sim {sim_id}"
+        )),
+    }
 }
 
 impl Lot {
@@ -562,10 +983,21 @@ impl Lot {
         session.time.speed = SimSpeed::new(self.world.speed());
     }
 
-    /// Attaches a co-op [`SessionState`] to this lot, enabling interactive
-    /// blocking dialog waits (`Lot::wait_for_answers`) and synchronizing fixed
-    /// session globals, host camera rotation, host selection, mode, pause, and
-    /// speed.
+    /// Builds default co-op [`BuildPrices`] from this lot's loaded surface
+    /// catalogs (`self.surfaces`) and built-in wall style prices.
+    ///
+    /// For full built-in floor/wallpaper pricing from `GameData/Build.iff`,
+    /// construct [`BuildPrices`] via [`build_prices_from_install`] and pass it
+    /// to [`CoopVmContext::with_build_prices`].
+    pub fn default_coop_build_prices(&self) -> BuildPrices {
+        default_build_prices_from_surfaces(&self.surfaces)
+    }
+
+    /// Attaches a co-op [`SessionState`] to this lot, installing the
+    /// authoritative co-op [`Frames`] schedule, suppressing single-player
+    /// Tutorial/Help System controllers, enabling interactive blocking dialog
+    /// waits (`Lot::wait_for_answers`), and synchronizing fixed session globals,
+    /// host camera rotation, host selection, mode, pause, and speed.
     pub fn attach_coop(&mut self, session: SessionState) -> Result<(), OrderError> {
         self.attach_coop_context(CoopVmContext::new(session))
     }
@@ -573,11 +1005,78 @@ impl Lot {
     /// Attaches a preconfigured [`CoopVmContext`] to this lot.
     pub fn attach_coop_context(&mut self, mut ctx: CoopVmContext) -> Result<(), OrderError> {
         self.ready()?;
+        if self
+            .world
+            .globals
+            .get(GLOBAL_TUTORIAL)
+            .copied()
+            .unwrap_or(0)
+            != 0
+        {
+            return Err(OrderError::Refused(crate::Fault {
+                object: 0,
+                at: None,
+                trap: crate::Trap::Invalid(
+                    "tutorial lots are single-player only and cannot be attached in co-op mode"
+                        .into(),
+                ),
+            }));
+        }
+        if ctx.build_prices.styles.is_empty()
+            && ctx.build_prices.floors.is_empty()
+            && ctx.build_prices.walls.is_empty()
+        {
+            ctx.build_prices = self.default_coop_build_prices();
+        }
         self.wait_for_answers();
+        self.frames = ctx.frames.clone();
+        self.disable_coop_tutorial_and_help();
         self.sanitize_session_selections(&mut ctx.session);
-        self.sync_world_from_session(&ctx.session, true)?;
+        self.sync_world_from_session(&mut ctx, true)?;
         self.coop = Some(ctx);
         Ok(())
+    }
+
+    /// Deterministically parks single-player Tutorial and Help System
+    /// controllers (non-person objects whose linked library uses opcode 10
+    /// `Tutorial` or opcode 34 `UI Effect`, per `docs/vision.md` line 153) so
+    /// single-player help prompts never pause a co-op lot.
+    fn disable_coop_tutorial_and_help(&mut self) {
+        let mut parked_ids = BTreeSet::new();
+        for (&id, obj) in &self.world.objects {
+            if obj.person.is_some() {
+                continue;
+            }
+            let Some(def) = self.catalog.object(obj.guid) else {
+                continue;
+            };
+            let Some(library) = self.program.libraries.get(&def.resource) else {
+                continue;
+            };
+            let is_tutorial_or_help = library.behaviors.values().any(|beh| {
+                beh.instructions
+                    .iter()
+                    .any(|ins| ins.opcode == OPCODE_TUTORIAL || ins.opcode == OPCODE_UI_EFFECT)
+            });
+            if is_tutorial_or_help {
+                parked_ids.insert(id);
+            }
+        }
+        if parked_ids.is_empty() {
+            return;
+        }
+        for &id in &parked_ids {
+            if let Some(obj) = self.world.objects.get_mut(&id) {
+                obj.set_flags(SCHEDULER_READY, false);
+            }
+            if self.world.event_owner == id {
+                self.world.event_owner = 0;
+            }
+        }
+        self.world
+            .dialogs
+            .records
+            .retain(|rec| !parked_ids.contains(&rec.caller));
     }
 
     /// Detaches and returns the active [`CoopVmContext`], restoring
@@ -597,9 +1096,11 @@ impl Lot {
     }
 
     /// Executes an authoritative [`AppliedBatch`] (produced by
-    /// `LockstepNode::step_next_tick`) against this lot and keeps `session`
-    /// synchronized with any script-driven selection changes or newly opened
-    /// blocking modal dialogs.
+    /// `LockstepNode::step_next_tick`) against this lot in exact stamped
+    /// command order, validating tick and epoch continuity and keeping
+    /// `session` synchronized with any VM-validated selections, dialog
+    /// answers, script-driven selection changes, or newly opened blocking
+    /// modal dialogs.
     pub fn apply_coop_batch(
         &mut self,
         batch: &AppliedBatch,
@@ -608,7 +1109,49 @@ impl Lot {
         let Some(mut ctx) = self.coop.take() else {
             return Err(CoopError::NotAttached);
         };
-        ctx.session = session.clone();
+
+        // Validate tick and epoch continuity so duplicate or out-of-order
+        // externally supplied batches can never execute twice.
+        let expected_tick = ctx.session.current_tick.next();
+        if batch.tick != expected_tick {
+            self.coop = Some(ctx);
+            return Err(CoopError::Session(SessionError::UnexpectedTick {
+                expected: expected_tick,
+                actual: batch.tick,
+            }));
+        }
+        if session.current_tick != batch.tick {
+            self.coop = Some(ctx);
+            return Err(CoopError::Session(SessionError::UnexpectedTick {
+                expected: batch.tick,
+                actual: session.current_tick,
+            }));
+        }
+        if batch.epoch < ctx.session.epoch {
+            let expected = ctx.session.epoch;
+            self.coop = Some(ctx);
+            return Err(CoopError::Session(SessionError::EpochMismatch {
+                expected,
+                actual: batch.epoch,
+            }));
+        }
+        // Reconcile out-of-band host failover (`SessionState::promote_host`)
+        // that may have advanced `session.epoch` / `host_id` between ticks
+        // before `batch` ran (only when `batch` itself does not carry
+        // `HostChanged`).
+        let batch_has_host_changed = batch
+            .commands
+            .iter()
+            .any(|c| matches!(c.stamped.command, Command::HostChanged { .. }));
+        if !batch_has_host_changed && session.epoch > ctx.session.epoch {
+            let old_host = ctx.session.host_id;
+            if session.host_id != old_host && ctx.session.players.contains_key(&session.host_id) {
+                let _ = ctx.session.promote_host(session.host_id);
+                ctx.activity_owners.retain(|_, owner| *owner != old_host);
+            }
+            ctx.session.epoch = session.epoch;
+        }
+
         let result = self.execute_coop_batch(batch, &mut ctx, session);
         self.coop = Some(ctx);
         result
@@ -631,7 +1174,6 @@ impl Lot {
                 return Err(CoopError::Session(err));
             }
         };
-        ctx.session = session.clone();
         let result = self.execute_coop_batch(&applied, &mut ctx, &mut session);
         ctx.session = session;
         self.coop = Some(ctx);
@@ -644,96 +1186,146 @@ impl Lot {
         ctx: &mut CoopVmContext,
         session: &mut SessionState,
     ) -> Result<CoopBatchReport, CoopError> {
+        // Ensure local `self.frames` always matches the authoritative co-op
+        // frame schedule before running commands or stepping.
+        self.frames = ctx.frames.clone();
+
+        // Start from the exact pre-batch session and replay every command
+        // sequentially in host-stamped order so early commands never observe
+        // future commands in the same batch and VM-rejected selections/dialog
+        // answers never clobber valid state.
+        let mut running_session = ctx.session.clone();
+        ctx.session = running_session.clone();
+
         let mut command_results = Vec::with_capacity(batch.commands.len());
-        let mut speed_changed = false;
+        let mut script_changes: BTreeMap<PlayerId, Option<u16>> = BTreeMap::new();
 
         for item in &batch.commands {
             let stamped = &item.stamped;
-            let status = match &item.outcome {
-                CommandOutcome::Rejected(reason) => CoopCommandStatus::RejectedBySession(*reason),
-                CommandOutcome::Ignored(reason) => CoopCommandStatus::IgnoredBySession(*reason),
-                CommandOutcome::DialogWon {
-                    dialog_id,
-                    winner,
-                    answer,
-                } => self.apply_coop_dialog_answer(
-                    batch.tick, *dialog_id, *winner, answer, ctx, session,
-                ),
-                CommandOutcome::Applied => {
-                    ctx.session = session.clone();
-                    let status = self.apply_coop_command(stamped, ctx, session, &mut speed_changed);
-                    // Preserve any script-driven selection mutations (e.g. an
-                    // `at_once` action in `execute_coop_pick`).
-                    ctx.session = session.clone();
-                    status
-                }
-            };
+            let status = self.execute_single_coop_command(
+                batch.tick,
+                stamped,
+                ctx,
+                &mut running_session,
+                &mut script_changes,
+            )?;
             command_results.push((stamped.clone(), status));
         }
 
-        if speed_changed {
-            ctx.pending_speed_sync = true;
-        }
-
-        // Validate player selections against live persons and keep session
-        // synced before stepping.
-        self.sanitize_session_selections(session);
-        ctx.session = session.clone();
+        running_session.current_tick = batch.tick;
+        self.sanitize_session_selections(&mut running_session);
+        ctx.session = running_session.clone();
 
         // Sync globals, mode, pause, host camera, and host plumbob when not
-        // frozen on a dialog snapshot.
-        if self.asking.is_none() && !self.answered {
+        // frozen on a dialog tick.
+        if ctx.frozen_dialog.is_none() && self.asking.is_none() && !self.answered {
             let apply_speed = ctx.pending_speed_sync;
-            if let Err(err) = self.sync_world_from_session(session, apply_speed) {
-                return Err(CoopError::Order(err));
-            }
+            let before_sync = snapshot_selections(&ctx.session);
+            self.sync_world_from_session(ctx, apply_speed)?;
+            record_selection_deltas(&before_sync, &ctx.session, &mut script_changes);
+            running_session = ctx.session.clone();
             ctx.pending_speed_sync = false;
-            ctx.session = session.clone();
-        } else {
-            // Free Will (Global 30) and fixed session globals apply safely even
-            // while waiting on a dialog; leave pre-replay world globals intact
-            // for mode/pause/selection/speed until replay completes.
-            let _ = self.set_free_will(session.config.free_will);
         }
-
-        // Snapshot pre-step selections so we can report script-driven changes.
-        let before_selections: BTreeMap<PlayerId, Option<u16>> = session
-            .players
-            .iter()
-            .map(|(&pid, p)| (pid, p.selected_sim))
-            .collect();
 
         let mut stepped = false;
         let mut update = None;
         let mut opened_dialog = None;
 
-        if !session.is_paused() && self.asking.is_none() {
+        if !running_session.is_paused() && self.asking.is_none() {
             let play_mode = ctx.play_mode;
-            let pre_step_session = session.clone();
-            // Temporarily install `ctx` on `self.coop` so `step_in` threads it
-            // into `Interpreter` and rolls it back atomically on `Stop::Asks`.
-            self.coop = Some(ctx.clone());
-            let step_result = self.step_in(play_mode);
-            if let Some(updated_ctx) = self.coop.take() {
-                *ctx = updated_ctx;
+            let was_frozen = ctx.frozen_dialog.is_some();
+            let frozen = ctx
+                .frozen_dialog
+                .clone()
+                .unwrap_or_else(|| FrozenDialogTick {
+                    session: running_session.clone(),
+                    activity_owners: ctx.activity_owners.clone(),
+                    free_will: running_session.config.free_will,
+                });
+
+            // Build the exact step context from `frozen` so live replay and
+            // snapshot restore execute with bit-for-bit identical pre-tick
+            // inputs (session, activity_owners, free_will).
+            let mut step_ctx = ctx.clone();
+            step_ctx.session = frozen.session.clone();
+            step_ctx.activity_owners = frozen.activity_owners.clone();
+            if let Some(slot) = self.world.globals.get_mut(GLOBAL_FREE_WILL) {
+                *slot = i16::from(frozen.free_will);
             }
+
+            let pre_step_selections = snapshot_selections(&step_ctx.session);
+
+            // Install `step_ctx` on `self.coop` so `step_in` threads it into
+            // `Interpreter` and rolls it back atomically on `Stop::Asks`.
+            self.coop = Some(step_ctx);
+            let step_result = self.step_in(play_mode);
+            let updated_step_ctx = self.coop.take().unwrap_or_else(|| ctx.clone());
+
             match step_result {
                 Ok(upd) => {
                     stepped = true;
-                    ctx.dialog_open_session = None;
-                    // Prune activity owners for any removed objects.
+                    ctx.frozen_dialog = None;
+
+                    if was_frozen {
+                        // Explicit merge policy after replaying an interrupted
+                        // dialog tick:
+                        // 1. Apply any new activity_owners created during the
+                        //    replayed tick that weren't removed by departures.
+                        for (&obj_id, &owner) in &updated_step_ctx.activity_owners {
+                            if running_session.players.contains_key(&owner)
+                                && !ctx.activity_owners.contains_key(&obj_id)
+                            {
+                                ctx.activity_owners.insert(obj_id, owner);
+                            }
+                        }
+                        // 2. For every player whose selection was rewritten by
+                        //    a script during the replayed tick, apply the
+                        //    script's new selection ONLY if that player did not
+                        //    issue an intervening `SelectPerson` while the
+                        //    dialog waited.
+                        for (&pid, post_player) in &updated_step_ctx.session.players {
+                            let pre_sel = pre_step_selections.get(&pid).copied().flatten();
+                            let post_sel = post_player.selected_sim;
+                            if post_sel != pre_sel
+                                && let Some(live_player) = running_session.players.get_mut(&pid)
+                                && live_player.selected_sim == pre_sel
+                            {
+                                live_player.selected_sim = post_sel;
+                                script_changes.insert(pid, post_sel);
+                            }
+                        }
+                    } else {
+                        ctx.activity_owners = updated_step_ctx.activity_owners;
+                        record_selection_deltas(
+                            &pre_step_selections,
+                            &updated_step_ctx.session,
+                            &mut script_changes,
+                        );
+                        running_session = updated_step_ctx.session;
+                    }
+
+                    // Prune deleted objects from both `ctx.activity_owners` and
+                    // `running_session` selections.
+                    let before_prune = snapshot_selections(&running_session);
+                    ctx.session = running_session.clone();
                     for &removed_id in &upd.removed {
                         ctx.remove_object(removed_id);
                     }
-                    // Sync script-driven changes (Global 3 writes, deletions,
-                    // end-of-update reselection) back into authoritative session.
-                    *session = ctx.session.clone();
-                    self.sanitize_session_selections(session);
-                    ctx.session = session.clone();
-                    // Sync host plumbob if a script rewrote host's selection.
-                    if self.asking.is_none() && !self.answered {
-                        let _ = self.sync_host_plumbob(session);
-                    }
+                    running_session = ctx.session.clone();
+                    self.sanitize_session_selections(&mut running_session);
+                    record_selection_deltas(&before_prune, &running_session, &mut script_changes);
+                    ctx.session = running_session.clone();
+
+                    // Reconcile all post-replay / intervening session state
+                    // (`FreeWill`, `Speed`, `Mode`, `Pause`, `HostCamera`,
+                    // `HostPlumbob`) cleanly against the completed tick world.
+                    let apply_speed = ctx.pending_speed_sync || was_frozen;
+                    let before_post = snapshot_selections(&ctx.session);
+                    self.sync_world_from_session(ctx, apply_speed)?;
+                    record_selection_deltas(&before_post, &ctx.session, &mut script_changes);
+                    running_session = ctx.session.clone();
+                    ctx.pending_speed_sync = false;
+
                     update = Some(upd);
                 }
                 Err(StepError::Asking { .. }) => {
@@ -741,38 +1333,33 @@ impl Lot {
                         let dialog_id = DialogId(ctx.next_dialog_id);
                         ctx.next_dialog_id = ctx.next_dialog_id.saturating_add(1);
                         ctx.active_dialog = Some(dialog_id);
-                        ctx.dialog_open_session = Some(pre_step_session);
+                        // Preserve the ORIGINAL frozen pre-tick context across
+                        // every dialog in this interrupted tick.
+                        if ctx.frozen_dialog.is_none() {
+                            ctx.frozen_dialog = Some(frozen);
+                        }
                         let shown = asking.shown.clone();
-                        session.open_blocking_dialog(dialog_id, shown.object, batch.tick);
-                        ctx.session = session.clone();
+                        running_session.open_blocking_dialog(dialog_id, shown.object, batch.tick);
+                        ctx.session = running_session.clone();
                         opened_dialog = Some((dialog_id, shown));
                     }
                 }
                 Err(err) => {
-                    *session = ctx.session.clone();
+                    *session = running_session;
+                    ctx.session = session.clone();
                     return Err(CoopError::Step(err));
                 }
             }
         }
 
-        // Sync any post-step mode/pause/speed state after a dialog replay finishes.
-        if self.asking.is_none() && !self.answered {
-            let apply_speed = ctx.pending_speed_sync;
-            let _ = self.sync_world_from_session(session, apply_speed);
-            ctx.pending_speed_sync = false;
-        }
+        // Write our exact sequentially-validated session back to the caller.
+        *session = running_session;
         ctx.session = session.clone();
 
-        let script_selection_changes: Vec<(PlayerId, Option<u16>)> = session
-            .players
-            .iter()
-            .filter_map(|(&pid, p)| {
-                let prev = before_selections.get(&pid).copied().flatten();
-                (prev != p.selected_sim).then_some((pid, p.selected_sim))
-            })
-            .collect();
+        let script_selection_changes: Vec<(PlayerId, Option<u16>)> =
+            script_changes.into_iter().collect();
 
-        // Install `ctx` briefly so `coop_world_hash` includes `ctx` metadata.
+        // Install `ctx` briefly so `coop_world_hash` includes all `ctx` metadata.
         self.coop = Some(ctx.clone());
         let world_hash = self.coop_world_hash();
         let _ = self.coop.take();
@@ -790,58 +1377,22 @@ impl Lot {
         })
     }
 
-    fn apply_coop_dialog_answer(
+    fn execute_single_coop_command(
         &mut self,
         tick: Tick,
-        dialog_id: DialogId,
-        winner: PlayerId,
-        answer: &DialogAnswer,
-        ctx: &mut CoopVmContext,
-        session: &mut SessionState,
-    ) -> CoopCommandStatus {
-        if ctx.active_dialog != Some(dialog_id) {
-            return CoopCommandStatus::Refused(format!(
-                "no active blocking dialog matching {dialog_id}"
-            ));
-        }
-        let Some(asking_obj) = self.asking.as_ref().map(|a| a.shown.object) else {
-            ctx.active_dialog = None;
-            return CoopCommandStatus::Refused("lot is not waiting on a dialog".to_string());
-        };
-        let vm_answer = Answer {
-            status: answer.status,
-            bitmap_id: answer.bitmap_id,
-            text: answer.text.clone(),
-        };
-        match self.answer(vm_answer) {
-            Ok(()) => {
-                ctx.active_dialog = None;
-                CoopCommandStatus::DialogAnswered { dialog_id, winner }
-            }
-            Err(AnswerError::NotOffered { answer, offered }) => {
-                // `SessionState::apply_batch` removed `dialog_id` before button
-                // validation. Deterministically reopen it on every peer so an
-                // invalid button status can never bypass or desync the dialog.
-                session.open_blocking_dialog(dialog_id, asking_obj, tick);
-                ctx.session = session.clone();
-                CoopCommandStatus::Refused(format!(
-                    "dialog {dialog_id} offers {offered:?}, not {answer}"
-                ))
-            }
-            Err(err) => CoopCommandStatus::Refused(err.to_string()),
-        }
-    }
-
-    fn apply_coop_command(
-        &mut self,
         stamped: &StampedCommand,
         ctx: &mut CoopVmContext,
         session: &mut SessionState,
-        speed_changed: &mut bool,
-    ) -> CoopCommandStatus {
+        script_changes: &mut BTreeMap<PlayerId, Option<u16>>,
+    ) -> Result<CoopCommandStatus, CoopError> {
         let issuer = stamped.issuer;
         match &stamped.command {
             Command::SelectPerson { sim_id } => {
+                if !session.players.contains_key(&issuer) {
+                    return Ok(CoopCommandStatus::RejectedBySession(
+                        CommandRejectReason::UnknownIssuer,
+                    ));
+                }
                 if let Some(id) = *sim_id
                     && !self
                         .world
@@ -849,49 +1400,213 @@ impl Lot {
                         .get(&id)
                         .is_some_and(|o| o.person.is_some())
                 {
-                    if let Some(player) = session.players.get_mut(&issuer) {
-                        player.selected_sim = None;
-                    }
-                    return CoopCommandStatus::Refused(format!(
+                    // Validate BEFORE mutating `session` so an invalid
+                    // selection never clobbers a prior valid selection.
+                    return Ok(CoopCommandStatus::Refused(format!(
                         "object {id} is not a person on the lot"
+                    )));
+                }
+                if let Some(player) = session.players.get_mut(&issuer) {
+                    player.selected_sim = *sim_id;
+                }
+                ctx.session = session.clone();
+                if ctx.frozen_dialog.is_none()
+                    && self.asking.is_none()
+                    && !self.answered
+                    && issuer == session.host_id
+                {
+                    let before = snapshot_selections(&ctx.session);
+                    self.sync_host_plumbob_with_coop(ctx)?;
+                    record_selection_deltas(&before, &ctx.session, script_changes);
+                    *session = ctx.session.clone();
+                }
+                Ok(CoopCommandStatus::Applied)
+            }
+            Command::AnswerBlockingDialog { dialog_id, answer } => {
+                if !session.players.contains_key(&issuer) {
+                    return Ok(CoopCommandStatus::RejectedBySession(
+                        CommandRejectReason::UnknownIssuer,
                     ));
                 }
-                CoopCommandStatus::Applied
+                if !session.open_dialogs.contains_key(dialog_id) {
+                    return Ok(CoopCommandStatus::IgnoredBySession(
+                        CommandIgnoreReason::DialogAlreadyAnswered,
+                    ));
+                }
+                if ctx.active_dialog != Some(*dialog_id) {
+                    return Ok(CoopCommandStatus::Refused(format!(
+                        "no active blocking dialog matching {dialog_id}"
+                    )));
+                }
+                let Some(asking) = self.asking.as_ref() else {
+                    ctx.active_dialog = None;
+                    session.open_dialogs.remove(dialog_id);
+                    ctx.session = session.clone();
+                    return Ok(CoopCommandStatus::Refused(
+                        "lot is not waiting on a dialog".to_string(),
+                    ));
+                };
+                // Validate button status BEFORE removing `dialog_id` from
+                // `session.open_dialogs` so an invalid answer leaves the dialog
+                // open for a later valid answer in the SAME batch!
+                let offered = asking.shown.answers;
+                if !offered.contains(&answer.status) {
+                    return Ok(CoopCommandStatus::Refused(format!(
+                        "dialog {dialog_id} offers {offered:?}, not {}",
+                        answer.status
+                    )));
+                }
+                let vm_answer = Answer {
+                    status: answer.status,
+                    bitmap_id: answer.bitmap_id,
+                    text: answer.text.clone(),
+                };
+                match self.answer(vm_answer) {
+                    Ok(()) => {
+                        session.open_dialogs.remove(dialog_id);
+                        ctx.active_dialog = None;
+                        ctx.session = session.clone();
+                        Ok(CoopCommandStatus::DialogAnswered {
+                            dialog_id: *dialog_id,
+                            winner: issuer,
+                        })
+                    }
+                    Err(AnswerError::NotOffered { answer, offered }) => {
+                        Ok(CoopCommandStatus::Refused(format!(
+                            "dialog {dialog_id} offers {offered:?}, not {answer}"
+                        )))
+                    }
+                    Err(err) => Ok(CoopCommandStatus::Refused(err.to_string())),
+                }
             }
             Command::SetCameraRotation { rotation } => {
-                if issuer == session.host_id && self.asking.is_none() && !self.answered {
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return Ok(status);
+                }
+                ctx.session = session.clone();
+                if issuer == session.host_id
+                    && ctx.frozen_dialog.is_none()
+                    && self.asking.is_none()
+                    && !self.answered
+                {
                     self.set_view_rotation(rotation.quarter_turns());
                 }
-                CoopCommandStatus::Applied
+                Ok(CoopCommandStatus::Applied)
             }
-            Command::SetMode { .. }
-            | Command::SetPaused { .. }
-            | Command::SetHostSpeedLock { .. }
-            | Command::PlayerJoined { .. } => CoopCommandStatus::Applied,
-            Command::PlayerLeft { player_id, .. } => {
-                ctx.activity_owners.retain(|_, owner| owner != player_id);
-                CoopCommandStatus::Applied
-            }
-            Command::HostChanged { .. } => {
-                if self.asking.is_none() && !self.answered {
-                    let rot = session
-                        .players
-                        .get(&session.host_id)
-                        .map(|p| p.camera_rotation.quarter_turns())
-                        .unwrap_or(0);
-                    self.set_view_rotation(rot);
+            Command::SetMode { .. } => {
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return Ok(status);
                 }
-                CoopCommandStatus::Applied
+                ctx.session = session.clone();
+                if ctx.frozen_dialog.is_none() && self.asking.is_none() && !self.answered {
+                    let target_mode = player_mode_to_panel_mode(session.effective_mode());
+                    if self.mode() != target_mode {
+                        let before = snapshot_selections(&ctx.session);
+                        self.set_mode_with_coop(target_mode, ctx)?;
+                        record_selection_deltas(&before, &ctx.session, script_changes);
+                        *session = ctx.session.clone();
+                    }
+                    sync_pause_global(&mut self.world, session.is_paused());
+                }
+                Ok(CoopCommandStatus::Applied)
+            }
+            Command::SetPaused { .. } => {
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return Ok(status);
+                }
+                ctx.session = session.clone();
+                if ctx.frozen_dialog.is_none() && self.asking.is_none() && !self.answered {
+                    sync_pause_global(&mut self.world, session.is_paused());
+                }
+                Ok(CoopCommandStatus::Applied)
             }
             Command::SetSpeed { .. } => {
-                *speed_changed = true;
-                CoopCommandStatus::Applied
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return Ok(status);
+                }
+                ctx.session = session.clone();
+                if ctx.frozen_dialog.is_none() && self.asking.is_none() && !self.answered {
+                    self.world.set_speed(i32::from(session.time.speed.value()));
+                    ctx.pending_speed_sync = false;
+                } else {
+                    ctx.pending_speed_sync = true;
+                }
+                Ok(CoopCommandStatus::Applied)
             }
-            Command::SetFreeWill { enabled } => match self.set_free_will(*enabled) {
-                Ok(()) => CoopCommandStatus::Applied,
-                Err(err) => CoopCommandStatus::Refused(err.to_string()),
-            },
-            Command::AnswerBlockingDialog { .. } => CoopCommandStatus::Applied,
+            Command::SetFreeWill { .. } => {
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return Ok(status);
+                }
+                ctx.session = session.clone();
+                // While a blocking dialog tick is frozen, keep pre-tick
+                // `world.globals[30]` untouched so replay and snapshot probes
+                // run the exact tick that asked; post-replay sync writes the
+                // updated `session.config.free_will`.
+                if ctx.frozen_dialog.is_none()
+                    && self.asking.is_none()
+                    && !self.answered
+                    && let Err(err) = self.set_free_will(session.config.free_will)
+                {
+                    return Ok(CoopCommandStatus::Refused(err.to_string()));
+                }
+                Ok(CoopCommandStatus::Applied)
+            }
+            Command::SetHostSpeedLock { .. } => {
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return Ok(status);
+                }
+                ctx.session = session.clone();
+                Ok(CoopCommandStatus::Applied)
+            }
+            Command::PlayerJoined { player_id, .. } => {
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return Ok(status);
+                }
+                if let Some(player) = session.players.get_mut(player_id)
+                    && let Some(sim_id) = player.selected_sim
+                    && !self
+                        .world
+                        .objects
+                        .get(&sim_id)
+                        .is_some_and(|o| o.person.is_some())
+                {
+                    player.selected_sim = None;
+                }
+                ctx.session = session.clone();
+                Ok(CoopCommandStatus::Applied)
+            }
+            Command::PlayerLeft { player_id, .. } => {
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return Ok(status);
+                }
+                ctx.activity_owners.retain(|_, owner| owner != player_id);
+                ctx.session = session.clone();
+                if ctx.frozen_dialog.is_none() && self.asking.is_none() && !self.answered {
+                    let target_mode = player_mode_to_panel_mode(session.effective_mode());
+                    if self.mode() != target_mode {
+                        let before = snapshot_selections(&ctx.session);
+                        self.set_mode_with_coop(target_mode, ctx)?;
+                        record_selection_deltas(&before, &ctx.session, script_changes);
+                        *session = ctx.session.clone();
+                    }
+                    sync_pause_global(&mut self.world, session.is_paused());
+                }
+                Ok(CoopCommandStatus::Applied)
+            }
+            Command::HostChanged { .. } => {
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return Ok(status);
+                }
+                ctx.session = session.clone();
+                if ctx.frozen_dialog.is_none() && self.asking.is_none() && !self.answered {
+                    self.set_view_rotation(ctx.host_camera_rotation());
+                    let before = snapshot_selections(&ctx.session);
+                    self.sync_host_plumbob_with_coop(ctx)?;
+                    record_selection_deltas(&before, &ctx.session, script_changes);
+                    *session = ctx.session.clone();
+                }
+                Ok(CoopCommandStatus::Applied)
+            }
             Command::SimActionPick {
                 sim_id,
                 target_id,
@@ -899,85 +1614,152 @@ impl Lot {
                 joining,
                 args,
             } => {
-                if self.asking.is_some() || self.answered {
-                    return CoopCommandStatus::IgnoredWhileDialogPending;
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return Ok(status);
+                }
+                if ctx.frozen_dialog.is_some() || self.asking.is_some() || self.answered {
+                    return Ok(CoopCommandStatus::IgnoredWhileDialogPending);
+                }
+                if self.mode() != PanelMode::Live {
+                    return Ok(CoopCommandStatus::Refused(
+                        "cannot queue Sim actions while lot is in Buy/Build mode".into(),
+                    ));
                 }
                 let Ok(menu) = u32::try_from(*menu_index) else {
-                    return CoopCommandStatus::Refused(format!("negative menu index {menu_index}"));
+                    return Ok(CoopCommandStatus::Refused(format!(
+                        "negative menu index {menu_index}"
+                    )));
                 };
-                self.execute_coop_pick(
-                    issuer, *sim_id, *target_id, menu, *joining, *args, ctx, session,
-                )
+                ctx.session = session.clone();
+                let before = snapshot_selections(&ctx.session);
+                let status =
+                    self.execute_coop_pick(issuer, *sim_id, *target_id, menu, *joining, *args, ctx);
+                record_selection_deltas(&before, &ctx.session, script_changes);
+                *session = ctx.session.clone();
+                Ok(status)
             }
             Command::SimActionCancel {
                 sim_id,
                 interaction_uid,
             } => {
-                if self.asking.is_some() || self.answered {
-                    return CoopCommandStatus::IgnoredWhileDialogPending;
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return Ok(status);
                 }
-                match self.cancel_with_coop(*sim_id, i32::from(*interaction_uid), ctx) {
-                    Ok(counted) => {
-                        *session = ctx.session.clone();
-                        CoopCommandStatus::CancelledInteraction { counted }
+                if ctx.frozen_dialog.is_some() || self.asking.is_some() || self.answered {
+                    return Ok(CoopCommandStatus::IgnoredWhileDialogPending);
+                }
+                if self.mode() != PanelMode::Live {
+                    return Ok(CoopCommandStatus::Refused(
+                        "cannot cancel Sim actions while lot is in Buy/Build mode".into(),
+                    ));
+                }
+                let resolved_uid = match resolve_cancel_uid(&self.world, *sim_id, *interaction_uid)
+                {
+                    Ok(Some(uid)) => uid,
+                    Ok(None) => {
+                        return Ok(CoopCommandStatus::CancelledInteraction { counted: false });
                     }
+                    Err(msg) => return Ok(CoopCommandStatus::Refused(msg)),
+                };
+                ctx.session = session.clone();
+                let before = snapshot_selections(&ctx.session);
+                let status = match self.cancel_with_coop(*sim_id, resolved_uid, ctx) {
+                    Ok(counted) => CoopCommandStatus::CancelledInteraction { counted },
                     Err(err) => CoopCommandStatus::Refused(err.to_string()),
-                }
+                };
+                record_selection_deltas(&before, &ctx.session, script_changes);
+                *session = ctx.session.clone();
+                Ok(status)
             }
             Command::BuyBuild(edit) => {
-                if self.asking.is_some() || self.answered {
-                    return CoopCommandStatus::IgnoredWhileDialogPending;
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return Ok(status);
                 }
-                let status = self.execute_coop_buy_build(edit);
-                if matches!(status, CoopCommandStatus::BuyBuildApplied) {
-                    self.purge_coop_buy_build_history();
+                if ctx.frozen_dialog.is_some() || self.asking.is_some() || self.answered {
+                    return Ok(CoopCommandStatus::IgnoredWhileDialogPending);
                 }
-                status
+                let issuer_mode = session
+                    .players
+                    .get(&issuer)
+                    .map(|p| p.mode)
+                    .unwrap_or(PlayerMode::Live);
+                let required_mode = match edit {
+                    BuyBuildEdit::BuyObject { .. }
+                    | BuyBuildEdit::MoveObject { .. }
+                    | BuyBuildEdit::SellObject { .. } => PlayerMode::Buy,
+                    BuyBuildEdit::PlaceWall { .. }
+                    | BuyBuildEdit::RemoveWall { .. }
+                    | BuyBuildEdit::SetFloorTile { .. }
+                    | BuyBuildEdit::SetWallpaper { .. }
+                    | BuyBuildEdit::SetTerrainHeight { .. } => PlayerMode::Build,
+                };
+                if issuer_mode != required_mode {
+                    return Ok(CoopCommandStatus::Refused(format!(
+                        "{issuer} must be in {required_mode:?} mode to execute this edit \
+                         (currently {issuer_mode:?}, tick {tick})"
+                    )));
+                }
+                if self.mode() == PanelMode::Live {
+                    return Ok(CoopCommandStatus::Refused(
+                        "cannot execute Buy/Build edits while lot is in Live mode".into(),
+                    ));
+                }
+                ctx.session = session.clone();
+                let before = snapshot_selections(&ctx.session);
+                let status = self.execute_coop_buy_build(edit, ctx);
+                record_selection_deltas(&before, &ctx.session, script_changes);
+                *session = ctx.session.clone();
+                Ok(status)
             }
         }
     }
 
-    /// Purges detached Buy/Build undo/redo objects after a committed co-op
-    /// `BuyBuildEdit` so live host state matches `Lot::save()` bytes
-    /// bit-for-bit during mid-Buy/Build snapshot resync.
-    fn purge_coop_buy_build_history(&mut self) {
-        let has_history = !self.buy_undo.is_empty()
-            || !self.buy_redo.is_empty()
-            || !self.buy_orphans.is_empty()
-            || !self.build_undo.is_empty()
-            || !self.build_redo.is_empty();
-        if !has_history {
-            return;
-        }
-        let sounds = RefCell::new(Vec::new());
-        let interpreter = Interpreter {
-            sounds: Some(&sounds),
-            view_rotation: self.view_rotation,
-            view_centre: self.view_centre,
+    /// Constructs a co-op [`Interpreter`] with `coop` attached, host camera
+    /// rotation from `coop`, and `view_centre: None` (so local camera panning
+    /// never leaks into shared simulation callbacks).
+    fn coop_interpreter<'a>(
+        &'a self,
+        sounds: &'a RefCell<Vec<crate::SoundEvent>>,
+        character_names: &'a RefCell<BTreeMap<u32, String>>,
+        coop: &'a RefCell<CoopVmContext>,
+    ) -> Interpreter<'a> {
+        let host_rotation = coop.borrow().host_camera_rotation();
+        Interpreter {
+            sounds: Some(sounds),
+            view_rotation: host_rotation,
+            view_centre: None,
+            character_names: Some(character_names),
+            default_character_name: Some(&self.default_character_name),
+            active_family: (self.load.house != 0 && self.load.family == 0).then_some(&[][..]),
+            coop: Some(coop),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
-        };
-        let empty = BTreeSet::new();
-        let mut build_detached = Vec::new();
-        for entry in self.build_undo.iter().chain(self.build_redo.iter()) {
-            build_detached.extend_from_slice(entry.detached_objects());
         }
+    }
+
+    fn set_mode_with_coop(
+        &mut self,
+        mode: PanelMode,
+        ctx: &mut CoopVmContext,
+    ) -> Result<(), OrderError> {
+        self.ready()?;
+        let previous = self.mode();
+        let sounds = RefCell::new(Vec::new());
+        let character_names = RefCell::new(self.character_names.clone());
+        let coop_cell = RefCell::new(ctx.clone());
+        let interpreter = self.coop_interpreter(&sounds, &character_names, &coop_cell);
         let mut world = self.world.clone();
-        let ok = interpreter
-            .buy_purge_detached(&mut world, &self.buy_redo, &empty)
-            .and_then(|()| interpreter.buy_purge_detached(&mut world, &self.buy_undo, &empty))
-            .and_then(|()| interpreter.buy_purge_detached(&mut world, &self.buy_orphans, &empty))
-            .and_then(|()| interpreter.buy_purge_detached(&mut world, &build_detached, &empty))
-            .is_ok();
-        if ok {
-            self.world = world;
-            self.buy_undo.clear();
-            self.buy_redo.clear();
-            self.buy_orphans.clear();
-            self.build_undo.clear();
-            self.build_redo.clear();
-            self.undo_order.clear();
-            self.redo_order.clear();
+        interpreter
+            .set_mode(&mut world, mode)
+            .map_err(OrderError::Refused)?;
+        if previous != PanelMode::Live && mode == PanelMode::Live {
+            interpreter
+                .update_comeandsee(&mut world)
+                .map_err(OrderError::Refused)?;
         }
+        self.world = world;
+        self.character_names = character_names.into_inner();
+        *ctx = coop_cell.into_inner();
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -990,40 +1772,98 @@ impl Lot {
         joining: bool,
         args: [i16; 4],
         ctx: &mut CoopVmContext,
-        session: &mut SessionState,
     ) -> CoopCommandStatus {
         if let Err(err) = self.ready() {
             return CoopCommandStatus::Refused(err.to_string());
         }
+
+        // 1. Validate availability against a throwaway issuer-specific
+        //    `pie_menu` probe (CoW World clone, zero side effects on shared
+        //    state) so stale, unavailable, or forged picks and join offers are
+        //    rejected cleanly and join offers retain their exact running flags.
+        let matched_entry = {
+            let mut probe_ctx = ctx.clone();
+            probe_ctx.active_player_override = Some(issuer);
+            let player_rotation = probe_ctx
+                .session
+                .players
+                .get(&issuer)
+                .map(|p| p.camera_rotation.quarter_turns())
+                .unwrap_or_else(|| probe_ctx.host_camera_rotation());
+            let probe_coop = RefCell::new(probe_ctx);
+            let probe_sounds = RefCell::new(Vec::new());
+            let probe_names = RefCell::new(self.character_names.clone());
+            let probe_interp = Interpreter {
+                sounds: Some(&probe_sounds),
+                view_rotation: player_rotation,
+                view_centre: None,
+                character_names: Some(&probe_names),
+                default_character_name: Some(&self.default_character_name),
+                active_family: (self.load.house != 0 && self.load.family == 0).then_some(&[][..]),
+                coop: Some(&probe_coop),
+                ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+            };
+            let mut throwaway_world = self.world.clone();
+            let (probe_caller, probe_clicked) = if joining {
+                let Ok(origin_sim) = u16::try_from(args[2]) else {
+                    return CoopCommandStatus::Refused(format!(
+                        "invalid join origin Sim ID {}",
+                        args[2]
+                    ));
+                };
+                if origin_sim == 0 {
+                    return CoopCommandStatus::Refused("join action missing origin Sim ID".into());
+                }
+                (origin_sim, sim_id)
+            } else {
+                (sim_id, target_id)
+            };
+            let entries =
+                match probe_interp.pie_menu(&mut throwaway_world, probe_caller, probe_clicked) {
+                    Ok(entries) => entries,
+                    Err(fault) => return CoopCommandStatus::Refused(fault.to_string()),
+                };
+            let want_join = if joining { 1 } else { 0 };
+            entries.into_iter().find(|entry| {
+                entry.action.caller == sim_id as i16
+                    && entry.action.target == target_id as i16
+                    && entry.action.table_index == menu as i32
+                    && (entry.action.join != 0) == (want_join != 0)
+                    && entry.action.args == args
+            })
+        };
+
+        let Some(entry) = matched_entry else {
+            return CoopCommandStatus::Refused(format!(
+                "interaction (sim={sim_id}, target={target_id}, menu={menu}, joining={joining}) \
+                 is not currently offered"
+            ));
+        };
+
+        // 2. Stage `(mut world, coop_cell)` with `issuer` recorded as activity
+        //    owner BEFORE running `interpreter.pick` so any `at_once` script
+        //    observes the new owner. Commit ONLY on `Ok(Some(uid))` so a failed
+        //    at-once check or full queue (`Ok(None)`) never leaks RNG draws,
+        //    check-tree mutations, or phantom ownership into shared state.
+        let target_lead = u16::try_from(entry.action.target).ok().unwrap_or(target_id);
+        let mut staged_ctx = ctx.clone();
+        staged_ctx.record_activity_owner(sim_id, issuer);
+        staged_ctx.record_activity_owner(target_id, issuer);
+        staged_ctx.record_activity_owner(target_lead, issuer);
+
+        let sounds = RefCell::new(Vec::new());
         let character_names = RefCell::new(self.character_names.clone());
-        let coop_cell = RefCell::new(ctx.clone());
-        let interpreter = Interpreter {
-            view_rotation: self.view_rotation,
-            view_centre: self.view_centre,
-            character_names: Some(&character_names),
-            coop: Some(&coop_cell),
-            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
-        };
+        let coop_cell = RefCell::new(staged_ctx);
+        let interpreter = self.coop_interpreter(&sounds, &character_names, &coop_cell);
         let mut world = self.world.clone();
-        let (mut action, _) = match interpreter.menu_action(&mut world, sim_id, target_id, menu) {
-            Ok(built) => built,
-            Err(fault) => return CoopCommandStatus::Refused(fault.to_string()),
-        };
-        action.args = args;
-        if joining {
-            action.join = 1;
-        }
-        let target_lead = u16::try_from(action.target).ok().unwrap_or(target_id);
-        match interpreter.pick(&mut world, sim_id, action) {
-            Ok(uid) => {
+        match interpreter.pick(&mut world, sim_id, entry.action) {
+            Ok(Some(uid)) => {
                 self.world = world;
+                self.character_names = character_names.into_inner();
                 *ctx = coop_cell.into_inner();
-                *session = ctx.session.clone();
-                ctx.record_activity_owner(sim_id, issuer);
-                ctx.record_activity_owner(target_id, issuer);
-                ctx.record_activity_owner(target_lead, issuer);
-                CoopCommandStatus::QueuedInteraction { uid }
+                CoopCommandStatus::QueuedInteraction { uid: Some(uid) }
             }
+            Ok(None) => CoopCommandStatus::QueuedInteraction { uid: None },
             Err(fault) => CoopCommandStatus::Refused(fault.to_string()),
         }
     }
@@ -1038,183 +1878,299 @@ impl Lot {
         let sounds = RefCell::new(Vec::new());
         let character_names = RefCell::new(self.character_names.clone());
         let coop_cell = RefCell::new(ctx.clone());
-        let interpreter = Interpreter {
-            sounds: Some(&sounds),
-            view_rotation: self.view_rotation,
-            view_centre: self.view_centre,
-            character_names: Some(&character_names),
-            coop: Some(&coop_cell),
-            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
-        };
+        let interpreter = self.coop_interpreter(&sounds, &character_names, &coop_cell);
         let mut world = self.world.clone();
         let counts = interpreter
             .cancel(&mut world, person, uid)
             .map_err(OrderError::Refused)?;
         self.world = world;
+        self.character_names = character_names.into_inner();
         *ctx = coop_cell.into_inner();
         Ok(counts)
     }
 
-    fn execute_coop_buy_build(&mut self, edit: &BuyBuildEdit) -> CoopCommandStatus {
-        match edit {
+    /// Executes one [`BuyBuildEdit`] atomically on a staged `(World,
+    /// CoopVmContext)` with co-op callbacks enabled and catalog `build_prices`,
+    /// purging all detached objects before committing so live state is always
+    /// cursor-free and snapshot-ready. Any refusal or cleanup error leaves
+    /// `self` and `ctx` 100% untouched.
+    fn execute_coop_buy_build(
+        &mut self,
+        edit: &BuyBuildEdit,
+        ctx: &mut CoopVmContext,
+    ) -> CoopCommandStatus {
+        if let Err(err) = self.ready() {
+            return CoopCommandStatus::Refused(err.to_string());
+        }
+        let sounds = RefCell::new(Vec::new());
+        let character_names = RefCell::new(self.character_names.clone());
+        let coop_cell = RefCell::new(ctx.clone());
+        let interpreter = self.coop_interpreter(&sounds, &character_names, &coop_cell);
+        let mut world = self.world.clone();
+        let empty_keep = BTreeSet::new();
+
+        let result: Result<(), String> = match edit {
             BuyBuildEdit::BuyObject {
                 guid,
                 position,
                 facing,
-                container: _,
-            } => {
-                let mut cur = match self.buy_start(*guid, position[2], *facing) {
-                    Ok(Some(cur)) => cur,
-                    Ok(None) => {
-                        return CoopCommandStatus::Refused(
-                            "cannot start Buy cursor (insufficient funds or busy)".to_string(),
-                        );
-                    }
-                    Err(err) => return CoopCommandStatus::Refused(err.to_string()),
-                };
-                let valid = match self.buy_move(&mut cur, [position[0], position[1]], position[2]) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        let _ = self.buy_cancel(&cur);
-                        return CoopCommandStatus::Refused(err.to_string());
-                    }
-                };
-                if !valid {
-                    let _ = self.buy_cancel(&cur);
-                    return CoopCommandStatus::Refused(
-                        "Buy placement does not fit at target position".to_string(),
-                    );
+                container,
+            } => (|| {
+                let target_facing = facing.rem_euclid(8);
+                let snapped = snap_to_tile_centre([position[0], position[1]]);
+                let mut cur = interpreter
+                    .buy_start(&mut world, *guid, position[2], target_facing)
+                    .map_err(|f| f.to_string())?
+                    .ok_or_else(|| "cannot start Buy cursor (insufficient funds)".to_string())?;
+                if let Some(target_container) = *container {
+                    cur.position = [snapped[0], snapped[1], position[2]];
+                    cur.container = Some(target_container);
                 }
-                match self.buy_commit(&cur) {
-                    Ok(_) => CoopCommandStatus::BuyBuildApplied,
-                    Err(err) => {
-                        let _ = self.buy_cancel(&cur);
-                        CoopCommandStatus::Refused(err.to_string())
-                    }
+                let valid = interpreter
+                    .buy_move(
+                        &mut world,
+                        &mut cur,
+                        [position[0], position[1]],
+                        position[2],
+                    )
+                    .map_err(|f| f.to_string())?;
+                if !valid || !cur.valid {
+                    return Err("Buy placement does not fit or is unaffordable".into());
                 }
-            }
+                let actual_facing = world
+                    .objects
+                    .get(&cur.held)
+                    .and_then(|o| o.data.get(DATA_FACING).copied())
+                    .unwrap_or(0)
+                    .rem_euclid(8);
+                if actual_facing != target_facing {
+                    return Err(format!(
+                        "Buy placement facing drifted from requested {target_facing} to \
+                         {actual_facing}"
+                    ));
+                }
+                if cur.container != *container {
+                    return Err(format!(
+                        "Buy placement container {:?} did not match requested {:?}",
+                        cur.container, container
+                    ));
+                }
+                if cur.position != [snapped[0], snapped[1], position[2]] {
+                    return Err(format!(
+                        "Buy placement position {:?} did not match requested [{}, {}, {}]",
+                        cur.position, snapped[0], snapped[1], position[2]
+                    ));
+                }
+                let _purchase = interpreter
+                    .buy_commit_record(&mut world, &cur)
+                    .map_err(|f| f.to_string())?;
+                Ok(())
+            })(),
             BuyBuildEdit::MoveObject {
                 object_id,
                 position,
                 facing,
-                container: _,
-            } => {
-                let mut cur = match self.buy_pick_up(*object_id) {
-                    Ok(Some(cur)) => cur,
-                    Ok(None) => {
-                        return CoopCommandStatus::Refused(format!(
-                            "object {object_id} cannot be picked up"
-                        ));
-                    }
-                    Err(err) => return CoopCommandStatus::Refused(err.to_string()),
-                };
-                if let Err(err) = self.buy_rotate(&mut cur, *facing) {
-                    let _ = self.buy_snap_back(&cur);
-                    return CoopCommandStatus::Refused(err.to_string());
+                container,
+            } => (|| {
+                let target_facing = facing.rem_euclid(8);
+                let snapped = snap_to_tile_centre([position[0], position[1]]);
+                let mut cur = interpreter
+                    .buy_pick_up(&mut world, *object_id)
+                    .map_err(|f| f.to_string())?
+                    .ok_or_else(|| format!("object {object_id} cannot be picked up"))?;
+                interpreter
+                    .buy_rotate(&mut world, &mut cur, target_facing)
+                    .map_err(|f| f.to_string())?;
+                let rotated_facing = world
+                    .objects
+                    .get(&cur.held)
+                    .and_then(|o| o.data.get(DATA_FACING).copied())
+                    .unwrap_or(0)
+                    .rem_euclid(8);
+                if rotated_facing != target_facing {
+                    return Err(format!(
+                        "object {object_id} cannot rotate to requested facing {target_facing}"
+                    ));
                 }
-                let valid = match self.buy_move(&mut cur, [position[0], position[1]], position[2]) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        let _ = self.buy_snap_back(&cur);
-                        return CoopCommandStatus::Refused(err.to_string());
-                    }
-                };
-                if !valid {
-                    let _ = self.buy_snap_back(&cur);
-                    return CoopCommandStatus::Refused(
-                        "moved object does not fit at target position".to_string(),
-                    );
+                if let Some(target_container) = *container {
+                    cur.position = [snapped[0], snapped[1], position[2]];
+                    cur.container = Some(target_container);
+                } else {
+                    cur.container = None;
                 }
-                match self.buy_commit(&cur) {
-                    Ok(_) => CoopCommandStatus::BuyBuildApplied,
-                    Err(err) => {
-                        let _ = self.buy_snap_back(&cur);
-                        CoopCommandStatus::Refused(err.to_string())
-                    }
+                let valid = interpreter
+                    .buy_move(
+                        &mut world,
+                        &mut cur,
+                        [position[0], position[1]],
+                        position[2],
+                    )
+                    .map_err(|f| f.to_string())?;
+                if !valid || !cur.valid {
+                    return Err("moved object does not fit at target position".into());
                 }
-            }
-            BuyBuildEdit::SellObject { object_id } => {
-                let cur = match self.buy_pick_up(*object_id) {
-                    Ok(Some(cur)) => cur,
-                    Ok(None) => {
-                        return CoopCommandStatus::Refused(format!(
-                            "object {object_id} cannot be picked up to sell"
-                        ));
-                    }
-                    Err(err) => return CoopCommandStatus::Refused(err.to_string()),
-                };
-                match self.buy_sell(&cur) {
-                    Ok(true) => CoopCommandStatus::BuyBuildApplied,
-                    Ok(false) => {
-                        let _ = self.buy_snap_back(&cur);
-                        CoopCommandStatus::Refused(format!("object {object_id} cannot be sold"))
-                    }
-                    Err(err) => {
-                        let _ = self.buy_snap_back(&cur);
-                        CoopCommandStatus::Refused(err.to_string())
-                    }
+                let actual_facing = world
+                    .objects
+                    .get(&cur.held)
+                    .and_then(|o| o.data.get(DATA_FACING).copied())
+                    .unwrap_or(0)
+                    .rem_euclid(8);
+                if actual_facing != target_facing {
+                    return Err(format!(
+                        "Move placement facing drifted from requested {target_facing} to \
+                         {actual_facing}"
+                    ));
                 }
-            }
+                if cur.container != *container {
+                    return Err(format!(
+                        "Move placement container {:?} did not match requested {:?}",
+                        cur.container, container
+                    ));
+                }
+                if cur.position != [snapped[0], snapped[1], position[2]] {
+                    return Err(format!(
+                        "Move placement position {:?} did not match requested [{}, {}, {}]",
+                        cur.position, snapped[0], snapped[1], position[2]
+                    ));
+                }
+                let _purchase = interpreter
+                    .buy_commit_record(&mut world, &cur)
+                    .map_err(|f| f.to_string())?;
+                Ok(())
+            })(),
+            BuyBuildEdit::SellObject { object_id } => (|| {
+                let cur = interpreter
+                    .buy_pick_up(&mut world, *object_id)
+                    .map_err(|f| f.to_string())?
+                    .ok_or_else(|| format!("object {object_id} cannot be picked up to sell"))?;
+                let sold = interpreter
+                    .buy_sell(&mut world, &cur)
+                    .map_err(|f| f.to_string())?
+                    .ok_or_else(|| format!("object {object_id} cannot be sold"))?;
+                if let Some(purchase) = sold {
+                    // Purge the detached sold instance immediately inside the
+                    // staged transaction so `removal.rs` cleans `activity_owners`
+                    // and live state stays 100% snapshot-ready.
+                    interpreter
+                        .buy_purge_detached(
+                            &mut world,
+                            std::slice::from_ref(&purchase),
+                            &empty_keep,
+                        )
+                        .map_err(|f| f.to_string())?;
+                }
+                Ok(())
+            })(),
             BuyBuildEdit::PlaceWall {
                 x,
                 y,
                 level,
                 style,
-                pattern: _,
-            } => {
-                let prices = build_prices_default();
-                let wall_style = WallStyle::from_style_id(*style).unwrap_or(WallStyle::Standard);
+                pattern,
+            } => (|| {
+                let Some(wall_style) = WallStyle::from_style_id(*style) else {
+                    return Err(format!("unknown wall style {style}"));
+                };
+                if WallStyle::is_fence_style(wall_style.style_id())
+                    && *pattern != 0
+                    && *pattern != wall_style.default_pattern()
+                {
+                    return Err(format!(
+                        "fence style {style} cannot take wallpaper pattern {pattern}"
+                    ));
+                }
                 let plan = plan_wall_drag(
-                    &self.world,
+                    &world,
                     [i32::from(*x), i32::from(*y)],
                     [i32::from(*x) + 1, i32::from(*y)],
                     *level,
                     wall_style,
                     WallDragMode::Build,
-                    &prices,
+                    &ctx.build_prices,
                 );
                 if !plan.valid || !plan.affordable {
-                    return CoopCommandStatus::Refused(
-                        "wall placement invalid or unaffordable".into(),
-                    );
+                    return Err("wall placement invalid or unaffordable".into());
                 }
-                match self.build_commit_wall(&plan) {
-                    Ok(true) => CoopCommandStatus::BuyBuildApplied,
-                    Ok(false) => {
-                        CoopCommandStatus::Refused("wall placement produced no change".into())
+                let history = interpreter
+                    .build_commit_wall(&mut world, &plan)
+                    .map_err(|f| f.to_string())?
+                    .ok_or_else(|| "wall placement produced no change".to_string())?;
+                interpreter
+                    .buy_purge_detached(&mut world, history.detached_objects(), &empty_keep)
+                    .map_err(|f| f.to_string())?;
+
+                // If a non-default wallpaper pattern was requested on a
+                // standard wall, apply it to both faces of the newly built
+                // north segment (`(tx, ty) WALL_NORTH` and `(tx, ty - 1)
+                // WALL_SOUTH`) inside the same atomic transaction using
+                // `ctx.build_prices`.
+                if *pattern != 0 && *pattern != wall_style.default_pattern() {
+                    let (Ok(tx), Ok(ty)) = (u8::try_from(*x), u8::try_from(*y)) else {
+                        return Err("wall tile out of range for wallpaper pattern".into());
+                    };
+                    let mut faces = vec![WallFace {
+                        tile: [tx, ty],
+                        bit: WALL_NORTH,
+                        side: 0,
+                    }];
+                    if let Some(north_y) = ty.checked_sub(1) {
+                        faces.push(WallFace {
+                            tile: [tx, north_y],
+                            bit: WALL_SOUTH,
+                            side: 0,
+                        });
                     }
-                    Err(err) => CoopCommandStatus::Refused(err.to_string()),
+                    let wp_plan = plan_wallpaper_edit(
+                        &world,
+                        &faces,
+                        *level,
+                        *pattern,
+                        WallpaperDragMode::Apply,
+                        &ctx.build_prices,
+                    );
+                    if !wp_plan.valid || !wp_plan.affordable {
+                        return Err(format!(
+                            "wall pattern {pattern} invalid or unaffordable on new wall"
+                        ));
+                    }
+                    let wp_hist = interpreter
+                        .build_commit_wallpaper(&mut world, &wp_plan)
+                        .map_err(|f| f.to_string())?
+                        .ok_or_else(|| "wall pattern application produced no change".to_string())?;
+                    interpreter
+                        .buy_purge_detached(&mut world, wp_hist.detached_objects(), &empty_keep)
+                        .map_err(|f| f.to_string())?;
                 }
-            }
-            BuyBuildEdit::RemoveWall { x, y, level } => {
-                let prices = build_prices_default();
+                Ok(())
+            })(),
+            BuyBuildEdit::RemoveWall { x, y, level } => (|| {
                 let plan = plan_wall_drag(
-                    &self.world,
+                    &world,
                     [i32::from(*x), i32::from(*y)],
                     [i32::from(*x) + 1, i32::from(*y)],
                     *level,
                     WallStyle::Standard,
                     WallDragMode::Demolish,
-                    &prices,
+                    &ctx.build_prices,
                 );
                 if !plan.valid {
-                    return CoopCommandStatus::Refused("wall removal invalid".into());
+                    return Err("wall removal invalid".into());
                 }
-                match self.build_commit_wall(&plan) {
-                    Ok(true) => CoopCommandStatus::BuyBuildApplied,
-                    Ok(false) => {
-                        CoopCommandStatus::Refused("wall removal produced no change".into())
-                    }
-                    Err(err) => CoopCommandStatus::Refused(err.to_string()),
-                }
-            }
+                let history = interpreter
+                    .build_commit_wall(&mut world, &plan)
+                    .map_err(|f| f.to_string())?
+                    .ok_or_else(|| "wall removal produced no change".to_string())?;
+                interpreter
+                    .buy_purge_detached(&mut world, history.detached_objects(), &empty_keep)
+                    .map_err(|f| f.to_string())?;
+                Ok(())
+            })(),
             BuyBuildEdit::SetFloorTile {
                 x,
                 y,
                 level,
                 pattern,
-            } => {
-                let prices = build_prices_default();
+            } => (|| {
                 let mode = if *pattern == 0 {
                     FloorDragMode::Remove
                 } else {
@@ -1222,39 +2178,43 @@ impl Lot {
                 };
                 let tile = [i32::from(*x), i32::from(*y)];
                 let plan = plan_floor_edit(
-                    &self.world,
+                    &world,
                     tile,
                     tile,
                     *level,
                     *pattern,
                     mode,
-                    &prices,
+                    &ctx.build_prices,
                     None,
                 );
                 if !plan.valid || !plan.affordable {
-                    return CoopCommandStatus::Refused("floor edit invalid or unaffordable".into());
+                    return Err("floor edit invalid or unaffordable".into());
                 }
-                match self.build_commit_floor(&plan) {
-                    Ok(true) => CoopCommandStatus::BuyBuildApplied,
-                    Ok(false) => CoopCommandStatus::Refused("floor edit produced no change".into()),
-                    Err(err) => CoopCommandStatus::Refused(err.to_string()),
-                }
-            }
+                let history = interpreter
+                    .build_commit_floor(&mut world, &plan)
+                    .map_err(|f| f.to_string())?
+                    .ok_or_else(|| "floor edit produced no change".to_string())?;
+                interpreter
+                    .buy_purge_detached(&mut world, history.detached_objects(), &empty_keep)
+                    .map_err(|f| f.to_string())?;
+                Ok(())
+            })(),
             BuyBuildEdit::SetWallpaper {
                 x,
                 y,
                 level,
                 side,
                 pattern,
-            } => {
+            } => (|| {
                 let (Ok(tx), Ok(ty)) = (u8::try_from(*x), u8::try_from(*y)) else {
-                    return CoopCommandStatus::Refused("wallpaper tile out of range".into());
+                    return Err("wallpaper tile out of range".into());
                 };
-                let bit = match *side & 3 {
+                let bit = match *side {
                     0 => WALL_NORTH,
                     1 => WALL_EAST,
                     2 => WALL_SOUTH,
-                    _ => WALL_WEST,
+                    3 => WALL_WEST,
+                    _ => return Err(format!("invalid wallpaper side {side} (expected 0..=3)")),
                 };
                 let face = WallFace {
                     tile: [tx, ty],
@@ -1266,25 +2226,33 @@ impl Lot {
                 } else {
                     WallpaperDragMode::Apply
                 };
-                let prices = build_prices_default();
                 let plan =
-                    plan_wallpaper_edit(&self.world, &[face], *level, *pattern, mode, &prices);
+                    plan_wallpaper_edit(&world, &[face], *level, *pattern, mode, &ctx.build_prices);
                 if !plan.valid || !plan.affordable {
-                    return CoopCommandStatus::Refused(
-                        "wallpaper edit invalid or unaffordable".into(),
-                    );
+                    return Err("wallpaper edit invalid or unaffordable".into());
                 }
-                match self.build_commit_wallpaper(&plan) {
-                    Ok(true) => CoopCommandStatus::BuyBuildApplied,
-                    Ok(false) => {
-                        CoopCommandStatus::Refused("wallpaper edit produced no change".into())
-                    }
-                    Err(err) => CoopCommandStatus::Refused(err.to_string()),
-                }
-            }
+                let history = interpreter
+                    .build_commit_wallpaper(&mut world, &plan)
+                    .map_err(|f| f.to_string())?
+                    .ok_or_else(|| "wallpaper edit produced no change".to_string())?;
+                interpreter
+                    .buy_purge_detached(&mut world, history.detached_objects(), &empty_keep)
+                    .map_err(|f| f.to_string())?;
+                Ok(())
+            })(),
             BuyBuildEdit::SetTerrainHeight { .. } => {
-                CoopCommandStatus::Refused("terrain height editing is not yet ported".to_string())
+                Err("terrain height editing is not yet ported".to_string())
             }
+        };
+
+        match result {
+            Ok(()) => {
+                self.world = world;
+                self.character_names = character_names.into_inner();
+                *ctx = coop_cell.into_inner();
+                CoopCommandStatus::BuyBuildApplied
+            }
+            Err(msg) => CoopCommandStatus::Refused(msg),
         }
     }
 
@@ -1304,33 +2272,30 @@ impl Lot {
 
     fn sync_world_from_session(
         &mut self,
-        session: &SessionState,
+        ctx: &mut CoopVmContext,
         apply_speed: bool,
     ) -> Result<(), OrderError> {
-        sync_session_globals(&mut self.world, session);
+        sync_session_globals(&mut self.world, &ctx.session);
         if apply_speed {
-            self.world.set_speed(i32::from(session.time.speed.value()));
+            self.world
+                .set_speed(i32::from(ctx.session.time.speed.value()));
         }
-        let host_rot = session
-            .players
-            .get(&session.host_id)
-            .map(|p| p.camera_rotation.quarter_turns())
-            .unwrap_or(self.view_rotation);
-        self.set_view_rotation(host_rot);
+        self.set_view_rotation(ctx.host_camera_rotation());
 
-        let target_mode = player_mode_to_panel_mode(session.effective_mode());
+        let target_mode = player_mode_to_panel_mode(ctx.session.effective_mode());
         if self.mode() != target_mode {
-            self.set_mode(target_mode)?;
+            self.set_mode_with_coop(target_mode, ctx)?;
         }
-        sync_pause_global(&mut self.world, session.is_paused());
-        self.sync_host_plumbob(session)?;
+        sync_pause_global(&mut self.world, ctx.session.is_paused());
+        self.sync_host_plumbob_with_coop(ctx)?;
         Ok(())
     }
 
-    fn sync_host_plumbob(&mut self, session: &SessionState) -> Result<(), OrderError> {
-        let host_selected = session
+    fn sync_host_plumbob_with_coop(&mut self, ctx: &mut CoopVmContext) -> Result<(), OrderError> {
+        let host_selected = ctx
+            .session
             .players
-            .get(&session.host_id)
+            .get(&ctx.session.host_id)
             .and_then(|p| p.selected_sim);
         if self.world.selected() == host_selected {
             if let Some(slot) = self.world.globals.get_mut(GLOBAL_SELECTED) {
@@ -1340,18 +2305,17 @@ impl Lot {
         }
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
-        let interpreter = Interpreter {
-            sounds: Some(&sounds),
-            view_rotation: self.view_rotation,
-            view_centre: self.view_centre,
-            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
-        };
+        let character_names = RefCell::new(self.character_names.clone());
+        let coop_cell = RefCell::new(ctx.clone());
+        let interpreter = self.coop_interpreter(&sounds, &character_names, &coop_cell);
         let mut world = self.world.clone();
         interpreter
             .select(&mut world, host_selected)
             .map_err(OrderError::Refused)?;
         interpreter.refresh_family_panel(&mut world);
         self.world = world;
+        self.character_names = character_names.into_inner();
+        *ctx = coop_cell.into_inner();
         Ok(())
     }
 
@@ -1408,15 +2372,17 @@ impl Lot {
             .players
             .get(&player)
             .map(|p| p.camera_rotation.quarter_turns())
-            .unwrap_or(self.view_rotation);
+            .unwrap_or_else(|| probe_ctx.host_camera_rotation());
         let coop_cell = RefCell::new(probe_ctx);
         let sounds = RefCell::new(Vec::new());
         let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: player_rotation,
-            view_centre: self.view_centre,
+            view_centre: None,
             character_names: Some(&character_names),
+            default_character_name: Some(&self.default_character_name),
+            active_family: (self.load.house != 0 && self.load.family == 0).then_some(&[][..]),
             coop: Some(&coop_cell),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
@@ -1430,20 +2396,38 @@ impl Lot {
         })
     }
 
-    /// Computes a deterministic 32-byte SHA-256 hash covering both `World`
-    /// (format 32 + format-8 auxiliary tables) and `Lot`/co-op VM metadata.
+    /// Computes a deterministic 32-byte SHA-256 hash covering `World` (format
+    /// 32 + format-8 auxiliary tables) and all `Lot`/co-op continuation inputs
+    /// (`frames`, `portrait_anchor`, `build_prices`, `answers`, `replay_view`,
+    /// `frozen_dialog`, `play_mode`, `play.fresh`, `activity_owners`).
     ///
     /// Pass this digest to `sims_net::LockstepNode::report_local_tick` and
     /// `sims_net::LockstepNode::send_snapshot` so periodic drift detection and
     /// snapshot verification match [`Self::coop_state_fingerprint`] bit-for-bit.
     pub fn coop_world_hash(&self) -> [u8; 32] {
         let w = &self.world;
+        let effective_view_rotation = self
+            .coop
+            .as_ref()
+            .map_or(self.view_rotation, CoopVmContext::host_camera_rotation);
+        let frozen_dialog_digest = self
+            .coop
+            .as_ref()
+            .and_then(|c| c.frozen_dialog.as_ref())
+            .map(FrozenDialogTick::digest);
         let tail = CoopWorldFingerprintTail {
             world_hash: w.hash(),
             ticks: self.ticks,
-            view_rotation: self.view_rotation,
+            view_rotation: effective_view_rotation,
             answered: self.answered,
             asking: self.asking.as_ref().map(|a| (a.shown.tick, a.shown.object)),
+            answers: &self.player,
+            replay_view_rotation: self.replay_view.map(|(rot, _)| rot),
+            frames: self.coop.as_ref().map_or(&self.frames, |c| &c.frames),
+            portrait_anchor: self.coop.as_ref().and_then(|c| c.portrait_anchor),
+            build_prices: self.coop.as_ref().map(|c| &c.build_prices),
+            play_mode: self.coop.as_ref().is_some_and(|c| c.play_mode),
+            play_fresh: &self.play.fresh,
             last_dialog_text: &self.last_dialog_text,
             character_names: &self.character_names,
             generated_portrait_2002: &w.generated_portrait_2002,
@@ -1463,6 +2447,7 @@ impl Lot {
             activity_owners: self.coop.as_ref().map(|c| &c.activity_owners),
             next_dialog_id: self.coop.as_ref().map(|c| c.next_dialog_id),
             active_dialog: self.coop.as_ref().and_then(|c| c.active_dialog),
+            frozen_dialog_digest,
             pending_speed_sync: self.coop.as_ref().is_some_and(|c| c.pending_speed_sync),
         };
         let encoded = postcard::to_allocvec(&tail)
@@ -1489,16 +2474,22 @@ impl Lot {
                 activity_owners: ctx.activity_owners.clone(),
                 next_dialog_id: ctx.next_dialog_id,
                 active_dialog: ctx.active_dialog,
-                dialog_open_session: ctx.dialog_open_session.clone(),
+                frozen_dialog: ctx.frozen_dialog.clone(),
                 pending_speed_sync: ctx.pending_speed_sync,
+                frames: ctx.frames.clone(),
+                portrait_anchor: ctx.portrait_anchor,
+                build_prices: ctx.build_prices.clone(),
                 play_mode: ctx.play_mode,
             },
             None => CoopSnapshotMeta {
                 activity_owners: BTreeMap::new(),
                 next_dialog_id: 1,
                 active_dialog: None,
-                dialog_open_session: None,
+                frozen_dialog: None,
                 pending_speed_sync: false,
+                frames: self.frames.clone(),
+                portrait_anchor: None,
+                build_prices: self.default_coop_build_prices(),
                 play_mode: false,
             },
         };
@@ -1513,15 +2504,40 @@ impl Lot {
     }
 
     /// Restores a co-op snapshot emitted via `NodeEvent::ApplySnapshot`
-    /// (`redb_bytes` + `session`) onto this lot.
+    /// (`redb_bytes` + `session`) onto this lot transactionally: if decoding,
+    /// metadata validation, or mid-dialog re-probing fails, `self` is restored
+    /// to its previous state unchanged.
     ///
     /// Accepts both [`Self::coop_snapshot_bytes`] envelopes and plain
-    /// [`Saved::encode`] bytes.
+    /// [`Saved::encode`] bytes (when `session.open_dialogs` is empty).
     pub fn restore_coop_snapshot(
         &mut self,
         bytes: &[u8],
         session: SessionState,
     ) -> Result<(), SaveError> {
+        self.restore_coop_snapshot_inner(bytes, session, None)
+    }
+
+    /// Transactionally restores a co-op snapshot AND verifies that the
+    /// resulting [`StateFingerprint`] matches `expected_fingerprint`, rolling
+    /// back `self` unchanged if verification fails.
+    pub fn restore_coop_snapshot_verified(
+        &mut self,
+        bytes: &[u8],
+        session: SessionState,
+        expected_fingerprint: StateFingerprint,
+    ) -> Result<(), SaveError> {
+        self.restore_coop_snapshot_inner(bytes, session, Some(expected_fingerprint))
+    }
+
+    fn restore_coop_snapshot_inner(
+        &mut self,
+        bytes: &[u8],
+        session: SessionState,
+        expected_fingerprint: Option<StateFingerprint>,
+    ) -> Result<(), SaveError> {
+        // 1. Validate envelope, `Saved` payload, and dialog consistency BEFORE
+        //    mutating `self`.
         let (saved_bytes, meta) = if bytes.starts_with(COOP_SNAPSHOT_MAGIC) {
             let Some((header, body)) = bytes.split_first_chunk::<8>() else {
                 return Err(SaveError::Format("truncated co-op snapshot header".into()));
@@ -1542,62 +2558,209 @@ impl Lot {
             }
             (env.saved_bytes, env.meta)
         } else {
+            if !session.open_dialogs.is_empty() {
+                return Err(SaveError::Format(
+                    "raw Saved snapshot lacks co-op dialog metadata required by open session \
+                     dialogs"
+                        .into(),
+                ));
+            }
             (
                 bytes.to_vec(),
                 CoopSnapshotMeta {
                     activity_owners: BTreeMap::new(),
                     next_dialog_id: 1,
                     active_dialog: None,
-                    dialog_open_session: None,
+                    frozen_dialog: None,
                     pending_speed_sync: false,
+                    frames: Frames::default(),
+                    portrait_anchor: None,
+                    build_prices: self.default_coop_build_prices(),
                     play_mode: false,
                 },
             )
         };
 
+        if !session.open_dialogs.is_empty() {
+            let Some(active_id) = meta.active_dialog else {
+                return Err(SaveError::Format(
+                    "co-op snapshot has open session dialogs without active_dialog metadata".into(),
+                ));
+            };
+            if !session.open_dialogs.contains_key(&active_id) {
+                return Err(SaveError::Format(format!(
+                    "co-op snapshot active_dialog {active_id} missing from session.open_dialogs"
+                )));
+            }
+        } else if meta.active_dialog.is_some() {
+            return Err(SaveError::Format(
+                "co-op snapshot has active_dialog metadata while session.open_dialogs is empty"
+                    .into(),
+            ));
+        }
+
         let saved = Saved::decode(&saved_bytes)?;
-        self.restore(saved)?;
-        self.wait_for_answers();
 
-        let probe_session = meta
-            .dialog_open_session
-            .clone()
-            .unwrap_or_else(|| session.clone());
-        let mut ctx = CoopVmContext::new(probe_session);
-        ctx.activity_owners = meta.activity_owners;
-        ctx.next_dialog_id = meta.next_dialog_id.max(1);
-        ctx.active_dialog = meta.active_dialog;
-        ctx.dialog_open_session = meta.dialog_open_session;
-        ctx.pending_speed_sync = meta.pending_speed_sync;
-        ctx.play_mode = meta.play_mode;
-        self.coop = Some(ctx);
+        // 2. Capture rollback checkpoint of all mutable `Lot` fields so any
+        //    later failure (including mid-dialog re-probe or fingerprint
+        //    mismatch) leaves `self` completely intact.
+        let backup_world = self.world.clone();
+        let backup_ticks = self.ticks;
+        let backup_start = self.start;
+        let backup_player = self.player.clone();
+        let backup_frames = self.frames.clone();
+        let backup_play = self.play.clone();
+        let backup_asks = self.asks;
+        let backup_view_rotation = self.view_rotation;
+        let backup_view_centre = self.view_centre;
+        let backup_replay_view = self.replay_view;
+        let backup_last_dialog_text = self.last_dialog_text.clone();
+        let backup_character_names = self.character_names.clone();
+        let backup_lot_name = self.lot_name.clone();
+        let backup_lot_description = self.lot_description.clone();
+        let backup_halted = self.halted;
+        let backup_asking = self.asking.clone();
+        let backup_answered = self.answered;
+        let backup_buy_undo = self.buy_undo.clone();
+        let backup_buy_redo = self.buy_redo.clone();
+        let backup_buy_orphans = self.buy_orphans.clone();
+        let backup_active_buy_cursor = self.active_buy_cursor.clone();
+        let backup_build_undo = self.build_undo.clone();
+        let backup_build_redo = self.build_redo.clone();
+        let backup_undo_order = self.undo_order.clone();
+        let backup_redo_order = self.redo_order.clone();
+        let backup_active_wall_cursor = self.active_wall_cursor.clone();
+        let backup_neighborhood_origin = self.neighborhood_origin.clone();
+        let backup_coop = self.coop.clone();
 
-        // If the snapshot was captured while a blocking dialog was awaiting an
-        // answer (`Saved` intentionally stores the pre-tick world without
-        // `Lot::asking`), re-run the tick probe using `dialog_open_session` so
-        // `self.asking` and `self.replay_view` match the host identically even
-        // if players changed camera/selection while the dialog remained open.
-        if meta.active_dialog.is_some() && self.asking.is_none() && !self.answered {
-            match self.step_in(meta.play_mode) {
-                Err(StepError::Asking { .. }) => {}
-                Ok(_) => {
-                    return Err(SaveError::Format(
-                        "co-op snapshot expected an open blocking dialog on restore, but tick \
-                         completed without asking"
-                            .into(),
-                    ));
+        let apply_result: Result<(), SaveError> = (|| {
+            self.restore(saved)?;
+            self.wait_for_answers();
+            self.frames = meta.frames.clone();
+
+            let probe_frozen = meta.frozen_dialog.clone();
+            let probe_session = probe_frozen
+                .as_ref()
+                .map(|f| f.session.clone())
+                .unwrap_or_else(|| session.clone());
+            let probe_owners = probe_frozen
+                .as_ref()
+                .map(|f| f.activity_owners.clone())
+                .unwrap_or_else(|| meta.activity_owners.clone());
+
+            let mut ctx = CoopVmContext::new(probe_session);
+            ctx.activity_owners = probe_owners;
+            ctx.next_dialog_id = meta.next_dialog_id.max(1);
+            ctx.active_dialog = meta.active_dialog;
+            ctx.frozen_dialog = meta.frozen_dialog;
+            ctx.pending_speed_sync = meta.pending_speed_sync;
+            ctx.frames = meta.frames;
+            ctx.portrait_anchor = meta.portrait_anchor;
+            ctx.build_prices = meta.build_prices;
+            ctx.play_mode = meta.play_mode;
+            self.coop = Some(ctx);
+
+            // If the snapshot was captured while a blocking dialog was awaiting
+            // an answer (`Saved` intentionally stores the pre-tick world
+            // without `Lot::asking`), re-run the tick probe using the exact
+            // frozen `(session, activity_owners, free_will)` so `self.asking`
+            // and `self.replay_view` match the host identically.
+            if meta.active_dialog.is_some() && self.asking.is_none() && !self.answered {
+                if let Some(frozen) = probe_frozen.as_ref()
+                    && let Some(slot) = self.world.globals.get_mut(GLOBAL_FREE_WILL)
+                {
+                    *slot = i16::from(frozen.free_will);
                 }
-                Err(err) => {
+                match self.step_in(meta.play_mode) {
+                    Err(StepError::Asking { .. }) => {}
+                    Ok(_) => {
+                        return Err(SaveError::Format(
+                            "co-op snapshot expected an open blocking dialog on restore, but tick \
+                             completed without asking"
+                                .into(),
+                        ));
+                    }
+                    Err(err) => {
+                        return Err(SaveError::Format(format!(
+                            "replaying open co-op blocking dialog failed: {err}"
+                        )));
+                    }
+                }
+            }
+
+            if let Some(ctx) = self.coop.as_mut() {
+                ctx.activity_owners = meta.activity_owners;
+                ctx.session = session;
+                self.view_rotation = ctx.host_camera_rotation();
+            }
+
+            if let Some(expected) = expected_fingerprint {
+                let actual = self
+                    .coop_state_fingerprint(&self.coop.as_ref().expect("coop installed").session);
+                if actual != expected {
                     return Err(SaveError::Format(format!(
-                        "replaying open co-op blocking dialog failed: {err}"
+                        "restored co-op snapshot fingerprint {actual:?} did not match expected \
+                         {expected:?}"
                     )));
                 }
             }
+            Ok(())
+        })();
+
+        if let Err(err) = apply_result {
+            self.world = backup_world;
+            self.ticks = backup_ticks;
+            self.start = backup_start;
+            self.player = backup_player;
+            self.frames = backup_frames;
+            self.play = backup_play;
+            self.asks = backup_asks;
+            self.view_rotation = backup_view_rotation;
+            self.view_centre = backup_view_centre;
+            self.replay_view = backup_replay_view;
+            self.last_dialog_text = backup_last_dialog_text;
+            self.character_names = backup_character_names;
+            self.lot_name = backup_lot_name;
+            self.lot_description = backup_lot_description;
+            self.halted = backup_halted;
+            self.asking = backup_asking;
+            self.answered = backup_answered;
+            self.buy_undo = backup_buy_undo;
+            self.buy_redo = backup_buy_redo;
+            self.buy_orphans = backup_buy_orphans;
+            self.active_buy_cursor = backup_active_buy_cursor;
+            self.build_undo = backup_build_undo;
+            self.build_redo = backup_build_redo;
+            self.undo_order = backup_undo_order;
+            self.redo_order = backup_redo_order;
+            self.active_wall_cursor = backup_active_wall_cursor;
+            self.neighborhood_origin = backup_neighborhood_origin;
+            self.coop = backup_coop;
+            return Err(err);
         }
-        if let Some(ctx) = self.coop.as_mut() {
-            ctx.session = session;
-        }
+
         Ok(())
+    }
+}
+
+fn snapshot_selections(session: &SessionState) -> BTreeMap<PlayerId, Option<u16>> {
+    session
+        .players
+        .iter()
+        .map(|(&pid, p)| (pid, p.selected_sim))
+        .collect()
+}
+
+fn record_selection_deltas(
+    before: &BTreeMap<PlayerId, Option<u16>>,
+    after: &SessionState,
+    out: &mut BTreeMap<PlayerId, Option<u16>>,
+) {
+    for (&pid, p) in &after.players {
+        let prev = before.get(&pid).copied().flatten();
+        if prev != p.selected_sim {
+            out.insert(pid, p.selected_sim);
+        }
     }
 }
 
@@ -1608,7 +2771,7 @@ mod tests {
     use sims_content::Catalog;
     use sims_formats::behavior::{Behavior, Instruction};
     use sims_formats::saved_objects::{Frame, Interaction, Person};
-    use sims_net::{PlayerRole, SessionConfig};
+    use sims_net::SessionConfig;
     use sims_sim::Object;
 
     fn test_person(id: u16, guid: u32, pos: [i32; 3]) -> Object {
@@ -1735,7 +2898,6 @@ mod tests {
         };
         let mut behaviors = BTreeMap::new();
         // Tree 4096: Expression `Temp[0] := Global[3]`
-        // Operands: left_index=0, right_index=3, op=5 (=), left_scope=8 (temps), right_scope=6 (global)
         behaviors.insert(
             4096,
             make_tree(
@@ -1878,7 +3040,6 @@ mod tests {
         world.order = vec![10, 20, 30, 40];
         world.people = vec![10, 20, 30];
         world.objects.get_mut(&10).unwrap().selected = true;
-        // Silence unused Frame import when constructing synthetic stacks elsewhere.
         let _ = std::mem::size_of::<Frame>();
         (program, catalog, world)
     }
@@ -1894,24 +3055,20 @@ mod tests {
             ..Interpreter::new(&program, &catalog, Stream::Lot)
         };
 
-        // Both Host's Sim (10) and Peer's Sim (20) see `MyData[11] == Global[3]` as true!
         assert!(interp.run_tree(&mut world, 10, 4097, 0, &[], 100).unwrap());
         assert!(interp.run_tree(&mut world, 20, 4097, 0, &[], 100).unwrap());
-        // Unselected Sim (30) sees `MyData[11] == Global[3]` as false!
         assert!(!interp.run_tree(&mut world, 30, 4097, 0, &[], 100).unwrap());
 
-        // Non-Sim object (40) owned by Peer 2 reads Peer 2's selected Sim (20).
         interp.run_tree(&mut world, 40, 4096, 0, &[], 100).unwrap();
         assert_eq!(world.objects[&40].temps[0], 20);
 
-        // Removing activity owner falls back to Host's selected Sim (10).
         coop_cell.borrow_mut().activity_owners.clear();
         interp.run_tree(&mut world, 40, 4096, 0, &[], 100).unwrap();
         assert_eq!(world.objects[&40].temps[0], 10);
     }
 
     #[test]
-    fn global_3_script_write_updates_only_affected_players() {
+    fn global_3_script_write_updates_only_affected_players_and_reconciles_host_projection() {
         let (program, catalog, mut world) = run_expr_world();
         let coop_cell = RefCell::new(CoopVmContext::new(two_player_session(Some(10), Some(20))));
         let interp = Interpreter {
@@ -1919,39 +3076,59 @@ mod tests {
             ..Interpreter::new(&program, &catalog, Stream::Lot)
         };
 
-        // Sim 20 (selected by Peer 2) writes Global[3] := 30 (e.g. Kid To Adult Backfire).
+        // Sim 20 (selected by Peer 2) writes Global[3] := 30.
         assert!(
             interp
                 .run_tree(&mut world, 20, 4098, 0, &[30], 100)
                 .unwrap()
         );
-        let ctx = coop_cell.borrow();
-        assert_eq!(ctx.session.players[&PlayerId(1)].selected_sim, Some(10));
-        assert_eq!(ctx.session.players[&PlayerId(2)].selected_sim, Some(30));
+        {
+            let ctx = coop_cell.borrow();
+            assert_eq!(ctx.session.players[&PlayerId(1)].selected_sim, Some(10));
+            assert_eq!(ctx.session.players[&PlayerId(2)].selected_sim, Some(30));
+        }
+        assert_eq!(world.selected(), Some(10));
         assert_eq!(world.globals[GLOBAL_SELECTED], 10);
+
+        // Sim 10 (selected by Host 1) writes Global[3] := 20 -> host projection
+        // (`world.selected()` + `world.globals[3]`) must reconcile immediately!
+        assert!(
+            interp
+                .run_tree(&mut world, 10, 4098, 0, &[20], 100)
+                .unwrap()
+        );
+        assert_eq!(
+            coop_cell.borrow().session.players[&PlayerId(1)].selected_sim,
+            Some(20)
+        );
+        assert_eq!(world.selected(), Some(20));
+        assert_eq!(world.globals[GLOBAL_SELECTED], 20);
     }
 
     #[test]
-    fn per_player_camera_rotation_drives_tile_depth_per_sim() {
+    fn per_player_camera_rotation_drives_tile_depth_and_unselected_sim_uses_host() {
         let (program, catalog, mut world) = run_expr_world();
-        // Host P1 has Sim 10 with NORTH (0); Peer P2 has Sim 20 with SOUTH (2).
-        let coop_cell = RefCell::new(CoopVmContext::new(two_player_session(Some(10), Some(20))));
+        let mut ctx = CoopVmContext::new(two_player_session(Some(10), Some(20)));
+        // Even if Peer 2 owns an activity on unselected Sim 30, Sim 30 is a
+        // person and must strictly fall back to the host's rotation (NORTH = 0),
+        // even when `stack_object` is Peer 2's selected Sim (20)!
+        ctx.record_activity_owner(30, PlayerId(2));
+        let coop_cell = RefCell::new(ctx);
         let interp = Interpreter {
             view_rotation: 0,
             coop: Some(&coop_cell),
             ..Interpreter::new(&program, &catalog, Stream::Lot)
         };
 
-        // Object 40 is at fine (160, 320) -> tile (10, 20).
-        // NORTH (0): -(10 + 20) = -30.
-        // SOUTH (2): turn_tile((10, 20), 2) = (53, 43) -> -(53 + 43) = -96.
         interp.run_tree(&mut world, 10, 4099, 40, &[], 100).unwrap();
         interp.run_tree(&mut world, 20, 4099, 40, &[], 100).unwrap();
-        interp.run_tree(&mut world, 30, 4099, 40, &[], 100).unwrap();
+        interp.run_tree(&mut world, 30, 4099, 20, &[], 100).unwrap();
         assert_eq!(world.objects[&10].temps[0], -30);
         assert_eq!(world.objects[&20].temps[0], -96);
-        // Unselected Sim 30 falls back to host rotation (NORTH = 0 -> -30).
-        assert_eq!(world.objects[&30].temps[0], -30);
+        assert_eq!(
+            world.objects[&30].temps[0], -30,
+            "unselected Sim must never borrow another player's camera"
+        );
     }
 
     #[test]
@@ -1971,5 +3148,452 @@ mod tests {
             PanelMode::Build
         );
         assert_eq!(player_mode_to_panel_mode(PlayerMode::Buy), PanelMode::Buy);
+    }
+
+    #[test]
+    fn resolve_cancel_uid_handles_large_serials_and_rejects_wrap_collision() {
+        let (_, _, mut world) = run_expr_world();
+        let person = world.objects.get_mut(&10).unwrap().person.as_mut().unwrap();
+        person.active.uid = 40_000;
+        let mut q1 = person.active.clone();
+        q1.uid = 100_000;
+        person.queue.push(q1);
+
+        assert_eq!(
+            resolve_cancel_uid(&world, 10, cancel_uid_to_wire(40_000)).unwrap(),
+            Some(40_000)
+        );
+        assert_eq!(
+            resolve_cancel_uid(&world, 10, cancel_uid_to_wire(100_000)).unwrap(),
+            Some(100_000)
+        );
+        assert_eq!(resolve_cancel_uid(&world, 10, 123).unwrap(), None);
+
+        // Two interactions sharing low 16 bits (40_000 and 40_000 + 65_536) must
+        // refuse deterministically rather than cancelling the wrong one.
+        let person = world.objects.get_mut(&10).unwrap().person.as_mut().unwrap();
+        let mut q2 = person.active.clone();
+        q2.uid = 40_000 + 65_536;
+        person.queue.push(q2);
+        assert!(resolve_cancel_uid(&world, 10, cancel_uid_to_wire(40_000)).is_err());
+    }
+
+    fn synthetic_coop_lot(program: Program, catalog: Catalog, world: World, frames: Frames) -> Lot {
+        use crate::boot::{Finished, LoadReport};
+        use crate::play::Play;
+        use sims_sim::motives::{Curve, Rates, Tuning};
+        let rates = || Rates::from_lookup(0, |_| None);
+        let curve = |motive| Curve::parse(motive, "(-100;1)(100;1)", 8);
+        let tuning = Tuning {
+            rates: [rates(), rates(), rates()],
+            adult_mood: vec![curve(7)],
+            child_mood: vec![curve(7)],
+        };
+        Lot {
+            program,
+            catalog,
+            surfaces: sims_content::Surfaces::default(),
+            world,
+            tuning: Some(tuning),
+            player: Answers::default(),
+            frames,
+            ticks: 0,
+            start: 0,
+            load: LoadReport {
+                finished: Some(Finished {
+                    indicators_made: false,
+                    sim: Some(10),
+                    counted: 0,
+                }),
+                ..LoadReport::default()
+            },
+            halted: false,
+            play: Play::default(),
+            asks: false,
+            answered: false,
+            asking: None,
+            view_rotation: 0,
+            floor_rotation: 0,
+            view_centre: None,
+            replay_view: None,
+            last_dialog_text: String::new(),
+            character_names: BTreeMap::new(),
+            default_character_name: String::new(),
+            lot_name: String::new(),
+            lot_description: String::new(),
+            loaded: [0; 32],
+            buy_undo: Vec::new(),
+            buy_redo: Vec::new(),
+            buy_orphans: Vec::new(),
+            active_buy_cursor: None,
+            build_undo: Vec::new(),
+            build_redo: Vec::new(),
+            undo_order: Vec::new(),
+            redo_order: Vec::new(),
+            active_wall_cursor: None,
+            neighborhood_origin: None,
+            coop: None,
+        }
+    }
+
+    #[test]
+    fn tutorial_lot_refused_and_duplicate_batch_rejected() {
+        let (program, catalog, mut world) = run_expr_world();
+        world.globals[GLOBAL_TUTORIAL] = 1;
+        let mut lot =
+            synthetic_coop_lot(program.clone(), catalog.clone(), world, Frames::default());
+        let session = two_player_session(Some(10), Some(20));
+        assert!(
+            lot.attach_coop(session.clone()).is_err(),
+            "tutorial lots (Global 26 != 0) must be rejected in co-op mode"
+        );
+
+        let (_, _, mut world2) = run_expr_world();
+        for obj in world2.objects.values_mut() {
+            obj.set_flags(SCHEDULER_READY, false);
+        }
+        let mut lot2 = synthetic_coop_lot(program, catalog, world2, Frames::parse("none").unwrap());
+        let mut s = session;
+        lot2.attach_coop_context(
+            CoopVmContext::new(s.clone()).with_frames(Frames::parse("none").unwrap()),
+        )
+        .expect("attach");
+        let batch1 = TickBatch {
+            epoch: s.epoch,
+            tick: Tick(1),
+            pacing_hint_ms: 0,
+            host_fingerprint: None,
+            commands: Vec::new(),
+        };
+        let applied1 = s.apply_batch(&batch1).expect("apply batch 1");
+        let _ = lot2.apply_coop_batch(&applied1, &mut s).expect("tick 1");
+        // Re-applying tick 1 must fail deterministically!
+        let err = lot2.apply_coop_batch(&applied1, &mut s).unwrap_err();
+        assert!(matches!(
+            err,
+            CoopError::Session(SessionError::UnexpectedTick {
+                expected: Tick(2),
+                actual: Tick(1)
+            })
+        ));
+    }
+
+    #[test]
+    fn blocking_dialog_same_batch_valid_answer_frozen_replay_and_snapshot() {
+        use sims_sim::Dialog;
+        // Build a synthetic non-tutorial lot with a pending 2-button modal
+        // dialog record on object 40 (offers statuses [2, 3], kind 1).
+        let (mut program, catalog, mut world) = run_expr_world();
+        // Give object 40 a definition so scheduler/end-of-update handles it cleanly.
+        program
+            .libraries
+            .get_mut(&0)
+            .unwrap()
+            .definitions
+            .insert(4, [0; crate::DEFINITION_WORDS]);
+        for obj in world.objects.values_mut() {
+            obj.set_flags(SCHEDULER_READY, false);
+        }
+        // Push a NEW modal Yes/No dialog (kind 1, modal bit 7 clear, non-inform bit 0 clear).
+        world.dialogs.records.push(Dialog {
+            caller: 40,
+            operands: [0, 0, 0, 0, 0, 1, 0, 0],
+            status: 0,
+        });
+
+        let mut host_lot = synthetic_coop_lot(
+            program.clone(),
+            catalog.clone(),
+            world.clone(),
+            Frames::parse("none").unwrap(),
+        );
+        let mut peer_lot = synthetic_coop_lot(
+            program,
+            catalog,
+            world,
+            Frames::default(), // intentionally different local schedule!
+        );
+
+        let mut session = two_player_session(Some(10), Some(20));
+        let host_ctx =
+            CoopVmContext::new(session.clone()).with_frames(Frames::parse("none").unwrap());
+        host_lot.attach_coop_context(host_ctx).expect("attach host");
+
+        // Tick 1: stepping hits the non-tutorial blocking dialog and freezes `FrozenDialogTick`.
+        let b1 = TickBatch {
+            epoch: session.epoch,
+            tick: Tick(1),
+            pacing_hint_ms: 0,
+            host_fingerprint: None,
+            commands: Vec::new(),
+        };
+        let a1 = session.apply_batch(&b1).unwrap();
+        let r1 = host_lot.apply_coop_batch(&a1, &mut session).unwrap();
+        assert!(!r1.stepped);
+        let (dlg_id, shown) = r1.opened_dialog.expect("blocking dialog opens");
+        assert_eq!(shown.answers, &[2, 3]);
+        assert!(session.is_paused());
+
+        // Intervening changes while the dialog waits: Free Will + selection + camera rotation.
+        let b2 = TickBatch {
+            epoch: session.epoch,
+            tick: Tick(2),
+            pacing_hint_ms: 0,
+            host_fingerprint: None,
+            commands: vec![
+                StampedCommand {
+                    tick: Tick(2),
+                    sequence: 0,
+                    issuer: PlayerId(1),
+                    command: Command::SetFreeWill { enabled: false },
+                },
+                StampedCommand {
+                    tick: Tick(2),
+                    sequence: 1,
+                    issuer: PlayerId(2),
+                    command: Command::SelectPerson { sim_id: Some(30) },
+                },
+                StampedCommand {
+                    tick: Tick(2),
+                    sequence: 2,
+                    issuer: PlayerId(2),
+                    command: Command::SetCameraRotation {
+                        rotation: CameraRotation::WEST,
+                    },
+                },
+            ],
+        };
+        let a2 = session.apply_batch(&b2).unwrap();
+        let r2 = host_lot.apply_coop_batch(&a2, &mut session).unwrap();
+        assert!(!r2.stepped);
+        // Pre-tick world must stay untouched while frozen (Free Will still 0/original!).
+        assert_eq!(host_lot.world().globals[GLOBAL_FREE_WILL], 1);
+
+        // Mid-dialog snapshot restore onto peer with DIFFERENT local `Frames`:
+        let snap = host_lot.coop_snapshot_bytes().expect("mid-dialog snap");
+        let fp2 = host_lot.coop_state_fingerprint(&session);
+        peer_lot
+            .restore_coop_snapshot_verified(&snap, session.clone(), fp2)
+            .expect("verified mid-dialog restore");
+        assert!(peer_lot.asking().is_some());
+        assert_eq!(
+            peer_lot.coop().unwrap().frames,
+            Frames::parse("none").unwrap()
+        );
+
+        // Tick 3: invalid answer (status 99) from Host followed by VALID answer (status 3)
+        // from Peer in the SAME batch, PLUS explicit pause so replay waits!
+        let mut peer_session = session.clone();
+        let b3 = TickBatch {
+            epoch: session.epoch,
+            tick: Tick(3),
+            pacing_hint_ms: 0,
+            host_fingerprint: None,
+            commands: vec![
+                StampedCommand {
+                    tick: Tick(3),
+                    sequence: 0,
+                    issuer: PlayerId(1),
+                    command: Command::SetPaused { paused: true },
+                },
+                StampedCommand {
+                    tick: Tick(3),
+                    sequence: 1,
+                    issuer: PlayerId(1),
+                    command: Command::AnswerBlockingDialog {
+                        dialog_id: dlg_id,
+                        answer: sims_net::DialogAnswer {
+                            status: 99,
+                            bitmap_id: None,
+                            text: None,
+                        },
+                    },
+                },
+                StampedCommand {
+                    tick: Tick(3),
+                    sequence: 2,
+                    issuer: PlayerId(2),
+                    command: Command::AnswerBlockingDialog {
+                        dialog_id: dlg_id,
+                        answer: sims_net::DialogAnswer {
+                            status: 3,
+                            bitmap_id: None,
+                            text: None,
+                        },
+                    },
+                },
+            ],
+        };
+        let a3_h = session.apply_batch(&b3).unwrap();
+        let a3_p = peer_session.apply_batch(&b3).unwrap();
+        let r3_h = host_lot.apply_coop_batch(&a3_h, &mut session).unwrap();
+        let r3_p = peer_lot.apply_coop_batch(&a3_p, &mut peer_session).unwrap();
+        assert!(!r3_h.stepped, "explicit pause holds replay until unpaused");
+        assert!(matches!(
+            r3_h.command_results[1].1,
+            CoopCommandStatus::Refused(_)
+        ));
+        assert!(matches!(
+            r3_h.command_results[2].1,
+            CoopCommandStatus::DialogAnswered {
+                winner: PlayerId(2),
+                ..
+            }
+        ));
+        assert_eq!(r3_h.state_fingerprint, r3_p.state_fingerprint);
+        assert!(session.open_dialogs.is_empty());
+
+        // Answered-but-paused snapshot restore must also match bit-for-bit!
+        let snap_ans = host_lot.coop_snapshot_bytes().expect("answered snap");
+        let mut joiner = synthetic_coop_lot(
+            host_lot.program.clone(),
+            host_lot.catalog.clone(),
+            World::empty(),
+            Frames::default(),
+        );
+        joiner
+            .restore_coop_snapshot_verified(&snap_ans, session.clone(), r3_h.state_fingerprint)
+            .expect("answered-but-paused snapshot restore");
+
+        // Tick 4: unpause -> replay runs with frozen pre-tick context, then applies
+        // deferred Free Will (false) and preserves Peer 2's intervening selection (30)!
+        let mut joiner_session = session.clone();
+        let b4 = TickBatch {
+            epoch: session.epoch,
+            tick: Tick(4),
+            pacing_hint_ms: 0,
+            host_fingerprint: None,
+            commands: vec![StampedCommand {
+                tick: Tick(4),
+                sequence: 0,
+                issuer: PlayerId(1),
+                command: Command::SetPaused { paused: false },
+            }],
+        };
+        let a4_h = session.apply_batch(&b4).unwrap();
+        let a4_p = peer_session.apply_batch(&b4).unwrap();
+        let a4_j = joiner_session.apply_batch(&b4).unwrap();
+        let r4_h = host_lot.apply_coop_batch(&a4_h, &mut session).unwrap();
+        let r4_p = peer_lot.apply_coop_batch(&a4_p, &mut peer_session).unwrap();
+        let r4_j = joiner.apply_coop_batch(&a4_j, &mut joiner_session).unwrap();
+        assert!(r4_h.stepped && r4_p.stepped && r4_j.stepped);
+        assert_eq!(r4_h.state_fingerprint, r4_p.state_fingerprint);
+        assert_eq!(r4_h.state_fingerprint, r4_j.state_fingerprint);
+        assert_eq!(
+            host_lot.world().globals[GLOBAL_FREE_WILL],
+            0,
+            "deferred Free Will change must apply once dialog replay completes"
+        );
+        assert_eq!(
+            session.players[&PlayerId(2)].selected_sim,
+            Some(30),
+            "intervening selection must be preserved after replay"
+        );
+    }
+
+    #[test]
+    fn sequential_batch_selection_and_mode_gating() {
+        let (program, catalog, mut world) = run_expr_world();
+        for obj in world.objects.values_mut() {
+            obj.set_flags(SCHEDULER_READY, false);
+        }
+        let mut lot = synthetic_coop_lot(program, catalog, world, Frames::parse("none").unwrap());
+        let mut session = two_player_session(Some(10), Some(20));
+        lot.attach_coop_context(
+            CoopVmContext::new(session.clone()).with_frames(Frames::parse("none").unwrap()),
+        )
+        .expect("attach");
+
+        // Same batch: Peer 2 selects invalid ID 9999 -> refused WITHOUT clobbering 20;
+        // then selects valid 30 -> applied; then selects invalid 8888 -> refused WITHOUT clobbering 30!
+        // Also BuyBuild in Live mode -> refused!
+        let b1 = TickBatch {
+            epoch: session.epoch,
+            tick: Tick(1),
+            pacing_hint_ms: 0,
+            host_fingerprint: None,
+            commands: vec![
+                StampedCommand {
+                    tick: Tick(1),
+                    sequence: 0,
+                    issuer: PlayerId(2),
+                    command: Command::SelectPerson { sim_id: Some(9999) },
+                },
+                StampedCommand {
+                    tick: Tick(1),
+                    sequence: 1,
+                    issuer: PlayerId(2),
+                    command: Command::SelectPerson { sim_id: Some(30) },
+                },
+                StampedCommand {
+                    tick: Tick(1),
+                    sequence: 2,
+                    issuer: PlayerId(2),
+                    command: Command::SelectPerson { sim_id: Some(8888) },
+                },
+                StampedCommand {
+                    tick: Tick(1),
+                    sequence: 3,
+                    issuer: PlayerId(1),
+                    command: Command::BuyBuild(BuyBuildEdit::PlaceWall {
+                        x: 5,
+                        y: 5,
+                        level: 1,
+                        style: 1,
+                        pattern: 0,
+                    }),
+                },
+            ],
+        };
+        let a1 = session.apply_batch(&b1).unwrap();
+        let r1 = lot.apply_coop_batch(&a1, &mut session).unwrap();
+        assert!(matches!(
+            r1.command_results[0].1,
+            CoopCommandStatus::Refused(_)
+        ));
+        assert_eq!(r1.command_results[1].1, CoopCommandStatus::Applied);
+        assert!(matches!(
+            r1.command_results[2].1,
+            CoopCommandStatus::Refused(_)
+        ));
+        assert!(matches!(
+            r1.command_results[3].1,
+            CoopCommandStatus::Refused(_)
+        ));
+        assert_eq!(
+            session.players[&PlayerId(2)].selected_sim,
+            Some(30),
+            "invalid SelectPerson must never clobber valid selection in the same batch"
+        );
+    }
+
+    #[test]
+    fn restore_coop_snapshot_is_transactional_on_error() {
+        let (program, catalog, mut world) = run_expr_world();
+        for obj in world.objects.values_mut() {
+            obj.set_flags(SCHEDULER_READY, false);
+        }
+        let mut lot = synthetic_coop_lot(program, catalog, world, Frames::parse("none").unwrap());
+        let mut session = two_player_session(Some(10), Some(20));
+        lot.attach_coop_context(
+            CoopVmContext::new(session.clone()).with_frames(Frames::parse("none").unwrap()),
+        )
+        .expect("attach");
+        let before_fp = lot.coop_state_fingerprint(&session);
+        let snap = lot.coop_snapshot_bytes().unwrap();
+
+        // Corrupt expected fingerprint -> restore must fail AND leave `lot` completely intact!
+        let bad_fp = StateFingerprint([0xaa; 32]);
+        assert!(
+            lot.restore_coop_snapshot_verified(&snap, session.clone(), bad_fp)
+                .is_err()
+        );
+        assert_eq!(lot.coop_state_fingerprint(&session), before_fp);
+
+        // Open dialog in session without dialog metadata in raw Saved -> refused & intact!
+        session.open_blocking_dialog(DialogId(1), 40, Tick(1));
+        let raw_saved = lot.save().unwrap().encode();
+        assert!(lot.restore_coop_snapshot(&raw_saved, session).is_err());
+        assert!(lot.coop().is_some());
     }
 }

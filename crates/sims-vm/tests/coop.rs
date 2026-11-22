@@ -1,27 +1,27 @@
 //! Multi-instance deterministic co-op VM integration tests (`crates/sims-vm/src/coop.rs`).
 //!
 //! Exercises `CoopVmContext`, `Lot::apply_coop_batch`, `Lot::coop_pie_menu`,
-//! `Lot::coop_state_fingerprint`, and `Lot::coop_snapshot_bytes` /
-//! `Lot::restore_coop_snapshot` with `sims_net::MemoryMesh` and
-//! `sims_net::LockstepNode` — both on synthetic worlds (always run) and on the
-//! real Complete Collection Goth House (`UserData/Houses/House05.iff`, when
-//! `SIMS_INSTALL` is set).
+//! `Lot::coop_state_fingerprint`, `build_prices_from_install`, and
+//! `Lot::coop_snapshot_bytes` / `Lot::restore_coop_snapshot_verified` with
+//! `sims_net::MemoryMesh` and `sims_net::LockstepNode` — both on synthetic
+//! worlds (always run) and on the real Complete Collection Goth House
+//! (`UserData/Houses/House05.iff`, when `SIMS_INSTALL` is set).
 
-use sims_content::Catalog;
+use sims_content::{Catalog, Install};
 use sims_formats::behavior::{Behavior, Instruction};
 use sims_formats::saved_objects::{Interaction, Person};
 use sims_net::manifest::sha256_bytes;
 use sims_net::{
-    CameraRotation, Command, CommandIgnoreReason, CommandRejectReason, DialogAnswer, DialogId,
-    FileManifest, FileManifestEntry, HostStepResult, LockstepNode, ManifestDigest, MemoryMesh,
-    MemoryNodeTransport, NodeEvent, PeerAddress, PlayerId, PlayerMode, PlayerRole, SessionConfig,
-    SessionState, SimSpeed, SnapshotCompression, StateFingerprint, Tick, Transport,
+    BuyBuildEdit, CameraRotation, Command, CommandRejectReason, FileManifest, FileManifestEntry,
+    HostStepResult, LockstepNode, ManifestDigest, MemoryMesh, MemoryNodeTransport, NodeEvent,
+    PeerAddress, PlayerId, PlayerMode, PlayerRole, SessionConfig, SessionState, SimSpeed,
+    SnapshotCompression, StateFingerprint, Tick, Transport,
 };
 use sims_sim::{Object, World};
 use sims_vm::boot::{Frames, Lot};
 use sims_vm::{
     CoopBatchReport, CoopCommandStatus, CoopVmContext, Interpreter, PanelMode, Program, Stream,
-    menu_entry_to_pick_command,
+    available_funds, build_prices_from_install, cancel_uid_to_wire, menu_entry_to_pick_command,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -53,7 +53,6 @@ struct CoopPeer {
     lot: Lot,
     step_us: u32,
     drift_events: Vec<(PlayerId, Tick, StateFingerprint, StateFingerprint)>,
-    last_opened_dialog: Option<DialogId>,
 }
 
 impl CoopPeer {
@@ -95,9 +94,6 @@ impl CoopPeer {
                 .lot
                 .apply_coop_batch(&applied, self.node.session_mut())
                 .expect("apply coop batch");
-            if let Some((dialog_id, _)) = report.opened_dialog {
-                self.last_opened_dialog = Some(dialog_id);
-            }
             self.node
                 .report_local_tick(
                     &mut self.transport,
@@ -126,10 +122,12 @@ fn pump_mesh(mesh: &MemoryMesh, peers: &mut [&mut CoopPeer], rounds: usize) {
     }
 }
 
-/// Loads a fresh Goth House lot with default frames and no pre-supplied dialog
-/// answers (co-op dialogs are answered interactively via `Command`).
+fn load_goth_lot_with_frames(root: &Path, house: &Path, frames: Frames) -> Lot {
+    Lot::load(root, house, &[], frames).expect("load Goth house")
+}
+
 fn load_goth_lot(root: &Path, house: &Path) -> Lot {
-    Lot::load(root, house, &[], Frames::default()).expect("load Goth house")
+    load_goth_lot_with_frames(root, house, Frames::default())
 }
 
 /// Runs one lockstep tick on host + all ready peers and returns each peer's
@@ -215,7 +213,11 @@ fn coop_two_players_goth_house_lockstep_convergence_and_throwaway_pie_menu() {
     };
 
     let mut host_lot = load_goth_lot(&root, &house);
-    let bob_lot = load_goth_lot(&root, &house);
+    let mut bob_lot = load_goth_lot(&root, &house);
+    // Simulate independent local camera pans on Host vs Bob before attach:
+    // local `view_centre` must never leak into the shared co-op simulation.
+    host_lot.set_view_centre(Some([12, 14]));
+    bob_lot.set_view_centre(Some([48, 52]));
     let (mortimer, bella, cassandra) = find_goth_residents(&host_lot);
 
     let mut host_node = LockstepNode::new_host(
@@ -242,7 +244,6 @@ fn coop_two_players_goth_house_lockstep_convergence_and_throwaway_pie_menu() {
         lot: host_lot,
         step_us: 1_500,
         drift_events: Vec::new(),
-        last_opened_dialog: None,
     };
     let mut bob = CoopPeer {
         node: bob_node,
@@ -250,7 +251,6 @@ fn coop_two_players_goth_house_lockstep_convergence_and_throwaway_pie_menu() {
         lot: bob_lot,
         step_us: 1_800,
         drift_events: Vec::new(),
-        last_opened_dialog: None,
     };
 
     bob.connect_and_hello(&host_addr);
@@ -260,62 +260,20 @@ fn coop_two_players_goth_house_lockstep_convergence_and_throwaway_pie_menu() {
         .attach_coop(bob.node.session().clone())
         .expect("attach bob coop");
 
-    // Tick 1: PlayerJoined(Bob) executes cleanly; both peers run tick 1.
+    // Tick 1 & Tick 2: Help System is disabled in co-op mode (`docs/vision.md`),
+    // so Goth house runs straight through tick 2 with NO Help System modal pause!
     let r1 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
     assert!(r1[0].stepped && r1[1].stepped);
+    assert!(r1[0].opened_dialog.is_none());
     assert_eq!(r1[0].state_fingerprint, r1[1].state_fingerprint);
     assert_eq!(host.lot.world().hash(), bob.lot.world().hash());
 
-    // Tick 2: Goth house Help System modal dialog opens on BOTH peers!
     let r2 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    assert!(!r2[0].stepped && !r2[1].stepped);
-    let &(host_dlg, _) = r2[0]
-        .opened_dialog
-        .as_ref()
-        .expect("host opens blocking dialog");
-    let &(bob_dlg, _) = r2[1]
-        .opened_dialog
-        .as_ref()
-        .expect("bob opens blocking dialog");
-    assert_eq!(host_dlg, bob_dlg);
-    assert!(host.node.session().is_paused());
-    assert!(bob.node.session().is_paused());
+    assert!(
+        r2[0].stepped && r2[1].stepped && r2[0].opened_dialog.is_none(),
+        "single-player Help System must not interrupt co-op on tick 2"
+    );
     assert_eq!(r2[0].state_fingerprint, r2[1].state_fingerprint);
-
-    // First-answer-wins race: Alice submits status 3 first, Bob submits status 2 second.
-    host.submit(Command::AnswerBlockingDialog {
-        dialog_id: host_dlg,
-        answer: DialogAnswer {
-            status: 3,
-            bitmap_id: None,
-            text: None,
-        },
-    });
-    bob.submit(Command::AnswerBlockingDialog {
-        dialog_id: bob_dlg,
-        answer: DialogAnswer {
-            status: 2,
-            bitmap_id: None,
-            text: None,
-        },
-    });
-    pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
-
-    let r3 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    assert!(r3[0].stepped && r3[1].stepped);
-    assert_eq!(r3[0].state_fingerprint, r3[1].state_fingerprint);
-    assert_eq!(host.lot.world().hash(), bob.lot.world().hash());
-    assert!(r3[0].command_results.iter().any(|(_, st)| matches!(
-        st,
-        CoopCommandStatus::DialogAnswered {
-            winner: PlayerId(1),
-            ..
-        }
-    )));
-    assert!(r3[0].command_results.iter().any(|(_, st)| matches!(
-        st,
-        CoopCommandStatus::IgnoredBySession(CommandIgnoreReason::DialogAlreadyAnswered)
-    )));
 
     // Alice selects Mortimer + EAST (1); Bob selects Bella + WEST (3).
     host.submit(Command::SelectPerson {
@@ -332,8 +290,8 @@ fn coop_two_players_goth_house_lockstep_convergence_and_throwaway_pie_menu() {
     });
     pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
 
-    let r4 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    assert_eq!(r4[0].state_fingerprint, r4[1].state_fingerprint);
+    let r3 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
+    assert_eq!(r3[0].state_fingerprint, r3[1].state_fingerprint);
 
     // Verify per-player Global 3 and per-player camera_rotation resolution on both peers.
     for peer in [&host, &bob] {
@@ -360,9 +318,9 @@ fn coop_two_players_goth_house_lockstep_convergence_and_throwaway_pie_menu() {
             3
         );
         assert_eq!(
-            ctx.resolve_camera_rotation(peer.lot.world(), cassandra, None),
+            ctx.resolve_camera_rotation(peer.lot.world(), cassandra, Some(bella as i16)),
             1,
-            "unselected Sim falls back to host camera rotation"
+            "unselected Sim must strictly fall back to host camera rotation"
         );
     }
 
@@ -405,24 +363,39 @@ fn coop_two_players_goth_house_lockstep_convergence_and_throwaway_pie_menu() {
         "throwaway pie-menu checks must never mutate shared World RNG or objects"
     );
 
-    // Submit the picked interaction from Bob over MemoryMesh!
+    // Submit a forged/unavailable pick AND the real offered pick from Bob.
     let pick_cmd = picked_cmd.expect("Goth house should offer at least one pie-menu interaction");
     let picked_target = match &pick_cmd {
         Command::SimActionPick { target_id, .. } => *target_id,
         _ => unreachable!(),
     };
+    bob.submit(Command::SimActionPick {
+        sim_id: bella,
+        target_id: picked_target,
+        menu_index: 999,
+        joining: false,
+        args: [0; 4],
+    });
     bob.submit(pick_cmd);
     pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
 
-    let r5 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    assert_eq!(r5[0].state_fingerprint, r5[1].state_fingerprint);
+    let r4 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
+    assert_eq!(r4[0].state_fingerprint, r4[1].state_fingerprint);
     assert!(
-        r5[0]
+        r4[0]
             .command_results
             .iter()
-            .any(|(_, st)| matches!(st, CoopCommandStatus::QueuedInteraction { .. })),
-        "picked interaction should queue cleanly"
+            .any(|(_, st)| matches!(st, CoopCommandStatus::Refused(_))),
+        "forged/unavailable pick must be refused"
     );
+    let queued_uid = r4[0]
+        .command_results
+        .iter()
+        .find_map(|(_, st)| match st {
+            CoopCommandStatus::QueuedInteraction { uid: Some(uid) } => Some(*uid),
+            _ => None,
+        })
+        .expect("picked interaction should queue cleanly");
     assert_eq!(
         host.lot
             .coop()
@@ -442,8 +415,24 @@ fn coop_two_players_goth_house_lockstep_convergence_and_throwaway_pie_menu() {
         "non-Sim activity object started by Bob should resolve Global 3 to Bella"
     );
 
-    // Advance 115 more ticks (120 lockstep ticks total) verifying bit-for-bit
-    // fingerprint parity on every tick and zero drift notifications.
+    // Test cancelling the queued interaction via `cancel_uid_to_wire`.
+    bob.submit(Command::SimActionCancel {
+        sim_id: bella,
+        interaction_uid: cancel_uid_to_wire(queued_uid),
+    });
+    pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
+    let r5 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
+    assert_eq!(r5[0].state_fingerprint, r5[1].state_fingerprint);
+    assert!(
+        r5[0]
+            .command_results
+            .iter()
+            .any(|(_, st)| matches!(st, CoopCommandStatus::CancelledInteraction { .. }))
+    );
+
+    // Mutate local UI camera centre differently mid-session and advance through tick 120.
+    host.lot.set_view_centre(Some([20, 22]));
+    bob.lot.set_view_centre(Some([40, 44]));
     for tick in 6..=120 {
         let reports = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
         assert_eq!(
@@ -462,7 +451,7 @@ fn coop_two_players_goth_house_lockstep_convergence_and_throwaway_pie_menu() {
 }
 
 #[test]
-fn coop_three_players_mid_game_join_redb_snapshot_convergence() {
+fn coop_three_players_mid_game_join_redb_snapshot_convergence_across_frame_schedules() {
     let Some((root, house)) = goth_house() else {
         return;
     };
@@ -479,7 +468,9 @@ fn coop_three_players_mid_game_join_redb_snapshot_convergence() {
     };
 
     let mut host_lot = load_goth_lot(&root, &house);
-    let bob_lot = load_goth_lot(&root, &house);
+    // Bob intentionally loads with `Frames::parse("none")` — attaching co-op
+    // must normalize Bob to the authoritative `Frames::default()` schedule!
+    let bob_lot = load_goth_lot_with_frames(&root, &house, Frames::parse("none").unwrap());
     let (mortimer, bella, cassandra) = find_goth_residents(&host_lot);
 
     let mut host_node =
@@ -496,7 +487,6 @@ fn coop_three_players_mid_game_join_redb_snapshot_convergence() {
         lot: host_lot,
         step_us: 1_500,
         drift_events: Vec::new(),
-        last_opened_dialog: None,
     };
     let mut bob = CoopPeer {
         node: LockstepNode::new_peer(
@@ -509,7 +499,6 @@ fn coop_three_players_mid_game_join_redb_snapshot_convergence() {
         lot: bob_lot,
         step_us: 1_500,
         drift_events: Vec::new(),
-        last_opened_dialog: None,
     };
 
     bob.connect_and_hello(&host_addr);
@@ -518,18 +507,6 @@ fn coop_three_players_mid_game_join_redb_snapshot_convergence() {
         .attach_coop(bob.node.session().clone())
         .expect("attach bob coop");
 
-    // Tick 1 + Tick 2 (blocking dialog) + answer + advance to tick 40.
-    step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    let r2 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    let dlg = r2[0].opened_dialog.as_ref().expect("dialog at tick 2").0;
-    host.submit(Command::AnswerBlockingDialog {
-        dialog_id: dlg,
-        answer: DialogAnswer {
-            status: 3,
-            bitmap_id: None,
-            text: None,
-        },
-    });
     host.submit(Command::SelectPerson {
         sim_id: Some(mortimer),
     });
@@ -541,7 +518,8 @@ fn coop_three_players_mid_game_join_redb_snapshot_convergence() {
     });
     pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
 
-    for tick in 3..=40 {
+    // Advance to tick 20 (BEFORE tick 33's `Frames::default()` animator draw!).
+    for tick in 1..=20 {
         let reps = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
         assert_eq!(
             reps[0].state_fingerprint, reps[1].state_fingerprint,
@@ -549,8 +527,9 @@ fn coop_three_players_mid_game_join_redb_snapshot_convergence() {
         );
     }
 
-    // Mid-game join: Carol connects at tick 40 and receives a compressed,
-    // chunked co-op snapshot from Alice!
+    // Mid-game join: Carol loads with `Frames::parse("none")` and joins at tick 20!
+    // Restoring Alice's snapshot MUST adopt Alice's authoritative `Frames::default()`
+    // so Carol does NOT diverge at tick 33 when person 259's animator is drawn!
     let mut carol = CoopPeer {
         node: LockstepNode::new_peer(
             "Carol",
@@ -559,10 +538,9 @@ fn coop_three_players_mid_game_join_redb_snapshot_convergence() {
             host_addr.clone(),
         ),
         transport: mesh.add_node("mem:carol"),
-        lot: load_goth_lot(&root, &house),
+        lot: load_goth_lot_with_frames(&root, &house, Frames::parse("none").unwrap()),
         step_us: 1_500,
         drift_events: Vec::new(),
-        last_opened_dialog: None,
     };
     carol.connect_and_hello(&host_addr);
 
@@ -596,20 +574,20 @@ fn coop_three_players_mid_game_join_redb_snapshot_convergence() {
                 redb_bytes,
             } = ev
             {
-                assert_eq!(at_tick, Tick(40));
+                assert_eq!(at_tick, Tick(20));
                 carol
                     .node
                     .confirm_snapshot_applied(&mut carol.transport, snapshot_id)
                     .expect("confirm snapshot applied");
                 carol
                     .lot
-                    .restore_coop_snapshot(&redb_bytes, carol.node.session().clone())
-                    .expect("restore coop snapshot");
-                assert_eq!(
-                    carol.lot.coop_state_fingerprint(carol.node.session()),
-                    state_fingerprint,
-                    "restored snapshot fingerprint must match host"
-                );
+                    .restore_coop_snapshot_verified(
+                        &redb_bytes,
+                        carol.node.session().clone(),
+                        state_fingerprint,
+                    )
+                    .expect("verified restore coop snapshot");
+                assert_eq!(carol.lot.coop().unwrap().frames, Frames::default());
                 snap_applied = true;
             }
         }
@@ -621,12 +599,11 @@ fn coop_three_players_mid_game_join_redb_snapshot_convergence() {
     assert!(snap_applied, "carol should have installed snapshot");
     pump_mesh(&mesh, &mut [&mut host, &mut bob, &mut carol], 4);
 
-    // Tick 41 stamps PlayerJoined(Carol) across all 3 peers identically!
-    let r41 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob, &mut carol], true);
-    assert_eq!(r41[0].state_fingerprint, r41[1].state_fingerprint);
-    assert_eq!(r41[0].state_fingerprint, r41[2].state_fingerprint);
+    // Tick 21 stamps PlayerJoined(Carol) across all 3 peers identically!
+    let r21 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob, &mut carol], true);
+    assert_eq!(r21[0].state_fingerprint, r21[1].state_fingerprint);
+    assert_eq!(r21[0].state_fingerprint, r21[2].state_fingerprint);
 
-    // Carol selects Cassandra and rotates her camera to SOUTH (2).
     carol.submit(Command::SelectPerson {
         sim_id: Some(cassandra),
     });
@@ -635,7 +612,8 @@ fn coop_three_players_mid_game_join_redb_snapshot_convergence() {
     });
     pump_mesh(&mesh, &mut [&mut host, &mut bob, &mut carol], 4);
 
-    for tick in 42..=120 {
+    // Cross tick 33 and tick 63 (`Frames::default()` draw ticks) through tick 100!
+    for tick in 22..=100 {
         let reps = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob, &mut carol], true);
         assert_eq!(
             reps[0].state_fingerprint, reps[1].state_fingerprint,
@@ -657,11 +635,12 @@ fn coop_three_players_mid_game_join_redb_snapshot_convergence() {
 }
 
 #[test]
-fn coop_mode_global_19_multi_reason_pause_and_fixed_session_globals() {
+fn coop_mode_global_19_multi_reason_pause_fixed_globals_and_catalog_build_prices() {
     let Some((root, house)) = goth_house() else {
         return;
     };
 
+    let install = Install::detect(&root).expect("detect install");
     let mesh = MemoryMesh::new(303);
     let manifest = sample_manifest();
     let config = SessionConfig {
@@ -679,6 +658,11 @@ fn coop_mode_global_19_multi_reason_pause_and_fixed_session_globals() {
 
     let mut host_lot = load_goth_lot(&root, &house);
     let bob_lot = load_goth_lot(&root, &house);
+    let build_prices = build_prices_from_install(&install, host_lot.surfaces());
+    assert!(
+        !build_prices.floors.is_empty() && !build_prices.walls.is_empty(),
+        "catalog BuildPrices should load built-in & plug-in floor/wall prices"
+    );
 
     let mut host_node =
         LockstepNode::new_host("Alice", Some("mem:host".to_string()), manifest, config);
@@ -689,7 +673,9 @@ fn coop_mode_global_19_multi_reason_pause_and_fixed_session_globals() {
         .unwrap()
         .selected_sim = host_lot.world().selected();
     host_lot
-        .attach_coop(host_node.session().clone())
+        .attach_coop_context(
+            CoopVmContext::new(host_node.session().clone()).with_build_prices(build_prices.clone()),
+        )
         .expect("attach host coop");
 
     // Verify fixed session globals synced immediately on attach!
@@ -704,7 +690,6 @@ fn coop_mode_global_19_multi_reason_pause_and_fixed_session_globals() {
         lot: host_lot,
         step_us: 1_000,
         drift_events: Vec::new(),
-        last_opened_dialog: None,
     };
     let mut bob = CoopPeer {
         node: LockstepNode::new_peer(
@@ -717,29 +702,18 @@ fn coop_mode_global_19_multi_reason_pause_and_fixed_session_globals() {
         lot: bob_lot,
         step_us: 1_000,
         drift_events: Vec::new(),
-        last_opened_dialog: None,
     };
     bob.connect_and_hello(&host_addr);
     pump_mesh(&mesh, &mut [&mut host, &mut bob], 6);
     bob.lot
-        .attach_coop(bob.node.session().clone())
+        .attach_coop_context(
+            CoopVmContext::new(bob.node.session().clone()).with_build_prices(build_prices.clone()),
+        )
         .expect("attach bob coop");
 
-    // Tick 1 (Live), Tick 2 (blocking dialog), Tick 3 (answer dialog -> resumes).
+    // Tick 1 & 2 run cleanly in Live mode (no Help System interruption!).
     step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    let r2 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    let dlg = r2[0].opened_dialog.as_ref().expect("dialog").0;
-    host.submit(Command::AnswerBlockingDialog {
-        dialog_id: dlg,
-        answer: DialogAnswer {
-            status: 3,
-            bitmap_id: None,
-            text: None,
-        },
-    });
-    pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
     step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-
     let ticks_before_pause = host.lot.world().ticks;
 
     // 1. Bob enters Buy mode -> Global 19 = 2 (Buy), paused!
@@ -747,36 +721,88 @@ fn coop_mode_global_19_multi_reason_pause_and_fixed_session_globals() {
         mode: PlayerMode::Buy,
     });
     pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
-    let r4 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    assert!(!r4[0].stepped && !r4[1].stepped);
+    let r3 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
+    assert!(!r3[0].stepped && !r3[1].stepped);
     assert_eq!(host.lot.mode(), PanelMode::Buy);
     assert_eq!(host.lot.world().globals[19], 2);
     assert_eq!(host.lot.world().globals[17], 1);
     assert_eq!(host.lot.world().ticks, ticks_before_pause);
-    assert_eq!(r4[0].state_fingerprint, r4[1].state_fingerprint);
+    assert_eq!(r3[0].state_fingerprint, r3[1].state_fingerprint);
 
-    // 2. Alice enters Build mode while Bob is in Buy -> Build takes precedence (Global 19 = 1)!
+    // 2. Alice enters Build mode while Bob is in Buy -> Global 19 = 1 (Build)!
+    //    Also test Build edit fidelity in the SAME batch:
+    //    - Unknown wall style (999) is refused cleanly without changing funds/world.
+    //    - Paid floor tile edit charges real catalog price from `BuildPrices`!
+    let paid_floor = build_prices
+        .floors
+        .iter()
+        .find_map(|(&k, &p)| (p > 0).then_some((k, p)))
+        .expect("catalog should have at least one paid floor pattern");
+    let buildable_tile = (2i16..60)
+        .flat_map(|x| (2i16..60).map(move |y| (x, y)))
+        .find(|&(x, y)| {
+            let plan = sims_vm::plan_floor_edit(
+                host.lot.world(),
+                [i32::from(x), i32::from(y)],
+                [i32::from(x), i32::from(y)],
+                1,
+                paid_floor.0,
+                sims_vm::FloorDragMode::Lay,
+                &build_prices,
+                None,
+            );
+            plan.valid && plan.affordable && plan.net_cost > 0
+        })
+        .expect("Goth lot should have a buildable tile for a paid floor");
+    let funds_before_build = available_funds(host.lot.world());
+
     host.submit(Command::SetMode {
         mode: PlayerMode::Build,
     });
+    host.submit(Command::BuyBuild(BuyBuildEdit::PlaceWall {
+        x: buildable_tile.0,
+        y: buildable_tile.1,
+        level: 1,
+        style: 999,
+        pattern: 0,
+    }));
+    host.submit(Command::BuyBuild(BuyBuildEdit::SetFloorTile {
+        x: buildable_tile.0,
+        y: buildable_tile.1,
+        level: 1,
+        pattern: paid_floor.0,
+    }));
     pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
-    let r5 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    assert!(!r5[0].stepped);
+    let r4 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
+    assert!(!r4[0].stepped);
     assert_eq!(host.lot.mode(), PanelMode::Build);
     assert_eq!(host.lot.world().globals[19], 1);
     assert_eq!(bob.lot.world().globals[19], 1);
-    assert_eq!(r5[0].state_fingerprint, r5[1].state_fingerprint);
+    assert!(matches!(
+        r4[0].command_results[1].1,
+        CoopCommandStatus::Refused(_)
+    ));
+    assert_eq!(
+        r4[0].command_results[2].1,
+        CoopCommandStatus::BuyBuildApplied
+    );
+    assert!(
+        available_funds(host.lot.world()) < funds_before_build,
+        "paid floor pattern (cost {}) must deduct funds via catalog BuildPrices",
+        paid_floor.1
+    );
+    assert_eq!(r4[0].state_fingerprint, r4[1].state_fingerprint);
 
     // 3. Alice returns to Live, Bob stays in Buy -> Global 19 = 2 (Buy), STILL paused!
     host.submit(Command::SetMode {
         mode: PlayerMode::Live,
     });
     pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
-    let r6 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    assert!(!r6[0].stepped);
+    let r5 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
+    assert!(!r5[0].stepped);
     assert_eq!(host.lot.mode(), PanelMode::Buy);
     assert_eq!(host.lot.world().globals[19], 2);
-    assert_eq!(r6[0].state_fingerprint, r6[1].state_fingerprint);
+    assert_eq!(r5[0].state_fingerprint, r5[1].state_fingerprint);
 
     // 4. Alice sets explicit pause, Bob leaves Buy -> Global 19 = 0 (Live), STILL paused!
     host.submit(Command::SetPaused { paused: true });
@@ -784,8 +810,8 @@ fn coop_mode_global_19_multi_reason_pause_and_fixed_session_globals() {
         mode: PlayerMode::Live,
     });
     pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
-    let r7 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    assert!(!r7[0].stepped);
+    let r6 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
+    assert!(!r6[0].stepped);
     assert_eq!(host.lot.mode(), PanelMode::Live);
     assert_eq!(host.lot.world().globals[19], 0);
     assert_eq!(host.lot.world().globals[17], 1);
@@ -795,10 +821,10 @@ fn coop_mode_global_19_multi_reason_pause_and_fixed_session_globals() {
     bob.submit(Command::SetFreeWill { enabled: true });
     host.submit(Command::SetHostSpeedLock { locked: true });
     pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
-    let r8 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
+    let r7 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
     assert_eq!(host.lot.world().globals[30], 1);
     assert_eq!(bob.lot.world().globals[30], 1);
-    assert_eq!(r8[0].state_fingerprint, r8[1].state_fingerprint);
+    assert_eq!(r7[0].state_fingerprint, r7[1].state_fingerprint);
 
     bob.submit(Command::SetSpeed {
         speed: SimSpeed::ULTRA,
@@ -808,9 +834,9 @@ fn coop_mode_global_19_multi_reason_pause_and_fixed_session_globals() {
     });
     host.submit(Command::SetPaused { paused: false });
     pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
-    let r9 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    assert!(r9[0].stepped && r9[1].stepped);
-    assert!(r9[0].command_results.iter().any(|(_, st)| matches!(
+    let r8 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
+    assert!(r8[0].stepped && r8[1].stepped);
+    assert!(r8[0].command_results.iter().any(|(_, st)| matches!(
         st,
         CoopCommandStatus::RejectedBySession(CommandRejectReason::SpeedLockedByHost)
     )));
@@ -818,160 +844,7 @@ fn coop_mode_global_19_multi_reason_pause_and_fixed_session_globals() {
     assert_eq!(bob.lot.world().speed(), SimSpeed::FAST.value());
     assert_eq!(host.lot.world().globals[17], 0);
     assert_eq!(host.lot.world().ticks, ticks_before_pause + 1);
-    assert_eq!(r9[0].state_fingerprint, r9[1].state_fingerprint);
-}
-
-#[test]
-fn coop_blocking_dialog_invalid_answer_reopens_and_mid_dialog_snapshot_resumes() {
-    let Some((root, house)) = goth_house() else {
-        return;
-    };
-
-    let mesh = MemoryMesh::new(404);
-    let manifest = sample_manifest();
-    let config = SessionConfig {
-        tick_delay: 1,
-        min_tick_delay: 1,
-        max_tick_delay: 8,
-        fingerprint_interval: 5,
-        max_players: 4,
-        ..SessionConfig::default()
-    };
-
-    let mut host_lot = load_goth_lot(&root, &house);
-    let mut host_node =
-        LockstepNode::new_host("Alice", Some("mem:host".to_string()), manifest, config);
-    host_lot.sync_initial_coop_session(host_node.session_mut());
-    host_lot
-        .attach_coop(host_node.session().clone())
-        .expect("attach host");
-
-    let host_addr = PeerAddress::new("mem:host");
-    let mut host = CoopPeer {
-        node: host_node,
-        transport: mesh.add_node("mem:host"),
-        lot: host_lot,
-        step_us: 1_000,
-        drift_events: Vec::new(),
-        last_opened_dialog: None,
-    };
-
-    // Advance host alone through tick 1 and tick 2 (opens Help System modal dialog).
-    step_lockstep_tick(&mesh, &mut host, &mut [], true);
-    let r2 = step_lockstep_tick(&mesh, &mut host, &mut [], true);
-    let dlg_id = r2[0]
-        .opened_dialog
-        .as_ref()
-        .expect("dialog opens on tick 2")
-        .0;
-    assert!(host.lot.asking().is_some());
-
-    // Bob joins MID-DIALOG via snapshot!
-    let mut bob = CoopPeer {
-        node: LockstepNode::new_peer(
-            "Bob",
-            Some("mem:bob".to_string()),
-            manifest,
-            host_addr.clone(),
-        ),
-        transport: mesh.add_node("mem:bob"),
-        lot: load_goth_lot(&root, &house),
-        step_us: 1_000,
-        drift_events: Vec::new(),
-        last_opened_dialog: None,
-    };
-    bob.connect_and_hello(&host_addr);
-
-    let mut applied = false;
-    for _ in 0..24 {
-        mesh.step();
-        for ev in host.poll_events() {
-            if let NodeEvent::SnapshotNeeded { snapshot_id, .. } = ev {
-                let bytes = host.lot.coop_snapshot_bytes().expect("coop snap bytes");
-                let wh = host.lot.coop_world_hash();
-                host.node
-                    .send_snapshot(
-                        &mut host.transport,
-                        snapshot_id,
-                        wh,
-                        bytes,
-                        SnapshotCompression::Deflate,
-                        32 * 1024,
-                    )
-                    .expect("send snap");
-            }
-        }
-        for ev in bob.poll_events() {
-            if let NodeEvent::ApplySnapshot {
-                snapshot_id,
-                state_fingerprint,
-                redb_bytes,
-                ..
-            } = ev
-            {
-                bob.node
-                    .confirm_snapshot_applied(&mut bob.transport, snapshot_id)
-                    .expect("confirm snap");
-                bob.lot
-                    .restore_coop_snapshot(&redb_bytes, bob.node.session().clone())
-                    .expect("restore mid-dialog snapshot");
-                assert!(
-                    bob.lot.asking().is_some(),
-                    "mid-dialog snapshot must restore open asking state"
-                );
-                assert_eq!(
-                    bob.lot.coop_state_fingerprint(bob.node.session()),
-                    state_fingerprint
-                );
-                applied = true;
-            }
-        }
-        if applied {
-            break;
-        }
-    }
-    assert!(applied);
-    pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
-
-    // Tick 3: PlayerJoined(Bob) executes while dialog stays open; also test an
-    // invalid button status (99) is deterministically refused and reopens dialog.
-    host.submit(Command::AnswerBlockingDialog {
-        dialog_id: dlg_id,
-        answer: DialogAnswer {
-            status: 99,
-            bitmap_id: None,
-            text: None,
-        },
-    });
-    pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
-    let r3 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    assert!(!r3[0].stepped && !r3[1].stepped);
-    assert!(host.node.session().open_dialogs.contains_key(&dlg_id));
-    assert!(bob.node.session().open_dialogs.contains_key(&dlg_id));
-    assert_eq!(r3[0].state_fingerprint, r3[1].state_fingerprint);
-
-    // Tick 4: Bob answers with valid status 3; both peers replay tick 2 and converge!
-    bob.submit(Command::AnswerBlockingDialog {
-        dialog_id: dlg_id,
-        answer: DialogAnswer {
-            status: 3,
-            bitmap_id: None,
-            text: None,
-        },
-    });
-    pump_mesh(&mesh, &mut [&mut host, &mut bob], 4);
-    let r4 = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-    assert!(r4[0].stepped && r4[1].stepped);
-    assert_eq!(r4[0].state_fingerprint, r4[1].state_fingerprint);
-    assert_eq!(host.lot.world().hash(), bob.lot.world().hash());
-
-    for tick in 5..=25 {
-        let reps = step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
-        assert_eq!(
-            reps[0].state_fingerprint, reps[1].state_fingerprint,
-            "tick {tick}"
-        );
-    }
+    assert_eq!(r8[0].state_fingerprint, r8[1].state_fingerprint);
 }
 
 #[test]
@@ -1133,7 +1006,6 @@ fn coop_camera_rotation_affects_look_towards_and_gsc_12_per_player() {
     world.globals = vec![0; 64];
     world.types.insert(1, 0xA001);
     world.types.insert(2, 0xA002);
-    // Tile (10, 20)
     world
         .objects
         .insert(10, synthetic_person(10, 0xA001, [160, 320, 1]));

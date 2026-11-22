@@ -119,7 +119,7 @@ const VIEW_LEVEL: i8 = 1;
 /// state: with a frame after every tick, the rooms are counted sooner.
 /// On this house that changes no state the captures hold through tick
 /// 261, but it changes the rooms' state in between.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Frames {
     /// Ticks after which a frame is drawn.
     pub after: Vec<u32>,
@@ -1324,9 +1324,17 @@ impl Lot {
         let masks_rebuilt = Cell::new(0);
         let dialog_text = RefCell::new(self.last_dialog_text.clone());
         let character_names = RefCell::new(self.character_names.clone());
-        let (view_rotation, view_centre) = self
-            .replay_view
-            .unwrap_or((self.view_rotation, self.view_centre));
+        let (view_rotation, view_centre) = if let Some(coop_cell) = coop {
+            // In co-op mode, local camera panning (`self.view_centre`) is UI-only
+            // and never feeds the shared simulation (`docs/vision.md`); portrait
+            // search reads the authoritative lot-coordinate `portrait_anchor`
+            // from `CoopVmContext`, and base rotation comes from the host's
+            // stamped rotation in `CoopVmContext`.
+            (coop_cell.borrow().host_camera_rotation(), None)
+        } else {
+            self.replay_view
+                .unwrap_or((self.view_rotation, self.view_centre))
+        };
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             ui_effects: Some(&ui_effects),

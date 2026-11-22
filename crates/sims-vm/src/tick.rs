@@ -1260,12 +1260,16 @@ impl Interpreter<'_> {
             }
         };
         if reselect {
+            let before = selected(world);
             let chosen = self.select_next_resident(world)?;
-            if let Some(coop) = self.coop {
+            let after = selected(world);
+            if let Some(coop) = self.coop
+                && (chosen.is_some() || after != before)
+            {
                 let mut ctx = coop.borrow_mut();
                 let host_id = ctx.session.host_id;
                 if let Some(host) = ctx.session.players.get_mut(&host_id) {
-                    host.selected_sim = chosen;
+                    host.selected_sim = after;
                 }
             }
         }
