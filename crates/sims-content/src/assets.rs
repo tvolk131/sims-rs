@@ -86,6 +86,7 @@ impl Assets {
                             mount,
                             path: path.clone(),
                             member: Some(member),
+                            inline: None,
                         });
                     }
                 } else {
@@ -93,6 +94,7 @@ impl Assets {
                         mount,
                         path,
                         member: None,
+                        inline: None,
                     });
                 }
             }
@@ -275,6 +277,7 @@ mod tests {
                 offset: 0,
                 size: 0,
             }),
+            inline: None,
         };
         let folder = |path, member| assets.folder(&resource(path, member));
         assert_eq!(

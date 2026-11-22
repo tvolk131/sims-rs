@@ -411,7 +411,7 @@ impl Interpreter<'_> {
     /// 2) does; any other only when its catalog master's word 69 is 0
     /// (0x45728d, `+0x60`, +0x8a). The test of flag 8 after it returns
     /// true here, flag 0x10 being clear.
-    fn valued(&self, world: &World, id: u16) -> Result<bool, Trap> {
+    pub(crate) fn valued(&self, world: &World, id: u16) -> Result<bool, Trap> {
         let object = world
             .objects
             .get(&id)
@@ -446,7 +446,7 @@ impl Interpreter<'_> {
 /// when 0). Either way the value is halved, toward zero, when data word
 /// 15 is not 0: for a group, on any tile from the lead along the chain
 /// (+0x18c).
-fn value(world: &World, words: &[i16], id: u16) -> Result<i16, Trap> {
+pub(crate) fn value(world: &World, words: &[i16], id: u16) -> Result<i16, Trap> {
     let object = |id: u16| {
         world
             .objects

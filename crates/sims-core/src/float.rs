@@ -44,6 +44,7 @@ impl F32 {
     pub const ZERO: Self = Self(0);
 
     /// Creates a value from IEEE single-precision bits, normalizing NaNs.
+    #[inline]
     pub const fn from_bits(bits: u32) -> Self {
         if bits & 0x7f80_0000 == 0x7f80_0000 && bits & 0x007f_ffff != 0 {
             Self(CANONICAL_NAN_BITS)
@@ -52,26 +53,31 @@ impl F32 {
         }
     }
 
+    #[inline]
     pub const fn to_bits(self) -> u32 {
         self.0
     }
 
     /// Converts a host `f32`, such as a constant written in source code.
+    #[inline]
     pub fn from_f32(value: f32) -> Self {
         Self::from_bits(value.to_bits())
     }
 
     /// The host `f32` with the same bits, for presentation only. Never do
     /// simulation arithmetic on the result.
+    #[inline]
     pub fn to_f32(self) -> f32 {
         f32::from_bits(self.0)
     }
 
     /// Loads the value into an FPU register (exact).
+    #[inline]
     pub fn ext(self) -> Ext {
         Ext::from_f32(self)
     }
 
+    #[inline]
     pub const fn is_nan(self) -> bool {
         self.0 == CANONICAL_NAN_BITS
     }
@@ -121,6 +127,7 @@ const MAX_LEADING_EXPONENT: i32 = 16383;
 const MIN_LEADING_EXPONENT: i32 = -16382;
 
 /// `value / 2^shift`, rounded to nearest with ties to even.
+#[inline]
 fn round_shift(value: u128, shift: u32) -> u128 {
     match shift {
         0 => value,
@@ -183,6 +190,7 @@ impl Ext {
     }
 
     /// Rounds `magnitude * 2^exponent` to a 64-bit significand.
+    #[inline]
     fn finite(negative: bool, magnitude: u128, exponent: i32) -> Self {
         if magnitude == 0 {
             return Self::zero(negative);
@@ -216,11 +224,13 @@ impl Ext {
     }
 
     /// Loads an integer (`FILD`, exact).
+    #[inline]
     pub fn from_i32(value: i32) -> Self {
         Self::finite(value < 0, u128::from(value.unsigned_abs()), 0)
     }
 
     /// Loads a stored float (`FLD m32`, exact).
+    #[inline]
     pub fn from_f32(value: F32) -> Self {
         let bits = value.to_bits();
         let negative = bits >> 31 != 0;
@@ -270,12 +280,14 @@ impl Ext {
     /// 24-bit tie without being that tie. Outside the range of a float the
     /// FPU keeps a wider exponent than this does; no game value gets
     /// there.
+    #[inline]
     pub fn single(self) -> Self {
         self.to_f32().ext()
     }
 
     /// Stores to 32 bits (`FSTP m32`), rounding to nearest even. Overflow
     /// gives infinity and tiny values become subnormal or zero.
+    #[inline]
     pub fn to_f32(self) -> F32 {
         let sign = u32::from(self.negative) << 31;
         match self.class {
@@ -439,6 +451,7 @@ impl Ext {
         Self::from_f64_bits(value.to_bits())
     }
 
+    #[inline]
     pub fn abs(self) -> Self {
         match self.class {
             Class::Nan => Self::NAN,
@@ -449,19 +462,23 @@ impl Ext {
         }
     }
 
+    #[inline]
     pub fn is_nan(self) -> bool {
         self.class == Class::Nan
     }
 
+    #[inline]
     pub fn is_zero(self) -> bool {
         self.class == Class::Zero
     }
 
     /// True for values below zero (not `-0`, not NaN).
+    #[inline]
     pub fn is_negative(self) -> bool {
         self.negative && matches!(self.class, Class::Finite | Class::Infinite)
     }
 
+    #[inline]
     fn magnitude_cmp(self, other: Self) -> Ordering {
         let rank = |c: Class| match c {
             Class::Zero => 0,
@@ -480,6 +497,7 @@ impl Ext {
 
 impl Neg for Ext {
     type Output = Self;
+    #[inline]
     fn neg(self) -> Self {
         match self.class {
             Class::Nan => Self::NAN,
@@ -493,6 +511,7 @@ impl Neg for Ext {
 
 impl Add for Ext {
     type Output = Self;
+    #[inline]
     fn add(self, other: Self) -> Self {
         use Class::*;
         match (self.class, other.class) {
@@ -536,6 +555,7 @@ impl Add for Ext {
 
 impl Sub for Ext {
     type Output = Self;
+    #[inline]
     fn sub(self, other: Self) -> Self {
         self + -other
     }
@@ -543,6 +563,7 @@ impl Sub for Ext {
 
 impl Mul for Ext {
     type Output = Self;
+    #[inline]
     fn mul(self, other: Self) -> Self {
         use Class::*;
         let negative = self.negative ^ other.negative;

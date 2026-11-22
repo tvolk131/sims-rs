@@ -209,6 +209,10 @@ pub struct Shown {
 pub struct Answers {
     pub(crate) queue: VecDeque<Answer>,
     include_single_button: bool,
+    /// Choice-only answers (`include_single_button = false`) that take over
+    /// once `queue` is drained (for example when reopening a saved
+    /// [`Answers::replay`] lot with caller-supplied choices).
+    pub(crate) choices_after: Option<VecDeque<Answer>>,
 }
 
 impl Answers {
@@ -218,6 +222,7 @@ impl Answers {
         Self {
             queue: list.iter().copied().map(Answer::from).collect(),
             include_single_button: false,
+            choices_after: None,
         }
     }
 
@@ -226,12 +231,41 @@ impl Answers {
         Self {
             queue: list.iter().cloned().collect(),
             include_single_button: true,
+            choices_after: None,
+        }
+    }
+
+    /// Appends choice-only answers to take over once any existing queued
+    /// answers have been consumed, switching `include_single_button` to `false`
+    /// at the boundary so later one-button notices never consume a choice.
+    pub(crate) fn extend_choices_after(&mut self, list: &[u8]) {
+        if list.is_empty() {
+            return;
+        }
+        let extra = self.choices_after.get_or_insert_with(VecDeque::new);
+        extra.extend(list.iter().copied().map(Answer::from));
+    }
+
+    /// Appends an interactive answer at the end of the pending answer stream
+    /// (onto `choices_after` when choice-only follow-up answers are staged
+    /// behind an explicit replay prefix, otherwise onto `queue`).
+    pub(crate) fn push_back_answer(&mut self, answer: Answer) {
+        if let Some(extra) = self.choices_after.as_mut() {
+            extra.push_back(answer);
+        } else {
+            self.queue.push_back(answer);
         }
     }
 }
 
 impl Player for Answers {
     fn answer(&mut self, shown: &Shown) -> Option<Answer> {
+        if self.queue.is_empty()
+            && let Some(next) = self.choices_after.take()
+        {
+            self.queue = next;
+            self.include_single_button = false;
+        }
         match shown.answers {
             [only] if !self.include_single_button && !shown.text_entry => Some((*only).into()),
             _ => self.queue.pop_front(),
@@ -543,11 +577,12 @@ impl Interpreter<'_> {
         };
         for id in start..=end {
             world.scheduler_cursor = id as i16;
-            let Some(object) = world.objects.get_mut(&id) else {
+            let Some(object) = world.objects.get(&id) else {
                 continue;
             };
-            if object.flags() & CHECK_ERROR != 0 {
-                if object.flags() & READY != 0 && object.stack.is_empty() {
+            let mut flags = object.flags();
+            if flags & CHECK_ERROR != 0 {
+                if flags & READY != 0 && object.stack.is_empty() {
                     // 0x46d5da -> 0x46d68c -> 0x439a6f: a deferred thread
                     // error recorded by 0x474aae (such as a faulted "init
                     // visitor") stops the pass and resets the object instead
@@ -573,15 +608,22 @@ impl Interpreter<'_> {
                     }
                     return Err(fault.into());
                 }
-                object.set_flags(CHECK_ERROR, false);
+                if let Some(object) = world.objects.get_mut(&id) {
+                    object.set_flags(CHECK_ERROR, false);
+                    flags = object.flags();
+                }
             }
-            let flags = object.flags();
             if flags & READY == 0 || (partial && flags & IN_PARTIAL == 0) {
                 continue;
             }
+            let Some(object) = world.objects.get(&id) else {
+                continue;
+            };
             let countdown = object.countdown().unwrap_or(0);
             if countdown > 0 {
-                object.set_countdown(countdown - 1);
+                if let Some(object) = world.objects.get_mut(&id) {
+                    object.set_countdown(countdown - 1);
+                }
                 update.counted.push(id);
                 continue;
             }
@@ -1062,8 +1104,8 @@ impl Interpreter<'_> {
     ///    ([`sims_sim::neighbors::Neighbors::relationships_changed`]) is cleared
     ///    (0x4424cb).
     /// 4. If no Sim is selected, or the selected one is a visitor on a
-    ///    residential lot, the game selects another (0x445501), which is
-    ///    not ported and fails.
+    ///    residential lot, the game selects another household member
+    ///    (`0x445501`, [`Interpreter::select_next_resident`]).
     pub fn end_of_update(
         &self,
         world: &mut World,
@@ -1209,11 +1251,7 @@ impl Interpreter<'_> {
             }
         };
         if reselect {
-            return Err(TickError::Unsupported(
-                "no Sim of the household is selected at the end of the lot update, and \
-                 selecting another (0x445501) is not ported"
-                    .into(),
-            ));
+            self.select_next_resident(world)?;
         }
         Ok(())
     }

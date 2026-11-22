@@ -1947,13 +1947,13 @@ fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {
     assert_eq!(digest(&format_29_bytes(lot.world())), NEWBIE_4052_29);
     assert_eq!(digest(&format_28_bytes(lot.world())), NEWBIE_4052_28);
     assert_eq!(digest(&format_27_bytes(lot.world())), NEWBIE_4052_27);
-    // The frame drawn after tick 4053 finds person 142's skin waiting for
-    // its update (0x590d26), which is not ported. Before the visitor pass
-    // above it was person 140's.
-    let stopped = lot.step().unwrap_err().to_string();
-    for part in ["4053", "person 142", "0x590d26"] {
-        assert!(stopped.contains(part), "{stopped}");
-    }
+    // The frame drawn after tick 4053 draws newly arrived person 142 for the
+    // first time (`undrawn` / byte +0xdb): step 3 (`0x5893a9` → `0x589361` at
+    // `0x58939e`) sets byte +0xd9 unconditionally, so `0x590d26` runs
+    // `update_skin` (`0x5992b3`) and tick 4053 now completes cleanly.
+    let tick4053 = lot.step().unwrap();
+    assert!(tick4053.errors.is_empty());
+    assert!(tick4053.frame_errors.is_empty());
 }
 
 /// The player cancels the snack from its icon in the queue
