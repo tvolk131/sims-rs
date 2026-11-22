@@ -263,8 +263,15 @@ fn wave2_build_mode_part2_terrain_water_pool_roof_and_previews() {
     // --- 1D. Roof pitch & pattern commit + Roof preview + Undo/Redo ---
     let base_roof = game.base_roof().clone();
     assert!(!base_roof.pattern.is_empty());
+    // Center over the Goth house footprint so the isometric roof mesh is in frame.
+    game.view.camera.center_on([26 * 16, 26 * 16], [400, 260]);
+    let before_roof_frame = game.render().color.clone();
     game.select_build_tool(BuildTool::Roof);
     let roof_preview_frame = game.render().color.clone();
+    assert_ne!(
+        before_roof_frame, roof_preview_frame,
+        "selecting BuildTool::Roof must render the isometric RoofCatalog preview"
+    );
     let target_pitch = if base_roof.pitch == sims_vm::RoofPitch::Steep {
         RoofPitchPreset::Shallow
     } else {
@@ -289,11 +296,9 @@ fn wave2_build_mode_part2_terrain_water_pool_roof_and_previews() {
     // Camera Roof toggle draws roofs even in Live mode, and toggling it off restores baseline.
     game.set_mode(Mode::Live);
     assert!(!game.roof_view());
-    let _ = roof_preview_frame;
     game.set_roof_view(true);
     let with_roof_live = game.render().color.clone();
     game.set_roof_view(false);
-    // Re-center to check untouched Live mode renders cleanly with roof_view off.
     let without_roof_live = game.render().color.clone();
     assert_ne!(
         with_roof_live, without_roof_live,
@@ -468,22 +473,55 @@ fn wave2_travel_shell_shop_picker_crash_recovery_and_community_edit() {
     )
     .expect("open NeighborhoodShell");
 
-    // --- 3A. Destination map switching & TravelChrome filter highlighting ---
-    for (dest, expected_kind) in [
-        (Destination::Downtown, NeighborhoodKind::Downtown),
-        (Destination::VacationIsland, NeighborhoodKind::Vacation),
-        (Destination::StudioTown, NeighborhoodKind::StudioTown),
-        (Destination::MagicTown, NeighborhoodKind::MagicTown),
+    // --- 3A. Destination map switching & TravelChrome filter + lodging pixel highlighting ---
+    for (dest, expected_kind, filter) in [
+        (
+            Destination::Downtown,
+            NeighborhoodKind::Downtown,
+            LotFilter::Shopping,
+        ),
+        (
+            Destination::VacationIsland,
+            NeighborhoodKind::Vacation,
+            LotFilter::Food,
+        ),
+        (
+            Destination::StudioTown,
+            NeighborhoodKind::StudioTown,
+            LotFilter::Movie,
+        ),
+        (
+            Destination::MagicTown,
+            NeighborhoodKind::MagicTown,
+            LotFilter::Magic,
+        ),
     ] {
         shell.handle_travel_command(TravelCommand::SwitchDestination(dest));
         assert_eq!(shell.neighborhood_kind(), expected_kind);
-        shell.handle_travel_command(TravelCommand::SetFilter(Some(LotFilter::Shopping)));
-        assert_eq!(
-            shell.travel_state().active_filter,
-            Some(LotFilter::Shopping)
-        );
         shell.render();
-        assert!(shell.canvas().width > 0);
+        let unfiltered = shell.canvas().color.clone();
+        shell.handle_travel_command(TravelCommand::SetFilter(Some(filter)));
+        assert_eq!(shell.travel_state().active_filter, Some(filter));
+        shell.render();
+        let filtered = shell.canvas().color.clone();
+        assert_ne!(
+            unfiltered, filtered,
+            "activating TravelChrome filter on {dest:?} must update rendered map/chrome pixels"
+        );
+        if dest == Destination::VacationIsland {
+            shell.handle_travel_command(TravelCommand::SetFilter(None));
+            shell.render();
+            let base_vac = shell.canvas().color.clone();
+            shell.handle_travel_command(TravelCommand::SetVacationLodging(Some(
+                sims_ui::travel::VacationLodging::Hotel,
+            )));
+            shell.render();
+            let hotel_vac = shell.canvas().color.clone();
+            assert_ne!(
+                base_vac, hotel_vac,
+                "selecting VacationLodging::Hotel must highlight hotel lots on Vacation Island"
+            );
+        }
     }
     shell.handle_travel_command(TravelCommand::ReturnToNeighborhood);
     assert_eq!(shell.neighborhood_kind(), NeighborhoodKind::Unleashed);
@@ -504,6 +542,12 @@ fn wave2_travel_shell_shop_picker_crash_recovery_and_community_edit() {
     assert_eq!(shell.screen(), ScreenKind::Lot);
     assert!(shell.is_destination_edit());
     assert!(shell.active_trip().is_none());
+    // Unlimited-budget edit sessions must NOT allow opening a spending ShopPickerDialog.
+    assert_eq!(
+        shell.game().unwrap().shop_kind_for_lot(),
+        None,
+        "ShopPickerDialog must be refused in community edit mode"
+    );
     shell.render();
     shell.leave_lot(true).expect("save and leave Downtown edit");
     assert_eq!(shell.screen(), ScreenKind::Neighborhood);
@@ -567,39 +611,135 @@ fn wave2_travel_shell_shop_picker_crash_recovery_and_community_edit() {
             before_buy - 250,
             "ShopPickerDialog Buy must deduct Simoleons cleanly"
         );
-        // Also verify MagiCoins purchase path works cleanly when household has tokens.
-        game.open_shop_with_items(
+        // Grant real MagiCoins to the first traveler and verify nonzero MagiCoins deduction.
+        let first_guid = goth_members[0];
+        let first_nid = game
+            .lot()
+            .world()
+            .neighbors
+            .slots
+            .iter()
+            .flatten()
+            .find(|r| r.guid == first_guid)
+            .map(|r| r.id)
+            .expect("traveler neighbor id");
+        {
+            let lot_mut = game.lot_mut();
+            let saved = lot_mut.save().expect("save for MagiCoins grant");
+            let orig_world_body = saved.world().encode();
+            let encoded = saved.encode();
+            let tail = encoded[8..]
+                .strip_prefix(orig_world_body.as_slice())
+                .expect("saved world prefix");
+            let mut world = saved.world().clone();
+            sims_vm::travel::set_neighbor_token_count(
+                &mut world,
+                first_nid,
+                sims_vm::travel::MAGICOIN_TOKEN_KIND,
+                sims_vm::travel::MAGICOIN_TOKEN_GUID,
+                120,
+            );
+            let new_world_body = world.encode();
+            let mut rebuilt = Vec::with_capacity(8 + new_world_body.len() + tail.len());
+            rebuilt.extend_from_slice(&encoded[..8]);
+            rebuilt.extend_from_slice(&new_world_body);
+            rebuilt.extend_from_slice(tail);
+            let patched =
+                sims_vm::boot::save::Saved::decode(&rebuilt).expect("decode patched saved");
+            lot_mut.restore(patched).expect("restore MagiCoins grant");
+        }
+        assert!(game.open_shop_with_items(
             ShopKind::MagicVendor,
             vec![ShopItem {
-                id: "free_reagent".into(),
-                name: "Sample Reagent".into(),
-                description: "Zero-cost test item".into(),
-                price: 0,
+                id: "magic_reagent_45".into(),
+                name: "Test Reagent".into(),
+                description: "Nonzero MagiCoins test item".into(),
+                price: 45,
                 currency: CurrencyKind::MagiCoins,
                 icon: None,
                 supports_try_on: false,
                 owned: false,
                 available: true,
             }],
-        );
+        ));
+        assert_eq!(game.shop_snapshot().unwrap().wallet.magic_coins, 120);
         game.execute_shop_command(ShopCommand::Buy {
-            item_id: "free_reagent".into(),
+            item_id: "magic_reagent_45".into(),
             currency: CurrencyKind::MagiCoins,
-            price: 0,
+            price: 45,
         });
+        assert_eq!(
+            game.shop_snapshot().unwrap().wallet.magic_coins,
+            75,
+            "ShopPickerDialog Buy must deduct nonzero MagiCoins cleanly"
+        );
         assert!(
             game.shop_snapshot()
                 .unwrap()
                 .items
                 .iter()
-                .find(|i| i.id == "free_reagent")
+                .find(|i| i.id == "magic_reagent_45")
                 .unwrap()
                 .owned
         );
         game.close_shop();
     }
+    let funds_after_shop = sims_vm::available_funds(shell.game().unwrap().lot().world());
+
+    // Save Manager during active trip must target home house and refuse loading slots.
+    assert!(shell.open_save_manager(None));
+    shell.handle_save_manager_command(sims_ui::saves::SaveManagerCommand::LoadSlot {
+        slot_id: "manual".into(),
+    });
+    assert!(
+        shell.active_trip().is_some(),
+        "Save Manager LoadSlot must be blocked during active travel visits"
+    );
+    shell.close_save_manager();
+
+    // Immediately return home WITHOUT restarting to prove the mutated destination lot
+    // reconciles the exact debited Simoleons + MagiCoins back onto the home lot!
+    let immediate_ret = shell
+        .return_from_destination()
+        .expect("immediate return from Downtown after shop purchases");
+    assert_eq!(immediate_ret.home_house, 5);
+    assert!(shell.active_trip().is_none());
+    assert_eq!(shell.active_lot_house(), Some(5));
+    assert_eq!(
+        sims_vm::available_funds(shell.game().unwrap().lot().world()),
+        funds_after_shop,
+        "immediate return_from_destination must reconcile shop Simoleons debit onto home lot"
+    );
+    assert_eq!(
+        sims_vm::travel::family_magic_coins(shell.game().unwrap().lot().world(), &goth_members),
+        75,
+        "immediate return_from_destination must reconcile MagiCoins debit onto home lot"
+    );
+
+    // Desktop shortcut helper: open_default_travel_dialog + cycle_travel_destination + confirm!
+    let default_plan = shell
+        .open_default_travel_dialog()
+        .expect("desktop open_default_travel_dialog on occupied home lot");
+    assert!(shell.travel_dialog_open());
+    assert!(shell.cycle_travel_destination(1));
+    let cycled_dest = shell.travel_dialog_state().unwrap().destination;
+    assert_ne!(
+        cycled_dest,
+        match default_plan.destination {
+            sims_vm::travel::TravelDestination::Downtown
+            | sims_vm::travel::TravelDestination::OldTown => Destination::Downtown,
+            sims_vm::travel::TravelDestination::VacationIsland => Destination::VacationIsland,
+            sims_vm::travel::TravelDestination::StudioTown => Destination::StudioTown,
+            sims_vm::travel::TravelDestination::MagicTown => Destination::MagicTown,
+        },
+        "cycling destination in TravelDialog must switch to another eligible destination"
+    );
+    shell.close_travel_dialog();
 
     // --- 3D. Crash recovery across restart (`inspect_active_trip` + `resume_active_trip`) ---
+    shell
+        .depart_to_destination(req.clone())
+        .expect("depart for crash-recovery verification");
     drop(shell);
     let mut recovered = NeighborhoodShell::open(
         install.clone(),
@@ -814,4 +954,116 @@ fn wave2_loading_screen_transitions_and_simlish_voices() {
     });
     let pcm2 = mixer.render(16_384);
     assert!(pcm2.iter().any(|&s| s != 0));
+}
+
+// ============================================================================
+// 5. Large Photo Album (>32 MiB aggregate) Summary + Lazy Hydration & Presenter
+// ============================================================================
+
+#[test]
+fn wave2_large_photo_album_60_snapshots_and_loading_presenter() {
+    let Some(install) = install_root() else {
+        return;
+    };
+    let tmp = TempDir::new("album-60");
+    let saves = tmp.path().join("wave2-album-60.redb");
+
+    let mut shell = NeighborhoodShell::open(
+        install.clone(),
+        saves.clone(),
+        1,
+        true,
+        vec![3],
+        Frames::default(),
+    )
+    .expect("open NeighborhoodShell");
+
+    // Attach a loading presenter and verify entering a lot invokes it with live
+    // rendered splash pixels AND `MusicMode::Load` before VM boot completes.
+    let presented_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let saw_load_music = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let count = std::sync::Arc::clone(&presented_count);
+        let load_flag = std::sync::Arc::clone(&saw_load_music);
+        shell.set_loading_presenter(Some(Box::new(move |pixels, size, audio| {
+            if !pixels.is_empty() && size[0] > 0 && size[1] > 0 {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if audio
+                .iter()
+                .any(|i| matches!(i, Input::MusicMode(MusicMode::Load)))
+            {
+                load_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        })));
+    }
+    shell.enter_lot(5).expect("enter Goth lot 5");
+    assert!(
+        presented_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "LoadingPresenter must present at least one native loading frame before blocking lot boot"
+    );
+    assert!(
+        saw_load_music.load(std::sync::atomic::Ordering::SeqCst),
+        "LoadingPresenter must receive MusicMode::Load immediately"
+    );
+    shell.leave_lot(false).expect("leave Goth lot 5");
+
+    // Add 60 full-size 640x480 RGB565 snapshots (~36 MiB > 32 MiB bulk `list()` ceiling)
+    // and verify the album opens, navigates to entry #60, hydrates its image, and deletes cleanly.
+    let goth_family = shell
+        .stored_neighborhood()
+        .family_in(5)
+        .map(|(id, _)| id)
+        .expect("Goth family id");
+    let token = shell
+        .store()
+        .albums()
+        .family_token("UserData", goth_family)
+        .expect("family token")
+        .expect("Goth token");
+    let full_img = sims_sim::album_store::AlbumImage::new(640, 480, vec![0x39E7u16; 640 * 480])
+        .expect("640x480 album image");
+    for i in 1..=60u32 {
+        let entry = sims_sim::album_store::NewAlbumPhoto::with_image(
+            format!("Snapshot {i}"),
+            format!("Caption {i}"),
+            full_img.clone(),
+        );
+        shell
+            .store()
+            .albums()
+            .add("UserData", token, entry)
+            .expect("add full-size snapshot");
+    }
+    // Confirm bulk `list()` would have rejected >32 MiB, while our shell opens cleanly via `list_summaries` + lazy `get`.
+    assert!(
+        shell
+            .store()
+            .albums()
+            .list("UserData", goth_family)
+            .is_err(),
+        "60 full-size 640x480 snapshots exceed the 32 MiB bulk list() ceiling"
+    );
+    shell
+        .open_photo_album_for_family(goth_family)
+        .expect("Photo Album must open 60+ full-size snapshots without locking out the player");
+    let snap = shell.album_snapshot().expect("album snapshot");
+    assert_eq!(snap.entries.len(), 60);
+    assert!(
+        snap.entries[0].image.is_some(),
+        "selected entry 0 must have hydrated image"
+    );
+    let last_id = snap.entries[59].id;
+    shell.execute_album_command(AlbumCommand::SelectEntry(last_id));
+    let after_select = shell.album_snapshot().expect("hydrated snapshot");
+    assert!(
+        after_select.entries[59].image.is_some(),
+        "selecting entry 60 must lazily hydrate its image"
+    );
+    shell.execute_album_command(AlbumCommand::DeleteEntry(last_id));
+    assert_eq!(
+        shell.album_snapshot().expect("after delete").entries.len(),
+        59
+    );
+    shell.close_photo_album();
 }

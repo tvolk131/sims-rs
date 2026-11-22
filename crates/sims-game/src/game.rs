@@ -6540,15 +6540,24 @@ impl Game {
     }
 
     /// Default [`ShopKind`] matching the active lot's expansion / community zoning.
+    ///
+    /// Returns `None` on residential lots (including Magic Town residential lots
+    /// 90–92) and during unlimited-budget community edit mode (`edit_mode` /
+    /// `globals[32] != 0`) or when no live household (`globals[9]`) is active.
     pub fn shop_kind_for_lot(&self) -> Option<ShopKind> {
+        let world = self.lot.world();
+        let has_household = world.globals.get(9).copied().unwrap_or(0) != 0;
+        let edit_budget = world.globals.get(32).copied().unwrap_or(0) != 0;
+        if self.edit_mode || edit_budget || !has_household || self.lot.residential() {
+            return None;
+        }
         let lot_id = self.lot.lot_id();
         match lot_id {
             21..=30 => Some(ShopKind::DowntownBoutique(WardrobeCategory::Formal)),
             40..=48 => Some(ShopKind::VacationKiosk),
             81..=89 => Some(ShopKind::StudioWardrobe),
             90..=98 => Some(ShopKind::MagicVendor),
-            _ if !self.lot.residential() => Some(ShopKind::PetAdoption),
-            _ => None,
+            _ => Some(ShopKind::PetAdoption),
         }
     }
 
@@ -6561,6 +6570,13 @@ impl Game {
 
     /// Opens [`ShopPickerDialog`] with explicit `items` and the live household wallet.
     pub fn open_shop_with_items(&mut self, kind: ShopKind, mut items: Vec<ShopItem>) -> bool {
+        let world = self.lot.world();
+        let has_household = world.globals.get(9).copied().unwrap_or(0) != 0;
+        let edit_budget = world.globals.get(32).copied().unwrap_or(0) != 0;
+        if self.edit_mode || edit_budget || !has_household {
+            self.note = Some("Shop is only available during a live household visit.".into());
+            return false;
+        }
         self.ensure_shop_assets();
         for item in &mut items {
             if self.purchased_shop_items.contains(&item.id) {
@@ -6746,7 +6762,8 @@ impl Game {
             let fam_id = i32::from(world.globals.get(9).copied().unwrap_or(0));
             match currency {
                 CurrencyKind::Simoleons => {
-                    world.budget.funds = world.budget.funds.saturating_sub(price).max(0);
+                    let next_funds = world.budget.funds.saturating_sub(price).max(0);
+                    let _ = world.set_funds(next_funds);
                 }
                 CurrencyKind::MagiCoins => {
                     let members: Vec<u32> = world
@@ -6919,14 +6936,28 @@ fn terrain_coord_for_mode(fine: [i32; 2], active: usize, mode: TerrainMode) -> [
 }
 
 fn terrain_overlay_for_drag(start: [i32; 2], end: [i32; 2], mode: TerrainMode) -> TerrainOverlay {
+    let vertex_drag_target = || {
+        if start == end {
+            TerrainTarget::Vertex(end)
+        } else {
+            let min_x = start[0].min(end[0]);
+            let max_x = start[0].max(end[0]);
+            let min_y = start[1].min(end[1]);
+            let max_y = start[1].max(end[1]);
+            TerrainTarget::Rect {
+                start: [min_x.saturating_sub(1), min_y.saturating_sub(1)],
+                end: [max_x, max_y],
+            }
+        }
+    };
     match mode {
         TerrainMode::Raise => TerrainOverlay {
             tool: RenderTerrainTool::Raise,
-            target: TerrainTarget::Vertex(end),
+            target: vertex_drag_target(),
         },
         TerrainMode::Lower => TerrainOverlay {
             tool: RenderTerrainTool::Lower,
-            target: TerrainTarget::Vertex(end),
+            target: vertex_drag_target(),
         },
         TerrainMode::Level | TerrainMode::LevelAverage => TerrainOverlay {
             tool: RenderTerrainTool::Level,

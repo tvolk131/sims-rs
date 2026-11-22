@@ -51,10 +51,11 @@
 use sims_audio::SoundEvent;
 use sims_audio::ambience::{AmbienceCatalog, AmbienceMixer, AmbienceZone, ZoomLevel};
 use sims_audio::files::SoundFiles;
+use sims_audio::levels;
 use sims_audio::module::Module;
 use sims_audio::music::{ALL_EXPANSIONS, ModeCatalog, ModeMusicPlayer, MusicMode};
 use sims_audio::placement::Projection;
-use sims_audio::player::{Player, RATE};
+use sims_audio::player::{Player, RATE, VOLUME_STEPS};
 use sims_audio::radio::{BuiltinStation, RadioCatalog, RadioPlayer, SpatialAttenuation, StationId};
 use sims_audio::sources::{FIELDS, NO_ROOM, Snapshot};
 use sims_audio::stations::StationLists;
@@ -1019,7 +1020,6 @@ impl Mixer {
             return;
         }
         let vox_step = self.player.vox_volume_step();
-        let master_gain = f32::from(vox_step) / f32::from(sims_ui::options::VOLUME_MAX);
         let frames = out.len() / 2;
         if frames == 0 {
             return;
@@ -1035,28 +1035,24 @@ impl Mixer {
             }
             scratch.resize(frames * ch, 0i16);
             let read = voice.stream.read_frames(&mut scratch);
-            if read == 0 || master_gain <= 0.0 {
+            if read == 0 || vox_step == 0 {
                 continue;
             }
-            let (left_gain, right_gain) = if let Some(obj) = voice.object {
+            let spatial = voice.object.map(|obj| {
                 let key = obj as i32;
-                let spatial = self
-                    .sources
+                self.sources
                     .screen
                     .get(&key)
                     .and_then(|proj| {
                         let level = self.sources.positions.get(&key).map_or(1, |pos| pos[2]);
                         SpatialAttenuation::from_projection(20, level, proj).ok()
                     })
-                    .unwrap_or(SpatialAttenuation::FULL);
-                let vol = master_gain * (spatial.volume as f32 / 1024.0);
-                let pan = (spatial.pan as f32).clamp(-1024.0, 1024.0) / 1024.0;
-                let l = vol * (1.0 - pan.max(0.0));
-                let r = vol * (1.0 + pan.min(0.0));
-                (l, r)
-            } else {
-                (master_gain, master_gain)
-            };
+                    .unwrap_or(SpatialAttenuation::FULL)
+            });
+            let [left_gain, right_gain] = voice_stereo_gains(vox_step, spatial);
+            if left_gain <= 0.0 && right_gain <= 0.0 {
+                continue;
+            }
             for i in 0..read {
                 let (sl, sr) = if ch == 1 {
                     let s = f32::from(scratch[i]);
@@ -1341,6 +1337,27 @@ impl Mixer {
     }
 }
 
+/// Converts a 1.91 `vox_volume_step` (`0..=10`) and optional [`SpatialAttenuation`]
+/// (`volume: 0..=1024`, `pan: 0..=1024` with `512` at center) into linear `[left, right]`
+/// stereo gains using the exact same [`sims_audio::levels`] conversion as [`RadioPlayer`].
+pub fn voice_stereo_gains(vox_step: u8, spatial: Option<SpatialAttenuation>) -> [f32; 2] {
+    let vox_vol = VOLUME_STEPS[usize::from(vox_step.min(10))];
+    if vox_vol <= 0 {
+        return [0.0, 0.0];
+    }
+    let spatial = spatial.unwrap_or(SpatialAttenuation::FULL);
+    if spatial.volume <= 0 {
+        return [0.0, 0.0];
+    }
+    let eff_vol = (i64::from(spatial.volume) * i64::from(vox_vol)) / 1024;
+    if eff_vol <= 0 {
+        return [0.0, 0.0];
+    }
+    let att = levels::attenuation(eff_vol, 1024);
+    let [gl, gr] = levels::gains(att, levels::pan(spatial.pan));
+    [gl as f32 / 65536.0, gr as f32 / 65536.0]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1499,5 +1516,56 @@ mod tests {
     #[test]
     fn feed_starts_focused_like_app_constructor() {
         assert!(Feed::default().focused());
+    }
+
+    #[test]
+    fn voice_stereo_gains_pan_left_center_and_right() {
+        assert_eq!(
+            voice_stereo_gains(0, Some(SpatialAttenuation::FULL)),
+            [0.0, 0.0]
+        );
+
+        let [cl, cr] = voice_stereo_gains(
+            10,
+            Some(SpatialAttenuation {
+                volume: 1024,
+                pan: 512,
+            }),
+        );
+        assert!(
+            cl > 0.9 && (cl - cr).abs() < 1e-4,
+            "center pan must be balanced: [{cl}, {cr}]"
+        );
+
+        let [ll, lr] = voice_stereo_gains(
+            10,
+            Some(SpatialAttenuation {
+                volume: 1024,
+                pan: 0,
+            }),
+        );
+        assert!(
+            ll > 0.9 && lr < ll * 0.1,
+            "left pan must favor left: [{ll}, {lr}]"
+        );
+
+        let [rl, rr] = voice_stereo_gains(
+            10,
+            Some(SpatialAttenuation {
+                volume: 1024,
+                pan: 1024,
+            }),
+        );
+        assert!(
+            rr > 0.9 && rl < rr * 0.1,
+            "right pan must favor right: [{rl}, {rr}]"
+        );
+
+        let [ul, ur] = voice_stereo_gains(10, None);
+        assert_eq!(
+            [ul, ur],
+            [cl, cr],
+            "UI/CAF preview must be centered at full volume"
+        );
     }
 }

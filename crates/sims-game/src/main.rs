@@ -23,17 +23,24 @@
 // A window shell: it reads the wall clock to pace the lot.
 #![allow(clippy::disallowed_methods)]
 
+use sims_content::Install;
+use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_game::game::goth_house;
 use sims_game::hud::DialogKey;
-use sims_game::neighborhood::{NeighborhoodShell, ScreenKind, ShellOutcome};
+use sims_game::neighborhood::{LoadingPresenter, NeighborhoodShell, ScreenKind, ShellOutcome};
 use sims_game::sound::{self, Input};
 use sims_game::view::Move;
 use sims_game::{Game, Options};
-use sims_render::{Walls, png};
+use sims_render::{Canvas, Walls, png};
+use sims_ui::art::Art;
+use sims_ui::frame::Frame;
+use sims_ui::loading::{LoadingKind, LoadingScreen, LoadingState, LoadingStrings};
 use softbuffer::{Context, Surface};
+use std::cell::{Cell, RefCell};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -326,6 +333,10 @@ struct Sound(Option<sims_game::output::Output>);
 
 #[cfg(any(target_os = "macos", feature = "sound"))]
 impl Sound {
+    fn empty() -> Self {
+        Self(None)
+    }
+
     fn from_mixer(mixer: Result<sims_game::sound::Mixer, String>) -> Self {
         let started = mixer.and_then(sims_game::output::Output::start);
         match started {
@@ -356,6 +367,10 @@ struct Sound;
 
 #[cfg(not(any(target_os = "macos", feature = "sound")))]
 impl Sound {
+    fn empty() -> Self {
+        Self
+    }
+
     fn start(_: &std::path::Path, mute: bool) -> Self {
         if !mute {
             eprintln!("sims-game: built without sound (the `sound` feature)");
@@ -491,9 +506,106 @@ fn options() -> Result<LaunchConfig, String> {
     )
 }
 
-/// Active desktop session: either a standalone explicit house launch or the
-/// full Neighborhood ↔ Family Bin ↔ Lot shell.
+type StartupResult = Result<
+    (
+        NeighborhoodShell,
+        Option<Result<sims_game::sound::Mixer, String>>,
+    ),
+    String,
+>;
+
+/// Native startup loading screen state shown while `NeighborhoodShell::open`
+/// and `Mixer::open` run in the background.
+struct StartupLoading {
+    loading_screen: LoadingScreen,
+    loading_art: Art,
+    loading_strings: LoadingStrings,
+    canvas: Canvas,
+    size: [i32; 2],
+    started: Instant,
+    last_tick: Instant,
+    rx: mpsc::Receiver<StartupResult>,
+    install: PathBuf,
+    mute: bool,
+}
+
+impl StartupLoading {
+    fn new(install: PathBuf, mute: bool, rx: mpsc::Receiver<StartupResult>) -> Self {
+        let mut loading_screen = LoadingScreen::new();
+        let _ = loading_screen.begin(1);
+        let (loading_art, loading_strings) = match Install::detect(&install) {
+            Ok(inst) => {
+                let art = UiGraphics::open(&inst)
+                    .ok()
+                    .and_then(|ui| sims_ui::loading::load_art(&ui, US_ENGLISH).ok())
+                    .unwrap_or_default();
+                let strings = LoadingStrings::load(&inst, US_ENGLISH).unwrap_or_default();
+                (art, strings)
+            }
+            Err(_) => (Art::default(), LoadingStrings::default()),
+        };
+        let now = Instant::now();
+        Self {
+            loading_screen,
+            loading_art,
+            loading_strings,
+            canvas: Canvas::new(800, 600, [0, 0, 0]),
+            size: [800, 600],
+            started: now,
+            last_tick: now,
+            rx,
+            install,
+            mute,
+        }
+    }
+
+    fn resize(&mut self, size: [i32; 2]) -> bool {
+        let size = [size[0].max(1), size[1].max(1)];
+        if self.size == size {
+            return false;
+        }
+        self.size = size;
+        self.canvas = Canvas::new(size[0] as usize, size[1] as usize, [0, 0, 0]);
+        true
+    }
+
+    fn tick(&mut self, now: Instant) {
+        let dt_ms = now.saturating_duration_since(self.last_tick).as_millis() as u64;
+        self.last_tick = now;
+        self.loading_screen.tick(dt_ms);
+    }
+
+    fn render(&mut self) {
+        let w = self.size[0].max(1) as u32;
+        let h = self.size[1].max(1) as u32;
+        let elapsed_s = self.started.elapsed().as_secs_f32();
+        let progress = (0.1 + (elapsed_s / 6.0) * 0.85).clamp(0.1, 0.95);
+        let state = LoadingState {
+            kind: LoadingKind::Startup,
+            progress,
+            destination_label: None,
+            caption_override: None,
+        };
+        let mut frame = Frame::new(w, h, [0, 0, 0]);
+        self.loading_screen
+            .draw(&mut frame, &state, &self.loading_art, &self.loading_strings);
+        self.canvas.width = w as usize;
+        self.canvas.height = h as usize;
+        self.canvas.color = frame.into_rgb();
+    }
+}
+
+type LocalLoadingPresenter = Box<dyn FnMut(&[[u8; 3]], [i32; 2], Vec<Input>)>;
+
+thread_local! {
+    static MAIN_THREAD_LOADING_PRESENTER: RefCell<Option<LocalLoadingPresenter>> =
+        RefCell::new(None);
+}
+
+/// Active desktop session: startup loading splash, standalone explicit house
+/// launch, or the full Neighborhood ↔ Family Bin ↔ Lot shell.
 enum Session {
+    Starting(Box<StartupLoading>),
     Standalone {
         game: Box<Game>,
         slot: String,
@@ -506,6 +618,7 @@ enum Session {
 impl Session {
     fn game(&self) -> Option<&Game> {
         match self {
+            Self::Starting(_) => None,
             Self::Standalone { game, .. } => Some(game),
             Self::Shell(shell) => shell.game(),
         }
@@ -513,6 +626,7 @@ impl Session {
 
     fn game_mut(&mut self) -> Option<&mut Game> {
         match self {
+            Self::Starting(_) => None,
             Self::Standalone { game, .. } => Some(game),
             Self::Shell(shell) => shell.game_mut(),
         }
@@ -520,6 +634,7 @@ impl Session {
 
     fn screen_kind(&self) -> ScreenKind {
         match self {
+            Self::Starting(_) => ScreenKind::Loading,
             Self::Standalone { .. } => ScreenKind::Lot,
             Self::Shell(shell) => shell.screen(),
         }
@@ -527,6 +642,7 @@ impl Session {
 
     fn has_dialog(&self) -> bool {
         match self {
+            Self::Starting(_) => false,
             Self::Standalone { game, .. } => game.has_dialog(),
             Self::Shell(shell) => shell.has_dialog(),
         }
@@ -534,6 +650,7 @@ impl Session {
 
     fn is_actively_interacting(&self) -> bool {
         match self {
+            Self::Starting(_) => false,
             Self::Standalone { game, .. } => game.is_actively_interacting(),
             Self::Shell(shell) => shell.is_actively_interacting(),
         }
@@ -541,6 +658,7 @@ impl Session {
 
     fn resize(&mut self, size: [i32; 2]) -> bool {
         match self {
+            Self::Starting(start) => start.resize(size),
             Self::Standalone { game, .. } => game.resize(size),
             Self::Shell(shell) => shell.resize(size),
         }
@@ -548,6 +666,7 @@ impl Session {
 
     fn render(&mut self) {
         match self {
+            Self::Starting(start) => start.render(),
             Self::Standalone { game, .. } => {
                 let _ = game.render();
             }
@@ -557,6 +676,7 @@ impl Session {
 
     fn canvas(&self) -> &sims_render::Canvas {
         match self {
+            Self::Starting(start) => &start.canvas,
             Self::Standalone { game, .. } => game.canvas(),
             Self::Shell(shell) => shell.canvas(),
         }
@@ -564,6 +684,7 @@ impl Session {
 
     fn persist_options(&mut self) {
         match self {
+            Self::Starting(_) => {}
             Self::Standalone {
                 game,
                 options_file,
@@ -583,16 +704,19 @@ impl Session {
     }
 }
 
+type SharedSurface = Rc<RefCell<Option<Surface<Rc<Window>, Rc<Window>>>>>;
+type SharedSurfaceSize = Rc<Cell<Option<(NonZeroU32, NonZeroU32)>>>;
+
 struct App {
     session: Session,
     last_screen: ScreenKind,
     last_lot_generation: (u64, u64),
     window: Option<Rc<Window>>,
-    surface: Option<Surface<Rc<Window>, Rc<Window>>>,
-    surface_size: Option<(NonZeroU32, NonZeroU32)>,
+    surface: SharedSurface,
+    surface_size: SharedSurfaceSize,
     title_throttle: TitleThrottle,
     redraw_pacer: RedrawPacer,
-    scale: u32,
+    scale: Rc<Cell<u32>>,
     cursor: Option<PhysicalPosition<f64>>,
     /// Most recent cursor position reported by winit (including outside the
     /// client rect) so captured Sound slider drags evaluate out-of-window
@@ -607,7 +731,7 @@ struct App {
     reported: bool,
     /// How many of the game's caught errors are printed.
     printed: usize,
-    sound: Sound,
+    sound: Rc<RefCell<Sound>>,
     /// Tracks what the sound has been told about the lot and camera.
     sound_feed: sound::Feed,
     /// Filters winit's synthetic pre-activation focus events at startup
@@ -738,7 +862,77 @@ impl App {
     fn window_drawable(&self) -> bool {
         self.window
             .as_ref()
-            .is_some_and(|w| canvas_size(w.inner_size(), self.scale.max(1)).is_some())
+            .is_some_and(|w| canvas_size(w.inner_size(), self.scale.get().max(1)).is_some())
+    }
+
+    fn send_sound(&self, input: Input) {
+        self.sound.borrow().send(input);
+    }
+
+    fn build_loading_presenter(&self) -> Option<LoadingPresenter> {
+        let window = self.window.clone()?;
+        let surface = Rc::clone(&self.surface);
+        let surface_size = Rc::clone(&self.surface_size);
+        let scale_cell = Rc::clone(&self.scale);
+        let sound = Rc::clone(&self.sound);
+        MAIN_THREAD_LOADING_PRESENTER.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(
+                move |pixels: &[[u8; 3]], size: [i32; 2], audio: Vec<Input>| {
+                    {
+                        let snd = sound.borrow();
+                        for input in audio {
+                            snd.send(input);
+                        }
+                    }
+                    let win_size = window.inner_size();
+                    let (Some(w), Some(h)) = (
+                        NonZeroU32::new(win_size.width),
+                        NonZeroU32::new(win_size.height),
+                    ) else {
+                        return;
+                    };
+                    let mut surf_guard = surface.borrow_mut();
+                    let Some(surf) = surf_guard.as_mut() else {
+                        return;
+                    };
+                    if surface_size.get() != Some((w, h)) {
+                        if surf.resize(w, h).is_err() {
+                            surface_size.set(None);
+                            return;
+                        }
+                        surface_size.set(Some((w, h)));
+                    }
+                    let Ok(mut buffer) = surf.buffer_mut() else {
+                        surface_size.set(None);
+                        return;
+                    };
+                    let cw = usize::try_from(size[0]).unwrap_or(0);
+                    let ch = usize::try_from(size[1]).unwrap_or(0);
+                    let mut tmp_canvas = Canvas::new(cw, ch, [0, 0, 0]);
+                    tmp_canvas.color = pixels.to_vec();
+                    let (bw, bh) = (win_size.width as usize, win_size.height as usize);
+                    let scale = scale_cell.get().max(1) as usize;
+                    blit_canvas(&tmp_canvas, &mut buffer, bw, bh, scale);
+                    if buffer.present().is_err() {
+                        surface_size.set(None);
+                    }
+                },
+            ));
+        });
+        Some(Box::new(|pixels, size, audio| {
+            MAIN_THREAD_LOADING_PRESENTER.with(|slot| {
+                if let Some(cb) = slot.borrow_mut().as_mut() {
+                    cb(pixels, size, audio);
+                }
+            });
+        }))
+    }
+
+    fn attach_loading_presenter(&mut self) {
+        let presenter = self.build_loading_presenter();
+        if let Session::Shell(shell) = &mut self.session {
+            shell.set_loading_presenter(presenter);
+        }
     }
 
     fn maybe_request_redraw(&mut self, now: Instant) {
@@ -757,6 +951,7 @@ impl App {
 
     fn current_lot_generation(&self) -> (u64, u64) {
         match &self.session {
+            Session::Starting(_) => (0, 0),
             Session::Standalone { game, .. } => (0, game.restore_generation()),
             Session::Shell(shell) => (
                 shell.lot_generation(),
@@ -773,8 +968,7 @@ impl App {
             self.last_screen = screen_now;
             self.last_lot_generation = lot_gen;
             if was_lot && screen_now == ScreenKind::Lot {
-                self.sound
-                    .send(sound::Input::Events(vec![sims_audio::SoundEvent::StopAll]));
+                self.send_sound(sound::Input::Events(vec![sims_audio::SoundEvent::StopAll]));
             }
             self.sound_feed.reset_for_lot();
             self.drag = None;
@@ -784,8 +978,9 @@ impl App {
             self.redraw_pacer.request_immediate();
         }
         if let Session::Shell(shell) = &mut self.session {
-            for input in shell.take_audio_inputs() {
-                self.sound.send(input);
+            let inputs = shell.take_audio_inputs();
+            for input in inputs {
+                self.send_sound(input);
             }
         }
     }
@@ -795,9 +990,10 @@ impl App {
     }
 
     fn slider_release_point(&mut self) -> Option<[i32; 2]> {
+        let scale = self.scale.get();
         #[cfg(target_os = "macos")]
         if let Some(window) = self.window.as_ref()
-            && let Some(point) = live_macos_cursor_point(window, self.scale)
+            && let Some(point) = live_macos_cursor_point(window, scale)
         {
             return Some(point);
         }
@@ -806,19 +1002,21 @@ impl App {
         }
         self.window
             .as_ref()
-            .and_then(|w| unclamped_canvas_point(self.last_cursor?, w.inner_size(), self.scale))
+            .and_then(|w| unclamped_canvas_point(self.last_cursor?, w.inner_size(), scale))
     }
 
     fn sync_size(&mut self, size: winit::dpi::PhysicalSize<u32>) {
-        if let Some(canvas) = canvas_size(size, self.scale) {
+        let scale = self.scale.get();
+        if let Some(canvas) = canvas_size(size, scale) {
             self.session.resize(canvas);
         }
         if self
             .cursor
-            .is_some_and(|c| canvas_point(c, size, self.scale).is_none())
+            .is_some_and(|c| canvas_point(c, size, scale).is_none())
         {
             self.cursor = None;
             let _ = match &mut self.session {
+                Session::Starting(_) => false,
                 Session::Standalone { game, .. } => game.leave(),
                 Session::Shell(shell) => shell.leave(),
             };
@@ -826,12 +1024,13 @@ impl App {
     }
 
     fn live_point(&mut self) -> Option<[i32; 2]> {
+        let scale = self.scale.get();
         let size = self.window.as_ref()?.inner_size();
-        if let Some(canvas) = canvas_size(size, self.scale) {
+        if let Some(canvas) = canvas_size(size, scale) {
             self.session.resize(canvas);
         }
         let cursor = self.cursor?;
-        let point = canvas_point(cursor, size, self.scale);
+        let point = canvas_point(cursor, size, scale);
         if point.is_none() {
             self.cursor = None;
         }
@@ -844,7 +1043,7 @@ impl App {
         let Some([x, y]) = self.session.game_mut().and_then(Game::take_pointer) else {
             return;
         };
-        let scale = f64::from(self.scale.max(1));
+        let scale = f64::from(self.scale.get().max(1));
         let position =
             PhysicalPosition::new((f64::from(x) + 0.5) * scale, (f64::from(y) + 0.5) * scale);
         if let Some(w) = &self.window
@@ -854,6 +1053,7 @@ impl App {
         }
         if let Some(point) = self.live_point() {
             let redraw = match &mut self.session {
+                Session::Starting(_) => false,
                 Session::Standalone { game, .. } => game.hover(point),
                 Session::Shell(shell) => shell.hover(point),
             };
@@ -885,6 +1085,7 @@ impl App {
     /// the operation succeeded (`0x4f26cf`, checked by `0x4f29cc` before quit).
     fn save(&mut self, restore: bool) -> bool {
         let ok = match &mut self.session {
+            Session::Starting(_) => false,
             Session::Standalone { game, slot, .. } => {
                 let store = match sims_sim::Snapshots::open(&self.saves) {
                     Ok(store) => store,
@@ -1022,6 +1223,15 @@ impl App {
                 let _ = self.save(false);
                 return;
             }
+            Key::Named(NamedKey::F7) => {
+                if let Session::Shell(shell) = &mut self.session {
+                    if let Err(err) = shell.open_default_travel_dialog() {
+                        shell.set_note(format!("Travel unavailable: {err}"));
+                    }
+                    self.changed(true, true);
+                }
+                return;
+            }
             Key::Named(NamedKey::F8) => {
                 if let Some(kind) = game.shop_kind_for_lot()
                     && game.open_shop(kind)
@@ -1036,7 +1246,9 @@ impl App {
             }
             Key::Named(NamedKey::F10) => {
                 if let Session::Shell(shell) = &mut self.session {
-                    let _ = shell.open_photo_album();
+                    if let Err(err) = shell.open_photo_album() {
+                        shell.set_note(format!("Photo Album unavailable: {err}"));
+                    }
                     self.changed(true, true);
                 }
                 return;
@@ -1070,11 +1282,22 @@ impl App {
                             }
                             return;
                         }
+                        "t" | "T" if !self.shift_held => {
+                            if let Session::Shell(shell) = &mut self.session {
+                                if let Err(err) = shell.open_default_travel_dialog() {
+                                    shell.set_note(format!("Travel unavailable: {err}"));
+                                }
+                                self.changed(true, true);
+                            }
+                            return;
+                        }
                         "h" | "H" if !self.shift_held => {
                             if let Session::Shell(shell) = &mut self.session
                                 && shell.active_trip().is_some()
                             {
-                                let _ = shell.return_from_destination();
+                                if let Err(err) = shell.return_from_destination() {
+                                    shell.set_note(format!("Could not return home: {err}"));
+                                }
                                 self.drain_shell_audio();
                                 self.changed(true, true);
                             }
@@ -1128,8 +1351,53 @@ impl App {
 
     /// Steps the active lot (or neighborhood animation timer) for the time
     /// since the last call.
-    fn tick(&mut self) {
+    fn tick(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        if let Session::Starting(start) = &mut self.session {
+            start.tick(now);
+            match start.rx.try_recv() {
+                Ok(Ok((mut shell, preloaded_mixer))) => {
+                    eprintln!(
+                        "sims-game: opened Neighborhood {} in {:.1} s",
+                        shell.neighborhood_slot(),
+                        start.started.elapsed().as_secs_f32()
+                    );
+                    let size = start.size;
+                    let install = start.install.clone();
+                    let mute = start.mute;
+                    let _ = start.loading_screen.finish();
+                    shell.resize(size);
+                    #[cfg(any(target_os = "macos", feature = "sound"))]
+                    let next_sound = match preloaded_mixer {
+                        Some(mixer) => Sound::from_mixer(mixer),
+                        None => Sound::start(&install, mute),
+                    };
+                    #[cfg(not(any(target_os = "macos", feature = "sound")))]
+                    let next_sound = {
+                        let _ = preloaded_mixer;
+                        Sound::start(&install, mute)
+                    };
+                    *self.sound.borrow_mut() = next_sound;
+                    self.session = Session::Shell(Box::new(shell));
+                    self.attach_loading_presenter();
+                    self.drain_shell_audio();
+                    self.wake_clock.reset(Instant::now());
+                    self.changed(true, true);
+                }
+                Ok(Err(err)) => {
+                    eprintln!("sims-game: startup failed: {err}");
+                    event_loop.exit();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("sims-game: startup worker disconnected");
+                    event_loop.exit();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.changed(true, false);
+                }
+            }
+            return;
+        }
         let (clock_us, step_us) = self.wake_clock.elapsed_us(now);
         self.drain_shell_audio();
         let shell_modal_open = matches!(
@@ -1143,7 +1411,7 @@ impl App {
             self.wake_clock.finish(now, Instant::now(), false);
             let redraw = match &mut self.session {
                 Session::Shell(shell) => shell.tick_shell(clock_us),
-                Session::Standalone { .. } => false,
+                Session::Standalone { .. } | Session::Starting(_) => false,
             };
             self.changed(redraw, false);
             return;
@@ -1152,7 +1420,7 @@ impl App {
             self.wake_clock.finish(now, Instant::now(), false);
             let redraw = match &mut self.session {
                 Session::Shell(shell) => shell.tick_shell(clock_us),
-                Session::Standalone { .. } => false,
+                Session::Standalone { .. } | Session::Starting(_) => false,
             };
             self.changed(redraw, false);
             return;
@@ -1167,7 +1435,9 @@ impl App {
         let scrolled = self.drag.is_none() && game.edge_scroll(clock_us);
         let pie_anim = game.pie_animating();
         redraw |= scrolled || pie_anim || game.spin_due() || game.blink_due();
-        self.sound_feed.update(game, |input| self.sound.send(input));
+        let sound_rc = Rc::clone(&self.sound);
+        self.sound_feed
+            .update(game, |input| sound_rc.borrow().send(input));
         let start = self.printed.min(game.errors().len());
         for error in &game.errors()[start..] {
             eprintln!("sims-game: error caught: {error}");
@@ -1197,7 +1467,7 @@ impl App {
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
             return;
         };
-        let scale = self.scale.max(1);
+        let scale = self.scale.get().max(1);
         let Some(canvas_size) = canvas_size(size, scale) else {
             return;
         };
@@ -1209,6 +1479,14 @@ impl App {
             self.dirty = false;
             let now = Instant::now();
             match &self.session {
+                Session::Starting(_) => {
+                    if let Some(title) = self
+                        .title_throttle
+                        .update_custom("sims-game: Loading...".into(), now)
+                    {
+                        window.set_title(title);
+                    }
+                }
                 Session::Standalone { game, .. } => {
                     let state = if game.stopped().is_some() {
                         TitleState::Stopped
@@ -1249,22 +1527,23 @@ impl App {
                 }
             }
         }
-        let Some(surface) = &mut self.surface else {
+        let mut surf_guard = self.surface.borrow_mut();
+        let Some(surface) = surf_guard.as_mut() else {
             self.dirty = true;
             self.redraw_pacer.on_redraw_failed(Instant::now());
             return;
         };
-        if self.surface_size != Some((w, h)) {
+        if self.surface_size.get() != Some((w, h)) {
             if surface.resize(w, h).is_err() {
-                self.surface_size = None;
+                self.surface_size.set(None);
                 self.dirty = true;
                 self.redraw_pacer.on_redraw_failed(Instant::now());
                 return;
             }
-            self.surface_size = Some((w, h));
+            self.surface_size.set(Some((w, h)));
         }
         let Ok(mut buffer) = surface.buffer_mut() else {
-            self.surface_size = None;
+            self.surface_size.set(None);
             self.dirty = true;
             self.redraw_pacer.on_redraw_failed(Instant::now());
             return;
@@ -1273,7 +1552,7 @@ impl App {
         let (bw, bh) = (size.width as usize, size.height as usize);
         blit_canvas(canvas, &mut buffer, bw, bh, scale as usize);
         if buffer.present().is_err() {
-            self.surface_size = None;
+            self.surface_size.set(None);
             self.dirty = true;
             self.redraw_pacer.on_redraw_failed(Instant::now());
             return;
@@ -1409,8 +1688,8 @@ impl ApplicationHandler for App {
             Context::new(window.clone()).and_then(|context| Surface::new(&context, window.clone()));
         match surface {
             Ok(s) => {
-                self.surface = Some(s);
-                self.surface_size = None;
+                *self.surface.borrow_mut() = Some(s);
+                self.surface_size.set(None);
             }
             Err(e) => {
                 eprintln!("sims-game: could not draw into the window: {e}");
@@ -1418,8 +1697,10 @@ impl ApplicationHandler for App {
                 return;
             }
         }
-        self.scale = window.scale_factor().round().max(1.0) as u32;
+        self.scale
+            .set(window.scale_factor().round().max(1.0) as u32);
         self.window = Some(window.clone());
+        self.attach_loading_presenter();
         self.refresh_monitor_rate();
         self.drain_shell_audio();
         self.wake_clock.reset(Instant::now());
@@ -1429,7 +1710,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.tick();
+        self.tick(event_loop);
         let now = Instant::now();
         let wake_deadline = now + WAKE;
         let next_deadline = if self.window_drawable() {
@@ -1456,17 +1737,18 @@ impl ApplicationHandler for App {
                     self.refresh_monitor_rate();
                 }
                 if let Some(focused) = self.focus_filter.filter(focused) {
+                    let sound_rc = Rc::clone(&self.sound);
                     if let Some(game) = self.session.game_mut() {
                         if self
                             .sound_feed
-                            .set_focused(focused, game, |input| self.sound.send(input))
+                            .set_focused(focused, game, |input| sound_rc.borrow().send(input))
                         {
                             self.wake_clock.reset(Instant::now());
                             self.changed(true, true);
                         }
                     } else {
                         self.sound_feed
-                            .set_shell_focused(focused, |input| self.sound.send(input));
+                            .set_shell_focused(focused, |input| sound_rc.borrow().send(input));
                     }
                 }
             }
@@ -1481,8 +1763,8 @@ impl ApplicationHandler for App {
                 self.changed(true, true);
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.scale = scale_factor.round().max(1.0) as u32;
-                self.surface_size = None;
+                self.scale.set(scale_factor.round().max(1.0) as u32);
+                self.surface_size.set(None);
                 self.refresh_monitor_rate();
                 if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
                     self.sync_size(size);
@@ -1542,6 +1824,9 @@ impl ApplicationHandler for App {
                 }
                 if travel_dialog_open && let Session::Shell(shell) = &mut self.session {
                     let out = match &event.logical_key {
+                        Key::Named(NamedKey::ArrowLeft) => shell.key_left(),
+                        Key::Named(NamedKey::ArrowRight) => shell.key_right(),
+                        Key::Named(NamedKey::Tab) => shell.key_tab(),
                         Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
                         Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
                         _ => ShellOutcome::default(),
@@ -1559,10 +1844,19 @@ impl ApplicationHandler for App {
                         Key::Named(NamedKey::ArrowDown) => shell.key_down(),
                         Key::Named(NamedKey::Home) => shell.key_home(),
                         Key::Named(NamedKey::End) => shell.key_end(),
+                        Key::Named(NamedKey::PageUp) => shell.key_page_up(),
+                        Key::Named(NamedKey::PageDown) => shell.key_page_down(),
                         Key::Named(NamedKey::Tab) => shell.key_tab(),
                         Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
                         Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
                         Key::Named(NamedKey::Space) => shell.key_char(' '),
+                        Key::Character(c)
+                            if self.ctrl_or_cmd_held
+                                && !event.repeat
+                                && c.eq_ignore_ascii_case("s") =>
+                        {
+                            shell.key_save_shortcut()
+                        }
                         _ => {
                             let mut combined = ShellOutcome::default();
                             if !self.ctrl_or_cmd_held
@@ -1581,6 +1875,7 @@ impl ApplicationHandler for App {
                 }
                 if shop_open {
                     match &mut self.session {
+                        Session::Starting(_) => {}
                         Session::Standalone { game, .. } => {
                             let out = match &event.logical_key {
                                 Key::Named(NamedKey::ArrowUp) => {
@@ -1763,6 +2058,7 @@ impl ApplicationHandler for App {
                             }
                             Key::Named(NamedKey::Enter) if !event.repeat => match &mut self.session
                             {
+                                Session::Starting(_) => {}
                                 Session::Standalone { game, .. } => {
                                     standalone_out = Some(game.dialog_submit());
                                 }
@@ -1775,6 +2071,7 @@ impl ApplicationHandler for App {
                             },
                             Key::Named(NamedKey::Escape) if !event.repeat => {
                                 match &mut self.session {
+                                    Session::Starting(_) => {}
                                     Session::Standalone { game, .. } => {
                                         standalone_out =
                                             Some(game.dialog_confirm_key(DialogKey::Escape));
@@ -1820,6 +2117,7 @@ impl ApplicationHandler for App {
                         };
                         if let Some(key) = dialog_key {
                             match &mut self.session {
+                                Session::Starting(_) => {}
                                 Session::Standalone { game, .. } => {
                                     let out = game.dialog_confirm_key(key);
                                     self.handle_standalone_outcome(event_loop, out);
@@ -1834,6 +2132,7 @@ impl ApplicationHandler for App {
                 } else if event.logical_key == Key::Named(NamedKey::Escape) {
                     if !event.repeat {
                         match &mut self.session {
+                            Session::Starting(_) => {}
                             Session::Standalone { game, .. } => {
                                 let closed = game.close_menu();
                                 let cancelled = !closed && game.cancel_buy();
@@ -1927,6 +2226,7 @@ impl ApplicationHandler for App {
                         });
                         self.last_left_press = if is_double { None } else { Some((now, point)) };
                         match &mut self.session {
+                            Session::Starting(_) => {}
                             Session::Standalone { game, .. } => {
                                 let out = game.press(point);
                                 self.handle_standalone_outcome(event_loop, out);
@@ -1950,6 +2250,7 @@ impl ApplicationHandler for App {
                         self.live_point()
                     };
                     match &mut self.session {
+                        Session::Starting(_) => {}
                         Session::Standalone { game, .. } => {
                             let out = match point {
                                 Some(pt) => game.release(pt),
@@ -1975,6 +2276,7 @@ impl ApplicationHandler for App {
                     self.drag = None;
                     let pt = self.live_point();
                     let redraw = match (&mut self.session, pt) {
+                        (Session::Starting(_), _) => false,
                         (Session::Standalone { game, .. }, Some(p)) => game.hover(p),
                         (Session::Standalone { game, .. }, None) => game.leave(),
                         (Session::Shell(shell), Some(p)) => shell.hover(p),
@@ -1987,6 +2289,7 @@ impl ApplicationHandler for App {
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = None;
                 let redraw = match &mut self.session {
+                    Session::Starting(_) => false,
                     Session::Standalone { game, .. } => game.leave(),
                     Session::Shell(shell) => shell.leave(),
                 };
@@ -1994,17 +2297,18 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_cursor = Some(position);
+                let scale = self.scale.get();
                 let (point, unclamped) = self
                     .window
                     .as_ref()
                     .map(|w| {
                         let size = w.inner_size();
-                        if let Some(canvas) = canvas_size(size, self.scale) {
+                        if let Some(canvas) = canvas_size(size, scale) {
                             self.session.resize(canvas);
                         }
                         (
-                            canvas_point(position, size, self.scale),
-                            unclamped_canvas_point(position, size, self.scale),
+                            canvas_point(position, size, scale),
+                            unclamped_canvas_point(position, size, scale),
                         )
                     })
                     .unwrap_or((None, None));
@@ -2012,6 +2316,7 @@ impl ApplicationHandler for App {
                     self.cursor = Some(position);
                     let redraw = self.drag.is_none()
                         && match &mut self.session {
+                            Session::Starting(_) => false,
                             Session::Standalone { game, .. } => game.hover(point),
                             Session::Shell(shell) => shell.hover(point),
                         };
@@ -2020,6 +2325,7 @@ impl ApplicationHandler for App {
                     self.cursor = None;
                     let mut redraw = self.drag.is_none()
                         && match &mut self.session {
+                            Session::Starting(_) => false,
                             Session::Standalone { game, .. } => game.leave(),
                             Session::Shell(shell) => shell.leave(),
                         };
@@ -2043,7 +2349,7 @@ impl ApplicationHandler for App {
                     self.drag = None;
                 }
                 if let Some(start) = self.drag {
-                    let scale = f64::from(self.scale.max(1));
+                    let scale = f64::from(self.scale.get().max(1));
                     let dx = ((position.x - start.x) / scale) as i32;
                     let dy = ((position.y - start.y) / scale) as i32;
                     if dx != 0 || dy != 0 {
@@ -2160,11 +2466,11 @@ fn run() -> Result<(), String> {
             last_screen: ScreenKind::Lot,
             last_lot_generation: (0, 0),
             window: None,
-            surface: None,
-            surface_size: None,
+            surface: Rc::new(RefCell::new(None)),
+            surface_size: Rc::new(Cell::new(None)),
             title_throttle: TitleThrottle::default(),
             redraw_pacer: RedrawPacer::new(None),
-            scale: 1,
+            scale: Rc::new(Cell::new(1)),
             cursor: None,
             last_cursor: None,
             drag: None,
@@ -2174,7 +2480,7 @@ fn run() -> Result<(), String> {
             photos: 0,
             reported: false,
             printed: 0,
-            sound,
+            sound: Rc::new(RefCell::new(sound)),
             sound_feed: sound::Feed::default(),
             focus_filter: FocusFilter::default(),
             saves: config.saves,
@@ -2189,70 +2495,72 @@ fn run() -> Result<(), String> {
         "sims-game: opening Neighborhood shell ({})",
         config.install.display()
     );
-    let started = Instant::now();
-    #[cfg(any(target_os = "macos", feature = "sound"))]
-    let (shell, preloaded_mixer) = if !config.mute {
-        let install_for_mixer = config.install.clone();
-        let (shell_res, mixer_res) = std::thread::scope(|scope| {
-            let mixer_handle = scope.spawn(|| sims_game::sound::Mixer::open(&install_for_mixer));
-            let shell_res = NeighborhoodShell::open(
-                config.install.clone(),
-                config.saves.clone(),
+    let (tx, rx) = mpsc::channel();
+    let install_bg = config.install.clone();
+    let saves_bg = config.saves.clone();
+    let play_bg = config.play;
+    let answers_bg = config.answers;
+    let mute_bg = config.mute;
+    std::thread::spawn(move || {
+        #[cfg(any(target_os = "macos", feature = "sound"))]
+        let result: StartupResult = if !mute_bg {
+            let install_for_mixer = install_bg.clone();
+            let (shell_res, mixer_res) = std::thread::scope(|scope| {
+                let mixer_handle =
+                    scope.spawn(|| sims_game::sound::Mixer::open(&install_for_mixer));
+                let shell_res = NeighborhoodShell::open(
+                    install_bg.clone(),
+                    saves_bg.clone(),
+                    1,
+                    play_bg,
+                    answers_bg,
+                    sims_game::Frames::default(),
+                );
+                (
+                    shell_res,
+                    mixer_handle
+                        .join()
+                        .unwrap_or_else(|_| Err("sound mixer worker panicked".to_owned())),
+                )
+            });
+            shell_res.map(|shell| (shell, Some(mixer_res)))
+        } else {
+            NeighborhoodShell::open(
+                install_bg,
+                saves_bg,
                 1,
-                config.play,
-                config.answers,
+                play_bg,
+                answers_bg,
                 sims_game::Frames::default(),
-            );
-            (
-                shell_res,
-                mixer_handle
-                    .join()
-                    .unwrap_or_else(|_| Err("sound mixer worker panicked".to_owned())),
             )
-        });
-        (shell_res?, Some(mixer_res))
-    } else {
-        let shell = NeighborhoodShell::open(
-            config.install.clone(),
-            config.saves.clone(),
-            1,
-            config.play,
-            config.answers,
-            sims_game::Frames::default(),
-        )?;
-        (shell, None)
-    };
-    #[cfg(not(any(target_os = "macos", feature = "sound")))]
-    let shell = NeighborhoodShell::open(
-        config.install.clone(),
-        config.saves.clone(),
-        1,
-        config.play,
-        config.answers,
-        sims_game::Frames::default(),
-    )?;
-    eprintln!(
-        "sims-game: opened Neighborhood {} in {:.1} s",
-        shell.neighborhood_slot(),
-        started.elapsed().as_secs_f32()
-    );
-    #[cfg(any(target_os = "macos", feature = "sound"))]
-    let sound = match preloaded_mixer {
-        Some(mixer) => Sound::from_mixer(mixer),
-        None => Sound::start(&config.install, config.mute),
-    };
-    #[cfg(not(any(target_os = "macos", feature = "sound")))]
-    let sound = Sound::start(&config.install, config.mute);
+            .map(|shell| (shell, None))
+        };
+        #[cfg(not(any(target_os = "macos", feature = "sound")))]
+        let result: StartupResult = {
+            let _ = mute_bg;
+            NeighborhoodShell::open(
+                install_bg,
+                saves_bg,
+                1,
+                play_bg,
+                answers_bg,
+                sims_game::Frames::default(),
+            )
+            .map(|shell| (shell, None))
+        };
+        let _ = tx.send(result);
+    });
+    let startup = StartupLoading::new(config.install.clone(), config.mute, rx);
     let mut app = App {
-        session: Session::Shell(Box::new(shell)),
-        last_screen: ScreenKind::Neighborhood,
+        session: Session::Starting(Box::new(startup)),
+        last_screen: ScreenKind::Loading,
         last_lot_generation: (0, 0),
         window: None,
-        surface: None,
-        surface_size: None,
+        surface: Rc::new(RefCell::new(None)),
+        surface_size: Rc::new(Cell::new(None)),
         title_throttle: TitleThrottle::default(),
         redraw_pacer: RedrawPacer::new(None),
-        scale: 1,
+        scale: Rc::new(Cell::new(1)),
         cursor: None,
         last_cursor: None,
         drag: None,
@@ -2262,7 +2570,7 @@ fn run() -> Result<(), String> {
         photos: 0,
         reported: false,
         printed: 0,
-        sound,
+        sound: Rc::new(RefCell::new(Sound::empty())),
         sound_feed: sound::Feed::default(),
         focus_filter: FocusFilter::default(),
         saves: config.saves,
