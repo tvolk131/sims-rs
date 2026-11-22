@@ -1317,7 +1317,11 @@ impl App {
             && !saved_ok
             && let Some(game) = self.session.game_mut()
         {
-            game.after_save_failed();
+            let msg = game
+                .note()
+                .map(str::to_owned)
+                .unwrap_or_else(|| "The lot was not saved.".into());
+            game.after_save_failed_with_notice("Save Failed", msg);
             self.changed(true, true);
         }
         if outcome.neighborhood
@@ -2227,13 +2231,17 @@ impl ApplicationHandler for App {
                     &self.session,
                     Session::Shell(shell) if shell.travel_dialog_open()
                 );
-                let shop_open = self.session.game().is_some_and(Game::shop_open);
+                let shop_open = self.session.game().is_some_and(Game::shop_open)
+                    || matches!(&self.session, Session::Shell(shell) if shell.import_picker_open());
+                let book_open = self.session.game().is_some_and(Game::book_open)
+                    || matches!(&self.session, Session::Shell(shell) if shell.credits_open());
                 let coop_lobby_open = self.session.coop_lobby_open();
                 if is_coop_toggle
                     && !save_manager_open
                     && !album_open
                     && !travel_dialog_open
                     && !shop_open
+                    && !book_open
                     && self.session.screen_kind() != ScreenKind::CreateFamily
                     && (coop_lobby_open || !self.session.has_dialog())
                 {
@@ -2330,6 +2338,7 @@ impl ApplicationHandler for App {
                     && !album_open
                     && !travel_dialog_open
                     && !shop_open
+                    && !book_open
                     && !self.session.has_dialog()
                     && let Some(game) = self.session.game_mut()
                 {
@@ -2399,6 +2408,45 @@ impl ApplicationHandler for App {
                     self.handle_shell_outcome(event_loop, out);
                     return;
                 }
+                if book_open {
+                    match &mut self.session {
+                        Session::Starting(_) => {}
+                        Session::Standalone { game, .. } => {
+                            let out = match &event.logical_key {
+                                Key::Named(NamedKey::ArrowLeft | NamedKey::PageUp) => {
+                                    sims_game::Outcome {
+                                        redraw: game.book_prev_page(),
+                                        ..sims_game::Outcome::default()
+                                    }
+                                }
+                                Key::Named(NamedKey::ArrowRight | NamedKey::PageDown) => {
+                                    sims_game::Outcome {
+                                        redraw: game.book_next_page(),
+                                        ..sims_game::Outcome::default()
+                                    }
+                                }
+                                Key::Named(NamedKey::Enter | NamedKey::Escape) if !event.repeat => {
+                                    game.book_close()
+                                }
+                                _ => sims_game::Outcome::default(),
+                            };
+                            self.handle_standalone_outcome(event_loop, out);
+                        }
+                        Session::Shell(shell) => {
+                            let out = match &event.logical_key {
+                                Key::Named(NamedKey::ArrowLeft) => shell.key_left(),
+                                Key::Named(NamedKey::ArrowRight) => shell.key_right(),
+                                Key::Named(NamedKey::PageUp) => shell.key_page_up(),
+                                Key::Named(NamedKey::PageDown) => shell.key_page_down(),
+                                Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
+                                Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
+                                _ => ShellOutcome::default(),
+                            };
+                            self.handle_shell_outcome(event_loop, out);
+                        }
+                    }
+                    return;
+                }
                 if shop_open {
                     match &mut self.session {
                         Session::Starting(_) => {}
@@ -2418,6 +2466,8 @@ impl ApplicationHandler for App {
                                         ..sims_game::Outcome::default()
                                     }
                                 }
+                                Key::Named(NamedKey::ArrowLeft) => game.shop_rotate_preview(-45),
+                                Key::Named(NamedKey::ArrowRight) => game.shop_rotate_preview(45),
                                 Key::Named(NamedKey::Enter) if !event.repeat => game.shop_submit(),
                                 Key::Named(NamedKey::Escape) if !event.repeat => game.shop_escape(),
                                 _ => sims_game::Outcome::default(),
@@ -2428,6 +2478,8 @@ impl ApplicationHandler for App {
                             let out = match &event.logical_key {
                                 Key::Named(NamedKey::ArrowUp) => shell.key_up(),
                                 Key::Named(NamedKey::ArrowDown) => shell.key_down(),
+                                Key::Named(NamedKey::ArrowLeft) => shell.key_left(),
+                                Key::Named(NamedKey::ArrowRight) => shell.key_right(),
                                 Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
                                 Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
                                 _ => ShellOutcome::default(),
@@ -2708,9 +2760,19 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(p) => p.y,
                 };
                 if let Session::Shell(shell) = &mut self.session
-                    && (shell.save_manager_open() || shell.album_open())
+                    && (shell.save_manager_open()
+                        || shell.album_open()
+                        || shell.import_picker_open()
+                        || shell.credits_open())
                 {
                     let redraw = shell.wheel(y);
+                    self.changed(redraw, true);
+                    return;
+                }
+                if let Some(game) = self.session.game_mut()
+                    && game.book_open()
+                {
+                    let redraw = game.book_wheel(y);
                     self.changed(redraw, true);
                     return;
                 }

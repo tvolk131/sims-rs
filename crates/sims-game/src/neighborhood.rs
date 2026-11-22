@@ -14,7 +14,7 @@
 
 use crate::autosave_worker::{
     AutosaveWorker, SaveCompletion, build_save_manager_snapshot, format_save_label, parse_slot_id,
-    validate_save_payload, validate_save_payload_cached,
+    validate_save_payload,
 };
 use crate::caf_screen::{CafOutcome, CafSession};
 use crate::coop::default_player_name;
@@ -25,8 +25,10 @@ use sims_audio::SoundEvent;
 use sims_audio::music::MusicMode;
 use sims_content::ui_graphics::UiGraphics;
 use sims_content::{ArchivePool, Catalog, Index, Install};
+use sims_core::CrtRng;
 use sims_formats::bitmap::Image;
-use sims_formats::iff::Iff;
+use sims_formats::family_file::FamilyFile;
+use sims_formats::iff::{ChunkData, Iff, write as write_iff};
 use sims_formats::strings::StringTable;
 use sims_render::camera::{Camera, Walls, Zoom};
 use sims_render::neighborhood::{
@@ -46,6 +48,9 @@ use sims_ui::album::{
     AlbumCommand, AlbumEntry, AlbumKey, AlbumSnapshot, AlbumStrings, PhotoAlbumDialog, PhotoId,
 };
 use sims_ui::art::Art;
+use sims_ui::book::{
+    BookCommand, BookEntry, BookPage, BookStrings, ReferenceBookDialog, ReferenceBookSnapshot,
+};
 use sims_ui::command::Command;
 use sims_ui::coop::{CoopCommand, CoopLobbyDialog, CoopSnapshot, LobbyTab};
 use sims_ui::dialog::{self, DialogFadeState, DialogState, FrameStyle, Labels, Message};
@@ -63,6 +68,10 @@ use sims_ui::neighborhood::{
 };
 use sims_ui::options::{OptionsState, OptionsTexts};
 use sims_ui::saves::{SaveManagerCommand, SaveManagerDialog, SaveManagerSnapshot};
+use sims_ui::shop::{
+    CurrencyKind, ShopCommand, ShopItem, ShopKind, ShopPickerDialog, ShopSnapshot, ShopStrings,
+    Wallet, WardrobeCategory,
+};
 use sims_ui::travel::{
     Destination, LotFilter, TravelBarMode, TravelChrome, TravelCommand, TravelDialog,
     TravelDialogCommand, TravelDialogLayout, TravelDialogState, TravelLayout, TravelState,
@@ -70,6 +79,7 @@ use sims_ui::travel::{
 };
 use sims_vm::boot::Frames;
 use sims_vm::boot::save::Saved;
+use sims_vm::caf::{CafContext, encode_fami, import_family_fam};
 use sims_vm::lifecycle::{self, BulldozeReport, EvictReport, MoveInReport, SaveReport};
 use sims_vm::travel::{
     self as vm_travel, ReturnReport, TravelDestination, TravelRequest, TravelSession,
@@ -82,6 +92,9 @@ use std::sync::Arc;
 const US_ENGLISH: u8 = 1;
 const NEIGHBORHOOD_DIALOG_STRINGS: u16 = 131;
 const MOVE_IN_DIALOG_STRINGS: u16 = 132;
+const IMPORT_DIALOG_STRINGS: u16 = 143;
+const REZONE_DIALOG_STRINGS: u16 = 250;
+const ZONING_TYPES_STRINGS: u16 = 251;
 const STREET_NAMES_TABLE: u16 = 2000;
 const LOT_ASSIGNMENTS_TABLE: u16 = 2001;
 const LOT_DESC_BASE_TABLE: u16 = 2000;
@@ -162,7 +175,21 @@ enum ShellDialogKind {
         home_house: u32,
         destination_house: u32,
     },
+    ConfirmRezone {
+        lot_id: u16,
+        target_zone: i32,
+    },
     Notice,
+}
+
+/// Discovered `.FAM` family archive eligible for importing into the Family Bin.
+#[derive(Debug, Clone)]
+struct ImportableFamily {
+    path: PathBuf,
+    family_name: String,
+    member_count: usize,
+    budget: i32,
+    source_label: String,
 }
 
 /// Optional desktop host hook called immediately before blocking lot/travel
@@ -395,6 +422,12 @@ struct DialogStrings {
     bulldoze: Vec<String>,
     /// `STR# 132`: Move-In confirmation / notice messages.
     move_in: Vec<String>,
+    /// `STR# 143`: Import Family strings.
+    import_strs: Vec<String>,
+    /// `STR# 250`: Rezone Mode confirmation strings.
+    rezone: Vec<String>,
+    /// `STR# 251`: Zoning type display names (`[0]` Residential, `[1]` Community).
+    zoning_types: Vec<String>,
     /// `STR# 128`: Family Bin strings (Delete Family confirmation at 6..=7).
     family_bin: FamilyBinStrings,
     /// `STR# 153`: Options / Quit confirmation strings.
@@ -408,6 +441,9 @@ impl DialogStrings {
         let mut out = Self {
             bulldoze: Vec::new(),
             move_in: Vec::new(),
+            import_strs: Vec::new(),
+            rezone: Vec::new(),
+            zoning_types: Vec::new(),
             family_bin: FamilyBinStrings::load(install, US_ENGLISH).unwrap_or_default(),
             options: OptionsTexts::load(install).unwrap_or_default(),
             labels: Labels::load(install).unwrap_or_default(),
@@ -435,6 +471,9 @@ impl DialogStrings {
             };
             out.bulldoze = read(NEIGHBORHOOD_DIALOG_STRINGS);
             out.move_in = read(MOVE_IN_DIALOG_STRINGS);
+            out.import_strs = read(IMPORT_DIALOG_STRINGS);
+            out.rezone = read(REZONE_DIALOG_STRINGS);
+            out.zoning_types = read(ZONING_TYPES_STRINGS);
         }
         out
     }
@@ -633,6 +672,18 @@ pub struct NeighborhoodShell {
     coop_error: Option<String>,
     coop_player_name: String,
     coop_iroh_config: sims_net::IrohConfig,
+    // Neighborhood Family Import picker modal (`ImportFamily` top-bar button).
+    import_search_dirs: Vec<PathBuf>,
+    import_picker: ShopPickerDialog,
+    import_picker_snapshot: Option<ShopSnapshot>,
+    import_picker_entries: BTreeMap<String, ImportableFamily>,
+    import_picker_strings: ShopStrings,
+    import_caf_ctx: Option<CafContext>,
+    import_rng_seed: u32,
+    // Neighborhood Credits/About paginated reference modal (`OpenCredits`).
+    credits_dialog: ReferenceBookDialog,
+    credits_snapshot: Option<ReferenceBookSnapshot>,
+    book_strings: BookStrings,
     note: Option<String>,
 
     // Pending sound inputs to be drained by the host.
@@ -868,9 +919,11 @@ impl NeighborhoodShell {
             mode: NeighborhoodMode::Normal,
             expansions: sims_ui::neighborhood::ExpansionFlags::ALL,
             has_importable_family: false,
-            show_credits_button: false,
+            show_credits_button: destination_for_kind(kind).is_none(),
             hovered_lot: None,
         };
+        let import_picker_strings = ShopStrings::load(&install, US_ENGLISH).unwrap_or_default();
+        let book_strings = BookStrings::load(&install, US_ENGLISH).unwrap_or_default();
         let travel_state = TravelState::default();
 
         let vols = [
@@ -984,12 +1037,23 @@ impl NeighborhoodShell {
             coop_error: None,
             coop_player_name: default_player_name("Player"),
             coop_iroh_config: sims_net::IrohConfig::P2pDefault,
+            import_search_dirs: Vec::new(),
+            import_picker: ShopPickerDialog::new(),
+            import_picker_snapshot: None,
+            import_picker_entries: BTreeMap::new(),
+            import_picker_strings,
+            import_caf_ctx: None,
+            import_rng_seed: 1,
+            credits_dialog: ReferenceBookDialog::new(),
+            credits_snapshot: None,
+            book_strings,
             note: startup_note,
             audio_queue,
             prev_nb_steady_key: None,
             prev_nb_dynamic_rects: Vec::new(),
             present_damage: None,
         };
+        shell.refresh_importable_families();
         let active_trips = shell.inspect_any_active_trips();
         if !active_trips.is_empty() && shell.note.is_none() {
             let (home_house, trip) = &active_trips[0];
@@ -1399,7 +1463,7 @@ impl NeighborhoodShell {
     pub fn should_highlight_hovered_lot(&self) -> bool {
         let in_action_mode = matches!(
             self.nbhd_state.mode,
-            NeighborhoodMode::MoveIn { .. } | NeighborhoodMode::Bulldoze
+            NeighborhoodMode::MoveIn { .. } | NeighborhoodMode::Bulldoze | NeighborhoodMode::Rezone
         ) || self.travel_state.mode == TravelBarMode::Bulldoze;
         let has_active_filter = destination_for_kind(self.kind).is_some()
             && (self.travel_state.active_filter.is_some()
@@ -1413,6 +1477,8 @@ impl NeighborhoodShell {
             || self.album_dialog.is_open()
             || self.travel_dialog_state.is_some()
             || self.coop_lobby.is_open()
+            || self.import_picker.is_open()
+            || self.credits_dialog.is_open()
         {
             return true;
         }
@@ -1421,6 +1487,43 @@ impl NeighborhoodShell {
             ActiveScreen::CreateFamily(caf) => caf.controller().confirm().is_some(),
             _ => self.dialog.is_some(),
         }
+    }
+
+    /// Whether the Neighborhood Family Import picker modal is currently open.
+    pub fn import_picker_open(&self) -> bool {
+        self.import_picker.is_open()
+    }
+
+    /// Active snapshot for the Family Import picker modal, if open.
+    pub fn import_picker_snapshot(&self) -> Option<&ShopSnapshot> {
+        self.import_picker_snapshot.as_ref()
+    }
+
+    /// Whether any importable `.FAM` household was found for the top-bar Import button.
+    pub fn has_importable_family(&self) -> bool {
+        self.nbhd_state.has_importable_family
+    }
+
+    /// Whether the Neighborhood Credits/About reference modal is currently open.
+    pub fn credits_open(&self) -> bool {
+        self.credits_dialog.is_open()
+    }
+
+    /// Active [`ReferenceBookDialog`] for the Credits/About modal.
+    pub fn credits_dialog(&self) -> &ReferenceBookDialog {
+        &self.credits_dialog
+    }
+
+    /// Active [`ReferenceBookSnapshot`] for the Credits/About modal, if open.
+    pub fn credits_snapshot(&self) -> Option<&ReferenceBookSnapshot> {
+        self.credits_snapshot.as_ref()
+    }
+
+    /// Whether any paginated reference book modal (Neighborhood Credits or
+    /// in-lot Spellbook / Cookbook) is currently open.
+    pub fn book_open(&self) -> bool {
+        self.credits_dialog.is_open()
+            || matches!(&self.screen, ActiveScreen::Lot(s) if s.game.book_open())
     }
 
     pub fn dialog_layout(&self) -> Option<&dialog::Layout> {
@@ -1473,6 +1576,8 @@ impl NeighborhoodShell {
             || self.album_dialog.is_open()
             || self.travel_dialog_state.is_some()
             || self.coop_lobby.is_open()
+            || self.import_picker.is_open()
+            || self.credits_dialog.is_open()
         {
             return true;
         }
@@ -1560,20 +1665,18 @@ impl NeighborhoodShell {
     /// polls background save completions. Returns `true` when the active screen
     /// should be redrawn.
     pub fn tick_shell(&mut self, delta_us: u64) -> bool {
-        let prev_clock = self.clock_us;
         self.clock_us = self.clock_us.saturating_add(delta_us);
         let mut redraw = self.poll_background_saves();
-        if self.album_dialog.is_open() {
-            self.album_dialog.advance_time(delta_us);
-            let blink = sims_ui::hud::PAUSE_BLINK_US;
-            if (prev_clock / blink) != (self.clock_us / blink) {
-                redraw = true;
-            }
+        if self.album_dialog.is_open() && self.album_dialog.sync_blink(delta_us) {
+            redraw = true;
         }
         if self.coop_lobby.is_open() && self.coop_lobby.sync_blink(self.clock_us) {
             redraw = true;
         }
-        if self.dialog.is_some() {
+        if let Some(dlg) = &mut self.dialog {
+            if dlg.message.entry.is_some() && dlg.state.sync_blink(self.clock_us) {
+                redraw = true;
+            }
             let now_ms = self.now_ms() as u32;
             let anim = self.clock_us > 0 && self.dialog_fade.is_animating(now_ms);
             if anim || self.dialog_fade_was_animating {
@@ -1610,7 +1713,9 @@ impl NeighborhoodShell {
                     || self.save_manager.is_open()
                     || self.album_dialog.is_open()
                     || self.travel_dialog_state.is_some()
-                    || self.coop_lobby.is_open();
+                    || self.coop_lobby.is_open()
+                    || self.import_picker.is_open()
+                    || self.credits_dialog.is_open();
                 if !modal_open
                     && let (Some(lot_id), Some(since_us)) =
                         (self.hovered_lot_id, self.hovered_lot_since_us)
@@ -1667,7 +1772,6 @@ impl NeighborhoodShell {
         can_draw: bool,
         frame_dirty: bool,
     ) -> Option<u64> {
-        const CARET_POLL_US: u64 = 100_000;
         let mut best: Option<u64> = None;
         let mut consider = |us: u64| {
             best = Some(best.map_or(us, |prev| prev.min(us)));
@@ -1676,12 +1780,11 @@ impl NeighborhoodShell {
             consider(25_000);
         }
         if can_draw {
-            if self.album_dialog.is_open() {
-                let blink = sims_ui::hud::PAUSE_BLINK_US;
-                consider((blink - (self.clock_us % blink)).max(1_000));
+            if let Some(us) = self.album_dialog.next_blink_us() {
+                consider(us);
             }
-            if self.coop_lobby.is_open() {
-                consider(CARET_POLL_US);
+            if let Some(us) = self.coop_lobby.next_blink_us(self.clock_us) {
+                consider(us);
             }
             if let Some(dialog) = &self.dialog {
                 let now_ms = self.now_ms() as u32;
@@ -1690,8 +1793,10 @@ impl NeighborhoodShell {
                 {
                     consider(anim_interval_us.max(1_000));
                 }
-                if dialog.message.entry.is_some() {
-                    consider(CARET_POLL_US);
+                if dialog.message.entry.is_some()
+                    && let Some(us) = dialog.state.next_blink_us(self.clock_us)
+                {
+                    consider(us);
                 }
             }
         }
@@ -1699,7 +1804,9 @@ impl NeighborhoodShell {
             || self.save_manager.is_open()
             || self.album_dialog.is_open()
             || self.travel_dialog_state.is_some()
-            || self.coop_lobby.is_open();
+            || self.coop_lobby.is_open()
+            || self.import_picker.is_open()
+            || self.credits_dialog.is_open();
         match &self.screen {
             ActiveScreen::Loading(_) => {
                 if can_draw {
@@ -1973,6 +2080,26 @@ impl NeighborhoodShell {
                         self.save_manager
                             .draw(&mut frame, snapshot, &self.save_manager_art);
                     }
+                    if self.import_picker.is_open()
+                        && let Some(snapshot) = &self.import_picker_snapshot
+                    {
+                        self.import_picker.draw(
+                            &mut frame,
+                            snapshot,
+                            &self.import_picker_strings,
+                            &self.save_manager_art,
+                        );
+                    }
+                    if self.credits_dialog.is_open()
+                        && let Some(snapshot) = &self.credits_snapshot
+                    {
+                        self.credits_dialog.draw(
+                            &mut frame,
+                            snapshot,
+                            &self.book_strings,
+                            &self.save_manager_art,
+                        );
+                    }
                     self.canvas.color = frame.into_packed();
                 } else {
                     self.canvas.color = vec![0u32; w * h];
@@ -1985,6 +2112,8 @@ impl NeighborhoodShell {
                     && self.travel_dialog_state.is_none()
                     && !self.save_manager.is_open()
                     && !self.coop_lobby.is_open()
+                    && !self.import_picker.is_open()
+                    && !self.credits_dialog.is_open()
                     && opts.active_filter.is_none()
                     && !opts.show_occupancy_markers;
                 let cur_key = steady_eligible.then(|| NeighborhoodSteadyKey {
@@ -2131,6 +2260,20 @@ impl NeighborhoodShell {
             }
             return true;
         }
+        if self.import_picker.is_open() {
+            if let Some(snapshot) = &self.import_picker_snapshot {
+                self.import_picker
+                    .pointer_move(frame_size, snapshot, point[0], point[1]);
+            }
+            return true;
+        }
+        if self.credits_dialog.is_open() {
+            if let Some(snapshot) = &self.credits_snapshot {
+                self.credits_dialog
+                    .pointer_move(frame_size, snapshot, point[0], point[1]);
+            }
+            return true;
+        }
         if self.coop_lobby.is_open() {
             let snap = self.shell_coop_snapshot();
             self.coop_lobby
@@ -2229,6 +2372,8 @@ impl NeighborhoodShell {
             || self.album_dialog.is_open()
             || self.travel_dialog_state.is_some()
             || self.coop_lobby.is_open()
+            || self.import_picker.is_open()
+            || self.credits_dialog.is_open()
         {
             return true;
         }
@@ -2275,6 +2420,33 @@ impl NeighborhoodShell {
             let frame_size = self.frame_size_u32();
             if let Some(snapshot) = &self.save_manager_snapshot {
                 return self.save_manager.scroll(delta, frame_size, snapshot);
+            }
+            return false;
+        }
+        if self.import_picker.is_open() {
+            let delta = if delta_y > 0.0 {
+                -1
+            } else if delta_y < 0.0 {
+                1
+            } else {
+                return false;
+            };
+            let frame_size = self.frame_size_u32();
+            if let Some(snapshot) = &self.import_picker_snapshot {
+                return self.import_picker.scroll(delta, frame_size, snapshot);
+            }
+            return false;
+        }
+        if self.credits_dialog.is_open() {
+            let delta = if delta_y > 0.0 {
+                -1
+            } else if delta_y < 0.0 {
+                1
+            } else {
+                return false;
+            };
+            if let Some(snapshot) = &self.credits_snapshot {
+                return self.credits_dialog.scroll(delta, snapshot).is_some();
             }
             return false;
         }
@@ -2363,6 +2535,30 @@ impl NeighborhoodShell {
                 redraw: changed,
                 ..ShellOutcome::default()
             };
+        }
+        if self.import_picker.is_open() {
+            if let Some(snapshot) = &self.import_picker_snapshot {
+                let changed = self
+                    .import_picker
+                    .pointer_down(frame_size, snapshot, point[0], point[1]);
+                return ShellOutcome {
+                    redraw: changed,
+                    ..ShellOutcome::default()
+                };
+            }
+            return ShellOutcome::default();
+        }
+        if self.credits_dialog.is_open() {
+            if let Some(snapshot) = &self.credits_snapshot {
+                let changed = self
+                    .credits_dialog
+                    .pointer_down(frame_size, snapshot, point[0], point[1]);
+                return ShellOutcome {
+                    redraw: changed,
+                    ..ShellOutcome::default()
+                };
+            }
+            return ShellOutcome::default();
         }
         if let Some(td_state) = &self.travel_dialog_state {
             let layout = TravelDialogLayout::compute(frame_size[0], frame_size[1]);
@@ -2505,6 +2701,8 @@ impl NeighborhoodShell {
     pub fn double_click(&mut self, point: [i32; 2]) -> ShellOutcome {
         self.pointer = Some(point);
         if self.save_manager.is_open()
+            || self.import_picker.is_open()
+            || self.credits_dialog.is_open()
             || self.dialog.is_some()
             || !matches!(self.screen, ActiveScreen::FamilyBin)
         {
@@ -2551,6 +2749,29 @@ impl NeighborhoodShell {
             return match cmd {
                 Some(cmd) => self.handle_shell_coop_command(cmd),
                 None => ShellOutcome::redraw(),
+            };
+        }
+        if self.import_picker.is_open() {
+            let cmd = self.import_picker_snapshot.as_ref().and_then(|snap| {
+                self.import_picker
+                    .pointer_up(frame_size, snap, point[0], point[1])
+            });
+            return match cmd {
+                Some(cmd) => self.handle_import_picker_command(cmd),
+                None => ShellOutcome::redraw(),
+            };
+        }
+        if self.credits_dialog.is_open() {
+            let cmd = self.credits_snapshot.as_ref().and_then(|snap| {
+                self.credits_dialog
+                    .pointer_up(frame_size, snap, point[0], point[1])
+            });
+            return match cmd {
+                Some(BookCommand::Close) => {
+                    self.close_credits_modal();
+                    ShellOutcome::redraw()
+                }
+                Some(BookCommand::PageChanged(_)) | None => ShellOutcome::redraw(),
             };
         }
         if let Some(td_state) = self.travel_dialog_state.clone() {
@@ -2698,6 +2919,8 @@ impl NeighborhoodShell {
         if self.save_manager.is_open()
             || self.album_dialog.is_open()
             || self.travel_dialog_state.is_some()
+            || self.import_picker.is_open()
+            || self.credits_dialog.is_open()
         {
             return ShellOutcome::redraw();
         }
@@ -2765,6 +2988,16 @@ impl NeighborhoodShell {
             }
             return ShellOutcome::redraw();
         }
+        if self.import_picker.is_open() {
+            if let Some(cmd) = self.import_picker.escape() {
+                return self.handle_import_picker_command(cmd);
+            }
+            return ShellOutcome::redraw();
+        }
+        if self.credits_dialog.is_open() {
+            self.close_credits_modal();
+            return ShellOutcome::redraw();
+        }
         if self.coop_lobby.is_open() {
             let snap = self.shell_coop_snapshot();
             if let Some(cmd) = self.coop_lobby.escape(&snap) {
@@ -2822,6 +3055,10 @@ impl NeighborhoodShell {
             }
             ActiveScreen::Lot(session) if session.game.shop_open() => {
                 let out = session.game.shop_escape();
+                self.handle_lot_outcome(out)
+            }
+            ActiveScreen::Lot(session) if session.game.book_open() => {
+                let out = session.game.book_close();
                 self.handle_lot_outcome(out)
             }
             ActiveScreen::Lot(session) if session.game.camera_strip_open() => {
@@ -2895,6 +3132,14 @@ impl NeighborhoodShell {
     }
 
     pub fn key_left(&mut self) -> ShellOutcome {
+        if self.credits_dialog.is_open()
+            && let Some(snapshot) = &self.credits_snapshot
+        {
+            return ShellOutcome {
+                redraw: self.credits_dialog.prev_page(snapshot).is_some(),
+                ..ShellOutcome::default()
+            };
+        }
         if self.travel_dialog_state.is_some() {
             return ShellOutcome {
                 redraw: self.cycle_travel_destination(-1),
@@ -2904,6 +3149,18 @@ impl NeighborhoodShell {
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::Left);
         }
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            if session.game.book_open() {
+                return ShellOutcome {
+                    redraw: session.game.book_prev_page(),
+                    ..ShellOutcome::default()
+                };
+            }
+            if session.game.shop_open() {
+                let out = session.game.shop_rotate_preview(-45);
+                return self.handle_lot_outcome(out);
+            }
+        }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.key_left();
             return self.handle_caf_outcome(outcome);
@@ -2912,6 +3169,14 @@ impl NeighborhoodShell {
     }
 
     pub fn key_right(&mut self) -> ShellOutcome {
+        if self.credits_dialog.is_open()
+            && let Some(snapshot) = &self.credits_snapshot
+        {
+            return ShellOutcome {
+                redraw: self.credits_dialog.next_page(snapshot).is_some(),
+                ..ShellOutcome::default()
+            };
+        }
         if self.travel_dialog_state.is_some() {
             return ShellOutcome {
                 redraw: self.cycle_travel_destination(1),
@@ -2920,6 +3185,18 @@ impl NeighborhoodShell {
         }
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::Right);
+        }
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            if session.game.book_open() {
+                return ShellOutcome {
+                    redraw: session.game.book_next_page(),
+                    ..ShellOutcome::default()
+                };
+            }
+            if session.game.shop_open() {
+                let out = session.game.shop_rotate_preview(45);
+                return self.handle_lot_outcome(out);
+            }
         }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.key_right();
@@ -2934,6 +3211,14 @@ impl NeighborhoodShell {
         {
             return ShellOutcome {
                 redraw: self.save_manager.select_prev(snapshot),
+                ..ShellOutcome::default()
+            };
+        }
+        if self.import_picker.is_open()
+            && let Some(snapshot) = &self.import_picker_snapshot
+        {
+            return ShellOutcome {
+                redraw: self.import_picker.select_prev(snapshot),
                 ..ShellOutcome::default()
             };
         }
@@ -2957,6 +3242,14 @@ impl NeighborhoodShell {
         {
             return ShellOutcome {
                 redraw: self.save_manager.select_next(snapshot),
+                ..ShellOutcome::default()
+            };
+        }
+        if self.import_picker.is_open()
+            && let Some(snapshot) = &self.import_picker_snapshot
+        {
+            return ShellOutcome {
+                redraw: self.import_picker.select_next(snapshot),
                 ..ShellOutcome::default()
             };
         }
@@ -3030,15 +3323,47 @@ impl NeighborhoodShell {
     }
 
     pub fn key_page_up(&mut self) -> ShellOutcome {
+        if self.credits_dialog.is_open()
+            && let Some(snapshot) = &self.credits_snapshot
+        {
+            return ShellOutcome {
+                redraw: self.credits_dialog.prev_page(snapshot).is_some(),
+                ..ShellOutcome::default()
+            };
+        }
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::PageUp);
+        }
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.book_open()
+        {
+            return ShellOutcome {
+                redraw: session.game.book_prev_page(),
+                ..ShellOutcome::default()
+            };
         }
         ShellOutcome::default()
     }
 
     pub fn key_page_down(&mut self) -> ShellOutcome {
+        if self.credits_dialog.is_open()
+            && let Some(snapshot) = &self.credits_snapshot
+        {
+            return ShellOutcome {
+                redraw: self.credits_dialog.next_page(snapshot).is_some(),
+                ..ShellOutcome::default()
+            };
+        }
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::PageDown);
+        }
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.book_open()
+        {
+            return ShellOutcome {
+                redraw: session.game.book_next_page(),
+                ..ShellOutcome::default()
+            };
         }
         ShellOutcome::default()
     }
@@ -3060,6 +3385,20 @@ impl NeighborhoodShell {
                 Some(cmd) => self.handle_save_manager_command(cmd),
                 None => ShellOutcome::default(),
             };
+        }
+        if self.import_picker.is_open() {
+            let cmd = self
+                .import_picker_snapshot
+                .as_ref()
+                .and_then(|snap| self.import_picker.submit(snap));
+            return match cmd {
+                Some(cmd) => self.handle_import_picker_command(cmd),
+                None => ShellOutcome::default(),
+            };
+        }
+        if self.credits_dialog.is_open() {
+            self.close_credits_modal();
+            return ShellOutcome::redraw();
         }
         if self.coop_lobby.is_open() {
             let snap = self.shell_coop_snapshot();
@@ -3083,11 +3422,15 @@ impl NeighborhoodShell {
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::Enter);
         }
-        if let ActiveScreen::Lot(session) = &mut self.screen
-            && session.game.shop_open()
-        {
-            let out = session.game.shop_submit();
-            return self.handle_lot_outcome(out);
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            if session.game.shop_open() {
+                let out = session.game.shop_submit();
+                return self.handle_lot_outcome(out);
+            }
+            if session.game.book_open() {
+                let out = session.game.book_close();
+                return self.handle_lot_outcome(out);
+            }
         }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.key_enter();
@@ -3166,12 +3509,10 @@ impl NeighborhoodShell {
         if let Some(err) = save_err
             && let ActiveScreen::Lot(session) = &mut self.screen
         {
-            session.game.after_save_failed();
-            if !session.game.has_ui_dialog() {
-                session
-                    .game
-                    .show_notice("Save Failed", format!("The lot was not saved: {err}"));
-            }
+            session.game.after_save_failed_with_notice(
+                "Save Failed",
+                format!("The lot was not saved: {err}"),
+            );
             out.redraw = true;
         }
         if outcome.quit && saved_ok {
@@ -4045,6 +4386,10 @@ impl NeighborhoodShell {
         self.save_manager.close();
         self.save_manager_snapshot = None;
         self.save_manager_target_lot = None;
+        self.close_import_family_picker();
+        self.close_credits_modal();
+        self.nbhd_state.show_credits_button = destination_for_kind(kind).is_none();
+        self.refresh_importable_families();
         self.note = None;
         self.screen = ActiveScreen::Neighborhood;
         self.sync_travel_state();
@@ -4076,7 +4421,10 @@ impl NeighborhoodShell {
         self.map = map;
         self.lot_meta = lot_meta;
         self.nbhd_state.mode = NeighborhoodMode::Normal;
+        self.nbhd_state.show_credits_button = destination_for_kind(kind).is_none();
         self.nbhd_state.hovered_lot = None;
+        self.close_import_family_picker();
+        self.close_credits_modal();
         self.hovered_lot_id = None;
         self.hovered_lot_since_us = None;
         self.hover_card_shown_for = None;
@@ -4581,6 +4929,7 @@ impl NeighborhoodShell {
             build_family_bin_entries(&self.stored, &self.family_names, &self.faces);
         self.family_bin
             .sync(&self.family_bin_entries, sims_ui::family_bin::VISIBLE_ROWS);
+        self.refresh_importable_families();
         self.sync_travel_state();
         self.refresh_hovered_lot();
         Ok(())
@@ -4719,19 +5068,40 @@ impl NeighborhoodShell {
                 ShellOutcome::redraw()
             }
             NeighborhoodCommand::ToggleRezone => {
-                self.note = Some("Rezone mode is not ported yet.".into());
+                self.nbhd_state.mode = if matches!(self.nbhd_state.mode, NeighborhoodMode::Rezone) {
+                    NeighborhoodMode::Normal
+                } else {
+                    self.move_in_family_id = None;
+                    NeighborhoodMode::Rezone
+                };
+                self.refresh_hovered_lot();
                 ShellOutcome::redraw()
             }
             NeighborhoodCommand::ImportFamily => {
-                self.note = Some("Family import is not ported yet.".into());
+                self.open_import_family_picker();
                 ShellOutcome::redraw()
             }
             NeighborhoodCommand::OpenWeb => {
-                self.note = Some("Web browser links are not available in this build.".into());
+                let title = self
+                    .chrome_strings
+                    .bar
+                    .get(sims_ui::neighborhood::BarButton::Web.tooltip_index())
+                    .filter(|s| !s.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "Web".into());
+                self.open_dialog(
+                    ShellDialogKind::Notice,
+                    Message::notice(
+                        title,
+                        "This offline engine does not launch external web browsers.",
+                        self.dialogs.ok(),
+                    )
+                    .with_frame(FrameStyle::Generic),
+                );
                 ShellOutcome::redraw()
             }
             NeighborhoodCommand::OpenCredits => {
-                self.note = Some("Credits screen is not ported yet.".into());
+                self.open_credits_modal();
                 ShellOutcome::redraw()
             }
         }
@@ -4792,7 +5162,8 @@ impl NeighborhoodShell {
 
     fn activate_lot(&mut self, lot_id: u16) -> ShellOutcome {
         match self.nbhd_state.mode.clone() {
-            NeighborhoodMode::Normal | NeighborhoodMode::Visit | NeighborhoodMode::Rezone => {
+            NeighborhoodMode::Rezone => self.prompt_rezone_lot(lot_id),
+            NeighborhoodMode::Normal | NeighborhoodMode::Visit => {
                 let house = u32::from(lot_id);
                 if let Ok(Some(trip)) =
                     vm_travel::inspect_active_trip(&self.store, &self.neighborhood_id, house)
@@ -4830,11 +5201,7 @@ impl NeighborhoodShell {
                     if self
                         .store
                         .autosaves()
-                        .list_saves_validated(
-                            &self.neighborhood_id,
-                            house,
-                            validate_save_payload_cached,
-                        )
+                        .list_saves_metadata(&self.neighborhood_id, house)
                         .is_ok_and(|slots| !slots.is_empty())
                     {
                         self.save_manager_target_lot = Some(house);
@@ -5049,9 +5416,504 @@ impl NeighborhoodShell {
                 }
                 ShellOutcome::redraw()
             }
+            ShellDialogKind::ConfirmRezone {
+                lot_id,
+                target_zone,
+            } => {
+                match self.execute_rezone(lot_id, target_zone) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.open_dialog(
+                            ShellDialogKind::Notice,
+                            Message::notice(
+                                DialogStrings::get(&self.dialogs.rezone, 0, "Rezone"),
+                                format!("Could not rezone lot {lot_id}: {e}"),
+                                self.dialogs.ok(),
+                            )
+                            .with_frame(FrameStyle::Generic),
+                        );
+                    }
+                }
+                ShellOutcome::redraw()
+            }
             ShellDialogKind::ConfirmResumeOrAbortTrip { .. } => unreachable!(),
             ShellDialogKind::Notice => ShellOutcome::redraw(),
         }
+    }
+
+    // =========================================================================
+    // Neighborhood Top-Bar Secondary Actions: Rezone, Import Family, Credits
+    // =========================================================================
+
+    fn is_lot_rezonable(&self, lot_id: u16) -> bool {
+        destination_for_kind(self.kind).is_none()
+            && ((1..=10).contains(&lot_id) || (50..=80).contains(&lot_id))
+    }
+
+    fn zoning_label(&self, zone: i32) -> &str {
+        if zone == 2 {
+            DialogStrings::get(&self.dialogs.zoning_types, 1, "Community")
+        } else {
+            DialogStrings::get(&self.dialogs.zoning_types, 0, "Residential")
+        }
+    }
+
+    fn prompt_rezone_lot(&mut self, lot_id: u16) -> ShellOutcome {
+        let title = DialogStrings::get(&self.dialogs.rezone, 0, "Rezone").to_owned();
+        if !self.is_lot_rezonable(lot_id) {
+            self.open_dialog(
+                ShellDialogKind::Notice,
+                Message::notice(
+                    title,
+                    format!("Lot {lot_id} cannot be rezoned."),
+                    self.dialogs.ok(),
+                )
+                .with_frame(FrameStyle::Generic),
+            );
+            return ShellOutcome::redraw();
+        }
+        let current_zone = self
+            .stored
+            .zoning
+            .get(&(lot_id as i16))
+            .copied()
+            .unwrap_or(1);
+        let target_zone = if current_zone == 2 { 1 } else { 2 };
+        let current_label = self.zoning_label(current_zone).to_owned();
+        let target_label = self.zoning_label(target_zone).to_owned();
+        let base_tmpl = DialogStrings::get(&self.dialogs.rezone, 1, "Rezone %s to %s?");
+        let mut body = format_template(base_tmpl, &[&current_label, &target_label]);
+        if let Some((fam_id, _)) = self.stored.family_in(u32::from(lot_id)) {
+            let fam_name = self
+                .family_names
+                .get(&fam_id)
+                .cloned()
+                .unwrap_or_else(|| format!("Family {fam_id}"));
+            body.push_str(&format!(
+                "\n\n{fam_name} will be moved back to the Family Bin before rezoning."
+            ));
+        }
+        self.open_dialog(
+            ShellDialogKind::ConfirmRezone {
+                lot_id,
+                target_zone,
+            },
+            Message::confirm(title, body, vec![self.dialogs.yes(), self.dialogs.no()])
+                .with_frame(FrameStyle::Generic),
+        );
+        ShellOutcome::redraw()
+    }
+
+    /// Toggles `lot_id` zoning in REDB (`1` = Residential, `2` = Community),
+    /// evicting any occupying household cleanly to the Family Bin first, and
+    /// refreshes map metadata and hover overlays immediately.
+    pub fn execute_rezone(&mut self, lot_id: u16, target_zone: i32) -> Result<i32, String> {
+        if !self.is_lot_rezonable(lot_id) {
+            return Err(format!("lot {lot_id} is not eligible for rezoning"));
+        }
+        if target_zone != 1 && target_zone != 2 {
+            return Err(format!("unsupported zoning code {target_zone}"));
+        }
+        let house = u32::from(lot_id);
+        if self.stored.family_in(house).is_some() {
+            self.execute_evict(house)?;
+        }
+        let mut updated = self
+            .store
+            .load_neighborhood(&self.neighborhood_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
+        let expected_instance_id = updated.instance_id;
+        let expected_revision = updated.revision;
+        updated.zoning.insert(lot_id as i16, target_zone);
+        updated.revision = updated.revision.saturating_add(1);
+        self.store
+            .save_neighborhood_checked(
+                &self.neighborhood_id,
+                expected_instance_id,
+                expected_revision,
+                &updated,
+            )
+            .map_err(|e| e.to_string())?
+            .map_err(|conflict| format!("neighborhood modified concurrently ({conflict:?})"))?;
+        self.refresh_from_store()?;
+        self.note = Some(format!(
+            "Rezoned lot {lot_id} to {}.",
+            self.zoning_label(target_zone)
+        ));
+        Ok(target_zone)
+    }
+
+    /// Adds an extra directory scanned for `.FAM` files by `ImportFamily`
+    /// (prepended ahead of the install's `UserData*/Import` and `Export` folders).
+    pub fn add_import_search_dir(&mut self, dir: PathBuf) {
+        if !self.import_search_dirs.contains(&dir) {
+            self.import_search_dirs.insert(0, dir);
+        }
+        self.refresh_importable_families();
+    }
+
+    fn scan_importable_families(&self) -> Vec<ImportableFamily> {
+        let mut dirs: Vec<(PathBuf, String)> = Vec::new();
+        for extra in &self.import_search_dirs {
+            let label = extra
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Import")
+                .to_owned();
+            dirs.push((extra.clone(), label));
+        }
+        if let Ok(user_dir) = resolve_user_dir(&self.install, self.slot) {
+            if let Some(imp) = resolve_dir_case_insensitive(&user_dir, "Import") {
+                dirs.push((imp, format!("{}/Import", self.neighborhood_id)));
+            }
+            if let Some(exp) = resolve_dir_case_insensitive(&user_dir, "Export") {
+                dirs.push((exp, format!("{}/Export", self.neighborhood_id)));
+            }
+        }
+        if let Ok(ud1) = self.install.file("UserData") {
+            if let Some(imp) = resolve_dir_case_insensitive(&ud1, "Import")
+                && !dirs.iter().any(|(d, _)| d == &imp)
+            {
+                dirs.push((imp, "UserData/Import".into()));
+            }
+            if let Some(exp) = resolve_dir_case_insensitive(&ud1, "Export")
+                && !dirs.iter().any(|(d, _)| d == &exp)
+            {
+                dirs.push((exp, "UserData/Export".into()));
+            }
+        }
+
+        let mut seen_paths = BTreeSet::new();
+        let mut out = Vec::new();
+        for (dir, source_label) in dirs {
+            let Ok(read_dir) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut entries: Vec<PathBuf> = read_dir
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("fam"))
+                })
+                .collect();
+            entries.sort();
+            for path in entries {
+                let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if !seen_paths.insert(canon) {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(parsed) = FamilyFile::parse(&bytes) else {
+                    continue;
+                };
+                // Skip system NPC/stray households (`Strays_4000.FAM`).
+                if parsed.export_info.family_id >= 4000 {
+                    continue;
+                }
+                let member_count = parsed
+                    .export_info
+                    .member_ids
+                    .into_iter()
+                    .take_while(|&id| id != 0)
+                    .count();
+                if member_count == 0 {
+                    continue;
+                }
+                let family_name = parsed
+                    .iff
+                    .get(b"CTSS", 1000)
+                    .and_then(|c| StringTable::parse(parsed.iff.data(c)).ok())
+                    .and_then(|t| {
+                        t.get(0, US_ENGLISH)
+                            .or_else(|| t.get(0, 1))
+                            .map(str::to_owned)
+                    })
+                    .or_else(|| {
+                        parsed
+                            .name
+                            .get(0, US_ENGLISH)
+                            .or_else(|| parsed.name.get(0, 1))
+                            .map(str::to_owned)
+                    })
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Family")
+                            .to_owned()
+                    });
+                out.push(ImportableFamily {
+                    path,
+                    family_name,
+                    member_count,
+                    budget: parsed.family.budget,
+                    source_label: source_label.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    fn refresh_importable_families(&mut self) {
+        self.nbhd_state.has_importable_family = !self.scan_importable_families().is_empty();
+    }
+
+    /// Scans installed `Import/` and `Export/` `.FAM` archives and opens the
+    /// native Family Import picker modal.
+    pub fn open_import_family_picker(&mut self) -> bool {
+        let candidates = self.scan_importable_families();
+        self.nbhd_state.has_importable_family = !candidates.is_empty();
+        let title = DialogStrings::get(&self.dialogs.import_strs, 8, "Import Family").to_owned();
+        if candidates.is_empty() {
+            self.open_dialog(
+                ShellDialogKind::Notice,
+                Message::notice(
+                    title,
+                    "No importable .FAM family files were found in UserData/Import.",
+                    self.dialogs.ok(),
+                )
+                .with_frame(FrameStyle::Generic),
+            );
+            return false;
+        }
+        let mut items = Vec::with_capacity(candidates.len());
+        let mut entries = BTreeMap::new();
+        for (idx, fam) in candidates.into_iter().enumerate() {
+            let id = format!("import_fam:{idx}");
+            let file_name = fam
+                .path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("family.FAM");
+            let members_word = if fam.member_count == 1 { "Sim" } else { "Sims" };
+            let description = format!(
+                "{} {} | {} | {}/{}",
+                fam.member_count,
+                members_word,
+                format_simoleons(fam.budget),
+                fam.source_label,
+                file_name,
+            );
+            items.push(ShopItem {
+                id: id.clone(),
+                name: fam.family_name.clone(),
+                description,
+                price: 0,
+                currency: CurrencyKind::Simoleons,
+                icon: None,
+                supports_try_on: false,
+                owned: false,
+                available: true,
+            });
+            entries.insert(id, fam);
+        }
+        self.clear_hover_state();
+        self.import_picker_entries = entries;
+        self.import_picker_snapshot = Some(ShopSnapshot {
+            kind: ShopKind::DowntownBoutique(WardrobeCategory::Everyday),
+            title_override: Some(title),
+            buy_label_override: Some("Import".into()),
+            shopper_name: None,
+            wallet: Wallet::default(),
+            items,
+            tried_on_item_id: None,
+            preview_image: None,
+            preview_label: None,
+        });
+        self.import_picker.open();
+        true
+    }
+
+    pub fn close_import_family_picker(&mut self) {
+        self.import_picker.close();
+        self.import_picker_snapshot = None;
+        self.import_picker_entries.clear();
+    }
+
+    fn handle_import_picker_command(&mut self, cmd: ShopCommand) -> ShellOutcome {
+        match cmd {
+            ShopCommand::Cancel => {
+                self.close_import_family_picker();
+                ShellOutcome::redraw()
+            }
+            ShopCommand::TryOn { .. } | ShopCommand::RotatePreview(_) => ShellOutcome::redraw(),
+            ShopCommand::Buy { item_id, .. } => {
+                let Some(entry) = self.import_picker_entries.get(&item_id).cloned() else {
+                    return ShellOutcome::redraw();
+                };
+                self.close_import_family_picker();
+                let title =
+                    DialogStrings::get(&self.dialogs.import_strs, 8, "Import Family").to_owned();
+                match self.execute_import_family(&entry) {
+                    Ok(created) => {
+                        let body = format!(
+                            "{} imported into the Family Bin ({} members).",
+                            created.family_name,
+                            created.members.len()
+                        );
+                        self.note = Some(body.clone());
+                        self.open_dialog(
+                            ShellDialogKind::Notice,
+                            Message::notice(title, body, self.dialogs.ok())
+                                .with_frame(FrameStyle::Generic),
+                        );
+                    }
+                    Err(e) => {
+                        let body = format!("Could not import {}: {e}", entry.family_name);
+                        self.note = Some(body.clone());
+                        self.open_dialog(
+                            ShellDialogKind::Notice,
+                            Message::notice(title, body, self.dialogs.ok())
+                                .with_frame(FrameStyle::Generic),
+                        );
+                    }
+                }
+                ShellOutcome::redraw()
+            }
+        }
+    }
+
+    fn execute_import_family(
+        &mut self,
+        entry: &ImportableFamily,
+    ) -> Result<sims_vm::caf::CreatedHousehold, String> {
+        let raw_bytes = std::fs::read(&entry.path).map_err(|e| e.to_string())?;
+        let parsed = FamilyFile::parse(&raw_bytes).map_err(|e| e.to_string())?;
+        let fam_bytes = if parsed.family.house == 0 && parsed.family.secondary_house() == 0 {
+            raw_bytes
+        } else {
+            // Normalize a house-exported `.FAM` into a Family Bin archive (`house = 0`,
+            // `secondary_house = 0`) so `import_family_fam` places it cleanly in the Family Bin.
+            let mut bin_family = parsed.family.clone();
+            bin_family.house = 0;
+            if bin_family.version >= 8 && bin_family.tail.len() >= 4 {
+                bin_family.tail[0..4].fill(0);
+            }
+            let fami_id = parsed.export_info.family_id;
+            let fami_bytes = encode_fami(&bin_family);
+            let mut chunks: Vec<ChunkData> = Vec::with_capacity(parsed.iff.chunks.len());
+            for chunk in &parsed.iff.chunks {
+                if &chunk.tag == b"rsmp" {
+                    continue;
+                }
+                let data = if &chunk.tag == b"FAMI" && chunk.id == fami_id {
+                    fami_bytes.clone()
+                } else {
+                    parsed.iff.data(chunk).to_vec()
+                };
+                chunks.push(ChunkData {
+                    tag: chunk.tag,
+                    id: chunk.id,
+                    flags: chunk.flags,
+                    label: chunk.label.clone(),
+                    data,
+                });
+            }
+            write_iff(&chunks).map_err(|e| e.to_string())?
+        };
+
+        if self.import_caf_ctx.is_none() {
+            self.import_caf_ctx =
+                Some(CafContext::from_install(&self.install_root).map_err(|e| e.to_string())?);
+        }
+        let ctx = self.import_caf_ctx.as_ref().expect("import_caf_ctx");
+        let seed = self
+            .import_rng_seed
+            .wrapping_add(self.clock_us as u32)
+            .max(1);
+        self.import_rng_seed = self.import_rng_seed.wrapping_add(1).max(1);
+        let mut rng = CrtRng::from_state(seed);
+        let created = match import_family_fam(
+            ctx,
+            &self.store,
+            &self.neighborhood_id,
+            &fam_bytes,
+            US_ENGLISH,
+            &mut rng,
+        ) {
+            Ok(created) => created,
+            Err(sims_vm::caf::CafError::Content(sims_content::Error::Unsupported(_)))
+                if ctx.wardrobe.is_some() =>
+            {
+                // Some base-game / pre-Hot-Date `.FAM` archives hit unported
+                // legacy outfit replacement generators in `refresh_outfits`;
+                // fall back to preserving the archive's original body strings.
+                let fallback_ctx = CafContext {
+                    template_iff: ctx.template_iff.clone(),
+                    catalog_guids: ctx.catalog_guids.clone(),
+                    wardrobe: None,
+                    starting_funds: ctx.starting_funds,
+                };
+                let mut fallback_rng = CrtRng::from_state(seed);
+                import_family_fam(
+                    &fallback_ctx,
+                    &self.store,
+                    &self.neighborhood_id,
+                    &fam_bytes,
+                    US_ENGLISH,
+                    &mut fallback_rng,
+                )
+                .map_err(|e| e.to_string())?
+            }
+            Err(err) => return Err(err.to_string()),
+        };
+        self.family_names
+            .insert(created.family_id, created.family_name.clone());
+        save_persisted_caf_name(
+            &self.saves_path,
+            &self.neighborhood_id,
+            self.stored.instance_id,
+            created.family_id,
+            Some(&created.family_name),
+        );
+        self.refresh_from_store()?;
+        Ok(created)
+    }
+
+    /// Opens the native paginated Credits/About modal loaded from
+    /// `GameData/Credits.iff` (with fallback to `GameData/UIText.iff` `STR# 163`).
+    pub fn open_credits_modal(&mut self) {
+        let title = self
+            .chrome_strings
+            .bar
+            .get(sims_ui::neighborhood::BarButton::Credits.tooltip_index())
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| "Credits".into());
+        let mut pages =
+            sims_ui::book::load_credits_pages(&self.install, US_ENGLISH).unwrap_or_default();
+        if pages.is_empty() {
+            pages.push(BookPage {
+                heading: None,
+                entries: vec![BookEntry {
+                    title: title.clone(),
+                    subtitle: None,
+                    body: "Credits data is unavailable in this install.".into(),
+                    badges: Vec::new(),
+                    highlight: false,
+                }],
+            });
+        }
+        self.clear_hover_state();
+        self.credits_snapshot = Some(ReferenceBookSnapshot {
+            title,
+            subtitle: None,
+            held_summary: Vec::new(),
+            pages,
+        });
+        self.credits_dialog.open();
+    }
+
+    pub fn close_credits_modal(&mut self) {
+        self.credits_dialog.close();
+        self.credits_snapshot = None;
     }
 
     // =========================================================================

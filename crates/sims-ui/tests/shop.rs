@@ -42,6 +42,7 @@ fn sample_boutique_snapshot() -> ShopSnapshot {
     ShopSnapshot {
         kind: ShopKind::DowntownBoutique(WardrobeCategory::Formal),
         title_override: None,
+        buy_label_override: None,
         shopper_name: Some("Bella".into()),
         wallet: Wallet {
             simoleons: 350,
@@ -83,6 +84,8 @@ fn sample_boutique_snapshot() -> ShopSnapshot {
             },
         ],
         tried_on_item_id: None,
+        preview_image: None,
+        preview_label: None,
     }
 }
 
@@ -193,6 +196,7 @@ fn magic_vendor_magicoins_and_negative_price_guard() {
     let snap = ShopSnapshot {
         kind: ShopKind::MagicVendor,
         title_override: None,
+        buy_label_override: None,
         shopper_name: Some("Mortimer".into()),
         wallet: Wallet {
             simoleons: 1_000,
@@ -234,6 +238,8 @@ fn magic_vendor_magicoins_and_negative_price_guard() {
             },
         ],
         tried_on_item_id: None,
+        preview_image: None,
+        preview_label: None,
     };
 
     let mut dialog = ShopPickerDialog::new();
@@ -326,6 +332,47 @@ fn responsive_layout_and_scrolling_cover_all_shop_kinds() {
 
     assert!(dialog.scroll(2, [800, 600], &snap));
     assert_eq!(dialog.scroll_offset(), 2);
+}
+
+#[test]
+fn try_on_preview_pane_renders_image_rotate_buttons_and_fallback() {
+    let mut snap = sample_boutique_snapshot();
+    snap.tried_on_item_id = Some("formal_01".into());
+    snap.preview_image = Some(sample_icon([220, 180, 140]));
+    snap.preview_label = Some("Evening Gown".into());
+
+    let mut dialog = ShopPickerDialog::new();
+    dialog.open();
+    let size = [800, 600];
+    let layout = dialog.layout(size, &snap);
+    let pane = layout.preview_pane.expect("preview pane laid out");
+    let left = layout.rotate_left_btn.expect("rotate left button");
+    let right = layout.rotate_right_btn.expect("rotate right button");
+    assert!(!intersects(layout.list_area, pane));
+    assert!(!intersects(left, right));
+
+    let (lx, ly) = center(left);
+    dialog.pointer_down(size, &snap, lx, ly);
+    assert_eq!(
+        dialog.pointer_up(size, &snap, lx, ly),
+        Some(ShopCommand::RotatePreview(-45))
+    );
+
+    let (rx, ry) = center(right);
+    dialog.pointer_down(size, &snap, rx, ry);
+    assert_eq!(
+        dialog.pointer_up(size, &snap, rx, ry),
+        Some(ShopCommand::RotatePreview(45))
+    );
+
+    // Fallback when preview_image is unavailable disables rotate commands cleanly.
+    snap.preview_image = None;
+    snap.preview_label = Some("Preview unavailable".into());
+    dialog.pointer_down(size, &snap, rx, ry);
+    assert_eq!(dialog.pointer_up(size, &snap, rx, ry), None);
+    let mut frame = Frame::new(size[0], size[1], [0, 0, 0]);
+    dialog.draw(&mut frame, &snap, &ShopStrings::default(), &Art::default());
+    assert!(frame.rgb().iter().any(|&px| px != [0, 0, 0]));
 }
 
 #[test]

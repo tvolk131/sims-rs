@@ -314,12 +314,18 @@ pub struct ShopSnapshot {
     pub kind: ShopKind,
     /// Optional explicit title overriding [`ShopStrings::title_for`].
     pub title_override: Option<String>,
+    /// Optional explicit Buy/Confirm button label overriding [`ShopStrings::buy_label_for`].
+    pub buy_label_override: Option<String>,
     /// Optional name of the shopping Sim.
     pub shopper_name: Option<String>,
     pub wallet: Wallet,
     pub items: Vec<ShopItem>,
     /// Currently previewed item ID, if the Sim is trying something on.
     pub tried_on_item_id: Option<String>,
+    /// Live 3D Sim turntable preview image rendered for Try-On.
+    pub preview_image: Option<Image>,
+    /// Optional caption or fallback status shown inside the 3D preview pane.
+    pub preview_label: Option<String>,
 }
 
 /// Typed commands emitted by [`ShopPickerDialog`] for `sims-game` / `sims-vm`.
@@ -327,6 +333,8 @@ pub struct ShopSnapshot {
 pub enum ShopCommand {
     /// Preview the selected item (e.g. outfit try-on).
     TryOn { item_id: String },
+    /// Rotate the live 3D Try-On Sim preview by `delta_deg` degrees.
+    RotatePreview(i16),
     /// Purchase or adopt the selected item.
     Buy {
         item_id: String,
@@ -343,6 +351,8 @@ pub enum ShopHit {
     ItemCard(usize),
     ScrollUp,
     ScrollDown,
+    RotateLeft,
+    RotateRight,
     TryOnButton,
     BuyButton,
     CancelButton,
@@ -359,6 +369,10 @@ pub struct ShopLayout {
     pub visible_cards: Vec<(usize, Rect)>,
     pub scroll_up: Option<Rect>,
     pub scroll_down: Option<Rect>,
+    /// Optional right-hand 3D Sim Try-On preview pane.
+    pub preview_pane: Option<Rect>,
+    pub rotate_left_btn: Option<Rect>,
+    pub rotate_right_btn: Option<Rect>,
     pub detail_bar: Rect,
     pub try_on_btn: Rect,
     pub buy_btn: Rect,
@@ -373,6 +387,12 @@ impl ShopLayout {
         }
         if self.scroll_down.is_some_and(|r| r.contains(x, y)) {
             return Some(ShopHit::ScrollDown);
+        }
+        if self.rotate_left_btn.is_some_and(|r| r.contains(x, y)) {
+            return Some(ShopHit::RotateLeft);
+        }
+        if self.rotate_right_btn.is_some_and(|r| r.contains(x, y)) {
+            return Some(ShopHit::RotateRight);
         }
         for &(idx, rect) in &self.visible_cards {
             if rect.contains(x, y) {
@@ -605,7 +625,13 @@ impl ShopPickerDialog {
         let margin = 12;
         let max_w = (fw - margin * 2).max(220).min(fw);
         let max_h = (fh - margin * 2).max(200).min(fh);
-        let width = 540.min(max_w);
+        let wants_preview = snapshot.preview_image.is_some() || snapshot.tried_on_item_id.is_some();
+        let show_preview = wants_preview && max_w >= 380;
+        let width = if show_preview {
+            680.min(max_w)
+        } else {
+            540.min(max_w)
+        };
         let height = 420.min(max_h);
         let x = ((fw - width) / 2).max(0);
         let y = ((fh - height) / 2).max(0);
@@ -637,7 +663,30 @@ impl ShopPickerDialog {
 
         let list_y = wallet_bar.y + wallet_bar.height + 6;
         let list_h = (detail_bar.y - list_y - 6).max(CARD_HEIGHT);
-        let list_area = Rect::new(inner_x, list_y, inner_w, list_h);
+        let (list_area, preview_pane, rotate_left_btn, rotate_right_btn) = if show_preview {
+            let preview_w = 136.min((inner_w / 3).max(96));
+            let list_w = (inner_w - preview_w - gap).max(160);
+            let list_area = Rect::new(inner_x, list_y, list_w, list_h);
+            let pane = Rect::new(
+                inner_x + list_w + gap,
+                list_y,
+                (inner_w - list_w - gap).max(72),
+                list_h,
+            );
+            let rot_h = 22.min((pane.height / 4).max(16));
+            let rot_y = pane.y + pane.height - rot_h - 4;
+            let rot_w = ((pane.width - 12) / 2).max(20);
+            let left = Rect::new(pane.x + 4, rot_y, rot_w, rot_h);
+            let right = Rect::new(pane.x + pane.width - rot_w - 4, rot_y, rot_w, rot_h);
+            (list_area, Some(pane), Some(left), Some(right))
+        } else {
+            (
+                Rect::new(inner_x, list_y, inner_w, list_h),
+                None,
+                None,
+                None,
+            )
+        };
 
         let capacity = (list_area.height / CARD_HEIGHT).max(1) as usize;
         let needs_scroll = snapshot.items.len() > capacity;
@@ -686,6 +735,9 @@ impl ShopPickerDialog {
             visible_cards,
             scroll_up,
             scroll_down,
+            preview_pane,
+            rotate_left_btn,
+            rotate_right_btn,
             detail_bar,
             try_on_btn,
             buy_btn,
@@ -771,6 +823,14 @@ impl ShopPickerDialog {
                 self.scroll(1, frame_size, snapshot);
                 None
             }
+            ShopHit::RotateLeft => snapshot
+                .preview_image
+                .is_some()
+                .then_some(ShopCommand::RotatePreview(-45)),
+            ShopHit::RotateRight => snapshot
+                .preview_image
+                .is_some()
+                .then_some(ShopCommand::RotatePreview(45)),
             ShopHit::TryOnButton => {
                 let (expected_id, _, _) = pressed_item?;
                 if !self.can_try_on_selected(snapshot) {
@@ -1056,6 +1116,92 @@ impl ShopPickerDialog {
             );
         }
 
+        // Optional right-hand 3D Sim Try-On preview pane.
+        if let Some(pane) = layout.preview_pane {
+            frame.fill(pane, DETAIL_BG);
+            draw_outline(frame, pane, LIST_BORDER);
+
+            let rot_top = layout
+                .rotate_left_btn
+                .map_or(pane.y + pane.height - 4, |r| r.y - 4);
+            let label_h = if snapshot.preview_label.is_some() {
+                small_font.map_or(14, |f| f.line_height + 4)
+            } else {
+                0
+            };
+            let img_bounds = Rect::new(
+                pane.x + 4,
+                pane.y + 4,
+                (pane.width - 8).max(1),
+                (rot_top - (pane.y + 4) - label_h).max(16),
+            );
+            frame.fill(img_bounds, ICON_SLOT_BG);
+            draw_outline(frame, img_bounds, LIST_BORDER);
+
+            if let Some(img) = snapshot.preview_image.as_ref() {
+                draw_aspect_fit(
+                    frame,
+                    img,
+                    Rect::new(
+                        img_bounds.x + 2,
+                        img_bounds.y + 2,
+                        (img_bounds.width - 4).max(1),
+                        (img_bounds.height - 4).max(1),
+                    ),
+                );
+            } else if let Some(font) = small_font {
+                let fallback = snapshot
+                    .preview_label
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("Preview N/A");
+                let text_rect = Rect::new(
+                    img_bounds.x + 6,
+                    img_bounds.y + (img_bounds.height / 2 - font.line_height).max(4),
+                    (img_bounds.width - 12).max(16),
+                    (img_bounds.height - 8).max(12),
+                );
+                draw_wrapped_text(frame, font, fallback, text_rect, TEXT_WARNING);
+            }
+
+            if let Some(label) = snapshot
+                .preview_label
+                .as_deref()
+                .filter(|s| !s.trim().is_empty() && snapshot.preview_image.is_some())
+                && let Some(font) = small_font
+                && label_h > 0
+            {
+                draw_clipped_text(
+                    frame,
+                    font,
+                    label,
+                    [pane.x + 6, img_bounds.y + img_bounds.height + 2],
+                    (pane.width - 12).max(16),
+                    TEXT_SELECTED,
+                );
+            }
+
+            let can_rotate = snapshot.preview_image.is_some();
+            if let Some(left) = layout.rotate_left_btn {
+                draw_button(
+                    frame,
+                    art,
+                    left,
+                    "<",
+                    self.button_state(ShopHit::RotateLeft, can_rotate),
+                );
+            }
+            if let Some(right) = layout.rotate_right_btn {
+                draw_button(
+                    frame,
+                    art,
+                    right,
+                    ">",
+                    self.button_state(ShopHit::RotateRight, can_rotate),
+                );
+            }
+        }
+
         // Detail / affordability status bar.
         draw_detail_bar(frame, art, layout.detail_bar);
         if let Some(font) = small_font {
@@ -1093,11 +1239,16 @@ impl ShopPickerDialog {
             &strings.try_on,
             self.button_state(ShopHit::TryOnButton, self.can_try_on_selected(snapshot)),
         );
+        let buy_label = snapshot
+            .buy_label_override
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| strings.buy_label_for(snapshot.kind));
         draw_button(
             frame,
             art,
             layout.buy_btn,
-            strings.buy_label_for(snapshot.kind),
+            buy_label,
             self.button_state(ShopHit::BuyButton, self.can_buy_selected(snapshot)),
         );
         draw_button(
