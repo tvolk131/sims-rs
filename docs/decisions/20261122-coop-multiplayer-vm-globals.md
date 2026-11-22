@@ -89,11 +89,15 @@ all 8 screenshot ratchet scenes).
 
 5. **Sequential command execution, mode gates & Mode Global 19 (`0x4ce44f`):**
    - `Lot::apply_coop_batch` validates tick and epoch continuity (rejecting
-     duplicate or out-of-order batches) and replays `batch.commands`
-     **sequentially** against the pre-batch `SessionState` in exact stamped
-     order so early commands never observe future commands in the same batch.
+     duplicate, out-of-order, or unbacked future-epoch batches, and reconciling
+     out-of-band host failover removals including unreachable candidates) and
+     replays `batch.commands` **sequentially** against the pre-batch
+     `SessionState` in exact stamped order so early commands never observe
+     future commands in the same batch.
    - `SelectPerson` validates target existence before mutating `SessionState`
-     so invalid selections never clobber valid selections.
+     and rolls back cleanly to `Refused` if host indicator placement faults,
+     preserving batch tick continuity; `SetMode` likewise rolls back on mode
+     callback error without stranding `current_tick` behind lockstep.
    - `AnswerBlockingDialog` validates `answer.status` against
      `self.asking.shown.answers` BEFORE consuming `dialog_id` from
      `open_dialogs`, so an invalid answer leaves the dialog open for a later
@@ -110,20 +114,22 @@ all 8 screenshot ratchet scenes).
 
 6. **Frozen pre-tick dialog replay (`FrozenDialogTick`):**
    - When an unpaused step hits `StepError::Asking`, `CoopVmContext` freezes
-     `FrozenDialogTick { session, activity_owners, free_will }` and retains it
-     across every dialog in the interrupted tick and through
-     answered-but-paused snapshots.
+     `FrozenDialogTick { session, activity_owners, free_will,
+     intervening_selections }` and retains it across every dialog in the
+     interrupted tick and through answered-but-paused snapshots.
    - While frozen, `self.world` (including `globals[30]`, mode, pause, speed,
      and plumbob) is NOT mutated; intervening commands update live `SessionState`
-     (with `SimActionPick`/`SimActionCancel`/`BuyBuild` returning
-     `IgnoredWhileDialogPending`).
+     (recording any accepted `SelectPerson` issuer in
+     `intervening_selections`, and returning `IgnoredWhileDialogPending` for
+     `SimActionPick`/`SimActionCancel`/`BuyBuild`).
    - Both live replay and `restore_coop_snapshot` mid-dialog probes execute
      with the exact `FrozenDialogTick`. On tick completion, script-driven
      selection changes merge deterministically into live `SessionState` only for
-     players who did not issue an intervening `SelectPerson`, deletions prune
-     both `activity_owners` and live selections, and all deferred session
-     changes (`FreeWill`, `Speed`, `Mode`, `Pause`, `HostCamera`, `HostPlumbob`)
-     are synchronized onto the completed world.
+     players NOT in `intervening_selections`, deletions prune both
+     `activity_owners` and live selections, `Speed` is reapplied ONLY when an
+     explicit `Command::SetSpeed` arrived while frozen (`pending_speed_sync`),
+     and all other deferred session changes (`FreeWill`, `Mode`, `Pause`,
+     `HostCamera`, `HostPlumbob`) are synchronized onto the completed world.
 
 7. **Throwaway pie-menu checks, validated picks, cancel UIDs & atomic Buy/Build:**
    - `Lot::coop_pie_menu(&self, player, target)` runs check scripts against a
@@ -140,25 +146,32 @@ all 8 screenshot ratchet scenes).
      ambiguous 16-bit wrap collision.
    - `BuyBuild` edits execute atomically on a staged `(World, CoopVmContext)`
      with co-op callbacks enabled and catalog `BuildPrices` (loaded via
-     `build_prices_from_install` or `Lot::default_coop_build_prices`), enforcing
-     exact `facing`, `container`, `style`, `pattern`, `side`, and `level`, and
-     purging all detached history objects inside the same staged transaction
-     before committing. Any refusal or cleanup error rolls back completely.
+     `Lot::attach_coop_with_install` or `build_prices_from_install`; unpriced
+     non-zero floor/wallpaper patterns are deterministically refused rather than
+     charged/refunded `$0`), verifying committed post-`USER_PLACEMENT` position,
+     facing, and container on `BuyObject`/`MoveObject`, restricting `PlaceWall`
+     to the 5 buildable styles (`1, 2, 12, 13, 14`) and requiring both wall
+     faces to be buildable and painted when `pattern != 0`, and purging all
+     detached history objects inside the same staged transaction before
+     committing. Any refusal or cleanup error rolls back completely.
 
-8. **Complete fingerprints & transactional co-op snapshot resync (`"SCOP"` v1):**
+8. **Complete fingerprints & transactional co-op snapshot resync (`"SCOP"` v2):**
    - `Lot::coop_world_hash()` hashes `World::hash()`, `Lot` step/dialog state,
      queued `Answers`, `replay_view` rotation, authoritative `Frames`,
      `portrait_anchor`, `build_prices`, `play_mode`, `play.fresh`, format-8
      auxiliary `World` tables, `activity_owners`, `next_dialog_id`,
-     `active_dialog`, `FrozenDialogTick` digest, and `pending_speed_sync` under
-     domain `b"sims-vm/coop-world/v1\0"`.
+     `active_dialog`, `FrozenDialogTick` digest (including
+     `intervening_selections`), and `pending_speed_sync` under domain
+     `b"sims-vm/coop-world/v1\0"`.
    - `Lot::coop_snapshot_bytes()` wraps `Saved::encode()` (keeping
      `Saved::FORMAT = 8` untouched for single-player) with `CoopSnapshotMeta`
-     behind `"SCOP"` v1.
+     behind `"SCOP"` v2.
    - `Lot::restore_coop_snapshot` and `Lot::restore_coop_snapshot_verified`
-     validate envelope, `Saved` bytes, dialog consistency, mid-dialog probe, and
-     optional expected `StateFingerprint` transactionally, rolling back `self`
-     unchanged on any error.
+     validate envelope, `Saved` bytes, tutorial refusal (`Global 26 == 0`),
+     Help System controller suppression (including for raw `Saved` restores),
+     dialog consistency, mid-dialog probe, and optional expected
+     `StateFingerprint` transactionally, rolling back `self` unchanged on any
+     error.
 
 ## Reopening Criteria
 

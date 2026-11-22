@@ -706,10 +706,8 @@ fn coop_mode_global_19_multi_reason_pause_fixed_globals_and_catalog_build_prices
     bob.connect_and_hello(&host_addr);
     pump_mesh(&mesh, &mut [&mut host, &mut bob], 6);
     bob.lot
-        .attach_coop_context(
-            CoopVmContext::new(bob.node.session().clone()).with_build_prices(build_prices.clone()),
-        )
-        .expect("attach bob coop");
+        .attach_coop_with_install(bob.node.session().clone(), &install)
+        .expect("attach bob coop with install");
 
     // Tick 1 & 2 run cleanly in Live mode (no Help System interruption!).
     step_lockstep_tick(&mesh, &mut host, &mut [&mut bob], true);
@@ -754,6 +752,11 @@ fn coop_mode_global_19_multi_reason_pause_fixed_globals_and_catalog_build_prices
             plan.valid && plan.affordable && plan.net_cost > 0
         })
         .expect("Goth lot should have a buildable tile for a paid floor");
+    let paid_wall = build_prices
+        .walls
+        .iter()
+        .find_map(|(&k, &p)| (p > 0).then_some(k))
+        .expect("catalog should have at least one paid wallpaper pattern");
     let funds_before_build = available_funds(host.lot.world());
 
     host.submit(Command::SetMode {
@@ -765,6 +768,15 @@ fn coop_mode_global_19_multi_reason_pause_fixed_globals_and_catalog_build_prices
         level: 1,
         style: 999,
         pattern: 0,
+    }));
+    // Border north wall at y = 1 with non-zero wallpaper must refuse atomically
+    // because `(x, 0)` is unbuildable and cannot be painted!
+    host.submit(Command::BuyBuild(BuyBuildEdit::PlaceWall {
+        x: buildable_tile.0,
+        y: 1,
+        level: 1,
+        style: 1,
+        pattern: paid_wall,
     }));
     host.submit(Command::BuyBuild(BuyBuildEdit::SetFloorTile {
         x: buildable_tile.0,
@@ -782,8 +794,12 @@ fn coop_mode_global_19_multi_reason_pause_fixed_globals_and_catalog_build_prices
         r4[0].command_results[1].1,
         CoopCommandStatus::Refused(_)
     ));
-    assert_eq!(
+    assert!(matches!(
         r4[0].command_results[2].1,
+        CoopCommandStatus::Refused(_)
+    ));
+    assert_eq!(
+        r4[0].command_results[3].1,
         CoopCommandStatus::BuyBuildApplied
     );
     assert!(
