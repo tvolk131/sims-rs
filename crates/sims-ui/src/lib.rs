@@ -1,6 +1,7 @@
 //! The game's interface, drawn from the original artwork.
 //!
 //! - [`hud`]: the live-mode control panel.
+//! - [`album`]: the Photo Album / Family Storybook modal viewer and editor.
 //! - [`caf`]: the Create-a-Family and Create-a-Sim screens.
 //! - [`neighborhood`]: the neighborhood top controls bar and lot hover popup card.
 //! - [`family_bin`]: the Select a Family / Family Bin picker screen.
@@ -20,6 +21,7 @@
 //! [`frame::Frame`] on the CPU (so tests need no window), and turns a
 //! press into a [`command::Command`] for the host to carry out.
 
+pub mod album;
 pub mod art;
 pub mod balloon;
 pub mod build;
