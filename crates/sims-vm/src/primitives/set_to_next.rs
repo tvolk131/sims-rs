@@ -114,6 +114,7 @@ impl Machine<'_, '_> {
         // addressing an allocated local inside a subsequent `Expression`'s
         // right-hand Global 34 read (`0x452c76` → `0x4541db`).
         self.world.scratch_ptr_set.remove(&self.me);
+        self.world.scratch_ptr_expression.remove(&self.me);
         self.world.scratch_ptr_set_to_next.insert(self.me);
         let (scope, index) = if operands[4] & 0x80 == 0 {
             (10, 0)

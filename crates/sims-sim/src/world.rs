@@ -290,6 +290,15 @@ pub struct World {
     /// `sims_vm::boot::save::Saved` preserves it across save/restore.
     #[serde(skip)]
     pub scratch_ptr_set_to_next: BTreeSet<u16>,
+    /// Live objects whose last `[object + 0x128]` write was `Expression`
+    /// (`0x452c85` → `&[ebp - 0x04]`). In a subsequent `Expression` at the
+    /// same dispatch depth, reading Global 34 on the right-hand side
+    /// (`0x452c76` → `0x4541db`) writes `&globals[34]` into `[ebp - 0x04]`,
+    /// which takes priority over `[ebp - 0x08]` (motives) and read-only LHS
+    /// destinations at `0x452e84..0x4530c5`. Kept out of [`World::encode`] to
+    /// preserve snapshot format 31; `sims_vm::boot::save::Saved` preserves it.
+    #[serde(skip)]
+    pub scratch_ptr_expression: BTreeSet<u16>,
     /// Appearance names newly inserted into `AvatarRegistry`'s hash table by
     /// runtime `.bcf` catalog loads (`0x59f320` → `0x5a1fb1`) that were not
     /// already present in startup eager or `.ndx` registrations, in exact
@@ -753,6 +762,7 @@ impl World {
             person_outfits: BTreeMap::new(),
             scratch_ptr_set: BTreeSet::new(),
             scratch_ptr_set_to_next: BTreeSet::new(),
+            scratch_ptr_expression: BTreeSet::new(),
             runtime_added_suits: Vec::new(),
             suit_scan_cache: None,
         }

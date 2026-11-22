@@ -225,6 +225,7 @@ pub(crate) struct LotSnapshot {
     person_outfits: BTreeMap<u16, sims_sim::PersonOutfit>,
     scratch_ptr_set: BTreeSet<u16>,
     scratch_ptr_set_to_next: BTreeSet<u16>,
+    scratch_ptr_expression: BTreeSet<u16>,
     runtime_added_suits: Vec<String>,
     suit_scan_cache: Option<Vec<String>>,
 }
@@ -248,6 +249,7 @@ impl LotSnapshot {
             person_outfits: w.person_outfits.clone(),
             scratch_ptr_set: w.scratch_ptr_set.clone(),
             scratch_ptr_set_to_next: w.scratch_ptr_set_to_next.clone(),
+            scratch_ptr_expression: w.scratch_ptr_expression.clone(),
             runtime_added_suits: w.runtime_added_suits.clone(),
             suit_scan_cache: w.suit_scan_cache.clone(),
         }
@@ -278,6 +280,7 @@ pub(crate) fn same_lot(a: &World, b: &World) -> bool {
         && a.person_outfits == b.person_outfits
         && a.scratch_ptr_set == b.scratch_ptr_set
         && a.scratch_ptr_set_to_next == b.scratch_ptr_set_to_next
+        && a.scratch_ptr_expression == b.scratch_ptr_expression
         && a.runtime_added_suits == b.runtime_added_suits
         && a.suit_scan_cache == b.suit_scan_cache
 }

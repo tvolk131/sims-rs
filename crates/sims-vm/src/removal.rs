@@ -455,6 +455,7 @@ impl Interpreter<'_> {
         world.frame_storage.remove(&id);
         world.scratch_ptr_set.remove(&id);
         world.scratch_ptr_set_to_next.remove(&id);
+        world.scratch_ptr_expression.remove(&id);
         // So does its headline list (0x4323ce).
         world.headlines.remove(&id);
         // The object's slot table goes with it.

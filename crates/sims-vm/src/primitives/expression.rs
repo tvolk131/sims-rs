@@ -30,8 +30,9 @@ impl Machine<'_, '_> {
         // pointer is still null (neither safe nor left by `Set To Next`, whose
         // `[ebp - 0x18]` slot lands inside `Expression`'s 0x58-byte local
         // frame), reading global 34 dereferences null at `0x4541db`.
-        if right_scope == 6
-            && right_index == 34
+        let rhs_is_global_34 = right_scope == 6 && right_index == 34;
+        let prev_was_expression = self.world.scratch_ptr_expression.contains(&self.me);
+        if rhs_is_global_34
             && !self.world.scratch_ptr_set.contains(&self.me)
             && !self.world.scratch_ptr_set_to_next.contains(&self.me)
         {
@@ -48,8 +49,9 @@ impl Machine<'_, '_> {
         // which the dispatcher restores at `0x452273` without faulting.
         self.world.scratch_ptr_set_to_next.remove(&self.me);
         self.world.scratch_ptr_set.insert(self.me);
+        self.world.scratch_ptr_expression.insert(self.me);
         let write = matches!(operator, 3..=7 | 9..=13 | 17..=20);
-        let (destination, writable) = self.resolve(left_scope, left_index, write)?;
+        let (mut destination, mut writable) = self.resolve(left_scope, left_index, write)?;
         // The left operand is read even when only assigned to, so an
         // unreadable destination faults for every operator.
         if matches!(operator, 5 | 20)
@@ -60,7 +62,24 @@ impl Machine<'_, '_> {
             // fine here.
             self.wrote_local(local);
         }
-        let lhs = i32::from(self.value(destination)?);
+        let mut lhs = i32::from(self.value(destination)?);
+        // After an earlier Expression at the same dispatch depth (`0x452c85`),
+        // `[edi + 0x128]` points to `[ebp - 0x04]` (this Expression's integer
+        // LHS pointer slot). Reading Global 34 on the RHS (`0x452c76` →
+        // `0x4541db`) writes `&globals[34]` into `[ebp - 0x04]`. If resolving
+        // the LHS does not write an integer pointer (motives write `[ebp - 0x08]`
+        // at `0x453e16`; read-only destinations write neither), `[ebp - 0x04]`
+        // remains `&globals[34]` and takes priority for every mutating operator
+        // (`0x452dc0..0x4530c5`).
+        if write
+            && rhs_is_global_34
+            && prev_was_expression
+            && (!writable || matches!(destination, Cell::Motive(..)))
+        {
+            destination = Cell::Global(34);
+            writable = true;
+            lhs = i32::from(self.value(destination)?);
+        }
 
         if let Cell::Motive(id, index) = destination {
             if matches!(operator, 3..=7) {

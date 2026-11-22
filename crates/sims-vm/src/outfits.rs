@@ -1105,7 +1105,24 @@ pub(crate) fn commit_character_clothing(
         }
         best.name.to_owned()
     };
-    let naked_suit = find_best(&make_other_suit_pat("N"), &scan);
+    // 0x40b2cc..0x40b319: single walk over `scan` testing `naked_suit_pat`
+    // first and breaking out of the inner loop (`0x40b2fa..0x40b304`) for the
+    // rest of the scan once `naked_suit_best` holds any match, skipping
+    // `formal_suit_pat` on subsequent entries.
+    let naked_suit_pat = make_other_suit_pat("N");
+    let formal_suit_pat = make_other_suit_pat("F");
+    let mut naked_suit_best = BestMatch::default();
+    let mut formal_suit_best = BestMatch::default();
+    for item in &scan {
+        let b = encode_cp1252(item);
+        naked_suit_best.consider(item, b.len(), naked_suit_pat.match_len(&b));
+        if !naked_suit_best.name.is_empty() {
+            continue;
+        }
+        formal_suit_best.consider(item, b.len(), formal_suit_pat.match_len(&b));
+    }
+    let naked_suit = naked_suit_best.name.to_owned();
+    let formal_suit = formal_suit_best.name.to_owned();
     let naked_tex = find_best(&make_other_tex_pat("N"), &textures);
     let swim_tex_raw = find_best(&make_other_tex_pat("U"), &textures);
     let swim_tex = if swim_tex_raw.is_empty() && is_child {
@@ -1113,7 +1130,6 @@ pub(crate) fn commit_character_clothing(
     } else {
         swim_tex_raw.as_str()
     };
-    let formal_suit = find_best(&make_other_suit_pat("F"), &scan);
     let formal_tex = find_best(&make_other_tex_pat("F"), &textures);
 
     let entry = world.made_outfits.entry(guid).or_default();

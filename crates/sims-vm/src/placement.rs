@@ -39,6 +39,13 @@ use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use crate::load::INDICATORS;
 
+/// Search rules used by `0x4e96dd` (`0x4347d1` defaults).
+pub(crate) const PORTRAIT_SEARCH_RULES: Rules = Rules {
+    same_room: true,
+    empty: true,
+    unmarked: false,
+};
+
 /// Placement strategy for `0x4e9652` temporary portrait persons.
 pub(crate) enum PortraitPutPlan {
     /// No valid tile found (`0x4e96e4` → `0x4e9706`): remove unput.
@@ -51,6 +58,15 @@ pub(crate) enum PortraitPutPlan {
     /// Multiple reachable tiles with unset `view_centre` and a tile-sensitive
     /// hook: verify invariance across all candidates.
     Candidates(Vec<[i32; 2]>),
+    /// Unset `view_centre` with a state-changing overlap callback during the
+    /// search (`0x433a1a` / `0x433a35`): run the real search + put + render +
+    /// remove sequence from every interior camera start and keep the result
+    /// iff every start yields identical post-removal state; otherwise report
+    /// `reason`.
+    Starts {
+        starts: Vec<[i32; 2]>,
+        reason: String,
+    },
 }
 use crate::program::DEFINITION_WORDS;
 use crate::visits::function;
@@ -1316,11 +1332,7 @@ impl Interpreter<'_> {
                 trap,
             })
         };
-        let rules = Rules {
-            same_room: true,
-            empty: true,
-            unmarked: false,
-        };
+        let rules = PORTRAIT_SEARCH_RULES;
         let tiles: Vec<[i8; 2]> = match self.view_centre {
             Some([x, y]) => {
                 let from = [(i32::from(x) << 4) | 8, (i32::from(y) << 4) | 8];
@@ -1337,7 +1349,33 @@ impl Interpreter<'_> {
                     callbacks_must_be_pure: true,
                     ..cells.on(self)
                 };
-                let mut ends = probe.search_from_anywhere(&mut copy, id, 1, rules)?;
+                let mut ends = match probe.search_from_anywhere(&mut copy, id, 1, rules) {
+                    Ok(ends) => ends,
+                    Err(fault)
+                        if matches!(
+                            &fault.trap,
+                            Trap::Unsupported(msg)
+                                if msg.contains(
+                                    "while a dialog's portrait searched for a tile from every start"
+                                )
+                        ) =>
+                    {
+                        let size = i32::from(world.size);
+                        let last = (size - 2).max(1);
+                        let mut starts = Vec::new();
+                        for x in 1..=last {
+                            for y in 1..=last {
+                                starts.push([(x << 4) | 8, (y << 4) | 8]);
+                            }
+                        }
+                        let reason = fault
+                            .trap
+                            .to_string()
+                            .replace("a dialog's portrait", caller);
+                        return Ok(PortraitPutPlan::Starts { starts, reason });
+                    }
+                    Err(fault) => return Err(fault),
+                };
                 if let Some(starts) = ends.remove(&None) {
                     if ends.is_empty() {
                         return Ok(PortraitPutPlan::NoTile);

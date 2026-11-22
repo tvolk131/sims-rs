@@ -172,6 +172,7 @@ impl Machine<'_, '_> {
         // parameter directly without touching `[edi + 0x128]`.
         if sets_scratch_ptr {
             self.world.scratch_ptr_set_to_next.remove(&self.me);
+            self.world.scratch_ptr_expression.remove(&self.me);
             self.world.scratch_ptr_set.insert(self.me);
         }
         // The operand is resolved for writing in both directions.

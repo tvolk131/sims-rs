@@ -585,6 +585,37 @@ impl Machine<'_, '_> {
                 }
                 first
             }
+            crate::placement::PortraitPutPlan::Starts { starts, reason } => {
+                let run_start = |from: [i32; 2]| {
+                    let mut lot = copy.clone();
+                    let run_cells = cells.copy();
+                    let tile = run_cells
+                        .on(&interpreter)
+                        .search(
+                            &mut lot,
+                            id,
+                            from,
+                            1,
+                            crate::placement::PORTRAIT_SEARCH_RULES,
+                        )
+                        .map_err(|f| f.trap)?;
+                    finish_at(tile, tile.is_some(), lot, run_cells)
+                };
+                let first = run_start(starts[0])?;
+                let first_lot = crate::both_ways::LotSnapshot::of(&first.1);
+                for &from in &starts[1..] {
+                    let Ok(next) = run_start(from) else {
+                        return Err(Trap::Unsupported(reason));
+                    };
+                    if next.0 != first.0
+                        || crate::both_ways::LotSnapshot::of(&next.1) != first_lot
+                        || !first.2.same(&next.2)
+                    {
+                        return Err(Trap::Unsupported(reason));
+                    }
+                }
+                first
+            }
         };
         final_cells.keep(&interpreter, self.world, final_world);
         Ok(rendered)
