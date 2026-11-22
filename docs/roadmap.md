@@ -3380,6 +3380,43 @@ through their public interfaces only; the simulation never depends on it.
     bench, cot, basin, multi-tile double bed, fridge -> counter -> stove ->
     meal-plate cooking chain, interactive wall phone, and repairable privacy
     shower with guard trees) verified live in `sims-vm` with 0 traps.
+- **Done (Batch 12 — Performance Part 4: Strictly Correctness-Neutral
+  Speedups Across VM, Render, Startup, Audio & Storage):**
+  - **Assets, audio, app event loop & cross-lot startup caching (#378):**
+    streaming/zero-copy `Iff::scan_types`, cached `ArchivePool` lengths
+    (`Catalog::build_with_pool` **1.55×**), zero-allocation real-time audio
+    mixer (`render_stereo_into`, shared `Arc<SoundFiles>`, `Mixer::open`
+    **1.63×**, **0 allocs/block**), exact `App::next_deadline` idle sleep
+    (**0 wakeups/sec** vs 200/sec), dirty-gated `Arc<Snapshot>` sound feed,
+    zero-clone co-op HUD selection override, parallel `NeighborhoodShell::open`
+    (**1.83×** warm), cross-lot `InstallAssets` cache (`Game::from_loaded_lot`
+    **2.01×**), and SHA-256-cached full save validation.
+  - **VM hot loop, routing, paged CoW & REDB V2 storage (#379):**
+    read-guarded `Frame::TREE_FLAG`, cached `Machine` active frame &
+    `ProgramFast` tuning/duplicate-GUIDs, incremental `sync_top_frame`,
+    16×16 spatial routing grid + exact-tie-break A\*, zero-alloc streaming
+    `Sha256Flavor` `World::hash()` / `coop_world_hash()`, paged 64-entry
+    `CowMap<u16, V>`, CoW `same_lot`, and compressed V2 REDB persistence
+    (**>3–4× smaller** saves/albums/thumbnails, full V1 read compatibility)
+    — taking the 43,200-tick Goth day from `2.84 s → 1.52 s` (**1.87×**
+    wall clock, bit-exact hash `df6eb544...`).
+  - **Sprite spans, multi-threaded bands, 3D people cache & neighborhood
+    cache (#380):** precompiled active sprite row spans + hoisted `Light`
+    LUTs, safe multi-threaded horizontal-band rasterization (`std::thread::scope`,
+    0 differing pixels across 1/4/8 bands; uncached lot pans **3.15–6.98×**
+    faster), 3D People scratch reuse & pose caching (**1.25×**), Neighborhood
+    65,536-entry `brighten_565` LUT + static base-layer cache (**19.09×**
+    faster hover fades, `6.00 ms → 0.31 ms`), and row-sliced UI `Frame::draw`
+    (**3.84×**).
+  - **Wave B `Canvas`/`Frame` compaction, zero-copy picking & fast present
+    (#381):** compacted `Canvas` (`u32` color, `u16` depth, `u16` IDs — 8 vs
+    11 B/px), zero-copy `LotCache::last_lot_depth`, sparse `<40 KB` per-Sim
+    `people_ids` picking (0 `Game::under` mismatches), `memcpy` 1× blit
+    (**2.49×**), pure-`u32` 2× blit, and `age() == 1` partial present —
+    delivering a further **2.00×** steady `Game::render` (`1.369 → 0.683 ms`),
+    **3.01×** uncached pan (`6.569 → 2.184 ms`), **−57.7%** steady-state
+    memory traffic, and **−41.4%** resident buffer RAM with `8/8 ratchet: ok`
+    and zero new crates.
 - **Needs from other crates:**
   - `sims-vm`: Done — all three failing Goth pie listings (#296) are
     now closed, and every person's pie menu on every object of the Goth
