@@ -66,6 +66,7 @@ use sims_sim::World;
 use sims_ui::command::{Mode, Speed};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 /// The register the sound scripts read the game's speed from.
 const SPEED_REGISTER: u8 = 100;
@@ -380,11 +381,33 @@ pub fn pause_event(paused: bool) -> SoundEvent {
 /// with live-mode auto-pause matching `byte [0x6c9fa1] == 1` at
 /// `0x4f7635`..`0x4f7666`), the simulation's sound events, the ambience
 /// view/hour/speed, and kind 33 camera moves in the order the window uses.
+/// Dirty-tracking key for world-side sound source fields (`objects`,
+/// `positions`, `absent`, `lot`). Pure UI/hover wakeups leave both this key
+/// and [`Shot`] unchanged, so [`Feed::update`] skips rebuilding [`Snapshot`]
+/// entirely; pure camera pans change only [`Shot`], reusing `objects` and
+/// `positions` from the prior snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SoundWorldKey {
+    pub(crate) ticks: u32,
+    pub(crate) restore_gen: u64,
+    pub(crate) sound_rev: u64,
+    pub(crate) error_count: usize,
+    pub(crate) object_count: usize,
+    pub(crate) hour: i16,
+    pub(crate) lot_id: i16,
+    pub(crate) buy_held_pos: Option<(u16, [i32; 3])>,
+}
+
 pub struct Feed {
     /// The hour, speed and ambience view the sound was last told.
     heard: Option<(u32, Speed, i32)>,
-    /// The object answers the sound was last told.
-    told: Option<Snapshot>,
+    /// The object answers the sound was last told, shared zero-copy with the
+    /// audio mixer thread via `Arc`.
+    told: Option<Arc<Snapshot>>,
+    /// World-side key of `self.told` for O(1) dirty gating.
+    told_world_key: Option<SoundWorldKey>,
+    /// Camera shot of `self.told` so pure camera pans reuse `objects`/`positions`.
+    told_shot: Option<Shot>,
     /// The camera the sound last heard move.
     shot: Option<Shot>,
     /// The last `game.paused()` value observed from [`crate::Game`], used to
@@ -425,6 +448,8 @@ impl Default for Feed {
         Self {
             heard: None,
             told: None,
+            told_world_key: None,
+            told_shot: None,
             shot: None,
             observed_game_paused: false,
             requested_paused: false,
@@ -547,6 +572,8 @@ impl Feed {
     pub fn reset_for_lot(&mut self) {
         self.heard = None;
         self.told = None;
+        self.told_world_key = None;
+        self.told_shot = None;
         self.shot = None;
         self.observed_game_paused = false;
         self.requested_paused = false;
@@ -586,6 +613,47 @@ impl Feed {
     /// Whether the window is currently considered focused.
     pub fn focused(&self) -> bool {
         self.focused
+    }
+
+    /// Refreshes `Input::Sources` only when simulation state or camera view
+    /// changed since the last sync, reusing `objects`/`positions` on pure
+    /// camera pans and sharing the `Snapshot` with the audio thread via `Arc`.
+    fn sync_sources(&mut self, game: &crate::Game, send: &mut impl FnMut(Input)) {
+        let world_key = game.sound_world_key();
+        let shot = game.shot();
+        if self.told.is_some()
+            && self.told_world_key == Some(world_key)
+            && self.told_shot == Some(shot)
+        {
+            return;
+        }
+        let next = if let Some(prev) = self.told.as_ref()
+            && self.told_world_key == Some(world_key)
+        {
+            // Pure camera pan/zoom/rotate: `objects`, `positions`, `absent`, and
+            // `lot` are unchanged; only recompute screen projections.
+            let screen = game.sound_screen();
+            if prev.screen == screen {
+                self.told_shot = Some(shot);
+                return;
+            }
+            Snapshot {
+                objects: prev.objects.clone(),
+                absent: prev.absent,
+                positions: prev.positions.clone(),
+                screen,
+                lot: prev.lot,
+            }
+        } else {
+            game.sound_sources()
+        };
+        if self.told.as_deref() != Some(&next) {
+            let shared = Arc::new(next);
+            send(Input::Sources(Arc::clone(&shared)));
+            self.told = Some(shared);
+        }
+        self.told_world_key = Some(world_key);
+        self.told_shot = Some(shot);
     }
 
     /// Handles a window focus change (`WM_ACTIVATEAPP`, `0x4f7608`..`0x4f76dc`),
@@ -657,11 +725,7 @@ impl Feed {
             }
         } else {
             let first = self.told.is_none();
-            let sources = game.sound_sources();
-            if self.told.as_ref() != Some(&sources) {
-                send(Input::Sources(sources.clone()));
-                self.told = Some(sources);
-            }
+            self.sync_sources(game, &mut send);
             if first {
                 send(Input::Events(enter_live()));
             }
@@ -698,11 +762,7 @@ impl Feed {
     /// [`Feed::update`] at `0x4ce59e`).
     fn flush_before_blur(&mut self, game: &mut crate::Game, mut send: impl FnMut(Input)) {
         let first = self.told.is_none();
-        let sources = game.sound_sources();
-        if self.told.as_ref() != Some(&sources) {
-            send(Input::Sources(sources.clone()));
-            self.told = Some(sources);
-        }
+        self.sync_sources(game, &mut send);
         if first {
             send(Input::Events(enter_live()));
         }
@@ -749,14 +809,11 @@ impl Feed {
     /// Sends every sound input that changed on `game` since the last call.
     pub fn update(&mut self, game: &mut crate::Game, mut send: impl FnMut(Input)) {
         // What the tick's sounds may ask about their objects, before the
-        // sounds themselves. Read on every call, not only after a step
-        // that succeeded: a failed step may still have changed the lot.
+        // sounds themselves. Dirty-gated on simulation mutations + camera shot
+        // so pure UI/hover wakeups skip rebuilding `Snapshot`, and pure camera
+        // pans reuse `objects`/`positions`.
         let first = self.told.is_none();
-        let sources = game.sound_sources();
-        if self.told.as_ref() != Some(&sources) {
-            send(Input::Sources(sources.clone()));
-            self.told = Some(sources);
-        }
+        self.sync_sources(game, &mut send);
         if first {
             send(Input::Events(enter_live()));
         }
@@ -884,8 +941,9 @@ pub enum Input {
     /// The ambience's camera value (see the module documentation).
     View(i32),
     Speed(Speed),
-    /// What the sound scripts may ask about the lot's objects.
-    Sources(Snapshot),
+    /// What the sound scripts may ask about the lot's objects, shared zero-copy
+    /// between the UI thread's [`Feed`] and the mixer thread.
+    Sources(Arc<Snapshot>),
     /// The camera moved (kind 33): sent after the [`Input::Sources`]
     /// and [`Input::View`] that show the lot through the moved camera.
     Camera,
@@ -948,15 +1006,16 @@ struct ActiveVoice {
 /// in-lot stereo/TV radio streaming, environmental lot ambience beds, and
 /// Simlish voice bank playback.
 pub struct Mixer {
-    player: Player<SoundFiles>,
-    music: ModeMusicPlayer<SoundFiles>,
-    radio: RadioPlayer<SoundFiles>,
-    ambience: AmbienceMixer<SoundFiles>,
+    player: Player<Arc<SoundFiles>>,
+    music: ModeMusicPlayer<Arc<SoundFiles>>,
+    radio: RadioPlayer<Arc<SoundFiles>>,
+    ambience: AmbienceMixer<Arc<SoundFiles>>,
     voices: VoiceCatalog,
     active_voices: Vec<ActiveVoice>,
+    voice_scratch: Vec<i16>,
     hour: u32,
     view: i32,
-    sources: Snapshot,
+    sources: Arc<Snapshot>,
     /// Whether the host window is focused (`Input::Active`).
     active: bool,
     /// Whether live gameplay audio is paused (`SoundEvent::Pause` / `Unpause`).
@@ -970,17 +1029,17 @@ pub struct Mixer {
 impl Mixer {
     /// Reads the install's sound files at `root`.
     pub fn open(root: &Path) -> Result<Self, String> {
-        let files = SoundFiles::scan(root).map_err(|e| format!("sound files: {e}"))?;
+        let files = Arc::new(SoundFiles::scan(root).map_err(|e| format!("sound files: {e}"))?);
         let modules = Module::load_all(&files).map_err(|e| format!("sound modules: {e}"))?;
         let lists = StationLists::build(&files);
         let catalog = ModeCatalog::from_sound_files(&files, true, ALL_EXPANSIONS);
-        let music = ModeMusicPlayer::new(catalog, files.clone(), SEED);
+        let music = ModeMusicPlayer::new(catalog, Arc::clone(&files), SEED);
         let radio_catalog = RadioCatalog::from_sound_files(&files);
-        let radio = RadioPlayer::new(radio_catalog, files.clone(), SEED ^ 0x5241_4449);
+        let radio = RadioPlayer::new(radio_catalog, Arc::clone(&files), SEED ^ 0x5241_4449);
         let ambience_catalog = AmbienceCatalog::from_sound_files(&files);
-        let ambience = AmbienceMixer::new(ambience_catalog, files.clone());
-        let voices = VoiceCatalog::from_sound_files(files.clone());
-        let mut player = Player::new(modules, files.clone(), SEED);
+        let ambience = AmbienceMixer::new(ambience_catalog, Arc::clone(&files));
+        let voices = VoiceCatalog::from_shared_sound_files(Arc::clone(&files));
+        let mut player = Player::new(modules, Arc::clone(&files), SEED);
         player.add_stations(&lists);
         player.add_scores(&files);
         player.set_global(SPEED_REGISTER, speed_register(Speed::Normal));
@@ -991,9 +1050,10 @@ impl Mixer {
             ambience,
             voices,
             active_voices: Vec::new(),
+            voice_scratch: Vec::new(),
             hour: u32::MAX,
             view: 0,
-            sources: Snapshot::default(),
+            sources: Arc::new(Snapshot::default()),
             active: true,
             paused_by_game: false,
             ambience_active: false,
@@ -1024,7 +1084,7 @@ impl Mixer {
         if frames == 0 {
             return;
         }
-        let mut scratch = Vec::new();
+        let mut scratch = std::mem::take(&mut self.voice_scratch);
         for voice in &mut self.active_voices {
             if voice.object.is_some() && self.paused_by_game {
                 continue;
@@ -1072,6 +1132,7 @@ impl Mixer {
                 out[i * 2 + 1] = dr;
             }
         }
+        self.voice_scratch = scratch;
         self.active_voices.retain(|v| !v.stream.is_finished());
     }
 
@@ -1160,7 +1221,7 @@ impl Mixer {
                             }
                         }
                     }
-                    self.player.handle(event, &self.sources);
+                    self.player.handle(event, &*self.sources);
                 }
             }
             Input::Hour(hour) => {
@@ -1171,7 +1232,7 @@ impl Mixer {
                 }
                 if changed {
                     self.player
-                        .camera_moved(self.view, self.hour, &self.sources);
+                        .camera_moved(self.view, self.hour, &*self.sources);
                 }
             }
             Input::View(view) => {
@@ -1184,18 +1245,18 @@ impl Mixer {
             }
             Input::Camera => {
                 self.player
-                    .camera_moved(self.view, self.hour, &self.sources);
+                    .camera_moved(self.view, self.hour, &*self.sources);
                 self.refresh_radio_spatial();
             }
             Input::Active(active) => {
                 self.active = active;
-                self.player.set_active(active, &self.sources);
+                self.player.set_active(active, &*self.sources);
                 self.music.set_paused(!active);
                 self.sync_stream_pause();
             }
             Input::FxVolume(step) => {
                 let idx = usize::from(step);
-                self.player.set_fx_volume_step(idx, &self.sources);
+                self.player.set_fx_volume_step(idx, &*self.sources);
                 self.radio.set_fx_volume_step(idx);
                 self.ambience.set_volume_step(idx);
             }
@@ -1278,12 +1339,12 @@ impl Mixer {
     }
 
     /// In-lot streaming stereo/TV radio player.
-    pub fn radio(&self) -> &RadioPlayer<SoundFiles> {
+    pub fn radio(&self) -> &RadioPlayer<Arc<SoundFiles>> {
         &self.radio
     }
 
     /// Streaming environmental lot ambience mixer.
-    pub fn ambience(&self) -> &AmbienceMixer<SoundFiles> {
+    pub fn ambience(&self) -> &AmbienceMixer<Arc<SoundFiles>> {
         &self.ambience
     }
 
@@ -1302,13 +1363,21 @@ impl Mixer {
     /// mixing streaming mode music, stereo/TV radio, environmental ambience,
     /// and Simlish voice playback into the output buffer.
     pub fn render(&mut self, frames: usize) -> Vec<i16> {
-        self.player.set_ambience_view(self.view, self.hour);
-        let mut out = self.player.render_stereo(frames, &self.sources);
-        self.music.mix_into_stereo(&mut out);
-        self.radio.mix_into_stereo(&mut out);
-        self.ambience.mix_into_stereo(&mut out);
-        self.mix_active_voices(&mut out);
+        let mut out = Vec::new();
+        self.render_into(frames, &mut out);
         out
+    }
+
+    /// Renders `frames` stereo frames into `out`, reusing `out`'s allocation
+    /// and the mixer's internal voice scratch buffer for zero steady-state
+    /// per-block heap allocations.
+    pub fn render_into(&mut self, frames: usize, out: &mut Vec<i16>) {
+        self.player.set_ambience_view(self.view, self.hour);
+        self.player.render_stereo_into(frames, &*self.sources, out);
+        self.music.mix_into_stereo(out);
+        self.radio.mix_into_stereo(out);
+        self.ambience.mix_into_stereo(out);
+        self.mix_active_voices(out);
     }
 
     /// Faults not reported yet, each once, up to `REPORTED` of them; a

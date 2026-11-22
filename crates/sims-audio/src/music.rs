@@ -369,6 +369,20 @@ impl TrackSource for SoundFiles {
     }
 }
 
+impl TrackSource for std::sync::Arc<SoundFiles> {
+    fn read_bytes(&mut self, path: &str) -> Option<Vec<u8>> {
+        self.get(path)?.read().ok()
+    }
+
+    fn open_track(&mut self, path: &str) -> Option<TrackData> {
+        let entry = self.get(path)?;
+        match &entry.source {
+            Source::Loose(file_path) => std::fs::File::open(file_path).ok().map(TrackData::File),
+            Source::Member { .. } => entry.read().ok().map(TrackData::Bytes),
+        }
+    }
+}
+
 impl TrackSource for BTreeMap<String, Vec<u8>> {
     fn read_bytes(&mut self, path: &str) -> Option<Vec<u8>> {
         self.get(path).cloned()
