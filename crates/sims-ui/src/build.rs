@@ -741,9 +741,25 @@ pub fn layout(
     if let Some(tool) = state.tool {
         let items = catalog.items_for(tool);
         if !items.is_empty() {
-            let grid_right = width - GRID_RIGHT_MARGIN;
+            let grid_right = (width - GRID_RIGHT_MARGIN).max(CELL as i32);
             let cell = CELL as i32;
-            let cols = ((grid_right - GRID_LEFT) / cell).max(1) as usize;
+            // Preserve exact native `GRID_LEFT = 556` on 800×600+ windows, while
+            // shifting left on narrow viewports (< 620 px) so the catalog stays
+            // onscreen and clickable.
+            let grid_left = if grid_right - GRID_LEFT >= cell {
+                GRID_LEFT
+            } else {
+                (grid_right - cell * 2)
+                    .max(240)
+                    .min(grid_right - cell)
+                    .max(0)
+            };
+            let prev_arrow_x = if grid_left == GRID_LEFT {
+                PREV_ARROW_X
+            } else {
+                (grid_left - 17).max(0)
+            };
+            let cols = ((grid_right - grid_left) / cell).max(1) as usize;
             let per_page = cols * GRID_ROWS;
             total_pages = items.len().div_ceil(per_page);
             if total_pages > 0 {
@@ -756,7 +772,7 @@ pub fn layout(
                 let col = (slot % cols) as i32;
                 let row = (slot / cols) as i32;
                 let rect = Rect::new(
-                    GRID_LEFT + col * cell,
+                    grid_left + col * cell,
                     strip_y + GRID_TOP + row * cell,
                     cell,
                     cell,
@@ -776,7 +792,7 @@ pub fn layout(
             if page > 0 {
                 let [aw, ah] = btn_size(id::PREV_ARROW);
                 widgets.push(BuildWidget {
-                    rect: Rect::new(PREV_ARROW_X, strip_y + ARROW_Y, aw, ah),
+                    rect: Rect::new(prev_arrow_x, strip_y + ARROW_Y, aw, ah),
                     kind: BuildWidgetKind::Button {
                         id: id::PREV_ARROW,
                         selected: false,

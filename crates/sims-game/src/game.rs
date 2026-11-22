@@ -898,9 +898,9 @@ impl Game {
                 } else {
                     redraw |= self.hide_buy_cursor();
                 }
-            } else if !self.hud.covers(point) || self.build_drag.is_some() {
+            } else if !self.hud.covers(point) {
                 redraw |= self.hover_build(point);
-            } else {
+            } else if self.build_drag.is_none() {
                 redraw |= self.hide_build_cursor();
             }
         } else {
@@ -2891,10 +2891,13 @@ impl Game {
         if active < 2 {
             return None;
         }
-        let wall_h = match self.view.camera.zoom {
-            sims_render::Zoom::Far => 29,
-            sims_render::Zoom::Medium => 58,
-            sims_render::Zoom::Near => 116,
+        let wall_h = match (self.view.camera.walls, self.view.camera.zoom) {
+            (Walls::Down, sims_render::Zoom::Far) => 6,
+            (Walls::Down, sims_render::Zoom::Medium) => 12,
+            (Walls::Down, sims_render::Zoom::Near) => 23,
+            (_, sims_render::Zoom::Far) => 29,
+            (_, sims_render::Zoom::Medium) => 58,
+            (_, sims_render::Zoom::Near) => 116,
         };
         let walls = &self.lot_shape.levels[level_idx].walls;
         let lvl = i32::from(level);
@@ -2920,7 +2923,13 @@ impl Game {
         let py = point[1] as f32;
         let mut best: Option<(f32, WallFace)> = None;
 
-        let mut test_quad = |c0: [i32; 2], c1: [i32; 2], normal: [i32; 2], face: WallFace| {
+        let mut test_quad = |c0: [i32; 2],
+                             c1: [i32; 2],
+                             normal: [i32; 2],
+                             face: WallFace,
+                             _seg_tile: [i32; 2],
+                             _seg_bit: u8| {
+            let quad_h = wall_h;
             let mid = [(c0[0] + c1[0]) / 2, (c0[1] + c1[1]) / 2];
             let p_mid = lot_point(&self.view.camera, &self.lot_shape, [mid[0], mid[1], lvl]);
             let p_out = lot_point(
@@ -2950,7 +2959,7 @@ impl Game {
                 ((px - x0) / (x1 - x0)).clamp(0.0, 1.0)
             };
             let y_bot = y0 + t * (y1 - y0);
-            if py >= y_bot - wall_h as f32 - 2.0 && py <= y_bot + 3.0 {
+            if py >= y_bot - quad_h as f32 - 2.0 && py <= y_bot + 3.0 {
                 let score = y_bot;
                 if best.is_none_or(|(b, _)| score > b) {
                     best = Some((score, face));
@@ -2962,6 +2971,7 @@ impl Game {
             let segs = walls[sims_render::Lot::cell(x, y)].segments;
             let fx = (x as i32) * 16;
             let fy = (y as i32) * 16;
+            let seg_tile = [x as i32, y as i32];
             if (segs & WALL_WEST) != 0 {
                 test_quad(
                     [fx, fy],
@@ -2972,6 +2982,8 @@ impl Game {
                         bit: WALL_WEST,
                         side: 0,
                     },
+                    seg_tile,
+                    WALL_WEST,
                 );
                 if x > 0 {
                     test_quad(
@@ -2983,6 +2995,8 @@ impl Game {
                             bit: WALL_EAST,
                             side: 0,
                         },
+                        seg_tile,
+                        WALL_WEST,
                     );
                 }
             }
@@ -2996,6 +3010,8 @@ impl Game {
                         bit: WALL_NORTH,
                         side: 0,
                     },
+                    seg_tile,
+                    WALL_NORTH,
                 );
                 if y > 0 {
                     test_quad(
@@ -3007,6 +3023,8 @@ impl Game {
                             bit: WALL_SOUTH,
                             side: 0,
                         },
+                        seg_tile,
+                        WALL_NORTH,
                     );
                 }
             }
@@ -3020,6 +3038,8 @@ impl Game {
                         bit: WALL_DESCENDING,
                         side: 0,
                     },
+                    seg_tile,
+                    WALL_DESCENDING,
                 );
                 test_quad(
                     [fx + 16, fy],
@@ -3030,6 +3050,8 @@ impl Game {
                         bit: WALL_DESCENDING,
                         side: 1,
                     },
+                    seg_tile,
+                    WALL_DESCENDING,
                 );
             }
             if (segs & WALL_ASCENDING) != 0 {
@@ -3042,6 +3064,8 @@ impl Game {
                         bit: WALL_ASCENDING,
                         side: 0,
                     },
+                    seg_tile,
+                    WALL_ASCENDING,
                 );
                 test_quad(
                     [fx, fy],
@@ -3052,6 +3076,8 @@ impl Game {
                         bit: WALL_ASCENDING,
                         side: 1,
                     },
+                    seg_tile,
+                    WALL_ASCENDING,
                 );
             }
         }
@@ -3417,6 +3443,12 @@ impl Game {
     }
 
     fn release_build(&mut self, point: [i32; 2]) -> Outcome {
+        if self.hud.covers(point) {
+            self.build_drag = None;
+            self.build_preview_shape = None;
+            self.hide_build_cursor();
+            return Outcome::redraw();
+        }
         self.pointer = Some(point);
         self.hover_build(point);
         let Some(drag) = self.build_drag.take() else {

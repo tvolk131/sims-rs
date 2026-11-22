@@ -32,7 +32,10 @@ pub const SPLIT_FLOOR_ID: u16 = 255;
 const FULL_SIZE: usize = 64;
 const WALL_CELL: usize = 14;
 const HEIGHTS_ARRAY: u16 = 0;
-const POOL_ARRAY: u16 = 4;
+const FLAGS_ARRAY: [u16; 2] = [8, 108];
+const FLAG_BUILDABLE: u8 = 1;
+const POOL_ARRAY: u16 = 9;
+const WATER_ARRAY: u16 = 10;
 
 /// Wall segment bitmasks (`ExpandedWall::segments`).
 pub const WALL_WEST: u8 = 1;
@@ -523,14 +526,17 @@ fn is_flat_tile(world: &World, x: usize, y: usize) -> bool {
     c[0] == c[1] && c[1] == c[2] && c[2] == c[3]
 }
 
-fn is_pool_tile(world: &World, x: usize, y: usize) -> bool {
-    let Some(pool) = world.arrays.get(&POOL_ARRAY) else {
-        return false;
-    };
-    if pool.stride != 1 {
-        return false;
+fn is_pool_or_water_tile(world: &World, x: usize, y: usize) -> bool {
+    let idx = cell_index(x, y);
+    for array_id in [POOL_ARRAY, WATER_ARRAY] {
+        if let Some(arr) = world.arrays.get(&array_id)
+            && arr.stride == 1
+            && arr.data.get(idx).copied().is_some_and(|v| v < 16)
+        {
+            return true;
+        }
     }
-    pool.data.get(cell_index(x, y)).copied().unwrap_or(0) != 0
+    false
 }
 
 fn is_road_tile(world: &World, x: usize, y: usize) -> bool {
@@ -559,33 +565,103 @@ pub fn is_buildable_tile(world: &World, x: usize, y: usize, level: u8) -> bool {
     true
 }
 
-/// Whether a level-2 tile `(x, y)` has structural support underneath on level 1
-/// (inside a ground-floor enclosed room, or directly above a level-1 wall).
+/// Whether a level-2 tile `(x, y)` is buildable according to the lot's rebuilt
+/// tile flags (array `108` bit `0x01`, computed by `World::rebuild_rooms` in
+/// `sims-sim/src/rooms.rs:667`).
 fn has_upper_support(world: &World, x: usize, y: usize) -> bool {
     let idx = cell_index(x, y);
+    if let Some(flags) = world.arrays.get(&FLAGS_ARRAY[1])
+        && flags.stride == 1
+        && let Some(&bits) = flags.data.get(idx)
+    {
+        return (bits & FLAG_BUILDABLE) != 0;
+    }
     let ground_room = world.rooms.map[0].get(idx).copied().unwrap_or(-1);
-    if ground_room >= 0
+    ground_room >= 0
         && world
             .rooms
             .rooms
             .get(&ground_room)
             .is_some_and(|r| !r.outdoors)
-    {
+}
+
+/// Whether tile `(x, y)` on `level` can currently accept new wall or floor
+/// construction (bounds, off-road, flat terrain, dry land on level 1, and
+/// rebuilt `BUILDABLE` support on level 2).
+fn tile_supports_build(world: &World, x: usize, y: usize, level: u8) -> bool {
+    if !is_buildable_tile(world, x, y, level) {
+        return false;
+    }
+    if level == 1 {
+        is_flat_tile(world, x, y) && !is_pool_or_water_tile(world, x, y)
+    } else {
+        has_upper_support(world, x, y)
+    }
+}
+
+/// Evaluates ONLY the wall-requirement bits of an object's `data[13]` rules
+/// (`0x476f5a`: `0x40` diagonal required, `0x20` corner required, `0x0f`
+/// directional non-fence wall required) against `walls_buf`. Forbid-only bits
+/// (`0x10`, `0x100..=0x800`) never cause an object to require a wall.
+fn object_missing_required_wall(obj: &sims_sim::Object, walls_buf: &[u8], active: usize) -> bool {
+    let rules = obj.data.get(13).copied().unwrap_or(0) as u16;
+    if (rules & 0x6f) == 0 {
+        return false;
+    }
+    let Ok(tx) = usize::try_from(obj.position[0] >> 4) else {
+        return false;
+    };
+    let Ok(ty) = usize::try_from(obj.position[1] >> 4) else {
+        return false;
+    };
+    if tx >= active || ty >= active {
+        return false;
+    }
+    let cell = ExpandedWall::get(walls_buf, active, tx, ty);
+    if (rules & 0x40) != 0 && (cell.segments & (WALL_DESCENDING | WALL_ASCENDING)) == 0 {
         return true;
     }
-    if let Some(walls) = world.arrays.get(&WALLS[0])
-        && walls.stride == WALL_CELL
-        && walls.data.get(idx * WALL_CELL).copied().unwrap_or(0) != 0
-    {
+    let unrotated: [Option<u16>; 4] = [
+        ((cell.segments & WALL_WEST) != 0).then(|| cell.styles[0].unwrap_or(1)),
+        ((cell.segments & WALL_NORTH) != 0).then(|| cell.styles[1].unwrap_or(1)),
+        ((cell.segments & WALL_EAST) != 0).then(|| cell.styles[2].unwrap_or(1)),
+        ((cell.segments & WALL_SOUTH) != 0).then(|| cell.styles[3].unwrap_or(1)),
+    ];
+    let facing = obj.data.get(1).copied().unwrap_or(0);
+    let rotation = (((-i32::from(facing)) & 7) >> 1) as usize;
+    let mut sides = [None; 4];
+    for (i, style) in unrotated.into_iter().enumerate() {
+        sides[(i + rotation) & 3] = style;
+    }
+    let has = |side: usize| sides[side].is_some();
+    let corner =
+        (has(0) && has(1)) || (has(0) && has(3)) || (has(1) && has(2)) || (has(3) && has(2));
+    if (rules & 0x20) != 0 && !corner {
         return true;
+    }
+    // Native `0x47707a..0x4770db`: edge bits 2, 1, 4, 8 need non-fence walls
+    // when rules bits 1, 8, 2, 4 are set respectively.
+    for (side, need) in [(1, 1u16), (0, 8), (2, 2), (3, 4)] {
+        if (rules & need) != 0
+            && !sides[side].is_some_and(|style| !WallStyle::is_fence_style(style))
+        {
+            return true;
+        }
     }
     false
 }
 
 /// Collects non-cursor lot objects standing on tile `(tx, ty)` at `level` that
-/// depend on a wall segment (`data[13] != 0`, wall attachment rules) or have
-/// `wall_style` cut-out shapes (doors/windows).
-fn wall_attached_objects(world: &World, tile: [u8; 2], level: u8) -> Vec<u16> {
+/// genuinely depended on a wall segment removed between `before_walls` and
+/// `after_walls`.
+fn detached_wall_objects_on_tile(
+    world: &World,
+    before_walls: &[u8],
+    after_walls: &[u8],
+    active: usize,
+    tile: [u8; 2],
+    level: u8,
+) -> Vec<u16> {
     let mut leads = BTreeSet::new();
     let tx = i32::from(tile[0]);
     let ty = i32::from(tile[1]);
@@ -597,17 +673,18 @@ fn wall_attached_objects(world: &World, tile: [u8; 2], level: u8) -> Vec<u16> {
         if !on_lot([obj.position[0], obj.position[1]]) || obj.position[2] != lvl {
             continue;
         }
-        if (obj.position[0] >> 4) == tx && (obj.position[1] >> 4) == ty {
-            let wall_rules = obj.data.get(13).copied().unwrap_or(0);
-            if wall_rules != 0 {
-                let lead = obj
-                    .multipart
-                    .as_ref()
-                    .and_then(|m| u16::try_from(m.parent).ok())
-                    .filter(|&p| p != 0)
-                    .unwrap_or(id);
-                leads.insert(lead);
-            }
+        if (obj.position[0] >> 4) == tx
+            && (obj.position[1] >> 4) == ty
+            && !object_missing_required_wall(obj, before_walls, active)
+            && object_missing_required_wall(obj, after_walls, active)
+        {
+            let lead = obj
+                .multipart
+                .as_ref()
+                .and_then(|m| u16::try_from(m.parent).ok())
+                .filter(|&p| p != 0)
+                .unwrap_or(id);
+            leads.insert(lead);
         }
     }
     leads.into_iter().collect()
@@ -693,6 +770,8 @@ pub fn plan_wall_drag(
     let new_pattern = style.default_pattern();
     let seg_price = prices.style_price(new_style);
 
+    let mut demolished_tiles = BTreeSet::new();
+
     for seg in segments {
         let x = usize::from(seg.tile[0]);
         let y = usize::from(seg.tile[1]);
@@ -702,19 +781,11 @@ pub fn plan_wall_drag(
                 ..empty
             };
         }
-        if !mode.is_demolish() {
-            if level == 1 && (!is_flat_tile(world, x, y) || is_pool_tile(world, x, y)) {
-                return WallPlan {
-                    valid: false,
-                    ..empty
-                };
-            }
-            if level == 2 && !has_upper_support(world, x, y) {
-                return WallPlan {
-                    valid: false,
-                    ..empty
-                };
-            }
+        if !mode.is_demolish() && !tile_supports_build(world, x, y, level) {
+            return WallPlan {
+                valid: false,
+                ..empty
+            };
         }
         let mut cell = ExpandedWall::get(&walls_buf, active, x, y);
         let is_diag = seg.bit == WALL_DESCENDING || seg.bit == WALL_ASCENDING;
@@ -732,12 +803,21 @@ pub fn plan_wall_drag(
                 _ => 1,
             };
             net_cost -= build_refund(prices.style_price(old_style));
+            let mut preserve_neighbor_bytes: Option<(usize, [u8; 2])> = None;
             match seg.bit {
                 WALL_WEST => {
                     net_cost -= build_refund(prices.wall_price(cell.patterns[0]));
                     if x > 0 {
                         let west_cell = ExpandedWall::get(&walls_buf, active, x - 1, y);
-                        net_cost -= build_refund(prices.wall_price(west_cell.patterns[2]));
+                        if (west_cell.segments & (WALL_DESCENDING | WALL_ASCENDING)) != 0 {
+                            // Neighbor holds a diagonal whose side-1 pattern shares
+                            // bytes `+12..+14`; preserve it across `cell.put`.
+                            let off = cell_index(x - 1, y) * WALL_CELL + 12;
+                            preserve_neighbor_bytes =
+                                Some((off, [walls_buf[off], walls_buf[off + 1]]));
+                        } else {
+                            net_cost -= build_refund(prices.wall_price(west_cell.patterns[2]));
+                        }
                     }
                     cell.patterns[0] = 0;
                     cell.styles[0] = Some(1);
@@ -746,7 +826,15 @@ pub fn plan_wall_drag(
                     net_cost -= build_refund(prices.wall_price(cell.patterns[1]));
                     if y > 0 {
                         let north_cell = ExpandedWall::get(&walls_buf, active, x, y - 1);
-                        net_cost -= build_refund(prices.wall_price(north_cell.patterns[3]));
+                        if (north_cell.segments & (WALL_DESCENDING | WALL_ASCENDING)) != 0 {
+                            // Neighbor holds a diagonal whose side-0 pattern shares
+                            // bytes `+10..+12`; preserve it across `cell.put`.
+                            let off = cell_index(x, y - 1) * WALL_CELL + 10;
+                            preserve_neighbor_bytes =
+                                Some((off, [walls_buf[off], walls_buf[off + 1]]));
+                        } else {
+                            net_cost -= build_refund(prices.wall_price(north_cell.patterns[3]));
+                        }
                     }
                     cell.patterns[1] = 0;
                     cell.styles[1] = Some(1);
@@ -787,18 +875,14 @@ pub fn plan_wall_drag(
                     ..empty
                 };
             }
-            // Collect wall-mounted objects on this tile (and adjacent side for cardinal walls).
-            for id in wall_attached_objects(world, [x as u8, y as u8], level) {
-                removed_set.insert(id);
+            if let Some((off, saved)) = preserve_neighbor_bytes {
+                walls_buf[off..off + 2].copy_from_slice(&saved);
             }
+            demolished_tiles.insert([x as u8, y as u8]);
             if seg.bit == WALL_WEST && x > 0 {
-                for id in wall_attached_objects(world, [(x - 1) as u8, y as u8], level) {
-                    removed_set.insert(id);
-                }
+                demolished_tiles.insert([(x - 1) as u8, y as u8]);
             } else if seg.bit == WALL_NORTH && y > 0 {
-                for id in wall_attached_objects(world, [x as u8, (y - 1) as u8], level) {
-                    removed_set.insert(id);
-                }
+                demolished_tiles.insert([x as u8, (y - 1) as u8]);
             }
             any_change = true;
         } else {
@@ -869,20 +953,33 @@ pub fn plan_wall_drag(
                     ..empty
                 };
             }
-            // Mirror default fence pattern onto neighbor's facing side (`0x494390`..`0x494600`).
+            // Mirror default fence pattern onto neighbor's facing side (`0x494390`..`0x494600`),
+            // skipping diagonal neighbors whose `+10`/`+12` bytes store diagonal wallpaper.
             if new_pattern != 0 {
                 if seg.bit == WALL_WEST && x > 0 {
                     let mut west = ExpandedWall::get(&walls_buf, active, x - 1, y);
-                    west.patterns[2] = new_pattern;
-                    let _ = west.put(&mut walls_buf, active, x - 1, y);
+                    if (west.segments & (WALL_DESCENDING | WALL_ASCENDING)) == 0 {
+                        west.patterns[2] = new_pattern;
+                        let _ = west.put(&mut walls_buf, active, x - 1, y);
+                    }
                 } else if seg.bit == WALL_NORTH && y > 0 {
                     let mut north = ExpandedWall::get(&walls_buf, active, x, y - 1);
-                    north.patterns[3] = new_pattern;
-                    let _ = north.put(&mut walls_buf, active, x, y - 1);
+                    if (north.segments & (WALL_DESCENDING | WALL_ASCENDING)) == 0 {
+                        north.patterns[3] = new_pattern;
+                        let _ = north.put(&mut walls_buf, active, x, y - 1);
+                    }
                 }
             }
             net_cost += seg_price;
             any_change = true;
+        }
+    }
+
+    for tile in demolished_tiles {
+        for id in
+            detached_wall_objects_on_tile(world, &orig_walls.data, &walls_buf, active, tile, level)
+        {
+            removed_set.insert(id);
         }
     }
 
@@ -1058,13 +1155,8 @@ pub fn plan_floor_edit(
     let mut affordable = true;
 
     for (x, y, half) in targets {
-        if !mode.is_remove() {
-            if level == 1 && (!is_flat_tile(world, x, y) || is_pool_tile(world, x, y)) {
-                continue;
-            }
-            if level == 2 && !has_upper_support(world, x, y) {
-                continue;
-            }
+        if !mode.is_remove() && !tile_supports_build(world, x, y, level) {
+            continue;
         }
         let idx = cell_index(x, y);
         let cur_floor = read_floor(&floors_buf, x, y);
@@ -1261,6 +1353,19 @@ pub fn room_wallpaper_faces(world: &World, room_id: i16, level: u8) -> Vec<WallF
                         });
                     }
                 }
+            } else {
+                // Freestanding diagonal whose both sides belong to `room_id`
+                // has no split-half record in `rooms.halves`.
+                out.push(WallFace {
+                    tile: [tx, ty],
+                    bit,
+                    side: 0,
+                });
+                out.push(WallFace {
+                    tile: [tx, ty],
+                    bit,
+                    side: 1,
+                });
             }
         }
     }
@@ -1541,7 +1646,11 @@ impl Interpreter<'_> {
         facing: Option<i16>,
         mode: Option<i16>,
     ) -> Result<(), Fault> {
-        let Some(obj) = world.objects.get_mut(&cursor.id) else {
+        let Some(obj) = world
+            .objects
+            .get_mut(&cursor.id)
+            .filter(|o| o.guid == WALL_CURSOR_GUID)
+        else {
             return Ok(());
         };
         if let Some(m) = mode {
@@ -1579,7 +1688,11 @@ impl Interpreter<'_> {
         world: &mut World,
         cursor: &mut WallCursor,
     ) -> Result<(), Fault> {
-        if world.objects.contains_key(&cursor.id) {
+        if world
+            .objects
+            .get(&cursor.id)
+            .is_some_and(|o| o.guid == WALL_CURSOR_GUID)
+        {
             let _ = self.take_off(world, cursor.id, false);
             if let Some(obj) = world.objects.get(&cursor.id) {
                 cursor.position = obj.position;
@@ -1590,7 +1703,11 @@ impl Interpreter<'_> {
 
     /// Deletes `"Wall Cursor"` (`0x48a6e5`).
     pub fn build_cursor_close(&self, world: &mut World, cursor: &WallCursor) -> Result<(), Fault> {
-        if world.objects.contains_key(&cursor.id) {
+        if world
+            .objects
+            .get(&cursor.id)
+            .is_some_and(|o| o.guid == WALL_CURSOR_GUID)
+        {
             self.delete(world, cursor.id)?;
         }
         Ok(())
@@ -1630,6 +1747,20 @@ impl Interpreter<'_> {
         {
             return Ok(None);
         }
+        // Re-validate live buildability/support for every tile gaining a new
+        // owned wall segment (`WEST`, `NORTH`, `DESCENDING`, `ASCENDING`),
+        // rejecting stale plans whose support or terrain changed.
+        for &(idx, before, after) in &plan.wall_changes {
+            let added = (after[0] & !before[0])
+                & (WALL_WEST | WALL_NORTH | WALL_DESCENDING | WALL_ASCENDING);
+            if added != 0 {
+                let x = idx / FULL_SIZE;
+                let y = idx % FULL_SIZE;
+                if !tile_supports_build(world, x, y, plan.level) {
+                    return Ok(None);
+                }
+            }
+        }
         // Detach any wall-attached objects on demolished segments, refunding
         // their resale value cleanly (refuse if any is undeletable).
         let mut removed_objects = Vec::new();
@@ -1659,7 +1790,11 @@ impl Interpreter<'_> {
         )?;
         self.rebuild_architecture_rooms(world)?;
         if plan.net_cost != 0 {
-            let _ = spend(world, ARCHITECTURE_BUDGET, plan.net_cost);
+            spend(world, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
+                object: 0,
+                at: None,
+                trap,
+            })?;
         }
         Ok(Some(BuildHistory::Wall {
             level: plan.level,
@@ -1690,6 +1825,33 @@ impl Interpreter<'_> {
         {
             return Ok(None);
         }
+        // Re-validate live buildability/support for every tile gaining or
+        // changing to a non-empty floor (rejecting stale plans after support
+        // below was removed).
+        for &(idx, _before, after) in &plan.floor_changes {
+            if after != 0 {
+                let x = idx / FULL_SIZE;
+                let y = idx % FULL_SIZE;
+                if !tile_supports_build(world, x, y, plan.level) {
+                    return Ok(None);
+                }
+            }
+        }
+        for &(idx, before, after) in &plan.wall_changes {
+            let h0_after = u16::from_le_bytes([after[2], after[3]]);
+            let h1_after = u16::from_le_bytes([after[6], after[7]]);
+            let h0_before = u16::from_le_bytes([before[2], before[3]]);
+            let h1_before = u16::from_le_bytes([before[6], before[7]]);
+            let laying_half = (h0_after != h0_before && h0_after != 0)
+                || (h1_after != h1_before && h1_after != 0);
+            if laying_half {
+                let x = idx / FULL_SIZE;
+                let y = idx % FULL_SIZE;
+                if !tile_supports_build(world, x, y, plan.level) {
+                    return Ok(None);
+                }
+            }
+        }
         apply_cell_diffs(
             world,
             plan.level,
@@ -1697,8 +1859,15 @@ impl Interpreter<'_> {
             &plan.floor_changes,
             true,
         )?;
+        if plan.level == 2 {
+            self.rebuild_architecture_rooms(world)?;
+        }
         if plan.net_cost != 0 {
-            let _ = spend(world, ARCHITECTURE_BUDGET, plan.net_cost);
+            spend(world, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
+                object: 0,
+                at: None,
+                trap,
+            })?;
         }
         Ok(Some(BuildHistory::Floor {
             level: plan.level,
@@ -1724,7 +1893,11 @@ impl Interpreter<'_> {
         }
         apply_cell_diffs(world, plan.level, &plan.wall_changes, &[], true)?;
         if plan.net_cost != 0 {
-            let _ = spend(world, ARCHITECTURE_BUDGET, plan.net_cost);
+            spend(world, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
+                object: 0,
+                at: None,
+                trap,
+            })?;
         }
         Ok(Some(BuildHistory::Wallpaper {
             level: plan.level,
@@ -1764,7 +1937,11 @@ impl Interpreter<'_> {
                 apply_cell_diffs(world, *level, wall_changes, floor_changes, false)?;
                 self.rebuild_architecture_rooms(world)?;
                 if *net_cost != 0 {
-                    let _ = spend(world, ARCHITECTURE_BUDGET, -*net_cost);
+                    spend(world, ARCHITECTURE_BUDGET, -*net_cost).map_err(|trap| Fault {
+                        object: 0,
+                        at: None,
+                        trap,
+                    })?;
                 }
                 for purchase in removed_objects.iter_mut().rev() {
                     if purchase.kind == BuyActionKind::Sell
@@ -1786,8 +1963,15 @@ impl Interpreter<'_> {
                     return Ok(false);
                 }
                 apply_cell_diffs(world, *level, wall_changes, floor_changes, false)?;
+                if *level == 2 {
+                    self.rebuild_architecture_rooms(world)?;
+                }
                 if *net_cost != 0 {
-                    let _ = spend(world, ARCHITECTURE_BUDGET, -*net_cost);
+                    spend(world, ARCHITECTURE_BUDGET, -*net_cost).map_err(|trap| Fault {
+                        object: 0,
+                        at: None,
+                        trap,
+                    })?;
                 }
                 Ok(true)
             }
@@ -1801,7 +1985,11 @@ impl Interpreter<'_> {
                 }
                 apply_cell_diffs(world, *level, wall_changes, &[], false)?;
                 if *net_cost != 0 {
-                    let _ = spend(world, ARCHITECTURE_BUDGET, -*net_cost);
+                    spend(world, ARCHITECTURE_BUDGET, -*net_cost).map_err(|trap| Fault {
+                        object: 0,
+                        at: None,
+                        trap,
+                    })?;
                 }
                 Ok(true)
             }
@@ -1841,7 +2029,11 @@ impl Interpreter<'_> {
                 apply_cell_diffs(world, *level, wall_changes, floor_changes, true)?;
                 self.rebuild_architecture_rooms(world)?;
                 if *net_cost != 0 {
-                    let _ = spend(world, ARCHITECTURE_BUDGET, *net_cost);
+                    spend(world, ARCHITECTURE_BUDGET, *net_cost).map_err(|trap| Fault {
+                        object: 0,
+                        at: None,
+                        trap,
+                    })?;
                 }
                 Ok(true)
             }
@@ -1855,8 +2047,15 @@ impl Interpreter<'_> {
                     return Ok(false);
                 }
                 apply_cell_diffs(world, *level, wall_changes, floor_changes, true)?;
+                if *level == 2 {
+                    self.rebuild_architecture_rooms(world)?;
+                }
                 if *net_cost != 0 {
-                    let _ = spend(world, ARCHITECTURE_BUDGET, *net_cost);
+                    spend(world, ARCHITECTURE_BUDGET, *net_cost).map_err(|trap| Fault {
+                        object: 0,
+                        at: None,
+                        trap,
+                    })?;
                 }
                 Ok(true)
             }
@@ -1870,7 +2069,11 @@ impl Interpreter<'_> {
                 }
                 apply_cell_diffs(world, *level, wall_changes, &[], true)?;
                 if *net_cost != 0 {
-                    let _ = spend(world, ARCHITECTURE_BUDGET, *net_cost);
+                    spend(world, ARCHITECTURE_BUDGET, *net_cost).map_err(|trap| Fault {
+                        object: 0,
+                        at: None,
+                        trap,
+                    })?;
                 }
                 Ok(true)
             }

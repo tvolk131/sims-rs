@@ -2409,13 +2409,13 @@ impl Lot {
     }
 
     /// Whether the Build Mode `"Wall Cursor"` handle `cursor` is currently live
-    /// on this lot.
+    /// on this lot (matching both its monotonic token and its registered object ID).
     fn is_active_wall_cursor(&self, cursor: &crate::WallCursor) -> bool {
         cursor.token != 0
             && self
                 .active_wall_cursor
                 .as_ref()
-                .is_some_and(|a| a.token == cursor.token)
+                .is_some_and(|a| a.token == cursor.token && a.id == cursor.id)
     }
 
     /// Opens the Build Mode `"Wall Cursor"` (`0x00000439`, off-lot) with
@@ -2533,14 +2533,12 @@ impl Lot {
     }
 
     /// Commits a planned wall build or demolition to `self.world`, updating
-    /// rooms, Architecture funds, and the unified Undo/Redo stack.
+    /// rooms, Architecture funds, and the unified Undo/Redo stack. Refuses
+    /// while any Buy Mode cursor is active so a held/hidden existing object
+    /// cannot lose its snapback wall and an unpaid preview cannot be sold.
     pub fn build_commit_wall(&mut self, plan: &crate::WallPlan) -> Result<bool, OrderError> {
         self.ready()?;
-        if self.active_buy_cursor.as_ref().is_some_and(|a| {
-            plan.removed_objects
-                .iter()
-                .any(|id| a.owned_ids.contains(id))
-        }) {
+        if self.active_buy_cursor.is_some() {
             return Ok(false);
         }
         let sounds = RefCell::new(Vec::new());
@@ -2592,6 +2590,9 @@ impl Lot {
     /// funds and the unified Undo/Redo stack.
     pub fn build_commit_floor(&mut self, plan: &crate::FloorPlan) -> Result<bool, OrderError> {
         self.ready()?;
+        if self.active_buy_cursor.is_some() {
+            return Ok(false);
+        }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
@@ -2637,6 +2638,9 @@ impl Lot {
         plan: &crate::WallpaperPlan,
     ) -> Result<bool, OrderError> {
         self.ready()?;
+        if self.active_buy_cursor.is_some() {
+            return Ok(false);
+        }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
@@ -2697,10 +2701,10 @@ impl Lot {
         match kind {
             HistoryKind::Buy => self.buy_undo(),
             HistoryKind::Build => {
-                let Some(mut entry) = self.build_undo.pop() else {
+                if self.build_undo.is_empty() {
                     self.undo_order.pop();
                     return Ok(false);
-                };
+                }
                 let sounds = RefCell::new(Vec::new());
                 let interpreter = Interpreter {
                     sounds: Some(&sounds),
@@ -2720,6 +2724,7 @@ impl Lot {
                         None
                     };
                 let snapped_existing = after_snap.is_some();
+                let mut entry = self.build_undo.pop().expect("checked non-empty");
                 match interpreter.build_undo_entry(&mut world, &mut entry) {
                     Ok(true) => {
                         let mut affected = BTreeSet::new();
@@ -2779,10 +2784,10 @@ impl Lot {
         match kind {
             HistoryKind::Buy => self.buy_redo(),
             HistoryKind::Build => {
-                let Some(mut entry) = self.build_redo.pop() else {
+                if self.build_redo.is_empty() {
                     self.redo_order.pop();
                     return Ok(false);
-                };
+                }
                 let sounds = RefCell::new(Vec::new());
                 let interpreter = Interpreter {
                     sounds: Some(&sounds),
@@ -2802,6 +2807,7 @@ impl Lot {
                         None
                     };
                 let snapped_existing = after_snap.is_some();
+                let mut entry = self.build_redo.pop().expect("checked non-empty");
                 match interpreter.build_redo_entry(&mut world, &mut entry) {
                     Ok(true) => {
                         let mut affected = BTreeSet::new();
