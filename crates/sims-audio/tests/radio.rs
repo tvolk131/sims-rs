@@ -212,6 +212,46 @@ fn spatial_attenuation_pan_and_volume_steps_for_stereo_vs_tv() {
 }
 
 #[test]
+fn unreadable_track_preserves_non_repeating_shuffle_and_crossfade_respects_muted_group() {
+    // 1. Unreadable track in [missing, B, C] must not cause B, C, C.
+    let mut catalog = RadioCatalog::empty();
+    catalog.insert(
+        BuiltinStation::Rock,
+        vec!["missing.wav".into(), "b.wav".into(), "c.wav".into()],
+    );
+    catalog.insert(BuiltinStation::TvAction, vec!["tv.wav".into()]);
+    let mut files = BTreeMap::new();
+    files.insert("b.wav".into(), make_wav(RATE, 2, 120, 5_000));
+    files.insert("c.wav".into(), make_wav(RATE, 2, 120, 6_000));
+    files.insert("tv.wav".into(), make_wav(RATE, 2, 2000, 12_000));
+
+    let mut player = RadioPlayer::new(catalog, files, 0);
+    player.set_crossfade_ms(0);
+    assert!(player.tune(1, BuiltinStation::Rock, SpatialAttenuation::FULL));
+    let mut prev = player.emitter_track(1).unwrap().to_owned();
+    for _ in 0..8 {
+        let _ = player.render_stereo(125);
+        let cur = player.emitter_track(1).unwrap().to_owned();
+        assert_ne!(cur, prev, "track repeated immediately after missing entry");
+        prev = cur;
+    }
+
+    // 2. Switching from muted TV (FX=0) to Rock (Music=10) with crossfade must
+    //    not leak the muted TV deck into the fade.
+    player.stop_emitter(1);
+    player.set_crossfade_ms(100);
+    player.set_fx_volume_step(0);
+    player.set_music_volume_step(0);
+    assert!(player.tune(2, BuiltinStation::TvAction, SpatialAttenuation::FULL));
+    player.set_music_volume_step(10);
+    // First sample of crossfade has incoming deck starting at gain 0, so any
+    // non-zero sample would mean the muted TV leaked through.
+    assert!(player.tune(2, BuiltinStation::Rock, SpatialAttenuation::FULL));
+    let first = player.render_stereo(1);
+    assert_eq!(first, vec![0, 0]);
+}
+
+#[test]
 fn complete_collection_live_install_discovers_and_streams_radio_and_tv() {
     let Some(root) = install() else {
         return;

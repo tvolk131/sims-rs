@@ -239,6 +239,10 @@ fn overlay_layout_is_strictly_non_overlapping_across_viewports() {
             !intersects(toast, resync),
             "toast {toast:?} overlapped resync {resync:?} at {size:?}"
         );
+        assert!(
+            resync.height >= 48,
+            "resync banner must remain drawable at {size:?}: {resync:?}"
+        );
 
         let mut frame = Frame::new(size[0], size[1], [0, 0, 0]);
         CoopHudOverlay::draw(&mut frame, &snapshot, &art);
@@ -247,6 +251,30 @@ fn overlay_layout_is_strictly_non_overlapping_across_viewports() {
             "overlay drew nothing at {size:?}"
         );
     }
+
+    // Compact 320x240 Host lobby must not overlap player_list with footer button,
+    // and conflicting session commands must be rejected.
+    let mut dialog = CoopLobbyDialog::new();
+    dialog.open(LobbyTab::Host);
+    let hosting = CoopSnapshot {
+        role: CoopRole::Host,
+        connection: ConnectionState::Hosting {
+            invite_ticket: "iroh-ticket".into(),
+        },
+        players: sample_players(),
+        ..CoopSnapshot::default()
+    };
+    let compact = dialog.layout([320, 240], &hosting);
+    if let Some(list) = compact.player_list {
+        assert!(
+            !intersects(list, compact.primary_btn),
+            "player list {list:?} overlapped footer {btn:?} at 320x240",
+            btn = compact.primary_btn
+        );
+    }
+    dialog.set_tab(LobbyTab::Join);
+    dialog.paste_text("other-ticket");
+    assert_eq!(dialog.submit(&hosting), None);
 }
 
 #[test]

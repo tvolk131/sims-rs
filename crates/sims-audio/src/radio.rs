@@ -346,12 +346,13 @@ impl RadioCatalog {
                 let Some((folder, _)) = rest.split_once('\\') else {
                     continue;
                 };
-                if folder.is_empty() {
+                let trimmed = folder.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
-                let station = match BuiltinStation::from_music_folder(folder) {
+                let station = match BuiltinStation::from_music_folder(trimmed) {
                     Some(b) => StationId::Builtin(b),
-                    None => StationId::Custom(folder.to_owned()),
+                    None => StationId::custom(trimmed),
                 };
                 tracks.entry(station).or_default().push(entry.path.clone());
                 continue;
@@ -544,7 +545,7 @@ struct EmitterChannel {
     station: StationId,
     spatial: SpatialAttenuation,
     current: Option<StreamDeck>,
-    fading_out: Option<StreamDeck>,
+    fading_out: Option<(StreamDeck, StationKind)>,
 }
 
 /// Streaming multi-emitter player for in-lot stereo radio stations and TV
@@ -710,10 +711,10 @@ impl<S: TrackSource> RadioPlayer<S> {
             }
         }
 
-        let prev_deck = self
-            .emitters
-            .get_mut(&emitter_id)
-            .and_then(|ch| ch.current.take());
+        let prev_deck = self.emitters.get_mut(&emitter_id).and_then(|ch| {
+            let kind = ch.station.kind();
+            ch.current.take().map(|deck| (deck, kind))
+        });
         let fade_in = cf > 0 && prev_deck.is_some();
 
         let Some(new_deck) = self.open_next_track(&station, fade_in) else {
@@ -722,10 +723,10 @@ impl<S: TrackSource> RadioPlayer<S> {
             return false;
         };
 
-        let fading_out = prev_deck.and_then(|mut old| {
+        let fading_out = prev_deck.and_then(|(mut old, kind)| {
             if cf > 0 {
                 old.start_fade(0, cf, true);
-                Some(old)
+                Some((old, kind))
             } else {
                 None
             }
@@ -782,11 +783,12 @@ impl<S: TrackSource> RadioPlayer<S> {
             return false;
         };
         if let Some(ch) = self.emitters.get_mut(&emitter_id) {
+            let kind = ch.station.kind();
             ch.current = Some(new_deck);
             ch.fading_out = prev.and_then(|mut old| {
                 if cf > 0 {
                     old.start_fade(0, cf, true);
-                    Some(old)
+                    Some((old, kind))
                 } else {
                     None
                 }
@@ -825,21 +827,19 @@ impl<S: TrackSource> RadioPlayer<S> {
         let emitter_ids: Vec<u32> = self.emitters.keys().copied().collect();
 
         for pair in dst.as_chunks_mut::<2>().0 {
-            let mut sum_l = 0i64;
-            let mut sum_r = 0i64;
+            let mut sum_l = i64::from(pair[0]);
+            let mut sum_r = i64::from(pair[1]);
 
             for &id in &emitter_ids {
                 let mut advance_station: Option<StationId> = None;
-                let (mut ch_l, mut ch_r) = (0i32, 0i32);
+                let mut cur_frame = None;
+                let mut fade_frame = None;
                 let (station_kind, spatial) = {
                     let Some(ch) = self.emitters.get_mut(&id) else {
                         continue;
                     };
                     if let Some(deck) = ch.current.as_mut() {
-                        if let Some([l, r]) = deck.next_frame() {
-                            ch_l = ch_l.saturating_add(l);
-                            ch_r = ch_r.saturating_add(r);
-                        }
+                        cur_frame = deck.next_frame();
                         if deck.is_finished() {
                             let was_stopping = deck.stop_at_zero;
                             ch.current = None;
@@ -848,10 +848,9 @@ impl<S: TrackSource> RadioPlayer<S> {
                             }
                         }
                     }
-                    if let Some(deck) = ch.fading_out.as_mut() {
-                        if let Some([l, r]) = deck.next_frame() {
-                            ch_l = ch_l.saturating_add(l);
-                            ch_r = ch_r.saturating_add(r);
+                    if let Some((deck, kind)) = ch.fading_out.as_mut() {
+                        if let Some(frame) = deck.next_frame() {
+                            fade_frame = Some((frame, *kind));
                         }
                         if deck.is_finished() {
                             ch.fading_out = None;
@@ -867,23 +866,39 @@ impl<S: TrackSource> RadioPlayer<S> {
                     }
                 }
 
-                let group_vol = match station_kind {
-                    StationKind::Stereo => self.music_volume,
-                    StationKind::Tv => self.fx_volume,
-                };
-                let eff_vol = (i64::from(spatial.volume) * i64::from(group_vol)) / 1024;
-                if eff_vol > 0 && self.master_volume > 0 {
-                    let att = levels::attenuation(eff_vol, i64::from(self.master_volume));
-                    let [gl, gr] = levels::gains(att, levels::pan(spatial.pan));
-                    sum_l += (i64::from(ch_l) * i64::from(gl)) >> 16;
-                    sum_r += (i64::from(ch_r) * i64::from(gr)) >> 16;
+                if self.master_volume > 0 && spatial.volume > 0 {
+                    let pan_db = levels::pan(spatial.pan);
+                    if let Some([l, r]) = cur_frame {
+                        let group_vol = match station_kind {
+                            StationKind::Stereo => self.music_volume,
+                            StationKind::Tv => self.fx_volume,
+                        };
+                        let eff_vol = (i64::from(spatial.volume) * i64::from(group_vol)) / 1024;
+                        if eff_vol > 0 {
+                            let att = levels::attenuation(eff_vol, i64::from(self.master_volume));
+                            let [gl, gr] = levels::gains(att, pan_db);
+                            sum_l += (i64::from(l) * i64::from(gl)) >> 16;
+                            sum_r += (i64::from(r) * i64::from(gr)) >> 16;
+                        }
+                    }
+                    if let Some(([l, r], fade_kind)) = fade_frame {
+                        let group_vol = match fade_kind {
+                            StationKind::Stereo => self.music_volume,
+                            StationKind::Tv => self.fx_volume,
+                        };
+                        let eff_vol = (i64::from(spatial.volume) * i64::from(group_vol)) / 1024;
+                        if eff_vol > 0 {
+                            let att = levels::attenuation(eff_vol, i64::from(self.master_volume));
+                            let [gl, gr] = levels::gains(att, pan_db);
+                            sum_l += (i64::from(l) * i64::from(gl)) >> 16;
+                            sum_r += (i64::from(r) * i64::from(gr)) >> 16;
+                        }
+                    }
                 }
             }
 
-            let sl = sum_l.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
-            let sr = sum_r.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
-            pair[0] = pair[0].saturating_add(sl);
-            pair[1] = pair[1].saturating_add(sr);
+            pair[0] = sum_l.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
+            pair[1] = sum_r.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
         }
 
         self.emitters
@@ -905,7 +920,7 @@ impl<S: TrackSource> RadioPlayer<S> {
         let mut unique_tried = 0usize;
         while unique_tried < count {
             let candidate = self.next_playlist_index(station, count);
-            let idx = if !tried[candidate] {
+            let idx = if !tried[candidate] && Some(candidate) != prev_played {
                 candidate
             } else if let Some(other) = (0..count).find(|&i| !tried[i] && Some(i) != prev_played) {
                 other
@@ -930,9 +945,10 @@ impl<S: TrackSource> RadioPlayer<S> {
                             deck.start_fade(MAX_VOLUME, cf, false);
                         }
                     }
-                    if let Some(state) = self.playlists.get_mut(station) {
-                        state.last_played = Some(idx);
-                    }
+                    self.playlists
+                        .entry(station.clone())
+                        .or_default()
+                        .last_played = Some(idx);
                     return Some(deck);
                 }
                 Err(err) => {
@@ -962,8 +978,6 @@ impl<S: TrackSource> RadioPlayer<S> {
             }
             state.queue = order;
         }
-        let next = state.queue.pop().unwrap_or(0);
-        state.last_played = Some(next);
-        next
+        state.queue.pop().unwrap_or(0)
     }
 }

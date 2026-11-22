@@ -479,28 +479,39 @@ impl CoopLobbyDialog {
         self.blink_since = None;
     }
 
+    fn can_start_hosting(snapshot: &CoopSnapshot) -> bool {
+        !matches!(
+            snapshot.connection,
+            ConnectionState::Hosting { .. }
+                | ConnectionState::Connecting
+                | ConnectionState::Connected
+        )
+    }
+
+    fn can_join_session(&self, snapshot: &CoopSnapshot) -> bool {
+        !self.ticket_input.trim().is_empty()
+            && !matches!(
+                snapshot.connection,
+                ConnectionState::Hosting { .. }
+                    | ConnectionState::Connecting
+                    | ConnectionState::Connected
+            )
+    }
+
     /// Handles `Enter` key submission on the active tab.
     pub fn submit(&mut self, snapshot: &CoopSnapshot) -> Option<CoopCommand> {
         if !self.open {
             return None;
         }
         match self.tab {
-            LobbyTab::Host => match &snapshot.connection {
-                ConnectionState::Hosting { .. } => None,
-                _ => Some(CoopCommand::StartHosting),
-            },
-            LobbyTab::Join => {
-                if matches!(snapshot.connection, ConnectionState::Connecting) {
-                    return None;
-                }
-                let trimmed = self.ticket_input.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                Some(CoopCommand::JoinSession {
-                    ticket: trimmed.to_owned(),
-                })
+            LobbyTab::Host => {
+                Self::can_start_hosting(snapshot).then_some(CoopCommand::StartHosting)
             }
+            LobbyTab::Join => self
+                .can_join_session(snapshot)
+                .then(|| CoopCommand::JoinSession {
+                    ticket: self.ticket_input.trim().to_owned(),
+                }),
         }
     }
 
@@ -578,24 +589,28 @@ impl CoopLobbyDialog {
             LobbyTab::Host => {
                 let mut cur_y = content.y;
                 if matches!(snapshot.connection, ConnectionState::Hosting { .. }) {
-                    // Invite ticket row: read-only box + Copy button.
-                    let label_h = 16;
+                    // Compact spacing on short viewports (e.g. 320x240) so the
+                    // player list fits cleanly above the footer action button.
+                    let compact = content.height < 130;
+                    let label_h = if compact { 12 } else { 16 };
+                    let row_h = if compact { 22 } else { 28 };
+                    let row_gap = if compact { 4 } else { 8 };
+                    let toggle_h = if compact { 18 } else { 22 };
+
                     cur_y += label_h;
-                    let row_h = 28;
                     let copy_w = 88.min((inner_w / 3).max(64));
                     let box_w = (inner_w - copy_w - gap).max(60);
                     ticket_box = Some(Rect::new(inner_x, cur_y, box_w, row_h));
                     copy_btn = Some(Rect::new(inner_x + box_w + gap, cur_y, copy_w, row_h));
-                    cur_y += row_h + 8;
+                    cur_y += row_h + row_gap;
 
-                    // Host-only time control checkbox row.
-                    let toggle_h = 22;
                     time_lock_toggle = Some(Rect::new(inner_x, cur_y, inner_w, toggle_h));
-                    cur_y += toggle_h + 8;
+                    cur_y += toggle_h + row_gap;
 
-                    // Player list fills remaining content area.
-                    let list_h = (content.y + content.height - cur_y).max(36);
-                    player_list = Some(Rect::new(inner_x, cur_y, inner_w, list_h));
+                    let list_h = (content.y + content.height - cur_y).max(0);
+                    if list_h > 0 {
+                        player_list = Some(Rect::new(inner_x, cur_y, inner_w, list_h));
+                    }
                 } else {
                     // Not hosting yet: info/status box explaining hosting.
                     status_box = Some(content);
@@ -727,20 +742,14 @@ impl CoopLobbyDialog {
             LobbyHit::PrimaryButton => match self.tab {
                 LobbyTab::Host => match &snapshot.connection {
                     ConnectionState::Hosting { .. } => Some(CoopCommand::Disconnect),
-                    _ => Some(CoopCommand::StartHosting),
+                    _ if Self::can_start_hosting(snapshot) => Some(CoopCommand::StartHosting),
+                    _ => None,
                 },
                 LobbyTab::Join => {
-                    if matches!(snapshot.connection, ConnectionState::Connecting) {
-                        return None;
-                    }
-                    let trimmed = self.ticket_input.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(CoopCommand::JoinSession {
-                            ticket: trimmed.to_owned(),
+                    self.can_join_session(snapshot)
+                        .then(|| CoopCommand::JoinSession {
+                            ticket: self.ticket_input.trim().to_owned(),
                         })
-                    }
                 }
             },
             LobbyHit::SecondaryButton => {
@@ -818,7 +827,7 @@ impl CoopLobbyDialog {
             LobbyTab::Host => {
                 let (label, enabled) = match &snapshot.connection {
                     ConnectionState::Hosting { .. } => ("Stop Hosting", true),
-                    _ => ("Start Hosting", true),
+                    _ => ("Start Hosting", Self::can_start_hosting(snapshot)),
                 };
                 draw_button(
                     frame,
@@ -829,8 +838,7 @@ impl CoopLobbyDialog {
                 );
             }
             LobbyTab::Join => {
-                let can_connect = !self.ticket_input.trim().is_empty()
-                    && !matches!(snapshot.connection, ConnectionState::Connecting);
+                let can_connect = self.can_join_session(snapshot);
                 draw_button(
                     frame,
                     art,
@@ -1174,19 +1182,43 @@ impl CoopHudOverlay {
         let margin = 10;
         let gap = 8;
 
+        let toast_h = (lh + 14).max(28);
+        let banner_h = (lh * 2 + 28).max(56);
+        let has_toast = snapshot
+            .time_toast
+            .as_ref()
+            .is_some_and(|t| t.remaining_ms > 0);
+        let has_resync = snapshot.resync.is_some();
+
         // 1. Top-right connected players & pause reasons panel.
         let status_panel = if !snapshot.players.is_empty()
             || !snapshot.pause_reasons.is_empty()
             || snapshot.role != CoopRole::Offline
         {
             let panel_w = 232.min((fw - margin * 2).max(140));
+            let px = (fw - margin - panel_w).max(margin);
+            let toast_stacks_below = has_toast && (px - margin - gap) < 160;
+            let banner_w = 320.min((fw - margin * 2).max(160));
+            let bx = ((fw - banner_w) / 2).max(margin);
+            let banner_overlaps_x = has_resync && (bx + banner_w > px && bx < px + panel_w);
+
+            // Reserve vertical room for any stacked toast and resync banner so
+            // the resync banner always remains visible even at 320x240.
+            let mut reserved_below = 0;
+            if toast_stacks_below {
+                reserved_below += toast_h + gap;
+            }
+            if banner_overlaps_x {
+                reserved_below += banner_h + gap;
+            }
+            let max_panel_h = (fh - margin * 2 - reserved_below).max(36);
+
             let header_rows = 1;
             let player_rows = snapshot.players.len().min(6) as i32;
             let pause_rows = snapshot.pause_reasons.len().min(3) as i32;
             let extra_gap = if pause_rows > 0 { 6 } else { 0 };
             let panel_h = (16 + (header_rows + player_rows + pause_rows) * (lh + 2) + extra_gap)
-                .min((fh - margin * 2).max(36));
-            let px = (fw - margin - panel_w).max(margin);
+                .min(max_panel_h);
             Some(Rect::new(px, margin, panel_w, panel_h))
         } else {
             None
@@ -1200,7 +1232,6 @@ impl CoopHudOverlay {
             .map(|toast| {
                 let label = toast.label();
                 let text_w = font.map_or(label.len() as i32 * 7, |f| f.width(&label));
-                let toast_h = (lh + 14).max(28);
                 let max_center_w = if let Some(sp) = status_panel {
                     // Available width centered left of the top-right status panel.
                     (sp.x - margin - gap).max(0)
@@ -1222,7 +1253,6 @@ impl CoopHudOverlay {
         // 3. Drift-resyncing progress banner, stacked below any overlapping top element.
         let resync_banner = snapshot.resync.as_ref().map(|_| {
             let banner_w = 320.min((fw - margin * 2).max(160));
-            let banner_h = (lh * 2 + 28).max(56);
             let bx = ((fw - banner_w) / 2).max(margin);
             let mut by = margin;
             if let Some(toast) = time_toast {
@@ -1231,11 +1261,9 @@ impl CoopHudOverlay {
             if let Some(sp) = status_panel {
                 let candidate = Rect::new(bx, by, banner_w, banner_h);
                 if rects_intersect(candidate, sp) {
-                    by = sp.y + sp.height + gap;
+                    by = by.max(sp.y + sp.height + gap);
                 }
             }
-            // Never clamp upward into `time_toast` or `status_panel`; shrink
-            // height if the viewport is extremely short.
             let max_h = (fh - by - margin).max(0);
             Rect::new(bx, by, banner_w, banner_h.min(max_h))
         });
