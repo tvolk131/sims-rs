@@ -1171,8 +1171,8 @@ fn purge_orphaned_person(
 fn strip_deleted_base_instances(
     world: &mut World,
     objects: &mut sims_formats::saved_objects::Objects,
-    catalog: &Catalog,
     deleted_characters: &BTreeSet<u32>,
+    deleted_at_epoch: &BTreeMap<u32, u64>,
 ) -> (BTreeSet<u16>, BTreeSet<u16>) {
     let deleted_ids: Vec<u16> = objects
         .order
@@ -1180,7 +1180,9 @@ fn strip_deleted_base_instances(
         .copied()
         .filter(|id| {
             objects.instances.get(id).is_some_and(|inst| {
-                deleted_characters.contains(&inst.guid) && catalog.object(inst.guid).is_none()
+                deleted_characters.contains(&inst.guid)
+                    || deleted_at_epoch.get(&inst.guid).is_some_and(|&e| e > 0)
+                    || (inst.person.is_some() && world.neighbors.first_of(inst.guid).is_none())
             })
         })
         .collect();
@@ -1783,7 +1785,10 @@ fn boot_from_saved_lot(
 
         // Purge any live person whose neighborhood record was deleted while
         // this lot was saved (for example a visitor whose home lot was
-        // bulldozed via `0x426fcd`) before re-attaching remaining persons.
+        // bulldozed via `0x426fcd`, even if a replacement character later
+        // reused the same GUID at a newer `deletion_epoch`) before re-attaching
+        // remaining persons.
+        let lot_epoch = saved.deletion_epoch;
         let orphaned_people: Vec<u16> = world
             .people
             .iter()
@@ -1792,7 +1797,11 @@ fn boot_from_saved_lot(
                 world.objects.get(&person_id).is_some_and(|o| {
                     o.person.is_some()
                         && (stored.deleted_characters.contains(&o.guid)
-                            || world.neighbors.first_of(o.guid).is_none())
+                            || world.neighbors.first_of(o.guid).is_none()
+                            || stored
+                                .deleted_at_epoch
+                                .get(&o.guid)
+                                .is_some_and(|&del_epoch| lot_epoch < del_epoch))
                 })
             })
             .collect();
@@ -2121,8 +2130,8 @@ fn boot_from_base_house(
         let (stripped_people_to_reset, stripped_objects_to_reset) = strip_deleted_base_instances(
             &mut world,
             &mut file.objects,
-            &catalog,
             &stored.deleted_characters,
+            &stored.deleted_at_epoch,
         );
         let people = People::load(
             &install,
@@ -2482,6 +2491,7 @@ fn save_and_leave_lot_inner(
         Some(family_flags),
         tuning.friendship_threshold,
     );
+    saved.deletion_epoch = stored.deletion_epoch;
     let lot_bytes = saved.encode();
     let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
         neighborhood_id,
@@ -2851,11 +2861,16 @@ fn evict_or_bulldoze(
             .map(|n| (n.id, n.guid))
             .collect();
         let mut deleted_guids: BTreeSet<u32> = BTreeSet::new();
+        if !tombstones.is_empty() {
+            stored.deletion_epoch = stored.deletion_epoch.saturating_add(1);
+        }
+        let current_epoch = stored.deletion_epoch;
         for (id, guid) in tombstones {
             lot.world.neighbors.remove_record(id);
             lot.world.characters.made.remove(&guid);
             stored.made_characters.made.remove(&guid);
             stored.deleted_characters.insert(guid);
+            stored.deleted_at_epoch.insert(guid, current_epoch);
             deleted_guids.insert(guid);
             deleted_tombstones += 1;
         }
@@ -2907,9 +2922,10 @@ fn evict_or_bulldoze(
     // Write back updated NBRS / NGBH / TATT / FAMI, delete removed tombstone
     // character files, and save the cleared lot atomically into REDB.
     stored.write_back_world(&lot.world, house, 0, 0, None, tuning.friendship_threshold);
-    let saved = lot
+    let mut saved = lot
         .save()
         .map_err(|e| LifecycleError::Lot(format!("saving cleared lot {house}: {e}")))?;
+    saved.deletion_epoch = stored.deletion_epoch;
     let lot_bytes = saved.encode();
     match store.save_lot_and_neighborhood_checked(
         neighborhood_id,
@@ -4358,5 +4374,208 @@ mod tests {
             assert_eq!(after.families[&fam_id].architecture_value, 0);
             assert_eq!(after.families[&fam_id].budget, expected_net_worth);
         }
+    }
+
+    #[test]
+    fn reusing_deleted_guid_purges_stale_visitor_on_older_saved_lot() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let db = TempDb::new("reuse-guid-purges-stale-visitor");
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let no_frames = Frames::parse("none").unwrap();
+
+        // 1. Create runtime-made character `0x61520029` homed on House 5
+        //    (non-member) and save House 5.
+        let guid = 0x6152_0029u32;
+        let mut house5 = enter_lot(&root, &store, "UserData", 5, &[3], no_frames.clone()).unwrap();
+        let template_guid = house5.world.objects[&house5.world.people[0]].guid;
+        house5.world.characters.made.insert(
+            guid,
+            sims_sim::characters::Character {
+                template: template_guid,
+                file: 901,
+                strings: BTreeMap::new(),
+            },
+        );
+        let old_nbr_id = (house5.world.neighbors.slots.len() as i16) + 1;
+        let mut data = vec![0i16; sims_sim::neighbors::PERSON_WORDS];
+        data[PERSON_HOME] = 5;
+        house5
+            .world
+            .neighbors
+            .slots
+            .push(Some(sims_sim::neighbors::Neighbor {
+                id: old_nbr_id,
+                guid,
+                revision: 9,
+                data,
+                relationships: Vec::new(),
+                friends: 0,
+                stale: false,
+            }));
+        save_and_leave_lot(&root, &store, "UserData", &mut house5).unwrap();
+
+        // 2. Save House 7 containing a live visitor instance of `0x61520029`
+        //    BEFORE House 5 is bulldozed.
+        let mut house7 = enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
+        let template_id = house7.world.people[0];
+        let stale_visitor_id = house7.world.objects.keys().copied().max().unwrap_or(100) + 1;
+        let next_type = house7.world.types.keys().copied().max().unwrap_or(0) + 1;
+        house7.world.types.insert(next_type, guid);
+        let mut visitor = house7.world.objects[&template_id].clone();
+        visitor.id = stale_visitor_id;
+        visitor.guid = guid;
+        visitor.selected = false;
+        if let Some(person) = visitor.person.as_mut() {
+            person.data[31] = old_nbr_id;
+            person.data[PERSON_HOME] = 5;
+            person.data[61] = 0;
+        }
+        house7.world.objects.insert(stale_visitor_id, visitor);
+        house7.world.order.push(stale_visitor_id);
+        house7.world.people.push(stale_visitor_id);
+        save_and_leave_lot(&root, &store, "UserData", &mut house7).unwrap();
+
+        // 3. Bulldoze House 5: deletes `0x61520029` (advancing `deletion_epoch`).
+        let dozed = bulldoze(&root, &store, "UserData", 5).unwrap();
+        assert!(dozed.deleted_tombstones >= 1);
+
+        // 4. Create a replacement character reusing `0x61520029` in family 2 on
+        //    House 4 and save House 4.
+        move_in(&root, &store, "UserData", 2, 4).unwrap();
+        let mut house4 = enter_lot(&root, &store, "UserData", 4, &[3], no_frames.clone()).unwrap();
+        house4.world.characters.made.insert(
+            guid,
+            sims_sim::characters::Character {
+                template: template_guid,
+                file: 902,
+                strings: BTreeMap::new(),
+            },
+        );
+        let new_nbr_id = (house4.world.neighbors.slots.len() as i16) + 1;
+        let mut new_data = vec![0i16; sims_sim::neighbors::PERSON_WORDS];
+        new_data[PERSON_HOME] = 4;
+        new_data[61] = 2;
+        house4
+            .world
+            .neighbors
+            .slots
+            .push(Some(sims_sim::neighbors::Neighbor {
+                id: new_nbr_id,
+                guid,
+                revision: 9,
+                data: new_data,
+                relationships: Vec::new(),
+                friends: 0,
+                stale: false,
+            }));
+        save_and_leave_lot(&root, &store, "UserData", &mut house4).unwrap();
+
+        // 5. Reopening older saved House 7 MUST purge the stale pre-bulldoze
+        //    visitor `stale_visitor_id` instead of reviving it attached to the
+        //    replacement's NBRS record!
+        let mut house7_after =
+            enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
+        assert!(
+            !house7_after.world.objects.contains_key(&stale_visitor_id),
+            "stale pre-bulldoze visitor must be purged when reopening House 7 after GUID reuse"
+        );
+        assert!(
+            house7_after.world.objects.values().all(|o| o.guid != guid),
+            "reused GUID must not revive the deleted visitor on older saved House 7"
+        );
+        house7_after.step().unwrap();
+        // And House 4 (saved at the newer epoch) still opens cleanly!
+        let mut house4_after = enter_lot(&root, &store, "UserData", 4, &[3], no_frames).unwrap();
+        assert!(house4_after.world.neighbors.first_of(guid).is_some());
+        house4_after.step().unwrap();
+    }
+
+    #[test]
+    fn bulldozing_lot_strips_far_archived_deleted_character_from_imported_base_house() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let db = TempDb::new("bulldoze-far-archived-base-instance");
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let no_frames = Frames::parse("none").unwrap();
+
+        // Replace Bob Newbie's loose `User00000.iff` with a FAR archive
+        // containing `User00000.iff` (so bulldozing House 5 cannot delete the
+        // FAR and Bob's OBJD stays in `catalog`).
+        let bob_guid = 0x32AA_2056u32;
+        let bob_bytes = std::fs::read(root.join("UserData/Characters/User00000.iff")).unwrap();
+        let member_name = b"User00000.iff";
+        let data_offset = 16u32;
+        let manifest_offset = data_offset + bob_bytes.len() as u32;
+        let mut far = Vec::new();
+        far.extend_from_slice(b"FAR!byAZ");
+        far.extend_from_slice(&1u32.to_le_bytes());
+        far.extend_from_slice(&manifest_offset.to_le_bytes());
+        far.extend_from_slice(&bob_bytes);
+        far.extend_from_slice(&1u32.to_le_bytes());
+        far.extend_from_slice(&(bob_bytes.len() as u32).to_le_bytes());
+        far.extend_from_slice(&(bob_bytes.len() as u32).to_le_bytes());
+        far.extend_from_slice(&data_offset.to_le_bytes());
+        far.extend_from_slice(&(member_name.len() as u32).to_le_bytes());
+        far.extend_from_slice(member_name);
+
+        // Save the FAR into REDB and remove the loose `User00000.iff` key.
+        let mut nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        nh.families
+            .get_mut(&1)
+            .unwrap()
+            .members
+            .retain(|&g| g != bob_guid);
+        for nbr in nh.neighbors.iter_mut().flatten() {
+            if nbr.guid == bob_guid {
+                nbr.person_data[PERSON_HOME] = 5;
+            }
+        }
+        store
+            .save_character_file("UserData", "bob.far", &far)
+            .unwrap();
+        // Remove loose `User00000.iff` via `save_lot_and_neighborhood_checked`
+        // (saving House 5? No, remove only the character file via neighborhood
+        // store update — wait: just overwrite `User00000.iff`? No, removing it
+        // leaves ONLY `bob.far`!).
+        let cur = store.load_neighborhood("UserData").unwrap().unwrap();
+        let house9_bytes = store.load_base_house("UserData", 9).unwrap().unwrap();
+        nh.instance_id = cur.instance_id;
+        nh.revision = cur.revision;
+        let _ = store
+            .save_lot_and_neighborhood_checked(
+                "UserData",
+                9,
+                Some((cur.instance_id, cur.revision)),
+                &house9_bytes,
+                &nh,
+                &["User00000.iff".to_owned()],
+            )
+            .unwrap()
+            .unwrap();
+
+        // Bulldoze House 5: deletes Bob from NBRS and marks him in
+        // `deleted_characters`, while `bob.far` remains in REDB & `catalog`.
+        let _ = bulldoze(&root, &store, "UserData", 5).unwrap();
+        assert!(
+            store
+                .load_character_files("UserData")
+                .unwrap()
+                .contains_key("bob.far")
+        );
+
+        // Untouched base `House07.iff` (still containing Bob object 105) must
+        // strip Bob cleanly even though his OBJD is still in `catalog` via FAR!
+        let mut after = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
+        assert!(after.world.objects.values().all(|o| o.guid != bob_guid));
+        after.step().unwrap();
     }
 }

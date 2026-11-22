@@ -129,6 +129,8 @@ fn move_in_unit_validation_and_accounting() {
         lot_rows: vec![4, 5, 8, 21],
         made_characters: Characters::default(),
         deleted_characters: BTreeSet::new(),
+        deletion_epoch: 0,
+        deleted_at_epoch: BTreeMap::new(),
         instance_id: 1,
         revision: 0,
     };
@@ -671,6 +673,8 @@ fn concurrent_move_in_only_allows_one_winner() {
         lot_rows: vec![4],
         made_characters: Characters::default(),
         deleted_characters: BTreeSet::new(),
+        deletion_epoch: 0,
+        deleted_at_epoch: BTreeMap::new(),
         instance_id: 77,
         revision: 0,
     };

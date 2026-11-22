@@ -84,6 +84,8 @@ fn sample_neighborhood(name: &str) -> StoredNeighborhood {
         lot_rows: vec![4, 5, 21],
         made_characters: Characters::default(),
         deleted_characters: BTreeSet::new(),
+        deletion_epoch: 0,
+        deleted_at_epoch: BTreeMap::new(),
         instance_id: 1,
         revision: 0,
     }

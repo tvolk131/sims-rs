@@ -212,6 +212,17 @@ pub struct StoredNeighborhood {
     /// are never re-registered into `NBRS` on subsequent lot loads.
     #[serde(default)]
     pub deleted_characters: BTreeSet<u32>,
+    /// Monotonic counter incremented whenever Bulldoze deletes tombstones,
+    /// paired with `deleted_at_epoch` and each saved lot's `deletion_epoch` so
+    /// reusing a deleted character GUID later never revives that GUID's stale
+    /// instance on an older saved lot or imported base house.
+    #[serde(default)]
+    pub deletion_epoch: u64,
+    /// Latest `deletion_epoch` at which each character GUID was deleted via
+    /// Bulldoze (retained even if a replacement character later reuses the same
+    /// GUID).
+    #[serde(default)]
+    pub deleted_at_epoch: BTreeMap<u32, u64>,
     /// Unique 128-bit identity assigned on each import/creation so re-importing
     /// a different neighborhood under the same ID invalidates previously opened
     /// lots even when both are at revision 0.
@@ -752,6 +763,8 @@ impl NeighborhoodStore {
             lot_rows,
             made_characters: Characters::default(),
             deleted_characters: BTreeSet::new(),
+            deletion_epoch: 0,
+            deleted_at_epoch: BTreeMap::new(),
             instance_id: 0,
             revision: 0,
         };

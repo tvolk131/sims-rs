@@ -40,7 +40,9 @@ use std::collections::BTreeSet;
 /// keeps the view-rotated screen-centre tile pick (`0x4a7b58` cut via
 /// `0x433067`) and any frozen dialog-replay view; layout 6 keeps choice-only
 /// follow-up answers (`Answers::choices_after`) separately from explicit
-/// dialog replay queues.
+/// dialog replay queues and records the neighborhood's `deletion_epoch` at save
+/// time so reusing a deleted character GUID never revives stale instances on
+/// older saved lots.
 pub const FORMAT: u32 = 6;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
@@ -64,6 +66,9 @@ pub struct Saved {
     /// Format 5 on: frozen `(view_rotation, view_centre)` while a dialog tick
     /// awaits replay.
     pub(crate) replay_view: Option<(u8, Option<[i8; 2]>)>,
+    /// Format 6 on: neighborhood `deletion_epoch` at the time this lot was
+    /// saved (`0` for non-REDB saves).
+    pub(crate) deletion_epoch: u64,
 }
 
 /// Why a lot could not be saved or restored.
@@ -219,6 +224,7 @@ impl Lot {
             view_centre: self.view_centre,
             floor_rotation: self.floor_rotation,
             replay_view: self.replay_view,
+            deletion_epoch: 0,
         })
     }
 
