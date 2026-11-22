@@ -1,6 +1,7 @@
 //! The game's interface, drawn from the original artwork.
 //!
 //! - [`hud`]: the live-mode control panel.
+//! - [`caf`]: the Create-a-Family and Create-a-Sim screens.
 //! - [`dialog`]: the dialogs scripts show.
 //! - [`balloon`]: the help balloons the panels open over the lot.
 //! - [`pie`]: the pie menu of what a Sim can do with an object.
@@ -19,6 +20,7 @@
 pub mod art;
 pub mod balloon;
 pub mod buy;
+pub mod caf;
 pub mod command;
 pub mod dialog;
 pub mod font;
