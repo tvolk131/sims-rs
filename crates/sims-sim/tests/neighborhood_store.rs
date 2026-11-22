@@ -1,8 +1,13 @@
 //! Unit and `SIMS_INSTALL` integration tests for `NeighborhoodStore`.
 
+use redb::ReadableDatabase;
 use sims_content::{Catalog, Index, Install};
 use sims_formats::neighborhood::Family;
 use sims_sim::characters::{Character, Characters};
+use sims_sim::migration::{
+    MigrationError, NEIGHBORHOOD_MIGRATIONS, NEIGHBORHOOD_MIN_FORMAT, NeighborhoodSchemaStatus,
+    StoreMigrationError, StoredNeighborhoodV1, StoredNeighborhoodV2, derive_legacy_instance_id,
+};
 use sims_sim::neighbors::{Inventory, Item, Neighbor, PERSON_WORDS, Row};
 use sims_sim::{
     DEFAULT_ARCH_VALUE_MULTIPLIER, FAMILY_FLAG_BIT_3, FAMILY_FLAG_HAS_CATEGORY_1,
@@ -131,24 +136,319 @@ fn lot_total_value_and_net_worth_match_sims_exe_191_formula() {
 }
 
 #[test]
-fn stored_neighborhood_decode_rejects_short_or_wrong_version() {
+fn stored_neighborhood_decode_rejects_short_corrupt_and_unsupported_versions() {
+    assert_eq!(NEIGHBORHOOD_MIN_FORMAT, 1);
     assert_eq!(NEIGHBORHOOD_FORMAT, 3);
-    assert!(StoredNeighborhood::decode("bad", &[1, 2]).is_err());
-    for old in [1u32, 2u32] {
-        let mut old_bytes = sample_neighborhood("UserData").encode();
-        old_bytes[0..4].copy_from_slice(&old.to_le_bytes());
-        let err_old = StoredNeighborhood::decode("UserData", &old_bytes)
-            .unwrap_err()
-            .to_string();
-        assert!(err_old.contains(&format!("neighborhood format {old}, expected 3")));
+    assert_eq!(NEIGHBORHOOD_MIGRATIONS.steps().len(), 2);
+
+    // Truncated header (< 4 bytes).
+    assert!(matches!(
+        StoredNeighborhood::decode_with_report("bad", &[1, 2]),
+        Err(MigrationError::TruncatedHeader { len: 2, .. })
+    ));
+
+    // Version 0 and future versions (> NEIGHBORHOOD_FORMAT).
+    for unsupported in [0u32, NEIGHBORHOOD_FORMAT + 1, NEIGHBORHOOD_FORMAT + 99] {
+        let mut wrong = sample_neighborhood("UserData").encode();
+        wrong[0..4].copy_from_slice(&unsupported.to_le_bytes());
+        assert!(matches!(
+            StoredNeighborhood::decode_with_report("UserData", &wrong),
+            Err(MigrationError::UnsupportedVersion {
+                found,
+                min_supported: 1,
+                max_supported: 3,
+                ..
+            }) if found == unsupported
+        ));
     }
 
-    let mut wrong = sample_neighborhood("UserData").encode();
-    wrong[0..4].copy_from_slice(&(NEIGHBORHOOD_FORMAT + 99).to_le_bytes());
-    let err = StoredNeighborhood::decode("UserData", &wrong)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("neighborhood format"));
+    // Tampering a v3 body's header down to v1 or v2 fails strict payload decoding
+    // (schema mismatch / trailing bytes) instead of silently misreading fields.
+    for old in [1u32, 2u32] {
+        let mut mismatched = sample_neighborhood("UserData").encode();
+        mismatched[0..4].copy_from_slice(&old.to_le_bytes());
+        assert!(matches!(
+            StoredNeighborhood::decode_with_report("UserData", &mismatched),
+            Err(MigrationError::CorruptPayload { version, .. }) if version == old
+        ));
+    }
+
+    // Trailing garbage appended to a valid v3 payload is rejected.
+    let mut with_trailing = sample_neighborhood("UserData").encode();
+    with_trailing.push(0xAA);
+    assert!(matches!(
+        StoredNeighborhood::decode_with_report("UserData", &with_trailing),
+        Err(MigrationError::CorruptPayload { version: 3, .. })
+    ));
+}
+
+#[test]
+fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
+    let base = sample_neighborhood("UserData");
+
+    // 1. Authentic v1 fixture -> migrates v1 -> v2 -> v3 losslessly & deterministically.
+    let v1 = StoredNeighborhoodV1 {
+        name: base.name.clone(),
+        families: base.families.clone(),
+        neighbors: base.neighbors.clone(),
+        inventories: base.inventories.clone(),
+        data: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        options: base.options,
+        type_attributes: base.type_attributes.clone(),
+        zoning: base.zoning.clone(),
+        lot_rows: base.lot_rows.clone(),
+        made_characters: base.made_characters.clone(),
+        revision: 7,
+    };
+    let v1_bytes = v1.encode();
+    assert!(matches!(
+        StoredNeighborhood::decode_strict("UserData", &v1_bytes),
+        Err(MigrationError::UnsupportedVersion {
+            found: 1,
+            min_supported: 3,
+            max_supported: 3,
+            ..
+        })
+    ));
+    let (migrated_v1, report_v1) =
+        StoredNeighborhood::decode_with_report("UserData", &v1_bytes).unwrap();
+    assert_eq!(report_v1.original_version, 1);
+    assert_eq!(report_v1.final_version, 3);
+    assert_eq!(report_v1.steps_applied, 2);
+    assert!(report_v1.was_migrated());
+    assert_eq!(migrated_v1.name, v1.name);
+    assert_eq!(migrated_v1.families, v1.families);
+    assert_eq!(migrated_v1.data, v1.data);
+    assert_eq!(migrated_v1.options, v1.options);
+    assert_eq!(migrated_v1.zoning, v1.zoning);
+    assert_eq!(migrated_v1.lot_rows, v1.lot_rows);
+    assert_eq!(migrated_v1.revision, 7);
+    assert!(migrated_v1.deleted_characters.is_empty());
+    assert_eq!(migrated_v1.deletion_epoch, 0);
+    assert!(migrated_v1.deleted_at_epoch.is_empty());
+    assert_ne!(migrated_v1.instance_id, 0);
+    assert_eq!(
+        migrated_v1.instance_id,
+        derive_legacy_instance_id("UserData", &v1_bytes[4..])
+    );
+
+    // 2. Authentic v2 fixture with deleted_characters -> migrates v2 -> v3,
+    //    preserving instance_id and backfilling deletion_epoch = 1.
+    let v2 = StoredNeighborhoodV2 {
+        name: "UserData2".to_owned(),
+        families: base.families.clone(),
+        neighbors: base.neighbors.clone(),
+        inventories: base.inventories.clone(),
+        data: base.data,
+        options: base.options,
+        type_attributes: base.type_attributes.clone(),
+        zoning: base.zoning.clone(),
+        lot_rows: base.lot_rows.clone(),
+        made_characters: base.made_characters.clone(),
+        deleted_characters: BTreeSet::from([0xDEAD_0001, 0xBEEF_0002]),
+        instance_id: 0x1234_5678_9ABC_DEF0,
+        revision: 11,
+    };
+    let v2_bytes = v2.encode();
+    let (migrated_v2, report_v2) =
+        StoredNeighborhood::decode_with_report("UserData2", &v2_bytes).unwrap();
+    assert_eq!(report_v2.original_version, 2);
+    assert_eq!(report_v2.final_version, 3);
+    assert_eq!(report_v2.steps_applied, 1);
+    assert_eq!(migrated_v2.instance_id, 0x1234_5678_9ABC_DEF0);
+    assert_eq!(migrated_v2.revision, 11);
+    assert_eq!(
+        migrated_v2.deleted_characters,
+        BTreeSet::from([0xDEAD_0001, 0xBEEF_0002])
+    );
+    assert_eq!(migrated_v2.deletion_epoch, 1);
+    assert_eq!(
+        migrated_v2.deleted_at_epoch,
+        BTreeMap::from([(0xDEAD_0001, 1), (0xBEEF_0002, 1)])
+    );
+
+    // 3. v2 fixture with instance_id == 0 and no deleted_characters -> normalizes
+    //    instance_id to deterministic non-zero and keeps deletion_epoch == 0.
+    let v2_zero_id = StoredNeighborhoodV2 {
+        deleted_characters: BTreeSet::new(),
+        instance_id: 0,
+        ..v2.clone()
+    };
+    let v2_zero_bytes = v2_zero_id.encode();
+    let (migrated_v2_zero, _) =
+        StoredNeighborhood::decode_with_report("ZeroId", &v2_zero_bytes).unwrap();
+    assert_ne!(migrated_v2_zero.instance_id, 0);
+    assert_eq!(migrated_v2_zero.deletion_epoch, 0);
+    assert!(migrated_v2_zero.deleted_at_epoch.is_empty());
+
+    // 4. Atomic REDB migration: a single bad/future record aborts `migrate_all`
+    //    with zero partial mutations across all rows.
+    let db = TempDb::new("atomic-migrations");
+    let v3_bytes = sample_neighborhood("UserData3").encode();
+    let mut future_bytes = sample_neighborhood("UserData4").encode();
+    future_bytes[0..4].copy_from_slice(&99u32.to_le_bytes());
+
+    {
+        let raw_db = redb::Database::create(&db.0).unwrap();
+        let w = raw_db.begin_write().unwrap();
+        {
+            const NH_TABLE: redb::TableDefinition<&str, &[u8]> =
+                redb::TableDefinition::new("neighborhoods");
+            let mut t = w.open_table(NH_TABLE).unwrap();
+            t.insert("UserData", v1_bytes.as_slice()).unwrap();
+            t.insert("UserData2", v2_bytes.as_slice()).unwrap();
+            t.insert("UserData3", v3_bytes.as_slice()).unwrap();
+            t.insert("UserData4", future_bytes.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    let inspected = store.inspect_schema().unwrap();
+    assert_eq!(
+        inspected,
+        vec![
+            NeighborhoodSchemaStatus::NeedsMigration {
+                id: "UserData".to_owned(),
+                from_version: 1,
+                target_version: 3,
+            },
+            NeighborhoodSchemaStatus::NeedsMigration {
+                id: "UserData2".to_owned(),
+                from_version: 2,
+                target_version: 3,
+            },
+            NeighborhoodSchemaStatus::Current {
+                id: "UserData3".to_owned(),
+                version: 3,
+            },
+            NeighborhoodSchemaStatus::Invalid {
+                id: "UserData4".to_owned(),
+                error: MigrationError::UnsupportedVersion {
+                    record: "UserData4".to_owned(),
+                    found: 99,
+                    min_supported: 1,
+                    max_supported: 3,
+                },
+            },
+        ]
+    );
+
+    // `migrate_all` fails atomically on "UserData4" and mutates NOTHING.
+    let err = store.migrate_all().unwrap_err();
+    assert!(matches!(
+        err,
+        StoreMigrationError::Migration(MigrationError::UnsupportedVersion {
+            ref record,
+            found: 99,
+            ..
+        }) if record == "UserData4"
+    ));
+    assert_eq!(store.recorded_schema_version().unwrap(), None);
+
+    // `save_neighborhood` refuses to silently overwrite the future-version row.
+    assert!(store.save_neighborhood("UserData4", &base).is_err());
+
+    // Confirm raw bytes on disk were NOT mutated by the aborted `migrate_all`.
+    drop(store);
+    {
+        let raw_db = redb::Database::open(&db.0).unwrap();
+        let r = raw_db.begin_read().unwrap();
+        const NH_TABLE: redb::TableDefinition<&str, &[u8]> =
+            redb::TableDefinition::new("neighborhoods");
+        let t = r.open_table(NH_TABLE).unwrap();
+        assert_eq!(
+            t.get("UserData").unwrap().unwrap().value(),
+            v1_bytes.as_slice()
+        );
+        assert_eq!(
+            t.get("UserData2").unwrap().unwrap().value(),
+            v2_bytes.as_slice()
+        );
+        assert_eq!(
+            t.get("UserData3").unwrap().unwrap().value(),
+            v3_bytes.as_slice()
+        );
+        assert_eq!(
+            t.get("UserData4").unwrap().unwrap().value(),
+            future_bytes.as_slice()
+        );
+    }
+
+    // Reopen: read-time decode works on v1/v2, single-record migration upgrades
+    // only "UserData", and checked save works seamlessly on an unmigrated v2 row.
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    assert_eq!(
+        store.load_neighborhood("UserData").unwrap().unwrap(),
+        migrated_v1
+    );
+    let single = store.migrate_neighborhood("UserData").unwrap().unwrap();
+    assert_eq!(single.from_version, 1);
+    assert_eq!(single.to_version, 3);
+    assert_eq!(single.steps_applied, 2);
+
+    // Checked save on unmigrated v2 row succeeds because read-time and write-time
+    // migration derive the exact same (instance_id, revision).
+    let loaded_v2 = store.load_neighborhood("UserData2").unwrap().unwrap();
+    assert_eq!(loaded_v2, migrated_v2);
+    let (new_inst, new_rev) = store
+        .save_neighborhood_checked(
+            "UserData2",
+            loaded_v2.instance_id,
+            loaded_v2.revision,
+            &loaded_v2,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(new_inst, loaded_v2.instance_id);
+    assert_eq!(new_rev, loaded_v2.revision + 1);
+
+    // Explicitly delete the future-version row, re-seed UserData2 as v2, and
+    // verify `migrate_all` upgrades everything atomically and is idempotent.
+    assert!(store.delete_neighborhood("UserData4").unwrap());
+    drop(store);
+    {
+        let raw_db = redb::Database::open(&db.0).unwrap();
+        let w = raw_db.begin_write().unwrap();
+        {
+            const NH_TABLE: redb::TableDefinition<&str, &[u8]> =
+                redb::TableDefinition::new("neighborhoods");
+            let mut t = w.open_table(NH_TABLE).unwrap();
+            t.insert("UserData2", v2_bytes.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    let report = store.migrate_all().unwrap();
+    assert_eq!(report.target_version, 3);
+    assert_eq!(report.inspected, 3);
+    assert_eq!(report.already_current, 2);
+    assert_eq!(report.migrated.len(), 1);
+    assert_eq!(report.migrated[0].id, "UserData2");
+    assert_eq!(report.migrated[0].from_version, 2);
+    assert_eq!(report.migrated[0].to_version, 3);
+    assert_eq!(store.recorded_schema_version().unwrap(), Some(3));
+
+    // Second `migrate_all` is a clean idempotent no-op.
+    let second = store.migrate_all().unwrap();
+    assert_eq!(second.inspected, 3);
+    assert_eq!(second.already_current, 3);
+    assert!(second.migrated.is_empty());
+
+    // Raw rows on disk are now strictly v3.
+    drop(store);
+    {
+        let raw_db = redb::Database::open(&db.0).unwrap();
+        let r = raw_db.begin_read().unwrap();
+        const NH_TABLE: redb::TableDefinition<&str, &[u8]> =
+            redb::TableDefinition::new("neighborhoods");
+        let t = r.open_table(NH_TABLE).unwrap();
+        for id in ["UserData", "UserData2", "UserData3"] {
+            let raw = t.get(id).unwrap().unwrap();
+            assert!(StoredNeighborhood::decode_strict(id, raw.value()).is_ok());
+        }
+    }
 }
 
 #[test]
