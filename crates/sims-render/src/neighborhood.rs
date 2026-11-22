@@ -34,8 +34,7 @@ use crate::{Error, Result};
 use sims_content::Install;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_formats::bitmap::{self, Image as BitmapImage};
-use sims_formats::iff::{DELETED as IFF_DELETED, ResourceMap};
-use sims_formats::neighborhood::Family;
+use sims_formats::iff::DELETED as IFF_DELETED;
 use sims_formats::strings::{Format as StringTableFormat, StringTable, TextEntry};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1709,25 +1708,93 @@ fn build_lot_cells(
     }))
 }
 
+/// Native serialized chunk stream matching `0x464f49` + `0x464ec1` + `0x464885`:
+/// - when `flags & 0x10 == 0` (and `run_swap_callback` is true, as in `0x464e7a`),
+///   native `0x464f49` sets `byte[0] = 1` and byte-swaps `version` (`bytes[4..8]`),
+/// - otherwise `version` is little-endian and `big_endian = bytes[0] != 0`,
+/// - stream reads start at byte 12 without inspecting `bytes[8..12]`.
+struct NativeStream<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    big_endian: bool,
+}
+
+impl<'a> NativeStream<'a> {
+    fn open(bytes: &'a [u8], flags: u16, run_swap_callback: bool) -> Option<(Self, i32)> {
+        if bytes.len() < 12 {
+            return None;
+        }
+        let swapped_header = run_swap_callback && (flags & 0x10) == 0;
+        let version = if swapped_header {
+            i32::from_be_bytes(bytes[4..8].try_into().unwrap())
+        } else {
+            i32::from_le_bytes(bytes[4..8].try_into().unwrap())
+        };
+        let big_endian = swapped_header || bytes[0] != 0;
+        Some((
+            Self {
+                bytes,
+                pos: 12,
+                big_endian,
+            },
+            version,
+        ))
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        let &b = self.bytes.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn i16(&mut self) -> Option<i16> {
+        let b = self.bytes.get(self.pos..self.pos + 2)?;
+        self.pos += 2;
+        Some(if self.big_endian {
+            i16::from_be_bytes([b[0], b[1]])
+        } else {
+            i16::from_le_bytes([b[0], b[1]])
+        })
+    }
+
+    fn i32(&mut self) -> Option<i32> {
+        let b = self.bytes.get(self.pos..self.pos + 4)?;
+        self.pos += 4;
+        Some(if self.big_endian {
+            i32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            i32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        })
+    }
+
+    fn skip_cstr_padded(&mut self) -> Option<()> {
+        let rel_nul = self.bytes[self.pos..].iter().position(|&b| b == 0)?;
+        self.pos += rel_nul + 1;
+        if (self.pos & 1) != 0 && self.pos < self.bytes.len() {
+            self.pos += 1;
+        }
+        Some(())
+    }
+}
+
 fn read_lot_filter_mask(iff: &NativeIff) -> Option<u16> {
     // 0x427f21 / 0x464e6d / 0x4e1e58..0x4e1e62: requires SIMI 1 to be present;
-    // once found, 0x46cfb3 deserializes globals with no 0x49 version ceiling
-    // (16 globals for v < 0x12, 32 for v < 0x41, 64 for v >= 0x41) and
-    // 0x427f46 reads globals[37].
-    let (data, _flags) = iff.get(b"SIMI", 1)?;
-    if data.len() < 12 || &data[8..12] != b"IMIS" {
+    // once found, 0x464ec1 opens the stream at byte 12 using byte[0] (or
+    // 0x464f49 when flags & 0x10 == 0) for byte order without checking `IMIS`,
+    // and 0x46cfb3 reads 64 globals for any version >= 0x41 (globals[37] at 0x427f46).
+    let (data, flags) = iff.get(b"SIMI", 1)?;
+    let Some((mut s, version)) = NativeStream::open(data, flags, true) else {
         return Some(0);
-    }
-    let version = i32::from_le_bytes(data[4..8].try_into().unwrap());
+    };
     if version < 0x41 {
         return Some(0);
     }
-    let off = 12 + 37 * 2;
-    let mask = data
-        .get(off..off + 2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]) as u16)
-        .unwrap_or(0);
-    Some(mask)
+    s.pos = s.pos.saturating_add(37 * 2);
+    Some(s.i16().unwrap_or(0) as u16)
 }
 
 #[derive(Default)]
@@ -1743,27 +1810,77 @@ struct FamilyOccupancy {
 }
 
 impl FamilyOccupancy {
-    fn record_family(&mut self, family_id: i32, family: &Family) {
-        // 0x410602..0x410613: secondary/vacation house is serialized starting at version 8.
-        let secondary_raw = if family.version >= 8 && family.tail.len() >= 4 {
-            i32::from_le_bytes(family.tail[0..4].try_into().unwrap())
-        } else {
-            0
-        };
-        // 0x54f20e & 0x54f24f compare family.house and secondary_raw directly
-        // against the lot ID without excluding lot 0.
-        self.any_house_matches.insert(family.house);
+    fn record_family_houses(&mut self, family_id: i32, house: i32, secondary_raw: i32) {
+        // 0x54f20e & 0x54f24f compare house and secondary_raw directly against
+        // the lot ID without excluding lot 0.
+        self.any_house_matches.insert(house);
         self.any_house_matches.insert(secondary_raw);
         if secondary_raw != 0 {
-            self.primary_vacation_stays.insert(family.house);
+            self.primary_vacation_stays.insert(house);
         }
         let secondary_u16 = u16::try_from(secondary_raw).ok().filter(|&lot| lot > 0);
-        if let Some(house) = u16::try_from(family.house).ok().filter(|&lot| lot > 0) {
-            self.primary_lot.insert(house, (family_id, secondary_u16));
+        if let Some(primary) = u16::try_from(house).ok().filter(|&lot| lot > 0) {
+            self.primary_lot.insert(primary, (family_id, secondary_u16));
         }
         if let Some(vac_lot) = secondary_u16 {
             self.vacation_lot.insert(vac_lot, family_id);
         }
+    }
+
+    /// Parses a raw `FAMI` chunk payload matching `0x4104ce..0x41064e` (with no
+    /// upper version ceiling and native `0x464f49` / `0x464ec1` byte-order handling).
+    fn record_fami_chunk(&mut self, family_id: i32, data: &[u8], flags: u16) {
+        let Some((mut s, version)) = NativeStream::open(data, flags, true) else {
+            return;
+        };
+        let house = s.i32().unwrap_or(0);
+        if version < 5 && s.skip_cstr_padded().is_none() {
+            self.record_family_houses(family_id, house, 0);
+            return;
+        }
+        if version >= 1 {
+            let _ = s.i32(); // number (+0x114)
+        }
+        if version >= 2 {
+            let _ = s.i32(); // budget (+0x118)
+            let _ = s.i32(); // architecture_value (+0x11c)
+            let _ = s.i32(); // friends (+0x120)
+        }
+        if version >= 7 {
+            let _ = s.i32(); // flags (+0x138)
+        } else {
+            if version >= 3 {
+                let _ = s.u8();
+            }
+            if version >= 4 {
+                let _ = s.u8();
+            }
+            if version >= 6 {
+                let _ = s.u8();
+            }
+        }
+        // 0x4105e7..0x4105ff: member list is serialized when family_id != 0.
+        if family_id != 0 {
+            let Some(member_count) = s.i32() else {
+                self.record_family_houses(family_id, house, 0);
+                return;
+            };
+            if member_count > 0 {
+                let skip = (member_count as usize).saturating_mul(4);
+                if skip > s.remaining() {
+                    self.record_family_houses(family_id, house, 0);
+                    return;
+                }
+                s.pos += skip;
+            }
+        }
+        // 0x410602..0x410613: secondary/vacation house exists for all versions >= 8.
+        let secondary_raw = if version >= 8 {
+            s.i32().unwrap_or(0)
+        } else {
+            0
+        };
+        self.record_family_houses(family_id, house, secondary_raw);
     }
 }
 
@@ -1773,12 +1890,9 @@ fn load_family_occupancy(install: &Install, user_dir: &Path) -> FamilyOccupancy 
     else {
         return occ;
     };
-    for (id, data) in iff.all(b"FAMI") {
-        let Ok(family) = Family::parse(data) else {
-            continue;
-        };
+    for (id, data, flags) in iff.all(b"FAMI") {
         // 0x410673 / 0x4e1e73: native family ID is the FAMI chunk ID, not payload `number`.
-        occ.record_family(i32::from(id), &family);
+        occ.record_fami_chunk(i32::from(id), data, flags);
     }
     occ
 }
@@ -1914,33 +2028,13 @@ impl NativeIff {
                         bytes.get(rsmp_offset + CHUNK_HEADER_SIZE..rsmp_offset.checked_add(length)?)
                     });
                 if let Some(payload) = payload
-                    && let Ok(map) = ResourceMap::parse(payload)
+                    && let Some((parsed_order, parsed_by_key, lists_self)) =
+                        parse_native_rsmp(payload)
+                    && !lists_self
                 {
-                    let lists_self = map.types.get(b"rsmp").is_some_and(|entries| {
-                        entries.iter().any(|e| e.id == 0 && e.flags >> 8 == 0)
-                    });
-                    if !lists_self {
-                        for (&entry_tag, entries) in &map.types {
-                            if entry_tag == *b"rsmp" {
-                                continue;
-                            }
-                            for entry in entries {
-                                let key = (entry_tag, entry.id, (entry.flags >> 8) as u8);
-                                if by_key.contains_key(&key) {
-                                    continue;
-                                }
-                                let res = NativeResource {
-                                    offset: entry.offset as usize,
-                                    tag: entry_tag,
-                                    id: entry.id,
-                                    flags: entry.flags,
-                                };
-                                by_key.insert(key, res);
-                                order.entry(entry_tag).or_default().push(res);
-                            }
-                        }
-                        used_map = true;
-                    }
+                    order = parsed_order;
+                    by_key = parsed_by_key;
+                    used_map = true;
                 }
             }
         }
@@ -2017,15 +2111,77 @@ impl NativeIff {
         Some((self.payload(res)?, res.flags))
     }
 
-    fn all(&self, tag: &[u8; 4]) -> Vec<(u16, &[u8])> {
+    fn all(&self, tag: &[u8; 4]) -> Vec<(u16, &[u8], u16)> {
         let Some(entries) = self.order.get(tag) else {
             return Vec::new();
         };
         entries
             .iter()
-            .filter_map(|&res| Some((res.id, self.payload(res)?)))
+            .filter_map(|&res| Some((res.id, self.payload(res)?, res.flags)))
             .collect()
     }
+}
+
+type ParsedRsmp = (
+    BTreeMap<[u8; 4], Vec<NativeResource>>,
+    BTreeMap<([u8; 4], u16, u8), NativeResource>,
+    bool,
+);
+
+/// Parses a native `rsmp` stream (`0x41be90..0x41c04c`, `0x41b7cb..0x41b826`),
+/// stopping immediately after the declared type/entry counts so trailing
+/// padding bytes inside the `rsmp` chunk do not invalidate the index.
+fn parse_native_rsmp(payload: &[u8]) -> Option<ParsedRsmp> {
+    // 0x41c465 pushes 0 for the load callback, so rsmp uses payload[0] for byte order.
+    let (mut s, _version) = NativeStream::open(payload, 0x10, false)?;
+    let _unused_bytes = s.i32()?;
+    let type_count = s.i32()?;
+    let mut order: BTreeMap<[u8; 4], Vec<NativeResource>> = BTreeMap::new();
+    let mut by_key: BTreeMap<([u8; 4], u16, u8), NativeResource> = BTreeMap::new();
+    let mut lists_self = false;
+    if type_count <= 0 {
+        return Some((order, by_key, false));
+    }
+    let type_count = type_count as usize;
+    if type_count.saturating_mul(8) > s.remaining() {
+        return None;
+    }
+    for _ in 0..type_count {
+        let entry_tag = (s.i32()? as u32).to_be_bytes();
+        let entry_count = s.i32()?;
+        if entry_count <= 0 {
+            continue;
+        }
+        let entry_count = entry_count as usize;
+        if entry_count.saturating_mul(10) > s.remaining() {
+            return None;
+        }
+        for _ in 0..entry_count {
+            let offset = s.i32()? as u32 as usize;
+            let id = s.i16()? as u16;
+            let flags = s.i16()? as u16;
+            s.skip_cstr_padded()?;
+            if entry_tag == *b"rsmp" {
+                if id == 0 && (flags >> 8) == 0 {
+                    lists_self = true;
+                }
+                continue;
+            }
+            let key = (entry_tag, id, (flags >> 8) as u8);
+            if by_key.contains_key(&key) {
+                continue;
+            }
+            let res = NativeResource {
+                offset,
+                tag: entry_tag,
+                id,
+                flags,
+            };
+            by_key.insert(key, res);
+            order.entry(entry_tag).or_default().push(res);
+        }
+    }
+    Some((order, by_key, lists_self))
 }
 
 fn open_iff(path: &Path) -> Option<NativeIff> {
@@ -2872,6 +3028,7 @@ mod tests {
         rsmp_payload.extend_from_slice(&4u16.to_le_bytes()); // map ID = 4
         rsmp_payload.extend_from_slice(&0x0010u16.to_le_bytes()); // flags
         rsmp_payload.extend_from_slice(&[0u8, 0u8]); // empty NUL label + pad
+        rsmp_payload.extend_from_slice(&[0xde, 0xad]); // trailing padding inside rsmp (0x41c038)
         let rsmp_offset = 64 + 76 + str_payload.len();
         let mut indexed = sims_formats::iff::write(&[
             sims_formats::iff::ChunkData {
@@ -2947,7 +3104,7 @@ mod tests {
             sims_formats::iff::write(&[sims_formats::iff::ChunkData {
                 tag: *b"SIMI",
                 id: 1,
-                flags: 0,
+                flags: 0x0010,
                 label: String::new(),
                 data: simi_4a,
             }])
@@ -2955,6 +3112,25 @@ mod tests {
         )
         .expect("SIMI 0x4a IFF opens");
         assert_eq!(read_lot_filter_mask(&simi_iff), Some(0x0005));
+
+        // Big-endian SIMI 1 (byte[0] = 1) with non-IMIS bytes 8..12 (0x464edd, 0x464936).
+        let mut simi_be = vec![0u8; 12 + 64 * 2];
+        simi_be[0] = 1;
+        simi_be[4..8].copy_from_slice(&0x45u32.to_le_bytes());
+        simi_be[8..12].copy_from_slice(b"XXXX");
+        simi_be[12 + 37 * 2..12 + 38 * 2].copy_from_slice(&0x0002u16.to_be_bytes());
+        let simi_be_iff = NativeIff::parse(
+            sims_formats::iff::write(&[sims_formats::iff::ChunkData {
+                tag: *b"SIMI",
+                id: 1,
+                flags: 0x0010,
+                label: String::new(),
+                data: simi_be,
+            }])
+            .expect("write big-endian SIMI IFF"),
+        )
+        .expect("big-endian SIMI IFF opens");
+        assert_eq!(read_lot_filter_mask(&simi_be_iff), Some(0x0002));
     }
 
     #[test]
@@ -3080,28 +3256,35 @@ mod tests {
         assert_eq!(magic_map.hit_test_with_options(&hover_opts, [18, 14]), None);
         assert_eq!(canvas.id_at(18, 14), None);
 
-        // Multiple FAMI records sharing lot 5 (secondary 41 followed by 0) and
-        // a single record with negative nonzero secondary (-1) both preserve
-        // primary vacation stay eligibility (0x54f20e).
-        let make_fam = |house: i32, secondary: i32| Family {
-            version: 8,
-            house,
-            number: 1,
-            budget: 0,
-            architecture_value: 0,
-            friends: 0,
-            flags: 0,
-            members: Vec::new(),
-            tail: secondary.to_le_bytes().to_vec(),
+        // Multiple FAMI records sharing lot 5 (secondary 41 followed by 0),
+        // negative nonzero secondary (-1), lot 0, and FAMI version 10 (no upper
+        // version check at 0x410602) all preserve vacation stay eligibility (0x54f20e).
+        let make_fami_chunk = |version: i32, house: i32, secondary: i32| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&0u32.to_le_bytes()); // LE marker
+            b.extend_from_slice(&version.to_le_bytes());
+            b.extend_from_slice(b"IMAF");
+            b.extend_from_slice(&house.to_le_bytes());
+            b.extend_from_slice(&1i32.to_le_bytes()); // number
+            b.extend_from_slice(&0i32.to_le_bytes()); // budget
+            b.extend_from_slice(&0i32.to_le_bytes()); // arch
+            b.extend_from_slice(&0i32.to_le_bytes()); // friends
+            b.extend_from_slice(&0u32.to_le_bytes()); // flags
+            b.extend_from_slice(&0i32.to_le_bytes()); // 0 members
+            b.extend_from_slice(&secondary.to_le_bytes());
+            b
         };
         let mut multi_occ = FamilyOccupancy::default();
-        multi_occ.record_family(1, &make_fam(5, 41));
-        multi_occ.record_family(2, &make_fam(5, 0));
-        multi_occ.record_family(3, &make_fam(6, -1));
-        multi_occ.record_family(4, &make_fam(0, 41));
+        multi_occ.record_fami_chunk(1, &make_fami_chunk(8, 5, 41), 0x0010);
+        multi_occ.record_fami_chunk(2, &make_fami_chunk(8, 5, 0), 0x0010);
+        multi_occ.record_fami_chunk(3, &make_fami_chunk(9, 6, -1), 0x0010);
+        multi_occ.record_fami_chunk(4, &make_fami_chunk(9, 0, 41), 0x0010);
+        multi_occ.record_fami_chunk(5, &make_fami_chunk(10, 7, 42), 0x0010);
         assert!(multi_occ.primary_vacation_stays.contains(&5));
         assert!(multi_occ.primary_vacation_stays.contains(&6));
         assert!(multi_occ.primary_vacation_stays.contains(&0));
+        assert!(multi_occ.primary_vacation_stays.contains(&7));
         assert!(multi_occ.any_house_matches.contains(&41));
+        assert!(multi_occ.any_house_matches.contains(&42));
     }
 }
