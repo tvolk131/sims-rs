@@ -28,42 +28,46 @@ destination zones:
 | `MagicTown` | `90..=98` (`90..=92` residential, `93..=98` community) | `0x80` (Makin' Magic) | `MagicHole` (`$0`) or `MagicBlimp` (`$50`) | Single human Sim (adult or child) or household group/family |
 
 Validation runs in `validate_travel_plan` before any mutation:
+- Uses the install's real detected expansion bitmask (`Install::detect` intersected
+  with `home_lot.program.expansions`) rather than a hardcoded mask.
 - Rejects self-travel (`destination == home`), non-destination residential lots
   (e.g. `1..=10` or residential `50..=79`), missing expansion bits, occupied
   destination lots (`StoredNeighborhood::family_in(dest).is_some()`),
+  departing from an unlimited-budget edit lot (`globals[32] != 0`),
   departing from a house the family does not reside on (`family.house !=
   home_house`), departing while already away (`family.secondary_house() != 0`),
   mismatched transport/accommodation, invalid party composition (duplicate
-  GUIDs, deleted characters, non-member leader, age/species violations,
-  insufficient fame for `StudioLimo`), negative fares, and insufficient
-  household funds.
+  GUIDs including duplicate leader GUIDs, deleted characters, non-member leader,
+  age/species violations, insufficient fame for `StudioLimo`), negative fares,
+  and insufficient household funds.
 - `family_magic_coins` sums `Magic Token - Currency` (`0x99e81bec`, inventory
   kind `7`, verified from `ExpansionPack7.far::TokensMagic.iff` and
   `CartDragon.iff`/`CartFaerie.iff` `Manage Inventory` opcode 51 calls) across
   all household members' inventories (`cFamily::GetMagicCoins`, `0x410282`).
 
-### 2. Departure, Home-Lot Freeze, and Destination Boot (`depart_to_destination`)
+### 2. Departure, Home-Lot Freeze, `TRVL` Envelope, and Destination Boot (`depart_to_destination`)
 
-To preserve crash/error atomicity, `depart_to_destination` stages the frozen
+To preserve crash/error atomicity and protect both the frozen home lot and the
+clean Build/Buy destination snapshot, `depart_to_destination` stages the frozen
 home lot and boots the destination lot in memory **before** committing to REDB:
 
 1. **Frozen Home Snapshot:** Captures live traveler state (`motives`,
-   `previous_motives`, 256-word `person.data`, `person_outfits`, `made_outfits`,
-   pre-trip hotel-key presence), snapshots the home lot at its exact departure
-   tick and clock (`hours/minutes/seconds`), deducts the fare (recording into
-   today's budget entry), flushes all live home persons via
+   `previous_motives`, 256-word `person.data`, `accessories`, `person_outfits`,
+   `made_outfits`, pre-trip hotel-key presence), snapshots the home lot at its
+   exact departure tick and clock (`hours/minutes/seconds`), ensures
+   `budget.days[0]` exists before deducting the fare (recording the actual
+   deducted fare into `today[5]`), flushes all live home persons via
    `people::save_to_record` (`0x425a69`), updates lot values (`0x416085`),
    writes back `StoredNeighborhood`, and sets `family.secondary_house =
    destination_house` (`0x425d95`, FAMI `+0x13c`).
 2. **Destination Boot:** Loads `destination_house` from REDB's `saved_lot`
-   (preserving prior community-lot edits, running `Load` callbacks on newly
-   reconciled global controllers so zone-gated controllers like Superstar's
-   `Controller - Insanity` `0xC2AF7E1C` self-remove cleanly on non-Studio lots)
-   or its imported base `HouseXX.iff` (validating `OBJT` catalog coverage and
-   stripping deleted character instances). For base-house loads with
-   `globals[23] < 64` (all destination lots), populates bare-lot architecture
-   arrays before `reconcile_controllers` (`0x415e20..0x415e67`), matching
-   `boot.rs` so Vacation/Downtown/Studio/Magic controllers initialize cleanly.
+   (stripping orphaned/deleted saved persons and preserving every saved
+   furnishing and controller from the initial base load, matching
+   `lifecycle::boot_from_saved_lot`) or its imported base `HouseXX.iff`
+   (validating `OBJT` catalog coverage, promoting `slot 0` successors and
+   resetting affected surviving threads when stripping deleted character
+   instances, and populating bare-lot architecture arrays before
+   `reconcile_controllers` on shrunken lots per `0x415e20..0x415e67`).
 3. **Live Away-From-Home Mode:** Shipped destination `HouseXX.iff` files save
    `globals[32] = 1` (Edit/Build unlimited-budget mode). `depart_to_destination`
    switches `globals[32] = 0`, unpauses (`globals[17] = 0`), sets live mode
@@ -71,69 +75,92 @@ home lot and boots the destination lot in memory **before** committing to REDB:
    home_family`, `globals[10] = destination_house`, `budget.funds =
    funds_at_arrival`), and ensures `budget.days[0]` is initialized so native
    `Alter Budget` purchases work on every destination lot.
-4. **Party Injection & Check-In:** Issues `Token - Hotel Key` (`0x3ac022d6`,
-   `kind = 0`) on Vacation `HotelCheckIn { grant_hotel_key: true }` so native
-   category 4/7 hotel doors and beds unlock (`0x458319`), spawns each traveler
-   via `Interpreter::create_person` on distinct walkable tiles near the arrival
-   portal (`PedPortal` `0x81e6bef9`, `CarPortal` `0x865a6812`, `Magic - Clown
-   Portal` `0x2baa0029`, or `Ped Marker Magic - Cab Stop` `0x13076784`), overlays
-   their exact live motives/skills/career/fame/outfits (temporarily zeroing
-   `data[81]`/`data[77]` across `put` to avoid unported celebrity star-marker
-   traps at `0x447a82`), and selects the party leader.
-5. **Checked REDB Commit:** Commits `(frozen_home_bytes, staged_stored)` via
-   `save_lot_and_neighborhood_checked` only after destination boot succeeds,
-   binding `destination_lot.neighborhood_origin` to the committed version.
+4. **Party Injection, Date Link & Check-In:** Issues `Token - Hotel Key`
+   (`0x3ac022d6`, `kind = 0`) on Vacation `HotelCheckIn { grant_hotel_key: true }`
+   so native category 4/7 hotel doors and beds unlock (`0x458319`), spawns (or
+   deduplicates and resets) each traveler on distinct walkable tiles validated
+   by native `Interpreter::search` / `Interpreter::fits` near the arrival portal
+   (`PedPortal` `0x81e6bef9`, `CarPortal` `0x865a6812`, `Magic - Clown Portal`
+   `0x2baa0029`, or `Ped Marker Magic - Cab Stop` `0x13076784`), overlays their
+   exact live motives/skills/career/fame/accessories/outfits, selects the party
+   leader via `select_sim` (which safely preserves `data[81]` celebrity fame and
+   `data[77]` date links across selection without hitting unported pools
+   `0x446c15`/`0x44664c`), and establishes the mutual Downtown Date link
+   (`person.data[77] = partner_id`) on `TravelParty::Date` trips.
+5. **Atomic `TRVL` Envelope & Handle Authority:** Wraps the authoritative
+   `PersistedTravelRecord { trip_id, is_date, view_centre, session,
+   departure_snapshots, frozen_home_bytes }` in a `TRVL` v1 envelope stored in
+   `NEIGHBORHOOD_LOTS[(nh, home_house)]` and commits it atomically with
+   `staged_stored` (`secondary_house = destination_house`) via
+   `save_lot_and_neighborhood_checked`:
+   - Ordinary `lifecycle::enter_lot` on `home_house` is rejected while away
+     because `Saved::decode` rejects the `TRVL` prefix, preventing accidental
+     overwrites of the frozen home lot.
+   - Live destination handles receive `neighborhood_origin = None` (blocking
+     ordinary `lifecycle::save_and_leave_lot` from overwriting the Build/Buy
+     destination snapshot) and `loaded = trip_binding_tag(store_id, trip_id)`
+     (cryptographically binding the handle to its unique departure `trip_id`).
 
-### 3. Return Home & State Reconciliation (`return_from_destination`)
+### 3. Return Home, Concurrent-Write Reconciliation & Crash Recovery (`return_from_destination`, `inspect_active_trip`, `resume_active_trip`, `abort_active_trip`)
 
-1. **Session Verification:** Verifies `destination_lot` belongs to the expected
-   store, neighborhood, revision, destination house, and visiting family, and
-   that REDB's `StoredNeighborhood` still records `family.house == home_house`
-   and `family.secondary_house() == destination_house`.
-2. **Flush & Extract:** Flushes every live Sim on `destination_lot` into `NBRS`
-   (preserving updated skills, career/fame, and relationships with newly met
-   townies, vacationers, celebrities, and magic NPCs), revokes temporary
-   Vacation check-in hotel keys (preserving pre-existing keys and all
-   souvenirs/gifts/ingredients/MagiCoins), marks the returning family's friend
-   count stale so `FAMI.friends` is freshly recomputed, and captures returning
-   live motives, person data, outfits (`person_outfits` and `made_outfits`),
-   and final funds/MagiCoins.
-3. **Community-Lot Edit Preservation & Single-Transaction Return:** Matching
-   `Sims.exe` 1.91, leaving an away-from-home Live-Mode visit does **not**
-   overwrite REDB's destination lot snapshot with transient visit mess,
-   spawned NPCs, or mid-visit controllers; community-lot Build/Buy edits are
-   authored via `open_destination_for_edit` + `lifecycle::save_and_leave_lot` and stay
-   cleanly preserved across all visits. `return_from_destination` writes back
-   `FAMI` (updating `budget` and `friends`, preserving home `house` and
-   `architecture_value`, clearing `secondary_house = 0`), `NBRS`, `NGBH`
-   (keeping `data[2]` pointed at `home_house`), `TATT`, and `made_characters`.
-4. **Home Reconciliation & Atomic Commit:** Restores the frozen home lot at its
-   exact departure tick and clock (`world.ticks`, `Lot::ticks`,
-   `globals[0/5/6]`), reloads updated neighborhood records/relationships/
-   inventories/MagiCoins/funds, keeps non-traveling Sims/pets untouched,
-   deduplicates and resets returning household travelers cleanly onto distinct
-   walkable tiles near the home curb/portal with their updated live motives/
-   skills/fame/outfits, and selects the returning leader. Commits the
-   reconciled home lot and updated `StoredNeighborhood` in a **single atomic
-   checked REDB transaction** (`save_lot_and_neighborhood_checked`), then
-   invalidates `destination_lot.neighborhood_origin` to prevent stale
-   overwrites.
+1. **Trip-ID Fencing & Concurrent-Write Tolerance:** `return_from_destination`
+   verifies `store_id`, `instance_id`, `destination_lot.loaded ==
+   trip_binding_tag(store_id, session.trip_id)`, and `persisted.trip_id ==
+   session.trip_id` against the REDB `TRVL` envelope (rejecting retained
+   sessions from earlier trips to the same lot and rejecting already-returned
+   handles). Because fencing keys on `(instance_id, trip_id)` rather than
+   freezing `departure_revision`, unrelated neighborhood writes made while away
+   (such as editing and saving another unoccupied destination lot) do **not**
+   strand the active trip.
+2. **Flush, Extract & Selective Neighborhood Merge:** Flushes every live Sim on
+   `destination_lot` into `NBRS`, revokes temporary Vacation check-in hotel
+   keys, captures returning traveler states (preferring each traveler's recorded
+   `destination_object_id` and copying `accessories` + outfits + motives +
+   `person.data`), and merges destination updates onto the **latest**
+   `StoredNeighborhood` (updating touched/new neighbors, their bidirectional
+   relationships and inventories, `TATT`, `made_characters`, and
+   `session.home_family`'s budget/friends/`secondary_house = 0` while preserving
+   unrelated families and untouched off-lot neighbors).
+3. **Home Reconciliation & Single-Transaction Commit:** Restores the frozen home
+   lot directly from the authoritative `persisted.frozen_home_bytes` (taking
+   exact `ticks`, `world.ticks`, and `globals[0/5/6]` clock from the decoded
+   `Saved` snapshot rather than caller-supplied session fields), keeps
+   non-traveling Sims/pets untouched, deduplicates and resets returning
+   household travelers cleanly at the home curb/portal, selects the returning
+   leader via `select_sim`, and commits the unwrapped `Saved` home lot + merged
+   `StoredNeighborhood` in a single atomic checked REDB transaction fenced on
+   the latest `(instance_id, revision)`. Clears `destination_lot.loaded` so the
+   handle cannot be returned twice.
+4. **Crash / Restart / Halted-Destination Recovery:**
+   - `inspect_active_trip`: reads and validates any active `TRVL` envelope for
+     `home_house`.
+   - `resume_active_trip`: reboots the destination lot from the persisted
+     departure snapshots after a crash/restart or halted lot, atomically
+     rotating `trip_id` in the `TRVL` envelope so any stale pre-crash handle is
+     invalidated.
+   - `abort_active_trip`: settles an active or halted trip directly from the
+     persisted frozen home snapshot without needing a live destination handle,
+     revoking temporary hotel keys, clearing `secondary_house = 0`, and
+     unwrapping `TRVL` back into a normal `Saved` lot under a checked commit.
 
 ## Known VM Follow-Ups (Outside Disjoint Scope)
 
-While ticking live Complete Collection destination lots, two unported VM
-primitives outside this PR's disjoint `travel.rs` scope were observed:
+While ticking live Complete Collection destination lots, three unported VM
+features outside this PR's disjoint `travel.rs` scope were observed:
 - `Find Best Interaction` on community/Vacation (`zoning == 2 || 40..50`) and
   unzoned (`zoning == 0`, Downtown/Studio Town) lots (`autonomy.rs:434-445`).
 - `Generic Sims Call` routine `26` on Magic Town community lots
   (`primitives/generic.rs:104`).
+- Superstar Studio Town memory scope `38` (`Trap::UnsupportedScope { scope: 38 }`)
+  on Studio Town lots (`House81.iff`).
 
 Home lots (`House05.iff`) and Magic Town residential lots (`House90.iff`,
 `zoning == 1`) tick all 220+ ticks in strict `Lot::step()` with zero errors.
 Community/unzoned destination lots (`House21`, `House40`, `House58`, `House81`,
 `House93`) tick all 220+ ticks cleanly under `Lot::step_play()` with every
-caught object fault verified to be strictly `Fault::Trap(Trap::Unsupported(_))`
-(zero `Trap::Invalid`, zero `Trap::Native`, zero corrupted slots/objects).
+caught object fault verified to satisfy `Trap::unported()` (`Trap::Unsupported`,
+`Trap::UnsupportedScope`, or `Trap::Unimplemented` — zero `Trap::Invalid`, zero
+`Trap::Native`, zero `Trap::BudgetExhausted`, zero corrupted slots/objects).
 
 ## Verification
 

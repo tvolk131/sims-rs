@@ -7,9 +7,9 @@ use sims_vm::lifecycle::{enter_lot, save_and_leave_lot};
 use sims_vm::travel::{
     DOWNTOWN_FARE, HOTEL_KEY_TOKEN_GUID, HOTEL_KEY_TOKEN_KIND, MAGIC_BLIMP_FARE, MAGIC_HOLE_FARE,
     OLD_TOWN_FARE, STUDIO_TOWN_FARE, TravelDestination, TravelError, TravelParty, TravelRequest,
-    TravelTransport, VACATION_FARE, VacationAccommodation, classify_destination,
-    depart_to_destination, neighbor_token_count, open_destination_for_edit,
-    return_from_destination,
+    TravelTransport, VACATION_FARE, VacationAccommodation, abort_active_trip, classify_destination,
+    depart_to_destination, inspect_active_trip, neighbor_token_count, open_destination_for_edit,
+    resume_active_trip, return_from_destination,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,10 +60,11 @@ fn step_strict(lot: &mut sims_vm::boot::Lot, ticks: u32, label: &str) {
 /// Steps a community/unzoned destination lot for `ticks` ticks in play mode,
 /// verifying:
 /// 1. Every tick succeeds without halting (`step_play` returns `Ok`).
-/// 2. Any caught per-object script error is strictly an unported VM primitive
-///    (`Fault::Trap(Trap::Unsupported(_))`, e.g. community-lot `Find Best
-///    Interaction` or `Generic Sims Call 26`), with ZERO `Trap::Invalid`,
-///    `Trap::Native`, or corrupted-object faults.
+/// 2. Any caught per-object script error is strictly an unported VM trap
+///    (`Trap::unported()`, i.e. `Trap::Unsupported`, `Trap::UnsupportedScope`
+///    such as Studio Town scope 38, or `Trap::Unimplemented`), with ZERO
+///    `Trap::Invalid`, `Trap::Native`, `Trap::BudgetExhausted`, or corrupted-
+///    object faults.
 /// 3. Both `lot.ticks()` and `lot.world().ticks` advance cleanly.
 fn step_community(lot: &mut sims_vm::boot::Lot, ticks: u32, label: &str) {
     let start_ticks = lot.ticks();
@@ -122,16 +123,87 @@ fn goth_downtown_house21_round_trip_and_community_edit_persistence() {
     let mortimer_guid = goth_members[0];
     let bella_guid = goth_members[1];
 
-    // Edit Downtown House 21 in Build/Buy mode from Neighborhood View and save
-    // to REDB — matching Sims 1's community-lot editing flow.
+    // Edit Downtown House 21 in Build/Buy mode from Neighborhood View, place a
+    // real Buy Mode furnishing, and save to REDB — matching Sims 1's
+    // community-lot editing flow.
     let mut dt_edit =
         open_destination_for_edit(&root, &store, "UserData", 21, &[3], Frames::default()).unwrap();
     assert_eq!(dt_edit.world().globals[32], 1, "edit mode unlimited budget");
+    let baseline_furnishings: Vec<(u16, u32, [i32; 3])> = dt_edit
+        .world()
+        .objects
+        .values()
+        .filter(|o| o.person.is_none() && o.position[0] >= 0 && o.position[1] >= 0)
+        .map(|o| (o.id, o.guid, o.position))
+        .collect();
+    assert!(
+        baseline_furnishings.len() > 20,
+        "Downtown House 21 has populated furnishings before edit"
+    );
+    // Pick a single-tile non-person furnishing already present on House 21 and
+    // buy + place a new copy via Buy Mode so we prove BOTH existing furnishings
+    // AND newly placed Buy Mode objects survive reload!
+    let candidate_guid = dt_edit
+        .world()
+        .objects
+        .values()
+        .find(|o| {
+            o.person.is_none()
+                && o.multipart.is_none()
+                && o.position[0] > 0
+                && o.position[1] > 0
+                && dt_edit
+                    .catalog()
+                    .object(o.guid)
+                    .is_some_and(|def| def.kind == 4)
+        })
+        .expect("Downtown House 21 has a single-tile catalog furnishing")
+        .guid;
+    let mut cursor = dt_edit
+        .buy_start(candidate_guid, 1, 0)
+        .unwrap()
+        .expect("buy_start succeeds in unlimited-budget edit mode");
+    let mut placed_fine = None;
+    'search_tile: for y in 6..26 {
+        for x in 6..26 {
+            let fine = [x * 16 + 8, y * 16 + 8];
+            if dt_edit.buy_move(&mut cursor, fine, 1).unwrap() {
+                placed_fine = Some(fine);
+                break 'search_tile;
+            }
+        }
+    }
+    let placed_fine = placed_fine.expect("found open tile for Buy Mode object on House 21");
+    let placed_id = dt_edit.buy_commit(&cursor).unwrap();
+    let placed_pos = dt_edit.world().objects[&placed_id].position;
+    assert_eq!([placed_pos[0], placed_pos[1]], placed_fine);
+
     dt_edit.set_lot_info(
         "Goth Downtown Lounge".to_string(),
         "Persisted community edit".to_string(),
     );
     save_and_leave_lot(&root, &store, "UserData", &mut dt_edit).unwrap();
+
+    // Reopen House 21 in Build/Buy edit mode and assert EVERY existing
+    // furnishing AND the newly placed Buy Mode object survived intact!
+    let dt_reopened =
+        open_destination_for_edit(&root, &store, "UserData", 21, &[3], Frames::default()).unwrap();
+    assert_eq!(dt_reopened.lot_name(), "Goth Downtown Lounge");
+    for &(id, guid, pos) in &baseline_furnishings {
+        let obj = dt_reopened.world().objects.get(&id).unwrap_or_else(|| {
+            panic!("baseline furnishing {id} (0x{guid:08X}) disappeared on edit reopen")
+        });
+        assert_eq!(obj.guid, guid);
+        assert_eq!(obj.position, pos);
+    }
+    let reopened_placed = dt_reopened
+        .world()
+        .objects
+        .get(&placed_id)
+        .expect("newly placed Buy Mode object survived edit reopen");
+    assert_eq!(reopened_placed.guid, candidate_guid);
+    assert_eq!(reopened_placed.position, placed_pos);
+    drop(dt_reopened);
 
     // Boot Goth House 5, tick 10 strict ticks so home lot has live state.
     let mut goth = enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
@@ -169,10 +241,62 @@ fn goth_downtown_house21_round_trip_and_community_edit_persistence() {
     assert_eq!(session.travelers.len(), 1);
     assert_eq!(dt.lot_name(), "Goth Downtown Lounge");
     assert_eq!(dt.lot_description(), "Persisted community edit");
+    for &(id, guid, pos) in &baseline_furnishings {
+        let obj = dt.world().objects.get(&id).unwrap_or_else(|| {
+            panic!("baseline furnishing {id} (0x{guid:08X}) disappeared on live travel")
+        });
+        assert_eq!(obj.guid, guid);
+        assert_eq!(obj.position, pos);
+    }
+    let live_placed = dt
+        .world()
+        .objects
+        .get(&placed_id)
+        .expect("newly placed Buy Mode object survived live travel");
+    assert_eq!(live_placed.guid, candidate_guid);
+    assert_eq!(live_placed.position, placed_pos);
 
-    // While away, REDB records `secondary_house == 21` on family 5.
+    // While away:
+    // 1. REDB records `secondary_house == 21` and an active trip on House 5.
+    // 2. Ordinary `save_and_leave_lot` on the live destination is REJECTED
+    //    (live visits can never overwrite Build/Buy snapshots).
+    // 3. Ordinary `enter_lot` on frozen home House 5 is REJECTED (protected by
+    //    the persisted `TRVL` envelope).
+    // 4. An UNRELATED write (editing & saving unoccupied Downtown House 22)
+    //    advances neighborhood revision without stranding the live trip!
     let nh_away = store.load_neighborhood("UserData").unwrap().unwrap();
     assert_eq!(nh_away.families[&5].secondary_house(), 21);
+    assert_eq!(
+        inspect_active_trip(&store, "UserData", 5)
+            .unwrap()
+            .expect("active trip persisted")
+            .trip_id,
+        session.trip_id
+    );
+    assert!(
+        save_and_leave_lot(&root, &store, "UserData", &mut dt).is_err(),
+        "live destination handle cannot overwrite Build/Buy snapshot via save_and_leave_lot"
+    );
+    assert!(
+        enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).is_err(),
+        "frozen home lot cannot be reopened via ordinary enter_lot while away"
+    );
+    let mut unrelated_edit =
+        open_destination_for_edit(&root, &store, "UserData", 22, &[3], Frames::default()).unwrap();
+    unrelated_edit.set_lot_info(
+        "Unrelated Downtown Cafe".to_string(),
+        "Edited while Goth family was at House 21".to_string(),
+    );
+    save_and_leave_lot(&root, &store, "UserData", &mut unrelated_edit).unwrap();
+    assert!(
+        store
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .revision
+            > dep.home_revision,
+        "unrelated edit advanced neighborhood revision"
+    );
 
     // Tick Downtown lot 220 ticks cleanly.
     step_community(&mut dt, 220, "downtown house 21");
@@ -229,21 +353,34 @@ fn goth_downtown_house21_round_trip_and_community_edit_persistence() {
         dt_motives_after
     );
 
-    // Verify secondary_house cleared back to 0 in REDB.
+    // Verify secondary_house cleared back to 0 in REDB, active trip cleared,
+    // and unrelated House 22 edit survived intact!
     let nh_after = store.load_neighborhood("UserData").unwrap().unwrap();
     assert_eq!(nh_after.families[&5].secondary_house(), 0);
     assert_eq!(nh_after.families[&5].budget, dt_funds_after);
+    assert!(
+        inspect_active_trip(&store, "UserData", 5)
+            .unwrap()
+            .is_none()
+    );
+    let check_22 =
+        open_destination_for_edit(&root, &store, "UserData", 22, &[3], Frames::default()).unwrap();
+    assert_eq!(check_22.lot_name(), "Unrelated Downtown Cafe");
+    drop(check_22);
 
     // Home lot ticks cleanly in strict mode after returning.
     step_strict(&mut home_after, 50, "goth home post-downtown return");
 
     // Second visit to Downtown House 21 verifies community-lot REDB persistence
-    // (lot metadata kept, zero duplicate Mortimer stranded from Visit 1).
+    // (lot metadata & furnishings kept, zero duplicate Mortimer stranded from
+    // Visit 1) AND proves Visit 1's retained session cannot return Visit 2!
     let req2 = TravelRequest::downtown(21, mortimer_guid);
     let dep2 = depart_to_destination(&root, &store, "UserData", &mut home_after, &req2).unwrap();
     let mut dt2 = dep2.destination_lot;
+    assert_ne!(dep2.session.trip_id, session.trip_id);
     assert_eq!(dt2.lot_name(), "Goth Downtown Lounge");
     assert_eq!(dt2.lot_description(), "Persisted community edit");
+    assert!(dt2.world().objects.contains_key(&placed_id));
     let dt2_mortimers = dt2
         .world()
         .people
@@ -251,6 +388,13 @@ fn goth_downtown_house21_round_trip_and_community_edit_persistence() {
         .filter(|id| dt2.world().objects[id].guid == mortimer_guid)
         .count();
     assert_eq!(dt2_mortimers, 1, "no duplicate traveler on second visit");
+    assert!(
+        matches!(
+            return_from_destination(&root, &store, &session, &mut dt2, &[3], Frames::default()),
+            Err(TravelError::SessionMismatch(_))
+        ),
+        "old Visit 1 session must not return Visit 2's destination handle"
+    );
     step_community(&mut dt2, 60, "downtown house 21 second visit");
     let ret2 = return_from_destination(
         &root,
@@ -579,4 +723,132 @@ fn goth_old_town_community_house58_and_atomicity_guards() {
     ));
 
     step_strict(&mut home_after, 30, "goth home post-oldtown");
+}
+
+#[test]
+fn active_trip_crash_resume_and_abort_recovery() {
+    let Some(root) = install() else {
+        return;
+    };
+    let db = TempDb::new("recovery");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .import_directory("UserData", &root.join("UserData"), 0xff)
+        .unwrap();
+
+    let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+    let goth_members = nh.family_in(5).unwrap().1.members.clone();
+    let mortimer_guid = goth_members[0];
+
+    let mut goth = enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+    step_strict(&mut goth, 5, "goth home pre-recovery");
+    let frozen_ticks = goth.ticks();
+    let frozen_clock = (
+        goth.world().globals[0],
+        goth.world().globals[5],
+        goth.world().globals[6],
+    );
+
+    // 1. Depart to Vacation House 40 with hotel check-in, then simulate a
+    //    crash/restart by dropping the live destination handle.
+    let req = TravelRequest::vacation(
+        40,
+        mortimer_guid,
+        VacationAccommodation::HotelCheckIn {
+            grant_hotel_key: true,
+        },
+    );
+    let dep = depart_to_destination(&root, &store, "UserData", &mut goth, &req).unwrap();
+    let old_trip_id = dep.session.trip_id;
+    let mut stale_vac = dep.destination_lot;
+
+    let inspected = inspect_active_trip(&store, "UserData", 5)
+        .unwrap()
+        .expect("active trip visible after crash/restart");
+    assert_eq!(inspected.trip_id, old_trip_id);
+    assert_eq!(inspected.destination_house, 40);
+
+    // Resume the active trip: rotates `trip_id`, invalidates the old handle,
+    // boots Vacation House 40 with all travelers & hotel keys, and returns home!
+    let resumed =
+        resume_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+    assert_ne!(resumed.session.trip_id, old_trip_id);
+    assert!(
+        matches!(
+            return_from_destination(
+                &root,
+                &store,
+                &dep.session,
+                &mut stale_vac,
+                &[3],
+                Frames::default()
+            ),
+            Err(TravelError::SessionMismatch(_))
+        ),
+        "stale pre-resume destination handle rejected after resume_active_trip"
+    );
+    drop(stale_vac);
+
+    let mut vac = resumed.destination_lot;
+    step_community(&mut vac, 40, "resumed vacation house 40");
+    let ret = return_from_destination(
+        &root,
+        &store,
+        &resumed.session,
+        &mut vac,
+        &[3],
+        Frames::default(),
+    )
+    .unwrap();
+    let mut home_after_resume = ret.home_lot;
+    assert_eq!(home_after_resume.ticks(), frozen_ticks);
+    assert_eq!(ret.report.restored_home_clock, frozen_clock);
+    assert!(
+        inspect_active_trip(&store, "UserData", 5)
+            .unwrap()
+            .is_none()
+    );
+    step_strict(&mut home_after_resume, 20, "goth home post-resume");
+
+    // 2. Depart again to Vacation House 40, simulate a halted destination /
+    //    crash by dropping the handle, and settle via `abort_active_trip`.
+    let ticks_before_abort = home_after_resume.ticks();
+    let clock_before_abort = (
+        home_after_resume.world().globals[0],
+        home_after_resume.world().globals[5],
+        home_after_resume.world().globals[6],
+    );
+    let dep2 =
+        depart_to_destination(&root, &store, "UserData", &mut home_after_resume, &req).unwrap();
+    let aborted_travelers = dep2.session.travelers.clone();
+    drop(dep2.destination_lot);
+
+    let aborted = abort_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+    let mut home_after_abort = aborted.home_lot;
+    assert_eq!(home_after_abort.ticks(), ticks_before_abort);
+    assert_eq!(aborted.report.restored_home_clock, clock_before_abort);
+    assert!(
+        inspect_active_trip(&store, "UserData", 5)
+            .unwrap()
+            .is_none()
+    );
+    let nh_after_abort = store.load_neighborhood("UserData").unwrap().unwrap();
+    assert_eq!(nh_after_abort.families[&5].secondary_house(), 0);
+    for t in &aborted_travelers {
+        assert_eq!(
+            neighbor_token_count(
+                home_after_abort.world(),
+                t.neighbor_id,
+                HOTEL_KEY_TOKEN_KIND,
+                HOTEL_KEY_TOKEN_GUID,
+            ),
+            0,
+            "temporary hotel keys cleared on abort_active_trip"
+        );
+    }
+    step_strict(&mut home_after_abort, 30, "goth home post-abort");
+    save_and_leave_lot(&root, &store, "UserData", &mut home_after_abort).unwrap();
+    // Normal `enter_lot` works again once the `TRVL` envelope is unwrapped.
+    let mut reopened = enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+    step_strict(&mut reopened, 10, "goth home normal enter_lot post-abort");
 }

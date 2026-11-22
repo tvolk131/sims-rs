@@ -20,32 +20,48 @@
 //!    - **Magic Town** (`90..=98`, Makin' Magic `0x80`; `90..=92` residential,
 //!      `93..=98` community): `$0` Magic Hole or `$50` Magic Blimp, single human
 //!      Sim (adult or child) or household group/family.
-//! 2. **Departure & Destination Lot Boot ([`depart_to_destination`]):**
-//!    - Validates eligibility and fare, prepares the frozen home lot snapshot
-//!      (deducting fare, flushing live persons to `NBRS`, refreshing lot values,
-//!      setting `family.secondary_house = destination_house`, and preserving the
-//!      home lot's exact clock and non-traveling Sims/pets), boots the
-//!      destination lot from REDB in live spending mode (`globals[32] = 0`,
-//!      `globals[9] = home_family`, `globals[10] = destination_house`), injects
-//!      the traveling party with live motives/skills/career/fame/relationships/
-//!      outfits/funds/MagiCoins/tokens near the arrival portal, and commits the
-//!      frozen home snapshot atomically once destination boot succeeds.
-//! 3. **Return Home & Reconciliation ([`return_from_destination`]):**
+//! 2. **Departure, `TRVL` Envelope & Destination Boot ([`depart_to_destination`]):**
+//!    - Validates eligibility (using the install's detected expansion bitmask),
+//!      live budget mode (`globals[32] == 0`), and fare; prepares the frozen
+//!      home lot snapshot (deducting fare into `budget.days[0]`, flushing live
+//!      persons to `NBRS`, refreshing lot values, setting
+//!      `family.secondary_house = destination_house`, and preserving the home
+//!      lot's exact clock and non-traveling Sims/pets); boots the destination
+//!      lot from REDB in live spending mode (`globals[32] = 0`, `globals[9] =
+//!      home_family`, `globals[10] = destination_house`); injects the traveling
+//!      party with live motives/skills/career/fame/accessories/relationships/
+//!      outfits/funds/MagiCoins/tokens near the arrival portal (establishing
+//!      mutual `person.data[77]` links on Downtown Dates and using
+//!      [`select_sim`]); and atomically persists a `TRVL` active-trip envelope
+//!      in `NEIGHBORHOOD_LOTS[(nh, home_house)]` alongside `secondary_house`
+//!      (blocking ordinary `enter_lot` on the frozen home lot while binding the
+//!      live destination handle exclusively to its unique `trip_id` with
+//!      `neighborhood_origin = None` so `save_and_leave_lot` cannot overwrite
+//!      Build/Buy destination snapshots).
+//! 3. **Return Home, Concurrent-Write Reconciliation & Crash Recovery
+//!    ([`return_from_destination`], [`inspect_active_trip`],
+//!    [`resume_active_trip`], [`abort_active_trip`]):**
+//!    - Fences return on `(store_id, instance_id, trip_id)` rather than
+//!      freezing `departure_revision`, so unrelated neighborhood writes made
+//!      while away do not strand an active trip while retained sessions from
+//!      older trips to the same lot are rejected.
 //!    - Flushes all live destination persons to `NBRS`, captures updated
-//!      motives, skills, career/fame, relationships (including newly met
-//!      townies/vacationers/celebrities/magic NPCs), funds & MagiCoins delta,
-//!      outfits, and inventory tokens (revoking temporary Vacation hotel keys
-//!      granted on check-in while keeping souvenirs/gifts/ingredients/MagiCoins).
+//!      motives, skills, career/fame, accessories, relationships, funds &
+//!      MagiCoins delta, outfits, and inventory tokens (revoking temporary
+//!      Vacation hotel keys granted on check-in while keeping souvenirs/gifts/
+//!      ingredients/MagiCoins), and selectively merges destination updates onto
+//!      the latest `StoredNeighborhood`.
 //!    - Preserves any Build/Buy community-lot edits stored in REDB untouched
-//!      (matching `Sims.exe` 1.91, where leaving a live away-from-home visit
-//!      discards transient visit mess/NPCs rather than overwriting the
-//!      destination lot; community-lot Build/Buy edits use
+//!      (matching `Sims.exe` 1.91; community-lot Build/Buy edits use
 //!      [`open_destination_for_edit`] + [`crate::lifecycle::save_and_leave_lot`]).
-//!    - Reconciles and resumes the frozen home lot at its exact departure tick
-//!      with returning household travelers placed cleanly at the home
-//!      curb/portal and zero duplicate or orphaned objects, committing the
-//!      reconciled home lot and updated `StoredNeighborhood` in a single atomic
-//!      checked REDB transaction.
+//!    - Reconciles and resumes the frozen home lot directly from the persisted
+//!      `Saved` snapshot at its exact departure tick and clock with returning
+//!      household travelers placed cleanly at the home curb/portal and zero
+//!      duplicate or orphaned objects, unwrapping `TRVL` back to a normal saved
+//!      lot in a single atomic checked REDB transaction.
+//!    - Provides checked recovery after crashes, restarts, or halted
+//!      destination lots via [`inspect_active_trip`], [`resume_active_trip`],
+//!      and [`abort_active_trip`].
 
 use crate::boot::save::Saved;
 use crate::boot::{Finished, Frames, LoadReport, Lot, NeighborhoodOrigin, opening_rotation};
@@ -61,6 +77,7 @@ use serde::{Deserialize, Serialize};
 use sims_content::{Animations, Catalog, House, Index, Install, People, SurfaceCatalog, Surfaces};
 use sims_core::CrtRng;
 use sims_formats::iff::Iff;
+use sims_formats::saved_objects::Accessory;
 use sims_formats::strings::StringTable;
 use sims_sim::load::{Context, ExpandedWall, FLOORS, WALLS, visitor_again};
 use sims_sim::neighborhood_store::{
@@ -73,6 +90,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Magic prefix and format version for persisted active-trip envelopes stored
+/// in `NEIGHBORHOOD_LOTS[(neighborhood_id, home_house)]` while a household is
+/// away from home. Because `Saved::decode` expects `FORMAT = 8u32` LE, this
+/// envelope simultaneously persists the authoritative trip record atomically
+/// with `secondary_house` AND prevents `lifecycle::enter_lot` from opening or
+/// overwriting the frozen home lot while the trip is active.
+const TRAVEL_ENVELOPE_MAGIC: &[u8; 4] = b"TRVL";
+const TRAVEL_ENVELOPE_VERSION: u32 = 1;
+
+static NEXT_TRIP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Installed-expansion bits (`[0x6e48bc] + 0x66`, `Program::expansions`).
 pub const EXPANSION_HOT_DATE: u16 = 0x04;
@@ -655,11 +684,18 @@ pub struct TravelerRecord {
 }
 
 /// Active away-from-home travel session returned by [`depart_to_destination`]
-/// and consumed by [`return_from_destination`].
+/// (or recovered via [`resume_active_trip`] / [`inspect_active_trip`]) and
+/// consumed by [`return_from_destination`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TravelSession {
     pub store_id: u128,
     pub neighborhood_id: String,
+    /// Neighborhood instance lifetime ID at departure (fences against
+    /// delete/re-import of the same neighborhood name).
+    pub instance_id: u128,
+    /// Unique non-zero departure identifier binding this session, the live
+    /// destination handle, and the persisted REDB `TRVL` envelope together.
+    pub trip_id: u128,
     pub home_house: u32,
     pub home_family: u16,
     pub destination_house: u32,
@@ -963,13 +999,19 @@ pub fn validate_travel_plan(
         )));
     }
 
-    // Check household funds when not in unlimited edit mode (`globals[32] == 0`).
+    // Departures require live budget mode (`globals[32] == 0`) so fare
+    // deductions always execute against real household funds.
     let budget_mode = home_world
         .globals
         .get(GLOBAL_BUDGET_MODE)
         .copied()
         .unwrap_or(0);
-    if budget_mode == 0 && fare > 0 && home_world.budget.funds < fare {
+    if budget_mode != 0 {
+        return Err(TravelError::SessionMismatch(format!(
+            "cannot depart while home lot {home_house} is in unlimited budget mode (globals[32]={budget_mode})"
+        )));
+    }
+    if fare > 0 && home_world.budget.funds < fare {
         return Err(TravelError::InsufficientFunds {
             family: home_family_id,
             available: home_world.budget.funds,
@@ -1175,16 +1217,20 @@ pub fn validate_travel_plan(
                     "Magic Town group leader must be a human household member".into(),
                 ));
             }
-            let mut seen = BTreeSet::from([leader.guid]);
+            // Allow `leader_guid` to appear at most once in `member_guids` and
+            // reject any duplicate GUID (including repeated leader GUIDs).
+            let mut seen_in_list = BTreeSet::new();
+            for &guid in member_guids {
+                if !seen_in_list.insert(guid) {
+                    return Err(TravelError::InvalidParty(format!(
+                        "duplicate member GUID 0x{guid:08X} in travel party"
+                    )));
+                }
+            }
             members.push(leader);
             for &guid in member_guids {
                 if guid == leader_guid {
                     continue;
-                }
-                if !seen.insert(guid) {
-                    return Err(TravelError::InvalidParty(format!(
-                        "duplicate member GUID 0x{guid:08X} in travel party"
-                    )));
                 }
                 members.push(lookup_member(guid, true)?);
             }
@@ -1208,8 +1254,9 @@ pub fn validate_travel_plan(
     })
 }
 
-/// Live per-traveler snapshot carried across the home ↔ destination boundary.
-#[derive(Debug, Clone)]
+/// Live per-traveler snapshot carried across the home ↔ destination boundary
+/// (and persisted in the REDB `TRVL` envelope for crash/restart recovery).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LiveTravelerSnapshot {
     guid: u32,
     neighbor_id: i16,
@@ -1218,9 +1265,118 @@ struct LiveTravelerSnapshot {
     motives: [f32; 16],
     previous_motives: [f32; 16],
     person_data: Vec<i16>,
+    accessories: Vec<Accessory>,
     outfit: Option<PersonOutfit>,
     made_outfits: Option<BTreeMap<usize, String>>,
     had_hotel_key_before_trip: bool,
+}
+
+/// Active-trip envelope persisted atomically in
+/// `NEIGHBORHOOD_LOTS[(neighborhood_id, home_house)]` while away.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedTravelRecord {
+    trip_id: u128,
+    is_date: bool,
+    view_centre: Option<[i8; 2]>,
+    session: TravelSession,
+    departure_snapshots: Vec<LiveTravelerSnapshot>,
+    frozen_home_bytes: Vec<u8>,
+}
+
+fn mix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+fn alloc_trip_id(
+    store_id: u128,
+    instance_id: u128,
+    revision: u64,
+    home_house: u32,
+    dest_house: u32,
+    home_family: u16,
+) -> u128 {
+    let seq = NEXT_TRIP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let hi = mix64(
+        (store_id as u64)
+            ^ ((instance_id >> 64) as u64)
+            ^ revision.rotate_left(17)
+            ^ ((u64::from(home_house) << 32) | u64::from(dest_house)),
+    );
+    let lo = mix64(
+        ((store_id >> 64) as u64)
+            ^ (instance_id as u64)
+            ^ seq.rotate_left(29)
+            ^ u64::from(home_family),
+    );
+    let id = (u128::from(hi) << 64) | u128::from(lo);
+    if id == 0 { 1 } else { id }
+}
+
+fn trip_binding_tag(store_id: u128, trip_id: u128) -> [u8; 32] {
+    let w0 = mix64((store_id as u64) ^ (trip_id as u64) ^ 0x5452_564c_0001);
+    let w1 = mix64(((store_id >> 64) as u64) ^ ((trip_id >> 64) as u64) ^ 0x5452_564c_0002);
+    let w2 = mix64(
+        (store_id as u64).rotate_left(19) ^ (trip_id as u64).rotate_left(13) ^ 0x5452_564c_0003,
+    );
+    let w3 = mix64(
+        ((store_id >> 64) as u64).rotate_left(7)
+            ^ ((trip_id >> 64) as u64).rotate_left(23)
+            ^ 0x5452_564c_0004,
+    );
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&w0.to_le_bytes());
+    out[8..16].copy_from_slice(&w1.to_le_bytes());
+    out[16..24].copy_from_slice(&w2.to_le_bytes());
+    out[24..32].copy_from_slice(&w3.to_le_bytes());
+    if out == [0u8; 32] {
+        out[0] = 1;
+    }
+    out
+}
+
+fn is_travel_envelope(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && &bytes[0..4] == TRAVEL_ENVELOPE_MAGIC
+}
+
+fn encode_travel_envelope(record: &PersistedTravelRecord) -> Result<Vec<u8>, TravelError> {
+    let payload = postcard::to_allocvec(record)
+        .map_err(|e| TravelError::Lot(format!("encoding active travel envelope: {e}")))?;
+    let mut out = Vec::with_capacity(8 + payload.len());
+    out.extend_from_slice(TRAVEL_ENVELOPE_MAGIC);
+    out.extend_from_slice(&TRAVEL_ENVELOPE_VERSION.to_le_bytes());
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+fn decode_travel_envelope(bytes: &[u8]) -> Result<PersistedTravelRecord, TravelError> {
+    if !is_travel_envelope(bytes) {
+        return Err(TravelError::SessionMismatch(
+            "home lot does not hold an active away-from-home travel envelope".into(),
+        ));
+    }
+    let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if version != TRAVEL_ENVELOPE_VERSION {
+        return Err(TravelError::SessionMismatch(format!(
+            "unsupported travel envelope version {version} (expected {TRAVEL_ENVELOPE_VERSION})"
+        )));
+    }
+    let (record, rest) = postcard::take_from_bytes::<PersistedTravelRecord>(&bytes[8..])
+        .map_err(|e| TravelError::SessionMismatch(format!("corrupt travel envelope: {e}")))?;
+    if !rest.is_empty() {
+        return Err(TravelError::SessionMismatch(format!(
+            "corrupt travel envelope: {} trailing byte(s)",
+            rest.len()
+        )));
+    }
+    if record.trip_id == 0 || record.trip_id != record.session.trip_id {
+        return Err(TravelError::SessionMismatch(
+            "corrupt travel envelope: inconsistent trip_id".into(),
+        ));
+    }
+    Ok(record)
 }
 
 /// Captures live traveler state from `world` (falling back to `NBRS` person data
@@ -1248,6 +1404,7 @@ fn capture_traveler_snapshot(
             motives: person.motives,
             previous_motives: person.previous_motives,
             person_data: person.data.clone(),
+            accessories: person.accessories.clone(),
             outfit: world.person_outfits.get(&obj_id).cloned(),
             made_outfits,
             had_hotel_key_before_trip: had_hotel_key,
@@ -1268,10 +1425,97 @@ fn capture_traveler_snapshot(
         motives: [50.0; 16],
         previous_motives: [50.0; 16],
         person_data: record.data.clone(),
+        accessories: Vec::new(),
         outfit: None,
         made_outfits,
         had_hotel_key_before_trip: had_hotel_key,
     })
+}
+
+/// Safely selects `sim` on `lot`, handling Superstar celebrity deselection
+/// (`person.data[81] >= 10`, unported star-marker pool `0x446c15`) and active
+/// Downtown date links (`person.data[77] != 0`, unported second indicator
+/// `0x44664c`) while preserving exact fame and date words on every Sim.
+pub fn select_sim(lot: &mut Lot, sim: u16) -> Result<Vec<crate::SoundEvent>, TravelError> {
+    let mut saved: Vec<(u16, i16, i16)> = Vec::new();
+    let prev = selected(&lot.world);
+    for id in prev.into_iter().chain(std::iter::once(sim)) {
+        if saved.iter().any(|&(s, _, _)| s == id) {
+            continue;
+        }
+        if let Some(person) = lot
+            .world
+            .objects
+            .get_mut(&id)
+            .and_then(|o| o.person.as_mut())
+        {
+            let fame = person.data.get(PERSON_FAME_LEVEL).copied().unwrap_or(0);
+            let date = person.data.get(PERSON_DATE).copied().unwrap_or(0);
+            saved.push((id, fame, date));
+            if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
+                *f = 0;
+            }
+            if let Some(d) = person.data.get_mut(PERSON_DATE) {
+                *d = 0;
+            }
+        }
+    }
+    let result = lot.select(sim);
+    for (id, fame, date) in saved {
+        if let Some(person) = lot
+            .world
+            .objects
+            .get_mut(&id)
+            .and_then(|o| o.person.as_mut())
+        {
+            if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
+                *f = fame;
+            }
+            if let Some(d) = person.data.get_mut(PERSON_DATE) {
+                *d = date;
+            }
+        }
+    }
+    result.map_err(|e| TravelError::Lot(format!("selecting Sim {sim}: {e}")))
+}
+
+/// Internal world-level equivalent of [`select_sim`] used during destination
+/// arrival and home reconciliation.
+fn select_sim_in_world(
+    interpreter: &Interpreter<'_>,
+    world: &mut World,
+    sim: u16,
+) -> Result<(), TravelError> {
+    let mut saved: Vec<(u16, i16, i16)> = Vec::new();
+    let prev = selected(world);
+    for id in prev.into_iter().chain(std::iter::once(sim)) {
+        if saved.iter().any(|&(s, _, _)| s == id) {
+            continue;
+        }
+        if let Some(person) = world.objects.get_mut(&id).and_then(|o| o.person.as_mut()) {
+            let fame = person.data.get(PERSON_FAME_LEVEL).copied().unwrap_or(0);
+            let date = person.data.get(PERSON_DATE).copied().unwrap_or(0);
+            saved.push((id, fame, date));
+            if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
+                *f = 0;
+            }
+            if let Some(d) = person.data.get_mut(PERSON_DATE) {
+                *d = 0;
+            }
+        }
+    }
+    let result = interpreter.select(world, Some(sim));
+    for (id, fame, date) in saved {
+        if let Some(person) = world.objects.get_mut(&id).and_then(|o| o.person.as_mut()) {
+            if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
+                *f = fame;
+            }
+            if let Some(d) = person.data.get_mut(PERSON_DATE) {
+                *d = date;
+            }
+        }
+    }
+    result.map_err(|e| TravelError::Lot(format!("selecting Sim {sim}: {e}")))
 }
 
 /// Atomically departs from `home_lot` to `request.destination_house`:
@@ -1340,6 +1584,11 @@ pub fn depart_to_destination(
             current_revision: dest_snapshot.neighborhood.revision,
         });
     }
+    if origin.revision == u64::MAX {
+        return Err(TravelError::Lot(
+            "neighborhood revision counter exhausted before departure".into(),
+        ));
+    }
     if dest_snapshot.saved_lot.is_none() && dest_snapshot.base_house.is_none() {
         return Err(TravelError::HouseNotFound {
             neighborhood: neighborhood_id.to_owned(),
@@ -1347,13 +1596,17 @@ pub fn depart_to_destination(
         });
     }
 
+    let install = Install::detect(install_root).map_err(|e| TravelError::Lot(e.to_string()))?;
+    let detected_expansions = u16::from(install.expansions.0);
+    let effective_expansions = detected_expansions & home_lot.program.expansions;
+
     let home_house = home_lot.load.house;
     let home_family = home_lot.load.family;
     let plan = validate_travel_plan(
         &home_lot.world,
         home_house,
         home_family,
-        home_lot.program.expansions,
+        effective_expansions,
         &dest_snapshot.neighborhood,
         request,
     )?;
@@ -1396,6 +1649,7 @@ pub fn depart_to_destination(
     let mut frozen_home = home_lot
         .save()
         .map_err(|e| TravelError::Lot(format!("snapshotting home lot {home_house}: {e}")))?;
+    ensure_today_budget_slot(&mut frozen_home.world);
 
     // Deduct travel fare from the staged home lot snapshot.
     if plan.fare > 0 {
@@ -1404,11 +1658,14 @@ pub fn depart_to_destination(
             .world
             .set_funds(new_funds)
             .map_err(|e| TravelError::Lot(format!("deducting travel fare: {e}")))?;
-        if let Some(Some(today)) = frozen_home.world.budget.days.first_mut() {
-            today[5] = today[5].wrapping_add(plan.fare);
-        }
     }
     let funds_at_arrival = frozen_home.world.budget.funds;
+    let actual_fare = funds_before_fare.wrapping_sub(funds_at_arrival);
+    if actual_fare > 0
+        && let Some(Some(today)) = frozen_home.world.budget.days.first_mut()
+    {
+        today[5] = today[5].wrapping_add(actual_fare);
+    }
 
     // Flush every live home person into `NBRS` on the staged frozen home copy.
     for person_id in frozen_home.world.people.clone() {
@@ -1424,7 +1681,6 @@ pub fn depart_to_destination(
     }
 
     // Recompute home lot values & write back neighborhood state onto a staged copy.
-    let install = Install::detect(install_root).map_err(|e| TravelError::Lot(e.to_string()))?;
     let prices = LotPrices::load(&install, &home_lot.surfaces);
     let tuning = NeighborhoodTuning::from_program(&home_lot.program);
     let home_interp = Interpreter {
@@ -1459,6 +1715,16 @@ pub fn depart_to_destination(
     }
     frozen_home.deletion_epoch = staged_stored.deletion_epoch;
 
+    let trip_id = alloc_trip_id(
+        store.store_id(),
+        origin.instance_id,
+        origin.revision,
+        home_house,
+        request.destination_house,
+        home_family,
+    );
+    let is_date = matches!(request.party, TravelParty::Date { .. });
+
     // Boot destination lot in memory BEFORE committing REDB, so any destination
     // boot/injection failure rolls back cleanly with zero REDB/home mutations.
     let runtime = StoreRuntime::from_snapshot(
@@ -1469,9 +1735,16 @@ pub fn depart_to_destination(
     let (mut dest_lot, traveler_records) = boot_destination_lot(
         runtime,
         store.store_id(),
+        trip_id,
         neighborhood_id,
-        request,
-        &plan,
+        request.destination_house,
+        plan.transport,
+        plan.accommodation,
+        plan.leader_guid,
+        is_date,
+        request.view_centre,
+        &request.answers,
+        request.frames.clone(),
         home_family,
         funds_at_arrival,
         &snapshots,
@@ -1479,14 +1752,48 @@ pub fn depart_to_destination(
         dest_snapshot.base_house,
     )?;
 
-    // Destination boot succeeded: commit the frozen home lot + updated
-    // neighborhood atomically in REDB with an in-transaction revision check.
+    let mut session = TravelSession {
+        store_id: store.store_id(),
+        instance_id: origin.instance_id,
+        trip_id,
+        neighborhood_id: neighborhood_id.to_owned(),
+        home_house,
+        home_family,
+        destination_house: request.destination_house,
+        destination: plan.destination,
+        transport: plan.transport,
+        accommodation: plan.accommodation,
+        fare_paid: actual_fare,
+        departure_ticks,
+        departure_world_ticks,
+        departure_clock,
+        funds_before_fare,
+        funds_at_arrival,
+        magic_coins_at_arrival,
+        leader_guid: plan.leader_guid,
+        travelers: traveler_records,
+    };
+
+    // Destination boot succeeded: persist the authoritative trip envelope
+    // (wrapping `frozen_home_bytes`, `session`, and `departure_snapshots`) +
+    // updated neighborhood atomically in REDB with an in-transaction revision
+    // check. Wrapping in `TRVL` simultaneously enables crash/halt recovery and
+    // prevents ordinary `lifecycle::enter_lot` from opening or overwriting the
+    // frozen home lot while the household is away.
     let frozen_home_bytes = frozen_home.encode();
+    let envelope_bytes = encode_travel_envelope(&PersistedTravelRecord {
+        trip_id,
+        is_date,
+        view_centre: request.view_centre,
+        session: session.clone(),
+        departure_snapshots: snapshots,
+        frozen_home_bytes,
+    })?;
     let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
         neighborhood_id,
         home_house,
         Some((origin.instance_id, origin.revision)),
-        &frozen_home_bytes,
+        &envelope_bytes,
         &staged_stored,
         &[],
     )? {
@@ -1507,44 +1814,594 @@ pub fn depart_to_destination(
     };
 
     // Invalidate the frozen `home_lot` handle's origin so a caller cannot
-    // overwrite REDB via `save_and_leave_lot` or depart again while away; bind
-    // `dest_lot` to the newly committed revision.
-    if plan.fare > 0 {
+    // overwrite REDB via `save_and_leave_lot` or depart again while away.
+    // `dest_lot` already has `neighborhood_origin = None` (so ordinary
+    // `save_and_leave_lot` can never overwrite the Build/Buy destination
+    // snapshot) and `loaded = trip_binding_tag(store_id, trip_id)`.
+    if actual_fare > 0 {
         let _ = home_lot.world.set_funds(funds_at_arrival);
     }
     home_lot.neighborhood_origin = None;
-    dest_lot.neighborhood_origin = Some(NeighborhoodOrigin {
-        store_id: store.store_id(),
-        neighborhood_id: neighborhood_id.to_owned(),
-        instance_id: committed_instance,
-        revision: committed_revision,
-    });
-
-    let session = TravelSession {
-        store_id: store.store_id(),
-        neighborhood_id: neighborhood_id.to_owned(),
-        home_house,
-        home_family,
-        destination_house: request.destination_house,
-        destination: plan.destination,
-        transport: plan.transport,
-        accommodation: plan.accommodation,
-        fare_paid: plan.fare,
-        departure_ticks,
-        departure_world_ticks,
-        departure_clock,
-        funds_before_fare,
-        funds_at_arrival,
-        magic_coins_at_arrival,
-        leader_guid: plan.leader_guid,
-        travelers: traveler_records,
-    };
+    session.instance_id = committed_instance;
+    dest_lot.neighborhood_origin = None;
+    dest_lot.loaded = trip_binding_tag(store.store_id(), trip_id);
 
     Ok(DepartureResult {
         destination_lot: dest_lot,
         session,
         home_revision: committed_revision,
     })
+}
+
+/// Inspects whether `home_house` in `neighborhood_id` currently has an active
+/// away-from-home trip persisted in REDB (e.g. after a process restart or
+/// destination fault).
+///
+/// Returns `Ok(None)` when `home_house` is at home normally, `Ok(Some(session))`
+/// when a valid active trip envelope matches `StoredNeighborhood`, or
+/// `Err(TravelError::SessionMismatch(_))` if the persisted envelope is corrupt
+/// or inconsistent with `StoredNeighborhood`.
+pub fn inspect_active_trip(
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_house: u32,
+) -> Result<Option<TravelSession>, TravelError> {
+    let Some(snapshot) = store.load_lot_snapshot(neighborhood_id, home_house)? else {
+        return Err(TravelError::NeighborhoodNotFound(
+            neighborhood_id.to_owned(),
+        ));
+    };
+    let Some(bytes) = snapshot.saved_lot.as_deref() else {
+        return Ok(None);
+    };
+    if !is_travel_envelope(bytes) {
+        return Ok(None);
+    }
+    let persisted = decode_travel_envelope(bytes)?;
+    verify_persisted_trip_against_snapshot(
+        store.store_id(),
+        neighborhood_id,
+        home_house,
+        &snapshot.neighborhood,
+        &persisted,
+    )?;
+    Ok(Some(persisted.session))
+}
+
+/// Resumes a persisted active away-from-home trip for `home_house` (for example
+/// after a crash/restart or a halted destination lot), rebooting the
+/// destination lot cleanly from the persisted departure snapshots and rotating
+/// `trip_id` atomically in REDB so any prior destination handle is invalidated.
+pub fn resume_active_trip(
+    install_root: &Path,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_house: u32,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<DepartureResult, TravelError> {
+    let install = Install::detect(install_root).map_err(|e| TravelError::Lot(e.to_string()))?;
+    let detected_expansions = u16::from(install.expansions.0);
+
+    let home_snapshot = store
+        .load_lot_snapshot(neighborhood_id, home_house)?
+        .ok_or_else(|| TravelError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    let Some(bytes) = home_snapshot.saved_lot.as_deref() else {
+        return Err(TravelError::SessionMismatch(format!(
+            "house {home_house} has no active away-from-home trip"
+        )));
+    };
+    let mut persisted = decode_travel_envelope(bytes)?;
+    verify_persisted_trip_against_snapshot(
+        store.store_id(),
+        neighborhood_id,
+        home_house,
+        &home_snapshot.neighborhood,
+        &persisted,
+    )?;
+
+    let required_bit = persisted.session.destination.expansion_bit();
+    if detected_expansions & required_bit == 0 {
+        return Err(TravelError::ExpansionNotInstalled {
+            destination: persisted.session.destination,
+            required_bit,
+            installed: detected_expansions,
+        });
+    }
+
+    let dest_house = persisted.session.destination_house;
+    let dest_snapshot = store
+        .load_lot_snapshot(neighborhood_id, dest_house)?
+        .ok_or_else(|| TravelError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    if dest_snapshot.neighborhood.instance_id != home_snapshot.neighborhood.instance_id {
+        return Err(TravelError::NeighborhoodMismatch {
+            expected: format!(
+                "{neighborhood_id}#{:032x}",
+                home_snapshot.neighborhood.instance_id
+            ),
+            actual: format!(
+                "{neighborhood_id}#{:032x}",
+                dest_snapshot.neighborhood.instance_id
+            ),
+        });
+    }
+    if dest_snapshot.neighborhood.revision != home_snapshot.neighborhood.revision {
+        return Err(TravelError::StaleNeighborhood {
+            neighborhood: neighborhood_id.to_owned(),
+            expected_revision: home_snapshot.neighborhood.revision,
+            current_revision: dest_snapshot.neighborhood.revision,
+        });
+    }
+    if home_snapshot.neighborhood.revision == u64::MAX {
+        return Err(TravelError::Lot(
+            "neighborhood revision counter exhausted before resume".into(),
+        ));
+    }
+    if dest_snapshot.saved_lot.is_none() && dest_snapshot.base_house.is_none() {
+        return Err(TravelError::HouseNotFound {
+            neighborhood: neighborhood_id.to_owned(),
+            house: dest_house,
+        });
+    }
+
+    let new_trip_id = alloc_trip_id(
+        store.store_id(),
+        home_snapshot.neighborhood.instance_id,
+        home_snapshot.neighborhood.revision,
+        home_house,
+        dest_house,
+        persisted.session.home_family,
+    );
+
+    let runtime = StoreRuntime::from_snapshot(
+        install_root,
+        home_snapshot.neighborhood.clone(),
+        &dest_snapshot.character_files,
+    )?;
+    let (mut dest_lot, traveler_records) = boot_destination_lot(
+        runtime,
+        store.store_id(),
+        new_trip_id,
+        neighborhood_id,
+        dest_house,
+        persisted.session.transport,
+        persisted.session.accommodation,
+        persisted.session.leader_guid,
+        persisted.is_date,
+        persisted.view_centre,
+        answers,
+        frames,
+        persisted.session.home_family,
+        persisted.session.funds_at_arrival,
+        &persisted.departure_snapshots,
+        dest_snapshot.saved_lot.as_deref(),
+        dest_snapshot.base_house,
+    )?;
+
+    persisted.trip_id = new_trip_id;
+    persisted.session.trip_id = new_trip_id;
+    persisted.session.instance_id = home_snapshot.neighborhood.instance_id;
+    persisted.session.travelers = traveler_records;
+    let envelope_bytes = encode_travel_envelope(&persisted)?;
+
+    let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
+        neighborhood_id,
+        home_house,
+        Some((
+            home_snapshot.neighborhood.instance_id,
+            home_snapshot.neighborhood.revision,
+        )),
+        &envelope_bytes,
+        &home_snapshot.neighborhood,
+        &[],
+    )? {
+        Ok(version) => version,
+        Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
+            return Err(TravelError::NeighborhoodMismatch {
+                expected: format!("{neighborhood_id}#{expected:032x}"),
+                actual: format!("{neighborhood_id}#{current:032x}"),
+            });
+        }
+        Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
+            return Err(TravelError::StaleNeighborhood {
+                neighborhood: neighborhood_id.to_owned(),
+                expected_revision: expected,
+                current_revision: current,
+            });
+        }
+    };
+
+    persisted.session.instance_id = committed_instance;
+    dest_lot.neighborhood_origin = None;
+    dest_lot.loaded = trip_binding_tag(store.store_id(), new_trip_id);
+
+    Ok(DepartureResult {
+        destination_lot: dest_lot,
+        session: persisted.session,
+        home_revision: committed_revision,
+    })
+}
+
+/// Settles/cancels an active (or crashed/halted) away-from-home trip directly
+/// from the persisted frozen home snapshot in REDB without needing an intact
+/// in-memory destination [`Lot`].
+///
+/// Revokes any temporary check-in hotel keys, clears `secondary_house = 0`,
+/// restores the frozen home lot at its exact departure tick and clock, unwraps
+/// the `TRVL` envelope back to a normal saved lot, and commits atomically via
+/// checked REDB transaction.
+pub fn abort_active_trip(
+    install_root: &Path,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_house: u32,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<ReturnResult, TravelError> {
+    let home_snapshot = store
+        .load_lot_snapshot(neighborhood_id, home_house)?
+        .ok_or_else(|| TravelError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    let Some(bytes) = home_snapshot.saved_lot.as_deref() else {
+        return Err(TravelError::SessionMismatch(format!(
+            "house {home_house} has no active away-from-home trip"
+        )));
+    };
+    let persisted = decode_travel_envelope(bytes)?;
+    verify_persisted_trip_against_snapshot(
+        store.store_id(),
+        neighborhood_id,
+        home_house,
+        &home_snapshot.neighborhood,
+        &persisted,
+    )?;
+
+    let auth_session = &persisted.session;
+    let expected_home_i32 =
+        i32::try_from(auth_session.home_house).map_err(|e| TravelError::Lot(e.to_string()))?;
+
+    let mut updated_stored = home_snapshot.neighborhood.clone();
+    let prev_last_lot = updated_stored.data[2];
+    updated_stored.data[2] = i16::try_from(auth_session.home_house).unwrap_or(prev_last_lot);
+    if let Some(fam) = updated_stored.families.get_mut(&auth_session.home_family) {
+        fam.upgrade_to_v9();
+        fam.budget = auth_session.funds_at_arrival;
+        fam.house = expected_home_i32;
+        fam.set_secondary_house(0);
+    }
+    if matches!(
+        auth_session.accommodation,
+        VacationAccommodation::HotelCheckIn {
+            grant_hotel_key: true
+        }
+    ) {
+        for traveler in &auth_session.travelers {
+            if !traveler.had_hotel_key_before_trip {
+                clear_stored_inventory_token(
+                    &mut updated_stored,
+                    traveler.neighbor_id,
+                    HOTEL_KEY_TOKEN_KIND,
+                    HOTEL_KEY_TOKEN_GUID,
+                );
+            }
+        }
+    }
+
+    let home_runtime = StoreRuntime::from_snapshot(
+        install_root,
+        updated_stored.clone(),
+        &home_snapshot.character_files,
+    )?;
+    let (mut resumed_home, returning_travelers) = reconcile_frozen_home_lot(
+        home_runtime,
+        store.store_id(),
+        auth_session,
+        &persisted.frozen_home_bytes,
+        auth_session.funds_at_arrival,
+        &persisted.departure_snapshots,
+        answers,
+        frames,
+    )?;
+
+    let mut home_saved_after = resumed_home
+        .save()
+        .map_err(|e| TravelError::Lot(format!("encoding reconciled home lot: {e}")))?;
+    home_saved_after.deletion_epoch = updated_stored.deletion_epoch;
+    let home_lot_bytes = home_saved_after.encode();
+
+    let (final_instance, final_revision) = match store.save_lot_and_neighborhood_checked(
+        neighborhood_id,
+        home_house,
+        Some((
+            home_snapshot.neighborhood.instance_id,
+            home_snapshot.neighborhood.revision,
+        )),
+        &home_lot_bytes,
+        &updated_stored,
+        &[],
+    )? {
+        Ok(version) => version,
+        Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
+            return Err(TravelError::NeighborhoodMismatch {
+                expected: format!("{neighborhood_id}#{expected:032x}"),
+                actual: format!("{neighborhood_id}#{current:032x}"),
+            });
+        }
+        Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
+            return Err(TravelError::StaleNeighborhood {
+                neighborhood: neighborhood_id.to_owned(),
+                expected_revision: expected,
+                current_revision: current,
+            });
+        }
+    };
+
+    resumed_home.neighborhood_origin = Some(NeighborhoodOrigin {
+        store_id: store.store_id(),
+        neighborhood_id: neighborhood_id.to_owned(),
+        instance_id: final_instance,
+        revision: final_revision,
+    });
+
+    let family_members = updated_stored
+        .families
+        .get(&auth_session.home_family)
+        .map(|f| f.members.clone())
+        .unwrap_or_default();
+    let magic_coins_at_return = family_magic_coins(&resumed_home.world, &family_members);
+    let restored_home_clock = (
+        resumed_home
+            .world
+            .globals
+            .get(GLOBAL_HOURS)
+            .copied()
+            .unwrap_or(0),
+        resumed_home
+            .world
+            .globals
+            .get(GLOBAL_MINUTES)
+            .copied()
+            .unwrap_or(0),
+        resumed_home
+            .world
+            .globals
+            .get(GLOBAL_SECONDS)
+            .copied()
+            .unwrap_or(0),
+    );
+    let report = ReturnReport {
+        neighborhood: auth_session.neighborhood_id.clone(),
+        home_house: auth_session.home_house,
+        destination_house: auth_session.destination_house,
+        home_family: auth_session.home_family,
+        destination: auth_session.destination,
+        restored_home_ticks: resumed_home.ticks,
+        restored_home_world_ticks: resumed_home.world.ticks,
+        restored_home_clock,
+        funds_at_arrival: auth_session.funds_at_arrival,
+        funds_at_return: auth_session.funds_at_arrival,
+        funds_delta: 0,
+        magic_coins_at_arrival: auth_session.magic_coins_at_arrival,
+        magic_coins_at_return,
+        magic_coins_delta: magic_coins_at_return.wrapping_sub(auth_session.magic_coins_at_arrival),
+        returning_travelers,
+        home_revision: final_revision,
+    };
+
+    Ok(ReturnResult {
+        home_lot: resumed_home,
+        report,
+    })
+}
+
+fn verify_persisted_trip_against_snapshot(
+    store_id: u128,
+    neighborhood_id: &str,
+    home_house: u32,
+    stored: &StoredNeighborhood,
+    persisted: &PersistedTravelRecord,
+) -> Result<(), TravelError> {
+    if persisted.session.store_id != store_id {
+        return Err(TravelError::NeighborhoodMismatch {
+            expected: format!(
+                "{}@store:{:032x}",
+                persisted.session.neighborhood_id, persisted.session.store_id
+            ),
+            actual: format!("{neighborhood_id}@store:{store_id:032x}"),
+        });
+    }
+    if persisted.session.neighborhood_id != neighborhood_id {
+        return Err(TravelError::SessionMismatch(format!(
+            "persisted trip belongs to neighborhood {}, requested {neighborhood_id}",
+            persisted.session.neighborhood_id
+        )));
+    }
+    if persisted.session.home_house != home_house {
+        return Err(TravelError::SessionMismatch(format!(
+            "persisted trip belongs to home house {}, requested {home_house}",
+            persisted.session.home_house
+        )));
+    }
+    if stored.instance_id != persisted.session.instance_id {
+        return Err(TravelError::NeighborhoodMismatch {
+            expected: format!("{neighborhood_id}#{:032x}", persisted.session.instance_id),
+            actual: format!("{neighborhood_id}#{:032x}", stored.instance_id),
+        });
+    }
+    let stored_family = stored
+        .families
+        .get(&persisted.session.home_family)
+        .ok_or_else(|| TravelError::FamilyNotFound {
+            neighborhood: neighborhood_id.to_owned(),
+            family: persisted.session.home_family,
+        })?;
+    let expected_home_i32 =
+        i32::try_from(home_house).map_err(|e| TravelError::Lot(e.to_string()))?;
+    let expected_dest_i32 = i32::try_from(persisted.session.destination_house)
+        .map_err(|e| TravelError::Lot(e.to_string()))?;
+    if stored_family.house != expected_home_i32
+        || stored_family.secondary_house() != expected_dest_i32
+    {
+        return Err(TravelError::SessionMismatch(format!(
+            "family {} is at home={}, secondary_house={}, expected home={}, secondary_house={}",
+            persisted.session.home_family,
+            stored_family.house,
+            stored_family.secondary_house(),
+            expected_home_i32,
+            expected_dest_i32,
+        )));
+    }
+    Ok(())
+}
+
+fn clear_stored_inventory_token(
+    stored: &mut StoredNeighborhood,
+    neighbor_id: i16,
+    kind: i32,
+    guid: u32,
+) {
+    for inv in stored.inventories.iter_mut().flatten() {
+        if inv.neighbor == neighbor_id {
+            inv.items.retain(|it| !(it.kind == kind && it.guid == guid));
+        }
+    }
+}
+
+/// Merges destination-visit updates from `dest_saved_world` onto the latest
+/// `StoredNeighborhood` snapshot without clobbering concurrent writes to
+/// unrelated lots, households, or off-lot neighbors.
+fn merge_destination_into_latest_neighborhood(
+    latest: &StoredNeighborhood,
+    dest_world: &World,
+    session: &TravelSession,
+    funds_at_return: i32,
+    friendship_threshold: i32,
+) -> Result<StoredNeighborhood, TravelError> {
+    let expected_home_i32 =
+        i32::try_from(session.home_house).map_err(|e| TravelError::Lot(e.to_string()))?;
+
+    // Run native `write_back_world` onto a scratch copy to produce exact
+    // serialized `Neighbor`, `Inventory`, `Family`, `TATT`, and `made_characters`.
+    let mut dest_written = latest.clone();
+    dest_written.write_back_world(
+        dest_world,
+        session.destination_house,
+        session.home_family,
+        0,
+        None,
+        friendship_threshold,
+    );
+
+    // Collect every neighbor touched during the destination visit:
+    // - all travelers (household + date companion)
+    // - every live person spawned on `destination_lot` (townies, NPCs, etc.)
+    // - any character newly created on `destination_lot`
+    let mut touched_neighbors: BTreeSet<i16> =
+        session.travelers.iter().map(|t| t.neighbor_id).collect();
+    for &pid in &dest_world.people {
+        if let Some(person) = dest_world.objects.get(&pid).and_then(|o| o.person.as_ref())
+            && let Some(&nid) = person.data.get(PERSON_NEIGHBOR)
+            && nid > 0
+        {
+            touched_neighbors.insert(nid);
+        }
+    }
+    for &guid in dest_world.characters.made.keys() {
+        if !latest.made_characters.made.contains_key(&guid)
+            && let Some(rec) = dest_world.neighbors.first_of(guid)
+        {
+            touched_neighbors.insert(rec.id);
+        }
+    }
+
+    let mut merged = latest.clone();
+    // Keep `NGBH.data[2]` (last active residential lot) pointing at home.
+    let prev_last_lot = merged.data[2];
+    merged.data[2] = i16::try_from(session.home_house).unwrap_or(prev_last_lot);
+
+    // Merge NBRS: overwrite slots for touched/new neighbors, and for untouched
+    // neighbors merge ONLY relationship rows targeting a touched neighbor so
+    // concurrent edits to unrelated households are preserved intact.
+    if merged.neighbors.len() < dest_written.neighbors.len() {
+        merged.neighbors.resize(dest_written.neighbors.len(), None);
+    }
+    for (idx, d_slot) in dest_written.neighbors.iter().enumerate() {
+        let Some(d_nbr) = d_slot else {
+            continue;
+        };
+        if merged.deleted_characters.contains(&d_nbr.guid) {
+            continue;
+        }
+        if touched_neighbors.contains(&d_nbr.id) {
+            merged.neighbors[idx] = Some(d_nbr.clone());
+        } else if let Some(u_nbr) = merged.neighbors[idx].as_mut()
+            && u_nbr.id == d_nbr.id
+            && u_nbr.guid == d_nbr.guid
+        {
+            for d_row in &d_nbr.relationships {
+                let target_i16 = i16::try_from(d_row.target).ok();
+                if target_i16.is_some_and(|t| touched_neighbors.contains(&t)) {
+                    if let Some(existing) = u_nbr
+                        .relationships
+                        .iter_mut()
+                        .find(|r| r.target == d_row.target)
+                    {
+                        existing.values = d_row.values.clone();
+                    } else {
+                        u_nbr.relationships.push(d_row.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Merge inventories: keep untouched neighbors' inventories from `latest`,
+    // and replace/insert inventories for all touched neighbors from `dest_written`.
+    merged.inventories.retain(|entry| {
+        entry
+            .as_ref()
+            .is_none_or(|inv| !touched_neighbors.contains(&inv.neighbor))
+    });
+    for d_inv in dest_written.inventories.iter().flatten() {
+        if touched_neighbors.contains(&d_inv.neighbor) {
+            merged.inventories.push(Some(d_inv.clone()));
+        }
+    }
+
+    // Merge FAMI: update ONLY `session.home_family`, preserving all other
+    // families in `latest` untouched.
+    if let Some(fam) = merged.families.get_mut(&session.home_family) {
+        fam.upgrade_to_v9();
+        fam.budget = funds_at_return;
+        fam.house = expected_home_i32;
+        fam.set_secondary_house(0);
+        if let Some(dest_fam) = dest_written.families.get(&session.home_family) {
+            fam.friends = dest_fam.friends;
+            if let Ok(Some(magic)) = dest_fam.magic_history() {
+                let _ = fam.set_magic_history(magic);
+            }
+        }
+    }
+
+    // Union newly made characters without losing characters made concurrently.
+    for (&guid, ch) in &dest_written.made_characters.made {
+        if !merged.deleted_characters.contains(&guid) {
+            merged
+                .made_characters
+                .made
+                .entry(guid)
+                .or_insert_with(|| ch.clone());
+        }
+    }
+    if dest_written.made_characters.next_file > merged.made_characters.next_file {
+        merged.made_characters.next_file = dest_written.made_characters.next_file;
+    }
+
+    // Merge TATT entries produced on the destination lot.
+    if let Some(dest_tatt) = dest_written.type_attributes {
+        merged.type_attributes = Some(dest_tatt);
+    }
+
+    Ok(merged)
 }
 
 /// Returns the traveling party from `destination_lot` back to the frozen home
@@ -1599,6 +2456,11 @@ pub fn return_from_destination(
             ),
         });
     }
+    if session.trip_id == 0 {
+        return Err(TravelError::SessionMismatch(
+            "travel session is missing a valid trip_id".into(),
+        ));
+    }
     if destination_lot.load.house != session.destination_house {
         return Err(TravelError::SessionMismatch(format!(
             "destination lot is house {}, session expects house {}",
@@ -1611,71 +2473,61 @@ pub fn return_from_destination(
             destination_lot.load.family, session.home_family
         )));
     }
-    let Some(origin) = destination_lot.neighborhood_origin.clone() else {
+    if destination_lot.loaded == [0u8; 32] {
         return Err(TravelError::Lot(
-            "destination lot was not opened from a NeighborhoodStore (or already returned)".into(),
+            "destination lot was already returned or is not bound to an active trip".into(),
         ));
-    };
-    if origin.store_id != store.store_id() || origin.neighborhood_id != session.neighborhood_id {
-        return Err(TravelError::NeighborhoodMismatch {
-            expected: format!("{}@store:{:032x}", origin.neighborhood_id, origin.store_id),
-            actual: format!(
-                "{}@store:{:032x}",
-                session.neighborhood_id,
-                store.store_id()
-            ),
-        });
+    }
+    let expected_tag = trip_binding_tag(store.store_id(), session.trip_id);
+    if destination_lot.loaded != expected_tag {
+        return Err(TravelError::SessionMismatch(format!(
+            "destination lot handle is bound to a different trip than session trip {:032x}",
+            session.trip_id
+        )));
     }
 
     let home_snapshot = store
         .load_lot_snapshot(&session.neighborhood_id, session.home_house)?
         .ok_or_else(|| TravelError::NeighborhoodNotFound(session.neighborhood_id.clone()))?;
-    if home_snapshot.neighborhood.instance_id != origin.instance_id {
+    if home_snapshot.neighborhood.instance_id != session.instance_id {
         return Err(TravelError::NeighborhoodMismatch {
-            expected: format!("{}#{:032x}", session.neighborhood_id, origin.instance_id),
+            expected: format!("{}#{:032x}", session.neighborhood_id, session.instance_id),
             actual: format!(
                 "{}#{:032x}",
                 session.neighborhood_id, home_snapshot.neighborhood.instance_id
             ),
         });
     }
-    if home_snapshot.neighborhood.revision != origin.revision {
-        return Err(TravelError::StaleNeighborhood {
-            neighborhood: session.neighborhood_id.clone(),
-            expected_revision: origin.revision,
-            current_revision: home_snapshot.neighborhood.revision,
-        });
-    }
-    let stored_family = home_snapshot
-        .neighborhood
-        .families
-        .get(&session.home_family)
-        .ok_or_else(|| TravelError::FamilyNotFound {
-            neighborhood: session.neighborhood_id.clone(),
-            family: session.home_family,
-        })?;
-    let expected_home_i32 =
-        i32::try_from(session.home_house).map_err(|e| TravelError::Lot(e.to_string()))?;
-    let expected_dest_i32 =
-        i32::try_from(session.destination_house).map_err(|e| TravelError::Lot(e.to_string()))?;
-    if stored_family.house != expected_home_i32
-        || stored_family.secondary_house() != expected_dest_i32
-    {
+    let Some(envelope_bytes) = home_snapshot.saved_lot.as_deref() else {
         return Err(TravelError::SessionMismatch(format!(
-            "family {} is at home={}, secondary_house={}, expected home={}, secondary_house={}",
-            session.home_family,
-            stored_family.house,
-            stored_family.secondary_house(),
-            expected_home_i32,
-            expected_dest_i32,
-        )));
-    }
-    let Some(frozen_home_bytes) = home_snapshot.saved_lot else {
-        return Err(TravelError::SessionMismatch(format!(
-            "frozen home lot {} is missing from REDB",
+            "active trip envelope for home lot {} is missing from REDB",
             session.home_house
         )));
     };
+    let persisted = decode_travel_envelope(envelope_bytes)?;
+    verify_persisted_trip_against_snapshot(
+        store.store_id(),
+        &session.neighborhood_id,
+        session.home_house,
+        &home_snapshot.neighborhood,
+        &persisted,
+    )?;
+    if persisted.trip_id != session.trip_id
+        || persisted.session.home_family != session.home_family
+        || persisted.session.destination_house != session.destination_house
+        || persisted.session.destination != session.destination
+    {
+        return Err(TravelError::SessionMismatch(format!(
+            "stale or mismatched travel session (trip {:032x} vs active trip {:032x})",
+            session.trip_id, persisted.trip_id
+        )));
+    }
+
+    // Use the REDB-persisted authoritative session & frozen home bytes so
+    // caller-mutated or retained session fields cannot supply wrong rosters,
+    // hotel-key rules, or home clocks.
+    let auth_session = &persisted.session;
+    let frozen_home_bytes = &persisted.frozen_home_bytes;
 
     // Clone the destination lot's saved snapshot so we can flush persons,
     // capture returning state, and strip visiting travelers without leaving
@@ -1702,12 +2554,12 @@ pub fn return_from_destination(
     // 2. Revoke temporary Vacation check-in hotel keys granted on arrival
     //    (preserving any pre-existing key and all souvenirs/gifts/MagiCoins).
     if matches!(
-        session.accommodation,
+        auth_session.accommodation,
         VacationAccommodation::HotelCheckIn {
             grant_hotel_key: true
         }
     ) {
-        for traveler in &session.travelers {
+        for traveler in &auth_session.travelers {
             if !traveler.had_hotel_key_before_trip {
                 set_neighbor_token_count(
                     &mut dest_saved.world,
@@ -1720,17 +2572,26 @@ pub fn return_from_destination(
         }
     }
 
-    // 3. Capture returning state for every traveler on the destination lot.
+    // 3. Capture returning state for every traveler on the destination lot,
+    //    preferring the recorded `destination_object_id` first.
     let mut returning_states: Vec<LiveTravelerSnapshot> =
-        Vec::with_capacity(session.travelers.len());
-    for traveler in &session.travelers {
-        let live_id = dest_saved.world.people.iter().copied().find(|&id| {
-            dest_saved
-                .world
-                .objects
-                .get(&id)
-                .is_some_and(|o| o.guid == traveler.guid && o.person.is_some())
-        });
+        Vec::with_capacity(auth_session.travelers.len());
+    for traveler in &auth_session.travelers {
+        let live_id = dest_saved
+            .world
+            .objects
+            .get(&traveler.destination_object_id)
+            .is_some_and(|o| o.guid == traveler.guid && o.person.is_some())
+            .then_some(traveler.destination_object_id)
+            .or_else(|| {
+                dest_saved.world.people.iter().copied().find(|&id| {
+                    dest_saved
+                        .world
+                        .objects
+                        .get(&id)
+                        .is_some_and(|o| o.guid == traveler.guid && o.person.is_some())
+                })
+            });
         let made_outfits = dest_saved.world.made_outfits.get(&traveler.guid).cloned();
         if let Some(id) = live_id
             && let Some(obj) = dest_saved.world.objects.get(&id)
@@ -1744,6 +2605,7 @@ pub fn return_from_destination(
                 motives: person.motives,
                 previous_motives: person.previous_motives,
                 person_data: person.data.clone(),
+                accessories: person.accessories.clone(),
                 outfit: dest_saved.world.person_outfits.get(&id).cloned(),
                 made_outfits,
                 had_hotel_key_before_trip: traveler.had_hotel_key_before_trip,
@@ -1757,6 +2619,7 @@ pub fn return_from_destination(
                 motives: [50.0; 16],
                 previous_motives: [50.0; 16],
                 person_data: record.data.clone(),
+                accessories: Vec::new(),
                 outfit: None,
                 made_outfits,
                 had_hotel_key_before_trip: traveler.had_hotel_key_before_trip,
@@ -1768,47 +2631,35 @@ pub fn return_from_destination(
     let family_members = home_snapshot
         .neighborhood
         .families
-        .get(&session.home_family)
+        .get(&auth_session.home_family)
         .map(|f| f.members.clone())
         .ok_or_else(|| TravelError::FamilyNotFound {
-            neighborhood: session.neighborhood_id.clone(),
-            family: session.home_family,
+            neighborhood: auth_session.neighborhood_id.clone(),
+            family: auth_session.home_family,
         })?;
     let magic_coins_at_return = family_magic_coins(&dest_saved.world, &family_members);
 
-    // 4. Write neighborhood-wide state (`FAMI`, `NBRS`, `NGBH`, `TATT`,
-    //    `made_characters`) into `updated_stored`, preserving home lot
-    //    `architecture_value` and clearing `secondary_house = 0`.
+    // 4. Reconcile destination neighborhood-wide updates onto the LATEST
+    //    `StoredNeighborhood` (`home_snapshot.neighborhood`) without clobbering
+    //    unrelated edits made while away, clearing `secondary_house = 0`.
     let tuning = NeighborhoodTuning::from_program(&destination_lot.program);
 
     // Mark the returning household's friend count stale so `write_back_world`
     // always recomputes `FAMI.friends` from any new destination friendships.
-    let home_family_i32 = i32::from(session.home_family);
+    let home_family_i32 = i32::from(auth_session.home_family);
     for live_family in &mut dest_saved.world.families {
         if live_family.id == home_family_i32 {
             live_family.stale = true;
         }
     }
 
-    let prev_last_lot = home_snapshot.neighborhood.data[2];
-    let mut updated_stored = home_snapshot.neighborhood.clone();
-    updated_stored.write_back_world(
+    let updated_stored = merge_destination_into_latest_neighborhood(
+        &home_snapshot.neighborhood,
         &dest_saved.world,
-        session.destination_house,
-        session.home_family,
-        0,
-        None,
+        auth_session,
+        funds_at_return,
         tuning.friendship_threshold,
-    );
-    // Keep `NGBH.data[2]` (last active residential lot) pointing at home rather
-    // than a transient away-from-home destination lot.
-    updated_stored.data[2] = i16::try_from(session.home_house).unwrap_or(prev_last_lot);
-    if let Some(fam) = updated_stored.families.get_mut(&session.home_family) {
-        fam.upgrade_to_v9();
-        fam.budget = funds_at_return;
-        fam.house = expected_home_i32;
-        fam.set_secondary_house(0);
-    }
+    )?;
 
     // 5. Reconcile & resume the frozen home lot in memory BEFORE committing to
     //    REDB, leaving any Build/Buy community-lot snapshot in REDB untouched
@@ -1822,8 +2673,8 @@ pub fn return_from_destination(
     let (mut resumed_home, returning_travelers) = reconcile_frozen_home_lot(
         home_runtime,
         store.store_id(),
-        session,
-        &frozen_home_bytes,
+        auth_session,
+        frozen_home_bytes,
         funds_at_return,
         &returning_states,
         answers,
@@ -1838,13 +2689,16 @@ pub fn return_from_destination(
     let home_lot_bytes = home_saved_after.encode();
 
     // 6. Commit the reconciled home lot + updated neighborhood in a SINGLE
-    //    atomic checked REDB transaction (so household funds, motives, skills,
-    //    fame, relationships, MagiCoins, inventory tokens, returning curb
-    //    positions, and `secondary_house = 0` all land together atomically).
+    //    atomic checked REDB transaction fenced on the latest home snapshot
+    //    revision (so unrelated writes before return succeed, while any
+    //    concurrent write racing with this return fails cleanly via CAS).
     let (final_instance, final_revision) = match store.save_lot_and_neighborhood_checked(
-        &session.neighborhood_id,
-        session.home_house,
-        Some((origin.instance_id, origin.revision)),
+        &auth_session.neighborhood_id,
+        auth_session.home_house,
+        Some((
+            home_snapshot.neighborhood.instance_id,
+            home_snapshot.neighborhood.revision,
+        )),
         &home_lot_bytes,
         &updated_stored,
         &[],
@@ -1852,25 +2706,26 @@ pub fn return_from_destination(
         Ok(version) => version,
         Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
             return Err(TravelError::NeighborhoodMismatch {
-                expected: format!("{}#{expected:032x}", session.neighborhood_id),
-                actual: format!("{}#{current:032x}", session.neighborhood_id),
+                expected: format!("{}#{expected:032x}", auth_session.neighborhood_id),
+                actual: format!("{}#{current:032x}", auth_session.neighborhood_id),
             });
         }
         Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
             return Err(TravelError::StaleNeighborhood {
-                neighborhood: session.neighborhood_id.clone(),
+                neighborhood: auth_session.neighborhood_id.clone(),
                 expected_revision: expected,
                 current_revision: current,
             });
         }
     };
 
-    // Mark the destination lot returned so it cannot overwrite the newer home
-    // state later, and bind `resumed_home` to the final committed revision.
+    // Clear the destination lot's trip binding so it cannot be returned twice,
+    // and bind `resumed_home` to the final committed revision.
     destination_lot.neighborhood_origin = None;
+    destination_lot.loaded = [0u8; 32];
     resumed_home.neighborhood_origin = Some(NeighborhoodOrigin {
         store_id: store.store_id(),
-        neighborhood_id: session.neighborhood_id.clone(),
+        neighborhood_id: auth_session.neighborhood_id.clone(),
         instance_id: final_instance,
         revision: final_revision,
     });
@@ -1896,20 +2751,20 @@ pub fn return_from_destination(
             .unwrap_or(0),
     );
     let report = ReturnReport {
-        neighborhood: session.neighborhood_id.clone(),
-        home_house: session.home_house,
-        destination_house: session.destination_house,
-        home_family: session.home_family,
-        destination: session.destination,
+        neighborhood: auth_session.neighborhood_id.clone(),
+        home_house: auth_session.home_house,
+        destination_house: auth_session.destination_house,
+        home_family: auth_session.home_family,
+        destination: auth_session.destination,
         restored_home_ticks: resumed_home.ticks,
         restored_home_world_ticks: resumed_home.world.ticks,
         restored_home_clock,
-        funds_at_arrival: session.funds_at_arrival,
+        funds_at_arrival: auth_session.funds_at_arrival,
         funds_at_return,
-        funds_delta: funds_at_return.wrapping_sub(session.funds_at_arrival),
-        magic_coins_at_arrival: session.magic_coins_at_arrival,
+        funds_delta: funds_at_return.wrapping_sub(auth_session.funds_at_arrival),
+        magic_coins_at_arrival: auth_session.magic_coins_at_arrival,
         magic_coins_at_return,
-        magic_coins_delta: magic_coins_at_return.wrapping_sub(session.magic_coins_at_arrival),
+        magic_coins_delta: magic_coins_at_return.wrapping_sub(auth_session.magic_coins_at_arrival),
         returning_travelers,
         home_revision: final_revision,
     };
@@ -1959,19 +2814,21 @@ pub fn open_destination_for_edit(
             house: destination_house,
         });
     }
+    let install = Install::detect(install_root).map_err(|e| TravelError::Lot(e.to_string()))?;
+    let detected_expansions = u16::from(install.expansions.0);
+    let required_bit = destination.expansion_bit();
+    if detected_expansions & required_bit == 0 {
+        return Err(TravelError::ExpansionNotInstalled {
+            destination,
+            required_bit,
+            installed: detected_expansions,
+        });
+    }
     let runtime = StoreRuntime::from_snapshot(
         install_root,
         dest_snapshot.neighborhood,
         &dest_snapshot.character_files,
     )?;
-    let required_bit = destination.expansion_bit();
-    if runtime.program.expansions & required_bit == 0 {
-        return Err(TravelError::ExpansionNotInstalled {
-            destination,
-            required_bit,
-            installed: runtime.program.expansions,
-        });
-    }
     boot_destination_for_edit(
         runtime,
         store.store_id(),
@@ -2189,27 +3046,12 @@ fn load_destination_world(
             )
             .map_err(|e| TravelError::Lot(e.to_string()))?;
         ensure_today_budget_slot(&mut world);
-        let reconciled = interpreter
-            .reconcile_controllers(&mut world)
-            .map_err(|e| TravelError::Lot(format!("reconciling destination controllers: {e}")))?;
-        // Newly created global controllers (e.g. Superstar's Studio/Insanity
-        // controllers `0xC2AF7E1C`) run their `Load` callback (`fn[2]`) during
-        // normal load step 13 to self-remove on non-matching lot zones.
-        for ctrl_id in reconciled.created {
-            if world.objects.contains_key(&ctrl_id) {
-                let _ = interpreter
-                    .callback(&mut world, ctrl_id, 2, 0)
-                    .map_err(|e| {
-                        TravelError::Lot(format!(
-                            "running Load callback on destination controller {ctrl_id}: {e}"
-                        ))
-                    })?;
-            }
-        }
-        let _ = interpreter
-            .clear(&mut world)
-            .map_err(|e| TravelError::Lot(format!("clearing self-removed controllers: {e}")))?;
-        let _ = world.discard_removals();
+        // Strip orphaned/deleted saved persons before re-attaching remaining
+        // persons and indicators. A `Saved` destination lot already completed
+        // controller reconciliation and `visit_objects` on its initial base
+        // load (just like `lifecycle::boot_from_saved_lot`), so we preserve
+        // its exact furnishings and controllers without re-running
+        // `reconcile_controllers` or `Interpreter::clear`.
         let lot_epoch = saved.deletion_epoch;
         let orphaned: Vec<u16> = world
             .people
@@ -2273,7 +3115,10 @@ fn load_destination_world(
     let mut file = House::parse_bytes_with_deleted(bytes, &virtual_path, catalog, &stripped_guids)
         .map_err(|e| TravelError::Lot(e.to_string()))?;
     let view_rotation = opening_rotation(&file);
-    let context = Context::COMPLETE_COLLECTION;
+    let context = Context {
+        expansions: program.expansions,
+        ..Context::COMPLETE_COLLECTION
+    };
     let mut world = World::empty();
     world.crt_rng = CrtRng::from_state(1);
     let mut load = LoadReport::default();
@@ -2414,7 +3259,7 @@ fn load_destination_world(
         .clear(&mut world)
         .map_err(|e| TravelError::Lot(e.to_string()))?
         .len();
-    strip_deleted_base_objects(
+    let (stripped_people_to_reset, stripped_objects_to_reset) = strip_deleted_base_objects(
         &mut world,
         &mut file.objects,
         &stored.deleted_characters,
@@ -2485,6 +3330,32 @@ fn load_destination_world(
             "destination house {dest_house} load did not finish: {reason}"
         )));
     }
+    for person_id in stripped_people_to_reset {
+        if world
+            .objects
+            .get(&person_id)
+            .is_some_and(|o| o.person.is_some())
+        {
+            interpreter
+                .reset_person_after_purge(&mut world, person_id)
+                .map_err(|e| {
+                    TravelError::Lot(format!(
+                        "resetting person {person_id} after stripped base character: {e}"
+                    ))
+                })?;
+        }
+    }
+    for object_id in stripped_objects_to_reset {
+        if world.objects.contains_key(&object_id) {
+            interpreter
+                .reset(&mut world, object_id, false)
+                .map_err(|e| {
+                    TravelError::Lot(format!(
+                        "resetting object {object_id} after stripped base character: {e}"
+                    ))
+                })?;
+        }
+    }
     let _ = interpreter
         .ensure_indicators(&mut world)
         .map_err(|e| TravelError::Lot(e.to_string()))?;
@@ -2521,16 +3392,22 @@ fn load_destination_world(
 fn boot_destination_lot(
     runtime: StoreRuntime,
     store_id: u128,
+    trip_id: u128,
     neighborhood_id: &str,
-    request: &TravelRequest,
-    plan: &ValidatedTravelPlan,
+    dest_house: u32,
+    transport: TravelTransport,
+    accommodation: VacationAccommodation,
+    leader_guid: u32,
+    is_date: bool,
+    requested_view_centre: Option<[i8; 2]>,
+    answers: &[u8],
+    frames: Frames,
     home_family: u16,
     arrival_funds: i32,
     snapshots: &[LiveTravelerSnapshot],
     saved_lot: Option<&[u8]>,
     base_house: Option<Vec<u8>>,
 ) -> Result<(Lot, Vec<TravelerRecord>), TravelError> {
-    let dest_house = request.destination_house;
     let StoreRuntime {
         install,
         index,
@@ -2540,8 +3417,6 @@ fn boot_destination_lot(
         stored,
         ..
     } = runtime;
-    let origin_instance_id = stored.instance_id;
-    let origin_revision = stored.revision;
     let family_magic = stored
         .families
         .get(&home_family)
@@ -2578,7 +3453,7 @@ fn boot_destination_lot(
         arrival_funds,
         family_magic,
         &family_members,
-        request.view_centre,
+        requested_view_centre,
         saved_lot,
         base_house,
     )?;
@@ -2597,7 +3472,7 @@ fn boot_destination_lot(
     // Issue Vacation hotel keys on check-in before spawning/ticking so
     // category 4/7 hotel doors and beds unlock immediately (`0x458319`).
     if matches!(
-        plan.accommodation,
+        accommodation,
         VacationAccommodation::HotelCheckIn {
             grant_hotel_key: true
         }
@@ -2629,36 +3504,53 @@ fn boot_destination_lot(
             active_family: Some(&family_members),
             ..Interpreter::new(&program, &catalog, Stream::Global)
         };
-        let anchor = find_arrival_anchor(&world, Some(plan.transport));
+        let anchor = find_arrival_anchor(&world, Some(transport));
         let residential = !TravelDestination::is_community_mode(dest_house, &program.zoning);
         let mut records = Vec::with_capacity(snapshots.len());
         let mut leader_obj_id = None;
         let mut used_tiles = BTreeSet::new();
 
         for snap in snapshots {
-            let existing = world.people.iter().copied().find(|&id| {
-                world
-                    .objects
-                    .get(&id)
-                    .is_some_and(|o| o.guid == snap.guid && o.person.is_some())
-            });
-            let person_id = match existing {
-                Some(id) => {
-                    people::clear_person_uses_and_counts(&mut world, id);
-                    if let Some(route) = world.routing.routes.get_mut(&id) {
-                        route.contexts.clear();
-                    }
-                    let _ = crate::placement::unlink_off_lot(&mut world, id);
-                    id
+            let mut matching: Vec<u16> = world
+                .people
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    world
+                        .objects
+                        .get(&id)
+                        .is_some_and(|o| o.guid == snap.guid && o.person.is_some())
+                })
+                .collect();
+            let (person_id, reused) = if let Some(primary) = matching.first().copied() {
+                for extra in matching.drain(1..) {
+                    strip_person_for_travel(&interpreter, &mut world, extra)?;
                 }
-                None => interpreter
+                people::clear_person_uses_and_counts(&mut world, primary);
+                if let Some(route) = world.routing.routes.get_mut(&primary) {
+                    route.contexts.clear();
+                }
+                if let Some(person) = world
+                    .objects
+                    .get_mut(&primary)
+                    .and_then(|o| o.person.as_mut())
+                {
+                    person.queue.clear();
+                    person.active = crate::object_uses::no_action();
+                    person.motive_deltas.clear();
+                }
+                let _ = crate::placement::unlink_off_lot(&mut world, primary);
+                (primary, true)
+            } else {
+                let id = interpreter
                     .create_person(&mut world, snap.guid)
                     .map_err(|e| {
                         TravelError::Lot(format!(
                             "creating traveler 0x{:08X} on house {dest_house}: {e}",
                             snap.guid
                         ))
-                    })?,
+                    })?;
+                (id, false)
             };
             // Place on a distinct walkable tile near the arrival portal BEFORE
             // applying fame >= 10 (so `placed_from_outside` 0x447a82 does not
@@ -2689,10 +3581,19 @@ fn boot_destination_lot(
             )?;
             used_tiles.insert([tile_pos[0].div_euclid(16), tile_pos[1].div_euclid(16)]);
             place_person_on_tile(&interpreter, &mut world, person_id, tile_pos)?;
+            if reused {
+                interpreter
+                    .reset_person_after_purge(&mut world, person_id)
+                    .map_err(|e| {
+                        TravelError::Lot(format!(
+                            "resetting reused traveler {person_id} on house {dest_house}: {e}"
+                        ))
+                    })?;
+            }
 
-            // Overlay live motives, skills, career/fame, outfits, and visitor word.
+            // Overlay live motives, skills, career/fame, accessories, outfits, and visitor word.
             apply_traveler_live_state(&mut world, person_id, snap, residential, saved_fame, None);
-            if snap.guid == plan.leader_guid {
+            if snap.guid == leader_guid {
                 leader_obj_id = Some(person_id);
             }
             records.push(TravelerRecord {
@@ -2711,12 +3612,29 @@ fn boot_destination_lot(
         let leader = leader_obj_id.ok_or_else(|| {
             TravelError::InvalidParty(format!(
                 "leader 0x{:08X} was not injected onto destination house {dest_house}",
-                plan.leader_guid
+                leader_guid
             ))
         })?;
-        interpreter
-            .select(&mut world, Some(leader))
-            .map_err(|e| TravelError::Lot(format!("selecting leader {leader}: {e}")))?;
+        select_sim_in_world(&interpreter, &mut world, leader)?;
+
+        // Establish the mutual VM date link (`person.data[77] = partner_id`)
+        // on Downtown Date arrivals after initial selection so date scripts see
+        // each Sim's active date partner (`0x44664c`).
+        if is_date && records.len() == 2 {
+            let id_a = records[0].destination_object_id;
+            let id_b = records[1].destination_object_id;
+            if let Some(person_a) = world.objects.get_mut(&id_a).and_then(|o| o.person.as_mut())
+                && let Some(slot) = person_a.data.get_mut(PERSON_DATE)
+            {
+                *slot = id_b as i16;
+            }
+            if let Some(person_b) = world.objects.get_mut(&id_b).and_then(|o| o.person.as_mut())
+                && let Some(slot) = person_b.data.get_mut(PERSON_DATE)
+            {
+                *slot = id_a as i16;
+            }
+        }
+
         interpreter
             .go_live(&mut world)
             .map_err(|e| TravelError::Lot(e.to_string()))?;
@@ -2732,15 +3650,18 @@ fn boot_destination_lot(
         sim: Some(leader_id),
         counted,
     });
-    let loaded = world.hash();
+    // Live destination handles carry `neighborhood_origin = None` so ordinary
+    // `lifecycle::save_and_leave_lot` can never overwrite the Build/Buy
+    // destination snapshot, and bind `loaded` to `(store_id, trip_id)`.
+    let loaded = trip_binding_tag(store_id, trip_id);
     let lot = Lot {
         program,
         catalog: Arc::new(catalog),
         surfaces,
         world,
         tuning: None,
-        player: Answers::choices(&request.answers),
-        frames: request.frames.clone(),
+        player: Answers::choices(answers),
+        frames,
         ticks: saved_ticks,
         start: start_ticks,
         load,
@@ -2768,12 +3689,7 @@ fn boot_destination_lot(
         undo_order: Vec::new(),
         redo_order: Vec::new(),
         active_wall_cursor: None,
-        neighborhood_origin: Some(NeighborhoodOrigin {
-            store_id,
-            neighborhood_id: neighborhood_id.to_owned(),
-            instance_id: origin_instance_id,
-            revision: origin_revision,
-        }),
+        neighborhood_origin: None,
     };
     Ok((lot, traveler_records))
 }
@@ -2831,6 +3747,16 @@ fn reconcile_frozen_home_lot(
         .flatten();
 
     let mut world = saved.world;
+    // Capture authoritative frozen clock and tick counters directly from the
+    // decoded `Saved` home snapshot (never trusting caller-supplied session
+    // fields).
+    let frozen_ticks = saved.ticks;
+    let frozen_world_ticks = world.ticks;
+    let frozen_clock = (
+        world.globals.get(GLOBAL_HOURS).copied().unwrap_or(0),
+        world.globals.get(GLOBAL_MINUTES).copied().unwrap_or(0),
+        world.globals.get(GLOBAL_SECONDS).copied().unwrap_or(0),
+    );
     let content_nh = stored.to_content_neighborhood();
     let reg = neighborhood_registry(
         &index,
@@ -2864,15 +3790,15 @@ fn reconcile_frozen_home_lot(
 
     // Preserve exact frozen home clock (`globals[0/5/6]` and `world.ticks`).
     if let Some(h) = world.globals.get_mut(GLOBAL_HOURS) {
-        *h = session.departure_clock.0;
+        *h = frozen_clock.0;
     }
     if let Some(m) = world.globals.get_mut(GLOBAL_MINUTES) {
-        *m = session.departure_clock.1;
+        *m = frozen_clock.1;
     }
     if let Some(s) = world.globals.get_mut(GLOBAL_SECONDS) {
-        *s = session.departure_clock.2;
+        *s = frozen_clock.2;
     }
-    world.ticks = session.departure_world_ticks;
+    world.ticks = frozen_world_ticks;
 
     let (returning_travelers, selected_sim) = {
         let interpreter = Interpreter {
@@ -3038,9 +3964,7 @@ fn reconcile_frozen_home_lot(
             .or_else(|| reconciled_pairs.first().map(|&(_, id)| id))
             .or_else(|| world.people.first().copied());
         if let Some(sim) = target_sim {
-            interpreter
-                .select(&mut world, Some(sim))
-                .map_err(|e| TravelError::Lot(format!("selecting returning Sim {sim}: {e}")))?;
+            select_sim_in_world(&interpreter, &mut world, sim)?;
         }
         interpreter
             .go_live(&mut world)
@@ -3081,7 +4005,7 @@ fn reconcile_frozen_home_lot(
         tuning: None,
         player,
         frames,
-        ticks: session.departure_ticks,
+        ticks: frozen_ticks,
         start: saved.start,
         load,
         halted: false,
@@ -3175,6 +4099,7 @@ fn apply_traveler_live_state(
         if let Some(slot) = person.data.get_mut(PERSON_VISITOR) {
             *slot = visitor_again(0, snap.is_household_member, residential);
         }
+        person.accessories = snap.accessories.clone();
     }
     if let Some(outfit) = &snap.outfit {
         world.person_outfits.insert(person_id, outfit.clone());
@@ -3265,7 +4190,10 @@ fn find_free_arrival_position(
         let sx = (ax + dx).clamp(1, size - 2);
         let sy = (ay + dy).clamp(1, size - 2);
         let start = [sx * 16 + 8, sy * 16 + 8];
-        if let Ok(Some(found)) = interpreter.search(world, person_id, start, 1, rules) {
+        if let Some(found) = interpreter
+            .search(world, person_id, start, 1, rules)
+            .map_err(|e| TravelError::Lot(format!("searching arrival tile for {person_id}: {e}")))?
+        {
             let tile = [found[0].div_euclid(16), found[1].div_euclid(16)];
             if !used_tiles.contains(&tile) {
                 return Ok(found);
@@ -3273,13 +4201,24 @@ fn find_free_arrival_position(
         }
     }
 
-    // Broad fallback: search from lot centre.
+    // Broad fallback: search from lot centre, still respecting `used_tiles`.
     let centre = [(size / 2) * 16 + 8, (size / 2) * 16 + 8];
-    if let Ok(Some(found)) = interpreter.search(world, person_id, centre, 1, rules) {
-        return Ok(found);
+    if let Some(found) = interpreter
+        .search(world, person_id, centre, 1, rules)
+        .map_err(|e| {
+            TravelError::Lot(format!(
+                "searching centre arrival tile for {person_id}: {e}"
+            ))
+        })?
+    {
+        let tile = [found[0].div_euclid(16), found[1].div_euclid(16)];
+        if !used_tiles.contains(&tile) {
+            return Ok(found);
+        }
     }
 
-    // Last-resort direct walkable tile scan (non-locked, non-pool, unoccupied).
+    // Last-resort full placement check (`Interpreter::fits`: bounds, ground/
+    // pool/water, slope, flags, walls, collisions, and footprint).
     for y in 2..(size - 2) {
         for x in 2..(size - 2) {
             if used_tiles.contains(&[x, y]) {
@@ -3287,8 +4226,13 @@ fn find_free_arrival_position(
             }
             let pos = [x * 16 + 8, y * 16 + 8];
             let tile_empty = crate::placement::head(world, [x as i8, y as i8, 1]).is_none();
-            let flags = crate::placement::tile_flags(world, x as i8, y as i8, 1).unwrap_or(0);
-            if tile_empty && flags & TILE_LOCKED == 0 {
+            if tile_empty
+                && interpreter.fits(world, person_id, pos, 1).map_err(|e| {
+                    TravelError::Lot(format!(
+                        "testing fallback arrival tile [{x}, {y}] for {person_id}: {e}"
+                    ))
+                })?
+            {
                 return Ok(pos);
             }
         }
@@ -3327,7 +4271,7 @@ fn strip_deleted_base_objects(
     objects: &mut sims_formats::saved_objects::Objects,
     deleted_characters: &BTreeSet<u32>,
     deleted_at_epoch: &BTreeMap<u32, u64>,
-) {
+) -> (BTreeSet<u16>, BTreeSet<u16>) {
     let deleted_ids: Vec<u16> = objects
         .order
         .iter()
@@ -3340,9 +4284,12 @@ fn strip_deleted_base_objects(
             })
         })
         .collect();
+    let mut people_to_reset = BTreeSet::new();
+    let mut objects_to_reset = BTreeSet::new();
     if deleted_ids.is_empty() {
-        return;
+        return (people_to_reset, objects_to_reset);
     }
+    let full = FULL_SIZE as usize;
     for id in deleted_ids {
         let Some(removed) = objects.instances.remove(&id) else {
             continue;
@@ -3350,7 +4297,8 @@ fn strip_deleted_base_objects(
         objects.order.retain(|&other| other != id);
         objects.types_by_id.remove(&id);
         let id_i16 = id as i16;
-        let target = i32::from(id_i16);
+        let deleted_type_id = removed.type_id as i16;
+
         if let Some(person) = &removed.person {
             for used in &person.object_uses {
                 if let Ok(target_id) = u16::try_from(used.target)
@@ -3362,24 +4310,87 @@ fn strip_deleted_base_objects(
                 }
             }
         }
-        for inst in objects.instances.values_mut() {
+
+        // Promote any surviving `slot 0` successor into `removed`'s tile grid
+        // cell or predecessor slot.
+        let next_id = removed
+            .slots
+            .first()
+            .and_then(|s| u16::try_from(s.object).ok())
+            .filter(|&n| n != 0 && objects.instances.contains_key(&n));
+        let slot_word = removed.data.get(14).copied().unwrap_or(-1);
+        let before_word = removed.data.get(26).copied().unwrap_or(0);
+        if slot_word >= 0
+            && let Ok(parent_id) = u16::try_from(before_word)
+            && let Some(parent) = objects.instances.get_mut(&parent_id)
+            && let Some(slot_entry) = parent.slots.get_mut(slot_word as usize)
+            && slot_entry.object == id_i16
+        {
+            slot_entry.object = next_id.map_or(0, |n| n as i16);
+        } else {
+            let level = if removed.position[2] == 2 { 1 } else { 0 };
+            let grid_id = crate::placement::LEVEL_GRIDS[level];
+            let tx = removed.position[0].div_euclid(16);
+            let ty = removed.position[1].div_euclid(16);
+            if tx >= 0
+                && ty >= 0
+                && (tx as usize) < full
+                && (ty as usize) < full
+                && let Some(grid) = world.arrays.get_mut(&grid_id)
+                && grid.stride == 2
+            {
+                let cell = (tx as usize * full + ty as usize) * 2;
+                if let Some(bytes) = grid.data.get_mut(cell..cell + 2)
+                    && bytes == id_i16.to_le_bytes()
+                {
+                    let replacement = next_id.unwrap_or(0u16);
+                    bytes.copy_from_slice(&replacement.to_le_bytes());
+                }
+            }
+        }
+        if let Some(next) = next_id
+            && let Some(next_obj) = objects.instances.get_mut(&next)
+        {
+            if let Some(s) = next_obj.data.get_mut(14) {
+                *s = slot_word;
+            }
+            if let Some(b) = next_obj.data.get_mut(26) {
+                *b = before_word;
+            }
+        }
+
+        let target_i32 = i32::from(id_i16);
+        for (&other_id, inst) in &mut objects.instances {
             for slot in &mut inst.slots {
                 if slot.object == id_i16 {
                     slot.object = 0;
                 }
             }
-            inst.relationships.retain(|r| r.target != target);
-            if let Some(person) = &mut inst.person {
+            inst.relationships.retain(|r| r.target != target_i32);
+            let stack_hits = inst
+                .stack
+                .iter()
+                .any(|f| f.stack_object == id_i16 || f.code_owner_type == deleted_type_id);
+            if let Some(person) = inst.person.as_mut() {
+                let uses_hit = person.object_uses.iter().any(|u| u.target == id_i16);
+                let active_hit = person.active.target == id_i16
+                    || person.active.icon == id_i16
+                    || person.active.caller == id_i16;
+                if uses_hit || active_hit || stack_hits {
+                    people_to_reset.insert(other_id);
+                    person.active = crate::object_uses::no_action();
+                }
                 person.object_uses.retain(|u| u.target != id_i16);
                 person
                     .queue
                     .retain(|a| a.target != id_i16 && a.icon != id_i16 && a.caller != id_i16);
-                if person.active.target == id_i16
-                    || person.active.icon == id_i16
-                    || person.active.caller == id_i16
-                {
-                    person.active = crate::object_uses::no_action();
+                if person.last.target == id_i16 || person.last.caller == id_i16 {
+                    person.last = crate::object_uses::no_action();
+                } else if person.last.icon == id_i16 {
+                    person.last.icon = 0;
                 }
+            } else if stack_hits {
+                objects_to_reset.insert(other_id);
             }
         }
         let id_bytes = id_i16.to_le_bytes();
@@ -3395,6 +4406,7 @@ fn strip_deleted_base_objects(
             }
         }
     }
+    (people_to_reset, objects_to_reset)
 }
 
 /// Removes a person cleanly from `world` without leaving dangling slots, routes,
@@ -3405,9 +4417,9 @@ fn strip_person_for_travel(
     world: &mut World,
     id: u16,
 ) -> Result<(), TravelError> {
-    if !world.objects.contains_key(&id) {
+    let Some(deleted_guid) = world.objects.get(&id).map(|o| o.guid) else {
         return Ok(());
-    }
+    };
     people::clear_person_uses_and_counts(world, id);
     let _ = crate::placement::unlink_off_lot(world, id);
     if world.event_owner == id {
@@ -3446,10 +4458,35 @@ fn strip_person_for_travel(
             }
             continue;
         }
-        let _ = interpreter.remove_now(world, held);
+        let held_guid = world.objects[&held].guid;
+        if world.types.values().any(|&g| g == held_guid)
+            && crate::interpreter::object_definition(interpreter.catalog, world, held_guid)
+                .is_some()
+        {
+            let _ = interpreter.remove_now(world, held);
+        } else if let Some(obj) = world.objects.get_mut(&held)
+            && let Some(slot0) = obj.slots.first_mut()
+        {
+            slot0.object = 0;
+        }
     }
     let id_i16 = id as i16;
     let target = i32::from(id_i16);
+    let mut people_to_reset = Vec::new();
+    let mut objects_to_reset = Vec::new();
+    let deleted_types: BTreeSet<i16> = world
+        .types
+        .iter()
+        .filter_map(|(&ty, &guid)| {
+            if guid == deleted_guid
+                || crate::interpreter::object_definition(interpreter.catalog, world, guid).is_none()
+            {
+                i16::try_from(ty).ok()
+            } else {
+                None
+            }
+        })
+        .collect();
     for (&other_id, obj) in &mut world.objects {
         if other_id == id {
             continue;
@@ -3460,22 +4497,29 @@ fn strip_person_for_travel(
             }
         }
         obj.relationships.retain(|r| r.target != target);
+        let stack_hits_deleted = obj.stack.iter().any(|frame| {
+            frame.stack_object == id_i16 || deleted_types.contains(&frame.code_owner_type)
+        });
         if let Some(person) = obj.person.as_mut() {
+            let uses_deleted = person.object_uses.iter().any(|u| u.target == id_i16);
+            let active_hits_deleted = person.active.target == id_i16
+                || person.active.icon == id_i16
+                || person.active.caller == id_i16;
+            if uses_deleted || active_hits_deleted || stack_hits_deleted {
+                people_to_reset.push(other_id);
+                person.active = crate::object_uses::no_action();
+            }
             person.object_uses.retain(|u| u.target != id_i16);
             person
                 .queue
                 .retain(|a| a.target != id_i16 && a.icon != id_i16 && a.caller != id_i16);
-            if person.active.target == id_i16
-                || person.active.icon == id_i16
-                || person.active.caller == id_i16
-            {
-                person.active = crate::object_uses::no_action();
-            }
             if person.last.target == id_i16 || person.last.caller == id_i16 {
                 person.last = crate::object_uses::no_action();
             } else if person.last.icon == id_i16 {
                 person.last.icon = 0;
             }
+        } else if stack_hits_deleted {
+            objects_to_reset.push(other_id);
         }
     }
     world.objects.remove(&id);
@@ -3524,6 +4568,30 @@ fn strip_person_for_travel(
     world.repair_grid().map_err(|e| {
         TravelError::Lot(format!("repairing grid after stripping person {id}: {e}"))
     })?;
+    for other in people_to_reset {
+        if world
+            .objects
+            .get(&other)
+            .is_some_and(|o| o.person.is_some())
+        {
+            interpreter
+                .reset_person_after_purge(world, other)
+                .map_err(|e| {
+                    TravelError::Lot(format!(
+                        "resetting person {other} after stripping person {id}: {e}"
+                    ))
+                })?;
+        }
+    }
+    for other in objects_to_reset {
+        if world.objects.contains_key(&other) {
+            interpreter.reset(world, other, false).map_err(|e| {
+                TravelError::Lot(format!(
+                    "resetting object {other} after stripping person {id}: {e}"
+                ))
+            })?;
+        }
+    }
     Ok(())
 }
 
@@ -3586,11 +4654,10 @@ impl StoreRuntime {
                 .map_err(|e| TravelError::Lot(e.to_string()))?;
         }
         let catalog = Catalog::build(&index).map_err(|e| TravelError::Lot(e.to_string()))?;
-        let context = Context::COMPLETE_COLLECTION;
         let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))
             .map_err(|e| TravelError::Lot(e.to_string()))?;
         program.zoning = stored.zoning.clone();
-        program.expansions = context.expansions;
+        program.expansions = u16::from(install.expansions.0);
         program.characters = catalog
             .objects
             .iter()
@@ -4460,7 +5527,44 @@ mod tests {
             })
         ));
 
-        // Duplicate GUID in HouseholdGroup and pet leader on Old Town rejected.
+        // HouseholdGroup: leader listed once is accepted; duplicate leader or
+        // duplicate member is rejected; pet leader on Old Town is rejected.
+        let group_ok = validate_travel_plan(
+            &world,
+            5,
+            5,
+            all_ep,
+            &stored,
+            &TravelRequest::magic_town(
+                93,
+                TravelParty::HouseholdGroup {
+                    leader_guid: 0x1001,
+                    member_guids: vec![0x1001, 0x1002],
+                },
+                TravelTransport::MagicBlimp,
+            ),
+        )
+        .unwrap();
+        assert_eq!(group_ok.members.len(), 2);
+
+        assert!(matches!(
+            validate_travel_plan(
+                &world,
+                5,
+                5,
+                all_ep,
+                &stored,
+                &TravelRequest::magic_town(
+                    93,
+                    TravelParty::HouseholdGroup {
+                        leader_guid: 0x1001,
+                        member_guids: vec![0x1001, 0x1001],
+                    },
+                    TravelTransport::MagicBlimp,
+                ),
+            ),
+            Err(TravelError::InvalidParty(_))
+        ));
         assert!(matches!(
             validate_travel_plan(
                 &world,
@@ -4490,6 +5594,21 @@ mod tests {
             ),
             Err(TravelError::InvalidParty(_))
         ));
+
+        // Unlimited-budget edit mode (`globals[32] != 0`) cannot depart.
+        world.globals[GLOBAL_BUDGET_MODE] = 1;
+        assert!(matches!(
+            validate_travel_plan(
+                &world,
+                5,
+                5,
+                all_ep,
+                &stored,
+                &TravelRequest::downtown(21, 0x1001),
+            ),
+            Err(TravelError::SessionMismatch(_))
+        ));
+        world.globals[GLOBAL_BUDGET_MODE] = 0;
     }
 
     #[test]
@@ -4569,9 +5688,28 @@ mod tests {
         assert!(!session.travelers[1].is_household_member);
         assert_eq!(session.magic_coins_at_arrival, 100);
 
-        // Mutate funds, motives, skills, fame, outfits, made_outfits, MagiCoins,
-        // souvenir/gift token, and relationship with the date companion on Downtown!
+        // Verify Downtown Date established mutual `person.data[PERSON_DATE]` link!
         let dt_mortimer_id = session.travelers[0].destination_object_id;
+        let dt_companion_id = session.travelers[1].destination_object_id;
+        assert_eq!(
+            dt.world.objects[&dt_mortimer_id]
+                .person
+                .as_ref()
+                .unwrap()
+                .data[PERSON_DATE],
+            dt_companion_id as i16
+        );
+        assert_eq!(
+            dt.world.objects[&dt_companion_id]
+                .person
+                .as_ref()
+                .unwrap()
+                .data[PERSON_DATE],
+            dt_mortimer_id as i16
+        );
+
+        // Mutate funds, motives, skills, fame, accessories, outfits, made_outfits,
+        // MagiCoins, souvenir/gift token, and relationship with the date companion!
         let spent_funds = dt.world.budget.funds - 135;
         dt.world.set_funds(spent_funds).unwrap();
         {
@@ -4588,6 +5726,10 @@ mod tests {
             person.data[9] = 600; // Cooking skill
             person.data[10] = 500; // Charisma skill
             person.data[PERSON_FAME_LEVEL] = 25; // 2.5 celebrity stars
+            person.accessories.push(Accessory {
+                name: "xskin-sunglasses".into(),
+                binding: "HEAD".into(),
+            });
         }
         let mut custom_outfit = dt
             .world
@@ -4682,6 +5824,13 @@ mod tests {
         assert_eq!(mort.data[9], 600);
         assert_eq!(mort.data[10], 500);
         assert_eq!(mort.data[PERSON_FAME_LEVEL], 25);
+        assert_eq!(mort.data[PERSON_DATE], 0, "date link cleared on return");
+        assert!(
+            mort.accessories
+                .iter()
+                .any(|a| a.name == "xskin-sunglasses" && a.binding == "HEAD"),
+            "traveler accessories reconciled on return"
+        );
         assert_eq!(
             home.world
                 .person_outfits
@@ -4722,6 +5871,29 @@ mod tests {
         assert_eq!(stored_after.families[&5].secondary_house(), 0);
         assert_eq!(stored_after.families[&5].budget, spent_funds);
         assert!(stored_after.families[&5].friends >= 1);
+
+        // Switching away from famous Mortimer (`fame=25`) via `select_sim`
+        // succeeds cleanly without tripping unported star-marker pool `0x446c15`
+        // and preserves exact fame!
+        let bella_id = home
+            .world
+            .people
+            .iter()
+            .copied()
+            .find(|id| home.world.objects[id].guid == bella_guid)
+            .unwrap();
+        select_sim(&mut home, bella_id).unwrap();
+        assert_eq!(selected(&home.world), Some(bella_id));
+        assert_eq!(
+            home.world.objects[&home_mortimer_id]
+                .person
+                .as_ref()
+                .unwrap()
+                .data[PERSON_FAME_LEVEL],
+            25
+        );
+        select_sim(&mut home, home_mortimer_id).unwrap();
+        assert_eq!(selected(&home.world), Some(home_mortimer_id));
 
         // Famous Mortimer (fame=25) ticks cleanly at home in strict mode,
         // and now qualifies for a complimentary `$0` Studio Town Limo!
