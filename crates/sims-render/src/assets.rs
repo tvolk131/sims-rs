@@ -22,7 +22,7 @@ use crate::canvas::Image;
 use crate::pools::Pools;
 use crate::shadows::{self, Mask};
 use crate::{Error, Result};
-use sims_content::{Catalog, Index, Install};
+use sims_content::{Catalog, Index, Install, SurfaceCatalog, SurfaceKind, SurfacePlugin};
 use sims_formats::execution::Slots;
 use sims_formats::iff::Iff;
 use sims_formats::sprite::{DrawGroup, LegacySpriteSet, Palette, SpriteSet};
@@ -107,6 +107,8 @@ pub struct Assets {
     catalog: Catalog,
     floors: Iff,
     walls: Iff,
+    floor_plugins: BTreeMap<u16, SurfacePlugin>,
+    wall_plugins: BTreeMap<u16, SurfacePlugin>,
     files: BTreeMap<usize, Iff>,
     definitions: BTreeMap<u32, Option<Definition>>,
     floor_images: BTreeMap<(u16, usize), Option<Image>>,
@@ -127,10 +129,15 @@ impl Assets {
                 std::fs::read(&path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
             Ok(Iff::parse(bytes)?)
         };
+        let floor_plugins =
+            SurfaceCatalog::plugins(install, SurfaceKind::Floor).unwrap_or_default();
+        let wall_plugins = SurfaceCatalog::plugins(install, SurfaceKind::Wall).unwrap_or_default();
         Ok(Self {
             id: NEXT_ASSETS_ID.fetch_add(1, Ordering::Relaxed),
             floors: read("GameData/floors.iff")?,
             walls: read("GameData/walls.iff")?,
+            floor_plugins,
+            wall_plugins,
             index,
             catalog,
             files: BTreeMap::new(),
@@ -169,6 +176,30 @@ impl Assets {
         &self.catalog
     }
 
+    /// Plug-in floor patterns (`.flr`) indexed by catalog key.
+    pub fn floor_plugins(&self) -> &BTreeMap<u16, SurfacePlugin> {
+        &self.floor_plugins
+    }
+
+    /// Plug-in wall patterns (`.wll`) indexed by catalog key.
+    pub fn wall_plugins(&self) -> &BTreeMap<u16, SurfacePlugin> {
+        &self.wall_plugins
+    }
+
+    /// Built-in floor pattern IDs present in `GameData/floors.iff` (`1..=29`).
+    pub fn builtin_floor_ids(&self) -> Vec<u16> {
+        (1u16..=29)
+            .filter(|&id| self.floors.get(b"SPR2", id).is_some())
+            .collect()
+    }
+
+    /// Built-in wallpaper pattern IDs present in `GameData/walls.iff` (`1..=30`).
+    pub fn builtin_wall_ids(&self) -> Vec<u16> {
+        (1u16..=30)
+            .filter(|&id| self.walls.get(b"SPR#", 1536 + id).is_some())
+            .collect()
+    }
+
     /// The floor's image at a zoom (0 far to 2 near), or None if the game
     /// has no such floor.
     pub fn floor(&mut self, id: u16, zoom: usize) -> Option<&Image> {
@@ -183,11 +214,21 @@ impl Assets {
         zoom: usize,
     ) -> Option<(&Image, Option<&Pools>)> {
         let floors = &self.floors;
+        let floor_plugins = &self.floor_plugins;
         let pools = self.pools.as_ref();
         let img = self
             .floor_images
             .entry((id, zoom))
             .or_insert_with(|| {
+                if let Some(plugin) = floor_plugins.get(&id) {
+                    let bytes = plugin.resource.read().ok()?;
+                    let iff = Iff::parse(bytes).ok()?;
+                    let sprite = plugin.local.checked_add([0, 256, 512][zoom])?;
+                    let chunk = iff.get(b"SPR2", sprite)?;
+                    let data = iff.data(chunk);
+                    let frame = SpriteSet::parse(data).ok()?.decode(data, 0, &iff).ok()?;
+                    return Some(frame.into());
+                }
                 let sprite = id.checked_add([0, 256, 512][zoom])?;
                 let chunk = floors.get(b"SPR2", sprite)?;
                 let data = floors.data(chunk);
@@ -220,9 +261,26 @@ impl Assets {
     /// The four frames of a wall pattern at a zoom, with its own palette.
     pub fn pattern(&mut self, id: u16, zoom: usize) -> Option<&[Image; 4]> {
         let walls = &self.walls;
+        let wall_plugins = &self.wall_plugins;
         self.patterns
             .entry((id, zoom))
             .or_insert_with(|| {
+                if let Some(plugin) = wall_plugins.get(&id) {
+                    let bytes = plugin.resource.read().ok()?;
+                    let iff = Iff::parse(bytes).ok()?;
+                    let candidates = [
+                        plugin.local.checked_add([1536, 1792, 2048][zoom]),
+                        plugin.local.checked_add([0, 1792, 2048][zoom]),
+                        plugin.local.checked_add([0, 256, 512][zoom]),
+                    ];
+                    let chunk = candidates
+                        .into_iter()
+                        .flatten()
+                        .find_map(|sprite| iff.get(b"SPR#", sprite))?;
+                    let data = iff.data(chunk);
+                    let set = LegacySpriteSet::parse(data).ok()?;
+                    return four(|i| set.decode(data, i, &iff).ok().map(Image::from));
+                }
                 let sprite = id.checked_add([1536, 1792, 2048][zoom])?;
                 let chunk = walls.get(b"SPR#", sprite)?;
                 let data = walls.data(chunk);
