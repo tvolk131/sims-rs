@@ -939,7 +939,7 @@ fn offset_container(offset: [f32; 3]) -> (Fixture, u16) {
 }
 
 #[test]
-fn a_container_slot_offset_across_snaps_into_slot_and_preserves_object_position() {
+fn a_container_slot_offset_across_snaps_into_slot_and_guards_stale_offset_mutations() {
     // 0x454ceb..0x454d5e applies the horizontal container-slot offset only to
     // the person's animator offset (`+0x8c/+0x90`, read by `cTSPerson::Place`
     // at `0x5921f0`); the object's lot position and `animator.position` stay at
@@ -956,6 +956,41 @@ fn a_container_slot_offset_across_snaps_into_slot_and_preserves_object_position(
         assert_eq!(fx.world.objects[&me].data[2], LAMP as i16, "{offset:?}");
         assert_eq!(fx.world.objects[&me].data[3], 1, "{offset:?}");
     }
+
+    // Rotating the container while it holds a person in a horizontal-offset
+    // slot would make the derived offset diverge from the value 0x58933b stored
+    // at Snap time, so writing container.data[1] (facing) fails loudly instead
+    // of silently altering the model position.
+    let (mut fx, me) = offset_container([8.0, 0.0, 0.0]);
+    fx.lamp_mut().data[1] = 0;
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    let rotate_err = trap(fx.expression(scope::MY_DATA, 1, op::ASSIGN, scope::LITERAL, 2));
+    assert!(
+        matches!(rotate_err, Trap::Unsupported(ref m) if m.contains("0x454ceb")),
+        "expected Unsupported when rotating container holding offset person, got {rotate_err}"
+    );
+    // Writing the same facing (0) is a no-op and succeeds.
+    assert_eq!(
+        fx.expression(scope::MY_DATA, 1, op::ASSIGN, scope::LITERAL, 0),
+        Ok(true)
+    );
+    // Snapping the person back out to a non-container routing slot clears
+    // containment and zeroes the animator offset, after which the container
+    // can rotate freely.
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .slots
+        .get_mut(&SLOTS)
+        .unwrap()
+        .push(slot(SKIP_CHECKS));
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 1, 3, 0), Ok(true));
+    assert_eq!(fx.world.objects[&me].data[2], 0);
+    assert_eq!(
+        fx.expression(scope::MY_DATA, 1, op::ASSIGN, scope::LITERAL, 2),
+        Ok(true)
+    );
 }
 
 #[test]

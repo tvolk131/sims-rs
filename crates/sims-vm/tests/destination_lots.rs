@@ -41,15 +41,15 @@ fn step_destination_lot(rel_house: &str, ticks: u32, select_first_person: bool) 
             .unwrap_or_else(|err| panic!("{rel_house} halted at tick {tick}: {err}"));
         for error in &update.errors {
             assert!(
-                !error.fault.trap.unported(),
-                "{rel_house} hit unported trap at tick {tick}: object {}: {}",
+                matches!(error.fault.trap, sims_vm::Trap::Native { .. }),
+                "{rel_house} hit non-native trap at tick {tick}: object {}: {}",
                 error.object,
                 error.fault
             );
             if let Some(then) = &error.then {
                 assert!(
-                    !then.trap.unported(),
-                    "{rel_house} hit unported follow-up trap at tick {tick}: object {}: {then}",
+                    matches!(then.trap, sims_vm::Trap::Native { .. }),
+                    "{rel_house} hit non-native follow-up trap at tick {tick}: object {}: {then}",
                     error.object,
                 );
             }
@@ -59,6 +59,12 @@ fn step_destination_lot(rel_house: &str, ticks: u32, select_first_person: bool) 
             update.frame_errors.is_empty(),
             "{rel_house} had frame errors at tick {tick}: {:?}",
             update.frame_errors
+        );
+    }
+    if select_first_person {
+        assert!(
+            selected,
+            "{rel_house}: expected at least one person to be selected during stepping"
         );
     }
     eprintln!(

@@ -87,19 +87,38 @@ a read-only `Cell::Literal` (tail `0x453b51`, no word pointer).
   with a 1-unit footprint edge strip at cost `10_000` and calls
   `InflateRect(3, 3)`, before the common `IntersectRect` against the actor
   (`0x48276f`) and second `InflateRect(3, 3)` (`0x48279f`).
-- **Graphic-paired doors (`0x4636c5`, `crates/sims-vm/src/routing/rooms.rs`)**:
-  When definition word 69 is `1`, `partner()` finds the first other tile in the
-  door's group list with matching definition word 8 (`+0x10`) and repeats until
-  a tile has callback 15 (`PORTAL_FUNCTION`) or returns to the starting door.
+- **Graphic-paired doors (`0x4636b5..0x463750`, `crates/sims-vm/src/routing/rooms.rs`, `portals.rs`)**:
+  `partner()` reads definition word 69 once from the starting `door` (`EDI` at
+  `0x4636b5`) and keeps that pairing mode across retries; when word 69 is `1`,
+  it scans the group list for the first other tile matching `current`'s
+  definition word 8 (`+0x10`). Returning to `door` or finding no match returns
+  `Ok(None)` (`0x463750` returning null), which `portal_distance` (`0x463adf`)
+  handles by skipping the cross-room edge while still exploring same-room
+  portals; callers that dereference the pointer (`0x4822cb`, `choose_portal`,
+  `try_portal`, `fail_portal`) use `require_partner` and fail loudly on `None`.
 - **Container-slot animator offset (`0x454ceb..0x454d5e` → `0x58933b` →
-  `0x5921f0`, `crates/sims-vm/src/primitives/snap.rs` + `head.rs`)**:
+  `0x5921f0`, `crates/sims-vm/src/primitives/snap.rs`, `head.rs`, `memory.rs`, `placement.rs`)**:
   `Snap` into a container slot rotates `entry.offset[0..2]` by
   `container.facing & 7` (even facings only; odd facings yield `(0, 0)`),
   truncates with `__ftol`, and sets `animator+0x8c..+0x94` for persons.
   `cTSPerson::Place` (`0x5921f0`) leaves `a.position` unshifted and adds
   `+0x8c..+0x94` when computing terrain altitude and the model matrix; `head.rs`
   derives this offset from `(object.data[2], object.data[3])` while the person
-  is contained so `sims-sim` and `boot/save.rs` stay unchanged.
+  is contained so `sims-sim` and `boot/save.rs` stay unchanged. To guarantee
+  this derivation never silently diverges from the stored `0x58933b` offset,
+  the VM guards all three transitions that could break the invariant with
+  `Trap::Unsupported`: rotating a container holding a person in a
+  horizontal-offset slot (`memory.rs::store` and `snap.rs`), placing a person
+  into such a slot outside `Snap`, and moving a person out of such a slot
+  outside `Snap`/reset (`placement.rs::put_one`).
+- **Family 0 active roster (`0x415fcf..0x415fd7`, `crates/sims-vm/src/boot.rs`)**:
+  When `self.load.house != 0 && self.load.family == 0`, `boot.rs` passes the
+  actual members of family `0` if present in `world.families` (else `&[]`) as
+  `active_family`.
+- **Scope 38 duplicate-GUID guard (`0x45434b`, `crates/sims-vm/src/memory.rs`)**:
+  Because `sims_sim::neighbors::Neighbor` stores only `guid` (not the linked
+  definition pointer), scope `38` fails loudly with `Trap::Unsupported` if more
+  than one catalog definition shares `record.guid`, matching `selection.rs`.
 
 ## Vacation `House40` note
 
@@ -121,10 +140,12 @@ without relaxing `check_local`.
   Windows emulator recording; all are verified from `Sims.exe` 1.91 disassembly,
   synthetic unit tests, and live Complete Collection multi-destination stepping.
 - Deriving the container-slot animator offset from `(object.data[2],
-  object.data[3])` in `head::model` assumes a contained person reached its slot
-  via `Snap` and the container does not rotate while holding the person; a
-  person placed into a non-zero-offset container slot by another primitive (or
-  a rotated container) is **unverified**.
+  object.data[3])` in `head::model` is guarded against container facing writes
+  and non-`Snap` container entry/exit via `Trap::Unsupported`, so any case
+  where stored `0x58933b` state would diverge fails loudly instead of silently
+  drifting.
 - Residential lot determinism is verified against the existing 43,200-tick Goth
   day hash (`df6eb544be87b93233011f355999ac9abb0c36dc5e914f2f7c0fe2f49967b19a`)
-  and 8/8 ratchet suite.
+  and 8/8 ratchet suite; note that previously unported error paths (such as
+  free-will-off visitors on residential lot 0) now execute the ported
+  `0x45dd87..0x45ddaa` logic instead of returning `Trap::Unsupported`.

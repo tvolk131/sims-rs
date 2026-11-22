@@ -635,10 +635,67 @@ impl Interpreter<'_> {
         })
     }
 
+    /// Whether `container_id`'s container slot `slot_index` has a nonzero
+    /// horizontal offset (`entry.offset[..2]`, ignoring `-0.0`).
+    pub(crate) fn slot_has_horizontal_offset(
+        &self,
+        world: &World,
+        container_id: u16,
+        slot_index: usize,
+    ) -> bool {
+        let Some(container) = world.objects.get(&container_id) else {
+            return false;
+        };
+        let Some(definition) =
+            crate::interpreter::object_definition(self.catalog, world, container.guid)
+        else {
+            return false;
+        };
+        self.program
+            .slots(definition.resource, definition.chunk)
+            .iter()
+            .filter(|entry| entry.kind == 0)
+            .nth(slot_index)
+            .is_some_and(|entry| {
+                entry.offset[..2]
+                    .iter()
+                    .any(|n| n.to_bits() & 0x7fff_ffff != 0)
+            })
+    }
+
+    /// Whether `container_id` currently holds a person in any container slot
+    /// whose horizontal offset is nonzero (`0x454ceb`). Rotating the container
+    /// while such a person is held would make the derived offset diverge from
+    /// the offset `0x58933b` stored at `Snap` time.
+    pub(crate) fn container_holds_horizontal_offset_person(
+        &self,
+        world: &World,
+        container_id: u16,
+    ) -> bool {
+        let Some(container) = world.objects.get(&container_id) else {
+            return false;
+        };
+        container
+            .slots
+            .iter()
+            .skip(1)
+            .enumerate()
+            .any(|(slot_index, slot)| {
+                let Some(occupant_id) = u16::try_from(slot.object).ok().filter(|&id| id > 0) else {
+                    return false;
+                };
+                world
+                    .objects
+                    .get(&occupant_id)
+                    .is_some_and(|o| o.person.is_some())
+                    && self.slot_has_horizontal_offset(world, container_id, slot_index)
+            })
+    }
+
     /// Container-slot animator offset (`0x454ceb..0x454d5e`) for a person
     /// currently held in a container slot, or `None` when not contained or the
     /// offset is zero.
-    fn container_animator_offset(
+    pub(crate) fn container_animator_offset(
         &self,
         world: &World,
         object: &sims_sim::Object,
@@ -748,5 +805,126 @@ mod tests {
                 "facing {facing}"
             );
         }
+    }
+
+    #[test]
+    fn model_adds_container_slot_animator_offset_to_person_placement() {
+        use sims_formats::execution::Slot;
+        use std::collections::BTreeMap;
+
+        let mut lib = crate::Library::default();
+        let mut def = [0i16; crate::DEFINITION_WORDS];
+        def[20] = 1; // SLOT chunk ID
+        lib.definitions.insert(1, def);
+        lib.slots.insert(
+            1,
+            vec![Slot {
+                kind: 0,
+                offset: [8.0, 0.0, 0.0],
+                standing: 1,
+                sitting: 0,
+                ground: 0,
+                flags: 0,
+                snap_target: -1,
+                proximity: [0; 3],
+                max_size: 0,
+                unknown: 0,
+                gradient: 0.0,
+                height: 0,
+                facing: 0,
+                resolution: 0,
+            }],
+        );
+        let program = crate::Program {
+            global: 0,
+            semi_globals: BTreeMap::new(),
+            libraries: BTreeMap::from([(1, lib)]),
+            careers: None,
+            career_texts_end: false,
+            labels_hold_no_token: false,
+            zoning: BTreeMap::new(),
+            animations: Default::default(),
+            people: Default::default(),
+            icon_frames: Default::default(),
+            wardrobe: None,
+            ordered_wardrobe: None,
+            characters: Default::default(),
+            character_files: Default::default(),
+            expansions: 0,
+        };
+        let catalog = sims_content::Catalog {
+            global: 0,
+            objects: vec![sims_content::Object {
+                guid: 0x5555,
+                resource: 1,
+                chunk: 1,
+                kind: 4,
+                master: 0,
+            }],
+            by_guid: BTreeMap::from([(0x5555, 0)]),
+            semi_globals: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut world = World::empty();
+        world.size = 64;
+        world.arrays.insert(
+            ALTITUDE,
+            sims_formats::lot::Array {
+                width: 64,
+                height: 64,
+                stride: 4,
+                encoding: 0,
+                data: vec![0; FULL * FULL * 4],
+            },
+        );
+        let make_obj = |id: u16, guid: u32, container: i16, slot: i16| sims_sim::Object {
+            id,
+            guid,
+            footprint: [0; 4],
+            position: [32, 32, 1],
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: vec![0; 8],
+            data: {
+                let mut d = vec![0; 72];
+                d[1] = 0; // facing 0
+                d[2] = container;
+                d[3] = slot;
+                d
+            },
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: -1,
+            relationships: Vec::new(),
+            slots: Vec::new(),
+            dynamic_sprites: Vec::new(),
+            multipart: None,
+            portal: None,
+            person: None,
+            registry_word: None,
+            last_result: false,
+            removal_skips_resets: false,
+            selected: false,
+        };
+        world.objects.insert(1, make_obj(1, 0x5555, 0, -1));
+        world.objects.insert(2, make_obj(2, 0x6666, 0, -1));
+        let mut animator = sims_sim::animator::LOADED;
+        animator.position = [F32::from_f32(32.0), F32::from_f32(32.0), F32::from_f32(0.0)];
+        let interp = Interpreter::new(&program, &catalog, crate::Stream::Lot);
+        let base_model = interp.model(&world, 2, &animator).unwrap();
+        // Contain person 2 in container 1 slot 0 (offset [8.0, 0.0, 0.0]).
+        world.objects.get_mut(&2).unwrap().data[2] = 1;
+        world.objects.get_mut(&2).unwrap().data[3] = 0;
+        let offset_model = interp.model(&world, 2, &animator).unwrap();
+        let expected = head::placement_on_level(
+            [F32::from_f32(40.0), F32::from_f32(32.0), F32::from_f32(0.0)],
+            F32::ZERO,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(offset_model, expected);
+        assert_ne!(offset_model, base_model);
     }
 }

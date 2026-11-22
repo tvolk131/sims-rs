@@ -168,18 +168,20 @@ pub(crate) fn room_level(room: i16) -> i32 {
 }
 
 impl Interpreter<'_> {
-    /// The other side of a door (0x4636ae): when definition word 69
-    /// ([`PAIRING`]) is 1 (`0x4636c5`), the first other tile in the door's
-    /// group list (starting from its lead tile) whose definition word 8
-    /// ([`GRAPHIC`], `+0x10`) matches; otherwise (`0x463705`), the next part
-    /// of the door's group round the ring. Repeats from the found tile until
+    /// The other side of a door (0x4636ae): when the original `door`'s
+    /// definition word 69 ([`PAIRING`]) is 1 (`0x4636b5`, `0x4636c5`), the
+    /// first other tile in the group list (starting from its lead tile) whose
+    /// definition word 8 ([`GRAPHIC`], `+0x10`) matches `current`'s graphic;
+    /// otherwise (`0x463705`), the next part of the group round the ring.
+    /// Repeats from the found tile (still using `door`'s pairing mode) until
     /// one has the door function (callback 15) or the search returns to `door`
-    /// or finds no match.
-    pub(crate) fn partner(&self, world: &World, door: u16) -> Result<u16, Trap> {
+    /// or finds no match, in which case `0x463750` returns null (`Ok(None)`).
+    pub(crate) fn partner(&self, world: &World, door: u16) -> Result<Option<u16>, Trap> {
+        let by_graphic = self.words(world, door)?[PAIRING] == 1;
         let parts = self.parts(world, door)?;
         let mut current = door;
         for _ in 0..=parts.len() {
-            let next = if self.words(world, current)?[PAIRING] == 1 {
+            let next = if by_graphic {
                 let graphic = self.words(world, current)?[GRAPHIC];
                 let mut matched = None;
                 for &candidate in &parts {
@@ -188,12 +190,10 @@ impl Interpreter<'_> {
                         break;
                     }
                 }
-                matched.ok_or_else(|| {
-                    Trap::Unsupported(
-                        "a door pairing by graphic (0x4636c5) has no matching tile in its group"
-                            .into(),
-                    )
-                })?
+                let Some(found) = matched else {
+                    return Ok(None);
+                };
+                found
             } else {
                 if parts.len() < 2 {
                     return Err(Trap::Unsupported(
@@ -215,20 +215,28 @@ impl Interpreter<'_> {
                 ));
             }
             if next == door {
-                return Err(Trap::Unsupported(
-                    "a door whose group has no other door tile: the original's partner search \
-                     returns null (0x463750), which is not ported"
-                        .into(),
-                ));
+                return Ok(None);
             }
             if self.has_function(world, next, PORTAL_FUNCTION) {
-                return Ok(next);
+                return Ok(Some(next));
             }
             current = next;
         }
         Err(Trap::Unsupported(
             "a door's partner search (0x4636ae) cycled without finding a door tile".into(),
         ))
+    }
+
+    /// [`Interpreter::partner`] for callers that dereference the returned
+    /// partner pointer without a null check (`0x463750` returning null).
+    pub(crate) fn require_partner(&self, world: &World, door: u16) -> Result<u16, Trap> {
+        self.partner(world, door)?.ok_or_else(|| {
+            Trap::Unsupported(
+                "a door has no partner tile: the original's partner search returns null \
+                 (0x463750), which this caller dereferences"
+                    .into(),
+            )
+        })
     }
 
     /// Whether a person of room `room` may stand on a tile (0x4821f3):
@@ -252,7 +260,7 @@ impl Interpreter<'_> {
         if !connected {
             for id in standing_on(world, [x as u8, y as u8, level as u8])? {
                 if self.kind(world, id)? == DOOR && self.has_function(world, id, PORTAL_FUNCTION) {
-                    let partner = self.partner(world, id)?;
+                    let partner = self.require_partner(world, id)?;
                     let other = world
                         .objects
                         .get(&partner)
@@ -863,12 +871,102 @@ mod tests {
 
         let interpreter = Interpreter::new(&prog, &cat, Stream::Lot);
         // Graphic pairing skips tile 11 (graphic 200) and pairs 10 <-> 12 (graphic 100).
-        assert_eq!(interpreter.partner(&w, 10), Ok(12));
-        assert_eq!(interpreter.partner(&w, 12), Ok(10));
-        // Tile 11 has no other tile with graphic 200 in the group.
+        assert_eq!(interpreter.partner(&w, 10), Ok(Some(12)));
+        assert_eq!(interpreter.partner(&w, 12), Ok(Some(10)));
+        // Tile 11 has no other tile with graphic 200 in the group: 0x463750 returns null.
+        assert_eq!(interpreter.partner(&w, 11), Ok(None));
         assert!(matches!(
-            interpreter.partner(&w, 11),
-            Err(Trap::Unsupported(msg)) if msg.contains("0x4636c5")
+            interpreter.require_partner(&w, 11),
+            Err(Trap::Unsupported(msg)) if msg.contains("0x463750")
         ));
+    }
+
+    #[test]
+    fn graphic_paired_door_retry_keeps_original_doors_pairing_mode() {
+        use sims_formats::saved_objects::Multipart;
+
+        // 0x4636b5 reads word 69 (PAIRING) from the original door (EDI) on
+        // every retry, not from the intermediate tile (ESI).
+        // Group: 10 (PAIRING=1, graphic 100, portal) -> 11 (PAIRING=0, graphic 100,
+        // NO portal) -> 12 (PAIRING=0, graphic 200, portal).
+        // Starting from 10: first graphic match is 11 (lacks callback 15).
+        // Retry from 11 MUST stay in door 10's graphic mode (matching back to 10
+        // and returning Ok(None)), NOT switch to ring mode and return tile 12.
+        let mut prog = program();
+        let mut lib = crate::Library::default();
+        let door_words = |graphic: i16, pairing: i16| {
+            let mut w = [0i16; crate::DEFINITION_WORDS];
+            w[9] = DOOR;
+            w[GRAPHIC] = graphic;
+            w[PAIRING] = pairing;
+            w
+        };
+        lib.definitions.insert(1, door_words(100, 1));
+        lib.definitions.insert(2, door_words(100, 0));
+        lib.definitions.insert(3, door_words(200, 0));
+        let mut portal_callbacks = vec![
+            sims_formats::execution::ObjectFunction {
+                condition: 0,
+                action: 0,
+            };
+            PORTAL_FUNCTION + 1
+        ];
+        portal_callbacks[PORTAL_FUNCTION].action = 4096;
+        lib.callbacks.insert(1, portal_callbacks.clone());
+        lib.callbacks.insert(3, portal_callbacks);
+        // Chunk 2 deliberately has NO PORTAL_FUNCTION callback.
+        prog.libraries.insert(1, lib);
+
+        let mut cat = catalog();
+        for (chunk, guid) in [(1u16, 0x8101u32), (2, 0x8102), (3, 0x8103)] {
+            let index = cat.objects.len();
+            cat.objects.push(sims_content::Object {
+                guid,
+                resource: 1,
+                chunk,
+                kind: DOOR as u16,
+                master: 1,
+            });
+            cat.by_guid.insert(guid, index);
+        }
+
+        let mut w = world();
+        let make_door = |id: u16, guid: u32, parent: i16| sims_sim::Object {
+            id,
+            guid,
+            footprint: [0; 4],
+            position: [32, 32, 0],
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: vec![0; 8],
+            data: vec![0; 72],
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: -1,
+            relationships: Vec::new(),
+            slots: Vec::new(),
+            dynamic_sprites: Vec::new(),
+            multipart: Some(Multipart {
+                offset: [0; 3],
+                group: [0; 3],
+                parent,
+            }),
+            portal: None,
+            person: None,
+            registry_word: None,
+            last_result: false,
+            removal_skips_resets: false,
+            selected: false,
+        };
+        w.objects.insert(10, make_door(10, 0x8101, 0));
+        w.objects.insert(11, make_door(11, 0x8102, 10));
+        w.objects.insert(12, make_door(12, 0x8103, 10));
+        w.next_parts.insert(10, 11);
+        w.next_parts.insert(11, 12);
+        w.order.extend([10, 11, 12]);
+
+        let interpreter = Interpreter::new(&prog, &cat, Stream::Lot);
+        assert_eq!(interpreter.partner(&w, 10), Ok(None));
     }
 }

@@ -333,6 +333,18 @@ impl Machine<'_, '_> {
             self.not_fit(NotFit::Code(0), operands[4] & 2 != 0)?;
             return Ok(false);
         }
+        let old_facing = self.facing(me)?;
+        if direction != old_facing
+            && self
+                .interpreter()
+                .container_holds_horizontal_offset_person(self.world, me)
+        {
+            return Err(Trap::Unsupported(
+                "Snap rotating a container holding a person in a slot with horizontal offset \
+                 (0x454ceb / 0x5921f0), whose stored animator offset is not kept"
+                    .into(),
+            ));
+        }
         let place_at = Place {
             on_lot: on_lot(to),
             position: to,
@@ -341,7 +353,7 @@ impl Machine<'_, '_> {
             level,
         };
         self.interpreter()
-            .put(self.world, me, place_at, true)
+            .put_from_snap(self.world, me, place_at, true)
             .map_err(|f| f.nested(me))?;
         self.set_datum(FACING, direction as i16)?;
         if person {

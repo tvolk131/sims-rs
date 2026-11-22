@@ -51,8 +51,9 @@
 //!   in the portrait table), temps are left untouched. Otherwise, when the
 //!   controlled family's ID (`+0x10c`) is nonzero, temp 0 becomes that ID and
 //!   temp 1 becomes 1; when its ID is 0, temp 0 becomes the first on-lot
-//!   person ID matching member 0 (`0x4e9608`) and temp 1 becomes 0. Always
-//!   takes the true branch.
+//!   person ID matching member 0 (`0x4e9608`) and temp 1 becomes 0 (or fails
+//!   with `Trap::Unsupported` if member 0 is off-lot, where `0x450764`
+//!   dereferences null). Takes the true branch when it succeeds.
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};

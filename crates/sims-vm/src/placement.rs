@@ -1237,12 +1237,51 @@ impl Interpreter<'_> {
     }
 
     /// One object is put at a place (0x433340).
-    fn put_one(&self, world: &mut World, id: u16, to: Place, notify: bool) -> Result<(), Fault> {
+    fn put_one(
+        &self,
+        world: &mut World,
+        id: u16,
+        to: Place,
+        notify: bool,
+        from_snap: bool,
+    ) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
             trap,
         };
+        if !from_snap
+            && let Some(object) = world.objects.get(&id)
+            && object.person.is_some()
+        {
+            let old_container =
+                u16::try_from(object.data.get(data::CONTAINER).copied().unwrap_or(0))
+                    .ok()
+                    .filter(|&c| c > 0);
+            let old_slot = i32::from(object.data.get(data::CONTAINER_SLOT).copied().unwrap_or(-1));
+            let same_slot = to.container == old_container && to.slot == old_slot;
+            if !same_slot {
+                if self.container_animator_offset(world, object).is_some() {
+                    return Err(fail(Trap::Unsupported(
+                        "moving a person out of a horizontal-offset container slot outside \
+                         Snap/reset (0x454ceb / 0x5921f0), whose stored animator offset is not \
+                         cleared"
+                            .into(),
+                    )));
+                }
+                if let Some(parent) = to.container
+                    && usize::try_from(to.slot)
+                        .ok()
+                        .is_some_and(|s| self.slot_has_horizontal_offset(world, parent, s))
+                {
+                    return Err(fail(Trap::Unsupported(
+                        "placing a person into a horizontal-offset container slot outside Snap \
+                         (0x454ceb / 0x5921f0)"
+                            .into(),
+                    )));
+                }
+            }
+        }
         let words = self.words(world, id).map_err(fail)?;
         let old = position(world, id).map_err(fail)?;
         let was_outside = !capture_raw(world, id).map_err(fail)?.on_lot;
@@ -2083,6 +2122,30 @@ impl Interpreter<'_> {
         to: Place,
         notify: bool,
     ) -> Result<(), Fault> {
+        self.put_as(world, id, to, notify, false)
+    }
+
+    /// [`Interpreter::put`] from `Snap` (`0x454976`), which updates the
+    /// person's stored animator offset (`0x454ceb -> 0x58933b`) to match the
+    /// destination slot (or zeroes it for a non-container spot).
+    pub(crate) fn put_from_snap(
+        &self,
+        world: &mut World,
+        id: u16,
+        to: Place,
+        notify: bool,
+    ) -> Result<(), Fault> {
+        self.put_as(world, id, to, notify, true)
+    }
+
+    fn put_as(
+        &self,
+        world: &mut World,
+        id: u16,
+        to: Place,
+        notify: bool,
+        from_snap: bool,
+    ) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -2090,7 +2153,7 @@ impl Interpreter<'_> {
         };
         let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
         let Some(selected) = object.multipart.as_ref().map(|part| part.offset) else {
-            return self.put_one(world, id, to, notify);
+            return self.put_one(world, id, to, notify, from_snap);
         };
         if object.person.is_some() {
             return Err(fail(Trap::Invalid("a person with several tiles".into())));
@@ -2117,7 +2180,7 @@ impl Interpreter<'_> {
                     level: to.level.wrapping_sub(selected[2]).wrapping_add(offset[2]),
                     ..to
                 };
-                self.put_one(world, part, place, notify)?;
+                self.put_one(world, part, place, notify, from_snap)?;
             } else {
                 self.take_off_one(world, part, notify)?;
             }

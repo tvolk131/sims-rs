@@ -649,6 +649,20 @@ impl Machine<'_, '_> {
                     .get(stack_object)
                     .ok_or(Trap::native(0x37, "missing neighbor"))?;
                 let index = bounded(index, DEFINITION_WORDS, 0x23)?;
+                if self
+                    .catalog
+                    .objects
+                    .iter()
+                    .filter(|o| o.guid == record.guid)
+                    .count()
+                    > 1
+                {
+                    return Err(Trap::Unsupported(format!(
+                        "scope 38 (0x454304) for neighbor GUID 0x{:08X}, which more than one \
+                         definition names: the neighbor's linked definition pointer is not kept",
+                        record.guid
+                    )));
+                }
                 Cell::Literal(self.definition_word(record.guid, index)?)
             }
             2 | 5 | 39..=255 => return Err(Trap::native(9, "invalid memory scope")),
@@ -816,6 +830,24 @@ impl Machine<'_, '_> {
                 *slot = host_selected.map_or(0, |id| id as i16);
             }
             return Ok(true);
+        }
+        if let Cell::Data(id, 1) = cell {
+            let old = self
+                .world
+                .objects
+                .get(&id)
+                .and_then(|o| o.data.get(1).copied());
+            if old.is_some_and(|prev| prev != value)
+                && self
+                    .interpreter()
+                    .container_holds_horizontal_offset_person(self.world, id)
+            {
+                return Err(Trap::Unsupported(
+                    "writing facing of a container holding a person in a slot with horizontal \
+                     offset (0x454ceb / 0x5921f0), whose stored animator offset is not kept"
+                        .into(),
+                ));
+            }
         }
         let world = &mut *self.world;
         let target = match cell {

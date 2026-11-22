@@ -615,6 +615,19 @@ fn neighbor_definition_reads_words_readonly_and_checks_bounds() {
     }
     // Read-only (no word pointer): write fails with native error 0x13.
     assert_eq!(code(run_write(&mut fx, 1, 12, 5)), Some(0x13));
+    // Duplicate-GUID definitions in catalog fail loudly (0x45434b follows the
+    // neighbor's linked definition pointer, which is not kept on Neighbor).
+    fx.catalog.objects.push(sims_content::Object {
+        guid,
+        resource: SIM_FILE,
+        chunk: 99,
+        kind: 2,
+        master: 0,
+    });
+    assert!(matches!(
+        trap(run_read(&mut fx, 1, 12, 777)),
+        Trap::Unsupported(ref m) if m.contains("0x454304")
+    ));
     assert_eq!(sims_vm::scope_name(38), "neighbor's definition");
     assert_eq!(sims_vm::scope_name(24), "neighbor in stack object");
 }
