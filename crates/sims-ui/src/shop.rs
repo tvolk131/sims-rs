@@ -398,8 +398,10 @@ pub struct ShopPickerDialog {
     open: bool,
     selected_item_id: Option<String>,
     scroll_offset: usize,
+    follow_selection: bool,
     hovered: Option<ShopHit>,
     pressed: Option<ShopHit>,
+    pressed_item: Option<(String, CurrencyKind, i32)>,
 }
 
 impl ShopPickerDialog {
@@ -419,20 +421,25 @@ impl ShopPickerDialog {
     pub fn open(&mut self) {
         self.open = true;
         self.scroll_offset = 0;
+        self.follow_selection = false;
         self.hovered = None;
         self.pressed = None;
+        self.pressed_item = None;
     }
 
     /// Closes the picker dialog and clears transient pointer state.
     pub fn close(&mut self) {
         self.open = false;
+        self.follow_selection = false;
         self.hovered = None;
         self.pressed = None;
+        self.pressed_item = None;
     }
 
     /// Selects an item by ID.
     pub fn select_item(&mut self, item_id: impl Into<String>) {
         self.selected_item_id = Some(item_id.into());
+        self.follow_selection = true;
     }
 
     /// Returns the currently selected item, defaulting to the first item when
@@ -458,6 +465,21 @@ impl ShopPickerDialog {
         Some(0)
     }
 
+    fn effective_scroll(&self, snapshot: &ShopSnapshot, capacity: usize) -> usize {
+        let max_scroll = snapshot.items.len().saturating_sub(capacity);
+        let mut scroll = self.scroll_offset.min(max_scroll);
+        if self.follow_selection
+            && let Some(idx) = self.selected_index(snapshot)
+        {
+            if idx < scroll {
+                scroll = idx;
+            } else if idx >= scroll + capacity {
+                scroll = (idx + 1).saturating_sub(capacity).min(max_scroll);
+            }
+        }
+        scroll
+    }
+
     /// Moves selection to the previous item.
     pub fn select_prev(&mut self, snapshot: &ShopSnapshot) -> bool {
         let Some(idx) = self.selected_index(snapshot) else {
@@ -468,6 +490,7 @@ impl ShopPickerDialog {
         }
         let next = idx - 1;
         self.selected_item_id = Some(snapshot.items[next].id.clone());
+        self.follow_selection = true;
         if next < self.scroll_offset {
             self.scroll_offset = next;
         }
@@ -484,6 +507,7 @@ impl ShopPickerDialog {
         }
         let next = idx + 1;
         self.selected_item_id = Some(snapshot.items[next].id.clone());
+        self.follow_selection = true;
         true
     }
 
@@ -497,7 +521,8 @@ impl ShopPickerDialog {
         let layout = self.layout(frame_size, snapshot);
         let capacity = (layout.list_area.height / CARD_HEIGHT).max(1) as usize;
         let max_scroll = snapshot.items.len().saturating_sub(capacity);
-        let current = self.scroll_offset.min(max_scroll);
+        let current = self.effective_scroll(snapshot, capacity);
+        self.follow_selection = false;
         let next = if delta_rows >= 0 {
             current.saturating_add(delta_rows as usize).min(max_scroll)
         } else {
@@ -616,8 +641,7 @@ impl ShopPickerDialog {
 
         let capacity = (list_area.height / CARD_HEIGHT).max(1) as usize;
         let needs_scroll = snapshot.items.len() > capacity;
-        let max_scroll = snapshot.items.len().saturating_sub(capacity);
-        let scroll = self.scroll_offset.min(max_scroll);
+        let scroll = self.effective_scroll(snapshot, capacity);
 
         let card_w = if needs_scroll {
             (list_area.width - SCROLL_BTN_WIDTH - 4).max(60)
@@ -694,6 +718,16 @@ impl ShopPickerDialog {
         let hit = layout.hit(x, y);
         self.hovered = hit;
         self.pressed = hit;
+        self.pressed_item = match hit {
+            Some(ShopHit::BuyButton | ShopHit::TryOnButton) => self
+                .selected_item(snapshot)
+                .map(|i| (i.id.clone(), i.currency, i.price)),
+            Some(ShopHit::ItemCard(idx)) => snapshot
+                .items
+                .get(idx)
+                .map(|i| (i.id.clone(), i.currency, i.price)),
+            _ => None,
+        };
         hit.is_some() || layout.dialog.contains(x, y)
     }
 
@@ -710,6 +744,7 @@ impl ShopPickerDialog {
             return None;
         }
         let pressed = self.pressed.take()?;
+        let pressed_item = self.pressed_item.take();
         let layout = self.layout(frame_size, snapshot);
         let released = layout.hit(x, y);
         self.hovered = released;
@@ -718,8 +753,13 @@ impl ShopPickerDialog {
         }
         match pressed {
             ShopHit::ItemCard(idx) => {
-                if let Some(item) = snapshot.items.get(idx) {
+                if let Some(item) = snapshot.items.get(idx)
+                    && pressed_item
+                        .as_ref()
+                        .is_some_and(|(id, _, _)| id == &item.id)
+                {
                     self.selected_item_id = Some(item.id.clone());
+                    self.follow_selection = false;
                 }
                 None
             }
@@ -732,14 +772,33 @@ impl ShopPickerDialog {
                 None
             }
             ShopHit::TryOnButton => {
+                let (expected_id, _, _) = pressed_item?;
                 if !self.can_try_on_selected(snapshot) {
                     return None;
                 }
-                self.selected_item(snapshot).map(|item| ShopCommand::TryOn {
-                    item_id: item.id.clone(),
-                })
+                self.selected_item(snapshot)
+                    .filter(|item| item.id == expected_id)
+                    .map(|item| ShopCommand::TryOn {
+                        item_id: item.id.clone(),
+                    })
             }
-            ShopHit::BuyButton => self.submit(snapshot),
+            ShopHit::BuyButton => {
+                let (expected_id, expected_currency, expected_price) = pressed_item?;
+                if !self.can_buy_selected(snapshot) {
+                    return None;
+                }
+                self.selected_item(snapshot)
+                    .filter(|item| {
+                        item.id == expected_id
+                            && item.currency == expected_currency
+                            && item.price == expected_price
+                    })
+                    .map(|item| ShopCommand::Buy {
+                        item_id: item.id.clone(),
+                        currency: item.currency,
+                        price: item.price,
+                    })
+            }
             ShopHit::CancelButton => {
                 self.close();
                 Some(ShopCommand::Cancel)
@@ -977,13 +1036,14 @@ impl ShopPickerDialog {
         // Scroll buttons.
         let capacity = (layout.list_area.height / CARD_HEIGHT).max(1) as usize;
         let max_scroll = snapshot.items.len().saturating_sub(capacity);
+        let eff_scroll = self.effective_scroll(snapshot, capacity);
         if let Some(up) = layout.scroll_up {
             draw_button(
                 frame,
                 art,
                 up,
                 "^",
-                self.button_state(ShopHit::ScrollUp, self.scroll_offset > 0),
+                self.button_state(ShopHit::ScrollUp, eff_scroll > 0),
             );
         }
         if let Some(down) = layout.scroll_down {
@@ -992,7 +1052,7 @@ impl ShopPickerDialog {
                 art,
                 down,
                 "v",
-                self.button_state(ShopHit::ScrollDown, self.scroll_offset < max_scroll),
+                self.button_state(ShopHit::ScrollDown, eff_scroll < max_scroll),
             );
         }
 

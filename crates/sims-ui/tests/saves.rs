@@ -136,7 +136,70 @@ fn manual_first_then_newest_first_autosaves_and_newest_intact_resolution() {
     let warning = snap.warning_banner_text().expect("warning banner");
     assert!(warning.contains("corrupt"));
     assert!(warning.contains("unsupported"));
-    assert!(warning.contains("not modified or deleted"));
+    assert!(warning.contains("Existing saves were preserved."));
+    let (line1, line2) = snap.warning_banner_lines().expect("warning banner lines");
+    assert!(line1.contains("corrupt"));
+    assert_eq!(line2, "Existing saves were preserved.");
+}
+
+#[test]
+fn delete_and_load_cancel_if_snapshot_refreshes_between_press_and_release() {
+    let snap = sample_snapshot();
+    let mut dialog = SaveManagerDialog::new();
+    dialog.open();
+    let size = [800, 600];
+
+    // Select corrupt Autosave #3 and press Delete.
+    assert!(dialog.select_next(&snap));
+    assert_eq!(
+        dialog.selected_slot(&snap).map(|s| s.slot_id.as_str()),
+        Some("n1-l1-auto-3")
+    );
+    let layout = dialog.layout(size, &snap);
+    let (dx, dy) = center(layout.delete_btn);
+    assert!(dialog.pointer_down(size, &snap, dx, dy));
+
+    // Refresh removes Autosave #3 before release; selection falls back to Manual Save.
+    let mut refreshed = snap.clone();
+    refreshed.slots.retain(|s| s.slot_id != "n1-l1-auto-3");
+    assert_eq!(
+        dialog.pointer_up(size, &refreshed, dx, dy),
+        None,
+        "releasing Delete after target disappeared must NOT delete the fallback Manual Save"
+    );
+
+    // Same guard for Load: press on Manual Save, then remove Manual Save before release.
+    dialog.select_slot("n1-l1-manual");
+    let layout2 = dialog.layout(size, &refreshed);
+    let (lx, ly) = center(layout2.load_btn);
+    assert!(dialog.pointer_down(size, &refreshed, lx, ly));
+    let mut no_manual = refreshed.clone();
+    no_manual.slots.retain(|s| s.slot_id != "n1-l1-manual");
+    assert_eq!(dialog.pointer_up(size, &no_manual, lx, ly), None);
+}
+
+#[test]
+fn keyboard_selection_stays_visible_at_compact_viewport() {
+    let snap = sample_snapshot();
+    let mut dialog = SaveManagerDialog::new();
+    dialog.open();
+    let size = [320, 240];
+
+    // Walk down through all 5 slots at 320x240 (where only ~2 rows fit).
+    for expected_idx in 0..snap.slots.len() {
+        let layout = dialog.layout(size, &snap);
+        assert!(
+            layout
+                .visible_rows
+                .iter()
+                .any(|&(idx, _)| idx == expected_idx),
+            "selected row {expected_idx} must be visible in {:?}",
+            layout.visible_rows
+        );
+        if expected_idx + 1 < snap.slots.len() {
+            assert!(dialog.select_next(&snap));
+        }
+    }
 }
 
 #[test]
@@ -292,5 +355,28 @@ fn complete_collection_live_install_renders_save_manager_with_native_chrome() {
     assert!(
         non_black > 25_000,
         "expected rich 1.91 9-slice save dialog rendering, got {non_black} non-black pixels"
+    );
+
+    // Verify recovery labels and 2-line warning banner fit with shipped bitmap fonts at 320x240.
+    let compact = dialog.layout([320, 240], &snap);
+    let font10 = art.font(10).expect("10pt shipped font");
+    let font9 = art.font(9).expect("9pt shipped font");
+    assert!(
+        font10.width("Newest Intact") <= compact.fallback_btn.width - 8,
+        "Newest Intact ({}) must fit inside compact fallback_btn ({})",
+        font10.width("Newest Intact"),
+        compact.fallback_btn.width - 8
+    );
+    let banner = compact.warning_banner.expect("compact warning banner");
+    let lh = font9.line_height.clamp(12, 18);
+    assert!(
+        banner.height >= 3 + lh * 2,
+        "warning banner ({}) must fit both summary and preservation lines (2 * {lh})",
+        banner.height
+    );
+    assert!(
+        font9.width("Unsupported") <= 82,
+        "Unsupported ({}) must fit inside 88px badge inner width",
+        font9.width("Unsupported")
     );
 }

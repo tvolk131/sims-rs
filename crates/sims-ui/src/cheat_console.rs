@@ -78,6 +78,7 @@ pub enum CheatCommand {
 /// Structured error returned when parsing a cheat console line fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheatParseError {
+    Closed,
     Empty,
     UnknownCommand(String),
     MissingArgument {
@@ -107,6 +108,7 @@ pub enum CheatParseError {
 impl fmt::Display for CheatParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Closed => write!(f, "Cheat console is closed."),
             Self::Empty => write!(f, "Enter a cheat command (type 'help' for list)."),
             Self::UnknownCommand(cmd) => write!(f, "No such cheat: {cmd}"),
             Self::MissingArgument { command, expected } => {
@@ -613,8 +615,11 @@ impl CheatConsole {
 
     /// Parses and submits the current input line (`Enter`), updating command
     /// history and the feedback line. Returns the parsed [`CheatCommand`] list
-    /// on success.
+    /// on success, or [`CheatParseError::Closed`] when the console is closed.
     pub fn submit(&mut self) -> std::result::Result<Vec<CheatCommand>, CheatParseError> {
+        if !self.open {
+            return Err(CheatParseError::Closed);
+        }
         let raw = self.input.trim().to_owned();
         let parsed = parse_cheat_line_with_previous(&raw, self.last_command.as_ref());
 
@@ -651,15 +656,42 @@ impl CheatConsole {
 
     /// Computes top-left overlay geometry inside `frame_size`.
     pub fn layout(&self, frame_size: [u32; 2]) -> CheatConsoleLayout {
+        self.layout_with_art(frame_size, None)
+    }
+
+    /// Computes top-left overlay geometry inside `frame_size`, sizing wrapped
+    /// feedback lines against `art`'s font metrics when available.
+    pub fn layout_with_art(&self, frame_size: [u32; 2], art: Option<&Art>) -> CheatConsoleLayout {
         let fw = i32::try_from(frame_size[0]).unwrap_or(800).max(1);
         let fh = i32::try_from(frame_size[1]).unwrap_or(600).max(1);
 
         let margin = 10;
-        let width = 420.min((fw - margin * 2).max(160).min(fw));
+        let width = 540.min((fw - margin * 2).max(160).min(fw));
         let input_h = 24;
-        let has_feedback = self.feedback.is_some();
-        let feedback_h = if has_feedback { 18 } else { 0 };
-        let bar_h = (input_h + 12 + feedback_h).min((fh - margin * 2).max(32));
+        let fb_w = (width - 16).max(40);
+        let small_font = art.and_then(|a| a.font(9).or_else(|| a.font(10)));
+        let lh = small_font.map_or(16, |f| f.line_height.max(12));
+
+        let feedback_lines = match self.feedback.as_ref() {
+            Some(fb) if !fb.message.is_empty() => {
+                if let Some(font) = small_font {
+                    font.wrap(&fb.message, fb_w).len().max(1) as i32
+                } else {
+                    let approx_cols = (fb_w / 7).max(1) as usize;
+                    fb.message.chars().count().div_ceil(approx_cols).max(1) as i32
+                }
+            }
+            _ => 0,
+        };
+
+        let max_bar_h = (fh - margin * 2).max(32);
+        let max_fb_h = (max_bar_h - input_h - 15).max(0);
+        let feedback_h = if feedback_lines > 0 {
+            (feedback_lines * lh + 2).min(max_fb_h)
+        } else {
+            0
+        };
+        let bar_h = (input_h + 12 + if feedback_h > 0 { feedback_h + 3 } else { 0 }).min(max_bar_h);
 
         let bar = Rect::new(margin, margin, width, bar_h);
         let input_box = Rect::new(
@@ -668,12 +700,12 @@ impl CheatConsole {
             (bar.width - 12).max(40),
             input_h.min((bar.height - 8).max(16)),
         );
-        let feedback_line = if has_feedback && bar.height >= input_box.height + 24 {
+        let feedback_line = if feedback_h >= lh {
             Some(Rect::new(
                 bar.x + 8,
                 input_box.y + input_box.height + 3,
-                (bar.width - 16).max(40),
-                16,
+                fb_w,
+                feedback_h,
             ))
         } else {
             None
@@ -691,7 +723,7 @@ impl CheatConsole {
         if !self.open {
             return;
         }
-        let layout = self.layout([frame.width(), frame.height()]);
+        let layout = self.layout_with_art([frame.width(), frame.height()], Some(art));
         draw_console_frame(frame, art, layout.bar);
 
         // Input box (`cTSWinTextEdit2` dark-navy fill + cyan focus border).
@@ -746,14 +778,16 @@ impl CheatConsole {
                 FeedbackKind::Ok => TEXT_OK,
                 FeedbackKind::Error => TEXT_ERROR,
             };
-            draw_clipped_text(
-                frame,
-                font,
-                &fb.message,
-                [fb_rect.x, fb_rect.y],
-                fb_rect.width,
-                color,
-            );
+            let lh = font.line_height.max(1);
+            let mut y = fb_rect.y;
+            let max_y = fb_rect.y + fb_rect.height;
+            for line in font.wrap(&fb.message, fb_rect.width) {
+                if y + lh > max_y {
+                    break;
+                }
+                draw_clipped_text(frame, font, &line, [fb_rect.x, y], fb_rect.width, color);
+                y += lh;
+            }
         }
     }
 }

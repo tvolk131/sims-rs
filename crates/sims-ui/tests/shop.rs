@@ -141,6 +141,54 @@ fn boutique_try_on_buy_affordability_and_cancel_flow() {
 }
 
 #[test]
+fn buy_cancels_if_item_removed_or_repriced_between_press_and_release() {
+    let snap = sample_boutique_snapshot();
+    let mut dialog = ShopPickerDialog::new();
+    dialog.open();
+    let size = [800, 600];
+
+    // Press Buy on formal_01 at §250.
+    let layout = dialog.layout(size, &snap);
+    let (bx, by) = center(layout.buy_btn);
+    assert!(dialog.pointer_down(size, &snap, bx, by));
+
+    // Reprice formal_01 to §300 before release -> must NOT silently accept the new price.
+    let mut repriced = snap.clone();
+    repriced.items[0].price = 300;
+    assert_eq!(dialog.pointer_up(size, &repriced, bx, by), None);
+
+    // Press Buy again, then remove formal_01 before release -> must NOT buy a replacement item.
+    assert!(dialog.pointer_down(size, &snap, bx, by));
+    let mut removed = snap.clone();
+    removed.items.remove(0);
+    removed.items[0].price = 100; // even if the replacement is affordable
+    assert_eq!(dialog.pointer_up(size, &removed, bx, by), None);
+}
+
+#[test]
+fn keyboard_selection_scrolls_card_into_view_at_compact_viewport() {
+    let snap = sample_boutique_snapshot();
+    let mut dialog = ShopPickerDialog::new();
+    dialog.open();
+    let size = [320, 240];
+
+    for expected_idx in 0..snap.items.len() {
+        let layout = dialog.layout(size, &snap);
+        assert!(
+            layout
+                .visible_cards
+                .iter()
+                .any(|&(idx, _)| idx == expected_idx),
+            "selected card {expected_idx} must be visible in {:?}",
+            layout.visible_cards
+        );
+        if expected_idx + 1 < snap.items.len() {
+            assert!(dialog.select_next(&snap));
+        }
+    }
+}
+
+#[test]
 fn magic_vendor_magicoins_and_negative_price_guard() {
     let snap = ShopSnapshot {
         kind: ShopKind::MagicVendor,

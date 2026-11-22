@@ -216,6 +216,16 @@ impl SaveManagerSnapshot {
     /// Non-destructive warning banner message per `docs/vision.md`, present
     /// whenever any slot is corrupt/unsupported or `active_error` is set.
     pub fn warning_banner_text(&self) -> Option<String> {
+        let (summary, preservation) = self.warning_banner_lines()?;
+        Some(format!("{summary} {preservation}"))
+    }
+
+    /// Two-line warning banner `(summary, preservation_reassurance)` so the
+    /// non-destructive preservation guarantee always renders on its own
+    /// dedicated line even at compact viewports or with long error messages.
+    pub fn warning_banner_lines(&self) -> Option<(String, &'static str)> {
+        const PRESERVED: &str = "Existing saves were preserved.";
+
         let corrupt_count = self
             .slots
             .iter()
@@ -233,23 +243,24 @@ impl SaveManagerSnapshot {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            return Some(format!(
-                "{err} Previous saves were preserved and not overwritten."
-            ));
+            return Some((err.to_owned(), PRESERVED));
         }
         if corrupt_count > 0 && unsupported_count > 0 {
-            return Some(format!(
-                "{corrupt_count} corrupt and {unsupported_count} unsupported save(s) detected. Existing saves were not modified or deleted."
+            return Some((
+                format!("{corrupt_count} corrupt, {unsupported_count} unsupported save(s)."),
+                PRESERVED,
             ));
         }
         if corrupt_count > 0 {
-            return Some(format!(
-                "{corrupt_count} corrupt save slot(s) detected. Existing saves were preserved and not overwritten."
+            return Some((
+                format!("{corrupt_count} corrupt save slot(s) detected."),
+                PRESERVED,
             ));
         }
         if unsupported_count > 0 {
-            return Some(format!(
-                "{unsupported_count} unsupported save schema version(s) detected. Existing saves were preserved."
+            return Some((
+                format!("{unsupported_count} unsupported save schema(s) detected."),
+                PRESERVED,
             ));
         }
         None
@@ -334,8 +345,10 @@ pub struct SaveManagerDialog {
     open: bool,
     selected_slot_id: Option<String>,
     scroll_offset: usize,
+    follow_selection: bool,
     hovered: Option<SaveManagerHit>,
     pressed: Option<SaveManagerHit>,
+    pressed_slot_id: Option<String>,
 }
 
 impl SaveManagerDialog {
@@ -355,20 +368,25 @@ impl SaveManagerDialog {
     pub fn open(&mut self) {
         self.open = true;
         self.scroll_offset = 0;
+        self.follow_selection = false;
         self.hovered = None;
         self.pressed = None;
+        self.pressed_slot_id = None;
     }
 
     /// Closes the dialog and clears transient pointer state.
     pub fn close(&mut self) {
         self.open = false;
+        self.follow_selection = false;
         self.hovered = None;
         self.pressed = None;
+        self.pressed_slot_id = None;
     }
 
     /// Explicitly selects a slot by ID.
     pub fn select_slot(&mut self, slot_id: impl Into<String>) {
         self.selected_slot_id = Some(slot_id.into());
+        self.follow_selection = true;
     }
 
     /// Resolves the currently selected slot against `snapshot`, falling back to
@@ -398,6 +416,21 @@ impl SaveManagerDialog {
         Some(0)
     }
 
+    fn effective_scroll(&self, ordered: &[&SaveSlotSummary], capacity: usize) -> usize {
+        let max_scroll = ordered.len().saturating_sub(capacity);
+        let mut scroll = self.scroll_offset.min(max_scroll);
+        if self.follow_selection
+            && let Some(idx) = self.selected_index(ordered)
+        {
+            if idx < scroll {
+                scroll = idx;
+            } else if idx >= scroll + capacity {
+                scroll = (idx + 1).saturating_sub(capacity).min(max_scroll);
+            }
+        }
+        scroll
+    }
+
     /// Moves selection up by one slot in display order.
     pub fn select_prev(&mut self, snapshot: &SaveManagerSnapshot) -> bool {
         let ordered = snapshot.ordered_slots();
@@ -409,6 +442,7 @@ impl SaveManagerDialog {
         }
         let next = idx - 1;
         self.selected_slot_id = Some(ordered[next].slot_id.clone());
+        self.follow_selection = true;
         if next < self.scroll_offset {
             self.scroll_offset = next;
         }
@@ -426,6 +460,7 @@ impl SaveManagerDialog {
         }
         let next = idx + 1;
         self.selected_slot_id = Some(ordered[next].slot_id.clone());
+        self.follow_selection = true;
         true
     }
 
@@ -436,11 +471,12 @@ impl SaveManagerDialog {
         frame_size: [u32; 2],
         snapshot: &SaveManagerSnapshot,
     ) -> bool {
-        let ordered_len = snapshot.slots.len();
+        let ordered = snapshot.ordered_slots();
         let layout = self.layout(frame_size, snapshot);
         let capacity = (layout.list_area.height / SLOT_ROW_HEIGHT).max(1) as usize;
-        let max_scroll = ordered_len.saturating_sub(capacity);
-        let current = self.scroll_offset.min(max_scroll);
+        let max_scroll = ordered.len().saturating_sub(capacity);
+        let current = self.effective_scroll(&ordered, capacity);
+        self.follow_selection = false;
         let next = if delta_rows >= 0 {
             current.saturating_add(delta_rows as usize).min(max_scroll)
         } else {
@@ -528,41 +564,58 @@ impl SaveManagerDialog {
         let inner_x = dialog.x + pad;
         let inner_w = (dialog.width - pad * 2).max(120);
 
-        let title_bar = Rect::new(inner_x, dialog.y + 12, inner_w, 22);
+        let title_bar = Rect::new(inner_x, dialog.y + 10, inner_w, 20);
 
-        let footer_h = 30;
-        let footer_y = dialog.y + dialog.height - footer_h - 14;
-        let gap = 6;
-        let btn_w = ((inner_w - gap * 3) / 4).max(40);
-        let load_btn = Rect::new(inner_x, footer_y, btn_w, footer_h);
-        let fallback_btn = Rect::new(inner_x + (btn_w + gap), footer_y, btn_w, footer_h);
-        let delete_btn = Rect::new(inner_x + (btn_w + gap) * 2, footer_y, btn_w, footer_h);
-        let cancel_x = inner_x + (btn_w + gap) * 3;
-        let cancel_btn = Rect::new(
-            cancel_x,
+        let footer_h = if dialog.height < 250 { 28 } else { 30 };
+        let footer_y = dialog.y + dialog.height - footer_h - 12;
+        let gap = if inner_w < 360 { 4 } else { 6 };
+        let avail_btn_w = (inner_w - gap * 3).max(160);
+        // Reserve enough width for "Newest Intact" (97px in 10pt shipped font + padding).
+        let fallback_w = 108
+            .max((avail_btn_w * 38) / 100)
+            .min((avail_btn_w - 132).max(108));
+        let rem_w = (avail_btn_w - fallback_w).max(90);
+        let load_w = (rem_w * 30) / 100;
+        let delete_w = (rem_w * 34) / 100;
+        let cancel_w = (rem_w - load_w - delete_w).max(30);
+        let load_btn = Rect::new(inner_x, footer_y, load_w, footer_h);
+        let fallback_btn = Rect::new(
+            load_btn.x + load_btn.width + gap,
             footer_y,
-            (inner_x + inner_w - cancel_x).max(40),
+            fallback_w,
+            footer_h,
+        );
+        let delete_btn = Rect::new(
+            fallback_btn.x + fallback_btn.width + gap,
+            footer_y,
+            delete_w,
+            footer_h,
+        );
+        let cancel_btn = Rect::new(
+            delete_btn.x + delete_btn.width + gap,
+            footer_y,
+            cancel_w,
             footer_h,
         );
 
-        let mut cursor_y = title_bar.y + title_bar.height + 6;
-        let warning_banner = if snapshot.warning_banner_text().is_some() {
-            let banner_h = if dialog.height < 250 { 28 } else { 36 };
+        let mut cursor_y = title_bar.y + title_bar.height + 4;
+        let warning_banner = if snapshot.warning_banner_lines().is_some() {
+            let banner_h = 40;
             let rect = Rect::new(inner_x, cursor_y, inner_w, banner_h);
-            cursor_y = rect.y + rect.height + 6;
+            cursor_y = rect.y + rect.height + 4;
             Some(rect)
         } else {
             None
         };
 
-        let list_h = (footer_y - cursor_y - 10).max(SLOT_ROW_HEIGHT);
+        let list_h = (footer_y - cursor_y - 8).max(SLOT_ROW_HEIGHT);
         let list_area = Rect::new(inner_x, cursor_y, inner_w, list_h);
 
-        let ordered_len = snapshot.slots.len();
+        let ordered = snapshot.ordered_slots();
+        let ordered_len = ordered.len();
         let capacity = (list_area.height / SLOT_ROW_HEIGHT).max(1) as usize;
         let needs_scroll = ordered_len > capacity;
-        let max_scroll = ordered_len.saturating_sub(capacity);
-        let scroll = self.scroll_offset.min(max_scroll);
+        let scroll = self.effective_scroll(&ordered, capacity);
 
         let row_w = if needs_scroll {
             (list_area.width - SCROLL_BTN_WIDTH - 4).max(60)
@@ -645,6 +698,18 @@ impl SaveManagerDialog {
         let hit = layout.hit(x, y);
         self.hovered = hit;
         self.pressed = hit;
+        self.pressed_slot_id = match hit {
+            Some(SaveManagerHit::LoadButton | SaveManagerHit::DeleteButton) => {
+                self.selected_slot(snapshot).map(|s| s.slot_id.clone())
+            }
+            Some(SaveManagerHit::FallbackButton) => {
+                snapshot.newest_intact().map(|s| s.slot_id.clone())
+            }
+            Some(SaveManagerHit::SlotRow(idx)) => {
+                snapshot.ordered_slots().get(idx).map(|s| s.slot_id.clone())
+            }
+            _ => None,
+        };
         hit.is_some() || layout.dialog.contains(x, y)
     }
 
@@ -661,6 +726,7 @@ impl SaveManagerDialog {
             return None;
         }
         let pressed = self.pressed.take()?;
+        let pressed_slot_id = self.pressed_slot_id.take();
         let layout = self.layout(frame_size, snapshot);
         let released = layout.hit(x, y);
         self.hovered = released;
@@ -670,8 +736,11 @@ impl SaveManagerDialog {
         match pressed {
             SaveManagerHit::SlotRow(idx) => {
                 let ordered = snapshot.ordered_slots();
-                if let Some(slot) = ordered.get(idx) {
+                if let Some(slot) = ordered.get(idx)
+                    && pressed_slot_id.as_deref() == Some(slot.slot_id.as_str())
+                {
                     self.selected_slot_id = Some(slot.slot_id.clone());
+                    self.follow_selection = false;
                 }
                 None
             }
@@ -683,21 +752,28 @@ impl SaveManagerDialog {
                 self.scroll(1, frame_size, snapshot);
                 None
             }
-            SaveManagerHit::LoadButton => self
-                .selected_slot(snapshot)
-                .filter(|slot| slot.health.is_loadable())
-                .map(|slot| SaveManagerCommand::LoadSlot {
-                    slot_id: slot.slot_id.clone(),
-                }),
-            SaveManagerHit::FallbackButton => self
-                .can_fallback(snapshot)
-                .then(|| snapshot.newest_intact())
-                .flatten()
-                .map(|slot| SaveManagerCommand::FallbackToNewestIntact {
-                    slot_id: slot.slot_id.clone(),
-                }),
-            SaveManagerHit::DeleteButton => {
+            SaveManagerHit::LoadButton => {
+                let expected = pressed_slot_id?;
                 self.selected_slot(snapshot)
+                    .filter(|slot| slot.slot_id == expected && slot.health.is_loadable())
+                    .map(|slot| SaveManagerCommand::LoadSlot {
+                        slot_id: slot.slot_id.clone(),
+                    })
+            }
+            SaveManagerHit::FallbackButton => {
+                let expected = pressed_slot_id?;
+                self.can_fallback(snapshot)
+                    .then(|| snapshot.newest_intact())
+                    .flatten()
+                    .filter(|slot| slot.slot_id == expected)
+                    .map(|slot| SaveManagerCommand::FallbackToNewestIntact {
+                        slot_id: slot.slot_id.clone(),
+                    })
+            }
+            SaveManagerHit::DeleteButton => {
+                let expected = pressed_slot_id?;
+                self.selected_slot(snapshot)
+                    .filter(|slot| slot.slot_id == expected)
                     .map(|slot| SaveManagerCommand::DeleteSlot {
                         slot_id: slot.slot_id.clone(),
                     })
@@ -754,16 +830,29 @@ impl SaveManagerDialog {
         }
 
         // Non-destructive warning banner when corrupt/unsupported saves or active_error exist.
-        if let (Some(banner), Some(msg)) = (layout.warning_banner, snapshot.warning_banner_text()) {
+        if let (Some(banner), Some((summary, preserved))) =
+            (layout.warning_banner, snapshot.warning_banner_lines())
+        {
             draw_warning_banner(frame, art, banner);
             if let Some(font) = small_font {
-                let text_rect = Rect::new(
-                    banner.x + 8,
-                    banner.y + 4,
-                    (banner.width - 16).max(20),
-                    (banner.height - 8).max(12),
+                let text_w = (banner.width - 14).max(20);
+                let lh = font.line_height.clamp(12, 18);
+                draw_clipped_text(
+                    frame,
+                    font,
+                    &summary,
+                    [banner.x + 7, banner.y + 3],
+                    text_w,
+                    TEXT_WARNING,
                 );
-                draw_wrapped_text(frame, font, &msg, text_rect, TEXT_WARNING);
+                draw_clipped_text(
+                    frame,
+                    font,
+                    preserved,
+                    [banner.x + 7, banner.y + 3 + lh],
+                    text_w,
+                    TEXT_HOVER,
+                );
             }
         }
 
@@ -808,8 +897,8 @@ impl SaveManagerDialog {
                     draw_outline(frame, row_rect, TEXT_SELECTED);
                 }
 
-                // Health badge on the right side of the row.
-                let badge_w = 78.min((row_rect.width / 3).max(48));
+                // Health badge on the right side of the row (wide enough for "Unsupported").
+                let badge_w = 88.min((row_rect.width / 2).max(84));
                 let badge_rect = Rect::new(
                     row_rect.x + row_rect.width - badge_w - 6,
                     row_rect.y + 6,
@@ -890,13 +979,14 @@ impl SaveManagerDialog {
         // Scroll buttons when overflowing.
         let capacity = (layout.list_area.height / SLOT_ROW_HEIGHT).max(1) as usize;
         let max_scroll = ordered.len().saturating_sub(capacity);
+        let eff_scroll = self.effective_scroll(&ordered, capacity);
         if let Some(up) = layout.scroll_up {
             draw_button(
                 frame,
                 art,
                 up,
                 "^",
-                self.button_state(SaveManagerHit::ScrollUp, self.scroll_offset > 0),
+                self.button_state(SaveManagerHit::ScrollUp, eff_scroll > 0),
             );
         }
         if let Some(down) = layout.scroll_down {
@@ -905,7 +995,7 @@ impl SaveManagerDialog {
                 art,
                 down,
                 "v",
-                self.button_state(SaveManagerHit::ScrollDown, self.scroll_offset < max_scroll),
+                self.button_state(SaveManagerHit::ScrollDown, eff_scroll < max_scroll),
             );
         }
 
@@ -1129,35 +1219,4 @@ fn draw_clipped_text(
     }
     clipped.push_str(ellipsis);
     font.draw(frame, &clipped, at, color);
-}
-
-fn draw_wrapped_text(frame: &mut Frame, font: &Font, text: &str, rect: Rect, color: [u8; 3]) {
-    if rect.width <= 0 || rect.height <= 0 {
-        return;
-    }
-    let lh = font.line_height.max(1);
-    let mut y = rect.y;
-    let max_y = rect.y + rect.height;
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        let candidate = if line.is_empty() {
-            word.to_owned()
-        } else {
-            format!("{line} {word}")
-        };
-        if !line.is_empty() && font.width(&candidate) > rect.width {
-            if y + lh > max_y {
-                return;
-            }
-            draw_clipped_text(frame, font, &line, [rect.x, y], rect.width, color);
-            y += lh;
-            line.clear();
-            line.push_str(word);
-        } else {
-            line = candidate;
-        }
-    }
-    if !line.is_empty() && y + lh <= max_y {
-        draw_clipped_text(frame, font, &line, [rect.x, y], rect.width, color);
-    }
 }

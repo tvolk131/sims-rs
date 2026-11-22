@@ -219,6 +219,20 @@ fn console_editing_history_caret_blink_and_repeat_across_submits() {
     assert!(console.sync_blink(CARET_BLINK_US));
     assert!(console.paste_text(&"a".repeat(MAX_INPUT_LEN + 50)));
     assert_eq!(console.input().chars().count(), MAX_INPUT_LEN);
+
+    // Closing the console blocks submit even if a valid draft remains in the buffer.
+    console.close();
+    assert_eq!(console.submit(), Err(CheatParseError::Closed));
+}
+
+#[test]
+fn closed_console_refuses_submit_without_emitting_cheats() {
+    let mut console = CheatConsole::new();
+    console.open();
+    assert!(console.paste_text("rosebud"));
+    console.close();
+    assert_eq!(console.submit(), Err(CheatParseError::Closed));
+    assert!(console.history().is_empty());
 }
 
 #[test]
@@ -266,4 +280,20 @@ fn console_layout_and_rendering_across_viewports_and_live_install() {
         non_black > 8_000,
         "expected rich 1.91 cheat console rendering, got {non_black} non-black pixels"
     );
+
+    // Verify `help` wrapped lines all fit inside feedback_line with shipped bitmap fonts.
+    let font9 = live_art.font(9).expect("9pt shipped font");
+    let help_msg = &console.feedback().expect("help feedback").message;
+    for size in [[320, 240], [800, 600], [1920, 1080]] {
+        let layout = console.layout_with_art(size, Some(&live_art));
+        let fb_rect = layout.feedback_line.expect("feedback rect");
+        let lines = font9.wrap(help_msg, fb_rect.width);
+        let needed_h = lines.len() as i32 * font9.line_height.max(1);
+        assert!(
+            fb_rect.height >= needed_h,
+            "help text ({} lines, {needed_h}px) did not fit in feedback_line ({}px) at {size:?}",
+            lines.len(),
+            fb_rect.height
+        );
+    }
 }
