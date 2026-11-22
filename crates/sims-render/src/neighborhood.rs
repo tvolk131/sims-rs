@@ -968,6 +968,39 @@ impl NeighborhoodMap {
         ]
     }
 
+    /// Resolves the active water wave surface for `frame_idx`, matching each
+    /// neighborhood's native wave playback logic:
+    /// - **Downtown (`0x54caf5`) & Vacation (`0x56baa5`)**: 10-step ping-pong
+    ///   over slots `0..=4` (`0,1,2,3,4,4,3,2,1,0`); slot `5` is never selected.
+    /// - **Unleashed (`0x557066`, `0x557e87`)**: cycles through slots `0..len`
+    ///   and skips widget updates when a slot is missing, keeping the most
+    ///   recently loaded wave visible.
+    /// - **Classic (`0x55f91a..0x55f92f`) & Magic Town (`0x554ff6`)**: direct
+    ///   modulo indexing over `self.waves`, drawing nothing if the slot is empty.
+    fn wave_for_frame(&self, frame_idx: usize) -> Option<&Surface565> {
+        let len = self.waves.len();
+        if len == 0 {
+            return None;
+        }
+        match self.kind {
+            NeighborhoodKind::Downtown | NeighborhoodKind::Vacation => {
+                let step = frame_idx % 10;
+                let slot = if step < 5 { step } else { 9 - step };
+                self.waves.get(slot).and_then(Option::as_ref)
+            }
+            NeighborhoodKind::Unleashed => {
+                let start = frame_idx.saturating_sub(len - 1);
+                for step in (start..=frame_idx).rev() {
+                    if let Some(wave) = &self.waves[step % len] {
+                        return Some(wave);
+                    }
+                }
+                None
+            }
+            _ => self.waves[frame_idx % len].as_ref(),
+        }
+    }
+
     /// Renders the neighborhood map screen into an existing [`Canvas`].
     ///
     /// Sets `canvas.set_id(Some(lot.id))` for each lot's opaque pixels so
@@ -996,13 +1029,14 @@ impl NeighborhoodMap {
         blit_surface_to_canvas(canvas, &self.backdrop, origin, backdrop_clip, false, None);
 
         // 3. Pre-lot water wave overlay:
-        //    - Classic (0x55f95f..0x55f98a -> DirectDraw Blt 0x605091) stretches
-        //      the full wave into the centered backdrop rectangle.
-        //    - Unleashed (0x5570c1) blits 1:1 at origin with a null clip.
+        //    - Classic (0x55f95f..0x55f98a -> cRZGraphic::Blt 0x5def36 ->
+        //      DirectDraw Blt 0x605091) crops dst & src 1:1 against the canvas
+        //      and stretches the remaining source rect into the clipped backdrop rect.
+        //    - Unleashed (0x5570c1, 0x557e87) blits 1:1 at origin with a null clip,
+        //      retaining the last valid frame if a custom slot is absent.
         if !self.kind.waves_draw_after_lots()
             && let Some(frame_idx) = options.water_frame
-            && !self.waves.is_empty()
-            && let Some(wave) = &self.waves[frame_idx % self.waves.len()]
+            && let Some(wave) = self.wave_for_frame(frame_idx)
         {
             if self.kind == NeighborhoodKind::Classic {
                 blit_surface_stretched_to_canvas(
@@ -1053,13 +1087,12 @@ impl NeighborhoodMap {
             blit_color_only_mode(canvas, trees, origin, full_clip, overlay_keyed);
         }
 
-        // 6. Post-lot water wave overlay for Downtown (0x54cb21, null clip at
-        //    0x54cb3e), Vacation (0x56bb7a..0x56bb92, null clip, skipping
-        //    missing slots), and Magic Town (0x554ff6 at (0, 62)).
+        // 6. Post-lot water wave overlay for Downtown (0x54caf5..0x54cb3e,
+        //    ping-pong over slots 0..=4, null clip), Vacation (0x56baa5..0x56bb92,
+        //    ping-pong over slots 0..=4, null clip), and Magic Town (0x554ff6 at (0, 62)).
         if self.kind.waves_draw_after_lots()
             && let Some(frame_idx) = options.water_frame
-            && !self.waves.is_empty()
-            && let Some(wave) = &self.waves[frame_idx % self.waves.len()]
+            && let Some(wave) = self.wave_for_frame(frame_idx)
         {
             let [wx, wy] = self.kind.wave_offset();
             let at = [origin[0].saturating_add(wx), origin[1].saturating_add(wy)];
@@ -3304,38 +3337,20 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
                     }
                 }
                 4 => {
+                    // Shipped `gimex.dll` (`0x600185b5..0x600185dc`) calls
+                    // `ijl10.dll` (`ijlInit` sets `JPGColor = IJL_YCBCR (3)`,
+                    // `DIBColor = IJL_BGR (2)`, `DIBChannels = 3`) with
+                    // `cconversion_reqd = 1` without overriding `JPGColor`, so
+                    // 4-component CMYK and YCCK JPEGs are converted from the
+                    // first three channels as YCbCr -> RGB and channel 4 is dropped.
                     let c0 = sample(0);
-                    let c1 = sample(1);
-                    let c2 = sample(2);
-                    let c3 = sample(3);
-                    if adobe_transform == Some(2) {
-                        // Adobe YCCK: (Y, Cb, Cr) encodes inverted CMY, c3 is inverted K.
-                        let cb = c1 - 128;
-                        let cr = c2 - 128;
-                        let r0 = (c0 + ((91_881 * cr + 32_768) >> 16)).clamp(0, 255);
-                        let g0 = (c0 + ((-22_554 * cb - 46_802 * cr + 32_768) >> 16)).clamp(0, 255);
-                        let b0 = (c0 + ((116_130 * cb + 32_768) >> 16)).clamp(0, 255);
-                        [
-                            ((r0 * c3 + 127) / 255) as u8,
-                            ((g0 * c3 + 127) / 255) as u8,
-                            ((b0 * c3 + 127) / 255) as u8,
-                        ]
-                    } else if adobe_transform == Some(0) {
-                        // Adobe CMYK: inverted (255-C, 255-M, 255-Y, 255-K).
-                        [
-                            ((c0 * c3 + 127) / 255) as u8,
-                            ((c1 * c3 + 127) / 255) as u8,
-                            ((c2 * c3 + 127) / 255) as u8,
-                        ]
-                    } else {
-                        // Non-Adobe CMYK: standard (C, M, Y, K) ink channels.
-                        let k_inv = 255 - c3;
-                        [
-                            (((255 - c0) * k_inv + 127) / 255) as u8,
-                            (((255 - c1) * k_inv + 127) / 255) as u8,
-                            (((255 - c2) * k_inv + 127) / 255) as u8,
-                        ]
-                    }
+                    let cb = sample(1) - 128;
+                    let cr = sample(2) - 128;
+                    let r = (c0 + ((91_881 * cr + 32_768) >> 16)).clamp(0, 255) as u8;
+                    let g =
+                        (c0 + ((-22_554 * cb - 46_802 * cr + 32_768) >> 16)).clamp(0, 255) as u8;
+                    let b = (c0 + ((116_130 * cb + 32_768) >> 16)).clamp(0, 255) as u8;
+                    [r, g, b]
                 }
                 _ => return None,
             };
@@ -3585,10 +3600,6 @@ fn blit_surface_stretched_to_canvas(
     if !surface.is_valid() || surface.width == 0 || surface.height == 0 || dw == 0 || dh == 0 {
         return;
     }
-    if surface.width == dw && surface.height == dh {
-        blit_surface_to_canvas(canvas, surface, dst_rect, clip, keyed, None);
-        return;
-    }
     let cw = canvas.width as i64;
     let ch = canvas.height as i64;
     let clip_x0 = i64::from(clip[0]).clamp(0, cw);
@@ -3596,18 +3607,64 @@ fn blit_surface_stretched_to_canvas(
     let clip_x1 = i64::from(clip[2]).clamp(clip_x0, cw);
     let clip_y1 = i64::from(clip[3]).clamp(clip_y0, ch);
 
-    let ax = i64::from(dst_rect[0]);
-    let ay = i64::from(dst_rect[1]);
-    let x0 = ax.clamp(clip_x0, clip_x1);
-    let y0 = ay.clamp(clip_y0, clip_y1);
-    let x1 = ax.saturating_add(dw as i64).clamp(x0, clip_x1);
-    let y1 = ay.saturating_add(dh as i64).clamp(y0, clip_y1);
+    // Match `cRZGraphic::Blt` (`0x5def36..0x5df028`): subtract any destination
+    // overhang outside the target surface and clip rect 1:1 from `src` before
+    // calling `IDirectDrawSurface::Blt` (`0x605091`) to stretch the remaining
+    // source sub-rectangle into the clipped destination rectangle.
+    let mut sx0 = 0i64;
+    let mut sy0 = 0i64;
+    let mut sx1 = surface.width as i64;
+    let mut sy1 = surface.height as i64;
+    let mut dx0 = i64::from(dst_rect[0]);
+    let mut dy0 = i64::from(dst_rect[1]);
+    let mut dx1 = dx0.saturating_add(dw as i64);
+    let mut dy1 = dy0.saturating_add(dh as i64);
 
-    for py in y0..y1 {
-        let sy = (((py - ay) as usize) * surface.height / dh).min(surface.height - 1);
+    if dx1 > clip_x1 {
+        let over = dx1 - clip_x1;
+        sx1 -= over;
+        dx1 -= over;
+    }
+    if dx0 < clip_x0 {
+        let over = clip_x0 - dx0;
+        sx0 += over;
+        dx0 += over;
+    }
+    if dy1 > clip_y1 {
+        let over = dy1 - clip_y1;
+        sy1 -= over;
+        dy1 -= over;
+    }
+    if dy0 < clip_y0 {
+        let over = clip_y0 - dy0;
+        sy0 += over;
+        dy0 += over;
+    }
+
+    if dx0 >= dx1
+        || dy0 >= dy1
+        || sx0 >= sx1
+        || sy0 >= sy1
+        || sx0 < 0
+        || sy0 < 0
+        || sx1 > surface.width as i64
+        || sy1 > surface.height as i64
+    {
+        return;
+    }
+
+    let sw = (sx1 - sx0) as usize;
+    let sh = (sy1 - sy0) as usize;
+    let out_w = (dx1 - dx0) as usize;
+    let out_h = (dy1 - dy0) as usize;
+    let src_x0 = sx0 as usize;
+    let src_y0 = sy0 as usize;
+
+    for py in dy0..dy1 {
+        let sy = src_y0 + (((py - dy0) as usize) * sh / out_h).min(sh - 1);
         let row = &surface.pixels[sy * surface.width..(sy + 1) * surface.width];
-        for px in x0..x1 {
-            let sx = (((px - ax) as usize) * surface.width / dw).min(surface.width - 1);
+        for px in dx0..dx1 {
+            let sx = src_x0 + (((px - dx0) as usize) * sw / out_w).min(sw - 1);
             let pixel = row[sx];
             if keyed && pixel == COLOR_KEY_565 {
                 continue;
@@ -4535,13 +4592,50 @@ mod tests {
         assert_eq!(classic_1024.color[200 * 1024 + 300], widen_565(left_c));
         assert_eq!(classic_1024.color[200 * 1024 + 700], widen_565(right_c));
 
+        // When Classic's backdrop exceeds the viewport (900px backdrop, 800px
+        // wave, 800px viewport), `cRZGraphic::Blt` (`0x5def65..0x5def81`)
+        // subtracts the 100px right overhang from `src.right`, cropping the
+        // wave to columns `0..700` before stretching to `0..800`.
+        let mut classic_wide = make_test_map(NeighborhoodKind::Classic, Vec::new());
+        let green_c = pack_565([20, 220, 20]);
+        let red_c = pack_565([240, 20, 20]);
+        classic_wide.backdrop = Surface565::filled(900, 600, bg_c);
+        let mut striped_wave = Surface565::filled(800, 600, green_c);
+        for y in 0..600 {
+            for x in 700..800 {
+                striped_wave.pixels[y * 800 + x] = red_c;
+            }
+        }
+        classic_wide.waves = vec![Some(striped_wave)];
+        classic_wide.opaque_overlays = true;
+        let classic_800 = classic_wide.render(&RenderOptions {
+            viewport: [800, 600],
+            water_frame: Some(0),
+            ..RenderOptions::default()
+        });
+        assert!(
+            classic_800.color.iter().all(|&c| c == widen_565(green_c)),
+            "rightmost 100 wave columns must be cropped out by 0x5def65"
+        );
+
         // Downtown and Vacation overlays pass a null clip and use their own
         // dimensions (0x54cb3e, 0x56baf4, 0x56bb29, 0x56bb92), so an 800×600
         // wave over a 600×400 backdrop at origin (212, 184) draws at (850, 200).
+        // Their playback cycles `0,1,2,3,4,4,3,2,1,0` (`0x54caf5`, `0x56baa5`),
+        // so `water_frame: Some(5)` draws slot 4 and never slot 5.
         let mut dt_small = make_test_map(NeighborhoodKind::Downtown, Vec::new());
+        let slot4_c = pack_565([10, 180, 240]);
+        let slot5_c = pack_565([240, 10, 10]);
         dt_small.backdrop = Surface565::filled(600, 400, bg_c);
         dt_small.large_frame = Some(Surface565::filled(1024, 768, frame_c));
-        dt_small.waves = vec![Some(Surface565::filled(800, 600, wave2_c))];
+        dt_small.waves = vec![
+            Some(Surface565::filled(800, 600, wave2_c)),
+            None,
+            None,
+            None,
+            Some(Surface565::filled(800, 600, slot4_c)),
+            Some(Surface565::filled(800, 600, slot5_c)),
+        ];
         dt_small.opaque_overlays = true;
         let dt_1024 = dt_small.render(&RenderOptions {
             viewport: [1024, 768],
@@ -4549,9 +4643,49 @@ mod tests {
             ..RenderOptions::default()
         });
         assert_eq!(dt_1024.color[200 * 1024 + 850], widen_565(wave2_c));
+        let dt_step5 = dt_small.render(&RenderOptions {
+            viewport: [1024, 768],
+            water_frame: Some(5),
+            ..RenderOptions::default()
+        });
+        assert_eq!(dt_step5.color[200 * 1024 + 850], widen_565(slot4_c));
+        let mut vac_cycle = make_test_map(NeighborhoodKind::Vacation, Vec::new());
+        vac_cycle.waves = vec![
+            Some(Surface565::filled(10, 10, wave2_c)),
+            None,
+            None,
+            None,
+            Some(Surface565::filled(10, 10, slot4_c)),
+            Some(Surface565::filled(10, 10, slot5_c)),
+        ];
+        vac_cycle.opaque_overlays = true;
+        let vac_step5 = vac_cycle.render(&RenderOptions {
+            water_frame: Some(5),
+            ..RenderOptions::default()
+        });
+        assert_eq!(vac_step5.color[0], widen_565(slot4_c));
 
-        // 4-component CMYK baseline JPEG decodes cleanly instead of falling back.
-        // 1×1 Adobe CMYK (transform=0, inverted C=255, M=0, Y=0, K=255 => red).
+        // Unleashed skips widget updates when a custom wave slot is absent
+        // (`0x557e87..0x557e90`), keeping the previous wave visible on slot 1.
+        let mut ul_sparse = make_test_map(NeighborhoodKind::Unleashed, Vec::new());
+        ul_sparse.waves = vec![
+            Some(Surface565::filled(10, 10, wave2_c)),
+            None,
+            Some(Surface565::filled(10, 10, slot4_c)),
+            None,
+            None,
+            None,
+        ];
+        ul_sparse.opaque_overlays = true;
+        let ul_step1 = ul_sparse.render(&RenderOptions {
+            water_frame: Some(1),
+            ..RenderOptions::default()
+        });
+        assert_eq!(ul_step1.color[0], widen_565(wave2_c));
+
+        // 4-component CMYK baseline JPEG decodes through the same YCbCr->RGB
+        // path as shipped `gimex.dll` + `ijl10.dll` (`JPGColor = IJL_YCBCR`,
+        // channel 4 ignored): (255, 0, 0, 255) -> RGB565 `0x4fe3`.
         let cmyk_1x1_jpeg: &[u8] = &[
             0xff, 0xd8, // SOI
             0xff, 0xee, 0x00, 0x0e, b'A', b'd', b'o', b'b', b'e', 0x00, 0x64, 0x00, 0x00, 0x00,
@@ -4570,16 +4704,11 @@ mod tests {
             0xff, 0xda, 0x00, 0x0e, 0x04, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00,
             0x3f, 0x00,
             // 4 blocks: (+1016 => 255), (-1024 => 0), (-1024 => 0), (+1016 => 255)
-            // C: '0' + '1111111000' + '0' (12 bits: 0111_1111 1000_0...)
-            // M: '0' + '0000000000' + '0' (12 bits)
-            // Y: '0' + '0000000000' + '0' (12 bits)
-            // K: '0' + '1111111000' + '0' (12 bits)
-            // Total 48 bits = 6 bytes: 7f 80 00 00 07 f8 (with trailing bit 0 -> 07 f8)
             0x7f, 0x80, 0x00, 0x00, 0x07, 0xf8, 0xff, 0xd9,
         ];
         let cmyk_decoded = decode_jpeg_to_surface565(cmyk_1x1_jpeg).expect("decode 4-comp CMYK");
         assert_eq!((cmyk_decoded.width, cmyk_decoded.height), (1, 1));
-        assert_eq!(cmyk_decoded.pixels[0], pack_565([255, 0, 0]));
+        assert_eq!(cmyk_decoded.pixels[0], 0x4fe3);
 
         // Header-only JPEG with zero SOS image scans must be rejected so the
         // loader falls back to bundled artwork rather than drawing gray.
