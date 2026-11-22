@@ -1239,6 +1239,56 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
         ]),
     );
 
+    // 7. Loose file with 57-byte 1x1 8-bit BMP_ 2002 (1 palette entry at 54..57
+    // with unread 4th reserved byte omitted, pixel offset 54) -> true per
+    // `0x4dee73..0x4deea6` / `0x4deec1..0x4deef3`.
+    let pal57_guid = 0x9000_0007u32;
+    let mut pal57 = tiny_bmp()[..57].to_vec();
+    pal57[28..30].copy_from_slice(&8u16.to_le_bytes());
+    pal57[46..50].copy_from_slice(&1u32.to_le_bytes());
+    dir.file(
+        "GameData/Objects/pal57.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(pal57_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, pal57),
+        ]),
+    );
+
+    // 8. Loose file with 1x1 RLE8 BMP_ 2002 having an extra EOL (`00 00`) or
+    // delta past row width (`00 02 05 00`) right before EOF (`00 01`) -> true
+    // per `0x4def84` and `0x4def97..0x4defab`.
+    let rle_eol_guid = 0x9000_0008u32;
+    let mut rle_eol = vec![0u8; 54 + 4 + 6];
+    rle_eol[0..54].copy_from_slice(&tiny_bmp()[..54]);
+    rle_eol[10..14].copy_from_slice(&58u32.to_le_bytes());
+    rle_eol[28..30].copy_from_slice(&8u16.to_le_bytes());
+    rle_eol[30..34].copy_from_slice(&1u32.to_le_bytes()); // RLE8
+    rle_eol[46..50].copy_from_slice(&1u32.to_le_bytes()); // 1 palette color
+    rle_eol[58..64].copy_from_slice(&[0, 0, 0, 0, 0, 1]); // extra EOLs + EOF
+    dir.file(
+        "GameData/Objects/rle_eol.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_eol_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, rle_eol),
+        ]),
+    );
+
+    let rle_delta_guid = 0x9000_0009u32;
+    let mut rle_delta = vec![0u8; 54 + 4 + 6];
+    rle_delta[0..54].copy_from_slice(&tiny_bmp()[..54]);
+    rle_delta[10..14].copy_from_slice(&58u32.to_le_bytes());
+    rle_delta[28..30].copy_from_slice(&8u16.to_le_bytes());
+    rle_delta[30..34].copy_from_slice(&1u32.to_le_bytes()); // RLE8
+    rle_delta[46..50].copy_from_slice(&1u32.to_le_bytes()); // 1 palette color
+    rle_delta[58..64].copy_from_slice(&[0, 2, 5, 0, 0, 1]); // delta past width + EOF
+    dir.file(
+        "GameData/Objects/rle_delta.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_delta_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, rle_delta),
+        ]),
+    );
+
     let install = Install::detect(&dir.0).unwrap();
     let index = Index::build(&install).unwrap();
     let catalog = Catalog::build(&index).unwrap();
@@ -1252,6 +1302,9 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
             bmp32_guid,
             bmp57_guid,
             truncated_guid,
+            pal57_guid,
+            rle_eol_guid,
+            rle_delta_guid,
         ],
     )
     .unwrap();
@@ -1270,4 +1323,7 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
     assert!(!lib(bmp32_guid).read_only);
     assert!(lib(bmp57_guid).has_portrait_2002);
     assert!(!lib(truncated_guid).has_portrait_2002);
+    assert!(lib(pal57_guid).has_portrait_2002);
+    assert!(lib(rle_eol_guid).has_portrait_2002);
+    assert!(lib(rle_delta_guid).has_portrait_2002);
 }

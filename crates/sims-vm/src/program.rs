@@ -1450,10 +1450,13 @@ fn is_native_portrait_bmp(data: &[u8]) -> bool {
     } else {
         1u32.wrapping_shl(u32::from(planes.wrapping_mul(bpp)))
     };
-    if used <= 256 {
-        let Some(pal_end) = (used as usize)
+    // 0x4dee73..0x4deea6 / 0x4deec1..0x4deef3 read only the 3 BGR bytes of
+    // each palette entry (advancing by 4 between entries), so the final
+    // entry's 4th reserved byte is never read (`54 + (used - 1) * 4 + 3`).
+    if (1..=256).contains(&used) {
+        let Some(pal_end) = (used as usize - 1)
             .checked_mul(4)
-            .and_then(|n| 54usize.checked_add(n))
+            .and_then(|n| 57usize.checked_add(n))
         else {
             return false;
         };
@@ -1477,12 +1480,13 @@ fn is_native_portrait_bmp(data: &[u8]) -> bool {
                 x += count;
             } else {
                 match val {
+                    // 0x4def84 (EOL) and 0x4def97..0x4defab (delta) only adjust
+                    // the cursor without writing pixels, so an extra EOL or a
+                    // delta past row width before `00 01` (EOF) succeeds at
+                    // 0x4df122 as long as no subsequent run writes out of bounds.
                     0 => {
-                        if y >= h {
-                            return false;
-                        }
                         x = 0;
-                        y += 1;
+                        y = y.saturating_add(1);
                     }
                     1 => return true,
                     2 => {
@@ -1492,9 +1496,6 @@ fn is_native_portrait_bmp(data: &[u8]) -> bool {
                         x = x.saturating_add(usize::from(body[pos]));
                         y = y.saturating_add(usize::from(body[pos + 1]));
                         pos += 2;
-                        if y >= h || x > w {
-                            return false;
-                        }
                     }
                     n => {
                         let n = usize::from(n);

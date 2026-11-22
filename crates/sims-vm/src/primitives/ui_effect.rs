@@ -571,12 +571,14 @@ impl Machine<'_, '_> {
         let mut copy = self.world.clone();
         let cells = crate::both_ways::Cells::of(&interpreter);
         let built = cells.on(&interpreter);
-        if self.definition_words(guid)?[TYPE] != PERSON_TYPE {
-            // 0x4e8b3d registered an earlier person definition under `guid`,
-            // while 0x43ac10 now resolves `guid` to a non-person definition.
-            // 0x4e9692 creates the non-person (running Init), dynamic_cast to
-            // cXPerson fails at 0x4e96b7, and 0x4e96c3 returns null without
-            // removing the created object.
+        let words = self.definition_words(guid)?;
+        if words[TYPE] != PERSON_TYPE || words[crate::factory::word::GROUP] != 0 {
+            // 0x440b6f checks OBJD group (`+0x14`) BEFORE person type (`+0x12`),
+            // and 0x4e8b3d may have registered an earlier person definition under
+            // `guid` while 0x43ac10 now resolves `guid` to a non-person or
+            // grouped definition. 0x4e9692 constructs the object/group via
+            // 0x440b2d (running Init), dynamic_cast to cXPerson fails at
+            // 0x4e96b7, and 0x4e96c3 returns null without removing it.
             let _ = built.try_create(&mut copy, guid).map_err(unsupported)?;
             if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
                 return Err(Trap::Unsupported(format!(

@@ -468,11 +468,6 @@ impl Machine<'_, '_> {
         if !self.is_portrait_file_writable(guid) {
             return Ok(());
         }
-        // 0x440d63 -> 0x440dd5 -> 0x4e969d: a pet disallowed by the installed
-        // expansions mask is refused before any construction.
-        if self.interpreter().is_refused_pet(self.world, guid) {
-            return Ok(());
-        }
         let interpreter = self.interpreter();
         let unsupported = |fault| {
             Trap::Unsupported(format!(
@@ -488,6 +483,27 @@ impl Machine<'_, '_> {
         let mut copy = self.world.clone();
         let cells = crate::both_ways::Cells::of(&interpreter);
         let built = cells.on(&interpreter);
+        let words = self.definition_words(guid)?;
+        if words[crate::factory::word::TYPE] != 2 || words[crate::factory::word::GROUP] != 0 {
+            // 0x440b6f checks OBJD group (`+0x14`) BEFORE person type (`+0x12`)
+            // and before the pet expansion check (`0x440d63`): a grouped or
+            // non-person definition runs the group/object factory, fails the
+            // cXPerson cast at 0x4e96b7, and stays registered at 0x4e96c3.
+            let _ = built.try_create(&mut copy, guid).map_err(unsupported)?;
+            if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
+                return Err(Trap::Unsupported(format!(
+                    "making an object of type 0x{guid:08X} for a dialog's portrait (0x4e9652) \
+                     changed the refresh pending, which is not ported"
+                )));
+            }
+            cells.keep(&interpreter, self.world, copy);
+            return Ok(());
+        }
+        // 0x440d63 -> 0x440dd5 -> 0x4e969d: a pet disallowed by the installed
+        // expansions mask is refused before any construction.
+        if self.interpreter().is_refused_pet(self.world, guid) {
+            return Ok(());
+        }
         let Some(id) = built
             .try_create_person(&mut copy, guid)
             .map_err(unsupported)?

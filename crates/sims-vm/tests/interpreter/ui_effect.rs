@@ -7314,3 +7314,265 @@ fn round_26_dirty_reset_invalidation_mixed_starts() {
         assert!(!fx.world.dirty_portraits.contains(&WIDGET));
     }
 }
+
+#[test]
+fn round_27_held_object_callback_and_grouped_type2() {
+    // 1. P2 #1 (`placement.rs:1417`): when a temporary Sim's Init places a held
+    // object into one of its slots (`0x433517 -> 0x433612 -> 0x4337d8`) whose
+    // `PLACED` callback depends on the tile/room, omitting `view_centre` must
+    // NOT take the O(1) `FastPlaced` shortcut — it must detect the tile
+    // dependence and fail loudly instead of silently skipping the held object's
+    // callback.
+    for use_dialog in [false, true] {
+        let (mut fx, file, record) = visitors();
+        fx.world.globals[19] = 0; // Live mode so Grab succeeds.
+        // Place LAMP at (2, 2) facing east (+X -> tile (3, 2)) as a SEAT
+        // (function 26) so placing WIDGET on (3, 2) sets bit 0x100 on any
+        // held prop and dispatches `PLACED` at `0x4337d8`, whereas placing
+        // WIDGET on (3, 3) does not.
+        fx.lamp_mut().position = [(2 << 4) | 8, (2 << 4) | 8, 1];
+        fx.lamp_mut().data[1] = 2; // facing +X (east)
+        fx.world.arrays.get_mut(&3).unwrap().data[(2 * 64 + 2) * 2..(2 * 64 + 2) * 2 + 2]
+            .copy_from_slice(&(LAMP as i16).to_le_bytes());
+        let lamp_lib = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+        for table in lamp_lib.callbacks.values_mut() {
+            table.resize(
+                27,
+                sims_formats::execution::ObjectFunction {
+                    condition: 0,
+                    action: 0,
+                },
+            );
+            table[26].action = 4096; // SEAT
+        }
+        // Define a carryable prop (`data[4] = 0x21`) with `SEAT_CHANGED` (25)
+        // and `PLACED` (5) incrementing `Global[36] += 1`.
+        const PROP_GUID: u32 = 0x5500_0027;
+        let prop_file = fx.add_type(PROP_GUID, 4, 4096, 4097);
+        fx.add(
+            prop_file,
+            4096,
+            tree(vec![assign(
+                scope::MY_DATA,
+                4,
+                scope::LITERAL,
+                0x21,
+                RETURN_TRUE,
+            )]),
+        );
+        fx.add(
+            prop_file,
+            4097,
+            tree(vec![
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                ins(0, 0, 0, [0; 8]),
+            ]),
+        );
+        let mut inc_g36 = [0u8; 8];
+        inc_g36[0..2].copy_from_slice(&36i16.to_le_bytes());
+        inc_g36[2..4].copy_from_slice(&1i16.to_le_bytes());
+        inc_g36[5] = 3; // +=
+        inc_g36[6] = scope::GLOBAL;
+        inc_g36[7] = scope::LITERAL;
+        fx.add(
+            prop_file,
+            4200,
+            tree(vec![ins(2, RETURN_TRUE, RETURN_FALSE, inc_g36)]),
+        );
+        let prop_lib = fx.program.libraries.get_mut(&prop_file).unwrap();
+        for table in prop_lib.callbacks.values_mut() {
+            table.resize(
+                27,
+                sims_formats::execution::ObjectFunction {
+                    condition: 0,
+                    action: 0,
+                },
+            );
+            table[9].action = 4200; // PLACED
+            table[25].action = 4200; // SEAT_CHANGED
+        }
+        // Provide a carry clip (STR# 150 index 0x26) so holding PROP_GUID in
+        // hand slot 0 succeeds during `put_person` without hitting 0x59db2f.
+        let mut names = vec![String::new(); 0x27];
+        names[0x26] = "test-carry".into();
+        fx.program
+            .libraries
+            .get_mut(&file)
+            .unwrap()
+            .strings
+            .insert(150, names);
+        fx.program.animations.insert(
+            "test.far",
+            sims_content::Clip {
+                name: "test-carry".into(),
+                skill: "test-carry-skill".into(),
+                duration: 100.0f32.to_bits(),
+                distance: 0,
+                moving: false,
+                frames: 4,
+                motions: 1,
+                tracks: Vec::new(),
+                channels: Vec::new(),
+                samples: [0, 0],
+            },
+        );
+        fx.program.animations.insert_samples("test-carry-skill");
+        // WIDGET's Init sets its normal placement flags (data[4] = 1, data[42] = 2),
+        // places itself on tile (1, 1) via `Find Location For` (opcode 16, mode 0),
+        // and creates PROP_GUID into hand slot 0 (`Create New Object Instance`,
+        // opcode 42, mode 1) so `put_person` walks PROP_GUID at `0x433517 ->
+        // 0x433612 -> 0x4337d8`.
+        let mut create_in_slot = [0u8; 8];
+        create_in_slot[0..4].copy_from_slice(&PROP_GUID.to_le_bytes());
+        create_in_slot[4] = 1; // in my container slot 0
+        // Skip re-creating PROP_GUID if construction runs Init a second time
+        // while slot 0 already holds it.
+        let mut slot0_empty = [0u8; 8];
+        slot0_empty[0..2].copy_from_slice(&0i16.to_le_bytes());
+        slot0_empty[2..4].copy_from_slice(&0i16.to_le_bytes());
+        slot0_empty[5] = 2; // ==
+        slot0_empty[6] = 20; // My Slot
+        slot0_empty[7] = scope::LITERAL;
+        fx.add(
+            file,
+            4096,
+            tree(vec![
+                ins(2, 1, RETURN_TRUE, slot0_empty),
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 2),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, 3),
+                assign(scope::STACK_OBJECT, 0, scope::MY_DATA, 11, 4),
+                ins(16, 5, RETURN_FALSE, [0; 8]),
+                ins(42, RETURN_TRUE, RETURN_FALSE, create_in_slot),
+            ]),
+        );
+        let ran = if use_dialog {
+            fx.add(
+                LAMP_FILE,
+                4096,
+                tree(vec![ins(
+                    36,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+                )]),
+            );
+            fx.run_with(LAMP, 4096, record, &[], 1000)
+        } else {
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1)
+        };
+        let err = ran.unwrap_err().to_string();
+        assert!(
+            err.contains("0x4e96dd") || err.contains("view_centre"),
+            "held object PLACED callback depending on room must fail loudly without view_centre (dialog={use_dialog}): {err}"
+        );
+    }
+
+    // 2. P2 #2 (`ui_effect.rs:574`, `dialog.rs:492`): a grouped definition
+    // (`OBJD[GROUP] != 0`) with `OBJD[TYPE] == 2` enters the group factory at
+    // `0x440b6f`, creates the non-person group, fails the `cXPerson` cast at
+    // `0x4e96b7`, and leaves the group registered at `0x4e96c3` without
+    // trapping (in both UI Effect and Dialog).
+    for use_dialog in [false, true] {
+        let (mut fx, _, _) = visitors();
+        const MASTER_GUID: u32 = 0x5500_0028;
+        const LEAD_GUID: u32 = 0x5500_0029;
+        let group_file = fx.add_type(MASTER_GUID, 2, 4096, 4097);
+        // Mark MASTER_GUID as a group master (GROUP = 1, SUB_INDEX = -1).
+        let master_words = fx.words(group_file);
+        master_words[10] = 1; // GROUP
+        master_words[11] = -1; // SUB_INDEX (master)
+        let master_idx = fx.catalog.by_guid[&MASTER_GUID];
+        fx.catalog.objects[master_idx].master = 1;
+        // Add lead tile in the same resource file (GROUP = 1, SUB_INDEX = 0, LEAD = 1).
+        let lead_chunk = 129u16;
+        let mut lead_words = [0i16; 108];
+        lead_words[0] = 138;
+        lead_words[9] = 4; // normal object tile
+        lead_words[10] = 1; // GROUP = 1
+        lead_words[11] = 0; // SUB_INDEX = (0, 0)
+        lead_words[14] = LEAD_GUID as i16;
+        lead_words[15] = (LEAD_GUID >> 16) as i16;
+        lead_words[0x7e / 2] = 1; // LEAD = 1
+        let lead_idx = fx.catalog.objects.len();
+        fx.catalog.objects.push(CatalogObject {
+            guid: LEAD_GUID,
+            resource: group_file,
+            chunk: lead_chunk,
+            kind: 4,
+            master: 1,
+        });
+        fx.catalog.by_guid.insert(LEAD_GUID, lead_idx);
+        let lib = fx.program.libraries.get_mut(&group_file).unwrap();
+        lib.definition_order.push(lead_chunk);
+        lib.definitions.insert(lead_chunk, lead_words);
+        lib.callbacks.insert(
+            lead_chunk,
+            vec![
+                sims_formats::execution::ObjectFunction {
+                    condition: 0,
+                    action: 4096,
+                },
+                sims_formats::execution::ObjectFunction {
+                    condition: 0,
+                    action: 4097,
+                },
+            ],
+        );
+        // Lead Init sets Global[36] = 88 to prove group factory ran.
+        fx.add(
+            group_file,
+            4096,
+            tree(vec![assign(
+                scope::GLOBAL,
+                36,
+                scope::LITERAL,
+                88,
+                RETURN_TRUE,
+            )]),
+        );
+        fx.add(
+            group_file,
+            4097,
+            tree(vec![
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                ins(0, 0, 0, [0; 8]),
+            ]),
+        );
+        let rec_id = fx.world.neighbors.slots.len() as i16 + 1;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: MASTER_GUID,
+            id: rec_id,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let ran = if use_dialog {
+            fx.add(
+                LAMP_FILE,
+                4096,
+                tree(vec![ins(
+                    36,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+                )]),
+            );
+            fx.run_with(LAMP, 4096, rec_id, &[], 1000)
+        } else {
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, rec_id, 1)
+        };
+        assert_eq!(
+            ran,
+            Ok(true),
+            "grouped type-2 definition must construct via group factory and return cleanly (dialog={use_dialog})"
+        );
+        assert_eq!(fx.world.globals[36], 88);
+        assert!(
+            fx.world.objects.values().any(|o| o.guid == LEAD_GUID),
+            "created group lead must stay registered after failed cXPerson cast (dialog={use_dialog})"
+        );
+        assert!(!fx.world.portraits.contains(&MASTER_GUID));
+    }
+}
