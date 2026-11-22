@@ -100,7 +100,7 @@ impl Machine<'_, '_> {
                 // 0x45aab9 to 0x45ab66.
                 let own = self.me()?.position;
                 let at = [own[1], own[0]];
-                let to = camera_point([own[0], own[1]], self.view_rotation);
+                let to = camera_point([own[0], own[1]], self.effective_view_rotation());
                 self.world.routing.routes.entry(me).or_default().path = vec![at, at, to];
                 self.set_datum(CLEARED, 0)?;
                 interpreter.start_route(self.world, me)?;

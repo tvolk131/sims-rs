@@ -190,6 +190,9 @@ pub struct Interpreter<'a> {
     /// unoccupied lots). `None` keeps the bare interpreter's fail-loudly guard
     /// when global 9 is 0.
     pub active_family: Option<&'a [u32]>,
+    /// Optional co-op multiplayer VM context (`docs/vision.md`, "Multiplayer
+    /// (v1)"). `None` in single-player, preserving 100% identical behavior.
+    pub coop: Option<&'a RefCell<crate::coop::CoopVmContext>>,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -228,6 +231,19 @@ impl<'a> Interpreter<'a> {
             character_names: None,
             default_character_name: None,
             active_family: None,
+            coop: None,
+        }
+    }
+
+    /// Resolves the camera rotation (`0..=3`) for `object` (a Sim or lot
+    /// object). In single-player (`self.coop.is_none()`), returns
+    /// [`Self::view_rotation`] unchanged. In co-op mode, uses the rotation of
+    /// the player who has `object` selected (or owns its activity), falling
+    /// back to the host's rotation.
+    pub(crate) fn view_rotation_for_object(&self, world: &World, object: u16) -> u8 {
+        match self.coop {
+            Some(coop) => coop.borrow().resolve_camera_rotation(world, object, None),
+            None => self.view_rotation,
         }
     }
 
@@ -379,6 +395,7 @@ impl<'a> Interpreter<'a> {
             character_names: self.character_names,
             default_character_name: self.default_character_name,
             active_family: self.active_family,
+            coop: self.coop,
         }
     }
 }
@@ -498,6 +515,8 @@ pub(crate) struct Machine<'a, 'w> {
     pub(crate) default_character_name: Option<&'a str>,
     /// See [`Interpreter::active_family`].
     pub(crate) active_family: Option<&'a [u32]>,
+    /// See [`Interpreter::coop`].
+    pub(crate) coop: Option<&'a RefCell<crate::coop::CoopVmContext>>,
 }
 
 impl<'a> Machine<'a, '_> {
@@ -528,6 +547,20 @@ impl<'a> Machine<'a, '_> {
             character_names: self.character_names,
             default_character_name: self.default_character_name,
             active_family: self.active_family,
+            coop: self.coop,
+        }
+    }
+
+    /// Resolves the camera rotation (`0..=3`) for the currently executing
+    /// script. Returns [`Self::view_rotation`] unchanged in single-player.
+    pub(crate) fn effective_view_rotation(&self) -> u8 {
+        match self.coop {
+            Some(coop) => {
+                let stack_object = self.frame().ok().map(|f| f.stack_object);
+                coop.borrow()
+                    .resolve_camera_rotation(self.world, self.me, stack_object)
+            }
+            None => self.view_rotation,
         }
     }
 

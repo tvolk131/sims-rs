@@ -221,7 +221,7 @@ impl Machine<'_, '_> {
             .and_then(|id| self.world.objects.get(&id))
             .ok_or_else(|| Trap::native(0xa, "Generic Sims Call 12 has no stack object"))?;
         let [x, y, _] = World::tile(object.position);
-        let [x, y] = turn_tile([x, y], self.view_rotation)?;
+        let [x, y] = turn_tile([x, y], self.effective_view_rotation())?;
         Ok((i16::from(x) + i16::from(y)).wrapping_neg())
     }
 }
