@@ -1,0 +1,23 @@
+[package]
+name = "sims-net"
+description = "Deterministic co-op lockstep protocol, session state, snapshot resync framing, and iroh P2P transport."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+flate2.workspace = true
+iroh.workspace = true
+postcard.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

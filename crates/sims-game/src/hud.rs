@@ -14,11 +14,12 @@ use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
 use sims_ui::balloon::Texts;
+use sims_ui::build::{self, BuildCatalog, BuildLayout, BuildState, BuildSwatches, BuildWidgetKind};
 use sims_ui::buy::{
     self, BuyCatalog, BuyLayout, BuyState, BuyWidgetKind, RatingLabels, SellInfo, SellLabels,
 };
 use sims_ui::command::{
-    Command, Mode, OptionsAction, Panel as UiPanel, VolumeChannel, Walls as UiWalls,
+    BuildItemId, Command, Mode, OptionsAction, Panel as UiPanel, VolumeChannel, Walls as UiWalls,
 };
 use sims_ui::dialog::{self, DialogState, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
@@ -52,6 +53,10 @@ pub const WHOOSH: &str = "UI_whoosh";
 pub const MONEYBACK: &str = "UI_moneyback";
 /// Disposing of a zero-value object (`0x487e18` → `0x492b05`).
 pub const ARCHTOOL_DELETE: &str = "UI_archtool_delete";
+/// Build Mode drag tool press (`0x48b000`, `0x488800`, `0x48a100`).
+pub const BLD_DRAG_DOWN: &str = "UI_bld_dragtool_mousedown";
+/// Build Mode drag tool commit (`0x48b550`, `0x488a80`, `0x48a480`).
+pub const BLD_DRAG_UP: &str = "UI_bld_dragtool_mouseup";
 
 /// Keyboard keys handled by native modal dialogs (`cTSWinGenDlg::OnKeyDown` /
 /// `OnChar` at `0x5e5b3b..0x5e5bfd`, `0x6d7530`, plus Tab on multi-field cards).
@@ -186,6 +191,16 @@ pub struct Hud {
     pub buy_state: BuyState,
     /// The Buy Mode strip widgets and popup card as last laid out.
     buy_layout: BuyLayout,
+    /// Install handle retained for lazy Build Mode catalog loading.
+    install: Install,
+    /// The Build Mode catalog, loaded lazily on first Build Mode entry.
+    build_catalog: Option<BuildCatalog>,
+    /// Cached 45×45 surface swatch thumbnails for walls, floors, and wallpapers.
+    build_swatches: BuildSwatches,
+    /// The Build Mode panel state (active tool, page, selected item).
+    pub build_state: BuildState,
+    /// The Build Mode strip widgets and popup card as last laid out.
+    build_layout: BuildLayout,
     /// The interface's sounds, until the game takes them.
     sounds: Vec<SoundEvent>,
 }
@@ -224,6 +239,9 @@ impl Hud {
             art.load_optional(&ui, US_ENGLISH, id);
         }
         for id in buy::resource_ids() {
+            art.load_optional(&ui, US_ENGLISH, id);
+        }
+        for id in build::resource_ids() {
             art.load_optional(&ui, US_ENGLISH, id);
         }
         let labels = Labels::load(&install).map_err(|e| e.to_string())?;
@@ -306,13 +324,21 @@ impl Hud {
             sell_labels,
             buy_state: BuyState::default(),
             buy_layout: BuyLayout::default(),
+            install,
+            build_catalog: None,
+            build_swatches: BuildSwatches::default(),
+            build_state: BuildState {
+                last_wall_style: 1,
+                ..BuildState::default()
+            },
+            build_layout: BuildLayout::default(),
             sounds: Vec::new(),
         })
     }
 
     /// Forgets what the panel kept of the lot it showed, for a lot put
     /// back to a save: the pie menu, the dialog read, the icons pressed,
-    /// the Buy Mode catalog state, and the pause button's blink timer. The
+    /// the Buy/Build Mode catalog state, and the pause button's blink timer. The
     /// rest is read from the lot at the next frame.
     pub fn forget(&mut self) {
         self.menu = None;
@@ -334,6 +360,8 @@ impl Hud {
         self.controls.ultra_lit = false;
         self.buy_state.reset();
         self.buy_layout = BuyLayout::default();
+        self.build_state.reset();
+        self.build_layout = BuildLayout::default();
     }
 
     /// Loads the residential Buy Mode catalog on first use and returns it.
@@ -406,7 +434,145 @@ impl Hud {
         self.buy_layout = BuyLayout::default();
     }
 
-    /// Re-lays out the control panel items and Buy Mode strip for `size`
+    /// Loads the Build Mode catalog on first use and returns it.
+    pub fn ensure_build_catalog(&mut self, assets: &Assets) -> &BuildCatalog {
+        let install = &self.install;
+        self.build_catalog.get_or_insert_with(|| {
+            let builtin_floors = assets.builtin_floor_ids();
+            let builtin_walls = assets.builtin_wall_ids();
+            BuildCatalog::load(
+                install,
+                assets.index(),
+                assets.catalog(),
+                &builtin_floors,
+                &builtin_walls,
+                assets.floor_plugins(),
+                assets.wall_plugins(),
+            )
+        })
+    }
+
+    /// Returns Architecture pricing tables for `sims_vm` Build Mode edits.
+    pub fn build_prices(&mut self, assets: &Assets) -> sims_vm::BuildPrices {
+        let catalog = self.ensure_build_catalog(assets);
+        sims_vm::BuildPrices {
+            styles: catalog.style_prices.clone(),
+            floors: catalog.floor_prices.clone(),
+            walls: catalog.wall_prices.clone(),
+        }
+    }
+
+    /// The Build Mode catalog strip layout as last built.
+    pub fn build_layout(&self) -> &BuildLayout {
+        &self.build_layout
+    }
+
+    /// Lays out the Build Mode strip (`cWinArch`) for `size` and `world`,
+    /// syncing `self.build_state.page` to the clamped page number.
+    pub fn layout_build(
+        &mut self,
+        size: [i32; 2],
+        world: &World,
+        assets: &Assets,
+        can_undo: bool,
+        can_redo: bool,
+    ) {
+        if self.controls.mode != Mode::Build || !self.controls.expanded {
+            self.build_layout = BuildLayout::default();
+            return;
+        }
+        let install = &self.install;
+        let catalog = self.build_catalog.get_or_insert_with(|| {
+            let builtin_floors = assets.builtin_floor_ids();
+            let builtin_walls = assets.builtin_wall_ids();
+            BuildCatalog::load(
+                install,
+                assets.index(),
+                assets.catalog(),
+                &builtin_floors,
+                &builtin_walls,
+                assets.floor_plugins(),
+                assets.wall_plugins(),
+            )
+        });
+        let funds = sims_vm::available_funds(world);
+        let layout = build::layout(
+            size,
+            catalog,
+            &self.build_state,
+            &self.art,
+            funds,
+            can_undo,
+            can_redo,
+            self.controls.pointer,
+        );
+        self.build_state.page = layout.page;
+        self.build_layout = layout;
+    }
+
+    /// Decodes and caches 45×45 swatch thumbnails for any visible Build Mode
+    /// floor, wallpaper, or wall/fence slots in `self.build_layout`.
+    pub fn ensure_build_swatches(&mut self, assets: &mut Assets) {
+        if self.controls.mode != Mode::Build || !self.controls.expanded {
+            return;
+        }
+        let mut needed: Vec<BuildItemId> = self
+            .build_layout
+            .widgets
+            .iter()
+            .filter_map(|w| match w.kind {
+                BuildWidgetKind::Slot { item, .. } => Some(item),
+                BuildWidgetKind::Button { .. } => None,
+            })
+            .collect();
+        if let Some(card) = &self.build_layout.popup {
+            needed.push(card.item);
+        }
+        for item in needed {
+            if self.build_swatches.contains(item) {
+                continue;
+            }
+            let image = match item {
+                BuildItemId::Floor(key) => {
+                    if let Some(img) = assets.floor(key, 0) {
+                        Some(render_image_to_swatch(img))
+                    } else {
+                        assets.floor(key, 1).map(render_image_to_swatch)
+                    }
+                }
+                BuildItemId::Wallpaper(key) => {
+                    if let Some(frames) = assets.pattern(key, 0) {
+                        Some(render_image_to_swatch(&frames[0]))
+                    } else {
+                        assets
+                            .pattern(key, 1)
+                            .map(|frames| render_image_to_swatch(&frames[0]))
+                    }
+                }
+                BuildItemId::WallStyle(style_id) => {
+                    let pat = sims_vm::WallStyle::from_style_id(style_id)
+                        .map(sims_vm::WallStyle::default_pattern)
+                        .unwrap_or(0);
+                    if let Some(frames) = assets.pattern(pat, 0) {
+                        let pat_img = frames[0].clone();
+                        if let Some(shapes) = assets.shape(style_id, false, 0) {
+                            Some(render_wall_swatch(&pat_img, &shapes[0]))
+                        } else {
+                            Some(render_image_to_swatch(&pat_img))
+                        }
+                    } else {
+                        None
+                    }
+                }
+                BuildItemId::Object(_) => None,
+            };
+            if let Some(img) = image {
+                self.build_swatches.insert(item, img);
+            }
+        }
+    }
+
+    /// Re-lays out the control panel items and Buy/Build strip for `size`
     /// after a mode or panel toggle, so consecutive clicks work even before
     /// the next [`Hud::draw`].
     pub fn relayout_panel(
@@ -429,6 +595,7 @@ impl Hud {
         );
         hud::fit(&mut self.items, &self.art, &self.texts);
         self.layout_buy(size, world, assets, sell);
+        self.layout_build(size, world, assets, false, false);
     }
 
     /// Opens a UI-owned Options confirmation dialog using the install's
@@ -1176,6 +1343,38 @@ impl Hud {
         } else {
             self.buy_layout = BuyLayout::default();
         }
+        if self.controls.mode == Mode::Build && self.controls.expanded {
+            let mut guids: Vec<u32> = self
+                .build_layout
+                .widgets
+                .iter()
+                .filter_map(|w| match w.kind {
+                    BuildWidgetKind::Slot {
+                        item: BuildItemId::Object(guid),
+                        ..
+                    } => Some(guid),
+                    _ => None,
+                })
+                .collect();
+            if let Some(card) = &self.build_layout.popup
+                && let BuildItemId::Object(guid) = card.item
+            {
+                guids.push(guid);
+            }
+            for guid in guids {
+                let _ = self.thumbnails.read(assets.index(), assets.catalog(), guid);
+            }
+            build::draw(
+                &mut frame,
+                &self.art,
+                &self.thumbnails,
+                &self.build_swatches,
+                &self.build_layout,
+                self.controls.pointer,
+            );
+        } else {
+            self.build_layout = BuildLayout::default();
+        }
         if self.controls.mode == Mode::Live {
             self.queue
                 .draw(&mut frame, &self.art, &self.faces, &self.thumbnails);
@@ -1247,6 +1446,9 @@ impl Hud {
             || (self.controls.mode == Mode::Buy
                 && self.controls.expanded
                 && self.buy_layout.covers(point))
+            || (self.controls.mode == Mode::Build
+                && self.controls.expanded
+                && self.build_layout.covers(point))
             || (self.controls.mode == Mode::Live && self.queue.at(point).is_some())
     }
 
@@ -1360,12 +1562,20 @@ impl Hud {
                 .iter()
                 .rposition(|w| w.rect.contains(x, y))
         };
+        let build_widget = |pointer: Option<[i32; 2]>| {
+            let [x, y] = pointer?;
+            self.build_layout
+                .widgets
+                .iter()
+                .rposition(|w| w.rect.contains(x, y))
+        };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
             hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
             buy_widget(self.controls.pointer),
+            build_widget(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
         let hovered_changed = (
@@ -1374,6 +1584,7 @@ impl Hud {
             button(self.controls.pointer),
             entry(self.controls.pointer),
             buy_widget(self.controls.pointer),
+            build_widget(self.controls.pointer),
         ) != before;
         let dismissed_live = self.controls.help.is_some()
             && !hud::in_subpanel(&self.items, point)
@@ -1501,6 +1712,12 @@ impl Hud {
             && let Some(command) = self.buy_layout.press(point)
         {
             self.buy_state.apply(&command);
+            return Some(command);
+        }
+        if self.controls.mode == Mode::Build
+            && self.controls.expanded
+            && let Some(command) = self.build_layout.press(point)
+        {
             return Some(command);
         }
         if let Some((channel, _)) = hud::slider_at(&self.items, point) {
@@ -1786,6 +2003,67 @@ impl ClockBlink {
             && self.lit;
         (self.pause_lit(), self.ultra_lit) != before
     }
+}
+
+/// Scales/crops a `sims_render::Image` (RGBA) to fit cleanly inside a 41×41
+/// Build Mode catalog swatch (`sims_formats::bitmap::Image`).
+fn render_image_to_swatch(src: &sims_render::Image) -> sims_formats::bitmap::Image {
+    let max_dim = 41usize;
+    let sw = src.width.max(1);
+    let sh = src.height.max(1);
+    let scale = (max_dim as f32 / sw as f32)
+        .min(max_dim as f32 / sh as f32)
+        .min(1.0);
+    let dw = ((sw as f32 * scale).round() as usize).clamp(1, max_dim);
+    let dh = ((sh as f32 * scale).round() as usize).clamp(1, max_dim);
+    let mut pixels = vec![0u8; dw * dh * 4];
+    for y in 0..dh {
+        let sy = ((y * sh) / dh).min(sh - 1);
+        for x in 0..dw {
+            let sx = ((x * sw) / dw).min(sw - 1);
+            let si = (sy * sw + sx) * 4;
+            let di = (y * dw + x) * 4;
+            pixels[di..di + 4].copy_from_slice(&src.rgba[si..si + 4]);
+        }
+    }
+    sims_formats::bitmap::Image {
+        width: dw as u32,
+        height: dh as u32,
+        rgba: pixels,
+    }
+}
+
+/// Masks a wall pattern sprite with a wall shape sprite and scales it into a
+/// Build Mode catalog swatch.
+fn render_wall_swatch(
+    pat: &sims_render::Image,
+    shape: &sims_render::Image,
+) -> sims_formats::bitmap::Image {
+    let w = pat.width.min(shape.width);
+    let h = pat.height.min(shape.height);
+    if w == 0 || h == 0 {
+        return render_image_to_swatch(pat);
+    }
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let pi = (y * pat.width + x) * 4;
+            let si = (y * shape.width + x) * 4;
+            let di = (y * w + x) * 4;
+            let alpha = shape.rgba[si + 3];
+            rgba[di] = pat.rgba[pi];
+            rgba[di + 1] = pat.rgba[pi + 1];
+            rgba[di + 2] = pat.rgba[pi + 2];
+            rgba[di + 3] = ((u16::from(pat.rgba[pi + 3]) * u16::from(alpha)) / 255) as u8;
+        }
+    }
+    let masked = sims_render::Image {
+        width: w,
+        height: h,
+        rgba,
+        depth: None,
+    };
+    render_image_to_swatch(&masked)
 }
 
 #[cfg(test)]

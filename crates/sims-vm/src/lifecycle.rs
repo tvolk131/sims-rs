@@ -1981,6 +1981,11 @@ fn boot_from_saved_lot(
         buy_redo: Vec::new(),
         buy_orphans: Vec::new(),
         active_buy_cursor: None,
+        build_undo: Vec::new(),
+        build_redo: Vec::new(),
+        undo_order: Vec::new(),
+        redo_order: Vec::new(),
+        active_wall_cursor: None,
         neighborhood_origin: Some(NeighborhoodOrigin {
             store_id,
             neighborhood_id: neighborhood_id.to_owned(),
@@ -2381,6 +2386,11 @@ fn boot_from_base_house(
         buy_redo: Vec::new(),
         buy_orphans: Vec::new(),
         active_buy_cursor: None,
+        build_undo: Vec::new(),
+        build_redo: Vec::new(),
+        undo_order: Vec::new(),
+        redo_order: Vec::new(),
+        active_wall_cursor: None,
         neighborhood_origin: Some(NeighborhoodOrigin {
             store_id,
             neighborhood_id: neighborhood_id.to_owned(),
