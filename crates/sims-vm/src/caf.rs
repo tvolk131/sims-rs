@@ -1774,6 +1774,17 @@ pub fn commit_family_with_context(
     spec: &FamilySpec,
     rng: &mut CrtRng,
 ) -> Result<CreatedHousehold, CafError> {
+    commit_family_with_context_hook(ctx, store, neighborhood_id, spec, rng, || {})
+}
+
+fn commit_family_with_context_hook(
+    ctx: &CafContext,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    spec: &FamilySpec,
+    rng: &mut CrtRng,
+    on_after_snapshot: impl FnOnce(),
+) -> Result<CreatedHousehold, CafError> {
     spec.validate()?;
 
     let _guard = CAF_COMMIT_LOCK
@@ -1783,6 +1794,7 @@ pub fn commit_family_with_context(
     let snapshot = store
         .load_lot_snapshot(neighborhood_id, 0)?
         .ok_or_else(|| CafError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    on_after_snapshot();
     let origin_neighborhood = snapshot.neighborhood.clone();
     let mut stored = snapshot.neighborhood;
     let origin_revision = stored.revision;
@@ -1978,24 +1990,16 @@ pub fn delete_bin_family(
         }
     }
 
-    let (committed_instance, committed_revision) = checked_save_neighborhood(
+    // `save_neighborhood_checked` atomically purges the removed family's photo
+    // album and advances its household lifetime epoch inside the same REDB
+    // write transaction.
+    let (_, committed_revision) = checked_save_neighborhood(
         store,
         neighborhood_id,
         origin_instance_id,
         origin_revision,
         &stored,
     )?;
-    // Clean up any persisted household photo album for the deleted family so a
-    // future household reusing `family_id` cannot inherit stale photos. If the
-    // neighborhood was concurrently deleted or re-imported, its albums were
-    // already purged atomically.
-    match store
-        .albums()
-        .delete_family_album(neighborhood_id, committed_instance, family_id)
-    {
-        Ok(_) | Err(sims_sim::AlbumError::StaleNeighborhoodInstance { .. }) => {}
-        Err(error) => return Err(CafError::Store(error.into())),
-    }
 
     Ok(DeletedFamilyReport {
         family_id,
@@ -3466,5 +3470,193 @@ mod tests {
         let ctss =
             StringTable::parse(parsed.members.get(&1).unwrap().ctss.as_deref().unwrap()).unwrap();
         assert_eq!(ctss.get(0, 1), Some("FreshLoose"));
+    }
+
+    #[test]
+    fn paused_caf_commit_returns_mismatch_and_preserves_replacement_byte_for_byte() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc;
+
+        static NEXT_PAUSE_DB: AtomicU64 = AtomicU64::new(0);
+        let db_path = std::env::temp_dir().join(format!(
+            "sims-vm-caf-paused-{}-{}.redb",
+            std::process::id(),
+            NEXT_PAUSE_DB.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(db_path.clone());
+
+        let store = NeighborhoodStore::open(&db_path).unwrap();
+        let make_nh = |marker: i16| StoredNeighborhood {
+            name: "PauseNH".into(),
+            families: BTreeMap::from([(
+                0,
+                Family {
+                    version: 9,
+                    house: 0,
+                    number: -1,
+                    budget: 0,
+                    architecture_value: 0,
+                    friends: 0,
+                    flags: 0,
+                    members: Vec::new(),
+                    tail: vec![0; 16],
+                },
+            )]),
+            neighbors: Vec::new(),
+            inventories: Vec::new(),
+            data: [marker; 16],
+            options: None,
+            type_attributes: None,
+            zoning: BTreeMap::from([(4, 1)]),
+            lot_rows: vec![4],
+            made_characters: sims_sim::characters::Characters::default(),
+            deleted_characters: BTreeSet::new(),
+            deletion_epoch: 0,
+            deleted_at_epoch: BTreeMap::new(),
+            instance_id: 1,
+            revision: 0,
+        };
+        store.save_neighborhood("PauseNH", &make_nh(1)).unwrap();
+
+        let ctx = CafContext::synthetic(
+            synthetic_template_iff(),
+            BTreeSet::from([TEMPLATE_PERSON_GUID]),
+            DEFAULT_STARTING_FUNDS,
+        );
+        let spec = FamilySpec::new(
+            "Stale",
+            "",
+            vec![SimSpec {
+                first_name: "Alice".into(),
+                bio: String::new(),
+                age: Age::Adult,
+                gender: Gender::Female,
+                skin_tone: SkinTone::Light,
+                body_appearance: "b002fafit_01".into(),
+                body_texture: "b002fafitlgt_mom02".into(),
+                head_appearance: "c809fa_beth".into(),
+                head_texture: "c809falgt_beth3".into(),
+                personality: Personality::new(5, 5, 5, 5, 5).unwrap(),
+                portraits: None,
+            }],
+        );
+
+        // Case 1: Pause CAF right after snapshot capture, replace the
+        // neighborhood (simulating concurrent `import_directory`), resume CAF,
+        // and assert deterministic `NeighborhoodMismatch` + byte-for-byte
+        // preservation of the replacement neighborhood and zero leaked files.
+        let (snap_tx, snap_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let mut replacement_encoded = Vec::new();
+        let mut replacement_chars = BTreeMap::new();
+        let ctx_ref = &ctx;
+        let store_ref = &store;
+        let spec_ref = &spec;
+        let err = std::thread::scope(|scope| {
+            let h = scope.spawn(move || {
+                let mut rng = CrtRng::from_state(0x1122_3344);
+                commit_family_with_context_hook(
+                    ctx_ref,
+                    store_ref,
+                    "PauseNH",
+                    spec_ref,
+                    &mut rng,
+                    || {
+                        snap_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    },
+                )
+            });
+            snap_rx.recv().unwrap();
+            assert!(store.delete_neighborhood("PauseNH").unwrap());
+            store.save_neighborhood("PauseNH", &make_nh(77)).unwrap();
+            store
+                .save_character_file("PauseNH", "User00099.iff", b"replacement-char")
+                .unwrap();
+            replacement_encoded = store
+                .load_neighborhood("PauseNH")
+                .unwrap()
+                .unwrap()
+                .encode();
+            replacement_chars = store.load_character_files("PauseNH").unwrap();
+            resume_tx.send(()).unwrap();
+            h.join().unwrap().unwrap_err()
+        });
+        assert!(
+            matches!(err, CafError::NeighborhoodMismatch { .. }),
+            "expected NeighborhoodMismatch, got {err}"
+        );
+        assert_eq!(
+            store
+                .load_neighborhood("PauseNH")
+                .unwrap()
+                .unwrap()
+                .encode(),
+            replacement_encoded
+        );
+        assert_eq!(
+            store.load_character_files("PauseNH").unwrap(),
+            replacement_chars
+        );
+
+        // Case 2: Pause CAF right after snapshot capture, bump same-instance
+        // revision via `save_neighborhood_checked`, resume CAF, and assert
+        // deterministic `StaleNeighborhood` + byte-for-byte preservation.
+        let (snap_tx2, snap_rx2) = mpsc::channel();
+        let (resume_tx2, resume_rx2) = mpsc::channel();
+        let mut bumped_encoded = Vec::new();
+        let err2 = std::thread::scope(|scope| {
+            let h = scope.spawn(move || {
+                let mut rng = CrtRng::from_state(0x5566_7788);
+                commit_family_with_context_hook(
+                    ctx_ref,
+                    store_ref,
+                    "PauseNH",
+                    spec_ref,
+                    &mut rng,
+                    || {
+                        snap_tx2.send(()).unwrap();
+                        resume_rx2.recv().unwrap();
+                    },
+                )
+            });
+            snap_rx2.recv().unwrap();
+            let mut cur = store.load_neighborhood("PauseNH").unwrap().unwrap();
+            cur.data[1] = 88;
+            store
+                .save_neighborhood_checked("PauseNH", cur.instance_id, cur.revision, &cur)
+                .unwrap()
+                .unwrap();
+            bumped_encoded = store
+                .load_neighborhood("PauseNH")
+                .unwrap()
+                .unwrap()
+                .encode();
+            resume_tx2.send(()).unwrap();
+            h.join().unwrap().unwrap_err()
+        });
+        assert!(
+            matches!(err2, CafError::StaleNeighborhood { .. }),
+            "expected StaleNeighborhood, got {err2}"
+        );
+        assert_eq!(
+            store
+                .load_neighborhood("PauseNH")
+                .unwrap()
+                .unwrap()
+                .encode(),
+            bumped_encoded
+        );
+        assert_eq!(
+            store.load_character_files("PauseNH").unwrap(),
+            replacement_chars
+        );
     }
 }

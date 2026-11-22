@@ -23,7 +23,9 @@ write. That left a narrow Phase 2 window against a concurrent
      and **zero** writes on conflict.
   3. Advances `(instance_id, revision)` via `advance_version` (handling `u64::MAX`
      revision rollover atomically inside the same transaction).
-  4. Inserts all `(id, filename) -> bytes` entries into `NEIGHBORHOOD_CHARACTERS`
+  4. Atomically purges photo albums and advances household lifetime epochs for
+     any non-zero families removed between the previous and committed states.
+  5. Inserts all `(id, filename) -> bytes` entries into `NEIGHBORHOOD_CHARACTERS`
      and updates `NEIGHBORHOODS[id]` together.
 - **`sims-vm::caf`** (`crates/sims-vm/src/caf.rs`) replaces the three-phase
   staging helper with `persist_household_atomic`, calling
@@ -31,17 +33,23 @@ write. That left a narrow Phase 2 window against a concurrent
   and `import_family_fam`. Each household commit now advances revision by +1
   atomically with zero staging tombstones and zero partial-write window against
   concurrent `import_directory`, `delete_neighborhood`, lot saves, or crashes.
-- **`delete_bin_family`** also cleans up the deleted family's persisted photo
-  album (fenced by the committed `instance_id`) so a later CAF household reusing
-  that `family_id` cannot inherit stale photos.
+- **Transactional family-deletion album purge:** All neighborhood write paths
+  (`save_neighborhood`, `save_neighborhood_checked`,
+  `save_lot_and_neighborhood_checked`, and
+  `save_characters_and_neighborhood_checked`) atomically purge albums and bump
+  `photo_album_family_epoch` for any non-zero family removed from
+  `StoredNeighborhood::families` inside the exact same REDB write transaction,
+  covering `sims-vm::caf::delete_bin_family`, `sims-game`'s Family Bin UI, and
+  empty-household pruning on lot save with zero two-transaction gap.
 
 ## 2. Household Photo Album REDB Storage (`sims-sim::album_store`)
 
 `PhotoAlbumStore` (`Clone + Send + Sync`, obtained via `NeighborhoodStore::albums()`
 sharing `Arc<Database>`) persists per-`(neighborhood_id, family_id)` household
 photo album / storybook entries matching `sims-ui::album`'s commands (`add`,
-`update_text`, `move_entry`, `delete`, `list`, plus `get`, `list_families`, and
-`delete_family_album`).
+`update_text`, `move_entry`, `delete`, `list`, plus `family_token`,
+`list_summaries`, `list_page`, `list_page_with_budget`, `get`, `list_families`,
+and `delete_family_album`).
 
 - **Tables:**
   - `photo_album_index` (`(&str, u16) -> &[u8]`): framed `"ALBI"` v1 record
@@ -51,21 +59,31 @@ photo album / storybook entries matching `sims-ui::album`'s commands (`add`,
     monotonic non-reused `photo_id >= 1` across deletions.
   - `photo_album_photos` (`(&str, u16, u64) -> &[u8]`): framed `"ALBP"` v1
     record holding `(neighborhood_id, family_id, id, title, caption, sim_day, image: Option<AlbumImage>)`.
-- **Integrity & Bounds:** Both record types carry a 4-byte magic, 4-byte
-  little-endian format version (`ALBUM_FORMAT = 1`), 32-byte domain-separated
-  SHA-256 checksum, strict exact-length `postcard` decoding
-  (`decode_postcard_exact`), and full key-binding verification. Text and bitmap
-  bounds are enforced on both write and read: `MAX_ALBUM_TITLE_CHARS = 80`,
-  `MAX_ALBUM_CAPTION_CHARS = 512`, `MAX_ALBUM_PHOTO_DIM = 1024`,
-  `MAX_ALBUM_PHOTO_PIXELS = 1024 * 768` (stored as row-major 16-bit RGB565
-  matching the Sims 1 display color space with `from_rgba` / `to_rgba` helpers),
-  and `MAX_ALBUM_ENTRIES = 256` per household.
-- **Lifetime Fencing & Purge:** Every mutating method requires a non-zero
-  `expected_instance_id` verified against `NEIGHBORHOODS[neighborhood_id]` inside
-  the REDB write transaction (`AlbumError::StaleNeighborhoodInstance` on delete
-  or re-import), without bumping `StoredNeighborhood::revision`. Both
-  `NeighborhoodStore::delete_neighborhood` and `import_directory` purge all album
-  rows for that neighborhood inside their atomic write transaction.
+  - `photo_album_family_epoch` (`(&str, u16) -> u64`): monotonic per-household
+    lifetime generation (default `1`, incremented atomically whenever
+    `family_id` is removed from `StoredNeighborhood::families`).
+- **Integrity & Pre-Allocation Bounds:** Both framed record types carry a 4-byte
+  magic, 4-byte little-endian format version (`ALBUM_FORMAT = 1`), 32-byte
+  domain-separated SHA-256 checksum, strict exact-length `postcard` decoding
+  (`decode_postcard_exact`), and full key-binding verification. Encoded byte
+  ceilings (`MAX_ALBUM_INDEX_ENCODED_BYTES`, `MAX_ALBUM_PHOTO_ENCODED_BYTES`)
+  are checked **before** hashing, and custom `Deserialize` visitors enforce
+  exact pixel counts (`width × height`), string byte/char limits
+  (`MAX_ALBUM_TITLE_CHARS = 80`, `MAX_ALBUM_CAPTION_CHARS = 512`), and
+  `MAX_ALBUM_ENTRIES = 256` **before** allocating collections. Bulk reads
+  (`list` / `list_page`) enforce `MAX_BULK_ALBUM_PIXEL_BYTES` (32 MiB), with
+  metadata-only `list_summaries` and paged `list_page` / `get` for arbitrarily
+  large albums.
+- **Neighborhood + Household Lifetime Fencing & Purge:** Every mutating method
+  requires an `AlbumFamilyToken { instance_id, family_id, family_epoch }` from
+  `PhotoAlbumStore::family_token`, verified inside the REDB write transaction
+  against `NEIGHBORHOODS[neighborhood_id].instance_id`, live membership in
+  `StoredNeighborhood::families`, and `photo_album_family_epoch[(nh, fam)]`
+  (returning `StaleNeighborhoodInstance` or `StaleFamilyToken` on delete,
+  re-import, or household ID reuse), without bumping
+  `StoredNeighborhood::revision`. Both `NeighborhoodStore::delete_neighborhood`
+  and `import_directory` purge all album index, photo, and epoch rows
+  atomically.
 
 ## 3. Persistent Custom Lot Map Thumbnails (`NEIGHBORHOOD_LOT_THUMBNAILS`)
 
@@ -73,18 +91,22 @@ Adds a dedicated REDB table `neighborhood_lot_thumbnails` (`(&str, u32) -> &[u8]
 and checked API on `NeighborhoodStore`:
 
 - `save_lot_thumbnail_checked(id, expected_instance_id, lot_id, thumbnail)`
-- `load_lot_thumbnail(id, lot_id)` and `load_lot_thumbnails(id)`
+- `load_lot_thumbnail(id, lot_id)`, `load_lot_thumbnails(id)` (bounded by
+  `DEFAULT_LOT_THUMBNAILS_MAX_BYTES = 32 MiB`), `load_lot_thumbnails_bounded`,
+  and subset loader `load_lot_thumbnails_for(id, lot_ids, max_pixel_bytes)`
 - `delete_lot_thumbnail_checked(id, expected_instance_id, lot_id)`
 
 Each record stores `StoredLotThumbnail { normal: ThumbnailSurface565, roofs_off: Option<ThumbnailSurface565> }`
 (matching `sims-render`'s `Surface565` and `MAX_LOT_THUMBNAIL_DIM = 1024`) inside
-a framed `"THMB"` v1 envelope with a 32-byte domain-separated SHA-256 checksum,
-`decode_postcard_exact`, and `(neighborhood_id, lot_id)` key-binding verification.
-Writes and deletes fence on `expected_instance_id` inside the REDB write
-transaction without bumping `StoredNeighborhood::revision` (so cosmetic map
-thumbnail updates never invalidate active lot sessions), and both
-`delete_neighborhood` and `import_directory` purge all thumbnails for that
-neighborhood atomically.
+a framed `"THMB"` v1 envelope with encoded-size checking (`MAX_LOT_THUMBNAIL_ENCODED_BYTES`)
+before hashing, a 32-byte domain-separated SHA-256 checksum, pre-allocation
+pixel-count enforcement during `Deserialize`, `decode_postcard_exact`, and
+`(neighborhood_id, lot_id)` key-binding verification. `save_lot_thumbnail_checked`
+validates any existing record before replacing it (refusing to silently clobber
+corrupt or future-version rows; explicit recovery uses
+`delete_lot_thumbnail_checked`), fences on `expected_instance_id` without
+bumping `StoredNeighborhood::revision`, and both `delete_neighborhood` and
+`import_directory` purge all thumbnails atomically.
 
 ## 4. Explicit `Saved` Forward Schema Migrations (`FORMAT 6 -> 7 -> 8`)
 

@@ -1,10 +1,12 @@
 //! Integration tests for `sims_sim::album_store::PhotoAlbumStore`.
 
 use redb::ReadableDatabase;
+use sha2::{Digest, Sha256};
+use sims_formats::neighborhood::Family;
 use sims_sim::{
-    ALBUM_FORMAT, AlbumError, AlbumImage, MAX_ALBUM_CAPTION_CHARS, MAX_ALBUM_ENTRIES,
-    MAX_ALBUM_PHOTO_DIM, MAX_ALBUM_TITLE_CHARS, NeighborhoodStore, NewAlbumPhoto, PhotoAlbumStore,
-    StoredNeighborhood,
+    ALBUM_FORMAT, AlbumError, AlbumFamilyToken, AlbumImage, MAX_ALBUM_CAPTION_CHARS,
+    MAX_ALBUM_ENTRIES, MAX_ALBUM_PHOTO_DIM, MAX_ALBUM_PHOTO_ENCODED_BYTES, MAX_ALBUM_TITLE_CHARS,
+    NeighborhoodStore, NewAlbumPhoto, PhotoAlbumStore, StoredNeighborhood,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -32,10 +34,28 @@ impl Drop for TempDb {
     }
 }
 
-fn sample_neighborhood(name: &str) -> StoredNeighborhood {
+fn dummy_family(number: i32) -> Family {
+    Family {
+        version: 9,
+        house: 0,
+        number,
+        budget: 20_000,
+        architecture_value: 0,
+        friends: 0,
+        flags: 0,
+        members: vec![0x1000 + number as u32],
+        tail: vec![0; 16],
+    }
+}
+
+fn sample_neighborhood(name: &str, family_ids: &[u16]) -> StoredNeighborhood {
+    let mut families = BTreeMap::new();
+    for (i, &fid) in family_ids.iter().enumerate() {
+        families.insert(fid, dummy_family((i as i32) + 1));
+    }
     StoredNeighborhood {
         name: name.to_owned(),
-        families: BTreeMap::new(),
+        families,
         neighbors: Vec::new(),
         inventories: Vec::new(),
         data: [0; 16],
@@ -68,20 +88,24 @@ fn sample_image(width: u32, height: u32, seed: u8) -> AlbumImage {
 fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
 
 #[test]
-fn album_store_crud_ordering_monotonic_ids_and_rgb565_round_trip() {
+fn album_store_crud_ordering_paging_summaries_and_rgb565_round_trip() {
     assert_clone_send_sync::<PhotoAlbumStore>();
 
     let db = TempDb::new("crud-ordering");
     let store = NeighborhoodStore::open(&db.0).unwrap();
     store
-        .save_neighborhood("UserData", &sample_neighborhood("UserData"))
+        .save_neighborhood("UserData", &sample_neighborhood("UserData", &[1]))
         .unwrap();
     let nh = store.load_neighborhood("UserData").unwrap().unwrap();
-    let inst = nh.instance_id;
     let albums = store.albums();
+    let tok = albums.family_token("UserData", 1).unwrap().unwrap();
+    assert_eq!(tok.instance_id, nh.instance_id);
+    assert_eq!(tok.family_id, 1);
+    assert!(albums.family_token("UserData", 99).unwrap().is_none());
 
     // Initially empty.
     assert!(albums.list("UserData", 1).unwrap().is_empty());
+    assert!(albums.list_summaries("UserData", 1).unwrap().is_empty());
     assert!(albums.list_families("UserData").unwrap().is_empty());
     assert!(albums.get("UserData", 1, 1).unwrap().is_none());
 
@@ -90,8 +114,7 @@ fn album_store_crud_ordering_monotonic_ids_and_rgb565_round_trip() {
     let p1 = albums
         .add(
             "UserData",
-            inst,
-            1,
+            tok,
             NewAlbumPhoto::with_image("Move-in Day", "Welcome to 5 Sim Lane!", img1.clone())
                 .with_sim_day(1),
         )
@@ -99,8 +122,7 @@ fn album_store_crud_ordering_monotonic_ids_and_rgb565_round_trip() {
     let p2 = albums
         .add(
             "UserData",
-            inst,
-            1,
+            tok,
             NewAlbumPhoto::blank("Chapter Two", "A quiet afternoon.").with_sim_day(3),
         )
         .unwrap();
@@ -108,8 +130,7 @@ fn album_store_crud_ordering_monotonic_ids_and_rgb565_round_trip() {
     let p3 = albums
         .add(
             "UserData",
-            inst,
-            1,
+            tok,
             NewAlbumPhoto::with_image("Party!", "Everyone danced.", img3.clone()).with_sim_day(5),
         )
         .unwrap();
@@ -127,8 +148,7 @@ fn album_store_crud_ordering_monotonic_ids_and_rgb565_round_trip() {
     let updated = albums
         .update_text(
             "UserData",
-            inst,
-            1,
+            tok,
             p2.id,
             "Chapter Two (Edited)",
             "Updated caption text.",
@@ -141,7 +161,7 @@ fn album_store_crud_ordering_monotonic_ids_and_rgb565_round_trip() {
     assert!(updated.image.is_none());
 
     // Reorder: move entry 3 to index 0 -> [3, 1, 2].
-    let order = albums.move_entry("UserData", inst, 1, p3.id, 0).unwrap();
+    let order = albums.move_entry("UserData", tok, p3.id, 0).unwrap();
     assert_eq!(order, vec![3, 1, 2]);
     let listed = albums.list("UserData", 1).unwrap();
     assert_eq!(
@@ -152,27 +172,50 @@ fn album_store_crud_ordering_monotonic_ids_and_rgb565_round_trip() {
     assert_eq!(listed[1].image.as_ref(), Some(&img1));
     assert_eq!(listed[2].title, "Chapter Two (Edited)");
 
+    // Metadata-only summaries & paging & pixel budget enforcement.
+    let summaries = albums.list_summaries("UserData", 1).unwrap();
+    assert_eq!(summaries.len(), 3);
+    assert_eq!(summaries[0].id, 3);
+    assert_eq!(summaries[0].image_dimensions, Some((4, 4)));
+    assert_eq!(summaries[1].id, 1);
+    assert_eq!(summaries[1].image_dimensions, Some((8, 6)));
+    assert_eq!(summaries[2].id, 2);
+    assert_eq!(summaries[2].image_dimensions, None);
+
+    let page = albums.list_page("UserData", 1, 1, 2).unwrap();
+    assert_eq!(page.iter().map(|p| p.id).collect::<Vec<_>>(), vec![1, 2]);
+    assert!(albums.list_page("UserData", 1, 5, 2).unwrap().is_empty());
+    // img3 is 32 bytes (4*4*2), img1 is 96 bytes (8*6*2) -> 128 total; cap at 64 fails!
+    assert!(matches!(
+        albums.list_page_with_budget("UserData", 1, 0, 3, 64),
+        Err(AlbumError::BudgetExceeded {
+            limit_bytes: 64,
+            required_bytes: 128,
+            ..
+        })
+    ));
+
     // Same-index move is a valid no-op; out-of-bounds index is rejected.
     assert_eq!(
-        albums.move_entry("UserData", inst, 1, p3.id, 0).unwrap(),
+        albums.move_entry("UserData", tok, p3.id, 0).unwrap(),
         vec![3, 1, 2]
     );
     assert!(matches!(
-        albums.move_entry("UserData", inst, 1, p3.id, 3),
+        albums.move_entry("UserData", tok, p3.id, 3),
         Err(AlbumError::InvalidIndex { index: 3, len: 3 })
     ));
     assert!(matches!(
-        albums.move_entry("UserData", inst, 1, 999, 0),
+        albums.move_entry("UserData", tok, 999, 0),
         Err(AlbumError::PhotoNotFound { photo_id: 999, .. })
     ));
 
     // Delete entry 3: returns true once, false on repeat, and next add gets ID 4 (never reuses 3).
-    assert!(albums.delete("UserData", inst, 1, p3.id).unwrap());
-    assert!(!albums.delete("UserData", inst, 1, p3.id).unwrap());
+    assert!(albums.delete("UserData", tok, p3.id).unwrap());
+    assert!(!albums.delete("UserData", tok, p3.id).unwrap());
     assert!(albums.get("UserData", 1, p3.id).unwrap().is_none());
 
     let p4 = albums
-        .add("UserData", inst, 1, NewAlbumPhoto::blank("Fourth", ""))
+        .add("UserData", tok, NewAlbumPhoto::blank("Fourth", ""))
         .unwrap();
     assert_eq!(p4.id, 4);
     assert_eq!(
@@ -185,6 +228,14 @@ fn album_store_crud_ordering_monotonic_ids_and_rgb565_round_trip() {
         vec![1, 2, 4]
     );
 
+    // Clearing the album preserves next_photo_id so newly added photo gets ID 5.
+    assert!(albums.delete_family_album("UserData", tok).unwrap());
+    assert!(albums.list("UserData", 1).unwrap().is_empty());
+    let p5 = albums
+        .add("UserData", tok, NewAlbumPhoto::blank("Fifth", ""))
+        .unwrap();
+    assert_eq!(p5.id, 5);
+
     // Album operations never bump StoredNeighborhood::revision.
     let nh_after = store.load_neighborhood("UserData").unwrap().unwrap();
     assert_eq!(nh_after.revision, nh.revision);
@@ -195,26 +246,51 @@ fn album_store_enforces_bounds_and_max_entries() {
     let db = TempDb::new("bounds");
     let store = NeighborhoodStore::open(&db.0).unwrap();
     store
-        .save_neighborhood("UserData", &sample_neighborhood("UserData"))
+        .save_neighborhood("UserData", &sample_neighborhood("UserData", &[1, 2]))
         .unwrap();
-    let inst = store
-        .load_neighborhood("UserData")
-        .unwrap()
-        .unwrap()
-        .instance_id;
     let albums = store.albums();
+    let tok1 = albums.family_token("UserData", 1).unwrap().unwrap();
+    let tok2 = albums.family_token("UserData", 2).unwrap().unwrap();
 
-    // Invalid IDs.
+    // Invalid IDs / zero token fields.
     assert!(matches!(
-        albums.add("", inst, 1, NewAlbumPhoto::blank("t", "c")),
+        albums.add("", tok1, NewAlbumPhoto::blank("t", "c")),
         Err(AlbumError::InvalidInput(_))
     ));
     assert!(matches!(
-        albums.add("UserData", 0, 1, NewAlbumPhoto::blank("t", "c")),
+        albums.add(
+            "UserData",
+            AlbumFamilyToken {
+                instance_id: 0,
+                family_id: 1,
+                family_epoch: 1
+            },
+            NewAlbumPhoto::blank("t", "c")
+        ),
         Err(AlbumError::InvalidInput(_))
     ));
     assert!(matches!(
-        albums.add("UserData", inst, 0, NewAlbumPhoto::blank("t", "c")),
+        albums.add(
+            "UserData",
+            AlbumFamilyToken {
+                instance_id: tok1.instance_id,
+                family_id: 0,
+                family_epoch: 1
+            },
+            NewAlbumPhoto::blank("t", "c")
+        ),
+        Err(AlbumError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        albums.add(
+            "UserData",
+            AlbumFamilyToken {
+                instance_id: tok1.instance_id,
+                family_id: 1,
+                family_epoch: 0
+            },
+            NewAlbumPhoto::blank("t", "c")
+        ),
         Err(AlbumError::InvalidInput(_))
     ));
 
@@ -222,11 +298,11 @@ fn album_store_enforces_bounds_and_max_entries() {
     let long_title = "a".repeat(MAX_ALBUM_TITLE_CHARS + 1);
     let long_caption = "b".repeat(MAX_ALBUM_CAPTION_CHARS + 1);
     assert!(matches!(
-        albums.add("UserData", inst, 1, NewAlbumPhoto::blank(long_title, "")),
+        albums.add("UserData", tok1, NewAlbumPhoto::blank(long_title, "")),
         Err(AlbumError::InvalidInput(_))
     ));
     assert!(matches!(
-        albums.add("UserData", inst, 1, NewAlbumPhoto::blank("", long_caption)),
+        albums.add("UserData", tok1, NewAlbumPhoto::blank("", long_caption)),
         Err(AlbumError::InvalidInput(_))
     ));
 
@@ -261,14 +337,13 @@ fn album_store_enforces_bounds_and_max_entries() {
         albums
             .add(
                 "UserData",
-                inst,
-                2,
+                tok2,
                 NewAlbumPhoto::blank(format!("Page {i}"), ""),
             )
             .unwrap();
     }
     assert!(matches!(
-        albums.add("UserData", inst, 2, NewAlbumPhoto::blank("Overflow", "")),
+        albums.add("UserData", tok2, NewAlbumPhoto::blank("Overflow", "")),
         Err(AlbumError::AlbumFull {
             max_entries: MAX_ALBUM_ENTRIES,
             ..
@@ -278,86 +353,146 @@ fn album_store_enforces_bounds_and_max_entries() {
 }
 
 #[test]
-fn album_store_fences_instance_id_and_purges_on_delete_and_reimport() {
+fn album_store_fences_family_lifetime_and_purges_atomically_on_family_or_neighborhood_delete() {
     let db = TempDb::new("fencing-purge");
     let store = NeighborhoodStore::open(&db.0).unwrap();
     store
-        .save_neighborhood("NH1", &sample_neighborhood("NH1"))
+        .save_neighborhood("NH1", &sample_neighborhood("NH1", &[1, 2]))
         .unwrap();
     store
-        .save_neighborhood("NH2", &sample_neighborhood("NH2"))
+        .save_neighborhood("NH2", &sample_neighborhood("NH2", &[1]))
         .unwrap();
-    let inst1 = store.load_neighborhood("NH1").unwrap().unwrap().instance_id;
-    let inst2 = store.load_neighborhood("NH2").unwrap().unwrap().instance_id;
     let albums = store.albums();
+    let tok1 = albums.family_token("NH1", 1).unwrap().unwrap();
+    let tok1_fam2 = albums.family_token("NH1", 2).unwrap().unwrap();
+    let tok2 = albums.family_token("NH2", 1).unwrap().unwrap();
 
     let p1 = albums
-        .add("NH1", inst1, 1, NewAlbumPhoto::blank("NH1 Photo", "cap"))
+        .add("NH1", tok1, NewAlbumPhoto::blank("NH1 Fam1 Photo", "cap"))
+        .unwrap();
+    let _p1_f2 = albums
+        .add("NH1", tok1_fam2, NewAlbumPhoto::blank("NH1 Fam2", "keep"))
         .unwrap();
     let _p2 = albums
-        .add("NH2", inst2, 1, NewAlbumPhoto::blank("NH2 Photo", "cap"))
+        .add("NH2", tok2, NewAlbumPhoto::blank("NH2 Photo", "cap"))
         .unwrap();
 
-    // Wrong instance_id fails on all mutators with zero changes.
-    let stale_inst = inst1 ^ 0xdead_beef;
+    // 1. Deleting family 1 via `save_neighborhood_checked` (the Family Bin UI
+    //    path!) atomically purges family 1's album and bumps its family epoch,
+    //    while keeping family 2's album untouched.
+    {
+        let mut nh1 = store.load_neighborhood("NH1").unwrap().unwrap();
+        nh1.families.remove(&1);
+        store
+            .save_neighborhood_checked("NH1", nh1.instance_id, nh1.revision, &nh1)
+            .unwrap()
+            .unwrap();
+    }
+    assert!(albums.list("NH1", 1).unwrap().is_empty());
+    assert_eq!(albums.list("NH1", 2).unwrap().len(), 1);
+    assert!(albums.family_token("NH1", 1).unwrap().is_none());
+
+    // Delayed add while family 1 is absent is rejected cleanly.
     assert!(matches!(
-        albums.add("NH1", stale_inst, 1, NewAlbumPhoto::blank("Stale", "")),
+        albums.add("NH1", tok1, NewAlbumPhoto::blank("Ghost", "")),
+        Err(AlbumError::StaleFamilyToken {
+            family_id: 1,
+            current_epoch: None,
+            ..
+        })
+    ));
+
+    // Recreate a brand-new household reusing family ID 1 in the SAME neighborhood
+    // instance; it starts with an empty album and a strictly newer family_epoch.
+    {
+        let mut nh1 = store.load_neighborhood("NH1").unwrap().unwrap();
+        nh1.families.insert(1, dummy_family(99));
+        store
+            .save_neighborhood_checked("NH1", nh1.instance_id, nh1.revision, &nh1)
+            .unwrap()
+            .unwrap();
+    }
+    assert!(albums.list("NH1", 1).unwrap().is_empty());
+    let new_tok1 = albums.family_token("NH1", 1).unwrap().unwrap();
+    assert_eq!(new_tok1.instance_id, tok1.instance_id);
+    assert_eq!(new_tok1.family_epoch, tok1.family_epoch + 1);
+    let repl_p1 = albums
+        .add(
+            "NH1",
+            new_tok1,
+            NewAlbumPhoto::blank("Replacement Photo", "safe"),
+        )
+        .unwrap();
+    assert_eq!(repl_p1.id, p1.id); // both are photo ID 1!
+
+    // Stale token from the original household MUST fail on all mutators against
+    // the replacement household!
+    assert!(matches!(
+        albums.update_text("NH1", tok1, p1.id, "Hijacked", "Bad"),
+        Err(AlbumError::StaleFamilyToken {
+            current_epoch: Some(cur),
+            ..
+        }) if cur == new_tok1.family_epoch
+    ));
+    assert!(matches!(
+        albums.move_entry("NH1", tok1, p1.id, 0),
+        Err(AlbumError::StaleFamilyToken { .. })
+    ));
+    assert!(matches!(
+        albums.delete("NH1", tok1, p1.id),
+        Err(AlbumError::StaleFamilyToken { .. })
+    ));
+    assert!(matches!(
+        albums.delete_family_album("NH1", tok1),
+        Err(AlbumError::StaleFamilyToken { .. })
+    ));
+    assert_eq!(albums.list("NH1", 1).unwrap()[0].title, "Replacement Photo");
+
+    // 2. Wrong neighborhood instance_id fails with StaleNeighborhoodInstance.
+    let stale_inst_tok = AlbumFamilyToken {
+        instance_id: new_tok1.instance_id ^ 0xdead_beef,
+        ..new_tok1
+    };
+    assert!(matches!(
+        albums.add("NH1", stale_inst_tok, NewAlbumPhoto::blank("Stale", "")),
         Err(AlbumError::StaleNeighborhoodInstance {
             current_instance_id: Some(cur),
             ..
-        }) if cur == inst1
+        }) if cur == new_tok1.instance_id
     ));
-    assert!(matches!(
-        albums.update_text("NH1", stale_inst, 1, p1.id, "Bad", "Bad"),
-        Err(AlbumError::StaleNeighborhoodInstance { .. })
-    ));
-    assert!(matches!(
-        albums.move_entry("NH1", stale_inst, 1, p1.id, 0),
-        Err(AlbumError::StaleNeighborhoodInstance { .. })
-    ));
-    assert!(matches!(
-        albums.delete("NH1", stale_inst, 1, p1.id),
-        Err(AlbumError::StaleNeighborhoodInstance { .. })
-    ));
-    assert!(matches!(
-        albums.delete_family_album("NH1", stale_inst, 1),
-        Err(AlbumError::StaleNeighborhoodInstance { .. })
-    ));
-    assert_eq!(albums.list("NH1", 1).unwrap().len(), 1);
 
-    // Deleting NH1 atomically purges NH1's album while preserving NH2's album.
+    // 3. Deleting NH1 atomically purges NH1's albums while preserving NH2's album.
     assert!(store.delete_neighborhood("NH1").unwrap());
     assert!(albums.list("NH1", 1).unwrap().is_empty());
+    assert!(albums.list("NH1", 2).unwrap().is_empty());
     assert_eq!(albums.list("NH2", 1).unwrap().len(), 1);
-
-    // Writing with old inst1 after delete returns StaleNeighborhoodInstance { current: None }.
     assert!(matches!(
-        albums.add("NH1", inst1, 1, NewAlbumPhoto::blank("AfterDelete", "")),
+        albums.add("NH1", new_tok1, NewAlbumPhoto::blank("AfterDelete", "")),
         Err(AlbumError::StaleNeighborhoodInstance {
             current_instance_id: None,
             ..
         })
     ));
 
-    // Recreating NH1 mints a new instance_id; old inst1 is still fenced out.
+    // Recreating NH1 mints a new instance_id; old token is still fenced out.
     store
-        .save_neighborhood("NH1", &sample_neighborhood("NH1"))
+        .save_neighborhood("NH1", &sample_neighborhood("NH1", &[1, 5]))
         .unwrap();
-    let new_inst1 = store.load_neighborhood("NH1").unwrap().unwrap().instance_id;
-    assert_ne!(new_inst1, inst1);
+    let recreated_tok = albums.family_token("NH1", 5).unwrap().unwrap();
+    assert_ne!(recreated_tok.instance_id, new_tok1.instance_id);
     assert!(matches!(
-        albums.add("NH1", inst1, 1, NewAlbumPhoto::blank("OldInst", "")),
+        albums.add("NH1", new_tok1, NewAlbumPhoto::blank("OldInst", "")),
         Err(AlbumError::StaleNeighborhoodInstance {
             current_instance_id: Some(cur),
             ..
-        }) if cur == new_inst1
+        }) if cur == recreated_tok.instance_id
     ));
 
-    // If SIMS_INSTALL is set, verify `import_directory` also purges album rows atomically.
+    // 4. If SIMS_INSTALL is set, verify `import_directory` also purges album rows atomically.
     if let Some(root) = std::env::var_os("SIMS_INSTALL") {
         let user_data = PathBuf::from(root).join("UserData");
         albums
-            .add("NH1", new_inst1, 5, NewAlbumPhoto::blank("PreImport", ""))
+            .add("NH1", recreated_tok, NewAlbumPhoto::blank("PreImport", ""))
             .unwrap();
         assert_eq!(albums.list("NH1", 5).unwrap().len(), 1);
         store.import_directory("NH1", &user_data, 0xff).unwrap();
@@ -367,33 +502,28 @@ fn album_store_fences_instance_id_and_purges_on_delete_and_reimport() {
 }
 
 #[test]
-fn album_store_detects_checksum_version_and_key_binding_corruption() {
+fn album_store_detects_checksum_version_key_binding_and_pre_allocation_bounds() {
     let db = TempDb::new("corruption");
     let store = NeighborhoodStore::open(&db.0).unwrap();
     store
-        .save_neighborhood("UserData", &sample_neighborhood("UserData"))
+        .save_neighborhood("UserData", &sample_neighborhood("UserData", &[1, 2]))
         .unwrap();
-    let inst = store
-        .load_neighborhood("UserData")
-        .unwrap()
-        .unwrap()
-        .instance_id;
     let albums = store.albums();
+    let tok1 = albums.family_token("UserData", 1).unwrap().unwrap();
+    let tok2 = albums.family_token("UserData", 2).unwrap().unwrap();
     let p1 = albums
         .add(
             "UserData",
-            inst,
-            1,
+            tok1,
             NewAlbumPhoto::with_image("Intact", "Caption", sample_image(2, 2, 1)),
         )
         .unwrap();
     let p2 = albums
-        .add("UserData", inst, 2, NewAlbumPhoto::blank("Other", ""))
+        .add("UserData", tok2, NewAlbumPhoto::blank("Other", ""))
         .unwrap();
     drop(albums);
     drop(store);
 
-    // Tamper directly with REDB tables to test integrity verification.
     const INDEX_TABLE: redb::TableDefinition<(&str, u16), &[u8]> =
         redb::TableDefinition::new("photo_album_index");
     const PHOTO_TABLE: redb::TableDefinition<(&str, u16, u64), &[u8]> =
@@ -423,18 +553,100 @@ fn album_store_detects_checksum_version_and_key_binding_corruption() {
     drop(raw_db);
 
     let store = NeighborhoodStore::open(&db.0).unwrap();
-    let albums = store.albums();
     assert!(matches!(
-        albums.list("UserData", 2),
+        store.albums().list("UserData", 2),
         Err(AlbumError::DecodeFailed { .. })
     ));
-    drop(albums);
     drop(store);
 
-    // 2. Flip a byte in family 1's photo payload -> CorruptChecksum.
+    // 2. Correctly checksummed current-version photo claiming `1x1` dimensions
+    //    with a mismatched large pixel vector (100,000 elements) must be rejected
+    //    during deserialization before allocation!
     let raw_db = redb::Database::open(&db.0).unwrap();
     {
-        let mut flipped = raw_fam1_photo.clone();
+        #[derive(serde::Serialize)]
+        struct BadImg {
+            width: u32,
+            height: u32,
+            rgb565: Vec<u16>,
+        }
+        #[derive(serde::Serialize)]
+        struct BadPhoto {
+            neighborhood_id: String,
+            family_id: u16,
+            id: u64,
+            title: String,
+            caption: String,
+            sim_day: Option<u32>,
+            image: Option<BadImg>,
+        }
+        let body = postcard::to_allocvec(&BadPhoto {
+            neighborhood_id: "UserData".into(),
+            family_id: 2,
+            id: p2.id,
+            title: "Bomb".into(),
+            caption: String::new(),
+            sim_day: None,
+            image: Some(BadImg {
+                width: 1,
+                height: 1,
+                rgb565: vec![0u16; 100_000],
+            }),
+        })
+        .unwrap();
+        let mut h = Sha256::new();
+        h.update(b"sims-sim:album-photo:v1");
+        h.update(ALBUM_FORMAT.to_le_bytes());
+        h.update(&body);
+        let mut framed = Vec::new();
+        framed.extend_from_slice(b"ALBP");
+        framed.extend_from_slice(&ALBUM_FORMAT.to_le_bytes());
+        framed.extend_from_slice(&h.finalize());
+        framed.extend_from_slice(&body);
+        let w = raw_db.begin_write().unwrap();
+        {
+            let mut t = w.open_table(PHOTO_TABLE).unwrap();
+            t.insert(("UserData", 2, p2.id), framed.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    drop(raw_db);
+
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    assert!(matches!(
+        store.albums().get("UserData", 2, p2.id),
+        Err(AlbumError::DecodeFailed { .. })
+    ));
+    drop(store);
+
+    // 3. Oversized encoded photo blob (> MAX_ALBUM_PHOTO_ENCODED_BYTES) rejected
+    //    before hashing.
+    let raw_db = redb::Database::open(&db.0).unwrap();
+    {
+        let mut oversized = vec![0u8; MAX_ALBUM_PHOTO_ENCODED_BYTES + 1];
+        oversized[0..4].copy_from_slice(b"ALBP");
+        oversized[4..8].copy_from_slice(&ALBUM_FORMAT.to_le_bytes());
+        let w = raw_db.begin_write().unwrap();
+        {
+            let mut t = w.open_table(PHOTO_TABLE).unwrap();
+            t.insert(("UserData", 2, p2.id), oversized.as_slice())
+                .unwrap();
+        }
+        w.commit().unwrap();
+    }
+    drop(raw_db);
+
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    assert!(matches!(
+        store.albums().get("UserData", 2, p2.id),
+        Err(AlbumError::DecodeFailed { .. })
+    ));
+    drop(store);
+
+    // 4. Flip a byte in family 1's photo payload -> CorruptChecksum.
+    let raw_db = redb::Database::open(&db.0).unwrap();
+    {
+        let mut flipped = raw_fam1_photo;
         let last = flipped.len() - 1;
         flipped[last] ^= 0x01;
         let w = raw_db.begin_write().unwrap();
@@ -448,15 +660,14 @@ fn album_store_detects_checksum_version_and_key_binding_corruption() {
     drop(raw_db);
 
     let store = NeighborhoodStore::open(&db.0).unwrap();
-    let albums = store.albums();
     assert!(matches!(
-        albums.list("UserData", 1),
+        store.albums().list("UserData", 1),
         Err(AlbumError::CorruptChecksum { .. })
     ));
-    drop(albums);
     drop(store);
 
-    // 3. Future version header on index -> UnsupportedVersion.
+    // 5. Future version header on index -> UnsupportedVersion, and writes refuse
+    //    to silently overwrite it.
     let raw_db = redb::Database::open(&db.0).unwrap();
     {
         let w = raw_db.begin_write().unwrap();
@@ -476,14 +687,10 @@ fn album_store_detects_checksum_version_and_key_binding_corruption() {
     let albums = store.albums();
     assert!(matches!(
         albums.list("UserData", 1),
-        Err(AlbumError::UnsupportedVersion {
-            found,
-            ..
-        }) if found == ALBUM_FORMAT + 1
+        Err(AlbumError::UnsupportedVersion { found, .. }) if found == ALBUM_FORMAT + 1
     ));
-    // Writes also refuse to silently overwrite unsupported-version indices.
     assert!(matches!(
-        albums.add("UserData", inst, 1, NewAlbumPhoto::blank("NoClobber", "")),
+        albums.add("UserData", tok1, NewAlbumPhoto::blank("NoClobber", "")),
         Err(AlbumError::UnsupportedVersion { .. })
     ));
 }
@@ -493,25 +700,20 @@ fn album_store_concurrent_shared_handles() {
     let db = TempDb::new("concurrent");
     let store = NeighborhoodStore::open(&db.0).unwrap();
     store
-        .save_neighborhood("UserData", &sample_neighborhood("UserData"))
+        .save_neighborhood("UserData", &sample_neighborhood("UserData", &[1, 2, 3, 4]))
         .unwrap();
-    let inst = store
-        .load_neighborhood("UserData")
-        .unwrap()
-        .unwrap()
-        .instance_id;
     let albums = store.albums();
 
     std::thread::scope(|scope| {
         for fam in 1u16..=4 {
             let handle = albums.clone();
+            let tok = handle.family_token("UserData", fam).unwrap().unwrap();
             scope.spawn(move || {
                 for n in 0..8 {
                     handle
                         .add(
                             "UserData",
-                            inst,
-                            fam,
+                            tok,
                             NewAlbumPhoto::with_image(
                                 format!("F{fam} P{n}"),
                                 format!("Caption {n}"),

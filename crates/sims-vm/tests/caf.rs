@@ -1146,14 +1146,19 @@ fn atomic_caf_commit_survives_concurrent_reimport_and_purges_album() {
     )
     .unwrap();
 
-    // Seed a photo album for `created.family_id`, then delete the bin family and
-    // confirm its album is purged cleanly.
-    store
+    // Seed a photo album for `created.family_id`, capture its household token,
+    // then delete the bin family and confirm its album is purged atomically and
+    // any stale token is rejected even after a replacement family reuses ID 1!
+    let orig_token = store
+        .albums()
+        .family_token("RaceNH", created.family_id)
+        .unwrap()
+        .expect("created household must have an album family token");
+    let orig_photo = store
         .albums()
         .add(
             "RaceNH",
-            after.instance_id,
-            created.family_id,
+            orig_token,
             NewAlbumPhoto::blank("Pre-Delete", "Should be purged"),
         )
         .unwrap();
@@ -1173,6 +1178,62 @@ fn atomic_caf_commit_survives_concurrent_reimport_and_purges_album() {
             .unwrap()
             .is_empty()
     );
+    // Delayed add while the family is absent must be rejected.
+    assert!(matches!(
+        store
+            .albums()
+            .add("RaceNH", orig_token, NewAlbumPhoto::blank("Ghost", "")),
+        Err(sims_sim::AlbumError::StaleFamilyToken {
+            current_epoch: None,
+            ..
+        })
+    ));
+    // Re-create a replacement household reusing `created.family_id` and photo #1;
+    // replaying stale `update_text`/`delete` from the original household must fail!
+    let replacement =
+        commit_family_with_context(&ctx, &store, "RaceNH", &three_sims, &mut rng).unwrap();
+    assert_eq!(replacement.family_id, created.family_id);
+    let repl_token = store
+        .albums()
+        .family_token("RaceNH", replacement.family_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(repl_token.family_epoch, orig_token.family_epoch);
+    let repl_photo = store
+        .albums()
+        .add(
+            "RaceNH",
+            repl_token,
+            NewAlbumPhoto::blank("Replacement Photo", "Keep intact"),
+        )
+        .unwrap();
+    assert_eq!(repl_photo.id, orig_photo.id);
+    assert!(matches!(
+        store.albums().update_text(
+            "RaceNH",
+            orig_token,
+            orig_photo.id,
+            "Hijacked",
+            "Should fail"
+        ),
+        Err(sims_sim::AlbumError::StaleFamilyToken {
+            current_epoch: Some(cur),
+            ..
+        }) if cur == repl_token.family_epoch
+    ));
+    assert!(matches!(
+        store.albums().delete("RaceNH", orig_token, orig_photo.id),
+        Err(sims_sim::AlbumError::StaleFamilyToken { .. })
+    ));
+    assert_eq!(
+        store
+            .albums()
+            .list("RaceNH", replacement.family_id)
+            .unwrap()[0]
+            .title,
+        "Replacement Photo"
+    );
+    delete_bin_family(&store, "RaceNH", replacement.family_id).unwrap();
 
     // 2. Race CAF commits and FAM imports against concurrent neighborhood
     //    replacements (using real `import_directory` if `SIMS_INSTALL` is set,

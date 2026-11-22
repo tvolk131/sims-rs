@@ -3,30 +3,40 @@
 //! Stores per-`(neighborhood_id, family_id)` photo album entries inside the
 //! same REDB database file as [`crate::NeighborhoodStore`] (via
 //! [`crate::NeighborhoodStore::albums`]), matching `sims-ui::album`'s view
-//! model and commands (`add`, `update_text`, `move_entry`, `delete`, `list`).
+//! model and commands (`add`, `update_text`, `move_entry`, `delete`, `list`,
+//! plus metadata-only [`PhotoAlbumStore::list_summaries`] and paged
+//! [`PhotoAlbumStore::list_page`]).
 //!
-//! ## Integrity, Ordering & Lifetime Guarantees
+//! ## Integrity, Ordering, Bounds & Lifetime Guarantees
 //! - Every index row (`photo_album_index`) and photo row (`photo_album_photos`)
 //!   is framed with a 4-byte magic (`"ALBI"` / `"ALBP"`), 4-byte little-endian
 //!   format version (`ALBUM_FORMAT = 1`), 32-byte domain-separated SHA-256
 //!   checksum, strict exact-length `postcard` body decoding, and key-binding
 //!   verification (`neighborhood_id`, `family_id`, and `photo_id`).
-//! - Photo IDs are strictly monotonic (`>= 1`) per `(neighborhood_id, family_id)`
-//!   and are never reused after deletion.
+//! - Encoded record-size ceilings are enforced **before** hashing or decoding,
+//!   and string/vector lengths (including RGB565 pixel counts against declared
+//!   `width × height`) are bounded **during** deserialization before allocation.
+//! - Photo IDs are strictly monotonic (`>= 1`) per household lifetime and are
+//!   never reused after deletion.
 //! - Ordering is stored explicitly in the per-family index row (`order: Vec<u64>`),
 //!   making [`PhotoAlbumStore::move_entry`] atomic and lightweight without
-//!   rewriting photo bitmaps, while [`PhotoAlbumStore::list`] reads the index
-//!   and every referenced photo in one consistent MVCC read transaction.
-//! - All text lengths, image dimensions, pixel counts, and per-household entry
-//!   counts are strictly bounded on both write and read.
-//! - Every mutating operation enforces `expected_instance_id` neighborhood
-//!   lifetime fencing inside its REDB write transaction against
-//!   `NEIGHBORHOODS[neighborhood_id]`, aborting cleanly with
-//!   [`AlbumError::StaleNeighborhoodInstance`] after a neighborhood delete or
-//!   re-import.
+//!   rewriting photo bitmaps, while [`PhotoAlbumStore::list`],
+//!   [`PhotoAlbumStore::list_summaries`], and [`PhotoAlbumStore::list_page`]
+//!   execute in one consistent MVCC read transaction. Bulk pixel reads enforce
+//!   [`MAX_BULK_ALBUM_PIXEL_BYTES`] so valid full albums cannot exhaust memory.
+//! - Every mutating operation requires an [`AlbumFamilyToken`] obtained via
+//!   [`PhotoAlbumStore::family_token`], verified inside the REDB write
+//!   transaction against both `NEIGHBORHOODS[neighborhood_id].instance_id`,
+//!   live membership in `StoredNeighborhood::families`, and the per-family
+//!   monotonic `photo_album_family_epoch` counter (bumped atomically whenever
+//!   a household is removed from `StoredNeighborhood::families` in any
+//!   neighborhood save). Deleting or replacing a household immediately
+//!   invalidates all stale tokens even if a replacement household later reuses
+//!   the same `family_id` and photo ID `1`.
 //! - [`crate::NeighborhoodStore::delete_neighborhood`] and
 //!   [`crate::NeighborhoodStore::import_directory`] atomically purge all album
-//!   rows for that neighborhood inside their write transaction.
+//!   indices, photos, and family-epoch rows for that neighborhood inside their
+//!   write transaction.
 
 use crate::Error;
 use crate::migration::decode_postcard_exact;
@@ -54,6 +64,9 @@ const PHOTO_HASH_DOMAIN: &[u8] = b"sims-sim:album-photo:v1";
 /// 32-byte SHA-256 checksum.
 const HEADER_LEN: usize = 4 + 4 + 32;
 
+/// Maximum UTF-8 byte length accepted for a neighborhood ID in album records.
+const MAX_NEIGHBORHOOD_ID_BYTES: usize = 1024;
+
 /// Earliest supported photo album record format version.
 pub const ALBUM_MIN_FORMAT: u32 = 1;
 
@@ -75,6 +88,21 @@ pub const MAX_ALBUM_PHOTO_PIXELS: usize = 1024 * 768;
 /// Maximum number of entries retained in one `(neighborhood_id, family_id)` album.
 pub const MAX_ALBUM_ENTRIES: usize = 256;
 
+/// Aggregate decoded RGB565 pixel-buffer memory budget enforced by bulk album
+/// reads (`list` / `list_page`, 32 MiB). Callers with larger albums should use
+/// [`PhotoAlbumStore::list_summaries`] paired with [`PhotoAlbumStore::list_page`]
+/// or [`PhotoAlbumStore::get`].
+pub const MAX_BULK_ALBUM_PIXEL_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum encoded byte length accepted for an `ALBUM_INDEX` row before hashing
+/// or deserializing (header + neighborhood_id + up to 256 varint u64 IDs + slack).
+pub const MAX_ALBUM_INDEX_ENCODED_BYTES: usize = 16 * 1024;
+
+/// Maximum encoded byte length accepted for an `ALBUM_PHOTOS` row before
+/// hashing or deserializing (header + text/metadata + up to `MAX_ALBUM_PHOTO_PIXELS`
+/// varint-encoded `u16`s at <= 3 bytes each).
+pub const MAX_ALBUM_PHOTO_ENCODED_BYTES: usize = HEADER_LEN + 8 * 1024 + 3 * MAX_ALBUM_PHOTO_PIXELS;
+
 /// Per-household album index (`next_photo_id` + ordered `photo_id` list) keyed
 /// by `(neighborhood_id, family_id)`.
 const ALBUM_INDEX: TableDefinition<(&str, u16), &[u8]> = TableDefinition::new("photo_album_index");
@@ -83,13 +111,144 @@ const ALBUM_INDEX: TableDefinition<(&str, u16), &[u8]> = TableDefinition::new("p
 const ALBUM_PHOTOS: TableDefinition<(&str, u16, u64), &[u8]> =
     TableDefinition::new("photo_album_photos");
 
+/// Monotonic per-`(neighborhood_id, family_id)` household lifetime epoch
+/// (defaults to `1`, incremented atomically whenever `family_id` is removed
+/// from `StoredNeighborhood::families`) so stale album mutations cannot target
+/// a replacement household reusing the same `family_id`.
+const ALBUM_FAMILY_EPOCH: TableDefinition<(&str, u16), u64> =
+    TableDefinition::new("photo_album_family_epoch");
+
+/// Initial household lifetime epoch assigned when no prior deletions have
+/// occurred for `(neighborhood_id, family_id)`.
+const INITIAL_FAMILY_EPOCH: u64 = 1;
+
+/// Transactional lifetime token binding a household photo album mutation to
+/// both the current neighborhood instance (`instance_id`) and the current
+/// household lifetime (`family_id`, `family_epoch`).
+///
+/// Obtained via [`PhotoAlbumStore::family_token`]. Deleting or re-importing the
+/// neighborhood, or deleting the family from `StoredNeighborhood::families`,
+/// atomically invalidates every previously issued token for that household even
+/// if a new household later reuses the same `family_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AlbumFamilyToken {
+    pub instance_id: u128,
+    pub family_id: u16,
+    pub family_epoch: u64,
+}
+
 /// Bounded 16-bit RGB565 photo bitmap stored inside an [`AlbumPhoto`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AlbumImage {
     pub width: u32,
     pub height: u32,
     /// Row-major top-down 16-bit RGB565 pixels (`len == width * height`).
     pub rgb565: Vec<u16>,
+}
+
+struct ExactU16VecSeed {
+    expected: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ExactU16VecSeed {
+    type Value = Vec<u16>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        struct ExactU16VecVisitor {
+            expected: usize,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for ExactU16VecVisitor {
+            type Value = Vec<u16>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    "a sequence of exactly {} RGB565 u16 pixels",
+                    self.expected
+                )
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                if let Some(hint) = seq.size_hint()
+                    && hint != self.expected
+                {
+                    return Err(serde::de::Error::custom(format!(
+                        "photo rgb565 pixel count {hint} does not match expected {}",
+                        self.expected
+                    )));
+                }
+                let mut out = Vec::with_capacity(self.expected);
+                for i in 0..self.expected {
+                    let Some(px) = seq.next_element::<u16>()? else {
+                        return Err(serde::de::Error::invalid_length(i, &self));
+                    };
+                    out.push(px);
+                }
+                if seq.next_element::<u16>()?.is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "photo rgb565 pixel count exceeds expected {}",
+                        self.expected
+                    )));
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_seq(ExactU16VecVisitor {
+            expected: self.expected,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AlbumImage {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct AlbumImageVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for AlbumImageVisitor {
+            type Value = AlbumImage;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("AlbumImage { width, height, rgb565 }")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let width: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let height: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let expected =
+                    checked_photo_pixel_count(width, height).map_err(serde::de::Error::custom)?;
+                let rgb565 = seq
+                    .next_element_seed(ExactU16VecSeed { expected })?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                Ok(AlbumImage {
+                    width,
+                    height,
+                    rgb565,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "AlbumImage",
+            &["width", "height", "rgb565"],
+            AlbumImageVisitor,
+        )
+    }
 }
 
 impl AlbumImage {
@@ -142,6 +301,12 @@ impl AlbumImage {
             out.extend_from_slice(&[r, g, b, 255]);
         }
         out
+    }
+
+    /// Size of the decoded RGB565 pixel buffer in bytes (`rgb565.len() * 2`).
+    #[must_use]
+    pub fn pixel_bytes(&self) -> usize {
+        self.rgb565.len().saturating_mul(2)
     }
 
     /// Validates non-zero bounded dimensions and exact `rgb565` pixel count.
@@ -257,6 +422,17 @@ pub struct AlbumPhoto {
     pub image: Option<AlbumImage>,
 }
 
+/// Lightweight metadata-only view of one photo album entry returned by
+/// [`PhotoAlbumStore::list_summaries`] without retaining pixel buffers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumPhotoSummary {
+    pub id: u64,
+    pub title: String,
+    pub caption: String,
+    pub sim_day: Option<u32>,
+    pub image_dimensions: Option<(u32, u32)>,
+}
+
 /// Typed errors returned by [`PhotoAlbumStore`] operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlbumError {
@@ -283,6 +459,22 @@ pub enum AlbumError {
         neighborhood_id: String,
         expected_instance_id: u128,
         current_instance_id: Option<u128>,
+    },
+    /// Household was deleted or replaced by a new household reusing `family_id`
+    /// before the write transaction committed.
+    StaleFamilyToken {
+        neighborhood_id: String,
+        family_id: u16,
+        expected_epoch: u64,
+        current_epoch: Option<u64>,
+    },
+    /// A bulk pixel read exceeded [`MAX_BULK_ALBUM_PIXEL_BYTES`]; callers should
+    /// use [`PhotoAlbumStore::list_summaries`] + [`PhotoAlbumStore::list_page`]
+    /// or [`PhotoAlbumStore::get`].
+    BudgetExceeded {
+        record: String,
+        limit_bytes: usize,
+        required_bytes: usize,
     },
     /// Outer SHA-256 verification failed on an album index or photo record.
     CorruptChecksum {
@@ -348,6 +540,35 @@ impl fmt::Display for AlbumError {
                 "stale neighborhood instance for {neighborhood_id:?}: expected \
                  {expected_instance_id:#034x}, neighborhood no longer exists"
             ),
+            Self::StaleFamilyToken {
+                neighborhood_id,
+                family_id,
+                expected_epoch,
+                current_epoch: Some(current),
+            } => write!(
+                f,
+                "stale household token for neighborhood {neighborhood_id:?} family {family_id}: \
+                 expected epoch {expected_epoch}, current epoch {current}"
+            ),
+            Self::StaleFamilyToken {
+                neighborhood_id,
+                family_id,
+                expected_epoch,
+                current_epoch: None,
+            } => write!(
+                f,
+                "stale household token for neighborhood {neighborhood_id:?} family {family_id}: \
+                 expected epoch {expected_epoch}, household no longer exists"
+            ),
+            Self::BudgetExceeded {
+                record,
+                limit_bytes,
+                required_bytes,
+            } => write!(
+                f,
+                "{record}: bulk album read requires at least {required_bytes} pixel bytes, \
+                 exceeding limit {limit_bytes}; use list_summaries + list_page/get"
+            ),
             Self::CorruptChecksum { record, .. } => {
                 write!(f, "{record}: corrupt photo album checksum")
             }
@@ -380,20 +601,146 @@ impl From<AlbumError> for Error {
     }
 }
 
+fn deserialize_bounded_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    field: &'static str,
+    max_bytes: usize,
+    max_chars: Option<usize>,
+) -> std::result::Result<String, D::Error> {
+    struct BoundedStringVisitor {
+        field: &'static str,
+        max_bytes: usize,
+        max_chars: Option<usize>,
+    }
+
+    impl<'de> serde::de::Visitor<'de> for BoundedStringVisitor {
+        type Value = String;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "a bounded UTF-8 string for {}", self.field)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<String, E> {
+            if v.len() > self.max_bytes {
+                return Err(E::custom(format!(
+                    "{} byte length {} exceeds maximum {}",
+                    self.field,
+                    v.len(),
+                    self.max_bytes
+                )));
+            }
+            if let Some(limit) = self.max_chars {
+                let chars = v.chars().count();
+                if chars > limit {
+                    return Err(E::custom(format!(
+                        "{} character length {chars} exceeds maximum {limit}",
+                        self.field
+                    )));
+                }
+            }
+            Ok(v.to_owned())
+        }
+    }
+
+    deserializer.deserialize_str(BoundedStringVisitor {
+        field,
+        max_bytes,
+        max_chars,
+    })
+}
+
+fn deserialize_neighborhood_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    deserialize_bounded_string(
+        deserializer,
+        "neighborhood_id",
+        MAX_NEIGHBORHOOD_ID_BYTES,
+        None,
+    )
+}
+
+fn deserialize_title<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    deserialize_bounded_string(
+        deserializer,
+        "title",
+        MAX_ALBUM_TITLE_CHARS * 4,
+        Some(MAX_ALBUM_TITLE_CHARS),
+    )
+}
+
+fn deserialize_caption<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    deserialize_bounded_string(
+        deserializer,
+        "caption",
+        MAX_ALBUM_CAPTION_CHARS * 4,
+        Some(MAX_ALBUM_CAPTION_CHARS),
+    )
+}
+
+fn deserialize_bounded_order<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<u64>, D::Error> {
+    struct OrderVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OrderVisitor {
+        type Value = Vec<u64>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "at most {MAX_ALBUM_ENTRIES} photo IDs")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            if let Some(hint) = seq.size_hint()
+                && hint > MAX_ALBUM_ENTRIES
+            {
+                return Err(serde::de::Error::custom(format!(
+                    "index entry count {hint} exceeds maximum {MAX_ALBUM_ENTRIES}"
+                )));
+            }
+            let cap = seq.size_hint().map_or(0, |h| h.min(MAX_ALBUM_ENTRIES));
+            let mut out = Vec::with_capacity(cap);
+            while let Some(id) = seq.next_element::<u64>()? {
+                if out.len() >= MAX_ALBUM_ENTRIES {
+                    return Err(serde::de::Error::custom(format!(
+                        "index entry count exceeds maximum {MAX_ALBUM_ENTRIES}"
+                    )));
+                }
+                out.push(id);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(OrderVisitor)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AlbumIndexV1 {
+    #[serde(deserialize_with = "deserialize_neighborhood_id")]
     neighborhood_id: String,
     family_id: u16,
     next_photo_id: u64,
+    #[serde(deserialize_with = "deserialize_bounded_order")]
     order: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AlbumPhotoV1 {
+    #[serde(deserialize_with = "deserialize_neighborhood_id")]
     neighborhood_id: String,
     family_id: u16,
     id: u64,
+    #[serde(deserialize_with = "deserialize_title")]
     title: String,
+    #[serde(deserialize_with = "deserialize_caption")]
     caption: String,
     sim_day: Option<u32>,
     image: Option<AlbumImage>,
@@ -414,14 +761,21 @@ fn encode_framed<T: Serialize>(
     record: &str,
     magic: [u8; 4],
     domain: &[u8],
+    max_encoded_bytes: usize,
     value: &T,
 ) -> std::result::Result<Vec<u8>, AlbumError> {
     let body = postcard::to_allocvec(value).map_err(|error| AlbumError::DecodeFailed {
         record: record.to_owned(),
         detail: format!("failed to encode record: {error}"),
     })?;
+    let total_len = HEADER_LEN.saturating_add(body.len());
+    if total_len > max_encoded_bytes {
+        return Err(AlbumError::InvalidInput(format!(
+            "{record}: encoded record size {total_len} exceeds maximum {max_encoded_bytes}"
+        )));
+    }
     let checksum = record_checksum(domain, ALBUM_FORMAT, &body);
-    let mut out = Vec::with_capacity(HEADER_LEN + body.len());
+    let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&magic);
     out.extend_from_slice(&ALBUM_FORMAT.to_le_bytes());
     out.extend_from_slice(&checksum);
@@ -433,6 +787,7 @@ fn decode_framed<'a, T: Deserialize<'a>>(
     record: &str,
     magic: [u8; 4],
     domain: &[u8],
+    max_encoded_bytes: usize,
     bytes: &'a [u8],
 ) -> std::result::Result<T, AlbumError> {
     if bytes.len() < 8 {
@@ -454,6 +809,15 @@ fn decode_framed<'a, T: Deserialize<'a>>(
             found: version,
             min_supported: ALBUM_MIN_FORMAT,
             max_supported: ALBUM_FORMAT,
+        });
+    }
+    if bytes.len() > max_encoded_bytes {
+        return Err(AlbumError::DecodeFailed {
+            record: record.to_owned(),
+            detail: format!(
+                "encoded record size {} exceeds maximum {max_encoded_bytes}",
+                bytes.len()
+            ),
         });
     }
     if bytes.len() < HEADER_LEN {
@@ -487,7 +851,13 @@ fn decode_index(
     bytes: &[u8],
 ) -> std::result::Result<AlbumIndexV1, AlbumError> {
     let record = format!("{neighborhood_id}:family{family_id}:album-index");
-    let index: AlbumIndexV1 = decode_framed(&record, INDEX_MAGIC, INDEX_HASH_DOMAIN, bytes)?;
+    let index: AlbumIndexV1 = decode_framed(
+        &record,
+        INDEX_MAGIC,
+        INDEX_HASH_DOMAIN,
+        MAX_ALBUM_INDEX_ENCODED_BYTES,
+        bytes,
+    )?;
     if index.neighborhood_id != neighborhood_id || index.family_id != family_id {
         return Err(AlbumError::DecodeFailed {
             record,
@@ -540,7 +910,13 @@ fn decode_photo(
     bytes: &[u8],
 ) -> std::result::Result<AlbumPhotoV1, AlbumError> {
     let record = format!("{neighborhood_id}:family{family_id}:photo#{photo_id}");
-    let photo: AlbumPhotoV1 = decode_framed(&record, PHOTO_MAGIC, PHOTO_HASH_DOMAIN, bytes)?;
+    let photo: AlbumPhotoV1 = decode_framed(
+        &record,
+        PHOTO_MAGIC,
+        PHOTO_HASH_DOMAIN,
+        MAX_ALBUM_PHOTO_ENCODED_BYTES,
+        bytes,
+    )?;
     if photo.neighborhood_id != neighborhood_id
         || photo.family_id != family_id
         || photo.id != photo_id
@@ -559,16 +935,6 @@ fn decode_photo(
             ),
         });
     }
-    validate_text(&photo.title, &photo.caption).map_err(|error| AlbumError::DecodeFailed {
-        record: record.clone(),
-        detail: error.to_string(),
-    })?;
-    if let Some(image) = &photo.image {
-        image.validate().map_err(|error| AlbumError::DecodeFailed {
-            record,
-            detail: error.to_string(),
-        })?;
-    }
     Ok(photo)
 }
 
@@ -584,11 +950,29 @@ impl From<AlbumPhotoV1> for AlbumPhoto {
     }
 }
 
+impl From<AlbumPhotoV1> for AlbumPhotoSummary {
+    fn from(value: AlbumPhotoV1) -> Self {
+        Self {
+            id: value.id,
+            title: value.title,
+            caption: value.caption,
+            sim_day: value.sim_day,
+            image_dimensions: value.image.map(|img| (img.width, img.height)),
+        }
+    }
+}
+
 fn validate_neighborhood_id(neighborhood_id: &str) -> std::result::Result<(), AlbumError> {
     if neighborhood_id.is_empty() {
         return Err(AlbumError::InvalidInput(
             "neighborhood_id must not be empty".into(),
         ));
+    }
+    if neighborhood_id.len() > MAX_NEIGHBORHOOD_ID_BYTES {
+        return Err(AlbumError::InvalidInput(format!(
+            "neighborhood_id byte length {} exceeds maximum {MAX_NEIGHBORHOOD_ID_BYTES}",
+            neighborhood_id.len()
+        )));
     }
     Ok(())
 }
@@ -602,10 +986,16 @@ fn validate_family_id(family_id: u16) -> std::result::Result<(), AlbumError> {
     Ok(())
 }
 
-fn validate_instance_id(expected_instance_id: u128) -> std::result::Result<(), AlbumError> {
-    if expected_instance_id == 0 {
+fn validate_family_token(token: AlbumFamilyToken) -> std::result::Result<(), AlbumError> {
+    if token.instance_id == 0 {
         return Err(AlbumError::InvalidInput(
-            "expected_instance_id must be non-zero".into(),
+            "token.instance_id must be non-zero".into(),
+        ));
+    }
+    validate_family_id(token.family_id)?;
+    if token.family_epoch == 0 {
+        return Err(AlbumError::InvalidInput(
+            "token.family_epoch must be non-zero".into(),
         ));
     }
     Ok(())
@@ -631,16 +1021,16 @@ fn store_err(error: impl fmt::Display) -> AlbumError {
     AlbumError::Store(error.to_string())
 }
 
-fn verify_neighborhood_instance_in_txn(
+fn verify_family_token_in_txn(
     txn: &redb::WriteTransaction,
     neighborhood_id: &str,
-    expected_instance_id: u128,
+    token: AlbumFamilyToken,
 ) -> std::result::Result<(), AlbumError> {
     let nh_table = txn.open_table(NEIGHBORHOODS_TABLE).map_err(store_err)?;
     let Some(raw) = nh_table.get(neighborhood_id).map_err(store_err)? else {
         return Err(AlbumError::StaleNeighborhoodInstance {
             neighborhood_id: neighborhood_id.to_owned(),
-            expected_instance_id,
+            expected_instance_id: token.instance_id,
             current_instance_id: None,
         });
     };
@@ -649,11 +1039,32 @@ fn verify_neighborhood_instance_in_txn(
             "cannot verify neighborhood {neighborhood_id:?} instance: {error}"
         ))
     })?;
-    if nh.instance_id != expected_instance_id {
+    if nh.instance_id != token.instance_id {
         return Err(AlbumError::StaleNeighborhoodInstance {
             neighborhood_id: neighborhood_id.to_owned(),
-            expected_instance_id,
+            expected_instance_id: token.instance_id,
             current_instance_id: Some(nh.instance_id),
+        });
+    }
+    if !nh.families.contains_key(&token.family_id) {
+        return Err(AlbumError::StaleFamilyToken {
+            neighborhood_id: neighborhood_id.to_owned(),
+            family_id: token.family_id,
+            expected_epoch: token.family_epoch,
+            current_epoch: None,
+        });
+    }
+    let epoch_table = txn.open_table(ALBUM_FAMILY_EPOCH).map_err(store_err)?;
+    let current_epoch = epoch_table
+        .get((neighborhood_id, token.family_id))
+        .map_err(store_err)?
+        .map_or(INITIAL_FAMILY_EPOCH, |v| v.value());
+    if current_epoch != token.family_epoch {
+        return Err(AlbumError::StaleFamilyToken {
+            neighborhood_id: neighborhood_id.to_owned(),
+            family_id: token.family_id,
+            expected_epoch: token.family_epoch,
+            current_epoch: Some(current_epoch),
         });
     }
     Ok(())
@@ -662,8 +1073,9 @@ fn verify_neighborhood_instance_in_txn(
 /// REDB-backed household photo album store sharing a [`crate::NeighborhoodStore`]'s
 /// `Arc<Database>` handle.
 ///
-/// `PhotoAlbumStore` is `Clone + Send + Sync` and enforces `expected_instance_id`
-/// lifetime fencing inside every mutating write transaction.
+/// `PhotoAlbumStore` is `Clone + Send + Sync` and enforces [`AlbumFamilyToken`]
+/// neighborhood + household lifetime fencing inside every mutating write
+/// transaction.
 #[derive(Clone)]
 pub struct PhotoAlbumStore {
     db: Arc<Database>,
@@ -680,28 +1092,73 @@ impl PhotoAlbumStore {
         Self { db }
     }
 
-    /// Appends a new photo or blank storybook page to `(neighborhood_id, family_id)`,
-    /// assigning a strictly monotonic `photo_id >= 1`, enforcing [`MAX_ALBUM_ENTRIES`],
-    /// and fencing the write transaction against `expected_instance_id`.
+    /// Reads the authoritative [`AlbumFamilyToken`] for `(neighborhood_id, family_id)`
+    /// inside a single MVCC read transaction.
+    ///
+    /// Returns `Ok(None)` if `neighborhood_id` does not exist or `family_id` is
+    /// not currently a member of `StoredNeighborhood::families`.
+    pub fn family_token(
+        &self,
+        neighborhood_id: &str,
+        family_id: u16,
+    ) -> std::result::Result<Option<AlbumFamilyToken>, AlbumError> {
+        validate_neighborhood_id(neighborhood_id)?;
+        validate_family_id(family_id)?;
+
+        let txn = self.db.begin_read().map_err(store_err)?;
+        let nh_table = match txn.open_table(NEIGHBORHOODS_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(store_err(error)),
+        };
+        let Some(raw) = nh_table.get(neighborhood_id).map_err(store_err)? else {
+            return Ok(None);
+        };
+        let nh = StoredNeighborhood::decode(neighborhood_id, raw.value()).map_err(|error| {
+            AlbumError::Store(format!(
+                "cannot decode neighborhood {neighborhood_id:?}: {error}"
+            ))
+        })?;
+        if !nh.families.contains_key(&family_id) {
+            return Ok(None);
+        }
+        let family_epoch = match txn.open_table(ALBUM_FAMILY_EPOCH) {
+            Ok(table) => table
+                .get((neighborhood_id, family_id))
+                .map_err(store_err)?
+                .map_or(INITIAL_FAMILY_EPOCH, |v| v.value()),
+            Err(redb::TableError::TableDoesNotExist(_)) => INITIAL_FAMILY_EPOCH,
+            Err(error) => return Err(store_err(error)),
+        };
+        Ok(Some(AlbumFamilyToken {
+            instance_id: nh.instance_id,
+            family_id,
+            family_epoch,
+        }))
+    }
+
+    /// Appends a new photo or blank storybook page to `token.family_id` in
+    /// `neighborhood_id`, assigning a strictly monotonic `photo_id >= 1`,
+    /// enforcing [`MAX_ALBUM_ENTRIES`], and fencing the write transaction
+    /// against `token`.
     pub fn add(
         &self,
         neighborhood_id: &str,
-        expected_instance_id: u128,
-        family_id: u16,
+        token: AlbumFamilyToken,
         entry: NewAlbumPhoto,
     ) -> std::result::Result<AlbumPhoto, AlbumError> {
         validate_neighborhood_id(neighborhood_id)?;
-        validate_instance_id(expected_instance_id)?;
-        validate_family_id(family_id)?;
+        validate_family_token(token)?;
         validate_text(&entry.title, &entry.caption)?;
         if let Some(image) = &entry.image {
             image.validate()?;
         }
+        let family_id = token.family_id;
 
         let txn = self.db.begin_write().map_err(store_err)?;
         let assigned_id;
         {
-            verify_neighborhood_instance_in_txn(&txn, neighborhood_id, expected_instance_id)?;
+            verify_family_token_in_txn(&txn, neighborhood_id, token)?;
             let mut index_table = txn.open_table(ALBUM_INDEX).map_err(store_err)?;
             let mut photo_table = txn.open_table(ALBUM_PHOTOS).map_err(store_err)?;
 
@@ -756,13 +1213,24 @@ impl PhotoAlbumStore {
                 image: entry.image.clone(),
             };
             let photo_name = format!("{neighborhood_id}:family{family_id}:photo#{next_id}");
-            let encoded_photo =
-                encode_framed(&photo_name, PHOTO_MAGIC, PHOTO_HASH_DOMAIN, &photo_record)?;
+            let encoded_photo = encode_framed(
+                &photo_name,
+                PHOTO_MAGIC,
+                PHOTO_HASH_DOMAIN,
+                MAX_ALBUM_PHOTO_ENCODED_BYTES,
+                &photo_record,
+            )?;
 
             index.next_photo_id = next_id;
             index.order.push(next_id);
             let index_name = format!("{neighborhood_id}:family{family_id}:album-index");
-            let encoded_index = encode_framed(&index_name, INDEX_MAGIC, INDEX_HASH_DOMAIN, &index)?;
+            let encoded_index = encode_framed(
+                &index_name,
+                INDEX_MAGIC,
+                INDEX_HASH_DOMAIN,
+                MAX_ALBUM_INDEX_ENCODED_BYTES,
+                &index,
+            )?;
 
             photo_table
                 .insert(
@@ -785,29 +1253,28 @@ impl PhotoAlbumStore {
         })
     }
 
-    /// Updates the title and caption of an existing photo in
-    /// `(neighborhood_id, family_id)` atomically, fenced by `expected_instance_id`.
+    /// Updates the title and caption of an existing photo in `token.family_id`
+    /// atomically, fenced by `token`.
     pub fn update_text(
         &self,
         neighborhood_id: &str,
-        expected_instance_id: u128,
-        family_id: u16,
+        token: AlbumFamilyToken,
         photo_id: u64,
         title: &str,
         caption: &str,
     ) -> std::result::Result<AlbumPhoto, AlbumError> {
         validate_neighborhood_id(neighborhood_id)?;
-        validate_instance_id(expected_instance_id)?;
-        validate_family_id(family_id)?;
+        validate_family_token(token)?;
         if photo_id == 0 {
             return Err(AlbumError::InvalidInput("photo_id must be non-zero".into()));
         }
         validate_text(title, caption)?;
+        let family_id = token.family_id;
 
         let txn = self.db.begin_write().map_err(store_err)?;
         let updated: AlbumPhotoV1;
         {
-            verify_neighborhood_instance_in_txn(&txn, neighborhood_id, expected_instance_id)?;
+            verify_family_token_in_txn(&txn, neighborhood_id, token)?;
             let index_table = txn.open_table(ALBUM_INDEX).map_err(store_err)?;
             let Some(raw_index) = index_table
                 .get((neighborhood_id, family_id))
@@ -829,22 +1296,30 @@ impl PhotoAlbumStore {
             }
 
             let mut photo_table = txn.open_table(ALBUM_PHOTOS).map_err(store_err)?;
-            let mut photo = match photo_table
-                .get((neighborhood_id, family_id, photo_id))
-                .map_err(store_err)?
-            {
-                Some(raw) => decode_photo(neighborhood_id, family_id, photo_id, raw.value())?,
-                None => {
-                    return Err(AlbumError::DecodeFailed {
-                        record: format!("{neighborhood_id}:family{family_id}:photo#{photo_id}"),
-                        detail: "photo referenced by album index is missing".into(),
-                    });
+            let mut photo = {
+                match photo_table
+                    .get((neighborhood_id, family_id, photo_id))
+                    .map_err(store_err)?
+                {
+                    Some(raw) => decode_photo(neighborhood_id, family_id, photo_id, raw.value())?,
+                    None => {
+                        return Err(AlbumError::DecodeFailed {
+                            record: format!("{neighborhood_id}:family{family_id}:photo#{photo_id}"),
+                            detail: "photo referenced by album index is missing".into(),
+                        });
+                    }
                 }
             };
             photo.title = title.to_owned();
             photo.caption = caption.to_owned();
             let photo_name = format!("{neighborhood_id}:family{family_id}:photo#{photo_id}");
-            let encoded = encode_framed(&photo_name, PHOTO_MAGIC, PHOTO_HASH_DOMAIN, &photo)?;
+            let encoded = encode_framed(
+                &photo_name,
+                PHOTO_MAGIC,
+                PHOTO_HASH_DOMAIN,
+                MAX_ALBUM_PHOTO_ENCODED_BYTES,
+                &photo,
+            )?;
             photo_table
                 .insert((neighborhood_id, family_id, photo_id), encoded.as_slice())
                 .map_err(store_err)?;
@@ -855,27 +1330,26 @@ impl PhotoAlbumStore {
     }
 
     /// Reorders `photo_id` to zero-based `new_index` (`0..entries.len()`)
-    /// inside `(neighborhood_id, family_id)` atomically, fenced by
-    /// `expected_instance_id`. Returns the new deterministic photo ID order.
+    /// inside `token.family_id` atomically, fenced by `token`. Returns the new
+    /// deterministic photo ID order.
     pub fn move_entry(
         &self,
         neighborhood_id: &str,
-        expected_instance_id: u128,
-        family_id: u16,
+        token: AlbumFamilyToken,
         photo_id: u64,
         new_index: usize,
     ) -> std::result::Result<Vec<u64>, AlbumError> {
         validate_neighborhood_id(neighborhood_id)?;
-        validate_instance_id(expected_instance_id)?;
-        validate_family_id(family_id)?;
+        validate_family_token(token)?;
         if photo_id == 0 {
             return Err(AlbumError::InvalidInput("photo_id must be non-zero".into()));
         }
+        let family_id = token.family_id;
 
         let txn = self.db.begin_write().map_err(store_err)?;
         let new_order;
         {
-            verify_neighborhood_instance_in_txn(&txn, neighborhood_id, expected_instance_id)?;
+            verify_family_token_in_txn(&txn, neighborhood_id, token)?;
             let mut index_table = txn.open_table(ALBUM_INDEX).map_err(store_err)?;
             let mut index = {
                 let Some(raw_index) = index_table
@@ -907,7 +1381,13 @@ impl PhotoAlbumStore {
                 let moved = index.order.remove(old_pos);
                 index.order.insert(new_index, moved);
                 let index_name = format!("{neighborhood_id}:family{family_id}:album-index");
-                let encoded = encode_framed(&index_name, INDEX_MAGIC, INDEX_HASH_DOMAIN, &index)?;
+                let encoded = encode_framed(
+                    &index_name,
+                    INDEX_MAGIC,
+                    INDEX_HASH_DOMAIN,
+                    MAX_ALBUM_INDEX_ENCODED_BYTES,
+                    &index,
+                )?;
                 index_table
                     .insert((neighborhood_id, family_id), encoded.as_slice())
                     .map_err(store_err)?;
@@ -918,28 +1398,26 @@ impl PhotoAlbumStore {
         Ok(new_order)
     }
 
-    /// Deletes a single photo entry from `(neighborhood_id, family_id)`
-    /// atomically, fenced by `expected_instance_id`, while preserving
-    /// `next_photo_id` so deleted IDs are never reused. Returns `true` if the
-    /// photo existed.
+    /// Deletes a single photo entry from `token.family_id` atomically, fenced
+    /// by `token`, while preserving `next_photo_id` so deleted IDs are never
+    /// reused. Returns `true` if the photo existed.
     pub fn delete(
         &self,
         neighborhood_id: &str,
-        expected_instance_id: u128,
-        family_id: u16,
+        token: AlbumFamilyToken,
         photo_id: u64,
     ) -> std::result::Result<bool, AlbumError> {
         validate_neighborhood_id(neighborhood_id)?;
-        validate_instance_id(expected_instance_id)?;
-        validate_family_id(family_id)?;
+        validate_family_token(token)?;
         if photo_id == 0 {
             return Err(AlbumError::InvalidInput("photo_id must be non-zero".into()));
         }
+        let family_id = token.family_id;
 
         let txn = self.db.begin_write().map_err(store_err)?;
         let existed;
         {
-            verify_neighborhood_instance_in_txn(&txn, neighborhood_id, expected_instance_id)?;
+            verify_family_token_in_txn(&txn, neighborhood_id, token)?;
             let mut index_table = txn.open_table(ALBUM_INDEX).map_err(store_err)?;
             let mut index = {
                 let Some(raw_index) = index_table
@@ -955,7 +1433,13 @@ impl PhotoAlbumStore {
             };
             index.order.remove(pos);
             let index_name = format!("{neighborhood_id}:family{family_id}:album-index");
-            let encoded = encode_framed(&index_name, INDEX_MAGIC, INDEX_HASH_DOMAIN, &index)?;
+            let encoded = encode_framed(
+                &index_name,
+                INDEX_MAGIC,
+                INDEX_HASH_DOMAIN,
+                MAX_ALBUM_INDEX_ENCODED_BYTES,
+                &index,
+            )?;
             index_table
                 .insert((neighborhood_id, family_id), encoded.as_slice())
                 .map_err(store_err)?;
@@ -969,39 +1453,52 @@ impl PhotoAlbumStore {
         Ok(existed)
     }
 
-    /// Removes the entire photo album (index and all photo rows) for
-    /// `(neighborhood_id, family_id)` inside a single write transaction fenced
-    /// by `expected_instance_id`. Returns `true` if any album data existed.
+    /// Removes all photo entries for a living household `token.family_id`
+    /// inside a single write transaction fenced by `token`, preserving
+    /// `next_photo_id` (when the existing index is readable) so cleared photo
+    /// IDs are never reused within the same household lifetime. Returns `true`
+    /// if any album data existed.
     pub fn delete_family_album(
         &self,
         neighborhood_id: &str,
-        expected_instance_id: u128,
-        family_id: u16,
+        token: AlbumFamilyToken,
     ) -> std::result::Result<bool, AlbumError> {
         validate_neighborhood_id(neighborhood_id)?;
-        validate_instance_id(expected_instance_id)?;
-        validate_family_id(family_id)?;
+        validate_family_token(token)?;
+        let family_id = token.family_id;
 
         let txn = self.db.begin_write().map_err(store_err)?;
         let mut existed = false;
         {
-            verify_neighborhood_instance_in_txn(&txn, neighborhood_id, expected_instance_id)?;
+            verify_family_token_in_txn(&txn, neighborhood_id, token)?;
             let mut index_table = txn.open_table(ALBUM_INDEX).map_err(store_err)?;
-            if index_table
-                .remove((neighborhood_id, family_id))
-                .map_err(store_err)?
-                .is_some()
-            {
-                existed = true;
-            }
+            let preserved_next_id = {
+                match index_table
+                    .get((neighborhood_id, family_id))
+                    .map_err(store_err)?
+                {
+                    Some(raw) => {
+                        existed = true;
+                        decode_index(neighborhood_id, family_id, raw.value())
+                            .ok()
+                            .map(|idx| idx.next_photo_id)
+                    }
+                    None => None,
+                }
+            };
             let mut photo_table = txn.open_table(ALBUM_PHOTOS).map_err(store_err)?;
             let mut photo_ids = Vec::new();
+            let mut max_photo_id = 0u64;
             for item in photo_table
                 .range((neighborhood_id, family_id, 0u64)..=(neighborhood_id, family_id, u64::MAX))
                 .map_err(store_err)?
             {
                 let (k, _) = item.map_err(store_err)?;
-                photo_ids.push(k.value().2);
+                let pid = k.value().2;
+                if pid > max_photo_id {
+                    max_photo_id = pid;
+                }
+                photo_ids.push(pid);
             }
             if !photo_ids.is_empty() {
                 existed = true;
@@ -1011,18 +1508,66 @@ impl PhotoAlbumStore {
                     .remove((neighborhood_id, family_id, photo_id))
                     .map_err(store_err)?;
             }
+            if existed {
+                let keep_next = preserved_next_id.unwrap_or(0).max(max_photo_id);
+                if keep_next > 0 {
+                    let cleared = AlbumIndexV1 {
+                        neighborhood_id: neighborhood_id.to_owned(),
+                        family_id,
+                        next_photo_id: keep_next,
+                        order: Vec::new(),
+                    };
+                    let index_name = format!("{neighborhood_id}:family{family_id}:album-index");
+                    let encoded = encode_framed(
+                        &index_name,
+                        INDEX_MAGIC,
+                        INDEX_HASH_DOMAIN,
+                        MAX_ALBUM_INDEX_ENCODED_BYTES,
+                        &cleared,
+                    )?;
+                    index_table
+                        .insert((neighborhood_id, family_id), encoded.as_slice())
+                        .map_err(store_err)?;
+                } else {
+                    index_table
+                        .remove((neighborhood_id, family_id))
+                        .map_err(store_err)?;
+                }
+            }
         }
         txn.commit().map_err(store_err)?;
         Ok(existed)
     }
 
     /// Lists all photo album entries for `(neighborhood_id, family_id)` in
-    /// deterministic page order inside a single MVCC read transaction.
+    /// deterministic page order inside a single MVCC read transaction,
+    /// enforcing [`MAX_BULK_ALBUM_PIXEL_BYTES`].
+    ///
+    /// For very large albums whose combined RGB565 bitmaps exceed
+    /// [`MAX_BULK_ALBUM_PIXEL_BYTES`], use [`Self::list_summaries`] paired with
+    /// [`Self::list_page`] or [`Self::get`].
     pub fn list(
         &self,
         neighborhood_id: &str,
         family_id: u16,
     ) -> std::result::Result<Vec<AlbumPhoto>, AlbumError> {
+        self.list_page_with_budget(
+            neighborhood_id,
+            family_id,
+            0,
+            MAX_ALBUM_ENTRIES,
+            MAX_BULK_ALBUM_PIXEL_BYTES,
+        )
+    }
+
+    /// Lists lightweight metadata summaries (dropping pixel buffers immediately
+    /// after validating each entry) for all entries of `(neighborhood_id, family_id)`
+    /// in deterministic page order inside a single MVCC read transaction.
+    pub fn list_summaries(
+        &self,
+        neighborhood_id: &str,
+        family_id: u16,
+    ) -> std::result::Result<Vec<AlbumPhotoSummary>, AlbumError> {
         validate_neighborhood_id(neighborhood_id)?;
         validate_family_id(family_id)?;
 
@@ -1053,7 +1598,7 @@ impl PhotoAlbumStore {
             Err(error) => return Err(store_err(error)),
         };
 
-        let mut entries = Vec::with_capacity(index.order.len());
+        let mut summaries = Vec::with_capacity(index.order.len());
         for photo_id in index.order {
             let Some(raw_photo) = photo_table
                 .get((neighborhood_id, family_id, photo_id))
@@ -1065,6 +1610,95 @@ impl PhotoAlbumStore {
                 });
             };
             let photo = decode_photo(neighborhood_id, family_id, photo_id, raw_photo.value())?;
+            summaries.push(photo.into());
+        }
+        Ok(summaries)
+    }
+
+    /// Loads one contiguous slice `offset..offset+limit` of photo album entries
+    /// in deterministic page order inside a single MVCC read transaction,
+    /// enforcing [`MAX_BULK_ALBUM_PIXEL_BYTES`].
+    pub fn list_page(
+        &self,
+        neighborhood_id: &str,
+        family_id: u16,
+        offset: usize,
+        limit: usize,
+    ) -> std::result::Result<Vec<AlbumPhoto>, AlbumError> {
+        self.list_page_with_budget(
+            neighborhood_id,
+            family_id,
+            offset,
+            limit,
+            MAX_BULK_ALBUM_PIXEL_BYTES,
+        )
+    }
+
+    /// Like [`Self::list_page`], with a caller-specified aggregate pixel-buffer
+    /// byte ceiling (`max_pixel_bytes`).
+    pub fn list_page_with_budget(
+        &self,
+        neighborhood_id: &str,
+        family_id: u16,
+        offset: usize,
+        limit: usize,
+        max_pixel_bytes: usize,
+    ) -> std::result::Result<Vec<AlbumPhoto>, AlbumError> {
+        validate_neighborhood_id(neighborhood_id)?;
+        validate_family_id(family_id)?;
+
+        let txn = self.db.begin_read().map_err(store_err)?;
+        let index_table = match txn.open_table(ALBUM_INDEX) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(store_err(error)),
+        };
+        let Some(raw_index) = index_table
+            .get((neighborhood_id, family_id))
+            .map_err(store_err)?
+        else {
+            return Ok(Vec::new());
+        };
+        let index = decode_index(neighborhood_id, family_id, raw_index.value())?;
+        if index.order.is_empty() || limit == 0 || offset >= index.order.len() {
+            return Ok(Vec::new());
+        }
+        let photo_table = match txn.open_table(ALBUM_PHOTOS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(AlbumError::DecodeFailed {
+                    record: format!("{neighborhood_id}:family{family_id}:album-index"),
+                    detail: "album photo table missing for non-empty index".into(),
+                });
+            }
+            Err(error) => return Err(store_err(error)),
+        };
+
+        let slice_end = offset.saturating_add(limit).min(index.order.len());
+        let page_ids = &index.order[offset..slice_end];
+        let mut entries = Vec::with_capacity(page_ids.len());
+        let mut total_pixel_bytes = 0usize;
+        for &photo_id in page_ids {
+            let Some(raw_photo) = photo_table
+                .get((neighborhood_id, family_id, photo_id))
+                .map_err(store_err)?
+            else {
+                return Err(AlbumError::DecodeFailed {
+                    record: format!("{neighborhood_id}:family{family_id}:photo#{photo_id}"),
+                    detail: "photo referenced by album index is missing".into(),
+                });
+            };
+            let photo = decode_photo(neighborhood_id, family_id, photo_id, raw_photo.value())?;
+            let entry_bytes = photo.image.as_ref().map_or(0, AlbumImage::pixel_bytes);
+            let next_total = total_pixel_bytes.saturating_add(entry_bytes);
+            if next_total > max_pixel_bytes {
+                return Err(AlbumError::BudgetExceeded {
+                    record: format!("{neighborhood_id}:family{family_id}"),
+                    limit_bytes: max_pixel_bytes,
+                    required_bytes: next_total,
+                });
+            }
+            total_pixel_bytes = next_total;
             entries.push(photo.into());
         }
         Ok(entries)
@@ -1152,8 +1786,68 @@ impl PhotoAlbumStore {
     }
 }
 
-/// Removes all photo album indices and photo rows for `neighborhood_id` inside
-/// an open REDB write transaction.
+/// Atomically purges one deleted family's photo album (`ALBUM_INDEX` and
+/// `ALBUM_PHOTOS`) and advances its `ALBUM_FAMILY_EPOCH` counter inside an open
+/// REDB write transaction so stale [`AlbumFamilyToken`]s cannot mutate a
+/// replacement household reusing `family_id`.
+///
+/// Called by [`crate::NeighborhoodStore`] inside every neighborhood write
+/// transaction whenever a non-zero family is removed from
+/// `StoredNeighborhood::families`.
+pub(crate) fn purge_family_in_txn(
+    txn: &redb::WriteTransaction,
+    neighborhood_id: &str,
+    family_id: u16,
+) -> std::result::Result<(), Error> {
+    if family_id == 0 {
+        return Ok(());
+    }
+    let mut index_table = txn
+        .open_table(ALBUM_INDEX)
+        .map_err(|e| Error::Store(e.to_string()))?;
+    index_table
+        .remove((neighborhood_id, family_id))
+        .map_err(|e| Error::Store(e.to_string()))?;
+
+    let mut photo_table = txn
+        .open_table(ALBUM_PHOTOS)
+        .map_err(|e| Error::Store(e.to_string()))?;
+    let mut photo_ids = Vec::new();
+    for item in photo_table
+        .range((neighborhood_id, family_id, 0u64)..=(neighborhood_id, family_id, u64::MAX))
+        .map_err(|e| Error::Store(e.to_string()))?
+    {
+        let (k, _) = item.map_err(|e| Error::Store(e.to_string()))?;
+        photo_ids.push(k.value().2);
+    }
+    for photo_id in photo_ids {
+        photo_table
+            .remove((neighborhood_id, family_id, photo_id))
+            .map_err(|e| Error::Store(e.to_string()))?;
+    }
+
+    let mut epoch_table = txn
+        .open_table(ALBUM_FAMILY_EPOCH)
+        .map_err(|e| Error::Store(e.to_string()))?;
+    let next_epoch = {
+        let current = epoch_table
+            .get((neighborhood_id, family_id))
+            .map_err(|e| Error::Store(e.to_string()))?
+            .map_or(INITIAL_FAMILY_EPOCH, |v| v.value());
+        current.checked_add(1).ok_or_else(|| {
+            Error::Store(format!(
+                "photo album family epoch exhausted for ({neighborhood_id:?}, family {family_id})"
+            ))
+        })?
+    };
+    epoch_table
+        .insert((neighborhood_id, family_id), next_epoch)
+        .map_err(|e| Error::Store(e.to_string()))?;
+    Ok(())
+}
+
+/// Removes all photo album indices, photo rows, and family-epoch rows for
+/// `neighborhood_id` inside an open REDB write transaction.
 ///
 /// Called by [`crate::NeighborhoodStore::delete_neighborhood`] and
 /// [`crate::NeighborhoodStore::import_directory`] so deleted or re-imported
@@ -1194,6 +1888,23 @@ pub(crate) fn purge_neighborhood_in_txn(
     for (family_id, photo_id) in photo_keys {
         photo_table
             .remove((neighborhood_id, family_id, photo_id))
+            .map_err(|e| Error::Store(e.to_string()))?;
+    }
+
+    let mut epoch_table = txn
+        .open_table(ALBUM_FAMILY_EPOCH)
+        .map_err(|e| Error::Store(e.to_string()))?;
+    let mut epoch_families = Vec::new();
+    for item in epoch_table
+        .range((neighborhood_id, 0u16)..=(neighborhood_id, u16::MAX))
+        .map_err(|e| Error::Store(e.to_string()))?
+    {
+        let (k, _) = item.map_err(|e| Error::Store(e.to_string()))?;
+        epoch_families.push(k.value().1);
+    }
+    for family_id in epoch_families {
+        epoch_table
+            .remove((neighborhood_id, family_id))
             .map_err(|e| Error::Store(e.to_string()))?;
     }
     Ok(())

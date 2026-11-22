@@ -1437,10 +1437,14 @@ fn lot_thumbnails_checked_crud_fencing_corruption_and_purge() {
     );
     assert!(store.load_lot_thumbnail("NH1", 7).unwrap().is_none());
 
-    // Tampering detection (checksum flip + key swap + unsupported future version).
+    // Tampering detection (checksum flip + key swap + unsupported future version
+    // + pre-allocation mismatched pixel vector + oversized blob + non-destructive
+    // overwrite refusal + explicit recovery via delete_lot_thumbnail_checked).
     drop(store);
     {
         use redb::ReadableDatabase;
+        use sha2::{Digest, Sha256};
+
         const THUMB_TABLE: redb::TableDefinition<(&str, u32), &[u8]> =
             redb::TableDefinition::new("neighborhood_lot_thumbnails");
         let raw_db = redb::Database::open(&db.0).unwrap();
@@ -1456,12 +1460,49 @@ fn lot_thumbnails_checked_crud_fencing_corruption_and_purge() {
         future.extend_from_slice(b"THMB");
         future.extend_from_slice(&(LOT_THUMBNAIL_FORMAT + 1).to_le_bytes());
         future.extend_from_slice(&[0u8; 32]);
+
+        // Validly checksummed current-version row with 1x1 dims and 100,000 pixels.
+        #[derive(serde::Serialize)]
+        struct BadSurf {
+            width: u32,
+            height: u32,
+            pixels: Vec<u16>,
+        }
+        #[derive(serde::Serialize)]
+        struct BadThumb {
+            neighborhood_id: String,
+            lot_id: u32,
+            normal: BadSurf,
+            roofs_off: Option<BadSurf>,
+        }
+        let bad_body = postcard::to_allocvec(&BadThumb {
+            neighborhood_id: "NH1".into(),
+            lot_id: 96,
+            normal: BadSurf {
+                width: 1,
+                height: 1,
+                pixels: vec![0u16; 100_000],
+            },
+            roofs_off: None,
+        })
+        .unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"sims-sim:lot-thumbnail:v1");
+        hasher.update(LOT_THUMBNAIL_FORMAT.to_le_bytes());
+        hasher.update(&bad_body);
+        let mut bad_framed = Vec::new();
+        bad_framed.extend_from_slice(b"THMB");
+        bad_framed.extend_from_slice(&LOT_THUMBNAIL_FORMAT.to_le_bytes());
+        bad_framed.extend_from_slice(&hasher.finalize());
+        bad_framed.extend_from_slice(&bad_body);
+
         let w = raw_db.begin_write().unwrap();
         {
             let mut t = w.open_table(THUMB_TABLE).unwrap();
             t.insert(("NH1", 99), flipped.as_slice()).unwrap();
             t.insert(("NH1", 98), nh1_lot5_bytes.as_slice()).unwrap(); // key-binding mismatch (lot 5 -> 98)
             t.insert(("NH1", 97), future.as_slice()).unwrap();
+            t.insert(("NH1", 96), bad_framed.as_slice()).unwrap();
         }
         w.commit().unwrap();
     }
@@ -1469,6 +1510,45 @@ fn lot_thumbnails_checked_crud_fencing_corruption_and_purge() {
     assert!(store.load_lot_thumbnail("NH1", 99).is_err());
     assert!(store.load_lot_thumbnail("NH1", 98).is_err());
     assert!(store.load_lot_thumbnail("NH1", 97).is_err());
+    assert!(store.load_lot_thumbnail("NH1", 96).is_err());
+    // Refuses to silently overwrite unreadable future-version (97) or corrupt (99) rows.
+    assert!(
+        store
+            .save_lot_thumbnail_checked("NH1", nh1.instance_id, 97, &thumb7)
+            .is_err()
+    );
+    assert!(
+        store
+            .save_lot_thumbnail_checked("NH1", nh1.instance_id, 99, &thumb7)
+            .is_err()
+    );
+    // Still unreadable (untouched on disk), until explicitly deleted for recovery.
+    assert!(store.load_lot_thumbnail("NH1", 97).is_err());
+    assert_eq!(
+        store
+            .delete_lot_thumbnail_checked("NH1", nh1.instance_id, 97)
+            .unwrap(),
+        Ok(true)
+    );
+    store
+        .save_lot_thumbnail_checked("NH1", nh1.instance_id, 97, &thumb7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.load_lot_thumbnail("NH1", 97).unwrap().as_ref(),
+        Some(&thumb7)
+    );
+
+    // Subset loading (`load_lot_thumbnails_for`) and byte-budget enforcement.
+    let subset = store
+        .load_lot_thumbnails_for("NH1", &[5, 97, 1234], 1024)
+        .unwrap();
+    assert_eq!(subset.len(), 2);
+    assert_eq!(subset.get(&5), Some(&thumb5));
+    assert_eq!(subset.get(&97), Some(&thumb7));
+    // thumb5 has 24 + 24 = 48 pixel bytes, thumb7 has 8 -> 56 total; cap at 50 fails!
+    assert!(store.load_lot_thumbnails_for("NH1", &[5, 97], 50).is_err());
+
     // Intact lot 5 still loads cleanly.
     assert_eq!(
         store.load_lot_thumbnail("NH1", 5).unwrap().as_ref(),

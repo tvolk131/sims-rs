@@ -1045,4 +1045,155 @@ mod tests {
             );
         }
     }
+
+    /// Independent raw-postcard wire-byte golden test derived directly from the
+    /// historical field declarations of commits `2ddea688` (FORMAT 6) and
+    /// `50106efb` (FORMAT 7), without using `SavedV6` or `SavedV7` to build the
+    /// input bytes. Catches any field-order or type drift between the historical
+    /// commits and our migration structs.
+    #[test]
+    fn golden_raw_wire_bytes_from_2ddea688_and_50106efb_migrate_losslessly() {
+        fn push_varint_u64(out: &mut Vec<u8>, mut v: u64) {
+            loop {
+                let mut byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v != 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if v == 0 {
+                    break;
+                }
+            }
+        }
+        fn push_zigzag_i16(out: &mut Vec<u8>, v: i16) {
+            let zz = ((v << 1) ^ (v >> 15)) as u16;
+            push_varint_u64(out, u64::from(zz));
+        }
+        fn push_str(out: &mut Vec<u8>, s: &str) {
+            push_varint_u64(out, s.len() as u64);
+            out.extend_from_slice(s.as_bytes());
+        }
+
+        // `World::encode()` is the canonical `postcard` encoding of `World` at `SNAPSHOT_FORMAT`.
+        let world_postcard = World::empty().encode();
+        let loaded_fingerprint: [u8; 32] =
+            std::array::from_fn(|i| (i as u8).wrapping_mul(7) ^ 0xa5);
+
+        // --- Golden FORMAT 6 bytes (commit `2ddea688`) ---
+        let mut raw_2ddea688 = Vec::new();
+        raw_2ddea688.extend_from_slice(&6u32.to_le_bytes()); // FORMAT = 6
+        raw_2ddea688.extend_from_slice(&sims_sim::SNAPSHOT_FORMAT.to_le_bytes()); // SNAPSHOT_FORMAT = 32
+        raw_2ddea688.extend_from_slice(&world_postcard); // 1. world: World
+        push_varint_u64(&mut raw_2ddea688, 777); // 2. ticks: u32
+        push_varint_u64(&mut raw_2ddea688, 33); // 3. start: u32
+        // 4. answers: Answers (2ddea688: { queue: VecDeque<Answer>, include_single_button: bool })
+        push_varint_u64(&mut raw_2ddea688, 1); // queue.len = 1
+        raw_2ddea688.push(3); // Answer.status = 3
+        raw_2ddea688.push(1); // Answer.bitmap_id = Some(-17)
+        push_zigzag_i16(&mut raw_2ddea688, -17);
+        raw_2ddea688.push(1); // Answer.text = Some("Bella")
+        push_str(&mut raw_2ddea688, "Bella");
+        raw_2ddea688.push(1); // include_single_button = true
+        // 5. fresh: BTreeSet<u16> = {4, 19}
+        push_varint_u64(&mut raw_2ddea688, 2);
+        push_varint_u64(&mut raw_2ddea688, 4);
+        push_varint_u64(&mut raw_2ddea688, 19);
+        raw_2ddea688.push(3); // 6. view_rotation: u8
+        raw_2ddea688.push(1); // 7. answered: bool = true
+        push_varint_u64(&mut raw_2ddea688, 5); // 8. house: u32
+        push_varint_u64(&mut raw_2ddea688, 1); // 9. family: u16
+        raw_2ddea688.extend_from_slice(&loaded_fingerprint); // 10. loaded: [u8; 32]
+        raw_2ddea688.extend_from_slice(&[1, 21, 42]); // 11. view_centre: Some([21, 42])
+        raw_2ddea688.push(2); // 12. floor_rotation: u8
+        raw_2ddea688.extend_from_slice(&[1, 3, 1, 21, 42]); // 13. replay_view: Some((3, Some([21, 42])))
+        push_str(&mut raw_2ddea688, "Last prompt text"); // 14. last_dialog_text
+        push_varint_u64(&mut raw_2ddea688, 1); // 15. character_names len = 1
+        push_varint_u64(&mut raw_2ddea688, 0x1234_5678);
+        push_str(&mut raw_2ddea688, "Cassandra");
+        push_str(&mut raw_2ddea688, "5 Sim Lane"); // 16. lot_name
+        push_str(&mut raw_2ddea688, "Historic Goth estate"); // 17. lot_description
+
+        let (dec6, rep6) = Saved::decode_with_report(&raw_2ddea688).unwrap();
+        assert_eq!(rep6.original_version, 6);
+        assert_eq!(rep6.final_version, FORMAT);
+        assert_eq!(rep6.steps_applied, 2);
+        assert_eq!(dec6.ticks, 777);
+        assert_eq!(dec6.start, 33);
+        assert_eq!(
+            dec6.answers,
+            Answers::replay(&[Answer {
+                status: 3,
+                bitmap_id: Some(-17),
+                text: Some("Bella".into()),
+            }])
+        );
+        assert_eq!(dec6.fresh, BTreeSet::from([4, 19]));
+        assert_eq!(dec6.view_rotation, 3);
+        assert!(dec6.answered);
+        assert_eq!(dec6.house, 5);
+        assert_eq!(dec6.family, 1);
+        assert_eq!(dec6.loaded, loaded_fingerprint);
+        assert_eq!(dec6.view_centre, Some([21, 42]));
+        assert_eq!(dec6.floor_rotation, 2);
+        assert_eq!(dec6.replay_view, Some((3, Some([21, 42]))));
+        assert_eq!(dec6.last_dialog_text, "Last prompt text");
+        assert_eq!(
+            dec6.character_names.get(&0x1234_5678).map(String::as_str),
+            Some("Cassandra")
+        );
+        assert_eq!(dec6.lot_name(), "5 Sim Lane");
+        assert_eq!(dec6.lot_description(), "Historic Goth estate");
+        assert_eq!(dec6.deletion_epoch, 0);
+
+        // --- Golden FORMAT 7 bytes (commit `50106efb`) ---
+        let mut raw_50106efb = Vec::new();
+        raw_50106efb.extend_from_slice(&7u32.to_le_bytes()); // FORMAT = 7
+        raw_50106efb.extend_from_slice(&sims_sim::SNAPSHOT_FORMAT.to_le_bytes()); // SNAPSHOT_FORMAT = 32
+        raw_50106efb.extend_from_slice(&world_postcard); // 1. world: World
+        push_varint_u64(&mut raw_50106efb, 888); // 2. ticks: u32
+        push_varint_u64(&mut raw_50106efb, 33); // 3. start: u32
+        // 4. answers: Answers (50106efb: adds `choices_after: Option<VecDeque<Answer>>`)
+        push_varint_u64(&mut raw_50106efb, 1); // queue.len = 1
+        raw_50106efb.push(2); // Answer.status = 2
+        raw_50106efb.push(0); // bitmap_id = None
+        raw_50106efb.push(0); // text = None
+        raw_50106efb.push(1); // include_single_button = true
+        raw_50106efb.push(1); // choices_after = Some(...)
+        push_varint_u64(&mut raw_50106efb, 2); // 2 follow-up choices
+        raw_50106efb.extend_from_slice(&[3, 0, 0]);
+        raw_50106efb.extend_from_slice(&[4, 0, 0]);
+        push_varint_u64(&mut raw_50106efb, 1); // 5. fresh = {11}
+        push_varint_u64(&mut raw_50106efb, 11);
+        raw_50106efb.push(1); // 6. view_rotation
+        raw_50106efb.push(0); // 7. answered = false
+        push_varint_u64(&mut raw_50106efb, 7); // 8. house
+        push_varint_u64(&mut raw_50106efb, 2); // 9. family
+        raw_50106efb.extend_from_slice(&loaded_fingerprint); // 10. loaded
+        raw_50106efb.push(0); // 11. view_centre = None
+        raw_50106efb.push(0); // 12. floor_rotation
+        raw_50106efb.push(0); // 13. replay_view = None
+        push_str(&mut raw_50106efb, "Dialog v7"); // 14. last_dialog_text
+        push_varint_u64(&mut raw_50106efb, 0); // 15. character_names = {}
+        push_str(&mut raw_50106efb, "7 Sim Lane"); // 16. lot_name
+        push_str(&mut raw_50106efb, "Newbie house"); // 17. lot_description
+        push_varint_u64(&mut raw_50106efb, 42); // 18. deletion_epoch = 42
+
+        let (dec7, rep7) = Saved::decode_with_report(&raw_50106efb).unwrap();
+        assert_eq!(rep7.original_version, 7);
+        assert_eq!(rep7.final_version, FORMAT);
+        assert_eq!(rep7.steps_applied, 1);
+        let mut expected_ans7 = Answers::replay(&[Answer::from(2)]);
+        expected_ans7.extend_choices_after(&[3, 4]);
+        assert_eq!(dec7.ticks, 888);
+        assert_eq!(dec7.answers, expected_ans7);
+        assert_eq!(dec7.fresh, BTreeSet::from([11]));
+        assert_eq!(dec7.house, 7);
+        assert_eq!(dec7.family, 2);
+        assert_eq!(dec7.loaded, loaded_fingerprint);
+        assert_eq!(dec7.last_dialog_text, "Dialog v7");
+        assert_eq!(dec7.lot_name(), "7 Sim Lane");
+        assert_eq!(dec7.lot_description(), "Newbie house");
+        assert_eq!(dec7.deletion_epoch, 42);
+    }
 }

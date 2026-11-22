@@ -42,9 +42,10 @@ pub mod speed;
 mod world;
 
 pub use album_store::{
-    ALBUM_FORMAT, ALBUM_MIN_FORMAT, AlbumError, AlbumImage, AlbumPhoto, MAX_ALBUM_CAPTION_CHARS,
-    MAX_ALBUM_ENTRIES, MAX_ALBUM_PHOTO_DIM, MAX_ALBUM_PHOTO_PIXELS, MAX_ALBUM_TITLE_CHARS,
-    NewAlbumPhoto, PhotoAlbumStore,
+    ALBUM_FORMAT, ALBUM_MIN_FORMAT, AlbumError, AlbumFamilyToken, AlbumImage, AlbumPhoto,
+    AlbumPhotoSummary, MAX_ALBUM_CAPTION_CHARS, MAX_ALBUM_ENTRIES, MAX_ALBUM_INDEX_ENCODED_BYTES,
+    MAX_ALBUM_PHOTO_DIM, MAX_ALBUM_PHOTO_ENCODED_BYTES, MAX_ALBUM_PHOTO_PIXELS,
+    MAX_ALBUM_TITLE_CHARS, MAX_BULK_ALBUM_PIXEL_BYTES, NewAlbumPhoto, PhotoAlbumStore,
 };
 pub use autosave::{
     AUTOSAVE_FORMAT, AUTOSAVE_MIN_FORMAT, AutosavePolicy, AutosaveStore, DEFAULT_MAX_AUTOSAVES,
@@ -61,11 +62,11 @@ pub use migration::{
 };
 pub use neighborhood_store::{
     CheckedCommitError, DEFAULT_ARCH_VALUE_MULTIPLIER, DEFAULT_LAYOUT_HISTORY_FILL,
-    DEFAULT_NEW_FAMILY_START_HOUR, FAMILY_FLAG_BIT_3, FAMILY_FLAG_HAS_CATEGORY_1,
-    FAMILY_FLAG_HAS_CATEGORY_9, FAMILY_FLAG_NEW_MOVE_IN, ImportSummary, LOT_THUMBNAIL_FORMAT,
-    LotSnapshot, MAX_LOT_THUMBNAIL_DIM, MAX_LOT_THUMBNAIL_PIXELS, NEIGHBORHOOD_FORMAT,
-    NeighborhoodStore, StoredLotThumbnail, StoredNeighborhood, ThumbnailSurface565,
-    family_net_worth, lot_total_value,
+    DEFAULT_LOT_THUMBNAILS_MAX_BYTES, DEFAULT_NEW_FAMILY_START_HOUR, FAMILY_FLAG_BIT_3,
+    FAMILY_FLAG_HAS_CATEGORY_1, FAMILY_FLAG_HAS_CATEGORY_9, FAMILY_FLAG_NEW_MOVE_IN, ImportSummary,
+    LOT_THUMBNAIL_FORMAT, LotSnapshot, MAX_LOT_THUMBNAIL_DIM, MAX_LOT_THUMBNAIL_ENCODED_BYTES,
+    MAX_LOT_THUMBNAIL_PIXELS, NEIGHBORHOOD_FORMAT, NeighborhoodStore, StoredLotThumbnail,
+    StoredNeighborhood, ThumbnailSurface565, family_net_worth, lot_total_value,
 };
 pub use snapshot::{FORMAT as SNAPSHOT_FORMAT, ReadOnlySnapshots, Snapshots};
 pub use world::{
