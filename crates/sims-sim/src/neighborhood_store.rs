@@ -1536,7 +1536,7 @@ fn read_family_surnames(
         if !families.contains_key(&chunk.id) {
             continue;
         }
-        let Ok(table) = StringTable::parse(iff.data(chunk)) else {
+        let Ok(table) = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)) else {
             continue;
         };
         let raw = table

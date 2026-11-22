@@ -852,6 +852,7 @@ struct CoopWorldFingerprintTail<'a> {
     scratch_ptr_arg_slot: sims_sim::ScratchPtrBitSerialize<'a>,
     runtime_added_suits: &'a Vec<String>,
     suit_scan_cache: &'a Option<Vec<String>>,
+    family_flags: &'a BTreeMap<i32, u32>,
     activity_owners: Option<&'a BTreeMap<u16, PlayerId>>,
     next_dialog_id: Option<u64>,
     active_dialog: Option<DialogId>,
@@ -2928,6 +2929,7 @@ impl Lot {
             scratch_ptr_arg_slot: w.scratch_ptrs.serialize_bit(sims_sim::SCRATCH_PTR_ARG_SLOT),
             runtime_added_suits: &w.runtime_added_suits,
             suit_scan_cache: &w.suit_scan_cache,
+            family_flags: &w.family_flags,
             activity_owners: self.coop.as_ref().map(|c| &c.activity_owners),
             next_dialog_id: self.coop.as_ref().map(|c| c.next_dialog_id),
             active_dialog: self.coop.as_ref().and_then(|c| c.active_dialog),
@@ -5357,5 +5359,30 @@ mod tests {
         );
         assert_eq!(interactive.world().hash(), restored.world().hash());
         assert_eq!(interactive.world().hash(), headless.world().hash());
+    }
+
+    #[test]
+    fn coop_fingerprint_covers_family_flags_and_refuses_local_cheats() {
+        let (program, catalog, world) = run_expr_world();
+        let mut lot_a = synthetic_coop_lot(
+            program.clone(),
+            catalog.clone(),
+            world.clone(),
+            Frames::default(),
+        );
+        let mut lot_b = synthetic_coop_lot(program, catalog, world, Frames::default());
+        assert_eq!(lot_a.coop_world_hash(), lot_b.coop_world_hash());
+
+        // Different family_flags must produce distinct coop_world_hash while
+        // preserving identical World::hash().
+        lot_b.world.family_flags.insert(5, 0x1);
+        assert_eq!(lot_a.world().hash(), lot_b.world().hash());
+        assert_ne!(lot_a.coop_world_hash(), lot_b.coop_world_hash());
+
+        // Attach a co-op context and verify local cheats are refused.
+        let session = SessionState::new("Host", None, SessionConfig::default());
+        lot_a.attach_coop(session).unwrap();
+        assert!(matches!(lot_a.add_funds(1000), Err(OrderError::Refused(_))));
+        assert!(matches!(lot_a.set_hour(12), Err(OrderError::Refused(_))));
     }
 }

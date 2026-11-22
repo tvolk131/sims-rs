@@ -553,12 +553,24 @@ impl Program {
         if let Some(guid) = missing_guid {
             return Err(Error::MissingDefinition(guid));
         }
+        let inserted_changes_careers = index.resources[inserted_range.clone()].iter().any(|r| {
+            let file = r.file_name();
+            file.eq_ignore_ascii_case("work.iff") || file.eq_ignore_ascii_case("careers.txt")
+        });
+        let (careers, career_texts_end) = if inserted_changes_careers {
+            (
+                careers_with_pool(index, pool)?,
+                career_texts_end_with_pool(index, pool)?,
+            )
+        } else {
+            (base.careers.clone(), base.career_texts_end)
+        };
         Ok(Self {
             global: catalog.global,
             libraries,
             semi_globals,
-            careers: base.careers.clone(),
-            career_texts_end: base.career_texts_end,
+            careers,
+            career_texts_end,
             labels_hold_no_token: base.labels_hold_no_token,
             zoning: BTreeMap::new(),
             animations: Animations::default(),

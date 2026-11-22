@@ -2062,11 +2062,29 @@ impl Lot {
     /// Adjusts household funds by signed `delta` directly on the live
     /// [`World`] without invoking [`Lot::restore`], preserving Buy/Build undo
     /// history and `neighborhood_origin`. Updates globals 13 and 14 via
-    /// [`World::set_funds`] (respecting budget mode `global[32]`) and returns
-    /// the resulting `world.budget.funds`.
+    /// [`World::set_funds`] (respecting budget mode `global[32]`), clamps the
+    /// resulting balance to the exact lossless `globals[13..14]` script range
+    /// `[-327_680_000, 327_679_999]`, refuses mutation while a co-op session is
+    /// attached, and returns the resulting `world.budget.funds`.
     pub fn add_funds(&mut self, delta: i32) -> Result<i32, OrderError> {
+        const MIN_CHEAT_FUNDS: i32 = -327_680_000;
+        const MAX_CHEAT_FUNDS: i32 = 327_679_999;
         self.ready()?;
-        let next = self.world.budget.funds.saturating_add(delta);
+        if self.coop.is_some() {
+            return Err(OrderError::Refused(crate::Fault {
+                object: 0,
+                at: None,
+                trap: crate::Trap::Invalid(
+                    "cannot invoke local add_funds cheat while co-op session is attached".into(),
+                ),
+            }));
+        }
+        let next = self
+            .world
+            .budget
+            .funds
+            .saturating_add(delta)
+            .clamp(MIN_CHEAT_FUNDS, MAX_CHEAT_FUNDS);
         self.world.set_funds(next).map_err(|error| {
             OrderError::Refused(crate::Fault {
                 object: 0,
@@ -2080,11 +2098,21 @@ impl Lot {
     /// Sets the live lot clock to `hour:00:00` (`0..24`) directly on the live
     /// [`World`] without invoking [`Lot::restore`], preserving Buy/Build undo
     /// history and `neighborhood_origin`. Updates global 0 (hour), clears
-    /// globals 5 and 6 (minute/second), and updates global 4 (time-of-day
-    /// period, marking all rooms for light recount when the period changes,
-    /// matching `0x46d86f` / `0x46d525`).
+    /// globals 5 and 6 (minute/second), updates global 4 (time-of-day period,
+    /// marking all rooms for light recount when the period changes, matching
+    /// `0x46d86f` / `0x46d525`), and refuses mutation while a co-op session is
+    /// attached.
     pub fn set_hour(&mut self, hour: u8) -> Result<(), OrderError> {
         self.ready()?;
+        if self.coop.is_some() {
+            return Err(OrderError::Refused(crate::Fault {
+                object: 0,
+                at: None,
+                trap: crate::Trap::Invalid(
+                    "cannot invoke local set_hour cheat while co-op session is attached".into(),
+                ),
+            }));
+        }
         if hour >= 24 {
             return Err(OrderError::Refused(crate::Fault {
                 object: 0,
@@ -4784,14 +4812,24 @@ mod tests {
         lot.set_move_objects(false);
         assert!(!lot.move_objects());
 
-        // add_funds updates budget + globals 13/14 and saturates safely.
+        // add_funds updates budget + globals 13/14 and clamps to the exact
+        // lossless script-visible range [-327_680_000, 327_679_999].
         assert_eq!(lot.add_funds(500).unwrap(), 1500);
         assert_eq!(lot.world().budget.funds, 1500);
         assert_eq!(lot.world().globals[13], 1500);
         assert_eq!(lot.world().globals[14], 0);
         assert_eq!(lot.add_funds(-2000).unwrap(), -500);
         assert_eq!(lot.world().budget.funds, -500);
-        assert_eq!(lot.add_funds(i32::MIN).unwrap(), i32::MIN);
+        assert_eq!(lot.add_funds(i32::MAX).unwrap(), 327_679_999);
+        assert_eq!(
+            i32::from(lot.world().globals[14]) * 10_000 + i32::from(lot.world().globals[13]),
+            327_679_999
+        );
+        assert_eq!(lot.add_funds(i32::MIN).unwrap(), -327_680_000);
+        assert_eq!(
+            i32::from(lot.world().globals[14]) * 10_000 + i32::from(lot.world().globals[13]),
+            -327_680_000
+        );
 
         // Budget mode (global 32 == 1): World::set_funds is a no-op, preserving
         // both budget.funds and globals 13/14.

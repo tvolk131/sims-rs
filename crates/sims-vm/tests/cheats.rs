@@ -134,13 +134,17 @@ fn add_funds_and_set_hour_mutate_live_world_and_preserve_undo_history() {
     assert_eq!(after_minus, start_funds + 750);
     assert_eq!(lot.world().budget.funds, start_funds + 750);
 
-    // Saturating addition never overflows.
-    let saturated = lot.add_funds(i32::MAX).unwrap();
-    assert_eq!(saturated, i32::MAX);
-    assert_eq!(lot.world().budget.funds, i32::MAX);
+    // Clamps to the lossless globals[13..14] script-visible ceiling without wrapping.
+    let clamped = lot.add_funds(i32::MAX).unwrap();
+    assert_eq!(clamped, 327_679_999);
+    assert_eq!(lot.world().budget.funds, 327_679_999);
+    assert_eq!(
+        i32::from(lot.world().globals[14]) * 10_000 + i32::from(lot.world().globals[13]),
+        327_679_999
+    );
 
     // Reset to a sane value before saving.
-    lot.add_funds(-(i32::MAX - 5000)).unwrap();
+    lot.add_funds(-(327_679_999 - 5000)).unwrap();
     assert_eq!(lot.world().budget.funds, 5000);
 
     // 2. set_hour rejects >= 24, updates global 0/4/5/6, and marks rooms on period change.
@@ -295,10 +299,33 @@ fn move_objects_overrides_in_use_and_overlap_while_preserving_invariants() {
         lot.buy_move(&mut cursor, occupied_pos, level).unwrap(),
         "move_objects must allow overlapping placement on an occupied in-bounds tile"
     );
+    // P0 regression: invalid floor passed to buy_put_if_fits must be refused
+    // without overwriting cursor.position[2] or crashing commit!
+    assert!(
+        !lot.buy_put_if_fits(&mut cursor, i32::MIN).unwrap(),
+        "buy_put_if_fits must refuse i32::MIN level"
+    );
+    assert!(
+        !lot.buy_put_if_fits(&mut cursor, 0).unwrap(),
+        "buy_put_if_fits must refuse level 0"
+    );
+    assert_eq!(
+        cursor.position[2], level,
+        "refused buy_put_if_fits must preserve the previous valid floor"
+    );
     assert!(
         lot.buy_put_if_fits(&mut cursor, level).unwrap(),
         "buy_put_if_fits must agree with move_objects override"
     );
+    // P1 regression: disabling move_objects while holding a cheat-overridden
+    // preview must prevent committing the stale overlap under strict mode.
+    lot.set_move_objects(false);
+    assert!(
+        matches!(lot.buy_commit(&cursor), Err(OrderError::Refused(_))),
+        "disabling move_objects after an overlap preview must reject commit"
+    );
+    // Re-enabling move_objects allows the overlap commit to proceed.
+    lot.set_move_objects(true);
     let placed_id = lot.buy_commit(&cursor).unwrap();
     assert_eq!(placed_id, item_id);
     assert_eq!(
@@ -308,6 +335,26 @@ fn move_objects_overrides_in_use_and_overlap_while_preserving_invariants() {
         ],
         occupied_pos
     );
+
+    // P1 regression: picking up an already-overlapped object, moving it away,
+    // and then disabling move_objects must still allow buy_snap_back / buy_cancel
+    // to restore the captured overlapped origin without stranding the object!
+    let mut overlap_cursor = lot
+        .buy_pick_up(item_id)
+        .unwrap()
+        .expect("move_objects picks up overlapped item");
+    assert!(lot.buy_move(&mut overlap_cursor, orig_pos, level).unwrap());
+    lot.set_move_objects(false);
+    lot.buy_snap_back(&overlap_cursor).unwrap();
+    assert_eq!(
+        [
+            lot.world().objects[&item_id].position[0],
+            lot.world().objects[&item_id].position[1],
+        ],
+        occupied_pos,
+        "buy_snap_back must restore overlapped origin even after move_objects is toggled off"
+    );
+    lot.set_move_objects(true);
 
     // 3. Undo & redo work cleanly under move_objects.
     assert!(lot.buy_undo().unwrap());

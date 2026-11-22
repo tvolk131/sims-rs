@@ -1726,17 +1726,18 @@ struct VmInstallCacheInner {
     pool: ArchivePool,
     base_index: Index,
     base_first_by_name: BTreeMap<String, usize>,
-    base_missing_semi_globals: BTreeSet<String>,
+    base_qualified_names: BTreeSet<String>,
+    base_missing_unqualified_semi_globals: BTreeSet<String>,
+    base_missing_qualified_semi_globals: BTreeSet<String>,
     base_catalog: Catalog,
-    base_program: Program,
+    base_program: Option<Program>,
     animations: Animations,
     avatar_registry: AvatarRegistry,
-    base_people: People,
-    base_unresolved_people: BTreeMap<u32, String>,
+    base_people: Option<(People, BTreeMap<u32, String>)>,
     icon_frames: Option<BTreeMap<u16, i32>>,
     wardrobe: sims_content::Wardrobe,
     surfaces: Surfaces,
-    tuning: NeighborhoodTuning,
+    tuning: Option<NeighborhoodTuning>,
     default_character_name: String,
 }
 
@@ -1745,7 +1746,14 @@ impl fmt::Debug for VmInstallCache {
         f.debug_struct("VmInstallCache")
             .field("install_root", &self.inner.install.root)
             .field("base_objects", &self.inner.base_catalog.objects.len())
-            .field("base_libraries", &self.inner.base_program.libraries.len())
+            .field(
+                "base_libraries",
+                &self
+                    .inner
+                    .base_program
+                    .as_ref()
+                    .map_or(0, |p| p.libraries.len()),
+            )
             .finish()
     }
 }
@@ -1816,7 +1824,11 @@ impl VmInstallCache {
             )
         });
 
-        let base_program = program_res.map_err(|e| LifecycleError::Lot(e.to_string()))?;
+        // Defer base `Program` or `People` load failures to per-neighborhood
+        // full linking so a malformed base BHAV or base person that is shadowed
+        // by a valid neighborhood `Characters` definition still opens cleanly,
+        // matching uncached `enter_lot`.
+        let base_program = program_res.ok();
         let animations = animations_res.map_err(|e| LifecycleError::Lot(e.to_string()))?;
         let avatar_registry = registry_res.map_err(|e| LifecycleError::Lot(e.to_string()))?;
         let surfaces = surfaces_res.map_err(|e| LifecycleError::Lot(e.to_string()))?;
@@ -1827,23 +1839,34 @@ impl VmInstallCache {
             .iter()
             .filter(|o| o.kind == 2)
             .map(|o| o.guid);
-        let (base_people, base_unresolved_people) = People::load_each_with_registry(
+        let base_people = People::load_each_with_registry(
             &base_index,
             &base_catalog,
             base_person_types,
             &avatar_registry,
             &pool,
         )
-        .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+        .ok();
 
-        let tuning = NeighborhoodTuning::from_program(&base_program);
+        let tuning = base_program.as_ref().map(NeighborhoodTuning::from_program);
         let base_first_by_name = base_index.first_by_file_name();
-        let mut base_missing_semi_globals = BTreeSet::new();
+        let base_qualified_names: BTreeSet<String> = base_index
+            .resources
+            .iter()
+            .map(|r| r.name().replace('\\', "/").to_ascii_lowercase())
+            .collect();
+        let mut base_missing_unqualified_semi_globals = BTreeSet::new();
+        let mut base_missing_qualified_semi_globals = BTreeSet::new();
         for diag in &base_catalog.diagnostics {
             if let Some(rest) = diag.rsplit(": semi-global ").next()
                 && let Some(file) = rest.strip_suffix(" not found")
             {
-                base_missing_semi_globals.insert(file.to_ascii_lowercase());
+                if file.contains(['\\', '/']) {
+                    base_missing_qualified_semi_globals
+                        .insert(file.replace('\\', "/").to_ascii_lowercase());
+                } else {
+                    base_missing_unqualified_semi_globals.insert(file.to_ascii_lowercase());
+                }
             }
         }
 
@@ -1853,13 +1876,14 @@ impl VmInstallCache {
                 pool,
                 base_index,
                 base_first_by_name,
-                base_missing_semi_globals,
+                base_qualified_names,
+                base_missing_unqualified_semi_globals,
+                base_missing_qualified_semi_globals,
                 base_catalog,
                 base_program,
                 animations,
                 avatar_registry,
                 base_people,
-                base_unresolved_people,
                 icon_frames,
                 wardrobe,
                 surfaces,
@@ -1905,12 +1929,15 @@ struct StoreRuntime {
 
 /// Incrementally splices `inserted_range` (neighborhood `Characters` files)
 /// into `base_catalog` when no inserted filename collides with any base file
-/// name or unresolved base semi-global name; otherwise falls back to
-/// [`Catalog::build_with_pool`]. Returns `(catalog, can_reuse_base_program)`.
+/// name, base qualified path, or unresolved base semi-global name; otherwise
+/// falls back to [`Catalog::build_with_pool`]. Returns `(catalog, can_reuse_base_program)`.
+#[allow(clippy::too_many_arguments)]
 fn splice_character_catalog(
     base_catalog: &Catalog,
     base_first_by_name: &BTreeMap<String, usize>,
-    base_missing_semi_globals: &BTreeSet<String>,
+    base_qualified_names: &BTreeSet<String>,
+    base_missing_unqualified_semi_globals: &BTreeSet<String>,
+    base_missing_qualified_semi_globals: &BTreeSet<String>,
     index: &Index,
     pool: &ArchivePool,
     inserted_range: std::ops::Range<usize>,
@@ -1920,11 +1947,15 @@ fn splice_character_catalog(
     let mut safe_to_splice = base_catalog.global < start;
     if safe_to_splice {
         for resource in &index.resources[inserted_range.clone()] {
-            let lower = resource.file_name().to_ascii_lowercase();
-            if lower == "global.iff"
-                || lower == "work.iff"
-                || base_first_by_name.contains_key(&lower)
-                || base_missing_semi_globals.contains(&lower)
+            let lower_file = resource.file_name().to_ascii_lowercase();
+            let lower_qualified = resource.name().replace('\\', "/").to_ascii_lowercase();
+            if lower_file == "global.iff"
+                || lower_file == "work.iff"
+                || lower_file == "careers.txt"
+                || base_first_by_name.contains_key(&lower_file)
+                || base_missing_unqualified_semi_globals.contains(&lower_file)
+                || base_qualified_names.contains(&lower_qualified)
+                || base_missing_qualified_semi_globals.contains(&lower_qualified)
             {
                 safe_to_splice = false;
                 break;
@@ -2011,9 +2042,24 @@ fn splice_character_catalog(
         objects.push(shifted);
     }
 
+    let inserted_end = start + delta;
     let mut by_guid = BTreeMap::new();
     for (idx, object) in objects.iter().enumerate() {
-        by_guid.insert(object.guid, idx);
+        if let Some(previous_idx) = by_guid.insert(object.guid, idx) {
+            let prev = &objects[previous_idx];
+            if (start..inserted_end).contains(&object.resource)
+                || (start..inserted_end).contains(&prev.resource)
+            {
+                diagnostics.push(format!(
+                    "GUID 0x{:08X} in {} OBJD #{} replaces {} OBJD #{}",
+                    object.guid,
+                    index.resources[object.resource].location(&index.root),
+                    object.chunk,
+                    index.resources[prev.resource].location(&index.root),
+                    prev.chunk,
+                ));
+            }
+        }
     }
 
     let shift = |r: usize| if r >= start { r + delta } else { r };
@@ -2170,7 +2216,9 @@ impl StoreRuntime {
             splice_character_catalog(
                 &inner.base_catalog,
                 &inner.base_first_by_name,
-                &inner.base_missing_semi_globals,
+                &inner.base_qualified_names,
+                &inner.base_missing_unqualified_semi_globals,
+                &inner.base_missing_qualified_semi_globals,
                 &index,
                 &inner.pool,
                 inserted_range.clone(),
@@ -2178,15 +2226,18 @@ impl StoreRuntime {
         };
 
         let context = Context::COMPLETE_COLLECTION;
-        let mut program = if inserted_range.is_empty() {
-            inner.base_program.clone()
-        } else if can_reuse_base_program {
+        let reused_base_program = can_reuse_base_program && inner.base_program.is_some();
+        let mut program = if inserted_range.is_empty()
+            && let Some(base_program) = &inner.base_program
+        {
+            base_program.clone()
+        } else if can_reuse_base_program && let Some(base_program) = &inner.base_program {
             Program::link_with_base_cache(
                 &index,
                 &catalog,
                 catalog.objects.iter().map(|o| o.guid),
                 &inner.pool,
-                &inner.base_program,
+                base_program,
                 inserted_range.clone(),
             )
             .map_err(|e| LifecycleError::Lot(e.to_string()))?
@@ -2226,28 +2277,15 @@ impl StoreRuntime {
             inner.animations.clone()
         };
 
-        let (people, unresolved_people) = if inserted_range.is_empty() {
-            (
-                inner.base_people.clone(),
-                inner.base_unresolved_people.clone(),
-            )
-        } else if !can_reuse_base_program {
-            let person_types = catalog
-                .objects
-                .iter()
-                .filter(|o| o.kind == 2)
-                .map(|o| o.guid);
-            People::load_each_with_registry(
-                &index,
-                &catalog,
-                person_types,
-                &inner.avatar_registry,
-                &inner.pool,
-            )
-            .map_err(|e| LifecycleError::Lot(e.to_string()))?
-        } else {
-            let mut people = inner.base_people.clone();
-            let mut unresolved = inner.base_unresolved_people.clone();
+        let (people, unresolved_people) = if inserted_range.is_empty()
+            && let Some((base_people, base_unresolved)) = &inner.base_people
+        {
+            (base_people.clone(), base_unresolved.clone())
+        } else if can_reuse_base_program
+            && let Some((base_people, base_unresolved)) = &inner.base_people
+        {
+            let mut people = base_people.clone();
+            let mut unresolved = base_unresolved.clone();
             let mut char_person_guids = Vec::new();
             for object in &catalog.objects {
                 if inserted_range.contains(&object.resource) {
@@ -2283,6 +2321,20 @@ impl StoreRuntime {
                 unresolved.extend(char_unresolved);
             }
             (people, unresolved)
+        } else {
+            let person_types = catalog
+                .objects
+                .iter()
+                .filter(|o| o.kind == 2)
+                .map(|o| o.guid);
+            People::load_each_with_registry(
+                &index,
+                &catalog,
+                person_types,
+                &inner.avatar_registry,
+                &inner.pool,
+            )
+            .map_err(|e| LifecycleError::Lot(e.to_string()))?
         };
         program.people = people;
         program.icon_frames = inner.icon_frames.clone();
@@ -2300,8 +2352,8 @@ impl StoreRuntime {
         program
             .character_files
             .extend(stored.made_characters.made.values().map(|c| c.file));
-        let tuning = if can_reuse_base_program {
-            inner.tuning
+        let tuning = if reused_base_program && let Some(cached_tuning) = inner.tuning {
+            cached_tuning
         } else {
             NeighborhoodTuning::from_program(&program)
         };
@@ -3425,6 +3477,7 @@ fn save_and_leave_lot_inner(
             });
         }
     };
+    lot.world.family_flags = saved.world.family_flags;
     lot.neighborhood_origin = Some(NeighborhoodOrigin {
         store_id: store.store_id(),
         neighborhood_id: neighborhood_id.to_owned(),

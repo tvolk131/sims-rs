@@ -47,6 +47,12 @@ use sims_sim::rooms::RoomError;
 /// Off the lot: where the factory puts a new object.
 const OFF_LOT: i32 = -16;
 
+/// Sentinel stored in [`sims_sim::route::Context::target`] when its target
+/// object is deleted while the route context survives (`0x440fff`). Because
+/// live object IDs are positive `i16` (`1..=32767`) and `0` is reserved for
+/// loaded contexts, `u16::MAX` can never collide with a reused object ID.
+pub(crate) const DELETED_ROUTE_TARGET: u16 = u16::MAX;
+
 /// The callback table's entry for the Reset tree.
 const RESET: usize = 3;
 
@@ -426,6 +432,16 @@ impl Interpreter<'_> {
             marks.borrow_mut().insert(id);
         }
         self.drop_references(world, id)?;
+        // Record target loss on any surviving route context pointing at `id` so
+        // immediate object-ID reuse before `Go To Routing Slot` next ticks
+        // cannot redirect the route onto an unrelated newly-created object.
+        for route in world.routing.routes.values_mut() {
+            for context in &mut route.contexts {
+                if context.target == id {
+                    context.target = DELETED_ROUTE_TARGET;
+                }
+            }
+        }
         if person {
             self.reset_person_to_delete(world, id)?;
         } else {

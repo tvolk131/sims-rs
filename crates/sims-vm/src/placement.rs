@@ -261,7 +261,7 @@ const GRIDS: [u16; 2] = [3, 103];
 /// The tile flags of the two levels.
 const FLAGS: [u16; 2] = [8, 108];
 /// The tile flag a door or window sets on the tile it stands on (0x4330d7).
-const PORTAL_TILE: u8 = 8;
+pub(crate) const PORTAL_TILE: u8 = 8;
 
 /// Data words.
 mod data {
@@ -1132,6 +1132,19 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    /// Whether `id`'s master definition marks it as a door/portal (`word::PORTAL == 6`).
+    pub(crate) fn is_portal_object(&self, world: &World, id: u16) -> Result<bool, Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        Ok(self
+            .master_words(world, id, "checking portal object (0x4332af)")
+            .map_err(fail)?[word::PORTAL]
+            == 6)
+    }
+
     /// Sets or clears the mark a door or window keeps on its tile
     /// (0x4330d7), which does nothing outside the lot's border.
     fn mark_portal(&self, world: &mut World, at: [i8; 3], set: bool) -> Result<(), Trap> {
@@ -1192,13 +1205,30 @@ impl Interpreter<'_> {
             self.callback(world, parent, function::PLACED, 0)?;
         }
         // 0x4332b7: the door test reads the definition the object stands
-        // for, not its own.
+        // for, not its own. Only clear `PORTAL_TILE` when no other on-lot
+        // portal remains on `was` (e.g. if two doors ever shared a tile).
         let door = self
             .master_words(world, id, "taking a door off (0x4332af)")
             .map_err(fail)?[word::PORTAL]
             == 6;
         if door {
-            self.mark_portal(world, was, false).map_err(fail)?;
+            let mut another_portal_remains = false;
+            for (&other_id, other) in &world.objects {
+                if other_id == id || other.position[0] < 0 || other.position[1] < 0 {
+                    continue;
+                }
+                if (other.position[0] >> 4) == i32::from(was[0])
+                    && (other.position[1] >> 4) == i32::from(was[1])
+                    && other.position[2] == i32::from(was[2])
+                    && self.is_portal_object(world, other_id)?
+                {
+                    another_portal_remains = true;
+                    break;
+                }
+            }
+            if !another_portal_remains {
+                self.mark_portal(world, was, false).map_err(fail)?;
+            }
         }
         if notify {
             self.left_lot(world, id)?;

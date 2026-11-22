@@ -137,6 +137,10 @@ pub struct BuyCursor {
     /// Monotonic token stamped by `Lot` so retired cursor handles can never
     /// alias newly created objects that reuse a numeric ID.
     pub(crate) token: u64,
+    /// Whether the current valid preview was accepted only via the
+    /// `move_objects` ground override (so disabling `move_objects` before
+    /// commit requires revalidation under strict rules).
+    pub(crate) placed_via_override: bool,
 }
 
 impl BuyCursor {
@@ -510,6 +514,7 @@ impl Interpreter<'_> {
             container: None,
             origin: None,
             token: 0,
+            placed_via_override: false,
         };
         self.buy_rotate(world, &mut out, direction)?;
         Ok(Some(out))
@@ -623,8 +628,9 @@ impl Interpreter<'_> {
 
     /// Bounds-checked ground placement fallback used only when
     /// `self.move_objects` is enabled: still requires tile-centred coordinates
-    /// (`(x & 15) == 8 && (y & 15) == 8`), `level in 1..=2`, and every part of
-    /// the object strictly inside `1..size - 1`.
+    /// (`(x & 15) == 8 && (y & 15) == 8`), `level in 1..=2`, every part of the
+    /// object strictly inside `1..size - 1`, and rejects overlapping two
+    /// doors/portals onto the same tile so `PORTAL_TILE` invariants hold.
     fn user_test_place_ground_override(
         &self,
         world: &World,
@@ -635,7 +641,73 @@ impl Interpreter<'_> {
         if (pos[0] & 0x0f) != 8 || (pos[1] & 0x0f) != 8 {
             return Ok(false);
         }
-        self.all_parts_within_lot_bounds(world, id, pos, level)
+        if !self.all_parts_within_lot_bounds(world, id, pos, level)? {
+            return Ok(false);
+        }
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let is_group = world
+            .objects
+            .get(&id)
+            .is_some_and(|o| o.multipart.is_some());
+        if !is_group {
+            if self.is_portal_object(world, id)? {
+                let flags = crate::placement::tile_flags(
+                    world,
+                    (pos[0] >> 4) as i8,
+                    (pos[1] >> 4) as i8,
+                    level,
+                )
+                .map_err(fail)?;
+                if (flags & crate::placement::PORTAL_TILE) != 0 {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        let selected = world
+            .objects
+            .get(&id)
+            .and_then(|o| o.multipart.as_ref())
+            .map(|m| m.offset)
+            .unwrap_or([0; 3]);
+        let origin = [
+            pos[0].wrapping_sub(selected[0].wrapping_mul(16)),
+            pos[1].wrapping_sub(selected[1].wrapping_mul(16)),
+        ];
+        let origin_level = level.wrapping_sub(selected[2]);
+        for part in self.parts(world, id).map_err(fail)? {
+            if !self.is_portal_object(world, part)? {
+                continue;
+            }
+            let Some(offset) = world
+                .objects
+                .get(&part)
+                .and_then(|o| o.multipart.as_ref())
+                .map(|m| m.offset)
+            else {
+                return Ok(false);
+            };
+            let at = [
+                origin[0].wrapping_add(offset[0].wrapping_mul(16)),
+                origin[1].wrapping_add(offset[1].wrapping_mul(16)),
+            ];
+            let part_level = origin_level.wrapping_add(offset[2]);
+            let flags = crate::placement::tile_flags(
+                world,
+                (at[0] >> 4) as i8,
+                (at[1] >> 4) as i8,
+                part_level,
+            )
+            .map_err(fail)?;
+            if (flags & crate::placement::PORTAL_TILE) != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Checks `cTSObject::CanPickUp` (`0x4352e8`) / `cTSMultiTileObject::CanPickUp`
@@ -957,6 +1029,7 @@ impl Interpreter<'_> {
             container: origin.container,
             origin: Some(origin),
             token: 0,
+            placed_via_override: false,
         };
         let retained = out.container;
         if on_lot([px, py])
@@ -1103,7 +1176,7 @@ impl Interpreter<'_> {
         allow_override: bool,
     ) -> Result<bool, Fault> {
         let affordable = cursor.price <= 0 || cursor.price <= available_funds(world);
-        let container = match self.test_buy_placement(
+        let (container, used_override) = match self.test_buy_placement(
             world,
             cursor.cursor,
             cursor.held,
@@ -1111,17 +1184,18 @@ impl Interpreter<'_> {
             level,
             retained,
         )? {
-            Some(container) => container,
+            Some(container) => (container, false),
             None if allow_override
                 && self.move_objects
                 && self.user_test_place_ground_override(world, cursor.held, at, level)? =>
             {
-                None
+                (None, true)
             }
             None => return Ok(false),
         };
         cursor.position = [at[0], at[1], level];
         cursor.container = container;
+        cursor.placed_via_override = used_override;
         if affordable {
             cursor.valid = true;
         }
@@ -1336,7 +1410,6 @@ impl Interpreter<'_> {
         level: i32,
     ) -> Result<bool, Fault> {
         let retained = cursor.container;
-        cursor.position[2] = level;
         self.put_if_cursor_fits(world, cursor, retained, level, false)
     }
 
@@ -1361,10 +1434,11 @@ impl Interpreter<'_> {
         allow_override: bool,
     ) -> Result<bool, Fault> {
         let [x, y, _] = cursor.position;
-        if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
+        if !(1..=2).contains(&level) || !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
             if clear_on_refusal {
                 cursor.valid = false;
                 cursor.container = None;
+                cursor.placed_via_override = false;
             }
             return Ok(false);
         }
@@ -1372,17 +1446,20 @@ impl Interpreter<'_> {
             if clear_on_refusal {
                 cursor.valid = false;
                 cursor.container = None;
+                cursor.placed_via_override = false;
             }
-            return Ok(cursor.valid);
+            return Ok(false);
         }
         cursor.valid = false;
         cursor.container = None;
+        cursor.placed_via_override = false;
         if self.try_place_buy_at_mode(world, cursor, [x, y], level, retained, allow_override)? {
             return Ok(cursor.valid);
         }
         cursor.position = [x, y, level];
         cursor.valid = false;
         cursor.container = None;
+        cursor.placed_via_override = false;
         let cursor_place = Place {
             on_lot: true,
             position: [x, y],
@@ -1519,14 +1596,44 @@ impl Interpreter<'_> {
                     .into(),
             )));
         }
+        let [x, y, level] = cursor.position;
+        if !(1..=2).contains(&level)
+            || !self.all_parts_within_lot_bounds(world, cursor.held, [x, y], level)?
+        {
+            return Err(fail(Trap::Invalid(
+                "cannot commit Buy Mode placement: target position or level is out of bounds"
+                    .into(),
+            )));
+        }
         if cursor.price > 0 && cursor.price > available_funds(world) {
             return Err(fail(Trap::Invalid(
                 "cannot commit Buy Mode placement: insufficient funds".into(),
             )));
         }
         self.remove_cursor_and_held(world, cursor)?;
+        if cursor.placed_via_override {
+            let still_valid = if self.move_objects {
+                cursor.container.is_none()
+                    && self.user_test_place_ground_override(world, cursor.held, [x, y], level)?
+            } else {
+                self.test_buy_placement(
+                    world,
+                    cursor.cursor,
+                    cursor.held,
+                    [x, y],
+                    level,
+                    cursor.container,
+                )?
+                .is_some()
+            };
+            if !still_valid {
+                return Err(fail(Trap::Invalid(
+                    "cannot commit Buy Mode placement: preview requires move_objects override"
+                        .into(),
+                )));
+            }
+        }
         self.remove_now(world, self.lead_object(world, cursor.cursor))?;
-        let [x, y, level] = cursor.position;
         let place = Place {
             on_lot: true,
             position: [x, y],
@@ -1651,9 +1758,10 @@ impl Interpreter<'_> {
         world: &mut World,
         target: &BuyPlacement,
         allow_create: bool,
+        allow_override: bool,
     ) -> Result<Option<u16>, Fault> {
         let [x, y, level] = target.position;
-        if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
+        if !(1..=2).contains(&level) || !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
             return Ok(None);
         }
         let snapshot = (!target.children.is_empty()).then(|| world.clone());
@@ -1677,7 +1785,7 @@ impl Interpreter<'_> {
             None => {
                 self.user_test_place_ground(world, id, [x, y], level)?
                     .is_ok()
-                    || (self.move_objects
+                    || (allow_override
                         && self.user_test_place_ground_override(world, id, [x, y], level)?)
             }
         };
@@ -1704,7 +1812,7 @@ impl Interpreter<'_> {
         self.run_user_placement(world, id)?;
         for child in &target.children {
             if self
-                .restore_placement(world, child, allow_create)?
+                .restore_placement(world, child, allow_create, allow_override)?
                 .is_none()
             {
                 if let Some(saved) = snapshot {
@@ -1761,7 +1869,8 @@ impl Interpreter<'_> {
                 if !all_placement_objects_on_lot(world, &before) {
                     return Ok(false);
                 }
-                let Some(id) = self.restore_placement(world, &before, false)? else {
+                let Some(id) = self.restore_placement(world, &before, false, self.move_objects)?
+                else {
                     return Ok(false);
                 };
                 purchase.object = id;
@@ -1791,7 +1900,8 @@ impl Interpreter<'_> {
                     return Ok(false);
                 }
                 let before_restore = world.clone();
-                let Some(id) = self.restore_placement(world, &target, true)? else {
+                let Some(id) = self.restore_placement(world, &target, true, self.move_objects)?
+                else {
                     return Ok(false);
                 };
                 if purchase.price > 0 && available_funds(world) < purchase.price {
@@ -1846,7 +1956,8 @@ impl Interpreter<'_> {
                     return Ok(false);
                 }
                 let before_restore = world.clone();
-                let Some(id) = self.restore_placement(world, &target, true)? else {
+                let Some(id) = self.restore_placement(world, &target, true, self.move_objects)?
+                else {
                     return Ok(false);
                 };
                 if purchase.price > 0 && available_funds(world) < purchase.price {
@@ -1865,7 +1976,8 @@ impl Interpreter<'_> {
                 if !all_placement_objects_on_lot(world, &after) {
                     return Ok(false);
                 }
-                let Some(id) = self.restore_placement(world, &after, false)? else {
+                let Some(id) = self.restore_placement(world, &after, false, self.move_objects)?
+                else {
                     return Ok(false);
                 };
                 purchase.object = id;
@@ -1983,7 +2095,13 @@ impl Interpreter<'_> {
         self.take_off_cursor_and_held_unconditional(world, cursor)?;
         self.remove_now(world, self.lead_object(world, cursor.cursor))?;
         if let Some(origin) = &cursor.origin {
-            if self.restore_placement(world, origin, false)?.is_none() {
+            // Always permit bounds-checked ground override when restoring the
+            // captured pre-pickup origin so toggling `move_objects` off mid-drag
+            // can never strand an already-overlapped object off-lot.
+            if self
+                .restore_placement(world, origin, false, true)?
+                .is_none()
+            {
                 return Err(Fault {
                     object: cursor.held,
                     at: None,

@@ -486,6 +486,7 @@ impl Machine<'_, '_> {
             }
             return Ok(Flow::Yield);
         }
+        let lost = lost || ctx.target == crate::removal::DELETED_ROUTE_TARGET;
         if lost {
             // 0x45ae8d: with the stack object gone or off the lot, a route
             // under way stops its animator first (step 20); any other step

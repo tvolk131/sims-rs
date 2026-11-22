@@ -587,4 +587,10 @@ fn deleting_an_object_that_a_person_is_routing_to_succeeds_without_trapping() {
     assert!(!world.objects.contains_key(&2));
     assert!(world.objects.contains_key(&1));
     assert!(world.objects.contains_key(&9));
+    // P1 regression: surviving route context is stamped with u16::MAX so even
+    // if `create` immediately reuses freed ID 2, the route cannot target the
+    // newly allocated object.
+    assert_eq!(world.routing.routes[&9].contexts[0].target, u16::MAX);
+    assert_eq!(interpreter.create(&mut world, WIDGET), Ok(2));
+    assert_eq!(world.routing.routes[&9].contexts[0].target, u16::MAX);
 }
