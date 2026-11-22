@@ -19,16 +19,20 @@
 //! Goth house), to the pixel. How the drawn menu looks has **not** been
 //! compared with a screenshot.
 //!
-//! In the middle the original draws the selected Sim's head, rendered
-//! live into the blank 201 by 201 face bitmap. The head is the host's
-//! (`sims-people`); [`draw`] takes it as an image.
+//! In the middle the original renders the selected Sim's 3D head directly
+//! into the house viewport during the 3D pass (`0x4a953e` → `0x462985`),
+//! before the 2D menu (`0x5eb04c`) draws the transparent 201 by 201 face
+//! placeholder (`PieFace1.bmp`) and labels over it. [`draw`] also accepts an
+//! optional pre-rendered head image for callers that composite in the 2D pass.
 
 use crate::art::Art;
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
 use sims_formats::bitmap::Image;
 
-/// The face bitmap the head is drawn into (kPieFaceBkg).
+/// The transparent 201×201 face placeholder bitmap (`kPieFaceBkg`, all colour
+/// key); in the original the 3D head draws in the house-viewport pass behind
+/// the 2D menu (`0x462985`).
 pub const FACE: i32 = 800;
 /// Every resource the menu draws, for [`Art::load`].
 pub const RESOURCES: [i32; 1] = [FACE];
@@ -342,8 +346,9 @@ pub fn draw(
     highlighted: Option<usize>,
     pressed: bool,
 ) {
-    // The face bitmap is all colour key in the game's art; the head is
-    // rendered into it.
+    // The face bitmap is all colour key in the game's art (`0x5eb04c`); the
+    // original draws the 3D head separately in the house-viewport pass
+    // (`0x462985`), though callers may also pass an image here.
     for image in [art.image(FACE), head].into_iter().flatten() {
         frame.draw_all(image, [layout.face.x, layout.face.y]);
     }
@@ -546,8 +551,10 @@ impl Pie {
         }
     }
 
-    /// Draws the menus of `layouts` with the head in each middle, the
-    /// pointer at `pointer` and a mouse button held when `pressed`.
+    /// Draws the menus of `layouts` with the head in the first menu's middle
+    /// (matching `0x462290`: while a submenu is open the 3D head stays at the
+    /// parent menu's center and is not duplicated onto the submenu), the
+    /// pointer at `pointer`, and a mouse button held when `pressed`.
     pub fn draw(
         frame: &mut Frame,
         art: &Art,
@@ -562,7 +569,14 @@ impl Pie {
             } else {
                 None
             };
-            draw(frame, art, layout, head, highlighted, pressed);
+            draw(
+                frame,
+                art,
+                layout,
+                head.filter(|_| n == 0),
+                highlighted,
+                pressed,
+            );
         }
     }
 }
@@ -741,6 +755,43 @@ mod tests {
         assert_eq!(pie.clone().press(&layouts, [0, 0]), Pressed::Closed);
         assert_eq!(pie.press(&layouts, layouts[1].center), Pressed::Back);
         assert_eq!(pie.submenu, None);
+    }
+
+    #[test]
+    fn submenu_draws_the_head_only_once_on_the_parent_menu() {
+        let art = art();
+        // Four entries put "Ask" to the right so the submenu's labels do not
+        // cover the parent's center.
+        let mut pie = Pie::new(&["Talk", "Ask/Dance", "Ask/Out", "Hug"], [400, 300]);
+        let layouts = pie.layout([800, 600], &art).unwrap();
+        let ask = layouts[0].labels[1].rect;
+        assert!(matches!(
+            pie.press(&layouts, [ask.x + 1, ask.y + 1]),
+            Pressed::Opened { .. }
+        ));
+        let layouts = pie.layout([800, 600], &art).unwrap();
+        assert_eq!(layouts.len(), 2);
+        // A 201x201 head with a single opaque red marker pixel at (100, 120),
+        // below the submenu's title box.
+        let mut rgba = vec![0u8; 201 * 201 * 4];
+        let mark = (120 * 201 + 100) * 4;
+        rgba[mark..mark + 4].copy_from_slice(&[255, 0, 0, 255]);
+        let head = Image {
+            width: 201,
+            height: 201,
+            rgba,
+        };
+        let mut frame = Frame::new(800, 600, [0; 3]);
+        Pie::draw(&mut frame, &art, &layouts, Some(&head), None, false);
+        assert_eq!(
+            frame.pixel(layouts[0].face.x + 100, layouts[0].face.y + 120),
+            Some([255, 0, 0])
+        );
+        // The submenu's own face is NOT stamped with a second copy of the head.
+        assert_eq!(
+            frame.pixel(layouts[1].face.x + 100, layouts[1].face.y + 120),
+            Some([0, 0, 0])
+        );
     }
 
     #[test]

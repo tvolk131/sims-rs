@@ -23,6 +23,7 @@ pub mod house;
 pub mod lot;
 pub mod math;
 pub mod person;
+pub mod pie_head;
 pub mod raster;
 pub mod rig;
 pub mod skin;

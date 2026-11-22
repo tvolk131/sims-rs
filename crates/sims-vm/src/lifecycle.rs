@@ -1706,6 +1706,7 @@ fn boot_from_saved_lot(
         )));
     }
     let StoreRuntime {
+        install,
         index,
         catalog,
         program,
@@ -1970,10 +1971,16 @@ fn boot_from_saved_lot(
         floor_rotation: saved.floor_rotation,
         view_centre: effective_view_centre,
         replay_view: saved.replay_view,
+        last_dialog_text: saved.last_dialog_text,
+        character_names: saved.character_names,
+        default_character_name: crate::boot::read_default_character_name(&install),
+        lot_name: saved.lot_name,
+        lot_description: saved.lot_description,
         loaded: saved.loaded,
         buy_undo: Vec::new(),
         buy_redo: Vec::new(),
         buy_orphans: Vec::new(),
+        active_buy_cursor: None,
         neighborhood_origin: Some(NeighborhoodOrigin {
             store_id,
             neighborhood_id: neighborhood_id.to_owned(),
@@ -2364,10 +2371,16 @@ fn boot_from_base_house(
         floor_rotation: view_rotation,
         view_centre,
         replay_view: None,
+        last_dialog_text: String::new(),
+        character_names: std::collections::BTreeMap::new(),
+        default_character_name: crate::boot::read_default_character_name(&install),
+        lot_name: String::new(),
+        lot_description: String::new(),
         loaded,
         buy_undo: Vec::new(),
         buy_redo: Vec::new(),
         buy_orphans: Vec::new(),
+        active_buy_cursor: None,
         neighborhood_origin: Some(NeighborhoodOrigin {
             store_id,
             neighborhood_id: neighborhood_id.to_owned(),
@@ -4116,11 +4129,13 @@ mod tests {
             tick: 1,
             object: 1,
             answers: &[2, 3],
+            text_entry: false,
         };
         let one_button_notice = Shown {
             tick: 2,
             object: 1,
             answers: &[2],
+            text_entry: false,
         };
         assert_eq!(player.answer(&choice_dialog).map(|a| a.status), Some(2));
         assert_eq!(

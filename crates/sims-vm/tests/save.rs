@@ -117,6 +117,7 @@ fn an_answered_save_takes_input_after_its_step_in_a_lot_that_does_not_wait() {
         .answer(sims_vm::Answer {
             status: 3,
             bitmap_id: Some(17),
+            text: None,
         })
         .unwrap();
     let saved = Saved::decode(&asked.save().unwrap().encode()).unwrap();

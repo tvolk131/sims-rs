@@ -251,6 +251,10 @@ impl<'a> Machine<'a, '_> {
             view_centre: self.view_centre,
             refreshing: interpreter.refreshing,
             taken_off: interpreter.taken_off,
+            dialog_text: self.dialog_text,
+            character_names: self.character_names,
+            default_character_name: self.default_character_name,
+            active_family: self.active_family,
         }
     }
 

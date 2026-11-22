@@ -10,6 +10,7 @@
 //! `docs/decisions/`.
 
 pub mod assets;
+pub mod cache;
 pub mod camera;
 pub mod canvas;
 pub mod caps;
@@ -25,6 +26,7 @@ pub mod scene;
 pub mod shadows;
 
 pub use assets::Assets;
+pub use cache::LotCache;
 pub use camera::{Camera, Walls, Zoom};
 pub use canvas::{Canvas, Ids, Image};
 pub use cutaway::{Focus, Selected, screen_centre_pick, unproject_terrain};
@@ -32,7 +34,9 @@ pub use light::Light;
 pub use lot::Lot;
 pub use open::{Opened, open_house};
 pub use scene::{
-    Stats, draw, draw_held, draw_lot, draw_lot_in_viewport, draw_lot_with_preview, holds_person,
+    RenderOptions, Stats, draw, draw_held, draw_held_with_options, draw_lot, draw_lot_in_viewport,
+    draw_lot_in_viewport_with_options, draw_lot_with_preview, draw_lot_with_preview_and_options,
+    holds_person,
 };
 
 /// An error with a message saying what failed.

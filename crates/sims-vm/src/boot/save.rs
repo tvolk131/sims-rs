@@ -27,7 +27,7 @@ use super::Lot;
 use crate::Answers;
 use serde::{Deserialize, Serialize};
 use sims_sim::World;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
 /// their order and their types (postcard is not self-describing). Bump it
@@ -38,11 +38,13 @@ use std::collections::BTreeSet;
 /// pre-resolved house view centre; layout 4 keeps the house file's saved
 /// floor rotation baseline (`HOUS 0` `camera_direction & 3`); layout 5
 /// keeps the view-rotated screen-centre tile pick (`0x4a7b58` cut via
-/// `0x433067`) and any frozen dialog-replay view; layout 6 keeps choice-only
-/// follow-up answers (`Answers::choices_after`) separately from explicit
-/// dialog replay queues; layout 7 records the neighborhood's `deletion_epoch`
-/// at save time so reusing a deleted character GUID never revives stale
-/// instances on older saved lots.
+/// `0x433067`) and any frozen dialog-replay view; layout 6 keeps each
+/// pending dialog answer's text-entry string ([`crate::Answer::text`]),
+/// last kind 3 dialog text, Make New Character catalog names, and Save Card
+/// lot name & description; layout 7 keeps choice-only follow-up answers
+/// (`Answers::choices_after`) separately from explicit dialog replay queues
+/// and records the neighborhood's `deletion_epoch` at save time so reusing a
+/// deleted character GUID never revives stale instances on older saved lots.
 pub const FORMAT: u32 = 7;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
@@ -66,7 +68,14 @@ pub struct Saved {
     /// Format 5 on: frozen `(view_rotation, view_centre)` while a dialog tick
     /// awaits replay.
     pub(crate) replay_view: Option<(u8, Option<[i8; 2]>)>,
-    /// Format 6 on: neighborhood `deletion_epoch` at the time this lot was
+    /// Format 6 on: last kind 3 dialog text (`[0x6e4ac0]`), Make New Character
+    /// catalog names (`0x44b0e8`), and Save Card lot name & description
+    /// (`0x50e1f8..0x50e42c`).
+    pub(crate) last_dialog_text: String,
+    pub(crate) character_names: BTreeMap<u32, String>,
+    pub(crate) lot_name: String,
+    pub(crate) lot_description: String,
+    /// Format 7 on: neighborhood `deletion_epoch` at the time this lot was
     /// saved (`0` for non-REDB saves).
     pub(crate) deletion_epoch: u64,
 }
@@ -177,6 +186,9 @@ impl Lot {
         if self.halted {
             return Err(SaveError::Halted);
         }
+        let cursor = cursor
+            .filter(|c| self.is_active_buy_cursor(c))
+            .or_else(|| self.active_buy_cursor.as_ref().map(|a| &a.cursor));
         let mut world = self.world.clone();
         let has_history =
             !self.buy_redo.is_empty() || !self.buy_undo.is_empty() || !self.buy_orphans.is_empty();
@@ -192,19 +204,26 @@ impl Lot {
                     crate::interpreter::Stream::Global,
                 )
             };
-            // Strip any unpaid Buy preview first so an item linked into an
-            // undone surface container's slot is cleanly unlinked and deleted
-            // before detached history objects are purged.
+            // Strip any active Buy preview (or snap back any held existing
+            // furniture) first so a saved lot never serializes an unpaid item,
+            // a `"Tile Cursor"`, or a held/hidden paid object stranded off-lot,
+            // and never double-deletes a preview linked in a detached surface.
             if let Some(cursor) = cursor {
-                interpreter.buy_cancel(&mut world, cursor).map_err(|e| {
+                let live = self.strip_detached_origin_children(cursor);
+                interpreter.buy_cancel(&mut world, &live).map_err(|e| {
                     SaveError::Format(format!("clearing Buy Mode preview for save: {e}"))
                 })?;
             }
             if has_history {
+                let empty = std::collections::BTreeSet::new();
                 interpreter
-                    .buy_purge_detached(&mut world, &self.buy_redo)
-                    .and_then(|()| interpreter.buy_purge_detached(&mut world, &self.buy_undo))
-                    .and_then(|()| interpreter.buy_purge_detached(&mut world, &self.buy_orphans))
+                    .buy_purge_detached(&mut world, &self.buy_redo, &empty)
+                    .and_then(|()| {
+                        interpreter.buy_purge_detached(&mut world, &self.buy_undo, &empty)
+                    })
+                    .and_then(|()| {
+                        interpreter.buy_purge_detached(&mut world, &self.buy_orphans, &empty)
+                    })
                     .map_err(|e| {
                         SaveError::Format(format!("clearing detached Buy Mode redo objects: {e}"))
                     })?;
@@ -224,6 +243,10 @@ impl Lot {
             view_centre: self.view_centre,
             floor_rotation: self.floor_rotation,
             replay_view: self.replay_view,
+            last_dialog_text: self.last_dialog_text.clone(),
+            character_names: self.character_names.clone(),
+            lot_name: self.lot_name.clone(),
+            lot_description: self.lot_description.clone(),
             deletion_epoch: 0,
         })
     }
@@ -257,12 +280,17 @@ impl Lot {
         self.view_rotation = saved.view_rotation;
         self.view_centre = saved.view_centre;
         self.replay_view = saved.replay_view;
+        self.last_dialog_text = saved.last_dialog_text;
+        self.character_names = saved.character_names;
+        self.lot_name = saved.lot_name;
+        self.lot_description = saved.lot_description;
         self.halted = false;
         self.asking = None;
         self.answered = saved.answered;
         self.buy_undo.clear();
         self.buy_redo.clear();
         self.buy_orphans.clear();
+        self.active_buy_cursor = None;
         // Restoring an external snapshot replaces `self.world` (including its
         // cached `families` and `neighbors`), so it is no longer a live
         // continuation of the store revision this `Lot` was opened from.

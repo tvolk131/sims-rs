@@ -14,13 +14,18 @@ use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
 use sims_ui::balloon::Texts;
-use sims_ui::buy::{self, BuyCatalog, BuyLayout, BuyState, BuyWidgetKind};
-use sims_ui::command::{Command, Mode, Panel as UiPanel, Walls as UiWalls};
-use sims_ui::dialog::{self, Labels, Message};
+use sims_ui::buy::{
+    self, BuyCatalog, BuyLayout, BuyState, BuyWidgetKind, RatingLabels, SellInfo, SellLabels,
+};
+use sims_ui::command::{
+    Command, Mode, OptionsAction, Panel as UiPanel, VolumeChannel, Walls as UiWalls,
+};
+use sims_ui::dialog::{self, DialogState, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::house;
 use sims_ui::household::{Acquaintances, Careers, Faces, Fame, Snapshot};
 use sims_ui::hud::{self, Controls, Item, Selected};
+use sims_ui::options::{self, OptionsTexts};
 use sims_ui::pie;
 use sims_ui::queue::Queue;
 use sims_ui::thumbnail::{self, Thumbnails};
@@ -43,10 +48,68 @@ pub const ERROR: &str = "UI_error";
 pub const CLICK: &str = "UI_click";
 /// A help balloon opening or closing (0x50fa95, 0x50fb7f).
 pub const WHOOSH: &str = "UI_whoosh";
+/// Selling an object with nonzero refund (`0x487e18` → `0x492ad4`).
+pub const MONEYBACK: &str = "UI_moneyback";
+/// Disposing of a zero-value object (`0x487e18` → `0x492b05`).
+pub const ARCHTOOL_DELETE: &str = "UI_archtool_delete";
+
+/// Keyboard keys handled by native modal dialogs (`cTSWinGenDlg::OnKeyDown` /
+/// `OnChar` at `0x5e5b3b..0x5e5bfd`, `0x6d7530`, plus Tab on multi-field cards).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogKey {
+    /// Enter (`0x0d`): activates the primary/default button (button 0).
+    Enter,
+    /// Escape (`0x1b`): activates the cancel button (last button on confirmations,
+    /// or Cancel on multi-button entry cards).
+    Escape,
+    /// Tab: cycles keyboard focus between Lot Name and Lot Description on the
+    /// edit-mode Save Card.
+    Tab,
+    /// Printable character: matches localized Yes/No shortcut letters on
+    /// confirmation dialogs (`STR# 142[3]` / `STR# 142[4]`, `0x5e5b80..0x5e5bfd`).
+    Char(char),
+}
+
+/// Which native Options confirmation dialog is currently open (`0x516809`,
+/// `0x516874`, `0x5170f0`, `0x517c03 -> 0x50d68a`, `0x4f290d`, `0x4f1a11`,
+/// `0x4f25b4`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionsDialog {
+    /// Edit-mode Save card (`0x516874 -> 0x517c03(0)` when `[lot + 0x50] == 1`):
+    /// `PopupInfoTiles.bmp` (3008) + `SAVE_CARD` (4994) + OK.
+    SaveCardSave,
+    /// Edit-mode dirty Quit card (`0x516815 -> 0x517c03(1)`):
+    /// `PopupInfoTiles.bmp` (3008) + `SAVE_CARD` (4994) + Yes/No/Cancel.
+    SaveCardQuit,
+    /// Edit-mode dirty Neighborhood card (`0x51710c -> 0x517c03(1)`):
+    /// `PopupInfoTiles.bmp` (3008) + `SAVE_CARD` (4994) + Yes/No/Cancel.
+    SaveCardNeighborhood,
+    /// Clean or non-savable Quit confirmation (`0x4f29f1..0x4f2a7a`):
+    /// `STR# 153[1..2]` (`confirm_quit`) + Yes/No.
+    ConfirmQuit,
+    /// Dirty savable Quit confirmation (`0x4f298e..0x4f29be`):
+    /// `STR# 153[5..6]` (`confirm_save_before_quit`) + Yes/No/Cancel.
+    ConfirmSaveBeforeQuit,
+    /// Dirty savable Neighborhood confirmation (`0x51712d -> 0x4f1a11`):
+    /// `STR# 153[3..4]` (`confirm_save`) + Yes/No/Cancel.
+    ConfirmSaveBeforeNeighborhood,
+    /// Reset Tutorial confirmation (`0x4f25b4`):
+    /// `STR# 153[7..8]` (`confirm_reset_tutorial`) + Yes/No.
+    ConfirmResetTutorial,
+    /// Edit-mode dirty Reset Tutorial card (`0x4f25ea -> 0x4f1a11 -> 0x517c03(1)`):
+    /// `PopupInfoTiles.bmp` (3008) + `SAVE_CARD` (4994) + Yes/No/Cancel.
+    SaveCardResetTutorial,
+    /// Dirty savable Reset Tutorial confirmation (`0x4f25ea -> 0x4f1a11`):
+    /// `STR# 153[3..4]` (`confirm_save`) + Yes/No/Cancel.
+    ConfirmSaveBeforeResetTutorial,
+}
 
 pub struct Hud {
     pub art: Art,
     faces: Faces,
+    /// Boot-time faces/names snapshot, restored before re-applying saved
+    /// runtime character names on [`Game::restore`].
+    boot_faces: Faces,
     /// The catalog pictures of the object types the queue has shown.
     thumbnails: Thumbnails,
     /// What could not be read while drawing, until the game takes it.
@@ -69,6 +132,9 @@ pub struct Hud {
     labels: Labels,
     /// The help balloons' texts.
     texts: Texts,
+    /// The Options panel's coordinates, labels, and confirmation strings
+    /// (`GameData/UIText.iff STR# 145` & `153`).
+    options_texts: OptionsTexts,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
     pub controls: Controls,
@@ -76,7 +142,21 @@ pub struct Hud {
     /// The dialog the world waits on, and the record it was read from
     /// (its caller and the operands), so it is read once.
     message: Option<(Message, (u16, [u8; 8]))>,
+    /// A UI-owned modal confirmation dialog (e.g. Save / Neighborhood / Quit /
+    /// Reset Tutorial from Options mode), shown using the same native
+    /// `cTSWinMsgBox` chrome (`PopupInfoTiles.bmp` 3008).
+    ui_dialog: Option<(OptionsDialog, Message)>,
+    /// Interactive state (focus, caret, 500 ms blink, pressed button) of the
+    /// active modal dialog.
+    dialog_state: DialogState,
     dialog: Option<dialog::Layout>,
+    /// Active Sound volume slider being dragged (`0x5f6245..0x5f6336`).
+    dragging_slider: Option<VolumeChannel>,
+    /// Options action button (`Save` / `Neighborhood` / `Quit` / `Reset Tutorial`)
+    /// currently held down for mouse-up dispatch (`0x514170..0x514176`,
+    /// `0x5e45d2..0x5e45f3`). Hit-tested against its live layout rectangle on
+    /// release so a mid-press resize cannot fire an unhovered button.
+    pressed_options_action: Option<OptionsAction>,
     /// The pie menu, while one is open.
     pub menu: Option<Menu>,
     /// The status band across the top, as last drawn.
@@ -97,6 +177,10 @@ pub struct Hud {
     idle_speed: bool,
     /// The Buy Mode residential catalog, loaded lazily on first Buy Mode entry.
     buy_catalog: Option<BuyCatalog>,
+    /// Buy Mode popup rating labels (`GameData/UIText.iff STR# 160`, `0x508168`).
+    rating_labels: RatingLabels,
+    /// Buy Mode sell prompt templates (`GameData/UIText.iff STR# 136`, `0x50a343`).
+    sell_labels: SellLabels,
     /// The Buy Mode catalog strip state (sort, category, subcategory, page,
     /// selected GUID).
     pub buy_state: BuyState,
@@ -123,6 +207,7 @@ impl Hud {
         let ui = UiGraphics::open(&install).map_err(|e| e.to_string())?;
         let resources: Vec<i32> = hud::RESOURCES
             .iter()
+            .chain(&options::RESOURCES)
             .chain(&dialog::RESOURCES)
             .chain(&pie::RESOURCES)
             .chain(&sims_ui::queue::RESOURCES)
@@ -130,17 +215,25 @@ impl Hud {
             .copied()
             .collect();
         let mut art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
-        for id in hud::OPTIONAL_RESOURCES {
+        for id in hud::OPTIONAL_RESOURCES
+            .iter()
+            .chain(&options::HELP_RESOURCES)
+            .chain(&[options::id::SAVE_CARD])
+            .copied()
+        {
             art.load_optional(&ui, US_ENGLISH, id);
         }
         for id in buy::resource_ids() {
             art.load_optional(&ui, US_ENGLISH, id);
         }
         let labels = Labels::load(&install).map_err(|e| e.to_string())?;
-        // Without the balloons' strings the HUD still opens; the balloons
-        // show what text they have.
+        let rating_labels = RatingLabels::load(&install);
+        let sell_labels = SellLabels::load(&install);
+        // Without the balloons' or options' strings the HUD still opens with defaults.
         let texts = Texts::load(&install).unwrap_or_default();
         let fame = Fame::load(&install).unwrap_or_default();
+        let options_texts = OptionsTexts::load(&install).unwrap_or_default();
+        let options_state = options::OptionsState::load_install(&install).unwrap_or_default();
         let neighborhood = house
             .parent()
             .and_then(Path::parent)
@@ -175,6 +268,7 @@ impl Hud {
         );
         Ok(Self {
             art,
+            boot_faces: faces.clone(),
             faces,
             thumbnails: Thumbnails::default(),
             problems: Vec::new(),
@@ -185,15 +279,22 @@ impl Hud {
             known,
             labels,
             texts,
+            options_texts,
             members,
-            // The strip opens as if Live had been pressed.
+            // The strip opens as if Live had been pressed, with preferences
+            // loaded from `UserData/Options.iff` (`Optn` 128, `0x4e6505`).
             controls: Controls {
                 expanded: true,
+                options: options_state,
                 ..Controls::default()
             },
             items: Vec::new(),
             message: None,
+            ui_dialog: None,
+            dialog_state: DialogState::default(),
             dialog: None,
+            dragging_slider: None,
+            pressed_options_action: None,
             menu: None,
             band: None,
             queue: Queue::default(),
@@ -201,6 +302,8 @@ impl Hud {
             clock_blink: ClockBlink::default(),
             idle_speed: false,
             buy_catalog: None,
+            rating_labels,
+            sell_labels,
             buy_state: BuyState::default(),
             buy_layout: BuyLayout::default(),
             sounds: Vec::new(),
@@ -214,7 +317,16 @@ impl Hud {
     pub fn forget(&mut self) {
         self.menu = None;
         self.message = None;
+        self.ui_dialog = None;
+        self.dialog_state = DialogState::default();
         self.dialog = None;
+        self.dragging_slider = None;
+        self.pressed_options_action = None;
+        self.controls.pressed_options_action = None;
+        self.controls.help = None;
+        self.controls.options.tab = None;
+        self.controls.options.help = None;
+        self.items.clear();
         self.pressed = Pressed::default();
         self.clock_blink.reset();
         self.idle_speed = false;
@@ -226,8 +338,13 @@ impl Hud {
 
     /// Loads the residential Buy Mode catalog on first use and returns it.
     pub fn ensure_buy_catalog(&mut self, assets: &Assets) -> &BuyCatalog {
-        self.buy_catalog
-            .get_or_insert_with(|| BuyCatalog::load(assets.index(), assets.catalog()))
+        let rating_labels = self.rating_labels.clone();
+        let sell_labels = self.sell_labels.clone();
+        self.buy_catalog.get_or_insert_with(|| {
+            BuyCatalog::load(assets.index(), assets.catalog())
+                .with_rating_labels(rating_labels)
+                .with_sell_labels(sell_labels)
+        })
     }
 
     /// The residential Buy Mode catalog, once loaded.
@@ -240,19 +357,46 @@ impl Hud {
         &self.buy_layout
     }
 
-    /// Lays out the Buy Mode catalog strip for `size` and `world` (or clears
-    /// it outside expanded Buy Mode), syncing `self.buy_state.page` to the
-    /// clamped page number.
-    pub fn layout_buy(&mut self, size: [i32; 2], world: &World, assets: &Assets) {
+    /// Whether `point` lies over the expanded Buy Mode catalog / sell strip
+    /// (`cWinCatalog`, `x >= 240` and `y >= height - STRIP`), where clicking or
+    /// dropping a held object sells it (`0x50d04d` → `0x4cf97a` → `0x487e18`).
+    /// Uses the 100 px strip height (`hud::STRIP`), NOT the 150 px left-cluster
+    /// container (`hud::TALL_STRIP`), so releasing in the house viewport above
+    /// `y = height - 100` never triggers a sale.
+    pub fn over_buy_catalog(&self, size: [i32; 2], point: [i32; 2]) -> bool {
+        if self.controls.mode != Mode::Buy || !self.controls.expanded {
+            return false;
+        }
+        if let Some(prompt) = &self.buy_layout.sell_prompt {
+            return prompt.rect.contains(point[0], point[1]);
+        }
+        let top = size[1] - hud::STRIP;
+        point[0] >= 240 && point[0] < size[0] && point[1] >= top && point[1] < size[1]
+    }
+
+    /// Lays out the Buy Mode catalog strip (or active Hand Tool sell prompt)
+    /// for `size` and `world` (or clears it outside expanded Buy Mode),
+    /// syncing `self.buy_state.page` to the clamped page number.
+    pub fn layout_buy(
+        &mut self,
+        size: [i32; 2],
+        world: &World,
+        assets: &Assets,
+        sell: Option<&SellInfo>,
+    ) {
         if self.controls.mode != Mode::Buy || !self.controls.expanded {
             self.buy_layout = BuyLayout::default();
             return;
         }
-        let catalog = self
-            .buy_catalog
-            .get_or_insert_with(|| BuyCatalog::load(assets.index(), assets.catalog()));
+        let rating_labels = self.rating_labels.clone();
+        let sell_labels = self.sell_labels.clone();
+        let catalog = self.buy_catalog.get_or_insert_with(|| {
+            BuyCatalog::load(assets.index(), assets.catalog())
+                .with_rating_labels(rating_labels)
+                .with_sell_labels(sell_labels)
+        });
         let funds = sims_vm::available_funds(world);
-        let layout = buy::layout(size, catalog, &self.buy_state, &self.art, funds);
+        let layout = buy::layout_with_sell(size, catalog, &self.buy_state, &self.art, funds, sell);
         self.buy_state.page = layout.page;
         self.buy_layout = layout;
     }
@@ -270,12 +414,455 @@ impl Hud {
         size: [i32; 2],
         world: &World,
         residential: bool,
+        visibility: options::LotVisibility,
         assets: &Assets,
+        sell: Option<&SellInfo>,
     ) {
         let snapshot = self.snapshot(world, residential);
-        self.items = hud::layout(size, &snapshot, &self.controls);
+        self.items = hud::layout_with_options_lot(
+            size,
+            &snapshot,
+            &self.controls,
+            &self.options_texts,
+            visibility,
+            Some(&self.art),
+        );
         hud::fit(&mut self.items, &self.art, &self.texts);
-        self.layout_buy(size, world, assets);
+        self.layout_buy(size, world, assets, sell);
+    }
+
+    /// Opens a UI-owned Options confirmation dialog using the install's
+    /// `UIText.iff STR# 153` strings and `STR# 142` OK/Yes/No/Cancel labels
+    /// (`cWinOptions::OnCommand`, `0x516809..0x516883`, `0x5170f0..0x517136`,
+    /// `0x517c03 -> 0x50d68a`, `0x4f290d`, `0x4f1a11`, `0x4f25b4`).
+    ///
+    /// - Edit-mode save cards (`0x517c21`: `[lot + 0x50] == 1`) build the
+    ///   dedicated `cWinEditLotInfo` layout (`PopupInfoTiles.bmp` `3008` +
+    ///   `SAVE_CARD` `4994` + editable Lot Name & Lot Description fields).
+    /// - Ordinary confirmations (`0x4f290d`, `0x4f1a11`, `0x4f25b4`) use
+    ///   `cTSWinGenDlg` (`FrameStyle::Generic`, slot 5 → `PopupInfoTiles.bmp`
+    ///   `3008` at `0x5e5441`, `396×135` for 3-button Neighborhood Save prompts).
+    ///
+    /// Immediately lays out the dialog against `view_size` so pointer hit
+    /// testing and modal blocking apply before the next frame draws.
+    pub fn open_options_dialog(
+        &mut self,
+        kind: OptionsDialog,
+        view_size: [i32; 2],
+        lot_name: &str,
+        lot_description: &str,
+    ) {
+        let ok = self.labels.get(1).to_owned();
+        let yes = self.labels.get(3).to_owned();
+        let no = self.labels.get(4).to_owned();
+        let cancel = self.labels.get(2).to_owned();
+        let save_card = self.art.image(options::id::SAVE_CARD).cloned();
+        let message = match kind {
+            OptionsDialog::SaveCardSave => {
+                Message::save_card(lot_name, lot_description, None, vec![ok], save_card)
+            }
+            OptionsDialog::SaveCardQuit
+            | OptionsDialog::SaveCardNeighborhood
+            | OptionsDialog::SaveCardResetTutorial => {
+                // `0x50dcc8..0x50dcec`: 3-button Save Card loads `STR# 153`
+                // 1-based entry 5 (`confirm_save.1`) and draws it centered
+                // above the buttons (`0x50dfb2..0x50e056`).
+                Message::save_card(
+                    lot_name,
+                    lot_description,
+                    Some(self.options_texts.confirm_save.1.clone()),
+                    vec![yes, no, cancel],
+                    save_card,
+                )
+            }
+            OptionsDialog::ConfirmQuit => Message::confirm(
+                self.options_texts.confirm_quit.0.clone(),
+                self.options_texts.confirm_quit.1.clone(),
+                vec![yes, no],
+            )
+            .with_frame(dialog::FrameStyle::Generic),
+            OptionsDialog::ConfirmSaveBeforeQuit => Message::confirm(
+                self.options_texts.confirm_save_before_quit.0.clone(),
+                self.options_texts.confirm_save_before_quit.1.clone(),
+                vec![yes, no, cancel],
+            )
+            .with_frame(dialog::FrameStyle::Generic),
+            OptionsDialog::ConfirmSaveBeforeNeighborhood
+            | OptionsDialog::ConfirmSaveBeforeResetTutorial => Message::confirm(
+                self.options_texts.confirm_save.0.clone(),
+                self.options_texts.confirm_save.1.clone(),
+                vec![yes, no, cancel],
+            )
+            .with_frame(dialog::FrameStyle::Generic),
+            OptionsDialog::ConfirmResetTutorial => Message::confirm(
+                self.options_texts.confirm_reset_tutorial.0.clone(),
+                self.options_texts.confirm_reset_tutorial.1.clone(),
+                vec![yes, no],
+            )
+            .with_frame(dialog::FrameStyle::Generic),
+        };
+        self.dialog_state = DialogState::for_message(&message);
+        self.dialog = dialog::layout(view_size, &message, &self.art);
+        self.ui_dialog = Some((kind, message));
+        self.menu = None;
+    }
+
+    /// The current text inside the active modal dialog's primary text entry
+    /// field, if any.
+    pub fn active_dialog_entry(&self) -> Option<&str> {
+        self.active_message().and_then(|m| m.entry.as_deref())
+    }
+
+    /// The current text inside the active modal dialog's secondary text entry
+    /// field (Lot Description on the edit-mode Save Card), if any.
+    pub fn active_dialog_secondary_entry(&self) -> Option<&str> {
+        self.active_message()
+            .and_then(|m| m.secondary_entry.as_deref())
+    }
+
+    /// Switches keyboard focus between Lot Name and Lot Description on an open
+    /// edit-mode Save Card (`Tab`).
+    pub fn switch_dialog_field(&mut self) -> bool {
+        self.active_message()
+            .cloned()
+            .is_some_and(|m| self.dialog_state.switch_field(&m))
+    }
+
+    /// Whether the active modal dialog's focused text field is multiline
+    /// (Lot Description on an edit-mode Save Card, `0x50db98..0x50dba0`), where
+    /// Return inserts `'\n'` instead of submitting (`0x5f28b6..0x5f28f9`).
+    pub fn is_multiline_entry(&self) -> bool {
+        self.active_message()
+            .is_some_and(|m| self.dialog_state.is_multiline(m))
+    }
+
+    /// The currently active modal dialog (UI confirmation or simulation
+    /// prompt), if any.
+    pub fn active_message(&self) -> Option<&Message> {
+        self.ui_dialog
+            .as_ref()
+            .map(|(_, m)| m)
+            .or_else(|| self.message.as_ref().map(|(m, _)| m))
+    }
+
+    /// Mutable access to the currently active modal dialog.
+    fn active_message_mut(&mut self) -> Option<&mut Message> {
+        if let Some((_, m)) = &mut self.ui_dialog {
+            Some(m)
+        } else {
+            self.message.as_mut().map(|(m, _)| m)
+        }
+    }
+
+    /// Advances the active dialog's `cTSWinTextEdit2` 500 ms caret blink timer.
+    pub fn sync_dialog_blink(&mut self, clock_us: u64) -> bool {
+        if self.active_message().is_some_and(|m| m.entry.is_some()) {
+            self.dialog_state.sync_blink(clock_us)
+        } else {
+            false
+        }
+    }
+
+    /// Types `ch` into the active dialog's text entry field.
+    pub fn type_dialog_char(&mut self, ch: char) -> bool {
+        let mut state = self.dialog_state.clone();
+        let changed = self
+            .active_message_mut()
+            .is_some_and(|m| state.insert(m, ch));
+        self.dialog_state = state;
+        changed
+    }
+
+    /// Deletes the character before the caret in the active dialog's text entry.
+    pub fn dialog_backspace(&mut self) -> bool {
+        let mut state = self.dialog_state.clone();
+        let changed = self
+            .active_message_mut()
+            .is_some_and(|m| state.backspace(m));
+        self.dialog_state = state;
+        changed
+    }
+
+    /// Deletes the character at the caret in the active dialog's text entry.
+    pub fn dialog_delete(&mut self) -> bool {
+        let mut state = self.dialog_state.clone();
+        let changed = self.active_message_mut().is_some_and(|m| state.delete(m));
+        self.dialog_state = state;
+        changed
+    }
+
+    /// Moves the active dialog's text-entry caret left.
+    pub fn dialog_move_left(&mut self) -> bool {
+        self.active_message()
+            .cloned()
+            .is_some_and(|m| self.dialog_state.move_left(&m))
+    }
+
+    /// Moves the active dialog's text-entry caret right.
+    pub fn dialog_move_right(&mut self) -> bool {
+        self.active_message()
+            .cloned()
+            .is_some_and(|m| self.dialog_state.move_right(&m))
+    }
+
+    /// Moves the active dialog's text-entry caret one visual row up (multiline
+    /// fields, `0x5f29f2..0x5f2a90`).
+    pub fn dialog_move_up(&mut self) -> bool {
+        self.active_message().cloned().is_some_and(|m| {
+            self.dialog_state
+                .move_up(&m, self.dialog.as_ref(), &self.art)
+        })
+    }
+
+    /// Moves the active dialog's text-entry caret one visual row down (multiline
+    /// fields, `0x5f2a90..0x5f2b40`).
+    pub fn dialog_move_down(&mut self) -> bool {
+        self.active_message().cloned().is_some_and(|m| {
+            self.dialog_state
+                .move_down(&m, self.dialog.as_ref(), &self.art)
+        })
+    }
+
+    /// Moves the active dialog's text-entry caret to the start of the current
+    /// line (or field, `0x5f2c13`).
+    pub fn dialog_home(&mut self) -> bool {
+        self.active_message().cloned().is_some_and(|m| {
+            self.dialog_state
+                .home_in_layout(&m, self.dialog.as_ref(), Some(&self.art))
+        })
+    }
+
+    /// Moves the active dialog's text-entry caret to the end of the current
+    /// line (or field, `0x5f2c13`).
+    pub fn dialog_end(&mut self) -> bool {
+        self.active_message().cloned().is_some_and(|m| {
+            self.dialog_state
+                .end_in_layout(&m, self.dialog.as_ref(), Some(&self.art))
+        })
+    }
+
+    /// Whether a Sound volume slider drag is currently captured (`0x5f6245`).
+    pub fn dragging_slider(&self) -> bool {
+        self.dragging_slider.is_some()
+    }
+
+    /// Updates an active Sound slider drag using canvas x-coordinate `x`
+    /// (including out-of-window coordinates while captured, `0x5f6245..0x5f6336`).
+    pub fn drag_slider(&mut self, x: i32) -> bool {
+        let Some(channel) = self.dragging_slider else {
+            return false;
+        };
+        let Some(rect) = hud::slider_rect(&self.items, channel) else {
+            return false;
+        };
+        let step = options::slider_value_at(rect, x);
+        self.controls.options.sound.set(channel, step)
+    }
+
+    /// Ends any active Sound slider drag (`0x5f62ba..0x5f62de`), evaluating
+    /// the release x-coordinate through `slider_value_at` before releasing
+    /// pointer capture.
+    pub fn release_slider(&mut self, point: Option<[i32; 2]>) -> bool {
+        let Some(channel) = self.dragging_slider.take() else {
+            return false;
+        };
+        if let (Some([x, _]), Some(rect)) = (point, hud::slider_rect(&self.items, channel)) {
+            let step = options::slider_value_at(rect, x);
+            self.controls.options.sound.set(channel, step);
+        }
+        true
+    }
+
+    /// Syncs runtime character names assigned by Make New Character
+    /// (`0x44b0a8..0x44b0fc`, `0x44b18a..0x44b1cc`) into the HUD's `Faces`
+    /// cache so newly created children and pets display their submitted names.
+    pub fn sync_character_names(&mut self, names: &std::collections::BTreeMap<u32, String>) {
+        for (&guid, name) in names {
+            self.faces.insert_name(guid, name);
+        }
+    }
+
+    /// Resets the HUD `Faces` cache back to its boot-time character names and
+    /// applies only `names` from the restored snapshot, dropping runtime names
+    /// created after that snapshot.
+    pub fn reset_character_names(&mut self, names: &std::collections::BTreeMap<u32, String>) {
+        self.faces = self.boot_faces.clone();
+        self.sync_character_names(names);
+    }
+
+    /// Recomputes the active modal dialog's layout for a resized canvas
+    /// (`0x5e45d2..0x5e45f3`) so mid-press resizing hit-tests live button bounds.
+    pub fn relayout_dialog(&mut self, size: [i32; 2]) {
+        self.dialog = self
+            .active_message()
+            .and_then(|m| dialog::layout(size, m, &self.art));
+    }
+
+    /// Releases a held Options action button (`0x514170..0x514176`,
+    /// `0x5e45d2..0x5e45f3`), activating it only when `point` is still inside
+    /// that button's current layout rectangle.
+    pub fn release_options_action(&mut self, point: Option<[i32; 2]>) -> (bool, Option<Command>) {
+        self.controls.pressed_options_action = None;
+        let Some(action) = self.pressed_options_action.take() else {
+            return (false, None);
+        };
+        let Some([x, y]) = point else {
+            return (true, None);
+        };
+        let Some(rect) = self
+            .items
+            .iter()
+            .find(|i| i.command == Some(Command::OptionsAction(action)))
+            .map(|i| i.rect)
+        else {
+            return (true, None);
+        };
+        if !rect.contains(x, y) {
+            return (true, None);
+        }
+        let command = Command::OptionsAction(action);
+        self.play(CLICK);
+        let open = self.controls.help.is_some() || self.controls.options.help.is_some();
+        self.controls.apply(&command);
+        let now_open = self.controls.help.is_some() || self.controls.options.help.is_some();
+        if now_open != open {
+            self.play(WHOOSH);
+        }
+        (true, Some(command))
+    }
+
+    /// Whether a `cTSWinTextEdit2` mouse-drag selection is currently captured
+    /// (`[esi + 0x157]` at `0x5f27a6..0x5f2887`).
+    pub fn dragging_dialog_entry(&self) -> bool {
+        self.dialog_state.dragging_entry.is_some()
+    }
+
+    /// Updates a captured `cTSWinTextEdit2` mouse-drag selection (`0x5f27ae..0x5f2887`).
+    pub fn drag_dialog_entry(&mut self, point: [i32; 2]) -> bool {
+        let Some(layout) = self.dialog.as_ref() else {
+            return false;
+        };
+        let Some(message) = self
+            .ui_dialog
+            .as_ref()
+            .map(|(_, m)| m)
+            .or_else(|| self.message.as_ref().map(|(m, _)| m))
+        else {
+            return false;
+        };
+        self.dialog_state
+            .drag_entry(layout, message, &self.art, point)
+    }
+
+    /// Releases a held modal dialog button (`cTSWinBtn`, `0x5e4599..0x5e45fc`)
+    /// or captured text-entry drag (`cTSWinTextEdit2`, `0x5f27a6`), activating
+    /// a button only if `point` is still inside that same enabled button.
+    pub fn release_dialog(&mut self, point: Option<[i32; 2]>) -> (bool, Option<Command>) {
+        // `0x5f27a6`: mouse-up only clears capture (`[ecx + 0x157] = 0`);
+        // drag movement updates the selection at `0x5f27ae..0x5f2887`.
+        // Re-hit-testing on mouse-up would misread a stationary click after
+        // mouse-down shifted the field's scroll offset.
+        let released_entry = self.dialog_state.release_entry();
+        let Some(pressed) = self.dialog_state.pressed_button.take() else {
+            return (released_entry, None);
+        };
+        let command = point.and_then(|[x, y]| {
+            let layout = self.dialog.as_ref()?;
+            let rect = layout.buttons.get(pressed)?;
+            if rect.contains(x, y) && !self.dialog_state.is_disabled(pressed) {
+                Some(Command::AnswerDialog {
+                    caller: layout.caller,
+                    button: u8::try_from(pressed).ok()?,
+                })
+            } else {
+                None
+            }
+        });
+        (true, command)
+    }
+
+    /// Submits the active modal dialog via Enter (activates button 0 if enabled).
+    pub fn submit_dialog(&mut self) -> Option<Command> {
+        self.confirm_key(DialogKey::Enter)
+    }
+
+    /// Handles a native modal confirmation key (`0x5e5b3b..0x5e5bfd`, `0x6d7530`):
+    /// - `Enter` activates button 0 (OK / Yes) when enabled.
+    /// - `Escape` activates the cancel button (last button on non-entry
+    ///   confirmations, or Cancel on multi-button entry dialogs such as Save Card).
+    /// - `Char(ch)` activates localized Yes (button 0) or No (button 1) on
+    ///   non-entry confirmations whose buttons match `STR# 142[3]` / `STR# 142[4]`.
+    pub fn confirm_key(&mut self, key: DialogKey) -> Option<Command> {
+        let message = self.active_message()?;
+        let count = message.buttons.len();
+        if count == 0 {
+            return None;
+        }
+        let caller = message.caller;
+        let button = match key {
+            DialogKey::Enter => Some(0usize),
+            DialogKey::Escape => {
+                if message.entry.is_some() && count <= 1 {
+                    None
+                } else {
+                    Some(count - 1)
+                }
+            }
+            DialogKey::Tab => None,
+            DialogKey::Char(ch) if message.entry.is_none() && count >= 2 => {
+                // `0x4f370d..0x4f374e` -> `[0x6d7530]`: Yes/No confirmation
+                // hotkeys come from `UIText.iff STR# 161` entries 7 and 8,
+                // checked at `0x5e5b80..0x5e5bfd` on Yes/No and Yes/No/Cancel
+                // dialogs.
+                let yes_label = self.labels.get(3);
+                let no_label = self.labels.get(4);
+                let yes_key = self.labels.yes_key();
+                let no_key = self.labels.no_key();
+                if message.buttons.first().is_some_and(|b| b == yes_label)
+                    && yes_key.to_lowercase().eq(ch.to_lowercase())
+                {
+                    Some(0)
+                } else if message.buttons.get(1).is_some_and(|b| b == no_label)
+                    && no_key.to_lowercase().eq(ch.to_lowercase())
+                {
+                    Some(1)
+                } else {
+                    None
+                }
+            }
+            DialogKey::Char(_) => None,
+        }?;
+        if button >= count || self.dialog_state.is_disabled(button) {
+            return None;
+        }
+        self.dialog_state.pressed_button = None;
+        Some(Command::AnswerDialog {
+            caller,
+            button: u8::try_from(button).ok()?,
+        })
+    }
+
+    /// Answers and closes the open UI confirmation dialog with `button`,
+    /// returning `(kind, button, primary_entry, secondary_entry)` if one was open.
+    pub fn take_ui_dialog_answer(
+        &mut self,
+        button: u8,
+    ) -> Option<(OptionsDialog, u8, Option<String>, Option<String>)> {
+        let (kind, message) = self.ui_dialog.take()?;
+        self.dialog = None;
+        self.dialog_state = DialogState::default();
+        Some((kind, button, message.entry, message.secondary_entry))
+    }
+
+    /// Whether a UI confirmation dialog (outside the simulation) is currently open.
+    pub fn has_ui_dialog(&self) -> bool {
+        self.ui_dialog.is_some()
+    }
+
+    /// Whether any modal dialog (UI confirmation, loaded VM dialog, or drawn
+    /// layout) is currently active, even before the next [`Hud::draw`].
+    pub fn has_dialog(&self) -> bool {
+        self.ui_dialog.is_some() || self.message.is_some() || self.dialog.is_some()
     }
 
     /// Updates the native `[control_panel + 0x1ec]` idle-blink flag
@@ -330,6 +917,17 @@ impl Hud {
         changed
     }
 
+    /// Clears the cached VM dialog and its input state after answering so a
+    /// consecutive identical prompt (`(caller, operands)`) initializes fresh
+    /// text state (`0x523825..0x523887`).
+    pub fn clear_vm_dialog(&mut self) {
+        self.message = None;
+        if self.ui_dialog.is_none() {
+            self.dialog = None;
+            self.dialog_state = DialogState::default();
+        }
+    }
+
     /// Reads the dialog `world` waits on, if it changed. The lot's world,
     /// or, while the lot waits for the player, the world as the tick left
     /// it when it showed the dialog.
@@ -351,7 +949,12 @@ impl Hud {
         )
         .ok()
         .flatten()
-        .map(|m| (m, key));
+        .map(|m| {
+            if self.ui_dialog.is_none() {
+                self.dialog_state = DialogState::for_message(&m);
+            }
+            (m, key)
+        });
     }
 
     /// What the panel shows of `world`: the household with what the next
@@ -418,8 +1021,38 @@ impl Hud {
         residential: bool,
         assets: &Assets,
         view: &View,
+        pace: &Pace,
+        status: Option<&str>,
+        canvas: &mut Canvas,
+    ) {
+        self.draw_for_lot(
+            world,
+            residential,
+            options::LotVisibility::from_residential(residential),
+            assets,
+            view,
+            pace,
+            status,
+            None,
+            canvas,
+        );
+    }
+
+    /// Like [`Hud::draw`], using exact per-lot [`options::LotVisibility`]
+    /// (`0x4f2490..0x4f24e7`, `0x5177aa..0x517833`) and optionally showing the
+    /// Buy Mode Hand Tool sell prompt (`0x487d7a` → `0x4cf90b` → `0x50a343`)
+    /// when `sell` is `Some`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_for_lot(
+        &mut self,
+        world: &World,
+        residential: bool,
+        visibility: options::LotVisibility,
+        assets: &Assets,
+        view: &View,
         _pace: &Pace,
         status: Option<&str>,
+        sell: Option<&SellInfo>,
         canvas: &mut Canvas,
     ) {
         let camera = &view.camera;
@@ -461,7 +1094,14 @@ impl Hud {
             self.controls.help = None;
             self.play(WHOOSH);
         }
-        self.items = hud::layout(view.size, &snapshot, &self.controls);
+        self.items = hud::layout_with_options_lot(
+            view.size,
+            &snapshot,
+            &self.controls,
+            &self.options_texts,
+            visibility,
+            Some(&self.art),
+        );
         hud::fit(&mut self.items, &self.art, &self.texts);
         self.queue = Queue::read(world, snapshot.selected);
         self.pressed.keep(&self.queue);
@@ -504,7 +1144,7 @@ impl Hud {
             &self.controls,
         );
         if self.controls.mode == Mode::Buy && self.controls.expanded {
-            self.layout_buy(view.size, world, assets);
+            self.layout_buy(view.size, world, assets, sell);
             let mut guids: Vec<u32> = self
                 .buy_layout
                 .widgets
@@ -516,6 +1156,12 @@ impl Hud {
                 .collect();
             if let Some(card) = &self.buy_layout.popup {
                 guids.push(card.guid);
+            }
+            if let Some(prompt) = &self.buy_layout.sell_prompt {
+                guids.push(prompt.guid);
+                let _ = self
+                    .thumbnails
+                    .read_balloon(assets.index(), assets.catalog(), prompt.guid);
             }
             for guid in guids {
                 let _ = self.thumbnails.read(assets.index(), assets.catalog(), guid);
@@ -535,26 +1181,26 @@ impl Hud {
                 .draw(&mut frame, &self.art, &self.faces, &self.thumbnails);
         }
         self.dialog = self
-            .message
-            .as_ref()
-            .and_then(|(m, _)| dialog::layout(view.size, m, &self.art));
+            .active_message()
+            .and_then(|m| dialog::layout(view.size, m, &self.art));
         // A dialog takes every press until it is answered, so a menu open
         // under it is closed rather than left to be chosen from after.
         if self.dialog.is_some() {
             self.menu = None;
         }
-        if let (Some((message, _)), Some(layout)) = (&self.message, &self.dialog) {
-            dialog::draw(
+        if let (Some(message), Some(layout)) = (self.active_message(), &self.dialog) {
+            dialog::draw_with_state(
                 &mut frame,
                 &self.art,
                 message,
                 layout,
                 self.controls.pointer,
+                &self.dialog_state,
             );
         }
         if let Some(menu) = &mut self.menu {
             menu.layout(&self.art, view.size);
-            menu.draw(&mut frame, &self.art, self.controls.pointer);
+            menu.draw_labels(&mut frame, &self.art, self.controls.pointer);
         }
         self.band = status.and_then(|status| self.status(&mut frame, status));
         canvas.color = frame.into_rgb();
@@ -594,7 +1240,7 @@ impl Hud {
     /// Whether the panel or the status band covers `point` (canvas
     /// pixels), or a dialog or a pie menu is shown and takes every press.
     pub fn covers(&self, point: [i32; 2]) -> bool {
-        self.dialog.is_some()
+        self.has_dialog()
             || self.menu.is_some()
             || self.band.is_some_and(|b| b.contains(point[0], point[1]))
             || hud::covers(&self.items, point)
@@ -660,11 +1306,44 @@ impl Hud {
         self.pressed.release(uid);
     }
 
-    /// Moves the pointer; true if what it hovers changed or an open help
-    /// balloon was dismissed by moving outside the subpanel (including onto
-    /// the balloon itself, which attaches outside `LivePanel` at
-    /// `0x51a0a2..0x51a0b5`, `0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d359`).
+    /// The pointer's current position in canvas pixels, if inside the window.
+    pub fn pointer(&self) -> Option<[i32; 2]> {
+        self.controls.pointer
+    }
+
+    /// Sets the pointer position directly (used when opening a pie menu so the
+    /// opening frame seeds its head pose and hit state from the press or
+    /// on-screen clamp warp rather than a stale hover, `0x5ebd05` / `0x5ebd29`).
+    pub fn set_pointer(&mut self, point: [i32; 2]) {
+        self.controls.pointer = Some(point);
+    }
+
+    /// Whether a dialog message is loaded and will cover/close any open pie
+    /// menu on this frame (`Hud::draw`).
+    pub fn will_show_dialog(&self, size: [i32; 2]) -> bool {
+        self.active_message()
+            .and_then(|m| dialog::layout(size, m, &self.art))
+            .is_some()
+    }
+
+    /// Moves the pointer; true if what it hovers changed, a pie menu is open
+    /// (so the Sim's 3D head follows the pointer), or an open help balloon was
+    /// dismissed by moving outside the subpanel (including onto the balloon
+    /// itself, which attaches outside `LivePanel` at `0x51a0a2..0x51a0b5`,
+    /// `0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d359`).
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
+        let moved_for_pie =
+            self.menu.is_some() && self.dialog.is_none() && self.controls.pointer != Some(point);
+        let mut dragged = false;
+        if let Some(channel) = self.dragging_slider
+            && let Some(rect) = hud::slider_rect(&self.items, channel)
+        {
+            let step = options::slider_value_at(rect, point[0]);
+            dragged = self.controls.options.sound.set(channel, step);
+        }
+        if self.dialog_state.dragging_entry.is_some() {
+            dragged |= self.drag_dialog_entry(point);
+        }
         let button = |pointer: Option<[i32; 2]>| {
             let layout = self.dialog.as_ref()?;
             let [x, y] = pointer?;
@@ -696,15 +1375,21 @@ impl Hud {
             entry(self.controls.pointer),
             buy_widget(self.controls.pointer),
         ) != before;
-        let dismissed = self.controls.help.is_some()
+        let dismissed_live = self.controls.help.is_some()
             && !hud::in_subpanel(&self.items, point)
-            && self.dismiss_help();
-        hovered_changed || dismissed
+            && self.dismiss_live_help();
+        // `0x517957..0x5179cd`: Options help balloons also dismiss when the
+        // pointer leaves the Options panel (`cWinOptions`).
+        let dismissed_options = self.controls.options.help.is_some()
+            && !hud::in_options_panel(&self.items, point)
+            && self.dismiss_options_help();
+        moved_for_pie || dragged || hovered_changed || dismissed_live || dismissed_options
     }
 
     /// The pointer left the window: no button is hovered, no name shows, and
-    /// any open help balloon is dismissed (`0x51d2ee..0x51d317`). True if the
-    /// frame changes.
+    /// any open Live or Options help balloon is dismissed (`0x51d2ee..0x51d317`,
+    /// `0x517995..0x5179bd`). Active slider drag capture (`0x5f6245..0x5f625b`)
+    /// is preserved until mouse release. True if the frame changes.
     pub fn leave(&mut self) -> bool {
         let left = self.controls.pointer.take().is_some();
         let dismissed = self.dismiss_help();
@@ -726,10 +1411,33 @@ impl Hud {
         }
     }
 
-    /// Dismisses any open help balloon (`0x50fb7f`) and plays `UI_whoosh`.
-    /// Returns true if a balloon was open.
-    pub fn dismiss_help(&mut self) -> bool {
+    /// Dismisses any open live-mode help balloon (`0x50fb7f`) and plays `UI_whoosh`.
+    fn dismiss_live_help(&mut self) -> bool {
         if self.controls.help.take().is_some() {
+            self.play(WHOOSH);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Dismisses any open Options help balloon (`0x517995..0x5179bd` -> `0x50fb7f`)
+    /// and plays `UI_whoosh`.
+    fn dismiss_options_help(&mut self) -> bool {
+        if self.controls.options.help.take().is_some() {
+            self.play(WHOOSH);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Dismisses any open help balloon (Live or Options, `0x50fb7f`) and plays
+    /// `UI_whoosh`. Returns true if a balloon was open.
+    pub fn dismiss_help(&mut self) -> bool {
+        let live = self.controls.help.take().is_some();
+        let opts = self.controls.options.help.take().is_some();
+        if live || opts {
             self.play(WHOOSH);
             true
         } else {
@@ -743,8 +1451,31 @@ impl Hud {
     /// is, `sims_vm::Lot::residential`) as they are at the press, not as
     /// the frame drew them ([`hud::check_press`]).
     pub fn press(&mut self, point: [i32; 2], world: &World, residential: bool) -> Option<Command> {
-        if let Some(layout) = &self.dialog {
-            return dialog::press(layout, point);
+        if let Some(layout) = self.dialog.clone() {
+            if let Some(message) = self.active_message().cloned()
+                && self
+                    .dialog_state
+                    .click_entry(&layout, &message, &self.art, point)
+            {
+                self.dialog_state.pressed_button = None;
+                return None;
+            }
+            // 0x5e44b4..0x5e45fc: cTSWinBtn captures on mouse-down and marks
+            // the button pressed; activation happens on matching mouse-up
+            // (`Hud::release_dialog`) if the pointer is still inside it.
+            let hit = layout
+                .buttons
+                .iter()
+                .position(|r| r.contains(point[0], point[1]))
+                .filter(|&idx| !self.dialog_state.is_disabled(idx));
+            self.dialog_state.dragging_entry = None;
+            self.dialog_state.pressed_button = hit;
+            return None;
+        }
+        // A modal dialog that has not yet been drawn still captures every
+        // press so underlying controls cannot fire through it.
+        if self.has_dialog() {
+            return None;
         }
         // A press on an open pie menu only marks the button held
         // (0x5eb3d1 with +0x170 clear); choosing happens on release
@@ -771,6 +1502,9 @@ impl Hud {
         {
             self.buy_state.apply(&command);
             return Some(command);
+        }
+        if let Some((channel, _)) = hud::slider_at(&self.items, point) {
+            self.dragging_slider = Some(channel);
         }
         let command = match hud::press(&self.items, point) {
             Some(command) => command,
@@ -815,9 +1549,25 @@ impl Hud {
         if command == (Command::Refused { error: true }) {
             self.play(ERROR);
         }
-        let open = self.controls.help.is_some();
+        // `0x514170..0x514176` + `0x5e45d2..0x5e45f3`: Options action buttons
+        // (`Save`, `Neighborhood`, `Quit`, `Reset Tutorial`) capture on press
+        // and dispatch on mouse-up inside the same button so dragging off
+        // cancels them cleanly.
+        if let Command::OptionsAction(action) = command {
+            self.pressed_options_action = Some(action);
+            self.controls.pressed_options_action = Some(action);
+            return None;
+        }
+        if matches!(
+            command,
+            Command::OpenOptionsTab(_) | Command::ToggleOption(_) | Command::SetDetail { .. }
+        ) {
+            self.play(CLICK);
+        }
+        let open = self.controls.help.is_some() || self.controls.options.help.is_some();
         self.controls.apply(&command);
-        if self.controls.help.is_some() != open {
+        let now_open = self.controls.help.is_some() || self.controls.options.help.is_some();
+        if now_open != open {
             self.play(WHOOSH);
         }
         Some(command)
@@ -843,7 +1593,17 @@ impl Hud {
                         });
                 (release, command)
             }
-            Release::Settled | Release::Stays => {
+            Release::Settled => {
+                // Settling does not create a new cursor warp (`0x5eb53c`);
+                // leave the pointer at the release coordinate rather than
+                // re-applying an unconsumed opening warp.
+                self.menu = Some(menu);
+                (release, None)
+            }
+            Release::Stays => {
+                if let Some(point) = menu.pending_pointer() {
+                    self.controls.pointer = Some(point);
+                }
                 self.menu = Some(menu);
                 (release, None)
             }
