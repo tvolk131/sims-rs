@@ -5873,94 +5873,100 @@ impl NeighborhoodShell {
             (session.game.take_coop_controller(), was_open)
         };
 
-        let staged_game: Result<Game, String> = (|| {
-            let store_matches = self
-                .stored
-                .family_in(host_house)
-                .is_some_and(|(fid, _)| u32::from(fid) == host_family);
-            if store_matches
-                && let Ok(game) = Game::open_from_store(
-                    &self.install_root,
-                    &self.store,
-                    &self.neighborhood_id,
-                    host_house,
-                    &self.answers,
-                    self.play,
-                    self.frames.clone(),
-                )
-            {
-                return Ok(game);
-            }
-            let base_house = self
-                .install_root
-                .join("UserData")
-                .join("Houses")
-                .join(format!("House{host_house:02}.iff"));
-            if base_house.is_file() {
-                return Game::open(&crate::game::Options {
-                    install: self.install_root.clone(),
-                    house: base_house,
-                    answers: self.answers.clone(),
-                    play: self.play,
-                    frames: self.frames.clone(),
-                });
-            }
-            Err(format!(
-                "Host is playing Lot {host_house} (family {host_family}), which is not available \
-                 in this neighborhood or install."
-            ))
-        })();
+        // Try ordered candidate sources (REDB store first, then installed
+        // `HouseNN.iff`) so an `OtherLoad` mismatch on the store copy falls
+        // back seamlessly to the matching installed base house before failing.
+        let mut candidates: Vec<Game> = Vec::new();
+        let store_matches = self
+            .stored
+            .family_in(host_house)
+            .is_some_and(|(fid, _)| u32::from(fid) == host_family);
+        if store_matches
+            && let Ok(game) = Game::open_from_store(
+                &self.install_root,
+                &self.store,
+                &self.neighborhood_id,
+                host_house,
+                &self.answers,
+                self.play,
+                self.frames.clone(),
+            )
+        {
+            candidates.push(game);
+        }
+        let base_house = self
+            .install_root
+            .join("UserData")
+            .join("Houses")
+            .join(format!("House{host_house:02}.iff"));
+        if base_house.is_file()
+            && let Ok(game) = Game::open(&crate::game::Options {
+                install: self.install_root.clone(),
+                house: base_house,
+                answers: self.answers.clone(),
+                play: self.play,
+                frames: self.frames.clone(),
+            })
+        {
+            candidates.push(game);
+        }
 
-        match staged_game {
-            Ok(mut new_game) => {
-                if self.options_file.is_file() {
-                    let _ = new_game.load_options(&self.options_file);
-                }
-                new_game.coop_set_player_name(self.coop_player_name.clone());
-                new_game.coop_set_iroh_config(self.coop_iroh_config);
-                new_game.set_album_button_enabled(true);
-                new_game.resize(self.size);
-                new_game.install_coop_controller(coop, true);
-                if lobby_open {
-                    new_game.open_coop_lobby(Some(LobbyTab::Join));
-                }
-                match new_game.complete_pending_coop_restage() {
-                    Ok(()) => {
-                        let initial_days_played =
-                            new_game.lot().world().globals.get(28).copied().unwrap_or(0);
-                        if let ActiveScreen::Lot(session) = &mut self.screen {
-                            session.game = new_game;
-                            session.house = host_house;
-                            session.last_days_played = initial_days_played;
-                        }
-                        self.lot_generation = self.lot_generation.wrapping_add(1);
-                        true
-                    }
-                    Err(err) => {
-                        let failed_coop = new_game.take_coop_controller();
-                        if let ActiveScreen::Lot(session) = &mut self.screen {
-                            session.game.install_coop_controller(failed_coop, false);
-                            session.game.set_note(err);
-                            if lobby_open {
-                                session.game.open_coop_lobby(Some(LobbyTab::Join));
-                            }
-                        }
-                        true
-                    }
-                }
+        let mut last_err = format!(
+            "Host is playing Lot {host_house} (family {host_family}), which is not available \
+             in this neighborhood or install."
+        );
+        for mut new_game in candidates {
+            if self.options_file.is_file() {
+                let _ = new_game.load_options(&self.options_file);
             }
-            Err(err) => {
-                if let ActiveScreen::Lot(session) = &mut self.screen {
-                    coop.fail_pending_restage(session.game.lot_mut(), err.clone());
-                    session.game.install_coop_controller(coop, false);
-                    session.game.set_note(err);
-                    if lobby_open {
-                        session.game.open_coop_lobby(Some(LobbyTab::Join));
+            new_game.coop_set_player_name(self.coop_player_name.clone());
+            new_game.coop_set_iroh_config(self.coop_iroh_config);
+            new_game.set_album_button_enabled(true);
+            new_game.resize(self.size);
+            new_game.install_coop_controller(coop, true);
+            if lobby_open {
+                new_game.open_coop_lobby(Some(LobbyTab::Join));
+            }
+            match new_game.try_complete_pending_coop_restage() {
+                Ok(()) => {
+                    let initial_days_played =
+                        new_game.lot().world().globals.get(28).copied().unwrap_or(0);
+                    if let ActiveScreen::Lot(session) = &mut self.screen {
+                        session.game = new_game;
+                        session.house = host_house;
+                        session.last_days_played = initial_days_played;
                     }
+                    self.lot_generation = self.lot_generation.wrapping_add(1);
+                    return true;
                 }
-                true
+                Err(crate::coop::RestageAttemptError::Mismatch(err)) => {
+                    // Snapshot remains parked; take controller back and try next candidate.
+                    coop = new_game.take_coop_controller();
+                    last_err = err;
+                }
+                Err(crate::coop::RestageAttemptError::Fatal(err)) => {
+                    let failed_coop = new_game.take_coop_controller();
+                    if let ActiveScreen::Lot(session) = &mut self.screen {
+                        session.game.install_coop_controller(failed_coop, false);
+                        session.game.set_note(err);
+                        if lobby_open {
+                            session.game.open_coop_lobby(Some(LobbyTab::Join));
+                        }
+                    }
+                    return true;
+                }
             }
         }
+
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            coop.fail_pending_restage(session.game.lot_mut(), last_err.clone());
+            session.game.install_coop_controller(coop, false);
+            session.game.set_note(last_err);
+            if lobby_open {
+                session.game.open_coop_lobby(Some(LobbyTab::Join));
+            }
+        }
+        true
     }
 
     fn shell_coop_snapshot(&self) -> CoopSnapshot {

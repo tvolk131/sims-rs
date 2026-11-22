@@ -849,6 +849,20 @@ fn sol_round1_regressions_build_guards_saves_restage_advance_and_failover() {
 
     let mut host = open_goth_game(&install);
     let mut peer = open_goth_game(&install);
+    let tmp = TempDir::new("save-guards");
+    let store = sims_sim::Snapshots::open(&tmp.path().join("standalone.redb")).expect("open store");
+    // Seed a real saved slot BEFORE co-op so F9 restore_from tests prove co-op actively blocks
+    // restore (rather than returning false for an empty slot).
+    assert!(
+        host.save_to(&store, "slot1"),
+        "single-player baseline save must succeed to seed valid slot"
+    );
+    // Round 2 P1 regression: enter Build Mode -> Wall (which attaches live VM Wall Cursor)
+    // BEFORE starting co-op host; host startup must close the VM wall cursor so subsequent
+    // Build hover never mutates the shared Lot world outside lockstep!
+    host.set_mode(Mode::Build);
+    host.select_build_tool(BuildTool::Wall);
+
     let mesh = MemoryMesh::new(777);
     let host_tx = mesh.add_node("mem://r1-host");
     let host_addr = host_tx.local_address().clone();
@@ -869,6 +883,20 @@ fn sol_round1_regressions_build_guards_saves_restage_advance_and_failover() {
         },
     )
     .expect("host start");
+    // Hovering in Build Mode -> Wall right after hosting must NOT mutate `coop_world_hash`.
+    let hash_after_host_from_build = host.lot().coop_world_hash();
+    let _ = host.hover([350, 240]);
+    let _ = host.hover([420, 260]);
+    assert_eq!(
+        host.lot().coop_world_hash(),
+        hash_after_host_from_build,
+        "hovering in Build Wall mode after hosting from Build mode must never mutate Lot"
+    );
+    host.set_mode(Mode::Live);
+    // Round 2 P3 regression: make multiple ticks owed (450ms elapsed) while capping budget to 1
+    // batch, THEN join Peer — interleaved 1-for-1 host scheduling/stepping guarantees zero
+    // unapplied scheduled batches and contiguous replay for the joining peer!
+    let _ = host.advance_while(450_000, 450_000, |ran| ran < 1);
     peer.coop_start_join_with_transport(
         CoopTransport::memory(peer_tx),
         host_addr,
@@ -1018,21 +1046,19 @@ fn sol_round1_regressions_build_guards_saves_restage_advance_and_failover() {
         "live advance_while must advance peer ticks under normal jitter buffering"
     );
 
-    // P1 #2 & P1 #3: Active co-op blocks F9 restore (host & peer) AND blocks peer standalone save
-    // even AFTER disconnecting from the host!
-    let tmp = TempDir::new("save-guards");
-    let store = sims_sim::Snapshots::open(&tmp.path().join("standalone.redb")).expect("open store");
+    // P1 #2 & P1 #3: Active co-op blocks F9 restore of the seeded valid slot (host & peer)
+    // AND blocks peer standalone save even AFTER disconnecting from the host!
     assert!(
         !peer.save_to(&store, "slot1"),
         "active peer must be refused local standalone save"
     );
     assert!(
         !host.restore_from(&store, "slot1"),
-        "active host must be refused local standalone restore"
+        "active host must be refused local standalone restore of valid slot"
     );
     assert!(
         !peer.restore_from(&store, "slot1"),
-        "active peer must be refused local standalone restore"
+        "active peer must be refused local standalone restore of valid slot"
     );
 
     // P3 #16: Host departure promotes Peer cleanly to Host and Peer continues advancing ticks!

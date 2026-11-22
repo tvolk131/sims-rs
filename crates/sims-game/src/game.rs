@@ -2145,7 +2145,10 @@ impl Game {
                 self.hide_buy_cursor()
             }
         } else if self.hud.controls.mode == Mode::Build {
-            if self.buy_selected.is_some() || self.buy_cursor.is_some() {
+            if self.buy_selected.is_some()
+                || self.buy_cursor.is_some()
+                || self.coop_buy_preview.is_some()
+            {
                 if !self.hud.covers(point) || self.buy_dragging.is_some() {
                     self.hover_buy(point)
                 } else {
@@ -5878,7 +5881,7 @@ impl Game {
     }
 
     fn open_wall_cursor(&mut self, mode: i16) {
-        if self.coop.is_active() {
+        if self.coop.is_active_or_starting() {
             return;
         }
         if let Some(mut cur) = self.wall_cursor.take() {
@@ -6197,7 +6200,9 @@ impl Game {
                     let corner = sims_vm::snap_wall_corner(fine, active);
                     *end_corner = corner;
                     *mode = self.current_wall_drag_mode();
-                    if let Some(mut cur) = self.wall_cursor.take() {
+                    if !self.coop.is_active()
+                        && let Some(mut cur) = self.wall_cursor.take()
+                    {
                         let cfine = sims_vm::wall_cursor_fine(corner, level);
                         let _ = self.lot.build_cursor_move(
                             &mut cur,
@@ -6273,7 +6278,9 @@ impl Game {
                     self.water_hover_overlay = None;
                     *mode = self.current_wallpaper_drag_mode();
                     if let Some(face) = self.pick_wall_face(point) {
-                        if let Some(mut cur) = self.wall_cursor.take() {
+                        if !self.coop.is_active()
+                            && let Some(mut cur) = self.wall_cursor.take()
+                        {
                             let cfine = sims_vm::wallpaper_cursor_fine(face, level);
                             let facing =
                                 sims_vm::wallpaper_cursor_facing(face, self.view.camera.rotation);
@@ -6401,7 +6408,9 @@ impl Game {
                 let fine = self.unproject_build_fine(point);
                 let corner = sims_vm::snap_wall_corner(fine, active);
                 let mode = self.current_wall_drag_mode().cursor_mode();
-                if let Some(mut cur) = self.wall_cursor.take() {
+                if !self.coop.is_active()
+                    && let Some(mut cur) = self.wall_cursor.take()
+                {
                     let cfine = sims_vm::wall_cursor_fine(corner, level);
                     let _ = self
                         .lot
@@ -6412,7 +6421,9 @@ impl Game {
             }
             Some(BuildTool::Wallpaper) => {
                 if let Some(face) = self.pick_wall_face(point) {
-                    if let Some(mut cur) = self.wall_cursor.take() {
+                    if !self.coop.is_active()
+                        && let Some(mut cur) = self.wall_cursor.take()
+                    {
                         let cfine = sims_vm::wallpaper_cursor_fine(face, level);
                         let facing =
                             sims_vm::wallpaper_cursor_facing(face, self.view.camera.rotation);
@@ -6515,6 +6526,10 @@ impl Game {
         let had_overlay = self.build_preview_shape.take().is_some()
             || self.terrain_hover_overlay.take().is_some()
             || self.water_hover_overlay.take().is_some();
+        if self.coop.is_active() {
+            self.wall_cursor = None;
+            return had_overlay;
+        }
         let Some(mut cur) = self.wall_cursor.take() else {
             return had_overlay;
         };
@@ -6539,7 +6554,9 @@ impl Game {
                 let style = WallStyle::from_style_id(self.hud.build_state.last_wall_style)
                     .unwrap_or(WallStyle::Standard);
                 let mode = self.current_wall_drag_mode();
-                if let Some(mut cur) = self.wall_cursor.take() {
+                if !self.coop.is_active()
+                    && let Some(mut cur) = self.wall_cursor.take()
+                {
                     let cfine = sims_vm::wall_cursor_fine(corner, level);
                     let _ = self.lot.build_cursor_move(
                         &mut cur,
@@ -6610,7 +6627,9 @@ impl Game {
                     self.keep_sounds(sounds);
                     return Outcome::redraw();
                 };
-                if let Some(mut cur) = self.wall_cursor.take() {
+                if !self.coop.is_active()
+                    && let Some(mut cur) = self.wall_cursor.take()
+                {
                     let cfine = sims_vm::wallpaper_cursor_fine(face, level);
                     let facing = sims_vm::wallpaper_cursor_facing(face, self.view.camera.rotation);
                     let _ = self.lot.build_cursor_move(&mut cur, cfine, facing, Some(2));
@@ -7465,6 +7484,19 @@ impl Game {
         }
     }
 
+    /// Attempts to complete a parked host-lot snapshot restore onto this
+    /// candidate `Game`, preserving the parked snapshot on `OtherHouse` /
+    /// `OtherLoad` mismatches so the shell can try fallback local candidates.
+    pub fn try_complete_pending_coop_restage(
+        &mut self,
+    ) -> Result<(), crate::coop::RestageAttemptError> {
+        let note = self.coop.try_complete_pending_restage(&mut self.lot)?;
+        self.coop_remote_world = true;
+        self.sync_after_coop_snapshot_restore();
+        self.note = Some(note);
+        Ok(())
+    }
+
     /// Completes a parked host-lot snapshot restore onto this newly staged
     /// `Game`, verifying the snapshot transactionally BEFORE sending the
     /// completion ACK to the host.
@@ -7560,7 +7592,7 @@ impl Game {
             self.note = Some(err.clone());
             return Err(err);
         }
-        self.cancel_buy();
+        self.cancel_active_buy_build_tools();
         self.close_menu();
         let opts = options.unwrap_or_else(|| CoopStartOptions {
             player_name: self.coop_player_name.clone(),
@@ -7589,7 +7621,7 @@ impl Game {
             self.note = Some(err.clone());
             return Err(err);
         }
-        self.cancel_buy();
+        self.cancel_active_buy_build_tools();
         self.close_menu();
         let opts = options.unwrap_or_else(|| CoopStartOptions {
             player_name: self.coop_player_name.clone(),
@@ -7618,7 +7650,7 @@ impl Game {
             self.note = Some(err.clone());
             return Err(err);
         }
-        self.cancel_buy();
+        self.cancel_active_buy_build_tools();
         self.close_menu();
         let install = self.hud.install().clone();
         let frames = self.frames.clone();
@@ -7649,7 +7681,7 @@ impl Game {
             self.note = Some(err.clone());
             return Err(err);
         }
-        self.cancel_buy();
+        self.cancel_active_buy_build_tools();
         self.close_menu();
         self.coop
             .start_join_with_transport(transport, host_addr, manifest, player_name)?;
@@ -7670,6 +7702,11 @@ impl Game {
 
     /// Polls pending async co-op startup and network/snapshot events.
     pub fn coop_poll(&mut self) -> CoopPollOutput {
+        // Ensure no lingering VM Buy/Build cursors (e.g. Wall Cursor) survive
+        // into the moment async startup finishes and attaches co-op to `Lot`.
+        if self.coop.is_starting() && (self.wall_cursor.is_some() || self.buy_cursor.is_some()) {
+            self.cancel_active_buy_build_tools();
+        }
         let install = self.hud.install().clone();
         let frames = self.frames.clone();
         let out = self

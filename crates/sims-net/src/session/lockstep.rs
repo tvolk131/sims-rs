@@ -1997,7 +1997,25 @@ impl LockstepNode {
                     .as_ref()
                     .is_some_and(|h| peer_matches_hint(&from, h.as_str()))
                 {
-                    self.initiate_host_failover(transport);
+                    if reason == LeaveReason::SessionClosed {
+                        // Terminal host closure / snapshot-resync abort for this peer:
+                        // fence failover so an already-rostered peer never promotes
+                        // itself into a split-brain second host while the original
+                        // host continues serving the session.
+                        self.host_addr = None;
+                        self.local_player_id = None;
+                        self.peer_phase = PeerConnectionPhase::Connecting;
+                        self.pending_batches.clear();
+                        self.pending_snapshot_install = None;
+                        self.active_snapshot_rx = None;
+                        self.awaiting_snapshot_id = None;
+                        self.events.push_back(NodeEvent::SessionEnded {
+                            reason: "session closed by host (snapshot/resync aborted)".to_string(),
+                        });
+                        let _ = transport.disconnect(&from);
+                    } else {
+                        self.initiate_host_failover(transport);
+                    }
                 }
             }
         }

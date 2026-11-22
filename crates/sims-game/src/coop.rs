@@ -567,6 +567,20 @@ pub struct CoopPollOutput {
     pub needs_lot_restage: Option<(u32, u32)>,
 }
 
+/// Outcome of attempting to restore a parked host-lot snapshot onto a candidate
+/// guest `Lot` during [`CoopController::try_complete_pending_restage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestageAttemptError {
+    /// This candidate lot's `(house, family)` or load fingerprint did not match
+    /// (`SaveError::OtherHouse` / `SaveError::OtherLoad`). The snapshot remains
+    /// parked so the caller can try another local candidate (e.g. base
+    /// `HouseNN.iff`) before disconnecting.
+    Mismatch(String),
+    /// Non-recoverable verification or confirmation failure; the controller has
+    /// already detached and recorded the terminal error state.
+    Fatal(String),
+}
+
 /// Snapshot parked while the guest shell re-stages the host's matching base
 /// lot `(host_house, host_family)` prior to verified restore and ACK.
 struct PendingHostLotRestage {
@@ -692,6 +706,11 @@ impl CoopController {
         Self {
             phase: CoopPhase::Idle,
         }
+    }
+
+    /// Whether an async `iroh` startup task is currently in flight.
+    pub fn is_starting(&self) -> bool {
+        matches!(self.phase, CoopPhase::Starting(_))
     }
 
     /// Returns whether a co-op session is actively attached or starting up.
@@ -1485,15 +1504,23 @@ impl CoopController {
         }
     }
 
-    /// Completes a parked host-lot snapshot restore onto `lot` (which has been
-    /// freshly loaded for `(host_house, host_family)`) and sends the verified
-    /// completion ACK to the host.
-    pub fn complete_pending_restage(&mut self, lot: &mut Lot) -> Result<String, String> {
+    /// Attempts to complete a parked host-lot snapshot restore onto candidate
+    /// `lot` without disconnecting on `OtherHouse` / `OtherLoad` so callers can
+    /// try multiple local candidates (e.g. REDB store first, then installed
+    /// `HouseNN.iff`) before failing and disconnecting.
+    pub fn try_complete_pending_restage(
+        &mut self,
+        lot: &mut Lot,
+    ) -> Result<String, RestageAttemptError> {
         let CoopPhase::Active(active) = &mut self.phase else {
-            return Err("not in an active co-op session".into());
+            return Err(RestageAttemptError::Fatal(
+                "not in an active co-op session".into(),
+            ));
         };
         let Some(pending) = active.pending_restage.take() else {
-            return Err("no pending co-op snapshot restage".into());
+            return Err(RestageAttemptError::Fatal(
+                "no pending co-op snapshot restage".into(),
+            ));
         };
         let Some(mut pending_session) = active
             .node
@@ -1506,7 +1533,7 @@ impl CoopController {
             );
             self.shutdown_active(lot, false);
             self.phase = CoopPhase::Failed(ConnectionState::Error(msg.clone()));
-            return Err(msg);
+            return Err(RestageAttemptError::Fatal(msg));
         };
         pending_session.current_tick = pending.at_tick;
         match lot.restore_coop_snapshot_verified(
@@ -1525,7 +1552,7 @@ impl CoopController {
                     );
                     self.shutdown_active(lot, false);
                     self.phase = CoopPhase::Failed(ConnectionState::Error(msg.clone()));
-                    return Err(msg);
+                    return Err(RestageAttemptError::Fatal(msg));
                 }
                 active.resync_reason = None;
                 active.resync_progress_ticks = 0;
@@ -1546,16 +1573,29 @@ impl CoopController {
                     pending.local_house,
                     pending.local_family
                 );
-                self.shutdown_active(lot, false);
-                self.phase = CoopPhase::Failed(ConnectionState::Error(msg.clone()));
-                Err(msg)
+                // Keep snapshot parked so caller can try another local candidate!
+                active.pending_restage = Some(pending);
+                Err(RestageAttemptError::Mismatch(msg))
             }
             Err(err) => {
                 let msg = format!("Snapshot verification/restore failed: {err}");
                 self.shutdown_active(lot, false);
                 self.phase = CoopPhase::Failed(ConnectionState::Error(msg.clone()));
+                Err(RestageAttemptError::Fatal(msg))
+            }
+        }
+    }
+
+    /// Completes a parked host-lot snapshot restore onto `lot` (single-shot
+    /// wrapper that disconnects cleanly on any mismatch or failure).
+    pub fn complete_pending_restage(&mut self, lot: &mut Lot) -> Result<String, String> {
+        match self.try_complete_pending_restage(lot) {
+            Ok(note) => Ok(note),
+            Err(RestageAttemptError::Mismatch(msg)) => {
+                self.fail_pending_restage(lot, msg.clone());
                 Err(msg)
             }
+            Err(RestageAttemptError::Fatal(msg)) => Err(msg),
         }
     }
 
