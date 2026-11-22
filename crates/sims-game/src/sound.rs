@@ -401,6 +401,12 @@ pub struct Feed {
     /// The requested pause state saved on focus loss (`[esi + 0xbc]` at
     /// `0x4f7645`..`0x4f764a`), restored on focus regain (`0x4f765c`..`0x4f7666`).
     saved_paused: bool,
+    /// Whether the most recent focus loss auto-paused the lot (true when
+    /// `Sim In Background` was off at blur time, `[0x6c9fa1] == 1`).
+    paused_for_blur: bool,
+    /// The last `[fx, music, vox]` volume steps (`0..=10`) sent to the mixer
+    /// (matching `Player::new`'s `[10, 10, 10]` startup defaults).
+    volumes: [u8; 3],
 }
 
 impl Default for Feed {
@@ -414,6 +420,8 @@ impl Default for Feed {
             pause_dirty: false,
             focused: true,
             saved_paused: false,
+            paused_for_blur: false,
+            volumes: [sims_ui::options::VOLUME_MAX; 3],
         }
     }
 }
@@ -455,12 +463,15 @@ impl Feed {
         if self.focused == focused {
             return false;
         }
-        // Pick up any manual pause toggle that happened since the last update
-        // so `0x4f7645 -> 0x4939c0` saves the latest requested pause state.
-        let current_game_paused = game.paused();
-        if current_game_paused != self.observed_game_paused {
-            self.observed_game_paused = current_game_paused;
-            self.requested_paused = current_game_paused;
+        // Pick up any manual pause toggle or mode transition (`0x4ce4c4..0x4ce4d1`)
+        // that happened since the last update so `0x4f7645 -> 0x4939c0` saves
+        // the latest requested pause state.
+        let live_mode = game.mode() == sims_ui::command::Mode::Live;
+        let current_audio_paused = game.paused() || !live_mode;
+        if current_audio_paused != self.observed_game_paused {
+            self.observed_game_paused = current_audio_paused;
+            self.requested_paused = current_audio_paused;
+            self.pause_dirty = true;
         }
         let pause_changed = if !focused {
             // Flush prior clicks, sounds, and camera moves before focus loss
@@ -468,17 +479,26 @@ impl Feed {
             // prematurely emitting a pending focus-regain `Unpause` when a
             // rapid refocus-then-blur occurs before the next `update`.
             self.flush_before_blur(game, &mut send);
-            self.saved_paused = self.requested_paused;
-            let before = game.paused();
-            if !before {
-                game.toggle_pause();
+            // `0x4f762b..0x4f763c`: auto-pause only in Live mode (`mode == 2`)
+            // and when `Sim In Background` is off (`byte [0x6c9fa1] == 1`,
+            // toggled at `0x4e628d`).
+            if !live_mode || game.options().play.sim_in_background {
+                self.paused_for_blur = false;
+                false
+            } else {
+                self.paused_for_blur = true;
+                self.saved_paused = self.requested_paused;
+                let before = game.paused();
+                if !before {
+                    game.toggle_pause();
+                }
+                self.observed_game_paused = game.paused() || !live_mode;
+                // `0x4cee52`..`0x4cee5d` records requested pause = true and marks
+                // pause dirty (`0x800000`) unconditionally.
+                self.requested_paused = true;
+                self.pause_dirty = true;
+                game.paused() != before
             }
-            self.observed_game_paused = game.paused();
-            // `0x4cee52`..`0x4cee5d` records requested pause = true and marks
-            // pause dirty (`0x800000`) unconditionally.
-            self.requested_paused = true;
-            self.pause_dirty = true;
-            self.observed_game_paused != before
         } else {
             let first = self.told.is_none();
             let sources = game.sound_sources();
@@ -489,18 +509,26 @@ impl Feed {
             if first {
                 send(Input::Events(enter_live()));
             }
-            let before = game.paused();
-            if before != self.saved_paused {
-                game.toggle_pause();
+            if !self.paused_for_blur || !live_mode {
+                if live_mode {
+                    self.paused_for_blur = false;
+                }
+                false
+            } else {
+                self.paused_for_blur = false;
+                let before = game.paused();
+                if before != self.saved_paused {
+                    game.toggle_pause();
+                }
+                self.observed_game_paused = game.paused() || !live_mode;
+                // `0x4cee52`..`0x4cee5d` records requested pause = saved_paused and
+                // marks pause dirty (`0x800000`) unconditionally, so a rapid
+                // blur-then-refocus still dispatches the final pause state on the
+                // next update (`0x4ce59e` → `0x4ce5b0`).
+                self.requested_paused = self.saved_paused;
+                self.pause_dirty = true;
+                game.paused() != before
             }
-            self.observed_game_paused = game.paused();
-            // `0x4cee52`..`0x4cee5d` records requested pause = saved_paused and
-            // marks pause dirty (`0x800000`) unconditionally, so a rapid
-            // blur-then-refocus still dispatches the final pause state on the
-            // next update (`0x4ce59e` → `0x4ce5b0`).
-            self.requested_paused = self.saved_paused;
-            self.pause_dirty = true;
-            self.observed_game_paused != before
         };
         self.focused = focused;
         send(Input::Active(focused));
@@ -538,6 +566,25 @@ impl Feed {
             send(Input::Camera);
             self.shot = Some(shot);
         }
+        self.sync_volumes(game, &mut send);
+    }
+
+    /// Sends changed `[fx, music, vox]` slider steps (`0..=10`) to the mixer
+    /// (kinds 37, 38, and 39, `0x4e6182..0x4e620e`).
+    fn sync_volumes(&mut self, game: &crate::Game, mut send: impl FnMut(Input)) {
+        let volumes = game.volumes();
+        if volumes[0] != self.volumes[0] {
+            send(Input::FxVolume(volumes[0]));
+            self.volumes[0] = volumes[0];
+        }
+        if volumes[1] != self.volumes[1] {
+            send(Input::MusicVolume(volumes[1]));
+            self.volumes[1] = volumes[1];
+        }
+        if volumes[2] != self.volumes[2] {
+            send(Input::VoxVolume(volumes[2]));
+            self.volumes[2] = volumes[2];
+        }
     }
 
     /// Sends every sound input that changed on `game` since the last call.
@@ -554,10 +601,13 @@ impl Feed {
         if first {
             send(Input::Events(enter_live()));
         }
-        let game_paused = game.paused();
-        if game_paused != self.observed_game_paused {
-            self.observed_game_paused = game_paused;
-            self.requested_paused = game_paused;
+        self.sync_volumes(game, &mut send);
+        // `0x4ce4c4..0x4ce4d1`: leaving Live mode (e.g. entering Options) pauses
+        // live audio; returning to Live unpauses unless the lot is paused.
+        let audio_paused = game.paused() || game.mode() != sims_ui::command::Mode::Live;
+        if audio_paused != self.observed_game_paused {
+            self.observed_game_paused = audio_paused;
+            self.requested_paused = audio_paused;
             self.pause_dirty = true;
         }
         if self.pause_dirty {
@@ -647,6 +697,12 @@ pub enum Input {
     Camera,
     /// The window gained or lost focus (kind 25, `0x4f7608` → `0x4f76d5`).
     Active(bool),
+    /// Sound effects volume slider step `0..=10` (kind 37, `0x4e6182` → `0x57408f`).
+    FxVolume(u8),
+    /// Music volume slider step `0..=10` (kind 38, `0x4e61bb` → `0x5740f9`).
+    MusicVolume(u8),
+    /// Voice volume slider step `0..=10` (kind 39, `0x4e61f4` → `0x57410d`).
+    VoxVolume(u8),
 }
 
 /// The sound player with every module, station and ambient score of an
@@ -703,10 +759,24 @@ impl Mixer {
                 .player
                 .camera_moved(self.view, self.hour, &self.sources),
             Input::Active(active) => self.player.set_active(active, &self.sources),
+            Input::FxVolume(step) => self
+                .player
+                .set_fx_volume_step(usize::from(step), &self.sources),
+            Input::MusicVolume(step) => self.player.set_music_volume_step(usize::from(step)),
+            Input::VoxVolume(step) => self.player.set_vox_volume_step(usize::from(step)),
             Input::Speed(speed) => self
                 .player
                 .set_global(SPEED_REGISTER, speed_register(speed)),
         }
+    }
+
+    /// Current `[fx, music, vox]` slider steps (`0..=10`) stored in the player.
+    pub fn volume_steps(&self) -> [u8; 3] {
+        [
+            self.player.fx_volume_step(),
+            self.player.music_volume_step(),
+            self.player.vox_volume_step(),
+        ]
     }
 
     /// Renders `frames` stereo frames at [`sims_audio::player::RATE`],

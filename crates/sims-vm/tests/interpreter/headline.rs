@@ -298,7 +298,7 @@ fn a_neighbors_picture_needs_the_record_and_its_type() {
         stale: true,
     };
     let mut fx = Fixture::new();
-    fx.world.neighbors = Neighbors {
+    *fx.world.neighbors = Neighbors {
         slots: vec![Some(record(1, LAMP_GUID)), Some(record(2, 0x9999)), None],
         ..Neighbors::default()
     };

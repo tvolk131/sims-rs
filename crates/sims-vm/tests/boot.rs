@@ -306,8 +306,12 @@ fn an_old_town_home_loads_through_its_guid_table_and_steps() {
         &bits,
     )
     .unwrap();
-    lot.replay_dialogs(&UD1_DIALOGS.map(|(status, bitmap_id)| Answer { status, bitmap_id }))
-        .unwrap();
+    lot.replay_dialogs(&UD1_DIALOGS.map(|(status, bitmap_id)| Answer {
+        status,
+        bitmap_id,
+        text: None,
+    }))
+    .unwrap();
     // The C runtime's stream as the original entered the lot: the dog file
     // was read before the load (`sims_vm::READ_BEFORE_THE_FIRST_LOAD`).
     assert_eq!(lot.world().crt_rng.state(), 2_984_970_331);

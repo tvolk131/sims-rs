@@ -13,7 +13,7 @@ use crate::light::Light;
 use crate::lot::{self, Lot, WallCell};
 use crate::pools::{self, Pools};
 use crate::shadows;
-use sims_sim::{Object, World};
+use sims_sim::{CowMap, Object, World};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Rows between a tile's left corner and the top of its first grass
@@ -56,6 +56,27 @@ pub fn background(time_of_day: i16, house: i16) -> [u8; 3] {
     crate::canvas::quantize565(rgb)
 }
 
+/// Graphics options that control how [`Painter`] renders the lot
+/// (`cTSOptions`: object floor shadows `[0x6f0188]` at `0x4e5fb2`/`0x4ae846`,
+/// dynamic lamp light pools `[0x6f018a]` at `0x4e5fd5`/`0x4c7c1a`/`0x4c835c`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderOptions {
+    /// Cast object floor shadows (`[0x6f0188]`).
+    pub shadows: bool,
+    /// Render dynamic lamp pools on floors and walls (`[0x6f018a]` at
+    /// `0x4c7c1a` and `0x4c835c`); base room shading always applies.
+    pub lighting: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            shadows: true,
+            lighting: true,
+        }
+    }
+}
+
 /// Counts of what one frame drew, for tests and the viewer's status line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -86,6 +107,7 @@ pub fn draw(
         camera,
         viewport,
         None,
+        RenderOptions::default(),
         canvas,
         Pass::All,
     )
@@ -109,6 +131,7 @@ pub fn draw_lot(
         camera,
         viewport,
         None,
+        RenderOptions::default(),
         canvas,
         Pass::Lot,
     )
@@ -133,6 +156,7 @@ pub fn draw_lot_in_viewport(
         camera,
         viewport,
         None,
+        RenderOptions::default(),
         canvas,
         Pass::Lot,
     )
@@ -157,6 +181,57 @@ pub fn draw_lot_with_preview(
         camera,
         viewport,
         preview,
+        RenderOptions::default(),
+        canvas,
+        Pass::Lot,
+    )
+}
+
+/// Draws the lot like [`draw_lot_in_viewport`], applying [`RenderOptions`]
+/// (`shadows` `[0x6f0188]` and `lighting` `[0x6f018a]`).
+pub fn draw_lot_in_viewport_with_options(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    options: RenderOptions,
+    canvas: &mut Canvas,
+) -> Stats {
+    paint(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        None,
+        options,
+        canvas,
+        Pass::Lot,
+    )
+}
+
+/// Draws the lot like [`draw_lot_with_preview`], applying [`RenderOptions`]
+/// (`shadows` `[0x6f0188]` and `lighting` `[0x6f018a]`).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_lot_with_preview_and_options(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    preview: Option<(u16, u16)>,
+    options: RenderOptions,
+    canvas: &mut Canvas,
+) -> Stats {
+    paint(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        preview,
+        options,
         canvas,
         Pass::Lot,
     )
@@ -175,6 +250,18 @@ pub fn draw_held(
     camera: &Camera,
     canvas: &mut Canvas,
 ) -> Stats {
+    draw_held_with_options(world, lot, assets, camera, RenderOptions::default(), canvas)
+}
+
+/// Like [`draw_held`], applying [`RenderOptions`].
+pub fn draw_held_with_options(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    options: RenderOptions,
+    canvas: &mut Canvas,
+) -> Stats {
     let held = holds_person(world);
     if held.is_empty() {
         return Stats::default();
@@ -187,6 +274,7 @@ pub fn draw_held(
         camera,
         viewport,
         None,
+        options,
         canvas,
         Pass::Held,
         None,
@@ -219,6 +307,7 @@ fn paint(
     camera: &Camera,
     viewport: (u32, u32),
     preview: Option<(u16, u16)>,
+    options: RenderOptions,
     canvas: &mut Canvas,
     pass: Pass,
 ) -> Stats {
@@ -229,22 +318,38 @@ fn paint(
         holds_person(world)
     };
     paint_with_precomputed(
-        world, lot, assets, camera, viewport, preview, canvas, pass, &grass, held, None,
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        preview,
+        options,
+        canvas,
+        pass,
+        &grass,
+        held,
+        None,
+        None,
+        |_, _| {},
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn paint_lot_precomputed(
+pub(crate) fn paint_lot_with_env_hook(
     world: &World,
     lot: &Lot,
     assets: &mut Assets,
     camera: &Camera,
     viewport: (u32, u32),
     preview: Option<(u16, u16)>,
+    options: RenderOptions,
     canvas: &mut Canvas,
     grass: &Grass,
     held: BTreeSet<u16>,
     cut_mask: Option<&Mask>,
+    level1_openings: Option<&BTreeMap<Edge, (usize, u16)>>,
+    after_level1_env: impl FnMut(&Canvas, Stats),
 ) -> Stats {
     paint_with_precomputed(
         world,
@@ -253,12 +358,61 @@ pub(crate) fn paint_lot_precomputed(
         camera,
         viewport,
         preview,
+        options,
         canvas,
         Pass::Lot,
         grass,
         held,
         cut_mask,
+        level1_openings,
+        after_level1_env,
     )
+}
+
+/// Completes `Pass::Lot` starting from a canvas already populated with level-1's
+/// static environment (`clear` + `floors(1)` + `walls(1)` + `trims(1)`) and its
+/// accumulated [`Stats`]. Draws level-1 non-held objects, plus all of level 2
+/// when `camera.level == 2`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_lot_from_env(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    preview: Option<(u16, u16)>,
+    options: RenderOptions,
+    canvas: &mut Canvas,
+    held: BTreeSet<u16>,
+    cut_mask: Option<&Mask>,
+    env_stats: Stats,
+) -> Stats {
+    let mut painter = Painter::new(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        preview,
+        options,
+        canvas,
+        Pass::Lot,
+        None,
+        held,
+    );
+    painter.stats = env_stats;
+    let top = camera.level.clamp(1, 2);
+    let cut1 = cut(lot, camera, 1, top, cut_mask);
+    painter.objects(1, &cut1);
+    if top == 2 {
+        painter.floors(2);
+        let cut2 = cut(lot, camera, 2, top, cut_mask);
+        let corners2 = painter.corners(2, &cut2);
+        painter.walls(2, &cut2, &corners2);
+        painter.trims(2, &corners2);
+        painter.objects(2, &cut2);
+    }
+    painter.stats
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -269,11 +423,14 @@ fn paint_with_precomputed(
     camera: &Camera,
     viewport: (u32, u32),
     preview: Option<(u16, u16)>,
+    options: RenderOptions,
     canvas: &mut Canvas,
     pass: Pass,
     grass: &Grass,
     held: BTreeSet<u16>,
     cut_mask: Option<&Mask>,
+    level1_openings: Option<&BTreeMap<Edge, (usize, u16)>>,
+    mut after_level1_env: impl FnMut(&Canvas, Stats),
 ) -> Stats {
     let time_of_day = world.globals.get(4).copied().unwrap_or(lot.time_of_day);
     let house = world.globals.get(10).copied().unwrap_or(0);
@@ -285,6 +442,7 @@ fn paint_with_precomputed(
         camera,
         viewport,
         preview,
+        options,
         canvas,
         pass,
         Some(grass),
@@ -295,8 +453,17 @@ fn paint_with_precomputed(
         painter.floors(level);
         let cut = cut(lot, camera, level, top, cut_mask);
         let corners = painter.corners(level, &cut);
-        painter.walls(level, &cut, &corners);
+        if level == 1
+            && let Some(openings) = level1_openings
+        {
+            painter.walls_with_openings(level, &cut, &corners, openings);
+        } else {
+            painter.walls(level, &cut, &corners);
+        }
         painter.trims(level, &corners);
+        if level == 1 {
+            after_level1_env(painter.canvas, painter.stats);
+        }
         painter.objects(level, &cut);
     }
     painter.stats
@@ -347,7 +514,7 @@ pub fn holds_person(world: &World) -> BTreeSet<u16> {
 }
 
 /// [`holds_person`] for `objects`, of which `people` are the people.
-fn held_trees(objects: &BTreeMap<u16, Object>, people: &BTreeSet<u16>) -> BTreeSet<u16> {
+fn held_trees(objects: &CowMap<u16, Object>, people: &BTreeSet<u16>) -> BTreeSet<u16> {
     let word = |id: u16, i: usize| objects.get(&id).and_then(|o| o.data.get(i).copied());
     let registered = |w: i16| {
         u16::try_from(w)
@@ -494,7 +661,32 @@ impl Level {
 }
 
 /// A wall segment by its two lot corners, the lower first.
-type Edge = [[i32; 2]; 2];
+pub(crate) type Edge = [[i32; 2]; 2];
+
+/// The objects that cut their own shape into a wall on a level, by the wall
+/// they stand in, stored as `(resource, wall_shape)`.
+pub(crate) fn wall_objects_on_level(
+    world: &World,
+    assets: &mut Assets,
+    level: i32,
+) -> BTreeMap<Edge, (usize, u16)> {
+    let mut found = BTreeMap::new();
+    for o in world.objects.values() {
+        if o.position[2] != level || o.position[0] < 0 || o.position[1] < 0 {
+            continue;
+        }
+        let Some(definition) = assets.definition_ref(o.guid) else {
+            continue;
+        };
+        if definition.shapes_wall() {
+            let info = (Assets::resource_of(definition), definition.wall_shape);
+            if let Some(e) = object_edge(o.position, &o.data) {
+                found.insert(e, info);
+            }
+        }
+    }
+    found
+}
 
 fn edge(a: [i32; 2], b: [i32; 2]) -> Edge {
     if a <= b { [a, b] } else { [b, a] }
@@ -555,6 +747,8 @@ struct Painter<'a> {
     /// Active house viewport bottom (`word ptr [0x6f0c14]`), clamped to the
     /// canvas height.
     clip_bottom: i32,
+    /// Graphics options (`shadows` `[0x6f0188]`, `lighting` `[0x6f018a]`).
+    options: RenderOptions,
     world: &'a World,
     lot: &'a Lot,
     camera: &'a Camera,
@@ -574,6 +768,7 @@ impl<'a> Painter<'a> {
         camera: &'a Camera,
         viewport: (u32, u32),
         preview: Option<(u16, u16)>,
+        options: RenderOptions,
         canvas: &'a mut Canvas,
         pass: Pass,
         grass: Option<&'a Grass>,
@@ -585,6 +780,7 @@ impl<'a> Painter<'a> {
             held,
             preview_overrides: buy_preview_overrides(world, preview),
             clip_bottom,
+            options,
             world,
             lot,
             camera,
@@ -789,7 +985,11 @@ impl<'a> Painter<'a> {
                     let byte = self
                         .lot
                         .light_at(index, [x * 16 + inside[0], y * 16 + inside[1]]);
-                    let lamps = Self::lamps_at(self.lot, self.camera, index, [x, y]);
+                    let lamps = if self.options.lighting {
+                        Self::lamps_at(self.lot, self.camera, index, [x, y])
+                    } else {
+                        [None; 2]
+                    };
                     let depth = &self.depth;
                     let (base_d, first_row) = depth.floor_base(view, height, level, at[1]);
                     let row_depth = |y| depth.floor_row(base_d, first_row, y);
@@ -835,6 +1035,9 @@ impl<'a> Painter<'a> {
     /// height `height`: that of the first object on the tile that has one
     /// (see [`crate::shadows`]).
     fn shadow(&mut self, level: i32, [x, y]: [i32; 2], p: [i32; 2], view: [i32; 2], height: i32) {
+        if !self.options.shadows {
+            return;
+        }
         let Some((code, strength)) =
             shadow_of_tile(self.world, self.assets, self.camera.rotation, level, [x, y])
         else {
@@ -992,29 +1195,25 @@ impl<'a> Painter<'a> {
     /// wall they stand in (the old prototype's `object_apertures` in
     /// `legacy/crates/sims-render/src/walls.rs`), stored as `(resource, wall_shape)`.
     fn wall_objects(&mut self, level: i32) -> BTreeMap<Edge, (usize, u16)> {
-        let mut found = BTreeMap::new();
-        for o in self.world.objects.values() {
-            if o.position[2] != level || o.position[0] < 0 || o.position[1] < 0 {
-                continue;
-            }
-            let Some(definition) = self.assets.definition_ref(o.guid) else {
-                continue;
-            };
-            if definition.shapes_wall() {
-                let info = (Assets::resource_of(definition), definition.wall_shape);
-                if let Some(e) = object_edge(o.position, &o.data) {
-                    found.insert(e, info);
-                }
-            }
-        }
-        found
+        wall_objects_on_level(self.world, self.assets, level)
     }
 
     /// Draws a level's walls.
     fn walls(&mut self, level: i32, cut: &Cut, corners: &Level) {
+        let openings = self.wall_objects(level);
+        self.walls_with_openings(level, cut, corners, &openings);
+    }
+
+    /// Draws a level's walls using precomputed wall-shaping object apertures.
+    fn walls_with_openings(
+        &mut self,
+        level: i32,
+        cut: &Cut,
+        corners: &Level,
+        openings: &BTreeMap<Edge, (usize, u16)>,
+    ) {
         let index = (level - 1) as usize;
         let zoom = self.camera.zoom.index();
-        let openings = self.wall_objects(level);
         for x in 0..self.lot.size as i32 {
             for y in 0..self.lot.size as i32 {
                 let wall = self.lot.levels[index].walls[Lot::cell(x as usize, y as usize)];
@@ -1195,8 +1394,10 @@ impl<'a> Painter<'a> {
         let plain = light.map_or(Light::FULL, |f| Light::from_fraction(f, brightest));
         let index = (level - 1) as usize;
         let drawn_base = light.and_then(|f| Light::drawn_fraction(f, brightest));
-        let wall_pools = match (drawn_base, seen) {
-            (Some(_), Some((along_y, tile))) => {
+        // `0x4c7c1a`: `[0x6f018a]` skips only dynamic wall lamp pools while
+        // preserving base room shading.
+        let wall_pools = match (self.options.lighting, drawn_base, seen) {
+            (true, Some(_), Some((along_y, tile))) => {
                 Self::wall_pools_ref(self.lot, self.camera, pools, index, along_y, tile)
             }
             _ => [None, None],
@@ -1696,6 +1897,9 @@ impl<'a> Painter<'a> {
             // in full light (0x437f7d, 0x4b455f). Then one whose master's
             // word 69 is 7 takes a light of 1 through the setter, held by
             // the time of day's cap (0x437adb to 0x437aed).
+            // 0x437abd..0x437aed: `0x437f7d` sets full light first, then
+            // master word 69 == 7 (`lit_at_brightest`) overwrites it with the
+            // time-of-day cap (`0x4b4525(1.0)`).
             let glows = o.data.get(LIGHT).is_some_and(|&w| w != 0) && def_kind != WINDOW;
             let light = if def_lit_at_brightest {
                 Light::from_fraction(1.0, self.lot.brightest())
@@ -1912,7 +2116,7 @@ const BEFORE: usize = 26;
 /// cycle returns `(false, base)`. Each accumulated coordinate stays within a
 /// lot's width of `base` so malformed slot data cannot overflow.
 fn held(
-    objects: &BTreeMap<u16, Object>,
+    objects: &CowMap<u16, Object>,
     mut slot: impl FnMut(u32, usize) -> Option<[f32; 3]>,
     id: u16,
     base: [f32; 3],
@@ -2782,7 +2986,7 @@ mod tests {
             (TRAY, 0) => Some([-9.6, 0.0, 0.0]),
             _ => None,
         };
-        let mut objects = BTreeMap::new();
+        let mut objects = CowMap::new();
         // A table facing 2 (one quarter turn) holds a lamp in its slot 1.
         objects.insert(1, object(1, TABLE, [100, 200, 1], &[(1, 2)]));
         objects.insert(
@@ -2839,11 +3043,11 @@ mod tests {
     #[test]
     fn a_persons_holders_and_all_they_hold_draw_after_the_people() {
         use sims_formats::saved_objects::Slot;
-        let mut objects = BTreeMap::new();
+        let mut objects = CowMap::new();
         // Sets entry `index` of `at`'s saved slot list to `id`. Entry 0
         // links to the next object on the tile; slot `n` (from 0) is entry
         // `n + 1`.
-        let entry = |objects: &mut BTreeMap<u16, Object>, at: u16, index: usize, id: u16| {
+        let entry = |objects: &mut CowMap<u16, Object>, at: u16, index: usize, id: u16| {
             let slots = &mut objects.get_mut(&at).unwrap().slots;
             if slots.len() <= index {
                 let empty = Slot {
@@ -2856,14 +3060,14 @@ mod tests {
         };
         // `at` holds `id` in its slot `slot` (from 0), by the link words
         // and in the holder's slot list.
-        let put = |objects: &mut BTreeMap<u16, Object>, id: u16, at: u16, slot: usize| {
+        let put = |objects: &mut CowMap<u16, Object>, id: u16, at: u16, slot: usize| {
             let o = objects.get_mut(&id).unwrap();
             o.data[LINK_SLOT] = slot as i16 + 1;
             o.data[BEFORE] = at as i16;
             entry(objects, at, slot + 1, id);
         };
         // `id` follows `before` on its tile.
-        let follow = |objects: &mut BTreeMap<u16, Object>, id: u16, before: u16| {
+        let follow = |objects: &mut CowMap<u16, Object>, id: u16, before: u16| {
             let o = objects.get_mut(&id).unwrap();
             o.data[LINK_SLOT] = 0;
             o.data[BEFORE] = before as i16;
@@ -2919,7 +3123,7 @@ mod tests {
     #[test]
     fn a_long_chain_of_huge_slots_stays_within_a_lot() {
         let huge = |_: u32, _: usize| Some([f32::MAX, -1e30, f32::INFINITY]);
-        let mut objects = BTreeMap::new();
+        let mut objects = CowMap::new();
         objects.insert(1, object(1, 1, [0, 0, 1], &[]));
         for id in 2..200u16 {
             let below = (id - 1) as i16;

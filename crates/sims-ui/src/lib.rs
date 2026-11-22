@@ -27,6 +27,7 @@ pub mod frame;
 pub mod house;
 pub mod household;
 pub mod hud;
+pub mod options;
 pub mod pie;
 pub mod queue;
 pub mod thumbnail;

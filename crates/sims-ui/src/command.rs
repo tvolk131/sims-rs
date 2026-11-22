@@ -112,6 +112,90 @@ pub enum BuildItemId {
     Object(u32),
 }
 
+/// The options panel's three subpanel tabs (`cWinOptions`, `0x514236..0x514374`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OptionsTab {
+    Graphics,
+    Sound,
+    Play,
+}
+
+/// The three volume sliders in the Sound options subpanel (`0x516624..0x516675`,
+/// mapping to audio kinds 37, 38, and 39).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VolumeChannel {
+    Fx,
+    Music,
+    Vox,
+}
+
+/// The 3-way detail radio groups in Graphics options (`0x514d1d..0x514dd7`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OptionsRadio {
+    TerrainDetail,
+    CharacterDetail,
+}
+
+/// Low / Med / High detail levels (`0x5375d5..0x53783b`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DetailLevel {
+    Low = 0,
+    Med = 1,
+    #[default]
+    High = 2,
+}
+
+/// The boolean checkbox options in the Graphics and Play subpanels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OptionsToggle {
+    AntiAlias,
+    Shadows,
+    Lighting,
+    InterfaceEffects,
+    AutoCentering,
+    FreeWill,
+    EdgeScrolling,
+    SimInBackground,
+    QuickTips,
+    AutoSnapshot,
+    LivePip,
+    ExportHtml,
+}
+
+/// The top-row action buttons and Play subpanel's Reset Tutorial button
+/// (`0x514101..0x514235`, `0x515939..0x515a59`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OptionsAction {
+    Neighborhood,
+    Save,
+    Quit,
+    TutorialReset,
+}
+
+/// Which Options-panel setting's help balloon to open or toggle
+/// (`0x516719..0x51679a`, `0x66c394..0x66c410`, `UIText.iff STR# 145`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OptionsHelp {
+    AntiAlias,
+    Shadows,
+    Lighting,
+    InterfaceEffects,
+    TerrainDetail,
+    CharacterDetail,
+    Fx,
+    Music,
+    Vox,
+    AutoCentering,
+    FreeWill,
+    EdgeScrolling,
+    SimInBackground,
+    ResetTutorial,
+    QuickTips,
+    AutoSnapshot,
+    LivePip,
+    ExportHtml,
+}
+
 /// One player action.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Command {
@@ -196,6 +280,26 @@ pub enum Command {
     Undo,
     /// Redo the most recently undone Buy/Build action (`0x4cf317` → `0x493338`).
     Redo,
+    /// Open or toggle an Options panel subpanel tab (`0x5167d5..0x5167fb`).
+    OpenOptionsTab(OptionsTab),
+    /// Toggle an Options checkbox (`0x5163cb..0x516520`).
+    ToggleOption(OptionsToggle),
+    /// Set a 3-way detail radio group in Graphics options (`0x516261..0x5162e5`).
+    SetDetail {
+        radio: OptionsRadio,
+        level: DetailLevel,
+    },
+    /// Set one of the three Sound volume sliders to a step in `0..=10`
+    /// (`0x516624..0x516675`, kinds 37–39).
+    SetVolume {
+        channel: VolumeChannel,
+        step: u8,
+    },
+    /// Press an Options panel action button (Save, Neighborhood, Quit, or
+    /// Reset Tutorial).
+    OptionsAction(OptionsAction),
+    /// Open or toggle an Options setting's help balloon (`0x516719..0x51679a`).
+    OptionsHelp(OptionsHelp),
 }
 
 impl Command {

@@ -160,7 +160,7 @@ pub trait Player {
 }
 
 /// The result of a modal dialog and the UI sample taken while it was open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Answer {
     /// The status the button gives (0x4370be): 2 for the first button,
     /// 3 for the second, 4 for the third.
@@ -173,6 +173,10 @@ pub struct Answer {
     /// window supplies the ID and a headless replay records what was
     /// observed.
     pub bitmap_id: Option<i16>,
+    /// The text entered into a kind 3 text-prompt dialog (`record + 0x44`,
+    /// copied to global `[0x6e4ac0]` at `0x451a6b..0x451a85`), or `None` for
+    /// non-text dialogs.
+    pub text: Option<String>,
 }
 
 impl From<u8> for Answer {
@@ -180,6 +184,7 @@ impl From<u8> for Answer {
         Self {
             status,
             bitmap_id: None,
+            text: None,
         }
     }
 }
@@ -193,6 +198,10 @@ pub struct Shown {
     pub object: u16,
     /// The answers it offers.
     pub answers: &'static [u8],
+    /// Whether this is a kind 3 text-prompt dialog (`cTSWinTextEdit2`,
+    /// `0x451a6b..0x451a85`), which requires an explicit player answer rather
+    /// than auto-accepting as a single-button notice.
+    pub text_entry: bool,
 }
 
 /// A player who answers from a list, in order.
@@ -215,7 +224,7 @@ impl Answers {
     /// One answer for each dialog shown, including one-button notices.
     pub fn replay(list: &[Answer]) -> Self {
         Self {
-            queue: list.iter().copied().collect(),
+            queue: list.iter().cloned().collect(),
             include_single_button: true,
         }
     }
@@ -224,7 +233,7 @@ impl Answers {
 impl Player for Answers {
     fn answer(&mut self, shown: &Shown) -> Option<Answer> {
         match shown.answers {
-            [only] if !self.include_single_button => Some((*only).into()),
+            [only] if !self.include_single_button && !shown.text_entry => Some((*only).into()),
             _ => self.queue.pop_front(),
         }
     }
@@ -288,6 +297,9 @@ pub struct Update {
     pub ticked: Vec<u16>,
     /// The dialogs shown and how each was answered.
     pub answered: Vec<(u16, u8)>,
+    /// The text returned by the last kind 3 text-entry dialog answered during
+    /// this update (`0x451a6b..0x451a85` -> global `[0x6e4ac0]`), if any.
+    pub dialog_text: Option<String>,
     /// The objects the registry removed.
     pub removed: Vec<u16>,
     /// In play mode, the error caught in an object's tick, if any, and
@@ -531,11 +543,12 @@ impl Interpreter<'_> {
         };
         for id in start..=end {
             world.scheduler_cursor = id as i16;
-            let Some(object) = world.objects.get_mut(&id) else {
+            let Some(object) = world.objects.get(&id) else {
                 continue;
             };
-            if object.flags() & CHECK_ERROR != 0 {
-                if object.flags() & READY != 0 && object.stack.is_empty() {
+            let mut flags = object.flags();
+            if flags & CHECK_ERROR != 0 {
+                if flags & READY != 0 && object.stack.is_empty() {
                     // 0x46d5da -> 0x46d68c -> 0x439a6f: a deferred thread
                     // error recorded by 0x474aae (such as a faulted "init
                     // visitor") stops the pass and resets the object instead
@@ -561,15 +574,22 @@ impl Interpreter<'_> {
                     }
                     return Err(fault.into());
                 }
-                object.set_flags(CHECK_ERROR, false);
+                if let Some(object) = world.objects.get_mut(&id) {
+                    object.set_flags(CHECK_ERROR, false);
+                    flags = object.flags();
+                }
             }
-            let flags = object.flags();
             if flags & READY == 0 || (partial && flags & IN_PARTIAL == 0) {
                 continue;
             }
+            let Some(object) = world.objects.get(&id) else {
+                continue;
+            };
             let countdown = object.countdown().unwrap_or(0);
             if countdown > 0 {
-                object.set_countdown(countdown - 1);
+                if let Some(object) = world.objects.get_mut(&id) {
+                    object.set_countdown(countdown - 1);
+                }
                 update.counted.push(id);
                 continue;
             }
@@ -1090,16 +1110,20 @@ impl Interpreter<'_> {
                 tick: world.ticks,
                 object: record.caller,
                 answers,
+                text_entry: record.operands[5] & 0x7f == 3,
             };
             // While the dialog waits, the game handles its messages, which
             // redraws the family panel.
             self.refresh_family_panel(world);
             let given = player.answer(&shown);
-            let Some(answer) = given.filter(|answer| answers.contains(&answer.status)) else {
-                return Err(TickError::Unanswered {
-                    shown,
-                    given: given.map(|answer| answer.status),
-                });
+            let answer = match given {
+                Some(answer) if answers.contains(&answer.status) => answer,
+                other => {
+                    return Err(TickError::Unanswered {
+                        shown,
+                        given: other.map(|answer| answer.status),
+                    });
+                }
             };
             if let Some(bitmap_id) = answer.bitmap_id {
                 publish_waited_for(world, bitmap_id)?;
@@ -1112,6 +1136,13 @@ impl Interpreter<'_> {
             } else {
                 answer.status
             };
+            if record.operands[5] & 0x7f == 3 {
+                let text = answer.text.unwrap_or_default();
+                if let Some(slot) = self.dialog_text {
+                    *slot.borrow_mut() = text.clone();
+                }
+                update.dialog_text = Some(text);
+            }
             update.answered.push((record.caller, answer.status));
         }
         if partial
@@ -1168,7 +1199,10 @@ impl Interpreter<'_> {
         }
         let lot = global(world, LOT)?;
         let reselect = match selected(world) {
-            None => true,
+            // `0x445501` (`0x4455e8..0x4456e3`): when the active family
+            // (`game + 0x10`) has zero members (an unoccupied lot), scanning
+            // for a replacement Sim returns NULL without changing selection.
+            None => self.active_family != Some(&[]),
             Some(sim) => {
                 let visitor = world
                     .objects

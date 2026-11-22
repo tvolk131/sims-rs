@@ -16,12 +16,13 @@ use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{Install, Neighborhood};
 use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_ui::balloon::Texts;
-use sims_ui::command::{Camera, Command, Panel, Walls as UiWalls};
+use sims_ui::command::{Camera, Command, Mode, Panel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::Frame;
 use sims_ui::house;
 use sims_ui::household::{Acquaintances, Careers, Faces, Fame, Snapshot};
 use sims_ui::hud::{self, Controls, Item, Selected};
+use sims_ui::options::{self, OptionsTexts};
 use sims_ui::thumbnail::{self, Thumbnails};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -50,6 +51,8 @@ pub struct Hud {
     known: Acquaintances,
     /// The help balloons' texts.
     texts: Texts,
+    /// The Options panel's coordinates and labels (`UIText.iff STR# 145`).
+    options_texts: OptionsTexts,
     pub controls: Controls,
     items: Vec<Item>,
     /// The dialog the world waits on, until it is answered here.
@@ -73,13 +76,18 @@ impl Hud {
         let ui = UiGraphics::open(&install).map_err(|e| e.to_string())?;
         let resources: Vec<i32> = hud::RESOURCES
             .iter()
+            .chain(&options::RESOURCES)
             .chain(&dialog::RESOURCES)
             .chain(&thumbnail::RESOURCES)
             .copied()
             .collect();
         let mut art =
             sims_ui::art::Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
-        for id in hud::OPTIONAL_RESOURCES {
+        for id in hud::OPTIONAL_RESOURCES
+            .iter()
+            .chain(&options::HELP_RESOURCES)
+            .copied()
+        {
             art.load_optional(&ui, US_ENGLISH, id);
         }
         let message = match dialog::pending(world) {
@@ -125,10 +133,11 @@ impl Hud {
             install.expansions,
             friendship(assets)?,
         );
-        // Without the balloons' strings the HUD still opens; the balloons
-        // show what text they have.
+        // Without the balloons' or options' strings the HUD still opens with defaults.
         let texts = Texts::load(&install).unwrap_or_default();
         let fame = Fame::load(&install).unwrap_or_default();
+        let options_texts = OptionsTexts::load(&install).unwrap_or_default();
+        let options_state = options::OptionsState::load_install(&install).unwrap_or_default();
         Ok(Self {
             art,
             faces,
@@ -141,9 +150,12 @@ impl Hud {
             zoning,
             known,
             texts,
-            // The strip opens as if Live had been pressed.
+            options_texts,
+            // The strip opens as if Live had been pressed, with preferences
+            // loaded from `UserData/Options.iff` (`Optn` 128, `0x4e6505`).
             controls: Controls {
                 expanded: true,
+                options: options_state,
                 ..Controls::default()
             },
             items: Vec::new(),
@@ -206,7 +218,15 @@ impl Hud {
             });
             snapshot = snapshot.with_house(world, &self.house, kinds);
         }
-        self.items = hud::layout(view.size, &snapshot, &self.controls);
+        let visibility = lot_visibility(world, &self.zoning);
+        self.items = hud::layout_with_options_lot(
+            view.size,
+            &snapshot,
+            &self.controls,
+            &self.options_texts,
+            visibility,
+            Some(&self.art),
+        );
         hud::fit(&mut self.items, &self.art, &self.texts);
         let balloon_guids: Vec<u32> = hud::balloon_objects(&self.items).collect();
         for guid in balloon_guids {
@@ -277,23 +297,32 @@ impl Hud {
             hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
         ) != before;
-        let dismissed = self.controls.help.is_some()
+        let dismissed_live = self.controls.help.is_some()
             && !hud::in_subpanel(&self.items, point)
-            && self.dismiss_help();
-        hovered_changed || dismissed
+            && self.controls.help.take().is_some();
+        // `0x517957..0x5179cd`: Options help balloons also dismiss when the
+        // pointer leaves the Options panel (`cWinOptions`).
+        let dismissed_options = self.controls.options.help.is_some()
+            && !hud::in_options_panel(&self.items, point)
+            && self.controls.options.help.take().is_some();
+        hovered_changed || dismissed_live || dismissed_options
     }
 
-    /// The pointer left the window: no button is hovered and any open help
-    /// balloon is dismissed (`0x51d2ee..0x51d317`). True if the frame changes.
+    /// The pointer left the window: no button is hovered and any open Live or
+    /// Options help balloon is dismissed (`0x51d2ee..0x51d317`,
+    /// `0x517995..0x5179bd`). True if the frame changes.
     pub fn leave(&mut self) -> bool {
         let left = self.controls.pointer.take().is_some();
         let dismissed = self.dismiss_help();
         left || dismissed
     }
 
-    /// Dismisses any open help balloon (`0x50fb7f`). Returns true if one was open.
+    /// Dismisses any open Live or Options help balloon (`0x50fb7f`). Returns
+    /// true if one was open.
     pub fn dismiss_help(&mut self) -> bool {
-        self.controls.help.take().is_some()
+        let live = self.controls.help.take().is_some();
+        let opts = self.controls.options.help.take().is_some();
+        live || opts
     }
 
     /// A press at `point`: the view command to carry out, if any, and
@@ -348,6 +377,22 @@ impl Hud {
             }
             other => hud::check_press(other, selected, residential),
         };
+        if let Command::SetMode(mode @ (Mode::Live | Mode::Options)) = command {
+            let changed = self.controls.mode != mode
+                || !self.controls.expanded
+                || self.controls.help.is_some()
+                || self.controls.options.help.is_some();
+            if mode == Mode::Options
+                && (self.controls.mode != Mode::Options || !self.controls.expanded)
+            {
+                self.controls.options.tab = None;
+            }
+            self.controls.mode = mode;
+            self.controls.expanded = true;
+            self.controls.help = None;
+            self.controls.options.help = None;
+            return (None, changed);
+        }
         if command.changes_simulation() {
             eprintln!("not carried out, the simulation takes no commands yet: {command:?}");
             let before = self.controls.help;
@@ -389,6 +434,25 @@ impl Hud {
 fn is_residential(world: &sims_sim::World, zoning: &BTreeMap<i16, i32>) -> bool {
     let lot = world.globals.get(10).copied().unwrap_or(0);
     lot == 0 || zoning.get(&lot) == Some(&1)
+}
+
+/// Computes per-lot Options visibility (`0x4f2490..0x4f24e7`,
+/// `0x5177aa..0x517833`) from `world`'s lot number (global 10), family ID
+/// (global 9), and neighborhood zoning table.
+fn lot_visibility(world: &sims_sim::World, zoning: &BTreeMap<i16, i32>) -> options::LotVisibility {
+    let lot_id = world.globals.get(10).copied().unwrap_or(0);
+    let lot_zoning = if lot_id == 0 {
+        Some(1)
+    } else {
+        zoning.get(&lot_id).copied()
+    };
+    let has_family = world.globals.get(9).copied().unwrap_or(0) != 0;
+    // `0x4f1b5f..0x4f1b76`, `0x4f24b5..0x4f24cd`: edit mode is active when
+    // global 32 is 1 or on any vacant zoned / special-neighborhood lot.
+    let edit_mode = world.globals.get(32).copied().unwrap_or(0) == 1
+        || (!has_family
+            && (lot_zoning.unwrap_or(0) != 0 || matches!(lot_id, 21..=30 | 40..=48 | 81..=99)));
+    options::LotVisibility::for_lot(lot_id, lot_zoning, has_family, edit_mode)
 }
 
 /// Syncs the viewer's HUD camera and speed controls from `world` and `camera`.
@@ -479,5 +543,34 @@ mod tests {
         assert!(!is_residential(&world, &zoning));
         world.globals[10] = 99;
         assert!(!is_residential(&world, &zoning));
+    }
+
+    #[test]
+    fn viewer_lot_visibility_hides_free_will_on_downtown_vacation_and_magic_lots() {
+        let zoning = BTreeMap::from([(5, 1), (25, 2), (42, 2), (85, 2), (95, 2)]);
+        let mut world = sims_sim::World::empty();
+        world.globals.resize(11, 0);
+        world.globals[9] = 1; // visiting family present
+
+        world.globals[10] = 5;
+        let res = lot_visibility(&world, &zoning);
+        assert!(res.can_save && res.show_free_will && res.show_reset_tutorial);
+
+        for lot in [25, 85, 95] {
+            world.globals[10] = lot;
+            let vis = lot_visibility(&world, &zoning);
+            assert!(!vis.can_save && !vis.show_free_will && !vis.show_reset_tutorial);
+        }
+
+        // Community lot 42 hides Save (when visiting) and Reset Tutorial, but shows Free Will.
+        world.globals[10] = 42;
+        let comm = lot_visibility(&world, &zoning);
+        assert!(!comm.can_save && comm.show_free_will && !comm.show_reset_tutorial);
+
+        // Opening Downtown 25 without a family enters edit mode (`can_save = true`, Free Will hidden).
+        world.globals[9] = 0;
+        world.globals[10] = 25;
+        let dt_edit = lot_visibility(&world, &zoning);
+        assert!(dt_edit.can_save && !dt_edit.show_free_will && !dt_edit.show_reset_tutorial);
     }
 }

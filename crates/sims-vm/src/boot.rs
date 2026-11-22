@@ -26,11 +26,74 @@ use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Anything that stops a boot, with a message that says where.
 pub type BootError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Loads the localized default baby/character name from
+/// `GameData/UIText.iff STR# 142` entry 5 (`0x44b0bf..0x44b0d6` -> `0x435f4e`).
+fn read_default_character_name(install: &Install) -> String {
+    let Ok(path) = install.file("GameData/UIText.iff") else {
+        return String::new();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return String::new();
+    };
+    let Ok(iff) = sims_formats::iff::Iff::parse(bytes) else {
+        return String::new();
+    };
+    let Some(chunk) = iff.get(b"STR#", 142) else {
+        return String::new();
+    };
+    let Ok(table) = sims_formats::strings::StringTable::parse(iff.data(chunk)) else {
+        return String::new();
+    };
+    table.get(4, 1).unwrap_or_default().to_owned()
+}
+
+/// Loads initial `(lot_name, lot_description)` for `lot_id` from the
+/// neighborhood's `Houses/*Desc.iff` `STR# (2000 + lot_id)` entries 1 and 2
+/// (`cWinEditLotInfo` at `0x50e14b..0x50e253`):
+/// - `21..=30` (`0x15..=0x1e`): `DTDesc.iff` (Downtown)
+/// - `40..=48` (`0x28..=0x30`): `VIDesc.iff` (Vacation Island)
+/// - `81..=89` (`0x51..=0x59`): `STDesc.iff` (Studio Town)
+/// - `90..=99` (`0x5a..=0x63`): `MTDesc.iff` (Magic Town)
+/// - otherwise, only when `0x42b9e3` zoning is nonzero (lot 0 returns 1):
+///   `NeighborhoodDesc.iff` (`0x50e19b..0x50e1b2`)
+fn read_lot_info(house: &Path, lot_id: u32, zoning: Option<i32>) -> (String, String) {
+    let Some(houses_dir) = house.parent() else {
+        return (String::new(), String::new());
+    };
+    let desc_file = match lot_id {
+        21..=30 => "DTDesc.iff",
+        40..=48 => "VIDesc.iff",
+        81..=89 => "STDesc.iff",
+        90..=99 => "MTDesc.iff",
+        _ if lot_id == 0 || zoning.unwrap_or(0) != 0 => "NeighborhoodDesc.iff",
+        _ => return (String::new(), String::new()),
+    };
+    let path = houses_dir.join(desc_file);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return (String::new(), String::new());
+    };
+    let Ok(iff) = sims_formats::iff::Iff::parse(bytes) else {
+        return (String::new(), String::new());
+    };
+    let Ok(table_id) = u16::try_from(2000u32.saturating_add(lot_id)) else {
+        return (String::new(), String::new());
+    };
+    let Some(chunk) = iff.get(b"STR#", table_id) else {
+        return (String::new(), String::new());
+    };
+    let Ok(table) = sims_formats::strings::StringTable::parse(iff.data(chunk)) else {
+        return (String::new(), String::new());
+    };
+    let name = table.get(0, 1).unwrap_or_default().to_owned();
+    let desc = table.get(1, 1).unwrap_or_default().to_owned();
+    (name, desc)
+}
 
 /// The level the house view shows: the ground.
 /// Global 11: set by Special Effect's first state (0x44aad6), cleared
@@ -238,6 +301,23 @@ pub struct Lot {
     /// unanswered dialog (`Stop::Asks`), so moving the camera while a
     /// dialog is showing does not alter the tick's replay once answered.
     replay_view: Option<(u8, Option<[i8; 2]>)>,
+    /// The text entered in the last kind 3 text-prompt dialog
+    /// (`0x451a6b..0x451a85` -> global `[0x6e4ac0]`).
+    last_dialog_text: String,
+    /// Catalog names assigned to characters created by Make New Character
+    /// (`0x44b0a8..0x44b0fc`), keyed by new character GUID.
+    character_names: BTreeMap<u32, String>,
+    /// Localized fallback name from `GameData/UIText.iff STR# 142[5]` for
+    /// empty kind-3 Make New Character submissions (`0x44b0bf..0x44b0d6`).
+    default_character_name: String,
+    /// Editable lot name (`cWinEditLotInfo`, `0x50e1f8..0x50e42c`), loaded
+    /// from the neighborhood's `*Desc.iff` `STR# (2000 + lot_id)` and persisted
+    /// in [`save::Saved`].
+    lot_name: String,
+    /// Editable lot description (`cWinEditLotInfo`, `0x50e1f8..0x50e42c`),
+    /// loaded from `*Desc.iff` `STR# (2000 + lot_id)` and persisted in
+    /// [`save::Saved`].
+    lot_description: String,
     /// The world's hash as the load left it, which a save carries so it
     /// goes back only into a lot loaded from the same files
     /// ([`save`]).
@@ -747,6 +827,9 @@ impl Lot {
             let interpreter = Interpreter {
                 view_rotation,
                 view_centre,
+                // `0x42a2b4..0x42a2e5`: during load after `clear_family()` and
+                // on unoccupied lots, `game + 0x10` holds an empty family.
+                active_family: Some(&[]),
                 ..Interpreter::new(&program, &catalog, Stream::Global)
             };
             // The lot the game holds before the load: empty, with the
@@ -798,10 +881,55 @@ impl Lot {
                     .ok_or("the house file has no HOUS 1 chunk, which holds its model")?,
             );
             world.apply_context(context)?;
-            load.created = interpreter.resize(&mut world)?.created.len();
+            // Step 5 (`0x415e20..0x415e67`): shrink the bare lot to the house's
+            // requested size, rebuild its bare-lot rooms and tile flags
+            // (`0x415e48`), and reconcile lot-wide controllers before clearing.
+            // Vacation lots (40..=48) run `Find Location For` inside controller
+            // init here, which reads the bare-lot room map and architecture
+            // arrays (`0, 1/101, 2/102, 3/103, 8/108`) that 1.91 holds from
+            // startup.
+            let requested = match world.globals.get(23).copied().unwrap_or(0) {
+                0 => sims_sim::FULL_SIZE,
+                size => size,
+            };
+            if requested >= 4 && requested < world.size {
+                let full = usize::from(sims_sim::FULL_SIZE as u16);
+                let bare = |stride, fill| sims_formats::lot::Array {
+                    width: full,
+                    height: full,
+                    stride,
+                    encoding: 0,
+                    data: vec![fill; full * full * stride],
+                };
+                for (id, stride, fill) in [
+                    (0u16, 4usize, 0u8),
+                    (1, 2, 0),
+                    (2, 14, 0),
+                    (3, 2, 0),
+                    (4, 1, 0),
+                    (6, 1, 0),
+                    (7, 1, 0),
+                    (8, 1, 0),
+                    (9, 1, 0xff),
+                    (10, 1, 0xff),
+                    (101, 2, 0),
+                    (102, 14, 0),
+                    (103, 2, 0),
+                    (108, 1, 0),
+                ] {
+                    world.arrays.insert(id, bare(stride, fill));
+                }
+                world.size = requested;
+                world.rebuild_rooms()?;
+                world.globals[27] = 0;
+                load.created = interpreter.reconcile_controllers(&mut world)?.created.len();
+            } else {
+                load.created = interpreter.resize(&mut world)?.created.len();
+            }
             world.clear_family()?;
             load.queued = world.removals.len();
             load.removed = interpreter.clear(&mut world)?.len();
+            world.arrays.clear();
             // 6a and 6b: the lot arrays, then the saved floor and wall IDs.
             let version = file
                 .version()
@@ -890,9 +1018,17 @@ impl Lot {
                 .find(|(_, path)| path.file_name() == house.file_name())
                 .map(|(number, _)| number)
                 .ok_or("the house file's name does not give a house number")?;
-            let (family, record) = neighborhood.family_in(number).ok_or(
-                "no family lives in the house; selecting none is not checked against the original",
-            )?;
+            let occupied = neighborhood.family_in(number);
+            let (family, budget, flags, members, magic_history) = match occupied {
+                Some((family, record)) => (
+                    family,
+                    record.budget,
+                    record.flags,
+                    record.members.as_slice(),
+                    record.magic_history()?,
+                ),
+                None => (0u16, 0i32, 0u32, &[][..], None),
+            };
             load.family = family;
             load.house = number;
             // 0x42821a: the people who are not visitors, noted before the
@@ -901,8 +1037,8 @@ impl Lot {
             world.select_family(
                 i16::try_from(family)?,
                 i16::try_from(number)?,
-                record.budget,
-                record.magic_history()?,
+                budget,
+                magic_history,
             )?;
             // 13: every object is visited in registration order. The step
             // stops at the first visit that is not ported, with the lot as
@@ -925,15 +1061,14 @@ impl Lot {
                 let made = interpreter.ensure_indicators(&mut world)?.is_some();
                 world.finish_selection(&Household {
                     house: i32::try_from(number)?,
-                    flags: record.flags,
-                    members: &record.members,
+                    flags,
+                    members,
                     characters: &program.characters,
                     residents: &residents,
                     zoning: &program.zoning,
                 })?;
                 let made_again = interpreter.announce_house(&mut world)?.is_some();
-                let sim =
-                    interpreter.select_resident(&mut world, record.budget, &record.members)?;
+                let sim = interpreter.select_resident(&mut world, budget, members)?;
                 interpreter.go_live(&mut world)?;
                 let counted = interpreter.before_frame(&mut world)?.len();
                 load.finished = Some(Finished {
@@ -950,6 +1085,15 @@ impl Lot {
         load.libraries = program.libraries.len();
         let start = world.ticks;
         let loaded = world.hash();
+        let default_character_name = read_default_character_name(&install);
+        let zoning = if load.house == 0 {
+            Some(1)
+        } else {
+            i16::try_from(load.house)
+                .ok()
+                .and_then(|id| program.zoning.get(&id).copied())
+        };
+        let (lot_name, lot_description) = read_lot_info(house, load.house, zoning);
         Ok(Self {
             program,
             catalog,
@@ -971,6 +1115,11 @@ impl Lot {
             floor_rotation: view_rotation,
             view_centre,
             replay_view: None,
+            last_dialog_text: String::new(),
+            character_names: BTreeMap::new(),
+            default_character_name,
+            lot_name,
+            lot_description,
             loaded,
             buy_undo: Vec::new(),
             buy_redo: Vec::new(),
@@ -1090,6 +1239,8 @@ impl Lot {
         let asks = self.asks;
         let sounds = RefCell::new(Vec::new());
         let masks_rebuilt = Cell::new(0);
+        let dialog_text = RefCell::new(self.last_dialog_text.clone());
+        let character_names = RefCell::new(self.character_names.clone());
         let (view_rotation, view_centre) = self
             .replay_view
             .unwrap_or((self.view_rotation, self.view_centre));
@@ -1098,6 +1249,10 @@ impl Lot {
             masks_rebuilt: Some(&masks_rebuilt),
             view_rotation,
             view_centre,
+            dialog_text: Some(&dialog_text),
+            character_names: Some(&character_names),
+            default_character_name: Some(&self.default_character_name),
+            active_family: (self.load.house != 0 && self.load.family == 0).then_some(&[][..]),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut frame_errors = Vec::new();
@@ -1199,6 +1354,8 @@ impl Lot {
         // failed.
         update.sounds = sounds.into_inner();
         update.masks_rebuilt = masks_rebuilt.get();
+        self.last_dialog_text = dialog_text.into_inner();
+        self.character_names = character_names.into_inner();
         if let Some(error) = frame {
             if play {
                 update.frame_errors.push(SkippedFrame {
@@ -1234,9 +1391,11 @@ impl Lot {
         menu: u32,
     ) -> Result<Option<i32>, OrderError> {
         self.ready()?;
+        let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            character_names: Some(&character_names),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1259,10 +1418,12 @@ impl Lot {
     pub fn pie_menu(&mut self, person: u16, object: u16) -> Result<Menu, OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
+        let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            character_names: Some(&character_names),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1290,10 +1451,12 @@ impl Lot {
     ) -> Result<Highlight, OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
+        let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            character_names: Some(&character_names),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1321,9 +1484,11 @@ impl Lot {
         action: sims_formats::saved_objects::Interaction,
     ) -> Result<Option<i32>, OrderError> {
         self.ready()?;
+        let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            character_names: Some(&character_names),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1343,10 +1508,12 @@ impl Lot {
     pub fn cancel(&mut self, person: u16, uid: i32) -> Result<Cancelled, OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
+        let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
+            character_names: Some(&character_names),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -2941,6 +3108,97 @@ impl Lot {
         residential(&self.world, &self.program)
     }
 
+    /// Editable lot name shown in the edit-mode Save Card (`cWinEditLotInfo`,
+    /// `0x50e1f8..0x50e42c`), loaded from `*Desc.iff` `STR# (2000 + lot_id)`
+    /// and persisted in [`save::Saved`].
+    pub fn lot_name(&self) -> &str {
+        &self.lot_name
+    }
+
+    /// Editable lot description shown in the edit-mode Save Card
+    /// (`cWinEditLotInfo`, `0x50e1f8..0x50e42c`), loaded from `*Desc.iff`
+    /// `STR# (2000 + lot_id)` and persisted in [`save::Saved`].
+    pub fn lot_description(&self) -> &str {
+        &self.lot_description
+    }
+
+    /// Updates the lot's name and description after accepting the edit-mode
+    /// Save Card (`0x50e28f..0x50e42c`), so [`Lot::save`] persists both edits.
+    pub fn set_lot_info(&mut self, name: String, description: String) {
+        self.lot_name = name;
+        self.lot_description = description;
+    }
+
+    /// The current lot number (`world.globals[10]`, house `+0x24`).
+    pub fn lot_id(&self) -> i16 {
+        self.world.globals.get(10).copied().unwrap_or(0)
+    }
+
+    /// The current lot's zoning code (`0x42b9e3`: 1 residential, 2 community/
+    /// Studio Town, 0 unzoned; lot 0 returns 1).
+    pub fn lot_zoning(&self) -> Option<i32> {
+        let lot = self.lot_id();
+        if lot == 0 {
+            Some(1)
+        } else {
+            self.program.zoning.get(&lot).copied()
+        }
+    }
+
+    /// Updates lot global 30 (`Free Will`, `0x432220..0x432242` ->
+    /// `0x46d9c4(0x1e, al)`). Unlike gameplay orders, Free Will is a direct
+    /// preference write that also applies while waiting on or replaying an
+    /// answered dialog snapshot.
+    pub fn set_free_will(&mut self, enabled: bool) -> Result<(), OrderError> {
+        if self.halted {
+            return Err(OrderError::Halted);
+        }
+        if self.load.finished.is_none() {
+            return Err(OrderError::Incomplete);
+        }
+        let value = i16::from(enabled);
+        if let Some(slot) = self.world.globals.get_mut(30) {
+            *slot = value;
+        }
+        if let Some(asking) = &mut self.asking
+            && let Some(slot) = asking.world.globals.get_mut(30)
+        {
+            *slot = value;
+        }
+        Ok(())
+    }
+
+    /// Sets lot global 32 (`BUDGET_MODE` / `[lot + 0x50]`, `0x4f1bd9..0x4f1be5`)
+    /// so edit-mode lots receive the native §999,999 budget (`0x46d8c9`).
+    pub fn set_edit_budget(&mut self, enabled: bool) {
+        let value = i16::from(enabled);
+        if let Some(slot) = self.world.globals.get_mut(32) {
+            *slot = value;
+        }
+        if let Some(asking) = &mut self.asking
+            && let Some(slot) = asking.world.globals.get_mut(32)
+        {
+            *slot = value;
+        }
+    }
+
+    /// The text entered in the last answered kind 3 text-prompt dialog
+    /// (`0x451a6b..0x451a85` -> global `[0x6e4ac0]`).
+    pub fn last_dialog_text(&self) -> &str {
+        &self.last_dialog_text
+    }
+
+    /// The catalog name assigned to a Make New Character GUID (`0x44b0a8..0x44b0fc`).
+    pub fn character_name(&self, guid: u32) -> Option<&str> {
+        self.character_names.get(&guid).map(String::as_str)
+    }
+
+    /// All runtime catalog names assigned to Make New Character GUIDs
+    /// (`0x44b0a8..0x44b0fc`, `0x44b18a..0x44b1cc`), for HUD face/name sync.
+    pub fn character_names(&self) -> &BTreeMap<u32, String> {
+        &self.character_names
+    }
+
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
@@ -3068,6 +3326,11 @@ mod tests {
             floor_rotation: 0,
             view_centre: None,
             replay_view: None,
+            last_dialog_text: String::new(),
+            character_names: BTreeMap::new(),
+            default_character_name: String::new(),
+            lot_name: String::new(),
+            lot_description: String::new(),
             loaded,
             buy_undo: Vec::new(),
             buy_redo: Vec::new(),

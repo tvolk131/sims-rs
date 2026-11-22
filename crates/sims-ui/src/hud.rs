@@ -13,11 +13,12 @@
 
 use crate::art::Art;
 use crate::balloon::{self, Balloon, Help, Texts};
-use crate::command::{Camera, Command, Mode, Panel, Relations, Speed, Walls};
+use crate::command::{Camera, Command, Mode, Panel, Relations, Speed, VolumeChannel, Walls};
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
 use crate::house::{self, House};
 use crate::household::{Faces, JobPanel, PetKind, Relation, Snapshot, Work, money};
+use crate::options::{self, OptionsState, OptionsTexts};
 use crate::thumbnail::Thumbnails;
 use sims_formats::bitmap::Image;
 
@@ -298,6 +299,11 @@ pub struct Controls {
     /// The help balloon open, if any. It shows while the panel that
     /// opened it does.
     pub help: Option<Help>,
+    /// The Options panel's tab, graphics, sound, and play state (`cWinOptions`).
+    pub options: OptionsState,
+    /// Options action button currently held down (`0x5e44dd..0x5e44e1`), drawn
+    /// in its pressed cell while the pointer remains over its rectangle.
+    pub pressed_options_action: Option<crate::command::OptionsAction>,
 }
 
 /// What the camera buttons show. The host's camera owns it.
@@ -341,6 +347,8 @@ impl Default for Controls {
             relations: Relations::default(),
             relations_page: 0,
             help: None,
+            options: OptionsState::default(),
+            pressed_options_action: None,
         }
     }
 }
@@ -363,6 +371,7 @@ impl Controls {
             Command::TogglePanel => {
                 self.expanded = !self.expanded;
                 self.help = None;
+                self.options.help = None;
             }
             Command::OpenPanel(panel) => self.open(Some(*panel)),
             // Out-of-range help indices have no balloon and do nothing.
@@ -375,14 +384,30 @@ impl Controls {
             }
             Command::ShowRelations(list) => self.relations = *list,
             Command::RelationsPage(page) => self.relations_page = *page,
+            Command::SetMode(mode) => {
+                // 0x5179eb..0x5179f6: cWinOptions::Show resets its open subpanel
+                // tab to 0 (`None`) whenever Options becomes visible.
+                if *mode == Mode::Options && (self.mode != Mode::Options || !self.expanded) {
+                    self.options.tab = None;
+                }
+                self.help = None;
+                self.options.help = None;
+            }
             Command::Select { .. }
             | Command::SetSpeed(_)
             | Command::TogglePause
             | Command::Camera(_)
-            | Command::SetMode(_)
             | Command::OpenHelp
             | Command::CancelAction { .. } => {
                 self.help = None;
+                self.options.help = None;
+            }
+            Command::OpenOptionsTab(_)
+            | Command::ToggleOption(_)
+            | Command::SetDetail { .. }
+            | Command::SetVolume { .. }
+            | Command::OptionsHelp(_) => {
+                self.options.apply(command);
             }
             _ => {}
         }
@@ -477,6 +502,12 @@ pub enum Kind {
     /// A cell of a button strip of `cells` cells. A disabled button has
     /// no command.
     Button { id: i32, cells: u32, selected: bool },
+    /// A 6-cell checkbox or radio toggle (`optcheckbox.bmp` 4953 or
+    /// `optradio.bmp` 4954, `0x5e3be6..0x5e3c3e`).
+    Toggle { id: i32, checked: bool },
+    /// A horizontal 11-step (`0..=10`) Sound volume slider (`cTSWinSlider`,
+    /// `0x5f6091..0x5f6232`).
+    Slider { channel: VolumeChannel, value: u8 },
     /// A fixed cell of a button strip of `cells` cells.
     Cell { id: i32, cells: u32, cell: u32 },
     /// The cluster's family-friends count (`[esi + 0x1d0]`, `0x539219`,
@@ -575,6 +606,10 @@ pub enum Kind {
     Help { help: Help, owner: Rect },
     /// A help balloon, laid out.
     Balloon(Balloon),
+    /// An Options-panel setting help balloon (`cWinOptions`, `0x516719..0x51679a`).
+    OptionsBalloon(options::OptionsBalloon),
+    /// A Quick Tips hover tooltip over an Options button (`0x5164ef..0x5164ff`).
+    OptionsTooltip(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -626,6 +661,40 @@ pub fn speed_for(world: &sims_sim::World) -> Option<Speed> {
 
 /// Lays the panel out in a window of `size`, in drawing order.
 pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<Item> {
+    layout_with_options(size, snapshot, controls, &OptionsTexts::default(), None)
+}
+
+/// Lays the panel out in a window of `size`, in drawing order, using loaded
+/// [`OptionsTexts`] and optional [`Art`] for font-measured Options subpanel
+/// geometry (`0x51409b..0x515ef6`).
+pub fn layout_with_options(
+    size: [i32; 2],
+    snapshot: &Snapshot,
+    controls: &Controls,
+    options_texts: &OptionsTexts,
+    art: Option<&Art>,
+) -> Vec<Item> {
+    layout_with_options_lot(
+        size,
+        snapshot,
+        controls,
+        options_texts,
+        options::LotVisibility::from_residential(snapshot.residential),
+        art,
+    )
+}
+
+/// Like [`layout_with_options`], using exact per-lot Options control
+/// visibility ([`options::LotVisibility`], `0x4f2490..0x4f24e7`,
+/// `0x5177aa..0x517833`).
+pub fn layout_with_options_lot(
+    size: [i32; 2],
+    snapshot: &Snapshot,
+    controls: &Controls,
+    options_texts: &OptionsTexts,
+    visibility: options::LotVisibility,
+    art: Option<&Art>,
+) -> Vec<Item> {
     // Sizes outside what a window can be are clamped, so no arithmetic
     // below can overflow.
     let [width, height] = size.map(|v| v.clamp(0, 1 << 15));
@@ -649,8 +718,18 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
             kind: Kind::Stretched(if tall { 4918 } else { id::STRIP }),
             command: None,
         });
-        if controls.mode == Mode::Live {
-            live_strip(&mut items, strip, snapshot, controls);
+        match controls.mode {
+            Mode::Live => live_strip(&mut items, strip, snapshot, controls),
+            Mode::Options => options::layout_strip_for_lot(
+                &mut items,
+                strip,
+                visibility,
+                &controls.options,
+                options_texts,
+                art,
+                controls.pointer,
+            ),
+            Mode::Buy | Mode::Build => {}
         }
     }
 
@@ -694,13 +773,18 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         ..button(id, 4, rect, selected, Command::Camera(c))
     };
     items.extend([
-        button(
-            id::LIVE,
-            4,
-            at(10, 6, 50, 50),
-            controls.mode == Mode::Live,
-            mode(Mode::Live),
-        ),
+        // `0x4f2482..0x4f248b` -> `0x53b233..0x53b254`: edit mode
+        // (`global[32] == 1`, `!snapshot.show_money`) disables the Live button.
+        Item {
+            command: snapshot.show_money.then(|| mode(Mode::Live)),
+            ..button(
+                id::LIVE,
+                4,
+                at(10, 6, 50, 50),
+                controls.mode == Mode::Live,
+                mode(Mode::Live),
+            )
+        },
         button(
             id::BUY,
             4,
@@ -715,12 +799,15 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
             controls.mode == Mode::Build,
             mode(Mode::Build),
         ),
+        // 0x53a51b..0x53a53e -> 0x4cea68..0x4cea73: pressing Options always
+        // passes toggle=0 (`SetMode(Options)`), expanding when collapsed and
+        // keeping an expanded Options strip open.
         button(
             id::OPTIONS,
             4,
             at(193, 125, 23, 23),
             controls.mode == Mode::Options,
-            mode(Mode::Options),
+            Command::SetMode(Mode::Options),
         ),
         // The old prototype had the two rotations the other way round;
         // the original's screen has rotate-right (kRotRight) on the left.
@@ -915,6 +1002,10 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
             });
         }
     }
+    // `0x514008..0x51401b`: Options help balloons and Quick Tips attach to the
+    // root HUD above the cluster so narrow windows never draw the cluster over
+    // them.
+    items.sort_by_key(|i| matches!(i.kind, Kind::OptionsBalloon(_) | Kind::OptionsTooltip(_)));
     items
 }
 
@@ -2446,7 +2537,11 @@ pub fn draw_with_thumbnails(
                 selected,
             } => {
                 let hover = controls.pointer.is_some_and(|[x, y]| r.contains(x, y));
-                let cell = if *selected {
+                let pressed = hover
+                    && controls
+                        .pressed_options_action
+                        .is_some_and(|action| item.command == Some(Command::OptionsAction(action)));
+                let cell = if *selected || pressed {
                     Cell::Selected
                 } else if item.command.is_none() {
                     Cell::Disabled
@@ -2458,6 +2553,13 @@ pub fn draw_with_thumbnails(
                 if let Some(image) = art.cell(*id, *cells, cell as u32) {
                     frame.draw_all(&image, [r.x, r.y]);
                 }
+            }
+            Kind::Toggle { id, checked } => {
+                let hover = controls.pointer.is_some_and(|[x, y]| r.contains(x, y));
+                options::draw_toggle(frame, art, r, *id, *checked, item.command.is_some(), hover);
+            }
+            Kind::Slider { value, .. } => {
+                options::draw_slider(frame, art, r, *value);
             }
             Kind::Cell { id, cells, cell } => {
                 if let Some(image) = art.cell(*id, *cells, *cell) {
@@ -2582,6 +2684,8 @@ pub fn draw_with_thumbnails(
             | Kind::Sign { .. }
             | Kind::Help { .. } => {}
             Kind::Balloon(b) => balloon::draw_with_thumbnails(frame, art, thumbnails, b),
+            Kind::OptionsBalloon(b) => options::draw_balloon(frame, art, b),
+            Kind::OptionsTooltip(tip) => options::draw_tooltip(frame, art, r, tip),
             Kind::Meter(value) => {
                 let (width, left, right) = meter(*value);
                 frame.fill(r, right);
@@ -2647,6 +2751,7 @@ impl Item {
                     | Kind::Work { .. }
                     | Kind::Relation { .. }
                     | Kind::Help { .. }
+                    | Kind::OptionsTooltip(_)
             )
     }
 }
@@ -2659,9 +2764,35 @@ fn topmost(items: &[Item], [x, y]: [i32; 2]) -> Option<usize> {
 }
 
 /// What a press at `point` asks for: the command of the topmost item
-/// there, if it has one. An item drawn over a button hides it.
+/// there, if it has one. An item drawn over a button hides it. Pressing
+/// a [`Kind::Slider`] maps `point[0]` to its volume step `0..=10`
+/// (`0x5f633d..0x5f640b`).
 pub fn press(items: &[Item], point: [i32; 2]) -> Option<Command> {
-    items.get(topmost(items, point)?)?.command.clone()
+    let item = items.get(topmost(items, point)?)?;
+    if let Kind::Slider { channel, .. } = item.kind {
+        let step = options::slider_value_at(item.rect, point[0]);
+        return Some(Command::SetVolume { channel, step });
+    }
+    item.command.clone()
+}
+
+/// If the topmost press-taking item at `point` is an Options volume slider,
+/// returns its channel and bounding rectangle (for click-and-drag capture,
+/// `0x5f6245..0x5f6336`).
+pub fn slider_at(items: &[Item], point: [i32; 2]) -> Option<(VolumeChannel, Rect)> {
+    let item = items.get(topmost(items, point)?)?;
+    match item.kind {
+        Kind::Slider { channel, .. } => Some((channel, item.rect)),
+        _ => None,
+    }
+}
+
+/// Returns the bounding rectangle of `channel`'s slider in `items`, if laid out.
+pub fn slider_rect(items: &[Item], channel: VolumeChannel) -> Option<Rect> {
+    items.iter().find_map(|item| match item.kind {
+        Kind::Slider { channel: ch, .. } if ch == channel => Some(item.rect),
+        _ => None,
+    })
 }
 
 /// If the topmost press-taking item at `point` is an Interests or Gifts
@@ -2711,11 +2842,11 @@ pub fn check_press(command: Command, selected: Selected, residential: bool) -> C
 /// Whether the panel covers `point`, so a press there is the panel's and
 /// not the lot's.
 pub fn covers(items: &[Item], point: [i32; 2]) -> bool {
-    // A name box floats over the lot and takes nothing from it.
+    // Floating name/tooltip boxes let presses pass through to the lot.
     // `4918` (`kTallSubpanel`, 150 px) extends 50 px transparently above the
     // 100 px Buy strip; only its bottom `STRIP` pixels belong to the panel.
     items.iter().any(|i| match i.kind {
-        Kind::Name { .. } => false,
+        Kind::Name { .. } | Kind::OptionsTooltip(_) => false,
         Kind::Stretched(4918) => {
             let strip = Rect::new(
                 i.rect.x,
@@ -2742,13 +2873,23 @@ pub fn in_subpanel(items: &[Item], [x, y]: [i32; 2]) -> bool {
     x >= gadget.rect.x.saturating_add(108) && y >= gadget.rect.y
 }
 
-/// Whether `point` lies inside an open help balloon (`Kind::Balloon`). A
-/// direct left press on the balloon (`0x66bd68 -> 0x5dd85f`) is absorbed
-/// without dismissing it.
-pub fn on_balloon(items: &[Item], [x, y]: [i32; 2]) -> bool {
+/// Whether `point` lies inside the expanded Options panel (`cWinOptions`,
+/// `0x517957..0x5179cd`). Moving outside the Options panel (including onto the
+/// help balloon itself, which attaches outside `cWinOptions`) dismisses an open
+/// Options help balloon with `UI_whoosh`.
+pub fn in_options_panel(items: &[Item], [x, y]: [i32; 2]) -> bool {
     items
         .iter()
-        .any(|i| matches!(i.kind, Kind::Balloon(_)) && i.rect.contains(x, y))
+        .any(|i| matches!(i.kind, Kind::Stretched(id::STRIP | 4918)) && i.rect.contains(x, y))
+}
+
+/// Whether `point` lies inside an open help balloon (`Kind::Balloon` or
+/// `Kind::OptionsBalloon`). A direct left press on the balloon
+/// (`0x66bd68 -> 0x5dd85f`) is absorbed without dismissing it.
+pub fn on_balloon(items: &[Item], [x, y]: [i32; 2]) -> bool {
+    items.iter().any(|i| {
+        matches!(i.kind, Kind::Balloon(_) | Kind::OptionsBalloon(_)) && i.rect.contains(x, y)
+    })
 }
 
 /// The item under `point` that a press would act on, for hover changes.
