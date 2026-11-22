@@ -7,7 +7,7 @@ use sims_vm::{Fault, Trap};
 
 /// A neighborhood whose record vector holds `guids` in order; None is an
 /// empty slot. Each record's ID is its place plus one.
-fn neighborhood(guids: &[Option<u32>]) -> Neighbors {
+fn neighborhood(guids: &[Option<u32>]) -> sims_sim::CowBox<Neighbors> {
     Neighbors {
         slots: guids
             .iter()
@@ -26,6 +26,7 @@ fn neighborhood(guids: &[Option<u32>]) -> Neighbors {
             .collect(),
         ..Neighbors::default()
     }
+    .into()
 }
 
 /// Mode 5 (0x425b15): the next occupied slot after the cursor, by place
@@ -186,6 +187,35 @@ fn modes_1_and_12_walk_the_person_vector_not_registration_order() {
     let fault = step(&mut fx, 1, 0).unwrap_err();
     assert!(
         matches!(fault.trap, Trap::Invalid(ref m) if m.contains("gone")),
+        "{fault}"
+    );
+}
+
+#[test]
+fn registration_order_is_validated_before_cursor_or_mode_6_parameter() {
+    let mut fx = Fixture::new();
+    fx.world.order = vec![LAMP, SIM, 99];
+
+    // Mode 0 from cursor 0 and from a cursor not in the list must both trap on
+    // the missing registered object 99.
+    for cursor in [0i16, 40] {
+        let fault = step(&mut fx, 0, cursor).unwrap_err();
+        assert!(
+            matches!(fault.trap, Trap::Invalid(ref m) if m.contains("registered object 99 does not exist")),
+            "cursor {cursor}: {fault}"
+        );
+    }
+
+    // Mode 6 with no parameters must still trap on the missing registered
+    // object before checking parameter 0.
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(31, RETURN_TRUE, RETURN_FALSE, in_temp(6, 0))]),
+    );
+    let fault = fx.run_with(LAMP, 4096, 0, &[], 10).unwrap_err();
+    assert!(
+        matches!(fault.trap, Trap::Invalid(ref m) if m.contains("registered object 99 does not exist")),
         "{fault}"
     );
 }

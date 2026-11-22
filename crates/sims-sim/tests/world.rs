@@ -73,7 +73,7 @@ fn world() -> World {
         order: vec![5, 2],
         people: vec![5],
         types: BTreeMap::from([(7, 0x1111), (8, 0x2222)]),
-        objects: BTreeMap::from([(2, object(2, 0x1111)), (5, object(5, 0x2222))]),
+        objects: BTreeMap::from([(2, object(2, 0x1111)), (5, object(5, 0x2222))]).into(),
         arrays: BTreeMap::from([(
             1,
             Array {
@@ -83,7 +83,8 @@ fn world() -> World {
                 encoding: 8,
                 data: vec![1, 2, 3, 4],
             },
-        )]),
+        )])
+        .into(),
         removals: vec![5],
         type_attributes: vec![TypeAttributes {
             guid: 0x1111,
@@ -153,7 +154,8 @@ fn world() -> World {
                 unknown: BTreeSet::from([(0, 1)]),
                 restarts: 0,
             },
-        )]),
+        )])
+        .into(),
         dialogs: Dialogs {
             records: vec![Dialog {
                 caller: 5,
@@ -194,7 +196,8 @@ fn world() -> World {
                 }],
             }],
             relationships_changed: true,
-        },
+        }
+        .into(),
         advertisement_record: Some(std::array::from_fn(|i| sims_sim::Advertisement {
             personality: i as i16,
             minimum: -(i as i16),
@@ -1206,7 +1209,7 @@ const PINNED_10: &str = "fd61775798ab1e3a152bc9875852ca2e51da1600fe802e90b5d7112
 /// The digest of [`world`] without its neighbors or animators, minus the
 /// bytes they encode to: what snapshot format 9 pinned.
 fn format_9_digest(mut world: World) -> String {
-    world.neighbors = Neighbors::default();
+    *world.neighbors = Neighbors::default();
     let mut bytes = format_10_bytes(world);
     assert_eq!(bytes.split_off(bytes.len() - 3), [0; 3]);
     digest(&bytes)
@@ -1230,7 +1233,7 @@ fn without_dialogs_or_person_ticks_the_encoding_is_format_8_and_three_zero_bytes
         declined: 0,
     };
     world.person_ticks.clear();
-    world.neighbors = Neighbors::default();
+    *world.neighbors = Neighbors::default();
     let mut bytes = format_10_bytes(world);
     assert_eq!(bytes.split_off(bytes.len() - 6), [0; 6]);
     assert_eq!(digest(&bytes), PINNED_8);

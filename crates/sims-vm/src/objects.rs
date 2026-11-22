@@ -455,7 +455,7 @@ impl Interpreter<'_> {
                 instances.push(id);
             }
         }
-        world.objects = objects;
+        world.objects = objects.into();
         world.order = order.clone();
         world.people = world.registered_people();
         world.next_parts = next_parts;

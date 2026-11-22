@@ -1,5 +1,6 @@
 use crate::animator::{Animator, HeldPose, Layer};
 use crate::characters::Characters;
+use crate::cow::{CowBox, CowMap};
 use crate::neighbors::{Family, Neighbors};
 use crate::rooms::Rooms;
 use crate::route::Routing;
@@ -45,9 +46,9 @@ pub struct World {
     /// The lot's object type table (objt): type ID to GUID. Script frames
     /// name the object whose code they run by type ID.
     pub types: BTreeMap<u16, u32>,
-    pub objects: BTreeMap<u16, Object>,
+    pub objects: CowMap<u16, Object>,
     /// Lot arrays (floors, walls, terrain and more) by Arry chunk ID.
-    pub arrays: BTreeMap<u16, Array>,
+    pub arrays: CowMap<u16, Array>,
     /// Objects waiting to be removed, in the order they asked (0x442d70).
     /// They stay registered until the removals are carried out.
     pub removals: Vec<u16>,
@@ -97,7 +98,7 @@ pub struct World {
     /// Each object's frame storage, for the objects whose thread has
     /// pushed or popped a frame since the object was made or read. See
     /// [`FrameStorage`].
-    pub frame_storage: BTreeMap<u16, FrameStorage>,
+    pub frame_storage: CowMap<u16, FrameStorage>,
     /// The dialogs objects have asked for and the registry still holds.
     /// See [`Dialogs`].
     pub dialogs: Dialogs,
@@ -106,7 +107,7 @@ pub struct World {
     /// gives (0x459327); see [`PersonTick`].
     pub person_ticks: BTreeMap<u16, PersonTick>,
     /// The neighborhood's people. See [`Neighbors`].
-    pub neighbors: Neighbors,
+    pub neighbors: CowBox<Neighbors>,
     /// For each person whose animator has run, what it keeps. A person
     /// with no entry has the animator the load leaves; see
     /// [`crate::animator::LOADED`].
@@ -749,8 +750,8 @@ impl World {
             order: Vec::new(),
             people: Vec::new(),
             types: BTreeMap::new(),
-            objects: BTreeMap::new(),
-            arrays: BTreeMap::new(),
+            objects: CowMap::new(),
+            arrays: CowMap::new(),
             removals: Vec::new(),
             type_attributes: Vec::new(),
             instances: BTreeMap::new(),
@@ -762,10 +763,10 @@ impl World {
             skeleton_files: BTreeSet::new(),
             rooms: Rooms::default(),
             fires: Vec::new(),
-            frame_storage: BTreeMap::new(),
+            frame_storage: CowMap::new(),
             dialogs: Dialogs::default(),
             person_ticks: BTreeMap::new(),
-            neighbors: Neighbors::default(),
+            neighbors: CowBox::default(),
             animators: BTreeMap::new(),
             usage: HouseUsage::default(),
             routing: Routing::default(),
@@ -852,7 +853,7 @@ impl World {
         if let Some(model) = &house.model {
             world.read_house_model(model);
         }
-        world.arrays = house.arrays.clone();
+        world.arrays = CowMap::from(house.arrays.clone());
         world.types = house.types.entries.iter().map(|t| (t.id, t.guid)).collect();
         // Every object the file describes, whether or not its registration
         // list names it.

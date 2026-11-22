@@ -520,9 +520,9 @@ impl<'a> Machine<'a, '_> {
     /// down, and so does the first headline's duration
     /// ([`Machine::count_headline`]).
     pub(crate) fn end_turn(&mut self) -> Result<(), Trap> {
-        let object = self.me_mut()?;
-        if object.data[LOCKOUT] != 0 {
-            object.data[LOCKOUT] = object.data[LOCKOUT].wrapping_sub(1);
+        let lockout = self.me()?.data[LOCKOUT];
+        if lockout != 0 {
+            self.me_mut()?.data[LOCKOUT] = lockout.wrapping_sub(1);
         }
         self.count_headline();
         Ok(())

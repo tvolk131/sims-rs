@@ -270,15 +270,54 @@ impl Machine<'_, '_> {
     /// order, or in the person vector for mode 1. None leaves the cursor as
     /// it was; mode 1 gives zero instead.
     fn next_in_order(&self, mode: u8, current: i16) -> Result<Option<i16>, Trap> {
-        let order = if mode == 1 {
-            self.person_order()?
+        let ids: &[u16] = if mode == 1 {
+            if let Some(id) = self.making_person {
+                return Err(Trap::Unsupported(format!(
+                    "a walk of the person vector while the factory makes person {id}; when in \
+                     the making the original appends a person is not read"
+                )));
+            }
+            // Validate every entry of the small person vector upfront (matching
+            // `person_order`), without allocating a temporary `Vec`.
+            for &raw_id in &self.world.people {
+                let object = self.world.objects.get(&raw_id).ok_or_else(|| {
+                    Trap::Invalid(format!(
+                        "person vector names object {raw_id}, which is gone"
+                    ))
+                })?;
+                if object.person.is_none() {
+                    return Err(Trap::Invalid(format!(
+                        "person vector names object {raw_id}, which is not a person"
+                    )));
+                }
+                i16::try_from(raw_id).map_err(|_| {
+                    Trap::Invalid(format!("object ID {raw_id} does not fit a script word"))
+                })?;
+            }
+            &self.world.people
         } else {
-            self.registration_order()?
+            // Validate every entry in registration order upfront (matching
+            // `registration_order`: object lookup before script-word
+            // conversion) without allocating a temporary `Vec`.
+            for &raw_id in &self.world.order {
+                if !self.world.objects.contains_key(&raw_id) {
+                    return Err(Trap::Invalid(format!(
+                        "registered object {raw_id} does not exist"
+                    )));
+                }
+                i16::try_from(raw_id).map_err(|_| {
+                    Trap::Invalid(format!("object ID {raw_id} does not fit a script word"))
+                })?;
+            }
+            &self.world.order
         };
         let remaining = match current {
-            0 => &order[..],
-            _ => match order.iter().position(|&(id, _)| id == current) {
-                Some(i) => &order[i + 1..],
+            0 => ids,
+            _ => match u16::try_from(current)
+                .ok()
+                .and_then(|cur| ids.iter().position(|&id| id == cur))
+            {
+                Some(i) => &ids[i + 1..],
                 None => &[],
             },
         };
@@ -293,7 +332,16 @@ impl Machine<'_, '_> {
         } else {
             None
         };
-        for &(id, object) in remaining {
+        for &raw_id in remaining {
+            let id = i16::try_from(raw_id).map_err(|_| {
+                Trap::Invalid(format!("object ID {raw_id} does not fit a script word"))
+            })?;
+            if mode == 1 {
+                return Ok(Some(id));
+            }
+            let object = self.world.objects.get(&raw_id).ok_or_else(|| {
+                Trap::Invalid(format!("registered object {raw_id} does not exist"))
+            })?;
             let matches = match mode {
                 6 => {
                     Some(*object.data.get(CATEGORY).ok_or_else(|| {
@@ -388,23 +436,6 @@ impl Machine<'_, '_> {
             }
         }
         Ok(None)
-    }
-
-    /// The objects in registration order, by script ID.
-    fn registration_order(&self) -> Result<Vec<(i16, &Object)>, Trap> {
-        self.world
-            .order
-            .iter()
-            .map(|&id| {
-                let object = self.world.objects.get(&id).ok_or_else(|| {
-                    Trap::Invalid(format!("registered object {id} does not exist"))
-                })?;
-                let id = i16::try_from(id).map_err(|_| {
-                    Trap::Invalid(format!("object ID {id} does not fit a script word"))
-                })?;
-                Ok((id, object))
-            })
-            .collect()
     }
 
     /// The native person vector ([`sims_sim::World::people`]), which

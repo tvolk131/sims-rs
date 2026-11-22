@@ -23,6 +23,7 @@
 //! alone. For the Goth house the results were also compared with a
 //! trace of the original loading it; see `docs/decisions/`.
 
+use crate::cow::CowMap;
 use crate::load::{FLOORS, WALLS};
 use crate::{FULL_SIZE, World};
 use serde::{Deserialize, Serialize};
@@ -280,7 +281,7 @@ fn at(x: usize, y: usize) -> usize {
     x * FULL + y
 }
 
-fn array(arrays: &BTreeMap<u16, Array>, id: u16, stride: usize) -> Result<&[u8], RoomError> {
+fn array(arrays: &CowMap<u16, Array>, id: u16, stride: usize) -> Result<&[u8], RoomError> {
     let array = arrays.get(&id).ok_or(RoomError::MissingArray(id))?;
     if array.width != FULL
         || array.height != FULL

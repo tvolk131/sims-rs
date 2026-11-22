@@ -218,7 +218,7 @@ pub fn world() -> World {
         order: vec![LAMP, SIM],
         people: vec![SIM],
         types: BTreeMap::from([(7, LAMP_GUID), (8, SIM_GUID)]),
-        objects: BTreeMap::from([(LAMP, object(LAMP, LAMP_GUID)), (SIM, sim)]),
+        objects: BTreeMap::from([(LAMP, object(LAMP, LAMP_GUID)), (SIM, sim)]).into(),
         // The family global 9 names, whose one member is the Sim's type.
         families: vec![sims_sim::neighbors::Family {
             id: 109,

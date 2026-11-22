@@ -30,7 +30,7 @@ fn lot() -> Fixture {
     fx.add_type(ADULT, 2, 0, 4097);
     fx.add_type(CHILD, 2, 0, 4097);
     fx.add_type(STOOL, 4, 0, 4097);
-    fx.world.neighbors = records(11);
+    *fx.world.neighbors = records(11);
     fx.world.changed_types = [ADULT, CHILD].into();
     fx
 }
@@ -475,7 +475,7 @@ fn a_person_with_low_interests_gets_defaults_that_only_cost_draws() {
     // until one has room, then a value. So 30 draws at least.
     for interest in [0, 10] {
         let mut fx = lot();
-        fx.world.neighbors = records(interest);
+        *fx.world.neighbors = records(interest);
         fx.world.crt_rng = CrtRng::from_state(99);
         let start = fx.world.crt_rng;
         let done = read(&mut fx, &file(vec![sim(3, ADULT)]), &people()).unwrap();
@@ -491,14 +491,14 @@ fn a_person_with_low_interests_gets_defaults_that_only_cost_draws() {
     // `default_traits`.
     for (state, draws) in [(99, DEFAULTS_FROM_99), (1, DEFAULTS_FROM_1)] {
         let mut fx = lot();
-        fx.world.neighbors = records(0);
+        *fx.world.neighbors = records(0);
         fx.world.crt_rng = CrtRng::from_state(state);
         let done = read(&mut fx, &file(vec![sim(3, ADULT)]), &people()).unwrap();
         assert_eq!(done.draws - 288, draws, "from state {state}");
     }
     // A record without person data leaves the interests at zero.
     let mut fx = lot();
-    fx.world.neighbors = records(500);
+    *fx.world.neighbors = records(500);
     let record = fx.world.neighbors.slots[0].as_mut().unwrap();
     record.revision = 0;
     record.data.fill(0);
@@ -525,7 +525,7 @@ fn people_the_read_cannot_construct_fail_loudly() {
     assert_eq!(object, 3);
     assert!(matches!(cause, Trap::Unsupported(_)), "{cause:?}");
     // A record too short to hold the interests.
-    fx.world.neighbors = records(11);
+    *fx.world.neighbors = records(11);
     fx.world.neighbors.slots[0]
         .as_mut()
         .unwrap()
@@ -533,7 +533,7 @@ fn people_the_read_cannot_construct_fail_loudly() {
         .truncate(50);
     let (_, cause) = trap(read(&mut fx, &objects, &people()));
     assert!(matches!(cause, Trap::Invalid(_)), "{cause:?}");
-    fx.world.neighbors = records(11);
+    *fx.world.neighbors = records(11);
     // The save says person and the definition does not, or the reverse.
     let (_, cause) = trap(read(&mut fx, &file(vec![sim(3, CHAIR)]), &people()));
     assert!(matches!(cause, Trap::Invalid(_)), "{cause:?}");
