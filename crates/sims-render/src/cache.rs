@@ -25,8 +25,8 @@ use crate::cutaway::{Focus, Mask};
 use crate::grass::Grass;
 use crate::lot::{Lot, WallCell};
 use crate::scene::{
-    Edge, Stats, background, holds_person, paint_lot_from_env, paint_lot_with_env_hook,
-    shadow_of_chain, wall_objects_on_level,
+    Edge, RenderOptions, Stats, background, holds_person, paint_lot_from_env,
+    paint_lot_with_env_hook, shadow_of_chain, wall_objects_on_level,
 };
 use sims_sim::{Object, World};
 use std::collections::{BTreeMap, BTreeSet};
@@ -190,6 +190,7 @@ struct EnvKey {
     /// Focus that produced `cut_mask` when `env_walls == Walls::Cutaway`.
     focus: Focus,
     cut_mask: Option<Mask>,
+    options: RenderOptions,
     time_of_day: i16,
     house: i16,
     show_grid: bool,
@@ -210,6 +211,7 @@ struct LotKey {
     camera: Camera,
     cut_mask: Option<Mask>,
     preview: Option<(u16, u16)>,
+    options: RenderOptions,
     time_of_day: i16,
     house: i16,
     show_grid: bool,
@@ -380,6 +382,32 @@ impl LotCache {
         preview: Option<(u16, u16)>,
         canvas: &mut Canvas,
     ) -> Stats {
+        self.draw_lot_with_preview_and_options(
+            world,
+            lot,
+            assets,
+            camera,
+            viewport,
+            preview,
+            RenderOptions::default(),
+            canvas,
+        )
+    }
+
+    /// Like [`LotCache::draw_lot_with_preview`], applying [`RenderOptions`]
+    /// (`shadows` and `lighting`) and invalidating the cache when they change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_lot_with_preview_and_options(
+        &mut self,
+        world: &World,
+        lot: &Lot,
+        assets: &mut Assets,
+        camera: &Camera,
+        viewport: (u32, u32),
+        preview: Option<(u16, u16)>,
+        options: RenderOptions,
+        canvas: &mut Canvas,
+    ) -> Stats {
         let assets_id = assets.instance_id();
         let width = canvas.width;
         let height = canvas.height;
@@ -417,6 +445,7 @@ impl LotCache {
                 && k.camera.origin == camera.origin
                 && k.camera.walls == camera.walls
                 && k.preview == preview
+                && k.options == options
                 && k.time_of_day == time_of_day
                 && k.house == house
                 && k.show_grid == show_grid
@@ -437,17 +466,19 @@ impl LotCache {
 
                 if mask_match && objects_match(&k.objects, world, assets, preview) {
                     let mut shadows_ok = true;
-                    for level_index in 0..top {
-                        if !level_shadows_match(
-                            &k.shadows[level_index],
-                            world,
-                            assets,
-                            camera.rotation,
-                            lot.size,
-                            level_index,
-                        ) {
-                            shadows_ok = false;
-                            break;
+                    if options.shadows {
+                        for level_index in 0..top {
+                            if !level_shadows_match(
+                                &k.shadows[level_index],
+                                world,
+                                assets,
+                                camera.rotation,
+                                lot.size,
+                                level_index,
+                            ) {
+                                shadows_ok = false;
+                                break;
+                            }
                         }
                     }
                     if shadows_ok {
@@ -481,6 +512,7 @@ impl LotCache {
                 && k.rotation == camera.rotation
                 && k.origin == camera.origin
                 && k.env_walls == env_walls
+                && k.options == options
                 && k.time_of_day == time_of_day
                 && k.house == house
                 && k.show_grid == show_grid
@@ -497,7 +529,15 @@ impl LotCache {
                 };
 
                 if env_mask_match
-                    && level_shadows_match(&k.shadows0, world, assets, camera.rotation, lot.size, 0)
+                    && (!options.shadows
+                        || level_shadows_match(
+                            &k.shadows0,
+                            world,
+                            assets,
+                            camera.rotation,
+                            lot.size,
+                            0,
+                        ))
                 {
                     if env_walls == Walls::Cutaway {
                         env.key.focus = camera.focus;
@@ -519,19 +559,24 @@ impl LotCache {
                         camera,
                         viewport,
                         preview,
+                        options,
                         canvas,
                         held.clone(),
                         cut_mask.as_ref(),
                         env.stats,
                     );
-                    let shadows = [
-                        env.key.shadows0.clone(),
-                        if top >= 2 {
-                            collect_level_shadows(world, assets, camera.rotation, lot.size, 1)
-                        } else {
-                            Vec::new()
-                        },
-                    ];
+                    let shadows = if options.shadows {
+                        [
+                            env.key.shadows0.clone(),
+                            if top >= 2 {
+                                collect_level_shadows(world, assets, camera.rotation, lot.size, 1)
+                            } else {
+                                Vec::new()
+                            },
+                        ]
+                    } else {
+                        [Vec::new(), Vec::new()]
+                    };
                     let key = LotKey {
                         assets_id,
                         width,
@@ -540,6 +585,7 @@ impl LotCache {
                         camera: *camera,
                         cut_mask,
                         preview,
+                        options,
                         time_of_day,
                         house,
                         show_grid,
@@ -584,6 +630,7 @@ impl LotCache {
             camera,
             viewport,
             preview,
+            options,
             canvas,
             grass,
             held.clone(),
@@ -605,11 +652,17 @@ impl LotCache {
             return stats;
         }
 
-        let shadows0 = collect_level_shadows(world, assets, camera.rotation, lot.size, 0);
-        let shadows1 = if top >= 2 {
-            collect_level_shadows(world, assets, camera.rotation, lot.size, 1)
+        let (shadows0, shadows1) = if options.shadows {
+            (
+                collect_level_shadows(world, assets, camera.rotation, lot.size, 0),
+                if top >= 2 {
+                    collect_level_shadows(world, assets, camera.rotation, lot.size, 1)
+                } else {
+                    Vec::new()
+                },
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let grid_flags = grid_slice.map(<[u8]>::to_vec);
 
@@ -633,6 +686,7 @@ impl LotCache {
                 } else {
                     None
                 },
+                options,
                 time_of_day,
                 house,
                 show_grid,
@@ -656,6 +710,7 @@ impl LotCache {
             camera: *camera,
             cut_mask,
             preview,
+            options,
             time_of_day,
             house,
             show_grid,

@@ -56,6 +56,27 @@ pub fn background(time_of_day: i16, house: i16) -> [u8; 3] {
     crate::canvas::quantize565(rgb)
 }
 
+/// Graphics options that control how [`Painter`] renders the lot
+/// (`cTSOptions`: object floor shadows `[0x6f0188]` at `0x4e5fb2`/`0x4ae846`,
+/// dynamic lamp light pools `[0x6f018a]` at `0x4e5fd5`/`0x4c7c1a`/`0x4c835c`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderOptions {
+    /// Cast object floor shadows (`[0x6f0188]`).
+    pub shadows: bool,
+    /// Render dynamic lamp pools on floors and walls (`[0x6f018a]` at
+    /// `0x4c7c1a` and `0x4c835c`); base room shading always applies.
+    pub lighting: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            shadows: true,
+            lighting: true,
+        }
+    }
+}
+
 /// Counts of what one frame drew, for tests and the viewer's status line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -86,6 +107,7 @@ pub fn draw(
         camera,
         viewport,
         None,
+        RenderOptions::default(),
         canvas,
         Pass::All,
     )
@@ -109,6 +131,7 @@ pub fn draw_lot(
         camera,
         viewport,
         None,
+        RenderOptions::default(),
         canvas,
         Pass::Lot,
     )
@@ -133,6 +156,7 @@ pub fn draw_lot_in_viewport(
         camera,
         viewport,
         None,
+        RenderOptions::default(),
         canvas,
         Pass::Lot,
     )
@@ -157,6 +181,57 @@ pub fn draw_lot_with_preview(
         camera,
         viewport,
         preview,
+        RenderOptions::default(),
+        canvas,
+        Pass::Lot,
+    )
+}
+
+/// Draws the lot like [`draw_lot_in_viewport`], applying [`RenderOptions`]
+/// (`shadows` `[0x6f0188]` and `lighting` `[0x6f018a]`).
+pub fn draw_lot_in_viewport_with_options(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    options: RenderOptions,
+    canvas: &mut Canvas,
+) -> Stats {
+    paint(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        None,
+        options,
+        canvas,
+        Pass::Lot,
+    )
+}
+
+/// Draws the lot like [`draw_lot_with_preview`], applying [`RenderOptions`]
+/// (`shadows` `[0x6f0188]` and `lighting` `[0x6f018a]`).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_lot_with_preview_and_options(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    preview: Option<(u16, u16)>,
+    options: RenderOptions,
+    canvas: &mut Canvas,
+) -> Stats {
+    paint(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        preview,
+        options,
         canvas,
         Pass::Lot,
     )
@@ -175,6 +250,18 @@ pub fn draw_held(
     camera: &Camera,
     canvas: &mut Canvas,
 ) -> Stats {
+    draw_held_with_options(world, lot, assets, camera, RenderOptions::default(), canvas)
+}
+
+/// Like [`draw_held`], applying [`RenderOptions`].
+pub fn draw_held_with_options(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    options: RenderOptions,
+    canvas: &mut Canvas,
+) -> Stats {
     let held = holds_person(world);
     if held.is_empty() {
         return Stats::default();
@@ -187,6 +274,7 @@ pub fn draw_held(
         camera,
         viewport,
         None,
+        options,
         canvas,
         Pass::Held,
         None,
@@ -219,6 +307,7 @@ fn paint(
     camera: &Camera,
     viewport: (u32, u32),
     preview: Option<(u16, u16)>,
+    options: RenderOptions,
     canvas: &mut Canvas,
     pass: Pass,
 ) -> Stats {
@@ -235,6 +324,7 @@ fn paint(
         camera,
         viewport,
         preview,
+        options,
         canvas,
         pass,
         &grass,
@@ -253,6 +343,7 @@ pub(crate) fn paint_lot_with_env_hook(
     camera: &Camera,
     viewport: (u32, u32),
     preview: Option<(u16, u16)>,
+    options: RenderOptions,
     canvas: &mut Canvas,
     grass: &Grass,
     held: BTreeSet<u16>,
@@ -267,6 +358,7 @@ pub(crate) fn paint_lot_with_env_hook(
         camera,
         viewport,
         preview,
+        options,
         canvas,
         Pass::Lot,
         grass,
@@ -289,6 +381,7 @@ pub(crate) fn paint_lot_from_env(
     camera: &Camera,
     viewport: (u32, u32),
     preview: Option<(u16, u16)>,
+    options: RenderOptions,
     canvas: &mut Canvas,
     held: BTreeSet<u16>,
     cut_mask: Option<&Mask>,
@@ -301,6 +394,7 @@ pub(crate) fn paint_lot_from_env(
         camera,
         viewport,
         preview,
+        options,
         canvas,
         Pass::Lot,
         None,
@@ -329,6 +423,7 @@ fn paint_with_precomputed(
     camera: &Camera,
     viewport: (u32, u32),
     preview: Option<(u16, u16)>,
+    options: RenderOptions,
     canvas: &mut Canvas,
     pass: Pass,
     grass: &Grass,
@@ -347,6 +442,7 @@ fn paint_with_precomputed(
         camera,
         viewport,
         preview,
+        options,
         canvas,
         pass,
         Some(grass),
@@ -651,6 +747,8 @@ struct Painter<'a> {
     /// Active house viewport bottom (`word ptr [0x6f0c14]`), clamped to the
     /// canvas height.
     clip_bottom: i32,
+    /// Graphics options (`shadows` `[0x6f0188]`, `lighting` `[0x6f018a]`).
+    options: RenderOptions,
     world: &'a World,
     lot: &'a Lot,
     camera: &'a Camera,
@@ -670,6 +768,7 @@ impl<'a> Painter<'a> {
         camera: &'a Camera,
         viewport: (u32, u32),
         preview: Option<(u16, u16)>,
+        options: RenderOptions,
         canvas: &'a mut Canvas,
         pass: Pass,
         grass: Option<&'a Grass>,
@@ -681,6 +780,7 @@ impl<'a> Painter<'a> {
             held,
             preview_overrides: buy_preview_overrides(world, preview),
             clip_bottom,
+            options,
             world,
             lot,
             camera,
@@ -885,7 +985,11 @@ impl<'a> Painter<'a> {
                     let byte = self
                         .lot
                         .light_at(index, [x * 16 + inside[0], y * 16 + inside[1]]);
-                    let lamps = Self::lamps_at(self.lot, self.camera, index, [x, y]);
+                    let lamps = if self.options.lighting {
+                        Self::lamps_at(self.lot, self.camera, index, [x, y])
+                    } else {
+                        [None; 2]
+                    };
                     let depth = &self.depth;
                     let (base_d, first_row) = depth.floor_base(view, height, level, at[1]);
                     let row_depth = |y| depth.floor_row(base_d, first_row, y);
@@ -931,6 +1035,9 @@ impl<'a> Painter<'a> {
     /// height `height`: that of the first object on the tile that has one
     /// (see [`crate::shadows`]).
     fn shadow(&mut self, level: i32, [x, y]: [i32; 2], p: [i32; 2], view: [i32; 2], height: i32) {
+        if !self.options.shadows {
+            return;
+        }
         let Some((code, strength)) =
             shadow_of_tile(self.world, self.assets, self.camera.rotation, level, [x, y])
         else {
@@ -1287,8 +1394,10 @@ impl<'a> Painter<'a> {
         let plain = light.map_or(Light::FULL, |f| Light::from_fraction(f, brightest));
         let index = (level - 1) as usize;
         let drawn_base = light.and_then(|f| Light::drawn_fraction(f, brightest));
-        let wall_pools = match (drawn_base, seen) {
-            (Some(_), Some((along_y, tile))) => {
+        // `0x4c7c1a`: `[0x6f018a]` skips only dynamic wall lamp pools while
+        // preserving base room shading.
+        let wall_pools = match (self.options.lighting, drawn_base, seen) {
+            (true, Some(_), Some((along_y, tile))) => {
                 Self::wall_pools_ref(self.lot, self.camera, pools, index, along_y, tile)
             }
             _ => [None, None],
@@ -1788,6 +1897,9 @@ impl<'a> Painter<'a> {
             // in full light (0x437f7d, 0x4b455f). Then one whose master's
             // word 69 is 7 takes a light of 1 through the setter, held by
             // the time of day's cap (0x437adb to 0x437aed).
+            // 0x437abd..0x437aed: `0x437f7d` sets full light first, then
+            // master word 69 == 7 (`lit_at_brightest`) overwrites it with the
+            // time-of-day cap (`0x4b4525(1.0)`).
             let glows = o.data.get(LIGHT).is_some_and(|&w| w != 0) && def_kind != WINDOW;
             let light = if def_lit_at_brightest {
                 Light::from_fraction(1.0, self.lot.brightest())

@@ -55,6 +55,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use sims_game::game::goth_house;
+use sims_game::hud::DialogKey;
 use sims_game::sound::{self, Input};
 use sims_game::view::Move;
 use sims_game::{Game, Options};
@@ -326,6 +327,10 @@ struct App {
     title_throttle: TitleThrottle,
     scale: u32,
     cursor: Option<PhysicalPosition<f64>>,
+    /// Most recent cursor position reported by winit (including outside the
+    /// client rect) so captured Sound slider drags evaluate out-of-window
+    /// release coordinates (`0x5f62ba..0x5f62de`).
+    last_cursor: Option<PhysicalPosition<f64>>,
     drag: Option<PhysicalPosition<f64>>,
     wake_clock: WakeClock,
     dirty: bool,
@@ -344,6 +349,10 @@ struct App {
     /// The REDB file of saves, and this house's name in it.
     saves: PathBuf,
     slot: String,
+    /// User Options preference file (`Optn` 128 IFF) persisted beside `--saves`,
+    /// plus the last serialized `Optn` body to avoid redundant writes.
+    options_file: PathBuf,
+    saved_optn: Vec<u8>,
     /// Modifier keys tracked from `WindowEvent::ModifiersChanged` for Buy Mode
     /// shortcuts (`Ctrl/Cmd+Z` Undo, `Ctrl+Y`/`Ctrl/Cmd+Shift+Z` Redo).
     ctrl_or_cmd_held: bool,
@@ -409,7 +418,75 @@ fn canvas_point(
     Some([x, y])
 }
 
+/// Maps any physical pointer `position` (including out-of-bounds coordinates
+/// during captured slider drags, `0x5f6245..0x5f62de`) to canvas pixels.
+fn unclamped_canvas_point(
+    position: PhysicalPosition<f64>,
+    size: winit::dpi::PhysicalSize<u32>,
+    scale: u32,
+) -> Option<[i32; 2]> {
+    let _ = canvas_size(size, scale)?;
+    let scale = f64::from(scale.max(1));
+    Some([
+        (position.x / scale).floor() as i32,
+        (position.y / scale).floor() as i32,
+    ])
+}
+
+/// Queries the live Quartz cursor position relative to `window`'s content area
+/// so a macOS Sound slider release outside the window evaluates the true
+/// release X coordinate (`0x5f62ba..0x5f62de`) even when winit filters
+/// `mouse_motion` after button release.
+#[cfg(target_os = "macos")]
+fn live_macos_cursor_point(window: &Window, scale: u32) -> Option<[i32; 2]> {
+    use core_graphics::event::CGEvent;
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    let inner = window.inner_position().ok()?;
+    let size = window.inner_size();
+    let winit_scale = window.scale_factor();
+    if !(winit_scale.is_finite() && winit_scale > 0.0) {
+        return None;
+    }
+    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+    let event = CGEvent::new(source).ok()?;
+    let loc = event.location();
+    let phys = PhysicalPosition::new(
+        loc.x * winit_scale - f64::from(inner.x),
+        loc.y * winit_scale - f64::from(inner.y),
+    );
+    unclamped_canvas_point(phys, size, scale)
+}
+
+/// Path of the persisted user `Options.iff` (`Optn` 128) beside `saves`.
+fn options_path(saves: &std::path::Path) -> PathBuf {
+    saves.with_extension("options.iff")
+}
+
 impl App {
+    fn persist_options(&mut self) {
+        let current = self.game.options().to_optn();
+        if current != self.saved_optn {
+            match self.game.save_options(&self.options_file) {
+                Ok(()) => self.saved_optn = current,
+                Err(e) => eprintln!("sims-game: {}: {e}", self.options_file.display()),
+            }
+        }
+    }
+
+    fn slider_release_point(&mut self) -> Option<[i32; 2]> {
+        #[cfg(target_os = "macos")]
+        if let Some(window) = self.window.as_ref()
+            && let Some(point) = live_macos_cursor_point(window, self.scale)
+        {
+            return Some(point);
+        }
+        if let Some(point) = self.live_point() {
+            return Some(point);
+        }
+        self.window
+            .as_ref()
+            .and_then(|w| unclamped_canvas_point(self.last_cursor?, w.inner_size(), self.scale))
+    }
     fn sync_size(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         if let Some(canvas) = canvas_size(size, self.scale) {
             self.game.resize(canvas);
@@ -477,24 +554,54 @@ impl App {
         }
     }
 
-    /// Saves the lot (F5) or goes back to its save (F9).
-    fn save(&mut self, restore: bool) {
+    /// Saves the lot (F5) or goes back to its save (F9). Returns `true` when
+    /// the operation succeeded (`0x4f26cf`, checked by `0x4f29cc` before quit).
+    fn save(&mut self, restore: bool) -> bool {
         let store = match sims_sim::Snapshots::open(&self.saves) {
             Ok(store) => store,
             Err(e) => {
                 eprintln!("sims-game: {}: {e}", self.saves.display());
-                return;
+                let msg = if restore {
+                    format!("The save was not restored: {e}")
+                } else {
+                    format!("The lot was not saved: {e}")
+                };
+                self.game.set_note(msg);
+                self.changed(true);
+                return false;
             }
         };
-        if !restore {
-            self.game.save_to(&store, &self.slot);
+        let ok = if !restore {
+            self.game.save_to(&store, &self.slot)
         } else if self.game.restore_from(&store, &self.slot) {
             // The errors and the stop are the restored lot's.
             self.printed = 0;
             self.reported = false;
             self.wake_clock.reset(Instant::now());
-        }
+            true
+        } else {
+            false
+        };
         self.changed(true);
+        ok
+    }
+
+    fn handle_outcome(&mut self, event_loop: &ActiveEventLoop, outcome: sims_game::game::Outcome) {
+        self.persist_options();
+        self.changed(outcome.redraw);
+        self.move_pointer();
+        if outcome.photo {
+            self.photo();
+        }
+        let saved_ok = if outcome.save { self.save(false) } else { true };
+        if outcome.save && !saved_ok {
+            self.game.after_save_failed();
+            self.changed(true);
+        }
+        // `0x4f29cc..0x4f29d1`: Save & Quit exits only if saving succeeded.
+        if outcome.quit && saved_ok {
+            event_loop.exit();
+        }
     }
 
     fn key(&mut self, key: &Key) {
@@ -521,8 +628,14 @@ impl App {
                 self.changed(true);
                 return;
             }
-            Key::Named(NamedKey::F5) => return self.save(false),
-            Key::Named(NamedKey::F9) => return self.save(true),
+            Key::Named(NamedKey::F5) => {
+                let _ = self.save(false);
+                return;
+            }
+            Key::Named(NamedKey::F9) => {
+                let _ = self.save(true);
+                return;
+            }
             Key::Named(NamedKey::Delete | NamedKey::Backspace) => {
                 if self.game.sell_held() {
                     self.changed(true);
@@ -601,9 +714,12 @@ impl App {
         self.wake_clock.finish(now, Instant::now(), capped);
         // A dialog shown at the first tick due is drawn though none ran.
         let mut redraw = ran > 0 || (!waited && self.game.asking().is_some());
-        // The plumb bob spins and the Live-mode pause button blinks by the
-        // time passed, ticks or not.
-        redraw |= self.game.spin_due() || self.game.blink_due();
+        // The plumb bob spins, the Live-mode pause button blinks, and edge
+        // scrolling pans independently (`0x4d4af8..0x4d4b06` must not be
+        // short-circuited by animation redraw flags, and active right-drag
+        // panning bypasses edge scrolling at `0x4d46bd..0x4d4704`).
+        let scrolled = self.drag.is_none() && self.game.edge_scroll(clock_us);
+        redraw |= scrolled || self.game.spin_due() || self.game.blink_due();
         self.sound_feed
             .update(&mut self.game, |input| self.sound.send(input));
         for error in &self.game.errors()[self.printed..] {
@@ -826,7 +942,10 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.persist_options();
+                event_loop.exit();
+            }
             WindowEvent::Focused(focused) => {
                 if let Some(focused) = self.focus_filter.filter(focused)
                     && self
@@ -859,15 +978,81 @@ impl ApplicationHandler for App {
                 self.game.set_shift(self.shift_held);
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if event.logical_key == Key::Named(NamedKey::Escape) {
-                    // Escape closes the pie menu or cancels Buy Mode, else
-                    // quits. A repeat does neither, and a refused Buy snapback
+                if self.game.has_dialog() {
+                    // Any active modal dialog blocks global shortcuts (Escape,
+                    // F5, F9, Space, camera, Buy Undo/Redo). Text-entry dialogs
+                    // route typing/editing/Tab/Enter/Escape into `cTSWinTextEdit2`,
+                    // while confirmation dialogs handle Enter, Escape, and
+                    // localized Yes/No keys (`0x5e5b3b..0x5e5bfd`, `0x6d7530`).
+                    if self.game.has_dialog_entry() {
+                        let changed = match &event.logical_key {
+                            Key::Named(NamedKey::Backspace) => self.game.dialog_backspace(),
+                            Key::Named(NamedKey::Delete) => self.game.dialog_delete(),
+                            Key::Named(NamedKey::ArrowLeft) => self.game.dialog_move_left(),
+                            Key::Named(NamedKey::ArrowRight) => self.game.dialog_move_right(),
+                            Key::Named(NamedKey::ArrowUp) => self.game.dialog_move_up(),
+                            Key::Named(NamedKey::ArrowDown) => self.game.dialog_move_down(),
+                            Key::Named(NamedKey::Home) => self.game.dialog_home(),
+                            Key::Named(NamedKey::End) => self.game.dialog_end(),
+                            Key::Named(NamedKey::Tab) => self.game.dialog_switch_field(),
+                            Key::Named(NamedKey::Enter) if self.game.dialog_enter_is_newline() => {
+                                // `0x5f28b6..0x5f28f9`: Return inserts a newline
+                                // in the multiline Save Card Lot Description field.
+                                self.game.type_dialog_char('\n')
+                            }
+                            Key::Named(NamedKey::Enter) if !event.repeat => {
+                                let outcome = self.game.dialog_submit();
+                                self.handle_outcome(event_loop, outcome);
+                                false
+                            }
+                            Key::Named(NamedKey::Escape) if !event.repeat => {
+                                let outcome = self.game.dialog_confirm_key(DialogKey::Escape);
+                                self.handle_outcome(event_loop, outcome);
+                                false
+                            }
+                            Key::Named(NamedKey::Space) => self.game.type_dialog_char(' '),
+                            _ => {
+                                let mut typed = false;
+                                if let Some(text) = &event.text {
+                                    for ch in text.chars() {
+                                        typed |= self.game.type_dialog_char(ch);
+                                    }
+                                }
+                                typed
+                            }
+                        };
+                        self.changed(changed);
+                    } else if !event.repeat {
+                        let dialog_key = match &event.logical_key {
+                            Key::Named(NamedKey::Enter) => Some(DialogKey::Enter),
+                            Key::Named(NamedKey::Escape) => Some(DialogKey::Escape),
+                            Key::Character(s) => s.chars().next().map(DialogKey::Char),
+                            _ => event
+                                .text
+                                .as_ref()
+                                .and_then(|t| t.chars().next())
+                                .map(DialogKey::Char),
+                        };
+                        if let Some(key) = dialog_key {
+                            let outcome = self.game.dialog_confirm_key(key);
+                            self.handle_outcome(event_loop, outcome);
+                        }
+                    }
+                } else if event.logical_key == Key::Named(NamedKey::Escape) {
+                    // Escape closes the pie menu, cancels Buy placement, or
+                    // closes the active Options tab (`0x517904..0x517954`,
+                    // consuming Escape while in Options mode); else quits. A
+                    // repeat does none of these, and a refused Buy snapback
                     // keeps the cursor open so the user sees the error instead
                     // of exiting.
                     if !event.repeat {
                         let closed = self.game.close_menu();
                         let cancelled = !closed && self.game.cancel_buy();
-                        if escape_exits(closed, cancelled, self.game.buy_cursor().is_some()) {
+                        let escaped_options = !closed && !cancelled && self.game.escape_options();
+                        if !escaped_options
+                            && escape_exits(closed, cancelled, self.game.buy_cursor().is_some())
+                        {
+                            self.persist_options();
                             event_loop.exit();
                         } else {
                             self.changed(true);
@@ -878,6 +1063,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.game.has_dialog() {
+                    return;
+                }
                 let y = match delta {
                     MouseScrollDelta::LineDelta(_, y) => f64::from(y),
                     MouseScrollDelta::PixelDelta(p) => p.y,
@@ -896,25 +1084,39 @@ impl ApplicationHandler for App {
                 (MouseButton::Left, ElementState::Pressed) => {
                     if let Some(point) = self.live_point() {
                         let outcome = self.game.press(point);
-                        self.changed(outcome.redraw);
-                        self.move_pointer();
-                        if outcome.photo {
-                            self.photo();
-                        }
+                        self.handle_outcome(event_loop, outcome);
                     }
                 }
                 (MouseButton::Left, ElementState::Released) => {
-                    let outcome = match self.live_point() {
-                        Some(point) => self.game.release(point),
-                        None => self.game.release_outside(),
+                    let outcome = if self.game.dragging_slider() {
+                        // `0x5f62ba..0x5f62de`: captured slider release evaluates
+                        // the live pointer x-coordinate (including outside the
+                        // window on macOS) before releasing capture.
+                        if let Some(point) = self.slider_release_point() {
+                            self.game.release(point)
+                        } else {
+                            self.game.release_outside()
+                        }
+                    } else if let Some(point) = self.live_point() {
+                        self.game.release(point)
+                    } else {
+                        self.game.release_outside()
                     };
-                    self.changed(outcome.redraw);
-                    self.move_pointer();
+                    self.handle_outcome(event_loop, outcome);
                 }
                 (MouseButton::Right, ElementState::Pressed) => {
-                    self.drag = self.live_point().and(self.cursor);
+                    if !self.game.has_dialog() {
+                        self.drag = self.live_point().and(self.cursor);
+                    }
                 }
-                (MouseButton::Right, ElementState::Released) => self.drag = None,
+                (MouseButton::Right, ElementState::Released) => {
+                    self.drag = None;
+                    let redraw = match self.live_point() {
+                        Some(point) => self.game.hover(point),
+                        None => self.game.leave(),
+                    };
+                    self.changed(redraw);
+                }
                 _ => {}
             },
             WindowEvent::CursorLeft { .. } => {
@@ -923,21 +1125,44 @@ impl ApplicationHandler for App {
                 self.changed(redraw);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let point = self.window.as_ref().and_then(|w| {
-                    let size = w.inner_size();
-                    if let Some(canvas) = canvas_size(size, self.scale) {
-                        self.game.resize(canvas);
-                    }
-                    canvas_point(position, size, self.scale)
-                });
+                self.last_cursor = Some(position);
+                let (point, unclamped) = self
+                    .window
+                    .as_ref()
+                    .map(|w| {
+                        let size = w.inner_size();
+                        if let Some(canvas) = canvas_size(size, self.scale) {
+                            self.game.resize(canvas);
+                        }
+                        (
+                            canvas_point(position, size, self.scale),
+                            unclamped_canvas_point(position, size, self.scale),
+                        )
+                    })
+                    .unwrap_or((None, None));
                 if let Some(point) = point {
                     self.cursor = Some(position);
                     let redraw = self.drag.is_none() && self.game.hover(point);
                     self.changed(redraw);
                 } else {
                     self.cursor = None;
-                    let redraw = self.drag.is_none() && self.game.leave();
+                    let mut redraw = self.drag.is_none() && self.game.leave();
+                    if self.drag.is_none()
+                        && self.game.dragging_slider()
+                        && let Some([x, _]) = unclamped
+                    {
+                        redraw |= self.game.drag_slider(x);
+                    }
+                    if self.drag.is_none()
+                        && self.game.dragging_dialog_entry()
+                        && let Some(pt) = unclamped
+                    {
+                        redraw |= self.game.drag_dialog_entry(pt);
+                    }
                     self.changed(redraw);
+                }
+                if self.game.has_dialog() {
+                    self.drag = None;
                 }
                 if let Some(start) = self.drag {
                     let scale = f64::from(self.scale.max(1));
@@ -1004,6 +1229,13 @@ fn run() -> Result<(), String> {
         return std::fs::write(&still.file, png::encode(game.canvas()))
             .map_err(|e| format!("{}: {e}", still.file.display()));
     }
+    let options_file = options_path(&saves);
+    if options_file.is_file()
+        && let Err(e) = game.load_options(&options_file)
+    {
+        eprintln!("sims-game: {}: {e}", options_file.display());
+    }
+    let saved_optn = game.options().to_optn();
     let mut app = App {
         game,
         window: None,
@@ -1012,6 +1244,7 @@ fn run() -> Result<(), String> {
         title_throttle: TitleThrottle::default(),
         scale: 1,
         cursor: None,
+        last_cursor: None,
         drag: None,
         wake_clock: WakeClock::new(Instant::now()),
         dirty: true,
@@ -1023,6 +1256,8 @@ fn run() -> Result<(), String> {
         focus_filter: FocusFilter::default(),
         saves,
         slot: slot(&options.house),
+        options_file,
+        saved_optn,
         ctrl_or_cmd_held: false,
         shift_held: false,
     };
@@ -1080,6 +1315,23 @@ mod tests {
         );
         assert_eq!(canvas_point(pos, PhysicalSize::new(260, 600), 1), None);
         assert_eq!(canvas_point(pos, PhysicalSize::new(0, 600), 1), None);
+    }
+
+    #[test]
+    fn unclamped_canvas_point_maps_out_of_window_slider_coordinates() {
+        let size = PhysicalSize::new(800, 600);
+        assert_eq!(
+            unclamped_canvas_point(PhysicalPosition::new(-25.0, 520.0), size, 1),
+            Some([-25, 520])
+        );
+        assert_eq!(
+            unclamped_canvas_point(PhysicalPosition::new(1050.0, 520.0), size, 1),
+            Some([1050, 520])
+        );
+        assert_eq!(
+            unclamped_canvas_point(PhysicalPosition::new(-10.0, 520.0), size, 2),
+            Some([-5, 260])
+        );
     }
 
     #[test]

@@ -4,8 +4,8 @@
 use sims_formats::lot::Array;
 use sims_render::lot::{FULL, Lamps, NORTH, WEST};
 use sims_render::{
-    CacheHit, Camera, Canvas, Focus, Lot, LotCache, Selected, Walls, Zoom, draw_lot_with_preview,
-    open_house,
+    CacheHit, Camera, Canvas, Focus, Lot, LotCache, RenderOptions, Selected, Walls, Zoom,
+    draw_lot_with_preview, draw_lot_with_preview_and_options, open_house,
 };
 use sims_sim::World;
 use std::path::PathBuf;
@@ -1583,5 +1583,141 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
     assert_ne!(
         level2_walls_up.color, level2_anim.color,
         "raising level-2 walls must visibly change pixels while reusing level-1 tier 1"
+    );
+    world.objects.get_mut(&level2_vis_id).unwrap().data[34] = 0;
+
+    // 10. `RenderOptions` (`shadows` and `lighting`) must invalidate BOTH Tier 2
+    //     and Tier 1 (`CacheHit::Miss`), visibly change pixels, and preserve
+    //     Tier-1 hits and bit-for-bit parity when objects subsequently animate.
+    camera.level = 1;
+    camera.walls = Walls::Cutaway;
+    let assert_options_parity = |cache: &mut LotCache,
+                                 world: &World,
+                                 lot: &Lot,
+                                 assets: &mut sims_render::Assets,
+                                 options: RenderOptions,
+                                 expected_hit: CacheHit,
+                                 label: &str|
+     -> Canvas {
+        let mut cached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+        let mut uncached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+        let sc = cache.draw_lot_with_preview_and_options(
+            world,
+            lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            options,
+            &mut cached,
+        );
+        let actual_hit = cache.last_hit();
+        let su = draw_lot_with_preview_and_options(
+            world,
+            lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            options,
+            &mut uncached,
+        );
+        assert_eq!(
+            actual_hit, expected_hit,
+            "cache hit tier mismatch at {label}"
+        );
+        assert_eq!(sc, su, "stats mismatch at {label}");
+        assert_eq!(cached, uncached, "canvas mismatch at {label}");
+        cached
+    };
+
+    let opt_both = RenderOptions {
+        shadows: true,
+        lighting: true,
+    };
+    let both_canvas = assert_options_parity(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        opt_both,
+        CacheHit::Miss,
+        "render options shadows=true lighting=true cold",
+    );
+    assert_options_parity(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        opt_both,
+        CacheHit::Full,
+        "render options shadows=true lighting=true steady",
+    );
+
+    // Turning off lighting hides the night lamp pool added in step 5.
+    let opt_no_lighting = RenderOptions {
+        shadows: true,
+        lighting: false,
+    };
+    let no_lighting_canvas = assert_options_parity(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        opt_no_lighting,
+        CacheHit::Miss,
+        "render options lighting=false invalidates tier 1 and tier 2",
+    );
+    assert_ne!(
+        no_lighting_canvas.color, both_canvas.color,
+        "toggling lighting off must visibly remove floor lamp pool"
+    );
+    assert_options_parity(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        opt_no_lighting,
+        CacheHit::Full,
+        "render options lighting=false steady",
+    );
+
+    // Turning off shadows removes object floor shadows.
+    let opt_neither = RenderOptions {
+        shadows: false,
+        lighting: false,
+    };
+    let neither_canvas = assert_options_parity(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        opt_neither,
+        CacheHit::Miss,
+        "render options shadows=false invalidates tier 1 and tier 2",
+    );
+    assert_ne!(
+        neither_canvas.color, no_lighting_canvas.color,
+        "toggling shadows off must visibly remove floor shadows"
+    );
+
+    // Animating an object while shadows/lighting are off still hits Tier 1 (`Environment`)
+    // and matches uncached rendering bit-for-bit.
+    {
+        let obj = world.objects.get_mut(&glow_id).unwrap();
+        obj.data[51] = if obj.data[51] == 0 { 100 } else { 0 };
+    }
+    let anim_neither_canvas = assert_options_parity(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        opt_neither,
+        CacheHit::Environment,
+        "object glow toggle with shadows=false lighting=false hits tier 1",
+    );
+    assert_ne!(
+        anim_neither_canvas.color, neither_canvas.color,
+        "object glow toggle must visibly change pixels under shadows=false lighting=false"
     );
 }
