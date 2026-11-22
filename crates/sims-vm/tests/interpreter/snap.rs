@@ -939,20 +939,132 @@ fn offset_container(offset: [f32; 3]) -> (Fixture, u16) {
 }
 
 #[test]
-fn a_container_slot_offset_across_fails_loudly_but_negative_zero_does_not() {
-    // The offset across moves my animator (0x454ceb), which is not kept.
-    for offset in [[8.0, 0.0, 0.0], [0.0, -0.5, 0.0]] {
+fn a_container_slot_offset_across_snaps_into_slot_and_guards_stale_offset_mutations() {
+    // 0x454ceb..0x454d5e applies the horizontal container-slot offset only to
+    // the person's animator offset (`+0x8c/+0x90`, read by `cTSPerson::Place`
+    // at `0x5921f0`); the object's lot position and `animator.position` stay at
+    // the container's position.
+    for offset in [[8.0, 0.0, 0.0], [0.0, -0.5, 0.0], [-0.0, -0.0, 0.0]] {
         let (mut fx, me) = offset_container(offset);
-        let start = unmoved(&fx, me);
-        let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
-        assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454ceb")),
+        let lamp_pos = fx.lamp().position;
+        assert_eq!(
+            snap(&mut fx, me, LAMP as i16, 0, 3, 0),
+            Ok(true),
             "{offset:?}"
         );
-        assert_eq!(unmoved(&fx, me), start, "{offset:?}");
+        assert_eq!(fx.world.objects[&me].position, lamp_pos, "{offset:?}");
+        assert_eq!(fx.world.objects[&me].data[2], LAMP as i16, "{offset:?}");
+        assert_eq!(fx.world.objects[&me].data[3], 1, "{offset:?}");
     }
-    let (mut fx, me) = offset_container([-0.0, -0.0, 0.0]);
+
+    // Rotating the container while it holds a person in a horizontal-offset
+    // slot would make the derived offset diverge from the value 0x58933b stored
+    // at Snap time, so writing container.data[1] (facing) fails loudly instead
+    // of silently altering the model position.
+    let (mut fx, me) = offset_container([8.0, 0.0, 0.0]);
+    fx.lamp_mut().data[1] = 0;
     assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    let rotate_err = trap(fx.expression(scope::MY_DATA, 1, op::ASSIGN, scope::LITERAL, 2));
+    assert!(
+        matches!(rotate_err, Trap::Unsupported(ref m) if m.contains("0x454ceb")),
+        "expected Unsupported when rotating container holding offset person, got {rotate_err}"
+    );
+    // Writing the same facing (0) is a no-op and succeeds.
+    assert_eq!(
+        fx.expression(scope::MY_DATA, 1, op::ASSIGN, scope::LITERAL, 0),
+        Ok(true)
+    );
+    // Snapping the person back out to a non-container routing slot clears
+    // containment and zeroes the animator offset, after which the container
+    // can rotate freely.
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .slots
+        .get_mut(&SLOTS)
+        .unwrap()
+        .push(slot(SKIP_CHECKS));
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 1, 3, 0), Ok(true));
+    assert_eq!(fx.world.objects[&me].data[2], 0);
+    assert_eq!(
+        fx.expression(scope::MY_DATA, 1, op::ASSIGN, scope::LITERAL, 2),
+        Ok(true)
+    );
+
+    // Find Location For mode 2 (`turn_one` at 0x433fa1) turning a container
+    // holding a person in a horizontal-offset slot fails before mutating facing.
+    let (mut fx, me) = offset_container([8.0, 0.0, 0.0]);
+    fx.lamp_mut().data[1] = 0;
+    fx.lamp_mut().data[23] = 2; // TURN_STEP
+    fx.world.objects.get_mut(&SIM).unwrap().data[1] = 2;
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    fx.add(
+        SIM_FILE,
+        4201,
+        tree(vec![ins(
+            16,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [2, 0, 0, 0, 0, 0, 0, 0],
+        )]),
+    );
+    let turn_err = trap(fx.run_with(SIM, 4201, LAMP as i16, &[], 1000));
+    assert!(
+        matches!(turn_err, Trap::Unsupported(ref m) if m.contains("0x433fa1")),
+        "expected Unsupported when Find Location For mode 2 turns container holding offset person, \
+         got {turn_err}"
+    );
+    assert_eq!(fx.lamp().data[1], 0);
+
+    // Find Location For mode 1 (`take_self_off`, 0x4332ed) during the Sim's own
+    // tick fails before unlinking the person from a horizontal-offset slot.
+    let (mut fx, me) = offset_container([8.0, 0.0, 0.0]);
+    fx.lamp_mut().data[1] = 0;
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    let widget_file = fx.catalog.objects[fx.catalog.by_guid[&fx.world.objects[&me].guid]].resource;
+    fx.add(
+        widget_file,
+        4202,
+        tree(vec![
+            assign(
+                scope::STACK_OBJECT,
+                0,
+                scope::MY_DATA,
+                11, // object ID
+                1,
+            ),
+            ins(16, RETURN_TRUE, RETURN_FALSE, [1, 0, 0, 0, 0, 0, 0, 0]),
+        ]),
+    );
+    fx.thread(me, 4202, &[]);
+    let rates = || sims_sim::motives::Rates::from_lookup(0, |_| None);
+    let curve = |motive| sims_sim::motives::Curve::parse(motive, "(-100;1)(100;1)", 8);
+    let tuning = sims_sim::motives::Tuning {
+        rates: [rates(), rates(), rates()],
+        adult_mood: vec![curve(7)],
+        child_mood: vec![curve(7)],
+    };
+    let self_off_err = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream)
+        .tick_person(&mut fx.world, me, 0, &tuning)
+        .unwrap_err();
+    assert!(
+        matches!(self_off_err.trap, Trap::Unsupported(ref m) if m.contains("0x4332ed")),
+        "expected Unsupported when contained offset person takes itself off, got {self_off_err}"
+    );
+    assert_eq!(fx.world.objects[&me].data[2], LAMP as i16);
+
+    // A sub-unit offset like [0.5, 0.0, 0.0] truncates to (0, 0) via __ftol at
+    // every facing (0x454d4c), so rotating the container does not shift the
+    // computed animator offset and succeeds.
+    let (mut fx, me) = offset_container([0.5, 0.0, 0.0]);
+    fx.lamp_mut().data[1] = 0;
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    assert_eq!(
+        fx.expression(scope::MY_DATA, 1, op::ASSIGN, scope::LITERAL, 2),
+        Ok(true)
+    );
+    assert_eq!(fx.lamp().data[1], 2);
 }
 
 #[test]

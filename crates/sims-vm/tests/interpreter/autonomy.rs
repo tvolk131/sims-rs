@@ -765,3 +765,211 @@ fn autonomy_allows_a_visitor_join_on_category_4_only_with_the_hotel_key() {
     assert_eq!(fx.sim().data[20], 5);
     assert!(fx.world.neighbors.inventories.is_empty());
 }
+
+#[test]
+fn community_and_vacation_lots_skip_objects_with_master_word_69_in_4_or_5() {
+    for (lot_num, zoning) in [(58i16, 2i32), (40, 0)] {
+        for word69 in [0i16, 4, 5] {
+            let mut fx = lot(0x100);
+            fx.world.globals[10] = lot_num;
+            if zoning != 0 {
+                fx.program.zoning.insert(lot_num, zoning);
+            }
+            fx.words(LAMP_FILE)[69] = word69;
+            // Ensure unzoned Vacation lot scans all objects (quarter 0).
+            fx.world.ticks = 4 - u32::from(SIM);
+            let status = turn(&mut fx);
+            if matches!(word69, 4 | 5) {
+                assert_eq!(
+                    status,
+                    Status::Returned(false),
+                    "lot {lot_num} word69={word69} should skip lamp"
+                );
+            } else {
+                assert_eq!(
+                    status,
+                    Status::Yielded,
+                    "lot {lot_num} word69={word69} should choose lamp"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn vacation_island_hotel_filter_skips_indoor_categories_5_to_7_for_non_family() {
+    use sims_sim::rooms::Room;
+
+    let setup = |sim_family: i16, has_hotel_marker: bool, outdoors: bool, category: i16| {
+        let mut fx = lot(0x100);
+        fx.world.globals[10] = 40; // Vacation Island (40..50)
+        fx.world.globals[9] = 109;
+        fx.world.ticks = 4 - u32::from(SIM); // quarter 0
+        fx.sim_mut().person.as_mut().unwrap().data[61] = sim_family;
+        fx.world.rooms.rooms.insert(
+            3,
+            Room {
+                outdoors,
+                ..Room::default()
+            },
+        );
+        fx.lamp_mut().data[29] = 3;
+        fx.lamp_mut().data[59] = category;
+        if has_hotel_marker {
+            fx.add_object(99);
+            fx.world.objects.get_mut(&99).unwrap().data[59] = 0x2e;
+        }
+        fx
+    };
+
+    // Non-family Sim on a Vacation lot with a 0x2e object skips indoor 5/6/7.
+    for cat in [5i16, 6, 7] {
+        let mut fx = setup(200, true, false, cat);
+        assert_eq!(turn(&mut fx), Status::Returned(false), "indoor cat {cat}");
+    }
+    // Category 4 indoors is allowed when the Sim holds a hotel key (0x45891b).
+    // Without a hotel key on Vacation Island (lot 40), category 4 and 7 targets
+    // are skipped in autonomy_entries (and create an empty inventory for the Sim).
+    let mut fx = setup(200, true, false, 4);
+    assert_eq!(turn(&mut fx), Status::Returned(false));
+    assert!(!fx.world.neighbors.inventories.is_empty());
+
+    // Category 3 indoors is allowed without a hotel key.
+    let mut fx = setup(200, true, false, 3);
+    assert_eq!(turn(&mut fx), Status::Yielded);
+
+    // With a hotel-key token (kind 0xd definition + inventory count != 0),
+    // category 4 on Vacation Island is emitted by autonomy_entries (0x45891b..
+    // 0x4589e4) even when NOT_AUTONOMOUS is set.
+    let mut fx = setup(109, true, false, 4);
+    const KEY_GUID: u32 = 0x3ac0_22d6;
+    let key_idx = fx.catalog.objects.len();
+    fx.catalog.objects.push(sims_content::Object {
+        guid: KEY_GUID,
+        resource: LAMP_FILE,
+        chunk: 99,
+        kind: 0xd,
+        master: 0,
+    });
+    fx.catalog.by_guid.insert(KEY_GUID, key_idx);
+    fx.sim_mut().person.as_mut().unwrap().data[31] = 1;
+    fx.world
+        .neighbors
+        .inventories
+        .push(sims_sim::neighbors::Inventory {
+            neighbor: 1,
+            items: vec![sims_sim::neighbors::Item {
+                kind: 0,
+                guid: KEY_GUID,
+                count: 1,
+            }],
+        });
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .interactions
+        .get_mut(&TABLE)
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .interactions[1]
+        .flags |= 0x80; // NOT_AUTONOMOUS: bypassed by 0x45891b..0x4589e4
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    assert_eq!(fx.sim().data[20], 5);
+
+    // Outdoor category 5 is allowed.
+    let mut fx = setup(200, true, true, 5);
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    // Without a 0x2e object on the lot, indoor category 5 is allowed.
+    let mut fx = setup(200, false, false, 5);
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    // Controlled family member (data[61] == global 9) is allowed on category 5.
+    let mut fx = setup(109, true, false, 5);
+    assert_eq!(turn(&mut fx), Status::Yielded);
+}
+
+#[test]
+fn unzoned_lot_cycles_through_four_quarter_filters() {
+    // Unzoned lot (lot 99, zoning 0): quarter = (world.ticks + SIM) & 3.
+    // Place LAMP (id = 1, odd) far from SIM (distance > 7.0 tiles).
+    let setup = |quarter: u32, lamp_id: u16, far: bool| {
+        let mut fx = lot(0x100);
+        fx.world.globals[10] = 99;
+        fx.world.ticks = (quarter + 4 - (u32::from(SIM) & 3)) & 3;
+        if lamp_id != LAMP {
+            let mut extra = fx.lamp().clone();
+            extra.id = lamp_id;
+            fx.lamp_mut().registry_word = Some(0); // silence original odd LAMP
+            fx.world.objects.insert(lamp_id, extra);
+        }
+        fx.sim_mut().position = [16, 16, 0];
+        fx.world.objects.get_mut(&lamp_id).unwrap().position = if far {
+            [16 + 10 * 16, 16, 0]
+        } else {
+            [16 + 7 * 16, 16, 0]
+        };
+        fx
+    };
+
+    // Quarter 0: scans all objects (even far ones).
+    assert_eq!(turn(&mut setup(0, LAMP, true)), Status::Yielded);
+    // Quarter 1: distance <= 7.0 allowed, > 7.0 skipped.
+    assert_eq!(turn(&mut setup(1, LAMP, false)), Status::Yielded);
+    assert_eq!(turn(&mut setup(1, LAMP, true)), Status::Returned(false));
+    // Quarter 2: even IDs only (id = 4 allowed, id = 1 skipped).
+    assert_eq!(turn(&mut setup(2, 4, true)), Status::Yielded);
+    assert_eq!(turn(&mut setup(2, LAMP, true)), Status::Returned(false));
+    // Quarter 3: odd IDs only (id = 1 allowed, id = 4 skipped).
+    assert_eq!(turn(&mut setup(3, LAMP, true)), Status::Yielded);
+    assert_eq!(turn(&mut setup(3, 4, true)), Status::Returned(false));
+}
+
+#[test]
+fn free_will_off_visitor_and_global_9_zero_follow_active_family() {
+    // Free will off for a visitor: refused only if person.data[61] == global 9
+    // and kind <= 1 (0x45dd87..0x45ddaa). Flag 1 (`VISITORS`) makes the lamp
+    // eligible to visitors so the free-will gate is what decides.
+    let mut fx = lot(0x100 | 1);
+    fx.world.globals[30] = 0; // free will off
+    fx.sim_mut().person.as_mut().unwrap().data[32] = 1; // visitor
+    fx.sim_mut().person.as_mut().unwrap().data[61] = 109; // matches global 9
+    fx.sim_mut().person.as_mut().unwrap().data[65] = 0; // human (<= 1)
+    assert_eq!(turn(&mut fx), Status::Returned(false));
+
+    // Visitor from another family is still autonomous with free will off.
+    let mut fx = lot(0x100 | 1);
+    fx.world.globals[30] = 0;
+    fx.sim_mut().person.as_mut().unwrap().data[32] = 1;
+    fx.sim_mut().person.as_mut().unwrap().data[61] = 200;
+    assert_eq!(turn(&mut fx), Status::Yielded);
+
+    // Global 9 == 0 with active_family = Some(&[SIM_GUID]) refuses autonomy
+    // for the first member on the lot (0x45ddb0..0x45ddd5), while
+    // active_family = Some(&[]) allows it and None traps Unsupported.
+    let mut fx = lot(0x100);
+    fx.world.globals[9] = 0;
+    let err = Interpreter::new(&fx.program, &fx.catalog, fx.stream)
+        .turn(&mut fx.world, SIM, 100)
+        .unwrap_err();
+    assert!(matches!(err.trap, Trap::Unsupported(_)));
+
+    let mut fx = lot(0x100);
+    fx.world.globals[9] = 0;
+    let first_member = [SIM_GUID];
+    let mut interp = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interp.active_family = Some(&first_member);
+    assert_eq!(
+        interp.turn(&mut fx.world, SIM, 100).unwrap(),
+        Status::Returned(false)
+    );
+
+    let mut fx = lot(0x100);
+    fx.world.globals[9] = 0;
+    let mut interp = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interp.active_family = Some(&[]);
+    assert_eq!(
+        interp.turn(&mut fx.world, SIM, 100).unwrap(),
+        Status::Yielded
+    );
+}

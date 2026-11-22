@@ -17,9 +17,14 @@
 //!    (0x42144e), stored as a float.
 //! 3. **The scan** (0x45dedc to 0x45e1a7): every object by rising ID, but
 //!    those without an interaction table, those whose scheduler flag
-//!    "advertises" is clear, the person itself (unless it is a pet), and
-//!    those whose data word 25 is above zero. A lot that is not zoned
-//!    scans a quarter of the objects each time, which is not ported.
+//!    "advertises" is clear, on community/vacation lots (`0x45e2db`) those
+//!    whose master definition (`0x45728d`) has word 69 equal to 4 or 5, the
+//!    person itself (unless `person.data[65] > 1`, e.g. a pet), those whose
+//!    data word 25 is above zero, on Vacation Island (`40..50`, `0x4074c8`)
+//!    indoor category 5/6/7 objects for non-family Sims when any lot object
+//!    has category `0x2e` (46), and on unzoned lots (`zoning == 0`) a 4-phase
+//!    `(world.ticks + me) & 3` filter (`0x45de60`, `0x45e024`: 0 = all,
+//!    1 = distance `<= 7.0`, 2 = even IDs, 3 = odd IDs).
 //! 4. For each object, its interaction target's table entries that the
 //!    person may choose ([`Machine::autonomy_entries`], 0x458826), from
 //!    the last entry to the first.
@@ -104,6 +109,17 @@ const THOUSANDTH: u32 = 0x3a83_126f;
 /// The comparison's tolerance (0x66734c).
 const EPSILON: u32 = 0x33d6_bf95;
 
+/// The float 7.0 (0x666a50), maximum distance in unzoned scan phase 1 (0x45e057).
+const UNZONED_NEAR_DISTANCE: u32 = 0x40e0_0000;
+
+/// Object category 0x2e (46): presence on a Vacation Island lot (`40..50`)
+/// gates indoor category 5/6/7 objects from non-family visitors (0x45dec7).
+const VACATION_HOTEL_CATEGORY: i16 = 0x2e;
+
+/// Definition word 69 (+0x8a): skipped on community/vacation lots when 4 or 5
+/// (0x45df68, 0x45df80).
+const DEFINITION_BUILD_KIND: usize = 69;
+
 pub(crate) use sims_sim::ADVERTISEMENTS;
 
 /// Object data words.
@@ -134,6 +150,8 @@ pub(crate) mod person {
     /// The highest autonomy threshold of an entry the person takes.
     pub const AUTONOMY: usize = 36;
     pub const AGE: usize = 58;
+    /// The person's family ID (+0x606).
+    pub const FAMILY: usize = 61;
     /// Bit 1: a dog; bit 2: a cat.
     pub const KIND: usize = 65;
 }
@@ -377,9 +395,14 @@ struct Chooser {
     child: bool,
     dog: bool,
     cat: bool,
+    kind: i16,
     pets_outside: bool,
     autonomy: i16,
     residential: bool,
+    vacation: bool,
+    community_or_vacation: bool,
+    vacation_filter: bool,
+    quarter: u32,
     constants: Constants,
 }
 
@@ -390,16 +413,19 @@ impl Machine<'_, '_> {
     ///
     /// - With free will off (global 30, which the lot's setup copies from
     ///   the option byte 0x6c2980 the original reads, 0x46d24c), a
-    ///   resident that is not a pet fails. A pet, or a visitor, fails
-    ///   loudly: the original then reads interface state that is not
-    ///   modeled (0x6e4f68, and the family the player controls).
+    ///   resident that is not a pet fails; a resident pet fails loudly
+    ///   (0x6e4f68). A visitor fails if its family (person word 61) matches
+    ///   the controlled family and its kind (word 65) is `<= 1`
+    ///   (`0x45dd87..0x45ddaa`).
     /// - The original also fails for the first member of the family the
     ///   player controls when that family's number is 0, and while two
     ///   interface flags are set (0x6f2a54 here, 0x6e5134 in the
-    ///   enumeration). The family's number is taken to be global 9, and
-    ///   global 9 being 0 fails loudly; the flags, which only interface
-    ///   code writes, are taken to be clear. A memory image of the
-    ///   original at its first call agrees with both.
+    ///   enumeration). The family's number is taken to be global 9; when
+    ///   global 9 is 0, `self.active_family` supplies the controlled family's
+    ///   members (`game +0x10`) if known and fails loudly if `None`. The
+    ///   interface flags, which only interface code writes, are taken to be
+    ///   clear. A memory image of the original at its first call agrees with
+    ///   both.
     pub(crate) fn find_best_interaction(&mut self) -> Result<Flow, Trap> {
         let me = self.me;
         let object = self.me()?;
@@ -412,37 +438,78 @@ impl Machine<'_, '_> {
         let (dog, cat) = (kind & 2 != 0, kind & 4 != 0);
         let visitor = word(person::VISITOR) != 0;
         let global = |index: usize| self.world.globals.get(index).copied().unwrap_or(0);
+        let family = global(FAMILY);
         if global(FREE_WILL) == 0 {
-            if !visitor && !dog && !cat {
+            if !visitor {
+                if !dog && !cat {
+                    return Ok(Flow::Branch(false));
+                }
+                return Err(Trap::Unsupported(
+                    "Find Best Interaction with free will off for a resident pet, which reads \
+                     interface state (0x6e4f68)"
+                        .into(),
+                ));
+            }
+            // 0x45dd87..0x45ddaa: a visitor skips free-will-off unless its
+            // family matches the controlled family (`game +0x10 -> +0x10c`)
+            // and `person.data[65] <= 1`.
+            if family == 0 && self.active_family.is_none() {
+                return Err(Trap::Unsupported(
+                    "Find Best Interaction with free will off for a visitor with global 9 at 0, \
+                     where the controlled family (game +0x10) is not kept"
+                        .into(),
+                ));
+            }
+            if word(person::FAMILY) == family && kind <= 1 {
                 return Ok(Flow::Branch(false));
             }
-            return Err(Trap::Unsupported(
-                "Find Best Interaction with free will off for a pet or a visitor, which reads \
-                 interface state (0x6e4f68, the family the player controls)"
-                    .into(),
-            ));
         }
-        if global(FAMILY) == 0 {
-            return Err(Trap::Unsupported(
-                "Find Best Interaction with no family on the lot, where the original compares \
-                 the person with the controlled family's first member (0x4e9608)"
-                    .into(),
-            ));
+        // 0x45ddb0..0x45ddd5: when the controlled family's ID (`+0x10c`) is 0,
+        // refuse autonomy for that family's first member (`0x4e97dc(0)` ->
+        // `0x4e9608`).
+        if family == 0 {
+            let Some(members) = self.active_family else {
+                return Err(Trap::Unsupported(
+                    "Find Best Interaction with no family on the lot, where the original compares \
+                     the person with the controlled family's first member (0x4e9608)"
+                        .into(),
+                ));
+            };
+            if let Some(&first_guid) = members.first()
+                && self.in_portrait_table(first_guid)?
+            {
+                let first_on_lot = self.world.people.iter().copied().find(|id| {
+                    self.world
+                        .objects
+                        .get(id)
+                        .is_some_and(|o| o.guid == first_guid)
+                });
+                if first_on_lot == Some(me) {
+                    return Ok(Flow::Branch(false));
+                }
+            }
         }
         let lot = global(LOT);
         let zoning = self.zoning(lot);
-        if zoning == 2 || (40..50).contains(&lot) {
-            return Err(Trap::Unsupported(format!(
-                "Find Best Interaction on lot {lot}, whose scan has rules for community lots \
-                 and lots 40 to 49 that are not ported (0x45e2db, 0x4074c8)"
-            )));
-        }
-        if zoning == 0 {
-            return Err(Trap::Unsupported(format!(
-                "Find Best Interaction on lot {lot}, which is not zoned: the original then \
-                 scans a quarter of the objects (0x45de63), which is not ported"
-            )));
-        }
+        // 0x45de58..0x45de72: unzoned lots (`0x45e2be == 0`) cycle through
+        // four scan filters indexed by `(world.ticks + me) & 3`.
+        let quarter = if zoning != 0 {
+            0
+        } else {
+            self.world.ticks.wrapping_add(u32::from(me)) & 3
+        };
+        // 0x4074c8: Vacation Island lots 40..50; 0x45e2db: community (zoning 2)
+        // or Vacation Island.
+        let vacation = (40..50).contains(&lot);
+        let community_or_vacation = zoning == 2 || vacation;
+        // 0x45de77..0x45ded8: on Vacation Island lots, a Sim whose family word
+        // differs from global 9 skips indoor category 5/6/7 objects when any
+        // object on the lot has category 0x2e (46).
+        let vacation_filter = vacation
+            && word(person::FAMILY) != family
+            && self.world.objects.values().any(|o| {
+                o.data.get(data::CATEGORY).copied().unwrap_or(0) == VACATION_HOTEL_CATEGORY
+            });
         let custom = self.definition_words(object.guid)?[51] as u16;
         let (global_table, table) = crate::people::curve_table(word(person::AGE), custom);
         let resource = self.definition(object.guid)?.resource;
@@ -465,9 +532,14 @@ impl Machine<'_, '_> {
             child: age != 0 && age < 18,
             dog,
             cat,
+            kind,
             pets_outside: word(person::PETS_OUTSIDE) != 0,
             autonomy: word(person::AUTONOMY),
             residential: zoning == 1,
+            vacation,
+            community_or_vacation,
+            vacation_filter,
+            quarter,
             constants,
         };
         let (posture, selection) = (word(person::POSTURE), word(person::SELECTION));
@@ -574,11 +646,65 @@ impl Machine<'_, '_> {
             if words[TABLE] == 0 || object.flags() & flag::ADVERTISES == 0 {
                 continue;
             }
-            if id == chooser.me && !chooser.dog && !chooser.cat {
+            // 0x45df43..0x45df8e: on community (zoning 2) and Vacation Island
+            // (40..50) lots, skip objects whose master definition (`0x45728d`)
+            // has word 69 (+0x8a) equal to 4 or 5.
+            if chooser.community_or_vacation {
+                let interpreter = self.interpreter();
+                let master = interpreter.master_words(
+                    self.world,
+                    id,
+                    "Find Best Interaction's community/vacation scan",
+                )?;
+                if matches!(master[DEFINITION_BUILD_KIND], 4 | 5) {
+                    continue;
+                }
+            }
+            // 0x45df8e..0x45dfbe: skip self unless `person.data[65] > 1`.
+            if id == chooser.me && chooser.kind <= 1 {
                 continue;
             }
+            let object = &self.world.objects[&id];
             if object.data.get(data::IN_USE).is_some_and(|&w| w > 0) {
                 continue;
+            }
+            // 0x45dfca..0x45e024: Vacation Island non-family filter skips
+            // indoor objects of category 5, 6, or 7 when a category-0x2e
+            // object is on the lot.
+            if chooser.vacation_filter {
+                let room_id = object.data.get(data::ROOM).copied().unwrap_or(0);
+                if room_id != sims_sim::rooms::NO_ROOM
+                    && self
+                        .world
+                        .rooms
+                        .rooms
+                        .get(&room_id)
+                        .is_some_and(|room| !room.outdoors)
+                    && matches!(object.data.get(data::CATEGORY).copied().unwrap_or(0), 5..=7)
+                {
+                    continue;
+                }
+            }
+            // 0x45e024..0x45e066: unzoned lot 4-phase object filter.
+            match chooser.quarter {
+                0 => {}
+                1 => {
+                    let near = F32::from_bits(UNZONED_NEAR_DISTANCE).ext();
+                    let d = distance(position, object.position, words[TYPE] == 7);
+                    if d.partial_cmp(&near) == Some(Ordering::Greater) {
+                        continue;
+                    }
+                }
+                2 => {
+                    if id & 1 != 0 {
+                        continue;
+                    }
+                }
+                _ => {
+                    if id & 1 == 0 {
+                        continue;
+                    }
+                }
             }
             let target = self.interaction_target(id)?;
             let entries = self.autonomy_entries(chooser, target)?;
@@ -682,21 +808,59 @@ impl Machine<'_, '_> {
     /// returns at once, before any side effect, so the entry is left out
     /// here. The rest of the entry is copied from the running action;
     /// the scan reads none of it but word +0 (see [`Entry`]).
-    fn autonomy_entries(&self, chooser: &Chooser, target: u16) -> Result<Vec<Entry>, Trap> {
+    fn autonomy_entries(&mut self, chooser: &Chooser, target: u16) -> Result<Vec<Entry>, Trap> {
         let object = &self.world.objects[&target];
         let kind = self.definition_words(object.guid)?[TYPE];
         if kind == 7 && !chooser.dog && !chooser.cat {
             return Ok(Vec::new());
         }
+        let room = object.data.get(data::ROOM).copied().unwrap_or(0);
+        let category = object.data.get(data::CATEGORY).copied().unwrap_or(0);
+        let vacation_hotel_target = chooser.vacation && matches!(category, 4 | 7);
         let Some(table) = self.table(target)? else {
             return Ok(Vec::new());
         };
-        let room = object.data.get(data::ROOM).copied().unwrap_or(0);
+        let table = table.clone();
         let mut entries = Vec::new();
         for interaction in table.interactions.iter().rev() {
             let flags = interaction.flags;
             let threshold = interaction.autonomy as u16 as i16;
             if threshold <= 0 {
+                continue;
+            }
+            // 0x45891b..0x4589e4: on Vacation Island lots (40..50), category
+            // 4 or 7 targets check the caller's hotel-key token (`0x42a8a1` +
+            // `0x43e21a` + `0x41f660`, testing `count != 0` via `test ax, ax;
+            // je`). A zero count skips the entry; a nonzero count checks only
+            // the dog/cat flags and emits the entry immediately.
+            if vacation_hotel_target {
+                let neighbor = self
+                    .checked_person(chooser.me)?
+                    .person
+                    .as_ref()
+                    .ok_or(Trap::native(0x1c, "object is not a person"))?
+                    .data
+                    .get(person::NEIGHBOR)
+                    .copied()
+                    .unwrap_or(0);
+                let guid = self.hotel_key_guid();
+                let has_key = self
+                    .find_inventory_token(neighbor, 0, guid)
+                    .is_some_and(|(_, count)| (count as i16) != 0);
+                if !has_key {
+                    continue;
+                }
+                if (chooser.dog && flags & entry::DOGS == 0)
+                    || (chooser.cat && flags & entry::CATS == 0)
+                {
+                    continue;
+                }
+                entries.push(self.autonomy_entry(
+                    chooser,
+                    target,
+                    &table,
+                    interaction.string_index,
+                ));
                 continue;
             }
             if (chooser.dog && flags & entry::DOGS == 0)
@@ -726,8 +890,9 @@ impl Machine<'_, '_> {
             {
                 continue;
             }
-            entries.push(self.autonomy_entry(chooser, target, table, interaction.string_index));
+            entries.push(self.autonomy_entry(chooser, target, &table, interaction.string_index));
         }
+        let object = &self.world.objects[&target];
         if kind == 2
             && let Some(person) = &object.person
             && person.active.target != 0
@@ -992,9 +1157,14 @@ impl Machine<'_, '_> {
             child: age != 0 && age < 18,
             dog: kind & 2 != 0,
             cat: kind & 4 != 0,
+            kind,
             pets_outside: word(person::PETS_OUTSIDE) != 0,
             autonomy: word(person::AUTONOMY),
             residential: self.zoning(lot) == 1,
+            vacation: false,
+            community_or_vacation: false,
+            vacation_filter: false,
+            quarter: 0,
             constants: self.program.autonomy_constants(),
         };
         let entry = Entry {

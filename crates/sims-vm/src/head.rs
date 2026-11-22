@@ -587,10 +587,21 @@ impl Interpreter<'_> {
             .objects
             .get(&id)
             .ok_or_else(|| Trap::native(10, "missing object"))?;
+        // 0x5921f0..0x59221a: add animator offset (+0x8c..+0x94), which Snap
+        // into a container slot (`0x454ceb..0x454d5e` -> `0x58933b`) sets to
+        // the slot's rotated horizontal offset while the person is contained.
+        let position = match self.container_animator_offset(world, object) {
+            Some(offset) => [
+                (a.position[0].ext() + offset[0].ext()).to_f32(),
+                (a.position[1].ext() + offset[1].ext()).to_f32(),
+                (a.position[2].ext() + offset[2].ext()).to_f32(),
+            ],
+            None => a.position,
+        };
         let level = World::tile(object.position)[2];
         let half = Ext::from_f64_bits(0x3fe0_0000_0000_0000);
         let round = |v: F32| (v.ext() + half).single().to_i32_truncate();
-        let point = [round(a.position[0]), round(a.position[1])];
+        let point = [round(position[0]), round(position[1])];
         let size = i32::from(world.size);
         let [first, second] = point.map(|p| (p >> 4) as i8 as i32);
         // Off the lot (0x45ee1d: either tile, as a signed byte, below 0
@@ -614,7 +625,7 @@ impl Interpreter<'_> {
         // Above the ground the level's rise is added (0x5922ad); see
         // docs/decisions/20261115-snap-offset-order.md.
         let rotation = self.view_rotation_for_object(world, id);
-        head::placement_on_level(a.position, height, level, rotation).ok_or_else(|| {
+        head::placement_on_level(position, height, level, rotation).ok_or_else(|| {
             unsupported(
                 "0x5c3a20",
                 &format!(
@@ -623,6 +634,105 @@ impl Interpreter<'_> {
             )
         })
     }
+
+    /// Computed container-slot animator offset (`0x454ceb..0x454d5e`) for
+    /// `container_id`'s container slot `slot_index` at container facing
+    /// `facing`, or `None` when the slot does not exist or the truncated
+    /// offset is zero.
+    pub(crate) fn slot_animator_offset(
+        &self,
+        world: &World,
+        container_id: u16,
+        slot_index: usize,
+        facing: i32,
+    ) -> Option<[F32; 3]> {
+        let container = world.objects.get(&container_id)?;
+        let definition =
+            crate::interpreter::object_definition(self.catalog, world, container.guid)?;
+        let entry = self
+            .program
+            .slots(definition.resource, definition.chunk)
+            .iter()
+            .filter(|entry| entry.kind == 0)
+            .nth(slot_index)?;
+        let offset = container_slot_animator_offset(entry.offset, facing);
+        (offset != [F32::ZERO; 3]).then_some(offset)
+    }
+
+    /// Whether changing `container_id`'s facing from `old_facing` to
+    /// `new_facing` would change the derived container-slot animator offset
+    /// (`0x454ceb -> 0x5921f0`) for any person currently held in one of its
+    /// container slots. Changing facing in that state would make the derived
+    /// offset diverge from the value `0x58933b` stored at `Snap` time.
+    pub(crate) fn facing_change_shifts_held_person_offset(
+        &self,
+        world: &World,
+        container_id: u16,
+        old_facing: i32,
+        new_facing: i32,
+    ) -> bool {
+        let Some(container) = world.objects.get(&container_id) else {
+            return false;
+        };
+        container
+            .slots
+            .iter()
+            .skip(1)
+            .enumerate()
+            .any(|(slot_index, slot)| {
+                let Some(occupant_id) = u16::try_from(slot.object).ok().filter(|&id| id > 0) else {
+                    return false;
+                };
+                world
+                    .objects
+                    .get(&occupant_id)
+                    .is_some_and(|o| o.person.is_some())
+                    && self.slot_animator_offset(world, container_id, slot_index, old_facing)
+                        != self.slot_animator_offset(world, container_id, slot_index, new_facing)
+            })
+    }
+
+    /// Container-slot animator offset (`0x454ceb..0x454d5e`) for a person
+    /// currently held in a container slot, or `None` when not contained or the
+    /// truncated offset is zero.
+    pub(crate) fn container_animator_offset(
+        &self,
+        world: &World,
+        object: &sims_sim::Object,
+    ) -> Option<[F32; 3]> {
+        let container_id = u16::try_from(object.data.get(2).copied().unwrap_or(0))
+            .ok()
+            .filter(|&c| c > 0)?;
+        let slot_index = usize::try_from(object.data.get(3).copied().unwrap_or(-1)).ok()?;
+        let container = world.objects.get(&container_id)?;
+        let facing = i32::from(container.data.get(1).copied().unwrap_or(0));
+        self.slot_animator_offset(world, container_id, slot_index, facing)
+    }
+}
+
+/// Rotated horizontal container-slot animator offset (`0x454ceb..0x454d5e`,
+/// passed to `0x58933b` at `0x454e01`): turns `entry.offset[0..2]` by
+/// `target_facing & 7` (even facings only; odd facings produce `(0, 0)`),
+/// truncating each component with `__ftol` (`0x636128`) and returning the
+/// single-precision `(dx, dy, 0.0)` offset added to `a.position` in
+/// `cTSPerson::Place` (`0x5921f0..0x59221a`).
+fn container_slot_animator_offset(offset: [f32; 3], target_facing: i32) -> [F32; 3] {
+    let x = F32::from_f32(offset[0]).ext();
+    let y = F32::from_f32(offset[1]).ext();
+    let (dx, dy) = match target_facing & 7 {
+        0 => (x, y),
+        2 => (-y, x),
+        4 => (-x, -y),
+        6 => (y, -x),
+        _ => (Ext::ZERO, Ext::ZERO),
+    };
+    let ix = dx.to_i32_truncate();
+    let iy = dy.to_i32_truncate();
+    [
+        Ext::from_i32(ix).single().to_f32(),
+        Ext::from_i32(iy).single().to_f32(),
+        F32::ZERO,
+    ]
 }
 
 /// A person's head anchors: +0x144, the point on top of the head, and
@@ -643,4 +753,165 @@ fn world_point(position: [i32; 3]) -> [F32; 3] {
         F32::from_bits(0),
         to_world_units(Ext::from_i32(position[0])).to_f32(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_slot_animator_offset_rotates_and_truncates_even_facings_only() {
+        let offset = [8.75f32, -3.9f32, 12.0f32];
+        let as_f32 = |v: [F32; 3]| [v[0].to_f32(), v[1].to_f32(), v[2].to_f32()];
+        assert_eq!(
+            as_f32(container_slot_animator_offset(offset, 0)),
+            [8.0, -3.0, 0.0]
+        );
+        assert_eq!(
+            as_f32(container_slot_animator_offset(offset, 2)),
+            [3.0, 8.0, 0.0]
+        );
+        assert_eq!(
+            as_f32(container_slot_animator_offset(offset, 4)),
+            [-8.0, 3.0, 0.0]
+        );
+        assert_eq!(
+            as_f32(container_slot_animator_offset(offset, 6)),
+            [-3.0, -8.0, 0.0]
+        );
+        // Negative facing wraps by & 7 (-2 & 7 == 6).
+        assert_eq!(
+            as_f32(container_slot_animator_offset(offset, -2)),
+            [-3.0, -8.0, 0.0]
+        );
+        // Odd facings yield zero (0x454d15).
+        for facing in [1, 3, 5, 7, -1] {
+            assert_eq!(
+                as_f32(container_slot_animator_offset(offset, facing)),
+                [0.0, 0.0, 0.0],
+                "facing {facing}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_adds_container_slot_animator_offset_to_person_placement() {
+        use sims_formats::execution::Slot;
+        use std::collections::BTreeMap;
+
+        let mut lib = crate::Library::default();
+        let mut def = [0i16; crate::DEFINITION_WORDS];
+        def[20] = 1; // SLOT chunk ID
+        lib.definitions.insert(1, def);
+        lib.slots.insert(
+            1,
+            vec![Slot {
+                kind: 0,
+                offset: [8.0, 0.0, 0.0],
+                standing: 1,
+                sitting: 0,
+                ground: 0,
+                flags: 0,
+                snap_target: -1,
+                proximity: [0; 3],
+                max_size: 0,
+                unknown: 0,
+                gradient: 0.0,
+                height: 0,
+                facing: 0,
+                resolution: 0,
+            }],
+        );
+        let program = crate::Program {
+            global: 0,
+            semi_globals: BTreeMap::new(),
+            libraries: BTreeMap::from([(1, lib)]),
+            careers: None,
+            career_texts_end: false,
+            labels_hold_no_token: false,
+            zoning: BTreeMap::new(),
+            animations: Default::default(),
+            people: Default::default(),
+            icon_frames: Default::default(),
+            wardrobe: None,
+            ordered_wardrobe: None,
+            characters: Default::default(),
+            character_files: Default::default(),
+            expansions: 0,
+        };
+        let catalog = sims_content::Catalog {
+            global: 0,
+            objects: vec![sims_content::Object {
+                guid: 0x5555,
+                resource: 1,
+                chunk: 1,
+                kind: 4,
+                master: 0,
+            }],
+            by_guid: BTreeMap::from([(0x5555, 0)]),
+            semi_globals: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut world = World::empty();
+        world.size = 64;
+        world.arrays.insert(
+            ALTITUDE,
+            sims_formats::lot::Array {
+                width: 64,
+                height: 64,
+                stride: 4,
+                encoding: 0,
+                data: vec![0; FULL * FULL * 4],
+            },
+        );
+        let make_obj = |id: u16, guid: u32, container: i16, slot: i16| sims_sim::Object {
+            id,
+            guid,
+            footprint: [0; 4],
+            position: [32, 32, 1],
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: vec![0; 8],
+            data: {
+                let mut d = vec![0; 72];
+                d[1] = 0; // facing 0
+                d[2] = container;
+                d[3] = slot;
+                d
+            },
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: -1,
+            relationships: Vec::new(),
+            slots: Vec::new(),
+            dynamic_sprites: Vec::new(),
+            multipart: None,
+            portal: None,
+            person: None,
+            registry_word: None,
+            last_result: false,
+            removal_skips_resets: false,
+            selected: false,
+        };
+        world.objects.insert(1, make_obj(1, 0x5555, 0, -1));
+        world.objects.insert(2, make_obj(2, 0x6666, 0, -1));
+        let mut animator = sims_sim::animator::LOADED;
+        animator.position = [F32::from_f32(32.0), F32::from_f32(32.0), F32::from_f32(0.0)];
+        let interp = Interpreter::new(&program, &catalog, crate::Stream::Lot);
+        let base_model = interp.model(&world, 2, &animator).unwrap();
+        // Contain person 2 in container 1 slot 0 (offset [8.0, 0.0, 0.0]).
+        world.objects.get_mut(&2).unwrap().data[2] = 1;
+        world.objects.get_mut(&2).unwrap().data[3] = 0;
+        let offset_model = interp.model(&world, 2, &animator).unwrap();
+        let expected = head::placement_on_level(
+            [F32::from_f32(40.0), F32::from_f32(32.0), F32::from_f32(0.0)],
+            F32::ZERO,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(offset_model, expected);
+        assert_ne!(offset_model, base_model);
+    }
 }
