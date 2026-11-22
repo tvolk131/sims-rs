@@ -45,7 +45,7 @@ mod sleep;
 mod snap;
 mod sound;
 mod special_effect;
-mod ui_effect;
+pub(crate) mod ui_effect;
 mod worst_motives;
 
 pub(crate) use distance::distance;

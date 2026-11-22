@@ -39,12 +39,13 @@ use std::collections::{BTreeMap, BTreeSet};
 /// [`World::generated_portrait_2002`] keyed by [`PortraitFile`],
 /// [`World::made_portrait_head`], [`World::ambiguous_portraits`],
 /// [`World::loaded_indexed_skeletons`], [`World::loaded_indexed_suits`],
+/// [`World::loaded_indexed_suit_bones`],
 /// [`World::made_outfits`], [`World::person_outfits`],
 /// [`World::scratch_ptr_set`], [`World::scratch_ptr_set_to_next`],
 /// [`World::scratch_ptr_expression`], [`World::scratch_ptr_arg_slot`],
 /// [`World::runtime_added_suits`], and [`World::suit_scan_cache`]
-/// (superseding pre-merge layouts 4–8).
-pub const FORMAT: u32 = 9;
+/// (layout 10, superseding pre-merge layouts 4–9).
+pub const FORMAT: u32 = 10;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +74,7 @@ pub struct Saved {
     ambiguous_portraits: BTreeSet<u32>,
     loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
     loaded_indexed_suits: BTreeMap<String, Option<bool>>,
+    loaded_indexed_suit_bones: BTreeMap<String, Vec<Vec<String>>>,
     made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
     person_outfits: BTreeMap<u16, PersonOutfit>,
     scratch_ptr_set: BTreeSet<u16>,
@@ -165,6 +167,7 @@ impl Saved {
         saved.world.ambiguous_portraits = saved.ambiguous_portraits.clone();
         saved.world.loaded_indexed_skeletons = saved.loaded_indexed_skeletons.clone();
         saved.world.loaded_indexed_suits = saved.loaded_indexed_suits.clone();
+        saved.world.loaded_indexed_suit_bones = saved.loaded_indexed_suit_bones.clone();
         saved.world.made_outfits = saved.made_outfits.clone();
         saved.world.person_outfits = saved.person_outfits.clone();
         saved.world.scratch_ptr_set = saved.scratch_ptr_set.clone();
@@ -209,6 +212,7 @@ impl Lot {
             ambiguous_portraits: self.world.ambiguous_portraits.clone(),
             loaded_indexed_skeletons: self.world.loaded_indexed_skeletons.clone(),
             loaded_indexed_suits: self.world.loaded_indexed_suits.clone(),
+            loaded_indexed_suit_bones: self.world.loaded_indexed_suit_bones.clone(),
             made_outfits: self.world.made_outfits.clone(),
             person_outfits: self.world.person_outfits.clone(),
             scratch_ptr_set: self.world.scratch_ptr_set.clone(),
@@ -275,6 +279,9 @@ mod tests {
         world
             .loaded_indexed_suits
             .insert("suit_b".into(), Some(true));
+        world
+            .loaded_indexed_suit_bones
+            .insert("suit_b".into(), vec![vec!["HEAD".into()]]);
         world.made_outfits.insert(
             0x5555_6666,
             BTreeMap::from([
@@ -295,6 +302,7 @@ mod tests {
             ambiguous_portraits: world.ambiguous_portraits.clone(),
             loaded_indexed_skeletons: world.loaded_indexed_skeletons.clone(),
             loaded_indexed_suits: world.loaded_indexed_suits.clone(),
+            loaded_indexed_suit_bones: world.loaded_indexed_suit_bones.clone(),
             made_outfits: world.made_outfits.clone(),
             person_outfits: world.person_outfits.clone(),
             scratch_ptr_set: world.scratch_ptr_set.clone(),
@@ -340,6 +348,10 @@ mod tests {
         assert_eq!(
             decoded.world().loaded_indexed_suits,
             BTreeMap::from([("suit_b".to_owned(), Some(true))])
+        );
+        assert_eq!(
+            decoded.world().loaded_indexed_suit_bones,
+            BTreeMap::from([("suit_b".to_owned(), vec![vec!["HEAD".to_owned()]])])
         );
         assert_eq!(
             decoded.world().made_outfits,

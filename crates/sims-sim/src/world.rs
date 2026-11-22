@@ -256,6 +256,13 @@ pub struct World {
     /// snapshot format 31; `sims_vm::boot::save::Saved` preserves it.
     #[serde(skip)]
     pub loaded_indexed_suits: BTreeMap<String, Option<bool>>,
+    /// Per-suit required `"HEAD"` mesh bone lists from the first `.ndx` `.bcf`
+    /// catalog that registered each runtime-loaded suit (`0x59f34c..0x59f35f`),
+    /// so duplicate suit names across catalogs preserve the winning catalog's
+    /// mesh requirements (`0x599f8a..0x59a01c`). Kept out of [`World::encode`]
+    /// to preserve snapshot format 31; `sims_vm::boot::save::Saved` preserves it.
+    #[serde(skip)]
+    pub loaded_indexed_suit_bones: BTreeMap<String, Vec<Vec<String>>>,
     /// `STR# 200` outfit rows rewritten by `Make New Character` (`0x40d183`,
     /// `0x40d4e7`, `0x40a5e2` rows 2 and 30–34, `0x40a667` rows 30 and 34,
     /// `0x40ac57` rows 1, 2, and 15–18) for runtime-made characters, kept out
@@ -770,6 +777,7 @@ impl World {
             ambiguous_portraits: BTreeSet::new(),
             loaded_indexed_skeletons: BTreeMap::new(),
             loaded_indexed_suits: BTreeMap::new(),
+            loaded_indexed_suit_bones: BTreeMap::new(),
             made_outfits: BTreeMap::new(),
             person_outfits: BTreeMap::new(),
             scratch_ptr_set: BTreeSet::new(),

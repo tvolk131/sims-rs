@@ -24,7 +24,7 @@ use sims_ui::command::{Camera as UiCamera, Command, Speed, Walls as UiWalls};
 use sims_vm::boot::save::Saved;
 use sims_vm::boot::{Frames, Lot, StepError};
 use sims_vm::play::{Recovery, ScriptError};
-use sims_vm::{SkippedFrame, SoundEvent};
+use sims_vm::{SkippedFrame, SoundEvent, UiEffectEvent};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -107,6 +107,12 @@ pub struct Game {
     errors: Errors,
     /// The steps' sound requests, in order, until the host takes them.
     sounds: VecDeque<SoundEvent>,
+    /// UI Effect highlight requests from steps not yet taken by the host.
+    ui_effects: VecDeque<UiEffectEvent>,
+    /// Active UI Effect highlights (opcode 34, `0x476485`/`0x47690d`/`0x4769c3`).
+    highlighted_buttons: BTreeSet<i16>,
+    highlighted_portraits: BTreeSet<u32>,
+    highlighted_relationships: BTreeSet<u32>,
     /// A short message about the last press, until the next one.
     note: Option<String>,
     /// Where the pointer is on the canvas, while it is over the window.
@@ -140,11 +146,15 @@ impl Game {
     pub fn open(options: &Options) -> Result<Self, String> {
         let house = &options.house;
         let opened = open_house(&options.install, house).map_err(|e| e.to_string())?;
-        let mut lot = Lot::load(
+        let initial_shape =
+            sims_render::Lot::from_world(&opened.world).map_err(|e| e.to_string())?;
+        let initial_view = View::new([800, 600], initial_shape.built_center(), opened.rotation);
+        let mut lot = Lot::load_viewed(
             &options.install,
             house,
             &options.answers,
             options.frames.clone(),
+            Some(initial_view.centre_tile()),
         )
         .map_err(|e| format!("{}: {e}", house.display()))?;
         // The player answers a dialog when it is shown.
@@ -167,6 +177,8 @@ impl Game {
         let mut people = People::open(&options.install, house)?;
         people.refresh(lot.world());
         let view = View::new([800, 600], lot_shape.built_center(), opened.rotation);
+        lot.set_view_rotation(view.camera.rotation);
+        lot.set_view_centre(Some(view.centre_tile()));
         let drawn_camera = view.camera;
         Ok(Self {
             lot,
@@ -180,6 +192,10 @@ impl Game {
             stopped,
             errors: Errors::default(),
             sounds: VecDeque::new(),
+            ui_effects: VecDeque::new(),
+            highlighted_buttons: BTreeSet::new(),
+            highlighted_portraits: BTreeSet::new(),
+            highlighted_relationships: BTreeSet::new(),
             pointer: None,
             reached: None,
             listed: None,
@@ -260,6 +276,29 @@ impl Game {
     /// order, for the sound system ([`crate::sound::event`]).
     pub fn take_sounds(&mut self) -> Vec<SoundEvent> {
         self.sounds.drain(..).collect()
+    }
+
+    /// The HUD highlight requests emitted by UI Effect (opcode 34, `0x44acff`)
+    /// since the last call, in order.
+    pub fn take_ui_effects(&mut self) -> Vec<UiEffectEvent> {
+        self.ui_effects.drain(..).collect()
+    }
+
+    /// Control IDs currently highlighted by UI Effect mode 0 (`0x476485`).
+    pub fn highlighted_buttons(&self) -> &BTreeSet<i16> {
+        &self.highlighted_buttons
+    }
+
+    /// Person GUIDs whose portrait button is currently highlighted by UI Effect
+    /// mode 1 (`0x47690d`).
+    pub fn highlighted_portraits(&self) -> &BTreeSet<u32> {
+        &self.highlighted_portraits
+    }
+
+    /// Neighbor GUIDs whose relationship control is currently highlighted by
+    /// UI Effect mode 2 (`0x4769c3`).
+    pub fn highlighted_relationships(&self) -> &BTreeSet<u32> {
+        &self.highlighted_relationships
     }
 
     /// How many errors play mode caught.
@@ -417,6 +456,7 @@ impl Game {
                     }
                     self.view.masks_rebuilt(update.masks_rebuilt);
                     self.keep_sounds(update.sounds);
+                    self.keep_ui_effects(update.ui_effects);
                 }
                 // The tick shows a dialog: it runs once it is answered,
                 // and no time is owed from before the wait.
@@ -434,6 +474,7 @@ impl Game {
                         } => {
                             self.view.masks_rebuilt(update.masks_rebuilt);
                             self.keep_sounds(update.sounds.clone());
+                            self.keep_ui_effects(update.ui_effects.clone());
                         }
                         // A play step whose tick failed hands back what
                         // it caught and made before the failure.
@@ -447,6 +488,7 @@ impl Game {
                             }
                             self.view.masks_rebuilt(update.masks_rebuilt);
                             self.keep_sounds(update.sounds.clone());
+                            self.keep_ui_effects(update.ui_effects.clone());
                         }
                         _ => {}
                     }
@@ -476,6 +518,42 @@ impl Game {
     /// [`SOUNDS_KEPT`], the oldest dropped first.
     fn keep_sounds(&mut self, sounds: Vec<SoundEvent>) {
         keep(&mut self.sounds, sounds, SOUNDS_KEPT);
+    }
+
+    /// Applies and queues a step's UI Effect highlight requests.
+    fn keep_ui_effects(&mut self, effects: Vec<UiEffectEvent>) {
+        for &effect in &effects {
+            match effect {
+                UiEffectEvent::Button { id, highlight } => {
+                    if highlight {
+                        self.highlighted_buttons.insert(id);
+                    } else {
+                        self.highlighted_buttons.remove(&id);
+                    }
+                }
+                UiEffectEvent::Portrait { guid, highlight } => {
+                    if highlight {
+                        self.highlighted_portraits.insert(guid);
+                    } else {
+                        self.highlighted_portraits.remove(&guid);
+                    }
+                }
+                UiEffectEvent::Relationship { guid, highlight } => {
+                    if highlight {
+                        self.highlighted_relationships.insert(guid);
+                    } else {
+                        self.highlighted_relationships.remove(&guid);
+                    }
+                }
+            }
+        }
+        keep(&mut self.ui_effects, effects, SOUNDS_KEPT);
+    }
+
+    /// Synchronizes the view's rotation and centre tile to the simulation lot.
+    fn sync_view(&mut self) {
+        self.lot.set_view_rotation(self.view.camera.rotation);
+        self.lot.set_view_centre(Some(self.view.centre_tile()));
     }
 
     fn stop(&mut self, error: &StepError) {
@@ -596,15 +674,17 @@ impl Game {
             return false;
         }
         self.view.resize(size);
+        self.sync_view();
         self.hud.resize_menu(size);
         true
     }
 
-    /// Moves the camera. A turn is the lot's input too: Generic Sims Call
-    /// 12 reads the view's rotation ([`Lot::set_view_rotation`]).
+    /// Moves the camera. Rotation and centre tile are lot inputs too: Generic
+    /// Sims Call 12 reads the rotation ([`Lot::set_view_rotation`]), and
+    /// portrait placement reads the centre tile ([`Lot::set_view_centre`]).
     pub fn apply(&mut self, command: Move) -> bool {
         let moved = self.view.apply(command);
-        self.lot.set_view_rotation(self.view.camera.rotation);
+        self.sync_view();
         moved
     }
 
@@ -1127,17 +1207,17 @@ impl Game {
         if object.person.is_some() && level == self.view.camera.level {
             let mut at = lot_point(&self.view.camera, position);
             at[1] -= person_rise(self.view.camera.zoom.level());
-            self.view.apply(Move::Centre(at));
+            self.apply(Move::Centre(at));
             return;
         }
-        self.view.apply(Move::Floor(level));
+        self.apply(Move::Floor(level));
         // The lot's bounds (0x4a7af0 reads them from the scene) are taken
         // as its tiles, which is **unverified** at the edges.
         if position[..2].iter().any(|&n| !(0..64 * 16).contains(&n)) {
             return;
         }
         let at = lot_point(&self.view.camera, position);
-        self.view.apply(Move::Centre(at));
+        self.apply(Move::Centre(at));
     }
 
     /// The lot as it stands, to go back to later ([`Game::restore`]).
@@ -1191,12 +1271,15 @@ impl Game {
         self.stopped = None;
         self.errors = Errors::default();
         self.sounds.clear();
+        self.ui_effects.clear();
+        self.highlighted_buttons.clear();
+        self.highlighted_portraits.clear();
+        self.highlighted_relationships.clear();
         self.reached = None;
         self.listed = None;
         self.highlighted = None;
         self.hud.forget();
-        let world = self.lot.world();
-        if let Some(speed) = pace::shown(world) {
+        if let Some(speed) = pace::shown(self.lot.world()) {
             self.pace.speed = speed;
         }
         // The view turns as the turn keys do, keeping the middle of the
@@ -1208,7 +1291,14 @@ impl Game {
             }
             self.view.apply(Move::Rotate(true));
         }
+        if let Some([tx, ty]) = self.lot.view_centre() {
+            let fine = [i32::from(tx) * 16 + 8, i32::from(ty) * 16 + 8];
+            let mid = [self.view.size[0] / 2, self.view.size[1] / 2];
+            self.view.camera.center_on(fine, mid);
+        }
+        self.sync_view();
         self.pace.restart();
+        let world = self.lot.world();
         self.people.refresh(world);
         match sims_render::Lot::from_world(world) {
             Ok(shape) => self.lot_shape = shape,
@@ -1222,10 +1312,6 @@ impl Game {
     /// Carries out a panel command. `menu` is the pie menu that was open
     /// when it was pressed.
     fn command(&mut self, command: Command, menu: Option<&Menu>) -> Outcome {
-        let moved = |view: &mut View, m: Move| {
-            view.apply(m);
-            Outcome::redraw()
-        };
         match command {
             Command::SetSpeed(speed) => {
                 self.set_speed(speed);
@@ -1236,8 +1322,14 @@ impl Game {
                 Outcome::redraw()
             }
             Command::Camera(camera) => match camera {
-                UiCamera::ZoomIn => moved(&mut self.view, Move::ZoomIn),
-                UiCamera::ZoomOut => moved(&mut self.view, Move::ZoomOut),
+                UiCamera::ZoomIn => {
+                    self.apply(Move::ZoomIn);
+                    Outcome::redraw()
+                }
+                UiCamera::ZoomOut => {
+                    self.apply(Move::ZoomOut);
+                    Outcome::redraw()
+                }
                 // Which way the original turns for each is unverified.
                 UiCamera::RotateRight => {
                     self.apply(Move::Rotate(true));
@@ -1247,16 +1339,22 @@ impl Game {
                     self.apply(Move::Rotate(false));
                     Outcome::redraw()
                 }
-                UiCamera::FloorUp => moved(&mut self.view, Move::LevelUp),
-                UiCamera::FloorDown => moved(&mut self.view, Move::LevelDown),
-                UiCamera::Walls(w) => moved(
-                    &mut self.view,
-                    Move::Walls(match w {
+                UiCamera::FloorUp => {
+                    self.apply(Move::LevelUp);
+                    Outcome::redraw()
+                }
+                UiCamera::FloorDown => {
+                    self.apply(Move::LevelDown);
+                    Outcome::redraw()
+                }
+                UiCamera::Walls(w) => {
+                    self.apply(Move::Walls(match w {
                         UiWalls::Up => Walls::Up,
                         UiWalls::Cutaway => Walls::Cutaway,
                         UiWalls::Down => Walls::Down,
-                    }),
-                ),
+                    }));
+                    Outcome::redraw()
+                }
                 UiCamera::Photo => Outcome {
                     redraw: false,
                     photo: true,
@@ -1359,10 +1457,10 @@ impl Errors {
     }
 }
 
-/// Adds `sounds` to the requests the host has yet to take, keeping at
+/// Adds `items` to the requests the host has yet to take, keeping at
 /// most `kept`: the oldest go first.
-fn keep(queue: &mut VecDeque<SoundEvent>, sounds: Vec<SoundEvent>, kept: usize) {
-    queue.extend(sounds);
+fn keep<T>(queue: &mut VecDeque<T>, items: Vec<T>, kept: usize) {
+    queue.extend(items);
     let over = queue.len().saturating_sub(kept);
     queue.drain(..over);
 }

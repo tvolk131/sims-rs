@@ -7722,3 +7722,310 @@ fn round_28_init_placed_arrival_and_mesh_required_bones() {
         );
     }
 }
+
+#[test]
+fn round_29_ui_effect_events_catalog_bones_and_three_passes() {
+    use sims_vm::UiEffectEvent;
+    use std::cell::RefCell;
+
+    // 1. P1: UI Effect modes 0, 1, 2 emit `UiEffectEvent` with operand 4 bit 0
+    // (`0x476485`, `0x47690d` gated by `0x4768e8`, `0x4769c3`).
+    {
+        let (mut fx, _, record) = visitors();
+        let [lo, hi] = record.to_le_bytes();
+        let events = RefCell::new(Vec::new());
+        // Mode 0 (highlight = 1): emits Button + falls through to Mode 1 Portrait.
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                UI_EFFECT,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, scope::LITERAL, lo, hi, 1, 0, 0, 0],
+            )]),
+        );
+        let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.ui_effects = Some(&events);
+        assert_eq!(
+            interpreter.run_tree(&mut fx.world, LAMP, 4096, 0, &[], 1000),
+            Ok(true)
+        );
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                UiEffectEvent::Button {
+                    id: record,
+                    highlight: true
+                },
+                UiEffectEvent::Portrait {
+                    guid: WIDGET,
+                    highlight: true
+                },
+            ]
+        );
+
+        // Mode 1 (highlight = 0) and Mode 2 (highlight = 1, then 0):
+        events.borrow_mut().clear();
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![
+                ins(
+                    UI_EFFECT,
+                    1,
+                    RETURN_FALSE,
+                    [1, scope::LITERAL, lo, hi, 0, 0, 0, 0],
+                ),
+                ins(
+                    UI_EFFECT,
+                    2,
+                    RETURN_FALSE,
+                    [2, scope::LITERAL, lo, hi, 1, 0, 0, 0],
+                ),
+                ins(
+                    UI_EFFECT,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [2, scope::LITERAL, lo, hi, 0, 0, 0, 0],
+                ),
+            ]),
+        );
+        let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.ui_effects = Some(&events);
+        assert_eq!(
+            interpreter.run_tree(&mut fx.world, LAMP, 4096, 0, &[], 1000),
+            Ok(true)
+        );
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                UiEffectEvent::Portrait {
+                    guid: WIDGET,
+                    highlight: false
+                },
+                UiEffectEvent::Relationship {
+                    guid: WIDGET,
+                    highlight: true
+                },
+                UiEffectEvent::Relationship {
+                    guid: WIDGET,
+                    highlight: false
+                },
+            ]
+        );
+
+        // Mode 1 when 0x4e92a8 fails (no HEAD binding): must NOT emit Portrait.
+        let (mut fx2, _, rec2) = visitors();
+        fx2.program.people.portrait_head.insert(WIDGET, false);
+        let [lo2, hi2] = rec2.to_le_bytes();
+        let events2 = RefCell::new(Vec::new());
+        fx2.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                UI_EFFECT,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, scope::LITERAL, lo2, hi2, 1, 0, 0, 0],
+            )]),
+        );
+        let mut interp2 = sims_vm::Interpreter::new(&fx2.program, &fx2.catalog, fx2.stream);
+        interp2.ui_effects = Some(&events2);
+        assert_eq!(
+            interp2.run_tree(&mut fx2.world, LAMP, 4096, 0, &[], 1000),
+            Ok(true)
+        );
+        assert_eq!(
+            *events2.borrow(),
+            vec![UiEffectEvent::Button {
+                id: rec2,
+                highlight: true
+            }]
+        );
+    }
+
+    // 2. P2 #2: Lazy suits preserve the required mesh bones from whichever
+    // `.bcf` catalog loaded first at runtime (`0x59f34c..0x59f35f`), rather
+    // than overwriting or conflating them globally across catalogs.
+    let bone = |name: &str, parent: Option<usize>| sims_content::Bone {
+        name: name.into(),
+        parent,
+        translation: [0; 3],
+        rotation: [0, 0, 0, 1.0f32.to_bits()],
+        blends: false,
+    };
+    for load_a_first in [false, true] {
+        let (mut fx, _, widget_rec) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[8] = 0;
+        let sim_rec = fx.world.neighbors.slots.len() as i16 + 1;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: sim_rec,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let bones = vec![bone("PELVIS", None), bone("HEAD", Some(0))];
+        let scales = vec![0i32; bones.len()];
+        fx.program.people.skeletons.insert(
+            SIM_GUID,
+            sims_content::Skeleton {
+                name: "adult".into(),
+                file: "adult.bcf".into(),
+                place: 0,
+                scales: vec![scales],
+                bones,
+            },
+        );
+        fx.program
+            .people
+            .indexed_suits
+            .insert("trigger_a".into(), Ok("GameData/Skins/a.bcf".into()));
+        fx.program
+            .people
+            .indexed_suits
+            .insert("dup_head".into(), Ok("GameData/Skins/b.bcf".into()));
+        fx.program.people.indexed_suit_catalogs.insert(
+            "GameData/Skins/a.bcf".into(),
+            (
+                vec![("trigger_a".into(), false), ("dup_head".into(), true)],
+                None,
+            ),
+        );
+        fx.program.people.indexed_suit_head_bones.insert(
+            "GameData/Skins/a.bcf".into(),
+            BTreeMap::from([("dup_head".into(), vec![vec!["HEAD".into()]])]),
+        );
+        fx.program.people.indexed_suit_catalogs.insert(
+            "GameData/Skins/b.bcf".into(),
+            (vec![("dup_head".into(), true)], None),
+        );
+        fx.program.people.indexed_suit_head_bones.insert(
+            "GameData/Skins/b.bcf".into(),
+            BTreeMap::from([(
+                "dup_head".into(),
+                vec![vec!["HEAD".into(), "MISSING_BONE".into()]],
+            )]),
+        );
+        fx.program.people.profiles.insert(
+            WIDGET,
+            sims_content::Profile {
+                body: Some("trigger_a,tex".into()),
+                ..Default::default()
+            },
+        );
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            sims_content::Profile {
+                head: Some("dup_head,tex".into()),
+                ..Default::default()
+            },
+        );
+        if load_a_first {
+            // Trigger a.bcf to load at runtime via WIDGET's body before SIM
+            // resolves dup_head (matching 0x59f34c..0x59f35f first-load wins).
+            assert_eq!(
+                run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, widget_rec, 1),
+                Ok(true)
+            );
+            assert_eq!(
+                fx.world.loaded_indexed_suit_bones.get("dup_head"),
+                Some(&vec![vec!["HEAD".to_owned()]])
+            );
+        }
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_rec, 1),
+            Ok(true)
+        );
+        assert_eq!(
+            fx.world.portraits.contains(&SIM_GUID),
+            load_a_first,
+            "duplicate lazy suit must use first-loaded catalog's mesh bones \
+             (load_a_first={load_a_first})"
+        );
+    }
+
+    // 3. P2 #3 (`0x4e733b..0x4e7411`): portrait generation runs 3 forced
+    // dressing passes. If pass 0 misses `sib_head` (not in `indexed_suits`)
+    // and then binds `lazy_body` which loads `body.bcf` registering `sib_head`
+    // as a sibling, pass 0 fails (`[ebp - 0xd] = 0`, so the first call does
+    // not cache the portrait), while pass 1 attaches `sib_head` into
+    // `person_outfits[SIM].head` so a second call succeeds on all 3 passes.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[8] = 0;
+        let sim_rec = fx.world.neighbors.slots.len() as i16 + 1;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: sim_rec,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        fx.program
+            .people
+            .indexed_suits
+            .insert("lazy_body".into(), Ok("GameData/Skins/body.bcf".into()));
+        fx.program.people.indexed_suit_catalogs.insert(
+            "GameData/Skins/body.bcf".into(),
+            (
+                vec![("lazy_body".into(), false), ("sib_head".into(), true)],
+                None,
+            ),
+        );
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            sims_content::Profile {
+                body: Some("lazy_body,tex".into()),
+                head: Some("sib_head,tex".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_rec, 1),
+            Ok(true)
+        );
+        assert!(
+            !fx.world.portraits.contains(&SIM_GUID),
+            "pass 0 missed sib_head so 0x4e73a5 cleared [ebp - 0xd] on first call"
+        );
+        assert_eq!(
+            fx.world
+                .person_outfits
+                .get(&SIM)
+                .and_then(|o| o.head.as_ref())
+                .map(|b| b.suit.as_str()),
+            Some("sib_head"),
+            "pass 1 (0x4e733b..0x4e7411) must attach sibling head loaded by pass 0's body"
+        );
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_rec, 1),
+            Ok(true)
+        );
+        assert!(
+            fx.world.portraits.contains(&SIM_GUID),
+            "second call must succeed across all 3 passes now that sib_head is bound"
+        );
+    }
+}

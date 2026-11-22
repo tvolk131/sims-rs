@@ -137,6 +137,11 @@ pub struct People {
     /// lookups (`0x5a044d` → `0x5a38da` → `0x59f35f`) can populate unloaded
     /// sibling appearance entries in exact runtime call order.
     pub indexed_suit_catalogs: BTreeMap<String, IndexedSuitCatalog>,
+    /// Per-catalog required `"HEAD"` mesh bone lists for each `.bcf` catalog
+    /// in [`People::indexed_suit_catalogs`] (`catalog_location -> suit_name ->
+    /// Vec<Vec<String>>`), so runtime loads (`0x59f34c..0x59f35f`) preserve the
+    /// first-loaded catalog's mesh requirements (`0x599f8a..0x59a01c`).
+    pub indexed_suit_head_bones: BTreeMap<String, BTreeMap<String, Vec<Vec<String>>>>,
     /// Each avatar catalog or index in the original's search paths whose
     /// skeletons or suits stopped decoding, by location, with the error:
     /// its suits after that point are missing from `suits`.
@@ -249,6 +254,7 @@ pub struct AvatarRegistry {
     indexed_suits: BTreeMap<String, std::result::Result<String, String>>,
     indexed_catalogs: BTreeMap<String, IndexedCatalog>,
     indexed_suit_catalogs: BTreeMap<String, IndexedSuitCatalog>,
+    indexed_suit_head_bones: BTreeMap<String, BTreeMap<String, Vec<Vec<String>>>>,
     head_suits: BTreeSet<String>,
     head_mesh_bones: BTreeMap<String, Vec<Vec<String>>>,
     suit_errors: BTreeMap<String, String>,
@@ -419,6 +425,8 @@ impl AvatarRegistry {
             BTreeMap::new();
         let mut indexed_catalogs: BTreeMap<String, IndexedCatalog> = BTreeMap::new();
         let mut indexed_suit_catalogs: BTreeMap<String, IndexedSuitCatalog> = BTreeMap::new();
+        let mut indexed_suit_head_bones: BTreeMap<String, BTreeMap<String, Vec<Vec<String>>>> =
+            BTreeMap::new();
         let mut by_catalog: BTreeMap<String, (Resource, Vec<String>, bool)> = BTreeMap::new();
         for (name, (ndx_location, directory, catalog_bcf)) in indexed_suit_entries {
             match paths.files.lookup(&directory, &catalog_bcf) {
@@ -525,6 +533,7 @@ impl AvatarRegistry {
                 }
             };
             let mut catalog_heads = Vec::with_capacity(catalog_suit_order.len());
+            let mut catalog_head_bones: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
             for suit_name in &catalog_suit_order {
                 let valid_meshes: Vec<Vec<String>> = catalog_head_bindings
                     .get(suit_name)
@@ -537,11 +546,12 @@ impl AvatarRegistry {
                     .unwrap_or_default();
                 let has_head = !valid_meshes.is_empty();
                 if has_head {
-                    head_mesh_bones
-                        .entry(suit_name.clone())
-                        .or_insert(valid_meshes);
+                    catalog_head_bones.insert(suit_name.clone(), valid_meshes);
                 }
                 catalog_heads.push((suit_name.clone(), has_head));
+            }
+            if !catalog_head_bones.is_empty() {
+                indexed_suit_head_bones.insert(location.clone(), catalog_head_bones);
             }
             indexed_suit_catalogs.insert(location, (catalog_heads, app_error));
             for name in names {
@@ -592,6 +602,7 @@ impl AvatarRegistry {
             indexed_suits,
             indexed_catalogs,
             indexed_suit_catalogs,
+            indexed_suit_head_bones,
             head_suits,
             head_mesh_bones,
             suit_errors,
@@ -977,6 +988,7 @@ impl People {
                 eager_suits: registry.eager_suits,
                 indexed_suits: registry.indexed_suits,
                 indexed_suit_catalogs: registry.indexed_suit_catalogs,
+                indexed_suit_head_bones: registry.indexed_suit_head_bones,
                 suit_errors: registry.suit_errors,
                 head_suits: registry.head_suits,
                 head_mesh_bones: registry.head_mesh_bones,
@@ -998,13 +1010,43 @@ impl People {
         has_head: bool,
         skeleton: Option<&Skeleton>,
     ) -> bool {
-        suit_head_matches_skeleton_parts(&self.head_mesh_bones, suit, has_head, skeleton)
+        self.suit_head_matches_skeleton_with_bones(
+            suit,
+            has_head,
+            self.head_mesh_bones.get(suit).map(Vec::as_slice),
+            skeleton,
+        )
+    }
+
+    /// Like [`People::suit_head_matches_skeleton`], using an explicit
+    /// catalog-specific `mesh_bones` override when available (for runtime-loaded
+    /// `.ndx` catalogs where first registration wins at `0x59f34c..0x59f35f`).
+    pub fn suit_head_matches_skeleton_with_bones(
+        &self,
+        _suit: &str,
+        has_head: bool,
+        mesh_bones: Option<&[Vec<String>]>,
+        skeleton: Option<&Skeleton>,
+    ) -> bool {
+        suit_head_matches_skeleton_bones(mesh_bones, has_head, skeleton)
     }
 }
 
 fn suit_head_matches_skeleton_parts(
     head_mesh_bones: &BTreeMap<String, Vec<Vec<String>>>,
     suit: &str,
+    has_head: bool,
+    skeleton: Option<&Skeleton>,
+) -> bool {
+    suit_head_matches_skeleton_bones(
+        head_mesh_bones.get(suit).map(Vec::as_slice),
+        has_head,
+        skeleton,
+    )
+}
+
+fn suit_head_matches_skeleton_bones(
+    mesh_bones: Option<&[Vec<String>]>,
     has_head: bool,
     skeleton: Option<&Skeleton>,
 ) -> bool {
@@ -1020,7 +1062,7 @@ fn suit_head_matches_skeleton_parts(
     if !skel.bones.iter().any(|b| b.name == "HEAD") {
         return false;
     }
-    let Some(meshes) = head_mesh_bones.get(suit) else {
+    let Some(meshes) = mesh_bones else {
         return true;
     };
     meshes.iter().any(|req_bones| {

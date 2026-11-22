@@ -266,6 +266,7 @@ impl Interpreter<'_> {
             files: world.skeleton_files.clone(),
             loaded_skeletons: world.loaded_indexed_skeletons.clone(),
             loaded_suits: world.loaded_indexed_suits.clone(),
+            loaded_suit_bones: world.loaded_indexed_suit_bones.clone(),
             runtime_added_suits: world.runtime_added_suits.clone(),
         };
         let expansions = world.globals.get(20).copied().unwrap_or(0);
@@ -328,6 +329,7 @@ impl Interpreter<'_> {
                 let mut reg = crate::people::RegistryMut {
                     loaded_skeletons: &mut registry.loaded_skeletons,
                     loaded_suits: &mut registry.loaded_suits,
+                    loaded_suit_bones: &mut registry.loaded_suit_bones,
                     runtime_added_suits: &mut registry.runtime_added_suits,
                     draws: &mut registry.draws,
                     files: &mut registry.files,
@@ -433,6 +435,7 @@ impl Interpreter<'_> {
             files,
             loaded_skeletons,
             loaded_suits,
+            loaded_suit_bones,
             runtime_added_suits,
         } = registry;
         let count = draws.count;
@@ -440,6 +443,7 @@ impl Interpreter<'_> {
         world.skeleton_files = files;
         world.loaded_indexed_skeletons = loaded_skeletons;
         world.loaded_indexed_suits = loaded_suits;
+        world.loaded_indexed_suit_bones = loaded_suit_bones;
         world.runtime_added_suits = runtime_added_suits;
         world.person_outfits.extend(person_outfits);
         for guid in dirtied_portraits {
@@ -609,6 +613,7 @@ struct SavedPersonRegistry<'a> {
     files: BTreeSet<String>,
     loaded_skeletons: BTreeMap<String, Option<String>>,
     loaded_suits: BTreeMap<String, Option<bool>>,
+    loaded_suit_bones: BTreeMap<String, Vec<Vec<String>>>,
     runtime_added_suits: Vec<String>,
 }
 
@@ -626,6 +631,7 @@ fn construct_person(
         let mut reg = crate::people::RegistryMut {
             loaded_skeletons: &mut registry.loaded_skeletons,
             loaded_suits: &mut registry.loaded_suits,
+            loaded_suit_bones: &mut registry.loaded_suit_bones,
             runtime_added_suits: &mut registry.runtime_added_suits,
             draws: &mut registry.draws,
             files: &mut registry.files,

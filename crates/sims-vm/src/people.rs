@@ -298,6 +298,7 @@ fn lookup_loaded_skeleton_by_name<'p>(
 pub(crate) struct RegistryMut<'a, 'b> {
     pub loaded_skeletons: &'a mut std::collections::BTreeMap<String, Option<String>>,
     pub loaded_suits: &'a mut std::collections::BTreeMap<String, Option<bool>>,
+    pub loaded_suit_bones: &'a mut std::collections::BTreeMap<String, Vec<Vec<String>>>,
     pub runtime_added_suits: &'a mut Vec<String>,
     pub draws: &'a mut crate::objects::Draws<'b>,
     pub files: &'a mut BTreeSet<String>,
@@ -336,9 +337,14 @@ fn load_indexed_bcf_catalog_into(people: &People, loc: &str, reg: &mut RegistryM
         }
     }
     if let Some((catalog_heads, _)) = people.indexed_suit_catalogs.get(loc) {
+        let catalog_bones = people.indexed_suit_head_bones.get(loc);
         for (app_name, has_head) in catalog_heads {
             if !people.eager_suits.contains(app_name) && !reg.loaded_suits.contains_key(app_name) {
                 reg.loaded_suits.insert(app_name.clone(), Some(*has_head));
+                if let Some(bones) = catalog_bones.and_then(|m| m.get(app_name)) {
+                    reg.loaded_suit_bones
+                        .insert(app_name.clone(), bones.clone());
+                }
                 // 0x59f320 -> 0x5a1fb1: appearances not already present in the
                 // startup eager or `.ndx` hash table are inserted as new nodes.
                 if !people.indexed_suits.contains_key(app_name)
@@ -438,6 +444,7 @@ pub(crate) fn resolve_skeleton_by_name<'p>(
     let mut reg = RegistryMut {
         loaded_skeletons: &mut world.loaded_indexed_skeletons,
         loaded_suits: &mut world.loaded_indexed_suits,
+        loaded_suit_bones: &mut world.loaded_indexed_suit_bones,
         runtime_added_suits: &mut world.runtime_added_suits,
         draws: &mut draws,
         files: &mut world.skeleton_files,
@@ -643,11 +650,34 @@ pub(crate) fn resolve_suit(people: &People, world: &mut World, suit: &str) -> Re
     let mut reg = RegistryMut {
         loaded_skeletons: &mut world.loaded_indexed_skeletons,
         loaded_suits: &mut world.loaded_indexed_suits,
+        loaded_suit_bones: &mut world.loaded_indexed_suit_bones,
         runtime_added_suits: &mut world.runtime_added_suits,
         draws: &mut draws,
         files: &mut world.skeleton_files,
     };
     resolve_suit_into(people, suit, &mut reg)
+}
+
+/// Whether `suit` has a `"HEAD"` mesh binding whose required bones all exist
+/// in `skeleton` (`0x599f8a..0x59a01c`), using the winning runtime-loaded
+/// `.bcf` catalog's mesh requirements (`World::loaded_indexed_suit_bones`,
+/// `0x59f34c..0x59f35f`) for lazy suits and `People::head_mesh_bones` for
+/// eager or synthetic suits.
+pub(crate) fn suit_head_matches_skeleton(
+    people: &People,
+    world: &World,
+    suit: &str,
+    has_head: bool,
+    skeleton: Option<&Skeleton>,
+) -> bool {
+    let mesh_bones = if people.eager_suits.contains(suit) {
+        people.head_mesh_bones.get(suit).map(Vec::as_slice)
+    } else if world.loaded_indexed_suits.contains_key(suit) {
+        world.loaded_indexed_suit_bones.get(suit).map(Vec::as_slice)
+    } else {
+        people.head_mesh_bones.get(suit).map(Vec::as_slice)
+    };
+    people.suit_head_matches_skeleton_with_bones(suit, has_head, mesh_bones, skeleton)
 }
 
 /// Reads person `id`'s appearance again if its animator says it is to be

@@ -1036,11 +1036,13 @@ impl Machine<'_, '_> {
     fn classify_suit_head(&self, guid: u32, suit: &str) -> Option<bool> {
         if self.program.people.head_suits.contains(suit) {
             let skel = crate::people::skeleton(&self.program.people, self.world, guid).ok();
-            Some(
-                self.program
-                    .people
-                    .suit_head_matches_skeleton(suit, true, skel),
-            )
+            Some(crate::people::suit_head_matches_skeleton(
+                &self.program.people,
+                self.world,
+                suit,
+                true,
+                skel,
+            ))
         } else if !self.program.people.suit_errors.is_empty()
             && !self.program.people.suits.contains(suit)
         {

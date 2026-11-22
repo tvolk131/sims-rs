@@ -1338,6 +1338,35 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
             (b"BMP_", 2002, 0x0010, make_2x2_rle(2, &[3, 0, 0, 1])),
         ]),
     );
+    // 10. 1x1 RLE8 with a 2-pixel run fits a 4-byte DWORD-aligned 16-bit
+    // surface pitch (`pitch = 2` pixels at `0x4def16`/`0x4def3d`), while a
+    // 3-pixel run overflows it.
+    let make_1x1_rle = |rle: &[u8]| {
+        let mut bmp = vec![0u8; 54 + 4 + rle.len()];
+        bmp[0..54].copy_from_slice(&tiny_bmp()[..54]);
+        bmp[10..14].copy_from_slice(&58u32.to_le_bytes());
+        bmp[28..30].copy_from_slice(&8u16.to_le_bytes());
+        bmp[30..34].copy_from_slice(&1u32.to_le_bytes());
+        bmp[46..50].copy_from_slice(&1u32.to_le_bytes());
+        bmp[58..].copy_from_slice(rle);
+        bmp
+    };
+    let rle_1x1_pitch_ok_guid = 0x9000_000eu32;
+    dir.file(
+        "GameData/Objects/rle_1x1_pitch_ok.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_1x1_pitch_ok_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, make_1x1_rle(&[2, 0, 0, 1])),
+        ]),
+    );
+    let rle_1x1_pitch_oob_guid = 0x9000_000fu32;
+    dir.file(
+        "GameData/Objects/rle_1x1_pitch_oob.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(rle_1x1_pitch_oob_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, make_1x1_rle(&[3, 0, 0, 1])),
+        ]),
+    );
 
     let install = Install::detect(&dir.0).unwrap();
     let index = Index::build(&install).unwrap();
@@ -1359,6 +1388,8 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
             rle_bu_wrap_guid,
             rle_td_oob_guid,
             rle_bu_oob_guid,
+            rle_1x1_pitch_ok_guid,
+            rle_1x1_pitch_oob_guid,
         ],
     )
     .unwrap();
@@ -1384,4 +1415,6 @@ fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
     assert!(lib(rle_bu_wrap_guid).has_portrait_2002);
     assert!(!lib(rle_td_oob_guid).has_portrait_2002);
     assert!(!lib(rle_bu_oob_guid).has_portrait_2002);
+    assert!(lib(rle_1x1_pitch_ok_guid).has_portrait_2002);
+    assert!(!lib(rle_1x1_pitch_oob_guid).has_portrait_2002);
 }

@@ -1469,23 +1469,27 @@ fn is_native_portrait_bmp(data: &[u8]) -> bool {
     };
     if compression == 1 {
         // 0x4def0c..0x4df014 decodes RLE8 directly into a linear 16-bit
-        // DirectDraw surface (`row_step = +pitch_px` for top-down,
-        // `-pitch_px` for bottom-up, starting at row `0` or `h - 1`). Runs
+        // DirectDraw surface (`ebx = lPitch >> 1`, DWORD-aligned so
+        // `pitch = (w + 1) & !1`; `row_step = +pitch` for top-down,
+        // `-pitch` for bottom-up, starting at row `0` or `h - 1`). Runs
         // advance `edx` linearly without checking logical row width, so a run
-        // that crosses a scanline still succeeds whenever every written pixel
-        // stays within `[0, w * h)`.
-        let Some(total) = w.checked_mul(h).and_then(|n| isize::try_from(n).ok()) else {
+        // that crosses a scanline or fills row padding still succeeds whenever
+        // every written pixel stays within `[0, pitch * h)`.
+        let Some(pitch) = w.checked_add(1).map(|n| n & !1) else {
             return false;
         };
-        let Ok(w_isize) = isize::try_from(w) else {
+        let Some(total) = pitch.checked_mul(h).and_then(|n| isize::try_from(n).ok()) else {
+            return false;
+        };
+        let Ok(pitch_isize) = isize::try_from(pitch) else {
             return false;
         };
         let top_down = raw_height < 0;
-        let row_step = if top_down { w_isize } else { -w_isize };
+        let row_step = if top_down { pitch_isize } else { -pitch_isize };
         let mut row_start = if top_down {
             0
         } else {
-            (h as isize - 1) * w_isize
+            (h as isize - 1) * pitch_isize
         };
         let mut cursor = row_start;
         let mut pos = 0usize;

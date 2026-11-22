@@ -67,6 +67,20 @@ impl View {
         [self.size[0] / 2, self.size[1] / 2]
     }
 
+    /// The lot tile at the middle of the canvas, for
+    /// [`sims_vm::boot::Lot::set_view_centre`] (`0x434865` → `0x4a677c`).
+    pub fn centre_tile(&self) -> [i8; 2] {
+        let fine = self.camera.unproject_fine(self.middle());
+        [
+            fine[0]
+                .div_euclid(16)
+                .clamp(i32::from(i8::MIN), i32::from(i8::MAX)) as i8,
+            fine[1]
+                .div_euclid(16)
+                .clamp(i32::from(i8::MIN), i32::from(i8::MAX)) as i8,
+        ]
+    }
+
     /// Resizes the canvas, keeping the lot point in the middle there.
     pub fn resize(&mut self, size: [i32; 2]) {
         let fine = self.camera.unproject_fine(self.middle());
@@ -218,5 +232,14 @@ mod tests {
         v.apply(Move::ZoomIn);
         assert!(v.masks_rebuilt(3));
         assert!(!v.masks_rebuilt(3));
+    }
+
+    #[test]
+    fn centre_tile_follows_the_middle_of_the_canvas() {
+        let mut v = View::new([800, 600], [32 * 16 + 8, 24 * 16 + 8], 0);
+        assert_eq!(v.centre_tile(), [32, 24]);
+        let before = v.centre_tile();
+        assert!(v.apply(Move::Scroll([128, 64])));
+        assert_ne!(v.centre_tile(), before);
     }
 }

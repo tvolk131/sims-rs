@@ -27,6 +27,7 @@ use crate::Trap;
 use crate::interpreter::{Asked, AtOnce, Interpreter, Machine, Status};
 use crate::orders::Checking;
 use crate::placement::{Kept, Pending, Refreshing};
+use crate::primitives::ui_effect::UiEffectEvent;
 use crate::sounds::SoundEvent;
 use sims_formats::saved_objects::Interaction;
 use sims_sim::World;
@@ -43,6 +44,7 @@ pub(crate) struct Cells {
     asked: Option<RefCell<Vec<Asked>>>,
     deleted: Option<RefCell<Vec<u16>>>,
     sounds: Option<RefCell<Vec<SoundEvent>>>,
+    ui_effects: Option<RefCell<Vec<UiEffectEvent>>>,
     masks_rebuilt: Option<Cell<u8>>,
     menu: Option<RefCell<Checking>>,
     /// The action of `running_at_once`.
@@ -113,6 +115,7 @@ impl Cells {
             asked: copy(interpreter.asked),
             deleted: copy(interpreter.deleted),
             sounds: copy(interpreter.sounds),
+            ui_effects: copy(interpreter.ui_effects),
             masks_rebuilt: interpreter.masks_rebuilt.map(|c| Cell::new(c.get())),
             menu: copy(interpreter.menu),
             action: copy(interpreter.running_at_once.map(|a| a.action)),
@@ -129,6 +132,7 @@ impl Cells {
             asked: self.asked.as_ref(),
             deleted: self.deleted.as_ref(),
             sounds: self.sounds.as_ref(),
+            ui_effects: self.ui_effects.as_ref(),
             masks_rebuilt: self.masks_rebuilt.as_ref(),
             menu: self.menu.as_ref(),
             running_at_once: interpreter.running_at_once.zip(self.action.as_ref()).map(
@@ -151,6 +155,7 @@ impl Cells {
             asked: copy(self.asked.as_ref()),
             deleted: copy(self.deleted.as_ref()),
             sounds: copy(self.sounds.as_ref()),
+            ui_effects: copy(self.ui_effects.as_ref()),
             masks_rebuilt: self.masks_rebuilt.as_ref().map(|c| Cell::new(c.get())),
             menu: copy(self.menu.as_ref()),
             action: copy(self.action.as_ref()),
@@ -166,6 +171,7 @@ impl Cells {
         alike(&self.asked, &other.asked, PartialEq::eq)
             && alike(&self.deleted, &other.deleted, PartialEq::eq)
             && alike(&self.sounds, &other.sounds, PartialEq::eq)
+            && alike(&self.ui_effects, &other.ui_effects, PartialEq::eq)
             && self.masks_rebuilt.as_ref().map(Cell::get)
                 == other.masks_rebuilt.as_ref().map(Cell::get)
             && alike(&self.menu, &other.menu, same_checking)
@@ -189,6 +195,7 @@ impl Cells {
         let asked = take(interpreter.asked);
         let deleted = take(interpreter.deleted);
         let sounds = take(interpreter.sounds);
+        let ui_effects = take(interpreter.ui_effects);
         let menu = take(interpreter.menu);
         let action = take(interpreter.running_at_once.map(|a| a.action));
         let letting_go = take(interpreter.letting_go);
@@ -198,6 +205,7 @@ impl Cells {
         put(asked, self.asked);
         put(deleted, self.deleted);
         put(sounds, self.sounds);
+        put(ui_effects, self.ui_effects);
         if let (Some(held), Some(copy)) = (interpreter.masks_rebuilt, self.masks_rebuilt) {
             held.set(copy.get());
         }
@@ -221,6 +229,7 @@ pub(crate) struct LotSnapshot {
     ambiguous_portraits: BTreeSet<u32>,
     loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
     loaded_indexed_suits: BTreeMap<String, Option<bool>>,
+    loaded_indexed_suit_bones: BTreeMap<String, Vec<Vec<String>>>,
     made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
     person_outfits: BTreeMap<u16, sims_sim::PersonOutfit>,
     scratch_ptr_set: BTreeSet<u16>,
@@ -246,6 +255,7 @@ impl LotSnapshot {
             ambiguous_portraits: w.ambiguous_portraits.clone(),
             loaded_indexed_skeletons: w.loaded_indexed_skeletons.clone(),
             loaded_indexed_suits: w.loaded_indexed_suits.clone(),
+            loaded_indexed_suit_bones: w.loaded_indexed_suit_bones.clone(),
             made_outfits: w.made_outfits.clone(),
             person_outfits: w.person_outfits.clone(),
             scratch_ptr_set: w.scratch_ptr_set.clone(),
@@ -278,6 +288,7 @@ pub(crate) fn same_lot(a: &World, b: &World) -> bool {
         && a.ambiguous_portraits == b.ambiguous_portraits
         && a.loaded_indexed_skeletons == b.loaded_indexed_skeletons
         && a.loaded_indexed_suits == b.loaded_indexed_suits
+        && a.loaded_indexed_suit_bones == b.loaded_indexed_suit_bones
         && a.made_outfits == b.made_outfits
         && a.person_outfits == b.person_outfits
         && a.scratch_ptr_set == b.scratch_ptr_set
@@ -304,6 +315,7 @@ impl<'a> Machine<'a, '_> {
             asked: interpreter.asked,
             deleted: interpreter.deleted,
             sounds: interpreter.sounds,
+            ui_effects: interpreter.ui_effects,
             masks_rebuilt: interpreter.masks_rebuilt,
             base: self.base,
             synchronous: self.synchronous,
@@ -418,6 +430,7 @@ mod tests {
             asked: None,
             deleted: None,
             sounds: None,
+            ui_effects: None,
             masks_rebuilt: None,
             menu: Some(RefCell::new(Checking {
                 action: action(menu_bits),

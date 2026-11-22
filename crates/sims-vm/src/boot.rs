@@ -733,6 +733,7 @@ impl Lot {
                     }
                 }
                 if let Some((suits, _)) = program.people.indexed_suit_catalogs.get(file) {
+                    let catalog_bones = program.people.indexed_suit_head_bones.get(file);
                     for (app_name, has_head) in suits {
                         if !program.people.eager_suits.contains(app_name)
                             && !world.loaded_indexed_suits.contains_key(app_name)
@@ -740,6 +741,11 @@ impl Lot {
                             world
                                 .loaded_indexed_suits
                                 .insert(app_name.clone(), Some(*has_head));
+                            if let Some(bones) = catalog_bones.and_then(|m| m.get(app_name)) {
+                                world
+                                    .loaded_indexed_suit_bones
+                                    .insert(app_name.clone(), bones.clone());
+                            }
                             if !program.people.indexed_suits.contains_key(app_name)
                                 && !world.runtime_added_suits.contains(app_name)
                             {
@@ -1047,9 +1053,11 @@ impl Lot {
         let tuning = self.tuning.as_ref().ok_or(StepError::Incomplete)?;
         let asks = self.asks;
         let sounds = RefCell::new(Vec::new());
+        let ui_effects = RefCell::new(Vec::new());
         let masks_rebuilt = Cell::new(0);
         let interpreter = Interpreter {
             sounds: Some(&sounds),
+            ui_effects: Some(&ui_effects),
             masks_rebuilt: Some(&masks_rebuilt),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -1112,6 +1120,7 @@ impl Lot {
                     // it: the errors caught, a skipped first frame, and
                     // the sounds.
                     update.sounds = sounds.take();
+                    update.ui_effects = ui_effects.take();
                     update.masks_rebuilt = masks_rebuilt.get();
                     StepError::Tick {
                         tick,
@@ -1149,6 +1158,7 @@ impl Lot {
         // The step's sounds go with its update whether or not the frame
         // failed.
         update.sounds = sounds.into_inner();
+        update.ui_effects = ui_effects.into_inner();
         update.masks_rebuilt = masks_rebuilt.get();
         if let Some(error) = frame {
             if play {

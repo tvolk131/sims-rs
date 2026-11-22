@@ -75,6 +75,27 @@ use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
 use sims_sim::PortraitFile;
 
+/// A HUD highlight change requested by UI Effect (opcode 34, `0x44acff`).
+///
+/// Like [`crate::SoundEvent`], highlight requests are recorded in a sink
+/// ([`crate::Interpreter::ui_effects`], returned in [`crate::Update::ui_effects`])
+/// without mutating [`sims_sim::World`] or changing its hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiEffectEvent {
+    /// Mode 0 (`0x44ad3f` → `0x476468` → `0x476485`): toggle highlight on the
+    /// `cTSWinBtn` whose control ID (`[ecx + 0x30]`) equals `i32::from(id)`.
+    /// Mode 0 then falls through into mode 1 (`0x44ad61`).
+    Button { id: i16, highlight: bool },
+    /// Mode 1 (`0x44ad61` → `0x47689c` → `0x47690d`): toggle highlight on the
+    /// portrait button matching `guid`, emitted only when `0x4e92a8` succeeds
+    /// (`0x4768e8`).
+    Portrait { guid: u32, highlight: bool },
+    /// Mode 2 (`0x44ad1f` → `0x476984` → `0x4769c3`): toggle highlight on
+    /// `cWinRelationship` for neighbor `guid`, emitted whenever the neighbor
+    /// record exists (`0x476997`).
+    Relationship { guid: u32, highlight: bool },
+}
+
 /// Scope 6: global words.
 const GLOBAL_SCOPE: u8 = 6;
 
@@ -108,7 +129,9 @@ fn portrait_head_status_in(
             if let Some(raw) = made.strings.get(&row) {
                 has_suit_override = true;
                 if extract_suit_name(raw).is_some_and(|suit| {
-                    program.people.suit_head_matches_skeleton(
+                    crate::people::suit_head_matches_skeleton(
+                        &program.people,
+                        world,
                         &suit,
                         program.people.head_suits.contains(&suit),
                         skel,
@@ -155,13 +178,28 @@ fn combine_head_status(a: Option<bool>, b: Option<bool>) -> Option<bool> {
     }
 }
 
-/// Whether the renderer (`0x4e725f` → `0x4e7801` → `0x58a178(1)` → `0x4e7817`
-/// → `0x4e810d` → `0x4e81a4` → `0x431726` → `0x4e7824`) finds a
-/// case-sensitive `"HEAD"` binding on the specific Sim `person_id` in `world`.
+/// Combines per-pass results across the three portrait mood passes
+/// (`0x4e733b..0x4e7411`): `[ebp - 0xd]` starts `true` and becomes `false` if
+/// any pass fails (`0x4e73a1..0x4e73a5`).
+fn combine_pass_status(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+/// Whether the renderer (`0x4e725f` → 3 passes at `0x4e733b..0x4e7411` of
+/// `0x4e77c6` → `0x4e7801` → `0x58a178(1)` → `0x4e7817` → `0x4e810d` →
+/// `0x4e81a4` → `0x431726` → `0x4e7824`) finds a case-sensitive `"HEAD"`
+/// binding on the specific Sim `person_id` in `world` across all three passes.
 ///
-/// Executes [`crate::outfits::dress_person`] with `force = true` (`0x4e7801`),
-/// checks the skeleton's `"HEAD"` bone (`0x595674`), and inspects the Sim's
-/// actually attached slots (`World::person_outfits`) and accessories.
+/// Executes [`crate::outfits::dress_person`] with `force = true` (`0x4e7801`)
+/// three times (even if pass 0 lacks `"HEAD"`, matching `0x4e733b..0x4e7411` so
+/// sibling suits loaded on pass 0 attach on pass 1), checks the skeleton's
+/// `"HEAD"` bone (`0x595674`) and mesh required bones (`0x599f8a..0x59a01c`),
+/// and inspects the Sim's actually attached slots (`World::person_outfits`) and
+/// accessories.
 pub(crate) fn can_render_person_portrait(
     catalog: &sims_content::Catalog,
     program: &crate::Program,
@@ -172,96 +210,113 @@ pub(crate) fn can_render_person_portrait(
     caller: &str,
 ) -> Result<Option<bool>, Trap> {
     let had_outfit_before = world.person_outfits.contains_key(&person_id);
-    // 0x4e7801 -> 0x58a178(1): run full forced dressing BEFORE 0x4e7824 checks
-    // for a usable "HEAD" bone.
-    crate::outfits::dress_person(catalog, program, world, person_id, true)?;
+    let mut overall = Some(true);
+    for _ in 0..3 {
+        // 0x4e7801 -> 0x58a178(1): run full forced dressing BEFORE 0x4e7824 checks
+        // for a usable "HEAD" bone.
+        crate::outfits::dress_person(catalog, program, world, person_id, true)?;
 
-    // 0x595674..0x595699 (checked at 0x4e7824 AFTER 0x4e7801 -> 0x58a178): a
-    // "HEAD" binding attaches only when the Sim's skeleton defines a bone named
-    // "HEAD" AND every bone required by the binding's mesh (`0x599f8a..0x59a01c`).
-    // A decoded zero-bone skeleton (`scales[place].is_empty()`) has no "HEAD"
-    // bone and returns false; synthetic fixtures with non-empty scales and
-    // omitted `bones` skip this check.
-    let skel = crate::people::skeleton(&program.people, world, guid).ok();
-    if let Some(skel) = skel
-        && (!skel.bones.is_empty() || skel.scales.get(skel.place).is_some_and(Vec::is_empty))
-        && !skel.bones.iter().any(|b| b.name == "HEAD")
-    {
-        return Ok(Some(false));
-    }
-
-    // Inspect actually attached slots (`[ebx + 0x258]`, `[ebx + 0x25c]`,
-    // `[ebx + 0x268]`, and `[ebx + 0x274]` accessories).
-    let mut any_slot_bound = false;
-    let mut status = Some(false);
-    let mut has_bound_accessories = false;
-    if let Some(outfit) = world.person_outfits.get(&person_id) {
-        for bound in [
-            &outfit.head,
-            &outfit.body,
-            &outfit.body_alt,
-            &outfit.extra_left,
-            &outfit.extra_right,
-        ]
-        .into_iter()
-        .flatten()
-        .chain(&outfit.accessories)
+        // 0x595674..0x595699 (checked at 0x4e7824 AFTER 0x4e7801 -> 0x58a178): a
+        // "HEAD" binding attaches only when the Sim's skeleton defines a bone named
+        // "HEAD" AND every bone required by the binding's mesh (`0x599f8a..0x59a01c`).
+        // A decoded zero-bone skeleton (`scales[place].is_empty()`) has no "HEAD"
+        // bone and returns false; synthetic fixtures with non-empty scales and
+        // omitted `bones` skip this check.
+        let skel = crate::people::skeleton(&program.people, world, guid).ok();
+        let pass_status = if let Some(skel) = skel
+            && (!skel.bones.is_empty() || skel.scales.get(skel.place).is_some_and(Vec::is_empty))
+            && !skel.bones.iter().any(|b| b.name == "HEAD")
         {
-            any_slot_bound = true;
-            let bound_head = bound.has_head.map(|h| {
-                program
-                    .people
-                    .suit_head_matches_skeleton(&bound.suit.to_ascii_lowercase(), h, skel)
-            });
-            status = combine_head_status(status, bound_head);
-        }
-        has_bound_accessories = !outfit.accessories.is_empty();
-    }
-    // Fallback only for synthetic fixtures that directly populate
-    // `person.accessories` on a Sim with no pre-existing `PersonOutfit` entry.
-    if !had_outfit_before
-        && !has_bound_accessories
-        && let Some(accessories) = world
-            .objects
-            .get(&person_id)
-            .and_then(|o| o.person.as_ref())
-            .map(|p| &p.accessories)
-    {
-        for acc in accessories {
-            if acc.name.is_empty() {
-                continue;
-            }
-            let lower = acc.name.to_ascii_lowercase();
-            let acc_status = match crate::people::peek_suit_head(&program.people, world, &lower) {
-                crate::people::ResolvedSuit::Found(h) => {
-                    Some(program.people.suit_head_matches_skeleton(&lower, h, skel))
+            Some(false)
+        } else {
+            // Inspect actually attached slots (`[ebx + 0x258]`, `[ebx + 0x25c]`,
+            // `[ebx + 0x268]`, and `[ebx + 0x274]` accessories).
+            let mut any_slot_bound = false;
+            let mut status = Some(false);
+            let mut has_bound_accessories = false;
+            if let Some(outfit) = world.person_outfits.get(&person_id) {
+                for bound in [
+                    &outfit.head,
+                    &outfit.body,
+                    &outfit.body_alt,
+                    &outfit.extra_left,
+                    &outfit.extra_right,
+                ]
+                .into_iter()
+                .flatten()
+                .chain(&outfit.accessories)
+                {
+                    any_slot_bound = true;
+                    let bound_head = bound.has_head.map(|h| {
+                        crate::people::suit_head_matches_skeleton(
+                            &program.people,
+                            world,
+                            &bound.suit.to_ascii_lowercase(),
+                            h,
+                            skel,
+                        )
+                    });
+                    status = combine_head_status(status, bound_head);
                 }
-                crate::people::ResolvedSuit::Missing => Some(false),
-                crate::people::ResolvedSuit::Unknown => None,
+                has_bound_accessories = !outfit.accessories.is_empty();
+            }
+            // Fallback only for synthetic fixtures that directly populate
+            // `person.accessories` on a Sim with no pre-existing `PersonOutfit` entry.
+            if !had_outfit_before
+                && !has_bound_accessories
+                && let Some(accessories) = world
+                    .objects
+                    .get(&person_id)
+                    .and_then(|o| o.person.as_ref())
+                    .map(|p| &p.accessories)
+            {
+                for acc in accessories {
+                    if acc.name.is_empty() {
+                        continue;
+                    }
+                    let lower = acc.name.to_ascii_lowercase();
+                    let acc_status =
+                        match crate::people::peek_suit_head(&program.people, world, &lower) {
+                            crate::people::ResolvedSuit::Found(h) => {
+                                Some(crate::people::suit_head_matches_skeleton(
+                                    &program.people,
+                                    world,
+                                    &lower,
+                                    h,
+                                    skel,
+                                ))
+                            }
+                            crate::people::ResolvedSuit::Missing => Some(false),
+                            crate::people::ResolvedSuit::Unknown => None,
+                        };
+                    status = combine_head_status(status, acc_status);
+                }
+            }
+
+            let has_profile_rows = {
+                let template = world.characters.definition(guid);
+                let prof = program.people.profiles.get(&template);
+                let made = world.characters.made.get(&guid);
+                let made_outfit = world.made_outfits.get(&guid);
+                prof.is_some_and(|p| {
+                    p.body.is_some() || p.head.is_some() || !p.suit_rows.is_empty()
+                }) || made.is_some_and(|m| m.strings.contains_key(&1) || m.strings.contains_key(&2))
+                    || made_outfit.is_some_and(|o| !o.is_empty())
             };
-            status = combine_head_status(status, acc_status);
-        }
+            if !has_profile_rows && !any_slot_bound && status == Some(false) {
+                status = portrait_head_status_in(program, world, guid);
+            }
+            status
+        };
+        overall = combine_pass_status(overall, pass_status);
     }
 
-    let has_profile_rows = {
-        let template = world.characters.definition(guid);
-        let prof = program.people.profiles.get(&template);
-        let made = world.characters.made.get(&guid);
-        let made_outfit = world.made_outfits.get(&guid);
-        prof.is_some_and(|p| p.body.is_some() || p.head.is_some() || !p.suit_rows.is_empty())
-            || made.is_some_and(|m| m.strings.contains_key(&1) || m.strings.contains_key(&2))
-            || made_outfit.is_some_and(|o| !o.is_empty())
-    };
-    if !has_profile_rows && !any_slot_bound && status == Some(false) {
-        status = portrait_head_status_in(program, world, guid);
-    }
-
-    if status.is_none() && !defer_unknown_head {
+    if overall.is_none() && !defer_unknown_head {
         return Err(Trap::Unsupported(format!(
             "{caller} of type 0x{guid:08X} (0x4e7824): whether its suit binds HEAD is unknown"
         )));
     }
-    Ok(status)
+    Ok(overall)
 }
 
 impl Machine<'_, '_> {
@@ -269,25 +324,34 @@ impl Machine<'_, '_> {
         let mode = operands[0];
         let scope = operands[1];
         let index = word(operands, 2);
+        let highlight = operands[4] & 1 != 0;
         match mode {
             0 => {
-                // 0x44ad3f: highlight cTSWinBtn (0x476468, presentation), then
+                // 0x44ad3f: highlight cTSWinBtn (0x476468 -> 0x476485), then
                 // fall through into mode 1 (0x44ad61), reading the variable a
                 // second time.
-                let _ = self.read_ui_effect_var(scope, index)?;
+                let control_id = self.read_ui_effect_var(scope, index)?;
+                self.emit_ui_effect(UiEffectEvent::Button {
+                    id: control_id,
+                    highlight,
+                });
                 let value = self.read_ui_effect_var(scope, index)?;
-                self.ui_effect_portrait(value)?;
+                self.ui_effect_portrait(value, highlight)?;
             }
             1 => {
-                // 0x44ad61: highlight the neighbor's portrait button (0x47689c),
-                // running 0x4e92a8 unconditionally.
+                // 0x44ad61: highlight the neighbor's portrait button (0x47689c ->
+                // 0x47690d), running 0x4e92a8 unconditionally and emitting the
+                // highlight when 0x4e92a8 returns true (`0x4768e8`).
                 let value = self.read_ui_effect_var(scope, index)?;
-                self.ui_effect_portrait(value)?;
+                self.ui_effect_portrait(value, highlight)?;
             }
             2 => {
                 // 0x44ad1f: read the variable and highlight cWinRelationship
-                // (0x476984, presentation only; does not call 0x4e92a8).
-                let _ = self.read_ui_effect_var(scope, index)?;
+                // (0x476984 -> 0x4769c3; does not call 0x4e92a8).
+                let value = self.read_ui_effect_var(scope, index)?;
+                if let Some(guid) = self.world.neighbors.get(value).map(|r| r.guid) {
+                    self.emit_ui_effect(UiEffectEvent::Relationship { guid, highlight });
+                }
             }
             _ => {}
         }
@@ -320,12 +384,17 @@ impl Machine<'_, '_> {
 
     /// The simulation-observable part of `0x47689c`: look up the 1-based
     /// neighbor record (`0x4256f4`), resolve its raw GUID (`0x5ed65e`,
-    /// record +4) in the portrait table (`0x4e9753`), and run `0x4e92a8`.
-    fn ui_effect_portrait(&mut self, neighbor: i16) -> Result<(), Trap> {
+    /// record +4) in the portrait table (`0x4e9753`), run `0x4e92a8`, and
+    /// emit [`UiEffectEvent::Portrait`] when `0x4e92a8` returns true (`0x4768e8`).
+    fn ui_effect_portrait(&mut self, neighbor: i16, highlight: bool) -> Result<(), Trap> {
         let Some(guid) = self.world.neighbors.get(neighbor).map(|r| r.guid) else {
             return Ok(());
         };
-        self.ui_effect_portrait_for_guid(guid, "UI Effect's portrait")
+        self.ui_effect_portrait_for_guid(guid, "UI Effect's portrait")?;
+        if self.in_portrait_table(guid)? && self.world.portraits.contains(&guid) {
+            self.emit_ui_effect(UiEffectEvent::Portrait { guid, highlight });
+        }
+        Ok(())
     }
 
     /// Runs `0x4e92a8` for a known `guid` (`0x47689c`, `0x4363d1`).
@@ -655,6 +724,9 @@ impl Machine<'_, '_> {
                 // temporary person at 0x4e8fdb (so a Reset callback during removal
                 // can still invalidate the portrait via 0x44e712 -> 0x4e895e,
                 // while 0x4e8feb flushes the staged BMP_ 2002 afterwards).
+                // Like Make New Character (`User%05d.iff`), sims-rs keeps the
+                // install directory read-only on disk and records the persisted
+                // BMP_ 2002 in `World::generated_portrait_2002` (saved in `Saved`).
                 lot.portraits.insert(guid);
                 lot.dirty_portraits.remove(&guid);
                 if save_bitmap {
