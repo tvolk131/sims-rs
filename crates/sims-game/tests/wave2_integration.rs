@@ -340,12 +340,46 @@ fn wave2_photo_album_and_persistent_custom_lot_thumbnails() {
         assert_eq!(shell.screen(), ScreenKind::Lot);
         shell.render();
 
-        // Camera panel Album button is enabled & laid out in NeighborhoodShell lots.
+        // In idle Live mode, no floating CamViewAlbum overlaps the clock/cluster.
+        assert!(
+            shell
+                .game()
+                .expect("active game")
+                .album_button_rect()
+                .is_none(),
+            "CamViewAlbum must not overlap the Live Mode cluster before opening Camera sub-strip"
+        );
+        // Clicking the cluster Camera button opens the Camera sub-strip inside the
+        // bottom panel strip area (x >= CLUSTER[0]), offering Take Snapshot & Photo Album.
+        let camera_btn = shell
+            .game()
+            .expect("active game")
+            .panel()
+            .iter()
+            .find(|item| {
+                item.command
+                    == Some(sims_ui::command::Command::Camera(
+                        sims_ui::command::Camera::Photo,
+                    ))
+            })
+            .expect("Camera button on Live cluster")
+            .rect;
+        let cam_center = [
+            camera_btn.x + camera_btn.width / 2,
+            camera_btn.y + camera_btn.height / 2,
+        ];
+        shell.press(cam_center);
+        shell.release(cam_center);
+        shell.render();
         let album_rect = shell
             .game()
             .expect("active game")
             .album_button_rect()
-            .expect("CamViewAlbum button rect should be present in NeighborhoodShell lot");
+            .expect("Photo Album button rect should be laid out in open Camera sub-strip");
+        assert!(
+            album_rect.x >= sims_ui::hud::CLUSTER[0],
+            "Camera sub-strip Photo Album button must sit right of Live cluster"
+        );
         let btn_center = [
             album_rect.x + album_rect.width / 2,
             album_rect.y + album_rect.height / 2,
@@ -354,7 +388,7 @@ fn wave2_photo_album_and_persistent_custom_lot_thumbnails() {
         shell.release(btn_center);
         assert!(
             shell.album_open(),
-            "clicking CamViewAlbum must open PhotoAlbumDialog"
+            "clicking Photo Album in Camera sub-strip must open PhotoAlbumDialog"
         );
 
         // Capture a live lot framebuffer snapshot, add a blank page, edit text, reorder, and render.

@@ -1775,6 +1775,7 @@ impl CafController {
     }
 
     fn draw_family(&self, frame: &mut Frame, art: &Art, layout: &CafLayout) {
+        let has_bkg = art.image(id::FAMILY_BKG).is_some();
         if let Some(bg) = art.image(id::FAMILY_BKG) {
             draw_scaled_or_direct(frame, bg, layout.canvas, layout.compact);
         } else {
@@ -1820,27 +1821,33 @@ impl CafController {
             name_focused,
             &self.text_state,
             false,
+            !has_bkg,
         );
 
-        // Family bio box (below roster well, unobtrusive when empty).
-        if let Some(font) = small_font {
-            font.draw(
+        // Family bio box: 1.91 `DsgnFamBkg.bmp` has no separate bio well below the
+        // roster, so only paint the optional bio box when focused, non-empty, or
+        // in headless/fallback mode without background art.
+        let bio_focused = self.confirm.is_none() && self.focus == FocusField::FamilyBio;
+        if !has_bkg || bio_focused || !self.family.bio.is_empty() {
+            if let Some(font) = small_font {
+                font.draw(
+                    frame,
+                    &self.texts.bio_label,
+                    layout.family_bio_label_pos,
+                    LABEL,
+                );
+            }
+            draw_text_box(
                 frame,
-                &self.texts.bio_label,
-                layout.family_bio_label_pos,
-                LABEL,
+                small_font,
+                layout.family_bio_field,
+                &self.family.bio,
+                bio_focused,
+                &self.text_state,
+                true,
+                true,
             );
         }
-        let bio_focused = self.confirm.is_none() && self.focus == FocusField::FamilyBio;
-        draw_text_box(
-            frame,
-            small_font,
-            layout.family_bio_field,
-            &self.family.bio,
-            bio_focused,
-            &self.text_state,
-            true,
-        );
 
         // Up to 8 member portrait slots inside the roster well.
         for (i, member) in self.family.members.iter().take(MAX_MEMBERS).enumerate() {
@@ -1973,6 +1980,7 @@ impl CafController {
             return;
         };
 
+        let has_bkg = art.image(id::CHAR_BKG).is_some();
         if let Some(bg) = art.image(id::CHAR_BKG) {
             draw_scaled_or_direct(frame, bg, layout.canvas, layout.compact);
         } else {
@@ -2027,6 +2035,7 @@ impl CafController {
             name_focused,
             &self.text_state,
             false,
+            !has_bkg,
         );
 
         // 5 Personality sliders + LEDs.
@@ -2252,6 +2261,7 @@ impl CafController {
             bio_focused,
             &self.text_state,
             true,
+            !has_bkg,
         );
 
         // Done & Cancel pill buttons.
@@ -2538,6 +2548,7 @@ fn draw_outline(frame: &mut Frame, rect: Rect, rgb: [u8; 3]) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_text_box(
     frame: &mut Frame,
     font: Option<&Font>,
@@ -2546,8 +2557,11 @@ fn draw_text_box(
     focused: bool,
     state: &TextFieldState,
     multiline: bool,
+    paint_well: bool,
 ) {
-    draw_well(frame, rect, focused);
+    if paint_well {
+        draw_well(frame, rect, focused);
+    }
     let Some(font) = font else {
         return;
     };
@@ -2565,6 +2579,16 @@ fn draw_text_box(
     }
 
     let mut scratch = Frame::new(w, h, ENTRY_FILL);
+    if !paint_well {
+        for dy in 0..h {
+            let fy = inside.y.saturating_add(dy as i32);
+            for dx in 0..w {
+                if let Some(bg) = frame.pixel(inside.x.saturating_add(dx as i32), fy) {
+                    scratch.blend(dx as i32, dy as i32, bg, 255);
+                }
+            }
+        }
+    }
     let pad = 5.min(inside.width / 4);
     let inner_w = (inside.width - pad * 2).max(1);
 
@@ -2642,15 +2666,6 @@ fn draw_personality_bar(frame: &mut Frame, art: Option<&Image>, rect: Rect, fill
                 Rect::new(0, 0, img_lit_w, i32::try_from(img.height).unwrap_or(0)),
                 Rect::new(rect.x, rect.y, lit_w, rect.height),
             );
-        }
-        if filled < total {
-            let unlit = Rect::new(
-                rect.x + lit_w,
-                rect.y,
-                (rect.width - lit_w).max(0),
-                rect.height,
-            );
-            draw_pip_fallback(frame, unlit, 0, total - filled);
         }
     } else {
         draw_pip_fallback(frame, rect, filled, total);

@@ -1,6 +1,7 @@
 //! The game's interface, drawn from the original artwork.
 //!
 //! - [`hud`]: the live-mode control panel.
+//! - [`camera`]: the Camera Mode subpanel (snapshot size, quality, and Photo Album button).
 //! - [`album`]: the Photo Album / Family Storybook modal viewer and editor.
 //! - [`caf`]: the Create-a-Family and Create-a-Sim screens.
 //! - [`neighborhood`]: the neighborhood top controls bar and lot hover popup card.
@@ -32,6 +33,7 @@ pub mod balloon;
 pub mod build;
 pub mod buy;
 pub mod caf;
+pub mod camera;
 pub mod cheat_console;
 pub mod command;
 pub mod coop;
