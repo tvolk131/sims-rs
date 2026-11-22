@@ -62,12 +62,17 @@ events, and what it asks for after them) come first.
    coordinates) and moving the default-frames 43,200 pin (`--answers 3,3
    --view-centre 32,32`) to
    `c3b7a6b9a8180d9e5e6463ba4e3638313cdec8d52bdaae28918bb05ce987e915`
-   (was `00fbe950` in #304). Open: screen-centre pick (`0x4a7b58`,
-   `0x434891`, `0x43491c`), no-tile portrait branch (`0x4e9706`,
-   `0x4e938c`), full-state comparison of the Goth day past 3350 against
-   a frame-watched recording (#304), and verifying the inferred
-   `cTSLiveModePIP` paint refresh (`Refresh(0)`) near update 40,317 as
-   the cause of that 1-update lag.
+   (was `00fbe950` in #304). #330 ports dialog portrait screen-centre pick
+   (`0x4a7b58`, `0x434891`, `0x43491c`), dirty-slot gate, and no-tile
+   fallback (`0x4e9706`, `0x4e938c`); #333 adds isolated `paused_ticks`
+   for `0x46d553` counter-117 wakeup; #340 lands shared `0x4e92a8`
+   portrait/dressing parity (`Saved::FORMAT = 8`, format-32 `TICK_43200`
+   pin `df6eb544be87b93233011f355999ac9abb0c36dc5e914f2f7c0fe2f49967b19a`,
+   `format_31_bytes` unchanged). Track 2's completed 44,200-update
+   frame-watched recording (`goth-day-frame-20261121`, 0 gaps, 5,028
+   `frame` rows) confirms the exact out-of-tick `Refresh(0)` write
+   (`eip=0x58da4a`) on both `mort_clk` and `racc_clk` at update 40,330
+   immediately following out-of-tick `frame` writes.
    See Progress.
 3. **1000 ticks on three more base-game houses**, picked for code the
    Goths do not reach (for example the Newbies and a family with
@@ -79,15 +84,18 @@ events, and what it asks for after them) come first.
    scripted clicks and pie-menu choices, matched through
    `Interpreter::pie_menu`, `Interpreter::pick` and `Interpreter::order`.
    These also check the integration track's game.
-5. **All 49 primitives**: port the remaining ones as recordings reach
-   them, or with targeted scenarios. Make New Character (19) now covers
-   all remaining executable-defined modes (#243, #308: negative age,
-   zero-count cleanup, and pet modes); Manage Inventory (51) covers all
-   operations (#302); Find Location For (16) covers all modes (#313,
+5. **All 52/52 primitives (0..=51) ported (#340, #366).** Make New Character
+   (19) covers all remaining executable-defined modes (#243, #308: negative
+   age, zero-count cleanup, and pet modes); Manage Inventory (51) covers
+   all operations (#302); Find Location For (16) covers all modes (#313,
    #317); Create New Object Instance (42) covers all 15 modes and flags
-   (#315). UI Effect (34) is used only by the Tutorial and the Help
-   System and is not ported. Also open: remaining failing modes of the
-   other ported primitives. See Progress.
+   (#315); UI Effect (34, `0x44acff`) landed in #340, completing all 52
+   SimAntics primitives (`0..=51`). #366 additionally ports non-residential
+   `Find Best Interaction` (`0x45dd39`), `Generic Sims Call` routines `18`
+   and `26`, Superstar memory operand scope `38` (`0x454304`), and
+   destination-lot routing/`Snap` support, verifying 300-tick strict
+   stepping across all five travel zones (Downtown, Vacation Island, Old
+   Town, Studio Town, Magic Town). See Progress.
 6. **One expansion-pack lot**, after steps 1 to 5. The plan (track 4, 2026-11-18): House 69 (Unleashed, the
    Charming family: one adult and one dog). The reference for the first
    6a comparison is House 69 in the shipped `UserData`; the
@@ -2478,6 +2486,26 @@ Progress:
   advanced it to. Over the Goths' first 3,400 ticks a person is seated
   in 94 of 226 samples, which before were posed on the standing loop;
   a full-weight foreground clip hides the difference in all of them.
+- Done (Batch 10 — D3D6 parity, CAF 3D turntable, pie transitions &
+  animation interpolation):
+  - **Direct3D 6 raster & lighting parity (#320, #326, #351):** matched
+    D3D6 pixel centres & 5-6-5 texel modulation (`0x5cf263`, `0x49f0ae`,
+    #320), parallel-point room lamps & 5-6-5 texel expansion (#326), and
+    default `D3DCULL_CCW` back-face culling (`0x5ce911`–`0x5d3c69`, #351),
+    raising `near-r2-0712-bench` `people` from `46.16%` to **`99.67%`**
+    (and `frame` to `99.99%` with #359).
+  - **Pie-menu 3D head & 400 ms transition animations (#334, #356):**
+    matched `Sims.exe`'s pie-menu 3D head camera, lighting, circular
+    backdrop (`#334`), and 400 ms pop-in / submenu glide /
+    `sqrt(0.1 + 0.9 * t)` direction ease-out (`PieAnimState`, #356).
+  - **Create-a-Family 3D turntable & portrait rasterizer (#345):**
+    `cWin3DView` interactive Sim preview, CAF head/body catalog
+    enumerator, and 3D `BMP_ 2002..=2007` portrait renderer (`99.8%`–`100.0%`
+    parity vs `User00172.iff`).
+  - **`cAnimLayer::Update` per-layer `interpolate` flag (#365):**
+    ported `0x597f1b`–`0x597f38` layer interpolation under x87 24-bit
+    precision (`Layer::interpolate`, `Clip::apply_with_interpolation`)
+    with zero `World` serialization or Goth hash changes.
 
 ## Track: lot rendering (`crates/sims-render`)
 
@@ -2626,15 +2654,37 @@ Progress:
   lifting `surface` across all 8 ratchet scenes to 99.32%–99.78% (and
   combined with #312's panel fixes, 6 of 8 scenes are now 99.00%–99.54%
   `frame`, with the remaining two at 98.37% and 98.32%).
-- Next: 3D people rendering fidelity (`people` 0.74%–17.16% in the
-  ratchet); corner kitchen counter at near zoom walls down
-  (`near-r3-down-0816`, `objects` 94.46%); road dashes at rotation 1
-  (`far-r1-cut-0816`); House02 flower beds drawing as grass; far rows
-  101–111 strip colour; pie-head camera/light/size comparison;
-  unmodeled cutaway mask triggers (`0x85` message senders; rooms with
-  `+0x34 == 0`, #301); unmodeled off-screen clear override
-  (`view+0x17c`/`+0x182`) and 15-bit 5-5-5 display path (`0x49f087`,
-  #306).
+- Done (Batch 10 — Neighborhood maps, Build previews, surface ratchet
+  & swimming pool/pond water):
+  - **Lot surface & wall parity (#324, #328, #359):** swapped odd-rotation
+    road centre-line dashes `10 <-> 11` (#324); clipped grass columns to
+    the active viewport, projected sloped objects (`0x4a9dc7`/`0x478dfe`),
+    and applied diagonal trim depth offsets (#328); ported sloped floor
+    shadows (`0x4adac0`–`0x4c9e38`), back-to-front wall draw order
+    (`0x54045b`–`0x44054c`), and diagonal mid-run trims (`0x53de05`–`0x53ca67`)
+    in #359, raising 13 ratchet floors with 0 lowered (`near-r2-0712-bench`:
+    **`frame 99.99%`, `surface 100.00%`, `objects 100.00%`, `people 99.67%`,
+    `panel 99.99%`**; all 8 scenes `frame 99.49%`–`99.99%`, `surface
+    99.70%`–`100.00%`, `objects 99.91%`–`100.00%`).
+  - **Neighborhood map renderer & hit-tester (#341):** all 6 Complete
+    Collection maps (Neighborhood, Unleashed, Downtown, Vacation Island,
+    Studio Town, Magic Town; `178,134/178,134` = `100.00%` lot pixels).
+  - **Build Mode Part 2 previews & exact diagonal roof clipping (#356,
+    #365):** terrain overlay, pool/water digging preview with coping rim,
+    all 18 `GameData/Roofs/*.bmp` textures, isometric roof previews
+    (`Hip`/`Gable`/`Mansard`/`Flat`), and exact split-diagonal triangle
+    clipping (#365).
+  - **Swimming pool (`Arry 9`) & pond (`Arry 10`) water rendering (#365):**
+    pixel-verified against `House02.iff` (`h02-g.png`) across the full
+    pool bounding box, plus `House08`/`House28` ponds/decks and live
+    `World -> Lot::from_world -> LotCache` invalidation.
+  - **Performance (#336, #339, #349):** static lot cache, two-tier
+    `LotCache` (4.6–6.9× faster animated misses), Retina blit speedup,
+    and shared `BaseAssets` / `ArchivePool` parallel asset loading.
+- Next (post-v1 polish): unmodeled cutaway mask triggers (`0x85` message
+  senders; rooms with `+0x34 == 0`, #301); unmodeled off-screen clear
+  override (`view+0x17c`/`+0x182`) and 15-bit 5-5-5 display path
+  (`0x49f087`, #306).
 
 ## Track: sound (`crates/sims-audio`)
 
@@ -2768,13 +2818,26 @@ stop-sounds events.
   recording). Removed `Player::ended`, added persistent stopped-track
   register banks (`Player::stopped`) and single-voice `Target::Track`
   routing.
-- **Next:**
-  - Tracks and fades step once a block (64 frames, about 2.9 ms); the
-    original sound manager's periodic update timer is **20 ms (50 Hz)**
-    (`0x572fc3` → `0x5edc57` → `0x6073f8`, firing `0x57cf37`).
-  - Kind 37 (effects volume slider) running `0x574978`, and `sims-game`
-    sending kind 25 on window focus changes.
-  - Checking rendered audio against the running original.
+- **Done (Batch 10 — 20 ms timer, volume sliders, streaming music,
+  radio, voices & ambience):**
+  - **Volume sliders, focus auto-pause & 20 ms HIT timer (#325, #329):**
+    ported kinds 37–39 (`FX`/`Music`/`Vox`), 20 ms periodic HIT/fade
+    execution (`0x572fc3`), and focus kind 25 auto-pause.
+  - **Streaming Mode Music (#344):** all 19 Complete Collection modes
+    (Neighborhood, Buy, Build, Load, expansions) with zero-stall
+    streaming.
+  - **Streaming Stereo/TV Radio Stations (#347):** `File`-backed
+    MP3/WAV/XA streaming across all 14 stereo + 8 TV stations plus
+    custom MP3 discovery and spatial attenuation.
+  - **Simlish Voice Bank Index & Resolver (#350):** discovers and plays
+    base and expansion `.XA`/`.WAV` voice clips with `VoiceAgeGender`
+    classification, deterministic selection, and pitch-shifted
+    resampling.
+  - **Environmental Lot & Expansion Ambience Mixer (#357):** seamless
+    looping day/night and zone crossfades driven by `AmbienceZone`,
+    `TimeOfDay`, `ZoomLevel`, `outdoor_percent`, and `VOLUME_STEPS`.
+- **Next (post-v1 polish):** checking rendered audio waveforms directly
+  against the running original.
 
 ## Track: recording tool input (`tools/harness`)
 
@@ -2810,9 +2873,16 @@ Progress:
   stop, and repairs a torn final log row.
   **Unverified:** a live QEMU takeover; the takeover paths were tested
   only against a fake gdbstub.
-- Next: build mode (its mode number), and a replay of the recorded push and
-  the purchase in our simulation. The replay needs a way to queue an
-  action on a person, and to place a bought object, before a tick.
+- Done (#335): added `drag` scenario step and Build Mode (`sim +0x36 = 1`).
+  Completed the full Batch 10 Complete Collection 1.91 oracle capture
+  suite (all private under `cache/`): `goth-build-wall-floor-20261121`
+  (1,200/1,200), `goth-buy-move-sell-20261121` (1,200/1,200),
+  `goth-day-frame-20261121` (44,200/44,200 with 5,028 `frame` rows +
+  `racc_clk`/`mort_clk` late-watch catching `0x58da4a` at u40,330),
+  `nb-save-movein-evict-20261121` (5 `UserData` snapshots + 20 PNGs),
+  and `caf-create-family-20261121` (`User00172.iff`, `Neighborhood.iff`,
+  `Export/Alice_7.FAM`, 9 PNGs). All Buy, Build, Read, and Sit+Read
+  replays run in `sims-game/tests/goth.rs`.
 
 ## Track: the interface (`crates/sims-ui`)
 
@@ -3192,6 +3262,77 @@ through their public interfaces only; the simulation never depends on it.
   changed code or tuning, and what happens to a long sound already
   playing when its object is gone after a restore. Next,
   if wanted: a save/load panel with named slots.
+- **Done (Batch 10 — Complete Collection UI panels, Buy/Build, CAF,
+  Neighborhood, Travel, Saves, Photo Album, Cheats & Co-op):**
+  - **Live-mode subpanel & HUD parity (#322, #327, #331):** money
+    visibility, non-residential friends, pause/ultra-speed blink, help
+    button, pet Personality/Skills subpanels, GUID selection, Report
+    Card, Superstar Fame subpanel, and live help balloons.
+  - **Buy Mode & Build Mode Parts 1–2 UI (#332, #337, #342, #358):**
+    catalogs, placement cursors, Hand tool, Walls/Floors/Wallpaper/Doors/
+    Windows/Terrain/Water/Pool/Roof subtools, `GameData/Roofs/*.bmp`
+    swatches, unified Undo/Redo, and narrow-viewport 4×3 reflow (`< 620 px`).
+  - **Options panel & native interactive dialog chrome (#338):**
+    `cWinOptions`, `cTSWinMsgBox`, `cTSWinGenDlg`, `cWinEditLotInfo`,
+    `cTSWinTextEdit2`, `cTSWinBtn`.
+  - **Neighborhood, Family Bin, Create-a-Family & Travel UI (#344, #346,
+    #350, #353):** Neighborhood top bar & Family Bin (`cWinPickFamily`),
+    Create-a-Family/Create-a-Sim (`sims-ui::caf`, 25-pt personality,
+    live zodiac), 19-bitmap Loading Screen (`sims-ui::loading`), Travel
+    Destination Chrome (`sims-ui::travel`), Travel Shop/Wardrobe/Pet/
+    Magic Picker (`sims-ui::shop`), Save/Autosave Manager
+    (`sims-ui::saves`), and `Ctrl+Shift+C` Cheat Console
+    (`sims-ui::cheat_console`).
+  - **Photo Album & Co-op Multiplayer UI (#347, #357):** `cWinPhotoAlbum`
+    modal storybook viewer/editor (`sims-ui::album`) and Co-op Lobby &
+    HUD Overlay (`sims-ui::coop`).
+- **Done (Batch 10 — Playable v1 Complete Collection Application Shell,
+  Persistence, Travel, Performance & Co-op Multiplayer):**
+  - **Camera & input replays (#321, #323):** native portrait centring,
+    multi-tile averaging, scroll limits, and Read / Sit+Read oracle replays.
+  - **Buy Mode & Build Mode Parts 1–2 end-to-end (#332, #337, #342,
+    #356, #358, #367):** catalog purchase, Hand tool move/sell/depreciation,
+    walls, floors, wallpaper, doors/windows, plug-in `.flr`/`.wll`,
+    terrain raise/lower/level/grass, ponds, swimming pools, roofs with
+    `HOUS 0` baseline, live previews, and unified Build/Buy Undo/Redo
+    verified against 1,200-update Buy and Build oracle replays.
+  - **Performance Parts 1–3 & hybrid redraw pacing (#336, #339, #349,
+    #354):** CoW `World` (22.9× clone speedup), 2.78× faster 43,200-tick
+    VM run, two-tier `LotCache`, bounded `ArchivePool` + parallel asset
+    load (`Game::open` initial `3,769 ms → 341 ms` **11.0×**, warm
+    `2,497 ms → 311 ms` **8.0×**, `sims-game --test goth` **2.85×**),
+    and `RedrawPacer` (display-refresh interactive / 60 FPS passive cap,
+    eliminating Ultra-speed 100% CPU spin).
+  - **Multi-neighborhood REDB persistence, migrations, autosave & CAF
+    (#343, #352, #355, #364):** multi-neighborhood REDB store, lot
+    lifecycle (import, Save & Leave, re-entry reconciliation, Move-In
+    with Simoleons + MagiCoins, Evict, Bulldoze), explicit forward schema
+    migrations (`NEIGHBORHOOD_FORMAT v1→v2→v3`, `Saved FORMAT v6→v7→v8`),
+    crash-safe rotating `AutosaveStore`, atomic single-transaction CAF
+    (`User%05d.iff` synthesis, `.FAM` export/import), `PhotoAlbumStore`,
+    and persistent custom lot map thumbnails (`NEIGHBORHOOD_LOT_THUMBNAILS`).
+  - **Away-From-Home Travel Destinations across all 5 expansion zones
+    (#361, #363, #366, #367):** Downtown, Vacation Island, Old Town
+    community, Studio Town, and Magic Town travel engine with `TRVL`
+    crash-resume/abort recovery, 3-way neighborhood merge, community-lot
+    Build/Buy editing, and live destination-lot VM stepping.
+  - **Integration Waves 1–2 (#354, #362, #367):** playable default
+    Neighborhood shell, startup `migrate_all()`, background CoW REDB
+    save/autosave worker, `SaveManagerDialog`, end-to-end 3D CAF,
+    `Ctrl/Cmd+Shift+C` Cheat Console, 400 ms pie transitions, streaming
+    Mode Music / Radio / Ambience / Simlish Voices, native Loading
+    Screen, Photo Album modal with lazy hydration, persistent map
+    thumbnails, Travel Destinations shell, and Shop/Wardrobe picker.
+  - **Co-op Multiplayer v1 end-to-end (#348, #360, #368):**
+    `crates/sims-net` deterministic lockstep protocol + `iroh 1.5.0`
+    QUIC P2P transport (`simscoop1...` tickets, `FileManifest`, chunked
+    `"SCOP"` v2 snapshots, failover), per-player VM globals (`Global 3`,
+    `camera_rotation`, Mode `Global 19`, multi-reason pause, throwaway
+    pie menus, `Lot::apply_coop_batch`), and Wave 3 live Co-op shell
+    (`IrohBridge`, `CoopLobbyDialog`, `CoopHudOverlay`, remote-player
+    plumbobs, drift resync, CLI `--host`/`--join`, and 2-client E2E
+    `MemoryMesh` + `IrohTransport` QUIC loopback tests; single-player
+    bit-for-bit unchanged).
 - **Needs from other crates:**
   - `sims-vm`: Done — all three failing Goth pie listings (#296) are
     now closed, and every person's pie menu on every object of the Goth
