@@ -127,17 +127,25 @@ impl TestPeer {
         self.node.poll(&mut self.transport);
         let events = self.node.drain_events();
         for ev in &events {
-            if let NodeEvent::ApplySnapshot { redb_bytes, .. } = ev {
+            if let NodeEvent::ApplySnapshot {
+                snapshot_id,
+                redb_bytes,
+                ..
+            } = ev
+            {
                 self.world = MockLotWorld::from_redb_bytes(redb_bytes);
+                self.node
+                    .confirm_snapshot_applied(&mut self.transport, *snapshot_id)
+                    .expect("confirm snapshot applied");
             }
         }
         events
     }
 
     fn step_ready(&mut self, flush: bool) -> Vec<AppliedBatch> {
-        let batches = self.node.drain_ready_ticks(flush).expect("drain ready");
-        for batch in &batches {
-            self.world.apply_batch(batch);
+        let mut batches = Vec::new();
+        while let Some(batch) = self.node.step_next_tick(flush).expect("step next tick") {
+            self.world.apply_batch(&batch);
             self.node
                 .report_local_tick(
                     &mut self.transport,
@@ -146,6 +154,7 @@ impl TestPeer {
                     Some(self.world.hash()),
                 )
                 .expect("report local tick");
+            batches.push(batch);
         }
         batches
     }
@@ -541,6 +550,7 @@ fn per_player_selection_and_camera_rotation_policies() {
                     selected_sim: Some(20),
                     camera_rotation: CameraRotation::EAST,
                     endpoint_hint: None,
+                    transport_addr: None,
                 },
             },
             sims_net::StampedCommand {
@@ -1063,6 +1073,7 @@ fn memory_mesh_latency_reordering_and_snapshot_integrity_guards() {
             drop_ppm: 0,
             reorder_jitter_steps: 3,
             partitioned: false,
+            max_in_flight_per_direction: 0,
         },
     );
     peer_t.connect(&host_addr).unwrap();
@@ -1188,4 +1199,417 @@ fn sim_speed_periods_match_original_and_snapshot_guards_reject_zip_bomb() {
             actual: 129,
         })
     );
+}
+
+#[test]
+fn transport_identity_binding_config_validation_and_trailing_byte_rejection() {
+    // 1. SessionConfig::validate rejects invalid delay/lead combinations that would deadlock.
+    let bad_cfg = SessionConfig {
+        tick_delay: 12,
+        max_tick_delay: 12,
+        max_ticks_ahead_of_slowest: 10,
+        ..SessionConfig::default()
+    };
+    assert!(bad_cfg.validate().is_err());
+    let bad_bounds = SessionConfig {
+        min_tick_delay: 8,
+        max_tick_delay: 4,
+        ..SessionConfig::default()
+    };
+    assert!(bad_bounds.validate().is_err());
+
+    // 2. Spoofed Welcome from non-host is ignored, and spoofed endpoint_hint on Hello is rejected.
+    let mesh = MemoryMesh::new(301);
+    let manifest = sample_manifest(b"auth-v1");
+    let host_addr = PeerAddress::new("mem:host");
+    let peer_addr = PeerAddress::new("mem:peer");
+
+    let mut host_t = mesh.add_node("mem:host");
+    let mut attacker_t = mesh.add_node("mem:attacker");
+    let mut peer_t = mesh.add_node("mem:peer");
+    attacker_t.connect(&host_addr).unwrap();
+    attacker_t.connect(&peer_addr).unwrap();
+    peer_t.connect(&host_addr).unwrap();
+
+    let mut host = LockstepNode::new_host(
+        "Host",
+        Some("mem:host".to_string()),
+        manifest,
+        SessionConfig::default(),
+    );
+    let mut peer = LockstepNode::new_peer(
+        "Peer",
+        Some("mem:peer".to_string()),
+        manifest,
+        host_addr.clone(),
+    );
+
+    // Attacker tries to spoof Welcome to peer before real host responds.
+    attacker_t
+        .send(
+            &peer_addr,
+            WireMessage::Welcome {
+                epoch: Epoch::INITIAL,
+                assigned_player: PlayerId(99),
+                host_id: PlayerId(1),
+                config: SessionConfig::default(),
+                current_tick: Tick::ZERO,
+                session_state: Box::new(host.session().clone()),
+                snapshot_id: None,
+                roster: Vec::new(),
+            },
+        )
+        .unwrap();
+    // Attacker sends Hello claiming victim's endpoint_hint.
+    attacker_t
+        .send(
+            &host_addr,
+            WireMessage::Hello {
+                protocol_version: sims_net::PROTOCOL_VERSION,
+                player_name: "Attacker".to_string(),
+                manifest,
+                endpoint_hint: Some("mem:peer".to_string()),
+            },
+        )
+        .unwrap();
+    mesh.step();
+
+    peer.poll(&mut peer_t);
+    host.poll(&mut host_t);
+    // Peer must ignore spoofed Welcome from attacker.
+    assert_eq!(peer.local_player_id(), None);
+    mesh.step();
+
+    // Attacker receives InvalidEndpointHint rejection from host.
+    let attacker_events = attacker_t.drain_events();
+    assert!(attacker_events.iter().any(|ev| matches!(
+        ev,
+        sims_net::TransportEvent::Message {
+            message: WireMessage::Reject {
+                reason: RejectReason::InvalidEndpointHint
+            },
+            ..
+        }
+    )));
+
+    // 3. Trailing bytes rejected in decode_payload and SnapshotEnvelope::decode,
+    //    and rooted/drive paths rejected by FileManifest::from_entries.
+    let mut payload = sims_net::encode_payload(&WireMessage::Heartbeat {
+        epoch: Epoch::INITIAL,
+        tick: Tick(1),
+        sender: None,
+    })
+    .unwrap();
+    payload.push(0x99);
+    assert!(sims_net::decode_payload(&payload).is_err());
+
+    let env = SnapshotEnvelope {
+        session: host.session().clone(),
+        redb_bytes: vec![1, 2, 3],
+    };
+    let mut env_bytes = env.encode().unwrap();
+    env_bytes.push(0x00);
+    assert!(SnapshotEnvelope::decode(&env_bytes).is_err());
+
+    for bad_path in [
+        "/gamedata/a.iff",
+        "\\gamedata\\a.iff",
+        "C:a.iff",
+        "C:\\a.iff",
+        "../a.iff",
+    ] {
+        let res = FileManifest::from_entries([FileManifestEntry {
+            relative_path: bad_path.to_string(),
+            size_bytes: 1,
+            sha256: [0; 32],
+        }]);
+        assert!(res.is_err(), "expected {bad_path} to be rejected");
+    }
+}
+
+#[test]
+fn resumable_snapshot_and_batch_delivery_under_transport_backpressure() {
+    let mesh = MemoryMesh::new(404);
+    let manifest = sample_manifest(b"bp-v1");
+    let host_addr = PeerAddress::new("mem:host");
+    let late_addr = PeerAddress::new("mem:late");
+
+    let mut host = TestPeer {
+        node: LockstepNode::new_host(
+            "Host",
+            Some("mem:host".to_string()),
+            manifest,
+            SessionConfig {
+                tick_delay: 1,
+                ..SessionConfig::default()
+            },
+        ),
+        transport: mesh.add_node("mem:host"),
+        world: MockLotWorld::new(),
+        step_us: 1_000,
+    };
+
+    // Advance host to tick 3.
+    for _ in 1..=3 {
+        host.node.advance_host_tick(&mut host.transport).unwrap();
+        host.step_ready(true);
+    }
+
+    // Impose tiny in-flight cap (2 frames) so multi-chunk snapshot hits Backpressure!
+    let mut late_t = mesh.add_node("mem:late");
+    late_t.connect(&host_addr).unwrap();
+    mesh.set_link_config(
+        &host_addr,
+        &late_addr,
+        LinkConfig {
+            latency_steps: 0,
+            drop_ppm: 0,
+            reorder_jitter_steps: 0,
+            partitioned: false,
+            max_in_flight_per_direction: 2,
+        },
+    );
+    let mut late = TestPeer {
+        node: LockstepNode::new_peer("Late", Some("mem:late".to_string()), manifest, host_addr),
+        transport: late_t,
+        world: MockLotWorld::new(),
+        step_us: 1_000,
+    };
+
+    let mut sid = None;
+    for _ in 0..8 {
+        late.poll_and_apply_snapshots();
+        for ev in host.poll_and_apply_snapshots() {
+            if let NodeEvent::SnapshotNeeded { snapshot_id, .. } = ev {
+                sid = Some(snapshot_id);
+            }
+        }
+        mesh.step();
+    }
+    let sid = sid.expect("SnapshotNeeded");
+
+    // 4 KiB payload in 64-byte chunks -> > 10 chunks over a 2-frame link cap!
+    let big_world_bytes = vec![0x77u8; 4096];
+    host.node
+        .send_snapshot(
+            &mut host.transport,
+            sid,
+            host.world.hash(),
+            big_world_bytes.clone(),
+            SnapshotCompression::None,
+            64,
+        )
+        .unwrap();
+    // Advance tick 4 (PlayerJoined) while snapshot is still draining under backpressure.
+    host.node.advance_host_tick(&mut host.transport).unwrap();
+    host.step_ready(true);
+
+    // Pump mesh + poll until all chunks resume and arrive cleanly.
+    let mut applied_bytes = None;
+    for _ in 0..120 {
+        host.node.poll(&mut host.transport);
+        mesh.step();
+        late.node.poll(&mut late.transport);
+        for ev in late.node.drain_events() {
+            if let NodeEvent::ApplySnapshot {
+                snapshot_id,
+                redb_bytes,
+                ..
+            } = ev
+            {
+                // Verify peer stays syncing BEFORE confirm_snapshot_applied!
+                assert!(late.node.is_syncing());
+                assert!(!late.node.can_step_tick(true));
+                applied_bytes = Some(redb_bytes);
+                late.node
+                    .confirm_snapshot_applied(&mut late.transport, snapshot_id)
+                    .unwrap();
+                assert!(!late.node.is_syncing());
+            }
+        }
+        let _ = late.node.drain_ready_ticks(true);
+        if applied_bytes.is_some() && late.node.session().current_tick == Tick(4) {
+            break;
+        }
+    }
+
+    assert_eq!(applied_bytes.as_deref(), Some(big_world_bytes.as_slice()));
+    assert_eq!(host.node.active_snapshot_tx_count(), 0);
+    assert_eq!(late.node.session(), host.node.session());
+}
+
+#[test]
+fn join_capacity_ghost_prevention_dialog_receipt_order_and_failover_fallback() {
+    // 1. Tick-0 capacity enforcement & disconnect before tick 1 leaves zero ghost player.
+    let mesh = MemoryMesh::new(808);
+    let manifest = sample_manifest(b"cap-v1");
+    let host_addr = PeerAddress::new("mem:host");
+    let mut host_t = mesh.add_node("mem:host");
+    let mut host = LockstepNode::new_host(
+        "Host",
+        Some("mem:host".to_string()),
+        manifest,
+        SessionConfig {
+            max_players: 2,
+            tick_delay: 2,
+            ..SessionConfig::default()
+        },
+    );
+
+    let mut p2_t = mesh.add_node("mem:p2");
+    let mut p3_t = mesh.add_node("mem:p3");
+    p2_t.connect(&host_addr).unwrap();
+    p3_t.connect(&host_addr).unwrap();
+    let mut p2 = LockstepNode::new_peer(
+        "P2",
+        Some("mem:p2".to_string()),
+        manifest,
+        host_addr.clone(),
+    );
+    let mut p3 = LockstepNode::new_peer(
+        "P3",
+        Some("mem:p3".to_string()),
+        manifest,
+        host_addr.clone(),
+    );
+
+    // Both P2 and P3 send Hello at tick 0 -> P2 accepted, P3 rejected SessionFull!
+    p2.poll(&mut p2_t);
+    p3.poll(&mut p3_t);
+    mesh.step();
+    host.poll(&mut host_t);
+    mesh.step();
+    p2.poll(&mut p2_t);
+    p3.poll(&mut p3_t);
+    assert_eq!(p2.local_player_id(), Some(PlayerId(2)));
+    assert!(
+        p3.drain_events()
+            .contains(&NodeEvent::JoinRejected(RejectReason::SessionFull {
+                max_players: 2
+            }))
+    );
+
+    // Verify P2's pending join did NOT mutate host's SessionState fingerprint before tick 1!
+    let fresh_session = sims_net::SessionState::new(
+        "Host",
+        Some("mem:host".to_string()),
+        SessionConfig {
+            max_players: 2,
+            tick_delay: 2,
+            ..SessionConfig::default()
+        },
+    );
+    assert_eq!(
+        host.session().session_fingerprint(),
+        fresh_session.session_fingerprint()
+    );
+
+    // P2 disconnects BEFORE tick 1 is scheduled -> queued PlayerJoined cancelled, zero ghost player!
+    p2_t.disconnect(&host_addr).unwrap();
+    host.poll(&mut host_t);
+    host.advance_host_tick(&mut host_t).unwrap();
+    host.drain_ready_ticks(true).unwrap();
+    assert_eq!(host.session().players.len(), 1);
+    assert!(!host.session().players.contains_key(&PlayerId(2)));
+
+    // 2. Blocking dialog first-answer-wins follows host RECEIPT order (P3 before P2 -> P3 wins!).
+    let mesh2 = MemoryMesh::new(909);
+    let mut h2_t = mesh2.add_node("mem:host");
+    let mut h2 = LockstepNode::new_host(
+        "Host",
+        Some("mem:host".to_string()),
+        manifest,
+        SessionConfig {
+            max_players: 4,
+            tick_delay: 2,
+            ..SessionConfig::default()
+        },
+    );
+    let mut a_t = mesh2.add_node("mem:a");
+    let mut b_t = mesh2.add_node("mem:b");
+    a_t.connect(&host_addr).unwrap();
+    b_t.connect(&host_addr).unwrap();
+    let mut a = LockstepNode::new_peer("A", Some("mem:a".to_string()), manifest, host_addr.clone());
+    let mut b = LockstepNode::new_peer("B", Some("mem:b".to_string()), manifest, host_addr.clone());
+    for _ in 0..4 {
+        a.poll(&mut a_t);
+        b.poll(&mut b_t);
+        h2.poll(&mut h2_t);
+        mesh2.step();
+    }
+    let a_id = a.local_player_id().unwrap();
+    let b_id = b.local_player_id().unwrap();
+    let higher_is_b = b_id > a_id;
+    assert!(higher_is_b);
+
+    // Tick 1 joins A and B; tick 2 opens dialog.
+    h2.advance_host_tick(&mut h2_t).unwrap();
+    h2.drain_ready_ticks(true).unwrap();
+    h2.session_mut()
+        .open_blocking_dialog(DialogId(5), 10, Tick(1));
+
+    // Higher PlayerId (B = P3) sends answer BEFORE lower PlayerId (A = P2) in the same tick!
+    b.submit_command(
+        &mut b_t,
+        Command::AnswerBlockingDialog {
+            dialog_id: DialogId(5),
+            answer: DialogAnswer {
+                status: 3,
+                bitmap_id: None,
+                text: None,
+            },
+        },
+    )
+    .unwrap();
+    mesh2.step();
+    h2.poll(&mut h2_t);
+    a.submit_command(
+        &mut a_t,
+        Command::AnswerBlockingDialog {
+            dialog_id: DialogId(5),
+            answer: DialogAnswer {
+                status: 2,
+                bitmap_id: None,
+                text: None,
+            },
+        },
+    )
+    .unwrap();
+    mesh2.step();
+    h2.poll(&mut h2_t);
+
+    h2.advance_host_tick(&mut h2_t).unwrap();
+    let applied = h2.step_next_tick(true).unwrap().unwrap();
+    assert!(matches!(
+        applied.commands[0].outcome,
+        CommandOutcome::DialogWon {
+            dialog_id: DialogId(5),
+            winner,
+            ..
+        } if winner == b_id
+    ));
+    assert_eq!(
+        applied.commands[1].outcome,
+        CommandOutcome::Ignored(CommandIgnoreReason::DialogAlreadyAnswered)
+    );
+
+    // 3. Failover candidate fallback: both Host (P1) AND primary successor (A = P2) crash
+    //    before B (P3) receives PlayerLeft(P2) -> B skips unreachable P2 and promotes itself!
+    mesh2.step();
+    b.poll(&mut b_t);
+    b.drain_ready_ticks(true).unwrap();
+    assert_eq!(b.session().players.len(), 3);
+
+    mesh2.crash_node(&PeerAddress::new("mem:a"));
+    mesh2.crash_node(&host_addr);
+    b.poll(&mut b_t);
+    let b_events = b.drain_events();
+    assert!(
+        b_events.contains(&NodeEvent::HostPromoted {
+            new_host: b_id,
+            new_epoch: Epoch(2),
+        }),
+        "expected B to skip crashed P2 and promote itself: {b_events:?}"
+    );
+    assert_eq!(b.role(), PlayerRole::Host);
 }

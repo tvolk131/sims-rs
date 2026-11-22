@@ -365,9 +365,62 @@ impl Default for SessionConfig {
             fingerprint_interval: 30,
             max_players: 4,
             max_commands_per_peer_per_tick: 16,
-            max_ticks_ahead_of_slowest: 10,
+            max_ticks_ahead_of_slowest: 16,
             retained_batch_history: 128,
         }
+    }
+}
+
+impl SessionConfig {
+    /// Validates lockstep delay, pacing, and capacity bounds so startup cannot
+    /// panic or deadlock.
+    pub fn validate(&self) -> Result<(), crate::error::SessionError> {
+        if self.min_tick_delay > self.max_tick_delay {
+            return Err(crate::error::SessionError::InvalidConfig(format!(
+                "min_tick_delay ({}) > max_tick_delay ({})",
+                self.min_tick_delay, self.max_tick_delay
+            )));
+        }
+        if self.tick_delay < self.min_tick_delay || self.tick_delay > self.max_tick_delay {
+            return Err(crate::error::SessionError::InvalidConfig(format!(
+                "tick_delay ({}) outside [{}..={}]",
+                self.tick_delay, self.min_tick_delay, self.max_tick_delay
+            )));
+        }
+        if self.max_players == 0 {
+            return Err(crate::error::SessionError::InvalidConfig(
+                "max_players must be >= 1".to_string(),
+            ));
+        }
+        if self.max_commands_per_peer_per_tick == 0 {
+            return Err(crate::error::SessionError::InvalidConfig(
+                "max_commands_per_peer_per_tick must be >= 1".to_string(),
+            ));
+        }
+        let min_lead = u64::from(self.tick_delay).max(1);
+        if self.max_ticks_ahead_of_slowest < min_lead {
+            return Err(crate::error::SessionError::InvalidConfig(format!(
+                "max_ticks_ahead_of_slowest ({}) must be >= tick_delay.max(1) ({min_lead})",
+                self.max_ticks_ahead_of_slowest
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns a defensively sanitized copy guaranteed to satisfy [`Self::validate`].
+    pub fn sanitized(mut self) -> Self {
+        if self.min_tick_delay > self.max_tick_delay {
+            self.max_tick_delay = self.min_tick_delay;
+        }
+        self.tick_delay = self
+            .tick_delay
+            .clamp(self.min_tick_delay, self.max_tick_delay);
+        self.max_players = self.max_players.max(1);
+        self.max_commands_per_peer_per_tick = self.max_commands_per_peer_per_tick.max(1);
+        self.max_ticks_ahead_of_slowest = self
+            .max_ticks_ahead_of_slowest
+            .max(u64::from(self.tick_delay).max(1));
+        self
     }
 }
 
@@ -485,6 +538,7 @@ pub enum Command {
         selected_sim: Option<u16>,
         camera_rotation: CameraRotation,
         endpoint_hint: Option<String>,
+        transport_addr: Option<String>,
     },
     /// Host-issued membership event: a player left the session.
     PlayerLeft {
@@ -568,6 +622,10 @@ pub enum RejectReason {
     NotHost { current_host: PlayerId },
     /// Player name was empty or invalid.
     InvalidPlayerName,
+    /// Provided endpoint hint did not match the authenticated transport peer.
+    InvalidEndpointHint,
+    /// Peer received an invalid session configuration from host.
+    InvalidConfig,
 }
 
 /// Reason a REDB snapshot transfer was initiated.
@@ -643,6 +701,7 @@ pub enum WireMessage {
         new_epoch: Epoch,
         new_host: PlayerId,
         resume_tick: Tick,
+        resume_fingerprint: Option<StateFingerprint>,
         session_state: Box<SessionState>,
         roster: Vec<PeerRosterEntry>,
     },
@@ -670,7 +729,7 @@ pub fn encode_payload(msg: &WireMessage) -> Result<Vec<u8>, ProtocolError> {
 }
 
 /// Decodes a [`WireMessage`] from raw `postcard` bytes, enforcing
-/// [`MAX_WIRE_FRAME_BYTES`].
+/// [`MAX_WIRE_FRAME_BYTES`] and rejecting trailing bytes.
 pub fn decode_payload(bytes: &[u8]) -> Result<WireMessage, ProtocolError> {
     if bytes.len() > MAX_WIRE_FRAME_BYTES {
         return Err(ProtocolError::FrameTooLarge {
@@ -678,7 +737,15 @@ pub fn decode_payload(bytes: &[u8]) -> Result<WireMessage, ProtocolError> {
             max: MAX_WIRE_FRAME_BYTES,
         });
     }
-    postcard::from_bytes(bytes).map_err(|e| ProtocolError::Decode(e.to_string()))
+    let (msg, rest) =
+        postcard::take_from_bytes(bytes).map_err(|e| ProtocolError::Decode(e.to_string()))?;
+    if !rest.is_empty() {
+        return Err(ProtocolError::Decode(format!(
+            "unexpected {} trailing bytes in wire payload",
+            rest.len()
+        )));
+    }
+    Ok(msg)
 }
 
 /// Encodes a [`WireMessage`] with a 4-byte big-endian length prefix.

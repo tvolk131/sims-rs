@@ -68,6 +68,8 @@ pub enum SnapshotError {
     CompressedTooLarge { len: u64, max: u64 },
     /// Invalid chunk size (zero or above cap).
     InvalidChunkSize { chunk_size: u32, max: u32 },
+    /// Chunk count exceeds the maximum allowed chunk table entries.
+    TooManyChunks { count: u32, max: u32 },
     /// Header chunk count does not match `compressed_len` and `chunk_size`.
     InconsistentChunkCount { expected: u32, actual: u32 },
     /// Chunk belongs to a different snapshot transfer.
@@ -110,6 +112,9 @@ impl fmt::Display for SnapshotError {
             }
             Self::InvalidChunkSize { chunk_size, max } => {
                 write!(f, "invalid snapshot chunk size {chunk_size} (max {max})")
+            }
+            Self::TooManyChunks { count, max } => {
+                write!(f, "snapshot chunk count {count} exceeds max {max}")
             }
             Self::InconsistentChunkCount { expected, actual } => {
                 write!(
@@ -188,6 +193,8 @@ pub enum SessionError {
     UnknownPlayer(PlayerId),
     /// Referenced snapshot transfer is unknown or no longer pending.
     UnknownSnapshot(SnapshotId),
+    /// Invalid session configuration parameters.
+    InvalidConfig(String),
     /// Snapshot transfer error.
     Snapshot(SnapshotError),
     /// Underlying transport error.
@@ -224,6 +231,7 @@ impl fmt::Display for SessionError {
             Self::UnassignedPlayer => f.write_str("peer has not been assigned a player id yet"),
             Self::UnknownPlayer(id) => write!(f, "unknown player {id}"),
             Self::UnknownSnapshot(id) => write!(f, "unknown snapshot transfer {id}"),
+            Self::InvalidConfig(msg) => write!(f, "invalid session configuration: {msg}"),
             Self::Snapshot(err) => err.fmt(f),
             Self::Transport(err) => err.fmt(f),
         }

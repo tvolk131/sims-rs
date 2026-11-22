@@ -1,8 +1,9 @@
 //! Deterministic in-memory simulated network mesh for fast CI testing.
 //!
 //! Supports configurable per-link latency (in logical steps), deterministic
-//! packet drop, packet reordering, and disconnect/partition injection — with
-//! zero wall-clock reads, zero threads, and zero `HashMap`/`HashSet`.
+//! packet drop, packet reordering, bounded queue backpressure injection, and
+//! disconnect/partition injection — with zero wall-clock reads, zero threads,
+//! and zero `HashMap`/`HashSet`.
 
 use crate::error::TransportError;
 use crate::protocol::{WireMessage, decode_framed, encode_framed};
@@ -24,12 +25,16 @@ pub struct LinkConfig {
     pub reorder_jitter_steps: u64,
     /// If `true`, all packets between these two endpoints are dropped.
     pub partitioned: bool,
+    /// Optional cap on simultaneous in-flight frames in one direction before
+    /// returning [`TransportError::Backpressure`]. `0` means unlimited.
+    pub max_in_flight_per_direction: usize,
 }
 
 #[derive(Debug, Clone)]
 struct InFlightFrame {
     deliver_at_step: u64,
     seq: u64,
+    conn_gen: u64,
     from: PeerAddress,
     to: PeerAddress,
     framed_bytes: Vec<u8>,
@@ -39,11 +44,14 @@ struct InFlightFrame {
 struct MeshInner {
     step: u64,
     next_seq: u64,
+    next_conn_gen: u64,
     rng_state: u64,
     default_link: LinkConfig,
     links: BTreeMap<(PeerAddress, PeerAddress), LinkConfig>,
     nodes: BTreeSet<PeerAddress>,
-    connections: BTreeMap<PeerAddress, BTreeSet<PeerAddress>>,
+    /// Active connections mapped to their connection generation ID so stale
+    /// frames from a prior connection can never leak across a reconnect.
+    connections: BTreeMap<PeerAddress, BTreeMap<PeerAddress, u64>>,
     inbox: BTreeMap<PeerAddress, VecDeque<TransportEvent>>,
     in_flight: Vec<InFlightFrame>,
 }
@@ -91,6 +99,7 @@ impl MemoryMesh {
             inner: Rc::new(RefCell::new(MeshInner {
                 step: 0,
                 next_seq: 1,
+                next_conn_gen: 1,
                 rng_state: seed,
                 default_link: LinkConfig::default(),
                 links: BTreeMap::new(),
@@ -139,17 +148,19 @@ impl MemoryMesh {
 
     /// Injects an abrupt disconnect (crash/link cut) of `node` from all its
     /// currently connected peers, emitting [`TransportEvent::PeerDisconnected`]
-    /// on both sides and dropping its in-flight packets.
+    /// on both sides, removing the node from accepting new dials, and purging
+    /// its in-flight packets.
     pub fn crash_node(&self, node: &PeerAddress) {
         let mut inner = self.inner.borrow_mut();
+        inner.nodes.remove(node);
         let peers: Vec<PeerAddress> = inner
             .connections
             .get(node)
-            .map(|set| set.iter().cloned().collect())
+            .map(|map| map.keys().cloned().collect())
             .unwrap_or_default();
         for peer in peers {
-            if let Some(set) = inner.connections.get_mut(&peer) {
-                set.remove(node);
+            if let Some(map) = inner.connections.get_mut(&peer) {
+                map.remove(node);
             }
             if let Some(q) = inner.inbox.get_mut(&peer) {
                 q.push_back(TransportEvent::PeerDisconnected {
@@ -164,8 +175,8 @@ impl MemoryMesh {
                 });
             }
         }
-        if let Some(set) = inner.connections.get_mut(node) {
-            set.clear();
+        if let Some(map) = inner.connections.get_mut(node) {
+            map.clear();
         }
         inner.in_flight.retain(|f| &f.from != node && &f.to != node);
     }
@@ -193,11 +204,13 @@ impl MemoryMesh {
 
         let mut delivered = 0usize;
         for frame in ready {
-            let still_connected = inner
+            let matching_conn = inner
                 .connections
                 .get(&frame.to)
-                .is_some_and(|peers| peers.contains(&frame.from));
-            if !still_connected {
+                .and_then(|peers| peers.get(&frame.from))
+                .copied()
+                == Some(frame.conn_gen);
+            if !matching_conn {
                 continue;
             }
             if let Ok(message) = decode_framed(&frame.framed_bytes)
@@ -252,20 +265,22 @@ impl Transport for MemoryNodeTransport {
         let already = inner
             .connections
             .get(&self.local)
-            .is_some_and(|s| s.contains(addr));
+            .is_some_and(|m| m.contains_key(addr));
         if already {
             return Ok(());
         }
+        let conn_gen = inner.next_conn_gen;
+        inner.next_conn_gen = conn_gen.saturating_add(1);
         inner
             .connections
             .entry(self.local.clone())
             .or_default()
-            .insert(addr.clone());
+            .insert(addr.clone(), conn_gen);
         inner
             .connections
             .entry(addr.clone())
             .or_default()
-            .insert(self.local.clone());
+            .insert(self.local.clone(), conn_gen);
 
         if let Some(q) = inner.inbox.get_mut(&self.local) {
             q.push_back(TransportEvent::PeerConnected { peer: addr.clone() });
@@ -283,11 +298,16 @@ impl Transport for MemoryNodeTransport {
         let removed_local = inner
             .connections
             .get_mut(&self.local)
-            .is_some_and(|s| s.remove(peer));
+            .is_some_and(|m| m.remove(peer).is_some());
         let removed_remote = inner
             .connections
             .get_mut(peer)
-            .is_some_and(|s| s.remove(&self.local));
+            .is_some_and(|m| m.remove(&self.local).is_some());
+        // Purge all in-flight frames in both directions so a reconnect cannot
+        // observe stale frames from the closed connection.
+        inner.in_flight.retain(|f| {
+            !((f.from == self.local && &f.to == peer) || (&f.from == peer && f.to == self.local))
+        });
         if removed_local || removed_remote {
             if let Some(q) = inner.inbox.get_mut(&self.local) {
                 q.push_back(TransportEvent::PeerDisconnected {
@@ -309,14 +329,20 @@ impl Transport for MemoryNodeTransport {
         // Always round-trip through canonical wire framing even in memory!
         let framed_bytes = encode_framed(&message)?;
         let mut inner = self.mesh.borrow_mut();
-        let connected = inner
-            .connections
-            .get(&self.local)
-            .is_some_and(|s| s.contains(to));
-        if !connected {
+        let Some(&conn_gen) = inner.connections.get(&self.local).and_then(|m| m.get(to)) else {
             return Err(TransportError::NotConnected(to.0.clone()));
-        }
+        };
         let cfg = inner.link_config(&self.local, to);
+        if cfg.max_in_flight_per_direction > 0 {
+            let current = inner
+                .in_flight
+                .iter()
+                .filter(|f| f.from == self.local && &f.to == to)
+                .count();
+            if current >= cfg.max_in_flight_per_direction {
+                return Err(TransportError::Backpressure(to.0.clone()));
+            }
+        }
         if cfg.partitioned {
             return Ok(());
         }
@@ -341,6 +367,7 @@ impl Transport for MemoryNodeTransport {
         inner.in_flight.push(InFlightFrame {
             deliver_at_step,
             seq,
+            conn_gen,
             from: self.local.clone(),
             to: to.clone(),
             framed_bytes,
@@ -362,7 +389,7 @@ impl Transport for MemoryNodeTransport {
         inner
             .connections
             .get(&self.local)
-            .map(|s| s.iter().cloned().collect())
+            .map(|m| m.keys().cloned().collect())
             .unwrap_or_default()
     }
 }

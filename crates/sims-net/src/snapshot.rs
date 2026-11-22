@@ -26,6 +26,10 @@ pub const MAX_SNAPSHOT_COMPRESSED_BYTES: u64 = MAX_SNAPSHOT_UNCOMPRESSED_BYTES +
 /// Maximum single snapshot chunk size (1 MiB, well below `MAX_WIRE_FRAME_BYTES`).
 pub const MAX_SNAPSHOT_CHUNK_BYTES: u32 = 1024 * 1024;
 
+/// Maximum number of chunks in a single snapshot transfer, bounding chunk-map
+/// metadata overhead against tiny-chunk memory amplification attacks.
+pub const MAX_SNAPSHOT_CHUNKS: u32 = 65_536;
+
 /// Compression algorithm applied to a snapshot payload.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SnapshotCompression {
@@ -53,10 +57,17 @@ impl SnapshotEnvelope {
             .map_err(|e| SnapshotError::Envelope(ProtocolError::Encode(e.to_string())))
     }
 
-    /// Decodes the envelope from `postcard` bytes.
+    /// Decodes the envelope from `postcard` bytes, rejecting trailing bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
-        postcard::from_bytes(bytes)
-            .map_err(|e| SnapshotError::Envelope(ProtocolError::Decode(e.to_string())))
+        let (env, rest) = postcard::take_from_bytes(bytes)
+            .map_err(|e| SnapshotError::Envelope(ProtocolError::Decode(e.to_string())))?;
+        if !rest.is_empty() {
+            return Err(SnapshotError::Envelope(ProtocolError::Decode(format!(
+                "unexpected {} trailing bytes in snapshot envelope",
+                rest.len()
+            ))));
+        }
+        Ok(env)
     }
 }
 
@@ -392,8 +403,15 @@ fn expected_chunk_count(compressed_len: u64, chunk_size: u32) -> Result<u32, Sna
         return Ok(0);
     }
     let count = compressed_len.div_ceil(u64::from(chunk_size));
-    u32::try_from(count).map_err(|_| SnapshotError::CompressedTooLarge {
-        len: compressed_len,
-        max: MAX_SNAPSHOT_COMPRESSED_BYTES,
-    })
+    let count_u32 = u32::try_from(count).map_err(|_| SnapshotError::TooManyChunks {
+        count: u32::MAX,
+        max: MAX_SNAPSHOT_CHUNKS,
+    })?;
+    if count_u32 > MAX_SNAPSHOT_CHUNKS {
+        return Err(SnapshotError::TooManyChunks {
+            count: count_u32,
+            max: MAX_SNAPSHOT_CHUNKS,
+        });
+    }
+    Ok(count_u32)
 }

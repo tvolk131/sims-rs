@@ -199,8 +199,16 @@ async fn iroh_invite_ticket_round_trip_and_loopback_lockstep_with_midgame_snapsh
             p2_node.poll(&mut p2_tr);
             p3_node.poll(&mut p3_tr);
             for ev in p3_node.drain_events() {
-                if let NodeEvent::ApplySnapshot { redb_bytes, .. } = ev {
+                if let NodeEvent::ApplySnapshot {
+                    snapshot_id,
+                    redb_bytes,
+                    ..
+                } = ev
+                {
                     p3_applied_bytes = Some(redb_bytes);
+                    p3_node
+                        .confirm_snapshot_applied(&mut p3_tr, snapshot_id)
+                        .expect("confirm p3 snapshot applied");
                 }
             }
             let _ = p2_node.drain_ready_ticks(true);
@@ -392,4 +400,73 @@ async fn iroh_loopback_three_player_host_failover_and_manifest_rejection() {
 
     survivor_tr.close().await;
     new_host_tr.close().await;
+}
+
+#[tokio::test]
+async fn iroh_loopback_simultaneous_cross_dial_converges_on_single_connection() {
+    let mut a = IrohTransport::bind(IrohConfig::Loopback).await.unwrap();
+    let mut b = IrohTransport::bind(IrohConfig::Loopback).await.unwrap();
+    let a_ticket = a.invite_ticket().encode_string().unwrap();
+    let b_ticket = b.invite_ticket().encode_string().unwrap();
+    let a_id = a.local_address().clone();
+    let b_id = b.local_address().clone();
+
+    // Initiate simultaneous cross-dials from both endpoints.
+    a.connect(&sims_net::PeerAddress::new(b_ticket)).unwrap();
+    b.connect(&sims_net::PeerAddress::new(a_ticket)).unwrap();
+
+    // Wait until both endpoints have a live connection to each other and settle tie-break.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if a.connected_peers().contains(&b_id) && b.connected_peers().contains(&a_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for simultaneous cross-dial");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Both sides must remain connected and exchange frames cleanly on the winning connection.
+    let ping_ab = sims_net::WireMessage::Heartbeat {
+        epoch: sims_net::Epoch::INITIAL,
+        tick: Tick(1),
+        sender: None,
+    };
+    let ping_ba = sims_net::WireMessage::Heartbeat {
+        epoch: sims_net::Epoch::INITIAL,
+        tick: Tick(2),
+        sender: None,
+    };
+    a.send(&b_id, ping_ab.clone()).unwrap();
+    b.send(&a_id, ping_ba.clone()).unwrap();
+
+    let mut a_got = false;
+    let mut b_got = false;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            for ev in a.drain_events() {
+                if matches!(ev, sims_net::TransportEvent::Message { message, .. } if message == ping_ba)
+                {
+                    a_got = true;
+                }
+            }
+            for ev in b.drain_events() {
+                if matches!(ev, sims_net::TransportEvent::Message { message, .. } if message == ping_ab)
+                {
+                    b_got = true;
+                }
+            }
+            if a_got && b_got {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timed out exchanging messages after simultaneous cross-dial");
+
+    a.close().await;
+    b.close().await;
 }

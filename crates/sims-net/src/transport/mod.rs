@@ -145,8 +145,14 @@ impl InviteTicket {
         if version != INVITE_TICKET_VERSION {
             return Err(TicketError::UnsupportedVersion(version));
         }
-        let decoded: TicketPayloadV1 = postcard::from_bytes(payload)
+        let (decoded, rest): (TicketPayloadV1, &[u8]) = postcard::take_from_bytes(payload)
             .map_err(|e| TicketError::Protocol(ProtocolError::Decode(e.to_string())))?;
+        if !rest.is_empty() {
+            return Err(TicketError::Protocol(ProtocolError::Decode(format!(
+                "unexpected {} trailing bytes in invite ticket",
+                rest.len()
+            ))));
+        }
         Ok(Self { addr: decoded.addr })
     }
 }

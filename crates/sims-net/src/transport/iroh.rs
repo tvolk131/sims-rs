@@ -5,11 +5,14 @@
 //! preamble followed by 4-byte length-prefixed `postcard` frames, and shareable
 //! [`InviteTicket`] tokens.
 //!
-//! - [`IrohConfig::loopback`]: binds locally on `127.0.0.1:0` using
-//!   `iroh::endpoint::presets::Minimal` (zero external relay or DNS traffic),
-//!   ideal for LAN play and deterministic loopback integration tests.
-//! - [`IrohConfig::p2p_default`]: uses `iroh::endpoint::presets::N0` with relay
-//!   servers and hole punching for internet co-op.
+//! Safety & liveness invariants:
+//! - Deterministic simultaneous-dial tie-breaking: both endpoints select the
+//!   same winning connection using total order on canonical `EndpointId`s.
+//! - Generation-gated event publication: messages and disconnects from a
+//!   superseded connection generation are discarded.
+//! - Bounded global and per-connection inbound byte/event budgets applying
+//!   natural QUIC flow-control backpressure to senders.
+//! - Graceful writer drain on disconnect so `Goodbye` frames flush cleanly.
 
 use crate::error::TransportError;
 use crate::protocol::{ALPN, MAX_WIRE_FRAME_BYTES, WireMessage, decode_payload, encode_framed};
@@ -20,12 +23,13 @@ use ::iroh::{
     Endpoint, EndpointAddr,
     endpoint::{Connection, RecvStream, SendStream, presets},
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 /// 4-byte preamble written by the dialer on every new bidirectional stream so
@@ -34,6 +38,21 @@ const STREAM_MAGIC: &[u8; 4] = b"SIM1";
 
 /// Bounded outbound frame queue depth per connected peer.
 const OUTBOUND_CHANNEL_CAP: usize = 256;
+
+/// Maximum buffered decoded inbound events across all connections.
+const MAX_INBOUND_EVENTS: usize = 1024;
+
+/// Maximum aggregate inbound decoded payload bytes buffered before applying
+/// QUIC stream backpressure (16 MiB).
+const MAX_GLOBAL_INBOUND_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum inbound decoded payload bytes buffered for a single peer before
+/// applying QUIC stream backpressure (4 MiB).
+const MAX_PER_PEER_INBOUND_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum time a writer task waits after `send.finish()` on graceful shutdown
+/// so a queued `Goodbye` frame can flush to the remote peer.
+const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// Configuration for binding an [`IrohTransport`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,24 +65,40 @@ pub enum IrohConfig {
 
 struct PeerHandle {
     conn_id: u64,
+    initiator_is_local: bool,
     tx: mpsc::Sender<Vec<u8>>,
     conn: Connection,
 }
 
+struct QueuedEvent {
+    event: TransportEvent,
+    _global_event_permit: Option<OwnedSemaphorePermit>,
+    _global_byte_permit: Option<OwnedSemaphorePermit>,
+    _peer_byte_permit: Option<OwnedSemaphorePermit>,
+}
+
 struct SharedState {
+    local_addr: PeerAddress,
     next_conn_id: AtomicU64,
     peers: Mutex<BTreeMap<PeerAddress, PeerHandle>>,
-    events: Mutex<VecDeque<TransportEvent>>,
+    dialing: Mutex<BTreeSet<PeerAddress>>,
+    events: Mutex<VecDeque<QueuedEvent>>,
     event_notify: Notify,
+    global_event_budget: Arc<Semaphore>,
+    global_byte_budget: Arc<Semaphore>,
 }
 
 impl SharedState {
-    fn new() -> Self {
+    fn new(local_addr: PeerAddress) -> Self {
         Self {
+            local_addr,
             next_conn_id: AtomicU64::new(1),
             peers: Mutex::new(BTreeMap::new()),
+            dialing: Mutex::new(BTreeSet::new()),
             events: Mutex::new(VecDeque::new()),
             event_notify: Notify::new(),
+            global_event_budget: Arc::new(Semaphore::new(MAX_INBOUND_EVENTS)),
+            global_byte_budget: Arc::new(Semaphore::new(MAX_GLOBAL_INBOUND_BYTES)),
         }
     }
 
@@ -71,27 +106,90 @@ impl SharedState {
         self.next_conn_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn push_event(&self, event: TransportEvent) {
+    fn push_control_event(&self, event: TransportEvent) {
         if let Ok(mut q) = self.events.lock() {
-            q.push_back(event);
+            q.push_back(QueuedEvent {
+                event,
+                _global_event_permit: None,
+                _global_byte_permit: None,
+                _peer_byte_permit: None,
+            });
         }
         self.event_notify.notify_waiters();
     }
 
-    fn register_peer(&self, peer: PeerAddress, handle: PeerHandle) {
-        let replaced = if let Ok(mut map) = self.peers.lock() {
-            if let Some(old) = map.insert(peer.clone(), handle) {
-                old.conn.close(0u32.into(), b"replaced");
-                true
+    fn push_message_for_conn(
+        &self,
+        peer: &PeerAddress,
+        conn_id: u64,
+        message: WireMessage,
+        global_event_permit: OwnedSemaphorePermit,
+        global_byte_permit: OwnedSemaphorePermit,
+        peer_byte_permit: OwnedSemaphorePermit,
+    ) -> bool {
+        let is_active = self
+            .peers
+            .lock()
+            .ok()
+            .is_some_and(|map| map.get(peer).is_some_and(|h| h.conn_id == conn_id));
+        if !is_active {
+            return false;
+        }
+        if let Ok(mut q) = self.events.lock() {
+            q.push_back(QueuedEvent {
+                event: TransportEvent::Message {
+                    from: peer.clone(),
+                    message,
+                },
+                _global_event_permit: Some(global_event_permit),
+                _global_byte_permit: Some(global_byte_permit),
+                _peer_byte_permit: Some(peer_byte_permit),
+            });
+        }
+        self.event_notify.notify_waiters();
+        true
+    }
+
+    /// Registers a peer connection using deterministic simultaneous-dial
+    /// tie-breaking so both endpoints always keep the same QUIC connection.
+    ///
+    /// Returns `true` if `handle` was installed as the active connection, or
+    /// `false` if an existing higher-priority connection won the tie-break (in
+    /// which case `handle.conn` is closed).
+    fn register_peer(&self, peer: PeerAddress, handle: PeerHandle) -> bool {
+        let mut emit_connected = false;
+        let accepted = if let Ok(mut map) = self.peers.lock() {
+            if let Some(existing) = map.get(&peer) {
+                let local_wins_tie = self.local_addr < peer;
+                let incoming_wins = if existing.initiator_is_local == handle.initiator_is_local {
+                    // Same initiator reconnecting: newer replaces older.
+                    true
+                } else {
+                    // Simultaneous cross-dial: both sides agree on the initiator
+                    // with the lexicographically smaller canonical EndpointId.
+                    handle.initiator_is_local == local_wins_tie
+                };
+                if incoming_wins {
+                    if let Some(old) = map.insert(peer.clone(), handle) {
+                        old.conn.close(0u32.into(), b"replaced");
+                    }
+                    true
+                } else {
+                    handle.conn.close(0u32.into(), b"tie-lost");
+                    false
+                }
             } else {
-                false
+                map.insert(peer.clone(), handle);
+                emit_connected = true;
+                true
             }
         } else {
             false
         };
-        if !replaced {
-            self.push_event(TransportEvent::PeerConnected { peer });
+        if emit_connected {
+            self.push_control_event(TransportEvent::PeerConnected { peer });
         }
+        accepted
     }
 
     fn remove_peer(&self, peer: &PeerAddress, conn_id: u64, reason: String) {
@@ -105,7 +203,7 @@ impl SharedState {
             false
         };
         if removed {
-            self.push_event(TransportEvent::PeerDisconnected {
+            self.push_control_event(TransportEvent::PeerDisconnected {
                 peer: peer.clone(),
                 reason,
             });
@@ -147,7 +245,7 @@ impl IrohTransport {
         };
 
         let local_addr = PeerAddress(endpoint.id().to_string());
-        let shared = Arc::new(SharedState::new());
+        let shared = Arc::new(SharedState::new(local_addr.clone()));
         let runtime = Handle::current();
 
         let accept_task = runtime.spawn(accept_loop(endpoint.clone(), Arc::clone(&shared)));
@@ -212,6 +310,7 @@ impl IrohTransport {
             &self.runtime,
             Arc::clone(&self.shared),
             peer_addr.clone(),
+            true,
             conn,
             send,
             recv,
@@ -219,28 +318,46 @@ impl IrohTransport {
         Ok(peer_addr)
     }
 
-    /// Waits asynchronously until at least one [`TransportEvent`] is queued.
+    /// Waits asynchronously until at least one [`TransportEvent`] is queued
+    /// without missed-wakeup races.
     pub async fn wait_for_event(&self) {
-        if self
-            .shared
-            .events
-            .lock()
-            .ok()
-            .is_some_and(|q| !q.is_empty())
-        {
-            return;
+        loop {
+            let notified = self.shared.event_notify.notified();
+            tokio::pin!(notified);
+            // Register waiter before checking the queue.
+            notified.as_mut().enable();
+            if self
+                .shared
+                .events
+                .lock()
+                .ok()
+                .is_some_and(|q| !q.is_empty())
+            {
+                return;
+            }
+            notified.await;
         }
-        self.shared.event_notify.notified().await;
     }
 
-    /// Gracefully closes all peer connections and the underlying `iroh`
-    /// endpoint.
+    /// Gracefully closes all peer connections (allowing queued outbound frames
+    /// such as `Goodbye` a brief window to flush) and closes the underlying
+    /// `iroh` endpoint.
     pub async fn close(mut self) {
         self.closed = true;
-        if let Ok(mut map) = self.shared.peers.lock() {
-            for (_, handle) in std::mem::take(&mut *map) {
-                handle.conn.close(0u32.into(), b"closing");
-            }
+        let handles: Vec<PeerHandle> = self
+            .shared
+            .peers
+            .lock()
+            .ok()
+            .map(|mut map| std::mem::take(&mut *map).into_values().collect())
+            .unwrap_or_default();
+        // Drop `tx` senders first so writer tasks flush queued frames + `send.finish()`.
+        let conns: Vec<Connection> = handles.into_iter().map(|h| h.conn).collect();
+        if !conns.is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        for conn in conns {
+            conn.close(0u32.into(), b"closing");
         }
         self.endpoint.close().await;
         if let Some(task) = self.accept_task.take() {
@@ -289,33 +406,55 @@ impl Transport for IrohTransport {
         {
             return Ok(());
         }
+        // Deduplicate concurrent in-flight dials to the same peer.
+        if let Ok(mut dialing) = self.shared.dialing.lock()
+            && !dialing.insert(peer_addr.clone())
+        {
+            return Ok(());
+        }
 
         let endpoint = self.endpoint.clone();
         let shared = Arc::clone(&self.shared);
         let runtime = self.runtime.clone();
         self.runtime.spawn(async move {
-            let Ok(conn) = endpoint.connect(remote_addr, ALPN).await else {
-                shared.push_event(TransportEvent::PeerDisconnected {
-                    peer: peer_addr,
-                    reason: "connect failed".to_string(),
-                });
-                return;
-            };
-            let Ok((mut send, recv)) = conn.open_bi().await else {
-                shared.push_event(TransportEvent::PeerDisconnected {
-                    peer: peer_addr,
-                    reason: "open_bi failed".to_string(),
-                });
-                return;
-            };
-            if send.write_all(STREAM_MAGIC).await.is_err() {
-                shared.push_event(TransportEvent::PeerDisconnected {
-                    peer: peer_addr,
-                    reason: "preamble write failed".to_string(),
-                });
-                return;
+            let outcome: Result<(Connection, SendStream, RecvStream), String> = async {
+                let conn = endpoint
+                    .connect(remote_addr, ALPN)
+                    .await
+                    .map_err(|e| format!("connect failed: {e}"))?;
+                let (mut send, recv) = conn
+                    .open_bi()
+                    .await
+                    .map_err(|e| format!("open_bi failed: {e}"))?;
+                send.write_all(STREAM_MAGIC)
+                    .await
+                    .map_err(|e| format!("preamble write failed: {e}"))?;
+                Ok((conn, send, recv))
             }
-            spawn_peer_io(&runtime, shared, peer_addr, conn, send, recv);
+            .await;
+
+            if let Ok(mut dialing) = shared.dialing.lock() {
+                dialing.remove(&peer_addr);
+            }
+
+            match outcome {
+                Ok((conn, send, recv)) => {
+                    spawn_peer_io(&runtime, shared, peer_addr, true, conn, send, recv);
+                }
+                Err(reason) => {
+                    let already_connected = shared
+                        .peers
+                        .lock()
+                        .ok()
+                        .is_some_and(|m| m.contains_key(&peer_addr));
+                    if !already_connected {
+                        shared.push_control_event(TransportEvent::PeerDisconnected {
+                            peer: peer_addr,
+                            reason,
+                        });
+                    }
+                }
+            }
         });
         Ok(())
     }
@@ -329,11 +468,20 @@ impl Transport for IrohTransport {
             .ok()
             .and_then(|mut map| map.remove(&key));
         if let Some(handle) = removed {
-            handle.conn.close(0u32.into(), b"disconnect");
-            self.shared.push_event(TransportEvent::PeerDisconnected {
-                peer: key,
-                reason: "disconnected".to_string(),
+            // Drop `handle.tx` so the writer task finishes flushing any queued
+            // frames (such as `Goodbye`) and calls `send.finish()`, then close
+            // the QUIC connection after a bounded drain window.
+            let conn = handle.conn;
+            drop(handle.tx);
+            self.runtime.spawn(async move {
+                tokio::time::sleep(GRACEFUL_DRAIN_TIMEOUT).await;
+                conn.close(0u32.into(), b"disconnect");
             });
+            self.shared
+                .push_control_event(TransportEvent::PeerDisconnected {
+                    peer: key,
+                    reason: "disconnected".to_string(),
+                });
         }
         Ok(())
     }
@@ -363,7 +511,7 @@ impl Transport for IrohTransport {
             .events
             .lock()
             .ok()
-            .map(|mut q| q.drain(..).collect())
+            .map(|mut q| q.drain(..).map(|item| item.event).collect())
             .unwrap_or_default()
     }
 
@@ -395,7 +543,7 @@ async fn accept_loop(endpoint: Endpoint, shared: Arc<SharedState>) {
                 conn.close(1u32.into(), b"bad magic");
                 return;
             }
-            spawn_peer_io(&runtime, shared, peer_addr, conn, send, recv);
+            spawn_peer_io(&runtime, shared, peer_addr, false, conn, send, recv);
         });
     }
 }
@@ -404,22 +552,30 @@ fn spawn_peer_io(
     runtime: &Handle,
     shared: Arc<SharedState>,
     peer_addr: PeerAddress,
+    initiator_is_local: bool,
     conn: Connection,
     mut send: SendStream,
     mut recv: RecvStream,
 ) {
     let conn_id = shared.alloc_conn_id();
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CHANNEL_CAP);
-    shared.register_peer(
+    let accepted = shared.register_peer(
         peer_addr.clone(),
         PeerHandle {
             conn_id,
+            initiator_is_local,
             tx,
             conn: conn.clone(),
         },
     );
+    if !accepted {
+        return;
+    }
 
-    // Writer task
+    let peer_byte_budget = Arc::new(Semaphore::new(MAX_PER_PEER_INBOUND_BYTES));
+
+    // Writer task: drains all queued frames even after `tx` is dropped so
+    // `Goodbye` frames flush cleanly before `send.finish()`.
     let writer_shared = Arc::clone(&shared);
     let writer_peer = peer_addr.clone();
     runtime.spawn(async move {
@@ -432,7 +588,9 @@ fn spawn_peer_io(
         let _ = send.finish();
     });
 
-    // Reader task
+    // Reader task: acquires per-peer and global event/byte permits before
+    // buffering decoded messages, applying natural QUIC flow-control
+    // backpressure when the caller falls behind draining events.
     runtime.spawn(async move {
         loop {
             let mut len_buf = [0u8; 4];
@@ -446,16 +604,44 @@ fn spawn_peer_io(
                 shared.remove_peer(&peer_addr, conn_id, "frame exceeded max length".to_string());
                 return;
             }
+            let permit_bytes = payload_len.clamp(1, MAX_PER_PEER_INBOUND_BYTES) as u32;
+            let Ok(global_event_permit) = Arc::clone(&shared.global_event_budget)
+                .acquire_owned()
+                .await
+            else {
+                return;
+            };
+            let Ok(global_byte_permit) = Arc::clone(&shared.global_byte_budget)
+                .acquire_many_owned(permit_bytes)
+                .await
+            else {
+                return;
+            };
+            let Ok(peer_byte_permit) = Arc::clone(&peer_byte_budget)
+                .acquire_many_owned(permit_bytes)
+                .await
+            else {
+                return;
+            };
+
             let mut payload = vec![0u8; payload_len];
             if let Err(err) = recv.read_exact(&mut payload).await {
                 shared.remove_peer(&peer_addr, conn_id, format!("truncated frame: {err}"));
                 return;
             }
             match decode_payload(&payload) {
-                Ok(message) => shared.push_event(TransportEvent::Message {
-                    from: peer_addr.clone(),
-                    message,
-                }),
+                Ok(message) => {
+                    if !shared.push_message_for_conn(
+                        &peer_addr,
+                        conn_id,
+                        message,
+                        global_event_permit,
+                        global_byte_permit,
+                        peer_byte_permit,
+                    ) {
+                        return;
+                    }
+                }
                 Err(err) => {
                     conn.close(3u32.into(), b"invalid payload");
                     shared.remove_peer(&peer_addr, conn_id, format!("decode error: {err}"));

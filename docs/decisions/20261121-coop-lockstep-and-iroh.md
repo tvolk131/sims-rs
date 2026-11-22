@@ -57,19 +57,31 @@ and clock:
      (round-tripping every message through length-prefixed `postcard` framing)
      with configurable latency, seeded drops, reordering jitter, partitions, and
      abrupt node crashes.
-   - `IrohTransport` runs on `iroh` 1.4 (`ALPN = b"sims-rs/coop/1"`) with one
-     bidirectional QUIC stream per peer (`"SIM1"` stream preamble + 4-byte
-     length-prefixed `postcard` frames) and `simscoop1...` base32 `InviteTicket`
-     tokens. `IrohConfig::Loopback` uses `presets::Minimal` on `127.0.0.1:0` for
+   - `IrohTransport` runs on `iroh` 1.x (resolved `1.5.0`, bumping workspace
+     `rust-version` from `1.90` to `1.91`; CI runs `1.99.0`) with ALPN
+     `b"sims-rs/coop/1"`, one bidirectional QUIC stream per peer (`"SIM1"`
+     stream preamble + 4-byte length-prefixed `postcard` frames), deterministic
+     simultaneous-dial tie-breaking, bounded inbound byte/event flow-control
+     budgets, and `simscoop1...` base32 `InviteTicket` tokens.
+     `IrohConfig::Loopback` uses `presets::Minimal` on `127.0.0.1:0` for
      offline/CI integration tests; `IrohConfig::P2pDefault` uses `presets::N0`
      with relay + hole punching.
 
 5. **Deterministic host failover with epoch fencing:**
-   On host departure, all surviving peers deterministically elect the lowest
-   remaining `PlayerId` at `epoch + 1`. Stale batches from prior epochs are
-   discarded. Peers already aligned at `resume_tick` continue without a
-   snapshot; peers behind `resume_tick` automatically request a REDB snapshot
-   (`ResyncReason::HostFailover`).
+   On host departure, all surviving peers fence unexecuted old-epoch batches
+   and deterministically elect the lowest remaining `PlayerId` at `epoch + 1`,
+   advancing to the next surviving candidate if the primary candidate is
+   unreachable. Stale batches from prior epochs are discarded. Peers take the
+   same-tick continuation shortcut only when tick, adopted `SessionState`
+   fingerprint, and recorded state fingerprint match; otherwise they request an
+   atomic REDB snapshot (`ResyncReason::HostFailover`).
+
+6. **Two-phase snapshot installation and resumable chunk streaming:**
+   Host snapshot transmission retains a per-transfer chunk cursor and resumes
+   cleanly across transport backpressure. Peers verify SHA-256 digests and keep
+   stepping blocked until the caller loads the REDB world and calls
+   `LockstepNode::confirm_snapshot_applied`, which atomically installs
+   `SessionState` and sends the completion `SnapshotAck`.
 
 ## Reopening Criteria
 

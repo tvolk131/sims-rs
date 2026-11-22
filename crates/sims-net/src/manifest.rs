@@ -147,6 +147,15 @@ fn canonicalize_relative_path(raw: &str) -> Result<String, ManifestError> {
     if raw.is_empty() || raw.contains('\0') {
         return Err(ManifestError::InvalidPath(raw.to_string()));
     }
+    // Reject rooted POSIX paths (`/foo`), Windows rooted/UNC paths (`\foo`, `\\server\share`),
+    // and Windows drive-qualified paths (`C:foo`, `C:\foo`).
+    if raw.starts_with('/') || raw.starts_with('\\') {
+        return Err(ManifestError::InvalidPath(raw.to_string()));
+    }
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(ManifestError::InvalidPath(raw.to_string()));
+    }
     let normalized = raw.replace('\\', "/");
     let mut parts = Vec::new();
     for part in normalized.split('/') {

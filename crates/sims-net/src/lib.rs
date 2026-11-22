@@ -49,8 +49,9 @@ pub use session::{
     SessionState, TimeControlState,
 };
 pub use snapshot::{
-    CompletedSnapshot, MAX_SNAPSHOT_CHUNK_BYTES, MAX_SNAPSHOT_UNCOMPRESSED_BYTES, SnapshotChunk,
-    SnapshotCompression, SnapshotEnvelope, SnapshotHeader, SnapshotReceiver, SnapshotSender,
+    CompletedSnapshot, MAX_SNAPSHOT_CHUNK_BYTES, MAX_SNAPSHOT_CHUNKS,
+    MAX_SNAPSHOT_UNCOMPRESSED_BYTES, SnapshotChunk, SnapshotCompression, SnapshotEnvelope,
+    SnapshotHeader, SnapshotReceiver, SnapshotSender,
 };
 pub use transport::{
     InviteTicket, IrohConfig, IrohTransport, LinkConfig, MemoryMesh, MemoryNodeTransport,

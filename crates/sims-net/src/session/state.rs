@@ -18,7 +18,7 @@ use crate::protocol::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const SESSION_FP_DOMAIN: &[u8] = b"sims-net/session-state/v1\0";
 const COMBINED_FP_DOMAIN: &[u8] = b"sims-net/combined-state/v1\0";
@@ -36,6 +36,8 @@ pub struct PerPlayerState {
     pub camera_rotation: CameraRotation,
     /// Optional transport address / invite ticket used for host failover.
     pub endpoint_hint: Option<String>,
+    /// Canonical authenticated transport identity bound on join.
+    pub transport_addr: Option<String>,
 }
 
 /// Shared speed, pause, and attribution state.
@@ -186,7 +188,11 @@ impl SessionState {
         host_endpoint_hint: Option<String>,
         config: SessionConfig,
     ) -> Self {
+        let config = config.sanitized();
         let host_id = PlayerId::INITIAL_HOST;
+        let host_transport_addr = host_endpoint_hint
+            .as_deref()
+            .map(crate::session::lockstep::canonical_addr_string_from_hint);
         let mut players = BTreeMap::new();
         players.insert(
             host_id,
@@ -198,6 +204,7 @@ impl SessionState {
                 selected_sim: None,
                 camera_rotation: CameraRotation::NORTH,
                 endpoint_hint: host_endpoint_hint,
+                transport_addr: host_transport_addr,
             },
         );
         let time = TimeControlState::from_config(&config);
@@ -343,6 +350,15 @@ impl SessionState {
         self.players.keys().copied().find(|&id| id != self.host_id)
     }
 
+    /// Deterministically selects the next host excluding both the current host
+    /// and any unreachable/failed failover candidates.
+    pub fn select_next_host_excluding(&self, excluded: &BTreeSet<PlayerId>) -> Option<PlayerId> {
+        self.players
+            .keys()
+            .copied()
+            .find(|id| *id != self.host_id && !excluded.contains(id))
+    }
+
     /// Builds a deterministic roster snapshot (sorted by [`PlayerId`]).
     pub fn roster(&self) -> Vec<PeerRosterEntry> {
         self.players
@@ -446,6 +462,7 @@ impl SessionState {
                 selected_sim,
                 camera_rotation,
                 endpoint_hint,
+                transport_addr,
             } => {
                 if issuer != self.host_id {
                     return CommandOutcome::Rejected(CommandRejectReason::HostOnly);
@@ -456,6 +473,11 @@ impl SessionState {
                 if player_id.0 >= self.next_player_id {
                     self.next_player_id = player_id.0.saturating_add(1);
                 }
+                let canonical_transport = transport_addr.clone().or_else(|| {
+                    endpoint_hint
+                        .as_deref()
+                        .map(crate::session::lockstep::canonical_addr_string_from_hint)
+                });
                 self.players.insert(
                     *player_id,
                     PerPlayerState {
@@ -466,6 +488,7 @@ impl SessionState {
                         selected_sim: *selected_sim,
                         camera_rotation: camera_rotation.normalized(),
                         endpoint_hint: endpoint_hint.clone(),
+                        transport_addr: canonical_transport,
                     },
                 );
                 CommandOutcome::Applied
