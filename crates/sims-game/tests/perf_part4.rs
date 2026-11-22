@@ -75,10 +75,9 @@ fn validate_save_payload_header_rejects_short_and_bad_versions() {
 #[test]
 fn autosave_worker_rejects_corrupt_body_bytes_and_tracks_unread_completions() {
     let tmp = TempTestDir::new("sol-r1-autosave");
-    let store =
-        sims_sim::NeighborhoodStore::open(&tmp.path().join("saves.redb")).expect("open redb store");
-    let autosaves = store.autosaves();
-    let worker = AutosaveWorker::spawn(autosaves.clone());
+    let autosaves = sims_sim::AutosaveStore::open(&tmp.path().join("autosaves.redb"))
+        .expect("open standalone autosave store");
+    let worker = AutosaveWorker::spawn(autosaves);
 
     let mut bogus_saved = Vec::new();
     bogus_saved.extend_from_slice(&sims_vm::boot::save::FORMAT.to_le_bytes());
@@ -86,15 +85,12 @@ fn autosave_worker_rejects_corrupt_body_bytes_and_tracks_unread_completions() {
     bogus_saved.extend_from_slice(b"corrupt-body-bytes");
 
     worker
-        .enqueue_saved_lot_bytes(
+        .enqueue_job(sims_sim::autosave::SaveJob::manual(
             "UserData",
-            0,
             5,
-            SaveTarget::Manual,
             1,
-            format_save_label(Some("Goth"), 1, 8, 0),
-            bogus_saved,
-        )
+            sims_sim::autosave::SavePayload::saved_lot(bogus_saved),
+        ))
         .expect("enqueue");
     worker.flush();
     assert!(
@@ -104,8 +100,12 @@ fn autosave_worker_rejects_corrupt_body_bytes_and_tracks_unread_completions() {
     let done = worker.poll_completions();
     assert_eq!(done.len(), 1);
     assert!(
-        done[0].result.is_err(),
-        "caller-supplied valid-header corrupt-body bytes must be rejected"
+        matches!(
+            done[0].result,
+            Err(sims_sim::autosave::SaveError::DecodeFailed { .. })
+        ),
+        "caller-supplied valid-header corrupt-body bytes must fail with DecodeFailed, got {:?}",
+        done[0].result
     );
     assert!(
         !worker.has_pending_or_unread(),
@@ -367,6 +367,35 @@ fn perf_part4_track1_measurements_and_parity() {
     for c in &completions {
         assert!(c.result.is_ok(), "save failed: {:?}", c.result);
     }
+    // Verify `enqueue_saved_lot_bytes` with a real neighborhood `instance_id`
+    // rejects a valid-header / corrupt-body payload with `SaveError::DecodeFailed`
+    // and never overwrites the existing intact manual save.
+    let mut corrupt_body = Vec::new();
+    corrupt_body.extend_from_slice(&sims_vm::boot::save::FORMAT.to_le_bytes());
+    corrupt_body.extend_from_slice(&sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
+    corrupt_body.extend_from_slice(b"corrupt-body-payload");
+    worker
+        .enqueue_saved_lot_bytes(
+            "UserData",
+            instance_id,
+            5,
+            SaveTarget::ManualForceReplace,
+            999,
+            format_save_label(Some("Goth"), 2, 8, 0),
+            corrupt_body,
+        )
+        .expect("enqueue corrupt bytes");
+    worker.flush();
+    let bad_done = worker.poll_completions();
+    assert_eq!(bad_done.len(), 1);
+    assert!(
+        matches!(
+            bad_done[0].result,
+            Err(sims_sim::autosave::SaveError::DecodeFailed { .. })
+        ),
+        "enqueue_saved_lot_bytes must fail with DecodeFailed on corrupt body, got {:?}",
+        bad_done[0].result
+    );
     drop(worker);
 
     let autosaves = shell.store().autosaves();

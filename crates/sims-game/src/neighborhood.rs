@@ -1532,11 +1532,15 @@ impl NeighborhoodShell {
     /// polls background save completions. Returns `true` when the active screen
     /// should be redrawn.
     pub fn tick_shell(&mut self, delta_us: u64) -> bool {
+        let prev_clock = self.clock_us;
         self.clock_us = self.clock_us.saturating_add(delta_us);
         let mut redraw = self.poll_background_saves();
         if self.album_dialog.is_open() {
             self.album_dialog.advance_time(delta_us);
-            redraw = true;
+            let blink = sims_ui::hud::PAUSE_BLINK_US;
+            if (prev_clock / blink) != (self.clock_us / blink) {
+                redraw = true;
+            }
         }
         if self.coop_lobby.is_open() && self.coop_lobby.sync_blink(self.clock_us) {
             redraw = true;
@@ -1645,7 +1649,8 @@ impl NeighborhoodShell {
         }
         if can_draw {
             if self.album_dialog.is_open() {
-                consider(CARET_POLL_US);
+                let blink = sims_ui::hud::PAUSE_BLINK_US;
+                consider((blink - (self.clock_us % blink)).max(1_000));
             }
             if self.coop_lobby.is_open() {
                 consider(CARET_POLL_US);
