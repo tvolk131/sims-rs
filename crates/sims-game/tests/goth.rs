@@ -8502,3 +8502,948 @@ fn pie_head_respects_house_depth_buffer_lessequal() {
         .count();
     assert_eq!(updated_depths, 1_940);
 }
+
+/// Strict 1,200-update replay of Track 2's Complete Collection 1.91
+/// `goth-build-wall-floor-20261121` recording on its exact drawn-frame
+/// schedule (`0,1,2,3+30`, verified across all 150 `watch.jsonl` rows):
+/// - Live updates `1..=93` (`tick=88_537`, `g[19]=0`, `funds=2542`,
+///   `arch=33654`, `n_obj=345`, `lot_rng=2_189_872_521`);
+/// - `F3` -> Build Mode (`g[19]=1`) before `u=94`;
+/// - Click `(380, 525)` (Wall Tool) before `u=244`: spawns `"Wall Cursor"`
+///   `260` (`0x00000439`, `data=[0,0,0]`, off-lot, `n_obj=346`);
+/// - Drag `(470, 380) -> (500, 365) -> (530, 350)` across `u=304..=394`:
+///   builds 3-tile bare wall (`-$210`, `funds=2332`, `arch=33864`), `"Wall
+///   Cursor"` `260` at `[417, 577, 1]` (`room=0`);
+/// - Click `(337, 573)` (Floor Tool) before `u=484`: deletes `"Wall Cursor"`
+///   `260` (`n_obj=345`);
+/// - Click `(510, 390)` before `u=544`: lays 1 terracotta floor tile (`-$3`,
+///   `funds=2329`, `arch=33867`);
+/// - Click `(423, 525)` (Wallpaper Tool) before `u=634`: spawns `"Wall Cursor"`
+///   `260` (`data=[2,0,0]`, off-lot, `n_obj=346`);
+/// - Click `(625, 525)` (Wallpaper catalog slot 1, `$3` cream wallpaper) and
+///   apply at `(500, 345)` before `u=784`: `"Wall Cursor"` `260` at
+///   `[440, 584, 1]` `data=[2,6,0]`, `funds=2326`, `arch=33870`;
+/// - `F1` -> Live Mode (`g[19]=0`) before `u=844`: deletes `"Wall Cursor"`
+///   `260` (`n_obj=345`), resumes Live (`tick=88_538`);
+/// - Live updates `844..=1200`: `tick=88_894`, `funds=2326`, `arch=33870`,
+///   `n_obj=346`, `lot_rng=2_327_799_612`, `global_rng=270_289_136`.
+#[test]
+fn build_mode_wall_floor_wallpaper_replays_recorded_goth_session() {
+    use sims_ui::command::{BuildTool, Mode};
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse("0,1,2,3+30").expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    let before_build = game.render().color.clone();
+
+    let arch_today = |g: &Game| g.lot().world().budget.days[0].unwrap()[7];
+
+    // Live updates 1..=93.
+    run_to(&mut game, &schedule, 93);
+    assert_eq!(game.lot().world().ticks, 88_537);
+    assert_eq!(game.lot().world().globals[19], 0);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    assert_eq!(arch_today(&game), 33_654);
+    assert_eq!(game.lot().world().lot_rng.state(), 2_189_872_521);
+    assert_eq!(game.lot().world().global_rng.state(), 270_289_136);
+    assert_eq!(game.lot().world().objects.len(), 345);
+
+    // F3 -> Build Mode before u=94.
+    game.set_mode(Mode::Build);
+    assert_eq!(game.lot().world().globals[19], 1);
+    run_to(&mut game, &schedule, 94);
+    assert_eq!(game.lot().world().ticks, 88_537);
+    assert_eq!(game.lot().world().globals[19], 1);
+    assert_eq!(game.lot().world().objects.len(), 345);
+    game.render();
+
+    // Click (380, 525) (Wall Tool) before u=244 -> spawns Wall Cursor 260 off-lot.
+    run_to(&mut game, &schedule, 243);
+    game.press([380, 525]);
+    game.release([380, 525]);
+    run_to(&mut game, &schedule, 244);
+    assert_eq!(game.build_state().tool, Some(BuildTool::Wall));
+    assert_eq!(game.lot().world().objects.len(), 346);
+    let wc = game
+        .lot()
+        .world()
+        .objects
+        .get(&260)
+        .expect("Wall Cursor id 260");
+    assert_eq!(wc.guid, sims_vm::WALL_CURSOR_GUID);
+    assert_eq!(&wc.data[..3], &[0, 0, 0]);
+    assert!(wc.position[0] < 0);
+
+    // Drag (470, 380) -> (500, 365) -> (530, 350) across u=304..u=394.
+    run_to(&mut game, &schedule, 303);
+    let p_start = recorded([470, 380]);
+    let p_mid = recorded([500, 365]);
+    let p_end = recorded([530, 350]);
+    game.hover(p_start);
+    game.press(p_start);
+    run_to(&mut game, &schedule, 304);
+    assert_eq!(game.lot().world().objects[&260].position, [577, 465, 1]);
+    assert_eq!(game.lot().world().objects[&260].data[29], 0);
+
+    run_to(&mut game, &schedule, 363);
+    game.hover(p_mid);
+    game.hover(p_end);
+    run_to(&mut game, &schedule, 364);
+    assert_eq!(game.lot().world().objects[&260].position, [577, 417, 1]);
+
+    run_to(&mut game, &schedule, 393);
+    game.release(p_end);
+    run_to(&mut game, &schedule, 394);
+    assert_eq!(game.lot().world().budget.funds, 2332);
+    assert_eq!(game.lot().world().globals[13], 2332);
+    assert_eq!(arch_today(&game), 33_864);
+    assert_eq!(game.lot().world().objects.len(), 346);
+    assert_eq!(game.lot().world().objects[&260].position, [577, 417, 1]);
+    let after_wall = game.render().color.clone();
+
+    // Verify rendered pixels changed visibly where the 3-tile wall stands.
+    let wall_px_changed = ((p_end[1] - 80) as usize..(p_start[1] + 20) as usize)
+        .flat_map(|y| {
+            ((p_start[0] - 20) as usize..(p_end[0] + 20) as usize).map(move |x| y * 800 + x)
+        })
+        .filter(|&i| after_wall[i] != before_build[i])
+        .count();
+    assert!(
+        wall_px_changed > 500,
+        "expected visible built wall pixels, got {wall_px_changed}"
+    );
+
+    // Click (337, 573) (Floor Tool) before u=484 -> deletes Wall Cursor 260.
+    run_to(&mut game, &schedule, 483);
+    game.press([337, 573]);
+    game.release([337, 573]);
+    run_to(&mut game, &schedule, 484);
+    assert_eq!(game.build_state().tool, Some(BuildTool::Floor));
+    assert_eq!(game.lot().world().objects.len(), 345);
+    assert!(!game.lot().world().objects.contains_key(&260));
+
+    // Click (510, 390) before u=544 -> lays 1 floor tile (-$3: 2332 -> 2329).
+    run_to(&mut game, &schedule, 543);
+    let p_floor = recorded([510, 390]);
+    game.hover(p_floor);
+    game.press(p_floor);
+    game.release(p_floor);
+    run_to(&mut game, &schedule, 544);
+    assert_eq!(game.lot().world().budget.funds, 2329);
+    assert_eq!(arch_today(&game), 33_867);
+    assert_eq!(game.lot().world().objects.len(), 345);
+    let after_floor = game.render().color.clone();
+    let floor_px_changed = ((p_floor[1] - 40) as usize..(p_floor[1] + 40) as usize)
+        .flat_map(|y| {
+            ((p_floor[0] - 50) as usize..(p_floor[0] + 50) as usize).map(move |x| y * 800 + x)
+        })
+        .filter(|&i| after_floor[i] != after_wall[i])
+        .count();
+    assert!(
+        floor_px_changed > 80,
+        "expected visible laid floor tile pixels, got {floor_px_changed}"
+    );
+
+    // Click (423, 525) (Wallpaper Tool) before u=634 -> spawns Wall Cursor 260 (data[0]=2).
+    run_to(&mut game, &schedule, 633);
+    game.press([423, 525]);
+    game.release([423, 525]);
+    run_to(&mut game, &schedule, 634);
+    assert_eq!(game.build_state().tool, Some(BuildTool::Wallpaper));
+    assert_eq!(game.lot().world().objects.len(), 346);
+    let wc_wp = game
+        .lot()
+        .world()
+        .objects
+        .get(&260)
+        .expect("Wallpaper Wall Cursor id 260");
+    assert_eq!(wc_wp.guid, sims_vm::WALL_CURSOR_GUID);
+    assert_eq!(&wc_wp.data[..3], &[2, 0, 0]);
+    assert!(wc_wp.position[0] < 0);
+
+    // Click (625, 525) (Wallpaper catalog slot 1, $3 cream wallpaper) before u=664.
+    run_to(&mut game, &schedule, 663);
+    game.press([625, 525]);
+    game.release([625, 525]);
+    run_to(&mut game, &schedule, 664);
+
+    // Click (500, 345) before u=784 -> Wall Cursor 260 at [584, 440, 1], data[1]=6, -$3.
+    run_to(&mut game, &schedule, 783);
+    let p_paper = recorded([500, 345]);
+    game.hover(p_paper);
+    game.press(p_paper);
+    game.release(p_paper);
+    run_to(&mut game, &schedule, 784);
+    assert_eq!(game.lot().world().budget.funds, 2326);
+    assert_eq!(arch_today(&game), 33_870);
+    assert_eq!(game.lot().world().objects.len(), 346);
+    let wc_applied = &game.lot().world().objects[&260];
+    assert_eq!(wc_applied.position, [584, 440, 1]);
+    assert_eq!(wc_applied.data[0], 2);
+    assert_eq!(wc_applied.data[1], 6);
+    assert_eq!(wc_applied.data[29], 0);
+    let after_paper = game.render().color.clone();
+    let paper_px_changed = ((p_paper[1] - 50) as usize..(p_paper[1] + 50) as usize)
+        .flat_map(|y| {
+            ((p_paper[0] - 40) as usize..(p_paper[0] + 40) as usize).map(move |x| y * 800 + x)
+        })
+        .filter(|&i| after_paper[i] != after_floor[i])
+        .count();
+    assert!(
+        paper_px_changed > 80,
+        "expected visible wallpapered wall pixels, got {paper_px_changed}"
+    );
+
+    // F1 -> Live Mode before u=844 -> deletes Wall Cursor 260, resumes Live (tick 88538).
+    run_to(&mut game, &schedule, 843);
+    game.set_mode(Mode::Live);
+    assert_eq!(game.lot().world().globals[19], 0);
+    assert!(!game.lot().world().objects.contains_key(&260));
+    assert_eq!(game.lot().world().objects.len(), 345);
+    run_to(&mut game, &schedule, 844);
+    assert_eq!(game.lot().world().ticks, 88_538);
+    assert_eq!(game.lot().world().objects.len(), 345);
+
+    // Run through u=1200 and assert exact RNG, tick, object count, funds, and architecture parity.
+    run_to(&mut game, &schedule, 1200);
+    assert_eq!(game.lot().world().ticks, 88_894);
+    assert_eq!(game.lot().world().globals[19], 0);
+    assert_eq!(game.lot().world().budget.funds, 2326);
+    assert_eq!(arch_today(&game), 33_870);
+    assert_eq!(game.lot().world().objects.len(), 346);
+    assert_eq!(game.lot().world().lot_rng.state(), 2_327_799_612);
+    assert_eq!(game.lot().world().global_rng.state(), 270_289_136);
+    assert!(game.errors().is_empty(), "errors: {:?}", game.errors());
+}
+
+/// Comprehensive Build Mode mechanics test covering:
+/// - Diagonal walls, Shift room-box, Ctrl demolition (80% refund), and
+///   wall-mounted object detachment + Undo restoration;
+/// - Floor drag rectangle, Shift room-fill (refusing outdoor room 0),
+///   split-diagonal half-tile flooring, and Ctrl removal (80% refund);
+/// - Wallpaper drag, Shift room-fill, Ctrl strip (80% refund), and fence refusal;
+/// - Doors/Windows/Hand Tool inside Build Mode;
+/// - Unified chronological Build/Buy Undo & Redo (including direct `buy_undo`
+///   syncing `undo_order`), stale plan rejection, and `Lot::save()`/`restore()`
+///   stripping `"Wall Cursor"` and detached objects.
+#[test]
+fn build_mode_walls_floors_wallpaper_doors_windows_and_undo_redo() {
+    use sims_ui::command::{BuildItemId, BuildTool, Mode};
+    use sims_vm::{
+        BuildPrices, FloorDragMode, PanelMode, WallDragMode, WallFace, WallStyle,
+        WallpaperDragMode, build_refund, plan_floor_edit, plan_wall_drag, plan_wallpaper_edit,
+    };
+    let Some(install) = install() else {
+        return;
+    };
+
+    // --- 1. Lot-level Build Mode mechanics, pricing, split diagonals, fences,
+    //        stale plans, save/restore, and unified Build/Buy Undo/Redo ---
+    let mut lot = Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+    for _ in 0..60 {
+        lot.step().unwrap();
+    }
+    lot.set_mode(PanelMode::Build).unwrap();
+
+    let mut prices = BuildPrices::default();
+    prices.floors.insert(1, 10);
+    prices.floors.insert(2, 20);
+    prices.walls.insert(1, 10);
+    prices.walls.insert(2, 15);
+    assert_eq!(build_refund(70), 56);
+    assert_eq!(build_refund(10), 8);
+    assert_eq!(build_refund(3), 2);
+
+    // Build a 3x3 Shift room-box on the open Goth front lawn (corners (26,36) -> (29,39)).
+    let funds_start = lot.world().budget.funds;
+    let rooms_before = lot.world().rooms.rooms.len();
+    let box_plan = plan_wall_drag(
+        lot.world(),
+        [26, 36],
+        [29, 39],
+        1,
+        WallStyle::Standard,
+        WallDragMode::RoomBox,
+        &prices,
+    );
+    assert!(box_plan.valid && box_plan.affordable);
+    assert_eq!(box_plan.net_cost, 12 * 70);
+    assert!(lot.build_commit_wall(&box_plan).unwrap());
+    assert_eq!(lot.world().budget.funds, funds_start - 12 * 70);
+    assert!(
+        lot.world().rooms.rooms.len() > rooms_before,
+        "enclosing a 3x3 room box must create a new indoor room"
+    );
+    // Re-committing the exact same stale plan must be rejected (cell_diffs_match).
+    assert!(!lot.build_commit_wall(&box_plan).unwrap());
+    assert_eq!(lot.world().budget.funds, funds_start - 12 * 70);
+
+    // Shift room-fill floor inside the new room (tile (27, 37)) lays all 9 tiles.
+    let fill_floor = plan_floor_edit(
+        lot.world(),
+        [27, 37],
+        [27, 37],
+        1,
+        1,
+        FloorDragMode::RoomFillLay,
+        &prices,
+        None,
+    );
+    assert!(fill_floor.valid && fill_floor.affordable);
+    assert_eq!(fill_floor.floor_changes.len(), 9);
+    assert_eq!(fill_floor.net_cost, 90);
+    assert!(lot.build_commit_floor(&fill_floor).unwrap());
+    assert_eq!(lot.world().budget.funds, funds_start - 840 - 90);
+
+    // Shift room-fill on outdoor tile (24, 37) (room 0) is refused (`0x4893d8`).
+    let outdoor_fill = plan_floor_edit(
+        lot.world(),
+        [24, 37],
+        [24, 37],
+        1,
+        1,
+        FloorDragMode::RoomFillLay,
+        &prices,
+        None,
+    );
+    assert!(!outdoor_fill.valid);
+
+    // Shift room-fill wallpaper inside the 3x3 room paints all 12 interior faces.
+    let seed_face = WallFace {
+        tile: [26, 36],
+        bit: sims_vm::WALL_NORTH,
+        side: 0,
+    };
+    let fill_wp = plan_wallpaper_edit(
+        lot.world(),
+        &[seed_face],
+        1,
+        1,
+        WallpaperDragMode::RoomFillApply,
+        &prices,
+    );
+    assert!(fill_wp.valid && fill_wp.affordable);
+    assert_eq!(fill_wp.net_cost, 12 * 10);
+    assert!(lot.build_commit_wallpaper(&fill_wp).unwrap());
+    assert_eq!(lot.world().budget.funds, funds_start - 840 - 90 - 120);
+
+    // Ctrl-strip wallpaper on one face refunds 80% (`build_refund(10) = 8`).
+    let strip_wp = plan_wallpaper_edit(
+        lot.world(),
+        &[seed_face],
+        1,
+        1,
+        WallpaperDragMode::Strip,
+        &prices,
+    );
+    assert!(strip_wp.valid);
+    assert_eq!(strip_wp.net_cost, -8);
+    assert!(lot.build_commit_wallpaper(&strip_wp).unwrap());
+    assert_eq!(lot.world().budget.funds, funds_start - 840 - 90 - 120 + 8);
+
+    // Ctrl-remove a 2x1 floor rect refunds 80% per tile (`2 * -8 = -16`).
+    let rem_floor = plan_floor_edit(
+        lot.world(),
+        [26, 36],
+        [27, 36],
+        1,
+        0,
+        FloorDragMode::Remove,
+        &prices,
+        None,
+    );
+    assert!(rem_floor.valid);
+    assert_eq!(rem_floor.net_cost, -16);
+    assert!(lot.build_commit_floor(&rem_floor).unwrap());
+
+    // Build a White Picket Fence segment outside the room and verify wallpaper refuses it.
+    let fence_plan = plan_wall_drag(
+        lot.world(),
+        [22, 36],
+        [24, 36],
+        1,
+        WallStyle::WhitePicket,
+        WallDragMode::Build,
+        &prices,
+    );
+    assert!(fence_plan.valid && fence_plan.net_cost == 20);
+    assert!(lot.build_commit_wall(&fence_plan).unwrap());
+    let fence_wp = plan_wallpaper_edit(
+        lot.world(),
+        &[WallFace {
+            tile: [22, 36],
+            bit: sims_vm::WALL_NORTH,
+            side: 0,
+        }],
+        1,
+        1,
+        WallpaperDragMode::Apply,
+        &prices,
+    );
+    assert!(!fence_wp.valid, "fences must refuse wallpaper");
+
+    // Diagonal wall on open lawn + split-diagonal half-tile flooring (`SPLIT_FLOOR_ID = 255`).
+    let diag_plan = plan_wall_drag(
+        lot.world(),
+        [22, 38],
+        [24, 40],
+        1,
+        WallStyle::Standard,
+        WallDragMode::Build,
+        &prices,
+    );
+    assert!(diag_plan.valid && diag_plan.net_cost == 140);
+    assert!(lot.build_commit_wall(&diag_plan).unwrap());
+    let split0 = plan_floor_edit(
+        lot.world(),
+        [22, 38],
+        [22, 38],
+        1,
+        1,
+        FloorDragMode::Lay,
+        &prices,
+        Some(0),
+    );
+    assert!(split0.valid && split0.net_cost == 5);
+    assert!(lot.build_commit_floor(&split0).unwrap());
+    let split1 = plan_floor_edit(
+        lot.world(),
+        [22, 38],
+        [22, 38],
+        1,
+        2,
+        FloorDragMode::Lay,
+        &prices,
+        Some(1),
+    );
+    assert!(split1.valid && split1.net_cost == 10);
+    assert!(lot.build_commit_floor(&split1).unwrap());
+    // Verify floor array holds SPLIT_FLOOR_ID (255) on tile (22, 38).
+    let flr_arr = &lot.world().arrays[&sims_sim::load::FLOORS[0]].data;
+    let off = (22 * 64 + 38) * 2;
+    assert_eq!(
+        u16::from_le_bytes([flr_arr[off], flr_arr[off + 1]]),
+        sims_vm::SPLIT_FLOOR_ID
+    );
+
+    // Ctrl-demolish the diagonal wall, then Undo & Redo it.
+    let demo_diag = plan_wall_drag(
+        lot.world(),
+        [22, 38],
+        [24, 40],
+        1,
+        WallStyle::Standard,
+        WallDragMode::Demolish,
+        &prices,
+    );
+    assert!(demo_diag.valid && demo_diag.net_cost == -2 * 56);
+    let funds_before_demo = lot.world().budget.funds;
+    assert!(lot.build_commit_wall(&demo_diag).unwrap());
+    assert_eq!(lot.world().budget.funds, funds_before_demo + 112);
+    assert!(lot.undo().unwrap());
+    assert_eq!(lot.world().budget.funds, funds_before_demo);
+    assert!(lot.redo().unwrap());
+    assert_eq!(lot.world().budget.funds, funds_before_demo + 112);
+
+    // Interleaved Build + Buy Undo/Redo (including direct `buy_undo` syncing `undo_order`).
+    let chair_guid = 0x26bf_bb29u32;
+    let mut ch = lot.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+    assert!(lot.buy_move(&mut ch, [376, 616], 1).unwrap());
+    let ch_id = lot.buy_commit(&ch).unwrap();
+    let funds_after_chair = lot.world().budget.funds;
+    let one_floor = plan_floor_edit(
+        lot.world(),
+        [24, 38],
+        [24, 38],
+        1,
+        1,
+        FloorDragMode::Lay,
+        &prices,
+        None,
+    );
+    assert!(lot.build_commit_floor(&one_floor).unwrap());
+    assert_eq!(lot.world().budget.funds, funds_after_chair - 10);
+    // Undo floor first, then undo chair, then redo both in chronological order.
+    assert!(lot.undo().unwrap());
+    assert_eq!(lot.world().budget.funds, funds_after_chair);
+    assert!(lot.world().objects[&ch_id].position[0] >= 0);
+    assert!(lot.undo().unwrap());
+    assert!(lot.world().objects[&ch_id].position[0] < 0);
+    assert!(lot.redo().unwrap());
+    assert!(lot.world().objects[&ch_id].position[0] >= 0);
+    assert!(lot.redo().unwrap());
+    assert_eq!(lot.world().budget.funds, funds_after_chair - 10);
+
+    // Direct `buy_undo()` while a Build entry is on top keeps `undo_order` synced.
+    assert!(lot.buy_undo().unwrap());
+    assert!(lot.world().objects[&ch_id].position[0] < 0);
+    // Next `undo()` must cleanly undo the Build floor entry.
+    assert!(lot.undo().unwrap());
+    assert_eq!(lot.world().budget.funds, funds_after_chair + 80);
+
+    // Open Wall Cursor, save & restore: saved snapshot must strip Wall Cursor & detached chair.
+    let wc = lot.build_cursor_open(0).unwrap();
+    assert!(lot.world().objects.contains_key(&wc.id));
+    let saved = lot.save().unwrap();
+    assert!(!saved.world().objects.contains_key(&wc.id));
+    assert!(!saved.world().objects.contains_key(&ch_id));
+    lot.restore(saved).unwrap();
+    assert!(!lot.world().objects.contains_key(&wc.id));
+    assert!(!lot.world().objects.contains_key(&ch_id));
+
+    // --- 2. Game-level Build Mode UI: Doors, Windows, Hand Tool, Undo/Redo,
+    //        and F1/F2 mode switch teardown ---
+    let mut game = Game::open(&options(install.clone())).expect("open Goth house");
+    game.resize([800, 600]);
+    game.render();
+    assert_eq!(game.run(60), 60);
+    game.set_mode(Mode::Build);
+    game.render();
+
+    // Doors tool & Windows tool both populate catalog items.
+    game.select_build_tool(BuildTool::Doors);
+    let door_guid = game
+        .build_layout()
+        .widgets
+        .iter()
+        .find_map(|w| match w.command {
+            Some(sims_ui::command::Command::BuildItem(BuildItemId::Object(g))) => Some(g),
+            _ => None,
+        })
+        .expect("Build Mode Doors catalog must have at least one door");
+    game.select_build_tool(BuildTool::Windows);
+    let window_guid = game
+        .build_layout()
+        .widgets
+        .iter()
+        .find_map(|w| match w.command {
+            Some(sims_ui::command::Command::BuildItem(BuildItemId::Object(g))) => Some(g),
+            _ => None,
+        })
+        .expect("Build Mode Windows catalog must have at least one window");
+    assert_ne!(door_guid, window_guid);
+
+    // Hand Tool in Build Mode can pick up and sell the porch bench (173/174),
+    // and Undo restores it.
+    game.select_build_tool(BuildTool::Hand);
+    let funds_before_hand = game.lot().world().budget.funds;
+    let bench_pt = recorded([432, 230]);
+    game.press(bench_pt);
+    game.release(bench_pt);
+    assert!(
+        game.buy_cursor()
+            .is_some_and(|c| c.is_existing() && matches!(c.held, 173 | 174))
+    );
+    assert!(game.sell_held());
+    assert_eq!(game.lot().world().budget.funds, funds_before_hand + 250);
+    assert!(game.undo_buy());
+    assert_eq!(game.lot().world().budget.funds, funds_before_hand);
+
+    // Wall Tool + Escape cancels active drag without leaving Wall Cursor orphaned;
+    // F1 switches to Live cleanly removing Wall Cursor.
+    game.select_build_tool(BuildTool::Wall);
+    assert!(
+        game.lot()
+            .world()
+            .objects
+            .values()
+            .any(|o| o.guid == sims_vm::WALL_CURSOR_GUID)
+    );
+    game.press(recorded([470, 380]));
+    game.hover(recorded([530, 350]));
+    assert!(game.cancel_buy());
+    game.set_mode(Mode::Live);
+    assert!(
+        !game
+            .lot()
+            .world()
+            .objects
+            .values()
+            .any(|o| o.guid == sims_vm::WALL_CURSOR_GUID)
+    );
+
+    // --- 3. Sol Round 1 regressions (3 P1 + 10 P2) ---
+    {
+        let mut rlot = Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+        for _ in 0..60 {
+            rlot.step().unwrap();
+        }
+        rlot.set_mode(PanelMode::Build).unwrap();
+
+        // P1 #1: Demolishing wall [26,22]..[26,23] must NOT detach or sell
+        // unrelated porch bench 173 (whose data[13] only has forbid rules).
+        let bench_demo = plan_wall_drag(
+            rlot.world(),
+            [26, 22],
+            [26, 23],
+            1,
+            WallStyle::Standard,
+            WallDragMode::Demolish,
+            &prices,
+        );
+        assert!(bench_demo.valid);
+        assert!(
+            !bench_demo.removed_objects.contains(&173),
+            "forbid-only porch bench 173 must not be detached: {:?}",
+            bench_demo.removed_objects
+        );
+        assert!(rlot.build_commit_wall(&bench_demo).unwrap());
+        assert!(rlot.world().objects[&173].position[0] >= 0);
+        let saved_bench = rlot.save().unwrap();
+        assert!(saved_bench.world().objects.contains_key(&173));
+        assert!(rlot.undo().unwrap());
+
+        // P1 #2: Picking up and hiding Goth window 72 prevents wall demolition
+        // at [26,21]..[26,22] from removing its snapback wall, keeping Undo,
+        // Save, and Live mode switch healthy.
+        let mut win_cur = rlot.buy_pick_up(72).unwrap().expect("window 72 picked up");
+        rlot.buy_hide(&mut win_cur).unwrap();
+        let win_demo = plan_wall_drag(
+            rlot.world(),
+            [26, 21],
+            [26, 22],
+            1,
+            WallStyle::Standard,
+            WallDragMode::Demolish,
+            &prices,
+        );
+        assert!(win_demo.valid);
+        assert!(
+            !rlot.build_commit_wall(&win_demo).unwrap(),
+            "build_commit_wall must refuse while existing window cursor is active"
+        );
+        let saved_win = rlot.save().unwrap();
+        assert!(saved_win.world().objects.contains_key(&72));
+        rlot.buy_cancel(&win_cur).unwrap();
+        assert!(rlot.world().objects[&72].position[0] >= 0);
+
+        // P1 #3: Tampering with a live WallCursor handle's `id` cannot delete
+        // another lot object (bench 173) or orphan the real Wall Cursor.
+        let mut wc_handle = rlot.build_cursor_open(0).unwrap();
+        let real_wc_id = wc_handle.id;
+        wc_handle.id = 173;
+        rlot.build_cursor_close(&wc_handle).unwrap();
+        assert!(
+            rlot.world().objects.contains_key(&173),
+            "tampered WallCursor handle must not delete bench 173"
+        );
+        assert!(rlot.world().objects.contains_key(&real_wc_id));
+        rlot.build_cursor_close_active().unwrap();
+        assert!(!rlot.world().objects.contains_key(&real_wc_id));
+
+        // P2 #1 & P2 #2: Upstairs floor edits rebuild rooms so tile [27,37]
+        // gets a real upstairs room (not 1024), and a saved upstairs FloorPlan
+        // is rejected after its ground-floor support is undone.
+        let box_plan2 = plan_wall_drag(
+            rlot.world(),
+            [26, 36],
+            [29, 39],
+            1,
+            WallStyle::Standard,
+            WallDragMode::RoomBox,
+            &prices,
+        );
+        assert!(rlot.build_commit_wall(&box_plan2).unwrap());
+        let up_floor = plan_floor_edit(
+            rlot.world(),
+            [27, 37],
+            [27, 37],
+            2,
+            1,
+            FloorDragMode::Lay,
+            &prices,
+            None,
+        );
+        assert!(up_floor.valid);
+        assert!(rlot.build_commit_floor(&up_floor).unwrap());
+        let up_room = rlot.world().rooms.map[1][27 * 64 + 37];
+        assert_ne!(
+            up_room, 1024,
+            "upstairs floor commit must rebuild upstairs room map"
+        );
+        assert!(rlot.undo().unwrap()); // undo upstairs floor
+        assert!(rlot.undo().unwrap()); // undo ground-floor room box
+        assert!(
+            !rlot.build_commit_floor(&up_floor).unwrap(),
+            "saved upstairs FloorPlan must be rejected once support is undone"
+        );
+
+        // P2 #3: Upper-floor planning obeys array 108 BUILDABLE flags (`[15,20]`
+        // on level 2 is unbuildable).
+        let unbuildable_l2 = plan_floor_edit(
+            rlot.world(),
+            [15, 20],
+            [15, 20],
+            2,
+            1,
+            FloorDragMode::Lay,
+            &prices,
+            None,
+        );
+        assert!(!unbuildable_l2.valid);
+
+        // P2 #4: Wall and floor planners reject pool/water tiles (arrays 9 & 10 < 16).
+        {
+            let mut pool_world = rlot.world().clone();
+            let cell = 24 * 64 + 38;
+            pool_world.arrays.get_mut(&9).unwrap().data[cell] = 0;
+            pool_world.arrays.get_mut(&10).unwrap().data[cell] = 0;
+            let pool_wall = plan_wall_drag(
+                &pool_world,
+                [24, 38],
+                [24, 39],
+                1,
+                WallStyle::Standard,
+                WallDragMode::Build,
+                &prices,
+            );
+            let pool_floor = plan_floor_edit(
+                &pool_world,
+                [24, 38],
+                [24, 38],
+                1,
+                1,
+                FloorDragMode::Lay,
+                &prices,
+                None,
+            );
+            assert!(!pool_wall.valid, "wall planner must reject pool/water tile");
+            assert!(
+                !pool_floor.valid,
+                "floor planner must reject pool/water tile"
+            );
+        }
+
+        // P2 #5: Adjacent fence must NOT overwrite diagonal wallpaper on tile [22,38].
+        let diag_p5 = plan_wall_drag(
+            rlot.world(),
+            [22, 38],
+            [24, 40],
+            1,
+            WallStyle::Standard,
+            WallDragMode::Build,
+            &prices,
+        );
+        assert!(rlot.build_commit_wall(&diag_p5).unwrap());
+        let wp_diag = plan_wallpaper_edit(
+            rlot.world(),
+            &[WallFace {
+                tile: [22, 38],
+                bit: sims_vm::WALL_ASCENDING,
+                side: 1,
+            }],
+            1,
+            2,
+            WallpaperDragMode::Apply,
+            &prices,
+        );
+        assert!(rlot.build_commit_wallpaper(&wp_diag).unwrap());
+        let adj_fence = plan_wall_drag(
+            rlot.world(),
+            [23, 38],
+            [23, 39],
+            1,
+            WallStyle::WhitePicket,
+            WallDragMode::Build,
+            &prices,
+        );
+        assert!(rlot.build_commit_wall(&adj_fence).unwrap());
+        let diag_cell = sims_sim::load::ExpandedWall::get(
+            &rlot.world().arrays[&sims_sim::load::WALLS[0]].data,
+            rlot.world().size as usize,
+            22,
+            38,
+        );
+        assert_eq!(
+            diag_cell.patterns[7], 2,
+            "adjacent fence must not overwrite diagonal side-1 wallpaper"
+        );
+
+        // P2 #6: Shift wallpaper inside a room also papers both faces of a
+        // freestanding diagonal wall whose two sides share that room.
+        assert!(rlot.build_commit_wall(&box_plan2).unwrap());
+        let free_diag = plan_wall_drag(
+            rlot.world(),
+            [27, 37],
+            [28, 38],
+            1,
+            WallStyle::Standard,
+            WallDragMode::Build,
+            &prices,
+        );
+        assert!(rlot.build_commit_wall(&free_diag).unwrap());
+        let shift_wp = plan_wallpaper_edit(
+            rlot.world(),
+            &[WallFace {
+                tile: [26, 36],
+                bit: sims_vm::WALL_NORTH,
+                side: 0,
+            }],
+            1,
+            1,
+            WallpaperDragMode::RoomFillApply,
+            &prices,
+        );
+        assert!(rlot.build_commit_wallpaper(&shift_wp).unwrap());
+        let inner_diag = sims_sim::load::ExpandedWall::get(
+            &rlot.world().arrays[&sims_sim::load::WALLS[0]].data,
+            rlot.world().size as usize,
+            27,
+            37,
+        );
+        assert_eq!(
+            (inner_diag.patterns[6], inner_diag.patterns[7]),
+            (1, 1),
+            "Shift room-fill wallpaper must paint both faces of freestanding diagonal"
+        );
+
+        // P2 #8 & Sol Round 2 P2 #2: Budget write failure (`world.budget.days[0] = None`)
+        // must return `Err` without mutating the world on direct `Interpreter` calls.
+        {
+            let mut bad_world = rlot.world().clone();
+            bad_world.budget.days[0] = None;
+            let orig_floor_bytes = bad_world.arrays[&sims_sim::load::FLOORS[0]].data.clone();
+            let f_plan = plan_floor_edit(
+                &bad_world,
+                [24, 38],
+                [24, 38],
+                1,
+                1,
+                FloorDragMode::Lay,
+                &prices,
+                None,
+            );
+            assert!(f_plan.valid);
+            let interp =
+                sims_vm::Interpreter::new(rlot.program(), rlot.catalog(), sims_vm::Stream::Global);
+            assert!(
+                interp.build_commit_floor(&mut bad_world, &f_plan).is_err(),
+                "budget write failure must propagate an error"
+            );
+            assert_eq!(
+                bad_world.arrays[&sims_sim::load::FLOORS[0]].data,
+                orig_floor_bytes,
+                "direct Interpreter floor commit must leave world unchanged on budget error"
+            );
+        }
+
+        // Sol Round 2 P2 #1: Removing half-flooring on a diagonal tile must
+        // succeed even if the tile is marked unbuildable (e.g. sloped/pool).
+        {
+            let mut diag_world = rlot.world().clone();
+            let lay0 = plan_floor_edit(
+                &diag_world,
+                [22, 38],
+                [22, 38],
+                1,
+                1,
+                FloorDragMode::Lay,
+                &prices,
+                Some(0),
+            );
+            let interp =
+                sims_vm::Interpreter::new(rlot.program(), rlot.catalog(), sims_vm::Stream::Global);
+            assert!(
+                interp
+                    .build_commit_floor(&mut diag_world, &lay0)
+                    .unwrap()
+                    .is_some()
+            );
+            // Mark tile [22, 38] as pool (unbuildable for laying, still removable).
+            diag_world.arrays.get_mut(&9).unwrap().data[22 * 64 + 38] = 0;
+            let rem0 = plan_floor_edit(
+                &diag_world,
+                [22, 38],
+                [22, 38],
+                1,
+                0,
+                FloorDragMode::Remove,
+                &prices,
+                Some(0),
+            );
+            assert!(rem0.valid);
+            assert!(
+                interp
+                    .build_commit_floor(&mut diag_world, &rem0)
+                    .unwrap()
+                    .is_some(),
+                "half-tile floor removal must succeed on unbuildable diagonal tile"
+            );
+        }
+
+        // P2 #7, P2 #9, P2 #10: Game-level regressions (Walls Down wallpaper
+        // click above cut height charges nothing; releasing a floor drag over
+        // HUD cancels instead of committing; narrow 512x384 window keeps Floor
+        // catalog slots onscreen).
+        let mut rg = Game::open(&options(install)).expect("open Goth house");
+        rg.resize([800, 600]);
+        rg.render();
+        assert_eq!(rg.run(60), 60);
+        rg.set_mode(Mode::Build);
+        rg.select_build_tool(BuildTool::Wall);
+        rg.press(recorded([470, 380]));
+        rg.hover(recorded([530, 350]));
+        rg.release(recorded([530, 350]));
+        rg.render();
+
+        // P2 #7: With Walls Down, clicking high on the cut-down wall at
+        // recorded [500, 345] ([597, 391]) must not charge wallpaper.
+        rg.select_build_tool(BuildTool::Wallpaper);
+        rg.apply(sims_game::view::Move::Walls(sims_render::Walls::Down));
+        rg.render();
+        let funds_before_down_wp = rg.lot().world().budget.funds;
+        let high_wall_pt = recorded([500, 345]);
+        rg.hover(high_wall_pt);
+        rg.press(high_wall_pt);
+        rg.release(high_wall_pt);
+        assert_eq!(
+            rg.lot().world().budget.funds,
+            funds_before_down_wp,
+            "clicking above cut-down wall in Walls Down mode must not charge wallpaper"
+        );
+
+        // P2 #9: Starting a floor drag on the lot and releasing over the HUD
+        // catalog strip must cancel the drag without charging funds.
+        rg.select_build_tool(BuildTool::Floor);
+        let funds_before_hud_release = rg.lot().world().budget.funds;
+        let floor_start = recorded([510, 390]);
+        rg.hover(floor_start);
+        rg.press(floor_start);
+        rg.hover([floor_start[0], 525]);
+        rg.release([floor_start[0], 525]);
+        assert_eq!(
+            rg.lot().world().budget.funds,
+            funds_before_hud_release,
+            "releasing a floor drag over the HUD strip must not commit flooring"
+        );
+
+        // P2 #10: In a narrow 512x384 window, Floor catalog slots must lie
+        // inside the viewport (`0..512`).
+        rg.resize([512, 384]);
+        rg.select_build_tool(BuildTool::Floor);
+        let slot_rects: Vec<_> = rg
+            .build_layout()
+            .widgets
+            .iter()
+            .filter(|w| matches!(w.kind, sims_ui::build::BuildWidgetKind::Slot { .. }))
+            .map(|w| w.rect)
+            .collect();
+        assert!(
+            !slot_rects.is_empty(),
+            "narrow 512x384 window must still lay out Build catalog slots"
+        );
+        for r in &slot_rects {
+            assert!(
+                r.x >= 0 && r.x + r.width <= 512,
+                "narrow-window Build catalog slot out of bounds: {r:?}"
+            );
+        }
+    }
+}
