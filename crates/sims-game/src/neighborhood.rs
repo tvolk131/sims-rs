@@ -1457,7 +1457,10 @@ impl NeighborhoodShell {
                 } else {
                     BTreeSet::new()
                 };
-                let active_filter = if is_travel_map {
+                let active_filter = if is_travel_map
+                    && !(self.kind == NeighborhoodKind::Vacation
+                        && self.travel_state.vacation_lodging_filter.is_some())
+                {
                     self.travel_state
                         .active_filter
                         .map(community_filter_for_lot_filter)
@@ -2866,6 +2869,10 @@ impl NeighborhoodShell {
             lot_label,
             active_error,
         );
+        self.clear_hover_state();
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            session.game.close_camera_strip();
+        }
         self.save_manager_snapshot = Some(snapshot);
         self.save_manager.open();
         true
@@ -4377,7 +4384,15 @@ impl NeighborhoodShell {
         );
     }
 
+    fn clear_hover_state(&mut self) {
+        self.hovered_lot_id = None;
+        self.hovered_lot_since_us = None;
+        self.hover_card_shown_for = None;
+        self.nbhd_state.hovered_lot = None;
+    }
+
     fn open_dialog(&mut self, kind: ShellDialogKind, message: Message) {
+        self.clear_hover_state();
         let state = DialogState::for_message(&message);
         let layout = dialog::layout(self.size, &message, &self.dialog_art);
         self.dialog = Some(ShellDialog {
@@ -4537,6 +4552,10 @@ impl NeighborhoodShell {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("family {family_id} not found in neighborhood {nh_id:?}"))?;
         let (snapshot, has_image) = self.build_album_snapshot(&nh_id, family_id, None)?;
+        self.clear_hover_state();
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            session.game.close_camera_strip();
+        }
         self.album_token = Some(token);
         self.album_neighborhood_id = Some(nh_id);
         self.album_has_image = has_image;
@@ -5402,6 +5421,9 @@ impl NeighborhoodShell {
         td_state.fare_simoleons = plan.fare;
         td_state.household_simoleons = simoleons;
         td_state.household_magic_coins = magic_coins;
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            session.game.close_camera_strip();
+        }
         self.travel_dialog = TravelDialog::new();
         self.travel_dialog_state = Some(td_state);
         self.pending_travel = Some(PendingTravel {
@@ -5897,9 +5919,11 @@ impl NeighborhoodShell {
     /// screen.
     pub fn open_coop_lobby(&mut self, tab: Option<LobbyTab>) {
         if let ActiveScreen::Lot(session) = &mut self.screen {
+            session.game.close_camera_strip();
             session.game.open_coop_lobby(tab);
             return;
         }
+        self.clear_hover_state();
         self.coop_error = None;
         self.coop_lobby.open(tab.unwrap_or(LobbyTab::Join));
     }

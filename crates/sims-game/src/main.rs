@@ -2745,16 +2745,18 @@ fn run() -> Result<(), String> {
             game.coop_set_iroh_config(sims_net::IrohConfig::Loopback);
         }
         if config.coop.host {
-            game.open_coop_lobby(Some(sims_ui::coop::LobbyTab::Host));
             if let Err(err) = game.coop_start_host_async(None) {
                 eprintln!("sims-game: co-op host failed: {err}");
                 game.show_notice("Co-op", format!("Co-op host failed: {err}"));
+            } else {
+                game.open_coop_lobby(Some(sims_ui::coop::LobbyTab::Host));
             }
         } else if let Some(ticket) = config.coop.join.clone() {
-            game.open_coop_lobby(Some(sims_ui::coop::LobbyTab::Join));
             if let Err(err) = game.coop_start_join_async(ticket, None) {
                 eprintln!("sims-game: co-op join failed: {err}");
                 game.show_notice("Co-op", format!("Co-op join failed: {err}"));
+            } else {
+                game.open_coop_lobby(Some(sims_ui::coop::LobbyTab::Join));
             }
         }
         #[cfg(any(target_os = "macos", feature = "sound"))]

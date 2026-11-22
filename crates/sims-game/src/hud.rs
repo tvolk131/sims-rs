@@ -1860,6 +1860,7 @@ impl Hud {
         // under it is closed rather than left to be chosen from after.
         if self.dialog.is_some() {
             self.menu = None;
+            self.close_camera_strip();
         }
         if let (Some(message), Some(layout)) = (self.active_message(), &self.dialog) {
             dialog::draw_with_state(
@@ -1986,10 +1987,9 @@ impl Hud {
         }
         let x = hud::CLUSTER[0];
         let avail_w = (size[0] - x).max(0);
-        if avail_w < 120 || size[1] < hud::STRIP {
-            self.camera_strip_rect = None;
-            self.camera_snapshot_rect = None;
-            self.camera_album_rect = None;
+        if avail_w < 84 || size[1] < hud::STRIP {
+            self.camera_strip_open = false;
+            self.clear_camera_strip_layout();
             return;
         }
         let strip_h = if self.controls.expanded && self.controls.mode == Mode::Buy {
@@ -2002,9 +2002,9 @@ impl Hud {
         self.camera_strip_rect = Some(Rect::new(x, y, avail_w, strip_h));
 
         let band_y = (size[1] - hud::STRIP).max(0);
-        let pad_x = 16;
-        let gap = 14;
-        let btn_w = ((avail_w - pad_x * 2 - gap) / 2).clamp(52, 184);
+        let pad_x = if avail_w >= 200 { 16 } else { 6 };
+        let gap = if avail_w >= 200 { 14 } else { 6 };
+        let btn_w = ((avail_w - pad_x * 2 - gap) / 2).clamp(32, 184);
         let btn_h = 46;
         let btn_y = band_y + 36;
         self.camera_snapshot_rect = Some(Rect::new(x + pad_x, btn_y, btn_w, btn_h));
@@ -2066,9 +2066,10 @@ impl Hud {
                 true,
                 self.pressed_camera_action == Some(CameraStripAction::TakeSnapshot),
             );
+            let gap = if strip.width >= 200 { 14 } else { 6 };
             let album_rect = self.camera_album_rect.unwrap_or_else(|| {
                 Rect::new(
-                    snap_rect.x + snap_rect.width + 14,
+                    snap_rect.x + snap_rect.width + gap,
                     snap_rect.y,
                     snap_rect.width,
                     snap_rect.height,

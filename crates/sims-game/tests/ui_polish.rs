@@ -239,11 +239,57 @@ fn live_mode_has_no_cam_view_album_overlap_and_camera_button_toggles_substrip() 
     shell.release(cam_pt);
     assert!(!shell.game().expect("active game").camera_strip_open());
 
-    // Direct F10 entry path (`open_photo_album`) continues to work directly.
+    // Direct F10 entry path (`open_photo_album`) continues to work directly and
+    // closes any open Camera sub-strip underneath.
+    shell.press(cam_pt);
+    shell.release(cam_pt);
+    assert!(shell.game().expect("active game").camera_strip_open());
     shell
         .open_photo_album()
         .expect("direct F10 Photo Album open succeeds");
     assert!(shell.album_open());
+    assert!(
+        !shell.game().expect("active game").camera_strip_open(),
+        "opening Photo Album via F10 must close the Camera sub-strip underneath"
+    );
+    shell.close_photo_album();
+
+    // Compact 340px viewport keeps Camera sub-strip buttons strictly inside canvas bounds,
+    // and sub-minimum widths auto-close rather than leaving an invisible strip open.
+    shell.resize([340, 600]);
+    shell.render();
+    let cam_rect_340 = shell
+        .game()
+        .expect("active game")
+        .panel()
+        .iter()
+        .find(|i| i.command == Some(Command::Camera(UiCamera::Photo)))
+        .expect("cluster Camera button at 340px")
+        .rect;
+    let cam_pt_340 = [
+        cam_rect_340.x + cam_rect_340.width / 2,
+        cam_rect_340.y + cam_rect_340.height / 2,
+    ];
+    shell.press(cam_pt_340);
+    shell.release(cam_pt_340);
+    shell.render();
+    {
+        let game = shell.game().expect("active game");
+        assert!(game.camera_strip_open());
+        let album = game
+            .album_button_rect()
+            .expect("Photo Album button at 340px");
+        assert!(
+            album.x + album.width <= 340,
+            "Photo Album button ({album:?}) must not clip past 340px right edge"
+        );
+    }
+    shell.resize([260, 600]);
+    shell.render();
+    assert!(
+        !shell.game().expect("active game").camera_strip_open(),
+        "narrow viewport below minimum strip width must close Camera sub-strip cleanly"
+    );
 }
 
 #[test]

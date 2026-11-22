@@ -3088,7 +3088,7 @@ impl Game {
     /// synced only when the picker's camera geometry actually changes so
     /// no-op or wall-mode commands preserve a restored pick.
     pub fn apply(&mut self, command: Move) -> bool {
-        self.camera_pan = None;
+        let cancelled_pan = self.camera_pan.take().is_some();
         let before = self.view.camera;
         let (w, h) = self.house_viewport_size();
         let viewport = [w as i32, h as i32];
@@ -3111,7 +3111,8 @@ impl Game {
                 rotation: CameraRotation::new(after.rotation),
             });
         }
-        if after.origin != before.origin
+        if cancelled_pan
+            || after.origin != before.origin
             || after.zoom != before.zoom
             || after.rotation != before.rotation
             || after.level != before.level
@@ -3254,8 +3255,12 @@ impl Game {
             // catalog strip while holding a picked-up existing object sells
             // it; clicking empty strip background while holding an unpaid
             // preview cancels it.
+            let over_camera_strip = self
+                .hud
+                .camera_strip_rect()
+                .is_some_and(|r| r.contains(point[0], point[1]));
             if !self.has_dialog()
-                && !self.hud.camera_strip_open()
+                && !over_camera_strip
                 && self.hud.controls.mode == Mode::Buy
                 && self.hud.over_buy_catalog(self.view.size, point)
                 && self.buy_cursor.is_some()
@@ -3266,7 +3271,7 @@ impl Game {
                 return Outcome::redraw();
             }
             if !self.has_dialog()
-                && !self.hud.camera_strip_open()
+                && !over_camera_strip
                 && self.hud.controls.mode == Mode::Build
                 && let Some(action) = self.hud.press_build_subtool(point)
             {
@@ -3521,7 +3526,9 @@ impl Game {
                 ..Outcome::default()
             };
         }
-        let (released_camera, camera_action) = self.hud.release_camera_strip(Some(point));
+        let (released_camera, camera_action) = self
+            .hud
+            .release_camera_strip((!self.has_dialog()).then_some(point));
         if let Some(action) = camera_action {
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
@@ -3571,6 +3578,17 @@ impl Game {
         if matches!(self.hud.controls.mode, Mode::Buy | Mode::Build)
             && let Some(anchor) = self.buy_dragging
         {
+            // Dropping a held object onto an open Camera sub-strip cancels the
+            // drag safely without committing a placement behind the HUD.
+            if self
+                .hud
+                .camera_strip_rect()
+                .is_some_and(|r| r.contains(point[0], point[1]))
+            {
+                self.buy_dragging = None;
+                self.buy_commit_on_release = false;
+                return Outcome::redraw();
+            }
             // Dropping a held object onto the Buy catalog strip sells it
             // (`0x50d04d` → `0x4cf97a` → `0x487e18`).
             if self.hud.controls.mode == Mode::Buy
