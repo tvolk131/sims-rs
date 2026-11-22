@@ -40,11 +40,15 @@
 
 use crate::Error;
 use crate::neighborhood_store::{NEIGHBORHOODS as NEIGHBORHOODS_TABLE, StoredNeighborhood};
+use flate2::Compression;
+use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 /// 4-byte magic prefix for per-family photo album index rows.
@@ -66,8 +70,9 @@ const HEADER_LEN: usize = 4 + 4 + 32;
 /// Earliest supported photo album record format version.
 pub const ALBUM_MIN_FORMAT: u32 = 1;
 
-/// Current photo album record format version.
-pub const ALBUM_FORMAT: u32 = 1;
+/// Current photo album record format version (V2: deflate-compressed raw
+/// little-endian RGB565 pixels without postcard varint bloat).
+pub const ALBUM_FORMAT: u32 = 2;
 
 /// Maximum character length of a photo title (matching `sims-ui::album::MAX_TITLE_LEN`).
 pub const MAX_ALBUM_TITLE_CHARS: usize = 80;
@@ -868,6 +873,353 @@ struct AlbumPhotoV1 {
     image: Option<AlbumImage>,
 }
 
+/// V2 compact image representation: raw little-endian RGB565 pixel bytes
+/// compressed with `flate2::Compression::fast()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AlbumImageV2 {
+    width: u32,
+    height: u32,
+    deflated_rgb565_le: Vec<u8>,
+}
+
+impl AlbumImageV2 {
+    fn from_image(record: &str, image: &AlbumImage) -> std::result::Result<Self, AlbumError> {
+        let mut raw = Vec::with_capacity(image.rgb565.len().saturating_mul(2));
+        for &px in &image.rgb565 {
+            raw.extend_from_slice(&px.to_le_bytes());
+        }
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder
+            .write_all(&raw)
+            .map_err(|e| AlbumError::DecodeFailed {
+                record: record.to_owned(),
+                detail: format!("failed to compress V2 photo pixels: {e}"),
+            })?;
+        let deflated_rgb565_le = encoder.finish().map_err(|e| AlbumError::DecodeFailed {
+            record: record.to_owned(),
+            detail: format!("failed to finish V2 photo compression: {e}"),
+        })?;
+        Ok(Self {
+            width: image.width,
+            height: image.height,
+            deflated_rgb565_le,
+        })
+    }
+
+    fn into_image(self, record: &str) -> std::result::Result<AlbumImage, AlbumError> {
+        let expected_pixels = checked_photo_pixel_count(self.width, self.height)?;
+        let expected_bytes =
+            expected_pixels
+                .checked_mul(2)
+                .ok_or_else(|| AlbumError::DecodeFailed {
+                    record: record.to_owned(),
+                    detail: "photo RGB565 byte count overflows".into(),
+                })?;
+        let mut decoder = DeflateDecoder::new(self.deflated_rgb565_le.as_slice())
+            .take((expected_bytes as u64).saturating_add(1));
+        let mut raw = Vec::with_capacity(expected_bytes);
+        decoder
+            .read_to_end(&mut raw)
+            .map_err(|e| AlbumError::DecodeFailed {
+                record: record.to_owned(),
+                detail: format!("failed to decompress V2 photo pixels: {e}"),
+            })?;
+        if raw.len() != expected_bytes {
+            return Err(AlbumError::DecodeFailed {
+                record: record.to_owned(),
+                detail: format!(
+                    "decompressed V2 photo byte length {} does not match expected {expected_bytes}",
+                    raw.len()
+                ),
+            });
+        }
+        let consumed = decoder.into_inner().total_in();
+        if consumed != self.deflated_rgb565_le.len() as u64 {
+            return Err(AlbumError::DecodeFailed {
+                record: record.to_owned(),
+                detail: format!(
+                    "V2 photo compressed stream has trailing bytes (consumed {consumed} of {} bytes)",
+                    self.deflated_rgb565_le.len()
+                ),
+            });
+        }
+        let mut rgb565 = Vec::with_capacity(expected_pixels);
+        for chunk in raw.as_chunks::<2>().0 {
+            rgb565.push(u16::from_le_bytes(*chunk));
+        }
+        Ok(AlbumImage {
+            width: self.width,
+            height: self.height,
+            rgb565,
+        })
+    }
+
+    /// Validates the V2 compressed pixel stream into a fixed stack discard
+    /// buffer so summary listings enforce exact parity with full reads without
+    /// allocating or retaining pixel buffers.
+    fn validate_stream(&self, record: &str) -> std::result::Result<(), AlbumError> {
+        let expected_pixels = checked_photo_pixel_count(self.width, self.height)?;
+        let expected_bytes =
+            expected_pixels
+                .checked_mul(2)
+                .ok_or_else(|| AlbumError::DecodeFailed {
+                    record: record.to_owned(),
+                    detail: "photo RGB565 byte count overflows".into(),
+                })?;
+        let mut decoder = DeflateDecoder::new(self.deflated_rgb565_le.as_slice())
+            .take((expected_bytes as u64).saturating_add(1));
+        let mut scratch = [0u8; 4096];
+        let mut total = 0usize;
+        loop {
+            let n = decoder
+                .read(&mut scratch)
+                .map_err(|e| AlbumError::DecodeFailed {
+                    record: record.to_owned(),
+                    detail: format!("failed to decompress V2 photo pixels: {e}"),
+                })?;
+            if n == 0 {
+                break;
+            }
+            total = total.saturating_add(n);
+            if total > expected_bytes {
+                return Err(AlbumError::DecodeFailed {
+                    record: record.to_owned(),
+                    detail: format!(
+                        "decompressed V2 photo byte length exceeds expected {expected_bytes}"
+                    ),
+                });
+            }
+        }
+        if total != expected_bytes {
+            return Err(AlbumError::DecodeFailed {
+                record: record.to_owned(),
+                detail: format!(
+                    "decompressed V2 photo byte length {total} does not match expected {expected_bytes}"
+                ),
+            });
+        }
+        let consumed = decoder.into_inner().total_in();
+        if consumed != self.deflated_rgb565_le.len() as u64 {
+            return Err(AlbumError::DecodeFailed {
+                record: record.to_owned(),
+                detail: format!(
+                    "V2 photo compressed stream has trailing bytes (consumed {consumed} of {} bytes)",
+                    self.deflated_rgb565_le.len()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+struct BoundedBytesSeed {
+    max_len: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BoundedBytesSeed {
+    type Value = Vec<u8>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        struct Visitor {
+            max_len: usize,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "at most {} bytes", self.max_len)
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> std::result::Result<Vec<u8>, E> {
+                if v.len() > self.max_len {
+                    return Err(E::custom(format!(
+                        "compressed pixel buffer len {} exceeds maximum {}",
+                        v.len(),
+                        self.max_len
+                    )));
+                }
+                Ok(v.to_vec())
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                if let Some(hint) = seq.size_hint()
+                    && hint > self.max_len
+                {
+                    return Err(serde::de::Error::custom(format!(
+                        "compressed pixel buffer len {hint} exceeds maximum {}",
+                        self.max_len
+                    )));
+                }
+                let cap = seq.size_hint().map_or(0, |h| h.min(self.max_len));
+                let mut out = Vec::with_capacity(cap);
+                while let Some(b) = seq.next_element::<u8>()? {
+                    if out.len() >= self.max_len {
+                        return Err(serde::de::Error::custom(format!(
+                            "compressed pixel buffer exceeds maximum {}",
+                            self.max_len
+                        )));
+                    }
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_seq(Visitor {
+            max_len: self.max_len,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AlbumImageV2 {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = AlbumImageV2;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("AlbumImageV2 { width, height, deflated_rgb565_le }")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let width: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let height: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let expected_pixels =
+                    checked_photo_pixel_count(width, height).map_err(serde::de::Error::custom)?;
+                // Deflate worst-case expansion is <= 1% + small block header; cap tightly.
+                let max_len = expected_pixels
+                    .saturating_mul(2)
+                    .saturating_add(4096)
+                    .min(MAX_ALBUM_PHOTO_ENCODED_BYTES);
+                let deflated_rgb565_le = seq
+                    .next_element_seed(BoundedBytesSeed { max_len })?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                Ok(AlbumImageV2 {
+                    width,
+                    height,
+                    deflated_rgb565_le,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "AlbumImageV2",
+            &["width", "height", "deflated_rgb565_le"],
+            Visitor,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AlbumPhotoV2 {
+    neighborhood_id: String,
+    family_id: u16,
+    id: u64,
+    title: String,
+    caption: String,
+    sim_day: Option<u32>,
+    image: Option<AlbumImageV2>,
+}
+
+struct AlbumPhotoV2Seed<'a> {
+    expected_neighborhood_id: &'a str,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for AlbumPhotoV2Seed<'_> {
+    type Value = AlbumPhotoV2;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        struct Visitor<'a> {
+            expected_neighborhood_id: &'a str,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for Visitor<'_> {
+            type Value = AlbumPhotoV2;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("AlbumPhotoV2")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                seq.next_element_seed(ExpectedStrSeed {
+                    expected: self.expected_neighborhood_id,
+                })?
+                .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let family_id: u16 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let id: u64 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                #[derive(Deserialize)]
+                struct BoundedTitle(#[serde(deserialize_with = "deserialize_title")] String);
+                #[derive(Deserialize)]
+                struct BoundedCaption(#[serde(deserialize_with = "deserialize_caption")] String);
+                let BoundedTitle(title) = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                let BoundedCaption(caption) = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
+                let sim_day: Option<u32> = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
+                let image: Option<AlbumImageV2> = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(6, &self))?;
+                Ok(AlbumPhotoV2 {
+                    neighborhood_id: self.expected_neighborhood_id.to_owned(),
+                    family_id,
+                    id,
+                    title,
+                    caption,
+                    sim_day,
+                    image,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "AlbumPhotoV2",
+            &[
+                "neighborhood_id",
+                "family_id",
+                "id",
+                "title",
+                "caption",
+                "sim_day",
+                "image",
+            ],
+            Visitor {
+                expected_neighborhood_id: self.expected_neighborhood_id,
+            },
+        )
+    }
+}
+
 struct AlbumIndexSeed<'a> {
     expected_neighborhood_id: &'a str,
 }
@@ -1193,6 +1545,33 @@ fn decode_index(
     Ok(index)
 }
 
+fn encode_photo_v2(
+    record: &str,
+    max_encoded_bytes: usize,
+    photo: &AlbumPhotoV1,
+) -> std::result::Result<Vec<u8>, AlbumError> {
+    let image = match &photo.image {
+        Some(img) => Some(AlbumImageV2::from_image(record, img)?),
+        None => None,
+    };
+    let v2 = AlbumPhotoV2 {
+        neighborhood_id: photo.neighborhood_id.clone(),
+        family_id: photo.family_id,
+        id: photo.id,
+        title: photo.title.clone(),
+        caption: photo.caption.clone(),
+        sim_day: photo.sim_day,
+        image,
+    };
+    encode_framed(
+        record,
+        PHOTO_MAGIC,
+        PHOTO_HASH_DOMAIN,
+        max_encoded_bytes,
+        &v2,
+    )
+}
+
 fn decode_photo(
     neighborhood_id: &str,
     family_id: u16,
@@ -1201,14 +1580,47 @@ fn decode_photo(
 ) -> std::result::Result<AlbumPhotoV1, AlbumError> {
     let record = format!("{neighborhood_id}:family{family_id}:photo#{photo_id}");
     let max_bytes = MAX_ALBUM_PHOTO_ENCODED_BYTES.saturating_add(neighborhood_id.len());
-    let (_, body) = decode_framed_body(&record, PHOTO_MAGIC, PHOTO_HASH_DOMAIN, max_bytes, bytes)?;
-    let photo = decode_postcard_seed_exact(
-        &record,
-        body,
-        AlbumPhotoSeed {
-            expected_neighborhood_id: neighborhood_id,
-        },
-    )?;
+    let (version, body) =
+        decode_framed_body(&record, PHOTO_MAGIC, PHOTO_HASH_DOMAIN, max_bytes, bytes)?;
+    let photo = match version {
+        1 => decode_postcard_seed_exact(
+            &record,
+            body,
+            AlbumPhotoSeed {
+                expected_neighborhood_id: neighborhood_id,
+            },
+        )?,
+        2 => {
+            let v2 = decode_postcard_seed_exact(
+                &record,
+                body,
+                AlbumPhotoV2Seed {
+                    expected_neighborhood_id: neighborhood_id,
+                },
+            )?;
+            let image = match v2.image {
+                Some(img) => Some(img.into_image(&record)?),
+                None => None,
+            };
+            AlbumPhotoV1 {
+                neighborhood_id: v2.neighborhood_id,
+                family_id: v2.family_id,
+                id: v2.id,
+                title: v2.title,
+                caption: v2.caption,
+                sim_day: v2.sim_day,
+                image,
+            }
+        }
+        _ => {
+            return Err(AlbumError::UnsupportedVersion {
+                record,
+                found: version,
+                min_supported: ALBUM_MIN_FORMAT,
+                max_supported: ALBUM_FORMAT,
+            });
+        }
+    };
     if photo.neighborhood_id != neighborhood_id
         || photo.family_id != family_id
         || photo.id != photo_id
@@ -1228,6 +1640,64 @@ fn decode_photo(
         });
     }
     Ok(photo)
+}
+
+fn decode_photo_summary(
+    neighborhood_id: &str,
+    family_id: u16,
+    photo_id: u64,
+    bytes: &[u8],
+) -> std::result::Result<AlbumPhotoSummary, AlbumError> {
+    let record = format!("{neighborhood_id}:family{family_id}:photo#{photo_id}");
+    let max_bytes = MAX_ALBUM_PHOTO_ENCODED_BYTES.saturating_add(neighborhood_id.len());
+    let (version, body) =
+        decode_framed_body(&record, PHOTO_MAGIC, PHOTO_HASH_DOMAIN, max_bytes, bytes)?;
+    match version {
+        1 => decode_photo(neighborhood_id, family_id, photo_id, bytes).map(AlbumPhotoSummary::from),
+        2 => {
+            let v2 = decode_postcard_seed_exact(
+                &record,
+                body,
+                AlbumPhotoV2Seed {
+                    expected_neighborhood_id: neighborhood_id,
+                },
+            )?;
+            if v2.neighborhood_id != neighborhood_id
+                || v2.family_id != family_id
+                || v2.id != photo_id
+            {
+                return Err(AlbumError::DecodeFailed {
+                    record,
+                    detail: format!(
+                        "photo key binding mismatch: stored ({:?}, family {}, photo {}), \
+                         expected ({:?}, family {}, photo {})",
+                        v2.neighborhood_id,
+                        v2.family_id,
+                        v2.id,
+                        neighborhood_id,
+                        family_id,
+                        photo_id
+                    ),
+                });
+            }
+            if let Some(ref img) = v2.image {
+                img.validate_stream(&record)?;
+            }
+            Ok(AlbumPhotoSummary {
+                id: v2.id,
+                title: v2.title,
+                caption: v2.caption,
+                sim_day: v2.sim_day,
+                image_dimensions: v2.image.map(|img| (img.width, img.height)),
+            })
+        }
+        _ => Err(AlbumError::UnsupportedVersion {
+            record,
+            found: version,
+            min_supported: ALBUM_MIN_FORMAT,
+            max_supported: ALBUM_FORMAT,
+        }),
+    }
 }
 
 impl From<AlbumPhotoV1> for AlbumPhoto {
@@ -1499,10 +1969,8 @@ impl PhotoAlbumStore {
                 image: entry.image.clone(),
             };
             let photo_name = format!("{neighborhood_id}:family{family_id}:photo#{next_id}");
-            let encoded_photo = encode_framed(
+            let encoded_photo = encode_photo_v2(
                 &photo_name,
-                PHOTO_MAGIC,
-                PHOTO_HASH_DOMAIN,
                 MAX_ALBUM_PHOTO_ENCODED_BYTES.saturating_add(neighborhood_id.len()),
                 &photo_record,
             )?;
@@ -1599,10 +2067,8 @@ impl PhotoAlbumStore {
             photo.title = title.to_owned();
             photo.caption = caption.to_owned();
             let photo_name = format!("{neighborhood_id}:family{family_id}:photo#{photo_id}");
-            let encoded = encode_framed(
+            let encoded = encode_photo_v2(
                 &photo_name,
-                PHOTO_MAGIC,
-                PHOTO_HASH_DOMAIN,
                 MAX_ALBUM_PHOTO_ENCODED_BYTES.saturating_add(neighborhood_id.len()),
                 &photo,
             )?;
@@ -1895,8 +2361,9 @@ impl PhotoAlbumStore {
                     detail: "photo referenced by album index is missing".into(),
                 });
             };
-            let photo = decode_photo(neighborhood_id, family_id, photo_id, raw_photo.value())?;
-            summaries.push(photo.into());
+            let summary =
+                decode_photo_summary(neighborhood_id, family_id, photo_id, raw_photo.value())?;
+            summaries.push(summary);
         }
         Ok(summaries)
     }

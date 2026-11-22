@@ -233,72 +233,209 @@ impl Cells {
     }
 }
 
-/// Pre-encoded snapshot of a [`World`] for repeated [`same_lot`] comparisons
-/// without re-encoding the reference world on every candidate.
-#[derive(PartialEq, Eq)]
+/// Cheap copy-on-write snapshot of a [`World`] for repeated [`same_lot`]
+/// comparisons without encoding the reference world to a heap buffer.
 pub(crate) struct LotSnapshot {
-    encoded: Vec<u8>,
-    restarts: Vec<(u16, u32)>,
-    dirty_portraits: BTreeSet<u32>,
-    generated_portrait_2002: BTreeSet<sims_sim::PortraitFile>,
-    made_portrait_head: BTreeMap<u32, Option<bool>>,
-    ambiguous_portraits: BTreeSet<u32>,
-    loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
-    loaded_indexed_suits: BTreeMap<String, Option<bool>>,
-    loaded_indexed_suit_bones: BTreeMap<String, Vec<Vec<String>>>,
-    made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
-    person_outfits: BTreeMap<u16, sims_sim::PersonOutfit>,
-    scratch_ptr_set: BTreeSet<u16>,
-    scratch_ptr_set_to_next: BTreeSet<u16>,
-    scratch_ptr_expression: BTreeSet<u16>,
-    scratch_ptr_arg_slot: BTreeSet<u16>,
-    runtime_added_suits: Vec<String>,
-    suit_scan_cache: Option<Vec<String>>,
+    world: World,
 }
 
-impl LotSnapshot {
-    pub(crate) fn of(w: &World) -> Self {
-        Self {
-            encoded: w.encode(),
-            restarts: w
-                .frame_storage
-                .iter()
-                .map(|(id, s)| (*id, s.restarts))
-                .collect(),
-            dirty_portraits: w.dirty_portraits.clone(),
-            generated_portrait_2002: w.generated_portrait_2002.clone(),
-            made_portrait_head: w.made_portrait_head.clone(),
-            ambiguous_portraits: w.ambiguous_portraits.clone(),
-            loaded_indexed_skeletons: w.loaded_indexed_skeletons.clone(),
-            loaded_indexed_suits: w.loaded_indexed_suits.clone(),
-            loaded_indexed_suit_bones: w.loaded_indexed_suit_bones.clone(),
-            made_outfits: w.made_outfits.clone(),
-            person_outfits: w.person_outfits.clone(),
-            scratch_ptr_set: w.scratch_ptr_set.clone(),
-            scratch_ptr_set_to_next: w.scratch_ptr_set_to_next.clone(),
-            scratch_ptr_expression: w.scratch_ptr_expression.clone(),
-            scratch_ptr_arg_slot: w.scratch_ptr_arg_slot.clone(),
-            runtime_added_suits: w.runtime_added_suits.clone(),
-            suit_scan_cache: w.suit_scan_cache.clone(),
-        }
+impl PartialEq for LotSnapshot {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        same_lot(&self.world, &other.world)
     }
 }
 
-/// Whether two lots are the same: their encodings, each object's count of
-/// its thread's restarts (`FrameStorage::restarts`), and the unencoded
-/// portrait dirty/writeback sets (`World::dirty_portraits`,
-/// `World::generated_portrait_2002`), which the encoding leaves out and
-/// the interpreter reads.
-pub(crate) fn same_lot(a: &World, b: &World) -> bool {
-    let restarts = |w: &World| {
-        w.frame_storage
+impl Eq for LotSnapshot {}
+
+impl LotSnapshot {
+    #[inline]
+    pub(crate) fn of(w: &World) -> Self {
+        Self { world: w.clone() }
+    }
+}
+
+#[inline]
+fn same_f32_slice(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+#[inline]
+fn same_interaction_bits(a: &Interaction, b: &Interaction) -> bool {
+    a.join == b.join
+        && a.uid == b.uid
+        && a.caller == b.caller
+        && a.target == b.target
+        && a.icon == b.icon
+        && a.table_index == b.table_index
+        && a.args == b.args
+        && a.priority == b.priority
+        && a.action == b.action
+        && a.attenuation.to_bits() == b.attenuation.to_bits()
+        && a.flags == b.flags
+}
+
+fn same_frame(
+    a: &sims_formats::saved_objects::Frame,
+    b: &sims_formats::saved_objects::Frame,
+) -> bool {
+    a.stack_object == b.stack_object
+        && a.tree == b.tree
+        && a.node == b.node
+        && a.parameters == b.parameters
+        && a.locals == b.locals
+        && a.primitive_state == b.primitive_state
+        && a.code_owner_type == b.code_owner_type
+}
+
+fn same_person(
+    a: &sims_formats::saved_objects::Person,
+    b: &sims_formats::saved_objects::Person,
+) -> bool {
+    a.animation_events == b.animation_events
+        && a.engaged == b.engaged
+        && a.appearance == b.appearance
+        && a.accessories.len() == b.accessories.len()
+        && a.accessories
             .iter()
-            .map(|(id, s)| (*id, s.restarts))
-            .collect::<Vec<_>>()
-    };
-    a.encode() == b.encode()
-        && restarts(a) == restarts(b)
+            .zip(&b.accessories)
+            .all(|(x, y)| x.name == y.name && x.binding == y.binding)
+        && a.animations == b.animations
+        && a.routing_state == b.routing_state
+        && same_f32_slice(&a.floats, &b.floats)
+        && same_f32_slice(&a.previous_motives, &b.previous_motives)
+        && same_f32_slice(&a.motives, &b.motives)
+        && a.data == b.data
+        && a.routing_frames == b.routing_frames
+        && same_interaction_bits(&a.active, &b.active)
+        && same_interaction_bits(&a.last, &b.last)
+        && a.queue.len() == b.queue.len()
+        && a.queue
+            .iter()
+            .zip(&b.queue)
+            .all(|(x, y)| same_interaction_bits(x, y))
+        && a.object_uses.len() == b.object_uses.len()
+        && a.object_uses.iter().zip(&b.object_uses).all(|(x, y)| {
+            x.target == y.target && x.stack_depth == y.stack_depth && x.unknown == y.unknown
+        })
+        && a.motive_deltas.len() == b.motive_deltas.len()
+        && a.motive_deltas.iter().zip(&b.motive_deltas).all(|(x, y)| {
+            x.motive == y.motive
+                && x.delta.to_bits() == y.delta.to_bits()
+                && x.stop_at.to_bits() == y.stop_at.to_bits()
+        })
+}
+
+fn same_object(a: &sims_sim::Object, b: &sims_sim::Object) -> bool {
+    a.id == b.id
+        && a.guid == b.guid
+        && a.footprint == b.footprint
+        && a.position == b.position
+        && a.unknown_short == b.unknown_short
+        && a.attributes == b.attributes
+        && a.temps == b.temps
+        && a.data == b.data
+        && a.obsolete_word == b.obsolete_word
+        && a.stack_capacity_bytes == b.stack_capacity_bytes
+        && a.stack.len() == b.stack.len()
+        && a.stack.iter().zip(&b.stack).all(|(x, y)| same_frame(x, y))
+        && a.relationship_flag == b.relationship_flag
+        && a.relationships.len() == b.relationships.len()
+        && a.relationships
+            .iter()
+            .zip(&b.relationships)
+            .all(|(x, y)| x.present == y.present && x.target == y.target && x.values == y.values)
+        && a.slots.len() == b.slots.len()
+        && a.slots
+            .iter()
+            .zip(&b.slots)
+            .all(|(x, y)| x.unknown == y.unknown && x.object == y.object)
+        && a.dynamic_sprites == b.dynamic_sprites
+        && match (&a.multipart, &b.multipart) {
+            (Some(x), Some(y)) => {
+                x.offset == y.offset && x.group == y.group && x.parent == y.parent
+            }
+            (None, None) => true,
+            _ => false,
+        }
+        && match (&a.portal, &b.portal) {
+            (Some(x), Some(y)) => same_f32_slice(x, y),
+            (None, None) => true,
+            _ => false,
+        }
+        && match (&a.person, &b.person) {
+            (Some(x), Some(y)) => same_person(x, y),
+            (None, None) => true,
+            _ => false,
+        }
+        && a.registry_word == b.registry_word
+        && a.last_result == b.last_result
+        && a.removal_skips_resets == b.removal_skips_resets
+        && a.selected == b.selected
+}
+
+fn same_budget(a: &sims_sim::Budget, b: &sims_sim::Budget) -> bool {
+    a.funds == b.funds
+        && a.pending_funds == b.pending_funds
+        && a.lot_value == b.lot_value
+        && a.objects_value == b.objects_value
+        && a.architecture_value == b.architecture_value
+        && a.days == b.days
+}
+
+fn same_array(a: &sims_formats::lot::Array, b: &sims_formats::lot::Array) -> bool {
+    a.width == b.width
+        && a.height == b.height
+        && a.stride == b.stride
+        && a.encoding == b.encoding
+        && a.data == b.data
+}
+
+/// Whether two lots are the same: every encoded field bit-for-bit (using
+/// `Arc::ptr_eq` CoW short-circuits and `f32::to_bits()`), each object's
+/// `FrameStorage::restarts`, and every unencoded auxiliary table the
+/// interpreter reads.
+pub(crate) fn same_lot(a: &World, b: &World) -> bool {
+    a.ticks == b.ticks
+        && a.scheduler_cursor == b.scheduler_cursor
+        && a.lot_rng == b.lot_rng
+        && a.global_rng == b.global_rng
+        && a.crt_rng == b.crt_rng
+        && a.size == b.size
+        && a.event_owner == b.event_owner
+        && a.indicators == b.indicators
+        && a.action_serial == b.action_serial
+        && a.usage == b.usage
+        && a.neighborhood_data == b.neighborhood_data
+        && a.advertisement_record == b.advertisement_record
+        && a.magic_history == b.magic_history
+        && same_budget(&a.budget, &b.budget)
+        && a.globals == b.globals
+        && a.order == b.order
+        && a.people == b.people
+        && a.removals == b.removals
+        && a.fires == b.fires
+        && a.types == b.types
+        && a.type_attributes == b.type_attributes
+        && a.instances == b.instances
+        && a.changed_types == b.changed_types
+        && a.next_parts == b.next_parts
+        && a.skeleton_files == b.skeleton_files
+        && a.rooms == b.rooms
+        && a.dialogs == b.dialogs
+        && a.person_ticks == b.person_ticks
+        && a.animators == b.animators
+        && a.routing == b.routing
+        && a.families == b.families
+        && a.headlines == b.headlines
+        && a.base_layers == b.base_layers
+        && a.translated_bones == b.translated_bones
+        && a.held_poses == b.held_poses
+        && a.stops_asked == b.stops_asked
+        && a.characters == b.characters
+        && a.portraits == b.portraits
         && a.dirty_portraits == b.dirty_portraits
+        && a.saved_portraits == b.saved_portraits
         && a.generated_portrait_2002 == b.generated_portrait_2002
         && a.made_portrait_head == b.made_portrait_head
         && a.ambiguous_portraits == b.ambiguous_portraits
@@ -307,12 +444,13 @@ pub(crate) fn same_lot(a: &World, b: &World) -> bool {
         && a.loaded_indexed_suit_bones == b.loaded_indexed_suit_bones
         && a.made_outfits == b.made_outfits
         && a.person_outfits == b.person_outfits
-        && a.scratch_ptr_set == b.scratch_ptr_set
-        && a.scratch_ptr_set_to_next == b.scratch_ptr_set_to_next
-        && a.scratch_ptr_expression == b.scratch_ptr_expression
-        && a.scratch_ptr_arg_slot == b.scratch_ptr_arg_slot
+        && a.scratch_ptrs == b.scratch_ptrs
         && a.runtime_added_suits == b.runtime_added_suits
         && a.suit_scan_cache == b.suit_scan_cache
+        && a.neighbors.ptr_eq_or(&b.neighbors, PartialEq::eq)
+        && a.arrays.ptr_eq_or(&b.arrays, same_array)
+        && a.frame_storage.ptr_eq_or(&b.frame_storage, PartialEq::eq)
+        && a.objects.ptr_eq_or(&b.objects, same_object)
 }
 
 impl<'a> Machine<'a, '_> {
@@ -322,38 +460,9 @@ impl<'a> Machine<'a, '_> {
         'a: 'b,
     {
         let interpreter = cells.on(&self.interpreter());
-        Machine {
-            program: self.program,
-            catalog: self.catalog,
-            world,
-            me: self.me,
-            stream: self.stream,
-            asked: interpreter.asked,
-            deleted: interpreter.deleted,
-            sounds: interpreter.sounds,
-            ui_effects: interpreter.ui_effects,
-            masks_rebuilt: interpreter.masks_rebuilt,
-            base: self.base,
-            synchronous: self.synchronous,
-            checking: self.checking,
-            making_person: self.making_person,
-            menu: interpreter.menu,
-            running_at_once: interpreter.running_at_once,
-            letting_go: interpreter.letting_go,
-            deleting: interpreter.deleting,
-            view_rotation: self.view_rotation,
-            view_centre: self.view_centre,
-            refreshing: interpreter.refreshing,
-            taken_off: interpreter.taken_off,
-            dialog_text: self.dialog_text,
-            character_names: self.character_names,
-            default_character_name: self.default_character_name,
-            active_family: self.active_family,
-            coop: interpreter.coop,
-            special_panels: interpreter.special_panels,
-            inline_special_panel: interpreter.inline_special_panel,
-            in_both_ways: interpreter.in_both_ways,
-        }
+        let mut machine = interpreter.machine(world, self.me, self.base, self.synchronous);
+        machine.checking = self.checking;
+        machine
     }
 
     /// Runs the current instruction, primitive `opcode`, both ways, with
@@ -728,5 +837,65 @@ mod tests {
             .step(&mut world, 1)
             .expect_err("Spellbook under both_ways must trap Unsupported rather than skipping");
         assert!(matches!(err.trap, crate::Trap::Unsupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn same_lot_cow_shortcut_matches_encode_on_floats_and_scratch_ptrs() {
+        let mut a = World::empty();
+        a.objects.insert(
+            1,
+            sims_sim::Object {
+                id: 1,
+                guid: 0x1000,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 64],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: Some(vec![0.0, 1.5, -2.25, 3.0, 4.0, 5.0]),
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+        // CoW clone shares all Arcs -> fast path returns true.
+        let mut b = a.clone();
+        assert!(same_lot(&a, &b));
+        assert_eq!(a.encode(), b.encode());
+
+        // -0.0 vs +0.0 differs in postcard wire bytes -> same_lot must return false.
+        b.objects.get_mut(&1).unwrap().portal.as_mut().unwrap()[0] = -0.0;
+        assert_ne!(a.encode(), b.encode());
+        assert!(!same_lot(&a, &b));
+
+        // Identical NaN bit patterns encode identically -> same_lot must return true.
+        let nan1 = f32::from_bits(0x7fc0_0001);
+        let nan2 = f32::from_bits(0x7fc0_0002);
+        a.objects.get_mut(&1).unwrap().portal.as_mut().unwrap()[0] = nan1;
+        b.objects.get_mut(&1).unwrap().portal.as_mut().unwrap()[0] = nan1;
+        assert_eq!(a.encode(), b.encode());
+        assert!(same_lot(&a, &b));
+
+        // Distinct NaN payloads differ in postcard bytes -> same_lot must return false.
+        b.objects.get_mut(&1).unwrap().portal.as_mut().unwrap()[0] = nan2;
+        assert_ne!(a.encode(), b.encode());
+        assert!(!same_lot(&a, &b));
+
+        // ScratchPtrs difference is caught even when encoded World matches.
+        let mut c = a.clone();
+        c.scratch_ptrs.set(1, sims_sim::SCRATCH_PTR_SET);
+        assert_eq!(a.encode(), c.encode());
+        assert!(!same_lot(&a, &c));
     }
 }

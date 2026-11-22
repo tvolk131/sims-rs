@@ -28,6 +28,9 @@ use crate::migration::{
     decode_neighborhood_strict, decode_neighborhood_with_report,
 };
 use crate::{Error, Result, World};
+use flate2::Compression;
+use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -40,6 +43,7 @@ use sims_formats::neighborhood::{
 };
 use sims_formats::tatt::{Entry as TattEntry, Tatt};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -113,8 +117,12 @@ const LOT_THUMBNAIL_HASH_DOMAIN: &[u8] = b"sims-sim:lot-thumbnail:v1";
 /// Length of the fixed lot-thumbnail envelope header (magic + version + SHA-256).
 const LOT_THUMBNAIL_HEADER_LEN: usize = 4 + 4 + 32;
 
-/// Current [`StoredLotThumbnail`] wire format version.
-pub const LOT_THUMBNAIL_FORMAT: u32 = 1;
+/// Earliest supported [`StoredLotThumbnail`] wire format version.
+pub const LOT_THUMBNAIL_MIN_FORMAT: u32 = 1;
+
+/// Current [`StoredLotThumbnail`] wire format version (V2: deflate-compressed
+/// raw little-endian RGB565 pixels without postcard varint bloat).
+pub const LOT_THUMBNAIL_FORMAT: u32 = 2;
 
 /// Maximum width or height accepted for a persisted lot map thumbnail surface
 /// (matching `sims-render`'s `MAX_LOT_CELL_DIM`).
@@ -438,6 +446,251 @@ struct LotThumbnailRecordV1 {
     roofs_off: Option<ThumbnailSurface565>,
 }
 
+/// V2 compact thumbnail surface: raw little-endian RGB565 pixel bytes
+/// compressed with `flate2::Compression::fast()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ThumbnailSurface565V2 {
+    width: u32,
+    height: u32,
+    deflated_rgb565_le: Vec<u8>,
+}
+
+impl ThumbnailSurface565V2 {
+    fn from_surface(surface: &ThumbnailSurface565) -> Result<Self> {
+        let mut raw = Vec::with_capacity(surface.pixels.len().saturating_mul(2));
+        for &px in &surface.pixels {
+            raw.extend_from_slice(&px.to_le_bytes());
+        }
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder
+            .write_all(&raw)
+            .map_err(|e| Error::Snapshot(format!("compress V2 lot thumbnail: {e}")))?;
+        let deflated_rgb565_le = encoder
+            .finish()
+            .map_err(|e| Error::Snapshot(format!("finish V2 lot thumbnail compression: {e}")))?;
+        Ok(Self {
+            width: surface.width,
+            height: surface.height,
+            deflated_rgb565_le,
+        })
+    }
+
+    fn into_surface(self) -> Result<ThumbnailSurface565> {
+        let expected_pixels = checked_thumbnail_pixel_count(self.width, self.height)?;
+        let expected_bytes = expected_pixels
+            .checked_mul(2)
+            .ok_or_else(|| Error::Snapshot("lot thumbnail RGB565 byte count overflows".into()))?;
+        let mut decoder = DeflateDecoder::new(self.deflated_rgb565_le.as_slice())
+            .take((expected_bytes as u64).saturating_add(1));
+        let mut raw = Vec::with_capacity(expected_bytes);
+        decoder
+            .read_to_end(&mut raw)
+            .map_err(|e| Error::Snapshot(format!("decompress V2 lot thumbnail: {e}")))?;
+        if raw.len() != expected_bytes {
+            return Err(Error::Snapshot(format!(
+                "decompressed V2 lot thumbnail byte length {} does not match expected {expected_bytes}",
+                raw.len()
+            )));
+        }
+        let consumed = decoder.into_inner().total_in();
+        if consumed != self.deflated_rgb565_le.len() as u64 {
+            return Err(Error::Snapshot(format!(
+                "V2 lot thumbnail compressed stream has trailing bytes (consumed {consumed} of {} bytes)",
+                self.deflated_rgb565_le.len()
+            )));
+        }
+        let mut pixels = Vec::with_capacity(expected_pixels);
+        for chunk in raw.as_chunks::<2>().0 {
+            pixels.push(u16::from_le_bytes(*chunk));
+        }
+        Ok(ThumbnailSurface565 {
+            width: self.width,
+            height: self.height,
+            pixels,
+        })
+    }
+}
+
+struct BoundedThumbnailBytesSeed {
+    max_len: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BoundedThumbnailBytesSeed {
+    type Value = Vec<u8>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        struct Visitor {
+            max_len: usize,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "at most {} bytes", self.max_len)
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> std::result::Result<Vec<u8>, E> {
+                if v.len() > self.max_len {
+                    return Err(E::custom(format!(
+                        "compressed thumbnail buffer len {} exceeds maximum {}",
+                        v.len(),
+                        self.max_len
+                    )));
+                }
+                Ok(v.to_vec())
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                if let Some(hint) = seq.size_hint()
+                    && hint > self.max_len
+                {
+                    return Err(serde::de::Error::custom(format!(
+                        "compressed thumbnail buffer len {hint} exceeds maximum {}",
+                        self.max_len
+                    )));
+                }
+                let cap = seq.size_hint().map_or(0, |h| h.min(self.max_len));
+                let mut out = Vec::with_capacity(cap);
+                while let Some(b) = seq.next_element::<u8>()? {
+                    if out.len() >= self.max_len {
+                        return Err(serde::de::Error::custom(format!(
+                            "compressed thumbnail buffer exceeds maximum {}",
+                            self.max_len
+                        )));
+                    }
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_seq(Visitor {
+            max_len: self.max_len,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ThumbnailSurface565V2 {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct SurfaceV2Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for SurfaceV2Visitor {
+            type Value = ThumbnailSurface565V2;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("ThumbnailSurface565V2 { width, height, deflated_rgb565_le }")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let width: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let height: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let expected_pixels = checked_thumbnail_pixel_count(width, height)
+                    .map_err(serde::de::Error::custom)?;
+                let max_len = expected_pixels
+                    .saturating_mul(2)
+                    .saturating_add(4096)
+                    .min(MAX_LOT_THUMBNAIL_ENCODED_BYTES);
+                let deflated_rgb565_le = seq
+                    .next_element_seed(BoundedThumbnailBytesSeed { max_len })?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                Ok(ThumbnailSurface565V2 {
+                    width,
+                    height,
+                    deflated_rgb565_le,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "ThumbnailSurface565V2",
+            &["width", "height", "deflated_rgb565_le"],
+            SurfaceV2Visitor,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct LotThumbnailRecordV2 {
+    neighborhood_id: String,
+    lot_id: u32,
+    normal: ThumbnailSurface565V2,
+    roofs_off: Option<ThumbnailSurface565V2>,
+}
+
+struct LotThumbnailRecordV2Seed<'a> {
+    expected_neighborhood_id: &'a str,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for LotThumbnailRecordV2Seed<'_> {
+    type Value = LotThumbnailRecordV2;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        struct RecordVisitor<'a> {
+            expected_neighborhood_id: &'a str,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for RecordVisitor<'_> {
+            type Value = LotThumbnailRecordV2;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("LotThumbnailRecordV2")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                seq.next_element_seed(ExpectedThumbnailIdSeed {
+                    expected: self.expected_neighborhood_id,
+                })?
+                .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let lot_id: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let normal: ThumbnailSurface565V2 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                let roofs_off: Option<ThumbnailSurface565V2> = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                Ok(LotThumbnailRecordV2 {
+                    neighborhood_id: self.expected_neighborhood_id.to_owned(),
+                    lot_id,
+                    normal,
+                    roofs_off,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "LotThumbnailRecordV2",
+            &["neighborhood_id", "lot_id", "normal", "roofs_off"],
+            RecordVisitor {
+                expected_neighborhood_id: self.expected_neighborhood_id,
+            },
+        )
+    }
+}
+
 struct ExpectedThumbnailIdSeed<'a> {
     expected: &'a str,
 }
@@ -549,11 +802,14 @@ fn encode_lot_thumbnail(
     thumbnail: &StoredLotThumbnail,
 ) -> Result<Vec<u8>> {
     thumbnail.validate()?;
-    let record = LotThumbnailRecordV1 {
+    let record = LotThumbnailRecordV2 {
         neighborhood_id: neighborhood_id.to_owned(),
         lot_id,
-        normal: thumbnail.normal.clone(),
-        roofs_off: thumbnail.roofs_off.clone(),
+        normal: ThumbnailSurface565V2::from_surface(&thumbnail.normal)?,
+        roofs_off: match &thumbnail.roofs_off {
+            Some(surface) => Some(ThumbnailSurface565V2::from_surface(surface)?),
+            None => None,
+        },
     };
     let body = postcard::to_allocvec(&record).map_err(|e| {
         Error::Snapshot(format!(
@@ -594,9 +850,9 @@ fn decode_lot_thumbnail(
         )));
     }
     let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
-    if version != LOT_THUMBNAIL_FORMAT {
+    if !(LOT_THUMBNAIL_MIN_FORMAT..=LOT_THUMBNAIL_FORMAT).contains(&version) {
         return Err(Error::Snapshot(format!(
-            "{record_name}: unsupported lot thumbnail format {version} (expected {LOT_THUMBNAIL_FORMAT})"
+            "{record_name}: unsupported lot thumbnail format {version} (supported {LOT_THUMBNAIL_MIN_FORMAT}..={LOT_THUMBNAIL_FORMAT})"
         )));
     }
     let max_bytes = MAX_LOT_THUMBNAIL_ENCODED_BYTES.saturating_add(neighborhood_id.len());
@@ -621,13 +877,43 @@ fn decode_lot_thumbnail(
         )));
     }
     let mut de = postcard::Deserializer::from_bytes(body);
-    let decoded = serde::de::DeserializeSeed::deserialize(
-        LotThumbnailRecordSeed {
-            expected_neighborhood_id: neighborhood_id,
-        },
-        &mut de,
-    )
-    .map_err(|e| Error::Snapshot(format!("{record_name}: {e}")))?;
+    let (stored_neighborhood, stored_lot, normal, roofs_off) = match version {
+        1 => {
+            let decoded = serde::de::DeserializeSeed::deserialize(
+                LotThumbnailRecordSeed {
+                    expected_neighborhood_id: neighborhood_id,
+                },
+                &mut de,
+            )
+            .map_err(|e| Error::Snapshot(format!("{record_name}: {e}")))?;
+            (
+                decoded.neighborhood_id,
+                decoded.lot_id,
+                decoded.normal,
+                decoded.roofs_off,
+            )
+        }
+        2 => {
+            let decoded = serde::de::DeserializeSeed::deserialize(
+                LotThumbnailRecordV2Seed {
+                    expected_neighborhood_id: neighborhood_id,
+                },
+                &mut de,
+            )
+            .map_err(|e| Error::Snapshot(format!("{record_name}: {e}")))?;
+            let normal = decoded.normal.into_surface()?;
+            let roofs_off = match decoded.roofs_off {
+                Some(surface) => Some(surface.into_surface()?),
+                None => None,
+            };
+            (decoded.neighborhood_id, decoded.lot_id, normal, roofs_off)
+        }
+        _ => {
+            return Err(Error::Snapshot(format!(
+                "{record_name}: unsupported lot thumbnail format {version} (supported {LOT_THUMBNAIL_MIN_FORMAT}..={LOT_THUMBNAIL_FORMAT})"
+            )));
+        }
+    };
     let trailing = de
         .finalize()
         .map_err(|e| Error::Snapshot(format!("{record_name}: {e}")))?;
@@ -637,16 +923,12 @@ fn decode_lot_thumbnail(
             trailing.len()
         )));
     }
-    if decoded.neighborhood_id != neighborhood_id || decoded.lot_id != lot_id {
+    if stored_neighborhood != neighborhood_id || stored_lot != lot_id {
         return Err(Error::Snapshot(format!(
-            "{record_name}: key binding mismatch: stored ({:?}, lot {}), expected ({:?}, lot {})",
-            decoded.neighborhood_id, decoded.lot_id, neighborhood_id, lot_id
+            "{record_name}: key binding mismatch: stored ({stored_neighborhood:?}, lot {stored_lot}), expected ({neighborhood_id:?}, lot {lot_id})"
         )));
     }
-    Ok(StoredLotThumbnail {
-        normal: decoded.normal,
-        roofs_off: decoded.roofs_off,
-    })
+    Ok(StoredLotThumbnail { normal, roofs_off })
 }
 
 fn purge_lot_thumbnails_in_txn(txn: &redb::WriteTransaction, id: &str) -> Result<()> {

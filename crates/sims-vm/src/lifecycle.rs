@@ -2161,8 +2161,10 @@ fn boot_from_saved_lot(
         Answers::choices(answers)
     };
     let play = Play { fresh: saved.fresh };
+    let fast = crate::program::ProgramFast::build(&program, &catalog);
     Ok(Lot {
         program,
+        fast,
         catalog: std::sync::Arc::new(catalog),
         surfaces,
         world,
@@ -2580,8 +2582,10 @@ fn boot_from_base_house(
     load.libraries = program.libraries.len();
     let start = world.ticks;
     let loaded = world.hash();
+    let fast = crate::program::ProgramFast::build(&program, &catalog);
     Ok(Lot {
         program,
+        fast,
         catalog: std::sync::Arc::new(catalog),
         surfaces,
         world,

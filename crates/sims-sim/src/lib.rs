@@ -27,6 +27,7 @@ pub mod characters;
 mod cow;
 mod error;
 pub mod grass;
+pub mod hash_flavor;
 pub mod head;
 pub mod load;
 pub mod migration;
@@ -52,8 +53,9 @@ pub use autosave::{
     LoadedSave, RecoveryLoad, SaveError, SaveJob, SaveMetadata, SavePayload, SavePayloadKind,
     SaveSlot, SaveSlotEntry, SaveTarget,
 };
-pub use cow::{CowBox, CowMap};
+pub use cow::{CowBox, CowKey, CowMap};
 pub use error::Error;
+pub use hash_flavor::{Sha256Flavor, hash_postcard};
 pub use migration::{
     MigratedBytes, MigratedRecord, MigrationError, MigrationRegistry, MigrationReport,
     MigrationStep, NEIGHBORHOOD_MIGRATIONS, NEIGHBORHOOD_MIN_FORMAT, NeighborhoodSchemaStatus,
@@ -64,15 +66,17 @@ pub use neighborhood_store::{
     CheckedCommitError, DEFAULT_ARCH_VALUE_MULTIPLIER, DEFAULT_LAYOUT_HISTORY_FILL,
     DEFAULT_LOT_THUMBNAILS_MAX_BYTES, DEFAULT_NEW_FAMILY_START_HOUR, FAMILY_FLAG_BIT_3,
     FAMILY_FLAG_HAS_CATEGORY_1, FAMILY_FLAG_HAS_CATEGORY_9, FAMILY_FLAG_NEW_MOVE_IN, ImportSummary,
-    LOT_THUMBNAIL_FORMAT, LotSnapshot, MAX_LOT_THUMBNAIL_DIM, MAX_LOT_THUMBNAIL_ENCODED_BYTES,
-    MAX_LOT_THUMBNAIL_PIXELS, NEIGHBORHOOD_FORMAT, NeighborhoodStore, StoredLotThumbnail,
-    StoredNeighborhood, ThumbnailSurface565, family_net_worth, lot_total_value,
+    LOT_THUMBNAIL_FORMAT, LOT_THUMBNAIL_MIN_FORMAT, LotSnapshot, MAX_LOT_THUMBNAIL_DIM,
+    MAX_LOT_THUMBNAIL_ENCODED_BYTES, MAX_LOT_THUMBNAIL_PIXELS, NEIGHBORHOOD_FORMAT,
+    NeighborhoodStore, StoredLotThumbnail, StoredNeighborhood, ThumbnailSurface565,
+    family_net_worth, lot_total_value,
 };
 pub use snapshot::{FORMAT as SNAPSHOT_FORMAT, ReadOnlySnapshots, Snapshots};
 pub use world::{
     ADVERTISEMENTS, Advertisement, BoundSlot, Budget, Dialog, Dialogs, FULL_SIZE, FrameStorage,
     Headline, HouseUsage, MagicHistory, Object, PersonOutfit, PersonTick, PortraitFile,
-    TypeAttributes, Usage, Whereabouts, WorkwearCache, World,
+    SCRATCH_PTR_ARG_SLOT, SCRATCH_PTR_EXPRESSION, SCRATCH_PTR_SET, SCRATCH_PTR_SET_TO_NEXT,
+    ScratchPtrBitSerialize, ScratchPtrs, TypeAttributes, Usage, Whereabouts, WorkwearCache, World,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -515,7 +515,7 @@ impl Machine<'_, '_> {
         let resource = self.definition(object.guid)?.resource;
         let curves = self
             .program
-            .score_curves(global_table, resource, table)
+            .score_curves_ref(global_table, resource, table)
             .map_err(Trap::Unsupported)?;
         let motives = person.motives.map(F32::from_f32);
         let baseline = score(&curves, &motives, &person.data, None)?.to_f32();

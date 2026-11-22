@@ -3659,6 +3659,7 @@ dependencies = [
 name = "sims-sim"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "postcard",
  "redb",
  "serde",

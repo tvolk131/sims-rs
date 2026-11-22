@@ -59,6 +59,7 @@ impl Machine<'_, '_> {
             if opcode == 0 {
                 object.set_countdown(0);
             }
+            crate::interpreter::mark_frame_dirty(self.world, target, index);
         }
         Ok(true)
     }

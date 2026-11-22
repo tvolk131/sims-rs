@@ -877,3 +877,241 @@ fn preexisting_orphan_album_is_purged_on_new_family_allocation_and_long_ids_roun
     assert!(albums.delete_family_album(&long_id, long_tok).unwrap());
     assert!(albums.list(&long_id, 1).unwrap().is_empty());
 }
+
+#[test]
+fn album_v2_roundtrip_compression_and_v1_backwards_compatibility() {
+    use redb::ReadableDatabase;
+    use sha2::{Digest, Sha256};
+
+    let db = TempDb::new("album_v1_v2_compat");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .save_neighborhood("UserData", &sample_neighborhood("UserData", &[1]))
+        .unwrap();
+    let albums = store.albums();
+    let tok = albums.family_token("UserData", 1).unwrap().unwrap();
+
+    // Realistic 128x96 RGB565 image with high-bit values (including magenta 0xf81f)
+    // that postcard V1 varint-inflated to 3 bytes/pixel.
+    let mut pixels = Vec::with_capacity(128 * 96);
+    for y in 0..96u16 {
+        for x in 0..128u16 {
+            pixels.push(if (x + y) % 8 == 0 {
+                0xf81f
+            } else {
+                0x8410 | ((x & 31) << 11) | ((y & 63) << 5)
+            });
+        }
+    }
+    let img = AlbumImage::new(128, 96, pixels).unwrap();
+    let added = albums
+        .add(
+            "UserData",
+            tok,
+            NewAlbumPhoto::with_image("V2 Shot", "Compressed raw LE RGB565", img.clone())
+                .with_sim_day(4),
+        )
+        .unwrap();
+    assert_eq!(
+        albums.get("UserData", 1, added.id).unwrap().unwrap().image,
+        Some(img.clone())
+    );
+    let summaries = albums.list_summaries("UserData", 1).unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].image_dimensions, Some((128, 96)));
+    drop(albums);
+    drop(store);
+
+    // Measure stored V2 size vs raw V1 varint-encoded size, then inject a genuine
+    // V1 record into photo #2 and verify bit-exact backwards-compatible reading.
+    const PHOTO_TABLE: redb::TableDefinition<(&str, u16, u64), &[u8]> =
+        redb::TableDefinition::new("photo_album_photos");
+    const INDEX_TABLE: redb::TableDefinition<(&str, u16), &[u8]> =
+        redb::TableDefinition::new("photo_album_index");
+
+    #[derive(serde::Serialize)]
+    struct LegacyPhotoV1 {
+        neighborhood_id: String,
+        family_id: u16,
+        id: u64,
+        title: String,
+        caption: String,
+        sim_day: Option<u32>,
+        image: Option<AlbumImage>,
+    }
+    #[derive(serde::Serialize)]
+    struct LegacyIndexV1 {
+        neighborhood_id: String,
+        family_id: u16,
+        next_photo_id: u64,
+        order: Vec<u64>,
+    }
+
+    let v1_body = postcard::to_allocvec(&LegacyPhotoV1 {
+        neighborhood_id: "UserData".into(),
+        family_id: 1,
+        id: 2,
+        title: "V1 Legacy".into(),
+        caption: "Uncompressed varint V1".into(),
+        sim_day: Some(2),
+        image: Some(img.clone()),
+    })
+    .unwrap();
+    let mut h = Sha256::new();
+    h.update(b"sims-sim:album-photo:v1");
+    h.update(1u32.to_le_bytes());
+    h.update(&v1_body);
+    let mut v1_framed = Vec::new();
+    v1_framed.extend_from_slice(b"ALBP");
+    v1_framed.extend_from_slice(&1u32.to_le_bytes());
+    v1_framed.extend_from_slice(&h.finalize());
+    v1_framed.extend_from_slice(&v1_body);
+
+    let idx_body = postcard::to_allocvec(&LegacyIndexV1 {
+        neighborhood_id: "UserData".into(),
+        family_id: 1,
+        next_photo_id: 2,
+        order: vec![added.id, 2],
+    })
+    .unwrap();
+    let mut ih = Sha256::new();
+    ih.update(b"sims-sim:album-index:v1");
+    ih.update(1u32.to_le_bytes());
+    ih.update(&idx_body);
+    let mut idx_framed = Vec::new();
+    idx_framed.extend_from_slice(b"ALBI");
+    idx_framed.extend_from_slice(&1u32.to_le_bytes());
+    idx_framed.extend_from_slice(&ih.finalize());
+    idx_framed.extend_from_slice(&idx_body);
+
+    let raw_db = redb::Database::open(&db.0).unwrap();
+    let v2_len = {
+        let r = raw_db.begin_read().unwrap();
+        let t = r.open_table(PHOTO_TABLE).unwrap();
+        t.get(("UserData", 1, added.id))
+            .unwrap()
+            .unwrap()
+            .value()
+            .len()
+    };
+    assert!(
+        v2_len * 3 < v1_framed.len(),
+        "expected V2 ({v2_len} B) to be >3x smaller than V1 ({} B)",
+        v1_framed.len()
+    );
+    {
+        let w = raw_db.begin_write().unwrap();
+        {
+            let mut pt = w.open_table(PHOTO_TABLE).unwrap();
+            pt.insert(("UserData", 1, 2), v1_framed.as_slice()).unwrap();
+            let mut it = w.open_table(INDEX_TABLE).unwrap();
+            it.insert(("UserData", 1), idx_framed.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    drop(raw_db);
+
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    let listed = store.albums().list("UserData", 1).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].image, Some(img.clone()));
+    assert_eq!(listed[1].title, "V1 Legacy");
+    assert_eq!(listed[1].image, Some(img));
+}
+
+#[test]
+fn album_v2_rejects_trailing_and_corrupt_deflate_in_both_get_and_list_summaries() {
+    use sha2::{Digest, Sha256};
+
+    let db = TempDb::new("album_v2_trailing");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .save_neighborhood("UserData", &sample_neighborhood("UserData", &[1]))
+        .unwrap();
+    let albums = store.albums();
+    let tok = albums.family_token("UserData", 1).unwrap().unwrap();
+    let img = AlbumImage::new(8, 8, vec![0xf81f; 64]).unwrap();
+    let added = albums
+        .add("UserData", tok, NewAlbumPhoto::with_image("Shot", "", img))
+        .unwrap();
+    drop(albums);
+    drop(store);
+
+    const PHOTO_TABLE: redb::TableDefinition<(&str, u16, u64), &[u8]> =
+        redb::TableDefinition::new("photo_album_photos");
+
+    #[derive(serde::Serialize)]
+    struct RawImageV2 {
+        width: u32,
+        height: u32,
+        deflated_rgb565_le: Vec<u8>,
+    }
+    #[derive(serde::Serialize)]
+    struct RawPhotoV2 {
+        neighborhood_id: String,
+        family_id: u16,
+        id: u64,
+        title: String,
+        caption: String,
+        sim_day: Option<u32>,
+        image: Option<RawImageV2>,
+    }
+
+    let sign_v2 = |photo: &RawPhotoV2| -> Vec<u8> {
+        let body = postcard::to_allocvec(photo).unwrap();
+        let mut h = Sha256::new();
+        h.update(b"sims-sim:album-photo:v1");
+        h.update(2u32.to_le_bytes());
+        h.update(&body);
+        let mut framed = Vec::new();
+        framed.extend_from_slice(b"ALBP");
+        framed.extend_from_slice(&2u32.to_le_bytes());
+        framed.extend_from_slice(&h.finalize());
+        framed.extend_from_slice(&body);
+        framed
+    };
+
+    // Valid compressed bytes for 8x8 RGB565 + trailing junk bytes.
+    let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut enc, &[0x1f; 128]).unwrap();
+    let mut with_trailing = enc.finish().unwrap();
+    with_trailing.extend_from_slice(b"TRAILING");
+
+    for bad_stream in [with_trailing, vec![0xff, 0x00, 0xde, 0xad]] {
+        let framed = sign_v2(&RawPhotoV2 {
+            neighborhood_id: "UserData".into(),
+            family_id: 1,
+            id: added.id,
+            title: "Bad".into(),
+            caption: String::new(),
+            sim_day: None,
+            image: Some(RawImageV2 {
+                width: 8,
+                height: 8,
+                deflated_rgb565_le: bad_stream,
+            }),
+        });
+        {
+            let raw_db = redb::Database::open(&db.0).unwrap();
+            let w = raw_db.begin_write().unwrap();
+            {
+                let mut pt = w.open_table(PHOTO_TABLE).unwrap();
+                pt.insert(("UserData", 1, added.id), framed.as_slice())
+                    .unwrap();
+            }
+            w.commit().unwrap();
+        }
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        let albums = store.albums();
+        assert!(matches!(
+            albums.get("UserData", 1, added.id),
+            Err(AlbumError::DecodeFailed { .. })
+        ));
+        assert!(matches!(
+            albums.list_summaries("UserData", 1),
+            Err(AlbumError::DecodeFailed { .. })
+        ));
+        drop(albums);
+        drop(store);
+    }
+}

@@ -113,10 +113,9 @@ impl Machine<'_, '_> {
         // the same dispatcher depth and faults at `&globals[34]`, while still
         // addressing an allocated local inside a subsequent `Expression`'s
         // right-hand Global 34 read (`0x452c76` → `0x4541db`).
-        self.world.scratch_ptr_set.remove(&self.me);
-        self.world.scratch_ptr_expression.remove(&self.me);
-        self.world.scratch_ptr_arg_slot.remove(&self.me);
-        self.world.scratch_ptr_set_to_next.insert(self.me);
+        self.world
+            .scratch_ptrs
+            .set(self.me, sims_sim::SCRATCH_PTR_SET_TO_NEXT);
         let (scope, index) = if operands[4] & 0x80 == 0 {
             (10, 0)
         } else {
@@ -229,20 +228,32 @@ impl Machine<'_, '_> {
     /// not in the list. None when no definition has the GUID. Ported from
     /// the old prototype (legacy/crates/sims-vm/src/person.rs:919).
     fn next_instance(&mut self, guid: u32, current: i16) -> Result<Option<i16>, Trap> {
-        match self
-            .catalog
-            .objects
-            .iter()
-            .filter(|o| o.guid == guid)
-            .count()
-        {
-            0 => return Ok(None),
-            1 => {}
-            _ => {
+        if self.fast.is_some() {
+            if self.catalog.object(guid).is_none() {
+                return Ok(None);
+            }
+            if self.is_duplicate_guid(guid) {
                 // The original lists instances by definition, not GUID.
                 return Err(Trap::Unsupported(format!(
                     "Set To Next mode 4: GUID 0x{guid:08X} names more than one definition"
                 )));
+            }
+        } else {
+            match self
+                .catalog
+                .objects
+                .iter()
+                .filter(|o| o.guid == guid)
+                .count()
+            {
+                0 => return Ok(None),
+                1 => {}
+                _ => {
+                    // The original lists instances by definition, not GUID.
+                    return Err(Trap::Unsupported(format!(
+                        "Set To Next mode 4: GUID 0x{guid:08X} names more than one definition"
+                    )));
+                }
             }
         }
         let objects = &self.world.objects;
@@ -269,8 +280,9 @@ impl Machine<'_, '_> {
     /// Modes 0, 1, 2 and 6: the next match after `current` in registration
     /// order, or in the person vector for mode 1. None leaves the cursor as
     /// it was; mode 1 gives zero instead.
-    fn next_in_order(&self, mode: u8, current: i16) -> Result<Option<i16>, Trap> {
-        let ids: &[u16] = if mode == 1 {
+    fn next_in_order(&mut self, mode: u8, current: i16) -> Result<Option<i16>, Trap> {
+        let is_people = mode == 1;
+        if is_people {
             if let Some(id) = self.making_person {
                 return Err(Trap::Unsupported(format!(
                     "a walk of the person vector while the factory makes person {id}; when in \
@@ -294,11 +306,15 @@ impl Machine<'_, '_> {
                     Trap::Invalid(format!("object ID {raw_id} does not fit a script word"))
                 })?;
             }
-            &self.world.people
-        } else {
-            // Validate every entry in registration order upfront (matching
-            // `registration_order`: object lookup before script-word
-            // conversion) without allocating a temporary `Vec`.
+        } else if !self.order_validated {
+            // Validate every entry in registration order once per contiguous
+            // read-only scan within a turn (matching `registration_order`:
+            // object lookup before script-word conversion), and track whether
+            // all IDs are unique so `last_order_cursor` preserves first-match
+            // semantics even if `world.order` has duplicate entries.
+            let mut seen_low = [0u64; 64];
+            let mut seen_high: Option<std::collections::BTreeSet<u16>> = None;
+            let mut unique = true;
             for &raw_id in &self.world.order {
                 if !self.world.objects.contains_key(&raw_id) {
                     return Err(Trap::Invalid(format!(
@@ -308,19 +324,47 @@ impl Machine<'_, '_> {
                 i16::try_from(raw_id).map_err(|_| {
                     Trap::Invalid(format!("object ID {raw_id} does not fit a script word"))
                 })?;
+                if unique {
+                    let idx = usize::from(raw_id);
+                    if idx < 4096 {
+                        let word = &mut seen_low[idx >> 6];
+                        let bit = 1u64 << (idx & 63);
+                        if *word & bit != 0 {
+                            unique = false;
+                        } else {
+                            *word |= bit;
+                        }
+                    } else if !seen_high.get_or_insert_default().insert(raw_id) {
+                        unique = false;
+                    }
+                }
             }
+            self.order_validated = true;
+            self.order_unique = unique;
+        }
+        let ids: &[u16] = if is_people {
+            &self.world.people
+        } else {
             &self.world.order
         };
-        let remaining = match current {
-            0 => ids,
-            _ => match u16::try_from(current)
-                .ok()
-                .and_then(|cur| ids.iter().position(|&id| id == cur))
-            {
-                Some(i) => &ids[i + 1..],
-                None => &[],
+        let start_idx = match current {
+            0 => 0,
+            _ => match u16::try_from(current).ok().and_then(|cur| {
+                if !is_people
+                    && self.order_unique
+                    && let Some((last_id, last_idx)) = self.last_order_cursor
+                    && last_id == cur
+                    && ids.get(last_idx) == Some(&cur)
+                {
+                    return Some(last_idx);
+                }
+                ids.iter().position(|&id| id == cur)
+            }) {
+                Some(i) => i + 1,
+                None => ids.len(),
             },
         };
+        let remaining = &ids[start_idx..];
         // Mode 6 compares against the frame's first parameter, which it
         // reads only when there is an object left to compare.
         let category = if mode == 6 && !remaining.is_empty() {
@@ -332,11 +376,11 @@ impl Machine<'_, '_> {
         } else {
             None
         };
-        for &raw_id in remaining {
+        for (offset, &raw_id) in remaining.iter().enumerate() {
             let id = i16::try_from(raw_id).map_err(|_| {
                 Trap::Invalid(format!("object ID {raw_id} does not fit a script word"))
             })?;
-            if mode == 1 {
+            if is_people {
                 return Ok(Some(id));
             }
             let object = self.world.objects.get(&raw_id).ok_or_else(|| {
@@ -352,10 +396,11 @@ impl Machine<'_, '_> {
                 _ => true,
             };
             if matches {
+                self.last_order_cursor = Some((raw_id, start_idx + offset));
                 return Ok(Some(id));
             }
         }
-        Ok((mode == 1).then_some(0))
+        Ok(is_people.then_some(0))
     }
 
     /// Mode 3 (0x44ec79): the tile after `current` in its multi-tile

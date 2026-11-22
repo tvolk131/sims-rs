@@ -3237,8 +3237,10 @@ fn boot_destination_for_edit(
         counted,
     });
     let loaded = world.hash();
+    let fast = crate::program::ProgramFast::build(&program, &catalog);
     Ok(Lot {
         program,
+        fast,
         catalog: Arc::new(catalog),
         surfaces,
         world,
@@ -3983,8 +3985,10 @@ fn boot_destination_lot(
     // `lifecycle::save_and_leave_lot` can never overwrite the Build/Buy
     // destination snapshot, and bind `loaded` to `(store_id, trip_id)`.
     let loaded = trip_binding_tag(store_id, trip_id);
+    let fast = crate::program::ProgramFast::build(&program, &catalog);
     let lot = Lot {
         program,
+        fast,
         catalog: Arc::new(catalog),
         surfaces,
         world,
@@ -4365,8 +4369,10 @@ fn reconcile_frozen_home_lot(
         Answers::choices(answers)
     };
 
+    let fast = crate::program::ProgramFast::build(&program, &catalog);
     let lot = Lot {
         program,
+        fast,
         catalog: Arc::new(catalog),
         surfaces,
         world,

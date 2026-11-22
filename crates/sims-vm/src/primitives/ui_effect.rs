@@ -371,7 +371,10 @@ impl Machine<'_, '_> {
     fn read_ui_effect_var(&mut self, scope: u8, index: i16) -> Result<i16, Trap> {
         if scope == GLOBAL_SCOPE
             && index == GLOBAL_34
-            && !self.world.scratch_ptr_set.contains(&self.me)
+            && !self
+                .world
+                .scratch_ptrs
+                .has(self.me, sims_sim::SCRATCH_PTR_SET)
         {
             return Err(Trap::Unsupported(
                 "UI Effect reading global 34 (0x45412b -> 0x4541d5 writes through null or \

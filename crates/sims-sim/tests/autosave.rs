@@ -826,3 +826,245 @@ fn validated_commits_pruning_and_fallback_reject_malformed_payloads() {
     assert_eq!(direct.loaded.metadata.slot, SaveSlot::Manual);
     assert!(direct.skipped_corrupt.is_empty());
 }
+
+#[test]
+fn autosave_v2_compression_v1_compat_and_fast_metadata_listing() {
+    use redb::ReadableDatabase;
+    use sha2::{Digest, Sha256};
+
+    let db = TempDb::new("autosave_v1_v2_meta");
+    let store = AutosaveStore::open(&db.0).unwrap();
+
+    // Repetitive 64 KiB payload representing a realistic serialized Saved lot.
+    let mut payload = Vec::with_capacity(64 * 1024);
+    for i in 0..(64 * 1024 / 16) {
+        payload.extend_from_slice(&(i as u32).to_le_bytes());
+        payload.extend_from_slice(&[0u8; 12]);
+    }
+    let expected_sha: [u8; 32] = Sha256::digest(&payload).into();
+
+    let v2_meta = store
+        .save_manual(
+            "UserData",
+            5,
+            9001,
+            Some(1_700_000_000),
+            "Goth V2",
+            SavePayload::saved_lot(payload.clone()),
+        )
+        .unwrap();
+    assert_eq!(v2_meta.format_version, AUTOSAVE_FORMAT);
+    assert_eq!(v2_meta.payload_len, payload.len());
+    assert_eq!(v2_meta.payload_sha256, expected_sha);
+
+    let loaded_v2 = store.load_manual("UserData", 5).unwrap();
+    assert_eq!(loaded_v2.payload, payload);
+    assert_eq!(loaded_v2.metadata, v2_meta);
+    drop(store);
+
+    // Inject a genuine V1 uncompressed autosave record at Autosave(1) and verify
+    // V2 size is dramatically smaller while V1 still decodes bit-identically.
+    const MANUAL_TABLE: redb::TableDefinition<(&str, u32), &[u8]> =
+        redb::TableDefinition::new("autosave_manual");
+    const RING_TABLE: redb::TableDefinition<(&str, u32, u64), &[u8]> =
+        redb::TableDefinition::new("autosave_ring");
+
+    #[derive(serde::Serialize)]
+    struct LegacyAutosaveV1 {
+        slot: SaveSlot,
+        neighborhood_id: String,
+        lot_id: u32,
+        sim_tick: u64,
+        saved_at_unix_secs: Option<u64>,
+        label: String,
+        payload_kind: SavePayloadKind,
+        payload_sha256: [u8; 32],
+        payload: Vec<u8>,
+    }
+    let v1_body = postcard::to_allocvec(&LegacyAutosaveV1 {
+        slot: SaveSlot::Autosave(1),
+        neighborhood_id: "UserData".into(),
+        lot_id: 5,
+        sim_tick: 8000,
+        saved_at_unix_secs: Some(1_699_999_000),
+        label: "Goth V1".into(),
+        payload_kind: SavePayloadKind::SavedLot,
+        payload_sha256: expected_sha,
+        payload: payload.clone(),
+    })
+    .unwrap();
+    let mut h = Sha256::new();
+    h.update(b"sims-sim:autosave-record:v1");
+    h.update(1u32.to_le_bytes());
+    h.update(&v1_body);
+    let mut v1_framed = Vec::new();
+    v1_framed.extend_from_slice(b"SAVG");
+    v1_framed.extend_from_slice(&1u32.to_le_bytes());
+    v1_framed.extend_from_slice(&h.finalize());
+    v1_framed.extend_from_slice(&v1_body);
+
+    let raw_db = redb::Database::open(&db.0).unwrap();
+    let v2_len = {
+        let r = raw_db.begin_read().unwrap();
+        let t = r.open_table(MANUAL_TABLE).unwrap();
+        t.get(("UserData", 5)).unwrap().unwrap().value().len()
+    };
+    assert!(
+        v2_len * 4 < v1_framed.len(),
+        "expected V2 ({v2_len} B) to be >4x smaller than V1 ({} B)",
+        v1_framed.len()
+    );
+    {
+        let w = raw_db.begin_write().unwrap();
+        {
+            let mut rt = w.open_table(RING_TABLE).unwrap();
+            rt.insert(("UserData", 5, 1), v1_framed.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    drop(raw_db);
+
+    let store = AutosaveStore::open(&db.0).unwrap();
+    // Fast metadata-only listing sees both V2 manual and V1 autosave cleanly.
+    let meta_list = store.list_saves_metadata("UserData", 5).unwrap();
+    assert_eq!(meta_list.len(), 2);
+    assert_eq!(meta_list[0].metadata(), Some(&v2_meta));
+    let v1_meta = meta_list[1].metadata().expect("V1 metadata intact");
+    assert_eq!(v1_meta.format_version, 1);
+    assert_eq!(v1_meta.label, "Goth V1");
+    assert_eq!(v1_meta.payload_len, payload.len());
+    assert_eq!(v1_meta.payload_sha256, expected_sha);
+
+    // Full V1 load restores exact payload bytes.
+    let loaded_v1 = store
+        .load_save("UserData", 5, SaveSlot::Autosave(1))
+        .unwrap();
+    assert_eq!(loaded_v1.payload, payload);
+    assert_eq!(loaded_v1.metadata.format_version, 1);
+}
+
+#[test]
+fn autosave_v2_rejects_oversized_writes_trailing_deflate_bytes_and_bad_payload_sha() {
+    use redb::ReadableDatabase;
+    use sha2::{Digest, Sha256};
+
+    let db = TempDb::new("autosave_v2_hardening");
+    let store = AutosaveStore::open_with_policy(&db.0, AutosavePolicy::new(1).unwrap()).unwrap();
+
+    // Seed one intact autosave with retention = 1.
+    let kept = store
+        .save_autosave(
+            "UserData",
+            5,
+            100,
+            None,
+            "Intact Slot",
+            SavePayload::saved_lot(b"keep-me".to_vec()),
+        )
+        .unwrap();
+
+    // Oversized payload (> 128 MiB) must be refused BEFORE committing or
+    // pruning the existing intact autosave.
+    let oversized = vec![0u8; 128 * 1024 * 1024 + 1];
+    assert!(matches!(
+        store.save_autosave(
+            "UserData",
+            5,
+            101,
+            None,
+            "Too Big",
+            SavePayload::saved_lot(oversized),
+        ),
+        Err(SaveError::InvalidInput(_))
+    ));
+    let loaded = store.load_save("UserData", 5, kept.slot).unwrap();
+    assert_eq!(loaded.payload, b"keep-me");
+    drop(store);
+
+    const MANUAL_TABLE: redb::TableDefinition<(&str, u32), &[u8]> =
+        redb::TableDefinition::new("autosave_manual");
+
+    let sign_v2 = |body: &[u8]| -> Vec<u8> {
+        let mut h = Sha256::new();
+        h.update(b"sims-sim:autosave-record:v1");
+        h.update(2u32.to_le_bytes());
+        h.update(body);
+        let mut framed = Vec::with_capacity(40 + body.len());
+        framed.extend_from_slice(b"SAVG");
+        framed.extend_from_slice(&2u32.to_le_bytes());
+        framed.extend_from_slice(&h.finalize());
+        framed.extend_from_slice(body);
+        framed
+    };
+
+    // Write a valid V2 manual save first, then tamper its raw record with
+    // (a) trailing bytes after the deflate stream (re-signed outer checksum) and
+    // (b) a mismatched payload_sha256 in the V2 header (re-signed outer checksum).
+    let store = AutosaveStore::open(&db.0).unwrap();
+    store
+        .save_manual(
+            "UserData",
+            5,
+            200,
+            None,
+            "Valid V2",
+            SavePayload::saved_lot(b"hello-v2-payload".to_vec()),
+        )
+        .unwrap();
+    drop(store);
+
+    let raw_db = redb::Database::open(&db.0).unwrap();
+    let valid_raw = {
+        let r = raw_db.begin_read().unwrap();
+        let t = r.open_table(MANUAL_TABLE).unwrap();
+        t.get(("UserData", 5)).unwrap().unwrap().value().to_vec()
+    };
+
+    // (a) Append trailing junk bytes after valid compressed stream + re-sign.
+    let mut trailing_body = valid_raw[40..].to_vec();
+    trailing_body.extend_from_slice(b"JUNK");
+    let trailing_framed = sign_v2(&trailing_body);
+    {
+        let w = raw_db.begin_write().unwrap();
+        {
+            let mut t = w.open_table(MANUAL_TABLE).unwrap();
+            t.insert(("UserData", 5), trailing_framed.as_slice())
+                .unwrap();
+        }
+        w.commit().unwrap();
+    }
+    drop(raw_db);
+
+    let store = AutosaveStore::open(&db.0).unwrap();
+    assert!(matches!(
+        store.load_manual("UserData", 5),
+        Err(SaveError::DecodeFailed { .. })
+    ));
+    drop(store);
+
+    // (b) Corrupt payload_sha256 in V2 header + re-sign outer checksum.
+    let mut bad_sha_body = valid_raw[40..].to_vec();
+    let expected_sha: [u8; 32] = Sha256::digest(b"hello-v2-payload").into();
+    let pos = bad_sha_body
+        .windows(32)
+        .position(|w| w == expected_sha)
+        .expect("payload_sha256 in V2 header");
+    bad_sha_body[pos] ^= 0xff;
+    let bad_sha_framed = sign_v2(&bad_sha_body);
+    {
+        let raw_db = redb::Database::open(&db.0).unwrap();
+        let w = raw_db.begin_write().unwrap();
+        {
+            let mut t = w.open_table(MANUAL_TABLE).unwrap();
+            t.insert(("UserData", 5), bad_sha_framed.as_slice())
+                .unwrap();
+        }
+        w.commit().unwrap();
+    }
+
+    let store = AutosaveStore::open(&db.0).unwrap();
+    assert!(matches!(
+        store.load_manual("UserData", 5),
+        Err(SaveError::CorruptChecksum { .. })
+    ));
+}

@@ -31,11 +31,11 @@ impl Machine<'_, '_> {
         // `[ebp - 0x18]` slot lands inside `Expression`'s 0x58-byte local
         // frame), reading global 34 dereferences null at `0x4541db`.
         let rhs_is_global_34 = right_scope == 6 && right_index == 34;
-        let prev_was_expression = self.world.scratch_ptr_expression.contains(&self.me);
-        let prev_was_arg_slot = self.world.scratch_ptr_arg_slot.contains(&self.me);
+        let prev_scratch = self.world.scratch_ptrs.get(self.me);
+        let prev_was_expression = prev_scratch & sims_sim::SCRATCH_PTR_EXPRESSION != 0;
+        let prev_was_arg_slot = prev_scratch & sims_sim::SCRATCH_PTR_ARG_SLOT != 0;
         if rhs_is_global_34
-            && !self.world.scratch_ptr_set.contains(&self.me)
-            && !self.world.scratch_ptr_set_to_next.contains(&self.me)
+            && prev_scratch & (sims_sim::SCRATCH_PTR_SET | sims_sim::SCRATCH_PTR_SET_TO_NEXT) == 0
         {
             return Err(Trap::Unsupported(
                 "Expression reading global 34 before [object + 0x128] is initialized \
@@ -48,10 +48,10 @@ impl Machine<'_, '_> {
         // dispatcher pushes 1 argument for Expression (`0x45237d`) and 2 for
         // UI Effect (`0x45226e`), this targets UI Effect's saved `ebp` slot,
         // which the dispatcher restores at `0x452273` without faulting.
-        self.world.scratch_ptr_set_to_next.remove(&self.me);
-        self.world.scratch_ptr_arg_slot.remove(&self.me);
-        self.world.scratch_ptr_set.insert(self.me);
-        self.world.scratch_ptr_expression.insert(self.me);
+        self.world.scratch_ptrs.set(
+            self.me,
+            sims_sim::SCRATCH_PTR_SET | sims_sim::SCRATCH_PTR_EXPRESSION,
+        );
         let write = matches!(operator, 3..=7 | 9..=13 | 17..=20);
         // After Random Number (`0x451e8d`) or Get Direction To (`0x45202b`),
         // `[edi + 0x128]` aliases this Expression's `[ebp + 0x08]` write-flag

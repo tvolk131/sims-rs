@@ -193,6 +193,7 @@ impl Machine<'_, '_> {
                 if let Some(top) = object.stack.last_mut() {
                     top.stack_object = target as i16;
                 }
+                crate::interpreter::mark_frame_dirty(self.world, me, frame);
                 self.flags_mut()?[FLAGS] |= INTERRUPTED;
                 Flow::Pushed
             } else {

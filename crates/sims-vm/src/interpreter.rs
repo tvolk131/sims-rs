@@ -9,7 +9,7 @@
 
 use crate::fault::{Fault, Location, Trap};
 use crate::primitives::ui_effect::UiEffectEvent;
-use crate::program::{DEFINITION_WORDS, Program, Tree};
+use crate::program::{DEFINITION_WORDS, Library, Program, ProgramFast, Tree};
 use crate::sounds::SoundEvent;
 use sims_content::Catalog;
 use sims_formats::behavior::{Behavior, Instruction};
@@ -205,6 +205,12 @@ pub struct Interpreter<'a> {
     /// where `inline_special_panel` is cleared so side-effectful inline books
     /// refuse loudly instead of silently skipping `Player::special_panel`.
     pub(crate) in_both_ways: bool,
+    /// Direct reference to `Global.iff` cached from `program.libraries` to
+    /// eliminate repeated `BTreeMap` lookups on global BHAV/BCON fetches.
+    pub(crate) global_lib: Option<&'a Library>,
+    /// Optional precomputed dense semi-global and duplicate-GUID index owned
+    /// by [`crate::boot::Lot`].
+    pub(crate) fast: Option<&'a ProgramFast>,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -247,6 +253,8 @@ impl<'a> Interpreter<'a> {
             special_panels: None,
             inline_special_panel: None,
             in_both_ways: false,
+            global_lib: program.libraries.get(&program.global),
+            fast: None,
         }
     }
 
@@ -414,8 +422,36 @@ impl<'a> Interpreter<'a> {
             special_panels: self.special_panels,
             inline_special_panel: self.inline_special_panel,
             in_both_ways: self.in_both_ways,
+            global_lib: self.global_lib,
+            fast: self.fast,
+            active_frame: None,
+            cached_owner: None,
+            order_validated: false,
+            order_unique: false,
+            last_order_cursor: None,
         }
     }
+}
+
+/// Cached decode state for the top stack frame within a [`Machine`].
+#[derive(Clone, Copy)]
+struct ActiveFrame<'a> {
+    depth: usize,
+    code_owner_type: i16,
+    tree_id: u16,
+    owner_res: usize,
+    behavior: &'a Behavior,
+}
+
+/// Cached resolved owner library and semi-global library for a
+/// `code_owner_type`, eliminating per-instruction `world.types` and
+/// `Program::libraries` `BTreeMap` traversals.
+#[derive(Clone, Copy)]
+struct CachedOwner<'a> {
+    code_owner_type: i16,
+    owner_res: usize,
+    owner_lib: Option<&'a Library>,
+    semi_lib: Option<(usize, &'a Library)>,
 }
 
 /// Where an object's thread is, for telling whether a primitive
@@ -548,6 +584,21 @@ pub(crate) struct Machine<'a, 'w> {
         Option<&'a (dyn crate::primitives::dialog::InlinePanelSink + 'a)>,
     /// See [`Interpreter::in_both_ways`].
     pub(crate) in_both_ways: bool,
+    /// See [`Interpreter::global_lib`].
+    pub(crate) global_lib: Option<&'a Library>,
+    /// See [`Interpreter::fast`].
+    pub(crate) fast: Option<&'a ProgramFast>,
+    active_frame: Option<ActiveFrame<'a>>,
+    cached_owner: Option<CachedOwner<'a>>,
+    /// True once `Set To Next` has validated `world.order` within this turn
+    /// and no subsequent primitive could have mutated object registration.
+    pub(crate) order_validated: bool,
+    /// True when the validated `world.order` contains no duplicate IDs,
+    /// allowing `O(1)` cursor continuation via `last_order_cursor`.
+    pub(crate) order_unique: bool,
+    /// Last `(object_id, index_in_order)` returned by `Set To Next` in this
+    /// turn so sequential scans advance in `O(1)` per step.
+    pub(crate) last_order_cursor: Option<(u16, usize)>,
 }
 
 impl<'a> Machine<'a, '_> {
@@ -582,7 +633,144 @@ impl<'a> Machine<'a, '_> {
             special_panels: self.special_panels,
             inline_special_panel: self.inline_special_panel,
             in_both_ways: self.in_both_ways,
+            global_lib: self.global_lib,
+            fast: self.fast,
         }
+    }
+
+    /// Returns whether `guid` appears more than once in `catalog.objects`
+    /// (`O(1)` via [`ProgramFast::duplicate_guids`] when attached).
+    #[inline]
+    pub(crate) fn is_duplicate_guid(&self, guid: u32) -> bool {
+        if let Some(fast) = self.fast {
+            !fast.duplicate_guids.is_empty() && fast.duplicate_guids.contains(&guid)
+        } else {
+            self.catalog
+                .objects
+                .iter()
+                .filter(|o| o.guid == guid)
+                .count()
+                > 1
+        }
+    }
+
+    #[inline]
+    fn resolve_owner(&mut self, code_owner_type: i16) -> Result<CachedOwner<'a>, Trap> {
+        if let Some(cached) = self.cached_owner
+            && cached.code_owner_type == code_owner_type
+        {
+            return Ok(cached);
+        }
+        let id = u16::try_from(code_owner_type)
+            .map_err(|_| Trap::Invalid(format!("negative code owner type {code_owner_type}")))?;
+        let guid = *self.world.types.get(&id).ok_or_else(|| {
+            Trap::Invalid(format!(
+                "code owner type {id} is not in the lot's type table"
+            ))
+        })?;
+        let owner_res = self.definition(guid)?.resource;
+        let owner_lib = self.program.libraries.get(&owner_res);
+        let semi_res = match self.fast {
+            Some(fast) => fast.semi_global(owner_res),
+            None => self.program.semi_globals.get(&owner_res).copied().flatten(),
+        };
+        let semi_lib = semi_res.and_then(|res| self.program.libraries.get(&res).map(|l| (res, l)));
+        let cached = CachedOwner {
+            code_owner_type,
+            owner_res,
+            owner_lib,
+            semi_lib,
+        };
+        self.cached_owner = Some(cached);
+        Ok(cached)
+    }
+
+    #[inline]
+    fn behavior_from_owner(&self, owner: CachedOwner<'a>, id: u16) -> Result<&'a Behavior, Trap> {
+        let lib = match id {
+            0..=255 => {
+                return Err(Trap::Invalid(format!(
+                    "tree ID {id} names a primitive, not a BHAV"
+                )));
+            }
+            256..=4095 => self.global_lib,
+            4096..=8191 => owner.owner_lib,
+            _ => owner.semi_lib.map(|(_, l)| l),
+        };
+        lib.and_then(|l| l.behaviors.get(&id))
+            .ok_or(Trap::MissingTree { id })
+    }
+
+    /// Reads a BCON constant for `frame` using cached library references when
+    /// available (scope 26).
+    #[inline]
+    pub(crate) fn frame_constant(&self, frame: &Frame, address: u16) -> Result<Option<i16>, Trap> {
+        if let Some(owner) = self.cached_owner
+            && owner.code_owner_type == frame.code_owner_type
+        {
+            let table = address >> 7;
+            let entry = usize::from(address & 127);
+            let (lib, id) = match table {
+                0..=63 => (owner.owner_lib, table + 4096),
+                64..=127 => (owner.semi_lib.map(|(_, l)| l), table - 64 + 8192),
+                128..=191 => (self.global_lib, table - 128 + 256),
+                _ => return Ok(None),
+            };
+            return Ok(lib.and_then(|l| l.constants.get(&id)?.get(entry).copied()));
+        }
+        let owner = self.owner(frame)?;
+        Ok(self.program.constant(owner, address))
+    }
+
+    #[inline]
+    fn resolve_active_frame(&mut self) -> Result<(usize, &'a Behavior, u16), Trap> {
+        let me = self.me()?;
+        let depth = me.stack.len();
+        let frame = me
+            .stack
+            .last()
+            .ok_or_else(|| Trap::Invalid("empty stack".into()))?;
+        let code_owner_type = frame.code_owner_type;
+        let tree_id = frame.tree_id();
+        let node = frame.node;
+        if let Some(cached) = self.active_frame
+            && cached.depth == depth
+            && cached.code_owner_type == code_owner_type
+            && cached.tree_id == tree_id
+        {
+            return Ok((cached.owner_res, cached.behavior, node));
+        }
+        let owner = self.resolve_owner(code_owner_type)?;
+        let behavior = self.behavior_from_owner(owner, tree_id)?;
+        self.active_frame = Some(ActiveFrame {
+            depth,
+            code_owner_type,
+            tree_id,
+            owner_res: owner.owner_res,
+            behavior,
+        });
+        Ok((owner.owner_res, behavior, node))
+    }
+
+    /// Resolves the top frame's current instruction using the active frame
+    /// decode cache.
+    #[inline]
+    fn current_cached(&mut self) -> Result<(usize, &'a Behavior, &'a Instruction), Trap> {
+        let (owner_res, behavior, node) = self.resolve_active_frame()?;
+        if node > u16::from(LAST_NODE) {
+            return Err(Trap::native(0x44c, "invalid instruction index"));
+        }
+        let instruction = behavior
+            .instructions
+            .get(usize::from(node))
+            .ok_or_else(|| {
+                Trap::Invalid(format!(
+                    "node {} is outside the tree's {} instructions",
+                    node,
+                    behavior.instructions.len()
+                ))
+            })?;
+        Ok((owner_res, behavior, instruction))
     }
 
     /// Resolves the camera rotation (`0..=3`) for the currently executing
@@ -718,27 +906,6 @@ impl<'a> Machine<'a, '_> {
         }
     }
 
-    /// The top frame's current instruction (0x474bcd). A caller's
-    /// instruction is also looked up on return (0x474dc2) before the
-    /// caller's tree flag is cleared by dispatch.
-    fn current(&self) -> Result<&'a Instruction, Trap> {
-        let frame = self.frame()?;
-        let behavior = self.behavior(self.owner(frame)?, frame.tree_id())?;
-        if frame.node > u16::from(LAST_NODE) {
-            return Err(Trap::native(0x44c, "invalid instruction index"));
-        }
-        behavior
-            .instructions
-            .get(usize::from(frame.node))
-            .ok_or_else(|| {
-                Trap::Invalid(format!(
-                    "node {} is outside the tree's {} instructions",
-                    frame.node,
-                    behavior.instructions.len()
-                ))
-            })
-    }
-
     /// Pushes an entry frame for `tree`, running the object's own code.
     /// Mirrors the old prototype's `spawn` (legacy lib.rs:498). A tree that
     /// takes more than `most` arguments is refused: the original would copy
@@ -770,15 +937,9 @@ impl<'a> Machine<'a, '_> {
             .get(&owner)
             .ok_or(Trap::native(0x15, "missing object"))?
             .guid;
-        let owner_type = self
-            .world
-            .types
-            .iter()
-            .find(|&(_, &g)| g == guid)
-            .map(|(&id, _)| id)
-            .ok_or_else(|| {
-                Trap::Invalid(format!("GUID 0x{guid:08X} is not in the lot's type table"))
-            })?;
+        let owner_type = self.world.type_id_for_guid(guid).ok_or_else(|| {
+            Trap::Invalid(format!("GUID 0x{guid:08X} is not in the lot's type table"))
+        })?;
         let code_owner_type = i16::try_from(owner_type)
             .map_err(|_| Trap::Invalid(format!("type ID {owner_type} does not fit a frame")))?;
         let owner = self.definition(guid)?.resource;
@@ -859,15 +1020,9 @@ impl<'a> Machine<'a, '_> {
             .get(&target)
             .ok_or(Trap::native(0x15, "missing object"))?
             .guid;
-        let owner_type = self
-            .world
-            .types
-            .iter()
-            .find(|&(_, &g)| g == guid)
-            .map(|(&id, _)| id)
-            .ok_or_else(|| {
-                Trap::Invalid(format!("GUID 0x{guid:08X} is not in the lot's type table"))
-            })?;
+        let owner_type = self.world.type_id_for_guid(guid).ok_or_else(|| {
+            Trap::Invalid(format!("GUID 0x{guid:08X} is not in the lot's type table"))
+        })?;
         let owner = self.definition(guid)?.resource;
         let behavior = self.behavior(owner, tree)?;
         let (argc, locals) = dimensions(behavior)?;
@@ -925,33 +1080,66 @@ impl<'a> Machine<'a, '_> {
                 storage.offsets.len()
             )));
         }
-        for (depth, (frame, &offset)) in object.stack.iter().zip(&storage.offsets).enumerate() {
-            let start = offset as usize;
-            let (args, locals) = (frame.parameters.len(), frame.locals.len());
-            let end = start + frame_words(args, locals);
-            if storage.words.len() < end {
-                storage.words.resize(end, Some(0));
+        for (depth, frame) in object.stack.iter().enumerate() {
+            let offset = storage.offsets[depth];
+            write_frame_to_storage(storage, depth, frame, offset);
+        }
+        Ok(())
+    }
+
+    /// Incrementally syncs only the top frame (plus any lower frames marked
+    /// dirty by cross-frame mutations) into `frame_storage` when
+    /// `frame_storage` already exists and matches stack depth; falls back to
+    /// full [`Self::sync_frames`] on first sync.
+    fn sync_top_frame(&mut self) -> Result<(), Trap> {
+        let me = self.me;
+        let Some(object) = self.world.objects.get(&me) else {
+            return Err(Trap::native(10, "missing object"));
+        };
+        let stack_len = object.stack.len();
+        let Some(existing) = self.world.frame_storage.get(&me) else {
+            if self.world.dirty_frames.contains_key(&me) {
+                self.world.dirty_frames.as_mut().remove(&me);
             }
-            let state = frame.primitive_state;
-            let header = [
-                Some(frame.tree as i16),
-                Some(frame.node as i16),
-                Some(frame.stack_object),
-                Some((locals | (args << 8)) as i16),
-                Some(state as i16),
-                Some((state >> 16) as i16),
-                None,
-                None,
-            ];
-            storage.words[start..start + 8].copy_from_slice(&header);
-            for (i, &value) in frame.parameters.iter().enumerate() {
-                storage.words[start + 8 + i] = Some(value);
-            }
-            for (i, &value) in frame.locals.iter().enumerate() {
-                let unknown = storage.unknown.contains(&(depth as u32, i as u32));
-                storage.words[start + 8 + args + i] = (!unknown).then_some(value);
+            return self.sync_frames();
+        };
+        if existing.offsets.len() != stack_len {
+            return Err(Trap::Invalid(format!(
+                "object {me} has {} frames and storage for {}",
+                stack_len,
+                existing.offsets.len()
+            )));
+        }
+        let dirty_mask = if self.world.dirty_frames.contains_key(&me) {
+            self.world.dirty_frames.as_mut().remove(&me).unwrap_or(0)
+        } else {
+            0
+        };
+        if stack_len == 0 {
+            return Ok(());
+        }
+        if dirty_mask == u64::MAX {
+            return self.sync_frames();
+        }
+        let top = stack_len - 1;
+        let storage = self
+            .world
+            .frame_storage
+            .get_mut(&me)
+            .expect("checked present");
+        if dirty_mask != 0 {
+            let mut mask = dirty_mask;
+            while mask != 0 {
+                let depth = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if depth < top {
+                    let offset = storage.offsets[depth];
+                    write_frame_to_storage(storage, depth, &object.stack[depth], offset);
+                }
             }
         }
+        let offset = storage.offsets[top];
+        write_frame_to_storage(storage, top, &object.stack[top], offset);
         Ok(())
     }
 
@@ -975,7 +1163,7 @@ impl<'a> Machine<'a, '_> {
     /// zeros, 1 and three zeros. Returns where the tree's frame starts.
     /// The mark is written even when the tree turns out to be missing.
     pub(crate) fn write_mark(&mut self) -> Result<usize, Trap> {
-        self.sync_frames()?;
+        self.sync_top_frame()?;
         let start = self.frames_end();
         let storage = self
             .world
@@ -999,11 +1187,12 @@ impl<'a> Machine<'a, '_> {
     /// first of a tree run synchronously, which goes above a mark.
     /// A new frame's header copy clears the tree flag (0x4751bd).
     fn push_frame(&mut self, mut frame: Frame, callback: bool) -> Result<(), Trap> {
+        self.active_frame = None;
         frame.tree = frame.tree_id();
         let start = if callback {
             self.write_mark()?
         } else {
-            self.sync_frames()?;
+            self.sync_top_frame()?;
             self.frames_end()
         };
         let me = self.me;
@@ -1035,13 +1224,16 @@ impl<'a> Machine<'a, '_> {
     /// storage. Then, for a person, the objects it uses are looked at (the
     /// object's virtual function 8; [`Machine::release_use`]).
     pub(crate) fn pop_frame(&mut self) -> Result<(), Trap> {
-        self.sync_frames()?;
+        self.active_frame = None;
+        self.sync_top_frame()?;
         let me = self.me;
         self.me_mut()?.stack.pop();
         if let Some(storage) = self.world.frame_storage.get_mut(&me) {
             storage.offsets.pop();
             let depth = storage.offsets.len() as u32;
-            storage.unknown.retain(|&(frame, _)| frame != depth);
+            if !storage.unknown.is_empty() {
+                storage.unknown.retain(|&(frame, _)| frame != depth);
+            }
         }
         let last_result = self.me()?.last_result;
         self.release_use(last_result)
@@ -1051,6 +1243,7 @@ impl<'a> Machine<'a, '_> {
     /// person using an object fails: how the original ends those uses
     /// here is not known.
     pub(crate) fn clear_frames(&mut self) -> Result<(), Trap> {
+        self.active_frame = None;
         if self
             .me()?
             .person
@@ -1063,6 +1256,9 @@ impl<'a> Machine<'a, '_> {
         }
         self.sync_frames()?;
         let me = self.me;
+        if self.world.dirty_frames.contains_key(&me) {
+            self.world.dirty_frames.as_mut().remove(&me);
+        }
         self.me_mut()?.stack.clear();
         let storage = self.world.frame_storage.entry(me).or_default();
         storage.offsets.clear();
@@ -1157,9 +1353,11 @@ impl<'a> Machine<'a, '_> {
     /// calls 0x474b13, which clears the flag in place and redispatches
     /// the same frame before counting or executing an instruction.
     pub fn step(&mut self) -> Result<Status, Trap> {
-        let frame = self.frame_mut()?;
-        frame.tree = frame.tree_id();
-        let instruction = self.current()?;
+        if self.frame()?.tree & Frame::TREE_FLAG != 0 {
+            let frame = self.frame_mut()?;
+            frame.tree = frame.tree_id();
+        }
+        let (_owner_res, behavior, instruction) = self.current_cached()?;
         if instruction.opcode & Frame::TREE_FLAG != 0 {
             // The separate instruction-flag hook writes to the shared
             // BHAV resource (0x474bf4 -> 0x474b33).
@@ -1169,7 +1367,7 @@ impl<'a> Machine<'a, '_> {
             )));
         }
         if instruction.opcode >= 256 {
-            self.call(instruction)?;
+            self.call(behavior, instruction)?;
             return Ok(Status::Running);
         }
         // With a person's animator refresh pending, a primitive that may
@@ -1182,16 +1380,16 @@ impl<'a> Machine<'a, '_> {
         {
             return self.step_both_ways(refreshing, instruction.opcode);
         }
+        let state = self.frame()?.primitive_state;
         // Go To Routing Slot applies these checks itself on its first run,
         // once it has named its slot and found its stack object on the lot
         // (`Machine::go_to_slot`), where it would go on to read an animator.
-        let checks_itself = instruction.opcode == 45 && self.frame()?.primitive_state == 0;
+        let checks_itself = instruction.opcode == 45 && state == 0;
         if !crate::placement::reads_no_animator(instruction.opcode, &instruction.operands)
             && !checks_itself
         {
             self.refuse_unsettled_animator(instruction.opcode)?;
         }
-        let state = self.frame()?.primitive_state;
         if state == RAN_TREE && instruction.opcode == 28 {
             // Run Tree By Name ran its tree: it takes the branch of the
             // tree's result.
@@ -1229,6 +1427,11 @@ impl<'a> Machine<'a, '_> {
                 return Err(trap);
             }
         };
+        if !matches!(instruction.opcode, 2 | 8 | 21 | 22 | 24 | 26 | 31 | 38 | 39) {
+            self.order_validated = false;
+            self.order_unique = false;
+            self.last_order_cursor = None;
+        }
         if self
             .inline_special_panel
             .is_some_and(|inline| inline.has_unanswered())
@@ -1255,13 +1458,37 @@ impl<'a> Machine<'a, '_> {
                 self.me
             )));
         }
-        self.frame_mut()?.primitive_state = 0;
-        self.me_mut()?.last_result = result;
-        self.branch(if result {
+        let target = if result {
             instruction.on_true
         } else {
             instruction.on_false
-        })
+        };
+        // Fast path for the common case: branching to another instruction node
+        // in the same BHAV with a single `me_mut()` CoW lookup.
+        if target <= LAST_NODE {
+            let count = behavior.instructions.len();
+            let me = self.me_mut()?;
+            me.last_result = result;
+            let frame = me
+                .stack
+                .last_mut()
+                .ok_or_else(|| Trap::Invalid("empty stack".into()))?;
+            frame.primitive_state = 0;
+            if usize::from(target) >= count {
+                return Err(Trap::InvalidBranch { target, count });
+            }
+            frame.node = u16::from(target);
+            return Ok(Status::Running);
+        }
+        {
+            let me = self.me_mut()?;
+            me.last_result = result;
+            me.stack
+                .last_mut()
+                .ok_or_else(|| Trap::Invalid("empty stack".into()))?
+                .primitive_state = 0;
+        }
+        self.branch(target)
     }
 
     /// Where the running object's thread is ([`ThreadPlace`]). None for
@@ -1280,19 +1507,32 @@ impl<'a> Machine<'a, '_> {
     }
 
     /// Calls the tree an instruction names (legacy lib.rs:1578).
-    fn call(&mut self, instruction: &Instruction) -> Result<(), Trap> {
-        let me = self.me()?;
-        if me.stack.len() >= MAX_STACK {
+    fn call(&mut self, caller_tree: &'a Behavior, instruction: &Instruction) -> Result<(), Trap> {
+        let (stack_len, parent_node, parent_stack_object, parent_code_owner_type, first_temp) = {
+            let me = self.me()?;
+            let parent = me
+                .stack
+                .last()
+                .ok_or_else(|| Trap::Invalid("empty stack".into()))?;
+            (
+                me.stack.len(),
+                parent.node,
+                parent.stack_object,
+                parent.code_owner_type,
+                me.temps.first().copied(),
+            )
+        };
+        if stack_len >= MAX_STACK {
             return Err(Trap::StackOverflow);
         }
-        let parent = self.frame()?;
-        let owner = self.owner(parent)?;
-        let callee = self.behavior(owner, instruction.opcode)?;
+        let owner = self.resolve_owner(parent_code_owner_type)?;
+        let callee = self.behavior_from_owner(owner, instruction.opcode)?;
         let (argc, locals) = dimensions(callee)?;
         let from_temps = instruction.operands == [255; 8];
         let args: Vec<i16> = if from_temps {
             // All-0xFF operands pass the caller's temps as arguments.
-            me.temps
+            self.me()?
+                .temps
                 .get(..argc)
                 .ok_or_else(|| {
                     Trap::Unsupported("native argument read beyond eight temporaries".into())
@@ -1302,33 +1542,72 @@ impl<'a> Machine<'a, '_> {
             // Native copies a contiguous argc-word span beginning at the
             // instruction's operands, running on into the instructions that
             // follow it in memory (12 bytes each: opcode, branches, operands).
-            let tree = self.behavior(owner, parent.tree_id())?;
-            let mut bytes = instruction.operands.to_vec();
-            for next in tree.instructions.iter().skip(usize::from(parent.node) + 1) {
-                if bytes.len() >= argc * 2 {
-                    break;
+            let need = argc * 2;
+            if need <= 8 {
+                let mut args = Vec::with_capacity(argc);
+                for &pair in instruction.operands[..need].as_chunks::<2>().0 {
+                    args.push(i16::from_le_bytes(pair));
                 }
-                bytes.extend_from_slice(&next.opcode.to_le_bytes());
-                bytes.extend_from_slice(&[next.on_true, next.on_false]);
-                bytes.extend_from_slice(&next.operands);
-            }
-            bytes
-                .get(..argc * 2)
-                .ok_or_else(|| {
-                    Trap::Unsupported(
+                args
+            } else if need <= 16 {
+                let mut buf = [0u8; 20];
+                buf[..8].copy_from_slice(&instruction.operands);
+                let mut len = 8usize;
+                for next in caller_tree
+                    .instructions
+                    .iter()
+                    .skip(usize::from(parent_node) + 1)
+                {
+                    if len >= need {
+                        break;
+                    }
+                    buf[len..len + 2].copy_from_slice(&next.opcode.to_le_bytes());
+                    buf[len + 2] = next.on_true;
+                    buf[len + 3] = next.on_false;
+                    buf[len + 4..len + 12].copy_from_slice(&next.operands);
+                    len += 12;
+                }
+                if len < need {
+                    return Err(Trap::Unsupported(
                         "native call argument read past the end of the BHAV resource".into(),
-                    )
-                })?
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&b| i16::from_le_bytes(b))
-                .collect()
+                    ));
+                }
+                let mut args = Vec::with_capacity(argc);
+                for &pair in buf[..need].as_chunks::<2>().0 {
+                    args.push(i16::from_le_bytes(pair));
+                }
+                args
+            } else {
+                let mut bytes = Vec::with_capacity(need + 12);
+                bytes.extend_from_slice(&instruction.operands);
+                for next in caller_tree
+                    .instructions
+                    .iter()
+                    .skip(usize::from(parent_node) + 1)
+                {
+                    if bytes.len() >= need {
+                        break;
+                    }
+                    bytes.extend_from_slice(&next.opcode.to_le_bytes());
+                    bytes.extend_from_slice(&[next.on_true, next.on_false]);
+                    bytes.extend_from_slice(&next.operands);
+                }
+                bytes
+                    .get(..need)
+                    .ok_or_else(|| {
+                        Trap::Unsupported(
+                            "native call argument read past the end of the BHAV resource".into(),
+                        )
+                    })?
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&b| i16::from_le_bytes(b))
+                    .collect()
+            }
         };
         let entry = if from_temps {
-            *me.temps
-                .first()
-                .ok_or_else(|| Trap::Invalid("object has no temps".into()))?
+            first_temp.ok_or_else(|| Trap::Invalid("object has no temps".into()))?
         } else {
             word(&instruction.operands, 0)
         };
@@ -1336,13 +1615,13 @@ impl<'a> Machine<'a, '_> {
         // The frame's locals start as whatever an earlier frame left in
         // the frame storage ([`Machine::push_frame`]).
         let frame = Frame {
-            stack_object: parent.stack_object,
+            stack_object: parent_stack_object,
             tree: instruction.opcode,
             node,
             parameters: args,
             locals: vec![0; locals],
             primitive_state: 0,
-            code_owner_type: parent.code_owner_type,
+            code_owner_type: parent_code_owner_type,
         };
         self.push_frame(frame, false)
     }
@@ -1372,17 +1651,22 @@ impl<'a> Machine<'a, '_> {
                     // A return counts as the thread's last result too
                     // (legacy lib.rs:1714), written once the frame is
                     // popped and a person's uses looked at (0x474da0).
-                    self.me_mut()?.last_result = value;
-                    let stack = &self.me()?.stack;
-                    if stack.len() <= base {
+                    let (stack_len, state) = {
+                        let me = self.me_mut()?;
+                        me.last_result = value;
+                        (
+                            me.stack.len(),
+                            me.stack.last().map_or(0, |f| f.primitive_state),
+                        )
+                    };
+                    if stack_len <= base {
                         return Ok(Status::Returned(value));
                     }
-                    let state = stack.last().map_or(0, |f| f.primitive_state);
-                    if state == RAN_TREE && self.current()?.opcode == 28 {
+                    if state == RAN_TREE && self.current_cached()?.2.opcode == 28 {
                         // The frame's next step finishes the primitive.
                         return Ok(Status::Running);
                     }
-                    if state != 0 && matches!(self.current()?.opcode, 17 | 27 | 45) {
+                    if state != 0 && matches!(self.current_cached()?.2.opcode, 17 | 27 | 45) {
                         // A route that ran a door's tree goes on from the
                         // step its frame holds, and Idle For Input that
                         // started an action looks at the queue again
@@ -1399,18 +1683,15 @@ impl<'a> Machine<'a, '_> {
                             "return into a primitive with saved state {state:#x}"
                         )));
                     }
-                    let call = self.current()?;
+                    let call = self.current_cached()?.2;
                     target = if value { call.on_true } else { call.on_false };
                 }
                 _ if target > LAST_NODE => {
                     return Err(Trap::native(0x44c, "invalid branch target"));
                 }
                 _ => {
-                    let frame = self.frame()?;
-                    let count = self
-                        .behavior(self.owner(frame)?, frame.tree_id())?
-                        .instructions
-                        .len();
+                    let (_, behavior, _) = self.resolve_active_frame()?;
+                    let count = behavior.instructions.len();
                     if usize::from(target) >= count {
                         return Err(Trap::InvalidBranch { target, count });
                     }
@@ -1420,6 +1701,59 @@ impl<'a> Machine<'a, '_> {
             }
         }
     }
+}
+
+/// Writes one frame's header, parameters, and locals into `storage` at
+/// `offset`.
+fn write_frame_to_storage(
+    storage: &mut sims_sim::FrameStorage,
+    depth: usize,
+    frame: &Frame,
+    offset: u32,
+) {
+    let start = offset as usize;
+    let (args, locals) = (frame.parameters.len(), frame.locals.len());
+    let end = start + frame_words(args, locals);
+    if storage.words.len() < end {
+        storage.words.resize(end, Some(0));
+    }
+    let state = frame.primitive_state;
+    let header = [
+        Some(frame.tree as i16),
+        Some(frame.node as i16),
+        Some(frame.stack_object),
+        Some((locals | (args << 8)) as i16),
+        Some(state as i16),
+        Some((state >> 16) as i16),
+        None,
+        None,
+    ];
+    storage.words[start..start + 8].copy_from_slice(&header);
+    for (i, &value) in frame.parameters.iter().enumerate() {
+        storage.words[start + 8 + i] = Some(value);
+    }
+    if storage.unknown.is_empty() {
+        for (i, &value) in frame.locals.iter().enumerate() {
+            storage.words[start + 8 + args + i] = Some(value);
+        }
+    } else {
+        for (i, &value) in frame.locals.iter().enumerate() {
+            let unknown = storage.unknown.contains(&(depth as u32, i as u32));
+            storage.words[start + 8 + args + i] = (!unknown).then_some(value);
+        }
+    }
+}
+
+/// Marks a frame `depth` of `object_id` as dirty when `frame_storage` already
+/// tracks `object_id`, so its next `sync_top_frame` flushes that frame into
+/// `frame_storage` at the exact same point full `sync_frames` would have.
+pub(crate) fn mark_frame_dirty(world: &mut World, object_id: u16, depth: usize) {
+    if !world.frame_storage.contains_key(&object_id) {
+        return;
+    }
+    let bit = if depth < 64 { 1u64 << depth } else { u64::MAX };
+    let entry = world.dirty_frames.as_mut().entry(object_id).or_insert(0);
+    *entry |= bit;
 }
 
 /// A tree's argument and local counts, as its format limits them
@@ -1462,4 +1796,208 @@ fn entry_node(behavior: &Behavior, entry: i16) -> Result<u16, Trap> {
 /// The little-endian word at `offset` in an instruction's operands.
 pub(crate) fn word(operands: &[u8; 8], offset: usize) -> i16 {
     i16::from_le_bytes([operands[offset], operands[offset + 1]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::program::{Library, Program};
+    use sims_content::Catalog;
+    use sims_formats::saved_objects::Frame;
+    use std::collections::BTreeMap;
+
+    fn frame(tree: u16, node: u16, stack_object: i16, params: Vec<i16>, locals: Vec<i16>) -> Frame {
+        Frame {
+            stack_object,
+            tree,
+            node,
+            parameters: params,
+            locals,
+            primitive_state: 0,
+            code_owner_type: 1,
+        }
+    }
+
+    #[test]
+    fn incremental_sync_top_frame_with_dirty_marks_matches_full_sync_frames() {
+        let program = Program {
+            global: 0,
+            libraries: BTreeMap::from([(0, Library::default())]),
+            semi_globals: BTreeMap::new(),
+            careers: None,
+            career_texts_end: false,
+            labels_hold_no_token: false,
+            zoning: BTreeMap::new(),
+            animations: Default::default(),
+            people: Default::default(),
+            icon_frames: None,
+            wardrobe: None,
+            ordered_wardrobe: None,
+            character_files: Default::default(),
+            expansions: 0,
+            characters: Default::default(),
+        };
+        let catalog = Catalog {
+            global: 0,
+            objects: Vec::new(),
+            by_guid: BTreeMap::new(),
+            semi_globals: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut world = World::empty();
+        world.objects.insert(
+            1,
+            sims_sim::Object {
+                id: 1,
+                guid: 1,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 64],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: vec![frame(4096, 1, 7, vec![10, 20], vec![1, 2])],
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+        let interpreter = Interpreter::new(&program, &catalog, Stream::Lot);
+
+        let assert_matches_full = |world: &World| {
+            let mut full = world.clone();
+            let mut m = interpreter.machine(&mut full, 1, 0, false);
+            m.sync_frames().unwrap();
+            assert_eq!(world.frame_storage.get(&1), full.frame_storage.get(&1));
+        };
+
+        // Push depth 1, mutate top frame + lower frame via mark_frame_dirty,
+        // push depth 2, then pop twice.
+        {
+            let mut m = interpreter.machine(&mut world, 1, 0, false);
+            m.push_frame(frame(4097, 2, 8, vec![30], vec![0, 0]), false)
+                .unwrap();
+        }
+        // Mutate lower frame 0 (simulating notify/wake/idle) and top frame 1.
+        world.objects.get_mut(&1).unwrap().stack[0].parameters[0] = 99;
+        world.objects.get_mut(&1).unwrap().stack[0].primitive_state = 5;
+        mark_frame_dirty(&mut world, 1, 0);
+        world.objects.get_mut(&1).unwrap().stack[1].locals[0] = 42;
+        world.objects.get_mut(&1).unwrap().stack[1].node = 9;
+        {
+            let mut m = interpreter.machine(&mut world, 1, 0, false);
+            m.push_frame(frame(4098, 0, 9, vec![], vec![0]), false)
+                .unwrap();
+        }
+        assert!(world.dirty_frames.is_empty());
+        // Before frame 2 writes anything, frames 0 and 1 must match full sync.
+        {
+            let mut m = interpreter.machine(&mut world, 1, 0, false);
+            m.sync_top_frame().unwrap();
+        }
+        assert_matches_full(&world);
+
+        // Mutate depth 2 and pop back to depth 1, then depth 0.
+        world.objects.get_mut(&1).unwrap().stack[2].locals[0] = -77;
+        {
+            let mut m = interpreter.machine(&mut world, 1, 0, false);
+            m.pop_frame().unwrap();
+        }
+        assert_matches_full(&world);
+        {
+            let mut m = interpreter.machine(&mut world, 1, 0, false);
+            m.pop_frame().unwrap();
+        }
+        assert_matches_full(&world);
+    }
+
+    #[test]
+    fn dirty_lower_frame_survives_world_encode_decode_roundtrip() {
+        let program = Program {
+            global: 0,
+            libraries: BTreeMap::from([(0, Library::default())]),
+            semi_globals: BTreeMap::new(),
+            careers: None,
+            career_texts_end: false,
+            labels_hold_no_token: false,
+            zoning: BTreeMap::new(),
+            animations: Default::default(),
+            people: Default::default(),
+            icon_frames: None,
+            wardrobe: None,
+            ordered_wardrobe: None,
+            character_files: Default::default(),
+            expansions: 0,
+            characters: Default::default(),
+        };
+        let catalog = Catalog {
+            global: 0,
+            objects: Vec::new(),
+            by_guid: BTreeMap::new(),
+            semi_globals: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut live = World::empty();
+        live.objects.insert(
+            1,
+            sims_sim::Object {
+                id: 1,
+                guid: 1,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 64],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: vec![frame(4096, 1, 7, vec![10], vec![1])],
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+        let interpreter = Interpreter::new(&program, &catalog, Stream::Lot);
+        {
+            let mut m = interpreter.machine(&mut live, 1, 0, false);
+            m.push_frame(frame(4097, 2, 8, vec![30], vec![0]), false)
+                .unwrap();
+        }
+        // Mutate lower frame 0 (as Idle For Input does) and mark dirty.
+        live.objects.get_mut(&1).unwrap().stack[0].parameters[0] = 0;
+        live.objects.get_mut(&1).unwrap().stack[0].primitive_state = 1;
+        mark_frame_dirty(&mut live, 1, 0);
+
+        // Save/restore drops #[serde(skip)] dirty_frames; World::decode must
+        // re-mark frame_storage entries so the next push matches uninterrupted.
+        let encoded = live.encode();
+        let mut restored = World::decode(&encoded).unwrap();
+        assert_eq!(live.hash(), restored.hash());
+
+        for w in [&mut live, &mut restored] {
+            let mut m = interpreter.machine(w, 1, 0, false);
+            m.push_frame(frame(4098, 0, 9, vec![], vec![0]), false)
+                .unwrap();
+        }
+        assert_eq!(live.frame_storage.get(&1), restored.frame_storage.get(&1));
+        assert_eq!(live.hash(), restored.hash());
+    }
 }

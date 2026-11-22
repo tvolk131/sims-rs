@@ -202,6 +202,7 @@ impl Machine<'_, '_> {
                 .first_mut()
                 .ok_or_else(|| Trap::Invalid("woken Sleep frame has no parameter".into()))? =
                 countdown;
+            crate::interpreter::mark_frame_dirty(self.world, id, depth - 1);
         }
         Ok(())
     }
@@ -270,8 +271,7 @@ impl Machine<'_, '_> {
         Ok(match index {
             0 => {
                 let guid = record.guid;
-                let definitions = self.catalog.objects.iter().filter(|o| o.guid == guid);
-                if definitions.count() > 1 {
+                if self.is_duplicate_guid(guid) {
                     return Err(Trap::Unsupported(format!(
                         "scope 24 field 0 (0x425baa) for a record of the GUID 0x{guid:08X}, \
                          which more than one definition has: which one the record is linked \
@@ -497,8 +497,7 @@ impl Machine<'_, '_> {
             26 => {
                 // Tables 0..64 are the owner's own BCONs, 64..128 its
                 // semi-global file's and 128..192 the global ones.
-                let owner = self.owner(frame)?;
-                Cell::Literal(self.program.constant(owner, index as u16).ok_or_else(|| {
+                Cell::Literal(self.frame_constant(frame, index as u16)?.ok_or_else(|| {
                     Trap::Invalid(format!(
                         "no tuning constant at address {:#06x}",
                         index as u16
@@ -649,14 +648,7 @@ impl Machine<'_, '_> {
                     .get(stack_object)
                     .ok_or(Trap::native(0x37, "missing neighbor"))?;
                 let index = bounded(index, DEFINITION_WORDS, 0x23)?;
-                if self
-                    .catalog
-                    .objects
-                    .iter()
-                    .filter(|o| o.guid == record.guid)
-                    .count()
-                    > 1
-                {
+                if self.is_duplicate_guid(record.guid) {
                     return Err(Trap::Unsupported(format!(
                         "scope 38 (0x454304) for neighbor GUID 0x{:08X}, which more than one \
                          definition names: the neighbor's linked definition pointer is not kept",

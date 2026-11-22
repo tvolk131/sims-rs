@@ -315,6 +315,7 @@ pub struct PreloadedBoot<'a> {
 /// A booted house: its linked code, its catalog and its lot.
 pub struct Lot {
     pub(crate) program: Program,
+    pub(crate) fast: crate::program::ProgramFast,
     pub(crate) catalog: Arc<Catalog>,
     /// The floor and wall catalogs the load renumbered the lot's patterns
     /// by (load step 6b).
@@ -1447,8 +1448,10 @@ impl Lot {
                 .and_then(|id| program.zoning.get(&id).copied())
         };
         let (lot_name, lot_description) = read_lot_info(house, load.house, zoning);
+        let fast = crate::program::ProgramFast::build(&program, &catalog);
         Ok(Self {
             program,
+            fast,
             catalog,
             surfaces,
             world,
@@ -1662,6 +1665,7 @@ impl Lot {
             Vec::new()
         };
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             ui_effects: Some(&ui_effects),
             masks_rebuilt: Some(&masks_rebuilt),
@@ -1852,6 +1856,7 @@ impl Lot {
         let sounds = RefCell::new(Vec::new());
         let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -1885,6 +1890,7 @@ impl Lot {
         let sounds = RefCell::new(Vec::new());
         let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -1942,6 +1948,7 @@ impl Lot {
         let sounds = RefCell::new(Vec::new());
         let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -1976,6 +1983,7 @@ impl Lot {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2069,6 +2077,7 @@ impl Lot {
         let clearing = previous != PanelMode::Live && mode != previous;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2203,6 +2212,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2287,6 +2297,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2357,6 +2368,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2437,6 +2449,7 @@ impl Lot {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2493,6 +2506,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2522,6 +2536,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2551,6 +2566,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2578,6 +2594,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2605,6 +2622,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2637,6 +2655,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2673,6 +2692,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2723,6 +2743,7 @@ impl Lot {
     fn purge_buy_history(&mut self, dropped: &[crate::BuyPurchase], keep: &BTreeSet<u16>) {
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2761,6 +2782,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2848,6 +2870,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2946,6 +2969,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -2992,6 +3016,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -3025,6 +3050,7 @@ impl Lot {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -3060,6 +3086,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -3085,6 +3112,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -3109,6 +3137,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -3142,6 +3171,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -3194,6 +3224,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -3242,6 +3273,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -3771,31 +3803,35 @@ mod tests {
         };
         let start = world.ticks;
         let loaded = world.hash();
+        let program = Program {
+            global: 0,
+            libraries: BTreeMap::new(),
+            semi_globals: BTreeMap::new(),
+            careers: None,
+            career_texts_end: false,
+            labels_hold_no_token: false,
+            zoning: BTreeMap::new(),
+            animations: Default::default(),
+            people: Default::default(),
+            icon_frames: None,
+            wardrobe: None,
+            ordered_wardrobe: None,
+            character_files: Default::default(),
+            expansions: 0,
+            characters: Default::default(),
+        };
+        let catalog = std::sync::Arc::new(Catalog {
+            global: 0,
+            objects: Vec::new(),
+            by_guid: BTreeMap::new(),
+            semi_globals: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        });
+        let fast = crate::program::ProgramFast::build(&program, &catalog);
         Lot {
-            program: Program {
-                global: 0,
-                libraries: BTreeMap::new(),
-                semi_globals: BTreeMap::new(),
-                careers: None,
-                career_texts_end: false,
-                labels_hold_no_token: false,
-                zoning: BTreeMap::new(),
-                animations: Default::default(),
-                people: Default::default(),
-                icon_frames: None,
-                wardrobe: None,
-                ordered_wardrobe: None,
-                character_files: Default::default(),
-                expansions: 0,
-                characters: Default::default(),
-            },
-            catalog: std::sync::Arc::new(Catalog {
-                global: 0,
-                objects: Vec::new(),
-                by_guid: BTreeMap::new(),
-                semi_globals: BTreeMap::new(),
-                diagnostics: Vec::new(),
-            }),
+            program,
+            fast,
+            catalog,
             surfaces: sims_content::Surfaces::default(),
             world,
             tuning: None,

@@ -171,10 +171,9 @@ impl Machine<'_, '_> {
         // clears it. Old Relationship (opcode 24, 0x44d593) reads the
         // parameter directly without touching `[edi + 0x128]`.
         if sets_scratch_ptr {
-            self.world.scratch_ptr_set_to_next.remove(&self.me);
-            self.world.scratch_ptr_expression.remove(&self.me);
-            self.world.scratch_ptr_arg_slot.remove(&self.me);
-            self.world.scratch_ptr_set.insert(self.me);
+            self.world
+                .scratch_ptrs
+                .set(self.me, sims_sim::SCRATCH_PTR_SET);
         }
         // The operand is resolved for writing in both directions.
         let (cell, writable) = self.resolve(operands[4], word(operands, 6), true)?;

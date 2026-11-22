@@ -1596,3 +1596,154 @@ fn lot_thumbnails_checked_crud_fencing_corruption_and_purge() {
     );
     assert!(store.load_lot_thumbnail(&long_id, 3).unwrap().is_none());
 }
+
+#[test]
+fn lot_thumbnail_v2_roundtrip_compression_and_v1_backwards_compatibility() {
+    use redb::ReadableDatabase;
+    use sha2::{Digest, Sha256};
+    use sims_sim::{StoredLotThumbnail, ThumbnailSurface565};
+
+    let db = TempDb::new("thumb_v1_v2_compat");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .save_neighborhood("NH1", &sample_neighborhood("NH1"))
+        .unwrap();
+    let nh1 = store.load_neighborhood("NH1").unwrap().unwrap();
+
+    // 128x96 RGB565 thumbnail with magenta 0xf81f color key (3-byte varint in V1).
+    let mut pixels = Vec::with_capacity(128 * 96);
+    for y in 0..96u16 {
+        for x in 0..128u16 {
+            pixels.push(if !(32..96).contains(&x) {
+                0xf81f
+            } else {
+                0x4208 + ((x + y) & 0x1f)
+            });
+        }
+    }
+    let normal = ThumbnailSurface565::new(128, 96, pixels.clone()).unwrap();
+    let roofs_off = ThumbnailSurface565::new(128, 96, pixels).unwrap();
+    let thumb = StoredLotThumbnail {
+        normal: normal.clone(),
+        roofs_off: Some(roofs_off.clone()),
+    };
+    store
+        .save_lot_thumbnail_checked("NH1", nh1.instance_id, 5, &thumb)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.load_lot_thumbnail("NH1", 5).unwrap().as_ref(),
+        Some(&thumb)
+    );
+    drop(store);
+
+    const THUMB_TABLE: redb::TableDefinition<(&str, u32), &[u8]> =
+        redb::TableDefinition::new("neighborhood_lot_thumbnails");
+
+    #[derive(serde::Serialize)]
+    struct LegacyThumbV1 {
+        neighborhood_id: String,
+        lot_id: u32,
+        normal: ThumbnailSurface565,
+        roofs_off: Option<ThumbnailSurface565>,
+    }
+    let v1_body = postcard::to_allocvec(&LegacyThumbV1 {
+        neighborhood_id: "NH1".into(),
+        lot_id: 6,
+        normal,
+        roofs_off: Some(roofs_off),
+    })
+    .unwrap();
+    let mut h = Sha256::new();
+    h.update(b"sims-sim:lot-thumbnail:v1");
+    h.update(1u32.to_le_bytes());
+    h.update(&v1_body);
+    let mut v1_framed = Vec::new();
+    v1_framed.extend_from_slice(b"THMB");
+    v1_framed.extend_from_slice(&1u32.to_le_bytes());
+    v1_framed.extend_from_slice(&h.finalize());
+    v1_framed.extend_from_slice(&v1_body);
+
+    let raw_db = redb::Database::open(&db.0).unwrap();
+    let v2_len = {
+        let r = raw_db.begin_read().unwrap();
+        let t = r.open_table(THUMB_TABLE).unwrap();
+        t.get(("NH1", 5)).unwrap().unwrap().value().len()
+    };
+    assert!(
+        v2_len * 4 < v1_framed.len(),
+        "expected V2 ({v2_len} B) to be >4x smaller than V1 ({} B)",
+        v1_framed.len()
+    );
+    {
+        let w = raw_db.begin_write().unwrap();
+        {
+            let mut t = w.open_table(THUMB_TABLE).unwrap();
+            t.insert(("NH1", 6), v1_framed.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    drop(raw_db);
+
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    assert_eq!(
+        store.load_lot_thumbnail("NH1", 5).unwrap().as_ref(),
+        Some(&thumb)
+    );
+    assert_eq!(
+        store.load_lot_thumbnail("NH1", 6).unwrap().as_ref(),
+        Some(&thumb)
+    );
+    drop(store);
+
+    // Trailing junk bytes after a valid V2 deflate stream (with valid outer
+    // checksum) must be rejected.
+    #[derive(serde::Serialize)]
+    struct RawThumbSurfaceV2 {
+        width: u32,
+        height: u32,
+        deflated_rgb565_le: Vec<u8>,
+    }
+    #[derive(serde::Serialize)]
+    struct RawThumbV2 {
+        neighborhood_id: String,
+        lot_id: u32,
+        normal: RawThumbSurfaceV2,
+        roofs_off: Option<RawThumbSurfaceV2>,
+    }
+    let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut enc, &[0x1f; 8 * 8 * 2]).unwrap();
+    let mut with_trailing = enc.finish().unwrap();
+    with_trailing.extend_from_slice(b"EXTRA");
+    let bad_body = postcard::to_allocvec(&RawThumbV2 {
+        neighborhood_id: "NH1".into(),
+        lot_id: 7,
+        normal: RawThumbSurfaceV2 {
+            width: 8,
+            height: 8,
+            deflated_rgb565_le: with_trailing,
+        },
+        roofs_off: None,
+    })
+    .unwrap();
+    let mut h = Sha256::new();
+    h.update(b"sims-sim:lot-thumbnail:v1");
+    h.update(2u32.to_le_bytes());
+    h.update(&bad_body);
+    let mut bad_framed = Vec::new();
+    bad_framed.extend_from_slice(b"THMB");
+    bad_framed.extend_from_slice(&2u32.to_le_bytes());
+    bad_framed.extend_from_slice(&h.finalize());
+    bad_framed.extend_from_slice(&bad_body);
+    {
+        let raw_db = redb::Database::open(&db.0).unwrap();
+        let w = raw_db.begin_write().unwrap();
+        {
+            let mut t = w.open_table(THUMB_TABLE).unwrap();
+            t.insert(("NH1", 7), bad_framed.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    assert!(store.load_lot_thumbnail("NH1", 7).is_err());
+}

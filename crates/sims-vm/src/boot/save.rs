@@ -438,10 +438,11 @@ impl Saved {
     /// format (each a little-endian u32), then the canonical encoding
     /// (postcard, as [`World::encode`]).
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = FORMAT.to_le_bytes().to_vec();
-        out.extend(sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
-        out.extend(postcard::to_allocvec(self).expect("encoding to memory cannot fail"));
-        out
+        let mut out = Vec::with_capacity(8 + 64 * 1024);
+        out.extend_from_slice(&FORMAT.to_le_bytes());
+        out.extend_from_slice(&sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
+        postcard::serialize_with_flavor(self, postcard::ser_flavors::ExtendFlavor::new(out))
+            .expect("encoding to memory cannot fail")
     }
 
     fn hydrate_world_aux(&mut self) {
@@ -453,12 +454,15 @@ impl Saved {
         self.world.loaded_indexed_suit_bones = self.loaded_indexed_suit_bones.clone();
         self.world.made_outfits = self.made_outfits.clone();
         self.world.person_outfits = self.person_outfits.clone();
-        self.world.scratch_ptr_set = self.scratch_ptr_set.clone();
-        self.world.scratch_ptr_set_to_next = self.scratch_ptr_set_to_next.clone();
-        self.world.scratch_ptr_expression = self.scratch_ptr_expression.clone();
-        self.world.scratch_ptr_arg_slot = self.scratch_ptr_arg_slot.clone();
+        self.world.scratch_ptrs = sims_sim::ScratchPtrs::from_btreesets(
+            &self.scratch_ptr_set,
+            &self.scratch_ptr_set_to_next,
+            &self.scratch_ptr_expression,
+            &self.scratch_ptr_arg_slot,
+        );
         self.world.runtime_added_suits = self.runtime_added_suits.clone();
         self.world.suit_scan_cache = self.suit_scan_cache.clone();
+        self.world.mark_all_frame_storage_dirty();
     }
 
     /// Reads [`Saved::encode`]'s bytes, deterministically migrating supported
@@ -655,10 +659,16 @@ impl Lot {
         let loaded_indexed_suit_bones = world.loaded_indexed_suit_bones.clone();
         let made_outfits = world.made_outfits.clone();
         let person_outfits = world.person_outfits.clone();
-        let scratch_ptr_set = world.scratch_ptr_set.clone();
-        let scratch_ptr_set_to_next = world.scratch_ptr_set_to_next.clone();
-        let scratch_ptr_expression = world.scratch_ptr_expression.clone();
-        let scratch_ptr_arg_slot = world.scratch_ptr_arg_slot.clone();
+        let scratch_ptr_set = world.scratch_ptrs.to_btreeset(sims_sim::SCRATCH_PTR_SET);
+        let scratch_ptr_set_to_next = world
+            .scratch_ptrs
+            .to_btreeset(sims_sim::SCRATCH_PTR_SET_TO_NEXT);
+        let scratch_ptr_expression = world
+            .scratch_ptrs
+            .to_btreeset(sims_sim::SCRATCH_PTR_EXPRESSION);
+        let scratch_ptr_arg_slot = world
+            .scratch_ptrs
+            .to_btreeset(sims_sim::SCRATCH_PTR_ARG_SLOT);
         let runtime_added_suits = world.runtime_added_suits.clone();
         let suit_scan_cache = world.suit_scan_cache.clone();
         Ok(Saved {
@@ -786,10 +796,14 @@ mod tests {
                 (2, "c001,HEAD-HEAD=c001".into()),
             ]),
         );
-        world.scratch_ptr_set.insert(42);
-        world.scratch_ptr_set_to_next.insert(43);
-        world.scratch_ptr_expression.insert(42);
-        world.scratch_ptr_arg_slot.insert(44);
+        world.scratch_ptrs.set(
+            42,
+            sims_sim::SCRATCH_PTR_SET | sims_sim::SCRATCH_PTR_EXPRESSION,
+        );
+        world
+            .scratch_ptrs
+            .set(43, sims_sim::SCRATCH_PTR_SET_TO_NEXT);
+        world.scratch_ptrs.set(44, sims_sim::SCRATCH_PTR_ARG_SLOT);
         world.runtime_added_suits.push("late_suit".into());
         world.suit_scan_cache = Some(vec!["suit_a".into(), "late_suit".into()]);
         let saved = Saved {
@@ -801,10 +815,16 @@ mod tests {
             loaded_indexed_suit_bones: world.loaded_indexed_suit_bones.clone(),
             made_outfits: world.made_outfits.clone(),
             person_outfits: world.person_outfits.clone(),
-            scratch_ptr_set: world.scratch_ptr_set.clone(),
-            scratch_ptr_set_to_next: world.scratch_ptr_set_to_next.clone(),
-            scratch_ptr_expression: world.scratch_ptr_expression.clone(),
-            scratch_ptr_arg_slot: world.scratch_ptr_arg_slot.clone(),
+            scratch_ptr_set: world.scratch_ptrs.to_btreeset(sims_sim::SCRATCH_PTR_SET),
+            scratch_ptr_set_to_next: world
+                .scratch_ptrs
+                .to_btreeset(sims_sim::SCRATCH_PTR_SET_TO_NEXT),
+            scratch_ptr_expression: world
+                .scratch_ptrs
+                .to_btreeset(sims_sim::SCRATCH_PTR_EXPRESSION),
+            scratch_ptr_arg_slot: world
+                .scratch_ptrs
+                .to_btreeset(sims_sim::SCRATCH_PTR_ARG_SLOT),
             runtime_added_suits: world.runtime_added_suits.clone(),
             suit_scan_cache: world.suit_scan_cache.clone(),
             world,
@@ -868,13 +888,34 @@ mod tests {
                 ])
             )])
         );
-        assert_eq!(decoded.world().scratch_ptr_set, BTreeSet::from([42]));
         assert_eq!(
-            decoded.world().scratch_ptr_set_to_next,
+            decoded
+                .world()
+                .scratch_ptrs
+                .to_btreeset(sims_sim::SCRATCH_PTR_SET),
+            BTreeSet::from([42])
+        );
+        assert_eq!(
+            decoded
+                .world()
+                .scratch_ptrs
+                .to_btreeset(sims_sim::SCRATCH_PTR_SET_TO_NEXT),
             BTreeSet::from([43])
         );
-        assert_eq!(decoded.world().scratch_ptr_expression, BTreeSet::from([42]));
-        assert_eq!(decoded.world().scratch_ptr_arg_slot, BTreeSet::from([44]));
+        assert_eq!(
+            decoded
+                .world()
+                .scratch_ptrs
+                .to_btreeset(sims_sim::SCRATCH_PTR_EXPRESSION),
+            BTreeSet::from([42])
+        );
+        assert_eq!(
+            decoded
+                .world()
+                .scratch_ptrs
+                .to_btreeset(sims_sim::SCRATCH_PTR_ARG_SLOT),
+            BTreeSet::from([44])
+        );
         assert_eq!(
             decoded.world().runtime_added_suits,
             vec!["late_suit".to_owned()]
