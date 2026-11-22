@@ -51,6 +51,7 @@
 use sims_audio::SoundEvent;
 use sims_audio::files::SoundFiles;
 use sims_audio::module::Module;
+use sims_audio::music::{ALL_EXPANSIONS, ModeCatalog, ModeMusicPlayer, MusicMode};
 use sims_audio::placement::Projection;
 use sims_audio::player::Player;
 use sims_audio::sources::{FIELDS, NO_ROOM, Snapshot};
@@ -58,7 +59,7 @@ use sims_audio::stations::StationLists;
 use sims_core::F32;
 use sims_render::camera::Camera;
 use sims_sim::World;
-use sims_ui::command::Speed;
+use sims_ui::command::{Mode, Speed};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -407,6 +408,8 @@ pub struct Feed {
     /// The last `[fx, music, vox]` volume steps (`0..=10`) sent to the mixer
     /// (matching `Player::new`'s `[10, 10, 10]` startup defaults).
     volumes: [u8; 3],
+    /// The last streaming mode-music station sent to the mixer.
+    music_mode: Option<MusicMode>,
 }
 
 impl Default for Feed {
@@ -422,11 +425,74 @@ impl Default for Feed {
             saved_paused: false,
             paused_for_blur: false,
             volumes: [sims_ui::options::VOLUME_MAX; 3],
+            music_mode: None,
         }
     }
 }
 
+/// Maps a live-lot control panel mode and lot ID to its 1.91 [`MusicMode`].
+pub fn lot_music_mode(mode: Mode, lot_id: i16) -> MusicMode {
+    let magic = (90..=98).contains(&lot_id);
+    match mode {
+        Mode::Live => MusicMode::Live,
+        Mode::Buy => {
+            if magic {
+                MusicMode::MagicTownBuy
+            } else {
+                MusicMode::Buy
+            }
+        }
+        Mode::Build => {
+            if magic {
+                MusicMode::MagicTownBuild
+            } else {
+                MusicMode::Build
+            }
+        }
+        Mode::Options => MusicMode::Options,
+    }
+}
+
 impl Feed {
+    /// Clears lot-scoped tracking when transitioning between lots or returning
+    /// to the neighborhood map, while preserving window focus and volume steps.
+    pub fn reset_for_lot(&mut self) {
+        self.heard = None;
+        self.told = None;
+        self.shot = None;
+        self.observed_game_paused = false;
+        self.requested_paused = false;
+        self.pause_dirty = false;
+        self.saved_paused = false;
+        self.paused_for_blur = false;
+        self.music_mode = None;
+    }
+
+    /// Syncs `[fx, music, vox]` slider steps (`0..=10`) outside a running lot
+    /// (e.g. on startup in the Neighborhood screen).
+    pub fn sync_volume_steps(&mut self, volumes: [u8; 3], mut send: impl FnMut(Input)) {
+        if volumes[0] != self.volumes[0] {
+            send(Input::FxVolume(volumes[0]));
+            self.volumes[0] = volumes[0];
+        }
+        if volumes[1] != self.volumes[1] {
+            send(Input::MusicVolume(volumes[1]));
+            self.volumes[1] = volumes[1];
+        }
+        if volumes[2] != self.volumes[2] {
+            send(Input::VoxVolume(volumes[2]));
+            self.volumes[2] = volumes[2];
+        }
+    }
+
+    /// Updates window focus outside a running lot (e.g. Neighborhood / Family Bin).
+    pub fn set_shell_focused(&mut self, focused: bool, mut send: impl FnMut(Input)) {
+        if self.focused == focused {
+            return;
+        }
+        self.focused = focused;
+        send(Input::Active(focused));
+    }
     /// Whether the window is currently considered focused.
     pub fn focused(&self) -> bool {
         self.focused
@@ -602,6 +668,11 @@ impl Feed {
             send(Input::Events(enter_live()));
         }
         self.sync_volumes(game, &mut send);
+        let desired_music = lot_music_mode(game.mode(), game.lot().lot_id());
+        if self.music_mode != Some(desired_music) {
+            send(Input::MusicMode(desired_music));
+            self.music_mode = Some(desired_music);
+        }
         // `0x4ce4c4..0x4ce4d1`: leaving Live mode (e.g. entering Options) pauses
         // live audio; returning to Live unpauses unless the lot is paused.
         let audio_paused = game.paused() || game.mode() != sims_ui::command::Mode::Live;
@@ -703,12 +774,15 @@ pub enum Input {
     MusicVolume(u8),
     /// Voice volume slider step `0..=10` (kind 39, `0x4e61f4` → `0x57410d`).
     VoxVolume(u8),
+    /// Streaming mode music transition (`kSetMusicMode`, `0x575170`).
+    MusicMode(MusicMode),
 }
 
 /// The sound player with every module, station and ambient score of an
-/// install.
+/// install, paired with streaming Neighborhood/Buy/Build/expansion mode music.
 pub struct Mixer {
     player: Player<SoundFiles>,
+    music: ModeMusicPlayer<SoundFiles>,
     hour: u32,
     view: i32,
     sources: Snapshot,
@@ -722,12 +796,15 @@ impl Mixer {
         let files = SoundFiles::scan(root).map_err(|e| format!("sound files: {e}"))?;
         let modules = Module::load_all(&files).map_err(|e| format!("sound modules: {e}"))?;
         let lists = StationLists::build(&files);
+        let catalog = ModeCatalog::from_sound_files(&files, true, ALL_EXPANSIONS);
+        let music = ModeMusicPlayer::new(catalog, files.clone(), SEED);
         let mut player = Player::new(modules, files.clone(), SEED);
         player.add_stations(&lists);
         player.add_scores(&files);
         player.set_global(SPEED_REGISTER, speed_register(Speed::Normal));
         Ok(Self {
             player,
+            music,
             hour: u32::MAX,
             view: 0,
             sources: Snapshot::default(),
@@ -742,6 +819,9 @@ impl Mixer {
                 // Placed where the last snapshot has their objects, which
                 // the game sends before a tick's events.
                 for event in &events {
+                    if matches!(event, SoundEvent::StopAll) {
+                        self.music.stop();
+                    }
                     self.player.handle(event, &self.sources);
                 }
             }
@@ -758,15 +838,22 @@ impl Mixer {
             Input::Camera => self
                 .player
                 .camera_moved(self.view, self.hour, &self.sources),
-            Input::Active(active) => self.player.set_active(active, &self.sources),
+            Input::Active(active) => {
+                self.player.set_active(active, &self.sources);
+                self.music.set_paused(!active);
+            }
             Input::FxVolume(step) => self
                 .player
                 .set_fx_volume_step(usize::from(step), &self.sources),
-            Input::MusicVolume(step) => self.player.set_music_volume_step(usize::from(step)),
+            Input::MusicVolume(step) => {
+                self.player.set_music_volume_step(usize::from(step));
+                self.music.set_volume_step(usize::from(step));
+            }
             Input::VoxVolume(step) => self.player.set_vox_volume_step(usize::from(step)),
             Input::Speed(speed) => self
                 .player
                 .set_global(SPEED_REGISTER, speed_register(speed)),
+            Input::MusicMode(mode) => self.music.set_mode(mode),
         }
     }
 
@@ -779,13 +866,24 @@ impl Mixer {
         ]
     }
 
+    /// Current streaming mode-music station.
+    pub fn music_mode(&self) -> MusicMode {
+        self.music.mode()
+    }
+
+    /// Whether streaming mode music currently has an active or fading deck.
+    pub fn music_playing(&self) -> bool {
+        self.music.is_playing()
+    }
+
     /// Renders `frames` stereo frames at [`sims_audio::player::RATE`],
-    /// moving the ambience's cursor to the latest hour and view first.
-    /// The original moves it on kind 33, as far as is read; this keeps
-    /// it to the clock between camera moves.
+    /// moving the ambience's cursor to the latest hour and view first, then
+    /// mixing streaming mode music into the output buffer.
     pub fn render(&mut self, frames: usize) -> Vec<i16> {
         self.player.set_ambience_view(self.view, self.hour);
-        self.player.render_stereo(frames, &self.sources)
+        let mut out = self.player.render_stereo(frames, &self.sources);
+        self.music.mix_into_stereo(&mut out);
+        out
     }
 
     /// Faults not reported yet, each once, up to `REPORTED` of them; a
@@ -793,7 +891,12 @@ impl Mixer {
     /// emptied each time, so neither it nor this one grows without end.
     pub fn new_faults(&mut self) -> Vec<String> {
         let mut out = Vec::new();
-        for fault in self.player.faults.drain(..) {
+        for fault in self
+            .player
+            .faults
+            .drain(..)
+            .chain(self.music.faults.drain(..))
+        {
             if self.reported.len() >= REPORTED {
                 continue;
             }

@@ -19,7 +19,13 @@
 //!   `flags`, `members`, `magic_history`), `NBRS` (slots, person data,
 //!   relationships), `NGBH` (16 data words, inventories, options), and `TATT`.
 
+use crate::autosave::{AutosavePolicy, AutosaveStore};
 use crate::characters::Characters;
+use crate::migration::{
+    MigratedRecord, MigrationError, MigrationReport, NEIGHBORHOOD_MIGRATIONS,
+    NeighborhoodSchemaStatus, StoreMigrationError, StoreMigrationReport,
+    decode_neighborhood_strict, decode_neighborhood_with_report,
+};
 use crate::{Error, Result, World};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -34,6 +40,7 @@ use sims_formats::neighborhood::{
 use sims_formats::tatt::{Entry as TattEntry, Tatt};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Key inside [`NEIGHBORHOOD_META`] holding this REDB store's persistent
@@ -75,7 +82,8 @@ pub enum CheckedCommitError {
 }
 
 /// Versioned `StoredNeighborhood` metadata keyed by neighborhood ID.
-const NEIGHBORHOODS: TableDefinition<&str, &[u8]> = TableDefinition::new("neighborhoods");
+pub(crate) const NEIGHBORHOODS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("neighborhoods");
 
 /// Raw immutable `Characters/*.iff` bytes keyed by `(neighborhood_id, filename)`.
 const NEIGHBORHOOD_CHARACTERS: TableDefinition<(&str, &str), &[u8]> =
@@ -101,9 +109,14 @@ const ACTIVE_KEY: &str = "active";
 /// inside this REDB file receives a strictly unique 128-bit `instance_id`.
 const INSTANCE_SEQ_KEY: &str = "instance_seq";
 
-/// Bumped whenever [`StoredNeighborhood`]'s postcard layout changes so an older
-/// record is refused cleanly instead of misread (format 2 added `instance_id`
-/// and `deleted_characters`; format 3 added `deletion_epoch` and
+/// Key inside [`NEIGHBORHOOD_META`] recording the last atomically migrated
+/// neighborhood schema version (4-byte little-endian `u32`).
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+
+/// Current [`StoredNeighborhood`] schema version. Older versions
+/// (`NEIGHBORHOOD_MIN_FORMAT..NEIGHBORHOOD_FORMAT`) are upgraded deterministically
+/// via [`crate::migration::NEIGHBORHOOD_MIGRATIONS`] (format 2 added
+/// `instance_id` and `deleted_characters`; format 3 added `deletion_epoch` and
 /// `deleted_at_epoch`).
 pub const NEIGHBORHOOD_FORMAT: u32 = 3;
 
@@ -325,19 +338,29 @@ impl StoredNeighborhood {
         out
     }
 
-    /// Decodes bytes written by [`StoredNeighborhood::encode`].
+    /// Decodes bytes written by [`StoredNeighborhood::encode`] (or an older
+    /// supported schema version `1..=NEIGHBORHOOD_FORMAT`), applying registered
+    /// forward migrations deterministically in memory.
     pub fn decode(name: &str, bytes: &[u8]) -> Result<Self> {
-        let (version, body) = bytes
-            .split_first_chunk::<4>()
-            .ok_or_else(|| Error::Snapshot(format!("{name}: shorter than its header")))?;
-        let version = u32::from_le_bytes(*version);
-        if version != NEIGHBORHOOD_FORMAT {
-            return Err(Error::Snapshot(format!(
-                "{name}: neighborhood format {version}, expected {NEIGHBORHOOD_FORMAT}"
-            )));
-        }
-        postcard::from_bytes(body)
-            .map_err(|error| Error::Snapshot(format!("{name}: invalid neighborhood data: {error}")))
+        Self::decode_with_report(name, bytes)
+            .map(|(neighborhood, _)| neighborhood)
+            .map_err(|error| Error::Snapshot(error.to_string()))
+    }
+
+    /// Decodes bytes from any supported schema version (`1..=NEIGHBORHOOD_FORMAT`)
+    /// and returns both the migrated [`StoredNeighborhood`] and its
+    /// [`MigrationReport`], or a structured [`MigrationError`].
+    pub fn decode_with_report(
+        name: &str,
+        bytes: &[u8],
+    ) -> std::result::Result<(Self, MigrationReport), MigrationError> {
+        decode_neighborhood_with_report(name, bytes)
+    }
+
+    /// Decodes bytes strictly at [`NEIGHBORHOOD_FORMAT`] without running
+    /// forward migrations for older schema versions.
+    pub fn decode_strict(name: &str, bytes: &[u8]) -> std::result::Result<Self, MigrationError> {
+        decode_neighborhood_strict(name, bytes)
     }
 
     /// Writes back live simulation neighborhood state from `world` into this
@@ -561,7 +584,7 @@ impl StoredNeighborhood {
 
 /// A REDB-backed multi-neighborhood and multi-lot persistence store.
 pub struct NeighborhoodStore {
-    db: Database,
+    db: Arc<Database>,
     store_id: u128,
 }
 
@@ -722,13 +745,227 @@ impl NeighborhoodStore {
             }
         };
         let store_id = bind_store_file_identity(persisted_id, &canon);
-        Ok(Self { db, store_id })
+        Ok(Self {
+            db: Arc::new(db),
+            store_id,
+        })
     }
 
     /// Persistent 128-bit identity of this REDB store file.
     #[must_use]
     pub fn store_id(&self) -> u128 {
         self.store_id
+    }
+
+    /// Returns a crash-safe [`AutosaveStore`] handle backed by tables in this
+    /// same REDB database file with [`AutosavePolicy::default`] (5 rotating
+    /// autosaves per lot).
+    ///
+    /// The returned handle is `Clone + Send + Sync` and can be moved onto a
+    /// background save worker thread without REDB file-lock conflicts.
+    #[must_use]
+    pub fn autosaves(&self) -> AutosaveStore {
+        AutosaveStore::from_shared_db(Arc::clone(&self.db), AutosavePolicy::default())
+    }
+
+    /// Returns a crash-safe [`AutosaveStore`] handle sharing this REDB
+    /// database file with a custom [`AutosavePolicy`].
+    pub fn autosaves_with_policy(
+        &self,
+        policy: AutosavePolicy,
+    ) -> std::result::Result<AutosaveStore, crate::autosave::SaveError> {
+        let validated = AutosavePolicy::new(policy.max_autosaves)?;
+        Ok(AutosaveStore::from_shared_db(
+            Arc::clone(&self.db),
+            validated,
+        ))
+    }
+
+    /// Returns the last neighborhood schema version explicitly recorded in
+    /// `NEIGHBORHOOD_META` by [`Self::migrate_all`], if any.
+    pub fn recorded_schema_version(&self) -> Result<Option<u32>> {
+        let txn = self.db.begin_read().map_err(store)?;
+        let table = match txn.open_table(NEIGHBORHOOD_META) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(store(error)),
+        };
+        let Some(value) = table.get(SCHEMA_VERSION_KEY).map_err(store)? else {
+            return Ok(None);
+        };
+        let bytes: [u8; 4] = value
+            .value()
+            .try_into()
+            .map_err(|_| Error::Snapshot("recorded schema_version is not 4 bytes".into()))?;
+        Ok(Some(u32::from_le_bytes(bytes)))
+    }
+
+    /// Inspects every stored neighborhood record in a single read-only
+    /// transaction without modifying the database, reporting which records are
+    /// current, which require forward migration, and which are corrupt or
+    /// written by an unsupported version.
+    pub fn inspect_schema(&self) -> Result<Vec<NeighborhoodSchemaStatus>> {
+        let txn = self.db.begin_read().map_err(store)?;
+        let table = match txn.open_table(NEIGHBORHOODS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(store(error)),
+        };
+        let mut statuses = Vec::new();
+        for entry in table.iter().map_err(store)? {
+            let (key, value) = entry.map_err(store)?;
+            let id = key.value().to_owned();
+            match NEIGHBORHOOD_MIGRATIONS.migrate_bytes(&id, value.value()) {
+                Ok(migrated) if migrated.steps_applied == 0 => {
+                    statuses.push(NeighborhoodSchemaStatus::Current {
+                        id,
+                        version: migrated.final_version,
+                    });
+                }
+                Ok(migrated) => {
+                    statuses.push(NeighborhoodSchemaStatus::NeedsMigration {
+                        id,
+                        from_version: migrated.original_version,
+                        target_version: migrated.final_version,
+                    });
+                }
+                Err(error) => {
+                    statuses.push(NeighborhoodSchemaStatus::Invalid { id, error });
+                }
+            }
+        }
+        Ok(statuses)
+    }
+
+    /// Atomically migrates a single neighborhood row `id` to
+    /// [`NEIGHBORHOOD_FORMAT`] inside one REDB write transaction.
+    ///
+    /// - Returns `Ok(None)` if `id` does not exist.
+    /// - Returns `Ok(Some(record))` with `steps_applied == 0` if already
+    ///   current (still validating integrity without rewriting).
+    /// - If the record is corrupt, truncated, or written by an unsupported
+    ///   version (`0` or `> NEIGHBORHOOD_FORMAT`), aborts the transaction and
+    ///   returns `Err(StoreMigrationError::Migration(_))` without modifying
+    ///   the database.
+    pub fn migrate_neighborhood(
+        &self,
+        id: &str,
+    ) -> std::result::Result<Option<MigratedRecord>, StoreMigrationError> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreMigrationError::Store(e.to_string()))?;
+        let outcome = {
+            let mut table = txn
+                .open_table(NEIGHBORHOODS)
+                .map_err(|e| StoreMigrationError::Store(e.to_string()))?;
+            let raw = table
+                .get(id)
+                .map_err(|e| StoreMigrationError::Store(e.to_string()))?
+                .map(|v| v.value().to_vec());
+            let Some(raw) = raw else {
+                return Ok(None);
+            };
+            let migrated = NEIGHBORHOOD_MIGRATIONS.migrate_bytes(id, &raw)?;
+            if migrated.steps_applied > 0 {
+                table
+                    .insert(id, migrated.encoded.as_slice())
+                    .map_err(|e| StoreMigrationError::Store(e.to_string()))?;
+            }
+            MigratedRecord {
+                id: id.to_owned(),
+                from_version: migrated.original_version,
+                to_version: migrated.final_version,
+                steps_applied: migrated.steps_applied,
+            }
+        };
+        if outcome.steps_applied > 0 {
+            txn.commit()
+                .map_err(|e| StoreMigrationError::Store(e.to_string()))?;
+        }
+        Ok(Some(outcome))
+    }
+
+    /// Atomically validates and migrates **every** neighborhood record in this
+    /// store to [`NEIGHBORHOOD_FORMAT`] inside a single REDB write transaction.
+    ///
+    /// Every row is validated and migrated in memory *before* any write is
+    /// applied or committed. If any record is corrupt, truncated, or uses an
+    /// unsupported/future version, the transaction is aborted and **zero**
+    /// records are modified on disk.
+    pub fn migrate_all(&self) -> std::result::Result<StoreMigrationReport, StoreMigrationError> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreMigrationError::Store(e.to_string()))?;
+        let report;
+        {
+            let mut nh_table = txn
+                .open_table(NEIGHBORHOODS)
+                .map_err(|e| StoreMigrationError::Store(e.to_string()))?;
+
+            // Phase 1: read all raw rows so no mutation happens until every
+            // record passes validation and migration cleanly.
+            let mut raw_rows: Vec<(String, Vec<u8>)> = Vec::new();
+            for entry in nh_table
+                .iter()
+                .map_err(|e| StoreMigrationError::Store(e.to_string()))?
+            {
+                let (key, value) = entry.map_err(|e| StoreMigrationError::Store(e.to_string()))?;
+                raw_rows.push((key.value().to_owned(), value.value().to_vec()));
+            }
+
+            // Phase 2: validate & migrate every row in memory. Any error
+            // returns immediately, dropping `txn` without committing.
+            let mut upgrades: Vec<(String, Vec<u8>, MigratedRecord)> = Vec::new();
+            let mut already_current = 0usize;
+            for (id, raw) in &raw_rows {
+                let migrated = NEIGHBORHOOD_MIGRATIONS.migrate_bytes(id, raw)?;
+                if migrated.steps_applied == 0 {
+                    already_current += 1;
+                } else {
+                    upgrades.push((
+                        id.clone(),
+                        migrated.encoded,
+                        MigratedRecord {
+                            id: id.clone(),
+                            from_version: migrated.original_version,
+                            to_version: migrated.final_version,
+                            steps_applied: migrated.steps_applied,
+                        },
+                    ));
+                }
+            }
+
+            // Phase 3: write all upgraded rows and record schema version
+            // atomically in this single write transaction.
+            let mut migrated_records = Vec::with_capacity(upgrades.len());
+            for (id, encoded, record) in upgrades {
+                nh_table
+                    .insert(id.as_str(), encoded.as_slice())
+                    .map_err(|e| StoreMigrationError::Store(e.to_string()))?;
+                migrated_records.push(record);
+            }
+            let mut meta_table = txn
+                .open_table(NEIGHBORHOOD_META)
+                .map_err(|e| StoreMigrationError::Store(e.to_string()))?;
+            meta_table
+                .insert(
+                    SCHEMA_VERSION_KEY,
+                    NEIGHBORHOOD_FORMAT.to_le_bytes().as_slice(),
+                )
+                .map_err(|e| StoreMigrationError::Store(e.to_string()))?;
+
+            report = StoreMigrationReport {
+                target_version: NEIGHBORHOOD_FORMAT,
+                inspected: raw_rows.len(),
+                already_current,
+                migrated: migrated_records,
+            };
+        }
+        txn.commit()
+            .map_err(|e| StoreMigrationError::Store(e.to_string()))?;
+        Ok(report)
     }
 
     /// Imports a neighborhood directory (`UserData`, `UserData2`..`UserData8`)
@@ -838,6 +1075,7 @@ impl NeighborhoodStore {
             for number in old_lots {
                 lot_table.remove((id, number)).map_err(store)?;
             }
+            crate::autosave::purge_neighborhood_in_txn(&txn, id)?;
 
             nh_table.insert(id, encoded.as_slice()).map_err(store)?;
             for (name, bytes) in &characters {
@@ -948,6 +1186,7 @@ impl NeighborhoodStore {
                 for number in lots {
                     lot_table.remove((id, number)).map_err(store)?;
                 }
+                crate::autosave::purge_neighborhood_in_txn(&txn, id)?;
                 let mut meta_table = txn.open_table(NEIGHBORHOOD_META).map_err(store)?;
                 let is_active = meta_table
                     .get(ACTIVE_KEY)
@@ -1048,7 +1287,8 @@ impl NeighborhoodStore {
             let previous = table
                 .get(id)
                 .map_err(store)?
-                .and_then(|v| StoredNeighborhood::decode(id, v.value()).ok());
+                .map(|v| StoredNeighborhood::decode(id, v.value()))
+                .transpose()?;
             let mut committed = state.clone();
             if let Some(prev) = previous {
                 let (next_instance, next_rev) =
@@ -1294,7 +1534,8 @@ impl NeighborhoodStore {
                 let previous = nh_table
                     .get(id)
                     .map_err(store)?
-                    .and_then(|v| StoredNeighborhood::decode(id, v.value()).ok());
+                    .map(|v| StoredNeighborhood::decode(id, v.value()))
+                    .transpose()?;
                 let mut next = state.clone();
                 if let Some(prev) = previous {
                     let (next_instance, next_rev) =

@@ -12,21 +12,30 @@
 //! caught is logged and shown across the top for a while, and only a
 //! failure play mode does not catch stops the lot.
 
-use crate::hud::{DialogKey, Hud, OptionsDialog};
+use crate::hud::{DialogKey, Hud, HudShared, HudStatic, OptionsDialog};
 use crate::menu::{self, Listing, Menu};
 use crate::pace::{self, Pace};
 use crate::people::People;
 use crate::pick;
 use crate::sound;
 use crate::view::{Move, View};
-use sims_render::{Camera, Canvas, Selected, Walls, open_house};
+use sims_content::assets::Assets as ContentAssets;
+use sims_content::{
+    Animations, ArchivePool, AvatarRegistry, Catalog, House, Index, Install, Neighborhood,
+    People as ContentPeople, Surfaces, Wardrobe,
+};
+use sims_people::{Cast, Library as PeopleLibrary, PreloadedCast};
+use sims_render::{BaseAssets, Camera, Canvas, Selected, Walls};
 use sims_ui::command::{
     BuildItemId, BuildTool, Camera as UiCamera, Command, Mode, OptionsAction, OptionsToggle, Speed,
     VolumeChannel, Walls as UiWalls,
 };
 use sims_ui::options::{LotVisibility, OptionsState};
+use sims_vm::Program;
 use sims_vm::boot::save::Saved;
-use sims_vm::boot::{Frames, Lot, StepError};
+use sims_vm::boot::{
+    Frames, Lot, PreloadedBoot, StepError, default_character_name, load_ordered_wardrobe,
+};
 use sims_vm::play::{Recovery, ScriptError};
 use sims_vm::{
     BuyCursor, FloorDragMode, FloorPlan, PanelMode, SkippedFrame, SoundEvent, UiEffectEvent,
@@ -35,6 +44,7 @@ use sims_vm::{
 };
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The room word of an object in no room.
 const NO_ROOM: i16 = -5;
@@ -89,15 +99,15 @@ pub struct Outcome {
     pub save: bool,
     /// The player accepted Quit from the Options panel (`0x516866..0x51686c`).
     pub quit: bool,
+    /// The player accepted returning to the Neighborhood screen (`0x5170f0..0x51713c`).
+    pub neighborhood: bool,
 }
 
 impl Outcome {
     fn redraw() -> Self {
         Self {
             redraw: true,
-            photo: false,
-            save: false,
-            quit: false,
+            ..Self::default()
         }
     }
 }
@@ -234,23 +244,227 @@ impl Game {
     /// Boots the house and reads everything drawing it needs.
     pub fn open(options: &Options) -> Result<Self, String> {
         let house = &options.house;
-        let opened = open_house(&options.install, house).map_err(|e| e.to_string())?;
-        let initial_centre = sims_render::Lot::from_world(&opened.world)
-            .ok()
-            .and_then(|shape| {
-                let shape = shape.with_floor_rotation(opened.rotation);
-                let view = View::new([800, 600], shape.built_center(), opened.rotation);
-                let mut camera = view.camera;
-                camera.origin[0] = camera.origin[0].saturating_add(pick::ORIGIN_COLUMN);
-                sims_render::screen_centre_pick(&shape, &camera, [800, 600])
-                    .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8])
+        let install = Install::detect(&options.install).map_err(|e| e.to_string())?;
+        let pool = Arc::new(ArchivePool::new());
+
+        // Stage A: load all independent install/neighborhood inputs in parallel
+        // once, sharing a single ArchivePool across every FAR read. Error
+        // checks are deferred to match the exact original sequential order:
+        // `open_house` -> `Lot::load` -> `Hud::open` -> `People::open`.
+        let (
+            index_catalog_res,
+            people_assets_res,
+            ordered_wardrobe,
+            registry_res,
+            surfaces_res,
+            hud_static_res,
+            base_assets_res,
+            icon_frames_res,
+            default_name,
+        ) = std::thread::scope(|scope| {
+            let idx_handle = scope.spawn(|| -> Result<_, String> {
+                let mut index = Index::build(&install).map_err(|e| e.to_string())?;
+                let neighborhood_dir = house
+                    .parent()
+                    .and_then(Path::parent)
+                    .ok_or("the house file is not in a Houses folder")?;
+                let neighborhood =
+                    Neighborhood::open(neighborhood_dir).map_err(|e| e.to_string())?;
+                let characters = neighborhood.characters().map_err(|e| e.to_string())?;
+                if let Some(ref chars) = characters {
+                    index.add_characters(chars).map_err(|e| e.to_string())?;
+                }
+                let catalog = Catalog::build_with_pool(&index, &pool).map_err(|e| e.to_string())?;
+                let house_file = House::load(house, &catalog).map_err(|e| e.to_string())?;
+                // Match `sims_render::open_house` house validation and initial
+                // screen-centre pick before consuming `BaseAssets` or VM boot results.
+                let mut world = sims_sim::World::from_house(&house_file, &catalog)
+                    .map_err(|e| e.to_string())?;
+                let version = house_file
+                    .version()
+                    .ok_or_else(|| "the house file has no HOUS 1 chunk".to_owned())?;
+                if let Some(&requested) = world.globals.get(23) {
+                    let requested = if requested == 0 {
+                        sims_sim::FULL_SIZE
+                    } else {
+                        requested
+                    };
+                    if (4..=sims_sim::FULL_SIZE).contains(&requested) {
+                        world.size = requested;
+                    }
+                }
+                for id in sims_sim::load::FLOORS
+                    .into_iter()
+                    .chain(sims_sim::load::WALLS)
+                {
+                    world.arrays.remove(&id);
+                }
+                world
+                    .read_arrays(&house_file.arrays, version)
+                    .map_err(|e| e.to_string())?;
+                world.rebuild_rooms().map_err(|e| e.to_string())?;
+                let opening_rotation = house_file
+                    .view
+                    .as_ref()
+                    .map_or(0, |v| (v.camera_direction & 3) as u8);
+                let initial_centre = sims_render::Lot::from_world(&world).ok().and_then(|shape| {
+                    let shape = shape.with_floor_rotation(opening_rotation);
+                    let view = View::new([800, 600], shape.built_center(), opening_rotation);
+                    let mut camera = view.camera;
+                    camera.origin[0] = camera.origin[0].saturating_add(pick::ORIGIN_COLUMN);
+                    sims_render::screen_centre_pick(&shape, &camera, [800, 600])
+                        .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8])
+                });
+                Ok((
+                    neighborhood,
+                    characters,
+                    index,
+                    catalog,
+                    house_file,
+                    initial_centre,
+                ))
             });
-        let mut lot = Lot::load_viewed(
-            &options.install,
+            let people_handle = scope.spawn(|| match ContentAssets::scan(&install.root) {
+                Ok(content_assets) => {
+                    let (wardrobe, library_res) = std::thread::scope(|inner| {
+                        let lib_handle =
+                            inner.spawn(|| PeopleLibrary::scan_with_pool(&content_assets, &pool));
+                        let wardrobe = Wardrobe::load_with_pool(&content_assets, &pool);
+                        (
+                            wardrobe,
+                            lib_handle.join().expect("people library worker panicked"),
+                        )
+                    });
+                    (
+                        wardrobe,
+                        library_res.map(|people_library| (content_assets, people_library)),
+                    )
+                }
+                Err(error) => (Wardrobe::unread(error.clone()), Err(error)),
+            });
+            let ordered_ward_handle = scope.spawn(|| load_ordered_wardrobe(&install, &pool));
+            let reg_handle = scope.spawn(|| AvatarRegistry::load_with_pool(&install, &pool));
+            let surf_handle =
+                scope.spawn(|| Surfaces::build_with_plugins_and_pool(&install, &pool));
+            let hud_handle = scope.spawn(|| HudStatic::load(&install, Arc::clone(&pool)));
+            let base_assets_res = BaseAssets::load(&install).map_err(|e| e.to_string());
+            let icon_frames_res = sims_vm::icon_frames(&install);
+            let default_name = default_character_name(&install);
+            (
+                idx_handle.join().expect("index/catalog worker panicked"),
+                people_handle.join().expect("people assets worker panicked"),
+                ordered_ward_handle
+                    .join()
+                    .expect("ordered wardrobe worker panicked"),
+                reg_handle.join().expect("avatar registry worker panicked"),
+                surf_handle.join().expect("surfaces worker panicked"),
+                hud_handle.join().expect("hud static worker panicked"),
+                base_assets_res,
+                icon_frames_res,
+                default_name,
+            )
+        });
+
+        let (neighborhood, characters, index, catalog, house_file, initial_centre) =
+            index_catalog_res?;
+        let index = Arc::new(index);
+        let catalog = Arc::new(catalog);
+        let (surfaces_res, floor_plugins, wall_plugins) = match surfaces_res {
+            Ok((surfaces, floor_plugins, wall_plugins)) => {
+                (Ok(surfaces), floor_plugins, wall_plugins)
+            }
+            Err(error) => (
+                Err(error),
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+            ),
+        };
+        let assets = sims_render::Assets::from_base(
+            base_assets_res?,
+            floor_plugins,
+            wall_plugins,
+            Arc::clone(&index),
+            Arc::clone(&catalog),
+            Arc::clone(&pool),
+        );
+
+        // Stage B: link Program, load Animations, resolve person types, and load
+        // Index/Catalog-dependent HUD tables in parallel.
+        let (program_res, animations_res, people_res, hud_shared_res) =
+            std::thread::scope(|scope| {
+                let prog_handle = scope.spawn(|| {
+                    Program::link_with_pool(
+                        &index,
+                        &catalog,
+                        catalog.objects.iter().map(|o| o.guid),
+                        &pool,
+                    )
+                });
+                let anim_handle =
+                    scope.spawn(|| Animations::load_with_pool(&install, &index, &pool));
+                let hud_shared_handle = scope.spawn(|| HudShared::load(&index, &catalog, &pool));
+                let person_types = catalog
+                    .objects
+                    .iter()
+                    .filter(|o| o.kind == 2)
+                    .map(|o| o.guid);
+                let people_res = ContentPeople::load_each_with_registry_result(
+                    &index,
+                    &catalog,
+                    person_types,
+                    registry_res,
+                    &pool,
+                );
+                (
+                    prog_handle.join().expect("program link worker panicked"),
+                    anim_handle.join().expect("animations worker panicked"),
+                    people_res,
+                    hud_shared_handle
+                        .join()
+                        .expect("hud shared worker panicked"),
+                )
+            });
+
+        let preloaded_cast = people_res
+            .as_ref()
+            .ok()
+            .map(|(people_types, unresolved_people)| PreloadedCast {
+                skeleton_names: people_types
+                    .skeletons
+                    .iter()
+                    .map(|(&guid, skeleton)| (guid, skeleton.name.clone()))
+                    .collect(),
+                unresolved: unresolved_people.clone(),
+            });
+        // `Lot::boot` keeps a loaded `Wardrobe` even if `PeopleLibrary::scan`
+        // fails, and records a `ContentAssets::scan` error in `Wardrobe::unread`;
+        // `People::open` reports either error later after `Hud::open`.
+        let (wardrobe, people_assets_for_cast) = people_assets_res;
+
+        // Stage C: run the deterministic lot boot from preloaded content, then
+        // assemble HUD portraits and 3D people in parallel against the booted world.
+        let mut lot = Lot::load_preloaded(
             house,
             &options.answers,
             options.frames.clone(),
-            initial_centre,
+            PreloadedBoot {
+                install: &install,
+                neighborhood: &neighborhood,
+                characters: characters.as_deref(),
+                index: &index,
+                catalog: Arc::clone(&catalog),
+                pool: &pool,
+                file: Some(house_file),
+                program: program_res,
+                animations: animations_res,
+                people: people_res,
+                icon_frames: icon_frames_res,
+                wardrobe,
+                ordered_wardrobe,
+                surfaces: surfaces_res,
+                default_character_name: default_name,
+                view_centre: initial_centre,
+            },
         )
         .map_err(|e| format!("{}: {e}", house.display()))?;
         // The player answers a dialog when it is shown.
@@ -265,13 +479,47 @@ impl Game {
         let lot_shape = sims_render::Lot::from_world(lot.world())
             .map_err(|e| e.to_string())?
             .with_floor_rotation(lot.floor_rotation());
-        let mut hud = Hud::open(
-            &options.install,
-            house,
-            &opened.assets,
-            lot.world(),
-            lot.program().autonomy_constants().friendship_threshold,
-        )?;
+        let friendship = lot.program().autonomy_constants().friendship_threshold;
+        let world = lot.world();
+        let (hud_res, people_open_res) = std::thread::scope(|scope| {
+            let people_handle = scope.spawn(|| -> Result<People, String> {
+                let (content_assets, people_library) = people_assets_for_cast?;
+                let cast = Cast::from_shared(
+                    install.clone(),
+                    Arc::clone(&index),
+                    Arc::clone(&catalog),
+                    preloaded_cast,
+                    Arc::clone(&pool),
+                )?;
+                let mut people = People::from_inner(sims_people::People::new(
+                    content_assets,
+                    people_library,
+                    cast,
+                ));
+                people.refresh(world);
+                Ok(people)
+            });
+            let hud_res = hud_static_res.and_then(|hud_static| {
+                Hud::from_preloaded(
+                    &install,
+                    house,
+                    &neighborhood,
+                    &assets,
+                    world,
+                    friendship,
+                    hud_static,
+                    hud_shared_res,
+                    &pool,
+                )
+            });
+            (
+                hud_res,
+                people_handle
+                    .join()
+                    .expect("people refresh worker panicked"),
+            )
+        });
+        let mut hud = hud_res?;
         hud.sync_clock_blink(lot.world(), 0);
         // `0x4e6704 -> 0x432220`: apply persisted `UserData/Options.iff` Free
         // Will preference to lot global 30 when it differs from the lot file.
@@ -279,7 +527,9 @@ impl Game {
         if lot.world().globals.get(30).copied().unwrap_or(1) != i16::from(free_will) {
             let _ = lot.set_free_will(free_will);
         }
-        let mut people = People::open(&options.install, house)?;
+        let mut people = people_open_res?;
+        // In case `set_free_will` changed anything (it only sets global 30),
+        // refreshing is an instant no-op when people are unchanged.
         people.refresh(lot.world());
         let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
         let drawn_camera = view.camera;
@@ -294,7 +544,7 @@ impl Game {
         let mut game = Self {
             lot,
             lot_shape,
-            assets: opened.assets,
+            assets,
             view,
             people,
             hud,
@@ -351,6 +601,306 @@ impl Game {
             game.set_mode(Mode::Buy);
         }
         Ok(game)
+    }
+
+    /// Boots `house` from a REDB [`sims_sim::neighborhood_store::NeighborhoodStore`]
+    /// via [`sims_vm::lifecycle::enter_lot`], without reading or mutating any
+    /// `UserData` house files on disk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_from_store(
+        install_root: &Path,
+        store: &sims_sim::neighborhood_store::NeighborhoodStore,
+        neighborhood_id: &str,
+        house: u32,
+        answers: &[u8],
+        play: bool,
+        frames: Frames,
+    ) -> Result<Self, String> {
+        let snapshot = store
+            .load_lot_snapshot(neighborhood_id, house)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {neighborhood_id:?} not found in store"))?;
+        let members = snapshot
+            .neighborhood
+            .family_in(house)
+            .map(|(_, f)| f.members.clone())
+            .unwrap_or_default();
+        let pool = Arc::new(ArchivePool::new());
+        let character_files = &snapshot.character_files;
+        let (lot_res, render_and_index_res, hud_static_res, people_assets_res) =
+            std::thread::scope(|scope| {
+                let assets_handle = scope.spawn(|| -> Result<_, String> {
+                    let install = Install::detect(install_root).map_err(|e| e.to_string())?;
+                    let (idx_cat_res, base_res, (floor_plugins, wall_plugins)) =
+                        std::thread::scope(|inner| {
+                            let plugins_handle =
+                                inner.spawn(|| Surfaces::plugins_with_pool(&install, &pool));
+                            let base_handle = inner
+                                .spawn(|| BaseAssets::load(&install).map_err(|e| e.to_string()));
+                            let idx_cat_res = (|| -> Result<_, String> {
+                                let mut index =
+                                    Index::build(&install).map_err(|e| e.to_string())?;
+                                if !character_files.is_empty() {
+                                    index
+                                        .add_character_files(character_files)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                                let catalog = Catalog::build_with_pool(&index, &pool)
+                                    .map_err(|e| e.to_string())?;
+                                let index = Arc::new(index);
+                                let catalog = Arc::new(catalog);
+                                let hud_shared_res = HudShared::load(&index, &catalog, &pool);
+                                Ok((index, catalog, hud_shared_res))
+                            })();
+                            (
+                                idx_cat_res,
+                                base_handle.join().expect("base assets worker panicked"),
+                                plugins_handle
+                                    .join()
+                                    .expect("surface plugins worker panicked"),
+                            )
+                        });
+                    let (index, catalog, hud_shared_res) = idx_cat_res?;
+                    let base = base_res?;
+                    Ok((
+                        install,
+                        index,
+                        catalog,
+                        hud_shared_res,
+                        base,
+                        floor_plugins,
+                        wall_plugins,
+                    ))
+                });
+                let hud_handle = scope.spawn(|| -> Result<HudStatic, String> {
+                    let install = Install::detect(install_root).map_err(|e| e.to_string())?;
+                    HudStatic::load(&install, Arc::clone(&pool))
+                });
+                let people_handle = scope.spawn(|| -> Result<_, String> {
+                    let content_assets = ContentAssets::scan(install_root)?;
+                    let people_library = PeopleLibrary::scan_with_pool(&content_assets, &pool)?;
+                    Ok((content_assets, people_library))
+                });
+                let lot_res = sims_vm::lifecycle::enter_lot(
+                    install_root,
+                    store,
+                    neighborhood_id,
+                    house,
+                    answers,
+                    frames,
+                )
+                .map_err(|e| format!("{neighborhood_id} House{house:02}: {e}"));
+                (
+                    lot_res,
+                    assets_handle.join().expect("store assets worker panicked"),
+                    hud_handle.join().expect("hud static worker panicked"),
+                    people_handle.join().expect("people assets worker panicked"),
+                )
+            });
+        let mut lot = lot_res?;
+        lot.wait_for_answers();
+        let stopped = lot
+            .load_report()
+            .stopped
+            .as_ref()
+            .map(|s| format!("The load stopped, so the lot cannot run: {s}"));
+        let (install, index, catalog, hud_shared_res, base_assets, floor_plugins, wall_plugins) =
+            render_and_index_res?;
+        let assets = sims_render::Assets::from_base(
+            base_assets,
+            floor_plugins,
+            wall_plugins,
+            Arc::clone(&index),
+            Arc::clone(&catalog),
+            Arc::clone(&pool),
+        );
+        let lot_shape = sims_render::Lot::from_world(lot.world())
+            .map_err(|e| e.to_string())?
+            .with_floor_rotation(lot.floor_rotation());
+        let friendship = lot.program().autonomy_constants().friendship_threshold;
+        let world = lot.world();
+        let (hud_res, people_open_res) = std::thread::scope(|scope| {
+            let people_handle = scope.spawn(|| -> Result<People, String> {
+                let (content_assets, people_library) = people_assets_res?;
+                let cast = Cast::from_shared(
+                    install.clone(),
+                    Arc::clone(&index),
+                    Arc::clone(&catalog),
+                    None,
+                    Arc::clone(&pool),
+                )?;
+                let mut people = People::from_inner(sims_people::People::new(
+                    content_assets,
+                    people_library,
+                    cast,
+                ));
+                people.refresh(world);
+                Ok(people)
+            });
+            let hud_res = hud_static_res.and_then(|hud_static| {
+                Hud::from_preloaded_with_members(
+                    &install,
+                    members,
+                    &assets,
+                    world,
+                    friendship,
+                    hud_static,
+                    hud_shared_res,
+                    &pool,
+                )
+            });
+            (
+                hud_res,
+                people_handle
+                    .join()
+                    .expect("people refresh worker panicked"),
+            )
+        });
+        let mut hud = hud_res?;
+        hud.sync_clock_blink(lot.world(), 0);
+        let free_will = hud.controls.options.play.free_will;
+        if lot.world().globals.get(30).copied().unwrap_or(1) != i16::from(free_will) {
+            let _ = lot.set_free_will(free_will);
+        }
+        let mut people = people_open_res?;
+        people.refresh(lot.world());
+        let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
+        let drawn_camera = view.camera;
+        let has_family = lot.world().globals.get(9).copied().unwrap_or(0) != 0;
+        let is_residential = lot.lot_zoning().unwrap_or(1) == 1
+            && !matches!(lot.lot_id(), 21..=30 | 40..=48 | 81..=89 | 93..=98);
+        let edit_mode = if has_family && is_residential {
+            false
+        } else {
+            lot.world().globals.get(32).copied().unwrap_or(0) == 1
+                || (!has_family
+                    && (lot.lot_zoning().unwrap_or(0) != 0
+                        || matches!(lot.lot_id(), 21..=30 | 40..=48 | 81..=99)))
+        };
+        let mut pace = Pace::default();
+        if let Some(speed) = pace::shown(lot.world()) {
+            pace.speed = speed;
+        }
+        let mut game = Self {
+            lot,
+            lot_shape,
+            assets,
+            view,
+            people,
+            hud,
+            pace,
+            play,
+            stopped,
+            errors: Errors::default(),
+            sounds: VecDeque::new(),
+            ui_effects: VecDeque::new(),
+            highlighted_buttons: BTreeSet::new(),
+            highlighted_portraits: BTreeSet::new(),
+            highlighted_relationships: BTreeSet::new(),
+            pointer: None,
+            reached: None,
+            listed: None,
+            highlighted: None,
+            buy_selected: None,
+            buy_cursor: None,
+            buy_in_house: false,
+            buy_last_guid: None,
+            buy_facing: None,
+            buy_dragging: None,
+            buy_grab_offset: [0, 0],
+            buy_commit_on_release: false,
+            live_panel_expanded: true,
+            shift_held: false,
+            ctrl_held: false,
+            wall_cursor: None,
+            build_drag: None,
+            build_preview_shape: None,
+            buy_moneyback_us: None,
+            buy_delete_us: None,
+            note: None,
+            clock_us: 0,
+            drawn_us: 0,
+            blink_dirty: false,
+            dirty: false,
+            restore_dirty_on_quit_cancel: false,
+            pending_after_save_note: None,
+            edit_mode,
+            edge_scroll_rem: [0, 0],
+            canvas: Canvas::new(1, 1, [0, 0, 0]),
+            lot_cache: sims_render::LotCache::new(),
+            drawn_camera,
+            lot_depth: Vec::new(),
+            people_ids: sims_render::Ids::default(),
+        };
+        game.sync_view();
+        if edit_mode && game.stopped.is_none() {
+            game.lot.set_edit_budget(true);
+            game.set_mode(Mode::Buy);
+        }
+        Ok(game)
+    }
+
+    /// Saves the active lot back to its REDB [`sims_sim::neighborhood_store::NeighborhoodStore`]
+    /// via [`sims_vm::lifecycle::save_and_leave_lot`] (stripping any unpaid
+    /// Buy Mode placement cursor first).
+    pub fn save_to_neighborhood(
+        &mut self,
+        install_root: &Path,
+        store: &sims_sim::neighborhood_store::NeighborhoodStore,
+        neighborhood_id: &str,
+    ) -> Result<sims_vm::lifecycle::SaveReport, String> {
+        let result = match self.buy_cursor.as_ref() {
+            Some(cursor) => sims_vm::lifecycle::save_and_leave_lot_without_buy_cursor(
+                install_root,
+                store,
+                neighborhood_id,
+                &mut self.lot,
+                cursor,
+            ),
+            None => sims_vm::lifecycle::save_and_leave_lot(
+                install_root,
+                store,
+                neighborhood_id,
+                &mut self.lot,
+            ),
+        }
+        .map_err(|e| e.to_string());
+        let followup = self.pending_after_save_note.take();
+        match &result {
+            Ok(_) => {
+                self.dirty = false;
+                self.note = Some(match followup {
+                    Some(extra) => format!("Saved after tick {}. {extra}", self.lot.ticks()),
+                    None => format!("Saved after tick {}.", self.lot.ticks()),
+                });
+            }
+            Err(e) => {
+                self.note = Some(format!("The lot was not saved: {e}"));
+            }
+        }
+        result
+    }
+
+    /// Whether the player is currently holding an interactive tool, drag,
+    /// slider, or modal dialog that benefits from display-refresh redraws.
+    pub fn is_actively_interacting(&self) -> bool {
+        self.buy_cursor.is_some()
+            || self.build_drag.is_some()
+            || self.wall_cursor.is_some()
+            || self.hud.dragging_slider()
+            || self.hud.dragging_dialog_entry()
+            || self.has_dialog()
+    }
+
+    /// Current lot geometry and render assets for capturing map thumbnails on save.
+    pub fn render_parts_mut(
+        &mut self,
+    ) -> (
+        &sims_sim::World,
+        &sims_render::Lot,
+        &mut sims_render::Assets,
+    ) {
+        (self.lot.world(), &self.lot_shape, &mut self.assets)
     }
 
     /// The lot, for reading.
@@ -2564,10 +3114,8 @@ impl Game {
                     Outcome::redraw()
                 }
                 UiCamera::Photo => Outcome {
-                    redraw: false,
                     photo: true,
-                    save: false,
-                    quit: false,
+                    ..Outcome::default()
                 },
                 UiCamera::Roof => {
                     self.note = Some("Roofs are not drawn yet.".into());
@@ -2649,8 +3197,7 @@ impl Game {
                                 return Outcome {
                                     redraw: true,
                                     save: true,
-                                    quit: false,
-                                    photo: false,
+                                    ..Outcome::default()
                                 };
                             }
                             (OptionsDialog::SaveCardQuit, 1) => {
@@ -2668,7 +3215,7 @@ impl Game {
                                     redraw: true,
                                     save: true,
                                     quit: true,
-                                    photo: false,
+                                    ..Outcome::default()
                                 };
                             }
                             (OptionsDialog::ConfirmSaveBeforeQuit, 1) => {
@@ -2680,22 +3227,24 @@ impl Game {
                             }
                             (OptionsDialog::SaveCardNeighborhood, 0) => {
                                 apply_save_card(&mut self.lot, &mut self.dirty);
-                                let note = "Neighborhood view is not ported yet.";
+                                let note = "Returning to Neighborhood.";
                                 self.pending_after_save_note = Some(note);
                                 self.note = Some(note.into());
                                 return Outcome {
                                     redraw: true,
                                     save: true,
+                                    neighborhood: true,
                                     ..Outcome::default()
                                 };
                             }
                             (OptionsDialog::ConfirmSaveBeforeNeighborhood, 0) => {
-                                let note = "Neighborhood view is not ported yet.";
+                                let note = "Returning to Neighborhood.";
                                 self.pending_after_save_note = Some(note);
                                 self.note = Some(note.into());
                                 return Outcome {
                                     redraw: true,
                                     save: true,
+                                    neighborhood: true,
                                     ..Outcome::default()
                                 };
                             }
@@ -2705,7 +3254,12 @@ impl Game {
                                 1,
                             ) => {
                                 self.pending_after_save_note = None;
-                                self.note = Some("Neighborhood view is not ported yet.".into());
+                                self.note = None;
+                                return Outcome {
+                                    redraw: true,
+                                    neighborhood: true,
+                                    ..Outcome::default()
+                                };
                             }
                             (OptionsDialog::ConfirmResetTutorial, 0) => {
                                 // `0x4f25ea -> 0x4f1a11..0x4f1ac6`: confirming
@@ -2814,10 +3368,11 @@ impl Game {
                     // `0x5170f0..0x51713c`: prompts only when `dirty && can_save`;
                     // edit mode uses the save card (`0x517c03(1)`), ordinary lots
                     // fall back to `0x4f1a11` (`STR# 153[3..4]`).
-                    OptionsAction::Neighborhood if !self.dirty || !can_save => {
-                        self.note = Some("Neighborhood view is not ported yet.".into());
-                        Outcome::redraw()
-                    }
+                    OptionsAction::Neighborhood if !self.dirty || !can_save => Outcome {
+                        redraw: true,
+                        neighborhood: true,
+                        ..Outcome::default()
+                    },
                     OptionsAction::Neighborhood => {
                         let dialog = if self.edit_mode {
                             OptionsDialog::SaveCardNeighborhood
