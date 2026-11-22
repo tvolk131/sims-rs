@@ -1161,7 +1161,13 @@ impl App {
         self.session.render();
         let path = PathBuf::from(format!("sims-game-{}.png", self.photos));
         self.photos += 1;
-        match std::fs::write(&path, png::encode(self.session.canvas())) {
+        let bytes = if let Some(game) = self.session.game() {
+            let cropped = game.capture_snapshot_canvas();
+            png::encode(&cropped)
+        } else {
+            png::encode(self.session.canvas())
+        };
+        match std::fs::write(&path, bytes) {
             Ok(()) => eprintln!("saved {}", path.display()),
             Err(e) => eprintln!("could not save {}: {e}", path.display()),
         }

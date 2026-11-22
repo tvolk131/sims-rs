@@ -462,6 +462,13 @@ fn native_camera_panel_wires_all_8_buttons_strings_album_and_clean_capture() {
         shell.game().unwrap().camera_state().size,
         SnapshotSize::Large
     );
+    shell.render();
+    let large_cap = shell.game().unwrap().capture_snapshot_canvas();
+    assert_eq!(
+        (large_cap.width, large_cap.height),
+        (640, 480),
+        "Large SnapshotSize must crop captured PNG canvas to 640x480"
+    );
 
     // Toggle snapshot quality -> Low (keeps CameraPanel open).
     let low_pt = [
@@ -534,9 +541,16 @@ fn neighborhood_hover_roof_fade_transitions_over_300ms_and_settles_idle() {
         .expect("another neighborhood lot");
     let other_pt = find_lot_hit_point(&shell, other_lot).expect("other lot hit point");
 
-    // 1. Static clock_us == 0 baseline render (deterministic).
+    // 1. Static clock_us == 0 baseline render (deterministic) & zero-clock hover guard.
     shell.render();
     let idle_pixels = shell.canvas().color.clone();
+    shell.hover(goth_pt);
+    assert!(
+        !shell.has_active_fades(),
+        "clock_us == 0 hover must never start a hidden fade ramp"
+    );
+    shell.leave();
+    assert!(!shell.has_active_fades());
 
     // 2. Advance presentation clock so live 300 ms cross-fade activates.
     shell.tick_shell(100_000); // now = 100 ms
@@ -757,11 +771,16 @@ fn temporal_ui_animations_advance_when_clock_positive_and_snap_at_clock_zero() {
         "newly queued interaction icon must slide in over 500 ms"
     );
     let sliding_icon = game.queue().icons[0].clone();
-    // Mid-slide click on the sliding icon must be ignored by `Queue::at_clickable` (`0x4cb406`).
+    // Mid-slide click on the sliding icon is covered by the HUD (so it does
+    // not activate the lot behind it) while ignoring cancellation (`0x4cb406`).
     let icon_pt = [
         sliding_icon.rect.x + sliding_icon.rect.width / 2,
         sliding_icon.rect.y + sliding_icon.rect.height / 2,
     ];
+    assert!(
+        game.over_panel(icon_pt),
+        "visible mid-slide queue icon must still intercept pointer hits"
+    );
     game.press(icon_pt);
     game.release(icon_pt);
     game.render();

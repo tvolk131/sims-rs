@@ -1308,8 +1308,13 @@ impl Hud {
         if matches!(self.ui_dialog, Some((OptionsDialog::SpecialBook, _))) {
             self.ui_dialog = None;
             self.dialog = None;
-            self.dialog_state = DialogState::default();
-            self.dialog_fade = DialogFadeState::hidden();
+            if let Some((vm_msg, _)) = &self.message {
+                self.dialog_state = DialogState::for_message(vm_msg);
+                self.start_dialog_fade();
+            } else {
+                self.dialog_state = DialogState::default();
+                self.dialog_fade = DialogFadeState::hidden();
+            }
         }
     }
 
@@ -1703,8 +1708,13 @@ impl Hud {
     ) -> Option<(OptionsDialog, u8, Option<String>, Option<String>)> {
         let (kind, message) = self.ui_dialog.take()?;
         self.dialog = None;
-        self.dialog_state = DialogState::default();
-        self.dialog_fade = DialogFadeState::hidden();
+        if let Some((vm_msg, _)) = &self.message {
+            self.dialog_state = DialogState::for_message(vm_msg);
+            self.start_dialog_fade();
+        } else {
+            self.dialog_state = DialogState::default();
+            self.dialog_fade = DialogFadeState::hidden();
+        }
         Some((kind, button, message.entry, message.secondary_entry))
     }
 
@@ -2415,12 +2425,12 @@ impl Hud {
             .pointer
             .is_some_and(|[px, py]| rect.contains(px, py));
         let pressed = self.pressed_camera_snapshot;
-        let (bg, border, fg) = if pressed && hovered {
-            ([30, 88, 176], [0, 255, 255], [0, 255, 255])
+        let (bg, border) = if pressed && hovered {
+            ([30, 88, 176], [0, 255, 255])
         } else if hovered {
-            ([26, 62, 146], [136, 178, 232], [255, 255, 255])
+            ([26, 62, 146], [136, 178, 232])
         } else {
-            ([16, 36, 108], [88, 120, 204], [195, 205, 205])
+            ([16, 36, 108], [88, 120, 204])
         };
         frame.fill(rect, bg);
         frame.fill(Rect::new(rect.x, rect.y, rect.width, 1), border);
@@ -2433,7 +2443,6 @@ impl Hud {
             Rect::new(rect.x + rect.width - 1, rect.y, 1, rect.height),
             border,
         );
-        let mut text_left = rect.x + 8;
         if let Some(strip) = self.art.image(hud::id::PHOTO)
             && strip.width >= 4
             && strip.height > 0
@@ -2452,17 +2461,9 @@ impl Hud {
                 cell_w as i32,
                 strip.height as i32,
             );
-            let dx = rect.x + 6;
+            let dx = rect.x + (rect.width - cell_w as i32) / 2;
             let dy = rect.y + (rect.height - strip.height as i32) / 2;
             frame.draw(strip, src, [dx, dy]);
-            text_left = dx + cell_w as i32 + 6;
-        }
-        if rect.width >= 88
-            && let Some(font) = self.art.font(10).or_else(|| self.art.font(9))
-        {
-            let label = "Snap";
-            let ty = rect.y + (rect.height - font.line_height) / 2;
-            font.draw(frame, label, [text_left, ty], fg);
         }
     }
 
@@ -2524,18 +2525,7 @@ impl Hud {
             || (self.controls.mode == Mode::Build
                 && self.controls.expanded
                 && self.build_layout.covers(point))
-            || (self.controls.mode == Mode::Live
-                && if self.last_clock_us > 0 {
-                    self.queue
-                        .at_clickable(
-                            point,
-                            &self.queue_slide,
-                            (self.last_clock_us / 1_000) as u32,
-                        )
-                        .is_some()
-                } else {
-                    self.queue.at(point).is_some()
-                })
+            || (self.controls.mode == Mode::Live && self.queue.at(point).is_some())
     }
 
     /// The selected Sim's actions as last drawn.

@@ -27,12 +27,12 @@ This decision records how `crates/sims-game/` wires both PR #373 and PR #371 end
 2. **Native `cWinCamera` Subpanel (`sims_ui::camera::CameraPanel`):**
    - Replaced PR #370's interim Camera sub-strip in `Hud` with `sims_ui::camera::CameraPanel`, loading `sims_ui::camera::{RESOURCES, HELP_RESOURCES}` and `CameraStrings` (`STR# 140`) in `HudStatic::load`.
    - Draws `CameraPatch.bmp` (`2035`) over the cluster at `[0, height - 183] + [165, 83]` and all 8 native buttons strictly right of `CLUSTER[0]` (`x >= 220`).
-   - Wires size (`Small`/`Medium`/`Large`) and quality (`Low`/`Medium`/`High`) toggles in place, `CamViewAlbum` (`1105`) to open Photo Album while closing `CameraPanel`, Quick Tips help balloons (`1109`/`1110`), house-viewport click + auxiliary `CamSnap` button strictly right of `CamViewAlbum` to close `CameraPanel` before clean PNG capture, and clean dismissal on Escape / Back / mode switches while preserving `F10`.
+   - Wires size (`Small`/`Medium`/`Large`) and quality (`Low`/`Medium`/`High`) toggles in place, applies the selected `SnapshotSize` centered crop in `Game::capture_snapshot_canvas()` / `App::photo()`, wires `CamViewAlbum` (`1105`) to open Photo Album while closing `CameraPanel`, Quick Tips help balloons (`1109`/`1110`), house-viewport click + icon-only auxiliary `CamSnap` button strictly right of `CamViewAlbum` to close `CameraPanel` before clean PNG capture, and clean dismissal on Escape / Back / mode switches while preserving `F10`.
 
 3. **300 ms Neighborhood Hover Roof Cross-Fade (`HoverFadeState`):**
    - `NeighborhoodShell` owns `HoverFadeState` driven by presentation clock `clock_us / 1_000`.
-   - When `clock_us == 0`, `RenderOptions` uses instantaneous `hover_roof_fade = 1.0` for bit-exact static/headless renders.
-   - When `clock_us > 0`, `HoverFadeState::apply_to` populates `lot_roof_fades` for simultaneous multi-lot fades and mouse-leave fade-back-in. `has_active_fades()` keeps `RedrawPacer` at display cadence only while transitions are running, emits one final landed frame on settlement, prunes finished fade-out ramps, and stops waking at idle.
+   - When `clock_us == 0`, `RenderOptions` uses instantaneous `hover_roof_fade = 1.0` and zero-clock hover never starts a hidden animation ramp, keeping static/headless renders bit-exact.
+   - When `clock_us > 0`, `HoverFadeState::apply_to` populates `lot_roof_fades` for simultaneous multi-lot fades and mouse-leave fade-back-in. `has_active_fades()` drives display-cadence redraws only while transitions are running, emits one final landed frame on settlement, prunes finished fade-out ramps, and stops fade-driven redraws once settled (keeping the main event loop's periodic 5 ms shell tick lightweight).
 
 4. **Temporal UI Animations (`BalloonFadeState`, `DialogFadeState`, `QueueSlideState`):**
    - Wired in `Hud::draw_for_lot_at(..., clock_us)` and `NeighborhoodShell` (for shell dialogs):

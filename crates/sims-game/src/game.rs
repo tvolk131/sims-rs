@@ -312,10 +312,14 @@ pub struct Game {
     purchased_shop_items: BTreeSet<String>,
     /// Currently presented VM special panel (`Dialog` kinds `5..=15`), if any.
     active_special_panel: Option<ActiveSpecialPanel>,
-    /// Co-op special-panel dialog ID already answered locally, kept until the
-    /// lockstep commit clears `Lot::asking_special_panel()` so intermediate
-    /// frames do not reopen the modal.
-    submitted_coop_special_panel: Option<NetDialogId>,
+    /// Co-op special-panel dialog ID already answered locally plus pump count
+    /// elapsed since submission; cleared when the lockstep commit resolves or
+    /// rejects the panel, or after a bounded retry wait if host ingress drops
+    /// the command.
+    submitted_coop_special_panel: Option<(NetDialogId, u32)>,
+    /// Lazily cached native ordered wardrobe (`ImportWardrobe`) matching
+    /// `sims-vm` pet/human skin indices for special pickers (kinds 6, 9, 14).
+    ordered_wardrobe: Option<sims_content::ImportWardrobe>,
     /// Destination lot chosen via a VM special lot picker (`5, 7, 8, 11, 13`)
     /// awaiting `NeighborhoodShell` travel transition (`depart_to_destination`).
     pending_travel_lot: Option<(SpecialPanelRequest, u32)>,
@@ -774,6 +778,7 @@ impl Game {
             purchased_shop_items: BTreeSet::new(),
             active_special_panel: None,
             submitted_coop_special_panel: None,
+            ordered_wardrobe: None,
             pending_travel_lot: None,
             special_lot_catalog: Vec::new(),
             ui_animating_prev: false,
@@ -1057,6 +1062,7 @@ impl Game {
             purchased_shop_items: BTreeSet::new(),
             active_special_panel: None,
             submitted_coop_special_panel: None,
+            ordered_wardrobe: None,
             pending_travel_lot: None,
             special_lot_catalog: Vec::new(),
             ui_animating_prev: false,
@@ -1308,6 +1314,7 @@ impl Game {
             purchased_shop_items: BTreeSet::new(),
             active_special_panel: None,
             submitted_coop_special_panel: None,
+            ordered_wardrobe: None,
             pending_travel_lot: None,
             special_lot_catalog: Vec::new(),
             ui_animating_prev: false,
@@ -2790,6 +2797,20 @@ impl Game {
                     self.view.masks_rebuilt(update.masks_rebuilt);
                     self.keep_sounds(update.sounds);
                     self.keep_ui_effects(update.ui_effects);
+                    for (req, resp) in update.special_panels_answered {
+                        if matches!(
+                            req,
+                            SpecialPanelRequest::DowntownLotPicker
+                                | SpecialPanelRequest::VacationLotPicker { .. }
+                                | SpecialPanelRequest::OldTownLotPicker { .. }
+                                | SpecialPanelRequest::StudioTownLotPicker { .. }
+                                | SpecialPanelRequest::MagicTownLotPicker { .. }
+                        ) && let SpecialPanelResponse::Lot(Some(lot_id)) = resp
+                            && lot_id > 0
+                        {
+                            self.pending_travel_lot = Some((req, lot_id as u32));
+                        }
+                    }
                 }
                 // The tick shows a dialog or special panel: it runs once it is
                 // answered, and no time is owed from before the wait.
@@ -4983,7 +5004,12 @@ impl Game {
                                 self.note = Some("Tutorial reset is not ported yet.".into());
                             }
                             (OptionsDialog::SpecialBook, _) => {
-                                self.answer_special_panel(SpecialPanelResponse::Dismissed);
+                                if !self.answer_special_panel(SpecialPanelResponse::Dismissed) {
+                                    // Restore the book modal if co-op submission failed so
+                                    // the blocking panel never becomes invisible.
+                                    self.active_special_panel = None;
+                                    self.sync_special_panel();
+                                }
                             }
                             _ => {
                                 self.note = None;
@@ -7771,26 +7797,37 @@ impl Game {
     /// books (Spellbook 12 & Cookbook 15) — present clean native modals in both
     /// single-player and co-op sessions.
     pub fn sync_special_panel(&mut self) {
-        let Some(asking) = self.lot.asking_special_panel().cloned() else {
-            self.submitted_coop_special_panel = None;
-            self.close_special_panel_ui();
-            return;
-        };
-        let tick = asking.shown.tick;
-        let request = asking.shown.request.clone();
+        // Borrow first to avoid cloning the paused VM world on unchanged frames.
         let coop_dialog_id = self
             .lot
             .coop()
             .and_then(|c| c.active_special_panel.as_ref().map(|(id, _)| *id));
-        if coop_dialog_id.is_some() && self.submitted_coop_special_panel == coop_dialog_id {
+        let unchanged = {
+            let Some(asking) = self.lot.asking_special_panel() else {
+                self.submitted_coop_special_panel = None;
+                self.close_special_panel_ui();
+                return;
+            };
+            if coop_dialog_id.is_some()
+                && self.submitted_coop_special_panel.map(|(id, _)| id) == coop_dialog_id
+            {
+                return;
+            }
+            self.active_special_panel.as_ref().is_some_and(|a| {
+                a.tick == asking.shown.tick
+                    && a.request == asking.shown.request
+                    && a.coop_dialog_id == coop_dialog_id
+            })
+        };
+        if unchanged {
             return;
         }
         self.submitted_coop_special_panel = None;
-        if self.active_special_panel.as_ref().is_some_and(|a| {
-            a.tick == tick && a.request == request && a.coop_dialog_id == coop_dialog_id
-        }) {
+        let Some(asking) = self.lot.asking_special_panel().cloned() else {
             return;
-        }
+        };
+        let tick = asking.shown.tick;
+        let request = asking.shown.request.clone();
         self.close_menu();
         self.hud.close_camera_strip();
         self.hud.close_special_book_dialog();
@@ -7824,7 +7861,7 @@ impl Game {
                     request,
                     coop_dialog_id,
                     shop_kind,
-                    Some(title),
+                    title,
                     None,
                     items,
                     responses,
@@ -7845,7 +7882,8 @@ impl Game {
                     ShopKind::DowntownBoutique(category)
                 };
                 let shopper = self.person_display_name(&asking.world, *person);
-                let (items, responses) = self.build_wardrobe_picker_items(*mode);
+                let (items, responses) =
+                    self.build_wardrobe_picker_items(&asking.world, *person, *mode);
                 self.open_special_picker(
                     tick,
                     request,
@@ -7859,7 +7897,7 @@ impl Game {
             }
             SpecialPanelRequest::PetPicker { pet } => {
                 let shopper = self.person_display_name(&asking.world, *pet);
-                let (items, responses) = self.build_pet_picker_items();
+                let (items, responses) = self.build_pet_picker_items(&asking.world, *pet);
                 self.open_special_picker(
                     tick,
                     request,
@@ -7872,6 +7910,20 @@ impl Game {
                 );
             }
             SpecialPanelRequest::CallNeighbor { caller_neighbor } => {
+                let caller_name = asking
+                    .world
+                    .neighbors
+                    .slots
+                    .iter()
+                    .flatten()
+                    .find(|r| r.id == *caller_neighbor)
+                    .and_then(|r| {
+                        self.lot
+                            .character_names()
+                            .get(&r.guid)
+                            .cloned()
+                            .or_else(|| self.hud.name(r.guid).map(str::to_owned))
+                    });
                 let (items, responses) =
                     self.build_call_neighbor_items(&asking.world, *caller_neighbor);
                 self.open_special_picker(
@@ -7879,7 +7931,7 @@ impl Game {
                     request,
                     coop_dialog_id,
                     ShopKind::DowntownBoutique(WardrobeCategory::Everyday),
-                    Some("Phone".into()),
+                    caller_name,
                     None,
                     items,
                     responses,
@@ -7887,13 +7939,13 @@ impl Game {
             }
             SpecialPanelRequest::CharmTransform { person } => {
                 let shopper = self.person_display_name(&asking.world, *person);
-                let (items, responses) = self.build_charm_transform_items();
+                let (items, responses) = self.build_charm_transform_items(&asking.world, *person);
                 self.open_special_picker(
                     tick,
                     request,
                     coop_dialog_id,
                     ShopKind::MagicVendor,
-                    Some("Charm Transform".into()),
+                    None,
                     shopper,
                     items,
                     responses,
@@ -7974,30 +8026,20 @@ impl Game {
                 self.note = Some(format!("Special panel response was not sent: {e}"));
                 return false;
             }
-            self.submitted_coop_special_panel = Some(dialog_id);
+            self.submitted_coop_special_panel = Some((dialog_id, 0));
             self.close_special_panel_ui();
             return true;
         }
-        if let Err(e) = self.lot.answer_special_panel(response.clone()) {
+        if let Err(e) = self.lot.answer_special_panel(response) {
             self.note = Some(format!("Special panel response was not taken: {e}"));
             return false;
         }
         self.close_special_panel_ui();
         // Replay the paused tick immediately with the chosen response, just
-        // like `Game::answer` does for ordinary dialogs.
+        // like `Game::answer` does for ordinary dialogs. Committed destination
+        // lot picks are recorded into `pending_travel_lot` inside `run_while`
+        // from `Update::special_panels_answered` only when the tick commits.
         self.run(1);
-        if matches!(
-            request,
-            SpecialPanelRequest::DowntownLotPicker
-                | SpecialPanelRequest::VacationLotPicker { .. }
-                | SpecialPanelRequest::OldTownLotPicker { .. }
-                | SpecialPanelRequest::StudioTownLotPicker { .. }
-                | SpecialPanelRequest::MagicTownLotPicker { .. }
-        ) && let SpecialPanelResponse::Lot(Some(lot_id)) = response
-            && lot_id > 0
-        {
-            self.pending_travel_lot = Some((request, lot_id as u32));
-        }
         self.sync_special_panel();
         true
     }
@@ -8010,8 +8052,19 @@ impl Game {
         match cmd {
             ShopCommand::Cancel => {
                 let cancel = special_panel_cancel_response(&active.request);
-                self.hud.play(crate::hud::CLICK);
-                self.answer_special_panel(cancel);
+                if self.answer_special_panel(cancel) {
+                    self.hud.play(crate::hud::CLICK);
+                } else {
+                    self.hud.play(crate::hud::ERROR);
+                    // Re-open the picker if co-op submission failed so the
+                    // blocking special panel never stays hidden.
+                    if self.shop_snapshot.is_some() {
+                        self.shop_dialog.open();
+                    } else {
+                        self.active_special_panel = None;
+                        self.sync_special_panel();
+                    }
+                }
                 let sounds = self.hud.take_sounds();
                 self.keep_sounds(sounds);
                 Outcome::redraw()
@@ -8032,8 +8085,17 @@ impl Game {
             }
             ShopCommand::Buy { item_id, .. } => {
                 if let Some(resp) = active.responses.get(&item_id).cloned() {
-                    self.hud.play(crate::hud::CLICK);
-                    self.answer_special_panel(resp);
+                    if self.answer_special_panel(resp) {
+                        self.hud.play(crate::hud::CLICK);
+                    } else {
+                        self.hud.play(crate::hud::ERROR);
+                        if self.shop_snapshot.is_some() {
+                            self.shop_dialog.open();
+                        } else {
+                            self.active_special_panel = None;
+                            self.sync_special_panel();
+                        }
+                    }
                 } else {
                     self.hud.play(crate::hud::ERROR);
                 }
@@ -8101,12 +8163,14 @@ impl Game {
                 }
             }
         }
+        const MAX_BOOK_LINES: usize = 10;
         let body = if entries.is_empty() {
-            if is_cookbook {
-                "No recipes recorded yet.".to_owned()
-            } else {
-                "No spells or ingredients recorded yet.".to_owned()
-            }
+            "—".to_owned()
+        } else if entries.len() > MAX_BOOK_LINES {
+            let remaining = entries.len() - (MAX_BOOK_LINES - 1);
+            let mut shown = entries[..(MAX_BOOK_LINES - 1)].to_vec();
+            shown.push(format!("+{remaining}"));
+            shown.join("\n")
         } else {
             entries.join("\n")
         };
@@ -8223,34 +8287,23 @@ impl Game {
         _world: &sims_sim::World,
     ) -> (
         ShopKind,
-        String,
+        Option<String>,
         Vec<ShopItem>,
         BTreeMap<String, SpecialPanelResponse>,
     ) {
         let entries = self.resolve_special_lot_entries();
-        let (shop_kind, title, fallback_range): (ShopKind, &str, std::ops::RangeInclusive<u16>) =
-            match request {
-                SpecialPanelRequest::DowntownLotPicker => (
-                    ShopKind::DowntownBoutique(WardrobeCategory::Formal),
-                    "Downtown",
-                    21..=30,
-                ),
-                SpecialPanelRequest::VacationLotPicker { .. } => {
-                    (ShopKind::VacationKiosk, "Vacation Island", 40..=48)
-                }
-                SpecialPanelRequest::OldTownLotPicker { .. } => {
-                    (ShopKind::PetAdoption, "Old Town", 58..=68)
-                }
-                SpecialPanelRequest::StudioTownLotPicker { .. } => {
-                    (ShopKind::StudioWardrobe, "Studio Town", 81..=89)
-                }
-                SpecialPanelRequest::MagicTownLotPicker { .. } => {
-                    (ShopKind::MagicVendor, "Magic Town", 93..=98)
-                }
-                _ => (ShopKind::MagicVendor, "Destination", 93..=98),
-            };
+        let shop_kind = match request {
+            SpecialPanelRequest::DowntownLotPicker => {
+                ShopKind::DowntownBoutique(WardrobeCategory::Formal)
+            }
+            SpecialPanelRequest::VacationLotPicker { .. } => ShopKind::VacationKiosk,
+            SpecialPanelRequest::OldTownLotPicker { .. } => ShopKind::PetAdoption,
+            SpecialPanelRequest::StudioTownLotPicker { .. } => ShopKind::StudioWardrobe,
+            SpecialPanelRequest::MagicTownLotPicker { .. } => ShopKind::MagicVendor,
+            _ => ShopKind::MagicVendor,
+        };
 
-        let mut filtered: Vec<SpecialLotEntry> = entries
+        let filtered: Vec<SpecialLotEntry> = entries
             .into_iter()
             .filter(|e| match request {
                 SpecialPanelRequest::DowntownLotPicker => (21..=30).contains(&e.lot_id),
@@ -8267,17 +8320,6 @@ impl Game {
                 _ => false,
             })
             .collect();
-        if filtered.is_empty() {
-            filtered = fallback_range
-                .map(|lot_id| SpecialLotEntry {
-                    lot_id,
-                    name: String::new(),
-                    address: None,
-                    description: String::new(),
-                    zoning: 2,
-                })
-                .collect();
-        }
 
         let mut items = Vec::with_capacity(filtered.len());
         let mut responses = BTreeMap::new();
@@ -8288,14 +8330,14 @@ impl Game {
             } else if let Some(addr) = entry.address.as_deref().filter(|a| !a.trim().is_empty()) {
                 addr.trim().to_owned()
             } else {
-                format!("Lot {}", entry.lot_id)
+                format!("#{}", entry.lot_id)
             };
             let description = if !entry.description.trim().is_empty() {
                 entry.description.trim().to_owned()
             } else if let Some(addr) = entry.address.as_deref().filter(|a| !a.trim().is_empty()) {
-                format!("Lot {} — {}", entry.lot_id, addr.trim())
+                addr.trim().to_owned()
             } else {
-                format!("Lot {}", entry.lot_id)
+                format!("#{}", entry.lot_id)
             };
             items.push(ShopItem {
                 id: id.clone(),
@@ -8310,34 +8352,65 @@ impl Game {
             });
             responses.insert(id, SpecialPanelResponse::Lot(Some(entry.lot_id as i16)));
         }
-        (shop_kind, title.to_owned(), items, responses)
+        (shop_kind, None, items, responses)
+    }
+
+    fn ensure_ordered_wardrobe(&mut self) -> Option<&sims_content::ImportWardrobe> {
+        if self.ordered_wardrobe.is_none()
+            && let Ok((wardrobe, _)) =
+                sims_content::ImportWardrobe::load_lenient(self.hud.install())
+        {
+            self.ordered_wardrobe = Some(wardrobe);
+        }
+        self.ordered_wardrobe.as_ref()
     }
 
     fn build_wardrobe_picker_items(
-        &self,
+        &mut self,
+        world: &sims_sim::World,
+        person: u16,
         mode: i16,
     ) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
-        let prefix = match mode {
-            1 => "s",
-            2 => "f",
-            3 => "l",
-            4 => "w",
-            5 => "h",
-            _ => "b",
-        };
-        let names = self.scan_install_skin_names(
-            &["ExpansionShared/SkinsBuy", "GameData/Skins"],
-            Some(prefix),
-            24,
-        );
-        let entries: Vec<String> = if names.is_empty() {
-            (1..=6).map(|n| format!("Outfit #{n}")).collect()
-        } else {
-            names
-        };
+        let mut entries: Vec<(usize, String)> = Vec::new();
+        if mode == 0 {
+            let (female, child) = world
+                .objects
+                .get(&person)
+                .and_then(|o| o.person.as_ref())
+                .map(|p| {
+                    let kind = p.data.get(sims_sim::neighbors::KIND).copied().unwrap_or(0);
+                    let age = p.data.get(58).copied().unwrap_or(27);
+                    ((kind & 1) == 1, age < 18)
+                })
+                .unwrap_or((false, false));
+            if let Some(wardrobe) = self.ensure_ordered_wardrobe() {
+                let count = wardrobe.count(false, female, child, "lgt").min(32);
+                for idx in 0..count {
+                    if let Some((suit, _)) = wardrobe.pick(false, female, child, "lgt", idx) {
+                        entries.push((idx, suit));
+                    }
+                }
+            }
+        }
+        if entries.is_empty() {
+            let prefix = match mode {
+                1 => "s",
+                2 => "f",
+                3 => "l",
+                4 => "w",
+                5 => "h",
+                _ => "b",
+            };
+            let names = self.scan_install_skin_names(
+                &["ExpansionShared/SkinsBuy", "GameData/Skins"],
+                Some(prefix),
+                32,
+            );
+            entries = names.into_iter().enumerate().collect();
+        }
         let mut items = Vec::with_capacity(entries.len());
         let mut responses = BTreeMap::new();
-        for (idx, name) in entries.into_iter().enumerate() {
+        for (idx, name) in entries {
             let id = format!("special_wardrobe:{idx}");
             items.push(ShopItem {
                 id: id.clone(),
@@ -8361,29 +8434,33 @@ impl Game {
         (items, responses)
     }
 
-    fn build_pet_picker_items(&self) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
-        let mut names: Vec<String> = self.scan_install_skin_names(
-            &["ExpansionPack5/Skins", "GameData/Skins"],
-            Some("c"),
-            16,
-        );
-        let dogs = self.scan_install_skin_names(
-            &["ExpansionPack5/Skins", "GameData/Skins"],
-            Some("d"),
-            16,
-        );
-        names.extend(dogs);
-        names.sort();
-        names.dedup();
-        names.truncate(24);
-        let entries: Vec<String> = if names.is_empty() {
-            (1..=6).map(|n| format!("Pet #{n}")).collect()
-        } else {
-            names
-        };
+    fn build_pet_picker_items(
+        &mut self,
+        world: &sims_sim::World,
+        pet: u16,
+    ) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
+        let is_cat = world
+            .objects
+            .get(&pet)
+            .and_then(|o| o.person.as_ref())
+            .and_then(|p| p.data.get(sims_sim::neighbors::KIND).copied())
+            .is_some_and(|kind| {
+                sims_ui::household::PetKind::from_kind(kind)
+                    == Some(sims_ui::household::PetKind::Cat)
+            });
+        // Match `sims-vm`'s exact native `ImportWardrobe::pick_pet(is_cat, idx)` ordering.
+        let mut entries: Vec<(usize, String)> = Vec::new();
+        if let Some(wardrobe) = self.ensure_ordered_wardrobe() {
+            let count = wardrobe.count_pet(is_cat).min(64);
+            for idx in 0..count {
+                if let Some((suit, _)) = wardrobe.pick_pet(is_cat, idx) {
+                    entries.push((idx, suit));
+                }
+            }
+        }
         let mut items = Vec::with_capacity(entries.len());
         let mut responses = BTreeMap::new();
-        for (idx, name) in entries.into_iter().enumerate() {
+        for (idx, name) in entries {
             let id = format!("special_pet:{idx}");
             items.push(ShopItem {
                 id: id.clone(),
@@ -8408,8 +8485,11 @@ impl Game {
     }
 
     fn build_charm_transform_items(
-        &self,
+        &mut self,
+        world: &sims_sim::World,
+        person: u16,
     ) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
+        let _ = (world, person);
         let names = self.scan_install_skin_names(
             &[
                 "ExpansionPack7/Skins",
@@ -8417,16 +8497,11 @@ impl Game {
                 "GameData/Skins",
             ],
             Some("b"),
-            16,
+            24,
         );
-        let entries: Vec<String> = if names.is_empty() {
-            (1..=6).map(|n| format!("Form #{n}")).collect()
-        } else {
-            names
-        };
-        let mut items = Vec::with_capacity(entries.len());
+        let mut items = Vec::with_capacity(names.len());
         let mut responses = BTreeMap::new();
-        for (idx, name) in entries.into_iter().enumerate() {
+        for (idx, name) in names.into_iter().enumerate() {
             let id = format!("special_charm:{idx}");
             items.push(ShopItem {
                 id: id.clone(),
@@ -8485,7 +8560,7 @@ impl Game {
                 .get(&record.guid)
                 .cloned()
                 .or_else(|| self.hud.name(record.guid).map(str::to_owned))
-                .unwrap_or_else(|| format!("Neighbor {}", record.id));
+                .unwrap_or_else(|| format!("#{}", record.id));
             let (daily, life) = caller_rels
                 .get(&i32::from(record.id))
                 .copied()
@@ -8494,7 +8569,7 @@ impl Game {
             items.push(ShopItem {
                 id: id.clone(),
                 name,
-                description: format!("Daily {daily} / Lifetime {life}"),
+                description: format!("{daily} / {life}"),
                 price: 0,
                 currency: CurrencyKind::Simoleons,
                 icon: self.hud.face(record.guid).cloned(),
@@ -8514,8 +8589,7 @@ impl Game {
         limit: usize,
     ) -> Vec<String> {
         let install = self.hud.install();
-        let mut out = Vec::new();
-        let mut seen = BTreeSet::new();
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
         for rel in dirs {
             let Ok(dir) = install.file(rel) else {
                 continue;
@@ -8540,16 +8614,38 @@ impl Game {
                 {
                     continue;
                 }
-                if seen.insert(lower) {
-                    out.push(stem.to_owned());
-                    if out.len() >= limit {
-                        out.sort();
-                        return out;
-                    }
-                }
+                seen.entry(lower).or_insert_with(|| stem.to_owned());
             }
         }
-        out.sort();
+        // Sort deterministically across the full scan before applying `limit`.
+        seen.into_values().take(limit).collect()
+    }
+
+    /// Crops the rendered lot canvas to the active Camera Mode `SnapshotSize`
+    /// centered on the frame (clamped to canvas bounds) so selecting Small,
+    /// Medium, Large, or Custom changes the saved PNG snapshot dimensions.
+    pub fn capture_snapshot_canvas(&self) -> Canvas {
+        let state = self.hud.camera_state();
+        let [req_w, req_h] = state.size.dimensions(state.custom_dimensions);
+        let src_w = self.canvas.width;
+        let src_h = self.canvas.height;
+        if src_w == 0 || src_h == 0 || req_w == 0 || req_h == 0 {
+            return self.canvas.clone();
+        }
+        let crop_w = (req_w as usize).min(src_w);
+        let crop_h = (req_h as usize).min(src_h);
+        if crop_w == src_w && crop_h == src_h {
+            return self.canvas.clone();
+        }
+        let x0 = (src_w - crop_w) / 2;
+        let y0 = (src_h - crop_h) / 2;
+        let mut out = Canvas::new(crop_w, crop_h, [0, 0, 0]);
+        for y in 0..crop_h {
+            let src_row = (y0 + y) * src_w + x0;
+            let dst_row = y * crop_w;
+            out.color[dst_row..dst_row + crop_w]
+                .copy_from_slice(&self.canvas.color[src_row..src_row + crop_w]);
+        }
         out
     }
 
@@ -8969,6 +9065,27 @@ impl Game {
             stats.snapshots_restored += 1;
         }
         stats.drift_events += poll2.drift_events as u32;
+
+        // Bounded retry guard: if a peer's special-panel answer was dropped by
+        // full host ingress while the same dialog ID remains active, reopen the
+        // modal so the client can retry instead of waiting indefinitely.
+        const COOP_SPECIAL_PANEL_RETRY_PUMPS: u32 = 120;
+        if let Some((submitted_id, ref mut pumps)) = self.submitted_coop_special_panel {
+            let still_active = self
+                .lot
+                .coop()
+                .and_then(|c| c.active_special_panel.as_ref().map(|(id, _)| *id))
+                == Some(submitted_id);
+            if still_active {
+                *pumps = pumps.saturating_add(1);
+                if *pumps >= COOP_SPECIAL_PANEL_RETRY_PUMPS {
+                    self.submitted_coop_special_panel = None;
+                    self.sync_special_panel();
+                }
+            } else {
+                self.submitted_coop_special_panel = None;
+            }
+        }
         Ok(stats)
     }
 

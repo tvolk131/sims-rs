@@ -1168,10 +1168,22 @@ impl NeighborhoodShell {
         self.clock_us / 1_000
     }
 
+    fn update_hover_fade(&mut self, hovered: Option<u16>) {
+        if self.clock_us > 0 {
+            let now_ms = self.clock_us / 1_000;
+            self.hover_fade.set_hovered(hovered, now_ms);
+            self.hover_fade_was_animating = self.hover_fade.is_animating(now_ms);
+        } else {
+            self.hover_fade.reset();
+            self.hover_fade_was_animating = false;
+        }
+    }
+
     /// Whether any Neighborhood lot roof cross-fade (300 ms `cWinLot` ramp) is
     /// actively transitioning at the current presentation clock.
     pub fn has_active_fades(&self) -> bool {
-        matches!(self.screen, ActiveScreen::Neighborhood)
+        self.clock_us > 0
+            && matches!(self.screen, ActiveScreen::Neighborhood)
             && self.hover_fade.is_animating(self.now_ms())
     }
 
@@ -1539,6 +1551,15 @@ impl NeighborhoodShell {
                     let now_ms = self.clock_us / 1_000;
                     self.hover_fade.prune(now_ms);
                     self.hover_fade.apply_to(&mut opts, now_ms);
+                    // Preserve a zero-clock hover as already settled at 1.0 if
+                    // the clock starts advancing before the pointer moves.
+                    if let Some(lot) = self.hovered_lot_id
+                        && self.hover_fade.hovered() != Some(lot)
+                    {
+                        opts.hovered_lot = Some(lot);
+                        opts.hover_roof_fade = 1.0;
+                        opts.lot_roof_fades.insert(lot, 1.0);
+                    }
                 }
                 self.map.render_into(&mut self.canvas, &opts);
                 let rgb = std::mem::take(&mut self.canvas.color);
@@ -1761,9 +1782,7 @@ impl NeighborhoodShell {
                     self.hovered_lot_since_us = next_lot.map(|_| self.clock_us);
                     self.hover_card_shown_for = None;
                     self.nbhd_state.hovered_lot = None;
-                    let now_ms = self.clock_us / 1_000;
-                    self.hover_fade.set_hovered(next_lot, now_ms);
-                    self.hover_fade_was_animating = self.hover_fade.is_animating(now_ms);
+                    self.update_hover_fade(next_lot);
                 }
                 chrome_changed || next_lot != prev_lot
             }
@@ -1816,9 +1835,7 @@ impl NeighborhoodShell {
                 self.hover_card_shown_for = None;
                 self.pressed_lot_id = None;
                 self.nbhd_state.hovered_lot = None;
-                let now_ms = self.clock_us / 1_000;
-                self.hover_fade.set_hovered(None, now_ms);
-                self.hover_fade_was_animating = self.hover_fade.is_animating(now_ms);
+                self.update_hover_fade(None);
                 had_state
             }
             ActiveScreen::FamilyBin => {
@@ -2009,9 +2026,7 @@ impl NeighborhoodShell {
                         self.hovered_lot_since_us = hit.map(|_| self.clock_us);
                         self.hover_card_shown_for = None;
                         self.nbhd_state.hovered_lot = None;
-                        let now_ms = self.clock_us / 1_000;
-                        self.hover_fade.set_hovered(hit, now_ms);
-                        self.hover_fade_was_animating = self.hover_fade.is_animating(now_ms);
+                        self.update_hover_fade(hit);
                     }
                     return ShellOutcome {
                         redraw: hit.is_some(),
@@ -2037,9 +2052,7 @@ impl NeighborhoodShell {
                     self.hovered_lot_since_us = hit.map(|_| self.clock_us);
                     self.hover_card_shown_for = None;
                     self.nbhd_state.hovered_lot = None;
-                    let now_ms = self.clock_us / 1_000;
-                    self.hover_fade.set_hovered(hit, now_ms);
-                    self.hover_fade_was_animating = self.hover_fade.is_animating(now_ms);
+                    self.update_hover_fade(hit);
                 }
                 ShellOutcome {
                     redraw: hit.is_some(),
@@ -2677,6 +2690,8 @@ impl NeighborhoodShell {
             photo: outcome.photo,
         };
         if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.asking().is_none()
+            && session.game.asking_special_panel().is_none()
             && let Some((request, dest_lot)) = session.game.take_pending_travel_lot()
         {
             self.handle_special_panel_travel(request, dest_lot);
@@ -5581,27 +5596,13 @@ impl NeighborhoodShell {
     /// pickers (`Dialog` kinds `5, 7, 8, 11, 13`).
     fn build_special_lot_catalog(&self) -> Vec<SpecialLotEntry> {
         let mut lot_ids: BTreeSet<u16> = self.lot_meta.keys().copied().collect();
-        for &lot_id in self.stored.zoning.keys() {
-            if let Ok(id) = u16::try_from(lot_id) {
-                lot_ids.insert(id);
-            }
-        }
-        // Include all standard Complete Collection destination lot numbers that
-        // exist in the neighborhood store or install template.
-        for candidate in (21u16..=30)
-            .chain(40..=48)
-            .chain(58..=68)
-            .chain(81..=89)
-            .chain(90..=98)
-        {
-            if self
-                .store
-                .load_lot_snapshot(&self.neighborhood_id, u32::from(candidate))
-                .ok()
-                .flatten()
-                .is_some_and(|s| s.base_house.is_some() || s.saved_lot.is_some())
-            {
-                lot_ids.insert(candidate);
+        // Single key-scan over stored houses (no character-file copying), so
+        // only lots that actually exist in the neighborhood store are offered.
+        if let Ok(stored_houses) = self.store.list_houses(&self.neighborhood_id) {
+            for house in stored_houses {
+                if let Ok(id) = u16::try_from(house) {
+                    lot_ids.insert(id);
+                }
             }
         }
         lot_ids
@@ -5637,23 +5638,51 @@ impl NeighborhoodShell {
     /// special lot picker (`Dialog` kinds `5, 7, 8, 11, 13`). Never halts or
     /// strands: when departure is ineligible (e.g., co-op active, already away,
     /// or missing destination snapshot), stays cleanly on the current lot and
-    /// surfaces a native notice dialog.
+    /// surfaces a native notice dialog without overwriting active VM dialogs.
     fn handle_special_panel_travel(
         &mut self,
         request: sims_vm::SpecialPanelRequest,
         dest_house: u32,
     ) {
+        let report_ineligible = |screen: &mut ActiveScreen, msg: String| {
+            if let ActiveScreen::Lot(session) = screen {
+                if !session.game.has_dialog() {
+                    session.game.show_notice("Travel", msg);
+                } else {
+                    session.game.set_note(msg);
+                }
+            }
+        };
         let Some(destination) = TravelDestination::classify(dest_house, &self.stored.zoning) else {
+            report_ineligible(
+                &mut self.screen,
+                format!("Lot {dest_house} is not a travel destination."),
+            );
             return;
         };
         let leader_guid = {
             let ActiveScreen::Lot(session) = &self.screen else {
                 return;
             };
-            if session.game.coop_active()
-                || session.active_trip.is_some()
-                || session.is_destination_edit
-            {
+            if session.game.coop_active() {
+                report_ineligible(
+                    &mut self.screen,
+                    "Leave the co-op session before traveling to a destination.".into(),
+                );
+                return;
+            }
+            if session.active_trip.is_some() {
+                report_ineligible(
+                    &mut self.screen,
+                    "Return home before starting another destination trip.".into(),
+                );
+                return;
+            }
+            if session.is_destination_edit {
+                report_ineligible(
+                    &mut self.screen,
+                    "Travel is unavailable while editing a destination lot.".into(),
+                );
                 return;
             }
             let world = session.game.lot().world();
@@ -5667,6 +5696,10 @@ impl NeighborhoodShell {
                         .filter(|&id| id != 0)
                 });
             let Some(home_family_id) = home_family_id else {
+                report_ineligible(
+                    &mut self.screen,
+                    "No resident household is active on this lot for travel.".into(),
+                );
                 return;
             };
             let fam_members: Vec<u32> = self
@@ -5681,6 +5714,10 @@ impl NeighborhoodShell {
                 .map(|o| o.guid)
                 .filter(|g| fam_members.contains(g));
             let Some(guid) = selected_guid.or_else(|| fam_members.first().copied()) else {
+                report_ineligible(
+                    &mut self.screen,
+                    "No household member is available to travel.".into(),
+                );
                 return;
             };
             guid
@@ -5717,11 +5754,9 @@ impl NeighborhoodShell {
             frames: self.frames.clone(),
             view_centre: None,
         };
-        if let Err(err) = self.depart_to_destination(travel_req)
-            && let ActiveScreen::Lot(session) = &mut self.screen
-        {
-            session.game.show_notice(
-                "Travel",
+        if let Err(err) = self.depart_to_destination(travel_req) {
+            report_ineligible(
+                &mut self.screen,
                 format!("Could not travel to lot {dest_house}: {err}"),
             );
         }
@@ -5756,8 +5791,9 @@ impl NeighborhoodShell {
             .ok_or_else(|| format!("neighborhood {nh_id:?} not found before departure"))?;
 
         self.start_load_audio();
+        let load_kind = loading_kind_for_travel(request.destination_house, request.transport);
         self.present_loading_step(
-            loading_kind_for_house(request.destination_house),
+            load_kind,
             Some(format!("Destination Lot {}", request.destination_house)),
             0.2,
         );
@@ -5783,7 +5819,7 @@ impl NeighborhoodShell {
             }
         };
         self.present_loading_step(
-            loading_kind_for_house(departure.session.destination_house),
+            loading_kind_for_travel(departure.session.destination_house, request.transport),
             Some(format!(
                 "Destination Lot {}",
                 departure.session.destination_house
@@ -6462,11 +6498,20 @@ impl NeighborhoodShell {
 }
 
 fn loading_kind_for_house(house: u32) -> LoadingKind {
+    loading_kind_for_travel(house, None)
+}
+
+fn loading_kind_for_travel(
+    house: u32,
+    transport: Option<vm_travel::TravelTransport>,
+) -> LoadingKind {
     match house {
         21..=30 => LoadingKind::Downtown,
         40..=48 => LoadingKind::Vacation { alternate: false },
         81..=89 => LoadingKind::StudioTown { fan_bus: false },
-        90..=98 => LoadingKind::MagicTown { via_hole: false },
+        90..=98 => LoadingKind::MagicTown {
+            via_hole: matches!(transport, Some(vm_travel::TravelTransport::MagicHole)),
+        },
         _ => LoadingKind::Lot,
     }
 }
