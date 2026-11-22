@@ -1375,3 +1375,105 @@ fn grow_grass_allows_undo_commits_are_transactional_and_extreme_coords_never_pan
     assert!(!plan_pool_edit(&world, [5, i32::MAX], [5, i32::MAX], PoolMode::Dig, &prices).valid);
     assert!(!plan_pool_edit(&world, [i32::MIN, 5], [5, 5], PoolMode::Dig, &prices).valid);
 }
+
+#[test]
+fn round2_disconnected_pool_demolish_undo_multistroke_pond_fill_and_stale_mask_repair() {
+    let (program, catalog) = empty_interpreter();
+    let interp = Interpreter::new(&program, &catalog, Stream::Global);
+    let prices = ToolPrices::default();
+
+    // 1. Two disconnected pools at different flat elevations (0 and 2) demolished
+    // in one drag rectangle MUST undo cleanly!
+    let mut world = synthetic_world(20, 2000, 0);
+    // Raise a flat 4x4 terrace (vertices 10..=13, 4..=7 -> flat tiles 10..=12, 4..=6) to height 2.
+    for _ in 0..2 {
+        for vx in 10..=13 {
+            for vy in 4..=7 {
+                let p = plan_terrain_edit(&world, [vx, vy], [vx, vy], TerrainMode::Raise, &prices);
+                assert!(p.valid);
+                interp
+                    .build_commit_terrain(&mut world, &p)
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+    }
+    let low_pool = plan_pool_edit(&world, [5, 5], [5, 5], PoolMode::Dig, &prices);
+    let high_pool = plan_pool_edit(&world, [11, 5], [11, 5], PoolMode::Dig, &prices);
+    assert!(low_pool.valid && high_pool.valid);
+    interp
+        .build_commit_pool(&mut world, &low_pool)
+        .unwrap()
+        .unwrap();
+    interp
+        .build_commit_pool(&mut world, &high_pool)
+        .unwrap()
+        .unwrap();
+    assert!(is_pool_tile(&world, 5, 5));
+    assert!(is_pool_tile(&world, 11, 5));
+
+    let funds_before_demo = world.budget.funds;
+    let demo_both = plan_pool_edit(&world, [5, 5], [11, 5], PoolMode::Demolish, &prices);
+    assert!(demo_both.valid && demo_both.net_cost == -120);
+    let mut demo_hist = interp
+        .build_commit_pool(&mut world, &demo_both)
+        .unwrap()
+        .unwrap();
+    assert!(!is_pool_tile(&world, 5, 5));
+    assert!(!is_pool_tile(&world, 11, 5));
+    assert!(
+        interp.build_undo_entry(&mut world, &mut demo_hist).unwrap(),
+        "undoing single-drag demolition of two disconnected pools at distinct elevations must succeed"
+    );
+    assert!(is_pool_tile(&world, 5, 5));
+    assert!(is_pool_tile(&world, 11, 5));
+    assert_eq!(world.budget.funds, funds_before_demo);
+
+    // 2. Multi-stroke pond paint lowers shared vertices from 3 -> 1; removing
+    // both tiles together refills ALL 6 vertices cleanly back to dry bank 3!
+    let mut pond_world = synthetic_world(20, 1000, 3);
+    let s1 = plan_water_edit(&pond_world, [5, 5], [5, 5], WaterMode::Paint, &prices);
+    interp
+        .build_commit_water(&mut pond_world, &s1)
+        .unwrap()
+        .unwrap();
+    let s2 = plan_water_edit(&pond_world, [6, 5], [6, 5], WaterMode::Paint, &prices);
+    interp
+        .build_commit_water(&mut pond_world, &s2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(terrain_vertex_height(&pond_world, 6, 5), Some(1));
+    assert_eq!(terrain_vertex_height(&pond_world, 6, 6), Some(1));
+    let rem_both = plan_water_edit(&pond_world, [5, 5], [6, 5], WaterMode::Remove, &prices);
+    assert!(rem_both.valid);
+    interp
+        .build_commit_water(&mut pond_world, &rem_both)
+        .unwrap()
+        .unwrap();
+    for vx in 5..=7 {
+        for vy in 5..=6 {
+            assert_eq!(
+                terrain_vertex_height(&pond_world, vx, vy),
+                Some(3),
+                "multi-stroke pond vertex ({vx}, {vy}) must refill all the way back to bank height 3"
+            );
+        }
+    }
+
+    // 3. Fresh edit that repairs an existing stale/disconnected mask (two
+    // adjacent wet tiles both at `0x00`) must succeed cleanly!
+    let mut repair_world = synthetic_world(20, 1000, 0);
+    repair_world.arrays.get_mut(&10).unwrap().data[cell(5, 5)] = 0x00;
+    repair_world.arrays.get_mut(&10).unwrap().data[cell(6, 5)] = 0x00;
+    let repair_rem = plan_water_edit(&repair_world, [6, 5], [6, 5], WaterMode::Remove, &prices);
+    assert!(repair_rem.valid);
+    assert!(
+        interp
+            .build_commit_water(&mut repair_world, &repair_rem)
+            .unwrap()
+            .is_some(),
+        "removing one tile of an existing stale 0x00/0x00 pair must succeed"
+    );
+    assert_eq!(repair_world.arrays[&10].data[cell(5, 5)], 0x00);
+    assert_eq!(repair_world.arrays[&10].data[cell(6, 5)], 0xff);
+}

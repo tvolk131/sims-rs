@@ -3436,15 +3436,14 @@ fn fill_removed_pond_basin(
             if bank_target <= cur {
                 continue;
             }
-            let desired = cur.saturating_add(1).min(bank_target);
             let v_lo = lo[&(vx, vy)];
             let v_hi = hi[&(vx, vy)];
             let next = if v_lo <= v_hi {
-                i32::from(desired).clamp(v_lo, v_hi).clamp(0, 255) as u8
+                i32::from(bank_target).clamp(v_lo, v_hi).clamp(0, 255) as u8
             } else {
                 cur
             };
-            if next != cur {
+            if next > cur {
                 write_vertex_height(heights_buf, vx, vy, next);
             }
         }
@@ -4050,17 +4049,7 @@ fn water_changes_allowed(
 fn pool_changes_allowed(world: &World, pool_changes: &[(usize, u8, u8)], forward: bool) -> bool {
     let active = usize::try_from(world.size).unwrap_or(0);
     let mut becoming_dry = BTreeSet::new();
-    for &(idx, before, after) in pool_changes {
-        let (src, dst) = if forward {
-            (before, after)
-        } else {
-            (after, before)
-        };
-        if src < 16 && dst >= 16 {
-            becoming_dry.insert((idx / FULL_SIZE, idx % FULL_SIZE));
-        }
-    }
-    let mut dig_elev: Option<u8> = None;
+    let mut becoming_pool: BTreeMap<(usize, usize), u8> = BTreeMap::new();
     for &(idx, before, after) in pool_changes {
         let (src, dst) = if forward {
             (before, after)
@@ -4069,39 +4058,45 @@ fn pool_changes_allowed(world: &World, pool_changes: &[(usize, u8, u8)], forward
         };
         let tx = idx / FULL_SIZE;
         let ty = idx % FULL_SIZE;
-        if src >= 16 && dst < 16 {
+        if src < 16 && dst >= 16 {
+            if !tile_supports_pool_demolish(world, tx, ty) {
+                return false;
+            }
+            becoming_dry.insert((tx, ty));
+        } else if src >= 16 && dst < 16 {
             if !tile_supports_pool_dig(world, tx, ty) {
                 return false;
             }
             let Some(elev) = tile_flat_elevation(world, tx, ty) else {
                 return false;
             };
-            if let Some(expected) = dig_elev {
-                if elev != expected {
-                    return false;
-                }
-            } else {
-                dig_elev = Some(elev);
-            }
-            for (nx, ny) in [
-                (tx.checked_sub(1), Some(ty)),
-                ((tx + 1 < active).then_some(tx + 1), Some(ty)),
-                (Some(tx), ty.checked_sub(1)),
-                (Some(tx), (ty + 1 < active).then_some(ty + 1)),
-            ] {
-                let (Some(nx), Some(ny)) = (nx, ny) else {
-                    continue;
-                };
-                if !becoming_dry.contains(&(nx, ny))
-                    && is_pool_tile(world, nx, ny)
-                    && tile_flat_elevation(world, nx, ny) != Some(elev)
-                {
-                    return false;
-                }
-            }
+            becoming_pool.insert((tx, ty), elev);
         }
-        if src < 16 && dst >= 16 && !tile_supports_pool_demolish(world, tx, ty) {
-            return false;
+    }
+    // Each connected component of tiles becoming pool must share a single flat
+    // elevation internally and with any adjacent surviving pool tile (allowing
+    // Undo of a drag that demolished multiple disconnected pools at distinct
+    // elevations).
+    for (&(tx, ty), &elev) in &becoming_pool {
+        for (nx, ny) in [
+            (tx.checked_sub(1), Some(ty)),
+            ((tx + 1 < active).then_some(tx + 1), Some(ty)),
+            (Some(tx), ty.checked_sub(1)),
+            (Some(tx), (ty + 1 < active).then_some(ty + 1)),
+        ] {
+            let (Some(nx), Some(ny)) = (nx, ny) else {
+                continue;
+            };
+            if let Some(&other_elev) = becoming_pool.get(&(nx, ny)) {
+                if other_elev != elev {
+                    return false;
+                }
+            } else if !becoming_dry.contains(&(nx, ny))
+                && is_pool_tile(world, nx, ny)
+                && tile_flat_elevation(world, nx, ny) != Some(elev)
+            {
+                return false;
+            }
         }
     }
     true
@@ -4195,14 +4190,32 @@ fn byte_array_diffs_match(
         Some(&arr.data)
     };
 
-    // Validate cardinal-neighbor connectivity so stale adjacent plans cannot
-    // commit or replay disconnected 4-bit masks.
+    // Validate resulting 4-bit connectivity masks on all changed present tiles
+    // and on all cardinal neighbors of presence-toggled tiles (so stale
+    // adjacent plans cannot commit disconnected masks, while fresh edits that
+    // repair an existing stale mask still succeed).
     let live_byte = |idx: usize| -> u8 { existing_data.map_or(0xff, |d| d[idx]) };
     let next_byte = |idx: usize| -> u8 {
         change_map
             .get(&idx)
             .copied()
             .unwrap_or_else(|| live_byte(idx))
+    };
+    let expected_mask = |tx: usize, ty: usize| -> u8 {
+        let mut m = 0u8;
+        if ty > 0 && next_byte(cell_index(tx, ty - 1)) < 16 {
+            m |= 0x01;
+        }
+        if tx > 0 && next_byte(cell_index(tx - 1, ty)) < 16 {
+            m |= 0x02;
+        }
+        if ty + 1 < active && next_byte(cell_index(tx, ty + 1)) < 16 {
+            m |= 0x04;
+        }
+        if tx + 1 < active && next_byte(cell_index(tx + 1, ty)) < 16 {
+            m |= 0x08;
+        }
+        m
     };
     for &(idx, before, after) in changes {
         let (src, dst) = if forward {
@@ -4215,8 +4228,10 @@ fn byte_array_diffs_match(
         if tx >= active || ty >= active {
             continue;
         }
-        let toggled = (src < 16) != (dst < 16);
-        if toggled {
+        if dst < 16 && dst != expected_mask(tx, ty) {
+            return false;
+        }
+        if (src < 16) != (dst < 16) {
             for (nx, ny) in [
                 (tx.checked_sub(1), Some(ty)),
                 ((tx + 1 < active).then_some(tx + 1), Some(ty)),
@@ -4227,27 +4242,10 @@ fn byte_array_diffs_match(
                     continue;
                 };
                 let nidx = cell_index(nx, ny);
-                if !change_map.contains_key(&nidx) && live_byte(nidx) < 16 {
+                let n_after = next_byte(nidx);
+                if n_after < 16 && n_after != expected_mask(nx, ny) {
                     return false;
                 }
-            }
-        }
-        if dst < 16 {
-            let mut expected_mask = 0u8;
-            if ty > 0 && next_byte(cell_index(tx, ty - 1)) < 16 {
-                expected_mask |= 0x01;
-            }
-            if tx > 0 && next_byte(cell_index(tx - 1, ty)) < 16 {
-                expected_mask |= 0x02;
-            }
-            if ty + 1 < active && next_byte(cell_index(tx, ty + 1)) < 16 {
-                expected_mask |= 0x04;
-            }
-            if tx + 1 < active && next_byte(cell_index(tx + 1, ty)) < 16 {
-                expected_mask |= 0x08;
-            }
-            if dst != expected_mask {
-                return false;
             }
         }
     }

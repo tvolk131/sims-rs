@@ -56,7 +56,9 @@ fn narrow_viewport_build_strip_has_zero_overlaps_across_tools() {
     ]);
     let art = Art::default();
 
-    for width in [360, 480, 512, 580, 619, 620, 640, 651, 652, 660, 800, 1024] {
+    for width in [
+        360, 400, 480, 512, 580, 619, 620, 640, 651, 652, 660, 800, 1024,
+    ] {
         for tool in [
             None,
             Some(BuildTool::Terrain),
@@ -93,24 +95,22 @@ fn narrow_viewport_build_strip_has_zero_overlaps_across_tools() {
                 );
                 assert_layout_has_no_overlaps_and_in_bounds(&lay, width);
             }
-            if width >= 480 {
-                assert_eq!(first.total_tool_pages, 1);
-                // Every single one of the 12 Build tools must be directly clickable
-                // through `layout.press(point)` (no unreachable pager!).
-                let mut clickable = std::collections::BTreeSet::new();
-                for w in &first.widgets {
-                    if let Some(Command::BuildTool(t)) = w.command {
-                        let c = [w.rect.x + w.rect.width / 2, w.rect.y + w.rect.height / 2];
-                        assert_eq!(first.press(c), Some(Command::BuildTool(t)));
-                        clickable.insert(t);
-                    }
+            assert_eq!(first.total_tool_pages, 1);
+            // Every single one of the 12 Build tools must be directly clickable
+            // through `layout.press(point)` even at 360 px and 400 px (no stranded tool!).
+            let mut clickable = std::collections::BTreeSet::new();
+            for w in &first.widgets {
+                if let Some(Command::BuildTool(t)) = w.command {
+                    let c = [w.rect.x + w.rect.width / 2, w.rect.y + w.rect.height / 2];
+                    assert_eq!(first.press(c), Some(Command::BuildTool(t)));
+                    clickable.insert(t);
                 }
-                assert_eq!(
-                    clickable.len(),
-                    12,
-                    "all 12 Build tools must remain reachable via press() at width {width} tool {tool:?}"
-                );
             }
+            assert_eq!(
+                clickable.len(),
+                12,
+                "all 12 Build tools must remain reachable via press() at width {width} tool {tool:?}"
+            );
         }
     }
 }
@@ -290,6 +290,7 @@ fn live_install_roof_catalog_subtool_prices_and_narrow_layout_rendering() {
     let swatches = BuildSwatches::default();
     for size in [
         [360, 384],
+        [400, 384],
         [480, 384],
         [512, 384],
         [620, 384],
@@ -312,22 +313,20 @@ fn live_install_roof_catalog_subtool_prices_and_narrow_layout_rendering() {
                 let lay = build::layout(size, &build_cat, &state, &art, 5000, true, true, None);
                 assert_layout_has_no_overlaps_and_in_bounds(&lay, size[0]);
             }
-            if size[0] >= 480 {
-                let mut clickable = std::collections::BTreeSet::new();
-                for w in &first.widgets {
-                    if let Some(Command::BuildTool(t)) = w.command {
-                        let c = [w.rect.x + w.rect.width / 2, w.rect.y + w.rect.height / 2];
-                        assert_eq!(first.press(c), Some(Command::BuildTool(t)));
-                        clickable.insert(t);
-                    }
+            let mut clickable = std::collections::BTreeSet::new();
+            for w in &first.widgets {
+                if let Some(Command::BuildTool(t)) = w.command {
+                    let c = [w.rect.x + w.rect.width / 2, w.rect.y + w.rect.height / 2];
+                    assert_eq!(first.press(c), Some(Command::BuildTool(t)));
+                    clickable.insert(t);
                 }
-                assert_eq!(
-                    clickable.len(),
-                    12,
-                    "all 12 real-art Build tools (including 43px Floor & Water) must be clickable via press() at {size:?} {tool:?}"
-                );
             }
-            if tool == BuildTool::Floor && size[0] >= 360 {
+            assert_eq!(
+                clickable.len(),
+                12,
+                "all 12 real-art Build tools (including 43px Floor & Water) must be clickable via press() at {size:?} {tool:?}"
+            );
+            if tool == BuildTool::Floor && size[0] >= 400 {
                 assert!(
                     first
                         .widgets

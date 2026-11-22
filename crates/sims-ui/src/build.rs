@@ -154,13 +154,14 @@ const STR_PLUGIN_WALL: u16 = 135;
 /// catalog slots never overlap tool buttons (`Roof` switches below 652 px when
 /// its pitch column needs extra width).
 const NARROW_WIDTH: i32 = 620;
-const TOOL_STRIP_LEFT: i32 = 268;
+const TOOL_STRIP_LEFT: i32 = 262;
 const TOOL_COL_GAP: i32 = 2;
 /// Minimum horizontal room required to render all 12 Build tools in a compact
-/// 4×3 grid directly clickable through `BuildLayout::press`.
+/// 4×3 grid directly clickable through `BuildLayout::press` (`4 * 10 + 3 * 1 = 43 px`).
 const COMPACT_TOOL_COLS: i32 = 4;
 const COMPACT_TOOL_ROWS: i32 = 3;
-const COMPACT_TOOL_MIN_W: i32 = 14;
+const COMPACT_TOOL_MIN_W: i32 = 10;
+const COMPACT_PITCH_MIN_W: i32 = 19;
 
 /// Native 6-column × 2-row pairing of [`TOOL_BUTTONS`] indices (top, bottom)
 /// used when paginating tool buttons on sub-620 px narrow viewports.
@@ -1252,8 +1253,8 @@ pub fn layout(
         .map(|p| pitch_size(p.resource_id())[0])
         .max()
         .unwrap_or(26);
-    let roof_pitch_col_w = max_pitch_w + 4;
-    let roof_extra = if is_roof { roof_pitch_col_w } else { 0 };
+    let wide_roof_pitch_col_w = max_pitch_w + 4;
+    let wide_roof_extra = if is_roof { wide_roof_pitch_col_w } else { 0 };
     let native_tools_right = TOOL_BUTTONS
         .iter()
         .map(|&(_, res_id, pos, _)| pos[0] + btn_size(res_id)[0])
@@ -1271,28 +1272,45 @@ pub fn layout(
         && (!has_right_grid
             || (native_tools_right < PREV_ARROW_X
                 && PREV_ARROW_X + prev_aw <= GRID_LEFT
-                && wide_grid_right - GRID_LEFT >= cell + roof_extra));
+                && wide_grid_right - GRID_LEFT >= cell + wide_roof_extra));
     let narrow = !wide_fits;
 
-    let (grid_left, grid_right, prev_arrow_x, next_arrow_x) = if !narrow {
+    // On narrow viewports, always reserve room for all 12 Build tools in a
+    // compact 4×3 grid so the player can never be stranded in a Build tool
+    // (even on 360 px or 400 px canvases where `hud.rs` dispatches `press()`).
+    let (grid_left, grid_right, prev_arrow_x, next_arrow_x, pitch_col_w, pitch_btn_w) = if !narrow {
         (
             if has_right_grid { GRID_LEFT } else { width },
             wide_grid_right,
             PREV_ARROW_X,
             wide_next_arrow_x,
+            wide_roof_pitch_col_w,
+            max_pitch_w,
         )
     } else {
-        let next_x = (width - next_aw - 2).max(0);
-        let right = (next_x - 2).max(0);
-        let tools_left = (undo_right + 4).max(TOOL_STRIP_LEFT);
-        let min_grid_left = undo_right + prev_aw + 3;
-        let min_compact_tools = COMPACT_TOOL_COLS * 16 + (COMPACT_TOOL_COLS - 1) * TOOL_COL_GAP;
+        let next_x = (width - next_aw - 1).max(0);
+        let right = (next_x - 1).max(0);
+        let tools_left = (undo_right + 2).max(TOOL_STRIP_LEFT);
+        let min_4x3_w = COMPACT_TOOL_COLS * COMPACT_TOOL_MIN_W + (COMPACT_TOOL_COLS - 1);
+        let min_grid_left = tools_left + min_4x3_w + 2 + prev_aw + 1;
+        let comfortable_tools_w = COMPACT_TOOL_COLS * 16 + (COMPACT_TOOL_COLS - 1) * TOOL_COL_GAP;
+
+        let (p_col_w, p_btn_w) = if !is_roof {
+            (0, 0)
+        } else if right - cell - wide_roof_pitch_col_w >= min_grid_left {
+            (wide_roof_pitch_col_w, max_pitch_w)
+        } else {
+            let compact_w = COMPACT_PITCH_MIN_W.min(max_pitch_w);
+            (compact_w + 1, compact_w)
+        };
+        let roof_extra = if is_roof { p_col_w } else { 0 };
+
         let left = if !has_right_grid {
             width
         } else {
             let two_col = right - cell * 2 - roof_extra;
             let one_col = right - cell - roof_extra;
-            if two_col >= tools_left + min_compact_tools + prev_aw + 6 {
+            if two_col >= tools_left + comfortable_tools_w + prev_aw + 6 {
                 two_col
             } else if one_col >= min_grid_left {
                 one_col
@@ -1300,16 +1318,16 @@ pub fn layout(
                 min_grid_left.min(right)
             }
         };
-        let prev_x = (left - prev_aw - 2).max(0);
-        (left, right, prev_x, next_x)
+        let prev_x = (left - prev_aw - 1).max(0);
+        (left, right, prev_x, next_x, p_col_w, p_btn_w)
     };
 
     // 12 Build Tool buttons (`0x6f2bf0`): exact native coordinates on wide
-    // viewports; on narrow viewports compact all 12 tools into a non-overlapping
-    // grid strictly left of `prev_arrow_x` so every tool stays directly
-    // reachable through `BuildLayout::press` without hiding behind a pager.
-    let mut tool_page = 0usize;
-    let mut total_tool_pages = 1usize;
+    // viewports; on narrow viewports compact all 12 tools directly into
+    // `BuildWidget` (`Command::BuildTool`) strictly left of `prev_arrow_x` so
+    // every tool stays reachable through `BuildLayout::press` without a pager.
+    let tool_page = 0usize;
+    let total_tool_pages = 1usize;
     if !narrow {
         for &(tool, res_id, pos, _) in &TOOL_BUTTONS {
             let [w, h] = btn_size(res_id);
@@ -1325,11 +1343,11 @@ pub fn layout(
             });
         }
     } else {
-        let tools_left = (undo_right + 4).max(TOOL_STRIP_LEFT);
+        let tools_left = (undo_right + 2).max(TOOL_STRIP_LEFT);
         let tools_right = if has_right_grid {
-            (prev_arrow_x - 3).max(tools_left)
+            (prev_arrow_x - 2).max(tools_left)
         } else {
-            (width - 4).max(tools_left)
+            (width - 2).max(tools_left)
         };
         let avail_w = (tools_right - tools_left).max(0);
         let col_widths: [i32; 6] = std::array::from_fn(|ci| {
@@ -1337,8 +1355,7 @@ pub fn layout(
             btn_size(TOOL_BUTTONS[top_i].1)[0].max(btn_size(TOOL_BUTTONS[bot_i].1)[0])
         });
         let total_6x2_w: i32 = col_widths.iter().sum::<i32>() + TOOL_COL_GAP * 5;
-        let min_4x3_w =
-            COMPACT_TOOL_COLS * COMPACT_TOOL_MIN_W + (COMPACT_TOOL_COLS - 1) * TOOL_COL_GAP;
+        let min_4x3_w = COMPACT_TOOL_COLS * COMPACT_TOOL_MIN_W + (COMPACT_TOOL_COLS - 1);
 
         if total_6x2_w <= avail_w {
             let mut x = tools_left;
@@ -1364,13 +1381,19 @@ pub fn layout(
                 x += cw + TOOL_COL_GAP;
             }
         } else if avail_w >= min_4x3_w {
+            let gap = if avail_w >= COMPACT_TOOL_COLS * 14 + (COMPACT_TOOL_COLS - 1) * TOOL_COL_GAP
+            {
+                TOOL_COL_GAP
+            } else {
+                1
+            };
             let row_gap = 2;
-            let btn_w = (avail_w - (COMPACT_TOOL_COLS - 1) * TOOL_COL_GAP) / COMPACT_TOOL_COLS;
+            let btn_w = (avail_w - (COMPACT_TOOL_COLS - 1) * gap) / COMPACT_TOOL_COLS;
             let btn_h = (STRIP - 4 - (COMPACT_TOOL_ROWS - 1) * row_gap) / COMPACT_TOOL_ROWS;
             for (idx, &(tool, res_id, _, _)) in TOOL_BUTTONS.iter().enumerate() {
                 let col = (idx as i32) % COMPACT_TOOL_COLS;
                 let row = (idx as i32) / COMPACT_TOOL_COLS;
-                let x = tools_left + col * (btn_w + TOOL_COL_GAP);
+                let x = tools_left + col * (btn_w + gap);
                 let y = strip_y + 2 + row * (btn_h + row_gap);
                 widgets.push(BuildWidget {
                     rect: Rect::new(x, y, btn_w, btn_h),
@@ -1381,52 +1404,6 @@ pub fn layout(
                     },
                     command: Some(Command::BuildTool(tool)),
                     tooltip: Some(catalog.tool_tip(tool).to_owned()),
-                });
-            }
-        } else if avail_w >= COMPACT_TOOL_MIN_W + next_aw + 2 {
-            // Ultra-narrow fallback (< ~430 px): paginate compact 3-row columns
-            // without ever dropping a tool or overflowing `tools_right`.
-            let usable_w = avail_w - next_aw - 2;
-            let cols_per_page =
-                ((usable_w + TOOL_COL_GAP) / (COMPACT_TOOL_MIN_W + TOOL_COL_GAP)).max(1) as usize;
-            let per_page = cols_per_page * (COMPACT_TOOL_ROWS as usize);
-            total_tool_pages = TOOL_BUTTONS.len().div_ceil(per_page).max(1);
-            tool_page = state.tool_page % total_tool_pages;
-            let start = tool_page * per_page;
-            let col_w = ((usable_w - (cols_per_page as i32 - 1) * TOOL_COL_GAP)
-                / cols_per_page as i32)
-                .max(1);
-            let row_gap = 2;
-            let btn_h = (STRIP - 4 - (COMPACT_TOOL_ROWS - 1) * row_gap) / COMPACT_TOOL_ROWS;
-            for (slot, &(tool, res_id, _, _)) in
-                TOOL_BUTTONS.iter().skip(start).take(per_page).enumerate()
-            {
-                let col = (slot / COMPACT_TOOL_ROWS as usize) as i32;
-                let row = (slot % COMPACT_TOOL_ROWS as usize) as i32;
-                let x = tools_left + col * (col_w + TOOL_COL_GAP);
-                let y = strip_y + 2 + row * (btn_h + row_gap);
-                widgets.push(BuildWidget {
-                    rect: Rect::new(x, y, col_w, btn_h),
-                    kind: BuildWidgetKind::Button {
-                        id: res_id,
-                        selected: state.tool == Some(tool),
-                        enabled: true,
-                    },
-                    command: Some(Command::BuildTool(tool)),
-                    tooltip: Some(catalog.tool_tip(tool).to_owned()),
-                });
-            }
-            if total_tool_pages > 1 {
-                subtools.push(BuildSubtoolWidget {
-                    rect: Rect::new(tools_right - next_aw, strip_y + ARROW_Y, next_aw, next_ah),
-                    action: BuildSubtoolAction::ToolPage(1),
-                    resource_id: Some(id::NEXT_ARROW),
-                    roof_pattern: None,
-                    selected: false,
-                    affordable: true,
-                    name: "More Build Tools".to_owned(),
-                    price: 0,
-                    description: "Cycle Build Mode tool strip page.".to_owned(),
                 });
             }
         }
@@ -1585,7 +1562,7 @@ pub fn layout(
         Some(BuildTool::Roof) => {
             // Left pitch column (Flat, Shallow, Medium, Steep) fitted cleanly
             // within the strip height using measured art dimensions.
-            if grid_left + max_pitch_w <= grid_right {
+            if pitch_btn_w > 0 && grid_left + pitch_btn_w <= grid_right {
                 let raw_heights: [i32; 4] =
                     std::array::from_fn(|i| pitch_size(RoofPitchPreset::ALL[i].resource_id())[1]);
                 let sum_h: i32 = raw_heights.iter().sum();
@@ -1600,7 +1577,7 @@ pub fn layout(
                     let [pw, _] = pitch_size(preset.resource_id());
                     let ph = raw_heights[i].min(cap_h);
                     subtools.push(BuildSubtoolWidget {
-                        rect: Rect::new(grid_left, py, pw.min(max_pitch_w), ph),
+                        rect: Rect::new(grid_left, py, pw.min(pitch_btn_w), ph),
                         action: BuildSubtoolAction::RoofPitch(preset),
                         resource_id: Some(preset.resource_id()),
                         roof_pattern: None,
@@ -1615,7 +1592,7 @@ pub fn layout(
             }
             // Paginated `GameData/Roofs/*.bmp` pattern swatches strictly within
             // `pattern_left..grid_right` (never overflowing into `next_arrow_x`).
-            let pattern_left = grid_left + roof_pitch_col_w;
+            let pattern_left = grid_left + pitch_col_w;
             let patterns = catalog.roof_patterns();
             let cols = ((grid_right - pattern_left) / cell).max(0) as usize;
             if !patterns.is_empty() && cols > 0 {
