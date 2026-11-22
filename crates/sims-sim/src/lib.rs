@@ -22,6 +22,7 @@
 
 pub mod animator;
 pub mod characters;
+mod cow;
 mod error;
 pub mod grass;
 pub mod head;
@@ -37,6 +38,7 @@ mod snapshot;
 pub mod speed;
 mod world;
 
+pub use cow::{CowBox, CowMap};
 pub use error::Error;
 pub use neighborhood_store::{
     CheckedCommitError, DEFAULT_ARCH_VALUE_MULTIPLIER, DEFAULT_LAYOUT_HISTORY_FILL,

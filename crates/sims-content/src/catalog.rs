@@ -73,6 +73,7 @@ impl Catalog {
     }
 
     /// The object a GUID resolves to.
+    #[inline]
     pub fn object(&self, guid: u32) -> Option<&Object> {
         self.by_guid.get(&guid).map(|&n| &self.objects[n])
     }

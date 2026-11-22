@@ -75,6 +75,113 @@ use winit::window::{Window, WindowId};
 /// How often the loop wakes to step the lot when nothing else happens.
 const WAKE: Duration = Duration::from_millis(5);
 
+/// Wall-clock simulation budget per event-loop wake. Keeps Ultra/Idle speeds
+/// responsive on the UI thread instead of running a full catch-up burst before
+/// yielding to draw a frame.
+const SIM_BUDGET: Duration = Duration::from_millis(8);
+
+/// Minimum interval between window title bar updates while running steadily,
+/// avoiding per-frame AppKit/WM `set_title` IPC churn at Fast/Ultra speed.
+const TITLE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether the interactive wake loop should start another owed simulation tick
+/// after `ran` ticks have already completed in `spent` wall-clock time.
+///
+/// Always permits the first owed tick (`ran == 0`) so a slow lot still makes
+/// forward progress, then yields to render once `spent >= budget`.
+fn within_step_budget(ran: u32, spent: Duration, budget: Duration) -> bool {
+    ran == 0 || spent < budget
+}
+
+/// Tracks wall-clock time for the interactive wake loop with separate anchors
+/// for presentation (`clock_us`: plumb bob spin, pause-button blink) and
+/// simulation pacing (`Pace::due`).
+///
+/// When all owed ticks fit inside [`SIM_BUDGET`], both anchors advance to the
+/// wake start (`wake_start`) for zero-drift pacing. When a batch hits the
+/// wall-clock cap, `last_step` re-anchors to `wake_end` so the next wake does
+/// not inherit this wake's simulation time as a catch-up spiral, while
+/// `last_clock` stays at `wake_start` so presentation time never slows down.
+struct WakeClock {
+    last_clock: Instant,
+    last_step: Instant,
+}
+
+impl WakeClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_clock: now,
+            last_step: now,
+        }
+    }
+
+    fn reset(&mut self, now: Instant) {
+        self.last_clock = now;
+        self.last_step = now;
+    }
+
+    fn elapsed_us(&self, now: Instant) -> (u64, u64) {
+        let to_us = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        (
+            to_us(now.saturating_duration_since(self.last_clock)),
+            to_us(now.saturating_duration_since(self.last_step)),
+        )
+    }
+
+    fn finish(&mut self, wake_start: Instant, wake_end: Instant, capped: bool) {
+        self.last_clock = wake_start;
+        self.last_step = if capped { wake_end } else { wake_start };
+    }
+}
+
+/// High-level run state reflected in the window title suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleState {
+    Running,
+    Paused,
+    Stopped,
+}
+
+/// Rate-limits window title updates while running, while flushing immediately
+/// on the first draw and whenever the paused/stopped status changes.
+#[derive(Default)]
+struct TitleThrottle {
+    last_title: String,
+    last_state: Option<TitleState>,
+    last_update: Option<Instant>,
+}
+
+impl TitleThrottle {
+    fn update(
+        &mut self,
+        ticks: u32,
+        state: TitleState,
+        now: Instant,
+        interval: Duration,
+    ) -> Option<&str> {
+        let state_changed = self.last_state != Some(state);
+        let interval_elapsed = self
+            .last_update
+            .is_none_or(|prev| now.saturating_duration_since(prev) >= interval);
+        if !state_changed && !interval_elapsed {
+            return None;
+        }
+        let suffix = match state {
+            TitleState::Running => "",
+            TitleState::Paused => ", paused",
+            TitleState::Stopped => ", stopped",
+        };
+        let next = format!("sims-game: tick {ticks}{suffix}");
+        self.last_state = Some(state);
+        if next == self.last_title {
+            return None;
+        }
+        self.last_title = next;
+        self.last_update = Some(now);
+        Some(&self.last_title)
+    }
+}
+
 /// The sound the window plays, or none.
 #[cfg(any(target_os = "macos", feature = "sound"))]
 struct Sound(Option<sims_game::output::Output>);
@@ -217,7 +324,7 @@ struct App {
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     surface_size: Option<(NonZeroU32, NonZeroU32)>,
-    last_title: String,
+    title_throttle: TitleThrottle,
     scale: u32,
     cursor: Option<PhysicalPosition<f64>>,
     /// Most recent cursor position reported by winit (including outside the
@@ -225,7 +332,7 @@ struct App {
     /// release coordinates (`0x5f62ba..0x5f62de`).
     last_cursor: Option<PhysicalPosition<f64>>,
     drag: Option<PhysicalPosition<f64>>,
-    last: Instant,
+    wake_clock: WakeClock,
     dirty: bool,
     photos: usize,
     /// The stop already printed, so it is printed once.
@@ -470,7 +577,7 @@ impl App {
             // The errors and the stop are the restored lot's.
             self.printed = 0;
             self.reported = false;
-            self.last = Instant::now();
+            self.wake_clock.reset(Instant::now());
             true
         } else {
             false
@@ -599,18 +706,19 @@ impl App {
     /// Steps the lot for the time since the last call.
     fn tick(&mut self) {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last);
-        self.last = now;
-        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let (clock_us, step_us) = self.wake_clock.elapsed_us(now);
         let waited = self.game.asking().is_some();
-        let ran = self.game.advance(micros);
+        let (ran, capped) = self.game.advance_while(clock_us, step_us, |ran| {
+            within_step_budget(ran, now.elapsed(), SIM_BUDGET)
+        });
+        self.wake_clock.finish(now, Instant::now(), capped);
         // A dialog shown at the first tick due is drawn though none ran.
         let mut redraw = ran > 0 || (!waited && self.game.asking().is_some());
         // The plumb bob spins, the Live-mode pause button blinks, and edge
         // scrolling pans independently (`0x4d4af8..0x4d4b06` must not be
         // short-circuited by animation redraw flags, and active right-drag
         // panning bypasses edge scrolling at `0x4d46bd..0x4d4704`).
-        let scrolled = self.drag.is_none() && self.game.edge_scroll(micros);
+        let scrolled = self.drag.is_none() && self.game.edge_scroll(clock_us);
         redraw |= scrolled || self.game.spin_due() || self.game.blink_due();
         self.sound_feed
             .update(&mut self.game, |input| self.sound.send(input));
@@ -648,21 +756,20 @@ impl App {
         if self.dirty {
             self.game.render();
             self.dirty = false;
-            let lot = self.game.lot();
-            let title = format!(
-                "sims-game: tick {}{}",
-                lot.ticks(),
-                if self.game.stopped().is_some() {
-                    ", stopped"
-                } else if self.game.paused() {
-                    ", paused"
-                } else {
-                    ""
-                }
-            );
-            if title != self.last_title {
-                window.set_title(&title);
-                self.last_title = title;
+            let state = if self.game.stopped().is_some() {
+                TitleState::Stopped
+            } else if self.game.paused() {
+                TitleState::Paused
+            } else {
+                TitleState::Running
+            };
+            if let Some(title) = self.title_throttle.update(
+                self.game.lot().ticks(),
+                state,
+                Instant::now(),
+                TITLE_INTERVAL,
+            ) {
+                window.set_title(title);
             }
         }
         let Some(surface) = &mut self.surface else {
@@ -823,7 +930,7 @@ impl ApplicationHandler for App {
         }
         self.scale = window.scale_factor().round().max(1.0) as u32;
         self.window = Some(window.clone());
-        self.last = Instant::now();
+        self.wake_clock.reset(Instant::now());
         self.dirty = true;
         window.request_redraw();
     }
@@ -847,7 +954,7 @@ impl ApplicationHandler for App {
                 {
                     // Drop any wall-clock time spent paused or stalled while
                     // unfocused so the first tick after resume does not catch up.
-                    self.last = Instant::now();
+                    self.wake_clock.reset(Instant::now());
                     self.changed(true);
                 }
             }
@@ -1134,12 +1241,12 @@ fn run() -> Result<(), String> {
         window: None,
         surface: None,
         surface_size: None,
-        last_title: String::new(),
+        title_throttle: TitleThrottle::default(),
         scale: 1,
         cursor: None,
         last_cursor: None,
         drag: None,
-        last: Instant::now(),
+        wake_clock: WakeClock::new(Instant::now()),
         dirty: true,
         photos: 0,
         reported: false,
@@ -1302,5 +1409,151 @@ mod tests {
         assert!(!escape_exits(false, true, false));
         assert!(!escape_exits(false, false, true));
         assert!(escape_exits(false, false, false));
+    }
+
+    #[test]
+    fn within_step_budget_allows_first_tick_and_stops_at_cap() {
+        let budget = Duration::from_millis(8);
+        // First owed tick always runs even if elapsed already exceeds budget.
+        assert!(within_step_budget(0, Duration::ZERO, budget));
+        assert!(within_step_budget(0, Duration::from_millis(20), budget));
+        // Subsequent ticks continue strictly below budget and stop at/above budget.
+        assert!(within_step_budget(1, Duration::from_millis(7), budget));
+        assert!(within_step_budget(3, Duration::from_micros(7_999), budget));
+        assert!(!within_step_budget(1, Duration::from_millis(8), budget));
+        assert!(!within_step_budget(4, Duration::from_millis(12), budget));
+    }
+
+    #[test]
+    fn wake_clock_preserves_presentation_time_across_capped_batches() {
+        let t0 = Instant::now();
+        let mut clock = WakeClock::new(t0);
+
+        // Uncapped wake: both presentation and scheduler anchor to wake_start.
+        let w1_start = t0 + Duration::from_millis(16);
+        let w1_end = w1_start + Duration::from_millis(2);
+        assert_eq!(clock.elapsed_us(w1_start), (16_000, 16_000));
+        clock.finish(w1_start, w1_end, false);
+
+        // Capped wake: takes 9 ms; next wake arrives 5 ms after it ends.
+        let w2_start = w1_start + Duration::from_millis(16);
+        let w2_end = w2_start + Duration::from_millis(9);
+        assert_eq!(clock.elapsed_us(w2_start), (16_000, 16_000));
+        clock.finish(w2_start, w2_end, true);
+
+        // Presentation clock must advance by the full 9 + 5 = 14 ms while
+        // scheduler pacing advances only by the 5 ms since w2_end.
+        let w3_start = w2_end + Duration::from_millis(5);
+        assert_eq!(clock.elapsed_us(w3_start), (14_000, 5_000));
+    }
+
+    #[test]
+    fn title_throttle_rate_limits_running_and_flushes_state_transitions() {
+        let mut throttle = TitleThrottle::default();
+        let interval = Duration::from_millis(250);
+        let t0 = Instant::now();
+
+        // First call always emits.
+        assert_eq!(
+            throttle.update(0, TitleState::Running, t0, interval),
+            Some("sims-game: tick 0")
+        );
+        // Running tick updates within interval are suppressed.
+        assert_eq!(
+            throttle.update(
+                5,
+                TitleState::Running,
+                t0 + Duration::from_millis(100),
+                interval
+            ),
+            None
+        );
+        assert_eq!(
+            throttle.update(
+                9,
+                TitleState::Running,
+                t0 + Duration::from_millis(249),
+                interval
+            ),
+            None
+        );
+        // Once interval elapses, emits latest tick.
+        assert_eq!(
+            throttle.update(
+                10,
+                TitleState::Running,
+                t0 + Duration::from_millis(250),
+                interval
+            ),
+            Some("sims-game: tick 10")
+        );
+        // Same tick after another interval emits nothing, and does not push back
+        // the next tick change.
+        assert_eq!(
+            throttle.update(
+                10,
+                TitleState::Running,
+                t0 + Duration::from_millis(600),
+                interval
+            ),
+            None
+        );
+        assert_eq!(
+            throttle.update(
+                11,
+                TitleState::Running,
+                t0 + Duration::from_millis(610),
+                interval
+            ),
+            Some("sims-game: tick 11")
+        );
+        // State transitions (Paused, Running, Stopped) flush immediately even
+        // 1 ms after the previous update.
+        assert_eq!(
+            throttle.update(
+                11,
+                TitleState::Paused,
+                t0 + Duration::from_millis(611),
+                interval
+            ),
+            Some("sims-game: tick 11, paused")
+        );
+        assert_eq!(
+            throttle.update(
+                12,
+                TitleState::Paused,
+                t0 + Duration::from_millis(650),
+                interval
+            ),
+            None
+        );
+        assert_eq!(
+            throttle.update(
+                12,
+                TitleState::Running,
+                t0 + Duration::from_millis(660),
+                interval
+            ),
+            Some("sims-game: tick 12")
+        );
+        assert_eq!(
+            throttle.update(
+                12,
+                TitleState::Stopped,
+                t0 + Duration::from_millis(661),
+                interval
+            ),
+            Some("sims-game: tick 12, stopped")
+        );
+        // Redundant stopped redraws emit nothing.
+        assert_eq!(
+            throttle.update(
+                12,
+                TitleState::Stopped,
+                t0 + Duration::from_millis(1000),
+                interval
+            ),
+            None
+        );
     }
 }

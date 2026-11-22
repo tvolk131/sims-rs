@@ -14,9 +14,11 @@
 
 use crate::index::{all_far_members, sorted_entries};
 use crate::install::resolve;
+use crate::people::{Bone, Skeleton};
 use crate::{Error, Index, Install, Resource, Result};
 use sims_formats::animation::{Samples, read_bcf, read_cfp};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 /// What the animator reads of one clip.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,16 +121,72 @@ impl Track {
     }
 }
 
+type StridesKey = (String, String, usize, String);
+type StridesEntry = (u64, Vec<Bone>, [u32; 2]);
+
 /// Every clip of the animation files, by name.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct Animations {
     /// Each name's definitions, one per file that defines it, by the file's
     /// location relative to the install.
     clips: BTreeMap<String, BTreeMap<String, Clip>>,
+    /// ASCII-lowercase index over `clips` keys (kept sorted in `BTreeMap` key
+    /// order) so case-insensitive fallback in [`Animations::clip`] is `O(log n)`
+    /// instead of scanning every clip linearly.
+    by_lower: BTreeMap<String, Vec<String>>,
     /// The sample files (`.cfp`), by name in lowercase, without the
     /// extension or any directory an archive member's name holds: each
     /// distinct content a file of that name has.
     samples: BTreeMap<String, BTreeSet<Vec<u8>>>,
+    /// Monotonic revision bumped on every mutation so memoized stride entries
+    /// stay sound even if tests mutate `Animations` in place.
+    revision: u64,
+    /// Memoized walk strides (`[first_bits, second_bits]`) per
+    /// `(skeleton.file, skeleton.name, skeleton.place, clip.name)`, validated
+    /// against `revision` and `skeleton.bones`.
+    strides_cache: Arc<Mutex<BTreeMap<StridesKey, StridesEntry>>>,
+}
+
+impl Clone for Animations {
+    fn clone(&self) -> Self {
+        Self {
+            clips: self.clips.clone(),
+            by_lower: self.by_lower.clone(),
+            samples: self.samples.clone(),
+            revision: self.revision,
+            strides_cache: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+}
+
+impl PartialEq for Animations {
+    fn eq(&self, other: &Self) -> bool {
+        self.clips == other.clips && self.samples == other.samples
+    }
+}
+
+impl Eq for Animations {}
+
+/// Calls `f` with the ASCII-lowercased form of `s`, using a stack buffer when
+/// `s` fits in 256 bytes to avoid heap allocation on hot lookups.
+#[inline]
+fn with_ascii_lowercase<R>(s: &str, f: impl FnOnce(&str) -> R) -> R {
+    if !s.bytes().any(|b| b.is_ascii_uppercase()) {
+        return f(s);
+    }
+    if s.len() <= 256 {
+        let mut buf = [0u8; 256];
+        for (dst, &src) in buf[..s.len()].iter_mut().zip(s.as_bytes()) {
+            *dst = src.to_ascii_lowercase();
+        }
+        // Replacing ASCII uppercase bytes with ASCII lowercase preserves UTF-8.
+        let lower =
+            std::str::from_utf8(&buf[..s.len()]).expect("ASCII lowercasing preserves UTF-8");
+        f(lower)
+    } else {
+        let lower = s.to_ascii_lowercase();
+        f(&lower)
+    }
 }
 
 impl Animations {
@@ -215,6 +273,7 @@ impl Animations {
                     samples: [animation.translation_count, animation.rotation_count],
                     name: animation.name,
                 };
+                animations.index_clip_name(&clip.name);
                 animations
                     .clips
                     .entry(clip.name.clone())
@@ -222,20 +281,71 @@ impl Animations {
                     .insert(location.clone(), clip);
             }
         }
+        animations.revision = animations.revision.wrapping_add(1);
         Ok(animations)
+    }
+
+    fn index_clip_name(&mut self, name: &str) {
+        let lower = name.to_ascii_lowercase();
+        let entry = self.by_lower.entry(lower).or_default();
+        if let Err(pos) = entry.binary_search_by(|existing| existing.as_str().cmp(name)) {
+            entry.insert(pos, name.to_owned());
+        }
+    }
+
+    /// Monotonic revision bumped whenever clips or samples change.
+    #[inline]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns memoized walk-stride bit patterns `[first, second]` for
+    /// `(skeleton, clip_name)`, resolving the canonical clip from `self` so
+    /// arbitrary caller-supplied `Clip` values can never collide in the cache.
+    /// Validated against `self.revision` and `skeleton.bones` so mutations
+    /// never observe stale entries. Errors are never cached.
+    pub fn cached_strides<E>(
+        &self,
+        skeleton: &Skeleton,
+        clip_name: &str,
+        on_lookup_err: impl FnOnce(Error) -> E,
+        compute: impl FnOnce(&Clip) -> std::result::Result<[u32; 2], E>,
+    ) -> std::result::Result<[u32; 2], E> {
+        let clip = self.clip(clip_name).map_err(on_lookup_err)?;
+        let key = (
+            skeleton.file.clone(),
+            skeleton.name.clone(),
+            skeleton.place,
+            clip.name.clone(),
+        );
+        if let Ok(cache) = self.strides_cache.lock()
+            && let Some((rev, bones, bits)) = cache.get(&key)
+            && *rev == self.revision
+            && *bones == skeleton.bones
+        {
+            return Ok(*bits);
+        }
+        let bits = compute(clip)?;
+        if let Ok(mut cache) = self.strides_cache.lock() {
+            cache.insert(key, (self.revision, skeleton.bones.clone(), bits));
+        }
+        Ok(bits)
     }
 
     /// Adds a clip, defined by `file`. For tests.
     pub fn insert(&mut self, file: &str, clip: Clip) {
+        self.index_clip_name(&clip.name);
         self.clips
             .entry(clip.name.clone())
             .or_default()
             .insert(file.to_owned(), clip);
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Notes a sample file, by its name without the extension. For tests.
     pub fn insert_samples(&mut self, skill: &str) {
         self.samples.entry(skill.to_ascii_lowercase()).or_default();
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Adds a sample file's content, by its name without the extension.
@@ -245,6 +355,7 @@ impl Animations {
             .entry(skill.to_ascii_lowercase())
             .or_default()
             .insert(bytes);
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// The positions and rotations of `clip`, from its sample file.
@@ -254,9 +365,7 @@ impl Animations {
     /// known), and when the file does not decode.
     pub fn samples(&self, clip: &Clip) -> std::result::Result<Samples, Error> {
         let unsupported = |message: String| Err(Error::Unsupported(message));
-        let mut files = self
-            .samples
-            .get(&clip.skill.to_ascii_lowercase())
+        let mut files = with_ascii_lowercase(&clip.skill, |lower| self.samples.get(lower))
             .into_iter()
             .flatten();
         let (Some(bytes), None) = (files.next(), files.next()) else {
@@ -299,37 +408,45 @@ impl Animations {
         let unsupported = |message: String| Err(Error::Unsupported(message));
         let definitions = match self.clips.get(name) {
             Some(definitions) => definitions,
-            None => {
-                let mut others = self
-                    .clips
-                    .iter()
-                    .filter(|(k, _)| k.eq_ignore_ascii_case(name));
-                match (others.next(), others.next()) {
-                    (Some((_, definitions)), None) => definitions,
-                    (Some((first, _)), Some((second, _))) => {
+            None => match with_ascii_lowercase(name, |lower| self.by_lower.get(lower)) {
+                Some(keys) => match keys.as_slice() {
+                    [only] => match self.clips.get(only) {
+                        Some(definitions) => definitions,
+                        None => {
+                            return unsupported(format!(
+                                "no animation file defines the clip {name:?}"
+                            ));
+                        }
+                    },
+                    [first, second, ..] => {
                         return unsupported(format!(
                             "no animation file defines the clip {name:?}, but files define \
                              {first:?} and {second:?}, which differ from it only in case; \
                              which one the original would play is not known"
                         ));
                     }
-                    _ => {
+                    [] => {
                         return unsupported(format!("no animation file defines the clip {name:?}"));
                     }
+                },
+                None => {
+                    return unsupported(format!("no animation file defines the clip {name:?}"));
                 }
-            }
+            },
         };
         let mut clips = definitions.iter();
         let Some((file, clip)) = clips.next() else {
             return unsupported(format!("no animation file defines the clip {name:?}"));
         };
-        if let Some((other, _)) = clips.find(|(_, other)| *other != clip) {
+        if definitions.len() > 1
+            && let Some((other, _)) = clips.find(|(_, other)| *other != clip)
+        {
             return unsupported(format!(
                 "the clip {name:?} is defined differently by {file} and by {other}; choosing \
                  between them needs the original's animation library, which is not ported"
             ));
         }
-        if !self.samples.contains_key(&clip.skill.to_ascii_lowercase()) {
+        if !with_ascii_lowercase(&clip.skill, |lower| self.samples.contains_key(lower)) {
             return unsupported(format!(
                 "the samples of the clip {name:?} ({}.cfp) are missing",
                 clip.skill

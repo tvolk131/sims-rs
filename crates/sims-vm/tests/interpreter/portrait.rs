@@ -162,11 +162,12 @@ fn a_runtime_made_person_type_is_listed_in_the_portrait_table() {
                     strings,
                 },
             );
+            let id = (fx.world.neighbors.slots.len() + 1) as i16;
             fx.world
                 .neighbors
                 .slots
                 .push(Some(sims_sim::neighbors::Neighbor {
-                    id: (fx.world.neighbors.slots.len() + 1) as i16,
+                    id,
                     guid: MADE_GUID,
                     revision: 7,
                     data: vec![12; 256],
