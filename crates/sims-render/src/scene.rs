@@ -935,6 +935,10 @@ impl<'a> Painter<'a> {
                 let p = self.corner_screen(top, level);
                 let (view, height) = (self.rotate_corner(top), self.corner_elevation(top) / 16);
                 if floor == 0 {
+                    if level == 1 {
+                        self.pool([x, y], view, height);
+                        self.water([x, y], view, height, p);
+                    }
                     self.shadow(level, [x, y], view, height);
                     continue;
                 }
@@ -1025,9 +1029,154 @@ impl<'a> Painter<'a> {
                     }
                     self.stats.floors += 1;
                 }
+                if level == 1 {
+                    self.pool([x, y], view, height);
+                    self.water([x, y], view, height, p);
+                }
                 self.shadow(level, [x, y], view, height);
             }
         }
+    }
+
+    /// Draws the swimming pool water/coping overlay and inner-corner coping
+    /// patches for level-1 tile `[x, y]` (`Arry 9`, `0x4ae63b`–`0x4ae83e`,
+    /// `SPR2 0x400..=0x43b` and floor `12` for mask `0x10`).
+    fn pool(&mut self, [x, y]: [i32; 2], view: [i32; 2], height: i32) {
+        let cell = Lot::cell(x as usize, y as usize);
+        let raw = self.lot.pool[cell];
+        if raw > 0x10 {
+            return;
+        }
+        let zoom = self.camera.zoom.index();
+        let rot_val = rotate_cardinal_mask(raw, self.camera.rotation);
+        let tile_w = self
+            .assets
+            .floor(0, zoom)
+            .map_or(self.camera.zoom.tile_width() as usize, |img| img.width);
+        let at = shadow_origin(self.camera, self.lot, [x, y], 1, tile_w);
+        let byte = self.lot.light_at(0, [x * 16 + 8, y * 16 + 8]);
+        let lamps = if self.options.lighting {
+            Self::lamps_at(self.lot, self.camera, 0, [x, y])
+        } else {
+            [None; 2]
+        };
+        let tile_px = self.camera.zoom.tile_width();
+        let brightest = self.lot.brightest();
+        let depth = &self.depth;
+        let (base_d, first_row) = depth.floor_base(view, height, 1, at[1]);
+        let main = if rot_val < 0x10 {
+            self.assets.pool_tile_with_pools(rot_val, zoom)
+        } else {
+            self.assets.floor_with_pools(12, zoom)
+        };
+        if let Some((image, pools)) = main {
+            let row_depth = |sy| depth.floor_row(base_d, first_row, sy);
+            match (Light::drawn_byte(byte, brightest), pools) {
+                (Some(base), Some(pools)) if lamps.iter().any(Option::is_some) => {
+                    let origins = lamps.map(|lamp| lamp.map(|a| Pools::origin(tile_px, a)));
+                    let light = |ix: usize, iy: usize| {
+                        let mut sum = base;
+                        for o in origins.into_iter().flatten() {
+                            sum += u32::from(pools.at(zoom, o[0] + ix as i32, o[1] + iy as i32));
+                        }
+                        Light::from_sum(sum)
+                    };
+                    self.canvas
+                        .draw_floor_shaded(image, at, None, light, row_depth);
+                }
+                _ => {
+                    let flat_light = Light::from_byte(byte, brightest);
+                    self.canvas
+                        .draw_floor_shaded(image, at, None, |_, _| flat_light, row_depth);
+                }
+            }
+        }
+        // Inner-corner coping patches (`0x4ae710`–`0x4ae83e` -> `0x461e39`):
+        // depth bias -1 relative to the pool tile (`0x4ae744: push -1`), with
+        // `first_row` anchored at `at[1]` before adding `frame.y`
+        // (`0x4c8345`–`0x4c8351`).
+        let corner_bits = pool_inner_corners(self.lot, x, y, self.camera.rotation);
+        if corner_bits == 0 {
+            return;
+        }
+        let corner_base = base_d.saturating_sub(1);
+        for ci in 0..4u8 {
+            if (corner_bits & (1 << ci)) == 0 {
+                continue;
+            }
+            let Some((image, offset, pools)) = self.assets.pool_corner_with_pools(ci, zoom) else {
+                continue;
+            };
+            let cat = [
+                at[0].saturating_add(offset[0]),
+                at[1].saturating_add(offset[1]),
+            ];
+            let row_depth = |sy| depth.floor_row(corner_base, first_row, sy);
+            match (Light::drawn_byte(byte, brightest), pools) {
+                (Some(base), Some(pools)) if lamps.iter().any(Option::is_some) => {
+                    let origins = lamps.map(|lamp| lamp.map(|a| Pools::origin(tile_px, a)));
+                    let light = |ix: usize, iy: usize| {
+                        let mut sum = base;
+                        for o in origins.into_iter().flatten() {
+                            sum += u32::from(pools.at(
+                                zoom,
+                                o[0] + offset[0] + ix as i32,
+                                o[1] + offset[1] + iy as i32,
+                            ));
+                        }
+                        Light::from_sum(sum)
+                    };
+                    self.canvas
+                        .draw_floor_shaded(image, cat, None, light, row_depth);
+                }
+                _ => {
+                    let flat_light = Light::from_byte(byte, brightest);
+                    self.canvas
+                        .draw_floor_shaded(image, cat, None, |_, _| flat_light, row_depth);
+                }
+            }
+        }
+    }
+
+    /// Draws the pond/natural water sprite overlay for inner level-1 tile
+    /// `[x, y]` (`Arry 10`, `0x4af9d3`–`0x4b010c` → `0x4c1eea`–`0x4c2059` →
+    /// `0x4c6594`, `GameData/floors.iff` `SPR2 0x800..=0x80f`, frame `2 - zoom`).
+    fn water(&mut self, [x, y]: [i32; 2], view: [i32; 2], height: i32, top_screen: [i32; 2]) {
+        let limit = self.lot.size as i32 - 1;
+        if x < 1 || x >= limit || y < 1 || y >= limit {
+            return;
+        }
+        let cell = Lot::cell(x as usize, y as usize);
+        let raw = self.lot.water[cell];
+        if raw == 0xff {
+            return;
+        }
+        let zoom = self.camera.zoom.index();
+        let rot_val = rotate_cardinal_mask(raw, self.camera.rotation) & 0x0f;
+        let half_w = self
+            .assets
+            .floor(0, zoom)
+            .map_or(self.camera.zoom.tile_width() / 2, |img| {
+                img.width as i32 / 2
+            });
+        let Some(image) = self.assets.water_tile(rot_val, zoom) else {
+            return;
+        };
+        // `0x4afaac`–`0x4afad6`: `y` shifts up by 4 at Near zoom and 1 at
+        // Far/Medium zoom; `x` shifts left by 1 relative to normal floors.
+        let y_adj = if self.camera.zoom == Zoom::Near { 4 } else { 1 };
+        let at = [top_screen[0] - half_w - 1, top_screen[1] - y_adj];
+        let center = [x * 16 + 8, y * 16 + 8];
+        let byte = self.lot.light_at(0, center);
+        let light = Light::from_byte(byte, self.lot.brightest());
+        // `0x4c1f9d`–`0x4c1fb1`: ground depth + 0x50 (80 = `floor_base + 15`),
+        // stepping row-by-row through `R[y - origin_y]` anchored at `at[1]`.
+        let depth = &self.depth;
+        let (floor_base, first_row) = depth.floor_base(view, height, 1, at[1]);
+        let water_base = floor_base.saturating_add(15);
+        self.canvas.draw_water_overlay(image, at, light, |sy| {
+            depth.floor_row(water_base, first_row, sy)
+        });
     }
 
     /// Casts the floor shadow of tile (`x`, `y`) on `level`, whose view top
@@ -2474,6 +2623,103 @@ fn project_fine_terrain(
     [base[0].saturating_add(dx), base[1].saturating_add(dy)]
 }
 
+/// Rotates a 4-bit cardinal connectivity mask (`Arry 9` pool / `Arry 10` water)
+/// right by `rotation & 3` bits while preserving the high nibble (`0x4614d6`,
+/// rotation table `[0x6f4b70]` built at `0x53d310`–`0x53d39c`).
+fn rotate_cardinal_mask(mask: u8, rotation: u8) -> u8 {
+    let rot = rotation & 3;
+    if rot == 0 {
+        return mask;
+    }
+    let lo = mask & 0x0f;
+    let rotated = ((lo >> rot) | (lo << (4 - rot))) & 0x0f;
+    (mask & 0xf0) | rotated
+}
+
+/// Computes the 4-bit view-rotated inner-corner coping mask for swimming pool
+/// tile `[x, y]` (`0x461e39`–`0x461f75`, table `[0x6e52a0..0x6e52c8]`
+/// initialized at `0x461d2f`–`0x461e38`): bits 0..3 select `SPR2 0x430..0x433`
+/// (+ `zoom * 4`).
+fn pool_inner_corners(lot: &Lot, x: i32, y: i32, rotation: u8) -> u8 {
+    struct CornerRule {
+        self_req: u8,
+        d1: [i32; 2],
+        forbid1: u8,
+        need1: u8,
+        d2: [i32; 2],
+        forbid2: u8,
+        need2: u8,
+        out_bit: u8,
+    }
+    const RULES: [CornerRule; 4] = [
+        CornerRule {
+            self_req: 0x03,
+            d1: [-1, 0],
+            forbid1: 0x01,
+            need1: 0x08,
+            d2: [0, -1],
+            forbid2: 0x02,
+            need2: 0x04,
+            out_bit: 1,
+        },
+        CornerRule {
+            self_req: 0x06,
+            d1: [-1, 0],
+            forbid1: 0x04,
+            need1: 0x08,
+            d2: [0, 1],
+            forbid2: 0x02,
+            need2: 0x01,
+            out_bit: 2,
+        },
+        CornerRule {
+            self_req: 0x09,
+            d1: [0, -1],
+            forbid1: 0x08,
+            need1: 0x04,
+            d2: [1, 0],
+            forbid2: 0x01,
+            need2: 0x02,
+            out_bit: 8,
+        },
+        CornerRule {
+            self_req: 0x0c,
+            d1: [0, 1],
+            forbid1: 0x08,
+            need1: 0x01,
+            d2: [1, 0],
+            forbid2: 0x04,
+            need2: 0x02,
+            out_bit: 4,
+        },
+    ];
+    if !lot.contains(x, y) {
+        return 0;
+    }
+    let self_val = lot.pool[Lot::cell(x as usize, y as usize)];
+    let mut bits = 0u8;
+    for rule in &RULES {
+        if (self_val & rule.self_req) != rule.self_req {
+            continue;
+        }
+        let (x1, y1) = (x + rule.d1[0], y + rule.d1[1]);
+        let (x2, y2) = (x + rule.d2[0], y + rule.d2[1]);
+        if !lot.contains(x1, y1) || !lot.contains(x2, y2) {
+            continue;
+        }
+        let v1 = lot.pool[Lot::cell(x1 as usize, y1 as usize)];
+        if (v1 & rule.forbid1) != 0 || (v1 & rule.need1) == 0 {
+            continue;
+        }
+        let v2 = lot.pool[Lot::cell(x2 as usize, y2 as usize)];
+        if (v2 & rule.forbid2) != 0 || (v2 & rule.need2) == 0 {
+            continue;
+        }
+        bits |= rule.out_bit;
+    }
+    rotate_cardinal_mask(bits, rotation)
+}
+
 /// Screen top-left of a tile's floor shadow mask (`0x4adac0` → `0x4b9613` →
 /// `0x4b97ea`, `0x4ae8cc`–`0x4ae8e3`): project the tile centre at its rounded
 /// terrain altitude (`0x478dfe`), then subtract half `tile_width` (matching
@@ -3233,6 +3479,8 @@ mod tests {
             size: 52,
             heights: vec![[height; 4]; full],
             grass: vec![0; full],
+            pool: vec![0xff; full],
+            water: vec![0xff; full],
             levels: [empty(), empty()],
             outdoor_rooms: BTreeSet::new(),
             room_lights: BTreeMap::new(),
@@ -3745,5 +3993,62 @@ mod tests {
                 wall_draw_key(&cam, west.1, west.0)
             );
         }
+    }
+
+    #[test]
+    fn rotate_cardinal_mask_cycles_low_nibble_and_preserves_deck_bit() {
+        // 0x4614d6 right-rotates bits 0..3 (N=1 -> E=8 -> S=4 -> W=2 -> N=1)
+        // and leaves the high nibble (including 0x10 pool deck) untouched.
+        assert_eq!(rotate_cardinal_mask(1, 0), 1);
+        assert_eq!(rotate_cardinal_mask(1, 1), 8);
+        assert_eq!(rotate_cardinal_mask(1, 2), 4);
+        assert_eq!(rotate_cardinal_mask(1, 3), 2);
+        assert_eq!(rotate_cardinal_mask(0x0f, 1), 0x0f);
+        assert_eq!(rotate_cardinal_mask(0x00, 3), 0x00);
+        for rot in 0..4 {
+            assert_eq!(rotate_cardinal_mask(0x10, rot), 0x10);
+        }
+    }
+
+    #[test]
+    fn pool_inner_corners_detects_l_shaped_inside_corners_and_rotates() {
+        let mut lot = flat_lot(0);
+        // Build an L-shaped pool:
+        // (10,10)=pool  (11,10)=pool
+        // (10,11)=pool  (11,11)=empty  <-- inner corner on tile (10,10) facing (+x,+y)
+        let pool_coords = [(10usize, 10usize), (11, 10), (10, 11)];
+        let is_pool = |x: usize, y: usize| pool_coords.contains(&(x, y));
+        for &(x, y) in &pool_coords {
+            let mut m = 0u8;
+            if is_pool(x, y - 1) {
+                m |= 1;
+            }
+            if is_pool(x - 1, y) {
+                m |= 2;
+            }
+            if is_pool(x, y + 1) {
+                m |= 4;
+            }
+            if is_pool(x + 1, y) {
+                m |= 8;
+            }
+            lot.pool[Lot::cell(x, y)] = m;
+        }
+        // Tile (10,10) has S(4) and E(8) neighbors, whose shared corner (11,11) is dry ->
+        // rule 4 emits bit 4 (index 2) at rotation 0, cycling 4 -> 2 -> 1 -> 8.
+        assert_eq!(pool_inner_corners(&lot, 10, 10, 0), 4);
+        assert_eq!(pool_inner_corners(&lot, 10, 10, 1), 2);
+        assert_eq!(pool_inner_corners(&lot, 10, 10, 2), 1);
+        assert_eq!(pool_inner_corners(&lot, 10, 10, 3), 8);
+        // The two outer arms have no inner corners.
+        assert_eq!(pool_inner_corners(&lot, 11, 10, 0), 0);
+        assert_eq!(pool_inner_corners(&lot, 10, 11, 0), 0);
+
+        // Lot::exact_eq detects edits to pool and water arrays (invalidating LotCache).
+        let base = flat_lot(0);
+        assert!(!base.exact_eq(&lot));
+        let mut pond = flat_lot(0);
+        pond.water[Lot::cell(12, 12)] = 0;
+        assert!(!base.exact_eq(&pond));
     }
 }

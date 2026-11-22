@@ -127,6 +127,11 @@ impl BaseAssets {
     }
 }
 
+struct PoolCorner {
+    image: Image,
+    offset: [i32; 2],
+}
+
 pub struct Assets {
     id: u64,
     index: Arc<Index>,
@@ -139,6 +144,9 @@ pub struct Assets {
     files: BTreeMap<usize, Iff>,
     definitions: BTreeMap<u32, Option<Definition>>,
     floor_images: BTreeMap<(u16, usize), Option<Image>>,
+    pool_images: BTreeMap<(u8, usize), Option<Image>>,
+    pool_corners: BTreeMap<(u8, usize), Option<PoolCorner>>,
+    water_images: BTreeMap<(u8, usize), Option<Image>>,
     patterns: BTreeMap<(u16, usize), Option<[Image; 4]>>,
     shapes: BTreeMap<(u16, bool, usize), Option<[Image; 4]>>,
     groups: BTreeMap<(usize, u16, u32, usize), Vec<Part>>,
@@ -208,6 +216,9 @@ impl Assets {
             files: BTreeMap::new(),
             definitions: BTreeMap::new(),
             floor_images: BTreeMap::new(),
+            pool_images: BTreeMap::new(),
+            pool_corners: BTreeMap::new(),
+            water_images: BTreeMap::new(),
             patterns: BTreeMap::new(),
             shapes: BTreeMap::new(),
             groups: BTreeMap::new(),
@@ -303,6 +314,116 @@ impl Assets {
             })
             .as_ref()?;
         Some((img, pools))
+    }
+
+    /// A swimming pool water/coping sprite (`Arry 9`, `0x4ae68f`–`0x4ae6cc`)
+    /// for rotated connectivity mask `mask` (`0..=15`: `SPR2 0x400 + zoom * 16 + mask`,
+    /// frame 0) at `zoom` (`0` far to `2` near), or `None` if absent.
+    pub fn pool_tile(&mut self, mask: u8, zoom: usize) -> Option<&Image> {
+        self.pool_tile_with_pools(mask, zoom).map(|(img, _)| img)
+    }
+
+    /// Like [`Assets::pool_tile`], also borrowing [`Assets::pools`] simultaneously.
+    pub(crate) fn pool_tile_with_pools(
+        &mut self,
+        mask: u8,
+        zoom: usize,
+    ) -> Option<(&Image, Option<&Pools>)> {
+        if mask >= 16 || zoom >= 3 {
+            return None;
+        }
+        let floors = &self.floors;
+        let pools = self.pools.as_ref();
+        let img = self
+            .pool_images
+            .entry((mask, zoom))
+            .or_insert_with(|| {
+                let sprite = 0x400u16 + (zoom as u16) * 16 + u16::from(mask);
+                let chunk = floors.get(b"SPR2", sprite)?;
+                let data = floors.data(chunk);
+                let frame = SpriteSet::parse(data).ok()?.decode(data, 0, floors).ok()?;
+                Some(frame.into())
+            })
+            .as_ref()?;
+        Some((img, pools))
+    }
+
+    /// One inner-corner swimming pool coping patch (`Arry 9`, `0x4ae736`–`0x4ae839`,
+    /// `SPR2 0x430 + zoom * 4 + corner`, frame 0) and its sprite frame `[x, y]`
+    /// placement offset (`0x4c817e`–`0x4c8189`), for `corner` in `0..4` and
+    /// `zoom` in `0..3`.
+    pub fn pool_corner(&mut self, corner: u8, zoom: usize) -> Option<(&Image, [i32; 2])> {
+        self.pool_corner_with_pools(corner, zoom)
+            .map(|(img, off, _)| (img, off))
+    }
+
+    /// Like [`Assets::pool_corner`], also borrowing [`Assets::pools`] simultaneously.
+    pub(crate) fn pool_corner_with_pools(
+        &mut self,
+        corner: u8,
+        zoom: usize,
+    ) -> Option<(&Image, [i32; 2], Option<&Pools>)> {
+        if corner >= 4 || zoom >= 3 {
+            return None;
+        }
+        let floors = &self.floors;
+        let pools = self.pools.as_ref();
+        let corner = self
+            .pool_corners
+            .entry((corner, zoom))
+            .or_insert_with(|| {
+                let sprite = 0x430u16 + (zoom as u16) * 4 + u16::from(corner);
+                let chunk = floors.get(b"SPR2", sprite)?;
+                let data = floors.data(chunk);
+                let frame = SpriteSet::parse(data).ok()?.decode(data, 0, floors).ok()?;
+                let offset = [frame.x, frame.y];
+                Some(PoolCorner {
+                    image: frame.into(),
+                    offset,
+                })
+            })
+            .as_ref()?;
+        Some((&corner.image, corner.offset, pools))
+    }
+
+    /// A pond/natural water overlay sprite (`Arry 10`, `0x4afa97`–`0x4afad8`,
+    /// `GameData/floors.iff` `SPR2 0x800 + mask`, frame `2 - zoom`: `2` far,
+    /// `1` medium, `0` near) for rotated connectivity mask `mask` in `0..=15`
+    /// and `zoom` in `0..3`.
+    ///
+    /// In `Sims.exe`'s water blitter (`0x4c1eea`–`0x4c2059` → `0x4c6594`),
+    /// each pixel's first byte (the SPR2 depth channel) is an 8-bit alpha
+    /// mask quantized to 5 bits (`z >> 3`: `0` transparent, `1..=30` blended
+    /// over terrain via `0x49a60b`, `31` opaque), rather than a sprite depth
+    /// byte. We store that byte directly in `rgba[i * 4 + 3]` and clear
+    /// `image.depth`.
+    pub fn water_tile(&mut self, mask: u8, zoom: usize) -> Option<&Image> {
+        if mask >= 16 || zoom >= 3 {
+            return None;
+        }
+        let floors = &self.floors;
+        self.water_images
+            .entry((mask, zoom))
+            .or_insert_with(|| {
+                let sprite = 0x800u16 + u16::from(mask);
+                let frame_index = 2 - zoom;
+                let chunk = floors.get(b"SPR2", sprite)?;
+                let data = floors.data(chunk);
+                let frame = SpriteSet::parse(data)
+                    .ok()?
+                    .decode(data, frame_index, floors)
+                    .ok()?;
+                let mut image: Image = frame.into();
+                if let Some(alpha) = image.depth.take() {
+                    for (px, a) in image.rgba.as_chunks_mut::<4>().0.iter_mut().zip(alpha) {
+                        if px[3] != 0 {
+                            px[3] = a;
+                        }
+                    }
+                }
+                Some(image)
+            })
+            .as_ref()
     }
 
     /// The floor shadow mask of a shadow code at a zoom (0 far to 2 near),

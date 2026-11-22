@@ -473,6 +473,67 @@ impl Canvas {
         self.blit_row_depth(image, at, light, None, sub_rect, row_depth);
     }
 
+    /// Draws a pond/natural water overlay tile (`Arry 10`, `0x4c1eea`–`0x4c2059`
+    /// → `0x4c6594`), where each pixel's alpha channel holds the raw 8-bit mask
+    /// from the SPR2 depth channel:
+    /// - `a >> 3 == 0` (`a < 8`): skipped completely;
+    /// - `1 <= (a >> 3) < 31`: blended over the canvas via the 5-bit `0x49a60b`
+    ///   table (`blend565_with`) and unconditionally writes row depth `row_depth(y)`;
+    /// - `a >> 3 >= 31` (`a >= 248`): opaque copy and unconditionally writes
+    ///   row depth `row_depth(y)`.
+    pub(crate) fn draw_water_overlay(
+        &mut self,
+        image: &Image,
+        at: [i32; 2],
+        light: Light,
+        row_depth: impl Fn(i32) -> i32,
+    ) {
+        let Some(pixels) = image.width.checked_mul(image.height) else {
+            return;
+        };
+        if image.is_empty()
+            || !self.has_pixel_storage()
+            || pixels.checked_mul(4) != Some(image.rgba.len())
+        {
+            return;
+        }
+        self.record_rect(at[0], at[1], image.width, image.height);
+        let (x0, x1, ax) = clip_span(at[0], image.width, self.width);
+        let (y0, y1, ay) = clip_span(at[1], image.height, self.height);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let table = blend_table();
+        let pen = self.pen;
+        let width = self.width;
+        let img_w = image.width;
+        let rgba = &image.rgba;
+        for py in y0..y1 {
+            let d = row_depth(py as i32).clamp(0, EMPTY);
+            let iy = (py as i64 - ay) as usize;
+            let src_row = iy * img_w;
+            let dst_row = py * width;
+            let ix_start = (x0 as i64 - ax) as usize;
+            for (offset, px) in (x0..x1).enumerate() {
+                let pi = (src_row + ix_start + offset) * 4;
+                let a = rgba[pi + 3];
+                let a5 = a >> 3;
+                if a5 == 0 {
+                    continue;
+                }
+                let target = dst_row + px;
+                self.depth[target] = d;
+                self.ids[target] = pen;
+                let rgb = light.apply([rgba[pi], rgba[pi + 1], rgba[pi + 2]]);
+                if a5 >= 31 {
+                    self.color[target] = rgb;
+                } else {
+                    self.color[target] = blend565_with(table, rgb, self.color[target], a);
+                }
+            }
+        }
+    }
+
     /// Draws a wall pattern masked by `mask` (`top_left = false` requires exact
     /// size match like [`Image::masked`]; `top_left = true` matches
     /// [`Image::masked_top_left`]) without cloning or pre-allocating a masked
@@ -1749,5 +1810,34 @@ mod tests {
             |_| 5,
         );
         assert!(c2.color.iter().all(|&p| p == [0, 0, 0]));
+    }
+
+    #[test]
+    fn draw_water_overlay_blends_five_bit_alpha_and_writes_depth_unconditionally() {
+        let water = Image {
+            width: 3,
+            height: 1,
+            // Pixel 0: a=7 (7>>3 == 0, transparent -> skip).
+            // Pixel 1: a=128 (128>>3 == 16, 5-bit blended over bg).
+            // Pixel 2: a=254 (254>>3 == 31, opaque copy).
+            rgba: vec![
+                255, 0, 220, 7, // skipped chroma key
+                40, 80, 160, 128, // blended shoreline
+                33, 57, 82, 254, // opaque water
+            ],
+            depth: None,
+        };
+        let bg = [80, 120, 40];
+        let mut c = Canvas::new(3, 1, bg);
+        // Existing depth is nearer (100) than water depth (500): 0x4c6650 still
+        // writes depth 500 on every drawn pixel without a Z-test.
+        c.depth.fill(100);
+        c.draw_water_overlay(&water, [0, 0], Light::FULL, |_| 500);
+        assert_eq!(c.color[0], bg);
+        assert_eq!(c.depth[0], 100);
+        assert_eq!(c.color[1], blend565([40, 80, 160], bg, 128));
+        assert_eq!(c.depth[1], 500);
+        assert_eq!(c.color[2], [33, 57, 82]);
+        assert_eq!(c.depth[2], 500);
     }
 }

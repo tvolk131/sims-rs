@@ -1328,36 +1328,94 @@ fn draw_roof_layer(
     let vw = w_sub + 1;
     let vh = h_sub + 1;
 
-    // Determine whether each half-tile cell is inside the footprint. For
-    // diagonally split tiles (`NO_ROOM` + `Lot::halves`), include only the
-    // half-tile sub-cells whose center lies in an indoor triangle when room
-    // data is available (explicit caller footprints without room data cover
-    // all four sub-cells).
+    // Determine exact triangle coverage for each half-tile sub-cell.
+    // Non-split tiles cover both triangles (`0b11`) with automatic ridge split.
+    // Split-diagonal tiles (`NO_ROOM` + `Lot::halves`) force the sub-cell split
+    // along the tile's diagonal wall (`ASCENDING` `(0,0)-(1,1)` or `DESCENDING`
+    // `(1,0)-(0,1)`) and test each triangle's exact centroid against
+    // `Lot::room_at`, giving exact diagonal triangle clipping with zero
+    // stair-stepping along 45° walls.
+    #[derive(Clone, Copy)]
+    enum SubCell {
+        Empty,
+        Full,
+        /// Forced `(0,0)-(1,1)` split: bit 0 = `(v00,v10,v11)`, bit 1 = `(v00,v11,v01)`.
+        Split0011(u8),
+        /// Forced `(1,0)-(0,1)` split: bit 0 = `(v00,v10,v01)`, bit 1 = `(v10,v11,v01)`.
+        Split1001(u8),
+    }
+    impl SubCell {
+        fn is_full(self) -> bool {
+            matches!(self, Self::Full) || matches!(self, Self::Split0011(3) | Self::Split1001(3))
+        }
+        fn is_empty(self) -> bool {
+            matches!(self, Self::Empty) || matches!(self, Self::Split0011(0) | Self::Split1001(0))
+        }
+    }
     let level_idx = (base_level - 1).clamp(0, 1) as usize;
-    let mut inside = vec![false; w_sub * h_sub];
+    let mut sub_cells = vec![SubCell::Empty; w_sub * h_sub];
     for &[tx, ty] in tile_set {
         let sx0 = ((tx - min_tx) * 2) as usize;
         let sy0 = ((ty - min_ty) * 2) as usize;
         let cell = Lot::cell(tx as usize, ty as usize);
-        let is_split = lot.levels[level_idx]
+        let split_halves = lot.levels[level_idx]
             .rooms
             .as_ref()
             .is_some_and(|r| r[cell] == sims_sim::rooms::NO_ROOM)
-            && lot
-                .halves
-                .contains_key(&[base_level as u8, tx as u8, ty as u8]);
+            .then(|| lot.halves.get(&[base_level as u8, tx as u8, ty as u8]))
+            .flatten();
+        let is_indoor_fine = |fx: i32, fy: i32| {
+            lot.room_at(level_idx, [tx * 16 + fx, ty * 16 + fy])
+                .is_some_and(|r| !lot.outdoor_rooms.contains(&r))
+        };
         for dx in 0..2 {
             for dy in 0..2 {
-                let sub_ok = if is_split {
-                    let fine = [tx * 16 + dx as i32 * 8 + 4, ty * 16 + dy as i32 * 8 + 4];
-                    lot.room_at(level_idx, fine)
-                        .is_some_and(|r| !lot.outdoor_rooms.contains(&r))
+                let sub = if let Some(halves) = split_halves {
+                    // Triangles 1 (`fy > fx`) and 3 (`fx > fy`) split along
+                    // ascending `(0,0)-(1,1)`; triangles 2 (`fx + fy > 16`)
+                    // and 4 (`fx + fy < 16`) split along descending `(1,0)-(0,1)`.
+                    let ascending = halves.iter().any(|&(t, _)| t == 1 || t == 3);
+                    let ox = dx as i32 * 8;
+                    let oy = dy as i32 * 8;
+                    if ascending {
+                        // Tri 0: (0,0)-(8,0)-(8,8), centroid ≈ (5, 3) -> fx > fy
+                        // Tri 1: (0,0)-(8,8)-(0,8), centroid ≈ (3, 5) -> fy > fx
+                        let mut mask = 0u8;
+                        if is_indoor_fine(ox + 5, oy + 3) {
+                            mask |= 1;
+                        }
+                        if is_indoor_fine(ox + 3, oy + 5) {
+                            mask |= 2;
+                        }
+                        if mask == 0 {
+                            SubCell::Empty
+                        } else if mask == 3 {
+                            SubCell::Full
+                        } else {
+                            SubCell::Split0011(mask)
+                        }
+                    } else {
+                        // Tri 0: (0,0)-(8,0)-(0,8), centroid ≈ (3, 3) -> fx + fy < 8
+                        // Tri 1: (8,0)-(8,8)-(0,8), centroid ≈ (5, 5) -> fx + fy > 8
+                        let mut mask = 0u8;
+                        if is_indoor_fine(ox + 3, oy + 3) {
+                            mask |= 1;
+                        }
+                        if is_indoor_fine(ox + 5, oy + 5) {
+                            mask |= 2;
+                        }
+                        if mask == 0 {
+                            SubCell::Empty
+                        } else if mask == 3 {
+                            SubCell::Full
+                        } else {
+                            SubCell::Split1001(mask)
+                        }
+                    }
                 } else {
-                    true
+                    SubCell::Full
                 };
-                if sub_ok {
-                    inside[(sx0 + dx) * h_sub + (sy0 + dy)] = true;
-                }
+                sub_cells[(sx0 + dx) * h_sub + (sy0 + dy)] = sub;
             }
         }
     }
@@ -1371,24 +1429,32 @@ fn draw_roof_layer(
     let v_idx = |vx: usize, vy: usize| vx * vh + vy;
 
     // Compute Chebyshev distance (in half-tile steps) from the boundary of the
-    // roofed region for every vertex.
+    // roofed region for every vertex. A vertex touching any non-full (empty or
+    // diagonally clipped) sub-cell sits on an eave (`dist = 0`).
     let mut dist = vec![0i32; vw * vh];
+    let cell_full = |cx: isize, cy: isize| -> bool {
+        cx >= 0
+            && cy >= 0
+            && (cx as usize) < w_sub
+            && (cy as usize) < h_sub
+            && sub_cells[cx as usize * h_sub + cy as usize].is_full()
+    };
     let cell_in = |cx: isize, cy: isize| -> bool {
         cx >= 0
             && cy >= 0
             && (cx as usize) < w_sub
             && (cy as usize) < h_sub
-            && inside[cx as usize * h_sub + cy as usize]
+            && !sub_cells[cx as usize * h_sub + cy as usize].is_empty()
     };
     let mut queue = std::collections::VecDeque::new();
     for vx in 0..vw {
         for vy in 0..vh {
             let ix = vx as isize;
             let iy = vy as isize;
-            let all_four = cell_in(ix - 1, iy - 1)
-                && cell_in(ix, iy - 1)
-                && cell_in(ix - 1, iy)
-                && cell_in(ix, iy);
+            let all_four = cell_full(ix - 1, iy - 1)
+                && cell_full(ix, iy - 1)
+                && cell_full(ix - 1, iy)
+                && cell_full(ix, iy);
             if !all_four {
                 dist[v_idx(vx, vy)] = 0;
                 queue.push_back((vx, vy));
@@ -1515,10 +1581,11 @@ fn draw_roof_layer(
         }
     };
 
-    // Emit and rasterize 2 triangles per covered half-tile cell.
+    // Emit and rasterize up to 2 triangles per covered half-tile cell.
     for sx in 0..w_sub {
         for sy in 0..h_sub {
-            if !inside[sx * h_sub + sy] {
+            let cell_kind = sub_cells[sx * h_sub + sy];
+            if cell_kind.is_empty() {
                 continue;
             }
             let h00 = vertex_world_h[v_idx(sx, sy)];
@@ -1531,15 +1598,25 @@ fn draw_roof_layer(
             let v11 = make_vertex(sx + 1, sy + 1, h11);
             let v01 = make_vertex(sx, sy + 1, h01);
 
-            // Split along the diagonal that preserves crisp hip ridges.
-            let split_00_11 = (h00 - h11).abs() <= (h10 - h01).abs();
-            let tris = if split_00_11 {
-                [[v00, v10, v11], [v00, v11, v01]]
-            } else {
-                [[v00, v10, v01], [v10, v11, v01]]
+            let (tris, tri_mask) = match cell_kind {
+                SubCell::Split0011(mask) => ([[v00, v10, v11], [v00, v11, v01]], mask),
+                SubCell::Split1001(mask) => ([[v00, v10, v01], [v10, v11, v01]], mask),
+                SubCell::Full => {
+                    // Split along the diagonal that preserves crisp hip ridges.
+                    let split_00_11 = (h00 - h11).abs() <= (h10 - h01).abs();
+                    if split_00_11 {
+                        ([[v00, v10, v11], [v00, v11, v01]], 0b11)
+                    } else {
+                        ([[v00, v10, v01], [v10, v11, v01]], 0b11)
+                    }
+                }
+                SubCell::Empty => continue,
             };
 
-            for tri in tris {
+            for (ti, tri) in tris.into_iter().enumerate() {
+                if (tri_mask & (1 << ti)) == 0 {
+                    continue;
+                }
                 let shade = triangle_roof_shade(tri, sun, brightest);
                 stats.pixels_written += raster_roof_triangle(canvas, tri, pattern, shade);
                 stats.triangles_drawn += 1;
@@ -2635,5 +2712,59 @@ mod tests {
             (diff - 32).abs() <= 2,
             "8-step higher terrace roof should sit ~32 px higher at Far zoom (got {diff})"
         );
+
+        // 7. Split-diagonal roof tiles clip to the exact indoor triangle (for
+        //    both ascending (0,0)-(1,1) and descending (1,0)-(0,1) diagonals)
+        //    with zero roof overhang onto the outdoor triangle.
+        let cfg_zero_elev = RoofPreviewConfig {
+            style: RoofStyle::Hip,
+            pitch: RoofPitch::Flat,
+            ..RoofPreviewConfig::default()
+        };
+        for (halves, indoor_off, outdoor_off) in [
+            // Ascending diagonal: triangle 1 (fy > fx) indoor, triangle 3 (fx > fy) outdoor.
+            ([(1u8, 1i16), (3u8, 0i16)], [3, 13], [13, 3]),
+            // Descending diagonal: triangle 4 (fx + fy < 16) indoor, triangle 2 (fx + fy > 16) outdoor.
+            ([(4u8, 1i16), (2u8, 0i16)], [3, 3], [13, 13]),
+        ] {
+            let mut diag_lot = flat_lot.clone();
+            let mut diag_rooms = vec![0i16; lot::FULL * lot::FULL];
+            diag_rooms[Lot::cell(6, 6)] = sims_sim::rooms::NO_ROOM;
+            diag_lot.outdoor_rooms.insert(0);
+            diag_lot.levels[0].rooms = Some(diag_rooms);
+            diag_lot.halves.insert([1, 6, 6], halves);
+            let mut diag_cam = camera_for(&diag_lot, Zoom::Near, 0);
+            // Roof sits on level 2 (232 px above level 1 at Near zoom), so anchor
+            // level 1 near the bottom of the canvas so the roof falls near y = 58.
+            diag_cam.center_on([6 * 16 + 8, 6 * 16 + 8], [160, 290]);
+            let mut diag_canvas = Canvas::new(320, 320, [115, 113, 115]);
+            let diag_stats = draw_roof_preview(
+                &diag_lot,
+                &diag_cam,
+                &pattern,
+                &cfg_zero_elev,
+                &mut diag_canvas,
+            );
+            assert!(
+                diag_stats.pixels_written > 0,
+                "indoor triangle {halves:?} should draw roof pixels"
+            );
+            let indoor_pt =
+                diag_cam.project_fine([6 * 16 + indoor_off[0], 6 * 16 + indoor_off[1]], 2, 0);
+            let outdoor_pt =
+                diag_cam.project_fine([6 * 16 + outdoor_off[0], 6 * 16 + outdoor_off[1]], 2, 0);
+            assert!(
+                diag_canvas.depth
+                    [indoor_pt[1] as usize * diag_canvas.width + indoor_pt[0] as usize]
+                    < EMPTY,
+                "indoor diagonal half {halves:?} must be covered by the roof triangle"
+            );
+            assert_eq!(
+                diag_canvas.depth
+                    [outdoor_pt[1] as usize * diag_canvas.width + outdoor_pt[0] as usize],
+                EMPTY,
+                "outdoor diagonal half {halves:?} must have zero roof overhang"
+            );
+        }
     }
 }

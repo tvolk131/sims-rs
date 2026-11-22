@@ -721,6 +721,8 @@ mod tests {
             size: SIZE,
             heights: vec![[0; 4]; full],
             grass: vec![0; full],
+            pool: vec![0xff; full],
+            water: vec![0xff; full],
             levels: [
                 level(Some(rooms), walls),
                 level(None, vec![lot::WallCell::default(); full]),

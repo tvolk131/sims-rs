@@ -182,6 +182,17 @@ impl<'a> Player<'a> {
     /// takes the higher layer's motion, as the skin's bone assignment does
     /// (0x5991fd); that blending is not modeled further. Last, the head
     /// turns as the simulation's head fields say ([`Pose::turn_head`]).
+    ///
+    /// By default this interpolates fractional keyframes across all layers:
+    /// although `cAnimLayer::Update` (`0x597f1b`–`0x597f38`) clears its
+    /// per-layer `interpolate` flag when `delta_clock >= 2 * (duration / frames)`
+    /// (modeled by [`Layer::interpolate`]), `Sims.exe` also runs forced
+    /// zero-delta `cAnimSkin::Update` passes (`0x5934a8`, triggered on
+    /// wall/cutaway detail invalidation at `0x590ed1`–`0x590f2b`) that reset
+    /// `delta_clock = 0` and re-enable interpolation at the unchanged phase
+    /// (as seen on Cassandra's `C2O-sit-front` in `near-r2-0712-bench`).
+    /// Callers that want strict per-tick `cAnimLayer::Update` snapping can
+    /// use [`Player::pose_with_layer_interpolation`].
     pub fn pose(
         &mut self,
         skeleton: &Skeleton,
@@ -189,16 +200,32 @@ impl<'a> Player<'a> {
         layer: Option<&Layer>,
         base: &str,
     ) -> Result<Pose, String> {
+        self.pose_with_layer_interpolation(skeleton, animator, layer, base, false)
+    }
+
+    /// Like [`Player::pose`], optionally honoring [`Layer::interpolate`]
+    /// (`cAnimLayer::Update`, `0x597f1b`–`0x597f38`, `0x59844d`–`0x5985f8`)
+    /// when `respect_layer_interpolation` is `true`.
+    pub fn pose_with_layer_interpolation(
+        &mut self,
+        skeleton: &Skeleton,
+        animator: &Animator,
+        layer: Option<&Layer>,
+        base: &str,
+        respect_layer_interpolation: bool,
+    ) -> Result<Pose, String> {
         let mut pose = Pose::rest(skeleton);
         match (&animator.base, layer) {
             (Base::Empty, _) => {}
             (_, Some(layer)) => {
                 let clip = self.clip(&layer.clip)?;
-                clip.apply(
+                let interpolate = !respect_layer_interpolation || layer.interpolate();
+                clip.apply_with_interpolation(
                     skeleton,
                     &mut pose,
                     layer.phase.to_f32(),
                     layer.mode == 1,
+                    interpolate,
                     layer.weight.to_f32(),
                 );
             }
@@ -232,11 +259,13 @@ impl<'a> Player<'a> {
             .flatten()
         {
             let clip = self.clip(&layer.clip)?;
-            clip.apply(
+            let interpolate = !respect_layer_interpolation || layer.interpolate();
+            clip.apply_with_interpolation(
                 skeleton,
                 &mut pose,
                 layer.phase.to_f32(),
                 layer.mode == 1,
+                interpolate,
                 layer.weight.to_f32(),
             );
         }
@@ -377,5 +406,63 @@ mod tests {
         let toes = at(0.0, 0.0, 3.0).vector(Vec3::new(0.0, 0.0, 1.0));
         let forward = camera.forward();
         assert!(toes.dot(forward) < -0.8, "{toes:?} {forward:?}");
+    }
+
+    #[test]
+    fn pose_with_layer_interpolation_respects_flag() {
+        use sims_formats::animation::{Animation, Motion, Samples};
+
+        let skeleton = crate::rig::tests::skeleton();
+        let clip = Clip {
+            animation: Animation {
+                name: "walk".into(),
+                skill: "walk".into(),
+                duration_ms: 100.0,
+                distance: 0.0,
+                moving: false,
+                translation_count: 2,
+                rotation_count: 0,
+                frames: 2,
+                motions: vec![Motion {
+                    bone: "CHILD".into(),
+                    frames: 2,
+                    duration_ms: 100.0,
+                    translation: Some(0),
+                    rotation: None,
+                    properties: Vec::new(),
+                    event_lists: Vec::new(),
+                }],
+                events: Vec::new(),
+            },
+            samples: Samples {
+                translations: vec![[0.0, 1.0, 0.0], [0.0, 3.0, 0.0]],
+                rotations: Vec::new(),
+            },
+        };
+        let (assets, library) = (Assets::default(), Library::default());
+        let mut clips = BTreeMap::new();
+        clips.insert("walk".into(), clip);
+        let mut player = Player::with_clips(&assets, &library, clips);
+
+        // duration = 100 ms, 2 frames -> 2 * frame_ms = 100 ms.
+        // Repeating layer at speed 2.0: duration = 50 ms -> 2 * frame_ms = 50 ms;
+        // dt = 50 >= 50 -> interpolate = false.
+        let mut layer = Layer::start("walk", F32::from_f32(100.0), 2, true, 0, false, 0);
+        layer.mode = 1;
+        layer.set_speed(F32::from_f32(2.0));
+        layer.update(50).unwrap();
+        layer.phase = F32::from_f32(0.25);
+        assert!(!layer.interpolate());
+
+        let mut animator = Animator::new(50);
+        animator.foreground = Some(layer);
+
+        let default_pose = player.pose(&skeleton, &animator, None, "unused").unwrap();
+        assert_eq!(default_pose.local[1].translation, Vec3::new(0.0, 2.0, 0.0));
+
+        let snapped_pose = player
+            .pose_with_layer_interpolation(&skeleton, &animator, None, "unused", true)
+            .unwrap();
+        assert_eq!(snapped_pose.local[1].translation, Vec3::new(0.0, 1.0, 0.0));
     }
 }
