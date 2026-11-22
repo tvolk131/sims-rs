@@ -480,6 +480,17 @@ impl LockstepNode {
         }
     }
 
+    /// Peer-only: inspects the pending snapshot's authoritative [`SessionState`]
+    /// before [`Self::confirm_snapshot_applied`] installs it and sends the
+    /// completion ACK, allowing callers to transactionally verify/stage the VM
+    /// snapshot first.
+    pub fn pending_snapshot_session(&self, snapshot_id: SnapshotId) -> Option<&SessionState> {
+        self.pending_snapshot_install
+            .as_ref()
+            .filter(|p| p.snapshot_id == snapshot_id)
+            .map(|p| &p.session)
+    }
+
     /// Confirms that the caller has finished loading the REDB snapshot emitted
     /// via [`NodeEvent::ApplySnapshot`], atomically installing the snapshot's
     /// [`SessionState`], unblocking tick stepping, and acknowledging completion
@@ -973,6 +984,38 @@ impl LockstepNode {
         let a = self.pending_snapshots.remove(&snapshot_id).is_some();
         let b = self.active_snapshot_txs.remove(&snapshot_id).is_some();
         a || b
+    }
+
+    /// Host-only: aborts a failed snapshot transfer AND disconnects the
+    /// affected peer cleanly with `Goodbye(SessionClosed)` so the peer exits
+    /// its sync screen with an explicit error instead of stalling forever.
+    pub fn fail_snapshot<T: Transport>(
+        &mut self,
+        transport: &mut T,
+        snapshot_id: SnapshotId,
+    ) -> bool {
+        let peer = self
+            .pending_snapshots
+            .remove(&snapshot_id)
+            .map(|req| req.peer)
+            .or_else(|| {
+                self.active_snapshot_txs
+                    .remove(&snapshot_id)
+                    .map(|tx| tx.peer)
+            });
+        let Some(peer) = peer else {
+            return false;
+        };
+        let _ = transport.send(
+            &peer,
+            WireMessage::Goodbye {
+                epoch: self.session.epoch,
+                reason: LeaveReason::SessionClosed,
+            },
+        );
+        let _ = transport.disconnect(&peer);
+        self.handle_peer_disconnected(transport, peer, "snapshot transfer failed".to_owned());
+        true
     }
 
     // -------------------------------------------------------------------------

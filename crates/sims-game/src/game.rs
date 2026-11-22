@@ -317,6 +317,10 @@ pub struct Game {
     /// Set by `NeighborhoodShell` while on an away-from-home travel visit or
     /// destination edit lot so v1 home-lot co-op refuses cleanly.
     coop_travel_blocked: bool,
+    /// Latched `true` once this `Game` joins as a co-op peer or restores a
+    /// remote host's `"SCOP"` v2 snapshot. Stays `true` even after disconnect
+    /// so a remote host's world can NEVER overwrite local saves or autosaves.
+    coop_remote_world: bool,
     /// Compact quick-action buttons rendered beneath `CoopHudOverlay` (`Co-op` / `Copy` / `Leave`).
     coop_overlay_buttons: CoopOverlayButtons,
     /// Local-only Buy/Move placement preview in co-op mode (never mutates `self.lot.world()`).
@@ -704,6 +708,7 @@ impl Game {
             coop_player_name: default_player_name("Player"),
             coop_iroh_config: IrohConfig::P2pDefault,
             coop_travel_blocked: false,
+            coop_remote_world: false,
             coop_overlay_buttons: CoopOverlayButtons::default(),
             coop_buy_preview: None,
         };
@@ -976,6 +981,7 @@ impl Game {
             coop_player_name: default_player_name("Player"),
             coop_iroh_config: IrohConfig::P2pDefault,
             coop_travel_blocked: false,
+            coop_remote_world: false,
             coop_overlay_buttons: CoopOverlayButtons::default(),
             coop_buy_preview: None,
         };
@@ -1216,6 +1222,7 @@ impl Game {
             coop_player_name: default_player_name("Player"),
             coop_iroh_config: IrohConfig::P2pDefault,
             coop_travel_blocked: false,
+            coop_remote_world: false,
             coop_overlay_buttons: CoopOverlayButtons::default(),
             coop_buy_preview: None,
         };
@@ -1236,6 +1243,11 @@ impl Game {
         store: &sims_sim::neighborhood_store::NeighborhoodStore,
         neighborhood_id: &str,
     ) -> Result<sims_vm::lifecycle::SaveReport, String> {
+        if self.coop_blocks_local_save() {
+            let msg = "Only the co-op host can save a local lot (remote guest lots are read-only).";
+            self.note = Some(msg.into());
+            return Err(msg.into());
+        }
         let result = match self.buy_cursor.as_ref() {
             Some(cursor) => sims_vm::lifecycle::save_and_leave_lot_without_buy_cursor(
                 install_root,
@@ -3113,12 +3125,19 @@ impl Game {
                 self.note = Some("The lot has stopped, so it takes no orders.".into());
                 return Outcome::redraw();
             }
-            if self.buy_selected.is_some() || self.buy_cursor.is_some() {
+            if self.buy_selected.is_some()
+                || self.buy_cursor.is_some()
+                || self.coop_buy_preview.is_some()
+            {
                 self.pointer = Some(point);
                 self.hover_buy(point);
                 self.buy_dragging = Some(point);
                 self.buy_commit_on_release = true;
-                let valid = self.buy_cursor.as_ref().is_some_and(|c| c.valid);
+                let valid = if self.coop.is_active() {
+                    self.coop_buy_preview.is_some()
+                } else {
+                    self.buy_cursor.as_ref().is_some_and(|c| c.valid)
+                };
                 self.hud.play(if valid {
                     "UI_object_move_place"
                 } else {
@@ -3132,28 +3151,7 @@ impl Game {
             // `0x486960` → `0x4215e6`).
             if let Some(target) = self.under(point) {
                 if self.coop.is_active() {
-                    if let Some(obj) = self.lot.world().objects.get(&target)
-                        && obj.person.is_none()
-                    {
-                        self.coop_buy_preview = Some(CoopBuyPreview {
-                            guid: obj.guid,
-                            existing_object_id: Some(target),
-                            position: obj.position,
-                            facing: obj.data.get(1).copied().unwrap_or(0).rem_euclid(8),
-                        });
-                        self.buy_in_house = true;
-                        self.buy_dragging = Some(point);
-                        self.buy_commit_on_release = false;
-                        self.pointer = Some(point);
-                        self.hud.play("UI_object_move");
-                        let sounds = self.hud.take_sounds();
-                        self.keep_sounds(sounds);
-                        return Outcome::redraw();
-                    }
-                    self.hud.play(crate::hud::ERROR);
-                    let sounds = self.hud.take_sounds();
-                    self.keep_sounds(sounds);
-                    return Outcome::redraw();
+                    return self.coop_pick_up_preview(target, point);
                 }
                 match self.lot.buy_pick_up(target) {
                     Ok(Some(cursor)) => {
@@ -3199,12 +3197,19 @@ impl Game {
                 self.note = Some("The lot has stopped, so it takes no orders.".into());
                 return Outcome::redraw();
             }
-            if self.buy_selected.is_some() || self.buy_cursor.is_some() {
+            if self.buy_selected.is_some()
+                || self.buy_cursor.is_some()
+                || self.coop_buy_preview.is_some()
+            {
                 self.pointer = Some(point);
                 self.hover_buy(point);
                 self.buy_dragging = Some(point);
                 self.buy_commit_on_release = true;
-                let valid = self.buy_cursor.as_ref().is_some_and(|c| c.valid);
+                let valid = if self.coop.is_active() {
+                    self.coop_buy_preview.is_some()
+                } else {
+                    self.buy_cursor.as_ref().is_some_and(|c| c.valid)
+                };
                 self.hud.play(if valid {
                     "UI_object_move_place"
                 } else {
@@ -3216,6 +3221,9 @@ impl Game {
             }
             if self.hud.build_state.tool == Some(BuildTool::Hand) {
                 if let Some(target) = self.under(point) {
+                    if self.coop.is_active() {
+                        return self.coop_pick_up_preview(target, point);
+                    }
                     match self.lot.buy_pick_up(target) {
                         Ok(Some(cursor)) => {
                             let screen =
@@ -3384,7 +3392,7 @@ impl Game {
             // (`0x50d04d` → `0x4cf97a` → `0x487e18`).
             if self.hud.controls.mode == Mode::Buy
                 && self.hud.over_buy_catalog(self.view.size, point)
-                && self.buy_cursor.is_some()
+                && (self.buy_cursor.is_some() || self.coop_buy_preview.is_some())
             {
                 self.buy_dragging = None;
                 self.buy_commit_on_release = false;
@@ -4178,6 +4186,10 @@ impl Game {
     /// that went. Returns `true` if the save succeeded (`0x4f26cf`, checked by
     /// `0x4f29cc` before exiting).
     pub fn save_to(&mut self, store: &sims_sim::Snapshots, slot: &str) -> bool {
+        if self.coop_blocks_local_save() {
+            self.note = Some("Cannot save a remote host's co-op lot to a local save slot.".into());
+            return false;
+        }
         let saved = self.save().and_then(|saved| {
             store
                 .save_lot(slot, &saved.encode())
@@ -4201,6 +4213,10 @@ impl Game {
     /// Goes back to the lot saved in `store` under `slot`, saying across
     /// the top how that went. False if nothing changed.
     pub fn restore_from(&mut self, store: &sims_sim::Snapshots, slot: &str) -> bool {
+        if self.coop.is_active_or_starting() {
+            self.note = Some("Leave the co-op session before restoring a local save.".into());
+            return false;
+        }
         let saved = match store.load_lot(slot) {
             Ok(Some(bytes)) => Saved::decode(&bytes).map_err(|e| e.to_string()),
             Ok(None) => Err("nothing is saved for this house".into()),
@@ -5572,6 +5588,23 @@ impl Game {
         self.water_hover_overlay = None;
         let catalog = self.hud.ensure_build_catalog(&self.assets).clone();
         self.hud.build_state.select_tool(tool, &catalog);
+        if self.coop.is_active() {
+            // Never open or close the VM `"Wall Cursor"` object out-of-band in
+            // co-op mode; Build previews remain purely local until lockstep commit.
+            if matches!(
+                tool,
+                BuildTool::Terrain | BuildTool::Water | BuildTool::Roof
+            ) {
+                self.note = Some(
+                    "Terrain, Water/Pool, and Roof tools are not yet supported in co-op mode."
+                        .into(),
+                );
+            } else if tool == BuildTool::Roof {
+                self.sync_build_roof_ui();
+            }
+            self.layout_build();
+            return;
+        }
         match tool {
             BuildTool::Wall => {
                 let mode = self.current_wall_drag_mode().cursor_mode();
@@ -5599,6 +5632,22 @@ impl Game {
             return false;
         }
         let catalog = self.hud.ensure_build_catalog(&self.assets).clone();
+        if self.coop.is_active()
+            && matches!(
+                action,
+                BuildSubtoolAction::RoofPitch(_)
+                    | BuildSubtoolAction::RoofPattern(_)
+                    | BuildSubtoolAction::Terrain(_)
+                    | BuildSubtoolAction::Water(_)
+            )
+        {
+            self.note = Some(
+                "Terrain, Water/Pool, and Roof tools are not yet supported in co-op mode.".into(),
+            );
+            self.hud.play(crate::hud::ERROR);
+            self.layout_build();
+            return false;
+        }
         let state_changed = self.hud.build_state.apply_subtool(action, &catalog);
         match action {
             BuildSubtoolAction::Terrain(_) | BuildSubtoolAction::Water(_) => {
@@ -5829,6 +5878,9 @@ impl Game {
     }
 
     fn open_wall_cursor(&mut self, mode: i16) {
+        if self.coop.is_active() {
+            return;
+        }
         if let Some(mut cur) = self.wall_cursor.take() {
             if cur.mode != mode {
                 let pos = cur.position;
@@ -5844,6 +5896,10 @@ impl Game {
     }
 
     fn close_wall_cursor(&mut self) {
+        if self.coop.is_active() {
+            self.wall_cursor = None;
+            return;
+        }
         if let Some(cursor) = self.wall_cursor.take() {
             if let Err(e) = self.lot.build_cursor_close(&cursor) {
                 self.note = Some(format!("Could not close Wall Cursor: {e}"));
@@ -7380,6 +7436,53 @@ impl Game {
         self.coop.is_peer()
     }
 
+    /// Whether local saves/autosaves must be blocked because this `Game` is
+    /// currently connected as a peer OR holds a remote host's restored world
+    /// (persists even after disconnect so a host's world never overwrites a
+    /// guest's local REDB/standalone save slots).
+    pub fn coop_blocks_local_save(&self) -> bool {
+        self.coop.is_peer() || self.coop_remote_world
+    }
+
+    /// Returns `(host_house, host_family)` if a verified `"SCOP"` v2 snapshot
+    /// is parked awaiting guest shell restaging onto the host's matching lot.
+    pub fn pending_coop_restage(&self) -> Option<(u32, u32)> {
+        self.coop.pending_restage_target()
+    }
+
+    /// Detaches and returns the live [`CoopController`] (used when the shell
+    /// re-stages a fresh `Game` for a remote host's lot before completing a
+    /// parked snapshot restore).
+    pub fn take_coop_controller(&mut self) -> CoopController {
+        std::mem::take(&mut self.coop)
+    }
+
+    /// Installs a transferred [`CoopController`] onto a freshly staged `Game`.
+    pub fn install_coop_controller(&mut self, coop: CoopController, mark_remote: bool) {
+        self.coop = coop;
+        if mark_remote {
+            self.coop_remote_world = true;
+        }
+    }
+
+    /// Completes a parked host-lot snapshot restore onto this newly staged
+    /// `Game`, verifying the snapshot transactionally BEFORE sending the
+    /// completion ACK to the host.
+    pub fn complete_pending_coop_restage(&mut self) -> Result<(), String> {
+        let note = self.coop.complete_pending_restage(&mut self.lot)?;
+        self.coop_remote_world = true;
+        self.sync_after_coop_snapshot_restore();
+        self.note = Some(note);
+        Ok(())
+    }
+
+    /// Fails and cleans up a parked host-lot restage with an actionable message.
+    pub fn fail_pending_coop_restage(&mut self, reason: String) {
+        self.coop
+            .fail_pending_restage(&mut self.lot, reason.clone());
+        self.note = Some(reason);
+    }
+
     /// Local assigned [`sims_net::PlayerId`], once hosting or joined.
     pub fn coop_local_player_id(&self) -> Option<NetPlayerId> {
         self.coop.local_player_id()
@@ -7624,10 +7727,31 @@ impl Game {
     /// Gracefully leaves any active co-op session, detaching `Lot::coop` and
     /// closing any `iroh` endpoint and background Tokio runtime cleanly.
     pub fn leave_coop(&mut self) {
+        let was_remote = self.coop_remote_world;
         self.coop_buy_preview = None;
         self.coop_overlay_buttons = CoopOverlayButtons::default();
         self.coop.leave_and_shutdown(&mut self.lot);
-        self.note = Some("Disconnected from co-op session.".into());
+        self.note = Some(if was_remote {
+            "Disconnected from co-op session (read-only remote lot; return to Neighborhood for local saves)."
+                .into()
+        } else {
+            "Disconnected from co-op session.".into()
+        });
+    }
+
+    /// Non-blocking interactive Leave/Cancel for UI buttons so endpoint drain
+    /// and runtime shutdown never stall the `winit` UI thread.
+    pub fn leave_coop_nonblocking(&mut self) {
+        let was_remote = self.coop_remote_world;
+        self.coop_buy_preview = None;
+        self.coop_overlay_buttons = CoopOverlayButtons::default();
+        self.coop.leave_nonblocking(&mut self.lot);
+        self.note = Some(if was_remote {
+            "Disconnected from co-op session (read-only remote lot; return to Neighborhood for local saves)."
+                .into()
+        } else {
+            "Disconnected from co-op session.".into()
+        });
     }
 
     /// Builds a read-only [`CoopSnapshot`] for the Co-op Lobby & HUD Overlay.
@@ -7653,7 +7777,7 @@ impl Game {
                 let _ = self.coop_start_host_async(None);
             }
             CoopCommand::Disconnect | CoopCommand::CancelConnect => {
-                self.leave_coop();
+                self.leave_coop_nonblocking();
             }
             CoopCommand::CopyInviteTicket(ticket) => match clipboard_copy(&ticket) {
                 Ok(()) => {
@@ -7700,7 +7824,7 @@ impl Game {
                 }
             }
             CoopOverlayAction::Leave => {
-                self.leave_coop();
+                self.leave_coop_nonblocking();
             }
         }
         Outcome::redraw()
@@ -7726,37 +7850,63 @@ impl Game {
             return (0, false);
         }
 
-        if self.coop.is_host()
-            && let Err(err) = self
-                .coop
-                .schedule_host_ticks_for_elapsed(step_elapsed_us, 8)
-        {
-            self.note = Some(err);
+        let is_host = self.coop.is_host();
+        if is_host {
+            self.coop.accumulate_host_elapsed(step_elapsed_us, 8);
         }
 
         let mut ran = 0u32;
         let mut capped = false;
         let mut any_batch = false;
-        let flush = self.coop.is_host();
 
+        // Interleave host tick scheduling and stepping 1-for-1 inside the budget
+        // loop so the host never yields with scheduled-but-unapplied batches
+        // that would create a tick gap for a mid-game joiner.
         while self.stopped.is_none() {
             if !keep_going(ran) {
                 capped = true;
                 break;
             }
-            match self.coop.step_next_batch(&mut self.lot, flush) {
+            match self.coop.step_next_batch(&mut self.lot, is_host) {
                 Ok(Some(report)) => {
                     any_batch = true;
                     if report.stepped {
                         ran += 1;
                     }
                     self.apply_coop_batch_side_effects(&report);
+                    continue;
                 }
-                Ok(None) => break,
+                Ok(None) => {}
                 Err(err) => {
                     self.note = Some(err);
                     break;
                 }
+            }
+            if is_host {
+                match self.coop.schedule_one_host_tick_if_due() {
+                    Ok(true) => match self.coop.step_next_batch(&mut self.lot, true) {
+                        Ok(Some(report)) => {
+                            any_batch = true;
+                            if report.stepped {
+                                ran += 1;
+                            }
+                            self.apply_coop_batch_side_effects(&report);
+                            continue;
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            self.note = Some(err);
+                            break;
+                        }
+                    },
+                    Ok(false) => break,
+                    Err(err) => {
+                        self.note = Some(err);
+                        break;
+                    }
+                }
+            } else {
+                break;
             }
         }
 
@@ -7822,6 +7972,9 @@ impl Game {
     }
 
     fn sync_after_coop_snapshot_restore(&mut self) {
+        if self.coop.is_peer() {
+            self.coop_remote_world = true;
+        }
         self.stopped = None;
         self.errors = Errors::default();
         self.buy_cursor = None;
@@ -7847,6 +8000,34 @@ impl Game {
         self.lot_cache.clear();
         self.restore_generation = self.restore_generation.wrapping_add(1);
         self.blink_dirty = true;
+    }
+
+    /// Presentation-only Hand Tool pickup preview for Buy/Build modes in co-op
+    /// (never calls `Lot::buy_pick_up`, keeping the shared world immutable until
+    /// `BuyBuildEdit::MoveObject` / `SellObject` commits via lockstep).
+    fn coop_pick_up_preview(&mut self, target: u16, point: [i32; 2]) -> Outcome {
+        if let Some(obj) = self.lot.world().objects.get(&target)
+            && obj.person.is_none()
+        {
+            self.coop_buy_preview = Some(CoopBuyPreview {
+                guid: obj.guid,
+                existing_object_id: Some(target),
+                position: obj.position,
+                facing: obj.data.get(1).copied().unwrap_or(0).rem_euclid(8),
+            });
+            self.buy_in_house = true;
+            self.buy_dragging = Some(point);
+            self.buy_commit_on_release = false;
+            self.pointer = Some(point);
+            self.hud.play("UI_object_move");
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+            return Outcome::redraw();
+        }
+        self.hud.play(crate::hud::ERROR);
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        Outcome::redraw()
     }
 
     fn hover_buy_coop(&mut self, point: [i32; 2]) -> bool {
@@ -7935,6 +8116,11 @@ impl Game {
     }
 
     fn commit_build_coop(&mut self, drag: BuildDrag) -> Outcome {
+        // Stay strictly below `LockstepNode`'s 64-command per-player queue cap
+        // so a single Build drag never silently drops trailing commands.
+        const MAX_COOP_BUILD_DRAG_COMMANDS: usize = 48;
+        // `sims_vm::build::cell_index(x, y) = x * 64 + y` (column-major stride 64).
+        const FULL_GRID_STRIDE: usize = 64;
         let level = self.view.camera.level.clamp(1, 2) as u8;
         let mut sent = 0usize;
         let mut err_msg: Option<String> = None;
@@ -7955,7 +8141,12 @@ impl Game {
                         start_corner[0].max(end_corner[0]),
                     );
                     let y = start_corner[1] as i16;
-                    if x1 > x0 {
+                    let count = usize::try_from(x1.saturating_sub(x0)).unwrap_or(0);
+                    if count > MAX_COOP_BUILD_DRAG_COMMANDS {
+                        err_msg = Some(format!(
+                            "Co-op wall drag ({count} segments) exceeds {MAX_COOP_BUILD_DRAG_COMMANDS}-segment limit; drag a smaller section."
+                        ));
+                    } else if x1 > x0 {
                         for x in x0..x1 {
                             let edit = if mode.is_demolish() {
                                 BuyBuildEdit::RemoveWall {
@@ -7995,22 +8186,28 @@ impl Game {
                     && plan.valid
                     && plan.affordable
                 {
-                    let active = usize::try_from(self.lot.world().size).unwrap_or(64);
-                    let pattern = if mode.is_remove() { 0 } else { floor_id };
-                    for &(idx, _before, _after) in &plan.floor_changes {
-                        let x = (idx % active) as i16;
-                        let y = (idx / active) as i16;
-                        let edit = BuyBuildEdit::SetFloorTile {
-                            x,
-                            y,
-                            level,
-                            pattern,
-                        };
-                        if let Err(e) = self.coop.submit_command(NetCommand::BuyBuild(edit)) {
-                            err_msg = Some(e);
-                            break;
+                    if plan.floor_changes.len() > MAX_COOP_BUILD_DRAG_COMMANDS {
+                        err_msg = Some(format!(
+                            "Co-op floor drag ({} tiles) exceeds {MAX_COOP_BUILD_DRAG_COMMANDS}-tile limit; drag a smaller area.",
+                            plan.floor_changes.len()
+                        ));
+                    } else {
+                        let pattern = if mode.is_remove() { 0 } else { floor_id };
+                        for &(idx, _before, _after) in &plan.floor_changes {
+                            let x = (idx / FULL_GRID_STRIDE) as i16;
+                            let y = (idx % FULL_GRID_STRIDE) as i16;
+                            let edit = BuyBuildEdit::SetFloorTile {
+                                x,
+                                y,
+                                level,
+                                pattern,
+                            };
+                            if let Err(e) = self.coop.submit_command(NetCommand::BuyBuild(edit)) {
+                                err_msg = Some(e);
+                                break;
+                            }
+                            sent += 1;
                         }
-                        sent += 1;
                     }
                 }
             }
@@ -8024,27 +8221,34 @@ impl Game {
                     && plan.valid
                     && plan.affordable
                 {
-                    let pattern = if mode.is_strip() { 0 } else { pattern_id };
-                    for face in faces {
-                        let side = match face.bit {
-                            WALL_NORTH => 0,
-                            WALL_EAST => 1,
-                            WALL_SOUTH => 2,
-                            WALL_WEST => 3,
-                            _ => continue,
-                        };
-                        let edit = BuyBuildEdit::SetWallpaper {
-                            x: i16::from(face.tile[0]),
-                            y: i16::from(face.tile[1]),
-                            level,
-                            side,
-                            pattern,
-                        };
-                        if let Err(e) = self.coop.submit_command(NetCommand::BuyBuild(edit)) {
-                            err_msg = Some(e);
-                            break;
+                    if faces.len() > MAX_COOP_BUILD_DRAG_COMMANDS {
+                        err_msg = Some(format!(
+                            "Co-op wallpaper drag ({} faces) exceeds {MAX_COOP_BUILD_DRAG_COMMANDS}-face limit; drag a smaller section.",
+                            faces.len()
+                        ));
+                    } else {
+                        let pattern = if mode.is_strip() { 0 } else { pattern_id };
+                        for face in faces {
+                            let side = match face.bit {
+                                WALL_NORTH => 0,
+                                WALL_EAST => 1,
+                                WALL_SOUTH => 2,
+                                WALL_WEST => 3,
+                                _ => continue,
+                            };
+                            let edit = BuyBuildEdit::SetWallpaper {
+                                x: i16::from(face.tile[0]),
+                                y: i16::from(face.tile[1]),
+                                level,
+                                side,
+                                pattern,
+                            };
+                            if let Err(e) = self.coop.submit_command(NetCommand::BuyBuild(edit)) {
+                                err_msg = Some(e);
+                                break;
+                            }
+                            sent += 1;
                         }
-                        sent += 1;
                     }
                 }
             }

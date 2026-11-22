@@ -245,16 +245,15 @@ fn memory_mesh_two_games_full_lockstep_convergence_and_hud() {
         hash_before_menu,
         "throwaway coop_pie_menu must never mutate the shared Lot world"
     );
-    if let Some(action) = picked {
-        peer.coop_submit_command(NetCommand::SimActionPick {
-            sim_id: action.caller as u16,
-            target_id: action.target as u16,
-            menu_index: action.table_index as i16,
-            joining: action.join != 0,
-            args: action.args,
-        })
-        .expect("submit SimActionPick");
-    }
+    let action = picked.expect("expected at least one offered throwaway pie action on Goth lot");
+    peer.coop_submit_command(NetCommand::SimActionPick {
+        sim_id: action.caller as u16,
+        target_id: action.target as u16,
+        menu_index: action.table_index as i16,
+        joining: action.join != 0,
+        args: action.args,
+    })
+    .expect("submit SimActionPick");
 
     // 3. Speed, Pause, Mode, CameraRotation, and Buy/Build floor tile placement through lockstep.
     host.set_speed(Speed::Fast);
@@ -829,4 +828,340 @@ fn coop_preflight_refuses_tutorial_and_travel_and_options_button_opens_lobby() {
     assert!(shell.coop_lobby_open());
     assert!(shell.toggle_coop_lobby());
     assert!(!shell.coop_lobby_open());
+}
+
+#[test]
+fn sol_round1_regressions_build_guards_saves_restage_advance_and_failover() {
+    use sims_game::coop::is_coop_manifest_file;
+    use sims_ui::build::{BuildSubtoolAction, RoofPitchPreset};
+    use sims_ui::command::BuildTool;
+
+    // P2 #11: Manifest allowlist covers Animation/*.far and TemplateNPCs/*.
+    assert!(is_coop_manifest_file("gamedata/animation/animation.far"));
+    assert!(is_coop_manifest_file("templatenpcs/npcs.iff"));
+    assert!(is_coop_manifest_file("downloads/custom.iff"));
+    assert!(!is_coop_manifest_file("expansionpack/sound/ambient.far"));
+
+    let Some(install) = install_root() else {
+        eprintln!("skipping: SIMS_INSTALL not set");
+        return;
+    };
+
+    let mut host = open_goth_game(&install);
+    let mut peer = open_goth_game(&install);
+    let mesh = MemoryMesh::new(777);
+    let host_tx = mesh.add_node("mem://r1-host");
+    let host_addr = host_tx.local_address().clone();
+    let peer_tx = mesh.add_node("mem://r1-peer");
+    let manifest = ManifestDigest([0x33; 32]);
+
+    host.coop_start_host_with_transport(
+        CoopTransport::memory(host_tx),
+        manifest,
+        CoopStartOptions {
+            player_name: "HostR1".into(),
+            session_config: SessionConfig {
+                fingerprint_interval: 4,
+                ..SessionConfig::default()
+            },
+            prime_tick_on_start: true,
+            ..CoopStartOptions::default()
+        },
+    )
+    .expect("host start");
+    peer.coop_start_join_with_transport(
+        CoopTransport::memory(peer_tx),
+        host_addr,
+        manifest,
+        "PeerR1",
+    )
+    .expect("peer start");
+
+    for _ in 0..40 {
+        pump_memory_pair(&mesh, &mut host, &mut peer, true);
+        if peer.coop_controller().snapshot_restore_count() >= 1
+            && coop_player_count(&host) == 2
+            && coop_player_count(&peer) == 2
+        {
+            break;
+        }
+    }
+    assert_eq!(host.lot().coop_world_hash(), peer.lot().coop_world_hash());
+
+    // P1 #1: Selecting Wall, Wallpaper, Hand, and Roof pitch/pattern in co-op must NEVER mutate
+    // the shared Lot world out-of-band.
+    let hash_before_build = host.lot().coop_world_hash();
+    host.set_mode(Mode::Build);
+    host.select_build_tool(BuildTool::Wall);
+    host.select_build_tool(BuildTool::Wallpaper);
+    host.select_build_tool(BuildTool::Hand);
+    host.select_build_tool(BuildTool::Roof);
+    assert!(!host.apply_build_subtool(BuildSubtoolAction::RoofPitch(RoofPitchPreset::Steep)));
+    assert!(!host.apply_build_subtool(BuildSubtoolAction::RoofPattern(0)));
+    assert_eq!(
+        host.lot().coop_world_hash(),
+        hash_before_build,
+        "Build tool selections and unsupported Roof subtools must never mutate Lot out-of-band"
+    );
+
+    // P2 #6: Off-diagonal Build floor mouse-release commits to exact (x, y), NOT swapped (y, x).
+    const FLOORS_L1_ARRAY: u16 = 1;
+    let prices = host
+        .lot()
+        .coop()
+        .map(|ctx| ctx.build_prices.clone())
+        .unwrap_or_default();
+    let test_floor_id = prices
+        .floors
+        .keys()
+        .copied()
+        .find(|&pat| pat != 0)
+        .unwrap_or(1);
+    let off_diag = {
+        let world = host.lot().world();
+        let active = usize::try_from(world.size).unwrap_or(52) as i32;
+        let mut chosen = None;
+        'outer: for x in 12..(active - 12) {
+            for y in 12..(active - 12) {
+                if x == y {
+                    continue;
+                }
+                let plan = sims_vm::plan_floor_edit(
+                    world,
+                    [x, y],
+                    [x, y],
+                    1,
+                    test_floor_id,
+                    sims_vm::FloorDragMode::Lay,
+                    &prices,
+                    None,
+                );
+                let cur_floor = world
+                    .arrays
+                    .get(&FLOORS_L1_ARRAY)
+                    .and_then(|a| {
+                        let at = (x as usize * 64 + y as usize) * 2;
+                        a.data
+                            .get(at..at + 2)
+                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    })
+                    .unwrap_or(0);
+                if plan.valid && plan.affordable && cur_floor == 0 {
+                    chosen = Some([x, y]);
+                    break 'outer;
+                }
+            }
+        }
+        chosen.expect("expected an open flat off-diagonal grass tile")
+    };
+    assert_ne!(off_diag[0], off_diag[1]);
+    // Pump so Host's Mode::Build commits before floor drag.
+    for _ in 0..4 {
+        pump_memory_pair(&mesh, &mut host, &mut peer, true);
+    }
+    host.select_build_tool(BuildTool::Floor);
+    let lot_shape = sims_render::Lot::from_world(host.lot().world()).expect("lot shape");
+    let fine = [off_diag[0] * 16 + 8, off_diag[1] * 16 + 8, 1];
+    host.view.camera.center_on([fine[0], fine[1]], [400, 220]);
+    let actual = sims_game::sound::object_point_on_lot(&host.view.camera, &lot_shape, fine);
+    host.view.camera.origin[0] += 400 - (actual[0] + 1);
+    host.view.camera.origin[1] += 220 - actual[1];
+    host.render();
+    let pt = sims_game::sound::object_point_on_lot(&host.view.camera, &lot_shape, fine);
+    let screen_pt = [pt[0] + 1, pt[1]];
+    let _ = host.press(screen_pt);
+    let _ = host.release(screen_pt);
+    for _ in 0..6 {
+        pump_memory_pair(&mesh, &mut host, &mut peer, true);
+    }
+    let floor_at = |g: &Game, tx: i32, ty: i32| -> u16 {
+        g.lot()
+            .world()
+            .arrays
+            .get(&FLOORS_L1_ARRAY)
+            .and_then(|a| {
+                let at = (tx as usize * 64 + ty as usize) * 2;
+                a.data
+                    .get(at..at + 2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            })
+            .unwrap_or(0)
+    };
+    let placed_id = floor_at(&host, off_diag[0], off_diag[1]);
+    assert_ne!(
+        placed_id, 0,
+        "mouse-released off-diagonal Build floor drag must paint exact (x, y)={off_diag:?}"
+    );
+    assert_eq!(
+        floor_at(&peer, off_diag[0], off_diag[1]),
+        placed_id,
+        "peer must receive exact off-diagonal floor tile at (x, y)={off_diag:?}"
+    );
+    assert_eq!(host.lot().coop_world_hash(), peer.lot().coop_world_hash());
+
+    // Return to Live Mode and drive BOTH Host and Peer via live `advance_while`
+    // (normal jitter buffering + interleaved 1-for-1 host scheduling/stepping, P1 #5 + P3 #16).
+    host.set_mode(Mode::Live);
+    let before_live_ticks = host.lot().ticks();
+    for _ in 0..24 {
+        let _ = mesh.step_n(4);
+        let _ = host.advance_while(45_000, 45_000, |ran| ran < 1);
+        let _ = mesh.step_n(4);
+        let _ = peer.advance_while(45_000, 45_000, |ran| ran < 4);
+    }
+    assert!(
+        host.lot().ticks() > before_live_ticks + 4,
+        "live advance_while must advance host ticks"
+    );
+    assert!(
+        peer.lot().ticks() > before_live_ticks,
+        "live advance_while must advance peer ticks under normal jitter buffering"
+    );
+
+    // P1 #2 & P1 #3: Active co-op blocks F9 restore (host & peer) AND blocks peer standalone save
+    // even AFTER disconnecting from the host!
+    let tmp = TempDir::new("save-guards");
+    let store = sims_sim::Snapshots::open(&tmp.path().join("standalone.redb")).expect("open store");
+    assert!(
+        !peer.save_to(&store, "slot1"),
+        "active peer must be refused local standalone save"
+    );
+    assert!(
+        !host.restore_from(&store, "slot1"),
+        "active host must be refused local standalone restore"
+    );
+    assert!(
+        !peer.restore_from(&store, "slot1"),
+        "active peer must be refused local standalone restore"
+    );
+
+    // P3 #16: Host departure promotes Peer cleanly to Host and Peer continues advancing ticks!
+    host.leave_coop();
+    let _ = mesh.step_n(8);
+    let ticks_before_failover = peer.lot().ticks();
+    for _ in 0..20 {
+        let _ = mesh.step_n(4);
+        let _ = peer.advance_while(50_000, 50_000, |ran| ran < 2);
+        if peer.coop_is_host() && peer.lot().ticks() > ticks_before_failover + 2 {
+            break;
+        }
+    }
+    assert!(
+        peer.coop_is_host(),
+        "surviving peer must promote to Host after host departs"
+    );
+    assert!(
+        peer.lot().ticks() > ticks_before_failover + 2,
+        "promoted host must continue advancing ticks via advance_while"
+    );
+
+    // After Peer disconnects, remote host world STILL refuses local standalone save!
+    peer.leave_coop();
+    assert!(
+        peer.coop_blocks_local_save(),
+        "disconnected guest world must remain save-blocked"
+    );
+    assert!(
+        !peer.save_to(&store, "slot1"),
+        "disconnected guest world must never overwrite local standalone save slot"
+    );
+
+    // P1 #4 & P2 #10: NeighborhoodShell lot lobby keyboard routing + cross-lot restage!
+    // Host boots House02.iff (Roomies) while Guest joins from NeighborhoodShell (which defaults
+    // to Goth House05.iff) -> Guest receives host's snapshot -> `pump_coop_restage()` seamlessly
+    // stages House02 and converges bit-for-bit!
+    let house2 = install.join("UserData").join("Houses").join("House02.iff");
+    if house2.is_file() {
+        let mut host2 = Game::open(&Options {
+            install: install.clone(),
+            house: house2,
+            answers: Vec::new(),
+            play: true,
+            frames: Frames::default(),
+        })
+        .expect("boot House02");
+        host2.resize([800, 600]);
+        let saves2 = tmp.path().join("shell-restage.redb");
+        let mut guest_shell =
+            NeighborhoodShell::open(install, saves2, 1, true, vec![3], Frames::default())
+                .expect("open guest NeighborhoodShell");
+        guest_shell.resize([800, 600]);
+        // Enter default Goth lot (House 5) and verify lot lobby receives keyboard input (P2 #10).
+        guest_shell.enter_lot(5).expect("enter Goth lot 5");
+        assert!(guest_shell.toggle_coop_lobby());
+        assert!(guest_shell.coop_lobby_open());
+        let _ = guest_shell.key_tab();
+        let _ = guest_shell.key_char('a');
+        let _ = guest_shell.key_backspace();
+        let _ = guest_shell.escape();
+        assert!(
+            !guest_shell.coop_lobby_open(),
+            "Escape in NeighborhoodShell must close the active lot's Co-op Lobby"
+        );
+
+        let mesh2 = MemoryMesh::new(888);
+        let h2_tx = mesh2.add_node("mem://h2");
+        let h2_addr = h2_tx.local_address().clone();
+        let g2_tx = mesh2.add_node("mem://g2");
+        let m2 = ManifestDigest([0x99; 32]);
+
+        host2
+            .coop_start_host_with_transport(
+                CoopTransport::memory(h2_tx),
+                m2,
+                CoopStartOptions {
+                    player_name: "HostHouse2".into(),
+                    prime_tick_on_start: true,
+                    ..CoopStartOptions::default()
+                },
+            )
+            .expect("start House02 host");
+        guest_shell
+            .game_mut()
+            .expect("guest lot")
+            .coop_start_join_with_transport(CoopTransport::memory(g2_tx), h2_addr, m2, "Guest")
+            .expect("start guest join from House05");
+
+        for _ in 0..40 {
+            let _ = mesh2.step_n(4);
+            let need_host_tick = guest_shell.game().is_none_or(|g| coop_player_count(g) < 2);
+            host2.coop_pump(need_host_tick, true).expect("host2 pump");
+            let _ = mesh2.step_n(4);
+            if let Some(g) = guest_shell.game_mut() {
+                g.coop_pump(false, true).expect("guest pump");
+            }
+            let _ = guest_shell.pump_coop_restage();
+            let _ = mesh2.step_n(4);
+            if let Some(g) = guest_shell.game_mut() {
+                g.coop_pump(false, true).expect("guest follow-up pump");
+            }
+            if guest_shell.game().is_some_and(|g| {
+                g.coop_controller().snapshot_restore_count() >= 1
+                    && coop_player_count(g) == 2
+                    && g.lot().ticks() == host2.lot().ticks()
+            }) && coop_player_count(&host2) == 2
+            {
+                break;
+            }
+        }
+        let guest_game = guest_shell.game().expect("guest restaged game");
+        assert_eq!(
+            guest_game.coop_controller().snapshot_restore_count(),
+            1,
+            "guest shell must restage House02 and restore verified SCOP v2 snapshot"
+        );
+        assert_eq!(
+            host2.lot().coop_world_hash(),
+            guest_game.lot().coop_world_hash(),
+            "restaged guest House02 must match host bit-for-bit"
+        );
+        assert!(
+            guest_shell
+                .enqueue_background_lot_save(sims_sim::autosave::SaveTarget::Autosave)
+                .is_err(),
+            "restaged guest lot must refuse background lot autosave"
+        );
+        guest_shell.leave_coop_if_active();
+        host2.leave_coop();
+    }
 }

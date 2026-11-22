@@ -30,12 +30,17 @@ use sims_vm::boot::{Frames, Lot};
 use sims_vm::coop::{CoopBatchReport, CoopCommandStatus};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 /// Duration (ms) a speed/pause attribution toast remains visible in
 /// [`sims_ui::coop::CoopHudOverlay`].
 const TIME_TOAST_DURATION_MS: u32 = 3_000;
+
+/// Brief drain window before `iroh::Endpoint::close()` so queued `Goodbye`
+/// frames flush cleanly after `leave_gracefully` calls `transport.disconnect`.
+const GOODBYE_DRAIN_WINDOW: Duration = Duration::from_millis(35);
 
 /// Bounded wait for graceful `iroh::Endpoint::close()` on disconnect/drop so
 /// `Goodbye` frames flush cleanly without leaking threads or hanging exit.
@@ -131,7 +136,7 @@ pub fn is_coop_manifest_file(rel: &str) -> bool {
     if !ext_ok {
         return false;
     }
-    if rel.starts_with("downloads/") {
+    if rel.starts_with("downloads/") || rel.starts_with("templatenpcs/") {
         return true;
     }
     if rel.starts_with("gamedata/") {
@@ -140,6 +145,7 @@ pub fn is_coop_manifest_file(rel: &str) -> bool {
             || rel.starts_with("gamedata/global/")
             || rel.starts_with("gamedata/globals/")
             || rel.starts_with("gamedata/behavior/")
+            || rel.starts_with("gamedata/animation/")
             || rel.starts_with("gamedata/floors/")
             || rel.starts_with("gamedata/walls/")
             || rel == "gamedata/build.iff"
@@ -163,6 +169,23 @@ pub fn is_coop_manifest_file(rel: &str) -> bool {
 /// for `install_root`.
 pub fn build_install_manifest(install_root: &Path) -> Result<FileManifest, ManifestError> {
     FileManifest::from_directory(install_root, is_coop_manifest_file)
+}
+
+/// Cooperatively cancellable manifest scan for background startup tasks: once
+/// `cancelled` is set, remaining files are skipped immediately without reading
+/// or hashing them, and `Err("co-op startup cancelled")` is returned.
+fn build_install_manifest_cancellable(
+    install_root: &Path,
+    cancelled: &AtomicBool,
+) -> Result<FileManifest, String> {
+    let manifest = FileManifest::from_directory(install_root, |rel| {
+        !cancelled.load(Ordering::Relaxed) && is_coop_manifest_file(rel)
+    })
+    .map_err(|e| format!("manifest scan failed: {e}"))?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("co-op startup cancelled".to_owned());
+    }
+    Ok(manifest)
 }
 
 /// Default local co-op display name derived from environment (`USER` / `USERNAME`)
@@ -235,11 +258,41 @@ impl IrohBridge {
     pub fn shutdown(&mut self) {
         if let (Some(transport), Some(runtime)) = (self.transport.take(), self.runtime.take()) {
             runtime.block_on(async {
+                tokio::time::sleep(GOODBYE_DRAIN_WINDOW).await;
                 let _ = tokio::time::timeout(IROH_CLOSE_TIMEOUT, transport.close()).await;
             });
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
         } else if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        }
+    }
+
+    /// Moves endpoint drain + close and runtime shutdown onto a short-lived
+    /// background thread so interactive UI Cancel/Leave never blocks the
+    /// `winit` event loop while still letting `Goodbye` frames drain cleanly.
+    pub fn shutdown_background(&mut self) {
+        let transport = self.transport.take();
+        let runtime = self.runtime.take();
+        if transport.is_none() && runtime.is_none() {
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("sims-coop-close".into())
+            .spawn(move || match (transport, runtime) {
+                (Some(transport), Some(runtime)) => {
+                    runtime.block_on(async {
+                        tokio::time::sleep(GOODBYE_DRAIN_WINDOW).await;
+                        let _ = tokio::time::timeout(IROH_CLOSE_TIMEOUT, transport.close()).await;
+                    });
+                    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+                }
+                (None, Some(runtime)) => {
+                    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+                }
+                _ => {}
+            });
+        if spawned.is_err() {
+            // Fall back cleanly if OS thread spawn fails.
         }
     }
 }
@@ -400,6 +453,14 @@ impl CoopTransport {
             bridge.shutdown();
         }
     }
+
+    /// Non-blocking interactive teardown of the underlying transport so the UI
+    /// thread never stalls on `Goodbye` drain or Tokio worker shutdown.
+    pub fn shutdown_background(&mut self) {
+        if let Self::Iroh(bridge) = self {
+            bridge.shutdown_background();
+        }
+    }
 }
 
 impl From<MemoryNodeTransport> for CoopTransport {
@@ -500,6 +561,23 @@ pub struct CoopPollOutput {
     pub drift_events: usize,
     /// Whether the session ended or was rejected and has detached.
     pub ended: bool,
+    /// Set when the host's verified `"SCOP"` v2 snapshot belongs to a different
+    /// `(house, family)` than the currently booted guest lot so the shell can
+    /// stage the matching house before completing verified restore & ACK.
+    pub needs_lot_restage: Option<(u32, u32)>,
+}
+
+/// Snapshot parked while the guest shell re-stages the host's matching base
+/// lot `(host_house, host_family)` prior to verified restore and ACK.
+struct PendingHostLotRestage {
+    snapshot_id: sims_net::SnapshotId,
+    at_tick: Tick,
+    state_fingerprint: sims_net::StateFingerprint,
+    redb_bytes: Vec<u8>,
+    host_house: u32,
+    host_family: u32,
+    local_house: u32,
+    local_family: u32,
 }
 
 /// Summary of a deterministic [`crate::Game::coop_pump`] call in headless tests.
@@ -520,21 +598,35 @@ struct PendingIrohStart {
     options: CoopStartOptions,
     runtime: Option<tokio::runtime::Runtime>,
     abort_handle: tokio::task::AbortHandle,
+    cancelled: Arc<AtomicBool>,
     rx: mpsc::Receiver<AsyncBindOutcome>,
 }
 
 impl PendingIrohStart {
-    fn cancel(&mut self) {
+    fn cancel_blocking(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
         self.abort_handle.abort();
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        }
+    }
+
+    fn cancel_background(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.abort_handle.abort();
+        if let Some(runtime) = self.runtime.take() {
+            let _ = std::thread::Builder::new()
+                .name("sims-coop-cancel".into())
+                .spawn(move || {
+                    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+                });
         }
     }
 }
 
 impl Drop for PendingIrohStart {
     fn drop(&mut self) {
-        self.cancel();
+        self.cancel_blocking();
     }
 }
 
@@ -554,6 +646,8 @@ struct ActiveCoop {
     snapshot_restore_count: u64,
     /// Recorded player names so leave/failover messages still show names.
     known_names: BTreeMap<PlayerId, String>,
+    /// Snapshot awaiting guest lot re-staging to `(host_house, host_family)`.
+    pending_restage: Option<PendingHostLotRestage>,
 }
 
 impl ActiveCoop {
@@ -726,18 +820,23 @@ impl CoopController {
         let (tx, rx) = mpsc::channel();
         let iroh_config = options.iroh_config;
         let manifest_override = options.manifest_override;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_bg = Arc::clone(&cancelled);
+        let cancelled_task = Arc::clone(&cancelled);
         let handle = runtime.spawn(async move {
             let outcome = async {
                 let manifest = match manifest_override {
                     Some(digest) => digest,
                     None => tokio::task::spawn_blocking(move || {
-                        build_install_manifest(&install_root)
+                        build_install_manifest_cancellable(&install_root, &cancelled_bg)
                             .map(|m| m.digest())
-                            .map_err(|e| format!("manifest scan failed: {e}"))
                     })
                     .await
                     .map_err(|e| format!("manifest task failed: {e}"))??,
                 };
+                if cancelled_task.load(Ordering::Relaxed) {
+                    return Err("co-op startup cancelled".to_owned());
+                }
                 let transport = IrohTransport::bind(iroh_config)
                     .await
                     .map_err(|e| format!("could not bind iroh endpoint: {e}"))?;
@@ -752,6 +851,7 @@ impl CoopController {
             options,
             runtime: Some(runtime),
             abort_handle: handle.abort_handle(),
+            cancelled: Arc::clone(&cancelled),
             rx,
         });
         Ok(())
@@ -779,18 +879,23 @@ impl CoopController {
         let (tx, rx) = mpsc::channel();
         let iroh_config = options.iroh_config;
         let manifest_override = options.manifest_override;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_bg = Arc::clone(&cancelled);
+        let cancelled_task = Arc::clone(&cancelled);
         let handle = runtime.spawn(async move {
             let outcome = async {
                 let manifest = match manifest_override {
                     Some(digest) => digest,
                     None => tokio::task::spawn_blocking(move || {
-                        build_install_manifest(&install_root)
+                        build_install_manifest_cancellable(&install_root, &cancelled_bg)
                             .map(|m| m.digest())
-                            .map_err(|e| format!("manifest scan failed: {e}"))
                     })
                     .await
                     .map_err(|e| format!("manifest task failed: {e}"))??,
                 };
+                if cancelled_task.load(Ordering::Relaxed) {
+                    return Err("co-op startup cancelled".to_owned());
+                }
                 let transport = IrohTransport::bind(iroh_config)
                     .await
                     .map_err(|e| format!("could not bind iroh endpoint: {e}"))?;
@@ -805,6 +910,7 @@ impl CoopController {
             options,
             runtime: Some(runtime),
             abort_handle: handle.abort_handle(),
+            cancelled: Arc::clone(&cancelled),
             rx,
         });
         Ok(())
@@ -861,6 +967,7 @@ impl CoopController {
             drift_count: 0,
             snapshot_restore_count: 0,
             known_names: BTreeMap::new(),
+            pending_restage: None,
         };
         active.refresh_known_names();
         if options.prime_tick_on_start && active.node.session().current_tick == Tick::ZERO {
@@ -914,6 +1021,7 @@ impl CoopController {
             drift_count: 0,
             snapshot_restore_count: 0,
             known_names: BTreeMap::new(),
+            pending_restage: None,
         };
         active.refresh_known_names();
         self.phase = CoopPhase::Active(Box::new(active));
@@ -1146,7 +1254,9 @@ impl CoopController {
                                 SnapshotCompression::Deflate,
                                 DEFAULT_SNAPSHOT_CHUNK_BYTES,
                             ) {
-                                active.node.abort_snapshot(snapshot_id);
+                                active
+                                    .node
+                                    .fail_snapshot(&mut active.transport, snapshot_id);
                                 out.note =
                                     Some(format!("Could not send snapshot to {player_id}: {err}"));
                             } else if reason == ResyncReason::DriftDetected {
@@ -1156,7 +1266,9 @@ impl CoopController {
                             }
                         }
                         Err(err) => {
-                            active.node.abort_snapshot(snapshot_id);
+                            active
+                                .node
+                                .fail_snapshot(&mut active.transport, snapshot_id);
                             out.note = Some(format!(
                                 "Could not capture co-op snapshot for {player_id}: {err}"
                             ));
@@ -1168,22 +1280,35 @@ impl CoopController {
                         state_fingerprint,
                         redb_bytes,
                     } => {
-                        if let Err(err) = active
-                            .node
-                            .confirm_snapshot_applied(&mut active.transport, snapshot_id)
-                        {
-                            let msg = format!("Could not confirm snapshot {snapshot_id}: {err}");
+                        // Transactionally verify and restore the VM snapshot BEFORE
+                        // confirming completion to the host so a failed or mismatched
+                        // restore never sends `SnapshotAck(complete=true)`.
+                        let Some(mut pending_session) =
+                            active.node.pending_snapshot_session(snapshot_id).cloned()
+                        else {
+                            let msg = format!("Missing pending session for snapshot {snapshot_id}");
                             out.note = Some(msg.clone());
                             disconnect_with_state = Some(ConnectionState::Error(msg));
                             break;
-                        }
-                        let restored_session = active.node.session().clone();
+                        };
+                        pending_session.current_tick = at_tick;
                         match lot.restore_coop_snapshot_verified(
                             &redb_bytes,
-                            restored_session,
+                            pending_session,
                             state_fingerprint,
                         ) {
                             Ok(()) => {
+                                if let Err(err) = active
+                                    .node
+                                    .confirm_snapshot_applied(&mut active.transport, snapshot_id)
+                                {
+                                    let msg =
+                                        format!("Could not confirm snapshot {snapshot_id}: {err}");
+                                    out.note = Some(msg.clone());
+                                    disconnect_with_state = Some(ConnectionState::Error(msg));
+                                    break;
+                                }
+                                active.pending_restage = None;
                                 active.resync_reason = None;
                                 active.resync_progress_ticks = 0;
                                 active.snapshot_restore_count =
@@ -1194,6 +1319,38 @@ impl CoopController {
                                     "Co-op lot synced at tick {} (verified).",
                                     at_tick.0
                                 ));
+                            }
+                            Err(sims_vm::boot::save::SaveError::OtherHouse {
+                                saved: (host_house, host_family),
+                                loaded: (local_house, local_family),
+                            }) => {
+                                // Park snapshot for guest shell lot restaging without
+                                // confirming or disconnecting yet.
+                                active.resync_reason = Some(format!(
+                                    "Loading host's Lot {host_house} before snapshot restore..."
+                                ));
+                                active.pending_restage = Some(PendingHostLotRestage {
+                                    snapshot_id,
+                                    at_tick,
+                                    state_fingerprint,
+                                    redb_bytes,
+                                    host_house,
+                                    host_family: u32::from(host_family),
+                                    local_house,
+                                    local_family: u32::from(local_family),
+                                });
+                                out.needs_lot_restage = Some((host_house, u32::from(host_family)));
+                                out.note = Some(format!(
+                                    "Host is playing Lot {host_house} (family {host_family}); staging matching lot..."
+                                ));
+                            }
+                            Err(sims_vm::boot::save::SaveError::OtherLoad) => {
+                                let msg = "Host's lot was loaded from a different neighborhood or \
+                                           save layout. Open the matching neighborhood/lot and rejoin."
+                                    .to_owned();
+                                out.note = Some(msg.clone());
+                                disconnect_with_state = Some(ConnectionState::Error(msg));
+                                break;
                             }
                             Err(err) => {
                                 let msg = format!("Snapshot verification/restore failed: {err}");
@@ -1245,6 +1402,18 @@ impl CoopController {
                         new_epoch,
                     } => {
                         active.refresh_known_names();
+                        if Some(new_host) != active.node.local_player_id() {
+                            active.invite_ticket = None;
+                            active.connection = ConnectionState::Connected;
+                            if active.node.is_syncing() {
+                                active.resync_reason =
+                                    Some("Resyncing with new co-op host...".to_owned());
+                                active.resync_progress_ticks = 1;
+                            } else {
+                                active.resync_reason = None;
+                                active.resync_progress_ticks = 0;
+                            }
+                        }
                         let name = active.player_name(new_host);
                         out.note = Some(format!(
                             "Host migrated to {name} ({new_host}, {new_epoch})."
@@ -1279,7 +1448,7 @@ impl CoopController {
         }
 
         if let Some(failed_state) = disconnect_with_state {
-            self.shutdown_active(lot);
+            self.shutdown_active(lot, false);
             self.phase = CoopPhase::Failed(failed_state);
             out.ended = true;
             out.redraw = true;
@@ -1304,6 +1473,156 @@ impl CoopController {
         Ok(Some(res))
     }
 
+    /// Returns `(host_house, host_family)` if a verified snapshot is parked
+    /// waiting for the guest shell to load the host's matching base house.
+    pub fn pending_restage_target(&self) -> Option<(u32, u32)> {
+        match &self.phase {
+            CoopPhase::Active(active) => active
+                .pending_restage
+                .as_ref()
+                .map(|p| (p.host_house, p.host_family)),
+            _ => None,
+        }
+    }
+
+    /// Completes a parked host-lot snapshot restore onto `lot` (which has been
+    /// freshly loaded for `(host_house, host_family)`) and sends the verified
+    /// completion ACK to the host.
+    pub fn complete_pending_restage(&mut self, lot: &mut Lot) -> Result<String, String> {
+        let CoopPhase::Active(active) = &mut self.phase else {
+            return Err("not in an active co-op session".into());
+        };
+        let Some(pending) = active.pending_restage.take() else {
+            return Err("no pending co-op snapshot restage".into());
+        };
+        let Some(mut pending_session) = active
+            .node
+            .pending_snapshot_session(pending.snapshot_id)
+            .cloned()
+        else {
+            let msg = format!(
+                "Missing pending session for snapshot {}",
+                pending.snapshot_id
+            );
+            self.shutdown_active(lot, false);
+            self.phase = CoopPhase::Failed(ConnectionState::Error(msg.clone()));
+            return Err(msg);
+        };
+        pending_session.current_tick = pending.at_tick;
+        match lot.restore_coop_snapshot_verified(
+            &pending.redb_bytes,
+            pending_session,
+            pending.state_fingerprint,
+        ) {
+            Ok(()) => {
+                if let Err(err) = active
+                    .node
+                    .confirm_snapshot_applied(&mut active.transport, pending.snapshot_id)
+                {
+                    let msg = format!(
+                        "Could not confirm restaged snapshot {}: {err}",
+                        pending.snapshot_id
+                    );
+                    self.shutdown_active(lot, false);
+                    self.phase = CoopPhase::Failed(ConnectionState::Error(msg.clone()));
+                    return Err(msg);
+                }
+                active.resync_reason = None;
+                active.resync_progress_ticks = 0;
+                active.snapshot_restore_count = active.snapshot_restore_count.saturating_add(1);
+                active.refresh_known_names();
+                Ok(format!(
+                    "Co-op Lot {} synced at tick {} (verified).",
+                    pending.host_house, pending.at_tick.0
+                ))
+            }
+            Err(sims_vm::boot::save::SaveError::OtherHouse { .. })
+            | Err(sims_vm::boot::save::SaveError::OtherLoad) => {
+                let msg = format!(
+                    "Host is playing Lot {} (family {}), which does not match your local Lot {} \
+                     (family {}) or neighborhood load. Load the matching lot and rejoin.",
+                    pending.host_house,
+                    pending.host_family,
+                    pending.local_house,
+                    pending.local_family
+                );
+                self.shutdown_active(lot, false);
+                self.phase = CoopPhase::Failed(ConnectionState::Error(msg.clone()));
+                Err(msg)
+            }
+            Err(err) => {
+                let msg = format!("Snapshot verification/restore failed: {err}");
+                self.shutdown_active(lot, false);
+                self.phase = CoopPhase::Failed(ConnectionState::Error(msg.clone()));
+                Err(msg)
+            }
+        }
+    }
+
+    /// Aborts a parked host-lot restage cleanly with an actionable UI error.
+    pub fn fail_pending_restage(&mut self, lot: &mut Lot, reason: String) {
+        self.shutdown_active(lot, false);
+        self.phase = CoopPhase::Failed(ConnectionState::Error(reason));
+    }
+
+    /// Host-only: accumulates `step_elapsed_us` toward owed lockstep ticks
+    /// (capped at `max_ticks` periods). Pair with
+    /// [`Self::schedule_one_host_tick_if_due`] interleaved 1-for-1 with
+    /// [`Self::step_next_batch`] so the host never yields with scheduled-but-
+    /// unapplied batches that could create a tick gap for a mid-game joiner.
+    pub fn accumulate_host_elapsed(&mut self, step_elapsed_us: u64, max_ticks: u32) {
+        let CoopPhase::Active(active) = &mut self.phase else {
+            return;
+        };
+        if active.node.role() != PlayerRole::Host {
+            return;
+        }
+        let period_us = Self::host_period_us(active);
+        active.host_accum_us = active
+            .host_accum_us
+            .saturating_add(step_elapsed_us)
+            .min(period_us.saturating_mul(u64::from(max_ticks.max(1))));
+    }
+
+    /// Host-only: schedules at most ONE owed lockstep batch if the accumulated
+    /// elapsed time covers one tick period and pacing permits it.
+    pub fn schedule_one_host_tick_if_due(&mut self) -> Result<bool, String> {
+        let CoopPhase::Active(active) = &mut self.phase else {
+            return Ok(false);
+        };
+        if active.node.role() != PlayerRole::Host {
+            return Ok(false);
+        }
+        let period_us = Self::host_period_us(active);
+        if active.host_accum_us < period_us {
+            return Ok(false);
+        }
+        match active
+            .node
+            .advance_host_tick(&mut active.transport)
+            .map_err(|e| format!("host tick scheduling failed: {e}"))?
+        {
+            HostStepResult::Scheduled(_) => {
+                active.host_accum_us = active.host_accum_us.saturating_sub(period_us);
+                Ok(true)
+            }
+            HostStepResult::WaitingForSlowestPeer { .. } => {
+                active.host_accum_us = period_us;
+                Ok(false)
+            }
+        }
+    }
+
+    fn host_period_us(active: &ActiveCoop) -> u64 {
+        let period_ms = if active.node.session().is_paused() {
+            SimSpeed::NORMAL.period_ms()
+        } else {
+            let speed_period = active.node.session().time.speed.period_ms();
+            active.node.pacing_hint_ms().max(speed_period).max(1)
+        };
+        u64::from(period_ms).saturating_mul(1_000).max(1_000)
+    }
+
     /// Advances host pacing by `step_elapsed_us` and schedules owed lockstep
     /// ticks (including command ticks while paused so unpause / Buy-Build /
     /// dialogs remain live).
@@ -1312,42 +1631,10 @@ impl CoopController {
         step_elapsed_us: u64,
         max_ticks: u32,
     ) -> Result<u32, String> {
-        let CoopPhase::Active(active) = &mut self.phase else {
-            return Ok(0);
-        };
-        if active.node.role() != PlayerRole::Host {
-            return Ok(0);
-        }
-        let period_ms = if active.node.session().is_paused() {
-            SimSpeed::NORMAL.period_ms()
-        } else {
-            let speed_period = active.node.session().time.speed.period_ms();
-            active.node.pacing_hint_ms().max(speed_period).max(1)
-        };
-        let period_us = u64::from(period_ms).saturating_mul(1_000).max(1_000);
-        active.host_accum_us = active
-            .host_accum_us
-            .saturating_add(step_elapsed_us)
-            .min(period_us.saturating_mul(u64::from(max_ticks.max(1))));
-
+        self.accumulate_host_elapsed(step_elapsed_us, max_ticks);
         let mut scheduled = 0u32;
-        while scheduled < max_ticks && active.host_accum_us >= period_us {
-            match active
-                .node
-                .advance_host_tick(&mut active.transport)
-                .map_err(|e| format!("host tick scheduling failed: {e}"))?
-            {
-                HostStepResult::Scheduled(_) => {
-                    active.host_accum_us = active.host_accum_us.saturating_sub(period_us);
-                    scheduled += 1;
-                }
-                HostStepResult::WaitingForSlowestPeer { .. } => {
-                    // Hold accumulator at one period so we resume promptly
-                    // once the slowest peer catches up.
-                    active.host_accum_us = period_us;
-                    break;
-                }
-            }
+        while scheduled < max_ticks && self.schedule_one_host_tick_if_due()? {
+            scheduled += 1;
         }
         Ok(scheduled)
     }
@@ -1444,21 +1731,39 @@ impl CoopController {
 
     /// Gracefully leaves any active session (sending `Goodbye`), detaches
     /// `lot.detach_coop()`, and cleanly shuts down any `iroh` endpoint and
-    /// Tokio worker runtime.
+    /// Tokio worker runtime synchronously (blocking up to bounded drain/close
+    /// timeouts so tests and process exit leave zero background threads).
     pub fn leave_and_shutdown(&mut self, lot: &mut Lot) {
-        self.shutdown_active(lot);
+        self.shutdown_active(lot, true);
         self.phase = CoopPhase::Idle;
     }
 
-    fn shutdown_active(&mut self, lot: &mut Lot) {
+    /// Interactive non-blocking leave/cancel for UI buttons: sends `Goodbye`,
+    /// detaches `lot.detach_coop()`, and hands endpoint drain/close + runtime
+    /// shutdown to a short-lived background teardown thread so the `winit` UI
+    /// thread never stalls.
+    pub fn leave_nonblocking(&mut self, lot: &mut Lot) {
+        self.shutdown_active(lot, false);
+        self.phase = CoopPhase::Idle;
+    }
+
+    fn shutdown_active(&mut self, lot: &mut Lot, blocking: bool) {
         let prev = std::mem::replace(&mut self.phase, CoopPhase::Idle);
         match prev {
             CoopPhase::Starting(mut pending) => {
-                pending.cancel();
+                if blocking {
+                    pending.cancel_blocking();
+                } else {
+                    pending.cancel_background();
+                }
             }
             CoopPhase::Active(mut active) => {
                 let _ = active.node.leave_gracefully(&mut active.transport);
-                active.transport.shutdown();
+                if blocking {
+                    active.transport.shutdown();
+                } else {
+                    active.transport.shutdown_background();
+                }
             }
             CoopPhase::Idle | CoopPhase::Failed(_) => {}
         }
@@ -1579,7 +1884,7 @@ impl Drop for CoopController {
     fn drop(&mut self) {
         let prev = std::mem::replace(&mut self.phase, CoopPhase::Idle);
         match prev {
-            CoopPhase::Starting(mut pending) => pending.cancel(),
+            CoopPhase::Starting(mut pending) => pending.cancel_blocking(),
             CoopPhase::Active(mut active) => {
                 let _ = active.node.leave_gracefully(&mut active.transport);
                 active.transport.shutdown();

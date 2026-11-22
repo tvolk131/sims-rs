@@ -1499,11 +1499,26 @@ impl App {
                     || shell.travel_dialog_open()
         );
         if shell_modal_open {
-            self.wake_clock.finish(now, Instant::now(), false);
-            let redraw = match &mut self.session {
+            let mut redraw = match &mut self.session {
                 Session::Shell(shell) => shell.tick_shell(clock_us),
                 Session::Standalone { .. } | Session::Starting(_) => false,
             };
+            // Keep co-op lockstep & peer ACKs running beneath presentation
+            // modals (Save Manager / Photo Album) so neither side stalls.
+            if let Some(game) = self.session.game_mut()
+                && game.coop_active()
+            {
+                let (ran, capped) = game.advance_while(clock_us, step_us, |ran| {
+                    within_step_budget(ran, now.elapsed(), SIM_BUDGET)
+                });
+                self.wake_clock.finish(now, Instant::now(), capped);
+                redraw |= ran > 0 || game.blink_due();
+            } else {
+                self.wake_clock.finish(now, Instant::now(), false);
+            }
+            if let Session::Shell(shell) = &mut self.session {
+                redraw |= shell.pump_coop_restage();
+            }
             self.changed(redraw, false);
             return;
         }
@@ -1542,7 +1557,17 @@ impl App {
             redraw = true;
         }
         if let Session::Shell(shell) = &mut self.session {
+            redraw |= shell.pump_coop_restage();
             redraw |= shell.poll_background_saves();
+        } else if let Session::Standalone { game, .. } = &mut self.session
+            && let Some((host_house, host_family)) = game.pending_coop_restage()
+        {
+            game.fail_pending_coop_restage(format!(
+                "Host is playing Lot {host_house} (family {host_family}), which does not match \
+                 this standalone house file. Relaunch with House{host_house:02}.iff or in \
+                 Neighborhood mode and rejoin."
+            ));
+            redraw = true;
         }
         // Edge-scrolling and active 400 ms pie animations use display-refresh cadence,
         // while pure simulation ticks / plumb-bob spin / pause blink are passive (60 FPS cap).
@@ -2385,7 +2410,7 @@ impl ApplicationHandler for App {
                     self.changed(redraw, true);
                     return;
                 }
-                if self.session.has_dialog() {
+                if self.session.has_dialog() || self.session.coop_lobby_open() {
                     return;
                 }
                 if let Some(game) = self.session.game_mut() {
@@ -2457,7 +2482,10 @@ impl ApplicationHandler for App {
                     }
                 }
                 (MouseButton::Right, ElementState::Pressed) => {
-                    if self.session.game().is_some() && !self.session.has_dialog() {
+                    if self.session.game().is_some()
+                        && !self.session.has_dialog()
+                        && !self.session.coop_lobby_open()
+                    {
                         self.drag = self.live_point().and(self.cursor);
                     }
                 }
@@ -2534,7 +2562,10 @@ impl ApplicationHandler for App {
                     }
                     self.changed(redraw, true);
                 }
-                if self.session.has_dialog() || self.session.game().is_none() {
+                if self.session.has_dialog()
+                    || self.session.coop_lobby_open()
+                    || self.session.game().is_none()
+                {
                     self.drag = None;
                 }
                 if let Some(start) = self.drag {

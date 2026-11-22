@@ -3,7 +3,7 @@
 - **Date:** 2026-11-22
 - **Status:** Accepted
 - **Branch:** `game/coop-multiplayer-shell`
-- **Scope:** `crates/sims-game/` (plus this decision record)
+- **Scope:** `crates/sims-game/` (plus two small `LockstepNode` helpers in `crates/sims-net/src/session/lockstep.rs` for verify-before-confirm and failed-snapshot peer disconnect, and this decision record)
 
 ## Context
 
@@ -24,9 +24,11 @@ Key invariants that had to hold simultaneously:
 - Shutdown (`IrohBridge::shutdown` and `Drop`) closes the `iroh::Endpoint` asynchronously with a bounded timeout and shuts down the Tokio runtime cleanly so no threads or sockets leak on disconnect or window exit.
 - `CoopTransport` unifies `Memory(MemoryTransportHandle)` and `Iroh(IrohBridge)` behind `sims_net::Transport`. `MemoryTransportHandle` stores the `!Send` `sims_net::MemoryNodeTransport` in a thread-local `BTreeMap<u64, MemoryNodeTransport>` keyed by an atomic ID, keeping `CoopTransport`, `CoopController`, `Game`, and `NeighborhoodShell` 100% `Send` with zero `unsafe`.
 
-### 2. Mid-Game `"SCOP"` v2 Snapshot Sync & Drift Resync Ordering
+### 2. Mid-Game `"SCOP"` v2 Snapshot Sync, Host-Lot Restaging & Drift Resync Ordering
 - Host startup primes tick 1 (`prime_tick_on_start = true`) so `LockstepNode::on_hello` always streams a verified compressed chunked `"SCOP"` v2 snapshot (`Lot::coop_snapshot_bytes` via `SnapshotEnvelope`) to every live joiner.
-- When `LockstepNode` emits `NodeEvent::ApplySnapshot`, `CoopController` calls `node.confirm_snapshot_applied(&mut transport, snapshot_id)` first so `LockstepNode` installs the snapshot's authoritative `SessionState`, then clones `node.session()` into `Lot::restore_coop_snapshot_verified(&redb_bytes, restored_session, state_fingerprint)`. On verification failure, `Lot` rolls back transactionally and `CoopController` transitions cleanly to `ConnectionState::Error(...)`.
+- `Game::advance_coop_while` interleaves host tick scheduling and stepping 1-for-1 inside the frame budget loop so the host never yields with scheduled-but-unapplied batches that could open a tick gap for a mid-game joiner.
+- When `LockstepNode` emits `NodeEvent::ApplySnapshot`, `CoopController` inspects `LockstepNode::pending_snapshot_session(snapshot_id)` and runs `Lot::restore_coop_snapshot_verified(&redb_bytes, pending_session, state_fingerprint)` **first**, only calling `confirm_snapshot_applied` (which transmits `SnapshotAck(complete=true)`) after transactional VM verification succeeds. If `restore_coop_snapshot_verified` reports `SaveError::OtherHouse`, the snapshot is parked without confirming so `NeighborhoodShell::pump_coop_restage()` can seamlessly stage the host's matching local lot and complete verification, or fail cleanly with an actionable mismatch error.
+- If host-side snapshot capture or encoding fails, `LockstepNode::fail_snapshot` notifies and disconnects the affected peer cleanly so joiners never stall on the sync screen.
 - During active co-op, the host continues scheduling lockstep tick batches even while paused or showing a blocking dialog so unpause, Buy/Build edits, `SelectPerson`, and first-answer-wins `DialogAnswer` commands flow deterministically (`Lot::apply_coop_batch` executes commands with `stepped = false` while paused).
 
 ### 3. Per-Player Selection, Throwaway Pie Menus & Remote Indicators (`game.rs`, `menu.rs`, `hud.rs`)
