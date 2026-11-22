@@ -49,6 +49,135 @@ const TITLE_TOP: i32 = 12;
 const PADDING: i32 = 24;
 const MIN_HEIGHT: i32 = 127;
 
+/// Duration of the help balloon's fade-in / fade-out (or vertical slide when
+/// Interface Effects is disabled) in milliseconds (`0xfa` = 250 ms at
+/// `0x50fb56`, `0x50fb9c`, `[0x66be20] = 250.0f`).
+pub const FADE_DURATION_MS: u32 = 250;
+
+/// Pure-state 250 ms fade-in / fade-out temporal animation helper for help
+/// balloons (`cWinHelpBalloon`, `0x50f882..0x50fbdc`, using the native
+/// `cRZLinearRamp` at `[esi + 0xe4]`, `0x4733b7` / `0x473390`).
+///
+/// - Calling [`Self::open`] ramps progress from `0.0 -> 1.0` over 250 ms; if
+///   called while fading out (`0x50fad3..0x50fb2e`), it reverses seamlessly
+///   from the current progress `p -> 1.0` over `round((1.0 - p) * 250.0)` ms.
+/// - Calling [`Self::close`] ramps progress from the current progress `p -> 0.0`
+///   over `round(p * 250.0)` ms (250 ms when fully open, `0x50fb7f..0x50fbd4`).
+/// - [`Self::alpha`] converts progress to `[0..=255]` via `round(p * 255.0)`
+///   (`0x50f9ac..0x50f9bd`), matching the 5-bit blend blitter `[0x6f06c4]`.
+/// - [`Self::slide_offset_y`] computes the non-alpha vertical reveal offset
+///   `round((1.0 - p) * height)` used when Interface Effects is disabled
+///   (`0x50f8e6..0x50f909`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BalloonFadeState {
+    open: bool,
+    start_value: f32,
+    target_value: f32,
+    start_ms: u32,
+    end_ms: u32,
+}
+
+impl BalloonFadeState {
+    /// Creates a hidden (alpha 0) fade state.
+    pub const fn new() -> Self {
+        Self {
+            open: false,
+            start_value: 0.0,
+            target_value: 0.0,
+            start_ms: 0,
+            end_ms: 0,
+        }
+    }
+
+    /// Creates a fully visible (alpha 255) fade state without animation.
+    pub const fn visible() -> Self {
+        Self {
+            open: true,
+            start_value: 1.0,
+            target_value: 1.0,
+            start_ms: 0,
+            end_ms: 0,
+        }
+    }
+
+    /// Whether the balloon is logically open (even if still fading in).
+    pub const fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Begins fading the balloon in at `now_ms` (`0x50fa95..0x50fb7a`).
+    pub fn open(&mut self, now_ms: u32) {
+        if self.open {
+            return;
+        }
+        let cur = self.progress(now_ms);
+        self.open = true;
+        if cur > 0.0 && cur < 1.0 {
+            let rem_ms = (((1.0 - cur) * FADE_DURATION_MS as f32) + 0.5).clamp(0.0, 250.0) as u32;
+            self.start_value = cur;
+            self.target_value = 1.0;
+            self.start_ms = now_ms;
+            self.end_ms = now_ms.saturating_add(rem_ms);
+        } else {
+            self.start_value = 0.0;
+            self.target_value = 1.0;
+            self.start_ms = now_ms;
+            self.end_ms = now_ms.saturating_add(FADE_DURATION_MS);
+        }
+    }
+
+    /// Begins fading the balloon out at `now_ms` (`0x50fb7f..0x50fbdc`).
+    ///
+    /// Native `0x50fb91..0x50fbb1` unconditionally starts a fresh `1.0 -> 0.0`
+    /// ramp lasting [`FADE_DURATION_MS`] (250 ms), even if dismissed mid-open.
+    pub fn close(&mut self, now_ms: u32) {
+        if !self.open {
+            return;
+        }
+        self.open = false;
+        self.start_value = 1.0;
+        self.target_value = 0.0;
+        self.start_ms = now_ms;
+        self.end_ms = now_ms.saturating_add(FADE_DURATION_MS);
+    }
+
+    /// Evaluates the normalized linear ramp in `0.0..=1.0` at `now_ms` (`0x473390`).
+    pub fn progress(&self, now_ms: u32) -> f32 {
+        if now_ms >= self.end_ms || self.end_ms <= self.start_ms {
+            return self.target_value.clamp(0.0, 1.0);
+        }
+        if now_ms <= self.start_ms {
+            return self.start_value.clamp(0.0, 1.0);
+        }
+        let dur = (self.end_ms - self.start_ms) as f64;
+        let rem = (self.end_ms - now_ms) as f64;
+        let rate = f64::from(self.target_value - self.start_value) / dur;
+        (f64::from(self.target_value) - rem * rate).clamp(0.0, 1.0) as f32
+    }
+
+    /// Evaluates the 8-bit fade alpha `0..=255` at `now_ms` (`0x50f9ac..0x50f9bd`).
+    pub fn alpha(&self, now_ms: u32) -> u8 {
+        ((f64::from(self.progress(now_ms)) * 255.0 + 0.5).trunc() as i32).clamp(0, 255) as u8
+    }
+
+    /// Evaluates the downward vertical slide offset in pixels for a balloon of
+    /// `height` pixels when Interface Effects is disabled (`0x50f8e6..0x50f909`).
+    pub fn slide_offset_y(&self, now_ms: u32, height: i32) -> i32 {
+        let h = height.max(0);
+        ((1.0 - f64::from(self.progress(now_ms))) * f64::from(h) + 0.5).trunc() as i32
+    }
+
+    /// Whether the balloon still needs to be drawn at `now_ms`.
+    pub fn is_visible(&self, now_ms: u32) -> bool {
+        self.open || now_ms < self.end_ms
+    }
+
+    /// Whether the 250 ms transition is still in flight at `now_ms`.
+    pub fn is_animating(&self, now_ms: u32) -> bool {
+        now_ms < self.end_ms && self.end_ms > self.start_ms
+    }
+}
+
 /// What a balloon picture slot draws (`0x510547`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Picture {
@@ -652,6 +781,83 @@ pub fn draw_with_thumbnails(
     thumbnails: Option<&Thumbnails>,
     balloon: &Balloon,
 ) {
+    let screen_width = frame.width();
+    draw_with_thumbnails_inner(frame, art, thumbnails, balloon, screen_width);
+}
+
+/// Draws `balloon` composited at `alpha` (`0` = fully transparent, `255` =
+/// opaque), matching `cWinBalloon`'s 250 ms fade-in / fade-out animation
+/// (`0x50f882..0x50fbdc`, `0x5e8c93..0x5e8e10`).
+///
+/// Pair with [`BalloonFadeState::alpha`] when Interface Effects are enabled,
+/// or offset `balloon.rect.y` by [`BalloonFadeState::slide_offset_y`] and pass
+/// `255` when Interface Effects are disabled.
+pub fn draw_with_alpha(
+    frame: &mut Frame,
+    art: &Art,
+    thumbnails: Option<&Thumbnails>,
+    balloon: &Balloon,
+    alpha: u8,
+) {
+    if alpha == 0 {
+        return;
+    }
+    if alpha == 255 {
+        draw_with_thumbnails(frame, art, thumbnails, balloon);
+        return;
+    }
+    let fw = i32::try_from(frame.width()).unwrap_or(i32::MAX);
+    let fh = i32::try_from(frame.height()).unwrap_or(i32::MAX);
+    let x0 = balloon.rect.x.clamp(0, fw);
+    let y0 = balloon.rect.y.clamp(0, fh);
+    let x1 = balloon
+        .rect
+        .x
+        .saturating_add(balloon.rect.width)
+        .clamp(x0, fw);
+    let y1 = balloon
+        .rect
+        .y
+        .saturating_add(balloon.rect.height)
+        .clamp(y0, fh);
+    let w = (x1 - x0) as u32;
+    let h = (y1 - y0) as u32;
+    if w == 0 || h == 0 {
+        return;
+    }
+    // Render into a clipped scratch frame seeded with the existing background
+    // so untouched pixels outside rounded corners stay bit-exact, then alpha
+    // blend changed pixels back onto `frame`.
+    let mut scratch = Frame::new(w, h, [0, 0, 0]);
+    for sy in 0..h as i32 {
+        for sx in 0..w as i32 {
+            if let Some(bg) = frame.pixel(x0 + sx, y0 + sy) {
+                scratch.blend(sx, sy, bg, 255);
+            }
+        }
+    }
+    let mut shifted = balloon.clone();
+    shifted.rect.x -= x0;
+    shifted.rect.y -= y0;
+    draw_with_thumbnails_inner(&mut scratch, art, thumbnails, &shifted, frame.width());
+    for sy in 0..h as i32 {
+        for sx in 0..w as i32 {
+            if let (Some(src), Some(bg)) = (scratch.pixel(sx, sy), frame.pixel(x0 + sx, y0 + sy))
+                && src != bg
+            {
+                frame.blend(x0 + sx, y0 + sy, src, alpha);
+            }
+        }
+    }
+}
+
+fn draw_with_thumbnails_inner(
+    frame: &mut Frame,
+    art: &Art,
+    thumbnails: Option<&Thumbnails>,
+    balloon: &Balloon,
+    screen_width: u32,
+) {
     let r = balloon.rect;
     if let Some(back) = art.image(BACKGROUND) {
         let (right, bottom) = (r.x.saturating_add(r.width), r.y.saturating_add(r.height));
@@ -676,10 +882,9 @@ pub fn draw_with_thumbnails(
             }
         }
     }
-    let frame_width = frame.width();
     for (slot_index, picture) in balloon.pictures.iter().enumerate() {
         let Some(picture) = picture else { continue };
-        let (slot_y, slot_h) = slot_vertical(slot_index, r.height, frame_width);
+        let (slot_y, slot_h) = slot_vertical(slot_index, r.height, screen_width);
         let slot_x = if slot_index == 0 { 0 } else { RIGHT_SLOT_X };
         let slot = Rect::new(
             r.x.saturating_add(slot_x),
@@ -1024,5 +1229,91 @@ mod tests {
         assert_eq!(b.lines.len(), n);
         let height = line * (1 + i32::try_from(n).unwrap()) + PADDING;
         assert_eq!(b.rect, Rect::new(241, 500 - height, WIDTH, height));
+    }
+
+    #[test]
+    fn balloon_fade_state_ramps_over_250ms_and_reverses_smoothly() {
+        let mut fade = BalloonFadeState::default();
+        assert!(!fade.is_visible(0));
+        assert_eq!(fade.alpha(0), 0);
+
+        fade.open(1000);
+        assert!(fade.is_visible(1000));
+        assert_eq!(fade.alpha(1000), 0);
+        assert_eq!(fade.alpha(1125), 128);
+        assert_eq!(fade.alpha(1250), 255);
+        assert_eq!(fade.alpha(2000), 255);
+        assert_eq!(fade.slide_offset_y(1000, 128), 128);
+        assert_eq!(fade.slide_offset_y(1125, 128), 64);
+        assert_eq!(fade.slide_offset_y(1250, 128), 0);
+
+        // Close from fully open: 250 ms ramp back to 0.
+        fade.close(2000);
+        assert!(fade.is_visible(2125));
+        assert_eq!(fade.alpha(2125), 128);
+        assert_eq!(fade.alpha(2250), 0);
+        assert!(!fade.is_visible(2250));
+
+        // Reopen mid-close (at 2125 ms -> progress 0.5): resumes smoothly from
+        // 0.5 -> 1.0 over (1 - 0.5) * 250 = 125 ms.
+        fade.open(2125);
+        assert_eq!(fade.alpha(2125), 128);
+        assert_eq!(fade.alpha(2250), 255);
+
+        // Dismissing mid-open (`0x50fb91..0x50fbb1`) starts a full 250 ms
+        // `1.0 -> 0.0` ramp.
+        let mut mid = BalloonFadeState::default();
+        mid.open(1000);
+        mid.close(1125);
+        assert_eq!(mid.alpha(1125), 255);
+        assert_eq!(mid.alpha(1250), 128);
+        assert_eq!(mid.alpha(1375), 0);
+        assert!(!mid.is_visible(1375));
+    }
+
+    #[test]
+    fn draw_with_alpha_blends_balloon_over_backdrop() {
+        let mut art = Art::default();
+        let font = crate::font::tests::font();
+        art.insert_font(TITLE_FONT, font.clone());
+        art.insert_font(BODY_FONT, font);
+        art.insert(
+            BACKGROUND,
+            sims_formats::bitmap::Image {
+                width: 36,
+                height: 36,
+                rgba: [200, 100, 50, 255].repeat(36 * 36),
+            },
+        );
+        let balloon = lay_out(
+            &art,
+            &Text {
+                title: "T".into(),
+                body: "Body".into(),
+                pictures: [None, None],
+            },
+            Rect::new(413, 500, 387, 100),
+        );
+        let bg = [20, 40, 60];
+        let mut zero = Frame::new(800, 600, bg);
+        draw_with_alpha(&mut zero, &art, None, &balloon, 0);
+        assert_eq!(
+            zero.pixel(balloon.rect.x + 20, balloon.rect.y + 20),
+            Some(bg)
+        );
+
+        let mut half = Frame::new(800, 600, bg);
+        draw_with_alpha(&mut half, &art, None, &balloon, 128);
+        let px = half
+            .pixel(balloon.rect.x + 20, balloon.rect.y + 20)
+            .unwrap();
+        assert!(px[0] > bg[0] && px[0] < 200);
+        assert_eq!(half.pixel(0, 0), Some(bg));
+
+        let mut full = Frame::new(800, 600, bg);
+        let mut direct = Frame::new(800, 600, bg);
+        draw_with_alpha(&mut full, &art, None, &balloon, 255);
+        draw_with_thumbnails(&mut direct, &art, None, &balloon);
+        assert_eq!(full.rgb(), direct.rgb());
     }
 }
