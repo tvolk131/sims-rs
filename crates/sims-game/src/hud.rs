@@ -280,6 +280,7 @@ pub struct Hud {
 
 /// Install-only HUD assets (art, UI strings, options defaults) that depend
 /// solely on [`Install`] and can be loaded in parallel with lot boot.
+#[derive(Clone)]
 pub(crate) struct HudStatic {
     art: Art,
     labels: Labels,
@@ -377,6 +378,7 @@ impl HudStatic {
 
 /// Index/Catalog-dependent HUD tables (`work.iff` careers and house rating
 /// tuning) that can be loaded in parallel with VM linking and animations.
+#[derive(Clone)]
 pub(crate) struct HudShared {
     careers: Careers,
     house: house::Tuning,
@@ -1757,6 +1759,28 @@ impl Hud {
         }
     }
 
+    /// Microseconds until the next HUD blink timer (`ClockBlink`, modal
+    /// text-entry caret, or cheat-console caret) needs a wakeup, or `None`
+    /// when no blink is active.
+    pub fn next_blink_us(&self, clock_us: u64) -> Option<u64> {
+        const CARET_POLL_US: u64 = 100_000;
+        let mut best: Option<u64> = None;
+        let mut consider = |us: u64| {
+            best = Some(best.map_or(us, |prev| prev.min(us)));
+        };
+        if let Some(us) = self.clock_blink.next_blink_us(clock_us) {
+            consider(us);
+        }
+        if self.active_message().is_some_and(|m| m.entry.is_some()) || self.cheat_console.is_open()
+        {
+            // Text-entry carets restart their 500 ms blink timer on focus/edit
+            // inside `sims-ui`; poll at 100 ms (10 Hz) only while open so the
+            // caret toggles promptly regardless of edit phase.
+            consider(CARET_POLL_US);
+        }
+        best
+    }
+
     /// Syncs the clock controls' shared 500 ms blink timer (`0x53b4b0..0x53b7e7`)
     /// with `world` and the monotonic `clock_us`:
     /// - state 2 (`Paused`): blinks `id::PAUSE` row 0 <-> row 1 whenever
@@ -1839,7 +1863,7 @@ impl Hud {
     /// every neighborhood record), or while the house panel shows (the
     /// strip open on it), the house's ratings.
     pub fn snapshot(&self, world: &World, residential: bool) -> Snapshot {
-        self.for_panel(self.household(world, residential), world)
+        self.for_panel(self.household(world, residential, None), world)
     }
 
     /// The active household's live member roster (`0x4e97dc`): reads the
@@ -1861,10 +1885,22 @@ impl Hud {
     }
 
     /// The household with zoning-aware family friends, career needs/grades,
-    /// and Superstar fame progression data.
-    fn household(&self, world: &World, residential: bool) -> Snapshot {
-        Snapshot::read(world, self.members(world))
-            .with_idle_speed(self.effective_idle_speed(world))
+    /// and Superstar fame progression data. When `selected_override` is `Some`,
+    /// overrides `selected` and `selected_guid` in-place without cloning `World`.
+    fn household(
+        &self,
+        world: &World,
+        residential: bool,
+        selected_override: Option<Option<u16>>,
+    ) -> Snapshot {
+        let mut snap = Snapshot::read(world, self.members(world));
+        if let Some(sel) = selected_override {
+            let selected_obj =
+                sel.and_then(|id| world.objects.get(&id).filter(|o| o.person.is_some()));
+            snap.selected = selected_obj.map(|o| o.id);
+            snap.selected_guid = selected_obj.map(|o| o.guid);
+        }
+        snap.with_idle_speed(self.effective_idle_speed(world))
             .with_zoning(world, residential, self.known.friendship)
             .with_careers(&self.careers)
             .with_fame(world, &self.known, &self.fame)
@@ -1957,10 +1993,43 @@ impl Hud {
         visibility: options::LotVisibility,
         assets: &Assets,
         view: &View,
+        pace: &Pace,
+        status: Option<&str>,
+        sell: Option<&SellInfo>,
+        clock_us: u64,
+        canvas: &mut Canvas,
+    ) {
+        self.draw_for_lot_at_with_selection(
+            world,
+            residential,
+            visibility,
+            assets,
+            view,
+            pace,
+            status,
+            sell,
+            clock_us,
+            None,
+            canvas,
+        );
+    }
+
+    /// Like [`Hud::draw_for_lot_at`], optionally overriding the HUD's displayed
+    /// selected Sim (`selected_override`: `Some(local_sel)`) in co-op mode
+    /// without cloning `world`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_for_lot_at_with_selection(
+        &mut self,
+        world: &World,
+        residential: bool,
+        visibility: options::LotVisibility,
+        assets: &Assets,
+        view: &View,
         _pace: &Pace,
         status: Option<&str>,
         sell: Option<&SellInfo>,
         clock_us: u64,
+        selected_override: Option<Option<u16>>,
         canvas: &mut Canvas,
     ) {
         self.last_clock_us = clock_us;
@@ -1980,7 +2049,7 @@ impl Hud {
         self.controls.speed = hud::speed_for(world);
         // The panel follows the selection first, so that the snapshot
         // reads what the open panel needs.
-        let household = self.household(world, residential);
+        let household = self.household(world, residential, selected_override);
         if self.controls.follow(Selected::of(&household)) {
             self.play(WHOOSH);
         }
@@ -2928,7 +2997,7 @@ impl Hud {
             // (e.g. zodiac on a pet, Report Card on an adult, or Fame on a
             // regular career) does not open a balloon or play `UI_whoosh`.
             Command::Help(help) => {
-                let snapshot = self.household(world, residential);
+                let snapshot = self.household(world, residential, None);
                 if !hud::help_matches_snapshot(help, &snapshot, self.controls.panel) {
                     return None;
                 }
@@ -3080,6 +3149,19 @@ impl ClockBlink {
 
     fn ultra_lit(&self) -> bool {
         self.ultra_lit
+    }
+
+    fn next_blink_us(&self, clock_us: u64) -> Option<u64> {
+        if !matches!(self.state, ClockState::Paused | ClockState::IdleUltra) {
+            return None;
+        }
+        match self.since {
+            None => Some(hud::PAUSE_BLINK_US),
+            Some(since) => {
+                let rem = hud::PAUSE_BLINK_US.saturating_sub(clock_us.saturating_sub(since));
+                Some(rem.max(1_000))
+            }
+        }
     }
 
     fn reset(&mut self) {

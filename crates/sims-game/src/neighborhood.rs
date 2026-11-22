@@ -14,17 +14,17 @@
 
 use crate::autosave_worker::{
     AutosaveWorker, SaveCompletion, build_save_manager_snapshot, format_save_label, parse_slot_id,
-    validate_save_payload,
+    validate_save_payload, validate_save_payload_cached,
 };
 use crate::caf_screen::{CafOutcome, CafSession};
 use crate::coop::default_player_name;
-use crate::game::{Game, SpecialLotEntry};
+use crate::game::{Game, InstallAssets, SpecialLotEntry};
 use crate::hud::{DIALOG_FADE_DURATION_MS, DialogKey};
 use crate::sound::{self, Input};
 use sims_audio::SoundEvent;
 use sims_audio::music::MusicMode;
 use sims_content::ui_graphics::UiGraphics;
-use sims_content::{Catalog, Index, Install};
+use sims_content::{ArchivePool, Catalog, Index, Install};
 use sims_formats::bitmap::Image;
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
@@ -77,6 +77,7 @@ use sims_vm::travel::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const US_ENGLISH: u8 = 1;
 const NEIGHBORHOOD_DIALOG_STRINGS: u16 = 131;
@@ -270,12 +271,24 @@ impl StreetNames {
 /// matching `sims_vm::boot::read_lot_info`: reads `STR# (2000 + lot_id)`
 /// entries 0 (name) and 1 (description) from `DTDesc.iff`, `VIDesc.iff`,
 /// `STDesc.iff`, `MTDesc.iff`, or `NeighborhoodDesc.iff`.
+///
+/// Each existing `*Desc.iff` file is read and parsed at most once on load and
+/// cached by file and table ID, eliminating 40+ redundant disk reads during
+/// [`build_lot_meta`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NeighborhoodDescriptions {
-    houses_dirs: Vec<PathBuf>,
+    by_file: BTreeMap<&'static str, BTreeMap<u16, (String, String)>>,
 }
 
 impl NeighborhoodDescriptions {
+    const DESC_FILES: [&'static str; 5] = [
+        "NeighborhoodDesc.iff",
+        "DTDesc.iff",
+        "VIDesc.iff",
+        "STDesc.iff",
+        "MTDesc.iff",
+    ];
+
     pub(crate) fn load(install: &Install, user_dir: &Path) -> Self {
         let mut houses_dirs = Vec::new();
         for dir in [
@@ -292,7 +305,48 @@ impl NeighborhoodDescriptions {
                 houses_dirs.push(houses);
             }
         }
-        Self { houses_dirs }
+        let mut by_file = BTreeMap::new();
+        for &desc_file in &Self::DESC_FILES {
+            let mut entries: BTreeMap<u16, (String, String)> = BTreeMap::new();
+            for houses_dir in &houses_dirs {
+                let Some(path) = resolve_child_case_insensitive(houses_dir, desc_file) else {
+                    continue;
+                };
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(scanned) = Iff::scan_types(&bytes, &[*b"STR#"]) else {
+                    continue;
+                };
+                for chunk in scanned.all(b"STR#") {
+                    // Match `Iff::get(b"STR#", table_id)` (high flag byte 0).
+                    if chunk.flags >> 8 != 0 || chunk.id < LOT_DESC_BASE_TABLE {
+                        continue;
+                    }
+                    if entries.contains_key(&chunk.id) {
+                        continue;
+                    }
+                    let Ok(table) = StringTable::parse(&chunk.data) else {
+                        continue;
+                    };
+                    let name = table
+                        .get(0, US_ENGLISH)
+                        .or_else(|| table.get(0, 1))
+                        .unwrap_or_default()
+                        .to_owned();
+                    let desc = table
+                        .get(1, US_ENGLISH)
+                        .or_else(|| table.get(1, 1))
+                        .unwrap_or_default()
+                        .to_owned();
+                    if !name.is_empty() || !desc.is_empty() {
+                        entries.insert(chunk.id, (name, desc));
+                    }
+                }
+            }
+            by_file.insert(desc_file, entries);
+        }
+        Self { by_file }
     }
 
     pub(crate) fn lot_info(&self, lot_number: u16) -> (String, String) {
@@ -306,37 +360,11 @@ impl NeighborhoodDescriptions {
         let Some(table_id) = LOT_DESC_BASE_TABLE.checked_add(lot_number) else {
             return (String::new(), String::new());
         };
-        for houses_dir in &self.houses_dirs {
-            let Some(path) = resolve_child_case_insensitive(houses_dir, desc_file) else {
-                continue;
-            };
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            let Ok(iff) = Iff::parse(bytes) else {
-                continue;
-            };
-            let Some(chunk) = iff.get(b"STR#", table_id) else {
-                continue;
-            };
-            let Ok(table) = StringTable::parse(iff.data(chunk)) else {
-                continue;
-            };
-            let name = table
-                .get(0, US_ENGLISH)
-                .or_else(|| table.get(0, 1))
-                .unwrap_or_default()
-                .to_owned();
-            let desc = table
-                .get(1, US_ENGLISH)
-                .or_else(|| table.get(1, 1))
-                .unwrap_or_default()
-                .to_owned();
-            if !name.is_empty() || !desc.is_empty() {
-                return (name, desc);
-            }
-        }
-        (String::new(), String::new())
+        self.by_file
+            .get(desc_file)
+            .and_then(|map| map.get(&table_id))
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -461,6 +489,18 @@ struct PendingTravel {
 pub struct NeighborhoodShell {
     install_root: PathBuf,
     install: Install,
+    /// Shared FAR archive handle pool reused across Neighborhood UI loading,
+    /// neighborhood portrait reloads, and cross-lot transitions.
+    pool: Arc<ArchivePool>,
+    /// Cached base install resource index (without neighborhood-specific
+    /// `Characters`), shared across neighborhood switches and lot entries.
+    base_index: Option<Arc<Index>>,
+    /// Cached base install catalog (when built without neighborhood characters).
+    base_catalog: Option<Arc<Catalog>>,
+    /// Lazily populated immutable install-wide assets (`Index`, `Catalog`,
+    /// `ArchivePool`, surface plug-ins, `HudStatic`, `HudShared`,
+    /// `ContentAssets`, `PeopleLibrary`) reused across lot entries & travel.
+    install_assets: Option<Arc<InstallAssets>>,
     saves_path: PathBuf,
     store: NeighborhoodStore,
     autosave_worker: AutosaveWorker,
@@ -605,78 +645,183 @@ impl NeighborhoodShell {
         };
         let autosave_worker = AutosaveWorker::spawn(store.autosaves());
         let options_file = saves_path.with_extension("options.iff");
-        let options_state = if options_file.is_file() {
-            OptionsState::load_iff(&options_file)
-                .or_else(|_| OptionsState::load_install(&install))
-                .unwrap_or_default()
-        } else {
-            OptionsState::load_install(&install).unwrap_or_default()
-        };
-        let saved_optn = options_state.to_optn();
-
-        let ui = UiGraphics::open(&install).map_err(|e| e.to_string())?;
-        let chrome_art =
-            sims_ui::neighborhood::load_art(&ui, US_ENGLISH).map_err(|e| e.to_string())?;
-        let chrome_strings = NeighborhoodStrings::load(&install, US_ENGLISH).unwrap_or_default();
-        let family_bin_art =
-            sims_ui::family_bin::load_art(&ui, US_ENGLISH).map_err(|e| e.to_string())?;
-        let dialog_art =
-            Art::load(&ui, US_ENGLISH, &dialog::RESOURCES).map_err(|e| e.to_string())?;
-        let save_manager_art = Art::load_with_optional(
-            &ui,
-            US_ENGLISH,
-            &dialog::RESOURCES,
-            &[sims_ui::neighborhood::art_id::POPUP_TILER],
-        )
-        .map_err(|e| e.to_string())?;
-        let loading_art = sims_ui::loading::load_art(&ui, US_ENGLISH)
-            .or_else(|_| {
-                Art::load_with_optional(&ui, US_ENGLISH, &[], &sims_ui::loading::RESOURCES)
-            })
-            .map_err(|e| e.to_string())?;
-        let loading_strings = LoadingStrings::load(&install, US_ENGLISH).unwrap_or_default();
-        let album_art = sims_ui::album::load_art(&ui, US_ENGLISH)
-            .or_else(|_| {
-                Art::load_with_optional(
-                    &ui,
-                    US_ENGLISH,
-                    &dialog::RESOURCES,
-                    &sims_ui::album::RESOURCES,
-                )
-            })
-            .map_err(|e| e.to_string())?;
-        let album_strings =
-            AlbumStrings::load_from_install(&install, US_ENGLISH).unwrap_or_default();
-        let travel_art = sims_ui::travel::load_art(&ui, US_ENGLISH)
-            .or_else(|_| Art::load_with_optional(&ui, US_ENGLISH, &[], &sims_ui::travel::RESOURCES))
-            .map_err(|e| e.to_string())?;
-        let coop_art = sims_ui::coop::load_art(&ui, US_ENGLISH)
-            .or_else(|_| Art::load_with_optional(&ui, US_ENGLISH, &[], &sims_ui::coop::RESOURCES))
-            .unwrap_or_default();
-        let travel_strings = TravelStrings::load(&install, US_ENGLISH).unwrap_or_default();
-        let dialogs = DialogStrings::load(&install);
-        let arch_multiplier = load_arch_multiplier(&install);
-        let magic_lot_91_cost = lifecycle::magic_town_lot_cost(Some(&install_root), 91);
-        let magic_lot_other_cost = lifecycle::magic_town_lot_cost(Some(&install_root), 90);
-
         let slot = slot.clamp(MIN_NEIGHBORHOOD, MAX_NEIGHBORHOOD);
         let kind = default_map_kind(&install, slot);
         let neighborhood_id = neighborhood_id_for_slot(slot);
         let stored = ensure_imported(&install, &store, &neighborhood_id)?;
         let _ = store.set_active_neighborhood(&neighborhood_id);
-        let mut map = load_map_for_slot(&install, slot, kind)?;
-
         let user_dir = resolve_user_dir(&install, slot)?;
-        let family_names = load_family_names_with_caf(
-            &user_dir,
-            &saves_path,
-            &neighborhood_id,
-            stored.instance_id,
-            &stored,
-        );
-        let street_names = StreetNames::load(&install, &user_dir);
-        let descriptions = NeighborhoodDescriptions::load(&install, &user_dir);
-        let faces = load_neighborhood_faces(&install, &store, &neighborhood_id, &stored);
+        let pool = Arc::new(ArchivePool::new());
+
+        // Parallelize independent UI art packs, string/tuning tables,
+        // neighborhood map, descriptions/street names, and base Index/Faces
+        // while sharing a single ArchivePool.
+        let (art_res, strings_tuple, map_res, text_meta, faces_tuple, custom_thumbs, family_names) =
+            std::thread::scope(|scope| {
+                let art_handle = scope.spawn(|| -> Result<_, String> {
+                    let ui = UiGraphics::open_with_pool(&install, Arc::clone(&pool))
+                        .map_err(|e| e.to_string())?;
+                    let chrome_art = sims_ui::neighborhood::load_art(&ui, US_ENGLISH)
+                        .map_err(|e| e.to_string())?;
+                    let family_bin_art = sims_ui::family_bin::load_art(&ui, US_ENGLISH)
+                        .map_err(|e| e.to_string())?;
+                    let dialog_art = Art::load(&ui, US_ENGLISH, &dialog::RESOURCES)
+                        .map_err(|e| e.to_string())?;
+                    let save_manager_art = Art::load_with_optional(
+                        &ui,
+                        US_ENGLISH,
+                        &dialog::RESOURCES,
+                        &[sims_ui::neighborhood::art_id::POPUP_TILER],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let loading_art = sims_ui::loading::load_art(&ui, US_ENGLISH)
+                        .or_else(|_| {
+                            Art::load_with_optional(
+                                &ui,
+                                US_ENGLISH,
+                                &[],
+                                &sims_ui::loading::RESOURCES,
+                            )
+                        })
+                        .map_err(|e| e.to_string())?;
+                    let album_art = sims_ui::album::load_art(&ui, US_ENGLISH)
+                        .or_else(|_| {
+                            Art::load_with_optional(
+                                &ui,
+                                US_ENGLISH,
+                                &dialog::RESOURCES,
+                                &sims_ui::album::RESOURCES,
+                            )
+                        })
+                        .map_err(|e| e.to_string())?;
+                    let travel_art = sims_ui::travel::load_art(&ui, US_ENGLISH)
+                        .or_else(|_| {
+                            Art::load_with_optional(
+                                &ui,
+                                US_ENGLISH,
+                                &[],
+                                &sims_ui::travel::RESOURCES,
+                            )
+                        })
+                        .map_err(|e| e.to_string())?;
+                    let coop_art = sims_ui::coop::load_art(&ui, US_ENGLISH)
+                        .or_else(|_| {
+                            Art::load_with_optional(&ui, US_ENGLISH, &[], &sims_ui::coop::RESOURCES)
+                        })
+                        .unwrap_or_default();
+                    Ok((
+                        chrome_art,
+                        family_bin_art,
+                        dialog_art,
+                        save_manager_art,
+                        loading_art,
+                        album_art,
+                        travel_art,
+                        coop_art,
+                    ))
+                });
+                let strings_handle = scope.spawn(|| {
+                    let options_state = if options_file.is_file() {
+                        OptionsState::load_iff(&options_file)
+                            .or_else(|_| OptionsState::load_install(&install))
+                            .unwrap_or_default()
+                    } else {
+                        OptionsState::load_install(&install).unwrap_or_default()
+                    };
+                    let chrome_strings =
+                        NeighborhoodStrings::load(&install, US_ENGLISH).unwrap_or_default();
+                    let loading_strings =
+                        LoadingStrings::load(&install, US_ENGLISH).unwrap_or_default();
+                    let album_strings =
+                        AlbumStrings::load_from_install(&install, US_ENGLISH).unwrap_or_default();
+                    let travel_strings =
+                        TravelStrings::load(&install, US_ENGLISH).unwrap_or_default();
+                    let dialogs = DialogStrings::load(&install);
+                    let arch_multiplier = load_arch_multiplier(&install);
+                    let magic_lot_91_cost = lifecycle::magic_town_lot_cost(Some(&install_root), 91);
+                    let magic_lot_other_cost =
+                        lifecycle::magic_town_lot_cost(Some(&install_root), 90);
+                    (
+                        options_state,
+                        chrome_strings,
+                        loading_strings,
+                        album_strings,
+                        travel_strings,
+                        dialogs,
+                        arch_multiplier,
+                        magic_lot_91_cost,
+                        magic_lot_other_cost,
+                    )
+                });
+                let map_handle = scope.spawn(|| load_map_for_slot(&install, slot, kind));
+                let meta_handle = scope.spawn(|| {
+                    let street_names = StreetNames::load(&install, &user_dir);
+                    let descriptions = NeighborhoodDescriptions::load(&install, &user_dir);
+                    (street_names, descriptions)
+                });
+                let faces_handle = scope.spawn(|| {
+                    let base_index = Index::build(&install).ok().map(Arc::new);
+                    let (faces, base_catalog) = load_neighborhood_faces_cached(
+                        &install,
+                        &store,
+                        &neighborhood_id,
+                        &stored,
+                        &pool,
+                        base_index.as_ref(),
+                        None,
+                    );
+                    (base_index, base_catalog, faces)
+                });
+                let family_names = load_family_names_with_caf(
+                    &user_dir,
+                    &saves_path,
+                    &neighborhood_id,
+                    stored.instance_id,
+                    &stored,
+                );
+                let custom_thumbs = load_persisted_custom_thumbs(&store, &neighborhood_id);
+                (
+                    art_handle.join().expect("neighborhood art worker panicked"),
+                    strings_handle
+                        .join()
+                        .expect("neighborhood strings worker panicked"),
+                    map_handle.join().expect("neighborhood map worker panicked"),
+                    meta_handle
+                        .join()
+                        .expect("neighborhood descriptions worker panicked"),
+                    faces_handle
+                        .join()
+                        .expect("neighborhood faces worker panicked"),
+                    custom_thumbs,
+                    family_names,
+                )
+            });
+
+        let (
+            chrome_art,
+            family_bin_art,
+            dialog_art,
+            save_manager_art,
+            loading_art,
+            album_art,
+            travel_art,
+            coop_art,
+        ) = art_res?;
+        let (
+            options_state,
+            chrome_strings,
+            loading_strings,
+            album_strings,
+            travel_strings,
+            dialogs,
+            arch_multiplier,
+            magic_lot_91_cost,
+            magic_lot_other_cost,
+        ) = strings_tuple;
+        let saved_optn = options_state.to_optn();
+        let mut map = map_res?;
+        let (street_names, descriptions) = text_meta;
+        let (base_index, base_catalog, faces) = faces_tuple;
         let lot_meta = build_lot_meta(
             &store,
             &neighborhood_id,
@@ -684,7 +829,6 @@ impl NeighborhoodShell {
             &descriptions,
             arch_multiplier,
         );
-        let custom_thumbs = load_persisted_custom_thumbs(&store, &neighborhood_id);
         sync_map_with_store(
             &mut map,
             &stored,
@@ -727,6 +871,10 @@ impl NeighborhoodShell {
         let mut shell = Self {
             install_root,
             install,
+            pool,
+            base_index,
+            base_catalog,
+            install_assets: None,
             saves_path,
             store,
             autosave_worker,
@@ -1384,11 +1532,15 @@ impl NeighborhoodShell {
     /// polls background save completions. Returns `true` when the active screen
     /// should be redrawn.
     pub fn tick_shell(&mut self, delta_us: u64) -> bool {
+        let prev_clock = self.clock_us;
         self.clock_us = self.clock_us.saturating_add(delta_us);
         let mut redraw = self.poll_background_saves();
         if self.album_dialog.is_open() {
             self.album_dialog.advance_time(delta_us);
-            redraw = true;
+            let blink = sims_ui::hud::PAUSE_BLINK_US;
+            if (prev_clock / blink) != (self.clock_us / blink) {
+                redraw = true;
+            }
         }
         if self.coop_lobby.is_open() && self.coop_lobby.sync_blink(self.clock_us) {
             redraw = true;
@@ -1451,6 +1603,134 @@ impl NeighborhoodShell {
             _ => {}
         }
         redraw
+    }
+
+    /// Ensures immutable install-wide assets are loaded once and cached on this
+    /// shell for fast cross-lot transitions.
+    fn ensure_install_assets(&mut self) -> Result<Arc<InstallAssets>, String> {
+        if let Some(cached) = &self.install_assets {
+            return Ok(Arc::clone(cached));
+        }
+        let loaded = Arc::new(InstallAssets::load(
+            &self.install,
+            Arc::clone(&self.pool),
+            self.base_index.clone(),
+            self.base_catalog.clone(),
+        )?);
+        self.base_index = Some(Arc::clone(&loaded.base_index));
+        self.base_catalog = Some(Arc::clone(&loaded.base_catalog));
+        self.install_assets = Some(Arc::clone(&loaded));
+        Ok(loaded)
+    }
+
+    /// Exact microseconds until this shell next needs an event-loop wakeup, or
+    /// `None` when completely idle (allowing `ControlFlow::Wait`).
+    pub fn next_wake_us(&self, dragging: bool, anim_interval_us: u64) -> Option<u64> {
+        self.next_wake_us_with_window(dragging, anim_interval_us, true, false)
+    }
+
+    /// Like [`NeighborhoodShell::next_wake_us`], gating pure presentation
+    /// wakeups on `can_draw` and letting the redraw pacer own already-dirty
+    /// frame deadlines so a zero-sized window or deferred redraw never spins.
+    pub fn next_wake_us_with_window(
+        &self,
+        dragging: bool,
+        anim_interval_us: u64,
+        can_draw: bool,
+        frame_dirty: bool,
+    ) -> Option<u64> {
+        const CARET_POLL_US: u64 = 100_000;
+        let mut best: Option<u64> = None;
+        let mut consider = |us: u64| {
+            best = Some(best.map_or(us, |prev| prev.min(us)));
+        };
+        if self.autosave_worker.has_pending_or_unread() {
+            consider(25_000);
+        }
+        if can_draw {
+            if self.album_dialog.is_open() {
+                let blink = sims_ui::hud::PAUSE_BLINK_US;
+                consider((blink - (self.clock_us % blink)).max(1_000));
+            }
+            if self.coop_lobby.is_open() {
+                consider(CARET_POLL_US);
+            }
+            if let Some(dialog) = &self.dialog {
+                let now_ms = self.now_ms() as u32;
+                if (self.clock_us > 0 && self.dialog_fade.is_animating(now_ms))
+                    || self.dialog_fade_was_animating
+                {
+                    consider(anim_interval_us.max(1_000));
+                }
+                if dialog.message.entry.is_some() {
+                    consider(CARET_POLL_US);
+                }
+            }
+        }
+        let modal_open = self.dialog.is_some()
+            || self.save_manager.is_open()
+            || self.album_dialog.is_open()
+            || self.travel_dialog_state.is_some()
+            || self.coop_lobby.is_open();
+        match &self.screen {
+            ActiveScreen::Loading(_) => {
+                if can_draw {
+                    consider(anim_interval_us.max(1_000));
+                }
+            }
+            ActiveScreen::Neighborhood => {
+                if can_draw {
+                    let now_ms = self.clock_us / 1_000;
+                    if self.hover_fade.is_animating(now_ms) || self.hover_fade_was_animating {
+                        consider(anim_interval_us.max(1_000));
+                    }
+                    let has_waves = self.map.waves.iter().any(Option::is_some);
+                    let has_filter_anim = destination_for_kind(self.kind).is_some()
+                        && self.travel_state.active_filter.is_some();
+                    if has_waves || has_filter_anim {
+                        let rem = WATER_STEP_US - (self.clock_us % WATER_STEP_US);
+                        consider(rem.max(1_000));
+                    }
+                    if !modal_open
+                        && let (Some(lot_id), Some(since_us)) =
+                            (self.hovered_lot_id, self.hovered_lot_since_us)
+                        && self.hover_card_shown_for != Some(lot_id)
+                    {
+                        let elapsed = self.clock_us.saturating_sub(since_us);
+                        let rem = HOVER_CARD_DELAY_US.saturating_sub(elapsed);
+                        if rem > 0 {
+                            consider(rem);
+                        } else if !frame_dirty {
+                            consider(anim_interval_us.max(1_000));
+                        }
+                    }
+                }
+            }
+            ActiveScreen::FamilyBin => {}
+            ActiveScreen::CreateFamily(caf) => {
+                if can_draw {
+                    consider(caf.next_wake_us());
+                }
+            }
+            ActiveScreen::Lot(session) => {
+                let shell_modal_open = self.save_manager.is_open()
+                    || self.album_dialog.is_open()
+                    || self.travel_dialog_state.is_some();
+                if shell_modal_open {
+                    if session.game.coop_active() || session.game.pending_coop_restage().is_some() {
+                        consider(5_000);
+                    }
+                } else if let Some(us) = session.game.next_wake_us_with_window(
+                    dragging,
+                    anim_interval_us,
+                    can_draw,
+                    frame_dirty,
+                ) {
+                    consider(us);
+                }
+            }
+        }
+        best
     }
 
     pub fn canvas(&self) -> &Canvas {
@@ -3203,6 +3483,7 @@ impl NeighborhoodShell {
                 .map_err(|e| e.to_string())?;
         }
 
+        let install_assets = self.ensure_install_assets()?;
         let (staged_saved_bytes, restored_tick) = match &loaded.metadata.payload_kind {
             SavePayloadKind::SavedLot => {
                 let _ = Saved::decode(&loaded.payload).map_err(|e| e.to_string())?;
@@ -3219,7 +3500,7 @@ impl NeighborhoodShell {
                         staging_store
                             .save_neighborhood(&self.neighborhood_id, &snapshot.neighborhood)
                             .map_err(|e| e.to_string())?;
-                        let base_game = Game::open_from_store(
+                        let base_game = Game::open_from_store_cached(
                             &self.install_root,
                             &staging_store,
                             &self.neighborhood_id,
@@ -3227,6 +3508,7 @@ impl NeighborhoodShell {
                             &self.answers,
                             self.play,
                             self.frames.clone(),
+                            Some(&install_assets),
                         )?;
                         base_game.save()?
                     }
@@ -3251,7 +3533,7 @@ impl NeighborhoodShell {
             )
             .map_err(|e| e.to_string())?;
 
-        let mut game = Game::open_from_store(
+        let mut game = Game::open_from_store_cached(
             &self.install_root,
             &staging_store,
             &self.neighborhood_id,
@@ -3259,6 +3541,7 @@ impl NeighborhoodShell {
             &self.answers,
             self.play,
             self.frames.clone(),
+            Some(&install_assets),
         )?;
         if self.options_file.is_file() {
             let _ = game.load_options(&self.options_file);
@@ -3590,7 +3873,18 @@ impl NeighborhoodShell {
         );
         let street_names = StreetNames::load(&self.install, &user_dir);
         let descriptions = NeighborhoodDescriptions::load(&self.install, &user_dir);
-        let faces = load_neighborhood_faces(&self.install, &self.store, &id, &stored);
+        let (faces, base_cat) = load_neighborhood_faces_cached(
+            &self.install,
+            &self.store,
+            &id,
+            &stored,
+            &self.pool,
+            self.base_index.as_ref(),
+            self.base_catalog.as_ref(),
+        );
+        if self.base_catalog.is_none() {
+            self.base_catalog = base_cat;
+        }
         let lot_meta = build_lot_meta(&self.store, &id, &map, &descriptions, self.arch_multiplier);
         let custom_thumbs = load_persisted_custom_thumbs(&self.store, &id);
         sync_map_with_store(&mut map, &stored, &lot_meta, &id, &custom_thumbs);
@@ -3836,7 +4130,15 @@ impl NeighborhoodShell {
                 return Err(err);
             }
         };
-        let mut game = match Game::open_from_store(
+        let install_assets = match self.ensure_install_assets() {
+            Ok(assets) => assets,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
+        };
+        let mut game = match Game::open_from_store_cached(
             &self.install_root,
             &self.store,
             &self.neighborhood_id,
@@ -3844,6 +4146,7 @@ impl NeighborhoodShell {
             &self.answers,
             self.play,
             self.frames.clone(),
+            Some(&install_assets),
         ) {
             Ok(game) => game,
             Err(err) => {
@@ -4121,12 +4424,19 @@ impl NeighborhoodShell {
             .load_neighborhood(&self.neighborhood_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
-        self.faces = load_neighborhood_faces(
+        let (faces, base_cat) = load_neighborhood_faces_cached(
             &self.install,
             &self.store,
             &self.neighborhood_id,
             &self.stored,
+            &self.pool,
+            self.base_index.as_ref(),
+            self.base_catalog.as_ref(),
         );
+        self.faces = faces;
+        if self.base_catalog.is_none() {
+            self.base_catalog = base_cat;
+        }
         self.lot_meta = build_lot_meta(
             &self.store,
             &self.neighborhood_id,
@@ -4395,7 +4705,11 @@ impl NeighborhoodShell {
                     if self
                         .store
                         .autosaves()
-                        .list_saves_validated(&self.neighborhood_id, house, validate_save_payload)
+                        .list_saves_validated(
+                            &self.neighborhood_id,
+                            house,
+                            validate_save_payload_cached,
+                        )
                         .is_ok_and(|slots| !slots.is_empty())
                     {
                         self.save_manager_target_lot = Some(house);
@@ -5311,13 +5625,15 @@ impl NeighborhoodShell {
                 return Err(err.to_string());
             }
         };
-        let mut game = match Game::from_loaded_lot(
+        let install_assets = self.ensure_install_assets().ok();
+        let mut game = match Game::from_loaded_lot_cached(
             &self.install_root,
             lot,
             Vec::new(),
             &snapshot.character_files,
             snapshot.base_house.as_deref(),
             self.play,
+            install_assets.as_ref(),
         ) {
             Ok(game) => game,
             Err(err) => {
@@ -5842,6 +6158,7 @@ impl NeighborhoodShell {
         );
         let trip = departure.session;
         let dest_house = trip.destination_house;
+        let install_assets = self.ensure_install_assets().ok();
         let post_commit_res: Result<(Game, StoredNeighborhood), String> = (|| {
             let snapshot = self
                 .store
@@ -5854,13 +6171,14 @@ impl NeighborhoodShell {
                 .get(&trip.home_family)
                 .map(|f| f.members.clone())
                 .unwrap_or_default();
-            let game = Game::from_loaded_lot(
+            let game = Game::from_loaded_lot_cached(
                 &self.install_root,
                 departure.destination_lot,
                 members,
                 &snapshot.character_files,
                 snapshot.base_house.as_deref(),
                 self.play,
+                install_assets.as_ref(),
             )?;
             Ok((game, snapshot.neighborhood))
         })();
@@ -5980,6 +6298,7 @@ impl NeighborhoodShell {
             Some(format!("Home Lot {home_house}")),
             0.75,
         );
+        let install_assets = self.ensure_install_assets().ok();
         let post_commit_res: Result<(Game, StoredNeighborhood), String> = (|| {
             let snapshot = self
                 .store
@@ -5991,13 +6310,14 @@ impl NeighborhoodShell {
                 .family_in(home_house)
                 .map(|(_, f)| f.members.clone())
                 .unwrap_or_default();
-            let game = Game::from_loaded_lot(
+            let game = Game::from_loaded_lot_cached(
                 &self.install_root,
                 ret.home_lot,
                 members,
                 &snapshot.character_files,
                 snapshot.base_house.as_deref(),
                 self.play,
+                install_assets.as_ref(),
             )?;
             Ok((game, snapshot.neighborhood))
         })();
@@ -6128,13 +6448,15 @@ impl NeighborhoodShell {
             .get(&trip.home_family)
             .map(|f| f.members.clone())
             .unwrap_or_default();
-        let mut game = match Game::from_loaded_lot(
+        let install_assets = self.ensure_install_assets().ok();
+        let mut game = match Game::from_loaded_lot_cached(
             &self.install_root,
             resumed.destination_lot,
             members,
             &snapshot.character_files,
             snapshot.base_house.as_deref(),
             self.play,
+            install_assets.as_ref(),
         ) {
             Ok(game) => game,
             Err(err) => {
@@ -6367,8 +6689,9 @@ impl NeighborhoodShell {
             .stored
             .family_in(host_house)
             .is_some_and(|(fid, _)| u32::from(fid) == host_family);
+        let install_assets = self.ensure_install_assets().ok();
         if store_matches
-            && let Ok(game) = Game::open_from_store(
+            && let Ok(game) = Game::open_from_store_cached(
                 &self.install_root,
                 &self.store,
                 &self.neighborhood_id,
@@ -6376,6 +6699,7 @@ impl NeighborhoodShell {
                 &self.answers,
                 self.play,
                 self.frames.clone(),
+                install_assets.as_ref(),
             )
         {
             candidates.push(game);
@@ -7185,23 +7509,15 @@ fn load_family_names(user_dir: &Path) -> BTreeMap<u16, String> {
     names
 }
 
-fn load_neighborhood_faces(
+fn load_neighborhood_faces_cached(
     install: &Install,
     store: &NeighborhoodStore,
     neighborhood_id: &str,
     stored: &StoredNeighborhood,
-) -> Faces {
-    let Ok(mut index) = Index::build(install) else {
-        return Faces::default();
-    };
-    if let Ok(chars) = store.load_character_files(neighborhood_id)
-        && !chars.is_empty()
-    {
-        let _ = index.add_character_files(&chars);
-    }
-    let Ok(catalog) = Catalog::build(&index) else {
-        return Faces::default();
-    };
+    pool: &ArchivePool,
+    base_index: Option<&Arc<Index>>,
+    base_catalog: Option<&Arc<Catalog>>,
+) -> (Faces, Option<Arc<Catalog>>) {
     let mut guids = Vec::new();
     for fam in stored.families.values() {
         for &guid in &fam.members {
@@ -7210,7 +7526,42 @@ fn load_neighborhood_faces(
             }
         }
     }
-    Faces::load(&index, &catalog, &guids).unwrap_or_default()
+    if guids.is_empty() {
+        return (Faces::default(), base_catalog.cloned());
+    }
+    let chars = store
+        .load_character_files(neighborhood_id)
+        .unwrap_or_default();
+    if chars.is_empty()
+        && let (Some(idx), Some(cat)) = (base_index, base_catalog)
+    {
+        return (
+            Faces::load_with_pool(idx, cat, &guids, pool).unwrap_or_default(),
+            Some(Arc::clone(cat)),
+        );
+    }
+    let mut index = match base_index {
+        Some(idx) => (**idx).clone(),
+        None => {
+            let Ok(idx) = Index::build(install) else {
+                return (Faces::default(), base_catalog.cloned());
+            };
+            idx
+        }
+    };
+    if !chars.is_empty() {
+        let _ = index.add_character_files(&chars);
+    }
+    let Ok(catalog) = Catalog::build_with_pool(&index, pool) else {
+        return (Faces::default(), base_catalog.cloned());
+    };
+    let faces = Faces::load_with_pool(&index, &catalog, &guids, pool).unwrap_or_default();
+    let new_base_cat = if chars.is_empty() {
+        Some(Arc::new(catalog))
+    } else {
+        base_catalog.cloned()
+    };
+    (faces, new_base_cat)
 }
 
 fn build_lot_meta(
@@ -7264,9 +7615,8 @@ fn build_lot_meta(
         let mut house_cost = 0;
         let mut has_house = false;
         if let Ok(Some(base_bytes)) = store.load_base_house(neighborhood_id, house)
-            && let Ok(iff) = Iff::parse(base_bytes)
-            && let Some(chunk) = iff.chunks.iter().find(|c| &c.tag == b"SIMI")
-            && let Ok(sim) = sims_formats::lot::Simulator::parse(iff.data(chunk))
+            && let Ok(Some(simi_bytes)) = Iff::find_first_physical(&base_bytes, b"SIMI")
+            && let Ok(sim) = sims_formats::lot::Simulator::parse(&simi_bytes)
         {
             house_cost = lot_total_value(
                 sim.lot_value,

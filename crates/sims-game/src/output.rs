@@ -168,6 +168,7 @@ impl Output {
 /// The mixer thread: inputs in, blocks out, until the game drops its end
 /// or the stream fails for good.
 fn mix(mut mixer: Mixer, inputs: &Receiver<Input>, shared: &Shared) {
+    let mut block = Vec::with_capacity(2 * BLOCK);
     loop {
         loop {
             match inputs.try_recv() {
@@ -186,7 +187,7 @@ fn mix(mut mixer: Mixer, inputs: &Receiver<Input>, shared: &Shared) {
             std::thread::sleep(NAP);
             continue;
         }
-        let block = mixer.render(BLOCK);
+        mixer.render_into(BLOCK, &mut block);
         // Only this thread adds frames, so the room checked is still there.
         shared.ring.push(block.as_chunks::<2>().0);
     }

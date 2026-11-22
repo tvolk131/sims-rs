@@ -6946,3 +6946,35 @@ fn timed_note_auto_stops_voice_after_duration_ticks_and_unpause_advances_hit_clo
     );
     assert!(player_u.faults.is_empty(), "{:?}", player_u.faults);
 }
+
+#[test]
+fn render_stereo_into_is_bit_identical_to_render_stereo() {
+    let events = "[GlobalHitList]\n7=1\n[EventMapping]\nseqa=53,10,0,7\nseqb=53,10,0,6\n";
+    let make = || {
+        let mut base = module_with(&[&GENERIC], 1, 10, events);
+        base.name = "sounddata\\base".to_owned();
+        Player::new(vec![base], samples(), 42)
+    };
+    let mut p_alloc = make();
+    let mut p_into = make();
+    for ev in ["seqa", "seqb", "seqa", "seqb"] {
+        play(&mut p_alloc, ev);
+        play(&mut p_into, ev);
+    }
+    let mut scratch = Vec::with_capacity(2 * 256);
+    scratch.extend_from_slice(&[1234i16; 17]);
+    let initial_ptr = scratch.as_ptr();
+    let initial_cap = scratch.capacity();
+    for frames in [0, 1, 13, 64, 64, 100, 64, 250] {
+        let expected = p_alloc.render_stereo(frames, &NoSources);
+        p_into.render_stereo_into(frames, &NoSources, &mut scratch);
+        assert_eq!(
+            scratch, expected,
+            "render_stereo_into diverged from render_stereo on {frames} frames"
+        );
+    }
+    assert_eq!(scratch.as_ptr(), initial_ptr);
+    assert_eq!(scratch.capacity(), initial_cap);
+    assert!(p_alloc.faults.is_empty(), "{:?}", p_alloc.faults);
+    assert!(p_into.faults.is_empty(), "{:?}", p_into.faults);
+}

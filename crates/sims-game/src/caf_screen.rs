@@ -198,6 +198,22 @@ impl CafSession {
         redraw
     }
 
+    /// Exact microseconds until the Create-a-Family screen next needs a wakeup
+    /// (33 ms turntable sweep in `EditSim`, or 100 ms caret-blink poll).
+    pub fn next_wake_us(&self) -> u64 {
+        const CARET_POLL_US: u64 = 100_000;
+        if self.controller.screen() == CafScreen::EditSim && !self.manual_yaw {
+            let next_ms = self.clock_us / 1_000;
+            let elapsed_ms = next_ms.saturating_sub(self.turntable_ms);
+            33u64
+                .saturating_sub(elapsed_ms)
+                .saturating_mul(1_000)
+                .max(1_000)
+        } else {
+            CARET_POLL_US
+        }
+    }
+
     pub fn pointer_move(&mut self, point: [i32; 2], frame_size: [u32; 2]) -> CafOutcome {
         let cmd = self.controller.pointer_move(point[0], point[1], frame_size);
         self.handle_command(cmd, true)
