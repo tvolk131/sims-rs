@@ -19,12 +19,13 @@
 //!   `flags`, `members`, `magic_history`), `NBRS` (slots, person data,
 //!   relationships), `NGBH` (16 data words, inventories, options), and `TATT`.
 
+use crate::album_store::PhotoAlbumStore;
 use crate::autosave::{AutosavePolicy, AutosaveStore};
 use crate::characters::Characters;
 use crate::migration::{
     MigratedRecord, MigrationError, MigrationReport, NEIGHBORHOOD_MIGRATIONS,
     NeighborhoodSchemaStatus, StoreMigrationError, StoreMigrationReport,
-    decode_neighborhood_strict, decode_neighborhood_with_report,
+    decode_neighborhood_strict, decode_neighborhood_with_report, decode_postcard_exact,
 };
 use crate::{Error, Result, World};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -97,6 +98,217 @@ const NEIGHBORHOOD_HOUSES: TableDefinition<(&str, u32), &[u8]> =
 /// `(neighborhood_id, house_number)`.
 const NEIGHBORHOOD_LOTS: TableDefinition<(&str, u32), &[u8]> =
     TableDefinition::new("neighborhood_lots");
+
+/// Persisted custom neighborhood map lot thumbnails keyed by
+/// `(neighborhood_id, lot_id)`.
+const NEIGHBORHOOD_LOT_THUMBNAILS: TableDefinition<(&str, u32), &[u8]> =
+    TableDefinition::new("neighborhood_lot_thumbnails");
+
+/// 4-byte magic prefix for framed [`StoredLotThumbnail`] rows.
+const LOT_THUMBNAIL_MAGIC: [u8; 4] = *b"THMB";
+
+/// Domain separator for [`StoredLotThumbnail`] outer SHA-256 checksums.
+const LOT_THUMBNAIL_HASH_DOMAIN: &[u8] = b"sims-sim:lot-thumbnail:v1";
+
+/// Length of the fixed lot-thumbnail envelope header (magic + version + SHA-256).
+const LOT_THUMBNAIL_HEADER_LEN: usize = 4 + 4 + 32;
+
+/// Current [`StoredLotThumbnail`] wire format version.
+pub const LOT_THUMBNAIL_FORMAT: u32 = 1;
+
+/// Maximum width or height accepted for a persisted lot map thumbnail surface
+/// (matching `sims-render`'s `MAX_LOT_CELL_DIM`).
+pub const MAX_LOT_THUMBNAIL_DIM: u32 = 1024;
+
+/// Maximum pixel count accepted for a single persisted lot map thumbnail surface.
+pub const MAX_LOT_THUMBNAIL_PIXELS: usize = 1024 * 1024;
+
+/// A bounded 16-bit RGB565 surface for a persisted neighborhood map lot
+/// thumbnail (`0xf81f` is the native magenta color key).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThumbnailSurface565 {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u16>,
+}
+
+impl ThumbnailSurface565 {
+    /// Constructs a validated RGB565 thumbnail surface.
+    pub fn new(width: u32, height: u32, pixels: Vec<u16>) -> Result<Self> {
+        let surface = Self {
+            width,
+            height,
+            pixels,
+        };
+        surface.validate()?;
+        Ok(surface)
+    }
+
+    /// Validates non-zero bounded dimensions and exact pixel count.
+    pub fn validate(&self) -> Result<()> {
+        if self.width == 0 || self.height == 0 {
+            return Err(Error::Store(
+                "lot thumbnail surface dimensions must be non-zero".into(),
+            ));
+        }
+        if self.width > MAX_LOT_THUMBNAIL_DIM || self.height > MAX_LOT_THUMBNAIL_DIM {
+            return Err(Error::Store(format!(
+                "lot thumbnail dimensions {}x{} exceed maximum {MAX_LOT_THUMBNAIL_DIM}x{MAX_LOT_THUMBNAIL_DIM}",
+                self.width, self.height
+            )));
+        }
+        let expected = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .ok_or_else(|| Error::Store("lot thumbnail pixel count overflows".into()))?;
+        if expected > MAX_LOT_THUMBNAIL_PIXELS {
+            return Err(Error::Store(format!(
+                "lot thumbnail pixel count {expected} exceeds maximum {MAX_LOT_THUMBNAIL_PIXELS}"
+            )));
+        }
+        if self.pixels.len() != expected {
+            return Err(Error::Store(format!(
+                "lot thumbnail pixel count {} does not match {}x{} ({expected})",
+                self.pixels.len(),
+                self.width,
+                self.height
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Persisted custom neighborhood map thumbnail for one lot (`normal` cell and
+/// optional `roofs_off` cell), matching `cWinLot`'s two 5-6-5 thumbnail planes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredLotThumbnail {
+    pub normal: ThumbnailSurface565,
+    pub roofs_off: Option<ThumbnailSurface565>,
+}
+
+impl StoredLotThumbnail {
+    /// Validates both the required `normal` surface and optional `roofs_off`
+    /// surface.
+    pub fn validate(&self) -> Result<()> {
+        self.normal.validate()?;
+        if let Some(roofs_off) = &self.roofs_off {
+            roofs_off.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LotThumbnailRecordV1 {
+    neighborhood_id: String,
+    lot_id: u32,
+    normal: ThumbnailSurface565,
+    roofs_off: Option<ThumbnailSurface565>,
+}
+
+fn lot_thumbnail_checksum(version: u32, body: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(LOT_THUMBNAIL_HASH_DOMAIN);
+    hasher.update(version.to_le_bytes());
+    hasher.update(body);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn encode_lot_thumbnail(
+    neighborhood_id: &str,
+    lot_id: u32,
+    thumbnail: &StoredLotThumbnail,
+) -> Result<Vec<u8>> {
+    thumbnail.validate()?;
+    let record = LotThumbnailRecordV1 {
+        neighborhood_id: neighborhood_id.to_owned(),
+        lot_id,
+        normal: thumbnail.normal.clone(),
+        roofs_off: thumbnail.roofs_off.clone(),
+    };
+    let body = postcard::to_allocvec(&record).map_err(|e| {
+        Error::Snapshot(format!(
+            "encode lot thumbnail ({neighborhood_id}, {lot_id}): {e}"
+        ))
+    })?;
+    let checksum = lot_thumbnail_checksum(LOT_THUMBNAIL_FORMAT, &body);
+    let mut out = Vec::with_capacity(LOT_THUMBNAIL_HEADER_LEN + body.len());
+    out.extend_from_slice(&LOT_THUMBNAIL_MAGIC);
+    out.extend_from_slice(&LOT_THUMBNAIL_FORMAT.to_le_bytes());
+    out.extend_from_slice(&checksum);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+fn decode_lot_thumbnail(
+    neighborhood_id: &str,
+    lot_id: u32,
+    bytes: &[u8],
+) -> Result<StoredLotThumbnail> {
+    let record_name = format!("{neighborhood_id}:lot{lot_id}:thumbnail");
+    if bytes.len() < 8 {
+        return Err(Error::Snapshot(format!(
+            "{record_name}: shorter than 8-byte header ({} bytes)",
+            bytes.len()
+        )));
+    }
+    if bytes[0..4] != LOT_THUMBNAIL_MAGIC {
+        return Err(Error::Snapshot(format!(
+            "{record_name}: invalid lot thumbnail magic"
+        )));
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
+    if version != LOT_THUMBNAIL_FORMAT {
+        return Err(Error::Snapshot(format!(
+            "{record_name}: unsupported lot thumbnail format {version} (expected {LOT_THUMBNAIL_FORMAT})"
+        )));
+    }
+    if bytes.len() < LOT_THUMBNAIL_HEADER_LEN {
+        return Err(Error::Snapshot(format!(
+            "{record_name}: shorter than {LOT_THUMBNAIL_HEADER_LEN}-byte header ({} bytes)",
+            bytes.len()
+        )));
+    }
+    let expected: [u8; 32] = bytes[8..40].try_into().expect("32 bytes");
+    let body = &bytes[LOT_THUMBNAIL_HEADER_LEN..];
+    let actual = lot_thumbnail_checksum(version, body);
+    if actual != expected {
+        return Err(Error::Snapshot(format!(
+            "{record_name}: corrupt lot thumbnail checksum"
+        )));
+    }
+    let decoded: LotThumbnailRecordV1 = decode_postcard_exact(&record_name, version, body)
+        .map_err(|e| Error::Snapshot(e.to_string()))?;
+    if decoded.neighborhood_id != neighborhood_id || decoded.lot_id != lot_id {
+        return Err(Error::Snapshot(format!(
+            "{record_name}: key binding mismatch: stored ({:?}, lot {}), expected ({:?}, lot {})",
+            decoded.neighborhood_id, decoded.lot_id, neighborhood_id, lot_id
+        )));
+    }
+    let thumbnail = StoredLotThumbnail {
+        normal: decoded.normal,
+        roofs_off: decoded.roofs_off,
+    };
+    thumbnail
+        .validate()
+        .map_err(|e| Error::Snapshot(format!("{record_name}: {e}")))?;
+    Ok(thumbnail)
+}
+
+fn purge_lot_thumbnails_in_txn(txn: &redb::WriteTransaction, id: &str) -> Result<()> {
+    let mut table = txn.open_table(NEIGHBORHOOD_LOT_THUMBNAILS).map_err(store)?;
+    let mut lots = Vec::new();
+    for item in table.range((id, 0u32)..=(id, u32::MAX)).map_err(store)? {
+        let (k, _) = item.map_err(store)?;
+        lots.push(k.value().1);
+    }
+    for lot_id in lots {
+        table.remove((id, lot_id)).map_err(store)?;
+    }
+    Ok(())
+}
 
 /// Store-level metadata (e.g. active neighborhood ID).
 const NEIGHBORHOOD_META: TableDefinition<&str, &[u8]> = TableDefinition::new("neighborhood_meta");
@@ -781,6 +993,17 @@ impl NeighborhoodStore {
         ))
     }
 
+    /// Returns a [`PhotoAlbumStore`] handle backed by tables in this same REDB
+    /// database file.
+    ///
+    /// The returned handle is `Clone + Send + Sync` and enforces
+    /// `expected_instance_id` lifetime fencing inside every mutating write
+    /// transaction.
+    #[must_use]
+    pub fn albums(&self) -> PhotoAlbumStore {
+        PhotoAlbumStore::from_shared_db(Arc::clone(&self.db))
+    }
+
     /// Returns the last neighborhood schema version explicitly recorded in
     /// `NEIGHBORHOOD_META` by [`Self::migrate_all`], if any.
     pub fn recorded_schema_version(&self) -> Result<Option<u32>> {
@@ -1076,6 +1299,8 @@ impl NeighborhoodStore {
                 lot_table.remove((id, number)).map_err(store)?;
             }
             crate::autosave::purge_neighborhood_in_txn(&txn, id)?;
+            crate::album_store::purge_neighborhood_in_txn(&txn, id)?;
+            purge_lot_thumbnails_in_txn(&txn, id)?;
 
             nh_table.insert(id, encoded.as_slice()).map_err(store)?;
             for (name, bytes) in &characters {
@@ -1187,6 +1412,8 @@ impl NeighborhoodStore {
                     lot_table.remove((id, number)).map_err(store)?;
                 }
                 crate::autosave::purge_neighborhood_in_txn(&txn, id)?;
+                crate::album_store::purge_neighborhood_in_txn(&txn, id)?;
+                purge_lot_thumbnails_in_txn(&txn, id)?;
                 let mut meta_table = txn.open_table(NEIGHBORHOOD_META).map_err(store)?;
                 let is_active = meta_table
                     .get(ACTIVE_KEY)
@@ -1393,6 +1620,207 @@ impl NeighborhoodStore {
         }
         bump_neighborhood_revision(&txn, self.store_id, id)?;
         txn.commit().map_err(store)
+    }
+
+    /// Atomically verifies `(expected_instance_id, expected_revision)` against
+    /// `NEIGHBORHOODS[id]` inside a single REDB write transaction, inserts
+    /// every `(filename, bytes)` pair into `NEIGHBORHOOD_CHARACTERS`, advances
+    /// `(instance_id, revision)` strictly past the committed version (rotating
+    /// `instance_id` on `u64::MAX` rollover), and writes `state` into
+    /// `NEIGHBORHOODS`.
+    ///
+    /// On an instance or revision mismatch (for example a concurrent
+    /// [`Self::import_directory`] or lot save), aborts the transaction cleanly
+    /// with **zero** partial writes and returns `Ok(Err(CheckedCommitError))`.
+    pub fn save_characters_and_neighborhood_checked<'a, I>(
+        &self,
+        id: &str,
+        expected_instance_id: u128,
+        expected_revision: u64,
+        character_files: I,
+        state: &StoredNeighborhood,
+    ) -> Result<std::result::Result<(u128, u64), CheckedCommitError>>
+    where
+        I: IntoIterator<Item = (&'a str, &'a [u8])>,
+    {
+        let mut files: Vec<(&str, &[u8])> = Vec::new();
+        let mut seen_names: BTreeSet<&str> = BTreeSet::new();
+        for (filename, bytes) in character_files {
+            if filename.is_empty() {
+                return Err(Error::Store("character filename must not be empty".into()));
+            }
+            if !seen_names.insert(filename) {
+                return Err(Error::Store(format!(
+                    "duplicate character filename {filename:?} in atomic batch"
+                )));
+            }
+            files.push((filename, bytes));
+        }
+
+        let txn = self.db.begin_write().map_err(store)?;
+        let committed_version;
+        {
+            let mut nh_table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
+            let current = {
+                let Some(existing) = nh_table.get(id).map_err(store)? else {
+                    return Err(Error::Store(format!("neighborhood {id:?} does not exist")));
+                };
+                StoredNeighborhood::decode(id, existing.value())?
+            };
+            if current.instance_id != expected_instance_id {
+                return Ok(Err(CheckedCommitError::InstanceMismatch {
+                    expected: expected_instance_id,
+                    current: current.instance_id,
+                }));
+            }
+            if current.revision != expected_revision {
+                return Ok(Err(CheckedCommitError::RevisionMismatch {
+                    expected: expected_revision,
+                    current: current.revision,
+                }));
+            }
+            let mut committed = state.clone();
+            let (next_instance, next_rev) = advance_version(
+                &txn,
+                self.store_id,
+                id,
+                current.instance_id,
+                current.revision,
+            )?;
+            committed.instance_id = next_instance;
+            committed.revision = next_rev;
+            committed_version = (next_instance, next_rev);
+            let encoded = committed.encode();
+            if !files.is_empty() {
+                let mut char_table = txn.open_table(NEIGHBORHOOD_CHARACTERS).map_err(store)?;
+                for (filename, bytes) in files {
+                    char_table.insert((id, filename), bytes).map_err(store)?;
+                }
+            }
+            nh_table.insert(id, encoded.as_slice()).map_err(store)?;
+        }
+        txn.commit().map_err(store)?;
+        Ok(Ok(committed_version))
+    }
+
+    /// Persists a custom neighborhood map thumbnail for `(id, lot_id)` inside a
+    /// single REDB write transaction fenced by `expected_instance_id`.
+    ///
+    /// Does not bump [`StoredNeighborhood::revision`] so cosmetic map thumbnail
+    /// refreshes never invalidate open lot sessions. Returns
+    /// `Ok(Err(CheckedCommitError::InstanceMismatch))` with zero writes if the
+    /// neighborhood was re-imported concurrently.
+    pub fn save_lot_thumbnail_checked(
+        &self,
+        id: &str,
+        expected_instance_id: u128,
+        lot_id: u32,
+        thumbnail: &StoredLotThumbnail,
+    ) -> Result<std::result::Result<(), CheckedCommitError>> {
+        if id.is_empty() {
+            return Err(Error::Store("neighborhood id must not be empty".into()));
+        }
+        if expected_instance_id == 0 {
+            return Err(Error::Store("expected_instance_id must be non-zero".into()));
+        }
+        let encoded = encode_lot_thumbnail(id, lot_id, thumbnail)?;
+        let txn = self.db.begin_write().map_err(store)?;
+        {
+            let nh_table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
+            let Some(existing) = nh_table.get(id).map_err(store)? else {
+                return Err(Error::Store(format!("neighborhood {id:?} does not exist")));
+            };
+            let current = StoredNeighborhood::decode(id, existing.value())?;
+            if current.instance_id != expected_instance_id {
+                return Ok(Err(CheckedCommitError::InstanceMismatch {
+                    expected: expected_instance_id,
+                    current: current.instance_id,
+                }));
+            }
+            let mut thumb_table = txn.open_table(NEIGHBORHOOD_LOT_THUMBNAILS).map_err(store)?;
+            thumb_table
+                .insert((id, lot_id), encoded.as_slice())
+                .map_err(store)?;
+        }
+        txn.commit().map_err(store)?;
+        Ok(Ok(()))
+    }
+
+    /// Loads the persisted custom neighborhood map thumbnail for `(id, lot_id)`,
+    /// if any, verifying its magic, format version, SHA-256 checksum, key
+    /// binding, and surface dimensions.
+    pub fn load_lot_thumbnail(&self, id: &str, lot_id: u32) -> Result<Option<StoredLotThumbnail>> {
+        if id.is_empty() {
+            return Err(Error::Store("neighborhood id must not be empty".into()));
+        }
+        let txn = self.db.begin_read().map_err(store)?;
+        let table = match txn.open_table(NEIGHBORHOOD_LOT_THUMBNAILS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(store(error)),
+        };
+        let Some(value) = table.get((id, lot_id)).map_err(store)? else {
+            return Ok(None);
+        };
+        decode_lot_thumbnail(id, lot_id, value.value()).map(Some)
+    }
+
+    /// Loads all persisted custom neighborhood map thumbnails for neighborhood
+    /// `id` in a single MVCC read transaction, keyed by `lot_id`.
+    pub fn load_lot_thumbnails(&self, id: &str) -> Result<BTreeMap<u32, StoredLotThumbnail>> {
+        if id.is_empty() {
+            return Err(Error::Store("neighborhood id must not be empty".into()));
+        }
+        let txn = self.db.begin_read().map_err(store)?;
+        let table = match txn.open_table(NEIGHBORHOOD_LOT_THUMBNAILS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BTreeMap::new()),
+            Err(error) => return Err(store(error)),
+        };
+        let mut thumbs = BTreeMap::new();
+        for entry in table.range((id, 0u32)..=(id, u32::MAX)).map_err(store)? {
+            let (key, value) = entry.map_err(store)?;
+            let lot_id = key.value().1;
+            let thumb = decode_lot_thumbnail(id, lot_id, value.value())?;
+            thumbs.insert(lot_id, thumb);
+        }
+        Ok(thumbs)
+    }
+
+    /// Deletes the persisted custom neighborhood map thumbnail for `(id, lot_id)`
+    /// inside a single REDB write transaction fenced by `expected_instance_id`.
+    /// Returns `Ok(Ok(true))` if a thumbnail existed and was removed.
+    pub fn delete_lot_thumbnail_checked(
+        &self,
+        id: &str,
+        expected_instance_id: u128,
+        lot_id: u32,
+    ) -> Result<std::result::Result<bool, CheckedCommitError>> {
+        if id.is_empty() {
+            return Err(Error::Store("neighborhood id must not be empty".into()));
+        }
+        if expected_instance_id == 0 {
+            return Err(Error::Store("expected_instance_id must be non-zero".into()));
+        }
+        let txn = self.db.begin_write().map_err(store)?;
+        let existed;
+        {
+            let nh_table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
+            let Some(existing) = nh_table.get(id).map_err(store)? else {
+                return Err(Error::Store(format!("neighborhood {id:?} does not exist")));
+            };
+            let current = StoredNeighborhood::decode(id, existing.value())?;
+            if current.instance_id != expected_instance_id {
+                return Ok(Err(CheckedCommitError::InstanceMismatch {
+                    expected: expected_instance_id,
+                    current: current.instance_id,
+                }));
+            }
+            let mut thumb_table = txn.open_table(NEIGHBORHOOD_LOT_THUMBNAILS).map_err(store)?;
+            existed = thumb_table.remove((id, lot_id)).map_err(store)?.is_some();
+        }
+        txn.commit().map_err(store)?;
+        Ok(Ok(existed))
     }
 
     /// Lists all house numbers available in neighborhood `id` (from base house

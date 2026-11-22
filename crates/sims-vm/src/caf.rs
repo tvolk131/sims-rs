@@ -29,13 +29,14 @@
 //!   `"money for new family"` (default `$20,000`), `flags = 0x18`
 //!   ([`CAF_INITIAL_FAMILY_FLAGS`]), 1..=8 member GUIDs with at least one adult
 //!   human Sim, and 16-byte zeroed v9 tail (`secondary_house` + 6 magic words).
-//!   Persisted into REDB [`NeighborhoodStore`] via a serialized three-phase
-//!   tombstone-shielded commit so concurrent CAF commits never overwrite each
-//!   other's character files, mid-flight lot loads never register staged
-//!   characters as stray neighbors, and the household publishes atomically so
-//!   it immediately appears in `StoredNeighborhood::family_bin()`, passes
-//!   [`crate::lifecycle::move_in`], and boots cleanly into any vacant
-//!   residential lot.
+//!   Persisted into REDB [`NeighborhoodStore`] via a single-transaction atomic
+//!   checked commit (`NeighborhoodStore::save_characters_and_neighborhood_checked`)
+//!   that verifies `(instance_id, revision)` before writing all `User%05d.iff`
+//!   character blobs and the updated `StoredNeighborhood` together — leaving
+//!   zero partial writes on concurrent revision conflicts or `import_directory`
+//!   replaces — so the household immediately appears in
+//!   `StoredNeighborhood::family_bin()`, passes [`crate::lifecycle::move_in`],
+//!   and boots cleanly into any vacant residential lot.
 //! - **Delete Family (`delete_bin_family`)**: removes an un-housed playable
 //!   Family Bin household, vacates its members' `NBRS` slots, scrubs reciprocal
 //!   relationships and inventories, bumps `deletion_epoch`, and records
@@ -1720,80 +1721,48 @@ fn checked_save_neighborhood(
     }
 }
 
-/// Persists synthesized character IFFs and publishes `final_stored` using a
-/// three-phase tombstone-shielded protocol (held under [`CAF_COMMIT_LOCK`]):
+/// Persists synthesized character IFFs and `final_stored` atomically inside a
+/// single REDB write transaction via
+/// [`NeighborhoodStore::save_characters_and_neighborhood_checked`].
 ///
-/// 1. **Phase 1 (Checked tombstone reservation):** Atomically checks
-///    `(origin_instance_id, origin_revision)` and inserts every new member's
-///    GUID into `deleted_characters` BEFORE writing any character file. If the
-///    neighborhood changed concurrently, returns `StaleNeighborhood` /
-///    `NeighborhoodMismatch` with zero files written. If `expected_revision`
-///    would roll over `u64::MAX` during Phase 2, advances the checked
-///    reservation across the rollover first so Phase 2 never crosses `u64::MAX`
-///    without an authoritative `instance_id`.
-/// 2. **Phase 2 (Staged character IFF writes):** Writes each `User%05d.iff`
-///    into REDB. Because every staged GUID is already suppressed in
-///    `deleted_characters`, any concurrent `load_lot_snapshot` / `enter_lot`
-///    (or recovery after a mid-write crash) ignores every staged/orphaned file
-///    and never registers it in `NBRS` (`World::read_neighbors`).
-/// 3. **Phase 3 (Atomic publication):** Atomically checks the post-Phase-2
-///    `(expected_instance, expected_revision)` and writes `final_stored`
-///    (un-tombstoning the new GUIDs and publishing `FAMI` + `NBRS` together).
-///
-/// Note: Because `NeighborhoodStore::save_character_file` is currently an
-/// unchecked single-file write in `sims-sim`, callers must not race
-/// `NeighborhoodStore::import_directory` (replacing the same neighborhood ID)
-/// against an in-flight CAF commit until a follow-up `sims-sim` API commits
-/// character files and neighborhood metadata inside one checked write
-/// transaction.
-fn persist_household_staged(
+/// Checking `(origin_neighborhood.instance_id, origin_neighborhood.revision)`
+/// inside the same write transaction that writes all `User%05d.iff` blobs and
+/// the updated `StoredNeighborhood` record eliminates any partial-write window
+/// against concurrent `import_directory`, `delete_neighborhood`, lot saves, or
+/// crashes: on conflict, zero character files and zero neighborhood rows are
+/// written.
+fn persist_household_atomic(
     store: &NeighborhoodStore,
     neighborhood_id: &str,
     origin_neighborhood: &StoredNeighborhood,
     final_stored: &StoredNeighborhood,
     created_members: &[CreatedSim],
 ) -> Result<u64, CafError> {
-    let mut reservation = origin_neighborhood.clone();
-    for member in created_members {
-        reservation.deleted_characters.insert(member.guid);
-    }
-    let (mut expected_instance, mut expected_revision) = checked_save_neighborhood(
-        store,
+    let files = created_members
+        .iter()
+        .map(|member| (member.file_name.as_str(), member.iff_bytes.as_slice()));
+    match store.save_characters_and_neighborhood_checked(
         neighborhood_id,
         origin_neighborhood.instance_id,
         origin_neighborhood.revision,
-        &reservation,
-    )?;
-    // Guarantee `expected_revision + created_members.len()` cannot cross
-    // `u64::MAX` during Phase 2's per-file writes without checked rotation.
-    while expected_revision
-        .checked_add(created_members.len() as u64)
-        .is_none()
-    {
-        (expected_instance, expected_revision) = checked_save_neighborhood(
-            store,
-            neighborhood_id,
-            expected_instance,
-            expected_revision,
-            &reservation,
-        )?;
-    }
-
-    for member in created_members {
-        store.save_character_file(neighborhood_id, &member.file_name, &member.iff_bytes)?;
-        expected_revision = expected_revision
-            .checked_add(1)
-            .expect("rollover cleared before Phase 2");
-    }
-
-    let (_, committed_revision) = checked_save_neighborhood(
-        store,
-        neighborhood_id,
-        expected_instance,
-        expected_revision,
+        files,
         final_stored,
-    )?;
-    Ok(committed_revision)
+    )? {
+        Ok((_, committed_revision)) => Ok(committed_revision),
+        Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
+            Err(CafError::NeighborhoodMismatch {
+                expected: format!("{neighborhood_id}#{expected:032x}"),
+                actual: format!("{neighborhood_id}#{current:032x}"),
+            })
+        }
+        Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
+            Err(CafError::StaleNeighborhood {
+                neighborhood: neighborhood_id.to_owned(),
+                expected_revision: expected,
+                current_revision: current,
+            })
+        }
+    }
 }
 
 /// Like [`commit_family`], reusing a pre-loaded [`CafContext`] (suitable for
@@ -1887,7 +1856,7 @@ pub fn commit_family_with_context(
     };
     stored.families.insert(family_id, family.clone());
 
-    let committed_revision = persist_household_staged(
+    let committed_revision = persist_household_atomic(
         store,
         neighborhood_id,
         &origin_neighborhood,
@@ -2009,13 +1978,24 @@ pub fn delete_bin_family(
         }
     }
 
-    let (_, committed_revision) = checked_save_neighborhood(
+    let (committed_instance, committed_revision) = checked_save_neighborhood(
         store,
         neighborhood_id,
         origin_instance_id,
         origin_revision,
         &stored,
     )?;
+    // Clean up any persisted household photo album for the deleted family so a
+    // future household reusing `family_id` cannot inherit stale photos. If the
+    // neighborhood was concurrently deleted or re-imported, its albums were
+    // already purged atomically.
+    match store
+        .albums()
+        .delete_family_album(neighborhood_id, committed_instance, family_id)
+    {
+        Ok(_) | Err(sims_sim::AlbumError::StaleNeighborhoodInstance { .. }) => {}
+        Err(error) => return Err(CafError::Store(error.into())),
+    }
 
     Ok(DeletedFamilyReport {
         family_id,
@@ -2856,7 +2836,7 @@ pub fn import_family_fam(
     };
     stored.families.insert(family_id, family.clone());
 
-    let committed_revision = persist_household_staged(
+    let committed_revision = persist_household_atomic(
         store,
         neighborhood_id,
         &origin_neighborhood,

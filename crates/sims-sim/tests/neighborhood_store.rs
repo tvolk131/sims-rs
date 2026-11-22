@@ -1158,3 +1158,335 @@ fn copied_store_gets_distinct_store_id_and_save_neighborhood_advances_revision()
     assert_ne!(recreated.instance_id, after_max.instance_id);
     assert_eq!(recreated.revision, 0);
 }
+
+#[test]
+fn save_characters_and_neighborhood_checked_is_atomic_and_handles_rollover() {
+    let db = TempDb::new("atomic-chars-commit");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    let nh = sample_neighborhood("UserData");
+    store.save_neighborhood("UserData", &nh).unwrap();
+    let initial = store.load_neighborhood("UserData").unwrap().unwrap();
+
+    // 1. Happy path commits multiple character files + neighborhood in one +1 revision step.
+    let mut updated = initial.clone();
+    updated.data[0] = 42;
+    let (inst1, rev1) = store
+        .save_characters_and_neighborhood_checked(
+            "UserData",
+            initial.instance_id,
+            initial.revision,
+            [
+                ("User00001.iff", b"char-1-bytes".as_slice()),
+                ("User00002.iff", b"char-2-bytes".as_slice()),
+            ],
+            &updated,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(inst1, initial.instance_id);
+    assert_eq!(rev1, initial.revision + 1);
+    let loaded_nh = store.load_neighborhood("UserData").unwrap().unwrap();
+    assert_eq!(loaded_nh.data[0], 42);
+    assert_eq!(loaded_nh.revision, rev1);
+    let chars = store.load_character_files("UserData").unwrap();
+    assert_eq!(chars.get("User00001.iff").unwrap(), b"char-1-bytes");
+    assert_eq!(chars.get("User00002.iff").unwrap(), b"char-2-bytes");
+
+    // 2. Stale revision aborts with ZERO character files written and neighborhood untouched.
+    let mut stale_state = loaded_nh.clone();
+    stale_state.data[0] = 99;
+    let rev_err = store
+        .save_characters_and_neighborhood_checked(
+            "UserData",
+            initial.instance_id,
+            initial.revision, // stale!
+            [("User00003.iff", b"must-not-appear".as_slice())],
+            &stale_state,
+        )
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        rev_err,
+        sims_sim::CheckedCommitError::RevisionMismatch {
+            expected: initial.revision,
+            current: rev1,
+        }
+    );
+    assert!(
+        !store
+            .load_character_files("UserData")
+            .unwrap()
+            .contains_key("User00003.iff")
+    );
+    assert_eq!(
+        store.load_neighborhood("UserData").unwrap().unwrap().data[0],
+        42
+    );
+
+    // 3. Stale instance_id aborts with ZERO partial writes.
+    let inst_err = store
+        .save_characters_and_neighborhood_checked(
+            "UserData",
+            initial.instance_id ^ 1,
+            rev1,
+            [("User00004.iff", b"must-not-appear".as_slice())],
+            &stale_state,
+        )
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        inst_err,
+        sims_sim::CheckedCommitError::InstanceMismatch {
+            expected: initial.instance_id ^ 1,
+            current: inst1,
+        }
+    );
+    assert!(
+        !store
+            .load_character_files("UserData")
+            .unwrap()
+            .contains_key("User00004.iff")
+    );
+
+    // 4. Empty or duplicate filenames are rejected up front with zero mutations.
+    assert!(
+        store
+            .save_characters_and_neighborhood_checked(
+                "UserData",
+                inst1,
+                rev1,
+                [("", b"bad".as_slice())],
+                &stale_state,
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .save_characters_and_neighborhood_checked(
+                "UserData",
+                inst1,
+                rev1,
+                [
+                    ("User00005.iff", b"a".as_slice()),
+                    ("User00005.iff", b"b".as_slice()),
+                ],
+                &stale_state,
+            )
+            .is_err()
+    );
+    assert!(
+        !store
+            .load_character_files("UserData")
+            .unwrap()
+            .contains_key("User00005.iff")
+    );
+
+    // 5. u64::MAX revision rolls over to a fresh instance_id at revision 0 atomically.
+    let mut raw_max = store.load_neighborhood("UserData").unwrap().unwrap();
+    raw_max.revision = u64::MAX;
+    drop(store);
+    {
+        let raw_db = redb::Database::open(&db.0).unwrap();
+        let w = raw_db.begin_write().unwrap();
+        {
+            const NH_TABLE: redb::TableDefinition<&str, &[u8]> =
+                redb::TableDefinition::new("neighborhoods");
+            let mut t = w.open_table(NH_TABLE).unwrap();
+            let enc = raw_max.encode();
+            t.insert("UserData", enc.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    let (rolled_inst, rolled_rev) = store
+        .save_characters_and_neighborhood_checked(
+            "UserData",
+            raw_max.instance_id,
+            u64::MAX,
+            [("User00009.iff", b"rolled-char".as_slice())],
+            &raw_max,
+        )
+        .unwrap()
+        .unwrap();
+    assert_ne!(rolled_inst, raw_max.instance_id);
+    assert_eq!(rolled_rev, 0);
+    assert_eq!(
+        store
+            .load_character_files("UserData")
+            .unwrap()
+            .get("User00009.iff")
+            .unwrap(),
+        b"rolled-char"
+    );
+}
+
+#[test]
+fn lot_thumbnails_checked_crud_fencing_corruption_and_purge() {
+    use sims_sim::{
+        CheckedCommitError, LOT_THUMBNAIL_FORMAT, MAX_LOT_THUMBNAIL_DIM, StoredLotThumbnail,
+        ThumbnailSurface565,
+    };
+
+    let db = TempDb::new("lot-thumbnails");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .save_neighborhood("NH1", &sample_neighborhood("NH1"))
+        .unwrap();
+    store
+        .save_neighborhood("NH2", &sample_neighborhood("NH2"))
+        .unwrap();
+    let nh1 = store.load_neighborhood("NH1").unwrap().unwrap();
+    let nh2 = store.load_neighborhood("NH2").unwrap().unwrap();
+
+    assert!(store.load_lot_thumbnail("NH1", 5).unwrap().is_none());
+    assert!(store.load_lot_thumbnails("NH1").unwrap().is_empty());
+
+    let thumb5 = StoredLotThumbnail {
+        normal: ThumbnailSurface565::new(4, 3, vec![0x1234; 12]).unwrap(),
+        roofs_off: Some(ThumbnailSurface565::new(4, 3, vec![0xabcd; 12]).unwrap()),
+    };
+    let thumb7 = StoredLotThumbnail {
+        normal: ThumbnailSurface565::new(2, 2, vec![0xf81f, 0x07e0, 0x001f, 0xffff]).unwrap(),
+        roofs_off: None,
+    };
+
+    // Save thumbnails; verify StoredNeighborhood::revision is NOT bumped.
+    store
+        .save_lot_thumbnail_checked("NH1", nh1.instance_id, 5, &thumb5)
+        .unwrap()
+        .unwrap();
+    store
+        .save_lot_thumbnail_checked("NH1", nh1.instance_id, 7, &thumb7)
+        .unwrap()
+        .unwrap();
+    store
+        .save_lot_thumbnail_checked("NH2", nh2.instance_id, 5, &thumb7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.load_neighborhood("NH1").unwrap().unwrap().revision,
+        nh1.revision
+    );
+
+    assert_eq!(
+        store.load_lot_thumbnail("NH1", 5).unwrap().as_ref(),
+        Some(&thumb5)
+    );
+    let all_nh1 = store.load_lot_thumbnails("NH1").unwrap();
+    assert_eq!(all_nh1.len(), 2);
+    assert_eq!(all_nh1.get(&5), Some(&thumb5));
+    assert_eq!(all_nh1.get(&7), Some(&thumb7));
+
+    // Stale instance_id is rejected on both save and delete with zero writes.
+    let stale = nh1.instance_id ^ 0x55;
+    assert_eq!(
+        store
+            .save_lot_thumbnail_checked("NH1", stale, 5, &thumb7)
+            .unwrap(),
+        Err(CheckedCommitError::InstanceMismatch {
+            expected: stale,
+            current: nh1.instance_id,
+        })
+    );
+    assert_eq!(
+        store.delete_lot_thumbnail_checked("NH1", stale, 5).unwrap(),
+        Err(CheckedCommitError::InstanceMismatch {
+            expected: stale,
+            current: nh1.instance_id,
+        })
+    );
+    assert_eq!(
+        store.load_lot_thumbnail("NH1", 5).unwrap().as_ref(),
+        Some(&thumb5)
+    );
+
+    // Invalid surfaces and IDs rejected cleanly.
+    assert!(ThumbnailSurface565::new(0, 4, vec![]).is_err());
+    assert!(
+        ThumbnailSurface565::new(
+            MAX_LOT_THUMBNAIL_DIM + 1,
+            1,
+            vec![0; (MAX_LOT_THUMBNAIL_DIM + 1) as usize]
+        )
+        .is_err()
+    );
+    assert!(ThumbnailSurface565::new(2, 2, vec![0; 3]).is_err());
+    assert!(
+        store
+            .save_lot_thumbnail_checked("NH1", 0, 5, &thumb5)
+            .is_err()
+    );
+    assert!(
+        store
+            .save_lot_thumbnail_checked("", nh1.instance_id, 5, &thumb5)
+            .is_err()
+    );
+
+    // Checked delete removes only the targeted lot.
+    assert_eq!(
+        store
+            .delete_lot_thumbnail_checked("NH1", nh1.instance_id, 7)
+            .unwrap(),
+        Ok(true)
+    );
+    assert_eq!(
+        store
+            .delete_lot_thumbnail_checked("NH1", nh1.instance_id, 7)
+            .unwrap(),
+        Ok(false)
+    );
+    assert!(store.load_lot_thumbnail("NH1", 7).unwrap().is_none());
+
+    // Tampering detection (checksum flip + key swap + unsupported future version).
+    drop(store);
+    {
+        use redb::ReadableDatabase;
+        const THUMB_TABLE: redb::TableDefinition<(&str, u32), &[u8]> =
+            redb::TableDefinition::new("neighborhood_lot_thumbnails");
+        let raw_db = redb::Database::open(&db.0).unwrap();
+        let nh1_lot5_bytes = {
+            let r = raw_db.begin_read().unwrap();
+            let t = r.open_table(THUMB_TABLE).unwrap();
+            t.get(("NH1", 5)).unwrap().unwrap().value().to_vec()
+        };
+        let mut flipped = nh1_lot5_bytes.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 1;
+        let mut future = Vec::new();
+        future.extend_from_slice(b"THMB");
+        future.extend_from_slice(&(LOT_THUMBNAIL_FORMAT + 1).to_le_bytes());
+        future.extend_from_slice(&[0u8; 32]);
+        let w = raw_db.begin_write().unwrap();
+        {
+            let mut t = w.open_table(THUMB_TABLE).unwrap();
+            t.insert(("NH1", 99), flipped.as_slice()).unwrap();
+            t.insert(("NH1", 98), nh1_lot5_bytes.as_slice()).unwrap(); // key-binding mismatch (lot 5 -> 98)
+            t.insert(("NH1", 97), future.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    assert!(store.load_lot_thumbnail("NH1", 99).is_err());
+    assert!(store.load_lot_thumbnail("NH1", 98).is_err());
+    assert!(store.load_lot_thumbnail("NH1", 97).is_err());
+    // Intact lot 5 still loads cleanly.
+    assert_eq!(
+        store.load_lot_thumbnail("NH1", 5).unwrap().as_ref(),
+        Some(&thumb5)
+    );
+
+    // Deleting NH1 atomically purges all NH1 thumbnails while keeping NH2 intact.
+    assert!(store.delete_neighborhood("NH1").unwrap());
+    assert!(store.load_lot_thumbnails("NH1").unwrap().is_empty());
+    assert_eq!(
+        store.load_lot_thumbnail("NH2", 5).unwrap().as_ref(),
+        Some(&thumb7)
+    );
+
+    // If SIMS_INSTALL is present, verify import_directory also purges thumbnails atomically.
+    if let Some(root) = std::env::var_os("SIMS_INSTALL") {
+        let user_data = PathBuf::from(root).join("UserData");
+        store.import_directory("NH2", &user_data, 0xff).unwrap();
+        assert!(store.load_lot_thumbnails("NH2").unwrap().is_empty());
+    }
+}
