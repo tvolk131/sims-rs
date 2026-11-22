@@ -16,7 +16,7 @@
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
-use crate::placement::{Place, capture, head_slot_redraw, on_lot};
+use crate::placement::{Place, capture, head_slot_redraw, off_lot};
 use sims_sim::World;
 
 /// Global 3: the selected Sim's ID, or 0.
@@ -299,11 +299,9 @@ impl Interpreter<'_> {
     ///    of a group there (`crate::placement::head_slot_redraw`).
     /// 3. The second indicator is taken off the lot too (0x446be8).
     /// 4. With the Superstar pack (bit 0x40 of the installed-expansions
-    ///    mask, application field +0x66, set on a Complete Collection
-    ///    install and not modeled), a person whose word 81 is 10 or more
-    ///    gets a star marker (0x446c15). That is not ported and fails,
-    ///    whatever the mask, as `Interpreter::placed_from_outside`
-    ///    does.
+    ///    mask, application field +0x66, [`crate::Program::expansions`]),
+    ///    a person whose word 81 is 10 or more gets a star marker from the
+    ///    interface's pool (0x446c15, [`Interpreter::mark_star`]).
     ///
     /// Not modeled, being presentation: the object is redrawn (0x434101
     /// with 0, from the outermost object holding it; that it writes
@@ -329,11 +327,7 @@ impl Interpreter<'_> {
             self.take_off(world, second, true)?;
         }
         if person_word(world, sim, person::FAME)? >= 10 {
-            return Err(unsupported(
-                sim,
-                "a Sim deselected whose person word 81 is 10 or more takes a star marker \
-                 (0x446c15); not ported",
-            ));
+            self.mark_star(world, sim)?;
         }
         Ok(())
     }
@@ -370,7 +364,9 @@ impl Interpreter<'_> {
         }
         let person = world.objects.get(&sim).ok_or_else(missing)?;
         let position = person.position;
-        let on_lot = on_lot([position[0], position[1]]);
+        // 0x446727 -> 0x422632: skip head-slot release and indicator placement
+        // when the Sim stands on or outside the lot's outer border tiles.
+        let on_inner_lot = !off_lot(world, [position[0], position[1]]);
         // Slot 1 as scripts count it is the third the object has: the
         // first names the next object on its tile. The original also
         // asks that the slot's flag 2 is set. A person's constructor sets
@@ -378,13 +374,14 @@ impl Interpreter<'_> {
         // person with the slot is taken to have it. In the trace's memory
         // the two Goths whose slots it holds have the flag there and on
         // no other slot. **Unverified** for any other person.
-        if on_lot && let Some(slot) = person.slots.get(2) {
-            if slot.object != 0 && world.objects.contains_key(&(slot.object as u16)) {
-                return Err(unsupported(
-                    sim,
-                    "the Sim's slot 1 holds something, which the indicator would replace; \
-                     that is not ported",
-                ));
+        if on_inner_lot && let Some(slot) = person.slots.get(2) {
+            let held = u16::try_from(slot.object)
+                .ok()
+                .filter(|&id| id != 0 && world.objects.contains_key(&id));
+            if let Some(held) = held {
+                // 0x4467d7: release any indicator or star marker held in the
+                // head slot (0x4481eb) before placing the selection indicator.
+                self.release_from_head(world, held)?;
             }
             self.put(
                 world,
