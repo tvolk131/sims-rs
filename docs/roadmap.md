@@ -3333,6 +3333,53 @@ through their public interfaces only; the simulation never depends on it.
     plumbobs, drift resync, CLI `--host`/`--join`, and 2-client E2E
     `MemoryMesh` + `IrohTransport` QUIC loopback tests; single-player
     bit-for-bit unchanged).
+- **Done (Batch 11 — Playtest Polish, 0/1,833 Complete Collection Sweep,
+  Special Panels & `sims-antics` Clean-Room Compiler):**
+  - **Interactive UX polish & play-mode defaults (#370):** removed floating
+    `CamViewAlbum` overlap from the Live Mode clock, gated maroon diagnostic
+    top bars behind `--debug` (surfacing real errors via native modal OK
+    dialogs), made interactive desktop launches default to graceful play
+    mode (`--strict` opt-in; programmatic & `--png` unchanged), disabled
+    synthetic yellow hover outlines during idle Neighborhood browsing, and
+    added 5 Hz water ripples, 275 ms hover-card debounce, and 350 ms cubic
+    ease-out portrait double-click camera pan.
+  - **Neighborhood/CAF pixel parity, hover roof fade, native `cWinCamera` &
+    UI pixel ratchets (#371):** removed the `Current.bmp` top-bar plate blit
+    (**41,600 / 41,600 = 100.00% bit-exact** vs 1.91 `01-nb-clean.png`),
+    lifted CAF Family (`96.18%`) and Create-a-Sim (`95.33%`) chrome parity,
+    added 300 ms native hover roof cross-fade (`HoverFadeState`), built the
+    authentic Complete Collection `cWinCamera` subpanel (`STR# 140`), added
+    temporal fade/slide helpers (`BalloonFadeState` 250 ms, `DialogFadeState`,
+    `QueueSlideState` 500 ms), and locked in automated 1.91 UI & hover pixel
+    ratchets.
+  - **Special `Dialog` kinds `5..=15`, `Saved::FORMAT = 9` & 0/1,833
+    Complete Collection interactive object sweep (#373, #374):** ported all
+    11 special `Dialog` panels (`5..=15`, fixing the Goth Magic Hole kind 13
+    crash), paired `Generic Sims Call` routines `14` & `35`, co-op special
+    panel lockstep (`COOP_SNAPSHOT_VERSION = 3`), and `Saved` v8->v9
+    migration; swept 3,103 objects / 1,833 unique pie-menu interactions
+    across 9 base + expansion lots and ported all 3 remaining root causes
+    (`Idle For Input` declined-push cancel `0x45dc90`, Superstar star-marker
+    pool `0x447a82`, `Animate Sim` global clip sources 1 & 2 `0x58944b`),
+    achieving **0 / 1,833 `Trap::Unsupported`** hits across all 8 active lots
+    while keeping the 43,200-tick Goth hash bit-exact.
+  - **Live shell wiring (#376):** wired all special `Dialog` kinds `5..=15`
+    (single-player destination travel including Magic Hole -> Magic Town,
+    wardrobe/pet/neighbor/charm pickers, inline Spellbook/Cookbook modals,
+    and co-op lockstep answers), native `cWinCamera` subpanel with snapshot
+    size cropping, 300 ms Neighborhood hover roof cross-fade, and temporal
+    UI animations cleanly into `sims-game`.
+  - **Clean-room `sims-antics` compiler & `open-pack/` foundation (#372,
+    #375):** added zero-external-dep `crates/sims-antics` (two-tier `.antics`
+    DSL + `object.toml` compiler, checked `BHAV`/`OBJD`/`OBJf`/`BCON`/`STR#`/
+    `TTAB`/`SLOT`/`PALT`/`SPR2`/`DGRP`/`FWAV`/`FAR` encoders, procedural
+    isometric sprite & WAV generators, and CLI `check`/`build`) with
+    **100% in-memory byte-for-byte round-trip parity across 1,255 Complete
+    Collection IFFs / 28,690 BHAVs** (zero original bytes committed), plus
+    10 original plain-text `open-pack/` objects (`0x7F00_0001..=0x7F00_0040`:
+    bench, cot, basin, multi-tile double bed, fridge -> counter -> stove ->
+    meal-plate cooking chain, interactive wall phone, and repairable privacy
+    shower with guard trees) verified live in `sims-vm` with 0 traps.
 - **Needs from other crates:**
   - `sims-vm`: Done — all three failing Goth pie listings (#296) are
     now closed, and every person's pie menu on every object of the Goth
