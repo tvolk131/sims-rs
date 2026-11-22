@@ -587,10 +587,21 @@ impl Interpreter<'_> {
             .objects
             .get(&id)
             .ok_or_else(|| Trap::native(10, "missing object"))?;
+        // 0x5921f0..0x59221a: add animator offset (+0x8c..+0x94), which Snap
+        // into a container slot (`0x454ceb..0x454d5e` -> `0x58933b`) sets to
+        // the slot's rotated horizontal offset while the person is contained.
+        let position = match self.container_animator_offset(world, object) {
+            Some(offset) => [
+                (a.position[0].ext() + offset[0].ext()).to_f32(),
+                (a.position[1].ext() + offset[1].ext()).to_f32(),
+                (a.position[2].ext() + offset[2].ext()).to_f32(),
+            ],
+            None => a.position,
+        };
         let level = World::tile(object.position)[2];
         let half = Ext::from_f64_bits(0x3fe0_0000_0000_0000);
         let round = |v: F32| (v.ext() + half).single().to_i32_truncate();
-        let point = [round(a.position[0]), round(a.position[1])];
+        let point = [round(position[0]), round(position[1])];
         let size = i32::from(world.size);
         let [first, second] = point.map(|p| (p >> 4) as i8 as i32);
         // Off the lot (0x45ee1d: either tile, as a signed byte, below 0
@@ -614,7 +625,7 @@ impl Interpreter<'_> {
         // Above the ground the level's rise is added (0x5922ad); see
         // docs/decisions/20261115-snap-offset-order.md.
         let rotation = self.view_rotation_for_object(world, id);
-        head::placement_on_level(a.position, height, level, rotation).ok_or_else(|| {
+        head::placement_on_level(position, height, level, rotation).ok_or_else(|| {
             unsupported(
                 "0x5c3a20",
                 &format!(
@@ -623,6 +634,61 @@ impl Interpreter<'_> {
             )
         })
     }
+
+    /// Container-slot animator offset (`0x454ceb..0x454d5e`) for a person
+    /// currently held in a container slot, or `None` when not contained or the
+    /// offset is zero.
+    fn container_animator_offset(
+        &self,
+        world: &World,
+        object: &sims_sim::Object,
+    ) -> Option<[F32; 3]> {
+        let container_id = u16::try_from(object.data.get(2).copied().unwrap_or(0))
+            .ok()
+            .filter(|&c| c > 0)?;
+        let slot_index = usize::try_from(object.data.get(3).copied().unwrap_or(-1)).ok()?;
+        let container = world.objects.get(&container_id)?;
+        let definition =
+            crate::interpreter::object_definition(self.catalog, world, container.guid)?;
+        let entry = self
+            .program
+            .slots(definition.resource, definition.chunk)
+            .iter()
+            .filter(|entry| entry.kind == 0)
+            .nth(slot_index)?;
+        let facing = i32::from(container.data.get(1).copied().unwrap_or(0));
+        let offset = container_slot_animator_offset(entry.offset, facing);
+        if offset == [F32::ZERO; 3] {
+            None
+        } else {
+            Some(offset)
+        }
+    }
+}
+
+/// Rotated horizontal container-slot animator offset (`0x454ceb..0x454d5e`,
+/// passed to `0x58933b` at `0x454e01`): turns `entry.offset[0..2]` by
+/// `target_facing & 7` (even facings only; odd facings produce `(0, 0)`),
+/// truncating each component with `__ftol` (`0x636128`) and returning the
+/// single-precision `(dx, dy, 0.0)` offset added to `a.position` in
+/// `cTSPerson::Place` (`0x5921f0..0x59221a`).
+fn container_slot_animator_offset(offset: [f32; 3], target_facing: i32) -> [F32; 3] {
+    let x = F32::from_f32(offset[0]).ext();
+    let y = F32::from_f32(offset[1]).ext();
+    let (dx, dy) = match target_facing & 7 {
+        0 => (x, y),
+        2 => (-y, x),
+        4 => (-x, -y),
+        6 => (y, -x),
+        _ => (Ext::ZERO, Ext::ZERO),
+    };
+    let ix = dx.to_i32_truncate();
+    let iy = dy.to_i32_truncate();
+    [
+        Ext::from_i32(ix).single().to_f32(),
+        Ext::from_i32(iy).single().to_f32(),
+        F32::ZERO,
+    ]
 }
 
 /// A person's head anchors: +0x144, the point on top of the head, and
@@ -643,4 +709,44 @@ fn world_point(position: [i32; 3]) -> [F32; 3] {
         F32::from_bits(0),
         to_world_units(Ext::from_i32(position[0])).to_f32(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_slot_animator_offset_rotates_and_truncates_even_facings_only() {
+        let offset = [8.75f32, -3.9f32, 12.0f32];
+        let as_f32 = |v: [F32; 3]| [v[0].to_f32(), v[1].to_f32(), v[2].to_f32()];
+        assert_eq!(
+            as_f32(container_slot_animator_offset(offset, 0)),
+            [8.0, -3.0, 0.0]
+        );
+        assert_eq!(
+            as_f32(container_slot_animator_offset(offset, 2)),
+            [3.0, 8.0, 0.0]
+        );
+        assert_eq!(
+            as_f32(container_slot_animator_offset(offset, 4)),
+            [-8.0, 3.0, 0.0]
+        );
+        assert_eq!(
+            as_f32(container_slot_animator_offset(offset, 6)),
+            [-3.0, -8.0, 0.0]
+        );
+        // Negative facing wraps by & 7 (-2 & 7 == 6).
+        assert_eq!(
+            as_f32(container_slot_animator_offset(offset, -2)),
+            [-3.0, -8.0, 0.0]
+        );
+        // Odd facings yield zero (0x454d15).
+        for facing in [1, 3, 5, 7, -1] {
+            assert_eq!(
+                as_f32(container_slot_animator_offset(offset, facing)),
+                [0.0, 0.0, 0.0],
+                "facing {facing}"
+            );
+        }
+    }
 }

@@ -77,11 +77,14 @@
 //!    - if I am a person, my animator's position is unset (its virtual
 //!      function 0x20, 0x589361);
 //!    - object data word 52 (+0xb2) becomes 0;
-//!    - if I am a person, Snap zeroes the animator's offset from me (+0x8c
-//!      to +0x94, virtual function 0x2c, 0x58933b) and the animator places
-//!      itself on my tile again (virtual function 0x60, `animator::place`).
-//!      A person with no animator entry has the one the load leaves, which
-//!      the write makes its entry.
+//!    - if I am a person, Snap sets the animator's offset from me (+0x8c
+//!      to +0x94, virtual function 0x2c, 0x58933b) to the container slot's
+//!      rotated truncated horizontal offset (0x454ceb to 0x454d5e) when
+//!      snapping into a container slot (applied in `head::model` while
+//!      contained, 0x5921f0), or zeroes it otherwise, and the animator
+//!      places itself on my tile again (virtual function 0x60,
+//!      `animator::place`). A person with no animator entry has the one the
+//!      load leaves, which the write makes its entry.
 //!
 //!    The branch is true. An object that is not a person snaps the same
 //!    way, without the animator.
@@ -128,9 +131,6 @@ enum NotFit {
     /// collided with (0x6e4ad0), if any.
     Refused(Refusal, Option<u16>),
 }
-
-/// The SLOT entry kind of a container slot.
-const CONTAINER: u16 = 0;
 
 /// Where a mode puts me, before the place is tested (0x454c70 on).
 struct Spot {
@@ -262,7 +262,6 @@ impl Machine<'_, '_> {
                         "in mode 1 into an object with no container slot",
                     ));
                 }
-                self.check_slot_place(target, 0)?;
                 Spot {
                     direction: self.facing(me)?,
                     position: self.world.objects[&target].position,
@@ -412,7 +411,6 @@ impl Machine<'_, '_> {
             if usize::try_from(slot.snap_target).is_ok_and(|s| s + 1 >= records) {
                 return Err(Trap::native(0x20, "Snap names no slot of the object"));
             }
-            self.check_slot_place(target, slot.snap_target)?;
             Some((target, slot.snap_target))
         } else {
             None
@@ -445,33 +443,6 @@ impl Machine<'_, '_> {
             .copied()
             .map(i32::from)
             .ok_or_else(|| Trap::Invalid(format!("object {id} has no data word {FACING}")))
-    }
-
-    /// What a place inside `target`'s container slot `slot` needs that is
-    /// not ported: a slot's offset across, turned to the object's facing,
-    /// is added to my animator's offset (0x454ceb to 0x454d5e), which is
-    /// not kept. (Flag bit 2's wall test is [`Machine::walls_in_the_way`],
-    /// after the place test.)
-    fn check_slot_place(&self, target: u16, slot: i32) -> Result<(), Trap> {
-        let guid = self.world.objects[&target].guid;
-        let definition = self.definition(guid)?;
-        let held = self
-            .program
-            .slots(definition.resource, definition.chunk)
-            .iter()
-            .filter(|entry| entry.kind == CONTAINER)
-            .nth(slot as usize);
-        if held.is_some_and(|entry| {
-            entry.offset[..2]
-                .iter()
-                .any(|n| n.to_bits() & 0x7fff_ffff != 0)
-        }) {
-            return Err(unsupported(
-                "0x454ceb",
-                "into a container slot whose offset across moves my animator",
-            ));
-        }
-        Ok(())
     }
 
     /// Flag bit 2's wall test for a place in a slot of `target` (0x45522c

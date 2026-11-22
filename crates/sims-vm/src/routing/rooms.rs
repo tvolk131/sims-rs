@@ -42,6 +42,9 @@ const CROSSABLE: [u16; 5] = [3, 5, 6, 15, 23];
 const PORTAL_FUNCTION: usize = 15;
 /// The object type of a door.
 const DOOR: i16 = 8;
+/// Definition word 8 (+0x10): base graphic ID, used to pair doors with
+/// `PAIRING == 1` (`0x4636c5`).
+const GRAPHIC: usize = 8;
 /// Definition word 69: how a door finds its other side.
 const PAIRING: usize = 0x8a / 2;
 /// Object data word 29: the room.
@@ -165,43 +168,66 @@ pub(crate) fn room_level(room: i16) -> i32 {
 }
 
 impl Interpreter<'_> {
-    /// The other side of a door (0x4636ae): the next part of the door's
-    /// group, round the ring, that has the door function. Doors that pair
-    /// by graphic (definition word 69 is 1) are not ported.
+    /// The other side of a door (0x4636ae): when definition word 69
+    /// ([`PAIRING`]) is 1 (`0x4636c5`), the first other tile in the door's
+    /// group list (starting from its lead tile) whose definition word 8
+    /// ([`GRAPHIC`], `+0x10`) matches; otherwise (`0x463705`), the next part
+    /// of the door's group round the ring. Repeats from the found tile until
+    /// one has the door function (callback 15) or the search returns to `door`
+    /// or finds no match.
     pub(crate) fn partner(&self, world: &World, door: u16) -> Result<u16, Trap> {
-        if self.words(world, door)?[PAIRING] == 1 {
-            return Err(Trap::Unsupported(
-                "a door that pairs with its other side by graphic (0x4636c5) is not ported".into(),
-            ));
-        }
         let parts = self.parts(world, door)?;
-        if parts.len() < 2 {
-            return Err(Trap::Unsupported(
-                "a door of one tile: the original's partner search reads through a null pointer \
-                 (0x463705)"
-                    .into(),
-            ));
-        }
-        let at = parts.iter().position(|&p| p == door).unwrap_or(0);
-        for step in 1..parts.len() {
-            let part = parts[(at + step) % parts.len()];
+        let mut current = door;
+        for _ in 0..=parts.len() {
+            let next = if self.words(world, current)?[PAIRING] == 1 {
+                let graphic = self.words(world, current)?[GRAPHIC];
+                let mut matched = None;
+                for &candidate in &parts {
+                    if candidate != current && self.words(world, candidate)?[GRAPHIC] == graphic {
+                        matched = Some(candidate);
+                        break;
+                    }
+                }
+                matched.ok_or_else(|| {
+                    Trap::Unsupported(
+                        "a door pairing by graphic (0x4636c5) has no matching tile in its group"
+                            .into(),
+                    )
+                })?
+            } else {
+                if parts.len() < 2 {
+                    return Err(Trap::Unsupported(
+                        "a door of one tile: the original's partner search reads through a null \
+                         pointer (0x463705)"
+                            .into(),
+                    ));
+                }
+                let at = parts.iter().position(|&p| p == current).unwrap_or(0);
+                parts[(at + 1) % parts.len()]
+            };
             // The original casts each part to its door class (0x635abe);
             // every part of a door's group is taken to be one.
-            if self.kind(world, part)? != DOOR {
+            if self.kind(world, next)? != DOOR {
                 return Err(Trap::Unsupported(
                     "a door's group has a part of another type; the original's class cast \
                      (0x463724) is not modeled"
                         .into(),
                 ));
             }
-            if self.has_function(world, part, PORTAL_FUNCTION) {
-                return Ok(part);
+            if next == door {
+                return Err(Trap::Unsupported(
+                    "a door whose group has no other door tile: the original's partner search \
+                     returns null (0x463750), which is not ported"
+                        .into(),
+                ));
             }
+            if self.has_function(world, next, PORTAL_FUNCTION) {
+                return Ok(next);
+            }
+            current = next;
         }
         Err(Trap::Unsupported(
-            "a door whose group has no other door tile: the original's partner search goes \
-             round the ring again (0x46374b), which is not ported"
-                .into(),
+            "a door's partner search (0x4636ae) cycled without finding a door tile".into(),
         ))
     }
 
@@ -752,5 +778,97 @@ mod tests {
             .room_rects(&watered(Some(0x1000)), 0, false)
             .unwrap();
         assert_eq!(standable, dry);
+    }
+
+    #[test]
+    fn graphic_paired_door_matches_definition_word_8_in_group() {
+        use sims_formats::saved_objects::Multipart;
+
+        let mut prog = program();
+        let mut lib = crate::Library::default();
+        let door_words = |graphic: i16, pairing: i16| {
+            let mut w = [0i16; crate::DEFINITION_WORDS];
+            w[9] = DOOR;
+            w[GRAPHIC] = graphic;
+            w[PAIRING] = pairing;
+            // DEFINITION_CALLBACKS[PORTAL_FUNCTION (15)] = 0x22 (word 17).
+            w[17] = 4096;
+            w
+        };
+        lib.definitions.insert(1, door_words(100, 1));
+        lib.definitions.insert(2, door_words(200, 1));
+        lib.definitions.insert(3, door_words(100, 1));
+        let mut portal_callbacks = vec![
+            sims_formats::execution::ObjectFunction {
+                condition: 0,
+                action: 0,
+            };
+            PORTAL_FUNCTION + 1
+        ];
+        portal_callbacks[PORTAL_FUNCTION].action = 4096;
+        for chunk in [1u16, 2, 3] {
+            lib.callbacks.insert(chunk, portal_callbacks.clone());
+        }
+        prog.libraries.insert(1, lib);
+
+        let mut cat = catalog();
+        for (chunk, guid) in [(1u16, 0x8001u32), (2, 0x8002), (3, 0x8003)] {
+            let index = cat.objects.len();
+            cat.objects.push(sims_content::Object {
+                guid,
+                resource: 1,
+                chunk,
+                kind: DOOR as u16,
+                master: 1,
+            });
+            cat.by_guid.insert(guid, index);
+        }
+
+        let mut w = world();
+        let make_door = |id: u16, guid: u32, parent: i16| sims_sim::Object {
+            id,
+            guid,
+            footprint: [0; 4],
+            position: [32, 32, 0],
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: vec![0; 8],
+            data: vec![0; 72],
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: -1,
+            relationships: Vec::new(),
+            slots: Vec::new(),
+            dynamic_sprites: Vec::new(),
+            multipart: Some(Multipart {
+                offset: [0; 3],
+                group: [0; 3],
+                parent,
+            }),
+            portal: None,
+            person: None,
+            registry_word: None,
+            last_result: false,
+            removal_skips_resets: false,
+            selected: false,
+        };
+        // Group: lead 10 (graphic 100), children 11 (graphic 200) and 12 (graphic 100).
+        w.objects.insert(10, make_door(10, 0x8001, 0));
+        w.objects.insert(11, make_door(11, 0x8002, 10));
+        w.objects.insert(12, make_door(12, 0x8003, 10));
+        w.next_parts.insert(10, 11);
+        w.next_parts.insert(11, 12);
+        w.order.extend([10, 11, 12]);
+
+        let interpreter = Interpreter::new(&prog, &cat, Stream::Lot);
+        // Graphic pairing skips tile 11 (graphic 200) and pairs 10 <-> 12 (graphic 100).
+        assert_eq!(interpreter.partner(&w, 10), Ok(12));
+        assert_eq!(interpreter.partner(&w, 12), Ok(10));
+        // Tile 11 has no other tile with graphic 200 in the group.
+        assert!(matches!(
+            interpreter.partner(&w, 11),
+            Err(Trap::Unsupported(msg)) if msg.contains("0x4636c5")
+        ));
     }
 }

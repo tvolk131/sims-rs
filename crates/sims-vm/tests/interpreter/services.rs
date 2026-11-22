@@ -240,6 +240,89 @@ fn other_generic_calls_name_themselves() {
     assert!(text.contains("Generic Sims Call routine 27"), "{text}");
 }
 
+#[test]
+fn generic_call_18_and_26_report_controlled_family_state() {
+    use sims_sim::neighbors::Family;
+    use sims_vm::Interpreter;
+
+    let run_generic = |fx: &mut Fixture, routine: u8, active: Option<&[u32]>| {
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                1,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [routine, 0, 0, 0, 0, 0, 0, 0],
+            )]),
+        );
+        let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.active_family = active;
+        interpreter.run_tree(&mut fx.world, LAMP, 4096, 0, &[], 10)
+    };
+
+    // Nonzero family in global 9 whose first member (SIM_GUID) is on the lot.
+    let mut fx = Fixture::new();
+    fx.world.globals[9] = 7;
+    fx.world.families.push(Family {
+        id: 7,
+        house: 1,
+        members: vec![SIM_GUID],
+        friends: 0,
+        stale: false,
+    });
+    assert_eq!(run_generic(&mut fx, 18, None), Ok(true));
+    assert_eq!(fx.lamp().temps[0], SIM as i16);
+    fx.lamp_mut().temps[0] = 99;
+    fx.lamp_mut().temps[1] = 88;
+    assert_eq!(run_generic(&mut fx, 26, None), Ok(true));
+    assert_eq!((fx.lamp().temps[0], fx.lamp().temps[1]), (7, 1));
+
+    // Member 0 off the lot: routine 18 writes -1, routine 26 still writes (family, 1).
+    fx.world.people.clear();
+    assert_eq!(run_generic(&mut fx, 18, None), Ok(true));
+    assert_eq!(fx.lamp().temps[0], -1);
+    assert_eq!(run_generic(&mut fx, 26, None), Ok(true));
+    assert_eq!((fx.lamp().temps[0], fx.lamp().temps[1]), (7, 1));
+
+    // Empty controlled family (global 9 == 0, active_family = Some(&[])):
+    // 0x4e97dc(0) returns -1 so both routines leave temps untouched.
+    let mut fx = Fixture::new();
+    fx.world.globals[9] = 0;
+    fx.lamp_mut().temps[0] = 42;
+    fx.lamp_mut().temps[1] = 77;
+    assert_eq!(run_generic(&mut fx, 18, Some(&[])), Ok(true));
+    assert_eq!(fx.lamp().temps[0], 42);
+    assert_eq!(run_generic(&mut fx, 26, Some(&[])), Ok(true));
+    assert_eq!((fx.lamp().temps[0], fx.lamp().temps[1]), (42, 77));
+
+    // Global 9 == 0 with active_family = Some(&[SIM_GUID]) on lot:
+    // routine 18 writes SIM, routine 26 writes (SIM, 0).
+    let members = [SIM_GUID];
+    assert_eq!(run_generic(&mut fx, 18, Some(&members)), Ok(true));
+    assert_eq!(fx.lamp().temps[0], SIM as i16);
+    assert_eq!(run_generic(&mut fx, 26, Some(&members)), Ok(true));
+    assert_eq!((fx.lamp().temps[0], fx.lamp().temps[1]), (SIM as i16, 0));
+
+    // Global 9 == 0 with active_family = Some(&[SIM_GUID]) off lot:
+    // routine 26 traps Unsupported (0x450764 dereferences null).
+    fx.world.people.clear();
+    assert!(matches!(
+        trap(run_generic(&mut fx, 26, Some(&members))),
+        Trap::Unsupported(_)
+    ));
+
+    // Global 9 == 0 with active_family = None traps Unsupported for both.
+    assert!(matches!(
+        trap(run_generic(&mut fx, 18, None)),
+        Trap::Unsupported(_)
+    ));
+    assert!(matches!(
+        trap(run_generic(&mut fx, 26, None)),
+        Trap::Unsupported(_)
+    ));
+}
+
 fn own(fx: &mut Fixture, object: u16, mode: u8) -> Result<bool, sims_vm::Fault> {
     let file = if object == LAMP { LAMP_FILE } else { SIM_FILE };
     fx.add(

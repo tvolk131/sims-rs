@@ -564,18 +564,57 @@ fn neighborhood_data_reads_words_1_to_15() {
 }
 
 #[test]
-fn unsupported_scopes_name_themselves() {
-    let scope = 38;
+fn neighbor_definition_reads_words_readonly_and_checks_bounds() {
+    // Scope 38 (0x454304): word `index` of the linked definition of the
+    // neighbor record the stack object names, as a read-only value. Missing
+    // neighbor is native error 0x37; index outside 0..108 is native error 0x23.
     let mut fx = Fixture::new();
-    let fault = read(&mut fx, scope, 0).unwrap_err();
-    assert_eq!(fault.trap, Trap::UnsupportedScope { scope });
-    let text = fault.to_string();
-    assert!(
-        text.contains(&format!(
-            "unsupported scope {scope} ({})",
-            sims_vm::scope_name(scope)
-        )),
-        "{text}"
-    );
+    let guid = fx.sim().guid;
+    fx.words(SIM_FILE)[12] = 777;
+    let word107 = fx.words(SIM_FILE)[107];
+    fx.world
+        .neighbors
+        .slots
+        .push(Some(sims_sim::neighbors::Neighbor {
+            id: 1,
+            guid,
+            revision: 1,
+            data: vec![0; 256],
+            relationships: Vec::new(),
+            friends: 0,
+            stale: false,
+        }));
+    let run_read = |fx: &mut Fixture, stack_obj: i16, index: i16, expected: i16| {
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![expression(38, index, EQUAL, LITERAL, expected)]),
+        );
+        fx.run_with(LAMP, 4096, stack_obj, &[], 10)
+    };
+    let run_write = |fx: &mut Fixture, stack_obj: i16, index: i16, value: i16| {
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![expression(38, index, ASSIGN, LITERAL, value)]),
+        );
+        fx.run_with(LAMP, 4096, stack_obj, &[], 10)
+    };
+    // Missing neighbor (stack object 0 or 99): native error 0x37 (checked before index).
+    assert_eq!(code(run_read(&mut fx, 0, 108, 0)), Some(0x37));
+    assert_eq!(code(run_read(&mut fx, 99, 0, 0)), Some(0x37));
+    // Neighbor 1 exists: reads definition words, rejects out-of-bounds with 0x23.
+    assert_eq!(run_read(&mut fx, 1, 12, 777), Ok(true));
+    assert_eq!(run_read(&mut fx, 1, 107, word107), Ok(true));
+    for index in [-1, 108, 200] {
+        assert_eq!(
+            code(run_read(&mut fx, 1, index, 0)),
+            Some(0x23),
+            "index {index}"
+        );
+    }
+    // Read-only (no word pointer): write fails with native error 0x13.
+    assert_eq!(code(run_write(&mut fx, 1, 12, 5)), Some(0x13));
+    assert_eq!(sims_vm::scope_name(38), "neighbor's definition");
     assert_eq!(sims_vm::scope_name(24), "neighbor in stack object");
 }

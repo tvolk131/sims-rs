@@ -97,19 +97,17 @@ fn unsupported(what: &str) -> Trap {
     ))
 }
 
-/// An object's obstacle (0x482599 to 0x4827b9): its footprint, in the
-/// object's own word order (the emulated original's obstacles at the
-/// Goth house's first route show that order), with the cost, left out when it
-/// overlaps the person's footprint (Wine's IntersectRect, on the
-/// footprint before growing), and grown by [`PADDING`] when the object is
-/// a person or the cost is 8 or more.
-fn obstacle(footprint: [i32; 4], cost: i32, kind: i16, actor: [i32; 4]) -> Option<Region> {
-    let a = footprint;
+/// An object's obstacle (0x482599 to 0x4827b9): its rectangle (initially its
+/// footprint, or replaced by a door edge strip at `0x482625..0x482758`),
+/// left out when it overlaps the person's footprint (Wine's IntersectRect,
+/// `0x48276f`), and grown by [`PADDING`] when the object is a person or the
+/// cost is 8 or more (`0x482779..0x48279f`).
+fn obstacle(rect: Region, cost: i32, kind: i16, actor: [i32; 4]) -> Option<Region> {
+    let a = rect.0;
     let b = actor;
     if a[0].max(b[0]) < a[2].min(b[2]) && a[1].max(b[1]) < a[3].min(b[3]) {
         return None;
     }
-    let rect = Region([a[0], a[1], a[2], a[3], cost]);
     Some(if kind == PERSON || cost >= 8 {
         rect.inflate(PADDING)
     } else {
@@ -232,27 +230,49 @@ impl Interpreter<'_> {
                 .get(&id)
                 .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
             let fp = object.footprint;
-            let cost = if datum(world, id, COST).map_err(fail)? != 0 {
+            let mut cost = if datum(world, id, COST).map_err(fail)? != 0 {
                 10
             } else {
                 HARD
             };
+            let mut rect = Region([fp[0], fp[1], fp[2], fp[3], cost]);
             let kind = self.kind(world, id).map_err(fail)?;
             if kind == DOOR {
                 // 0x4359ce: the door's walls, turned by its direction.
+                // 0x482620..0x482758: each matching wall edge bit replaces
+                // the obstacle rectangle (`[ebp - 0x58]`) with a 1-unit strip
+                // along that footprint edge at cost 10000 and inflates it by
+                // `PADDING` (3); `0x48276f` and `0x48279f` then run on the
+                // resulting rectangle and cost.
                 let mask = i32::from(datum(world, id, WALL_MASK).map_err(fail)?);
                 if mask != 0 {
                     let dir = (datum(world, id, DIRECTION).map_err(fail)? as u8 & 31) as u32;
                     let turned = (mask as u32).wrapping_shl(dir);
                     let bits = (turned & 0xff) | ((turned >> 8) & 0xff);
-                    if bits & 0x55 != 0 {
-                        return Err(fail(unsupported(
-                            "a door with walls on its edges (0x482625)",
-                        )));
+                    const DOOR_EDGE_COST: i32 = 10_000;
+                    if bits & 0x01 != 0 {
+                        cost = DOOR_EDGE_COST;
+                        rect = Region([fp[0], fp[1], fp[2], fp[1].wrapping_add(1), cost])
+                            .inflate(PADDING);
+                    }
+                    if bits & 0x04 != 0 {
+                        cost = DOOR_EDGE_COST;
+                        rect = Region([fp[2].wrapping_sub(1), fp[1], fp[2], fp[3], cost])
+                            .inflate(PADDING);
+                    }
+                    if bits & 0x10 != 0 {
+                        cost = DOOR_EDGE_COST;
+                        rect = Region([fp[0], fp[3].wrapping_sub(1), fp[2], fp[3], cost])
+                            .inflate(PADDING);
+                    }
+                    if bits & 0x40 != 0 {
+                        cost = DOOR_EDGE_COST;
+                        rect = Region([fp[0], fp[1], fp[0].wrapping_add(1), fp[3], cost])
+                            .inflate(PADDING);
                     }
                 }
             }
-            dynamic.extend(obstacle(fp, cost, kind, actor));
+            dynamic.extend(obstacle(rect, cost, kind, actor));
         }
 
         // 0x4827f6: the room's own rectangles (0x46795a, with terrain), or,
@@ -469,16 +489,16 @@ mod tests {
         // A hard obstacle (cost 8 or more) grows by 3 on each side; the
         // footprint's words stay in order.
         assert_eq!(
-            obstacle([10, 20, 30, 40], HARD, 4, actor),
+            obstacle(Region([10, 20, 30, 40, HARD]), HARD, 4, actor),
             Some(Region([7, 17, 33, 43, HARD]))
         );
         // A cheap one stays as it is, unless it is a person.
         assert_eq!(
-            obstacle([10, 20, 30, 40], 5, 4, actor),
+            obstacle(Region([10, 20, 30, 40, 5]), 5, 4, actor),
             Some(Region([10, 20, 30, 40, 5]))
         );
         assert_eq!(
-            obstacle([10, 20, 30, 40], 5, PERSON, actor),
+            obstacle(Region([10, 20, 30, 40, 5]), 5, PERSON, actor),
             Some(Region([7, 17, 33, 43, 5]))
         );
     }
@@ -486,12 +506,31 @@ mod tests {
     #[test]
     fn an_obstacle_over_the_person_is_left_out() {
         let actor = [8, 8, 12, 12];
-        assert_eq!(obstacle([10, 10, 20, 20], HARD, 4, actor), None);
+        assert_eq!(
+            obstacle(Region([10, 10, 20, 20, HARD]), HARD, 4, actor),
+            None
+        );
         // Touching edges do not overlap; growing comes after the test.
         assert_eq!(
-            obstacle([12, 0, 20, 20], HARD, 4, actor),
+            obstacle(Region([12, 0, 20, 20, HARD]), HARD, 4, actor),
             Some(Region([9, -3, 23, 23, HARD]))
         );
+    }
+
+    #[test]
+    fn door_edge_strip_grows_twice_at_cost_10000_when_disjoint_from_actor() {
+        // 0x482625..0x48279f: edge strip at cost 10000 gets InflateRect(3, 3)
+        // when built, then a second InflateRect(3, 3) in obstacle() because
+        // cost >= 8.
+        let fp = [32, 48, 48, 64];
+        let strip = Region([fp[0], fp[1], fp[2], fp[1] + 1, 10_000]).inflate(PADDING);
+        assert_eq!(strip, Region([29, 45, 51, 52, 10_000]));
+        assert_eq!(
+            obstacle(strip, 10_000, DOOR, [0, 0, 4, 4]),
+            Some(Region([26, 42, 54, 55, 10_000]))
+        );
+        // If the pre-inflated strip overlaps the actor, IntersectRect drops it.
+        assert_eq!(obstacle(strip, 10_000, DOOR, [30, 46, 34, 50]), None);
     }
 
     #[test]

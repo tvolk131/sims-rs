@@ -64,7 +64,7 @@ const SCOPE_NAMES: [&str; 39] = [
     "stack object's callback",
     "my type attribute",
     "stack object's type attribute",
-    "scope 38",
+    "neighbor's definition",
 ];
 
 /// A scope's name, for messages.
@@ -105,10 +105,6 @@ fn bounded(index: i16, count: usize, code: u16) -> Result<usize, Trap> {
         .ok()
         .filter(|&i| i < count)
         .ok_or(Trap::native(code, "memory index out of bounds"))
-}
-
-fn unsupported(scope: u8) -> Trap {
-    Trap::UnsupportedScope { scope }
 }
 
 impl Machine<'_, '_> {
@@ -641,9 +637,19 @@ impl Machine<'_, '_> {
                     .ok_or(Trap::native(0x3c, "neighborhood data index out of bounds"))?;
                 Cell::Literal(self.world.neighborhood_data[i])
             }
-            // Scope 38 needs state the simulation doesn't hold yet.
+            // Neighbor's object definition as words (0x454304): the neighbor
+            // record the stack object names (native error 0x37 if missing),
+            // then word `index` of its linked definition's 108 words (native
+            // error 0x23 if out of bounds), as a read-only value with no word
+            // pointer.
             38 => {
-                return Err(unsupported(scope));
+                let record = self
+                    .world
+                    .neighbors
+                    .get(stack_object)
+                    .ok_or(Trap::native(0x37, "missing neighbor"))?;
+                let index = bounded(index, DEFINITION_WORDS, 0x23)?;
+                Cell::Literal(self.definition_word(record.guid, index)?)
             }
             2 | 5 | 39..=255 => return Err(Trap::native(9, "invalid memory scope")),
         };

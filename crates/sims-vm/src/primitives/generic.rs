@@ -42,6 +42,17 @@
 //!   0xa. Routine 12 takes the true branch.
 //! - 6 (0x44fc53): take the neighbor the stack object names out of its
 //!   family (0x42601e). See [`Machine::leave_family`].
+//! - 18 (0x4506fb): write the object ID of the controlled family's first
+//!   member (`0x4e97dc(0)` -> `0x4e9608`), or -1 if not on the lot, into
+//!   temp 0. Leaves temp 0 untouched when `0x4e97dc(0)` returns -1. Always
+//!   takes the true branch.
+//! - 26 (0x450732): report the controlled family (game +0x10) in temps 0
+//!   and 1. If `0x4e97dc(0)` returns -1 (no first member, or its GUID is not
+//!   in the portrait table), temps are left untouched. Otherwise, when the
+//!   controlled family's ID (`+0x10c`) is nonzero, temp 0 becomes that ID and
+//!   temp 1 becomes 1; when its ID is 0, temp 0 becomes the first on-lot
+//!   person ID matching member 0 (`0x4e9608`) and temp 1 becomes 0. Always
+//!   takes the true branch.
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
@@ -101,6 +112,14 @@ impl Machine<'_, '_> {
                 Ok(true)
             }
             6 => self.leave_family(),
+            18 => {
+                self.controlled_family_head_object()?;
+                Ok(true)
+            }
+            26 => {
+                self.controlled_family_info()?;
+                Ok(true)
+            }
             routine => Err(Trap::Unsupported(format!(
                 "Generic Sims Call routine {routine}"
             ))),
@@ -191,6 +210,95 @@ impl Machine<'_, '_> {
         crate::person_factory::visitor_pass(self.program, self.world, self.active_family)?;
         self.world.families[place].stale = true;
         Ok(true)
+    }
+
+    /// Resolves `(family_id, first_member_guid)` for the active/controlled
+    /// family (`game +0x10`), returning `Ok((family_id, None))` when
+    /// `0x4e97dc(0)` returns -1 (empty member list or member 0 not in the
+    /// portrait table `0x4e9753`).
+    fn controlled_family_first_member(&self, routine: u16) -> Result<(i16, Option<u32>), Trap> {
+        let family_id = self.world.globals.get(9).copied().unwrap_or(0);
+        let first_guid = if family_id == 0 {
+            let Some(members) = self.active_family else {
+                return Err(Trap::Unsupported(format!(
+                    "Generic Sims Call {routine} with global 9 at 0: which family the game holds \
+                     (game +0x10) is not kept"
+                )));
+            };
+            members.first().copied()
+        } else {
+            let family = self
+                .world
+                .families
+                .iter()
+                .find(|f| f.id == i32::from(family_id))
+                .ok_or_else(|| {
+                    Trap::Invalid(format!("global 9 names family {family_id}, which is gone"))
+                })?;
+            family.members.first().copied()
+        };
+        let Some(guid) = first_guid else {
+            return Ok((family_id, None));
+        };
+        if !self.in_portrait_table(guid)? {
+            return Ok((family_id, None));
+        }
+        Ok((family_id, Some(guid)))
+    }
+
+    /// First on-lot person in `world.people` whose GUID matches `guid` (`0x4e9608`).
+    fn first_on_lot_person(&self, guid: u32) -> Option<u16> {
+        self.world
+            .people
+            .iter()
+            .copied()
+            .find(|id| self.world.objects.get(id).is_some_and(|o| o.guid == guid))
+    }
+
+    /// Routine 18 (0x4506fb): writes the controlled family's first member's
+    /// on-lot object ID (`0x4e97dc(0)` -> `0x4e9608`), or -1 if absent, into
+    /// temp 0. Leaves temp 0 untouched when `0x4e97dc(0)` returns -1.
+    fn controlled_family_head_object(&mut self) -> Result<(), Trap> {
+        let (_, Some(guid)) = self.controlled_family_first_member(18)? else {
+            return Ok(());
+        };
+        let result = self.first_on_lot_person(guid).map_or(-1, |id| id as i16);
+        *self
+            .me_mut()?
+            .temps
+            .first_mut()
+            .ok_or_else(|| Trap::Invalid("object has no temps".into()))? = result;
+        Ok(())
+    }
+
+    /// Routine 26 (0x450732): writes the active/controlled family (`game +0x10`)
+    /// into temps 0 and 1 when `0x4e97dc(0) != -1` (the family has a first
+    /// member whose GUID is in the portrait table `0x4e9753`).
+    fn controlled_family_info(&mut self) -> Result<(), Trap> {
+        let (family_id, Some(guid)) = self.controlled_family_first_member(26)? else {
+            return Ok(());
+        };
+        let (temp0, temp1) = if family_id == 0 {
+            let person_id = self.first_on_lot_person(guid).ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "Generic Sims Call 26 (0x450764): active family 0's first member \
+                     0x{guid:08X} is not on the lot, where the original dereferences null"
+                ))
+            })?;
+            (person_id as i16, 0)
+        } else {
+            (family_id, 1)
+        };
+        let temps = &mut self.me_mut()?.temps;
+        if temps.len() < 2 {
+            return Err(Trap::Invalid(format!(
+                "object has {} temps, need at least 2",
+                temps.len()
+            )));
+        }
+        temps[0] = temp0;
+        temps[1] = temp1;
+        Ok(())
     }
 
     /// Routine 2 (0x44fb51 to 0x44fbd8).

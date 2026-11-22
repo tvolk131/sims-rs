@@ -939,20 +939,23 @@ fn offset_container(offset: [f32; 3]) -> (Fixture, u16) {
 }
 
 #[test]
-fn a_container_slot_offset_across_fails_loudly_but_negative_zero_does_not() {
-    // The offset across moves my animator (0x454ceb), which is not kept.
-    for offset in [[8.0, 0.0, 0.0], [0.0, -0.5, 0.0]] {
+fn a_container_slot_offset_across_snaps_into_slot_and_preserves_object_position() {
+    // 0x454ceb..0x454d5e applies the horizontal container-slot offset only to
+    // the person's animator offset (`+0x8c/+0x90`, read by `cTSPerson::Place`
+    // at `0x5921f0`); the object's lot position and `animator.position` stay at
+    // the container's position.
+    for offset in [[8.0, 0.0, 0.0], [0.0, -0.5, 0.0], [-0.0, -0.0, 0.0]] {
         let (mut fx, me) = offset_container(offset);
-        let start = unmoved(&fx, me);
-        let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
-        assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454ceb")),
+        let lamp_pos = fx.lamp().position;
+        assert_eq!(
+            snap(&mut fx, me, LAMP as i16, 0, 3, 0),
+            Ok(true),
             "{offset:?}"
         );
-        assert_eq!(unmoved(&fx, me), start, "{offset:?}");
+        assert_eq!(fx.world.objects[&me].position, lamp_pos, "{offset:?}");
+        assert_eq!(fx.world.objects[&me].data[2], LAMP as i16, "{offset:?}");
+        assert_eq!(fx.world.objects[&me].data[3], 1, "{offset:?}");
     }
-    let (mut fx, me) = offset_container([-0.0, -0.0, 0.0]);
-    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
 }
 
 #[test]
