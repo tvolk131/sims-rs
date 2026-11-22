@@ -237,11 +237,21 @@ pub struct StoredNeighborhood {
 impl StoredNeighborhood {
     /// Builds a `sims_content::Neighborhood` view of this stored neighborhood
     /// so existing loaders (`World::read_neighbors`) can read it directly.
+    ///
+    /// Omits any non-zero empty family (`members.is_empty()`), matching
+    /// `Sims.exe` `0x425efb` (house load deletes empty households) so an empty
+    /// household can never block loading another lot.
     #[must_use]
     pub fn to_content_neighborhood(&self) -> Neighborhood {
+        let families = self
+            .families
+            .iter()
+            .filter(|&(&id, family)| id == 0 || !family.members.is_empty())
+            .map(|(&id, family)| (id, family.clone()))
+            .collect();
         Neighborhood {
             directory: PathBuf::new(),
-            families: self.families.clone(),
+            families,
             type_attributes: self.type_attributes.clone(),
             neighbors: self.neighbors.clone(),
             inventories: self.inventories.clone(),
@@ -504,6 +514,11 @@ impl StoredNeighborhood {
             }
             let _ = active.set_magic_history(history);
         }
+        // Drop any non-zero family that now has zero members (matching
+        // `0x425efb` when the last member dies or moves out via Generic Sims
+        // Call 6) so empty households never persist or block other lot loads.
+        self.families
+            .retain(|&id, family| id == 0 || !family.members.is_empty());
 
         // 4. TATT (0x425455 → 0x43e0be): merge updated world type attributes.
         if !world.type_attributes.is_empty() {

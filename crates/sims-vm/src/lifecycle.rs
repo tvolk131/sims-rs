@@ -2556,14 +2556,11 @@ pub fn evict(
     neighborhood_id: &str,
     house: u32,
 ) -> Result<EvictReport, LifecycleError> {
-    let report = evict_or_bulldoze(install_root, store, neighborhood_id, house, false)?;
+    let (report, budget_after) =
+        evict_or_bulldoze(install_root, store, neighborhood_id, house, false)?;
     let family = report
         .evicted_family
         .ok_or(LifecycleError::LotUnoccupied { house })?;
-    let stored = store
-        .load_neighborhood(neighborhood_id)?
-        .ok_or_else(|| LifecycleError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
-    let budget_after = stored.families.get(&family).map_or(0, |f| f.budget);
     Ok(EvictReport {
         house,
         family,
@@ -2586,7 +2583,7 @@ pub fn bulldoze(
     neighborhood_id: &str,
     house: u32,
 ) -> Result<BulldozeReport, LifecycleError> {
-    evict_or_bulldoze(install_root, store, neighborhood_id, house, true)
+    Ok(evict_or_bulldoze(install_root, store, neighborhood_id, house, true)?.0)
 }
 
 fn evict_or_bulldoze(
@@ -2595,7 +2592,7 @@ fn evict_or_bulldoze(
     neighborhood_id: &str,
     house: u32,
     bulldoze: bool,
-) -> Result<BulldozeReport, LifecycleError> {
+) -> Result<(BulldozeReport, i32), LifecycleError> {
     let snapshot = store
         .load_lot_snapshot(neighborhood_id, house)?
         .ok_or_else(|| LifecycleError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
@@ -2905,6 +2902,7 @@ fn evict_or_bulldoze(
     // Update evicted family in `world.families` & `stored.families`:
     // 0x427674 (cFamily::GetNetWorth with house == 0) + 0x42767f (arch = 0).
     let mut refund = 0i32;
+    let mut evicted_budget_after = 0i32;
     let evicted_family = evicted.as_ref().map(|(id, _)| *id);
     if let Some((family_id, _)) = evicted {
         if let Some(live_fam) = lot
@@ -2926,6 +2924,7 @@ fn evict_or_bulldoze(
                 stored_fam.house = 0;
                 stored_fam.flags &= !(FAMILY_FLAG_BIT_3 | FAMILY_FLAG_NEW_MOVE_IN);
             }
+            evicted_budget_after = stored_fam.budget;
         }
     }
 
@@ -2961,16 +2960,19 @@ fn evict_or_bulldoze(
         }
     }
 
-    Ok(BulldozeReport {
-        house,
-        evicted_family,
-        refund,
-        removed_objects,
-        cleared_tiles,
-        deleted_tombstones,
-        remaining_objects_value,
-        remaining_architecture_value,
-    })
+    Ok((
+        BulldozeReport {
+            house,
+            evicted_family,
+            refund,
+            removed_objects,
+            cleared_tiles,
+            deleted_tombstones,
+            remaining_objects_value,
+            remaining_architecture_value,
+        },
+        evicted_budget_after,
+    ))
 }
 
 /// Evaluates `0x4274bd..0x427516` (`0x4354d5`, plus the bulldoze branch at
@@ -4632,5 +4634,40 @@ mod tests {
         let mut after = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
         assert!(after.world.objects.values().all(|o| o.guid != bob_guid));
         after.step().unwrap();
+    }
+
+    #[test]
+    fn saving_empty_household_does_not_block_unrelated_lots() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let db = TempDb::new("empty-household-save");
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let no_frames = Frames::parse("none").unwrap();
+
+        // Move single-member Bachelor family (id=2) into House 4, clear its
+        // sole member (mirroring Generic Sims Call 6 removing the last member),
+        // and Save & Leave.
+        move_in(&root, &store, "UserData", 2, 4).unwrap();
+        let mut house4 = enter_lot(&root, &store, "UserData", 4, &[3], no_frames.clone()).unwrap();
+        if let Some(fam2) = house4.world.families.iter_mut().find(|f| f.id == 2) {
+            fam2.members.clear();
+        }
+        save_and_leave_lot(&root, &store, "UserData", &mut house4).unwrap();
+
+        // The empty household must be pruned from stored families, leaving
+        // House 4 unoccupied and unrelated Goth House 5 both loadable and
+        // bulldozable!
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert!(!nh.families.contains_key(&2));
+        assert!(nh.family_in(4).is_none());
+
+        let mut goth = enter_lot(&root, &store, "UserData", 5, &[3], no_frames.clone()).unwrap();
+        goth.step().unwrap();
+        let _ = bulldoze(&root, &store, "UserData", 5).unwrap();
+        let _reopened4 = enter_lot(&root, &store, "UserData", 4, &[3], no_frames).unwrap();
     }
 }

@@ -14,11 +14,13 @@ any install files.
 using five tables:
 
 - `neighborhoods` (`&str -> &[u8]`): versioned `StoredNeighborhood`
-  (`NEIGHBORHOOD_FORMAT = 2` little-endian `u32` + postcard payload) holding
+  (`NEIGHBORHOOD_FORMAT = 3` little-endian `u32` + postcard payload) holding
   `FAMI`, `NBRS`, `NGBH` data/inventories/options, `TATT`, resolved
   `LotZoning`, lot row order, runtime-created `World::characters`, permanently
-  deleted character GUIDs (`deleted_characters`), unique `instance_id`, and a
-  monotonic `revision`.
+  deleted character GUIDs (`deleted_characters`), monotonic `deletion_epoch` and
+  `deleted_at_epoch` (so reusing a previously bulldozed GUID still strips stale
+  instances on older saved or base lots), unique `instance_id`, and a monotonic
+  `revision`.
 - `neighborhood_characters` (`(&str, &str) -> &[u8]`): raw immutable
   `Characters/*.iff` blobs imported from `UserData*/Characters`.
 - `neighborhood_houses` (`(&str, u32) -> &[u8]`): raw immutable base
