@@ -798,6 +798,30 @@ impl Layer {
     pub fn commit(&mut self) {
         self.previous_event_time = self.event_time;
     }
+
+    /// Whether `cAnimLayer::Update` (`0x597f1b`–`0x597f38`) interpolates
+    /// between adjacent keyframes on this layer, or snaps to
+    /// `floor(phase * frames)` (`interpolate = false` when
+    /// `delta_clock >= 2 * (duration / frames)` with no frame-skip clamping).
+    ///
+    /// Evaluated under the game's x87 24-bit significand precision from the
+    /// layer's `current`, `previous`, `duration`, and `frames` fields without
+    /// changing `World` serialization or simulation hashes.
+    pub fn interpolate(&self) -> bool {
+        if self.frames == 0 {
+            return false;
+        }
+        let elapsed = Ext::from_i32(self.current.wrapping_sub(self.previous)).single();
+        let frame_ms = (self.duration.ext() / Ext::from_i32(self.frames as i32)).single();
+        let threshold = (frame_ms + frame_ms).single();
+        // 0x597f2f–0x597f38: `fcompp; fnstsw ax; sahf; jb keep_true` keeps
+        // `interpolate = true` when `elapsed < threshold` or unordered (NaN),
+        // and clears it when `elapsed >= threshold`.
+        !matches!(
+            elapsed.partial_cmp(&threshold),
+            Some(Ordering::Greater | Ordering::Equal)
+        )
+    }
 }
 
 /// How far an update went.
@@ -951,5 +975,101 @@ impl Animator {
         (Ext::from_i32(ticks) * Ext::from_i32(self.per_tick()))
             .single()
             .to_i32_truncate()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pose::Selection;
+
+    #[test]
+    fn layer_interpolate_matches_canimlayer_update_threshold() {
+        // C2O-sit-front: 3033 ms, 91 frames. At speed 1.4, duration = 2166.4285 ms,
+        // 2 * (duration / frames) = 47.6138 ms.
+        let mut sit = Layer::start(
+            "C2O-sit-front",
+            F32::from_f32(3033.0),
+            91,
+            true,
+            0,
+            false,
+            0,
+        );
+        sit.set_speed(F32::from_f32(1.4));
+        // Fresh layer (dt = 0 < 47.6138): interpolates.
+        assert!(sit.interpolate());
+        // Slow tick (dt = 42 < 47.6138): interpolates.
+        sit.update(42).unwrap();
+        assert!(sit.interpolate());
+        // Normal tick (dt = 50 >= 47.6138): snaps to floor(phase * frames).
+        sit.update(92).unwrap();
+        assert!(!sit.interpolate());
+        // Zero-delta forced re-update at unchanged clock (dt = 0): interpolates again.
+        sit.update(92).unwrap();
+        assert!(sit.interpolate());
+
+        // c2o-walking-loop: 900 ms, 27 frames. At speed 1.4, 2 * frame_ms = 47.619 ms.
+        let mut walk = Layer::make(
+            "c2o-walking-loop",
+            F32::from_f32(900.0),
+            27,
+            true,
+            0,
+            1,
+            F32::from_f32(1.4),
+            F32::from_f32(1.0),
+            1000,
+        );
+        walk.update(1050).unwrap();
+        assert!(!walk.interpolate());
+
+        // A2O-bookshelf-read-sitting-loop1: 1333 ms, 40 frames, speed 1.0 ->
+        // 2 * (1333 / 40) = 66.65 ms > 50 ms -> interpolates.
+        let mut read = Layer::start(
+            "A2O-bookshelf-read-sitting-loop1",
+            F32::from_f32(1333.0),
+            40,
+            true,
+            0,
+            false,
+            1000,
+        );
+        read.update(1050).unwrap();
+        assert!(read.interpolate());
+
+        // Exact boundary: duration = 1000 ms, frames = 40 -> 2 * frame_ms = 50 ms.
+        // dt = 49 -> true; dt = 50 -> false (`elapsed >= threshold` clears flag).
+        let mut boundary = Layer::start("boundary", F32::from_f32(1000.0), 40, true, 0, false, 0);
+        boundary.update(49).unwrap();
+        assert!(boundary.interpolate());
+        boundary.update(99).unwrap();
+        assert!(!boundary.interpolate());
+
+        // Degenerate zero-frame layer never interpolates.
+        let zero_frames = Layer::start("empty", F32::from_f32(1000.0), 0, true, 0, false, 0);
+        assert!(!zero_frames.interpolate());
+
+        // Agrees with `pose::Selection::at` across representative speeds and deltas.
+        for (clip_dur, frames, speed, dt) in [
+            (3033.0_f32, 91_u32, 1.4_f32, 50_i32),
+            (3033.0, 91, 1.0, 50),
+            (900.0, 27, 1.4, 50),
+            (900.0, 27, 1.4, 42),
+            (1000.0, 40, 1.0, 50),
+            (1000.0, 40, 1.0, 49),
+            (1266.0, 38, 1.4, 50),
+        ] {
+            let mut l = Layer::start("cmp", F32::from_f32(clip_dur), frames, true, 0, false, 100);
+            l.set_speed(F32::from_f32(speed));
+            l.update(100 + dt).unwrap();
+            let elapsed = Ext::from_i32(dt).single().to_f32();
+            let sel = Selection::at(l.phase, l.frames, l.duration, elapsed, l.mode == 1).unwrap();
+            assert_eq!(
+                l.interpolate(),
+                sel.interpolate,
+                "mismatch for dur={clip_dur} frames={frames} speed={speed} dt={dt}"
+            );
+        }
     }
 }

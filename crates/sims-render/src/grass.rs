@@ -936,6 +936,8 @@ mod tests {
             size,
             heights: vec![[0; 4]; full],
             grass: vec![grass; full],
+            pool: vec![0xff; full],
+            water: vec![0xff; full],
             levels: [level(), level()],
             outdoor_rooms: Default::default(),
             room_lights: Default::default(),

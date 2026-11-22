@@ -69,6 +69,14 @@ pub struct Lot {
     pub heights: Vec<[u8; 4]>,
     /// Each tile's grass value (Arry 6).
     pub grass: Vec<i8>,
+    /// Each tile's swimming pool mask (`Arry 9`, 64×64 stride 1): `0..=15`
+    /// cardinal pool connectivity bits, `16` (`0x10`) pool deck tile, `0xff`
+    /// none (`0x47855c`, `0x4ae645`–`0x4ae83e`).
+    pub pool: Vec<u8>,
+    /// Each tile's pond/natural water mask (`Arry 10`, 64×64 stride 1):
+    /// `0..=15` cardinal water connectivity bits, `0xff` none (`0x478574`,
+    /// `0x4afa0d`–`0x4b010c`).
+    pub water: Vec<u8>,
     pub levels: [Level; 2],
     /// The rooms that are outdoors, by ID.
     pub outdoor_rooms: std::collections::BTreeSet<i16>,
@@ -168,6 +176,28 @@ impl Lot {
             }
             _ => vec![0; FULL * FULL],
         };
+        let pool = match world.arrays.get(&9) {
+            Some(a)
+                if a.width == FULL
+                    && a.height == FULL
+                    && a.stride == 1
+                    && a.data.len() == FULL * FULL =>
+            {
+                a.data.clone()
+            }
+            _ => vec![0xff; FULL * FULL],
+        };
+        let water = match world.arrays.get(&10) {
+            Some(a)
+                if a.width == FULL
+                    && a.height == FULL
+                    && a.stride == 1
+                    && a.data.len() == FULL * FULL =>
+            {
+                a.data.clone()
+            }
+            _ => vec![0xff; FULL * FULL],
+        };
         let level = |index: usize| -> Result<Level> {
             let floors = array([1, 101][index])?;
             let floors = match floors.stride {
@@ -251,6 +281,8 @@ impl Lot {
             size,
             heights,
             grass,
+            pool,
+            water,
             levels,
             outdoor_rooms,
             room_lights,
@@ -281,6 +313,8 @@ impl Lot {
             && self.halves == other.halves
             && self.heights == other.heights
             && self.grass == other.grass
+            && self.pool == other.pool
+            && self.water == other.water
             && self.levels == other.levels
             && self.lamps == other.lamps
     }
