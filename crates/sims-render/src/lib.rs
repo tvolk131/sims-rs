@@ -10,6 +10,7 @@
 //! `docs/decisions/`.
 
 pub mod assets;
+pub mod build_preview;
 pub mod cache;
 pub mod camera;
 pub mod canvas;
