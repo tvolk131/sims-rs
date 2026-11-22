@@ -178,7 +178,7 @@ fn multi_neighborhood_crud_and_active_switching_round_trip() {
     );
     store.set_active_neighborhood("UserData").unwrap();
     let mut expected_nh1 = nh1.clone();
-    expected_nh1.revision = 1;
+    expected_nh1.revision = 3;
     assert_eq!(
         store.load_neighborhood("UserData").unwrap().as_ref(),
         Some(&expected_nh1)
@@ -601,7 +601,8 @@ fn copied_store_gets_distinct_store_id_and_save_neighborhood_advances_revision()
         1
     );
 
-    // Copying the `.redb` file on disk yields a distinct file-bound `store_id`.
+    // Copying the `.redb` file on disk yields a distinct file-bound `store_id`,
+    // whereas renaming the same file on the same volume preserves `store_id`.
     let orig_id = store_orig.store_id();
     drop(store_orig);
     std::fs::copy(&orig.0, &copy.0).unwrap();
@@ -609,4 +610,69 @@ fn copied_store_gets_distinct_store_id_and_save_neighborhood_advances_revision()
     let opened_copy = NeighborhoodStore::open(&copy.0).unwrap();
     assert_eq!(reopened_orig.store_id(), orig_id);
     assert_ne!(opened_copy.store_id(), orig_id);
+    drop(reopened_orig);
+    let renamed = TempDb::new("copy-renamed");
+    std::fs::rename(&orig.0, &renamed.0).unwrap();
+    let reopened_renamed = NeighborhoodStore::open(&renamed.0).unwrap();
+    assert_eq!(reopened_renamed.store_id(), orig_id);
+
+    // Checked writers and auxiliary file/base-house writers always strictly
+    // advance revision even when callers submit `state.revision == expected`.
+    let cur = reopened_renamed
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap();
+    assert!(
+        reopened_renamed
+            .save_neighborhood_checked("UserData", cur.instance_id, cur.revision, &cur)
+            .unwrap()
+            .is_ok()
+    );
+    let after_checked = reopened_renamed
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_checked.revision, cur.revision + 1);
+
+    assert!(
+        reopened_renamed
+            .save_lot_and_neighborhood_checked(
+                "UserData",
+                5,
+                Some((after_checked.instance_id, after_checked.revision)),
+                b"lot-bytes",
+                &after_checked,
+                &[],
+            )
+            .unwrap()
+            .is_ok()
+    );
+    let after_lot_checked = reopened_renamed
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_lot_checked.revision, after_checked.revision + 1);
+
+    reopened_renamed
+        .save_base_house("UserData", 4, b"replaced-base")
+        .unwrap();
+    assert_eq!(
+        reopened_renamed
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .revision,
+        after_lot_checked.revision + 1
+    );
+    reopened_renamed
+        .save_character_file("UserData", "User99999.iff", b"extra-char")
+        .unwrap();
+    assert_eq!(
+        reopened_renamed
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .revision,
+        after_lot_checked.revision + 2
+    );
 }

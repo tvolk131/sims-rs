@@ -532,24 +532,51 @@ fn store(error: impl std::fmt::Display) -> Error {
     Error::Store(error.to_string())
 }
 
-/// Mixes a store's persisted database ID with its canonical path and OS file
-/// identity (device + inode on Unix) so copying a `.redb` file on disk yields a
-/// distinct store identity while reopening the same file preserves it.
+/// Mixes a store's persisted database ID with its OS file identity (device +
+/// inode on Unix, falling back to canonical path when unavailable) so copying a
+/// `.redb` file on disk yields a distinct store identity while reopening or
+/// renaming the same file on the same volume preserves it.
 fn bind_store_file_identity(persisted_id: u128, canonical_path: &Path) -> u128 {
     let mut hasher = Sha256::new();
     hasher.update(b"store-file-identity");
     hasher.update(persisted_id.to_le_bytes());
-    hasher.update(canonical_path.to_string_lossy().as_bytes());
     #[cfg(unix)]
     if let Ok(meta) = std::fs::metadata(canonical_path) {
         use std::os::unix::fs::MetadataExt;
+        hasher.update(b"unix-dev-ino");
         hasher.update(meta.dev().to_le_bytes());
         hasher.update(meta.ino().to_le_bytes());
+    } else {
+        hasher.update(b"path");
+        hasher.update(canonical_path.to_string_lossy().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        hasher.update(b"path");
+        hasher.update(canonical_path.to_string_lossy().as_bytes());
     }
     let digest = hasher.finalize();
     let bytes: [u8; 16] = digest[..16].try_into().expect("sha256 is 32 bytes");
     let id = u128::from_le_bytes(bytes);
     if id == 0 { 1 } else { id }
+}
+
+/// Strictly advances `NEIGHBORHOODS[id].revision` inside an open write
+/// transaction whenever neighborhood `id` already exists, invalidating any
+/// already-open lot session against stale overwrites.
+fn bump_neighborhood_revision(txn: &redb::WriteTransaction, id: &str) -> Result<()> {
+    let mut table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
+    let existing = table
+        .get(id)
+        .map_err(store)?
+        .map(|v| StoredNeighborhood::decode(id, v.value()))
+        .transpose()?;
+    if let Some(mut nh) = existing {
+        nh.revision = nh.revision.saturating_add(1);
+        let encoded = nh.encode();
+        table.insert(id, encoded.as_slice()).map_err(store)?;
+    }
+    Ok(())
 }
 
 impl NeighborhoodStore {
@@ -942,7 +969,9 @@ impl NeighborhoodStore {
 
     /// Atomically saves `state` for neighborhood `id` only if the committed
     /// neighborhood's `(instance_id, revision)` still matches
-    /// `(expected_instance_id, expected_revision)`.
+    /// `(expected_instance_id, expected_revision)`, always preserving
+    /// `instance_id` and strictly advancing `revision` past the committed
+    /// revision so no concurrent or open lot session can silently overwrite it.
     pub fn save_neighborhood_checked(
         &self,
         id: &str,
@@ -950,7 +979,6 @@ impl NeighborhoodStore {
         expected_revision: u64,
         state: &StoredNeighborhood,
     ) -> Result<std::result::Result<(), CheckedCommitError>> {
-        let encoded = state.encode();
         let txn = self.db.begin_write().map_err(store)?;
         {
             let mut table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
@@ -972,6 +1000,12 @@ impl NeighborhoodStore {
                     current: current.revision,
                 }));
             }
+            let mut committed = state.clone();
+            committed.instance_id = current.instance_id;
+            if committed.revision <= current.revision {
+                committed.revision = current.revision.saturating_add(1);
+            }
+            let encoded = committed.encode();
             table.insert(id, encoded.as_slice()).map_err(store)?;
         }
         txn.commit().map_err(store)?;
@@ -998,13 +1032,16 @@ impl NeighborhoodStore {
         Ok(files)
     }
 
-    /// Stores a character file under neighborhood `id`.
+    /// Stores a character file under neighborhood `id`, bumping `id`'s
+    /// neighborhood revision if it already exists so open lot sessions cannot
+    /// overwrite the updated neighborhood state.
     pub fn save_character_file(&self, id: &str, filename: &str, bytes: &[u8]) -> Result<()> {
         let txn = self.db.begin_write().map_err(store)?;
         {
             let mut table = txn.open_table(NEIGHBORHOOD_CHARACTERS).map_err(store)?;
             table.insert((id, filename), bytes).map_err(store)?;
         }
+        bump_neighborhood_revision(&txn, id)?;
         txn.commit().map_err(store)
     }
 
@@ -1050,13 +1087,16 @@ impl NeighborhoodStore {
             .map(|value| value.value().to_vec()))
     }
 
-    /// Stores base `HouseXX.iff` bytes for `(id, house)`.
+    /// Stores base `HouseXX.iff` bytes for `(id, house)`, bumping `id`'s
+    /// neighborhood revision if it already exists so open lot sessions cannot
+    /// overwrite the replaced base house on Save & Leave.
     pub fn save_base_house(&self, id: &str, house: u32, bytes: &[u8]) -> Result<()> {
         let txn = self.db.begin_write().map_err(store)?;
         {
             let mut table = txn.open_table(NEIGHBORHOOD_HOUSES).map_err(store)?;
             table.insert((id, house), bytes).map_err(store)?;
         }
+        bump_neighborhood_revision(&txn, id)?;
         txn.commit().map_err(store)
     }
 
@@ -1096,7 +1136,8 @@ impl NeighborhoodStore {
     /// neighborhood's `instance_id` and `revision` still match; if the
     /// neighborhood was re-imported or another operation committed a newer
     /// revision meanwhile, aborts the transaction cleanly and returns
-    /// `Ok(Err(CheckedCommitError))`.
+    /// `Ok(Err(CheckedCommitError))`. Always preserves `instance_id` and
+    /// strictly advances `revision` past the previously committed revision.
     pub fn save_lot_and_neighborhood_checked(
         &self,
         id: &str,
@@ -1126,7 +1167,12 @@ impl NeighborhoodStore {
                         current: current.revision,
                     }));
                 }
-                state.clone()
+                let mut next = state.clone();
+                next.instance_id = current.instance_id;
+                if next.revision <= current.revision {
+                    next.revision = current.revision.saturating_add(1);
+                }
+                next
             } else {
                 let previous = nh_table
                     .get(id)

@@ -62,16 +62,19 @@ recursive directory / inline `.far` mounting, Windows-1252 key encoding, and
 ### Save & Leave Writeback (`0x428687` → `0x41615d` → `0x43fb1b` → `0x4252cc`)
 
 1. Verify `lot.neighborhood_origin` matches the store's file-identity-bound
-   128-bit `store_id` (combining persisted metadata with canonical path and OS
-   file identity so copied `.redb` files never share a `store_id`),
-   `neighborhood_id`, and `instance_id` (`LifecycleError::NeighborhoodMismatch`),
-   and matches the store's current `revision` both before serialization and
-   inside the REDB write transaction (`LifecycleError::StaleNeighborhood`),
-   preventing cross-store or copied-DB writes, same-ID re-import overwrites, or
-   silent lost updates from stale open lots. `Lot::restore` clears
-   `neighborhood_origin` so restoring an older snapshot cannot bypass the
-   revision guard, `save_neighborhood` strictly advances `revision` when
-   overwriting an existing neighborhood record, and `enter_lot`/`evict`/
+   128-bit `store_id` (combining persisted metadata with Unix `(dev, ino)` so
+   copied `.redb` files never share a `store_id` while same-volume renames and
+   reopens preserve it), `neighborhood_id`, and `instance_id`
+   (`LifecycleError::NeighborhoodMismatch`), and matches the store's current
+   `revision` both before serialization and inside the REDB write transaction
+   (`LifecycleError::StaleNeighborhood`), preventing cross-store or copied-DB
+   writes, same-ID re-import overwrites, or silent lost updates from stale open
+   lots. `Lot::restore` clears `neighborhood_origin` so restoring an older
+   snapshot cannot bypass the revision guard, every mutating store writer
+   (`save_neighborhood`, `save_neighborhood_checked`,
+   `save_lot_and_neighborhood`, `save_lot_and_neighborhood_checked`,
+   `save_base_house`, `save_character_file`) strictly advances `revision` when
+   mutating an existing neighborhood record, and `enter_lot`/`evict`/
    `bulldoze`/`lot_price` all read from a single MVCC REDB read transaction via
    `NeighborhoodStore::load_lot_snapshot`. `move_in` likewise commits via an
    in-transaction `(instance_id, revision)` check.

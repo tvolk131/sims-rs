@@ -903,6 +903,10 @@ fn purge_orphaned_person(
     if !world.objects.contains_key(&id) {
         return Ok(());
     }
+    // Unlink cleanly from the object's tile (ground or upper floor) or
+    // container FIRST so any surviving object behind `id` in `slot 0` is
+    // promoted into `id`'s tile/container head (`placement::relink` / 0x4329c1).
+    let _ = crate::placement::unlink_off_lot(world, id);
     if world.event_owner == id {
         world.event_owner = 0;
     }
@@ -991,6 +995,21 @@ fn purge_orphaned_person(
     let target = i32::from(id_i16);
     for obj in world.objects.values_mut() {
         obj.relationships.retain(|row| row.target != target);
+    }
+    // Clear any lingering grid head on either floor (ground array 3 or upper
+    // array 103) in case a saved lot had an inconsistent grid cell pointing to
+    // the purged person.
+    let id_bytes = id_i16.to_le_bytes();
+    for grid_id in crate::placement::LEVEL_GRIDS {
+        if let Some(grid) = world.arrays.get_mut(&grid_id)
+            && grid.stride == 2
+        {
+            for cell in grid.data.as_chunks_mut::<2>().0 {
+                if *cell == id_bytes {
+                    *cell = [0, 0];
+                }
+            }
+        }
     }
     world.repair_grid().map_err(|e| {
         LifecycleError::Lot(format!("repairing grid after purging person {id}: {e}"))
@@ -2980,26 +2999,114 @@ mod tests {
         let no_frames = Frames::parse("none").unwrap();
         let chars_before = store.load_character_files("UserData").unwrap().len();
 
-        // Save House 7 containing a live visitor with GUID `0x7757D9EE`
-        // (Goth House 5 tombstone whose loose `.iff` is deleted on bulldoze).
+        // Save House 7 containing two live visitors with GUID `0x7757D9EE`
+        // (Goth House 5 tombstone whose loose `.iff` is deleted on bulldoze):
+        //   1. `visitor_ground` stacked at the head of an occupied ground-floor
+        //      tile ahead of a surviving object `survivor_id`.
+        //   2. `visitor_upstairs` standing on the upper floor (level 2, grid 103).
         let mut house7 = enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
         let template_id = house7.world.people[0];
-        let visitor_id = house7.world.objects.keys().copied().max().unwrap_or(100) + 1;
-        let mut visitor = house7.world.objects[&template_id].clone();
-        visitor.id = visitor_id;
-        visitor.guid = 0x7757_D9EE;
-        visitor.selected = false;
+        let base_id = house7.world.objects.keys().copied().max().unwrap_or(100) + 1;
+        let visitor_ground_id = base_id;
+        let visitor_upstairs_id = base_id + 1;
+
+        // Find an occupied ground-floor tile with a surviving non-person head.
+        let (survivor_id, ground_tile) = house7
+            .world
+            .order
+            .iter()
+            .copied()
+            .find_map(|oid| {
+                let obj = house7.world.objects.get(&oid)?;
+                if obj.person.is_some()
+                    || obj.multipart.is_some()
+                    || house7.world.indicators.contains(&oid)
+                {
+                    return None;
+                }
+                let tile = World::tile(obj.position);
+                if tile[2] != 1 || tile[0] <= 0 || tile[1] <= 0 {
+                    return None;
+                }
+                if crate::placement::head(&house7.world, tile) == Some(oid) {
+                    Some((oid, tile))
+                } else {
+                    None
+                }
+            })
+            .expect("House 7 has a ground-floor tile head object");
+
         let tomb_nbr = house7.world.neighbors.first_of(0x7757_D9EE).unwrap().id;
-        if let Some(person) = visitor.person.as_mut() {
+        let next_type = house7.world.types.keys().copied().max().unwrap_or(0) + 1;
+        house7.world.types.insert(next_type, 0x7757_D9EE);
+
+        let full = FULL_SIZE as usize;
+        let write_grid_head = |world: &mut World, array_id: u16, tile: [i8; 3], val: u16| {
+            let cell = (tile[0] as usize * full + tile[1] as usize) * 2;
+            world.arrays.get_mut(&array_id).unwrap().data[cell..cell + 2]
+                .copy_from_slice(&val.to_le_bytes());
+        };
+
+        // 1. Place `visitor_ground_id` as the head of `ground_tile`, pushing
+        //    `survivor_id` into `visitor_ground_id`'s slot 0.
+        let mut visitor_ground = house7.world.objects[&template_id].clone();
+        visitor_ground.id = visitor_ground_id;
+        visitor_ground.guid = 0x7757_D9EE;
+        visitor_ground.selected = false;
+        visitor_ground.position = house7.world.objects[&survivor_id].position;
+        visitor_ground.data[2] = 0; // CONTAINER
+        visitor_ground.data[3] = -1; // CONTAINER_SLOT
+        visitor_ground.data[14] = -1; // SLOT (tile head)
+        visitor_ground.data[26] = 0; // BEFORE
+        visitor_ground.slots[0].object = survivor_id as i16;
+        if let Some(person) = visitor_ground.person.as_mut() {
             person.data[31] = tomb_nbr;
             person.data[PERSON_HOME] = 5;
             person.data[61] = 0;
         }
-        let next_type = house7.world.types.keys().copied().max().unwrap_or(0) + 1;
-        house7.world.types.insert(next_type, 0x7757_D9EE);
-        house7.world.objects.insert(visitor_id, visitor);
-        house7.world.order.push(visitor_id);
-        house7.world.people.push(visitor_id);
+        {
+            let surv = house7.world.objects.get_mut(&survivor_id).unwrap();
+            surv.data[14] = 0; // SLOT (linked after visitor_ground in slot 0)
+            surv.data[26] = visitor_ground_id as i16; // BEFORE
+        }
+        write_grid_head(&mut house7.world, 3, ground_tile, visitor_ground_id);
+        house7
+            .world
+            .objects
+            .insert(visitor_ground_id, visitor_ground);
+        house7.world.order.push(visitor_ground_id);
+        house7.world.people.push(visitor_ground_id);
+
+        // 2. Place `visitor_upstairs_id` on an empty upper-floor tile (level 2, grid 103).
+        let upstairs_tile = [12i8, 12i8, 2i8];
+        let mut visitor_upstairs = house7.world.objects[&template_id].clone();
+        visitor_upstairs.id = visitor_upstairs_id;
+        visitor_upstairs.guid = 0x7757_D9EE;
+        visitor_upstairs.selected = false;
+        visitor_upstairs.position = [
+            i32::from(upstairs_tile[0]) * 16,
+            i32::from(upstairs_tile[1]) * 16,
+            2,
+        ];
+        visitor_upstairs.data[2] = 0;
+        visitor_upstairs.data[3] = -1;
+        visitor_upstairs.data[14] = -1;
+        visitor_upstairs.data[26] = 0;
+        if !visitor_upstairs.slots.is_empty() {
+            visitor_upstairs.slots[0].object = 0;
+        }
+        if let Some(person) = visitor_upstairs.person.as_mut() {
+            person.data[31] = tomb_nbr;
+            person.data[PERSON_HOME] = 5;
+            person.data[61] = 0;
+        }
+        write_grid_head(&mut house7.world, 103, upstairs_tile, visitor_upstairs_id);
+        house7
+            .world
+            .objects
+            .insert(visitor_upstairs_id, visitor_upstairs);
+        house7.world.order.push(visitor_upstairs_id);
+        house7.world.people.push(visitor_upstairs_id);
         save_and_leave_lot(&root, &store, "UserData", &mut house7).unwrap();
 
         // Bulldoze House 5: deletes `0x7757D9EE` from NBRS and its loose `.iff`.
@@ -3019,10 +3126,32 @@ mod tests {
             "bulldozing House 5 must remove deleted tombstone character files from REDB"
         );
 
-        // Reopening House 7 must purge the deleted visitor cleanly and step!
+        // Reopening House 7 must purge both deleted visitors cleanly, promote
+        // `survivor_id` back to the ground-floor tile head, clear the upstairs
+        // grid cell, and step cleanly!
         let mut house7_after = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
-        assert!(!house7_after.world.objects.contains_key(&visitor_id));
-        assert!(!house7_after.world.people.contains(&visitor_id));
+        assert!(!house7_after.world.objects.contains_key(&visitor_ground_id));
+        assert!(!house7_after.world.people.contains(&visitor_ground_id));
+        assert!(
+            !house7_after
+                .world
+                .objects
+                .contains_key(&visitor_upstairs_id)
+        );
+        assert!(!house7_after.world.people.contains(&visitor_upstairs_id));
+        assert_eq!(
+            crate::placement::head(&house7_after.world, ground_tile),
+            Some(survivor_id),
+            "surviving object behind purged visitor must be promoted to the tile head"
+        );
+        let survivor_after = &house7_after.world.objects[&survivor_id];
+        assert_eq!(survivor_after.data[14], -1);
+        assert_eq!(survivor_after.data[26], 0);
+        assert_eq!(
+            crate::placement::head(&house7_after.world, upstairs_tile),
+            None,
+            "upper-floor grid must not retain purged visitor ID"
+        );
         for _ in 0..3 {
             house7_after.step().unwrap();
         }

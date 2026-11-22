@@ -678,6 +678,7 @@ fn concurrent_move_in_only_allows_one_winner() {
     store
         .save_base_house("Race", 4, &synthetic_house_iff(5_500, 0, 0))
         .unwrap();
+    let rev_before = store.load_neighborhood("Race").unwrap().unwrap().revision;
 
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let s1 = std::sync::Arc::clone(&store);
@@ -700,7 +701,7 @@ fn concurrent_move_in_only_allows_one_winner() {
         "concurrent move_in into the same house must yield exactly one winner: r1={r1:?} r2={r2:?}"
     );
     let after = store.load_neighborhood("Race").unwrap().unwrap();
-    assert_eq!(after.revision, 1);
+    assert_eq!(after.revision, rev_before + 1);
     let winner = if r1.is_ok() { 2 } else { 5 };
     let loser = if r1.is_ok() { 5 } else { 2 };
     assert_eq!(after.families[&winner].house, 4);
@@ -939,6 +940,68 @@ fn copied_redb_and_save_neighborhood_writes_invalidate_open_lots() {
             .house,
         4
     );
+
+    // 3. Checked writers with unchanged `state.revision == expected_revision`
+    //    must still advance revision so an open lot cannot clobber the write.
+    let mut goth_checked =
+        enter_lot(&root, &store_orig, "UserData", 5, &[3], no_frames.clone()).unwrap();
+    let mut nh_checked = store_orig.load_neighborhood("UserData").unwrap().unwrap();
+    nh_checked.data[1] = 1234;
+    assert!(
+        store_orig
+            .save_neighborhood_checked(
+                "UserData",
+                nh_checked.instance_id,
+                nh_checked.revision,
+                &nh_checked,
+            )
+            .unwrap()
+            .is_ok()
+    );
+    assert!(matches!(
+        save_and_leave_lot(&root, &store_orig, "UserData", &mut goth_checked),
+        Err(LifecycleError::StaleNeighborhood { .. })
+    ));
+    assert_eq!(
+        store_orig
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .data[1],
+        1234
+    );
+
+    // 4. Replacing a base house via `save_base_house` bumps revision so an
+    //    already-open session for that lot cannot overwrite the replaced price.
+    let mut open_house4 =
+        enter_lot(&root, &store_orig, "UserData", 4, &[3], no_frames.clone()).unwrap();
+    let house2_bytes = store_orig.load_base_house("UserData", 2).unwrap().unwrap();
+    store_orig
+        .save_base_house("UserData", 4, &house2_bytes)
+        .unwrap();
+    assert_eq!(
+        lot_price(&store_orig, "UserData", 4, DEFAULT_ARCH_VALUE_MULTIPLIER).unwrap(),
+        50_777
+    );
+    assert!(matches!(
+        save_and_leave_lot(&root, &store_orig, "UserData", &mut open_house4),
+        Err(LifecycleError::StaleNeighborhood { .. })
+    ));
+    assert_eq!(
+        lot_price(&store_orig, "UserData", 4, DEFAULT_ARCH_VALUE_MULTIPLIER).unwrap(),
+        50_777
+    );
+
+    // 5. Renaming the same `.redb` file on the same volume preserves `store_id`
+    //    so an already-open lot still saves cleanly after reopening the renamed
+    //    file.
+    let mut open_for_rename =
+        enter_lot(&root, &store_orig, "UserData", 5, &[3], no_frames).unwrap();
+    drop(store_orig);
+    let db_renamed = TempDb::new("copied-orig-renamed");
+    std::fs::rename(&db_orig.0, &db_renamed.0).unwrap();
+    let store_renamed = NeighborhoodStore::open(&db_renamed.0).unwrap();
+    save_and_leave_lot(&root, &store_renamed, "UserData", &mut open_for_rename).unwrap();
 }
 
 #[test]
