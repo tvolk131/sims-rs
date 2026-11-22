@@ -566,12 +566,12 @@ impl Target for sims_render::Canvas {
 
     #[inline]
     fn row_index(&self, y: u32) -> usize {
-        y as usize * self.width
+        (y as usize).saturating_mul(self.width)
     }
 
     #[inline]
-    fn passes_at(&self, row: usize, x: u32, _y: u32, z: f32) -> bool {
-        self.depth_passes_at(row, x as usize, z as i32)
+    fn passes_at(&self, row: usize, x: u32, y: u32, z: f32) -> bool {
+        (y as usize) < self.height && self.depth_passes_at(row, x as usize, z as i32)
     }
 
     #[inline]
@@ -584,15 +584,18 @@ impl Target for sims_render::Canvas {
         &mut self,
         row: usize,
         x: u32,
-        _y: u32,
+        y: u32,
         z: f32,
         texel: [u8; 4],
         shade: [f32; 3],
     ) {
+        if (x as usize) >= self.width || (y as usize) >= self.height {
+            return;
+        }
         let lit = |c: u8, s: f32| (f32::from(c) * s + 0.5).clamp(0.0, 255.0) as u8;
         let [r, g, b, a] = texel;
         self.put_passed_at(
-            row + x as usize,
+            row.saturating_add(x as usize),
             [lit(r, shade[0]), lit(g, shade[1]), lit(b, shade[2]), a],
             z as i32,
         );

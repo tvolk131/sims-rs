@@ -551,6 +551,9 @@ fn triangle<T: Target + ?Sized>(
 ) {
     let grey = shade.iter().all(|s| matches!(s, Shade::Grey(_)));
     let (width, height) = target.size();
+    if width == 0 || height == 0 {
+        return;
+    }
     let mut area = edge(p[0], p[1], p[2]);
     if area.abs() < 1e-8 || !area.is_finite() {
         return;
@@ -577,30 +580,29 @@ fn triangle<T: Target + ?Sized>(
         top_left(p[2], p[0]),
         top_left(p[0], p[1]),
     ];
-    let min_x = p
-        .iter()
-        .map(|v| v.x)
-        .fold(f32::INFINITY, f32::min)
-        .floor()
-        .max(0.0) as i64;
-    let max_x = p
-        .iter()
-        .map(|v| v.x)
-        .fold(f32::NEG_INFINITY, f32::max)
-        .ceil()
-        .min(width as f32 - 1.0) as i64;
-    let min_y = p
-        .iter()
-        .map(|v| v.y)
-        .fold(f32::INFINITY, f32::min)
-        .floor()
-        .max(0.0) as i64;
-    let max_y = p
-        .iter()
-        .map(|v| v.y)
-        .fold(f32::NEG_INFINITY, f32::max)
-        .ceil()
-        .min(height as f32 - 1.0) as i64;
+    let w_max = i64::from(width) - 1;
+    let h_max = i64::from(height) - 1;
+    let min_x_f = f64::from(p.iter().map(|v| v.x).fold(f32::INFINITY, f32::min).floor());
+    let max_x_f = f64::from(
+        p.iter()
+            .map(|v| v.x)
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil(),
+    );
+    let min_y_f = f64::from(p.iter().map(|v| v.y).fold(f32::INFINITY, f32::min).floor());
+    let max_y_f = f64::from(
+        p.iter()
+            .map(|v| v.y)
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil(),
+    );
+    if max_x_f < 0.0 || min_x_f > w_max as f64 || max_y_f < 0.0 || min_y_f > h_max as f64 {
+        return;
+    }
+    let min_x = min_x_f.max(0.0) as i64;
+    let max_x = max_x_f.min(w_max as f64) as i64;
+    let min_y = min_y_f.max(0.0) as i64;
+    let max_y = max_y_f.min(h_max as f64) as i64;
     if min_x > max_x || min_y > max_y {
         return;
     }

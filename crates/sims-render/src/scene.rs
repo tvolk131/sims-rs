@@ -799,7 +799,7 @@ enum SpriteRef {
     Shape(u16, bool, usize, u8),
     ObjectShape(usize, u16, bool, usize, u8),
     Trim(bool, usize, u16),
-    GroupPart(usize, u16, u32, usize, u16),
+    GroupPart(usize, u16, u32, usize, usize),
 }
 
 impl SpriteRef {
@@ -818,7 +818,7 @@ impl SpriteRef {
             }
             SpriteRef::Trim(cut, zoom, frame) => assets.trim_cached(cut, zoom, frame as usize),
             SpriteRef::GroupPart(res, group, dir, zoom, idx) => {
-                assets.group_part_cached(res, group, dir, zoom, idx as usize)
+                assets.group_part_cached(res, group, dir, zoom, idx)
             }
         }
     }
@@ -1049,6 +1049,8 @@ struct ResolvedCmd<'a> {
     kind: ResolvedCmdKind<'a>,
 }
 
+const MAX_BAND_WORKERS: usize = 8;
+
 fn default_band_count(width: usize, height: usize, cmd_count: usize) -> usize {
     if height < 128 || width.saturating_mul(height) < 64 * 64 || cmd_count < 32 {
         return 1;
@@ -1056,7 +1058,7 @@ fn default_band_count(width: usize, height: usize, cmd_count: usize) -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
-        .clamp(1, 8)
+        .clamp(1, MAX_BAND_WORKERS)
 }
 
 fn rasterize_band(
@@ -1413,7 +1415,7 @@ impl<'a> Painter<'a> {
         if self.commands.is_empty() {
             return;
         }
-        if !self.canvas.has_pixel_storage() || self.canvas.width == 0 || self.canvas.height == 0 {
+        if self.canvas.width == 0 || self.canvas.height == 0 {
             self.commands.clear();
             return;
         }
@@ -1606,9 +1608,12 @@ impl<'a> Painter<'a> {
         if resolved.is_empty() {
             return;
         }
-        let num_bands = self.band_override.unwrap_or_else(|| {
-            default_band_count(self.canvas.width, self.canvas.height, resolved.len())
-        });
+        let num_bands = self
+            .band_override
+            .map(|b| b.clamp(1, MAX_BAND_WORKERS))
+            .unwrap_or_else(|| {
+                default_band_count(self.canvas.width, self.canvas.height, resolved.len())
+            });
         let depth_table = &self.depth;
         let grass = self.grass;
         let mut bands = self.canvas.split_bands(num_bands);
@@ -1616,15 +1621,40 @@ impl<'a> Painter<'a> {
             if let Some(band) = bands.first_mut() {
                 rasterize_band(band, &resolved, depth_table, pools, grass);
             }
-        } else if let Some((first, rest)) = bands.split_first_mut() {
+        } else {
             let cmds = &resolved;
+            let mut iter = bands.into_iter();
+            let Some(mut first) = iter.next() else {
+                return;
+            };
+            let rest_slots: Vec<std::sync::Mutex<Option<CanvasBand<'_>>>> =
+                iter.map(|b| std::sync::Mutex::new(Some(b))).collect();
             std::thread::scope(|scope| {
-                for band in rest {
-                    scope.spawn(move || {
-                        rasterize_band(band, cmds, depth_table, pools, grass);
-                    });
+                let mut fallback = Vec::new();
+                for (i, slot) in rest_slots.iter().enumerate() {
+                    if std::thread::Builder::new()
+                        .spawn_scoped(scope, move || {
+                            if let Some(mut band) =
+                                slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+                            {
+                                rasterize_band(&mut band, cmds, depth_table, pools, grass);
+                            }
+                        })
+                        .is_err()
+                    {
+                        fallback.push(i);
+                    }
                 }
-                rasterize_band(first, cmds, depth_table, pools, grass);
+                rasterize_band(&mut first, cmds, depth_table, pools, grass);
+                for i in fallback {
+                    if let Some(mut band) = rest_slots[i]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    {
+                        rasterize_band(&mut band, cmds, depth_table, pools, grass);
+                    }
+                }
             });
         }
     }
@@ -1764,13 +1794,6 @@ impl<'a> Painter<'a> {
             3 => [1, 0],
             _ => [0, 0],
         };
-        let tile_w = self.camera.zoom.tile_width();
-        let tile_h = self.camera.zoom.tile_height();
-        let cw = i32::try_from(self.canvas.width).unwrap_or(i32::MAX);
-        let ch = i32::try_from(self.canvas.height).unwrap_or(i32::MAX);
-        let margin_x = tile_w.saturating_mul(2);
-        let margin_y_top = tile_h.saturating_mul(3);
-        let margin_y_bot = tile_h.saturating_mul(2);
         let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
         let canvas_w_wide = wide(self.canvas.width);
         let canvas_h_wide = wide(self.canvas.height);
@@ -1780,19 +1803,8 @@ impl<'a> Painter<'a> {
                 let floor = self.lot.levels[index].floors[cell];
                 let top = [x + top_offset[0], y + top_offset[1]];
                 let p = self.corner_screen(top, level);
-                let h = self.lot.heights[cell];
-                let max_h = h[0].max(h[1]).max(h[2]).max(h[3]);
-                let min_h = h[0].min(h[1]).min(h[2]).min(h[3]);
-                let slope_pad = i32::from(max_h - min_h) << (zoom + 2);
-                let on_screen = p[0].saturating_add(margin_x) > 0
-                    && p[0].saturating_sub(margin_x) < cw
-                    && p[1].saturating_add(margin_y_top).saturating_add(slope_pad) > 0
-                    && p[1].saturating_sub(margin_y_bot).saturating_sub(slope_pad) < ch;
+                let (view, height) = (self.rotate_corner(top), self.corner_elevation(top) / 16);
                 if floor == 0 {
-                    if !on_screen {
-                        continue;
-                    }
-                    let (view, height) = (self.rotate_corner(top), self.corner_elevation(top) / 16);
                     if level == 1 {
                         self.pool([x, y], view, height);
                         self.water([x, y], view, height, p);
@@ -1814,15 +1826,6 @@ impl<'a> Painter<'a> {
                         None,
                     ]
                 };
-                if !on_screen {
-                    for id in halves.into_iter().flatten().filter(|&id| id != 0) {
-                        if self.assets.has_floor(id, zoom) {
-                            self.stats.floors += 1;
-                        }
-                    }
-                    continue;
-                }
-                let (view, height) = (self.rotate_corner(top), self.corner_elevation(top) / 16);
                 for (half, id) in halves.into_iter().enumerate() {
                     let Some(id) = id.filter(|&id| id != 0) else {
                         continue;
@@ -2292,10 +2295,18 @@ impl<'a> Painter<'a> {
         let flat = heights[0] == heights[1] && heights[0] == heights[2] && heights[0] == heights[3];
         let step = if flat { 2 } else { 4 };
         let max_h = self.canvas.height.min(self.clip_bottom.max(0) as usize);
-        let min_y = y_left.min(y_top).min(y_right).saturating_sub(2);
-        let max_y = y_left.max(y_top).max(y_right).saturating_add(3);
-        let y0 = min_y.clamp(0, max_h as i32) as usize;
-        let y1 = max_y.clamp(y0 as i32, max_h as i32) as usize;
+        let fixed_safe = [y_left, y_top, y_right]
+            .into_iter()
+            .all(|v| (-32768..=32767).contains(&v));
+        let (y0, y1) = if fixed_safe {
+            let min_y = y_left.min(y_top).min(y_right).saturating_sub(2);
+            let max_y = y_left.max(y_top).max(y_right).saturating_add(3);
+            let y0 = min_y.clamp(0, max_h as i32) as usize;
+            let y1 = max_y.clamp(y0 as i32, max_h as i32) as usize;
+            (y0, y1)
+        } else {
+            (0, max_h)
+        };
         if y0 >= y1 {
             return;
         }
@@ -3224,20 +3235,11 @@ impl<'a> Painter<'a> {
                 } else {
                     PixelDepthMode::Sprite(anchor)
                 };
-                let Ok(part_idx_u16) = u16::try_from(part_idx) else {
-                    continue;
-                };
                 self.commands.push(DrawCmd {
                     y0,
                     y1,
                     kind: DrawCmdKind::DepthSprite {
-                        sprite: SpriteRef::GroupPart(
-                            resource,
-                            group,
-                            direction,
-                            zoom,
-                            part_idx_u16,
-                        ),
+                        sprite: SpriteRef::GroupPart(resource, group, direction, zoom, part_idx),
                         at,
                         flip: part.flip,
                         slack: 0,
@@ -3248,6 +3250,7 @@ impl<'a> Painter<'a> {
                     },
                 });
             }
+            self.canvas.set_id(None);
             self.stats.objects += 1;
         }
         list.clear();

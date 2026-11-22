@@ -37,7 +37,6 @@ use sims_formats::bitmap::{self, Image as BitmapImage};
 use sims_formats::iff::DELETED as IFF_DELETED;
 use sims_formats::strings::{Format as StringTableFormat, StringTable, TextEntry};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
 use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -875,7 +874,7 @@ fn effective_vacation_fade(lot_id: u16, options: &RenderOptions) -> f32 {
 
 const MAX_HIGHLIGHT_CACHE_ENTRIES: usize = 128;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SurfaceFingerprint {
     width: usize,
     height: usize,
@@ -924,58 +923,108 @@ fn fingerprint_surface(surface: &Surface565) -> SurfaceFingerprint {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StaticLotKey {
+struct CachedStaticLot {
     index: usize,
     id: u16,
     cell_origin: [i32; 2],
     highlight_565: Option<u16>,
-    normal_fp: SurfaceFingerprint,
-    cutaway_fp: Option<SurfaceFingerprint>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BaseLayerKey {
-    viewport: [u32; 2],
-    kind: NeighborhoodKind,
-    opaque_overlays: bool,
-    large_frame_fp: Option<SurfaceFingerprint>,
-    backdrop_fp: SurfaceFingerprint,
-    pre_lot_wave_fp: Option<SurfaceFingerprint>,
-    static_lots: Vec<StaticLotKey>,
+    normal: Surface565,
+    cutaway: Option<Surface565>,
 }
 
 struct CachedBaseLayer {
-    key: BaseLayerKey,
+    viewport: [u32; 2],
+    kind: NeighborhoodKind,
+    opaque_overlays: bool,
+    large_frame: Option<Surface565>,
+    backdrop: Surface565,
+    pre_lot_wave: Option<Surface565>,
+    static_lots: Vec<CachedStaticLot>,
     canvas: Canvas,
 }
 
+impl CachedBaseLayer {
+    #[allow(clippy::too_many_arguments)]
+    fn matches(
+        &self,
+        viewport: [u32; 2],
+        map: &NeighborhoodMap,
+        options: &RenderOptions,
+        active_large_frame: Option<&Surface565>,
+        pre_lot_wave: Option<&Surface565>,
+        excluded: &[bool],
+        static_count: usize,
+    ) -> bool {
+        if self.viewport != viewport
+            || self.kind != map.kind
+            || self.opaque_overlays != map.opaque_overlays
+            || self.static_lots.len() != static_count
+            || self.large_frame.as_ref() != active_large_frame
+            || self.pre_lot_wave.as_ref() != pre_lot_wave
+            || self.backdrop != map.backdrop
+        {
+            return false;
+        }
+        let mut cached_iter = self.static_lots.iter();
+        for (index, lot) in map.lots.iter().enumerate() {
+            if excluded[index] {
+                continue;
+            }
+            let Some(cached) = cached_iter.next() else {
+                return false;
+            };
+            let highlight_565 = map.highlight_rgb_for(lot, options).map(pack_565);
+            if cached.index != index
+                || cached.id != lot.id
+                || cached.cell_origin != lot.cell_origin
+                || cached.highlight_565 != highlight_565
+                || cached.normal != lot.normal
+            {
+                return false;
+            }
+            let cutaway_matches = match highlight_565 {
+                Some(_) => cached.cutaway.as_ref() == lot.roofs_off.as_ref(),
+                None => cached.cutaway.is_none(),
+            };
+            if !cutaway_matches {
+                return false;
+            }
+        }
+        cached_iter.next().is_none()
+    }
+}
+
+type HighlightCacheKey = (
+    u16,
+    bool,
+    u16,
+    SurfaceFingerprint,
+    Option<SurfaceFingerprint>,
+);
+
 struct CachedHighlight {
-    normal_fp: SurfaceFingerprint,
-    cutaway_fp: Option<SurfaceFingerprint>,
+    normal: Surface565,
+    cutaway: Option<Surface565>,
     surface: Arc<Surface565>,
 }
 
 #[derive(Default)]
 struct NeighborhoodRenderCache {
     base: Option<CachedBaseLayer>,
-    highlights: BTreeMap<(u16, bool, u16), CachedHighlight>,
+    highlights: BTreeMap<HighlightCacheKey, CachedHighlight>,
 }
 
-/// Interior-mutable render cache slot for [`NeighborhoodMap`]. Cloning a map
-/// starts with an empty cache so clones never contend on a shared mutex.
-#[derive(Default)]
-struct RenderCacheSlot(Mutex<NeighborhoodRenderCache>);
+static NEIGHBORHOOD_RENDER_CACHE: OnceLock<Mutex<NeighborhoodRenderCache>> = OnceLock::new();
 
-impl Clone for RenderCacheSlot {
-    fn clone(&self) -> Self {
-        Self::default()
-    }
+fn render_cache() -> &'static Mutex<NeighborhoodRenderCache> {
+    NEIGHBORHOOD_RENDER_CACHE.get_or_init(|| Mutex::new(NeighborhoodRenderCache::default()))
 }
 
-impl fmt::Debug for RenderCacheSlot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("RenderCacheSlot(..)")
+fn valid_drawable_size(surface: &Surface565) -> (usize, usize) {
+    if surface.is_valid() && surface.width > 0 && surface.height > 0 {
+        (surface.width, surface.height)
+    } else {
+        (0, 0)
     }
 }
 
@@ -1017,7 +1066,6 @@ pub struct NeighborhoodMap {
     pub filter_badges: BTreeMap<CommunityFilter, Surface565>,
     /// Lots in exact back-to-front draw order (`hit_test` scans in reverse).
     pub lots: Vec<MapLot>,
-    render_cache: RenderCacheSlot,
 }
 
 impl NeighborhoodMap {
@@ -1231,7 +1279,6 @@ impl NeighborhoodMap {
             vacation_no_vacancy,
             filter_badges,
             lots,
-            render_cache: RenderCacheSlot::default(),
         })
     }
 
@@ -1362,7 +1409,11 @@ impl NeighborhoodMap {
     /// [`Canvas::id_at`] agrees with [`Self::hit_test_with_options`] inside
     /// the clipped `800×600` lot rectangle from the centered backdrop origin.
     pub fn render_into(&self, canvas: &mut Canvas, options: &RenderOptions) {
-        if canvas.width == 0 || canvas.height == 0 || !canvas.has_pixel_storage() {
+        if canvas.width == 0
+            || canvas.height == 0
+            || !canvas.has_pixel_storage()
+            || canvas.width.saturating_mul(canvas.height) > MAX_SURFACE_PIXELS
+        {
             self.render_into_uncached(canvas, options);
             return;
         }
@@ -1385,23 +1436,22 @@ impl NeighborhoodMap {
         let clip_y0 = i64::from(map_clip[1]).clamp(0, canvas.height as i64);
         let clip_x1 = i64::from(map_clip[2]).clamp(clip_x0, canvas.width as i64);
         let clip_y1 = i64::from(map_clip[3]).clamp(clip_y0, canvas.height as i64);
+        let mut static_count = 0usize;
         for (i, lot) in self.lots.iter().enumerate() {
-            let max_w = lot
-                .normal
-                .width
-                .max(lot.roofs_off.as_ref().map_or(0, |s| s.width))
-                .max(lot.vacation_badged.as_ref().map_or(0, |s| s.width));
-            let max_h = lot
-                .normal
-                .height
-                .max(lot.roofs_off.as_ref().map_or(0, |s| s.height))
-                .max(lot.vacation_badged.as_ref().map_or(0, |s| s.height));
+            let (nw, nh) = valid_drawable_size(&lot.normal);
+            let (cw, ch) = lot.roofs_off.as_ref().map_or((0, 0), valid_drawable_size);
+            let (bw, bh) = lot
+                .vacation_badged
+                .as_ref()
+                .map_or((0, 0), valid_drawable_size);
+            let max_w = i64::try_from(nw.max(cw).max(bw)).unwrap_or(i64::MAX);
+            let max_h = i64::try_from(nh.max(ch).max(bh)).unwrap_or(i64::MAX);
             let ax = i64::from(origin[0].saturating_add(lot.cell_origin[0]));
             let ay = i64::from(origin[1].saturating_add(lot.cell_origin[1]));
             let rx0 = ax.clamp(clip_x0, clip_x1);
             let ry0 = ay.clamp(clip_y0, clip_y1);
-            let rx1 = ax.saturating_add(max_w as i64).clamp(rx0, clip_x1);
-            let ry1 = ay.saturating_add(max_h as i64).clamp(ry0, clip_y1);
+            let rx1 = ax.saturating_add(max_w).clamp(rx0, clip_x1);
+            let ry1 = ay.saturating_add(max_h).clamp(ry0, clip_y1);
             let non_empty = rx0 < rx1 && ry0 < ry1;
 
             let inherently_dynamic = options.hovered_lot == Some(lot.id)
@@ -1421,9 +1471,16 @@ impl NeighborhoodMap {
                 if non_empty {
                     excluded_rects.push([rx0, ry0, rx1, ry1]);
                 }
+            } else {
+                static_count += 1;
             }
         }
 
+        let active_large_frame = if viewport[0] > MAP_WIDTH {
+            self.large_frame.as_ref()
+        } else {
+            None
+        };
         let pre_lot_wave = if !self.kind.waves_draw_after_lots() {
             options
                 .water_frame
@@ -1432,44 +1489,19 @@ impl NeighborhoodMap {
             None
         };
 
-        let mut static_lots = Vec::with_capacity(self.lots.len());
-        for (index, lot) in self.lots.iter().enumerate() {
-            if excluded[index] {
-                continue;
-            }
-            let highlight_565 = self.highlight_rgb_for(lot, options).map(pack_565);
-            static_lots.push(StaticLotKey {
-                index,
-                id: lot.id,
-                cell_origin: lot.cell_origin,
-                highlight_565,
-                normal_fp: fingerprint_surface(&lot.normal),
-                cutaway_fp: highlight_565
-                    .and_then(|_| lot.roofs_off.as_ref().map(fingerprint_surface)),
-            });
-        }
-
-        let base_key = BaseLayerKey {
-            viewport,
-            kind: self.kind,
-            opaque_overlays: self.opaque_overlays,
-            large_frame_fp: (viewport[0] > MAP_WIDTH)
-                .then(|| self.large_frame.as_ref().map(fingerprint_surface))
-                .flatten(),
-            backdrop_fp: fingerprint_surface(&self.backdrop),
-            pre_lot_wave_fp: pre_lot_wave.map(fingerprint_surface),
-            static_lots,
-        };
-
         let mut hit = false;
         {
-            let guard = self
-                .render_cache
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let guard = render_cache().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = &guard.base
-                && cached.key == base_key
+                && cached.matches(
+                    viewport,
+                    self,
+                    options,
+                    active_large_frame,
+                    pre_lot_wave,
+                    &excluded,
+                    static_count,
+                )
             {
                 canvas.restore_pixels_from(&cached.canvas, [0, 0, 0]);
                 hit = true;
@@ -1482,9 +1514,7 @@ impl NeighborhoodMap {
 
             // 1. 1024×768 outer frame only when viewport width exceeds 800
             //    (`cmp eax, 0x320; jle` at 0x556d89, 0x569025).
-            if viewport[0] > MAP_WIDTH
-                && let Some(frame) = &self.large_frame
-            {
+            if let Some(frame) = active_large_frame {
                 blit_surface_to_canvas(canvas, frame, [0, 0], full_clip, false, None);
             }
 
@@ -1518,21 +1548,52 @@ impl NeighborhoodMap {
             }
 
             canvas.set_id(None);
-            let mut guard = self
-                .render_cache
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let mut snap = guard
-                .base
-                .take()
-                .map(|b| b.canvas)
-                .unwrap_or_else(|| Canvas::new(canvas.width, canvas.height, [0, 0, 0]));
-            snap.snapshot_pixels_from(canvas);
-            guard.base = Some(CachedBaseLayer {
-                key: base_key,
-                canvas: snap,
-            });
+
+            let can_cache_sources = self.backdrop.pixels.len() <= MAX_SURFACE_PIXELS
+                && active_large_frame.is_none_or(|s| s.pixels.len() <= MAX_SURFACE_PIXELS)
+                && pre_lot_wave.is_none_or(|s| s.pixels.len() <= MAX_SURFACE_PIXELS)
+                && self.lots.iter().enumerate().all(|(i, lot)| {
+                    excluded[i]
+                        || (lot.normal.pixels.len() <= MAX_SURFACE_PIXELS
+                            && lot
+                                .roofs_off
+                                .as_ref()
+                                .is_none_or(|c| c.pixels.len() <= MAX_SURFACE_PIXELS))
+                });
+            if can_cache_sources {
+                let mut static_lots = Vec::with_capacity(static_count);
+                for (index, lot) in self.lots.iter().enumerate() {
+                    if excluded[index] {
+                        continue;
+                    }
+                    let highlight_565 = self.highlight_rgb_for(lot, options).map(pack_565);
+                    static_lots.push(CachedStaticLot {
+                        index,
+                        id: lot.id,
+                        cell_origin: lot.cell_origin,
+                        highlight_565,
+                        normal: lot.normal.clone(),
+                        cutaway: highlight_565.and_then(|_| lot.roofs_off.clone()),
+                    });
+                }
+                let mut guard = render_cache().lock().unwrap_or_else(|e| e.into_inner());
+                let mut snap = guard
+                    .base
+                    .take()
+                    .map(|b| b.canvas)
+                    .unwrap_or_else(|| Canvas::new(canvas.width, canvas.height, [0, 0, 0]));
+                snap.snapshot_pixels_from(canvas);
+                guard.base = Some(CachedBaseLayer {
+                    viewport,
+                    kind: self.kind,
+                    opaque_overlays: self.opaque_overlays,
+                    large_frame: active_large_frame.cloned(),
+                    backdrop: self.backdrop.clone(),
+                    pre_lot_wave: pre_lot_wave.cloned(),
+                    static_lots,
+                    canvas: snap,
+                });
+            }
         }
 
         // 4b. Dynamic lots (hovered, fading, badged, and overlapping later Z-order lots).
@@ -1897,37 +1958,41 @@ impl NeighborhoodMap {
     ) -> ResolvedSurface<'a> {
         match self.highlight_rgb_for(lot, options) {
             Some(rgb) => {
+                let can_cache = lot.normal.pixels.len() <= MAX_SURFACE_PIXELS
+                    && lot
+                        .roofs_off
+                        .as_ref()
+                        .is_none_or(|c| c.pixels.len() <= MAX_SURFACE_PIXELS);
+                if !can_cache {
+                    return ResolvedSurface::Cached(Arc::new(highlight_lot_cell(
+                        lot,
+                        show_cutaway,
+                        rgb,
+                    )));
+                }
                 let outline_565 = pack_565(rgb);
                 let normal_fp = fingerprint_surface(&lot.normal);
                 let cutaway_fp = lot.roofs_off.as_ref().map(fingerprint_surface);
-                let key = (lot.id, show_cutaway, outline_565);
+                let key = (lot.id, show_cutaway, outline_565, normal_fp, cutaway_fp);
                 {
-                    let guard = self
-                        .render_cache
-                        .0
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let guard = render_cache().lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(entry) = guard.highlights.get(&key)
-                        && entry.normal_fp == normal_fp
-                        && entry.cutaway_fp == cutaway_fp
+                        && entry.normal == lot.normal
+                        && entry.cutaway.as_ref() == lot.roofs_off.as_ref()
                     {
                         return ResolvedSurface::Cached(Arc::clone(&entry.surface));
                     }
                 }
                 let built = Arc::new(highlight_lot_cell(lot, show_cutaway, rgb));
-                let mut guard = self
-                    .render_cache
-                    .0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut guard = render_cache().lock().unwrap_or_else(|e| e.into_inner());
                 if guard.highlights.len() >= MAX_HIGHLIGHT_CACHE_ENTRIES {
                     guard.highlights.clear();
                 }
                 guard.highlights.insert(
                     key,
                     CachedHighlight {
-                        normal_fp,
-                        cutaway_fp,
+                        normal: lot.normal.clone(),
+                        cutaway: lot.roofs_off.clone(),
                         surface: Arc::clone(&built),
                     },
                 );
@@ -4808,7 +4873,6 @@ mod tests {
             vacation_no_vacancy: None,
             filter_badges: BTreeMap::new(),
             lots,
-            render_cache: RenderCacheSlot::default(),
         }
     }
 
@@ -6223,5 +6287,90 @@ mod tests {
         assert_eq!(cached_canvas.color, uncached_canvas.color);
         assert_eq!(cached_canvas.depth, uncached_canvas.depth);
         assert_eq!(cached_canvas.ids(), uncached_canvas.ids());
+    }
+
+    #[test]
+    fn render_cache_rejects_fingerprint_collisions_and_handles_duplicate_lot_ids() {
+        let zeros = Surface565 {
+            width: 16,
+            height: 1,
+            pixels: vec![0u16; 16],
+        };
+        let colliding = Surface565 {
+            width: 16,
+            height: 1,
+            pixels: vec![1, 0, 0, 0, 42237, 49783, 8413, 2659, 0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            fingerprint_surface(&zeros),
+            fingerprint_surface(&colliding),
+            "regression pair must collide on SurfaceFingerprint"
+        );
+
+        let mut map = make_test_map(
+            NeighborhoodKind::Unleashed,
+            vec![
+                make_lot(1, [20, 20], zeros.clone()),
+                make_lot(1, [20, 30], colliding.clone()),
+            ],
+        );
+        let mut cached = Canvas::new(800, 600, [0, 0, 0]);
+        let mut uncached = Canvas::new(800, 600, [0, 0, 0]);
+
+        // Test both unhighlighted static base-layer caching and highlighted surface caching.
+        for highlight in [false, true] {
+            let mut opts = RenderOptions::default();
+            if highlight {
+                opts.highlighted_lots.insert(1);
+            }
+            map.lots[0].normal = zeros.clone();
+            map.render_into(&mut cached, &opts);
+            map.render_into_uncached(&mut uncached, &opts);
+            assert_eq!(cached.color, uncached.color, "initial hl={highlight}");
+            assert_eq!(cached.ids(), uncached.ids(), "initial hl={highlight}");
+
+            // Swap lot 0 from `zeros` to the colliding surface: must NOT reuse stale cache.
+            map.lots[0].normal = colliding.clone();
+            map.render_into(&mut cached, &opts);
+            map.render_into_uncached(&mut uncached, &opts);
+            assert_eq!(cached.color, uncached.color, "colliding hl={highlight}");
+            assert_eq!(cached.ids(), uncached.ids(), "colliding hl={highlight}");
+        }
+    }
+
+    #[test]
+    fn invalid_normal_surface_does_not_hide_valid_cutaway_from_overlap_exclusion() {
+        let mut dynamic_lot = make_lot(
+            1,
+            [20, 20],
+            Surface565 {
+                width: usize::MAX,
+                height: 1,
+                pixels: Vec::new(),
+            },
+        );
+        dynamic_lot.roofs_off = Some(Surface565::filled(12, 12, pack_565([40, 200, 40])));
+
+        // Later static lot overlapping dynamic_lot's valid cutaway at [20..32, 20..32].
+        let later_static = make_lot(
+            2,
+            [24, 24],
+            Surface565::filled(10, 10, pack_565([220, 40, 40])),
+        );
+
+        let map = make_test_map(NeighborhoodKind::Unleashed, vec![dynamic_lot, later_static]);
+        let opts = RenderOptions {
+            hovered_lot: Some(1),
+            hover_roofs_off: true,
+            hover_roof_fade: 0.5,
+            ..RenderOptions::default()
+        };
+        let mut cached = Canvas::new(800, 600, [0, 0, 0]);
+        let mut uncached = Canvas::new(800, 600, [0, 0, 0]);
+        map.render_into(&mut cached, &opts);
+        map.render_into_uncached(&mut uncached, &opts);
+        assert_eq!(cached.color, uncached.color);
+        assert_eq!(cached.depth, uncached.depth);
+        assert_eq!(cached.ids(), uncached.ids());
     }
 }

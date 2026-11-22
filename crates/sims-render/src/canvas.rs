@@ -402,15 +402,21 @@ impl Canvas {
     }
 
     /// Splits this canvas into up to `num_bands` disjoint horizontal row bands
-    /// (`[y0, y1)` covering `0..self.height`) for safe parallel rasterization.
-    /// Caller must ensure `self.has_pixel_storage()`.
+    /// covering all fully-backed rows (`0..backed_rows`, which equals
+    /// `0..self.height` whenever `self.has_pixel_storage()` holds) for safe
+    /// parallel rasterization.
     pub(crate) fn split_bands(&mut self, num_bands: usize) -> Vec<CanvasBand<'_>> {
         if self.width == 0 || self.height == 0 {
             return Vec::new();
         }
-        let pixels = self.width * self.height;
-        let bands = num_bands.clamp(1, self.height);
-        let band_rows = self.height.div_ceil(bands);
+        let min_len = self.color.len().min(self.depth.len()).min(self.ids.len());
+        let backed_rows = (min_len / self.width).min(self.height);
+        if backed_rows == 0 {
+            return Vec::new();
+        }
+        let pixels = backed_rows * self.width;
+        let bands = num_bands.clamp(1, backed_rows);
+        let band_rows = backed_rows.div_ceil(bands);
         let band_pixels = band_rows * self.width;
         let width = self.width;
         let height = self.height;
@@ -1146,9 +1152,11 @@ impl Canvas {
     /// scanline loops.
     #[inline]
     pub fn depth_passes_at(&self, row_start: usize, x: usize, d: i32) -> bool {
-        self.depth
-            .get(row_start.saturating_add(x))
-            .is_some_and(|&cur| d <= cur)
+        x < self.width
+            && self
+                .depth
+                .get(row_start.saturating_add(x))
+                .is_some_and(|&cur| d <= cur)
     }
 
     /// Writes a straight-alpha pixel at precomputed index `idx = y * width + x`

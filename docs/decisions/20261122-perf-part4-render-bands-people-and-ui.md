@@ -9,10 +9,10 @@ cache from Item 4.1) landed in Wave A Track 5
 (`perf/render-spans-bands-people-nb-hud`).
 
 All public `Canvas` fields (`color`, `depth`, `width`, `height`), `Image`
-fields, `Assets` signatures, `NeighborhoodMap` public fields, and `People` /
-`Target` public APIs remain 100% backwards-compatible (strictly additive
-helpers only), with **zero new external crates** and **100% safe Rust
-(`unsafe_code = "forbid"`)**.
+fields, `Assets` signatures, `NeighborhoodMap` public fields and struct-literal
+layout, and `People` / `Target` public APIs remain 100% backwards-compatible
+(strictly additive helpers only), with **zero new external crates** and
+**100% safe Rust (`unsafe_code = "forbid"`)**.
 
 ## Summary of Changes
 
@@ -26,10 +26,10 @@ helpers only), with **zero new external crates** and **100% safe Rust
        `Light::FULL` + `all_opaque` spans (and `mask_span.all_opaque` on masked
        walls) into tight auto-vectorizable loops that skip transparent margins
        (50–80% of isometric diamonds & object sprites).
-     - Added `Palette` caching per `(resource, palt_id)` in `Assets` and
-       LRU-bounded `Assets::files` (`MAX_CACHED_FILES = 96`) so multi-lot /
-       catalog browsing avoids unbounded raw IFF retention while keeping active
-       lot decode hit rates warm.
+     - Added `Palette` caching inside each `CachedFile` entry in `Assets` and
+       LRU-bounded `Assets::files` (`MAX_CACHED_FILES = 96`) so evicting a raw
+       IFF automatically drops its cached palettes, avoiding unbounded memory
+       retention while keeping active lot decode hit rates warm.
 
 2. **Multi-Threaded Horizontal-Band Software Rasterization (Audit Item 2.3)**
    - `crates/sims-render/src/scene.rs`, `canvas.rs`, `grass.rs`:
@@ -38,8 +38,10 @@ helpers only), with **zero new external crates** and **100% safe Rust
        `Canvas::record_rect_for` deterministically before rasterization.
      - Split `Canvas` into disjoint horizontal row bands (`Canvas::split_bands`
        via safe `chunks_mut`) and rasterized bands in parallel with
-       `std::thread::scope` (`1..=8` bands), preserving exact draw order,
-       depth comparisons, 5-6-5 alpha blends, and `Canvas::drawn` rects.
+       `std::thread::scope` + `std::thread::Builder::spawn_scoped` (`1..=8`
+       capped workers, falling back to serial execution for any band if OS
+       thread creation fails), preserving exact draw order, depth comparisons,
+       5-6-5 alpha blends, and `Canvas::drawn` rects.
      - Added `grass::Column::rows_rgb_in_band(band_y0, band_y1)` to preserve
        the exact unbanded dither parity `(self.y + self.height + row) & 1`
        across arbitrary band splits.
@@ -80,16 +82,18 @@ helpers only), with **zero new external crates** and **100% safe Rust
        `brighten_565(p, 1.0, HIGHLIGHT_Y_OFFSET)` (verified bit-exact across all
        65,536 inputs) and hoisted it outside the pixel loop in
        `highlight_row_in_place`.
-     - Added an interior-mutable `RenderCacheSlot` on `NeighborhoodMap` (keeping
-       `render_into(&self, ...)` unchanged and `NeighborhoodMap: Debug + Clone + Send + Sync`)
-       caching both highlighted lot surfaces and the static base layer
-       (`large_frame + backdrop + pre-lot wave + non-dynamic static lots`),
-       validated by fast 4-way unrolled content fingerprints so any external
-       field mutation invalidates immediately.
+     - Added a bounded internal sidecar cache (`NEIGHBORHOOD_RENDER_CACHE`,
+       keeping `NeighborhoodMap`'s exact public struct layout and
+       `render_into(&self, ...)` signature unchanged so external struct
+       literals compile untouched) caching both highlighted lot surfaces and
+       the static base layer (`large_frame + backdrop + pre-lot wave +
+       non-dynamic static lots`), verified by exact `Surface565` equality
+       against stored snapshots so neither mutations nor hash collisions nor
+       duplicate lot IDs can ever serve stale pixels.
      - Excluded hovered, fading, and badged lots — plus any later Z-order lots
-       transitively overlapping an excluded lot's clipped screen rect — from the
-       static base layer so both Z-order and overhanging-roof backdrop
-       cross-fading remain 100% bit-exact.
+       transitively overlapping an excluded lot's valid drawable clipped
+       screen rect — from the static base layer so both Z-order and
+       overhanging-roof backdrop cross-fading remain 100% bit-exact.
      - Row-sliced `blit_surface_to_canvas`, `blit_crossfade_to_canvas`,
        `mark_surface_ids`, `blit_surface_stretched_to_canvas`, and
        `blit_subrect_to_canvas_mode`, and hoisted `blend_table()` + direct 5-6-5
@@ -106,10 +110,10 @@ helpers only), with **zero new external crates** and **100% safe Rust
 6. **Floor/Object Micro-Optimizations & `LotCache::cached_depth` (Audit Item 2.7)**
    - `crates/sims-render/src/scene.rs`, `crates/sims-render/src/cache.rs`:
      - Replaced 4-corner `min_by_key` in `Painter::floors` with constant
-       rotation-indexed `top_offset`, added conservative slope-padded viewport
-       culling before floor/pool/water/shadow lookups (preserving `stats.floors`
-       via `Assets::has_floor`), and borrowed `&'a Object` directly in reusable
-       `Painter::object_scratch` without per-frame `Vec` allocations.
+       rotation-indexed `top_offset`, culled decoded floor/pool/water/shadow
+       sprites against exact sprite bounds, and borrowed `&'a Object` directly
+       in reusable `Painter::object_scratch` without per-frame `Vec`
+       allocations.
      - Added additive `pub fn LotCache::cached_depth(&self) -> Option<&[i32]>`
        for future zero-copy depth access.
 
@@ -120,26 +124,27 @@ helpers only), with **zero new external crates** and **100% safe Rust
     `ids`, every object's `drawn(id)` rect, and `Stats`) across 1 vs 4 vs 8
     bands on `House05.iff`, `House02.iff`, and `House08.iff`.
   - `sims-render::neighborhood::tests`: **0 differing pixels** across all
-    65,536 `brighten_565` LUT entries and cached vs uncached rendering
-    (including overhanging roof cross-fades, overlapping Z-order lots,
-    highlights, and in-place surface mutations).
+    65,536 `brighten_565` LUT entries, cached vs uncached rendering (including
+    overhanging roof cross-fades, overlapping Z-order lots, highlights, in-place
+    surface mutations, fingerprint-collision pairs, duplicate lot IDs, and
+    invalid surfaces).
   - `sims-people::raster::tests::clip_edge_span_never_skips_any_inside_pixel`
     and `sims-people --test lot cached_pose_and_skinning_match_fresh_people_bit_for_bit`:
     **0 differing pixels** (`color`, `depth`, `ids`).
 - **Ratchets:** Zero lowered floors across `sims-game --test ratchet` (8/8),
   `sims-ui --test ui_ratchet` (4/4), and `sims-render --test neighborhood_map`
-  (6/6, including 1.91 live oracles).
+  (7/7, including 1.91 live oracles and external struct-literal compile check).
 
 ## `--release` Benchmark Results (Apple Silicon, 1024×768)
 
 | Benchmark | Baseline (`origin/main`) | Optimized (Track 5) | Speedup |
 |---|---:|---:|---:|
-| Lot Pan (`LotCache`) — Far L1 Cutaway | 7.472 ms/frame | 2.143 ms/frame | **3.49×** |
-| Lot Pan (`LotCache`) — Med L1 Cutaway | 10.101 ms/frame | 2.348 ms/frame | **4.30×** |
-| Lot Pan (`LotCache`) — Near L1 Cutaway | 11.992 ms/frame | 2.040 ms/frame | **5.88×** |
-| Lot Pan (`LotCache`) — Med L2 Up | 16.313 ms/frame | 2.434 ms/frame | **6.70×** |
-| Direct `draw_lot_with_preview` — Med L1 Cutaway | 15.027 ms/frame | 1.847 ms/frame | **8.14×** |
-| Neighborhood Map — HoverFade + Highlight | 5.995 ms/frame | 0.400 ms/frame | **14.99×** |
-| Neighborhood Map — HoverFade | 5.623 ms/frame | 0.372 ms/frame | **15.12×** |
+| Lot Pan (`LotCache`) — Far L1 Cutaway | 7.472 ms/frame | 2.375 ms/frame | **3.15×** |
+| Lot Pan (`LotCache`) — Med L1 Cutaway | 10.101 ms/frame | 2.468 ms/frame | **4.09×** |
+| Lot Pan (`LotCache`) — Near L1 Cutaway | 11.992 ms/frame | 2.242 ms/frame | **5.35×** |
+| Lot Pan (`LotCache`) — Med L2 Up | 16.313 ms/frame | 2.668 ms/frame | **6.11×** |
+| Direct `draw_lot_with_preview` — Med L1 Cutaway | 15.027 ms/frame | 2.154 ms/frame | **6.98×** |
+| Neighborhood Map — HoverFade + Highlight | 5.995 ms/frame | 0.314 ms/frame | **19.09×** |
+| Neighborhood Map — HoverFade | 5.623 ms/frame | 0.296 ms/frame | **19.00×** |
 | 3D People Steady (`update + draw`, 4 Sims Near) | 0.243 ms/frame | 0.195 ms/frame | **1.25×** |
 | UI `Frame::draw` (800×120 mixed-alpha) | 0.1645 ms/call | 0.0428 ms/call | **3.84×** |

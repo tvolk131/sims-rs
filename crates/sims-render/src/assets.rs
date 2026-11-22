@@ -180,6 +180,7 @@ struct PoolCorner {
 
 struct CachedFile {
     iff: Iff,
+    palettes: BTreeMap<u16, Option<Arc<Palette>>>,
     last_used: u64,
 }
 
@@ -196,7 +197,6 @@ pub struct Assets {
     file_use_clock: u64,
     floor_palettes: BTreeMap<u16, Option<Arc<Palette>>>,
     wall_palettes: BTreeMap<u16, Option<Arc<Palette>>>,
-    file_palettes: BTreeMap<(usize, u16), Option<Arc<Palette>>>,
     gray_palette: Palette,
     definitions: BTreeMap<u32, Option<Definition>>,
     floor_images: BTreeMap<(u16, usize), Option<CachedImage>>,
@@ -273,7 +273,6 @@ impl Assets {
             file_use_clock: 0,
             floor_palettes: BTreeMap::new(),
             wall_palettes: BTreeMap::new(),
-            file_palettes: BTreeMap::new(),
             gray_palette: Palette(vec![[255, 255, 255]; 256]),
             definitions: BTreeMap::new(),
             floor_images: BTreeMap::new(),
@@ -376,15 +375,6 @@ impl Assets {
             })
             .as_ref()?;
         Some((&entry.image, pools))
-    }
-
-    /// Returns whether floor `(id, zoom)` exists, using the cache without
-    /// duplicating work on offscreen culled tiles.
-    pub(crate) fn has_floor(&mut self, id: u16, zoom: usize) -> bool {
-        if let Some(entry) = self.floor_images.get(&(id, zoom)) {
-            return entry.is_some();
-        }
-        self.floor_with_pools(id, zoom).is_some()
     }
 
     /// A swimming pool water/coping sprite (`Arry 9`, `0x4ae68f`–`0x4ae6cc`)
@@ -827,6 +817,7 @@ impl Assets {
             resource,
             CachedFile {
                 iff,
+                palettes: BTreeMap::new(),
                 last_used: stamp,
             },
         );
@@ -850,14 +841,13 @@ impl Assets {
         let key = (resource, group, direction, zoom);
         if !self.groups.contains_key(&key) {
             let parts = if self.ensure_file(resource).is_some() {
-                let iff = &self.files[&resource].iff;
+                let entry = self.files.get_mut(&resource).expect("just inserted");
                 load_group_cached(
-                    resource,
-                    iff,
+                    &entry.iff,
                     group,
                     direction,
                     zoom as u32 + 1,
-                    &mut self.file_palettes,
+                    &mut entry.palettes,
                 )
             } else {
                 Vec::new()
@@ -1176,21 +1166,6 @@ fn cached_iff_palette(
         .clone()
 }
 
-fn cached_file_palette(
-    resource: usize,
-    iff: &Iff,
-    palt_id: u16,
-    cache: &mut BTreeMap<(usize, u16), Option<Arc<Palette>>>,
-) -> Option<Arc<Palette>> {
-    cache
-        .entry((resource, palt_id))
-        .or_insert_with(|| {
-            let chunk = iff.get(b"PALT", palt_id)?;
-            Palette::parse(iff.data(chunk)).ok().map(Arc::new)
-        })
-        .clone()
-}
-
 fn spr2_palette_id(set: &SpriteSet, frame: &[u8]) -> Option<u16> {
     let stored = u16::from_le_bytes([*frame.get(8)?, *frame.get(9)?]);
     let palette = if set.version == 1000 || stored == 0 || stored == 0xA3A3 {
@@ -1216,12 +1191,11 @@ fn decode_spr2_with_cache(
 }
 
 fn load_group_cached(
-    resource: usize,
     iff: &Iff,
     group: u16,
     direction: u32,
     zoom: u32,
-    palettes: &mut BTreeMap<(usize, u16), Option<Arc<Palette>>>,
+    palettes: &mut BTreeMap<u16, Option<Arc<Palette>>>,
 ) -> Vec<Part> {
     let Some(chunk) = iff.get(b"DGRP", group) else {
         return Vec::new();
@@ -1257,7 +1231,7 @@ fn load_group_cached(
         let Some(palt_id) = spr2_palette_id(&set, frame_bytes) else {
             continue;
         };
-        let Some(palette) = cached_file_palette(resource, iff, palt_id, palettes) else {
+        let Some(palette) = cached_iff_palette(iff, palt_id, palettes) else {
             continue;
         };
         let Ok(frame) = SpriteFrame::decode(frame_bytes, &palette) else {
