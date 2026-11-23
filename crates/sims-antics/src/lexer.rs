@@ -1,4 +1,5 @@
-//! Deterministic lexer for the `.antics` language with 1-based line/column spans.
+//! Deterministic lexer for the `.air` (Antics IR) low-level textual IR layer
+//! with 1-based line/column spans.
 
 use crate::error::{Error, Result, Span};
 

@@ -1,5 +1,5 @@
-//! Deterministic lowering from `.antics` AST (both low-level exact and
-//! high-level structured trees) to validated `BHAV`, `BCON`, and `STR#` chunks.
+//! Deterministic lowering from `.air` (Antics IR) AST (both raw exact and
+//! structured IR trees) to validated `BHAV`, `BCON`, and `STR#` chunks.
 
 use crate::ast::{
     AssignOp, CallTarget, Condition, Item, LocalRef, Module, Operand, OperandRef, PrimitiveCall,

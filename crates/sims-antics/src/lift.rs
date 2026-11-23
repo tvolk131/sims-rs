@@ -1,5 +1,5 @@
 //! In-memory chunk lifter from parsed `sims_formats` / raw IFF chunks into
-//! `sims-antics` IR and canonical low-level `.antics` source text.
+//! `sims-antics` IR and canonical low-level `.air` (Antics IR) source text.
 //!
 //! Strictly in-memory: never writes any lifted representation to disk.
 
@@ -31,7 +31,14 @@ pub fn lift_bhav(id: u16, label: &str, data: &[u8]) -> Result<BhavChunk> {
     })
 }
 
-/// Formats a [`BhavChunk`] into canonical low-level `.antics` source text that
+/// Formats a [`BhavChunk`] into canonical low-level `.air` (Antics IR) source text that
+/// parses and lowers back to the exact same instruction stream and payload bytes.
+#[must_use]
+pub fn format_bhav_air(chunk: &BhavChunk) -> String {
+    format_bhav_antics(chunk)
+}
+
+/// Formats a [`BhavChunk`] into canonical low-level `.air` (Antics IR) source text that
 /// parses and lowers back to the exact same instruction stream and payload bytes.
 #[must_use]
 pub fn format_bhav_antics(chunk: &BhavChunk) -> String {
