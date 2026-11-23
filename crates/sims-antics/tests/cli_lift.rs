@@ -1851,38 +1851,13 @@ impl SyntheticInstall {
         )
         .expect("write TestGlobals.iff");
 
-        let trees = [
-            two_call_bhav(4096, 300, 8192),
-            two_call_bhav(4097, 301, 300),
-            two_call_bhav(4098, 302, 300),
-        ];
-        let mut chunks: Vec<ChunkData> = trees
-            .iter()
-            .map(|bhav| ChunkData {
-                tag: *b"BHAV",
-                id: bhav.id,
-                flags: 0,
-                label: bhav.label.clone(),
-                data: encode_bhav(bhav).expect("encode_bhav"),
-            })
-            .collect();
-        let link = b"TestGlobals";
-        let mut glob = vec![link.len() as u8];
-        glob.extend_from_slice(link);
-        chunks.push(ChunkData {
-            tag: *b"GLOB",
-            id: 128,
-            flags: 0,
-            label: String::new(),
-            data: glob,
-        });
-        let thing = write_iff(&chunks).expect("write Thing.iff");
+        let thing = synthetic_object_iff(Some(b"TestGlobals"));
         let far = package_far(&[("Thing.iff", &thing)]).expect("package far");
         std::fs::write(game_data.join("Objects").join("Test.far"), far).expect("write far");
         // The same trees as a loose object file without a GLOB link.
         std::fs::write(
             game_data.join("Objects").join("Loose.iff"),
-            synthetic_bhav_iff(&trees),
+            synthetic_object_iff(None),
         )
         .expect("write Loose.iff");
         Self { _dir: dir, root }
@@ -1895,6 +1870,37 @@ impl SyntheticInstall {
     fn global_dir(&self) -> PathBuf {
         self.root.join("GameData").join("Global")
     }
+}
+
+/// The synthetic object's trees (4096..=4098), with a `GLOB` chunk naming `link` if given.
+fn synthetic_object_iff(link: Option<&[u8]>) -> Vec<u8> {
+    let trees = [
+        two_call_bhav(4096, 300, 8192),
+        two_call_bhav(4097, 301, 300),
+        two_call_bhav(4098, 302, 300),
+    ];
+    let mut chunks: Vec<ChunkData> = trees
+        .iter()
+        .map(|bhav| ChunkData {
+            tag: *b"BHAV",
+            id: bhav.id,
+            flags: 0,
+            label: bhav.label.clone(),
+            data: encode_bhav(bhav).expect("encode_bhav"),
+        })
+        .collect();
+    if let Some(link) = link {
+        let mut glob = vec![link.len() as u8];
+        glob.extend_from_slice(link);
+        chunks.push(ChunkData {
+            tag: *b"GLOB",
+            id: 128,
+            flags: 0,
+            label: String::new(),
+            data: glob,
+        });
+    }
+    write_iff(&chunks).expect("write object iff")
 }
 
 fn run_lift(args: &[&OsStr]) -> (bool, String, String) {
@@ -2353,6 +2359,7 @@ fn lift_install_discovery_skips_fifos_in_mounts() {
     std::fs::create_dir_all(&downloads).expect("mkdir Downloads");
     let status = Command::new("mkfifo")
         .arg(downloads.join("pipe.iff"))
+        .arg(downloads.join("pipe.far"))
         .status()
         .expect("mkfifo should be available on Unix");
     assert!(status.success(), "mkfifo failed");
@@ -2439,6 +2446,57 @@ fn lift_override_ambiguity_and_bang_directories() {
     assert!(ok, "stderr: {stderr}");
     assert!(
         stdout.contains("Patch.far! staging/Global.iff (explicit)"),
+        "{stdout}"
+    );
+}
+
+/// `Objects/link/../Loose.iff` opens the `Loose.iff` beside the link's target, not
+/// `Objects/Loose.iff`: the catalog entry must be the file actually opened, or none.
+#[cfg(unix)]
+#[test]
+fn lift_symlink_then_dotdot_uses_the_opened_file_not_the_lexical_entry() {
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+
+    // Target inside the install: the opened file is indexed and has its own GLOB link,
+    // while the lexical entry (Objects/Loose.iff) has none.
+    std::fs::create_dir_all(objects.join("actual").join("sub")).expect("mkdir actual/sub");
+    std::fs::write(
+        objects.join("actual").join("Loose.iff"),
+        synthetic_object_iff(Some(b"TestGlobals")),
+    )
+    .expect("write actual/Loose.iff");
+    std::os::unix::fs::symlink(objects.join("actual").join("sub"), objects.join("link"))
+        .expect("symlink link");
+    let via = objects.join("link").join("..").join("Loose.iff");
+    let (ok, stdout, stderr) = run_lift(&[via.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "semi-global 8192+: 1 from GameData/Global/TestGlobals.iff (install catalog)"
+        ),
+        "must resolve through the opened actual/Loose.iff:\n{stdout}"
+    );
+
+    // Target outside the install: the opened file is not indexed, so only its own
+    // private range is known, and the header says why.
+    let outside = CleanupDir::new("dotdot-outside");
+    std::fs::create_dir_all(outside.path().join("sub")).expect("mkdir outside/sub");
+    std::fs::write(
+        outside.path().join("Loose.iff"),
+        synthetic_object_iff(Some(b"TestGlobals")),
+    )
+    .expect("write outside/Loose.iff");
+    std::os::unix::fs::symlink(outside.path().join("sub"), objects.join("away"))
+        .expect("symlink away");
+    let via = objects.join("away").join("..").join("Loose.iff");
+    let (ok, stdout, stderr) = run_lift(&[via.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "global 256..=4095: none (path names an install index entry but opens a different, unindexed file (symlink before `..`))"
+        ) && stdout.contains("private 4096..=8191: 3 from this file")
+            && stdout.contains("semi-global 8192+: none (path names an install index entry"),
         "{stdout}"
     );
 }

@@ -149,7 +149,10 @@ fn print_usage() {
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]   (lifts to .air Antics IR)\n  \
-         sims-antics build <pack_dir> --out <dir>"
+         sims-antics build <pack_dir> --out <dir>\n\
+         lift arities: inside an install, global and semi-global callee arities come from its catalog;\n  \
+         --globals/--semiglobal replace one range; --no-catalog disables catalog lookup (private arities\n  \
+         from the file only). Equivalent is relative to the arities shown in the `// arity sources:` header."
     );
 }
 
@@ -730,7 +733,8 @@ fn emit_lifted_bhavs<W: Write>(
     // here still lets the loop below count parse errors before it stops.
     if let Some(resolved) = resolved {
         match out.writeln_str(&format!(
-            "// arity sources: {}",
+            "// arity sources: {}; lifting and --verify-equiv assume these callee arities (an \
+             override, or a lot whose loaded callee versions differ, may change them)",
             sanitize_single_line(&resolved.describe())
         )) {
             Ok(()) => {}
@@ -843,7 +847,12 @@ fn emit_lifted_bhavs<W: Write>(
                                 states_checked,
                                 paths_verified,
                             } => format!(
-                                "// verify-equiv: Equivalent ({states_checked} states checked, {paths_verified} paths verified)"
+                                "// verify-equiv: Equivalent ({states_checked} states checked, {paths_verified} paths verified){}",
+                                if arities.is_some() {
+                                    " under the callee arities above"
+                                } else {
+                                    ""
+                                }
                             ),
                             EquivResult::Counterexample { path, divergence } => {
                                 summary.counterexamples += 1;

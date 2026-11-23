@@ -204,6 +204,9 @@ pub enum ResourceMatch {
     Ambiguous(usize),
     /// Not in the index.
     Unindexed,
+    /// The path as written names an index entry, but resolves to a different file (a
+    /// symlinked directory before `..`), and the file actually opened is not indexed.
+    PathMismatch,
 }
 
 /// Lexically normalizes an absolute path: drops `.` and folds `..` into its parent.
@@ -294,7 +297,9 @@ impl InstallArityCatalog {
 
     /// The index resource for the file at `path`, or for its FAR member `name` at byte
     /// `offset` when `member` is given. The path as given (then lexically normalized)
-    /// must match exactly; otherwise canonical paths are compared, and more than one
+    /// is tried first, but only accepted when that entry is the file actually opened:
+    /// `link/../X.iff` opens the `X.iff` beside the link's *target*, not the one the
+    /// lexical form names. Otherwise canonical paths are compared, and more than one
     /// canonical match is [`ResourceMatch::Ambiguous`].
     #[must_use]
     pub fn resource_for(&self, path: &Path, member: Option<(&str, u64)>) -> ResourceMatch {
@@ -303,9 +308,11 @@ impl InstallArityCatalog {
             (Some(have), Some((name, offset))) => have.name == name && have.offset == offset,
             _ => false,
         };
-        let Ok(given) = std::path::absolute(path) else {
+        let (Ok(given), Ok(canonical)) = (std::path::absolute(path), std::fs::canonicalize(path))
+        else {
             return ResourceMatch::Unindexed;
         };
+        let mut lexical_mismatch = false;
         for logical in [given.clone(), normalize_lexically(&given)] {
             if let Some(found) = self
                 .index
@@ -313,12 +320,12 @@ impl InstallArityCatalog {
                 .iter()
                 .position(|r| member_matches(r) && r.path == logical)
             {
-                return ResourceMatch::Unique(found);
+                if std::fs::canonicalize(&logical).is_ok_and(|c| c == canonical) {
+                    return ResourceMatch::Unique(found);
+                }
+                lexical_mismatch = true;
             }
         }
-        let Ok(canonical) = std::fs::canonicalize(path) else {
-            return ResourceMatch::Unindexed;
-        };
         let mut canonical_of: BTreeMap<&Path, Option<PathBuf>> = BTreeMap::new();
         let matches: Vec<usize> = self
             .index
@@ -336,6 +343,7 @@ impl InstallArityCatalog {
             .map(|(n, _)| n)
             .collect();
         match matches.as_slice() {
+            [] if lexical_mismatch => ResourceMatch::PathMismatch,
             [] => ResourceMatch::Unindexed,
             [one] => ResourceMatch::Unique(*one),
             many => ResourceMatch::Ambiguous(many.len()),
@@ -373,6 +381,13 @@ impl InstallArityCatalog {
             ResourceMatch::Unique(resource) => Some(resource),
             ResourceMatch::Unindexed => {
                 return ResolvedArities::private_only(iff, "file not in install index");
+            }
+            ResourceMatch::PathMismatch => {
+                return ResolvedArities::private_only(
+                    iff,
+                    "path names an install index entry but opens a different, unindexed \
+                     file (symlink before `..`)",
+                );
             }
             ResourceMatch::Ambiguous(count) => {
                 let why = format!("owner-dependent: file matches {count} install index entries");

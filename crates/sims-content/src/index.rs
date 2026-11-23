@@ -1080,6 +1080,14 @@ type RawMember = (Member, Vec<u8>);
 /// [`far_members`], each with the bytes of its name.
 fn archive_members(path: &Path) -> Result<(Vec<RawMember>, Vec<String>)> {
     let io = |e| Error::io(path, e);
+    // Opening a FIFO (e.g. a `*.far` pipe in Downloads) blocks until a writer
+    // appears, so anything but a regular file is refused before the open.
+    if !std::fs::metadata(path).map_err(io)?.is_file() {
+        return Err(io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        )));
+    }
     let mut file = File::open(path).map_err(io)?;
     let len = file.metadata().map_err(io)?.len();
     let mut header = [0; 16];

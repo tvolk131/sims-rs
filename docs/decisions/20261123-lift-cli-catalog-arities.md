@@ -2,7 +2,7 @@
 
 - **Date:** 2026-11-23
 - **Status:** Accepted
-- **Scope:** `crates/sims-antics/` (`arity_catalog.rs`, `structure_lift.rs`, `bin/sims-antics.rs`, `tests/cli_lift.rs`, `tests/structured_equiv.rs`)
+- **Scope:** `crates/sims-antics/` (`arity_catalog.rs`, `structure_lift.rs`, `bin/sims-antics.rs`, `tests/cli_lift.rs`, `tests/structured_equiv.rs`); `crates/sims-content/src/index.rs` (archive open guard)
 
 ## Context
 
@@ -21,18 +21,19 @@ The `structured_equiv` corpus run resolved callee arities the way `sims_vm::inte
   - A path that matches more than one index entry only through symlinks (for example a file mounted both as an object and in the global directory) keeps its private and semi-global ranges unknown, since the owner depends on which entry the game loaded.
   - This is stricter than the self-fallback the corpus used before. It leaves the Complete Collection numbers unchanged: on real data the looser rule never changed an arity.
 - **Duplicate IDs.** The VM's library loader keeps the last physical BHAV chunk of an ID, deleted ones included. The original's loader skips deleted chunks. The extractor therefore reads every parseable chunk and leaves an ID unknown when its chunks disagree on arity. That is sound under either rule.
-- **Auto-discovery.** `lift` walks up from the input path *as given* to the nearest install root (`Install::detect`), so a symlink into another install still uses the install it was reached from. Only after that does it try the canonical path. It then matches the input to its index resource: exact path first, then the lexically normalized path (so `Objects/sub/../X.iff` is `Objects/X.iff`), then the canonical path. It matches the loose file, or the FAR path plus member name and offset. Only regular files enter the catalog, so a FIFO or socket in a mount such as `Downloads/` cannot block discovery. Catalog errors name paths as `<install>/…`. A `Global.iff` that fails to load leaves only the global range unknown; semi-global links still resolve. On the Complete Collection this adds about 0.4 s.
+- **Auto-discovery.** `lift` walks up from the input path *as given* to the nearest install root (`Install::detect`), so a symlink into another install still uses the install it was reached from. Only after that does it try the canonical path. It then matches the input to its index resource: exact path first, then the lexically normalized path (so `Objects/sub/../X.iff` is `Objects/X.iff`), then the canonical path. An exact or lexical match counts only when that entry is the file actually opened: if `Objects/link` is a symlink to `Objects/actual/sub`, then `Objects/link/../X.iff` opens `Objects/actual/X.iff`, which can have a different `GLOB`. When the opened file is not indexed, only its private range is known, and the header says why. It matches the loose file, or the FAR path plus member name and offset. Only regular files enter the catalog, so a FIFO or socket in a mount such as `Downloads/` cannot block discovery. `sims_content` index building likewise refuses to open a `*.far` that is not a regular file, and records a diagnostic, as it does for any unreadable archive. Catalog errors name paths as `<install>/…`. A `Global.iff` that fails to load leaves only the global range unknown; semi-global links still resolve. On the Complete Collection this adds about 0.4 s.
 - **Overrides.**
   - `--globals <Global.iff | archive.far[!member.iff]>`: a FAR without `!member` defaults to `Global.iff`.
   - `--semiglobal <file.iff | archive.far!member.iff>`.
   - A spec that names an existing file is used as-is. Otherwise it splits at the first `.far!` whose prefix is an existing file, so directory names and member names may contain `!`.
   - Override members must match exactly: the full name, or the full name or last path component case-insensitively. Suffix matching is never used.
   - Each override replaces only its own ID range.
-  - `--no-catalog` keeps the old private-only behaviour.
+  - `--no-catalog` disables catalog lookup, leaving private arities from the file only. It is not byte-for-byte the old behaviour: a private ID whose chunks disagree on arity (e.g. a live 4-arg tree plus a deleted 6-arg duplicate) is now unknown, where the old path took one of them. On Fridges it reproduces the old 43/51.
   - All three are rejected with `--raw`, which does not use arities, and with an archive `--list` that has no `--entry`.
   - Arities are resolved after tree selection, so a bad override never hides a missing `--tree`.
 - **Explainable output.**
   - Lift and `--list` output start with `// arity sources: global …; private …; semi-global …`. Each range shows its count and source: this file, install catalog (path relative to the install), explicit, or none, with the reason.
+  - `Equivalent` from `--verify-equiv` is relative to the callee arities used, and the header and the verify line say so. An explicit override, or a lot whose loaded callee versions differ from the base install's catalog (for example a `Characters` or `Downloads` file taking precedence over a `GLOB` target), can supply a different arity, and then a different lift.
   - `structure_lift` exposes `structured_lift_header_check` / `UnsupportedHeaderReason`, refactored out of the lifter's own guard so the two cannot drift. Fallback lines name the format, instruction count, kind-4 entry, out-of-bounds target, or the node and callee whose arity is above 4 or unknown. An unknown arity also names the missing source and the flag that would supply it.
 
 ## Results
