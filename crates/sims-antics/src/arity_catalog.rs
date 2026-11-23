@@ -26,9 +26,10 @@
 //! Unknown arities make the lifter keep the labeled-CFG layout, which is always sound.
 //!
 //! The rule: **whenever the VM, booted the same way (the base install, no
-//! neighborhood), executes a call instruction, it reads exactly the argument count used
-//! here.** A call the VM never executes in that boot (failed link, owner that lost its
-//! GUID, discarded caller chunk) cannot be misdescribed. `InstallArityCatalog` (feature
+//! neighborhood), executes a call instruction and copies its arguments, it copies exactly
+//! the argument count used here.** A call the VM never executes in that boot (failed
+//! link, owner that lost its GUID, discarded caller chunk), or that traps before copying
+//! any argument, cannot be misdescribed. `InstallArityCatalog` (feature
 //! `install-catalog`, on by default) asks the VM's own code rather than restating it:
 //!
 //! - **Boot path.** It builds the `sims_content` index and catalog as the VM boots. A
@@ -58,7 +59,7 @@
 #[cfg(feature = "install-catalog")]
 use sims_content::{ArchivePool, Catalog, Index, Install, Resource};
 use sims_formats::behavior::{Behavior, TreeScope, instruction_refused};
-use sims_formats::iff::Iff;
+use sims_formats::iff::{Chunk, Iff};
 use std::collections::BTreeMap;
 #[cfg(feature = "install-catalog")]
 use std::collections::BTreeSet;
@@ -107,6 +108,41 @@ pub fn bhav_arities_in_range(iff: &Iff, range: RangeInclusive<u16>) -> BTreeMap<
     seen.into_iter()
         .filter_map(|(id, arity)| arity.map(|a| (id, a)))
         .collect()
+}
+
+/// The BHAV chunks the VM runs: one per ID, sorted by ID.
+#[derive(Debug)]
+pub struct KeptBhavs<'a> {
+    pub chunks: Vec<&'a Chunk>,
+    /// IDs with more than one BHAV chunk, with their chunk counts.
+    pub duplicates: BTreeMap<u16, usize>,
+}
+
+/// Selects, for every BHAV ID in `iff`, the chunk the VM's library loader keeps: it reads
+/// chunks in physical order and keeps the last BHAV of each ID, deleted ones included
+/// (`sims_vm` `load_library_with_pool`). That is the tree the VM runs for the ID, so it
+/// is the one `lift` lists, lifts and verifies, the one the corpus verifier checks, and
+/// the one a file's arity context describes. An ID whose only chunks are deleted is
+/// included: the VM loads and can run it.
+#[must_use]
+pub fn vm_kept_bhavs(iff: &Iff) -> KeptBhavs<'_> {
+    let mut by_id: BTreeMap<u16, (&Chunk, usize)> = BTreeMap::new();
+    for chunk in iff.chunks.iter().filter(|c| &c.tag == b"BHAV") {
+        by_id
+            .entry(chunk.id)
+            .and_modify(|(kept, count)| {
+                *kept = chunk;
+                *count += 1;
+            })
+            .or_insert((chunk, 1));
+    }
+    let duplicates = by_id
+        .iter()
+        .filter(|(_, (_, count))| *count > 1)
+        .map(|(&id, &(_, count))| (id, count))
+        .collect();
+    let chunks = by_id.into_values().map(|(kept, _)| kept).collect();
+    KeptBhavs { chunks, duplicates }
 }
 
 /// Where one ID range's arities came from.
@@ -832,7 +868,7 @@ mod tests {
     use crate::encode::encode_bhav;
     use crate::ir::BhavChunk;
     use sims_formats::behavior::Instruction;
-    use sims_formats::iff::{ChunkData, write as write_iff};
+    use sims_formats::iff::{ChunkData, DELETED, write as write_iff};
 
     fn bhav(id: u16, args: u8) -> ChunkData {
         let chunk = BhavChunk {
@@ -908,6 +944,43 @@ mod tests {
         assert_eq!(
             bhav_arities_in_range(&iff, GLOBAL_TREES),
             BTreeMap::from([(301, 2)])
+        );
+    }
+
+    #[test]
+    fn vm_kept_bhavs_keeps_the_last_chunk_of_every_id() {
+        let mut deleted_last = bhav(4097, 2);
+        deleted_last.flags = DELETED;
+        deleted_last.label = "deleted last".to_owned();
+        let mut high_flag = bhav(4096, 3);
+        high_flag.flags = 0x0100;
+        high_flag.label = "kept".to_owned();
+        let mut deleted_only = bhav(4098, 1);
+        deleted_only.flags = DELETED;
+        let iff = Iff::parse(
+            write_iff(&[
+                bhav(4096, 1),
+                bhav(4097, 1),
+                high_flag,
+                deleted_last,
+                deleted_only,
+            ])
+            .expect("write_iff"),
+        )
+        .expect("parse");
+        let kept = vm_kept_bhavs(&iff);
+        let picked: Vec<(u16, &str)> = kept
+            .chunks
+            .iter()
+            .map(|c| (c.id, c.label.as_str()))
+            .collect();
+        assert_eq!(picked[0], (4096, "kept"));
+        assert_eq!(picked[1], (4097, "deleted last"));
+        assert_eq!(picked[2].0, 4098);
+        assert_eq!(picked.len(), 3);
+        assert_eq!(
+            kept.duplicates.into_iter().collect::<Vec<_>>(),
+            vec![(4096, 2), (4097, 2)]
         );
     }
 }

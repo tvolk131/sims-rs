@@ -10,7 +10,7 @@
 //!
 //! Skips cleanly when `SIMS_INSTALL` is unset (CI-safe).
 
-use sims_antics::arity_catalog::{InstallArityCatalog, ResourceMatch};
+use sims_antics::arity_catalog::{InstallArityCatalog, ResourceMatch, vm_kept_bhavs};
 use sims_antics::{
     EquivOptions, EquivResult, LiftOptions, StructuredLiftOutcome,
     check_bhav_equivalent_with_arities, compile_antics, extract_lift_symbols_from_iff,
@@ -18,7 +18,7 @@ use sims_antics::{
     lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
 };
 use sims_formats::behavior::Behavior;
-use sims_formats::iff::{DELETED, Iff};
+use sims_formats::iff::Iff;
 use std::path::PathBuf;
 
 #[test]
@@ -95,10 +95,8 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
             .is_some_and(|base| base.eq_ignore_ascii_case("Fridges.iff"));
         let lift_symbols = extract_lift_symbols_from_iff(&iff);
 
-        for chunk in &iff.chunks {
-            if chunk.flags & DELETED != 0 || &chunk.tag != b"BHAV" {
-                continue;
-            }
+        // Only the chunk the VM keeps for each ID runs, so only it is checked.
+        for chunk in vm_kept_bhavs(&iff).chunks {
             let data = iff.data(chunk);
             if Behavior::parse(data).is_err() {
                 continue;

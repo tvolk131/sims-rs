@@ -3233,8 +3233,10 @@ fn lift_with_an_unidentifiable_index_path_keeps_owner_ranges_unknown() {
 }
 
 /// Two BHAV chunks share an ID: the VM's loader keeps the last one in file order (deleted
-/// ones included), so that is the tree `lift` lists, lifts, and describes with the
-/// file's arity context, and the duplicate is flagged.
+/// ones included, whatever the flags' high byte), so that is the tree `lift` lists,
+/// lifts, and describes with the file's arity context, and the duplicate is flagged.
+/// The kept 4096 has a nonzero high flag byte, so a lookup keyed on flags (`Iff::get`)
+/// would pick the first copy instead.
 #[test]
 fn lift_shows_the_duplicate_bhav_chunk_the_vm_keeps() {
     let install = SyntheticInstall::new();
@@ -3251,7 +3253,7 @@ fn lift_shows_the_duplicate_bhav_chunk_the_vm_keeps() {
     let chunks = vec![
         named(two_call_bhav(4096, 300, 8192), "FirstCopy", 0),
         named(two_call_bhav(4097, 300, 4096), "LiveCopy", 0),
-        named(two_call_bhav(4096, 301, 300), "KeptCopy", 0),
+        named(two_call_bhav(4096, 301, 300), "KeptCopy", 0x0100),
         named(two_call_bhav(4097, 301, 4096), "DeletedKept", 4),
         objd_chunk(),
         glob_chunk(b"TestGlobals"),
@@ -3270,11 +3272,27 @@ fn lift_shows_the_duplicate_bhav_chunk_the_vm_keeps() {
         "{stdout}"
     );
 
+    // KeptCopy calls global 301 (6 arguments) inline at its first node: the kept caller,
+    // under this file's arity context, reads them from the next record and falls back.
+    let row_4096 = stdout
+        .lines()
+        .find(|l| l.starts_with("4096"))
+        .unwrap_or_default();
+    assert!(
+        row_4096.contains("labeled-cfg (calls global 301 with 6 args)")
+            && row_4096.contains("KeptCopy"),
+        "{stdout}"
+    );
+
     let (ok, stdout, stderr) =
         run_lift(&[path.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
     assert!(ok, "stderr: {stderr}");
     assert!(
         stdout.contains("KeptCopy") && !stdout.contains("FirstCopy"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("node 0 calls global tree 301 with inline operands and 6 args (>4 reads following records)"),
         "{stdout}"
     );
     assert!(
@@ -3292,4 +3310,51 @@ fn lift_shows_the_duplicate_bhav_chunk_the_vm_keeps() {
             && !stdout.contains("LiveCopy"),
         "{stdout}"
     );
+}
+
+/// A BHAV whose only chunk is deleted is still loaded by the VM, which can run it (here
+/// live 4096 calls it), so `lift` lists, lifts and verifies it like any other tree.
+#[test]
+fn lift_includes_a_bhav_whose_only_chunk_is_deleted() {
+    let install = SyntheticInstall::new();
+    let path = install
+        .root
+        .join("GameData")
+        .join("Objects")
+        .join("DeletedOnly.iff");
+    let mut deleted = bhav_chunk(&two_call_bhav(4097, 300, 300));
+    deleted.flags = 4;
+    deleted.label = "OnlyDeleted".to_owned();
+    let chunks = vec![
+        bhav_chunk(&two_call_bhav(4096, 300, 4097)),
+        deleted,
+        objd_chunk(),
+        glob_chunk(b"TestGlobals"),
+    ];
+    std::fs::write(&path, write_iff(&chunks).expect("write_iff")).expect("write iff");
+
+    let (ok, stdout, stderr) =
+        run_lift(&[path.as_os_str(), OsStr::new("--tree"), OsStr::new("4097")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains("OnlyDeleted"), "{stdout}");
+    assert!(
+        stdout.contains("private 4096..=8191: 2 from this file"),
+        "{stdout}"
+    );
+
+    let (ok, stdout, stderr) = run_lift(&[path.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    let row = stdout
+        .lines()
+        .find(|l| l.starts_with("4097"))
+        .unwrap_or_default();
+    assert!(
+        row.contains("structured") && row.contains("OnlyDeleted"),
+        "{stdout}"
+    );
+
+    let (ok, stdout, stderr) = run_lift(&[path.as_os_str(), OsStr::new("--verify-equiv")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains("OnlyDeleted"), "{stdout}");
+    assert!(stdout.contains("Caller4096"), "{stdout}");
 }

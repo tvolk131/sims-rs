@@ -100,15 +100,17 @@ fn loaded_str_order(entries: &[sims_formats::strings::TextEntry]) -> Vec<String>
 }
 
 /// Extracts strictly in-memory [`LiftSymbols`] (private `BHAV` labels, local `BCON` tables,
-/// and local `STR#` tables) from a parsed [`sims_formats::iff::Iff`], preferring canonical
-/// high-flag-byte `0` chunks and skipping deleted chunks.
+/// and local `STR#` tables) from a parsed [`sims_formats::iff::Iff`]. A `BHAV` label is the
+/// one on the chunk the VM keeps for that ID
+/// ([`crate::arity_catalog::vm_kept_bhavs`]); `BCON` and `STR#` prefer canonical
+/// high-flag-byte `0` chunks and skip deleted chunks.
 #[must_use]
 pub fn extract_lift_symbols_from_iff(iff: &sims_formats::iff::Iff) -> LiftSymbols {
     let mut symbols = LiftSymbols::default();
 
-    for (id, chunk) in collect_canonical_chunks(iff, b"BHAV") {
-        if (4096..=8191).contains(&id) && !chunk.label.is_empty() {
-            symbols.bhav_labels.insert(id, chunk.label.clone());
+    for chunk in crate::arity_catalog::vm_kept_bhavs(iff).chunks {
+        if (4096..=8191).contains(&chunk.id) && !chunk.label.is_empty() {
+            symbols.bhav_labels.insert(chunk.id, chunk.label.clone());
         }
     }
     for (id, chunk) in collect_canonical_chunks(iff, b"BCON") {

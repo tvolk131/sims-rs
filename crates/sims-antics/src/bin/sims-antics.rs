@@ -11,8 +11,8 @@
 //! - `sims-antics build <pack_dir> --out <dir>`
 
 use sims_antics::arity_catalog::{
-    AritySource, FileArities, FileIdentity, GLOBAL_TREES, ResolvedArities, SEMI_GLOBAL_TREES,
-    bhav_arities_in_range,
+    AritySource, FileArities, FileIdentity, GLOBAL_TREES, KeptBhavs, ResolvedArities,
+    SEMI_GLOBAL_TREES, bhav_arities_in_range, vm_kept_bhavs,
 };
 use sims_antics::ir::BhavChunk;
 use sims_antics::{
@@ -28,7 +28,7 @@ use sims_antics::{
     verify_object_safety, verify_pack_safety,
 };
 use sims_formats::far;
-use sims_formats::iff::{DELETED, Iff};
+use sims_formats::iff::Iff;
 use std::ffi::{OsStr, OsString};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -1189,7 +1189,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     let KeptBhavs {
         chunks: bhav_chunks,
         duplicates,
-    } = kept_bhavs(&iff);
+    } = vm_kept_bhavs(&iff);
 
     // Resolved after tree selection (so a bad override never masks a not-found tree), and
     // skipped for `--raw`, which does not use arities, or when there is nothing to lift and
@@ -1337,44 +1337,6 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
         verify_equiv,
         &mut out,
     )
-}
-
-/// The BHAV chunks the VM runs: one per ID, sorted by ID.
-struct KeptBhavs<'a> {
-    chunks: Vec<&'a sims_formats::iff::Chunk>,
-    /// IDs with more than one BHAV chunk, with their chunk counts.
-    duplicates: std::collections::BTreeMap<u16, usize>,
-}
-
-/// Selects, for each ID with a live BHAV chunk, the chunk the VM's library loader keeps:
-/// it reads chunks in physical order and keeps the last BHAV of each ID, deleted ones
-/// included (`sims_vm` `load_library_with_pool`). That is the tree the VM runs, so it is
-/// the one listed, lifted and verified, and the one the arity context describes.
-fn kept_bhavs(iff: &Iff) -> KeptBhavs<'_> {
-    let mut by_id: std::collections::BTreeMap<u16, (&sims_formats::iff::Chunk, usize, bool)> =
-        std::collections::BTreeMap::new();
-    for chunk in iff.chunks.iter().filter(|c| &c.tag == b"BHAV") {
-        let live = chunk.flags & DELETED == 0;
-        by_id
-            .entry(chunk.id)
-            .and_modify(|(kept, count, any_live)| {
-                *kept = chunk;
-                *count += 1;
-                *any_live |= live;
-            })
-            .or_insert((chunk, 1, live));
-    }
-    let duplicates = by_id
-        .iter()
-        .filter(|(_, (_, count, any_live))| *count > 1 && *any_live)
-        .map(|(&id, &(_, count, _))| (id, count))
-        .collect();
-    let chunks = by_id
-        .into_values()
-        .filter(|&(_, _, any_live)| any_live)
-        .map(|(kept, _, _)| kept)
-        .collect();
-    KeptBhavs { chunks, duplicates }
 }
 
 /// A comment naming IDs shared by several BHAV chunks, if any.
