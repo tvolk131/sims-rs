@@ -178,6 +178,11 @@ enum EventKind {
         inline_args: Vec<u8>,
         /// The whole instruction suffix after a call whose callee arity is unknown.
         unknown_arity_suffix: Option<Vec<u8>>,
+        /// `(params, locals)` of the running frame, for primitives that push a frame:
+        /// frame storage is one word stack, so a callee's frame starts after this one
+        /// and its initial locals are whatever an earlier frame left there
+        /// (`interpreter.rs:1195`).
+        caller_frame: Option<(usize, usize)>,
     },
     /// An `Expression` read of an untracked operand.
     Read {
@@ -1235,6 +1240,7 @@ impl Explorer<'_> {
                 operands: canonicalize_primitive_operands(ins.opcode, *ops),
                 inline_args,
                 unknown_arity_suffix,
+                caller_frame: pushes_frame(ins.opcode).then_some((self.args, self.locals)),
             },
             frame,
             interner,
@@ -1267,6 +1273,13 @@ impl Explorer<'_> {
         }
         Ok(out)
     }
+}
+
+/// Primitives that run another tree on the same object's stack: subroutine calls and
+/// the callback primitives (`FindBestInteraction`, `FindBestObject`, `RunFunctionalTree`,
+/// `RunTreeByName`, `GosubFoundAction`, `UiEffect`, `Reach`).
+fn pushes_frame(opcode: u16) -> bool {
+    matches!(opcode, 3 | 14 | 20 | 28 | 30 | 34 | 47 | 256..=u16::MAX)
 }
 
 /// Frame slots primitives write beyond their listed destinations (mirrors the lockstep
@@ -1716,16 +1729,24 @@ fn event_difference(
                 operands: xa,
                 inline_args: ia,
                 unknown_arity_suffix: sa,
+                caller_frame: fa,
             },
             EventKind::Primitive {
                 opcode: ob,
                 operands: xb,
                 inline_args: ib,
                 unknown_arity_suffix: sb,
+                caller_frame: fb,
             },
-        ) if oa == ob && xa == xb && ia == ib && sa != sb => {
+        ) if oa == ob && xa == xb && ia == ib && (sa != sb || fa != fb) => {
+            if sa != sb {
+                return Difference::Possible(format!(
+                    "{at}: call #{oa} has unknown callee arity and the instructions after it differ"
+                ));
+            }
             return Difference::Possible(format!(
-                "{at}: call #{oa} has unknown callee arity and the instructions after it differ"
+                "{at}: opcode {oa:#06x} runs a tree whose frame starts at a different frame-storage \
+                 offset (caller params/locals A {fa:?} vs B {fb:?}), so its uninitialized locals may differ"
             ));
         }
         (x, y) if !same_shape(x, y) => {
@@ -1862,14 +1883,16 @@ fn same_shape(a: &EventKind, b: &EventKind) -> bool {
                 operands: xa,
                 inline_args: ia,
                 unknown_arity_suffix: sa,
+                caller_frame: fa,
             },
             EventKind::Primitive {
                 opcode: ob,
                 operands: xb,
                 inline_args: ib,
                 unknown_arity_suffix: sb,
+                caller_frame: fb,
             },
-        ) => oa == ob && xa == xb && ia == ib && sa == sb,
+        ) => oa == ob && xa == xb && ia == ib && sa == sb && fa == fb,
         (
             EventKind::Read {
                 scope: sa, idx: ia, ..

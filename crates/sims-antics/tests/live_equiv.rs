@@ -596,3 +596,38 @@ fn verify_equiv_cli_exit_codes() {
     let out = cli().arg("verify-equiv").arg(&path_a).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// Frame storage is one word stack: a callee's frame starts after the caller's, so its
+/// uninitialized locals come from wherever an earlier frame left words there. Trees
+/// whose frames differ in size can hand their callees different locals, so a dead local
+/// is only dead when nothing runs another tree.
+#[test]
+fn caller_frame_size_matters_when_calling_other_trees() {
+    let call = prim(0x1000, [0; 8], T, F);
+    let more_locals = tree(4096, 0, 4, vec![call.clone()]);
+    let fewer_locals = tree(4096, 0, 0, vec![call]);
+    let ctx = LiveContext {
+        callee_arities: Some([(0x1000, 0)].into_iter().collect()),
+        ..LiveContext::default()
+    };
+    assert_inconclusive(&live_with(
+        &more_locals,
+        &fewer_locals,
+        &ctx,
+        &LiveOptions::default(),
+    ));
+    let (_, combined) = check_bhav_equivalent_combined(
+        &more_locals,
+        &ctx,
+        &fewer_locals,
+        &ctx,
+        &EquivOptions::default(),
+        &LiveOptions::default(),
+    );
+    assert_inconclusive(&combined);
+
+    // Without calls the frame size is unobservable (residue is opt-in).
+    let no_call_more = tree(4096, 0, 4, vec![expr((TEMP, 0), SET, (LIT, 1), T, ERR)]);
+    let no_call_fewer = tree(4096, 0, 0, vec![expr((TEMP, 0), SET, (LIT, 1), T, ERR)]);
+    assert_equivalent(&live(&no_call_more, &no_call_fewer));
+}

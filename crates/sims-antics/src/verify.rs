@@ -5449,7 +5449,18 @@ pub fn check_bhav_equivalent_combined(
 ) -> (EquivMethod, EquivResult) {
     let arities = merge_arities(ctx_a.callee_arities.as_ref(), ctx_b.callee_arities.as_ref());
     let first = check_bhav_equivalent_with_arities(a, b, lockstep, arities.as_ref());
-    if matches!(first, EquivResult::Equivalent { .. }) {
+    // Lockstep does not compare frame sizes, but a callee's frame starts after the
+    // caller's in the frame storage, so its uninitialized locals depend on them
+    // (`sims-vm/src/interpreter.rs:1195`); let the live checker decide those trees.
+    let runs_trees = |bhav: &BhavChunk| {
+        bhav.instructions
+            .iter()
+            .any(|ins| matches!(ins.opcode, 3 | 14 | 20 | 28 | 30 | 34 | 47 | 256..=u16::MAX))
+    };
+    let same_frame = live::frame_dims(a) == live::frame_dims(b);
+    if matches!(first, EquivResult::Equivalent { .. })
+        && (same_frame || !(runs_trees(a) || runs_trees(b)))
+    {
         return (EquivMethod::Lockstep, first);
     }
     match check_bhav_live_equivalent(a, ctx_a, b, ctx_b, live) {
@@ -5459,7 +5470,11 @@ pub fn check_bhav_equivalent_combined(
                     format!("lockstep counterexample: {divergence}")
                 }
                 EquivResult::Inconclusive { reason } => format!("lockstep: {reason}"),
-                EquivResult::Equivalent { .. } => unreachable!("returned above"),
+                EquivResult::Equivalent { .. } => {
+                    "lockstep: equivalent node for node, but the frames differ in size and \
+                     the trees run other trees"
+                        .to_owned()
+                }
             };
             (
                 EquivMethod::LiveOutput,
