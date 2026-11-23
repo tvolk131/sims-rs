@@ -6,7 +6,8 @@
 use crate::error::{Error, Result, Span};
 use crate::manifest::{TomlValue, parse_toml};
 use crate::v2::ast::{
-    BitflagsDecl, EnumDecl, FnDecl, ObjectDecl, TemplateDecl, V2File, V2Item, object_type_ident,
+    BitflagsDecl, EnumDecl, ExternBconDecl, ExternModDecl, FnDecl, ObjectDecl, TemplateDecl,
+    V2File, V2Item, object_type_ident,
 };
 use crate::v2::parser::parse_v2_file;
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +43,10 @@ pub struct ModuleScope {
     pub enums: BTreeMap<String, (String, EnumDecl)>,
     pub bitflags: BTreeMap<String, (String, BitflagsDecl)>,
     pub objects: BTreeMap<String, (String, ObjectDecl)>,
+    /// `extern mod` BHAV bindings visible by local name (local + imported), with their owning module id.
+    pub extern_mods: BTreeMap<String, (String, ExternModDecl)>,
+    /// `extern bcon` constant bindings visible by local name (local + imported), with their owning module id.
+    pub extern_bcons: BTreeMap<String, (String, ExternBconDecl)>,
 }
 
 /// Optional pack root and external dependency roots for `use` resolution.
@@ -451,6 +456,8 @@ struct LoadedModuleData {
     pub_enums: BTreeMap<String, EnumDecl>,
     pub_bitflags: BTreeMap<String, BitflagsDecl>,
     pub_objects: BTreeMap<String, ObjectDecl>,
+    pub_extern_mods: BTreeMap<String, ExternModDecl>,
+    pub_extern_bcons: BTreeMap<String, ExternBconDecl>,
     /// All items declared locally (for private-visibility error diagnostics).
     all_local_names: BTreeSet<String>,
     /// Complete scope visible inside this module.
@@ -483,6 +490,10 @@ impl<'a> ModuleLoader<'a> {
         let mut pub_enums = BTreeMap::new();
         let mut pub_bitflags = BTreeMap::new();
         let mut pub_objects = BTreeMap::new();
+        let mut extern_mods: BTreeMap<String, (String, ExternModDecl)> = BTreeMap::new();
+        let mut extern_bcons: BTreeMap<String, (String, ExternBconDecl)> = BTreeMap::new();
+        let mut pub_extern_mods = BTreeMap::new();
+        let mut pub_extern_bcons = BTreeMap::new();
         let mut all_local_names = BTreeSet::new();
 
         // 1. Register local items first so duplicate local names are caught clearly.
@@ -536,6 +547,30 @@ impl<'a> ModuleLoader<'a> {
                     }
                     bitflags.insert(b.name.clone(), (module_id.clone(), b.clone()));
                 }
+                V2Item::ExternMod(m) => {
+                    if !all_local_names.insert(m.name.clone()) {
+                        return Err(Error::at(
+                            m.span,
+                            format!("duplicate top-level item '{}' in {module_id}", m.name),
+                        ));
+                    }
+                    if m.is_pub {
+                        pub_extern_mods.insert(m.name.clone(), m.clone());
+                    }
+                    extern_mods.insert(m.name.clone(), (module_id.clone(), m.clone()));
+                }
+                V2Item::ExternBcon(b) => {
+                    if !all_local_names.insert(b.name.clone()) {
+                        return Err(Error::at(
+                            b.span,
+                            format!("duplicate top-level item '{}' in {module_id}", b.name),
+                        ));
+                    }
+                    if b.is_pub {
+                        pub_extern_bcons.insert(b.name.clone(), b.clone());
+                    }
+                    extern_bcons.insert(b.name.clone(), (module_id.clone(), b.clone()));
+                }
                 V2Item::Object(obj) => {
                     let type_name = object_type_ident(&obj.name);
                     if crate::v2::ast::is_reserved_type_name(&type_name) {
@@ -581,7 +616,9 @@ impl<'a> ModuleLoader<'a> {
                     || templates.contains_key(local_name)
                     || enums.contains_key(local_name)
                     || bitflags.contains_key(local_name)
-                    || imported_objects.contains_key(local_name);
+                    || imported_objects.contains_key(local_name)
+                    || extern_mods.contains_key(local_name)
+                    || extern_bcons.contains_key(local_name);
                 if let Some(fn_decl) = target.pub_functions.get(&item.name) {
                     if name_taken {
                         return Err(Error::at(
@@ -633,6 +670,26 @@ impl<'a> ModuleLoader<'a> {
                     }
                     imported_objects
                         .insert(local_name.clone(), (target_key.clone(), obj_decl.clone()));
+                } else if let Some(m_decl) = target.pub_extern_mods.get(&item.name) {
+                    if name_taken {
+                        return Err(Error::at(
+                            item.span,
+                            format!(
+                                "imported name '{local_name}' collides with an existing binding"
+                            ),
+                        ));
+                    }
+                    extern_mods.insert(local_name.clone(), (target_key.clone(), m_decl.clone()));
+                } else if let Some(b_decl) = target.pub_extern_bcons.get(&item.name) {
+                    if name_taken {
+                        return Err(Error::at(
+                            item.span,
+                            format!(
+                                "imported name '{local_name}' collides with an existing binding"
+                            ),
+                        ));
+                    }
+                    extern_bcons.insert(local_name.clone(), (target_key.clone(), b_decl.clone()));
                 } else if target.all_local_names.contains(&item.name) {
                     return Err(Error::at(
                         item.span,
@@ -658,6 +715,8 @@ impl<'a> ModuleLoader<'a> {
             enums: enums.clone(),
             bitflags: bitflags.clone(),
             objects: imported_objects.clone(),
+            extern_mods,
+            extern_bcons,
         };
 
         if !is_root {
@@ -669,6 +728,8 @@ impl<'a> ModuleLoader<'a> {
                     pub_enums,
                     pub_bitflags,
                     pub_objects,
+                    pub_extern_mods,
+                    pub_extern_bcons,
                     all_local_names,
                     scope: scope.clone(),
                 },

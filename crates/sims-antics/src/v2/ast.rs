@@ -37,6 +37,103 @@ pub enum V2Item {
     Object(ObjectDecl),
     Enum(EnumDecl),
     Bitflags(BitflagsDecl),
+    ExternMod(ExternModDecl),
+    ExternBcon(ExternBconDecl),
+}
+
+/// Where a BHAV-call ABI parameter is passed (`a: i16` positional or `a: i16 @ temp[N]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbiParamSlot {
+    /// Passed positionally as callee `param[i]` (literal call operands, or `temp[i]` via `call(temps)`).
+    Positional,
+    /// Written into the shared thread temporary `temp[N]` (`0..=7`) before the call.
+    Temp(u8),
+}
+
+/// One parameter of an `extern mod` function or standalone `tree` declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbiParam {
+    pub span: Span,
+    pub name: String,
+    pub ty: V2Type,
+    pub slot: AbiParamSlot,
+}
+
+/// Explicit SimAntics return ABI of an `extern mod` function or standalone `tree`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReturnAbi {
+    /// No declared result: the call's true/false exit is ignored by callers.
+    Void,
+    /// `-> bool`: the call's true/false exit is a boolean value.
+    Bool,
+    /// `-> Result`: true exit = success, false exit = failure (`?` propagates `return error;`).
+    Result,
+    /// `-> T @ temp[N]`: the callee leaves a value in `temp[N]` (true/false exit ignored).
+    Value { ty: V2Type, temp: u8 },
+    /// `-> Result<T @ temp[N]>`: true exit = success with the value in `temp[N]`, false = failure.
+    ResultValue { ty: V2Type, temp: u8 },
+}
+
+/// One callable external BHAV inside an `extern mod` block (`@id(N) fn name(...) -> Abi;`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternFnDecl {
+    pub span: Span,
+    pub id: u16,
+    pub name: String,
+    pub params: Vec<AbiParam>,
+    pub ret: ReturnAbi,
+}
+
+/// External global (`256..=4095`) / semi-global (`8192..`) BHAV bindings (`[pub] extern mod name { ... }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternModDecl {
+    pub span: Span,
+    pub is_pub: bool,
+    pub name: String,
+    pub fns: Vec<ExternFnDecl>,
+}
+
+/// One named external BCON constant (`name @ <address>;` or `name @ <bcon_id>[<entry>];`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternBconEntry {
+    pub span: Span,
+    pub name: String,
+    /// Encoded SimAntics constant operand address (`(table << 7) | entry`).
+    pub address: u16,
+}
+
+/// External constant bindings (`[pub] extern bcon name { entry @ 16521; ... }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternBconDecl {
+    pub span: Span,
+    pub is_pub: bool,
+    pub name: String,
+    pub entries: Vec<ExternBconEntry>,
+}
+
+/// Explicit private BCON table (`bcon 4097 "LampTuning" { cheap = 10, ... }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BconTableDecl {
+    pub span: Span,
+    pub id: u16,
+    pub label: String,
+    pub entries: Vec<(Span, String, i16)>,
+}
+
+/// Standalone non-inlined BHAV (`[@id(N)] tree [ident] ["Label"] [(params)] [-> Abi] { ... }`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeMemberDecl {
+    pub span: Span,
+    pub pinned_id: Option<u16>,
+    /// Call identifier (explicit, or derived in `snake_case` from the label).
+    pub ident: String,
+    /// BHAV chunk label (explicit string, or the identifier).
+    pub label: String,
+    /// `Some(name)` when the first parameter is `name: Sim` (Sim-on-object context).
+    pub sim_binding: Option<String>,
+    pub params: Vec<AbiParam>,
+    pub ret: ReturnAbi,
+    pub body: Vec<V2Stmt>,
 }
 
 /// Zero-cost integer enum declaration (`[pub] enum Name { VariantA, VariantB = 2 }`).
@@ -166,6 +263,10 @@ pub enum ObjectMember {
     Functional(FunctionalDecl),
     Interaction(InteractionDecl),
     Fn(FnDecl),
+    ExternMod(ExternModDecl),
+    ExternBcon(ExternBconDecl),
+    Bcon(BconTableDecl),
+    Tree(TreeMemberDecl),
 }
 
 /// Procedural sprite declaration (`Sprite::procedural("cot", primary: #RRGGBB, ...)`).
@@ -261,6 +362,8 @@ pub struct ParamAssignDecl {
 pub struct StateDecl {
     pub span: Span,
     pub name: String,
+    /// Optional explicit `my.attr[slot]` binding (`state name @ 7: i16;`).
+    pub slot: Option<(Span, u16)>,
     pub ty: StateType,
     pub init: Option<StateInitValue>,
 }
@@ -516,6 +619,13 @@ pub enum V2Stmt {
         span: Span,
         value: Option<V2Expr>,
     },
+    /// `return error;` — exits the whole BHAV through the SimAntics error exit.
+    ReturnError {
+        span: Span,
+        /// Synthesized by `cond?;`: always the error exit, even when a binding named `error`
+        /// is in scope (a written `return error;` then returns that binding instead).
+        from_try: bool,
+    },
     Expr {
         span: Span,
         expr: V2Expr,
@@ -612,6 +722,11 @@ pub enum V2Expr {
         type_args: Vec<V2Type>,
         args: Vec<CallArg>,
     },
+    /// Postfix `expr?`: exits through `return error;` when `expr` is false / fails.
+    Try {
+        span: Span,
+        inner: Box<V2Expr>,
+    },
 }
 
 impl V2Expr {
@@ -631,7 +746,8 @@ impl V2Expr {
             | Self::Unary { span: s, .. }
             | Self::Binary { span: s, .. }
             | Self::Call { span: s, .. }
-            | Self::MethodCall { span: s, .. } => *s,
+            | Self::MethodCall { span: s, .. }
+            | Self::Try { span: s, .. } => *s,
         }
     }
 }

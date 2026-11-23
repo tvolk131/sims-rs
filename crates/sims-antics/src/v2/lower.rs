@@ -13,13 +13,15 @@ use crate::manifest::{
 };
 use crate::parser::{motive_by_name, skill_by_name};
 use crate::v2::ast::{
-    BitflagsDecl, CallArg, ConstIntExpr, EnumDecl, FnDecl, ForEachIter, FunctionalDecl, GuardBody,
-    GuardDecl, InteractionDecl, MatchArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl,
-    ObjectMember, ParamType, ParamValue, SlotDecl, SoundDecl, SpriteDecl, StateDecl,
-    StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, V2AssignOp, V2BinOp, V2Expr,
+    AbiParam, AbiParamSlot, BconTableDecl, BitflagsDecl, CallArg, ConstIntExpr, EnumDecl,
+    ExternBconDecl, ExternModDecl, FnDecl, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
+    InteractionDecl, MatchArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl, ObjectMember,
+    ParamType, ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl, StateInitValue,
+    StateType, StringsDecl, TemplateDecl, TileDecl, TreeMemberDecl, V2AssignOp, V2BinOp, V2Expr,
     V2Stmt, V2Type, V2UnaryOp, object_type_ident,
 };
 use crate::v2::loader::{ModuleScope, ResolvedModule};
+use crate::v2::parser::snake_case_ident;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -77,6 +79,8 @@ struct ResolvedState {
     ty: ValueType,
     init: Option<StateInitValue>,
     span: Span,
+    /// `true` for `state x @ N: T;` without an initializer: `init` leaves `my.attr[N]` untouched.
+    skip_zero_init: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +135,67 @@ struct ResolvedObjectSchema {
     tile_guids: Vec<u32>,
     states: BTreeMap<String, (usize, ValueType)>,
     functionals: BTreeMap<String, ResolvedFunctionalSig>,
+}
+
+/// Resolved return ABI of a callable BHAV (`extern mod` fn or standalone `tree`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedReturnAbi {
+    Void,
+    Bool,
+    Result,
+    Value { ty: ValueType, temp: u8 },
+    ResultValue { ty: ValueType, temp: u8 },
+}
+
+/// Resolved parameter of a callable BHAV.
+#[derive(Debug, Clone)]
+struct ResolvedAbiParam {
+    name: String,
+    ty: ValueType,
+    slot: AbiParamSlot,
+}
+
+/// Fully resolved call signature of an `extern mod` fn or a sibling standalone `tree`.
+#[derive(Debug, Clone)]
+struct CallableSig {
+    /// Human-readable name for diagnostics (`light_globals::init_floor`, `tree 'is_fridge'`).
+    display: String,
+    id: u16,
+    /// `Some(true)` for Sim-on-object trees, `Some(false)` for object-self trees, `None` for externs.
+    sim_context: Option<bool>,
+    params: Vec<ResolvedAbiParam>,
+    ret: ResolvedReturnAbi,
+}
+
+/// Private named BCON table (`bcon 4097 "LampTuning" { ... }`) resolved to operand addresses.
+#[derive(Debug, Clone)]
+struct ResolvedBconTable {
+    id: u16,
+    label: String,
+    /// Entry name -> (operand address `(table << 7) | entry`, compile-time value).
+    entries: BTreeMap<String, (u16, i16)>,
+    /// Declaration-ordered values.
+    values: Vec<(String, i16)>,
+}
+
+/// Standalone `tree` member ready for lowering.
+#[derive(Debug, Clone)]
+struct OwnedTree {
+    owner_module: String,
+    decl: TreeMemberDecl,
+}
+
+/// Generalized "value in `temp[N]`" return ABI used by typed functionals and value-returning trees.
+#[derive(Debug, Clone)]
+struct ValueReturnAbi {
+    ty: ValueType,
+    temp: u8,
+    /// `true` when `return None;` / `return false;` (non-bool `T`) exits through `return false;`.
+    allow_none: bool,
+    /// `true` to lower compound arithmetic returns directly into `temp[N]` when alias/trap-safe.
+    in_place: bool,
+    /// Diagnostic noun (`functional` / `tree`).
+    what: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +349,14 @@ struct ObjectEnv<'a> {
     object_schemas: BTreeMap<String, ResolvedObjectSchema>,
     /// Canonical schema key for the object currently being lowered (`Self`).
     self_object_key: String,
+    /// Object/template-local `extern mod` blocks by name -> (owner module, decl).
+    local_extern_mods: BTreeMap<String, (String, ExternModDecl)>,
+    /// Object/template-local `extern bcon` blocks by name -> (owner module, decl).
+    local_extern_bcons: BTreeMap<String, (String, ExternBconDecl)>,
+    /// Private named BCON tables by reference name (`LampTuning` and `lamp_tuning`).
+    bcon_tables: BTreeMap<String, ResolvedBconTable>,
+    /// Standalone sibling `tree` call signatures by call identifier.
+    trees: BTreeMap<String, CallableSig>,
 }
 
 impl<'a> ObjectEnv<'a> {
@@ -442,6 +515,161 @@ impl<'a> ObjectEnv<'a> {
         }
     }
 
+    fn lookup_extern_mod(
+        &self,
+        owner_module: &str,
+        name: &str,
+        allow_local: bool,
+    ) -> Option<(String, bool, &ExternModDecl)> {
+        if allow_local && let Some((m, decl)) = self.local_extern_mods.get(name) {
+            return Some((m.clone(), true, decl));
+        }
+        self.resolved
+            .module_scopes
+            .get(owner_module)
+            .and_then(|s| s.extern_mods.get(name))
+            .map(|(m, decl)| (m.clone(), false, decl))
+    }
+
+    fn lookup_extern_bcon(
+        &self,
+        owner_module: &str,
+        name: &str,
+        allow_local: bool,
+    ) -> Option<&ExternBconDecl> {
+        if allow_local && let Some((_, decl)) = self.local_extern_bcons.get(name) {
+            return Some(decl);
+        }
+        self.resolved
+            .module_scopes
+            .get(owner_module)
+            .and_then(|s| s.extern_bcons.get(name))
+            .map(|(_, decl)| decl)
+    }
+
+    /// `true` if `name` refers to a private BCON table or `extern bcon` block in this scope.
+    fn is_bcon_table_name(&self, owner_module: &str, name: &str, allow_local: bool) -> bool {
+        (allow_local && self.bcon_tables.contains_key(name))
+            || self
+                .lookup_extern_bcon(owner_module, name, allow_local)
+                .is_some()
+    }
+
+    /// Resolves `table.entry` to its `.air` constant operand and (for private tables) its
+    /// compile-time value. Returns `None` if `table` is not a BCON table name in scope.
+    fn lookup_bcon_entry(
+        &self,
+        owner_module: &str,
+        table: &str,
+        entry: &str,
+        allow_local: bool,
+        span: Span,
+    ) -> Option<Result<(String, Option<i16>)>> {
+        if allow_local && let Some(t) = self.bcon_tables.get(table) {
+            return Some(match t.entries.get(entry) {
+                Some(&(addr, val)) => Ok((format!("bcon[{addr}]"), Some(val))),
+                None => Err(Error::at(
+                    span,
+                    format!(
+                        "BCON table '{}' (BCON {}) has no entry '{entry}'",
+                        t.label, t.id
+                    ),
+                )),
+            });
+        }
+        let decl = self.lookup_extern_bcon(owner_module, table, allow_local)?;
+        Some(match decl.entries.iter().find(|e| e.name == entry) {
+            Some(e) => Ok((format!("bcon[{}]", e.address), None)),
+            None => Err(Error::at(
+                span,
+                format!("extern bcon '{table}' has no entry '{entry}'"),
+            )),
+        })
+    }
+
+    /// Resolves an `extern mod` fn or standalone tree signature's declared types.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_callable_sig(
+        &self,
+        display: String,
+        id: u16,
+        sim_context: Option<bool>,
+        params: &[AbiParam],
+        ret: &ReturnAbi,
+        decl_module: &str,
+        allow_local: bool,
+        span: Span,
+    ) -> Result<CallableSig> {
+        let resolve = |ty: &V2Type, pspan: Span, what: &str| -> Result<ValueType> {
+            self.resolve_value_type(ty, decl_module, allow_local, pspan)
+                .map_err(|_| {
+                    Error::at(
+                        pspan,
+                        format!(
+                            "{what} has unsupported type '{}' in {display} (expected i16, bool, ObjectId, enum, bitflags, or object type)",
+                            ty.display_name()
+                        ),
+                    )
+                })
+        };
+        let mut out_params = Vec::with_capacity(params.len());
+        let mut positional = 0usize;
+        for p in params {
+            let ty = resolve(&p.ty, p.span, &format!("parameter '{}'", p.name))?;
+            if p.slot == AbiParamSlot::Positional {
+                positional += 1;
+            }
+            out_params.push(ResolvedAbiParam {
+                name: p.name.clone(),
+                ty,
+                slot: p.slot,
+            });
+        }
+        if positional > 8 {
+            return Err(Error::at(
+                span,
+                format!(
+                    "{display} declares {positional} positional parameters (SimAntics passes at most 8 via temps)"
+                ),
+            ));
+        }
+        // Positional args passed through `call(temps)` land in `temp[0..positional]`; an explicit
+        // `@ temp[N]` binding inside that window would be overwritten.
+        for p in params {
+            if let AbiParamSlot::Temp(t) = p.slot
+                && usize::from(t) < positional
+            {
+                return Err(Error::at(
+                    p.span,
+                    format!(
+                        "parameter '{}' '@ temp[{t}]' collides with positional parameter #{t} of {display}, which is passed in temp[{t}] by 'call(temps)' (bind explicit temps at or above temp[{positional}])",
+                        p.name
+                    ),
+                ));
+            }
+        }
+        let ret = match ret {
+            ReturnAbi::Void => ResolvedReturnAbi::Void,
+            ReturnAbi::Bool => ResolvedReturnAbi::Bool,
+            ReturnAbi::Result => ResolvedReturnAbi::Result,
+            ReturnAbi::Value { ty, temp } => ResolvedReturnAbi::Value {
+                ty: resolve(ty, span, "return value")?,
+                temp: *temp,
+            },
+            ReturnAbi::ResultValue { ty, temp } => ResolvedReturnAbi::ResultValue {
+                ty: resolve(ty, span, "return value")?,
+                temp: *temp,
+            },
+        };
+        Ok(CallableSig {
+            display,
+            id,
+            sim_context,
+            params: out_params,
+            ret,
+        })
+    }
+
     fn display_value_type(&self, ty: &ValueType) -> String {
         match ty {
             ValueType::I16 => "i16".to_owned(),
@@ -539,17 +767,28 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     let mut functionals: Vec<OwnedFunctional> = Vec::new();
     let mut interactions: Vec<OwnedInteraction> = Vec::new();
     let mut local_fns: BTreeMap<String, (String, FnDecl)> = BTreeMap::new();
+    let mut local_extern_mods: BTreeMap<String, (String, ExternModDecl)> = BTreeMap::new();
+    let mut local_extern_bcons: BTreeMap<String, (String, ExternBconDecl)> = BTreeMap::new();
+    let mut bcon_decls: Vec<BconTableDecl> = Vec::new();
+    let mut tree_members: Vec<OwnedTree> = Vec::new();
+    // Every module that contributes members (templates + the object): helper-fn lookups from any
+    // of their code must not be shadowed by an (inherited) tree ident.
+    let mut member_modules: BTreeSet<String> = BTreeSet::new();
 
     let mut apply_members = |owner_mod: &str,
                              members: &[ObjectMember],
                              is_override: bool|
      -> Result<()> {
+        member_modules.insert(owner_mod.to_owned());
         let mut seen_sounds_here = BTreeSet::new();
         let mut seen_slots_here = BTreeSet::new();
         let mut seen_functionals_here = BTreeSet::new();
         let mut seen_interactions_here = BTreeSet::new();
         let mut seen_fns_here = BTreeSet::new();
         let mut seen_types_here = BTreeSet::new();
+        let mut seen_externs_here = BTreeSet::new();
+        let mut seen_bcons_here = BTreeSet::new();
+        let mut seen_trees_here = BTreeSet::new();
         for member in members {
             match member {
                 ObjectMember::Meta(MetaField { span, kind }) => match kind {
@@ -835,6 +1074,66 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                     }
                     local_fns.insert(f.name.clone(), (owner_mod.to_owned(), f.clone()));
                 }
+                ObjectMember::ExternMod(m) => {
+                    if !seen_externs_here.insert(m.name.clone())
+                        || (local_extern_mods.contains_key(&m.name) && !is_override)
+                        || local_extern_bcons.contains_key(&m.name)
+                    {
+                        return Err(Error::at(
+                            m.span,
+                            format!("duplicate extern block '{}'", m.name),
+                        ));
+                    }
+                    local_extern_mods.insert(m.name.clone(), (owner_mod.to_owned(), m.clone()));
+                }
+                ObjectMember::ExternBcon(b) => {
+                    if !seen_externs_here.insert(b.name.clone())
+                        || (local_extern_bcons.contains_key(&b.name) && !is_override)
+                        || local_extern_mods.contains_key(&b.name)
+                    {
+                        return Err(Error::at(
+                            b.span,
+                            format!("duplicate extern block '{}'", b.name),
+                        ));
+                    }
+                    local_extern_bcons.insert(b.name.clone(), (owner_mod.to_owned(), b.clone()));
+                }
+                ObjectMember::Bcon(t) => {
+                    if !seen_bcons_here.insert(t.id) {
+                        return Err(Error::at(
+                            t.span,
+                            format!("duplicate BCON table id {}", t.id),
+                        ));
+                    }
+                    if let Some(pos) = bcon_decls.iter().position(|d| d.id == t.id) {
+                        if !is_override {
+                            return Err(Error::at(
+                                t.span,
+                                format!("duplicate BCON table id {}", t.id),
+                            ));
+                        }
+                        bcon_decls[pos] = t.clone();
+                    } else {
+                        bcon_decls.push(t.clone());
+                    }
+                }
+                ObjectMember::Tree(t) => {
+                    if !seen_trees_here.insert(t.ident.clone()) {
+                        return Err(Error::at(t.span, format!("duplicate tree '{}'", t.ident)));
+                    }
+                    let owned = OwnedTree {
+                        owner_module: owner_mod.to_owned(),
+                        decl: t.clone(),
+                    };
+                    if let Some(pos) = tree_members.iter().position(|x| x.decl.ident == t.ident) {
+                        if !is_override {
+                            return Err(Error::at(t.span, format!("duplicate tree '{}'", t.ident)));
+                        }
+                        tree_members[pos] = owned;
+                    } else {
+                        tree_members.push(owned);
+                    }
+                }
             }
         }
         Ok(())
@@ -1017,10 +1316,16 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         }
     };
 
-    // 4. Allocate state attribute indices `0..N` with resolved types.
+    // 4. Allocate state attribute indices (explicit `@ slot` states first, then the lowest free
+    // slot in declaration order; without explicit slots this is exactly `0..N`).
+    let state_slots = allocate_state_slots(
+        state_order
+            .iter()
+            .map(|n| (n.as_str(), raw_states[n].slot, raw_states[n].span)),
+    )?;
     let mut states = BTreeMap::new();
     let mut self_schema_states = BTreeMap::new();
-    for (idx, sname) in state_order.iter().enumerate() {
+    for (sname, &idx) in state_order.iter().zip(&state_slots) {
         let s = &raw_states[sname];
         let owner_mod = state_owners
             .get(sname)
@@ -1041,6 +1346,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                 ty: resolved_ty,
                 init: s.init.clone(),
                 span: s.span,
+                skip_zero_init: s.slot.is_some() && s.init.is_none(),
             },
         );
     }
@@ -1166,6 +1472,8 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         slots.insert(sl_name.clone(), (routing_idx, sl));
     }
 
+    let bcon_tables = resolve_bcon_tables(&bcon_decls, &i16_param_order, &local_extern_bcons)?;
+
     let dialog_strings = RefCell::new(DialogStringTable::from_existing(strings.get(&301)));
     let env = ObjectEnv {
         resolved,
@@ -1187,6 +1495,16 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         all_bitflags,
         object_schemas,
         self_object_key,
+        local_extern_mods,
+        local_extern_bcons,
+        bcon_tables,
+        trees: BTreeMap::new(),
+    };
+    let env = {
+        let mut env = env;
+        let tree_sigs = resolve_tree_sigs(&env, &tree_members, &member_modules)?;
+        env.trees = tree_sigs;
+        env
     };
 
     // 7. Allocate deterministic private BHAV IDs (`4096..=8191`), respecting `@id` / `@guard_id`.
@@ -1234,6 +1552,11 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             register_pinned(id, inter.decl.span)?;
         }
     }
+    for t in &tree_members {
+        if let Some(id) = t.decl.pinned_id {
+            register_pinned(id, t.decl.span)?;
+        }
+    }
 
     let mut used_tree_ids = pinned_ids;
     let mut next_tree_id = 4096u16;
@@ -1264,6 +1587,19 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
 
     let init_id = alloc_tree_id(init_pinned_id, Some(4096), obj.span)?;
     let main_id = alloc_tree_id(main_pinned_id, Some(4097), obj.span)?;
+    // Standalone `tree` IDs are allocated up front so bodies (and siblings) can `call` them.
+    let mut tree_ids: BTreeMap<String, u16> = BTreeMap::new();
+    for t in &tree_members {
+        let id = alloc_tree_id(t.decl.pinned_id, None, t.decl.span)?;
+        tree_ids.insert(t.decl.ident.clone(), id);
+    }
+    let env = {
+        let mut env = env;
+        for (ident, sig) in &mut env.trees {
+            sig.id = tree_ids[ident];
+        }
+        env
+    };
 
     // 8. Emit all trees into `trees_air` first so inline dialog strings interned into
     // `env.dialog_strings` are complete before we emit the STR# 301 table at the top!
@@ -1302,6 +1638,22 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         // Auto-initialize all declared states in declaration order.
         for sname in &env.state_order {
             let st = &env.states[sname];
+            if st.skip_zero_init {
+                // `match` lowers the last enum arm as a plain `else`, so an uninitialized explicit
+                // slot (0, or whatever a previous owner left) would silently dispatch to it.
+                if let ValueType::Enum(ref key) = st.ty
+                    && let Some(e) = env.all_enums.get(key)
+                {
+                    return Err(Error::at(
+                        st.span,
+                        format!(
+                            "state '{sname}' @ {} of enum type '{}' requires an explicit initializer (init leaves an explicit slot without one untouched, so it may hold an undeclared value)",
+                            st.attr_index, e.display_name
+                        ),
+                    ));
+                }
+                continue;
+            }
             let owner_mod = state_owners
                 .get(sname)
                 .map_or(resolved.module_id.as_str(), String::as_str);
@@ -1476,7 +1828,13 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             &func.owner_module,
             needs_self_save,
         );
-        ctx.functional_return_type = func_ret_ty;
+        ctx.value_return = func_ret_ty.map(|ty| ValueReturnAbi {
+            ty,
+            temp: 0,
+            allow_none: true,
+            in_place: false,
+            what: "functional",
+        });
         if needs_self_save {
             ctx.line("let __self_obj = stack_obj;".to_owned());
         }
@@ -1672,6 +2030,11 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         });
     }
 
+    // 8h. Standalone `tree` declarations (non-inlined BHAVs callable via `.air` `call`).
+    for t in &tree_members {
+        emit_standalone_tree(&mut trees_air, &env, t)?;
+    }
+
     // 8g. Assemble final `.air` output: header + BCON 4096 + STR# tables (including auto-interned 301) + trees.
     let mut air = String::new();
     let _ = writeln!(
@@ -1681,11 +2044,17 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     );
     if !env.state_order.is_empty() {
         air.push_str("// Attributes: ");
-        for (i, sname) in env.state_order.iter().enumerate() {
+        let mut by_index: Vec<(usize, &String)> = env
+            .state_order
+            .iter()
+            .map(|n| (env.states[n].attr_index, n))
+            .collect();
+        by_index.sort();
+        for (i, (idx, sname)) in by_index.into_iter().enumerate() {
             if i > 0 {
                 air.push_str(", ");
             }
-            let _ = write!(air, "attr[{i}] = {sname}");
+            let _ = write!(air, "attr[{idx}] = {sname}");
         }
         air.push('\n');
     }
@@ -1698,6 +2067,22 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             let _ = writeln!(air, "    {pname} = {val},");
         }
         air.push_str("}\n\n");
+    }
+    // Named private BCON tables: emitted in list form (entries are referenced numerically as
+    // `bcon[(table << 7) | entry]`, so they never enter `.air`'s global BCON name namespace).
+    let mut emitted_tables = BTreeSet::new();
+    for t in env.bcon_tables.values() {
+        if !emitted_tables.insert(t.id) {
+            continue;
+        }
+        let vals: Vec<String> = t.values.iter().map(|(_, v)| v.to_string()).collect();
+        let _ = writeln!(
+            air,
+            "bcon {} \"{}\" = [{}];\n",
+            t.id,
+            escape_str(&t.label),
+            vals.join(", ")
+        );
     }
 
     // Emit STR# tables in deterministic ID order, merging any auto-interned STR# 301 dialog strings.
@@ -1774,7 +2159,13 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         })
         .collect();
 
-    let state_count = u16::try_from(env.state_order.len())
+    let state_count = env
+        .states
+        .values()
+        .map(|st| st.attr_index + 1)
+        .max()
+        .unwrap_or(0);
+    let state_count = u16::try_from(state_count)
         .map_err(|_| Error::at(obj.span, "object declares too many state attributes"))?;
     let num_attributes = match explicit_attributes {
         Some(explicit) => state_count.max(explicit),
@@ -1820,6 +2211,299 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         manifest,
         air_source: air,
     })
+}
+
+/// Built-in v2 call names a standalone `tree` identifier may not shadow.
+const BUILTIN_CALL_NAMES: &[&str] = &[
+    "sleep",
+    "idle",
+    "play_sound",
+    "stop_all_sounds",
+    "debit_funds",
+    "credit_funds",
+    "destroy_self",
+    "set_graphic",
+    "route_to",
+    "snap",
+    "set_motive_change",
+    "clear_motive_changes",
+    "dialog",
+    "random",
+    "can_afford",
+    "find_best_object",
+    "create_object",
+    "objects_of",
+    "Some",
+    "None",
+];
+
+/// Allocates state attribute slots shared by object lowering and imported object schemas.
+///
+/// Explicit `state x @ N: T;` slots are reserved first (overlaps are errors), then every
+/// auto-allocated state takes the lowest free slot in declaration order. Without explicit slots
+/// this is exactly the historical `0..N` layout.
+fn allocate_state_slots<'s>(
+    states: impl IntoIterator<Item = (&'s str, Option<(Span, u16)>, Span)>,
+) -> Result<Vec<usize>> {
+    let states: Vec<_> = states.into_iter().collect();
+    let mut used: BTreeMap<u16, &str> = BTreeMap::new();
+    for &(name, slot, _) in &states {
+        if let Some((sspan, n)) = slot
+            && let Some(other) = used.insert(n, name)
+        {
+            return Err(Error::at(
+                sspan,
+                format!(
+                    "state '{name}' @ {n} overlaps state '{other}' (both bind attribute slot {n})"
+                ),
+            ));
+        }
+    }
+    let mut next = 0u16;
+    let mut out = Vec::with_capacity(states.len());
+    for &(name, slot, span) in &states {
+        let idx = match slot {
+            Some((_, n)) => n,
+            None => {
+                while used.contains_key(&next) {
+                    next += 1;
+                }
+                if next > crate::v2::parser::MAX_STATE_SLOT {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "state '{name}' does not fit in attribute slots 0..={}",
+                            crate::v2::parser::MAX_STATE_SLOT
+                        ),
+                    ));
+                }
+                used.insert(next, name);
+                next
+            }
+        };
+        out.push(usize::from(idx));
+    }
+    Ok(out)
+}
+
+/// Resolves private named BCON tables into operand addresses, keyed by both reference spellings
+/// (`LampTuning` and `lamp_tuning`).
+fn resolve_bcon_tables(
+    decls: &[BconTableDecl],
+    i16_param_order: &[String],
+    local_extern_bcons: &BTreeMap<String, (String, ExternBconDecl)>,
+) -> Result<BTreeMap<String, ResolvedBconTable>> {
+    let mut out: BTreeMap<String, ResolvedBconTable> = BTreeMap::new();
+    for d in decls {
+        if !(4096..=4159).contains(&d.id) {
+            return Err(Error::at(
+                d.span,
+                format!(
+                    "BCON table id {} must be a private BCON chunk id in 4096..=4159 (use 'extern bcon' for global/semi-global constants)",
+                    d.id
+                ),
+            ));
+        }
+        if d.id == 4096 && !i16_param_order.is_empty() {
+            return Err(Error::at(
+                d.span,
+                "BCON 4096 is reserved for this object's i16 params (pick 4097..=4159)",
+            ));
+        }
+        if d.entries.len() > 128 {
+            return Err(Error::at(
+                d.span,
+                format!(
+                    "BCON table '{}' has {} entries (max 128)",
+                    d.label,
+                    d.entries.len()
+                ),
+            ));
+        }
+        let table = d.id - 4096;
+        let mut entries = BTreeMap::new();
+        let mut values = Vec::with_capacity(d.entries.len());
+        for (i, (espan, ename, v)) in d.entries.iter().enumerate() {
+            let entry = u16::try_from(i).expect("<= 128 entries");
+            if entries
+                .insert(ename.clone(), ((table << 7) | entry, *v))
+                .is_some()
+            {
+                return Err(Error::at(
+                    *espan,
+                    format!("duplicate entry '{ename}' in BCON table '{}'", d.label),
+                ));
+            }
+            values.push((ename.clone(), *v));
+        }
+        let resolved = ResolvedBconTable {
+            id: d.id,
+            label: d.label.clone(),
+            entries,
+            values,
+        };
+        let mut names = vec![object_type_ident(&d.label), snake_case_ident(&d.label)];
+        names.dedup();
+        for name in names {
+            if local_extern_bcons.contains_key(&name) {
+                return Err(Error::at(
+                    d.span,
+                    format!(
+                        "BCON table '{}' reference name '{name}' collides with an 'extern bcon' block",
+                        d.label
+                    ),
+                ));
+            }
+            if let Some(prev) = out.insert(name.clone(), resolved.clone()) {
+                return Err(Error::at(
+                    d.span,
+                    format!(
+                        "BCON table '{}' reference name '{name}' collides with BCON table '{}' (BCON {})",
+                        d.label, prev.label, prev.id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Resolves standalone `tree` call signatures (IDs are filled in after allocation).
+fn resolve_tree_sigs(
+    env: &ObjectEnv<'_>,
+    trees: &[OwnedTree],
+    member_modules: &BTreeSet<String>,
+) -> Result<BTreeMap<String, CallableSig>> {
+    let mut out = BTreeMap::new();
+    for t in trees {
+        let d = &t.decl;
+        if BUILTIN_CALL_NAMES.contains(&d.ident.as_str()) {
+            return Err(Error::at(
+                d.span,
+                format!("tree '{}' shadows the built-in '{}()'", d.ident, d.ident),
+            ));
+        }
+        if let Some(m) = std::iter::once(&t.owner_module)
+            .chain(member_modules)
+            .find(|m| env.lookup_fn(m, &d.ident, true).is_some())
+        {
+            return Err(Error::at(
+                d.span,
+                format!(
+                    "tree '{}' collides with helper function '{}' in scope (module '{m}')",
+                    d.ident, d.ident
+                ),
+            ));
+        }
+        let mut sig = env.resolve_callable_sig(
+            format!("tree '{}'", d.ident),
+            0,
+            Some(d.sim_binding.is_some()),
+            &d.params,
+            &d.ret,
+            &t.owner_module,
+            true,
+            d.span,
+        )?;
+        // A tree without `->` is a plain SimAntics check/action tree: it exits true/false
+        // (`return true;` by default), so callers may test it like a `-> bool` tree.
+        if sig.ret == ResolvedReturnAbi::Void {
+            sig.ret = ResolvedReturnAbi::Bool;
+        }
+        out.insert(d.ident.clone(), sig);
+    }
+    Ok(out)
+}
+
+/// Lowers and emits one standalone `tree` member as a real (non-inlined) BHAV.
+fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTree) -> Result<()> {
+    let d = &t.decl;
+    let sig = &env.trees[&d.ident];
+    let must_return = matches!(
+        d.ret,
+        ReturnAbi::Bool | ReturnAbi::Value { .. } | ReturnAbi::ResultValue { .. }
+    );
+    if must_return && !stmts_always_return(&d.body, env, &t.owner_module, true) {
+        return Err(Error::at(
+            d.span,
+            format!(
+                "tree '{}' declares a return value and must return on all control-flow paths",
+                d.ident
+            ),
+        ));
+    }
+    let (tree_ctx, needs_self_save) = match &d.sim_binding {
+        Some(sim) => (
+            TreeContext::SimOnObject {
+                sim_name: sim.clone(),
+            },
+            stmts_may_clobber_stack_obj(&d.body, env, &t.owner_module, true, Some(sim), 0),
+        ),
+        None => (TreeContext::ObjectSelf, false),
+    };
+    let mut ctx = TreeLowerer::new(env, tree_ctx, &t.owner_module, needs_self_save);
+    match &sig.ret {
+        ResolvedReturnAbi::Value { ty, temp } | ResolvedReturnAbi::ResultValue { ty, temp } => {
+            ctx.value_return = Some(ValueReturnAbi {
+                ty: ty.clone(),
+                temp: *temp,
+                // `Result<T @ temp[N]>` trees take the false exit with `return None;` (or
+                // `return false;` when T is not bool), so a caller's `?` runs its own cleanups.
+                allow_none: matches!(sig.ret, ResolvedReturnAbi::ResultValue { .. }),
+                in_place: true,
+                what: "tree",
+            });
+        }
+        _ => {}
+    }
+    if needs_self_save {
+        ctx.line("let __self_obj = stack_obj;".to_owned());
+    }
+    // Temp-bound params are snapshotted into locals at entry (temps are shared with callees).
+    let mut positional = 0usize;
+    for p in &sig.params {
+        match p.slot {
+            AbiParamSlot::Positional => {
+                ctx.bind_var(
+                    p.name.clone(),
+                    Binding::BhavParam {
+                        index: positional,
+                        ty: p.ty.clone(),
+                    },
+                );
+                positional += 1;
+            }
+            AbiParamSlot::Temp(n) => {
+                let local = ctx.fresh(&format!("p_{}", p.name));
+                ctx.line(format!("let {local} = temp[{n}];"));
+                ctx.bind_var(
+                    p.name.clone(),
+                    Binding::Local {
+                        air_name: local,
+                        ty: p.ty.clone(),
+                    },
+                );
+            }
+        }
+    }
+    ctx.lower_stmts(&d.body)?;
+    if !stmts_always_return(&d.body, env, &t.owner_module, true) {
+        ctx.emit_all_cleanups()?;
+        ctx.line("return true;".to_owned());
+    }
+    let label = escape_str(&d.label);
+    if positional == 0 {
+        let _ = writeln!(trees_air, "tree {} \"{label}\" {{", sig.id);
+    } else {
+        let _ = writeln!(
+            trees_air,
+            "tree {} \"{label}\" (args: {positional}) {{",
+            sig.id
+        );
+    }
+    trees_air.push_str(&ctx.finish());
+    trees_air.push_str("}\n\n");
+    Ok(())
 }
 
 fn sprite_decl_to_spec(sp: SpriteDecl) -> SpriteSpec {
@@ -1949,8 +2633,13 @@ fn build_object_schema(
         }
     };
 
+    let state_slots = allocate_state_slots(
+        raw_states
+            .iter()
+            .map(|(_, n, d)| (n.as_str(), d.slot, d.span)),
+    )?;
     let mut states = BTreeMap::new();
-    for (idx, (m_owner, sname, sdecl)) in raw_states.into_iter().enumerate() {
+    for ((m_owner, sname, sdecl), idx) in raw_states.into_iter().zip(state_slots) {
         let vty = match &sdecl.ty {
             StateType::Bool => ValueType::Bool,
             StateType::I16 => ValueType::I16,
@@ -2448,8 +3137,9 @@ struct TreeLowerer<'a> {
     /// touches `stack_obj` for a foreign object access, so `finish()` preserves the incoming
     /// `stack_obj` (e.g. the cancelling Sim in `cleanup` / OBJf 4) into `__saved_stack_obj`.
     used_saved_stack_obj: bool,
-    /// Non-`None` when lowering a typed value-returning `functional kind(...) -> T` body.
-    functional_return_type: Option<ValueType>,
+    /// Non-`None` when lowering a body that returns a value in `temp[N]` (typed
+    /// `functional kind(...) -> T` or a standalone `tree ... -> T @ temp[N]`).
+    value_return: Option<ValueReturnAbi>,
     out: String,
     indent: usize,
     next_id: usize,
@@ -2483,7 +3173,7 @@ impl<'a> TreeLowerer<'a> {
             in_object_scope: true,
             has_self_obj_local,
             used_saved_stack_obj: false,
-            functional_return_type: None,
+            value_return: None,
             out: String::new(),
             indent: 1,
             next_id: 0,
@@ -2542,6 +3232,513 @@ impl<'a> TreeLowerer<'a> {
         let res = f(self);
         self.owner_module = prev;
         res
+    }
+
+    /// Resolves a `tree_ident(...)` / `extern_mod::fn_name(...)` call target, if `callee` is one.
+    fn resolve_callable(&self, callee: &V2Expr, span: Span) -> Result<Option<CallableSig>> {
+        match callee {
+            V2Expr::Ident(_, name) => {
+                if self.in_object_scope
+                    && let Some(sig) = self.env.trees.get(name)
+                {
+                    return Ok(Some(sig.clone()));
+                }
+                Ok(None)
+            }
+            V2Expr::Path(_, segs) if segs.len() == 2 => {
+                let Some((decl_mod, is_local, decl)) =
+                    self.env
+                        .lookup_extern_mod(&self.owner_module, &segs[0], self.in_object_scope)
+                else {
+                    return Ok(None);
+                };
+                let f = decl.fns.iter().find(|f| f.name == segs[1]).ok_or_else(|| {
+                    Error::at(
+                        span,
+                        format!("extern mod '{}' has no fn '{}'", segs[0], segs[1]),
+                    )
+                })?;
+                self.env
+                    .resolve_callable_sig(
+                        format!("{}::{}", segs[0], segs[1]),
+                        f.id,
+                        None,
+                        &f.params,
+                        &f.ret,
+                        &decl_mod,
+                        is_local,
+                        f.span,
+                    )
+                    .map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Evaluates call arguments, writes `@ temp[N]` / `call(temps)` operands, and returns the
+    /// `.air` call text (`call ID`, `call ID(1, 2)`, or `call ID(temps)`).
+    fn prepare_callable_call(
+        &mut self,
+        sig: &CallableSig,
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<String> {
+        let mut args = args;
+        match sig.sim_context {
+            Some(true) => {
+                if !matches!(self.tree_ctx, TreeContext::SimOnObject { .. }) {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "{} runs in the Sim-on-object context and can only be called from interactions, functionals, or other Sim trees",
+                            sig.display
+                        ),
+                    ));
+                }
+                let first_is_sim = args.first().is_some_and(|a| {
+                    a.name.is_none()
+                        && matches!(&a.value, V2Expr::Ident(_, n) if self.is_sim_ident(n))
+                });
+                if !first_is_sim {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "{} expects the Sim handle as its first argument",
+                            sig.display
+                        ),
+                    ));
+                }
+                args = &args[1..];
+            }
+            Some(false) if !matches!(self.tree_ctx, TreeContext::ObjectSelf) => {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "{} runs in the object's own context (it has no Sim parameter) and can only be called from init/main/load/reset/cleanup or other object trees",
+                        sig.display
+                    ),
+                ));
+            }
+            Some(false) | None => {}
+        }
+
+        // Match arguments to parameters (positional first, then by name).
+        let n = sig.params.len();
+        let mut slots: Vec<Option<&V2Expr>> = vec![None; n];
+        // Parameter indices in source (evaluation) order.
+        let mut source_order: Vec<usize> = Vec::with_capacity(n);
+        let mut next_pos = 0usize;
+        let mut seen_named = false;
+        for a in args {
+            match &a.name {
+                None => {
+                    if seen_named {
+                        return Err(Error::at(
+                            a.span,
+                            format!(
+                                "positional argument after named argument in call to {}",
+                                sig.display
+                            ),
+                        ));
+                    }
+                    if next_pos >= n {
+                        return Err(Error::at(
+                            a.span,
+                            format!("{} takes {n} argument(s), but more were given", sig.display),
+                        ));
+                    }
+                    slots[next_pos] = Some(&a.value);
+                    source_order.push(next_pos);
+                    next_pos += 1;
+                }
+                Some(name) => {
+                    seen_named = true;
+                    let idx = sig
+                        .params
+                        .iter()
+                        .position(|p| &p.name == name)
+                        .ok_or_else(|| {
+                            Error::at(
+                                a.span,
+                                format!("{} has no parameter named '{name}'", sig.display),
+                            )
+                        })?;
+                    if slots[idx].is_some() {
+                        return Err(Error::at(
+                            a.span,
+                            format!(
+                                "duplicate argument for parameter '{name}' of {}",
+                                sig.display
+                            ),
+                        ));
+                    }
+                    slots[idx] = Some(&a.value);
+                    source_order.push(idx);
+                }
+            }
+        }
+        let mut values: Vec<&V2Expr> = Vec::with_capacity(n);
+        for (i, slot) in slots.into_iter().enumerate() {
+            values.push(slot.ok_or_else(|| {
+                Error::at(
+                    span,
+                    format!(
+                        "missing argument '{}' in call to {}",
+                        sig.params[i].name, sig.display
+                    ),
+                )
+            })?);
+        }
+
+        // Evaluate operands left to right in source order (named arguments may be reordered). An
+        // operand is snapshotted into a fresh local when it reads a temp (about to be overwritten)
+        // or a later-evaluated argument may run code (calls, foreign reads) that could change it.
+        let mut operands: Vec<(String, Option<i16>)> = vec![(String::new(), None); n];
+        for (k, &i) in source_order.iter().enumerate() {
+            let expr = values[i];
+            let (air, ty) = self.lower_value_expr(expr)?;
+            let pty = &sig.params[i].ty;
+            if !types_compatible_for_assign(pty, &ty) {
+                return Err(Error::at(
+                    expr.span(),
+                    format!(
+                        "argument '{}' of {} expects '{}', found '{}'",
+                        sig.params[i].name,
+                        sig.display,
+                        self.env.display_value_type(pty),
+                        self.env.display_value_type(&ty)
+                    ),
+                ));
+            }
+            let const_val = air.parse::<i16>().ok().or_else(|| {
+                self.try_const_i16_air_operand(expr)
+                    .ok()
+                    .flatten()
+                    .map(|(_, v)| v)
+            });
+            let later_impure = source_order[k + 1..]
+                .iter()
+                .any(|&j| !self.is_pure_single_operand(values[j]));
+            // A runtime (`extern bcon`) read can fault on a missing chunk: read it now, in source
+            // order, so a fault cannot follow a partial temp staging or an out-of-order read.
+            let may_fault = air.starts_with("bcon[");
+            operands[i] =
+                if const_val.is_none() && (air.contains("temp[") || later_impure || may_fault) {
+                    let snap = self.fresh("arg");
+                    self.line(format!("let {snap} = {air};"));
+                    (snap, None)
+                } else {
+                    (air, const_val)
+                };
+        }
+
+        let positional: Vec<usize> = (0..n)
+            .filter(|&i| sig.params[i].slot == AbiParamSlot::Positional)
+            .collect();
+        let literals: Option<Vec<i16>> = if positional.len() <= 4 {
+            positional.iter().map(|&i| operands[i].1).collect()
+        } else {
+            None
+        };
+        let literals = literals.filter(|l| !(l.len() == 4 && l.iter().all(|&v| v == -1)));
+        for (i, p) in sig.params.iter().enumerate() {
+            let dst = match p.slot {
+                AbiParamSlot::Temp(t) => usize::from(t),
+                AbiParamSlot::Positional if literals.is_some() => continue,
+                AbiParamSlot::Positional => positional
+                    .iter()
+                    .position(|&x| x == i)
+                    .expect("positional index"),
+            };
+            let op = operands[i].0.clone();
+            self.line(format!("temp[{dst}] := {op};"));
+        }
+        Ok(match literals {
+            Some(l) if l.is_empty() => format!("call {}", sig.id),
+            Some(l) => {
+                let parts: Vec<String> = l.iter().map(i16::to_string).collect();
+                format!("call {}({})", sig.id, parts.join(", "))
+            }
+            None => format!("call {}(temps)", sig.id),
+        })
+    }
+
+    /// Emits `if !<call> { <all cleanups> return error; }` for `?` propagation.
+    fn emit_try_fail_branch(&mut self, call: &str, span: Span) -> Result<()> {
+        if self.in_defer() {
+            return Err(Error::at(span, "'?' cannot exit out of a 'defer' block"));
+        }
+        self.line(format!("if !{call} {{"));
+        self.indent += 1;
+        self.emit_cleanups_down_to(0)?;
+        self.line("return error;".to_owned());
+        self.indent -= 1;
+        self.line("}".to_owned());
+        Ok(())
+    }
+
+    /// Lowers a callable used as a statement (`f(..);` or `f(..)?;`).
+    fn emit_callable_stmt(
+        &mut self,
+        sig: &CallableSig,
+        args: &[CallArg],
+        span: Span,
+        is_try: bool,
+    ) -> Result<()> {
+        match (&sig.ret, is_try) {
+            (ResolvedReturnAbi::Result | ResolvedReturnAbi::ResultValue { .. }, false) => {
+                Err(Error::at(
+                    span,
+                    format!(
+                        "unused Result from {}: propagate failure with '?' or test it with 'if'",
+                        sig.display
+                    ),
+                ))
+            }
+            (ResolvedReturnAbi::Void | ResolvedReturnAbi::Value { .. }, true) => Err(Error::at(
+                span,
+                format!(
+                    "'?' needs a call returning 'bool' or 'Result', but {} does not",
+                    sig.display
+                ),
+            )),
+            (_, false) => {
+                // Both exits continue: the result (if any) is ignored.
+                let call = self.prepare_callable_call(sig, args, span)?;
+                self.line(format!("if {call} {{"));
+                self.line("}".to_owned());
+                Ok(())
+            }
+            (_, true) => {
+                let call = self.prepare_callable_call(sig, args, span)?;
+                self.emit_try_fail_branch(&call, span)
+            }
+        }
+    }
+
+    /// Lowers a callable in value position. With `raw`, a `temp[N]` result is returned as-is
+    /// (the caller must consume it before anything else can run).
+    fn lower_callable_value(
+        &mut self,
+        sig: &CallableSig,
+        args: &[CallArg],
+        span: Span,
+        is_try: bool,
+        raw: bool,
+    ) -> Result<(String, ValueType)> {
+        match (&sig.ret, is_try) {
+            (ResolvedReturnAbi::Value { ty, temp }, false) => {
+                let (ty, temp) = (ty.clone(), *temp);
+                let call = self.prepare_callable_call(sig, args, span)?;
+                self.line(format!("if {call} {{"));
+                self.line("}".to_owned());
+                Ok((self.capture_temp(temp, raw), ty))
+            }
+            (ResolvedReturnAbi::ResultValue { ty, temp }, true) => {
+                let (ty, temp) = (ty.clone(), *temp);
+                let call = self.prepare_callable_call(sig, args, span)?;
+                self.emit_try_fail_branch(&call, span)?;
+                Ok((self.capture_temp(temp, raw), ty))
+            }
+            (ResolvedReturnAbi::Bool, false) => {
+                let call = self.prepare_callable_call(sig, args, span)?;
+                let tmp = self.fresh("call");
+                self.line(format!("let {tmp} = 0;"));
+                self.line(format!("if {call} {{"));
+                self.indent += 1;
+                self.line(format!("{tmp} := 1;"));
+                self.indent -= 1;
+                self.line("}".to_owned());
+                Ok((tmp, ValueType::Bool))
+            }
+            (ResolvedReturnAbi::Result | ResolvedReturnAbi::ResultValue { .. }, false) => {
+                Err(Error::at(
+                    span,
+                    format!(
+                        "{} returns a Result: unwrap it with '?' or test it with 'if'",
+                        sig.display
+                    ),
+                ))
+            }
+            (ResolvedReturnAbi::Void, false) => Err(Error::at(
+                span,
+                format!("{} does not return a value", sig.display),
+            )),
+            (_, true) => Err(Error::at(
+                span,
+                format!(
+                    "'?' in value position needs a call returning 'Result<T @ temp[N]>', but {} does not",
+                    sig.display
+                ),
+            )),
+        }
+    }
+
+    fn capture_temp(&mut self, temp: u8, raw: bool) -> String {
+        if raw {
+            return format!("temp[{temp}]");
+        }
+        let tmp = self.fresh("xret");
+        self.line(format!("let {tmp} = temp[{temp}];"));
+        tmp
+    }
+
+    /// If `expr` is a value-returning callable (`f(..)` with `-> T @ temp[N]`, or `f(..)?` with
+    /// `-> Result<T @ temp[N]>`), lowers the call and returns the raw `temp[N]` operand.
+    fn try_lower_callable_value_raw(
+        &mut self,
+        expr: &V2Expr,
+    ) -> Result<Option<(String, ValueType)>> {
+        let (call_expr, is_try) = match expr {
+            V2Expr::Try { inner, .. } => (inner.as_ref(), true),
+            other => (other, false),
+        };
+        let V2Expr::Call {
+            span,
+            callee,
+            type_args,
+            args,
+        } = call_expr
+        else {
+            return Ok(None);
+        };
+        if !type_args.is_empty() {
+            return Ok(None);
+        }
+        let Some(sig) = self.resolve_callable(callee, *span)? else {
+            return Ok(None);
+        };
+        if !matches!(
+            (&sig.ret, is_try),
+            (ResolvedReturnAbi::Value { .. }, false)
+                | (ResolvedReturnAbi::ResultValue { .. }, true)
+        ) {
+            return Ok(None);
+        }
+        self.lower_callable_value(&sig, args, *span, is_try, true)
+            .map(Some)
+    }
+
+    /// `true` if `name` names a BCON table / `extern bcon` block in scope. Table names take
+    /// priority over same-named variables (matching the `stack_obj` clobber analysis); only the
+    /// `self` / Sim handles are never treated as tables.
+    fn is_bcon_table_ref(&self, name: &str) -> bool {
+        !self.is_self_ident(name)
+            && !self.is_sim_ident(name)
+            && self
+                .env
+                .is_bcon_table_name(&self.owner_module, name, self.in_object_scope)
+    }
+
+    /// Resolves `Table.entry` to its `bcon[addr]` operand (and compile-time value for private
+    /// tables). `None` if `expr` is not a BCON table entry reference.
+    fn bcon_field_ref(&self, expr: &V2Expr) -> Option<Result<(String, Option<i16>)>> {
+        let V2Expr::Field { span, base, field } = expr else {
+            return None;
+        };
+        let V2Expr::Ident(_, bname) = base.as_ref() else {
+            return None;
+        };
+        if !self.is_bcon_table_ref(bname) {
+            return None;
+        }
+        self.env.lookup_bcon_entry(
+            &self.owner_module,
+            bname,
+            field,
+            self.in_object_scope,
+            *span,
+        )
+    }
+
+    /// Lowers `return [expr];` inside a body that returns its value in `temp[N]`.
+    fn lower_value_return(
+        &mut self,
+        span: Span,
+        value: Option<&V2Expr>,
+        abi: &ValueReturnAbi,
+    ) -> Result<()> {
+        let expected_ty = abi.ty.clone();
+        let dest = format!("temp[{}]", abi.temp);
+        let Some(raw_expr) = value else {
+            return Err(Error::at(
+                span,
+                if abi.allow_none {
+                    format!(
+                        "{} declaring '-> {}' must return a value (or 'return false;' / 'return None;' on failure)",
+                        abi.what,
+                        self.env.display_value_type(&expected_ty)
+                    )
+                } else {
+                    format!(
+                        "{} declaring '-> {} @ {dest}' must return a value",
+                        abi.what,
+                        self.env.display_value_type(&expected_ty)
+                    )
+                },
+            ));
+        };
+        if abi.allow_none
+            && (matches!(raw_expr, V2Expr::Ident(_, n) if n == "None" && self.lookup_var(n).is_none())
+                || (matches!(raw_expr, V2Expr::Bool(_, false)) && expected_ty != ValueType::Bool))
+        {
+            self.emit_all_cleanups()?;
+            self.line("return false;".to_owned());
+            return Ok(());
+        }
+        let inner_expr = match raw_expr {
+            V2Expr::Call {
+                callee,
+                type_args,
+                args,
+                ..
+            } if abi.allow_none
+                && type_args.is_empty()
+                && args.len() == 1
+                && args[0].name.is_none()
+                && matches!(callee.as_ref(), V2Expr::Ident(_, s) if s == "Some") =>
+            {
+                &args[0].value
+            }
+            other => other,
+        };
+        let type_err = |this: &Self, val_ty: &ValueType| {
+            Error::at(
+                span,
+                format!(
+                    "{} returning '{}' cannot return '{}' expression",
+                    abi.what,
+                    this.env.display_value_type(&expected_ty),
+                    this.env.display_value_type(val_ty)
+                ),
+            )
+        };
+        if abi.in_place
+            && !self.has_active_cleanups()
+            && is_compound_arith_or_neg(inner_expr)
+            && self.can_lower_arith_in_place(&dest, inner_expr, false)
+        {
+            let val_ty = self.lower_arith_into_dest(inner_expr, &dest, false)?;
+            if !types_compatible_for_assign(&expected_ty, &val_ty) {
+                return Err(type_err(self, &val_ty));
+            }
+            self.line("return true;".to_owned());
+            return Ok(());
+        }
+        let (val_air, val_ty) = self.lower_value_expr(inner_expr)?;
+        if !types_compatible_for_assign(&expected_ty, &val_ty) {
+            return Err(type_err(self, &val_ty));
+        }
+        if self.has_active_cleanups() {
+            let ret_snap = self.fresh("fret");
+            self.line(format!("let {ret_snap} = {val_air};"));
+            self.emit_all_cleanups()?;
+            self.line(format!("{dest} := {ret_snap};"));
+        } else {
+            self.line(format!("{dest} := {val_air};"));
+        }
+        self.line("return true;".to_owned());
+        Ok(())
     }
 
     fn bind_var(&mut self, name: String, binding: Binding) {
@@ -2788,6 +3985,9 @@ impl<'a> TreeLowerer<'a> {
                 let air_name = self.fresh(&format!("v_{name}"));
                 let inferred_ty = if is_compound_arith_or_neg(init) {
                     self.lower_arith_into_dest(init, &air_name, true)?
+                } else if let Some((val_air, inferred)) = self.try_lower_callable_value_raw(init)? {
+                    self.line(format!("let {air_name} = {val_air};"));
+                    inferred
                 } else {
                     let (val_air, inferred) = self.lower_value_expr(init)?;
                     self.line(format!("let {air_name} = {val_air};"));
@@ -2873,7 +4073,16 @@ impl<'a> TreeLowerer<'a> {
                     }
                     return Ok(());
                 }
-                let (val_air, val_ty) = self.lower_value_expr(value)?;
+                // A value-returning call into a plain (non-foreign) target reads `temp[N]` directly.
+                let raw_call = if matches!(lval, LValue::Direct { .. }) {
+                    self.try_lower_callable_value_raw(value)?
+                } else {
+                    None
+                };
+                let (val_air, val_ty) = match raw_call {
+                    Some(r) => r,
+                    None => self.lower_value_expr(value)?,
+                };
                 if *op != V2AssignOp::Set {
                     match &target_ty {
                         ValueType::Bool => {
@@ -3375,71 +4584,12 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
 
-                // Value-returning `functional kind(...) -> T` tree:
-                // `return None;` / `return false;` (for non-bool T) exits with `return false;`
-                // `return Some(expr);` / `return expr;` writes `temp[0] := val;` and exits `return true;`
-                if let Some(expected_ty) = self.functional_return_type.clone() {
-                    match value {
-                        None => {
-                            return Err(Error::at(
-                                *span,
-                                format!(
-                                    "functional declaring '-> {}' must return a value (or 'return false;' / 'return None;' on failure)",
-                                    self.env.display_value_type(&expected_ty)
-                                ),
-                            ));
-                        }
-                        Some(V2Expr::Ident(_, n)) if n == "None" => {
-                            self.emit_all_cleanups()?;
-                            self.line("return false;".to_owned());
-                            return Ok(());
-                        }
-                        Some(V2Expr::Bool(_, false)) if expected_ty != ValueType::Bool => {
-                            self.emit_all_cleanups()?;
-                            self.line("return false;".to_owned());
-                            return Ok(());
-                        }
-                        Some(raw_expr) => {
-                            let inner_expr = match raw_expr {
-                                V2Expr::Call {
-                                    callee,
-                                    type_args,
-                                    args,
-                                    ..
-                                } if type_args.is_empty()
-                                    && args.len() == 1
-                                    && args[0].name.is_none()
-                                    && matches!(callee.as_ref(), V2Expr::Ident(_, s) if s == "Some") =>
-                                {
-                                    &args[0].value
-                                }
-                                other => other,
-                            };
-                            let (val_air, val_ty) = self.lower_value_expr(inner_expr)?;
-                            if !types_compatible_for_assign(&expected_ty, &val_ty) {
-                                return Err(Error::at(
-                                    *span,
-                                    format!(
-                                        "functional returning '{}' cannot return '{}' expression",
-                                        self.env.display_value_type(&expected_ty),
-                                        self.env.display_value_type(&val_ty)
-                                    ),
-                                ));
-                            }
-                            if self.has_active_cleanups() {
-                                let ret_snap = self.fresh("fret");
-                                self.line(format!("let {ret_snap} = {val_air};"));
-                                self.emit_all_cleanups()?;
-                                self.line(format!("temp[0] := {ret_snap};"));
-                            } else {
-                                self.line(format!("temp[0] := {val_air};"));
-                            }
-                            self.line("return true;".to_owned());
-                            return Ok(());
-                        }
-                    }
+                // Value-returning `functional kind(...) -> T` tree / `tree ... -> T @ temp[N]`:
+                // `return None;` / `return false;` (functionals, non-bool T) exits with `return false;`
+                // `return Some(expr);` / `return expr;` writes `temp[N] := val;` and exits `return true;`
+                if let Some(abi) = self.value_return.clone() {
+                    return self.lower_value_return(*span, value.as_ref(), &abi);
                 }
-
                 match value {
                     None => {
                         self.emit_all_cleanups()?;
@@ -3479,6 +4629,30 @@ impl<'a> TreeLowerer<'a> {
                         }
                     }
                 }
+            }
+            V2Stmt::ReturnError { span, from_try } => {
+                // A written `return error;` with `error` bound as a local/param/i16 or bool param
+                // keeps its pre-v2-interop meaning (returns that value). `cond?;` always errors.
+                if !*from_try
+                    && (self.lookup_var("error").is_some()
+                        || self.env.i16_params.contains_key("error")
+                        || self.env.bool_params.contains_key("error"))
+                {
+                    return self.lower_stmt(&V2Stmt::Return {
+                        span: *span,
+                        value: Some(V2Expr::Ident(*span, "error".to_owned())),
+                    });
+                }
+                if self.in_defer() {
+                    return Err(Error::at(
+                        *span,
+                        "'return error;' cannot exit out of a 'defer' block",
+                    ));
+                }
+                // Exits the whole BHAV (even from an inlined helper), so every active cleanup runs.
+                self.emit_cleanups_down_to(0)?;
+                self.line("return error;".to_owned());
+                Ok(())
             }
             V2Stmt::Expr { span: _, expr } => self.lower_expr_stmt(expr),
             V2Stmt::RawAir { span, code } => {
@@ -4331,6 +5505,39 @@ impl<'a> TreeLowerer<'a> {
 
     fn lower_expr_stmt(&mut self, expr: &V2Expr) -> Result<()> {
         match expr {
+            V2Expr::Try { span, inner } => {
+                // Checked up front: the generic desugaring below may constant-fold its error
+                // branch away before `return error;` would report it.
+                if self.in_defer() {
+                    return Err(Error::at(*span, "'?' cannot exit out of a 'defer' block"));
+                }
+                if let V2Expr::Call {
+                    span: cspan,
+                    callee,
+                    type_args,
+                    args,
+                } = inner.as_ref()
+                    && type_args.is_empty()
+                    && let Some(sig) = self.resolve_callable(callee, *cspan)?
+                {
+                    return self.emit_callable_stmt(&sig, args, *cspan, true);
+                }
+                // Generic `cond?;` on a bool expression: `if !cond { return error; }`.
+                let desugared = V2Stmt::If {
+                    span: *span,
+                    cond: V2Expr::Unary {
+                        span: *span,
+                        op: V2UnaryOp::Not,
+                        inner: inner.clone(),
+                    },
+                    then_body: vec![V2Stmt::ReturnError {
+                        span: *span,
+                        from_try: true,
+                    }],
+                    else_body: Vec::new(),
+                };
+                self.lower_stmt(&desugared)
+            }
             V2Expr::Call {
                 span,
                 callee,
@@ -4342,6 +5549,9 @@ impl<'a> TreeLowerer<'a> {
                         *span,
                         "type arguments are only supported on 'create_object::<T>', 'find_best_object::<T>', and 'objects_of::<T>'",
                     ));
+                }
+                if let Some(sig) = self.resolve_callable(callee, *span)? {
+                    return self.emit_callable_stmt(&sig, args, *span, false);
                 }
                 if let V2Expr::Ident(_, fname) = callee.as_ref() {
                     match fname.as_str() {
@@ -4367,16 +5577,54 @@ impl<'a> TreeLowerer<'a> {
                             return Ok(());
                         }
                         "destroy_self" => {
-                            if !args.is_empty() {
-                                return Err(Error::at(*span, "destroy_self() takes no arguments"));
+                            let mut flags = 0u8;
+                            for a in args {
+                                let Some(aname) = &a.name else {
+                                    return Err(Error::at(
+                                        a.span,
+                                        "destroy_self() only takes named options ('flags:', 'no_yield:', 'skip_resets:')",
+                                    ));
+                                };
+                                match aname.as_str() {
+                                    "flags" => {
+                                        let v = self.eval_const_i16(&a.value)?;
+                                        flags |= u8::try_from(v).map_err(|_| {
+                                            Error::at(
+                                                a.span,
+                                                format!(
+                                                    "destroy_self flags {v} out of range 0..=255"
+                                                ),
+                                            )
+                                        })?;
+                                    }
+                                    "no_yield" => {
+                                        if self.eval_const_bool_required(&a.value, a.span)? {
+                                            flags |= 1;
+                                        }
+                                    }
+                                    "skip_resets" => {
+                                        if self.eval_const_bool_required(&a.value, a.span)? {
+                                            flags |= 2;
+                                        }
+                                    }
+                                    other => {
+                                        return Err(Error::at(
+                                            a.span,
+                                            format!(
+                                                "unknown destroy_self option '{other}' (expected 'flags', 'no_yield', or 'skip_resets')"
+                                            ),
+                                        ));
+                                    }
+                                }
                             }
-                            match self.tree_ctx {
-                                TreeContext::ObjectSelf => {
-                                    self.line("remove_object(me);".to_owned())
-                                }
-                                TreeContext::SimOnObject { .. } => {
-                                    self.line("remove_object(stack_obj);".to_owned())
-                                }
+                            let target = match self.tree_ctx {
+                                TreeContext::ObjectSelf => "me",
+                                TreeContext::SimOnObject { .. } => "stack_obj",
+                            };
+                            if flags == 0 {
+                                self.line(format!("remove_object({target});"));
+                            } else {
+                                self.line(format!("remove_object({target}, flags: {flags});"));
                             }
                             return Ok(());
                         }
@@ -5386,6 +6634,13 @@ impl<'a> TreeLowerer<'a> {
                 }
             },
             V2Expr::Field { span, base, field } => {
+                if let Some(r) = self.bcon_field_ref(expr) {
+                    r?;
+                    return Err(Error::at(
+                        *span,
+                        "BCON constants are read-only (cannot assign to a BCON table entry)",
+                    ));
+                }
                 // `sim.motive.energy`, `sim.skill.cooking`, `self.<state>`, `self.graphic`, etc.
                 if let V2Expr::Field {
                     base: root,
@@ -5941,9 +7196,15 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Index { base, index, .. } => {
                 self.expr_may_trap_arith(base) || self.expr_may_trap_arith(index)
             }
-            V2Expr::Field { base, .. } => self.expr_may_trap_arith(base),
+            V2Expr::Field { base, .. } => match self.bcon_field_ref(expr) {
+                // `extern bcon` entries are read at runtime and trap when the chunk/entry is
+                // missing; private tables are compile-time constants.
+                Some(Ok((_, Some(_)))) => false,
+                Some(_) => true,
+                None => self.expr_may_trap_arith(base),
+            },
             V2Expr::Tuple(_, elems) => elems.iter().any(|e| self.expr_may_trap_arith(e)),
-            V2Expr::Call { .. } | V2Expr::MethodCall { .. } => true,
+            V2Expr::Call { .. } | V2Expr::MethodCall { .. } | V2Expr::Try { .. } => true,
             V2Expr::Int(..)
             | V2Expr::Bool(..)
             | V2Expr::Str(..)
@@ -6033,6 +7294,10 @@ impl<'a> TreeLowerer<'a> {
             }
             V2Expr::Field { base, field, .. } => {
                 if let V2Expr::Ident(_, bname) = base.as_ref() {
+                    if self.is_bcon_table_ref(bname) {
+                        // Read-only BCON constant: never aliases a writable cell.
+                        return false;
+                    }
                     if self.is_self_ident(bname) {
                         if let Some(st) = self.env.states.get(field) {
                             return format!("{}.attr[{}]", self.self_prefix(), st.attr_index)
@@ -6123,8 +7388,8 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Tuple(_, elems) => elems
                 .iter()
                 .any(|e| self.expr_may_read_or_clobber_air(e, canon_target)),
-            // Calls/method calls may have arbitrary side effects.
-            V2Expr::Call { .. } | V2Expr::MethodCall { .. } => true,
+            // Calls/method calls (and `?`-propagated calls) may have arbitrary side effects.
+            V2Expr::Call { .. } | V2Expr::MethodCall { .. } | V2Expr::Try { .. } => true,
         }
     }
 
@@ -6389,6 +7654,9 @@ impl<'a> TreeLowerer<'a> {
                 self.read_lvalue(&lval)
             }
             V2Expr::Field { span, base, field } => {
+                if let Some(r) = self.bcon_field_ref(expr) {
+                    return Ok((r?.0, ValueType::I16));
+                }
                 // Handle read-only properties like `sim.id`, `sim.priority`, `self.id`, `self.room`
                 if let V2Expr::Ident(bspan, bname) = base.as_ref() {
                     if self.is_sim_ident(bname) {
@@ -6501,6 +7769,9 @@ impl<'a> TreeLowerer<'a> {
                         "type arguments are only supported on 'create_object::<T>', 'find_best_object::<T>', and 'objects_of::<T>'",
                     ));
                 }
+                if let Some(sig) = self.resolve_callable(callee, *span)? {
+                    return self.lower_callable_value(&sig, args, *span, false, false);
+                }
                 if let V2Expr::Ident(_, fname) = callee.as_ref() {
                     if fname == "random" {
                         if args.len() != 1 || args[0].name.is_some() {
@@ -6570,6 +7841,23 @@ impl<'a> TreeLowerer<'a> {
                 self.line(format!("let {tmp} = 0;"));
                 self.emit_bool_into_local(expr, &tmp)?;
                 Ok((tmp, ValueType::Bool))
+            }
+            V2Expr::Try { span, inner } => {
+                if let V2Expr::Call {
+                    span: cspan,
+                    callee,
+                    type_args,
+                    args,
+                } = inner.as_ref()
+                    && type_args.is_empty()
+                    && let Some(sig) = self.resolve_callable(callee, *cspan)?
+                {
+                    return self.lower_callable_value(&sig, args, *cspan, true, false);
+                }
+                Err(Error::at(
+                    *span,
+                    "'?' in an expression needs a call to an 'extern mod' fn or 'tree' (use 'cond?;' as a statement for plain bool checks)",
+                ))
             }
             other => Err(Error::at(
                 other.span(),
@@ -6648,6 +7936,13 @@ impl<'a> TreeLowerer<'a> {
                 }
                 Ok(None)
             }
+            V2Expr::Field { .. } => match self.bcon_field_ref(expr) {
+                Some(r) => {
+                    let (air, val) = r?;
+                    Ok(val.map(|v| (air, v)))
+                }
+                None => Ok(None),
+            },
             _ => Ok(None),
         }
     }
@@ -6760,6 +8055,15 @@ impl<'a> TreeLowerer<'a> {
                     Error::at(*span, format!("expected constant i16, found '{name}'"))
                 })
             }
+            V2Expr::Field { span, .. } => match self.bcon_field_ref(expr) {
+                Some(r) => r?.1.ok_or_else(|| {
+                    Error::at(
+                        *span,
+                        "expected constant i16, found an 'extern bcon' entry (its value is only known at runtime)",
+                    )
+                }),
+                None => Err(Error::at(*span, "expected constant i16 index")),
+            },
             other => Err(Error::at(other.span(), "expected constant i16 index")),
         }
     }
@@ -6795,7 +8099,11 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
             V2Expr::Field { base, .. } => match base.as_ref() {
-                V2Expr::Ident(_, bname) => self.is_self_ident(bname) || self.is_sim_ident(bname),
+                V2Expr::Ident(_, bname) => {
+                    self.is_self_ident(bname)
+                        || self.is_sim_ident(bname)
+                        || self.is_bcon_table_ref(bname)
+                }
                 V2Expr::Field { base: root, .. } => {
                     matches!(root.as_ref(), V2Expr::Ident(_, rname) if self.is_sim_ident(rname))
                 }
@@ -7076,6 +8384,20 @@ impl<'a> TreeLowerer<'a> {
             } => {
                 if !type_args.is_empty() {
                     return Ok(None);
+                }
+                if let Some(sig) = self.resolve_callable(callee, *span)? {
+                    return match sig.ret {
+                        ResolvedReturnAbi::Bool | ResolvedReturnAbi::Result => {
+                            Ok(Some(self.prepare_callable_call(&sig, args, *span)?))
+                        }
+                        _ => Err(Error::at(
+                            *span,
+                            format!(
+                                "{} cannot be used as a condition (only '-> bool' and '-> Result' calls can)",
+                                sig.display
+                            ),
+                        )),
+                    };
                 }
                 if let V2Expr::Ident(_, fname) = callee.as_ref() {
                     match fname.as_str() {
@@ -8461,6 +9783,7 @@ fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
         V2Stmt::Break { .. }
         | V2Stmt::Continue { .. }
         | V2Stmt::Return { value: None, .. }
+        | V2Stmt::ReturnError { .. }
         | V2Stmt::RawAir { .. } => false,
     })
 }
@@ -8473,7 +9796,8 @@ fn expr_borrows_ident(expr: &V2Expr, target_name: &str) -> bool {
         }
         V2Expr::Field { base, .. }
         | V2Expr::Deref { inner: base, .. }
-        | V2Expr::Unary { inner: base, .. } => expr_borrows_ident(base, target_name),
+        | V2Expr::Unary { inner: base, .. }
+        | V2Expr::Try { inner: base, .. } => expr_borrows_ident(base, target_name),
         V2Expr::Index { base, index, .. } => {
             expr_borrows_ident(base, target_name) || expr_borrows_ident(index, target_name)
         }
@@ -8569,7 +9893,12 @@ fn stmts_unconditionally_diverge(
     allow_local: bool,
 ) -> bool {
     match stmts.last() {
-        Some(V2Stmt::Return { .. } | V2Stmt::Break { .. } | V2Stmt::Continue { .. }) => true,
+        Some(
+            V2Stmt::Return { .. }
+            | V2Stmt::ReturnError { .. }
+            | V2Stmt::Break { .. }
+            | V2Stmt::Continue { .. },
+        ) => true,
         Some(V2Stmt::If {
             then_body,
             else_body,
@@ -8597,7 +9926,8 @@ fn stmts_unconditionally_diverge(
 
 fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
     stmts.iter().any(|s| match s {
-        V2Stmt::Return { .. } => true,
+        // `return error;` may resolve to an ordinary `return <local error>;` (see lowering).
+        V2Stmt::Return { .. } | V2Stmt::ReturnError { .. } => true,
         V2Stmt::WithLock { body, .. }
         | V2Stmt::Defer { body, .. }
         | V2Stmt::Repeat { body, .. }
@@ -8622,7 +9952,7 @@ fn stmts_always_return(
 ) -> bool {
     for stmt in stmts {
         match stmt {
-            V2Stmt::Return { .. } => return true,
+            V2Stmt::Return { .. } | V2Stmt::ReturnError { .. } => return true,
             V2Stmt::If {
                 then_body,
                 else_body,
@@ -8670,6 +10000,13 @@ fn stmts_may_clobber_stack_obj(
         return true;
     }
     stmts.iter().any(|s| match s {
+        // Rebinding the Sim name makes later `sim.x` reads foreign-object reads (stack_obj swaps)
+        // that the field check below would otherwise treat as plain Sim reads.
+        V2Stmt::Let { name, .. } | V2Stmt::LetSome { name, .. }
+            if Some(name.as_str()) == sim_name =>
+        {
+            true
+        }
         V2Stmt::LetSome {
             init, else_body, ..
         } => {
@@ -8892,9 +10229,11 @@ fn expr_may_clobber_stack_obj(
         }
         V2Expr::Field { base, .. } => {
             // Typed foreign object field access (`fridge.stock`, `plate.nutrition`, etc.) swaps `stack_obj`!
+            // (Named BCON table entries such as `LampTuning.a` are plain constant reads.)
             if let V2Expr::Ident(_, rname) = base.as_ref()
                 && rname != "self"
                 && Some(rname.as_str()) != sim_name
+                && !env.is_bcon_table_name(owner_mod, rname, allow_local_fns)
             {
                 return true;
             }
@@ -8902,7 +10241,8 @@ fn expr_may_clobber_stack_obj(
         }
         V2Expr::Deref { inner: base, .. }
         | V2Expr::MutRef { inner: base, .. }
-        | V2Expr::Unary { inner: base, .. } => {
+        | V2Expr::Unary { inner: base, .. }
+        | V2Expr::Try { inner: base, .. } => {
             expr_may_clobber_stack_obj(base, env, owner_mod, allow_local_fns, sim_name, depth)
         }
         V2Expr::Binary { lhs, rhs, .. } => {

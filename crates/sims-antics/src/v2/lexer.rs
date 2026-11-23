@@ -34,6 +34,7 @@ pub enum TokenKind {
     Comma,
     Dot,
     At,
+    Question, // ?
     Arrow,    // ->
     FatArrow, // =>
     // Logical & comparison operators
@@ -127,6 +128,10 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>> {
             b'@' => {
                 lexer.bump();
                 TokenKind::At
+            }
+            b'?' => {
+                lexer.bump();
+                TokenKind::Question
             }
             b':' => {
                 lexer.bump();
