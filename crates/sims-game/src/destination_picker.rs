@@ -181,6 +181,7 @@ pub struct DestinationMapPicker {
     pressed_lot_id: Option<u16>,
     hover_fade: HoverFadeState,
     hover_fade_was_animating: bool,
+    last_clock_us: u64,
     water_frame: usize,
     pointer: Option<[i32; 2]>,
     back_hovered: bool,
@@ -276,6 +277,7 @@ impl DestinationMapPicker {
             pressed_lot_id: None,
             hover_fade: HoverFadeState::default(),
             hover_fade_was_animating: false,
+            last_clock_us: 0,
             water_frame: 0,
             pointer: None,
             back_hovered: false,
@@ -313,19 +315,24 @@ impl DestinationMapPicker {
     }
 
     /// Finds a clickable screen point on `lot_id` inside `size` (below the
-    /// top bar / filter strip) using the exact same [`RenderOptions`] used
-    /// during rendering, or the fallback chip center if `lot_id` has no map
-    /// thumbnail.
+    /// top bar / filter strip) using the exact same [`hit_test_lot`] path and
+    /// active fade clock used by live input, or the fallback chip center if
+    /// `lot_id` has no map thumbnail.
     pub fn hit_point_for_lot(&self, size: [i32; 2], lot_id: u16) -> Option<[i32; 2]> {
         let viewport = [size[0].max(1) as u32, size[1].max(1) as u32];
+        let clock_us = self.last_clock_us;
         for (id, rect) in self.fallback_chip_rects(viewport) {
             if id == lot_id {
-                return Some([rect.x + rect.width / 2, rect.y + rect.height / 2]);
+                let pt = [rect.x + rect.width / 2, rect.y + rect.height / 2];
+                if !self.over_chrome(viewport, pt)
+                    && self.hit_test_lot(viewport, pt, clock_us) == Some(lot_id)
+                {
+                    return Some(pt);
+                }
             }
         }
         let map = self.map.as_ref()?;
         let lot = map.lot(lot_id)?;
-        let opts = self.build_render_options(viewport, 0);
         let [left, top, right, bottom] = map.lot_screen_rect(lot, viewport);
         let min_y = self.chrome_bottom_y(viewport);
         let y_start = top.max(min_y + 1);
@@ -335,7 +342,7 @@ impl DestinationMapPicker {
         for y in (y_start..y_end).step_by(2) {
             for x in (x_start..x_end).step_by(2) {
                 if !self.over_chrome(viewport, [x, y])
-                    && map.hit_test_with_options(&opts, [x, y]) == Some(lot_id)
+                    && self.hit_test_lot(viewport, [x, y], clock_us) == Some(lot_id)
                 {
                     return Some([x, y]);
                 }
@@ -362,6 +369,7 @@ impl DestinationMapPicker {
     /// Advances animation timers (300 ms hover roof cross-fade & water waves)
     /// and returns whether the map needs a redraw.
     pub fn tick(&mut self, clock_us: u64) -> bool {
+        self.last_clock_us = clock_us;
         let mut redraw = false;
         let now_ms = clock_us / 1_000;
         let animating = self.hover_fade.is_animating(now_ms);
@@ -415,6 +423,7 @@ impl DestinationMapPicker {
     /// Handles pointer motion over the destination map. Returns `true` if the
     /// rendered frame changed.
     pub fn hover(&mut self, size: [i32; 2], point: [i32; 2], clock_us: u64) -> bool {
+        self.last_clock_us = clock_us;
         self.pointer = Some(point);
         let viewport = [size[0].max(1) as u32, size[1].max(1) as u32];
         let mut changed = false;
@@ -452,6 +461,7 @@ impl DestinationMapPicker {
     /// Clears transient hover/press state across both `TravelChrome`, Old Town
     /// return bar, and lot capture when the pointer leaves or releases outside.
     pub fn leave(&mut self, clock_us: u64) -> bool {
+        self.last_clock_us = clock_us;
         self.pointer = None;
         let mut changed = self.travel_chrome.clear_pointer();
         if self.back_hovered || self.back_pressed {
@@ -472,6 +482,7 @@ impl DestinationMapPicker {
     /// Handles a left mouse press on the destination map. Returns `true` if the
     /// rendered frame changed.
     pub fn press(&mut self, size: [i32; 2], point: [i32; 2], clock_us: u64) -> bool {
+        self.last_clock_us = clock_us;
         self.pointer = Some(point);
         let viewport = [size[0].max(1) as u32, size[1].max(1) as u32];
         if let Some(state) = &self.travel_state {
@@ -519,6 +530,7 @@ impl DestinationMapPicker {
         point: [i32; 2],
         clock_us: u64,
     ) -> Option<DestinationPickerAction> {
+        self.last_clock_us = clock_us;
         self.pointer = Some(point);
         let viewport = [size[0].max(1) as u32, size[1].max(1) as u32];
 
@@ -585,6 +597,7 @@ impl DestinationMapPicker {
     /// Renders the full graphical destination map, top bar, filter strip,
     /// fallback lot chips (if any), and hovered lot info card into `canvas`.
     pub fn draw(&mut self, canvas: &mut Canvas, assets: &DestinationPickerAssets, clock_us: u64) {
+        self.last_clock_us = clock_us;
         let w = canvas.width;
         let h = canvas.height;
         if w == 0 || h == 0 {
@@ -774,23 +787,34 @@ impl DestinationMapPicker {
         }
         let w = i32::try_from(viewport[0]).unwrap_or(i32::MAX).max(1);
         let h = i32::try_from(viewport[1]).unwrap_or(i32::MAX).max(1);
-        let count = self.fallback_lots.len() as i32;
         let gap = 8;
-        let pad = 16;
-        let chip_h = 32;
+        let pad = 16.min((w - 1) / 2);
+        let chip_h = 30;
+        let min_chip_w = 88;
+        let max_chip_w = 160;
         let avail_w = (w - pad * 2).max(1);
-        let chip_w = (((avail_w - gap * (count - 1)).max(count)) / count).clamp(72, 160);
-        let total_w = chip_w * count + gap * (count - 1);
-        let start_x = ((w - total_w) / 2).max(pad);
-        let y = (h - chip_h - 14).max(self.chrome_bottom_y(viewport) + 8);
-        self.fallback_lots
-            .iter()
-            .enumerate()
-            .map(|(idx, &lot_id)| {
-                let x = start_x + idx as i32 * (chip_w + gap);
-                (lot_id, Rect::new(x, y, chip_w, chip_h))
-            })
-            .collect()
+        let max_cols = ((avail_w + gap) / (min_chip_w + gap)).max(1) as usize;
+        let cols = self.fallback_lots.len().min(max_cols).max(1);
+        let rows = self.fallback_lots.len().div_ceil(cols);
+        let chip_w = (((avail_w - gap * (cols as i32 - 1)).max(cols as i32)) / cols as i32)
+            .clamp(1, max_chip_w);
+        let min_y = self.chrome_bottom_y(viewport) + 8;
+        let total_h = rows as i32 * chip_h + (rows as i32 - 1) * gap;
+        let start_y = (h - 14 - total_h).max(min_y);
+
+        let mut rects = Vec::with_capacity(self.fallback_lots.len());
+        for (row_idx, chunk) in self.fallback_lots.chunks(cols).enumerate() {
+            let row_count = chunk.len() as i32;
+            let row_w = row_count * chip_w + (row_count - 1) * gap;
+            let row_x = ((w - row_w) / 2).max(pad);
+            let y = start_y + row_idx as i32 * (chip_h + gap);
+            for (col_idx, &lot_id) in chunk.iter().enumerate() {
+                let x = row_x + col_idx as i32 * (chip_w + gap);
+                let clamped_w = chip_w.min((w - pad - x).max(1));
+                rects.push((lot_id, Rect::new(x, y, clamped_w, chip_h)));
+            }
+        }
+        rects
     }
 
     fn draw_fallback_lot_chips(
@@ -803,20 +827,44 @@ impl DestinationMapPicker {
             .travel_art
             .font(10)
             .or_else(|| assets.chrome_art.font(10));
+        let lodging_filter_active = self.kind == NeighborhoodKind::Vacation
+            && self
+                .travel_state
+                .as_ref()
+                .is_some_and(|s| s.vacation_lodging_filter.is_some());
+        let highlighted = if lodging_filter_active {
+            self.highlighted_lots()
+        } else {
+            BTreeSet::new()
+        };
         for (lot_id, rect) in self.fallback_chip_rects(viewport) {
             let hovered = self.hovered_lot_id == Some(lot_id);
             let pressed = self.pressed_lot_id == Some(lot_id);
+            let matches_filter = !lodging_filter_active || highlighted.contains(&lot_id);
             let bg = if pressed {
                 [66, 132, 218]
             } else if hovered {
                 [44, 78, 148]
+            } else if lodging_filter_active && matches_filter {
+                [40, 68, 134]
+            } else if lodging_filter_active {
+                [16, 24, 56]
             } else {
                 [24, 38, 86]
             };
             let border = if hovered {
                 [255, 224, 112]
+            } else if lodging_filter_active && matches_filter {
+                [255, 212, 84]
+            } else if lodging_filter_active {
+                [58, 76, 122]
             } else {
                 [96, 134, 210]
+            };
+            let text_color = if matches_filter || hovered || pressed {
+                [235, 242, 255]
+            } else {
+                [148, 162, 194]
             };
             frame.fill(rect, bg);
             frame.fill(Rect::new(rect.x, rect.y, rect.width, 1), border);
@@ -839,7 +887,7 @@ impl DestinationMapPicker {
                     .unwrap_or_else(|| format!("Lot {lot_id}"));
                 let tx = rect.x + (rect.width - f.width(&label)).max(4) / 2;
                 let ty = rect.y + (rect.height - f.line_height) / 2;
-                f.draw(frame, &label, [tx, ty], [235, 242, 255]);
+                f.draw(frame, &label, [tx, ty], text_color);
             }
         }
     }
@@ -878,9 +926,9 @@ impl DestinationMapPicker {
             let tx = rect.x + (rect.width - f.width(title)) / 2;
             f.draw(frame, title, [tx, rect.y + 18], [255, 232, 136]);
             let hint = if self.fallback_lots.is_empty() {
-                "Press Escape or Return to go back to the lot."
+                "Press Escape or click Back to go back to the lot."
             } else {
-                "Choose a lot below, or press Escape / Return to cancel."
+                "Choose a lot below, or press Escape / click Back to cancel."
             };
             let hx = rect.x + (rect.width - f.width(hint)).max(8) / 2;
             f.draw(frame, hint, [hx, rect.y + 52], [220, 234, 255]);
@@ -1189,5 +1237,55 @@ mod tests {
             46,
             VacationLodging::Campground
         ));
+    }
+
+    #[test]
+    fn fallback_chips_wrap_cleanly_within_800x600_for_eleven_old_town_lots() {
+        let empty = Install {
+            root: PathBuf::from("/nonexistent-sims-install-for-test"),
+            layout: sims_content::Layout::Cd,
+            expansions: sims_content::Expansions(0),
+        };
+        let entries: Vec<SpecialLotEntry> = (58..=68)
+            .map(|lot_id| SpecialLotEntry {
+                lot_id,
+                name: format!("Old Town Lot {lot_id}"),
+                address: None,
+                description: "Community lot".into(),
+                zoning: 2,
+            })
+            .collect();
+        let mut picker = DestinationMapPicker::open(
+            &empty,
+            1,
+            SpecialPanelRequest::OldTownLotPicker { unleashed: true },
+            entries,
+            1000,
+            0,
+            0,
+        )
+        .expect("fallback picker opens");
+        assert_eq!(picker.fallback_lots().len(), 11);
+
+        let rects = picker.fallback_chip_rects([800, 600]);
+        assert_eq!(rects.len(), 11);
+        for (lot_id, rect) in &rects {
+            assert!(
+                rect.x >= 0 && rect.x + rect.width <= 800,
+                "lot {lot_id} chip {rect:?} must fit horizontally in 800px"
+            );
+            assert!(
+                rect.y >= 0 && rect.y + rect.height <= 600,
+                "lot {lot_id} chip {rect:?} must fit vertically in 600px"
+            );
+            let pt = picker
+                .hit_point_for_lot([800, 600], *lot_id)
+                .expect("every wrapped fallback chip must be clickable");
+            assert!(picker.press([800, 600], pt, 0));
+            assert_eq!(
+                picker.release([800, 600], pt, 0),
+                Some(DestinationPickerAction::SelectLot(*lot_id))
+            );
+        }
     }
 }
