@@ -3599,6 +3599,7 @@ version = "0.1.0"
 dependencies = [
  "core-graphics",
  "cpal",
+ "flate2",
  "sha2 0.10.9",
  "sims-antics",
  "sims-audio",

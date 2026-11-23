@@ -350,7 +350,7 @@ fn wave2_photo_album_and_persistent_custom_lot_thumbnails() {
             "CamViewAlbum must not overlap the Live Mode cluster before opening Camera sub-strip"
         );
         // Clicking the cluster Camera button opens the Camera sub-strip inside the
-        // bottom panel strip area (x >= CLUSTER[0]), offering Take Snapshot & Photo Album.
+        // bottom panel strip area (x >= CLUSTER[0]), offering its native controls and Photo Album.
         let camera_btn = shell
             .game()
             .expect("active game")

@@ -22,7 +22,8 @@ use sims_ui::neighborhood::{
     draw_hovered_lot_popup,
 };
 use sims_ui::travel::{
-    BAR_HEIGHT as TRAVEL_BAR_HEIGHT, Destination, LotFilter, NATIVE_WIDTH as TRAVEL_NATIVE_WIDTH,
+    BAR_HEIGHT as TRAVEL_BAR_HEIGHT, Destination, LotFilter, NATIVE_HEIGHT as TRAVEL_NATIVE_HEIGHT,
+    NATIVE_WIDTH as TRAVEL_NATIVE_WIDTH,
     TravelBarMode, TravelChrome, TravelCommand, TravelLayout, TravelState, TravelStrings,
     VacationLodging, art_id as travel_art_id,
 };
@@ -249,17 +250,40 @@ impl DestinationMapPicker {
             .filter(|&id| map.as_ref().is_none_or(|m| m.lot(id).is_none()))
             .collect();
 
+        // Picker filters with no visitable lot on this map draw disabled, as
+        // the 1.91 oracle shows for Gardening on Magic Town.
+        let unavailable_filters: Vec<LotFilter> = destination
+            .map(|dest| {
+                dest.picker_filters()
+                    .iter()
+                    .copied()
+                    .filter(|&f| {
+                        let bit = community_filter_for_lot_filter(f).bit();
+                        map.as_ref().is_some_and(|m| {
+                            !m.lots.iter().any(|lot| {
+                                visitable_lots.contains(&lot.id) && lot.filter_mask & bit != 0
+                            })
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let travel_state = destination.map(|dest| TravelState {
             destination: dest,
             mode: TravelBarMode::Visit,
             expansions: ExpansionFlags(install.expansions.0),
             has_importable_lot: false,
-            active_filter: None,
+            // The 1.91 Magic Hole picker opens with the Magic filter pressed
+            // (oracle `flow-magic-hole-picker.png`).
+            active_filter: (dest == Destination::MagicTown
+                && !unavailable_filters.contains(&LotFilter::Magic))
+            .then_some(LotFilter::Magic),
             vacation_lodging_filter: None,
             vacation_has_no_vacancy: false,
             studio_fame_half_stars,
             magic_coins,
             simoleons,
+            unavailable_filters,
         });
 
         Ok(Self {
@@ -1073,9 +1097,7 @@ impl DestinationMapPicker {
 
     fn over_chrome(&self, viewport: [u32; 2], point: [i32; 2]) -> bool {
         if let Some(state) = &self.travel_state {
-            let layout = TravelLayout::compute(viewport[0], viewport[1], state);
-            layout.bar_rect.contains(point[0], point[1])
-                || layout.filter_strip_rect.contains(point[0], point[1])
+            TravelLayout::compute(viewport[0], viewport[1], state).blocks_map(point[0], point[1])
         } else {
             let (bar_rect, _) = old_town_bar_layout(viewport);
             bar_rect.contains(point[0], point[1])
@@ -1103,12 +1125,17 @@ fn old_town_bar_layout(viewport: [u32; 2]) -> (Rect, Rect) {
     let compact = w < TRAVEL_NATIVE_WIDTH;
     let bar_w = if compact { w } else { TRAVEL_NATIVE_WIDTH };
     let bar_x = if compact { 0 } else { (w - bar_w) / 2 };
-    let bar_h = TRAVEL_BAR_HEIGHT.min(h);
-    let bar_rect = Rect::new(bar_x, 0, bar_w, bar_h);
+    let oy = if !compact && h > TRAVEL_NATIVE_HEIGHT {
+        (h - TRAVEL_NATIVE_HEIGHT) / 2
+    } else {
+        0
+    };
+    let bar_h = TRAVEL_BAR_HEIGHT.min(h - oy);
+    let bar_rect = Rect::new(bar_x, oy, bar_w, bar_h);
     let back_x = bar_x + if compact { 8 } else { 78 };
     let back_w = if compact { 44 } else { 53 };
     let back_h = (bar_h - 6).max(1);
-    let back_y = (bar_h - back_h) / 2;
+    let back_y = oy + (bar_h - back_h) / 2;
     let back_rect = Rect::new(back_x, back_y, back_w, back_h);
     (bar_rect, back_rect)
 }

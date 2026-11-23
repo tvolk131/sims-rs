@@ -134,11 +134,16 @@ const UNDO_POS: [i32; 2] = [231, 21];
 const REDO_POS: [i32; 2] = [231, 53];
 const PREV_ARROW_X: i32 = 539;
 const ARROW_Y: i32 = 32;
-const GRID_LEFT: i32 = 556;
+/// Catalog grid left edge. The 1.91 oracle (`build-windows.png`) matches our
+/// 45 px cells pixel-for-pixel only with the grid at `558`.
+const GRID_LEFT: i32 = 558;
 const GRID_TOP: i32 = 5;
 const GRID_ROWS: usize = 2;
-const GRID_RIGHT_MARGIN: i32 = 19;
-const NEXT_ARROW_MARGIN: i32 = 18;
+/// The catalog grid may run up to the next-page arrow: the 1.91 oracle
+/// (`build-windows.png`, `1024×768`) fits ten 45 px columns from `558` to
+/// `1008`, with the arrow at `1010` (five columns at `800×600`).
+const GRID_RIGHT_MARGIN: i32 = 14;
+const NEXT_ARROW_MARGIN: i32 = 14;
 const FALLBACK_BTN: [i32; 2] = [36, 36];
 
 /// `Build.iff` `STR#` chunk IDs (`0x4cd453`, `0x4cd696`, `0x4cd71b`).
@@ -173,6 +178,7 @@ const OBJD_TTAB: usize = 0x0e;
 const OBJD_TYPE: usize = 0x12;
 const OBJD_MASTER: usize = 0x14;
 const OBJD_SUB_INDEX: usize = 0x16;
+const OBJD_DISABLED: usize = 0x20;
 const OBJD_PRICE: usize = 0x24;
 const OBJD_CTSS: usize = 0x52;
 const OBJD_BUILD_TYPE: usize = 0x8a;
@@ -770,6 +776,12 @@ impl BuildCatalog {
                 if read_i16(data, OBJD_TYPE) == PERSON_TYPE {
                     continue;
                 }
+                // OBJD `+0x20` (word 16, after the GUID) is the "disabled"
+                // flag. `Shutters.iff` ($1, no thumbnail) sets it and the
+                // 1.91 Windows catalog omits it (oracle `build-windows.png`).
+                if read_i16(data, OBJD_DISABLED) != 0 {
+                    continue;
+                }
                 let build_type = read_i16(data, OBJD_BUILD_TYPE);
                 let Some(tool) = tool_for_build_mode_type(build_type) else {
                     continue;
@@ -1279,7 +1291,7 @@ pub fn layout(
         .min((width - next_aw).max(0))
         .max(0);
     let wide_grid_right = (width - GRID_RIGHT_MARGIN)
-        .min((wide_next_arrow_x - 1).max(0))
+        .min(wide_next_arrow_x.max(0))
         .max(0);
     let wide_fits = width >= NARROW_WIDTH
         && native_tools_right <= width

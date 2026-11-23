@@ -7636,6 +7636,23 @@ impl Game {
                 self.close_wall_cursor();
             }
         }
+        // 1.91 opens every object catalog tool with its first item picked up
+        // (oracle `build-doors/windows/stairs/fireplace/plants.png` all show
+        // slot 0 in the selected state). Skip it when the item is not
+        // affordable so a tool click never plays the error sound.
+        if matches!(
+            tool,
+            BuildTool::Doors
+                | BuildTool::Windows
+                | BuildTool::Stairs
+                | BuildTool::Fireplace
+                | BuildTool::Plants
+        ) && self.hud.build_state.selected.is_none()
+            && let Some(first) = catalog.items_for(tool).first()
+            && (first.price <= 0 || first.price <= sims_vm::available_funds(self.lot.world()))
+        {
+            self.select_build_item(first.id);
+        }
         self.layout_build();
         self.refresh_world();
     }
