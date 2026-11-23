@@ -8,9 +8,11 @@
 //! The replay world is a minimal lot: one object (`me`, also the stack object) of a
 //! synthetic type whose definition words are zero apart from its GUID and type, with
 //! the witness's temps, attributes, parameters and initial frame-storage words, and
-//! everything else zero. Each side's program holds its tree and its file's `BCON`
-//! tables and nothing else, so only trees made of `Expression` nodes are replayed: a
-//! primitive or a call could reach code or state the replay world does not have.
+//! everything else zero. Each side's program is the one the VM builds for an object
+//! whose file holds the tree: the tree and the file's `BCON` tables in the object's own
+//! library, an empty global library and no semi-global one. So only private trees
+//! (4096 to 8191) are replayed, and only those made of `Expression` nodes: a primitive
+//! or a call could reach code or state the replay world does not have.
 //!
 //! A run counts only if it returns: a fault (any VM trap, including running out of
 //! the instruction budget) means the witness shows nothing, so the result stays
@@ -84,7 +86,7 @@ impl std::fmt::Display for Witness {
 /// `Expression`, so the run touches only the frame, the object and the lot's globals.
 pub(crate) fn replayable(bhav: &BhavChunk, entry: usize) -> bool {
     let len = bhav.instructions.len();
-    if len == 0 || bhav.id < 256 {
+    if len == 0 || !super::iff::runs_from_own_file(bhav.id) {
         return false;
     }
     let mut seen = BTreeSet::new();
@@ -128,19 +130,18 @@ pub(crate) fn replay(
     Some(format!("sims-vm runs both from {w}: {what}"))
 }
 
+/// The program the VM would build for the replay object: its own file (resource 1)
+/// holds the tree and the file's `BCON`s, as an object's file does for a private tree
+/// (`program.rs:1015`); the global library (0) is empty and there is no semi-global
+/// one. Only private trees are run from an object's file, so any other tree has no
+/// such program and is not replayed.
 fn program(bhav: &BhavChunk, ctx: &LiveContext) -> Option<Program> {
-    let resource = match bhav.id {
-        256..=4095 => 0,
-        4096..=8191 => 1,
-        8192.. => 2,
-        _ => return None,
-    };
-    let mut libraries = BTreeMap::from([(0, Library::default()), (1, Library::default())]);
-    if resource == 2 {
-        libraries.insert(2, Library::default());
+    if !super::iff::runs_from_own_file(bhav.id) {
+        return None;
     }
+    let mut libraries = BTreeMap::from([(0, Library::default()), (1, Library::default())]);
     {
-        let lib = libraries.get_mut(&resource)?;
+        let lib = libraries.get_mut(&1)?;
         lib.behaviors.insert(
             bhav.id,
             Behavior {
@@ -167,7 +168,7 @@ fn program(bhav: &BhavChunk, ctx: &LiveContext) -> Option<Program> {
     Some(Program {
         global: 0,
         libraries,
-        semi_globals: BTreeMap::from([(1, (resource == 2).then_some(2))]),
+        semi_globals: BTreeMap::from([(1, None)]),
         careers: None,
         career_texts_end: true,
         labels_hold_no_token: true,

@@ -7,7 +7,7 @@
 //! - `sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]`
-//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]`
+//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]`
 //!   (exit 0 equivalent, 1 different, 2 inconclusive or error). Only files that differ in
 //!   BHAV bodies alone are compared; DIFFERENT is reported only when both trees, run in
 //!   sims-vm from the same world, end differently; EQUIVALENT assumes neither run
@@ -157,10 +157,12 @@ fn print_usage() {
          sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]\n  \
-         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n    \
+         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n    \
              (files must differ in BHAV bodies alone; DIFFERENT needs a sims-vm replay that ends differently;\n    \
               EQUIVALENT assumes neither run exhausts the VM instruction budget; the same holds for equiv;\n    \
-              a tree is EQUIVALENT only if every tree it may run is the same bytes or proven equivalent too)\n  \
+              a tree is EQUIVALENT only if every tree it may run is the same bytes or proven equivalent too;\n    \
+              only private trees, 4096 to 8191, are run from an object's file: --global and --semi-global\n    \
+              name the libraries calls to 256-4095 and 8192 and up run)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>"
     );
@@ -1730,7 +1732,8 @@ fn run() -> Result<(), CliError> {
 /// `sims-antics verify-equiv <a.iff> <b.iff>`: whole-file resource and BHAV equivalence.
 fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
     let mut paths: Vec<PathBuf> = Vec::new();
-    let mut with: Vec<PathBuf> = Vec::new();
+    // Library files and whether each is a semi-global one.
+    let mut with: Vec<(PathBuf, bool)> = Vec::new();
     let mut opts = IffEquivOptions::default();
     let mut show_all = false;
     let mut i = 1usize;
@@ -1747,8 +1750,13 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
                     i += 2;
                     continue;
                 }
-                "--with" => {
-                    with.push(PathBuf::from(value(s)?));
+                "--global" => {
+                    with.push((PathBuf::from(value(s)?), false));
+                    i += 2;
+                    continue;
+                }
+                "--semi-global" => {
+                    with.push((PathBuf::from(value(s)?), true));
                     i += 2;
                     continue;
                 }
@@ -1808,11 +1816,19 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
         let (file, len, hdr) = read_regular_file_prefix(path)?;
         Ok(read_bounded_iff_file(path, file, len, hdr)?)
     };
-    for extra in &with {
+    // Each library supplies only its own range (`program.rs:1015`): the global file
+    // trees 256 to 4095, a semi-global file 8192 and up.
+    for (extra, semi) in &with {
         let bytes = read(extra)?;
         let arities = extract_bhav_arities_from_iff(&bytes)
             .map_err(|e| format!("{}: {e}", extra.display()))?;
-        opts.extra_arities.extend(arities);
+        opts.extra_arities.extend(arities.into_iter().filter(|&(id, _)| {
+            if *semi {
+                id >= 8192
+            } else {
+                (256..=4095).contains(&id)
+            }
+        }));
     }
     let (a, b) = (read(&path_a)?, read(&path_b)?);
     let report = check_iff_equivalent(&a, &b, &opts).map_err(|e| e.to_string())?;

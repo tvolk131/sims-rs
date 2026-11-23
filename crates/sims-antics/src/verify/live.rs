@@ -615,10 +615,14 @@ enum Exit {
     Error,
     /// A VM trap the checker models (`sims-vm` native error code).
     Trap(u16),
-    /// A jump to a node past the end of the tree.
-    BadNode(u8),
+    /// A jump to a node past the end of the tree: the target and the tree's length,
+    /// which are both in the VM's error (`Trap::InvalidBranch`, `interpreter.rs:1484`).
+    BadNode(u8, usize),
     /// A primitive or call that failed (its error is not modeled).
     PrimitiveFault,
+    /// An operand the checker does not track, or a local the tree may not have
+    /// written, that the VM failed to read or write (its error is not modeled).
+    OperandFault,
 }
 
 impl std::fmt::Display for Exit {
@@ -629,8 +633,11 @@ impl std::fmt::Display for Exit {
             Self::Error => write!(f, "error"),
             Self::Trap(NEGATIVE_SQRT) => write!(f, "square root of a negative number"),
             Self::Trap(code) => write!(f, "VM trap {code:#x}"),
-            Self::BadNode(n) => write!(f, "jump to missing node {n}"),
+            Self::BadNode(n, count) => {
+                write!(f, "jump to missing node {n} of a {count}-node tree")
+            }
             Self::PrimitiveFault => write!(f, "a failing primitive or call"),
+            Self::OperandFault => write!(f, "a failing operand"),
         }
     }
 }
@@ -663,6 +670,8 @@ struct Outputs {
 /// all of those are.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct FaultPoint {
+    /// The tree's ID: a fault names the tree it happened in (`fault.rs`, `Location`).
+    tree: u16,
     /// `u8::MAX` for an entry past the last node, which faults before any node runs.
     node: u8,
     /// Opcode and operands. The branch targets are left out: a node that faults
@@ -809,6 +818,7 @@ impl Explorer<'_> {
         interner: &Interner,
     ) -> FaultPoint {
         FaultPoint {
+            tree: self.bhav.id,
             node,
             instruction: ins.map(|i| (i.opcode, i.operands)),
             prefix: state.prefix,
@@ -908,7 +918,8 @@ impl Explorer<'_> {
             _ => {}
         }
         let Some(ins) = self.bhav.instructions.get(usize::from(pc)) else {
-            return Ok(vec![self.finish(state, Exit::BadNode(pc), interner)]);
+            let count = self.bhav.instructions.len();
+            return Ok(vec![self.finish(state, Exit::BadNode(pc, count), interner)]);
         };
         state.steps += 1;
         if state.steps > self.opts.max_steps {
@@ -1021,19 +1032,22 @@ impl Explorer<'_> {
         interner.prefix(PrefixNode::Event(state.prefix, event))
     }
 
-    /// Reads an operand: a value, or the trap reading it raises.
+    /// Reads an operand: a value, or the trap reading it raises. A read the VM may fail
+    /// in a way the checker does not model (memory it does not track, a local the tree
+    /// may not have written) also leaves a faulting path in `out` ([`Self::may_fault`]).
     fn read(
         &self,
         state: &mut PathState,
         scope: u8,
         idx: i16,
+        out: &mut Vec<Step>,
         interner: &mut Interner,
     ) -> Result<Result<Val, u16>, String> {
         let loc = self.locate(state, scope, idx)?;
         if let Loc::Trap(code) = loc {
             return Ok(Err(code));
         }
-        self.note_unwritten_read(state, loc, scope, idx, interner);
+        self.note_unwritten_read(state, loc, scope, idx, out, interner);
         if let Some(v) = self.tracked(state, loc, interner) {
             return Ok(Ok(v));
         }
@@ -1052,23 +1066,50 @@ impl Explorer<'_> {
             interner,
         );
         state.prefix = prefix;
+        // Any untracked operand may fail to resolve or read (`memory.rs:364`): an index
+        // out of range (`global[64]`), a missing object, a scope the VM does not hold.
+        self.may_fault(state, prefix, out, interner);
         Ok(Ok(interner.sym(SymKey::EventValue(prefix))))
     }
 
+    /// Splits off a path on which the running node faults, after the event that ends at
+    /// `prefix`, for a failure the checker does not model. As for primitives, the
+    /// fault's condition is a fresh atom of the event: two trees agree on it only for
+    /// the same event from the same history, and their faults are equal only from the
+    /// same state at the same node ([`FaultPoint`]).
+    fn may_fault(
+        &self,
+        state: &mut PathState,
+        prefix: u32,
+        out: &mut Vec<Step>,
+        interner: &mut Interner,
+    ) {
+        let faults = interner.prefix(PrefixNode::Fault(prefix));
+        let mut faulted = state.clone();
+        faulted.cond.push((Atom::Outcome(faults), true));
+        if let Some(at) = faulted.at.as_mut() {
+            at.event = Some(prefix);
+        }
+        out.push(self.finish(faulted, Exit::OperandFault, interner));
+        state.cond.push((Atom::Outcome(faults), false));
+    }
+
     /// Records the read of a local the tree may not have written yet as an event: the
-    /// VM can fail reading it (`interpreter.rs:1277`), so it is not a pure read.
+    /// VM can fail reading it (`interpreter.rs:1277`), so it is not a pure read, and
+    /// leaves a faulting path in `out`.
     fn note_unwritten_read(
         &self,
         state: &mut PathState,
         loc: Loc,
         scope: u8,
         idx: i16,
+        out: &mut Vec<Step>,
         interner: &mut Interner,
     ) {
         if let Loc::Local(i) = loc
             && state.unwritten[i]
         {
-            state.prefix = self.record(
+            let prefix = self.record(
                 state,
                 EventKind::Read {
                     scope,
@@ -1079,6 +1120,8 @@ impl Explorer<'_> {
                 None,
                 interner,
             );
+            state.prefix = prefix;
+            self.may_fault(state, prefix, out, interner);
         }
     }
 
@@ -1179,21 +1222,30 @@ impl Explorer<'_> {
         }
         let mut out = Vec::new();
         // The right operand is read first (`expression.rs:43`).
-        let rhs = match self.read(&mut state, rhs_scope, rhs_idx, interner)? {
+        let rhs = match self.read(&mut state, rhs_scope, rhs_idx, &mut out, interner)? {
             Ok(v) => v,
-            Err(code) => return Ok(vec![self.finish(state, Exit::Trap(code), interner)]),
+            Err(code) => {
+                out.push(self.finish(state, Exit::Trap(code), interner));
+                return Ok(out);
+            },
         };
         state.scratch = Scratch::Expression;
         let lhs_loc = self.locate(&state, lhs_scope, lhs_idx)?;
         if let Loc::Trap(code) = lhs_loc {
-            return Ok(vec![self.finish(state, Exit::Trap(code), interner)]);
+            {
+                out.push(self.finish(state, Exit::Trap(code), interner));
+                return Ok(out);
+            };
         }
 
         // Comparisons read the left operand without writing it.
         if matches!(op, 0 | 1 | 2 | 8 | 14 | 15 | 16) {
-            let lhs = match self.read(&mut state, lhs_scope, lhs_idx, interner)? {
+            let lhs = match self.read(&mut state, lhs_scope, lhs_idx, &mut out, interner)? {
                 Ok(v) => v,
-                Err(code) => return Ok(vec![self.finish(state, Exit::Trap(code), interner)]),
+                Err(code) => {
+                out.push(self.finish(state, Exit::Trap(code), interner));
+                return Ok(out);
+            },
             };
             let (atom, t, f, negated) = match op {
                 0 => (Atom::Lt(rhs, lhs), ins.on_true, ins.on_false, false),
@@ -1248,6 +1300,9 @@ impl Explorer<'_> {
                 interner,
             );
             state.prefix = prefix;
+            // Resolving, reading or storing an untracked destination may fail
+            // (`expression.rs:63`, `memory.rs:797`).
+            self.may_fault(&mut state, prefix, &mut out, interner);
             if matches!(op, 11 | 17) {
                 for value in [true, false] {
                     let mut s = state.clone();
@@ -1273,7 +1328,7 @@ impl Explorer<'_> {
         // `=` and square root mark a local written before reading it (`expression.rs:75`);
         // the other operators read it first.
         if !matches!(op, 5 | 20) {
-            self.note_unwritten_read(&mut state, lhs_loc, lhs_scope, lhs_idx, interner);
+            self.note_unwritten_read(&mut state, lhs_loc, lhs_scope, lhs_idx, &mut out, interner);
         }
         let lhs = self
             .tracked(&state, lhs_loc, interner)
@@ -1283,7 +1338,10 @@ impl Explorer<'_> {
             let delta = if op == 11 { 1 } else { -1 };
             let value = mk_op(3, lhs, Val::Const(delta), interner);
             if !writable {
-                return Ok(vec![self.finish(state, Exit::Trap(0x13), interner)]);
+                {
+                out.push(self.finish(state, Exit::Trap(0x13), interner));
+                return Ok(out);
+            };
             }
             self.write(&mut state, lhs_loc, value);
             let atom = if op == 11 {
@@ -1650,6 +1708,15 @@ pub fn check_bhav_live_equivalent(
             ),
         };
     }
+    // The VM enters only formats 0x8000 to 0x8002 (`interpreter.rs:1768`).
+    if let Some(format) = [a.format, b.format]
+        .into_iter()
+        .find(|f| !(0x8000..=0x8002).contains(f))
+    {
+        return EquivResult::Inconclusive {
+            reason: format!("BHAV format {format:#06x} faults when entered"),
+        };
+    }
     // An empty tree faults on entry (`interpreter.rs:1786`).
     if a.instructions.is_empty() || b.instructions.is_empty() {
         return EquivResult::Inconclusive {
@@ -1677,7 +1744,7 @@ pub fn check_bhav_live_equivalent(
             // The frame is pushed at the clamped entry node, which then faults with
             // 0x44c (`interpreter.rs:766`), leaving the frame at that node. Two such
             // faults are the same only at the same node with the same frame.
-            if entry_a == entry_b && frame_dims(a) == frame_dims(b) {
+            if a.id == b.id && entry_a == entry_b && frame_dims(a) == frame_dims(b) {
                 continue;
             }
             return EquivResult::Inconclusive {

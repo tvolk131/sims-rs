@@ -34,8 +34,9 @@ pub struct IffEquivOptions {
     pub my_attribute_count: usize,
     /// Compare only this `BHAV`.
     pub tree: Option<u16>,
-    /// Arities of trees outside both files (`Global.iff`, semi-globals) that calls may
-    /// target, so calls with more than four inline arguments compare exactly.
+    /// Arities of the global (256 to 4095) and semi-global (8192 and up) libraries the
+    /// game loads, by tree ID, so calls into them with more than four inline arguments
+    /// compare exactly. Entries for private IDs are ignored: those come from the file.
     pub extra_arities: BTreeMap<u16, usize>,
 }
 
@@ -49,6 +50,28 @@ impl Default for IffEquivOptions {
             extra_arities: BTreeMap::new(),
         }
     }
+}
+
+/// Whether the VM runs tree `id` from the file of the object that runs it: only the
+/// private trees, 4096 to 8191. A call to 256..=4095 runs the global library's tree and
+/// one to 8192 and up the semi-global library's, whatever the object's own file holds
+/// under that ID (`program.rs:1015`, `interpreter.rs:695`).
+#[must_use]
+pub fn runs_from_own_file(id: u16) -> bool {
+    (4096..=8191).contains(&id)
+}
+
+/// Why `sims-antics` will not compare tree `id` of an object's file, if it will not.
+#[must_use]
+pub fn not_run_from_file(id: u16) -> Option<String> {
+    (!runs_from_own_file(id)).then(|| {
+        format!(
+            "the VM never runs BHAV #{id} from an object's file: it takes {} from the {} \
+             library",
+            if id < 256 { "IDs below 256 as primitives, not trees, and 256 to 4095" } else if id < 4096 { "256 to 4095" } else { "8192 and up" },
+            if id < 4096 { "global" } else { "semi-global" }
+        )
+    })
 }
 
 /// How one resource compares.
@@ -144,11 +167,13 @@ impl IffEquivReport {
 pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Result<IffEquivReport> {
     let iff_a = Iff::parse(a.to_vec()).map_err(|e| Error::new(format!("file A: {e}")))?;
     let iff_b = Iff::parse(b.to_vec()).map_err(|e| Error::new(format!("file B: {e}")))?;
-    if let Some(tree) = opts.tree
-        && !has_bhav(&iff_a, tree)
-        && !has_bhav(&iff_b, tree)
-    {
-        return Err(Error::new(format!("neither file contains BHAV #{tree}")));
+    if let Some(tree) = opts.tree {
+        if let Some(why) = not_run_from_file(tree) {
+            return Err(Error::new(why));
+        }
+        if !has_bhav(&iff_a, tree) && !has_bhav(&iff_b, tree) {
+            return Err(Error::new(format!("neither file contains BHAV #{tree}")));
+        }
     }
     let mut report = IffEquivReport::default();
     for (side, iff) in [("A", &iff_a), ("B", &iff_b)] {
@@ -170,10 +195,12 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
     let (ctx_a, ctx_b) = (ctx(&iff_a), ctx(&iff_b));
     // The structure check leaves the same chunks, in the same order, on both sides.
     let (trees_a, trees_b) = (lift_all(&iff_a), lift_all(&iff_b));
+    // The trees a call can reach in the file: only private ones. A call to any other ID
+    // runs a library tree, which [`tree_reach`] treats as opaque.
     let ids: BTreeSet<u16> = iff_a
         .chunks
         .iter()
-        .filter(|c| &c.tag == b"BHAV")
+        .filter(|c| &c.tag == b"BHAV" && runs_from_own_file(c.id))
         .map(|c| c.id)
         .collect();
     let needed: BTreeSet<u16> = match opts.tree {
@@ -182,7 +209,17 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
     };
     let mut verdicts: BTreeMap<u16, (ResourceVerdict, Vec<String>)> = BTreeMap::new();
     for (ca, cb) in iff_a.chunks.iter().zip(&iff_b.chunks) {
-        if &ca.tag == b"BHAV" && needed.contains(&ca.id) {
+        if &ca.tag == b"BHAV" && !runs_from_own_file(ca.id) && opts.tree.is_none() {
+            // The VM never runs it from this file, so it is compared as bytes only.
+            let verdict = if iff_a.data(ca) == iff_b.data(cb) {
+                ResourceVerdict::Identical
+            } else {
+                ResourceVerdict::Inconclusive {
+                    why: not_run_from_file(ca.id).unwrap_or_default(),
+                }
+            };
+            verdicts.insert(ca.id, (verdict, Vec::new()));
+        } else if &ca.tag == b"BHAV" && needed.contains(&ca.id) {
             let mut notes = Vec::new();
             let verdict = compare_bhav(
                 ca.id, ca, cb, &iff_a, &iff_b, &ctx_a, &ctx_b, opts, &mut notes,
@@ -195,12 +232,14 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         if is_bhav && opts.tree.is_some_and(|tree| ca.id != tree) {
             continue;
         }
-        let (verdict, notes) = if is_bhav {
+        let (verdict, notes) = if is_bhav && runs_from_own_file(ca.id) {
             let (verdict, notes) = verdicts[&ca.id].clone();
             (
                 needs_callees(ca.id, verdict, &ids, &trees_a, &trees_b, &verdicts),
                 notes,
             )
+        } else if is_bhav {
+            verdicts[&ca.id].clone()
         } else {
             (ResourceVerdict::Identical, Vec::new())
         };
@@ -380,7 +419,18 @@ pub fn check_tree_with_callees(
         local_bcons: iff.as_ref().filter(|_| both).map(bcons),
         ..LiveContext::default()
     };
-    let (ctx_a, ctx_b) = (ctx(arities.0, &iff_a), ctx(arities.1, &iff_b));
+    if let Some(why) = not_run_from_file(root) {
+        return inconclusive(why);
+    }
+    // Only private arities come from the sides' trees (see [`arities`]).
+    let private = |m: &BTreeMap<u16, usize>| -> BTreeMap<u16, usize> {
+        m.iter()
+            .filter(|&(&id, _)| runs_from_own_file(id))
+            .map(|(&id, &n)| (id, n))
+            .collect()
+    };
+    let (arities_a, arities_b) = (private(arities.0), private(arities.1));
+    let (ctx_a, ctx_b) = (ctx(&arities_a, &iff_a), ctx(&arities_b, &iff_b));
     let (Some(ra), Some(rb)) = (a.get(&root), b.get(&root)) else {
         return inconclusive(format!("tree #{root} is not defined on both sides"));
     };
@@ -388,7 +438,12 @@ pub fn check_tree_with_callees(
     if !matches!(first.1, EquivResult::Equivalent { .. }) {
         return first;
     }
-    let ids: BTreeSet<u16> = a.keys().chain(b.keys()).copied().collect();
+    let ids: BTreeSet<u16> = a
+        .keys()
+        .chain(b.keys())
+        .copied()
+        .filter(|&id| runs_from_own_file(id))
+        .collect();
     let reach = tree_reach(root, &ids, a, b);
     if reach.reads_file() {
         let problem = match (&iff_a, &iff_b) {
@@ -435,11 +490,21 @@ fn has_bhav(iff: &Iff, id: u16) -> bool {
     iff.chunks.iter().any(|c| &c.tag == b"BHAV" && c.id == id)
 }
 
-/// Callee argument counts: every `BHAV` in the file (`sims-vm` loads deleted chunks
-/// too, `program.rs:601`), plus `extra`.
+/// Callee argument counts as the VM resolves them for code of an object whose file is
+/// `iff`: its private `BHAV`s (`sims-vm` loads deleted chunks too, `program.rs:601`),
+/// and `extra` for the global and semi-global libraries. A tree the file holds in a
+/// library's range is never the one a call runs, so it supplies no arity.
 fn arities(iff: &Iff, extra: &BTreeMap<u16, usize>) -> BTreeMap<u16, usize> {
-    let mut map = extra.clone();
-    for chunk in iff.chunks.iter().filter(|c| &c.tag == b"BHAV") {
+    let mut map: BTreeMap<u16, usize> = extra
+        .iter()
+        .filter(|&(&id, _)| !runs_from_own_file(id))
+        .map(|(&id, &n)| (id, n))
+        .collect();
+    for chunk in iff
+        .chunks
+        .iter()
+        .filter(|c| &c.tag == b"BHAV" && runs_from_own_file(c.id))
+    {
         if let Ok(bhav) = Behavior::parse(iff.data(chunk)) {
             map.insert(chunk.id, bhav_param_limit(&bhav));
         }

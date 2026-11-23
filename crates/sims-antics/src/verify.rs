@@ -21,8 +21,8 @@ mod live;
 mod replay;
 pub use iff::{
     IffEquivOptions, IffEquivReport, IffVerdict, Reach, ResourceReport, ResourceVerdict,
-    check_iff_equivalent, check_tree_with_callees, same_tree_bytes, single_file_problem,
-    tree_reach,
+    check_iff_equivalent, check_tree_with_callees, not_run_from_file, runs_from_own_file,
+    same_tree_bytes, single_file_problem, tree_reach,
 };
 pub use live::{GUARANTEED_ATTRIBUTES, LiveContext, LiveOptions, check_bhav_live_equivalent};
 
@@ -5647,6 +5647,13 @@ fn lockstep_suffices(
         return false;
     }
     if live::frame_dims(a) != live::frame_dims(b) {
+        return false;
+    }
+    // A fault names the tree, a jump to a missing node carries the tree's length
+    // (`interpreter.rs:1484`), and the VM enters a tree by its format and kind.
+    if (a.id, a.format, a.kind, a.instructions.len())
+        != (b.id, b.format, b.kind, b.instructions.len())
+    {
         return false;
     }
     // Lockstep runs nodes past 250 and branches to 251 and 252, which the VM rejects
