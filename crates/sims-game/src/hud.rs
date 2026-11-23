@@ -374,6 +374,22 @@ impl HudStatic {
             camera_strings,
         })
     }
+
+    /// Clean-room procedural HUD chrome & defaults for standalone `open-pack/`
+    /// mode (zero EA/Maxis `UIGraphics.far` or `UIText.iff` assets required).
+    pub(crate) fn clean_room_procedural() -> Self {
+        Self {
+            art: Art::clean_room_procedural(),
+            labels: Labels::default(),
+            rating_labels: RatingLabels::default(),
+            sell_labels: SellLabels::default(),
+            texts: Texts::default(),
+            fame: Fame::default(),
+            options_texts: OptionsTexts::default(),
+            options_state: options::OptionsState::default(),
+            camera_strings: CameraStrings::default(),
+        }
+    }
 }
 
 /// Index/Catalog-dependent HUD tables (`work.iff` careers and house rating
@@ -548,6 +564,49 @@ impl Hud {
             assets,
             friendship,
             static_part,
+            shared_part,
+            members,
+            faces,
+        ))
+    }
+
+    /// Builds a clean-room standalone [`Hud`] backed by
+    /// [`Art::clean_room_procedural`] and procedural starter Sim portraits with
+    /// zero commercial EA/Maxis UI assets.
+    pub(crate) fn open_open_pack(
+        install: &Install,
+        members: Vec<u32>,
+        starter_sims: &[sims_antics::house::StarterSimSpec],
+        assets: &Assets,
+        world: &World,
+        friendship: i32,
+        pool: &ArchivePool,
+    ) -> Result<Self, String> {
+        let mut people = members.clone();
+        for record in world.neighbors.slots.iter().flatten() {
+            if !people.contains(&record.guid) {
+                people.push(record.guid);
+            }
+        }
+        let mut faces = Faces::load_with_pool(assets.index(), assets.catalog(), &people, pool)
+            .unwrap_or_default();
+        for (idx, sim) in starter_sims.iter().enumerate() {
+            if faces.name(sim.guid).is_none() {
+                faces.insert_name(sim.guid, &sim.name);
+            }
+            if faces.face(sim.guid).is_none() {
+                faces.insert(sim.guid, crate::open_pack::procedural_sim_portrait(idx));
+            }
+        }
+        let shared_part = HudShared {
+            careers: Careers::default(),
+            house: house::Tuning::default(),
+        };
+        Ok(Self::assemble(
+            install,
+            assets,
+            friendship,
+            HudStatic::clean_room_procedural(),
             shared_part,
             members,
             faces,

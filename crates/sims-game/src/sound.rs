@@ -1001,6 +1001,120 @@ struct ActiveVoice {
     object: Option<u32>,
 }
 
+/// Pre-decoded mono PCM16 clip at [`RATE`] (22,050 Hz) for standalone
+/// `open-pack/` synthesized WAV playback.
+struct OpenPackActiveClip {
+    samples: Arc<[i16]>,
+    cursor: usize,
+    object: Option<u32>,
+}
+
+/// Clean-room synthesized WAV sound bank loaded from `sims_antics::StandalonePack`.
+struct OpenPackAudioBank {
+    /// Lowercased FWAV sound event name -> mono 16-bit PCM resampled to `RATE`.
+    clips: BTreeMap<String, Arc<[i16]>>,
+    active: Vec<OpenPackActiveClip>,
+}
+
+impl OpenPackAudioBank {
+    fn from_wav_map(wavs: &BTreeMap<String, Vec<u8>>) -> Self {
+        let mut clips = BTreeMap::new();
+        for (name, bytes) in wavs {
+            if let Some(samples) = decode_pcm16_wav_to_mono_rate(bytes, RATE) {
+                clips.insert(name.to_ascii_lowercase(), Arc::from(samples));
+            }
+        }
+        Self {
+            clips,
+            active: Vec::new(),
+        }
+    }
+
+    fn trigger(&mut self, name: &str, object: Option<u32>) -> bool {
+        let key = name.to_ascii_lowercase();
+        let Some(samples) = self.clips.get(&key) else {
+            return false;
+        };
+        if self.active.len() >= MAX_ACTIVE_VOICES {
+            self.active.remove(0);
+        }
+        self.active.push(OpenPackActiveClip {
+            samples: Arc::clone(samples),
+            cursor: 0,
+            object,
+        });
+        true
+    }
+}
+
+/// Decodes a standard uncompressed 16-bit PCM RIFF/WAVE buffer into mono `i16`
+/// samples resampled cleanly via linear interpolation to `target_rate`.
+fn decode_pcm16_wav_to_mono_rate(bytes: &[u8], target_rate: u32) -> Option<Vec<i16>> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12usize;
+    let mut channels = 0u16;
+    let mut sample_rate = 0u32;
+    let mut bits_per_sample = 0u16;
+    let mut data: Option<&[u8]> = None;
+    while pos + 8 <= bytes.len() {
+        let tag = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let payload_start = pos + 8;
+        let payload_end = payload_start.checked_add(size)?.min(bytes.len());
+        let payload = &bytes[payload_start..payload_end];
+        if tag == b"fmt " && payload.len() >= 16 {
+            let audio_format = u16::from_le_bytes(payload[0..2].try_into().ok()?);
+            if audio_format != 1 {
+                return None;
+            }
+            channels = u16::from_le_bytes(payload[2..4].try_into().ok()?);
+            sample_rate = u32::from_le_bytes(payload[4..8].try_into().ok()?);
+            bits_per_sample = u16::from_le_bytes(payload[14..16].try_into().ok()?);
+        } else if tag == b"data" {
+            data = Some(payload);
+        }
+        pos = payload_start.saturating_add(size + (size & 1));
+    }
+    let pcm_bytes = data?;
+    if channels == 0 || sample_rate == 0 || bits_per_sample != 16 {
+        return None;
+    }
+    let frame_bytes = usize::from(channels) * 2;
+    let frame_count = pcm_bytes.len() / frame_bytes;
+    if frame_count == 0 {
+        return None;
+    }
+    let mut mono = Vec::with_capacity(frame_count);
+    for frame in pcm_bytes.chunks_exact(frame_bytes) {
+        let mut sum = 0i32;
+        for &ch in frame.as_chunks::<2>().0 {
+            sum += i32::from(i16::from_le_bytes(ch));
+        }
+        mono.push((sum / i32::from(channels)) as i16);
+    }
+    if sample_rate == target_rate || target_rate == 0 {
+        return Some(mono);
+    }
+    let out_len =
+        ((mono.len() as u64) * u64::from(target_rate) / u64::from(sample_rate)).max(1) as usize;
+    let mut resampled = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_pos = (i as f64) * (sample_rate as f64) / (target_rate as f64);
+        let idx = (src_pos as usize).min(mono.len() - 1);
+        let next = (idx + 1).min(mono.len() - 1);
+        let frac = src_pos - idx as f64;
+        let sample = mono[idx] as f64 * (1.0 - frac) + mono[next] as f64 * frac;
+        resampled.push(
+            sample
+                .round()
+                .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16,
+        );
+    }
+    Some(resampled)
+}
+
 /// The sound player with every module, station and ambient score of an
 /// install, paired with streaming Neighborhood/Buy/Build/expansion mode music,
 /// in-lot stereo/TV radio streaming, environmental lot ambience beds, and
@@ -1013,6 +1127,7 @@ pub struct Mixer {
     voices: VoiceCatalog,
     active_voices: Vec<ActiveVoice>,
     voice_scratch: Vec<i16>,
+    open_pack_bank: Option<OpenPackAudioBank>,
     hour: u32,
     view: i32,
     sources: Arc<Snapshot>,
@@ -1051,6 +1166,7 @@ impl Mixer {
             voices,
             active_voices: Vec::new(),
             voice_scratch: Vec::new(),
+            open_pack_bank: None,
             hour: u32::MAX,
             view: 0,
             sources: Arc::new(Snapshot::default()),
@@ -1059,6 +1175,43 @@ impl Mixer {
             ambience_active: false,
             reported: BTreeSet::new(),
         })
+    }
+
+    /// Creates a clean-room standalone [`Mixer`] backed solely by synthesized
+    /// PCM WAV clips from `open-pack/` (zero commercial `SoundData` required).
+    pub fn open_pack(wavs: &BTreeMap<String, Vec<u8>>) -> Self {
+        let files = Arc::new(SoundFiles::default());
+        let catalog = ModeCatalog::from_sound_files(&files, true, ALL_EXPANSIONS);
+        let music = ModeMusicPlayer::new(catalog, Arc::clone(&files), SEED);
+        let radio_catalog = RadioCatalog::from_sound_files(&files);
+        let radio = RadioPlayer::new(radio_catalog, Arc::clone(&files), SEED ^ 0x5241_4449);
+        let ambience_catalog = AmbienceCatalog::from_sound_files(&files);
+        let ambience = AmbienceMixer::new(ambience_catalog, Arc::clone(&files));
+        let voices = VoiceCatalog::from_shared_sound_files(Arc::clone(&files));
+        let mut player = Player::new(Vec::new(), Arc::clone(&files), SEED);
+        player.set_global(SPEED_REGISTER, speed_register(Speed::Normal));
+        Self {
+            player,
+            music,
+            radio,
+            ambience,
+            voices,
+            active_voices: Vec::new(),
+            voice_scratch: Vec::new(),
+            open_pack_bank: Some(OpenPackAudioBank::from_wav_map(wavs)),
+            hour: u32::MAX,
+            view: 0,
+            sources: Arc::new(Snapshot::default()),
+            active: true,
+            paused_by_game: false,
+            ambience_active: false,
+            reported: BTreeSet::new(),
+        }
+    }
+
+    /// Number of currently playing standalone `open-pack/` synthesized WAV clips.
+    pub fn active_open_pack_clips(&self) -> usize {
+        self.open_pack_bank.as_ref().map_or(0, |b| b.active.len())
     }
 
     fn start_voice_stream(&mut self, stream: VoiceStream, object: Option<u32>) {
@@ -1183,6 +1336,9 @@ impl Mixer {
                             self.radio.stop_all();
                             self.ambience.stop();
                             self.active_voices.clear();
+                            if let Some(bank) = &mut self.open_pack_bank {
+                                bank.active.clear();
+                            }
                             self.ambience_active = false;
                             self.paused_by_game = false;
                             self.sync_stream_pause();
@@ -1198,8 +1354,17 @@ impl Mixer {
                         SoundEvent::StopObject { object } => {
                             self.radio.stop_emitter(*object);
                             self.active_voices.retain(|v| v.object != Some(*object));
+                            if let Some(bank) = &mut self.open_pack_bank {
+                                bank.active.retain(|c| c.object != Some(*object));
+                            }
                         }
                         SoundEvent::Play { object, name } => {
+                            if let Some(bank) = &mut self.open_pack_bank {
+                                let obj = (*object != 0).then_some(*object);
+                                if bank.trigger(name, obj) {
+                                    continue;
+                                }
+                            }
                             if is_radio_stop_event(name) {
                                 self.radio.stop_emitter(*object);
                             } else if let Some(station) = station_for_sound_event(name) {
@@ -1378,6 +1543,45 @@ impl Mixer {
         self.radio.mix_into_stereo(out);
         self.ambience.mix_into_stereo(out);
         self.mix_active_voices(out);
+        self.mix_open_pack_clips(out);
+    }
+
+    fn mix_open_pack_clips(&mut self, out: &mut [i16]) {
+        let Some(bank) = &mut self.open_pack_bank else {
+            return;
+        };
+        if !self.active || bank.active.is_empty() || out.is_empty() {
+            return;
+        }
+        let fx_step = self.player.fx_volume_step();
+        let gain = if fx_step == 0 {
+            0.0f32
+        } else {
+            (VOLUME_STEPS[usize::from(fx_step.min(10))] as f32 / 1024.0).clamp(0.0, 1.0)
+        };
+        let frames = out.len() / 2;
+        for clip in &mut bank.active {
+            if clip.object.is_some() && self.paused_by_game {
+                continue;
+            }
+            let remaining = clip.samples.len().saturating_sub(clip.cursor);
+            let n = remaining.min(frames);
+            if gain > 0.0 {
+                for i in 0..n {
+                    let s = (f32::from(clip.samples[clip.cursor + i]) * gain).round() as i32;
+                    let li = i * 2;
+                    let ri = li + 1;
+                    out[li] = (i32::from(out[li]) + s)
+                        .clamp(i32::from(i16::MIN), i32::from(i16::MAX))
+                        as i16;
+                    out[ri] = (i32::from(out[ri]) + s)
+                        .clamp(i32::from(i16::MIN), i32::from(i16::MAX))
+                        as i16;
+                }
+            }
+            clip.cursor = clip.cursor.saturating_add(n);
+        }
+        bank.active.retain(|c| c.cursor < c.samples.len());
     }
 
     /// Faults not reported yet, each once, up to `REPORTED` of them; a

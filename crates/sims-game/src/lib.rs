@@ -29,6 +29,7 @@ pub mod game;
 pub mod hud;
 pub mod menu;
 pub mod neighborhood;
+pub mod open_pack;
 #[cfg(any(target_os = "macos", feature = "sound"))]
 pub mod output;
 pub mod pace;

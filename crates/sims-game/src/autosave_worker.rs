@@ -72,12 +72,11 @@ fn validation_cache() -> &'static Mutex<ValidationCache> {
     CACHE.get_or_init(|| Mutex::new(ValidationCache::default()))
 }
 
-/// Records that `bytes` were just produced by `Saved::encode()` inside the
-/// worker thread so `commit_job_validated` skips a redundant round-trip
-/// `Saved::decode` for that exact digest while still running full validation
-/// for existing slots and any caller-supplied bytes.
-fn note_validated_saved_lot(bytes: &[u8]) {
-    let key = (ValidationKind::SavedLot, sha256_bytes(bytes));
+/// Records that an already-hashed `Saved::encode()` payload produced inside the
+/// worker thread is valid so subsequent lookups hit the validation cache in O(1)
+/// without hashing the incoming payload twice.
+fn note_validated_saved_lot_sha256(sha256: [u8; 32]) {
+    let key = (ValidationKind::SavedLot, sha256);
     let mut guard = validation_cache().lock().unwrap_or_else(|e| e.into_inner());
     guard.insert(key, Ok(()));
 }
@@ -123,11 +122,15 @@ pub fn validate_save_payload(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(),
 }
 
 /// Full payload validator backed by a bounded `(SavePayloadKind, SHA-256)`
-/// cache so Save Manager listings, overwrite/pruning safeguards, and
-/// self-encoded commits agree 100% with [`validate_save_payload`] without
-/// repeatedly re-decoding identical immutable payloads.
-pub fn validate_save_payload_cached(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(), String> {
-    let key = (ValidationKind::from(kind), sha256_bytes(bytes));
+/// cache using an already-computed `sha256` digest so `AutosaveStore`
+/// commits and loads avoid hashing immutable payloads a second time while
+/// agreeing 100% with [`validate_save_payload`].
+pub fn validate_save_payload_cached_with_sha256(
+    kind: &SavePayloadKind,
+    sha256: &[u8; 32],
+    bytes: &[u8],
+) -> Result<(), String> {
+    let key = (ValidationKind::from(kind), *sha256);
     {
         let guard = validation_cache().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = guard.get(&key) {
@@ -140,6 +143,15 @@ pub fn validate_save_payload_cached(kind: &SavePayloadKind, bytes: &[u8]) -> Res
         guard.insert(key, result.clone());
     }
     result
+}
+
+/// Full payload validator backed by a bounded `(SavePayloadKind, SHA-256)`
+/// cache so Save Manager listings, overwrite/pruning safeguards, and
+/// self-encoded commits agree 100% with [`validate_save_payload`] without
+/// repeatedly re-decoding identical immutable payloads.
+pub fn validate_save_payload_cached(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(), String> {
+    let sha256 = sha256_bytes(bytes);
+    validate_save_payload_cached_with_sha256(kind, &sha256, bytes)
 }
 
 /// Fast header-only check verifying the 8-byte `Saved` format and
@@ -614,7 +626,10 @@ fn worker_loop(
                 let lot_id = job.lot_id;
                 let target = job.target;
                 let sim_tick = job.sim_tick;
-                let result = store.commit_job_validated(job, validate_save_payload_cached);
+                let result = store.commit_job_validated_with_sha256(
+                    job,
+                    validate_save_payload_cached_with_sha256,
+                );
                 publish(SaveCompletion {
                     neighborhood_id,
                     lot_id,
@@ -635,7 +650,7 @@ fn worker_loop(
             } => {
                 // Encode off the UI/render thread so manual & periodic saves never hitch.
                 let encoded = saved.encode();
-                note_validated_saved_lot(&encoded);
+                let incoming_len = encoded.len();
                 let payload = SavePayload::saved_lot(encoded);
                 let mut job = match target {
                     SaveTarget::Manual => SaveJob::manual_for_instance(
@@ -664,10 +679,23 @@ fn worker_loop(
                 if let Some(ts) = saved_at_unix_secs {
                     job = job.with_saved_at_unix_secs(ts);
                 }
-                // Incoming payload hits the SHA-256 validation cache in O(1);
-                // existing manual/ring records still run full `Saved::decode`
-                // on first sight so corrupt slots are never overwritten/pruned.
-                let result = store.commit_job_validated(job, validate_save_payload_cached);
+                // `AutosaveStore::commit_job_validated_with_sha256` computes
+                // `payload_sha256` once and invokes the validator first on the
+                // freshly self-encoded incoming payload; seed the cache with
+                // that digest on the first call so we never hash twice, while
+                // existing manual/ring slots still run full `Saved::decode` on
+                // first sight so corrupt slots are never overwritten/pruned.
+                let incoming_pending = std::sync::atomic::AtomicBool::new(true);
+                let result = store.commit_job_validated_with_sha256(job, |kind, sha256, bytes| {
+                    if matches!(kind, SavePayloadKind::SavedLot)
+                        && bytes.len() == incoming_len
+                        && incoming_pending.swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        note_validated_saved_lot_sha256(*sha256);
+                        return Ok(());
+                    }
+                    validate_save_payload_cached_with_sha256(kind, sha256, bytes)
+                });
                 publish(SaveCompletion {
                     neighborhood_id,
                     lot_id,

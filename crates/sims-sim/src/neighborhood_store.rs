@@ -2117,6 +2117,86 @@ impl NeighborhoodStore {
         txn.commit().map_err(store)
     }
 
+    /// Atomically migrates legacy `.caf-names.tsv` surnames into REDB v4
+    /// `StoredNeighborhood.family_surnames` AND records the completion marker
+    /// in `NEIGHBORHOOD_META` within a single write transaction.
+    ///
+    /// Returns `Ok(Ok(Some(updated)))` when migration ran and committed,
+    /// `Ok(Ok(None))` when `(id, expected_instance_id)` was already migrated,
+    /// or `Ok(Err(CheckedCommitError))` on instance/revision mismatch (leaving
+    /// the database untouched).
+    pub fn migrate_legacy_caf_surnames_checked(
+        &self,
+        id: &str,
+        expected_instance_id: u128,
+        expected_revision: u64,
+        surnames: &BTreeMap<u16, String>,
+    ) -> Result<std::result::Result<Option<StoredNeighborhood>, CheckedCommitError>> {
+        let marker_key = format!("caf_sidecar_migrated:{id}:{expected_instance_id:032x}");
+        let txn = self.db.begin_write().map_err(store)?;
+        let committed_state;
+        {
+            let mut meta_table = txn.open_table(NEIGHBORHOOD_META).map_err(store)?;
+            if meta_table
+                .get(marker_key.as_str())
+                .map_err(store)?
+                .is_some()
+            {
+                return Ok(Ok(None));
+            }
+            let mut table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
+            let current = {
+                let Some(existing) = table.get(id).map_err(store)? else {
+                    return Err(Error::Store(format!("neighborhood {id:?} does not exist")));
+                };
+                StoredNeighborhood::decode(id, existing.value())?
+            };
+            if current.instance_id != expected_instance_id {
+                return Ok(Err(CheckedCommitError::InstanceMismatch {
+                    expected: expected_instance_id,
+                    current: current.instance_id,
+                }));
+            }
+            if current.revision != expected_revision {
+                return Ok(Err(CheckedCommitError::RevisionMismatch {
+                    expected: expected_revision,
+                    current: current.revision,
+                }));
+            }
+            let mut updated = current.clone();
+            let mut changed = false;
+            for (&fam_id, surname) in surnames {
+                let trimmed = surname.trim();
+                if updated.families.contains_key(&fam_id)
+                    && !trimmed.is_empty()
+                    && !updated.family_surnames.contains_key(&fam_id)
+                {
+                    updated.set_family_surname(fam_id, trimmed);
+                    changed = true;
+                }
+            }
+            if changed {
+                let (next_instance, next_rev) = advance_version(
+                    &txn,
+                    self.store_id,
+                    id,
+                    current.instance_id,
+                    current.revision,
+                )?;
+                updated.instance_id = next_instance;
+                updated.revision = next_rev;
+                let encoded = updated.encode();
+                table.insert(id, encoded.as_slice()).map_err(store)?;
+            }
+            meta_table
+                .insert(marker_key.as_str(), b"1".as_slice())
+                .map_err(store)?;
+            committed_state = Some(updated);
+        }
+        txn.commit().map_err(store)?;
+        Ok(Ok(committed_state))
+    }
+
     /// Deletes a neighborhood and all of its characters, base houses, and saved
     /// lots atomically. Returns `true` if the neighborhood existed.
     pub fn delete_neighborhood(&self, id: &str) -> Result<bool> {

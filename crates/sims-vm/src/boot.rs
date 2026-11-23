@@ -940,6 +940,98 @@ impl Lot {
         )
     }
 
+    /// Opt-in clean-room boot for a standalone `open-pack/` staged directory
+    /// with zero commercial EA/Maxis assets (no commercial `.skn`/`.cmx` avatar
+    /// catalogs or `GameData/UIText.iff` required).
+    ///
+    /// Synthesizes minimal single-bone clean-room skeletons for any `kind == 2`
+    /// clean-room character definitions in the staged catalog and delegates to
+    /// [`Lot::boot_preloaded`], leaving all Complete Collection boot paths
+    /// untouched.
+    pub fn load_open_pack(
+        root: &Path,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+    ) -> Result<Self, BootError> {
+        let install = Install::detect(root)?;
+        let neighborhood_dir = house
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("the house file is not in a Houses folder")?;
+        let neighborhood = Neighborhood::open(neighborhood_dir)?;
+        let pool = ArchivePool::new();
+        let mut index = Index::build(&install)?;
+        let characters = neighborhood.characters()?;
+        if let Some(characters) = &characters {
+            index.add_characters(characters)?;
+        }
+        let catalog = Arc::new(Catalog::build_with_pool(&index, &pool)?);
+        let file = House::load(house, &catalog)?;
+        let program_res = Program::link_with_pool(
+            &index,
+            &catalog,
+            catalog.objects.iter().map(|o| o.guid),
+            &pool,
+        );
+        let animations_res = Animations::load_with_pool(&install, &index, &pool);
+        let surfaces_res = Surfaces::build_with_pool(&install, &pool);
+
+        // Synthesize minimal clean-room skeletons for open-pack Sims.
+        let mut people = People::default();
+        let clean_skeleton = sims_content::Skeleton {
+            name: "open_sim".to_owned(),
+            file: "open-pack/open_sim.skel".to_owned(),
+            place: 0,
+            scales: vec![vec![0]],
+            bones: Vec::new(),
+        };
+        people
+            .skeletons_by_name
+            .insert("open_sim".to_owned(), clean_skeleton.clone());
+        for obj in catalog.objects.iter().filter(|o| o.kind == 2) {
+            people.skeletons.insert(obj.guid, clean_skeleton.clone());
+            people
+                .skeleton_names
+                .insert(obj.guid, "open_sim".to_owned());
+            people.profiles.entry(obj.guid).or_default();
+        }
+
+        let wardrobe = match sims_content::Assets::scan(&install.root) {
+            Ok(assets) => sims_content::Wardrobe::load_with_pool(&assets, &pool),
+            Err(error) => sims_content::Wardrobe::unread(error),
+        };
+        let ordered_wardrobe = load_ordered_wardrobe(&install, &pool);
+
+        Self::boot_preloaded(
+            house,
+            answers,
+            frames,
+            CrtRng::from_state(1),
+            &BTreeSet::new(),
+            None,
+            None,
+            PreloadedBoot {
+                install: &install,
+                neighborhood: &neighborhood,
+                characters: characters.as_deref(),
+                index: &index,
+                catalog,
+                pool: &pool,
+                file: Some(file),
+                program: program_res,
+                animations: animations_res,
+                people: Ok((people, BTreeMap::new())),
+                icon_frames: Ok(None),
+                wardrobe,
+                ordered_wardrobe,
+                surfaces: surfaces_res,
+                default_character_name: "Sim".to_owned(),
+                view_centre: None,
+            },
+        )
+    }
+
     /// The load itself, with every input the loaders above take.
     #[allow(clippy::too_many_arguments)]
     fn boot(
