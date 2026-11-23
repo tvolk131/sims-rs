@@ -2882,3 +2882,72 @@ object "Mixed Tile DGRP" {
         assert!(err.message.contains("symlink"), "{err}");
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_system_symlink_paths_work_while_user_symlinks_remain_rejected() {
+    struct TmpCleanup(PathBuf);
+    impl Drop for TmpCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Explicitly use uncanonicalized `/tmp/...` (where `/tmp -> /private/tmp` on macOS).
+    let root = PathBuf::from(format!(
+        "/tmp/sims-antics-macos-syslink-{}-{seq}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("pack/objects")).expect("mkdir /tmp pack");
+    let _guard = TmpCleanup(root.clone());
+
+    let pack_dir = root.join("pack");
+    std::fs::write(
+        pack_dir.join("pack.toml"),
+        "[pack]\nid = \"mac_pack\"\nname = \"Mac Pack\"\nversion = \"0.1.0\"\narchive = \"mac.far\"\nobjects = [\"demo\"]\n",
+    )
+    .expect("write pack.toml");
+    let obj_path = pack_dir.join("objects/demo.antics");
+    std::fs::write(
+        &obj_path,
+        "object \"Mac Demo\" {\n    guid: 0x7F33_0001;\n    state busy: bool = false;\n    interaction \"Ping\" { guard(sim) => !self.busy, run(sim) { with lock(self.busy) { sleep(1); } return true; } }\n}\n",
+    )
+    .expect("write demo.antics");
+
+    for subcmd in ["check", "expand", "verify"] {
+        let out = Command::new(cli_bin())
+            .args([subcmd])
+            .arg(&obj_path)
+            .output()
+            .expect("run cli subcommand");
+        assert!(
+            out.status.success(),
+            "sims-antics {subcmd} failed on /tmp path: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let out_dir = root.join("built");
+    let build_out = Command::new(cli_bin())
+        .args(["build"])
+        .arg(&pack_dir)
+        .args(["--out"])
+        .arg(&out_dir)
+        .output()
+        .expect("run cli build");
+    assert!(
+        build_out.status.success(),
+        "sims-antics build failed on /tmp path: {}",
+        String::from_utf8_lossy(&build_out.stderr)
+    );
+
+    // Real user symlink under `/tmp/...` must STILL be rejected!
+    let alias = root.join("alias");
+    std::os::unix::fs::symlink(&pack_dir, &alias).expect("symlink alias");
+    let aliased_file = alias.join("objects/demo.antics");
+    let err = compile_v2_object_file(&aliased_file, Some(&pack_dir))
+        .expect_err("user symlink under /tmp must still be rejected");
+    assert!(err.message.contains("symlink"), "{err}");
+}

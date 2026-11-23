@@ -340,6 +340,18 @@ pub fn resolve_v2_file(file_path: &Path, pack_dir: Option<&Path>) -> Result<Reso
     resolve_v2_source(label, &source, &config)
 }
 
+fn is_macos_system_symlink(path: &Path) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    if path.components().count() != 2 {
+        return false;
+    }
+    std::fs::canonicalize(path)
+        .map(|canon| canon.starts_with("/private/"))
+        .unwrap_or(false)
+}
+
 /// Walks an uncanonicalized source path to catch symlinked ancestor components even when
 /// `abs_file` does not lexically start with `base_to_check` or `root_canon` (e.g.
 /// `/tmp/alias/sub/demo.antics` where `/tmp/alias -> /tmp/pack`).
@@ -349,7 +361,8 @@ fn verify_no_symlink_ancestors_to_root(
     root_canon: &Path,
 ) -> Result<()> {
     // 1. Check from the longest common lexical prefix with `base_to_check` down to `abs_file`
-    //    (handles macOS `/var -> /private/var` cleanly while catching `/tmp/alias/...`).
+    //    (allows macOS's top-level `/var` / `/tmp` -> `/private/*` system symlinks while
+    //    still catching any real symlink component like `/tmp/alias/...`).
     let mut common = PathBuf::new();
     for (a, b) in abs_file.components().zip(base_to_check.components()) {
         if a == b {
@@ -371,7 +384,7 @@ fn verify_no_symlink_ancestors_to_root(
     {
         let meta = std::fs::symlink_metadata(cur)
             .map_err(|e| Error::new(format!("failed to inspect {}: {e}", cur.display())))?;
-        if meta.file_type().is_symlink() {
+        if meta.file_type().is_symlink() && !is_macos_system_symlink(cur) {
             return Err(Error::new(format!(
                 "refusing to follow symlink path component: {}",
                 cur.display()
@@ -401,7 +414,7 @@ fn verify_no_symlink_components(base: &Path, rel: &Path) -> Result<()> {
                 cur.push(seg);
                 let meta = std::fs::symlink_metadata(&cur)
                     .map_err(|e| Error::new(format!("failed to inspect {}: {e}", cur.display())))?;
-                if meta.file_type().is_symlink() {
+                if meta.file_type().is_symlink() && !is_macos_system_symlink(&cur) {
                     return Err(Error::new(format!(
                         "refusing to follow symlink path component: {}",
                         cur.display()
