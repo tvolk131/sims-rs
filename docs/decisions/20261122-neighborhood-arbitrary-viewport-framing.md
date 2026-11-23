@@ -23,10 +23,10 @@ The original Sims 1 Complete Collection supported only two fixed display resolut
      1. Samples the four clean inner-perimeter corner patches of `large_frame` (strictly inside the 16 px bevel and outside the `[112..912, 84..684)` cutout / magenta key) and fills the entire viewport with a smooth bilinear royal-blue gradient (with a matching royal-blue fallback when `large_frame` is absent).
      2. Blits the four `16×16` outer bevel corners 1:1 and stretches the four `16 px` outer bevel edges along their length to hug `(0, 0)..(vw, vh)` cleanly.
      3. Applies a multiplicative drop shadow around the centered map rectangle `[ox..ox+bw, oy..oy+bh)` extracted from `large_frame`'s native cutout shadow attenuation (skipping `COLOR_KEY_565` and feathering smoothly to `1.0` so there is never a hard seam or magenta leak on Studio Town / Magic Town).
-   - `CachedBaseLayer` tracks `active_large_frame` whenever `viewport[0] > 800 || viewport[1] > 600` so cached and uncached renders stay 0-diff at every size.
-3. **Chrome alignment & defensive `< 800` scaling (`crates/sims-ui/src/neighborhood.rs`, `crates/sims-game/src/neighborhood.rs`):**
-   - `NeighborhoodShell::resize` refreshes any visible lot hover card so its screen anchor tracks the newly centered map origin immediately.
-   - `draw_four_cell_button` preserves sprite aspect ratio when scaling into compact `< 800` slots while keeping the `>= 800` 1:1 draw path untouched.
+   - `CachedBaseLayer` tracks `active_large_frame` whenever `viewport[0] > 800 || viewport[1] > 600` so cached and uncached renders stay 0-diff at every size, and `hit_test_with_options` clips picking to `lot_clip_for(viewport)` on arbitrary resized viewports so the surround never exposes invisible overhanging lot hotspots (preserving native unclipped picking at `800×600` and `1024×768`).
+3. **Chrome alignment & defensive `< 800` scaling (`crates/sims-ui/src/neighborhood.rs`, `crates/sims-game/src/neighborhood.rs`, `crates/sims-game/src/main.rs`):**
+   - `NeighborhoodShell::resize` and `App::sync_size` re-hit-test any stationary cursor against the resized layout, clearing stale lot highlights/cards when a lot moves away from the cursor while preserving and re-anchoring an open card when the same lot still sits under the cursor.
+   - `draw_four_cell_button` preserves sprite aspect ratio when scaling into compact `< 800` width slots while keeping all `>= 800` width layouts untouched.
 
 ## Consequences
 

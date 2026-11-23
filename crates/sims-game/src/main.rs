@@ -1282,19 +1282,26 @@ impl App {
 
     fn sync_size(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         let scale = self.scale.get();
-        if let Some(canvas) = canvas_size(size, scale) {
-            self.session.resize(canvas);
-        }
-        if self
-            .cursor
-            .is_some_and(|c| canvas_point(c, size, scale).is_none())
-        {
-            self.cursor = None;
-            let _ = match &mut self.session {
-                Session::Starting(_) => false,
-                Session::Standalone { game, .. } => game.leave(),
-                Session::Shell(shell) => shell.leave(),
-            };
+        let resized = canvas_size(size, scale).is_some_and(|canvas| self.session.resize(canvas));
+        if let Some(cursor) = self.cursor {
+            match canvas_point(cursor, size, scale) {
+                None => {
+                    self.cursor = None;
+                    let _ = match &mut self.session {
+                        Session::Starting(_) => false,
+                        Session::Standalone { game, .. } => game.leave(),
+                        Session::Shell(shell) => shell.leave(),
+                    };
+                }
+                Some(point) if resized && self.drag.is_none() => {
+                    let _ = match &mut self.session {
+                        Session::Starting(_) => false,
+                        Session::Standalone { game, .. } => game.hover(point),
+                        Session::Shell(shell) => shell.hover(point),
+                    };
+                }
+                Some(_) => {}
+            }
         }
     }
 

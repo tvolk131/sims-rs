@@ -1447,11 +1447,10 @@ impl NeighborhoodMap {
         canvas: &mut Canvas,
         options: &RenderOptions,
     ) -> Option<Vec<Rect>> {
-        if canvas.width == 0
-            || canvas.height == 0
-            || !canvas.has_pixel_storage()
-            || canvas.width.saturating_mul(canvas.height) > MAX_SURFACE_PIXELS
-        {
+        if canvas.width == 0 || canvas.height == 0 || !canvas.has_pixel_storage() {
+            return None;
+        }
+        if canvas.width.saturating_mul(canvas.height) > MAX_SURFACE_PIXELS {
             self.render_into_uncached(canvas, options);
             return None;
         }
@@ -1681,6 +1680,15 @@ impl NeighborhoodMap {
     }
 
     fn render_into_uncached(&self, canvas: &mut Canvas, options: &RenderOptions) {
+        if canvas.width == 0
+            || canvas.height == 0
+            || canvas
+                .width
+                .checked_mul(canvas.height)
+                .is_none_or(|n| canvas.color.len() < n)
+        {
+            return;
+        }
         let viewport = [canvas.width as u32, canvas.height as u32];
         let origin = self.map_origin_for(viewport);
         let full_clip = [0, 0, canvas.width as i32, canvas.height as i32];
@@ -1912,6 +1920,23 @@ impl NeighborhoodMap {
     /// highlight evaluation, and only the single sampled scanline is
     /// highlighted on hit candidates.
     pub fn hit_test_with_options(&self, options: &RenderOptions, point: [i32; 2]) -> Option<u16> {
+        // Preserve native 1.91 unclipped picking (`0x5e4071`) at stock `800×600`
+        // (and `<= 800×600`) and `1024×768` viewports, while clipping picking to
+        // the drawn map bounds on arbitrary resized viewports so the surround
+        // never exposes invisible overhanging lot hotspots.
+        let is_arbitrary_framed = (options.viewport[0] > MAP_WIDTH
+            || options.viewport[1] > MAP_HEIGHT)
+            && options.viewport != [LARGE_FRAME_NATIVE_WIDTH, LARGE_FRAME_NATIVE_HEIGHT];
+        if is_arbitrary_framed {
+            let map_clip = self.lot_clip_for(options.viewport);
+            if point[0] < map_clip[0]
+                || point[0] >= map_clip[2]
+                || point[1] < map_clip[1]
+                || point[1] >= map_clip[3]
+            {
+                return None;
+            }
+        }
         let origin = self.map_origin_for(options.viewport);
         for lot in self.lots.iter().rev() {
             let fade = effective_roof_fade(lot.id, options);
@@ -4615,7 +4640,7 @@ fn render_arbitrary_large_frame(
 ) {
     let vw = canvas.width;
     let vh = canvas.height;
-    if vw == 0 || vh == 0 {
+    if vw == 0 || vh == 0 || vw.checked_mul(vh).is_none_or(|n| canvas.color.len() < n) {
         return;
     }
 
@@ -7223,5 +7248,15 @@ mod tests {
                 }
             }
         }
+
+        // Truncated/short pixel storage must return cleanly without panicking.
+        let mut short_canvas = Canvas::new(800, 800, [0, 0, 0]);
+        short_canvas.color.truncate(800 * 700);
+        let opts_800x800 = RenderOptions {
+            viewport: [800, 800],
+            ..RenderOptions::default()
+        };
+        map.render_into(&mut short_canvas, &opts_800x800);
+        map.render_into_uncached(&mut short_canvas, &opts_800x800);
     }
 }

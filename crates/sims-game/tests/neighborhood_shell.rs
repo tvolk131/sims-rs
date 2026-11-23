@@ -881,8 +881,12 @@ fn neighborhood_shell_resizes_cleanly_across_non_native_viewports() {
         }
     }
 
-    // Hover Goth lot 5 at 1440×768, verify hover popup opens with centered anchor,
-    // then resize to 1024×860 and verify the open popup anchor updates immediately.
+    // Hover Goth lot 5 near its interior at 1440×768, verify hover popup opens with
+    // centered anchor, then test both resize outcomes for a stationary cursor:
+    // 1. Small resize (1440×768 -> 1442×768) where the cursor stays on lot 5: preserves
+    //    the open popup card and updates its anchor to the new centered origin.
+    // 2. Large resize (1442×768 -> 1024×860) where lot 5 shifts away from the cursor:
+    //    clears the stale lot 5 hover and stale popup card immediately.
     shell.resize([1440, 768]);
     let goth_lot = shell.map().lot(5).expect("Goth lot 5");
     let goth_anchor_1440 = {
@@ -896,7 +900,10 @@ fn neighborhood_shell_resizes_cleanly_across_non_native_viewports() {
         .step_by(2)
     {
         for x in (goth_rect_1440[0].max(0)..goth_rect_1440[2].min(1440)).step_by(2) {
-            if shell.map().hit_test([1440, 768], [x, y]) == Some(5) {
+            if shell.map().hit_test([1440, 768], [x, y]) == Some(5)
+                && shell.map().hit_test([1442, 768], [x, y]) == Some(5)
+                && shell.map().hit_test([1024, 860], [x, y]) != Some(5)
+            {
                 goth_pt_1440 = Some([x, y]);
                 break 'search;
             }
@@ -916,21 +923,35 @@ fn neighborhood_shell_resizes_cleanly_across_non_native_viewports() {
         goth_anchor_1440
     );
 
-    shell.resize([1024, 860]);
-    let goth_anchor_1024 = {
-        let [ox, oy] = shell.map().map_origin_for([1024, 860]);
+    // 1. Stationary cursor still hits Goth lot 5 after 1440×768 -> 1442×768 resize.
+    shell.resize([1442, 768]);
+    let goth_anchor_1442 = {
+        let [ox, oy] = shell.map().map_origin_for([1442, 768]);
         let lot = shell.map().lot(5).expect("Goth lot 5");
         [ox + lot.anchor[0], oy + lot.anchor[1]]
     };
+    assert_eq!(shell.hovered_lot_id(), Some(5));
     assert_eq!(
         shell
             .neighborhood_state()
             .hovered_lot
             .as_ref()
-            .expect("Goth popup still visible after resize")
+            .expect("Goth popup preserved when cursor stays on lot 5")
             .anchor,
-        goth_anchor_1024,
+        goth_anchor_1442,
         "open lot hover popup anchor must track centered map origin on resize"
+    );
+
+    // 2. Stationary cursor moves off Goth lot 5 after 1442×768 -> 1024×860 resize.
+    shell.resize([1024, 860]);
+    assert_ne!(
+        shell.hovered_lot_id(),
+        Some(5),
+        "stale Goth lot 5 highlight must clear when resize moves lot away from cursor"
+    );
+    assert!(
+        shell.neighborhood_state().hovered_lot.is_none(),
+        "stale Goth lot 5 popup card must close when resize moves lot away from cursor"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);

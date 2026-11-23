@@ -616,6 +616,36 @@ fn arbitrary_viewports_have_seamless_surround_zero_black_margins_and_aligned_hit
                 }
             }
 
+            // At native 1024×768, every outer frame pixel outside [112..912, 84..684)
+            // must match `large_frame` bit-for-bit (pinning outer bevel & drop shadow).
+            if viewport == [1024, 768]
+                && let Some(ref frame) = map.large_frame
+            {
+                for y in 0..768usize {
+                    for x in 0..1024usize {
+                        if (112..912).contains(&x) && (84..684).contains(&y) {
+                            continue;
+                        }
+                        let want = sims_render::pack_rgb(sims_render::neighborhood::widen_565(
+                            frame.pixels[y * 1024 + x],
+                        ));
+                        assert_eq!(
+                            canvas.color[y * 1024 + x],
+                            want,
+                            "{kind:?} 1024x768 native outer frame pixel mismatch at ({x}, {y})"
+                        );
+                    }
+                }
+            }
+
+            // On Unleashed at 1440×768, lot 2's overhanging pixel at (1122, 150) lies
+            // 2 px outside the drawn map edge (x = 1120) and must NOT be an invisible
+            // hotspot in the arbitrary surround (matching Canvas::id_at == None).
+            if kind == NeighborhoodKind::Unleashed && viewport == [1440, 768] {
+                assert_eq!(map.hit_test(viewport, [1122, 150]), None);
+                assert_eq!(canvas.id_at(1122, 150), None);
+            }
+
             // Outside the centered map, non-native sizes > 800×600 must have ZERO pure-black
             // voids and ZERO magenta cutout leaks (critical for StudioTown/MagicTown).
             if vw > MAP_WIDTH || vh > MAP_HEIGHT {

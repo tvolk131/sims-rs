@@ -978,6 +978,7 @@ impl NeighborhoodChrome {
         }
 
         // 4. All interactive bar buttons + Credits billboard.
+        let compact_width = layout.frame_size[0] < NATIVE_WIDTH;
         for placement in &layout.buttons {
             let btn = placement.button;
             let enabled = btn.is_enabled(state);
@@ -990,7 +991,14 @@ impl NeighborhoodChrome {
             } else {
                 0
             };
-            draw_four_cell_button(frame, art, btn.art_id(), cell, placement.draw_rect);
+            draw_four_cell_button(
+                frame,
+                art,
+                btn.art_id(),
+                cell,
+                placement.draw_rect,
+                compact_width,
+            );
         }
 
         // 5. Lot hover / House Info popup card.
@@ -1060,7 +1068,14 @@ fn button_cell_size(art: &Art, button: BarButton) -> [i32; 2] {
     button.native_size()
 }
 
-fn draw_four_cell_button(frame: &mut Frame, art: &Art, id: i32, cell: u32, dest: Rect) {
+fn draw_four_cell_button(
+    frame: &mut Frame,
+    art: &Art,
+    id: i32,
+    cell: u32,
+    dest: Rect,
+    preserve_aspect: bool,
+) {
     if dest.width <= 0 || dest.height <= 0 {
         return;
     }
@@ -1073,7 +1088,7 @@ fn draw_four_cell_button(frame: &mut Frame, art: &Art, id: i32, cell: u32, dest:
         let sx = cw.saturating_mul(cell.min(3) as i32);
         if dest.width == cw && dest.height == ch {
             frame.draw(img, Rect::new(sx, 0, cw, ch), [dest.x, dest.y]);
-        } else {
+        } else if preserve_aspect {
             // Preserve aspect ratio within `dest` for compact viewports < 800 px
             // so circular neighborhood buttons stay round instead of squishing
             // into vertical slivers.
@@ -1099,6 +1114,8 @@ fn draw_four_cell_button(frame: &mut Frame, art: &Art, id: i32, cell: u32, dest:
                 fit_h,
             );
             draw_scaled_region(frame, img, Rect::new(sx, 0, cw, ch), fit_dest);
+        } else {
+            draw_scaled_region(frame, img, Rect::new(sx, 0, cw, ch), dest);
         }
     } else {
         let color = match cell {
