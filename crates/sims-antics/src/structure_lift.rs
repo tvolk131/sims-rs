@@ -76,6 +76,29 @@ fn collect_canonical_chunks<'a>(
     by_id
 }
 
+/// Extracts US English strings in the exact order the original Sims 1 loader
+/// (`sims-vm/src/program.rs::loaded_order`) indexes them: each run of one language
+/// restarts its insertion slot at 0, so a later English run is inserted in front of
+/// earlier runs. Non-localized formats decode every entry with `language == 1` in
+/// file order, so this helper handles all `STR#` formats uniformly and returns an
+/// empty list for localized tables with no English entries (matching VM behavior).
+fn loaded_str_order(entries: &[sims_formats::strings::TextEntry]) -> Vec<String> {
+    let mut loaded: Vec<String> = Vec::new();
+    let mut run = None;
+    let mut place = 0usize;
+    for entry in entries {
+        if run != Some(entry.language) {
+            run = Some(entry.language);
+            place = 0;
+        }
+        if entry.language == 1 {
+            loaded.insert(place.min(loaded.len()), entry.text.clone());
+            place += 1;
+        }
+    }
+    loaded
+}
+
 /// Extracts strictly in-memory [`LiftSymbols`] (private `BHAV` labels, local `BCON` tables,
 /// and local `STR#` tables) from a parsed [`sims_formats::iff::Iff`], preferring canonical
 /// high-flag-byte `0` chunks and skipping deleted chunks.
@@ -101,16 +124,10 @@ pub fn extract_lift_symbols_from_iff(iff: &sims_formats::iff::Iff) -> LiftSymbol
             sims_formats::strings::StringTable::parse_chunk(data, iff.resource_flags(chunk))
         });
         if let Ok(table) = parsed {
-            let mut texts: Vec<String> = table
-                .entries
-                .iter()
-                .filter(|e| e.language == 1)
-                .map(|e| e.text.clone())
-                .collect();
-            if texts.is_empty() {
-                texts = table.entries.into_iter().map(|e| e.text).collect();
+            let texts = loaded_str_order(&table.entries);
+            if !texts.is_empty() {
+                symbols.strings.insert(id, texts);
             }
-            symbols.strings.insert(id, texts);
         }
     }
 
@@ -3534,6 +3551,208 @@ mod tests {
         assert!(
             !plain.contains("//"),
             "plain lift must emit zero comments:\n{plain}"
+        );
+    }
+
+    #[test]
+    fn sol_wave2_r1_zero_instruction_while_true_and_localized_str_order_regressions() {
+        use crate::compile::compile_antics;
+        use crate::encode::{encode_bhav, encode_string_table};
+        use crate::ir::{StringEntry, StringFormat, StringTableChunk};
+        use sims_formats::iff::{ChunkData, Iff, write as write_iff};
+
+        // P1-1a: `refresh(0, 0); while true { return false; } refresh(0, 1);`
+        // First refresh must jump directly to TARGET_FALSE and never emit/jump to refresh(0, 1).
+        let t1 = &compile_antics(
+            r#"
+            tree 4096 "T1" {
+                refresh(target: 0, mode: 0);
+                while true { return false; }
+                refresh(target: 0, mode: 1);
+            }
+            "#,
+        )
+        .expect("compile T1")
+        .behaviors[&4096];
+        assert_eq!(t1.instructions.len(), 1);
+        assert_eq!(t1.instructions[0].opcode, 7);
+        assert_eq!(t1.instructions[0].on_true, TARGET_FALSE);
+        assert_eq!(t1.instructions[0].on_false, TARGET_FALSE);
+
+        // P1-1b: `refresh(0, 0); while true { return false; }` (no trailing stmt) must not point OOB.
+        let t2 = &compile_antics(
+            r#"
+            tree 4096 "T2" {
+                refresh(target: 0, mode: 0);
+                while true { return false; }
+            }
+            "#,
+        )
+        .expect("compile T2")
+        .behaviors[&4096];
+        assert_eq!(t2.instructions.len(), 1);
+        assert_eq!(t2.instructions[0].on_true, TARGET_FALSE);
+        assert_eq!(t2.instructions[0].on_false, TARGET_FALSE);
+
+        // P1-1c: `while true { return false; } refresh(0, 0);` must return false, not run refresh.
+        let t3 = &compile_antics(
+            r#"
+            tree 4096 "T3" {
+                while true { return false; }
+                refresh(target: 0, mode: 0);
+            }
+            "#,
+        )
+        .expect("compile T3")
+        .behaviors[&4096];
+        assert_eq!(t3.instructions.len(), 1);
+        assert_eq!(t3.instructions[0].opcode, 2);
+        assert_eq!(t3.instructions[0].on_true, TARGET_FALSE);
+        assert_eq!(t3.instructions[0].on_false, TARGET_FALSE);
+
+        // P1-1d: Nested `while true { while true { break; } refresh(0, 0); }` must patch outer
+        // back-edge cleanly to node 0 with zero unpatched sentinels!
+        let t4 = &compile_antics(
+            r#"
+            tree 4096 "T4" {
+                while true {
+                    while true { break; }
+                    refresh(target: 0, mode: 0);
+                }
+            }
+            "#,
+        )
+        .expect("compile T4")
+        .behaviors[&4096];
+        assert_eq!(t4.instructions.len(), 1);
+        assert_eq!(t4.instructions[0].opcode, 7);
+        assert_eq!(t4.instructions[0].on_true, 0);
+        assert_eq!(t4.instructions[0].on_false, 0);
+
+        // P1-1e: `while true { while true { break; } }` must emit a clean 1-node self-loop.
+        let t5 = &compile_antics(
+            r#"
+            tree 4096 "T5" {
+                while true {
+                    while true { break; }
+                }
+            }
+            "#,
+        )
+        .expect("compile T5")
+        .behaviors[&4096];
+        assert_eq!(t5.instructions.len(), 1);
+        assert_eq!(t5.instructions[0].on_true, 0);
+        assert_eq!(t5.instructions[0].on_false, 0);
+
+        // P1-1f: `refresh(0, 0); while true { break; } return true;` jumps directly to TARGET_TRUE.
+        let t6 = &compile_antics(
+            r#"
+            tree 4096 "T6" {
+                refresh(target: 0, mode: 0);
+                while true { break; }
+                return true;
+            }
+            "#,
+        )
+        .expect("compile T6")
+        .behaviors[&4096];
+        assert_eq!(t6.instructions.len(), 1);
+        assert_eq!(t6.instructions[0].on_true, TARGET_TRUE);
+
+        // P2-2: Localized STR# with interleaved English/French/English matches VM `loaded_order`
+        // (`Last` before `First`), and French-only localized STR# produces NO preview comment.
+        let str_interleaved = StringTableChunk::new(
+            *b"STR#",
+            300,
+            "Interleaved",
+            StringFormat::Localized,
+            vec![
+                StringEntry::english("First"),
+                StringEntry {
+                    language: 2,
+                    text: "Autre".to_owned(),
+                    comment: String::new(),
+                    raw_text: None,
+                    raw_comment: None,
+                },
+                StringEntry::english("Last"),
+            ],
+        );
+        let str_french_only = StringTableChunk::new(
+            *b"STR#",
+            301,
+            "FrenchOnly",
+            StringFormat::Localized,
+            vec![StringEntry {
+                language: 2,
+                text: "Seulement".to_owned(),
+                comment: String::new(),
+                raw_text: None,
+                raw_comment: None,
+            }],
+        );
+        let probe = &compile_antics(
+            r#"
+            tree 4096 "Probe" {
+                action_string(table: 300, index: 1);
+                action_string(table: 300, index: 2);
+                dialog(kind: 0, message: 1, title: 0, button1: 0, button2: 0, button3: 0, mode4_str: 0, flags: 0);
+                return true;
+            }
+            "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let iff_bytes = write_iff(&[
+            ChunkData {
+                tag: *b"BHAV",
+                id: 4096,
+                flags: 0,
+                label: "Probe".to_owned(),
+                data: encode_bhav(probe).unwrap(),
+            },
+            ChunkData {
+                tag: *b"STR#",
+                id: 300,
+                flags: 0,
+                label: "Interleaved".to_owned(),
+                data: encode_string_table(&str_interleaved).unwrap(),
+            },
+            ChunkData {
+                tag: *b"STR#",
+                id: 301,
+                flags: 0,
+                label: "FrenchOnly".to_owned(),
+                data: encode_string_table(&str_french_only).unwrap(),
+            },
+        ])
+        .unwrap();
+        let iff = Iff::parse(iff_bytes).unwrap();
+        let symbols = extract_lift_symbols_from_iff(&iff);
+        let lifted = match lift_bhav_structured_with_context(
+            probe,
+            LiftOptions {
+                strict_padding: true,
+                annotate_comments: true,
+            },
+            None,
+            Some(&symbols),
+        ) {
+            StructuredLiftOutcome::Lifted(s) => s,
+            other => panic!("expected Lifted, got {other:?}"),
+        };
+        assert!(
+            lifted.contains("action_string(table: 300, index: 1); // \"Last\""),
+            "interleaved localized STR# index 1 must preview \"Last\" matching VM loaded_order:\n{lifted}"
+        );
+        assert!(
+            lifted.contains("action_string(table: 300, index: 2); // \"First\""),
+            "interleaved localized STR# index 2 must preview \"First\" matching VM loaded_order:\n{lifted}"
+        );
+        assert!(
+            !lifted.contains("Seulement"),
+            "French-only localized STR# must not emit a misleading preview:\n{lifted}"
         );
     }
 }

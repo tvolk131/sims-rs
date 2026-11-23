@@ -712,10 +712,11 @@ fn compute_private_helper_param_consts(
             if !reach[i] {
                 continue;
             }
-            // `RunFunctionalTree` (20), `RunTreeByName` (28), `GosubFoundAction` (30), and
-            // `Reach` (47, which runs `"CT - Grab"` / `"CT - Put"` by name) can invoke private
-            // trees dynamically, so no private helper has a closed inline caller set.
-            if matches!(ins.opcode, 20 | 28 | 30 | 47) {
+            // `FindBestInteraction` (3), `RunFunctionalTree` (20), `RunTreeByName` (28),
+            // `GosubFoundAction` (30), and `Reach` (47, which runs `"CT - Grab"` / `"CT - Put"`
+            // by name) can invoke private trees dynamically, so no private helper has a closed
+            // inline caller set.
+            if matches!(ins.opcode, 3 | 20 | 28 | 30 | 47) {
                 has_dynamic_tree_dispatch = true;
             }
             if !(4096..=8191).contains(&ins.opcode) {
@@ -1384,6 +1385,7 @@ fn verify_bhav_static(
                 }
                 15 => {
                     let scope = word_i16(ops, 2);
+                    let cond_idx = word_i16(ops, 0);
                     if !(0..=255).contains(&scope) {
                         add_err(
                             violations,
@@ -1392,7 +1394,36 @@ fn verify_bhav_static(
                             format!("Breakpoint scope {scope} out of 0..=255 range"),
                         );
                     } else {
-                        check_operand(scope as u8, word_i16(ops, 0), false, violations);
+                        check_operand(scope as u8, cond_idx, false, violations);
+                        let (ref cur_p, ref cur_l) = node_consts[idx];
+                        let static_cond_vals: Option<BTreeSet<i16>> = match scope as u8 {
+                            7 => Some(BTreeSet::from([cond_idx])),
+                            9 => cur_p.get(&cond_idx).and_then(|v| v.clone()),
+                            25 => cur_l.get(&cond_idx).and_then(|v| v.clone()),
+                            26 => lookup_bcon(model, cond_idx).map(|v| BTreeSet::from([v])),
+                            _ => None,
+                        };
+                        match static_cond_vals.as_ref() {
+                            Some(vals) if !vals.is_empty() && vals.iter().all(|&v| v == 0) => {}
+                            Some(vals) if vals.iter().any(|&v| v != 0) => {
+                                let bad = vals.iter().copied().find(|&v| v != 0).unwrap_or(1);
+                                add_err(
+                                    violations,
+                                    SafetyCategory::PotentialTrap,
+                                    idx,
+                                    format!(
+                                        "Breakpoint condition can be nonzero ({bad}), raising native error 0x3e"
+                                    ),
+                                );
+                            }
+                            _ => add_err(
+                                violations,
+                                SafetyCategory::PotentialTrap,
+                                idx,
+                                "Breakpoint condition is unproved non-zero and may raise native error 0x3e"
+                                    .to_owned(),
+                            ),
+                        }
                     }
                 }
                 16 => {
@@ -2150,8 +2181,9 @@ fn collect_tree_lock_ops(
             record_unknown_dst_write(ins.operands[4], word_i16(&ins.operands, 6), out);
         } else if ins.opcode == 31 && ins.operands[4] & 0x80 != 0 {
             record_unknown_dst_write(ins.operands[5], i16::from(ins.operands[7]), out);
-        } else if matches!(ins.opcode, 30 | 47) {
-            // GosubFoundAction (30) and Reach (47, CT - Grab/Put) invoke dynamic trees.
+        } else if matches!(ins.opcode, 3 | 30 | 47) {
+            // FindBestInteraction (3, TTAB check trees), GosubFoundAction (30), and
+            // Reach (47, CT - Grab/Put) invoke dynamic trees.
             out.has_dynamic_call = true;
         } else if ins.opcode == 28 {
             match resolve_named_tree_local(model, &ins.operands) {
@@ -2308,9 +2340,8 @@ fn verify_object_locks(model: &ObjectModel, violations: &mut Vec<SafetyViolation
                     tree_name: tree_name.clone(),
                     category: SafetyCategory::InconclusiveProof,
                     node: None,
-                    message:
-                        "reachable unresolved Run Tree By Name prevents complete lock safety proof"
-                            .to_owned(),
+                    message: "reachable dynamic tree call prevents complete lock safety proof"
+                        .to_owned(),
                     path: Vec::new(),
                 });
             }
@@ -2370,6 +2401,14 @@ fn eval_sym_operand(model: &ObjectModel, state: &LockState, scope: u8, idx: i16)
             .copied()
             .unwrap_or(SymWord::Unknown),
         10 => frame.stack_obj,
+        11 => match state.temps.get(idx as usize).copied() {
+            Some(SymWord::Const(t)) => state
+                .temps
+                .get(t as usize)
+                .copied()
+                .unwrap_or(SymWord::Unknown),
+            _ => SymWord::Unknown,
+        },
         22 => {
             // Scope 22 is `stack.attr[param[idx]]` (`sims-vm/src/memory.rs:461`).
             if frame.stack_obj == SymWord::InitialTarget
@@ -2412,6 +2451,19 @@ fn write_sym_operand(state: &mut LockState, scope: u8, idx: i16, val: SymWord) {
         }
         10 => {
             frame.stack_obj = val;
+        }
+        11 => {
+            // Scope 11 writes `temp[temp[idx]]` (`sims-vm/src/memory.rs:446`).
+            match state.temps.get(idx as usize).copied() {
+                Some(SymWord::Const(t)) => {
+                    if let Some(slot) = state.temps.get_mut(t as usize) {
+                        *slot = val;
+                    }
+                }
+                _ => {
+                    state.temps.fill(SymWord::Unknown);
+                }
+            }
         }
         25 => {
             if let Some(slot) = frame.locals.get_mut(idx as usize) {
@@ -2975,6 +3027,19 @@ fn prove_interaction_lock_safety(
                     }
                 }
             }
+            3 | 30 | 47 => {
+                let name = match ins.opcode {
+                    3 => "Find Best Interaction",
+                    30 => "Gosub Found Action",
+                    _ => "Reach",
+                };
+                return Err(LockProofFailure::Inconclusive {
+                    reason: format!(
+                        "reachable {name} at tree#{cur_tree}@n{cur_pc} can invoke dynamic trees"
+                    ),
+                    trace,
+                });
+            }
             opcode if (4096..=8191).contains(&opcode) && model.behaviors.contains_key(&opcode) => {
                 if state.frames.len() >= 8 {
                     return Err(LockProofFailure::Inconclusive {
@@ -3083,9 +3148,8 @@ fn prove_interaction_lock_safety(
                         write_sym_operand(&mut next_true, 9, p, SymWord::Const(0));
                         write_sym_operand(&mut next_false, 9, p, SymWord::Const(0));
                     }
-                    3 | 19 => {
-                        // FindBestInteraction (3) and MakeNewCharacter (19) overwrite `stack_obj`
-                        // on `true` (`autonomy.rs:11`, `make_character.rs:30`).
+                    19 => {
+                        // MakeNewCharacter (19) overwrites `stack_obj` on `true` (`make_character.rs:30`).
                         write_sym_operand(&mut next_true, 10, 0, SymWord::Unknown);
                     }
                     8 => {
@@ -3388,17 +3452,52 @@ fn primitive_may_trap_in_lock_prover(
         12 => {
             let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
             let dst_idx = word_i16(ops, 0);
-            dst_scope > 255
-                || !is_valid_memory_scope(dst_scope as u8)
-                || matches!(
-                    dst_scope,
-                    7 | 14 | 15 | 17 | 21 | 24 | 26 | 27 | 28 | 29 | 33 | 35 | 38
-                )
-                || (dst_scope == 6 && !matches!(dst_idx, 34 | 36))
-                || (dst_scope == 9 && check_param(dst_idx))
-                || (dst_scope == 25 && check_local(dst_idx))
-                || frame.stack_obj != SymWord::InitialTarget
-                || (ops[4] & 1 != 0)
+            let dst_may_trap = if dst_scope > 255 || !is_valid_memory_scope(dst_scope as u8) {
+                true
+            } else {
+                match dst_scope as u8 {
+                    // Read-only, float motive, or object/room/world scopes that may trap on write.
+                    0 | 3 | 4 | 7 | 14..=21 | 23 | 24 | 26..=38 => true,
+                    1 => {
+                        frame.stack_obj != SymWord::InitialTarget
+                            || dst_idx < 0
+                            || model.objds.is_empty()
+                            || !model.objds.values().all(|o| {
+                                usize::from(dst_idx as u16)
+                                    < usize::from(o.words.get(58).copied().unwrap_or(0))
+                            })
+                    }
+                    6 => !matches!(dst_idx, 34 | 36),
+                    8 => !(0..8).contains(&dst_idx),
+                    9 => check_param(dst_idx),
+                    10 => dst_idx != 0,
+                    11 => {
+                        !(0..8).contains(&dst_idx)
+                            || !matches!(
+                                state.temps[dst_idx as usize],
+                                SymWord::Const(t) if (0..8).contains(&t)
+                            )
+                    }
+                    13 => !(0..8).contains(&dst_idx) || frame.stack_obj != SymWord::InitialTarget,
+                    22 => {
+                        check_param(dst_idx)
+                            || frame.stack_obj != SymWord::InitialTarget
+                            || model.objds.is_empty()
+                            || !matches!(
+                                frame.params[dst_idx as usize],
+                                SymWord::Const(a)
+                                    if a >= 0
+                                        && model.objds.values().all(|o| {
+                                            usize::from(a as u16)
+                                                < usize::from(o.words.get(58).copied().unwrap_or(0))
+                                        })
+                            )
+                    }
+                    25 => check_local(dst_idx),
+                    _ => true,
+                }
+            };
+            dst_may_trap || frame.stack_obj != SymWord::InitialTarget || (ops[4] & 1 != 0)
         }
         15 => !(word_i16(ops, 2) == 7 && word_i16(ops, 0) == 0),
         16 => {
@@ -3569,8 +3668,10 @@ fn bhav_uses_global_34(bhav: &BhavChunk) -> bool {
                     && is_global_34(ins.operands[5], word_i16(&ins.operands, 6)))
         }
         15 => word_i16(&ins.operands, 2) == 6 && word_i16(&ins.operands, 0) == 34,
-        // `UI Effect` (opcode 34) reads Global 34 / scratch pointers (`ui_effect.rs:371`).
-        34 => true,
+        // `UI Effect` (opcode 34) reads Global 34 / scratch pointers (`ui_effect.rs:371`), and
+        // any dynamic tree callback or subroutine call can invoke a callee that observes the
+        // actor's scratch pointer (e.g. `Reach` calling `CT - Grab` with `ui_effect`).
+        3 | 20 | 28 | 30 | 34 | 47 | 256..=u16::MAX => true,
         _ => false,
     })
 }
@@ -6622,6 +6723,202 @@ guard = "Guard"
                 EquivResult::Counterexample { .. }
             ),
             "OldRelationship read mutates param[0], so folding param[0] == 7 to true must be rejected"
+        );
+    }
+
+    #[test]
+    fn sol_wave2_r1_soundness_regressions() {
+        use crate::compile::{compile_antics, compile_object_from_sources};
+
+        let base_manifest = r#"
+[object]
+name = "SolWave2R1Probe"
+guid = 0x50110004
+init = "Init"
+main = "Init"
+scripts = ["behavior.antics"]
+
+[[interaction]]
+name = "Probe"
+action = "Action"
+guard = "Guard"
+"#;
+
+        // P1-2: Reach (47), GosubFoundAction (30), and FindBestInteraction (3) must return
+        // InconclusiveProof even when a tracked lock was acquired and released before them!
+        for (label, call_stmt) in [
+            ("Reach", "reach(mode: 0, moves: true);"),
+            ("GosubFoundAction", "gosub_found_action();"),
+            ("FindBestInteraction", "find_best_interaction();"),
+        ] {
+            let script = format!(
+                r#"
+                tree 4096 "Init" {{ return true; }}
+                tree 4098 "Guard" {{
+                    if stack.attr[0] != 0 {{ return false; }}
+                    return true;
+                }}
+                tree 4097 "Action" {{
+                    stack.attr[0] := 1;
+                    stack.attr[0] := 0;
+                    {call_stmt}
+                    return true;
+                }}
+                "#
+            );
+            let obj = compile_object_from_sources(base_manifest, &[("behavior.antics", &script)])
+                .unwrap();
+            let rep = verify_object_safety(&obj).unwrap();
+            assert!(
+                rep.violations
+                    .iter()
+                    .any(|v| v.category == SafetyCategory::InconclusiveProof),
+                "{label} after balanced lock acquire/release must return InconclusiveProof: {:?}",
+                rep.violations
+            );
+        }
+
+        // P1-3a: GetDirectionTo writing scope(11, 0) (`temp[temp[0]]`) must invalidate temp[1]!
+        let scope11_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            tree 4097 "Action" {
+                stack.attr[0] := 1;
+                temp[0] := 1;
+                temp[1] := 0;
+                get_direction_to(scope(11, 0));
+                if temp[1] == 0 {
+                    stack.attr[0] := 0;
+                }
+                return true;
+            }
+        "#;
+        let scope11_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", scope11_script)])
+                .unwrap();
+        let scope11_rep = verify_object_safety(&scope11_obj).unwrap();
+        assert!(
+            scope11_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::LockLeak),
+            "GetDirectionTo writing scope(11, 0) must invalidate temp[1] and catch LockLeak: {:?}",
+            scope11_rep.violations
+        );
+
+        // P1-3b: GetDirectionTo writing scope(22, 0) with param[0] = -1 traps before lock release!
+        let scope22_trap_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            tree 4097 "Action" (args: 1) {
+                stack.attr[0] := 1;
+                param[0] := -1;
+                get_direction_to(scope(22, 0));
+                stack.attr[0] := 0;
+                return true;
+            }
+        "#;
+        let scope22_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", scope22_trap_script)])
+                .unwrap();
+        let scope22_rep = verify_object_safety(&scope22_obj).unwrap();
+        assert!(
+            scope22_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::LockLeak),
+            "GetDirectionTo writing scope(22, 0) with param[0] = -1 must trap and catch LockLeak: {:?}",
+            scope22_rep.violations
+        );
+
+        // P1-4: Equivalence must NOT erase `0 == 0` scratch-pointer init before `Reach`!
+        let reach_with_init = &compile_antics(
+            r#"
+            tree 4096 "A" {
+                if 0 == 0 {
+                    reach(mode: 0, moves: true);
+                }
+                return true;
+            }
+            "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let reach_without_init = &compile_antics(
+            r#"
+            tree 4096 "B" {
+                reach(mode: 0, moves: true);
+                return true;
+            }
+            "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        assert!(
+            !matches!(
+                check_bhav_equivalent(
+                    reach_with_init,
+                    reach_without_init,
+                    &EquivOptions::default()
+                ),
+                EquivResult::Equivalent { .. }
+            ),
+            "Equivalence must not erase `0 == 0` scratch-pointer init before Reach"
+        );
+
+        // P2-1: Breakpoint static trap checks (`breakpoint()` and nonzero local trap; `0` passes).
+        let bp_trap_script = r#"
+            tree 4096 "Init" (locals: 1) {
+                breakpoint();
+                local[0] := 1;
+                breakpoint(local[0]);
+                return true;
+            }
+            tree 4098 "Guard" { return true; }
+            tree 4097 "Action" { return true; }
+        "#;
+        let bp_trap_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", bp_trap_script)])
+                .unwrap();
+        let bp_trap_rep = verify_object_safety(&bp_trap_obj).unwrap();
+        let bp_traps: Vec<&str> = bp_trap_rep
+            .violations
+            .iter()
+            .filter(|v| {
+                v.category == SafetyCategory::PotentialTrap && v.message.contains("Breakpoint")
+            })
+            .map(|v| v.message.as_str())
+            .collect();
+        assert_eq!(
+            bp_traps.len(),
+            2,
+            "expected 2 Breakpoint PotentialTrap diagnostics, got: {bp_traps:?}"
+        );
+
+        let bp_safe_script = r#"
+            tree 4096 "Init" (locals: 1) {
+                breakpoint(0);
+                local[0] := 0;
+                breakpoint(local[0]);
+                return true;
+            }
+            tree 4098 "Guard" { return true; }
+            tree 4097 "Action" { return true; }
+        "#;
+        let bp_safe_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", bp_safe_script)])
+                .unwrap();
+        let bp_safe_rep = verify_object_safety(&bp_safe_obj).unwrap();
+        assert!(
+            bp_safe_rep.violations.is_empty(),
+            "zero-condition Breakpoint must pass static checks: {:?}",
+            bp_safe_rep.violations
         );
     }
 }

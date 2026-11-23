@@ -23,19 +23,19 @@ All 15 remaining executable primitives in `0..52` (opcodes `38, 39, 40` are the 
 | Opcode | `.air` Syntax | VM Reference | Notes |
 |---|---|---|---|
 | `0x0003` (3) | `find_best_interaction()` | `autonomy.rs` | Sets `stack_obj` (`SymWord::Unknown`) |
-| `0x0009` (9) | `burn(mode:, flags:)` | `burn.rs` | `mode: u16`, `flags: u16` |
+| `0x0009` (9) | `burn(mode:, flags:)` | `burn.rs` | `mode: u8`, `flags: u8` |
 | `0x000a` (10) | `tutorial(mode)` | `events.rs` | Traps when `mode > 1` |
 | `0x000b` (11) | `get_distance_to(temp[N][, from: <op>][, flags: f])` | `distance.rs` | Always-true; `from` reads `ops[3], ops[4..6]` when `flags & 1 != 0`; Global 34 modeled |
 | `0x000c` (12) | `get_direction_to(<dst>[, from: <op>][, flags: f])` | `direction.rs` | Always-true; writes `<dst>` (tracked in static, lock, dataflow, and equiv models); Global 34 & scope 22 modeled |
 | `0x000f` (15) | `breakpoint(<cond>)` | `debug.rs` | Always-true; reads operand `ops[0..2]` in scope `ops[2..4]`; Global 34 modeled |
 | `0x0013` (19) | `make_new_character(skin:, age:, sex:, species:)` | `make_character.rs` | Writes `stack_obj` |
-| `0x0015` (21) | `show_string(table:, index:)` | `events.rs` | Always-true; `table: u16`, `index: u16` |
+| `0x0015` (21) | `show_string(table:, index:)` | `debug.rs` | Always-true; `table: u16`, `index: u16` |
 | `0x0016` (22) | `look_towards(mode)` | `look_towards.rs` | Always-true when `mode == 0`; traps when `mode > 3` |
 | `0x0018` (24) | `old_relationship(write:, column:, param:, dir:, flags:)` | `relationship.rs` | Legacy opcode 24; always-true when `flags & 1 == 0`; write-back to `param[N]` modeled |
 | `0x001e` (30) | `gosub_found_action()` | `found_action.rs` | Dynamic subroutine call; disables closed-caller param inference & reports `InconclusiveProof` when reachable |
 | `0x0021` (33) | `find_worst_motives(target:, mode:)` | `worst_motives.rs` | Always-true; traps on `target == 2` or `mode > 2`; mutates `temp[0..=4]` |
 | `0x0022` (34) | `ui_effect(mode:[, target: <op>][, flags: f])` | `ui_effect.rs` | Always-true; reads `target` only when `mode <= 2` |
-| `0x0023` (35) | `special_effect(duration:, kind:, size:, flags:, str_index:)` | `special_effect.rs` | Always-true; `duration: u8`, `kind: u8`, `size: u16`, `flags: u16`, `str_index: u16` |
+| `0x0023` (35) | `special_effect(duration:, kind:, size:, flags:, str_index:)` | `special_effect.rs` | Always-true; `duration: i16`, `kind: u8`, `size: u8`, `flags: u8`, `str_index: u8` |
 | `0x002f` (47) | `reach(mode:, moves:, slot_param:)` | `reach.rs` | `mode == 1` reads `param[slot_param]`; dynamic callback modeled |
 
 Numeric indices remain strictly numeric (`my.motive[7]`, `my.person[58]`, `my.data[25]`).

@@ -1563,21 +1563,41 @@ impl<'a> TreeBuilder<'a> {
         if active.is_empty() {
             return Ok(next_target);
         }
+        let slice_start = self.nodes.len();
         let mut i = 0usize;
-        let mut entry = None;
+        let mut entry: Option<PendingTarget> = None;
+        let mut prev_sid: Option<u32> = None;
         while i < active.len() {
             let is_last = i + 1 == active.len();
             let stmt = active[i];
             if let Some(jump) = self.resolve_jump_stmt(stmt)? {
+                if let Some(psid) = prev_sid.take() {
+                    for node in &mut self.nodes[slice_start..] {
+                        patch_sentinel_target(&mut node.on_true, psid, &jump);
+                        patch_sentinel_target(&mut node.on_false, psid, &jump);
+                    }
+                    if let Some(ent) = &mut entry {
+                        patch_sentinel_target(ent, psid, &jump);
+                    }
+                }
                 if entry.is_none() {
                     return Ok(jump);
                 }
                 break;
             }
-            let (after, sentinel_id) = if is_last {
+            let (after, next_sid) = if is_last {
                 (next_target.clone(), None)
             } else if let Some(jump) = self.resolve_jump_stmt(active[i + 1])? {
                 let stmt_entry = self.lower_structured_stmt(stmt, jump)?;
+                if let Some(psid) = prev_sid.take() {
+                    for node in &mut self.nodes[slice_start..] {
+                        patch_sentinel_target(&mut node.on_true, psid, &stmt_entry);
+                        patch_sentinel_target(&mut node.on_false, psid, &stmt_entry);
+                    }
+                    if let Some(ent) = &mut entry {
+                        patch_sentinel_target(ent, psid, &stmt_entry);
+                    }
+                }
                 if entry.is_none() {
                     entry = Some(stmt_entry);
                 }
@@ -1586,17 +1606,27 @@ impl<'a> TreeBuilder<'a> {
                 let sid = self.alloc_sentinel();
                 (PendingTarget::Sentinel(sid), Some(sid))
             };
-            let before = self.nodes.len();
             let stmt_entry = self.lower_structured_stmt(stmt, after)?;
-            if entry.is_none() {
-                entry = Some(stmt_entry);
-            }
-            if let Some(sid) = sentinel_id {
-                let next_idx = self.nodes.len();
-                for node in &mut self.nodes[before..] {
-                    patch_sentinel(&mut node.on_true, sid, next_idx);
-                    patch_sentinel(&mut node.on_false, sid, next_idx);
+            if let Some(psid) = prev_sid.take() {
+                for node in &mut self.nodes[slice_start..] {
+                    patch_sentinel_target(&mut node.on_true, psid, &stmt_entry);
+                    patch_sentinel_target(&mut node.on_false, psid, &stmt_entry);
                 }
+                if let Some(ent) = &mut entry {
+                    patch_sentinel_target(ent, psid, &stmt_entry);
+                }
+            }
+            if entry.is_none() {
+                entry = Some(stmt_entry.clone());
+            }
+            if let Some(nsid) = next_sid {
+                // If this statement never falls through to `nsid` (for example,
+                // `while true { return false; }`), stop before emitting dead code that
+                // could otherwise occupy node 0 when `entry` is a zero-node jump.
+                if !slice_uses_sentinel(&self.nodes[slice_start..], &stmt_entry, nsid) {
+                    break;
+                }
+                prev_sid = Some(nsid);
             }
             i += 1;
         }
@@ -1795,32 +1825,23 @@ impl<'a> TreeBuilder<'a> {
                 let body_result = self.lower_structured_slice(body, loop_back);
                 self.loop_stack.pop();
                 let body_target = body_result?;
-                if self.nodes.len() == before {
-                    return match body_target {
-                        PendingTarget::Sentinel(id) if id == header_sid => {
-                            let idx = self.nodes.len();
-                            let self_target = PendingTarget::Node {
-                                index: idx,
-                                span: *span,
-                            };
-                            self.emit_return_node(*span, self_target.clone())?;
-                            Ok(self_target)
-                        }
-                        other => Ok(other),
-                    };
-                }
-                let header_idx = match body_target {
-                    PendingTarget::Node { index, .. } => index,
-                    other => return Ok(other),
+                let resolved_entry = match body_target {
+                    PendingTarget::Sentinel(id) if id == header_sid => {
+                        let idx = self.nodes.len();
+                        let self_target = PendingTarget::Node {
+                            index: idx,
+                            span: *span,
+                        };
+                        self.emit_return_node(*span, self_target.clone())?;
+                        self_target
+                    }
+                    other => other,
                 };
                 for node in &mut self.nodes[before..] {
-                    patch_sentinel(&mut node.on_true, header_sid, header_idx);
-                    patch_sentinel(&mut node.on_false, header_sid, header_idx);
+                    patch_sentinel_target(&mut node.on_true, header_sid, &resolved_entry);
+                    patch_sentinel_target(&mut node.on_false, header_sid, &resolved_entry);
                 }
-                Ok(PendingTarget::Node {
-                    index: header_idx,
-                    span: *span,
-                })
+                Ok(resolved_entry)
             }
             Stmt::InlineRawOp {
                 span,
@@ -1920,14 +1941,31 @@ fn cond_is_negated(cond: &Condition) -> bool {
 }
 
 fn patch_sentinel(target: &mut PendingTarget, sentinel_id: u32, actual_next: usize) {
+    let replacement = PendingTarget::Node {
+        index: actual_next,
+        span: Span::default(),
+    };
+    patch_sentinel_target(target, sentinel_id, &replacement);
+}
+
+fn patch_sentinel_target(
+    target: &mut PendingTarget,
+    sentinel_id: u32,
+    replacement: &PendingTarget,
+) {
     if let PendingTarget::Sentinel(id) = target
         && *id == sentinel_id
     {
-        *target = PendingTarget::Node {
-            index: actual_next,
-            span: Span::default(),
-        };
+        *target = replacement.clone();
     }
+}
+
+fn slice_uses_sentinel(nodes: &[PendingNode], entry: &PendingTarget, sentinel_id: u32) -> bool {
+    matches!(entry, PendingTarget::Sentinel(id) if *id == sentinel_id)
+        || nodes.iter().any(|n| {
+            matches!(n.on_true, PendingTarget::Sentinel(id) if id == sentinel_id)
+                || matches!(n.on_false, PendingTarget::Sentinel(id) if id == sentinel_id)
+        })
 }
 
 fn encode_expr_operands(lhs: Operand, operator: u8, rhs: Operand) -> [u8; 8] {
