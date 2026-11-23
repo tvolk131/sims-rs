@@ -89,6 +89,9 @@ the 1.91 disassembly and the oracle tour (`cache/ui-oracle-tour-20261122`).
    banner 5422 with their own button table at the native positions.
    - Sprites draw at their native origins. The window clips Sims.com's last
      column at x = 800.
+   - Controls draw in table order, so Bulldoze covers Return's right edge
+     and Import's left edge. Each hit rect is trimmed to its visible span,
+     so a click lands on the button the player sees.
    - There is no text label on any button. Missing art falls back to a
      blank chip.
    - `Destination::bar_buttons()` cites the tables.
@@ -110,12 +113,14 @@ the 1.91 disassembly and the oracle tour (`cache/ui-oracle-tour-20261122`).
      "Fam" button.
    - Enable rules follow `0x56b19e`. Import stays greyed until lot import
      exists, which matches the oracle.
+   - While a family is being placed, Move In is held down (`0x55478a`).
+     Clicking it resets placement before reopening the bin (`0x552d96`).
 4. **Lot pickers.**
    - **Magic Town** keeps its oracle-measured dlgframe2 dialog.
    - **Downtown, Vacation Island and Studio Town** keep the flag-1 bar.
      It holds no invented elements and matches the Downtown oracle (header
-     score 0.9897). Bulldoze, Import and Move In are disabled there so a
-     trip picker cannot edit lots.
+     score 0.9897). Only Return is live there, so a trip picker can neither
+     edit lots nor open shell dialogs it cannot host.
    - The flag-0 dialog for these three is a follow-up. It needs a harness
      capture of a cab, shuttle or ferry picker, because the only Downtown
      shot shows the flag-1 bar.
