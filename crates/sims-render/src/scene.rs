@@ -301,6 +301,93 @@ pub fn draw_held_with_options(
     options: RenderOptions,
     canvas: &mut Canvas,
 ) -> Stats {
+    draw_held_with_attach(
+        world,
+        lot,
+        assets,
+        camera,
+        options,
+        &BTreeMap::new(),
+        canvas,
+    )
+}
+
+/// Where a person draws what its container slots hold, in the lot's
+/// unrotated fine units and height units (`[fine x, fine y, altitude]`, as
+/// an object's pose): the person's attach points.
+///
+/// The generic slot walk skips a person holder (`0x437c56`: definition
+/// `+0x12 == 2`). Instead the person's own draw (`0x459dc0`..`0x45a131`)
+/// draws each held object at an attach point of its animator before
+/// drawing the person (`0x59185d` → `0x59293d` → `0x4b966b`, then the
+/// object's draw). The attach points are bone-local points of the posed
+/// skeleton, set from the person's body strings (`0x5924a4`); see
+/// `sims_people::attach`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PersonAttach {
+    /// Attach point 0 (animator `+0x140`): `R_HAND`'s "Palm".
+    pub palm: Option<[f32; 3]>,
+    /// Attach points 1 and 2 (`+0x144`): `HEAD`'s "Top".
+    pub head_top: Option<[f32; 3]>,
+    /// Attach point 3 (`+0x148`): `PELVIS`.
+    pub pelvis: Option<[f32; 3]>,
+}
+
+impl PersonAttach {
+    /// The attach point the person's draw uses for its container slot
+    /// `slot` (as scripts count them): slot 0 (the carry slot) at point 0,
+    /// slot 2 at point 3, slot 3 at point 1, slot 4 at point 0
+    /// (`0x459e25`, `0x459ecf`, `0x459f7b`, `0x45a027`). Slot 1, the
+    /// "HEAD" record, is not drawn there: the animator's tick moves an
+    /// animated object held in it (the tail of `0x58dc72`), which is not
+    /// ported.
+    pub fn for_slot(&self, slot: usize) -> Option<[f32; 3]> {
+        match slot {
+            0 | 4 => self.palm,
+            2 => self.pelvis,
+            3 => self.head_top,
+            _ => None,
+        }
+    }
+
+    /// What the person's draw does with its slot `slot`: draws it at a
+    /// point, skips it because the point is unbound (`0x591874`), or (slot
+    /// 1 and slots past 4) does not draw it at all, which is `None`.
+    fn slot_point(&self, slot: usize) -> Option<SlotPoint> {
+        let point = match slot {
+            0 | 4 => self.palm,
+            2 => self.pelvis,
+            3 => self.head_top,
+            _ => return None,
+        };
+        Some(point.map_or(SlotPoint::Unbound, SlotPoint::At))
+    }
+}
+
+/// Where the person's draw puts what one of its slots holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SlotPoint {
+    /// At this attach point.
+    At([f32; 3]),
+    /// Nowhere: the slot's point is unbound, so the person's draw skips the
+    /// slot (`0x459e2c`, `0x591874`) and what it holds is not drawn.
+    Unbound,
+}
+
+/// Like [`draw_held_with_options`], drawing what each person in `attach`
+/// holds at that person's attach points ([`PersonAttach`]). What sits in a
+/// slot whose point is unbound is not drawn, as in the original. Objects
+/// held by a person missing from `attach`, or in slot 1, stay at their own
+/// position.
+pub fn draw_held_with_attach(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    options: RenderOptions,
+    attach: &BTreeMap<u16, PersonAttach>,
+    canvas: &mut Canvas,
+) -> Stats {
     let held = holds_person(world);
     if held.is_empty() {
         return Stats::default();
@@ -320,6 +407,7 @@ pub fn draw_held_with_options(
         held,
         Some(1),
     );
+    painter.person_attach = attach.clone();
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
         let cut = cut(lot, camera, level, top, None);
@@ -1372,6 +1460,8 @@ struct Painter<'a> {
     band_override: Option<usize>,
     commands: Vec<DrawCmd>,
     object_scratch: Vec<ObjectEntry<'a>>,
+    /// Where each drawn person draws what it holds ([`PersonAttach`]).
+    person_attach: BTreeMap<u16, PersonAttach>,
 }
 
 impl<'a> Painter<'a> {
@@ -1408,6 +1498,7 @@ impl<'a> Painter<'a> {
             band_override,
             commands: Vec::with_capacity(512),
             object_scratch: Vec::new(),
+            person_attach: BTreeMap::new(),
         }
     }
 
@@ -3076,6 +3167,8 @@ impl<'a> Painter<'a> {
             }
             let assets = &mut *self.assets;
             let slot = |guid, i: usize| assets.definition_ref(guid)?.slots.get(i).copied();
+            let person_attach = &self.person_attach;
+            let attach = |person: u16, i: usize| person_attach.get(&person)?.slot_point(i);
             // The object's base altitude comes from `0x478dfe` (`0x4b9613`),
             // and its base screen position and depth anchor from `0x4b97ea`
             // (unheld) or `0x4b9991` (held in a slot, `0x437fdd`, or an
@@ -3087,12 +3180,16 @@ impl<'a> Painter<'a> {
                     place_moved(&self.depth, self.camera, self.lot, [x, y], level, pose[2]);
                 (pose, screen, anchor)
             } else {
-                let (is_held, pose) = held(
+                let Some((is_held, pose)) = held(
                     &self.world.objects,
                     slot,
+                    attach,
                     id,
                     [x as f32, y as f32, base_altitude],
-                );
+                ) else {
+                    // In a person's slot with an unbound point: not drawn.
+                    continue;
+                };
                 let (screen, anchor) = if is_held {
                     let fine = [
                         (pose[0] + 0.5).trunc() as i32,
@@ -3396,25 +3493,34 @@ const LINK_SLOT: usize = 14;
 const BEFORE: usize = 26;
 
 /// Computes a held object's floating-point pose `[x, y, z]` starting from
-/// `base = [x, y, base_altitude]`, and reports whether it is held by a
-/// non-person container (`0x437fdd`).
+/// `base = [x, y, base_altitude]`, and reports whether it is drawn away from
+/// its own position: held by a non-person container (`0x437fdd`), or at a
+/// person's attach point (`0x59185d`).
 ///
 /// The original walks top-down from the root holder to each child (`0x437c56`
 /// -> `0x437fdd`): a hidden holder still traverses its slots (`0x4378fa` ->
 /// `0x437c56`), each slot's horizontal offset is turned by the holder's facing
 /// with odd facings clearing both `x` and `y` (`0x438044` -> `0x439109`), and
 /// each step adds `[dx, dy, dz]` sequentially onto the running `f32` pose
-/// (`0x438049`–`0x438090`). Objects a Sim holds get no offset, and a holder
-/// cycle returns `(false, base)`. Each accumulated coordinate stays within a
-/// lot's width of `base` so malformed slot data cannot overflow.
+/// (`0x438049`–`0x438090`). A person holder is not walked that way
+/// (`0x437c56` skips definition type 2): the person's draw puts what its
+/// slot holds at the attach point `attach(person, slot)` gives
+/// ([`PersonAttach::for_slot`]), and the steps below it stack on that. A
+/// slot whose point is unbound is skipped with all it holds, which is
+/// `None`. With no attach point (the person has none this frame, or slot
+/// 1), or one that is not finite or more than a lot's width from `base`,
+/// an object a Sim holds gets no offset from the Sim. A holder cycle
+/// returns `(false, base)`. Each accumulated coordinate stays within a
+/// lot's width of its start so malformed slot data cannot overflow.
 fn held(
     objects: &CowMap<u16, Object>,
     mut slot: impl FnMut(u32, usize) -> Option<[f32; 3]>,
+    attach: impl Fn(u16, usize) -> Option<SlotPoint>,
     id: u16,
     base: [f32; 3],
-) -> (bool, [f32; 3]) {
+) -> Option<(bool, [f32; 3])> {
     let Some(mut cursor) = objects.get(&id) else {
-        return (false, base);
+        return Some((false, base));
     };
     // Fast path: the vast majority of objects are not contained in any slot,
     // so check the immediate container word before allocating `seen`/`steps`.
@@ -3423,27 +3529,35 @@ fn held(
         .ok()
         .filter(|&c| c != 0)
         .and_then(|c| objects.get(&c))
-        .is_none_or(|h| h.person.is_some())
+        .is_none()
     {
-        return (false, base);
+        return Some((false, base));
     }
     let mut seen = BTreeSet::from([id]);
     let mut steps = Vec::new();
+    let mut start = None;
     loop {
         let container = cursor.data.get(CONTAINER).copied().unwrap_or(0);
         let Some((holder_id, holder)) = u16::try_from(container)
             .ok()
             .filter(|&c| c != 0)
             .and_then(|c| Some((c, objects.get(&c)?)))
-            .filter(|(_, h)| h.person.is_none())
         else {
             break;
         };
-        if !seen.insert(holder_id) {
-            return (false, base);
+        let in_slot = usize::try_from(cursor.data.get(CONTAINER_SLOT).copied().unwrap_or(-1)).ok();
+        if holder.person.is_some() {
+            match in_slot.and_then(|i| attach(holder_id, i)) {
+                Some(SlotPoint::At(point)) => start = Some(point),
+                Some(SlotPoint::Unbound) => return None,
+                None => {}
+            }
+            break;
         }
-        let at = usize::try_from(cursor.data.get(CONTAINER_SLOT).copied().unwrap_or(-1))
-            .ok()
+        if !seen.insert(holder_id) {
+            return Some((false, base));
+        }
+        let at = in_slot
             .and_then(|i| slot(holder.guid, i))
             .unwrap_or_default();
         let [mut x, mut y, z] = sprite_offset(at);
@@ -3458,23 +3572,30 @@ fn held(
         steps.push([x, y, z]);
         cursor = holder;
     }
-    if steps.is_empty() {
-        return (false, base);
-    }
+    // A point that is not finite, or further than a lot's width from the
+    // object's own position (which is its holder's), is no point: the
+    // object stays where it was, drawn as an unheld one. This keeps a
+    // malformed pose from overflowing the integer projection.
     let limit = (camera::ARRAY_SIZE * 16) as f32;
-    let mut pose = base;
+    let start =
+        start.filter(|p| (0..3).all(|i| p[i].is_finite() && (p[i] - base[i]).abs() <= limit));
+    if steps.is_empty() && start.is_none() {
+        return Some((false, base));
+    }
+    let start = start.unwrap_or(base);
+    let mut pose = start;
     for [dx, dy, dz] in steps.into_iter().rev() {
         let delta = [dx, dy, dz];
         for i in 0..3 {
             let next = pose[i] + delta[i];
             pose[i] = if next.is_finite() {
-                next.clamp(base[i] - limit, base[i] + limit)
+                next.clamp(start[i] - limit, start[i] + limit)
             } else {
-                base[i]
+                start[i]
             };
         }
     }
-    (true, pose)
+    Some((true, pose))
 }
 
 /// A draw group sprite's world offset (`object`), made safe: x and y in
@@ -4373,6 +4494,169 @@ mod tests {
         assert_eq!(view_direction(4, &camera(3)), 4);
     }
 
+    fn no_attach(_: u16, _: usize) -> Option<SlotPoint> {
+        None
+    }
+
+    /// [`held`] for an object that is drawn.
+    fn held_drawn(
+        objects: &CowMap<u16, Object>,
+        slot: impl FnMut(u32, usize) -> Option<[f32; 3]>,
+        attach: impl Fn(u16, usize) -> Option<SlotPoint>,
+        id: u16,
+        base: [f32; 3],
+    ) -> (bool, [f32; 3]) {
+        held(objects, slot, attach, id, base).expect("drawn")
+    }
+
+    fn person_object(id: u16, position: [i32; 3]) -> Object {
+        use sims_formats::saved_objects::{Interaction, Person};
+        let idle = Interaction {
+            join: 0,
+            uid: 0,
+            caller: 0,
+            target: 0,
+            icon: 0,
+            table_index: -1,
+            args: [0; 4],
+            priority: 0,
+            action: 0,
+            attenuation: 0.0,
+            flags: 0,
+        };
+        let mut o = object(id, 77, position, &[]);
+        o.person = Some(Person {
+            animation_events: 0,
+            engaged: 0,
+            appearance: Default::default(),
+            accessories: Vec::new(),
+            animations: Default::default(),
+            routing_state: 0,
+            floats: [0.0; 9],
+            previous_motives: [0.0; 16],
+            motives: [0.0; 16],
+            data: vec![0; 128],
+            routing_frames: 0,
+            active: idle.clone(),
+            last: idle,
+            queue: Vec::new(),
+            object_uses: Vec::new(),
+            motive_deltas: Vec::new(),
+        });
+        o
+    }
+
+    /// What a Sim holds is drawn at the Sim's attach point for its slot
+    /// (0x459dc0 → 0x59185d), not at the Sim's feet: a plate in the carry
+    /// slot (slot 0) follows the given palm point, food on the plate
+    /// stacks the plate's slot offset on top, and with no attach point
+    /// (the person not drawn, or slot 1) the plate stays where it is.
+    #[test]
+    fn person_held_objects_follow_the_persons_attach_point() {
+        const PLATE: u32 = 8;
+        let slot = |guid: u32, i: usize| match (guid, i) {
+            (PLATE, 0) => Some([0.0, 0.0, 0.25]),
+            _ => None,
+        };
+        let palm = [131.25, 207.5, 9.75];
+        let pelvis = [128.0, 200.0, 6.0];
+        let hands = PersonAttach {
+            palm: Some(palm),
+            head_top: Some([128.0, 199.0, 12.0]),
+            pelvis: Some(pelvis),
+        };
+        let attach = |person: u16, i: usize| (person == 1).then(|| hands.slot_point(i)).flatten();
+        let mut objects = CowMap::new();
+        objects.insert(1, person_object(1, [128, 200, 1]));
+        // The plate in the Sim's carry slot, its own position the Sim's.
+        objects.insert(
+            2,
+            object(
+                2,
+                PLATE,
+                [128, 200, 1],
+                &[(CONTAINER, 1), (CONTAINER_SLOT, 0)],
+            ),
+        );
+        // Food on the plate's slot 0.
+        objects.insert(
+            3,
+            object(3, 9, [128, 200, 1], &[(CONTAINER, 2), (CONTAINER_SLOT, 0)]),
+        );
+        let base = [128.0, 200.0, 0.0];
+        assert_eq!(held_drawn(&objects, slot, attach, 2, base), (true, palm));
+        assert_eq!(
+            held_drawn(&objects, slot, attach, 3, base),
+            (true, [palm[0], palm[1], palm[2] + 0.25])
+        );
+        // The point moves with the hand from frame to frame.
+        let moved = PersonAttach {
+            palm: Some([140.0, 190.0, 8.0]),
+            ..hands
+        };
+        let follow = |_: u16, i: usize| moved.slot_point(i);
+        assert_eq!(
+            held_drawn(&objects, slot, follow, 2, base),
+            (true, [140.0, 190.0, 8.0])
+        );
+        // Slot 2 draws at the pelvis; slot 1 (the "HEAD" record) has no
+        // point here, so the plate keeps its own position.
+        objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 2;
+        assert_eq!(held_drawn(&objects, slot, attach, 2, base), (true, pelvis));
+        objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 1;
+        assert_eq!(held_drawn(&objects, slot, attach, 2, base), (false, base));
+        // Without the person's points, as before: no offset from the Sim.
+        objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 0;
+        assert_eq!(
+            held_drawn(&objects, slot, no_attach, 2, base),
+            (false, base)
+        );
+        // A non-finite point is no point: the object's own position, drawn
+        // as unheld (not through the moved-object projection).
+        let broken = |_: u16, _: usize| Some(SlotPoint::At([f32::NAN, 0.0, 0.0]));
+        assert_eq!(held_drawn(&objects, slot, broken, 2, base), (false, base));
+        // Nor is a finite point more than a lot's width away, which would
+        // overflow the integer projection.
+        let far = |_: u16, _: usize| Some(SlotPoint::At([1.0e9, 0.0, 0.0]));
+        assert_eq!(held_drawn(&objects, slot, far, 2, base), (false, base));
+        let off_lot = base[0] + (camera::ARRAY_SIZE * 16) as f32 + 1.0;
+        let past = |_: u16, _: usize| Some(SlotPoint::At([off_lot, base[1], base[2]]));
+        assert_eq!(held_drawn(&objects, slot, past, 2, base), (false, base));
+        // A slot whose point is unbound (the Side Show Assistant's hand) is
+        // skipped by the person's draw, with what it holds: the plate and
+        // the food on it are not drawn.
+        let handless = PersonAttach {
+            palm: None,
+            ..hands
+        };
+        let unbound = |_: u16, i: usize| handless.slot_point(i);
+        assert_eq!(held(&objects, slot, unbound, 2, base), None);
+        assert_eq!(held(&objects, slot, unbound, 3, base), None);
+        // The person's other points still draw.
+        objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 2;
+        assert_eq!(held_drawn(&objects, slot, unbound, 2, base), (true, pelvis));
+    }
+
+    #[test]
+    fn person_attach_slots_follow_the_persons_draw() {
+        let p = PersonAttach {
+            palm: Some([1.0; 3]),
+            head_top: Some([2.0; 3]),
+            pelvis: Some([3.0; 3]),
+        };
+        assert_eq!(p.for_slot(0), Some([1.0; 3]));
+        assert_eq!(p.for_slot(1), None);
+        assert_eq!(p.for_slot(2), Some([3.0; 3]));
+        assert_eq!(p.for_slot(3), Some([2.0; 3]));
+        assert_eq!(p.for_slot(4), Some([1.0; 3]));
+        assert_eq!(p.for_slot(5), None);
+        let handless = PersonAttach { palm: None, ..p };
+        assert_eq!(handless.slot_point(0), Some(SlotPoint::Unbound));
+        assert_eq!(handless.slot_point(4), Some(SlotPoint::Unbound));
+        assert_eq!(handless.slot_point(1), None, "slot 1 is not drawn here");
+        assert_eq!(handless.slot_point(3), Some(SlotPoint::At([2.0; 3])));
+    }
+
     fn object(id: u16, guid: u32, position: [i32; 3], words: &[(usize, i16)]) -> Object {
         let mut data = vec![0; 64];
         for &(i, v) in words {
@@ -4423,19 +4707,31 @@ mod tests {
         );
         let base = [100.0, 200.0, 0.0];
         // The slot's x turns with the table into y; its height lifts.
-        assert_eq!(held(&objects, slot, 2, base), (true, [100.0, 204.0, 4.0]));
-        assert_eq!(held(&objects, slot, 1, base), (false, base));
+        assert_eq!(
+            held_drawn(&objects, slot, no_attach, 2, base),
+            (true, [100.0, 204.0, 4.0])
+        );
+        assert_eq!(
+            held_drawn(&objects, slot, no_attach, 1, base),
+            (false, base)
+        );
         // An odd holder facing clears both horizontal offsets (0x438044 -> 0x439109).
         objects.get_mut(&1).unwrap().data[FACING] = 3;
-        assert_eq!(held(&objects, slot, 2, base), (true, [100.0, 200.0, 4.0]));
+        assert_eq!(
+            held_drawn(&objects, slot, no_attach, 2, base),
+            (true, [100.0, 200.0, 4.0])
+        );
         objects.get_mut(&1).unwrap().data[FACING] = 2;
         // A holder without that slot puts it at its own place.
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 5;
-        assert_eq!(held(&objects, slot, 2, base), (true, base));
+        assert_eq!(held_drawn(&objects, slot, no_attach, 2, base), (true, base));
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 1;
         // A hidden holder still traverses its slots (0x4378fa -> 0x437c56).
         objects.get_mut(&1).unwrap().data[HIDDEN] = 1;
-        assert_eq!(held(&objects, slot, 2, base), (true, [100.0, 204.0, 4.0]));
+        assert_eq!(
+            held_drawn(&objects, slot, no_attach, 2, base),
+            (true, [100.0, 204.0, 4.0])
+        );
         objects.get_mut(&1).unwrap().data[HIDDEN] = 0;
         // Multi-level slots accumulate sequentially in root-to-child f32 order
         // (0x438049–0x438090): ((32.0 + 0.1) + -9.6) + 0.5 truncates to 22,
@@ -4454,18 +4750,24 @@ mod tests {
             6,
             object(6, 9, [32, 0, 1], &[(CONTAINER, 5), (CONTAINER_SLOT, 0)]),
         );
-        let (is_held, pose) = held(&objects, slot, 6, [32.0, 0.0, 0.0]);
+        let (is_held, pose) = held_drawn(&objects, slot, no_attach, 6, [32.0, 0.0, 0.0]);
         assert!(is_held);
         assert_eq!((pose[0] + 0.5).trunc() as i32, 22);
         // Holders that hold each other, or an object that holds itself,
         // give no offset, however many other objects there are.
         objects.get_mut(&1).unwrap().data[CONTAINER] = 2;
-        assert_eq!(held(&objects, slot, 2, base), (false, base));
+        assert_eq!(
+            held_drawn(&objects, slot, no_attach, 2, base),
+            (false, base)
+        );
         objects.insert(
             3,
             object(3, TABLE, [0, 0, 1], &[(CONTAINER, 3), (CONTAINER_SLOT, 1)]),
         );
-        assert_eq!(held(&objects, slot, 3, [0.0; 3]), (false, [0.0; 3]));
+        assert_eq!(
+            held_drawn(&objects, slot, no_attach, 3, [0.0; 3]),
+            (false, [0.0; 3])
+        );
     }
 
     #[test]
@@ -4561,7 +4863,7 @@ mod tests {
             );
         }
         let limit = camera::ARRAY_SIZE * 16;
-        let (is_held, [x, y, lift]) = held(&objects, huge, 199, [0.0; 3]);
+        let (is_held, [x, y, lift]) = held_drawn(&objects, huge, no_attach, 199, [0.0; 3]);
         assert!(is_held);
         assert!(x.abs() <= limit as f32 && y.abs() <= limit as f32);
         assert!(lift.abs() <= limit as f32);
