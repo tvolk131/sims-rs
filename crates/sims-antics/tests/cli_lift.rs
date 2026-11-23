@@ -3,18 +3,19 @@
 //! Uses only clean-room `open-pack/` and synthetic in-memory `.iff` / `.far`
 //! fixtures (zero commercial assets; runs in CI without `SIMS_INSTALL`).
 
-use sims_antics::encode::encode_bhav;
-use sims_antics::ir::BhavChunk;
+use sims_antics::encode::{encode_bhav, encode_objd};
+use sims_antics::ir::{BhavChunk, ObjdChunk};
 use sims_antics::{
     EquivOptions, EquivResult, check_bhav_equivalent, compile_antics, compile_pack_dir, package_far,
 };
 use sims_formats::behavior::Instruction;
 use sims_formats::iff::{ChunkData, write as write_iff};
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -179,9 +180,18 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
             && tv_table.contains("structured"),
         "{tv_table}"
     );
-    let pos_4096 = tv_table.find("4096").expect("4096 row");
-    let pos_4103 = tv_table.find("4103").expect("4103 row");
+    // Row IDs in table order (skipping the `// arity sources` header and column titles).
+    let row_ids: Vec<u16> = tv_table
+        .lines()
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect();
+    let pos_4096 = row_ids.iter().position(|&id| id == 4096).expect("4096 row");
+    let pos_4103 = row_ids.iter().position(|&id| id == 4103).expect("4103 row");
     assert!(pos_4096 < pos_4103, "BHAV table must be sorted by ID");
+    assert!(
+        row_ids.windows(2).all(|w| w[0] < w[1]),
+        "BHAV table must be sorted by ID: {row_ids:?}"
+    );
 
     // 3b. `--list --filter` on BHAVs matches both name and hex ID.
     let filter_tv = Command::new(cli_bin())
@@ -1761,4 +1771,1629 @@ fn lift_emits_symbol_comments_by_default_and_no_comments_disables_them() {
         plain_stdout.contains("// verify-equiv: Equivalent"),
         "{plain_stdout}"
     );
+}
+
+fn one_node_bhav(id: u16, args: u8) -> BhavChunk {
+    BhavChunk {
+        id,
+        label: format!("Callee{id}"),
+        format: 0x8002,
+        kind: 0,
+        args,
+        locals: 0,
+        revision: 0,
+        instructions: vec![Instruction {
+            opcode: 2,
+            on_true: 0xFE,
+            on_false: 0xFE,
+            operands: [0, 0, 0, 0, 0, 5, 0, 7],
+        }],
+        trailing: Vec::new(),
+    }
+}
+
+/// A private tree making an inline call to `first` and then to `second`.
+fn two_call_bhav(id: u16, first: u16, second: u16) -> BhavChunk {
+    BhavChunk {
+        id,
+        label: format!("Caller{id}"),
+        format: 0x8002,
+        kind: 0,
+        args: 0,
+        locals: 0,
+        revision: 0,
+        instructions: vec![
+            Instruction {
+                opcode: first,
+                on_true: 1,
+                on_false: 0xFF,
+                operands: [1, 0, 2, 0, 3, 0, 4, 0],
+            },
+            Instruction {
+                opcode: second,
+                on_true: 0xFE,
+                on_false: 0xFF,
+                operands: [5, 0, 0, 0, 0, 0, 0, 0],
+            },
+        ],
+        trailing: Vec::new(),
+    }
+}
+
+/// A synthetic install: `Global.iff` (300: 4 args, 301: 6 args), a `TestGlobals.iff`
+/// semi-global (8192: 1 arg), and `Objects/Test.far!Thing.iff` linking to it with
+/// callers 4096 (300 then 8192), 4097 (301), and 4098 (302, absent from `Global.iff`).
+struct SyntheticInstall {
+    _dir: CleanupDir,
+    root: PathBuf,
+}
+
+impl SyntheticInstall {
+    fn new() -> Self {
+        let dir = CleanupDir::new("synthetic-install");
+        let root = dir.path().join("install");
+        let game_data = root.join("GameData");
+        std::fs::create_dir_all(game_data.join("Global")).expect("mkdir Global");
+        std::fs::create_dir_all(game_data.join("Objects")).expect("mkdir Objects");
+        std::fs::write(
+            game_data.join("Behavior.iff"),
+            write_iff(&[]).expect("empty iff"),
+        )
+        .expect("write Behavior.iff");
+        std::fs::write(
+            game_data.join("Global").join("Global.iff"),
+            synthetic_bhav_iff(&[one_node_bhav(300, 4), one_node_bhav(301, 6)]),
+        )
+        .expect("write Global.iff");
+        std::fs::write(
+            game_data.join("Global").join("TestGlobals.iff"),
+            synthetic_bhav_iff(&[one_node_bhav(8192, 1)]),
+        )
+        .expect("write TestGlobals.iff");
+
+        let thing = synthetic_object_iff(Some(b"TestGlobals"));
+        let far = package_far(&[("Thing.iff", &thing)]).expect("package far");
+        std::fs::write(game_data.join("Objects").join("Test.far"), far).expect("write far");
+        // The same trees as a loose object file without a GLOB link.
+        std::fs::write(
+            game_data.join("Objects").join("Loose.iff"),
+            synthetic_object_iff(None),
+        )
+        .expect("write Loose.iff");
+        Self { _dir: dir, root }
+    }
+
+    fn far(&self) -> PathBuf {
+        self.root.join("GameData").join("Objects").join("Test.far")
+    }
+
+    fn global_dir(&self) -> PathBuf {
+        self.root.join("GameData").join("Global")
+    }
+}
+
+static NEXT_GUID: AtomicU32 = AtomicU32::new(0x5EED_0001);
+
+/// An `OBJD` chunk registering an object with a GUID no other fixture uses.
+fn objd_chunk() -> ChunkData {
+    objd_chunk_with_guid(NEXT_GUID.fetch_add(1, Ordering::Relaxed))
+}
+
+fn objd_chunk_with_guid(guid: u32) -> ChunkData {
+    let mut words = vec![0u16; 64];
+    words[14] = guid as u16;
+    words[15] = (guid >> 16) as u16;
+    ChunkData {
+        tag: *b"OBJD",
+        id: 128,
+        flags: 0,
+        label: "Object".to_owned(),
+        data: encode_objd(&ObjdChunk {
+            id: 128,
+            label: "Object".to_owned(),
+            version: 138,
+            words,
+            trailing_byte: None,
+        })
+        .expect("encode_objd"),
+    }
+}
+
+fn bhav_chunk(bhav: &BhavChunk) -> ChunkData {
+    ChunkData {
+        tag: *b"BHAV",
+        id: bhav.id,
+        flags: 0,
+        label: bhav.label.clone(),
+        data: encode_bhav(bhav).expect("encode_bhav"),
+    }
+}
+
+fn glob_chunk(link: &[u8]) -> ChunkData {
+    let mut glob = vec![link.len() as u8];
+    glob.extend_from_slice(link);
+    ChunkData {
+        tag: *b"GLOB",
+        id: 128,
+        flags: 0,
+        label: String::new(),
+        data: glob,
+    }
+}
+
+/// An IFF of `trees`, registered as an object (`OBJD`) when `registered`, with a
+/// `GLOB` chunk naming `link` if given.
+fn object_iff(trees: &[BhavChunk], registered: bool, link: Option<&[u8]>) -> Vec<u8> {
+    let mut chunks: Vec<ChunkData> = trees.iter().map(bhav_chunk).collect();
+    if registered {
+        chunks.push(objd_chunk());
+    }
+    if let Some(link) = link {
+        chunks.push(glob_chunk(link));
+    }
+    write_iff(&chunks).expect("write object iff")
+}
+
+/// The synthetic registered object's trees (4096..=4098), with a `GLOB` chunk naming
+/// `link` if given.
+fn synthetic_object_iff(link: Option<&[u8]>) -> Vec<u8> {
+    object_iff(
+        &[
+            two_call_bhav(4096, 300, 8192),
+            two_call_bhav(4097, 301, 300),
+            two_call_bhav(4098, 302, 300),
+        ],
+        true,
+        link,
+    )
+}
+
+fn run_lift(args: &[&OsStr]) -> (bool, String, String) {
+    let out = Command::new(cli_bin())
+        .arg("lift")
+        .args(args)
+        .output()
+        .expect("run lift");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn lift_inside_install_uses_catalog_global_and_semi_global_arities() {
+    let install = SyntheticInstall::new();
+    let far = install.far();
+    let (ok, stdout, stderr) = run_lift(&[
+        far.as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--tree"),
+        OsStr::new("4096"),
+        OsStr::new("--verify-equiv"),
+    ]);
+    assert!(ok, "stderr: {stderr}\nstdout: {stdout}");
+    let header = stdout.lines().next().unwrap_or_default();
+    assert!(
+        header.starts_with("// arity sources: ")
+            && header
+                .contains("global 256..=4095: 2 from GameData/Global/Global.iff (install catalog)")
+            && header.contains("private 4096..=8191: 3 from this file")
+            && header.contains(
+                "semi-global 8192+: 1 from GameData/Global/TestGlobals.iff (install catalog)"
+            ),
+        "{stdout}"
+    );
+    assert!(
+        !header.contains(&*install.root.to_string_lossy()),
+        "catalog locations are install-relative: {header}"
+    );
+    assert!(stdout.contains("// .air (Antics IR) tree 4096"), "{stdout}");
+    assert!(!stdout.contains("structured lift fallback"), "{stdout}");
+    assert!(stdout.contains("// verify-equiv: Equivalent"), "{stdout}");
+
+    // Known 6-arg global and a callee missing from Global.iff fall back, naming the cause.
+    let (ok, stdout, stderr) = run_lift(&[
+        far.as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--verify-equiv"),
+    ]);
+    assert!(ok, "stderr: {stderr}\nstdout: {stdout}");
+    assert!(
+        stdout.contains(
+            "tree 4097 \"Caller4097\": structured lift fallback (unsupported header or target: node 0 calls global tree 301 with inline operands and 6 args"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("node 0 calls global tree 302 with inline operands but its arity is unknown; no usable arity for tree 302 in GameData/Global/Global.iff (absent, or duplicate chunks disagree))"),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("// verify-equiv: Equivalent").count(),
+        3,
+        "{stdout}"
+    );
+
+    // `--list` uses the same arities and a compact reason.
+    let (ok, stdout, stderr) = run_lift(&[
+        far.as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--list"),
+    ]);
+    assert!(ok, "stderr: {stderr}");
+    let row = |id: &str| {
+        stdout
+            .lines()
+            .find(|l| l.starts_with(id))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(stdout.starts_with("// arity sources: "), "{stdout}");
+    assert!(row("4096").contains(" structured "), "{stdout}");
+    assert!(
+        row("4097").contains("labeled-cfg (calls global 301 with 6 args)"),
+        "{stdout}"
+    );
+    assert!(
+        row("4098").contains("labeled-cfg (calls global 302, arity unknown)"),
+        "{stdout}"
+    );
+
+    // A loose object file without a GLOB link has no semi-global library in the VM, so
+    // semi-global arities stay unknown (its own stray 8192+ chunks are not trusted).
+    let loose = install
+        .root
+        .join("GameData")
+        .join("Objects")
+        .join("Loose.iff");
+    let (ok, stdout, stderr) =
+        run_lift(&[loose.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("semi-global 8192+: none (no resolved GLOB link)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("node 1 calls semi-global tree 8192 with inline operands but its arity is unknown; semi-global arities not loaded (no resolved GLOB link); pass --semiglobal <semiglobal.iff>"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn lift_no_catalog_and_explicit_arity_overrides() {
+    let install = SyntheticInstall::new();
+    let far = install.far();
+    let base: [&OsStr; 5] = [
+        far.as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--tree"),
+        OsStr::new("4096"),
+    ];
+
+    // `--no-catalog` keeps the private-only behaviour and explains the fallback.
+    let mut args = base.to_vec();
+    args.extend([OsStr::new("--no-catalog"), OsStr::new("--verify-equiv")]);
+    let (ok, stdout, stderr) = run_lift(&args);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("global 256..=4095: none (--no-catalog)")
+            && stdout.contains("semi-global 8192+: none (--no-catalog)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("structured lift fallback (unsupported header or target: node 0 calls global tree 300 with inline operands but its arity is unknown; global arities not loaded (--no-catalog); pass --globals <Global.iff>)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("// verify-equiv: Equivalent"), "{stdout}");
+
+    // `--globals` alone moves the cause to the semi-global callee.
+    let globals = install.global_dir().join("Global.iff");
+    let mut args = base.to_vec();
+    args.extend([
+        OsStr::new("--no-catalog"),
+        OsStr::new("--globals"),
+        globals.as_os_str(),
+    ]);
+    let (ok, stdout, stderr) = run_lift(&args);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("global 256..=4095: 2 from ") && stdout.contains("Global.iff (explicit)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("node 1 calls semi-global tree 8192 with inline operands but its arity is unknown; semi-global arities not loaded (--no-catalog); pass --semiglobal <semiglobal.iff>"),
+        "{stdout}"
+    );
+
+    // `--globals` plus `--semiglobal` (as a FAR member) lifts structurally.
+    let tmp = CleanupDir::new("semi-far");
+    let semi_bytes =
+        std::fs::read(install.global_dir().join("TestGlobals.iff")).expect("read semi");
+    let semi_far = tmp.path().join("Semi.far");
+    std::fs::write(
+        &semi_far,
+        package_far(&[("TestGlobals.iff", &semi_bytes)]).expect("package"),
+    )
+    .expect("write Semi.far");
+    let semi_spec = format!("{}!TestGlobals.iff", semi_far.display());
+    let mut args = base.to_vec();
+    args.extend([
+        OsStr::new("--no-catalog"),
+        OsStr::new("--globals"),
+        globals.as_os_str(),
+        OsStr::new("--semiglobal"),
+        OsStr::new(&semi_spec),
+        OsStr::new("--verify-equiv"),
+    ]);
+    let (ok, stdout, stderr) = run_lift(&args);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("semi-global 8192+: 1 from ")
+            && stdout.contains("Semi.far!TestGlobals.iff (explicit)"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("structured lift fallback"), "{stdout}");
+    assert!(stdout.contains("// verify-equiv: Equivalent"), "{stdout}");
+
+    // A FAR `--semiglobal` must name its member; `--raw` rejects arity flags.
+    let mut args = base.to_vec();
+    args.extend([OsStr::new("--semiglobal"), semi_far.as_os_str()]);
+    let (ok, _, stderr) = run_lift(&args);
+    assert!(!ok && stderr.contains("name a member"), "stderr: {stderr}");
+    let mut args = base.to_vec();
+    args.extend([OsStr::new("--raw"), OsStr::new("--no-catalog")]);
+    let (ok, _, stderr) = run_lift(&args);
+    assert!(
+        !ok && stderr.contains("cannot be combined with --raw"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `SIMS_INSTALL`-gated: the CLI path on `Objects.far!Fridges.iff` uses the catalog
+/// arities the corpus run uses, lifting all 51 trees structurally and proving each one
+/// `Equivalent` (strict and relaxed padding). Prints metadata only.
+#[test]
+fn install_fridges_cli_lift_is_fully_structured_and_equivalent() {
+    let Ok(root) = std::env::var("SIMS_INSTALL") else {
+        eprintln!("install_fridges_cli_lift: skipped (SIMS_INSTALL unset)");
+        return;
+    };
+    if root.trim().is_empty() {
+        eprintln!("install_fridges_cli_lift: skipped (SIMS_INSTALL empty)");
+        return;
+    }
+    let install = sims_content::Install::detect(Path::new(&root))
+        .expect("SIMS_INSTALL did not resolve to a valid Sims installation");
+    let objects = install
+        .file("GameData/Objects/Objects.far")
+        .expect("Objects.far in SIMS_INSTALL");
+    for extra in [None, Some("--relax-padding")] {
+        let mut args: Vec<&OsStr> = vec![
+            objects.as_os_str(),
+            OsStr::new("--entry"),
+            OsStr::new("Fridges.iff"),
+            OsStr::new("--verify-equiv"),
+        ];
+        if let Some(flag) = extra {
+            args.push(OsStr::new(flag));
+        }
+        let (ok, stdout, _) = run_lift(&args);
+        assert!(ok, "lift Fridges.iff ({extra:?}) failed");
+        let structured = stdout.matches("// .air (Antics IR) tree ").count();
+        let fallbacks = stdout.matches("structured lift fallback").count();
+        let equivalent = stdout.matches("// verify-equiv: Equivalent").count();
+        let header = stdout.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("Global.iff (install catalog)"),
+            "global arities must come from the install catalog"
+        );
+        eprintln!(
+            "install_fridges_cli_lift ({extra:?}): {structured} structured, {fallbacks} labeled-CFG, {equivalent} Equivalent"
+        );
+        assert_eq!((structured, fallbacks, equivalent), (51, 0, 51));
+    }
+}
+
+#[test]
+fn lift_owner_dependent_ranges_stay_unknown_for_global_and_semi_global_files() {
+    let install = SyntheticInstall::new();
+    // Global.iff runs under whichever object called it: private and semi-global callees
+    // depend on that owner, so only its own global range is known.
+    let global = install.global_dir().join("Global.iff");
+    let (ok, stdout, stderr) = run_lift(&[global.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("global 256..=4095: 2 from GameData/Global/Global.iff (install catalog)")
+            && stdout.contains(
+                "private 4096..=8191: none (owner-dependent: Global.iff runs under the calling object)"
+            )
+            && stdout.contains(
+                "semi-global 8192+: none (owner-dependent: Global.iff runs under the calling object)"
+            ),
+        "{stdout}"
+    );
+    // A semi-global file knows its own semi-global range (every owner reaching it links
+    // to it) but not the calling object's private trees.
+    let semi = install.global_dir().join("TestGlobals.iff");
+    let (ok, stdout, stderr) = run_lift(&[semi.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "private 4096..=8191: none (owner-dependent: semi-global file runs under the calling object)"
+        ) && stdout.contains("semi-global 8192+: 1 from this file (linked as a semi-global)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn lift_arity_override_specs_are_strict_and_validated() {
+    let install = SyntheticInstall::new();
+    let far = install.far();
+    let tmp = CleanupDir::new("override-specs");
+    let globals_bytes = std::fs::read(install.global_dir().join("Global.iff")).expect("read");
+
+    // `--globals Lib.far` defaults to `Global.iff` and never suffix-matches `NotGlobal.iff`.
+    let lib = tmp.path().join("Lib.far");
+    std::fs::write(
+        &lib,
+        package_far(&[("NotGlobal.iff", &globals_bytes)]).expect("package"),
+    )
+    .expect("write Lib.far");
+    let (ok, _, stderr) = run_lift(&[
+        far.as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--globals"),
+        lib.as_os_str(),
+    ]);
+    assert!(
+        !ok && stderr.contains("--globals: FAR member 'Global.iff' not found"),
+        "stderr: {stderr}"
+    );
+
+    // A member name containing `!` is addressable: the spec splits at the first `.far!`.
+    let bang = tmp.path().join("Bang.far");
+    std::fs::write(
+        &bang,
+        package_far(&[("Food!Prep.iff", &globals_bytes)]).expect("package"),
+    )
+    .expect("write Bang.far");
+    let spec = format!("{}!Food!Prep.iff", bang.display());
+    let (ok, stdout, stderr) = run_lift(&[
+        far.as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--tree"),
+        OsStr::new("4096"),
+        OsStr::new("--no-catalog"),
+        OsStr::new("--globals"),
+        OsStr::new(&spec),
+    ]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("Bang.far!Food!Prep.iff (explicit)"),
+        "{stdout}"
+    );
+
+    // Arity flags with an archive-only listing are rejected rather than ignored.
+    let (ok, _, stderr) = run_lift(&[
+        far.as_os_str(),
+        OsStr::new("--list"),
+        OsStr::new("--globals"),
+        OsStr::new("missing.iff"),
+    ]);
+    assert!(!ok && stderr.contains("need --entry"), "stderr: {stderr}");
+
+    // A missing tree is reported before a bad override is read.
+    let (ok, _, stderr) = run_lift(&[
+        far.as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--tree"),
+        OsStr::new("4999"),
+        OsStr::new("--globals"),
+        OsStr::new("missing.iff"),
+    ]);
+    assert!(!ok && stderr.contains("BHAV #4999"), "stderr: {stderr}");
+}
+
+/// An object reached through a symlink in install A that points into install B is not
+/// positively an entry of A (it resolves outside A's root), so neither install's
+/// arities apply: no inferred role, and the header suggests the flags.
+#[cfg(unix)]
+#[test]
+fn lift_through_symlink_into_another_install_has_no_inferred_role() {
+    let a = SyntheticInstall::new();
+    let b = SyntheticInstall::new();
+    // In B, global #300 takes 6 args, so B's arities would force a labeled-CFG fallback.
+    std::fs::write(
+        b.global_dir().join("Global.iff"),
+        synthetic_bhav_iff(&[one_node_bhav(300, 6), one_node_bhav(301, 6)]),
+    )
+    .expect("rewrite B Global.iff");
+    let alias = a.root.join("GameData").join("Objects").join("Alias.far");
+    std::os::unix::fs::symlink(b.far(), &alias).expect("symlink");
+
+    let (ok, stdout, stderr) = run_lift(&[
+        alias.as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--tree"),
+        OsStr::new("4096"),
+        OsStr::new("--verify-equiv"),
+    ]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "global 256..=4095: none (no inferred role: file resolves outside the install root)"
+        ) && stdout.contains("pass --no-catalog to use this file's own private trees"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("calls global tree 300 with inline operands but its arity is unknown")
+            && stdout.contains("pass --globals <Global.iff>"),
+        "neither A's nor B's #300 may be assumed:\n{stdout}"
+    );
+    assert!(stdout.contains("// verify-equiv: Equivalent"), "{stdout}");
+}
+
+/// Index matching is by file identity: a `..` path finds its entry; a file indexed twice
+/// (as `Objects/Loose.iff` and a `Global/Shadow.iff` alias) is not one entry, and an
+/// unindexed copy under the install root is none, so both have no inferred role.
+#[cfg(unix)]
+#[test]
+fn lift_index_matching_uses_file_identity() {
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    let loose = objects.join("Loose.iff");
+    std::fs::create_dir_all(objects.join("sub")).expect("mkdir sub");
+
+    let dotted = objects.join("sub").join("..").join("Loose.iff");
+    let (ok, stdout, stderr) = run_lift(&[dotted.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("private 4096..=8191: 3 from this file")
+            && stdout.contains("semi-global 8192+: none (no resolved GLOB link)"),
+        "a `..` path must match Objects/Loose.iff itself:\n{stdout}"
+    );
+
+    // Reached through a symlink outside any install: found through its canonical path,
+    // inside the install, and identified as Objects/Loose.iff.
+    let outside = CleanupDir::new("outside-link");
+    let via = outside.path().join("via.iff");
+    std::os::unix::fs::symlink(&loose, &via).expect("symlink via.iff");
+    let (ok, stdout, stderr) = run_lift(&[via.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("private 4096..=8191: 3 from this file"),
+        "{stdout}"
+    );
+
+    // Once the same file is also indexed as Global/Shadow.iff, it is not one entry.
+    std::os::unix::fs::symlink(&loose, install.global_dir().join("Shadow.iff"))
+        .expect("symlink Shadow.iff");
+    let (ok, stdout, stderr) = run_lift(&[via.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "private 4096..=8191: none (no inferred role: the same file is indexed as GameData/Global/Shadow.iff and GameData/Objects/Loose.iff)"
+        ),
+        "{stdout}"
+    );
+
+    let scratch = install.root.join("scratch");
+    std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+    let copy = scratch.join("Copy.iff");
+    std::fs::copy(&loose, &copy).expect("copy");
+    let (ok, stdout, stderr) = run_lift(&[copy.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("global 256..=4095: none (no inferred role: file not in install index)")
+            && stdout.contains(
+                "private 4096..=8191: none (no inferred role: file not in install index)"
+            ),
+        "{stdout}"
+    );
+}
+
+/// A FIFO elsewhere in the install must not block catalog discovery.
+// Subprocess hang-watchdog timeout in a CLI integration test (not simulation logic).
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn lift_install_discovery_skips_fifos_in_mounts() {
+    use std::time::{Duration, Instant};
+    let install = SyntheticInstall::new();
+    let downloads = install.root.join("Downloads");
+    std::fs::create_dir_all(&downloads).expect("mkdir Downloads");
+    let status = Command::new("mkfifo")
+        .arg(downloads.join("pipe.iff"))
+        .arg(downloads.join("pipe.far"))
+        .status()
+        .expect("mkfifo should be available on Unix");
+    assert!(status.success(), "mkfifo failed");
+
+    let mut child = Command::new(cli_bin())
+        .arg("lift")
+        .arg(install.far())
+        .args(["--entry", "Thing.iff", "--tree", "4096"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lift");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let exited = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break Some(st);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let st = exited.expect("lift blocked on a FIFO in the install's Downloads mount");
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut stdout)
+        .expect("read stdout");
+    assert!(st.success(), "{stdout}");
+    assert!(
+        stdout.contains("GameData/Global/Global.iff (install catalog)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn lift_override_ambiguity_and_bang_directories() {
+    let install = SyntheticInstall::new();
+    let far = install.far();
+    let tmp = CleanupDir::new("override-ambiguity");
+    let globals_bytes = std::fs::read(install.global_dir().join("Global.iff")).expect("read");
+
+    let lib = tmp.path().join("Lib.far");
+    std::fs::write(
+        &lib,
+        package_far(&[
+            ("a/Global.iff", &globals_bytes),
+            ("b/Global.iff", &globals_bytes),
+        ])
+        .expect("package"),
+    )
+    .expect("write Lib.far");
+    let (ok, _, stderr) = run_lift(&[
+        far.as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--globals"),
+        lib.as_os_str(),
+    ]);
+    assert!(
+        !ok && stderr.contains("--globals: ambiguous FAR member 'Global.iff' matched 2"),
+        "stderr: {stderr}"
+    );
+
+    // A loose IFF under a directory whose name contains `.far!` is used as-is.
+    let staging = tmp.path().join("Patch.far! staging");
+    std::fs::create_dir_all(&staging).expect("mkdir staging");
+    let staged = staging.join("Global.iff");
+    std::fs::write(&staged, &globals_bytes).expect("write staged");
+    let (ok, stdout, stderr) = run_lift(&[
+        far.as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--tree"),
+        OsStr::new("4096"),
+        OsStr::new("--no-catalog"),
+        OsStr::new("--globals"),
+        staged.as_os_str(),
+    ]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("Patch.far! staging/Global.iff (explicit)"),
+        "{stdout}"
+    );
+}
+
+/// `Objects/link/../Loose.iff` opens the `Loose.iff` beside the link's target, not
+/// `Objects/Loose.iff`: the catalog entry must be the file actually opened, or none.
+#[cfg(unix)]
+#[test]
+fn lift_symlink_then_dotdot_uses_the_opened_file_not_the_lexical_entry() {
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+
+    // Target inside the install: the opened file is indexed and has its own GLOB link,
+    // while the lexical entry (Objects/Loose.iff) has none.
+    std::fs::create_dir_all(objects.join("actual").join("sub")).expect("mkdir actual/sub");
+    std::fs::write(
+        objects.join("actual").join("Loose.iff"),
+        synthetic_object_iff(Some(b"TestGlobals")),
+    )
+    .expect("write actual/Loose.iff");
+    std::os::unix::fs::symlink(objects.join("actual").join("sub"), objects.join("link"))
+        .expect("symlink link");
+    let via = objects.join("link").join("..").join("Loose.iff");
+    let (ok, stdout, stderr) = run_lift(&[via.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "semi-global 8192+: 1 from GameData/Global/TestGlobals.iff (install catalog)"
+        ),
+        "must resolve through the opened actual/Loose.iff:\n{stdout}"
+    );
+
+    // Target outside the install: no inferred role, and the header says why.
+    let outside = CleanupDir::new("dotdot-outside");
+    std::fs::create_dir_all(outside.path().join("sub")).expect("mkdir outside/sub");
+    std::fs::write(
+        outside.path().join("Loose.iff"),
+        synthetic_object_iff(Some(b"TestGlobals")),
+    )
+    .expect("write outside/Loose.iff");
+    std::os::unix::fs::symlink(outside.path().join("sub"), objects.join("away"))
+        .expect("symlink away");
+    let via = objects.join("away").join("..").join("Loose.iff");
+    let (ok, stdout, stderr) = run_lift(&[via.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "private 4096..=8191: none (no inferred role: file resolves outside the install root)"
+        ),
+        "{stdout}"
+    );
+}
+
+/// `Objects/Global.iff` is a hard link to `Global/Global.iff`, and `Objects/link` points
+/// at `Global/sub`. Whether the file is opened directly or as `Objects/link/../Global.iff`
+/// (which names the object alias lexically), it is one file with two roles, so its
+/// role is inferred and the header names both entries.
+#[cfg(unix)]
+#[test]
+fn lift_file_indexed_under_two_roles_is_ambiguous() {
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    let global = install.global_dir().join("Global.iff");
+    std::fs::hard_link(&global, objects.join("Global.iff")).expect("hard link Global.iff");
+    std::fs::create_dir_all(install.global_dir().join("sub")).expect("mkdir Global/sub");
+    std::os::unix::fs::symlink(install.global_dir().join("sub"), objects.join("link"))
+        .expect("symlink link");
+
+    let why = "no inferred role: the same file is indexed as GameData/Global/Global.iff and GameData/Objects/Global.iff";
+    for input in [
+        global.clone(),
+        objects.join("link").join("..").join("Global.iff"),
+    ] {
+        let (ok, stdout, stderr) = run_lift(&[input.as_os_str(), OsStr::new("--list")]);
+        assert!(ok, "stderr: {stderr}");
+        assert!(
+            stdout.contains(&format!("global 256..=4095: none ({why})"))
+                && stdout.contains(&format!("private 4096..=8191: none ({why})"))
+                && stdout.contains(&format!("semi-global 8192+: none ({why})")),
+            "{}:\n{stdout}",
+            input.display()
+        );
+    }
+}
+
+/// The shipped binary has no test hook: the former
+/// `SIMS_ANTICS_TEST_REPLACE_INPUT_AFTER_READ` variable must not make `lift` touch its
+/// input.
+#[test]
+fn lift_has_no_input_replacing_test_hook() {
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    let loose = objects.join("Loose.iff");
+    let before = std::fs::read(&loose).expect("read Loose.iff");
+    let staged = objects.join("Loose.iff.saving");
+    std::fs::write(&staged, synthetic_object_iff(Some(b"TestGlobals"))).expect("stage");
+
+    let out = Command::new(cli_bin())
+        .arg("lift")
+        .arg(&loose)
+        .arg("--list")
+        .env("SIMS_ANTICS_TEST_REPLACE_INPUT_AFTER_READ", &staged)
+        .output()
+        .expect("run lift");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(staged.exists(), "the staged file must be left alone");
+    assert_eq!(
+        std::fs::read(&loose).expect("reread"),
+        before,
+        "the input must not change"
+    );
+}
+
+/// An atomic save replaces the file at a path with a new inode. The lookup uses the
+/// identity of the handle the bytes were read through (as `lift` does, keeping that
+/// handle open until the lookup is done), so the replaced file never matches the new
+/// index entry.
+#[cfg(unix)]
+#[test]
+fn catalog_lookup_never_matches_a_file_replaced_after_reading() {
+    use sims_antics::arity_catalog::{FileIdentity, InstallArityCatalog, ResourceMatch};
+
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    let loose = objects.join("Loose.iff");
+    let mut read_handle = std::fs::File::open(&loose).expect("open Loose.iff");
+    let mut bytes = Vec::new();
+    read_handle.read_to_end(&mut bytes).expect("read");
+    let read_identity = FileIdentity::of_open(&read_handle, &loose).expect("fstat");
+
+    let staged = objects.join("Loose.iff.saving");
+    std::fs::write(&staged, synthetic_object_iff(Some(b"TestGlobals"))).expect("stage");
+    std::fs::rename(&staged, &loose).expect("atomic replace");
+
+    let catalog = InstallArityCatalog::load(&install.root).expect("load catalog");
+    assert_eq!(
+        catalog.resource_for(&loose, &read_identity, None),
+        ResourceMatch::Unindexed,
+        "the file that was read is no longer indexed"
+    );
+    let now = FileIdentity::of_path(&loose).expect("stat");
+    assert!(matches!(
+        catalog.resource_for(&loose, &now, None),
+        ResourceMatch::Unique(_)
+    ));
+    drop(read_handle);
+}
+
+/// The catalog is built from the whole index, as the VM builds it: a dangling
+/// `Global/Shared.iff` comes before `Objects/Shared.iff` in name resolution, so the
+/// owner's `GLOB "Shared"` resolves to the dangling file and its semi-global arities are
+/// unknown, rather than borrowing the second file's.
+#[cfg(unix)]
+#[test]
+fn lift_semi_global_link_resolves_to_the_first_file_even_when_it_is_dangling() {
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    std::os::unix::fs::symlink(
+        install.global_dir().join("missing-target.iff"),
+        install.global_dir().join("Shared.iff"),
+    )
+    .expect("dangling symlink");
+    std::fs::write(
+        objects.join("Shared.iff"),
+        synthetic_bhav_iff(&[one_node_bhav(8192, 6)]),
+    )
+    .expect("write Objects/Shared.iff");
+    let owner = objects.join("Owner.iff");
+    std::fs::write(&owner, synthetic_object_iff(Some(b"Shared"))).expect("write Owner.iff");
+
+    let (ok, stdout, stderr) = run_lift(&[owner.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("private 4096..=8191: 3 from this file")
+            && stdout
+                .contains("semi-global 8192+: none (failed to read GameData/Global/Shared.iff")
+            && !stdout.contains("GameData/Objects/Shared.iff"),
+        "{stdout}"
+    );
+}
+
+/// A `Global.iff` the VM's library loader rejects (BHAV 301 truncated, while 300 still
+/// parses) supplies no arities, though its container parses and a per-chunk extractor
+/// would skip 301 and keep 300. Without it the VM does not link at all, so every range
+/// is unknown, and the header says why.
+#[test]
+fn lift_with_a_global_iff_the_vm_rejects_has_no_arities() {
+    let install = SyntheticInstall::new();
+    let valid = one_node_bhav(300, 4);
+    let mut truncated = encode_bhav(&one_node_bhav(301, 6)).expect("encode_bhav");
+    truncated.truncate(4);
+    std::fs::write(
+        install.global_dir().join("Global.iff"),
+        write_iff(&[
+            ChunkData {
+                tag: *b"BHAV",
+                id: 300,
+                flags: 0,
+                label: valid.label.clone(),
+                data: encode_bhav(&valid).expect("encode_bhav"),
+            },
+            ChunkData {
+                tag: *b"BHAV",
+                id: 301,
+                flags: 0,
+                label: "Truncated".to_owned(),
+                data: truncated,
+            },
+        ])
+        .expect("write_iff"),
+    )
+    .expect("rewrite Global.iff");
+
+    let (ok, stdout, stderr) = run_lift(&[
+        install.far().as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--tree"),
+        OsStr::new("4096"),
+    ]);
+    assert!(ok, "stderr: {stderr}\nstdout: {stdout}");
+    let header = stdout.lines().next().unwrap_or_default();
+    let why =
+        "none (the VM cannot link this install: the VM would not load GameData/Global/Global.iff: ";
+    assert!(
+        header.contains(&format!("global 256..=4095: {why}"))
+            && header.contains(&format!("private 4096..=8191: {why}"))
+            && header.contains(&format!("semi-global 8192+: {why}")),
+        "{stdout}"
+    );
+}
+
+/// An indexed `Global.iff` that cannot be read (for any user: here a dangling symlink,
+/// which the index keeps) leaves the VM unable to link, so no call runs and every range
+/// is unknown.
+#[cfg(unix)]
+#[test]
+fn lift_with_an_unreadable_global_iff_has_no_arities() {
+    let install = SyntheticInstall::new();
+    let global = install.global_dir().join("Global.iff");
+    std::fs::remove_file(&global).expect("remove Global.iff");
+    std::os::unix::fs::symlink(install.root.join("missing.iff"), &global)
+        .expect("symlink Global.iff");
+    assert!(
+        std::fs::File::open(&global).is_err(),
+        "Global.iff must be unreadable"
+    );
+    let loose = install
+        .root
+        .join("GameData")
+        .join("Objects")
+        .join("Loose.iff");
+    let (ok, stdout, stderr) =
+        run_lift(&[loose.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
+    assert!(ok, "stderr: {stderr}");
+    let header = stdout.lines().next().unwrap_or_default();
+    let why = "none (the VM cannot link this install: failed to read GameData/Global/Global.iff";
+    assert!(
+        header.contains(&format!("global 256..=4095: {why}"))
+            && header.contains(&format!("private 4096..=8191: {why}"))
+            && header.contains(&format!("semi-global 8192+: {why}")),
+        "{stdout}"
+    );
+}
+
+/// The owner's own file must also pass the VM's library loader: with a truncated BHAV
+/// the VM rejects it. That object's link then fails, so none of its calls run, and no
+/// count can misdescribe one; its private counts are reported unknown, with the reason,
+/// rather than taken from a library the VM never loads.
+#[test]
+fn lift_owner_file_the_vm_rejects_has_no_private_arities() {
+    let install = SyntheticInstall::new();
+    let mut truncated = encode_bhav(&one_node_bhav(4099, 1)).expect("encode_bhav");
+    truncated.truncate(4);
+    let broken = install
+        .root
+        .join("GameData")
+        .join("Objects")
+        .join("Broken.iff");
+    let mut chunks = vec![
+        bhav_chunk(&two_call_bhav(4096, 300, 4097)),
+        bhav_chunk(&one_node_bhav(4097, 1)),
+        objd_chunk(),
+        glob_chunk(b"TestGlobals"),
+    ];
+    chunks.push(ChunkData {
+        tag: *b"BHAV",
+        id: 4099,
+        flags: 0,
+        label: "Truncated".to_owned(),
+        data: truncated,
+    });
+    std::fs::write(&broken, write_iff(&chunks).expect("write_iff")).expect("write Broken.iff");
+    let (ok, stdout, stderr) =
+        run_lift(&[broken.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
+    assert!(ok, "stderr: {stderr}");
+    let header = stdout.lines().next().unwrap_or_default();
+    assert!(
+        header.contains(
+            "private 4096..=8191: none (the VM would not load GameData/Objects/Broken.iff: "
+        ) && header.contains("global 256..=4095: 2 from GameData/Global/Global.iff"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "node 1 calls private tree 4097 with inline operands but its arity is unknown"
+        ),
+        "{stdout}"
+    );
+}
+
+/// Owner contexts come only from registered objects: an IFF with no `OBJD` (or whose
+/// `OBJD` loses its GUID to a later registration) never runs its private trees, and a
+/// `GLOB` in such a file makes no semi-global.
+#[test]
+fn lift_owner_roles_come_from_registered_objects_only() {
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    let orphan = objects.join("Orphan.iff");
+    std::fs::write(
+        &orphan,
+        object_iff(&[two_call_bhav(4096, 300, 8192)], false, Some(b"Lib")),
+    )
+    .expect("write Orphan.iff");
+    let lib = objects.join("Lib.iff");
+    std::fs::write(
+        &lib,
+        object_iff(
+            &[two_call_bhav(8192, 300, 8193), one_node_bhav(8193, 1)],
+            false,
+            None,
+        ),
+    )
+    .expect("write Lib.iff");
+
+    let (ok, stdout, stderr) =
+        run_lift(&[orphan.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("private 4096..=8191: none (never runs: no registered object definition (OBJD) in this file)"),
+        "{stdout}"
+    );
+    let (ok, stdout, stderr) =
+        run_lift(&[lib.as_os_str(), OsStr::new("--tree"), OsStr::new("8192")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("semi-global 8192+: none (never runs: no registered object links to this file as its semi-global)"),
+        "{stdout}"
+    );
+
+    // Two files register the same GUID and the later registration wins. Within a
+    // directory the index follows the original's file-table hash order (`Index::build`),
+    // which registers Shadow2.iff before Shadow1.iff, so Shadow1.iff is the owner and
+    // Shadow2.iff's OBJD registers nothing.
+    let guid = 0x0BAD_F00D;
+    let header_of = |name: &str| {
+        let path = objects.join(name);
+        let (ok, stdout, stderr) =
+            run_lift(&[path.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
+        assert!(ok, "stderr: {stderr}");
+        stdout.lines().next().unwrap_or_default().to_owned()
+    };
+    for name in ["Shadow1.iff", "Shadow2.iff"] {
+        let chunks = [
+            bhav_chunk(&two_call_bhav(4096, 300, 4097)),
+            bhav_chunk(&one_node_bhav(4097, 1)),
+            objd_chunk_with_guid(guid),
+        ];
+        std::fs::write(objects.join(name), write_iff(&chunks).expect("write_iff"))
+            .expect("write shadow");
+    }
+    let winner = header_of("Shadow1.iff");
+    assert!(
+        winner.contains("private 4096..=8191: 2 from this file"),
+        "{winner}"
+    );
+    let loser = header_of("Shadow2.iff");
+    assert!(
+        loser.contains("private 4096..=8191: none (never runs: no registered object definition (OBJD) in this file)"),
+        "{loser}"
+    );
+}
+
+/// A `GLOB` name that resolves to a file in a mount a neighborhood's `Characters`
+/// directory precedes (here `Downloads`) may resolve to a `Characters` file instead,
+/// as the VM boots with that neighborhood; `lift` does not know which, so the
+/// semi-global range is unknown.
+#[test]
+fn lift_glob_target_a_characters_file_could_shadow_is_unknown() {
+    let install = SyntheticInstall::new();
+    let downloads = install.root.join("Downloads");
+    std::fs::create_dir_all(&downloads).expect("mkdir Downloads");
+    std::fs::write(
+        downloads.join("Shared.iff"),
+        synthetic_bhav_iff(&[one_node_bhav(8192, 1)]),
+    )
+    .expect("write Downloads/Shared.iff");
+    let characters = install.root.join("UserData").join("Characters");
+    std::fs::create_dir_all(&characters).expect("mkdir Characters");
+    std::fs::write(
+        characters.join("Shared.iff"),
+        synthetic_bhav_iff(&[one_node_bhav(8192, 6)]),
+    )
+    .expect("write Characters/Shared.iff");
+    let owner = install
+        .root
+        .join("GameData")
+        .join("Objects")
+        .join("Owner.iff");
+    std::fs::write(&owner, synthetic_object_iff(Some(b"Shared"))).expect("write Owner.iff");
+
+    let (ok, stdout, stderr) =
+        run_lift(&[owner.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("semi-global 8192+: none (a neighborhood's Characters file named Shared.iff would take precedence over Downloads/Shared.iff, and the neighborhood is not known)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("structured lift fallback"), "{stdout}");
+}
+
+/// A count is supplied only where the VM reads one when it executes the call: not for
+/// an empty BHAV (no frame dimensions), nor for a flagged call opcode (0xA000), which
+/// the VM refuses before dispatch.
+#[test]
+fn lift_callee_the_vm_would_not_dispatch_has_unknown_arity() {
+    let install = SyntheticInstall::new();
+    let empty = BhavChunk {
+        instructions: Vec::new(),
+        ..one_node_bhav(303, 1)
+    };
+    std::fs::write(
+        install.global_dir().join("Global.iff"),
+        synthetic_bhav_iff(&[one_node_bhav(300, 4), one_node_bhav(301, 6), empty]),
+    )
+    .expect("rewrite Global.iff");
+    std::fs::write(
+        install.global_dir().join("TestGlobals.iff"),
+        synthetic_bhav_iff(&[one_node_bhav(8192, 1), one_node_bhav(0xA000, 1)]),
+    )
+    .expect("rewrite TestGlobals.iff");
+    let caller = install
+        .root
+        .join("GameData")
+        .join("Objects")
+        .join("Caller.iff");
+    std::fs::write(
+        &caller,
+        object_iff(
+            &[
+                two_call_bhav(4096, 303, 300),
+                two_call_bhav(4097, 0xA000, 300),
+            ],
+            true,
+            Some(b"TestGlobals"),
+        ),
+    )
+    .expect("write Caller.iff");
+
+    let (ok, stdout, stderr) = run_lift(&[caller.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    let row = |id: &str| {
+        stdout
+            .lines()
+            .find(|l| l.starts_with(id))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(
+        row("4096").contains("labeled-cfg (calls global 303, arity unknown)"),
+        "{stdout}"
+    );
+    assert!(row("4097").contains("labeled-cfg"), "{stdout}");
+    assert!(
+        stdout.contains("global 256..=4095: 2 from GameData/Global/Global.iff")
+            && stdout.contains("semi-global 8192+: 1 from GameData/Global/TestGlobals.iff"),
+        "{stdout}"
+    );
+}
+
+/// `Dual.iff` is an object with no `GLOB` link that another object links to as its
+/// semi-global. Its private tree 4096 runs under Dual itself, which has no semi-global
+/// library (the VM traps on 8192), so the call stays unknown; only Dual's own 8192+
+/// trees, run as the library, take semi-global arities from Dual.
+#[test]
+fn lift_semi_global_arities_follow_the_calling_tree_not_the_file() {
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    let dual = objects.join("Dual.iff");
+    std::fs::write(
+        &dual,
+        object_iff(
+            &[two_call_bhav(4096, 300, 8192), one_node_bhav(8192, 1)],
+            true,
+            None,
+        ),
+    )
+    .expect("write Dual.iff");
+    std::fs::write(
+        objects.join("Linker.iff"),
+        synthetic_object_iff(Some(b"Dual")),
+    )
+    .expect("write Linker.iff");
+
+    let (ok, stdout, stderr) =
+        run_lift(&[dual.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
+    assert!(ok, "stderr: {stderr}");
+    let header = stdout.lines().next().unwrap_or_default();
+    assert!(
+        header.contains("private 4096..=8191: 1 from this file")
+            && header.contains("semi-global 8192+: none (no resolved GLOB link)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("node 1 calls semi-global tree 8192 with inline operands but its arity is unknown; semi-global arities not loaded (no resolved GLOB link)"),
+        "{stdout}"
+    );
+
+    let (ok, stdout, stderr) =
+        run_lift(&[dual.as_os_str(), OsStr::new("--tree"), OsStr::new("8192")]);
+    assert!(ok, "stderr: {stderr}");
+    let header = stdout.lines().next().unwrap_or_default();
+    assert!(
+        header.contains(
+            "private 4096..=8191: none (owner-dependent: semi-global file runs under the calling object)"
+        ) && header.contains("semi-global 8192+: 1 from this file (linked as a semi-global)"),
+        "{stdout}"
+    );
+
+    // Listing both shows each calling scope separately.
+    let (ok, stdout, stderr) = run_lift(&[dual.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    let header = stdout.lines().next().unwrap_or_default();
+    assert!(
+        header.contains("for trees 4096..=8191: global 256..=4095: ")
+            && header.contains(" | for trees 8192+: global 256..=4095: "),
+        "{stdout}"
+    );
+    let row = stdout
+        .lines()
+        .find(|l| l.starts_with("4096"))
+        .unwrap_or_default();
+    assert!(row.contains("labeled-cfg"), "{stdout}");
+}
+
+/// Runs `lift` with `args`, failing the test if it does not exit within 20 s.
+#[allow(clippy::disallowed_methods)]
+fn run_lift_with_watchdog(args: &[&OsStr], what: &str) -> (bool, String) {
+    use std::time::{Duration, Instant};
+    let mut child = Command::new(cli_bin())
+        .arg("lift")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lift");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let exited = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break Some(st);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let st = exited.unwrap_or_else(|| panic!("lift blocked on {what}"));
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut stdout)
+        .expect("read stdout");
+    (st.success(), stdout)
+}
+
+/// A FIFO the catalog selects as `Global.iff`, or as an object's `GLOB` target, is
+/// refused before any open on the arity path, so `lift` does not block on it.
+#[cfg(unix)]
+#[test]
+fn lift_does_not_block_on_a_fifo_the_catalog_selects() {
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    let owner = objects.join("Owner.iff");
+    std::fs::write(&owner, synthetic_object_iff(Some(b"Pipe"))).expect("write Owner.iff");
+    let status = Command::new("mkfifo")
+        .arg(install.global_dir().join("Pipe.iff"))
+        .status()
+        .expect("mkfifo should be available on Unix");
+    assert!(status.success(), "mkfifo failed");
+
+    let (ok, stdout) = run_lift_with_watchdog(
+        &[owner.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")],
+        "a FIFO GLOB target",
+    );
+    assert!(ok, "{stdout}");
+    assert!(
+        stdout.contains(
+            "semi-global 8192+: none (failed to read GameData/Global/Pipe.iff: not a regular file)"
+        ),
+        "{stdout}"
+    );
+
+    let global = install.global_dir().join("Global.iff");
+    std::fs::remove_file(&global).expect("remove Global.iff");
+    let status = Command::new("mkfifo")
+        .arg(&global)
+        .status()
+        .expect("mkfifo should be available on Unix");
+    assert!(status.success(), "mkfifo failed");
+    let loose = objects.join("Loose.iff");
+    let (ok, stdout) = run_lift_with_watchdog(
+        &[loose.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")],
+        "a FIFO Global.iff",
+    );
+    assert!(ok, "{stdout}");
+    let why = "none (the VM cannot link this install: failed to read GameData/Global/Global.iff: not a regular file)";
+    assert!(
+        stdout.contains(&format!("global 256..=4095: {why}"))
+            && stdout.contains(&format!("private 4096..=8191: {why}"))
+            && stdout.contains(&format!("semi-global 8192+: {why}")),
+        "{stdout}"
+    );
+}
+
+/// An unidentifiable loose entry in install A must not lend A's arities to a file of
+/// install B reached through a symlink in A, nor affect a FAR-member input of A.
+#[cfg(unix)]
+#[test]
+fn lift_unidentifiable_entry_is_scoped_to_its_install_and_kind() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let a = SyntheticInstall::new();
+    let b = SyntheticInstall::new();
+    let a_objects = a.root.join("GameData").join("Objects");
+    let locked = a_objects.join("locked");
+    std::fs::create_dir_all(&locked).expect("mkdir locked");
+    std::fs::write(locked.join("Hidden.iff"), synthetic_object_iff(None)).expect("write");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let _restore = RestoreMode(locked.clone());
+    if std::fs::metadata(locked.join("Hidden.iff")).is_ok() {
+        eprintln!("skipping: permissions are not enforced for this user");
+        return;
+    }
+
+    // B's loose object, reached through a symlink in A.
+    let link = a_objects.join("FromB.iff");
+    std::os::unix::fs::symlink(
+        b.root.join("GameData").join("Objects").join("Loose.iff"),
+        &link,
+    )
+    .expect("symlink");
+    let (ok, stdout, stderr) = run_lift(&[link.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "global 256..=4095: none (no inferred role: file resolves outside the install root)"
+        ),
+        "A's globals must not apply to B's file:\n{stdout}"
+    );
+
+    // A FAR member of A is identified; a loose unidentifiable entry cannot be it.
+    let far = a.far();
+    let (ok, stdout, stderr) = run_lift(&[
+        far.as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--list"),
+    ]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("global 256..=4095: 2 from GameData/Global/Global.iff (install catalog)")
+            && stdout.contains(
+                "semi-global 8192+: 1 from GameData/Global/TestGlobals.iff (install catalog)"
+            ),
+        "{stdout}"
+    );
+}
+
+/// An index path that cannot be `stat`ed (here: in a directory without search
+/// permission) might be the lifted file under another role, so owner-dependent ranges
+/// are unknown and the header names it.
+#[cfg(unix)]
+#[test]
+fn lift_with_an_unidentifiable_index_path_keeps_owner_ranges_unknown() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    let locked = objects.join("locked");
+    std::fs::create_dir_all(&locked).expect("mkdir locked");
+    std::fs::write(locked.join("Hidden.iff"), synthetic_object_iff(None)).expect("write");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let _restore = RestoreMode(locked.clone());
+    if std::fs::metadata(locked.join("Hidden.iff")).is_ok() {
+        eprintln!("skipping: permissions are not enforced for this user");
+        return;
+    }
+
+    let loose = objects.join("Loose.iff");
+    let (ok, stdout, stderr) = run_lift(&[loose.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    let why = "no inferred role: 1 install index path(s) that could be this file could not be identified: GameData/Objects/locked/Hidden.iff (";
+    assert!(
+        stdout.contains(&format!("global 256..=4095: none ({why}"))
+            && stdout.contains(&format!("private 4096..=8191: none ({why}"))
+            && stdout.contains(&format!("semi-global 8192+: none ({why}")),
+        "{stdout}"
+    );
+}
+
+/// Two BHAV chunks share an ID: the VM's loader keeps the last one in file order (deleted
+/// ones included, whatever the flags' high byte), so that is the tree `lift` lists,
+/// lifts, and describes with the file's arity context, and the duplicate is flagged.
+/// The kept 4096 has a nonzero high flag byte, so a lookup keyed on flags (`Iff::get`)
+/// would pick the first copy instead.
+#[test]
+fn lift_shows_the_duplicate_bhav_chunk_the_vm_keeps() {
+    let install = SyntheticInstall::new();
+    let named = |bhav: BhavChunk, label: &str, flags: u16| ChunkData {
+        flags,
+        label: label.to_owned(),
+        ..bhav_chunk(&bhav)
+    };
+    let path = install
+        .root
+        .join("GameData")
+        .join("Objects")
+        .join("Dup.iff");
+    let chunks = vec![
+        named(two_call_bhav(4096, 300, 8192), "FirstCopy", 0),
+        named(two_call_bhav(4097, 300, 4096), "LiveCopy", 0),
+        named(two_call_bhav(4096, 301, 300), "KeptCopy", 0x0100),
+        named(two_call_bhav(4097, 301, 4096), "DeletedKept", 4),
+        objd_chunk(),
+        glob_chunk(b"TestGlobals"),
+    ];
+    std::fs::write(&path, write_iff(&chunks).expect("write_iff")).expect("write Dup.iff");
+    let note = "// duplicate BHAV IDs: 4096 (2 chunks), 4097 (2 chunks); each shows the last chunk in file order, the one the VM keeps";
+
+    let (ok, stdout, stderr) = run_lift(&[path.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains(note), "{stdout}");
+    assert!(
+        stdout.contains("KeptCopy")
+            && stdout.contains("DeletedKept")
+            && !stdout.contains("FirstCopy")
+            && !stdout.contains("LiveCopy"),
+        "{stdout}"
+    );
+
+    // KeptCopy calls global 301 (6 arguments) inline at its first node: the kept caller,
+    // under this file's arity context, reads them from the next record and falls back.
+    let row_4096 = stdout
+        .lines()
+        .find(|l| l.starts_with("4096"))
+        .unwrap_or_default();
+    assert!(
+        row_4096.contains("labeled-cfg (calls global 301 with 6 args)")
+            && row_4096.contains("KeptCopy"),
+        "{stdout}"
+    );
+
+    let (ok, stdout, stderr) =
+        run_lift(&[path.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("KeptCopy") && !stdout.contains("FirstCopy"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("node 0 calls global tree 301 with inline operands and 6 args (>4 reads following records)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("// duplicate BHAV IDs: 4096 (2 chunks);"),
+        "{stdout}"
+    );
+
+    let (ok, stdout, stderr) = run_lift(&[path.as_os_str(), OsStr::new("--verify-equiv")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains(note), "{stdout}");
+    assert!(
+        stdout.contains("KeptCopy")
+            && stdout.contains("DeletedKept")
+            && !stdout.contains("FirstCopy")
+            && !stdout.contains("LiveCopy"),
+        "{stdout}"
+    );
+}
+
+/// A BHAV whose only chunk is deleted is still loaded by the VM, which can run it (here
+/// live 4096 calls it), so `lift` lists, lifts and verifies it like any other tree.
+#[test]
+fn lift_includes_a_bhav_whose_only_chunk_is_deleted() {
+    let install = SyntheticInstall::new();
+    let path = install
+        .root
+        .join("GameData")
+        .join("Objects")
+        .join("DeletedOnly.iff");
+    let mut deleted = bhav_chunk(&two_call_bhav(4097, 300, 300));
+    deleted.flags = 4;
+    deleted.label = "OnlyDeleted".to_owned();
+    let chunks = vec![
+        bhav_chunk(&two_call_bhav(4096, 300, 4097)),
+        deleted,
+        objd_chunk(),
+        glob_chunk(b"TestGlobals"),
+    ];
+    std::fs::write(&path, write_iff(&chunks).expect("write_iff")).expect("write iff");
+
+    let (ok, stdout, stderr) =
+        run_lift(&[path.as_os_str(), OsStr::new("--tree"), OsStr::new("4097")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains("OnlyDeleted"), "{stdout}");
+    assert!(
+        stdout.contains("private 4096..=8191: 2 from this file"),
+        "{stdout}"
+    );
+
+    let (ok, stdout, stderr) = run_lift(&[path.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    let row = stdout
+        .lines()
+        .find(|l| l.starts_with("4097"))
+        .unwrap_or_default();
+    assert!(
+        row.contains("structured") && row.contains("OnlyDeleted"),
+        "{stdout}"
+    );
+
+    let (ok, stdout, stderr) = run_lift(&[path.as_os_str(), OsStr::new("--verify-equiv")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains("OnlyDeleted"), "{stdout}");
+    assert!(stdout.contains("Caller4096"), "{stdout}");
+}
+
+/// A private call runs the code owner's tree. A semi-global caller's owner is not this
+/// file, so its call comments must not name this file's (here deleted-only) 4096; a
+/// private caller in the same file still names its own private callee.
+#[test]
+fn lift_names_private_callees_only_for_private_callers() {
+    let install = SyntheticInstall::new();
+    let path = install.global_dir().join("TestGlobals.iff");
+    let mut not_the_owners = bhav_chunk(&one_node_bhav(4096, 0));
+    not_the_owners.flags = 4;
+    not_the_owners.label = "NotTheOwners".to_owned();
+    std::fs::write(
+        &path,
+        write_iff(&[
+            bhav_chunk(&two_call_bhav(8192, 300, 4096)),
+            not_the_owners,
+            bhav_chunk(&two_call_bhav(4097, 300, 4096)),
+        ])
+        .expect("write_iff"),
+    )
+    .expect("write TestGlobals.iff");
+
+    for extra in [None, Some("--no-catalog")] {
+        let mut args = vec![path.as_os_str(), OsStr::new("--tree"), OsStr::new("8192")];
+        args.extend(extra.map(OsStr::new));
+        let (ok, stdout, stderr) = run_lift(&args);
+        assert!(ok, "stderr: {stderr}");
+        assert!(stdout.contains("call 4096"), "{stdout}");
+        assert!(!stdout.contains("NotTheOwners"), "{extra:?}: {stdout}");
+    }
+    let (ok, stdout, stderr) = run_lift(&[
+        path.as_os_str(),
+        OsStr::new("--tree"),
+        OsStr::new("4097"),
+        OsStr::new("--no-catalog"),
+    ]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains("\"NotTheOwners\""), "{stdout}");
 }

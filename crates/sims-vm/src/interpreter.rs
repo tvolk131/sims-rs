@@ -12,7 +12,9 @@ use crate::primitives::ui_effect::UiEffectEvent;
 use crate::program::{DEFINITION_WORDS, Library, Program, ProgramFast, Tree};
 use crate::sounds::SoundEvent;
 use sims_content::Catalog;
-use sims_formats::behavior::{Behavior, Instruction};
+use sims_formats::behavior::{
+    Behavior, FrameDimensionsError, Instruction, TreeScope, instruction_refused,
+};
 use sims_formats::saved_objects::Frame;
 use sims_sim::characters;
 use sims_sim::{Object, World};
@@ -693,15 +695,15 @@ impl<'a> Machine<'a, '_> {
 
     #[inline]
     fn behavior_from_owner(&self, owner: CachedOwner<'a>, id: u16) -> Result<&'a Behavior, Trap> {
-        let lib = match id {
-            0..=255 => {
+        let lib = match TreeScope::of(id) {
+            None => {
                 return Err(Trap::Invalid(format!(
                     "tree ID {id} names a primitive, not a BHAV"
                 )));
             }
-            256..=4095 => self.global_lib,
-            4096..=8191 => owner.owner_lib,
-            _ => owner.semi_lib.map(|(_, l)| l),
+            Some(TreeScope::Global) => self.global_lib,
+            Some(TreeScope::Private) => owner.owner_lib,
+            Some(TreeScope::SemiGlobal) => owner.semi_lib.map(|(_, l)| l),
         };
         lib.and_then(|l| l.behaviors.get(&id))
             .ok_or(Trap::MissingTree { id })
@@ -1364,7 +1366,7 @@ impl<'a> Machine<'a, '_> {
             frame.tree = frame.tree_id();
         }
         let (_owner_res, behavior, instruction) = self.current_cached()?;
-        if instruction.opcode & Frame::TREE_FLAG != 0 {
+        if instruction_refused(instruction.opcode) {
             // The separate instruction-flag hook writes to the shared
             // BHAV resource (0x474bf4 -> 0x474b33).
             return Err(Trap::Unsupported(format!(
@@ -1765,20 +1767,15 @@ pub(crate) fn mark_frame_dirty(world: &mut World, object_id: u16, depth: usize) 
 /// A tree's argument and local counts, as its format limits them
 /// (legacy lib.rs:1550). Format 0x8000 always has four arguments and no
 /// locals, and 0x8001 caps both at four. The local count is a byte.
+/// Shared with callers that predict a call's argument count
+/// ([`Behavior::frame_dimensions`]).
 fn dimensions(behavior: &Behavior) -> Result<(usize, usize), Trap> {
-    if behavior.instructions.is_empty() {
-        return Err(Trap::Invalid("BHAV has no instructions".into()));
-    }
-    let locals = behavior.locals as u8;
-    let (args, locals) = match behavior.format {
-        0x8000 => (4, 0),
-        0x8001 => (behavior.args.min(4), locals.min(4)),
-        0x8002 => (behavior.args, locals),
-        format => {
-            return Err(Trap::Unsupported(format!("BHAV format {format:#06x}")));
+    behavior.frame_dimensions().map_err(|e| match e {
+        FrameDimensionsError::Empty => Trap::Invalid("BHAV has no instructions".into()),
+        FrameDimensionsError::Format(format) => {
+            Trap::Unsupported(format!("BHAV format {format:#06x}"))
         }
-    };
-    Ok((usize::from(args), usize::from(locals)))
+    })
 }
 
 /// The words a frame takes in the frame storage: eight for its header,

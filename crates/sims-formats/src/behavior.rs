@@ -106,6 +106,69 @@ pub fn branch(target: u8, count: usize) -> String {
     }
 }
 
+/// Which library the VM looks a tree ID up in, for a running tree and for a callee
+/// alike (`sims_vm`'s `behavior_from_owner`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TreeScope {
+    /// `256..=4095`: `Global.iff`.
+    Global,
+    /// `4096..=8191`: the code owner's own file.
+    Private,
+    /// `8192..`: the code owner's `GLOB`-linked semi-global file.
+    SemiGlobal,
+}
+
+impl TreeScope {
+    /// The library tree `id` is looked up in, or `None` for a primitive (`0..=255`).
+    #[must_use]
+    pub fn of(id: u16) -> Option<Self> {
+        match id {
+            0..=255 => None,
+            256..=4095 => Some(Self::Global),
+            4096..=8191 => Some(Self::Private),
+            _ => Some(Self::SemiGlobal),
+        }
+    }
+}
+
+/// The instruction-opcode bit the VM refuses before dispatching the instruction
+/// (0x474bf4 -> 0x474b33 writes to the shared BHAV resource).
+pub const INSTRUCTION_FLAG: u16 = 0x8000;
+
+/// Whether the VM refuses an instruction with `opcode` before dispatching it.
+#[must_use]
+pub fn instruction_refused(opcode: u16) -> bool {
+    opcode & INSTRUCTION_FLAG != 0
+}
+
+/// Why the VM cannot build a call frame for a tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameDimensionsError {
+    /// The tree has no instructions.
+    Empty,
+    /// The format word is not one the interpreter runs.
+    Format(u16),
+}
+
+impl Behavior {
+    /// A call frame's argument and local counts, as the interpreter takes them before a
+    /// call reads its arguments (legacy lib.rs:1550). Format 0x8000 always has four
+    /// arguments and no locals, and 0x8001 caps both at four. The local count is a byte.
+    pub fn frame_dimensions(&self) -> std::result::Result<(usize, usize), FrameDimensionsError> {
+        if self.instructions.is_empty() {
+            return Err(FrameDimensionsError::Empty);
+        }
+        let locals = self.locals as u8;
+        let (args, locals) = match self.format {
+            0x8000 => (4, 0),
+            0x8001 => (self.args.min(4), locals.min(4)),
+            0x8002 => (self.args, locals),
+            format => return Err(FrameDimensionsError::Format(format)),
+        };
+        Ok((usize::from(args), usize::from(locals)))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ObjectDefinition {
     pub stand_function: u16,

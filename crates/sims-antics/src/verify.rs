@@ -556,7 +556,7 @@ fn verify_resource_links(model: &ObjectModel, violations: &mut Vec<SafetyViolati
     }
 }
 
-fn bhav_param_limit(bhav: &Behavior) -> usize {
+pub(crate) fn bhav_param_limit(bhav: &Behavior) -> usize {
     match bhav.format {
         0x8000 => 4,
         0x8001 => usize::from(bhav.args).min(4),
