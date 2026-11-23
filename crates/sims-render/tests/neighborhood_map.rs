@@ -555,6 +555,136 @@ fn neighborhood_hover_cutaway_and_crossfade_match_191_oracle() {
 }
 
 #[test]
+fn arbitrary_viewports_have_seamless_surround_zero_black_margins_and_aligned_hit_tests() {
+    let Some(install) = install() else {
+        return;
+    };
+    let dump_dir = std::env::var_os("SIMS_DUMP_NBHD_DIR").map(PathBuf::from);
+    if let Some(dir) = &dump_dir {
+        std::fs::create_dir_all(dir).expect("create dump dir");
+    }
+
+    let magenta_packed = sims_render::pack_rgb(sims_render::neighborhood::widen_565(COLOR_KEY_565));
+
+    for (kind_name, kind) in [
+        ("unleashed", NeighborhoodKind::Unleashed),
+        ("studiotown", NeighborhoodKind::StudioTown),
+        ("magictown", NeighborhoodKind::MagicTown),
+    ] {
+        let map = NeighborhoodMap::load(&install, 1, kind, false)
+            .unwrap_or_else(|e| panic!("load {kind:?}: {e}"));
+        let c800 = map.render(&RenderOptions {
+            viewport: [800, 600],
+            water_frame: Some(0),
+            ..RenderOptions::default()
+        });
+
+        for viewport in [
+            [800u32, 600u32],
+            [1024, 768],
+            [800, 800],
+            [950, 700],
+            [1024, 860],
+            [1440, 768],
+            [1600, 900],
+        ] {
+            let [vw, vh] = viewport;
+            let [ox, oy] = map.map_origin_for(viewport);
+            let opts = RenderOptions {
+                viewport,
+                water_frame: Some(0),
+                ..RenderOptions::default()
+            };
+            let canvas = map.render(&opts);
+            assert_eq!((canvas.width, canvas.height), (vw as usize, vh as usize));
+
+            if let Some(dir) = &dump_dir
+                && (kind == NeighborhoodKind::Unleashed || viewport == [1440, 768])
+            {
+                let path = dir.join(format!("map-{kind_name}-{vw}x{vh}.png"));
+                std::fs::write(&path, sims_render::png::encode(&canvas)).expect("write map png");
+            }
+
+            // Centered 800×600 map interior matches 800×600 pixel-for-pixel.
+            for y in 0..600usize {
+                for x in 0..800usize {
+                    assert_eq!(
+                        canvas.color[(y + oy as usize) * vw as usize + (x + ox as usize)],
+                        c800.color[y * 800 + x],
+                        "{kind:?} {vw}x{vh} interior mismatch at ({x}, {y})"
+                    );
+                }
+            }
+
+            // At native 1024×768, every outer frame pixel outside [112..912, 84..684)
+            // must match `large_frame` bit-for-bit (pinning outer bevel & drop shadow).
+            if viewport == [1024, 768]
+                && let Some(ref frame) = map.large_frame
+            {
+                for y in 0..768usize {
+                    for x in 0..1024usize {
+                        if (112..912).contains(&x) && (84..684).contains(&y) {
+                            continue;
+                        }
+                        let want = sims_render::pack_rgb(sims_render::neighborhood::widen_565(
+                            frame.pixels[y * 1024 + x],
+                        ));
+                        assert_eq!(
+                            canvas.color[y * 1024 + x],
+                            want,
+                            "{kind:?} 1024x768 native outer frame pixel mismatch at ({x}, {y})"
+                        );
+                    }
+                }
+            }
+
+            // On Unleashed at 1440×768, lot 2's overhanging pixel at (1122, 150) lies
+            // 2 px outside the drawn map edge (x = 1120) and must NOT be an invisible
+            // hotspot in the arbitrary surround (matching Canvas::id_at == None).
+            if kind == NeighborhoodKind::Unleashed && viewport == [1440, 768] {
+                assert_eq!(map.hit_test(viewport, [1122, 150]), None);
+                assert_eq!(canvas.id_at(1122, 150), None);
+            }
+
+            // Outside the centered map, non-native sizes > 800×600 must have ZERO pure-black
+            // voids and ZERO magenta cutout leaks (critical for StudioTown/MagicTown).
+            if vw > MAP_WIDTH || vh > MAP_HEIGHT {
+                for y in 0..vh as i32 {
+                    for x in 0..vw as i32 {
+                        if x >= ox && x < ox + 800 && y >= oy && y < oy + 600 {
+                            continue;
+                        }
+                        let px = canvas.color[y as usize * vw as usize + x as usize];
+                        assert_ne!(
+                            px, 0,
+                            "{kind:?} {vw}x{vh}: pure black outer margin pixel at ({x}, {y})"
+                        );
+                        assert_ne!(
+                            px, magenta_packed,
+                            "{kind:?} {vw}x{vh}: magenta cutout pixel leaked at ({x}, {y})"
+                        );
+                    }
+                }
+            }
+
+            // Every lot's screen_rect, hit_test, and Canvas::id_at must remain 100% aligned.
+            for lot in &map.lots {
+                let p800 = opaque_screen_point(&map, lot.id, [800, 600]);
+                let p = [p800[0] + ox, p800[1] + oy];
+                let rect = map.lot_screen_rect(lot, viewport);
+                assert!(
+                    p[0] >= rect[0] && p[0] < rect[2] && p[1] >= rect[1] && p[1] < rect[3],
+                    "{kind:?} {vw}x{vh}: lot {} point {p:?} outside lot_screen_rect {rect:?}",
+                    lot.id
+                );
+                assert_eq!(map.hit_test(viewport, p), Some(lot.id));
+                assert_eq!(canvas.id_at(p[0], p[1]), Some(lot.id));
+            }
+        }
+    }
+}
+
+#[test]
 fn test_png_decoder_rejects_short_and_corrupted_inputs() {
     assert!(decode_png_rgb(&[0; 7], None).is_err());
     assert!(decode_png_rgb(b"\x89PNG\r\n\x1a\n", None).is_err());

@@ -1654,6 +1654,12 @@ impl NeighborhoodShell {
         }
         if changed {
             self.relayout_dialog();
+            if matches!(self.screen, ActiveScreen::Neighborhood) {
+                if let Some(point) = self.pointer {
+                    let _ = self.hover(point);
+                }
+                self.refresh_hovered_lot();
+            }
         }
         changed
     }
