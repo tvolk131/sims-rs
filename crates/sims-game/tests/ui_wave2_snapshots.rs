@@ -373,12 +373,37 @@ fn lot_points(game: &Game) -> Vec<[i32; 2]> {
         .collect()
 }
 
+/// The Goth house `ticks` in, Mortimer selected, with no modal up.
+fn goth_at(root: &Path, ticks: u32) -> Game {
+    let mut game = open_goth(root);
+    game.run(ticks);
+    game.render();
+    game
+}
+
+/// A point on the lot whose pie-menu listing changes the world at `ticks`
+/// (its check trees commit), found on a throwaway copy of the same lot.
+fn mutating_point(root: &Path, ticks: u32) -> [i32; 2] {
+    let mut probe = goth_at(root, ticks);
+    for point in lot_points(&probe) {
+        let before = probe.lot().world().hash_hex();
+        probe.hover(point);
+        if probe.lot().world().hash_hex() != before {
+            return point;
+        }
+    }
+    panic!("no listing on the Goth lot changes the world at tick {ticks}");
+}
+
+const TICKS: u32 = 93;
+
 #[test]
 fn a_panel_preview_never_changes_the_world() {
     let Some(root) = env_dir("SIMS_INSTALL") else {
         return;
     };
-    let mut game = open_goth(&root);
+    let target = mutating_point(&root, TICKS);
+    let mut game = goth_at(&root, TICKS);
     let world = game.lot().world().clone();
     let sim = world.selected().expect("Mortimer selected");
     let neighbor = world.objects[&sim]
@@ -386,8 +411,6 @@ fn a_panel_preview_never_changes_the_world() {
         .as_ref()
         .and_then(|p| p.data.get(31).copied())
         .expect("Mortimer's neighbor id");
-    let points = lot_points(&game);
-    assert!(!points.is_empty(), "the lot has things to point at");
     let before = game.lot().world().hash_hex();
 
     game.preview_special_panel(
@@ -398,9 +421,9 @@ fn a_panel_preview_never_changes_the_world() {
     );
     game.render();
     assert_eq!(game.lot().world().hash_hex(), before, "opening a preview");
-    // Pointing at Sims and objects behind the modal lists no pie menu: the
-    // listing runs check trees, which change the world.
-    for &point in &points {
+    // Pointing at the lot behind the modal lists nothing, ending on the
+    // target so the pointer is left over it.
+    for point in lot_points(&game).into_iter().chain([target]) {
         game.hover(point);
         game.render();
         assert_eq!(game.listed(), None, "nothing is listed behind a modal");
@@ -410,23 +433,57 @@ fn a_panel_preview_never_changes_the_world() {
         before,
         "hovering behind a preview"
     );
+    // Dismissing leaves no stale pointer for the next frame to list.
     game.dialog_confirm_key(DialogKey::Escape);
     game.render();
+    game.render();
     assert!(!game.has_dialog(), "Escape dismisses the preview");
+    assert_eq!(
+        game.listed(),
+        None,
+        "nothing is listed until the pointer moves"
+    );
     assert_eq!(
         game.lot().world().hash_hex(),
         before,
         "dismissing a preview"
     );
 
-    // With the modal gone, the same pointing does list a menu.
-    let listed = points.iter().any(|&point| {
-        game.hover(point);
-        game.listed().is_some()
-    });
+    // Fresh pointer input over the target does list, and changes the world.
+    game.hover(target);
     assert!(
-        listed,
-        "with no modal, pointing at the lot lists a pie menu"
+        game.listed().is_some(),
+        "with no modal, pointing lists a pie menu"
+    );
+    assert_ne!(
+        game.lot().world().hash_hex(),
+        before,
+        "the target's listing changes the world"
+    );
+}
+
+#[test]
+fn the_community_shop_blocks_listing_behind_it() {
+    let Some(root) = env_dir("SIMS_INSTALL") else {
+        return;
+    };
+    let target = mutating_point(&root, TICKS);
+    let mut game = goth_at(&root, TICKS);
+    let before = game.lot().world().hash_hex();
+    assert!(
+        game.open_shop(sims_ui::shop::ShopKind::PetAdoption),
+        "the shop opens for a live household"
+    );
+    game.render();
+    for point in lot_points(&game).into_iter().chain([target]) {
+        game.hover(point);
+        game.render();
+        assert_eq!(game.listed(), None, "nothing is listed behind the shop");
+    }
+    assert_eq!(
+        game.lot().world().hash_hex(),
+        before,
+        "hovering behind the shop"
     );
 }
 

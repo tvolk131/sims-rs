@@ -195,6 +195,39 @@ P1=0, P2=2, P3=2`. All four are fixed:
   matches `scrapback.bmp` pixel for pixel (95% within 8 levels), so the
   9-slice fallback fails it.
 
+A second re-check of `a7af8d6d` found `P0=0, P1=0, P2=2, P3=2`. It also
+confirmed the album check: the fallback matches at most 926 of 4,200
+pixels. All four are fixed:
+
+- **P2: dismissing a preview could still change the world.** The pointer
+  left over the preview made the next frame list the object under it.
+  Closing a preview now clears the lot pointer, so listing resumes only on
+  fresh pointer input. The test finds a point whose listing changes the
+  world at tick 93, using a throwaway copy of the lot. It leaves the
+  pointer there behind the preview, dismisses it, and checks that the
+  hash is unchanged. It then checks that fresh pointer input on that same
+  point does change the world.
+- **P2: the community shop allowed lot checks behind it.** `follow` now
+  also blocks while the shop is open. A separate test covers this with the
+  same target point.
+- **P3: a tick-zero request could be mistaken for the preview.**
+  `ActiveSpecialPanel::shows` never matches a preview, so a real request
+  replaces it. A unit test covers this.
+  - The full VM round trip is not tested. No Goth-lot interaction raises a
+    real special panel within a few thousand ticks, so there was no cheap
+    fixture.
+- **P3: typing reached the field behind the phone book.** The desktop
+  handler gives text-entry keys to `has_dialog_entry` and the
+  `dialog_*`/`type_dialog_char` methods. Those now all defer to whichever
+  Game-drawn modal is in front.
+  - The test puts a phone book preview over the edit-mode Save Card's
+    text field. It checks that Enter, Escape, typing, Backspace, Delete,
+    caret keys and Tab all stay with the phone book. Once the book
+    closes, the field edits and Enter submits the typed name.
+  - A scan of every interaction Mortimer can pick on the Goth lot found
+    no kind 3 prompt. So the test uses the Save Card's
+    `cTSWinTextEdit2`, which takes the same desktop path.
+
 ## Unverified assumptions
 
 - Wardrobe modes 1–5 categories, and the item order for kind 14.

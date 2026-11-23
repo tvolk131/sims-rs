@@ -73,6 +73,7 @@ use sims_ui::shop::{
     Wallet, WardrobeCategory,
 };
 use sims_vm::Program;
+use sims_vm::ShownSpecialPanel;
 use sims_vm::boot::save::Saved;
 use sims_vm::boot::{
     AskingSpecialPanel, Frames, Lot, PreloadedBoot, StepError, default_character_name,
@@ -250,6 +251,19 @@ struct ActiveSpecialPanel {
     /// (nothing answers the VM, and [`Game::sync_special_panel`] keeps it
     /// open), `false` for a VM request. Set on every open or replacement.
     preview: bool,
+}
+
+impl ActiveSpecialPanel {
+    /// Whether this panel already presents the VM's `shown` request. A
+    /// preview never does, even one with the same request at tick 0: the
+    /// real request must replace it, or a pick would close the preview and
+    /// leave the VM waiting.
+    fn shows(&self, shown: &ShownSpecialPanel, coop_dialog_id: Option<NetDialogId>) -> bool {
+        !self.preview
+            && self.tick == shown.tick
+            && self.request == shown.request
+            && self.coop_dialog_id == coop_dialog_id
+    }
 }
 
 /// Conservative invariant key for steady-state Tier-2 lot frames where all
@@ -2986,14 +3000,14 @@ impl Game {
     /// Switches keyboard focus between Lot Name and Lot Description on an open
     /// edit-mode Save Card (`Tab`).
     pub fn dialog_switch_field(&mut self) -> bool {
-        self.hud.switch_dialog_field()
+        !self.ui_modal_in_front() && self.hud.switch_dialog_field()
     }
 
     /// Whether pressing Return/Enter in the active dialog inserts a newline
     /// into a multiline field (Lot Description on the edit-mode Save Card,
     /// `0x50db98..0x50dba0`, `0x5f28b6..0x5f28f9`) instead of submitting.
     pub fn dialog_enter_is_newline(&self) -> bool {
-        self.hud.is_multiline_entry()
+        !self.ui_modal_in_front() && self.hud.is_multiline_entry()
     }
 
     /// Handles a native modal confirmation key (`Enter`, `Escape`, or localized
@@ -3124,7 +3138,18 @@ impl Game {
 
     /// Whether the active modal dialog has an editable `cTSWinTextEdit2` field.
     pub fn has_dialog_entry(&self) -> bool {
-        self.hud.active_dialog_entry().is_some()
+        !self.ui_modal_in_front() && self.hud.active_dialog_entry().is_some()
+    }
+
+    /// Whether a Game-drawn modal (phone book, book, shop picker, special
+    /// panel or destination picker) sits in front of any HUD or VM dialog.
+    /// Keys then go to it, never to a text field behind it.
+    fn ui_modal_in_front(&self) -> bool {
+        self.phonebook_dialog.is_open()
+            || self.book_dialog.is_open()
+            || self.shop_dialog.is_open()
+            || self.active_special_panel.is_some()
+            || self.destination_picker.is_some()
     }
 
     /// The text currently in the active modal dialog's `cTSWinTextEdit2` field,
@@ -3176,50 +3201,50 @@ impl Game {
 
     /// Types `ch` into the active modal dialog's `cTSWinTextEdit2` input field.
     pub fn type_dialog_char(&mut self, ch: char) -> bool {
-        self.hud.type_dialog_char(ch)
+        !self.ui_modal_in_front() && self.hud.type_dialog_char(ch)
     }
 
     /// Deletes the character before the caret in the active dialog's input field.
     pub fn dialog_backspace(&mut self) -> bool {
-        self.hud.dialog_backspace()
+        !self.ui_modal_in_front() && self.hud.dialog_backspace()
     }
 
     /// Deletes the character at the caret in the active dialog's input field.
     pub fn dialog_delete(&mut self) -> bool {
-        self.hud.dialog_delete()
+        !self.ui_modal_in_front() && self.hud.dialog_delete()
     }
 
     /// Moves the active dialog's text-entry caret one character left.
     pub fn dialog_move_left(&mut self) -> bool {
-        self.hud.dialog_move_left()
+        !self.ui_modal_in_front() && self.hud.dialog_move_left()
     }
 
     /// Moves the active dialog's text-entry caret one character right.
     pub fn dialog_move_right(&mut self) -> bool {
-        self.hud.dialog_move_right()
+        !self.ui_modal_in_front() && self.hud.dialog_move_right()
     }
 
     /// Moves the active dialog's text-entry caret one visual row up (multiline
     /// fields, `0x5f29f2..0x5f2a90`).
     pub fn dialog_move_up(&mut self) -> bool {
-        self.hud.dialog_move_up()
+        !self.ui_modal_in_front() && self.hud.dialog_move_up()
     }
 
     /// Moves the active dialog's text-entry caret one visual row down (multiline
     /// fields, `0x5f2a90..0x5f2b40`).
     pub fn dialog_move_down(&mut self) -> bool {
-        self.hud.dialog_move_down()
+        !self.ui_modal_in_front() && self.hud.dialog_move_down()
     }
 
     /// Moves the active dialog's text-entry caret to the start of the current
     /// line (or field, `0x5f2c13`).
     pub fn dialog_home(&mut self) -> bool {
-        self.hud.dialog_home()
+        !self.ui_modal_in_front() && self.hud.dialog_home()
     }
 
     /// Moves the active dialog's text-entry caret to the end of the field.
     pub fn dialog_end(&mut self) -> bool {
-        self.hud.dialog_end()
+        !self.ui_modal_in_front() && self.hud.dialog_end()
     }
 
     /// Submits the active modal dialog via Enter (activates button 0 if enabled).
@@ -5305,7 +5330,7 @@ impl Game {
     /// pointer, and listing runs check trees that change the world), or
     /// once the lot has stopped. True if a listing may have changed the lot.
     fn follow(&mut self) -> bool {
-        if self.hud.controls.mode != Mode::Live || self.has_dialog() {
+        if self.hud.controls.mode != Mode::Live || self.has_dialog() || self.shop_dialog.is_open() {
             self.reached = None;
             self.listed = None;
             return false;
@@ -10043,7 +10068,15 @@ impl Game {
     /// an answer to the VM (used after answering, on co-op peer dismissal, or on
     /// restore).
     fn close_special_panel_ui(&mut self) {
-        if self.active_special_panel.take().is_some() {
+        if let Some(panel) = self.active_special_panel.take() {
+            if panel.preview {
+                // The pointer last moved over the preview, not the lot:
+                // listing resumes only on fresh pointer input, so dismissing
+                // never runs a check tree for whatever was under it.
+                self.pointer = None;
+                self.reached = None;
+                self.listed = None;
+            }
             self.shop_dialog.close();
             self.shop_snapshot = None;
             self.shop_preview_yaw_deg = 0;
@@ -10083,11 +10116,9 @@ impl Game {
             {
                 return;
             }
-            self.active_special_panel.as_ref().is_some_and(|a| {
-                a.tick == asking.shown.tick
-                    && a.request == asking.shown.request
-                    && a.coop_dialog_id == coop_dialog_id
-            })
+            self.active_special_panel
+                .as_ref()
+                .is_some_and(|a| a.shows(&asking.shown, coop_dialog_id))
         };
         if unchanged {
             return;
@@ -13709,6 +13740,29 @@ fn pet_breed_label(row: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_preview_never_stands_in_for_the_vm_request() {
+        let request = SpecialPanelRequest::CallNeighbor { caller_neighbor: 7 };
+        let shown = ShownSpecialPanel {
+            tick: 0,
+            request: request.clone(),
+        };
+        let mut panel = ActiveSpecialPanel {
+            tick: 0,
+            request,
+            coop_dialog_id: None,
+            responses: BTreeMap::new(),
+            preview_targets: BTreeMap::new(),
+            preview: true,
+        };
+        assert!(
+            !panel.shows(&shown, None),
+            "a tick-0 preview of the same request is replaced by the real one"
+        );
+        panel.preview = false;
+        assert!(panel.shows(&shown, None), "the real panel stays as it is");
+    }
     use sims_vm::{Fault, Location, Trap};
 
     fn fault(object: u16) -> Fault {
