@@ -6303,10 +6303,16 @@ impl Game {
 
     /// Toggles the bottom control panel strip collapsed/expanded (`F10` or
     /// pressing `F1` while already in Live Mode, `0x4cfc75`). Closes the Camera
-    /// strip if open and re-centers the active house viewport.
+    /// strip if open, clears any open help balloons (`Command::TogglePanel`),
+    /// and re-centers the active house viewport. Defers while a Buy or Build
+    /// pointer drag is in progress so expanding the strip underneath a held
+    /// object cannot turn a move release into an unintended sale.
     pub fn toggle_panel(&mut self) -> bool {
+        if self.buy_dragging.is_some() || self.buy_commit_on_release || self.build_drag.is_some() {
+            return false;
+        }
         self.hud.close_camera_strip();
-        self.hud.controls.expanded = !self.hud.controls.expanded;
+        self.hud.controls.apply(&Command::TogglePanel);
         if self.hud.controls.mode == Mode::Live {
             self.live_panel_expanded = self.hud.controls.expanded;
         }
@@ -6322,7 +6328,11 @@ impl Game {
     }
 
     /// Toggles the Camera / Photo Mode strip (`F4`, `0x4d1712` / `0x53a543`).
+    /// Defers while a Buy or Build pointer drag is in progress.
     pub fn toggle_camera_strip(&mut self) -> bool {
+        if self.buy_dragging.is_some() || self.buy_commit_on_release || self.build_drag.is_some() {
+            return false;
+        }
         let was_expanded = self.hud.controls.expanded;
         self.hud.toggle_camera_strip(self.view.size);
         if self.hud.controls.expanded != was_expanded {
@@ -6393,9 +6403,13 @@ impl Game {
 
     /// Cycles selection to the next Sim in the household roster, wrapping
     /// around (`Space` in Live Mode, `cWinLive::OnKeyDown` at `0x51ba2d..0x51ba7c`).
-    /// Closes any open pie menu and plays `UI_click`. If only one Sim is in the
-    /// household, centres the camera on that Sim.
+    /// Only active in Live Mode so Buy/Build/Options editing never switches
+    /// household selection. Closes any open pie menu and plays `UI_click`. If
+    /// only one Sim is in the household, centres the camera on that Sim.
     pub fn select_next_sim(&mut self) -> bool {
+        if self.hud.controls.mode != Mode::Live {
+            return false;
+        }
         let residents = self.hud.resident_object_ids(self.lot.world());
         if residents.is_empty() {
             return false;

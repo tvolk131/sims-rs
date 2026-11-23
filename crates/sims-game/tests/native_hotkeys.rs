@@ -113,21 +113,75 @@ fn native_hotkeys_control_pause_speed_modes_sim_cycling_walls_and_floors() {
     game.hotkey_mode(Mode::Buy); // F2 -> Buy
     assert_eq!(game.mode(), Mode::Buy);
     assert!(game.panel_expanded());
+    // Space (select_next_sim) must NOT switch Sims outside Live Mode.
+    let sim_before_buy_space = game.local_selected_sim();
+    assert!(!game.select_next_sim());
+    assert_eq!(game.local_selected_sim(), sim_before_buy_space);
+
     let sort_before = game.buy_state().sort;
     game.hotkey_mode(Mode::Buy); // F2 again -> toggles ByFunction <-> ByRoom
     assert_ne!(game.buy_state().sort, sort_before);
 
     game.hotkey_mode(Mode::Build); // F3 -> Build
     assert_eq!(game.mode(), Mode::Build);
+    assert!(!game.select_next_sim());
 
     game.toggle_camera_strip(); // F4 -> Camera strip
     assert!(game.camera_strip_open());
     game.hotkey_mode(Mode::Options); // F5 -> Options (closes Camera strip)
     assert!(!game.camera_strip_open());
     assert_eq!(game.mode(), Mode::Options);
+    assert!(!game.select_next_sim());
 
+    // Rejected Camera open on a sub-minimum canvas must not expand a collapsed HUD.
     game.hotkey_mode(Mode::Live); // F1 -> back to Live
     assert_eq!(game.mode(), Mode::Live);
+    if game.panel_expanded() {
+        assert!(game.toggle_panel());
+    }
+    assert!(!game.panel_expanded());
+    game.resize([250, 200]);
+    let _ = game.toggle_camera_strip();
+    assert!(!game.camera_strip_open());
+    assert!(
+        !game.panel_expanded(),
+        "rejected Camera open on narrow canvas must not leave HUD expanded"
+    );
+    game.resize([800, 600]);
+
+    // P1 regression: an active Buy drag must defer F10/F4 panel toggles so
+    // releasing the pointer at the bottom edge cannot trigger an unintended sale.
+    game.hotkey_mode(Mode::Buy);
+    assert_eq!(game.mode(), Mode::Buy);
+    assert!(game.panel_expanded());
+    let _ = game.render();
+    // Pick up an existing object in the Goth house via Buy Mode Hand Tool drag.
+    let mut picked_up = false;
+    'scan: for y in (160..460).step_by(12) {
+        for x in (200..640).step_by(12) {
+            let _ = game.press([x, y]);
+            if game.buy_cursor().is_some() {
+                picked_up = true;
+                break 'scan;
+            }
+            let _ = game.release([x, y]);
+        }
+    }
+    assert!(
+        picked_up,
+        "expected to pick up an existing Goth house object in Buy Mode"
+    );
+    let before_toggle = game.panel_expanded();
+    assert!(
+        !game.toggle_panel(),
+        "F10 toggle_panel must defer while a Buy drag is in progress"
+    );
+    assert_eq!(game.panel_expanded(), before_toggle);
+    assert!(
+        !game.toggle_camera_strip(),
+        "F4 toggle_camera_strip must defer while a Buy drag is in progress"
+    );
+    assert!(game.cancel_buy());
 }
 
 #[test]

@@ -933,12 +933,15 @@ impl Hud {
     pub fn toggle_camera_strip(&mut self, size: [i32; 2]) -> bool {
         self.camera_strip_open = !self.camera_strip_open;
         if self.camera_strip_open {
-            // Native `0x4d1734..0x4d1746` / `0x53a543`: opening Camera Mode
-            // expands the control panel strip so `BackPatch.bmp` (`2036`) fills
-            // the curved cluster wedge next to the Camera/Options buttons.
-            self.controls.expanded = true;
-            self.dismiss_help();
             self.layout_camera_strip(size);
+            if self.camera_strip_open {
+                // Native `0x4d1734..0x4d1746` / `0x53a543`: opening Camera Mode
+                // expands the control panel strip so `BackPatch.bmp` (`2036`)
+                // fills the curved cluster wedge next to the Camera/Options
+                // buttons. Only expand once layout accepts the viewport size.
+                self.controls.expanded = true;
+                self.dismiss_help();
+            }
         } else {
             self.clear_camera_strip_layout();
         }

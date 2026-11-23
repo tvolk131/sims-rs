@@ -2219,16 +2219,15 @@ fn relationships(items: &mut Vec<Item>, panel: Rect, snapshot: &Snapshot, contro
             command: Some(Command::RelationsPage((page + 1) as u32)),
         });
     }
-    // 0x4ebdfa: left to right, a new row where the next would pass the
-    // right edge.
-    let (mut x, mut row) = (left, 0);
-    for relation in shown.iter().skip(page * per_page).take(per_page) {
-        let rect = panel.offset(x, RELATIONS_TOP + h * row).with_size(w, h);
-        x += w;
-        if x + w > right {
-            row += 1;
-            x = left;
-        }
+    // 0x4ebdfa: single row of `per_page` entries from `left` across the panel.
+    for (idx, relation) in shown
+        .iter()
+        .skip(page * per_page)
+        .take(per_page)
+        .enumerate()
+    {
+        let x = left.saturating_add(w.saturating_mul(i32::try_from(idx).unwrap_or(0)));
+        let rect = panel.offset(x, RELATIONS_TOP).with_size(w, h);
         let lit = controls
             .pointer
             .is_some_and(|[px, py]| rect.contains(px, py));

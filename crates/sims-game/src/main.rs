@@ -1356,6 +1356,13 @@ impl App {
     }
 
     fn photo(&mut self) {
+        // Match the mouse Camera Snapshot button (`hud.rs:998`): close the
+        // Camera strip before rendering so Large crops never capture the
+        // Camera controls themselves.
+        let closed_camera = self
+            .session
+            .game_mut()
+            .is_some_and(Game::close_camera_strip);
         self.session.render();
         let path = PathBuf::from(format!("sims-game-{}.png", self.photos));
         self.photos += 1;
@@ -1369,10 +1376,14 @@ impl App {
             Ok(()) => eprintln!("saved {}", path.display()),
             Err(e) => eprintln!("could not save {}: {e}", path.display()),
         }
+        if closed_camera {
+            self.changed(true, true);
+        }
     }
 
-    /// Saves the lot (F5) or goes back to its save (F9). Returns `true` when
-    /// the operation succeeded (`0x4f26cf`, checked by `0x4f29cc` before quit).
+    /// Saves the lot (`Ctrl/Cmd+S`) or goes back to its save (`F9`). Returns
+    /// `true` when the operation succeeded (`0x4f26cf`, checked by `0x4f29cc`
+    /// before quit).
     fn save(&mut self, restore: bool) -> bool {
         let ok = match &mut self.session {
             Session::Starting(_) => false,
@@ -2365,16 +2376,20 @@ impl ApplicationHandler for App {
                     || matches!(&self.session, Session::Shell(shell) if shell.credits_open());
                 let coop_lobby_open = self.session.coop_lobby_open();
                 let cheat_console_open = self.session.game().is_some_and(Game::cheat_console_open);
-                if is_coop_toggle
-                    && !save_manager_open
-                    && !album_open
-                    && !travel_dialog_open
-                    && !shop_open
-                    && !book_open
-                    && !cheat_console_open
-                    && self.session.screen_kind() != ScreenKind::CreateFamily
-                    && (coop_lobby_open || !self.session.has_dialog())
-                {
+                let has_dialog = self.session.has_dialog();
+                let create_family = self.session.screen_kind() == ScreenKind::CreateFamily;
+                let kbd_focus = KeyboardFocus {
+                    save_manager_open,
+                    album_open,
+                    travel_dialog_open,
+                    shop_open,
+                    book_open,
+                    coop_lobby_open,
+                    cheat_console_open,
+                    has_dialog,
+                    create_family,
+                };
+                if is_coop_toggle && coop_toggle_allowed(kbd_focus) {
                     let toggled = match &mut self.session {
                         Session::Starting(_) => false,
                         Session::Standalone { game, .. } => game.toggle_coop_lobby(),
@@ -2464,12 +2479,7 @@ impl ApplicationHandler for App {
                     return;
                 }
                 if is_cheat_toggle
-                    && !save_manager_open
-                    && !album_open
-                    && !travel_dialog_open
-                    && !shop_open
-                    && !book_open
-                    && !self.session.has_dialog()
+                    && cheat_toggle_allowed(kbd_focus)
                     && let Some(game) = self.session.game_mut()
                 {
                     game.toggle_cheat_console();
@@ -2890,13 +2900,7 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
-                } else if !lot_hotkeys_blocked(LotInputFocus {
-                    cheat_console_open,
-                    has_dialog: self.session.has_dialog(),
-                    album_open,
-                    coop_lobby_open,
-                    create_family: self.session.screen_kind() == ScreenKind::CreateFamily,
-                }) {
+                } else if !lot_hotkeys_blocked(kbd_focus) {
                     self.key(&event.logical_key, event.physical_key, event.repeat);
                 }
             }
@@ -3489,25 +3493,58 @@ fn escape_exits(closed_menu: bool, cancelled_buy: bool, has_buy_cursor: bool) ->
     !closed_menu && !cancelled_buy && !has_buy_cursor
 }
 
-/// Active UI focus flags that suppress bare Lot-mode keyboard hotkeys so
-/// typing in any text-input surface never triggers pause/speed/mode/camera
-/// commands.
+/// Active modal / text-input focus snapshot captured at the top of
+/// `WindowEvent::KeyboardInput` and shared across early global toggles
+/// (`F6`/`Ctrl+M`, `Ctrl+Shift+C`) and Lot-mode hotkey dispatch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct LotInputFocus {
+struct KeyboardFocus {
+    save_manager_open: bool,
+    album_open: bool,
+    travel_dialog_open: bool,
+    shop_open: bool,
+    book_open: bool,
+    coop_lobby_open: bool,
     cheat_console_open: bool,
     has_dialog: bool,
-    album_open: bool,
-    coop_lobby_open: bool,
     create_family: bool,
+}
+
+/// Whether `F6` / `Ctrl+M` may toggle the Co-op Lobby without stealing input
+/// from another modal or text-input surface.
+fn coop_toggle_allowed(focus: KeyboardFocus) -> bool {
+    !focus.save_manager_open
+        && !focus.album_open
+        && !focus.travel_dialog_open
+        && !focus.shop_open
+        && !focus.book_open
+        && !focus.cheat_console_open
+        && !focus.create_family
+        && (focus.coop_lobby_open || !focus.has_dialog)
+}
+
+/// Whether `Ctrl+Shift+C` may toggle the Cheat Console.
+fn cheat_toggle_allowed(focus: KeyboardFocus) -> bool {
+    !focus.save_manager_open
+        && !focus.album_open
+        && !focus.travel_dialog_open
+        && !focus.shop_open
+        && !focus.book_open
+        && !focus.coop_lobby_open
+        && !focus.create_family
+        && !focus.has_dialog
 }
 
 /// Returns `true` when any text-input or modal surface has keyboard focus and
 /// Lot-mode hotkeys must be suppressed.
-fn lot_hotkeys_blocked(focus: LotInputFocus) -> bool {
-    focus.cheat_console_open
-        || focus.has_dialog
+fn lot_hotkeys_blocked(focus: KeyboardFocus) -> bool {
+    focus.save_manager_open
         || focus.album_open
+        || focus.travel_dialog_open
+        || focus.shop_open
+        || focus.book_open
         || focus.coop_lobby_open
+        || focus.cheat_console_open
+        || focus.has_dialog
         || focus.create_family
 }
 
@@ -3609,10 +3646,8 @@ fn classify_lot_hotkey(
             " " => (!repeat).then_some(LotHotkey::NextSim),
             "+" | "=" => Some(LotHotkey::Move(Move::ZoomIn)),
             "-" | "_" => Some(LotHotkey::Move(Move::ZoomOut)),
-            "[" => Some(LotHotkey::Move(Move::Rotate(false))),
-            "]" => Some(LotHotkey::Move(Move::Rotate(true))),
-            "," | "<" => Some(LotHotkey::RotateHeldOrCamera(false)),
-            "." | ">" => Some(LotHotkey::RotateHeldOrCamera(true)),
+            "," | "<" | "[" => Some(LotHotkey::RotateHeldOrCamera(false)),
+            "." | ">" | "]" => Some(LotHotkey::RotateHeldOrCamera(true)),
             "c" | "C" => (!repeat).then_some(LotHotkey::Photo),
             "z" | "Z" => Some(LotHotkey::CatalogPage(-1)),
             "x" | "X" => Some(LotHotkey::CatalogPage(1)),
@@ -4540,6 +4575,14 @@ mod tests {
             Some(LotHotkey::RotateHeldOrCamera(true))
         );
         assert_eq!(
+            classify_lot_hotkey(&ch("["), unid, false, false, false),
+            Some(LotHotkey::RotateHeldOrCamera(false))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("]"), unid, false, false, false),
+            Some(LotHotkey::RotateHeldOrCamera(true))
+        );
+        assert_eq!(
             classify_lot_hotkey(&ch("c"), unid, false, false, false),
             Some(LotHotkey::Photo)
         );
@@ -4584,26 +4627,48 @@ mod tests {
 
     #[test]
     fn text_input_guard_suppresses_hotkeys_in_all_five_text_surfaces() {
-        assert!(!lot_hotkeys_blocked(LotInputFocus::default()));
-        assert!(lot_hotkeys_blocked(LotInputFocus {
-            cheat_console_open: true,
-            ..LotInputFocus::default()
-        }));
-        assert!(lot_hotkeys_blocked(LotInputFocus {
-            has_dialog: true,
-            ..LotInputFocus::default()
-        }));
-        assert!(lot_hotkeys_blocked(LotInputFocus {
-            album_open: true,
-            ..LotInputFocus::default()
-        }));
-        assert!(lot_hotkeys_blocked(LotInputFocus {
+        let none = KeyboardFocus::default();
+        assert!(!lot_hotkeys_blocked(none));
+        assert!(coop_toggle_allowed(none));
+        assert!(cheat_toggle_allowed(none));
+
+        for focus in [
+            KeyboardFocus {
+                cheat_console_open: true,
+                ..none
+            },
+            KeyboardFocus {
+                has_dialog: true,
+                ..none
+            },
+            KeyboardFocus {
+                album_open: true,
+                ..none
+            },
+            KeyboardFocus {
+                create_family: true,
+                ..none
+            },
+        ] {
+            assert!(lot_hotkeys_blocked(focus));
+            assert!(
+                !coop_toggle_allowed(focus),
+                "F6/Ctrl+M co-op toggle must stay blocked under {focus:?}"
+            );
+            assert!(
+                !cheat_toggle_allowed(focus) || focus.cheat_console_open,
+                "Ctrl+Shift+C cheat toggle must stay blocked under non-console modal {focus:?}"
+            );
+        }
+
+        // Co-op lobby blocks bare lot hotkeys and cheat toggle while still
+        // allowing F6/Ctrl+M to close the lobby itself.
+        let coop = KeyboardFocus {
             coop_lobby_open: true,
-            ..LotInputFocus::default()
-        }));
-        assert!(lot_hotkeys_blocked(LotInputFocus {
-            create_family: true,
-            ..LotInputFocus::default()
-        }));
+            ..none
+        };
+        assert!(lot_hotkeys_blocked(coop));
+        assert!(coop_toggle_allowed(coop));
+        assert!(!cheat_toggle_allowed(coop));
     }
 }

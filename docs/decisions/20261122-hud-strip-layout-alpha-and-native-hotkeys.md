@@ -59,8 +59,8 @@ Disassembled directly from `Sims.exe` 1.91 (`0x4d0ef0` `OnChar`, `0x4d12b1` `OnK
 | `F3` | `0x4d1750` | Build Mode |
 | `F4` | `0x4d1712` | Toggle Camera / Photo Mode strip (expands strip if collapsed) |
 | `F5` | `0x4d16e2` | Options Mode |
-| `F10` | Player-expected panel toggle (in Lot mode; Neighborhood keeps Photo Album) | Toggle control panel collapse/expand (`Sims.exe` `0x4d166b` took a `.jpg` snapshot, while `F1` collapsed Live mode; binding `F10` to `toggle_panel` in Lot mode provides the standard quick hide/show control panel hotkey) |
-| `Space` | `0x51ba2d` (`cWinLive::OnKeyDown`) | Select next Sim in household (wraps around, closes pie menu) |
+| `F10` | Intentional departure (user-requested quick panel toggle in Lot mode; Neighborhood keeps Photo Album) | Toggle control panel collapse/expand (defers during active Buy/Build drags). `Sims.exe` `0x4d166b` mapped `F10` to JPEG snapshot capture while `F1` collapsed Live mode; here `C` handles snapshot capture (closing Camera controls before capture) and `F10` provides quick panel hide/show in Lot mode. |
+| `Space` | `0x51ba2d` (`cWinLive::OnKeyDown`) | Select next Sim in household in Live Mode only (wraps around, closes pie menu) |
 | `Enter` | `0x4d1330` → `0x4d14d2` | Center camera on currently selected Sim |
 | `Tab` | `0x4d1324` → `0x4d150c` | Toggle floor 1 ↔ 2 |
 | `PageUp` / `PageDown` | `0x4d1341` / `0x4d134a` | Floor up / Floor down |

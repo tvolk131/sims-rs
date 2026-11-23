@@ -682,3 +682,65 @@ fn report_card_superstar_and_needs_pet_balloons_from_install() {
         hud::Kind::Balloon(b) if b.title.starts_with("Studio Fly")
     )));
 }
+
+#[test]
+fn expanded_hud_at_800x600_and_1024x768_preserves_native_pixels_outside_backpatch() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to verify 800x600 and 1024x768 HUD preservation");
+        return;
+    };
+    let opened = common::open(&root, common::GOTH_HOUSE);
+    let open = Controls {
+        expanded: true,
+        ..Controls::default()
+    };
+    for [w, h] in [[800, 600], [1024, 768]] {
+        let items = hud::layout([w, h], &opened.snapshot, &open);
+        // Gadget stays at native x = 413 on both 800x600 and 1024x768.
+        let gauge = items
+            .iter()
+            .find(|i| matches!(i.kind, hud::Kind::Image(hud::id::GAUGE)))
+            .expect("gauge present");
+        assert_eq!(gauge.rect, Rect::new(413, h - hud::STRIP, 108, hud::STRIP));
+
+        let mut with_patch = Frame::new(w as u32, h as u32, [0, 0, 0]);
+        hud::draw(&mut with_patch, &opened.art, &opened.faces, &items, &open);
+
+        let without_patch_items: Vec<_> = items
+            .iter()
+            .filter(|i| !matches!(i.kind, hud::Kind::Image(hud::id::BACK_PATCH)))
+            .cloned()
+            .collect();
+        let mut without_patch = Frame::new(w as u32, h as u32, [0, 0, 0]);
+        hud::draw(
+            &mut without_patch,
+            &opened.art,
+            &opened.faces,
+            &without_patch_items,
+            &open,
+        );
+
+        let patch_rect = Rect::new(168, h - hud::STRIP, 52, hud::STRIP);
+        let mut patch_diff = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                let p_with = with_patch.pixel(x, y);
+                let p_without = without_patch.pixel(x, y);
+                if patch_rect.contains(x, y) {
+                    if p_with != p_without {
+                        patch_diff += 1;
+                    }
+                } else {
+                    assert_eq!(
+                        p_with, p_without,
+                        "unexpected pixel change outside BackPatch at ({x}, {y}) on {w}x{h}"
+                    );
+                }
+            }
+        }
+        assert!(
+            patch_diff > 0,
+            "BackPatch must actually fill transparent cluster wedge at {w}x{h}"
+        );
+    }
+}
