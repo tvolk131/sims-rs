@@ -978,6 +978,7 @@ impl NeighborhoodChrome {
         }
 
         // 4. All interactive bar buttons + Credits billboard.
+        let compact_width = layout.frame_size[0] < NATIVE_WIDTH;
         for placement in &layout.buttons {
             let btn = placement.button;
             let enabled = btn.is_enabled(state);
@@ -990,7 +991,14 @@ impl NeighborhoodChrome {
             } else {
                 0
             };
-            draw_four_cell_button(frame, art, btn.art_id(), cell, placement.draw_rect);
+            draw_four_cell_button(
+                frame,
+                art,
+                btn.art_id(),
+                cell,
+                placement.draw_rect,
+                compact_width,
+            );
         }
 
         // 5. Lot hover / House Info popup card.
@@ -1060,7 +1068,14 @@ fn button_cell_size(art: &Art, button: BarButton) -> [i32; 2] {
     button.native_size()
 }
 
-fn draw_four_cell_button(frame: &mut Frame, art: &Art, id: i32, cell: u32, dest: Rect) {
+fn draw_four_cell_button(
+    frame: &mut Frame,
+    art: &Art,
+    id: i32,
+    cell: u32,
+    dest: Rect,
+    preserve_aspect: bool,
+) {
     if dest.width <= 0 || dest.height <= 0 {
         return;
     }
@@ -1073,8 +1088,33 @@ fn draw_four_cell_button(frame: &mut Frame, art: &Art, id: i32, cell: u32, dest:
         let sx = cw.saturating_mul(cell.min(3) as i32);
         if dest.width == cw && dest.height == ch {
             frame.draw(img, Rect::new(sx, 0, cw, ch), [dest.x, dest.y]);
+        } else if preserve_aspect {
+            // Preserve aspect ratio within `dest` for compact viewports < 800 px
+            // so circular neighborhood buttons stay round instead of squishing
+            // into vertical slivers.
+            let (fit_w, fit_h) = if i64::from(dest.width) * i64::from(ch)
+                <= i64::from(dest.height) * i64::from(cw)
+            {
+                let fw = dest.width;
+                let fh = ((i64::from(dest.width) * i64::from(ch) + i64::from(cw) / 2)
+                    / i64::from(cw))
+                .clamp(1, i64::from(dest.height)) as i32;
+                (fw, fh)
+            } else {
+                let fh = dest.height;
+                let fw = ((i64::from(dest.height) * i64::from(cw) + i64::from(ch) / 2)
+                    / i64::from(ch))
+                .clamp(1, i64::from(dest.width)) as i32;
+                (fw, fh)
+            };
+            let fit_dest = Rect::new(
+                dest.x + (dest.width - fit_w) / 2,
+                dest.y + (dest.height - fit_h) / 2,
+                fit_w,
+                fit_h,
+            );
+            draw_scaled_region(frame, img, Rect::new(sx, 0, cw, ch), fit_dest);
         } else {
-            // Nearest-neighbor scale within `dest` for compact viewports < 800 px.
             draw_scaled_region(frame, img, Rect::new(sx, 0, cw, ch), dest);
         }
     } else {
