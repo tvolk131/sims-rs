@@ -1582,3 +1582,155 @@ fn generic_call_21_reads_a_token_past_0x7fff_through_its_place_cut_to_a_word() {
     assert_eq!((len, fifth), (0x10005, token(1, 0, 3)));
     assert_eq!((motives[6], motives[5]), (44.0, 50.0));
 }
+
+/// Runs Generic Sims Call 19 on the Sim with `person` in its temp 0, and
+/// gives the Sim's temp 0 after.
+fn companion(fx: &mut Fixture, person: i16) -> Result<i16, sims_vm::Fault> {
+    fx.sim_mut().temps[0] = person;
+    assert!(sim_runs(fx, 1, [19, 0, 0, 0, 0, 0, 0, 0], 0)?);
+    Ok(fx.sim().temps[0])
+}
+
+#[test]
+fn generic_call_19_finds_the_companion_on_the_lot_and_takes_one_from_its_token() {
+    // The first kind 1 token names the Sim's own type, which is on the
+    // lot: temp 0 takes the Sim's ID, and the token's count drops by one.
+    let mut fx = neighbors();
+    fx.world.neighbors.inventories = vec![Inventory {
+        neighbor: 1,
+        items: vec![
+            token(2, 0, 5),
+            token(1, SIM_GUID, 2),
+            token(1, LAMP_GUID, 1),
+        ],
+    }];
+    assert_eq!(companion(&mut fx, SIM as i16), Ok(SIM as i16));
+    assert_eq!(
+        fx.world.neighbors.inventories[0].items,
+        [
+            token(2, 0, 5),
+            token(1, SIM_GUID, 1),
+            token(1, LAMP_GUID, 1)
+        ]
+    );
+    // Again: the count runs out and the token is erased.
+    assert_eq!(companion(&mut fx, SIM as i16), Ok(SIM as i16));
+    assert_eq!(
+        fx.world.neighbors.inventories[0].items,
+        [token(2, 0, 5), token(1, LAMP_GUID, 1)]
+    );
+}
+
+#[test]
+fn generic_call_19_with_no_kind_1_token_sets_temp_0_to_minus_1() {
+    // No inventory: an empty one is added, and temp 0 is -1.
+    let mut fx = neighbors();
+    fx.world.neighbors.inventories = vec![Inventory {
+        neighbor: 7,
+        items: vec![token(1, SIM_GUID, 1)],
+    }];
+    assert_eq!(companion(&mut fx, SIM as i16), Ok(-1));
+    assert_eq!(
+        fx.world.neighbors.inventories,
+        [
+            Inventory {
+                neighbor: 7,
+                items: vec![token(1, SIM_GUID, 1)],
+            },
+            Inventory {
+                neighbor: 1,
+                items: Vec::new(),
+            },
+        ]
+    );
+    // Tokens of other kinds are left alone.
+    let mut fx = neighbors();
+    let items = vec![token(2, SIM_GUID, 1), token(3, SIM_GUID, 1)];
+    fx.world.neighbors.inventories = vec![Inventory {
+        neighbor: 1,
+        items: items.clone(),
+    }];
+    assert_eq!(companion(&mut fx, SIM as i16), Ok(-1));
+    assert_eq!(fx.world.neighbors.inventories[0].items, items);
+}
+
+#[test]
+fn generic_call_19_takes_the_token_even_when_its_type_is_no_person() {
+    // A GUID missing from the table of person types (0x4e9753 gives -1),
+    // whether no type at all or the lamp's: nothing is made, temp 0 is
+    // -1, and the token is still taken.
+    for guid in [0xDEAD_BEEF, LAMP_GUID] {
+        let mut fx = neighbors();
+        fx.world.neighbors.inventories = vec![Inventory {
+            neighbor: 1,
+            items: vec![token(1, guid, 1), token(1, SIM_GUID, 1)],
+        }];
+        let objects: Vec<u16> = fx.world.objects.keys().copied().collect();
+        assert_eq!(companion(&mut fx, SIM as i16), Ok(-1), "{guid:08x}");
+        assert_eq!(
+            fx.world.neighbors.inventories[0].items,
+            [token(1, SIM_GUID, 1)]
+        );
+        assert_eq!(
+            fx.world.objects.keys().copied().collect::<Vec<_>>(),
+            objects
+        );
+    }
+}
+
+#[test]
+fn generic_call_19_makes_the_companion_when_none_is_on_the_lot() {
+    // The widget is a person type with nobody of it on the lot: the
+    // factory makes one (0x4e9719), off the lot, and temp 0 takes its ID.
+    let (mut fx, _, _) = crate::create_person::visitors();
+    fx.sim_mut().person.as_mut().unwrap().data[31] = 5;
+    fx.sim_mut().temps = vec![0; 8];
+    fx.world.neighbors.inventories = vec![Inventory {
+        neighbor: 5,
+        items: vec![token(1, crate::factory::WIDGET, 1)],
+    }];
+    assert!(
+        !fx.world
+            .people
+            .iter()
+            .any(|id| fx.world.objects[id].guid == crate::factory::WIDGET)
+    );
+    let made = companion(&mut fx, SIM as i16).expect("routine 19 runs");
+    let made = u16::try_from(made).expect("a companion was made");
+    assert_eq!(fx.world.objects[&made].guid, crate::factory::WIDGET);
+    assert!(fx.world.objects[&made].person.is_some());
+    assert!(fx.world.people.contains(&made));
+    assert_eq!(fx.world.neighbors.inventories[0].items, []);
+}
+
+#[test]
+fn generic_call_19_needs_temp_0_to_name_a_person() {
+    for person in [0, -1, LAMP as i16, 99] {
+        let mut fx = neighbors();
+        fx.sim_mut().temps[0] = person;
+        let result = sim_runs(&mut fx, 1, [19, 0, 0, 0, 0, 0, 0, 0], 0);
+        assert_eq!(code(result), Some(0x1c), "{person}");
+    }
+}
+
+#[test]
+fn generic_call_19_reads_a_token_past_0x7fff_through_its_place_cut_to_a_word() {
+    // `at` tokens of kind 3 (the one at 5 names the Sim's type, count 2),
+    // then one of kind 1 naming the Sim's type, count 1.
+    let run = |at: usize| {
+        let mut fx = neighbors();
+        let mut items = vec![token(3, 0, 1); at];
+        items[5] = token(3, SIM_GUID, 2);
+        items.push(token(1, SIM_GUID, 1));
+        fx.world.neighbors.inventories = vec![Inventory { neighbor: 1, items }];
+        let found = companion(&mut fx, SIM as i16).expect("routine 19 runs");
+        let items = &fx.world.neighbors.inventories[0].items;
+        (found, items.len(), items[5].clone())
+    };
+    // Place -32768 or -1: as if none were found; nothing is taken.
+    assert_eq!(run(0x8000), (-1, 0x8001, token(3, SIM_GUID, 2)));
+    assert_eq!(run(0xffff), (-1, 0x10000, token(3, SIM_GUID, 2)));
+    // Place 5 (index 65541): the kind 3 token there is read and one is
+    // taken from it.
+    assert_eq!(run(0x10005), (SIM as i16, 0x10006, token(3, SIM_GUID, 1)));
+}

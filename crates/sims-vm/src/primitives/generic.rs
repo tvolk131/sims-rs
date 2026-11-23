@@ -62,6 +62,11 @@
 //!   inventory. See [`Machine::restore_saved_state`]. Magic Town's middle
 //!   ped marker (tree 0x100e, node 35) runs it after it places each member
 //!   of an arriving family.
+//! - 19 (0x450787): bring back the person who traveled with the person
+//!   whose object ID is in the running object's temp 0: temp 0 becomes the
+//!   companion's object ID, or -1. See [`Machine::find_companion`].
+//!   Downtown's middle ped marker (EP3 `PedMarkers.iff` tree 0x100e,
+//!   node 11) runs it for the arriving family's first member.
 //! - 3 (0x44fb41): take down the interface's travel picture, if it shows
 //!   one (0x4fc3ca on the interface, `[0x6f2a58]`). That picture is the
 //!   full-screen window 0x4fc416 opens: a bitmap picked by kind and screen
@@ -159,6 +164,10 @@ impl Machine<'_, '_> {
             }
             21 => {
                 self.restore_saved_state()?;
+                Ok(true)
+            }
+            19 => {
+                self.find_companion()?;
                 Ok(true)
             }
             // Presentation only (see the module's notes).
@@ -495,6 +504,14 @@ impl Machine<'_, '_> {
 /// The inventory token kind routine 21 restores from.
 const SAVED_STATE: i32 = 2;
 
+/// The inventory token kind routine 19 reads: the GUID of a person who
+/// travels with the token's owner.
+const COMPANION: i32 = 1;
+
+/// Definition word 9, the object's type, and the type a person has.
+const TYPE: usize = 9;
+const PERSON_TYPE: i16 = 2;
+
 /// Where routine 21 puts a token's count, by the token's GUID (the
 /// switch at 0x450a53, through the table at 0x4514ea).
 enum Restored {
@@ -524,6 +541,143 @@ fn restored(guid: u32) -> Option<Restored> {
 }
 
 impl Machine<'_, '_> {
+    /// The person whose object ID is in the running object's temp 0
+    /// (+0x3a), and that person's neighbor ID (person data word 31,
+    /// +0x5ca), as routines 19 and 21 read them. An ID that names no
+    /// object, or an object that is not a person, is native error 0x1c
+    /// (the casts at 0x4507bb and 0x4509be).
+    fn temp_0_person(&self) -> Result<(u16, i16), Trap> {
+        let temp = *self
+            .me()?
+            .temps
+            .first()
+            .ok_or_else(|| Trap::Invalid("object has no temps".into()))?;
+        let not_person = || Trap::native(0x1c, "object is not a person");
+        let person = u16::try_from(temp)
+            .ok()
+            .filter(|&id| id > 0)
+            .filter(|id| {
+                self.world
+                    .objects
+                    .get(id)
+                    .is_some_and(|object| object.person.is_some())
+            })
+            .ok_or_else(not_person)?;
+        let neighbor = self.world.objects[&person]
+            .person
+            .as_ref()
+            .ok_or_else(not_person)?
+            .data
+            .get(31)
+            .copied()
+            .ok_or_else(|| Trap::Invalid("a person has no data word 31".into()))?;
+        Ok((person, neighbor))
+    }
+
+    /// Writes `value` into the running object's temp 0.
+    fn set_temp_0(&mut self, value: i16) -> Result<(), Trap> {
+        *self
+            .me_mut()?
+            .temps
+            .first_mut()
+            .ok_or_else(|| Trap::Invalid("object has no temps".into()))? = value;
+        Ok(())
+    }
+
+    /// Routine 19 (0x450787 to 0x450985).
+    ///
+    /// 1. The running object's temp 0 names a person ([`Self::temp_0_person`]),
+    ///    and that person's neighbor inventory is found, or added empty
+    ///    (0x42a8a1).
+    /// 2. The first token of kind 1, any GUID, is found from the start
+    ///    (0x41f69c). Its place is kept as a word; a negative one (none
+    ///    found, or an index past 0x7fff that wraps negative) sets temp 0
+    ///    to -1 and ends the routine there, with nothing erased and no
+    ///    save (0x450cde). A place that wraps back to 0 or more names the
+    ///    token there, whatever its kind.
+    /// 3. The token's GUID names a person type ([`Self::person_of_type`]):
+    ///    temp 0 becomes the object ID of the lot's first person of that
+    ///    type, made if there is none, or -1 (0x45081c to 0x45086f).
+    /// 4. One is taken from the token's count, and the token erased when
+    ///    none is left (0x41f56b with 1).
+    /// 5. The neighborhood is saved (0x4252cc). Here the neighborhood's
+    ///    inventories are kept in the world and written when the lot is
+    ///    saved, so the save is not modeled.
+    ///
+    /// The routine always ends with the true branch (0x44f7f0). Kind-1
+    /// tokens are what Manage Inventory's operation 5 writes: the GUID of
+    /// the neighbor a traveler takes along.
+    fn find_companion(&mut self) -> Result<(), Trap> {
+        let (_, neighbor) = self.temp_0_person()?;
+        let inventory = self.inventory_slot(neighbor);
+        let items = &self.world.neighbors.inventories[inventory].items;
+        let place = items
+            .iter()
+            .position(|item| item.kind == COMPANION)
+            .map_or(-1, |index| (index as u16) as i16);
+        // A place of 0 or more is at or before the token's index, so it
+        // is in the inventory (0x41f6fb reads it).
+        let Ok(at) = usize::try_from(place) else {
+            return self.set_temp_0(-1);
+        };
+        let guid = items[at].guid;
+        let companion = self.person_of_type(guid)?;
+        self.set_temp_0(companion.map_or(-1, |id| id as i16))?;
+        // 0x41f56b(place, 1), on the inventory as it is now: making the
+        // companion ran its scripts.
+        let inventory = self.inventory_slot(neighbor);
+        let items = &mut self.world.neighbors.inventories[inventory].items;
+        if let Some(item) = items.get_mut(at) {
+            let remaining = i32::from(item.count as i16) - 1;
+            if remaining > 0 {
+                item.count = remaining as u16;
+            } else {
+                items.remove(at);
+            }
+        }
+        Ok(())
+    }
+
+    /// The lot's first person of the type `guid` names, made if there is
+    /// none (routine 19, 0x450825 to 0x450866).
+    ///
+    /// - A type missing from the interface's table of person types
+    ///   (0x4e9753 gives -1, [`Self::in_portrait_table`]) gives none, and
+    ///   nothing is made.
+    /// - Otherwise the lot's people are walked for the first of that type
+    ///   (0x4e9608, [`Self::first_on_lot_person`]).
+    /// - With none, the type's winning definition (0x43ac10) goes to the
+    ///   object factory (0x440b2d, from 0x4e9719): a person, or for a
+    ///   grouped or non-person definition the object it makes. The walk
+    ///   then runs again, so a factory that made no person gives none.
+    fn person_of_type(&mut self, guid: u32) -> Result<Option<u16>, Trap> {
+        if !self.in_portrait_table(guid)? {
+            return Ok(None);
+        }
+        if let Some(id) = self.first_on_lot_person(guid) {
+            return Ok(Some(id));
+        }
+        if crate::interpreter::object_definition(self.catalog, self.world, guid).is_some() {
+            let words = self.definition_words(guid)?;
+            let interpreter = self.interpreter();
+            let unsupported = |fault: crate::fault::Fault| {
+                fault.unsupported_in(format!(
+                    "making a person of type 0x{guid:08X} for Generic Sims Call 19 (0x4e9719)"
+                ))
+            };
+            if words[TYPE] == PERSON_TYPE && words[crate::factory::word::GROUP] == 0 {
+                interpreter
+                    .try_create_person(self.world, guid)
+                    .map_err(unsupported)?;
+            } else {
+                interpreter
+                    .try_create(self.world, guid)
+                    .map_err(unsupported)?;
+            }
+        }
+        Ok(self.first_on_lot_person(guid))
+    }
+
     /// Routine 21 (0x45098a to 0x450b26).
     ///
     /// 1. The running object's temp 0 (+0x3a) names a person. An ID that
@@ -557,30 +711,7 @@ impl Machine<'_, '_> {
     /// - a place that wraps back to 0 or more reads, and erases, the
     ///   token there, whatever its kind.
     fn restore_saved_state(&mut self) -> Result<(), Trap> {
-        let temp = *self
-            .me()?
-            .temps
-            .first()
-            .ok_or_else(|| Trap::Invalid("object has no temps".into()))?;
-        let not_person = || Trap::native(0x1c, "object is not a person");
-        let person = u16::try_from(temp)
-            .ok()
-            .filter(|&id| id > 0)
-            .filter(|id| {
-                self.world
-                    .objects
-                    .get(id)
-                    .is_some_and(|object| object.person.is_some())
-            })
-            .ok_or_else(not_person)?;
-        let neighbor = self.world.objects[&person]
-            .person
-            .as_ref()
-            .ok_or_else(not_person)?
-            .data
-            .get(31)
-            .copied()
-            .ok_or_else(|| Trap::Invalid("a person has no data word 31".into()))?;
+        let (person, neighbor) = self.temp_0_person()?;
         let inventory = self.inventory_slot(neighbor);
         let items = &self.world.neighbors.inventories[inventory].items;
         let passes = items.iter().filter(|item| item.kind == SAVED_STATE).count() as i16;
