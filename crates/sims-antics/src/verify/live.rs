@@ -289,26 +289,15 @@ impl Interner {
     }
 
     /// Whether symbol `id` is an input the checker may pick freely: a value the tree
-    /// starts from, or a read before any primitive ran. Values a primitive produced or
-    /// may have changed can be constrained by what the primitive does (a `Random` result
-    /// is below its bound), so a difference in them is only a possible one.
+    /// starts from. Values a primitive produced or may have changed can be constrained
+    /// by what the primitive does (a `Random` result is below its bound), and a read of
+    /// unmodeled memory may only ever return some values (`memory.rs:542`), so a
+    /// difference in them is only a possible one.
     fn is_input(&self, id: u32) -> bool {
-        match self.key(id) {
-            SymKey::InitParam(_) | SymKey::InitLocal(_) | SymKey::Cell(0, _) => true,
-            SymKey::EventValue(prefix) => !self.history(*prefix).iter().any(|node| {
-                matches!(
-                    node,
-                    PrefixNode::Event(
-                        _,
-                        LiveEvent {
-                            kind: EventKind::Primitive { .. } | EventKind::Write { .. },
-                            ..
-                        }
-                    )
-                )
-            }),
-            _ => false,
-        }
+        matches!(
+            self.key(id),
+            SymKey::InitParam(_) | SymKey::InitLocal(_) | SymKey::Cell(0, _)
+        )
     }
 
     fn is_input_val(&self, v: Val) -> bool {
@@ -617,7 +606,7 @@ struct PathSummary {
     out: Outputs,
     cond: Vec<(Atom, bool)>,
     nodes: Vec<u8>,
-    entry: u8,
+    entry: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -665,7 +654,7 @@ struct Explorer<'a> {
     opts: &'a LiveOptions,
     args: usize,
     locals: usize,
-    entry: u8,
+    entry: usize,
 }
 
 /// `(params, locals)` the VM gives a frame running `bhav` (`sims_vm::interpreter::dimensions`).
@@ -693,7 +682,13 @@ impl Explorer<'_> {
             .map(|i| interner.sym(SymKey::InitLocal((self.args + i) as u16)))
             .collect();
         PathState {
-            pc: self.entry,
+            // An entry past the last node index fails before running anything; 251 is
+            // the invalid target `step` treats that way.
+            pc: if self.entry > LAST_NODE {
+                251
+            } else {
+                self.entry as u8
+            },
             prefix: 0,
             epoch: 0,
             params,
@@ -1494,6 +1489,9 @@ pub fn check_bhav_live_equivalent(
     ctx_b: &LiveContext,
     opts: &LiveOptions,
 ) -> EquivResult {
+    if let Some(reason) = super::context_mismatch(a, ctx_a, b, ctx_b) {
+        return EquivResult::Inconclusive { reason };
+    }
     if a.kind != b.kind {
         return EquivResult::Counterexample {
             path: Vec::new(),
@@ -1519,44 +1517,36 @@ pub fn check_bhav_live_equivalent(
             ),
         };
     }
-    // Kind-4 trees can be entered at any node (`interpreter.rs:1786`).
-    if a.kind == 4 && a.instructions.len() != b.instructions.len() {
-        return EquivResult::Counterexample {
-            path: Vec::new(),
-            divergence: format!(
-                "kind-4 indexed tree length mismatch: A has {} entries vs B has {}",
-                a.instructions.len(),
-                b.instructions.len()
-            ),
-        };
-    }
-    // An entry past node 250 fails on both sides alike (`interpreter.rs:766`), as kind-4
-    // trees of different lengths were rejected above.
-    let entries = if a.kind == 4 {
-        a.instructions.len().min(LAST_NODE + 1)
-    } else {
-        1
-    };
+    // Kind-4 trees can be entered at any node; the VM clamps the entry to the last
+    // node (`interpreter.rs:1790`), and a node past 250 fails (`interpreter.rs:766`).
+    // Entries from the longer tree's length on all map to the same pair of nodes.
+    let (len_a, len_b) = (a.instructions.len(), b.instructions.len());
+    let entries = if a.kind == 4 { len_a.max(len_b) } else { 1 };
 
     let mut interner = Interner::new();
     let mut steps = 0usize;
     let mut paths = 0usize;
     let mut undecided: Option<String> = None;
     for entry in 0..entries {
-        let entry = entry as u8;
-        let explore = |bhav: &BhavChunk, ctx: &LiveContext, interner: &mut Interner| {
-            let (args, locals) = frame_dims(bhav);
-            Explorer {
-                bhav,
-                ctx,
-                opts,
-                args,
-                locals,
-                entry,
-            }
-            .explore(interner)
-        };
-        let (paths_a, steps_a) = match explore(a, ctx_a, &mut interner) {
+        let (entry_a, entry_b) = (entry.min(len_a - 1), entry.min(len_b - 1));
+        if entry_a > LAST_NODE && entry_b > LAST_NODE {
+            // Both fail with 0x44c before running anything.
+            continue;
+        }
+        let explore =
+            |bhav: &BhavChunk, ctx: &LiveContext, entry: usize, interner: &mut Interner| {
+                let (args, locals) = frame_dims(bhav);
+                Explorer {
+                    bhav,
+                    ctx,
+                    opts,
+                    args,
+                    locals,
+                    entry,
+                }
+                .explore(interner)
+            };
+        let (paths_a, steps_a) = match explore(a, ctx_a, entry_a, &mut interner) {
             Ok(r) => r,
             Err(reason) => {
                 return EquivResult::Inconclusive {
@@ -1564,7 +1554,7 @@ pub fn check_bhav_live_equivalent(
                 };
             }
         };
-        let (paths_b, steps_b) = match explore(b, ctx_b, &mut interner) {
+        let (paths_b, steps_b) = match explore(b, ctx_b, entry_b, &mut interner) {
             Ok(r) => r,
             Err(reason) => {
                 return EquivResult::Inconclusive {
@@ -1705,6 +1695,29 @@ fn first_difference(
     cond: &[(Atom, bool)],
     interner: &Interner,
 ) -> Difference {
+    // A primitive both paths ran may never succeed, or never take the branch the
+    // paths took after it (a `Random` with a zero bound always fails), so a difference
+    // after one is only a possible one.
+    let ha = interner.history(a.prefix);
+    let hb = interner.history(b.prefix);
+    let common = ha.iter().zip(&hb).take_while(|(x, y)| x == y).count();
+    let after_primitive = ha[..common].iter().any(is_primitive);
+    match first_difference_inner(a, b, &ha, &hb, cond, interner) {
+        Difference::Definite(what) if after_primitive => Difference::Possible(format!(
+            "{what}, after a primitive both trees run, which may not succeed or return on that branch"
+        )),
+        d => d,
+    }
+}
+
+fn first_difference_inner(
+    a: &Outputs,
+    b: &Outputs,
+    ha: &[&PrefixNode],
+    hb: &[&PrefixNode],
+    cond: &[(Atom, bool)],
+    interner: &Interner,
+) -> Difference {
     let values = |what: String, x: Val, y: Val| -> Option<Difference> {
         match can_differ(x, y, cond, interner) {
             Some(false) => None,
@@ -1722,8 +1735,6 @@ fn first_difference(
     };
 
     if a.prefix != b.prefix {
-        let ha = interner.history(a.prefix);
-        let hb = interner.history(b.prefix);
         for k in 0..ha.len().max(hb.len()) {
             match (ha.get(k), hb.get(k)) {
                 (Some(x), Some(y)) if x == y => continue,
@@ -1910,13 +1921,31 @@ fn event_difference(
                 callee_arity: cb,
                 caller_frame: fb,
             },
-        ) if oa == ob && xa == xb && ia == ib && (sa != sb || ca != cb || fa != fb) => {
-            if ca != cb {
-                return Difference::Possible(format!(
-                    "{at}: call #{oa} names trees with different argument counts in the two files \
-                     ({ca:?} vs {cb:?})"
-                ));
-            }
+        ) if oa == ob && xa == xb && ca != cb => {
+            // Checked before the inline arguments, whose span follows the arity.
+            return Difference::Possible(format!(
+                "{at}: call #{oa} names trees with different argument counts in the two files \
+                 ({ca:?} vs {cb:?})"
+            ));
+        }
+        (
+            EventKind::Primitive {
+                opcode: oa,
+                operands: xa,
+                inline_args: ia,
+                unknown_arity_suffix: sa,
+                caller_frame: fa,
+                ..
+            },
+            EventKind::Primitive {
+                opcode: ob,
+                operands: xb,
+                inline_args: ib,
+                unknown_arity_suffix: sb,
+                caller_frame: fb,
+                ..
+            },
+        ) if oa == ob && xa == xb && ia == ib && (sa != sb || fa != fb) => {
             if sa != sb {
                 return Difference::Possible(format!(
                     "{at}: call #{oa} has unknown callee arity and the instructions after it differ"
@@ -1990,20 +2019,38 @@ fn event_difference(
             }
         }
     }
+    // A built-in primitive may overwrite the scratch pointer, the last branch result and
+    // the tracked cells without reading them (`Stop All Sounds` sets its own result,
+    // `sound.rs:64`), so a difference in them before one is only a possible one. Idle
+    // and Gosub Found Action read the last result first (`idle.rs:187`,
+    // `found_action.rs:102`). A called tree is handed all of them.
+    let builtin = match a.kind {
+        EventKind::Primitive { opcode, .. } if opcode < 256 => Some(opcode),
+        _ => None,
+    };
+    let opaque = |d: Difference, reads_last_result: bool| match d {
+        Difference::Definite(what)
+            if builtin.is_some_and(|op| !(reads_last_result && matches!(op, 17 | 30))) =>
+        {
+            Difference::Possible(format!("{what}, but the primitive may overwrite it unread"))
+        }
+        d => d,
+    };
     if a.scratch != b.scratch {
-        return Difference::Definite(format!(
+        let what = format!(
             "scratch-pointer state before {at} ({}) differs: A {:?} vs B {:?}",
             describe_kind(&a.kind, interner),
             a.scratch,
             b.scratch
-        ));
+        );
+        return opaque(Difference::Definite(what), false);
     }
     if let Some(d) = last_result_difference(
         &format!("before {at} ({})", describe_kind(&a.kind, interner)),
         a.last_result,
         b.last_result,
     ) {
-        return d;
+        return opaque(d, true);
     }
     if let Some(d) = store_difference(
         &format!("before {at} ({})", describe_kind(&a.kind, interner)),
@@ -2013,7 +2060,7 @@ fn event_difference(
         cond,
         interner,
     ) {
-        return d;
+        return opaque(d, false);
     }
     if a.frame.len() != b.frame.len() {
         return Difference::Definite(format!("{at}: frame operands differ"));
@@ -2058,6 +2105,19 @@ fn event_difference(
         };
     }
     Difference::Possible(format!("{at}: events differ"))
+}
+
+fn is_primitive(node: &&PrefixNode) -> bool {
+    matches!(
+        node,
+        PrefixNode::Event(
+            _,
+            LiveEvent {
+                kind: EventKind::Primitive { .. },
+                ..
+            }
+        )
+    )
 }
 
 fn is_read(node: &&PrefixNode) -> bool {

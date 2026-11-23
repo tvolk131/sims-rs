@@ -33,9 +33,14 @@ what the rest of the game can observe:
 - **Exit:** true, false, error, a modeled VM trap with its native code, or a
   jump to a missing node. Branches to nodes 251 and 252, and kind-4 entries
   past node 250, trap with 0x44c whatever the tree's length
-  (`interpreter.rs:766`, `interpreter.rs:1695`).
+  (`interpreter.rs:766`, `interpreter.rs:1695`). A kind-4 entry runs at the
+  entry clamped to the tree's last node (`interpreter.rs:1790`), so trees of
+  different lengths are compared entry by entry, not rejected.
 - **Last branch result** at exit and before each primitive (a primitive may
-  start a tree that reads it, `found_action.rs:102`, `idle.rs:187`). The
+  start a tree that reads it, `found_action.rs:102`, `idle.rs:187`). Before a
+  built-in primitive other than Idle and Gosub Found Action, which read it
+  first, a difference in it, the scratch pointer or the tracked cells is only
+  possible: the primitive may overwrite them unread (`sound.rs:64`). The
   `>=`, `<=` and `!=` tests take their false branch when the canonical atom
   holds, so their own result is the atom's negation.
 - **Event trace:** primitives and calls with canonical operands; reads of
@@ -80,9 +85,13 @@ term-versus-literal atoms.
 A difference becomes a **counterexample** only when both of these hold:
 
 - the joint condition constrains independent inputs only by literal bounds.
-  Inputs are the tree's starting values and reads made before any primitive
-  or untracked write. A value a primitive produced can be constrained by what
-  it does (a `Random` result is below its bound), so it is not free;
+  Inputs are only the tree's starting values: params, locals and tracked
+  cells. A value a primitive produced can be constrained by what it does (a
+  `Random` result is below its bound), and a read of unmodeled memory may
+  only ever return some values (`memory.rs:542`), so neither is free;
+- no primitive runs before the paths diverge. A primitive both paths ran may
+  never succeed, or never take the branch they took after it (a `Random`
+  with a zero bound always fails);
 - the differing values provably can differ.
 
 Anything else is `Inconclusive`. This includes extra or different reads,
@@ -118,7 +127,8 @@ reports which method decided (`EquivMethod`).
 - If the two files' BCON tables differ and either tree may read them (any
   primitive, or a scope-26 operand), the result is `Inconclusive`: neither
   checker sees constants a primitive or an unfolded operand reads
-  (`context_mismatch`).
+  (`context_mismatch`). The live checker applies the same rule when called
+  on its own.
 - Lockstep runs with silent steps off (`max_silent_steps: 0`), so every
   `Expression` is matched. That keeps the scratch pointer and unwritten-local
   reads in step. With `observe_last_result`, it also tracks whether the two
@@ -127,7 +137,10 @@ reports which method decided (`EquivMethod`).
   (`lockstep_suffices`). It is not taken when frame residue is observed, when
   the frames differ and a tree has a primitive, when a tree has more than 251
   nodes or branches to 251 or 252, or when a called tree's argument count
-  differs between the files.
+  differs between the files. Nor is it taken when a path may read a local
+  before writing it: lockstep folds `local[0] == local[0]` to `true`, but the
+  read can fail (`interpreter.rs:1277`). A must-be-written analysis decides
+  that, counting only `:=` and op 20 as writes.
 
 A lockstep counterexample is a divergence in the stricter
 all-accesses-observable trace. When live-output cannot decide, the result is
@@ -155,6 +168,16 @@ arities and BCON tables come from the chunks it resolves.
 | `BCON` | Values must match; the flags byte is a note. |
 | `TPRP`, `TRCN` | Editor metadata, notes only. |
 | Everything else | Bytes must match. |
+
+Two more file problems make the verdict `Inconclusive`. One is a file whose
+resource map picks a different chunk for some `(type, id)` than `sims-vm`,
+which loads every chunk in file order so the last one wins
+(`program.rs:601`); duplicate or deleted chunks cause this. The other is a
+`STR#` #303 whose tree names, as `sims-vm` reads them for Run Tree By Name
+(`program.rs:615`), differ though the original loader reads the two tables
+alike. A version-0 table is the example: the loader reads it as empty.
+String tables are parsed even when their bytes match, so identical tables
+that do not parse are `Inconclusive` too.
 
 Other chunks' labels, and all chunk flags, are notes. Reports name resources
 and entry indices only, never string contents.

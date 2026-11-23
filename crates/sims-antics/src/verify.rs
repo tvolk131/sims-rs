@@ -5500,6 +5500,84 @@ pub fn context_mismatch(
         .then(|| "the files' constant tables (BCON) differ and the trees may read them".to_owned())
 }
 
+/// Whether some path through `bhav` may read a local before writing it.
+///
+/// A forward must-be-written analysis: only `:=` (op 5) and op 20, which mark the
+/// local written before reading it (`expression.rs:75`), count as writes; other
+/// operators read the left side first. Primitive writes are not counted, so the
+/// answer errs towards "may". Every node of a kind-4 tree is an entry point.
+fn may_read_unwritten_local(bhav: &BhavChunk) -> bool {
+    let locals = live::frame_dims(bhav).1;
+    if locals == 0 {
+        return false;
+    }
+    let local = |idx: i16| usize::try_from(idx).ok().filter(|&i| i < locals);
+    let len = bhav.instructions.len().min(251);
+    let all = vec![true; locals];
+    // `written[n]`: locals written on every path reaching node `n` (None: unreached).
+    let mut written: Vec<Option<Vec<bool>>> = vec![None; len];
+    let mut work: Vec<usize> = Vec::new();
+    for (n, w) in written.iter_mut().enumerate() {
+        if n == 0 || bhav.kind == 4 {
+            *w = Some(vec![false; locals]);
+            work.push(n);
+        }
+    }
+    while let Some(n) = work.pop() {
+        let ins = &bhav.instructions[n];
+        let mut out = written[n].clone().unwrap_or_else(|| all.clone());
+        if ins.opcode == 2 {
+            let ops = &ins.operands;
+            let (lhs, rhs) = (word_i16(ops, 0), word_i16(ops, 2));
+            let op = ops[5];
+            if ops[7] == 25
+                && let Some(i) = local(rhs)
+                && !out[i]
+            {
+                return true;
+            }
+            if ops[6] == 25
+                && let Some(i) = local(lhs)
+            {
+                if matches!(op, 5 | 20) {
+                    out[i] = true;
+                } else if !out[i] {
+                    return true;
+                }
+            }
+        } else {
+            for u in primitive_frame_uses(ins.opcode, &ins.operands) {
+                match u {
+                    FrameUse::Read(25, idx, _) => {
+                        if local(idx).is_some_and(|i| !out[i]) {
+                            return true;
+                        }
+                    }
+                    FrameUse::AllLocals(_) | FrameUse::WholeFrame if out.iter().any(|w| !w) => {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for target in [ins.on_true, ins.on_false] {
+            let t = usize::from(target);
+            if t >= len {
+                continue;
+            }
+            let merged = match &written[t] {
+                None => out.clone(),
+                Some(prev) => prev.iter().zip(&out).map(|(&p, &o)| p && o).collect(),
+            };
+            if written[t].as_ref() != Some(&merged) {
+                written[t] = Some(merged);
+                work.push(t);
+            }
+        }
+    }
+    false
+}
+
 /// Whether a lockstep proof (with silent steps off) also covers everything the
 /// live-output checker observes under `live`.
 fn lockstep_suffices(
@@ -5530,6 +5608,13 @@ fn lockstep_suffices(
                 .any(|ins| matches!(ins.on_true, 251 | 252) || matches!(ins.on_false, 251 | 252))
     };
     if past_last_node(a) || past_last_node(b) {
+        return false;
+    }
+    // Reading a local the tree has not written yet can fail in the VM
+    // (`interpreter.rs:1277`), but lockstep folds such reads (`local[0] == local[0]`
+    // becomes `true`). Leave trees that may do so to the live-output checker, which
+    // records those reads.
+    if may_read_unwritten_local(a) || may_read_unwritten_local(b) {
         return false;
     }
     // A call whose target has different argument counts in the two files runs

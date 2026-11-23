@@ -201,12 +201,24 @@ fn last_branch_result_is_observed() {
     assert_eq!(method, EquivMethod::LiveOutput);
     assert_counterexample(&result);
 
-    // Before a primitive, which may start a tree that reads it, too.
-    let sound = [1, 0, 0, 0, 0, 0, 0, 0];
-    let then_sound = |test: Instruction| tree(4096, 1, 0, vec![test, prim(23, sound, T, T)]);
-    let a = then_sound(expr((PARAM, 0), LT, (LIT, 5), 1, 1));
-    let b = then_sound(expr((PARAM, 0), 14, (LIT, 5), 1, 1));
-    assert_counterexample(&live(&a, &b));
+    // Before a primitive that reads it (Idle, `idle.rs:187`) or a call, too.
+    let then = |test: Instruction, next: Instruction| tree(4096, 1, 0, vec![test, next]);
+    let lt_test = expr((PARAM, 0), LT, (LIT, 5), 1, 1);
+    let ge_test = expr((PARAM, 0), 14, (LIT, 5), 1, 1);
+    let idle = prim(17, [1, 0, 0, 0, 0, 0, 0, 0], T, T);
+    assert_counterexample(&live(
+        &then(lt_test.clone(), idle.clone()),
+        &then(ge_test.clone(), idle),
+    ));
+    let call = prim(0x1000, [0; 8], T, T);
+    assert_counterexample(&live(
+        &then(lt_test.clone(), call.clone()),
+        &then(ge_test.clone(), call),
+    ));
+    // Play Sound returns true whatever came before (`sound.rs:64`): only possibly
+    // different.
+    let sound = prim(23, [1, 0, 0, 0, 0, 0, 0, 0], T, T);
+    assert_inconclusive(&live(&then(lt_test, sound.clone()), &then(ge_test, sound)));
 }
 
 /// A self assignment `temp[0] := temp[0]` returning false leaves nothing behind.
@@ -403,7 +415,13 @@ fn scratch_pointer_state_before_primitives_is_observed() {
         0,
         vec![expr((LIT, 0), EQ, (LIT, 0), 1, 1), prim(23, sound, T, T)],
     );
-    assert_counterexample(&live(&bare, &after_expression));
+    // Play Sound does not read it, but a tree a call runs may (Global 34).
+    assert_inconclusive(&live(&bare, &after_expression));
+    let call = prim(0x1000, [0; 8], T, T);
+    assert_counterexample(&live(
+        &tree(4096, 0, 0, vec![call.clone()]),
+        &tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), 1, 1), call]),
+    ));
     // The test before the sound also sets the last result.
     let lenient = LiveOptions {
         observe_scratch_pointer: false,
@@ -915,4 +933,194 @@ fn deep_terms_are_described_briefly() {
     let result = live(&doubling(40), &doubling(41));
     let text = format!("{result:?}");
     assert!(text.len() < 4000, "{} bytes", text.len());
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2 regressions
+// ---------------------------------------------------------------------------
+
+/// `local[0] == local[0]` reads a local the tree never wrote, which can fail in the VM
+/// (`interpreter.rs:1277`); the combined checker must not take lockstep's folded proof.
+#[test]
+fn combined_checker_keeps_unwritten_local_reads() {
+    let reads = tree(4096, 0, 1, vec![expr((LOCAL, 0), EQ, (LOCAL, 0), T, T)]);
+    let literal = tree(4096, 0, 1, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    let ctx = LiveContext::default();
+    let (method, result) = check_bhav_equivalent_combined(
+        &reads,
+        &ctx,
+        &literal,
+        &ctx,
+        &EquivOptions::default(),
+        &LiveOptions::default(),
+    );
+    assert_eq!(method, EquivMethod::LiveOutput);
+    assert_inconclusive(&result);
+
+    // A local written before it is read keeps the lockstep proof.
+    let written = tree(
+        4096,
+        0,
+        1,
+        vec![
+            expr((LOCAL, 0), SET, (LIT, 3), 1, ERR),
+            expr((TEMP, 0), SET, (LOCAL, 0), T, ERR),
+        ],
+    );
+    let (method, result) = check_bhav_equivalent_combined(
+        &written,
+        &ctx,
+        &written,
+        &ctx,
+        &EquivOptions::default(),
+        &LiveOptions::default(),
+    );
+    assert_eq!(method, EquivMethod::Lockstep);
+    assert_equivalent(&result);
+}
+
+/// The live checker alone also refuses trees whose constant tables differ.
+#[test]
+fn live_checker_checks_constant_tables() {
+    // Random Number with its range in BCON 4096 entry 0 (scope 26).
+    let random = tree(
+        4096,
+        0,
+        0,
+        vec![prim(8, [0, 0, TEMP, 0, 0, 0, 26, 0], T, T)],
+    );
+    let ctx = |value| LiveContext {
+        local_bcons: Some([(4096, vec![value])].into_iter().collect()),
+        ..LiveContext::default()
+    };
+    assert_inconclusive(&check_bhav_live_equivalent(
+        &random,
+        &ctx(0),
+        &random,
+        &ctx(1),
+        &LiveOptions::default(),
+    ));
+}
+
+/// A second chunk with the same type and id: the VM loads the later one
+/// (`program.rs:601`), whatever the resource map says.
+#[test]
+fn duplicate_chunks_are_not_equivalent() {
+    let t = tree(4096, 0, 0, vec![prim(23, [0; 8], T, T)]);
+    let bcon = |value: i16| ChunkData {
+        tag: *b"BCON",
+        id: 4096,
+        flags: 0x10,
+        label: String::new(),
+        data: [vec![1, 0], value.to_le_bytes().to_vec()].concat(),
+    };
+    let a = write_iff(&[bhav_chunk(&t, "T"), bcon(1), bcon(1)]).expect("write");
+    let b = write_iff(&[bhav_chunk(&t, "T"), bcon(1), bcon(2)]).expect("write");
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_ne!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+}
+
+/// `sims-vm` reads a version-0 `STR#` #303 for Run Tree By Name, which the original
+/// loader reads as empty: the two readings disagree, so the result is undecided.
+#[test]
+fn tree_name_tables_follow_both_readers() {
+    let names = |name: &[u8]| ChunkData {
+        tag: *b"STR#",
+        id: 303,
+        flags: 0x10,
+        label: String::new(),
+        data: [vec![0, 0, 1, 0, name.len() as u8], name.to_vec()].concat(),
+    };
+    let a = write_iff(&[names(b"Alpha")]).expect("write");
+    let b = write_iff(&[names(b"Beta")]).expect("write");
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+    // Another table id read that way is empty on both sides.
+    let other = |name: &[u8]| ChunkData {
+        id: 128,
+        ..names(name)
+    };
+    let a = write_iff(&[other(b"Alpha")]).expect("write");
+    let b = write_iff(&[other(b"Beta")]).expect("write");
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+}
+
+/// Identical bytes that do not parse as a string table are still undecided.
+#[test]
+fn identical_malformed_string_tables_are_inconclusive() {
+    let bad = ChunkData {
+        tag: *b"STR#",
+        id: 128,
+        flags: 0x10,
+        label: String::new(),
+        data: vec![0xFF],
+    };
+    let a = write_iff(&[bad]).expect("write");
+    let report = check_iff_equivalent(&a, &a, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+}
+
+/// A primitive both trees run may never succeed (a `Random` with a zero range always
+/// fails), so different exits after it are not a proven difference.
+#[test]
+fn differences_after_a_shared_primitive_are_undecided() {
+    let random = |exit| {
+        tree(
+            4096,
+            0,
+            0,
+            vec![prim(8, [0, 0, TEMP, 0, 0, 0, LIT, 0], exit, exit)],
+        )
+    };
+    assert_inconclusive(&live(&random(T), &random(F)));
+}
+
+/// Calls to trees with different argument counts that read their arguments inline
+/// (more than four) are undecided, not different.
+#[test]
+fn inline_calls_with_different_arities_are_inconclusive() {
+    let filler = expr((LIT, 0), EQ, (LIT, 0), T, T);
+    let caller = tree(
+        4096,
+        0,
+        0,
+        vec![
+            prim(0x1000, [0xFF; 8], T, T),
+            filler.clone(),
+            filler.clone(),
+        ],
+    );
+    let ctx = |arity| LiveContext {
+        callee_arities: Some([(0x1000, arity)].into_iter().collect()),
+        ..LiveContext::default()
+    };
+    assert_inconclusive(&check_bhav_live_equivalent(
+        &caller,
+        &ctx(5),
+        &caller,
+        &ctx(6),
+        &LiveOptions::default(),
+    ));
+}
+
+/// Kind-4 trees are entered at the clamped node: entries past node 250 fail alike
+/// whatever the lengths, and a shorter tree's last node answers the longer one's
+/// extra entries.
+#[test]
+fn kind4_entries_follow_the_clamp() {
+    let node = |exit| expr((LIT, 0), EQ, (LIT, 0), exit, exit);
+    let indexed = |nodes: Vec<Instruction>| BhavChunk {
+        kind: 4,
+        ..tree(4096, 0, 0, nodes)
+    };
+    let long_a = indexed(vec![node(T); 252]);
+    let long_b = indexed(vec![node(T); 253]);
+    assert_equivalent(&live(&long_a, &long_b));
+
+    let short = indexed(vec![node(T), node(T), node(F)]);
+    let same = indexed(vec![node(T), node(T), node(F), node(F), node(F)]);
+    assert_equivalent(&live(&short, &same));
+    let differs = indexed(vec![node(T), node(T), node(F), node(T), node(F)]);
+    assert_counterexample(&live(&short, &differs));
 }
