@@ -1755,7 +1755,11 @@ mod tests {
             .iter()
             .map(|r| r.id)
             .collect();
-        assert_eq!(ids, [6, 7], "the first made first, though its GUID is higher");
+        assert_eq!(
+            ids,
+            [6, 7],
+            "the first made first, though its GUID is higher"
+        );
         assert_eq!(first_relation(&world, 100, &[], &known), Some(first));
 
         // The order survives the world's encoding, and a save (`Saved`

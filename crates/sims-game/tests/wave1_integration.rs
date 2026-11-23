@@ -871,9 +871,8 @@ fn a_world_snapshot_slot_restores_its_own_indicator_queues() {
     };
     let tmp = TempTestDir::new("snapshot-queues");
     let saves = tmp.path().join("saves.redb");
-    let mut shell =
-        NeighborhoodShell::open(install, saves, 1, false, vec![3], Frames::default())
-            .expect("NeighborhoodShell opens");
+    let mut shell = NeighborhoodShell::open(install, saves, 1, false, vec![3], Frames::default())
+        .expect("NeighborhoodShell opens");
     shell.enter_lot(5).expect("enter Goth lot 5");
     let people = shell.game().expect("lot game").lot().world().people.clone();
     let [first, second, ..] = people[..] else {
@@ -885,10 +884,7 @@ fn a_world_snapshot_slot_restores_its_own_indicator_queues() {
     saved.queue_date(first, 1);
     saved.queue_star(first);
     set_open_queues(&mut shell, saved.clone());
-    assert_eq!(
-        shell.game().unwrap().lot().world().indicator_queues,
-        saved
-    );
+    assert_eq!(shell.game().unwrap().lot().world().indicator_queues, saved);
     shell
         .enqueue_background_world_save(SaveTarget::Manual)
         .expect("enqueue a WorldSnapshot manual save");
@@ -911,7 +907,12 @@ fn a_world_snapshot_slot_restores_its_own_indicator_queues() {
         "loading the WorldSnapshot slot must succeed"
     );
     assert_eq!(
-        shell.game().expect("lot game").lot().world().indicator_queues,
+        shell
+            .game()
+            .expect("lot game")
+            .lot()
+            .world()
+            .indicator_queues,
         saved,
         "the slot's queues, not the open lot's"
     );

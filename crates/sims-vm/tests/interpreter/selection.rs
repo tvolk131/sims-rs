@@ -364,7 +364,6 @@ fn in_no_pool(fx: &Fixture) -> u16 {
 /// after placing (0x446ed9), so it loses none.
 #[test]
 fn a_star_refresh_on_a_border_tile_loses_the_popped_star() {
-
     // The refresh: OTHER, not selected, is famous on a lot's border tile.
     let mut fx = two_residents();
     fx.program.expansions = 0x40;
@@ -451,7 +450,10 @@ fn the_star_pool_hands_out_the_last_star_let_go() {
     let held = |fx: &Fixture, sim: u16| fx.world.objects[&sim].slots[2].object as u16;
     let (newer, older) = (held(&fx, OTHER), held(&fx, THIRD));
     assert_eq!(fx.world.indicator_queues.stars_in_use, [newer, older]);
-    assert!(newer > older, "made in order, the last made handed out first");
+    assert!(
+        newer > older,
+        "made in order, the last made handed out first"
+    );
     // Selecting OTHER lets its star go (0x4467d7 -> 0x4481eb); it is then
     // no longer famous, so selecting THIRD next gives it no star again.
     asking(&mut fx, |i, world| i.select(world, Some(OTHER)).unwrap());
