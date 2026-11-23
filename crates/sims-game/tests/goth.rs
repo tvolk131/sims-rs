@@ -6561,9 +6561,12 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
     let mut portrait_min_y = i32::MAX;
     let mut portrait_max_y = 0;
     let mut portrait_pixels = 0usize;
+    // `PanelBack.bmp` (`4910`) has a horizontal blue gradient across the strip
+    // and is vertically uniform across its interior, so compare each pixel
+    // against the column-matched strip background just above the portrait.
     for y in 505..597 {
-        let bg = canvas.pixel_rgb(245, y as usize);
         for x in 252..390 {
+            let bg = canvas.pixel_rgb(x as usize, 506);
             let [r, g, b] = canvas.pixel_rgb(x as usize, y as usize);
             let diff =
                 r.abs_diff(bg[0]) as u32 + g.abs_diff(bg[1]) as u32 + b.abs_diff(bg[2]) as u32;

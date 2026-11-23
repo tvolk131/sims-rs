@@ -1003,9 +1003,7 @@ impl NeighborhoodChrome {
 
         // 5. Lot hover / House Info popup card.
         if let Some(lot) = &state.hovered_lot {
-            let popup =
-                LotPopupLayout::compute(lot, state, [frame.width(), frame.height()], art, strings);
-            draw_lot_popup(frame, &popup, lot, art);
+            draw_hovered_lot_popup(frame, lot, state, art, strings);
         }
 
         // 6. Hover tooltip over top-bar buttons (drawn last so it stays visible).
@@ -1032,6 +1030,20 @@ impl NeighborhoodChrome {
 
         layout
     }
+}
+
+/// Draws the native House Info / Community Lot hover popup card into `frame`
+/// for `lot`, reusing the same [`LotPopupLayout`] geometry as
+/// [`NeighborhoodChrome::draw`].
+pub fn draw_hovered_lot_popup(
+    frame: &mut Frame,
+    lot: &LotInfo,
+    state: &NeighborhoodState,
+    art: &Art,
+    strings: &NeighborhoodStrings,
+) {
+    let popup = LotPopupLayout::compute(lot, state, [frame.width(), frame.height()], art, strings);
+    draw_lot_popup(frame, &popup, lot, art);
 }
 
 fn command_for_button(button: BarButton, state: &NeighborhoodState) -> NeighborhoodCommand {

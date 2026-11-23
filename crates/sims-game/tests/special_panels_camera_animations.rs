@@ -146,7 +146,7 @@ fn goth_magic_hole_opens_kind13_picker_in_game_and_answers_cleanly() {
         "Goth Magic Hole 'Jump In' must pause on Dialog kind 13 (MagicTownLotPicker)"
     );
 
-    // Render to sync and draw the native Magic Town lot picker modal.
+    // Render to sync and draw the real graphical Magic Town destination map.
     game.render();
     assert!(game.has_dialog(), "special panel counts as an active modal");
     assert_eq!(
@@ -154,27 +154,41 @@ fn goth_magic_hole_opens_kind13_picker_in_game_and_answers_cleanly() {
         Some(&SpecialPanelRequest::MagicTownLotPicker { via_blimp: false })
     );
     assert!(
-        game.shop_open(),
-        "MagicTownLotPicker must open native ShopPickerDialog modal"
-    );
-    let snap = game.shop_snapshot().expect("special picker snapshot");
-    assert!(
-        !snap.items.is_empty(),
-        "Magic Town lot picker must be populated with real installed lots"
+        !game.shop_open(),
+        "MagicTownLotPicker must NOT open fake ShopPickerDialog"
     );
     assert!(
-        snap.items.iter().any(|i| i.id == "special_lot:93"),
-        "Magic Town lot picker must include Magic Town community lot 93: {:?}",
-        snap.items.iter().map(|i| &i.id).collect::<Vec<_>>()
+        game.destination_picker_open(),
+        "MagicTownLotPicker must open real graphical DestinationMapPicker"
+    );
+    let picker = game.destination_picker().expect("destination map picker");
+    assert_eq!(
+        picker.kind(),
+        sims_render::neighborhood::NeighborhoodKind::MagicTown
+    );
+    assert!(
+        picker.visitable_lots().contains(&93),
+        "Magic Town destination map must include visitable community lot 93: {:?}",
+        picker.visitable_lots()
+    );
+    assert!(
+        !picker.visitable_lots().contains(&90),
+        "Magic Town residential lot 90 must NOT be a visitable travel target"
     );
 
-    // Confirming via Enter / shop_submit delivers SpecialPanelResponse::Lot(Some(lot_id))
-    // cleanly without halting and records the pending travel destination for NeighborhoodShell.
-    let out = game.shop_submit();
+    // Clicking real visitable lot 93 on the graphical map delivers
+    // SpecialPanelResponse::Lot(Some(93)) cleanly without halting and records
+    // the pending travel destination for NeighborhoodShell.
+    let lot_93_pt = picker
+        .hit_point_for_lot([800, 600], 93)
+        .expect("clickable screen point on Magic Town lot 93");
+    let _ = game.hover(lot_93_pt);
+    let _ = game.press(lot_93_pt);
+    let out = game.release(lot_93_pt);
     assert!(out.redraw);
     assert!(game.stopped().is_none());
     assert!(game.asking_special_panel().is_none());
-    assert!(!game.shop_open());
+    assert!(!game.destination_picker_open());
     let pending = game
         .take_pending_travel_lot()
         .expect("picking a Magic Town lot must queue travel transition");
@@ -182,11 +196,11 @@ fn goth_magic_hole_opens_kind13_picker_in_game_and_answers_cleanly() {
         pending.0,
         SpecialPanelRequest::MagicTownLotPicker { via_blimp: false }
     );
-    assert!((93..=98).contains(&pending.1));
-    assert_eq!(game.lot().special_panels().magic_lot, pending.1 as i16);
+    assert_eq!(pending.1, 93);
+    assert_eq!(game.lot().special_panels().magic_lot, 93);
 
-    // Also verify cancelling a Magic Town picker via Escape (`shop_escape`) cleanly
-    // answers `SpecialPanelResponse::Lot(None)` without halting or stranding.
+    // Also verify cancelling a Magic Town picker via Escape (`destination_picker_escape`)
+    // cleanly answers `SpecialPanelResponse::Lot(None)` without halting or stranding.
     let mut game_cancel = Game::open(&Options {
         install: install.clone(),
         house: goth_house(&install),
@@ -211,11 +225,13 @@ fn goth_magic_hole_opens_kind13_picker_in_game_and_answers_cleanly() {
     }
     assert!(game_cancel.asking_special_panel().is_some());
     game_cancel.render();
-    let cancel_out = game_cancel.shop_escape();
+    assert!(game_cancel.destination_picker_open());
+    assert!(!game_cancel.shop_open());
+    let cancel_out = game_cancel.destination_picker_escape();
     assert!(cancel_out.redraw);
     assert!(game_cancel.stopped().is_none());
     assert!(game_cancel.asking_special_panel().is_none());
-    assert!(!game_cancel.shop_open());
+    assert!(!game_cancel.destination_picker_open());
     assert!(
         game_cancel.take_pending_travel_lot().is_none(),
         "cancelling MagicTownLotPicker must not trigger travel"
@@ -326,8 +342,14 @@ fn coop_lockstep_special_panel_opens_and_answers_via_special_panel_answer_comman
 
     host.render();
     peer.render();
-    assert!(host.shop_open(), "host must open special panel UI");
-    assert!(peer.shop_open(), "peer must open special panel UI");
+    assert!(
+        host.destination_picker_open() && !host.shop_open(),
+        "host must open graphical destination map picker (never ShopPickerDialog)"
+    );
+    assert!(
+        peer.destination_picker_open() && !peer.shop_open(),
+        "peer must open graphical destination map picker (never ShopPickerDialog)"
+    );
     assert_eq!(
         peer.active_special_panel_request(),
         Some(&SpecialPanelRequest::MagicTownLotPicker { via_blimp: false })
@@ -337,8 +359,8 @@ fn coop_lockstep_special_panel_opens_and_answers_via_special_panel_answer_comman
     // `sims_vm::coop::special_panel_answer_command(...)` over lockstep!
     assert!(peer.answer_special_panel(SpecialPanelResponse::Lot(Some(93))));
     assert!(
-        !peer.shop_open(),
-        "peer local modal closes immediately after submitting answer"
+        !peer.destination_picker_open(),
+        "peer local destination map closes immediately after submitting answer"
     );
 
     // Pump lockstep batches so both peers apply the answer deterministically.
@@ -353,8 +375,8 @@ fn coop_lockstep_special_panel_opens_and_answers_via_special_panel_answer_comman
     assert!(host.asking_special_panel().is_none());
     assert!(peer.asking_special_panel().is_none());
     assert!(
-        !host.shop_open(),
-        "host modal must auto-close once peer's lockstep answer resolves the special panel"
+        !host.destination_picker_open(),
+        "host destination map must auto-close once peer's lockstep answer resolves the special panel"
     );
     assert_eq!(
         host.lot().world().hash(),

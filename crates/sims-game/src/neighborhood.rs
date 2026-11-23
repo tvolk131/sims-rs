@@ -1524,6 +1524,12 @@ impl NeighborhoodShell {
             || matches!(&self.screen, ActiveScreen::Lot(s) if s.game.book_open())
     }
 
+    /// Whether the active lot is presenting a graphical destination map picker
+    /// (`Dialog` kinds `5, 7, 8, 11, 13`).
+    pub fn destination_picker_open(&self) -> bool {
+        matches!(&self.screen, ActiveScreen::Lot(s) if s.game.destination_picker_open())
+    }
+
     pub fn dialog_layout(&self) -> Option<&dialog::Layout> {
         match &self.screen {
             ActiveScreen::Lot(session) => session.game.dialog(),
@@ -2501,6 +2507,7 @@ impl NeighborhoodShell {
             return false;
         }
         match &mut self.screen {
+            ActiveScreen::Lot(session) if session.game.destination_picker_open() => false,
             ActiveScreen::Lot(session) if session.game.shop_open() => {
                 session.game.shop_wheel(delta_y)
             }
@@ -3077,6 +3084,10 @@ impl NeighborhoodShell {
                 self.drain_caf_voice_previews();
                 self.handle_caf_outcome(outcome)
             }
+            ActiveScreen::Lot(session) if session.game.destination_picker_open() => {
+                let out = session.game.destination_picker_escape();
+                self.handle_lot_outcome(out)
+            }
             ActiveScreen::Lot(session) if session.game.shop_open() => {
                 let out = session.game.shop_escape();
                 self.handle_lot_outcome(out)
@@ -3487,6 +3498,10 @@ impl NeighborhoodShell {
             return self.send_album_key(AlbumKey::Enter);
         }
         if let ActiveScreen::Lot(session) = &mut self.screen {
+            if session.game.destination_picker_open() {
+                let out = session.game.destination_picker_submit();
+                return self.handle_lot_outcome(out);
+            }
             if session.game.shop_open() {
                 let out = session.game.shop_submit();
                 return self.handle_lot_outcome(out);
@@ -4117,6 +4132,7 @@ impl NeighborhoodShell {
             let _ = game.load_options(&self.options_file);
         }
         game.set_album_button_enabled(true);
+        game.set_neighborhood_slot(self.slot);
         game.set_special_lot_catalog(self.build_special_lot_catalog());
         game.set_debug(self.debug);
         game.resize(self.size);
@@ -4752,6 +4768,7 @@ impl NeighborhoodShell {
         game.coop_set_player_name(self.coop_player_name.clone());
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.set_album_button_enabled(true);
+        game.set_neighborhood_slot(self.slot);
         game.set_special_lot_catalog(self.build_special_lot_catalog());
         game.set_debug(self.debug);
         game.resize(self.size);
@@ -6918,6 +6935,7 @@ impl NeighborhoodShell {
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.coop_set_travel_blocked(true);
         game.set_album_button_enabled(true);
+        game.set_neighborhood_slot(self.slot);
         game.set_special_lot_catalog(self.build_special_lot_catalog());
         game.set_debug(self.debug);
         game.resize(self.size);
@@ -7483,6 +7501,7 @@ impl NeighborhoodShell {
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.coop_set_travel_blocked(true);
         game.set_album_button_enabled(true);
+        game.set_neighborhood_slot(self.slot);
         game.set_special_lot_catalog(self.build_special_lot_catalog());
         game.set_debug(self.debug);
         game.resize(self.size);
@@ -7618,6 +7637,7 @@ impl NeighborhoodShell {
             let _ = game.load_options(&self.options_file);
         }
         game.set_album_button_enabled(true);
+        game.set_neighborhood_slot(self.slot);
         game.set_special_lot_catalog(self.build_special_lot_catalog());
         game.set_debug(self.debug);
         game.resize(self.size);
@@ -7741,6 +7761,7 @@ impl NeighborhoodShell {
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.coop_set_travel_blocked(true);
         game.set_album_button_enabled(true);
+        game.set_neighborhood_slot(self.slot);
         game.set_special_lot_catalog(self.build_special_lot_catalog());
         game.set_debug(self.debug);
         game.resize(self.size);
@@ -8001,6 +8022,7 @@ impl NeighborhoodShell {
             new_game.coop_set_player_name(self.coop_player_name.clone());
             new_game.coop_set_iroh_config(self.coop_iroh_config);
             new_game.set_album_button_enabled(true);
+            new_game.set_neighborhood_slot(self.slot);
             new_game.set_special_lot_catalog(self.build_special_lot_catalog());
             new_game.set_debug(self.debug);
             new_game.resize(self.size);
