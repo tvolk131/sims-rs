@@ -4,7 +4,6 @@ object "Open Hearth Stove" {
     guid: 0x7F00_0022;
     price: 490;
     category: appliances;
-    attributes: 8;
     description: "A clean-room kitchen range that scales meal nutrition with Cooking skill and spawns an Open Meal Plate.";
     sprite: Sprite::procedural("stove", primary: #DADEE4, accent: #949CA6, trim: #2E343C);
 
@@ -19,20 +18,13 @@ object "Open Hearth Stove" {
 
     sound sizzle = preset("sizzle", wav: "open_stove_sizzle");
 
-    slot front {
-        kind: routing,
-        offset: [0.0, -0.75, 0.0],
-        standing: true,
-        sitting: false,
-        ground: true,
-        facing: north,
-    }
+    slot front = routing([0.0, -0.75, 0.0]);
 
     functional cook(cooking_skill: i16, sim_id: ObjectId, plate_slot: i16, prep_bonus: i16) {
         score: cook_score,
         guard(sim) => !self.occupied,
         run(sim) {
-            play_sound(sizzle, self);
+            play_sound(sizzle);
             sleep(cook_ticks);
 
             let mut nutrition = cooking_skill / skill_divisor + base_hunger_value + prep_bonus;
@@ -47,7 +39,6 @@ object "Open Hearth Stove" {
             plate.attr[1] = 1;
             self.meals_cooked += 1;
             temp[2] = plate;
-            return true;
         }
     }
 }

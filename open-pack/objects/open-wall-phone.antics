@@ -4,7 +4,6 @@ object "Open Wall Phone" {
     guid: 0x7F00_0030;
     price: 95;
     category: electronics;
-    attributes: 8;
     description: "A clean-room wall telephone with interactive choice dialogs for neighbor calls, grocery delivery, and community info.";
     sprite: Sprite::procedural("wall_phone", primary: #36485C, accent: #D4DAE0, trim: #222A34);
 
@@ -36,14 +35,7 @@ object "Open Wall Phone" {
         info_bulletin = "Community Bulletin: Bright skies and friendly neighbors today.",
     }
 
-    slot front {
-        kind: routing,
-        offset: [0.0, -0.65, 0.0],
-        standing: true,
-        sitting: false,
-        ground: true,
-        facing: north,
-    }
+    slot front = routing([0.0, -0.65, 0.0]);
 
     fn deliver_groceries(sim: Sim) -> bool {
         if debit_funds(grocery_cost) {
@@ -51,7 +43,7 @@ object "Open Wall Phone" {
                 fridge.attr[0] += grocery_stock_bonus;
             }
             sim.motive.comfort += grocery_comfort_gain;
-            play_sound(confirm, self);
+            play_sound(confirm);
             self.last_outcome = 1;
             self.completed_calls += 1;
             return true;
@@ -62,80 +54,69 @@ object "Open Wall Phone" {
 
     interaction "Use Phone" {
         autonomy: 80,
-        attenuation: 0.02,
-        advertises: [
-            social +40 (min: -100),
-            fun +15 (min: -100),
-        ],
-        guard(sim) => !self.occupied,
+        advertises: [social +40, fun +15],
+        lock: self.occupied,
         run(sim) {
-            with lock(self.occupied) {
-                play_sound(ring, self);
-                play_sound(dial, self);
+            play_sound(ring);
+            play_sound(dial);
 
-                if dialog(
-                    kind: yes_no_cancel,
-                    title: title,
-                    message: menu_prompt,
-                    button1: btn_groceries,
-                    button2: btn_chat,
-                    button3: btn_info,
-                    temp: 0,
-                    icon_mode: 1
-                ) {
-                    if !deliver_groceries(sim) {
-                        return false;
-                    }
-                } else if temp[0] == 0 {
-                    // Button 2: Chat with Neighbor
-                    sleep(chat_ticks);
-                    sim.motive.social += chat_social_gain;
-                    sim.motive.fun += chat_fun_gain;
-                    play_sound(confirm, self);
-                    self.last_outcome = 2;
-                    self.completed_calls += 1;
-                } else {
-                    // Button 3: Call for Info (non-blocking info bulletin)
-                    dialog(
-                        kind: ok,
-                        title: title,
-                        message: info_bulletin,
-                        inform: true,
-                        icon_mode: 1
-                    );
-                    sim.motive.fun += info_fun_gain;
-                    play_sound(confirm, self);
-                    self.last_outcome = 3;
-                    self.completed_calls += 1;
+            if dialog(
+                kind: yes_no_cancel,
+                title: title,
+                message: menu_prompt,
+                button1: btn_groceries,
+                button2: btn_chat,
+                button3: btn_info,
+                temp: 0,
+                icon_mode: 1
+            ) {
+                if !deliver_groceries(sim) {
+                    return false;
                 }
+            } else if temp[0] == 0 {
+                // Button 2: Chat with Neighbor
+                sleep(chat_ticks);
+                sim.motive.social += chat_social_gain;
+                sim.motive.fun += chat_fun_gain;
+                play_sound(confirm);
+                self.last_outcome = 2;
+                self.completed_calls += 1;
+            } else {
+                // Button 3: Call for Info (non-blocking info bulletin)
+                dialog(
+                    kind: ok,
+                    title: title,
+                    message: info_bulletin,
+                    inform: true,
+                    icon_mode: 1
+                );
+                sim.motive.fun += info_fun_gain;
+                play_sound(confirm);
+                self.last_outcome = 3;
+                self.completed_calls += 1;
             }
-            return true;
         }
     }
 
     interaction "Order Groceries" {
         autonomy: 95,
-        attenuation: 0.02,
-        guard(sim) => !self.occupied,
+        lock: self.occupied,
         run(sim) {
-            with lock(self.occupied) {
-                play_sound(dial, self);
-                if dialog(
-                    kind: yes_no,
-                    title: title,
-                    message: confirm_groceries,
-                    button1: btn_yes,
-                    button2: btn_cancel,
-                    icon_mode: 1
-                ) {
-                    if !deliver_groceries(sim) {
-                        return false;
-                    }
-                } else {
-                    self.last_outcome = 4;
+            play_sound(dial);
+            if dialog(
+                kind: yes_no,
+                title: title,
+                message: confirm_groceries,
+                button1: btn_yes,
+                button2: btn_cancel,
+                icon_mode: 1
+            ) {
+                if !deliver_groceries(sim) {
+                    return false;
                 }
+            } else {
+                self.last_outcome = 4;
             }
-            return true;
         }
     }
 }

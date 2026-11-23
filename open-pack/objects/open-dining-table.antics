@@ -4,7 +4,6 @@ object "Open Dining Table" {
     guid: 0x7F00_0060;
     price: 260;
     category: surfaces;
-    attributes: 8;
     description: "A clean-room solid wood dining table with a serving surface and quick refreshment interaction.";
     sprite: Sprite::procedural("table", primary: #A67648, accent: #CCA272, trim: #583C24);
 
@@ -16,57 +15,33 @@ object "Open Dining Table" {
 
     sound tap = preset("wood_creak", wav: "open_table_tap");
 
-    slot top_surface {
-        kind: container,
-        offset: [0.0, 0.0, 0.65],
-        standing: false,
-        sitting: false,
-        ground: false,
-        height: 5,
-        facing: north,
-    }
-
-    slot front {
-        kind: routing,
-        offset: [0.0, -0.75, 0.0],
-        standing: true,
-        sitting: true,
-        ground: true,
-        facing: north,
-    }
+    slot top_surface = container([0.0, 0.0, 0.65]);
+    slot front = routing([0.0, -0.75, 0.0], sitting: true);
 
     fn toggle_table_setting(sim: Sim, set_state: bool) {
-        with lock(self.occupied) {
-            play_sound(tap, self);
-            sleep(action_ticks);
-            self.is_set = set_state;
-            sim.motive.room += room_gain;
-        }
+        play_sound(tap);
+        sleep(action_ticks);
+        self.is_set = set_state;
+        sim.motive.room += room_gain;
     }
 
     interaction "Set Table" {
         autonomy: 30,
-        attenuation: 0.02,
-        advertises: [
-            room +30 (min: -100),
-        ],
-        guard(sim) => !self.occupied && !self.is_set,
+        advertises: [room +30],
+        lock: self.occupied,
+        guard(sim) => !self.is_set,
         run(sim) {
             toggle_table_setting(sim, true);
-            return true;
         }
     }
 
     interaction "Tidy Table" {
         autonomy: 40,
-        attenuation: 0.02,
-        advertises: [
-            room +35 (min: -100),
-        ],
-        guard(sim) => !self.occupied && self.is_set,
+        advertises: [room +35],
+        lock: self.occupied,
+        guard(sim) => self.is_set,
         run(sim) {
             toggle_table_setting(sim, false);
-            return true;
         }
     }
 }

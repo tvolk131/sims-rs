@@ -14,24 +14,15 @@ pub template SeatBase {
 
     sound creak = preset("wood_creak");
 
-    slot seat_entry {
-        kind: routing,
-        offset: [0.0, -0.75, 0.0],
-        standing: true,
-        sitting: true,
-        ground: true,
-        facing: north,
-    }
+    slot seat_entry = routing([0.0, -0.75, 0.0], sitting: true);
 
-    fn sit_comfort_loop(sim: Sim, completed: &mut i16) {
-        restore_motive_loop(
+    fn sit_comfort_loop(sim: Sim) -> i16 {
+        return restore_motive_loop(
             sim,
             Motive::Comfort,
-            sit_cycles,
-            sit_ticks,
-            comfort_step,
-            100,
-            completed,
+            cycles: sit_cycles,
+            step: comfort_step,
+            ticks: sit_ticks,
         );
     }
 }

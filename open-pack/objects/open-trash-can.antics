@@ -4,7 +4,6 @@ object "Open Pedal Trash Can" {
     guid: 0x7F00_0071;
     price: 45;
     category: misc;
-    attributes: 8;
     description: "A clean-room kitchen pedal bin with dispose and cancel-safe empty loops to keep rooms tidy.";
     sprite: Sprite::procedural("trash_can", primary: #A4AEB6, accent: #C4CED4, trim: #585E66);
 
@@ -19,53 +18,36 @@ object "Open Pedal Trash Can" {
 
     sound lid = preset("soft_thud", wav: "open_trash_lid");
 
-    slot front {
-        kind: routing,
-        offset: [0.0, -0.60, 0.0],
-        standing: true,
-        sitting: false,
-        ground: true,
-        facing: north,
-    }
+    slot front = routing([0.0, -0.60, 0.0]);
 
     interaction "Dispose Trash" {
         autonomy: 40,
-        attenuation: 0.02,
-        advertises: [
-            room +25 (min: -100),
-        ],
-        guard(sim) => !self.occupied && self.trash_count < max_trash,
+        advertises: [room +25],
+        lock: self.occupied,
+        guard(sim) => self.trash_count < max_trash,
         run(sim) {
-            with lock(self.occupied) {
-                play_sound(lid, self);
-                self.trash_count += 1;
-                sim.motive.room += dispose_room_gain;
-            }
-            return true;
+            play_sound(lid);
+            self.trash_count += 1;
+            sim.motive.room += dispose_room_gain;
         }
     }
 
     interaction "Empty Trash" {
         autonomy: 65,
-        attenuation: 0.02,
-        advertises: [
-            room +45 (min: -100),
-        ],
-        guard(sim) => !self.occupied && self.trash_count > 0,
+        advertises: [room +45],
+        lock: self.occupied,
+        guard(sim) => self.trash_count > 0,
         run(sim) {
-            with lock(self.occupied) {
-                play_sound(lid, self);
-                while self.trash_count > 0 cancel_on_abort {
-                    sleep(empty_ticks);
-                    self.trash_count -= 1;
-                }
-                if self.trash_count == 0 {
-                    sim.motive.room += empty_room_gain;
-                    self.times_emptied += 1;
-                    play_sound(lid, self);
-                }
+            play_sound(lid);
+            while self.trash_count > 0 cancel_on_abort {
+                sleep(empty_ticks);
+                self.trash_count -= 1;
             }
-            return true;
+            if self.trash_count == 0 {
+                sim.motive.room += empty_room_gain;
+                self.times_emptied += 1;
+                play_sound(lid);
+            }
         }
     }
 }

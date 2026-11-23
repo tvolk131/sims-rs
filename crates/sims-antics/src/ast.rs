@@ -227,6 +227,13 @@ pub enum CallTarget {
     Name(String),
 }
 
+/// Slot selector for `drop_onto` (`kind == 0` literal slot, `kind != 0` parameter index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotSpec {
+    Literal(i16),
+    Param(i16),
+}
+
 /// High-level boolean condition usable in `if` and `while`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Condition {
@@ -246,6 +253,11 @@ pub enum Condition {
         span: Span,
         prim: PrimitiveCall,
     },
+    RawOp {
+        span: Span,
+        opcode: u16,
+        operands: [u8; 8],
+    },
     Not(Box<Condition>),
 }
 
@@ -264,12 +276,36 @@ pub enum PrimitiveCall {
         operator: u8,
         rhs: OperandRef,
     },
+    Grab,
+    Drop,
+    ChangeSuit {
+        index: u8,
+        scope: u8,
+        remove: bool,
+    },
+    Refresh {
+        target: u16,
+        mode: u16,
+    },
     Random {
         dst: OperandRef,
         range: OperandRef,
     },
+    PushInteraction {
+        menu: u8,
+        object_slot: u8,
+        priority: u8,
+        flags: u8,
+        icon_local: LocalRef,
+    },
     FindBestObject {
         function: u16,
+        flags: u8,
+        origin: Option<OperandRef>,
+    },
+    FindLocation {
+        mode: u8,
+        local: LocalRef,
         flags: u8,
     },
     IdleForInput {
@@ -287,13 +323,31 @@ pub enum PrimitiveCall {
     },
     PlaySound {
         sound_id: u16,
-        use_stack_object: bool,
+        flags: u8,
     },
     AlterBudget {
         amount: OperandRef,
         category: u8,
         /// Bit 0 = test only, bit 1 = income (negate amount).
         flags: u8,
+    },
+    Relationship {
+        column: u8,
+        direction: u8,
+        flags: u8,
+        local: LocalRef,
+        value: OperandRef,
+    },
+    GoToRelative {
+        location: i8,
+        facing: u8,
+        options: u8,
+    },
+    RunTreeByName {
+        table: u16,
+        index: u8,
+        mode: u8,
+        global: bool,
     },
     StopAllSounds {
         use_stack_object: bool,
@@ -310,6 +364,10 @@ pub enum PrimitiveCall {
         dest: Option<OperandRef>,
         local: LocalRef,
     },
+    TestObjectType {
+        guid: u32,
+        object: OperandRef,
+    },
     Dialog {
         kind: u8,
         message: StringRef,
@@ -320,11 +378,26 @@ pub enum PrimitiveCall {
         mode4_str: StringRef,
         flags: u8,
     },
+    TestSimInteractingWith {
+        person: Option<OperandRef>,
+    },
+    SetHeadline {
+        use_stack_object: bool,
+        local: LocalRef,
+        index: u8,
+        kind: u8,
+        duration: i16,
+        options: u16,
+    },
     CreateObject {
         guid: u32,
         mode: u8,
         flags: u8,
         local: LocalRef,
+    },
+    DropOnto {
+        src: SlotSpec,
+        dst: SlotSpec,
     },
     Animate {
         clip_id: u16,
@@ -335,11 +408,24 @@ pub enum PrimitiveCall {
     },
     RouteTo {
         slot: u16,
+        source: u16,
         flags: u8,
     },
     Snap {
         slot: u16,
+        mode: u16,
         flags: u8,
+    },
+    NotifyIdle,
+    ActionString {
+        table: u16,
+        index: u8,
+    },
+    ManageInventory {
+        operation: u8,
+        kind: u8,
+        flags: u16,
+        guid: u32,
     },
 }
 
@@ -360,6 +446,11 @@ pub enum Stmt {
         opcode: u16,
         operands: [u8; 8],
         branches: Branches,
+    },
+    InlineRawOp {
+        span: Span,
+        opcode: u16,
+        operands: [u8; 8],
     },
     Primitive {
         span: Span,

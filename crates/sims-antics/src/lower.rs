@@ -3,7 +3,7 @@
 
 use crate::ast::{
     AssignOp, CallTarget, Condition, Item, LocalRef, Module, Operand, OperandRef, PrimitiveCall,
-    Stmt, StringRef, Target, TreeDecl,
+    SlotSpec, Stmt, StringRef, Target, TreeDecl,
 };
 use crate::error::{Error, Result, Span};
 use crate::ir::{BconChunk, BhavChunk, StringEntry, StringFormat, StringTableChunk};
@@ -217,7 +217,7 @@ struct PendingNode {
 
 #[derive(Debug, Default)]
 struct TreeUsage {
-    only_raw_ops: bool,
+    is_verbatim_explicit: bool,
     has_raw_ops: bool,
     uses_idle: bool,
     uses_param0: bool,
@@ -227,7 +227,7 @@ struct TreeUsage {
 
 fn scan_tree_usage(stmts: &[Stmt]) -> TreeUsage {
     let mut usage = TreeUsage {
-        only_raw_ops: true,
+        is_verbatim_explicit: true,
         ..TreeUsage::default()
     };
     scan_stmts(stmts, &mut usage);
@@ -267,8 +267,48 @@ fn scan_primitive(prim: &PrimitiveCall, usage: &mut TreeUsage) {
             scan_operand(dst, usage);
             scan_operand(range, usage);
         }
+        PrimitiveCall::PushInteraction {
+            object_slot,
+            flags,
+            icon_local,
+            ..
+        } => {
+            if flags & 2 != 0 {
+                let idx = usize::from(*object_slot);
+                usage.max_explicit_local =
+                    Some(usage.max_explicit_local.map_or(idx, |m| m.max(idx)));
+            } else if *object_slot == 0 {
+                usage.uses_param0 = true;
+            }
+            if flags & 1 != 0 {
+                scan_local_ref(icon_local, usage);
+            }
+        }
+        PrimitiveCall::FindBestObject { flags, origin, .. } => {
+            if flags & 8 != 0
+                && let Some(op) = origin
+            {
+                scan_operand(op, usage);
+            }
+        }
+        PrimitiveCall::FindLocation { local, flags, .. } => {
+            if flags & 1 != 0 {
+                scan_local_ref(local, usage);
+            }
+        }
         PrimitiveCall::AlterBudget { amount, .. } => {
             scan_operand(amount, usage);
+        }
+        PrimitiveCall::Relationship {
+            direction,
+            local,
+            value,
+            ..
+        } => {
+            if matches!(direction, 2 | 3) {
+                scan_local_ref(local, usage);
+            }
+            scan_operand(value, usage);
         }
         PrimitiveCall::SetMotiveChange {
             delta_per_hour,
@@ -292,11 +332,29 @@ fn scan_primitive(prim: &PrimitiveCall, usage: &mut TreeUsage) {
                 scan_operand(d, usage);
             }
         }
+        PrimitiveCall::TestObjectType { object, .. } => {
+            scan_operand(object, usage);
+        }
+        PrimitiveCall::TestSimInteractingWith { person: Some(p) } => {
+            scan_operand(p, usage);
+        }
+        PrimitiveCall::SetHeadline {
+            kind, index, local, ..
+        } => {
+            if *kind == 7 && *index == 2 {
+                scan_local_ref(local, usage);
+            }
+        }
         PrimitiveCall::CreateObject { mode, local, .. } => {
             if *mode == 7 {
                 usage.uses_param0 = true;
             } else if *mode == 8 || *mode == 9 {
                 scan_local_ref(local, usage);
+            }
+        }
+        PrimitiveCall::DropOnto { src, dst } => {
+            if matches!(src, SlotSpec::Param(0)) || matches!(dst, SlotSpec::Param(0)) {
+                usage.uses_param0 = true;
             }
         }
         PrimitiveCall::Animate {
@@ -318,6 +376,12 @@ fn scan_primitive(prim: &PrimitiveCall, usage: &mut TreeUsage) {
                 usage.uses_param0 = true;
             }
         }
+        PrimitiveCall::RouteTo { slot, source, .. } if *source == 0 && *slot == 0 => {
+            usage.uses_param0 = true;
+        }
+        PrimitiveCall::Snap { slot, mode, .. } if *mode == 0 && *slot == 0 => {
+            usage.uses_param0 = true;
+        }
         _ => {}
     }
 }
@@ -331,6 +395,9 @@ fn scan_condition(cond: &Condition, usage: &mut TreeUsage) {
         }
         Condition::Call { .. } => {}
         Condition::Primitive { prim, .. } => scan_primitive(prim, usage),
+        Condition::RawOp { .. } => {
+            usage.has_raw_ops = true;
+        }
     }
 }
 
@@ -339,7 +406,7 @@ fn scan_stmts(stmts: &[Stmt], usage: &mut TreeUsage) {
         match stmt {
             Stmt::Label { .. } => {}
             Stmt::Let { span, name, init } => {
-                usage.only_raw_ops = false;
+                usage.is_verbatim_explicit = false;
                 usage.let_decls.push((*span, name.clone()));
                 if let Some(op) = init {
                     scan_operand(op, usage);
@@ -348,20 +415,28 @@ fn scan_stmts(stmts: &[Stmt], usage: &mut TreeUsage) {
             Stmt::RawOp { .. } => {
                 usage.has_raw_ops = true;
             }
-            Stmt::Primitive { prim, .. } => {
-                usage.only_raw_ops = false;
+            Stmt::InlineRawOp { .. } => {
+                usage.is_verbatim_explicit = false;
+                usage.has_raw_ops = true;
+            }
+            Stmt::Primitive { prim, branches, .. } => {
+                if branches.is_none() {
+                    usage.is_verbatim_explicit = false;
+                }
                 scan_primitive(prim, usage);
             }
-            Stmt::Call { .. } => {
-                usage.only_raw_ops = false;
+            Stmt::Call { branches, .. } => {
+                if branches.is_none() {
+                    usage.is_verbatim_explicit = false;
+                }
             }
             Stmt::Assign { lhs, rhs, .. } => {
-                usage.only_raw_ops = false;
+                usage.is_verbatim_explicit = false;
                 scan_operand(lhs, usage);
                 scan_operand(rhs, usage);
             }
             Stmt::Idle { ticks, .. } => {
-                usage.only_raw_ops = false;
+                usage.is_verbatim_explicit = false;
                 usage.uses_idle = true;
                 scan_operand(ticks, usage);
             }
@@ -371,18 +446,18 @@ fn scan_stmts(stmts: &[Stmt], usage: &mut TreeUsage) {
                 else_body,
                 ..
             } => {
-                usage.only_raw_ops = false;
+                usage.is_verbatim_explicit = false;
                 scan_condition(cond, usage);
                 scan_stmts(then_body, usage);
                 scan_stmts(else_body, usage);
             }
             Stmt::While { cond, body, .. } => {
-                usage.only_raw_ops = false;
+                usage.is_verbatim_explicit = false;
                 scan_condition(cond, usage);
                 scan_stmts(body, usage);
             }
             Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Return { .. } => {
-                usage.only_raw_ops = false;
+                usage.is_verbatim_explicit = false;
             }
         }
     }
@@ -400,7 +475,7 @@ struct TreeBuilder<'a> {
     idle_scratch_local: Option<usize>,
     max_allowed_args: usize,
     max_allowed_locals: usize,
-    only_raw_ops: bool,
+    is_verbatim_explicit: bool,
 }
 
 impl<'a> TreeBuilder<'a> {
@@ -411,7 +486,7 @@ impl<'a> TreeBuilder<'a> {
         idle_scratch_local: Option<usize>,
         max_allowed_args: usize,
         max_allowed_locals: usize,
-        only_raw_ops: bool,
+        is_verbatim_explicit: bool,
     ) -> Self {
         Self {
             symbols,
@@ -425,7 +500,7 @@ impl<'a> TreeBuilder<'a> {
             idle_scratch_local,
             max_allowed_args,
             max_allowed_locals,
-            only_raw_ops,
+            is_verbatim_explicit,
         }
     }
 
@@ -558,7 +633,7 @@ impl<'a> TreeBuilder<'a> {
         on_false: PendingTarget,
     ) -> Result<usize> {
         let idx = self.nodes.len();
-        let max_nodes = if self.only_raw_ops {
+        let max_nodes = if self.is_verbatim_explicit {
             usize::from(u16::MAX)
         } else {
             MAX_BHAV_NODES
@@ -644,6 +719,18 @@ impl<'a> TreeBuilder<'a> {
                 let rhs = self.resolve_operand(rhs, span)?;
                 Ok((2, encode_expr_operands(lhs, *operator, rhs)))
             }
+            PrimitiveCall::Grab => Ok((4, [0; 8])),
+            PrimitiveCall::Drop => Ok((5, [0; 8])),
+            PrimitiveCall::ChangeSuit {
+                index,
+                scope,
+                remove,
+            } => Ok((6, [*index, *scope, u8::from(*remove), 0, 0, 0, 0, 0])),
+            PrimitiveCall::Refresh { target, mode } => {
+                let [t0, t1] = target.to_le_bytes();
+                let [m0, m1] = mode.to_le_bytes();
+                Ok((7, [t0, t1, m0, m1, 0, 0, 0, 0]))
+            }
             PrimitiveCall::Random { dst, range } => {
                 let dst = self.resolve_operand(dst, span)?;
                 let range = self.resolve_operand(range, span)?;
@@ -653,9 +740,47 @@ impl<'a> TreeBuilder<'a> {
                 let [rs0, rs1] = u16::from(range.scope).to_le_bytes();
                 Ok((8, [d0, d1, ds0, ds1, r0, r1, rs0, rs1]))
             }
-            PrimitiveCall::FindBestObject { function, flags } => {
+            PrimitiveCall::PushInteraction {
+                menu,
+                object_slot,
+                priority,
+                flags,
+                icon_local,
+            } => {
+                if flags & 2 != 0 {
+                    self.note_operand(Operand::new(25, i16::from(*object_slot)), span)?;
+                } else {
+                    self.note_operand(Operand::new(9, i16::from(*object_slot)), span)?;
+                }
+                let icon_byte = self.resolve_local_ref(icon_local, span, flags & 1 != 0)?;
+                Ok((
+                    13,
+                    [*menu, *object_slot, *priority, *flags, icon_byte, 0, 0, 0],
+                ))
+            }
+            PrimitiveCall::FindBestObject {
+                function,
+                flags,
+                origin,
+            } => {
                 let [f0, f1] = function.to_le_bytes();
-                Ok((14, [f0, f1, 0, 0, 0, 0, *flags, 0]))
+                if flags & 8 != 0 {
+                    let op = origin.as_ref().ok_or_else(|| {
+                        Error::at(
+                            span,
+                            "find_best_object with flag bit 8 requires an 'origin' operand",
+                        )
+                    })?;
+                    let resolved = self.resolve_operand(op, span)?;
+                    let [i0, i1] = resolved.index.to_le_bytes();
+                    Ok((14, [f0, f1, i0, i1, resolved.scope, 0, *flags, 0]))
+                } else {
+                    Ok((14, [f0, f1, 0, 0, 0, 0, *flags, 0]))
+                }
+            }
+            PrimitiveCall::FindLocation { mode, local, flags } => {
+                let local_byte = self.resolve_local_ref(local, span, flags & 1 != 0)?;
+                Ok((16, [*mode, local_byte, *flags, 0, 0, 0, 0, 0]))
             }
             PrimitiveCall::IdleForInput {
                 param_index,
@@ -685,13 +810,9 @@ impl<'a> TreeBuilder<'a> {
                 let [f0, f1] = function.to_le_bytes();
                 Ok((20, [f0, f1, u8::from(*change_icon), 0, 0, 0, 0, 0]))
             }
-            PrimitiveCall::PlaySound {
-                sound_id,
-                use_stack_object,
-            } => {
+            PrimitiveCall::PlaySound { sound_id, flags } => {
                 let [s0, s1] = sound_id.to_le_bytes();
-                let flags = if *use_stack_object { 2 } else { 0 };
-                Ok((23, [s0, s1, 0, 0, flags, 0, 0, 0]))
+                Ok((23, [s0, s1, 0, 0, *flags, 0, 0, 0]))
             }
             PrimitiveCall::AlterBudget {
                 amount,
@@ -716,6 +837,44 @@ impl<'a> TreeBuilder<'a> {
                     25,
                     [scope_sel, amount.scope, i0, i1, *flags, 0, *category, 0],
                 ))
+            }
+            PrimitiveCall::Relationship {
+                column,
+                direction,
+                flags,
+                local,
+                value,
+            } => {
+                let local_byte = self.resolve_local_ref(local, span, matches!(direction, 2 | 3))?;
+                let resolved = self.resolve_operand(value, span)?;
+                let [v0, v1] = resolved.index.to_le_bytes();
+                Ok((
+                    26,
+                    [
+                        *column,
+                        *direction,
+                        *flags,
+                        local_byte,
+                        resolved.scope,
+                        0,
+                        v0,
+                        v1,
+                    ],
+                ))
+            }
+            PrimitiveCall::GoToRelative {
+                location,
+                facing,
+                options,
+            } => Ok((27, [0, 0, *location as u8, *facing, 0, 0, *options, 0])),
+            PrimitiveCall::RunTreeByName {
+                table,
+                index,
+                mode,
+                global,
+            } => {
+                let [t0, t1] = table.to_le_bytes();
+                Ok((28, [t0, t1, u8::from(*global), 0, *index, *mode, 0, 0]))
             }
             PrimitiveCall::StopAllSounds { use_stack_object } => {
                 let target: u16 = u16::from(*use_stack_object);
@@ -793,6 +952,12 @@ impl<'a> TreeBuilder<'a> {
                     ],
                 ))
             }
+            PrimitiveCall::TestObjectType { guid, object } => {
+                let resolved = self.resolve_operand(object, span)?;
+                let [g0, g1, g2, g3] = guid.to_le_bytes();
+                let [i0, i1] = resolved.index.to_le_bytes();
+                Ok((32, [g0, g1, g2, g3, i0, i1, resolved.scope, 0]))
+            }
             PrimitiveCall::Dialog {
                 kind,
                 message,
@@ -826,6 +991,29 @@ impl<'a> TreeBuilder<'a> {
                     ],
                 ))
             }
+            PrimitiveCall::TestSimInteractingWith { person } => match person {
+                None => Ok((37, [0; 8])),
+                Some(op) => {
+                    let resolved = self.resolve_operand(op, span)?;
+                    let [i0, i1] = resolved.index.to_le_bytes();
+                    Ok((37, [1, resolved.scope, i0, i1, 0, 0, 0, 0]))
+                }
+            },
+            PrimitiveCall::SetHeadline {
+                use_stack_object,
+                local,
+                index,
+                kind,
+                duration,
+                options,
+            } => {
+                let local_byte = self.resolve_local_ref(local, span, *kind == 7 && *index == 2)?;
+                let w0 = (u16::from(local_byte) << 1) | u16::from(*use_stack_object);
+                let [w0_lo, w0_hi] = w0.to_le_bytes();
+                let [d0, d1] = duration.to_le_bytes();
+                let [o0, o1] = options.to_le_bytes();
+                Ok((41, [w0_lo, w0_hi, *index, *kind, d0, d1, o0, o1]))
+            }
             PrimitiveCall::CreateObject {
                 guid,
                 mode,
@@ -836,8 +1024,37 @@ impl<'a> TreeBuilder<'a> {
                     self.note_operand(Operand::new(9, 0), span)?;
                 }
                 let local_byte = self.resolve_local_ref(local, span, *mode == 8 || *mode == 9)?;
+                if (*mode == 8 || *mode == 9) && local_byte >= 128 {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "create_object mode {mode} local index {local_byte} exceeds signed i8 range 0..=127"
+                        ),
+                    ));
+                }
                 let [g0, g1, g2, g3] = guid.to_le_bytes();
                 Ok((42, [g0, g1, g2, g3, *mode, *flags, local_byte, 0]))
+            }
+            PrimitiveCall::DropOnto { src, dst } => {
+                let (sk, sv) = match *src {
+                    SlotSpec::Literal(v) => (0i16, v),
+                    SlotSpec::Param(p) => {
+                        self.note_operand(Operand::new(9, p), span)?;
+                        (1i16, p)
+                    }
+                };
+                let (dk, dv) = match *dst {
+                    SlotSpec::Literal(v) => (0i16, v),
+                    SlotSpec::Param(p) => {
+                        self.note_operand(Operand::new(9, p), span)?;
+                        (1i16, p)
+                    }
+                };
+                let [sk0, sk1] = sk.to_le_bytes();
+                let [sv0, sv1] = sv.to_le_bytes();
+                let [dk0, dk1] = dk.to_le_bytes();
+                let [dv0, dv1] = dv.to_le_bytes();
+                Ok((43, [sk0, sk1, sv0, sv1, dk0, dk1, dv0, dv1]))
             }
             PrimitiveCall::Animate {
                 clip_id,
@@ -859,17 +1076,45 @@ impl<'a> TreeBuilder<'a> {
                     [c0, c1, local_byte, 0, *table, *flags, *events as u8, 0],
                 ))
             }
-            PrimitiveCall::RouteTo { slot, flags } => {
-                // Go To Routing Slot (opcode 45): word 0 = slot, word 1 = source
-                // (1 = literal object routing slot; 0 = parameter index), byte 4 = flags.
+            PrimitiveCall::RouteTo {
+                slot,
+                source,
+                flags,
+            } => {
+                // Go To Routing Slot (opcode 45): word 0 = slot/param, word 1 = source
+                // (0 = param, 1 = literal object slot, 2 = global slot), byte 4 = flags.
+                if *source == 0 {
+                    self.note_operand(Operand::new(9, *slot as i16), span)?;
+                }
                 let [s0, s1] = slot.to_le_bytes();
-                Ok((45, [s0, s1, 1, 0, *flags, 0, 0, 0]))
+                let [src0, src1] = source.to_le_bytes();
+                Ok((45, [s0, s1, src0, src1, *flags, 0, 0, 0]))
             }
-            PrimitiveCall::Snap { slot, flags } => {
-                // Snap (opcode 46): word 0 = slot, word 1 = mode
-                // (3 = literal object routing slot; 0 = parameter index), byte 4 = flags.
+            PrimitiveCall::Snap { slot, mode, flags } => {
+                // Snap (opcode 46): word 0 = slot/param, word 1 = mode
+                // (0 = param, 1 = object container 0, 2 = front, 3 = object slot, 4 = global slot),
+                // byte 4 = flags.
+                if *mode == 0 {
+                    self.note_operand(Operand::new(9, *slot as i16), span)?;
+                }
                 let [s0, s1] = slot.to_le_bytes();
-                Ok((46, [s0, s1, 3, 0, *flags, 0, 0, 0]))
+                let [m0, m1] = mode.to_le_bytes();
+                Ok((46, [s0, s1, m0, m1, *flags, 0, 0, 0]))
+            }
+            PrimitiveCall::NotifyIdle => Ok((49, [0; 8])),
+            PrimitiveCall::ActionString { table, index } => {
+                let [t0, t1] = table.to_le_bytes();
+                Ok((50, [t0, t1, 0, 0, *index, 0, 0, 0]))
+            }
+            PrimitiveCall::ManageInventory {
+                operation,
+                kind,
+                flags,
+                guid,
+            } => {
+                let [f0, f1] = flags.to_le_bytes();
+                let [g0, g1, g2, g3] = guid.to_le_bytes();
+                Ok((51, [*operation, *kind, f0, f1, g0, g1, g2, g3]))
             }
         }
     }
@@ -922,11 +1167,23 @@ impl<'a> TreeBuilder<'a> {
     /// Lowers a sequence of statements whose fallthrough exits to `next_target`.
     /// Returns the entry target of this statement sequence.
     fn lower_block(&mut self, stmts: &[Stmt], next_target: PendingTarget) -> Result<PendingTarget> {
-        let has_labels_or_raw = stmts
-            .iter()
-            .any(|s| matches!(s, Stmt::Label { .. } | Stmt::RawOp { .. }));
+        let has_explicit_cfg = stmts.iter().any(|s| {
+            matches!(
+                s,
+                Stmt::Label { .. }
+                    | Stmt::RawOp { .. }
+                    | Stmt::Primitive {
+                        branches: Some(_),
+                        ..
+                    }
+                    | Stmt::Call {
+                        branches: Some(_),
+                        ..
+                    }
+            )
+        });
 
-        if has_labels_or_raw {
+        if has_explicit_cfg {
             return self.lower_linear_block(stmts, next_target);
         }
 
@@ -970,6 +1227,19 @@ impl<'a> TreeBuilder<'a> {
                     let on_true = self.target_from_ast(&branches.on_true, *span);
                     let on_false = self.target_from_ast(&branches.on_false, *span);
                     self.emit(*span, *opcode, *operands, on_true, on_false)?;
+                }
+                Stmt::InlineRawOp {
+                    span,
+                    opcode,
+                    operands,
+                } => {
+                    self.emit(
+                        *span,
+                        *opcode,
+                        *operands,
+                        fallthrough.clone(),
+                        fallthrough.clone(),
+                    )?;
                 }
                 Stmt::Return { span, target } => {
                     // Emit a concrete terminating node so any preceding label points to
@@ -1043,7 +1313,9 @@ impl<'a> TreeBuilder<'a> {
                 && self.nodes.len() > before
                 && matches!(
                     stmt,
-                    Stmt::Primitive { branches: None, .. } | Stmt::Call { branches: None, .. }
+                    Stmt::InlineRawOp { .. }
+                        | Stmt::Primitive { branches: None, .. }
+                        | Stmt::Call { branches: None, .. }
                 )
             {
                 let next_idx = self.nodes.len();
@@ -1052,7 +1324,10 @@ impl<'a> TreeBuilder<'a> {
                     index: next_idx,
                     span: last_node.span,
                 };
-                if matches!(stmt, Stmt::Primitive { branches: None, .. }) {
+                if matches!(
+                    stmt,
+                    Stmt::InlineRawOp { .. } | Stmt::Primitive { branches: None, .. }
+                ) {
                     last_node.on_false = PendingTarget::Node {
                         index: next_idx,
                         span: last_node.span,
@@ -1306,9 +1581,20 @@ impl<'a> TreeBuilder<'a> {
                     span: *span,
                 })
             }
+            Stmt::InlineRawOp {
+                span,
+                opcode,
+                operands,
+            } => {
+                let idx = self.emit(*span, *opcode, *operands, next_target.clone(), next_target)?;
+                Ok(PendingTarget::Node {
+                    index: idx,
+                    span: *span,
+                })
+            }
             Stmt::Label { span, .. } | Stmt::RawOp { span, .. } => Err(Error::at(
                 *span,
-                "labels and raw ops cannot appear inside nested structured blocks",
+                "labels and explicit-branch raw ops cannot appear inside nested structured blocks",
             )),
         }
     }
@@ -1341,6 +1627,11 @@ impl<'a> TreeBuilder<'a> {
                 let (opcode, operands) = self.encode_primitive(prim, *span)?;
                 self.emit(*span, opcode, operands, on_true, on_false)
             }
+            Condition::RawOp {
+                span,
+                opcode,
+                operands,
+            } => self.emit(*span, *opcode, *operands, on_true, on_false),
         }
     }
 
@@ -1487,7 +1778,7 @@ fn lower_tree(tree: &TreeDecl, symbols: &ModuleSymbols) -> Result<BhavChunk> {
         idle_scratch_local,
         max_allowed_args,
         max_allowed_locals,
-        usage.only_raw_ops,
+        usage.is_verbatim_explicit,
     );
     let entry = builder.lower_block(&tree.body, PendingTarget::Resolved(TARGET_TRUE))?;
 
@@ -1515,15 +1806,17 @@ fn lower_tree(tree: &TreeDecl, symbols: &ModuleSymbols) -> Result<BhavChunk> {
         });
     }
 
-    // Verbatim raw-op trees (such as lifted original BHAVs) preserve exact header args/locals.
-    let (args, locals) = if usage.only_raw_ops {
-        (
-            tree.header.args.unwrap_or(0),
-            tree.header.locals.unwrap_or(0),
-        )
-    } else {
-        let locals = match tree.header.locals {
-            Some(declared) => {
+    // Verbatim explicit-branch trees (such as lifted original BHAVs) preserve exact header
+    // `args`/`locals` when explicitly declared (including non-standard high-byte local counts
+    // or 0x8000 header bytes), while still enforcing bounds for any decoded operand accesses.
+    let locals = match tree.header.locals {
+        Some(declared) => {
+            let eff_declared = usize::from(declared as u8).min(max_allowed_locals);
+            if usage.is_verbatim_explicit
+                && (builder.max_local_needed == 0 || eff_declared >= builder.max_local_needed)
+            {
+                declared
+            } else {
                 if usize::from(declared) > max_allowed_locals {
                     return Err(Error::at(
                         tree.span,
@@ -1545,43 +1838,48 @@ fn lower_tree(tree: &TreeDecl, symbols: &ModuleSymbols) -> Result<BhavChunk> {
                 }
                 declared
             }
-            None => builder.max_local_needed as u16,
-        };
+        }
+        None => builder.max_local_needed as u16,
+    };
 
-        let args = match tree.header.args {
-            Some(declared) => {
-                if tree.header.format != 0x8000 {
-                    if usize::from(declared) > max_allowed_args {
-                        return Err(Error::at(
-                            tree.span,
-                            format!(
-                                "tree '{}' declares {declared} args, exceeding format {:#06x}'s \
-                                 limit of {max_allowed_args}",
-                                tree.label, tree.header.format
-                            ),
-                        ));
-                    }
-                    if usize::from(declared) < builder.max_param_needed {
-                        return Err(Error::at(
-                            tree.span,
-                            format!(
-                                "tree '{}' declares {declared} args but requires at least {}",
-                                tree.label, builder.max_param_needed
-                            ),
-                        ));
-                    }
+    let args = match tree.header.args {
+        Some(declared) => {
+            if tree.header.format == 0x8000
+                || (usage.is_verbatim_explicit
+                    && (builder.max_param_needed == 0
+                        || usize::from(declared).min(max_allowed_args) >= builder.max_param_needed))
+            {
+                declared
+            } else {
+                if usize::from(declared) > max_allowed_args {
+                    return Err(Error::at(
+                        tree.span,
+                        format!(
+                            "tree '{}' declares {declared} args, exceeding format {:#06x}'s \
+                             limit of {max_allowed_args}",
+                            tree.label, tree.header.format
+                        ),
+                    ));
+                }
+                if usize::from(declared) < builder.max_param_needed {
+                    return Err(Error::at(
+                        tree.span,
+                        format!(
+                            "tree '{}' declares {declared} args but requires at least {}",
+                            tree.label, builder.max_param_needed
+                        ),
+                    ));
                 }
                 declared
             }
-            None => {
-                if tree.header.format == 0x8000 {
-                    0
-                } else {
-                    builder.max_param_needed as u8
-                }
+        }
+        None => {
+            if tree.header.format == 0x8000 {
+                0
+            } else {
+                builder.max_param_needed as u8
             }
-        };
-        (args, locals)
+        }
     };
 
     Ok(BhavChunk {

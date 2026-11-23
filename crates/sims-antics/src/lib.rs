@@ -36,9 +36,16 @@ pub use compile::{
     package_far,
 };
 pub use error::{Error, Result, Span};
-pub use lift::{format_bhav_air, format_bhav_antics};
+pub use lift::{
+    format_bhav_air, format_bhav_antics, format_bhav_labeled_air,
+    format_bhav_labeled_air_with_arities, format_bhav_raw_air,
+};
 pub use sim_pack::{StandalonePack, compile_standalone_pack_dir};
-pub use structure_lift::{StructuredLiftOutcome, lift_bhav_air_structured, lift_bhav_structured};
+pub use structure_lift::{
+    LiftOptions, StructuredLiftOutcome, lift_bhav_air_structured,
+    lift_bhav_air_structured_with_options, lift_bhav_structured, lift_bhav_structured_with_arities,
+    lift_bhav_structured_with_options,
+};
 pub use v2::{
     ExpandedV2Object, PackResolverConfig, compile_v2_object_file, compile_v2_pack_dir,
     compile_v2_source, expand_v2_to_air,

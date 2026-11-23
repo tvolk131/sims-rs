@@ -135,6 +135,23 @@ fn complete_collection_in_memory_chunk_roundtrip_parity() {
                     );
                     s.compared += 1;
 
+                    // Verify 100% byte-exact decoded labeled-CFG `.air` round-trip across EVERY BHAV
+                    // (including >251-instruction trees, out-of-range `raw(0xHH)` targets, and trailing bytes!).
+                    let source_text = format_bhav_antics(&lifted);
+                    let compiled = compile_antics(&source_text).unwrap_or_else(|e| {
+                        panic!(
+                            "compile_antics failed on decoded labeled-CFG BHAV {loc} #{}: {e}",
+                            chunk.id
+                        )
+                    });
+                    let re_bhav = &compiled.behaviors[&chunk.id];
+                    let encoded_text = encode_bhav(re_bhav).expect("encode_bhav text failed");
+                    assert_bytes_equal(
+                        &encoded_text,
+                        data,
+                        &format!("{loc} BHAV #{} (decoded labeled-CFG .air)", chunk.id),
+                    );
+                    bhav_text_roundtrips += 1;
                     let valid_targets = lifted.instructions.len() <= 251
                         && lifted.instructions.iter().all(|ins| {
                             let ok = |t: u8| {
@@ -143,24 +160,7 @@ fn complete_collection_in_memory_chunk_roundtrip_parity() {
                             };
                             ok(ins.on_true) && ok(ins.on_false)
                         });
-                    if valid_targets {
-                        let source_text = format_bhav_antics(&lifted);
-                        let compiled = compile_antics(&source_text).unwrap_or_else(|e| {
-                            panic!(
-                                "compile_antics failed on lifted BHAV {loc} #{}: {e}",
-                                chunk.id
-                            )
-                        });
-                        let mut re_bhav = compiled.behaviors[&chunk.id].clone();
-                        re_bhav.trailing = lifted.trailing.clone();
-                        let encoded_text = encode_bhav(&re_bhav).expect("encode_bhav text failed");
-                        assert_bytes_equal(
-                            &encoded_text,
-                            data,
-                            &format!("{loc} BHAV #{} (.antics text)", chunk.id),
-                        );
-                        bhav_text_roundtrips += 1;
-                    } else {
+                    if !valid_targets {
                         bhav_text_skipped_invalid_targets += 1;
                     }
                 }
