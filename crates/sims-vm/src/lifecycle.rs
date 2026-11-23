@@ -1154,6 +1154,7 @@ fn purge_orphaned_person(
         }
     }
     world.objects.remove(&id);
+    world.indicator_queues.forget(id);
     world.frame_storage.remove(&id);
     world.headlines.remove(&id);
     world.fires.retain(|&other| other != id);

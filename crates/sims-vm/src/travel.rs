@@ -4956,6 +4956,7 @@ fn strip_person_for_travel_deferred(
         }
     }
     world.objects.remove(&id);
+    world.indicator_queues.forget(id);
     world.frame_storage.remove(&id);
     world.headlines.remove(&id);
     world.fires.retain(|&other| other != id);

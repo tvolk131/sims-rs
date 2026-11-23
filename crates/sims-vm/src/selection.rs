@@ -454,22 +454,27 @@ impl Interpreter<'_> {
     ///
     /// The original walks each queue to the end it had when the walk
     /// began, and the emptying also drops what a refresh queued on the way
-    /// (`legacy/crates/sims-vm/src/indicator_refresh.rs`). A queued person
-    /// leaves the queues when it is removed (0x447d8b), so each one is on
-    /// the lot here; one that is not fails.
+    /// (`legacy/crates/sims-vm/src/indicator_refresh.rs`). A person leaves
+    /// the queues when it is deleted (`sims_sim::IndicatorQueues::forget`),
+    /// so each one is on the lot here; one that is not fails. Should a
+    /// refresh delete a queued person, the walk stops at the shorter end.
     pub(crate) fn refresh_indicators(&self, world: &mut World) -> Result<(), Fault> {
         if !world.indicator_queues.dirty {
             return Ok(());
         }
         let end = world.indicator_queues.dates.len();
         for index in 0..end {
-            let person = world.indicator_queues.dates[index];
+            let Some(&person) = world.indicator_queues.dates.get(index) else {
+                break;
+            };
             self.refresh_date(world, person)?;
         }
         world.indicator_queues.dates.clear();
         let end = world.indicator_queues.stars.len();
         for index in 0..end {
-            let person = world.indicator_queues.stars[index];
+            let Some(&person) = world.indicator_queues.stars.get(index) else {
+                break;
+            };
             self.refresh_star(world, person)?;
         }
         world.indicator_queues.stars.clear();

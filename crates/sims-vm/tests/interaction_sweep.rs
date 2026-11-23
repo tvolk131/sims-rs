@@ -1036,6 +1036,13 @@ fn studio_town_house81_celebrity_pooled_stars_and_downtown_house21_bar_avoid_uns
             if let Err(err) = res {
                 panic!("House81 0xFD4FB8E4 failed at tick {tick}: {err}");
             }
+            // A Sim made famous after it arrives gets its star when the
+            // next frame refreshes the indicators (0x4a8b12 -> 0x4464db).
+            // On this community lot the load reseeds both streams, and the
+            // celebrity summoned arrives at fame 0 and is made famous here.
+            if let Err(err) = interp.draw_frame(&mut world, 1) {
+                panic!("House81 frame failed at tick {tick}: {err}");
+            }
             if world
                 .objects
                 .values()
@@ -1046,7 +1053,7 @@ fn studio_town_house81_celebrity_pooled_stars_and_downtown_house21_bar_avoid_uns
         }
         assert!(
             saw_star_attached,
-            "House81 celebrity arrival must allocate and attach a pooled star marker (0xE9337020)"
+            "a House81 celebrity must get a pooled star marker (0xE9337020)"
         );
     }
 

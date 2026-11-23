@@ -620,10 +620,25 @@ impl IndicatorQueues {
         self.dirty = true;
     }
 
-    /// 0x444962: queues `person` for a star refresh.
+    /// 0x444962: queues `person` for a star refresh. Unlike a date, a
+    /// person already queued is queued again.
     pub fn queue_star(&mut self, person: u16) {
         self.stars.push(person);
         self.dirty = true;
+    }
+
+    /// Drops every entry for `object`, as it is deleted.
+    ///
+    /// **A departure.** The original erases only the first entry of each
+    /// queue, and only for a removal with the interface on (0x447d8b:
+    /// 0x447f2b..0x447f46 and 0x448030..0x448059, then 0x448663). A person
+    /// queued twice for a star (0x444962 does not check), or queued while
+    /// the lot is cleared (0x445f84 empties the star pools at +0xd0 and
+    /// +0xdc, not these), stays queued after it is freed, and the next
+    /// refresh reads freed memory. The port drops such an entry instead.
+    pub fn forget(&mut self, object: u16) {
+        self.dates.retain(|&other| other != object);
+        self.stars.retain(|&other| other != object);
     }
 }
 

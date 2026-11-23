@@ -237,8 +237,8 @@ impl Interpreter<'_> {
         }
         // 0x447ed5..0x447f74 and 0x447fdd..0x448068: a person leaves the
         // indicator refresh queues, the first entry of each that names it
-        // (0x448663 erases one element), so a later frame's refresh does
-        // not read it (`sims_sim::IndicatorQueues`).
+        // (0x448663 erases one element). Any other entry goes when the
+        // object is deleted below (`sims_sim::IndicatorQueues::forget`).
         if interface_enabled && world.objects.get(&id).is_some_and(|o| o.person.is_some()) {
             let queues = &mut world.indicator_queues;
             for queue in [&mut queues.dates, &mut queues.stars] {
@@ -520,6 +520,7 @@ impl Interpreter<'_> {
         // The object's destructor stops its sounds (0x4323c9).
         self.sound(SoundEvent::Stop { object: id as i16 });
         world.objects.remove(&id);
+        world.indicator_queues.forget(id);
         // 0x447d8b -> 0x448097 (`legacy/crates/sims-vm/src/indicator_unregister.rs`):
         // unregister a deleted indicator from `world.indicators` so later
         // selection/deselection never dereferences a missing indicator ID.
@@ -901,6 +902,7 @@ impl Interpreter<'_> {
             }
             // Remove `victim` from `world.objects` and all side tables.
             world.objects.remove(&victim);
+            world.indicator_queues.forget(victim);
             if let Some(marks) = self.deleting {
                 marks.borrow_mut().remove(&victim);
             }
