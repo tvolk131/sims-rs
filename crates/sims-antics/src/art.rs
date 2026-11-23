@@ -20,8 +20,16 @@ pub enum FurnitureShape {
     Bench,
     Cot,
     Basin,
+    Toilet,
+    Sofa,
+    Television,
+    Bookshelf,
     Table,
     Chair,
+    FloorLamp,
+    TrashCan,
+    FrontDoor,
+    Mailbox,
     Box,
     DoubleBed,
     DoubleBedLeft,
@@ -668,6 +676,269 @@ fn shape_geometry(
                 min: [-0.10, 0.14, 0.98],
                 max: [0.10, 0.26, 1.04],
                 base_rgb: trim,
+            },
+        ],
+        FurnitureShape::Toilet => vec![
+            // Porcelain pedestal base
+            IsoBox {
+                min: [-0.18, -0.24, 0.0],
+                max: [0.18, 0.16, 0.26],
+                base_rgb: primary,
+            },
+            // Bowl & seat rim
+            IsoBox {
+                min: [-0.24, -0.32, 0.26],
+                max: [0.24, 0.18, 0.42],
+                base_rgb: primary,
+            },
+            IsoBox {
+                min: [-0.22, -0.30, 0.42],
+                max: [0.22, 0.14, 0.46],
+                base_rgb: accent,
+            },
+            // Rear cistern tank & lid
+            IsoBox {
+                min: [-0.24, 0.14, 0.42],
+                max: [0.24, 0.34, 0.82],
+                base_rgb: primary,
+            },
+            IsoBox {
+                min: [-0.26, 0.12, 0.82],
+                max: [0.26, 0.36, 0.86],
+                base_rgb: accent,
+            },
+            // Chrome flush handle
+            IsoBox {
+                min: [-0.30, 0.18, 0.72],
+                max: [-0.24, 0.24, 0.77],
+                base_rgb: trim,
+            },
+        ],
+        FurnitureShape::Sofa => vec![
+            // Timber plinth base
+            IsoBox {
+                min: [-0.46, -0.34, 0.0],
+                max: [0.46, 0.34, 0.14],
+                base_rgb: trim,
+            },
+            // Plush twin seat cushions
+            IsoBox {
+                min: [-0.40, -0.34, 0.14],
+                max: [-0.01, 0.22, 0.36],
+                base_rgb: primary,
+            },
+            IsoBox {
+                min: [0.01, -0.34, 0.14],
+                max: [0.40, 0.22, 0.36],
+                base_rgb: primary,
+            },
+            // Left and right armrests
+            IsoBox {
+                min: [-0.46, -0.34, 0.14],
+                max: [-0.36, 0.34, 0.50],
+                base_rgb: accent,
+            },
+            IsoBox {
+                min: [0.36, -0.34, 0.14],
+                max: [0.46, 0.34, 0.50],
+                base_rgb: accent,
+            },
+            // High cushioned backrest
+            IsoBox {
+                min: [-0.42, 0.20, 0.36],
+                max: [0.42, 0.36, 0.76],
+                base_rgb: accent,
+            },
+        ],
+        FurnitureShape::Television => vec![
+            // Media stand legs
+            IsoBox {
+                min: [-0.38, -0.26, 0.0],
+                max: [-0.30, -0.18, 0.24],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [0.30, -0.26, 0.0],
+                max: [0.38, -0.18, 0.24],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [-0.38, 0.18, 0.0],
+                max: [-0.30, 0.26, 0.24],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [0.30, 0.18, 0.0],
+                max: [0.38, 0.26, 0.24],
+                base_rgb: trim,
+            },
+            // CRT cabinet housing
+            IsoBox {
+                min: [-0.40, -0.28, 0.24],
+                max: [0.40, 0.28, 0.80],
+                base_rgb: primary,
+            },
+            // Recessed glass screen on front (-y) face
+            IsoBox {
+                min: [-0.32, -0.32, 0.34],
+                max: [0.16, -0.27, 0.72],
+                base_rgb: accent,
+            },
+            // Right-side speaker grille / dial column
+            IsoBox {
+                min: [0.20, -0.31, 0.36],
+                max: [0.34, -0.27, 0.70],
+                base_rgb: trim,
+            },
+        ],
+        FurnitureShape::Bookshelf => vec![
+            // Main upright timber frame
+            IsoBox {
+                min: [-0.42, 0.04, 0.0],
+                max: [0.42, 0.42, 1.18],
+                base_rgb: primary,
+            },
+            // Lower, middle, and upper book rows
+            IsoBox {
+                min: [-0.36, -0.02, 0.16],
+                max: [0.36, 0.10, 0.40],
+                base_rgb: accent,
+            },
+            IsoBox {
+                min: [-0.36, -0.02, 0.48],
+                max: [0.36, 0.10, 0.72],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [-0.36, -0.02, 0.80],
+                max: [0.36, 0.10, 1.04],
+                base_rgb: accent,
+            },
+            // Crown molding top cap
+            IsoBox {
+                min: [-0.45, 0.0, 1.14],
+                max: [0.45, 0.44, 1.22],
+                base_rgb: trim,
+            },
+        ],
+        FurnitureShape::FloorLamp => vec![
+            // Weighted plinth base
+            IsoBox {
+                min: [-0.20, -0.20, 0.0],
+                max: [0.20, 0.20, 0.08],
+                base_rgb: trim,
+            },
+            // Slender upright stem
+            IsoBox {
+                min: [-0.04, -0.04, 0.08],
+                max: [0.04, 0.04, 0.90],
+                base_rgb: trim,
+            },
+            // Lower lampshade tier
+            IsoBox {
+                min: [-0.24, -0.24, 0.86],
+                max: [0.24, 0.24, 1.06],
+                base_rgb: primary,
+            },
+            // Upper tapered lampshade cap
+            IsoBox {
+                min: [-0.16, -0.16, 1.06],
+                max: [0.16, 0.16, 1.18],
+                base_rgb: accent,
+            },
+        ],
+        FurnitureShape::TrashCan => vec![
+            // Base bin cylinder-box
+            IsoBox {
+                min: [-0.20, -0.20, 0.0],
+                max: [0.20, 0.20, 0.48],
+                base_rgb: primary,
+            },
+            // Foot pedal
+            IsoBox {
+                min: [-0.08, -0.26, 0.02],
+                max: [0.08, -0.20, 0.08],
+                base_rgb: trim,
+            },
+            // Rim collar & domed lid
+            IsoBox {
+                min: [-0.23, -0.23, 0.48],
+                max: [0.23, 0.23, 0.56],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [-0.18, -0.18, 0.56],
+                max: [0.18, 0.18, 0.62],
+                base_rgb: accent,
+            },
+        ],
+        FurnitureShape::FrontDoor => vec![
+            // Outer door jamb left & right
+            IsoBox {
+                min: [-0.46, -0.08, 0.0],
+                max: [-0.36, 0.08, 1.24],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [0.36, -0.08, 0.0],
+                max: [0.46, 0.08, 1.24],
+                base_rgb: trim,
+            },
+            // Top lintel
+            IsoBox {
+                min: [-0.46, -0.08, 1.16],
+                max: [0.46, 0.08, 1.26],
+                base_rgb: trim,
+            },
+            // Solid door leaf
+            IsoBox {
+                min: [-0.36, -0.05, 0.0],
+                max: [0.36, 0.05, 1.16],
+                base_rgb: primary,
+            },
+            // Upper glass fanlight inset
+            IsoBox {
+                min: [-0.22, -0.07, 0.72],
+                max: [0.22, 0.07, 1.04],
+                base_rgb: accent,
+            },
+            // Brass doorknob
+            IsoBox {
+                min: [0.22, -0.10, 0.50],
+                max: [0.30, 0.10, 0.58],
+                base_rgb: accent,
+            },
+        ],
+        FurnitureShape::Mailbox => vec![
+            // Wooden post
+            IsoBox {
+                min: [-0.07, -0.07, 0.0],
+                max: [0.07, 0.07, 0.68],
+                base_rgb: trim,
+            },
+            // Cross support bracket
+            IsoBox {
+                min: [-0.14, -0.18, 0.64],
+                max: [0.14, 0.18, 0.70],
+                base_rgb: trim,
+            },
+            // Horizontal mailbox body
+            IsoBox {
+                min: [-0.16, -0.28, 0.70],
+                max: [0.16, 0.28, 0.96],
+                base_rgb: primary,
+            },
+            // Curved/stepped roof crown
+            IsoBox {
+                min: [-0.13, -0.28, 0.96],
+                max: [0.13, 0.28, 1.02],
+                base_rgb: primary,
+            },
+            // Side mail flag arm
+            IsoBox {
+                min: [0.16, -0.16, 0.78],
+                max: [0.22, -0.08, 1.04],
+                base_rgb: accent,
             },
         ],
     }

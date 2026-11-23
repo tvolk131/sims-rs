@@ -552,7 +552,7 @@ fn open_pack_compiles_from_disk_and_all_chunks_and_sprites_validate_without_clip
     let pack = compile_pack_dir(&open_pack_dir()).expect("open-pack compile failed");
     assert_eq!(pack.name, "Open Starter Pack");
     assert_eq!(pack.archive_name, "open-pack.far");
-    assert_eq!(pack.objects.len(), 10);
+    assert_eq!(pack.objects.len(), 20);
 
     // Determinism check: compiling twice yields bit-identical FAR and WAV bytes.
     let pack2 = compile_pack_dir(&open_pack_dir()).expect("second compile failed");
@@ -567,7 +567,7 @@ fn open_pack_compiles_from_disk_and_all_chunks_and_sprites_validate_without_clip
         pack.far_bytes.len() as u64,
     )
     .unwrap();
-    assert_eq!(dir.len(), 10);
+    assert_eq!(dir.len(), 20);
 
     for (member, entry) in pack.objects.iter().zip(&dir) {
         assert_eq!(entry.name, member.iff_name);
@@ -1603,7 +1603,7 @@ fn cli_check_validates_on_disk_open_pack() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Open Starter Pack"));
-    assert!(stdout.contains("10 objects"));
+    assert!(stdout.contains("20 objects"));
 }
 
 #[test]

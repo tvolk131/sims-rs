@@ -1,0 +1,79 @@
+// Open Pedal Trash Can (0x7F00_0071) — cleanliness utility with fill level (attr[1]),
+// dispose action, and cancel-safe empty loop.
+//
+// Attributes (`stack.attr`):
+//   attr[0] = occupancy lock (0 = free, 1 = in use)
+//   attr[1] = trash fill count (0..=max_trash)
+//   attr[2] = total times emptied
+
+bcon 4096 "TrashTuning" {
+    max_trash = 5,
+    empty_ticks = 1,
+    dispose_room_gain = 15,
+    empty_room_gain = 35,
+}
+
+tree 4096 "Init" {
+    my.attr[0] := 0;
+    my.attr[1] := 1;
+    my.attr[2] := 0;
+    return true;
+}
+
+tree 4097 "Main" {
+    return true;
+}
+
+tree 4098 "CanDisposeTrash" {
+    if stack.attr[0] != 0 {
+        return false;
+    }
+    if stack.attr[1] >= bcon.max_trash {
+        return false;
+    }
+    return true;
+}
+
+tree 4099 "CanEmptyTrash" {
+    if stack.attr[0] != 0 {
+        return false;
+    }
+    if stack.attr[1] <= 0 {
+        return false;
+    }
+    return true;
+}
+
+interaction 4100 "DisposeTrash" {
+    stack.attr[0] := 1;
+    play_sound(1, stack_obj);
+    stack.attr[1] += 1;
+    my.motive.room += bcon.dispose_room_gain;
+    stack.attr[0] := 0;
+    return true;
+}
+
+interaction 4101 "EmptyTrash" {
+    stack.attr[0] := 1;
+    play_sound(1, stack_obj);
+
+    while stack.attr[1] > 0 {
+        if my.person.priority == 0 {
+            break;
+        }
+        idle(bcon.empty_ticks);
+        if my.person.priority == 0 {
+            break;
+        }
+        stack.attr[1] -= 1;
+    }
+
+    if stack.attr[1] == 0 {
+        my.motive.room += bcon.empty_room_gain;
+        stack.attr[2] += 1;
+        play_sound(1, stack_obj);
+    }
+
+    stack.attr[0] := 0;
+    return true;
+}

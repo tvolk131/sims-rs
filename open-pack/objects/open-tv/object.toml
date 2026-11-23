@@ -1,0 +1,57 @@
+[object]
+name = "Open Retro Television"
+description = "A clean-room cabinet television with on/off power state and a cancel-safe Fun watch loop."
+guid = 0x7F00_0052
+price = 380
+attributes = 8
+init = "Init"
+main = "Main"
+scripts = ["behavior.antics"]
+
+[sprite]
+shape = "television"
+primary_rgb = [118, 84, 56]
+accent_rgb = [54, 72, 86]
+trim_rgb = [66, 48, 34]
+
+[[interaction]]
+name = "Turn On"
+action = "TurnOnTv"
+guard = "CanTurnOnTv"
+autonomy = 30
+attenuation = 0.02
+
+[[interaction]]
+name = "Turn Off"
+action = "TurnOffTv"
+guard = "CanTurnOffTv"
+autonomy = 20
+attenuation = 0.02
+
+[[interaction]]
+name = "Watch TV"
+action = "WatchTv"
+guard = "CanWatchTv"
+autonomy = 60
+attenuation = 0.02
+motives = [
+    { motive = "fun", min = -100, delta = 75, personality = 0 },
+]
+
+[[slot]]
+kind = 3
+offset = [0.0, -1.25, 0.0]
+standing = 1
+sitting = 1
+ground = 1
+facing = 0
+
+[[sound]]
+id = 1
+name = "open_tv_click"
+preset = "ui_click"
+
+[[sound]]
+id = 2
+name = "open_tv_jingle"
+preset = "chime"
