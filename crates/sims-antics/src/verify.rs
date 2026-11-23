@@ -21,8 +21,8 @@ mod live;
 mod replay;
 pub use iff::{
     IffEquivOptions, IffEquivReport, IffVerdict, Reach, ResourceReport, ResourceVerdict,
-    check_iff_equivalent, check_tree_with_callees, not_run_from_file, runs_from_own_file,
-    same_tree_bytes, single_file_problem, tree_reach,
+    check_iff_equivalent, check_tree_with_callees, library_arities_from_iff, not_run_from_file,
+    runs_from_own_file, same_tree_bytes, single_file_problem, tree_reach,
 };
 pub use live::{GUARANTEED_ATTRIBUTES, LiveContext, LiveOptions, check_bhav_live_equivalent};
 

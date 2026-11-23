@@ -1861,6 +1861,241 @@ fn equiv_checks_the_trees_a_tree_calls() {
     assert!(ok && text.contains("EQUIVALENT"), "{text}");
 }
 
+/// The return path (`interpreter.rs:1640`, `pop_frame`, `release_use`): a tree a
+/// primitive runs as an object use releases it when its frame pops, may end the
+/// running action with its returning node's result, and can fault once its frame is
+/// written to the frame storage. So `--ignore-last-result` and
+/// `--ignore-frame-residue` relax only the checked tree (run by `run_tree`, which
+/// records no use); every tree in its reach is proven with both observed.
+#[test]
+fn reach_trees_observe_their_returns() {
+    let root = air(
+        r#"tree 4096 "Main" { if call 4097(temps) { return true; } return false; }"#,
+        4096,
+    );
+    let file = |callee: BhavChunk| {
+        write_iff(&[bhav_chunk(&root, "Main"), bhav_chunk(&callee, "Callee")]).unwrap()
+    };
+    let verdict = |report: &IffEquivReport, id: u16| {
+        report
+            .resources
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .verdict
+            .clone()
+    };
+    // Callees that return true with different last results, and callees that differ
+    // only in a dead local write.
+    let cases = [
+        (
+            tree(4097, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]),
+            tree(4097, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 1), T, T)]),
+            LiveOptions {
+                observe_last_result: false,
+                ..LiveOptions::default()
+            },
+        ),
+        (
+            tree(4097, 0, 1, vec![expr((LOCAL, 0), SET, (LIT, 3), T, T)]),
+            tree(4097, 0, 1, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]),
+            LiveOptions {
+                observe_frame_residue: false,
+                ..LiveOptions::default()
+            },
+        ),
+    ];
+    for (callee_a, callee_b, live) in cases {
+        let (a, b) = (file(callee_a), file(callee_b));
+        reach_verdicts(&a, &b, live, 4096, 4097);
+    }
+    // Review P2-3: callee 4097 leaves local 0 as 1 or 2, and 4098, the same on both
+    // sides, reads it before writing it.
+    let calls = tree(
+        4096,
+        0,
+        0,
+        vec![prim(4097, [0; 8], 1, 1), prim(4098, [0; 8], T, T)],
+    );
+    let leaves = |value| tree(4097, 0, 1, vec![expr((LOCAL, 0), SET, (LIT, value), T, T)]);
+    let reads = tree(4098, 0, 1, vec![expr((TEMP, 0), SET, (LOCAL, 0), T, T)]);
+    let two_calls = |callee: BhavChunk| {
+        write_iff(&[
+            bhav_chunk(&calls, "Main"),
+            bhav_chunk(&callee, "Leaves"),
+            bhav_chunk(&reads, "Reads"),
+        ])
+        .unwrap()
+    };
+    reach_verdicts(
+        &two_calls(leaves(1)),
+        &two_calls(leaves(2)),
+        LiveOptions {
+            observe_frame_residue: false,
+            ..LiveOptions::default()
+        },
+        4096,
+        4097,
+    );
+    // Review P2-2: a tree with a primitive may be run by it as an object use, so its
+    // own last result counts even with `--ignore-last-result`.
+    let own = |test: Instruction| {
+        write_iff(&[bhav_chunk(
+            &tree(4096, 0, 0, vec![prim(3, [0; 8], 1, 1), test]),
+            "Main",
+        )])
+        .unwrap()
+    };
+    let (a, b) = (
+        own(expr((LIT, 0), EQ, (LIT, 0), T, T)),
+        own(expr((LIT, 0), EQ, (LIT, 1), T, T)),
+    );
+    let relaxed = LiveOptions {
+        observe_last_result: false,
+        ..LiveOptions::default()
+    };
+    for tree in [None, Some(4096)] {
+        let opts = IffEquivOptions {
+            tree,
+            live: relaxed,
+            ..IffEquivOptions::default()
+        };
+        let report = check_iff_equivalent(&a, &b, &opts).expect("check");
+        match verdict(&report, 4096) {
+            ResourceVerdict::Inconclusive { why } => {
+                assert!(why.contains("object use"), "{why}");
+            }
+            other => panic!("expected Inconclusive, got {other:?}"),
+        }
+    }
+    // The same through `check_tree_with_callees` (`equiv`'s check), with two files.
+    let trees = |test: Instruction| {
+        std::collections::BTreeMap::from([(
+            4096,
+            tree(4096, 0, 0, vec![prim(3, [0; 8], 1, 1), test]),
+        )])
+    };
+    let (ta, tb) = (
+        trees(expr((LIT, 0), EQ, (LIT, 0), T, T)),
+        trees(expr((LIT, 0), EQ, (LIT, 1), T, T)),
+    );
+    let arities = std::collections::BTreeMap::new();
+    let (_, result) = sims_antics::verify::check_tree_with_callees(
+        4096,
+        &ta,
+        Some(&a),
+        &tb,
+        Some(&b),
+        (&arities, &arities),
+        &EquivOptions::default(),
+        &relaxed,
+    );
+    match result {
+        EquivResult::Inconclusive { reason } => assert!(reason.contains("object use"), "{reason}"),
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+    // Without the primitive, the flag holds.
+    let plain = |test: Instruction| {
+        write_iff(&[bhav_chunk(&tree(4096, 0, 0, vec![test]), "Main")]).unwrap()
+    };
+    let report = check_iff_equivalent(
+        &plain(expr((LIT, 0), EQ, (LIT, 0), T, T)),
+        &plain(expr((LIT, 0), EQ, (LIT, 1), T, T)),
+        &IffEquivOptions {
+            live: relaxed,
+            ..IffEquivOptions::default()
+        },
+    )
+    .expect("check");
+    assert!(
+        matches!(verdict(&report, 4096), ResourceVerdict::Equivalent { .. }),
+        "{report:#?}"
+    );
+    reach_cli(file);
+}
+
+/// Whole-file verdicts for `root` and `callee` under `live`: the callee is proven on its
+/// own, its caller is undecided.
+fn reach_verdicts(a: &[u8], b: &[u8], live: LiveOptions, root: u16, callee: u16) {
+    let verdict = |report: &IffEquivReport, id: u16| {
+        report
+            .resources
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .verdict
+            .clone()
+    };
+    {
+        for tree in [None, Some(root)] {
+            let opts = IffEquivOptions {
+                tree,
+                live,
+                ..IffEquivOptions::default()
+            };
+            let report = check_iff_equivalent(a, b, &opts).expect("check");
+            match verdict(&report, root) {
+                ResourceVerdict::Inconclusive { why } => {
+                    assert!(why.contains(&format!("may run tree #{callee}")), "{why}");
+                }
+                other => panic!("expected Inconclusive, got {other:?}"),
+            }
+            if tree.is_none() {
+                // The flag still holds for the callee checked on its own.
+                assert!(
+                    matches!(verdict(&report, callee), ResourceVerdict::Equivalent { .. }),
+                    "{report:#?}"
+                );
+            }
+        }
+    }
+}
+
+/// `equiv` (`check_tree_with_callees`) for [`reach_trees_observe_their_returns`].
+fn reach_cli(file: impl Fn(BhavChunk) -> Vec<u8>) {
+    // `equiv` (`check_tree_with_callees`): a source whose callee returns true from a
+    // true test, against a file whose callee returns true from a false one.
+    let dir = scratch_dir("equiv-reach-returns");
+    let source = dir.join("a.antics");
+    std::fs::write(
+        &source,
+        r#"tree 4096 "Main" { if call 4097(temps) { return true; } return false; }
+tree 4097 "Callee" { return true; }
+"#,
+    )
+    .unwrap();
+    let iff = dir.join("b.iff");
+    std::fs::write(
+        &iff,
+        file(tree(4097, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 1), T, T)])),
+    )
+    .unwrap();
+    let equiv = |tree: &str| {
+        let out = cli()
+            .arg("equiv")
+            .arg(&source)
+            .arg(&iff)
+            .args(["--tree", tree, "--ignore-last-result"])
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let (ok, text) = equiv("4097");
+    assert!(ok && text.contains("EQUIVALENT"), "{text}");
+    let (ok, text) = equiv("4096");
+    assert!(
+        !ok && text.contains("INCONCLUSIVE") && text.contains("tree #4097"),
+        "{text}"
+    );
+}
+
 /// In whole-file mode a tree is the same only if every tree it may run is: an
 /// identical tree that calls an undecided one is undecided too, alone (`--tree`) or
 /// with the whole file.
@@ -1981,6 +2216,89 @@ fn missing_node_faults_carry_the_tree_length() {
     let mut odd = short.clone();
     odd.format = 0x8003;
     assert_inconclusive(&live(&short, &odd));
+}
+
+/// Review P1-1 and P2-4: `--global` and `--semi-global` supply argument counts as the
+/// VM's loader keeps the trees (`program.rs:588`: physical order, deleted chunks
+/// included, the last copy of an ID winning), only for their own range, and two
+/// libraries that disagree on a tree are refused.
+#[test]
+fn library_arities_follow_the_loader() {
+    let dir = scratch_dir("library-arities");
+    // Tree 4096 calls `callee` with inline arguments; the node after the call is never
+    // run and differs between the files. With six arguments the call reads into it.
+    let object = |callee: u16, next: Instruction| {
+        write_iff(&[bhav_chunk(
+            &tree(4096, 0, 0, vec![prim(callee, [0; 8], T, T), next]),
+            "Main",
+        )])
+        .unwrap()
+    };
+    let library = |chunks: &[(u16, u8, u16)]| {
+        let chunks: Vec<ChunkData> = chunks
+            .iter()
+            .map(|&(id, args, flags)| ChunkData {
+                flags,
+                ..bhav_chunk(
+                    &tree(id, args, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]),
+                    "Lib",
+                )
+            })
+            .collect();
+        write_iff(&chunks).unwrap()
+    };
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    let run = |callee: u16, libraries: &[(&str, &std::path::Path)]| {
+        let pa = write("a.iff", &object(callee, expr((LIT, 0), EQ, (LIT, 0), T, T)));
+        let pb = write("b.iff", &object(callee, prim(3, [0; 8], T, T)));
+        let mut cmd = cli();
+        cmd.arg("verify-equiv").arg(&pa).arg(&pb);
+        for (flag, path) in libraries {
+            cmd.arg(flag).arg(path);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    const LIVE: u16 = 0x10;
+    const DELETED: u16 = 0x10 | 0x04;
+    // A live copy with two arguments, then a deleted one with six: the VM keeps the
+    // second. So do two live copies.
+    for later in [DELETED, LIVE] {
+        let lib = write("global.iff", &library(&[(300, 2, LIVE), (300, 6, later)]));
+        let (code, text) = run(300, &[("--global", &lib)]);
+        assert_eq!(code, Some(2), "{text}");
+    }
+    // The other way round, the call reads two arguments, inside its own operands.
+    let lib = write("global.iff", &library(&[(300, 6, DELETED), (300, 2, LIVE)]));
+    let (code, text) = run(300, &[("--global", &lib)]);
+    assert_eq!(code, Some(0), "{text}");
+    // A library supplies only its own range: a semi-global file's #300, or a global
+    // file's #8192, says nothing, so the arity stays unknown.
+    let none = write("none.iff", &library(&[(300, 0, LIVE), (8192, 0, LIVE)]));
+    let (code, text) = run(300, &[("--global", &none)]);
+    assert_eq!(code, Some(0), "{text}");
+    let (code, text) = run(300, &[("--semi-global", &none)]);
+    assert_eq!(code, Some(2), "{text}");
+    let (code, text) = run(8192, &[("--semi-global", &none)]);
+    assert_eq!(code, Some(0), "{text}");
+    let (code, text) = run(8192, &[("--global", &none)]);
+    assert_eq!(code, Some(2), "{text}");
+    // Two libraries that disagree on a tree cannot both be the game's.
+    let other = write("other.iff", &library(&[(300, 6, LIVE)]));
+    let (code, text) = run(300, &[("--global", &none), ("--global", &other)]);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("library tree #300"), "{text}");
 }
 
 /// Round 6, fault inventory: a fault names its tree, and any tree can fault on entry

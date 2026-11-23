@@ -29,7 +29,7 @@ pub struct IffEquivOptions {
     pub lockstep: EquivOptions,
     /// Bounds and observation policy for the live-output checker.
     pub live: LiveOptions,
-    /// Attributes the objects running these trees are known to have (see
+    /// Attributes whatever runs these trees as `me` is known to have (see
     /// [`LiveContext::my_attribute_count`]).
     pub my_attribute_count: usize,
     /// Compare only this `BHAV`.
@@ -233,6 +233,37 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
             verdicts.insert(ca.id, (verdict, notes));
         }
     }
+    // As a tree in another's reach, each tree must be proven under the stricter
+    // policy (see [`dependency_options`]).
+    let strict = IffEquivOptions {
+        live: dependency_options(&opts.live),
+        ..opts.clone()
+    };
+    let mut dependency_verdicts = verdicts.clone();
+    if strict.live != opts.live {
+        for (ca, cb) in iff_a.chunks.iter().zip(&iff_b.chunks) {
+            if &ca.tag == b"BHAV"
+                && runs_from_own_file(ca.id)
+                && matches!(
+                    verdicts.get(&ca.id),
+                    Some((ResourceVerdict::Equivalent { .. }, _))
+                )
+            {
+                let verdict = compare_bhav(
+                    ca.id,
+                    ca,
+                    cb,
+                    &iff_a,
+                    &iff_b,
+                    &ctx_a,
+                    &ctx_b,
+                    &strict,
+                    &mut Vec::new(),
+                );
+                dependency_verdicts.insert(ca.id, (verdict, Vec::new()));
+            }
+        }
+    }
     for ca in &iff_a.chunks {
         let is_bhav = &ca.tag == b"BHAV";
         if is_bhav && opts.tree.is_some_and(|tree| ca.id != tree) {
@@ -241,7 +272,14 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         let (verdict, notes) = if is_bhav && runs_from_own_file(ca.id) {
             let (verdict, notes) = verdicts[&ca.id].clone();
             (
-                needs_callees(ca.id, verdict, &ids, &trees_a, &trees_b, &verdicts),
+                needs_callees(
+                    ca.id,
+                    verdict,
+                    &ids,
+                    &trees_a,
+                    &trees_b,
+                    &dependency_verdicts,
+                ),
                 notes,
             )
         } else if is_bhav {
@@ -268,6 +306,25 @@ fn lift_all(iff: &Iff) -> BTreeMap<u16, BhavChunk> {
         .collect()
 }
 
+/// The observation policy a tree in another tree's reach is proven under: the
+/// caller's, except that the last result and the frame residue are always observed.
+///
+/// `--ignore-last-result` and `--ignore-frame-residue` describe how the checked tree is
+/// run: by `run_tree`, whose frame records no object use, so its return releases none
+/// and cannot fault once its frame is written (`interpreter.rs:1230`,
+/// `object_uses.rs:128`). A tree in its reach may instead be run by a primitive as an
+/// object use (Run Tree By Name in mode 2, `count_use`). Its return then releases the
+/// use, may end the running action with the returning node's result
+/// (`Machine::end_action`), and can fault after its frame is written to the frame
+/// storage, so both are observable there.
+fn dependency_options(live: &LiveOptions) -> LiveOptions {
+    LiveOptions {
+        observe_last_result: true,
+        observe_frame_residue: true,
+        ..*live
+    }
+}
+
 /// `verdict` for tree `id`, unless a tree it may run was not shown to behave the same.
 ///
 /// Both checkers treat a call (and a primitive that runs a tree) as an event: equal
@@ -291,11 +348,21 @@ fn needs_callees(
         return verdict;
     }
     let reach = tree_reach(id, ids, trees_a, trees_b);
-    for dep in reach.trees.iter().filter(|&&t| t != id) {
+    // With a primitive in reach, the tree itself may be run as an object use too.
+    for dep in reach.trees.iter().filter(|&&t| t != id || reach.opaque) {
         match verdicts.get(dep).map(|(v, _)| v) {
             Some(ResourceVerdict::Identical | ResourceVerdict::Equivalent { .. }) => {}
             Some(ResourceVerdict::Different { .. } | ResourceVerdict::Inconclusive { .. })
             | None => {
+                if *dep == id {
+                    return ResourceVerdict::Inconclusive {
+                        why: format!(
+                            "a primitive in the reach of tree #{id} may run it as an object \
+                             use, whose return records its last result and frame, and it was \
+                             not shown to behave the same with those observed"
+                        ),
+                    };
+                }
                 return ResourceVerdict::Inconclusive {
                     why: format!(
                         "tree #{id} may run tree #{dep}{}, which was not shown to behave \
@@ -467,6 +534,20 @@ pub fn check_tree_with_callees(
             ));
         }
     }
+    let strict = dependency_options(live);
+    if reach.opaque
+        && strict != *live
+        && !matches!(
+            check_bhav_equivalent_combined(ra, &ctx_a, rb, &ctx_b, lockstep, &strict).1,
+            EquivResult::Equivalent { .. }
+        )
+    {
+        return inconclusive(format!(
+            "a primitive in the reach of tree #{root} may run it as an object use, whose \
+             return records its last result and frame, and it was not shown to behave the \
+             same with those observed"
+        ));
+    }
     for dep in reach.trees.iter().filter(|&&t| t != root) {
         let (Some(da), Some(db)) = (a.get(dep), b.get(dep)) else {
             return inconclusive(format!(
@@ -479,7 +560,7 @@ pub fn check_tree_with_callees(
         }
         let proven = super::live::frame_dims(da).0 == super::live::frame_dims(db).0
             && matches!(
-                check_bhav_equivalent_combined(da, &ctx_a, db, &ctx_b, lockstep, live).1,
+                check_bhav_equivalent_combined(da, &ctx_a, db, &ctx_b, lockstep, &strict).1,
                 EquivResult::Equivalent { .. }
             );
         if !proven {
@@ -506,16 +587,43 @@ fn arities(iff: &Iff, extra: &BTreeMap<u16, usize>) -> BTreeMap<u16, usize> {
         .filter(|&(&id, _)| !runs_from_own_file(id))
         .map(|(&id, &n)| (id, n))
         .collect();
-    for chunk in iff
-        .chunks
-        .iter()
-        .filter(|c| &c.tag == b"BHAV" && runs_from_own_file(c.id))
-    {
-        if let Ok(bhav) = Behavior::parse(iff.data(chunk)) {
-            map.insert(chunk.id, bhav_param_limit(&bhav));
-        }
-    }
+    map.extend(
+        loaded_arities(iff)
+            .into_iter()
+            .filter(|&(id, _)| runs_from_own_file(id))
+            .filter_map(|(id, n)| Some((id, n?))),
+    );
     map
+}
+
+/// The argument count of each tree of a file as the VM's loader keeps the trees
+/// (`load_library_with_pool`, `program.rs:588`): every `BHAV` chunk in physical order,
+/// deleted ones included, the last copy of an ID replacing the earlier ones. `None`
+/// when that last copy does not parse (the loader then refuses the file, so the count
+/// is unknown).
+fn loaded_arities(iff: &Iff) -> BTreeMap<u16, Option<usize>> {
+    iff.chunks
+        .iter()
+        .filter(|c| &c.tag == b"BHAV")
+        .map(|c| {
+            (
+                c.id,
+                Behavior::parse(iff.data(c))
+                    .ok()
+                    .map(|bhav| bhav_param_limit(&bhav)),
+            )
+        })
+        .collect()
+}
+
+/// [`loaded_arities`] of a library file (`--global`, `--semi-global`, or the file a
+/// source is compared against).
+///
+/// # Errors
+///
+/// When the file is not an IFF.
+pub fn library_arities_from_iff(iff_bytes: &[u8]) -> Result<BTreeMap<u16, Option<usize>>> {
+    Ok(loaded_arities(&Iff::parse(iff_bytes.to_vec())?))
 }
 
 fn bcons(iff: &Iff) -> BTreeMap<u16, Vec<i16>> {

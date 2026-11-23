@@ -25,7 +25,7 @@ use sims_antics::{
     v2::is_v2_source,
     verify::{
         check_tree_with_callees, extract_bhav_arities_from_iff, extract_bhav_from_iff,
-        single_file_problem,
+        library_arities_from_iff, single_file_problem,
     },
     verify_object_safety, verify_pack_safety,
 };
@@ -161,8 +161,13 @@ fn print_usage() {
              (files must differ in BHAV bodies alone; DIFFERENT needs a sims-vm replay that ends differently;\n    \
               EQUIVALENT assumes neither run exhausts the VM instruction budget; the same holds for equiv;\n    \
               a tree is EQUIVALENT only if every tree it may run is the same bytes or proven equivalent too;\n    \
+              --ignore-last-result and --ignore-frame-residue relax the named tree only: the trees it may run are\n    \
+              proven with both observed, since a primitive may run one as an object use whose return records them;\n    \
               only private trees, 4096 to 8191, are run from an object's file: --global and --semi-global\n    \
-              name the libraries calls to 256-4095 and 8192 and up run)\n  \
+              name the libraries calls to 256-4095 and 8192 and up run; they are trusted to be the game's,\n    \
+              and two that disagree on a tree are refused;\n    \
+              --my-attributes is the attribute count of whatever runs as me, which call_as may make another\n    \
+              object than the one whose file holds the tree: give the smallest count of anything that runs it)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>"
     );
@@ -1540,7 +1545,13 @@ fn run() -> Result<(), CliError> {
             // Each side calls the trees of its own file: the compiled source's for A,
             // the IFF's for B. A callee only one side defines has an unknown argument
             // count on the other, which the checkers treat as a possible difference.
-            let arities_b = extract_bhav_arities_from_iff(&iff_bytes).unwrap_or_default();
+            // As the VM's loader keeps them (`program.rs:588`).
+            let arities_b: std::collections::BTreeMap<u16, usize> =
+                library_arities_from_iff(&iff_bytes)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(id, n)| Some((id, n?)))
+                    .collect();
             let arities_a: std::collections::BTreeMap<u16, usize> = behaviors
                 .iter()
                 .map(|(&id, bhav)| {
@@ -1767,7 +1778,7 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
                         .map_err(|_| format!("invalid --my-attributes count '{v}'"))?;
                     if n < sims_antics::GUARANTEED_ATTRIBUTES {
                         return Err(format!(
-                            "--my-attributes must be at least {} (every object has that many)",
+                            "--my-attributes must be at least {} (whatever runs as me has that many)",
                             sims_antics::GUARANTEED_ATTRIBUTES
                         )
                         .into());
@@ -1817,20 +1828,49 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
         Ok(read_bounded_iff_file(path, file, len, hdr)?)
     };
     // Each library supplies only its own range (`program.rs:1015`): the global file
-    // trees 256 to 4095, a semi-global file 8192 and up.
+    // trees 256 to 4095, a semi-global file 8192 and up, with the argument counts the
+    // VM's loader keeps. The files are trusted to be the libraries the game loads; two
+    // that disagree on a tree cannot both be, so that is an error.
+    let mut library: std::collections::BTreeMap<u16, (Option<usize>, PathBuf)> =
+        std::collections::BTreeMap::new();
     for (extra, semi) in &with {
         let bytes = read(extra)?;
-        let arities = extract_bhav_arities_from_iff(&bytes)
-            .map_err(|e| format!("{}: {e}", extra.display()))?;
-        opts.extra_arities
-            .extend(arities.into_iter().filter(|&(id, _)| {
-                if *semi {
-                    id >= 8192
-                } else {
-                    (256..=4095).contains(&id)
-                }
-            }));
+        let arities =
+            library_arities_from_iff(&bytes).map_err(|e| format!("{}: {e}", extra.display()))?;
+        let in_range = |id: u16| {
+            if *semi {
+                id >= 8192
+            } else {
+                (256..=4095).contains(&id)
+            }
+        };
+        for (id, argc) in arities.into_iter().filter(|&(id, _)| in_range(id)) {
+            if let Some((seen, from)) = library.get(&id)
+                && *seen != argc
+            {
+                let count = |n: &Option<usize>| {
+                    n.map_or_else(
+                        || "an unparseable tree".to_owned(),
+                        |n| format!("{n} arguments"),
+                    )
+                };
+                return Err(format!(
+                    "library tree #{id} has {} in {} but {} in {}",
+                    count(seen),
+                    from.display(),
+                    count(&argc),
+                    extra.display()
+                )
+                .into());
+            }
+            library.insert(id, (argc, extra.clone()));
+        }
     }
+    opts.extra_arities.extend(
+        library
+            .into_iter()
+            .filter_map(|(id, (argc, _))| Some((id, argc?))),
+    );
     let (a, b) = (read(&path_a)?, read(&path_b)?);
     let report = check_iff_equivalent(&a, &b, &opts).map_err(|e| e.to_string())?;
 

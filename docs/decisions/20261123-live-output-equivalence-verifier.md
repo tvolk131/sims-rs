@@ -49,11 +49,14 @@ callee resolution exactly as `program.rs` does it.
   a faulting path, over-approximating freely.
 - **A tree is only as equivalent as the trees it may run.** Every tree in its
   reach must be the same bytes on both sides or itself proven equivalent.
-- **Callees resolve as in the VM.** Only private trees (4096 to 8191) run from
-  an object's file; 256 to 4095 come from the global library and 8192 and up
-  from the semi-global one (`program.rs:1015`). A file's own copy of a library
-  tree never supplies an argument count, a body or a replay, and `--tree`
-  refuses one.
+- **Callees resolve by the VM's ranges, from trusted library inputs.** Only
+  private trees (4096 to 8191) run from an object's file; 256 to 4095 come
+  from the global library and 8192 and up from the semi-global one
+  (`program.rs:1015`). A file's own copy of a library tree never supplies an
+  argument count, a body or a replay, and `--tree` refuses one. The library
+  files given with `--global` and `--semi-global` are trusted to be the ones
+  the game loads; their argument counts are read the way the VM's loader
+  reads them, and two files that disagree on a tree are refused.
 - **Whole files are compared only when they differ in BHAV bodies alone.**
   Every other byte must be identical: the file header, each chunk header
   (label field included), every non-BHAV payload, and the resource map apart
@@ -78,6 +81,11 @@ callee resolution exactly as `program.rs` does it.
   per-node faulting path would forbid every dummy node. Faults of the world
   that come before the first node (a full stack, no frame storage) are the
   same on both sides and need no assumption.
+- **Scope: a synchronous `run_tree`.** The verdict is about the tree run to
+  its return by `Interpreter::run_tree`, as the replay runs it. Soundness
+  is claimed for that only, not for a thread that `turn` or `step` runs,
+  yields and resumes on a later tick, where the world may change between
+  ticks.
 
 ### 1. Live-output checker (`verify/live.rs`, `check_bhav_live_equivalent`)
 
@@ -195,7 +203,12 @@ mismatches, and corners nobody has found yet.
 One consequence: the replay world has no person and no action, so it cannot
 observe the last result (`object_uses.rs:246` records it only for a person
 with uses). A difference in the last result alone is therefore always
-`Inconclusive`, not a counterexample.
+`Inconclusive`, not a counterexample. That record is a world effect, not
+only thread state: when a tree that a primitive runs as an object use
+returns, `release_use` ends the action with that tree's last result (flag
+0x20 in the person's action). So `--ignore-last-result` may hide a real
+difference, and it relaxes only a tree that nothing in the checked reach can
+run that way (see [Policies](#policies-and-why)).
 
 Everything else is `Inconclusive` too. This includes:
 
@@ -310,7 +323,15 @@ Handling:
 | branch to node ≤ 250 past the end | `InvalidBranch { target, count }`, after setting the last result | Exact: `Exit::BadNode(target, count)`, at the branching node with the last result (round 6 added `count`) |
 | branch to 253 | `ErrorBranch` | Exact: `Exit::Error` at the branching node |
 | branch to 251 or 252 | native 0x44c | Exact: `Exit::Trap(0x44c)` |
-| return, then the caller's branch | `InvalidBranch` with the caller's `count`, `ErrorBranch`, 0x44c | Exact: the call node's own branch exits, as above |
+| **Returns** (`branch`, `interpreter.rs:1640`; `pop_frame`, `interpreter.rs:1233`) | | |
+| writing the return target into the frame's node word | none (`frame_mut` of the running frame) | Cannot happen: the returning frame is on the stack |
+| where a return's fault points | `Fault.at` is the top frame when the trap is raised (`interpreter.rs:809`) | Before the pop (`sync_top_frame`) it is the returning frame at node 254 or 255. After the pop (`release_use`, the caller's `current_cached`, its primitive state, its branch) it is the caller's frame at its call node, or for the checked tree's own return the frame below `run_tree`'s base, which is the same on both sides. Each row below says why default options cover it |
+| `pop_frame` → `sync_top_frame` (`interpreter.rs:1100`) | native 10 missing object; `Invalid` frames and frame-storage offsets out of step | Missing object: assumption (world faults). Out of step: cannot happen, since `push_frame`, `pop_frame` and `clear_frames` change both together. The write itself cannot fail, and puts the frame's parameters and locals in the frame storage (observed as residue by default). `Fault.at` would be the returning frame at 254 or 255, but no fault is raised |
+| `pop_frame` → `release_use` → `end_action` → `set_action` (`object_uses.rs:128`) | `Invalid` (the used object is gone, no data word 62, no person word 73), native 0x1c | The checked tree's return: cannot happen. `run_tree` records no object use for its frame, and every use's depth is at most the stack's length (each pop releases a deeper one), so no use ends there. A `call` frame records none either. A tree a primitive runs as an object use (Run Tree By Name in mode 2, `count_use`) does release one when it returns: it may end the action with its returning node's result, and can fail after its frame is written to the frame storage. That happens inside the primitive's run, so it is the primitive's fault path at the primitive's node, and that tree is in the reach. Trees in the reach are always proven with the last result and the frame residue observed, whatever `--ignore-last-result` and `--ignore-frame-residue` say (round 7, `dependency_options`), and when the reach holds a primitive the checked tree itself is too, since the primitive may run it. `Fault.at`: the checked tree's return raises none; a call's callee raises none; a primitive's object use faults inside the primitive, so it is the primitive's fault path, compared with the whole state before the primitive by default and by every option |
+| after a call returns: the last result, then `current_cached` for the caller (`resolve_active_frame` after the pop clears its cache) | `Invalid`, `MissingTree`, native 0x44c | Cannot happen: the caller's frame resolved to the same tree and node when the call ran, and a primitive that changes the world in between is the callee's event, the same on both sides. `Fault.at` would be the caller at its call node; the checked tree's own return never gets here (`stack_len <= base` returns first) |
+| after a call returns: a nonzero primitive state in the caller | `Unsupported` "return into a primitive with saved state" | Cannot happen for a call: the call node runs with state 0 and `call` sets none. For a primitive that runs a tree (Run Tree By Name, Idle For Input, routing), part of that primitive's fault path, with `Fault.at` at the primitive's node, which its event records. Not affected by any option |
+| the caller's branch after a return | `InvalidBranch` with the caller's `count`, `ErrorBranch`, 0x44c, or a further return | Exact: the call node's own branch exits, as above, with `Fault.at` at the call node; a further return pops the caller (these rows again) |
+| the checked tree's own return | `Ok(value)`; the thread's last result becomes `value` after the pop | Exact: `Exit::True` or `Exit::False`. The returning node's result, which the pop sees first, is the observed last result |
 | budget | `BudgetExhausted` | Assumption (instruction budget) |
 | **Calls** (`call`, `interpreter.rs:1516`, opcode ≥ 256) | | |
 | stack depth, `resolve_owner`, `behavior_from_owner` | `StackOverflow`, `Invalid`, `MissingTree` | Fault path at the call node |
@@ -318,7 +339,7 @@ Handling:
 | anything inside the callee | any | The callee is in the tree's reach: it must be the same bytes, or proven equivalent with its own faults compared by this table (cycles by induction). A callee from a library not supplied, or an undefined tree, puts every private tree in reach |
 | **Operands** (`locate`, `memory.rs:364`, then `value` and `store`) | | |
 | `frame()`, `me()`, the running object's ID fitting a word, `object(me)` | `Invalid`, native 10 | Assumption (world faults): they fail for every operand of every node alike, so a per-node fault path would forbid every dummy node |
-| temp 0 to 7 (scope 8), `my` attribute 0 to 7 (scope 0) | none | Cannot happen: every object has 8 temps (`saved_objects.rs:384`) and at least 8 attributes (`factory.rs:314`, `objects.rs:530`). `--my-attributes N` states that the object has N |
+| temp 0 to 7 (scope 8), `my` attribute 0 to 7 (scope 0) | none | Cannot happen: every object has 8 temps (`saved_objects.rs:384`) and at least 8 attributes (`factory.rs:314`, `objects.rs:530`). `--my-attributes N` states that whatever runs as `me` has N (not necessarily the object whose file holds the tree: `call_as` runs it as another) |
 | temp outside 0 to 7 | native 2 | Exact |
 | `my` attribute index < 0 | native 6 | Exact |
 | `my` attribute past the stated count | native 6 | Fault path (opaque read or write) |
@@ -464,6 +485,16 @@ by the rule above) and the argument counts of the trees its calls run:
   from `--global <Global.iff>` and `--semi-global <file.iff>` (the old
   `--with` took any file's trees for any ID). A file's own chunk in those
   ranges never supplies an argument count, a body or a replay.
+- **The library files are trusted inputs.** The checker cannot tell whether
+  they are the files the game loads; the verdict assumes they are. Their
+  argument counts are read as `load_library_with_pool` (`program.rs:588`)
+  reads a library: every `BHAV` chunk in physical order, deleted ones
+  included, the last copy of an ID winning (`library_arities_from_iff`).
+  Only the file's own range is taken (256 to 4095 from `--global`, 8192 and
+  up from `--semi-global`). A tree that two supplied files give different
+  argument counts (or that one parses and another cannot) is refused
+  (exit 2): which copy the game would load is not known. A tree no file can
+  parse has an unknown count (next bullet).
 - **A callee whose argument count is unknown** (its library not supplied, or
   an undefined tree) is compared conservatively: the call node and every node
   after it must be the same bytes on both sides, which covers every argument
@@ -499,7 +530,8 @@ these, and with 2 on usage or I/O errors. The CLI flags are:
 
 - `--tree <id>` (a private tree, 4096 to 8191)
 - `--global <iff>` and `--semi-global <iff>` (repeatable)
-- `--my-attributes <n>` (at least 8)
+- `--my-attributes <n>` (at least 8): the attribute count of whatever runs
+  as `me`
 - `--ignore-scratch-pointer`
 - `--ignore-last-result` (also on `equiv`)
 - `--ignore-frame-residue` (also on `equiv`)
@@ -507,6 +539,21 @@ these, and with 2 on usage or I/O errors. The CLI flags are:
 
 ## Policies and why
 
+- **The two `--ignore-*` flags relax the checked tree only.** Its return
+  ends no object use (see the inventory's return rows), but a tree in its
+  reach may be run by a primitive as an object use, whose return records its
+  last result in the person and can fault after writing its frame. So trees
+  in the reach are always proven with both observed (`dependency_options`).
+  When the reach holds a primitive, the checked tree itself must also hold
+  with both observed, since that primitive may run it as an object use;
+  otherwise it is `Inconclusive` and says so. This is narrower than refusing
+  the flags outright whenever a primitive is in reach: it still proves a
+  root whose difference survives observation of both.
+- **Frame residue reaching a later callee is observed.** One callee's final
+  locals become the next same-depth frame's initial locals, so a callee
+  that leaves local 0 at 1 in A and 2 in B changes what an identical later
+  callee reads. Each callee is a tree in the reach, proven with the residue
+  observed, so the caller is `Inconclusive`.
 - **Frame residue is observed by default.** A frame's final locals become
   the next same-depth frame's initial locals (`interpreter.rs:1216`), and an
   identical later reader can see what differs. A difference in it is only
@@ -524,10 +571,18 @@ these, and with 2 on usage or I/O errors. The CLI flags are:
   from being proven equal to straight-line code. Such a difference is
   `Inconclusive`, never a counterexample, since the replay world cannot see
   it. `--ignore-last-result` (`LiveOptions::observe_last_result = false`)
-  proves such trees equivalent. Use it when the tree is not the root of an
-  action, as a check tree is.
-- **Attributes 8 and up are opaque** unless `--my-attributes` says the
-  running object has them. Reading them can trap (native 6).
+  proves such trees equivalent. Use it only for a tree the game never runs
+  as an object use (Run Tree By Name in mode 2) or as the root of an action,
+  since then its last result is written into the person's action. The
+  checker refuses the flag's relaxation when a primitive in the checked
+  reach could run the tree that way, but it cannot see what runs the tree
+  from outside the file (another object, the global library).
+- **Attributes 8 and up are opaque** unless `--my-attributes` gives the
+  attribute count of whatever runs as `me`. Reading them can trap
+  (native 6). That is not necessarily the object whose file holds the tree:
+  `call_as` runs a tree as another object (an object's interaction runs with
+  the person as `me`), so give the smallest count of anything that may run
+  it.
 
 ## Dependencies and tests
 
@@ -581,6 +636,25 @@ the replay uses its public API only.
   rule, private-only arities and reach, the replay library, `--tree`'s
   refusal, byte-only library trees, and the callee rule on cycles), and each
   made at least one of these tests fail;
+- round 7 (the Claude review of 2313032f) adds:
+  - `reach_trees_observe_their_returns`: with `--ignore-last-result` or
+    `--ignore-frame-residue`, a callee that differs only in its last result
+    or a dead local write is still proven on its own, but its caller is
+    undecided, in whole-file mode and in `equiv`; two calls whose first
+    callee leaves local 0 at 1 vs 2 before an identical second callee reads
+    it; and a root with a primitive in reach that differs only in its last
+    result is undecided under `--ignore-last-result` (whole-file and
+    `check_tree_with_callees`), while the same root without the primitive
+    is proven;
+  - `library_arities_follow_the_loader` (CLI `verify-equiv`): a deleted
+    copy of a library tree after a live one wins, a live one after a
+    deleted one wins, `--global` and `--semi-global` take only their own
+    ranges, and two library files that disagree are refused (exit 2).
+  Both fail on 2313032f. Each round-7 guard was removed in turn (7
+  mutations: the conflict refusal, the range filter, the opaque-root check
+  in whole-file mode and in `equiv`, the loader reading deleted chunks, and
+  strict proofs of reach trees in whole-file mode and in `equiv`), and each
+  made one of them fail;
 - the round-5 P2 fixtures fail when their guard is removed. This was checked
   by removing each guard in turn: the fault-point comparison, the primitive
   fault path, the fault point's last result and instruction, the replay's
@@ -632,3 +706,10 @@ bisimulation with symbol renaming at loop heads, which would memoize
 (pcA, pcB, canonical frame) after each pair of matched events. That is the
 natural follow-up if a migration needs dummy-node elimination inside such
 loops.
+
+**Lockstep's own pruning is unaudited.** A combined proof that rests on
+lockstep inherits lockstep's branch pruning (paths it rules out from the
+values it tracks). Round 6 audited the live-output checker's faults and the
+VM's errors, not lockstep's pruning; its conditions for counting a lockstep
+proof (same node numbers, bytes, header and frame size) bound how far a
+pruning error could reach, but do not rule one out. This is a residual risk.

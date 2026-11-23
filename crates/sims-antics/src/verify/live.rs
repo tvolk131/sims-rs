@@ -95,8 +95,10 @@ pub struct LiveContext {
     /// `(tree_id -> argument count)` for subroutines the tree calls, used to compare
     /// calls whose inline arguments spill into the following instructions.
     pub callee_arities: Option<BTreeMap<u16, usize>>,
-    /// How many attributes the running object (`me`) is known to have. Reads of
-    /// `my.attr[i]` below this never trap. Defaults to [`GUARANTEED_ATTRIBUTES`].
+    /// How many attributes whatever runs as `me` is known to have. That need not be the
+    /// object whose file holds the tree (`call_as` runs a tree as another object), so it
+    /// is the smallest count of anything that may run it. Reads of `my.attr[i]` below
+    /// this never trap. Defaults to [`GUARANTEED_ATTRIBUTES`].
     pub my_attribute_count: usize,
     /// The tree's own file's `BCON` tables (`chunk id -> values`). When set, and the tree
     /// is a private tree (`4096..=8191`), reads of the owner's tuning constants
