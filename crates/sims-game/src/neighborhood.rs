@@ -2372,9 +2372,11 @@ impl NeighborhoodShell {
                 let had_state = self.chrome.hovered().is_some()
                     || self.chrome.pressed().is_some()
                     || self.travel_chrome.hovered().is_some()
+                    || self.travel_chrome.pressed().is_some()
                     || self.hovered_lot_id.is_some()
                     || self.pressed_lot_id.is_some();
                 self.chrome.clear_pointer();
+                self.travel_chrome.clear_pointer();
                 let prev_lot = self.hovered_lot_id.take();
                 self.hovered_lot_since_us = None;
                 self.hover_card_shown_for = None;
@@ -2926,6 +2928,7 @@ impl NeighborhoodShell {
         }
         self.pressed_lot_id = None;
         self.chrome.clear_pointer();
+        self.travel_chrome.clear_pointer();
         self.family_bin.clear_pointer();
         ShellOutcome::redraw()
     }
@@ -4504,6 +4507,7 @@ impl NeighborhoodShell {
         self.move_in_family_id = None;
         self.travel_state.active_filter = None;
         self.travel_state.mode = TravelBarMode::Browse;
+        self.travel_chrome.clear_pointer();
         self.sync_travel_state();
         self.audio_queue
             .push(Input::MusicMode(music_mode_for_kind(kind)));
@@ -6662,6 +6666,9 @@ impl NeighborhoodShell {
         self.travel_state.mode = match self.nbhd_state.mode {
             NeighborhoodMode::Bulldoze => TravelBarMode::Bulldoze,
             NeighborhoodMode::Visit => TravelBarMode::Visit,
+            // `cWinMagicland` holds Move In down while a family is placed
+            // (`0x55478a`).
+            NeighborhoodMode::MoveIn { .. } => TravelBarMode::MoveIn,
             _ => TravelBarMode::Browse,
         };
         self.travel_state.expansions = self.nbhd_state.expansions;
@@ -6723,6 +6730,11 @@ impl NeighborhoodShell {
                 self.handle_neighborhood_command(NeighborhoodCommand::OpenCredits)
             }
             TravelCommand::OpenFamilyBin => {
+                // The native resets the placement mode before reopening the
+                // bin (`0x552d96`).
+                self.nbhd_state.mode = NeighborhoodMode::Normal;
+                self.move_in_family_id = None;
+                self.sync_travel_state();
                 self.open_family_bin();
                 ShellOutcome::redraw()
             }

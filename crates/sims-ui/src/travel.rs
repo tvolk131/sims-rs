@@ -176,10 +176,6 @@ const PICKER_FILTER_CELL: i32 = 50;
 /// Top of the picker dialog's filter row relative to the map origin
 /// (position table `0x6f54d0`: `y = 20`).
 const PICKER_FILTER_Y: i32 = 20;
-/// Hit width of a 53 px bar button: Return (`323`) and Bulldoze (`373`) sit
-/// 50 px apart, so the hit rects are trimmed to stay disjoint while the
-/// sprites still draw their full cell.
-const BAR_BUTTON_HIT_W: i32 = 49;
 /// Native cell size of the bar buttons (`212 / 4 × 52`).
 const BAR_BUTTON_W: i32 = 53;
 const BAR_BUTTON_H: i32 = 52;
@@ -412,6 +408,9 @@ pub enum TravelBarMode {
     Visit,
     /// Bulldozing / resetting a community lot back to template.
     Bulldoze,
+    /// Placing a family from the bin on a Magic Town lot: Move In is held
+    /// down (`0x55478a`).
+    MoveIn,
 }
 
 /// Read-only state rendered by [`TravelChrome`].
@@ -624,6 +623,10 @@ impl TravelStrings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlPlacement {
     pub control: TravelControl,
+    /// Where the control's sprite is drawn (its native origin).
+    pub origin: [i32; 2],
+    /// Hit rectangle: the part of the sprite left visible after later
+    /// controls draw over it, clipped to the bar.
     pub rect: Rect,
     pub enabled: bool,
     pub active: bool,
@@ -674,6 +677,7 @@ impl TravelLayout {
             .enumerate()
             .map(|(i, &filter)| ControlPlacement {
                 control: TravelControl::ToggleFilter(filter),
+                origin: [start + i as i32 * PICKER_FILTER_CELL, oy + PICKER_FILTER_Y],
                 rect: Rect::new(
                     start + i as i32 * PICKER_FILTER_CELL,
                     oy + PICKER_FILTER_Y,
@@ -721,18 +725,26 @@ impl TravelLayout {
         // Enable rules from `cWinVacation`'s mode switch (`0x56b19e`): in
         // Bulldoze mode Return / Sims.com / logo / Import are disabled and
         // Bulldoze is held down; Import otherwise needs an importable lot
-        // (`0x56b870`). Visit mode (lot picking from a trip) keeps only the
-        // non-editing buttons live.
+        // (`0x56b870`). Visit mode (lot picking from a trip) keeps only
+        // Return live. Move In is held down while a family is placed.
         let mode = state.mode;
         let enabled = |control: TravelControl| match (control, mode) {
-            (TravelControl::Bulldoze, TravelBarMode::Visit) => false,
+            (TravelControl::ReturnHome, TravelBarMode::Visit) => true,
+            (_, TravelBarMode::Visit) => false,
             (TravelControl::Bulldoze, _) => true,
             (TravelControl::ImportLot, TravelBarMode::Browse) => state.has_importable_lot,
             (TravelControl::ImportLot, _) => false,
-            (TravelControl::MoveIn, TravelBarMode::Browse) => true,
+            (TravelControl::MoveIn, TravelBarMode::Browse | TravelBarMode::MoveIn) => true,
             (TravelControl::MoveIn, _) => false,
             (_, TravelBarMode::Bulldoze) => false,
             _ => true,
+        };
+        let active = |control: TravelControl| {
+            matches!(
+                (control, mode),
+                (TravelControl::Bulldoze, TravelBarMode::Bulldoze)
+                    | (TravelControl::MoveIn, TravelBarMode::MoveIn)
+            )
         };
 
         let buttons = state.destination.bar_buttons();
@@ -745,18 +757,16 @@ impl TravelLayout {
             ordered.sort_by_key(|&(_, [x, _])| x);
             let mut x = bar_x;
             for (control, _) in ordered {
-                let cw = match control {
-                    TravelControl::Web | TravelControl::Credits => control_hit_width(control),
-                    _ => BAR_BUTTON_W,
-                };
+                let cw = control_sprite_width(control);
                 if x + cw > bar_x + bar_w {
                     break;
                 }
                 controls.push(ControlPlacement {
                     control,
+                    origin: [x, oy],
                     rect: Rect::new(x, oy, cw, bar_h),
                     enabled: enabled(control),
-                    active: control == TravelControl::Bulldoze && mode == TravelBarMode::Bulldoze,
+                    active: active(control),
                 });
                 x += cw;
             }
@@ -764,15 +774,39 @@ impl TravelLayout {
             for &(control, [x, y]) in buttons {
                 controls.push(ControlPlacement {
                     control,
+                    origin: [bar_x + x, oy + y],
                     rect: Rect::new(
                         bar_x + x,
                         oy + y,
-                        control_hit_width(control).min(NATIVE_WIDTH - x),
+                        control_sprite_width(control).min(NATIVE_WIDTH - x),
                         BAR_BUTTON_H.min(bar_h),
                     ),
                     enabled: enabled(control),
-                    active: control == TravelControl::Bulldoze && mode == TravelBarMode::Bulldoze,
+                    active: active(control),
                 });
+            }
+            // Controls draw in table order, so a later sprite covers the
+            // edge of an earlier one (Bulldoze at 373..426 over Return's
+            // right edge and Import's left edge). Trim each hit rect to its
+            // visible span so a click lands on the button it shows.
+            for i in 0..controls.len() {
+                for j in i + 1..controls.len() {
+                    let top = controls[j].rect;
+                    let r = &mut controls[i].rect;
+                    let (left, right) = (r.x, r.x + r.width);
+                    let (tl, tr) = (top.x, top.x + top.width);
+                    if tl >= right || tr <= left {
+                        continue;
+                    }
+                    if tl > left {
+                        r.width = tl - left;
+                    } else if tr < right {
+                        r.x = tr;
+                        r.width = right - tr;
+                    } else {
+                        r.width = 0;
+                    }
+                }
             }
         }
 
@@ -797,12 +831,12 @@ impl TravelLayout {
     }
 }
 
-const fn control_hit_width(control: TravelControl) -> i32 {
+const fn control_sprite_width(control: TravelControl) -> i32 {
     match control {
         TravelControl::Web => INET_W,
         TravelControl::Credits => LOGO_W,
         TravelControl::ToggleFilter(_) => PICKER_FILTER_CELL,
-        _ => BAR_BUTTON_HIT_W,
+        _ => BAR_BUTTON_W,
     }
 }
 
@@ -941,11 +975,12 @@ impl TravelChrome {
                     // The bar window clips its children: Sims.com at `762`
                     // loses its last column past the 800 px edge.
                     let bar_right = layout.bar_rect.x + layout.bar_rect.width;
-                    let visible = (sprite.width as i32).min(bar_right - placement.rect.x);
+                    let [sx, sy] = placement.origin;
+                    let visible = (sprite.width as i32).min(bar_right - sx);
                     frame.draw(
                         &sprite,
                         Rect::new(0, 0, visible, sprite.height as i32),
-                        [placement.rect.x, placement.rect.y],
+                        [sx, sy],
                     );
                 }
                 _ => {

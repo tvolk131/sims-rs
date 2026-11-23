@@ -99,8 +99,8 @@ fn destination_bars_hold_exactly_the_native_button_table() {
                 .controls
                 .iter()
                 .map(|c| {
-                    assert_eq!(c.rect.y, origin[1], "{:?} must sit on row 0", c.control);
-                    (c.control, c.rect.x - origin[0])
+                    assert_eq!(c.origin[1], origin[1], "{:?} must sit on row 0", c.control);
+                    (c.control, c.origin[0] - origin[0])
                 })
                 .collect();
             got.sort_by_key(|&(_, x)| x);
@@ -140,6 +140,10 @@ fn destination_bar_enable_rules_follow_the_native_mode_switch() {
     assert!(browse.contains(&(Credits, true, false)));
     assert!(browse.contains(&(MoveIn, true, false)));
     assert!(enabled(dest, TravelBarMode::Browse, true).contains(&(ImportLot, true, false)));
+
+    let placing = enabled(dest, TravelBarMode::MoveIn, true);
+    assert!(placing.contains(&(MoveIn, true, true)), "Move In held down");
+    assert!(placing.contains(&(Bulldoze, true, false)));
 
     let doze = enabled(Destination::VacationIsland, TravelBarMode::Bulldoze, true);
     assert_eq!(
@@ -184,13 +188,17 @@ fn clicking_controls_emits_expected_commands() {
         assert_eq!(chrome.pointer_up(x, y, &layout, &state), Some(command));
     }
 
-    // Visit mode (lot picking from a trip) disables the editing buttons.
+    // Visit mode (lot picking from a trip) keeps only Return live.
     state.mode = TravelBarMode::Visit;
     state.destination = Destination::Downtown;
     let visit_layout = TravelLayout::compute(800, 600, &state);
     for c in &visit_layout.controls {
-        let editing = matches!(c.control, Bulldoze | ImportLot | MoveIn);
-        assert_eq!(c.enabled, !editing, "{:?} in Visit", c.control);
+        assert_eq!(
+            c.enabled,
+            c.control == ReturnHome,
+            "{:?} in Visit",
+            c.control
+        );
     }
     let doze = visit_layout
         .controls
@@ -459,8 +467,8 @@ fn browse_bar_draws_only_the_banner_and_native_sprites() {
                         4
                     };
                     Rect::new(
-                        c.rect.x,
-                        c.rect.y,
+                        c.origin[0],
+                        c.origin[1],
                         img.width as i32 / cells,
                         img.height as i32,
                     )
@@ -493,4 +501,28 @@ fn browse_bar_draws_only_the_banner_and_native_sprites() {
             }
         }
     }
+}
+
+/// Bulldoze (`373`) draws after Return (`323`) and Import (`422`), covering
+/// their edges: each visible column hits the button drawn there.
+#[test]
+fn bar_hit_rects_follow_the_visible_sprites() {
+    let state = TravelState {
+        destination: Destination::Downtown,
+        has_importable_lot: true,
+        ..TravelState::default()
+    };
+    let layout = TravelLayout::compute(800, 600, &state);
+    let hit = |x| layout.hit(x, 26).map(|c| c.control);
+    assert_eq!(hit(323), Some(TravelControl::ReturnHome));
+    assert_eq!(hit(372), Some(TravelControl::ReturnHome));
+    assert_eq!(hit(373), Some(TravelControl::Bulldoze));
+    assert_eq!(hit(425), Some(TravelControl::Bulldoze));
+    assert_eq!(hit(426), Some(TravelControl::ImportLot));
+    assert_eq!(hit(474), Some(TravelControl::ImportLot));
+    assert_eq!(hit(475), None);
+    assert_eq!(hit(799), Some(TravelControl::Web));
+    assert_eq!(hit(5), Some(TravelControl::Credits));
+    assert_eq!(hit(74), Some(TravelControl::Credits));
+    assert_eq!(hit(75), None);
 }
