@@ -733,6 +733,7 @@ fn emit_lifted_bhavs<W: Write>(
     tree_id: Option<u16>,
     raw: bool,
     resolved: Option<&FileArities>,
+    duplicates: &std::collections::BTreeMap<u16, usize>,
     lift_opts: LiftOptions,
     verify_equiv: bool,
     out: &mut OutWriter<W>,
@@ -764,6 +765,18 @@ fn emit_lifted_bhavs<W: Write>(
              override, or a lot whose loaded callee versions differ, may change them)",
             sanitize_single_line(&resolved.describe_for(&tree_ids))
         )) {
+            Ok(()) => {}
+            Err(CliError::BrokenPipe) => broken_pipe = true,
+            Err(other) => return Err(other),
+        }
+    }
+    let selected_duplicates: std::collections::BTreeMap<u16, usize> = duplicates
+        .iter()
+        .filter(|(id, _)| tree_ids.contains(id))
+        .map(|(&id, &count)| (id, count))
+        .collect();
+    if !broken_pipe && let Some(note) = duplicates_note(&selected_duplicates) {
+        match out.writeln_str(&note) {
             Ok(()) => {}
             Err(CliError::BrokenPipe) => broken_pipe = true,
             Err(other) => return Err(other),
@@ -1173,21 +1186,10 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     let iff =
         Iff::parse(iff_bytes).map_err(|e| format!("failed to parse IFF {source_label}: {e}"))?;
 
-    // Deduplicate BHAV chunks by resource ID, preferring canonical high-flag-byte 0
-    // (matching `Iff::get(b"BHAV", id)` and `sims-vm`), then sort by ID.
-    let mut by_id: std::collections::BTreeMap<u16, &sims_formats::iff::Chunk> =
-        std::collections::BTreeMap::new();
-    for chunk in iff.all(b"BHAV").filter(|c| c.flags & DELETED == 0) {
-        by_id
-            .entry(chunk.id)
-            .and_modify(|existing| {
-                if (existing.flags >> 8) != 0 && (chunk.flags >> 8) == 0 {
-                    *existing = chunk;
-                }
-            })
-            .or_insert(chunk);
-    }
-    let bhav_chunks: Vec<&sims_formats::iff::Chunk> = by_id.into_values().collect();
+    let KeptBhavs {
+        chunks: bhav_chunks,
+        duplicates,
+    } = kept_bhavs(&iff);
 
     // Resolved after tree selection (so a bad override never masks a not-found tree), and
     // skipped for `--raw`, which does not use arities, or when there is nothing to lift and
@@ -1227,6 +1229,9 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
                 "// arity sources: {}",
                 sanitize_single_line(&resolved.describe_for(&listed))
             ))?;
+        }
+        if let Some(note) = duplicates_note(&duplicates) {
+            out.writeln_str(&note)?;
         }
         out.writeln_str(&format!(
             "{:<7} {:<8} {:<5} {:<5} {:<7} {:<36} {}",
@@ -1293,10 +1298,10 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     }
 
     let selected_chunks: Vec<&sims_formats::iff::Chunk> = if let Some(target_id) = tree_id {
-        let chunk = iff
-            .get(b"BHAV", target_id)
-            .filter(|c| c.flags & DELETED == 0)
-            .or_else(|| bhav_chunks.iter().copied().find(|c| c.id == target_id))
+        let chunk = bhav_chunks
+            .iter()
+            .copied()
+            .find(|c| c.id == target_id)
             .ok_or_else(|| {
                 format!("BHAV #{target_id} ({target_id:#06x}) not found in {source_label}")
             })?;
@@ -1327,10 +1332,64 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
         tree_id,
         raw,
         resolved.as_ref(),
+        &duplicates,
         lift_opts,
         verify_equiv,
         &mut out,
     )
+}
+
+/// The BHAV chunks the VM runs: one per ID, sorted by ID.
+struct KeptBhavs<'a> {
+    chunks: Vec<&'a sims_formats::iff::Chunk>,
+    /// IDs with more than one BHAV chunk, with their chunk counts.
+    duplicates: std::collections::BTreeMap<u16, usize>,
+}
+
+/// Selects, for each ID with a live BHAV chunk, the chunk the VM's library loader keeps:
+/// it reads chunks in physical order and keeps the last BHAV of each ID, deleted ones
+/// included (`sims_vm` `load_library_with_pool`). That is the tree the VM runs, so it is
+/// the one listed, lifted and verified, and the one the arity context describes.
+fn kept_bhavs(iff: &Iff) -> KeptBhavs<'_> {
+    let mut by_id: std::collections::BTreeMap<u16, (&sims_formats::iff::Chunk, usize, bool)> =
+        std::collections::BTreeMap::new();
+    for chunk in iff.chunks.iter().filter(|c| &c.tag == b"BHAV") {
+        let live = chunk.flags & DELETED == 0;
+        by_id
+            .entry(chunk.id)
+            .and_modify(|(kept, count, any_live)| {
+                *kept = chunk;
+                *count += 1;
+                *any_live |= live;
+            })
+            .or_insert((chunk, 1, live));
+    }
+    let duplicates = by_id
+        .iter()
+        .filter(|(_, (_, count, any_live))| *count > 1 && *any_live)
+        .map(|(&id, &(_, count, _))| (id, count))
+        .collect();
+    let chunks = by_id
+        .into_values()
+        .filter(|&(_, _, any_live)| any_live)
+        .map(|(kept, _, _)| kept)
+        .collect();
+    KeptBhavs { chunks, duplicates }
+}
+
+/// A comment naming IDs shared by several BHAV chunks, if any.
+fn duplicates_note(duplicates: &std::collections::BTreeMap<u16, usize>) -> Option<String> {
+    if duplicates.is_empty() {
+        return None;
+    }
+    let ids: Vec<String> = duplicates
+        .iter()
+        .map(|(id, count)| format!("{id} ({count} chunks)"))
+        .collect();
+    Some(format!(
+        "// duplicate BHAV IDs: {}; each shows the last chunk in file order, the one the VM keeps",
+        ids.join(", ")
+    ))
 }
 
 fn is_macos_system_symlink(path: &Path) -> bool {
@@ -2143,6 +2202,7 @@ mod tests {
             None,
             false,
             Some(&resolved),
+            &std::collections::BTreeMap::new(),
             LiftOptions::default(),
             false,
             &mut out,

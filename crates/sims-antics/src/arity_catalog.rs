@@ -25,8 +25,10 @@
 //! A tree outside those cases never runs, and its owner-dependent ranges stay unknown.
 //! Unknown arities make the lifter keep the labeled-CFG layout, which is always sound.
 //!
-//! The rule: **a count is known only when the VM, booted the same way, would dispatch
-//! this exact call to this exact tree.** `InstallArityCatalog` (feature
+//! The rule: **whenever the VM, booted the same way (the base install, no
+//! neighborhood), executes a call instruction, it reads exactly the argument count used
+//! here.** A call the VM never executes in that boot (failed link, owner that lost its
+//! GUID, discarded caller chunk) cannot be misdescribed. `InstallArityCatalog` (feature
 //! `install-catalog`, on by default) asks the VM's own code rather than restating it:
 //!
 //! - **Boot path.** It builds the `sims_content` index and catalog as the VM boots. A
@@ -682,8 +684,7 @@ impl InstallArityCatalog {
     }
 
     /// Merged arities for the index resource `resource`, per calling tree: a callee's
-    /// count is known only when the VM, booted the same way, would dispatch that call
-    /// to that tree.
+    /// count is supplied only if every execution of that call in the same boot reads it.
     fn resolve_entry(&mut self, resource: usize) -> FileArities {
         // Without Global.iff the VM does not link at all (`Program::link_with_pool`).
         let global = match &self.global {

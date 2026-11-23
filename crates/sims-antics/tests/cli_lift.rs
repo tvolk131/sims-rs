@@ -2736,28 +2736,21 @@ fn lift_with_a_global_iff_the_vm_rejects_has_no_arities() {
     );
 }
 
-/// An indexed `Global.iff` the VM cannot read leaves the VM unable to link, so every
-/// range is unknown.
+/// An indexed `Global.iff` that cannot be read (for any user: here a dangling symlink,
+/// which the index keeps) leaves the VM unable to link, so no call runs and every range
+/// is unknown.
 #[cfg(unix)]
 #[test]
 fn lift_with_an_unreadable_global_iff_has_no_arities() {
-    use std::os::unix::fs::PermissionsExt;
-
-    struct RestoreMode(PathBuf);
-    impl Drop for RestoreMode {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
-        }
-    }
-
     let install = SyntheticInstall::new();
     let global = install.global_dir().join("Global.iff");
-    std::fs::set_permissions(&global, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-    let _restore = RestoreMode(global.clone());
-    if std::fs::File::open(&global).is_ok() {
-        eprintln!("skipping: permissions are not enforced for this user");
-        return;
-    }
+    std::fs::remove_file(&global).expect("remove Global.iff");
+    std::os::unix::fs::symlink(install.root.join("missing.iff"), &global)
+        .expect("symlink Global.iff");
+    assert!(
+        std::fs::File::open(&global).is_err(),
+        "Global.iff must be unreadable"
+    );
     let loose = install
         .root
         .join("GameData")
@@ -2767,8 +2760,7 @@ fn lift_with_an_unreadable_global_iff_has_no_arities() {
         run_lift(&[loose.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
     assert!(ok, "stderr: {stderr}");
     let header = stdout.lines().next().unwrap_or_default();
-    let why =
-        "none (the VM cannot link this install: the VM would not load GameData/Global/Global.iff";
+    let why = "none (the VM cannot link this install: failed to read GameData/Global/Global.iff";
     assert!(
         header.contains(&format!("global 256..=4095: {why}"))
             && header.contains(&format!("private 4096..=8191: {why}"))
@@ -2778,7 +2770,9 @@ fn lift_with_an_unreadable_global_iff_has_no_arities() {
 }
 
 /// The owner's own file must also pass the VM's library loader: with a truncated BHAV
-/// the VM rejects it, so its private counts are unknown.
+/// the VM rejects it. That object's link then fails, so none of its calls run, and no
+/// count can misdescribe one; its private counts are reported unknown, with the reason,
+/// rather than taken from a library the VM never loads.
 #[test]
 fn lift_owner_file_the_vm_rejects_has_no_private_arities() {
     let install = SyntheticInstall::new();
@@ -2860,40 +2854,37 @@ fn lift_owner_roles_come_from_registered_objects_only() {
         "{stdout}"
     );
 
-    // Two files register the same GUID: the later registration wins, and the other
-    // file's OBJD no longer registers anything, so exactly one of them is an owner.
+    // Two files register the same GUID and the later registration wins. Within a
+    // directory the index follows the original's file-table hash order (`Index::build`),
+    // which registers Shadow2.iff before Shadow1.iff, so Shadow1.iff is the owner and
+    // Shadow2.iff's OBJD registers nothing.
     let guid = 0x0BAD_F00D;
-    let mut private_ranges = Vec::new();
-    for name in ["Shadow1.iff", "Shadow2.iff"] {
+    let header_of = |name: &str| {
         let path = objects.join(name);
+        let (ok, stdout, stderr) =
+            run_lift(&[path.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
+        assert!(ok, "stderr: {stderr}");
+        stdout.lines().next().unwrap_or_default().to_owned()
+    };
+    for name in ["Shadow1.iff", "Shadow2.iff"] {
         let chunks = [
             bhav_chunk(&two_call_bhav(4096, 300, 4097)),
             bhav_chunk(&one_node_bhav(4097, 1)),
             objd_chunk_with_guid(guid),
         ];
-        std::fs::write(&path, write_iff(&chunks).expect("write_iff")).expect("write shadow");
-        private_ranges.push(path);
+        std::fs::write(objects.join(name), write_iff(&chunks).expect("write_iff"))
+            .expect("write shadow");
     }
-    let headers: Vec<String> = private_ranges
-        .iter()
-        .map(|path| {
-            let (ok, stdout, stderr) =
-                run_lift(&[path.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
-            assert!(ok, "stderr: {stderr}");
-            stdout.lines().next().unwrap_or_default().to_owned()
-        })
-        .collect();
-    let owners = headers
-        .iter()
-        .filter(|h| h.contains("private 4096..=8191: 2 from this file"))
-        .count();
-    let shadowed = headers
-        .iter()
-        .filter(|h| {
-            h.contains("private 4096..=8191: none (never runs: no registered object definition (OBJD) in this file)")
-        })
-        .count();
-    assert_eq!((owners, shadowed), (1, 1), "{headers:#?}");
+    let winner = header_of("Shadow1.iff");
+    assert!(
+        winner.contains("private 4096..=8191: 2 from this file"),
+        "{winner}"
+    );
+    let loser = header_of("Shadow2.iff");
+    assert!(
+        loser.contains("private 4096..=8191: none (never runs: no registered object definition (OBJD) in this file)"),
+        "{loser}"
+    );
 }
 
 /// A `GLOB` name that resolves to a file in a mount a neighborhood's `Characters`
@@ -2934,9 +2925,9 @@ fn lift_glob_target_a_characters_file_could_shadow_is_unknown() {
     assert!(stdout.contains("structured lift fallback"), "{stdout}");
 }
 
-/// A count is known only for a call the VM would dispatch to a tree it can run: not
-/// for an empty BHAV (no frame dimensions), nor for a flagged call opcode (0xA000),
-/// which the VM refuses before dispatch.
+/// A count is supplied only where the VM reads one when it executes the call: not for
+/// an empty BHAV (no frame dimensions), nor for a flagged call opcode (0xA000), which
+/// the VM refuses before dispatch.
 #[test]
 fn lift_callee_the_vm_would_not_dispatch_has_unknown_arity() {
     let install = SyntheticInstall::new();
@@ -3237,6 +3228,68 @@ fn lift_with_an_unidentifiable_index_path_keeps_owner_ranges_unknown() {
         stdout.contains(&format!("global 256..=4095: none ({why}"))
             && stdout.contains(&format!("private 4096..=8191: none ({why}"))
             && stdout.contains(&format!("semi-global 8192+: none ({why}")),
+        "{stdout}"
+    );
+}
+
+/// Two BHAV chunks share an ID: the VM's loader keeps the last one in file order (deleted
+/// ones included), so that is the tree `lift` lists, lifts, and describes with the
+/// file's arity context, and the duplicate is flagged.
+#[test]
+fn lift_shows_the_duplicate_bhav_chunk_the_vm_keeps() {
+    let install = SyntheticInstall::new();
+    let named = |bhav: BhavChunk, label: &str, flags: u16| ChunkData {
+        flags,
+        label: label.to_owned(),
+        ..bhav_chunk(&bhav)
+    };
+    let path = install
+        .root
+        .join("GameData")
+        .join("Objects")
+        .join("Dup.iff");
+    let chunks = vec![
+        named(two_call_bhav(4096, 300, 8192), "FirstCopy", 0),
+        named(two_call_bhav(4097, 300, 4096), "LiveCopy", 0),
+        named(two_call_bhav(4096, 301, 300), "KeptCopy", 0),
+        named(two_call_bhav(4097, 301, 4096), "DeletedKept", 4),
+        objd_chunk(),
+        glob_chunk(b"TestGlobals"),
+    ];
+    std::fs::write(&path, write_iff(&chunks).expect("write_iff")).expect("write Dup.iff");
+    let note = "// duplicate BHAV IDs: 4096 (2 chunks), 4097 (2 chunks); each shows the last chunk in file order, the one the VM keeps";
+
+    let (ok, stdout, stderr) = run_lift(&[path.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains(note), "{stdout}");
+    assert!(
+        stdout.contains("KeptCopy")
+            && stdout.contains("DeletedKept")
+            && !stdout.contains("FirstCopy")
+            && !stdout.contains("LiveCopy"),
+        "{stdout}"
+    );
+
+    let (ok, stdout, stderr) =
+        run_lift(&[path.as_os_str(), OsStr::new("--tree"), OsStr::new("4096")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("KeptCopy") && !stdout.contains("FirstCopy"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("// duplicate BHAV IDs: 4096 (2 chunks);"),
+        "{stdout}"
+    );
+
+    let (ok, stdout, stderr) = run_lift(&[path.as_os_str(), OsStr::new("--verify-equiv")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains(note), "{stdout}");
+    assert!(
+        stdout.contains("KeptCopy")
+            && stdout.contains("DeletedKept")
+            && !stdout.contains("FirstCopy")
+            && !stdout.contains("LiveCopy"),
         "{stdout}"
     );
 }
