@@ -2,7 +2,8 @@
 //! port still refuses.
 //!
 //! Every BHAV in the install is read, the neighborhoods' character
-//! files included; a file or tree that cannot be read fails the test.
+//! files included; a file, tree, archive or folder that cannot be read
+//! fails the test.
 //! Each call of opcode 1, Generic Sims Call, gives its routine number
 //! (operand word 0). Each number is
 //! then run once on the synthetic lot of the interpreter tests. A routine
@@ -24,7 +25,7 @@ use sims_formats::behavior::Behavior;
 use sims_formats::iff::{DELETED, Iff};
 use sims_vm::Trap;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use support::*;
 
 /// The routines the install's trees call that the port refuses.
@@ -33,14 +34,56 @@ const RESIDUALS: &[u16] = &[
 ];
 
 /// The paths in `dir`, sorted, so the scan never depends on the order the
-/// filesystem lists them in.
+/// filesystem lists them in. An entry that cannot be read is an error:
+/// it could hide a file.
 #[allow(clippy::disallowed_methods)]
-fn sorted_paths(dir: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .collect();
+fn sorted_paths(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut paths = std::fs::read_dir(dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<PathBuf>>>()?;
     paths.sort();
     Ok(paths)
+}
+
+/// Each routine: how many calls, and the first tree that makes one.
+type Calls = BTreeMap<u16, (usize, String)>;
+
+/// Adds the Generic Sims Calls in the IFF file `bytes` (shown as
+/// `location`) to `calls`; a file or tree that cannot be read goes in
+/// `unread`.
+fn scan(
+    location: &str,
+    bytes: Result<Vec<u8>, String>,
+    calls: &mut Calls,
+    unread: &mut Vec<String>,
+) {
+    let iff = match bytes.and_then(|bytes| Iff::parse(bytes).map_err(|e| e.to_string())) {
+        Ok(iff) => iff,
+        Err(e) => {
+            unread.push(format!("{location}: {e}"));
+            return;
+        }
+    };
+    for chunk in &iff.chunks {
+        if &chunk.tag != b"BHAV" || chunk.flags & DELETED != 0 {
+            continue;
+        }
+        let behavior = match Behavior::parse(iff.data(chunk)) {
+            Ok(behavior) => behavior,
+            Err(e) => {
+                unread.push(format!("{location} tree 0x{:04x}: {e}", chunk.id));
+                continue;
+            }
+        };
+        for instruction in behavior.instructions.iter().filter(|i| i.opcode == 1) {
+            let operands = instruction.operands;
+            let routine = u16::from_le_bytes([operands[0], operands[1]]);
+            let entry = calls
+                .entry(routine)
+                .or_insert_with(|| (0, format!("{location} tree 0x{:04x}", chunk.id)));
+            entry.0 += 1;
+        }
+    }
 }
 
 /// Whether the port refuses routine `routine`.
@@ -73,18 +116,28 @@ fn the_generic_routines_the_install_calls_are_ported_or_listed() {
     let install = Install::detect(&root).expect("detect the install");
     let index = Index::build(&install).expect("index the install");
     let pool = ArchivePool::new();
-    // The files to read: the index's IFF files, and the neighborhoods'
-    // character files, which a lot's load adds to its index
-    // (`Index::add_characters`) but `Index::build` does not.
-    let mut files: Vec<(String, Result<Vec<u8>, String>)> = index
-        .resources
-        .iter()
-        .filter(|r| r.name().to_ascii_lowercase().ends_with(".iff"))
-        .map(|r| {
-            let bytes = r.read_with(&pool).map_err(|e| e.to_string());
-            (r.location(&index.root), bytes)
-        })
-        .collect();
+    let mut calls = Calls::new();
+    // Files, trees and archives that could not be read: they would hide
+    // calls. Each file is read and scanned on its own, so only one is held
+    // at a time.
+    let mut unread: Vec<String> = index.diagnostics.clone();
+    // The index's IFF files.
+    for resource in &index.resources {
+        if !resource.name().to_ascii_lowercase().ends_with(".iff") {
+            continue;
+        }
+        let bytes = resource.read_with(&pool).map_err(|e| e.to_string());
+        scan(
+            &resource.location(&index.root),
+            bytes,
+            &mut calls,
+            &mut unread,
+        );
+    }
+    // The neighborhoods' character files, which a lot's load adds to its
+    // index (`Index::add_characters`) but `Index::build` does not. A
+    // neighborhood without a Characters folder has none; any other folder
+    // that cannot be listed fails the test.
     let neighborhoods: Vec<PathBuf> = sorted_paths(&root)
         .expect("list the install")
         .into_iter()
@@ -96,8 +149,20 @@ fn the_generic_routines_the_install_calls_are_ported_or_listed() {
         .collect();
     let mut characters = 0;
     for neighborhood in neighborhoods {
-        let Ok(entries) = sorted_paths(&neighborhood.join("Characters")) else {
-            continue;
+        let folder = neighborhood.join("Characters");
+        let shown = |path: &Path| {
+            path.strip_prefix(&root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        };
+        let entries = match sorted_paths(&folder) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                unread.push(format!("{}: {e}", shown(&folder)));
+                continue;
+            }
         };
         let paths = entries.into_iter().filter(|p| {
             p.extension()
@@ -106,61 +171,20 @@ fn the_generic_routines_the_install_calls_are_ported_or_listed() {
         });
         for path in paths {
             characters += 1;
-            let shown = path
-                .strip_prefix(&root)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            files.push((shown, std::fs::read(&path).map_err(|e| e.to_string())));
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string());
+            scan(&shown(&path), bytes, &mut calls, &mut unread);
         }
     }
     assert!(
         characters > 0,
         "the install has no neighborhood character files"
     );
-    // Each routine: how many calls, and the first tree that makes one.
-    let mut calls: BTreeMap<u16, (usize, String)> = BTreeMap::new();
-    // Files or trees that could not be read: they would hide calls.
-    let mut unread = Vec::new();
-    for (location, bytes) in files {
-        let iff = match bytes.map(Iff::parse) {
-            Ok(Ok(iff)) => iff,
-            Ok(Err(e)) => {
-                unread.push(format!("{location}: {e}"));
-                continue;
-            }
-            Err(e) => {
-                unread.push(format!("{location}: {e}"));
-                continue;
-            }
-        };
-        for chunk in &iff.chunks {
-            if &chunk.tag != b"BHAV" || chunk.flags & DELETED != 0 {
-                continue;
-            }
-            let behavior = match Behavior::parse(iff.data(chunk)) {
-                Ok(behavior) => behavior,
-                Err(e) => {
-                    unread.push(format!("{location} tree 0x{:04x}: {e}", chunk.id));
-                    continue;
-                }
-            };
-            for instruction in behavior.instructions.iter().filter(|i| i.opcode == 1) {
-                let operands = instruction.operands;
-                let routine = u16::from_le_bytes([operands[0], operands[1]]);
-                let entry = calls
-                    .entry(routine)
-                    .or_insert_with(|| (0, format!("{location} tree 0x{:04x}", chunk.id)));
-                entry.0 += 1;
-            }
-        }
-    }
     for line in &unread {
         eprintln!("unread: {line}");
     }
     assert!(
         unread.is_empty(),
-        "{} files or trees could not be read",
+        "{} files, trees, archives or folders could not be read",
         unread.len()
     );
     assert!(!calls.is_empty(), "the install has no Generic Sims Calls");
