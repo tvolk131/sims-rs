@@ -307,8 +307,6 @@ pub enum CameraCommand {
     SetQuality(SnapshotQuality),
     /// Pressed `kCamViewAlbum` (`1105`) to open the Photo Album (`0x503e85`).
     OpenPhotoAlbum,
-    /// Triggered a snapshot capture with the current size and quality.
-    TakeSnapshot,
     /// Requested the Camera Mode help balloon for a size/quality button.
     Help(CameraHelp),
 }

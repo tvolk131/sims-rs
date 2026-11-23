@@ -69,7 +69,7 @@ pub const SCRAP_RESOURCES: [i32; 7] = [
 ];
 
 /// Required `UIGraphics` fallback resource IDs used by [`PhotoAlbumDialog`].
-pub const RESOURCES: [i32; 4] = [BACKGROUND, BUTTON, POPUP_TILER, CAM_VIEW_ALBUM];
+pub const RESOURCES: [i32; 3] = [BACKGROUND, BUTTON, POPUP_TILER];
 
 /// Maximum character length of a photo title.
 pub const MAX_TITLE_LEN: usize = 80;

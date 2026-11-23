@@ -165,26 +165,37 @@ fn choice_dialog_is_a_view_between_arrows_with_ok_and_cancel() {
     assert!(!intersects(layout.buy_btn, layout.cancel_btn));
     assert!(layout.buy_btn.y >= view.y + view.height);
 
-    // The previous arrow does nothing on the first outfit (no wrap).
+    let try_on = |id: &str| Some(ShopCommand::TryOn { item_id: id.into() });
+    // The arrows wrap (`0x40d360`, `0x40d229`): previous on the first
+    // outfit shows the last, next on the last shows the first.
     let (px, py) = center(previous);
     dialog.pointer_down(size, &snap, px, py);
-    assert_eq!(dialog.pointer_up(size, &snap, px, py), None);
-
-    // The next arrow steps and tries the outfit on.
+    assert_eq!(dialog.pointer_up(size, &snap, px, py), try_on("formal_03"));
     let (nx, ny) = center(next);
     dialog.pointer_down(size, &snap, nx, ny);
+    assert_eq!(dialog.pointer_up(size, &snap, nx, ny), try_on("formal_01"));
+    dialog.pointer_down(size, &snap, nx, ny);
+    assert_eq!(dialog.pointer_up(size, &snap, nx, ny), try_on("formal_02"));
+    assert_eq!(dialog.choose(&snap, false), try_on("formal_01"));
+    // An item that cannot be tried on is still shown (as its fallback).
+    let mut plain = snap.clone();
+    plain.items[1].supports_try_on = false;
+    assert_eq!(dialog.choose(&plain, true), try_on("formal_02"));
+    assert_eq!(dialog.choose(&plain, false), try_on("formal_01"));
+    // One choice: the arrows have nowhere to go.
+    let mut single = snap.clone();
+    single.items.truncate(1);
+    assert_eq!(dialog.choose(&single, true), None);
+
+    // Cancel closes without buying.
+    let mut cancelled = dialog.clone();
+    let (cx, cy) = center(layout.cancel_btn);
+    cancelled.pointer_down(size, &snap, cx, cy);
     assert_eq!(
-        dialog.pointer_up(size, &snap, nx, ny),
-        Some(ShopCommand::TryOn {
-            item_id: "formal_02".into()
-        })
+        cancelled.pointer_up(size, &snap, cx, cy),
+        Some(ShopCommand::Cancel)
     );
-    assert_eq!(
-        dialog.choose(&snap, false),
-        Some(ShopCommand::TryOn {
-            item_id: "formal_01".into()
-        })
-    );
+    assert!(!cancelled.is_open());
 
     // OK buys the outfit on show.
     let (bx, by) = center(layout.buy_btn);

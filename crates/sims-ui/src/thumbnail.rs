@@ -338,9 +338,9 @@ const SURFACE: i64 = 200;
 /// - 0x4cc0eb: the two results side by side, the second at the first's
 ///   width.
 ///
-/// **Unverified:** 0x4ba778's filter, taken here as an area average; its
-/// output size, taken as the nearest whole pixel (it floors through
-/// 0x636b98 and adds 0.5); and the flag 0x4e5886 passes for the second
+/// **Unverified:** 0x4ba778's filter, taken here as an exact area
+/// average ([`area_sample`]); its output size, taken as the nearest whole
+/// pixel (it floors through 0x636b98 and adds 0.5); and the flag 0x4e5886 passes for the second
 /// cell (0x4384c8 `[ebp-0x67]`), taken as changing nothing but the
 /// background.
 fn rendered(iff: &Iff, definition: &[u8], backgrounds: [[u8; 4]; 2]) -> Option<Image> {
@@ -354,47 +354,16 @@ fn rendered(iff: &Iff, definition: &[u8], backgrounds: [[u8; 4]; 2]) -> Option<I
         .or_else(|| render_object_zoom(iff, definition, 1))?;
     let (w, h) = (i64::from(picture.width), i64::from(picture.height));
     let (x, y) = ((SURFACE - w) / 2, (SURFACE - h) / 2);
-    let ([left, top, right, bottom], scale) = fit(x, y, w, h)?;
-    let out = |size: i64| ((size as f64 * f64::from(scale)).round() as i64).max(1);
-    let (out_w, out_h) = (out(right - left), out(bottom - top));
+    let (rect, [out_w, out_h]) = fit(x, y, w, h)?;
     let width = usize::try_from(out_w * 2).ok()?;
+    let cell_w = usize::try_from(out_w).ok()? * 4;
     let mut rgba = vec![0u8; width * usize::try_from(out_h).ok()? * 4];
     for (i, background) in backgrounds.into_iter().enumerate() {
         let surface = draw_on_surface(&picture, x, y, background);
-        let step = f64::from(scale).recip();
-        let area = step * step;
-        for oy in 0..out_h {
-            for ox in 0..out_w {
-                let (x0, y0) = (
-                    left as f64 + ox as f64 * step,
-                    top as f64 + oy as f64 * step,
-                );
-                let mut sum = [0f64; 4];
-                let mut sy = y0.floor() as i64;
-                while (sy as f64) < y0 + step && sy < bottom {
-                    let cover_y = (y0 + step).min(sy as f64 + 1.0) - y0.max(sy as f64);
-                    let mut sx = x0.floor() as i64;
-                    while (sx as f64) < x0 + step && sx < right {
-                        let cover =
-                            cover_y * ((x0 + step).min(sx as f64 + 1.0) - x0.max(sx as f64));
-                        let at = ((sy * SURFACE + sx) * 4) as usize;
-                        let a = f64::from(surface[at + 3]);
-                        for c in 0..3 {
-                            sum[c] += f64::from(surface[at + c]) * a * cover;
-                        }
-                        sum[3] += a * cover;
-                        sx += 1;
-                    }
-                    sy += 1;
-                }
-                let at = ((oy as usize * width) + (i as i64 * out_w + ox) as usize) * 4;
-                if sum[3] > 0.0 {
-                    for c in 0..3 {
-                        rgba[at + c] = (sum[c] / sum[3]).round().clamp(0.0, 255.0) as u8;
-                    }
-                    rgba[at + 3] = (sum[3] / area).round().clamp(0.0, 255.0) as u8;
-                }
-            }
+        let cell = area_sample(&surface, SURFACE, rect, [out_w, out_h]);
+        for (row, line) in cell.chunks_exact(cell_w).enumerate() {
+            let at = (row * width) * 4 + i * cell_w;
+            rgba[at..at + cell_w].copy_from_slice(line);
         }
     }
     Some(Image {
@@ -404,10 +373,60 @@ fn rendered(iff: &Iff, definition: &[u8], backgrounds: [[u8; 4]; 2]) -> Option<I
     })
 }
 
+/// `rect` of the RGBA `surface` (`stride` pixels wide) averaged by area
+/// into `out_w` by `out_h` pixels, colour weighted by alpha. Footprints
+/// come from the whole sizes, not a rounded scale: counting in units of
+/// one output-size part of a source pixel, output pixel `o` spans
+/// `[o·src, (o+1)·src)` and source pixel `s` spans `[s·out, (s+1)·out)`,
+/// so every weight is a whole number. Halves round up, as 0x636b98's
+/// floor of the value plus 0.5 does.
+fn area_sample(
+    surface: &[u8],
+    stride: i64,
+    [left, top, right, bottom]: [i64; 4],
+    [out_w, out_h]: [i64; 2],
+) -> Vec<u8> {
+    let (src_w, src_h) = (right - left, bottom - top);
+    let overlap = |o: i64, s: i64, src: i64, out: i64| {
+        ((o + 1) * src).min((s + 1) * out) - (o * src).max(s * out)
+    };
+    let round = |num: i64, den: i64| ((2 * num + den) / (2 * den)).clamp(0, 255) as u8;
+    // Every operand is non-negative.
+    let ceil = |num: i64, den: i64| (num + den - 1) / den;
+    let mut rgba = vec![0u8; (out_w * out_h * 4) as usize];
+    for oy in 0..out_h {
+        let rows = oy * src_h / out_h..ceil((oy + 1) * src_h, out_h);
+        for ox in 0..out_w {
+            let mut sum = [0i64; 4];
+            for sy in rows.clone() {
+                let cover_y = overlap(oy, sy, src_h, out_h);
+                for sx in ox * src_w / out_w..ceil((ox + 1) * src_w, out_w) {
+                    let cover = cover_y * overlap(ox, sx, src_w, out_w);
+                    let at = (((top + sy) * stride + left + sx) * 4) as usize;
+                    let a = i64::from(surface[at + 3]);
+                    for c in 0..3 {
+                        sum[c] += i64::from(surface[at + c]) * a * cover;
+                    }
+                    sum[3] += a * cover;
+                }
+            }
+            if sum[3] > 0 {
+                let at = ((oy * out_w + ox) * 4) as usize;
+                for c in 0..3 {
+                    rgba[at + c] = round(sum[c], sum[3]);
+                }
+                rgba[at + 3] = round(sum[3], src_w * src_h);
+            }
+        }
+    }
+    rgba
+}
+
 /// The part of the 200 by 200 surface 0x4e5aee shrinks into a cell, for
-/// a picture drawn at `(x, y)` with size `w` by `h`, and the scale:
-/// `[left, top, right, bottom]`.
-fn fit(x: i64, y: i64, w: i64, h: i64) -> Option<([i64; 4], f32)> {
+/// a picture drawn at `(x, y)` with size `w` by `h`, as
+/// `[left, top, right, bottom]`, and the size it shrinks to: each side
+/// times `37 / width`, never enlarged, to the nearest pixel.
+fn fit(x: i64, y: i64, w: i64, h: i64) -> Option<([i64; 4], [i64; 2])> {
     let cell = i64::from(SIZE) - 8;
     let [mut left, mut top, mut right, mut bottom] = [x, y, x + w, y + h];
     // 0x4e5b05..0x4e5bb8: grow a side shorter than the cell to the cell.
@@ -445,8 +464,15 @@ fn fit(x: i64, y: i64, w: i64, h: i64) -> Option<([i64; 4], f32)> {
     if left >= right || top >= bottom {
         return None;
     }
-    let scale = (cell as f32 / (right - left) as f32).min(1.0);
-    Some(([left, top, right, bottom], scale))
+    let width = right - left;
+    let out = |size: i64| {
+        if width > cell {
+            ((2 * size * cell + width) / (2 * width)).max(1)
+        } else {
+            size
+        }
+    };
+    Some(([left, top, right, bottom], [out(width), out(bottom - top)]))
 }
 
 /// The 200 by 200 surface filled with `background`, `picture` drawn over
@@ -897,11 +923,36 @@ mod tests {
     #[test]
     fn a_rendered_thumbnail_squares_the_picture_and_shrinks_it_into_the_cell() {
         // Tall: no grow, squared about its centre, shrunk by 37/60.
-        assert_eq!(fit(90, 70, 20, 60), Some(([70, 70, 130, 130], 37.0 / 60.0)));
+        assert_eq!(fit(90, 70, 20, 60), Some(([70, 70, 130, 130], [37, 37])));
         // Small: both sides grow to the 37-px cell, so no shrink.
-        assert_eq!(fit(95, 95, 10, 10), Some(([82, 82, 119, 119], 1.0)));
+        assert_eq!(fit(95, 95, 10, 10), Some(([82, 82, 119, 119], [37, 37])));
         // Wide: squared downward, then clamped to the surface's last pixel.
-        assert_eq!(fit(1, 95, 198, 10), Some(([1, 1, 199, 199], 37.0 / 198.0)));
+        assert_eq!(fit(1, 95, 198, 10), Some(([1, 1, 199, 199], [37, 37])));
+        // Clamped short: the height shrinks by the width's 37/60, so
+        // 49 · 37/60 = 30.2 rounds to 30.
+        assert_eq!(fit(0, 150, 60, 60), Some(([0, 150, 60, 199], [37, 30])));
+    }
+
+    #[test]
+    fn area_sampling_weighs_exact_footprints_and_rounds_halves_up() {
+        // 40 to 37: output pixel 0 spans source [0, 40/37), all of
+        // column 0 (0) and 3/37 of column 1 (20): 60/40 = 1.5 exactly,
+        // which rounds up. A rounded f32 scale gave 1.4999998 and 1.
+        let surface: Vec<u8> = (0..40 * 40)
+            .flat_map(|i| [if i % 40 == 1 { 20 } else { 0 }, 0, 0, 255])
+            .collect();
+        let out = area_sample(&surface, 40, [0, 0, 40, 40], [37, 37]);
+        assert_eq!(&out[..4], &[2, 0, 0, 255]);
+        // Unscaled, every pixel is copied.
+        let same = area_sample(&surface, 40, [0, 0, 40, 40], [40, 40]);
+        assert_eq!(same, surface);
+        // Half covered by alpha 0: the colour is the opaque part's, the
+        // alpha the covered share.
+        let half: Vec<u8> = [[0, 0, 0, 0], [100, 50, 10, 255]].concat();
+        assert_eq!(
+            area_sample(&half, 2, [0, 0, 2, 1], [1, 1]),
+            [100, 50, 10, 128]
+        );
     }
 
     #[test]

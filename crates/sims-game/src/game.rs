@@ -2677,12 +2677,6 @@ impl Game {
         self.hud.camera_strip_rect()
     }
 
-    /// Screen rectangle of the Camera subpanel's "Take Snapshot" button (`CamSnap`),
-    /// when open and wide enough to display beside `CamViewAlbum`.
-    pub fn camera_snapshot_button_rect(&self) -> Option<sims_ui::frame::Rect> {
-        self.hud.camera_snapshot_button_rect()
-    }
-
     /// Screen rectangle of the native `CamViewAlbum` (`1105`) button, if open and enabled.
     pub fn album_button_rect(&self) -> Option<sims_ui::frame::Rect> {
         self.hud.album_button_rect()
@@ -4065,6 +4059,13 @@ impl Game {
 
     /// Draws the frame.
     fn draw(&mut self) {
+        self.draw_frame(false);
+    }
+
+    /// Draws the frame, or with `photo` only the house view (the lot, its
+    /// people and what they hold) without menus, panel or dialogs: what
+    /// Camera Mode photographs.
+    fn draw_frame(&mut self, photo: bool) {
         let [w, h] = self.view.size.map(|n| n.max(1) as usize);
         if (self.canvas.width, self.canvas.height) != (w, h) {
             self.canvas = Canvas::new(w, h, [0, 0, 0]);
@@ -4196,6 +4197,14 @@ impl Game {
                 && self.hud.build_state.tool == Some(BuildTool::Roof))
         {
             self.draw_roof_preview();
+        }
+        if photo {
+            // The next frame presents in full: this one never reaches the
+            // window.
+            self.prev_steady_key = None;
+            self.present_damage = None;
+            self.prev_dynamic_rects = cur_dynamic_rects;
+            return;
         }
         if self.coop.is_active() {
             self.draw_coop_remote_indicators(viewport);
@@ -5073,11 +5082,6 @@ impl Game {
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
             return match cmd {
-                CameraCommand::TakeSnapshot => Outcome {
-                    redraw: true,
-                    photo: true,
-                    ..Outcome::default()
-                },
                 CameraCommand::OpenPhotoAlbum => Outcome {
                     redraw: true,
                     open_photo_album: true,
@@ -10353,10 +10357,15 @@ impl Game {
         self.shop_preview_yaw_deg = 0;
         self.shop_preview_body = None;
         self.shop_dialog.open();
-        // A choice dialog opens on its first item already in the view.
+        // A choice dialog opens on its first item already in the view, and
+        // that item is the selection OK accepts: a new request must not
+        // inherit the previous request's selection.
         let shown = choice
             .and(first)
             .map(|id| (preview_targets.get(&id).cloned(), id));
+        if let Some((_, id)) = &shown {
+            self.shop_dialog.select_item(id.clone());
+        }
         self.active_special_panel = Some(ActiveSpecialPanel {
             tick,
             request,
@@ -11031,10 +11040,16 @@ impl Game {
     /// (`person.data[65] > 1`, `0x427c69`) and not familyless (service NPC).
     /// Rows keep the caller's relationship order.
     ///
-    /// Native lists neighbors on this lot too: `cWinPhoneBook` filters by
-    /// family (`0x522ea1`), kind and relationship (`0x522f17`), and that the
-    /// neighbor's character resolves by GUID (`0x43ac10` on the object
-    /// definitions, `0x523136`), never by presence.
+    /// Native lists neighbors on this lot too: `cWinPhoneBook` never asks
+    /// where a neighbor is. It filters by family (`0x522ea1`), kind and a
+    /// relationship row with values (`0x522f17`), and skips a neighbor whose
+    /// GUID no longer resolves to a definition (`0x523011` after
+    /// `0x43ac10`). See [`phonebook_eligible`]. Each target is judged by
+    /// its first row, as `0x464f74` finds it, and listed once.
+    ///
+    /// **Not native:** `cWinPhoneBook` pages by family (`0x5230cc` picks
+    /// the page's family, `0x522f7a` lists its members); this lists every
+    /// eligible neighbor in the caller's relationship order.
     fn build_phonebook_snapshot(
         &self,
         world: &sims_sim::World,
@@ -11053,14 +11068,28 @@ impl Game {
         let caller_family = caller
             .and_then(|r| r.data.get(sims_sim::neighbors::FAMILY).copied())
             .unwrap_or(0);
+        let mut seen = BTreeSet::new();
         let entries = caller
             .map(|c| c.relationships.as_slice())
             .unwrap_or_default()
             .iter()
+            .filter(|row| seen.insert(row.target))
             .filter_map(|row| {
                 let id = i16::try_from(row.target).ok()?;
                 let record = records.get(&id).copied()?;
-                phonebook_eligible(record, caller_neighbor, caller_family).then(|| {
+                let resolves = self
+                    .lot
+                    .catalog()
+                    .object(world.characters.definition(record.guid))
+                    .is_some();
+                let eligible = phonebook_eligible(
+                    record,
+                    caller_neighbor,
+                    caller_family,
+                    &world.families,
+                    row,
+                ) && resolves;
+                eligible.then(|| {
                     let daily = row.values.first().copied().unwrap_or(0);
                     let lifetime = row.values.get(1).copied().unwrap_or(0);
                     let clamp = |v: i32| v.clamp(-100, 100) as i16;
@@ -11188,24 +11217,39 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// Crops the rendered lot canvas to the active Camera Mode `SnapshotSize`
-    /// centered on the frame (clamped to canvas bounds) so selecting Small,
-    /// Medium, Large, or Custom changes the saved PNG snapshot dimensions.
+    /// The Camera Mode photo: the house view drawn alone (no panel, menus
+    /// or dialogs), cropped by [`Game::capture_snapshot_canvas`]. The full
+    /// frame is drawn again afterwards, so the canvas still shows the screen.
+    pub fn take_photo(&mut self) -> Canvas {
+        self.draw_frame(true);
+        let shot = self.capture_snapshot_canvas();
+        self.draw();
+        shot
+    }
+
+    /// Crops the canvas to the active Camera Mode `SnapshotSize`, centred
+    /// on the house viewport and clamped to it, so selecting Small, Medium,
+    /// Large or Custom changes the saved picture's size and the panel below
+    /// the viewport never shows. (**Unverified:** that native centres the
+    /// crop on the house view.)
     pub fn capture_snapshot_canvas(&self) -> Canvas {
         let state = self.hud.camera_state();
         let [req_w, req_h] = state.size.dimensions(state.custom_dimensions);
         let src_w = self.canvas.width;
         let src_h = self.canvas.height;
-        if src_w == 0 || src_h == 0 || req_w == 0 || req_h == 0 {
+        let (view_w, view_h) = self.house_viewport_size();
+        let area_w = (view_w as usize).min(src_w);
+        let area_h = (view_h as usize).min(src_h);
+        if area_w == 0 || area_h == 0 || req_w == 0 || req_h == 0 {
             return self.canvas.clone();
         }
-        let crop_w = (req_w as usize).min(src_w);
-        let crop_h = (req_h as usize).min(src_h);
+        let crop_w = (req_w as usize).min(area_w);
+        let crop_h = (req_h as usize).min(area_h);
         if crop_w == src_w && crop_h == src_h {
             return self.canvas.clone();
         }
-        let x0 = (src_w - crop_w) / 2;
-        let y0 = (src_h - crop_h) / 2;
+        let x0 = (area_w - crop_w) / 2;
+        let y0 = (area_h - crop_h) / 2;
         let mut out = Canvas::new(crop_w, crop_h, [0, 0, 0]);
         for y in 0..crop_h {
             let src_row = (y0 + y) * src_w + x0;
@@ -13616,6 +13660,8 @@ fn phonebook_eligible(
     record: &sims_sim::neighbors::Neighbor,
     caller: i16,
     caller_family: i16,
+    families: &[sims_sim::neighbors::Family],
+    row: &sims_sim::neighbors::Row,
 ) -> bool {
     let family = record
         .data
@@ -13627,11 +13673,18 @@ fn phonebook_eligible(
         .get(sims_sim::neighbors::KIND)
         .copied()
         .unwrap_or(0);
-    record.id > 0
-        && record.id != caller
-        && kind <= 1
-        && family > 0
-        && (caller_family <= 0 || family != caller_family)
+    // `0x522ea1`: not the caller's family; below 2000 a family needs an
+    // ID and a house (`[family + 0x110] >= 1`). Native reaches a neighbor
+    // only as a member GUID of a family in the neighborhood's list.
+    let family_ok = family != caller_family
+        && families.iter().any(|f| {
+            f.id == i32::from(family)
+                && f.members.contains(&record.guid)
+                && (family >= 2000 || (family != 0 && f.house >= 1))
+        });
+    // `0x522f17`: kind at most 1 and a relationship row with values
+    // (`0x464f74` gives the first row's value count).
+    record.id > 0 && record.id != caller && kind <= 1 && family_ok && !row.values.is_empty()
 }
 
 /// The suit category letter of `Dialog` kind 6 mode `0..=5` (`0x5097c9`):
@@ -14419,13 +14472,14 @@ mod tests {
     fn phone_book_eligibility_is_family_kind_and_caller_only() {
         // `cWinPhoneBook` never asks where a neighbor is (`0x522f17`), so
         // there is no presence input at all.
+        use sims_sim::neighbors::{FAMILY, Family, KIND, Neighbor, PERSON_WORDS, Row};
         let record = |id: i16, family: i16, kind: i16| {
-            let mut data = vec![0i16; sims_sim::neighbors::PERSON_WORDS];
-            data[sims_sim::neighbors::FAMILY] = family;
-            data[sims_sim::neighbors::KIND] = kind;
-            sims_sim::neighbors::Neighbor {
+            let mut data = vec![0i16; PERSON_WORDS];
+            data[FAMILY] = family;
+            data[KIND] = kind;
+            Neighbor {
                 id,
-                guid: 0,
+                guid: 0x1000 + id as u32,
                 revision: 1,
                 data,
                 relationships: Vec::new(),
@@ -14433,13 +14487,51 @@ mod tests {
                 stale: false,
             }
         };
-        assert!(phonebook_eligible(&record(5, 3, 0), 1, 2), "a neighbor");
+        let family = |id: i32, house: i32, members: &[i16]| Family {
+            id,
+            house,
+            members: members.iter().map(|&m| 0x1000 + m as u32).collect(),
+            friends: 0,
+            stale: false,
+        };
+        let families = [
+            family(2, 1, &[1]),
+            family(3, 4, &[5, 7]),
+            family(4, 0, &[6]),
+            family(2001, 0, &[8]),
+            family(0, 0, &[9]),
+        ];
+        let met = Row {
+            target: 0,
+            values: vec![10, 20],
+        };
+        let eligible = |r: &Neighbor, row: &Row| phonebook_eligible(r, 1, 2, &families, row);
+        assert!(eligible(&record(5, 3, 0), &met), "a neighbor");
+        assert!(!eligible(&record(5, 2, 0), &met), "the caller's family");
+        assert!(!eligible(&record(9, 0, 0), &met), "familyless");
+        assert!(!eligible(&record(5, 3, 2), &met), "a pet");
+        assert!(!eligible(&record(1, 3, 0), &met), "the caller");
         assert!(
-            !phonebook_eligible(&record(5, 2, 0), 1, 2),
-            "the caller's family"
+            !eligible(&record(6, 4, 0), &met),
+            "a family below 2000 without a house"
         );
-        assert!(!phonebook_eligible(&record(5, 0, 0), 1, 2), "familyless");
-        assert!(!phonebook_eligible(&record(5, 3, 2), 1, 2), "a pet");
-        assert!(!phonebook_eligible(&record(1, 3, 0), 1, 2), "the caller");
+        assert!(
+            eligible(&record(8, 2001, 0), &met),
+            "a family from 2000 needs no house"
+        );
+        assert!(
+            !eligible(&record(10, 3, 0), &met),
+            "not a member of the family it names"
+        );
+        assert!(
+            !eligible(
+                &record(7, 3, 0),
+                &Row {
+                    target: 0,
+                    values: Vec::new()
+                }
+            ),
+            "a relationship row without values"
+        );
     }
 }

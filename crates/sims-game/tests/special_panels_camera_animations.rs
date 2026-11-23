@@ -485,12 +485,38 @@ fn native_camera_panel_wires_all_8_buttons_strings_album_and_clean_capture() {
         SnapshotSize::Large
     );
     shell.render();
-    let large_cap = shell.game().unwrap().capture_snapshot_canvas();
+    let large_cap = shell.game_mut().unwrap().take_photo();
     assert_eq!(
         (large_cap.width, large_cap.height),
         (640, 480),
         "Large SnapshotSize must crop captured PNG canvas to 640x480"
     );
+    // The photo is the house view centred in the viewport, never the panel
+    // below it: its rows match the frame's own rows inside the viewport (a
+    // crop of the whole frame would sit 50 rows lower). Only the upper
+    // half is compared: the Large button's Quick Tips balloon, which the
+    // photo leaves out, covers part of the lower viewport.
+    {
+        let game = shell.game().unwrap();
+        let canvas = game.canvas();
+        let (view_w, view_h) = game.house_viewport_size();
+        let (view_w, view_h) = (view_w as usize, view_h as usize);
+        assert!(
+            view_h < canvas.height,
+            "the panel is open below the viewport"
+        );
+        let x0 = (view_w - 640) / 2;
+        let y0 = (view_h - 480) / 2;
+        for y in 0..240 {
+            let row = (y0 + y) * canvas.width + x0;
+            assert_eq!(
+                &large_cap.color[y * 640..(y + 1) * 640],
+                &canvas.color[row..row + 640],
+                "photo row {y} must be viewport row {}",
+                y0 + y
+            );
+        }
+    }
 
     // Toggle snapshot quality -> Low (keeps CameraPanel open).
     let low_pt = [

@@ -126,16 +126,6 @@ pub enum OptionsDialog {
 /// `0x5e8c93..0x5e8e10`).
 pub const DIALOG_FADE_DURATION_MS: u32 = 200;
 
-/// Interactive button inside the bottom Camera subpanel (toggled by the
-/// cluster's Camera button, `Command::Camera(Photo)`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CameraStripAction {
-    /// Captures a PNG snapshot of the current lot view.
-    TakeSnapshot,
-    /// Opens the household Photo Album modal (`F10`).
-    PhotoAlbum,
-}
-
 pub struct Hud {
     pub art: Art,
     faces: Faces,
@@ -213,12 +203,8 @@ pub struct Hud {
     camera_strings: CameraStrings,
     /// Last laid-out native `CameraLayout` while Camera Mode is open.
     camera_layout: Option<CameraLayout>,
-    /// Whether the auxiliary Take Snapshot button beside `CamViewAlbum` is pressed.
-    pressed_camera_snapshot: bool,
     /// Last laid-out bounding rect of the Camera subpanel strip when open.
     camera_strip_rect: Option<Rect>,
-    /// Last laid-out screen rect of the Take Snapshot button (`CamSnap`), when wide enough to display.
-    camera_snapshot_rect: Option<Rect>,
     /// Whether the Roof camera toggle (`Camera::Roof`) is active.
     roof_view: bool,
     /// Classic Sims 1 top-left cheat console (`Ctrl+Shift+C` / `Cmd+Shift+C`).
@@ -678,9 +664,7 @@ impl Hud {
             },
             camera_strings: static_part.camera_strings,
             camera_layout: None,
-            pressed_camera_snapshot: false,
             camera_strip_rect: None,
-            camera_snapshot_rect: None,
             roof_view: false,
             cheat_console: CheatConsole::new(),
             menu: None,
@@ -747,9 +731,7 @@ impl Hud {
         self.camera_strip_open = false;
         self.camera_panel.clear_pointer();
         self.camera_layout = None;
-        self.pressed_camera_snapshot = false;
         self.camera_strip_rect = None;
-        self.camera_snapshot_rect = None;
         self.roof_view = false;
         self.controls.pressed_options_action = None;
         self.controls.help = None;
@@ -1003,21 +985,13 @@ impl Hud {
     fn clear_camera_strip_layout(&mut self) {
         self.camera_panel.clear_pointer();
         self.camera_layout = None;
-        self.pressed_camera_snapshot = false;
         self.camera_strip_rect = None;
-        self.camera_snapshot_rect = None;
     }
 
     /// Bounding rectangle of the Camera subpanel inside the bottom panel strip
     /// area, when open.
     pub fn camera_strip_rect(&self) -> Option<Rect> {
         self.camera_strip_rect
-    }
-
-    /// Screen rectangle of the Camera subpanel's "Take Snapshot" button (`CamSnap`),
-    /// when open and wide enough to display beside `CamViewAlbum`.
-    pub fn camera_snapshot_button_rect(&self) -> Option<Rect> {
-        self.camera_snapshot_rect
     }
 
     /// Screen rectangle of the native `CamViewAlbum` (`1105`) button, when the
@@ -1029,28 +1003,16 @@ impl Hud {
         self.camera_button_rect(CameraButton::ViewAlbum)
     }
 
-    /// Releases a held native `cWinCamera` button or Take Snapshot button,
-    /// returning `(changed, Option<CameraCommand>)`.
+    /// Releases a held native `cWinCamera` button, returning
+    /// `(changed, Option<CameraCommand>)`.
     ///
     /// Size and quality toggles update `self.camera_state` in place while
-    /// keeping the Camera subpanel open; `TakeSnapshot` and `OpenPhotoAlbum`
-    /// close the subpanel cleanly before returning so PNG capture never
-    /// includes the Camera strip.
+    /// keeping the Camera subpanel open; `OpenPhotoAlbum` closes the
+    /// subpanel before returning. Photos are taken by clicking the lot.
     pub fn release_camera_strip(
         &mut self,
         point: Option<[i32; 2]>,
     ) -> (bool, Option<CameraCommand>) {
-        if self.pressed_camera_snapshot {
-            self.pressed_camera_snapshot = false;
-            let activated = point
-                .is_some_and(|[x, y]| self.camera_snapshot_rect.is_some_and(|r| r.contains(x, y)));
-            if activated {
-                self.play(CLICK);
-                self.close_camera_strip();
-                return (true, Some(CameraCommand::TakeSnapshot));
-            }
-            return (true, None);
-        }
         if self.camera_panel.pressed().is_none() {
             return (false, None);
         }
@@ -1085,11 +1047,6 @@ impl Hud {
                 self.play(CLICK);
                 self.close_camera_strip();
                 (true, Some(CameraCommand::OpenPhotoAlbum))
-            }
-            Some(CameraCommand::TakeSnapshot) => {
-                self.play(CLICK);
-                self.close_camera_strip();
-                (true, Some(CameraCommand::TakeSnapshot))
             }
             Some(CameraCommand::Help(topic)) => {
                 self.play(WHOOSH);
@@ -2715,7 +2672,6 @@ impl Hud {
         // divider, and Photo Album) — snapshots are taken by clicking the lot
         // viewport, with no synthetic button injected into the strip.
         self.camera_strip_rect = Some(strip);
-        self.camera_snapshot_rect = None;
         self.camera_layout = Some(layout);
     }
 
@@ -2934,9 +2890,7 @@ impl Hud {
                 .is_some_and(|[x, y]| self.saves_button_rect.is_some_and(|r| r.contains(x, y)));
             let c = pointer
                 .is_some_and(|[x, y]| self.coop_button_rect.is_some_and(|r| r.contains(x, y)));
-            let snap = pointer
-                .is_some_and(|[x, y]| self.camera_snapshot_rect.is_some_and(|r| r.contains(x, y)));
-            (s, c, snap)
+            (s, c)
         };
         let prev_camera_hover = self.camera_panel.hovered();
         let before = (
@@ -3106,27 +3060,20 @@ impl Hud {
             self.dismiss_help();
             return None;
         }
-        if self.camera_strip_open {
-            if self
-                .camera_snapshot_rect
-                .is_some_and(|r| r.contains(point[0], point[1]))
-            {
-                self.pressed_camera_snapshot = true;
+        if self.camera_strip_open
+            && let Some(strip) = self.camera_strip_rect
+        {
+            let state = self.camera_state();
+            if self.camera_panel.press(
+                point[0],
+                point[1],
+                strip,
+                &state,
+                &self.camera_strings,
+                &self.art,
+            ) {
+                self.dismiss_help();
                 return None;
-            }
-            if let Some(strip) = self.camera_strip_rect {
-                let state = self.camera_state();
-                if self.camera_panel.press(
-                    point[0],
-                    point[1],
-                    strip,
-                    &state,
-                    &self.camera_strings,
-                    &self.art,
-                ) {
-                    self.dismiss_help();
-                    return None;
-                }
             }
         }
         if self

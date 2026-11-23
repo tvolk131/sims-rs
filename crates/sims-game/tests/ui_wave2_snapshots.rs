@@ -193,17 +193,33 @@ fn wave2_panels_open_and_draw_with_native_art() {
         .find(|r| r.id == neighbor)
         .map(|r| r.data[FAMILY])
         .expect("Mortimer's record");
-    let townies: Vec<i16> = social_world
+    // Callable as `0x522ea1` has it: a member of a listed family other
+    // than the caller's, which below ID 2000 needs a house.
+    let callable = |r: &&sims_sim::neighbors::Neighbor| {
+        let family = r.data[FAMILY];
+        r.id > 0
+            && r.data[KIND] <= 1
+            && family != goth_family
+            && world.families.iter().any(|f| {
+                f.id == i32::from(family)
+                    && f.members.contains(&r.guid)
+                    && (family >= 2000 || (family != 0 && f.house >= 1))
+            })
+    };
+    let candidates: Vec<i16> = social_world
         .neighbors
         .slots
         .iter()
         .flatten()
-        .filter(|r| r.id > 0 && r.data[KIND] <= 1 && r.data[FAMILY] > 0)
-        .filter(|r| r.data[FAMILY] != goth_family)
+        .filter(callable)
         .map(|r| r.id)
-        .take(10)
+        .take(11)
         .collect();
-    assert!(!townies.is_empty(), "the neighborhood has other families");
+    assert!(candidates.len() >= 2, "the neighborhood has other families");
+    // The last candidate gets a row without values, which `0x522f17`
+    // skips; the first gets a second row, listed once.
+    let (&unmet, townies) = candidates.split_last().expect("candidates");
+    let townies = townies.to_vec();
     let mortimer = social_world
         .neighbors
         .slots
@@ -218,6 +234,14 @@ fn wave2_panels_open_and_draw_with_native_art() {
             values: vec![i * 22 - 60, i * 15 - 30],
         });
     }
+    mortimer.relationships.push(Row {
+        target: i32::from(unmet),
+        values: Vec::new(),
+    });
+    mortimer.relationships.push(Row {
+        target: i32::from(townies[0]),
+        values: vec![90, 90],
+    });
     preview(
         &mut game,
         "phonebook",
@@ -227,11 +251,16 @@ fn wave2_panels_open_and_draw_with_native_art() {
         &social_world,
         &before,
     );
-    let listed = game.phonebook_snapshot().expect("phone book").entries.len();
+    let listed: Vec<i16> = game
+        .phonebook_snapshot()
+        .expect("phone book")
+        .entries
+        .iter()
+        .map(|e| e.neighbor_id)
+        .collect();
     assert_eq!(
-        listed,
-        townies.len(),
-        "every townie Mortimer knows is listed"
+        listed, townies,
+        "every townie Mortimer knows is listed once, in his row order"
     );
 
     preview(
@@ -244,8 +273,33 @@ fn wave2_panels_open_and_draw_with_native_art() {
         &world,
         &before,
     );
-    let wardrobe = game.shop_snapshot().expect("wardrobe").items.len();
-    assert!(wardrobe > 0, "the everyday wardrobe lists outfits");
+    let wardrobe = game.shop_snapshot().expect("wardrobe").clone();
+    assert!(
+        !wardrobe.items.is_empty(),
+        "the everyday wardrobe lists outfits"
+    );
+    // The dialog opens with its first outfit on show, unprompted.
+    assert_eq!(
+        wardrobe.tried_on_item_id.as_deref(),
+        Some(wardrobe.items[0].id.as_str()),
+        "the wardrobe opens on its first outfit"
+    );
+    assert!(
+        wardrobe.preview_image.is_some(),
+        "the wardrobe opens with the outfit in 3D: {:?}",
+        wardrobe.preview_label
+    );
+    // Previous wraps to the last outfit and shows it.
+    assert!(game.shop_select_prev(), "the previous arrow wraps");
+    let last = &wardrobe.items[wardrobe.items.len() - 1].id;
+    assert_eq!(
+        game.shop_snapshot()
+            .expect("wardrobe")
+            .tried_on_item_id
+            .as_ref(),
+        Some(last),
+        "previous on the first outfit shows the last"
+    );
     preview(
         &mut game,
         "charm-transform",
@@ -269,16 +323,20 @@ fn wave2_panels_open_and_draw_with_native_art() {
             &dog_world,
             &before,
         );
-        // Try On turns the breed on the 3D turntable.
-        game.shop_try_on_selected();
-        game.shop_rotate_preview(45);
-        game.render();
+        // The pet dialog opens with its first breed already in the view.
         let snap = game.shop_snapshot().expect("pet picker");
+        assert_eq!(
+            snap.tried_on_item_id.as_deref(),
+            snap.items.first().map(|item| item.id.as_str()),
+            "the pet picker opens on its first breed"
+        );
         assert!(
             snap.preview_image.is_some(),
             "the pet picker previews the breed in 3D: {:?}",
             snap.preview_label
         );
+        game.shop_rotate_preview(45);
+        game.render();
         snapshot("pet-picker-preview", game.canvas());
     } else {
         panic!("Complete Collection must define a dog person type");

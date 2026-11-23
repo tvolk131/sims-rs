@@ -153,7 +153,6 @@ fn live_mode_has_no_cam_view_album_overlap_and_camera_button_toggles_substrip() 
         let game = shell.game().expect("active game");
         assert!(!game.camera_strip_open());
         assert!(game.camera_strip_rect().is_none());
-        assert!(game.camera_snapshot_button_rect().is_none());
         assert!(game.album_button_rect().is_none());
     }
 
@@ -183,11 +182,6 @@ fn live_mode_has_no_cam_view_album_overlap_and_camera_button_toggles_substrip() 
         let game = shell.game().expect("active game");
         assert!(game.camera_strip_open());
         let strip = game.camera_strip_rect().expect("Camera sub-strip rect");
-        // `Sims.exe` 1.91 `camera-strip.png`: no synthetic Take Snapshot button.
-        assert!(
-            game.camera_snapshot_button_rect().is_none(),
-            "native cWinCamera has no Take Snapshot button"
-        );
         let album = game.album_button_rect().expect("Photo Album rect");
         // Strictly to the right of the 220px Live Mode cluster (zero overlap with clock/speed/Camera).
         assert!(

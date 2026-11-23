@@ -1014,22 +1014,28 @@ impl ShopPickerDialog {
         }
     }
 
-    /// A choice dialog's arrow: the next or previous item, tried on so the
-    /// 3D view shows it. None at either end.
+    /// A choice dialog's arrow: the next or previous item, wrapping at
+    /// either end as native does (`0x40d229` past the last goes to the
+    /// first, `0x40d360` before the first goes to the last). The item is
+    /// always tried on, so the view (or its fallback) follows the
+    /// selection even when no picture can be rendered. None only when
+    /// there is nothing to move to.
     pub fn choose(&mut self, snapshot: &ShopSnapshot, next: bool) -> Option<ShopCommand> {
-        let moved = if next {
-            self.select_next(snapshot)
-        } else {
-            self.select_prev(snapshot)
-        };
-        if !moved {
+        let count = snapshot.items.len();
+        let idx = self.selected_index(snapshot)?;
+        if count < 2 {
             return None;
         }
-        self.selected_item(snapshot)
-            .filter(|item| item.supports_try_on)
-            .map(|item| ShopCommand::TryOn {
-                item_id: item.id.clone(),
-            })
+        let to = if next {
+            (idx + 1) % count
+        } else {
+            (idx + count - 1) % count
+        };
+        let item = &snapshot.items[to];
+        self.select_item(item.id.clone());
+        Some(ShopCommand::TryOn {
+            item_id: item.id.clone(),
+        })
     }
 
     fn button_state(&self, target: ShopHit, enabled: bool) -> ButtonState {
@@ -1468,27 +1474,53 @@ impl ShopPickerDialog {
                 TEXT_HOVER,
             );
         }
-        if let (Some(view), Some(image)) = (layout.preview_pane, snapshot.preview_image.as_ref()) {
-            // Rendered at the view's size; a smaller picture sits centred.
-            let x = view.x + (view.width - image.width as i32) / 2;
-            let y = view.y + (view.height - image.height as i32) / 2;
-            frame.draw_all(image, [x, y]);
+        match (layout.preview_pane, snapshot.preview_image.as_ref()) {
+            (Some(view), Some(image)) => {
+                // Rendered at the view's size; a smaller picture sits centred.
+                let x = view.x + (view.width - image.width as i32) / 2;
+                let y = view.y + (view.height - image.height as i32) / 2;
+                frame.draw_all(image, [x, y]);
+            }
+            (Some(view), None) => {
+                // Not native: when the 3D view cannot render (a missing
+                // skeleton or mesh), name the candidate so OK never accepts
+                // an unseen choice.
+                if let (Some(font), Some(item)) = (
+                    art.font(10).or_else(|| art.font(12)),
+                    self.selected_item(snapshot),
+                ) {
+                    let note = snapshot
+                        .preview_label
+                        .as_deref()
+                        .filter(|label| *label != item.name);
+                    let line_h = 14;
+                    let mut y = view.y + view.height / 2 - line_h;
+                    for line in std::iter::once(item.name.as_str()).chain(note) {
+                        let width = font.width(line).min(view.width);
+                        draw_clipped_text(
+                            frame,
+                            font,
+                            line,
+                            [view.x + (view.width - width) / 2, y],
+                            view.width,
+                            TEXT_HOVER,
+                        );
+                        y += line_h;
+                    }
+                }
+            }
+            _ => {}
         }
-        let selected = self.selected_index(snapshot);
-        let count = snapshot.items.len();
+        // Native arrows wrap, so both stay live while there is a choice.
+        let movable = snapshot.items.len() > 1;
         for (rect, hit, id, enabled) in [
             (
                 layout.previous_btn,
                 ShopHit::PreviousItem,
                 CLOTHING_PREVIOUS,
-                selected.is_some_and(|i| i > 0),
+                movable,
             ),
-            (
-                layout.next_btn,
-                ShopHit::NextItem,
-                CLOTHING_NEXT,
-                selected.is_some_and(|i| i + 1 < count),
-            ),
+            (layout.next_btn, ShopHit::NextItem, CLOTHING_NEXT, movable),
         ] {
             let Some(rect) = rect else {
                 continue;

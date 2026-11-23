@@ -3532,7 +3532,7 @@ impl NeighborhoodShell {
         if outcome.photo
             && let Err(err) = self.capture_lot_photo()
         {
-            self.set_note(format!("The photo was not saved: {err}"));
+            self.show_notice("Photo Album", format!("The photo was not saved: {err}"));
         }
         if let ActiveScreen::Lot(session) = &mut self.screen
             && session.game.asking().is_none()
@@ -6322,7 +6322,11 @@ impl NeighborhoodShell {
 
     /// Stores a Camera Mode photo of the open lot in its household's album
     /// (`cWinCamera`: clicking the lot takes the picture). The picture is
-    /// the Camera Mode size crop of the rendered lot.
+    /// the Camera Mode size crop of the house view ([`Game::take_photo`]).
+    ///
+    /// An error means the photo was not stored. Once it is stored the ID
+    /// is returned; an open album that then fails to refresh is reported
+    /// with a notice, not as an error, so a retry cannot store it twice.
     pub fn capture_lot_photo(&mut self) -> Result<PhotoId, String> {
         let family_id = self
             .album_family()
@@ -6331,8 +6335,7 @@ impl NeighborhoodShell {
             return Err("a photo needs an open lot".to_owned());
         };
         let nh_id = session.neighborhood_id.clone();
-        session.game.render();
-        let image = capture_canvas_to_album_image(&session.game.capture_snapshot_canvas())?;
+        let image = capture_canvas_to_album_image(&session.game.take_photo())?;
         let sim_day = u32::try_from(
             session
                 .game
@@ -6370,8 +6373,14 @@ impl NeighborhoodShell {
             .add(&nh_id, token, entry)
             .map_err(|e| e.to_string())?;
         let id = PhotoId(photo.id);
-        if self.album_dialog.is_open() && self.album_token == Some(token) {
-            self.reload_album_snapshot(Some(id))?;
+        if self.album_dialog.is_open()
+            && self.album_token == Some(token)
+            && let Err(err) = self.refresh_album_snapshot()
+        {
+            self.show_notice(
+                "Photo Album",
+                format!("The photo was saved, but the album did not refresh: {err}"),
+            );
         }
         Ok(id)
     }
@@ -6577,6 +6586,24 @@ impl NeighborhoodShell {
         if let Some(id) = select_id {
             self.album_dialog.select_entry(&snapshot, id);
         }
+        self.album_snapshot = Some(snapshot);
+        self.sync_album_strip_scroll_to_selection();
+        self.hydrate_album_images();
+        Ok(())
+    }
+
+    /// Rebuilds the open album from the store without moving its
+    /// selection: the selected photo, its strip position and any caption
+    /// being typed stay as they are, and new photos join the list.
+    fn refresh_album_snapshot(&mut self) -> Result<(), String> {
+        let (Some(nh_id), Some(token)) = (self.album_neighborhood_id.clone(), self.album_token)
+        else {
+            return Err("Photo Album is not open".into());
+        };
+        let keep = self.album_dialog.selected_id();
+        let (snapshot, has_image) = self.build_album_snapshot(&nh_id, token.family_id, keep)?;
+        self.album_has_image = has_image;
+        self.album_dialog.sync_snapshot(&snapshot);
         self.album_snapshot = Some(snapshot);
         self.sync_album_strip_scroll_to_selection();
         self.hydrate_album_images();

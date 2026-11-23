@@ -21,6 +21,11 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
      - a heap-sort fallback;
      - a guarded insertion pass over the first 16, then unguarded insertion.
    - `BuildCatalog::items_for(Floor)` runs it.
+   - The tests check the port against the 1.91 routine itself: `0x501a69`
+     and `0x501b21` with an exhausted budget, run under an x86 emulator
+     over the shipped image, with the predicate call (`0x501c80`)
+     answered from the same keys. Both leave the same permutations as
+     the port, the heap fallback included.
    - Wallpaper order is unchanged: once the swatches were fixed, its strip
      scored .98 against the oracle.
 2. **Wallpaper swatches.**
@@ -41,7 +46,10 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
      - it grows a side shorter than the 37 px cell to 37;
      - it squares the rect about its centre;
      - it clamps the rect to 199;
-     - it shrinks by `min(37/w, 1)`.
+     - it shrinks by `min(37/w, 1)`, each side rounded to the nearest
+       pixel.
+   - The shrink is an exact area average: footprints come from the whole
+     input and output sizes, with integer weights, and halves round up.
    - The two cells sit side by side, so the result is 74×37 at full size.
    - `Thumbnails::with_template` carries the two background colours.
    - Three CC doors take this path: Outdoor Indoor Door, Gaily Gilded Gypsy
@@ -58,8 +66,15 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
    - The pet dialog (`0x521911`) has the same shape, with `STR# 221`
      ("Please Select Your Pet") and param 5.0.
    - `ShopSnapshot::choice` selects this layout.
-   - Each arrow steps the selection and tries the item on. The dialog
-     opens already trying on the first item.
+   - Each arrow steps the selection and tries the item on. The arrows
+     wrap at both ends, as native's do (`0x40d229` past the last goes to
+     the first, `0x40d360` before the first goes to the last).
+   - The dialog opens with its first item both selected and tried on, so
+     OK accepts what is on show, even if an earlier request left
+     another item selected.
+   - **Not native:** when the view cannot render (a pet without a
+     skeleton, a missing mesh), the view names the item, so OK never
+     accepts an unseen choice.
    - Raw suit names and the " [Preview]"/" [Owned]" suffixes are gone,
      because no list exists.
 5. **Pet preview scale.** Pets render at 200×300 and ×5.0/3.25 the Sim
@@ -72,7 +87,18 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
    - Photos now come from where they come from natively: clicking the lot
      with the Camera strip open (`cWinCamera`).
    - `NeighborhoodShell::capture_lot_photo` stores the Camera Mode size
-     crop in the household's album, and refreshes an open album.
+     crop in the household's album.
+   - The photo is the house view alone (`Game::take_photo`). The view is
+     drawn without the panel, menus or dialogs, and the crop is centred
+     on the house viewport, so the control panel never shows in a Large
+     photo. The viewer's PNG copy (`LotHotkey::Photo`, and the same lot
+     click) uses the same picture.
+   - A save that fails shows a notice. Once a photo is stored, its ID is
+     returned. An open album is then refreshed without moving its
+     selection or dropping a caption being typed. A refresh that fails
+     shows a notice, so a retry cannot store the photo twice.
+   - The Camera strip's dead Take Snapshot path is removed:
+     `CameraCommand::TakeSnapshot` and its button state.
 7. **Roof page arrows.**
    - `cWinRoofPanel` (`0x52911a`) reads its six buttons from `UIText.iff`
      `STR# 147` `roofpanelstrs`. The art table at `0x66d73c` is
@@ -90,14 +116,19 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
    - Wave 2 left out any neighbor whose person object was registered on
      the lot. The aim was neighbors on this lot, but it also caught
      off-map ones.
-   - Native has no presence test at all:
-     - `0x522ea1` filters by family;
-     - `0x522f17` checks kind ≤ 1 and a relationship row;
-     - `0x523136`/`0x522f7a` require the neighbor's character to resolve
-       by GUID. `0x43ac10` looks it up in the 5,454-entry object
-       definitions table.
-   - The filter is removed. A neighbor visiting the lot can be called, as
-     in 1.91.
+   - Native has no presence test at all, so the filter is removed. A
+     neighbor visiting the lot can be called, as in 1.91.
+   - The native checks are mirrored:
+     - `0x522ea1`: not the caller's family. Below family ID 2000, the
+       family needs a nonzero ID and a house (`[family + 0x110] >= 1`).
+       A neighbor is reached only as a member GUID of a family in the
+       neighborhood's list.
+     - `0x522f17`: kind ≤ 1, and the caller's first row for the neighbor
+       (`0x464f74`) has at least one value.
+     - `0x523011`: the neighbor's GUID resolves to a definition
+       (`0x43ac10`). Ours uses the catalog through
+       `Characters::definition`.
+   - Each neighbor is listed once, judged by their first row.
 
 ## Oracle tour
 
@@ -124,7 +155,6 @@ choice dialogs. All three were inspected by eye.
 - **Choice dialogs.**
   - The size of the frame and its border.
   - The pet view's size; the dialog-area source is not traced.
-  - Whether the arrows wrap at either end. Ours stop.
   - That Charm Transform (kind 14) uses `cWinClothingChoiceDlg`. This is
     inferred; the call path through `0x4417xx` would not disassemble
     cleanly.
@@ -135,8 +165,8 @@ choice dialogs. All three were inspected by eye.
 - **Roof pages** wider or narrower than 800/1024 use the 16-pattern layout
   when it fits, else the 8-pattern one, else our old fitted grid. Native
   only knows 800 and the rest.
-- **Phone book.** The family check's `[family + 0x110] ≥ 1` test for IDs
-  below 2000 is not mirrored. We test `family > 0`.
+- **Photo crop.** That native centres the Camera crop on the house
+  viewport.
 
 ## Residuals
 
@@ -148,3 +178,7 @@ choice dialogs. All three were inspected by eye.
   reading above, so we left them alone.
 - **No oracle shot** shows the wardrobe, charm or pet dialog, or a second
   roof page.
+- **Phone book pages.** Native `cWinPhoneBook` shows one family per page:
+  `0x5230cc` picks the page's family and `0x522f7a` lists its members.
+  Ours lists every eligible neighbor in the caller's relationship order,
+  as Wave 2 did. A follow-up should page by family.
