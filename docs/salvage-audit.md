@@ -4,6 +4,12 @@ A read-only audit of every crate, graded against `docs/vision.md`. Its purpose
 is to decide what carries into the re-founded workspace. Paths refer to the
 `integration/playable-alpha-20261113` branch.
 
+**Status (November 23, 2026):** `sims-kernel`, `sims-fixtures` and `sims-tools`
+have been mined and removed. They are still readable at the `legacy-final` tag. Every
+other crate stays until its backlog in `docs/legacy-mining-audit.md` is empty. See
+`docs/decisions/20261123-legacy-crate-by-crate-cleanup.md`. Paths below are
+under `legacy/crates/`.
+
 Verdicts:
 - **PORT:** carry the code over, with light changes.
 - **REFACTOR:** carry it over after restructuring.
@@ -29,9 +35,9 @@ on private fixtures.
 | sims-content | 98k | ~6% | ~30% | New crate; port the index, GUID scan, save import and linker |
 | sims-runtime | 129k | ~2% | ~12–15% | Leave behind; port the exploration fuzzer |
 | sims-app | 88k | ~2% | ~9% | Leave behind; mine the HUD layout tables |
-| sims-kernel | 5.5k | 0 | 0 | DROP (Win32 mutex/event emulation) |
-| sims-fixtures | 6.8k | 0 | design only | DROP (evidence store) |
-| sims-tools | 0.9k | 0 | small | Rebuild as a thin CLI |
+| sims-kernel | 5.5k | 0 | 0 | DROP (Win32 mutex/event emulation). **Removed 2026-11-23** |
+| sims-fixtures | 6.8k | 0 | design only | DROP (evidence store). **Removed 2026-11-23** |
+| sims-tools | 0.9k | 0 | small | Rebuild as a thin CLI (done: `sims-cli`, `sims-antics lift`). **Removed 2026-11-23** |
 
 ## Cross-cutting findings
 

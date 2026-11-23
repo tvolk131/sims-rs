@@ -48,6 +48,7 @@ pub mod hud;
 pub mod loading;
 pub mod neighborhood;
 pub mod options;
+pub mod phonebook;
 pub mod pie;
 pub mod queue;
 pub mod saves;

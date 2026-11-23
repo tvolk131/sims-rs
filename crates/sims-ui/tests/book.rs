@@ -42,6 +42,7 @@ fn sample_snapshot() -> ReferenceBookSnapshot {
         pages: vec![
             BookPage {
                 heading: Some("Chapter 1".into()),
+                category: None,
                 entries: vec![BookEntry {
                     title: "Entry One".into(),
                     subtitle: Some("Adult".into()),
@@ -55,6 +56,7 @@ fn sample_snapshot() -> ReferenceBookSnapshot {
             },
             BookPage {
                 heading: Some("Chapter 2".into()),
+                category: None,
                 entries: vec![BookEntry {
                     title: "Entry Two".into(),
                     subtitle: Some("Child".into()),
@@ -65,6 +67,7 @@ fn sample_snapshot() -> ReferenceBookSnapshot {
             },
             BookPage {
                 heading: Some("Chapter 3".into()),
+                category: None,
                 entries: vec![BookEntry {
                     title: "Entry Three".into(),
                     subtitle: None,
@@ -74,6 +77,7 @@ fn sample_snapshot() -> ReferenceBookSnapshot {
                 }],
             },
         ],
+        use_magic_book_chrome: false,
     }
 }
 
@@ -155,6 +159,7 @@ fn reference_book_scrolls_long_wrapped_text_at_short_viewport() {
         held_summary: Vec::new(),
         pages: vec![BookPage {
             heading: Some("Tall Page".into()),
+            category: None,
             entries: vec![BookEntry {
                 title: "Tall Entry".into(),
                 subtitle: None,
@@ -163,6 +168,7 @@ fn reference_book_scrolls_long_wrapped_text_at_short_viewport() {
                 highlight: false,
             }],
         }],
+        use_magic_book_chrome: false,
     };
     let mut dlg = ReferenceBookDialog::new();
     dlg.open();
@@ -217,6 +223,13 @@ fn reference_book_renders_across_viewports_and_live_install() {
     let ui = UiGraphics::open(&install).expect("open UIGraphics");
     let live_art = load_art(&ui, 1).expect("load book art");
     assert!(live_art.missing.is_empty());
+    // Verify all 6 native Makin' Magic book bitmaps (`82`, `90..=94`) loaded!
+    for &id in &sims_ui::book::OPTIONAL_RESOURCES {
+        assert!(
+            live_art.image(id).is_some(),
+            "Complete Collection must load native Magic Book bitmap ID {id}"
+        );
+    }
 
     let live_strings = BookStrings::load(&install, 1).expect("load magic.iff strings");
     assert!(!live_strings.back.is_empty());
@@ -230,6 +243,29 @@ fn reference_book_renders_across_viewports_and_live_install() {
         "expected real spellbook catalog entries"
     );
     assert!(recipes.len() >= 6, "expected real cookbook catalog entries");
+    // Render native 620x400 Magic Book chrome with category art (`90..=94`).
+    let mut magic_snap = sample_snapshot();
+    magic_snap.use_magic_book_chrome = true;
+    magic_snap.pages[0].category = Some(spells[0].category);
+    let magic_layout = dlg.layout([800, 600], &magic_snap);
+    assert_eq!(
+        magic_layout.dialog.width,
+        sims_ui::book::MAGIC_BOOK_NATIVE_WIDTH
+    );
+    assert_eq!(
+        magic_layout.dialog.height,
+        sims_ui::book::MAGIC_BOOK_NATIVE_HEIGHT
+    );
+    let mut magic_frame = Frame::new(800, 600, [0, 0, 0]);
+    dlg.draw(&mut magic_frame, &magic_snap, &live_strings, &live_art);
+    assert!(
+        magic_frame
+            .rgb()
+            .iter()
+            .filter(|&&p| p != [0, 0, 0])
+            .count()
+            > 200_000
+    );
 
     let credits = load_credits_pages(&install, 1).expect("load credits pages");
     assert!(credits.len() >= 5, "expected multi-page credits catalog");

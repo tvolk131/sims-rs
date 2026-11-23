@@ -489,7 +489,8 @@ by the rule above) and the argument counts of the trees its calls run:
   they are the files the game loads; the verdict assumes they are. Their
   argument counts are read as `load_library_with_pool` (`program.rs:588`)
   reads a library: every `BHAV` chunk in physical order, deleted ones
-  included, the last copy of an ID winning (`library_arities_from_iff`).
+  included, the last copy of an ID winning (`library_arities_from_iff`, which
+  selects chunks with #406's `arity_catalog::vm_kept_bhavs`).
   Only the file's own range is taken (256 to 4095 from `--global`, 8192 and
   up from `--semi-global`). A tree that two supplied files give different
   argument counts (or that one parses and another cannot) is refused
@@ -586,8 +587,11 @@ these, and with 2 on usage or I/O errors. The CLI flags are:
 
 ## Dependencies and tests
 
-`sims-antics` now depends on `sims-vm`, `sims-sim` and `sims-content` (for the
-replay), not only as dev-dependencies. `sims-vm` stays a read-only reference:
+The replay needs `sims-vm`, `sims-sim` and `sims-content`, so it sits behind the
+`vm-replay` feature, on by default next to #406's `install-catalog`. A
+compiler-only build (`--no-default-features`) still pulls in none of them
+(`tests/dependency_weight.rs`); its checker replays nothing, so a difference is
+never confirmed and stays `Inconclusive`. `sims-vm` stays a read-only reference:
 the replay uses its public API only.
 
 `tests/live_equiv.rs` pins the contract:

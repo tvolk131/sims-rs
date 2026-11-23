@@ -12,6 +12,7 @@
 //! See `docs/decisions/20261122-antics-v2-language-and-air-ir.md` and
 //! `docs/decisions/20261122-sims-antics-compiler-and-open-pack.md`.
 
+pub mod arity_catalog;
 pub mod art;
 pub mod ast;
 pub mod audio;
@@ -43,10 +44,10 @@ pub use lift::{
 };
 pub use sim_pack::{StandalonePack, compile_standalone_pack_dir};
 pub use structure_lift::{
-    LiftOptions, LiftSymbols, StructuredLiftOutcome, extract_lift_symbols_from_iff,
-    lift_bhav_air_structured, lift_bhav_air_structured_with_options, lift_bhav_structured,
-    lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
-    lift_bhav_structured_with_options,
+    LiftOptions, LiftSymbols, StructuredLiftOutcome, UnsupportedHeaderReason, callee_scope_name,
+    extract_lift_symbols_from_iff, lift_bhav_air_structured, lift_bhav_air_structured_with_options,
+    lift_bhav_structured, lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
+    lift_bhav_structured_with_options, structured_lift_header_check,
 };
 pub use v2::{
     ExpandedV2Object, PackResolverConfig, compile_v2_object_file, compile_v2_pack_dir,

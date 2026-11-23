@@ -13,7 +13,7 @@ use sims_content::Install;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_render::Canvas;
 use sims_render::neighborhood::{
-    CommunityFilter, HoverFadeState, MapLot, NeighborhoodKind, NeighborhoodMap, RenderOptions,
+    CommunityFilter, HoverFadeState, NeighborhoodKind, NeighborhoodMap, RenderOptions,
 };
 use sims_ui::art::Art;
 use sims_ui::frame::{Frame, Rect};
@@ -22,9 +22,9 @@ use sims_ui::neighborhood::{
     draw_hovered_lot_popup,
 };
 use sims_ui::travel::{
-    BAR_HEIGHT as TRAVEL_BAR_HEIGHT, Destination, LotFilter, NATIVE_WIDTH as TRAVEL_NATIVE_WIDTH,
-    TravelBarMode, TravelChrome, TravelCommand, TravelLayout, TravelState, TravelStrings,
-    VacationLodging, art_id as travel_art_id,
+    BAR_HEIGHT as TRAVEL_BAR_HEIGHT, Destination, LotFilter, NATIVE_HEIGHT as TRAVEL_NATIVE_HEIGHT,
+    NATIVE_WIDTH as TRAVEL_NATIVE_WIDTH, TravelBarMode, TravelChrome, TravelCommand, TravelLayout,
+    TravelState, TravelStrings, art_id as travel_art_id,
 };
 use sims_vm::SpecialPanelRequest;
 use std::collections::{BTreeMap, BTreeSet};
@@ -204,8 +204,10 @@ impl DestinationMapPicker {
         request: SpecialPanelRequest,
         lot_entries: Vec<SpecialLotEntry>,
         simoleons: i32,
-        magic_coins: i32,
-        studio_fame_half_stars: u8,
+        // The native destination bar shows no MagicCoin or fame readout
+        // (`docs/decisions/20261123-travel-chrome-native-audit.md`).
+        _magic_coins: i32,
+        _studio_fame_half_stars: u8,
     ) -> Result<Self, String> {
         let Some((kind, destination)) = destination_kind_for_request(&request) else {
             return Err(format!(
@@ -249,17 +251,35 @@ impl DestinationMapPicker {
             .filter(|&id| map.as_ref().is_none_or(|m| m.lot(id).is_none()))
             .collect();
 
+        // Picker filters with no visitable lot on this map draw disabled, as
+        // the 1.91 oracle shows for Gardening on Magic Town.
+        let unavailable_filters: Vec<LotFilter> = destination
+            .map(|dest| {
+                dest.picker_filters()
+                    .iter()
+                    .copied()
+                    .filter(|&f| {
+                        let bit = community_filter_for_lot_filter(f).bit();
+                        map.as_ref().is_some_and(|m| {
+                            !m.lots.iter().any(|lot| {
+                                visitable_lots.contains(&lot.id) && lot.filter_mask & bit != 0
+                            })
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let travel_state = destination.map(|dest| TravelState {
             destination: dest,
             mode: TravelBarMode::Visit,
             expansions: ExpansionFlags(install.expansions.0),
             has_importable_lot: false,
-            active_filter: None,
-            vacation_lodging_filter: None,
-            vacation_has_no_vacancy: false,
-            studio_fame_half_stars,
-            magic_coins,
-            simoleons,
+            // The 1.91 Magic Hole picker opens with the Magic filter pressed
+            // (oracle `flow-magic-hole-picker.png`).
+            active_filter: (dest == Destination::MagicTown
+                && !unavailable_filters.contains(&LotFilter::Magic))
+            .then_some(LotFilter::Magic),
+            unavailable_filters,
         });
 
         Ok(Self {
@@ -433,8 +453,7 @@ impl DestinationMapPicker {
             let prev = self.travel_chrome.hovered();
             self.travel_chrome.pointer_move(point[0], point[1], &layout);
             changed |= self.travel_chrome.hovered() != prev;
-            layout.bar_rect.contains(point[0], point[1])
-                || layout.filter_strip_rect.contains(point[0], point[1])
+            layout.blocks_map(point[0], point[1])
         } else {
             let (bar_rect, back_rect) = old_town_bar_layout(viewport);
             let next_back = back_rect.contains(point[0], point[1]);
@@ -487,13 +506,17 @@ impl DestinationMapPicker {
         let viewport = [size[0].max(1) as u32, size[1].max(1) as u32];
         if let Some(state) = &self.travel_state {
             let layout = TravelLayout::compute(viewport[0], viewport[1], state);
-            if self.travel_chrome.pointer_down(point[0], point[1], &layout) {
+            // A trip picker's bar has no press-triggered control live (only
+            // Return is enabled in Visit mode), so a press only captures.
+            if self
+                .travel_chrome
+                .pointer_down(point[0], point[1], &layout, state)
+                .consumed()
+            {
                 self.pressed_lot_id = None;
                 return true;
             }
-            if layout.bar_rect.contains(point[0], point[1])
-                || layout.filter_strip_rect.contains(point[0], point[1])
-            {
+            if layout.blocks_map(point[0], point[1]) {
                 self.pressed_lot_id = None;
                 return false;
             }
@@ -546,24 +569,12 @@ impl DestinationMapPicker {
                     TravelCommand::ReturnToNeighborhood => Some(DestinationPickerAction::Cancel),
                     TravelCommand::SetFilter(filter) => {
                         state.active_filter = filter;
-                        state.vacation_lodging_filter = None;
-                        Some(DestinationPickerAction::Clicked)
-                    }
-                    TravelCommand::SetVacationLodging(lodging) => {
-                        state.vacation_lodging_filter = lodging;
-                        if lodging.is_some() {
-                            state.active_filter = Some(LotFilter::Lodging);
-                        } else if state.active_filter == Some(LotFilter::Lodging) {
-                            state.active_filter = None;
-                        }
                         Some(DestinationPickerAction::Clicked)
                     }
                     _ => Some(DestinationPickerAction::Redraw),
                 };
             }
-            if layout.bar_rect.contains(point[0], point[1])
-                || layout.filter_strip_rect.contains(point[0], point[1])
-            {
+            if layout.blocks_map(point[0], point[1]) {
                 let had_lot = self.pressed_lot_id.take().is_some();
                 return (had_chrome_press || had_lot).then_some(DestinationPickerAction::Redraw);
             }
@@ -660,13 +671,10 @@ impl DestinationMapPicker {
     }
 
     fn build_render_options(&self, viewport: [u32; 2], clock_us: u64) -> RenderOptions {
-        let active_filter = self.travel_state.as_ref().and_then(|s| {
-            if self.kind == NeighborhoodKind::Vacation && s.vacation_lodging_filter.is_some() {
-                None
-            } else {
-                s.active_filter.map(community_filter_for_lot_filter)
-            }
-        });
+        let active_filter = self
+            .travel_state
+            .as_ref()
+            .and_then(|s| s.active_filter.map(community_filter_for_lot_filter));
         let highlighted_lots = self.highlighted_lots();
         let mut opts = RenderOptions {
             viewport,
@@ -713,28 +721,6 @@ impl DestinationMapPicker {
             // On Old Town / main neighborhood maps, highlight all visitable
             // community lots so they stand out cleanly from residential houses.
             return self.visitable_lots.clone();
-        }
-        if let Some(state) = &self.travel_state
-            && let Some(lodging) = state.vacation_lodging_filter
-            && self.kind == NeighborhoodKind::Vacation
-        {
-            if let Some(map) = &self.map {
-                return map
-                    .lots
-                    .iter()
-                    .filter(|lot| {
-                        self.visitable_lots.contains(&lot.id)
-                            && vacation_lot_matches_lodging(lot, lodging)
-                    })
-                    .map(|lot| lot.id)
-                    .collect();
-            }
-            return self
-                .visitable_lots
-                .iter()
-                .copied()
-                .filter(|&id| vacation_lot_id_matches_lodging(id, lodging))
-                .collect();
         }
         BTreeSet::new()
     }
@@ -827,45 +813,22 @@ impl DestinationMapPicker {
             .travel_art
             .font(10)
             .or_else(|| assets.chrome_art.font(10));
-        let lodging_filter_active = self.kind == NeighborhoodKind::Vacation
-            && self
-                .travel_state
-                .as_ref()
-                .is_some_and(|s| s.vacation_lodging_filter.is_some());
-        let highlighted = if lodging_filter_active {
-            self.highlighted_lots()
-        } else {
-            BTreeSet::new()
-        };
         for (lot_id, rect) in self.fallback_chip_rects(viewport) {
             let hovered = self.hovered_lot_id == Some(lot_id);
             let pressed = self.pressed_lot_id == Some(lot_id);
-            let matches_filter = !lodging_filter_active || highlighted.contains(&lot_id);
             let bg = if pressed {
                 [66, 132, 218]
             } else if hovered {
                 [44, 78, 148]
-            } else if lodging_filter_active && matches_filter {
-                [40, 68, 134]
-            } else if lodging_filter_active {
-                [16, 24, 56]
             } else {
                 [24, 38, 86]
             };
             let border = if hovered {
                 [255, 224, 112]
-            } else if lodging_filter_active && matches_filter {
-                [255, 212, 84]
-            } else if lodging_filter_active {
-                [58, 76, 122]
             } else {
                 [96, 134, 210]
             };
-            let text_color = if matches_filter || hovered || pressed {
-                [235, 242, 255]
-            } else {
-                [148, 162, 194]
-            };
+            let text_color = [235, 242, 255];
             frame.fill(rect, bg);
             frame.fill(Rect::new(rect.x, rect.y, rect.width, 1), border);
             frame.fill(
@@ -1063,8 +1026,7 @@ impl DestinationMapPicker {
     fn chrome_bottom_y(&self, viewport: [u32; 2]) -> i32 {
         if let Some(state) = &self.travel_state {
             let layout = TravelLayout::compute(viewport[0], viewport[1], state);
-            (layout.filter_strip_rect.y + layout.filter_strip_rect.height)
-                .max(layout.bar_rect.y + layout.bar_rect.height)
+            layout.bar_rect.y + layout.bar_rect.height
         } else {
             let (bar_rect, _) = old_town_bar_layout(viewport);
             bar_rect.y + bar_rect.height
@@ -1073,28 +1035,12 @@ impl DestinationMapPicker {
 
     fn over_chrome(&self, viewport: [u32; 2], point: [i32; 2]) -> bool {
         if let Some(state) = &self.travel_state {
-            let layout = TravelLayout::compute(viewport[0], viewport[1], state);
-            layout.bar_rect.contains(point[0], point[1])
-                || layout.filter_strip_rect.contains(point[0], point[1])
+            TravelLayout::compute(viewport[0], viewport[1], state).blocks_map(point[0], point[1])
         } else {
             let (bar_rect, _) = old_town_bar_layout(viewport);
             bar_rect.contains(point[0], point[1])
         }
     }
-}
-
-fn vacation_lot_id_matches_lodging(lot_id: u16, lodging: VacationLodging) -> bool {
-    match lodging {
-        VacationLodging::Hotel => matches!(lot_id, 40 | 42 | 46),
-        VacationLodging::CabinRental => matches!(lot_id, 44 | 48),
-        VacationLodging::Campground => matches!(lot_id, 41 | 43 | 45 | 47),
-    }
-}
-
-fn vacation_lot_matches_lodging(lot: &MapLot, lodging: VacationLodging) -> bool {
-    let has_lodging_bit = (lot.filter_mask & (CommunityFilter::Lodging as u16)) != 0;
-    vacation_lot_id_matches_lodging(lot.id, lodging)
-        && (has_lodging_bit || (40..=48).contains(&lot.id))
 }
 
 fn old_town_bar_layout(viewport: [u32; 2]) -> (Rect, Rect) {
@@ -1103,12 +1049,17 @@ fn old_town_bar_layout(viewport: [u32; 2]) -> (Rect, Rect) {
     let compact = w < TRAVEL_NATIVE_WIDTH;
     let bar_w = if compact { w } else { TRAVEL_NATIVE_WIDTH };
     let bar_x = if compact { 0 } else { (w - bar_w) / 2 };
-    let bar_h = TRAVEL_BAR_HEIGHT.min(h);
-    let bar_rect = Rect::new(bar_x, 0, bar_w, bar_h);
+    let oy = if !compact && h > TRAVEL_NATIVE_HEIGHT {
+        (h - TRAVEL_NATIVE_HEIGHT) / 2
+    } else {
+        0
+    };
+    let bar_h = TRAVEL_BAR_HEIGHT.min(h - oy);
+    let bar_rect = Rect::new(bar_x, oy, bar_w, bar_h);
     let back_x = bar_x + if compact { 8 } else { 78 };
     let back_w = if compact { 44 } else { 53 };
     let back_h = (bar_h - 6).max(1);
-    let back_y = (bar_h - back_h) / 2;
+    let back_y = oy + (bar_h - back_h) / 2;
     let back_rect = Rect::new(back_x, back_y, back_w, back_h);
     (bar_rect, back_rect)
 }
@@ -1205,38 +1156,6 @@ mod tests {
             picker.release([800, 600], pt, 0),
             Some(DestinationPickerAction::Cancel)
         );
-    }
-
-    #[test]
-    fn vacation_lodging_predicate_matches_native_hotel_cabin_and_campground_lots() {
-        assert!(vacation_lot_id_matches_lodging(40, VacationLodging::Hotel));
-        assert!(vacation_lot_id_matches_lodging(42, VacationLodging::Hotel));
-        assert!(vacation_lot_id_matches_lodging(46, VacationLodging::Hotel));
-        assert!(!vacation_lot_id_matches_lodging(41, VacationLodging::Hotel));
-
-        assert!(vacation_lot_id_matches_lodging(
-            44,
-            VacationLodging::CabinRental
-        ));
-        assert!(vacation_lot_id_matches_lodging(
-            48,
-            VacationLodging::CabinRental
-        ));
-        assert!(!vacation_lot_id_matches_lodging(
-            43,
-            VacationLodging::CabinRental
-        ));
-
-        for camp in [41, 43, 45, 47] {
-            assert!(vacation_lot_id_matches_lodging(
-                camp,
-                VacationLodging::Campground
-            ));
-        }
-        assert!(!vacation_lot_id_matches_lodging(
-            46,
-            VacationLodging::Campground
-        ));
     }
 
     #[test]

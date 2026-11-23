@@ -134,11 +134,16 @@ const UNDO_POS: [i32; 2] = [231, 21];
 const REDO_POS: [i32; 2] = [231, 53];
 const PREV_ARROW_X: i32 = 539;
 const ARROW_Y: i32 = 32;
-const GRID_LEFT: i32 = 556;
+/// Catalog grid left edge. The 1.91 oracle (`build-windows.png`) matches our
+/// 45 px cells pixel-for-pixel only with the grid at `558`.
+const GRID_LEFT: i32 = 558;
 const GRID_TOP: i32 = 5;
 const GRID_ROWS: usize = 2;
-const GRID_RIGHT_MARGIN: i32 = 19;
-const NEXT_ARROW_MARGIN: i32 = 18;
+/// The catalog grid may run up to the next-page arrow: the 1.91 oracle
+/// (`build-windows.png`, `1024×768`) fits ten 45 px columns from `558` to
+/// `1008`, with the arrow at `1010` (five columns at `800×600`).
+const GRID_RIGHT_MARGIN: i32 = 14;
+const NEXT_ARROW_MARGIN: i32 = 14;
 const FALLBACK_BTN: [i32; 2] = [36, 36];
 
 /// `Build.iff` `STR#` chunk IDs (`0x4cd453`, `0x4cd696`, `0x4cd71b`).
@@ -162,6 +167,20 @@ const COMPACT_TOOL_COLS: i32 = 4;
 const COMPACT_TOOL_ROWS: i32 = 3;
 const COMPACT_TOOL_MIN_W: i32 = 10;
 const COMPACT_PITCH_MIN_W: i32 = 19;
+/// Wide Roof tool geometry from the 1.91 oracle (`build-roof.png`,
+/// `1024×768`), matched pixel-for-pixel: the pitch column sits 14 px left
+/// of [`GRID_LEFT`] (Steep at the top, Flat at the bottom), and the pattern
+/// grid starts 50 px right of it, one pixel lower than the object grid.
+const ROOF_PITCH_DX: i32 = -14;
+const ROOF_PATTERN_DX: i32 = 50;
+const ROOF_PATTERN_DY: i32 = 1;
+/// Pitch buttons top to bottom (oracle `build-roof.png`).
+const ROOF_PITCH_ORDER: [RoofPitchPreset; 4] = [
+    RoofPitchPreset::Steep,
+    RoofPitchPreset::Medium,
+    RoofPitchPreset::Shallow,
+    RoofPitchPreset::Flat,
+];
 
 /// Native 6-column × 2-row pairing of [`TOOL_BUTTONS`] indices (top, bottom)
 /// used when paginating tool buttons on sub-620 px narrow viewports.
@@ -173,6 +192,7 @@ const OBJD_TTAB: usize = 0x0e;
 const OBJD_TYPE: usize = 0x12;
 const OBJD_MASTER: usize = 0x14;
 const OBJD_SUB_INDEX: usize = 0x16;
+const OBJD_DISABLED: usize = 0x20;
 const OBJD_PRICE: usize = 0x24;
 const OBJD_CTSS: usize = 0x52;
 const OBJD_BUILD_TYPE: usize = 0x8a;
@@ -189,17 +209,22 @@ const BUILTIN_WALL_STYLES: [(u16, usize, u16, i32, &str); 5] = [
 ];
 
 /// Terrain subtool selection (`BuildTool::Terrain`, `GameData/Build.iff STR# 128`).
+///
+/// The 1.91 oracle (`build-terrain`) shows the subtools left to right as
+/// Grass, Level, Lower, Raise (the reverse of `STR# 128`), bare icons with
+/// no catalog cell behind them, and Grass selected on a fresh Build Mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TerrainSubtool {
-    #[default]
     Raise,
     Lower,
     Level,
+    #[default]
     Grass,
 }
 
 impl TerrainSubtool {
-    pub const ALL: [Self; 4] = [Self::Raise, Self::Lower, Self::Level, Self::Grass];
+    /// Display order, left to right.
+    pub const ALL: [Self; 4] = [Self::Grass, Self::Level, Self::Lower, Self::Raise];
 
     pub const fn resource_id(self) -> i32 {
         match self {
@@ -770,6 +795,12 @@ impl BuildCatalog {
                 if read_i16(data, OBJD_TYPE) == PERSON_TYPE {
                     continue;
                 }
+                // OBJD `+0x20` (word 16, after the GUID) is the "disabled"
+                // flag. `Shutters.iff` ($1, no thumbnail) sets it and the
+                // 1.91 Windows catalog omits it (oracle `build-windows.png`).
+                if read_i16(data, OBJD_DISABLED) != 0 {
+                    continue;
+                }
                 let build_type = read_i16(data, OBJD_BUILD_TYPE);
                 let Some(tool) = tool_for_build_mode_type(build_type) else {
                     continue;
@@ -1094,11 +1125,11 @@ pub enum BuildWidgetKind {
         selected: bool,
         enabled: bool,
     },
-    Slot {
-        item: BuildItemId,
-        selected: bool,
-        affordable: bool,
-    },
+    /// A catalog cell. Unlike Buy Mode, native Build Mode draws an item
+    /// the family cannot afford in the normal cell (oracle `build-stairs`:
+    /// the $2,699..$6,000 stairs at $2,542 funds); the purchase check
+    /// happens on placement.
+    Slot { item: BuildItemId, selected: bool },
 }
 
 /// Hover/selected popup card for a Build Mode catalog entry.
@@ -1267,7 +1298,7 @@ pub fn layout(
         .map(|p| pitch_size(p.resource_id())[0])
         .max()
         .unwrap_or(26);
-    let wide_roof_pitch_col_w = max_pitch_w + 4;
+    let wide_roof_pitch_col_w = ROOF_PATTERN_DX.max(max_pitch_w + 4);
     let wide_roof_extra = if is_roof { wide_roof_pitch_col_w } else { 0 };
     let native_tools_right = TOOL_BUTTONS
         .iter()
@@ -1279,7 +1310,7 @@ pub fn layout(
         .min((width - next_aw).max(0))
         .max(0);
     let wide_grid_right = (width - GRID_RIGHT_MARGIN)
-        .min((wide_next_arrow_x - 1).max(0))
+        .min(wide_next_arrow_x.max(0))
         .max(0);
     let wide_fits = width >= NARROW_WIDTH
         && native_tools_right <= width
@@ -1550,7 +1581,6 @@ pub fn layout(
                             kind: BuildWidgetKind::Slot {
                                 item: item.id,
                                 selected: state.selected == Some(item.id),
-                                affordable: item.price <= available_funds,
                             },
                             command: Some(Command::BuildItem(item.id)),
                             tooltip: None,
@@ -1576,9 +1606,14 @@ pub fn layout(
         Some(BuildTool::Roof) => {
             // Left pitch column (Flat, Shallow, Medium, Steep) fitted cleanly
             // within the strip height using measured art dimensions.
+            let pitch_x = if narrow {
+                grid_left
+            } else {
+                grid_left + ROOF_PITCH_DX
+            };
             if pitch_btn_w > 0 && grid_left + pitch_btn_w <= grid_right {
                 let raw_heights: [i32; 4] =
-                    std::array::from_fn(|i| pitch_size(RoofPitchPreset::ALL[i].resource_id())[1]);
+                    std::array::from_fn(|i| pitch_size(ROOF_PITCH_ORDER[i].resource_id())[1]);
                 let sum_h: i32 = raw_heights.iter().sum();
                 let (mut py, gap, cap_h) = if sum_h + 9 <= STRIP - 10 {
                     (strip_y + 6, 3, i32::MAX)
@@ -1587,11 +1622,11 @@ pub fn layout(
                 } else {
                     (strip_y + 2, 1, ((STRIP - 4 - 3) / 4).max(1))
                 };
-                for (i, preset) in RoofPitchPreset::ALL.into_iter().enumerate() {
+                for (i, preset) in ROOF_PITCH_ORDER.into_iter().enumerate() {
                     let [pw, _] = pitch_size(preset.resource_id());
                     let ph = raw_heights[i].min(cap_h);
                     subtools.push(BuildSubtoolWidget {
-                        rect: Rect::new(grid_left, py, pw.min(pitch_btn_w), ph),
+                        rect: Rect::new(pitch_x, py, pw.min(pitch_btn_w), ph),
                         action: BuildSubtoolAction::RoofPitch(preset),
                         resource_id: Some(preset.resource_id()),
                         roof_pattern: None,
@@ -1607,6 +1642,7 @@ pub fn layout(
             // Paginated `GameData/Roofs/*.bmp` pattern swatches strictly within
             // `pattern_left..grid_right` (never overflowing into `next_arrow_x`).
             let pattern_left = grid_left + pitch_col_w;
+            let pattern_top = strip_y + GRID_TOP + if narrow { 0 } else { ROOF_PATTERN_DY };
             let patterns = catalog.roof_patterns();
             let cols = ((grid_right - pattern_left) / cell).max(0) as usize;
             if !patterns.is_empty() && cols > 0 {
@@ -1623,7 +1659,7 @@ pub fn layout(
                     let row = (slot / cols) as i32;
                     let rect = Rect::new(
                         pattern_left + col * cell,
-                        strip_y + GRID_TOP + row * cell,
+                        pattern_top + row * cell,
                         cell,
                         cell,
                     );
@@ -1643,10 +1679,14 @@ pub fn layout(
                     &mut widgets,
                     page,
                     start + per_page < patterns.len(),
-                    prev_arrow_x,
+                    if narrow {
+                        prev_arrow_x
+                    } else {
+                        pattern_left - prev_aw - 2
+                    },
                     next_arrow_x,
                     undo_right,
-                    grid_left,
+                    pattern_left,
                     grid_right,
                     width,
                     strip_y,
@@ -1681,7 +1721,6 @@ pub fn layout(
                         kind: BuildWidgetKind::Slot {
                             item: item.id,
                             selected: state.selected == Some(item.id),
-                            affordable: item.price <= available_funds,
                         },
                         command: Some(Command::BuildItem(item.id)),
                         tooltip: None,
@@ -1883,14 +1922,8 @@ pub fn draw_with_catalog(
                     draw_image_fitted(frame, &img, widget.rect);
                 }
             }
-            BuildWidgetKind::Slot {
-                item,
-                selected,
-                affordable,
-            } => {
-                let cell = if !affordable {
-                    3
-                } else if selected {
+            BuildWidgetKind::Slot { item, selected } => {
+                let cell = if selected {
                     1
                 } else if hovered {
                     2
@@ -1968,7 +2001,12 @@ pub fn draw_with_catalog(
             }
         } else if let Some(res_id) = sub.resource_id {
             let is_square_slot = sub.rect.width == CELL as i32 && sub.rect.height == CELL as i32;
-            if is_square_slot && let Some(bg) = art.cell(TEMPLATE, 4, cell) {
+            // Terrain subtools are bare icons (oracle `build-terrain`).
+            let bare = matches!(sub.action, BuildSubtoolAction::Terrain(_));
+            if is_square_slot
+                && !bare
+                && let Some(bg) = art.cell(TEMPLATE, 4, cell)
+            {
                 frame.draw_all(&bg, [sub.rect.x, sub.rect.y]);
             }
             if let Some(img) = art.cell(res_id, 4, cell) {
@@ -2138,16 +2176,14 @@ pub fn load_roof_patterns(install: &Install) -> Vec<RoofPatternEntry> {
         }
         found.push((stem.to_owned(), path));
     }
-    let rank = |stem: &str| -> (u8, String) {
-        match stem.to_ascii_lowercase().as_str() {
-            "r1_" => (0, stem.to_ascii_lowercase()),
-            "r2_" => (1, stem.to_ascii_lowercase()),
-            "r3_" => (2, stem.to_ascii_lowercase()),
-            "r4_" => (3, stem.to_ascii_lowercase()),
-            _ => (4, stem.to_ascii_lowercase()),
-        }
-    };
-    found.sort_by(|a, b| rank(&a.0).cmp(&rank(&b.0)).then_with(|| a.0.cmp(&b.0)));
+    // The 1.91 oracle (`build-roof.png`) lists the patterns in plain
+    // case-insensitive name order (`gravel1`, `MM*`, `r1_`..`r4_`,
+    // `Superstar*`, `tar1`).
+    found.sort_by(|a, b| {
+        a.0.to_ascii_lowercase()
+            .cmp(&b.0.to_ascii_lowercase())
+            .then_with(|| a.0.cmp(&b.0))
+    });
     found
         .into_iter()
         .enumerate()

@@ -86,6 +86,7 @@ fn sample_boutique_snapshot() -> ShopSnapshot {
         tried_on_item_id: None,
         preview_image: None,
         preview_label: None,
+        hide_wallet_and_prices: false,
     }
 }
 
@@ -240,6 +241,7 @@ fn magic_vendor_magicoins_and_negative_price_guard() {
         tried_on_item_id: None,
         preview_image: None,
         preview_label: None,
+        hide_wallet_and_prices: false,
     };
 
     let mut dialog = ShopPickerDialog::new();

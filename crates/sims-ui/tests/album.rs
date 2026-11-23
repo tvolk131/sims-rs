@@ -323,6 +323,12 @@ fn loads_complete_collection_art_and_uitext_strings() {
     let install = Install::detect(&path).expect("open Complete Collection install");
     let ui = UiGraphics::open(&install).expect("open UIGraphics");
     let art = load_art(&ui, 1).expect("load album UIGraphics art");
+    for &id in &sims_ui::album::SCRAP_RESOURCES {
+        assert!(
+            art.image(id).is_some(),
+            "Complete Collection must load native Scrapbook bitmap ID {id}"
+        );
+    }
     let strings = AlbumStrings::load_from_install(&install, 1).expect("load UIText.iff strings");
 
     assert!(!strings.title.is_empty());

@@ -23,6 +23,56 @@ use sims_formats::strings::StringTable;
 /// `HotspotPopupTiler.TGA` (`5107`).
 pub const RESOURCES: [i32; 3] = [BACKGROUND, BUTTON, POPUP_TILER];
 
+/// `UIGraphics/Res_CPanel.h` `kMagicBookBkg` (`cpanel/Backgrounds/magicbookbkg.bmp`, `620×400`).
+pub const MAGIC_BOOK_BKG: i32 = 82;
+/// `UIGraphics/Res_CPanel.h` `kMagicBookOven` (`SPELLBOOK_BakersOven.bmp`, `130×90`).
+pub const MAGIC_BOOK_OVEN: i32 = 90;
+/// `UIGraphics/Res_CPanel.h` `kMagicBookCharm` (`SPELLBOOK_CharmMakerAdult.bmp`, `130×90`).
+pub const MAGIC_BOOK_CHARM: i32 = 91;
+/// `UIGraphics/Res_CPanel.h` `kMagicBookSpell` (`SPELLBOOK_WandCharger.bmp`, `130×90`).
+pub const MAGIC_BOOK_SPELL: i32 = 92;
+/// `UIGraphics/Res_CPanel.h` `kMagicBookKid` (`SPELLBOOK_CharmMakerKid.bmp`, `130×90`).
+pub const MAGIC_BOOK_KID: i32 = 93;
+/// `UIGraphics/Res_CPanel.h` `kMagicBookNectar` (`SPELLBOOK_NectarPress.bmp`, `130×90`).
+pub const MAGIC_BOOK_NECTAR: i32 = 94;
+
+/// Optional native Makin' Magic Spellbook & Cookbook bitmaps (`82`, `90..=94`).
+pub const OPTIONAL_RESOURCES: [i32; 6] = [
+    MAGIC_BOOK_BKG,
+    MAGIC_BOOK_OVEN,
+    MAGIC_BOOK_CHARM,
+    MAGIC_BOOK_SPELL,
+    MAGIC_BOOK_KID,
+    MAGIC_BOOK_NECTAR,
+];
+
+/// Native `magicbookbkg.bmp` dimensions (`620×400`).
+pub const MAGIC_BOOK_NATIVE_WIDTH: i32 = 620;
+pub const MAGIC_BOOK_NATIVE_HEIGHT: i32 = 400;
+
+/// Native category illustration shown on Spellbook & Cookbook pages (`90..=94`, `130×90`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookArtCategory {
+    BakerOven,
+    AdultCharm,
+    AdultSpell,
+    KidCharm,
+    NectarPress,
+}
+
+impl BookArtCategory {
+    /// `UIGraphics` resource ID (`90..=94`) for this book page's native `130×90` illustration.
+    pub const fn art_id(self) -> i32 {
+        match self {
+            Self::BakerOven => MAGIC_BOOK_OVEN,
+            Self::AdultCharm => MAGIC_BOOK_CHARM,
+            Self::AdultSpell => MAGIC_BOOK_SPELL,
+            Self::KidCharm => MAGIC_BOOK_KID,
+            Self::NectarPress => MAGIC_BOOK_NECTAR,
+        }
+    }
+}
+
 /// `GameData/magic.iff` dialog labels (`STR# 1`: title templates, back/next,
 /// page counter).
 pub const MAGIC_BOOK_STR: u16 = 1;
@@ -45,10 +95,10 @@ pub const UITEXT_CREDITS_STR: u16 = 163;
 /// `GameData/Credits.iff` expansion credit tables ordered newest to base 1.0.
 pub const CREDITS_TABLES: [u16; 9] = [171, 170, 169, 168, 167, 166, 165, 164, 163];
 
-/// Loads the native 1.91 9-slice frames, button strip, and bitmap fonts used
-/// by [`ReferenceBookDialog`].
+/// Loads the native 1.91 Magic Book bitmaps (`82`, `90..=94`), 9-slice frames,
+/// button strip, and bitmap fonts used by [`ReferenceBookDialog`].
 pub fn load_art(ui: &UiGraphics, language: u8) -> Result<Art> {
-    Art::load(ui, language, &RESOURCES)
+    Art::load_with_optional(ui, language, &RESOURCES, &OPTIONAL_RESOURCES)
 }
 
 const TEXT_NORMAL: [u8; 3] = [195, 205, 205];
@@ -176,6 +226,7 @@ pub struct MagicCatalogEntry {
     pub title: String,
     pub description: String,
     pub is_child: bool,
+    pub category: BookArtCategory,
 }
 
 /// Loads the installed Spellbook (`is_cookbook == false`) or Cookbook
@@ -196,6 +247,7 @@ pub fn load_magic_book_entries(
             COOKBOOK_DESC_STR,
             language,
             false,
+            true,
             &mut out,
         );
     } else {
@@ -205,6 +257,7 @@ pub fn load_magic_book_entries(
             SPELL_DESC_STR,
             language,
             false,
+            false,
             &mut out,
         );
         collect_magic_pairs(
@@ -213,6 +266,7 @@ pub fn load_magic_book_entries(
             KID_CHARM_DESC_STR,
             language,
             true,
+            false,
             &mut out,
         );
     }
@@ -225,6 +279,7 @@ fn collect_magic_pairs(
     descs_id: u16,
     language: u8,
     is_child: bool,
+    is_cookbook: bool,
     out: &mut Vec<MagicCatalogEntry>,
 ) {
     let Some(t_chunk) = iff.get(b"STR#", titles_id) else {
@@ -243,7 +298,12 @@ fn collect_magic_pairs(
             continue;
         };
         let lower = title.to_ascii_lowercase();
-        if lower.contains("tbd") || lower == "not used" {
+        if lower.contains("tbd")
+            || lower == "not used"
+            || lower == "unknown spell"
+            || lower == "unknown charm"
+            || lower == "unknown magic"
+        {
             continue;
         }
         let desc = descs
@@ -253,11 +313,27 @@ fn collect_magic_pairs(
         if desc.to_ascii_lowercase().contains("tbd") {
             continue;
         }
+        let category = if is_cookbook {
+            // `magic.iff STR# 14`: `1..=4` Nectar Press, `5..=9` Baker's Oven.
+            if idx <= 4 {
+                BookArtCategory::NectarPress
+            } else {
+                BookArtCategory::BakerOven
+            }
+        } else if is_child {
+            BookArtCategory::KidCharm
+        } else if idx <= 11 {
+            // `magic.iff STR# 12`: `1..=11` Adult Charms, `13..=22` Adult Spells.
+            BookArtCategory::AdultCharm
+        } else {
+            BookArtCategory::AdultSpell
+        };
         out.push(MagicCatalogEntry {
             index: idx,
             title,
             description: desc,
             is_child,
+            category,
         });
     }
 }
@@ -299,6 +375,7 @@ pub fn load_credits_pages(install: &Install, language: u8) -> Result<Vec<BookPag
             for chunk_lines in lines.chunks(LINES_PER_PAGE) {
                 pages.push(BookPage {
                     heading: section_heading.clone(),
+                    category: None,
                     entries: vec![BookEntry {
                         title: String::new(),
                         subtitle: None,
@@ -331,6 +408,7 @@ pub fn load_credits_pages(install: &Install, language: u8) -> Result<Vec<BookPag
         for chunk_lines in lines.chunks(LINES_PER_PAGE) {
             pages.push(BookPage {
                 heading: None,
+                category: None,
                 entries: vec![BookEntry {
                     title: String::new(),
                     subtitle: None,
@@ -369,6 +447,8 @@ pub struct BookEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BookPage {
     pub heading: Option<String>,
+    /// Optional native `130×90` Magic Book illustration (`90..=94`) for this page.
+    pub category: Option<BookArtCategory>,
     pub entries: Vec<BookEntry>,
 }
 
@@ -380,6 +460,9 @@ pub struct ReferenceBookSnapshot {
     /// Optional summary strip of tokens/ingredients currently held by the caller.
     pub held_summary: Vec<BookBadge>,
     pub pages: Vec<BookPage>,
+    /// When `true`, renders the native `620×400` `magicbookbkg.bmp` (`82`) chrome
+    /// on viewports `>= 620×400` (falling back to 9-slice on compact viewports).
+    pub use_magic_book_chrome: bool,
 }
 
 /// Typed commands emitted by [`ReferenceBookDialog`].
@@ -630,8 +713,14 @@ impl ReferenceBookDialog {
         let margin = 12;
         let max_w = (fw - margin * 2).max(240).min(fw);
         let max_h = (fh - margin * 2).max(200).min(fh);
-        let width = 580.min(max_w);
-        let height = 430.min(max_h);
+        let use_native_magic = snapshot.use_magic_book_chrome
+            && fw >= MAGIC_BOOK_NATIVE_WIDTH
+            && fh >= MAGIC_BOOK_NATIVE_HEIGHT;
+        let (width, height) = if use_native_magic {
+            (MAGIC_BOOK_NATIVE_WIDTH, MAGIC_BOOK_NATIVE_HEIGHT)
+        } else {
+            (580.min(max_w), 430.min(max_h))
+        };
         let x = ((fw - width) / 2).max(0);
         let y = ((fh - height) / 2).max(0);
         let dialog = Rect::new(x, y, width, height);
@@ -778,7 +867,14 @@ impl ReferenceBookDialog {
             return;
         }
         let layout = self.layout([frame.width(), frame.height()], snapshot);
-        draw_dialog_frame(frame, art, layout.dialog);
+        let use_native_magic = snapshot.use_magic_book_chrome
+            && layout.dialog.width == MAGIC_BOOK_NATIVE_WIDTH
+            && layout.dialog.height == MAGIC_BOOK_NATIVE_HEIGHT;
+        if use_native_magic && let Some(bkg) = art.image(MAGIC_BOOK_BKG) {
+            frame.draw_all(bkg, [layout.dialog.x, layout.dialog.y]);
+        } else {
+            draw_dialog_frame(frame, art, layout.dialog);
+        }
 
         let title_font = art.font(12).or_else(|| art.font(10));
         let body_font = art.font(10).or_else(|| art.font(12));
@@ -905,8 +1001,32 @@ impl ReferenceBookDialog {
 
                 let mut ey = card.y + 8;
                 let ex = card.x + 10;
-                let ew = (card.width - 20).max(24);
                 let emax_y = card.y + card.height - 6;
+                let category_img = page
+                    .category
+                    .and_then(|cat| art.image(cat.art_id()))
+                    .filter(|img| {
+                        img.width > 0 && img.height > 0 && card.width >= 260 && card.height >= 106
+                    });
+                let illus_rect = category_img.map(|img| {
+                    let iw = i32::try_from(img.width).unwrap_or(130).min(130);
+                    let ih = i32::try_from(img.height).unwrap_or(90).min(90);
+                    Rect::new(card.x + card.width - iw - 10, card.y + 8, iw, ih)
+                });
+                let ew = match illus_rect {
+                    Some(ir) => (ir.x - ex - 10).max(80),
+                    None => (card.width - 20).max(24),
+                };
+                if let (Some(img), Some(ir)) = (category_img, illus_rect) {
+                    let src = Rect::new(
+                        0,
+                        0,
+                        i32::try_from(img.width).unwrap_or(i32::MAX),
+                        i32::try_from(img.height).unwrap_or(i32::MAX),
+                    );
+                    draw_scaled_region(frame, img, src, ir);
+                    draw_outline(frame, ir, PAGE_BORDER);
+                }
 
                 if !entry.title.is_empty()
                     && let Some(font) = title_font
@@ -1341,7 +1461,17 @@ fn measure_page_max_scroll(layout: &BookLayout, page: &BookPage, art: &Art) -> u
         }
         let card_h = per_entry_h.min(max_y - y);
         let mut ey = y + 8;
-        let ew = (content_w - 20).max(24);
+        let has_illus = page
+            .category
+            .and_then(|cat| art.image(cat.art_id()))
+            .is_some_and(|img| {
+                img.width > 0 && img.height > 0 && content_w >= 260 && card_h >= 106
+            });
+        let ew = if has_illus {
+            (content_w - 130 - 30).max(80)
+        } else {
+            (content_w - 20).max(24)
+        };
         let emax_y = y + card_h - 6;
 
         if !entry.title.is_empty()
