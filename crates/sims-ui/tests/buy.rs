@@ -199,14 +199,31 @@ fn buy_and_build_hover_popups_render_native_popup_info_tiles_chrome() {
         let top = buy::layout([800, 600], &buy_cat, &st, &art, 50_000);
         assert_eq!(top.widgets.len(), 5, "{zone:?} top-level category count");
         assert!(st.apply(&Command::BuyCategory(0)));
+        assert!(st.apply(&Command::BuySubcategory(7)));
         let sub = buy::layout([800, 600], &buy_cat, &st, &art, 50_000);
+        let slot_count = sub
+            .widgets
+            .iter()
+            .filter(|w| matches!(w.command, Some(Command::BuyItem(_))))
+            .count();
         assert!(
-            sub.widgets.len() >= 9,
-            "{zone:?} sub-view should have back + 8 subcategories + slots"
+            slot_count > 0,
+            "{zone:?} sub-view must populate real Command::BuyItem product slots (got {slot_count})"
         );
     }
 
-    // Buy Mode PopupCard renders PopupInfoTiles.bmp (3008) top-left highlight pixel [149, 149, 204].
+    // Buy Mode PopupCard renders full PopupInfoTiles.bmp (3008) 9-slice chrome
+    // (all 4 corners, all 4 edges, and tiled interior — not just top-left).
+    let sheet = art
+        .image(sims_ui::dialog::BACKGROUND)
+        .expect("PopupInfoTiles.bmp (3008) loaded");
+    let cell_w = sheet.width / 3;
+    let cell_h = sheet.height / 3;
+    let sheet_rgb = |sx: u32, sy: u32| -> [u8; 3] {
+        let p = sheet.pixel(sx, sy).unwrap();
+        [p[0], p[1], p[2]]
+    };
+
     let mut buy_state = BuyState::default();
     buy_state.apply(&Command::BuyCategory(0));
     buy_state.apply(&Command::BuySubcategory(7));
@@ -218,10 +235,46 @@ fn buy_and_build_hover_popups_render_native_popup_info_tiles_chrome() {
     let _ = thumbs.read(&index, &catalog, first_guid);
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
     buy::draw(&mut frame, &art, &thumbs, &buy_layout, None);
+    let pr = popup.rect;
     assert_eq!(
-        frame.pixel(popup.rect.x, popup.rect.y),
-        Some([149, 149, 204]),
-        "Buy hover popup must use PopupInfoTiles.bmp (3008) 9-slice chrome"
+        frame.pixel(pr.x, pr.y),
+        Some(sheet_rgb(0, 0)),
+        "Buy TL corner"
+    );
+    assert_eq!(
+        frame.pixel(pr.x + pr.width - 1, pr.y),
+        Some(sheet_rgb(sheet.width - 1, 0)),
+        "Buy TR corner"
+    );
+    assert_eq!(
+        frame.pixel(pr.x, pr.y + pr.height - 1),
+        Some(sheet_rgb(0, sheet.height - 1)),
+        "Buy BL corner"
+    );
+    assert_eq!(
+        frame.pixel(pr.x + pr.width - 1, pr.y + pr.height - 1),
+        Some(sheet_rgb(sheet.width - 1, sheet.height - 1)),
+        "Buy BR corner"
+    );
+    assert_eq!(
+        frame.pixel(pr.x + pr.width / 2, pr.y),
+        Some(sheet_rgb(cell_w, 0)),
+        "Buy top edge"
+    );
+    assert_eq!(
+        frame.pixel(pr.x + pr.width / 2, pr.y + pr.height - 1),
+        Some(sheet_rgb(cell_w, sheet.height - 1)),
+        "Buy bottom edge"
+    );
+    assert_eq!(
+        frame.pixel(pr.x + pr.width - 1, pr.y + pr.height / 2),
+        Some(sheet_rgb(sheet.width - 1, cell_h)),
+        "Buy right edge"
+    );
+    assert_eq!(
+        frame.pixel(pr.x + 20, pr.y + pr.height - 16),
+        Some(sheet_rgb(cell_w, cell_h)),
+        "Buy tiled interior"
     );
     if let Some(dir) = std::env::var_os("SIMS_WAVE1_SHOTS_DIR").map(std::path::PathBuf::from) {
         let _ = std::fs::create_dir_all(&dir);
@@ -304,10 +357,41 @@ fn buy_and_build_hover_popups_render_native_popup_info_tiles_chrome() {
         &build_layout,
         None,
     );
+    let br = bpopup.rect;
     assert_eq!(
-        bframe.pixel(bpopup.rect.x, bpopup.rect.y),
-        Some([149, 149, 204]),
-        "Build hover popup must use PopupInfoTiles.bmp (3008) 9-slice chrome"
+        bframe.pixel(br.x, br.y),
+        Some(sheet_rgb(0, 0)),
+        "Build TL corner"
+    );
+    assert_eq!(
+        bframe.pixel(br.x + br.width - 1, br.y),
+        Some(sheet_rgb(sheet.width - 1, 0)),
+        "Build TR corner"
+    );
+    assert_eq!(
+        bframe.pixel(br.x, br.y + br.height - 1),
+        Some(sheet_rgb(0, sheet.height - 1)),
+        "Build BL corner"
+    );
+    assert_eq!(
+        bframe.pixel(br.x + br.width - 1, br.y + br.height - 1),
+        Some(sheet_rgb(sheet.width - 1, sheet.height - 1)),
+        "Build BR corner"
+    );
+    assert_eq!(
+        bframe.pixel(br.x + br.width / 2, br.y + br.height - 1),
+        Some(sheet_rgb(cell_w, sheet.height - 1)),
+        "Build bottom edge"
+    );
+    assert_eq!(
+        bframe.pixel(br.x + br.width - 1, br.y + br.height / 2),
+        Some(sheet_rgb(sheet.width - 1, cell_h)),
+        "Build right edge"
+    );
+    assert_eq!(
+        bframe.pixel(br.x + 20, br.y + br.height - 16),
+        Some(sheet_rgb(cell_w, cell_h)),
+        "Build tiled interior"
     );
     if let Some(dir) = std::env::var_os("SIMS_WAVE1_SHOTS_DIR").map(std::path::PathBuf::from) {
         let _ = std::fs::create_dir_all(&dir);

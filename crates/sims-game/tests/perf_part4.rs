@@ -297,6 +297,7 @@ fn perf_part4_track1_measurements_and_parity() {
             hud_a.draw_for_lot_at_with_selection(
                 world,
                 true,
+                Some(1),
                 vis,
                 assets,
                 &view,

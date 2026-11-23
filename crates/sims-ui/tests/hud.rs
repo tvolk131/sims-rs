@@ -794,6 +794,13 @@ fn interests_and_gifts_panels_render_native_art_and_paginate() {
         .filter(|i| matches!(i.kind, hud::Kind::Interest { .. }))
         .count();
     assert_eq!(interest_count_p0, 6, "2 cols x 3 rows on 800x600 page 0");
+    // Native `0x519251`: 1024x768 shows 3 columns x 3 rows = 9 adult interests on page 0.
+    let page0_1024 = hud::layout([1024, 768], &snap, &ctrl);
+    let interest_count_1024 = page0_1024
+        .iter()
+        .filter(|i| matches!(i.kind, hud::Kind::Interest { .. }))
+        .count();
+    assert_eq!(interest_count_1024, 9, "3 cols x 3 rows on 1024x768 page 0");
     assert!(
         page0_items
             .iter()
@@ -956,4 +963,87 @@ fn interests_and_gifts_panels_render_native_art_and_paginate() {
         &i.kind,
         hud::Kind::InventoryItem { entry, .. } if entry.name == "Red Roses"
     )));
+
+    // Native `0x51e402`: Other tab enumerates ONLY kind 8 tokens, excluding
+    // internal bookkeeping tokens (kinds 1 and 3) populated via `Snapshot::with_inventory`.
+    let mut mixed_world = opened.world.clone();
+    let sel_guid = snap.selected_guid.unwrap();
+    let nb_id = mixed_world
+        .neighbors
+        .slots
+        .iter()
+        .flatten()
+        .find(|n| n.guid == sel_guid)
+        .expect("selected Sim has neighbor record")
+        .id;
+    mixed_world
+        .neighbors
+        .inventories
+        .retain(|inv| inv.neighbor != nb_id);
+    let mut raw_items = vec![
+        sims_sim::neighbors::Item {
+            kind: 1,
+            guid: 0xAAAA_0001,
+            count: 1,
+        },
+        sims_sim::neighbors::Item {
+            kind: 3,
+            guid: 0xAAAA_0003,
+            count: 2,
+        },
+        sims_sim::neighbors::Item {
+            kind: 8,
+            guid: 0xAAAA_0008,
+            count: 1,
+        },
+    ];
+    for i in 0..10u32 {
+        raw_items.push(sims_sim::neighbors::Item {
+            kind: 0,
+            guid: 0xBBBB_0000 + i,
+            count: 1,
+        });
+    }
+    mixed_world
+        .neighbors
+        .inventories
+        .push(sims_sim::neighbors::Inventory {
+            neighbor: nb_id,
+            items: raw_items,
+        });
+    let mixed_snap = snap
+        .clone()
+        .with_inventory(&mixed_world, |g| format!("Item {g:X}"));
+    gifts_ctrl.apply(&Command::ShowInventory(
+        sims_ui::command::InventoryTab::Other,
+    ));
+    let other_items = hud::layout([800, 600], &mixed_snap, &gifts_ctrl);
+    let other_guids: Vec<u32> = other_items
+        .iter()
+        .filter_map(|i| match &i.kind {
+            hud::Kind::InventoryItem { entry, .. } => Some(entry.guid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        other_guids,
+        vec![0xAAAA_0008],
+        "Other tab must show only kind 8 and exclude internal kinds 1 and 3"
+    );
+
+    // Native `0x51927e` / `0x519262` / `0x51e355`: Gifts shows 5 items/page at
+    // 800x600 and 9 items/page at 1024x768.
+    gifts_ctrl.apply(&Command::ShowInventory(
+        sims_ui::command::InventoryTab::Gifts,
+    ));
+    let gifts_800 = hud::layout([800, 600], &mixed_snap, &gifts_ctrl)
+        .iter()
+        .filter(|i| matches!(i.kind, hud::Kind::InventoryItem { .. }))
+        .count();
+    let gifts_1024 = hud::layout([1024, 768], &mixed_snap, &gifts_ctrl)
+        .iter()
+        .filter(|i| matches!(i.kind, hud::Kind::InventoryItem { .. }))
+        .count();
+    assert_eq!(gifts_800, 5, "Gifts must fit 5 items/page at 800x600");
+    assert_eq!(gifts_1024, 9, "Gifts must fit 9 items/page at 1024x768");
 }

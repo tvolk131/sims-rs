@@ -17,7 +17,7 @@ use crate::art::{Art, KEY};
 use crate::command::Command;
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
-use crate::household::{Careers, Faces, Fame, money};
+use crate::household::{Careers, Faces, Fame};
 use crate::hud::{LABEL, rgb565};
 use crate::thumbnail::Thumbnails;
 use crate::{Error, Result};
@@ -256,10 +256,18 @@ pub fn pending(world: &World) -> Option<&Dialog> {
     world.dialogs.records.iter().find(|r| r.status <= 1)
 }
 
+/// Cached neighborhood family metadata (`FAMI` / `FAMs`) used by `$Family`
+/// (`0x44c034`) and `$FamilyAssets:N` (`0x44bf66`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyInfo {
+    pub name: String,
+    pub assets: i32,
+}
+
 /// Optional cached UI context passed into [`Message::read_with_context`] so
 /// ordinary VM dialogs (`0..=4`) resolve `$Me`/`$Object`/`$Neighbor`/`$Job`/
-/// `$FameTitleLocal` tokens and icon modes `0, 1, 2, 4` without re-reading
-/// character or career archives from disk.
+/// `$FameTitleLocal`/`$Family`/`$FamilyAssets` tokens and icon modes `0, 2`
+/// without re-reading character or career archives from disk.
 #[derive(Default)]
 pub struct DialogContext<'a> {
     pub faces: Option<&'a Faces>,
@@ -267,6 +275,7 @@ pub struct DialogContext<'a> {
     pub art: Option<&'a Art>,
     pub careers: Option<&'a Careers>,
     pub fame: Option<&'a Fame>,
+    pub families: Option<&'a std::collections::BTreeMap<i32, FamilyInfo>>,
 }
 
 /// OBJD byte offsets used when resolving object display names and portraits.
@@ -326,7 +335,50 @@ fn catalog_display_name(
     (!chunk.label.is_empty()).then(|| chunk.label.clone())
 }
 
-/// Resolves a multi-tile object GUID to its group master GUID (`0x45728d`).
+/// Resolves the master GUID for a multi-tile object (`0x45728d..0x43ae0a`).
+/// Returns `None` for a multi-tile sub-object whose group has no master
+/// (`0x436345..0x43634d`), matching native mode-0 icon handling.
+fn master_guid_opt(guid: u32, world: &World, index: &Index, catalog: &Catalog) -> Option<u32> {
+    if world.characters.made.contains_key(&guid) {
+        return Some(guid);
+    }
+    let obj = catalog.object(guid)?;
+    let res = index.resources.get(obj.resource)?;
+    let bytes = res.read().ok()?;
+    let iff = Iff::parse(bytes).ok()?;
+    let chunk = iff.get(b"OBJD", obj.chunk)?;
+    let data = iff.data(chunk);
+    if data.len() < OBJD_SUB_INDEX_OFFSET + 2 {
+        return Some(guid);
+    }
+    let master = i16::from_le_bytes([data[OBJD_MASTER_OFFSET], data[OBJD_MASTER_OFFSET + 1]]);
+    let sub_index =
+        i16::from_le_bytes([data[OBJD_SUB_INDEX_OFFSET], data[OBJD_SUB_INDEX_OFFSET + 1]]);
+    if master == 0 || sub_index == -1 {
+        return Some(guid);
+    }
+    for (&cand_guid, &idx) in &catalog.by_guid {
+        let cand = &catalog.objects[idx];
+        if cand.resource != obj.resource {
+            continue;
+        }
+        let Some(c) = iff.get(b"OBJD", cand.chunk) else {
+            continue;
+        };
+        let d = iff.data(c);
+        if d.len() >= OBJD_SUB_INDEX_OFFSET + 2 {
+            let cm = i16::from_le_bytes([d[OBJD_MASTER_OFFSET], d[OBJD_MASTER_OFFSET + 1]]);
+            let cs = i16::from_le_bytes([d[OBJD_SUB_INDEX_OFFSET], d[OBJD_SUB_INDEX_OFFSET + 1]]);
+            if cm == master && cs == -1 {
+                return Some(cand_guid);
+            }
+        }
+    }
+    None
+}
+
+/// Resolves the master GUID for a multi-tile object, falling back to `guid`
+/// when reading an object thumbnail directly.
 fn master_guid_for(guid: u32, index: &Index, catalog: &Catalog) -> u32 {
     let Some(obj) = catalog.object(guid) else {
         return guid;
@@ -348,8 +400,9 @@ fn master_guid_for(guid: u32, index: &Index, catalog: &Catalog) -> u32 {
         return guid;
     }
     let master = i16::from_le_bytes([data[OBJD_MASTER_OFFSET], data[OBJD_MASTER_OFFSET + 1]]);
-    let sub = i16::from_le_bytes([data[OBJD_SUB_INDEX_OFFSET], data[OBJD_SUB_INDEX_OFFSET + 1]]);
-    if master == 0 || sub == -1 {
+    let sub_index =
+        i16::from_le_bytes([data[OBJD_SUB_INDEX_OFFSET], data[OBJD_SUB_INDEX_OFFSET + 1]]);
+    if master == 0 || sub_index == -1 {
         return guid;
     }
     for (&cand_guid, &idx) in &catalog.by_guid {
@@ -595,6 +648,7 @@ fn format_dialog_text(
     faces: Option<&Faces>,
     careers: Option<&Careers>,
     fame: Option<&Fame>,
+    families: Option<&std::collections::BTreeMap<i32, FamilyInfo>>,
     portrait_guid: &mut Option<u32>,
 ) -> String {
     if !input.contains('$') {
@@ -610,18 +664,47 @@ fn format_dialog_text(
         .and_then(|id| world.objects.get(&id));
     let neighbor_rec = world.neighbors.get(stack_object);
 
-    // Pass 1: `$FamilyAssets` and `$Family`.
+    // Pass 1: `$FamilyAssets:N` (`0x44bf66`: family ID in local `N`) and
+    // `$Family` (`0x44c034`: family name of the stack neighbor record).
     if text.contains("$FamilyAssets") {
-        let assets_str = money(world.budget.funds);
-        text = replace_token_safe(&text, "$FamilyAssets", &assets_str);
+        let mut out = text.clone();
+        let mut from = 0;
+        let active_family_id = i32::from(world.globals.get(9).copied().unwrap_or(0));
+        while let Some(at) = out
+            .get(from..)
+            .and_then(|s| s.find("$FamilyAssets"))
+            .map(|i| i + from)
+        {
+            let (n, _, end) = parse_token_numbers(out.as_bytes(), at + "$FamilyAssets".len());
+            if let Ok(idx) = usize::try_from(n)
+                && idx < locals.len()
+            {
+                let fam_id = i32::from(locals[idx]);
+                let assets = families
+                    .and_then(|f| f.get(&fam_id))
+                    .map(|info| info.assets)
+                    .or_else(|| {
+                        (fam_id != 0 && fam_id == active_family_id).then_some(world.budget.funds)
+                    });
+                if let Some(assets) = assets {
+                    let s = assets.to_string();
+                    out.replace_range(at..end, &s);
+                    from = at + s.len();
+                    continue;
+                }
+            }
+            from = at + "$FamilyAssets".len();
+        }
+        text = out;
     }
-    if text.contains("$Family") {
-        // Fallback to active household's first resident name when family surname is absent.
-        let family_name = caller_obj
-            .and_then(|o| catalog_display_name(o.guid, world, index, catalog, faces))
-            .unwrap_or_default();
-        if !family_name.is_empty() {
-            text = replace_token_safe(&text, "$Family", &family_name);
+    if text.contains("$Family")
+        && let Some(rec) = neighbor_rec
+    {
+        let fam_id = i32::from(rec.data.get(61).copied().unwrap_or(0));
+        if let Some(info) = families.and_then(|f| f.get(&fam_id))
+            && !info.name.is_empty()
+        {
+            text = replace_token_safe(&text, "$Family", &info.name);
         }
     }
 
@@ -815,14 +898,33 @@ fn format_dialog_text(
     };
     let careers_ref = careers.or(loaded_careers.as_ref());
 
+    // `$Grade:N` (`0x44c861..0x44c8c4`): parses `:N`, validates `0 <= N < locals.len()`,
+    // passes the parsed index `N` directly to `0x4034ce` (`Careers::grade`), and
+    // consumes the full token including `:N`.
     if text.contains("$Grade")
         && let Some(c) = careers_ref
-        && let Some(person) = caller_obj.and_then(|o| o.person.as_ref())
     {
-        let grade = c.grade(person.data.get(57).copied().unwrap_or(0));
-        if !grade.is_empty() {
-            text = replace_token_safe(&text, "$Grade", grade);
+        let mut out = text.clone();
+        let mut from = 0;
+        while let Some(at) = out
+            .get(from..)
+            .and_then(|s| s.find("$Grade"))
+            .map(|i| i + from)
+        {
+            let (n, _, end) = parse_token_numbers(out.as_bytes(), at + "$Grade".len());
+            if let Ok(idx) = usize::try_from(n)
+                && idx < locals.len()
+            {
+                let grade = c.grade(n as i16);
+                if !grade.is_empty() {
+                    out.replace_range(at..end, grade);
+                    from = at + grade.len();
+                    continue;
+                }
+            }
+            from = at + "$Grade".len();
         }
+        text = out;
     }
 
     // Pass 9: `$TimeLocal:N` (`0x44c8c4`).
@@ -868,20 +970,27 @@ fn format_dialog_text(
                 .map(|i| i + from)
             {
                 let (n1, n2, end) = parse_token_numbers(out.as_bytes(), at + token.len());
-                let (career_id, level) = match (usize::try_from(n1), usize::try_from(n2)) {
-                    (Ok(i1), Ok(i2)) if i1 < locals.len() && i2 < locals.len() => {
-                        (locals[i1], i32::from(locals[i2]))
-                    }
-                    (Ok(i1), _) if i1 < locals.len() => (locals[i1], default_level),
-                    _ => (default_career, default_level),
+                // 0x44c9c4..0x44ca23: use the caller's career & level whenever
+                // EITHER suffix is absent (`-1`); only when BOTH suffixes are
+                // present read `(locals[n1], locals[n2])` (leaving unmatched if
+                // either index is out of range).
+                let resolved = if n1 == -1 || n2 == -1 {
+                    Some((default_career, default_level))
+                } else if let (Ok(i1), Ok(i2)) = (usize::try_from(n1), usize::try_from(n2))
+                    && i1 < locals.len()
+                    && i2 < locals.len()
+                {
+                    Some((locals[i1], i32::from(locals[i2])))
+                } else {
+                    None
                 };
-                let replacement = match token {
+                let replacement = resolved.and_then(|(career_id, level)| match token {
                     "$JobOffer" => c
                         .offer(career_id)
                         .or_else(|| c.title(career_id, level, female)),
                     "$JobDesc" => c.description(career_id, level),
                     _ => c.title(career_id, level, female),
-                };
+                });
                 if let Some(rep) = replacement
                     && !rep.is_empty()
                 {
@@ -896,6 +1005,31 @@ fn format_dialog_text(
     }
 
     text
+}
+
+/// Formats one ordinary dialog string through the Complete Collection 1.91
+/// `0x44bf1a` pass order without mutating `world`.
+pub fn format_text(
+    input: &str,
+    caller: u16,
+    world: &World,
+    index: &Index,
+    catalog: &Catalog,
+    ctx: &DialogContext<'_>,
+) -> String {
+    let mut ignored = None;
+    format_dialog_text(
+        input,
+        caller,
+        world,
+        index,
+        catalog,
+        ctx.faces,
+        ctx.careers,
+        ctx.fame,
+        ctx.families,
+        &mut ignored,
+    )
 }
 
 impl Message {
@@ -1081,6 +1215,7 @@ impl Message {
                 ctx.faces,
                 ctx.careers,
                 ctx.fame,
+                ctx.families,
                 &mut portrait_guid,
             );
         }
@@ -1093,6 +1228,7 @@ impl Message {
             ctx.faces,
             ctx.careers,
             ctx.fame,
+            ctx.families,
             &mut portrait_guid,
         );
         msg.text = format_dialog_text(
@@ -1104,10 +1240,19 @@ impl Message {
             ctx.faces,
             ctx.careers,
             ctx.fame,
+            ctx.families,
             &mut portrait_guid,
         );
 
-        // 0x436279..0x4363b5: resolve icon modes 0, 1, 2, 4 alongside mode 3.
+        // 0x436279..0x4363b5: exact native icon-mode dispatch alongside mode 3:
+        // - mode 0: portrait GUID written by `$Object`/`$Neighbor`, else the
+        //   stack object's master definition GUID (`0x436308..0x43634d`), else None.
+        // - mode 1: None (`0x436279`).
+        // - mode 2: `world.neighbors.get(stack_object)` directly (`0x4362f4`),
+        //   never checking `world.objects` first, else None.
+        // - mode 3: custom `BMP_` (`1000 + operands[1]`, loaded in `from_file`).
+        // - mode 4: formats `operands[1]` text (`0x436297..0x4362c0`, discarding
+        //   portrait out-param) and leaves `msg.icon = None`.
         let icon_mode = (dialog.operands[7] >> 1) & 7;
         let stack_object = caller_obj.stack.last().map_or(0, |f| f.stack_object);
         let stack_obj_guid = u16::try_from(stack_object)
@@ -1117,120 +1262,49 @@ impl Message {
         let stack_neighbor_guid = world.neighbors.get(stack_object).map(|n| n.guid);
         if msg.icon.is_none() {
             match icon_mode {
-                // Mode 0 (auto): `$Object`/`$Neighbor` portrait GUID, else stack
-                // object's master GUID, else caller's portrait/icon.
                 0 => {
-                    msg.icon = portrait_guid
-                        .and_then(|g| {
-                            resolve_guid_icon(
-                                g,
-                                world,
-                                index,
-                                catalog,
-                                ctx.faces,
-                                ctx.thumbnails.as_deref_mut(),
-                                ctx.art,
-                            )
-                        })
-                        .or_else(|| {
-                            stack_obj_guid.and_then(|g| {
-                                resolve_guid_icon(
-                                    g,
-                                    world,
-                                    index,
-                                    catalog,
-                                    ctx.faces,
-                                    ctx.thumbnails.as_deref_mut(),
-                                    ctx.art,
-                                )
-                            })
-                        })
-                        .or_else(|| {
-                            resolve_guid_icon(
-                                caller_obj.guid,
-                                world,
-                                index,
-                                catalog,
-                                ctx.faces,
-                                ctx.thumbnails.as_deref_mut(),
-                                ctx.art,
-                            )
-                        });
+                    let target = portrait_guid.or_else(|| {
+                        stack_obj_guid.and_then(|g| master_guid_opt(g, world, index, catalog))
+                    });
+                    msg.icon = target.and_then(|g| {
+                        resolve_guid_icon(
+                            g,
+                            world,
+                            index,
+                            catalog,
+                            ctx.faces,
+                            ctx.thumbnails.as_deref_mut(),
+                            ctx.art,
+                        )
+                    });
                 }
-                // Mode 1 (neighbor / person 45×45 portrait over SimStub.BMP 4992).
-                1 => {
-                    let target = stack_neighbor_guid
-                        .or(portrait_guid)
-                        .or(stack_obj_guid)
-                        .unwrap_or(caller_obj.guid);
-                    msg.icon = resolve_person_portrait(target, world, index, catalog, ctx.faces)
-                        .or_else(|| {
-                            resolve_guid_icon(
-                                target,
-                                world,
-                                index,
-                                catalog,
-                                ctx.faces,
-                                ctx.thumbnails.as_deref_mut(),
-                                ctx.art,
-                            )
-                        })
-                        .or_else(|| {
-                            resolve_person_portrait(
-                                caller_obj.guid,
-                                world,
-                                index,
-                                catalog,
-                                ctx.faces,
-                            )
-                        });
-                }
-                // Mode 2 (stack object thumbnail/icon or stack neighbor portrait).
                 2 => {
-                    msg.icon = stack_obj_guid
-                        .and_then(|g| {
-                            resolve_guid_icon(
-                                g,
-                                world,
-                                index,
-                                catalog,
-                                ctx.faces,
-                                ctx.thumbnails.as_deref_mut(),
-                                ctx.art,
-                            )
-                        })
-                        .or_else(|| {
-                            stack_neighbor_guid.and_then(|g| {
-                                resolve_person_portrait(g, world, index, catalog, ctx.faces)
-                            })
-                        })
-                        .or_else(|| {
-                            resolve_guid_icon(
-                                caller_obj.guid,
-                                world,
-                                index,
-                                catalog,
-                                ctx.faces,
-                                ctx.thumbnails.as_deref_mut(),
-                                ctx.art,
-                            )
-                        });
+                    msg.icon = stack_neighbor_guid
+                        .and_then(|g| resolve_person_portrait(g, world, index, catalog, ctx.faces));
                 }
-                // Mode 4 (caller/person face portrait).
                 4 => {
-                    msg.icon =
-                        resolve_person_portrait(caller_obj.guid, world, index, catalog, ctx.faces)
-                            .or_else(|| {
-                                resolve_guid_icon(
-                                    caller_obj.guid,
-                                    world,
-                                    index,
-                                    catalog,
-                                    ctx.faces,
-                                    ctx.thumbnails.as_deref_mut(),
-                                    ctx.art,
-                                )
-                            });
+                    if let Some(chunk) = iff.get(b"STR#", STRINGS)
+                        && let Ok(table) = StringTable::parse(iff.data(chunk))
+                        && let Some(op1_str) = usize::from(dialog.operands[1])
+                            .checked_sub(1)
+                            .and_then(|i| table.get(i, 1))
+                            .filter(|s| !s.is_empty())
+                    {
+                        let mut ignored = None;
+                        let _ = format_dialog_text(
+                            op1_str,
+                            dialog.caller,
+                            world,
+                            index,
+                            catalog,
+                            ctx.faces,
+                            ctx.careers,
+                            ctx.fame,
+                            ctx.families,
+                            &mut ignored,
+                        );
+                    }
+                    msg.icon = None;
                 }
                 _ => {}
             }

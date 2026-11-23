@@ -225,7 +225,7 @@ impl Destination {
         match self {
             Self::Downtown => (21, 30),
             Self::VacationIsland => (40, 48),
-            Self::OldTown => (58, 68),
+            Self::OldTown => (50, 79),
             Self::StudioTown => (81, 89),
             Self::MagicTown => (90, 98),
         }
@@ -257,7 +257,8 @@ impl Destination {
     pub const fn default_transport(self) -> TravelTransport {
         match self {
             Self::Downtown => TravelTransport::Taxi,
-            Self::VacationIsland | Self::OldTown | Self::StudioTown => TravelTransport::Shuttle,
+            Self::VacationIsland | Self::StudioTown => TravelTransport::Shuttle,
+            Self::OldTown => TravelTransport::Trolley,
             Self::MagicTown => TravelTransport::MagicHole,
         }
     }
@@ -1054,8 +1055,10 @@ fn control_short_label(control: TravelControl) -> &'static str {
 pub enum TravelTransport {
     /// Hot Date Downtown yellow cab (`Downtown/dtphone.bmp`).
     Taxi,
-    /// Vacation Island / Studio Town / Old Town shuttle or limo.
+    /// Vacation Island / Studio Town shuttle or limo.
     Shuttle,
+    /// Unleashed Old Town trolley (`NghUI/nbphone.bmp`, `5433`).
+    Trolley,
     /// Makin' Magic Hole in the Ground (`Magicland/mtclownhole.bmp`).
     MagicHole,
 }
@@ -1067,7 +1070,7 @@ impl TravelTransport {
             (Self::Taxi, _) => art_id::PHONE_DOWNTOWN,
             (Self::Shuttle, Destination::VacationIsland) => art_id::PHONE_VACATION,
             (Self::Shuttle, Destination::StudioTown) => art_id::PHONE_STUDIO_TOWN,
-            (Self::Shuttle, _) => art_id::PHONE_NEIGHBORHOOD,
+            (Self::Shuttle, _) | (Self::Trolley, _) => art_id::PHONE_NEIGHBORHOOD,
             (Self::MagicHole, _) => art_id::MAGIC_HOLE_ICON,
         }
     }
@@ -1076,6 +1079,7 @@ impl TravelTransport {
         match self {
             Self::Taxi => "Taxi",
             Self::Shuttle => "Shuttle",
+            Self::Trolley => "Trolley",
             Self::MagicHole => "Magic Hole",
         }
     }
@@ -1107,7 +1111,8 @@ impl TravelDialogState {
         let (transport, fare_simoleons) = match destination {
             Destination::Downtown => (TravelTransport::Taxi, 50),
             Destination::VacationIsland => (TravelTransport::Shuttle, 500),
-            Destination::OldTown | Destination::StudioTown => (TravelTransport::Shuttle, 0),
+            Destination::OldTown => (TravelTransport::Trolley, 0),
+            Destination::StudioTown => (TravelTransport::Shuttle, 0),
             Destination::MagicTown => (TravelTransport::MagicHole, 0),
         };
         Self {

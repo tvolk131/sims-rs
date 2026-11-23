@@ -568,6 +568,15 @@ fn ordinary_dialogs_format_tokens_resolve_icon_modes_and_caller_title_fallback()
         });
     }
 
+    let mut families = std::collections::BTreeMap::new();
+    let other_fam_id = i32::from(other_neighbor.data.get(61).copied().unwrap_or(0)).max(1);
+    families.insert(
+        other_fam_id,
+        dialog::FamilyInfo {
+            name: "Newbie".into(),
+            assets: 12_345,
+        },
+    );
     let mut thumbs = sims_ui::thumbnail::Thumbnails::default();
     let mut ctx = dialog::DialogContext {
         faces: Some(&faces),
@@ -575,11 +584,101 @@ fn ordinary_dialogs_format_tokens_resolve_icon_modes_and_caller_title_fallback()
         art: Some(&art),
         careers: Some(&careers),
         fame: Some(&fame),
+        families: Some(&families),
     };
 
-    // Test icon modes 0 (auto), 1 (neighbor/person portrait), 2 (stack object), 4 (caller face),
-    // all with operands[6] == 0 to verify caller display-name title fallback!
+    // 1. Real VM-emitted dialog check: step the Goth house to tick 2 where the
+    //    real VM executes a Dialog instruction ("Help System"), and verify
+    //    `Message::read_with_context` produces the exact title, body, and icon.
+    let mut live_lot = Lot::load(
+        &root,
+        &house,
+        &[],
+        Frames {
+            after: Vec::new(),
+            every: Vec::new(),
+        },
+    )
+    .unwrap();
+    live_lot.wait_for_answers();
+    live_lot.step().expect("tick 1");
+    let _ = live_lot.step().expect_err("tick 2 asks Help System");
+    let live_world = &live_lot.asking().unwrap().world;
+    let live_rec = dialog::pending(live_world).expect("VM-emitted Help System dialog");
+    let live_msg = Message::read_with_context(
+        live_world,
+        &index,
+        live_lot.catalog(),
+        &labels,
+        live_rec,
+        &mut ctx,
+    )
+    .unwrap()
+    .expect("VM-emitted dialog read via read_with_context");
+    assert_eq!(live_msg.title, "Help System");
+    assert_eq!(live_msg.buttons, ["Yes", "No"]);
+    assert_eq!(
+        live_msg.icon.as_ref().map(|i| (i.width, i.height)),
+        Some((133, 103))
+    );
+
+    // 2. Native 1.91 token semantics (`0x44bf66`, `0x44c034`, `0x44c861`, `0x44c9c4`):
+    //    - `$FamilyAssets:N` uses family ID in local `N` and consumes `:N`
+    //    - `$Family` resolves stack neighbor's family name (not caller display name)
+    //    - `$Grade:N` validates `N < locals.len()` and passes `N` to `Careers::grade`
+    //    - `$Job` / `$Job:0` (single suffix -> caller career+level) vs `$Job:4:5` (both locals)
+    let mut fmt_world = world.clone();
+    if let Some(nb) = fmt_world.neighbors.get_mut(other_neighbor.id)
+        && nb.data.len() > 61
+    {
+        nb.data[61] = other_fam_id as i16;
+    }
+    if let Some(caller) = fmt_world.objects.get_mut(&sim_id)
+        && let Some(frame) = caller.stack.last_mut()
+    {
+        frame.stack_object = other_neighbor.id;
+        // locals: [0]=other_fam_id, [1]=500, [2]=other_neighbor.id, [3]=13 (1pm), [4]=2 (Entertainment), [5]=3
+        frame.locals = vec![other_fam_id as i16, 500, other_neighbor.id, 13, 2, 3];
+    }
+    let caller_job = careers.title(1, 1, false).expect("career 1 level 1");
+    let local_job = careers.title(2, 3, false).expect("career 2 level 3");
+    let grade_2 = careers.grade(2);
+    let formatted_all = dialog::format_text(
+        "fam=$Family assets=$FamilyAssets:0 grade=$Grade:2 time=$TimeLocal:3 cost=$$Local:1 cur=$Job single=$Job:4 both=$Job:4:5",
+        sim_id,
+        &fmt_world,
+        &index,
+        lot.catalog(),
+        &ctx,
+    );
+    assert_eq!(
+        formatted_all,
+        format!(
+            "fam=Newbie assets=12345 grade={grade_2} time= 1:00 pm cost=$500 cur={caller_job} single={caller_job} both={local_job}"
+        )
+    );
+
+    // 3. Exact 1.91 icon-mode dispatch (`0x436279..0x4363b5`) + caller title
+    //    fallback (`operands[6] == 0`):
+    //    - mode 0: resolves `$Object`/`$Neighbor` or stack object's master icon,
+    //      and leaves `None` when neither token nor stack object supplies one.
+    //    - mode 1: leaves `icon == None`.
+    //    - mode 2: resolves `world.neighbors.get(stack_object)` DIRECTLY (`0x4362f4`)
+    //      even when an unrelated live object shares the EXACT SAME numeric ID!
+    //    - mode 4: formats operand 1 text and leaves `icon == None`.
     for mode in [0u8, 1, 2, 4] {
+        let mut test_world = world.clone();
+        if mode == 2 {
+            let colliding_id = other_neighbor.id as u16;
+            let mut collider = non_person_obj.clone();
+            collider.id = colliding_id;
+            test_world.objects.insert(colliding_id, collider);
+            if let Some(caller) = test_world.objects.get_mut(&sim_id)
+                && let Some(frame) = caller.stack.last_mut()
+            {
+                frame.stack_object = other_neighbor.id;
+            }
+        }
         let mut operands = [0u8; 8];
         operands[2] = msg_str_id;
         operands[5] = 0; // kind 0 (OK)
@@ -591,7 +690,7 @@ fn ordinary_dialogs_format_tokens_resolve_icon_modes_and_caller_title_fallback()
             status: 0,
         };
         let msg =
-            Message::read_with_context(&world, &index, lot.catalog(), &labels, &rec, &mut ctx)
+            Message::read_with_context(&test_world, &index, lot.catalog(), &labels, &rec, &mut ctx)
                 .unwrap()
                 .expect("dialog message");
         assert_eq!(
@@ -608,49 +707,67 @@ fn ordinary_dialogs_format_tokens_resolve_icon_modes_and_caller_title_fallback()
             "raw token leaked in mode {mode}: raw={raw_template:?} -> formatted={:?}",
             msg.text
         );
-        assert!(
-            msg.icon.is_some(),
-            "icon mode {mode} must resolve a non-None icon"
-        );
-        if matches!(mode, 1 | 4) {
-            let icon = msg.icon.as_ref().unwrap();
-            assert_eq!(
-                (icon.width, icon.height),
-                (45, 45),
-                "person portrait in mode {mode} must be 45x45 for SimStub.BMP backing"
-            );
-            let laid = dialog::layout([800, 600], &msg, &art).unwrap();
-            assert!(laid.icon.is_some());
+        match mode {
+            0 => assert!(
+                msg.icon.is_some(),
+                "icon mode 0 with valid stack object must resolve an icon"
+            ),
+            1 | 4 => assert!(
+                msg.icon.is_none(),
+                "native 1.91 icon mode {mode} leaves icon None (0x436279)"
+            ),
+            2 => {
+                let icon = msg
+                    .icon
+                    .as_ref()
+                    .expect("icon mode 2 must resolve neighbor portrait");
+                assert_eq!(
+                    (icon.width, icon.height),
+                    (45, 45),
+                    "mode 2 must return 45x45 neighbor portrait even on object/neighbor ID collision"
+                );
+                let laid = dialog::layout([800, 600], &msg, &art).unwrap();
+                assert!(laid.icon.is_some());
+                if let Some(dir) =
+                    std::env::var_os("SIMS_WAVE1_SHOTS_DIR").map(std::path::PathBuf::from)
+                {
+                    let mut frame = Frame::new(800, 600, [24, 34, 48]);
+                    dialog::draw(&mut frame, &art, &msg, &laid, None);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ =
+                        std::fs::write(dir.join("dialog_mode2_portrait_800x600.png"), frame.png());
+                }
+            }
+            _ => unreachable!(),
         }
     }
 
-    // Also explicitly verify `$Neighbor`, `$NeighborLocal:2`, `$TimeLocal:3`, `$$Local:1`, and `$Job`
-    // against a synthetic STR# 301 IFF mounted into an isolated world & catalog check via `format_dialog_text`.
-    // Using a real stack with stack_object = other_neighbor.id for mode 1 portrait check:
-    if let Some(caller) = world.objects.get_mut(&sim_id)
+    // Mode 0 with NO `$Object`/`$Neighbor` token and NO stack object (stack_object = 0)
+    // must leave `icon == None` (no spurious fallback to caller!).
+    let mut empty_stack_world = world.clone();
+    if let Some(caller) = empty_stack_world.objects.get_mut(&sim_id)
         && let Some(frame) = caller.stack.last_mut()
     {
-        frame.stack_object = other_neighbor.id;
+        frame.stack_object = 0;
     }
-    let rec_mode1 = sims_sim::Dialog {
+    let rec_mode0_empty = sims_sim::Dialog {
         caller: sim_id,
-        operands: [0, 0, msg_str_id, 0, 0, 0, 0, 1 << 1],
+        operands: [0, 0, msg_str_id, 0, 0, 0, 0, 0],
         status: 0,
     };
-    let msg_nb =
-        Message::read_with_context(&world, &index, lot.catalog(), &labels, &rec_mode1, &mut ctx)
-            .unwrap()
-            .expect("mode 1 neighbor dialog");
-    assert_eq!(
-        msg_nb.icon.as_ref().map(|i| (i.width, i.height)),
-        Some((45, 45))
+    let msg_empty = Message::read_with_context(
+        &empty_stack_world,
+        &index,
+        lot.catalog(),
+        &labels,
+        &rec_mode0_empty,
+        &mut ctx,
+    )
+    .unwrap()
+    .expect("mode 0 empty stack dialog");
+    assert!(
+        msg_empty.icon.is_none(),
+        "mode 0 with no token portrait and stack_object=0 must leave icon None"
     );
-    if let Some(dir) = std::env::var_os("SIMS_WAVE1_SHOTS_DIR").map(std::path::PathBuf::from) {
-        let laid = dialog::layout([800, 600], &msg_nb, &art).unwrap();
-        let mut frame = Frame::new(800, 600, [24, 34, 48]);
-        dialog::draw(&mut frame, &art, &msg_nb, &laid, None);
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(dir.join("dialog_mode1_portrait_800x600.png"), frame.png());
-    }
     assert!(!other_name.is_empty());
 }

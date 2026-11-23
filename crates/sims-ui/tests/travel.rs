@@ -312,10 +312,15 @@ fn complete_collection_loads_travel_art_and_localized_tooltips() {
     );
 
     // Destination::OldTown has its own distinct identity, PHONE_NEIGHBORHOOD (5433)
-    // transport icon, Unleashed community filters, and travel dialog.
+    // transport icon, Trolley transport, full 50..=79 range, Unleashed community filters, and travel dialog.
     assert_ne!(Destination::OldTown, Destination::Downtown);
     assert_eq!(Destination::OldTown.short_label(), "Old Town");
-    assert_eq!(Destination::OldTown.lot_range(), (58, 68));
+    assert_eq!(Destination::OldTown.lot_range(), (50, 79));
+    assert_eq!(
+        Destination::OldTown.default_transport(),
+        sims_ui::travel::TravelTransport::Trolley
+    );
+    assert_eq!(Destination::OldTown.default_transport().label(), "Trolley");
     assert_eq!(
         Destination::OldTown
             .default_transport()

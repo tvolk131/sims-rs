@@ -257,7 +257,7 @@ impl BuyItem {
     /// Returns the catalog sort bitmask for `zone`.
     pub const fn sort_word(&self, zone: BuyZone) -> u16 {
         match zone {
-            BuyZone::Residential => self.room_sort,
+            BuyZone::Residential => self.room_sort | self.function_sort,
             BuyZone::Downtown => self.downtown_sort,
             BuyZone::Vacation => self.vacation_sort,
             BuyZone::Community => self.community_sort,
@@ -717,14 +717,17 @@ impl BuyCatalog {
                     raw_name = cp1252_bytes(&chunk.label);
                 }
                 // 0x4cb905..0x4cbaa8: keep the object whenever any residential
-                // or expansion commercial catalog sort word is nonzero.
+                // (`+0x4e` room or `+0x50` function) or expansion commercial
+                // catalog sort word is nonzero.
                 let room_sort = read_i16(data, OBJD_ROOM_SORT) as u16;
+                let function_sort = read_i16(data, OBJD_FUNC_SORT) as u16;
                 let downtown_sort = read_i16(data, OBJD_DOWNTOWN_SORT) as u16;
                 let vacation_sort = read_i16(data, OBJD_VACATION_SORT) as u16;
                 let community_sort = read_i16(data, OBJD_COMMUNITY_SORT) as u16;
                 let studio_sort = read_i16(data, OBJD_STUDIO_SORT) as u16;
                 let magic_sort = read_i16(data, OBJD_MAGIC_SORT) as u16;
                 let any_sort = room_sort
+                    | function_sort
                     | downtown_sort
                     | vacation_sort
                     | community_sort
@@ -741,7 +744,6 @@ impl BuyCatalog {
                     continue;
                 }
                 let price = i32::from(read_i16(data, OBJD_PRICE));
-                let function_sort = read_i16(data, OBJD_FUNC_SORT) as u16;
                 let function_subsort = read_i16(data, OBJD_FUNC_SUBSORT) as u16;
                 let build_mode_type = read_i16(data, OBJD_BUILD_TYPE);
                 let mut ratings = [0i16; 7];
@@ -891,8 +893,7 @@ impl BuyCatalog {
                     self.items
                         .iter()
                         .filter(|item| {
-                            item.room_sort != 0
-                                && (item.function_sort & cat_bit) != 0
+                            (item.function_sort & cat_bit) != 0
                                 && ((item.function_subsort & sub_mask) != 0
                                     || (sub_mask == 0xff && item.function_subsort == 0))
                         })
@@ -1547,23 +1548,32 @@ fn read_ttab_usage(iff: &Iff, ttab_id: i16) -> (Option<UsageRestriction>, bool) 
         if !no_adults || !no_kids {
             pets_only = false;
         }
-        if action.joining_index >= 0 && (action.joining_index as usize) < table.interactions.len() {
+        // 0x4579da -> 0x41f12c: `joining_index` references a target interaction
+        // by its TTAB menu `string_index`, not its dense vector position.
+        if action.joining_index >= 0
+            && table
+                .interactions
+                .iter()
+                .any(|other| other.string_index == action.joining_index as u32)
+        {
             group_activity = true;
         }
     }
     if non_debug == 0 {
         return (None, false);
     }
+    // 0x5086ef..0x50873e: check `adults_only`, `kids_only`, then `pets_only`
+    // (`0x457914`) BEFORE `dogs_only` (`0x4578a5`) and `cats_only` (`0x457836`).
     let restriction = if adults_only {
         Some(UsageRestriction::AdultsOnly)
     } else if kids_only {
         Some(UsageRestriction::KidsOnly)
-    } else if dogs_only && !cats_only {
-        Some(UsageRestriction::DogsOnly)
-    } else if cats_only && !dogs_only {
-        Some(UsageRestriction::CatsOnly)
     } else if pets_only {
         Some(UsageRestriction::PetsOnly)
+    } else if dogs_only {
+        Some(UsageRestriction::DogsOnly)
+    } else if cats_only {
+        Some(UsageRestriction::CatsOnly)
     } else {
         None
     };
@@ -1855,5 +1865,82 @@ mod tests {
         let (name, desc, _) = read_ctss(&ctss_only, 2008);
         assert_eq!(name, "CTSS Lamp");
         assert_eq!(desc, "CTSS description");
+    }
+
+    #[test]
+    fn function_only_residential_item_is_retained_and_filtered_by_function() {
+        // An object with `room_sort == 0`, `function_sort != 0`, and
+        // `function_subsort != 0` must be included in Residential ByFunction
+        // (`0x50765c`) and `items_for_zone(BuyZone::Residential)`.
+        let item = make_item(
+            0x3333_3333,
+            150,
+            "Function-Only Chair",
+            "No room bits set",
+            0,      // room_sort == 0
+            0x0001, // Seating
+            0x0001, // Dining chairs subsort
+            [2, 0, 0, 0, 0, 0, 0],
+            0,
+        );
+        let cat = BuyCatalog::from_items(vec![item]);
+        assert_eq!(cat.items_for_zone(BuyZone::Residential).len(), 1);
+        let state = BuyState {
+            zone: BuyZone::Residential,
+            sort: BuySort::ByFunction,
+            category: Some(0),
+            subcategory: 0,
+            page: 0,
+            selected: None,
+        };
+        let filtered = cat.filtered(&state);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].guid, 0x3333_3333);
+    }
+
+    /// Encodes a minimal TTAB v7 chunk from `(string_index, flags, joining_index)` tuples.
+    fn build_ttab(rows: &[(u32, u32, i32)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(rows.len() as u16).to_le_bytes());
+        out.extend_from_slice(&7u16.to_le_bytes()); // version 7 (no compression flag)
+        for &(string_index, flags, joining_index) in rows {
+            out.extend_from_slice(&4096u16.to_le_bytes()); // action
+            out.extend_from_slice(&0u16.to_le_bytes()); // test
+            out.extend_from_slice(&0u32.to_le_bytes()); // motive count
+            out.extend_from_slice(&flags.to_le_bytes());
+            out.extend_from_slice(&string_index.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // attenuation_code
+            out.extend_from_slice(&0f32.to_le_bytes()); // attenuation
+            out.extend_from_slice(&50u32.to_le_bytes()); // autonomy
+            out.extend_from_slice(&joining_index.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn ttab_usage_matches_191_sparse_joining_id_and_pets_precedence() {
+        // Sparse menu string IDs: `joining_index = 42` matches `string_index == 42`
+        // even though `interactions.len() == 2` (`0x41f12c`).
+        let sparse_ttab = build_ttab(&[(10, 0, 42), (42, 0, -1)]);
+        let iff = Iff::parse(build_iff(&[(b"TTAB", 128, &sparse_ttab)])).unwrap();
+        assert_eq!(read_ttab_usage(&iff, 128), (None, true));
+
+        // Nonexistent low `joining_index = 0` must NOT match when no interaction
+        // has `string_index == 0` (even though `0 < interactions.len()`).
+        let bogus_join = build_ttab(&[(10, 0, 0), (20, 0, -1)]);
+        let iff_bogus = Iff::parse(build_iff(&[(b"TTAB", 128, &bogus_join)])).unwrap();
+        assert_eq!(read_ttab_usage(&iff_bogus, 128), (None, false));
+
+        // Precedence (`0x5086ef`): `no_adults (bit 6) | no_kids (bit 4)` satisfies
+        // `pets_only` (`0x457914`) AND `dogs_only` (`0x4578a5`, no cat bit 10) AND
+        // `cats_only` (`0x457836`, no dog bit 9). Native `0x5086ef` checks `pets_only`
+        // FIRST, returning `UsageRestriction::PetsOnly`.
+        let pet_flags = (1 << 4) | (1 << 6);
+        let pets_ttab = build_ttab(&[(1, pet_flags | (1 << 9), -1)]);
+        let iff_pets = Iff::parse(build_iff(&[(b"TTAB", 128, &pets_ttab)])).unwrap();
+        assert_eq!(
+            read_ttab_usage(&iff_pets, 128),
+            (Some(UsageRestriction::PetsOnly), false)
+        );
     }
 }

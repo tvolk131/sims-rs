@@ -1236,4 +1236,109 @@ fn options_saves_and_coop_buttons_never_overlap_any_subpanel_widget_across_resol
             }
         }
     }
+
+    // Synchronous relayout check (`P2 #8`): switching Options tab updates
+    // Saves/Co-op rects immediately BEFORE `render()` is called.
+    game.resize([800, 600]);
+    game.set_mode(Mode::Options);
+    if game.options().tab.is_some() {
+        assert!(game.escape_options());
+    }
+    let before_tab_saves = game
+        .options_saves_button_rect()
+        .expect("Saves laid out synchronously on base Options");
+    let play_btn = find_command_point(&game, &Command::OpenOptionsTab(OptionsTab::Play));
+    game.press(play_btn);
+    let after_tab_saves = game
+        .options_saves_button_rect()
+        .expect("Saves updated synchronously on OpenOptionsTab before render()");
+    assert_ne!(
+        before_tab_saves, after_tab_saves,
+        "Saves button rect must update synchronously before draw when opening Play tab at 800x600"
+    );
+
+    // Help balloon + Quick Tips hover tooltip at 800x600 must NEVER overlap Saves/Co-op.
+    let help_pt = find_command_point(&game, &Command::OptionsHelp(OptionsHelp::FreeWill));
+    game.press(help_pt);
+    let save_action = find_command_point(&game, &Command::OptionsAction(OptionsAction::Save));
+    game.hover(save_action);
+    game.render();
+    if let (Some(saves), Some(coop)) = (
+        game.options_saves_button_rect(),
+        game.options_coop_button_rect(),
+    ) {
+        assert!(!rects_overlap(saves, coop));
+        for r in [saves, coop] {
+            for item in game.panel() {
+                if matches!(
+                    item.kind,
+                    sims_ui::hud::Kind::Stretched(_)
+                        | sims_ui::hud::Kind::Image(
+                            sims_ui::hud::id::STRIP | sims_ui::hud::id::BACK_PATCH
+                        )
+                ) {
+                    continue;
+                }
+                assert!(
+                    !rects_overlap(r, item.rect),
+                    "Saves/Co-op {r:?} overlapped balloon/tooltip/widget {:?} ({:?})",
+                    item.kind,
+                    item.rect
+                );
+            }
+        }
+    }
+
+    // Extreme narrow viewport (`320x240`, `P3 #1`): when the pair cannot fit
+    // cleanly within bounds without overlap, return `None` instead of clipping.
+    game.resize([320, 240]);
+    game.render();
+    assert_eq!(
+        game.options_saves_button_rect(),
+        None,
+        "Saves button must be hidden rather than clip out of a 320x240 viewport"
+    );
+    assert_eq!(
+        game.options_coop_button_rect(),
+        None,
+        "Co-op button must be hidden rather than clip out of a 320x240 viewport"
+    );
+
+    // Resizing in Buy Mode on an Old Town community lot (`House58.iff`, P2 #4)
+    // must keep `BuyZone::Community` and preserve category/selection across resize + render.
+    let old_town_house = root.join("UserData/Houses/House58.iff");
+    if old_town_house.is_file() {
+        let mut community = Game::open(&Options {
+            install: root.clone(),
+            house: old_town_house,
+            answers: vec![3],
+            play: false,
+            frames: Frames {
+                after: Vec::new(),
+                every: Vec::new(),
+            },
+        })
+        .expect("open Old Town community lot House58");
+        community.resize([800, 600]);
+        community.set_mode(Mode::Buy);
+        community.render();
+        assert_eq!(community.buy_state().zone, sims_ui::buy::BuyZone::Community);
+        let cat0 = community
+            .buy_layout()
+            .widgets
+            .iter()
+            .find(|w| w.command == Some(Command::BuyCategory(0)))
+            .expect("Community BuyCategory(0)")
+            .rect;
+        community.press([cat0.x + cat0.width / 2, cat0.y + cat0.height / 2]);
+        community.render();
+        assert_eq!(community.buy_state().category, Some(0));
+        // Resize from 800x600 -> 1024x768 -> render: zone & category MUST stay intact!
+        community.resize([1024, 768]);
+        assert_eq!(community.buy_state().zone, sims_ui::buy::BuyZone::Community);
+        assert_eq!(community.buy_state().category, Some(0));
+        community.render();
+        assert_eq!(community.buy_state().zone, sims_ui::buy::BuyZone::Community);
+        assert_eq!(community.buy_state().category, Some(0));
+    }
 }

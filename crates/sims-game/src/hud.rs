@@ -797,17 +797,17 @@ impl Hud {
         assets: &Assets,
         sell: Option<&SellInfo>,
     ) {
-        self.layout_buy_for_lot(size, world, true, assets, sell);
+        self.layout_buy_for_lot(size, world, None, assets, sell);
     }
 
-    /// Like [`Hud::layout_buy`], using the lot's residential zoning flag to
-    /// distinguish Old Town community lots (`BuyZone::Community`) from
-    /// residential lots (`BuyZone::Residential`).
+    /// Like [`Hud::layout_buy`], using the lot's neighborhood zoning (`Some(1)`
+    /// residential, `Some(2)` community) to distinguish Old Town community lots
+    /// (`BuyZone::Community`) from residential lots (`BuyZone::Residential`).
     pub fn layout_buy_for_lot(
         &mut self,
         size: [i32; 2],
         world: &World,
-        residential: bool,
+        lot_zoning: Option<i32>,
         assets: &Assets,
         sell: Option<&SellInfo>,
     ) {
@@ -816,8 +816,7 @@ impl Hud {
             return;
         }
         let lot_id = world.globals.get(10).copied().unwrap_or(0);
-        let zoning = Some(if residential { 1 } else { 2 });
-        let zone = sims_ui::buy::BuyZone::for_lot(lot_id, zoning);
+        let zone = sims_ui::buy::BuyZone::for_lot(lot_id, lot_zoning);
         self.buy_state.set_zone(zone);
         let rating_labels = self.rating_labels.clone();
         let sell_labels = self.sell_labels.clone();
@@ -1246,11 +1245,13 @@ impl Hud {
     /// Re-lays out the control panel items and Buy/Build strip for `size`
     /// after a mode or panel toggle, so consecutive clicks work even before
     /// the next [`Hud::draw`].
+    #[allow(clippy::too_many_arguments)]
     pub fn relayout_panel(
         &mut self,
         size: [i32; 2],
         world: &World,
         residential: bool,
+        lot_zoning: Option<i32>,
         visibility: options::LotVisibility,
         assets: &Assets,
         sell: Option<&SellInfo>,
@@ -1265,7 +1266,8 @@ impl Hud {
             Some(&self.art),
         );
         hud::fit(&mut self.items, &self.art, &self.texts);
-        self.layout_buy(size, world, assets, sell);
+        self.sync_options_extra_button_rects(size);
+        self.layout_buy_for_lot(size, world, lot_zoning, assets, sell);
         self.layout_build(size, world, assets, false, false);
         self.layout_camera_strip(size);
     }
@@ -1927,6 +1929,7 @@ impl Hud {
             art: Some(&self.art),
             careers: Some(&self.careers),
             fame: Some(&self.fame),
+            families: None,
         };
         let read = Message::read_with_context(
             world,
@@ -2114,6 +2117,7 @@ impl Hud {
         self.draw_for_lot_at_with_selection(
             world,
             residential,
+            Some(if residential { 1 } else { 2 }),
             visibility,
             assets,
             view,
@@ -2128,12 +2132,13 @@ impl Hud {
 
     /// Like [`Hud::draw_for_lot_at`], optionally overriding the HUD's displayed
     /// selected Sim (`selected_override`: `Some(local_sel)`) in co-op mode
-    /// without cloning `world`.
+    /// without cloning `world` and passing exact neighborhood `lot_zoning`.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_for_lot_at_with_selection(
         &mut self,
         world: &World,
         residential: bool,
+        lot_zoning: Option<i32>,
         visibility: options::LotVisibility,
         assets: &Assets,
         view: &View,
@@ -2210,6 +2215,7 @@ impl Hud {
             Some(&self.art),
         );
         hud::fit(&mut self.items, &self.art, &self.texts);
+        self.sync_options_extra_button_rects(view.size);
         self.queue = Queue::read(world, snapshot.selected);
         if clock_us > 0 {
             let origin = self.pending_queue_origin.and_then(|(person, pos, ts)| {
@@ -2349,16 +2355,14 @@ impl Hud {
                 );
             }
         }
-        self.saves_button_rect = self.compute_options_saves_button_rect(view.size);
         if let Some(rect) = self.saves_button_rect {
             self.draw_options_strip_button(&mut frame, rect, "Saves", self.pressed_saves_button);
         }
-        self.coop_button_rect = self.compute_options_coop_button_rect(view.size);
         if let Some(rect) = self.coop_button_rect {
             self.draw_options_strip_button(&mut frame, rect, "Co-op", self.pressed_coop_button);
         }
         if self.controls.mode == Mode::Buy && self.controls.expanded {
-            self.layout_buy_for_lot(view.size, world, residential, assets, sell);
+            self.layout_buy_for_lot(view.size, world, lot_zoning, assets, sell);
             let mut guids: Vec<u32> = self
                 .buy_layout
                 .widgets
@@ -2608,18 +2612,27 @@ impl Hud {
             .min()
             .unwrap_or(above_y);
         let lifted_y = (top_float - BTN_H - 4).max(4);
-        let (coop, saves) = pair_at(min_x.min(max_x), lifted_y);
-        Some((coop, saves))
+        for candidate_x in [min_x, max_x, divider_x + 4, (min_x + max_x) / 2] {
+            let x = candidate_x.clamp(min_x, max_x);
+            let (coop, saves) = pair_at(x, lifted_y);
+            if is_clear(coop, saves) {
+                return Some((coop, saves));
+            }
+        }
+        None
     }
 
-    fn compute_options_saves_button_rect(&self, size: [i32; 2]) -> Option<Rect> {
-        self.compute_options_extra_button_rects(size)
-            .map(|(_, saves)| saves)
-    }
-
-    fn compute_options_coop_button_rect(&self, size: [i32; 2]) -> Option<Rect> {
-        self.compute_options_extra_button_rects(size)
-            .map(|(coop, _)| coop)
+    /// Synchronizes stored `"Saves"` and `"Co-op"` hitboxes with the latest
+    /// laid-out Options items so pointer hits immediately after resize or
+    /// Options tab switches never target stale rectangles.
+    fn sync_options_extra_button_rects(&mut self, size: [i32; 2]) {
+        if let Some((coop, saves)) = self.compute_options_extra_button_rects(size) {
+            self.coop_button_rect = Some(coop);
+            self.saves_button_rect = Some(saves);
+        } else {
+            self.coop_button_rect = None;
+            self.saves_button_rect = None;
+        }
     }
 
     fn draw_options_strip_button(&self, frame: &mut Frame, rect: Rect, label: &str, pressed: bool) {

@@ -2276,7 +2276,16 @@ fn interests(
     let rows = 3usize;
     let left = arrow_w + 6;
     let right = panel.width - arrow_w - 4;
-    let cols = ((right - left + 3) / col_stride).max(1) as usize;
+    // 0x519251 / 0x519274: 2 columns (6/page) at 800 px (`panel.width == 279`),
+    // 3 columns (9/page) at 1024 px (`panel.width == 503`), scaling smoothly on
+    // wider viewports.
+    let cols = if panel.width <= 300 {
+        ((right - left + 3) / col_stride).clamp(1, 2) as usize
+    } else if panel.width <= 520 {
+        3
+    } else {
+        ((right - left + 3) / col_stride).max(3) as usize
+    };
     let per_page = (cols * rows).max(1);
     let pages = list.len().div_ceil(per_page).max(1);
     let page = (controls.interests_page as usize).min(pages - 1);
@@ -2332,12 +2341,13 @@ const INVENTORY_TABS: [(i32, InventoryTab); 3] = [
 ];
 
 /// Whether an inventory token kind belongs to `tab` (`0x51e3b4..0x51e440`:
-/// kinds `0, 4, 5` -> Gifts, kind `7` -> Magic, kind `8` and remaining -> Other).
+/// kinds `0, 4, 5` -> Gifts, kind `7` -> Magic, kind `8` -> Other; internal
+/// bookkeeping tokens such as kinds `1` and `3` are excluded).
 pub fn inventory_kind_matches_tab(kind: i32, tab: InventoryTab) -> bool {
     match tab {
         InventoryTab::Gifts => matches!(kind, 0 | 4 | 5),
         InventoryTab::Magic => kind == 7,
-        InventoryTab::Other => !matches!(kind, 0 | 4 | 5 | 7),
+        InventoryTab::Other => kind == 8,
     }
 }
 
@@ -2368,10 +2378,18 @@ fn gifts(items: &mut Vec<Item>, panel: Rect, snapshot: &Snapshot, controls: &Con
     let [arrow_w, arrow_h] = [9, 49];
     let cell_w = 45;
     let cell_h = 45;
-    let pitch_x = 48;
-    let left = button_w + arrow_w + 8;
-    let right = panel.width - arrow_w - 4;
-    let per_page = ((right - left + 3) / pitch_x).max(1) as usize;
+    // 0x519262 / 0x51927e / 0x51e355: native `[esi + 0x450] - 1` yields 5 items
+    // per page at 800 px (`panel.width == 279`) and 9 items per page at 1024 px
+    // (`panel.width == 503`).
+    let pitch_x = if panel.width <= 300 { 46 } else { 48 };
+    let left = button_w + arrow_w + 6;
+    let right = panel.width - arrow_w - 2;
+    let fit = ((right - left + (pitch_x - cell_w)) / pitch_x).max(1) as usize;
+    let per_page = if panel.width <= 520 && panel.width > 300 {
+        fit.min(9)
+    } else {
+        fit
+    };
     let pages = shown.len().div_ceil(per_page).max(1);
     let page = (controls.inventory_page as usize).min(pages - 1);
     let arrow_y = (panel.height - arrow_h) / 2;
