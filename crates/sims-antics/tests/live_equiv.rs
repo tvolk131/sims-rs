@@ -137,7 +137,12 @@ fn dead_pure_read_dummy_node_equals_return_true() {
         other => panic!("expected Counterexample, got {other:?}"),
     }
     let ctx = LiveContext::default();
-    assert_equivalent(&live_with(&fridge, &high_level, &ctx, &ignoring_last_result()));
+    assert_equivalent(&live_with(
+        &fridge,
+        &high_level,
+        &ctx,
+        &ignoring_last_result(),
+    ));
     let (method, result) = check_bhav_equivalent_combined(
         &fridge,
         &ctx,
@@ -834,9 +839,7 @@ fn differing_constant_tables_are_inconclusive() {
         label: String::new(),
         data: [vec![1, 0], value.to_le_bytes().to_vec()].concat(),
     };
-    let file = |value| {
-        write_iff(&[bhav_chunk(&reads_constant, "T"), bcon(value)]).expect("write")
-    };
+    let file = |value| write_iff(&[bhav_chunk(&reads_constant, "T"), bcon(value)]).expect("write");
     let opts = IffEquivOptions {
         tree: Some(4096),
         ..IffEquivOptions::default()

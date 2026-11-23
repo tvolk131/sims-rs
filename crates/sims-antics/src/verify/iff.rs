@@ -271,9 +271,7 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
                 } else if &tag == b"BHAV" {
                     // Even identical bytes behave differently against different constants
                     // or callees, so the tree's context is checked too.
-                    compare_bhav(
-                        id, ca, cb, &iff_a, &iff_b, &ctx_a, &ctx_b, opts, &mut notes,
-                    )
+                    compare_bhav(id, ca, cb, &iff_a, &iff_b, &ctx_a, &ctx_b, opts, &mut notes)
                 } else if da == db && (fa == fb || !matches!(&tag, b"STR#" | b"CTSS" | b"TTAs")) {
                     ResourceVerdict::Identical
                 } else {
@@ -370,8 +368,14 @@ fn compare_bhav(
         }
         let callee_arity_differs = a.instructions.iter().any(|ins| {
             ins.opcode >= 256
-                && ctx_a.callee_arities.as_ref().and_then(|m| m.get(&ins.opcode))
-                    != ctx_b.callee_arities.as_ref().and_then(|m| m.get(&ins.opcode))
+                && ctx_a
+                    .callee_arities
+                    .as_ref()
+                    .and_then(|m| m.get(&ins.opcode))
+                    != ctx_b
+                        .callee_arities
+                        .as_ref()
+                        .and_then(|m| m.get(&ins.opcode))
         });
         if !callee_arity_differs {
             return ResourceVerdict::Identical;

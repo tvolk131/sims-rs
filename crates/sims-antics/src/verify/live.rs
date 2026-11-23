@@ -777,9 +777,7 @@ impl Explorer<'_> {
             // Targets past the last node index (250) other than the three exits are
             // invalid, whatever the tree's length (`interpreter.rs:1695`).
             251..=252 => {
-                return Ok(vec![
-                    self.finish(state, Exit::Trap(INVALID_NODE), interner),
-                ]);
+                return Ok(vec![self.finish(state, Exit::Trap(INVALID_NODE), interner)]);
             }
             _ => {}
         }
@@ -1337,8 +1335,7 @@ impl Explorer<'_> {
                     if matches!(scope, 9 | 25) {
                         let inside = in_frame(scope, idx);
                         let val = inside.then(|| slot_val(&state, scope, idx));
-                        let unwritten =
-                            inside && scope == 25 && state.unwritten[idx as usize];
+                        let unwritten = inside && scope == 25 && state.unwritten[idx as usize];
                         frame.push(FrameVal::Read(scope, idx, val, unwritten));
                     }
                 }
@@ -1383,13 +1380,12 @@ impl Explorer<'_> {
         state.prefix = prefix;
 
         // Random never takes its false branch: it succeeds or traps (`random.rs`).
-        let outcomes: Vec<(Option<bool>, u8)> = if is_always_true_instruction(ins)
-            || ins.opcode == 8
-        {
-            vec![(None, ins.on_true)]
-        } else {
-            vec![(Some(true), ins.on_true), (Some(false), ins.on_false)]
-        };
+        let outcomes: Vec<(Option<bool>, u8)> =
+            if is_always_true_instruction(ins) || ins.opcode == 8 {
+                vec![(None, ins.on_true)]
+            } else {
+                vec![(Some(true), ins.on_true), (Some(false), ins.on_false)]
+            };
         let mut out = Vec::new();
         for (outcome, target) in outcomes {
             let mut s = state.clone();
@@ -1802,8 +1798,7 @@ fn first_difference(
         }
         if ua != ub {
             return Difference::Possible(
-                "final locals differ in which may still hold what an earlier frame left"
-                    .to_owned(),
+                "final locals differ in which may still hold what an earlier frame left".to_owned(),
             );
         }
     }

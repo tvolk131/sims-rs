@@ -5497,9 +5497,7 @@ pub fn context_mismatch(
             .any(|ins| ins.opcode != 2 || ins.operands[6] == 26 || ins.operands[7] == 26)
     };
     (ctx_a.local_bcons != ctx_b.local_bcons && (may_read_constants(a) || may_read_constants(b)))
-        .then(|| {
-            "the files' constant tables (BCON) differ and the trees may read them".to_owned()
-        })
+        .then(|| "the files' constant tables (BCON) differ and the trees may read them".to_owned())
 }
 
 /// Whether a lockstep proof (with silent steps off) also covers everything the
@@ -5536,7 +5534,8 @@ fn lockstep_suffices(
     }
     // A call whose target has different argument counts in the two files runs
     // different trees; lockstep only sees the call.
-    let arity = |ctx: &LiveContext, id: u16| ctx.callee_arities.as_ref().map(|m| m.get(&id).copied());
+    let arity =
+        |ctx: &LiveContext, id: u16| ctx.callee_arities.as_ref().map(|m| m.get(&id).copied());
     !a.instructions
         .iter()
         .chain(&b.instructions)
@@ -5564,7 +5563,10 @@ pub fn check_bhav_equivalent_combined(
     live: &LiveOptions,
 ) -> (EquivMethod, EquivResult) {
     if let Some(reason) = context_mismatch(a, ctx_a, b, ctx_b) {
-        return (EquivMethod::LiveOutput, EquivResult::Inconclusive { reason });
+        return (
+            EquivMethod::LiveOutput,
+            EquivResult::Inconclusive { reason },
+        );
     }
     let arities = merge_arities(ctx_a.callee_arities.as_ref(), ctx_b.callee_arities.as_ref());
     let strict = EquivOptions {
@@ -5573,7 +5575,8 @@ pub fn check_bhav_equivalent_combined(
         ..*lockstep
     };
     let first = check_bhav_equivalent_with_arities(a, b, &strict, arities.as_ref());
-    if matches!(first, EquivResult::Equivalent { .. }) && lockstep_suffices(a, ctx_a, b, ctx_b, live)
+    if matches!(first, EquivResult::Equivalent { .. })
+        && lockstep_suffices(a, ctx_a, b, ctx_b, live)
     {
         return (EquivMethod::Lockstep, first);
     }
