@@ -14,7 +14,7 @@
 
 use crate::autosave_worker::{
     AutosaveWorker, SaveCompletion, build_save_manager_snapshot, format_save_label, parse_slot_id,
-    validate_save_payload,
+    validate_save_payload_cached_with_sha256,
 };
 use crate::caf_screen::{CafOutcome, CafSession};
 use crate::coop::default_player_name;
@@ -727,7 +727,8 @@ impl NeighborhoodShell {
         let slot = slot.clamp(MIN_NEIGHBORHOOD, MAX_NEIGHBORHOOD);
         let kind = default_map_kind(&install, slot);
         let neighborhood_id = neighborhood_id_for_slot(slot);
-        let stored = ensure_imported(&install, &store, &neighborhood_id)?;
+        let mut stored = ensure_imported(&install, &store, &neighborhood_id)?;
+        migrate_legacy_caf_sidecar_if_needed(&store, &saves_path, &neighborhood_id, &mut stored);
         let _ = store.set_active_neighborhood(&neighborhood_id);
         let user_dir = resolve_user_dir(&install, slot)?;
         let pool = Arc::new(ArchivePool::new());
@@ -851,13 +852,7 @@ impl NeighborhoodShell {
                     );
                     (base_index, base_catalog, faces)
                 });
-                let family_names = load_family_names_with_caf(
-                    &user_dir,
-                    &saves_path,
-                    &neighborhood_id,
-                    stored.instance_id,
-                    &stored,
-                );
+                let family_names = load_family_names_with_caf(&user_dir, &stored);
                 let custom_thumbs = load_persisted_custom_thumbs(&store, &neighborhood_id);
                 (
                     art_handle.join().expect("neighborhood art worker panicked"),
@@ -3982,7 +3977,12 @@ impl NeighborhoodShell {
         let loaded = self
             .store
             .autosaves()
-            .load_save_validated(&self.neighborhood_id, lot_id, slot, validate_save_payload)
+            .load_save_validated_with_sha256(
+                &self.neighborhood_id,
+                lot_id,
+                slot,
+                validate_save_payload_cached_with_sha256,
+            )
             .map_err(|e| e.to_string())?;
         self.apply_loaded_save_into_lot(lot_id, &loaded)
     }
@@ -4157,6 +4157,7 @@ impl NeighborhoodShell {
     /// [`AutosaveWorker`] manual slot and updates the cached neighborhood map
     /// thumbnail immediately.
     pub fn save_current_lot(&mut self) -> Result<SaveReport, String> {
+        let cached_vm = self.install_assets.as_ref().map(|a| a.vm_cache().clone());
         let (report, committed_bytes, nh_id, expected_instance_id, house, ticks, label) = {
             let ActiveScreen::Lot(session) = &mut self.screen else {
                 return Err("no lot is currently open".into());
@@ -4183,6 +4184,7 @@ impl NeighborhoodShell {
                     self.arch_multiplier,
                     &self.answers,
                     self.frames.clone(),
+                    cached_vm.as_deref(),
                     &mut session.game,
                 )?
             } else if let Some(staging) = &session.staging {
@@ -4327,11 +4329,11 @@ impl NeighborhoodShell {
             }
             _ => return Err("no lot is currently open".into()),
         };
-        let manual_slot = self.store.autosaves().load_save_validated(
+        let manual_slot = self.store.autosaves().load_save_validated_with_sha256(
             &neighborhood_id,
             house,
             sims_sim::autosave::SaveSlot::Manual,
-            validate_save_payload,
+            validate_save_payload_cached_with_sha256,
         );
         let manual_loaded = match manual_slot {
             Ok(loaded) => Some(loaded),
@@ -4424,17 +4426,12 @@ impl NeighborhoodShell {
         let slot = slot.clamp(MIN_NEIGHBORHOOD, MAX_NEIGHBORHOOD);
         let kind = default_map_kind(&self.install, slot);
         let id = neighborhood_id_for_slot(slot);
-        let stored = ensure_imported(&self.install, &self.store, &id)?;
+        let mut stored = ensure_imported(&self.install, &self.store, &id)?;
+        migrate_legacy_caf_sidecar_if_needed(&self.store, &self.saves_path, &id, &mut stored);
         let _ = self.store.set_active_neighborhood(&id);
         let mut map = load_map_for_slot(&self.install, slot, kind)?;
         let user_dir = resolve_user_dir(&self.install, slot)?;
-        let family_names = load_family_names_with_caf(
-            &user_dir,
-            &self.saves_path,
-            &id,
-            stored.instance_id,
-            &stored,
-        );
+        let family_names = load_family_names_with_caf(&user_dir, &stored);
         let street_names = StreetNames::load(&self.install, &user_dir);
         let descriptions = NeighborhoodDescriptions::load(&self.install, &user_dir);
         let (faces, base_cat) = load_neighborhood_faces_cached(
@@ -4624,13 +4621,6 @@ impl NeighborhoodShell {
                     Ok(created) => {
                         self.family_names
                             .insert(created.family_id, created.family_name.clone());
-                        save_persisted_caf_name(
-                            &self.saves_path,
-                            &self.neighborhood_id,
-                            self.stored.instance_id,
-                            created.family_id,
-                            Some(&created.family_name),
-                        );
                         if let Err(err) = self.refresh_from_store() {
                             self.note = Some(format!(
                                 "Created family {} but refresh failed: {err}",
@@ -4976,13 +4966,6 @@ impl NeighborhoodShell {
         sims_vm::caf::delete_bin_family(&self.store, &self.neighborhood_id, family_id)
             .map_err(|e| e.to_string())?;
         self.family_names.remove(&family_id);
-        save_persisted_caf_name(
-            &self.saves_path,
-            &self.neighborhood_id,
-            self.stored.instance_id,
-            family_id,
-            None,
-        );
         self.refresh_from_store()?;
         Ok(())
     }
@@ -4995,6 +4978,15 @@ impl NeighborhoodShell {
             .load_neighborhood(&self.neighborhood_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
+        migrate_legacy_caf_sidecar_if_needed(
+            &self.store,
+            &self.saves_path,
+            &self.neighborhood_id,
+            &mut self.stored,
+        );
+        if let Ok(user_dir) = resolve_user_dir(&self.install, self.slot) {
+            self.family_names = load_family_names_with_caf(&user_dir, &self.stored);
+        }
         let (faces, base_cat) = load_neighborhood_faces_cached(
             &self.install,
             &self.store,
@@ -6157,13 +6149,6 @@ impl NeighborhoodShell {
         };
         self.family_names
             .insert(created.family_id, created.family_name.clone());
-        save_persisted_caf_name(
-            &self.saves_path,
-            &self.neighborhood_id,
-            self.stored.instance_id,
-            created.family_id,
-            Some(&created.family_name),
-        );
         self.refresh_from_store()?;
         Ok(created)
     }
@@ -8431,6 +8416,7 @@ fn save_cheat_mutated_lot_to_store(
     arch_multiplier: f32,
     answers: &[u8],
     frames: Frames,
+    vm_cache: Option<&sims_vm::lifecycle::VmInstallCache>,
     game: &mut Game,
 ) -> Result<(SaveReport, Vec<u8>), String> {
     let snapshot = store
@@ -8482,14 +8468,24 @@ fn save_cheat_mutated_lot_to_store(
         .save_lot_and_neighborhood(neighborhood_id, house, &flushed_saved_bytes, &staging_nh)
         .map_err(|e| e.to_string())?;
 
-    let mut staged_lot = lifecycle::enter_lot(
-        install_root,
-        &staging_store,
-        neighborhood_id,
-        house,
-        answers,
-        frames,
-    )
+    let mut staged_lot = match vm_cache {
+        Some(cache) => lifecycle::enter_lot_with_cache(
+            cache,
+            &staging_store,
+            neighborhood_id,
+            house,
+            answers,
+            frames,
+        ),
+        None => lifecycle::enter_lot(
+            install_root,
+            &staging_store,
+            neighborhood_id,
+            house,
+            answers,
+            frames,
+        ),
+    }
     .map_err(|e| format!("staging cheat save boot failed: {e}"))?;
     let mut report = lifecycle::save_and_leave_lot(
         install_root,
@@ -8573,19 +8569,27 @@ fn caf_names_sidecar_path(saves_path: &Path) -> PathBuf {
     saves_path.with_extension("caf-names.tsv")
 }
 
-fn load_family_names_with_caf(
-    user_dir: &Path,
+/// One-time atomic read-only migration from any pre-v4 `<saves>.caf-names.tsv`
+/// sidecar into native REDB v4 `StoredNeighborhood.family_surnames`.
+///
+/// Leaves the sidecar file untouched on disk, commits both the migrated
+/// surnames and the `NEIGHBORHOOD_META` completion marker in a single REDB
+/// transaction, and updates `stored` in memory only after that commit succeeds.
+fn migrate_legacy_caf_sidecar_if_needed(
+    store: &NeighborhoodStore,
     saves_path: &Path,
     neighborhood_id: &str,
-    instance_id: u128,
-    stored: &StoredNeighborhood,
-) -> BTreeMap<u16, String> {
-    let mut names = load_family_names(user_dir);
+    stored: &mut StoredNeighborhood,
+) {
     let sidecar = caf_names_sidecar_path(saves_path);
+    if !sidecar.is_file() {
+        return;
+    }
     let Ok(text) = std::fs::read_to_string(&sidecar) else {
-        return names;
+        return;
     };
-    let inst_hex = format!("{instance_id:032x}");
+    let inst_hex = format!("{:032x}", stored.instance_id);
+    let mut legacy_surnames = BTreeMap::new();
     for line in text.lines() {
         let mut parts = line.splitn(4, '\t');
         let (Some(nh), Some(inst), Some(fam_str), Some(surname)) =
@@ -8593,61 +8597,39 @@ fn load_family_names_with_caf(
         else {
             continue;
         };
+        let trimmed = surname.trim();
         if nh == neighborhood_id
             && inst == inst_hex
             && let Ok(fam_id) = fam_str.parse::<u16>()
-            && stored.families.contains_key(&fam_id)
-            && !surname.trim().is_empty()
+            && !trimmed.is_empty()
         {
-            names.insert(fam_id, surname.to_owned());
+            legacy_surnames.insert(fam_id, trimmed.to_owned());
+        }
+    }
+    if let Ok(Ok(Some(updated))) = store.migrate_legacy_caf_surnames_checked(
+        neighborhood_id,
+        stored.instance_id,
+        stored.revision,
+        &legacy_surnames,
+    ) {
+        *stored = updated;
+    }
+}
+
+/// Loads household surnames for `stored`, overlaying native REDB v4
+/// `StoredNeighborhood.family_surnames` over base `Neighborhood.iff` names.
+fn load_family_names_with_caf(
+    user_dir: &Path,
+    stored: &StoredNeighborhood,
+) -> BTreeMap<u16, String> {
+    let mut names = load_family_names(user_dir);
+    for (&fam_id, surname) in &stored.family_surnames {
+        let trimmed = surname.trim();
+        if stored.families.contains_key(&fam_id) && !trimmed.is_empty() {
+            names.insert(fam_id, trimmed.to_owned());
         }
     }
     names
-}
-
-fn save_persisted_caf_name(
-    saves_path: &Path,
-    neighborhood_id: &str,
-    instance_id: u128,
-    family_id: u16,
-    surname: Option<&str>,
-) {
-    let sidecar = caf_names_sidecar_path(saves_path);
-    let inst_hex = format!("{instance_id:032x}");
-    let mut entries: BTreeMap<(String, String, u16), String> = BTreeMap::new();
-    if let Ok(text) = std::fs::read_to_string(&sidecar) {
-        for line in text.lines() {
-            let mut parts = line.splitn(4, '\t');
-            if let (Some(nh), Some(inst), Some(fam_str), Some(name)) =
-                (parts.next(), parts.next(), parts.next(), parts.next())
-                && let Ok(fid) = fam_str.parse::<u16>()
-                && !name.is_empty()
-            {
-                entries.insert((nh.to_owned(), inst.to_owned(), fid), name.to_owned());
-            }
-        }
-    }
-    let key = (neighborhood_id.to_owned(), inst_hex, family_id);
-    match surname.map(|s| s.replace(['\t', '\r', '\n'], " ")) {
-        Some(clean) if !clean.trim().is_empty() => {
-            entries.insert(key, clean.trim().to_owned());
-        }
-        _ => {
-            entries.remove(&key);
-        }
-    }
-    let mut out = String::new();
-    for ((nh, inst, fid), name) in entries {
-        out.push_str(&nh);
-        out.push('\t');
-        out.push_str(&inst);
-        out.push('\t');
-        out.push_str(&fid.to_string());
-        out.push('\t');
-        out.push_str(&name);
-        out.push('\n');
-    }
-    let _ = std::fs::write(&sidecar, out);
 }
 
 fn resolve_dir_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {

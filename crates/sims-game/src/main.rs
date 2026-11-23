@@ -358,6 +358,19 @@ impl Sound {
         Self::from_mixer(sims_game::sound::Mixer::open(install))
     }
 
+    fn start_open_pack(
+        wavs: Option<&std::collections::BTreeMap<String, Vec<u8>>>,
+        mute: bool,
+    ) -> Self {
+        if mute {
+            return Self(None);
+        }
+        let empty = std::collections::BTreeMap::new();
+        Self::from_mixer(Ok(sims_game::sound::Mixer::open_pack(
+            wavs.unwrap_or(&empty),
+        )))
+    }
+
     fn send(&self, input: Input) {
         if let Some(output) = &self.0 {
             output.send(input);
@@ -375,6 +388,16 @@ impl Sound {
     }
 
     fn start(_: &std::path::Path, mute: bool) -> Self {
+        if !mute {
+            eprintln!("sims-game: built without sound (the `sound` feature)");
+        }
+        Self
+    }
+
+    fn start_open_pack(
+        _: Option<&std::collections::BTreeMap<String, Vec<u8>>>,
+        mute: bool,
+    ) -> Self {
         if !mute {
             eprintln!("sims-game: built without sound (the `sound` feature)");
         }
@@ -403,6 +426,10 @@ struct CoopCliConfig {
 /// Parsed CLI launch configuration.
 struct LaunchConfig {
     install: PathBuf,
+    /// `Some(pack_dir)` when launching in zero-commercial-asset standalone
+    /// `open-pack/` mode (via `--open-pack [dir]` or automatic fallback when
+    /// neither `<install>` nor `SIMS_INSTALL` is provided).
+    open_pack: Option<PathBuf>,
     /// `Some(house)` for direct house launch or `--png`; `None` for the
     /// Neighborhood screen shell.
     house: Option<PathBuf>,
@@ -419,9 +446,10 @@ fn parse_launch_args<I>(args: I, env_install: Option<PathBuf>) -> Result<LaunchC
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    let usage = "usage: sims-game [<install>] [<house file>] [--neighborhood] [--answers A,B,...] \
-                 [--mute] [--play | --strict] [--debug] [--saves <file>] [--host | --join <ticket>] \
-                 [--player-name <name>] [--coop-loopback] [--png <file> [--ticks N] [--size WxH]]";
+    let usage = "usage: sims-game [--open-pack [<dir>]] [<install>] [<house file>] [--neighborhood] \
+                 [--answers A,B,...] [--mute] [--play | --strict] [--debug] [--saves <file>] \
+                 [--host | --join <ticket>] [--player-name <name>] [--coop-loopback] \
+                 [--png <file> [--ticks N] [--size WxH]]";
     let mut paths = Vec::new();
     let mut answers = None;
     let mut png = None;
@@ -432,9 +460,11 @@ where
     let mut strict_flag = false;
     let mut debug = false;
     let mut neighborhood_flag = false;
+    let mut open_pack_flag = false;
+    let mut open_pack_explicit: Option<PathBuf> = None;
     let mut saves = PathBuf::from("sims-game-saves.redb");
     let mut coop = CoopCliConfig::default();
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
         let mut text = |name: &str| -> Result<String, String> {
             args.next()
@@ -451,6 +481,19 @@ where
             debug = true;
         } else if arg == "--neighborhood" {
             neighborhood_flag = true;
+        } else if arg == "--open-pack" {
+            open_pack_flag = true;
+            if let Some(next) = args.peek()
+                && !next.to_str().is_some_and(|s| s.starts_with("--"))
+            {
+                open_pack_explicit = Some(PathBuf::from(args.next().expect("peeked")));
+            }
+        } else if let Some(val) = arg.to_str().and_then(|s| s.strip_prefix("--open-pack=")) {
+            if val.trim().is_empty() {
+                return Err("--open-pack= needs a directory path".into());
+            }
+            open_pack_flag = true;
+            open_pack_explicit = Some(PathBuf::from(val));
         } else if arg == "--host" {
             coop.host = true;
         } else if arg == "--join" {
@@ -517,10 +560,77 @@ where
     } else {
         png.is_none()
     };
+
+    if open_pack_flag {
+        if !paths.is_empty() {
+            return Err("--open-pack cannot be combined with an install or house path".into());
+        }
+        if neighborhood_flag {
+            return Err("--open-pack cannot be combined with --neighborhood".into());
+        }
+        if coop.host || coop.join.is_some() {
+            return Err("--open-pack cannot be combined with --host or --join".into());
+        }
+        let pack_dir = match open_pack_explicit {
+            Some(dir) => dir,
+            None => sims_game::open_pack::discover_open_pack_dir().ok_or_else(|| {
+                "could not locate standalone open-pack/ directory (pass --open-pack <dir>)"
+                    .to_owned()
+            })?,
+        };
+        let still = png.map(|file| Still { file, ticks, size });
+        return Ok(LaunchConfig {
+            install: pack_dir.clone(),
+            open_pack: Some(pack_dir),
+            house: None,
+            answers: answers.unwrap_or_default(),
+            play,
+            debug,
+            still,
+            mute,
+            saves,
+            coop,
+        });
+    }
+
     let mut paths = paths.into_iter();
     let install = match paths.next() {
         Some(path) => path,
-        None => env_install.ok_or("give the install, or set SIMS_INSTALL")?,
+        None => match env_install {
+            Some(env_path) => env_path,
+            None => {
+                // Automatic zero-commercial-asset standalone fallback when neither
+                // `<install>` nor `SIMS_INSTALL` is provided.
+                if neighborhood_flag {
+                    return Err(
+                        "--neighborhood requires a Complete Collection install or SIMS_INSTALL"
+                            .into(),
+                    );
+                }
+                if coop.host || coop.join.is_some() {
+                    return Err(
+                        "--host/--join requires a Complete Collection install or SIMS_INSTALL"
+                            .into(),
+                    );
+                }
+                let pack_dir = sims_game::open_pack::discover_open_pack_dir().ok_or_else(|| {
+                    "give the install, set SIMS_INSTALL, or run with --open-pack <dir>".to_owned()
+                })?;
+                let still = png.map(|file| Still { file, ticks, size });
+                return Ok(LaunchConfig {
+                    install: pack_dir.clone(),
+                    open_pack: Some(pack_dir),
+                    house: None,
+                    answers: answers.unwrap_or_default(),
+                    play,
+                    debug,
+                    still,
+                    mute,
+                    saves,
+                    coop,
+                });
+            }
+        },
     };
     let explicit_house = paths.next();
     if paths.next().is_some() {
@@ -548,6 +658,7 @@ where
     let still = png.map(|file| Still { file, ticks, size });
     Ok(LaunchConfig {
         install,
+        open_pack: None,
         house,
         answers,
         play,
@@ -2987,6 +3098,118 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let config = options()?;
+    if let Some(pack_dir) = config.open_pack {
+        eprintln!(
+            "sims-game: booting clean-room open-pack ({})",
+            pack_dir.display()
+        );
+        let started = Instant::now();
+        let mut game = Game::open_open_pack(
+            &pack_dir,
+            &config.answers,
+            config.play,
+            sims_game::Frames::default(),
+        )?;
+        game.set_debug(config.debug);
+        eprintln!(
+            "sims-game: booted open-pack in {:.2} s",
+            started.elapsed().as_secs_f32()
+        );
+        for problem in game.problems() {
+            eprintln!("sims-game: {problem}");
+        }
+        if let Some(still) = config.still {
+            let started = Instant::now();
+            let ran = game.run(still.ticks);
+            eprintln!(
+                "sims-game: ran {ran} ticks in {:.2} s",
+                started.elapsed().as_secs_f32()
+            );
+            for error in game.errors() {
+                eprintln!("sims-game: error caught: {error}");
+            }
+            if let Some(stop) = game.stopped() {
+                eprintln!("sims-game: {stop}");
+                return Err(format!(
+                    "open-pack headless run stopped after {ran}/{} ticks: {stop}",
+                    still.ticks
+                ));
+            }
+            if !config.play && !game.errors().is_empty() {
+                return Err(format!(
+                    "open-pack headless strict run encountered {} VM error(s) after {ran}/{} ticks",
+                    game.errors().len(),
+                    still.ticks
+                ));
+            }
+            if ran < still.ticks {
+                if let Some(dialog) = game.asking() {
+                    return Err(format!(
+                        "open-pack headless run paused on dialog (object {}, answers {:?}) after {ran}/{} ticks (supply --answers)",
+                        dialog.shown.object, dialog.shown.answers, still.ticks
+                    ));
+                }
+                return Err(format!(
+                    "open-pack headless run completed only {ran}/{} ticks",
+                    still.ticks
+                ));
+            }
+            game.resize(still.size);
+            let started = Instant::now();
+            game.render();
+            eprintln!(
+                "sims-game: drew the frame in {} ms",
+                started.elapsed().as_millis()
+            );
+            return std::fs::write(&still.file, png::encode(game.canvas()))
+                .map_err(|e| format!("{}: {e}", still.file.display()));
+        }
+        let options_file = options_path(&config.saves);
+        if options_file.is_file()
+            && let Err(e) = game.load_options(&options_file)
+        {
+            eprintln!("sims-game: {}: {e}", options_file.display());
+        }
+        let saved_optn = game.options().to_optn();
+        let sound = Sound::start_open_pack(game.open_pack_sounds(), config.mute);
+        let save_slot = game.open_pack_save_slot().unwrap_or("open-pack").to_owned();
+        let mut app = App {
+            session: Session::Standalone {
+                game: Box::new(game),
+                slot: save_slot,
+                options_file,
+                saved_optn,
+            },
+            last_screen: ScreenKind::Lot,
+            last_lot_generation: (0, 0),
+            window: None,
+            surface: Rc::new(RefCell::new(None)),
+            surface_size: Rc::new(Cell::new(None)),
+            last_present_sig: Rc::new(Cell::new(None)),
+            title_throttle: TitleThrottle::default(),
+            redraw_pacer: RedrawPacer::new(None),
+            scale: Rc::new(Cell::new(1)),
+            cursor: None,
+            last_cursor: None,
+            drag: None,
+            last_left_press: None,
+            wake_clock: WakeClock::new(Instant::now()),
+            dirty: true,
+            photos: 0,
+            reported: false,
+            printed: 0,
+            sound: Rc::new(RefCell::new(sound)),
+            sound_feed: sound::Feed::default(),
+            focus_filter: FocusFilter::default(),
+            saves: config.saves,
+            ctrl_or_cmd_held: false,
+            shift_held: false,
+            startup_error: None,
+            pending_coop: CoopCliConfig::default(),
+        };
+        let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
+        return event_loop.run_app(&mut app).map_err(|e| e.to_string());
+    }
     if let Some(house) = config.house {
         let game_options = Options {
             install: config.install.clone(),
@@ -3893,6 +4116,69 @@ mod tests {
                     OsString::from("--host"),
                 ],
                 env,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_supports_open_pack_flag_and_automatic_standalone_fallback() {
+        // Explicit `--open-pack` discovers workspace open-pack/ even when SIMS_INSTALL is set.
+        let cfg = parse_launch_args(
+            [OsString::from("--open-pack")],
+            Some(PathBuf::from("/sims")),
+        )
+        .unwrap();
+        assert!(cfg.open_pack.is_some());
+        assert!(cfg.house.is_none());
+        assert!(cfg.play);
+
+        // Explicit `--open-pack <dir> --png out.png --ticks 5`.
+        let cfg = parse_launch_args(
+            [
+                OsString::from("--open-pack"),
+                OsString::from("custom-pack"),
+                OsString::from("--png"),
+                OsString::from("out.png"),
+                OsString::from("--ticks"),
+                OsString::from("5"),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.open_pack, Some(PathBuf::from("custom-pack")));
+        assert_eq!(cfg.still.as_ref().map(|s| s.ticks), Some(5));
+        assert!(
+            !cfg.play,
+            "headless --open-pack --png defaults to strict mode"
+        );
+
+        // Automatic fallback when neither <install> nor SIMS_INSTALL is given.
+        let cfg = parse_launch_args(Vec::<OsString>::new(), None).unwrap();
+        assert!(cfg.open_pack.is_some());
+        assert!(cfg.play);
+
+        // Automatic fallback with `--png` and no SIMS_INSTALL.
+        let cfg =
+            parse_launch_args([OsString::from("--png"), OsString::from("shot.png")], None).unwrap();
+        assert!(cfg.open_pack.is_some());
+        assert!(cfg.still.is_some());
+
+        // --open-pack + --neighborhood or --host is rejected.
+        assert!(
+            parse_launch_args(
+                [
+                    OsString::from("--open-pack"),
+                    OsString::from("--neighborhood"),
+                ],
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_launch_args(
+                [OsString::from("--open-pack"), OsString::from("--host")],
+                None,
             )
             .is_err()
         );

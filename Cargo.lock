@@ -3600,6 +3600,7 @@ dependencies = [
  "core-graphics",
  "cpal",
  "sha2 0.10.9",
+ "sims-antics",
  "sims-audio",
  "sims-content",
  "sims-core",
