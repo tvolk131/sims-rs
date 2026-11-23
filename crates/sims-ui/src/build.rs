@@ -167,14 +167,14 @@ const COMPACT_PITCH_MIN_W: i32 = 19;
 /// used when paginating tool buttons on sub-620 px narrow viewports.
 const TOOL_COLUMNS: [(usize, usize); 6] = [(0, 6), (1, 7), (2, 8), (3, 9), (4, 10), (5, 11)];
 
-/// OBJD byte offsets shared with `buy.rs`.
+/// OBJD byte offsets shared with `buy.rs` (`0x4cd149`, `0x457a36`).
+const OBJD_GRAPHICS: usize = 0x08;
+const OBJD_TTAB: usize = 0x0e;
 const OBJD_TYPE: usize = 0x12;
 const OBJD_MASTER: usize = 0x14;
 const OBJD_SUB_INDEX: usize = 0x16;
 const OBJD_PRICE: usize = 0x24;
-const OBJD_GRAPHICS: usize = 0x38;
-const OBJD_TTAB: usize = 0x52;
-const OBJD_CTSS: usize = 0x62;
+const OBJD_CTSS: usize = 0x52;
 const OBJD_BUILD_TYPE: usize = 0x8a;
 const PERSON_TYPE: i16 = 2;
 
@@ -1029,16 +1029,30 @@ impl BuildCatalog {
     }
 }
 
-/// Maps OBJD word 69 (`build_mode_type`) to its Build Mode tool (`0x4cbb08`).
-fn tool_for_build_mode_type(build_type: i16) -> Option<BuildTool> {
+/// Maps OBJD word 69 (`build_mode_type`, byte offset `0x8a`) to its Build Mode
+/// tool.
+///
+/// Verified against both Complete Collection 1.91 `Objects.far` /
+/// `ExpansionPack*` `OBJD` chunks and `Sims.exe` `0x4cbb08..0x4cbb58` (where
+/// non-wall/floor catalog objects match word 69 `1..=7` directly at `0x4cbb35`,
+/// while wall/floor entries `[ecx + 0x24] == 1` pass shifted `3..=9` table IDs
+/// to `0x487c28`):
+/// - `1` => Doors
+/// - `2` => Windows
+/// - `3` => Stairs
+/// - `4` => Plants
+/// - `5` => Fireplace
+/// - `6` => Wall / Columns / Object Fences
+/// - `7` => Water / Pool objects (Ladder, Diving Board, Pool Slide)
+pub fn tool_for_build_mode_type(build_type: i16) -> Option<BuildTool> {
     match build_type {
-        3 => Some(BuildTool::Doors),
-        4 => Some(BuildTool::Windows),
-        5 => Some(BuildTool::Stairs),
-        6 => Some(BuildTool::Plants),
-        7 => Some(BuildTool::Fireplace),
-        8 => Some(BuildTool::Wall),
-        9 => Some(BuildTool::Water),
+        1 => Some(BuildTool::Doors),
+        2 => Some(BuildTool::Windows),
+        3 => Some(BuildTool::Stairs),
+        4 => Some(BuildTool::Plants),
+        5 => Some(BuildTool::Fireplace),
+        6 => Some(BuildTool::Wall),
+        7 => Some(BuildTool::Water),
         _ => None,
     }
 }

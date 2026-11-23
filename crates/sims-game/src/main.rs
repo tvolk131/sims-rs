@@ -2374,6 +2374,10 @@ impl ApplicationHandler for App {
                     || matches!(&self.session, Session::Shell(shell) if shell.import_picker_open());
                 let book_open = self.session.game().is_some_and(Game::book_open)
                     || matches!(&self.session, Session::Shell(shell) if shell.credits_open());
+                let destination_picker_open = self
+                    .session
+                    .game()
+                    .is_some_and(Game::destination_picker_open);
                 let coop_lobby_open = self.session.coop_lobby_open();
                 let cheat_console_open = self.session.game().is_some_and(Game::cheat_console_open);
                 let has_dialog = self.session.has_dialog();
@@ -2384,6 +2388,7 @@ impl ApplicationHandler for App {
                     travel_dialog_open,
                     shop_open,
                     book_open,
+                    destination_picker_open,
                     coop_lobby_open,
                     cheat_console_open,
                     has_dialog,
@@ -2588,6 +2593,32 @@ impl ApplicationHandler for App {
                                 Key::Named(NamedKey::ArrowRight) => shell.key_right(),
                                 Key::Named(NamedKey::PageUp) => shell.key_page_up(),
                                 Key::Named(NamedKey::PageDown) => shell.key_page_down(),
+                                Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
+                                Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
+                                _ => ShellOutcome::default(),
+                            };
+                            self.handle_shell_outcome(event_loop, out);
+                        }
+                    }
+                    return;
+                }
+                if destination_picker_open {
+                    match &mut self.session {
+                        Session::Starting(_) => {}
+                        Session::Standalone { game, .. } => {
+                            let out = match &event.logical_key {
+                                Key::Named(NamedKey::Enter) if !event.repeat => {
+                                    game.destination_picker_submit()
+                                }
+                                Key::Named(NamedKey::Escape) if !event.repeat => {
+                                    game.destination_picker_escape()
+                                }
+                                _ => sims_game::Outcome::default(),
+                            };
+                            self.handle_standalone_outcome(event_loop, out);
+                        }
+                        Session::Shell(shell) => {
+                            let out = match &event.logical_key {
                                 Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
                                 Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
                                 _ => ShellOutcome::default(),
@@ -3503,6 +3534,7 @@ struct KeyboardFocus {
     travel_dialog_open: bool,
     shop_open: bool,
     book_open: bool,
+    destination_picker_open: bool,
     coop_lobby_open: bool,
     cheat_console_open: bool,
     has_dialog: bool,
@@ -3517,6 +3549,7 @@ fn coop_toggle_allowed(focus: KeyboardFocus) -> bool {
         && !focus.travel_dialog_open
         && !focus.shop_open
         && !focus.book_open
+        && !focus.destination_picker_open
         && !focus.cheat_console_open
         && !focus.create_family
         && (focus.coop_lobby_open || !focus.has_dialog)
@@ -3529,6 +3562,7 @@ fn cheat_toggle_allowed(focus: KeyboardFocus) -> bool {
         && !focus.travel_dialog_open
         && !focus.shop_open
         && !focus.book_open
+        && !focus.destination_picker_open
         && !focus.coop_lobby_open
         && !focus.create_family
         && !focus.has_dialog
@@ -3542,6 +3576,7 @@ fn lot_hotkeys_blocked(focus: KeyboardFocus) -> bool {
         || focus.travel_dialog_open
         || focus.shop_open
         || focus.book_open
+        || focus.destination_picker_open
         || focus.coop_lobby_open
         || focus.cheat_console_open
         || focus.has_dialog
@@ -4647,6 +4682,10 @@ mod tests {
             },
             KeyboardFocus {
                 book_open: true,
+                ..none
+            },
+            KeyboardFocus {
+                destination_picker_open: true,
                 ..none
             },
             KeyboardFocus {
