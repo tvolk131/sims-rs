@@ -23,9 +23,8 @@ use sims_ui::neighborhood::{
 };
 use sims_ui::travel::{
     BAR_HEIGHT as TRAVEL_BAR_HEIGHT, Destination, LotFilter, NATIVE_HEIGHT as TRAVEL_NATIVE_HEIGHT,
-    NATIVE_WIDTH as TRAVEL_NATIVE_WIDTH,
-    TravelBarMode, TravelChrome, TravelCommand, TravelLayout, TravelState, TravelStrings,
-    VacationLodging, art_id as travel_art_id,
+    NATIVE_WIDTH as TRAVEL_NATIVE_WIDTH, TravelBarMode, TravelChrome, TravelCommand, TravelLayout,
+    TravelState, TravelStrings, VacationLodging, art_id as travel_art_id,
 };
 use sims_vm::SpecialPanelRequest;
 use std::collections::{BTreeMap, BTreeSet};

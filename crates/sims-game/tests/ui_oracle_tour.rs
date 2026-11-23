@@ -85,7 +85,12 @@ struct Rgb {
 
 fn read_png(path: &Path) -> Rgb {
     let data = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n", "{} is not a PNG", path.display());
+    assert_eq!(
+        &data[..8],
+        b"\x89PNG\r\n\x1a\n",
+        "{} is not a PNG",
+        path.display()
+    );
     let mut pos = 8;
     let (mut width, mut height) = (0usize, 0usize);
     let mut idat = Vec::new();
@@ -134,7 +139,11 @@ fn read_png(path: &Path) -> Rgb {
                 3 => ((u16::from(a) + u16::from(b)) / 2) as u8,
                 4 => {
                     let p = i16::from(a) + i16::from(b) - i16::from(c);
-                    let (pa, pb, pc) = ((p - i16::from(a)).abs(), (p - i16::from(b)).abs(), (p - i16::from(c)).abs());
+                    let (pa, pb, pc) = (
+                        (p - i16::from(a)).abs(),
+                        (p - i16::from(b)).abs(),
+                        (p - i16::from(c)).abs(),
+                    );
                     if pa <= pb && pa <= pc {
                         a
                     } else if pb <= pc {
@@ -151,7 +160,7 @@ fn read_png(path: &Path) -> Rgb {
     Rgb {
         width,
         height,
-        pixels: out.chunks_exact(3).map(|p| [p[0], p[1], p[2]]).collect(),
+        pixels: out.as_chunks::<3>().0.to_vec(),
     }
 }
 
@@ -192,7 +201,10 @@ fn frame_score(ours: &Canvas, oracle: &Rgb) -> f64 {
     for y in 0..oracle.height {
         for x in 0..oracle.width {
             let (xi, yi) = (x as i32, y as i32);
-            if xi >= inner[0] && xi < inner[0] + inner[2] && yi >= inner[1] && yi < inner[1] + inner[3]
+            if xi >= inner[0]
+                && xi < inner[0] + inner[2]
+                && yi >= inner[1]
+                && yi < inner[1] + inner[3]
             {
                 continue;
             }
@@ -256,8 +268,7 @@ fn write_debug(out: Option<&Path>, shot: &str, ours: &Canvas) {
 
 #[test]
 fn ui_oracle_tour_ratchet() {
-    let (Some(install), Some(oracle)) = (env_dir("SIMS_INSTALL"), env_dir("SIMS_UI_ORACLE"))
-    else {
+    let (Some(install), Some(oracle)) = (env_dir("SIMS_INSTALL"), env_dir("SIMS_UI_ORACLE")) else {
         eprintln!("skipping: set SIMS_INSTALL and SIMS_UI_ORACLE to score the 1.91 UI oracle tour");
         return;
     };
@@ -314,7 +325,11 @@ fn ui_oracle_tour_ratchet() {
         click(&mut game, point);
         let oracle = load(shot);
         write_debug(out, shot, game.canvas());
-        push(shot, "strip", score(game.canvas(), &oracle, hud_regions(size)[1].1));
+        push(
+            shot,
+            "strip",
+            score(game.canvas(), &oracle, hud_regions(size)[1].1),
+        );
     }
 
     // 4-way view radio, clicked at the oracle's own coordinates.
@@ -328,7 +343,11 @@ fn ui_oracle_tour_ratchet() {
         click(&mut game, point);
         let oracle = load(shot);
         write_debug(out, shot, game.canvas());
-        push(shot, "view-radio", score(game.canvas(), &oracle, VIEW_RADIO));
+        push(
+            shot,
+            "view-radio",
+            score(game.canvas(), &oracle, VIEW_RADIO),
+        );
     }
 
     let strip = hud_regions(size)[1].1;
@@ -340,14 +359,22 @@ fn ui_oracle_tour_ratchet() {
         game.render();
         let oracle = load("buy-top-function");
         write_debug(out, "buy-top-function", game.canvas());
-        push("buy-top-function", "strip", score(game.canvas(), &oracle, strip));
+        push(
+            "buy-top-function",
+            "strip",
+            score(game.canvas(), &oracle, strip),
+        );
 
         click(&mut game, [258, 692]);
         game.hover([465, 696]);
         game.render();
         let oracle = load("buy-subcat-seating");
         write_debug(out, "buy-subcat-seating", game.canvas());
-        push("buy-subcat-seating", "strip", score(game.canvas(), &oracle, strip));
+        push(
+            "buy-subcat-seating",
+            "strip",
+            score(game.canvas(), &oracle, strip),
+        );
     }
 
     // Build Mode top level and key tools.
@@ -383,7 +410,11 @@ fn ui_oracle_tour_ratchet() {
         game.render();
         let oracle = load("camera-strip");
         write_debug(out, "camera-strip", game.canvas());
-        push("camera-strip", "strip", score(game.canvas(), &oracle, strip));
+        push(
+            "camera-strip",
+            "strip",
+            score(game.canvas(), &oracle, strip),
+        );
     }
     {
         let mut game = open_goth(&install, size);
@@ -391,7 +422,11 @@ fn ui_oracle_tour_ratchet() {
         game.render();
         let oracle = load("options-strip");
         write_debug(out, "options-strip", game.canvas());
-        push("options-strip", "strip", score(game.canvas(), &oracle, strip));
+        push(
+            "options-strip",
+            "strip",
+            score(game.canvas(), &oracle, strip),
+        );
     }
 
     // Destination map pickers at 1024x768: the beveled frame around the
@@ -421,7 +456,10 @@ fn ui_oracle_tour_ratchet() {
     }
 
     println!("Sims.exe 1.91 UI oracle similarity (share of pixels within {TOLERANCE}/255):");
-    println!("{:<28} {:<11} {:>7} {:>7}", "shot", "region", "score", "floor");
+    println!(
+        "{:<28} {:<11} {:>7} {:>7}",
+        "shot", "region", "score", "floor"
+    );
     let mut failures = Vec::new();
     for r in &results {
         let floor = FLOORS
@@ -434,7 +472,10 @@ fn ui_oracle_tour_ratchet() {
             r.shot, r.region, r.score, floor
         );
         if r.score + 1e-9 < floor {
-            failures.push(format!("{}/{}: {:.4} < {:.4}", r.shot, r.region, r.score, floor));
+            failures.push(format!(
+                "{}/{}: {:.4} < {:.4}",
+                r.shot, r.region, r.score, floor
+            ));
         }
     }
     assert_eq!(results.len(), FLOORS.len(), "every floor must be scored");

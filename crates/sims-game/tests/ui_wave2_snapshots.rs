@@ -54,14 +54,18 @@ fn open_goth(root: &Path) -> Game {
 fn dog_guid(install: &Install) -> Option<u32> {
     let index = Index::build(install).ok()?;
     let catalog = Catalog::build(&index).ok()?;
-    catalog.objects.iter().filter(|o| o.kind == 2).find_map(|o| {
-        let bytes = index.resources.get(o.resource)?.read().ok()?;
-        let iff = Iff::parse(bytes).ok()?;
-        let chunk = iff.get(b"STR#", 200)?;
-        let table = StringTable::parse(iff.data(chunk)).ok()?;
-        let skeleton = table.get(0, 1)?.to_ascii_lowercase();
-        skeleton.contains("dog").then_some(o.guid)
-    })
+    catalog
+        .objects
+        .iter()
+        .filter(|o| o.kind == 2)
+        .find_map(|o| {
+            let bytes = index.resources.get(o.resource)?.read().ok()?;
+            let iff = Iff::parse(bytes).ok()?;
+            let chunk = iff.get(b"STR#", 200)?;
+            let table = StringTable::parse(iff.data(chunk)).ok()?;
+            let skeleton = table.get(0, 1)?.to_ascii_lowercase();
+            skeleton.contains("dog").then_some(o.guid)
+        })
 }
 
 /// Opens `request` over `world` (closing the previous panel), checks a
@@ -101,7 +105,12 @@ fn wave2_panels_open_and_draw_with_native_art() {
         },
         &world,
     );
-    assert!(game.phonebook_snapshot().expect("phone book").entries.is_empty());
+    assert!(
+        game.phonebook_snapshot()
+            .expect("phone book")
+            .entries
+            .is_empty()
+    );
     let mut social_world = world.clone();
     let goth_family = social_world
         .neighbors
@@ -145,7 +154,11 @@ fn wave2_panels_open_and_draw_with_native_art() {
         &social_world,
     );
     let listed = game.phonebook_snapshot().expect("phone book").entries.len();
-    assert_eq!(listed, townies.len(), "every townie Mortimer knows is listed");
+    assert_eq!(
+        listed,
+        townies.len(),
+        "every townie Mortimer knows is listed"
+    );
 
     preview(
         &mut game,

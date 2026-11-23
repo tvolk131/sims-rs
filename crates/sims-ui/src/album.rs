@@ -2103,7 +2103,7 @@ impl PhotoAlbumDialog {
         {
             let cell_w = (sheet.width / 4) as i32;
             let cell_h = sheet.height as i32;
-            let src = Rect::new(cell_w * cell_idx as i32, 0, cell_w, cell_h);
+            let src = Rect::new(cell_w * cell_idx, 0, cell_w, cell_h);
             frame.draw(sheet, src, [rect.x, rect.y]);
             if let Some(text) = label {
                 draw_centered_text(

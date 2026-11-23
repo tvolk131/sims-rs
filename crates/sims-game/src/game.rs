@@ -10101,8 +10101,7 @@ impl Game {
             | SpecialPanelRequest::CookBook { caller } => {
                 let is_cookbook = matches!(request, SpecialPanelRequest::CookBook { .. });
                 self.ensure_book_assets();
-                let snapshot =
-                    self.build_reference_book_snapshot(&world, *caller, is_cookbook);
+                let snapshot = self.build_reference_book_snapshot(world, *caller, is_cookbook);
                 self.book_snapshot = Some(snapshot);
                 self.book_dialog.open();
                 self.active_special_panel = Some(ActiveSpecialPanel {
@@ -10166,9 +10165,9 @@ impl Game {
                 } else {
                     ShopKind::DowntownBoutique(category)
                 };
-                let shopper = self.person_display_name(&world, *person);
+                let shopper = self.person_display_name(world, *person);
                 let (items, responses, preview_targets) =
-                    self.build_wardrobe_picker_items(&world, *person, *mode);
+                    self.build_wardrobe_picker_items(world, *person, *mode);
                 self.open_special_picker(
                     tick,
                     request,
@@ -10182,9 +10181,8 @@ impl Game {
                 );
             }
             SpecialPanelRequest::PetPicker { pet } => {
-                let shopper = self.person_display_name(&world, *pet);
-                let (items, responses, preview_targets) =
-                    self.build_pet_picker_items(&world, *pet);
+                let shopper = self.person_display_name(world, *pet);
+                let (items, responses, preview_targets) = self.build_pet_picker_items(world, *pet);
                 self.open_special_picker(
                     tick,
                     request,
@@ -10200,7 +10198,7 @@ impl Game {
             SpecialPanelRequest::CallNeighbor { caller_neighbor } => {
                 // Native `cWinPhoneBook` (`0x5221d0`) on `phonebookbkg.bmp`.
                 self.ensure_phonebook_assets();
-                let snapshot = self.build_phonebook_snapshot(&world, *caller_neighbor);
+                let snapshot = self.build_phonebook_snapshot(world, *caller_neighbor);
                 self.phonebook_snapshot = Some(snapshot);
                 self.phonebook_dialog.open();
                 self.active_special_panel = Some(ActiveSpecialPanel {
@@ -10212,9 +10210,9 @@ impl Game {
                 });
             }
             SpecialPanelRequest::CharmTransform { person } => {
-                let shopper = self.person_display_name(&world, *person);
+                let shopper = self.person_display_name(world, *person);
                 let (items, responses, preview_targets) =
-                    self.build_charm_transform_items(&world, *person);
+                    self.build_charm_transform_items(world, *person);
                 self.open_special_picker(
                     tick,
                     request,
@@ -13428,6 +13426,244 @@ fn viewport_for_controls(size: [i32; 2], controls: &sims_ui::hud::Controls) -> (
     (w as u32, (h - strip).max(1) as u32)
 }
 
+/// Loads a pet's body for the pet picker's turntable. Pets' skeletons are
+/// `dog_skeleton.cmx.bcf` and `kat_skeleton.cmx.bcf` (`ExpansionShared.far`
+/// `Skeletons\`), an underscore where people's `<name>-skeleton.cmx.bcf`
+/// has a hyphen, so [`sims_people::Body::load`] cannot find them; this
+/// tries the hyphen first, then the underscore, and binds the outfit the
+/// same way.
+fn load_pet_body(
+    assets: &sims_people::Assets,
+    skeleton: &str,
+    outfit: &sims_people::Outfit,
+) -> Result<sims_people::Body, String> {
+    if let Ok(body) = sims_people::Body::load(assets, skeleton, outfit) {
+        return Ok(body);
+    }
+    use sims_people::appearance::{load_appearance, load_mesh, load_texture, texture_for};
+    use sims_people::rig::bone;
+    let file = format!("{skeleton}_skeleton.cmx.bcf");
+    let catalog =
+        sims_formats::avatar::read_bcf(&assets.read(&file)?).map_err(|e| format!("{file}: {e}"))?;
+    let skeleton = catalog
+        .skeletons
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("{file} holds no skeleton"))?;
+    let mut parts = Vec::new();
+    for (name, textures) in &outfit.parts {
+        let appearance = load_appearance(assets, name)?;
+        for binding in &appearance.bindings {
+            let at = bone(&skeleton, &binding.bone)
+                .ok_or_else(|| format!("{name:?} binds the missing bone {:?}", binding.bone))?;
+            let mesh = load_mesh(assets, &binding.mesh)?;
+            let bones = mesh
+                .bones
+                .iter()
+                .map(|b| bone(&skeleton, b).ok_or_else(|| format!("missing bone {b:?}")))
+                .collect::<Result<Vec<_>, _>>()?;
+            let texture_name = texture_for(&binding.mesh, textures)
+                .or_else(|| (!mesh.texture.is_empty()).then(|| mesh.texture.clone()));
+            let texture = match &texture_name {
+                Some(t) => load_texture(assets, t)?,
+                None => sims_people::texture::Texture::solid([200, 200, 200, 255]),
+            };
+            parts.push(sims_people::Part {
+                appearance: name.clone(),
+                bone: at,
+                bones,
+                mesh,
+                texture_name,
+                texture,
+                censor: binding.censor,
+            });
+        }
+    }
+    Ok(sims_people::Body { skeleton, parts })
+}
+
+/// `person.data[31]`: the person's neighbor record ID (`PERSON_NEIGHBOR`).
+const PERSON_NEIGHBOR_WORD: usize = 31;
+
+/// Whether `record` may appear in `caller`'s Phonebook (see
+/// [`Game::build_phonebook_snapshot`]).
+fn phonebook_eligible(
+    record: &sims_sim::neighbors::Neighbor,
+    caller: i16,
+    caller_family: i16,
+    on_lot: &std::collections::BTreeSet<i16>,
+) -> bool {
+    let family = record
+        .data
+        .get(sims_sim::neighbors::FAMILY)
+        .copied()
+        .unwrap_or(0);
+    let kind = record
+        .data
+        .get(sims_sim::neighbors::KIND)
+        .copied()
+        .unwrap_or(0);
+    record.id > 0
+        && record.id != caller
+        && kind <= 1
+        && family > 0
+        && (caller_family <= 0 || family != caller_family)
+        && !on_lot.contains(&record.id)
+}
+
+/// The suit category letter of `Dialog` kind 6 mode `0..=5` (`0x5097c9`):
+/// everyday `b`, swimwear `s`, formal `f`, pajamas `l`, winter `w`, and
+/// Superstar high fashion `h`.
+fn wardrobe_mode_category(mode: i16) -> u8 {
+    match mode {
+        1 => b's',
+        2 => b'f',
+        3 => b'l',
+        4 => b'w',
+        5 => b'h',
+        _ => b'b',
+    }
+}
+
+/// Every `(suit, "suit,BODY=texture")` of category `first` that a person
+/// of the given sex, age and skin tone can wear, in native wardrobe order:
+/// the filter of `ImportWardrobe::pick` (`0x409663`) — a 9-byte suit prefix
+/// `<first>NNN<sex|u><age>xxx` and textures `<prefix><skin>…` — with the
+/// category letter in place of `b`.
+fn category_outfits(
+    wardrobe: &sims_content::ImportWardrobe,
+    first: u8,
+    female: bool,
+    child: bool,
+    skin: &str,
+) -> Vec<(String, String)> {
+    let Some(skin_bytes) = sims_formats::far::encode_name(&skin.to_ascii_lowercase()) else {
+        return Vec::new();
+    };
+    let sex = if female { b'f' } else { b'm' };
+    let age = if child { b'c' } else { b'a' };
+    let mut out = Vec::new();
+    for suit in wardrobe.suits() {
+        if suit.len() < 9
+            || !suit[0].eq_ignore_ascii_case(&first)
+            || !(suit[4].eq_ignore_ascii_case(&sex) || suit[4].eq_ignore_ascii_case(&b'u'))
+            || !suit[5].eq_ignore_ascii_case(&age)
+        {
+            continue;
+        }
+        let mut prefix = suit[..9].to_ascii_lowercase();
+        prefix.extend_from_slice(&skin_bytes);
+        for tex in wardrobe.textures() {
+            if tex.len() >= prefix.len() && tex[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+                let suit_str: String = sims_formats::strings::decode(suit, 1)
+                    .to_ascii_lowercase()
+                    .chars()
+                    .take(63)
+                    .collect();
+                let tex_str = sims_formats::strings::decode(tex, 1);
+                let desc: String = format!("BODY={tex_str}").chars().take(63).collect();
+                out.push((suit_str.clone(), format!("{suit_str},{desc}")));
+            }
+        }
+    }
+    out
+}
+
+/// A readable outfit name from a wardrobe row: the texture's name after its
+/// first `_` (`"b002fafitmed_mom02"` -> `"Mom02"`, `"h551mafitlgt_TuxedoBasic"`
+/// -> `"Tuxedo Basic"`), falling back to the suit's.
+fn outfit_display_label(suit: &str, row: &str) -> String {
+    let texture = row
+        .split_once(',')
+        .and_then(|(_, desc)| desc.split_once('='))
+        .map(|(_, tex)| tex.trim())
+        .unwrap_or("");
+    let tail = |name: &str| name.split_once('_').map(|(_, t)| t.to_owned());
+    let raw = tail(texture)
+        .or_else(|| tail(suit))
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| suit.to_owned());
+    humanize_identifier(&raw)
+}
+
+/// `"TuxedoBasic"` -> `"Tuxedo Basic"`, `"mom02"` -> `"Mom02"`,
+/// `"red_dress"` -> `"Red Dress"`.
+fn humanize_identifier(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 4);
+    let mut prev: Option<char> = None;
+    for c in raw.chars() {
+        if c == '_' || c == '-' {
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+            prev = Some(' ');
+            continue;
+        }
+        let boundary = prev.is_some_and(|p| p.is_ascii_lowercase() && c.is_ascii_uppercase());
+        if boundary {
+            out.push(' ');
+        }
+        let start = prev.is_none_or(|p| p == ' ');
+        if start || boundary {
+            out.extend(c.to_uppercase());
+        } else {
+            out.push(c);
+        }
+        prev = Some(c);
+    }
+    out.trim().to_owned()
+}
+
+/// A pet body row's breed (`"b000dog,BODY=B000dog_lab"` -> `"Labrador
+/// Retriever"`), from the Unleashed texture names, title-casing any
+/// unlisted one.
+fn pet_breed_label(row: &str) -> String {
+    let texture = row
+        .split_once(',')
+        .and_then(|(_, desc)| desc.split_once('='))
+        .map(|(_, tex)| tex.trim())
+        .unwrap_or(row);
+    let key = texture
+        .split_once('_')
+        .map_or(texture, |(_, t)| t)
+        .to_ascii_lowercase();
+    let known = match key.as_str() {
+        "lab" => "Labrador Retriever",
+        "aussie" => "Australian Shepherd",
+        "dalmation" | "dalmatian" => "Dalmatian",
+        "cairn" => "Cairn Terrier",
+        "poodle" => "Poodle",
+        "pinkpoodle" => "Pink Poodle",
+        "jack" => "Jack Russell Terrier",
+        "springer" => "Springer Spaniel",
+        "setter" => "Irish Setter",
+        "greyhound" => "Greyhound",
+        "beagle" => "Beagle",
+        "rott" => "Rottweiler",
+        "bulldog" => "Bulldog",
+        "scottish" => "Scottish Terrier",
+        "shep" => "German Shepherd",
+        "chihuahua" => "Chihuahua",
+        "tabby" => "Tabby",
+        "tabbybrown" => "Brown Tabby",
+        "silver" => "Silver Tabby",
+        "calico" => "Calico",
+        "calicoblk" => "Black Calico",
+        "calicored" => "Red Calico",
+        "persian" => "Persian",
+        "bluemanx" => "Blue Manx",
+        "ragdoll" => "Ragdoll",
+        "siamese" => "Siamese",
+        "tortoise" => "Tortoiseshell",
+        "bombay" => "Bombay",
+        "spotted" => "Spotted",
+        "sphinx" => "Sphynx",
+        "albino" => "Albino",
+        _ => return humanize_identifier(&key),
+    };
+    known.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -14032,242 +14268,4 @@ mod tests {
         // Interior pixels stay untouched.
         assert_eq!(pixel(&canvas, 6, 6), [0, 0, 0]);
     }
-}
-
-/// Loads a pet's body for the pet picker's turntable. Pets' skeletons are
-/// `dog_skeleton.cmx.bcf` and `kat_skeleton.cmx.bcf` (`ExpansionShared.far`
-/// `Skeletons\`), an underscore where people's `<name>-skeleton.cmx.bcf`
-/// has a hyphen, so [`sims_people::Body::load`] cannot find them; this
-/// tries the hyphen first, then the underscore, and binds the outfit the
-/// same way.
-fn load_pet_body(
-    assets: &sims_people::Assets,
-    skeleton: &str,
-    outfit: &sims_people::Outfit,
-) -> Result<sims_people::Body, String> {
-    if let Ok(body) = sims_people::Body::load(assets, skeleton, outfit) {
-        return Ok(body);
-    }
-    use sims_people::appearance::{load_appearance, load_mesh, load_texture, texture_for};
-    use sims_people::rig::bone;
-    let file = format!("{skeleton}_skeleton.cmx.bcf");
-    let catalog = sims_formats::avatar::read_bcf(&assets.read(&file)?)
-        .map_err(|e| format!("{file}: {e}"))?;
-    let skeleton = catalog
-        .skeletons
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("{file} holds no skeleton"))?;
-    let mut parts = Vec::new();
-    for (name, textures) in &outfit.parts {
-        let appearance = load_appearance(assets, name)?;
-        for binding in &appearance.bindings {
-            let at = bone(&skeleton, &binding.bone)
-                .ok_or_else(|| format!("{name:?} binds the missing bone {:?}", binding.bone))?;
-            let mesh = load_mesh(assets, &binding.mesh)?;
-            let bones = mesh
-                .bones
-                .iter()
-                .map(|b| bone(&skeleton, b).ok_or_else(|| format!("missing bone {b:?}")))
-                .collect::<Result<Vec<_>, _>>()?;
-            let texture_name = texture_for(&binding.mesh, textures)
-                .or_else(|| (!mesh.texture.is_empty()).then(|| mesh.texture.clone()));
-            let texture = match &texture_name {
-                Some(t) => load_texture(assets, t)?,
-                None => sims_people::texture::Texture::solid([200, 200, 200, 255]),
-            };
-            parts.push(sims_people::Part {
-                appearance: name.clone(),
-                bone: at,
-                bones,
-                mesh,
-                texture_name,
-                texture,
-                censor: binding.censor,
-            });
-        }
-    }
-    Ok(sims_people::Body { skeleton, parts })
-}
-
-/// `person.data[31]`: the person's neighbor record ID (`PERSON_NEIGHBOR`).
-const PERSON_NEIGHBOR_WORD: usize = 31;
-
-/// Whether `record` may appear in `caller`'s Phonebook (see
-/// [`Game::build_phonebook_snapshot`]).
-fn phonebook_eligible(
-    record: &sims_sim::neighbors::Neighbor,
-    caller: i16,
-    caller_family: i16,
-    on_lot: &std::collections::BTreeSet<i16>,
-) -> bool {
-    let family = record
-        .data
-        .get(sims_sim::neighbors::FAMILY)
-        .copied()
-        .unwrap_or(0);
-    let kind = record
-        .data
-        .get(sims_sim::neighbors::KIND)
-        .copied()
-        .unwrap_or(0);
-    record.id > 0
-        && record.id != caller
-        && kind <= 1
-        && family > 0
-        && (caller_family <= 0 || family != caller_family)
-        && !on_lot.contains(&record.id)
-}
-
-/// The suit category letter of `Dialog` kind 6 mode `0..=5` (`0x5097c9`):
-/// everyday `b`, swimwear `s`, formal `f`, pajamas `l`, winter `w`, and
-/// Superstar high fashion `h`.
-fn wardrobe_mode_category(mode: i16) -> u8 {
-    match mode {
-        1 => b's',
-        2 => b'f',
-        3 => b'l',
-        4 => b'w',
-        5 => b'h',
-        _ => b'b',
-    }
-}
-
-/// Every `(suit, "suit,BODY=texture")` of category `first` that a person
-/// of the given sex, age and skin tone can wear, in native wardrobe order:
-/// the filter of `ImportWardrobe::pick` (`0x409663`) — a 9-byte suit prefix
-/// `<first>NNN<sex|u><age>xxx` and textures `<prefix><skin>…` — with the
-/// category letter in place of `b`.
-fn category_outfits(
-    wardrobe: &sims_content::ImportWardrobe,
-    first: u8,
-    female: bool,
-    child: bool,
-    skin: &str,
-) -> Vec<(String, String)> {
-    let Some(skin_bytes) = sims_formats::far::encode_name(&skin.to_ascii_lowercase()) else {
-        return Vec::new();
-    };
-    let sex = if female { b'f' } else { b'm' };
-    let age = if child { b'c' } else { b'a' };
-    let mut out = Vec::new();
-    for suit in wardrobe.suits() {
-        if suit.len() < 9
-            || !suit[0].eq_ignore_ascii_case(&first)
-            || !(suit[4].eq_ignore_ascii_case(&sex) || suit[4].eq_ignore_ascii_case(&b'u'))
-            || !suit[5].eq_ignore_ascii_case(&age)
-        {
-            continue;
-        }
-        let mut prefix = suit[..9].to_ascii_lowercase();
-        prefix.extend_from_slice(&skin_bytes);
-        for tex in wardrobe.textures() {
-            if tex.len() >= prefix.len() && tex[..prefix.len()].eq_ignore_ascii_case(&prefix) {
-                let suit_str: String = sims_formats::strings::decode(suit, 1)
-                    .to_ascii_lowercase()
-                    .chars()
-                    .take(63)
-                    .collect();
-                let tex_str = sims_formats::strings::decode(tex, 1);
-                let desc: String = format!("BODY={tex_str}").chars().take(63).collect();
-                out.push((suit_str.clone(), format!("{suit_str},{desc}")));
-            }
-        }
-    }
-    out
-}
-
-/// A readable outfit name from a wardrobe row: the texture's name after its
-/// first `_` (`"b002fafitmed_mom02"` -> `"Mom02"`, `"h551mafitlgt_TuxedoBasic"`
-/// -> `"Tuxedo Basic"`), falling back to the suit's.
-fn outfit_display_label(suit: &str, row: &str) -> String {
-    let texture = row
-        .split_once(',')
-        .and_then(|(_, desc)| desc.split_once('='))
-        .map(|(_, tex)| tex.trim())
-        .unwrap_or("");
-    let tail = |name: &str| name.split_once('_').map(|(_, t)| t.to_owned());
-    let raw = tail(texture)
-        .or_else(|| tail(suit))
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| suit.to_owned());
-    humanize_identifier(&raw)
-}
-
-/// `"TuxedoBasic"` -> `"Tuxedo Basic"`, `"mom02"` -> `"Mom02"`,
-/// `"red_dress"` -> `"Red Dress"`.
-fn humanize_identifier(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len() + 4);
-    let mut prev: Option<char> = None;
-    for c in raw.chars() {
-        if c == '_' || c == '-' {
-            if !out.ends_with(' ') && !out.is_empty() {
-                out.push(' ');
-            }
-            prev = Some(' ');
-            continue;
-        }
-        let boundary = prev.is_some_and(|p| p.is_ascii_lowercase() && c.is_ascii_uppercase());
-        if boundary {
-            out.push(' ');
-        }
-        let start = prev.is_none_or(|p| p == ' ');
-        if start || boundary {
-            out.extend(c.to_uppercase());
-        } else {
-            out.push(c);
-        }
-        prev = Some(c);
-    }
-    out.trim().to_owned()
-}
-
-/// A pet body row's breed (`"b000dog,BODY=B000dog_lab"` -> `"Labrador
-/// Retriever"`), from the Unleashed texture names, title-casing any
-/// unlisted one.
-fn pet_breed_label(row: &str) -> String {
-    let texture = row
-        .split_once(',')
-        .and_then(|(_, desc)| desc.split_once('='))
-        .map(|(_, tex)| tex.trim())
-        .unwrap_or(row);
-    let key = texture
-        .split_once('_')
-        .map_or(texture, |(_, t)| t)
-        .to_ascii_lowercase();
-    let known = match key.as_str() {
-        "lab" => "Labrador Retriever",
-        "aussie" => "Australian Shepherd",
-        "dalmation" | "dalmatian" => "Dalmatian",
-        "cairn" => "Cairn Terrier",
-        "poodle" => "Poodle",
-        "pinkpoodle" => "Pink Poodle",
-        "jack" => "Jack Russell Terrier",
-        "springer" => "Springer Spaniel",
-        "setter" => "Irish Setter",
-        "greyhound" => "Greyhound",
-        "beagle" => "Beagle",
-        "rott" => "Rottweiler",
-        "bulldog" => "Bulldog",
-        "scottish" => "Scottish Terrier",
-        "shep" => "German Shepherd",
-        "chihuahua" => "Chihuahua",
-        "tabby" => "Tabby",
-        "tabbybrown" => "Brown Tabby",
-        "silver" => "Silver Tabby",
-        "calico" => "Calico",
-        "calicoblk" => "Black Calico",
-        "calicored" => "Red Calico",
-        "persian" => "Persian",
-        "bluemanx" => "Blue Manx",
-        "ragdoll" => "Ragdoll",
-        "siamese" => "Siamese",
-        "tortoise" => "Tortoiseshell",
-        "bombay" => "Bombay",
-        "spotted" => "Spotted",
-        "sphinx" => "Sphynx",
-        "albino" => "Albino",
-        _ => return humanize_identifier(&key),
-    };
-    known.to_owned()
 }

@@ -1250,13 +1250,21 @@ fn draw_picker_dialog(
         if let Some(hole) = layout.map_hole {
             let right = hole.x + hole.width;
             let bottom = hole.y + hole.height;
-            frame.fill(Rect::new(dialog.x, hole.y, hole.x - dialog.x, hole.height), bg);
+            frame.fill(
+                Rect::new(dialog.x, hole.y, hole.x - dialog.x, hole.height),
+                bg,
+            );
             frame.fill(
                 Rect::new(right, hole.y, dialog.x + dialog.width - right, hole.height),
                 bg,
             );
             frame.fill(
-                Rect::new(dialog.x, bottom, dialog.width, dialog.y + dialog.height - bottom),
+                Rect::new(
+                    dialog.x,
+                    bottom,
+                    dialog.width,
+                    dialog.y + dialog.height - bottom,
+                ),
                 bg,
             );
         }

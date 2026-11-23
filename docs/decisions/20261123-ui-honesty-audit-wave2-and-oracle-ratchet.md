@@ -1,0 +1,160 @@
+# 2026-11-23: UI Honesty Audit Wave 2 — special panels, shell dialogs, and a UI oracle ratchet
+
+## Context
+
+Wave 1 (#397) fixed the core Live/Buy/Options gaps. Wave 2 covers the
+special panels the VM opens through `SpecialPanelRequest`, plus the shell
+dialogs (Photo Album, Travel, Import Family). These still drew generic
+9-slice placeholders or leaked raw data. Wave 2 also adds a test that scores
+our UI against 1.91 oracle screenshots and fails if any region drops below
+its floor. Every fix after that test landed came from a discrepancy it
+found.
+
+## Changes
+
+1. **Phone book (`Dialog` kind 10, `cWinPhoneBook`, `0x5221d0`).**
+   - New `crates/sims-ui/src/phonebook.rs` draws the native
+     `phonebookbkg.bmp` (80, 620×356) and `phoneicon.bmp` (81).
+   - Each entry has a 45×45 portrait and Daily/Lifetime relationship bars,
+     with paging.
+   - Viewports smaller than 620×356 fall back to `PopupInfoTiles.bmp` (3008).
+   - `CallNeighbor` wires the caller's neighbor record. The list holds the
+     non-family neighbors the caller has a relationship with, so a fresh
+     Mortimer Goth sees an empty book.
+2. **Wardrobe (6), Charm Transform (14) and Pet picker (9).**
+   - These pickers are now filtered by mode/category instead of listing
+     everything, and they show no prices.
+   - The pet picker previews the breed on the 3D turntable. Pet skeletons
+     are `dog_skeleton.cmx.bcf` and `kat_skeleton.cmx.bcf`, with an
+     underscore. `sims_people::Body::load` only looks for
+     `<name>-skeleton.cmx.bcf`, so the new `load_pet_body` in
+     `crates/sims-game/src/game.rs` falls back to the underscore name and
+     binds the outfit the same way. The People track could fix this
+     upstream.
+3. **Import Family:** the modal no longer shows a stray `$0`. It shows the
+   family funds and the search paths.
+4. **Spellbook / reference book:**
+   - Chrome is `magicbookbkg.bmp` (82), with illustrations 90..=94.
+   - The title takes the caller's surname: "Goth Family Spellbook".
+   - 82 is a plain blue 620×400 frame in the game data, so drawing it bare
+     is correct.
+5. **Photo Album:** draws the native Scrapbook art 1200..=1206 on viewports
+   of at least 700×560. The six native buttons sit at their `STR# 141`
+   coordinates.
+6. **Travel dialog:** `PopupInfoTiles.bmp` (3008) frame, `WinBtn` 17 buttons
+   and `STR# 142` labels. The Magic Town and Downtown pickers get the
+   `dlgframe2.bmp` header and the filter row, measured against the oracle.
+7. **P1-12:** removed the synthetic Take Snapshot button from the Camera
+   strip. Native `cWinCamera` has none.
+8. **Build Mode, oracle-driven:**
+   - Catalog slots no longer mark unaffordable items. The native
+     `build-stairs` shot shows plain cells.
+   - Terrain subtools are in the native order Grass, Level, Lower, Raise.
+     Grass is the default, and the icons are bare with no template cell.
+   - Roof pitch column sits at `grid_left − 14` in the order Steep, Medium,
+     Shallow, Flat. The pattern grid is at `+50`/`+1`.
+   - Roof patterns are sorted case-insensitively by stem. The game matches
+     patterns by stem, so re-indexing is safe.
+9. **Pause:** the oracle's 1024×768 Live shot is paused. The tour pauses and
+   advances one blink before it captures.
+10. **Test hook:** `Game::preview_special_panel` (`#[doc(hidden)]`) opens a
+    special panel over a given world without a VM request. Only the new
+    snapshot test uses it.
+
+## Oracle ratchet
+
+`crates/sims-game/tests/ui_oracle_tour.rs` runs when both `SIMS_UI_ORACLE`
+(the folder of 1.91 screenshots) and `SIMS_INSTALL` are set; otherwise it
+skips.
+
+- It drives the Goth house through Live tabs, view radios, the Buy and
+  Build tools, Camera, Options, and the Magic Town and Downtown pickers.
+- For each named region it scores the share of pixels within tolerance of
+  the oracle.
+- It fails if any score falls below its floor. Floors are
+  `floor((score − 0.005) · 100) / 100`, so they only move up.
+- `SIMS_UI_ORACLE_OUT` writes side-by-side PNGs.
+
+| shot | region | score | floor |
+|---|---|---|---|
+| live 800 | puck | .9939 | .98 |
+| live 800 | strip | .9979 | .99 |
+| live 1024 | puck | .8655 | .86 |
+| live 1024 | strip | .9997 | .99 |
+| relationships | strip | .9555 | .95 |
+| job | strip | .9598 | .95 |
+| personality | strip | .9673 | .96 |
+| house | strip | .9495 | .94 |
+| view radios | radio | 1.0000 | .99 |
+| buy top | strip | 1.0000 | .99 |
+| buy seating | strip | .9918 | .98 |
+| build top | strip | .9836 | .97 |
+| terrain | strip | .9609 | .95 |
+| water | strip | .9943 | .98 |
+| wall | strip | .9678 | .96 |
+| wallpaper | strip | .8923 | .88 |
+| plants | strip | .9930 | .98 |
+| floor | strip | .9281 | .92 |
+| roof | strip | .9818 | .97 |
+| doors | strip | .9880 | .98 |
+| windows | strip | .9930 | .98 |
+| stairs | strip | .9919 | .98 |
+| fireplace | strip | .9943 | .98 |
+| camera | strip | .9779 | .97 |
+| options | strip | .9921 | .98 |
+| magic picker | frame | 1.0000 | .99 |
+| magic picker | header | .9118 | .90 |
+| downtown picker | frame | 1.0000 | .99 |
+| downtown picker | header | .9730 | .96 |
+
+`crates/sims-game/tests/ui_wave2_snapshots.rs` opens every Wave 2 panel on
+the Goth house with real art and asserts that it draws. With
+`SIMS_UI_SNAPSHOT_OUT` set, it writes PNGs. All of them were inspected by
+eye:
+
+- phone book, empty and with 10 townies;
+- wardrobe and charm;
+- pet picker, with and without the 3D preview;
+- Spellbook;
+- Photo Album;
+- Travel;
+- Import Family.
+
+## Known gaps (follow-ups)
+
+- **Wallpaper (.89) and floor (.93):** our catalog order differs from
+  native (we sort by price, then name, then id). Native wallpaper
+  thumbnails are slanted wall pieces.
+- **Doors:** slot 3 is blank. Native renders object thumbnails at
+  `0x4e57a6`, which is not ported.
+- **Live 1024 puck (.87):** the lot terrain and camera framing behind the
+  puck differ. The puck itself matches.
+- **Live tab values (relationships, job, personality, house):** some values
+  differ from the oracle's moment in time.
+- **Wardrobe and charm:**
+  - The lists show raw suit names ("Dave", "Ct", "Flametroop", "Jrsk2")
+    and no thumbnails.
+  - Charm reuses the everyday category. This is unverified.
+  - The selected try-on row gets a synthetic " [Preview]" or " [Owned]"
+    suffix.
+- **Pet preview:** the dog is drawn small at the bottom of the pane; the
+  framing needs work.
+- **Photo Album:** "Snap" and "Add" are not among the six native `STR# 141`
+  buttons. They are our own extras with English defaults.
+- **Roof page arrows:** the previous-page arrow sits at
+  `pattern_left − arrow − 2`. No oracle shot shows a second page, so this
+  is unverified.
+
+## Unverified assumptions
+
+- Wardrobe modes 1–5 categories, and the item order for kind 14.
+- NPCs are left out of the phone book by `family > 0`.
+- The breed-name map.
+- Native pickers show no prices.
+- Magic Town's default filter is Magic.
+- Downtown's omitted right button.
+- Bulldoze is disabled while visiting.
+- The interpolation of the picker header gradient.
+- The first picker item is auto-selected.
+- The OBJD Disabled flag (`+0x20`) applies only in Build Mode.
+- Grass is the terrain default; the oracle shows no selection.
