@@ -561,10 +561,12 @@ fn bhav_param_limit(bhav: &Behavior) -> usize {
 }
 
 fn bhav_local_limit(bhav: &Behavior) -> usize {
+    // Match `sims_vm::interpreter::dimensions`: the local count is truncated to a byte.
+    let low = usize::from(bhav.locals as u8);
     match bhav.format {
         0x8000 => 0,
-        0x8001 => usize::from(bhav.locals).min(4),
-        _ => usize::from(bhav.locals),
+        0x8001 => low.min(4),
+        _ => low,
     }
 }
 
@@ -3023,13 +3025,13 @@ pub fn check_bhav_equivalent_with_arities(
     };
     let locals_a = match a.format {
         0x8000 => 0,
-        0x8001 => usize::from(a.locals).min(4),
-        _ => usize::from(a.locals),
+        0x8001 => usize::from(a.locals as u8).min(4),
+        _ => usize::from(a.locals as u8),
     };
     let locals_b = match b.format {
         0x8000 => 0,
-        0x8001 => usize::from(b.locals).min(4),
-        _ => usize::from(b.locals),
+        0x8001 => usize::from(b.locals as u8).min(4),
+        _ => usize::from(b.locals as u8),
     };
 
     let uses_global_34 = bhav_uses_global_34(a) || bhav_uses_global_34(b);

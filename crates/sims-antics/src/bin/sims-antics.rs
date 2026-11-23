@@ -18,6 +18,7 @@ use sims_antics::{
 };
 use sims_formats::far;
 use sims_formats::iff::{DELETED, Iff};
+use std::ffi::{OsStr, OsString};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
@@ -25,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug)]
 enum CliError {
     Message(String),
     BrokenPipe,
@@ -36,15 +38,22 @@ impl From<String> for CliError {
     }
 }
 
-struct StdoutOut {
-    writer: BufWriter<std::io::StdoutLock<'static>>,
+struct OutWriter<W: Write> {
+    writer: W,
 }
 
-impl StdoutOut {
-    fn new() -> Self {
+impl OutWriter<BufWriter<std::io::StdoutLock<'static>>> {
+    fn stdout() -> Self {
         Self {
             writer: BufWriter::new(std::io::stdout().lock()),
         }
+    }
+}
+
+impl<W: Write> OutWriter<W> {
+    #[cfg(test)]
+    fn from_writer(writer: W) -> Self {
+        Self { writer }
     }
 
     fn map_io(err: std::io::Error) -> CliError {
@@ -67,6 +76,47 @@ impl StdoutOut {
     fn flush(&mut self) -> Result<(), CliError> {
         self.writer.flush().map_err(Self::map_io)
     }
+}
+
+#[derive(Default)]
+struct LiftSummary {
+    counterexamples: usize,
+    compile_errors: usize,
+    parse_errors: usize,
+}
+
+impl LiftSummary {
+    fn into_result(self, broken_pipe: bool) -> Result<(), CliError> {
+        if self.counterexamples > 0 || self.compile_errors > 0 {
+            let mut msg = format!(
+                "verify-equiv failed ({} counterexample(s), {} compile error(s))",
+                self.counterexamples, self.compile_errors
+            );
+            if self.parse_errors > 0 {
+                msg.push_str(&format!("; {} BHAV(s) failed to parse", self.parse_errors));
+            }
+            return Err(CliError::Message(msg));
+        }
+        if self.parse_errors > 0 {
+            return Err(CliError::Message(format!(
+                "failed to parse {} BHAV chunk(s)",
+                self.parse_errors
+            )));
+        }
+        if broken_pipe {
+            return Err(CliError::BrokenPipe);
+        }
+        Ok(())
+    }
+}
+
+fn os_arg_to_str<'a>(arg: &'a OsStr, context: &str) -> Result<&'a str, CliError> {
+    arg.to_str()
+        .ok_or_else(|| CliError::Message(format!("{context} contains invalid UTF-8")))
+}
+
+fn os_arg_starts_with_dash(arg: &OsStr) -> bool {
+    arg.as_encoded_bytes().starts_with(b"-")
 }
 
 fn print_usage() {
@@ -98,7 +148,10 @@ fn sanitize_single_line(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             c if c.is_control() => {
                 use std::fmt::Write as _;
-                let _ = write!(out, "\\x{:02x}", c as u32);
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).as_bytes() {
+                    let _ = write!(out, "\\x{b:02x}");
+                }
             }
             c => out.push(c),
         }
@@ -151,11 +204,12 @@ fn resolve_far_entry<'a>(
         return Err(format_ambiguous_matches(query, &exact));
     }
 
-    // 2. Case-insensitive exact match (normalizing `\` and `/`).
+    // 2. Unicode case-insensitive exact match (normalizing `\` and `/`).
     let q_norm = normalize_archive_path(query);
+    let q_folded = q_norm.to_lowercase();
     let ci_exact: Vec<&far::Entry> = entries
         .iter()
-        .filter(|e| normalize_archive_path(&e.name).eq_ignore_ascii_case(&q_norm))
+        .filter(|e| normalize_archive_path(&e.name).to_lowercase() == q_folded)
         .collect();
     if ci_exact.len() == 1 {
         return Ok(ci_exact[0]);
@@ -164,18 +218,18 @@ fn resolve_far_entry<'a>(
         return Err(format_ambiguous_matches(query, &ci_exact));
     }
 
-    // 3. Unique path-segment suffix / basename match (case-insensitive, separator-normalized).
+    // 3. Unique path-segment suffix / basename match (Unicode case-insensitive, separator-normalized).
     let q_trimmed = q_norm.trim_start_matches('/');
     if !q_trimmed.is_empty() {
-        let q_lower = q_trimmed.to_ascii_lowercase();
+        let q_lower = q_trimmed.to_lowercase();
         let seg_suffix: Vec<&far::Entry> = entries
             .iter()
             .filter(|e| {
-                let norm = normalize_archive_path(&e.name).to_ascii_lowercase();
+                let norm = normalize_archive_path(&e.name).to_lowercase();
                 if norm == q_lower {
                     true
-                } else if norm.len() > q_lower.len() && norm.ends_with(&q_lower) {
-                    norm.as_bytes()[norm.len() - q_lower.len() - 1] == b'/'
+                } else if let Some(prefix) = norm.strip_suffix(&q_lower) {
+                    prefix.ends_with('/')
                 } else {
                     false
                 }
@@ -188,12 +242,12 @@ fn resolve_far_entry<'a>(
             return Err(format_ambiguous_matches(query, &seg_suffix));
         }
 
-        // 4. Unique general case-insensitive suffix fallback.
+        // 4. Unique general Unicode case-insensitive suffix fallback.
         let general_suffix: Vec<&far::Entry> = entries
             .iter()
             .filter(|e| {
                 normalize_archive_path(&e.name)
-                    .to_ascii_lowercase()
+                    .to_lowercase()
                     .ends_with(&q_lower)
             })
             .collect();
@@ -225,7 +279,7 @@ fn lift_reason(outcome: &StructuredLiftOutcome) -> Option<String> {
 }
 
 fn bhav_matches_filter(id: u16, label: &str, filter_lower: &str) -> bool {
-    if label.to_ascii_lowercase().contains(filter_lower) {
+    if label.to_lowercase().contains(filter_lower) {
         return true;
     }
     let dec = id.to_string();
@@ -240,9 +294,50 @@ fn bhav_matches_filter(id: u16, label: &str, filter_lower: &str) -> bool {
     hex_short.contains(filter_lower)
 }
 
+fn open_regular_file_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0x0004;
+        opts.custom_flags(O_NONBLOCK);
+    }
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0x0800;
+        opts.custom_flags(O_NONBLOCK);
+    }
+    opts.open(path)
+}
+
 fn read_regular_file_prefix(path: &Path) -> Result<(std::fs::File, u64, Vec<u8>), String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    // Reject non-regular files (such as FIFOs/directories) before opening so a named pipe
+    // cannot block waiting for a writer, then open non-blocking and re-verify the opened fd.
+    let pre_meta =
+        std::fs::metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    if !pre_meta.file_type().is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    let mut file = open_regular_file_nonblocking(path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
     let meta = file
         .metadata()
         .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
@@ -289,7 +384,167 @@ fn read_bounded_iff_file(
     Ok(bytes)
 }
 
-fn cmd_lift(args: &[String]) -> Result<(), CliError> {
+fn emit_lifted_bhavs<W: Write>(
+    iff: &Iff,
+    selected_chunks: &[&sims_formats::iff::Chunk],
+    source_label: &str,
+    tree_id: Option<u16>,
+    raw: bool,
+    verify_equiv: bool,
+    out: &mut OutWriter<W>,
+) -> Result<(), CliError> {
+    if selected_chunks.is_empty() {
+        out.writeln_str(&format!("// no BHAV chunks found in {source_label}"))?;
+        out.flush()?;
+        return Ok(());
+    }
+
+    let arities = if verify_equiv {
+        Some(extract_bhav_arities_from_iff(&iff.bytes).unwrap_or_default())
+    } else {
+        None
+    };
+
+    let mut summary = LiftSummary::default();
+    let mut broken_pipe = false;
+
+    macro_rules! write_or_break {
+        ($expr:expr) => {
+            match $expr {
+                Ok(()) => {}
+                Err(CliError::BrokenPipe) => {
+                    broken_pipe = true;
+                    break;
+                }
+                Err(other) => return Err(other),
+            }
+        };
+    }
+
+    for (idx, chunk) in selected_chunks.iter().enumerate() {
+        if idx > 0 {
+            write_or_break!(out.writeln_str(""));
+        }
+        let bhav = match lift_bhav(chunk.id, &chunk.label, iff.data(chunk)) {
+            Ok(b) => b,
+            Err(err) => {
+                if tree_id.is_some() {
+                    return Err(format!(
+                        "failed to parse BHAV #{} ({:#06x}) in {source_label}: {err}",
+                        chunk.id, chunk.id
+                    )
+                    .into());
+                }
+                summary.parse_errors += 1;
+                write_or_break!(out.writeln_str(&format!(
+                    "// tree {} \"{}\": failed to parse BHAV ({})",
+                    chunk.id,
+                    sanitize_single_line(&chunk.label),
+                    sanitize_single_line(&err.to_string())
+                )));
+                continue;
+            }
+        };
+
+        if raw {
+            let src = format_bhav_antics(&bhav);
+            write_or_break!(out.write_str(&src));
+            if !src.ends_with('\n') {
+                write_or_break!(out.writeln_str(""));
+            }
+            continue;
+        }
+
+        let outcome = lift_bhav_structured(&bhav);
+        match outcome {
+            StructuredLiftOutcome::Lifted(src) => {
+                if !bhav.label.is_empty() {
+                    write_or_break!(out.writeln_str(&format!(
+                        "// tree {} \"{}\"",
+                        bhav.id,
+                        sanitize_single_line(&bhav.label)
+                    )));
+                }
+                write_or_break!(out.write_str(&src));
+                if !src.ends_with('\n') {
+                    write_or_break!(out.writeln_str(""));
+                }
+                if verify_equiv {
+                    let status_line = match compile_antics(&src) {
+                        Ok(compiled) => {
+                            if let Some(recompiled) = compiled.behaviors.get(&bhav.id) {
+                                match check_bhav_equivalent_with_arities(
+                                    &bhav,
+                                    recompiled,
+                                    &EquivOptions::default(),
+                                    arities.as_ref(),
+                                ) {
+                                    EquivResult::Equivalent {
+                                        states_checked,
+                                        paths_verified,
+                                    } => format!(
+                                        "// verify-equiv: Equivalent ({states_checked} states checked, {paths_verified} paths verified)"
+                                    ),
+                                    EquivResult::Counterexample { path, divergence } => {
+                                        summary.counterexamples += 1;
+                                        format!(
+                                            "// verify-equiv: Counterexample(after {} step(s): {})",
+                                            path.len(),
+                                            sanitize_single_line(&divergence)
+                                        )
+                                    }
+                                    EquivResult::Inconclusive { reason } => format!(
+                                        "// verify-equiv: Inconclusive({})",
+                                        sanitize_single_line(&reason)
+                                    ),
+                                }
+                            } else {
+                                summary.compile_errors += 1;
+                                format!(
+                                    "// verify-equiv: CompileError(recompiled output missing tree #{})",
+                                    bhav.id
+                                )
+                            }
+                        }
+                        Err(err) => {
+                            summary.compile_errors += 1;
+                            format!(
+                                "// verify-equiv: CompileError({})",
+                                sanitize_single_line(&err.to_string())
+                            )
+                        }
+                    };
+                    write_or_break!(out.writeln_str(&status_line));
+                }
+            }
+            other => {
+                let reason = lift_reason(&other).unwrap_or_else(|| "unknown".to_owned());
+                write_or_break!(out.writeln_str(&format!(
+                    "// tree {} \"{}\": structured lift fallback ({reason}); showing raw low-level .antics",
+                    bhav.id,
+                    sanitize_single_line(&bhav.label)
+                )));
+                let raw_src = format_bhav_antics(&bhav);
+                write_or_break!(out.write_str(&raw_src));
+                if !raw_src.ends_with('\n') {
+                    write_or_break!(out.writeln_str(""));
+                }
+            }
+        }
+    }
+
+    if !broken_pipe {
+        match out.flush() {
+            Ok(()) => {}
+            Err(CliError::BrokenPipe) => broken_pipe = true,
+            Err(other) => return Err(other),
+        }
+    }
+
+    summary.into_result(broken_pipe)
+}
+
+fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     let mut input_path: Option<PathBuf> = None;
     let mut entry_name: Option<String> = None;
     let mut tree_id: Option<u16> = None;
@@ -301,74 +556,82 @@ fn cmd_lift(args: &[String]) -> Result<(), CliError> {
 
     let mut i = 1usize;
     while i < args.len() {
-        let arg = args[i].as_str();
+        let arg = args[i].as_os_str();
         if !end_of_flags {
-            match arg {
-                "-h" | "--help" => {
-                    print_usage();
-                    return Ok(());
-                }
-                "--" => {
-                    end_of_flags = true;
-                    i += 1;
-                    continue;
-                }
-                "--entry" | "-e" => {
-                    if entry_name.is_some() {
-                        return Err("duplicate --entry flag".to_owned().into());
+            if let Some(s) = arg.to_str() {
+                match s {
+                    "-h" | "--help" => {
+                        print_usage();
+                        return Ok(());
                     }
-                    let val = args
-                        .get(i + 1)
-                        .ok_or_else(|| "missing entry name after --entry".to_owned())?;
-                    entry_name = Some(val.clone());
-                    i += 2;
-                    continue;
-                }
-                "--tree" | "-t" => {
-                    if tree_id.is_some() {
-                        return Err("duplicate --tree flag".to_owned().into());
+                    "--" => {
+                        end_of_flags = true;
+                        i += 1;
+                        continue;
                     }
-                    let val = args
-                        .get(i + 1)
-                        .ok_or_else(|| "missing tree ID after --tree".to_owned())?;
-                    tree_id = Some(parse_tree_id(val)?);
-                    i += 2;
-                    continue;
-                }
-                "--list" | "-l" => {
-                    list = true;
-                    i += 1;
-                    continue;
-                }
-                "--filter" | "-f" => {
-                    if filter.is_some() {
-                        return Err("duplicate --filter flag".to_owned().into());
+                    "--entry" | "-e" => {
+                        if entry_name.is_some() {
+                            return Err("duplicate --entry flag".to_owned().into());
+                        }
+                        let val = args
+                            .get(i + 1)
+                            .ok_or_else(|| "missing entry name after --entry".to_owned())?;
+                        entry_name = Some(os_arg_to_str(val, "--entry value")?.to_owned());
+                        i += 2;
+                        continue;
                     }
-                    let val = args
-                        .get(i + 1)
-                        .ok_or_else(|| "missing substring after --filter".to_owned())?;
-                    filter = Some(val.clone());
-                    i += 2;
-                    continue;
+                    "--tree" | "-t" => {
+                        if tree_id.is_some() {
+                            return Err("duplicate --tree flag".to_owned().into());
+                        }
+                        let val = args
+                            .get(i + 1)
+                            .ok_or_else(|| "missing tree ID after --tree".to_owned())?;
+                        tree_id = Some(parse_tree_id(os_arg_to_str(val, "--tree value")?)?);
+                        i += 2;
+                        continue;
+                    }
+                    "--list" | "-l" => {
+                        list = true;
+                        i += 1;
+                        continue;
+                    }
+                    "--filter" | "-f" => {
+                        if filter.is_some() {
+                            return Err("duplicate --filter flag".to_owned().into());
+                        }
+                        let val = args
+                            .get(i + 1)
+                            .ok_or_else(|| "missing substring after --filter".to_owned())?;
+                        filter = Some(os_arg_to_str(val, "--filter value")?.to_owned());
+                        i += 2;
+                        continue;
+                    }
+                    "--raw" => {
+                        raw = true;
+                        i += 1;
+                        continue;
+                    }
+                    "--verify-equiv" => {
+                        verify_equiv = true;
+                        i += 1;
+                        continue;
+                    }
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown flag '{other}'").into());
+                    }
+                    _ => {}
                 }
-                "--raw" => {
-                    raw = true;
-                    i += 1;
-                    continue;
-                }
-                "--verify-equiv" => {
-                    verify_equiv = true;
-                    i += 1;
-                    continue;
-                }
-                other if other.starts_with('-') => {
-                    return Err(format!("unknown flag '{other}'").into());
-                }
-                _ => {}
+            } else if os_arg_starts_with_dash(arg) {
+                return Err(
+                    "unknown non-UTF-8 flag (use '--' before file paths starting with '-')"
+                        .to_owned()
+                        .into(),
+                );
             }
         }
         if input_path.is_some() {
-            return Err(format!("unexpected extra argument '{arg}'").into());
+            return Err(format!("unexpected extra argument '{}'", Path::new(arg).display()).into());
         }
         input_path = Some(PathBuf::from(arg));
         i += 1;
@@ -403,7 +666,7 @@ fn cmd_lift(args: &[String]) -> Result<(), CliError> {
     let has_far_magic = header.len() >= 8 && &header[..8] == b"FAR!byAZ";
     let is_far = has_far_ext || has_far_magic;
 
-    let mut out = StdoutOut::new();
+    let mut out = OutWriter::stdout();
 
     let (iff_bytes, source_label) = if is_far {
         if header.len() < 16 {
@@ -446,12 +709,12 @@ fn cmd_lift(args: &[String]) -> Result<(), CliError> {
                     )
                     .into());
                 }
-                let filter_lower = filter.as_deref().map(str::to_ascii_lowercase);
+                let filter_lower = filter.as_deref().map(str::to_lowercase);
                 let mut iff_entries: Vec<&far::Entry> = entries
                     .iter()
                     .filter(|e| is_iff_entry_name(&e.name))
                     .filter(|e| match &filter_lower {
-                        Some(needle) => e.name.to_ascii_lowercase().contains(needle),
+                        Some(needle) => e.name.to_lowercase().contains(needle),
                         None => true,
                     })
                     .collect();
@@ -535,7 +798,7 @@ fn cmd_lift(args: &[String]) -> Result<(), CliError> {
     });
 
     if list {
-        let filter_lower = filter.as_deref().map(str::to_ascii_lowercase);
+        let filter_lower = filter.as_deref().map(str::to_lowercase);
         out.writeln_str(&format!(
             "{:<7} {:<8} {:<5} {:<5} {:<7} {:<36} {}",
             "ID", "HEX", "INS", "ARGS", "LOCALS", "STATUS", "NAME"
@@ -591,7 +854,7 @@ fn cmd_lift(args: &[String]) -> Result<(), CliError> {
             })?;
         vec![chunk]
     } else if let Some(ref needle_raw) = filter {
-        let needle = needle_raw.to_ascii_lowercase();
+        let needle = needle_raw.to_lowercase();
         let matched: Vec<_> = bhav_chunks
             .into_iter()
             .filter(|c| bhav_matches_filter(c.id, &c.label, &needle))
@@ -606,144 +869,15 @@ fn cmd_lift(args: &[String]) -> Result<(), CliError> {
         bhav_chunks
     };
 
-    if selected_chunks.is_empty() {
-        out.writeln_str(&format!("// no BHAV chunks found in {source_label}"))?;
-        out.flush()?;
-        return Ok(());
-    }
-
-    let arities = if verify_equiv {
-        Some(extract_bhav_arities_from_iff(&iff.bytes).unwrap_or_default())
-    } else {
-        None
-    };
-
-    let mut counterexamples = 0usize;
-    let mut compile_errors = 0usize;
-
-    for (idx, chunk) in selected_chunks.iter().enumerate() {
-        if idx > 0 {
-            out.writeln_str("")?;
-        }
-        let bhav = match lift_bhav(chunk.id, &chunk.label, iff.data(chunk)) {
-            Ok(b) => b,
-            Err(err) => {
-                if tree_id.is_some() {
-                    return Err(format!(
-                        "failed to parse BHAV #{} ({:#06x}) in {source_label}: {err}",
-                        chunk.id, chunk.id
-                    )
-                    .into());
-                }
-                out.writeln_str(&format!(
-                    "// tree {} \"{}\": failed to parse BHAV ({})",
-                    chunk.id,
-                    sanitize_single_line(&chunk.label),
-                    sanitize_single_line(&err.to_string())
-                ))?;
-                continue;
-            }
-        };
-
-        if raw {
-            let src = format_bhav_antics(&bhav);
-            out.write_str(&src)?;
-            if !src.ends_with('\n') {
-                out.writeln_str("")?;
-            }
-            continue;
-        }
-
-        let outcome = lift_bhav_structured(&bhav);
-        match outcome {
-            StructuredLiftOutcome::Lifted(src) => {
-                if !bhav.label.is_empty() {
-                    out.writeln_str(&format!(
-                        "// tree {} \"{}\"",
-                        bhav.id,
-                        sanitize_single_line(&bhav.label)
-                    ))?;
-                }
-                out.write_str(&src)?;
-                if !src.ends_with('\n') {
-                    out.writeln_str("")?;
-                }
-                if verify_equiv {
-                    match compile_antics(&src) {
-                        Ok(compiled) => {
-                            if let Some(recompiled) = compiled.behaviors.get(&bhav.id) {
-                                match check_bhav_equivalent_with_arities(
-                                    &bhav,
-                                    recompiled,
-                                    &EquivOptions::default(),
-                                    arities.as_ref(),
-                                ) {
-                                    EquivResult::Equivalent {
-                                        states_checked,
-                                        paths_verified,
-                                    } => {
-                                        out.writeln_str(&format!(
-                                            "// verify-equiv: Equivalent ({states_checked} states checked, {paths_verified} paths verified)"
-                                        ))?;
-                                    }
-                                    EquivResult::Counterexample { path, divergence } => {
-                                        counterexamples += 1;
-                                        out.writeln_str(&format!(
-                                            "// verify-equiv: Counterexample(after {} step(s): {})",
-                                            path.len(),
-                                            sanitize_single_line(&divergence)
-                                        ))?;
-                                    }
-                                    EquivResult::Inconclusive { reason } => {
-                                        out.writeln_str(&format!(
-                                            "// verify-equiv: Inconclusive({})",
-                                            sanitize_single_line(&reason)
-                                        ))?;
-                                    }
-                                }
-                            } else {
-                                compile_errors += 1;
-                                out.writeln_str(&format!(
-                                    "// verify-equiv: CompileError(recompiled output missing tree #{})",
-                                    bhav.id
-                                ))?;
-                            }
-                        }
-                        Err(err) => {
-                            compile_errors += 1;
-                            out.writeln_str(&format!(
-                                "// verify-equiv: CompileError({})",
-                                sanitize_single_line(&err.to_string())
-                            ))?;
-                        }
-                    }
-                }
-            }
-            other => {
-                let reason = lift_reason(&other).unwrap_or_else(|| "unknown".to_owned());
-                out.writeln_str(&format!(
-                    "// tree {} \"{}\": structured lift fallback ({reason}); showing raw low-level .antics",
-                    bhav.id,
-                    sanitize_single_line(&bhav.label)
-                ))?;
-                let raw_src = format_bhav_antics(&bhav);
-                out.write_str(&raw_src)?;
-                if !raw_src.ends_with('\n') {
-                    out.writeln_str("")?;
-                }
-            }
-        }
-    }
-
-    out.flush()?;
-
-    if counterexamples > 0 || compile_errors > 0 {
-        return Err(format!(
-            "verify-equiv failed ({counterexamples} counterexample(s), {compile_errors} compile error(s))"
-        )
-        .into());
-    }
-    Ok(())
+    emit_lifted_bhavs(
+        &iff,
+        &selected_chunks,
+        &source_label,
+        tree_id,
+        raw,
+        verify_equiv,
+        &mut out,
+    )
 }
 
 fn is_macos_system_symlink(path: &Path) -> bool {
@@ -946,13 +1080,18 @@ fn write_contained_file(parent_canon: &Path, filename: &str, bytes: &[u8]) -> Re
 }
 
 fn run() -> Result<(), CliError> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if args.is_empty() {
+        print_usage();
+        return Ok(());
+    }
+    let subcmd = os_arg_to_str(&args[0], "subcommand")?;
+    if matches!(subcmd, "-h" | "--help" | "help") {
         print_usage();
         return Ok(());
     }
 
-    match args[0].as_str() {
+    match subcmd {
         "check" => {
             if args.len() != 2 {
                 print_usage();
@@ -1020,28 +1159,37 @@ fn run() -> Result<(), CliError> {
             let mut tree_id: Option<u16> = None;
             let mut i = 1usize;
             while i < args.len() {
-                match args[i].as_str() {
-                    "--tree" | "-t" => {
-                        let val = args
-                            .get(i + 1)
-                            .ok_or_else(|| "missing tree ID after --tree".to_owned())?;
-                        tree_id = Some(parse_tree_id(val)?);
-                        i += 2;
-                    }
-                    other if other.starts_with('-') => {
-                        return Err(format!("unknown flag '{other}'").into());
-                    }
-                    other => {
-                        if antics_path.is_none() {
-                            antics_path = Some(PathBuf::from(other));
-                        } else if iff_path.is_none() {
-                            iff_path = Some(PathBuf::from(other));
-                        } else {
-                            return Err(format!("unexpected extra argument '{other}'").into());
+                let arg = args[i].as_os_str();
+                if let Some(s) = arg.to_str() {
+                    match s {
+                        "--tree" | "-t" => {
+                            let val = args
+                                .get(i + 1)
+                                .ok_or_else(|| "missing tree ID after --tree".to_owned())?;
+                            tree_id = Some(parse_tree_id(os_arg_to_str(val, "--tree value")?)?);
+                            i += 2;
+                            continue;
                         }
-                        i += 1;
+                        other if other.starts_with('-') => {
+                            return Err(format!("unknown flag '{other}'").into());
+                        }
+                        _ => {}
                     }
+                } else if os_arg_starts_with_dash(arg) {
+                    return Err("unknown non-UTF-8 flag".to_owned().into());
                 }
+                if antics_path.is_none() {
+                    antics_path = Some(PathBuf::from(arg));
+                } else if iff_path.is_none() {
+                    iff_path = Some(PathBuf::from(arg));
+                } else {
+                    return Err(format!(
+                        "unexpected extra argument '{}'",
+                        Path::new(arg).display()
+                    )
+                    .into());
+                }
+                i += 1;
             }
             let antics_path = antics_path.ok_or_else(|| "equiv requires <a.antics>".to_owned())?;
             let iff_path = iff_path.ok_or_else(|| "equiv requires <b.iff>".to_owned())?;
@@ -1097,25 +1245,34 @@ fn run() -> Result<(), CliError> {
             let mut out_dir: Option<PathBuf> = None;
             let mut i = 1usize;
             while i < args.len() {
-                match args[i].as_str() {
-                    "--out" | "-o" => {
-                        let val = args
-                            .get(i + 1)
-                            .ok_or_else(|| "missing directory path after --out".to_owned())?;
-                        out_dir = Some(PathBuf::from(val));
-                        i += 2;
-                    }
-                    other if other.starts_with('-') => {
-                        return Err(format!("unknown flag '{other}'").into());
-                    }
-                    other => {
-                        if pack_dir.is_some() {
-                            return Err(format!("unexpected extra argument '{other}'").into());
+                let arg = args[i].as_os_str();
+                if let Some(s) = arg.to_str() {
+                    match s {
+                        "--out" | "-o" => {
+                            let val = args
+                                .get(i + 1)
+                                .ok_or_else(|| "missing directory path after --out".to_owned())?;
+                            out_dir = Some(PathBuf::from(val));
+                            i += 2;
+                            continue;
                         }
-                        pack_dir = Some(PathBuf::from(other));
-                        i += 1;
+                        other if other.starts_with('-') => {
+                            return Err(format!("unknown flag '{other}'").into());
+                        }
+                        _ => {}
                     }
+                } else if os_arg_starts_with_dash(arg) {
+                    return Err("unknown non-UTF-8 flag".to_owned().into());
                 }
+                if pack_dir.is_some() {
+                    return Err(format!(
+                        "unexpected extra argument '{}'",
+                        Path::new(arg).display()
+                    )
+                    .into());
+                }
+                pack_dir = Some(PathBuf::from(arg));
+                i += 1;
             }
             let pack_dir = pack_dir.ok_or_else(|| "build requires <pack_dir>".to_owned())?;
             let out_dir = out_dir.ok_or_else(|| "build requires --out <dir>".to_owned())?;
@@ -1229,5 +1386,99 @@ fn main() -> ExitCode {
             eprintln!("error: {msg}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sims_formats::iff::{ChunkData, write as write_iff};
+
+    struct FailWithBrokenPipe {
+        fail_after_bytes: usize,
+        written: usize,
+    }
+
+    impl Write for FailWithBrokenPipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.written >= self.fail_after_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated broken pipe",
+                ));
+            }
+            let allow = (self.fail_after_bytes - self.written).min(buf.len());
+            self.written += allow;
+            Ok(allow)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.written >= self.fail_after_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated broken pipe on flush",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn broken_pipe_does_not_erase_already_recorded_failures() {
+        let counterexample = LiftSummary {
+            counterexamples: 1,
+            compile_errors: 0,
+            parse_errors: 0,
+        };
+        assert!(matches!(
+            counterexample.into_result(true),
+            Err(CliError::Message(msg)) if msg.contains("1 counterexample")
+        ));
+
+        let compile_err = LiftSummary {
+            counterexamples: 0,
+            compile_errors: 1,
+            parse_errors: 0,
+        };
+        assert!(matches!(
+            compile_err.into_result(true),
+            Err(CliError::Message(msg)) if msg.contains("1 compile error")
+        ));
+
+        let parse_err = LiftSummary {
+            counterexamples: 0,
+            compile_errors: 0,
+            parse_errors: 1,
+        };
+        assert!(matches!(
+            parse_err.into_result(true),
+            Err(CliError::Message(msg)) if msg.contains("failed to parse 1 BHAV")
+        ));
+
+        let clean = LiftSummary::default();
+        assert!(matches!(clean.into_result(true), Err(CliError::BrokenPipe)));
+    }
+
+    #[test]
+    fn bulk_parse_error_still_fails_even_when_stdout_hits_broken_pipe() {
+        let iff_bytes = write_iff(&[ChunkData {
+            tag: *b"BHAV",
+            id: 4096,
+            flags: 0,
+            label: "Truncated".to_owned(),
+            data: vec![0x02, 0x80], // truncated header
+        }])
+        .expect("write_iff");
+        let iff = Iff::parse(iff_bytes).expect("Iff::parse");
+        let chunks: Vec<_> = iff.all(b"BHAV").collect();
+        let mut out = OutWriter::from_writer(FailWithBrokenPipe {
+            fail_after_bytes: 0,
+            written: 0,
+        });
+        let res = emit_lifted_bhavs(&iff, &chunks, "test.iff", None, false, false, &mut out);
+        assert!(matches!(
+            res,
+            Err(CliError::Message(msg)) if msg.contains("failed to parse 1 BHAV")
+        ));
     }
 }

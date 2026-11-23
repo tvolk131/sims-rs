@@ -584,6 +584,7 @@ impl<'a> TreeBuilder<'a> {
                 index: usize::from(*n),
                 span,
             },
+            Target::Raw(b) => PendingTarget::Resolved(*b),
             Target::ReturnTrue => PendingTarget::Resolved(TARGET_TRUE),
             Target::ReturnFalse => PendingTarget::Resolved(TARGET_FALSE),
             Target::Error => PendingTarget::Resolved(TARGET_ERROR),
@@ -1574,6 +1575,6 @@ fn lower_tree(tree: &TreeDecl, symbols: &ModuleSymbols) -> Result<BhavChunk> {
         locals,
         revision: tree.header.revision,
         instructions,
-        trailing: Vec::new(),
+        trailing: tree.header.trailing.clone(),
     })
 }

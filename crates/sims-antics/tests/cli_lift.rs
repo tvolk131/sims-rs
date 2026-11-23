@@ -5,7 +5,9 @@
 
 use sims_antics::encode::encode_bhav;
 use sims_antics::ir::BhavChunk;
-use sims_antics::{compile_pack_dir, package_far};
+use sims_antics::{
+    EquivOptions, EquivResult, check_bhav_equivalent, compile_antics, compile_pack_dir, package_far,
+};
 use sims_formats::behavior::Instruction;
 use sims_formats::iff::{ChunkData, write as write_iff};
 use std::collections::BTreeSet;
@@ -98,10 +100,16 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
     let fridge_path = tmp.path().join("open_fridge.iff");
     std::fs::write(&fridge_path, &fridge.object.iff_bytes).expect("write open_fridge.iff");
 
+    let cwd = tmp.path().join("cwd");
+    std::fs::create_dir_all(&cwd).expect("create empty cwd");
     let before_files = list_dir_entries(tmp.path());
+    let before_cwd = list_dir_entries(&cwd);
+    let before_far_bytes = std::fs::read(&far_path).expect("read far before");
+    let before_fridge_bytes = std::fs::read(&fridge_path).expect("read fridge before");
 
     // 1. `lift <open-pack.far> --list` lists all 20 `.iff` entries in sorted order.
     let list_far = Command::new(cli_bin())
+        .current_dir(&cwd)
         .args(["lift"])
         .arg(&far_path)
         .arg("--list")
@@ -129,6 +137,7 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
 
     // 2. `lift <open-pack.far> --list --filter TV` filters case-insensitively.
     let filter_far = Command::new(cli_bin())
+        .current_dir(&cwd)
         .args(["lift"])
         .arg(&far_path)
         .args(["--list", "--filter", "TV"])
@@ -147,6 +156,7 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
 
     // 3. `lift <open-pack.far> --entry open_tv.iff --list` prints sorted BHAV table.
     let list_tv = Command::new(cli_bin())
+        .current_dir(&cwd)
         .args(["lift"])
         .arg(&far_path)
         .args(["--entry", "open_tv.iff", "--list"])
@@ -175,6 +185,7 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
 
     // 3b. `--list --filter` on BHAVs matches both name and hex ID.
     let filter_tv = Command::new(cli_bin())
+        .current_dir(&cwd)
         .args(["lift"])
         .arg(&far_path)
         .args(["--entry", "open_tv.iff", "--list", "--filter", "0x1007"])
@@ -187,6 +198,7 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
 
     // 4. `lift <open-pack.far> --entry open_tv.iff --tree 4103 --verify-equiv`
     let watch_tv = Command::new(cli_bin())
+        .current_dir(&cwd)
         .args(["lift"])
         .arg(&far_path)
         .args(["--entry", "open_tv.iff", "--tree", "4103", "--verify-equiv"])
@@ -211,6 +223,7 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
 
     // 4b. Hex `--tree 0x1007` produces identical output.
     let watch_hex = Command::new(cli_bin())
+        .current_dir(&cwd)
         .args(["lift"])
         .arg(&far_path)
         .args([
@@ -227,6 +240,7 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
 
     // 5. `lift <open_fridge.iff> --raw --tree 4099` emits low-level byte-exact `.antics`.
     let fridge_raw = Command::new(cli_bin())
+        .current_dir(&cwd)
         .args(["lift"])
         .arg(&fridge_path)
         .args(["--raw", "--tree", "4099"])
@@ -237,16 +251,25 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
         "stderr: {}",
         String::from_utf8_lossy(&fridge_raw.stderr)
     );
-    let raw_stdout = String::from_utf8_lossy(&fridge_raw.stdout);
+    let raw_stdout = String::from_utf8(fridge_raw.stdout).expect("utf8 stdout");
     assert!(
         raw_stdout.contains("tree 4099 \"CookMeal\""),
         "{raw_stdout}"
     );
     assert!(raw_stdout.contains("@n0:"), "{raw_stdout}");
     assert!(raw_stdout.contains("op 0x"), "{raw_stdout}");
+    let raw_recompiled = compile_antics(&raw_stdout).expect("raw fridge tree compiles");
+    let orig_fridge_4099 = encode_bhav(&fridge.object.behaviors[&4099]).expect("encode orig 4099");
+    let rt_fridge_4099 =
+        encode_bhav(&raw_recompiled.behaviors[&4099]).expect("encode roundtripped 4099");
+    assert_eq!(
+        rt_fridge_4099, orig_fridge_4099,
+        "raw lift of open_fridge.iff #4099 must round-trip byte-for-byte"
+    );
 
     // 5b. Lifting all BHAVs of `open_tv.iff` with `--verify-equiv` succeeds with 0 raw ops.
     let all_tv = Command::new(cli_bin())
+        .current_dir(&cwd)
         .args(["lift"])
         .arg(&far_path)
         .args(["--entry", "open_tv.iff", "--verify-equiv"])
@@ -268,6 +291,7 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
 
     // 5c. Lifting with `--filter` (without `--list`) lifts only matching trees.
     let filtered_lift = Command::new(cli_bin())
+        .current_dir(&cwd)
         .args(["lift"])
         .arg(&far_path)
         .args(["--entry", "open_tv.iff", "--filter", "WatchTv"])
@@ -284,11 +308,27 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
         "{filtered_lift_out}"
     );
 
-    // 6. Verify stdout-only guarantee: zero files created in temp dir.
+    // 6. Verify stdout-only guarantee: zero files created in temp dir or cwd, and inputs unchanged.
     let after_files = list_dir_entries(tmp.path());
+    let after_cwd = list_dir_entries(&cwd);
     assert_eq!(
         before_files, after_files,
-        "lift must never write files to disk"
+        "lift must never write files to fixture dir"
+    );
+    assert_eq!(
+        before_cwd, after_cwd,
+        "lift must never write files to working directory"
+    );
+    assert!(after_cwd.is_empty(), "cwd must remain empty");
+    assert_eq!(
+        before_far_bytes,
+        std::fs::read(&far_path).expect("read far after"),
+        "lift must never modify input .far"
+    );
+    assert_eq!(
+        before_fridge_bytes,
+        std::fs::read(&fridge_path).expect("read fridge after"),
+        "lift must never modify input .iff"
     );
 }
 
@@ -664,4 +704,387 @@ fn lift_handles_broken_pipe_cleanly_without_panicking() {
         "expected empty stderr on broken pipe, got: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn lift_raw_preserves_trailing_bytes_out_of_range_targets_and_escapes_control_labels() {
+    let orig = BhavChunk {
+        id: 4096,
+        label: "Raw\x1b[31mTest\x07\x7f0m".to_owned(),
+        format: 0x8002,
+        kind: 0,
+        args: 2,
+        locals: 3,
+        revision: 0x1234_5678,
+        instructions: vec![Instruction {
+            opcode: 0x0042,
+            // Out-of-range node target (5 >= 1) and reserved byte 251 (0xfb).
+            on_true: 0x05,
+            on_false: 0xfb,
+            operands: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+        }],
+        trailing: vec![0xDE, 0xAD, 0xBE, 0xEF],
+    };
+    let orig_payload = encode_bhav(&orig).expect("encode orig BHAV");
+    let iff_bytes = synthetic_bhav_iff(std::slice::from_ref(&orig));
+
+    let tmp = CleanupDir::new("raw-roundtrip");
+    let iff_path = tmp.path().join("raw_exact.iff");
+    std::fs::write(&iff_path, &iff_bytes).expect("write iff");
+
+    let out = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&iff_path)
+        .args(["--raw", "--tree", "4096"])
+        .output()
+        .expect("run lift --raw");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    // Must not emit raw ASCII ESC/BEL/DEL control bytes to stdout.
+    assert!(
+        !stdout.contains('\x1b'),
+        "raw ESC leaked to stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains('\x07'),
+        "raw BEL leaked to stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains('\x7f'),
+        "raw DEL leaked to stdout: {stdout}"
+    );
+    assert!(stdout.contains("\\x1b"), "{stdout}");
+    assert!(stdout.contains("raw(0x05)"), "{stdout}");
+    assert!(stdout.contains("raw(0xfb)"), "{stdout}");
+    assert!(
+        stdout.contains("trailing: [0xde, 0xad, 0xbe, 0xef]"),
+        "{stdout}"
+    );
+
+    // Recompile stdout in memory and compare encoded BHAV payload byte-for-byte.
+    let compiled = compile_antics(&stdout).expect("raw lift output must compile cleanly");
+    let roundtripped = compiled.behaviors.get(&4096).expect("compiled tree 4096");
+    assert_eq!(
+        roundtripped.label, orig.label,
+        "label must round-trip losslessly"
+    );
+    let roundtripped_payload = encode_bhav(roundtripped).expect("encode roundtripped BHAV");
+    assert_eq!(
+        roundtripped_payload, orig_payload,
+        "raw lifted output must re-encode byte-for-byte identically"
+    );
+
+    // Also verify Unicode C1 CSI (`U+009B`) is escaped in `format_bhav_antics` and round-trips.
+    let c1_tree = BhavChunk {
+        label: "C1\u{009b}31m".to_owned(),
+        ..orig
+    };
+    let c1_src = sims_antics::lift::format_bhav_antics(&c1_tree);
+    assert!(!c1_src.contains('\u{009b}'), "{c1_src}");
+    let c1_rt = compile_antics(&c1_src).expect("C1 escaped source compiles");
+    assert_eq!(c1_rt.behaviors[&4096].label, c1_tree.label);
+}
+
+#[test]
+fn lift_unicode_windows1252_case_folding_and_ambiguity() {
+    let make_iff = |label: &str, val: u8| {
+        synthetic_bhav_iff(&[BhavChunk {
+            id: 4096,
+            label: label.to_owned(),
+            format: 0x8002,
+            kind: 0,
+            args: 0,
+            locals: 0,
+            revision: 0,
+            instructions: vec![Instruction {
+                opcode: 2,
+                on_true: 0xFE,
+                on_false: 0xFE,
+                operands: [0, 0, val, 0, 0, 5, 0, 7],
+            }],
+            trailing: Vec::new(),
+        }])
+    };
+
+    let sink_iff = make_iff("EvierInit", 11);
+    let cafe_a = make_iff("CafeA", 21);
+    let cafe_b = make_iff("CafeB", 22);
+
+    let far_bytes = package_far(&[
+        ("Objets\\Évier.iff", &sink_iff),
+        ("Objets\\Alpha\\Café.iff", &cafe_a),
+        ("Objets\\Beta\\café.iff", &cafe_b),
+    ])
+    .expect("package_far with Windows-1252 names");
+
+    let tmp = CleanupDir::new("win1252-case");
+    let far_path = tmp.path().join("french.far");
+    std::fs::write(&far_path, &far_bytes).expect("write french.far");
+
+    // Case-insensitive exact match across `É` / `é` and `\` / `/`.
+    let exact_ci = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&far_path)
+        .args(["--entry", "objets/évier.iff", "--tree", "4096"])
+        .output()
+        .expect("case-folded accented exact match");
+    assert!(
+        exact_ci.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exact_ci.stderr)
+    );
+    assert!(String::from_utf8_lossy(&exact_ci.stdout).contains("my.attr[0] := 11"));
+
+    // Unique basename match across `É` / `é`.
+    let basename_ci = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&far_path)
+        .args(["--entry", "évier.iff", "--tree", "4096"])
+        .output()
+        .expect("case-folded accented basename match");
+    assert!(
+        basename_ci.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&basename_ci.stderr)
+    );
+    assert!(String::from_utf8_lossy(&basename_ci.stdout).contains("my.attr[0] := 11"));
+
+    // Ambiguous accented match (`Café.iff` vs `café.iff` queried as `CAFÉ.IFF`).
+    let ambig = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&far_path)
+        .args(["--entry", "CAFÉ.IFF", "--tree", "4096"])
+        .output()
+        .expect("ambiguous accented match");
+    assert!(!ambig.status.success());
+    let stderr = String::from_utf8_lossy(&ambig.stderr);
+    assert!(stderr.contains("ambiguous"), "{stderr}");
+    assert!(stderr.contains("Objets\\Alpha\\Café.iff"), "{stderr}");
+    assert!(stderr.contains("Objets\\Beta\\café.iff"), "{stderr}");
+}
+
+#[test]
+fn lift_0x8002_high_byte_locals_matches_vm_frame_dimensions() {
+    // Format 0x8002 with locals = 0x0100: `sims-vm` truncates locals to u8 (0 locals),
+    // so assigning `local[0] := 1` traps at runtime. Structured lifting must NOT promote
+    // this to `locals: 255`, and the equivalence checker must detect divergence against
+    // a 1-local tree.
+    let orig = BhavChunk {
+        id: 4096,
+        label: "HighByteLocals".to_owned(),
+        format: 0x8002,
+        kind: 0,
+        args: 0,
+        locals: 0x0100,
+        revision: 0,
+        instructions: vec![Instruction {
+            opcode: 2,
+            on_true: 0xFE,
+            on_false: 0xFF,
+            // local[0] := 1 (scope 25 = local, op 5 = Set, scope 7 = literal 1)
+            operands: [0, 0, 1, 0, 0, 5, 25, 7],
+        }],
+        trailing: Vec::new(),
+    };
+    let one_local = BhavChunk {
+        locals: 1,
+        ..orig.clone()
+    };
+
+    // Equivalence checker must report Counterexample (0 effective locals vs 1 local).
+    let eq = check_bhav_equivalent(&orig, &one_local, &EquivOptions::default());
+    assert!(
+        matches!(eq, EquivResult::Counterexample { .. }),
+        "expected Counterexample when original has 0x0100 (0 effective) locals vs 1 local, got {eq:?}"
+    );
+
+    // CLI `lift --verify-equiv` must fall back to raw instead of falsely lifting + reporting Equivalent.
+    let tmp = CleanupDir::new("high-byte-locals");
+    let iff_path = tmp.path().join("high_locals.iff");
+    std::fs::write(&iff_path, synthetic_bhav_iff(&[orig])).expect("write iff");
+
+    let out = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&iff_path)
+        .args(["--tree", "4096", "--verify-equiv"])
+        .output()
+        .expect("run lift on 0x0100 locals");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("structured lift fallback"), "{stdout}");
+    assert!(
+        !stdout.contains("// verify-equiv: Equivalent"),
+        "must not falsely report Equivalent on 0x0100 locals:\n{stdout}"
+    );
+}
+
+#[test]
+fn lift_bulk_returns_nonzero_when_any_bhav_is_malformed() {
+    let valid = BhavChunk {
+        id: 4096,
+        label: "ValidTree".to_owned(),
+        format: 0x8002,
+        kind: 0,
+        args: 0,
+        locals: 0,
+        revision: 0,
+        instructions: vec![Instruction {
+            opcode: 2,
+            on_true: 0xFE,
+            on_false: 0xFE,
+            operands: [0, 0, 1, 0, 0, 5, 0, 7],
+        }],
+        trailing: Vec::new(),
+    };
+    let iff_bytes = write_iff(&[
+        ChunkData {
+            tag: *b"BHAV",
+            id: valid.id,
+            flags: 0,
+            label: valid.label.clone(),
+            data: encode_bhav(&valid).expect("encode valid"),
+        },
+        ChunkData {
+            tag: *b"BHAV",
+            id: 4097,
+            flags: 0,
+            label: "TruncatedTree".to_owned(),
+            data: vec![0x02, 0x80, 0x01],
+        },
+    ])
+    .expect("write mixed iff");
+
+    let tmp = CleanupDir::new("bulk-malformed");
+    let iff_path = tmp.path().join("mixed.iff");
+    std::fs::write(&iff_path, &iff_bytes).expect("write mixed.iff");
+
+    let out = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&iff_path)
+        .output()
+        .expect("run bulk lift on mixed iff");
+    assert!(
+        !out.status.success(),
+        "bulk lift must fail when a BHAV fails to parse"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ValidTree"),
+        "valid BHAV should still be emitted:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("failed to parse BHAV"),
+        "malformed BHAV comment should be emitted:\n{stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("failed to parse 1 BHAV"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// Subprocess hang-watchdog timeout in a CLI integration test (not simulation logic).
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn lift_rejects_unix_fifo_without_blocking() {
+    use std::time::{Duration, Instant};
+
+    let tmp = CleanupDir::new("fifo");
+    let fifo_path = tmp.path().join("pipe.iff");
+    let status = Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("mkfifo should be available on Unix");
+    assert!(status.success(), "mkfifo failed");
+
+    let mut child = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&fifo_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sims-antics lift on fifo");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let exited = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break Some(st);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let st = exited.expect("sims-antics lift blocked on FIFO instead of rejecting it");
+    assert!(!st.success(), "FIFO input must exit non-zero");
+    let mut stderr = String::new();
+    if let Some(mut err_pipe) = child.stderr.take() {
+        let _ = err_pipe.read_to_string(&mut stderr);
+    }
+    assert!(stderr.contains("not a regular file"), "stderr: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn lift_handles_non_utf8_unix_path_without_panicking() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let tmp = CleanupDir::new("non-utf8");
+    let mut raw_path = tmp.path().as_os_str().as_encoded_bytes().to_vec();
+    raw_path.push(b'/');
+    raw_path.extend_from_slice(b"bad_\xff_name.iff");
+    let os_path = OsString::from_vec(raw_path);
+
+    // On filesystems that allow non-UTF-8 filenames (e.g. Linux ext4), write a real IFF and
+    // verify `lift` succeeds; on filesystems that reject invalid UTF-8 (e.g. macOS APFS),
+    // verify `lift` returns a clean error and does NOT panic.
+    let valid_iff = synthetic_bhav_iff(&[BhavChunk {
+        id: 4096,
+        label: "NonUtf8PathTree".to_owned(),
+        format: 0x8002,
+        kind: 0,
+        args: 0,
+        locals: 0,
+        revision: 0,
+        instructions: vec![Instruction {
+            opcode: 2,
+            on_true: 0xFE,
+            on_false: 0xFE,
+            operands: [0, 0, 7, 0, 0, 5, 0, 7],
+        }],
+        trailing: Vec::new(),
+    }]);
+    let created = std::fs::write(&os_path, &valid_iff).is_ok();
+
+    let out = Command::new(cli_bin())
+        .arg("lift")
+        .arg(&os_path)
+        .arg("--tree")
+        .arg("4096")
+        .output()
+        .expect("run lift with non-UTF-8 path");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "CLI panicked on non-UTF-8 path: {stderr}"
+    );
+    if created {
+        assert!(out.status.success(), "stderr: {stderr}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("my.attr[0] := 7"));
+    } else {
+        assert!(!out.status.success());
+    }
 }
