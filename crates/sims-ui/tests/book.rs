@@ -248,11 +248,24 @@ fn reference_book_renders_across_viewports_and_live_install() {
     magic_snap.use_magic_book_chrome = true;
     magic_snap.pages[0].category = Some(spells[0].category);
     let magic_layout = dlg.layout([800, 600], &magic_snap);
-    assert_eq!(magic_layout.dialog.width, sims_ui::book::MAGIC_BOOK_NATIVE_WIDTH);
-    assert_eq!(magic_layout.dialog.height, sims_ui::book::MAGIC_BOOK_NATIVE_HEIGHT);
+    assert_eq!(
+        magic_layout.dialog.width,
+        sims_ui::book::MAGIC_BOOK_NATIVE_WIDTH
+    );
+    assert_eq!(
+        magic_layout.dialog.height,
+        sims_ui::book::MAGIC_BOOK_NATIVE_HEIGHT
+    );
     let mut magic_frame = Frame::new(800, 600, [0, 0, 0]);
     dlg.draw(&mut magic_frame, &magic_snap, &live_strings, &live_art);
-    assert!(magic_frame.rgb().iter().filter(|&&p| p != [0, 0, 0]).count() > 200_000);
+    assert!(
+        magic_frame
+            .rgb()
+            .iter()
+            .filter(|&&p| p != [0, 0, 0])
+            .count()
+            > 200_000
+    );
 
     let credits = load_credits_pages(&install, 1).expect("load credits pages");
     assert!(credits.len() >= 5, "expected multi-page credits catalog");

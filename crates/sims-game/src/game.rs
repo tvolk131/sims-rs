@@ -63,8 +63,10 @@ use sims_ui::coop::{
     CoopSnapshot, LobbyTab,
 };
 use sims_ui::dialog::DialogFadeState;
-use sims_ui::phonebook::{PhoneBookCommand, PhoneBookDialog, PhoneBookEntry, PhoneBookSnapshot};
 use sims_ui::options::{LotVisibility, OptionsState};
+use sims_ui::phonebook::{
+    PhoneBookCommand, PhoneBookDialog, PhoneBookEntry, PhoneBookSnapshot, PhoneBookStrings,
+};
 use sims_ui::queue::QueueSlideState;
 use sims_ui::shop::{
     CurrencyKind, ShopCommand, ShopItem, ShopKind, ShopPickerDialog, ShopSnapshot, ShopStrings,
@@ -220,10 +222,20 @@ struct ShopPreviewTarget {
     person: u16,
     suit: String,
     row: Option<String>,
-    /// `Some(false)` = Dog (`"dog"` skeleton), `Some(true)` = Cat (`"kat"` skeleton), `None` = Human.
-    pet_is_cat: Option<bool>,
-    /// Optional head override `(appearance, texture)` for full-body Charm Transform costumes.
-    head_override: Option<(String, String)>,
+    /// For a pet adoption preview, the pet's skeleton (its type's body
+    /// string 0, `STR# 200[0]`); `None` renders a human with a head.
+    pet_skeleton: Option<String>,
+}
+
+impl ShopPreviewTarget {
+    fn human(person: u16, suit: String, row: Option<String>) -> Self {
+        Self {
+            person,
+            suit,
+            row,
+            pet_skeleton: None,
+        }
+    }
 }
 
 /// Active VM special panel (`Dialog` kinds `5..=15`) currently presented in UI.
@@ -367,6 +379,7 @@ pub struct Game {
     /// for `Dialog` kind 10 (`CallNeighbor`).
     phonebook_dialog: PhoneBookDialog,
     phonebook_art: Option<Art>,
+    phonebook_strings: Option<PhoneBookStrings>,
     phonebook_snapshot: Option<PhoneBookSnapshot>,
     /// Real graphical destination map picker for VM special lot pickers
     /// (`Dialog` kinds `5, 7, 8, 11, 13`: Downtown, Vacation, Old Town,
@@ -1087,6 +1100,7 @@ impl Game {
             book_snapshot: None,
             phonebook_dialog: PhoneBookDialog::new(),
             phonebook_art: None,
+            phonebook_strings: None,
             phonebook_snapshot: None,
             destination_picker: None,
             destination_picker_assets: None,
@@ -1476,6 +1490,7 @@ impl Game {
             book_snapshot: None,
             phonebook_dialog: PhoneBookDialog::new(),
             phonebook_art: None,
+            phonebook_strings: None,
             phonebook_snapshot: None,
             destination_picker: None,
             destination_picker_assets: None,
@@ -1821,6 +1836,7 @@ impl Game {
             book_snapshot: None,
             phonebook_dialog: PhoneBookDialog::new(),
             phonebook_art: None,
+            phonebook_strings: None,
             phonebook_snapshot: None,
             destination_picker: None,
             destination_picker_assets: None,
@@ -2027,6 +2043,7 @@ impl Game {
             book_snapshot: None,
             phonebook_dialog: PhoneBookDialog::new(),
             phonebook_art: None,
+            phonebook_strings: None,
             phonebook_snapshot: None,
             destination_picker: None,
             destination_picker_assets: None,
@@ -2983,49 +3000,6 @@ impl Game {
                 DialogKey::Enter => self.phonebook_submit(),
                 DialogKey::Escape => self.phonebook_escape(),
                 _ => Outcome::default(),
-            };
-        }
-        if self.phonebook_dialog.is_open() {
-            if let Some(snapshot) = &self.phonebook_snapshot {
-                let size = [
-                    self.view.size[0].max(1) as u32,
-                    self.view.size[1].max(1) as u32,
-                ];
-                self.phonebook_dialog
-                    .pointer_move(size, snapshot, point[0], point[1]);
-            }
-            return true;
-        }
-        if self.phonebook_dialog.is_open() {
-            self.pointer = Some(point);
-            if let Some(snapshot) = &self.phonebook_snapshot {
-                let size = [
-                    self.view.size[0].max(1) as u32,
-                    self.view.size[1].max(1) as u32,
-                ];
-                let changed = self
-                    .phonebook_dialog
-                    .pointer_down(size, snapshot, point[0], point[1]);
-                return Outcome {
-                    redraw: changed,
-                    ..Outcome::default()
-                };
-            }
-            return Outcome::default();
-        }
-        if self.phonebook_dialog.is_open() {
-            self.pointer = Some(point);
-            let cmd = self.phonebook_snapshot.as_ref().and_then(|snap| {
-                let size = [
-                    self.view.size[0].max(1) as u32,
-                    self.view.size[1].max(1) as u32,
-                ];
-                self.phonebook_dialog
-                    .pointer_up(size, snap, point[0], point[1])
-            });
-            return match cmd {
-                Some(cmd) => self.execute_phonebook_command(cmd),
-                None => Outcome::redraw(),
             };
         }
         if self.book_dialog.is_open() {
@@ -4533,13 +4507,6 @@ impl Game {
             return true;
         }
         if self.phonebook_dialog.is_open() {
-            return match key {
-                DialogKey::Enter => self.phonebook_submit(),
-                DialogKey::Escape => self.phonebook_escape(),
-                _ => Outcome::default(),
-            };
-        }
-        if self.phonebook_dialog.is_open() {
             if let Some(snapshot) = &self.phonebook_snapshot {
                 let size = [
                     self.view.size[0].max(1) as u32,
@@ -4549,38 +4516,6 @@ impl Game {
                     .pointer_move(size, snapshot, point[0], point[1]);
             }
             return true;
-        }
-        if self.phonebook_dialog.is_open() {
-            self.pointer = Some(point);
-            if let Some(snapshot) = &self.phonebook_snapshot {
-                let size = [
-                    self.view.size[0].max(1) as u32,
-                    self.view.size[1].max(1) as u32,
-                ];
-                let changed = self
-                    .phonebook_dialog
-                    .pointer_down(size, snapshot, point[0], point[1]);
-                return Outcome {
-                    redraw: changed,
-                    ..Outcome::default()
-                };
-            }
-            return Outcome::default();
-        }
-        if self.phonebook_dialog.is_open() {
-            self.pointer = Some(point);
-            let cmd = self.phonebook_snapshot.as_ref().and_then(|snap| {
-                let size = [
-                    self.view.size[0].max(1) as u32,
-                    self.view.size[1].max(1) as u32,
-                ];
-                self.phonebook_dialog
-                    .pointer_up(size, snap, point[0], point[1])
-            });
-            return match cmd {
-                Some(cmd) => self.execute_phonebook_command(cmd),
-                None => Outcome::redraw(),
-            };
         }
         if self.book_dialog.is_open() {
             if let Some(snapshot) = &self.book_snapshot {
@@ -4658,24 +4593,6 @@ impl Game {
             return Outcome::default();
         }
         if self.phonebook_dialog.is_open() {
-            return match key {
-                DialogKey::Enter => self.phonebook_submit(),
-                DialogKey::Escape => self.phonebook_escape(),
-                _ => Outcome::default(),
-            };
-        }
-        if self.phonebook_dialog.is_open() {
-            if let Some(snapshot) = &self.phonebook_snapshot {
-                let size = [
-                    self.view.size[0].max(1) as u32,
-                    self.view.size[1].max(1) as u32,
-                ];
-                self.phonebook_dialog
-                    .pointer_move(size, snapshot, point[0], point[1]);
-            }
-            return true;
-        }
-        if self.phonebook_dialog.is_open() {
             self.pointer = Some(point);
             if let Some(snapshot) = &self.phonebook_snapshot {
                 let size = [
@@ -4691,21 +4608,6 @@ impl Game {
                 };
             }
             return Outcome::default();
-        }
-        if self.phonebook_dialog.is_open() {
-            self.pointer = Some(point);
-            let cmd = self.phonebook_snapshot.as_ref().and_then(|snap| {
-                let size = [
-                    self.view.size[0].max(1) as u32,
-                    self.view.size[1].max(1) as u32,
-                ];
-                self.phonebook_dialog
-                    .pointer_up(size, snap, point[0], point[1])
-            });
-            return match cmd {
-                Some(cmd) => self.execute_phonebook_command(cmd),
-                None => Outcome::redraw(),
-            };
         }
         if self.book_dialog.is_open() {
             self.pointer = Some(point);
@@ -5016,41 +4918,6 @@ impl Game {
                 Some(cmd) => self.execute_shop_command(cmd),
                 None => Outcome::redraw(),
             };
-        }
-        if self.phonebook_dialog.is_open() {
-            return match key {
-                DialogKey::Enter => self.phonebook_submit(),
-                DialogKey::Escape => self.phonebook_escape(),
-                _ => Outcome::default(),
-            };
-        }
-        if self.phonebook_dialog.is_open() {
-            if let Some(snapshot) = &self.phonebook_snapshot {
-                let size = [
-                    self.view.size[0].max(1) as u32,
-                    self.view.size[1].max(1) as u32,
-                ];
-                self.phonebook_dialog
-                    .pointer_move(size, snapshot, point[0], point[1]);
-            }
-            return true;
-        }
-        if self.phonebook_dialog.is_open() {
-            self.pointer = Some(point);
-            if let Some(snapshot) = &self.phonebook_snapshot {
-                let size = [
-                    self.view.size[0].max(1) as u32,
-                    self.view.size[1].max(1) as u32,
-                ];
-                let changed = self
-                    .phonebook_dialog
-                    .pointer_down(size, snapshot, point[0], point[1]);
-                return Outcome {
-                    redraw: changed,
-                    ..Outcome::default()
-                };
-            }
-            return Outcome::default();
         }
         if self.phonebook_dialog.is_open() {
             self.pointer = Some(point);
@@ -9260,6 +9127,7 @@ impl Game {
             tried_on_item_id: None,
             preview_image: None,
             preview_label: None,
+            hide_wallet_and_prices: false,
         });
         self.shop_preview_yaw_deg = 0;
         self.shop_preview_body = None;
@@ -9808,11 +9676,7 @@ impl Game {
                 if let Some((suit, row)) = everyday_rows.get(idx) {
                     targets.insert(
                         item.id.clone(),
-                        ShopPreviewTarget {
-                            person,
-                            suit: suit.clone(),
-                            row: Some(row.clone()),
-                        },
+                        ShopPreviewTarget::human(person, suit.clone(), Some(row.clone())),
                     );
                 }
             }
@@ -9845,11 +9709,7 @@ impl Game {
             if let Some(suit) = category_suits.get(idx) {
                 targets.insert(
                     item.id.clone(),
-                    ShopPreviewTarget {
-                        person,
-                        suit: suit.clone(),
-                        row: None,
-                    },
+                    ShopPreviewTarget::human(person, suit.clone(), None),
                 );
             }
         }
@@ -9951,6 +9811,9 @@ impl Game {
         target: Option<&ShopPreviewTarget>,
     ) -> Option<sims_formats::bitmap::Image> {
         let target = target?;
+        if let Some(skeleton) = target.pet_skeleton.clone() {
+            return self.render_pet_try_on_image(item_id, target, &skeleton);
+        }
         let world = self
             .lot
             .asking_special_panel()
@@ -10068,6 +9931,48 @@ impl Game {
         })
     }
 
+    /// Renders a pet adoption candidate on the pet's own skeleton: the
+    /// picked body (`BODY=` row) alone, as pets wear no head or hands.
+    fn render_pet_try_on_image(
+        &mut self,
+        item_id: &str,
+        target: &ShopPreviewTarget,
+        skeleton: &str,
+    ) -> Option<sims_formats::bitmap::Image> {
+        if self
+            .shop_preview_body
+            .as_ref()
+            .is_none_or(|(id, _)| id != item_id)
+        {
+            let row = target.row.as_deref()?;
+            let (app, tex) = sims_people::appearance::body_string(row);
+            let app = if app.is_empty() {
+                target.suit.clone()
+            } else {
+                app
+            };
+            let assets = self.ensure_shop_preview_assets()?;
+            let outfit = sims_people::appearance::Outfit {
+                parts: vec![(app, tex)],
+            };
+            let body = sims_people::appearance::Body::load(assets, skeleton, &outfit).ok()?;
+            self.shop_preview_body = Some((item_id.to_owned(), body));
+        }
+        let (_, body) = self.shop_preview_body.as_ref()?;
+        let yaw = sims_people::caf_preview::TURNTABLE_BASE_YAW
+            + f32::from(self.shop_preview_yaw_deg).to_radians();
+        let params = sims_people::caf_preview::TurntableParams {
+            yaw,
+            ..sims_people::caf_preview::TurntableParams::default()
+        };
+        let canvas = sims_people::caf_preview::render_turntable(body, None, &params).ok()?;
+        Some(sims_formats::bitmap::Image {
+            width: canvas.width,
+            height: canvas.height,
+            rgba: canvas.rgba,
+        })
+    }
+
     // -------------------------------------------------------------------------
     // Special Dialog Panels (`Dialog` kinds `5..=15`, single-player & co-op)
     // -------------------------------------------------------------------------
@@ -10084,6 +9989,8 @@ impl Game {
             self.shop_preview_targets.clear();
             self.book_dialog.close();
             self.book_snapshot = None;
+            self.phonebook_dialog.close();
+            self.phonebook_snapshot = None;
             self.destination_picker = None;
             self.hud.close_special_book_dialog();
         }
@@ -10131,6 +10038,8 @@ impl Game {
         self.hud.close_special_book_dialog();
         self.book_dialog.close();
         self.book_snapshot = None;
+        self.phonebook_dialog.close();
+        self.phonebook_snapshot = None;
         self.destination_picker = None;
         self.shop_dialog.close();
         self.shop_snapshot = None;
@@ -10225,7 +10134,8 @@ impl Game {
             }
             SpecialPanelRequest::PetPicker { pet } => {
                 let shopper = self.person_display_name(&asking.world, *pet);
-                let (items, responses) = self.build_pet_picker_items(&asking.world, *pet);
+                let (items, responses, preview_targets) =
+                    self.build_pet_picker_items(&asking.world, *pet);
                 self.open_special_picker(
                     tick,
                     request,
@@ -10235,37 +10145,22 @@ impl Game {
                     shopper,
                     items,
                     responses,
-                    BTreeMap::new(),
+                    preview_targets,
                 );
             }
             SpecialPanelRequest::CallNeighbor { caller_neighbor } => {
-                let caller_name = asking
-                    .world
-                    .neighbors
-                    .slots
-                    .iter()
-                    .flatten()
-                    .find(|r| r.id == *caller_neighbor)
-                    .and_then(|r| {
-                        self.lot
-                            .character_names()
-                            .get(&r.guid)
-                            .cloned()
-                            .or_else(|| self.hud.name(r.guid).map(str::to_owned))
-                    });
-                let (items, responses) =
-                    self.build_call_neighbor_items(&asking.world, *caller_neighbor);
-                self.open_special_picker(
+                // Native `cWinPhoneBook` (`0x5221d0`) on `phonebookbkg.bmp`.
+                self.ensure_phonebook_assets();
+                let snapshot = self.build_phonebook_snapshot(&asking.world, *caller_neighbor);
+                self.phonebook_snapshot = Some(snapshot);
+                self.phonebook_dialog.open();
+                self.active_special_panel = Some(ActiveSpecialPanel {
                     tick,
                     request,
                     coop_dialog_id,
-                    ShopKind::DowntownBoutique(WardrobeCategory::Everyday),
-                    caller_name,
-                    None,
-                    items,
-                    responses,
-                    BTreeMap::new(),
-                );
+                    responses: BTreeMap::new(),
+                    preview_targets: BTreeMap::new(),
+                });
             }
             SpecialPanelRequest::CharmTransform { person } => {
                 let shopper = self.person_display_name(&asking.world, *person);
@@ -10311,6 +10206,9 @@ impl Game {
             tried_on_item_id: None,
             preview_image: None,
             preview_label: None,
+            // Special VM pickers carry no price: the calling object's own
+            // tree charges (if anything), so never show a bogus `$0` wallet.
+            hide_wallet_and_prices: true,
         });
         self.shop_preview_yaw_deg = 0;
         self.shop_preview_body = None;
@@ -10462,8 +10360,17 @@ impl Game {
         is_cookbook: bool,
     ) -> ReferenceBookSnapshot {
         let strings = self.book_strings.clone().unwrap_or_default();
-        let caller_name = caller.and_then(|id| self.person_display_name(world, id));
-        let title = strings.format_title(is_cookbook, caller_name.as_deref());
+        // `magic.iff STR# 1[0..1]` is `"%s Family Spellbook"` / `"%s Family
+        // Cookbook"`: the subject is the caller's family surname (`FAMs` of the
+        // family `person.data[61]` names), e.g. `"Goth Family Spellbook"`.
+        let surname = caller
+            .and_then(|id| world.objects.get(&id))
+            .and_then(|o| o.person.as_ref())
+            .and_then(|p| p.data.get(sims_sim::neighbors::FAMILY).copied())
+            .filter(|&fam| fam > 0)
+            .and_then(|fam| self.hud.family_surname(i32::from(fam)))
+            .map(str::to_owned);
+        let title = strings.format_title(is_cookbook, surname.as_deref());
 
         let neighbor_id = caller
             .and_then(|id| world.objects.get(&id))
@@ -10538,6 +10445,7 @@ impl Game {
             let highlight = !matched_badges.is_empty();
             pages.push(BookPage {
                 heading: None,
+                category: Some(entry.category),
                 entries: vec![BookEntry {
                     title: entry.title,
                     subtitle: None,
@@ -10560,6 +10468,7 @@ impl Game {
             };
             pages.push(BookPage {
                 heading: None,
+                category: None,
                 entries: vec![BookEntry {
                     title: title.clone(),
                     subtitle: None,
@@ -10575,6 +10484,7 @@ impl Game {
             subtitle: None,
             held_summary,
             pages,
+            use_magic_book_chrome: true,
         }
     }
 
@@ -10682,18 +10592,6 @@ impl Game {
             .collect()
     }
 
-    fn format_wardrobe_row_label(suit: &str, row: &str) -> String {
-        if let Some((_, desc)) = row.split_once(',')
-            && let Some((_, tex)) = desc.split_once('=')
-        {
-            let tex = tex.trim();
-            if !tex.is_empty() && !tex.eq_ignore_ascii_case(suit) {
-                return format!("{suit} ({tex})");
-            }
-        }
-        suit.to_owned()
-    }
-
     fn person_skin_tone(&self, world: &sims_sim::World, person: u16) -> String {
         let Some(obj) = world.objects.get(&person) else {
             return "lgt".into();
@@ -10743,6 +10641,24 @@ impl Game {
         self.ordered_wardrobe.as_ref()
     }
 
+    /// The caller's `(female, child)` from `person.data[65]` bit 0 and age
+    /// word 58.
+    fn person_sex_and_age(world: &sims_sim::World, person: u16) -> (bool, bool) {
+        world
+            .objects
+            .get(&person)
+            .and_then(|o| o.person.as_ref())
+            .map(|p| {
+                let kind = p.data.get(sims_sim::neighbors::KIND).copied().unwrap_or(0);
+                let age = p.data.get(58).copied().unwrap_or(27);
+                ((kind & 1) == 1, age < 18)
+            })
+            .unwrap_or((false, false))
+    }
+
+    /// `Dialog` kind 6 (`0x508f22`): every outfit of the mode's category the
+    /// caller can wear — matching sex (or unisex), age and skin tone — in
+    /// native wardrobe order, uncapped. Item `i` answers `Selection { index: i }`.
     fn build_wardrobe_picker_items(
         &mut self,
         world: &sims_sim::World,
@@ -10753,58 +10669,37 @@ impl Game {
         BTreeMap<String, SpecialPanelResponse>,
         BTreeMap<String, ShopPreviewTarget>,
     ) {
-        let mut entries: Vec<(usize, String, String, Option<String>)> = Vec::new();
-        if mode == 0 {
-            let (female, child) = world
-                .objects
-                .get(&person)
-                .and_then(|o| o.person.as_ref())
-                .map(|p| {
-                    let kind = p.data.get(sims_sim::neighbors::KIND).copied().unwrap_or(0);
-                    let age = p.data.get(58).copied().unwrap_or(27);
-                    ((kind & 1) == 1, age < 18)
-                })
-                .unwrap_or((false, false));
-            let skin = self.person_skin_tone(world, person);
-            if let Some(wardrobe) = self.ensure_ordered_wardrobe() {
-                let count = wardrobe.count(false, female, child, &skin).min(32);
-                for idx in 0..count {
-                    if let Some((suit, row)) = wardrobe.pick(false, female, child, &skin, idx) {
-                        let label = Self::format_wardrobe_row_label(&suit, &row);
-                        entries.push((idx, label, suit, Some(row)));
-                    }
-                }
-            }
-        }
-        if entries.is_empty() {
-            let prefix = match mode {
-                1 => "s",
-                2 => "f",
-                3 => "l",
-                4 => "w",
-                5 => "h",
-                _ => "b",
-            };
-            let names = self.scan_install_skin_names(
-                &["ExpansionShared/SkinsBuy", "GameData/Skins"],
-                Some(prefix),
-                32,
-            );
-            entries = names
-                .into_iter()
-                .enumerate()
-                .map(|(idx, suit)| (idx, suit.clone(), suit, None))
-                .collect();
-        }
-        let mut items = Vec::with_capacity(entries.len());
+        let (female, child) = Self::person_sex_and_age(world, person);
+        let skin = self.person_skin_tone(world, person);
+        let outfits = self
+            .ensure_ordered_wardrobe()
+            .map(|w| category_outfits(w, wardrobe_mode_category(mode), female, child, &skin))
+            .unwrap_or_default();
+        Self::outfit_picker_items("special_wardrobe", person, outfits)
+    }
+
+    /// Picker rows for human outfits: clean labels, no price, try-on enabled.
+    fn outfit_picker_items(
+        id_prefix: &str,
+        person: u16,
+        outfits: Vec<(String, String)>,
+    ) -> (
+        Vec<ShopItem>,
+        BTreeMap<String, SpecialPanelResponse>,
+        BTreeMap<String, ShopPreviewTarget>,
+    ) {
+        let mut items = Vec::with_capacity(outfits.len());
         let mut responses = BTreeMap::new();
         let mut preview_targets = BTreeMap::new();
-        for (idx, name, suit, row) in entries {
-            let id = format!("special_wardrobe:{idx}");
+        for (idx, (suit, row)) in outfits.into_iter().enumerate() {
+            let Ok(index) = i16::try_from(idx) else {
+                break;
+            };
+            let id = format!("{id_prefix}:{idx}");
             items.push(ShopItem {
                 id: id.clone(),
-                name,
-                description: format!("#{idx}"),
+                name: outfit_display_label(&suit, &row),
+                description: String::new(),
                 price: 0,
                 currency: CurrencyKind::Simoleons,
                 icon: None,
@@ -10816,65 +10711,123 @@ impl Game {
                 id.clone(),
                 SpecialPanelResponse::Selection {
                     accepted: true,
-                    index: idx as i16,
+                    index,
                 },
             );
-            preview_targets.insert(id, ShopPreviewTarget { person, suit, row });
+            preview_targets.insert(id, ShopPreviewTarget::human(person, suit, Some(row)));
         }
         (items, responses, preview_targets)
     }
 
+    /// `Dialog` kind 9 (`0x521788`): the pet bodies of the pen pet's species
+    /// in the exact `ImportWardrobe::pick_pet` order `Make New Character`
+    /// reads the answer with (`0x44b064`), uncapped, with breed and sex labels
+    /// and a 3D turntable preview on the pet's own skeleton.
     fn build_pet_picker_items(
         &mut self,
         world: &sims_sim::World,
         pet: u16,
-    ) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
-        let is_cat = world
+    ) -> (
+        Vec<ShopItem>,
+        BTreeMap<String, SpecialPanelResponse>,
+        BTreeMap<String, ShopPreviewTarget>,
+    ) {
+        let kind = world
             .objects
             .get(&pet)
             .and_then(|o| o.person.as_ref())
             .and_then(|p| p.data.get(sims_sim::neighbors::KIND).copied())
-            .is_some_and(|kind| {
-                sims_ui::household::PetKind::from_kind(kind)
-                    == Some(sims_ui::household::PetKind::Cat)
-            });
-        // Match `sims-vm`'s exact native `ImportWardrobe::pick_pet(is_cat, idx)` ordering.
-        let mut entries: Vec<(usize, String)> = Vec::new();
-        if let Some(wardrobe) = self.ensure_ordered_wardrobe() {
-            let count = wardrobe.count_pet(is_cat).min(64);
-            for idx in 0..count {
-                if let Some((suit, row)) = wardrobe.pick_pet(is_cat, idx) {
-                    let label = Self::format_wardrobe_row_label(&suit, &row);
-                    entries.push((idx, label));
-                }
-            }
-        }
-        let mut items = Vec::with_capacity(entries.len());
+            .unwrap_or(0);
+        let species = sims_ui::household::PetKind::from_kind(kind);
+        let is_cat = species == Some(sims_ui::household::PetKind::Cat);
+        let female = kind & 1 == 1;
+        let skeleton = world
+            .objects
+            .get(&pet)
+            .and_then(|o| self.person_body_string(o.guid, 0))
+            .filter(|s| !s.trim().is_empty());
+        let sex_species = match (female, is_cat) {
+            (false, false) => "Male Dog",
+            (true, false) => "Female Dog",
+            (false, true) => "Male Cat",
+            (true, true) => "Female Cat",
+        };
+        let rows: Vec<(String, String)> = self
+            .ensure_ordered_wardrobe()
+            .map(|w| {
+                (0..w.count_pet(is_cat))
+                    .map_while(|idx| w.pick_pet(is_cat, idx))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut items = Vec::with_capacity(rows.len());
         let mut responses = BTreeMap::new();
-        for (idx, name) in entries {
+        let mut preview_targets = BTreeMap::new();
+        for (idx, (suit, row)) in rows.into_iter().enumerate() {
+            let Ok(index) = i16::try_from(idx) else {
+                break;
+            };
             let id = format!("special_pet:{idx}");
             items.push(ShopItem {
                 id: id.clone(),
-                name,
-                description: format!("#{idx}"),
+                name: pet_breed_label(&row),
+                description: sex_species.to_owned(),
                 price: 0,
                 currency: CurrencyKind::Simoleons,
                 icon: None,
-                supports_try_on: false,
+                supports_try_on: skeleton.is_some(),
                 owned: false,
                 available: true,
             });
             responses.insert(
-                id,
+                id.clone(),
                 SpecialPanelResponse::Selection {
                     accepted: true,
-                    index: idx as i16,
+                    index,
                 },
             );
+            if let Some(skeleton) = &skeleton {
+                preview_targets.insert(
+                    id,
+                    ShopPreviewTarget {
+                        person: pet,
+                        suit,
+                        row: Some(row),
+                        pet_skeleton: Some(skeleton.clone()),
+                    },
+                );
+            }
         }
-        (items, responses)
+        (items, responses, preview_targets)
     }
 
+    /// Body string `index` (`STR# 200`) of the person type `guid`, preferring
+    /// strings Make New Character wrote.
+    fn person_body_string(&self, guid: u32, index: usize) -> Option<String> {
+        let catalog = self.assets.catalog();
+        let entry = catalog
+            .by_guid
+            .get(&guid)
+            .and_then(|&idx| catalog.objects.get(idx))?;
+        let bytes = self
+            .assets
+            .index()
+            .resources
+            .get(entry.resource)?
+            .read()
+            .ok()?;
+        let iff = sims_formats::iff::Iff::parse(bytes).ok()?;
+        let chunk = iff.get(b"STR#", 200)?;
+        let table = sims_formats::strings::StringTable::parse(iff.data(chunk)).ok()?;
+        table
+            .get(index, US_ENGLISH)
+            .or_else(|| table.get(index, 1))
+            .map(|s| s.trim().to_owned())
+    }
+
+    /// `Dialog` kind 14 (`0x536a6b`): the caller's own Create-a-Sim body list
+    /// (everyday `b` bodies matching sex, age and skin tone, native order,
+    /// uncapped). No MagiCoin price: the charm, not the picker, pays.
     fn build_charm_transform_items(
         &mut self,
         world: &sims_sim::World,
@@ -10884,146 +10837,180 @@ impl Game {
         BTreeMap<String, SpecialPanelResponse>,
         BTreeMap<String, ShopPreviewTarget>,
     ) {
-        let _ = world;
-        let names = self.scan_install_skin_names(
-            &[
-                "ExpansionPack7/Skins",
-                "ExpansionShared/SkinsBuy",
-                "GameData/Skins",
-            ],
-            Some("b"),
-            24,
-        );
-        let mut items = Vec::with_capacity(names.len());
-        let mut responses = BTreeMap::new();
-        let mut preview_targets = BTreeMap::new();
-        for (idx, name) in names.into_iter().enumerate() {
-            let id = format!("special_charm:{idx}");
-            let suit = name.clone();
-            items.push(ShopItem {
-                id: id.clone(),
-                name,
-                description: format!("#{idx}"),
-                price: 0,
-                currency: CurrencyKind::MagiCoins,
-                icon: None,
-                supports_try_on: true,
-                owned: false,
-                available: true,
-            });
-            responses.insert(
-                id.clone(),
-                SpecialPanelResponse::Selection {
-                    accepted: true,
-                    index: idx as i16,
-                },
-            );
-            preview_targets.insert(
-                id,
-                ShopPreviewTarget {
-                    person,
-                    suit,
-                    row: None,
-                },
-            );
-        }
-        (items, responses, preview_targets)
+        let (female, child) = Self::person_sex_and_age(world, person);
+        let skin = self.person_skin_tone(world, person);
+        let outfits = self
+            .ensure_ordered_wardrobe()
+            .map(|w| category_outfits(w, b'b', female, child, &skin))
+            .unwrap_or_default();
+        Self::outfit_picker_items("special_charm", person, outfits)
     }
 
-    fn build_call_neighbor_items(
+    /// Builds the call-eligible neighbor list for the native Phonebook
+    /// (`cWinPhoneBook`, `Dialog` kind 10). A neighbor is listed when the
+    /// caller has a relationship row naming them (`"They can only call people
+    /// they've already met"`, `UIText.iff STR# 166[59]`), and they are not the
+    /// caller, not in the caller's family (`person.data[61]`), not a pet
+    /// (`person.data[65] > 1`, `0x427c69`), not familyless (service NPC), and
+    /// not already on this lot. Rows keep the caller's relationship order.
+    fn build_phonebook_snapshot(
         &self,
         world: &sims_sim::World,
         caller_neighbor: i16,
-    ) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
-        let caller_rels: BTreeMap<i32, (i32, i32)> = world
+    ) -> PhoneBookSnapshot {
+        let strings = self.phonebook_strings.clone().unwrap_or_default();
+        let records: BTreeMap<i16, &sims_sim::neighbors::Neighbor> = world
             .neighbors
             .slots
             .iter()
             .flatten()
-            .find(|r| r.id == caller_neighbor)
-            .map(|r| {
-                r.relationships
-                    .iter()
-                    .map(|row| {
-                        let daily = row.values.first().copied().unwrap_or(0);
-                        let life = row.values.get(1).copied().unwrap_or(0);
-                        (row.target, (daily, life))
-                    })
-                    .collect()
+            .map(|r| (r.id, r))
+            .collect();
+        let caller = records.get(&caller_neighbor).copied();
+        let caller_name = caller.and_then(|r| self.neighbor_display_name(r.guid));
+        let caller_family = caller
+            .and_then(|r| r.data.get(sims_sim::neighbors::FAMILY).copied())
+            .unwrap_or(0);
+        let on_lot: std::collections::BTreeSet<i16> = world
+            .objects
+            .values()
+            .filter_map(|o| o.person.as_ref())
+            .filter_map(|p| p.data.get(PERSON_NEIGHBOR_WORD).copied())
+            .filter(|&id| id > 0)
+            .collect();
+        let entries = caller
+            .map(|c| c.relationships.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| {
+                let id = i16::try_from(row.target).ok()?;
+                let record = records.get(&id).copied()?;
+                phonebook_eligible(record, caller_neighbor, caller_family, &on_lot).then(|| {
+                    let daily = row.values.first().copied().unwrap_or(0);
+                    let lifetime = row.values.get(1).copied().unwrap_or(0);
+                    let clamp = |v: i32| v.clamp(-100, 100) as i16;
+                    PhoneBookEntry {
+                        neighbor_id: id,
+                        name: self
+                            .neighbor_display_name(record.guid)
+                            .unwrap_or_else(|| format!("#{id}")),
+                        daily: clamp(daily),
+                        lifetime: clamp(lifetime),
+                        portrait: self.hud.face(record.guid).cloned(),
+                        is_friend: daily >= 50 || lifetime >= 50,
+                    }
+                })
             })
-            .unwrap_or_default();
-
-        let mut items = Vec::new();
-        let mut responses = BTreeMap::new();
-        for record in world.neighbors.slots.iter().flatten() {
-            if record.id <= 0 || record.id == caller_neighbor {
-                continue;
-            }
-            let name = self
-                .lot
-                .character_names()
-                .get(&record.guid)
-                .cloned()
-                .or_else(|| self.hud.name(record.guid).map(str::to_owned))
-                .unwrap_or_else(|| format!("#{}", record.id));
-            let (daily, life) = caller_rels
-                .get(&i32::from(record.id))
-                .copied()
-                .unwrap_or((0, 0));
-            let id = format!("special_neighbor:{}", record.id);
-            items.push(ShopItem {
-                id: id.clone(),
-                name,
-                description: format!("{daily} / {life}"),
-                price: 0,
-                currency: CurrencyKind::Simoleons,
-                icon: self.hud.face(record.guid).cloned(),
-                supports_try_on: false,
-                owned: false,
-                available: true,
-            });
-            responses.insert(id, SpecialPanelResponse::Neighbor(Some(record.id)));
+            .collect();
+        let empty_message = match caller_name.as_deref() {
+            Some(name) => format!("{name} {}", strings.knows_nobody),
+            None => strings.knows_nobody.clone(),
+        };
+        PhoneBookSnapshot {
+            title: strings.title.clone(),
+            caller_name,
+            entries,
+            cancel_label: strings.cancel.clone(),
+            prev_label: "<".into(),
+            next_label: ">".into(),
+            empty_message,
         }
-        (items, responses)
     }
 
-    fn scan_install_skin_names(
-        &self,
-        dirs: &[&str],
-        prefix: Option<&str>,
-        limit: usize,
-    ) -> Vec<String> {
-        let install = self.hud.install();
-        let mut seen: BTreeMap<String, String> = BTreeMap::new();
-        for rel in dirs {
-            let Ok(dir) = install.file(rel) else {
-                continue;
-            };
-            let Ok(read_dir) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in read_dir.flatten() {
-                let path = entry.path();
-                let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-                    continue;
-                };
-                if !ext.eq_ignore_ascii_case("bmp") && !ext.eq_ignore_ascii_case("cmx") {
-                    continue;
-                }
-                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                let lower = stem.to_ascii_lowercase();
-                if let Some(p) = prefix
-                    && !lower.starts_with(p)
-                {
-                    continue;
-                }
-                seen.entry(lower).or_insert_with(|| stem.to_owned());
+    fn neighbor_display_name(&self, guid: u32) -> Option<String> {
+        self.lot
+            .character_names()
+            .get(&guid)
+            .cloned()
+            .or_else(|| self.hud.name(guid).map(str::to_owned))
+    }
+
+    fn ensure_phonebook_assets(&mut self) {
+        if self.phonebook_strings.is_none() {
+            let strings =
+                PhoneBookStrings::load(self.hud.install(), US_ENGLISH).unwrap_or_default();
+            self.phonebook_strings = Some(strings);
+        }
+        if self.phonebook_art.is_none()
+            && let Ok(ui) = UiGraphics::open(self.hud.install())
+            && let Ok(art) = sims_ui::phonebook::load_art(&ui, US_ENGLISH)
+        {
+            self.phonebook_art = Some(art);
+        }
+    }
+
+    fn draw_phonebook_dialog(&mut self) {
+        if !self.phonebook_dialog.is_open() {
+            return;
+        }
+        self.ensure_phonebook_assets();
+        let Some(snapshot) = self.phonebook_snapshot.as_ref() else {
+            return;
+        };
+        let art = self.phonebook_art.as_ref().unwrap_or(&self.hud.art);
+        let (w, h) = (
+            u32::try_from(self.canvas.width).unwrap_or(0),
+            u32::try_from(self.canvas.height).unwrap_or(0),
+        );
+        let Ok(mut frame) =
+            sims_ui::frame::Frame::from_packed(w, h, std::mem::take(&mut self.canvas.color))
+        else {
+            return;
+        };
+        self.phonebook_dialog.draw(&mut frame, snapshot, art);
+        self.canvas.color = frame.into_packed();
+    }
+
+    /// The open Phonebook's view-model, if any (for tests and the harness).
+    pub fn phonebook_snapshot(&self) -> Option<&PhoneBookSnapshot> {
+        self.phonebook_dialog
+            .is_open()
+            .then_some(self.phonebook_snapshot.as_ref())
+            .flatten()
+    }
+
+    /// Calls the Phonebook's selected neighbor (`Enter`).
+    pub fn phonebook_submit(&mut self) -> Outcome {
+        let cmd = self
+            .phonebook_snapshot
+            .as_ref()
+            .and_then(|snap| self.phonebook_dialog.submit(snap));
+        match cmd {
+            Some(cmd) => self.execute_phonebook_command(cmd),
+            None => Outcome::default(),
+        }
+    }
+
+    /// Cancels the Phonebook (`Escape`).
+    pub fn phonebook_escape(&mut self) -> Outcome {
+        match self.phonebook_dialog.escape() {
+            Some(cmd) => self.execute_phonebook_command(cmd),
+            None => Outcome::default(),
+        }
+    }
+
+    /// Answers the waiting `Dialog` kind 10 with the Phonebook's choice:
+    /// `Neighbor(Some(id))` for a call, `Neighbor(None)` for Cancel (stored as
+    /// `-9999` by `end_of_update`, `0x4413e1`).
+    pub fn execute_phonebook_command(&mut self, cmd: PhoneBookCommand) -> Outcome {
+        let response = match cmd {
+            PhoneBookCommand::Call(id) => SpecialPanelResponse::Neighbor(Some(id)),
+            PhoneBookCommand::Cancel => SpecialPanelResponse::Neighbor(None),
+        };
+        self.phonebook_dialog.close();
+        if self.answer_special_panel(response) {
+            self.hud.play(crate::hud::CLICK);
+        } else {
+            self.hud.play(crate::hud::ERROR);
+            if self.phonebook_snapshot.is_some() && self.active_special_panel.is_some() {
+                self.phonebook_dialog.open();
+            } else {
+                self.phonebook_snapshot = None;
             }
         }
-        // Sort deterministically across the full scan before applying `limit`.
-        seen.into_values().take(limit).collect()
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        Outcome::redraw()
     }
 
     /// Crops the rendered lot canvas to the active Camera Mode `SnapshotSize`
@@ -13996,4 +13983,186 @@ mod tests {
         // Interior pixels stay untouched.
         assert_eq!(pixel(&canvas, 6, 6), [0, 0, 0]);
     }
+}
+
+/// `person.data[31]`: the person's neighbor record ID (`PERSON_NEIGHBOR`).
+const PERSON_NEIGHBOR_WORD: usize = 31;
+
+/// Whether `record` may appear in `caller`'s Phonebook (see
+/// [`Game::build_phonebook_snapshot`]).
+fn phonebook_eligible(
+    record: &sims_sim::neighbors::Neighbor,
+    caller: i16,
+    caller_family: i16,
+    on_lot: &std::collections::BTreeSet<i16>,
+) -> bool {
+    let family = record
+        .data
+        .get(sims_sim::neighbors::FAMILY)
+        .copied()
+        .unwrap_or(0);
+    let kind = record
+        .data
+        .get(sims_sim::neighbors::KIND)
+        .copied()
+        .unwrap_or(0);
+    record.id > 0
+        && record.id != caller
+        && kind <= 1
+        && family > 0
+        && (caller_family <= 0 || family != caller_family)
+        && !on_lot.contains(&record.id)
+}
+
+/// The suit category letter of `Dialog` kind 6 mode `0..=5` (`0x5097c9`):
+/// everyday `b`, swimwear `s`, formal `f`, pajamas `l`, winter `w`, and
+/// Superstar high fashion `h`.
+fn wardrobe_mode_category(mode: i16) -> u8 {
+    match mode {
+        1 => b's',
+        2 => b'f',
+        3 => b'l',
+        4 => b'w',
+        5 => b'h',
+        _ => b'b',
+    }
+}
+
+/// Every `(suit, "suit,BODY=texture")` of category `first` that a person
+/// of the given sex, age and skin tone can wear, in native wardrobe order:
+/// the filter of `ImportWardrobe::pick` (`0x409663`) — a 9-byte suit prefix
+/// `<first>NNN<sex|u><age>xxx` and textures `<prefix><skin>…` — with the
+/// category letter in place of `b`.
+fn category_outfits(
+    wardrobe: &sims_content::ImportWardrobe,
+    first: u8,
+    female: bool,
+    child: bool,
+    skin: &str,
+) -> Vec<(String, String)> {
+    let Some(skin_bytes) = sims_formats::far::encode_name(&skin.to_ascii_lowercase()) else {
+        return Vec::new();
+    };
+    let sex = if female { b'f' } else { b'm' };
+    let age = if child { b'c' } else { b'a' };
+    let mut out = Vec::new();
+    for suit in wardrobe.suits() {
+        if suit.len() < 9
+            || !suit[0].eq_ignore_ascii_case(&first)
+            || !(suit[4].eq_ignore_ascii_case(&sex) || suit[4].eq_ignore_ascii_case(&b'u'))
+            || !suit[5].eq_ignore_ascii_case(&age)
+        {
+            continue;
+        }
+        let mut prefix = suit[..9].to_ascii_lowercase();
+        prefix.extend_from_slice(&skin_bytes);
+        for tex in wardrobe.textures() {
+            if tex.len() >= prefix.len() && tex[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+                let suit_str: String = sims_formats::strings::decode(suit, 1)
+                    .to_ascii_lowercase()
+                    .chars()
+                    .take(63)
+                    .collect();
+                let tex_str = sims_formats::strings::decode(tex, 1);
+                let desc: String = format!("BODY={tex_str}").chars().take(63).collect();
+                out.push((suit_str.clone(), format!("{suit_str},{desc}")));
+            }
+        }
+    }
+    out
+}
+
+/// A readable outfit name from a wardrobe row: the texture's name after its
+/// first `_` (`"b002fafitmed_mom02"` -> `"Mom02"`, `"h551mafitlgt_TuxedoBasic"`
+/// -> `"Tuxedo Basic"`), falling back to the suit's.
+fn outfit_display_label(suit: &str, row: &str) -> String {
+    let texture = row
+        .split_once(',')
+        .and_then(|(_, desc)| desc.split_once('='))
+        .map(|(_, tex)| tex.trim())
+        .unwrap_or("");
+    let tail = |name: &str| name.split_once('_').map(|(_, t)| t.to_owned());
+    let raw = tail(texture)
+        .or_else(|| tail(suit))
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| suit.to_owned());
+    humanize_identifier(&raw)
+}
+
+/// `"TuxedoBasic"` -> `"Tuxedo Basic"`, `"mom02"` -> `"Mom02"`,
+/// `"red_dress"` -> `"Red Dress"`.
+fn humanize_identifier(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 4);
+    let mut prev: Option<char> = None;
+    for c in raw.chars() {
+        if c == '_' || c == '-' {
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+            prev = Some(' ');
+            continue;
+        }
+        let boundary = prev.is_some_and(|p| p.is_ascii_lowercase() && c.is_ascii_uppercase());
+        if boundary {
+            out.push(' ');
+        }
+        let start = prev.is_none_or(|p| p == ' ');
+        if start || boundary {
+            out.extend(c.to_uppercase());
+        } else {
+            out.push(c);
+        }
+        prev = Some(c);
+    }
+    out.trim().to_owned()
+}
+
+/// A pet body row's breed (`"b000dog,BODY=B000dog_lab"` -> `"Labrador
+/// Retriever"`), from the Unleashed texture names, title-casing any
+/// unlisted one.
+fn pet_breed_label(row: &str) -> String {
+    let texture = row
+        .split_once(',')
+        .and_then(|(_, desc)| desc.split_once('='))
+        .map(|(_, tex)| tex.trim())
+        .unwrap_or(row);
+    let key = texture
+        .split_once('_')
+        .map_or(texture, |(_, t)| t)
+        .to_ascii_lowercase();
+    let known = match key.as_str() {
+        "lab" => "Labrador Retriever",
+        "aussie" => "Australian Shepherd",
+        "dalmation" | "dalmatian" => "Dalmatian",
+        "cairn" => "Cairn Terrier",
+        "poodle" => "Poodle",
+        "pinkpoodle" => "Pink Poodle",
+        "jack" => "Jack Russell Terrier",
+        "springer" => "Springer Spaniel",
+        "setter" => "Irish Setter",
+        "greyhound" => "Greyhound",
+        "beagle" => "Beagle",
+        "rott" => "Rottweiler",
+        "bulldog" => "Bulldog",
+        "scottish" => "Scottish Terrier",
+        "shep" => "German Shepherd",
+        "chihuahua" => "Chihuahua",
+        "tabby" => "Tabby",
+        "tabbybrown" => "Brown Tabby",
+        "silver" => "Silver Tabby",
+        "calico" => "Calico",
+        "calicoblk" => "Black Calico",
+        "calicored" => "Red Calico",
+        "persian" => "Persian",
+        "bluemanx" => "Blue Manx",
+        "ragdoll" => "Ragdoll",
+        "siamese" => "Siamese",
+        "tortoise" => "Tortoiseshell",
+        "bombay" => "Bombay",
+        "spotted" => "Spotted",
+        "sphinx" => "Sphynx",
+        "albino" => "Albino",
+        _ => return humanize_identifier(&key),
+    };
+    known.to_owned()
 }

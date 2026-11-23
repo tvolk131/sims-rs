@@ -60,6 +60,7 @@ fn sample_snapshot(count: usize) -> PhoneBookSnapshot {
         cancel_label: "Cancel".into(),
         prev_label: "Prev".into(),
         next_label: "Next".into(),
+        empty_message: "Mortimer doesn't know anyone.".into(),
     }
 }
 

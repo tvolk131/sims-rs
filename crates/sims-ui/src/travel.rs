@@ -1509,12 +1509,7 @@ fn draw_travel_dialog_button(
     }
 }
 
-fn blit_scaled_region(
-    frame: &mut Frame,
-    img: &sims_formats::bitmap::Image,
-    src: Rect,
-    dest: Rect,
-) {
+fn blit_scaled_region(frame: &mut Frame, img: &sims_formats::bitmap::Image, src: Rect, dest: Rect) {
     if src.width <= 0 || src.height <= 0 || dest.width <= 0 || dest.height <= 0 {
         return;
     }

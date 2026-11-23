@@ -11,10 +11,12 @@ use crate::art::Art;
 use crate::dialog::{BACKGROUND, BUTTON, draw_nine_slice};
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
-use crate::hud;
-use crate::Result;
+use crate::{Error, Result};
+use sims_content::Install;
 use sims_content::ui_graphics::UiGraphics;
 use sims_formats::bitmap::Image;
+use sims_formats::iff::Iff;
+use sims_formats::strings::StringTable;
 
 /// `UIGraphics/Res_CPanel.h` `kPhoneBookBkg` (`cpanel/Backgrounds/phonebookbkg.bmp`, `620×356`).
 pub const PHONE_BOOK_BKG: i32 = 80;
@@ -28,7 +30,70 @@ pub const NATIVE_HEIGHT: i32 = 356;
 /// Required 9-slice / button fallback resources for [`PhoneBookDialog`].
 pub const RESOURCES: [i32; 2] = [BACKGROUND, BUTTON];
 /// Optional native Phonebook & portrait-well artwork (`80`, `81`, `4992`).
-pub const OPTIONAL_RESOURCES: [i32; 3] = [PHONE_BOOK_BKG, PHONE_BOOK_ICON, hud::id::SIM_STUB];
+pub const OPTIONAL_RESOURCES: [i32; 3] =
+    [PHONE_BOOK_BKG, PHONE_BOOK_ICON, crate::dialog::ICON_STUB];
+
+/// `UIText.iff STR# 180`: Phonebook labels (`[0]` title `"Call"`, `[1]` call
+/// button `"Call"`, `[2]` empty-list suffix `"doesn't know anyone."`).
+pub const PHONE_BOOK_STR: u16 = 180;
+/// `UIText.iff STR# 142`: shared dialog labels (`[1]` `"Cancel"`).
+pub const DIALOG_LABELS_STR: u16 = 142;
+
+/// Localized Phonebook labels from `GameData/UIText.iff`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhoneBookStrings {
+    pub title: String,
+    pub call: String,
+    pub knows_nobody: String,
+    pub cancel: String,
+}
+
+impl Default for PhoneBookStrings {
+    fn default() -> Self {
+        Self {
+            title: "Call".into(),
+            call: "Call".into(),
+            knows_nobody: "doesn't know anyone.".into(),
+            cancel: "Cancel".into(),
+        }
+    }
+}
+
+impl PhoneBookStrings {
+    /// Loads `STR# 180` and `STR# 142[1]` for `language` (1 = US English),
+    /// falling back per entry to the US English defaults.
+    pub fn load(install: &Install, language: u8) -> Result<Self> {
+        let path = install
+            .file("GameData/UIText.iff")
+            .map_err(Error::Content)?;
+        let bytes = std::fs::read(&path).map_err(Error::Io)?;
+        let iff = Iff::parse(bytes).map_err(Error::Format)?;
+        let mut strings = Self::default();
+        let read = |id: u16, index: usize| -> Option<String> {
+            let chunk = iff.get(b"STR#", id)?;
+            let table = StringTable::parse(iff.data(chunk)).ok()?;
+            table
+                .get(index, language)
+                .or_else(|| table.get(index, 1))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        if let Some(s) = read(PHONE_BOOK_STR, 0) {
+            strings.title = s;
+        }
+        if let Some(s) = read(PHONE_BOOK_STR, 1) {
+            strings.call = s;
+        }
+        if let Some(s) = read(PHONE_BOOK_STR, 2) {
+            strings.knows_nobody = s;
+        }
+        if let Some(s) = read(DIALOG_LABELS_STR, 1) {
+            strings.cancel = s;
+        }
+        Ok(strings)
+    }
+}
 
 /// Loads all Phonebook bitmaps and UI fonts from `ui`.
 pub fn load_art(ui: &UiGraphics, language: u8) -> Result<Art> {
@@ -77,6 +142,9 @@ pub struct PhoneBookSnapshot {
     pub cancel_label: String,
     pub prev_label: String,
     pub next_label: String,
+    /// Shown when `entries` is empty (`"<caller> doesn't know anyone."`,
+    /// `STR# 180[2]`).
+    pub empty_message: String,
 }
 
 /// Commands emitted by [`PhoneBookDialog`].
@@ -182,7 +250,13 @@ impl PhoneBookDialog {
             (true, 2, 4)
         } else {
             let cols = if fw >= 520 { 2 } else { 1 };
-            let rows = if fh >= 320 { 4 } else if fh >= 260 { 3 } else { 2 };
+            let rows = if fh >= 320 {
+                4
+            } else if fh >= 260 {
+                3
+            } else {
+                2
+            };
             (false, cols, rows)
         }
     }
@@ -303,63 +377,65 @@ impl PhoneBookDialog {
         let per_page = (cols * rows).max(1);
         let page = self.effective_page(frame_size, snapshot);
 
-        let (dialog, icon_rect, title_rect, col_rects, footer_y, footer_x, footer_w) =
-            if native_art {
-                let x = (fw - NATIVE_WIDTH) / 2;
-                let y = (fh - NATIVE_HEIGHT) / 2;
-                let dialog = Rect::new(x, y, NATIVE_WIDTH, NATIVE_HEIGHT);
-                // Native `phonebookbkg.bmp` (620x356):
-                // - Phone icon slot top-left `(10, 10, 33, 23)`
-                // - Header pill `(52, 6, 560, 32)`
-                // - Left beveled column `(12, 56, 288, 250)`
-                // - Right beveled column `(322, 56, 288, 250)`
-                // - Footer strip inside lower wells `(14, 316, 592, 28)`
-                let icon_rect = Rect::new(x + 11, y + 11, 33, 23);
-                let title_rect = Rect::new(x + 60, y + 8, 544, 28);
-                let left_col = Rect::new(x + 14, y + 58, 284, 252);
-                let right_col = Rect::new(x + 324, y + 58, 284, 252);
-                (
-                    dialog,
-                    icon_rect,
-                    title_rect,
-                    vec![left_col, right_col],
-                    y + 318,
-                    x + 14,
-                    594,
-                )
+        let (dialog, icon_rect, title_rect, col_rects, footer_y, footer_x, footer_w) = if native_art
+        {
+            let x = (fw - NATIVE_WIDTH) / 2;
+            let y = (fh - NATIVE_HEIGHT) / 2;
+            let dialog = Rect::new(x, y, NATIVE_WIDTH, NATIVE_HEIGHT);
+            // Native `phonebookbkg.bmp` (620x356):
+            // - Phone icon slot top-left `(10, 10, 33, 23)`
+            // - Header pill `(52, 6, 560, 32)`
+            // - Left beveled column `(12, 56, 288, 250)`
+            // - Right beveled column `(322, 56, 288, 250)`
+            // - Footer strip inside lower wells `(14, 316, 592, 28)`
+            let icon_rect = Rect::new(x + 11, y + 11, 33, 23);
+            let title_rect = Rect::new(x + 60, y + 8, 544, 28);
+            let left_col = Rect::new(x + 14, y + 58, 284, 252);
+            let right_col = Rect::new(x + 324, y + 58, 284, 252);
+            (
+                dialog,
+                icon_rect,
+                title_rect,
+                vec![left_col, right_col],
+                y + 318,
+                x + 14,
+                594,
+            )
+        } else {
+            let margin = 10;
+            let w = (fw - margin * 2).clamp(240, NATIVE_WIDTH).min(fw);
+            let h = (fh - margin * 2).clamp(200, NATIVE_HEIGHT).min(fh);
+            let x = ((fw - w) / 2).max(0);
+            let y = ((fh - h) / 2).max(0);
+            let dialog = Rect::new(x, y, w, h);
+            let pad = 12;
+            let inner_x = x + pad;
+            let inner_w = (w - pad * 2).max(120);
+            let icon_rect = Rect::new(inner_x, y + 10, 33.min(inner_w / 5), 23);
+            let title_rect = Rect::new(
+                icon_rect.x + icon_rect.width + 8,
+                y + 10,
+                (inner_x + inner_w - (icon_rect.x + icon_rect.width + 8)).max(60),
+                24,
+            );
+            let footer_h = 26;
+            let footer_y = y + h - footer_h - 10;
+            let body_y = y + 40;
+            let body_h = (footer_y - body_y - 6).max(80);
+            let col_rects = if cols == 2 {
+                let gap = 8;
+                let cw = (inner_w - gap) / 2;
+                vec![
+                    Rect::new(inner_x, body_y, cw, body_h),
+                    Rect::new(inner_x + cw + gap, body_y, inner_w - cw - gap, body_h),
+                ]
             } else {
-                let margin = 10;
-                let w = (fw - margin * 2).clamp(240, NATIVE_WIDTH).min(fw);
-                let h = (fh - margin * 2).clamp(200, NATIVE_HEIGHT).min(fh);
-                let x = ((fw - w) / 2).max(0);
-                let y = ((fh - h) / 2).max(0);
-                let dialog = Rect::new(x, y, w, h);
-                let pad = 12;
-                let inner_x = x + pad;
-                let inner_w = (w - pad * 2).max(120);
-                let icon_rect = Rect::new(inner_x, y + 10, 33.min(inner_w / 5), 23);
-                let title_rect = Rect::new(
-                    icon_rect.x + icon_rect.width + 8,
-                    y + 10,
-                    (inner_x + inner_w - (icon_rect.x + icon_rect.width + 8)).max(60),
-                    24,
-                );
-                let footer_h = 26;
-                let footer_y = y + h - footer_h - 10;
-                let body_y = y + 40;
-                let body_h = (footer_y - body_y - 6).max(80);
-                let col_rects = if cols == 2 {
-                    let gap = 8;
-                    let cw = (inner_w - gap) / 2;
-                    vec![
-                        Rect::new(inner_x, body_y, cw, body_h),
-                        Rect::new(inner_x + cw + gap, body_y, inner_w - cw - gap, body_h),
-                    ]
-                } else {
-                    vec![Rect::new(inner_x, body_y, inner_w, body_h)]
-                };
-                (dialog, icon_rect, title_rect, col_rects, footer_y, inner_x, inner_w)
+                vec![Rect::new(inner_x, body_y, inner_w, body_h)]
             };
+            (
+                dialog, icon_rect, title_rect, col_rects, footer_y, inner_x, inner_w,
+            )
+        };
 
         let footer_h = if native_art { 28 } else { 26 };
         let gap = 8;
@@ -530,7 +606,8 @@ impl PhoneBookDialog {
                 Some(caller) if !base.eq_ignore_ascii_case(caller) => format!("{base} - {caller}"),
                 _ => base.to_owned(),
             };
-            let ty = layout.title_rect.y + ((layout.title_rect.height - font.line_height) / 2).max(0);
+            let ty =
+                layout.title_rect.y + ((layout.title_rect.height - font.line_height) / 2).max(0);
             draw_clipped_text(
                 frame,
                 font,
@@ -544,7 +621,11 @@ impl PhoneBookDialog {
         // Neighbor cards (45x45 portrait + name + Daily & Lifetime bars).
         if snapshot.entries.is_empty() {
             if let Some(font) = body_font {
-                let msg = "No known neighbors available to call.";
+                let msg = if snapshot.empty_message.trim().is_empty() {
+                    "doesn't know anyone."
+                } else {
+                    snapshot.empty_message.trim()
+                };
                 let msg_rect = Rect::new(
                     layout.dialog.x + 24,
                     layout.dialog.y + 84,
@@ -561,14 +642,13 @@ impl PhoneBookDialog {
                 );
             }
         } else {
-            let stub = art.image(hud::id::SIM_STUB);
+            let stub = art.image(crate::dialog::ICON_STUB);
             for &(idx, rect) in &layout.entry_slots {
                 let Some(entry) = snapshot.entries.get(idx) else {
                     continue;
                 };
                 let is_hovered = self.hovered == Some(PhoneBookHit::Entry(idx));
-                let is_pressed =
-                    is_hovered && self.pressed == Some(PhoneBookHit::Entry(idx));
+                let is_pressed = is_hovered && self.pressed == Some(PhoneBookHit::Entry(idx));
                 let is_selected = self.selected_index == Some(idx);
 
                 let bg = if is_pressed || is_selected {
@@ -730,8 +810,16 @@ impl PhoneBookDialog {
             let text = format!("{cur_page} / {total_pages}");
             let tw = font.width(&text).min(layout.page_label.width);
             let tx = layout.page_label.x + ((layout.page_label.width - tw) / 2).max(0);
-            let ty = layout.page_label.y + ((layout.page_label.height - font.line_height) / 2).max(2);
-            draw_clipped_text(frame, font, &text, [tx, ty], layout.page_label.width, TEXT_HOVER);
+            let ty =
+                layout.page_label.y + ((layout.page_label.height - font.line_height) / 2).max(2);
+            draw_clipped_text(
+                frame,
+                font,
+                &text,
+                [tx, ty],
+                layout.page_label.width,
+                TEXT_HOVER,
+            );
         }
     }
 
@@ -792,7 +880,9 @@ fn draw_rel_bar(frame: &mut Frame, rect: Rect, value: i16, pos_color: [u8; 3]) {
     frame.fill(Rect::new(mid, inner_y, 1, inner_h), BAR_TRACK_BORDER);
     let half_w = inner_w / 2;
     if clamped > 0 {
-        let fill_w = ((clamped * half_w) / 100).max(1).min(inner_x + inner_w - mid);
+        let fill_w = ((clamped * half_w) / 100)
+            .max(1)
+            .min(inner_x + inner_w - mid);
         frame.fill(Rect::new(mid, inner_y, fill_w, inner_h), pos_color);
     } else if clamped < 0 {
         let fill_w = (((-clamped) * half_w) / 100).max(1).min(mid - inner_x);

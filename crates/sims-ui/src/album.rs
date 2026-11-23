@@ -737,7 +737,12 @@ impl PhotoAlbumDialog {
             // Middle thumbnail strip sits cleanly inside the `STR# 141` `(100, 430, 500, 72)` well.
             let strip_box = Rect::new(mx + 100, my + 430, 500, 72);
             let arrow_w = 24;
-            let strip_prev = Rect::new(strip_box.x + 4, strip_box.y + 8, arrow_w, strip_box.height - 16);
+            let strip_prev = Rect::new(
+                strip_box.x + 4,
+                strip_box.y + 8,
+                arrow_w,
+                strip_box.height - 16,
+            );
             let strip_next = Rect::new(
                 strip_box.x + strip_box.width - 4 - arrow_w,
                 strip_box.y + 8,
@@ -2117,15 +2122,7 @@ impl PhotoAlbumDialog {
                 ControlId::Last => ">|",
                 _ => "",
             });
-            self.draw_button(
-                frame,
-                art,
-                rect,
-                fallback,
-                control,
-                snapshot,
-                visible_slots,
-            );
+            self.draw_button(frame, art, rect, fallback, control, snapshot, visible_slots);
         }
     }
 

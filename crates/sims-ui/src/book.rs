@@ -1005,7 +1005,9 @@ impl ReferenceBookDialog {
                 let category_img = page
                     .category
                     .and_then(|cat| art.image(cat.art_id()))
-                    .filter(|img| img.width > 0 && img.height > 0 && card.width >= 260 && card.height >= 106);
+                    .filter(|img| {
+                        img.width > 0 && img.height > 0 && card.width >= 260 && card.height >= 106
+                    });
                 let illus_rect = category_img.map(|img| {
                     let iw = i32::try_from(img.width).unwrap_or(130).min(130);
                     let ih = i32::try_from(img.height).unwrap_or(90).min(90);
@@ -1462,7 +1464,9 @@ fn measure_page_max_scroll(layout: &BookLayout, page: &BookPage, art: &Art) -> u
         let has_illus = page
             .category
             .and_then(|cat| art.image(cat.art_id()))
-            .is_some_and(|img| img.width > 0 && img.height > 0 && content_w >= 260 && card_h >= 106);
+            .is_some_and(|img| {
+                img.width > 0 && img.height > 0 && content_w >= 260 && card_h >= 106
+            });
         let ew = if has_illus {
             (content_w - 130 - 30).max(80)
         } else {

@@ -655,8 +655,8 @@ impl ShopPickerDialog {
         let footer_h = 30;
         let footer_y = dialog.y + dialog.height - footer_h - 14;
         let gap = 8;
-        let hide_try_on = snapshot.hide_wallet_and_prices
-            && !snapshot.items.iter().any(|i| i.supports_try_on);
+        let hide_try_on =
+            snapshot.hide_wallet_and_prices && !snapshot.items.iter().any(|i| i.supports_try_on);
         let (try_on_btn, buy_btn, cancel_btn) = if hide_try_on {
             let btn_w = ((inner_w - gap) / 2).max(48);
             let buy_btn = Rect::new(inner_x, footer_y, btn_w, footer_h);
