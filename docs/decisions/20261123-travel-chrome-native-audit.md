@@ -92,6 +92,12 @@ the 1.91 disassembly and the oracle tour (`cache/ui-oracle-tour-20261122`).
    - Controls draw in table order, so Bulldoze covers Return's right edge
      and Import's left edge. Each hit rect is trimmed to its visible span,
      so a click lands on the button the player sees.
+     - **Unverified:** native click routing in the overlaps, for example
+       (373, 26) on the Return/Bulldoze edge. `cWinBtn` may route by window
+       order or by transparent pixels; a harness click would settle it.
+   - As with `cWinBtn`, a held button shows its down frame only while the
+     pointer is over it. Dragging off and back restores it, and the click
+     still lands on release.
    - There is no text label on any button. Missing art falls back to a
      blank chip.
    - `Destination::bar_buttons()` cites the tables.
@@ -108,18 +114,27 @@ the 1.91 disassembly and the oracle tour (`cache/ui-oracle-tour-20261122`).
      buttons natively.
 3. **Native controls that were missing are now wired:**
    - Sims.com shows the neighborhood bar's offline notice.
-   - The Sims logo opens credits.
+   - The Sims logo opens credits and switches to the map's credits music:
+     - `bkground_credits` on Downtown (`0x54b811`), Studio Town
+       (`0x565b90`), Vacation Island (`0x56a545`) and the neighborhood
+       (`0x559397`);
+     - `music_magictown_credits` on Magic Town (`0x552f5d`).
+
+     Closing credits restores the map station (`0x54b879`, `0x565bf8`,
+     `0x56a5ad`, `0x552fc5`, `0x5593ff`).
    - Magic Town's Move In opens the family bin. It replaces the invented
      "Fam" button.
    - Enable rules follow `0x56b19e`. Import stays greyed until lot import
      exists, which matches the oracle.
    - While a family is being placed, Move In is held down (`0x55478a`).
      Clicking it resets placement before reopening the bin (`0x552d96`).
+     The bar mode is re-derived from the shell mode on every render and
+     pointer event, so each shell transition updates it.
 4. **Lot pickers.**
    - **Magic Town** keeps its oracle-measured dlgframe2 dialog.
    - **Downtown, Vacation Island and Studio Town** keep the flag-1 bar.
      It holds no invented elements and matches the Downtown oracle (header
-     score 0.9897). Only Return is live there, so a trip picker can neither
+     score 0.98 against a 0.96 floor). Only Return is live there, so a trip picker can neither
      edit lots nor open shell dialogs it cannot host.
    - The flag-0 dialog for these three is a follow-up. It needs a harness
      capture of a cab, shuttle or ferry picker, because the only Downtown
@@ -132,6 +147,13 @@ the 1.91 disassembly and the oracle tour (`cache/ui-oracle-tour-20261122`).
      art, every bar pixel outside the button sprites must equal the banner,
      and nothing may be painted below the bar. A tab, badge or label that
      comes back fails this test.
+   - The pixel test compares the whole frame against the banner plus the
+     expected native cells, so a label painted inside a sprite also fails.
+   - `neighborhood_shell::magic_town_bar_is_native_through_the_shell_with_move_in_latch_and_credits_music`
+     checks the composited shell frame. Every pixel the native chrome
+     covers must equal it, so a shell-drawn button or badge fails. The test
+     also runs Family Bin → choose household → map with Move In latched,
+     and checks credits music in and out.
    - The existing `ui_oracle_tour` Downtown header floor still applies.
 
 ## Follow-ups (not in this change)

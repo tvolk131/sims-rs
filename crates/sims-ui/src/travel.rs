@@ -948,7 +948,9 @@ impl TravelChrome {
 
         for placement in &layout.controls {
             let is_hovered = self.hovered == Some(placement.control);
-            let is_pressed = self.pressed == Some(placement.control);
+            // Like `cWinBtn`, a held button shows its down frame only while
+            // the pointer is over it; dragging off and back restores it.
+            let is_pressed = self.pressed == Some(placement.control) && is_hovered;
             let cell = if !placement.enabled {
                 3
             } else if is_pressed || placement.active {

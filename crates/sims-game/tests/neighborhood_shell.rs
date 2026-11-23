@@ -956,3 +956,143 @@ fn neighborhood_shell_resizes_cleanly_across_non_native_viewports() {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+/// Magic Town's bar through the real shell: what the shell draws on the bar
+/// is exactly `TravelChrome`'s native bar (no shell-added buttons or text),
+/// Family Bin → choose household → map latches Move In down (`0x55478a`),
+/// and the Sims logo switches to `music_magictown_credits` (`0x552f5d`) and
+/// back to `music_magictown` on close (`0x552fc5`).
+#[test]
+fn magic_town_bar_is_native_through_the_shell_with_move_in_latch_and_credits_music() {
+    use sims_ui::frame::Frame;
+    use sims_ui::travel::{
+        TravelBarMode, TravelChrome, TravelCommand, TravelControl, TravelStrings,
+    };
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL is not set; skipping Magic Town bar shell test");
+        return;
+    };
+    let install = PathBuf::from(root);
+    let (tmp_dir, saves_path) = temp_redb("magic-bar");
+    let mut shell = NeighborhoodShell::open(
+        install.clone(),
+        saves_path,
+        1,
+        true,
+        vec![3],
+        Frames::default(),
+    )
+    .expect("NeighborhoodShell opens");
+    shell.resize([800, 600]);
+    shell
+        .switch_kind(sims_render::neighborhood::NeighborhoodKind::MagicTown)
+        .expect("switch to Magic Town");
+
+    let content = sims_content::Install::detect(&install).expect("open install");
+    let ui = sims_content::ui_graphics::UiGraphics::open(&content).expect("open UIGraphics");
+    let art =
+        sims_ui::travel::load_art(&ui, sims_content::ui_graphics::US_ENGLISH).expect("travel art");
+    let strings = TravelStrings::load(&content, sims_content::ui_graphics::US_ENGLISH)
+        .expect("travel strings");
+
+    // Every bar pixel the native chrome covers must be exactly the native
+    // chrome; pixels it leaves see-through show the map. Coverage is found
+    // by drawing the chrome over two different backgrounds.
+    let assert_shell_bar_is_native = |shell: &mut NeighborhoodShell, label: &str| {
+        // Off the bar, so no hover tooltip is drawn over it.
+        shell.leave();
+        shell.render();
+        let state = shell.travel_state().clone();
+        let canvas = shell.canvas();
+        let shell_frame = Frame::from_packed(800, 600, canvas.color.clone()).expect("shell frame");
+        let chrome = TravelChrome::new();
+        let mut a = Frame::new(800, 600, [0, 0, 0]);
+        let mut b = Frame::new(800, 600, [255, 255, 255]);
+        let layout = chrome.draw(&mut a, &state, &art, &strings);
+        chrome.draw(&mut b, &state, &art, &strings);
+        for y in 0..layout.bar_rect.height {
+            for x in 0..800 {
+                let (pa, pb) = (a.pixel(x, y).unwrap(), b.pixel(x, y).unwrap());
+                if pa == pb {
+                    assert_eq!(
+                        shell_frame.pixel(x, y).unwrap(),
+                        pa,
+                        "{label}: shell drew over the native bar at ({x}, {y})"
+                    );
+                }
+            }
+        }
+        layout
+    };
+
+    let browse = assert_shell_bar_is_native(&mut shell, "browse");
+    let mut controls: Vec<_> = browse.controls.iter().map(|c| c.control).collect();
+    controls.sort_by_key(|c| format!("{c:?}"));
+    assert_eq!(
+        controls,
+        vec![
+            TravelControl::Bulldoze,
+            TravelControl::Credits,
+            TravelControl::ImportLot,
+            TravelControl::MoveIn,
+            TravelControl::ReturnHome,
+            TravelControl::Web,
+        ]
+    );
+
+    // Move In → Family Bin → choose a household → back on the map with
+    // Move In held down.
+    let move_in = browse
+        .controls
+        .iter()
+        .find(|c| c.control == TravelControl::MoveIn)
+        .expect("Move In");
+    let pt = [
+        move_in.rect.x + move_in.rect.width / 2,
+        move_in.rect.y + move_in.rect.height / 2,
+    ];
+    shell.press(pt);
+    shell.release(pt);
+    assert_eq!(shell.screen(), ScreenKind::FamilyBin);
+    let chosen = shell.family_bin_entries()[0].id as u16;
+    shell.start_move_in(chosen).expect("start Move-In");
+    assert_eq!(shell.screen(), ScreenKind::Neighborhood);
+    let placing = assert_shell_bar_is_native(&mut shell, "move-in");
+    assert_eq!(shell.travel_state().mode, TravelBarMode::MoveIn);
+    assert!(
+        placing
+            .controls
+            .iter()
+            .any(|c| c.control == TravelControl::MoveIn && c.active),
+        "Move In must be latched while placing a family"
+    );
+    shell.escape();
+    shell.render();
+    assert_eq!(
+        shell.travel_state().mode,
+        TravelBarMode::Browse,
+        "cancelling placement releases Move In"
+    );
+
+    // Credits music in and out.
+    shell.render();
+    shell.take_audio_inputs();
+    shell.handle_travel_command(TravelCommand::OpenCredits);
+    assert!(shell.credits_dialog().is_open());
+    assert!(
+        shell
+            .take_audio_inputs()
+            .contains(&Input::MusicMode(MusicMode::MagicTownCredits)),
+        "Magic Town credits play music_magictown_credits"
+    );
+    shell.escape();
+    assert!(!shell.credits_dialog().is_open());
+    assert_eq!(
+        shell.take_audio_inputs().last(),
+        Some(&Input::MusicMode(MusicMode::MagicTown)),
+        "closing credits restores music_magictown"
+    );
+
+    drop(shell);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

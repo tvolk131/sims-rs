@@ -1996,6 +1996,9 @@ impl NeighborhoodShell {
             }
             ActiveScreen::Neighborhood => {
                 let is_travel_map = destination_for_kind(self.kind).is_some();
+                if is_travel_map {
+                    self.sync_travel_state();
+                }
                 let highlighted_lots = if is_travel_map {
                     self.travel_filtered_lot_ids()
                 } else {
@@ -2296,6 +2299,8 @@ impl NeighborhoodShell {
                 let prev_lot = self.hovered_lot_id;
                 let (chrome_changed, over_bar) = if destination_for_kind(self.kind).is_some() {
                     let prev_btn = self.travel_chrome.hovered();
+                    // The bar mode follows every shell mode change (Move In latch).
+                    self.sync_travel_state();
                     let layout =
                         TravelLayout::compute(frame_size[0], frame_size[1], &self.travel_state);
                     self.travel_chrome.pointer_move(point[0], point[1], &layout);
@@ -2605,6 +2610,8 @@ impl NeighborhoodShell {
             ActiveScreen::Loading(_) => ShellOutcome::default(),
             ActiveScreen::Neighborhood => {
                 if destination_for_kind(self.kind).is_some() {
+                    // The bar mode follows every shell mode change (Move In latch).
+                    self.sync_travel_state();
                     let layout =
                         TravelLayout::compute(frame_size[0], frame_size[1], &self.travel_state);
                     if self.travel_chrome.pointer_down(point[0], point[1], &layout) {
@@ -2754,7 +2761,7 @@ impl NeighborhoodShell {
             });
             return match cmd {
                 Some(BookCommand::Close) => {
-                    self.close_credits_modal();
+                    self.close_credits_and_restore_music();
                     ShellOutcome::redraw()
                 }
                 Some(BookCommand::ScrollLines(delta)) => {
@@ -2824,6 +2831,8 @@ impl NeighborhoodShell {
             ActiveScreen::Loading(_) => ShellOutcome::default(),
             ActiveScreen::Neighborhood => {
                 if destination_for_kind(self.kind).is_some() {
+                    // The bar mode follows every shell mode change (Move In latch).
+                    self.sync_travel_state();
                     let layout =
                         TravelLayout::compute(frame_size[0], frame_size[1], &self.travel_state);
                     if let Some(cmd) = self.travel_chrome.pointer_up(
@@ -2982,7 +2991,7 @@ impl NeighborhoodShell {
             return ShellOutcome::redraw();
         }
         if self.credits_dialog.is_open() {
-            self.close_credits_modal();
+            self.close_credits_and_restore_music();
             return ShellOutcome::redraw();
         }
         if self.coop_lobby.is_open() {
@@ -3428,7 +3437,7 @@ impl NeighborhoodShell {
             };
         }
         if self.credits_dialog.is_open() {
-            self.close_credits_modal();
+            self.close_credits_and_restore_music();
             return ShellOutcome::redraw();
         }
         if self.coop_lobby.is_open() {
@@ -4560,6 +4569,7 @@ impl NeighborhoodShell {
         };
         self.screen = ActiveScreen::Neighborhood;
         self.dialog = None;
+        self.sync_travel_state();
         self.refresh_hovered_lot();
         self.audio_queue
             .push(Input::MusicMode(music_mode_for_kind(self.kind)));
@@ -5170,7 +5180,7 @@ impl NeighborhoodShell {
                 ShellOutcome::redraw()
             }
             NeighborhoodCommand::OpenCredits => {
-                self.open_credits_modal();
+                self.open_credits_with_music();
                 ShellOutcome::redraw()
             }
         }
@@ -6672,6 +6682,35 @@ impl NeighborhoodShell {
             _ => TravelBarMode::Browse,
         };
         self.travel_state.expansions = self.nbhd_state.expansions;
+    }
+
+    /// Opens the credits book with the map's credits music. Every map
+    /// screen's logo handler switches music before showing credits:
+    /// `bkground_credits` on the neighborhood (`0x559397`, `0x56099a`),
+    /// Downtown (`0x54b811`), Studio Town (`0x565b90`) and Vacation Island
+    /// (`0x56a545`); `music_magictown_credits` on Magic Town (`0x552f5d`).
+    fn open_credits_with_music(&mut self) {
+        let mode = match self.kind {
+            NeighborhoodKind::MagicTown => MusicMode::MagicTownCredits,
+            _ => MusicMode::Credits,
+        };
+        self.audio_queue.push(Input::MusicMode(mode));
+        self.open_credits_modal();
+    }
+
+    /// Closes the credits book and restores the map's music, as the native
+    /// close paths do (`station_dtnhood` `0x54b879`, `station_superstar`
+    /// `0x565bf8`, `station_vacation` `0x56a5ad`, `music_magictown`
+    /// `0x552fc5`, `bkground_nhood1` `0x5593ff`).
+    fn close_credits_and_restore_music(&mut self) {
+        if !self.credits_dialog.is_open() {
+            return;
+        }
+        self.close_credits_modal();
+        if matches!(self.screen, ActiveScreen::Neighborhood) {
+            self.audio_queue
+                .push(Input::MusicMode(music_mode_for_kind(self.kind)));
+        }
     }
 
     fn travel_filtered_lot_ids(&self) -> BTreeSet<u16> {

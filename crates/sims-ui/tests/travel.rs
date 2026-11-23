@@ -141,10 +141,6 @@ fn destination_bar_enable_rules_follow_the_native_mode_switch() {
     assert!(browse.contains(&(MoveIn, true, false)));
     assert!(enabled(dest, TravelBarMode::Browse, true).contains(&(ImportLot, true, false)));
 
-    let placing = enabled(dest, TravelBarMode::MoveIn, true);
-    assert!(placing.contains(&(MoveIn, true, true)), "Move In held down");
-    assert!(placing.contains(&(Bulldoze, true, false)));
-
     let doze = enabled(Destination::VacationIsland, TravelBarMode::Bulldoze, true);
     assert_eq!(
         doze,
@@ -447,55 +443,47 @@ fn browse_bar_draws_only_the_banner_and_native_sprites() {
             let mut frame = Frame::new(1024, 768, CLEAR);
             let layout = TravelChrome::new().draw(&mut frame, &state, &art, &strings);
             let [ox, oy] = layout.origin;
-            let sprites: Vec<Rect> = layout
-                .controls
-                .iter()
-                .map(|c| {
-                    let id = match c.control {
-                        TravelControl::ReturnHome => sims_ui::travel::art_id::DOWNTOWN_RETURN,
-                        TravelControl::Web => sims_ui::travel::art_id::INET,
-                        TravelControl::Credits => sims_ui::travel::art_id::DOWNTOWN_LOGO,
-                        TravelControl::ImportLot => dest.import_art_id(),
-                        TravelControl::Bulldoze => sims_ui::travel::art_id::DOWNTOWN_BULLDOZE,
-                        TravelControl::MoveIn => sims_ui::travel::art_id::MOVE_IN,
-                        TravelControl::ToggleFilter(_) => unreachable!("no filters on the bar"),
-                    };
-                    let img = art.image(id).expect("button art");
-                    let cells = if c.control == TravelControl::Credits {
-                        1
-                    } else {
-                        4
-                    };
-                    Rect::new(
-                        c.origin[0],
-                        c.origin[1],
-                        img.width as i32 / cells,
-                        img.height as i32,
-                    )
-                })
-                .collect();
+            // Expected bar: the banner, then each native cell in table order
+            // (enabled 0, held 1, disabled 3; the logo is one cell), clipped
+            // to the bar. Nothing else may differ anywhere in the frame.
+            let mut expected = Frame::new(1024, 768, CLEAR);
+            expected.draw_all(banner, [ox, oy]);
+            for c in &layout.controls {
+                let id = match c.control {
+                    TravelControl::ReturnHome => sims_ui::travel::art_id::DOWNTOWN_RETURN,
+                    TravelControl::Web => sims_ui::travel::art_id::INET,
+                    TravelControl::Credits => sims_ui::travel::art_id::DOWNTOWN_LOGO,
+                    TravelControl::ImportLot => dest.import_art_id(),
+                    TravelControl::Bulldoze => sims_ui::travel::art_id::DOWNTOWN_BULLDOZE,
+                    TravelControl::MoveIn => sims_ui::travel::art_id::MOVE_IN,
+                    TravelControl::ToggleFilter(_) => unreachable!("no filters on the bar"),
+                };
+                let cell = if !c.enabled {
+                    3
+                } else if c.active {
+                    1
+                } else {
+                    0
+                };
+                let sprite = if c.control == TravelControl::Credits {
+                    art.image(id).cloned()
+                } else {
+                    art.cell(id, 4, cell)
+                }
+                .expect("button art");
+                let visible = (sprite.width as i32).min(ox + 800 - c.origin[0]);
+                expected.draw(
+                    &sprite,
+                    Rect::new(0, 0, visible, sprite.height as i32),
+                    c.origin,
+                );
+            }
             for y in 0..768 {
                 for x in 0..1024 {
-                    let got = frame.pixel(x, y).expect("in frame");
-                    let in_bar = (ox..ox + 800).contains(&x) && (oy..oy + 52).contains(&y);
-                    if !in_bar {
-                        assert_eq!(
-                            got, CLEAR,
-                            "{dest:?} {mode:?} painted ({x}, {y}) off the bar"
-                        );
-                        continue;
-                    }
-                    if sprites.iter().any(|r| r.contains(x, y)) {
-                        continue;
-                    }
-                    let b = banner
-                        .pixel((x - ox) as u32, (y - oy) as u32)
-                        .expect("banner pixel");
-                    // Color-keyed banner pixels stay see-through.
-                    let want = if b[3] == 0 { CLEAR } else { [b[0], b[1], b[2]] };
                     assert_eq!(
-                        got, want,
-                        "{dest:?} {mode:?} drew over the banner at ({x}, {y}): banner {b:?}"
+                        frame.pixel(x, y),
+                        expected.pixel(x, y),
+                        "{dest:?} {mode:?} drew a non-native pixel at ({x}, {y})"
                     );
                 }
             }
@@ -525,4 +513,42 @@ fn bar_hit_rects_follow_the_visible_sprites() {
     assert_eq!(hit(5), Some(TravelControl::Credits));
     assert_eq!(hit(74), Some(TravelControl::Credits));
     assert_eq!(hit(75), None);
+}
+
+/// Like `cWinBtn`, a held button shows its down frame only while the pointer
+/// is over it, and the click still lands when released back on it.
+#[test]
+fn held_button_shows_down_frame_only_while_hovered() {
+    let state = TravelState::default();
+    let art = Art::default();
+    let strings = TravelStrings::default();
+    let layout = TravelLayout::compute(800, 600, &state);
+    let ret = layout
+        .controls
+        .iter()
+        .find(|c| c.control == TravelControl::ReturnHome)
+        .copied()
+        .expect("Return");
+    let (cx, cy) = (
+        ret.rect.x + ret.rect.width / 2,
+        ret.rect.y + ret.rect.height / 2,
+    );
+    let mut chrome = TravelChrome::new();
+    let center = |chrome: &TravelChrome| {
+        let mut frame = Frame::new(800, 600, [0, 0, 0]);
+        chrome.draw(&mut frame, &state, &art, &strings);
+        frame.pixel(cx, cy).unwrap()
+    };
+    let idle = center(&chrome);
+    assert!(chrome.pointer_down(cx, cy, &layout));
+    let down = center(&chrome);
+    assert_ne!(idle, down, "pressed button shows its down frame");
+    chrome.pointer_move(400, 300, &layout);
+    assert_eq!(center(&chrome), idle, "dragging off drops the down frame");
+    chrome.pointer_move(cx, cy, &layout);
+    assert_eq!(center(&chrome), down, "dragging back restores it");
+    assert_eq!(
+        chrome.pointer_up(cx, cy, &layout, &state),
+        Some(TravelCommand::ReturnToNeighborhood)
+    );
 }
