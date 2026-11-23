@@ -32,16 +32,27 @@ pub fn lift_bhav(id: u16, label: &str, data: &[u8]) -> Result<BhavChunk> {
 }
 
 /// Formats a [`BhavChunk`] into canonical low-level `.antics` source text that
-/// parses and lowers back to the exact same instruction stream.
+/// parses and lowers back to the exact same instruction stream and payload bytes.
 #[must_use]
 pub fn format_bhav_antics(chunk: &BhavChunk) -> String {
     let mut out = String::new();
     let escaped_label = escape_antics_string(&chunk.label);
-    let _ = writeln!(
+    let _ = write!(
         out,
-        "tree {} \"{}\" (format: {:#06x}, kind: {}, args: {}, locals: {}, revision: {:#010x}) {{",
+        "tree {} \"{}\" (format: {:#06x}, kind: {}, args: {}, locals: {}, revision: {:#010x}",
         chunk.id, escaped_label, chunk.format, chunk.kind, chunk.args, chunk.locals, chunk.revision
     );
+    if !chunk.trailing.is_empty() {
+        out.push_str(", trailing: [");
+        for (i, b) in chunk.trailing.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{b:#04x}");
+        }
+        out.push(']');
+    }
+    out.push_str(") {\n");
     for (idx, ins) in chunk.instructions.iter().enumerate() {
         let _ = writeln!(out, "    @n{idx}:");
         let on_true = format_target(ins.on_true, chunk.instructions.len());
@@ -62,8 +73,8 @@ fn format_target(target: u8, count: usize) -> String {
         0xFD => "error".to_owned(),
         0xFE => "true".to_owned(),
         0xFF => "false".to_owned(),
-        n if usize::from(n) < count => format!("@n{n}"),
-        n => n.to_string(),
+        n if n <= 250 && usize::from(n) < count => format!("@n{n}"),
+        n => format!("raw({n:#04x})"),
     }
 }
 
@@ -77,6 +88,12 @@ fn escape_antics_string(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             '\0' => out.push_str("\\0"),
+            c if c.is_control() => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).as_bytes() {
+                    let _ = write!(out, "\\x{b:02x}");
+                }
+            }
             c => out.push(c),
         }
     }

@@ -302,6 +302,18 @@ impl Parser {
                     "locals" => header.locals = Some(self.expect_u16("BHAV locals")?),
                     "flags" => header.flags = self.expect_u16("BHAV flags")?,
                     "revision" => header.revision = self.expect_u32("BHAV revision")?,
+                    "trailing" => {
+                        self.expect(&TokenKind::LBracket, "'['")?;
+                        let mut bytes = Vec::new();
+                        while !self.eat(&TokenKind::RBracket) {
+                            bytes.push(self.expect_u8("BHAV trailing byte")?);
+                            if !self.eat(&TokenKind::Comma) {
+                                self.expect(&TokenKind::RBracket, "']'")?;
+                                break;
+                            }
+                        }
+                        header.trailing = bytes;
+                    }
                     "id" => {
                         let explicit = self.expect_u16("BHAV id")?;
                         if explicit != id {
@@ -505,6 +517,11 @@ impl Parser {
                 "true" => Ok(Target::ReturnTrue),
                 "false" => Ok(Target::ReturnFalse),
                 "error" => Ok(Target::Error),
+                "raw" if self.eat(&TokenKind::LParen) => {
+                    let b = self.expect_u8("raw branch target")?;
+                    self.expect(&TokenKind::RParen, "')'")?;
+                    Ok(Target::Raw(b))
+                }
                 _ => Ok(Target::Label(s)),
             },
             TokenKind::Int(v) => match v {

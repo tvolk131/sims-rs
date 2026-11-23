@@ -55,6 +55,7 @@ pub struct TreeHeader {
     pub locals: Option<u16>,
     pub flags: u16,
     pub revision: u32,
+    pub trailing: Vec<u8>,
 }
 
 impl Default for TreeHeader {
@@ -66,6 +67,7 @@ impl Default for TreeHeader {
             locals: None,
             flags: 0,
             revision: 0,
+            trailing: Vec::new(),
         }
     }
 }
@@ -86,6 +88,7 @@ pub struct TreeDecl {
 pub enum Target {
     Label(String),
     Node(u8),
+    Raw(u8),
     ReturnTrue,
     ReturnFalse,
     Error,

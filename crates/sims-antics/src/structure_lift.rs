@@ -555,7 +555,8 @@ pub fn lift_bhav_structured(chunk: &BhavChunk) -> StructuredLiftOutcome {
     } else {
         usize::from(chunk.args).min(max_args) as u8
     };
-    let eff_locals = usize::from(chunk.locals).min(max_locals) as u16;
+    // Match `sims_vm::interpreter::dimensions`: the local count is truncated to a byte (`locals as u8`).
+    let eff_locals = usize::from(chunk.locals as u8).min(max_locals) as u16;
 
     // Indexed-entry trees (kind 4) can enter at caller-selected PCs (`interpreter.rs:1786`),
     // so renumbering or pruning unreachable-from-0 nodes would alter semantics.
