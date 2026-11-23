@@ -57,6 +57,9 @@ What was decided:
   branch on a date. An aborted date (Abort Trip, our recovery, not the
   original's) takes the token back, as it takes back a hotel key the trip
   granted; otherwise the leader's next trip would bring the companion.
+  The travel envelope's version goes to 2 to say a departure wrote the
+  token. A version 1 trip, saved before, is still read, and its abort
+  leaves the leader's tokens alone: a token there was the leader's own.
 - **The residual scan reads character files as a lot's load does.** It
   adds the Characters folder of each neighborhood (UserData, UserData2 to
   UserData8) with `Index::add_characters` (found whatever its case,
@@ -90,7 +93,9 @@ How it was checked:
   its DateFlag to the leader. Without the departure token it fails on the
   companion's PetsOutside.
 - A third test departs on a date, reopens the neighborhood, aborts the
-  trip and checks the leader holds no kind-1 token.
+  trip and checks the leader holds no kind-1 token. A unit test in
+  `travel.rs` rewrites such a trip as version 1 and checks its abort keeps
+  the token.
 - The Goth house's 43,200-tick hash is unchanged.
 
 **Unverified:**
@@ -101,12 +106,13 @@ How it was checked:
   runs. Whether the original also places the companion at arrival, as
   the headless date does, or leaves it to routine 19 to make, is part of
   that follow-up.
-- **A traveler other than the family's first member is never placed.**
-  The marker finds the arriving Sim with Generic Sims Call 18, which
-  names the first member of the game's family (0x4e97dc(0)). On Downtown
-  our family is still the whole household, Mortimer first, so a solo trip
-  by Bella leaves her where she arrives: PetsOutside stays 0 and nothing
-  after node 2 runs. The original lets any adult go Downtown, so it must
+- **A trip led by anyone but the family's first member is never
+  placed.** The marker finds the arriving Sim with Generic Sims Call 18,
+  which names the first member of the game's family (0x4e97dc(0)). On
+  Downtown our family is still the whole household, Mortimer first, so a
+  solo trip by Bella leaves her where she arrives: PetsOutside stays 0 and
+  the marker goes on waiting at node 2. A trip Mortimer leads works, with
+  Bella too as his companion, since routine 19 then finds her. The original lets any adult go Downtown, so it must
   give the destination a family the traveler leads; which rule it uses is
   not yet found. The date test uses the household's first member for
   this reason. That is a travel follow-up.
