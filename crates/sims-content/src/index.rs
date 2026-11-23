@@ -1116,26 +1116,33 @@ fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
+fn not_regular_file() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file")
+}
+
+/// Opens `path` without blocking on a FIFO ([`open_nonblocking`]) and refuses
+/// the handle unless `fstat` says it is a regular file. Regular files ignore
+/// O_NONBLOCK, so reads from the returned file behave as usual.
+fn open_regular_nonblocking(path: &Path) -> std::io::Result<File> {
+    let file = open_nonblocking(path)?;
+    if file.metadata()?.is_file() {
+        Ok(file)
+    } else {
+        Err(not_regular_file())
+    }
+}
+
 /// [`far_members`], each with the bytes of its name.
 fn archive_members(path: &Path) -> Result<(Vec<RawMember>, Vec<String>)> {
     let io = |e| Error::io(path, e);
-    let not_regular = || {
-        io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ))
-    };
     // A blocking open of a FIFO (e.g. a `*.far` pipe in Downloads) waits for a
-    // writer. The open is non-blocking, and the opened handle must be a regular
-    // file (fstat), so a FIFO swapped in after the first check cannot block
-    // either. Regular files ignore O_NONBLOCK.
+    // writer. The path is checked first (for targets without a known
+    // O_NONBLOCK), then opened non-blocking and the handle itself checked, so a
+    // FIFO swapped in after the first check cannot block either.
     if !std::fs::metadata(path).map_err(io)?.is_file() {
-        return Err(not_regular());
+        return Err(io(not_regular_file()));
     }
-    let mut file = open_nonblocking(path).map_err(io)?;
-    if !file.metadata().map_err(io)?.is_file() {
-        return Err(not_regular());
-    }
+    let mut file = open_regular_nonblocking(path).map_err(io)?;
     let len = file.metadata().map_err(io)?.len();
     let mut header = [0; 16];
     file.read_exact(&mut header).map_err(io)?;
@@ -1188,4 +1195,39 @@ fn archive_members(path: &Path) -> Result<(Vec<RawMember>, Vec<String>)> {
         ));
     }
     Ok((members, skipped))
+}
+
+#[cfg(all(test, unix))]
+mod fifo_tests {
+    use super::open_regular_nonblocking;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// The open-then-`fstat` path on its own, past the path pre-check: a FIFO with no
+    /// writer is refused without blocking.
+    #[test]
+    fn open_regular_nonblocking_refuses_a_fifo_without_blocking() {
+        let dir =
+            std::env::temp_dir().join(format!("sims-content-fifo-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let fifo = dir.join("pipe.far");
+        let _ = std::fs::remove_file(&fifo);
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should be available on Unix");
+        assert!(status.success(), "mkfifo failed");
+
+        let (send, receive) = mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = send.send(open_regular_nonblocking(&path).map(|_| ()));
+        });
+        let result = receive.recv_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = result
+            .expect("opening a FIFO blocked")
+            .expect_err("a FIFO must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+    }
 }

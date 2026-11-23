@@ -10,6 +10,12 @@ An inline subroutine call reads as many argument words as its callee declares, a
 
 The `structured_equiv` corpus run resolved callee arities the way `sims_vm::interpreter::behavior_from_owner` dispatches trees: globals (256..=4095) from `Global.iff`, private trees (4096..=8191) from the object IFF, and semi-globals (8192+) from the object's `GLOB`-linked IFF. The standalone CLI kept only private arities. As a result, `lift Objects.far --entry Fridges.iff` structured 43/51 trees, against 51/51 in the corpus (ADR `20261123-air-expansion-wave2`), and printed only "unsupported header or target" for the other 8.
 
+## Threat model
+
+- The install is not modified while a `lift` or `--verify-equiv` run is in progress.
+- Supported hosts are macOS and Linux (x86_64 / aarch64), per product scope.
+- Races from concurrent modification, other Unix targets, and Windows file identity are documented residuals (below), not handled.
+
 ## Decision
 
 - **One resolver.** `sims_antics::arity_catalog::InstallArityCatalog` builds the `sims_content` install `Index` and `Catalog`, loads `Global.iff` arities, and resolves semi-globals through `Catalog::semi_globals`. `structured_equiv` and the CLI both call it. `sims-content` moves from a dev-dependency to a dependency of `sims-antics`.
@@ -23,9 +29,11 @@ The `structured_equiv` corpus run resolved callee arities the way `sims_vm::inte
 - **Duplicate IDs.** The VM's library loader keeps the last physical BHAV chunk of an ID, deleted ones included. The original's loader skips deleted chunks. The extractor therefore reads every parseable chunk and leaves an ID unknown when its chunks disagree on arity. That is sound under either rule.
 - **Auto-discovery and file identity.**
   - `lift` walks up from the input path *as given* to the nearest install root (`Install::detect`), so a symlink into another install still uses the install it was reached from. Only after that does it try the canonical path.
-  - The input is opened once. Its bytes are read from that handle, and its identity is taken from the same handle with `fstat`: `(device, inode)` on Unix. At catalog load, every index entry's file is `stat`ed the same way. The input matches the entries with its identity (plus member name and offset inside a FAR), never by path.
+  - The input is opened once. Its bytes are read from that handle, and its identity is taken from the same handle with `fstat`: `(device, inode)` on Unix. The handle stays open until the catalog lookup is done, so its inode cannot be freed and reused. At catalog load, every index entry's file is `stat`ed the same way. The input matches the entries with its identity (plus member name and offset inside a FAR), never by path.
   - This closes the path cases. `Objects/link/../X.iff` opens the `X.iff` beside the link's target, which can have a different `GLOB`, and a hard link or symlink can give one file two roles. It also closes an atomic save between the read and the lookup: the replaced file is a different inode, so it finds no entry and gets private arities only.
   - Off Unix, the identity is the canonical path, which cannot see a replacement.
+  - Index paths are `stat`ed once, at catalog load. A path that is gone (`NotFound`, e.g. a broken symlink) or not a regular file cannot be the regular file being lifted, so it is left out. Any other failure, such as a directory without search permission, leaves a path that might be the lifted file under a role that cannot be resolved. While any such path exists, owner-dependent ranges are unknown for every lift, and the header names the paths.
+  - A hidden test hook, `SIMS_ANTICS_TEST_REPLACE_INPUT_AFTER_READ=<staged file>`, renames a file over the input between the read and the lookup, so the atomic-save test runs through the CLI's own handle.
   - Only regular files enter the catalog, so a FIFO or socket in a mount such as `Downloads/` cannot block discovery. `sims_content` index building opens each `*.far` with `O_NONBLOCK` and refuses the handle unless `fstat` says it is a regular file, recording a diagnostic as it does for any unreadable archive.
   - Catalog errors name paths as `<install>/…`. A `Global.iff` that fails to load leaves only the global range unknown; semi-global links still resolve. On the Complete Collection this adds about 0.4 s.
 - **Overrides.**
@@ -51,8 +59,13 @@ The `structured_equiv` corpus run resolved callee arities the way `sims_vm::inte
 
 ## Residuals
 
-- `sims_content` opens indexed files again later with blocking opens: `Resource::read`, the catalog scan (`catalog.rs`) and the archive pool (`pool.rs`). A FIFO that replaces a file between indexing and those opens makes them hang. They never misread, and changing them is out of scope here.
-- Between the catalog's `stat` of an entry and its own read of that entry, a replacement can still change what the catalog read (for example a `GLOB` link). This window is inside catalog loading, not between the lifted file's read and its lookup.
+These are outside the threat model: they need the install modified during a run, or an unsupported host.
+
+- `sims_content` opens indexed files again later with blocking opens: `Resource::read`, the catalog scan (`catalog.rs`) and the archive pool (`pool.rs`). A FIFO that replaces a file between indexing and those opens makes them hang. They never misread.
+- FAR member offsets are indexed from one archive. If the archive is swapped before the members are read, they are read at those offsets from the new archive (`index.rs` scan).
+- Between the catalog's `stat` of an entry and its own read of that entry, a replacement can change what the catalog read (for example a `GLOB` link).
+- On Windows, the canonical-path identity does not see NTFS hard links, so a hard-linked alias under another role is not detected.
+- On Unix targets without a known `O_NONBLOCK` value (outside macOS/BSD and Linux x86/x86_64/arm/aarch64/riscv64), only the path pre-check guards against a FIFO, so a FIFO swapped in after that check blocks the open.
 
 ## Declined
 

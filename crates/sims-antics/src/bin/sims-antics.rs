@@ -152,7 +152,8 @@ fn print_usage() {
          sims-antics build <pack_dir> --out <dir>\n\
          lift arities: inside an install, global and semi-global callee arities come from its catalog;\n  \
          --globals/--semiglobal replace one range; --no-catalog disables catalog lookup (private arities\n  \
-         from the file only). Equivalent is relative to the arities shown in the `// arity sources:` header."
+         from the file only). Equivalent is relative to the arities shown in the `// arity sources:` header.\n  \
+         Assumes the install is not modified during a run; supported hosts are macOS and Linux (x86_64/aarch64)."
     );
 }
 
@@ -396,7 +397,7 @@ struct ArityOptions {
 fn resolve_lift_arities(
     iff: &Iff,
     input_path: &Path,
-    input_identity: Option<&FileIdentity>,
+    input_identity: Result<&FileIdentity, &str>,
     member: Option<(&str, u64)>,
     opts: &ArityOptions,
 ) -> Result<ResolvedArities, CliError> {
@@ -406,13 +407,16 @@ fn resolve_lift_arities(
         match InstallArityCatalog::find_install_root(input_path) {
             Some(root) => match InstallArityCatalog::load(&root) {
                 Ok(mut catalog) => match input_identity {
-                    Some(identity) => {
+                    Ok(identity) => {
                         let resource = catalog.resource_for(identity, member);
                         catalog.resolve(resource, iff)
                     }
-                    None => ResolvedArities::private_only(
+                    Err(why) => ResolvedArities::private_only(
                         iff,
-                        "could not identify the opened file (fstat failed)",
+                        &format!(
+                            "could not identify the opened file: {}",
+                            sanitize_single_line(why)
+                        ),
                     ),
                 },
                 Err(err) => ResolvedArities::private_only(
@@ -498,7 +502,7 @@ fn read_override_iff(
             return Err(format!("{flag}: {safe_path} is not a FAR archive").into());
         }
         (
-            read_bounded_iff_file(path, file, file_len, header)
+            read_bounded_iff_file(path, &mut file, file_len, header)
                 .map_err(|e| format!("{flag}: {e}"))?,
             safe_path,
         )
@@ -678,7 +682,7 @@ fn read_regular_file_prefix(path: &Path) -> Result<(std::fs::File, u64, Vec<u8>)
 
 fn read_bounded_iff_file(
     path: &Path,
-    mut file: std::fs::File,
+    file: &mut std::fs::File,
     file_len: u64,
     header: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
@@ -692,7 +696,7 @@ fn read_bounded_iff_file(
     let mut bytes = Vec::with_capacity(file_len as usize);
     bytes.extend_from_slice(&header);
     let max_rest = far::MAX_MEMBER.saturating_sub(header.len() as u64);
-    (&mut file)
+    Read::by_ref(file)
         .take(max_rest.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|e| format!("failed to read {safe_path}: {e}"))?;
@@ -1077,10 +1081,12 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     };
 
     let safe_input_path = sanitize_path_display(&input_path);
+    // `file` stays open until the catalog lookup is done: while it is open its inode
+    // cannot be freed and reused by another file.
     let (mut file, file_len, header) = read_regular_file_prefix(&input_path)?;
     // The identity of the file the bytes are read from (fstat on this handle), so the
     // catalog lookup can never match a different file now at this path.
-    let input_identity = FileIdentity::of_open(&file, &input_path).ok();
+    let input_identity = FileIdentity::of_open(&file, &input_path).map_err(|e| e.to_string());
     let has_far_ext = input_path
         .extension()
         .and_then(|e| e.to_str())
@@ -1141,12 +1147,19 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
             )
             .into());
         }
-        let bytes = read_bounded_iff_file(&input_path, file, file_len, header)?;
+        let bytes = read_bounded_iff_file(&input_path, &mut file, file_len, header)?;
         (bytes, safe_input_path, None)
     };
 
     let iff =
         Iff::parse(iff_bytes).map_err(|e| format!("failed to parse IFF {source_label}: {e}"))?;
+
+    // Test hook: replace the input with another file after it was read and before the
+    // catalog lookup (an atomic save), to check the lookup uses the read handle.
+    if let Some(staged) = std::env::var_os("SIMS_ANTICS_TEST_REPLACE_INPUT_AFTER_READ") {
+        std::fs::rename(&staged, &input_path)
+            .map_err(|e| format!("test hook: rename over input failed: {e}"))?;
+    }
 
     // Deduplicate BHAV chunks by resource ID, preferring canonical high-flag-byte 0
     // (matching `Iff::get(b"BHAV", id)` and `sims-vm`), then sort by ID.
@@ -1176,7 +1189,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
         resolve_lift_arities(
             &iff,
             &input_path,
-            input_identity.as_ref(),
+            input_identity.as_ref().map_err(String::as_str),
             far_member
                 .as_ref()
                 .map(|(name, offset)| (name.as_str(), *offset)),
@@ -1831,8 +1844,8 @@ fn run() -> Result<(), CliError> {
             let bhav_a = behaviors.get(&tree_id).ok_or_else(|| {
                 format!("{} does not define tree #{tree_id}", antics_path.display())
             })?;
-            let (iff_file, iff_len, iff_hdr) = read_regular_file_prefix(&iff_path)?;
-            let iff_bytes = read_bounded_iff_file(&iff_path, iff_file, iff_len, iff_hdr)?;
+            let (mut iff_file, iff_len, iff_hdr) = read_regular_file_prefix(&iff_path)?;
+            let iff_bytes = read_bounded_iff_file(&iff_path, &mut iff_file, iff_len, iff_hdr)?;
             let bhav_b = extract_bhav_from_iff(&iff_bytes, tree_id).map_err(|e| e.to_string())?;
             let mut arities = extract_bhav_arities_from_iff(&iff_bytes).unwrap_or_default();
             for (&id, bhav) in &behaviors {

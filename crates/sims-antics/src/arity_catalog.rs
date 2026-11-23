@@ -199,6 +199,9 @@ impl ResolvedArities {
 pub enum ResourceMatch {
     /// Exactly one index resource.
     Unique(usize),
+    /// Some index paths could not be `stat`ed (listed with their errors), so this file
+    /// might also be one of them, under a role that cannot be resolved.
+    Unidentified(Vec<String>),
     /// Several index resources are the same file (hard links, or symlinks into two
     /// mounts), which may give it different code-owner roles.
     Ambiguous(Vec<usize>),
@@ -257,6 +260,9 @@ pub struct InstallArityCatalog {
     semi_cache: BTreeMap<usize, Result<BTreeMap<u16, usize>, String>>,
     /// Each index resource's file identity, taken when the catalog was built.
     identities: Vec<Option<FileIdentity>>,
+    /// Index paths that could not be `stat`ed (and were left out), each with its error.
+    /// Any of them might be the lifted file under another role.
+    unidentified: Vec<String>,
 }
 
 impl InstallArityCatalog {
@@ -267,24 +273,36 @@ impl InstallArityCatalog {
         let relative = |e: String| e.replace(&root_text, "<install>");
         let install = Install::detect(root).map_err(|e| relative(e.to_string()))?;
         let mut index = Index::build(&install).map_err(|e| relative(e.to_string()))?;
-        // The catalog scan opens every IFF; drop anything that is not a regular file
-        // (a FIFO would block the open). Symlinks to regular files stay.
-        let mut regular: BTreeMap<PathBuf, bool> = BTreeMap::new();
-        index.resources.retain(|r| {
-            *regular
-                .entry(r.path.clone())
-                .or_insert_with(|| std::fs::metadata(&r.path).is_ok_and(|m| m.is_file()))
-        });
-        let mut identity_of: BTreeMap<PathBuf, Option<FileIdentity>> = BTreeMap::new();
+        // The catalog scan opens every IFF, so only regular files stay (a FIFO would block
+        // the open; symlinks to regular files stay). One `stat` per path gives both that
+        // test and the file's identity. A path that is gone (`NotFound`: a broken
+        // symlink) or not a regular file cannot be the regular file being lifted; any
+        // other failure (e.g. a directory without search permission) leaves a path that
+        // might be, so it is counted in `unidentified`.
+        let mut stat_of: BTreeMap<PathBuf, Option<FileIdentity>> = BTreeMap::new();
+        let mut unidentified = Vec::new();
+        for r in &index.resources {
+            if stat_of.contains_key(&r.path) {
+                continue;
+            }
+            let identity = match std::fs::metadata(&r.path) {
+                Ok(meta) if meta.is_file() => FileIdentity::of_path(&r.path).ok(),
+                Ok(_) => None,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    unidentified.push(format!("{} ({e})", r.location(&index.root)));
+                    None
+                }
+            };
+            stat_of.insert(r.path.clone(), identity);
+        }
+        index
+            .resources
+            .retain(|r| stat_of.get(&r.path).is_some_and(Option::is_some));
         let identities = index
             .resources
             .iter()
-            .map(|r| {
-                identity_of
-                    .entry(r.path.clone())
-                    .or_insert_with(|| FileIdentity::of_path(&r.path).ok())
-                    .clone()
-            })
+            .map(|r| stat_of.get(&r.path).cloned().flatten())
             .collect();
         let pool = ArchivePool::new();
         let catalog =
@@ -311,6 +329,7 @@ impl InstallArityCatalog {
             global_location,
             semi_cache: BTreeMap::new(),
             identities,
+            unidentified,
         })
     }
 
@@ -344,6 +363,9 @@ impl InstallArityCatalog {
             (Some(have), Some((name, offset))) => have.name == name && have.offset == offset,
             _ => false,
         };
+        if !self.unidentified.is_empty() {
+            return ResourceMatch::Unidentified(self.unidentified.clone());
+        }
         let matches: Vec<usize> = self
             .index
             .resources
@@ -393,6 +415,17 @@ impl InstallArityCatalog {
             ResourceMatch::Unindexed => {
                 ResolvedArities::private_only(iff, "file not in install index")
             }
+            ResourceMatch::Unidentified(paths) => {
+                let mut shown = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+                if paths.len() > 3 {
+                    shown.push_str(&format!(" and {} more", paths.len() - 3));
+                }
+                let why = format!(
+                    "unknown code-owner role: {} install index path(s) could not be identified: {shown}",
+                    paths.len()
+                );
+                self.global_only(&why)
+            }
             ResourceMatch::Ambiguous(entries) => {
                 let mut each = entries.iter().map(|&r| self.resolve_entry(r, iff));
                 let first = each.next().expect("an ambiguous match has entries");
@@ -412,14 +445,7 @@ impl InstallArityCatalog {
                     "ambiguous: the same file is indexed as {}, with different code-owner roles",
                     locations.join(" and ")
                 );
-                let mut resolved = ResolvedArities {
-                    arities: BTreeMap::new(),
-                    private: ArityPart::missing(&why),
-                    global: ArityPart::missing("unset"),
-                    semi_global: ArityPart::missing(&why),
-                };
-                self.apply_global(&mut resolved);
-                resolved
+                self.global_only(&why)
             }
         }
     }
@@ -486,6 +512,18 @@ impl InstallArityCatalog {
                 resolved.semi_global = ArityPart::missing("no resolved GLOB link");
             }
         }
+        resolved
+    }
+
+    /// Only the owner-independent global range; the others are unknown for `why`.
+    fn global_only(&self, why: &str) -> ResolvedArities {
+        let mut resolved = ResolvedArities {
+            arities: BTreeMap::new(),
+            private: ArityPart::missing(why),
+            global: ArityPart::missing("unset"),
+            semi_global: ArityPart::missing(why),
+        };
+        self.apply_global(&mut resolved);
         resolved
     }
 

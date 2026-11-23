@@ -2529,33 +2529,75 @@ fn lift_file_indexed_under_two_roles_is_ambiguous() {
     }
 }
 
-/// An atomic save replaces the file at a path with a new inode. The catalog lookup uses
-/// the identity of the handle the bytes were read from, so the replaced file never
-/// matches the new index entry.
+/// An atomic save replaces the file at a path with a new inode. The CLI's test hook
+/// renames a staged file over the input after the CLI has read it and before the
+/// catalog lookup; the lookup uses the identity of the CLI's own read handle, so the
+/// replaced file finds no index entry and the new file's role is not borrowed.
 #[cfg(unix)]
 #[test]
-fn catalog_lookup_never_matches_a_file_replaced_after_reading() {
-    use sims_antics::arity_catalog::{FileIdentity, InstallArityCatalog, ResourceMatch};
-
+fn lift_catalog_lookup_never_matches_a_file_replaced_after_reading() {
     let install = SyntheticInstall::new();
     let objects = install.root.join("GameData").join("Objects");
     let loose = objects.join("Loose.iff");
-    let read_handle = std::fs::File::open(&loose).expect("open Loose.iff");
-
     let staged = objects.join("Loose.iff.saving");
     std::fs::write(&staged, synthetic_object_iff(Some(b"TestGlobals"))).expect("stage");
-    std::fs::rename(&staged, &loose).expect("atomic replace");
 
-    let catalog = InstallArityCatalog::load(&install.root).expect("load catalog");
-    let read_identity = FileIdentity::of_open(&read_handle, &loose).expect("fstat");
-    assert_eq!(
-        catalog.resource_for(&read_identity, None),
-        ResourceMatch::Unindexed,
-        "the file that was read is no longer indexed"
+    let out = Command::new(cli_bin())
+        .arg("lift")
+        .arg(&loose)
+        .arg("--list")
+        .env("SIMS_ANTICS_TEST_REPLACE_INPUT_AFTER_READ", &staged)
+        .output()
+        .expect("run lift");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let now = FileIdentity::of_path(&loose).expect("stat");
-    assert!(matches!(
-        catalog.resource_for(&now, None),
-        ResourceMatch::Unique(_)
-    ));
+    assert!(!staged.exists(), "the hook must have replaced the input");
+    assert!(
+        stdout.contains("global 256..=4095: none (file not in install index)")
+            && stdout.contains("semi-global 8192+: none (file not in install index)"),
+        "the replaced file must not take the new file's GLOB link:\n{stdout}"
+    );
+}
+
+/// An index path that cannot be `stat`ed (here: in a directory without search
+/// permission) might be the lifted file under another role, so owner-dependent ranges
+/// are unknown and the header names it.
+#[cfg(unix)]
+#[test]
+fn lift_with_an_unidentifiable_index_path_keeps_owner_ranges_unknown() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    let locked = objects.join("locked");
+    std::fs::create_dir_all(&locked).expect("mkdir locked");
+    std::fs::write(locked.join("Hidden.iff"), synthetic_object_iff(None)).expect("write");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let _restore = RestoreMode(locked.clone());
+    if std::fs::metadata(locked.join("Hidden.iff")).is_ok() {
+        eprintln!("skipping: permissions are not enforced for this user");
+        return;
+    }
+
+    let loose = objects.join("Loose.iff");
+    let (ok, stdout, stderr) = run_lift(&[loose.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    let why = "unknown code-owner role: 1 install index path(s) could not be identified: GameData/Objects/locked/Hidden.iff (";
+    assert!(
+        stdout.contains("global 256..=4095: 2 from GameData/Global/Global.iff (install catalog)")
+            && stdout.contains(&format!("private 4096..=8191: none ({why}"))
+            && stdout.contains(&format!("semi-global 8192+: none ({why}")),
+        "{stdout}"
+    );
 }
