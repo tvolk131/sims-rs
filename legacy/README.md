@@ -11,6 +11,36 @@ still encodes hard-won knowledge of primitive semantics, file formats,
 routing and rendering, so it stays here to be read while the new crates are
 written.
 
-`docs/salvage-audit.md` lists, crate by crate, what to port, what to read
-for behavior only, and what to leave. Each legacy crate is deleted once it has
-been fully mined. The tag keeps everything recoverable.
+## Rules
+
+- **Never edit legacy code.** Read it, port from it, cite it.
+- **A whole crate may be deleted** once a mining audit shows nothing in it is
+  left to port: every piece of knowledge is either ported (with its new
+  location) or deliberately dropped (with the vision, ADR or salvage-audit
+  line that drops it). If in doubt, it stays. See
+  `docs/decisions/20261123-legacy-crate-by-crate-cleanup.md`.
+- **Everything stays recoverable** from the tag `legacy-final` (e1b72647). A
+  citation of a deleted crate is written `legacy-final:legacy/crates/<crate>/...`;
+  read it with `git show legacy-final:legacy/crates/<crate>/<path>`.
+
+## Crates
+
+`docs/salvage-audit.md` gives the original port/reference/drop verdicts.
+`docs/legacy-mining-audit.md` gives the per-crate mining audit and the
+backlog of what is still to mine.
+
+| Crate | State |
+| --- | --- |
+| sims-app | stays (still to mine: see the mining audit) |
+| sims-content | stays (still to mine) |
+| sims-formats | stays (still to mine; leftovers only) |
+| sims-render | stays (still to mine) |
+| sims-runtime | stays (still to mine) |
+| sims-sim | stays (still to mine) |
+| sims-vm | stays (still to mine) |
+| sims-fixtures | removed 2026-11-23; at `legacy-final` |
+| sims-kernel | removed 2026-11-23; at `legacy-final` |
+| sims-tools | removed 2026-11-23; at `legacy-final` |
+
+The remaining crates' `Cargo.toml` files still name the removed crates as
+dependencies. That doesn't matter, because nothing here is built.
