@@ -14,9 +14,19 @@ the repository, and so do the captures.
 - The game ISO.
 - An installed guest disk: an ext4 image of an i386 Debian with Wine, with the
   game installed in `/root/installer-prefix` and booting through
-  `/sims-init.sh`.
-- The guest's kernel and initramfs. The initramfs switches root to `/dev/vda`
-  and runs `/sims-init.sh`.
+  `/sims-init.sh`. `prepare_guest.sh` clones it and never writes it, so it
+  can be kept read-only. Its kernel is in `/boot` and its modules in
+  `/lib/modules`.
+- The kernel and initramfs the guest boots, made from that disk by
+  `build_runtime.sh <installed guest ext4> <out dir>`. It copies the disk's
+  `/boot/vmlinuz-<version>` and builds an initramfs with the disk's static
+  busybox, the modules for the root disk (virtio_pci, virtio_blk,
+  crc32c_generic, ext4 and what they need) and `runtime/init`, which mounts
+  `/dev/vda`, moves `/dev`, `/proc` and `/sys` onto it and switch_roots into
+  `/sims-init.sh`. The 9p share and the CD-ROM drivers are loaded later, from
+  the disk. The same disk gives the same two files byte for byte, and
+  `runtime.txt` next to them records the kernel version, the modules and
+  the digests. Nothing else is needed to make them again.
 - The install whose `UserData*` folders the game should read. They are the
   same folders our simulation reads, so the dump needs no other
   neighborhood file.
@@ -26,6 +36,10 @@ the repository, and so do the captures.
 | File | What it does |
 | --- | --- |
 | `Dockerfile` | The `sims-harness-qemu:bookworm` image: Debian bookworm with `qemu-system-i386`, e2fsprogs and perl. |
+| `build_runtime.sh` | Makes the kernel and initramfs from an installed guest disk (see Inputs), with debugfs inside the image and the disk mounted read-only. |
+| `runtime/init` | `/init` of the initramfs. |
+| `runtime/build_in_image.sh` | The part of `build_runtime.sh` that runs in the image: it reads the kernel, busybox and modules off the disk and packs them. |
+| `runtime/newc.pl` | Writes a directory as a cpio archive in the kernel's initramfs format, with names sorted, owner root and mtime 0. Only perl-base, which the image has. |
 | `prepare_guest.sh` | Makes a new guest directory. It clones the disk, copies the UserData folders and their hashes, and installs `guest/sims-init.sh`. |
 | `guest/sims-init.sh` | PID 1 in the guest. It mounts the host share at `/research` and runs each `/research/cmd/<n>.sh` once. |
 | `guest/prepare_disk.sh` | Replaces `/sims-init.sh` on the cloned disk, using debugfs inside the image. |
@@ -48,8 +62,9 @@ the repository, and so do the captures.
 
 ```sh
 docker build --platform linux/arm64 -t sims-harness-qemu:bookworm tools/harness
+tools/harness/build_runtime.sh <installed guest ext4> <runtime dir>   # once
 tools/harness/prepare_guest.sh <install> <installed guest ext4> <new guest dir>
-tools/harness/start_vm.sh <guest dir> <game iso> <vmlinuz> <initramfs.cpio.gz>
+tools/harness/start_vm.sh <guest dir> <game iso> <runtime dir>/vmlinuz <runtime dir>/initramfs.cpio.gz
 python3 tools/harness/guest.py <guest dir>/share run 'sh /research/launch.sh' 900
 ```
 

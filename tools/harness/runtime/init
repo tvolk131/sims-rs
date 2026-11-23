@@ -1,0 +1,24 @@
+#!/bin/busybox sh
+# /init of the harness initramfs (the kernel runs it: rdinit=/init). It loads
+# the drivers for the root disk, mounts /dev/vda and switch_roots into the
+# guest's /sims-init.sh, moving /dev, /proc and /sys across: sims-init.sh
+# mounts neither /proc nor /sys, and Wine needs both. The same steps as the
+# initramfs the first harness VMs booted from (2026-10-10).
+set -eu
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+modprobe virtio_pci
+modprobe virtio_blk
+modprobe crc32c_generic
+modprobe ext4
+mkdir -p /newroot
+for attempt in 1 2 3 4 5; do
+    test -b /dev/vda && break
+    sleep 1
+done
+mount -t ext4 /dev/vda /newroot
+mount --move /dev /newroot/dev
+mount --move /proc /newroot/proc
+mount --move /sys /newroot/sys
+exec switch_root /newroot /sims-init.sh
