@@ -2372,7 +2372,10 @@ impl Parser {
                     {
                         self.bump();
                         self.bump();
-                        return Ok(V2Stmt::ReturnError { span });
+                        return Ok(V2Stmt::ReturnError {
+                            span,
+                            from_try: false,
+                        });
                     }
                     let expr = self.parse_expr()?;
                     self.expect(&TokenKind::Semicolon, "';'")?;

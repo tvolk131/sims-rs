@@ -622,6 +622,9 @@ pub enum V2Stmt {
     /// `return error;` — exits the whole BHAV through the SimAntics error exit.
     ReturnError {
         span: Span,
+        /// Synthesized by `cond?;`: always the error exit, even when a binding named `error`
+        /// is in scope (a written `return error;` then returns that binding instead).
+        from_try: bool,
     },
     Expr {
         span: Span,

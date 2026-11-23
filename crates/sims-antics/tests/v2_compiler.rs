@@ -7173,6 +7173,8 @@ object "Interop Review" {
     state h: i16;
     state cleaned: i16;
     state got: i16;
+    state nv: i16;
+    state cleaned2: i16;
 
     tree take "Take" (a: i16, b: i16) -> i16 @ temp[4] {
         return b;
@@ -7203,7 +7205,23 @@ object "Interop Review" {
         self.got = v;
     }
 
+    // `cond?;` always takes the error exit, even with a local named `error` in scope.
+    @id(4212) tree try_err "Try Err" (sim: Sim) {
+        let error = true;
+        defer {
+            self.cleaned2 += 1;
+        }
+        (self.n > 100)?;
+        return false;
+    }
+    tree none_val "None Val" -> Result<i16 @ temp[0]> {
+        let None = 7;
+        return None;
+    }
+
     init {
+        let v = none_val()?;
+        self.nv = v;
         // Named arguments evaluate left to right in source order.
         self.seen = take(b: self.n, a: change());
         if chk() {
@@ -7250,6 +7268,16 @@ fn maxis_interop_review_regressions_run_live() {
     assert!(vm.try_run_tree(o, 4211, 7).expect("success path"));
     assert_eq!(vm.obj_attr(o, 4), 2);
     assert_eq!(vm.obj_attr(o, 5), 7);
+    assert_eq!(
+        vm.obj_attr(o, 6),
+        7,
+        "a local named 'None' is returned as a value"
+    );
+    let err = vm
+        .try_run_tree(o, 4212, 0)
+        .expect_err("'cond?' with a local 'error' must still exit via error");
+    assert!(format!("{err:?}").contains("ErrorBranch"), "{err:?}");
+    assert_eq!(vm.obj_attr(o, 7), 1, "defer ran before the error exit");
 
     // Rebinding the Sim name turns `actor.count` into a foreign read that swaps stack_obj, so the
     // tree must save its own object first and write through the saved handle.
@@ -7262,12 +7290,22 @@ object "Rebind" {
         let n = actor.count;
         self.count = n + 1;
     }
+    extern bcon ext { first @ 257[0]; second @ 257[1]; }
+    tree take "Take" (a: i16 @ temp[0], b: i16 @ temp[1]) {
+    }
+    main {
+        take(b: ext.second, a: 11);
+    }
 }
 "#;
     let expanded = sims_antics::v2::expand_v2_source_to_objects("rebind.antics", src, &cfg)
         .expect("expand rebind");
     let air = &expanded[0].air_source;
     assert!(air.contains("let __self_obj = stack_obj;"), "{air}");
+    // Runtime BCON arguments are read (and may fault) before any temp is staged.
+    let first_read = air.find("= bcon[").expect("runtime bcon snapshot");
+    let first_stage = air.find("temp[0] := 11;").expect("staged literal");
+    assert!(first_read < first_stage, "{air}");
 }
 
 #[test]

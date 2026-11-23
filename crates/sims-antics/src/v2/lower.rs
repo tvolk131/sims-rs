@@ -3419,13 +3419,17 @@ impl<'a> TreeLowerer<'a> {
             let later_impure = source_order[k + 1..]
                 .iter()
                 .any(|&j| !self.is_pure_single_operand(values[j]));
-            operands[i] = if const_val.is_none() && (air.contains("temp[") || later_impure) {
-                let snap = self.fresh("arg");
-                self.line(format!("let {snap} = {air};"));
-                (snap, None)
-            } else {
-                (air, const_val)
-            };
+            // A runtime (`extern bcon`) read can fault on a missing chunk: read it now, in source
+            // order, so a fault cannot follow a partial temp staging or an out-of-order read.
+            let may_fault = air.starts_with("bcon[");
+            operands[i] =
+                if const_val.is_none() && (air.contains("temp[") || later_impure || may_fault) {
+                    let snap = self.fresh("arg");
+                    self.line(format!("let {snap} = {air};"));
+                    (snap, None)
+                } else {
+                    (air, const_val)
+                };
         }
 
         let positional: Vec<usize> = (0..n)
@@ -3675,7 +3679,7 @@ impl<'a> TreeLowerer<'a> {
             ));
         };
         if abi.allow_none
-            && (matches!(raw_expr, V2Expr::Ident(_, n) if n == "None")
+            && (matches!(raw_expr, V2Expr::Ident(_, n) if n == "None" && self.lookup_var(n).is_none())
                 || (matches!(raw_expr, V2Expr::Bool(_, false)) && expected_ty != ValueType::Bool))
         {
             self.emit_all_cleanups()?;
@@ -4626,12 +4630,13 @@ impl<'a> TreeLowerer<'a> {
                     }
                 }
             }
-            V2Stmt::ReturnError { span } => {
-                // `error` bound as a local/param/i16 or bool param keeps its pre-v2-interop
-                // meaning: `return error;` returns that value, not the BHAV error exit.
-                if self.lookup_var("error").is_some()
-                    || self.env.i16_params.contains_key("error")
-                    || self.env.bool_params.contains_key("error")
+            V2Stmt::ReturnError { span, from_try } => {
+                // A written `return error;` with `error` bound as a local/param/i16 or bool param
+                // keeps its pre-v2-interop meaning (returns that value). `cond?;` always errors.
+                if !*from_try
+                    && (self.lookup_var("error").is_some()
+                        || self.env.i16_params.contains_key("error")
+                        || self.env.bool_params.contains_key("error"))
                 {
                     return self.lower_stmt(&V2Stmt::Return {
                         span: *span,
@@ -5525,7 +5530,10 @@ impl<'a> TreeLowerer<'a> {
                         op: V2UnaryOp::Not,
                         inner: inner.clone(),
                     },
-                    then_body: vec![V2Stmt::ReturnError { span: *span }],
+                    then_body: vec![V2Stmt::ReturnError {
+                        span: *span,
+                        from_try: true,
+                    }],
                     else_body: Vec::new(),
                 };
                 self.lower_stmt(&desugared)

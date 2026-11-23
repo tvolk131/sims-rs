@@ -39,7 +39,7 @@ extern mod lamp_semi { @id(8192) fn doubled(x: i16) -> Result<i16 @ temp[1]>; }
   - `call ID(a, b)` (literal operands) is used when every positional argument is a compile-time constant. Constants include literals, bools, i16 params, enum constants and private BCON entries. There must be at most 4, and not all four may be `-1` (the `call(temps)` sentinel).
   - Otherwise the call uses `temp[i] := arg_i; ...; call ID(temps)`.
   - Temp-bound arguments are always written as `temp[N] := expr;` before the call.
-  - Arguments are evaluated left to right in *source* order (named arguments may be reordered) before any temp is written. An operand that reads a temp, or one followed by an argument that may run code, is snapshotted into a fresh local first.
+  - Arguments are evaluated left to right in *source* order (named arguments may be reordered) before any temp is written. Runtime `extern bcon` arguments, which fault when the chunk is missing, are read into locals first. An operand that reads a temp, or one followed by an argument that may run code, is snapshotted into a fresh local first.
 - **Return ABIs:**
 
   | Declared | Statement `f();` | `f()?;` | Condition `if f()` | Value `x = f()` |
@@ -55,7 +55,8 @@ extern mod lamp_semi { @id(8192) fn doubled(x: i16) -> Result<i16 @ temp[1]>; }
   - Postfix `?` on a call lowers as described above.
   - `cond?;` on any bool expression is sugar for `if !cond { return error; }`.
   - `return error;` and `?` are rejected inside `defer`. That includes a constant `true?`.
-  - **Backward compatibility.** When `error` is bound (a local, a helper/tree parameter, or an i16/bool `param`), `return error;` keeps its old meaning: it returns that value.
+  - **Backward compatibility.** When `error` is bound (a local, a helper/tree parameter, or an i16/bool `param`), a *written* `return error;` keeps its old meaning: it returns that value. The exit synthesized by `?` is always the error exit.
+  - **Dead code in `defer`.** A `?` in a branch that constant-folds away inside `defer` is not diagnosed. This matches the existing handling of `return` inside `defer`.
 - **Why `if call X { }` rather than a bare `call X;`:** `.air` routes a bare call's false exit to `return false`. The empty `if` sends both exits to the next node: one node, no extra instructions.
 
 ### 2. Sparse / Explicit-Slot States
@@ -112,7 +113,7 @@ tree bump "Bump Hits" (sim: Sim, n: i16) { self.fridge_hits += n; }  // Sim-on-o
   - A mismatch is a compile error. BHAV calls copy, but never propagate back, the caller's `stack_obj`, so calls never clobber it.
   - Rebinding the Sim name with `let` makes the `stack_obj`-clobber analysis assume a clobber, so the tree saves `__self_obj`.
 - **No `->` means a check tree.** A tree without `->` behaves like a SimAntics check/action tree: it may `return true/false/<bool>`, falls through to `return true`, and can be used as a condition.
-- **`Result<T @ temp[N]>` failure.** `Result<T @ temp[N]>` trees take the false exit with `return None;`, or with `return false;` when `T` is not bool. The caller's `?` then runs the caller's own cleanups before its error exit.
+- **`Result<T @ temp[N]>` failure.** `Result<T @ temp[N]>` trees take the false exit with `return None;` (unless `None` is a bound local), or with `return false;` when `T` is not bool. The caller's `?` then runs the caller's own cleanups before its error exit.
 - **Must return on every path.** Trees declaring `-> bool`, `-> T @ temp[N]` or `-> Result<T @ temp[N]>` must return on every path. Value returns write `temp[N]`. When the expression is alias- and trap-safe and no cleanups are active, compound arithmetic lowers in place into `temp[N]`. The example above is 6 nodes in total: compare, 4 in-place arithmetic, and `else`.
 - **Reserved idents.** Tree idents may not shadow built-in calls or helper `fn`s. The check covers every module that contributes members to the object, so an inherited tree cannot shadow the deriving module's helper.
 - **Return analysis ignores constant conditions.** It is a syntactic check, like Rust's: `if true { return 7; }` without an `else` still needs a final return. Write `return error;` rather than `false?;` for an unconditional error exit.
@@ -155,5 +156,8 @@ Lowers to `remove_object(me|stack_obj, flags: N)`, using the same bits as `.air`
     - named arguments evaluated in source order;
     - `return error;` with a bound `error` (a tree local and an inlined helper parameter);
     - `Result<T>` tree `return None;` running the caller's `defer` before `?` exits via error;
-    - a rebound Sim name saving `__self_obj`.
+    - a rebound Sim name saving `__self_obj`;
+    - `cond?` exiting via error with a local `error` in scope;
+    - a local named `None` returned as a value;
+    - runtime BCON call arguments read before temp staging.
 - **Parity.** All 20 `open-pack/objects/*.antics` expand to **byte-identical** `.air` against `main` (`ce1110c4`, CLI `expand --pack open-pack`). `sims-game --test cheats_cache_and_open_pack` passes 7/7.
