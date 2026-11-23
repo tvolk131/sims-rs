@@ -56,6 +56,23 @@ pub struct LiftSymbols {
     pub strings: BTreeMap<u16, Vec<String>>,
 }
 
+impl LiftSymbols {
+    /// The symbols that apply to calls made by tree `caller`. A private call runs the
+    /// code owner's tree; only a private caller's owner is known to be this file, so a
+    /// global or semi-global caller gets no private-callee labels.
+    #[must_use]
+    pub fn for_caller(&self, caller: u16) -> std::borrow::Cow<'_, Self> {
+        if (4096..=8191).contains(&caller) || self.bhav_labels.is_empty() {
+            std::borrow::Cow::Borrowed(self)
+        } else {
+            std::borrow::Cow::Owned(Self {
+                bhav_labels: BTreeMap::new(),
+                ..self.clone()
+            })
+        }
+    }
+}
+
 fn collect_canonical_chunks<'a>(
     iff: &'a sims_formats::iff::Iff,
     tag: &'a [u8; 4],
@@ -1977,6 +1994,8 @@ pub fn lift_bhav_structured_with_context(
     callee_arities: Option<&BTreeMap<u16, usize>>,
     symbols: Option<&LiftSymbols>,
 ) -> StructuredLiftOutcome {
+    let scoped = symbols.map(|s| s.for_caller(chunk.id));
+    let symbols = scoped.as_deref();
     let precheck = match structured_lift_precheck(chunk, callee_arities) {
         Ok(p) => p,
         Err(_) => return StructuredLiftOutcome::UnsupportedHeaderOrTarget,
