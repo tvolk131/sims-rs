@@ -10273,6 +10273,12 @@ impl Game {
     /// kinds `5..=15`) in either single-player (`Lot::answer_special_panel` +
     /// tick replay) or co-op lockstep (`sims_vm::coop::special_panel_answer_command`).
     pub fn answer_special_panel(&mut self, response: SpecialPanelResponse) -> bool {
+        if self.special_panel_preview {
+            // A synthetic preview panel never answers a real VM request,
+            // even one that happens to be waiting.
+            self.close_special_panel_ui();
+            return false;
+        }
         let Some(asking) = self.lot.asking_special_panel() else {
             self.close_special_panel_ui();
             self.note = Some("No special panel waits for a response.".into());

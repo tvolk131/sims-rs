@@ -145,6 +145,34 @@ eye:
   `pattern_left − arrow − 2`. No oracle shot shows a second page, so this
   is unverified.
 
+- **Phone book:** the "is on the lot" filter treats every registered
+  person object as present. A neighbor whose person object stays
+  registered off the map would be left out (Sol review P3).
+
+## Sol review
+
+Round 1 (`gpt-6.2-sol`, high, at `4a49b4f4`) found `P0=0, P1=0, P2=3,
+P3=5`, so there was no round 2. Fixed:
+
+- **P2:** the native Visit picker layout dropped Vacation Island and Studio
+  Town filters at 800 px and wider. It now applies only to the
+  oracle-measured Downtown and Magic Town pickers
+  (`Destination::picker_is_native`).
+- **P2:** Magic Town's dialog trim let hover and clicks through to lots
+  under it. Hover, press and release now use `TravelLayout::blocks_map`.
+- **P2:** after a resize, the phone book could call a contact that was no
+  longer on screen. The page is now derived from the selection, with a
+  regression test.
+- **P3:** a preview panel never answers a waiting VM request.
+- **P3:** Magic Town's Family Bin button now includes the bar origin in
+  its Y.
+- **P3:** the snapshot test asserts that each panel paints and that the
+  wardrobe and charm lists are not empty.
+- **P3:** both new tests fail, instead of skipping, when an environment
+  path is set but missing.
+
+The off-map phone book P3 is left as a follow-up above.
+
 ## Unverified assumptions
 
 - Wardrobe modes 1–5 categories, and the item order for kind 14.

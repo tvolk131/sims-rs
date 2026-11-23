@@ -23,9 +23,13 @@ use std::path::{Path, PathBuf};
 
 const SIZE: [i32; 2] = [800, 600];
 
+/// The folder `name` names, or `None` when it is unset. A set variable
+/// that is not a folder fails the test instead of skipping it, so a typo or
+/// an unmounted fixture cannot pass with nothing checked.
 fn env_dir(name: &str) -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os(name)?);
-    dir.is_dir().then_some(dir)
+    assert!(dir.is_dir(), "{name}={} is not a folder", dir.display());
+    Some(dir)
 }
 
 fn snapshot(name: &str, canvas: &Canvas) {
@@ -68,13 +72,40 @@ fn dog_guid(install: &Install) -> Option<u32> {
         })
 }
 
+/// Asserts the panel actually painted: at least a third of the central
+/// 400×300 window differs from `before`, the same view with no panel.
+fn assert_drawn(name: &str, before: &[u32], after: &Canvas) {
+    assert_eq!(
+        before.len(),
+        after.color.len(),
+        "{name}: frame size changed"
+    );
+    let (w, h) = (after.width, after.color.len() / after.width);
+    let (x0, y0) = (w / 2 - 200, h / 2 - 150);
+    let changed = (y0..y0 + 300)
+        .flat_map(|y| (x0..x0 + 400).map(move |x| y * w + x))
+        .filter(|&i| before[i] != after.color[i])
+        .count();
+    assert!(
+        changed * 3 >= 400 * 300,
+        "{name} must draw over the view: only {changed} of 120000 central pixels changed"
+    );
+}
+
 /// Opens `request` over `world` (closing the previous panel), checks a
-/// modal is up and snapshots it.
-fn preview(game: &mut Game, name: &str, request: SpecialPanelRequest, world: &sims_sim::World) {
+/// modal is up and painted, and snapshots it.
+fn preview(
+    game: &mut Game,
+    name: &str,
+    request: SpecialPanelRequest,
+    world: &sims_sim::World,
+    before: &[u32],
+) {
     game.preview_special_panel(request.clone(), world);
     game.render();
     assert!(game.has_dialog(), "{name} must open a modal");
     assert_eq!(game.active_special_panel_request(), Some(&request));
+    assert_drawn(name, before, game.canvas());
     snapshot(name, game.canvas());
 }
 
@@ -87,6 +118,7 @@ fn wave2_panels_open_and_draw_with_native_art() {
     let install = Install::detect(&root).expect("open install");
 
     let mut game = open_goth(&root);
+    let before = game.canvas().color.clone();
     let world = game.lot().world().clone();
     let sim = world.selected().expect("Mortimer selected");
     let neighbor = world.objects[&sim]
@@ -104,6 +136,7 @@ fn wave2_panels_open_and_draw_with_native_art() {
             caller_neighbor: neighbor,
         },
         &world,
+        &before,
     );
     assert!(
         game.phonebook_snapshot()
@@ -152,6 +185,7 @@ fn wave2_panels_open_and_draw_with_native_art() {
             caller_neighbor: neighbor,
         },
         &social_world,
+        &before,
     );
     let listed = game.phonebook_snapshot().expect("phone book").entries.len();
     assert_eq!(
@@ -168,13 +202,19 @@ fn wave2_panels_open_and_draw_with_native_art() {
             mode: 0,
         },
         &world,
+        &before,
     );
+    let wardrobe = game.shop_snapshot().expect("wardrobe").items.len();
+    assert!(wardrobe > 0, "the everyday wardrobe lists outfits");
     preview(
         &mut game,
         "charm-transform",
         SpecialPanelRequest::CharmTransform { person: sim },
         &world,
+        &before,
     );
+    let charms = game.shop_snapshot().expect("charm").items.len();
+    assert!(charms > 0, "the charm transform lists outfits");
 
     // A dog in Mortimer's place, so the pet picker has a skeleton to turn.
     if let Some(guid) = dog_guid(&install) {
@@ -187,6 +227,7 @@ fn wave2_panels_open_and_draw_with_native_art() {
             "pet-picker",
             SpecialPanelRequest::PetPicker { pet: sim },
             &dog_world,
+            &before,
         );
         // Try On turns the breed on the 3D turntable.
         game.shop_try_on_selected();
@@ -208,6 +249,7 @@ fn wave2_panels_open_and_draw_with_native_art() {
         "spellbook",
         SpecialPanelRequest::SpellBook { caller: Some(sim) },
         &world,
+        &before,
     );
     assert!(game.book_open(), "Spellbook opens");
     let title = &game.book_snapshot().expect("Spellbook").title;
@@ -228,10 +270,12 @@ fn wave2_panels_open_and_draw_with_native_art() {
     shell.resize(SIZE);
     shell.enter_lot(5).expect("enter Goth house");
     shell.render();
+    let lot_view = shell.canvas().color.clone();
 
     shell.open_photo_album().expect("open Photo Album");
     shell.render();
     assert!(shell.album_open());
+    assert_drawn("photo-album", &lot_view, shell.canvas());
     snapshot("photo-album", shell.canvas());
     shell.close_photo_album();
 
@@ -240,11 +284,13 @@ fn wave2_panels_open_and_draw_with_native_art() {
         .expect("open the Travel dialog");
     shell.render();
     assert!(shell.travel_dialog_open());
+    assert_drawn("travel-dialog", &lot_view, shell.canvas());
     snapshot("travel-dialog", shell.canvas());
     shell.close_travel_dialog();
 
     shell.leave_lot(false).expect("back to the neighborhood");
     shell.render();
+    let neighborhood_view = shell.canvas().color.clone();
     // Export the Goths as a `.FAM` so the Import picker has a family to list.
     let stored = shell
         .store()
@@ -272,5 +318,6 @@ fn wave2_panels_open_and_draw_with_native_art() {
     shell.release(point);
     shell.render();
     assert!(shell.import_picker_open(), "Import Family opens its picker");
+    assert_drawn("import-family", &neighborhood_view, shell.canvas());
     snapshot("import-family", shell.canvas());
 }

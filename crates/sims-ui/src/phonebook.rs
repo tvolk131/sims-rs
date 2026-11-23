@@ -268,9 +268,19 @@ impl PhoneBookDialog {
         snapshot.entries.len().div_ceil(per_page).max(1)
     }
 
+    /// The page on screen. The selected entry wins over the stored page so
+    /// a resize that changes the cards per page keeps the selection (what
+    /// `Enter` calls) visible.
     fn effective_page(&self, frame_size: [u32; 2], snapshot: &PhoneBookSnapshot) -> usize {
         let count = self.page_count(frame_size, snapshot);
-        self.page.min(count.saturating_sub(1))
+        let page = match self.selected_index {
+            Some(sel) if sel < snapshot.entries.len() => {
+                let (_, cols, rows) = Self::effective_per_page(frame_size);
+                sel / (cols * rows).max(1)
+            }
+            _ => self.page,
+        };
+        page.min(count.saturating_sub(1))
     }
 
     pub fn can_prev(&self, frame_size: [u32; 2], snapshot: &PhoneBookSnapshot) -> bool {

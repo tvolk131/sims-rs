@@ -6747,7 +6747,7 @@ impl NeighborhoodShell {
             let btn_w = 53;
             let btn_h = (layout.bar_rect.height - 6).clamp(0, 56);
             let x = layout.bar_rect.x + 12;
-            let y = (layout.bar_rect.height - btn_h) / 2;
+            let y = layout.bar_rect.y + (layout.bar_rect.height - btn_h) / 2;
             if btn_w <= 0 || btn_h <= 0 {
                 return None;
             }

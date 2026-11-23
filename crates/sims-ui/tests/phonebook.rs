@@ -154,3 +154,24 @@ fn complete_collection_loads_native_phonebook_bitmaps_and_renders() {
     dlg.draw(&mut fallback, &snap, &Art::default());
     assert!(fallback.rgb().iter().any(|&px| px != [0, 0, 0]));
 }
+
+#[test]
+fn resize_keeps_the_selected_contact_on_screen() {
+    let snapshot = sample_snapshot(12);
+    let mut dlg = PhoneBookDialog::new();
+    dlg.open();
+    // Native 800×600 holds 8 cards a page: page two starts at entry 8.
+    assert!(dlg.next_page([800, 600], &snapshot));
+    assert_eq!(dlg.selected_index(), Some(8));
+    // At 500×600 a page holds 4, so entry 8 is on the third page.
+    let layout = dlg.layout([500, 600], &snapshot);
+    assert!(
+        layout.entry_slots.iter().any(|&(i, _)| i == 8),
+        "the selected contact stays visible after a resize: {:?}",
+        layout.entry_slots.iter().map(|s| s.0).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        dlg.submit(&snapshot),
+        Some(PhoneBookCommand::Call(snapshot.entries[8].neighbor_id))
+    );
+}

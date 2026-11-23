@@ -456,8 +456,7 @@ impl DestinationMapPicker {
             let prev = self.travel_chrome.hovered();
             self.travel_chrome.pointer_move(point[0], point[1], &layout);
             changed |= self.travel_chrome.hovered() != prev;
-            layout.bar_rect.contains(point[0], point[1])
-                || layout.filter_strip_rect.contains(point[0], point[1])
+            layout.blocks_map(point[0], point[1])
         } else {
             let (bar_rect, back_rect) = old_town_bar_layout(viewport);
             let next_back = back_rect.contains(point[0], point[1]);
@@ -514,9 +513,7 @@ impl DestinationMapPicker {
                 self.pressed_lot_id = None;
                 return true;
             }
-            if layout.bar_rect.contains(point[0], point[1])
-                || layout.filter_strip_rect.contains(point[0], point[1])
-            {
+            if layout.blocks_map(point[0], point[1]) {
                 self.pressed_lot_id = None;
                 return false;
             }
@@ -584,9 +581,7 @@ impl DestinationMapPicker {
                     _ => Some(DestinationPickerAction::Redraw),
                 };
             }
-            if layout.bar_rect.contains(point[0], point[1])
-                || layout.filter_strip_rect.contains(point[0], point[1])
-            {
+            if layout.blocks_map(point[0], point[1]) {
                 let had_lot = self.pressed_lot_id.take().is_some();
                 return (had_chrome_press || had_lot).then_some(DestinationPickerAction::Redraw);
             }

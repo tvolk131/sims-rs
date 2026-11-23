@@ -71,9 +71,13 @@ const FLOORS: &[(&str, &str, f64)] = &[
 /// `[x, y, width, height]`.
 type Region = [i32; 4];
 
+/// The folder `name` names, or `None` when it is unset. A set variable
+/// that is not a folder fails the test instead of skipping it, so a typo or
+/// an unmounted fixture cannot pass with nothing checked.
 fn env_dir(name: &str) -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os(name)?);
-    dir.is_dir().then_some(dir)
+    assert!(dir.is_dir(), "{name}={} is not a folder", dir.display());
+    Some(dir)
 }
 
 /// An 8-bit RGB, non-interlaced PNG (the only kind the tour holds).

@@ -349,6 +349,15 @@ impl Destination {
         matches!(self, Self::MagicTown)
     }
 
+    /// Whether this destination's Visit picker uses the native 1.91 layout
+    /// measured against the oracle (Downtown's plain bar, Magic Town's
+    /// dialog). Vacation Island, Old Town and Studio Town have no oracle
+    /// shot yet, so they keep the full bar with their filter strip rather
+    /// than lose filters a player may already have active.
+    pub const fn picker_is_native(self) -> bool {
+        matches!(self, Self::Downtown | Self::MagicTown)
+    }
+
     /// Fallback bar fill RGB for this destination.
     const fn bar_fallback_bg(self) -> [u8; 3] {
         match self {
@@ -738,7 +747,7 @@ impl TravelLayout {
 
     /// Native lot-picker layout (`TravelBarMode::Visit` on viewports at least
     /// `800` wide): the plain bar with centered Return / Bulldoze / Import for
-    /// most destinations, or the `dlgframe2.bmp` dialog with a title and
+    /// Downtown, or the `dlgframe2.bmp` dialog with a title and
     /// filter row for Magic Town. No destination tabs or wallet badge: the
     /// 1.91 picker shows neither.
     fn compute_picker(w: i32, h: i32, origin: [i32; 2], state: &TravelState) -> Self {
@@ -826,7 +835,7 @@ impl TravelLayout {
         } else {
             0
         };
-        if !compact && state.mode == TravelBarMode::Visit {
+        if !compact && state.mode == TravelBarMode::Visit && state.destination.picker_is_native() {
             return Self::compute_picker(w, h, [bar_x, oy], state);
         }
         let bar_h = BAR_HEIGHT.min(h - oy);
