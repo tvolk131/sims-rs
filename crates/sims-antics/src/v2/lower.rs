@@ -5106,14 +5106,15 @@ fn expr_may_clobber_stack_obj(
                 })
         }
         V2Expr::Index { base, index, .. } => {
-            // Foreign `obj.attr[i]` or `obj.data[i]` swaps `stack_obj`!
+            // Foreign `obj.attr[i]` or `obj.data[i]` swaps `stack_obj` (even if the helper
+            // parameter happens to be named `sim: Object`, since Sim handles do not expose
+            // `.attr[...]` or `.data[...]`).
             if let V2Expr::Field {
                 base: root, field, ..
             } = base.as_ref()
                 && matches!(field.as_str(), "attr" | "data")
                 && let V2Expr::Ident(_, rname) = root.as_ref()
                 && rname != "self"
-                && rname != "sim"
             {
                 return true;
             }

@@ -4871,4 +4871,61 @@ object "Nested Lock Loop" {
         1,
         "open-tv watch_cycles must increment per cycle (visible during cycle 2)"
     );
+
+    // Sol R2 P1: Omitted default calling a helper whose `Object` parameter is named `sim`
+    // (`sim.attr[0]`) must still trigger `__self_obj` save/restore so subsequent `self` writes
+    // target `self` rather than the foreign peer object!
+    let r2_peer = compile_v2_source(
+        "r2_peer.antics",
+        r#"
+object "R2 Peer" {
+    guid: 0x7F42_0011;
+    state val: i16 = 37;
+    state sentinel: i16 = 0;
+}
+"#,
+        &cfg,
+    )
+    .expect("compile r2_peer");
+    let r2_reader = compile_v2_source(
+        "r2_reader.antics",
+        r#"
+fn read_peer(sim: Object) -> i16 {
+    return sim.attr[0];
+}
+
+object "R2 Default Reader" {
+    guid: 0x7F42_0012;
+    state peer: ObjectId = 0;
+    state result: i16 = 0;
+
+    fn sample(value: i16 = read_peer(self.peer)) -> i16 {
+        return value;
+    }
+
+    interaction "Sample" {
+        run(actor) {
+            self.result = sample();
+        }
+    }
+}
+"#,
+        &cfg,
+    )
+    .expect("compile r2_reader");
+    let mut vm_r2 = V2VmFixture::from_objects(&[&r2_peer, &r2_reader], 100);
+    let peer_id = vm_r2.spawn(0x7F42_0011, 2, 2);
+    let reader_id = vm_r2.spawn(0x7F42_0012, 4, 4);
+    vm_r2.world.objects.get_mut(&reader_id).unwrap().attributes[0] = peer_id as i16;
+    vm_r2.run_interaction(reader_id, "Sample", None);
+    assert_eq!(
+        vm_r2.obj_attr(reader_id, 1),
+        37,
+        "self.result on reader must receive 37 after foreign read_peer(sim: Object) default"
+    );
+    assert_eq!(
+        vm_r2.obj_attr(peer_id, 1),
+        0,
+        "peer.sentinel must remain untouched (stack_obj restored before writing self.result)"
+    );
 }
