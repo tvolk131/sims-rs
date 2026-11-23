@@ -794,8 +794,12 @@ pub fn money(amount: i32) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct Careers {
     careers: BTreeMap<i16, Vec<Level>>,
-    /// Each career's levels' titles, a man's and a woman's.
+    /// Each career's levels' titles, a man's and a woman's, as the job
+    /// panel and dialogs show them (+0x54, +0xe0).
     titles: BTreeMap<i16, Vec<[String; 2]>>,
+    /// The same from the career's first table (+0x16c, +0x1f8), as a list
+    /// of people shows them ([`Careers::list_title`]).
+    list_titles: BTreeMap<i16, Vec<[String; 2]>>,
     /// Each career's levels' descriptions (`STR#` entry `4 + 2*k`).
     descriptions: BTreeMap<i16, Vec<String>>,
     /// Each career's track/offer name (`STR#` entry `0` / `1`).
@@ -821,7 +825,7 @@ impl Careers {
     /// 1000 (0x404027..0x404057, 0x40427a..0x40430f). Without that table
     /// they are strings 1000 further on in the first (0x4041d4..0x404269),
     /// which no career has. The first table's own titles go to +0x16c and
-    /// +0x1f8, which nothing is known to read.
+    /// +0x1f8 ([`Careers::list_title`]).
     ///
     /// The second tables differ: they spell some titles differently
     /// ("Back-up Musician", "Free Lance Photographer", "Douser",
@@ -887,12 +891,16 @@ impl Careers {
                 let titles = (0..career.levels.len())
                     .map(|k| [title(3 + 2 * k), title(23 + k)])
                     .collect();
+                let list_titles = (0..career.levels.len())
+                    .map(|k| [text(3 + 2 * k), text(23 + k)])
+                    .collect();
                 let descriptions = (0..career.levels.len()).map(|k| text(4 + 2 * k)).collect();
                 let offer = {
                     let s1 = text(1);
                     if !s1.is_empty() { s1 } else { text(0) }
                 };
                 out.titles.insert(id, titles);
+                out.list_titles.insert(id, list_titles);
                 out.descriptions.insert(id, descriptions);
                 if !offer.is_empty() {
                     out.offers.insert(id, offer);
@@ -934,19 +942,20 @@ impl Careers {
         self.careers.contains_key(&career)
     }
 
-    /// The title of level `level` of career `career` (0x4033a4): a
-    /// woman's where the level has one, else the level's; empty for a
-    /// level without a title.
+    /// The title of level `level` of career `career` as the game shows it
+    /// (0x4033d2, from the second table): a woman's where the level has
+    /// one, else the level's; empty for a level without a title. The live
+    /// job panel (0x53074c, at 0x530e79) and `$Job` (0x44ca89) read it.
     pub fn title(&self, career: i16, level: i32, female: bool) -> Option<&str> {
-        let [man, woman] = self
-            .titles
-            .get(&career)?
-            .get(usize::try_from(level).ok()?)?;
-        Some(if female && !woman.is_empty() {
-            woman
-        } else {
-            man
-        })
+        pick_title(&self.titles, career, level, female)
+    }
+
+    /// The title from the career's first table (0x4033a4), chosen the same
+    /// way. Only a list box of people reads it: 0x52ff7e (vtable 0x66e354,
+    /// at 0x530674) fills a row's first column with it, next to a number
+    /// and a field of the person, which the port does not draw.
+    pub fn list_title(&self, career: i16, level: i32, female: bool) -> Option<&str> {
+        pick_title(&self.list_titles, career, level, female)
     }
 
     /// The description of level `level` of career `career` (`STR#` entry `4 + 2*k`),
@@ -1225,6 +1234,20 @@ const FAME: usize = 81;
 /// first person on the lot of the record's type, in the lot's people
 /// order (0x4e9608 walks the lot's people for the first of the GUID),
 /// or else the first record of the type.
+fn pick_title(
+    titles: &BTreeMap<i16, Vec<[String; 2]>>,
+    career: i16,
+    level: i32,
+    female: bool,
+) -> Option<&str> {
+    let [man, woman] = titles.get(&career)?.get(usize::try_from(level).ok()?)?;
+    Some(if female && !woman.is_empty() {
+        woman
+    } else {
+        man
+    })
+}
+
 fn person_data(world: &World, guid: u32) -> Option<&[i16]> {
     world
         .people

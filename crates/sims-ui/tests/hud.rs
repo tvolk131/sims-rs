@@ -1079,17 +1079,22 @@ fn career_titles_come_from_the_second_string_table() {
     let careers = household::Careers::load(&index).unwrap();
     // Musician (12) level 6, Slacker (13) level 7, Paranormal (14) level 5,
     // Journalism (15) level 3.
-    for (career, level, title) in [
-        (12, 6, "Back-up Musician"),
-        (13, 7, "Free Lance Photographer"),
-        (14, 5, "Douser"),
-        (15, 3, "Papparazzi"),
+    // The job panel and `$Job` read the second table (0x4033d2); a list
+    // box of people reads the first (0x4033a4).
+    for (career, level, title, listed) in [
+        (12, 6, "Back-up Musician", "Back-Up Musician"),
+        (13, 7, "Free Lance Photographer", "Freelance Photographer"),
+        (14, 5, "Douser", "Dowser"),
+        (15, 3, "Papparazzi", "Paparazzi"),
     ] {
         assert_eq!(careers.title(career, level, false), Some(title));
         // The second table's woman's title is empty: the man's shows.
         assert_eq!(careers.title(career, level, true), Some(title));
+        assert_eq!(careers.list_title(career, level, false), Some(listed));
+        assert_eq!(careers.list_title(career, level, true), Some(listed));
     }
     // Where both tables agree, nothing changes.
     assert_eq!(careers.title(2, 0, false), Some("Waiter"));
     assert_eq!(careers.title(2, 0, true), Some("Waitress"));
+    assert_eq!(careers.list_title(2, 0, true), Some("Waitress"));
 }

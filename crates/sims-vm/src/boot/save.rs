@@ -1653,6 +1653,69 @@ mod tests {
             BTreeMap::from([(5, 0x3), (7, 0x1)])
         );
         assert_eq!(dec10.world.indicator_queues, dec8.indicator_queues);
+
+        // --- A real format-10 record migrates to 11 with empty queues ---
+        let s = dec10.clone();
+        let v10 = SavedV10 {
+            world: s.world.clone(),
+            ticks: s.ticks,
+            start: s.start,
+            answers: s.answers,
+            fresh: s.fresh,
+            view_rotation: s.view_rotation,
+            answered: s.answered,
+            house: s.house,
+            family: s.family,
+            loaded: s.loaded,
+            view_centre: s.view_centre,
+            floor_rotation: s.floor_rotation,
+            replay_view: s.replay_view,
+            last_dialog_text: s.last_dialog_text,
+            character_names: s.character_names,
+            lot_name: s.lot_name,
+            lot_description: s.lot_description,
+            deletion_epoch: s.deletion_epoch,
+            generated_portrait_2002: s.generated_portrait_2002,
+            made_portrait_head: s.made_portrait_head,
+            ambiguous_portraits: s.ambiguous_portraits,
+            loaded_indexed_skeletons: s.loaded_indexed_skeletons,
+            loaded_indexed_suits: s.loaded_indexed_suits,
+            loaded_indexed_suit_bones: s.loaded_indexed_suit_bones,
+            made_outfits: s.made_outfits,
+            person_outfits: s.person_outfits,
+            scratch_ptr_set: s.scratch_ptr_set,
+            scratch_ptr_set_to_next: s.scratch_ptr_set_to_next,
+            scratch_ptr_expression: s.scratch_ptr_expression,
+            scratch_ptr_arg_slot: s.scratch_ptr_arg_slot,
+            runtime_added_suits: s.runtime_added_suits,
+            suit_scan_cache: s.suit_scan_cache,
+            special_panels: s.special_panels,
+            special_panel_responses: s.special_panel_responses,
+            family_flags: s.family_flags,
+        };
+        let mut raw_v10 = Vec::new();
+        raw_v10.extend_from_slice(&10u32.to_le_bytes());
+        raw_v10.extend_from_slice(&sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
+        raw_v10.extend_from_slice(&postcard::to_allocvec(&v10).unwrap());
+        let (from10, rep) = Saved::decode_with_report(&raw_v10).unwrap();
+        assert_eq!(rep.original_version, 10);
+        assert_eq!(rep.final_version, FORMAT);
+        assert_eq!(rep.steps_applied, 1);
+        assert_eq!(from10.world.hash(), dec10.world.hash());
+        assert_eq!(from10.world.family_flags, dec10.world.family_flags);
+        assert_eq!(from10.special_panels, dec10.special_panels);
+        assert_eq!(
+            from10.special_panel_responses,
+            dec10.special_panel_responses
+        );
+        assert_eq!(
+            from10.indicator_queues,
+            sims_sim::IndicatorQueues::default()
+        );
+        assert_eq!(
+            from10.world.indicator_queues,
+            sims_sim::IndicatorQueues::default()
+        );
     }
 
     #[test]

@@ -1466,51 +1466,12 @@ fn capture_traveler_snapshot(
     })
 }
 
-/// Safely selects `sim` on `lot`, handling Superstar celebrity deselection
-/// (`person.data[81] >= 10`, unported star-marker pool `0x446c15`) and active
-/// Downtown date links (`person.data[77] != 0`, unported second indicator
-/// `0x44664c`) while preserving exact fame and date words on every Sim.
+/// Selects `sim` on `lot` ([`Lot::select`]): the previous Sim is
+/// deselected, which gives a famous one its star (0x446c15), and a Sim
+/// with a date has the second indicator put on it (0x446924).
 pub fn select_sim(lot: &mut Lot, sim: u16) -> Result<Vec<crate::SoundEvent>, TravelError> {
-    let mut saved: Vec<(u16, i16, i16)> = Vec::new();
-    let prev = selected(&lot.world);
-    for id in prev.into_iter().chain(std::iter::once(sim)) {
-        if saved.iter().any(|&(s, _, _)| s == id) {
-            continue;
-        }
-        if let Some(person) = lot
-            .world
-            .objects
-            .get_mut(&id)
-            .and_then(|o| o.person.as_mut())
-        {
-            let fame = person.data.get(PERSON_FAME_LEVEL).copied().unwrap_or(0);
-            let date = person.data.get(PERSON_DATE).copied().unwrap_or(0);
-            saved.push((id, fame, date));
-            if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
-                *f = 0;
-            }
-            if let Some(d) = person.data.get_mut(PERSON_DATE) {
-                *d = 0;
-            }
-        }
-    }
-    let result = lot.select(sim);
-    for (id, fame, date) in saved {
-        if let Some(person) = lot
-            .world
-            .objects
-            .get_mut(&id)
-            .and_then(|o| o.person.as_mut())
-        {
-            if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
-                *f = fame;
-            }
-            if let Some(d) = person.data.get_mut(PERSON_DATE) {
-                *d = date;
-            }
-        }
-    }
-    result.map_err(|e| TravelError::Lot(format!("selecting Sim {sim}: {e}")))
+    lot.select(sim)
+        .map_err(|e| TravelError::Lot(format!("selecting Sim {sim}: {e}")))
 }
 
 /// Internal world-level equivalent of [`select_sim`] used during destination
@@ -1520,36 +1481,9 @@ fn select_sim_in_world(
     world: &mut World,
     sim: u16,
 ) -> Result<(), TravelError> {
-    let mut saved: Vec<(u16, i16, i16)> = Vec::new();
-    let prev = selected(world);
-    for id in prev.into_iter().chain(std::iter::once(sim)) {
-        if saved.iter().any(|&(s, _, _)| s == id) {
-            continue;
-        }
-        if let Some(person) = world.objects.get_mut(&id).and_then(|o| o.person.as_mut()) {
-            let fame = person.data.get(PERSON_FAME_LEVEL).copied().unwrap_or(0);
-            let date = person.data.get(PERSON_DATE).copied().unwrap_or(0);
-            saved.push((id, fame, date));
-            if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
-                *f = 0;
-            }
-            if let Some(d) = person.data.get_mut(PERSON_DATE) {
-                *d = 0;
-            }
-        }
-    }
-    let result = interpreter.select(world, Some(sim));
-    for (id, fame, date) in saved {
-        if let Some(person) = world.objects.get_mut(&id).and_then(|o| o.person.as_mut()) {
-            if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
-                *f = fame;
-            }
-            if let Some(d) = person.data.get_mut(PERSON_DATE) {
-                *d = date;
-            }
-        }
-    }
-    result.map_err(|e| TravelError::Lot(format!("selecting Sim {sim}: {e}")))
+    interpreter
+        .select(world, Some(sim))
+        .map_err(|e| TravelError::Lot(format!("selecting Sim {sim}: {e}")))
 }
 
 /// Atomically departs from `home_lot` to `request.destination_house`:
