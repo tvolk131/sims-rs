@@ -849,3 +849,70 @@ fn sound_mixer_radio_streaming_and_ambience_integration() {
     assert!(!mixer.ambience().is_playing());
     assert!(mixer.render(512).iter().all(|&s| s == 0));
 }
+
+/// Sets the open lot's pending indicator refreshes and star pools, through
+/// a save of the lot and its restore.
+fn set_open_queues(shell: &mut NeighborhoodShell, queues: sims_sim::IndicatorQueues) {
+    let game = shell.game_mut().expect("lot game");
+    let mut saved = game.save().expect("save the open lot");
+    saved.set_indicator_queues(queues);
+    game.lot_mut().restore(saved).expect("restore the open lot");
+}
+
+/// Loading a `WorldSnapshot` slot through the Save Manager restores the
+/// slot's own indicator refreshes and star pools, not the open lot's: the
+/// restore splices the snapshot's world into the open lot's `Saved`, whose
+/// queues may name people the restored world lacks.
+#[test]
+fn a_world_snapshot_slot_restores_its_own_indicator_queues() {
+    let Some(install) = install_dir() else {
+        eprintln!("SIMS_INSTALL is not set; skipping the snapshot queues restore test");
+        return;
+    };
+    let tmp = TempTestDir::new("snapshot-queues");
+    let saves = tmp.path().join("saves.redb");
+    let mut shell =
+        NeighborhoodShell::open(install, saves, 1, false, vec![3], Frames::default())
+            .expect("NeighborhoodShell opens");
+    shell.enter_lot(5).expect("enter Goth lot 5");
+    let people = shell.game().expect("lot game").lot().world().people.clone();
+    let [first, second, ..] = people[..] else {
+        panic!("the Goth house has two people: {people:?}");
+    };
+
+    // The slot: the world with `saved` pending.
+    let mut saved = sims_sim::IndicatorQueues::default();
+    saved.queue_date(first, 1);
+    saved.queue_star(first);
+    set_open_queues(&mut shell, saved.clone());
+    assert_eq!(
+        shell.game().unwrap().lot().world().indicator_queues,
+        saved
+    );
+    shell
+        .enqueue_background_world_save(SaveTarget::Manual)
+        .expect("enqueue a WorldSnapshot manual save");
+    shell.flush_background_saves();
+    assert_eq!(shell.pending_background_saves(), 0);
+
+    // The open lot then has others pending.
+    let mut open = sims_sim::IndicatorQueues::default();
+    open.queue_star(second);
+    open.queue_star(second);
+    set_open_queues(&mut shell, open.clone());
+    assert_ne!(open, saved);
+
+    assert!(shell.open_save_manager(None));
+    let _ = shell.handle_save_manager_command(SaveManagerCommand::LoadSlot {
+        slot_id: "manual".into(),
+    });
+    assert!(
+        !shell.save_manager_open(),
+        "loading the WorldSnapshot slot must succeed"
+    );
+    assert_eq!(
+        shell.game().expect("lot game").lot().world().indicator_queues,
+        saved,
+        "the slot's queues, not the open lot's"
+    );
+}

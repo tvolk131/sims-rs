@@ -689,7 +689,7 @@ impl Saved {
     }
 
     /// Reads [`Saved::encode`]'s bytes, deterministically migrating supported
-    /// older layouts ([`MIN_FORMAT`]..=[`FORMAT`], i.e. `6 -> 7 -> 8 -> 9`) forward
+    /// older layouts ([`MIN_FORMAT`]..=[`FORMAT`], i.e. `6 -> 7 -> 8 -> 9 -> 10 -> 11`) forward
     /// through [`SAVED_MIGRATIONS`]. Truncated payloads, trailing bytes,
     /// unsupported layout versions, and mismatched world formats are refused.
     pub fn decode(bytes: &[u8]) -> Result<Self, SaveError> {
@@ -1232,7 +1232,7 @@ mod tests {
             Err(SaveError::Format(_))
         ));
 
-        // Migrating decode upgrades 6 -> 7 -> 8 -> 9 -> 10 deterministically.
+        // Migrating decode upgrades 6 -> 7 -> 8 -> 9 -> 10 -> 11 deterministically.
         let (migrated_v6, report_v6) = Saved::decode_with_report(&bytes_v6_replay).unwrap();
         assert_eq!(report_v6.original_version, 6);
         assert_eq!(report_v6.final_version, FORMAT);
@@ -1677,7 +1677,7 @@ mod tests {
         );
         assert_eq!(dec10.world.indicator_queues, dec8.indicator_queues);
 
-        // --- A real format-10 record migrates to 11 with empty queues ---
+        // --- A real format-10 record migrates to 11 ---
         let s = dec10.clone();
         let v10 = SavedV10 {
             world: s.world.clone(),
@@ -1731,14 +1731,10 @@ mod tests {
             from10.special_panel_responses,
             dec10.special_panel_responses
         );
-        assert_eq!(
-            from10.indicator_queues,
-            sims_sim::IndicatorQueues::default()
-        );
-        assert_eq!(
-            from10.world.indicator_queues,
-            sims_sim::IndicatorQueues::default()
-        );
+        // No refreshes pending, and the star pools from where the stars are.
+        let adopted = crate::placement::adopted_star_pools(&dec10.world);
+        assert_eq!(from10.indicator_queues, adopted);
+        assert_eq!(from10.world.indicator_queues, adopted);
 
         // A save whose world came from a snapshot takes the snapshot's
         // queues, and its world hash does not move.

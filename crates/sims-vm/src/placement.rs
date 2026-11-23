@@ -2853,6 +2853,61 @@ fn forward(at: [i8; 3], facing: i16) -> Result<[i8; 3], Trap> {
 mod tests {
     use super::*;
 
+    /// A world saved before the star pools were kept: its stars go into
+    /// the pools where the port took them from. Held ones are in use;
+    /// free ones off the lot are available, the first registered last,
+    /// as the port handed that one out next. A star on the lot held by
+    /// none, and any other object, is in neither.
+    #[test]
+    fn a_world_saved_without_star_pools_adopts_its_stars() {
+        let object = |id: u16, guid: u32, position: [i32; 3], held_by: i16| {
+            let mut data = vec![0; 128];
+            data[data::CONTAINER] = held_by;
+            sims_sim::Object {
+                id,
+                guid,
+                footprint: [0; 4],
+                position,
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: Vec::new(),
+                data,
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            }
+        };
+        let off = [-16, -16, 1];
+        let on = [40, 40, 1];
+        let mut world = World::empty();
+        for o in [
+            object(4, STAR_MARKER, off, 0),
+            object(5, STAR_MARKER, on, 9),
+            object(6, STAR_MARKER, off, 0),
+            object(7, STAR_MARKER, on, 0),
+            object(8, 0x1234, off, 0),
+            object(9, STAR_MARKER, on, 3),
+        ] {
+            world.order.push(o.id);
+            world.objects.insert(o.id, o);
+        }
+        let pools = adopted_star_pools(&world);
+        assert_eq!(pools.available_stars, [6, 4]);
+        assert_eq!(pools.stars_in_use, [9, 5]);
+        assert!(pools.stars.is_empty() && pools.dates.is_empty() && !pools.dirty);
+    }
+
     #[test]
     fn portrait_start_checks_rotated_bounds_falls_back_and_unrotates() {
         // 64-tile lot: in-bounds pick [32, 32] stays [32, 32] at view 0,

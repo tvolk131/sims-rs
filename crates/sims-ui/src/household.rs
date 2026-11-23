@@ -441,23 +441,22 @@ impl Acquaintances {
     /// (0x4e9753), or None when it is not there (-1).
     ///
     /// Types made while the game runs (`world.characters.made`) come
-    /// after the startup ones: making one appends it (0x4265fd →
-    /// 0x4e8a3a, which walks the registry again and appends each person
-    /// GUID the table lacks, 0x4e8add). The port keeps made types by GUID,
-    /// not in the order they were made, so it places them in GUID order
-    /// (**unverified** that the two agree when two were made).
+    /// after the startup ones, in the order made: making one appends it
+    /// (0x4265fd → 0x4e8a3a, which walks the registry again and appends
+    /// each person GUID the table lacks, 0x4e8add, and then only the new
+    /// type is missing). The GUID does not give that order: two types
+    /// made in one tick can have descending GUIDs.
     pub fn portrait_place(&self, world: &World, guid: u32) -> Option<usize> {
         if let Some(place) = self.portraits.iter().position(|&other| other == guid) {
             return Some(place);
         }
-        let made = &world.characters.made;
-        made.contains_key(&guid).then(|| {
-            self.portraits.len()
-                + made
-                    .keys()
-                    .filter(|&&other| other < guid && !self.portraits.contains(&other))
-                    .count()
-        })
+        world
+            .characters
+            .made
+            .keys()
+            .filter(|other| !self.portraits.contains(other))
+            .position(|&other| other == guid)
+            .map(|place| self.portraits.len() + place)
     }
 }
 
@@ -1725,6 +1724,48 @@ mod tests {
         assert_eq!(known.portrait_place(&world, 500), Some(3));
         assert_eq!(known.portrait_place(&world, 400), None);
         assert_eq!(first_relation(&world, 100, &[], &known), Some(300));
+    }
+
+    /// Made types take their places in the order made (0x4265fd →
+    /// 0x4e8a3a), not by GUID: two made in one tick share the GUID's high
+    /// word (the tick) and can descend in the low (0x4260e1's draw).
+    #[test]
+    fn made_types_tie_in_the_order_they_were_made() {
+        // Made in one tick: first 0x0005_7000, then 0x0005_1000.
+        let (first, second) = (0x0005_7000_u32, 0x0005_1000_u32);
+        let mut world = World::empty();
+        world.neighbors.slots = vec![
+            Some(record(1, 100, &[(6, 30), (7, 30)])),
+            Some(record(6, first, &[])),
+            Some(record(7, second, &[])),
+        ];
+        let made = |template| sims_sim::characters::Character {
+            template,
+            file: 0,
+            strings: BTreeMap::new(),
+        };
+        world.characters.made.insert(first, made(100));
+        world.characters.made.insert(second, made(100));
+        let mut known = known();
+        known.characters.extend([first, second]);
+        known.portraits = vec![100];
+        assert_eq!(known.portrait_place(&world, first), Some(1));
+        assert_eq!(known.portrait_place(&world, second), Some(2));
+        let ids: Vec<_> = relations(&world, 100, &[], &known)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, [6, 7], "the first made first, though its GUID is higher");
+        assert_eq!(first_relation(&world, 100, &[], &known), Some(first));
+
+        // The order survives the world's encoding, and a save (`Saved`
+        // keeps the world's encoding), as the map is written in it.
+        let back = World::decode(&world.encode()).unwrap();
+        assert_eq!(
+            back.characters.made.keys().copied().collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert_eq!(known.portrait_place(&back, second), Some(2));
     }
 
     #[test]
