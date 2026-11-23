@@ -2043,6 +2043,19 @@ impl Lot {
         }
     }
 
+    /// The controlled family's members for a co-op interpreter when global 9
+    /// is 0. A lot loaded with family number 0 holds the family numbered 0
+    /// (0x428041 at 0x42827c..0x42830d). When the World keeps that family,
+    /// `None` lets each reader look it up live (`family_zero_members`), as
+    /// the solo arrival path (0x4f1c87..0x4f1cec) refills it; otherwise the
+    /// family is empty, as on an unoccupied lot.
+    fn coop_active_family(&self) -> Option<&'static [u32]> {
+        (self.load.house != 0
+            && self.load.family == 0
+            && !self.world.families.iter().any(|f| f.id == 0))
+        .then_some(&[][..])
+    }
+
     /// Constructs a co-op [`Interpreter`] with `coop` attached, host camera
     /// rotation from `coop`, and `view_centre: None` (so local camera panning
     /// never leaks into shared simulation callbacks).
@@ -2059,7 +2072,7 @@ impl Lot {
             view_centre: None,
             character_names: Some(character_names),
             default_character_name: Some(&self.default_character_name),
-            active_family: (self.load.house != 0 && self.load.family == 0).then_some(&[][..]),
+            active_family: self.coop_active_family(),
             coop: Some(coop),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         }
@@ -2128,7 +2141,7 @@ impl Lot {
                 view_centre: None,
                 character_names: Some(&probe_names),
                 default_character_name: Some(&self.default_character_name),
-                active_family: (self.load.house != 0 && self.load.family == 0).then_some(&[][..]),
+                active_family: self.coop_active_family(),
                 coop: Some(&probe_coop),
                 ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
             };
@@ -2857,7 +2870,7 @@ impl Lot {
             view_centre: None,
             character_names: Some(&character_names),
             default_character_name: Some(&self.default_character_name),
-            active_family: (self.load.house != 0 && self.load.family == 0).then_some(&[][..]),
+            active_family: self.coop_active_family(),
             coop: Some(&coop_cell),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };

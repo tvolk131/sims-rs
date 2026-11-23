@@ -19,6 +19,7 @@
 
 use sims_game::Frames;
 use sims_game::neighborhood::NeighborhoodShell;
+use sims_ui::shop::{CurrencyKind, ShopCommand};
 use sims_vm::travel::TravelRequest;
 use std::path::PathBuf;
 
@@ -44,18 +45,30 @@ fn install_root() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-/// The Goth house's selected Sim, 30 ticks in, sent Downtown by
-/// `request(leader)`; then the lot's ARRIVAL ticks, checked to have run
-/// with no error from the marker, and `check` given the game, the
-/// traveler's object and the marker's.
+/// A trip Downtown and its first ARRIVAL ticks.
+struct Arrived {
+    shell: NeighborhoodShell,
+    /// The leader's object on the Downtown lot.
+    traveler: u16,
+    /// The home family and its funds before departure.
+    home_family: u16,
+    home_funds: i32,
+}
+
+/// The Goth house 30 ticks in, sent Downtown by `request(leader)`, where
+/// `leader` (a GUID) is the selected Sim unless `pick` names another. Then
+/// the lot's ARRIVAL ticks, checked to have run with no error from the
+/// marker. The leader arrives off the lot, as the person factory makes it
+/// (0x4e9719 -> 0x440b2d); the marker's placement is its one jump, and it
+/// ends on the lot.
 fn arrive(
     dir_name: &str,
+    pick: impl FnOnce(&sims_game::Game) -> Option<u32>,
     request: impl FnOnce(&sims_game::Game, u32) -> TravelRequest,
-    check: impl FnOnce(&sims_game::Game, u16, u16),
-) {
+) -> Option<Arrived> {
     let Some(root) = install_root() else {
         eprintln!("skipping: set SIMS_INSTALL to run the Downtown arrival test");
-        return;
+        return None;
     };
     let dir = std::env::temp_dir().join(format!("{dir_name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -73,9 +86,13 @@ fn arrive(
     shell.enter_lot(5).expect("enter the Goth house");
     let game = shell.game_mut().expect("active lot");
     assert_eq!(game.run(30), 30);
-    let leader = {
+    let leader = pick(game).unwrap_or_else(|| {
         let world = game.lot().world();
         world.objects[&world.selected().expect("selected Goth Sim")].guid
+    });
+    let (home_family, home_funds) = {
+        let world = game.lot().world();
+        (world.globals[9] as u16, world.budget.funds)
     };
     let request = request(game, leader);
     shell
@@ -102,9 +119,22 @@ fn arrive(
     };
     assert_eq!(person_word(game, traveler, PETS_OUTSIDE), 0);
 
-    // An unanswered dialog would stop the ticks without stopping the lot.
-    assert_eq!(game.run(ARRIVAL), ARRIVAL, "the lot stopped advancing");
-    assert!(game.stopped().is_none(), "lot halted: {:?}", game.stopped());
+    let mut last = game.lot().world().objects[&traveler].position;
+    let mut jumps = Vec::new();
+    for _ in 0..ARRIVAL {
+        // An unanswered dialog would stop the ticks without stopping the lot.
+        assert_eq!(game.run(1), 1, "the lot stopped advancing");
+        assert!(game.stopped().is_none(), "lot halted: {:?}", game.stopped());
+        let now = game.lot().world().objects[&traveler].position;
+        // A walking Sim moves about a sixteenth of a tile a tick; more than
+        // a tile and a half at once is a jump.
+        let step = (now[0] - last[0]).abs().max((now[1] - last[1]).abs());
+        if step > 24 || now[2] != last[2] {
+            let tick = game.lot().ticks();
+            jumps.push(format!("tick {tick}: {last:?} -> {now:?}"));
+        }
+        last = now;
+    }
     let world = game.lot().world();
     assert_eq!(
         world.objects[&marker].attributes[3], 0,
@@ -117,7 +147,18 @@ fn arrive(
         .filter(|e| e.contains(&from_marker) || e.contains("Generic Sims Call routine 19"))
         .collect();
     assert!(caught.is_empty(), "caught: {caught:?}");
-    check(game, traveler, marker);
+    assert!(last[0] >= 0, "the marker never placed the traveler");
+    assert_eq!(
+        jumps.len(),
+        1,
+        "the traveler should jump once, when the marker places it: {jumps:?}"
+    );
+    Some(Arrived {
+        shell,
+        traveler,
+        home_family,
+        home_funds,
+    })
 }
 
 fn person_word(game: &sims_game::Game, id: u16, word: usize) -> i16 {
@@ -130,52 +171,151 @@ fn person_word(game: &sims_game::Game, id: u16, word: usize) -> i16 {
 
 #[test]
 fn the_middle_ped_marker_finishes_a_downtown_arrival() {
-    arrive(
+    let Some(mut arrived) = arrive(
         "sims-downtown-arrival",
+        |_| None,
         |_, leader| TravelRequest::downtown(DOWNTOWN_LOT, leader),
-        |game, traveler, _| {
-            // Node 24 follows routine 19 when nobody traveled with the Sim.
-            assert_eq!(
-                person_word(game, traveler, PETS_OUTSIDE),
-                1,
-                "the marker's arrival pass stopped before node 24"
-            );
-        },
+    ) else {
+        return;
+    };
+    let game = arrived.shell.game_mut().expect("the Downtown lot");
+    // Node 24 follows routine 19 when nobody traveled with the Sim.
+    assert_eq!(
+        person_word(game, arrived.traveler, PETS_OUTSIDE),
+        1,
+        "the marker's arrival pass stopped before node 24"
     );
 }
 
 #[test]
 fn the_middle_ped_marker_brings_back_a_date() {
     let companion_guid = std::cell::Cell::new(0);
-    arrive(
+    let Some(mut arrived) = arrive(
         "sims-downtown-date",
+        |_| None,
         |game, leader| {
             let guid = date_for(game, leader);
             companion_guid.set(guid);
             TravelRequest::downtown_date(DOWNTOWN_LOT, leader, guid)
         },
-        |game, traveler, _| {
+    ) else {
+        return;
+    };
+    let traveler = arrived.traveler;
+    let game = arrived.shell.game_mut().expect("the Downtown lot");
+    let world = game.lot().world();
+    let companion = world
+        .objects
+        .values()
+        .find(|o| o.guid == companion_guid.get() && o.person.is_some())
+        .map(|o| o.id)
+        .expect("the companion is on the lot");
+    let leader_guid = world.objects[&traveler].guid;
+    assert_eq!(
+        companion_tokens(game, leader_guid),
+        0,
+        "routine 19 left the companion's token"
+    );
+    // Node 26 marks the companion, node 16 links it to the leader.
+    assert_eq!(person_word(game, companion, PETS_OUTSIDE), 1);
+    assert_eq!(
+        person_word(game, companion, DATE_FLAG),
+        traveler as i16,
+        "the companion's DateFlag does not name the leader"
+    );
+}
+
+/// A solo trip by a household member other than the first. The traveler
+/// leads family 0 on the destination (0x4f1c87..0x4f1cec: 0x410a41 erases
+/// the family's members and adds the traveler), so Generic Sims Call 18
+/// (0x4e97dc(0)) names them and the marker places them. Global 9 stays 0,
+/// the funds are the traveler's family's (0x4f1cc0..0x4f1ce7), the lot is
+/// played rather than edited (0x4f1b7c..0x4f1b9d), and a purchase there is
+/// carried home.
+#[test]
+fn a_solo_traveler_who_is_not_the_first_member_leads_the_visit() {
+    let Some(mut arrived) = arrive(
+        "sims-downtown-second",
+        |game| {
             let world = game.lot().world();
-            let companion = world
-                .objects
-                .values()
-                .find(|o| o.guid == companion_guid.get() && o.person.is_some())
-                .map(|o| o.id)
-                .expect("the companion is on the lot");
-            let leader_guid = world.objects[&traveler].guid;
-            assert_eq!(
-                companion_tokens(game, leader_guid),
-                0,
-                "routine 19 left the companion's token"
-            );
-            // Node 26 marks the companion, node 16 links it to the leader.
-            assert_eq!(person_word(game, companion, PETS_OUTSIDE), 1);
-            assert_eq!(
-                person_word(game, companion, DATE_FLAG),
-                traveler as i16,
-                "the companion's DateFlag does not name the leader"
-            );
+            let family = i32::from(world.globals[9]);
+            let members = &world
+                .families
+                .iter()
+                .find(|f| f.id == family)
+                .expect("the Goth household")
+                .members;
+            members.iter().skip(1).copied().find(|&guid| {
+                world
+                    .neighbors
+                    .first_of(guid)
+                    .is_some_and(|n| n.data[AGE] >= 18)
+            })
         },
+        |_, leader| TravelRequest::downtown(DOWNTOWN_LOT, leader),
+    ) else {
+        return;
+    };
+    let traveler = arrived.traveler;
+    let home_family = arrived.home_family;
+    let game = arrived.shell.game_mut().expect("the Downtown lot");
+    assert_eq!(person_word(game, traveler, PETS_OUTSIDE), 1);
+    assert!(!game.edit_mode(), "a solo visit opened in edit mode");
+    let world = game.lot().world();
+    assert_eq!(world.globals[9], 0, "a solo visit leaves global 9 at 0");
+    let funds = world.budget.funds;
+    assert!(
+        funds > 0 && funds < arrived.home_funds,
+        "the visit should hold the family's funds less the fare: {funds} of {}",
+        arrived.home_funds
+    );
+    let panel = game.snapshot(world);
+    assert_eq!(panel.funds, funds);
+    let shown: Vec<u16> = panel.residents.iter().map(|r| r.object).collect();
+    assert_eq!(shown, vec![traveler], "the panel shows the traveler alone");
+
+    let kind = game.shop_kind_for_lot().expect("Downtown's shop");
+    assert!(game.open_shop(kind), "the shop refused a solo visit");
+    let (item_id, price) = game
+        .shop_snapshot()
+        .expect("the shop's items")
+        .items
+        .iter()
+        .find(|i| {
+            i.currency == CurrencyKind::Simoleons
+                && i.available
+                && !i.owned
+                && (1..=funds).contains(&i.price)
+        })
+        .map(|i| (i.id.clone(), i.price))
+        .expect("an item for sale in Simoleons");
+    let _ = game.execute_shop_command(ShopCommand::Buy {
+        item_id,
+        currency: CurrencyKind::Simoleons,
+        price,
+    });
+    let spent = funds - price;
+    assert_eq!(
+        game.lot().world().budget.funds,
+        spent,
+        "the purchase was not charged"
+    );
+
+    arrived
+        .shell
+        .return_from_destination()
+        .expect("return home");
+    assert_eq!(arrived.shell.active_lot_house(), Some(5));
+    let home = arrived.shell.game().expect("the Goth house again");
+    assert_eq!(home.lot().world().globals[9] as u16, home_family);
+    assert_eq!(
+        home.lot().world().budget.funds,
+        spent,
+        "the purchase did not come home"
+    );
+    assert_eq!(
+        arrived.shell.stored_neighborhood().families[&home_family].budget,
+        spent
     );
 }
 

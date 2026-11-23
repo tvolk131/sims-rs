@@ -1988,14 +1988,14 @@ impl Hud {
     /// The active household's live member roster (`0x4e97dc`): reads the
     /// family named by global 9 from `world.families` when families are
     /// loaded, falling back to the neighborhood roster opened from disk.
+    /// Global 9 at 0 names the family numbered 0 (0x428041 at
+    /// 0x42827c..0x42830d), which a solo traveler leads
+    /// (0x4f1c87..0x4f1cec).
     fn members<'a>(&'a self, world: &'a World) -> &'a [u32] {
         if world.families.is_empty() {
             return &self.members;
         }
         let id = i32::from(world.globals.get(9).copied().unwrap_or(0));
-        if id == 0 {
-            return &[];
-        }
         world
             .families
             .iter()

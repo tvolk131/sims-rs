@@ -758,6 +758,18 @@ impl InstallAssets {
     }
 }
 
+/// Whether a household is living on the lot: global 9 names its family, or
+/// the family numbered 0 holds a solo traveler. A solo arrival leaves global
+/// 9 at 0 and makes family 0 the traveler alone (0x4f1c87..0x4f1cec, with
+/// 0x410a41 erasing then adding the member).
+fn live_household(world: &sims_sim::World) -> bool {
+    world.globals.get(9).copied().unwrap_or(0) != 0
+        || world
+            .families
+            .iter()
+            .any(|f| f.id == 0 && !f.members.is_empty())
+}
+
 impl Game {
     /// Boots the house and reads everything drawing it needs.
     pub fn open(options: &Options) -> Result<Self, String> {
@@ -1612,6 +1624,11 @@ impl Game {
         cached: Option<&Arc<InstallAssets>>,
     ) -> Result<Self, String> {
         lot.wait_for_answers();
+        // A household arriving by travel sets one of the flags +0x140,
+        // +0x141 or +0x142 (0x4fc59b), and the lot load then skips edit mode
+        // (0x4f1b7c..0x4f1b9d jump past it to 0x4f1c32). A solo arrival
+        // leaves global 9 at 0, so the flag, not global 9, decides.
+        let household_visit = !members.is_empty();
         let stopped = lot
             .load_report()
             .stopped
@@ -1788,7 +1805,7 @@ impl Game {
         let people = people_open_res?;
         let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
         let drawn_camera = view.camera;
-        let has_family = lot.world().globals.get(9).copied().unwrap_or(0) != 0;
+        let has_family = household_visit || lot.world().globals.get(9).copied().unwrap_or(0) != 0;
         let edit_mode = lot.world().globals.get(32).copied().unwrap_or(0) == 1
             || (!has_family
                 && (lot.lot_zoning().unwrap_or(0) != 0
@@ -9139,7 +9156,7 @@ impl Game {
     /// `globals[32] != 0`) or when no live household (`globals[9]`) is active.
     pub fn shop_kind_for_lot(&self) -> Option<ShopKind> {
         let world = self.lot.world();
-        let has_household = world.globals.get(9).copied().unwrap_or(0) != 0;
+        let has_household = live_household(world);
         let edit_budget = world.globals.get(32).copied().unwrap_or(0) != 0;
         if self.edit_mode || edit_budget || !has_household || self.lot.residential() {
             return None;
@@ -9164,7 +9181,7 @@ impl Game {
     /// Opens [`ShopPickerDialog`] with explicit `items` and the live household wallet.
     pub fn open_shop_with_items(&mut self, kind: ShopKind, mut items: Vec<ShopItem>) -> bool {
         let world = self.lot.world();
-        let has_household = world.globals.get(9).copied().unwrap_or(0) != 0;
+        let has_household = live_household(world);
         let edit_budget = world.globals.get(32).copied().unwrap_or(0) != 0;
         if self.edit_mode || edit_budget || !has_household {
             self.note = Some("Shop is only available during a live household visit.".into());

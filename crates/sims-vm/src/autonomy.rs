@@ -453,7 +453,10 @@ impl Machine<'_, '_> {
             // 0x45dd87..0x45ddaa: a visitor skips free-will-off unless its
             // family matches the controlled family (`game +0x10 -> +0x10c`)
             // and `person.data[65] <= 1`.
-            if family == 0 && self.active_family.is_none() {
+            if family == 0
+                && crate::person_factory::family_zero_members(self.active_family, self.world)
+                    .is_none()
+            {
                 return Err(Trap::Unsupported(
                     "Find Best Interaction with free will off for a visitor with global 9 at 0, \
                      where the controlled family (game +0x10) is not kept"
@@ -468,7 +471,9 @@ impl Machine<'_, '_> {
         // refuse autonomy for that family's first member (`0x4e97dc(0)` ->
         // `0x4e9608`).
         if family == 0 {
-            let Some(members) = self.active_family else {
+            let Some(members) =
+                crate::person_factory::family_zero_members(self.active_family, self.world)
+            else {
                 return Err(Trap::Unsupported(
                     "Find Best Interaction with no family on the lot, where the original compares \
                      the person with the controlled family's first member (0x4e9608)"

@@ -19,7 +19,8 @@
 //! the start tile's room, then anywhere. It draws no random numbers. A
 //! tile found is tested once more with the place test, the object is put
 //! there with the lot told (virtual function 0x58, 0x433340), and virtual
-//! function 0x74 runs. The true branch is taken; if no tile is found or
+//! function 0x74 runs: for a person 0x45e519, which unsets its animator's
+//! position (`Interpreter::refresh_person`). The true branch is taken; if no tile is found or
 //! the second test fails nothing moves and the false branch is taken.
 //!
 //! Mode 1 takes the object off the lot (0x44b519 to 0x44b565): its virtual
@@ -185,7 +186,16 @@ impl Machine<'_, '_> {
                 true,
             )
             .map_err(unsupported)?;
-        // Virtual function 0x74 (0x433bb3) refreshes the object's own
+        // Virtual function 0x74 (0x44b66e). A person's (0x45e519,
+        // [`crate::Interpreter::refresh_person`]) unsets its animator's
+        // position, so a walk under way goes on from the tile it was put
+        // on, not from where it stood, and redoes its word 64.
+        if self.world.objects[&target].person.is_some() {
+            return interpreter
+                .refresh_person(self.world, target)
+                .map(|()| true);
+        }
+        // Any other object's (0x433bb3) refreshes the object's own
         // graphics, if it has any; that is presentation, but an object
         // with its own graphics is not expected here.
         let guid = self.world.objects[&target].guid;

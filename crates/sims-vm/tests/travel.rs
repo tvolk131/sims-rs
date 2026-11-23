@@ -237,7 +237,17 @@ fn goth_downtown_house21_round_trip_and_community_edit_persistence() {
     assert_eq!(dt.world().budget.funds, home_funds_before - DOWNTOWN_FARE);
     assert_eq!(dt.world().globals[32], 0, "live community spending mode");
     assert_eq!(dt.world().globals[10], 21);
-    assert_eq!(dt.world().globals[9], 5);
+    // A solo arrival leaves global 9 at 0 and makes family 0 the traveler
+    // alone (0x4f1c87..0x4f1cec).
+    assert_eq!(dt.world().globals[9], 0);
+    assert_eq!(
+        dt.world()
+            .families
+            .iter()
+            .find(|f| f.id == 0)
+            .map(|f| f.members.clone()),
+        Some(vec![mortimer_guid])
+    );
     assert_eq!(session.travelers.len(), 1);
     assert_eq!(dt.lot_name(), "Goth Downtown Lounge");
     assert_eq!(dt.lot_description(), "Persisted community edit");
