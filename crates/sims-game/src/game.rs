@@ -504,6 +504,9 @@ pub struct Game {
     _open_pack_staging: Option<crate::open_pack::OpenPackStagingDir>,
     /// Synthesized PCM WAV sound bank from `open-pack/` (for `Mixer::open_pack`).
     open_pack_wavs: Option<BTreeMap<String, Vec<u8>>>,
+    /// Stable save slot key derived from the source `open-pack/` directory and
+    /// lot manifest (never from the temporary staging directory).
+    open_pack_save_slot: Option<String>,
 }
 
 /// Immutable install-wide assets cached on [`crate::neighborhood::NeighborhoodShell`]
@@ -1115,6 +1118,7 @@ impl Game {
             open_pack_mode: false,
             _open_pack_staging: None,
             open_pack_wavs: None,
+            open_pack_save_slot: None,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -1497,6 +1501,7 @@ impl Game {
             open_pack_mode: false,
             _open_pack_staging: None,
             open_pack_wavs: None,
+            open_pack_save_slot: None,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -1835,6 +1840,7 @@ impl Game {
             open_pack_mode: false,
             _open_pack_staging: None,
             open_pack_wavs: None,
+            open_pack_save_slot: None,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -1852,7 +1858,12 @@ impl Game {
     /// starter Sims, and synthesized PCM WAV bank, paired with
     /// [`sims_ui::art::Art::clean_room_procedural`] and 2D clean-room Sim
     /// sprite rendering.
-    pub fn open_open_pack(pack_dir: &Path, play: bool, frames: Frames) -> Result<Self, String> {
+    pub fn open_open_pack(
+        pack_dir: &Path,
+        answers: &[u8],
+        play: bool,
+        frames: Frames,
+    ) -> Result<Self, String> {
         let staged = crate::open_pack::stage_open_pack(pack_dir)?;
         let install_root = staged.staging_dir.path();
         let house = &staged.house_path;
@@ -1874,7 +1885,7 @@ impl Game {
         let base_assets = BaseAssets::load(&install).map_err(|e| e.to_string())?;
         let (floor_plugins, wall_plugins) = Surfaces::plugins_with_pool(&install, &pool);
 
-        let mut lot = Lot::load_open_pack(install_root, house, &[], frames.clone())
+        let mut lot = Lot::load_open_pack(install_root, house, answers, frames.clone())
             .map_err(|e| format!("{}: {e}", house.display()))?;
         lot.wait_for_answers();
         let stopped = lot
@@ -2029,6 +2040,7 @@ impl Game {
             open_pack_mode: true,
             _open_pack_staging: Some(staged.staging_dir),
             open_pack_wavs: Some(staged.sounds_wav),
+            open_pack_save_slot: Some(staged.save_slot),
         };
         game.sync_view();
         Ok(game)
@@ -2037,6 +2049,12 @@ impl Game {
     /// Whether this game is running in standalone clean-room `open-pack/` mode.
     pub fn is_open_pack(&self) -> bool {
         self.open_pack_mode
+    }
+
+    /// Stable save slot key for standalone clean-room `open-pack/` mode,
+    /// derived from the source pack directory and lot manifest.
+    pub fn open_pack_save_slot(&self) -> Option<&str> {
+        self.open_pack_save_slot.as_deref()
     }
 
     /// Synthesized PCM WAV sound bank loaded from `open-pack/`, when running
@@ -3906,7 +3924,6 @@ impl Game {
             crate::open_pack::draw_open_pack_sims(
                 world,
                 draw_shape,
-                &mut self.assets,
                 &self.view.camera,
                 viewport,
                 &mut self.canvas,

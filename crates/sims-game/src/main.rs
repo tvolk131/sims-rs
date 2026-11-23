@@ -3104,7 +3104,12 @@ fn run() -> Result<(), String> {
             pack_dir.display()
         );
         let started = Instant::now();
-        let mut game = Game::open_open_pack(&pack_dir, config.play, sims_game::Frames::default())?;
+        let mut game = Game::open_open_pack(
+            &pack_dir,
+            &config.answers,
+            config.play,
+            sims_game::Frames::default(),
+        )?;
         game.set_debug(config.debug);
         eprintln!(
             "sims-game: booted open-pack in {:.2} s",
@@ -3125,6 +3130,29 @@ fn run() -> Result<(), String> {
             }
             if let Some(stop) = game.stopped() {
                 eprintln!("sims-game: {stop}");
+                return Err(format!(
+                    "open-pack headless run stopped after {ran}/{} ticks: {stop}",
+                    still.ticks
+                ));
+            }
+            if !config.play && !game.errors().is_empty() {
+                return Err(format!(
+                    "open-pack headless strict run encountered {} VM error(s) after {ran}/{} ticks",
+                    game.errors().len(),
+                    still.ticks
+                ));
+            }
+            if ran < still.ticks {
+                if let Some(dialog) = game.asking() {
+                    return Err(format!(
+                        "open-pack headless run paused on dialog (object {}, answers {:?}) after {ran}/{} ticks (supply --answers)",
+                        dialog.shown.object, dialog.shown.answers, still.ticks
+                    ));
+                }
+                return Err(format!(
+                    "open-pack headless run completed only {ran}/{} ticks",
+                    still.ticks
+                ));
             }
             game.resize(still.size);
             let started = Instant::now();
@@ -3144,10 +3172,11 @@ fn run() -> Result<(), String> {
         }
         let saved_optn = game.options().to_optn();
         let sound = Sound::start_open_pack(game.open_pack_sounds(), config.mute);
+        let save_slot = game.open_pack_save_slot().unwrap_or("open-pack").to_owned();
         let mut app = App {
             session: Session::Standalone {
                 game: Box::new(game),
-                slot: "open-pack".to_owned(),
+                slot: save_slot,
                 options_file,
                 saved_optn,
             },

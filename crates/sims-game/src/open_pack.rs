@@ -20,9 +20,9 @@ use sims_antics::ir::{
 use sims_formats::bitmap::Image;
 use sims_formats::execution::ObjectFunction;
 use sims_formats::iff::ChunkData;
-use sims_render::canvas::{Image as CanvasImage, Rect as CanvasRect};
-use sims_render::depth::Depth;
-use sims_render::{Assets, Camera, Canvas, Lot as RenderLot};
+use sims_render::canvas::Image as CanvasImage;
+use sims_render::depth::{Anchor, Depth};
+use sims_render::{Camera, Canvas, Lot as RenderLot};
 use sims_sim::World;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -70,8 +70,22 @@ impl Drop for OpenPackStagingDir {
 pub(crate) struct StagedOpenPack {
     pub(crate) staging_dir: OpenPackStagingDir,
     pub(crate) house_path: PathBuf,
+    pub(crate) save_slot: String,
     pub(crate) sounds_wav: BTreeMap<String, Vec<u8>>,
     pub(crate) starter_sims: Vec<StarterSimSpec>,
+}
+
+/// Computes a stable, pack- and lot-scoped save slot key derived from the
+/// source `open-pack/` directory and manifest identity (never from the
+/// temporary staging directory) so multiple standalone packs sharing one
+/// `--saves` file never overwrite one another.
+pub fn open_pack_save_slot(pack_dir: &Path, pack_name: &str, lot_number: i32) -> String {
+    let canonical = std::fs::canonicalize(pack_dir).unwrap_or_else(|_| pack_dir.to_path_buf());
+    format!(
+        "open-pack:{}:{}:lot{lot_number}",
+        canonical.to_string_lossy(),
+        pack_name.trim()
+    )
 }
 
 /// Returns `true` when `dir` looks like a valid `open-pack/` source directory.
@@ -143,9 +157,11 @@ pub(crate) fn stage_open_pack(pack_dir: &Path) -> Result<StagedOpenPack, String>
     let global_iff = build_clean_room_global_iff()?;
     write_bytes(global_dir.join("Global.iff"), &global_iff)?;
 
-    // Clean-room objects FAR + hidden lot indicator definitions (`0x2f72_6fff`, `0x0baa_71c5`).
+    // Clean-room objects FAR (fixed `.far` name distinct from `open_indicators.iff`
+    // so arbitrary manifest `archive_name` values always mount cleanly) + hidden
+    // lot indicator & Buy/Build cursor definitions.
     write_bytes(
-        objects_dir.join(&compiled.pack.archive_name),
+        objects_dir.join("open_pack_objects.far"),
         &compiled.pack.far_bytes,
     )?;
     let indicators_iff = build_clean_room_indicators_iff()?;
@@ -178,9 +194,16 @@ pub(crate) fn stage_open_pack(pack_dir: &Path) -> Result<StagedOpenPack, String>
         write_bytes(chars_dir.join(name), bytes)?;
     }
 
+    let save_slot = open_pack_save_slot(
+        pack_dir,
+        &compiled.pack.name,
+        compiled.house_manifest.lot_number,
+    );
+
     Ok(StagedOpenPack {
         staging_dir,
         house_path,
+        save_slot,
         sounds_wav: compiled.pack.sounds_wav,
         starter_sims: compiled.starter_sims,
     })
@@ -653,21 +676,38 @@ pub(crate) fn procedural_sim_portrait(sim_index: usize) -> Image {
     }
 }
 
-/// Draws clean-room 2D sprite-backed Sims (and a crisp green diamond plumb bob
-/// above the selected Sim) into `canvas` for standalone `open-pack/` lots where
-/// no commercial 3D `.skn`/`.cmx` character meshes exist.
+/// Projects an `open-pack/` Sim's fine world position `[x, y, level]` to screen
+/// pixels and its matching [`Depth`] anchor using terrain steps (`altitude_at`)
+/// converted to near-zoom pixels (`steps * 16`) for [`Camera::project_fine`]
+/// and passed directly in terrain steps to [`Depth::anchor`].
+pub fn project_open_pack_sim(
+    camera: &Camera,
+    lot_shape: &RenderLot,
+    pos: [i32; 3],
+) -> ([i32; 2], Anchor) {
+    let [x, y, level] = pos;
+    let altitude = lot_shape.altitude_at([x, y]);
+    let elevation_near_px = (altitude * 16.0).round() as i32;
+    let rotated = camera.rotate_fine([x, y]);
+    let screen = camera.project_fine(rotated, level, elevation_near_px);
+    let anchor = Depth::new(camera).anchor(screen[1], altitude, level);
+    (screen, anchor)
+}
+
+/// Draws clean-room directional 2D procedural Sims (and a crisp green diamond
+/// plumb bob above the selected Sim) into `canvas` for standalone `open-pack/`
+/// lots where no commercial 3D `.skn`/`.cmx` character meshes exist.
 ///
-/// Writes both `canvas.color`, `canvas.depth`, and object picking IDs so Sims
-/// are visibly rendered, depth-occluded by nearer walls/furniture, and
-/// clickable/selectable via `Game::click`.
+/// Writes `canvas.color`, `canvas.depth`, and object picking IDs so Sims are
+/// visibly rendered at all rotations and zooms, depth-occluded by nearer
+/// walls/furniture, and clickable/selectable via `Game::click`.
 pub(crate) fn draw_open_pack_sims(
     world: &World,
     lot_shape: &RenderLot,
-    assets: &mut Assets,
     camera: &Camera,
     viewport: (u32, u32),
     canvas: &mut Canvas,
-    written_rects: &mut Vec<CanvasRect>,
+    written_rects: &mut Vec<sims_render::canvas::Rect>,
 ) {
     let vp_w = i32::try_from(viewport.0)
         .unwrap_or(i32::MAX)
@@ -682,15 +722,13 @@ pub(crate) fn draw_open_pack_sims(
     let zoom_idx = camera.zoom.index();
     let active_level = camera.level;
     let selected_id = world.selected();
-    let depth_table = Depth::new(camera);
 
     struct VisibleOpenSim {
         id: u16,
         guid: u32,
-        pos: [i32; 3],
-        facing: i16,
+        rel_dir: u8,
         screen: [i32; 2],
-        altitude: f32,
+        anchor: Anchor,
     }
 
     // Collect visible Sims sorted back-to-front by screen Y so nearer Sims draw cleanly over farther ones.
@@ -703,17 +741,18 @@ pub(crate) fn draw_open_pack_sims(
         if level != active_level || x < 0 || y < 0 {
             continue;
         }
-        let altitude = lot_shape.altitude_at([x, y]);
-        let rotated = camera.rotate_fine([x, y]);
-        let screen = camera.project_fine(rotated, level, altitude.round() as i32);
+        let (screen, anchor) = project_open_pack_sim(camera, lot_shape, [x, y, level]);
         let facing = obj.data.get(1).copied().unwrap_or(0);
+        // Combine world Sim facing (0..8) with camera rotation (0..4) so the
+        // character faces consistently relative to the active camera angle.
+        let rel_dir =
+            ((facing.rem_euclid(8) / 2) + i16::from(camera.rotation & 3)).rem_euclid(4) as u8;
         sims.push(VisibleOpenSim {
             id,
             guid: obj.guid,
-            pos: [x, y, level],
-            facing,
+            rel_dir,
             screen,
-            altitude,
+            anchor,
         });
     }
     sims.sort_by_key(|s| s.screen[1]);
@@ -721,58 +760,37 @@ pub(crate) fn draw_open_pack_sims(
     for VisibleOpenSim {
         id,
         guid,
-        pos,
-        facing,
+        rel_dir,
         screen,
-        altitude,
+        anchor,
     } in sims
     {
-        let anchor = depth_table.anchor(screen[1], altitude / 16.0, pos[2]);
         let mut min_x = i32::MAX;
         let mut min_y = i32::MAX;
         let mut max_x = i32::MIN;
         let mut max_y = i32::MIN;
 
         canvas.set_id(Some(id));
-        let sprite_drawn = draw_sim_dgrp_sprite(
+        draw_procedural_sim_figure(
             guid,
-            facing,
+            rel_dir,
             screen,
             zoom_idx,
             vp_w,
             vp_h,
-            &depth_table,
-            anchor,
-            assets,
+            anchor.depth,
             canvas,
             &mut min_x,
             &mut min_y,
             &mut max_x,
             &mut max_y,
         );
-
-        if !sprite_drawn {
-            // Crisp clean-room procedural Sim silhouette fallback if DGRP is absent.
-            draw_procedural_sim_figure(
-                id,
-                screen,
-                zoom_idx,
-                vp_w,
-                vp_h,
-                anchor.depth,
-                canvas,
-                &mut min_x,
-                &mut min_y,
-                &mut max_x,
-                &mut max_y,
-            );
-        }
         canvas.set_id(None);
 
         // Draw green diamond plumb bob above the selected Sim.
         if selected_id == Some(id) {
             let bob_y = (if min_y < i32::MAX {
-                min_y - (10 << zoom_idx).min(24)
+                min_y - (8 << zoom_idx).min(24)
             } else {
                 screen[1] - (42 << zoom_idx).min(96)
             })
@@ -796,94 +814,9 @@ pub(crate) fn draw_open_pack_sims(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_sim_dgrp_sprite(
-    guid: u32,
-    facing: i16,
-    screen: [i32; 2],
-    zoom_idx: usize,
-    vp_w: i32,
-    vp_h: i32,
-    depth_table: &Depth,
-    anchor: sims_render::depth::Anchor,
-    assets: &mut Assets,
-    canvas: &mut Canvas,
-    min_x: &mut i32,
-    min_y: &mut i32,
-    max_x: &mut i32,
-    max_y: &mut i32,
-) -> bool {
-    let Some(def) = assets.definition(guid) else {
-        return false;
-    };
-    let group = def.graphic;
-    if def.graphics == 0 {
-        return false;
-    }
-    let dir_bit = 1u32 << ((facing.rem_euclid(8) / 2) as u32);
-    let parts = assets.group(&def, group, dir_bit, zoom_idx);
-    if parts.is_empty() {
-        return false;
-    }
-    // Tint each starter Sim subtly by GUID parity so both Sims are immediately distinguishable.
-    let tint: [u16; 3] = if guid & 1 == 1 {
-        [100, 100, 100]
-    } else {
-        [118, 90, 96]
-    };
-    let mut drew_any = false;
-    for part in parts {
-        let mut tinted = part.image.clone();
-        if tint != [100, 100, 100] {
-            for px in tinted.rgba.as_chunks_mut::<4>().0 {
-                if px[3] != 0 {
-                    px[0] = ((u16::from(px[0]) * tint[0]) / 100).min(255) as u8;
-                    px[1] = ((u16::from(px[1]) * tint[1]) / 100).min(255) as u8;
-                    px[2] = ((u16::from(px[2]) * tint[2]) / 100).min(255) as u8;
-                }
-            }
-        }
-        let iw = tinted.width as i32;
-        let ih = tinted.height as i32;
-        let ox = screen[0] + part.offset[0];
-        let oy = screen[1] + part.offset[1] - ih;
-        // Skip sprites completely outside the active 3D viewport (above the HUD strip).
-        if ox >= vp_w || oy >= vp_h || ox + iw <= 0 || oy + ih <= 0 {
-            continue;
-        }
-        // Clip sprite bottom to the 3D house viewport so it never bleeds into the HUD strip.
-        let clipped_h = (vp_h - oy).min(ih);
-        if clipped_h <= 0 {
-            continue;
-        }
-        let draw_img = if clipped_h < ih {
-            let new_h = clipped_h as usize;
-            CanvasImage {
-                width: tinted.width,
-                height: new_h,
-                rgba: tinted.rgba[..tinted.width * new_h * 4].to_vec(),
-                depth: tinted
-                    .depth
-                    .as_ref()
-                    .map(|d| d[..tinted.width * new_h].to_vec()),
-            }
-        } else {
-            tinted
-        };
-        canvas.draw(&draw_img, [ox, oy], part.flip, |_, _, z| {
-            depth_table.sprite(anchor, z).unwrap_or(anchor.depth)
-        });
-        *min_x = (*min_x).min(ox);
-        *min_y = (*min_y).min(oy);
-        *max_x = (*max_x).max(ox + iw);
-        *max_y = (*max_y).max(oy + clipped_h);
-        drew_any = true;
-    }
-    drew_any
-}
-
-#[allow(clippy::too_many_arguments)]
 fn draw_procedural_sim_figure(
-    id: u16,
+    guid: u32,
+    rel_dir: u8,
     screen: [i32; 2],
     zoom_idx: usize,
     vp_w: i32,
@@ -896,53 +829,142 @@ fn draw_procedural_sim_figure(
     max_y: &mut i32,
 ) {
     let scale = 1i32 << zoom_idx;
-    let body_w = 5 * scale;
-    let body_h = 14 * scale;
-    let head_r = 3 * scale;
-    let total_w = (body_w * 2 + 1) as usize;
-    let total_h = (body_h + head_r * 2 + 2) as usize;
-    let shirt = if id.is_multiple_of(2) {
-        [68u8, 138, 206, 255]
+    let half_w = 6 * scale;
+    let total_w = (half_w * 2 + 1) as usize;
+    let total_h = (28 * scale) as usize;
+    let (shirt, shirt_hi, shirt_lo, hair, skin, pants) = if guid & 1 == 1 {
+        (
+            [62u8, 134, 204, 255],
+            [92u8, 166, 232, 255],
+            [40u8, 92, 150, 255],
+            [86u8, 56, 36, 255],
+            [236u8, 198, 168, 255],
+            [48u8, 66, 98, 255],
+        )
     } else {
-        [196u8, 92, 118, 255]
+        (
+            [196u8, 86, 114, 255],
+            [224u8, 120, 144, 255],
+            [142u8, 54, 76, 255],
+            [42u8, 34, 48, 255],
+            [218u8, 174, 142, 255],
+            [56u8, 58, 76, 255],
+        )
     };
-    let skin = [232u8, 192, 162, 255];
+    let shoe = [38u8, 34, 34, 255];
+    let eye = [30u8, 32, 42, 255];
+    let shadow = [24u8, 28, 34, 140];
+
     let mut rgba = vec![0u8; total_w * total_h * 4];
-    let cx = body_w;
-    let head_cy = head_r;
+    let cx = half_w;
+    let head_r = 3 * scale;
+    let head_cy = 4 * scale;
+    let torso_top = head_cy + head_r + scale;
+    let torso_bot = torso_top + 9 * scale;
+    let legs_bot = torso_bot + 8 * scale;
+    let feet_bot = (total_h as i32) - scale;
+
     for y in 0..total_h as i32 {
         for x in 0..total_w as i32 {
             let dx = x - cx;
             let dy_h = y - head_cy;
-            let px = if dx * dx + dy_h * dy_h <= head_r * head_r {
-                Some(skin)
-            } else if y >= head_r * 2 {
-                Some(shirt)
-            } else {
-                None
-            };
+            let mut px: Option<[u8; 4]> = None;
+
+            // Ground shadow oval under feet.
+            let dy_s = y - feet_bot;
+            if dy_s.abs() <= scale && dx.abs() <= 5 * scale {
+                px = Some(shadow);
+            }
+
+            // Two legs + shoes.
+            if y >= torso_bot && y <= feet_bot {
+                let leg_gap = (scale / 2).max(1);
+                let in_left = dx >= -3 * scale && dx <= -leg_gap;
+                let in_right = dx >= leg_gap && dx <= 3 * scale;
+                if in_left || in_right {
+                    px = Some(if y >= legs_bot { shoe } else { pants });
+                }
+            }
+
+            // Shaded torso + arms.
+            if y >= torso_top && y < torso_bot {
+                let torso_half = 4 * scale;
+                let arm_half = 5 * scale;
+                if dx.abs() <= torso_half {
+                    px = Some(if dx < -scale {
+                        shirt_hi
+                    } else if dx > scale {
+                        shirt_lo
+                    } else {
+                        shirt
+                    });
+                } else if dx.abs() <= arm_half && y >= torso_top + scale && y < torso_bot - scale {
+                    px = Some(if y >= torso_bot - 3 * scale {
+                        skin
+                    } else if dx < 0 {
+                        shirt_hi
+                    } else {
+                        shirt_lo
+                    });
+                }
+            }
+
+            // Neck.
+            if y >= head_cy + head_r && y < torso_top && dx.abs() <= scale {
+                px = Some(skin);
+            }
+
+            // Head, hair crown, and camera-relative directional face/eyes.
+            if dx * dx + dy_h * dy_h <= head_r * head_r {
+                let back_view = rel_dir == 2;
+                let hair_cap = back_view || dy_h <= -scale;
+                let mut c = if hair_cap { hair } else { skin };
+                if !back_view && dy_h >= 0 && dy_h <= scale {
+                    let eye_shift = match rel_dir {
+                        1 => -scale,
+                        3 => scale,
+                        _ => 0,
+                    };
+                    let ex = dx - eye_shift;
+                    if (ex == -scale || ex == scale) && dy_h == 0 {
+                        c = eye;
+                    }
+                }
+                px = Some(c);
+            }
+
             if let Some(c) = px {
                 let p = (y as usize * total_w + x as usize) * 4;
                 rgba[p..p + 4].copy_from_slice(&c);
             }
         }
     }
-    let ox = screen[0] - body_w;
-    let oy = screen[1] - total_h as i32;
+
+    let ox = screen[0] - half_w;
+    let oy = screen[1] - (total_h as i32) + scale;
     if ox >= vp_w || oy >= vp_h || ox + total_w as i32 <= 0 || oy + total_h as i32 <= 0 {
         return;
     }
+    let clipped_h = (vp_h - oy).min(total_h as i32);
+    if clipped_h <= 0 {
+        return;
+    }
+    let draw_h = clipped_h as usize;
     let img = CanvasImage {
         width: total_w,
-        height: total_h,
-        rgba,
+        height: draw_h,
+        rgba: if draw_h < total_h {
+            rgba[..total_w * draw_h * 4].to_vec()
+        } else {
+            rgba
+        },
         depth: None,
     };
     canvas.draw(&img, [ox, oy], false, |_, _, _| depth);
     *min_x = (*min_x).min(ox);
     *min_y = (*min_y).min(oy);
     *max_x = (*max_x).max(ox + total_w as i32);
-    *max_y = (*max_y).max(oy + total_h as i32);
+    *max_y = (*max_y).max(oy + clipped_h);
 }
 
 #[allow(clippy::too_many_arguments)]

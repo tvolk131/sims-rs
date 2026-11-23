@@ -2117,6 +2117,38 @@ impl NeighborhoodStore {
         txn.commit().map_err(store)
     }
 
+    /// Returns whether legacy `.caf-names.tsv` sidecar surnames have already
+    /// been migrated once into REDB for `(neighborhood_id, instance_id)`.
+    pub fn caf_sidecar_migrated(&self, neighborhood_id: &str, instance_id: u128) -> Result<bool> {
+        let key = format!("caf_sidecar_migrated:{neighborhood_id}:{instance_id:032x}");
+        let txn = self.db.begin_read().map_err(store)?;
+        let table = match txn.open_table(NEIGHBORHOOD_META) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(error) => return Err(store(error)),
+        };
+        Ok(table.get(key.as_str()).map_err(store)?.is_some())
+    }
+
+    /// Records that legacy `.caf-names.tsv` sidecar migration has completed
+    /// for `(neighborhood_id, instance_id)` so deleted families' old sidecar
+    /// rows are never reapplied if a family ID is later reused.
+    pub fn mark_caf_sidecar_migrated(
+        &self,
+        neighborhood_id: &str,
+        instance_id: u128,
+    ) -> Result<()> {
+        let key = format!("caf_sidecar_migrated:{neighborhood_id}:{instance_id:032x}");
+        let txn = self.db.begin_write().map_err(store)?;
+        {
+            let mut meta_table = txn.open_table(NEIGHBORHOOD_META).map_err(store)?;
+            meta_table
+                .insert(key.as_str(), b"1".as_slice())
+                .map_err(store)?;
+        }
+        txn.commit().map_err(store)
+    }
+
     /// Deletes a neighborhood and all of its characters, base houses, and saved
     /// lots atomically. Returns `true` if the neighborhood existed.
     pub fn delete_neighborhood(&self, id: &str) -> Result<bool> {

@@ -6,7 +6,7 @@
 
 ## Context
 
-Following PR #383 (clean-room `open-pack/` assets + `sims-antics` Antics compiler), PR #384 (`sims-audio` / `sims-people` polish), and PR #385 (`sims-vm` native live cheats, `VmInstallCache`, REDB v4 `StoredNeighborhood.family_surnames`, and `AutosaveStore` SHA-256 validator fast paths), `sims-game` still had four runtime seams pointing at pre-PR #385 workarounds, and could not boot without a commercial `SIMS_INSTALL` directory:
+Following PR #383 (`6c347669`, fast Save Manager listing, 3D Try-On preview, paginated Spellbook/Cookbook, and Neighborhood secondary actions), PR #384 (`f906d5a4`, `sims-antics` formal verifier and 20-object clean-room standalone `open-pack/`), and PR #385 (`0b5e1fa1`, `sims-vm` native live cheats, `VmInstallCache`, 600-tick deep sweep ports, REDB v4 `StoredNeighborhood.family_surnames`, and `AutosaveStore` SHA-256 validator fast paths), `sims-game` still had four runtime seams pointing at pre-PR #385 workarounds, and could not boot without a commercial `SIMS_INSTALL` directory:
 
 1. **Live cheats** (`move_objects`, `rosebud` / `klapaucius`, `set_hour`) either kept a UI-only flag (`"VM placement override pending"`) or round-tripped through `Lot::restore`, which wiped Buy/Build undo history and cleared `neighborhood_origin`.
 2. **Warm lot entry** cached render/UI/people assets in `InstallAssets`, but still rebuilt the entire base VM `Program`, animations, avatar registry, surfaces, and icon frames on every `NeighborhoodShell::enter_lot`.

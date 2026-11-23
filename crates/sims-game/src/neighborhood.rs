@@ -727,7 +727,8 @@ impl NeighborhoodShell {
         let slot = slot.clamp(MIN_NEIGHBORHOOD, MAX_NEIGHBORHOOD);
         let kind = default_map_kind(&install, slot);
         let neighborhood_id = neighborhood_id_for_slot(slot);
-        let stored = ensure_imported(&install, &store, &neighborhood_id)?;
+        let mut stored = ensure_imported(&install, &store, &neighborhood_id)?;
+        migrate_legacy_caf_sidecar_if_needed(&store, &saves_path, &neighborhood_id, &mut stored);
         let _ = store.set_active_neighborhood(&neighborhood_id);
         let user_dir = resolve_user_dir(&install, slot)?;
         let pool = Arc::new(ArchivePool::new());
@@ -851,13 +852,7 @@ impl NeighborhoodShell {
                     );
                     (base_index, base_catalog, faces)
                 });
-                let family_names = load_family_names_with_caf(
-                    &user_dir,
-                    &saves_path,
-                    &neighborhood_id,
-                    stored.instance_id,
-                    &stored,
-                );
+                let family_names = load_family_names_with_caf(&user_dir, &stored);
                 let custom_thumbs = load_persisted_custom_thumbs(&store, &neighborhood_id);
                 (
                     art_handle.join().expect("neighborhood art worker panicked"),
@@ -4431,17 +4426,12 @@ impl NeighborhoodShell {
         let slot = slot.clamp(MIN_NEIGHBORHOOD, MAX_NEIGHBORHOOD);
         let kind = default_map_kind(&self.install, slot);
         let id = neighborhood_id_for_slot(slot);
-        let stored = ensure_imported(&self.install, &self.store, &id)?;
+        let mut stored = ensure_imported(&self.install, &self.store, &id)?;
+        migrate_legacy_caf_sidecar_if_needed(&self.store, &self.saves_path, &id, &mut stored);
         let _ = self.store.set_active_neighborhood(&id);
         let mut map = load_map_for_slot(&self.install, slot, kind)?;
         let user_dir = resolve_user_dir(&self.install, slot)?;
-        let family_names = load_family_names_with_caf(
-            &user_dir,
-            &self.saves_path,
-            &id,
-            stored.instance_id,
-            &stored,
-        );
+        let family_names = load_family_names_with_caf(&user_dir, &stored);
         let street_names = StreetNames::load(&self.install, &user_dir);
         let descriptions = NeighborhoodDescriptions::load(&self.install, &user_dir);
         let (faces, base_cat) = load_neighborhood_faces_cached(
@@ -4988,14 +4978,14 @@ impl NeighborhoodShell {
             .load_neighborhood(&self.neighborhood_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
+        migrate_legacy_caf_sidecar_if_needed(
+            &self.store,
+            &self.saves_path,
+            &self.neighborhood_id,
+            &mut self.stored,
+        );
         if let Ok(user_dir) = resolve_user_dir(&self.install, self.slot) {
-            self.family_names = load_family_names_with_caf(
-                &user_dir,
-                &self.saves_path,
-                &self.neighborhood_id,
-                self.stored.instance_id,
-                &self.stored,
-            );
+            self.family_names = load_family_names_with_caf(&user_dir, &self.stored);
         }
         let (faces, base_cat) = load_neighborhood_faces_cached(
             &self.install,
@@ -8579,41 +8569,76 @@ fn caf_names_sidecar_path(saves_path: &Path) -> PathBuf {
     saves_path.with_extension("caf-names.tsv")
 }
 
-/// Loads household surnames for `stored`, preferring native REDB v4
-/// `StoredNeighborhood.family_surnames` with a read-only migration fallback
-/// from any legacy `<saves>.caf-names.tsv` sidecar (never writing new sidecar
-/// files).
-fn load_family_names_with_caf(
-    user_dir: &Path,
+/// One-time read-only migration from any pre-v4 `<saves>.caf-names.tsv` sidecar
+/// into native REDB v4 `StoredNeighborhood.family_surnames`.
+///
+/// Leaves the sidecar file untouched on disk and records completion in REDB
+/// `NEIGHBORHOOD_META` for `(neighborhood_id, stored.instance_id)` so a family
+/// deleted after migration can never have its stale sidecar name reapplied when
+/// a later family reuses that family ID.
+fn migrate_legacy_caf_sidecar_if_needed(
+    store: &NeighborhoodStore,
     saves_path: &Path,
     neighborhood_id: &str,
-    instance_id: u128,
+    stored: &mut StoredNeighborhood,
+) {
+    let sidecar = caf_names_sidecar_path(saves_path);
+    if !sidecar.is_file() {
+        return;
+    }
+    if store
+        .caf_sidecar_migrated(neighborhood_id, stored.instance_id)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(&sidecar) else {
+        return;
+    };
+    let inst_hex = format!("{:032x}", stored.instance_id);
+    let mut changed = false;
+    for line in text.lines() {
+        let mut parts = line.splitn(4, '\t');
+        let (Some(nh), Some(inst), Some(fam_str), Some(surname)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let trimmed = surname.trim();
+        if nh == neighborhood_id
+            && inst == inst_hex
+            && let Ok(fam_id) = fam_str.parse::<u16>()
+            && stored.families.contains_key(&fam_id)
+            && !trimmed.is_empty()
+            && !stored.family_surnames.contains_key(&fam_id)
+        {
+            stored.set_family_surname(fam_id, trimmed);
+            changed = true;
+        }
+    }
+    if changed {
+        match store.save_neighborhood_checked(
+            neighborhood_id,
+            stored.instance_id,
+            stored.revision,
+            stored,
+        ) {
+            Ok(Ok((_, new_rev))) => {
+                stored.revision = new_rev;
+            }
+            _ => return,
+        }
+    }
+    let _ = store.mark_caf_sidecar_migrated(neighborhood_id, stored.instance_id);
+}
+
+/// Loads household surnames for `stored`, overlaying native REDB v4
+/// `StoredNeighborhood.family_surnames` over base `Neighborhood.iff` names.
+fn load_family_names_with_caf(
+    user_dir: &Path,
     stored: &StoredNeighborhood,
 ) -> BTreeMap<u16, String> {
     let mut names = load_family_names(user_dir);
-    // Read-only backwards-compatibility fallback for pre-v4 saves that still
-    // carry a legacy `<saves>.caf-names.tsv` sidecar alongside REDB.
-    let sidecar = caf_names_sidecar_path(saves_path);
-    if let Ok(text) = std::fs::read_to_string(&sidecar) {
-        let inst_hex = format!("{instance_id:032x}");
-        for line in text.lines() {
-            let mut parts = line.splitn(4, '\t');
-            let (Some(nh), Some(inst), Some(fam_str), Some(surname)) =
-                (parts.next(), parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            if nh == neighborhood_id
-                && inst == inst_hex
-                && let Ok(fam_id) = fam_str.parse::<u16>()
-                && stored.families.contains_key(&fam_id)
-                && !surname.trim().is_empty()
-            {
-                names.insert(fam_id, surname.trim().to_owned());
-            }
-        }
-    }
-    // Native REDB v4 `StoredNeighborhood.family_surnames` takes precedence.
     for (&fam_id, surname) in &stored.family_surnames {
         let trimmed = surname.trim();
         if stored.families.contains_key(&fam_id) && !trimmed.is_empty() {

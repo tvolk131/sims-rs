@@ -1,21 +1,27 @@
 //! Headless E2E verification for Batch 13 Track 1:
 //! - Zero-`SIMS_INSTALL` standalone clean-room `open-pack/` boot, rendering,
-//!   interaction pie menu, camera controls, live cheats, synthesized WAV audio,
-//!   and CLI `--open-pack --png` / automatic standalone fallback.
+//!   interaction pie menu, camera rotations/zooms, raised-terrain Sim elevation
+//!   & depth projection, Buy Mode + live cheats, synthesized WAV audio,
+//!   two-pack isolated save slots & custom archive names, and CLI
+//!   `--open-pack --png` / automatic standalone fallback (with decoded RGB check).
 //! - `SIMS_INSTALL`-gated Complete Collection verification for native live
 //!   cheats (`move_objects`, `rosebud`/`klapaucius`, `set_hour` preserving
 //!   Buy/Build undo history), warm `NeighborhoodShell::enter_lot` with
-//!   `VmInstallCache` (bit-exact `World::hash()` + 5-run median timing),
-//!   native REDB v4 `StoredNeighborhood.family_surnames` (zero `.caf-names.tsv`
-//!   writes + read-only legacy fallback), and `AutosaveStore` SHA-256 fast path.
+//!   `VmInstallCache` (full state/render/audio/save parity + 5-run median
+//!   timing), native REDB v4 `StoredNeighborhood.family_surnames` driven through
+//!   `NeighborhoodShell` (zero `.caf-names.tsv` writes + one-time legacy
+//!   migration that never resurrects deleted families), and `AutosaveStore`
+//!   SHA-256 fast path.
 
 use sims_audio::SoundEvent;
 use sims_game::autosave_worker::{AutosaveWorker, validate_save_payload_cached_with_sha256};
 use sims_game::game::Game;
 use sims_game::neighborhood::NeighborhoodShell;
-use sims_game::open_pack::discover_open_pack_dir;
+use sims_game::open_pack::{discover_open_pack_dir, project_open_pack_sim};
 use sims_game::sound::{Input, Mixer};
 use sims_game::view::Move;
+use sims_render::depth::Depth;
+use sims_render::{Camera, Lot as RenderLot, Zoom};
 use sims_sim::autosave::{AutosaveStore, SaveError, SaveJob, SavePayload, SaveSlot};
 use sims_ui::command::Mode;
 use sims_vm::boot::Frames;
@@ -64,10 +70,79 @@ fn submit_cheat(game: &mut Game, line: &str) {
         .unwrap_or_else(|e| panic!("cheat {line:?} parse failed: {e}"));
 }
 
+#[allow(clippy::disallowed_methods)]
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("create dst dir");
+    let mut entries: Vec<_> = std::fs::read_dir(src)
+        .expect("read src dir")
+        .map(|e| e.expect("dir entry"))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let ty = entry.file_type().expect("file type");
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &target);
+        } else if ty.is_file() {
+            std::fs::copy(entry.path(), target).expect("copy file");
+        }
+    }
+}
+
+/// Decodes uncompressed 8-bit RGB PNG bytes written by `sims_render::png::encode`
+/// into `(width, height, rgb_bytes)`.
+fn decode_stored_rgb_png(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "PNG signature");
+    let mut pos = 8usize;
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut idat = Vec::new();
+    while pos + 12 <= bytes.len() {
+        let len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let kind = &bytes[pos + 4..pos + 8];
+        let data = &bytes[pos + 8..pos + 8 + len];
+        pos += 12 + len;
+        if kind == b"IHDR" {
+            width = u32::from_be_bytes(data[0..4].try_into().unwrap());
+            height = u32::from_be_bytes(data[4..8].try_into().unwrap());
+            assert_eq!(&data[8..13], &[8, 2, 0, 0, 0], "expected 8-bit RGB PNG");
+        } else if kind == b"IDAT" {
+            idat.extend_from_slice(data);
+        } else if kind == b"IEND" {
+            break;
+        }
+    }
+    assert!(width > 0 && height > 0, "valid PNG dimensions");
+    assert!(idat.len() >= 6, "valid zlib stream");
+    let mut zpos = 2usize; // skip 2-byte zlib header
+    let mut raw = Vec::new();
+    while zpos + 5 <= idat.len() - 4 {
+        let header = idat[zpos];
+        assert_eq!(header & 0x06, 0, "expected stored deflate block");
+        let blen = u16::from_le_bytes([idat[zpos + 1], idat[zpos + 2]]) as usize;
+        let nlen = u16::from_le_bytes([idat[zpos + 3], idat[zpos + 4]]);
+        assert_eq!(blen as u16, !nlen, "valid stored block length");
+        zpos += 5;
+        raw.extend_from_slice(&idat[zpos..zpos + blen]);
+        zpos += blen;
+        if header & 1 != 0 {
+            break;
+        }
+    }
+    let row_bytes = (width as usize) * 3 + 1;
+    assert_eq!(raw.len(), row_bytes * (height as usize));
+    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for row in raw.chunks_exact(row_bytes) {
+        assert_eq!(row[0], 0, "expected filter type 0");
+        rgb.extend_from_slice(&row[1..]);
+    }
+    (width, height, rgb)
+}
+
 #[test]
 fn open_pack_boots_renders_steps_interacts_cheats_and_plays_wavs() {
     let pack_dir = open_pack_path();
-    let mut game = Game::open_open_pack(&pack_dir, false, Frames::default())
+    let mut game = Game::open_open_pack(&pack_dir, &[], false, Frames::default())
         .expect("standalone open-pack/ must boot cleanly without SIMS_INSTALL");
 
     assert!(game.is_open_pack());
@@ -131,15 +206,63 @@ fn open_pack_boots_renders_steps_interacts_cheats_and_plays_wavs() {
         hud_colors.len()
     );
 
-    // Verify both starter Sims and multiple furniture objects are visibly drawn on canvas.
-    let drawn_sims = sim_ids
-        .iter()
-        .filter(|&&id| canvas.drawn(id).is_some())
-        .count();
-    assert!(
-        drawn_sims >= 1,
-        "at least one starter Sim must be visibly drawn in the initial viewport"
-    );
+    // Verify BOTH starter Sims render visibly across all 4 camera rotations and all 3 zooms.
+    for rot in 0..4 {
+        game.render();
+        for &sim_id in &sim_ids {
+            assert!(
+                game.canvas().drawn(sim_id).is_some(),
+                "starter Sim {sim_id} must render visibly at rotation {rot}"
+            );
+        }
+        assert!(game.apply(Move::Rotate(true)));
+    }
+    // Zoom in to Near and out to Far, confirming both starter Sims still draw cleanly.
+    let _ = game.apply(Move::ZoomIn);
+    game.render();
+    assert!(sim_ids.iter().any(|&id| game.canvas().drawn(id).is_some()));
+    let _ = game.apply(Move::ZoomOut);
+    let _ = game.apply(Move::ZoomOut);
+    game.render();
+    for &sim_id in &sim_ids {
+        assert!(
+            game.canvas().drawn(sim_id).is_some(),
+            "starter Sim {sim_id} must render visibly at Far zoom"
+        );
+    }
+    let _ = game.apply(Move::ZoomIn);
+    game.render();
+
+    // Verify raised-terrain projection & depth anchor at all 3 zooms (1 step = 16 near-zoom px).
+    let tile_x = 16usize;
+    let tile_y = 16usize;
+    let fine = [(tile_x as i32) * 16 + 8, (tile_y as i32) * 16 + 8, 1];
+    let mut flat_lot = RenderLot::from_world(game.lot().world()).expect("flat lot");
+    flat_lot.heights[RenderLot::cell(tile_x, tile_y)] = [0, 0, 0, 0];
+    let mut raised_lot = RenderLot::from_world(game.lot().world()).expect("raised lot");
+    raised_lot.heights[RenderLot::cell(tile_x, tile_y)] = [2, 2, 2, 2];
+    for (zoom, expected_dy) in [(Zoom::Far, 8i32), (Zoom::Medium, 16), (Zoom::Near, 32)] {
+        let cam = Camera {
+            zoom,
+            rotation: 0,
+            level: 1,
+            origin: [400, 120],
+            walls: sims_render::Walls::Up,
+            focus: sims_render::Focus::default(),
+        };
+        let (flat_screen, _) = project_open_pack_sim(&cam, &flat_lot, fine);
+        let (raised_screen, raised_anchor) = project_open_pack_sim(&cam, &raised_lot, fine);
+        assert_eq!(
+            flat_screen[1] - raised_screen[1],
+            expected_dy,
+            "2-step raised tile must lift Sim by {expected_dy} px at {zoom:?}"
+        );
+        let expected_anchor = Depth::new(&cam).anchor(raised_screen[1], 2.0, 1);
+        assert_eq!(
+            raised_anchor.depth, expected_anchor.depth,
+            "raised Sim depth anchor must match Depth::anchor in terrain steps at {zoom:?}"
+        );
+    }
 
     // Find a drawn interactive furniture object pixel and click it to open its pie menu.
     let mut clicked_entry = None;
@@ -217,11 +340,8 @@ fn open_pack_boots_renders_steps_interacts_cheats_and_plays_wavs() {
         game.errors()
     );
 
-    // Exercise camera pan, rotate, and zoom.
+    // Exercise camera pan.
     assert!(game.apply(Move::Scroll([24, -16])));
-    assert!(game.apply(Move::Rotate(true)));
-    let _ = game.apply(Move::ZoomIn);
-    let _ = game.apply(Move::ZoomOut);
     game.render();
 
     // Exercise Buy Mode in open-pack (catalog rendering, move_objects overlap placement,
@@ -347,17 +467,113 @@ fn open_pack_boots_renders_steps_interacts_cheats_and_plays_wavs() {
 }
 
 #[test]
+fn open_pack_two_packs_isolate_save_slots_and_custom_archive_names_boot() {
+    let tmp = TempTestDir::new("two-packs-slots");
+    let src_pack = open_pack_path();
+    let pack_a = tmp.path().join("pack-alpha");
+    let pack_b = tmp.path().join("pack-beta");
+    copy_dir_recursive(&src_pack, &pack_a);
+    copy_dir_recursive(&src_pack, &pack_b);
+
+    // Customize pack A's archive_name to collide with `open_indicators.iff` (no `.far`!)
+    // and pack B's archive_name to omit `.far` and use lot_number = 2.
+    let pack_toml_a = std::fs::read_to_string(pack_a.join("pack.toml")).unwrap();
+    std::fs::write(
+        pack_a.join("pack.toml"),
+        pack_toml_a
+            .replace("open-pack.far", "open_indicators.iff")
+            .replace("open-pack", "alpha-pack"),
+    )
+    .unwrap();
+    let pack_toml_b = std::fs::read_to_string(pack_b.join("pack.toml")).unwrap();
+    std::fs::write(
+        pack_b.join("pack.toml"),
+        pack_toml_b
+            .replace("open-pack.far", "beta_objects_no_ext")
+            .replace("open-pack", "beta-pack"),
+    )
+    .unwrap();
+    let house_toml_b = std::fs::read_to_string(pack_b.join("starter-house.toml")).unwrap();
+    std::fs::write(
+        pack_b.join("starter-house.toml"),
+        house_toml_b.replace("lot_number = 1", "lot_number = 2"),
+    )
+    .unwrap();
+
+    let mut game_a = Game::open_open_pack(&pack_a, &[], false, Frames::default())
+        .expect("pack A with colliding archive_name must still boot cleanly");
+    let mut game_b = Game::open_open_pack(&pack_b, &[], false, Frames::default())
+        .expect("pack B with extensionless archive_name and lot 2 must boot cleanly");
+
+    let slot_a = game_a
+        .open_pack_save_slot()
+        .expect("pack A save slot")
+        .to_owned();
+    let slot_b = game_b
+        .open_pack_save_slot()
+        .expect("pack B save slot")
+        .to_owned();
+    assert_ne!(
+        slot_a, slot_b,
+        "two distinct open-pack directories must never share the same save slot"
+    );
+    assert!(
+        !slot_a.contains("sims-rs-open-pack-"),
+        "save slot must derive from source pack, never temporary staging dir: {slot_a}"
+    );
+
+    // Save both packs into the SAME `--saves` REDB file with different funds.
+    let saves_db = tmp.path().join("shared-saves.redb");
+    let store = sims_sim::Snapshots::open(&saves_db).expect("open shared Snapshots store");
+    submit_cheat(&mut game_a, "rosebud");
+    submit_cheat(&mut game_b, "rosebud;!;!");
+    let funds_a = game_a.lot().world().budget.funds;
+    let funds_b = game_b.lot().world().budget.funds;
+    assert_ne!(funds_a, funds_b);
+    assert!(
+        game_a.save_to(&store, &slot_a),
+        "pack A save_to must succeed"
+    );
+    assert!(
+        game_b.save_to(&store, &slot_b),
+        "pack B save_to must succeed"
+    );
+
+    // Re-boot both packs fresh (new temp staging dirs) and verify both restore
+    // cleanly from the shared store without overwriting or rejecting each other.
+    drop(game_a);
+    drop(game_b);
+    let mut game_a2 = Game::open_open_pack(&pack_a, &[], false, Frames::default()).unwrap();
+    let mut game_b2 = Game::open_open_pack(&pack_b, &[], false, Frames::default()).unwrap();
+    assert_eq!(game_a2.open_pack_save_slot(), Some(slot_a.as_str()));
+    assert_eq!(game_b2.open_pack_save_slot(), Some(slot_b.as_str()));
+
+    let bytes_a = store.load_lot(&slot_a).unwrap().expect("pack A saved lot");
+    let bytes_b = store.load_lot(&slot_b).unwrap().expect("pack B saved lot");
+    game_a2
+        .restore(sims_vm::boot::save::Saved::decode(&bytes_a).unwrap())
+        .expect("pack A restore from shared saves file must succeed");
+    game_b2
+        .restore(sims_vm::boot::save::Saved::decode(&bytes_b).unwrap())
+        .expect("pack B restore from shared saves file must succeed");
+    assert_eq!(game_a2.lot().world().budget.funds, funds_a);
+    assert_eq!(game_b2.lot().world().budget.funds, funds_b);
+}
+
+#[test]
 fn open_pack_cli_png_renders_non_blank_screenshot_without_sims_install() {
     let tmp = TempTestDir::new("cli-open-pack-png");
     let exe = env!("CARGO_BIN_EXE_sims-game");
     let pack_dir = open_pack_path();
 
-    // 1. Explicit `--open-pack <dir> --png <out.png> --ticks 5 --size 640x480`.
+    // 1. Explicit `--open-pack <dir> --answers 3 --png <out.png> --ticks 5 --size 640x480`.
     let out1 = tmp.path().join("explicit-open-pack.png");
     let status1 = Command::new(exe)
         .env_remove("SIMS_INSTALL")
         .arg("--open-pack")
         .arg(&pack_dir)
+        .arg("--answers")
+        .arg("3")
         .arg("--png")
         .arg(&out1)
         .arg("--ticks")
@@ -366,21 +582,27 @@ fn open_pack_cli_png_renders_non_blank_screenshot_without_sims_install() {
         .arg("640x480")
         .output()
         .expect("run sims-game --open-pack --png");
+    let stderr1 = String::from_utf8_lossy(&status1.stderr);
     assert!(
         status1.status.success(),
-        "sims-game --open-pack --png failed:\nstdout: {}\nstderr: {}",
+        "sims-game --open-pack --png failed:\nstdout: {}\nstderr: {stderr1}",
         String::from_utf8_lossy(&status1.stdout),
-        String::from_utf8_lossy(&status1.stderr),
+    );
+    assert!(
+        stderr1.contains("ran 5 ticks"),
+        "expected headless run to report 5 completed ticks, got stderr:\n{stderr1}"
     );
     let png1 = std::fs::read(&out1).expect("read rendered open-pack PNG");
+    let (w1, h1, rgb1) = decode_stored_rgb_png(&png1);
+    assert_eq!((w1, h1), (640, 480));
+    let mut colors1 = BTreeSet::new();
+    for &px in rgb1.as_chunks::<3>().0.iter().step_by(7) {
+        colors1.insert(px);
+    }
     assert!(
-        png1.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "output must be a valid PNG"
-    );
-    assert!(
-        png1.len() > 4_000,
-        "rendered open-pack PNG should be non-blank (>4 KB), got {} bytes",
-        png1.len()
+        colors1.len() >= 16,
+        "decoded 640x480 open-pack PNG must have rich RGB variation (got {} colors)",
+        colors1.len()
     );
 
     // 2. Automatic standalone fallback (no `--open-pack`, no `<install>`, `SIMS_INSTALL` unset).
@@ -396,15 +618,28 @@ fn open_pack_cli_png_renders_non_blank_screenshot_without_sims_install() {
         .arg("320x240")
         .output()
         .expect("run sims-game --png auto fallback");
+    let stderr2 = String::from_utf8_lossy(&status2.stderr);
     assert!(
         status2.status.success(),
-        "sims-game auto fallback --png failed:\nstdout: {}\nstderr: {}",
+        "sims-game auto fallback --png failed:\nstdout: {}\nstderr: {stderr2}",
         String::from_utf8_lossy(&status2.stdout),
-        String::from_utf8_lossy(&status2.stderr),
+    );
+    assert!(
+        stderr2.contains("ran 2 ticks"),
+        "expected auto-fallback headless run to report 2 ticks, got stderr:\n{stderr2}"
     );
     let png2 = std::fs::read(&out2).expect("read auto-fallback PNG");
-    assert!(png2.starts_with(b"\x89PNG\r\n\x1a\n"));
-    assert!(png2.len() > 1_500);
+    let (w2, h2, rgb2) = decode_stored_rgb_png(&png2);
+    assert_eq!((w2, h2), (320, 240));
+    let mut colors2 = BTreeSet::new();
+    for &px in rgb2.as_chunks::<3>().0.iter().step_by(5) {
+        colors2.insert(px);
+    }
+    assert!(
+        colors2.len() >= 12,
+        "decoded 320x240 auto-fallback PNG must be non-blank (got {} colors)",
+        colors2.len()
+    );
 }
 
 #[test]
@@ -603,12 +838,100 @@ fn complete_collection_warm_enter_lot_vm_cache_parity_and_speedup() {
         NeighborhoodShell::open(root.clone(), saves, 1, true, vec![3], Frames::default())
             .expect("open neighborhood shell");
 
-    // Baseline uncached `Game::open_from_store_cached(..., None)` hash & 5-run median.
+    // 1. Full parity on base house boot: step 30 ticks, render, drain sounds, encode save.
+    let mut uncached_base = Game::open_from_store_cached(
+        &root,
+        shell.store(),
+        "UserData",
+        5,
+        &[3],
+        true,
+        Frames::default(),
+        None,
+    )
+    .expect("uncached base open_from_store_cached");
+    shell.enter_lot(5).expect("cold enter_lot 5 (warms cache)");
+    shell.enter_lot(5).expect("warm cached base enter_lot 5");
+    {
+        let cached_base = shell.game_mut().expect("cached base game");
+        uncached_base.resize([800, 600]);
+        cached_base.resize([800, 600]);
+        assert_eq!(uncached_base.run(30), 30);
+        assert_eq!(cached_base.run(30), 30);
+        uncached_base.render();
+        cached_base.render();
+        assert_eq!(
+            cached_base.lot().world().hash(),
+            uncached_base.lot().world().hash(),
+            "base cached vs uncached 30-tick World::hash() must be bit-identical"
+        );
+        assert_eq!(
+            cached_base.canvas().color,
+            uncached_base.canvas().color,
+            "base cached vs uncached rendered Canvas must be bit-identical"
+        );
+        let s1: Vec<_> = uncached_base.take_sounds();
+        let s2: Vec<_> = cached_base.take_sounds();
+        assert_eq!(s2, s1, "base cached vs uncached sound events must match");
+        assert_eq!(
+            cached_base.save().unwrap().encode(),
+            uncached_base.save().unwrap().encode(),
+            "base cached vs uncached Saved::encode() bytes must be bit-identical"
+        );
+    }
+
+    // 2. Persist a saved-lot snapshot and verify full parity on saved-lot restoration too!
+    shell
+        .save_current_lot()
+        .expect("save lot 5 into store for saved-lot cache parity check");
+    let mut uncached_saved = Game::open_from_store_cached(
+        &root,
+        shell.store(),
+        "UserData",
+        5,
+        &[3],
+        true,
+        Frames::default(),
+        None,
+    )
+    .expect("uncached saved open_from_store_cached");
+    shell.enter_lot(5).expect("warm cached saved enter_lot 5");
+    {
+        let cached_saved = shell.game_mut().expect("cached saved game");
+        uncached_saved.resize([800, 600]);
+        cached_saved.resize([800, 600]);
+        assert_eq!(uncached_saved.run(20), 20);
+        assert_eq!(cached_saved.run(20), 20);
+        uncached_saved.render();
+        cached_saved.render();
+        assert_eq!(
+            cached_saved.lot().world().hash(),
+            uncached_saved.lot().world().hash(),
+            "saved-lot cached vs uncached World::hash() must be bit-identical"
+        );
+        assert_eq!(
+            cached_saved.canvas().color,
+            uncached_saved.canvas().color,
+            "saved-lot cached vs uncached Canvas must be bit-identical"
+        );
+        let s1: Vec<_> = uncached_saved.take_sounds();
+        let s2: Vec<_> = cached_saved.take_sounds();
+        assert_eq!(
+            s2, s1,
+            "saved-lot cached vs uncached sound events must match"
+        );
+        assert_eq!(
+            cached_saved.save().unwrap().encode(),
+            uncached_saved.save().unwrap().encode(),
+            "saved-lot cached vs uncached Saved::encode() bytes must be bit-identical"
+        );
+    }
+
+    // 3. 5-run median timing comparison (uncached vs warm cached enter_lot).
     let mut uncached_ms = Vec::with_capacity(5);
-    let mut uncached_hash = None;
     for _ in 0..5 {
         let t0 = Instant::now();
-        let g = Game::open_from_store_cached(
+        let _g = Game::open_from_store_cached(
             &root,
             shell.store(),
             "UserData",
@@ -620,28 +943,19 @@ fn complete_collection_warm_enter_lot_vm_cache_parity_and_speedup() {
         )
         .expect("uncached open_from_store_cached");
         uncached_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
-        uncached_hash = Some(g.lot().world().hash());
     }
     uncached_ms.sort_by(f64::total_cmp);
     let uncached_median = uncached_ms[2];
 
-    // Warm first entry (loads InstallAssets + VmInstallCache once), then measure 5 warm re-entries.
-    shell.enter_lot(5).expect("cold enter_lot 5");
     let mut cached_ms = Vec::with_capacity(5);
-    let mut cached_hash = None;
     for _ in 0..5 {
         let t0 = Instant::now();
         shell.enter_lot(5).expect("warm enter_lot 5");
         cached_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
-        cached_hash = Some(shell.game().expect("game").lot().world().hash());
     }
     cached_ms.sort_by(f64::total_cmp);
     let cached_median = cached_ms[2];
 
-    assert_eq!(
-        cached_hash, uncached_hash,
-        "warm VmInstallCache enter_lot must produce bit-identical World::hash()"
-    );
     eprintln!(
         "BENCH warm enter_lot(House05) 5-run median: uncached={uncached_median:.2} ms, cached(VmInstallCache+InstallAssets)={cached_median:.2} ms (speedup={:.2}x)",
         uncached_median / cached_median.max(0.001)
@@ -660,7 +974,9 @@ fn complete_collection_native_caf_surnames_without_sidecar_and_legacy_fallback()
     let saves = tmp.path().join("saves.redb");
     let sidecar = saves.with_extension("caf-names.tsv");
 
-    // 1. Create a CAF family via CafSession -> NeighborhoodStore and verify native REDB persistence.
+    // 1. Drive a CAF family commit straight through `NeighborhoodShell` UI handlers
+    //    (exercising `NeighborhoodShell::handle_caf_outcome`) and verify native REDB v4
+    //    persistence with zero `.caf-names.tsv` sidecar writes.
     let mut shell = NeighborhoodShell::open(
         root.clone(),
         saves.clone(),
@@ -670,9 +986,10 @@ fn complete_collection_native_caf_surnames_without_sidecar_and_legacy_fallback()
         Frames::default(),
     )
     .expect("open neighborhood shell");
+    shell.resize([800, 600]);
     shell.open_family_bin();
     shell.open_create_family().expect("open CAF");
-    let draft = {
+    {
         let caf = shell.caf_session_mut().expect("CAF session");
         let _ = caf.controller_mut().begin_add_sim();
         {
@@ -687,30 +1004,44 @@ fn complete_collection_native_caf_surnames_without_sidecar_and_legacy_fallback()
             };
             sim.personality = sims_ui::caf::Personality::from_raw([5, 5, 5, 5, 5]);
         }
-        let sim = caf.controller().editing_sim().unwrap().clone();
-        sims_ui::caf::FamilyDraft {
-            last_name: "Starlight".to_owned(),
-            bio: "Clean-room REDB v4 surname test".to_owned(),
-            members: vec![sim],
-        }
-    };
-    let created = {
-        let mut caf_session = {
-            let install = sims_content::Install::detect(&root).unwrap();
-            let ui = sims_content::ui_graphics::UiGraphics::open(&install).unwrap();
-            sims_game::caf_screen::CafSession::open(&root, &install, &ui).unwrap()
-        };
-        caf_session
-            .commit_family_draft(shell.store(), "UserData", &draft)
-            .expect("commit CAF family")
-    };
-    shell
-        .refresh_from_store()
-        .expect("refresh after CAF commit");
+    }
+    // Click SimDone in EditSim screen through `NeighborhoodShell::press`/`release`.
+    let caf_layout = sims_ui::caf::CafLayout::compute(800, 600);
+    let sim_done_pt = [
+        caf_layout.sim_done.x + caf_layout.sim_done.width / 2,
+        caf_layout.sim_done.y + caf_layout.sim_done.height / 2,
+    ];
+    let _ = shell.press(sim_done_pt);
+    let _ = shell.release(sim_done_pt);
+    // Click family last-name field and type "Starlight" through `NeighborhoodShell`,
+    // then click FamilyDone -> confirm.
+    let fam_name_pt = [
+        caf_layout.family_name_field.x + caf_layout.family_name_field.width / 2,
+        caf_layout.family_name_field.y + caf_layout.family_name_field.height / 2,
+    ];
+    let _ = shell.press(fam_name_pt);
+    let _ = shell.release(fam_name_pt);
+    for ch in "Starlight".chars() {
+        let _ = shell.key_char(ch);
+    }
+    let fam_done_pt = [
+        caf_layout.family_done.x + caf_layout.family_done.width / 2,
+        caf_layout.family_done.y + caf_layout.family_done.height / 2,
+    ];
+    let _ = shell.press(fam_done_pt);
+    let _ = shell.release(fam_done_pt);
+    let _ = shell.key_enter(); // accept commit confirmation if shown
     assert!(
         !sidecar.exists(),
-        "CAF commit must NOT write legacy .caf-names.tsv sidecar"
+        "NeighborhoodShell CAF commit must NOT write legacy .caf-names.tsv sidecar"
     );
+
+    let created_family_id = shell
+        .family_bin_entries()
+        .iter()
+        .find(|e| e.name == "Starlight")
+        .map(|e| e.id as u16)
+        .expect("Family Bin must contain Starlight committed through NeighborhoodShell");
 
     // Reopen shell from disk and verify surname survives natively in StoredNeighborhood.family_surnames.
     drop(shell);
@@ -729,7 +1060,7 @@ fn complete_collection_native_caf_surnames_without_sidecar_and_legacy_fallback()
         .unwrap()
         .unwrap();
     assert_eq!(
-        stored.family_surname(created.family_id),
+        stored.family_surname(created_family_id),
         Some("Starlight"),
         "StoredNeighborhood.family_surnames must persist CAF surname natively"
     );
@@ -737,35 +1068,84 @@ fn complete_collection_native_caf_surnames_without_sidecar_and_legacy_fallback()
         reopened
             .family_bin_entries()
             .iter()
-            .any(|e| e.id == u32::from(created.family_id) && e.name == "Starlight"),
+            .any(|e| e.id == u32::from(created_family_id) && e.name == "Starlight"),
         "Family Bin must display native REDB surname after reopen"
     );
 
-    // 2. Verify read-only legacy `.caf-names.tsv` fallback when StoredNeighborhood lacks an entry.
+    // 2. Verify one-time read-only legacy `.caf-names.tsv` migration AND that deleting
+    //    the migrated family never resurrects its stale sidecar name when the ID is reused.
     let mut stripped = stored.clone();
-    stripped.remove_family_surname(created.family_id);
+    stripped.remove_family_surname(created_family_id);
     reopened
         .store()
         .save_neighborhood("UserData", &stripped)
         .expect("save stripped neighborhood");
     let inst_hex = format!("{:032x}", stripped.instance_id);
-    std::fs::write(
-        &sidecar,
-        format!(
-            "UserData\t{inst_hex}\t{}\tLegacySidecarName\n",
-            created.family_id
-        ),
-    )
-    .expect("write legacy sidecar fixture");
+    let sidecar_body = format!("UserData\t{inst_hex}\t{created_family_id}\tLegacySidecarName\n");
+    std::fs::write(&sidecar, &sidecar_body).expect("write legacy sidecar fixture");
     drop(reopened);
 
-    let legacy_shell = NeighborhoodShell::open(root, saves, 1, true, vec![3], Frames::default())
-        .expect("reopen with legacy sidecar");
+    let mut legacy_shell = NeighborhoodShell::open(
+        root.clone(),
+        saves.clone(),
+        1,
+        true,
+        vec![3],
+        Frames::default(),
+    )
+    .expect("reopen with legacy sidecar");
     assert!(
         legacy_shell
             .family_bin_entries()
             .iter()
-            .any(|e| e.id == u32::from(created.family_id) && e.name == "LegacySidecarName"),
-        "read-only legacy .caf-names.tsv fallback must still surface surnames for pre-v4 saves"
+            .any(|e| e.id == u32::from(created_family_id) && e.name == "LegacySidecarName"),
+        "one-time legacy .caf-names.tsv migration must populate surnames for pre-v4 saves"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).unwrap(),
+        sidecar_body,
+        "legacy .caf-names.tsv file must remain strictly read-only on disk"
+    );
+    let migrated_stored = legacy_shell
+        .store()
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        migrated_stored.family_surname(created_family_id),
+        Some("LegacySidecarName"),
+        "migrated surname must now be persisted natively in REDB"
+    );
+
+    // Delete the migrated family and verify that even if a later family reuses its
+    // family_id with no native surname, the stale read-only sidecar row is NOT reapplied!
+    legacy_shell
+        .execute_delete_family(created_family_id)
+        .expect("delete migrated family");
+    let mut after_del = legacy_shell
+        .store()
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap();
+    assert!(!after_del.families.contains_key(&created_family_id));
+    assert!(after_del.family_surname(created_family_id).is_none());
+    // Simulate a future family reusing `created_family_id` with no native surname.
+    let reused_family = stripped.families.get(&created_family_id).unwrap().clone();
+    after_del.families.insert(created_family_id, reused_family);
+    legacy_shell
+        .store()
+        .save_neighborhood("UserData", &after_del)
+        .expect("save reused family_id fixture");
+    drop(legacy_shell);
+
+    let post_delete_shell =
+        NeighborhoodShell::open(root, saves, 1, true, vec![3], Frames::default())
+            .expect("reopen after delete + family_id reuse");
+    assert!(
+        !post_delete_shell
+            .family_bin_entries()
+            .iter()
+            .any(|e| e.id == u32::from(created_family_id) && e.name == "LegacySidecarName"),
+        "deleted legacy family name must NOT be reapplied from read-only sidecar after migration"
     );
 }

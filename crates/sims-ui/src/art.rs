@@ -252,47 +252,248 @@ impl Art {
             ),
         );
 
-        // Mode, camera, speed, and panel tab buttons (4-cell horizontal strips).
-        let mode_buttons: &[(i32, u32, u32, [u8; 3])] = &[
-            (crate::hud::id::LIVE, 44, 42, [44, 134, 92]),
-            (crate::hud::id::BUY, 44, 42, [52, 112, 176]),
-            (crate::hud::id::BUILD, 44, 42, [168, 118, 52]),
-            (crate::hud::id::OPTIONS, 44, 42, [104, 88, 154]),
-            (crate::hud::id::ROTATE_RIGHT, 28, 28, [56, 88, 132]),
-            (crate::hud::id::ROTATE_LEFT, 28, 28, [56, 88, 132]),
-            (crate::hud::id::ZOOM_IN, 28, 28, [56, 88, 132]),
-            (crate::hud::id::ZOOM_OUT, 28, 28, [56, 88, 132]),
-            (crate::hud::id::FLOOR_DOWN, 26, 26, [58, 92, 136]),
-            (crate::hud::id::FLOOR_UP, 26, 26, [58, 92, 136]),
-            (crate::hud::id::WALLS_DOWN, 26, 26, [64, 98, 138]),
-            (crate::hud::id::CUTAWAY, 26, 26, [64, 98, 138]),
-            (crate::hud::id::WALLS_UP, 26, 26, [64, 98, 138]),
-            (crate::hud::id::ROOF, 26, 26, [64, 98, 138]),
-            (crate::hud::id::PHOTO, 26, 26, [72, 116, 152]),
-            (crate::hud::id::NORMAL, 22, 22, [48, 128, 86]),
-            (crate::hud::id::FAST, 22, 22, [48, 128, 86]),
-            (crate::hud::id::ULTRA, 22, 22, [48, 128, 86]),
-            (crate::hud::id::NEEDS, 32, 24, [48, 132, 92]),
-            (crate::hud::id::PERSONALITY, 32, 24, [132, 96, 154]),
-            (crate::hud::id::HOUSE, 32, 24, [156, 116, 56]),
-            (crate::hud::id::JOB, 32, 24, [66, 112, 168]),
-            (crate::hud::id::RELATIONSHIPS, 32, 24, [164, 82, 108]),
-            (crate::hud::id::INTERESTS, 32, 24, [66, 138, 146]),
-            (crate::hud::id::GIFTS, 32, 24, [162, 132, 54]),
-            (crate::hud::id::HELP, 24, 24, [62, 106, 158]),
-            (crate::hud::id::PAGE_BACK, 20, 20, [62, 98, 142]),
-            (crate::hud::id::PAGE_ON, 20, 20, [62, 98, 142]),
-            (crate::hud::id::FAMILY, 24, 24, [64, 124, 96]),
-            (crate::hud::id::FRIENDS, 24, 24, [64, 108, 156]),
-            (crate::hud::id::STARS, 24, 24, [174, 142, 52]),
-            (crate::hud::id::EVERYONE, 24, 24, [82, 104, 138]),
-            (crate::hud::id::FAME_FRIENDS, 22, 20, [168, 140, 56]),
+        // Mode, camera, speed, and panel tab buttons (4-cell horizontal strips)
+        // sized to match `crate::hud::layout`'s exact hit-target rectangles and
+        // stamped with crisp clean-room procedural glyphs.
+        let mode_buttons: &[(i32, u32, u32, [u8; 3], ButtonGlyph)] = &[
+            (
+                crate::hud::id::LIVE,
+                50,
+                50,
+                [44, 134, 92],
+                ButtonGlyph::Live,
+            ),
+            (
+                crate::hud::id::BUY,
+                45,
+                47,
+                [52, 112, 176],
+                ButtonGlyph::Buy,
+            ),
+            (
+                crate::hud::id::BUILD,
+                39,
+                39,
+                [168, 118, 52],
+                ButtonGlyph::Build,
+            ),
+            (
+                crate::hud::id::OPTIONS,
+                23,
+                23,
+                [104, 88, 154],
+                ButtonGlyph::Options,
+            ),
+            (
+                crate::hud::id::ROTATE_RIGHT,
+                27,
+                27,
+                [56, 88, 132],
+                ButtonGlyph::ArrowRight,
+            ),
+            (
+                crate::hud::id::ROTATE_LEFT,
+                27,
+                27,
+                [56, 88, 132],
+                ButtonGlyph::ArrowLeft,
+            ),
+            (
+                crate::hud::id::ZOOM_IN,
+                27,
+                27,
+                [56, 88, 132],
+                ButtonGlyph::Plus,
+            ),
+            (
+                crate::hud::id::ZOOM_OUT,
+                27,
+                27,
+                [56, 88, 132],
+                ButtonGlyph::Minus,
+            ),
+            (
+                crate::hud::id::FLOOR_DOWN,
+                21,
+                11,
+                [58, 92, 136],
+                ButtonGlyph::TriDown,
+            ),
+            (
+                crate::hud::id::FLOOR_UP,
+                22,
+                15,
+                [58, 92, 136],
+                ButtonGlyph::TriUp,
+            ),
+            (
+                crate::hud::id::WALLS_DOWN,
+                22,
+                15,
+                [64, 98, 138],
+                ButtonGlyph::WallsDown,
+            ),
+            (
+                crate::hud::id::CUTAWAY,
+                21,
+                21,
+                [64, 98, 138],
+                ButtonGlyph::Cutaway,
+            ),
+            (
+                crate::hud::id::WALLS_UP,
+                21,
+                21,
+                [64, 98, 138],
+                ButtonGlyph::WallsUp,
+            ),
+            (
+                crate::hud::id::ROOF,
+                22,
+                19,
+                [64, 98, 138],
+                ButtonGlyph::Roof,
+            ),
+            (
+                crate::hud::id::PHOTO,
+                29,
+                29,
+                [72, 116, 152],
+                ButtonGlyph::Camera,
+            ),
+            (
+                crate::hud::id::NORMAL,
+                11,
+                15,
+                [48, 128, 86],
+                ButtonGlyph::Speed1,
+            ),
+            (
+                crate::hud::id::FAST,
+                20,
+                15,
+                [48, 128, 86],
+                ButtonGlyph::Speed2,
+            ),
+            (
+                crate::hud::id::ULTRA,
+                32,
+                15,
+                [48, 128, 86],
+                ButtonGlyph::Speed3,
+            ),
+            (
+                crate::hud::id::NEEDS,
+                32,
+                39,
+                [48, 132, 92],
+                ButtonGlyph::Bars,
+            ),
+            (
+                crate::hud::id::PERSONALITY,
+                27,
+                30,
+                [132, 96, 154],
+                ButtonGlyph::Star,
+            ),
+            (
+                crate::hud::id::HOUSE,
+                27,
+                30,
+                [156, 116, 56],
+                ButtonGlyph::Build,
+            ),
+            (
+                crate::hud::id::JOB,
+                27,
+                30,
+                [66, 112, 168],
+                ButtonGlyph::Briefcase,
+            ),
+            (
+                crate::hud::id::RELATIONSHIPS,
+                27,
+                30,
+                [164, 82, 108],
+                ButtonGlyph::Heart,
+            ),
+            (
+                crate::hud::id::INTERESTS,
+                27,
+                30,
+                [66, 138, 146],
+                ButtonGlyph::Diamond,
+            ),
+            (
+                crate::hud::id::GIFTS,
+                27,
+                30,
+                [162, 132, 54],
+                ButtonGlyph::BoxIcon,
+            ),
+            (
+                crate::hud::id::HELP,
+                10,
+                15,
+                [62, 106, 158],
+                ButtonGlyph::Question,
+            ),
+            (
+                crate::hud::id::PAGE_BACK,
+                9,
+                49,
+                [62, 98, 142],
+                ButtonGlyph::ArrowLeft,
+            ),
+            (
+                crate::hud::id::PAGE_ON,
+                9,
+                49,
+                [62, 98, 142],
+                ButtonGlyph::ArrowRight,
+            ),
+            (
+                crate::hud::id::FAMILY,
+                20,
+                20,
+                [64, 124, 96],
+                ButtonGlyph::Build,
+            ),
+            (
+                crate::hud::id::FRIENDS,
+                20,
+                20,
+                [64, 108, 156],
+                ButtonGlyph::Heart,
+            ),
+            (
+                crate::hud::id::STARS,
+                20,
+                20,
+                [174, 142, 52],
+                ButtonGlyph::Star,
+            ),
+            (
+                crate::hud::id::EVERYONE,
+                20,
+                20,
+                [82, 104, 138],
+                ButtonGlyph::Options,
+            ),
+            (
+                crate::hud::id::FAME_FRIENDS,
+                22,
+                20,
+                [168, 140, 56],
+                ButtonGlyph::Star,
+            ),
         ];
-        for &(id, cw, ch, accent) in mode_buttons {
-            art.insert(id, build_button_strip(cw, ch, 4, accent));
+        for &(id, cw, ch, accent, glyph) in mode_buttons {
+            art.insert(id, build_button_strip_with_glyph(cw, ch, 4, accent, glyph));
         }
 
-        // Pause button: 2 rows of 4 cells (row 0 cyan-lit, row 1 red-lit blink).
+        // Pause button: 4 columns x 2 rows of 15x15 cells (`60x30`, matching
+        // `Kind::Pause` slicing `src_x = col * 15, src_y = row * 15`).
         art.insert(crate::hud::id::PAUSE, build_pause_button_sheet());
 
         // Mode trim strips.
@@ -762,33 +963,83 @@ fn build_bevel_panel(
     }
 }
 
+#[derive(Clone, Copy)]
+enum ButtonGlyph {
+    None,
+    Live,
+    Buy,
+    Build,
+    Options,
+    ArrowLeft,
+    ArrowRight,
+    Plus,
+    Minus,
+    TriUp,
+    TriDown,
+    WallsDown,
+    Cutaway,
+    WallsUp,
+    Roof,
+    Camera,
+    Pause,
+    Speed1,
+    Speed2,
+    Speed3,
+    Bars,
+    Star,
+    Briefcase,
+    Heart,
+    Diamond,
+    BoxIcon,
+    Question,
+}
+
 fn build_button_strip(cell_w: u32, cell_h: u32, cells: u32, accent: [u8; 3]) -> Image {
+    build_button_strip_with_glyph(cell_w, cell_h, cells, accent, ButtonGlyph::None)
+}
+
+fn build_button_strip_with_glyph(
+    cell_w: u32,
+    cell_h: u32,
+    cells: u32,
+    accent: [u8; 3],
+    glyph: ButtonGlyph,
+) -> Image {
     let total_w = cell_w * cells;
     let w = total_w as usize;
     let h = cell_h as usize;
     let cw = cell_w as usize;
     let mut rgba = vec![0u8; w * h * 4];
     for cell in 0..cells as usize {
-        let (fill, hi, lo, border) = match cell {
+        let (fill, hi, lo, border, fg) = match cell {
             0 => (
                 shade_rgb(accent, 78, 100),
                 shade_rgb(accent, 128, 100),
                 shade_rgb(accent, 42, 100),
                 shade_rgb(accent, 110, 100),
+                [232u8, 242, 255],
             ),
             1 => (
                 shade_rgb(accent, 118, 100),
                 [210, 246, 255],
                 shade_rgb(accent, 55, 100),
                 [120, 232, 255],
+                [255u8, 255, 255],
             ),
             2 => (
                 shade_rgb(accent, 102, 100),
                 shade_rgb(accent, 148, 100),
                 shade_rgb(accent, 50, 100),
                 [188, 224, 255],
+                [248u8, 252, 255],
             ),
-            _ => ([46, 54, 68], [64, 74, 92], [28, 34, 44], [58, 68, 84]),
+            _ => (
+                [46, 54, 68],
+                [64, 74, 92],
+                [28, 34, 44],
+                [58, 68, 84],
+                [108u8, 120, 138],
+            ),
         };
         let x0 = cell * cw;
         for y in 0..h {
@@ -809,6 +1060,7 @@ fn build_button_strip(cell_w: u32, cell_h: u32, cells: u32, accent: [u8; 3]) -> 
                 rgba[p + 3] = 255;
             }
         }
+        stamp_button_glyph(&mut rgba, w, x0, cw, h, glyph, fg);
     }
     Image {
         width: total_w,
@@ -817,9 +1069,268 @@ fn build_button_strip(cell_w: u32, cell_h: u32, cells: u32, accent: [u8; 3]) -> 
     }
 }
 
+fn stamp_button_glyph(
+    rgba: &mut [u8],
+    stride: usize,
+    x0: usize,
+    cw: usize,
+    ch: usize,
+    glyph: ButtonGlyph,
+    fg: [u8; 3],
+) {
+    if matches!(glyph, ButtonGlyph::None) || cw < 6 || ch < 6 {
+        return;
+    }
+    let cx = (cw / 2) as i32;
+    let cy = (ch / 2) as i32;
+    let r = ((cw.min(ch) as i32) / 3).max(2);
+    let mut put = |lx: i32, ly: i32| {
+        if lx >= 2 && ly >= 2 && (lx as usize) + 2 < cw && (ly as usize) + 2 < ch {
+            let p = (ly as usize * stride + (x0 + lx as usize)) * 4;
+            rgba[p] = fg[0];
+            rgba[p + 1] = fg[1];
+            rgba[p + 2] = fg[2];
+            rgba[p + 3] = 255;
+        }
+    };
+    let draw_tri_right = |put: &mut dyn FnMut(i32, i32), ox: i32, oy: i32, size: i32| {
+        for dy in -size..=size {
+            let span = size - dy.abs();
+            for dx in 0..=span {
+                put(ox + dx, oy + dy);
+            }
+        }
+    };
+    match glyph {
+        ButtonGlyph::None => {}
+        ButtonGlyph::Live => {
+            // Plumb-bob diamond + person shoulders.
+            let d = (r / 2).max(3);
+            for dy in -d..=d {
+                let w = (d - dy.abs()).max(0);
+                for dx in -w..=w {
+                    put(cx + dx, cy - r / 2 + dy);
+                }
+            }
+            for dy in 0..=r / 2 {
+                for dx in -(r / 2 + 2)..=(r / 2 + 2) {
+                    put(cx + dx, cy + 3 + dy);
+                }
+            }
+        }
+        ButtonGlyph::Buy => {
+            // Chair silhouette.
+            for dy in -r..=r {
+                put(cx - r / 2, cy + dy);
+                put(cx - r / 2 + 1, cy + dy);
+            }
+            for dx in -r / 2..=r / 2 {
+                put(cx + dx, cy + 1);
+                put(cx + dx, cy + 2);
+            }
+            for dy in 2..=r {
+                put(cx + r / 2, cy + dy);
+                put(cx + r / 2 - 1, cy + dy);
+            }
+        }
+        ButtonGlyph::Build => {
+            // House gable + walls.
+            for dy in 0..=r / 2 {
+                for dx in -dy * 2..=dy * 2 {
+                    if dx.abs() <= r {
+                        put(cx + dx, cy - r + dy);
+                    }
+                }
+            }
+            for dy in -r / 2 + 1..=r {
+                for dx in -(r * 3 / 4)..=(r * 3 / 4) {
+                    if dy < r / 3 || dx.abs() > r / 4 {
+                        put(cx + dx, cy + dy);
+                    }
+                }
+            }
+        }
+        ButtonGlyph::Options => {
+            // Three horizontal menu dots.
+            for ox in [-4, 0, 4] {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        put(cx + ox + dx, cy + dy);
+                    }
+                }
+            }
+        }
+        ButtonGlyph::ArrowRight => {
+            let s = (r / 2).clamp(2, 4);
+            draw_tri_right(&mut put, cx - s / 2, cy, s);
+        }
+        ButtonGlyph::ArrowLeft => {
+            let s = (r / 2).clamp(2, 4);
+            for dy in -s..=s {
+                let span = s - dy.abs();
+                for dx in 0..=span {
+                    put(cx + s / 2 - dx, cy + dy);
+                }
+            }
+        }
+        ButtonGlyph::Plus => {
+            for d in -r / 2..=r / 2 {
+                put(cx + d, cy);
+                put(cx + d, cy - 1);
+                put(cx, cy + d);
+                put(cx - 1, cy + d);
+            }
+        }
+        ButtonGlyph::Minus => {
+            for d in -r / 2..=r / 2 {
+                put(cx + d, cy);
+                put(cx + d, cy - 1);
+            }
+        }
+        ButtonGlyph::TriUp => {
+            let s = (ch as i32 / 4).clamp(2, 4);
+            for dy in 0..=s {
+                for dx in -dy..=dy {
+                    put(cx + dx, cy - s / 2 + dy);
+                }
+            }
+        }
+        ButtonGlyph::TriDown => {
+            let s = (ch as i32 / 4).clamp(2, 4);
+            for dy in 0..=s {
+                let w = s - dy;
+                for dx in -w..=w {
+                    put(cx + dx, cy - s / 2 + dy);
+                }
+            }
+        }
+        ButtonGlyph::WallsDown => {
+            for dx in -r..=r {
+                put(cx + dx, cy + 1);
+                put(cx + dx, cy + 2);
+            }
+        }
+        ButtonGlyph::Cutaway => {
+            for dx in -r..=r {
+                put(cx + dx, cy + r / 2);
+            }
+            for dy in -r / 2..=r / 2 {
+                put(cx - r, cy + dy);
+                put(cx - r + 1, cy + dy);
+            }
+        }
+        ButtonGlyph::WallsUp => {
+            for dy in -r / 2..=r / 2 {
+                for dx in -r / 2..=r / 2 {
+                    if dx.abs() >= r / 2 - 1 || dy.abs() >= r / 2 - 1 {
+                        put(cx + dx, cy + dy);
+                    }
+                }
+            }
+        }
+        ButtonGlyph::Roof => {
+            let s = (r / 2 + 1).clamp(2, 5);
+            for dy in 0..=s {
+                put(cx - dy, cy - s / 2 + dy);
+                put(cx + dy, cy - s / 2 + dy);
+                if dy > 0 {
+                    put(cx - dy + 1, cy - s / 2 + dy);
+                    put(cx + dy - 1, cy - s / 2 + dy);
+                }
+            }
+        }
+        ButtonGlyph::Camera => {
+            for dy in -r / 2..=r / 2 {
+                for dx in -r..=r {
+                    if dx * dx + dy * dy > (r / 3) * (r / 3) {
+                        put(cx + dx, cy + dy);
+                    }
+                }
+            }
+        }
+        ButtonGlyph::Pause => {
+            for dy in -3..=3 {
+                put(cx - 2, cy + dy);
+                put(cx - 1, cy + dy);
+                put(cx + 1, cy + dy);
+                put(cx + 2, cy + dy);
+            }
+        }
+        ButtonGlyph::Speed1 => {
+            draw_tri_right(&mut put, cx - 1, cy, 3);
+        }
+        ButtonGlyph::Speed2 => {
+            draw_tri_right(&mut put, cx - 5, cy, 3);
+            draw_tri_right(&mut put, cx + 1, cy, 3);
+        }
+        ButtonGlyph::Speed3 => {
+            draw_tri_right(&mut put, cx - 9, cy, 3);
+            draw_tri_right(&mut put, cx - 3, cy, 3);
+            draw_tri_right(&mut put, cx + 3, cy, 3);
+        }
+        ButtonGlyph::Bars => {
+            for row in [-4, 0, 4] {
+                for dx in -r..=r {
+                    put(cx + dx, cy + row);
+                    put(cx + dx, cy + row + 1);
+                }
+            }
+        }
+        ButtonGlyph::Star | ButtonGlyph::Diamond => {
+            for dy in -r..=r {
+                let w = r - dy.abs();
+                for dx in -w..=w {
+                    put(cx + dx, cy + dy);
+                }
+            }
+        }
+        ButtonGlyph::Briefcase => {
+            for dx in -r / 3..=r / 3 {
+                put(cx + dx, cy - r / 2 - 1);
+            }
+            for dy in -r / 2..=r / 2 {
+                for dx in -r..=r {
+                    put(cx + dx, cy + dy);
+                }
+            }
+        }
+        ButtonGlyph::Heart => {
+            for dy in -r / 2..=r / 2 {
+                for dx in -r / 2..=r / 2 {
+                    if dy < 0 && dx == 0 {
+                        continue;
+                    }
+                    if dy <= 0 || dx.abs() <= r / 2 - dy {
+                        put(cx + dx, cy + dy);
+                    }
+                }
+            }
+        }
+        ButtonGlyph::BoxIcon => {
+            for dy in -r / 2..=r / 2 {
+                for dx in -r / 2..=r / 2 {
+                    if dx == 0 || dy == 0 || dx.abs() == r / 2 || dy.abs() == r / 2 {
+                        put(cx + dx, cy + dy);
+                    }
+                }
+            }
+        }
+        ButtonGlyph::Question => {
+            for dx in -1..=1 {
+                put(cx + dx, cy - 3);
+            }
+            put(cx + 1, cy - 2);
+            put(cx, cy - 1);
+            put(cx, cy);
+            put(cx, cy + 2);
+            put(cx, cy + 3);
+        }
+    }
+}
+
 fn build_pause_button_sheet() -> Image {
-    let top = build_button_strip(26, 26, 4, [56, 142, 178]);
-    let bot = build_button_strip(26, 26, 4, [186, 56, 62]);
+    let top = build_button_strip_with_glyph(15, 15, 4, [56, 142, 178], ButtonGlyph::Pause);
+    let bot = build_button_strip_with_glyph(15, 15, 4, [186, 56, 62], ButtonGlyph::Pause);
     let mut rgba = Vec::with_capacity(top.rgba.len() + bot.rgba.len());
     rgba.extend_from_slice(&top.rgba);
     rgba.extend_from_slice(&bot.rgba);
@@ -1017,5 +1528,108 @@ mod tests {
                 "clean-room Art missing required resource ID {id}"
             );
         }
+
+        // Verify Pause button sheet matches 4x2 cells of 15x15 (`60x30`).
+        let pause_img = art.image(crate::hud::id::PAUSE).expect("pause sheet");
+        assert_eq!((pause_img.width, pause_img.height), (60, 30));
+
+        // Verify every HUD button's procedural cell dimensions match its exact
+        // hit-target rectangle in `crate::hud::layout`, and verify hit testing
+        // and distinct Pause state rendering across (normal, paused unlit, paused lit).
+        let controls = crate::hud::Controls::default();
+        let snapshot = crate::household::Snapshot::read(&sims_sim::World::empty(), &[]);
+        let items = crate::hud::layout([800, 600], &snapshot, &controls);
+        let mut checked_buttons = 0usize;
+        for item in &items {
+            if let crate::hud::Kind::Button { id, cells, .. } = item.kind
+                && let Some(cell) = art.cell(id, cells, 0)
+            {
+                assert_eq!(
+                    (cell.width as i32, cell.height as i32),
+                    (item.rect.width, item.rect.height),
+                    "button {id} procedural cell {}x{} disagrees with layout hit target {}x{}",
+                    cell.width,
+                    cell.height,
+                    item.rect.width,
+                    item.rect.height
+                );
+                checked_buttons += 1;
+            }
+        }
+        assert!(
+            checked_buttons >= 15,
+            "expected at least 15 HUD buttons checked against layout rects, got {checked_buttons}"
+        );
+
+        // Hit-test Options & Pause centers via `crate::hud::press`.
+        let options_item = items
+            .iter()
+            .find(|i| {
+                matches!(
+                    i.kind,
+                    crate::hud::Kind::Button {
+                        id: crate::hud::id::OPTIONS,
+                        ..
+                    }
+                )
+            })
+            .expect("Options button in layout");
+        let opt_center = [
+            options_item.rect.x + options_item.rect.width / 2,
+            options_item.rect.y + options_item.rect.height / 2,
+        ];
+        assert_eq!(
+            crate::hud::press(&items, opt_center),
+            Some(crate::command::Command::SetMode(
+                crate::command::Mode::Options
+            ))
+        );
+
+        let pause_item = items
+            .iter()
+            .find(|i| matches!(i.kind, crate::hud::Kind::Pause { .. }))
+            .expect("Pause button in layout");
+        let pause_center = [
+            pause_item.rect.x + pause_item.rect.width / 2,
+            pause_item.rect.y + pause_item.rect.height / 2,
+        ];
+        assert_eq!(
+            crate::hud::press(&items, pause_center),
+            Some(crate::command::Command::TogglePause)
+        );
+
+        // Render Pause in normal (row 0 col 0), paused unlit (row 0 col 1), and
+        // paused lit (row 1 col 1) and verify all three states produce distinct pixels.
+        let render_pause = |paused: bool, pause_lit: bool| -> Vec<u8> {
+            let mut snap = crate::household::Snapshot::read(&sims_sim::World::empty(), &[]);
+            snap.paused = paused;
+            let ctl = crate::hud::Controls {
+                pause_lit,
+                ..Default::default()
+            };
+            let layout_items = crate::hud::layout([800, 600], &snap, &ctl);
+            let mut frame = crate::frame::Frame::new(800, 600, [0, 0, 0]);
+            let faces = crate::household::Faces::default();
+            crate::hud::draw(&mut frame, &art, &faces, &layout_items, &ctl);
+            let pr = pause_item.rect;
+            let mut slice = Vec::new();
+            for y in pr.y..pr.y + pr.height {
+                for x in pr.x..pr.x + pr.width {
+                    slice.extend_from_slice(&frame.pixel(x, y).expect("pause pixel in bounds"));
+                }
+            }
+            slice
+        };
+        let px_normal = render_pause(false, false);
+        let px_paused_cyan = render_pause(true, false);
+        let px_paused_red = render_pause(true, true);
+        assert_ne!(
+            px_normal, px_paused_cyan,
+            "Pause normal vs selected must differ"
+        );
+        assert_ne!(
+            px_paused_cyan, px_paused_red,
+            "Pause row 0 (cyan) vs row 1 (red) blink states must differ"
+        );
     }
 }
