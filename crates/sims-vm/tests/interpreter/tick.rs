@@ -2375,6 +2375,68 @@ fn play_mode_force_removes_faulting_multipart_group_and_preserves_indicators() {
     assert!(u2.full && u2.errors.is_empty());
 }
 
+/// A star marker held by an object that Play Mode force-removes is parked
+/// off the lot and goes back to the available star pool, as a star taken
+/// off a head does (0x4481eb), not left in the in-use pool: a stale in-use
+/// entry would also make the next refill two stars instead of four
+/// (0x446356).
+#[test]
+fn play_mode_force_removal_returns_a_held_star_to_the_pool() {
+    use sims_formats::execution::ObjectFunction;
+    use sims_formats::saved_objects::Slot;
+
+    const STAR_MARKER: u32 = 0xE933_7020;
+    const STAR: u16 = 383;
+    let mut fx = lot(sleeper());
+    // Reset tree triggers explicit error branch (253) during deletion.
+    fx.add(LAMP_FILE, 4097, tree(vec![ins(2, ERROR, ERROR, [0; 8])]));
+    let callbacks = [0, 4096, 0, 4097].map(|action| ObjectFunction {
+        condition: 0,
+        action,
+    });
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .callbacks
+        .insert(128, callbacks.to_vec());
+
+    let mut star = fx.lamp().clone();
+    star.id = STAR;
+    star.guid = STAR_MARKER;
+    star.position = [-16, -16, 1];
+    star.data[2] = LAMP as i16;
+    star.slots.truncate(1);
+    fx.world.objects.insert(STAR, star);
+    fx.world.order.push(STAR);
+    fx.world.indicator_queues.stars_in_use = vec![STAR];
+    fx.world.indicator_queues.available_stars = vec![7];
+
+    let lamp = fx.lamp_mut();
+    lamp.set_countdown(5);
+    lamp.slots = vec![
+        Slot {
+            unknown: 0,
+            object: 0,
+        },
+        Slot {
+            unknown: 0,
+            object: STAR as i16,
+        },
+    ];
+    fx.world.removals = vec![LAMP];
+
+    let mut play = Play::default();
+    let u1 = play_update(&mut fx, &mut play);
+    assert_eq!(u1.removed, vec![LAMP]);
+    assert_eq!(u1.errors.len(), 1, "the lamp is force-removed");
+    assert!(!fx.world.objects.contains_key(&LAMP));
+    assert!(fx.world.objects.contains_key(&STAR));
+    assert_eq!(fx.world.objects[&STAR].data[2], 0);
+    assert!(fx.world.indicator_queues.stars_in_use.is_empty());
+    assert_eq!(fx.world.indicator_queues.available_stars, vec![7, STAR]);
+}
+
 #[test]
 fn play_mode_survives_partial_pass_person_removal_and_dialog_owner_removal() {
     // 1. Partial-pass `+0x109` person removal deferral.

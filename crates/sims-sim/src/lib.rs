@@ -49,9 +49,9 @@ pub use album_store::{
     MAX_ALBUM_TITLE_CHARS, MAX_BULK_ALBUM_PIXEL_BYTES, NewAlbumPhoto, PhotoAlbumStore,
 };
 pub use autosave::{
-    AUTOSAVE_FORMAT, AUTOSAVE_MIN_FORMAT, AutosavePolicy, AutosaveStore, DEFAULT_MAX_AUTOSAVES,
-    LoadedSave, RecoveryLoad, SaveError, SaveJob, SaveMetadata, SavePayload, SavePayloadKind,
-    SaveSlot, SaveSlotEntry, SaveTarget,
+    AUTOSAVE_FORMAT, AUTOSAVE_MADE_ORDER_FORMAT, AUTOSAVE_MIN_FORMAT, AutosavePolicy,
+    AutosaveStore, DEFAULT_MAX_AUTOSAVES, LoadedSave, RecoveryLoad, SaveError, SaveJob,
+    SaveMetadata, SavePayload, SavePayloadKind, SaveSlot, SaveSlotEntry, SaveTarget,
 };
 pub use cow::{CowBox, CowKey, CowMap};
 pub use error::Error;

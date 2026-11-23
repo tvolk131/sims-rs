@@ -1178,3 +1178,88 @@ fn validated_with_sha256_fast_path_supplies_exact_digest_across_v2_and_v1() {
     assert_eq!(fallback.loaded.payload, good_bytes);
     assert_eq!(fallback.skipped_corrupt.len(), 1);
 }
+
+/// A world snapshot record keeps the made person types in the order made
+/// from record format 3 on; a format-2 record (a build that kept them by
+/// GUID) reads them back by GUID. A format-2 build refuses format 3.
+#[test]
+fn world_snapshot_records_keep_made_types_in_the_order_made() {
+    use sha2::{Digest, Sha256};
+    use sims_sim::AUTOSAVE_MADE_ORDER_FORMAT;
+    use sims_sim::characters::Character;
+
+    const MANUAL_TABLE: redb::TableDefinition<(&str, u32), &[u8]> =
+        redb::TableDefinition::new("autosave_manual");
+    assert_eq!(AUTOSAVE_FORMAT, 3);
+    assert_eq!(AUTOSAVE_MADE_ORDER_FORMAT, 3);
+
+    let made = |guid: u32, file: i32| {
+        (
+            guid,
+            Character {
+                template: 0x1234,
+                file,
+                strings: BTreeMap::new(),
+            },
+        )
+    };
+    let mut world = World::empty();
+    world.characters.made = [made(0x0005_7000, 1), made(0x0005_1000, 2)]
+        .into_iter()
+        .collect();
+    let keys = |world: &World| world.characters.made.keys().copied().collect::<Vec<_>>();
+
+    let db = TempDb::new("made_order");
+    let store = AutosaveStore::open(&db.0).unwrap();
+    let meta = store
+        .save_manual(
+            "UserData",
+            5,
+            1,
+            None,
+            "Made",
+            SavePayload::from_world(world),
+        )
+        .unwrap();
+    assert_eq!(meta.format_version, 3);
+    let loaded = store.load_manual("UserData", 5).unwrap();
+    assert_eq!(
+        keys(&loaded.decode_world().unwrap()),
+        [0x0005_7000, 0x0005_1000]
+    );
+    drop(store);
+
+    // The same record as format 2 wrote it.
+    let raw_db = redb::Database::open(&db.0).unwrap();
+    let raw = {
+        let r = raw_db.begin_read().unwrap();
+        let t = r.open_table(MANUAL_TABLE).unwrap();
+        t.get(("UserData", 5)).unwrap().unwrap().value().to_vec()
+    };
+    let body = &raw[40..];
+    let mut h = Sha256::new();
+    h.update(b"sims-sim:autosave-record:v1");
+    h.update(2u32.to_le_bytes());
+    h.update(body);
+    let mut v2 = b"SAVG".to_vec();
+    v2.extend_from_slice(&2u32.to_le_bytes());
+    v2.extend_from_slice(&h.finalize());
+    v2.extend_from_slice(body);
+    {
+        let w = raw_db.begin_write().unwrap();
+        {
+            let mut t = w.open_table(MANUAL_TABLE).unwrap();
+            t.insert(("UserData", 5), v2.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    drop(raw_db);
+
+    let store = AutosaveStore::open(&db.0).unwrap();
+    let loaded = store.load_manual("UserData", 5).unwrap();
+    assert_eq!(loaded.metadata.format_version, 2);
+    assert_eq!(
+        keys(&loaded.decode_world().unwrap()),
+        [0x0005_1000, 0x0005_7000]
+    );
+}

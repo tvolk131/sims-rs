@@ -48,9 +48,12 @@ pub struct Characters {
 /// (0x4260e1 draws the low bits), so the GUID does not give the order.
 ///
 /// It encodes as a map, as a `BTreeMap` did: its length, then each GUID
-/// and type, here in the order made. Types made in GUID order encode as
-/// before, and an encoding made before the order was kept (in GUID order)
-/// reads back in GUID order.
+/// and type, here in the order made. A build that keeps types by GUID
+/// would read it and save it back in GUID order, so each stored encoding
+/// that carries it has a version an older build refuses: the
+/// neighborhood store (format 5), the save records (format 3), the named
+/// snapshot records (record format 33) and `Saved` (format 11). An encoding of an older
+/// version reads back in GUID order ([`MadeTypes::sort_by_guid`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MadeTypes(Vec<(u32, Character)>);
 
@@ -102,6 +105,12 @@ impl MadeTypes {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Puts the types in GUID order, the order an encoding made before the
+    /// order made was kept has them in.
+    pub fn sort_by_guid(&mut self) {
+        self.0.sort_by_key(|&(guid, _)| guid);
     }
 }
 

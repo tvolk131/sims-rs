@@ -755,6 +755,15 @@ impl Interpreter<'_> {
                             || o.guid == crate::placement::STAR_MARKER
                     });
                 if is_protected_marker {
+                    // A star let go goes back to the available pool, as a
+                    // star taken off a head does (0x4481eb).
+                    if world
+                        .objects
+                        .get(&held)
+                        .is_some_and(|o| o.guid == crate::placement::STAR_MARKER)
+                    {
+                        Self::release_star(world, held);
+                    }
                     let _ = crate::placement::unlink_off_lot(world, held);
                     if let Some(parent_obj) = world.objects.get_mut(&cur)
                         && let Some(slot) = parent_obj.slots.get_mut(slot_idx)

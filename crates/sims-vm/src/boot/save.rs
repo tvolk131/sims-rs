@@ -415,6 +415,16 @@ struct SavedV10 {
     family_flags: Option<BTreeMap<i32, u32>>,
 }
 
+/// The pending indicator refreshes and star pools for a world saved before
+/// they were kept: a `Saved` of format 10 or older, or a `WorldSnapshot`
+/// payload without its queues (`World::decode_snapshot_parts`). None are
+/// pending, and the star pools are taken from where the world's stars
+/// stand, as the port picked them then: a star held by an object is in
+/// use, and one off the lot and held by none is available.
+pub fn queues_saved_before_kept(world: &World) -> sims_sim::IndicatorQueues {
+    crate::placement::adopted_star_pools(world)
+}
+
 fn migrate_v10_to_v11(record: &str, body: &[u8]) -> Result<Vec<u8>, MigrationError> {
     let v10: SavedV10 = decode_postcard_exact(record, 10, body)?;
     let v11 = Saved {
@@ -456,7 +466,7 @@ fn migrate_v10_to_v11(record: &str, body: &[u8]) -> Result<Vec<u8>, MigrationErr
         indicator_queues: sims_sim::IndicatorQueues::default(),
     };
     let mut v11 = v11;
-    let pools = crate::placement::adopted_star_pools(&v11.world);
+    let pools = queues_saved_before_kept(&v11.world);
     v11.world.indicator_queues = pools.clone();
     v11.indicator_queues = pools;
     postcard::to_allocvec(&v11).map_err(|error| MigrationError::StepFailed {
@@ -1678,7 +1688,20 @@ mod tests {
         assert_eq!(dec10.world.indicator_queues, dec8.indicator_queues);
 
         // --- A real format-10 record migrates to 11 ---
-        let s = dec10.clone();
+        // Its world has stars: two free off the lot and one held.
+        let mut s = dec10.clone();
+        let star = crate::placement::STAR_MARKER;
+        for o in [
+            crate::placement::tests::pool_object(4001, star, [-16, -16, 1], 0),
+            crate::placement::tests::pool_object(4002, star, [40, 40, 1], 4003),
+            crate::placement::tests::pool_object(4003, 0x1234, [40, 40, 1], 0),
+            crate::placement::tests::pool_object(4004, star, [-16, -16, 1], 0),
+        ] {
+            assert!(!s.world.objects.contains_key(&o.id));
+            s.world.order.push(o.id);
+            s.world.objects.insert(o.id, o);
+        }
+        let with_stars = s.world.clone();
         let v10 = SavedV10 {
             world: s.world.clone(),
             ticks: s.ticks,
@@ -1724,7 +1747,7 @@ mod tests {
         assert_eq!(rep.original_version, 10);
         assert_eq!(rep.final_version, FORMAT);
         assert_eq!(rep.steps_applied, 1);
-        assert_eq!(from10.world.hash(), dec10.world.hash());
+        assert_eq!(from10.world.hash(), with_stars.hash());
         assert_eq!(from10.world.family_flags, dec10.world.family_flags);
         assert_eq!(from10.special_panels, dec10.special_panels);
         assert_eq!(
@@ -1732,7 +1755,12 @@ mod tests {
             dec10.special_panel_responses
         );
         // No refreshes pending, and the star pools from where the stars are.
-        let adopted = crate::placement::adopted_star_pools(&dec10.world);
+        let adopted = sims_sim::IndicatorQueues {
+            available_stars: vec![4004, 4001],
+            stars_in_use: vec![4002],
+            ..Default::default()
+        };
+        assert_eq!(queues_saved_before_kept(&with_stars), adopted);
         assert_eq!(from10.indicator_queues, adopted);
         assert_eq!(from10.world.indicator_queues, adopted);
 

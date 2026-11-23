@@ -61,8 +61,16 @@ const MAX_AUTOSAVE_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 pub const AUTOSAVE_MIN_FORMAT: u32 = 1;
 
 /// Current autosave record format version (V2: deflate-compressed payload with
-/// split metadata header for fast metadata-only listing).
-pub const AUTOSAVE_FORMAT: u32 = 2;
+/// split metadata header for fast metadata-only listing; V3: V2's layout,
+/// whose [`SavePayloadKind::WorldSnapshot`] payloads keep the made person
+/// types in the order made, so a V2 build refuses them rather than saving
+/// them back by GUID. An older record's world reads them back by GUID:
+/// [`LoadedSave::decode_world`]).
+pub const AUTOSAVE_FORMAT: u32 = 3;
+
+/// The first autosave record format whose world snapshots keep the made
+/// person types in the order made ([`crate::characters::MadeTypes`]).
+pub const AUTOSAVE_MADE_ORDER_FORMAT: u32 = 3;
 
 /// Default maximum number of rotating autosave slots kept per
 /// `(neighborhood_id, lot_id)`.
@@ -148,6 +156,10 @@ pub enum SavePayload {
     SavedLot(Vec<u8>),
     /// Pre-encoded custom payload with a format tag.
     Custom { kind: String, bytes: Vec<u8> },
+    /// A pre-encoded [`SavePayloadKind::WorldSnapshot`] payload, as
+    /// [`World::encode_snapshot`] writes it, or an older build's
+    /// [`World::encode`] without the pending indicator refreshes.
+    WorldBytes(Vec<u8>),
 }
 
 impl SavePayload {
@@ -161,6 +173,12 @@ impl SavePayload {
     #[must_use]
     pub fn saved_lot(bytes: Vec<u8>) -> Self {
         Self::SavedLot(bytes)
+    }
+
+    /// Wraps pre-encoded world snapshot bytes ([`SavePayload::WorldBytes`]).
+    #[must_use]
+    pub fn world_bytes(bytes: Vec<u8>) -> Self {
+        Self::WorldBytes(bytes)
     }
 
     /// Wraps custom payload bytes under a caller-chosen format tag.
@@ -177,6 +195,7 @@ impl SavePayload {
             Self::World(world) => (SavePayloadKind::WorldSnapshot, world.encode_snapshot()),
             Self::SavedLot(bytes) => (SavePayloadKind::SavedLot, bytes),
             Self::Custom { kind, bytes } => (SavePayloadKind::Custom(kind), bytes),
+            Self::WorldBytes(bytes) => (SavePayloadKind::WorldSnapshot, bytes),
         }
     }
 }
@@ -370,7 +389,8 @@ pub struct LoadedSave {
 
 impl LoadedSave {
     /// Decodes `self.payload` as a [`World`] when `metadata.payload_kind` is
-    /// [`SavePayloadKind::WorldSnapshot`].
+    /// [`SavePayloadKind::WorldSnapshot`]. A record older than
+    /// [`AUTOSAVE_MADE_ORDER_FORMAT`] has its made person types by GUID.
     pub fn decode_world(&self) -> std::result::Result<World, SaveError> {
         if self.metadata.payload_kind != SavePayloadKind::WorldSnapshot {
             return Err(SaveError::DecodeFailed {
@@ -383,12 +403,17 @@ impl LoadedSave {
                 ),
             });
         }
-        World::decode_snapshot(&self.payload).map_err(|error| SaveError::DecodeFailed {
-            neighborhood_id: self.metadata.neighborhood_id.clone(),
-            lot_id: self.metadata.lot_id,
-            slot: self.metadata.slot,
-            detail: format!("invalid world snapshot payload: {error}"),
-        })
+        let mut world =
+            World::decode_snapshot(&self.payload).map_err(|error| SaveError::DecodeFailed {
+                neighborhood_id: self.metadata.neighborhood_id.clone(),
+                lot_id: self.metadata.lot_id,
+                slot: self.metadata.slot,
+                detail: format!("invalid world snapshot payload: {error}"),
+            })?;
+        if self.metadata.format_version < AUTOSAVE_MADE_ORDER_FORMAT {
+            world.characters.made.sort_by_guid();
+        }
+        Ok(world)
     }
 }
 
@@ -865,7 +890,7 @@ fn decode_record_metadata(
                 format_version: version,
             })
         }
-        2 => {
+        2 | 3 => {
             let mut de = postcard::Deserializer::from_bytes(body_bytes);
             let header = AutosaveHeaderV2::deserialize(&mut de).map_err(|error| {
                 SaveError::DecodeFailed {
@@ -989,7 +1014,7 @@ where
                 payload: body.payload,
             })
         }
-        2 => {
+        2 | 3 => {
             let mut de = postcard::Deserializer::from_bytes(body_bytes);
             let header = AutosaveHeaderV2::deserialize(&mut de).map_err(|error| {
                 SaveError::DecodeFailed {

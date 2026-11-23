@@ -480,11 +480,13 @@ fn the_star_pool_hands_out_the_last_star_let_go() {
 /// lot: 0x433366 tests the old position with 0x422632 on the lot, so
 /// against the lot's size, not the 64 tiles of its arrays. A famous Sim
 /// moved from tile 31 to tile 30 of a 32-tile lot arrives and takes a
-/// star; on a 64-tile lot tile 31 is inside and nothing arrives.
+/// star; on a 64-tile lot tile 31 is inside and nothing arrives. Only
+/// the x word is compared for a move (0x4335a2..0x4335a5), so a move
+/// from (3, 31) to (3, 30) on the 32-tile lot runs no arrival.
 #[test]
 fn a_famous_sim_moved_in_from_a_small_lots_border_takes_a_star() {
     const FIND_LOCATION: u16 = 16;
-    let star_on = |size: i16| {
+    let star_on = |size: i16, from: [i32; 2], to: [i32; 2]| {
         let mut fx = two_residents();
         fx.program.expansions = 0x40;
         register_star(&mut fx);
@@ -492,8 +494,7 @@ fn a_famous_sim_moved_in_from_a_small_lots_border_takes_a_star() {
         // No pool and no water anywhere, for the place test.
         fx.world.arrays.insert(9, crate::rooms::array(1, 0xff));
         fx.world.arrays.insert(10, crate::rooms::array(1, 0xff));
-        // OTHER, famous and not selected, stands on tile (31, 3).
-        let from = [31, 3];
+        // OTHER, famous and not selected, stands on tile `from`.
         let grid = &mut fx.world.arrays.get_mut(&3).unwrap().data;
         let cell = |t: [i32; 2]| ((t[0] * 64 + t[1]) * 2) as usize;
         grid[cell([4, 4])..cell([4, 4]) + 2].copy_from_slice(&[0, 0]);
@@ -505,9 +506,9 @@ fn a_famous_sim_moved_in_from_a_small_lots_border_takes_a_star() {
         other.data[4] |= 1;
         other.data[42] |= 2;
         famous(&mut fx, OTHER, 10);
-        // Find Location mode 2 puts OTHER where the lamp is, on tile 30,
+        // Find Location mode 2 puts OTHER where the lamp is, on tile `to`,
         // with the lot told (0x433340).
-        fx.lamp_mut().position = [30 * 16 + 8, 3 * 16 + 8, 1];
+        fx.lamp_mut().position = [to[0] * 16 + 8, to[1] * 16 + 8, 1];
         fx.add(
             LAMP_FILE,
             4096,
@@ -522,7 +523,7 @@ fn a_famous_sim_moved_in_from_a_small_lots_border_takes_a_star() {
         assert_eq!(ran, Ok(true), "lot size {size}");
         assert_eq!(
             fx.world.objects[&OTHER].position,
-            [30 * 16 + 8, 3 * 16 + 8, 1]
+            [to[0] * 16 + 8, to[1] * 16 + 8, 1]
         );
         let star = fx.world.objects[&OTHER].slots[2].object as u16;
         fx.world
@@ -530,8 +531,15 @@ fn a_famous_sim_moved_in_from_a_small_lots_border_takes_a_star() {
             .get(&star)
             .is_some_and(|o| o.guid == STAR_MARKER)
     };
-    assert!(star_on(32), "tile 31 is off a 32-tile lot: OTHER arrives");
-    assert!(!star_on(64), "tile 31 is on a 64-tile lot: no arrival");
+    assert!(
+        star_on(32, [31, 3], [30, 3]),
+        "tile 31 is off a 32-tile lot: OTHER arrives"
+    );
+    assert!(
+        !star_on(64, [31, 3], [30, 3]),
+        "tile 31 is on a 64-tile lot: no arrival"
+    );
+    assert!(!star_on(32, [3, 31], [3, 30]), "x did not move: no arrival");
 }
 
 #[test]

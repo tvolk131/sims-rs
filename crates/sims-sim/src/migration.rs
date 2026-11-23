@@ -18,6 +18,9 @@
 //! - `v3 -> v4`: adds `family_surnames` (`BTreeMap<u16, String>`, empty on
 //!   upgrade) so Create-A-Family and imported `FAMs` surnames persist natively
 //!   inside REDB without an external sidecar file.
+//! - `v4 -> v5`: keeps the layout; `made_characters` is in the order made
+//!   from v5 on, so a v4 build refuses it rather than saving it back by
+//!   GUID. A v4 record's made types read back in GUID order.
 
 use crate::characters::Characters;
 use crate::neighborhood_store::{NEIGHBORHOOD_FORMAT, StoredNeighborhood};
@@ -553,7 +556,26 @@ fn migrate_v3_to_v4(record: &str, body: &[u8]) -> std::result::Result<Vec<u8>, M
     })
 }
 
-fn validate_neighborhood_v4(record: &str, body: &[u8]) -> std::result::Result<(), MigrationError> {
+/// Format 5 keeps the made person types in the order made
+/// ([`crate::characters::MadeTypes`]); format 4 had them by GUID. Its
+/// layout is format 4's, so a build of format 4 refuses it rather than
+/// saving the types back in GUID order. A format-4 record reads back in
+/// GUID order.
+fn migrate_v4_to_v5(record: &str, body: &[u8]) -> std::result::Result<Vec<u8>, MigrationError> {
+    let mut v5: StoredNeighborhood = decode_postcard_exact(record, 4, body)?;
+    v5.made_characters.made.sort_by_guid();
+    postcard::to_allocvec(&v5).map_err(|error| MigrationError::StepFailed {
+        record: record.to_owned(),
+        from: 4,
+        to: 5,
+        detail: error.to_string(),
+    })
+}
+
+fn validate_neighborhood_current(
+    record: &str,
+    body: &[u8],
+) -> std::result::Result<(), MigrationError> {
     let _: StoredNeighborhood = decode_postcard_exact(record, NEIGHBORHOOD_FORMAT, body)?;
     Ok(())
 }
@@ -577,18 +599,24 @@ static NEIGHBORHOOD_STEPS: &[MigrationStep] = &[
         description: "add native family_surnames map for CAF and FAMs persistence",
         apply: migrate_v3_to_v4,
     },
+    MigrationStep {
+        from: 4,
+        to: 5,
+        description: "keep made person types in the order made (format 4 had them by GUID)",
+        apply: migrate_v4_to_v5,
+    },
 ];
 
-/// Registered forward migration chain for [`StoredNeighborhood`] (`v1 -> v2 -> v3 -> v4`).
+/// Registered forward migration chain for [`StoredNeighborhood`] (`v1 -> v2 -> v3 -> v4 -> v5`).
 pub const NEIGHBORHOOD_MIGRATIONS: MigrationRegistry = MigrationRegistry {
     min_version: NEIGHBORHOOD_MIN_FORMAT,
     current_version: NEIGHBORHOOD_FORMAT,
     steps: NEIGHBORHOOD_STEPS,
-    validate_current: validate_neighborhood_v4,
+    validate_current: validate_neighborhood_current,
 };
 
 /// Decodes a [`StoredNeighborhood`] record from any supported version
-/// (`v1..=v4`), applying forward migrations in memory and returning both the
+/// (`v1..=v5`), applying forward migrations in memory and returning both the
 /// decoded neighborhood and its [`MigrationReport`].
 pub fn decode_neighborhood_with_report(
     name: &str,

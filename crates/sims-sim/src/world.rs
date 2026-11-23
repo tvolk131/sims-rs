@@ -1350,11 +1350,24 @@ impl World {
 
     /// Reads [`World::encode_snapshot`]'s payload. A payload with nothing
     /// after the world (one saved before the refreshes were kept) has none
-    /// pending.
+    /// pending and empty star pools: a caller that plays the world on
+    /// takes its pools from where its stars stand, through
+    /// [`World::decode_snapshot_parts`].
     pub fn decode_snapshot(bytes: &[u8]) -> Result<Self> {
+        let (mut world, queues) = Self::decode_snapshot_parts(bytes)?;
+        world.indicator_queues = queues.unwrap_or_default();
+        Ok(world)
+    }
+
+    /// [`World::decode_snapshot`]'s parts: the world, with no pending
+    /// indicator refreshes, and the payload's own refreshes and star pools,
+    /// or None for a payload saved before they were kept.
+    pub fn decode_snapshot_parts(bytes: &[u8]) -> Result<(Self, Option<IndicatorQueues>)> {
         let (mut world, rest): (Self, _) =
             postcard::take_from_bytes(bytes).map_err(|e| Error::Snapshot(e.to_string()))?;
-        if !rest.is_empty() {
+        let queues = if rest.is_empty() {
+            None
+        } else {
             let (queues, rest) = postcard::take_from_bytes::<IndicatorQueues>(rest)
                 .map_err(|e| Error::Snapshot(format!("indicator refreshes: {e}")))?;
             if !rest.is_empty() {
@@ -1363,10 +1376,10 @@ impl World {
                     rest.len()
                 )));
             }
-            world.indicator_queues = queues;
-        }
+            Some(queues)
+        };
         world.mark_all_frame_storage_dirty();
-        Ok(world)
+        Ok((world, queues))
     }
 
     /// Marks every existing [`Self::frame_storage`] entry dirty so each object

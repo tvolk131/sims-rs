@@ -1929,7 +1929,7 @@ impl Interpreter<'_> {
     /// 0x4481eb (0x448338..0x4483d1): a star marker let go from a head
     /// moves from the in-use pool to the end of the available pool
     /// (0x4483bd), if it was in use. One in neither pool stays there.
-    fn release_star(world: &mut World, star: u16) {
+    pub(crate) fn release_star(world: &mut World, star: u16) {
         let pools = &mut world.indicator_queues;
         if let Some(index) = pools.stars_in_use.iter().position(|&s| s == star) {
             pools.available_stars.push(star);
@@ -2850,8 +2850,44 @@ fn forward(at: [i8; 3], facing: i16) -> Result<[i8; 3], Trap> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// An object for the star-pool tests: `held_by` is its container
+    /// (`data::CONTAINER`).
+    pub(crate) fn pool_object(
+        id: u16,
+        guid: u32,
+        position: [i32; 3],
+        held_by: i16,
+    ) -> sims_sim::Object {
+        let mut data = vec![0; 128];
+        data[data::CONTAINER] = held_by;
+        sims_sim::Object {
+            id,
+            guid,
+            footprint: [0; 4],
+            position,
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: Vec::new(),
+            data,
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: 0,
+            relationships: Vec::new(),
+            slots: Vec::new(),
+            dynamic_sprites: Vec::new(),
+            multipart: None,
+            portal: None,
+            person: None,
+            registry_word: None,
+            last_result: false,
+            removal_skips_resets: false,
+            selected: false,
+        }
+    }
 
     /// A world saved before the star pools were kept: its stars go into
     /// the pools where the port took them from. Held ones are in use;
@@ -2860,34 +2896,7 @@ mod tests {
     /// none, and any other object, is in neither.
     #[test]
     fn a_world_saved_without_star_pools_adopts_its_stars() {
-        let object = |id: u16, guid: u32, position: [i32; 3], held_by: i16| {
-            let mut data = vec![0; 128];
-            data[data::CONTAINER] = held_by;
-            sims_sim::Object {
-                id,
-                guid,
-                footprint: [0; 4],
-                position,
-                unknown_short: 0,
-                attributes: Vec::new(),
-                temps: Vec::new(),
-                data,
-                obsolete_word: 0,
-                stack_capacity_bytes: 0,
-                stack: Vec::new(),
-                relationship_flag: 0,
-                relationships: Vec::new(),
-                slots: Vec::new(),
-                dynamic_sprites: Vec::new(),
-                multipart: None,
-                portal: None,
-                person: None,
-                registry_word: None,
-                last_result: false,
-                removal_skips_resets: false,
-                selected: false,
-            }
-        };
+        let object = pool_object;
         let off = [-16, -16, 1];
         let on = [40, 40, 1];
         let mut world = World::empty();
