@@ -10,6 +10,8 @@ test ! -e "$G"
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$G/share/userdata"
 cp -c "$SEED" "$G/working.ext4"
+chflags nouchg "$G/working.ext4"  # the seed may be locked (uchg) or read-only
+chmod u+w "$G/working.ext4"
 cp "$HERE/guest/sims-init.sh" "$HERE/guest/prepare_disk.sh" "$HERE/guest/launch.sh" "$G/share/"
 for d in UserData UserData2 UserData3 UserData4 UserData5 UserData6 UserData7 UserData8; do
     cp -c -R "$I/$d" "$G/share/userdata/"
