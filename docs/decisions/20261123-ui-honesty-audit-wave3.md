@@ -141,8 +141,12 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
      Done, Delete, Previous, Next, First and Last, each as position,
      label and tooltip. It puts Done at (129, 512), where `STR# 141` had
      (150, 512); the other positions agree. Ours now reads `STR# 144`.
-     Its entries 14 to 18 hold more geometry whose use is not traced, so
-     the strip keeps `STR# 141`'s (100, 430, 500, 72) box.
+   - Its entries 14 and 15 are the size 520×72 and origin (90, 435)
+     (`0x52a8e9`, `0x52a921`) of the control set at `0x52a96b`: the well
+     between Previous and Next. Our thumbnail strip now sits in that
+     box. Native's control there is the photo's caption text (`+0xf8`,
+     filled from the photo at `0x52b157`); native has no thumbnail
+     strip. Entries 16 to 18 are not traced.
    - "Snap", "Add", `AlbumCommand::CaptureSnapshot`/`AddBlankPage` and
      `AlbumSnapshot::can_capture_snapshot` are removed.
    - Photos now come from where they come from natively: clicking the lot
@@ -175,10 +179,18 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
      drawn above the album and answered before it (pointer, Enter,
      Escape and typed keys).
    - Native builds a fresh `cWinScrapbook` on every open (`new` at
-     `0x4d2100` and `0x503e9e`; the constructor `0x52a4c9` zeroes its
-     state). Ours resets the album's view on open (selection, drafts,
-     strip offset) and loads the opening strip's thumbnails, so a
-     reopened album is never blank.
+     `0x4d2100` and `0x503e9e`; the constructor `0x52a4c9` zeroes the
+     dialog's state). The album it shows is not the dialog's: `0x4108e4`
+     keeps one album object on the household (`+0x148`), and its current
+     photo index (`+0x10`) outlives the dialog. It starts at 0
+     (`0x4ed6a8`), a new photo makes it the newest (`0x4ed857`), Done
+     leaves it alone, and `0x52b119` shows it when the dialog opens.
+   - Ours resets the dialog on open (drafts, strip offset), then shows
+     the household's current photo (`NeighborhoodShell::album_index`, by
+     neighborhood and family, recorded on close, newest after a Camera
+     photo). The strip, which is ours, scrolls just far enough to show
+     it, and the opening strip's thumbnails load, so a reopened album is
+     never blank.
    - A notice over the album also takes the wheel, so nothing behind it
      scrolls, and it is laid out again when the window is resized.
    - The album loads thumbnails for the strip the dialog draws. The
@@ -220,9 +232,14 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
        not empty. Ours reads it as native does (`Game::catalog_name`,
        `definition_catalog_name`): the name Make New Character gave a
        made type; else the definition's `CATS` (its second string) or
-       `CTSS` slot 1 in US English (`0x4061e3`). For a person whose name
-       is empty, `0x47145f` probes the languages by number and takes
-       slot 1 of the first that has one, even when its text is empty.
+       `CTSS` slot 1 in US English (`0x4061e3`). The `CTSS` is read in
+       the byte order its resource flags give, as the loader does:
+       without flag 0x10 it is big-endian (`0x470351`,
+       `StringTable::parse_chunk`). For a person whose name is empty,
+       `0x47145f` probes indices 0 to 19. The loader files each string
+       under its language code less one (`0x470e32`), so that is codes 1
+       to 20, Korean included. The probe takes slot 1 of the first
+       language that has one, even when its text is empty.
        A name still empty becomes `*` and the `OBJD` label
        (`0x457db4..0x457de2`), so it is `*` alone with no label. The
        name is therefore never empty, and the check skips no readable
@@ -294,6 +311,10 @@ choice dialogs. All three were inspected by eye.
   (`0x4b7fb4`). The port stores album photos losslessly and has no JPEG
   encoder, so the setting changes no pixel. `SnapshotQuality::jpeg_quality`
   now gives native's numbers. Porting the encoder is left for later.
+- **Album well.** Native shows the photo's caption in the well between
+  Previous and Next (`STR# 144` entries 14 and 15) and has no thumbnail
+  strip. Ours draws a thumbnail strip there and edits the caption beside
+  the photo. Moving the caption into the well is left for later.
 - **Camera frame outline.** Native draws the frame under the pointer
   while Camera Mode is open (`0x4b156a`). Ours does not draw it.
 - **Phone book pages.** Native `cWinPhoneBook` shows one family per page:

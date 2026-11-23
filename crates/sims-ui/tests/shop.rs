@@ -491,6 +491,17 @@ fn complete_collection_live_install_loads_uitext_and_renders_shop_picker() {
         strings.choice_title(ChoiceDialog::Charm),
         "Choose the New You"
     );
+    // The English defaults match those entries, so a localized table pins
+    // which resource each title comes from.
+    let german = ShopStrings::load(&install, 4).expect("load German UIText.iff strings");
+    assert_eq!(
+        german.choice_title(ChoiceDialog::Charm),
+        "Wähle Dein neues Ich"
+    );
+    assert_eq!(
+        german.choice_title(ChoiceDialog::Clothing),
+        "Bitte ein Outfit auswählen."
+    );
 
     let snap = sample_boutique_snapshot();
     let mut dialog = ShopPickerDialog::new();

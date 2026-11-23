@@ -1235,33 +1235,57 @@ fn wave2_large_photo_album_60_snapshots_and_loading_presenter() {
             "strip slot {idx} shows a loaded thumbnail"
         );
     }
+    // Choose photo 25 and close with Done.
+    let chosen = shell.album_snapshot().expect("album").entries[25].id;
+    shell.execute_album_command(AlbumCommand::SelectEntry(chosen));
     shell.close_photo_album();
 
-    // Native builds a fresh `cWinScrapbook` on every open (`0x4d2100`,
-    // `0x52a4c9` zeroes its state): the album reopens at its start, its
-    // first photo chosen, with the strip's thumbnails loaded.
+    // The dialog is new on every open (`0x4d2100`, `0x52a4c9`), but the
+    // photo it shows is the household album's current one, which outlives
+    // it (`0x4108e4`, read at `0x52b119`) and which Done leaves alone: the
+    // album reopens on photo 25, the strip scrolled just far enough to
+    // show it, with the strip's thumbnails and the photo loaded.
     shell.open_photo_album().expect("reopen the Goths' album");
+    assert_eq!(shell.album_dialog().selected_id(), Some(chosen));
+    let reopened_scroll = shell.album_dialog().strip_scroll();
     assert_eq!(
-        shell.album_dialog().strip_scroll(),
-        0,
-        "reopens at the start"
+        reopened_scroll,
+        25 + 1 - slots,
+        "photo 25 at the strip's end"
     );
     let reopened = shell.album_snapshot().expect("album");
-    assert_eq!(
-        shell.album_dialog().selected_id(),
-        Some(reopened.entries[0].id)
-    );
-    assert!(reopened.entries[0].image.is_some(), "the first photo shows");
-    for (idx, entry) in reopened.entries.iter().enumerate().take(slots) {
+    assert!(reopened.entries[25].image.is_some(), "photo 25 shows");
+    for (idx, entry) in reopened
+        .entries
+        .iter()
+        .enumerate()
+        .skip(reopened_scroll)
+        .take(slots)
+    {
         assert!(
             entry.thumbnail.is_some(),
             "reopened strip slot {idx} shows a loaded thumbnail"
         );
     }
+    shell.close_photo_album();
+
+    // A photo taken with the album closed becomes its current one
+    // (`0x4ed857`), so the album next opens on it.
+    let newest = shell
+        .capture_lot_photo()
+        .expect("photo with the album closed");
+    shell.open_photo_album().expect("reopen after a photo");
+    let reopened = shell.album_snapshot().expect("album");
+    assert_eq!(reopened.entries.len(), 61);
+    assert_eq!(reopened.entries.last().map(|e| e.id), Some(newest));
+    assert_eq!(shell.album_dialog().selected_id(), Some(newest));
+    assert_eq!(shell.album_dialog().strip_scroll(), 61 - slots);
+    let reopened_scroll = shell.album_dialog().strip_scroll();
+
     // A notice over the album takes the wheel: the strip behind stays put.
     shell.show_notice("Photo Album", "A notice over the album.");
     assert!(!shell.wheel(-1.0), "the wheel does not reach the album");
-    assert_eq!(shell.album_dialog().strip_scroll(), 0);
+    assert_eq!(shell.album_dialog().strip_scroll(), reopened_scroll);
     // The notice is centred on the window, and follows a resize.
     let centre = |shell: &NeighborhoodShell| {
         let rect = shell.dialog_layout().expect("the notice is in front").rect;
@@ -1279,8 +1303,8 @@ fn wave2_large_photo_album_60_snapshots_and_loading_presenter() {
     assert_eq!(centre(&shell), small);
     shell.escape();
     assert!(shell.album_open(), "Escape closes only the notice");
-    assert!(shell.wheel(-1.0), "with the notice gone the strip scrolls");
-    assert_eq!(shell.album_dialog().strip_scroll(), 1);
+    assert!(shell.wheel(1.0), "with the notice gone the strip scrolls");
+    assert_eq!(shell.album_dialog().strip_scroll(), reopened_scroll - 1);
     shell.close_photo_album();
     shell
         .enqueue_background_lot_save(sims_sim::autosave::SaveTarget::Manual)

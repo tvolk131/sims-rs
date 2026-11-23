@@ -664,6 +664,10 @@ pub struct NeighborhoodShell {
     album_has_image: BTreeSet<PhotoId>,
     album_strip_scroll: usize,
     album_strip_pressed: Option<i32>,
+    /// Each household album's current photo, by neighborhood and family.
+    /// Native keeps it on the household's album object (`+0x10`), which
+    /// outlives the dialog (`0x4108e4`); a missing entry is its initial 0.
+    album_index: BTreeMap<(String, u16), usize>,
     // Crash-safe Save & Rotating Autosave Manager dialog (overlay over Lot/Neighborhood).
     save_manager: SaveManagerDialog,
     save_manager_snapshot: Option<SaveManagerSnapshot>,
@@ -1026,6 +1030,7 @@ impl NeighborhoodShell {
             album_has_image: BTreeSet::new(),
             album_strip_scroll: 0,
             album_strip_pressed: None,
+            album_index: BTreeMap::new(),
             save_manager: SaveManagerDialog::new(),
             save_manager_snapshot: None,
             save_manager_target_lot: None,
@@ -6399,8 +6404,8 @@ impl NeighborhoodShell {
             .family_token(&nh_id, family_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("family {family_id} not found in neighborhood {nh_id:?}"))?;
-        // A fresh view, as native's new `cWinScrapbook` is (see
-        // `PhotoAlbumDialog::reset_view`).
+        // A fresh dialog, as native's new `cWinScrapbook` is (see
+        // `PhotoAlbumDialog::reset_view`), on the album's current photo.
         self.album_dialog.reset_view();
         self.album_strip_scroll = 0;
         let (snapshot, has_image) = self.build_album_snapshot(&nh_id, family_id, None)?;
@@ -6409,11 +6414,25 @@ impl NeighborhoodShell {
             session.game.close_camera_strip();
         }
         self.album_token = Some(token);
-        self.album_neighborhood_id = Some(nh_id);
         self.album_has_image = has_image;
         self.album_strip_scroll = 0;
         self.album_strip_pressed = None;
         self.album_dialog.open(&snapshot);
+        // `0x52b119` shows the album's current photo; Done leaves it as it
+        // was last shown (`close_photo_album`).
+        let current = self
+            .album_index
+            .get(&(nh_id.clone(), family_id))
+            .copied()
+            .unwrap_or(0);
+        let visible_slots = self
+            .album_dialog
+            .layout(self.size[0], self.size[1])
+            .thumb_slots
+            .len();
+        self.album_dialog
+            .show_index(&snapshot, current, visible_slots);
+        self.album_neighborhood_id = Some(nh_id);
         self.album_snapshot = Some(snapshot);
         self.hydrate_album_images();
         Ok(())
@@ -6472,6 +6491,12 @@ impl NeighborhoodShell {
             .add(&nh_id, token, entry)
             .map_err(|e| e.to_string())?;
         let id = PhotoId(photo.id);
+        // Adding a photo makes it the album's current one (`0x4ed857`): the
+        // index past the end is clamped to the newest when the album opens.
+        // An album open now keeps the photo it shows, and records that on
+        // close.
+        self.album_index
+            .insert((nh_id.clone(), family_id), usize::MAX);
         if self.album_dialog.is_open()
             && self.album_token == Some(token)
             && let Err(err) = self.refresh_album_snapshot()
@@ -6484,8 +6509,19 @@ impl NeighborhoodShell {
         Ok(id)
     }
 
-    /// Closes the Photo Album modal cleanly.
+    /// Closes the Photo Album modal cleanly. The album keeps the photo it
+    /// showed as its current one, for the next opening.
     pub fn close_photo_album(&mut self) {
+        if self.album_dialog.is_open()
+            && let (Some(nh_id), Some(token), Some(snapshot)) = (
+                self.album_neighborhood_id.clone(),
+                self.album_token,
+                self.album_snapshot.as_ref(),
+            )
+        {
+            let shown = self.album_dialog.shown_index(snapshot).unwrap_or(0);
+            self.album_index.insert((nh_id, token.family_id), shown);
+        }
         self.album_dialog.close();
         self.album_snapshot = None;
         self.album_token = None;

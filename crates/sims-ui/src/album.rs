@@ -453,11 +453,12 @@ impl PhotoAlbumDialog {
         self.focus = None;
     }
 
-    /// Forgets the last opening's view: no selection (the first photo is
-    /// chosen on the next sync), no draft, and the strip at its start.
-    /// Native builds a new `cWinScrapbook` for every opening (`0x4d2100`,
-    /// `0x503e9e` → `0x52a4c9`, which zeroes its state), so nothing of an
-    /// earlier opening carries over.
+    /// Forgets the last opening's dialog state: no selection (the first
+    /// photo is chosen on the next sync, unless [`Self::show_index`]
+    /// picks one), no draft, and the strip at its start. Native builds a
+    /// new `cWinScrapbook` for every opening (`0x4d2100`, `0x503e9e` →
+    /// `0x52a4c9`, which zeroes the dialog's own state). The photo it
+    /// shows is not the dialog's: see [`Self::show_index`].
     pub fn reset_view(&mut self) {
         self.selected_id = None;
         self.draft_title.clear();
@@ -468,6 +469,30 @@ impl PhotoAlbumDialog {
         self.dirty = false;
         self.pending_delete = None;
         self.strip_scroll = 0;
+    }
+
+    /// Shows the photo at `index` (clamped to the last), scrolling the
+    /// strip just far enough to show it. Native's current photo belongs to
+    /// the household's album object, which outlives the dialog
+    /// (`0x4108e4` keeps it on the family at `+0x148`): `0x52b119` reads
+    /// its index (`+0x10`) when the dialog opens. The strip is ours (native
+    /// has none), so it only follows the selection.
+    pub fn show_index(&mut self, snapshot: &AlbumSnapshot, index: usize, visible_slots: usize) {
+        let total = snapshot.entries.len();
+        let Some(entry) = total
+            .checked_sub(1)
+            .and_then(|last| snapshot.entries.get(index.min(last)))
+        else {
+            return;
+        };
+        let index = index.min(total - 1);
+        self.select_entry(snapshot, entry.id);
+        self.ensure_strip_visible(index, visible_slots, total);
+    }
+
+    /// The index of the photo shown, if any.
+    pub fn shown_index(&self, snapshot: &AlbumSnapshot) -> Option<usize> {
+        self.selected_index(snapshot)
     }
 
     /// The first thumbnail the strip shows (its horizontal scroll).
@@ -739,10 +764,12 @@ impl PhotoAlbumDialog {
             let btn_done = Rect::new(mx + 129, my + 512, 130, 41);
             let btn_delete = Rect::new(mx + 442, my + 511, 130, 41);
 
-            // Middle thumbnail strip sits inside the `STR# 141` `(100, 430, 500, 72)`
-            // well. `STR# 144` entries 14-18 hold other geometry whose use is
-            // not traced, so the strip keeps the older table's box.
-            let strip_box = Rect::new(mx + 100, my + 430, 500, 72);
+            // The well between Previous and Next is `STR# 144` entry 15's
+            // origin (90, 435) and entry 14's size 520×72 (`0x52a8e9`,
+            // `0x52a921`, set at `0x52a96b`). Native puts the photo's
+            // caption text control there (`+0xf8`, filled at `0x52b157`);
+            // our thumbnail strip has it instead.
+            let strip_box = Rect::new(mx + 90, my + 435, 520, 72);
             let arrow_w = 24;
             let strip_prev = Rect::new(
                 strip_box.x + 4,

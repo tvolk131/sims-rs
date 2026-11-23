@@ -11385,10 +11385,7 @@ impl Game {
             .data(chunk)
             .get(0x52..0x54)
             .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
-        let cats = iff.get(b"CATS", table).map(|c| iff.data(c));
-        let ctss = iff
-            .get(b"CTSS", table)
-            .and_then(|c| sims_formats::strings::StringTable::parse(iff.data(c)).ok());
+        let (cats, ctss) = catalog_strings(&iff, table);
         definition_catalog_name(cats, ctss.as_ref(), object.kind == 2, &chunk.label)
     }
 
@@ -14008,15 +14005,30 @@ fn outfit_key(row: &str) -> (String, String) {
     (fit(suit), fit(texture))
 }
 
+/// A definition's `CATS` bytes and its `CTSS` table, both numbered by
+/// definition word 41. The `CTSS` is read in the byte order its flags give,
+/// as the loader does: without flag 0x10 it is big-endian (`0x470351`).
+fn catalog_strings(
+    iff: &sims_formats::iff::Iff,
+    table: u16,
+) -> (Option<&[u8]>, Option<sims_formats::strings::StringTable>) {
+    let cats = iff.get(b"CATS", table).map(|c| iff.data(c));
+    let ctss = iff.get(b"CTSS", table).and_then(|c| {
+        sims_formats::strings::StringTable::parse_chunk(iff.data(c), iff.resource_flags(c)).ok()
+    });
+    (cats, ctss)
+}
+
 /// A definition's catalog name (`0x457d3b`, which fills it by
 /// `0x4061e3`):
 ///
 /// - with a `CATS` resource, its second string (`0x40631f..0x406352`);
 /// - else `CTSS` slot 1 in the game's language, US English
 ///   (`0x470ca7(0, 0)`, `0x471411(1, -1)`). For a person whose name is
-///   empty (`0x4062c1`), `0x47145f(1, 0)` probes the languages in order
-///   and takes slot 1 of the first that has one, even when its text is
-///   empty (`0x471465..0x471479`);
+///   empty (`0x4062c1`), `0x47145f(1, 0)` probes language codes 1 to 20
+///   in order (indices 0 to 19, each a code less one, `0x470e32`) and
+///   takes slot 1 of the first that has one, even when its text is empty
+///   (`0x471465..0x471479`);
 /// - a name still empty becomes `*` and the definition's own name, its
 ///   `OBJD` label (`0x457db4..0x457de2`, `"*"` at `0x6c12fc`), so it is
 ///   never empty.
@@ -14053,9 +14065,10 @@ fn definition_catalog_name(
         None => {
             let name = slot_one(US_ENGLISH).unwrap_or_default();
             if name.is_empty() && person {
-                // The reader gives language 0 entries language 1, so the
-                // probe starts there.
-                (1..20).find_map(slot_one).unwrap_or_default()
+                // The probe walks indices 0..=19, and the loader files a
+                // string under its code less one (`0x470e32`), so codes 1
+                // to 20 (Korean). The reader gives code 0 language 1.
+                (1..=20).find_map(slot_one).unwrap_or_default()
             } else {
                 name
             }
@@ -14331,6 +14344,46 @@ mod tests {
             definition_catalog_name(None, Some(&table), false, "Label"),
             "New"
         );
+        // The probe reaches code 20 (Korean, index 19).
+        let table = ctss(&[(20, "Korean")]);
+        assert_eq!(
+            definition_catalog_name(None, Some(&table), true, "Label"),
+            "Korean"
+        );
+    }
+
+    #[test]
+    fn catalog_strings_read_a_ctss_in_its_flags_byte_order() {
+        use sims_formats::iff::{ChunkData, Iff, write};
+        // A version -1 table of two strings, written big-endian (flag 0x10
+        // clear) and little-endian (flag 0x10 set).
+        let file = |flags: u16, data: Vec<u8>| {
+            Iff::parse(
+                write(&[ChunkData {
+                    tag: *b"CTSS",
+                    id: 2000,
+                    flags,
+                    label: String::new(),
+                    data,
+                }])
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut big = vec![0xff, 0xff, 0x00, 0x02];
+        big.extend(b"Bella\0Goth\0");
+        let mut little = vec![0xff, 0xff, 0x02, 0x00];
+        little.extend(b"Bella\0Goth\0");
+        for (flags, data) in [(0, big), (0x10, little)] {
+            let iff = file(flags, data);
+            let (cats, ctss) = catalog_strings(&iff, 2000);
+            assert!(cats.is_none());
+            assert_eq!(
+                definition_catalog_name(cats, ctss.as_ref(), true, "Label"),
+                "Bella",
+                "flags {flags:#x}"
+            );
+        }
     }
 
     #[test]

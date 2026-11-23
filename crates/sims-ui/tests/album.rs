@@ -328,3 +328,58 @@ fn loads_complete_collection_art_and_uitext_strings() {
     let mut frame = Frame::new(800, 600, [20, 40, 60]);
     dialog.draw(&mut frame, &snapshot, &art);
 }
+
+/// The modal-relative rect of `rect` in the 800×600 native layout.
+fn native_rel(rect: Rect, screen: [i32; 2]) -> (i32, i32, i32, i32) {
+    let dialog = PhotoAlbumDialog::default();
+    let modal = dialog.layout(screen[0], screen[1]).modal;
+    (rect.x - modal.x, rect.y - modal.y, rect.width, rect.height)
+}
+
+#[test]
+fn native_layout_puts_done_and_the_well_where_str_144_does() {
+    for screen in [[800, 600], [1024, 768]] {
+        let dialog = PhotoAlbumDialog::default();
+        let layout = dialog.layout(screen[0], screen[1]);
+        assert!(layout.native_scrap);
+        // `STR# 144[0]` "(129;512)", not `STR# 141`'s (150, 512).
+        assert_eq!(native_rel(layout.btn_done, screen).0, 129);
+        assert_eq!(native_rel(layout.btn_done, screen).1, 512);
+        // Entry 15's origin and entry 14's size (`0x52a8e9`, `0x52a921`).
+        assert_eq!(native_rel(layout.strip_box, screen), (90, 435, 520, 72));
+    }
+}
+
+#[test]
+fn str_144_holds_the_positions_the_layout_uses() {
+    let Some(path) = install() else {
+        return;
+    };
+    let install = Install::detect(&path).expect("open Complete Collection install");
+    let bytes = std::fs::read(install.file("GameData/UIText.iff").expect("UIText.iff"))
+        .expect("read UIText.iff");
+    let iff = sims_formats::iff::Iff::parse(bytes).expect("parse UIText.iff");
+    let chunk = iff
+        .get(b"STR#", sims_ui::album::SCRAPBOOK_STRINGS)
+        .expect("STR# 144");
+    let table =
+        sims_formats::strings::StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk))
+            .expect("parse STR# 144");
+    let pair = |index: usize| -> (i32, i32) {
+        let text = table.get(index, 1).expect("entry");
+        let (a, b) = text
+            .trim_matches(|c| c == '(' || c == ')')
+            .split_once(';')
+            .expect("(a;b)");
+        (a.trim().parse().unwrap(), b.trim().parse().unwrap())
+    };
+    let layout = PhotoAlbumDialog::default().layout(800, 600);
+    let screen = [800, 600];
+    let done = native_rel(layout.btn_done, screen);
+    assert_eq!(pair(0), (done.0, done.1), "Done");
+    let delete = native_rel(layout.btn_delete, screen);
+    assert_eq!(pair(3), (delete.0, delete.1), "Delete");
+    let well = native_rel(layout.strip_box, screen);
+    assert_eq!(pair(14), (well.2, well.3), "the well's size");
+    assert_eq!(pair(15), (well.0, well.1), "the well's origin");
+}
