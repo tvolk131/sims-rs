@@ -326,6 +326,10 @@ pub struct ShopSnapshot {
     pub preview_image: Option<Image>,
     /// Optional caption or fallback status shown inside the 3D preview pane.
     pub preview_label: Option<String>,
+    /// When `true`, hides the Simoleon/MagiCoin wallet bar, per-item price tags,
+    /// and disabled `Try On` button so non-monetary pickers (e.g. `.FAM` family
+    /// import or free charm/wardrobe selectors) never display a bogus `$0` wallet.
+    pub hide_wallet_and_prices: bool,
 }
 
 /// Typed commands emitted by [`ShopPickerDialog`] for `sims-game` / `sims-vm`.
@@ -642,21 +646,41 @@ impl ShopPickerDialog {
         let inner_w = (dialog.width - pad * 2).max(120);
 
         let title_bar = Rect::new(inner_x, dialog.y + 12, inner_w, 20);
-        let wallet_bar = Rect::new(inner_x, title_bar.y + title_bar.height + 2, inner_w, 18);
+        let wallet_bar = if snapshot.hide_wallet_and_prices {
+            Rect::new(inner_x, title_bar.y + title_bar.height, inner_w, 0)
+        } else {
+            Rect::new(inner_x, title_bar.y + title_bar.height + 2, inner_w, 18)
+        };
 
         let footer_h = 30;
         let footer_y = dialog.y + dialog.height - footer_h - 14;
         let gap = 8;
-        let btn_w = ((inner_w - gap * 2) / 3).max(48);
-        let try_on_btn = Rect::new(inner_x, footer_y, btn_w, footer_h);
-        let buy_btn = Rect::new(inner_x + btn_w + gap, footer_y, btn_w, footer_h);
-        let cancel_x = inner_x + (btn_w + gap) * 2;
-        let cancel_btn = Rect::new(
-            cancel_x,
-            footer_y,
-            (inner_x + inner_w - cancel_x).max(48),
-            footer_h,
-        );
+        let hide_try_on =
+            snapshot.hide_wallet_and_prices && !snapshot.items.iter().any(|i| i.supports_try_on);
+        let (try_on_btn, buy_btn, cancel_btn) = if hide_try_on {
+            let btn_w = ((inner_w - gap) / 2).max(48);
+            let buy_btn = Rect::new(inner_x, footer_y, btn_w, footer_h);
+            let cancel_x = inner_x + btn_w + gap;
+            let cancel_btn = Rect::new(
+                cancel_x,
+                footer_y,
+                (inner_x + inner_w - cancel_x).max(48),
+                footer_h,
+            );
+            (Rect::new(inner_x, footer_y, 0, 0), buy_btn, cancel_btn)
+        } else {
+            let btn_w = ((inner_w - gap * 2) / 3).max(48);
+            let try_on_btn = Rect::new(inner_x, footer_y, btn_w, footer_h);
+            let buy_btn = Rect::new(inner_x + btn_w + gap, footer_y, btn_w, footer_h);
+            let cancel_x = inner_x + (btn_w + gap) * 2;
+            let cancel_btn = Rect::new(
+                cancel_x,
+                footer_y,
+                (inner_x + inner_w - cancel_x).max(48),
+                footer_h,
+            );
+            (try_on_btn, buy_btn, cancel_btn)
+        };
 
         let detail_h = if dialog.height < 260 { 22 } else { 32 };
         let detail_bar = Rect::new(inner_x, footer_y - detail_h - 8, inner_w, detail_h);
@@ -924,7 +948,10 @@ impl ShopPickerDialog {
         }
 
         // Wallet balance bar (Simoleons & MagiCoins).
-        if let Some(font) = small_font {
+        if !snapshot.hide_wallet_and_prices
+            && layout.wallet_bar.height > 0
+            && let Some(font) = small_font
+        {
             let sim_str = format!(
                 "Funds: {}",
                 CurrencyKind::Simoleons.format_price(snapshot.wallet.simoleons)
@@ -1028,37 +1055,39 @@ impl ShopPickerDialog {
                     );
                 }
 
-                // Price label on top-right.
-                let price_str = item.currency.format_price(item.price);
-                let price_w = body_font.map_or(56, |f| f.width(&price_str).max(40)) + 8;
-                let price_x = (card_rect.x + card_rect.width - price_w - 4)
-                    .max(icon_rect.x + icon_rect.width + 8);
-                let price_color = if !item.available || item.price < 0 {
-                    TEXT_DISABLED
-                } else if item.owned {
-                    TEXT_NORMAL
-                } else if !affordable {
-                    TEXT_ERROR
-                } else if item.currency == CurrencyKind::MagiCoins {
-                    TEXT_MAGIC
-                } else {
-                    TEXT_OK
-                };
-                if let Some(font) = body_font {
-                    draw_clipped_text(
-                        frame,
-                        font,
-                        &price_str,
-                        [price_x, card_rect.y + 5],
-                        (card_rect.x + card_rect.width - price_x - 4).max(16),
-                        price_color,
-                    );
-                }
-
-                // Name & description to the right of the icon slot.
+                // Price label on top-right (hidden for non-monetary pickers).
                 let text_x = icon_rect.x + icon_rect.width + 8;
-                let name_w = (price_x - text_x - 6).max(20);
                 let desc_w = (card_rect.x + card_rect.width - text_x - 8).max(20);
+                let name_w = if snapshot.hide_wallet_and_prices {
+                    desc_w
+                } else {
+                    let price_str = item.currency.format_price(item.price);
+                    let price_w = body_font.map_or(56, |f| f.width(&price_str).max(40)) + 8;
+                    let price_x = (card_rect.x + card_rect.width - price_w - 4)
+                        .max(icon_rect.x + icon_rect.width + 8);
+                    let price_color = if !item.available || item.price < 0 {
+                        TEXT_DISABLED
+                    } else if item.owned {
+                        TEXT_NORMAL
+                    } else if !affordable {
+                        TEXT_ERROR
+                    } else if item.currency == CurrencyKind::MagiCoins {
+                        TEXT_MAGIC
+                    } else {
+                        TEXT_OK
+                    };
+                    if let Some(font) = body_font {
+                        draw_clipped_text(
+                            frame,
+                            font,
+                            &price_str,
+                            [price_x, card_rect.y + 5],
+                            (card_rect.x + card_rect.width - price_x - 4).max(16),
+                            price_color,
+                        );
+                    }
+                    (price_x - text_x - 6).max(20)
+                };
                 if let Some(font) = body_font {
                     let mut name_text = item.name.clone();
                     if is_tried {
@@ -1208,14 +1237,18 @@ impl ShopPickerDialog {
             let (msg, color) = if let Some(hint) = self.selected_status_hint(snapshot) {
                 (hint.to_owned(), TEXT_WARNING)
             } else if let Some(item) = self.selected_item(snapshot) {
-                (
-                    format!(
-                        "Selected: {} ({})",
-                        item.name,
-                        item.currency.format_price(item.price)
-                    ),
-                    TEXT_NORMAL,
-                )
+                if snapshot.hide_wallet_and_prices {
+                    (format!("Selected: {}", item.name), TEXT_NORMAL)
+                } else {
+                    (
+                        format!(
+                            "Selected: {} ({})",
+                            item.name,
+                            item.currency.format_price(item.price)
+                        ),
+                        TEXT_NORMAL,
+                    )
+                }
             } else {
                 ("Select an item.".to_owned(), TEXT_NORMAL)
             };
@@ -1231,14 +1264,16 @@ impl ShopPickerDialog {
             );
         }
 
-        // Footer buttons: Try On, Buy, Cancel.
-        draw_button(
-            frame,
-            art,
-            layout.try_on_btn,
-            &strings.try_on,
-            self.button_state(ShopHit::TryOnButton, self.can_try_on_selected(snapshot)),
-        );
+        // Footer buttons: Try On (when shown), Buy/Confirm, Cancel.
+        if layout.try_on_btn.width > 0 && layout.try_on_btn.height > 0 {
+            draw_button(
+                frame,
+                art,
+                layout.try_on_btn,
+                &strings.try_on,
+                self.button_state(ShopHit::TryOnButton, self.can_try_on_selected(snapshot)),
+            );
+        }
         let buy_label = snapshot
             .buy_label_override
             .as_deref()

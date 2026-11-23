@@ -431,7 +431,8 @@ fn magic_hole_and_downtown_pickers_use_real_graphical_destination_maps_end_to_en
         "clicking Magic Town lot 93 on the graphical destination map must travel to lot 93"
     );
 
-    // 3. Cancel via Return button on a fresh Magic Hole prompt returns cleanly to Goth house.
+    // 3. Cancel a fresh Magic Hole prompt with Esc (the 1.91 dialog frame has
+    //    no visible cancel button) and return cleanly to the Goth house.
     let (_tmp2, saves2) = temp_redb("magic-hole-cancel-e2e");
     let mut shell_cancel =
         NeighborhoodShell::open(root, saves2, 1, true, vec![3], Frames::default())
@@ -454,19 +455,17 @@ fn magic_hole_and_downtown_pickers_use_real_graphical_destination_maps_end_to_en
     }
     shell_cancel.render();
     assert!(shell_cancel.destination_picker_open());
-    let cancel_rect = shell_cancel
-        .game()
-        .expect("lot")
-        .destination_picker()
-        .expect("picker")
-        .cancel_button_rect([1024, 768])
-        .expect("Return/Cancel button rect");
-    let cancel_pt = [
-        cancel_rect.x + cancel_rect.width / 2,
-        cancel_rect.y + cancel_rect.height / 2,
-    ];
-    let _ = shell_cancel.press(cancel_pt);
-    let _ = shell_cancel.release(cancel_pt);
+    assert!(
+        shell_cancel
+            .game()
+            .expect("lot")
+            .destination_picker()
+            .expect("picker")
+            .cancel_button_rect([1024, 768])
+            .is_none(),
+        "the Magic Town dialog frame has no visible cancel control"
+    );
+    let _ = shell_cancel.escape();
     assert!(!shell_cancel.destination_picker_open());
     assert_eq!(
         shell_cancel.active_lot_house(),

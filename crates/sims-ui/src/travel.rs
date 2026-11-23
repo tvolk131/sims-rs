@@ -18,18 +18,22 @@
 //! no verbatim game prose is embedded in source.
 
 use crate::art::Art;
+use crate::dialog::{BACKGROUND as DIALOG_BACKGROUND, BUTTON as DIALOG_BUTTON, draw_nine_slice};
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
 use crate::neighborhood::ExpansionFlags;
 use crate::{Error, Result};
 use sims_content::Install;
 use sims_content::ui_graphics::UiGraphics;
+use sims_formats::bitmap::Image;
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 
 /// `GameData/UIText.iff` string table IDs for the four expansion screens,
 /// filter bar, and travel confirmation dialogs.
 pub mod str_id {
+    /// `ObjDialogs` default button strings (`OK`, `Cancel`, `Yes`, `No`).
+    pub const DIALOG_BUTTONS: u16 = 142;
     /// `Downtown Screen Tooltips` (5 entries).
     pub const DOWNTOWN_TIPS: u16 = 169;
     /// `Vacation Island Screen Tooltips` (5 entries).
@@ -119,7 +123,9 @@ pub mod art_id {
 ///
 /// Note: `Res_Nbhd.RT` misspells `kStudiotownBulldoze` (`5219`) as
 /// `kStudiownBulldoze`, so Studio Town falls back to [`art_id::DOWNTOWN_BULLDOZE`].
-pub const RESOURCES: [i32; 39] = [
+pub const RESOURCES: [i32; 41] = [
+    DIALOG_BACKGROUND,
+    DIALOG_BUTTON,
     art_id::DOWNTOWN_BAR_BKG,
     art_id::NEIGHBORHOOD_BAR_BKG,
     art_id::DOWNTOWN_RETURN,
@@ -169,6 +175,28 @@ pub const BAR_HEIGHT: i32 = 52;
 pub const FILTER_STRIP_HEIGHT: i32 = 56;
 /// Compact filter strip height on viewports narrower than 800 px.
 pub const COMPACT_FILTER_STRIP_HEIGHT: i32 = 30;
+/// Native destination map height. Viewports taller than this center the
+/// `800×600` map and its chrome (`0x556db7..0x556ddc`: origin `[112, 84]` at
+/// `1024×768`).
+pub const NATIVE_HEIGHT: i32 = 600;
+/// Title header height of the Magic Town picker dialog frame
+/// (`kDTDlgBkg2` `5432`, `Downtown/dlgframe2.bmp`), measured against the 1.91
+/// oracle (`flow-magic-hole-picker.png`): rows `0..62` are the header and the
+/// transparent map hole starts at row `62`.
+pub const DIALOG_HEADER_HEIGHT: i32 = 62;
+/// Map hole inside `dlgframe2.bmp` relative to the map origin (columns
+/// `15..789`, rows `62..585`).
+pub const DIALOG_MAP_HOLE: Rect = Rect::new(15, DIALOG_HEADER_HEIGHT, 774, 523);
+/// Width of one `NghUI/Filter*Btn.bmp` cell (`200×52`, four states).
+const PICKER_FILTER_CELL: i32 = 50;
+/// Top of the picker dialog's filter row relative to the map origin (oracle).
+const PICKER_FILTER_Y: i32 = 20;
+/// Visit-mode bar button columns relative to the map origin, measured against
+/// the 1.91 oracle (`flow-cab-downtown-picker.png`): Return `kDowntownExitToNgh`
+/// (`5209`), Bulldoze (`5211`), Import (`5212`).
+const VISIT_BAR_BUTTON_X: [i32; 3] = [323, 373, 422];
+/// `TheSimsLogo.bmp` (`5210`) left inset inside the bar (oracle).
+const LOGO_X: i32 = 5;
 
 /// Loads all travel chrome bitmaps and UI fonts from `ui`.
 pub fn load_art(ui: &UiGraphics, language: u8) -> Result<Art> {
@@ -190,8 +218,6 @@ const TEXT_GOLD: [u8; 3] = [255, 224, 112];
 const TEXT_MUTED: [u8; 3] = [148, 158, 182];
 const DIALOG_BG: [u8; 3] = [22, 32, 82];
 const DIALOG_BORDER: [u8; 3] = [110, 158, 242];
-const BTN_CONFIRM_BG: [u8; 3] = [44, 138, 92];
-const BTN_CANCEL_BG: [u8; 3] = [146, 56, 62];
 const TOOLTIP_BG: [u8; 3] = [255, 255, 230];
 const TOOLTIP_BORDER: [u8; 3] = [0, 0, 0];
 const TOOLTIP_TEXT: [u8; 3] = [0, 0, 0];
@@ -296,6 +322,40 @@ impl Destination {
                 LotFilter::Shopping,
             ],
         }
+    }
+
+    /// Filter buttons shown in the destination picker dialog header, in the
+    /// native left-to-right order. Only Magic Town uses the dialog header; the
+    /// order is measured against the 1.91 oracle (`flow-magic-hole-picker.png`).
+    pub const fn picker_filters(self) -> &'static [LotFilter] {
+        match self {
+            Self::MagicTown => &[
+                LotFilter::Rides,
+                LotFilter::SmallAnimal,
+                LotFilter::Shopping,
+                LotFilter::Gardening,
+                LotFilter::Food,
+                LotFilter::Recreation,
+                LotFilter::Magic,
+            ],
+            _ => &[],
+        }
+    }
+
+    /// Whether this destination's lot picker uses the full `dlgframe2.bmp`
+    /// dialog frame with a title header (Magic Town) instead of the plain
+    /// top bar (Downtown and the rest).
+    pub const fn picker_uses_dialog_frame(self) -> bool {
+        matches!(self, Self::MagicTown)
+    }
+
+    /// Whether this destination's Visit picker uses the native 1.91 layout
+    /// measured against the oracle (Downtown's plain bar, Magic Town's
+    /// dialog). Vacation Island, Old Town and Studio Town have no oracle
+    /// shot yet, so they keep the full bar with their filter strip rather
+    /// than lose filters a player may already have active.
+    pub const fn picker_is_native(self) -> bool {
+        matches!(self, Self::Downtown | Self::MagicTown)
     }
 
     /// Fallback bar fill RGB for this destination.
@@ -470,6 +530,9 @@ pub struct TravelState {
     pub magic_coins: i32,
     /// Active household's Simoleon balance (displayed in Visit / Magic / Vacation contexts).
     pub simoleons: i32,
+    /// Filters with no matching lot on the current map. The picker dialog
+    /// draws these with the disabled cell and ignores clicks on them.
+    pub unavailable_filters: Vec<LotFilter>,
 }
 
 impl Default for TravelState {
@@ -485,6 +548,7 @@ impl Default for TravelState {
             studio_fame_half_stars: 0,
             magic_coins: 0,
             simoleons: 0,
+            unavailable_filters: Vec::new(),
         }
     }
 }
@@ -524,6 +588,8 @@ pub struct TravelStrings {
     pub go_vacation_dialog: Vec<String>,
     pub visit_neighborhood: Vec<String>,
     pub visit_magic_town: Vec<String>,
+    /// `UIText.iff STR# 142` default dialog button labels (`OK`, `Cancel`, `Yes`, `No`).
+    pub dialog_buttons: Vec<String>,
 }
 
 impl TravelStrings {
@@ -563,7 +629,56 @@ impl TravelStrings {
             go_vacation_dialog: read_table(str_id::GO_VACATION_DIALOG)?,
             visit_neighborhood: read_table(str_id::VISIT_NEIGHBORHOOD)?,
             visit_magic_town: read_table(str_id::VISIT_MAGIC_TOWN)?,
+            dialog_buttons: read_table(str_id::DIALOG_BUTTONS)?,
         })
+    }
+
+    /// Picker dialog title for `destination` (`UIText.iff STR# 212[2]`,
+    /// "Where am I taking you?" for the Magic Town hole).
+    pub fn picker_title(&self, destination: Destination) -> Option<&str> {
+        match destination {
+            Destination::MagicTown => self.go_downtown_dialog.get(2),
+            _ => None,
+        }
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    }
+
+    /// Localized `OK` button label from `UIText.iff STR# 142[0]`.
+    pub fn dialog_ok(&self) -> &str {
+        self.dialog_buttons
+            .first()
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("OK")
+    }
+
+    /// Localized `Cancel` button label from `UIText.iff STR# 142[1]`.
+    pub fn dialog_cancel(&self) -> &str {
+        self.dialog_buttons
+            .get(1)
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("Cancel")
+    }
+
+    /// Localized `Yes` button label from `UIText.iff STR# 142[2]`.
+    pub fn dialog_yes(&self) -> &str {
+        self.dialog_buttons
+            .get(2)
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("Yes")
+    }
+
+    /// Localized `No` button label from `UIText.iff STR# 142[3]`.
+    pub fn dialog_no(&self) -> &str {
+        self.dialog_buttons
+            .get(3)
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("No")
     }
 
     /// Tooltip string for `control` on `destination`.
@@ -600,14 +715,113 @@ pub struct ControlPlacement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TravelLayout {
     pub frame_size: [i32; 2],
+    /// Top-left of the native `800×600` map area (`[112, 84]` at `1024×768`).
+    pub origin: [i32; 2],
     pub bar_rect: Rect,
     pub filter_strip_rect: Rect,
     pub status_badge_rect: Rect,
     pub controls: Vec<ControlPlacement>,
     pub compact: bool,
+    /// Picker dialog frame (`dlgframe2.bmp`, `800×600` at `origin`), if used.
+    pub dialog_rect: Option<Rect>,
+    /// Transparent map hole inside [`Self::dialog_rect`].
+    pub map_hole: Option<Rect>,
+    /// Area for the picker dialog title text.
+    pub title_rect: Option<Rect>,
+    /// Draw native-size button sprites at their hit rect's top-left (the
+    /// picker bar's oracle-measured columns) instead of centering them.
+    sprites_top_left: bool,
 }
 
 impl TravelLayout {
+    /// Whether `(x, y)` lies on chrome that should swallow map clicks.
+    pub fn blocks_map(&self, x: i32, y: i32) -> bool {
+        if self.bar_rect.contains(x, y) || self.filter_strip_rect.contains(x, y) {
+            return true;
+        }
+        if let (Some(dialog), Some(hole)) = (self.dialog_rect, self.map_hole) {
+            return dialog.contains(x, y) && !hole.contains(x, y);
+        }
+        self.controls.iter().any(|c| c.rect.contains(x, y))
+    }
+
+    /// Native lot-picker layout (`TravelBarMode::Visit` on viewports at least
+    /// `800` wide): the plain bar with centered Return / Bulldoze / Import for
+    /// Downtown, or the `dlgframe2.bmp` dialog with a title and
+    /// filter row for Magic Town. No destination tabs or wallet badge: the
+    /// 1.91 picker shows neither.
+    fn compute_picker(w: i32, h: i32, origin: [i32; 2], state: &TravelState) -> Self {
+        let [ox, oy] = origin;
+        let mut controls = Vec::new();
+        if state.destination.picker_uses_dialog_frame() {
+            let dialog = Rect::new(ox, oy, NATIVE_WIDTH, NATIVE_HEIGHT.min(h - oy));
+            let header_h = DIALOG_HEADER_HEIGHT.min(dialog.height);
+            let bar_rect = Rect::new(ox, oy, NATIVE_WIDTH, header_h);
+            let filters = state.destination.picker_filters();
+            let count = filters.len() as i32;
+            let start = ox + (NATIVE_WIDTH - count * PICKER_FILTER_CELL) / 2;
+            // The native dialog has no visible cancel control; Esc backs out.
+            for (i, &filter) in filters.iter().enumerate() {
+                controls.push(ControlPlacement {
+                    control: TravelControl::ToggleFilter(filter),
+                    rect: Rect::new(
+                        start + i as i32 * PICKER_FILTER_CELL,
+                        oy + PICKER_FILTER_Y,
+                        PICKER_FILTER_CELL,
+                        BAR_HEIGHT,
+                    ),
+                    enabled: !state.unavailable_filters.contains(&filter),
+                    active: state.active_filter == Some(filter),
+                });
+            }
+            return Self {
+                frame_size: [w, h],
+                origin,
+                bar_rect,
+                filter_strip_rect: Rect::new(ox, oy + header_h, NATIVE_WIDTH, 0),
+                status_badge_rect: Rect::new(ox, oy, 0, 0),
+                controls,
+                compact: false,
+                dialog_rect: Some(dialog),
+                map_hole: Some(DIALOG_MAP_HOLE.offset(ox, oy)),
+                title_rect: Some(Rect::new(ox, oy + 2, NATIVE_WIDTH, PICKER_FILTER_Y)),
+                sprites_top_left: true,
+            };
+        }
+
+        let bar_h = BAR_HEIGHT.min(h - oy).max(0);
+        let bar_rect = Rect::new(ox, oy, NATIVE_WIDTH, bar_h);
+        let items = [
+            (TravelControl::ReturnHome, true),
+            (TravelControl::Bulldoze, false),
+            (TravelControl::ImportLot, false),
+        ];
+        for ((control, enabled), x) in items.into_iter().zip(VISIT_BAR_BUTTON_X) {
+            controls.push(ControlPlacement {
+                control,
+                // Hit rects are trimmed to 49 px so the native columns
+                // (`323`, `373`, `422`) stay disjoint; sprites still draw at
+                // their full 53 px cell from the column's left edge.
+                rect: Rect::new(ox + x, oy, 49, bar_h),
+                enabled,
+                active: false,
+            });
+        }
+        Self {
+            frame_size: [w, h],
+            origin,
+            bar_rect,
+            filter_strip_rect: Rect::new(ox, oy + bar_h, NATIVE_WIDTH, 0),
+            status_badge_rect: Rect::new(ox, oy, 0, 0),
+            controls,
+            compact: false,
+            dialog_rect: None,
+            map_hole: None,
+            title_rect: None,
+            sprites_top_left: true,
+        }
+    }
+
     /// Computes pairwise-disjoint control placements for `width` × `height`.
     pub fn compute(width: u32, height: u32, state: &TravelState) -> Self {
         let w = i32::try_from(width).unwrap_or(i32::MAX).max(0);
@@ -616,16 +830,24 @@ impl TravelLayout {
 
         let bar_w = if compact { w } else { NATIVE_WIDTH };
         let bar_x = if compact { 0 } else { (w - bar_w) / 2 };
-        let bar_h = BAR_HEIGHT.min(h);
-        let bar_rect = Rect::new(bar_x, 0, bar_w, bar_h);
+        let oy = if !compact && h > NATIVE_HEIGHT {
+            (h - NATIVE_HEIGHT) / 2
+        } else {
+            0
+        };
+        if !compact && state.mode == TravelBarMode::Visit && state.destination.picker_is_native() {
+            return Self::compute_picker(w, h, [bar_x, oy], state);
+        }
+        let bar_h = BAR_HEIGHT.min(h - oy);
+        let bar_rect = Rect::new(bar_x, oy, bar_w, bar_h);
 
         let desired_strip_h = if compact {
             COMPACT_FILTER_STRIP_HEIGHT
         } else {
             FILTER_STRIP_HEIGHT
         };
-        let strip_h = desired_strip_h.min((h - bar_h).max(0));
-        let filter_strip_rect = Rect::new(bar_x, bar_h, bar_w, strip_h);
+        let strip_h = desired_strip_h.min((h - oy - bar_h).max(0));
+        let filter_strip_rect = Rect::new(bar_x, oy + bar_h, bar_w, strip_h);
 
         let mut controls = Vec::new();
         let is_visit = state.mode == TravelBarMode::Visit;
@@ -673,7 +895,7 @@ impl TravelLayout {
         };
         let status_badge_rect = Rect::new(
             bar_x + bar_w - badge_w - 6,
-            6.min(bar_h),
+            oy + 6.min(bar_h),
             (badge_w).max(0),
             (bar_h - 12).max(0),
         );
@@ -688,7 +910,7 @@ impl TravelLayout {
             53.min(((avail_top_w - gap * (count - 1)).max(0)) / count)
         };
         let btn_h = (bar_h - 6).max(0);
-        let btn_y = (bar_h - btn_h) / 2;
+        let btn_y = oy + (bar_h - btn_h) / 2;
 
         for (idx, (control, enabled, active)) in top_items.into_iter().enumerate() {
             let x = bar_x + left_pad + idx as i32 * (btn_w + gap);
@@ -755,11 +977,16 @@ impl TravelLayout {
 
         Self {
             frame_size: [w, h],
+            origin: [bar_x, oy],
             bar_rect,
             filter_strip_rect,
             status_badge_rect,
             controls,
             compact,
+            dialog_rect: None,
+            map_hole: None,
+            title_rect: None,
+            sprites_top_left: false,
         }
     }
 
@@ -872,21 +1099,25 @@ impl TravelChrome {
     ) -> TravelLayout {
         let layout = TravelLayout::compute(frame.width(), frame.height(), state);
 
-        // Top bar backdrop.
-        let bar_bg = art
-            .image(art_id::DOWNTOWN_BAR_BKG)
-            .or_else(|| art.image(art_id::NEIGHBORHOOD_BAR_BKG));
-        if !layout.compact
-            && let Some(img) = bar_bg
-        {
-            frame.draw_all(img, [layout.bar_rect.x, layout.bar_rect.y]);
+        if let Some(dialog) = layout.dialog_rect {
+            draw_picker_dialog(frame, &layout, dialog, state, art, strings);
         } else {
-            frame.fill(layout.bar_rect, state.destination.bar_fallback_bg());
-            draw_border(frame, layout.bar_rect, STRIP_BORDER);
+            // Top bar backdrop.
+            let bar_bg = art
+                .image(art_id::DOWNTOWN_BAR_BKG)
+                .or_else(|| art.image(art_id::NEIGHBORHOOD_BAR_BKG));
+            if !layout.compact
+                && let Some(img) = bar_bg
+            {
+                frame.draw_all(img, [layout.bar_rect.x, layout.bar_rect.y]);
+            } else {
+                frame.fill(layout.bar_rect, state.destination.bar_fallback_bg());
+                draw_border(frame, layout.bar_rect, STRIP_BORDER);
+            }
         }
 
         // Destination emblem on left of top bar when non-compact.
-        if !layout.compact {
+        if !layout.compact && layout.dialog_rect.is_none() {
             let logo_id = match state.destination {
                 Destination::VacationIsland => art_id::VACATION_LOGO,
                 Destination::StudioTown => art_id::STUDIO_TOWN_LOGO,
@@ -894,7 +1125,7 @@ impl TravelChrome {
             };
             if let Some(logo) = art.image(logo_id) {
                 let ly = layout.bar_rect.y + (layout.bar_rect.height - logo.height as i32) / 2;
-                frame.draw_all(logo, [layout.bar_rect.x + 4, ly.max(0)]);
+                frame.draw_all(logo, [layout.bar_rect.x + LOGO_X, ly.max(0)]);
             }
         }
 
@@ -945,8 +1176,14 @@ impl TravelChrome {
                 && sprite.width as i32 <= placement.rect.width + 6
                 && sprite.height as i32 <= placement.rect.height + 6
             {
-                let sx = placement.rect.x + (placement.rect.width - sprite.width as i32) / 2;
-                let sy = placement.rect.y + (placement.rect.height - sprite.height as i32) / 2;
+                let (sx, sy) = if layout.sprites_top_left {
+                    (placement.rect.x, placement.rect.y)
+                } else {
+                    (
+                        placement.rect.x + (placement.rect.width - sprite.width as i32) / 2,
+                        placement.rect.y + (placement.rect.height - sprite.height as i32) / 2,
+                    )
+                };
                 frame.draw_all(&sprite, [sx, sy]);
             } else {
                 let bg = match placement.control {
@@ -999,6 +1236,87 @@ impl TravelChrome {
         }
 
         layout
+    }
+}
+
+/// Draws the Magic Town picker dialog: `dlgframe2.bmp` (`5432`) over the map,
+/// its header gap filled, and the `STR# 212` title.
+fn draw_picker_dialog(
+    frame: &mut Frame,
+    layout: &TravelLayout,
+    dialog: Rect,
+    state: &TravelState,
+    art: &Art,
+    strings: &TravelStrings,
+) {
+    if let Some(img) = art.image(art_id::DIALOG_FRAME_ALT) {
+        frame.draw_all(img, [dialog.x, dialog.y]);
+        fill_dialog_header_gap(frame, img, [dialog.x, dialog.y]);
+    } else {
+        let bg = state.destination.bar_fallback_bg();
+        frame.fill(layout.bar_rect, bg);
+        draw_border(frame, layout.bar_rect, STRIP_BORDER);
+        if let Some(hole) = layout.map_hole {
+            let right = hole.x + hole.width;
+            let bottom = hole.y + hole.height;
+            frame.fill(
+                Rect::new(dialog.x, hole.y, hole.x - dialog.x, hole.height),
+                bg,
+            );
+            frame.fill(
+                Rect::new(right, hole.y, dialog.x + dialog.width - right, hole.height),
+                bg,
+            );
+            frame.fill(
+                Rect::new(
+                    dialog.x,
+                    bottom,
+                    dialog.width,
+                    dialog.y + dialog.height - bottom,
+                ),
+                bg,
+            );
+        }
+    }
+    if let (Some(rect), Some(title)) = (layout.title_rect, strings.picker_title(state.destination))
+        && let Some(font) = pick_font(art, 12)
+    {
+        draw_centered_text(frame, font, rect, title, TEXT_LIGHT);
+    }
+}
+
+/// The native header behind the title and filter row is a horizontal bevel
+/// gradient, but `dlgframe2.bmp` leaves those columns transparent. Fill each
+/// header row by interpolating between the opaque pixels bordering its gap,
+/// which reproduces the oracle header within the ratchet tolerance.
+fn fill_dialog_header_gap(frame: &mut Frame, img: &Image, at: [i32; 2]) {
+    let rows = (DIALOG_HEADER_HEIGHT as u32).min(img.height);
+    for y in 0..rows {
+        let transparent = |x: u32| img.pixel(x, y).is_some_and(|p| p[3] == 0);
+        let Some(first) = (0..img.width).find(|&x| transparent(x)) else {
+            continue;
+        };
+        let Some(last) = (0..img.width).rev().find(|&x| transparent(x)) else {
+            continue;
+        };
+        if first == 0 || last + 1 >= img.width {
+            continue;
+        }
+        let (Some(left), Some(right)) = (img.pixel(first - 1, y), img.pixel(last + 1, y)) else {
+            continue;
+        };
+        let span = (last + 2 - first) as i32;
+        for x in first..=last {
+            let t = (x + 1 - first) as i32;
+            let mix = |i: usize| {
+                let (l, r) = (i32::from(left[i]), i32::from(right[i]));
+                (l + (r - l) * t / span) as u8
+            };
+            frame.fill(
+                Rect::new(at[0] + x as i32, at[1] + y as i32, 1, 1),
+                [mix(0), mix(1), mix(2)],
+            );
+        }
     }
 }
 
@@ -1185,6 +1503,8 @@ impl TravelDialogLayout {
 /// Interactive controller for the travel confirmation dialog.
 #[derive(Debug, Clone, Default)]
 pub struct TravelDialog {
+    hovered_confirm: bool,
+    hovered_cancel: bool,
     pressed_confirm: bool,
     pressed_cancel: bool,
 }
@@ -1192,6 +1512,12 @@ pub struct TravelDialog {
 impl TravelDialog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Tracks hover state over Confirm and Cancel buttons.
+    pub fn pointer_move(&mut self, x: i32, y: i32, layout: &TravelDialogLayout) {
+        self.hovered_confirm = layout.confirm_rect.contains(x, y);
+        self.hovered_cancel = layout.cancel_rect.contains(x, y);
     }
 
     /// Handles `Enter` (confirm if affordable) or `Escape` (cancel).
@@ -1252,27 +1578,38 @@ impl TravelDialog {
             return layout;
         }
 
-        // Dim background behind modal dialog.
+        // Dim background behind modal dialog, then render native 9-sliced
+        // `PopupInfoTiles.bmp` (`3008`) chrome (falling back to solid fill only
+        // when UI art is absent).
         fill_alpha(
             frame,
             Rect::new(0, 0, frame.width() as i32, frame.height() as i32),
             [0, 0, 0],
             120,
         );
-        frame.fill(layout.panel_rect, DIALOG_BG);
-        draw_border(frame, layout.panel_rect, DIALOG_BORDER);
+        if let Some(tiler) = art.image(DIALOG_BACKGROUND)
+            && tiler.width >= 3
+            && tiler.height >= 3
+        {
+            draw_nine_slice(frame, tiler, layout.panel_rect);
+        } else {
+            frame.fill(layout.panel_rect, DIALOG_BG);
+            draw_border(frame, layout.panel_rect, DIALOG_BORDER);
+        }
 
         let title = state
             .title_override
             .as_deref()
             .filter(|s| !s.is_empty())
             .or_else(|| match state.destination {
-                Destination::Downtown => strings.go_downtown_dialog.first().map(String::as_str),
+                Destination::Downtown | Destination::OldTown => {
+                    strings.go_downtown_dialog.first().map(String::as_str)
+                }
                 Destination::VacationIsland => {
                     strings.go_vacation_dialog.first().map(String::as_str)
                 }
-                Destination::OldTown => strings.visit_neighborhood.first().map(String::as_str),
-                Destination::StudioTown | Destination::MagicTown => None,
+                Destination::StudioTown => strings.go_downtown_dialog.get(1).map(String::as_str),
+                Destination::MagicTown => strings.go_downtown_dialog.get(2).map(String::as_str),
             })
             .unwrap_or_else(|| state.destination.short_label());
 
@@ -1341,33 +1678,136 @@ impl TravelDialog {
             }
         }
 
-        // Confirm and Cancel buttons.
-        let confirm_bg = if state.can_confirm() {
-            BTN_CONFIRM_BG
+        // Native 4-state `WinBtn.bmp` (`17`) Confirm (`STR# 142[0]` OK) and
+        // Cancel (`STR# 142[1]` Cancel) buttons.
+        let confirm_cell: u32 = if !state.can_confirm() {
+            3
+        } else if self.pressed_confirm && self.hovered_confirm {
+            1
+        } else if self.hovered_confirm {
+            2
         } else {
-            CHIP_DISABLED_BG
+            0
         };
-        frame.fill(layout.confirm_rect, confirm_bg);
-        draw_border(frame, layout.confirm_rect, DIALOG_BORDER);
-        frame.fill(layout.cancel_rect, BTN_CANCEL_BG);
-        draw_border(frame, layout.cancel_rect, DIALOG_BORDER);
-
-        if let Some(f) = pick_font(art, 10) {
-            draw_centered_text(
-                frame,
-                f,
-                layout.confirm_rect,
-                "Go",
-                if state.can_confirm() {
-                    TEXT_LIGHT
-                } else {
-                    TEXT_MUTED
-                },
-            );
-            draw_centered_text(frame, f, layout.cancel_rect, "Cancel", TEXT_LIGHT);
-        }
+        let cancel_cell: u32 = if self.pressed_cancel && self.hovered_cancel {
+            1
+        } else if self.hovered_cancel {
+            2
+        } else {
+            0
+        };
+        draw_travel_dialog_button(
+            frame,
+            art,
+            layout.confirm_rect,
+            confirm_cell,
+            strings.dialog_ok(),
+            state.can_confirm(),
+        );
+        draw_travel_dialog_button(
+            frame,
+            art,
+            layout.cancel_rect,
+            cancel_cell,
+            strings.dialog_cancel(),
+            true,
+        );
 
         layout
+    }
+}
+
+fn draw_travel_dialog_button(
+    frame: &mut Frame,
+    art: &Art,
+    rect: Rect,
+    cell: u32,
+    label: &str,
+    enabled: bool,
+) {
+    if rect.width <= 0 || rect.height <= 0 {
+        return;
+    }
+    if let Some(sheet) = art.image(DIALOG_BUTTON)
+        && sheet.width >= 4
+        && sheet.height > 0
+    {
+        let cw = (sheet.width / 4) as i32;
+        let ch = sheet.height as i32;
+        let sx = cw.saturating_mul(cell.min(3) as i32);
+        let cap = (cw / 4).min(rect.width / 2).max(1);
+        let mid_src_w = (cw - cap * 2).max(1);
+        let mid_dst_w = (rect.width - cap * 2).max(0);
+        blit_scaled_region(
+            frame,
+            sheet,
+            Rect::new(sx, 0, cap, ch),
+            Rect::new(rect.x, rect.y, cap, rect.height),
+        );
+        if mid_dst_w > 0 {
+            blit_scaled_region(
+                frame,
+                sheet,
+                Rect::new(sx + cap, 0, mid_src_w, ch),
+                Rect::new(rect.x + cap, rect.y, mid_dst_w, rect.height),
+            );
+        }
+        blit_scaled_region(
+            frame,
+            sheet,
+            Rect::new(sx + cw - cap, 0, cap, ch),
+            Rect::new(rect.x + rect.width - cap, rect.y, cap, rect.height),
+        );
+    } else {
+        let fill = if !enabled {
+            CHIP_DISABLED_BG
+        } else if cell == 1 {
+            [22, 112, 168]
+        } else if cell == 2 {
+            [64, 96, 196]
+        } else {
+            [38, 60, 148]
+        };
+        frame.fill(rect, fill);
+        draw_border(frame, rect, DIALOG_BORDER);
+    }
+    let text_color = if !enabled {
+        TEXT_MUTED
+    } else if cell == 1 {
+        [0, 255, 255]
+    } else if cell == 2 {
+        [255, 255, 255]
+    } else {
+        TEXT_LIGHT
+    };
+    if let Some(f) = pick_font(art, 10) {
+        draw_centered_text(frame, f, rect, label, text_color);
+    }
+}
+
+fn blit_scaled_region(frame: &mut Frame, img: &sims_formats::bitmap::Image, src: Rect, dest: Rect) {
+    if src.width <= 0 || src.height <= 0 || dest.width <= 0 || dest.height <= 0 {
+        return;
+    }
+    let fw = i32::try_from(frame.width()).unwrap_or(i32::MAX);
+    let fh = i32::try_from(frame.height()).unwrap_or(i32::MAX);
+    let x0 = dest.x.max(0);
+    let y0 = dest.y.max(0);
+    let x1 = dest.x.saturating_add(dest.width).min(fw);
+    let y1 = dest.y.saturating_add(dest.height).min(fh);
+    for y in y0..y1 {
+        let sy = src.y
+            + ((i64::from(y - dest.y) * i64::from(src.height)) / i64::from(dest.height)) as i32;
+        for x in x0..x1 {
+            let sx = src.x
+                + ((i64::from(x - dest.x) * i64::from(src.width)) / i64::from(dest.width)) as i32;
+            if let (Ok(ux), Ok(uy)) = (u32::try_from(sx), u32::try_from(sy))
+                && let Some([r, g, b, a]) = img.pixel(ux, uy)
+                && a > 0
+            {
+                frame.blend(x, y, [r, g, b], a);
+            }
+        }
     }
 }
 

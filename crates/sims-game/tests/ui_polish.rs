@@ -1,8 +1,9 @@
 //! Headless integration tests for interactive UX polish:
 //! - `--debug` top diagnostic banner gating (off by default, preserved programmatic getters,
 //!   native `cTSWinMsgBox` user-facing notice dialogs)
-//! - Zero Live-mode `CamViewAlbum` overlap + bottom-strip Camera sub-strip (Take Snapshot &
-//!   Photo Album) + direct `F10` path
+//! - Zero Live-mode `CamViewAlbum` overlap + bottom-strip Camera sub-strip (native
+//!   `cWinCamera` controls only, as `Sims.exe` 1.91 `camera-strip.png` shows; a snapshot is
+//!   a click on the lot) + Photo Album + direct `F10` path
 //! - Neighborhood idle `highlight_hovered == false` (active only in Move-In, Bulldoze, or
 //!   Community Filter modes), smooth `water_frame` ripple ticking, and 275 ms hover-card
 //!   debounce with immediate leave clear
@@ -178,40 +179,33 @@ fn live_mode_has_no_cam_view_album_overlap_and_camera_button_toggles_substrip() 
     shell.release(cam_pt);
     shell.render();
 
-    let (strip_rect, snap_rect, album_rect) = {
+    let (strip_rect, album_rect) = {
         let game = shell.game().expect("active game");
         assert!(game.camera_strip_open());
         let strip = game.camera_strip_rect().expect("Camera sub-strip rect");
-        let snap = game
-            .camera_snapshot_button_rect()
-            .expect("Take Snapshot rect");
+        // `Sims.exe` 1.91 `camera-strip.png`: no synthetic Take Snapshot button.
+        assert!(
+            game.camera_snapshot_button_rect().is_none(),
+            "native cWinCamera has no Take Snapshot button"
+        );
         let album = game.album_button_rect().expect("Photo Album rect");
         // Strictly to the right of the 220px Live Mode cluster (zero overlap with clock/speed/Camera).
         assert!(
             strip.x >= sims_ui::hud::CLUSTER[0],
             "strip_rect {strip:?} overlaps Live cluster"
         );
-        assert!(snap.x >= sims_ui::hud::CLUSTER[0]);
         assert!(album.x >= sims_ui::hud::CLUSTER[0]);
-        assert!(
-            snap.x + snap.width <= album.x || album.x + album.width <= snap.x,
-            "Take Snapshot ({snap:?}) and Photo Album ({album:?}) must not overlap"
-        );
-        (strip, snap, album)
+        (strip, album)
     };
     assert!(strip_rect.width > 0 && strip_rect.height >= sims_ui::hud::STRIP);
 
-    // Clicking Take Snapshot emits `photo == true` and closes the Camera sub-strip.
-    let snap_pt = [
-        snap_rect.x + snap_rect.width / 2,
-        snap_rect.y + snap_rect.height / 2,
-    ];
-    shell.press(snap_pt);
-    let snap_out = shell.release(snap_pt);
-    assert!(snap_out.photo, "Take Snapshot must emit photo outcome");
+    // A click on the lot takes the snapshot and closes the Camera sub-strip.
+    let snap_out = shell.press([400, 200]);
+    shell.release([400, 200]);
+    assert!(snap_out.photo, "a lot click in Camera Mode must emit photo");
     assert!(
         !shell.game().expect("active game").camera_strip_open(),
-        "Take Snapshot closes the Camera sub-strip"
+        "the snapshot closes the Camera sub-strip"
     );
 
     // Re-open Camera sub-strip and click Photo Album -> opens PhotoAlbumDialog.

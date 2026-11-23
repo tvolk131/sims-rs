@@ -34,6 +34,7 @@ cpal = "0.18.2"
 
 [dev-dependencies]
 sha2.workspace = true
+flate2.workspace = true
 
 # The screenshot ratchet prints its skip and its table even when it
 # passes, so it runs without the test harness.

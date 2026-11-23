@@ -713,9 +713,18 @@ impl Hud {
     }
 
     /// Replaces the cached neighborhood family table used for ordinary VM dialog
-    /// `$Family` / `$FamilyAssets:N` formatting.
+    /// `$Family` / `$FamilyAssets:N` formatting and Spellbook/Cookbook titles.
     pub fn set_families(&mut self, families: std::collections::BTreeMap<i32, dialog::FamilyInfo>) {
         self.families = families;
+    }
+
+    /// Returns the household's localized family surname (`FAMs`) for `family_id`,
+    /// if present and non-empty.
+    pub fn family_surname(&self, family_id: i32) -> Option<&str> {
+        self.families
+            .get(&family_id)
+            .map(|f| f.name.trim())
+            .filter(|s| !s.is_empty())
     }
 
     /// Forgets what the panel kept of the lot it showed, for a lot put
@@ -2704,19 +2713,12 @@ impl Hud {
         let strip = CameraPanel::strip_rect([size[0].max(0) as u32, size[1].max(0) as u32]);
         let state = self.camera_state();
         let layout = CameraLayout::compute(strip, &state, &self.camera_strings, &self.art);
-        // Place the Take Snapshot (`CamSnap`) button cleanly to the right of
-        // `CamViewAlbum` (`226 + 61 = 287`) when strip width permits, never
-        // overlapping any of the 8 native `cWinCamera` buttons or toothpicks.
-        let snap_rect = if !layout.compact && strip.width >= CameraLayout::MIN_NATIVE_WIDTH + 56 {
-            let x = strip.x.saturating_add(304);
-            let right_room = strip.x.saturating_add(strip.width).saturating_sub(x + 8);
-            let w = right_room.clamp(48, 132);
-            Some(Rect::new(x, strip.y.saturating_add(34), w, 36))
-        } else {
-            None
-        };
+        // Verified directly against Sims.exe 1.91 `camera-strip.png`: native
+        // `cWinCamera` displays only its 8 controls (3 sizes, 3 qualities,
+        // divider, and Photo Album) — snapshots are taken by clicking the lot
+        // viewport, with no synthetic button injected into the strip.
         self.camera_strip_rect = Some(strip);
-        self.camera_snapshot_rect = snap_rect;
+        self.camera_snapshot_rect = None;
         self.camera_layout = Some(layout);
     }
 
@@ -2735,58 +2737,6 @@ impl Hud {
             self.camera_panel
                 .draw(frame, strip, &state, &self.camera_strings, &self.art, true);
         self.camera_layout = Some(layout);
-
-        if let Some(snap_rect) = self.camera_snapshot_rect {
-            self.draw_camera_snapshot_button(frame, snap_rect);
-        }
-    }
-
-    fn draw_camera_snapshot_button(&self, frame: &mut Frame, rect: Rect) {
-        let hovered = self
-            .controls
-            .pointer
-            .is_some_and(|[px, py]| rect.contains(px, py));
-        let pressed = self.pressed_camera_snapshot;
-        let (bg, border) = if pressed && hovered {
-            ([30, 88, 176], [0, 255, 255])
-        } else if hovered {
-            ([26, 62, 146], [136, 178, 232])
-        } else {
-            ([16, 36, 108], [88, 120, 204])
-        };
-        frame.fill(rect, bg);
-        frame.fill(Rect::new(rect.x, rect.y, rect.width, 1), border);
-        frame.fill(
-            Rect::new(rect.x, rect.y + rect.height - 1, rect.width, 1),
-            border,
-        );
-        frame.fill(Rect::new(rect.x, rect.y, 1, rect.height), border);
-        frame.fill(
-            Rect::new(rect.x + rect.width - 1, rect.y, 1, rect.height),
-            border,
-        );
-        if let Some(strip) = self.art.image(hud::id::PHOTO)
-            && strip.width >= 4
-            && strip.height > 0
-        {
-            let cell_w = strip.width / 4;
-            let state = if pressed && hovered {
-                2
-            } else if hovered {
-                3
-            } else {
-                1
-            };
-            let src = Rect::new(
-                (cell_w * state) as i32,
-                0,
-                cell_w as i32,
-                strip.height as i32,
-            );
-            let dx = rect.x + (rect.width - cell_w as i32) / 2;
-            let dy = rect.y + (rect.height - strip.height as i32) / 2;
-            frame.draw(strip, src, [dx, dy]);
-        }
     }
 
     /// A line of text on a band across the top of the frame; the band.

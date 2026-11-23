@@ -1353,3 +1353,99 @@ fn options_saves_and_coop_buttons_never_overlap_any_subpanel_widget_across_resol
         assert_eq!(community.buy_state().category, Some(0));
     }
 }
+
+/// A phone book preview in front of a text-entry dialog takes every key:
+/// Enter, Escape, typing, Backspace and the caret keys never edit or submit
+/// the field behind it. Once it closes, the field works as before.
+#[test]
+fn a_phone_book_preview_takes_keys_before_a_text_entry_behind_it() {
+    let Some(root) = install_root() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        install: root.clone(),
+        house: root.join("UserData/Houses/House90.iff"),
+        answers: Vec::new(),
+        play: false,
+        frames: Frames {
+            after: Vec::new(),
+            every: Vec::new(),
+        },
+    })
+    .unwrap();
+    game.resize([800, 600]);
+    game.render();
+    let opt_btn = find_command_point(&game, &Command::SetMode(Mode::Options));
+    game.press(opt_btn);
+    game.render();
+    let save_btn = find_command_point(&game, &Command::OptionsAction(OptionsAction::Save));
+    game.press(save_btn);
+    game.release(save_btn);
+    assert!(game.has_dialog_entry(), "the Save Card has a text field");
+    for ch in "ab".chars() {
+        assert!(game.type_dialog_char(ch));
+    }
+    assert_eq!(game.dialog_entry(), Some("ab"));
+
+    let world = game.lot().world().clone();
+    // A caller missing from the world has no relationships, so the book is
+    // empty no matter what the saved neighborhood holds.
+    let neighbor = (1..=i16::MAX)
+        .find(|id| !world.neighbors.slots.iter().flatten().any(|r| r.id == *id))
+        .expect("a free neighbor id");
+    let preview = |game: &mut Game| {
+        game.preview_special_panel(
+            sims_vm::SpecialPanelRequest::CallNeighbor {
+                caller_neighbor: neighbor,
+            },
+            &world,
+        );
+        game.render();
+        assert!(game.phonebook_snapshot().is_some(), "the phone book is up");
+    };
+
+    preview(&mut game);
+    assert!(
+        !game.has_dialog_entry(),
+        "the desktop routes keys to the phone book, not the text field"
+    );
+    assert!(!game.dialog_enter_is_newline());
+    assert!(!game.type_dialog_char('z'));
+    assert!(!game.dialog_backspace());
+    assert!(!game.dialog_delete());
+    assert!(!game.dialog_move_left());
+    assert!(!game.dialog_home());
+    assert!(!game.dialog_switch_field());
+    let _ = game.dialog_confirm_key(DialogKey::Char('z'));
+    assert_eq!(
+        game.dialog_entry(),
+        Some("ab"),
+        "typing never reaches the field"
+    );
+    // Enter goes to the phone book (empty here: nobody to call, so it
+    // stays up) and never submits the Save Card behind it.
+    let out = game.dialog_submit();
+    assert!(!out.save, "Enter does not submit the Save Card");
+    assert!(
+        game.phonebook_snapshot().is_some(),
+        "Enter went to the phone book"
+    );
+    assert_eq!(game.dialog_entry(), Some("ab"));
+
+    let out = game.dialog_confirm_key(DialogKey::Escape);
+    assert!(!out.save);
+    assert!(
+        game.phonebook_snapshot().is_none(),
+        "Escape closed the phone book"
+    );
+    assert!(game.has_dialog_entry(), "the Save Card is still up");
+    assert_eq!(game.dialog_entry(), Some("ab"));
+
+    // With the phone book gone the field edits and submits as before.
+    assert!(game.dialog_backspace());
+    assert!(game.type_dialog_char('c'));
+    assert_eq!(game.dialog_entry(), Some("ac"));
+    let out = game.dialog_submit();
+    assert!(out.save, "Enter submits the typed name");
+    assert_eq!(game.lot_name(), "ac");
+}
