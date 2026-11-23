@@ -20,8 +20,10 @@ written.
   line that drops it). If in doubt, it stays. See
   `docs/decisions/20261123-legacy-crate-by-crate-cleanup.md`.
 - **Everything stays recoverable** from the tag `legacy-final` (e1b72647). A
-  citation of a deleted crate is written `legacy-final:legacy/crates/<crate>/...`;
-  read it with `git show legacy-final:legacy/crates/<crate>/<path>`.
+  citation of a deleted crate is written `legacy-final:crates/<crate>/...`. The
+  tag predates the move under `legacy/`, so `legacy/crates/<crate>/<path>` here
+  is `crates/<crate>/<path>` there. Read it with
+  `git show legacy-final:crates/<crate>/<path>`.
 
 ## Crates
 

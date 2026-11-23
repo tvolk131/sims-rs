@@ -2,7 +2,7 @@
 
 - **Date:** 2026-11-23
 - **Status:** Accepted
-- **Scope:** `legacy/crates/`, `legacy/README.md`, `docs/salvage-audit.md`, `docs/legacy-mining-audit.md`
+- **Scope:** `legacy/crates/`, `legacy/README.md`, `docs/salvage-audit.md`, `docs/legacy-mining-audit.md` (new; added to the public-docs allowlist in `.gitignore` and `scripts/check_repository.py`)
 
 ## Context
 
@@ -56,10 +56,13 @@ The user changed the rule on 2026-11-23:
    consolidated porting backlog. A crate becomes deletable when every backlog
    item for it is ported, or explicitly dropped with a cited reason.
 4. **Cite a deleted crate through the tag.** Outside `legacy/`, write
-   `legacy-final:legacy/crates/<crate>/<path>`; it resolves with
-   `git show legacy-final:legacy/crates/<crate>/<path>`. When a crate is deleted,
-   rewrite every `legacy/crates/<crate>/` citation in the same change. This
-   round needed no rewrites.
+   `legacy-final:crates/<crate>/<path>`, and it resolves with
+   `git show legacy-final:crates/<crate>/<path>`. The tag predates the move under
+   `legacy/`, so the `legacy/` prefix is dropped. When a crate is deleted,
+   rewrite every `legacy/crates/<crate>/<path>` citation to that form in the same
+   change. This round needed no rewrites: the three removed crates are
+   byte-identical at the tag and on `main` before deletion, and nothing outside
+   `legacy/` cited them.
 5. **Delete one crate or group per PR, each opened after the previous one merges.**
    Each PR updates:
    - `legacy/README.md`;

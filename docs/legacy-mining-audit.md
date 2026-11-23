@@ -52,8 +52,10 @@ knowledge.
 | sims-vm | 100k | stays | 8 | [sims-vm](#sims-vm--stays) |
 | sims-sim | 187k | stays | ~20 | [sims-sim](#sims-sim--stays) |
 
-Citations of the removed crates are written `legacy-final:legacy/crates/<crate>/...`. Read
-them with `git show legacy-final:legacy/crates/<crate>/<path>`.
+Citations of the removed crates are written `legacy-final:crates/<crate>/...`. The tag
+predates the move under `legacy/`, so a path `legacy/crates/<crate>/<path>` in today's tree
+is `crates/<crate>/<path>` at the tag. Read it with `git show legacy-final:crates/<crate>/<path>`.
+The three removed crates are byte-identical at the tag and just before their deletion.
 
 ## Porting backlog
 
@@ -63,7 +65,7 @@ the details, the legacy line ranges and the evidence. Several items overlap acro
 cited reason.
 
 **sims-formats**
-1. Parity for an empty SKN texture line. The original reader skips empty lines, so three EP7 meshes fail to load, but `crates/sims-formats/src/avatar/text.rs:214` accepts them. Settle it with the oracle.
+1. Parity for an empty SKN texture line. Legacy evidence says the original reader skips empty lines, which would make three EP7 meshes fail to load, but `crates/sims-formats/src/avatar/text.rs:214` accepts them. Settle it with the oracle.
 2. Re-express the catalog short-read tests and the synthetic text-avatar rejection tests.
 
 **sims-runtime**
@@ -115,7 +117,7 @@ cited reason.
 3. Route-cache invalidation on house refresh (`0x444805`/`0x46387c`) and the resume states.
 4. "Go Here" ground click (`0x48cbec`, marker `0x7c4`).
 5. Layer masking when posing.
-6. The house's architecture value (`0x47b006`), and body scale from word 85 (`0x5a0932`).
+6. The house's architecture value on the day turn: the load path computes it (`crates/sims-vm/src/lifecycle.rs:524-680`), but `daily.rs` leaves it stale, and the walls-only global-22 case (`0x4795c5`) fails. Also body scale from word 85 (`0x5a0932`).
 7. The original wall draw order (`0x5404b5`, `0x5409ab`, `0x53f1db`).
 8. Linear camera glide (`0x4c9a27`).
 9. Floating text over a person (lifetime, styles, `sting_char_winner`).
@@ -140,7 +142,7 @@ Low priority:
 **Verdict: DELETE-SAFE (removed in this change).** 5.5k lines with no game knowledge. Every
 module is a Rust-port authority for Win32 named mutexes and anonymous events. Nothing in it
 names a Sims.exe address, a game object or a file format: there are no `0x4xxxxx`–`0x6xxxxx`
-addresses, and the only hex constant is a protocol test value. No file outside `legacy/` cites
+addresses. Its hex literals are broker wire-protocol tags (`0x81`–`0x86`) and test values. No file outside `legacy/` cites
 the crate.
 
 | Legacy module/area | Knowledge | Status | Evidence |
@@ -190,10 +192,10 @@ so the crate stays.
 | Legacy module/area | Knowledge | Status | Evidence |
 | --- | --- | --- | --- |
 | `src/pe32.rs` (+`pe32/tests.rs`) | Bounded PE32/I386 reader for the executable's initial image (sections, imports) | deliberately dropped | salvage-audit (formats): "drop `far/mount.rs` and `pe32` (oracle tooling only)". No current crate reads Sims.exe bytes |
-| `src/far/mount.rs`, `tests/far_mount.rs` | Native incremental FAR mount (0x5b9dbc): magic and version are not validated; the signed count is read at the manifest offset; a name of 2048 bytes or more fails ("native mount buffer"); a name is cut at its first NUL | deliberately dropped | salvage-audit (formats), as above. `crates/sims-formats/src/far.rs:83` validates more strictly (32 KiB cap, embedded NUL rejected). This only matters for malformed archives, and those facts are recorded here |
+| `src/far/mount.rs`, `tests/far_mount.rs` | Native incremental FAR mount (0x5b9dbc): magic and version are not validated; the signed count is read at the manifest offset; a name of 2048 bytes or more fails ("native mount buffer"); a name is cut at its first NUL. The native catalog manager registers the archive and publishes each member as it is read, so a short read leaves earlier members visible and the archive registered, and a retry takes the already-mounted branch (see legacy `sims-sim/src/pose/clothing/catalog_mount.rs:121`) | deliberately dropped | salvage-audit (formats), as above. `crates/sims-formats/src/far.rs:83` validates more strictly (32 KiB cap, embedded NUL rejected). `crates/sims-content/src/index.rs` parses a whole directory before registering any member, so partial mounting is not reproduced, and names between 2048 bytes and 32 KiB are accepted. All of these differences only show on malformed archives. They are recorded here as a deliberate drop |
 | `tests/resource_map.rs` `map_ordinal_order_overrides_file_and_numeric_id_order` | `rsmp` order decides resource order over file and ID order | ported | `crates/sims-formats/tests/boundaries.rs` `a_resource_map_decides_lookup_as_well_as_order`, `a_resource_map_can_choose_the_earlier_chunk`, `only_version_2_5_headers_name_a_resource_map` |
 | `tests/catalog.rs` (2 public tests) | Binary avatar catalog: a native short read on a count returns "none" and keeps earlier successes; the next count read then errors; three groups decode and leave a tail unread | ported in code, **tests to re-express** | Behavior is in `crates/sims-formats/src/avatar/catalog.rs:60-62` (doc: "None represents the native count reader's short-read failure"). No current test pins it |
-| `tests/skn_texture_names.rs` | **The original's SKN name reader skips empty lines.** With an empty texture line, the bone count (`1`) is taken as the texture and parsing then fails ("invalid avatar integer"). Three EP7 meshes (`xskin-funhousecart-ROOT-CART.skn` at offset 0x27, and `xskin-magic-wizeyelashes-R_HAND-WAX_JAR01/08.skn` at 0x36) fail to load in the original | **still to mine** | `crates/sims-formats/src/avatar/text.rs:214-216` deliberately *accepts* an empty texture line ("EP7's untextured fun-house cart skins"), and `tests/avatar_codecs/avatar.rs` `skn_texture_line_may_be_empty` pins that. This disagrees with the native evidence in legacy. Decide on parity: either the original never draws these meshes, or the legacy finding is wrong |
+| `tests/skn_texture_names.rs` | **The original's SKN name reader skips empty lines.** With an empty texture line, the bone count (`1`) is taken as the texture and parsing then fails ("invalid avatar integer"). Three EP7 meshes (`xskin-funhousecart-ROOT-CART.skn` at offset 0x27, and `xskin-magic-wizeyelashes-R_HAND-WAX_JAR01/08.skn` at 0x36) fail to load. The native token sequence comes from a private-fixture test; the three-mesh test ran the legacy Rust reader. Whether the original game fails to draw these meshes is still an oracle question | **still to mine** | `crates/sims-formats/src/avatar/text.rs:214-216` deliberately *accepts* an empty texture line ("EP7's untextured fun-house cart skins"), and `tests/avatar_codecs/avatar.rs` `skn_texture_line_may_be_empty` pins that. This disagrees with the native evidence in legacy. Decide on parity: either the original never draws these meshes, or the legacy finding is wrong |
 | `tests/text_avatar.rs` `text_avatar_rejects_invalid_or_unrepresented_data` | CMX `version 301`, nonzero trailing counts, NUL in names and trailing bytes are rejected; SKN out-of-range indices, NaN, oversize blends (32769), huge counts and incomplete lines are rejected | ported in code, **tests to re-express** | `crates/sims-formats/src/avatar/text.rs` enforces these bounds. The legacy test was gated on a private fixture, but its rejection cases are synthetic |
 | `tests/{career,neighborhood,surface_map,legacy_rle,resource_map(native),catalog(native motion),text_avatar(native)}.rs` | Native-reader parity on private captures | not minable (fixture JSON absent) | The `tests/fixtures/*.json` files were never public. The parsers are in `crates/sims-formats/src/{career,neighborhood,lot,legacy_sprite,iff,avatar}.rs` |
 
@@ -221,7 +223,7 @@ The crate still holds two items that are not yet mined:
 - the salvage audit's one **PORT** item, `exploration.rs` (the seeded command fuzzer comparing a warm fork with a cold restore, plus delta-debug minimisation). Nothing equivalent exists in `crates/`.
 - the **REFERENCE** comparator skeleton in `fixture_replay.rs`. The oracle comparison that would absorb it is still in private comparison scripts outside the repository.
 
-Both are pure Rust with no native dependencies (anyhow, serde, sha2, serde_json) and have synthetic unit tests. Once they are ported, or the user explicitly waives them in favour of the `legacy-final` tag, the crate is DELETE-SAFE.
+Both are pure Rust with no native dependencies (anyhow, serde, sha2, serde_json) and have synthetic unit tests. Once each is ported, or dropped with a cited reason (an ADR), the crate is DELETE-SAFE.
 
 ### 2. Module table
 
@@ -266,10 +268,10 @@ Both are pure Rust with no native dependencies (anyhow, serde, sha2, serde_json)
 2. **Absorb the comparator skeleton.**
    - Source: `legacy/crates/sims-runtime/src/fixture_replay.rs:30-60` (Driver/Poll), `:219-397` (schedule run, poll invariants, compare) and `:407-445` (`first_difference`), plus the invariant tests in `fixture_replay/tests.rs:191-420`.
    - Destination: the in-repo oracle comparator that replaces the private comparison scripts kept outside the repository, e.g. `crates/sims-cli` or `tools/harness` (in Python).
-   - Minimal fallback: record the invariants and the first-difference contract in a `docs/decisions/` note, then cite `legacy-final:` for the code.
+   - Minimal fallback: record the invariants and the first-difference contract in a `docs/decisions/` note, then cite `legacy-final:crates/sims-runtime/src/fixture_replay.rs` for the code.
    - Drop the `sims_fixtures` Store and qualification parts.
 
-Nothing else is left. The 1,160 unique addresses are continuation plumbing, code pins, or captured-memory and vtable layout. Their game behaviour is either ported (with cited addresses) or lives in legacy `sims-sim`/`sims-vm`, which those crates' own audits cover. After items 1 and 2 (or an explicit waiver), the crate is DELETE-SAFE.
+Nothing else is left. The 1,160 unique addresses are continuation plumbing, code pins, or captured-memory and vtable layout. Their game behaviour is either ported (with cited addresses) or lives in legacy `sims-sim`/`sims-vm`, which those crates' own audits cover. After items 1 and 2 are ported, or dropped with a cited reason, the crate is DELETE-SAFE.
 
 Optional, not blocking: the addresses where the loaded tuning tables sit in memory (motives `0x6e4948-0x6e4a08` in `completed_simulation.rs:322-340`; rooms and lighting `0x6e53e0-0x6e5424` in `completed_lot/environment.rs:62-80`) are not cited anywhere current. The values are ported, but the addresses could be added as doc comments in `crates/sims-sim/src/motives.rs` and `rooms.rs` as `--watch` targets for the harness.
 
@@ -697,7 +699,7 @@ Address sweep:
 - `.gitignore:65,67` and `scripts/check_repository.py:30,32` name
   `legacy/crates/sims-render/tests/{clown_household_continuation,fresh_household_replay}.rs`.
 - About 10 doc comments and ADRs cite `legacy/crates/sims-render/...`
-  paths. They stay readable at tag `legacy-final`.
+  paths. When the crate is deleted they are rewritten to `legacy-final:crates/sims-render/...`.
 
 ## sims-vm — stays
 
@@ -890,7 +892,7 @@ Status key: **ported**, **dropped** (vision or salvage-audit), **to-mine** (see 
 | `lot_presenter` plumbing (viewport, redraw, open, lifecycle, person_refresh, physical_next, row_tail stages, motion/frame) | dirty rectangles, F6 ownership, native resume points (66 unmatched addresses) | dropped | salvage-audit:189-191 |
 | `lot_rooms.rs`, `lot_flags.rs`, `lot_walls.rs`, `lot_geometry.rs`, `architecture.rs`, `geometry.rs` | 0x479d9a partition, exterior and build-support flags, 0x476dbc wall collision | ported (the prototype's fixture topology is dropped) | `crates/sims-sim/src/rooms.rs:1-24,67`, `load.rs:249-350` |
 | `lot_environment(+/)` | 0x4665d1/0x467980 room scores, light byte, lamp pairs 0x4b5037, cap of 6 lamps | ported (the 0x4b51ae removal order is recomputed each frame) | `crates/sims-sim/src/rooms.rs:979`, `sims-render/src/lot.rs:115-126,531` |
-| `house_valuation(+/)` | 0x444cb9 features, 0x43219a depreciation, 0x4354d5; 0x47b006 architecture value | partly ported; the architecture value is **to-mine (#6a)** | `crates/sims-vm/src/daily.rs:400-436` ("known gap" at :435) |
+| `house_valuation(+/)` | 0x444cb9 features, 0x43219a depreciation, 0x4354d5; 0x47b006 architecture value | partly ported (the load path computes the architecture value in `crates/sims-vm/src/lifecycle.rs:524-680`); the day-turn architecture value is **to-mine (#6a)** | `crates/sims-vm/src/daily.rs:400-436` ("known gap" at :435) |
 | `saved_world`, `saved_geometry`, `saved_matrix.rs`, `saved_types.rs`, `surface_remap(+/)` | 0x478599 arrays, 0x431005 reads, 0x43dd76 type linking, 0x4a0e3b/0x4c5d35 surface remap | ported (the 0x478909 light reset is presentation) | `crates/sims-sim/src/load.rs:590-760`, `sims-vm/src/load.rs:280` |
 | `native_grass(+/)` | grass generator for a fresh or resized lot: seed 0x1de48a, `rand%160-32` grid, refine passes, RNG restored | **to-mine, low (#20)**. Needed only if new lots are created | nothing in `crates/sims-sim/src/grass.rs` |
 | `native_world(+/)`, `native_world_children(+/)`, `native_matrix(+/)`, `native_wall_io(+/)`, `native_wall_vertices(+/)` | resource manager, path and strings, startup naming, matrix resize, wall service write tape. Real parts: channel tables, rotation tables, room-map fill, wall service | real rules ported (`sims-render/src/light.rs:12-25`, `rooms.rs:67`, `load.rs:249-350`); the rest dropped | salvage-audit:192-193 |
@@ -940,7 +942,7 @@ Items are ordered by gameplay impact. Line numbers refer to the legacy files.
    - What it covers: a bone is skipped when its priority exceeds the layer's; translation policy −1 and the blend marker 0x595947; layers ordered by priority with stable ties (0x5991fd, 0x597c1d).
    - Destination: `crates/sims-people/src/{animation,person}.rs`.
 6. **Architecture value and body scale.**
-   - (a) Architecture value, stored at simulator +0xa4.
+   - (a) Architecture value, stored at simulator +0xa4. The lot-load path already computes it (`crates/sims-vm/src/lifecycle.rs:524-680`, writing `budget.architecture_value`). What remains is the day turn: `daily.rs` keeps the saved value ("known gap" at :435), and a lot where only walls count for global 22 fails because wall resolution (0x4795c5) is not ported there.
      - Source: `house_valuation.rs:11-30`.
      - Rule (0x47b006): wall cost is halved once; split-floor halves are truncated separately; sums wrap as i32; visit order is floor, Y, X.
      - Destination: `crates/sims-vm/src/daily.rs:423-436`.
