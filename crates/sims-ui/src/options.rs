@@ -134,8 +134,10 @@ pub struct LotVisibility {
     /// Whether the Save action button is visible (`!no_save`, `0x5174ac..0x5174c5`).
     pub can_save: bool,
     /// Whether the Play subpanel's Free Will label and checkbox are visible
-    /// (`0x5177aa..0x517822`: hidden on Downtown `21..=30`, Vacation `81..=89`,
-    /// and Magic Town `93..=98`).
+    /// (`0x5177aa..0x51788e`: hidden on Downtown `21..=30` (`0x40749a`),
+    /// Studio Town `81..=89` (`0x4074b1`), and Magic Town `93..=98` (`0x428825`);
+    /// explicitly shown on Vacation Island `40..=49` (`0x4074c8`),
+    /// Old Town Community (`zoning == 2`, `0x40747c`), and Residential lots).
     pub show_free_will: bool,
     /// Whether the Play subpanel's Reset Tutorial button is visible
     /// (`0x5175d5..0x5175f4`, `0x40745f`: residential lots only).
@@ -156,7 +158,7 @@ impl LotVisibility {
     ) -> Self {
         let is_residential = matches!(zoning, Some(1));
         let is_downtown = lot_id >= 21 && lot_id <= 30;
-        let is_vacation = lot_id >= 81 && lot_id <= 89;
+        let is_studio_town = lot_id >= 81 && lot_id <= 89;
         let is_magic_town = lot_id >= 93 && lot_id <= 98;
         // 0x4f2490..0x4f24e7: community/Studio Town (zoning == 2) or Magic Town
         // lots 93..=99 (`0x5d..=0x63`) cannot save while visiting (`!edit_mode`);
@@ -168,7 +170,11 @@ impl LotVisibility {
         };
         Self {
             can_save: !no_save,
-            show_free_will: !(is_downtown || is_vacation || is_magic_town),
+            // 0x5177b2 (`0x40749a` Downtown 21..=30), 0x51780a (`0x4074b1`
+            // Studio Town 81..=89), and 0x51781b (`0x428825` Magic Town 93..=98)
+            // hide Free Will; 0x51782c (`0x4074c8` Vacation Island 40..=49),
+            // 0x51783d (`0x40747c` zoning == 2 Community), and Residential keep it visible.
+            show_free_will: !(is_downtown || is_studio_town || is_magic_town),
             show_reset_tutorial: is_residential,
         }
     }
@@ -1021,28 +1027,45 @@ pub fn draw_balloon(frame: &mut Frame, art: &Art, balloon: &OptionsBalloon) {
     }
 }
 
-/// Draws a Quick Tip tooltip box above an Options button (`0x517a6f`).
-pub fn draw_tooltip(frame: &mut Frame, art: &Art, anchor: Rect, text: &str) {
-    let Some(font) = art.font(LABEL_FONT) else {
-        return;
-    };
+/// Computes the screen rectangle of a Quick Tip tooltip box above `anchor`
+/// (`0x517a6f`), matching [`draw_tooltip`] byte-for-byte.
+pub fn tooltip_rect(size: [i32; 2], art: &Art, anchor: Rect, text: &str) -> Option<Rect> {
+    let font = art.font(LABEL_FONT)?;
     if text.is_empty() {
-        return;
+        return None;
     }
     let pad_x = 5;
     let pad_y = 2;
     let w = font.width(text) + pad_x * 2;
     let h = font.line_height.max(1) + pad_y * 2;
+    let x = (anchor.x + (anchor.width - w) / 2).clamp(0, (size[0] - w).max(0));
+    let y = (anchor.y - h - 2).clamp(0, (size[1] - h).max(0));
+    Some(Rect::new(x, y, w, h))
+}
+
+/// Draws a Quick Tip tooltip box above an Options button (`0x517a6f`).
+pub fn draw_tooltip(frame: &mut Frame, art: &Art, anchor: Rect, text: &str) {
     let fw = i32::try_from(frame.width()).unwrap_or(i32::MAX);
     let fh = i32::try_from(frame.height()).unwrap_or(i32::MAX);
-    let x = (anchor.x + (anchor.width - w) / 2).clamp(0, (fw - w).max(0));
-    let y = (anchor.y - h - 2).clamp(0, (fh - h).max(0));
-    frame.fill(Rect::new(x, y, w, h), LABEL);
+    let Some(r) = tooltip_rect([fw, fh], art, anchor, text) else {
+        return;
+    };
+    let Some(font) = art.font(LABEL_FONT) else {
+        return;
+    };
+    let pad_x = 5;
+    let pad_y = 2;
+    frame.fill(r, LABEL);
     frame.fill(
-        Rect::new(x + 1, y + 1, (w - 2).max(0), (h - 2).max(0)),
+        Rect::new(
+            r.x + 1,
+            r.y + 1,
+            (r.width - 2).max(0),
+            (r.height - 2).max(0),
+        ),
         TOOLTIP_BACK,
     );
-    font.draw(frame, text, [x + pad_x, y + pad_y], LABEL);
+    font.draw(frame, text, [r.x + pad_x, r.y + pad_y], LABEL);
 }
 
 /// Computes the x coordinate of a horizontal `cTSWinSlider`'s thumb

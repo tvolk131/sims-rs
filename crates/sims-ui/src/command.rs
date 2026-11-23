@@ -56,6 +56,19 @@ pub enum Relations {
     Everyone,
 }
 
+/// Which inventory category tab the Gifts/Inventory subpanel (`Panel::Gifts`,
+/// `4507`) displays (`cWinLive`, `0x51aa96..0x51ac9e`, `0x51e3b4..0x51e440`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum InventoryTab {
+    /// Gifts & souvenirs (`InventoryGiftSort.bmp` `4112`, token kinds `0, 4, 5`).
+    #[default]
+    Gifts,
+    /// Magic spells, ingredients & MagiCoins (`InventoryMagicSort.bmp` `4113`, token kind `7`).
+    Magic,
+    /// Other inventory tokens (`InventoryOtherSort.bmp` `4114`, token kind `8` and remaining kinds).
+    Other,
+}
+
 /// How walls are drawn: the cluster's three wall buttons.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Walls {
@@ -245,6 +258,16 @@ pub enum Command {
     /// Show this page of the relationship panel, from 0 (presentation
     /// only).
     RelationsPage(u32),
+    /// Show this page of the interests panel, from 0 (presentation only).
+    InterestsPage(u32),
+    /// Switch the Gifts/Inventory subpanel category tab (`4112`/`4113`/`4114`,
+    /// presentation only).
+    ShowInventory(InventoryTab),
+    /// Show this page of the Gifts/Inventory subpanel, from 0 (presentation only).
+    InventoryPage(u32),
+    /// Select or clear an item token GUID in the Gifts/Inventory subpanel
+    /// (presentation only).
+    SelectInventoryItem(Option<u32>),
     /// Move the camera (presentation only).
     Camera(Camera),
     /// Open the help balloon `help`, or close it if it is the one open

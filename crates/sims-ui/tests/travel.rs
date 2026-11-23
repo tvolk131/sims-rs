@@ -261,6 +261,7 @@ fn complete_collection_loads_travel_art_and_localized_tooltips() {
     assert!(strings.filter_tips.len() >= 13);
     assert!(!strings.go_downtown_dialog.is_empty());
     assert!(!strings.go_vacation_dialog.is_empty());
+    assert!(!strings.visit_neighborhood.is_empty());
     assert!(!strings.visit_magic_town.is_empty());
 
     let chrome = TravelChrome::new();
@@ -309,4 +310,31 @@ fn complete_collection_loads_travel_art_and_localized_tooltips() {
             TravelControl::ToggleFilter(LotFilter::DogCat)
         )
     );
+
+    // Destination::OldTown has its own distinct identity, PHONE_NEIGHBORHOOD (5433)
+    // transport icon, Trolley transport, full 50..=79 range, Unleashed community filters, and travel dialog.
+    assert_ne!(Destination::OldTown, Destination::Downtown);
+    assert_eq!(Destination::OldTown.short_label(), "Old Town");
+    assert_eq!(Destination::OldTown.lot_range(), (50, 79));
+    assert_eq!(
+        Destination::OldTown.default_transport(),
+        sims_ui::travel::TravelTransport::Trolley
+    );
+    assert_eq!(Destination::OldTown.default_transport().label(), "Trolley");
+    assert_eq!(
+        Destination::OldTown
+            .default_transport()
+            .icon_art_id(Destination::OldTown),
+        sims_ui::travel::art_id::PHONE_NEIGHBORHOOD
+    );
+    assert!(Destination::OldTown.filters().contains(&LotFilter::DogCat));
+    assert!(
+        Destination::OldTown
+            .filters()
+            .contains(&LotFilter::Gardening)
+    );
+    let old_town_dlg = TravelDialogState::for_destination(Destination::OldTown, vec!["Sim".into()]);
+    let mut frame = Frame::new(800, 600, [0, 0, 0]);
+    let layout = dialog.draw(&mut frame, &old_town_dlg, &art, &strings);
+    assert!(layout.panel_rect.width > 100);
 }
