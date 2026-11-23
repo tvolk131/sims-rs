@@ -2257,11 +2257,12 @@ fn lift_arity_override_specs_are_strict_and_validated() {
     assert!(!ok && stderr.contains("BHAV #4999"), "stderr: {stderr}");
 }
 
-/// An object reached through a symlink in install A that points into install B uses A's
-/// catalog (the install the VM would boot), not B's.
+/// An object reached through a symlink in install A that points into install B is not
+/// positively an entry of A (it resolves outside A's root), so neither install's
+/// arities apply: no inferred role, and the header suggests the flags.
 #[cfg(unix)]
 #[test]
-fn lift_through_symlink_uses_the_install_it_was_reached_from() {
+fn lift_through_symlink_into_another_install_has_no_inferred_role() {
     let a = SyntheticInstall::new();
     let b = SyntheticInstall::new();
     // In B, global #300 takes 6 args, so B's arities would force a labeled-CFG fallback.
@@ -2284,29 +2285,27 @@ fn lift_through_symlink_uses_the_install_it_was_reached_from() {
     assert!(ok, "stderr: {stderr}");
     assert!(
         stdout.contains(
-            "semi-global 8192+: 1 from GameData/Global/TestGlobals.iff (install catalog)"
-        ),
-        "the symlinked member must match A's index entry and keep its GLOB link:\n{stdout}"
+            "global 256..=4095: none (no inferred role: file resolves outside the install root)"
+        ) && stdout.contains("pass --no-catalog to use this file's own private trees"),
+        "{stdout}"
     );
     assert!(
-        !stdout.contains("structured lift fallback"),
-        "A's 4-arg #300 must apply, not B's 6-arg #300:\n{stdout}"
+        stdout.contains("calls global tree 300 with inline operands but its arity is unknown")
+            && stdout.contains("pass --globals <Global.iff>"),
+        "neither A's nor B's #300 may be assumed:\n{stdout}"
     );
     assert!(stdout.contains("// verify-equiv: Equivalent"), "{stdout}");
 }
 
-/// Index matching is by file identity: a `..` path finds its entry; a file reached
-/// through an outside symlink and indexed twice (as `Objects/Loose.iff` and a
-/// `Global/Shadow.iff` alias) resolves when both entries agree; an unindexed copy under
-/// the install root gets private arities only.
+/// Index matching is by file identity: a `..` path finds its entry; a file indexed twice
+/// (as `Objects/Loose.iff` and a `Global/Shadow.iff` alias) is not one entry, and an
+/// unindexed copy under the install root is none, so both have no inferred role.
 #[cfg(unix)]
 #[test]
 fn lift_index_matching_uses_file_identity() {
     let install = SyntheticInstall::new();
     let objects = install.root.join("GameData").join("Objects");
     let loose = objects.join("Loose.iff");
-    std::os::unix::fs::symlink(&loose, install.global_dir().join("Shadow.iff"))
-        .expect("symlink Shadow.iff");
     std::fs::create_dir_all(objects.join("sub")).expect("mkdir sub");
 
     let dotted = objects.join("sub").join("..").join("Loose.iff");
@@ -2318,16 +2317,28 @@ fn lift_index_matching_uses_file_identity() {
         "a `..` path must match Objects/Loose.iff itself:\n{stdout}"
     );
 
+    // Reached through a symlink outside any install: found through its canonical path,
+    // inside the install, and identified as Objects/Loose.iff.
     let outside = CleanupDir::new("outside-link");
     let via = outside.path().join("via.iff");
     std::os::unix::fs::symlink(&loose, &via).expect("symlink via.iff");
     let (ok, stdout, stderr) = run_lift(&[via.as_os_str(), OsStr::new("--list")]);
     assert!(ok, "stderr: {stderr}");
     assert!(
-        stdout.contains("global 256..=4095: 2 from GameData/Global/Global.iff (install catalog)")
-            && stdout.contains("private 4096..=8191: 3 from this file")
-            && stdout.contains("semi-global 8192+: none (no resolved GLOB link)"),
-        "both entries resolve the same way:\n{stdout}"
+        stdout.contains("private 4096..=8191: 3 from this file"),
+        "{stdout}"
+    );
+
+    // Once the same file is also indexed as Global/Shadow.iff, it is not one entry.
+    std::os::unix::fs::symlink(&loose, install.global_dir().join("Shadow.iff"))
+        .expect("symlink Shadow.iff");
+    let (ok, stdout, stderr) = run_lift(&[via.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "private 4096..=8191: none (no inferred role: the same file is indexed as GameData/Global/Shadow.iff and GameData/Objects/Loose.iff)"
+        ),
+        "{stdout}"
     );
 
     let scratch = install.root.join("scratch");
@@ -2337,8 +2348,10 @@ fn lift_index_matching_uses_file_identity() {
     let (ok, stdout, stderr) = run_lift(&[copy.as_os_str(), OsStr::new("--list")]);
     assert!(ok, "stderr: {stderr}");
     assert!(
-        stdout.contains("global 256..=4095: none (file not in install index)")
-            && stdout.contains("private 4096..=8191: 3 from this file"),
+        stdout.contains("global 256..=4095: none (no inferred role: file not in install index)")
+            && stdout.contains(
+                "private 4096..=8191: none (no inferred role: file not in install index)"
+            ),
         "{stdout}"
     );
 }
@@ -2474,8 +2487,7 @@ fn lift_symlink_then_dotdot_uses_the_opened_file_not_the_lexical_entry() {
         "must resolve through the opened actual/Loose.iff:\n{stdout}"
     );
 
-    // Target outside the install: the opened file is not indexed, so only its own
-    // private range is known, and the header says why.
+    // Target outside the install: no inferred role, and the header says why.
     let outside = CleanupDir::new("dotdot-outside");
     std::fs::create_dir_all(outside.path().join("sub")).expect("mkdir outside/sub");
     std::fs::write(
@@ -2489,9 +2501,9 @@ fn lift_symlink_then_dotdot_uses_the_opened_file_not_the_lexical_entry() {
     let (ok, stdout, stderr) = run_lift(&[via.as_os_str(), OsStr::new("--list")]);
     assert!(ok, "stderr: {stderr}");
     assert!(
-        stdout.contains("global 256..=4095: none (file not in install index)")
-            && stdout.contains("private 4096..=8191: 3 from this file")
-            && stdout.contains("semi-global 8192+: none (file not in install index)"),
+        stdout.contains(
+            "private 4096..=8191: none (no inferred role: file resolves outside the install root)"
+        ),
         "{stdout}"
     );
 }
@@ -2499,7 +2511,7 @@ fn lift_symlink_then_dotdot_uses_the_opened_file_not_the_lexical_entry() {
 /// `Objects/Global.iff` is a hard link to `Global/Global.iff`, and `Objects/link` points
 /// at `Global/sub`. Whether the file is opened directly or as `Objects/link/../Global.iff`
 /// (which names the object alias lexically), it is one file with two roles, so its
-/// owner-dependent ranges stay unknown and the header names both entries.
+/// role is inferred and the header names both entries.
 #[cfg(unix)]
 #[test]
 fn lift_file_indexed_under_two_roles_is_ambiguous() {
@@ -2511,7 +2523,7 @@ fn lift_file_indexed_under_two_roles_is_ambiguous() {
     std::os::unix::fs::symlink(install.global_dir().join("sub"), objects.join("link"))
         .expect("symlink link");
 
-    let why = "ambiguous: the same file is indexed as GameData/Global/Global.iff and GameData/Objects/Global.iff, with different code-owner roles";
+    let why = "no inferred role: the same file is indexed as GameData/Global/Global.iff and GameData/Objects/Global.iff";
     for input in [
         global.clone(),
         objects.join("link").join("..").join("Global.iff"),
@@ -2519,8 +2531,7 @@ fn lift_file_indexed_under_two_roles_is_ambiguous() {
         let (ok, stdout, stderr) = run_lift(&[input.as_os_str(), OsStr::new("--list")]);
         assert!(ok, "stderr: {stderr}");
         assert!(
-            stdout
-                .contains("global 256..=4095: 2 from GameData/Global/Global.iff (install catalog)")
+            stdout.contains(&format!("global 256..=4095: none ({why})"))
                 && stdout.contains(&format!("private 4096..=8191: none ({why})"))
                 && stdout.contains(&format!("semi-global 8192+: none ({why})")),
             "{}:\n{stdout}",
@@ -2529,16 +2540,15 @@ fn lift_file_indexed_under_two_roles_is_ambiguous() {
     }
 }
 
-/// An atomic save replaces the file at a path with a new inode. The CLI's test hook
-/// renames a staged file over the input after the CLI has read it and before the
-/// catalog lookup; the lookup uses the identity of the CLI's own read handle, so the
-/// replaced file finds no index entry and the new file's role is not borrowed.
-#[cfg(unix)]
+/// The shipped binary has no test hook: the former
+/// `SIMS_ANTICS_TEST_REPLACE_INPUT_AFTER_READ` variable must not make `lift` touch its
+/// input.
 #[test]
-fn lift_catalog_lookup_never_matches_a_file_replaced_after_reading() {
+fn lift_has_no_input_replacing_test_hook() {
     let install = SyntheticInstall::new();
     let objects = install.root.join("GameData").join("Objects");
     let loose = objects.join("Loose.iff");
+    let before = std::fs::read(&loose).expect("read Loose.iff");
     let staged = objects.join("Loose.iff.saving");
     std::fs::write(&staged, synthetic_object_iff(Some(b"TestGlobals"))).expect("stage");
 
@@ -2549,17 +2559,196 @@ fn lift_catalog_lookup_never_matches_a_file_replaced_after_reading() {
         .env("SIMS_ANTICS_TEST_REPLACE_INPUT_AFTER_READ", &staged)
         .output()
         .expect("run lift");
-    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!staged.exists(), "the hook must have replaced the input");
+    assert!(staged.exists(), "the staged file must be left alone");
+    assert_eq!(
+        std::fs::read(&loose).expect("reread"),
+        before,
+        "the input must not change"
+    );
+}
+
+/// An atomic save replaces the file at a path with a new inode. The lookup uses the
+/// identity of the handle the bytes were read through (as `lift` does, keeping that
+/// handle open until the lookup is done), so the replaced file never matches the new
+/// index entry.
+#[cfg(unix)]
+#[test]
+fn catalog_lookup_never_matches_a_file_replaced_after_reading() {
+    use sims_antics::arity_catalog::{FileIdentity, InstallArityCatalog, ResourceMatch};
+
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    let loose = objects.join("Loose.iff");
+    let mut read_handle = std::fs::File::open(&loose).expect("open Loose.iff");
+    let mut bytes = Vec::new();
+    read_handle.read_to_end(&mut bytes).expect("read");
+    let read_identity = FileIdentity::of_open(&read_handle, &loose).expect("fstat");
+
+    let staged = objects.join("Loose.iff.saving");
+    std::fs::write(&staged, synthetic_object_iff(Some(b"TestGlobals"))).expect("stage");
+    std::fs::rename(&staged, &loose).expect("atomic replace");
+
+    let catalog = InstallArityCatalog::load(&install.root).expect("load catalog");
+    assert_eq!(
+        catalog.resource_for(&loose, &read_identity, None),
+        ResourceMatch::Unindexed,
+        "the file that was read is no longer indexed"
+    );
+    let now = FileIdentity::of_path(&loose).expect("stat");
+    assert!(matches!(
+        catalog.resource_for(&loose, &now, None),
+        ResourceMatch::Unique(_)
+    ));
+    drop(read_handle);
+}
+
+/// The catalog is built from the whole index, as the VM builds it: a dangling
+/// `Global/Shared.iff` comes before `Objects/Shared.iff` in name resolution, so the
+/// owner's `GLOB "Shared"` resolves to the dangling file and its semi-global arities are
+/// unknown, rather than borrowing the second file's.
+#[cfg(unix)]
+#[test]
+fn lift_semi_global_link_resolves_to_the_first_file_even_when_it_is_dangling() {
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    std::os::unix::fs::symlink(
+        install.global_dir().join("missing-target.iff"),
+        install.global_dir().join("Shared.iff"),
+    )
+    .expect("dangling symlink");
+    std::fs::write(
+        objects.join("Shared.iff"),
+        synthetic_bhav_iff(&[one_node_bhav(8192, 6)]),
+    )
+    .expect("write Objects/Shared.iff");
+    let owner = objects.join("Owner.iff");
+    std::fs::write(&owner, synthetic_object_iff(Some(b"Shared"))).expect("write Owner.iff");
+
+    let (ok, stdout, stderr) = run_lift(&[owner.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
     assert!(
-        stdout.contains("global 256..=4095: none (file not in install index)")
-            && stdout.contains("semi-global 8192+: none (file not in install index)"),
-        "the replaced file must not take the new file's GLOB link:\n{stdout}"
+        stdout.contains("private 4096..=8191: 3 from this file")
+            && stdout
+                .contains("semi-global 8192+: none (failed to read GameData/Global/Shared.iff")
+            && !stdout.contains("GameData/Objects/Shared.iff"),
+        "{stdout}"
+    );
+}
+
+/// A `Global.iff` the VM cannot load (here: its archive is unreadable) leaves the
+/// catalog unusable, so a semi-global file gets no inferred role. In particular its
+/// `4096+` calls are not taken as its own: they belong to the calling object.
+#[cfg(unix)]
+#[test]
+fn lift_with_an_unloadable_global_iff_has_no_inferred_role() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+        }
+    }
+
+    let install = SyntheticInstall::new();
+    let global_dir = install.global_dir();
+    let global_bytes = std::fs::read(global_dir.join("Global.iff")).expect("read Global.iff");
+    std::fs::remove_file(global_dir.join("Global.iff")).expect("remove loose Global.iff");
+    let far = global_dir.join("Global.far");
+    std::fs::write(
+        &far,
+        package_far(&[("Global.iff", &global_bytes)]).expect("package"),
+    )
+    .expect("write Global.far");
+    std::fs::set_permissions(&far, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let _restore = RestoreMode(far.clone());
+    if std::fs::File::open(&far).is_ok() {
+        eprintln!("skipping: permissions are not enforced for this user");
+        return;
+    }
+
+    // TestGlobals.iff is the semi-global Test.far!Thing.iff links to; give it a
+    // private-range tree so a wrongly inferred role would show a nonzero count.
+    let semi = global_dir.join("TestGlobals.iff");
+    std::fs::write(
+        &semi,
+        synthetic_bhav_iff(&[one_node_bhav(8192, 1), one_node_bhav(4100, 6)]),
+    )
+    .expect("rewrite TestGlobals.iff");
+    let (ok, stdout, stderr) = run_lift(&[semi.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "private 4096..=8191: none (no inferred role: install catalog failed to load"
+        ) && stdout.contains("global 256..=4095: none (no inferred role:")
+            && stdout.contains("semi-global 8192+: none (no inferred role:"),
+        "{stdout}"
+    );
+}
+
+/// An unidentifiable loose entry in install A must not lend A's arities to a file of
+/// install B reached through a symlink in A, nor affect a FAR-member input of A.
+#[cfg(unix)]
+#[test]
+fn lift_unidentifiable_entry_is_scoped_to_its_install_and_kind() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let a = SyntheticInstall::new();
+    let b = SyntheticInstall::new();
+    let a_objects = a.root.join("GameData").join("Objects");
+    let locked = a_objects.join("locked");
+    std::fs::create_dir_all(&locked).expect("mkdir locked");
+    std::fs::write(locked.join("Hidden.iff"), synthetic_object_iff(None)).expect("write");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let _restore = RestoreMode(locked.clone());
+    if std::fs::metadata(locked.join("Hidden.iff")).is_ok() {
+        eprintln!("skipping: permissions are not enforced for this user");
+        return;
+    }
+
+    // B's loose object, reached through a symlink in A.
+    let link = a_objects.join("FromB.iff");
+    std::os::unix::fs::symlink(
+        b.root.join("GameData").join("Objects").join("Loose.iff"),
+        &link,
+    )
+    .expect("symlink");
+    let (ok, stdout, stderr) = run_lift(&[link.as_os_str(), OsStr::new("--list")]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "global 256..=4095: none (no inferred role: file resolves outside the install root)"
+        ),
+        "A's globals must not apply to B's file:\n{stdout}"
+    );
+
+    // A FAR member of A is identified; a loose unidentifiable entry cannot be it.
+    let far = a.far();
+    let (ok, stdout, stderr) = run_lift(&[
+        far.as_os_str(),
+        OsStr::new("--entry"),
+        OsStr::new("Thing.iff"),
+        OsStr::new("--list"),
+    ]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stdout.contains("global 256..=4095: 2 from GameData/Global/Global.iff (install catalog)")
+            && stdout.contains(
+                "semi-global 8192+: 1 from GameData/Global/TestGlobals.iff (install catalog)"
+            ),
+        "{stdout}"
     );
 }
 
@@ -2593,9 +2782,9 @@ fn lift_with_an_unidentifiable_index_path_keeps_owner_ranges_unknown() {
     let loose = objects.join("Loose.iff");
     let (ok, stdout, stderr) = run_lift(&[loose.as_os_str(), OsStr::new("--list")]);
     assert!(ok, "stderr: {stderr}");
-    let why = "unknown code-owner role: 1 install index path(s) could not be identified: GameData/Objects/locked/Hidden.iff (";
+    let why = "no inferred role: 1 install index path(s) that could be this file could not be identified: GameData/Objects/locked/Hidden.iff (";
     assert!(
-        stdout.contains("global 256..=4095: 2 from GameData/Global/Global.iff (install catalog)")
+        stdout.contains(&format!("global 256..=4095: none ({why}"))
             && stdout.contains(&format!("private 4096..=8191: none ({why}"))
             && stdout.contains(&format!("semi-global 8192+: none ({why}")),
         "{stdout}"

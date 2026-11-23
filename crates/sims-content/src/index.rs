@@ -1079,9 +1079,10 @@ type RawMember = (Member, Vec<u8>);
 
 /// Opens `path` for reading with `O_NONBLOCK` where its value is known, so a
 /// FIFO does not block the open. The same flags as `sims-antics lift`'s input
-/// open. The later opens of indexed files (`Resource::read`, `catalog.rs`,
-/// `pool.rs`) still block if a FIFO replaces a file after indexing; that
-/// residual hangs rather than misreads (ADR 20261123-lift-cli-catalog-arities).
+/// open. The catalog's loose-file scan uses it too. The later opens of
+/// indexed files (`Resource::read`, `pool.rs`) still block if a FIFO replaces
+/// a file after indexing; that residual hangs rather than misreads (ADR
+/// 20261123-lift-cli-catalog-arities).
 fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -1123,7 +1124,7 @@ fn not_regular_file() -> std::io::Error {
 /// Opens `path` without blocking on a FIFO ([`open_nonblocking`]) and refuses
 /// the handle unless `fstat` says it is a regular file. Regular files ignore
 /// O_NONBLOCK, so reads from the returned file behave as usual.
-fn open_regular_nonblocking(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_regular_nonblocking(path: &Path) -> std::io::Result<File> {
     let file = open_nonblocking(path)?;
     if file.metadata()?.is_file() {
         Ok(file)

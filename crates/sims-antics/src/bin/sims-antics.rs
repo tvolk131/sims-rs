@@ -338,7 +338,7 @@ fn detailed_lift_reason(
                 } else if SEMI_GLOBAL_TREES.contains(&callee) {
                     "; pass --semiglobal <semiglobal.iff>"
                 } else {
-                    ""
+                    "; pass --no-catalog to use this file's own private trees"
                 };
                 format!("; {scope} arities not loaded ({why}){flag}")
             }
@@ -391,9 +391,10 @@ struct ArityOptions {
     semi_global: Option<String>,
 }
 
-/// Merges callee arities for the lifted IFF: private trees from the IFF itself, plus
-/// (unless `--no-catalog`) global and semi-global trees from the enclosing install's
-/// catalog, then any explicit `--globals` / `--semiglobal` overrides.
+/// Merges callee arities for the lifted IFF. With `--no-catalog`: private trees from the
+/// IFF itself. Otherwise from the enclosing install's catalog, but only when the file is
+/// positively identified as one of its entries; with no inferred role every range is
+/// unknown. Explicit `--globals` / `--semiglobal` overrides apply last.
 fn resolve_lift_arities(
     iff: &Iff,
     input_path: &Path,
@@ -408,26 +409,20 @@ fn resolve_lift_arities(
             Some(root) => match InstallArityCatalog::load(&root) {
                 Ok(mut catalog) => match input_identity {
                     Ok(identity) => {
-                        let resource = catalog.resource_for(identity, member);
+                        let resource = catalog.resource_for(input_path, identity, member);
                         catalog.resolve(resource, iff)
                     }
-                    Err(why) => ResolvedArities::private_only(
-                        iff,
-                        &format!(
-                            "could not identify the opened file: {}",
-                            sanitize_single_line(why)
-                        ),
-                    ),
+                    Err(why) => ResolvedArities::no_role(&format!(
+                        "could not identify the opened file: {}",
+                        sanitize_single_line(why)
+                    )),
                 },
-                Err(err) => ResolvedArities::private_only(
-                    iff,
-                    &format!(
-                        "install catalog failed to load: {}",
-                        sanitize_single_line(&err)
-                    ),
-                ),
+                Err(err) => ResolvedArities::no_role(&format!(
+                    "install catalog failed to load: {}",
+                    sanitize_single_line(&err)
+                )),
             },
-            None => ResolvedArities::private_only(iff, "no Sims install found above the input"),
+            None => ResolvedArities::no_role("no Sims install found above the input"),
         }
     };
     if let Some(spec) = &opts.globals {
@@ -1153,13 +1148,6 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
 
     let iff =
         Iff::parse(iff_bytes).map_err(|e| format!("failed to parse IFF {source_label}: {e}"))?;
-
-    // Test hook: replace the input with another file after it was read and before the
-    // catalog lookup (an atomic save), to check the lookup uses the read handle.
-    if let Some(staged) = std::env::var_os("SIMS_ANTICS_TEST_REPLACE_INPUT_AFTER_READ") {
-        std::fs::rename(&staged, &input_path)
-            .map_err(|e| format!("test hook: rename over input failed: {e}"))?;
-    }
 
     // Deduplicate BHAV chunks by resource ID, preferring canonical high-flag-byte 0
     // (matching `Iff::get(b"BHAV", id)` and `sims-vm`), then sort by ID.

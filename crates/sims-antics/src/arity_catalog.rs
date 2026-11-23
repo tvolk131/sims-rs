@@ -20,6 +20,10 @@
 //! [`InstallArityCatalog`] resolves those files through `sims_content`'s [`Catalog`] (the
 //! same index, catalog, and `GLOB` links the VM boots from). The `structured_equiv` corpus
 //! test and `sims-antics lift` both use it, so the CLI and the corpus see the same arities.
+//!
+//! Roles are inferred only for a positively identified file: one under the install root
+//! that matches exactly one index entry by file identity ([`ResourceMatch::Unique`]).
+//! Anything else gets [`ResolvedArities::no_role`], with every range unknown.
 
 use crate::verify::bhav_param_limit;
 use sims_content::{ArchivePool, Catalog, Index, Install};
@@ -119,9 +123,31 @@ pub struct ResolvedArities {
     pub private: ArityPart,
     pub global: ArityPart,
     pub semi_global: ArityPart,
+    /// A suggestion appended to [`Self::describe`], e.g. the flags that would supply
+    /// the unknown ranges.
+    pub hint: Option<String>,
 }
 
+/// What the header suggests when no code-owner role could be inferred.
+pub const NO_ROLE_HINT: &str = "pass --no-catalog to use this file's own private trees, \
+     --globals <Global.iff> or --semiglobal <file.iff> for the others";
+
 impl ResolvedArities {
+    /// No code-owner role could be inferred for the file (`why`): every range is unknown,
+    /// because even its private calls may belong to a calling object (a semi-global's
+    /// `4096+` calls do).
+    #[must_use]
+    pub fn no_role(why: &str) -> Self {
+        let why = format!("no inferred role: {why}");
+        Self {
+            arities: BTreeMap::new(),
+            private: ArityPart::missing(&why),
+            global: ArityPart::missing(&why),
+            semi_global: ArityPart::missing(&why),
+            hint: Some(NO_ROLE_HINT.to_owned()),
+        }
+    }
+
     /// Private arities from `iff` only; global and semi-global ranges stay unknown so
     /// stray chunks in an object IFF cannot mask the real external arities.
     #[must_use]
@@ -135,6 +161,7 @@ impl ResolvedArities {
             global: ArityPart::missing(why_missing),
             semi_global: ArityPart::missing(why_missing),
             arities,
+            hint: None,
         }
     }
 
@@ -185,128 +212,132 @@ impl ResolvedArities {
     /// One line naming every range's source, for an output header.
     #[must_use]
     pub fn describe(&self) -> String {
-        format!(
+        let mut out = format!(
             "{}; {}; {}",
             self.global.describe("global 256..=4095:"),
             self.private.describe("private 4096..=8191:"),
             self.semi_global.describe("semi-global 8192+:"),
-        )
+        );
+        if let Some(hint) = &self.hint {
+            out.push_str("; ");
+            out.push_str(hint);
+        }
+        out
     }
 }
 
 /// How an opened file matched the install index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceMatch {
-    /// Exactly one index resource.
+    /// Exactly one index resource: the file's code-owner role is known.
     Unique(usize),
-    /// Some index paths could not be `stat`ed (listed with their errors), so this file
-    /// might also be one of them, under a role that cannot be resolved.
-    Unidentified(Vec<String>),
-    /// Several index resources are the same file (hard links, or symlinks into two
-    /// mounts), which may give it different code-owner roles.
-    Ambiguous(Vec<usize>),
+    /// The file resolves outside the install root (canonical paths).
+    OutsideInstall,
     /// No index resource is this file.
     Unindexed,
+    /// Several index resources are this file (hard links, or symlinks into two mounts).
+    Ambiguous(Vec<usize>),
+    /// Index paths of the same kind (loose file, or archive with a member of the same
+    /// name) could not be `stat`ed, so this file might be one of them; each with its
+    /// error.
+    MayAlias(Vec<String>),
 }
 
 /// The identity of a file: `(device, inode)` on Unix. For an opened file it comes from
 /// the open handle (`fstat`), so a file replaced at the same path after it was read (an
 /// atomic save) is a different file, and so is a path that reaches another file through
-/// symlinks and `..`. Elsewhere it is the canonical path, which cannot see a replacement.
+/// symlinks and `..`. Elsewhere it is the canonical path, which cannot see a replacement
+/// or an NTFS hard link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileIdentity(#[cfg(unix)] (u64, u64), #[cfg(not(unix))] PathBuf);
 
 impl FileIdentity {
     /// The identity of `file`, opened from `path`.
     pub fn of_open(file: &std::fs::File, path: &Path) -> std::io::Result<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let _ = path;
-            let meta = file.metadata()?;
-            Ok(Self((meta.dev(), meta.ino())))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = file;
-            Ok(Self(std::fs::canonicalize(path)?))
-        }
+        Self::from_metadata(&file.metadata()?, path)
     }
 
     /// The identity of the file `path` names now (following symlinks).
     pub fn of_path(path: &Path) -> std::io::Result<Self> {
+        Self::from_metadata(&std::fs::metadata(path)?, path)
+    }
+
+    /// The identity behind `meta`, which was read for `path`.
+    pub fn from_metadata(meta: &std::fs::Metadata, path: &Path) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let meta = std::fs::metadata(path)?;
+            let _ = path;
             Ok(Self((meta.dev(), meta.ino())))
         }
         #[cfg(not(unix))]
         {
+            let _ = meta;
             Ok(Self(std::fs::canonicalize(path)?))
         }
     }
 }
 
-/// An install's index and catalog, with `Global.iff` arities loaded and semi-global
-/// arities cached per resource.
+/// An install's index and catalog, built exactly as the VM builds them, with
+/// `Global.iff` arities loaded, semi-global arities cached per resource, and a side
+/// table of file identities used only to find which entry a lifted file is.
 pub struct InstallArityCatalog {
     pub index: Index,
     pub pool: ArchivePool,
     pub catalog: Catalog,
+    /// The install root, canonicalized.
+    root_canonical: Option<PathBuf>,
     /// `Global.iff` arities, or why they could not be read.
     global: Result<BTreeMap<u16, usize>, String>,
     global_location: String,
     semi_cache: BTreeMap<usize, Result<BTreeMap<u16, usize>, String>>,
-    /// Each index resource's file identity, taken when the catalog was built.
+    /// Each index resource's file identity when its path names a regular file.
     identities: Vec<Option<FileIdentity>>,
-    /// Index paths that could not be `stat`ed (and were left out), each with its error.
-    /// Any of them might be the lifted file under another role.
-    unidentified: Vec<String>,
+    /// Index resources whose path could not be `stat`ed for a reason other than
+    /// `NotFound`, each with its error.
+    unidentified: Vec<(usize, String)>,
 }
 
 impl InstallArityCatalog {
-    /// Indexes the install at `root`, builds its catalog, and loads `Global.iff` arities.
-    /// Errors name paths relative to the install (`<install>/...`).
+    /// Indexes the install at `root`, builds its catalog from the whole index (as the VM
+    /// does), and loads `Global.iff` arities. Errors name paths relative to the install
+    /// (`<install>/...`).
     pub fn load(root: &Path) -> Result<Self, String> {
         let root_text = root.to_string_lossy().into_owned();
         let relative = |e: String| e.replace(&root_text, "<install>");
         let install = Install::detect(root).map_err(|e| relative(e.to_string()))?;
-        let mut index = Index::build(&install).map_err(|e| relative(e.to_string()))?;
-        // The catalog scan opens every IFF, so only regular files stay (a FIFO would block
-        // the open; symlinks to regular files stay). One `stat` per path gives both that
-        // test and the file's identity. A path that is gone (`NotFound`: a broken
-        // symlink) or not a regular file cannot be the regular file being lifted; any
-        // other failure (e.g. a directory without search permission) leaves a path that
-        // might be, so it is counted in `unidentified`.
-        let mut stat_of: BTreeMap<PathBuf, Option<FileIdentity>> = BTreeMap::new();
-        let mut unidentified = Vec::new();
-        for r in &index.resources {
-            if stat_of.contains_key(&r.path) {
-                continue;
-            }
-            let identity = match std::fs::metadata(&r.path) {
-                Ok(meta) if meta.is_file() => FileIdentity::of_path(&r.path).ok(),
-                Ok(_) => None,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => {
-                    unidentified.push(format!("{} ({e})", r.location(&index.root)));
-                    None
-                }
-            };
-            stat_of.insert(r.path.clone(), identity);
-        }
-        index
-            .resources
-            .retain(|r| stat_of.get(&r.path).is_some_and(Option::is_some));
-        let identities = index
-            .resources
-            .iter()
-            .map(|r| stat_of.get(&r.path).cloned().flatten())
-            .collect();
+        let index = Index::build(&install).map_err(|e| relative(e.to_string()))?;
         let pool = ArchivePool::new();
         let catalog =
             Catalog::build_with_pool(&index, &pool).map_err(|e| relative(e.to_string()))?;
+
+        // One `stat` per path. A path that is gone (`NotFound`, e.g. a broken symlink)
+        // or not a regular file cannot be the regular file being lifted; any other
+        // failure (e.g. no search permission) leaves a path that might be.
+        let mut stat_of: BTreeMap<PathBuf, Result<Option<FileIdentity>, String>> = BTreeMap::new();
+        let mut identities = Vec::with_capacity(index.resources.len());
+        let mut unidentified = Vec::new();
+        for (number, r) in index.resources.iter().enumerate() {
+            let stat =
+                stat_of
+                    .entry(r.path.clone())
+                    .or_insert_with(|| match std::fs::metadata(&r.path) {
+                        Ok(meta) if meta.is_file() => FileIdentity::from_metadata(&meta, &r.path)
+                            .map(Some)
+                            .map_err(|e| e.to_string()),
+                        Ok(_) => Ok(None),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                        Err(e) => Err(e.to_string()),
+                    });
+            match stat {
+                Ok(identity) => identities.push(identity.clone()),
+                Err(e) => {
+                    identities.push(None);
+                    unidentified.push((number, e.clone()));
+                }
+            }
+        }
+
         let global_resource = &index.resources[catalog.global];
         let global_location = global_resource.location(&index.root);
         let global = global_resource
@@ -322,6 +353,7 @@ impl InstallArityCatalog {
             })
             .map(|iff| bhav_arities_in_range(&iff, GLOBAL_TREES));
         Ok(Self {
+            root_canonical: std::fs::canonicalize(root).ok(),
             index,
             pool,
             catalog,
@@ -334,8 +366,7 @@ impl InstallArityCatalog {
     }
 
     /// The nearest install root above `path`. Ancestors of the path as given are tried
-    /// first (so an install reached through a symlink is the one whose catalog applies),
-    /// then ancestors of its canonical form.
+    /// first, then ancestors of its canonical form.
     #[must_use]
     pub fn find_install_root(path: &Path) -> Option<PathBuf> {
         let given = std::path::absolute(path).ok();
@@ -349,23 +380,49 @@ impl InstallArityCatalog {
         })
     }
 
-    /// The index resources that are the file `identity`, or its FAR member `name` at
-    /// byte `offset` when `member` is given. Paths play no part: only an entry whose file
-    /// is the one actually read can supply its code-owner role.
+    /// Which index resource the file read from `path` is: `identity` is that file's
+    /// identity (from the handle it was read through), and `member` its FAR member
+    /// `name` at byte `offset`. Only a file inside the install root (canonical paths)
+    /// identified as exactly one entry, with no unidentifiable entry of the same kind
+    /// that could also be it, is [`ResourceMatch::Unique`].
     #[must_use]
     pub fn resource_for(
         &self,
+        path: &Path,
         identity: &FileIdentity,
         member: Option<(&str, u64)>,
     ) -> ResourceMatch {
+        let inside = match (&self.root_canonical, std::fs::canonicalize(path)) {
+            (Some(root), Ok(file)) => file.starts_with(root),
+            _ => false,
+        };
+        if !inside {
+            return ResourceMatch::OutsideInstall;
+        }
+        let same_kind = |resource: &sims_content::Resource| match (&resource.member, member) {
+            (None, None) => true,
+            (Some(have), Some((name, _))) => have.name.eq_ignore_ascii_case(name),
+            _ => false,
+        };
+        let may_alias: Vec<String> = self
+            .unidentified
+            .iter()
+            .filter(|(number, _)| same_kind(&self.index.resources[*number]))
+            .map(|(number, error)| {
+                format!(
+                    "{} ({error})",
+                    self.index.resources[*number].location(&self.index.root)
+                )
+            })
+            .collect();
+        if !may_alias.is_empty() {
+            return ResourceMatch::MayAlias(may_alias);
+        }
         let member_matches = |resource: &sims_content::Resource| match (&resource.member, member) {
             (None, None) => true,
             (Some(have), Some((name, offset))) => have.name == name && have.offset == offset,
             _ => false,
         };
-        if !self.unidentified.is_empty() {
-            return ResourceMatch::Unidentified(self.unidentified.clone());
-        }
         let matches: Vec<usize> = self
             .index
             .resources
@@ -405,33 +462,20 @@ impl InstallArityCatalog {
     }
 
     /// Merged arities for `iff`, matched to the index as `matched`, following the
-    /// code-owner rules in the module docs. A file outside the index gets only its
-    /// private range (it may come from another install). A file indexed more than once
-    /// keeps an owner-dependent range only when every entry resolves it the same way;
-    /// otherwise it gets only the owner-independent global range.
+    /// code-owner rules in the module docs. Catalog-derived arities (and the claim that
+    /// private calls are local) apply only to a [`ResourceMatch::Unique`] file of a
+    /// complete catalog; anything else has no inferred role, and every range is unknown.
     pub fn resolve(&mut self, matched: ResourceMatch, iff: &Iff) -> ResolvedArities {
+        if let Err(why) = &self.global {
+            return ResolvedArities::no_role(&format!("install catalog incomplete: {why}"));
+        }
         match matched {
             ResourceMatch::Unique(resource) => self.resolve_entry(resource, iff),
-            ResourceMatch::Unindexed => {
-                ResolvedArities::private_only(iff, "file not in install index")
+            ResourceMatch::OutsideInstall => {
+                ResolvedArities::no_role("file resolves outside the install root")
             }
-            ResourceMatch::Unidentified(paths) => {
-                let mut shown = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-                if paths.len() > 3 {
-                    shown.push_str(&format!(" and {} more", paths.len() - 3));
-                }
-                let why = format!(
-                    "unknown code-owner role: {} install index path(s) could not be identified: {shown}",
-                    paths.len()
-                );
-                self.global_only(&why)
-            }
+            ResourceMatch::Unindexed => ResolvedArities::no_role("file not in install index"),
             ResourceMatch::Ambiguous(entries) => {
-                let mut each = entries.iter().map(|&r| self.resolve_entry(r, iff));
-                let first = each.next().expect("an ambiguous match has entries");
-                if each.all(|other| other == first) {
-                    return first;
-                }
                 let mut locations: Vec<String> = entries
                     .iter()
                     .map(|&r| self.index.resources[r].location(&self.index.root))
@@ -441,11 +485,20 @@ impl InstallArityCatalog {
                     locations.truncate(3);
                     locations.push(format!("{more} more"));
                 }
-                let why = format!(
-                    "ambiguous: the same file is indexed as {}, with different code-owner roles",
+                ResolvedArities::no_role(&format!(
+                    "the same file is indexed as {}",
                     locations.join(" and ")
-                );
-                self.global_only(&why)
+                ))
+            }
+            ResourceMatch::MayAlias(paths) => {
+                let mut shown = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+                if paths.len() > 3 {
+                    shown.push_str(&format!(" and {} more", paths.len() - 3));
+                }
+                ResolvedArities::no_role(&format!(
+                    "{} install index path(s) that could be this file could not be identified: {shown}",
+                    paths.len()
+                ))
             }
         }
     }
@@ -465,6 +518,7 @@ impl InstallArityCatalog {
             private: ArityPart::missing("unset"),
             global: ArityPart::missing("unset"),
             semi_global: ArityPart::missing("unset"),
+            hint: None,
         };
         self.apply_global(&mut resolved);
 
@@ -512,18 +566,6 @@ impl InstallArityCatalog {
                 resolved.semi_global = ArityPart::missing("no resolved GLOB link");
             }
         }
-        resolved
-    }
-
-    /// Only the owner-independent global range; the others are unknown for `why`.
-    fn global_only(&self, why: &str) -> ResolvedArities {
-        let mut resolved = ResolvedArities {
-            arities: BTreeMap::new(),
-            private: ArityPart::missing(why),
-            global: ArityPart::missing("unset"),
-            semi_global: ArityPart::missing(why),
-        };
-        self.apply_global(&mut resolved);
         resolved
     }
 
