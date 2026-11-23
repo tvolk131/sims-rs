@@ -72,13 +72,6 @@ fn asking<T>(
     (result, calls)
 }
 
-fn unsupported<T: std::fmt::Debug>(result: Result<T, sims_vm::Fault>) -> String {
-    match result.expect_err("expected a fault").trap {
-        Trap::Unsupported(what) => what,
-        other => panic!("expected an unsupported fault, got {other:?}"),
-    }
-}
-
 #[test]
 fn announcing_the_house_makes_the_indicators_and_clears_the_selection() {
     let mut fx = lot_with_person();
@@ -361,15 +354,116 @@ fn a_lot_without_indicators_still_selects() {
     assert_eq!(fx.world.globals[3], PERSON as i16);
 }
 
+/// The date of the date tests: a second resident.
+const DATE: u16 = 51;
+
+fn date_word(fx: &mut Fixture, id: u16, value: i16) {
+    let sim = fx.world.objects.get_mut(&id).unwrap();
+    sim.person.as_mut().unwrap().data[77] = value;
+}
+
 #[test]
-fn what_the_selection_does_not_port_fails() {
-    // A Sim with a date, which the second indicator marks.
+fn selecting_a_sim_with_a_date_puts_the_second_indicator_on_the_date() {
+    // 0x446924..0x446bae: a word 77 below 0 names the date by its negated
+    // ID. The second indicator leaves the lot and goes into the date's
+    // head slot (record 2, slot 1), letting go what was there.
     let mut fx = lot_with_person();
+    resident(&mut fx, DATE, [3, 2]);
     asking(&mut fx, |i, world| i.announce_house(world).unwrap());
-    let sim = fx.world.objects.get_mut(&PERSON).unwrap();
-    sim.person.as_mut().unwrap().data[77] = -3;
-    let (result, _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON)));
-    assert!(unsupported(result).contains("date"));
+    let [first, second] = fx.world.indicators;
+    date_word(&mut fx, PERSON, -(DATE as i16));
+    let ((), _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON)).unwrap());
+    assert_eq!(fx.world.objects[&PERSON].slots[2].object, first as i16);
+    assert_eq!(fx.world.objects[&DATE].slots[2].object, second as i16);
+    let marker = &fx.world.objects[&second];
+    assert_eq!((marker.data[2], marker.data[3]), (DATE as i16, 1));
+    assert_eq!(marker.position, fx.world.objects[&DATE].position);
+
+    // A word 77 above 0 does nothing here, and neither does a date that
+    // is not on the lot (only the indicator leaves).
+    for date in [DATE as i16, -999] {
+        let mut fx = lot_with_person();
+        resident(&mut fx, DATE, [3, 2]);
+        asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+        let second = fx.world.indicators[1];
+        date_word(&mut fx, PERSON, date);
+        let ((), _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON)).unwrap());
+        assert_eq!(fx.world.objects[&DATE].slots[2].object, 0);
+        assert_eq!(fx.world.objects[&second].data[2], 0);
+    }
+}
+
+#[test]
+fn writing_a_date_or_fame_queues_an_indicator_refresh() {
+    // 0x4538e3: resolving person word 77 or 81 with write intent queues
+    // the person, before the write. A date is queued once and only while
+    // word 77 is not 0 (0x4448a6); fame every time (0x444962).
+    let mut fx = lot_with_person();
+    let write = |fx: &mut Fixture, word: i16, value: i16| {
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![assign(
+                scope::MY_PERSON,
+                word,
+                scope::LITERAL,
+                value,
+                RETURN_TRUE,
+            )]),
+        );
+        assert_eq!(fx.run_with(PERSON, 4096, 0, &[], 100), Ok(true));
+    };
+    write(&mut fx, 77, -(DATE as i16));
+    assert_eq!(fx.world.indicator_queues, Default::default());
+    write(&mut fx, 77, 0);
+    write(&mut fx, 77, 5);
+    assert_eq!(fx.world.indicator_queues.dates, [PERSON]);
+    write(&mut fx, 77, 6);
+    assert_eq!(fx.world.indicator_queues.dates, [PERSON]);
+    write(&mut fx, 81, 3);
+    write(&mut fx, 81, 4);
+    assert_eq!(fx.world.indicator_queues.stars, [PERSON, PERSON]);
+    assert!(fx.world.indicator_queues.dirty);
+}
+
+#[test]
+fn the_indicator_refresh_moves_the_date_marker_and_empties_the_queues() {
+    // 0x4464db -> 0x4472a2: the second indicator leaves the lot, and goes
+    // onto the date of a selected person whose word 77 is below 0. The
+    // queues are emptied and the flag cleared (0x448847, 0x446643).
+    let mut fx = lot_with_person();
+    resident(&mut fx, DATE, [3, 2]);
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    let ((), _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON)).unwrap());
+    let second = fx.world.indicators[1];
+    date_word(&mut fx, PERSON, -(DATE as i16));
+    fx.world.indicator_queues = sims_sim::IndicatorQueues {
+        dates: vec![PERSON],
+        stars: vec![DATE],
+        dirty: true,
+    };
+    // Announcing the house with a Sim selected only refreshes (0x4a8679).
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    assert_eq!(fx.world.objects[&DATE].slots[2].object, second as i16);
+    assert_eq!(fx.world.indicator_queues, Default::default());
+
+    // A person that is not selected loses the marker and gives no new one.
+    fx.world.objects.get_mut(&PERSON).unwrap().selected = false;
+    fx.world.indicator_queues = sims_sim::IndicatorQueues {
+        dates: vec![PERSON],
+        stars: Vec::new(),
+        dirty: true,
+    };
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    assert_eq!(fx.world.objects[&DATE].slots[2].object, 0);
+    assert_eq!(fx.world.objects[&second].data[2], 0);
+
+    // Nothing is refreshed while the flag is clear.
+    fx.world.objects.get_mut(&PERSON).unwrap().selected = true;
+    fx.world.indicator_queues.dates = vec![PERSON];
+    let before = fx.world.hash();
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    assert_eq!(fx.world.hash(), before);
 }
 
 #[test]

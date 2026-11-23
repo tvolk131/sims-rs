@@ -52,6 +52,21 @@ fn unsupported(object: u16, what: &str) -> Fault {
     fault(object, Trap::Unsupported(what.into()))
 }
 
+/// The object a person word names by its ID (0x40743b), if it is on the
+/// lot's registry.
+fn object_by_id(world: &World, id: i16) -> Option<u16> {
+    u16::try_from(id)
+        .ok()
+        .filter(|&id| id != 0 && world.objects.contains_key(&id))
+}
+
+fn queued_but_gone(person: u16) -> Fault {
+    fault(
+        person,
+        Trap::Invalid("a person queued for an indicator refresh is not on the lot".into()),
+    )
+}
+
 /// The selected Sim (0x4456e4): [`World::selected`].
 pub fn selected(world: &World) -> Option<u16> {
     world.selected()
@@ -77,12 +92,21 @@ impl Interpreter<'_> {
     /// A house saves the Sim that was selected in global 3 but not the
     /// Sim's mark, so after a load nobody is selected and global 3 is
     /// cleared here.
+    ///
+    /// The house view answers the same signal (0x4a85a2), and its answer
+    /// ends with the interface's indicator refresh (0x4a8679,
+    /// [`Interpreter::refresh_indicators`]); it is taken to answer after
+    /// the registry, which is **unverified**. Only a refresh that a load
+    /// script queued could tell.
     pub fn announce_house(&self, world: &mut World) -> Result<Option<[u16; 2]>, Fault> {
-        if selected(world).is_some() {
-            return Ok(None);
-        }
-        let made = self.ensure_indicators(world)?;
-        set_global(world, SELECTED, 0)?;
+        let made = if selected(world).is_some() {
+            None
+        } else {
+            let made = self.ensure_indicators(world)?;
+            set_global(world, SELECTED, 0)?;
+            made
+        };
+        self.refresh_indicators(world)?;
         Ok(made)
     }
 
@@ -344,8 +368,9 @@ impl Interpreter<'_> {
     /// 2. If the Sim stands on the lot and has a slot 1, the indicator is
     ///    put into that slot (0x433340): it is asked function 9, and so
     ///    is the Sim.
-    /// 3. The second indicator marks the Sim's date. A Sim with a date
-    ///    (person data word 77 not 0) fails: that is not ported.
+    /// 3. The second indicator marks the Sim's date: a word 77 below 0
+    ///    takes it off the lot and puts it on the head of the object of the
+    ///    opposite ID ([`Interpreter::mark_date`]).
     ///
     /// Not modeled, being presentation: the indicator's graphic is bound
     /// to the Sim's and both are refreshed. With the Superstar pack the
@@ -398,14 +423,130 @@ impl Interpreter<'_> {
                 true,
             )?;
         }
-        if second != 0 && person_word(world, sim, person::DATE)? != 0 {
-            return Err(unsupported(
-                sim,
-                "the selected Sim has a date, which the second indicator marks; that is not \
-                 ported",
-            ));
+        // 0x446924..0x446bae: a word 77 below 0 is a date with the object
+        // of the opposite ID. The second indicator leaves the lot (virtual
+        // function 0x50 with 1), and if the object exists (0x40743b) goes
+        // onto its head. A word 77 above 0 does nothing here.
+        if second != 0 {
+            let date = person_word(world, sim, person::DATE)?;
+            if date < 0 {
+                if !world.objects.contains_key(&second) {
+                    return Err(missing());
+                }
+                self.take_off(world, second, true)?;
+                if let Some(target) = object_by_id(world, date.wrapping_neg()) {
+                    self.mark_date(world, target)?;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The interface's indicator refresh, when it draws the house view
+    /// (0x4464db: from the frame's draw at 0x4a8b12, after the rooms that
+    /// wait are counted, and from the view's answer to signal 0xf6 at
+    /// 0x4a8679). Nothing happens unless a refresh is waiting
+    /// (`IndicatorQueues::dirty`). Otherwise each person queued for a date
+    /// refresh has it ([`Interpreter::refresh_date`], 0x4472a2), in queue
+    /// order, then the date queue is emptied (0x448847); then the same for
+    /// the star queue ([`Interpreter::refresh_star`], 0x446ee9), and the
+    /// flag is cleared.
+    ///
+    /// The original walks each queue to the end it had when the walk
+    /// began, and the emptying also drops what a refresh queued on the way
+    /// (`legacy/crates/sims-vm/src/indicator_refresh.rs`). A queued person
+    /// leaves the queues when it is removed (0x447d8b), so each one is on
+    /// the lot here; one that is not fails.
+    pub(crate) fn refresh_indicators(&self, world: &mut World) -> Result<(), Fault> {
+        if !world.indicator_queues.dirty {
+            return Ok(());
+        }
+        let end = world.indicator_queues.dates.len();
+        for index in 0..end {
+            let person = world.indicator_queues.dates[index];
+            self.refresh_date(world, person)?;
+        }
+        world.indicator_queues.dates.clear();
+        let end = world.indicator_queues.stars.len();
+        for index in 0..end {
+            let person = world.indicator_queues.stars[index];
+            self.refresh_star(world, person)?;
+        }
+        world.indicator_queues.stars.clear();
+        world.indicator_queues.dirty = false;
+        Ok(())
+    }
+
+    /// A queued person's date refresh (0x4472a2). With no indicators on
+    /// the lot (the interface's +0x11 and +0xc8), or no second indicator,
+    /// nothing happens. Otherwise the second indicator leaves the lot
+    /// (virtual function 0x50 with 1). Then, if the person is selected and
+    /// its word 77, read after that, is below 0, the indicator goes onto
+    /// the head of the object of the opposite ID, if it exists (0x40743b;
+    /// [`Interpreter::mark_date`]).
+    fn refresh_date(&self, world: &mut World, person: u16) -> Result<(), Fault> {
+        let [first, second] = world.indicators;
+        let selected = world
+            .objects
+            .get(&person)
+            .ok_or_else(|| queued_but_gone(person))?
+            .selected;
+        if first == 0 || second == 0 {
+            return Ok(());
+        }
+        if !world.objects.contains_key(&second) {
+            return Err(fault(person, Trap::native(10, "missing object")));
+        }
+        self.take_off(world, second, true)?;
+        let date = person_word(world, person, person::DATE)?;
+        if !selected || date >= 0 {
+            return Ok(());
+        }
+        match object_by_id(world, date.wrapping_neg()) {
+            Some(target) => self.mark_date(world, target),
+            None => Ok(()),
+        }
+    }
+
+    /// A queued person's star refresh (0x446ee9). Only with the Superstar
+    /// pack (bit 0x40 of [`crate::Program::expansions`]) and for a person
+    /// that is not selected:
+    ///
+    /// - fame (word 81) 10 or more: a pooled star marker goes onto its
+    ///   head ([`Interpreter::mark_star`]);
+    /// - otherwise (0x4471ba): if its head slot holds the **date**
+    ///   indicator (GUID `0x0BAA_71C5`, 0x44727c), that indicator leaves
+    ///   the lot (virtual function 0x50 with 1) and is let go
+    ///   ([`Interpreter::release_from_head`], 0x4481eb). The original
+    ///   compares with the date indicator's GUID, not the star marker's.
+    ///
+    /// For a famous person on the border tiles the original takes a star
+    /// from its pool before it checks the tiles, and keeps it in neither
+    /// list; the port's pool is where the stars stand, so that star stays
+    /// available.
+    fn refresh_star(&self, world: &mut World, person: u16) -> Result<(), Fault> {
+        let selected = world
+            .objects
+            .get(&person)
+            .ok_or_else(|| queued_but_gone(person))?
+            .selected;
+        if self.program.expansions & crate::placement::EXPANSION_SUPERSTAR == 0 || selected {
+            return Ok(());
+        }
+        if person_word(world, person, person::FAME)? >= 10 {
+            return self.mark_star(world, person);
+        }
+        let Some(held) = self.head_slot(world, person)? else {
+            return Ok(());
+        };
+        let Some(held) = object_by_id(world, held) else {
+            return Ok(());
+        };
+        if world.objects[&held].guid != crate::load::INDICATORS[1] {
+            return Ok(());
+        }
+        self.take_off(world, held, true)?;
+        self.release_from_head(world, held)
     }
 
     /// Load step 19: the game goes to live mode (0x4cea5d, 0x416534,

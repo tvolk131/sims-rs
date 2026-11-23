@@ -578,6 +578,53 @@ pub struct World {
     /// [`World::encode`] to preserve snapshot format 32.
     #[serde(skip)]
     pub family_flags: BTreeMap<i32, u32>,
+    /// The interface's indicator refresh queues ([`IndicatorQueues`]).
+    /// The house file does not hold them. Kept out of [`World::encode`] to
+    /// preserve snapshot format 32; `sims_vm::boot::save::Saved` keeps
+    /// them across lot save/restore.
+    #[serde(skip)]
+    pub indicator_queues: IndicatorQueues,
+}
+
+/// The people whose indicators the interface will refresh when it next
+/// draws the house view (the interface object's vectors +0xb0 and +0xbc
+/// and its flag +0xac).
+///
+/// Resolving a person's data word with write intent, before the word is
+/// written, queues the person (0x4538e3, the resolver's person-data case):
+///
+/// - word 77, the date: 0x4448a6 queues the person unless its word 77 is
+///   0 before the write, or the person is already queued;
+/// - word 81, fame: 0x444962 queues the person every time.
+///
+/// Either sets `dirty`, which only the drain (0x4464db) clears.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndicatorQueues {
+    /// People whose date indicator to refresh (+0xb0), each once.
+    pub dates: Vec<u16>,
+    /// People whose star marker to refresh (+0xbc), repeats kept.
+    pub stars: Vec<u16>,
+    /// +0xac: a refresh is waiting.
+    pub dirty: bool,
+}
+
+impl IndicatorQueues {
+    /// 0x4448a6: queues `person` for a date refresh, given its word 77
+    /// before the write. A date of 0 or a person already queued (compared
+    /// by object ID, object +0xf0) changes nothing.
+    pub fn queue_date(&mut self, person: u16, date: i16) {
+        if date == 0 || self.dates.contains(&person) {
+            return;
+        }
+        self.dates.push(person);
+        self.dirty = true;
+    }
+
+    /// 0x444962: queues `person` for a star refresh.
+    pub fn queue_star(&mut self, person: u16) {
+        self.stars.push(person);
+        self.dirty = true;
+    }
 }
 
 /// One appearance attachment slot on `cTSPerson` (`0x583559`: suit name at
@@ -994,6 +1041,7 @@ impl World {
             event_owner: 0,
             magic_history: None,
             indicators: [0; 2],
+            indicator_queues: IndicatorQueues::default(),
             changed_types: BTreeSet::new(),
             next_parts: BTreeMap::new(),
             skeleton_files: BTreeSet::new(),
@@ -1090,6 +1138,23 @@ impl World {
         ans
     }
 
+    /// What the simulator read (0x46cfb3) does next on a lot not zoned
+    /// residential (`0x40745f` false, asked with the saved global 10): it
+    /// drops both saved streams and seeds each from a reading of the
+    /// host's millisecond clock (`timeGetTime`, import slot `0x666400`),
+    /// the lot's stream first (`0x46d0d3`, written to lot `+0xac`), then
+    /// the global stream (`0x46d0db`, set through `0x46f44d`). A
+    /// residential lot instead sets the global stream to its saved state
+    /// (`0x46d0ce`). Every SIMI version the port reads is at least 14, the
+    /// first to hold the streams (`0x46d096`).
+    ///
+    /// `readings` are the two clock readings, in that order. The port has
+    /// no host clock in the simulation, so a load passes them in.
+    pub fn seed_from_host_clock(&mut self, readings: [u32; 2]) {
+        self.lot_rng = GameRng::from_state(readings[0]);
+        self.global_rng = GameRng::from_state(readings[1]);
+    }
+
     /// Reads a house's usage counts from its house model (HOUS 1;
     /// 0x416568). The file stores each pair as the routing count, then
     /// the total; the five earlier days first, today last. A model of a
@@ -1111,6 +1176,10 @@ impl World {
     ///
     /// The globals are the saved 32 or 64 words as they are;
     /// [`World::apply_context`] turns them into the ones the lot runs with.
+    ///
+    /// Both streams take their saved states, as on a residential lot. A lot
+    /// zoned otherwise reseeds them straight after
+    /// ([`World::seed_from_host_clock`]).
     pub fn read_simulator(&mut self, simulator: &Simulator) {
         self.ticks = simulator.ticks;
         self.globals = simulator.globals.clone();
@@ -1318,6 +1387,27 @@ impl Object {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_date_is_queued_once_and_only_while_set_and_fame_every_time() {
+        // 0x4448a6 and 0x444962.
+        let mut queues = IndicatorQueues::default();
+        queues.queue_date(5, 0);
+        assert_eq!(queues, IndicatorQueues::default());
+        queues.queue_date(5, -3);
+        queues.queue_date(5, 7);
+        queues.queue_date(6, 1);
+        queues.queue_star(5);
+        queues.queue_star(5);
+        assert_eq!(
+            queues,
+            IndicatorQueues {
+                dates: vec![5, 6],
+                stars: vec![5, 5],
+                dirty: true,
+            }
+        );
+    }
 
     #[test]
     fn scratch_ptrs_serialize_bit_matches_btreeset_postcard_bytes() {

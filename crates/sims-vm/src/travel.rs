@@ -3488,7 +3488,7 @@ fn load_destination_world(
     interpreter
         .create_indicators(&mut world)
         .map_err(|e| TravelError::Lot(e.to_string()))?;
-    world.read_simulator(&file.simulator);
+    crate::boot::read_simulator(&mut world, &file.simulator, program);
     world.read_house_model(
         file.model
             .as_ref()

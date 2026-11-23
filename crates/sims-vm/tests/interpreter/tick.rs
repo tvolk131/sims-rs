@@ -3105,8 +3105,9 @@ fn play_mode_reselection_fault_reconciles_global_3_with_selected_sim() {
         stale: false,
     });
     // Put indicator objects 383 and 384 in the world; SIM stands off-lot so
-    // `move_indicators` skips head-slot placement and faults on SIM's date
-    // word (`person::DATE = 77`) AFTER `select` already set `SIM.selected = true`!
+    // `move_indicators` skips head-slot placement and faults on the missing
+    // second indicator its date asks for (`person::DATE = 77` below 0,
+    // 0x446996) AFTER `select` already set `SIM.selected = true`!
     let mut ind0 = fx.lamp().clone();
     ind0.id = 383;
     ind0.guid = sims_vm::INDICATORS[0];
@@ -3123,12 +3124,14 @@ fn play_mode_reselection_fault_reconciles_global_3_with_selected_sim() {
     fx.world.objects.insert(383, ind0);
     fx.world.objects.insert(384, ind1);
     fx.world.order.extend([383, 384]);
-    fx.world.indicators = [383, 384];
+    // The second indicator is gone from the lot, but the interface still
+    // names it.
+    fx.world.indicators = [383, 385];
 
     let sim = fx.sim_mut();
     sim.selected = false;
     sim.position = [-16, -16, 1];
-    sim.person.as_mut().unwrap().data[77] = 1; // DATE != 0 -> unsupported!
+    sim.person.as_mut().unwrap().data[77] = -1; // a date -> the missing indicator faults
 
     let mut play = Play::default();
     let u1 = play_update(&mut fx, &mut play);

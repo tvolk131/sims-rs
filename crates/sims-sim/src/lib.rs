@@ -74,9 +74,10 @@ pub use neighborhood_store::{
 pub use snapshot::{FORMAT as SNAPSHOT_FORMAT, ReadOnlySnapshots, Snapshots};
 pub use world::{
     ADVERTISEMENTS, Advertisement, BoundSlot, Budget, Dialog, Dialogs, FULL_SIZE, FrameStorage,
-    Headline, HouseUsage, MagicHistory, Object, PersonOutfit, PersonTick, PortraitFile,
-    SCRATCH_PTR_ARG_SLOT, SCRATCH_PTR_EXPRESSION, SCRATCH_PTR_SET, SCRATCH_PTR_SET_TO_NEXT,
-    ScratchPtrBitSerialize, ScratchPtrs, TypeAttributes, Usage, Whereabouts, WorkwearCache, World,
+    Headline, HouseUsage, IndicatorQueues, MagicHistory, Object, PersonOutfit, PersonTick,
+    PortraitFile, SCRATCH_PTR_ARG_SLOT, SCRATCH_PTR_EXPRESSION, SCRATCH_PTR_SET,
+    SCRATCH_PTR_SET_TO_NEXT, ScratchPtrBitSerialize, ScratchPtrs, TypeAttributes, Usage,
+    Whereabouts, WorkwearCache, World,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;

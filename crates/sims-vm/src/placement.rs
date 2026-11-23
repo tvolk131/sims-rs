@@ -253,7 +253,7 @@ pub(crate) const STAR_MARKER: u32 = 0xE933_7020;
 /// Superstar expansion bit in `[0x6e48bc] + 0x66` (`Program::expansions`),
 /// checked before creating or placing star markers (0x44639f, 0x446bf4,
 /// 0x447a36).
-const EXPANSION_SUPERSTAR: u16 = 0x40;
+pub(crate) const EXPANSION_SUPERSTAR: u16 = 0x40;
 
 /// A container entry in a definition's SLOT list.
 const CONTAINER_SLOT: u16 = 0;
@@ -1795,9 +1795,9 @@ impl Interpreter<'_> {
     ///
     /// - the person is the selected Sim: the first indicator goes into its
     ///   head slot ([`Interpreter::mark_selected`], 0x4475d2);
-    /// - person word 77 names an object (is above 0): the second
-    ///   indicator moves to that object (0x4477fb), which is not ported
-    ///   and fails;
+    /// - person word 77 names an object (is above 0): the person has a
+    ///   date with it, and the second indicator moves onto its head
+    ///   (0x4477fb; taken off the lot first if the person is selected);
     /// - the person is not selected and person word 81 is 10 or more:
     ///   with bit 0x40 of the installed-expansions mask (application field
     ///   +0x66, [`crate::Program::expansions`]), a pooled star marker
@@ -1828,18 +1828,22 @@ impl Interpreter<'_> {
             trap: Trap::Invalid("a person stopped being one".into()),
         })?;
         let word = |index: usize| person.data.get(index).copied().unwrap_or(0);
-        if word(77) > 0 {
-            return Err(Fault {
-                object: id,
-                at: None,
-                trap: Trap::Unsupported(
-                    "a person whose person word 77 names an object moves the second indicator \
-                     there (0x4477fb); not ported"
-                        .into(),
-                ),
-            });
+        let (date, fame) = (word(77), word(81));
+        // 0x4477c8..0x447a2d: a person whose word 77 is above 0 has a date
+        // with the object of that ID. If the person is selected the second
+        // indicator first leaves the lot (virtual function 0x50 with 1);
+        // then, if the object exists (0x40743b), the indicator goes onto its
+        // head ([`Interpreter::mark_date`]).
+        let second = world.indicators[1];
+        if second != 0 && date > 0 {
+            if selected {
+                self.take_off(world, second, true)?;
+            }
+            if let Some(target) = registered(world, date) {
+                self.mark_date(world, target)?;
+            }
         }
-        if !selected && word(81) >= 10 {
+        if !selected && fame >= 10 {
             self.mark_star(world, id)?;
         }
         Ok(())
@@ -1982,30 +1986,44 @@ impl Interpreter<'_> {
         if capture(world, indicator).map_err(fail)?.container != Some(id) {
             self.take_off(world, indicator, true)?;
         }
+        self.put_in_head(world, indicator, id)
+    }
+
+    /// Puts `indicator` into the head slot of `id`, as the interface does
+    /// with each of its markers (0x4475d2 for the selected Sim's,
+    /// 0x446924, 0x4477c8 and 0x447376 for a date's):
+    ///
+    /// 1. An object on the lot's border tiles (0x422632) stops here.
+    /// 2. Its slot 1 as scripts count it (record 2) is its head slot, when
+    ///    its definition has no container slots of its own (the person's
+    ///    records, 0x45962b); one with any fails loudly. The head slot has
+    ///    flag 2 (record +0x1c), so the step goes on.
+    /// 3. The object the head slot holds, if any, is let go
+    ///    ([`Interpreter::release_from_head`], 0x4481eb).
+    /// 4. The indicator is put into the head slot with the lot told
+    ///    (virtual function 0x58: the object's position and level, slot 1,
+    ///    last argument 1).
+    ///
+    /// The rest is drawing: the indicator's sprite is told the object's
+    /// draw group and shown.
+    pub(crate) fn put_in_head(
+        &self,
+        world: &mut World,
+        indicator: u16,
+        id: u16,
+    ) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
         let [p0, p1, level] = position(world, id).map_err(fail)?;
         if off_lot(world, [p0, p1]) {
             return Ok(());
         }
-        let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
-        let definition = crate::interpreter::object_definition(self.catalog, world, object.guid)
-            .ok_or_else(|| fail(Trap::Invalid("object has no definition".into())))?;
-        let own = self
-            .program
-            .slots(definition.resource, definition.chunk)
-            .iter()
-            .filter(|entry| entry.kind == CONTAINER_SLOT)
-            .count();
-        if own != 0 {
-            return Err(fail(Trap::Unsupported(format!(
-                "the selected Sim {id} comes onto the lot with {own} container slots of its \
-                 own: its slot 1 (0x4476a2) is then one of them, whose flags are not read"
-            ))));
-        }
-        let held = object
-            .slots
-            .get(2)
-            .ok_or_else(|| fail(Trap::Invalid(format!("person {id} has no head slot"))))?
-            .object;
+        let Some(held) = self.head_slot(world, id)? else {
+            return Err(fail(Trap::Invalid(format!("object {id} has no head slot"))));
+        };
         if let Some(held) = registered(world, held) {
             self.release_from_head(world, held)?;
         }
@@ -2021,6 +2039,43 @@ impl Interpreter<'_> {
             },
             true,
         )
+    }
+
+    /// What the head slot of `id` holds (record 2, slot 1 as scripts count
+    /// it): an object ID or 0, or None when `id` has no such record. The
+    /// record is the head slot only when the definition has no container
+    /// slots of its own; one with any fails loudly, since its slot 1 is
+    /// then one of them, whose flags are not read.
+    pub(crate) fn head_slot(&self, world: &World, id: u16) -> Result<Option<i16>, Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
+        let definition = crate::interpreter::object_definition(self.catalog, world, object.guid)
+            .ok_or_else(|| fail(Trap::Invalid("object has no definition".into())))?;
+        let own = self
+            .program
+            .slots(definition.resource, definition.chunk)
+            .iter()
+            .filter(|entry| entry.kind == CONTAINER_SLOT)
+            .count();
+        if own != 0 {
+            return Err(fail(Trap::Unsupported(format!(
+                "object {id} has {own} container slots of its own: its slot 1 (0x4476a2, and \
+                 for a date 0x446a4a, 0x4478d0) is then one of them, whose flags are not read"
+            ))));
+        }
+        Ok(object.slots.get(2).map(|slot| slot.object))
+    }
+
+    /// The date indicator (the lot's second indicator) onto `target`'s head
+    /// ([`Interpreter::put_in_head`]). The callers have looked `target` up
+    /// by its ID (0x40743b) from the dating person's word 77.
+    pub(crate) fn mark_date(&self, world: &mut World, target: u16) -> Result<(), Fault> {
+        let indicator = world.indicators[1];
+        self.put_in_head(world, indicator, target)
     }
 
     /// 0x4481eb, for an object in a Sim's head slot: reads the argument's GUID

@@ -235,6 +235,18 @@ impl Interpreter<'_> {
                 }
             }
         }
+        // 0x447ed5..0x447f74 and 0x447fdd..0x448068: a person leaves the
+        // indicator refresh queues, the first entry of each that names it
+        // (0x448663 erases one element), so a later frame's refresh does
+        // not read it (`sims_sim::IndicatorQueues`).
+        if interface_enabled && world.objects.get(&id).is_some_and(|o| o.person.is_some()) {
+            let queues = &mut world.indicator_queues;
+            for queue in [&mut queues.dates, &mut queues.stars] {
+                if let Some(index) = queue.iter().position(|&other| other == id) {
+                    queue.remove(index);
+                }
+            }
+        }
         let person = world.objects.get(&id).is_some_and(|o| o.person.is_some());
         if person {
             if matches!(
