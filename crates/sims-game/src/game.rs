@@ -6312,6 +6312,8 @@ impl Game {
             return false;
         }
         self.hud.close_camera_strip();
+        let had_balloon =
+            self.hud.controls.help.is_some() || self.hud.controls.options.help.is_some();
         self.hud.controls.apply(&Command::TogglePanel);
         if self.hud.controls.mode == Mode::Live {
             self.live_panel_expanded = self.hud.controls.expanded;
@@ -6321,6 +6323,9 @@ impl Game {
             self.layout_buy();
         } else if self.hud.controls.mode == Mode::Build {
             self.layout_build();
+        }
+        if had_balloon {
+            self.hud.play(crate::hud::WHOOSH);
         }
         self.hud.play(crate::hud::CLICK);
         self.flush_hud_sounds();

@@ -4634,7 +4634,19 @@ mod tests {
 
         for focus in [
             KeyboardFocus {
-                cheat_console_open: true,
+                save_manager_open: true,
+                ..none
+            },
+            KeyboardFocus {
+                travel_dialog_open: true,
+                ..none
+            },
+            KeyboardFocus {
+                shop_open: true,
+                ..none
+            },
+            KeyboardFocus {
+                book_open: true,
                 ..none
             },
             KeyboardFocus {
@@ -4656,10 +4668,20 @@ mod tests {
                 "F6/Ctrl+M co-op toggle must stay blocked under {focus:?}"
             );
             assert!(
-                !cheat_toggle_allowed(focus) || focus.cheat_console_open,
-                "Ctrl+Shift+C cheat toggle must stay blocked under non-console modal {focus:?}"
+                !cheat_toggle_allowed(focus),
+                "Ctrl+Shift+C cheat toggle must stay blocked under {focus:?}"
             );
         }
+
+        // Open Cheat Console blocks bare lot hotkeys and F6/Ctrl+M co-op toggle,
+        // while still allowing Ctrl+Shift+C to close the console itself.
+        let console = KeyboardFocus {
+            cheat_console_open: true,
+            ..none
+        };
+        assert!(lot_hotkeys_blocked(console));
+        assert!(!coop_toggle_allowed(console));
+        assert!(cheat_toggle_allowed(console));
 
         // Co-op lobby blocks bare lot hotkeys and cheat toggle while still
         // allowing F6/Ctrl+M to close the lobby itself.

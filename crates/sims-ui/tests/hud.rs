@@ -742,5 +742,13 @@ fn expanded_hud_at_800x600_and_1024x768_preserves_native_pixels_outside_backpatc
             patch_diff > 0,
             "BackPatch must actually fill transparent cluster wedge at {w}x{h}"
         );
+        if [w, h] == [800, 600] {
+            // Pin 100.00% of pixels outside BackPatch directly against the
+            // exact pre-branch `open 800x600` SHA-256 baseline.
+            assert_eq!(
+                digest(&without_patch),
+                "3829280fd7136e5abc9d561e63fdec9aa38a28dec6ae0b3a72cbd3434b898f1a"
+            );
+        }
     }
 }
