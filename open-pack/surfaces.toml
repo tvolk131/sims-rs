@@ -1,0 +1,81 @@
+# Clean-room procedural floor (.flr) and wall (.wll) surface specifications.
+
+[[floor]]
+file = "open_oak_plank.flr"
+id = 30
+name = "Open Oak Plank"
+price = 12
+description = "Warm clean-room oak hardwood planks for living and sleeping rooms."
+pattern = "plank"
+primary_rgb = [168, 122, 78]
+accent_rgb = [118, 82, 48]
+
+[[floor]]
+file = "open_ceramic_tile.flr"
+id = 31
+name = "Open Ceramic Tile"
+price = 14
+description = "Bright glazed clean-room tiles suited for kitchens and baths."
+pattern = "tile"
+primary_rgb = [224, 232, 236]
+accent_rgb = [164, 182, 194]
+
+[[floor]]
+file = "open_meadow_carpet.flr"
+id = 32
+name = "Open Meadow Carpet"
+price = 10
+description = "Soft woven sage clean-room carpet for cozy bedrooms."
+pattern = "carpet"
+primary_rgb = [132, 158, 134]
+accent_rgb = [104, 130, 108]
+
+[[floor]]
+file = "open_stone_paver.flr"
+id = 33
+name = "Open Stone Paver"
+price = 8
+description = "Checkered slate clean-room paving stones for porches and walkways."
+pattern = "checker"
+primary_rgb = [154, 158, 162]
+accent_rgb = [120, 124, 130]
+
+[[wall]]
+file = "open_cream_plaster.wll"
+id = 31
+name = "Open Cream Plaster"
+price = 8
+description = "Smooth sunlit clean-room plaster with timber baseboard trim."
+pattern = "plaster"
+primary_rgb = [236, 228, 210]
+accent_rgb = [148, 114, 78]
+
+[[wall]]
+file = "open_warm_brick.wll"
+id = 32
+name = "Open Warm Brick"
+price = 12
+description = "Classic running-bond clean-room masonry wall for cottage exteriors."
+pattern = "brick"
+primary_rgb = [174, 96, 74]
+accent_rgb = [212, 204, 190]
+
+[[wall]]
+file = "open_bath_tile.wll"
+id = 33
+name = "Open Bath Tile"
+price = 14
+description = "Clean-room glazed ceramic wall tile for bathrooms and kitchens."
+pattern = "tile"
+primary_rgb = [188, 214, 224]
+accent_rgb = [234, 240, 244]
+
+[[wall]]
+file = "open_wood_panel.wll"
+id = 34
+name = "Open Wood Panel"
+price = 11
+description = "Clean-room wainscot timber wall paneling for studies and dining rooms."
+pattern = "panel"
+primary_rgb = [164, 120, 82]
+accent_rgb = [106, 74, 46]

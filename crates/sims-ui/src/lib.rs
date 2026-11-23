@@ -30,6 +30,7 @@
 pub mod album;
 pub mod art;
 pub mod balloon;
+pub mod book;
 pub mod build;
 pub mod buy;
 pub mod caf;

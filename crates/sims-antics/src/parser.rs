@@ -1533,7 +1533,14 @@ impl Parser {
                 | "create_object"
                 | "remove_object"
                 | "run_functional_tree"
-                | "alter_budget" => {
+                | "alter_budget"
+                | "sleep"
+                | "generic_call"
+                | "random"
+                | "idle_for_input"
+                | "stop_all_sounds"
+                | "set_motive_change"
+                | "clear_motive_changes" => {
                     let prim = self.parse_primitive_call()?;
                     Condition::Primitive { span, prim }
                 }

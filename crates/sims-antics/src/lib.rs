@@ -10,12 +10,16 @@ pub mod audio;
 pub mod compile;
 pub mod encode;
 pub mod error;
+pub mod house;
 pub mod ir;
 pub mod lexer;
 pub mod lift;
 pub mod lower;
 pub mod manifest;
 pub mod parser;
+pub mod sim_pack;
+pub mod structure_lift;
+pub mod verify;
 
 pub use compile::{
     CompiledModule, CompiledObject, CompiledPack, CompiledPackObject, compile_antics,
@@ -23,3 +27,10 @@ pub use compile::{
     package_far,
 };
 pub use error::{Error, Result, Span};
+pub use sim_pack::{StandalonePack, compile_standalone_pack_dir};
+pub use structure_lift::{StructuredLiftOutcome, lift_bhav_structured};
+pub use verify::{
+    EquivOptions, EquivResult, PackSafetyReport, SafetyCategory, SafetyReport, SafetyViolation,
+    TraceStep, check_bhav_equivalent, check_bhav_equivalent_with_arities, verify_iff_safety,
+    verify_object_safety, verify_pack_safety,
+};

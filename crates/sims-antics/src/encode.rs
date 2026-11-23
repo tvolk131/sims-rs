@@ -3,8 +3,9 @@
 
 use crate::error::{Error, Result};
 use crate::ir::{
-    BconChunk, BhavChunk, DgrpChunk, FarEntry, FwavChunk, ObjdChunk, ObjfChunk, PaltChunk,
-    SlotChunk, Spr2Chunk, Spr2Frame, Spr2Pixel, StringFormat, StringTableChunk, TtabChunk,
+    BconChunk, BhavChunk, DgrpChunk, FarEntry, FwavChunk, LegacySprChunk, LegacySprFrame,
+    ObjdChunk, ObjfChunk, PaltChunk, SlotChunk, Spr2Chunk, Spr2Frame, Spr2Pixel, StringFormat,
+    StringTableChunk, TtabChunk,
 };
 use sims_formats::far::{MAX_DIRECTORY, MAX_MEMBER};
 use sims_formats::iff::{ChunkData, DELETED};
@@ -691,6 +692,159 @@ pub fn encode_spr2(chunk: &Spr2Chunk) -> Result<Vec<u8>> {
             out.extend_from_slice(&len_u32.to_le_bytes());
             out.extend_from_slice(&frame_bytes);
         }
+    }
+    Ok(out)
+}
+
+fn encode_legacy_spr_frame(frame: &LegacySprFrame) -> Result<Vec<u8>> {
+    let width = usize::from(frame.width);
+    let height = usize::from(frame.height);
+    let expected = width
+        .checked_mul(height)
+        .ok_or_else(|| Error::new("SPR# frame dimensions overflow"))?;
+    if expected > MAX_SPR2_PIXELS {
+        return Err(Error::new("SPR# frame exceeds 16 megapixel reader limit"));
+    }
+    if frame.pixels.len() != expected {
+        return Err(Error::new(format!(
+            "SPR# frame expected {expected} pixels, got {}",
+            frame.pixels.len()
+        )));
+    }
+    let bottom = i16::try_from(frame.height)
+        .map_err(|_| Error::new("SPR# frame height exceeds i16::MAX"))?;
+    let right =
+        i16::try_from(frame.width).map_err(|_| Error::new("SPR# frame width exceeds i16::MAX"))?;
+
+    let mut out = Vec::new();
+    // Native Rect: top, left, bottom, right, plus 2 skipped bytes.
+    out.extend_from_slice(&0i16.to_le_bytes());
+    out.extend_from_slice(&0i16.to_le_bytes());
+    out.extend_from_slice(&bottom.to_le_bytes());
+    out.extend_from_slice(&right.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+
+    let mut row = 0usize;
+    while row < height {
+        let mut empty = 0usize;
+        while row + empty < height && empty < 255 {
+            let start = (row + empty) * width;
+            if frame.pixels[start..start + width]
+                .iter()
+                .all(Option::is_none)
+            {
+                empty += 1;
+            } else {
+                break;
+            }
+        }
+        if empty > 0 {
+            out.push(9);
+            out.push(empty as u8);
+            row += empty;
+            continue;
+        }
+
+        let row_pixels = &frame.pixels[row * width..(row + 1) * width];
+        let mut row_buf = Vec::new();
+        let mut col = 0usize;
+        while col < width {
+            match row_pixels[col] {
+                None => {
+                    let start = col;
+                    while col < width && col - start < 255 && row_pixels[col].is_none() {
+                        col += 1;
+                    }
+                    row_buf.push(1);
+                    row_buf.push((col - start) as u8);
+                }
+                Some(first) => {
+                    let mut same = 1usize;
+                    while col + same < width && same < 255 && row_pixels[col + same] == Some(first)
+                    {
+                        same += 1;
+                    }
+                    if same >= 3 {
+                        row_buf.push(2);
+                        row_buf.push(same as u8);
+                        row_buf.push(first);
+                        row_buf.push(first);
+                        col += same;
+                    } else {
+                        let start = col;
+                        let mut literal = Vec::new();
+                        while col < width && col - start < 255 {
+                            let Some(c) = row_pixels[col] else {
+                                break;
+                            };
+                            literal.push(c);
+                            col += 1;
+                        }
+                        let n = literal.len();
+                        row_buf.push(3);
+                        row_buf.push(n as u8);
+                        row_buf.extend_from_slice(&literal);
+                        if !n.is_multiple_of(2) {
+                            row_buf.push(0);
+                        }
+                    }
+                }
+            }
+        }
+        if row_buf.len() + 2 <= 255 && row_buf.len() + 2 != 2 {
+            out.push(4);
+            out.push((row_buf.len() + 2) as u8);
+            out.extend_from_slice(&row_buf);
+        } else {
+            let total = u16::try_from(row_buf.len() + 6)
+                .map_err(|_| Error::new("SPR# encoded row exceeds u16::MAX"))?;
+            out.push(4);
+            out.push(2);
+            out.push(5);
+            out.push(255);
+            out.extend_from_slice(&total.to_be_bytes());
+            out.extend_from_slice(&row_buf);
+        }
+        row += 1;
+    }
+    out.push(5);
+    out.push(0);
+    Ok(out)
+}
+
+/// Encodes a legacy `SPR#` sprite set chunk (versions `502..=505`, little-endian)
+/// compatible with `sims_formats::sprite::LegacySpriteSet::parse`.
+pub fn encode_legacy_spr(chunk: &LegacySprChunk) -> Result<Vec<u8>> {
+    if !(502..=505).contains(&chunk.version) {
+        return Err(Error::new(format!(
+            "unsupported SPR# version {} (supported: 502..=505)",
+            chunk.version
+        )));
+    }
+    if chunk.frames.len() > 4096 {
+        return Err(Error::new("SPR# frame count exceeds 4096 limit"));
+    }
+    let mut encoded_frames = Vec::with_capacity(chunk.frames.len());
+    for frame in &chunk.frames {
+        encoded_frames.push(encode_legacy_spr_frame(frame)?);
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&chunk.version.to_le_bytes());
+    out.extend_from_slice(&(encoded_frames.len() as u32).to_le_bytes());
+    out.extend_from_slice(&chunk.default_palette.to_le_bytes());
+    let mut offset = 12usize
+        .checked_add(encoded_frames.len().saturating_mul(4))
+        .ok_or_else(|| Error::new("SPR# offset overflow"))?;
+    for frame_bytes in &encoded_frames {
+        let off_u32 =
+            u32::try_from(offset).map_err(|_| Error::new("SPR# frame offset exceeds u32"))?;
+        out.extend_from_slice(&off_u32.to_le_bytes());
+        offset = offset
+            .checked_add(frame_bytes.len())
+            .ok_or_else(|| Error::new("SPR# total size overflow"))?;
+    }
+    for frame_bytes in encoded_frames {
+        out.extend_from_slice(&frame_bytes);
     }
     Ok(out)
 }

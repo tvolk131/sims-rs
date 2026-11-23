@@ -431,6 +431,25 @@ pub struct FwavChunk {
     pub sound_name: String,
 }
 
+/// One frame in a legacy `SPR#` sprite set (used for `.wll` wallpaper patterns).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacySprFrame {
+    pub width: u16,
+    pub height: u16,
+    /// Row-major `width * height` pixels; `None` = transparent, `Some(idx)` = palette index.
+    pub pixels: Vec<Option<u8>>,
+}
+
+/// A legacy `SPR#` sprite set chunk (versions `502..=505`, little-endian).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacySprChunk {
+    pub id: u16,
+    pub label: String,
+    pub version: u32,
+    pub default_palette: u32,
+    pub frames: Vec<LegacySprFrame>,
+}
+
 /// One member to package into a `FAR` archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FarEntry<'a> {

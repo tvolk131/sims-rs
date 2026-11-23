@@ -1,0 +1,65 @@
+// Open Floor Lamp (0x7F00_0070) — toggleable lighting state (attr[1]) and Room score boost.
+//
+// Attributes (`stack.attr`):
+//   attr[0] = occupancy lock (0 = free, 1 = busy)
+//   attr[1] = light state (0 = off, 1 = on)
+
+bcon 4096 "LampTuning" {
+    room_boost = 35,
+    enjoy_ticks = 1,
+}
+
+tree 4096 "Init" {
+    my.attr[0] := 0;
+    my.attr[1] := 1;
+    return true;
+}
+
+tree 4097 "Main" {
+    return true;
+}
+
+tree 4098 "CanTurnOnLamp" {
+    if stack.attr[1] != 0 {
+        return false;
+    }
+    return true;
+}
+
+tree 4099 "CanTurnOffLamp" {
+    if stack.attr[1] == 0 {
+        return false;
+    }
+    return true;
+}
+
+tree 4100 "CanEnjoyLamp" {
+    if stack.attr[0] != 0 {
+        return false;
+    }
+    if stack.attr[1] == 0 {
+        return false;
+    }
+    return true;
+}
+
+interaction 4101 "TurnOnLamp" {
+    stack.attr[1] := 1;
+    play_sound(1, stack_obj);
+    my.motive.room += bcon.room_boost;
+    return true;
+}
+
+interaction 4102 "TurnOffLamp" {
+    stack.attr[1] := 0;
+    play_sound(1, stack_obj);
+    return true;
+}
+
+interaction 4103 "EnjoyLamp" {
+    stack.attr[0] := 1;
+    idle(bcon.enjoy_ticks);
+    my.motive.room += bcon.room_boost;
+    stack.attr[0] := 0;
+    return true;
+}

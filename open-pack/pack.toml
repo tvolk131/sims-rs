@@ -1,6 +1,6 @@
 [pack]
 name = "Open Starter Pack"
-version = "0.2.0"
+version = "0.3.0"
 author = "sims-rs Contributors"
 license = "MIT"
 archive = "open-pack.far"
@@ -15,4 +15,14 @@ objects = [
     "open-meal-plate",
     "open-wall-phone",
     "open-shower",
+    "open-toilet",
+    "open-sofa",
+    "open-tv",
+    "open-bookshelf",
+    "open-dining-table",
+    "open-dining-chair",
+    "open-floor-lamp",
+    "open-trash-can",
+    "open-front-door",
+    "open-mailbox",
 ]
