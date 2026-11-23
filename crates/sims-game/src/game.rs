@@ -63,6 +63,7 @@ use sims_ui::coop::{
     CoopSnapshot, LobbyTab,
 };
 use sims_ui::dialog::DialogFadeState;
+use sims_ui::phonebook::{PhoneBookCommand, PhoneBookDialog, PhoneBookEntry, PhoneBookSnapshot};
 use sims_ui::options::{LotVisibility, OptionsState};
 use sims_ui::queue::QueueSlideState;
 use sims_ui::shop::{
@@ -213,12 +214,16 @@ pub struct SpecialLotEntry {
     pub zoning: i16,
 }
 
-/// Outfit / skin target resolved for live 3D Sim "Try On" preview rendering.
+/// Outfit / skin / pet target resolved for live 3D "Try On" turntable preview rendering.
 #[derive(Debug, Clone)]
 struct ShopPreviewTarget {
     person: u16,
     suit: String,
     row: Option<String>,
+    /// `Some(false)` = Dog (`"dog"` skeleton), `Some(true)` = Cat (`"kat"` skeleton), `None` = Human.
+    pet_is_cat: Option<bool>,
+    /// Optional head override `(appearance, texture)` for full-body Charm Transform costumes.
+    head_override: Option<(String, String)>,
 }
 
 /// Active VM special panel (`Dialog` kinds `5..=15`) currently presented in UI.
@@ -358,6 +363,11 @@ pub struct Game {
     book_art: Option<Art>,
     book_strings: Option<BookStrings>,
     book_snapshot: Option<ReferenceBookSnapshot>,
+    /// Native `cWinPhoneBook` (`phonebookbkg.bmp` `80`, `phoneicon.bmp` `81`) modal
+    /// for `Dialog` kind 10 (`CallNeighbor`).
+    phonebook_dialog: PhoneBookDialog,
+    phonebook_art: Option<Art>,
+    phonebook_snapshot: Option<PhoneBookSnapshot>,
     /// Real graphical destination map picker for VM special lot pickers
     /// (`Dialog` kinds `5, 7, 8, 11, 13`: Downtown, Vacation, Old Town,
     /// Studio Town, Magic Town).
@@ -1075,6 +1085,9 @@ impl Game {
             book_art: None,
             book_strings: None,
             book_snapshot: None,
+            phonebook_dialog: PhoneBookDialog::new(),
+            phonebook_art: None,
+            phonebook_snapshot: None,
             destination_picker: None,
             destination_picker_assets: None,
             neighborhood_slot: 1,
@@ -1461,6 +1474,9 @@ impl Game {
             book_art: None,
             book_strings: None,
             book_snapshot: None,
+            phonebook_dialog: PhoneBookDialog::new(),
+            phonebook_art: None,
+            phonebook_snapshot: None,
             destination_picker: None,
             destination_picker_assets: None,
             neighborhood_slot: 1,
@@ -1803,6 +1819,9 @@ impl Game {
             book_art: None,
             book_strings: None,
             book_snapshot: None,
+            phonebook_dialog: PhoneBookDialog::new(),
+            phonebook_art: None,
+            phonebook_snapshot: None,
             destination_picker: None,
             destination_picker_assets: None,
             neighborhood_slot: 1,
@@ -2006,6 +2025,9 @@ impl Game {
             book_art: None,
             book_strings: None,
             book_snapshot: None,
+            phonebook_dialog: PhoneBookDialog::new(),
+            phonebook_art: None,
+            phonebook_snapshot: None,
             destination_picker: None,
             destination_picker_assets: None,
             neighborhood_slot: 1,
@@ -2140,6 +2162,7 @@ impl Game {
             || self.build_drag.is_some()
             || self.wall_cursor.is_some()
             || self.shop_dialog.is_open()
+            || self.phonebook_dialog.is_open()
             || self.coop_lobby.is_open()
             || self.hud.dragging_slider()
             || self.hud.dragging_dialog_entry()
@@ -2890,6 +2913,7 @@ impl Game {
     pub fn has_dialog(&self) -> bool {
         self.hud.has_dialog()
             || self.book_dialog.is_open()
+            || self.phonebook_dialog.is_open()
             || self.destination_picker.is_some()
             || self.lot.asking().is_some()
             || self.lot.asking_special_panel().is_some()
@@ -2954,6 +2978,56 @@ impl Game {
     /// Handles a native modal confirmation key (`Enter`, `Escape`, or localized
     /// Yes/No from `STR# 161`, `0x5e5b3b..0x5e5bfd`, `0x6d7530`).
     pub fn dialog_confirm_key(&mut self, key: DialogKey) -> Outcome {
+        if self.phonebook_dialog.is_open() {
+            return match key {
+                DialogKey::Enter => self.phonebook_submit(),
+                DialogKey::Escape => self.phonebook_escape(),
+                _ => Outcome::default(),
+            };
+        }
+        if self.phonebook_dialog.is_open() {
+            if let Some(snapshot) = &self.phonebook_snapshot {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                self.phonebook_dialog
+                    .pointer_move(size, snapshot, point[0], point[1]);
+            }
+            return true;
+        }
+        if self.phonebook_dialog.is_open() {
+            self.pointer = Some(point);
+            if let Some(snapshot) = &self.phonebook_snapshot {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                let changed = self
+                    .phonebook_dialog
+                    .pointer_down(size, snapshot, point[0], point[1]);
+                return Outcome {
+                    redraw: changed,
+                    ..Outcome::default()
+                };
+            }
+            return Outcome::default();
+        }
+        if self.phonebook_dialog.is_open() {
+            self.pointer = Some(point);
+            let cmd = self.phonebook_snapshot.as_ref().and_then(|snap| {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                self.phonebook_dialog
+                    .pointer_up(size, snap, point[0], point[1])
+            });
+            return match cmd {
+                Some(cmd) => self.execute_phonebook_command(cmd),
+                None => Outcome::redraw(),
+            };
+        }
         if self.book_dialog.is_open() {
             return match key {
                 DialogKey::Enter | DialogKey::Escape => self.book_close(),
@@ -3184,6 +3258,7 @@ impl Game {
             || self.lot.asking_special_panel().is_some()
             || self.shop_dialog.is_open()
             || self.book_dialog.is_open()
+            || self.phonebook_dialog.is_open()
             || self.hud.menu.is_some()
             || self.cheat_console_open()
         {
@@ -3445,6 +3520,7 @@ impl Game {
             || self.lot.asking_special_panel().is_some()
             || self.shop_dialog.is_open()
             || self.book_dialog.is_open()
+            || self.phonebook_dialog.is_open()
             || self.hud.menu.is_some()
             || self.cheat_console_open()
         {
@@ -3488,6 +3564,7 @@ impl Game {
         let ticks_active = self.hud.controls.mode == Mode::Live
             && !self.hud.has_ui_dialog()
             && !self.book_dialog.is_open()
+            && !self.phonebook_dialog.is_open()
             && self.destination_picker.is_none()
             && self.lot.asking().is_none()
             && self.lot.asking_special_panel().is_none()
@@ -4221,6 +4298,7 @@ impl Game {
         self.draw_build_cost_label();
         self.draw_shop_dialog();
         self.draw_book_dialog();
+        self.draw_phonebook_dialog();
         self.draw_destination_picker();
         self.draw_coop_hud_and_lobby();
         // The help balloon closed by the selection's going.
@@ -4253,6 +4331,7 @@ impl Game {
             && !self.cheat_console_open()
             && !self.shop_dialog.is_open()
             && !self.book_dialog.is_open()
+            && !self.phonebook_dialog.is_open()
             && self.destination_picker.is_none()
             && self.highlighted_buttons.is_empty()
             && self.highlighted_portraits.is_empty()
@@ -4453,6 +4532,56 @@ impl Game {
             }
             return true;
         }
+        if self.phonebook_dialog.is_open() {
+            return match key {
+                DialogKey::Enter => self.phonebook_submit(),
+                DialogKey::Escape => self.phonebook_escape(),
+                _ => Outcome::default(),
+            };
+        }
+        if self.phonebook_dialog.is_open() {
+            if let Some(snapshot) = &self.phonebook_snapshot {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                self.phonebook_dialog
+                    .pointer_move(size, snapshot, point[0], point[1]);
+            }
+            return true;
+        }
+        if self.phonebook_dialog.is_open() {
+            self.pointer = Some(point);
+            if let Some(snapshot) = &self.phonebook_snapshot {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                let changed = self
+                    .phonebook_dialog
+                    .pointer_down(size, snapshot, point[0], point[1]);
+                return Outcome {
+                    redraw: changed,
+                    ..Outcome::default()
+                };
+            }
+            return Outcome::default();
+        }
+        if self.phonebook_dialog.is_open() {
+            self.pointer = Some(point);
+            let cmd = self.phonebook_snapshot.as_ref().and_then(|snap| {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                self.phonebook_dialog
+                    .pointer_up(size, snap, point[0], point[1])
+            });
+            return match cmd {
+                Some(cmd) => self.execute_phonebook_command(cmd),
+                None => Outcome::redraw(),
+            };
+        }
         if self.book_dialog.is_open() {
             if let Some(snapshot) = &self.book_snapshot {
                 let size = [
@@ -4527,6 +4656,56 @@ impl Game {
                 };
             }
             return Outcome::default();
+        }
+        if self.phonebook_dialog.is_open() {
+            return match key {
+                DialogKey::Enter => self.phonebook_submit(),
+                DialogKey::Escape => self.phonebook_escape(),
+                _ => Outcome::default(),
+            };
+        }
+        if self.phonebook_dialog.is_open() {
+            if let Some(snapshot) = &self.phonebook_snapshot {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                self.phonebook_dialog
+                    .pointer_move(size, snapshot, point[0], point[1]);
+            }
+            return true;
+        }
+        if self.phonebook_dialog.is_open() {
+            self.pointer = Some(point);
+            if let Some(snapshot) = &self.phonebook_snapshot {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                let changed = self
+                    .phonebook_dialog
+                    .pointer_down(size, snapshot, point[0], point[1]);
+                return Outcome {
+                    redraw: changed,
+                    ..Outcome::default()
+                };
+            }
+            return Outcome::default();
+        }
+        if self.phonebook_dialog.is_open() {
+            self.pointer = Some(point);
+            let cmd = self.phonebook_snapshot.as_ref().and_then(|snap| {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                self.phonebook_dialog
+                    .pointer_up(size, snap, point[0], point[1])
+            });
+            return match cmd {
+                Some(cmd) => self.execute_phonebook_command(cmd),
+                None => Outcome::redraw(),
+            };
         }
         if self.book_dialog.is_open() {
             self.pointer = Some(point);
@@ -4835,6 +5014,56 @@ impl Game {
             });
             return match cmd {
                 Some(cmd) => self.execute_shop_command(cmd),
+                None => Outcome::redraw(),
+            };
+        }
+        if self.phonebook_dialog.is_open() {
+            return match key {
+                DialogKey::Enter => self.phonebook_submit(),
+                DialogKey::Escape => self.phonebook_escape(),
+                _ => Outcome::default(),
+            };
+        }
+        if self.phonebook_dialog.is_open() {
+            if let Some(snapshot) = &self.phonebook_snapshot {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                self.phonebook_dialog
+                    .pointer_move(size, snapshot, point[0], point[1]);
+            }
+            return true;
+        }
+        if self.phonebook_dialog.is_open() {
+            self.pointer = Some(point);
+            if let Some(snapshot) = &self.phonebook_snapshot {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                let changed = self
+                    .phonebook_dialog
+                    .pointer_down(size, snapshot, point[0], point[1]);
+                return Outcome {
+                    redraw: changed,
+                    ..Outcome::default()
+                };
+            }
+            return Outcome::default();
+        }
+        if self.phonebook_dialog.is_open() {
+            self.pointer = Some(point);
+            let cmd = self.phonebook_snapshot.as_ref().and_then(|snap| {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                self.phonebook_dialog
+                    .pointer_up(size, snap, point[0], point[1])
+            });
+            return match cmd {
+                Some(cmd) => self.execute_phonebook_command(cmd),
                 None => Outcome::redraw(),
             };
         }

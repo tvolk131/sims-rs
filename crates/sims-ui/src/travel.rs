@@ -18,6 +18,7 @@
 //! no verbatim game prose is embedded in source.
 
 use crate::art::Art;
+use crate::dialog::{BACKGROUND as DIALOG_BACKGROUND, BUTTON as DIALOG_BUTTON, draw_nine_slice};
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
 use crate::neighborhood::ExpansionFlags;
@@ -30,6 +31,8 @@ use sims_formats::strings::StringTable;
 /// `GameData/UIText.iff` string table IDs for the four expansion screens,
 /// filter bar, and travel confirmation dialogs.
 pub mod str_id {
+    /// `ObjDialogs` default button strings (`OK`, `Cancel`, `Yes`, `No`).
+    pub const DIALOG_BUTTONS: u16 = 142;
     /// `Downtown Screen Tooltips` (5 entries).
     pub const DOWNTOWN_TIPS: u16 = 169;
     /// `Vacation Island Screen Tooltips` (5 entries).
@@ -119,7 +122,9 @@ pub mod art_id {
 ///
 /// Note: `Res_Nbhd.RT` misspells `kStudiotownBulldoze` (`5219`) as
 /// `kStudiownBulldoze`, so Studio Town falls back to [`art_id::DOWNTOWN_BULLDOZE`].
-pub const RESOURCES: [i32; 39] = [
+pub const RESOURCES: [i32; 41] = [
+    DIALOG_BACKGROUND,
+    DIALOG_BUTTON,
     art_id::DOWNTOWN_BAR_BKG,
     art_id::NEIGHBORHOOD_BAR_BKG,
     art_id::DOWNTOWN_RETURN,
@@ -190,8 +195,6 @@ const TEXT_GOLD: [u8; 3] = [255, 224, 112];
 const TEXT_MUTED: [u8; 3] = [148, 158, 182];
 const DIALOG_BG: [u8; 3] = [22, 32, 82];
 const DIALOG_BORDER: [u8; 3] = [110, 158, 242];
-const BTN_CONFIRM_BG: [u8; 3] = [44, 138, 92];
-const BTN_CANCEL_BG: [u8; 3] = [146, 56, 62];
 const TOOLTIP_BG: [u8; 3] = [255, 255, 230];
 const TOOLTIP_BORDER: [u8; 3] = [0, 0, 0];
 const TOOLTIP_TEXT: [u8; 3] = [0, 0, 0];
@@ -524,6 +527,8 @@ pub struct TravelStrings {
     pub go_vacation_dialog: Vec<String>,
     pub visit_neighborhood: Vec<String>,
     pub visit_magic_town: Vec<String>,
+    /// `UIText.iff STR# 142` default dialog button labels (`OK`, `Cancel`, `Yes`, `No`).
+    pub dialog_buttons: Vec<String>,
 }
 
 impl TravelStrings {
@@ -563,7 +568,44 @@ impl TravelStrings {
             go_vacation_dialog: read_table(str_id::GO_VACATION_DIALOG)?,
             visit_neighborhood: read_table(str_id::VISIT_NEIGHBORHOOD)?,
             visit_magic_town: read_table(str_id::VISIT_MAGIC_TOWN)?,
+            dialog_buttons: read_table(str_id::DIALOG_BUTTONS)?,
         })
+    }
+
+    /// Localized `OK` button label from `UIText.iff STR# 142[0]`.
+    pub fn dialog_ok(&self) -> &str {
+        self.dialog_buttons
+            .first()
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("OK")
+    }
+
+    /// Localized `Cancel` button label from `UIText.iff STR# 142[1]`.
+    pub fn dialog_cancel(&self) -> &str {
+        self.dialog_buttons
+            .get(1)
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("Cancel")
+    }
+
+    /// Localized `Yes` button label from `UIText.iff STR# 142[2]`.
+    pub fn dialog_yes(&self) -> &str {
+        self.dialog_buttons
+            .get(2)
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("Yes")
+    }
+
+    /// Localized `No` button label from `UIText.iff STR# 142[3]`.
+    pub fn dialog_no(&self) -> &str {
+        self.dialog_buttons
+            .get(3)
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("No")
     }
 
     /// Tooltip string for `control` on `destination`.
@@ -1185,6 +1227,8 @@ impl TravelDialogLayout {
 /// Interactive controller for the travel confirmation dialog.
 #[derive(Debug, Clone, Default)]
 pub struct TravelDialog {
+    hovered_confirm: bool,
+    hovered_cancel: bool,
     pressed_confirm: bool,
     pressed_cancel: bool,
 }
@@ -1192,6 +1236,12 @@ pub struct TravelDialog {
 impl TravelDialog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Tracks hover state over Confirm and Cancel buttons.
+    pub fn pointer_move(&mut self, x: i32, y: i32, layout: &TravelDialogLayout) {
+        self.hovered_confirm = layout.confirm_rect.contains(x, y);
+        self.hovered_cancel = layout.cancel_rect.contains(x, y);
     }
 
     /// Handles `Enter` (confirm if affordable) or `Escape` (cancel).
@@ -1252,27 +1302,38 @@ impl TravelDialog {
             return layout;
         }
 
-        // Dim background behind modal dialog.
+        // Dim background behind modal dialog, then render native 9-sliced
+        // `PopupInfoTiles.bmp` (`3008`) chrome (falling back to solid fill only
+        // when UI art is absent).
         fill_alpha(
             frame,
             Rect::new(0, 0, frame.width() as i32, frame.height() as i32),
             [0, 0, 0],
             120,
         );
-        frame.fill(layout.panel_rect, DIALOG_BG);
-        draw_border(frame, layout.panel_rect, DIALOG_BORDER);
+        if let Some(tiler) = art.image(DIALOG_BACKGROUND)
+            && tiler.width >= 3
+            && tiler.height >= 3
+        {
+            draw_nine_slice(frame, tiler, layout.panel_rect);
+        } else {
+            frame.fill(layout.panel_rect, DIALOG_BG);
+            draw_border(frame, layout.panel_rect, DIALOG_BORDER);
+        }
 
         let title = state
             .title_override
             .as_deref()
             .filter(|s| !s.is_empty())
             .or_else(|| match state.destination {
-                Destination::Downtown => strings.go_downtown_dialog.first().map(String::as_str),
+                Destination::Downtown | Destination::OldTown => {
+                    strings.go_downtown_dialog.first().map(String::as_str)
+                }
                 Destination::VacationIsland => {
                     strings.go_vacation_dialog.first().map(String::as_str)
                 }
-                Destination::OldTown => strings.visit_neighborhood.first().map(String::as_str),
-                Destination::StudioTown | Destination::MagicTown => None,
+                Destination::StudioTown => strings.go_downtown_dialog.get(1).map(String::as_str),
+                Destination::MagicTown => strings.go_downtown_dialog.get(2).map(String::as_str),
             })
             .unwrap_or_else(|| state.destination.short_label());
 
@@ -1341,33 +1402,141 @@ impl TravelDialog {
             }
         }
 
-        // Confirm and Cancel buttons.
-        let confirm_bg = if state.can_confirm() {
-            BTN_CONFIRM_BG
+        // Native 4-state `WinBtn.bmp` (`17`) Confirm (`STR# 142[0]` OK) and
+        // Cancel (`STR# 142[1]` Cancel) buttons.
+        let confirm_cell: u32 = if !state.can_confirm() {
+            3
+        } else if self.pressed_confirm && self.hovered_confirm {
+            1
+        } else if self.hovered_confirm {
+            2
         } else {
-            CHIP_DISABLED_BG
+            0
         };
-        frame.fill(layout.confirm_rect, confirm_bg);
-        draw_border(frame, layout.confirm_rect, DIALOG_BORDER);
-        frame.fill(layout.cancel_rect, BTN_CANCEL_BG);
-        draw_border(frame, layout.cancel_rect, DIALOG_BORDER);
-
-        if let Some(f) = pick_font(art, 10) {
-            draw_centered_text(
-                frame,
-                f,
-                layout.confirm_rect,
-                "Go",
-                if state.can_confirm() {
-                    TEXT_LIGHT
-                } else {
-                    TEXT_MUTED
-                },
-            );
-            draw_centered_text(frame, f, layout.cancel_rect, "Cancel", TEXT_LIGHT);
-        }
+        let cancel_cell: u32 = if self.pressed_cancel && self.hovered_cancel {
+            1
+        } else if self.hovered_cancel {
+            2
+        } else {
+            0
+        };
+        draw_travel_dialog_button(
+            frame,
+            art,
+            layout.confirm_rect,
+            confirm_cell,
+            strings.dialog_ok(),
+            state.can_confirm(),
+        );
+        draw_travel_dialog_button(
+            frame,
+            art,
+            layout.cancel_rect,
+            cancel_cell,
+            strings.dialog_cancel(),
+            true,
+        );
 
         layout
+    }
+}
+
+fn draw_travel_dialog_button(
+    frame: &mut Frame,
+    art: &Art,
+    rect: Rect,
+    cell: u32,
+    label: &str,
+    enabled: bool,
+) {
+    if rect.width <= 0 || rect.height <= 0 {
+        return;
+    }
+    if let Some(sheet) = art.image(DIALOG_BUTTON)
+        && sheet.width >= 4
+        && sheet.height > 0
+    {
+        let cw = (sheet.width / 4) as i32;
+        let ch = sheet.height as i32;
+        let sx = cw.saturating_mul(cell.min(3) as i32);
+        let cap = (cw / 4).min(rect.width / 2).max(1);
+        let mid_src_w = (cw - cap * 2).max(1);
+        let mid_dst_w = (rect.width - cap * 2).max(0);
+        blit_scaled_region(
+            frame,
+            sheet,
+            Rect::new(sx, 0, cap, ch),
+            Rect::new(rect.x, rect.y, cap, rect.height),
+        );
+        if mid_dst_w > 0 {
+            blit_scaled_region(
+                frame,
+                sheet,
+                Rect::new(sx + cap, 0, mid_src_w, ch),
+                Rect::new(rect.x + cap, rect.y, mid_dst_w, rect.height),
+            );
+        }
+        blit_scaled_region(
+            frame,
+            sheet,
+            Rect::new(sx + cw - cap, 0, cap, ch),
+            Rect::new(rect.x + rect.width - cap, rect.y, cap, rect.height),
+        );
+    } else {
+        let fill = if !enabled {
+            CHIP_DISABLED_BG
+        } else if cell == 1 {
+            [22, 112, 168]
+        } else if cell == 2 {
+            [64, 96, 196]
+        } else {
+            [38, 60, 148]
+        };
+        frame.fill(rect, fill);
+        draw_border(frame, rect, DIALOG_BORDER);
+    }
+    let text_color = if !enabled {
+        TEXT_MUTED
+    } else if cell == 1 {
+        [0, 255, 255]
+    } else if cell == 2 {
+        [255, 255, 255]
+    } else {
+        TEXT_LIGHT
+    };
+    if let Some(f) = pick_font(art, 10) {
+        draw_centered_text(frame, f, rect, label, text_color);
+    }
+}
+
+fn blit_scaled_region(
+    frame: &mut Frame,
+    img: &sims_formats::bitmap::Image,
+    src: Rect,
+    dest: Rect,
+) {
+    if src.width <= 0 || src.height <= 0 || dest.width <= 0 || dest.height <= 0 {
+        return;
+    }
+    let fw = i32::try_from(frame.width()).unwrap_or(i32::MAX);
+    let fh = i32::try_from(frame.height()).unwrap_or(i32::MAX);
+    let x0 = dest.x.max(0);
+    let y0 = dest.y.max(0);
+    let x1 = dest.x.saturating_add(dest.width).min(fw);
+    let y1 = dest.y.saturating_add(dest.height).min(fh);
+    for y in y0..y1 {
+        let sy = src.y
+            + ((i64::from(y - dest.y) * i64::from(src.height)) / i64::from(dest.height)) as i32;
+        for x in x0..x1 {
+            let sx = src.x
+                + ((i64::from(x - dest.x) * i64::from(src.width)) / i64::from(dest.width)) as i32;
+            if let (Ok(ux), Ok(uy)) = (u32::try_from(sx), u32::try_from(sy))
+                && let Some([r, g, b, a]) = img.pixel(ux, uy)
+                && a > 0
+            {
+                frame.blend(x, y, [r, g, b], a);
+            }
+        }
     }
 }
 

@@ -6012,6 +6012,7 @@ impl NeighborhoodShell {
             tried_on_item_id: None,
             preview_image: None,
             preview_label: None,
+            hide_wallet_and_prices: true,
         });
         self.import_picker.open();
         true
@@ -6191,6 +6192,7 @@ impl NeighborhoodShell {
         if pages.is_empty() {
             pages.push(BookPage {
                 heading: None,
+                category: None,
                 entries: vec![BookEntry {
                     title: title.clone(),
                     subtitle: None,
@@ -6206,6 +6208,7 @@ impl NeighborhoodShell {
             subtitle: None,
             held_summary: Vec::new(),
             pages,
+            use_magic_book_chrome: false,
         });
         self.credits_dialog.open();
     }

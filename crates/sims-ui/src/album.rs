@@ -40,7 +40,31 @@ pub const MISC_STRINGS: u16 = 154;
 /// `UIGraphics/Res_CPanel.h` `kCamViewAlbum` (`CPanel/Buttons/CamViewAlbum.bmp`).
 pub const CAM_VIEW_ALBUM: i32 = 1105;
 
-/// `UIGraphics` resource IDs used by [`PhotoAlbumDialog`].
+/// `UIGraphics/Res_CPanel.h` native Scrapbook / Photo Album artwork (`1200..=1206`).
+pub const SCRAP_BACK: i32 = 1200;
+pub const SCRAP_DONE: i32 = 1201;
+pub const SCRAP_DELETE: i32 = 1202;
+pub const SCRAP_LEFT: i32 = 1203;
+pub const SCRAP_RIGHT: i32 = 1204;
+pub const SCRAP_HOME: i32 = 1205;
+pub const SCRAP_END: i32 = 1206;
+
+/// Native `scrapback.bmp` dimensions (`700×560`).
+pub const NATIVE_WIDTH: i32 = 700;
+pub const NATIVE_HEIGHT: i32 = 560;
+
+/// All 7 native Scrapbook / Photo Album `UIGraphics` resource IDs (`1200..=1206`).
+pub const SCRAP_RESOURCES: [i32; 7] = [
+    SCRAP_BACK,
+    SCRAP_DONE,
+    SCRAP_DELETE,
+    SCRAP_LEFT,
+    SCRAP_RIGHT,
+    SCRAP_HOME,
+    SCRAP_END,
+];
+
+/// Required `UIGraphics` fallback resource IDs used by [`PhotoAlbumDialog`].
 pub const RESOURCES: [i32; 4] = [BACKGROUND, BUTTON, POPUP_TILER, CAM_VIEW_ALBUM];
 
 /// Maximum character length of a photo title.
@@ -72,10 +96,10 @@ const THUMB_HOVER_BORDER: [u8; 3] = [210, 228, 255];
 const CONFIRM_BG: [u8; 3] = [56, 24, 36];
 const CONFIRM_BORDER: [u8; 3] = [228, 128, 128];
 
-/// Loads the native 1.91 9-slice frames, button strip, album icon, and bitmap
-/// fonts used by [`PhotoAlbumDialog`].
+/// Loads the native 1.91 Scrapbook bitmaps (`1200..=1206`), 9-slice frames,
+/// button strip, album icon, and bitmap fonts used by [`PhotoAlbumDialog`].
 pub fn load_art(ui: &UiGraphics, language: u8) -> Result<Art> {
-    Art::load(ui, language, &RESOURCES)
+    Art::load_with_optional(ui, language, &RESOURCES, &SCRAP_RESOURCES)
 }
 
 /// Opaque REDB-ready identifier for a household photo album entry.
@@ -319,6 +343,8 @@ enum ControlId {
 #[derive(Debug, Clone)]
 pub struct AlbumLayout {
     pub modal: Rect,
+    /// Whether this layout uses the native `700×560` `scrapback.bmp` (`1200..=1206`) coordinates.
+    pub native_scrap: bool,
     pub header_title: [i32; 2],
     pub page_counter: [i32; 2],
     pub photo_viewport: Rect,
@@ -612,7 +638,174 @@ impl PhotoAlbumDialog {
     }
 
     /// Computes responsive modal geometry inside a `screen_w × screen_h` frame.
+    ///
+    /// On viewports `>= 700×560`, anchors the modal to native `scrapback.bmp`
+    /// (`700×560`) and places the 6 native Scrapbook buttons (`1201..=1206`) at
+    /// their exact `UIText.iff STR# 141` pixel coordinates. On smaller viewports,
+    /// falls back cleanly to the responsive 9-slice layout.
     pub fn layout(&self, screen_w: i32, screen_h: i32) -> AlbumLayout {
+        if screen_w >= NATIVE_WIDTH && screen_h >= NATIVE_HEIGHT {
+            let mx = (screen_w - NATIVE_WIDTH) / 2;
+            let my = (screen_h - NATIVE_HEIGHT) / 2;
+            let modal = Rect {
+                x: mx,
+                y: my,
+                width: NATIVE_WIDTH,
+                height: NATIVE_HEIGHT,
+            };
+
+            // Upper beveled frame interior inside `scrapback.bmp`: `(50, 18, 600, 402)`.
+            let inner_x = mx + 58;
+            let inner_right = mx + 642;
+            let header_y = my + 24;
+            let header_title = [inner_x, header_y + 4];
+            let small_btn_h = 24;
+            let btn_add = Rect {
+                x: inner_right - 58,
+                y: header_y,
+                width: 58,
+                height: small_btn_h,
+            };
+            let btn_snapshot = Rect {
+                x: btn_add.x - 6 - 68,
+                y: header_y,
+                width: 68,
+                height: small_btn_h,
+            };
+            let page_counter = [btn_snapshot.x - 84, header_y + 5];
+
+            let content_top = header_y + small_btn_h + 8;
+            let content_bottom = my + 412;
+            let content_h = content_bottom - content_top;
+            let photo_viewport = Rect {
+                x: inner_x,
+                y: content_top,
+                width: 342,
+                height: content_h,
+            };
+
+            let right_x = photo_viewport.x + photo_viewport.width + 12;
+            let right_w = (inner_right - right_x).max(160);
+            let title_label_pos = [right_x, content_top];
+            let title_box = Rect {
+                x: right_x,
+                y: content_top + 16,
+                width: right_w,
+                height: 26,
+            };
+            let caption_label_pos = [right_x, title_box.y + title_box.height + 8];
+            let action_row_h = 26;
+            let actions_top = content_bottom - action_row_h * 2 - 6;
+            let caption_top = caption_label_pos[1] + 16;
+            let caption_box = Rect {
+                x: right_x,
+                y: caption_top,
+                width: right_w,
+                height: (actions_top - 8 - caption_top).max(60),
+            };
+            let half_w = (right_w - 6) / 2;
+            let btn_move_earlier = Rect {
+                x: right_x,
+                y: actions_top,
+                width: half_w,
+                height: action_row_h,
+            };
+            let btn_move_later = Rect {
+                x: right_x + half_w + 6,
+                y: actions_top,
+                width: right_w - half_w - 6,
+                height: action_row_h,
+            };
+            let btn_save = Rect {
+                x: right_x,
+                y: actions_top + action_row_h + 6,
+                width: right_w,
+                height: action_row_h,
+            };
+
+            // Native `STR# 141` button positions over `scrapback.bmp` recesses:
+            // First `(19, 442)` 38x47, Prev `(58, 442)` 29x47,
+            // Next `(614, 442)` 28x46, Last `(643, 442)` 37x46,
+            // Done `(150, 512)` 130x41, Delete `(442, 511)` 130x41.
+            let btn_first = Rect::new(mx + 19, my + 442, 38, 47);
+            let btn_prev = Rect::new(mx + 58, my + 442, 29, 47);
+            let btn_next = Rect::new(mx + 614, my + 442, 28, 46);
+            let btn_last = Rect::new(mx + 643, my + 442, 37, 46);
+            let btn_done = Rect::new(mx + 150, my + 512, 130, 41);
+            let btn_delete = Rect::new(mx + 442, my + 511, 130, 41);
+
+            // Middle thumbnail strip sits cleanly inside the `STR# 141` `(100, 430, 500, 72)` well.
+            let strip_box = Rect::new(mx + 100, my + 430, 500, 72);
+            let arrow_w = 24;
+            let strip_prev = Rect::new(strip_box.x + 4, strip_box.y + 8, arrow_w, strip_box.height - 16);
+            let strip_next = Rect::new(
+                strip_box.x + strip_box.width - 4 - arrow_w,
+                strip_box.y + 8,
+                arrow_w,
+                strip_box.height - 16,
+            );
+            let thumbs_x = strip_prev.x + strip_prev.width + 6;
+            let thumbs_avail = (strip_next.x - 6 - thumbs_x).max(0);
+            let thumb_w = 78;
+            let thumb_gap = 6;
+            let slot_count = ((thumbs_avail + thumb_gap) / (thumb_w + thumb_gap)).max(1) as usize;
+            let mut thumb_slots = Vec::with_capacity(slot_count);
+            for i in 0..slot_count {
+                thumb_slots.push(Rect {
+                    x: thumbs_x + (i as i32) * (thumb_w + thumb_gap),
+                    y: strip_box.y + 7,
+                    width: thumb_w,
+                    height: strip_box.height - 14,
+                });
+            }
+
+            // Inline delete confirmation replaces `btn_delete` cleanly without overlapping `btn_done`.
+            let confirm_bar = Rect::new(mx + 392, my + 514, 230, 36);
+            let confirm_btn_w = 54;
+            let btn_confirm_no = Rect::new(
+                confirm_bar.x + confirm_bar.width - confirm_btn_w - 4,
+                confirm_bar.y + 4,
+                confirm_btn_w,
+                confirm_bar.height - 8,
+            );
+            let btn_confirm_yes = Rect::new(
+                btn_confirm_no.x - confirm_btn_w - 4,
+                confirm_bar.y + 4,
+                confirm_btn_w,
+                confirm_bar.height - 8,
+            );
+
+            return AlbumLayout {
+                modal,
+                native_scrap: true,
+                header_title,
+                page_counter,
+                photo_viewport,
+                title_label_pos,
+                title_box,
+                caption_label_pos,
+                caption_box,
+                btn_snapshot,
+                btn_add,
+                btn_move_earlier,
+                btn_move_later,
+                btn_delete,
+                btn_save,
+                btn_done,
+                confirm_bar,
+                btn_confirm_yes,
+                btn_confirm_no,
+                btn_first,
+                btn_prev,
+                btn_next,
+                btn_last,
+                strip_box,
+                strip_prev,
+                strip_next,
+                thumb_slots,
+            };
+        }
+
         let modal_w = (screen_w - 40).clamp(560, 720).min(screen_w.max(320));
         let modal_h = (screen_h - 32).clamp(420, 552).min(screen_h.max(240));
         let mx = (screen_w - modal_w) / 2;
@@ -804,6 +997,7 @@ impl PhotoAlbumDialog {
 
         AlbumLayout {
             modal,
+            native_scrap: false,
             header_title,
             page_counter,
             photo_viewport,
@@ -874,6 +1068,12 @@ impl PhotoAlbumDialog {
             }
             if layout.btn_confirm_no.contains(pos[0], pos[1]) {
                 return Some(ControlId::ConfirmDeleteNo);
+            }
+            if layout.native_scrap
+                && let Some(id) = self.selected_id
+                && layout.btn_save.contains(pos[0], pos[1])
+            {
+                return Some(ControlId::Save(id));
             }
         } else if let Some(id) = self.selected_id {
             if layout.btn_save.contains(pos[0], pos[1]) {
@@ -1442,8 +1642,12 @@ impl PhotoAlbumDialog {
         // 1. Subtle modal backdrop dimming
         dim_backdrop(frame);
 
-        // 2. Native 1.91 9-slice dialog chrome (`PopupInfoTiles.bmp` 3008)
-        if let Some(sheet) = art.image(BACKGROUND) {
+        // 2. Native `scrapback.bmp` (`1200`, 700x560) or 9-slice fallback (`3008`)
+        if layout.native_scrap
+            && let Some(scrap_bg) = art.image(SCRAP_BACK)
+        {
+            frame.draw_all(scrap_bg, [layout.modal.x, layout.modal.y]);
+        } else if let Some(sheet) = art.image(BACKGROUND) {
             draw_nine_slice(frame, sheet, layout.modal);
         } else {
             frame.fill(layout.modal, DIALOG_FALLBACK_BG);
@@ -1497,15 +1701,28 @@ impl PhotoAlbumDialog {
             snapshot,
             visible_slots,
         );
-        self.draw_button(
-            frame,
-            art,
-            layout.btn_done,
-            &self.strings.done,
-            ControlId::Done,
-            snapshot,
-            visible_slots,
-        );
+        if layout.native_scrap {
+            self.draw_scrap_button(
+                frame,
+                art,
+                SCRAP_DONE,
+                layout.btn_done,
+                Some(&self.strings.done),
+                ControlId::Done,
+                snapshot,
+                visible_slots,
+            );
+        } else {
+            self.draw_button(
+                frame,
+                art,
+                layout.btn_done,
+                &self.strings.done,
+                ControlId::Done,
+                snapshot,
+                visible_slots,
+            );
+        }
 
         // 4. Full-size photo viewport
         frame.fill(layout.photo_viewport, PHOTO_MATTE_BG);
@@ -1545,43 +1762,86 @@ impl PhotoAlbumDialog {
             );
         }
 
-        // 5. Navigation buttons below viewport
-        self.draw_button(
-            frame,
-            art,
-            layout.btn_first,
-            "|<",
-            ControlId::First,
-            snapshot,
-            visible_slots,
-        );
-        self.draw_button(
-            frame,
-            art,
-            layout.btn_prev,
-            "<",
-            ControlId::Prev,
-            snapshot,
-            visible_slots,
-        );
-        self.draw_button(
-            frame,
-            art,
-            layout.btn_next,
-            ">",
-            ControlId::Next,
-            snapshot,
-            visible_slots,
-        );
-        self.draw_button(
-            frame,
-            art,
-            layout.btn_last,
-            ">|",
-            ControlId::Last,
-            snapshot,
-            visible_slots,
-        );
+        // 5. Navigation buttons (`scraphome`/`scrapleft`/`scrapright`/`scrapend` in native mode)
+        if layout.native_scrap {
+            self.draw_scrap_button(
+                frame,
+                art,
+                SCRAP_HOME,
+                layout.btn_first,
+                None,
+                ControlId::First,
+                snapshot,
+                visible_slots,
+            );
+            self.draw_scrap_button(
+                frame,
+                art,
+                SCRAP_LEFT,
+                layout.btn_prev,
+                None,
+                ControlId::Prev,
+                snapshot,
+                visible_slots,
+            );
+            self.draw_scrap_button(
+                frame,
+                art,
+                SCRAP_RIGHT,
+                layout.btn_next,
+                None,
+                ControlId::Next,
+                snapshot,
+                visible_slots,
+            );
+            self.draw_scrap_button(
+                frame,
+                art,
+                SCRAP_END,
+                layout.btn_last,
+                None,
+                ControlId::Last,
+                snapshot,
+                visible_slots,
+            );
+        } else {
+            self.draw_button(
+                frame,
+                art,
+                layout.btn_first,
+                "|<",
+                ControlId::First,
+                snapshot,
+                visible_slots,
+            );
+            self.draw_button(
+                frame,
+                art,
+                layout.btn_prev,
+                "<",
+                ControlId::Prev,
+                snapshot,
+                visible_slots,
+            );
+            self.draw_button(
+                frame,
+                art,
+                layout.btn_next,
+                ">",
+                ControlId::Next,
+                snapshot,
+                visible_slots,
+            );
+            self.draw_button(
+                frame,
+                art,
+                layout.btn_last,
+                ">|",
+                ControlId::Last,
+                snapshot,
+                visible_slots,
+            );
+        }
 
         // 6. Title & wrapped caption editors (`cTSWinTextEdit2`)
         draw_text(
@@ -1639,7 +1899,59 @@ impl PhotoAlbumDialog {
             visible_slots,
         );
 
-        if let Some(pending) = self.pending_delete {
+        if layout.native_scrap {
+            self.draw_button(
+                frame,
+                art,
+                layout.btn_save,
+                &self.strings.save,
+                ControlId::Save(selected_id),
+                snapshot,
+                visible_slots,
+            );
+            if let Some(pending) = self.pending_delete {
+                frame.fill(layout.confirm_bar, CONFIRM_BG);
+                draw_outline(frame, layout.confirm_bar, CONFIRM_BORDER);
+                draw_text_clipped(
+                    frame,
+                    art.font(10),
+                    layout.confirm_bar.x + 8,
+                    layout.confirm_bar.y + 10,
+                    (layout.btn_confirm_yes.x - layout.confirm_bar.x - 12).max(20),
+                    &format!("{}?", self.strings.delete),
+                    TEXT_WARNING,
+                );
+                self.draw_button(
+                    frame,
+                    art,
+                    layout.btn_confirm_yes,
+                    &self.strings.confirm_yes,
+                    ControlId::ConfirmDeleteYes(pending),
+                    snapshot,
+                    visible_slots,
+                );
+                self.draw_button(
+                    frame,
+                    art,
+                    layout.btn_confirm_no,
+                    &self.strings.confirm_no,
+                    ControlId::ConfirmDeleteNo,
+                    snapshot,
+                    visible_slots,
+                );
+            } else {
+                self.draw_scrap_button(
+                    frame,
+                    art,
+                    SCRAP_DELETE,
+                    layout.btn_delete,
+                    Some(&self.strings.delete),
+                    ControlId::Delete(selected_id),
+                    snapshot,
+                    visible_slots,
+                );
+            }
+        } else if let Some(pending) = self.pending_delete {
             frame.fill(layout.confirm_bar, CONFIRM_BG);
             draw_outline(frame, layout.confirm_bar, CONFIRM_BORDER);
             draw_text_clipped(
@@ -1753,6 +2065,67 @@ impl PhotoAlbumDialog {
             ControlId::Next => Some(&self.strings.next_tooltip),
             ControlId::Last => Some(&self.strings.last_tooltip),
             _ => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_scrap_button(
+        &self,
+        frame: &mut Frame,
+        art: &Art,
+        art_id: i32,
+        rect: Rect,
+        label: Option<&str>,
+        control: ControlId,
+        snapshot: &AlbumSnapshot,
+        visible_slots: usize,
+    ) {
+        let enabled = self.control_enabled(control, snapshot, visible_slots);
+        let pressed = enabled && self.pressed == Some(control) && self.hovered == Some(control);
+        let hovered = enabled && self.hovered == Some(control);
+        let (cell_idx, text_color) = if !enabled {
+            (3, TEXT_DISABLED)
+        } else if pressed {
+            (1, TEXT_SELECTED)
+        } else if hovered {
+            (2, TEXT_HOVER)
+        } else {
+            (0, TEXT_NORMAL)
+        };
+        if let Some(sheet) = art.image(art_id)
+            && sheet.width >= 4
+            && sheet.height > 0
+        {
+            let cell_w = (sheet.width / 4) as i32;
+            let cell_h = sheet.height as i32;
+            let src = Rect::new(cell_w * cell_idx as i32, 0, cell_w, cell_h);
+            frame.draw(sheet, src, [rect.x, rect.y]);
+            if let Some(text) = label {
+                draw_centered_text(
+                    frame,
+                    art.font(12).or_else(|| art.font(10)),
+                    rect,
+                    text,
+                    text_color,
+                );
+            }
+        } else {
+            let fallback = label.unwrap_or(match control {
+                ControlId::First => "|<",
+                ControlId::Prev => "<",
+                ControlId::Next => ">",
+                ControlId::Last => ">|",
+                _ => "",
+            });
+            self.draw_button(
+                frame,
+                art,
+                rect,
+                fallback,
+                control,
+                snapshot,
+                visible_slots,
+            );
         }
     }
 
