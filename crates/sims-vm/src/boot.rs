@@ -726,6 +726,28 @@ fn residential(world: &World, program: &Program) -> bool {
     zoning == 1
 }
 
+/// Reads a house's simulator state onto the lot being loaded, as `0x46cfb3`
+/// does: the saved state ([`World::read_simulator`]), then, on a lot not
+/// zoned residential (asked with the saved global 10), both random streams
+/// reseeded from the host clock ([`World::seed_from_host_clock`]).
+///
+/// The port's stand-in for the clock is the house's saved tick count, read
+/// twice: the two native readings are a call apart and almost always
+/// equal. A reading from state the save holds keeps the load replayable;
+/// that it is the tick count is a substitute, as Make New Character's
+/// GUID clock is (`primitives::make_character`).
+pub(crate) fn read_simulator(
+    world: &mut World,
+    simulator: &sims_formats::lot::Simulator,
+    program: &Program,
+) {
+    world.read_simulator(simulator);
+    if !residential(world, program) {
+        let clock = simulator.ticks;
+        world.seed_from_host_clock([clock, clock]);
+    }
+}
+
 /// The rotation a house opens at: the camera direction its file saved
 /// (`HOUS 0`, `0x4a87b1`–`0x4a87dc`), as the render track opens the view
 /// (`sims_render::open_house`). On load, the original calls `0x4a7dfe` at
@@ -1318,7 +1340,7 @@ impl Lot {
                 world.crt_rng = before_indicators;
             }
             // The load steps, in the original's order.
-            world.read_simulator(&file.simulator);
+            read_simulator(&mut world, &file.simulator, &program);
             // With the simulator state, the house file's model gives the
             // house's usage counts (0x416568).
             world.read_house_model(
@@ -4099,6 +4121,62 @@ mod tests {
             adult_mood: vec![curve(7)],
             child_mood: vec![curve(7)],
         }
+    }
+
+    /// `0x46cfb3`: a residential lot keeps both saved streams; a lot zoned
+    /// otherwise reseeds the lot stream, then the global one, from the
+    /// host clock (`0x46d0d3`, `0x46d0db`), which the port reads as the
+    /// saved tick count. Lot 0 is residential whatever the table says.
+    #[test]
+    fn a_lot_not_zoned_residential_reseeds_both_streams_on_load() {
+        let mut program = Program {
+            global: 0,
+            libraries: BTreeMap::new(),
+            semi_globals: BTreeMap::new(),
+            careers: None,
+            career_texts_end: false,
+            labels_hold_no_token: false,
+            zoning: BTreeMap::from([(1, 1), (21, 2)]),
+            animations: Default::default(),
+            people: Default::default(),
+            icon_frames: None,
+            wardrobe: None,
+            ordered_wardrobe: None,
+            character_files: Default::default(),
+            expansions: 0,
+            characters: Default::default(),
+        };
+        let simulator = |lot: i16| {
+            let mut globals = vec![0; 32];
+            globals[10] = lot;
+            sims_formats::lot::Simulator {
+                version: 0x49,
+                globals,
+                ticks: 0x1234_5678,
+                scheduler_cursor: 0,
+                funds: 0,
+                lot_rng: 0xaaaa,
+                global_rng: 0xbbbb,
+                pending_funds: 0,
+                lot_value: 0,
+                objects_value: 0,
+                architecture_value: 0,
+                budget_days: Vec::new(),
+                tail: Vec::new(),
+            }
+        };
+        let streams = |lot: i16, program: &Program| {
+            let mut world = World::empty();
+            super::read_simulator(&mut world, &simulator(lot), program);
+            (world.lot_rng.state(), world.global_rng.state())
+        };
+        assert_eq!(streams(1, &program), (0xaaaa, 0xbbbb));
+        assert_eq!(streams(0, &program), (0xaaaa, 0xbbbb));
+        assert_eq!(streams(21, &program), (0x1234_5678, 0x1234_5678));
+        // A lot the table doesn't zone isn't residential either.
+        assert_eq!(streams(30, &program), (0x1234_5678, 0x1234_5678));
+        program.zoning.insert(21, 1);
+        assert_eq!(streams(21, &program), (0xaaaa, 0xbbbb));
     }
 
     #[test]

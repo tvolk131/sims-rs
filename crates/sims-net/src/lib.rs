@@ -42,6 +42,7 @@ pub use protocol::{
     PROTOCOL_VERSION, PeerRosterEntry, PlayerId, PlayerMode, PlayerRole, RejectReason,
     ResyncReason, SessionConfig, SimSpeed, SnapshotId, StampedCommand, StateFingerprint, Tick,
     TickBatch, WireMessage, decode_framed, decode_payload, encode_framed, encode_payload,
+    protocol_mismatch_message,
 };
 pub use session::{
     ActivePauseReasons, AppliedBatch, AppliedCommand, BlockingDialog, CommandIgnoreReason,

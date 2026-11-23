@@ -90,14 +90,6 @@ impl Hud {
         {
             art.load_optional(&ui, US_ENGLISH, id);
         }
-        let message = match dialog::pending(world) {
-            Some(pending) => {
-                let labels = Labels::load(&install).map_err(|e| e.to_string())?;
-                Message::read(world, assets.index(), assets.catalog(), &labels, pending)
-                    .map_err(|e| e.to_string())?
-            }
-            None => None,
-        };
         let neighborhood = house
             .parent()
             .and_then(Path::parent)
@@ -138,10 +130,37 @@ impl Hud {
         let fame = Fame::load(&install).unwrap_or_default();
         let options_texts = OptionsTexts::load(&install).unwrap_or_default();
         let options_state = options::OptionsState::load_install(&install).unwrap_or_default();
+        let mut thumbnails = Thumbnails::default();
+        let message = match dialog::pending(world) {
+            Some(pending) => {
+                let labels = Labels::load(&install).map_err(|e| e.to_string())?;
+                let mut ctx = dialog::DialogContext {
+                    faces: Some(&faces),
+                    thumbnails: Some(&mut thumbnails),
+                    art: Some(&art),
+                    careers: Some(&careers),
+                    fame: Some(&fame),
+                    families: None,
+                    ui: Some(&ui),
+                    known: Some(&known),
+                    members: &members,
+                };
+                Message::read_with_context(
+                    world,
+                    assets.index(),
+                    assets.catalog(),
+                    &labels,
+                    pending,
+                    &mut ctx,
+                )
+                .map_err(|e| e.to_string())?
+            }
+            None => None,
+        };
         Ok(Self {
             art,
             faces,
-            thumbnails: Thumbnails::default(),
+            thumbnails,
             careers,
             fame,
             house,

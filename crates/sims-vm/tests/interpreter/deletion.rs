@@ -799,3 +799,59 @@ fn deleting_an_object_skips_stale_missing_targets_in_person_queues() {
     assert_eq!(interp2.remove_now(&mut world2, person_id), Ok(()));
     assert!(!world2.objects.contains_key(&person_id));
 }
+
+#[test]
+fn a_deleted_person_leaves_every_indicator_queue_entry() {
+    // 0x444962 queues a person for a star each time its fame is written,
+    // and a removal (0x447d8b) erases only the first entry of each queue
+    // (0x448663). The original's second entry would then name freed
+    // memory; the port drops every entry as the person is deleted, so the
+    // next frame's refresh (0x4a8b12 -> 0x4464db) does not fail.
+    let (mut fx, _) = crate::visits::lot();
+    let person_id = 50u16;
+    place_test_person(&mut fx, person_id);
+    fx.add(
+        SIM_FILE,
+        4097,
+        tree(vec![assign(
+            scope::MY_PERSON,
+            81,
+            scope::LITERAL,
+            3,
+            RETURN_TRUE,
+        )]),
+    );
+    for _ in 0..2 {
+        assert_eq!(fx.run_with(person_id, 4097, 0, &[], 100), Ok(true));
+    }
+    fx.world
+        .objects
+        .get_mut(&person_id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[77] = 5;
+    fx.world.indicator_queues.queue_date(person_id, 5);
+    assert_eq!(fx.world.indicator_queues.stars, [person_id, person_id]);
+    assert_eq!(fx.world.indicator_queues.dates, [person_id]);
+
+    let interpreter = fx.interpreter();
+    let mut world = fx.world.clone();
+    interpreter.create_indicators(&mut world).unwrap();
+    assert_eq!(interpreter.remove_now(&mut world, person_id), Ok(()));
+    assert!(world.indicator_queues.dates.is_empty());
+    assert!(world.indicator_queues.stars.is_empty());
+    assert!(world.indicator_queues.dirty, "the flag stays for the frame");
+    assert_eq!(interpreter.draw_frame(&mut world, 1), Ok(()));
+    assert_eq!(world.indicator_queues, Default::default());
+
+    // Clearing the lot runs no interface removal (0x445f84 leaves the
+    // queues as they are); the entries still go with the person.
+    let mut world = fx.world.clone();
+    world.order = world.objects.keys().copied().collect();
+    let cleared = interpreter.clear(&mut world);
+    assert!(cleared.is_ok(), "{cleared:?}");
+    assert!(world.indicator_queues.dates.is_empty());
+    assert!(world.indicator_queues.stars.is_empty());
+}
