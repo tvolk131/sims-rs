@@ -11,7 +11,7 @@ use crate::v2::ast::{
     StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, UseDecl, UseItem, V2AssignOp,
     V2BinOp, V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp,
 };
-use crate::v2::lexer::{Token, TokenKind, extract_raw_brace_block, tokenize};
+use crate::v2::lexer::{Token, TokenKind, tokenize};
 
 const MAX_NESTING_DEPTH: usize = 64;
 
@@ -19,7 +19,6 @@ const MAX_NESTING_DEPTH: usize = 64;
 pub fn parse_v2_file(source: &str) -> Result<V2File> {
     let tokens = tokenize(source)?;
     let mut parser = Parser {
-        source,
         tokens,
         pos: 0,
         depth: 0,
@@ -27,14 +26,13 @@ pub fn parse_v2_file(source: &str) -> Result<V2File> {
     parser.parse_file()
 }
 
-struct Parser<'a> {
-    source: &'a str,
+struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     depth: usize,
 }
 
-impl<'a> Parser<'a> {
+impl Parser {
     fn peek(&self) -> &Token {
         self.tokens
             .get(self.pos)
@@ -306,7 +304,10 @@ impl<'a> Parser<'a> {
                     "only mutable references '&mut <type>' are supported",
                 ));
             }
-            let inner = self.parse_type()?;
+            self.enter_nesting(span)?;
+            let inner = self.parse_type();
+            self.leave_nesting();
+            let inner = inner?;
             match inner {
                 V2Type::Bool | V2Type::I16 | V2Type::ObjectId => {
                     return Ok(V2Type::MutRef(Box::new(inner)));
@@ -1580,6 +1581,11 @@ impl<'a> Parser<'a> {
 
     fn parse_stmt(&mut self) -> Result<V2Stmt> {
         let span = self.span();
+        if let TokenKind::RawBlock(code) = &self.peek().kind {
+            let code = code.clone();
+            self.bump();
+            return Ok(V2Stmt::RawAir { span, code });
+        }
         if let TokenKind::Ident(kw) = &self.peek().kind {
             match kw.as_str() {
                 "let" => return self.parse_let_stmt(span),
@@ -1615,7 +1621,9 @@ impl<'a> Parser<'a> {
                         value: Some(expr),
                     });
                 }
-                "raw" => return self.parse_raw_stmt(span),
+                "raw" => {
+                    return Err(Error::at(span, "expected '{' after 'raw'"));
+                }
                 _ => {}
             }
         }
@@ -1793,7 +1801,10 @@ impl<'a> Parser<'a> {
         let else_body = if self.eat_ident("else") {
             if self.is_ident("if") {
                 let elif_span = self.span();
-                vec![self.parse_if_stmt(elif_span)?]
+                self.enter_nesting(elif_span)?;
+                let elif = self.parse_if_stmt(elif_span);
+                self.leave_nesting();
+                vec![elif?]
             } else {
                 self.parse_block()?
             }
@@ -1808,34 +1819,22 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_raw_stmt(&mut self, span: Span) -> Result<V2Stmt> {
-        self.bump(); // 'raw'
-        let brace_span = self.expect(&TokenKind::LBrace, "'{'")?;
-        let (code, _end_span) = extract_raw_brace_block(self.source, brace_span)?;
-        // Advance token stream past the balanced `{ ... }` block.
-        let mut depth = 1usize;
-        while depth > 0 {
-            let tok = self.bump();
-            match tok.kind {
-                TokenKind::LBrace => depth += 1,
-                TokenKind::RBrace => depth -= 1,
-                TokenKind::Eof => {
-                    return Err(Error::at(brace_span, "unterminated 'raw { ... }' block"));
-                }
-                _ => {}
-            }
-        }
-        Ok(V2Stmt::RawAir { span, code })
-    }
-
     fn parse_expr(&mut self) -> Result<V2Expr> {
         self.parse_or_expr()
     }
 
     fn parse_or_expr(&mut self) -> Result<V2Expr> {
         let mut lhs = self.parse_and_expr()?;
+        let mut chain = 0usize;
         while self.peek().kind == TokenKind::OrOr {
             let span = self.bump().span;
+            chain += 1;
+            if self.depth + chain > MAX_NESTING_DEPTH {
+                return Err(Error::at(
+                    span,
+                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
+                ));
+            }
             let rhs = self.parse_and_expr()?;
             lhs = V2Expr::Binary {
                 span,
@@ -1849,8 +1848,16 @@ impl<'a> Parser<'a> {
 
     fn parse_and_expr(&mut self) -> Result<V2Expr> {
         let mut lhs = self.parse_cmp_expr()?;
+        let mut chain = 0usize;
         while self.peek().kind == TokenKind::AndAnd {
             let span = self.bump().span;
+            chain += 1;
+            if self.depth + chain > MAX_NESTING_DEPTH {
+                return Err(Error::at(
+                    span,
+                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
+                ));
+            }
             let rhs = self.parse_cmp_expr()?;
             lhs = V2Expr::Binary {
                 span,
@@ -1890,8 +1897,16 @@ impl<'a> Parser<'a> {
 
     fn parse_bitor_expr(&mut self) -> Result<V2Expr> {
         let mut lhs = self.parse_bitxor_expr()?;
+        let mut chain = 0usize;
         while self.peek().kind == TokenKind::Pipe {
             let span = self.bump().span;
+            chain += 1;
+            if self.depth + chain > MAX_NESTING_DEPTH {
+                return Err(Error::at(
+                    span,
+                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
+                ));
+            }
             let rhs = self.parse_bitxor_expr()?;
             lhs = V2Expr::Binary {
                 span,
@@ -1905,8 +1920,16 @@ impl<'a> Parser<'a> {
 
     fn parse_bitxor_expr(&mut self) -> Result<V2Expr> {
         let mut lhs = self.parse_bitand_expr()?;
+        let mut chain = 0usize;
         while self.peek().kind == TokenKind::Caret {
             let span = self.bump().span;
+            chain += 1;
+            if self.depth + chain > MAX_NESTING_DEPTH {
+                return Err(Error::at(
+                    span,
+                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
+                ));
+            }
             let rhs = self.parse_bitand_expr()?;
             lhs = V2Expr::Binary {
                 span,
@@ -1920,8 +1943,16 @@ impl<'a> Parser<'a> {
 
     fn parse_bitand_expr(&mut self) -> Result<V2Expr> {
         let mut lhs = self.parse_add_expr()?;
+        let mut chain = 0usize;
         while self.peek().kind == TokenKind::Amp {
             let span = self.bump().span;
+            chain += 1;
+            if self.depth + chain > MAX_NESTING_DEPTH {
+                return Err(Error::at(
+                    span,
+                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
+                ));
+            }
             let rhs = self.parse_add_expr()?;
             lhs = V2Expr::Binary {
                 span,
@@ -1935,6 +1966,7 @@ impl<'a> Parser<'a> {
 
     fn parse_add_expr(&mut self) -> Result<V2Expr> {
         let mut lhs = self.parse_mul_expr()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek().kind {
                 TokenKind::Plus => V2BinOp::Add,
@@ -1942,6 +1974,13 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             let span = self.bump().span;
+            chain += 1;
+            if self.depth + chain > MAX_NESTING_DEPTH {
+                return Err(Error::at(
+                    span,
+                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
+                ));
+            }
             let rhs = self.parse_mul_expr()?;
             lhs = V2Expr::Binary {
                 span,
@@ -1955,6 +1994,7 @@ impl<'a> Parser<'a> {
 
     fn parse_mul_expr(&mut self) -> Result<V2Expr> {
         let mut lhs = self.parse_unary_expr()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek().kind {
                 TokenKind::Star => V2BinOp::Mul,
@@ -1963,6 +2003,13 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             let span = self.bump().span;
+            chain += 1;
+            if self.depth + chain > MAX_NESTING_DEPTH {
+                return Err(Error::at(
+                    span,
+                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
+                ));
+            }
             let rhs = self.parse_unary_expr()?;
             lhs = V2Expr::Binary {
                 span,
@@ -2054,7 +2101,10 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::LBracket => {
                     let span = self.bump().span;
-                    let index = self.parse_expr()?;
+                    self.enter_nesting(span)?;
+                    let index = self.parse_expr();
+                    self.leave_nesting();
+                    let index = index?;
                     self.expect(&TokenKind::RBracket, "']'")?;
                     expr = V2Expr::Index {
                         span,
@@ -2078,31 +2128,44 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<CallArg>> {
-        self.expect(&TokenKind::LParen, "'('")?;
+        let open_span = self.expect(&TokenKind::LParen, "'('")?;
+        self.enter_nesting(open_span)?;
         let mut args = Vec::new();
-        while !self.eat(&TokenKind::RParen) {
+        let res = loop {
+            if self.eat(&TokenKind::RParen) {
+                break Ok(args);
+            }
             let aspan = self.span();
-            let (name, value) = if matches!(&self.peek().kind, TokenKind::Ident(_))
+            let parsed = if matches!(&self.peek().kind, TokenKind::Ident(_))
                 && self.peek_at(1).kind == TokenKind::Colon
             {
-                let (n, _) = self.expect_ident("argument name")?;
-                self.bump(); // ':'
-                let v = self.parse_expr()?;
-                (Some(n), v)
+                match self.expect_ident("argument name") {
+                    Ok((n, _)) => {
+                        self.bump(); // ':'
+                        self.parse_expr().map(|v| (Some(n), v))
+                    }
+                    Err(e) => Err(e),
+                }
             } else {
-                (None, self.parse_expr()?)
+                self.parse_expr().map(|v| (None, v))
             };
-            args.push(CallArg {
-                span: aspan,
-                name,
-                value,
-            });
-            if !self.eat(&TokenKind::Comma) {
-                self.expect(&TokenKind::RParen, "')'")?;
-                break;
+            match parsed {
+                Ok((name, value)) => args.push(CallArg {
+                    span: aspan,
+                    name,
+                    value,
+                }),
+                Err(e) => break Err(e),
             }
-        }
-        Ok(args)
+            if !self.eat(&TokenKind::Comma) {
+                if let Err(e) = self.expect(&TokenKind::RParen, "')'") {
+                    break Err(e);
+                }
+                break Ok(args);
+            }
+        };
+        self.leave_nesting();
+        res
     }
 
     fn parse_primary_expr(&mut self) -> Result<V2Expr> {

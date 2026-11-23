@@ -92,7 +92,8 @@ struct ObjectEnv<'a> {
     states: BTreeMap<String, ResolvedState>,
     state_order: Vec<String>,
     sounds: BTreeMap<String, ResolvedSound>,
-    slots: BTreeMap<String, (usize, SlotDecl)>,
+    /// Slot declarations paired with their routing-only ordinal (`Some(idx)` for `kind == 3`).
+    slots: BTreeMap<String, (Option<u16>, SlotDecl)>,
     strings: BTreeMap<u16, StringsDecl>,
     string_names: BTreeMap<String, u16>,
     local_fns: BTreeMap<String, (String, FnDecl)>,
@@ -123,14 +124,20 @@ impl<'a> ObjectEnv<'a> {
         }
     }
 
-    fn lookup_fn(&self, owner_module: &str, name: &str) -> Option<(String, FnDecl)> {
-        if let Some(found) = self.local_fns.get(name) {
-            return Some(found.clone());
+    fn lookup_fn(
+        &self,
+        owner_module: &str,
+        name: &str,
+        allow_local_fns: bool,
+    ) -> Option<(String, FnDecl, bool)> {
+        if allow_local_fns && let Some((m, decl)) = self.local_fns.get(name) {
+            return Some((m.clone(), decl.clone(), true));
         }
         self.resolved
             .module_scopes
             .get(owner_module)
-            .and_then(|s: &ModuleScope| s.functions.get(name).cloned())
+            .and_then(|s: &ModuleScope| s.functions.get(name))
+            .map(|(m, decl)| (m.clone(), decl.clone(), false))
     }
 }
 
@@ -560,6 +567,8 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             .wav_name
             .clone()
             .unwrap_or_else(|| format!("{}_{}", slug.replace('-', "_"), sname));
+        crate::manifest::validate_relative_filename(&wav_name, "sound wav name")
+            .map_err(|e| Error::at(s.span, e.message))?;
         sounds.insert(sname.clone(), ResolvedSound { id });
         sound_specs.push(SoundSpec {
             id,
@@ -568,11 +577,21 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         });
     }
 
-    // 6. Build slot table.
+    // 6. Build slot table (routing_ordinal counts ONLY kind == 3 routing slots, matching sims-vm).
     let mut slots = BTreeMap::new();
     let mut slot_specs = Vec::with_capacity(slot_order.len());
-    for (idx, sl_name) in slot_order.iter().enumerate() {
+    let mut routing_ordinal = 0u16;
+    for sl_name in &slot_order {
         let sl = raw_slots[sl_name].clone();
+        let routing_idx = if sl.kind == 3 {
+            let idx = routing_ordinal;
+            routing_ordinal = routing_ordinal
+                .checked_add(1)
+                .ok_or_else(|| Error::at(sl.span, "routing slot count overflow"))?;
+            Some(idx)
+        } else {
+            None
+        };
         slot_specs.push(SlotSpec {
             kind: sl.kind,
             offset: sl.offset,
@@ -588,7 +607,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             facing: sl.facing,
             resolution: sl.resolution,
         });
-        slots.insert(sl_name.clone(), (idx, sl));
+        slots.insert(sl_name.clone(), (routing_idx, sl));
     }
 
     let env = ObjectEnv {
@@ -785,16 +804,25 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             };
             ctx.line(format!("my.attr[{}] := {rhs};", st.attr_index));
         }
-        // Append template + object `init { ... }` hooks.
+        // Append template + object `init { ... }` hooks, each in its own lexical/cleanup scope.
         for blk in &init_blocks {
-            ctx.with_owner_module(&blk.owner_module, |c| c.lower_stmts(&blk.stmts))?;
+            ctx.with_owner_module(&blk.owner_module, |c| {
+                c.push_scope(ScopeFrame::block());
+                let r = c.lower_stmts(&blk.stmts);
+                let p = if stmts_always_return(&blk.stmts) {
+                    c.pop_scope_discard_cleanups();
+                    Ok(())
+                } else {
+                    c.pop_scope_and_run_cleanups()
+                };
+                r.and(p)
+            })?;
         }
-        if !ends_with_unconditional_return(
-            init_blocks
-                .last()
-                .map(|b| b.stmts.as_slice())
-                .unwrap_or(&[]),
-        ) {
+        if !init_blocks
+            .last()
+            .is_some_and(|b| stmts_always_return(&b.stmts))
+        {
+            ctx.emit_all_cleanups()?;
             ctx.line("return true;".to_owned());
         }
         let _ = writeln!(air, "tree {init_id} \"Init\" {{");
@@ -806,8 +834,19 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     {
         let mut ctx = TreeLowerer::new(&env, TreeContext::ObjectSelf, &resolved.module_id, false);
         if let Some(blk) = &main_block {
-            ctx.with_owner_module(&blk.owner_module, |c| c.lower_stmts(&blk.stmts))?;
-            if !ends_with_unconditional_return(&blk.stmts) {
+            ctx.with_owner_module(&blk.owner_module, |c| {
+                c.push_scope(ScopeFrame::block());
+                let r = c.lower_stmts(&blk.stmts);
+                let p = if stmts_always_return(&blk.stmts) {
+                    c.pop_scope_discard_cleanups();
+                    Ok(())
+                } else {
+                    c.pop_scope_and_run_cleanups()
+                };
+                r.and(p)
+            })?;
+            if !stmts_always_return(&blk.stmts) {
+                ctx.emit_all_cleanups()?;
                 ctx.line("return true;".to_owned());
             }
         } else {
@@ -841,7 +880,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         let action_id = alloc_tree_id(func.decl.pinned_id, None, func.decl.span)?;
         let action_label = format!("Functional_{}", capitalize(&func.decl.kind));
         let needs_self_save =
-            stmts_may_clobber_stack_obj(&func.decl.body, &env, &func.owner_module, 0);
+            stmts_may_clobber_stack_obj(&func.decl.body, &env, &func.owner_module, true, 0);
         let mut ctx = TreeLowerer::new(
             &env,
             TreeContext::SimOnObject {
@@ -902,7 +941,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         };
         let action_id = alloc_tree_id(inter.decl.pinned_id, None, inter.decl.span)?;
         let needs_self_save =
-            stmts_may_clobber_stack_obj(&inter.decl.run_body, &env, &inter.owner_module, 0);
+            stmts_may_clobber_stack_obj(&inter.decl.run_body, &env, &inter.owner_module, true, 0);
         let mut ctx = TreeLowerer::new(
             &env,
             TreeContext::SimOnObject {
@@ -1041,8 +1080,8 @@ fn emit_guard_tree(
     func_params: &[crate::v2::ast::FnParam],
 ) -> Result<()> {
     let needs_self_save = match &guard.kind {
-        GuardBody::Expr(e) => expr_may_clobber_stack_obj(e, env, owner_module, 0),
-        GuardBody::Block(stmts) => stmts_may_clobber_stack_obj(stmts, env, owner_module, 0),
+        GuardBody::Expr(e) => expr_may_clobber_stack_obj(e, env, owner_module, true, 0),
+        GuardBody::Block(stmts) => stmts_may_clobber_stack_obj(stmts, env, owner_module, true, 0),
     };
     let mut ctx = TreeLowerer::new(
         env,
@@ -1136,7 +1175,7 @@ enum ValueType {
 }
 
 /// A resolved assignable storage location in `.air`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LValue {
     /// Direct `.air` operand (e.g., `stack.attr[0]`, `my.motive.energy`, `v_x_0`, `temp[2]`).
     Direct { air: String, ty: ValueType },
@@ -1146,11 +1185,21 @@ enum LValue {
     ForeignData { obj_air: String, data_index: i16 },
 }
 
+impl LValue {
+    fn value_type(&self) -> ValueType {
+        match self {
+            LValue::Direct { ty, .. } => *ty,
+            LValue::ForeignAttr { .. } | LValue::ForeignData { .. } => ValueType::I16,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum CleanupAction {
     Unlock(LValue),
     Defer {
         owner_module: String,
+        in_object_scope: bool,
         body: Vec<V2Stmt>,
         saved_bindings: Vec<BTreeMap<String, Binding>>,
     },
@@ -1160,9 +1209,23 @@ enum CleanupAction {
 struct ScopeFrame {
     cleanups: Vec<CleanupAction>,
     is_loop_body: bool,
-    is_fn_root: bool,
-    cancel_on_abort: bool,
+    /// `true` when this frame corresponds to an emitted `.air` `while` loop
+    /// (`repeat`, `while`, `for`, or wrapped inline helper `while 1 == 1`).
+    is_air_while: bool,
+    cancel_flag: Option<String>,
     repeat_counter: Option<String>,
+}
+
+impl ScopeFrame {
+    fn block() -> Self {
+        Self {
+            cleanups: Vec::new(),
+            is_loop_body: false,
+            is_air_while: false,
+            cancel_flag: None,
+            repeat_counter: None,
+        }
+    }
 }
 
 struct ActiveInlineFn {
@@ -1177,6 +1240,9 @@ struct TreeLowerer<'a> {
     env: &'a ObjectEnv<'a>,
     tree_ctx: TreeContext,
     owner_module: String,
+    /// `true` when lowering code inside the object/template (can see `local_fns`),
+    /// `false` inside an imported/module-level helper function.
+    in_object_scope: bool,
     has_self_obj_local: bool,
     out: String,
     indent: usize,
@@ -1200,18 +1266,13 @@ impl<'a> TreeLowerer<'a> {
             env,
             tree_ctx,
             owner_module: owner_module.to_owned(),
+            in_object_scope: true,
             has_self_obj_local,
             out: String::new(),
             indent: 1,
             next_id: 0,
             var_scopes: vec![BTreeMap::new()],
-            cleanup_scopes: vec![ScopeFrame {
-                cleanups: Vec::new(),
-                is_loop_body: false,
-                is_fn_root: false,
-                cancel_on_abort: false,
-                repeat_counter: None,
-            }],
+            cleanup_scopes: vec![ScopeFrame::block()],
             in_defer: false,
             inline_call_stack: Vec::new(),
             inline_expansions: 0,
@@ -1309,17 +1370,17 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
-    fn in_cancel_on_abort_loop(&self) -> Option<usize> {
-        // Walk from innermost scope up to the nearest loop boundary (stopping at inline fn root).
+    fn enclosing_cancel_flag(&self) -> Option<(usize, String)> {
         for (idx, frame) in self.cleanup_scopes.iter().enumerate().rev() {
-            if frame.is_loop_body {
-                return frame.cancel_on_abort.then_some(idx);
-            }
-            if frame.is_fn_root {
-                return None;
+            if let Some(flag) = &frame.cancel_flag {
+                return Some((idx, flag.clone()));
             }
         }
         None
+    }
+
+    fn nearest_air_while_idx(&self) -> Option<usize> {
+        self.cleanup_scopes.iter().rposition(|f| f.is_air_while)
     }
 
     fn push_scope(&mut self, frame: ScopeFrame) {
@@ -1329,9 +1390,14 @@ impl<'a> TreeLowerer<'a> {
 
     fn pop_scope_and_run_cleanups(&mut self) -> Result<()> {
         let frame = self.cleanup_scopes.pop().expect("cleanup_scopes balanced");
-        self.run_frame_cleanups(&frame)?;
+        let res = self.run_frame_cleanups(&frame);
         self.var_scopes.pop();
-        Ok(())
+        res
+    }
+
+    fn pop_scope_discard_cleanups(&mut self) {
+        self.cleanup_scopes.pop().expect("cleanup_scopes balanced");
+        self.var_scopes.pop();
     }
 
     fn has_active_cleanups(&self) -> bool {
@@ -1344,16 +1410,29 @@ impl<'a> TreeLowerer<'a> {
             .any(|f| !f.cleanups.is_empty())
     }
 
+    fn has_any_active_cleanups(&self) -> bool {
+        self.cleanup_scopes.iter().any(|f| !f.cleanups.is_empty())
+    }
+
+    fn emit_cleanups_down_to(&mut self, start: usize) -> Result<()> {
+        let saved = self.cleanup_scopes.split_off(start);
+        let mut res = Ok(());
+        for frame in saved.iter().rev() {
+            if let Err(e) = self.run_frame_cleanups(frame) {
+                res = Err(e);
+                break;
+            }
+        }
+        self.cleanup_scopes.extend(saved);
+        res
+    }
+
     fn emit_all_cleanups(&mut self) -> Result<()> {
         let floor = self
             .active_inline_fn
             .as_ref()
             .map_or(0, |f| f.fn_scope_depth);
-        let frames: Vec<ScopeFrame> = self.cleanup_scopes[floor..].iter().rev().cloned().collect();
-        for frame in &frames {
-            self.run_frame_cleanups(frame)?;
-        }
-        Ok(())
+        self.emit_cleanups_down_to(floor)
     }
 
     fn emit_loop_cleanups(&mut self, span: Span, is_continue: bool) -> Result<()> {
@@ -1375,17 +1454,29 @@ impl<'a> TreeLowerer<'a> {
                     },
                 )
             })?;
-        let frames: Vec<ScopeFrame> = self.cleanup_scopes[loop_idx..]
-            .iter()
-            .rev()
-            .cloned()
-            .collect();
-        for frame in &frames {
-            self.run_frame_cleanups(frame)?;
-        }
+        self.emit_cleanups_down_to(loop_idx)?;
         if is_continue && let Some(counter) = self.cleanup_scopes[loop_idx].repeat_counter.clone() {
             self.line(format!("{counter} += 1;"));
         }
+        Ok(())
+    }
+
+    fn emit_cancel_propagation(&mut self) -> Result<()> {
+        if self.in_defer {
+            return Ok(());
+        }
+        let Some((_, flag)) = self.enclosing_cancel_flag() else {
+            return Ok(());
+        };
+        let target_while = self
+            .nearest_air_while_idx()
+            .expect("enclosing cancel_flag implies an enclosing air while loop");
+        self.line(format!("if {flag} != 0 {{"));
+        self.indent += 1;
+        self.emit_cleanups_down_to(target_while)?;
+        self.line("break;".to_owned());
+        self.indent -= 1;
+        self.line("}".to_owned());
         Ok(())
     }
 
@@ -1398,25 +1489,23 @@ impl<'a> TreeLowerer<'a> {
                 }
                 CleanupAction::Defer {
                     owner_module,
+                    in_object_scope,
                     body,
                     saved_bindings,
                 } => {
                     let prev_in_defer = self.in_defer;
+                    let prev_in_obj = self.in_object_scope;
                     let prev_vars = std::mem::replace(&mut self.var_scopes, saved_bindings.clone());
                     self.in_defer = true;
+                    self.in_object_scope = *in_object_scope;
                     let res = self.with_owner_module(owner_module, |c| {
-                        c.push_scope(ScopeFrame {
-                            cleanups: Vec::new(),
-                            is_loop_body: false,
-                            is_fn_root: false,
-                            cancel_on_abort: false,
-                            repeat_counter: None,
-                        });
+                        c.push_scope(ScopeFrame::block());
                         let r = c.lower_stmts(body);
                         let p = c.pop_scope_and_run_cleanups();
                         r.and(p)
                     });
                     self.in_defer = prev_in_defer;
+                    self.in_object_scope = prev_in_obj;
                     self.var_scopes = prev_vars;
                     res?;
                 }
@@ -1464,6 +1553,15 @@ impl<'a> TreeLowerer<'a> {
                             ),
                         ));
                     }
+                    if expected != ValueType::Bool && inferred_ty == ValueType::Bool {
+                        return Err(Error::at(
+                            *span,
+                            format!(
+                                "cannot initialize '{}' variable '{name}' from bool expression",
+                                ann.display_name()
+                            ),
+                        ));
+                    }
                     expected
                 } else {
                     inferred_ty
@@ -1493,26 +1591,23 @@ impl<'a> TreeLowerer<'a> {
             } => {
                 let lval = self.resolve_lvalue(target)?;
                 let (val_air, val_ty) = self.lower_value_expr(value)?;
-                if let LValue::Direct {
-                    ty: ValueType::Bool,
-                    ..
-                } = &lval
-                    && *op != V2AssignOp::Set
-                {
+                let target_ty = lval.value_type();
+                if target_ty == ValueType::Bool && *op != V2AssignOp::Set {
                     return Err(Error::at(
                         *span,
                         "compound arithmetic assignment is not allowed on a bool target",
                     ));
                 }
-                if let LValue::Direct {
-                    ty: ValueType::Bool,
-                    ..
-                } = &lval
-                    && val_ty != ValueType::Bool
-                {
+                if target_ty == ValueType::Bool && val_ty != ValueType::Bool {
                     return Err(Error::at(
                         *span,
                         "cannot assign a non-bool expression to a bool target",
+                    ));
+                }
+                if target_ty != ValueType::Bool && val_ty == ValueType::Bool {
+                    return Err(Error::at(
+                        *span,
+                        "cannot assign a bool expression to a non-bool target",
                     ));
                 }
                 self.emit_lvalue_assign(&lval, *op, &val_air)
@@ -1523,20 +1618,29 @@ impl<'a> TreeLowerer<'a> {
                 body,
             } => {
                 let lval = self.resolve_lvalue(lock_expr)?;
-                if let LValue::Direct { ty, .. } = &lval
-                    && *ty != ValueType::Bool
-                {
+                if lval.value_type() != ValueType::Bool {
                     return Err(Error::at(
                         *span,
                         "with lock(...) requires a bool state or &mut bool target",
+                    ));
+                }
+                if self.cleanup_scopes.iter().any(|frame| {
+                    frame
+                        .cleanups
+                        .iter()
+                        .any(|a| matches!(a, CleanupAction::Unlock(existing) if existing == &lval))
+                }) {
+                    return Err(Error::at(
+                        *span,
+                        "re-entrant 'with lock(...)' on an already-locked target in the same scope chain",
                     ));
                 }
                 self.emit_lvalue_assign(&lval, V2AssignOp::Set, "1")?;
                 self.push_scope(ScopeFrame {
                     cleanups: vec![CleanupAction::Unlock(lval)],
                     is_loop_body: false,
-                    is_fn_root: false,
-                    cancel_on_abort: false,
+                    is_air_while: false,
+                    cancel_flag: None,
                     repeat_counter: None,
                 });
                 let res = self.lower_stmts(body);
@@ -1552,9 +1656,11 @@ impl<'a> TreeLowerer<'a> {
                 }
                 let saved_bindings = self.var_scopes.clone();
                 let owner_module = self.owner_module.clone();
+                let in_object_scope = self.in_object_scope;
                 if let Some(frame) = self.cleanup_scopes.last_mut() {
                     frame.cleanups.push(CleanupAction::Defer {
                         owner_module,
+                        in_object_scope,
                         body: body.clone(),
                         saved_bindings,
                     });
@@ -1573,7 +1679,20 @@ impl<'a> TreeLowerer<'a> {
                         "'cancel_on_abort' requires a Sim interaction context (not available in init/main)",
                     ));
                 }
+                if *cancel_on_abort && self.in_defer {
+                    return Err(Error::at(
+                        *span,
+                        "'cancel_on_abort' is not allowed inside a 'defer' block",
+                    ));
+                }
                 let (limit_air, _) = self.lower_value_expr(count)?;
+                let cancel_flag = if *cancel_on_abort {
+                    let f = self.fresh("abort");
+                    self.line(format!("let {f} = 0;"));
+                    Some(f)
+                } else {
+                    None
+                };
                 let counter = self.fresh("rep");
                 self.line(format!("let {counter} = 0;"));
                 self.line(format!("while {counter} < {limit_air} {{"));
@@ -1581,13 +1700,14 @@ impl<'a> TreeLowerer<'a> {
                 self.push_scope(ScopeFrame {
                     cleanups: Vec::new(),
                     is_loop_body: true,
-                    is_fn_root: false,
-                    cancel_on_abort: *cancel_on_abort,
+                    is_air_while: true,
+                    cancel_flag: cancel_flag.clone(),
                     repeat_counter: Some(counter.clone()),
                 });
-                if *cancel_on_abort {
+                if let Some(flag) = &cancel_flag {
                     self.line("if my.person.priority == 0 {".to_owned());
                     self.indent += 1;
+                    self.line(format!("{flag} := 1;"));
                     self.line("break;".to_owned());
                     self.indent -= 1;
                     self.line("}".to_owned());
@@ -1598,7 +1718,17 @@ impl<'a> TreeLowerer<'a> {
                 self.indent -= 1;
                 self.line("}".to_owned());
                 res.and(pop_res)?;
+                if let Some(inner_flag) = &cancel_flag
+                    && let Some((_, outer_flag)) = self.enclosing_cancel_flag()
+                {
+                    self.line(format!("if {inner_flag} != 0 {{"));
+                    self.indent += 1;
+                    self.line(format!("{outer_flag} := 1;"));
+                    self.indent -= 1;
+                    self.line("}".to_owned());
+                }
                 self.emit_inline_fn_return_propagation()?;
+                self.emit_cancel_propagation()?;
                 Ok(())
             }
             V2Stmt::While {
@@ -1613,19 +1743,35 @@ impl<'a> TreeLowerer<'a> {
                         "'cancel_on_abort' requires a Sim interaction context (not available in init/main)",
                     ));
                 }
-                if let Some(simple_cond) = self.try_lower_simple_air_cond(cond)? {
+                if *cancel_on_abort && self.in_defer {
+                    return Err(Error::at(
+                        *span,
+                        "'cancel_on_abort' is not allowed inside a 'defer' block",
+                    ));
+                }
+                let cancel_flag = if *cancel_on_abort {
+                    let f = self.fresh("abort");
+                    self.line(format!("let {f} = 0;"));
+                    Some(f)
+                } else {
+                    None
+                };
+                if self.is_pure_simple_air_cond(cond)
+                    && let Some(simple_cond) = self.try_lower_simple_air_cond(cond)?
+                {
                     self.line(format!("while {simple_cond} {{"));
                     self.indent += 1;
                     self.push_scope(ScopeFrame {
                         cleanups: Vec::new(),
                         is_loop_body: true,
-                        is_fn_root: false,
-                        cancel_on_abort: *cancel_on_abort,
+                        is_air_while: true,
+                        cancel_flag: cancel_flag.clone(),
                         repeat_counter: None,
                     });
-                    if *cancel_on_abort {
+                    if let Some(flag) = &cancel_flag {
                         self.line("if my.person.priority == 0 {".to_owned());
                         self.indent += 1;
+                        self.line(format!("{flag} := 1;"));
                         self.line("break;".to_owned());
                         self.indent -= 1;
                         self.line("}".to_owned());
@@ -1635,41 +1781,50 @@ impl<'a> TreeLowerer<'a> {
                     self.indent -= 1;
                     self.line("}".to_owned());
                     res.and(pop_res)?;
-                    self.emit_inline_fn_return_propagation()?;
-                    Ok(())
                 } else {
                     self.line("while 1 == 1 {".to_owned());
                     self.indent += 1;
+                    self.push_scope(ScopeFrame {
+                        cleanups: Vec::new(),
+                        is_loop_body: true,
+                        is_air_while: true,
+                        cancel_flag: cancel_flag.clone(),
+                        repeat_counter: None,
+                    });
+                    if let Some(flag) = &cancel_flag {
+                        self.line("if my.person.priority == 0 {".to_owned());
+                        self.indent += 1;
+                        self.line(format!("{flag} := 1;"));
+                        self.line("break;".to_owned());
+                        self.indent -= 1;
+                        self.line("}".to_owned());
+                    }
                     let cond_loc = self.fresh("wcond");
                     self.line(format!("let {cond_loc} = 0;"));
-                    self.emit_bool_into_local(cond, &cond_loc)?;
+                    let cond_res = self.emit_bool_into_local(cond, &cond_loc);
                     self.line(format!("if {cond_loc} == 0 {{"));
                     self.indent += 1;
                     self.line("break;".to_owned());
                     self.indent -= 1;
                     self.line("}".to_owned());
-                    self.push_scope(ScopeFrame {
-                        cleanups: Vec::new(),
-                        is_loop_body: true,
-                        is_fn_root: false,
-                        cancel_on_abort: *cancel_on_abort,
-                        repeat_counter: None,
-                    });
-                    if *cancel_on_abort {
-                        self.line("if my.person.priority == 0 {".to_owned());
-                        self.indent += 1;
-                        self.line("break;".to_owned());
-                        self.indent -= 1;
-                        self.line("}".to_owned());
-                    }
-                    let res = self.lower_stmts(body);
+                    let body_res = cond_res.and_then(|()| self.lower_stmts(body));
                     let pop_res = self.pop_scope_and_run_cleanups();
                     self.indent -= 1;
                     self.line("}".to_owned());
-                    res.and(pop_res)?;
-                    self.emit_inline_fn_return_propagation()?;
-                    Ok(())
+                    body_res.and(pop_res)?;
                 }
+                if let Some(inner_flag) = &cancel_flag
+                    && let Some((_, outer_flag)) = self.enclosing_cancel_flag()
+                {
+                    self.line(format!("if {inner_flag} != 0 {{"));
+                    self.indent += 1;
+                    self.line(format!("{outer_flag} := 1;"));
+                    self.indent -= 1;
+                    self.line("}".to_owned());
+                }
+                self.emit_inline_fn_return_propagation()?;
+                self.emit_cancel_propagation()?;
+                Ok(())
             }
             V2Stmt::ForEach {
                 span: _,
@@ -1678,6 +1833,7 @@ impl<'a> TreeLowerer<'a> {
                 body,
             } => {
                 let iter_var = self.fresh(&format!("v_{binding}"));
+                let mut parts_root_opt = None;
                 match iter {
                     ForEachIter::ObjectsByGuid(guid) => {
                         self.line(format!("let {iter_var} = 0;"));
@@ -1686,17 +1842,30 @@ impl<'a> TreeLowerer<'a> {
                         ));
                     }
                     ForEachIter::SelfParts => {
-                        if self.has_self_obj_local {
-                            self.line(format!("let {iter_var} = __self_obj;"));
-                        } else {
-                            self.line(format!("let {iter_var} = stack_obj;"));
-                        }
+                        let root_expr = match self.tree_ctx {
+                            TreeContext::ObjectSelf => {
+                                let root_loc = self.fresh("parts_root");
+                                self.line(format!("let {root_loc} = my.id;"));
+                                root_loc
+                            }
+                            TreeContext::SimOnObject { .. } => {
+                                if self.has_self_obj_local {
+                                    "__self_obj".to_owned()
+                                } else {
+                                    let root_loc = self.fresh("parts_root");
+                                    self.line(format!("let {root_loc} = stack_obj;"));
+                                    root_loc
+                                }
+                            }
+                        };
+                        self.line(format!("let {iter_var} = {root_expr};"));
                         self.line(format!("while set_to_next(part, dest: {iter_var}) {{"));
+                        parts_root_opt = Some(root_expr);
                     }
                 }
                 self.indent += 1;
-                if matches!(iter, ForEachIter::SelfParts) && self.has_self_obj_local {
-                    self.line(format!("if {iter_var} == __self_obj {{"));
+                if let Some(root_expr) = parts_root_opt {
+                    self.line(format!("if {iter_var} == {root_expr} {{"));
                     self.indent += 1;
                     self.line("break;".to_owned());
                     self.indent -= 1;
@@ -1705,8 +1874,8 @@ impl<'a> TreeLowerer<'a> {
                 self.push_scope(ScopeFrame {
                     cleanups: Vec::new(),
                     is_loop_body: true,
-                    is_fn_root: false,
-                    cancel_on_abort: false,
+                    is_air_while: true,
+                    cancel_flag: None,
                     repeat_counter: None,
                 });
                 self.bind_var(
@@ -1725,6 +1894,7 @@ impl<'a> TreeLowerer<'a> {
                 }
                 res.and(pop_res)?;
                 self.emit_inline_fn_return_propagation()?;
+                self.emit_cancel_propagation()?;
                 Ok(())
             }
             V2Stmt::If {
@@ -1736,13 +1906,7 @@ impl<'a> TreeLowerer<'a> {
                 // Constant-fold literal boolean conditions (e.g. from `bool` params!).
                 if let Some(const_b) = self.try_eval_const_bool(cond) {
                     let chosen = if const_b { then_body } else { else_body };
-                    self.push_scope(ScopeFrame {
-                        cleanups: Vec::new(),
-                        is_loop_body: false,
-                        is_fn_root: false,
-                        cancel_on_abort: false,
-                        repeat_counter: None,
-                    });
+                    self.push_scope(ScopeFrame::block());
                     let r = self.lower_stmts(chosen);
                     let p = self.pop_scope_and_run_cleanups();
                     return r.and(p);
@@ -1759,13 +1923,7 @@ impl<'a> TreeLowerer<'a> {
 
                 self.line(format!("if {cond_text} {{"));
                 self.indent += 1;
-                self.push_scope(ScopeFrame {
-                    cleanups: Vec::new(),
-                    is_loop_body: false,
-                    is_fn_root: false,
-                    cancel_on_abort: false,
-                    repeat_counter: None,
-                });
+                self.push_scope(ScopeFrame::block());
                 let r1 = self.lower_stmts(then_body);
                 let p1 = self.pop_scope_and_run_cleanups();
                 self.indent -= 1;
@@ -1775,13 +1933,7 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     self.line("} else {".to_owned());
                     self.indent += 1;
-                    self.push_scope(ScopeFrame {
-                        cleanups: Vec::new(),
-                        is_loop_body: false,
-                        is_fn_root: false,
-                        cancel_on_abort: false,
-                        repeat_counter: None,
-                    });
+                    self.push_scope(ScopeFrame::block());
                     let r2 = self.lower_stmts(else_body);
                     let p2 = self.pop_scope_and_run_cleanups();
                     self.indent -= 1;
@@ -1883,7 +2035,36 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
             V2Stmt::Expr { span: _, expr } => self.lower_expr_stmt(expr),
-            V2Stmt::RawAir { span: _, code } => {
+            V2Stmt::RawAir { span, code } => {
+                if self.in_defer {
+                    return Err(Error::at(
+                        *span,
+                        "'raw { ... }' is not allowed inside a 'defer' block",
+                    ));
+                }
+                if self.has_any_active_cleanups()
+                    || !self.inline_call_stack.is_empty()
+                    || self.enclosing_cancel_flag().is_some()
+                {
+                    let tokens = crate::lexer::tokenize(code).map_err(|e| {
+                        Error::at(
+                            *span,
+                            format!("invalid .air syntax in raw block: {}", e.message),
+                        )
+                    })?;
+                    for tok in &tokens {
+                        if let crate::lexer::TokenKind::Ident(ident) = &tok.kind
+                            && matches!(ident.as_str(), "return" | "break" | "continue")
+                        {
+                            return Err(Error::at(
+                                *span,
+                                format!(
+                                    "'raw {{ ... }}' cannot contain '{ident}' while cleanups, inline helpers, or cancel_on_abort loops are active"
+                                ),
+                            ));
+                        }
+                    }
+                }
                 for raw_line in code.lines() {
                     let trimmed = raw_line.trim();
                     if !trimmed.is_empty() {
@@ -1955,13 +2136,7 @@ impl<'a> TreeLowerer<'a> {
         if self.has_self_obj_local {
             self.line("stack_obj := __self_obj;".to_owned());
         }
-        self.push_scope(ScopeFrame {
-            cleanups: Vec::new(),
-            is_loop_body: false,
-            is_fn_root: false,
-            cancel_on_abort: false,
-            repeat_counter: None,
-        });
+        self.push_scope(ScopeFrame::block());
         let r = self.lower_stmts(else_body);
         let p = self.pop_scope_and_run_cleanups();
         self.indent -= 1;
@@ -2067,10 +2242,12 @@ impl<'a> TreeLowerer<'a> {
                         }
                         _ => {
                             // User helper function call (discarding optional bool return).
-                            if let Some((fn_mod, fn_decl)) =
-                                self.env.lookup_fn(&self.owner_module, fname)
+                            if let Some((fn_mod, fn_decl, is_local)) =
+                                self.env
+                                    .lookup_fn(&self.owner_module, fname, self.in_object_scope)
                             {
-                                let _ = self.inline_helper_call(&fn_mod, &fn_decl, args, *span)?;
+                                let _ = self
+                                    .inline_helper_call(&fn_mod, &fn_decl, is_local, args, *span)?;
                                 return Ok(());
                             }
                             return Err(Error::at(*span, format!("unknown function '{fname}'")));
@@ -2106,20 +2283,32 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         let (ticks_air, _) = self.lower_value_expr(&args[0].value)?;
-        let cancel_loop = self.in_cancel_on_abort_loop();
-        if cancel_loop.is_some() {
+        let cancel = if self.in_defer {
+            None
+        } else {
+            self.enclosing_cancel_flag()
+        };
+        if let Some((_, ref flag)) = cancel {
+            let target_while = self
+                .nearest_air_while_idx()
+                .expect("enclosing cancel_flag implies an enclosing air while loop");
             self.line("if my.person.priority == 0 {".to_owned());
             self.indent += 1;
-            self.emit_loop_cleanups(span, false)?;
+            self.line(format!("{flag} := 1;"));
+            self.emit_cleanups_down_to(target_while)?;
             self.line("break;".to_owned());
             self.indent -= 1;
             self.line("}".to_owned());
         }
         self.line(format!("idle({ticks_air});"));
-        if cancel_loop.is_some() {
+        if let Some((_, ref flag)) = cancel {
+            let target_while = self
+                .nearest_air_while_idx()
+                .expect("enclosing cancel_flag implies an enclosing air while loop");
             self.line("if my.person.priority == 0 {".to_owned());
             self.indent += 1;
-            self.emit_loop_cleanups(span, false)?;
+            self.line(format!("{flag} := 1;"));
+            self.emit_cleanups_down_to(target_while)?;
             self.line("break;".to_owned());
             self.indent -= 1;
             self.line("}".to_owned());
@@ -2147,8 +2336,17 @@ impl<'a> TreeLowerer<'a> {
             ));
         };
         let _ = functional_kind_info(kind_name, *kspan)?;
+        let (target_air, target_ty) = self.lower_value_expr(receiver)?;
+        if target_ty == ValueType::Bool {
+            return Err(Error::at(
+                receiver.span(),
+                "run_functional() receiver must be an ObjectId, not bool",
+            ));
+        }
+        let staged_target = self.fresh("rf_obj");
+        self.line(format!("let {staged_target} = {target_air};"));
         let mut change_icon = false;
-        let mut temp_args = Vec::new();
+        let mut staged_args = Vec::new();
         for arg in &args[1..] {
             if let Some(aname) = &arg.name {
                 if aname == "change_icon" {
@@ -2160,20 +2358,22 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
             } else {
-                temp_args.push(self.lower_value_expr(&arg.value)?.0);
+                let (val, _) = self.lower_value_expr(&arg.value)?;
+                let staged = self.fresh("rf_arg");
+                self.line(format!("let {staged} = {val};"));
+                staged_args.push(staged);
             }
         }
-        if temp_args.len() > 8 {
+        if staged_args.len() > 8 {
             return Err(Error::at(
                 span,
                 "run_functional() supports at most 8 temp arguments (temp[0..7])",
             ));
         }
-        let (target_air, _) = self.lower_value_expr(receiver)?;
-        for (i, val) in temp_args.iter().enumerate() {
+        for (i, val) in staged_args.iter().enumerate() {
             self.line(format!("temp[{i}] := {val};"));
         }
-        self.line(format!("stack_obj := {target_air};"));
+        self.line(format!("stack_obj := {staged_target};"));
         let prim = if change_icon {
             format!("run_functional_tree({kind_name}, change_icon: true)")
         } else {
@@ -2202,6 +2402,7 @@ impl<'a> TreeLowerer<'a> {
         &mut self,
         fn_mod: &str,
         fn_decl: &FnDecl,
+        is_local_fn: bool,
         args: &[CallArg],
         call_span: Span,
     ) -> Result<Option<String>> {
@@ -2286,7 +2487,13 @@ impl<'a> TreeLowerer<'a> {
                     }
                 }
                 V2Type::ObjectId => {
-                    let (air, _) = self.lower_value_expr(&arg.value)?;
+                    let (air, ty) = self.lower_value_expr(&arg.value)?;
+                    if ty == ValueType::Bool {
+                        return Err(Error::at(
+                            arg.span,
+                            format!("parameter '{}' expects ObjectId, found bool", param.name),
+                        ));
+                    }
                     let loc = self.fresh(&format!("arg_{}", param.name));
                     self.line(format!("let {loc} = {air};"));
                     Binding::Local {
@@ -2295,26 +2502,39 @@ impl<'a> TreeLowerer<'a> {
                     }
                 }
                 V2Type::MutRef(inner) => {
-                    let V2Expr::MutRef { inner: place, .. } = &arg.value else {
-                        return Err(Error::at(
-                            arg.span,
-                            format!(
-                                "parameter '{}' expects '&mut {}'",
-                                param.name,
-                                inner.display_name()
-                            ),
-                        ));
+                    let mut lval = match &arg.value {
+                        V2Expr::MutRef { inner: place, .. } => self.resolve_lvalue(place)?,
+                        V2Expr::Ident(_, pname) => match self.lookup_var(pname).cloned() {
+                            Some(Binding::MutRef { target }) => target,
+                            _ => {
+                                return Err(Error::at(
+                                    arg.span,
+                                    format!(
+                                        "parameter '{}' expects '&mut {}'",
+                                        param.name,
+                                        inner.display_name()
+                                    ),
+                                ));
+                            }
+                        },
+                        _ => {
+                            return Err(Error::at(
+                                arg.span,
+                                format!(
+                                    "parameter '{}' expects '&mut {}'",
+                                    param.name,
+                                    inner.display_name()
+                                ),
+                            ));
+                        }
                     };
-                    let lval = self.resolve_lvalue(place)?;
                     let expected_inner = match inner.as_ref() {
                         V2Type::Bool => ValueType::Bool,
                         V2Type::I16 => ValueType::I16,
                         V2Type::ObjectId => ValueType::ObjectId,
                         _ => unreachable!("parser restricts &mut inner types"),
                     };
-                    if let LValue::Direct { ty, .. } = &lval
-                        && *ty != expected_inner
-                    {
+                    if lval.value_type() != expected_inner {
                         return Err(Error::at(
                             arg.span,
                             format!(
@@ -2323,6 +2543,16 @@ impl<'a> TreeLowerer<'a> {
                                 param.name
                             ),
                         ));
+                    }
+                    // Snapshot foreign object handle so later reassignment of caller local cannot alias.
+                    match &mut lval {
+                        LValue::ForeignAttr { obj_air, .. }
+                        | LValue::ForeignData { obj_air, .. } => {
+                            let snap = self.fresh(&format!("ref_obj_{}", param.name));
+                            self.line(format!("let {snap} = {obj_air};"));
+                            *obj_air = snap;
+                        }
+                        LValue::Direct { .. } => {}
                     }
                     Binding::MutRef { target: lval }
                 }
@@ -2350,7 +2580,13 @@ impl<'a> TreeLowerer<'a> {
                     {
                         Binding::SelfHandle
                     } else {
-                        let (air, _) = self.lower_value_expr(&arg.value)?;
+                        let (air, ty) = self.lower_value_expr(&arg.value)?;
+                        if ty == ValueType::Bool {
+                            return Err(Error::at(
+                                arg.span,
+                                format!("parameter '{}' expects Object, found bool", param.name),
+                            ));
+                        }
                         let loc = self.fresh(&format!("obj_{}", param.name));
                         self.line(format!("let {loc} = {air};"));
                         Binding::ForeignObject { air_name: loc }
@@ -2386,8 +2622,19 @@ impl<'a> TreeLowerer<'a> {
                 ));
             }
         };
+        if has_ret && !stmts_always_return(&fn_decl.body) {
+            return Err(Error::at(
+                fn_decl.span,
+                format!(
+                    "helper function '{}' declares '-> bool' but does not return on all control-flow paths",
+                    fn_decl.name
+                ),
+            ));
+        }
 
-        let needs_wrapper = stmts_have_return(&fn_decl.body);
+        let has_returns = stmts_have_return(&fn_decl.body);
+        let has_enclosing_cancel = !self.in_defer && self.enclosing_cancel_flag().is_some();
+        let needs_wrapper = has_returns || has_enclosing_cancel;
         let ret_val_local = if has_ret {
             let rv = self.fresh(&format!("ret_{}", fn_decl.name));
             self.line(format!("let {rv} = 0;"));
@@ -2399,28 +2646,32 @@ impl<'a> TreeLowerer<'a> {
         self.inline_call_stack.push(fqn);
         let prev_vars = std::mem::replace(&mut self.var_scopes, vec![bound_params]);
         let prev_active_fn = self.active_inline_fn.take();
+        let prev_in_obj = self.in_object_scope;
+        self.in_object_scope = is_local_fn;
         let fn_scope_depth = self.cleanup_scopes.len();
 
         let res = self.with_owner_module(fn_mod, |c| {
             if needs_wrapper {
-                let ret_flag = c.fresh("fn_ret");
-                let rv_name = ret_val_local
-                    .clone()
-                    .unwrap_or_else(|| c.fresh("fn_void_ret"));
-                c.line(format!("let {ret_flag} = 0;"));
+                if has_returns {
+                    let ret_flag = c.fresh("fn_ret");
+                    let rv_name = ret_val_local
+                        .clone()
+                        .unwrap_or_else(|| c.fresh("fn_void_ret"));
+                    c.line(format!("let {ret_flag} = 0;"));
+                    c.active_inline_fn = Some(ActiveInlineFn {
+                        ret_flag,
+                        ret_val: rv_name,
+                        has_return_type: has_ret,
+                        fn_scope_depth,
+                    });
+                }
                 c.line("while 1 == 1 {".to_owned());
                 c.indent += 1;
-                c.active_inline_fn = Some(ActiveInlineFn {
-                    ret_flag,
-                    ret_val: rv_name,
-                    has_return_type: has_ret,
-                    fn_scope_depth,
-                });
                 c.push_scope(ScopeFrame {
                     cleanups: Vec::new(),
                     is_loop_body: false,
-                    is_fn_root: true,
-                    cancel_on_abort: false,
+                    is_air_while: true,
+                    cancel_flag: None,
                     repeat_counter: None,
                 });
                 let r = c.lower_stmts(&fn_decl.body);
@@ -2430,23 +2681,21 @@ impl<'a> TreeLowerer<'a> {
                 c.line("}".to_owned());
                 r.and(p)
             } else {
-                c.push_scope(ScopeFrame {
-                    cleanups: Vec::new(),
-                    is_loop_body: false,
-                    is_fn_root: true,
-                    cancel_on_abort: false,
-                    repeat_counter: None,
-                });
+                c.push_scope(ScopeFrame::block());
                 let r = c.lower_stmts(&fn_decl.body);
                 let p = c.pop_scope_and_run_cleanups();
                 r.and(p)
             }
         });
 
+        self.in_object_scope = prev_in_obj;
         self.active_inline_fn = prev_active_fn;
         self.var_scopes = prev_vars;
         self.inline_call_stack.pop();
         res?;
+        if needs_wrapper {
+            self.emit_cancel_propagation()?;
+        }
         Ok(ret_val_local)
     }
 
@@ -2656,18 +2905,40 @@ impl<'a> TreeLowerer<'a> {
                         };
                     }
                     // Foreign ObjectId variable: `plate.attr[0] = nutrition;`
-                    if let Some(
-                        Binding::Local { air_name, .. } | Binding::ForeignObject { air_name },
-                    ) = self.lookup_var(rname).cloned()
-                    {
+                    if let Some(binding) = self.lookup_var(rname).cloned() {
+                        let obj_air = match binding {
+                            Binding::Local {
+                                air_name,
+                                ty: ValueType::ObjectId,
+                            }
+                            | Binding::ForeignObject { air_name } => air_name,
+                            Binding::BhavParam {
+                                index,
+                                ty: ValueType::ObjectId,
+                            } => format!("param[{index}]"),
+                            Binding::Local { ty, .. } | Binding::BhavParam { ty, .. } => {
+                                return Err(Error::at(
+                                    *span,
+                                    format!(
+                                        "cannot index '{rname}.{field}[...]': '{rname}' has type {ty:?}, expected ObjectId"
+                                    ),
+                                ));
+                            }
+                            _ => {
+                                return Err(Error::at(
+                                    *span,
+                                    format!("cannot index '{rname}.{field}[...]'"),
+                                ));
+                            }
+                        };
                         let idx = self.eval_const_i16(index)?;
                         return match field.as_str() {
                             "attr" => Ok(LValue::ForeignAttr {
-                                obj_air: air_name,
+                                obj_air,
                                 attr_index: idx,
                             }),
                             "data" => Ok(LValue::ForeignData {
-                                obj_air: air_name,
+                                obj_air,
                                 data_index: idx,
                             }),
                             other => Err(Error::at(
@@ -2708,8 +2979,17 @@ impl<'a> TreeLowerer<'a> {
                 obj_air,
                 attr_index,
             } => {
+                let effective_rhs = if rhs_air.starts_with("stack.") || rhs_air == "stack_obj" {
+                    let snap = self.fresh("frhs");
+                    self.line(format!("let {snap} = {rhs_air};"));
+                    snap
+                } else {
+                    rhs_air.to_owned()
+                };
                 self.line(format!("stack_obj := {obj_air};"));
-                self.line(format!("stack.attr[{attr_index}] {op_str} {rhs_air};"));
+                self.line(format!(
+                    "stack.attr[{attr_index}] {op_str} {effective_rhs};"
+                ));
                 if self.has_self_obj_local {
                     self.line("stack_obj := __self_obj;".to_owned());
                 }
@@ -2718,8 +2998,17 @@ impl<'a> TreeLowerer<'a> {
                 obj_air,
                 data_index,
             } => {
+                let effective_rhs = if rhs_air.starts_with("stack.") || rhs_air == "stack_obj" {
+                    let snap = self.fresh("frhs");
+                    self.line(format!("let {snap} = {rhs_air};"));
+                    snap
+                } else {
+                    rhs_air.to_owned()
+                };
                 self.line(format!("stack_obj := {obj_air};"));
-                self.line(format!("stack.data[{data_index}] {op_str} {rhs_air};"));
+                self.line(format!(
+                    "stack.data[{data_index}] {op_str} {effective_rhs};"
+                ));
                 if self.has_self_obj_local {
                     self.line("stack_obj := __self_obj;".to_owned());
                 }
@@ -2903,9 +3192,9 @@ impl<'a> TreeLowerer<'a> {
                 | V2BinOp::BitOr
                 | V2BinOp::BitXor => {
                     let (l_air, _) = self.lower_value_expr(lhs)?;
-                    let (r_air, _) = self.lower_value_expr(rhs)?;
                     let tmp = self.fresh("arith");
                     self.line(format!("let {tmp} = {l_air};"));
+                    let (r_air, _) = self.lower_value_expr(rhs)?;
                     let aop = match op {
                         V2BinOp::Add => "+=",
                         V2BinOp::Sub => "-=",
@@ -2949,8 +3238,12 @@ impl<'a> TreeLowerer<'a> {
                         self.emit_bool_into_local(expr, &tmp)?;
                         return Ok((tmp, ValueType::Bool));
                     }
-                    if let Some((fn_mod, fn_decl)) = self.env.lookup_fn(&self.owner_module, fname) {
-                        let ret = self.inline_helper_call(&fn_mod, &fn_decl, args, *span)?;
+                    if let Some((fn_mod, fn_decl, is_local)) =
+                        self.env
+                            .lookup_fn(&self.owner_module, fname, self.in_object_scope)
+                    {
+                        let ret =
+                            self.inline_helper_call(&fn_mod, &fn_decl, is_local, args, *span)?;
                         let rv = ret.ok_or_else(|| {
                             Error::at(
                                 *span,
@@ -3081,6 +3374,88 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// Returns `true` iff lowering `expr` emits zero setup statements and has zero side effects.
+    fn is_pure_single_operand(&self, expr: &V2Expr) -> bool {
+        match expr {
+            V2Expr::Int(_, _) | V2Expr::Bool(_, _) | V2Expr::Ident(_, _) => true,
+            V2Expr::Unary {
+                op: V2UnaryOp::Neg,
+                inner,
+                ..
+            } => matches!(inner.as_ref(), V2Expr::Int(_, _)),
+            V2Expr::Deref { inner, .. } => {
+                if let V2Expr::Ident(_, pname) = inner.as_ref() {
+                    matches!(
+                        self.lookup_var(pname),
+                        Some(Binding::MutRef {
+                            target: LValue::Direct { .. }
+                        })
+                    )
+                } else {
+                    false
+                }
+            }
+            V2Expr::Field { base, .. } => match base.as_ref() {
+                V2Expr::Ident(_, bname) => self.is_self_ident(bname) || self.is_sim_ident(bname),
+                V2Expr::Field { base: root, .. } => {
+                    matches!(root.as_ref(), V2Expr::Ident(_, rname) if self.is_sim_ident(rname))
+                }
+                _ => false,
+            },
+            V2Expr::Index { base, .. } => match base.as_ref() {
+                V2Expr::Ident(_, bname) => matches!(bname.as_str(), "temp" | "global"),
+                V2Expr::Field { base: root, .. } => {
+                    matches!(
+                        root.as_ref(),
+                        V2Expr::Ident(_, rname) if self.is_self_ident(rname) || self.is_sim_ident(rname)
+                    )
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Returns `true` iff `expr` can be lowered directly into an `.air` `while <cond>` header
+    /// without hoisting any setup statements before the loop!
+    fn is_pure_simple_air_cond(&self, expr: &V2Expr) -> bool {
+        match expr {
+            V2Expr::Bool(_, _) => true,
+            V2Expr::Unary {
+                op: V2UnaryOp::Not,
+                inner,
+                ..
+            } => self.is_pure_simple_air_cond(inner),
+            V2Expr::Binary { lhs, op, rhs, .. } => match op {
+                V2BinOp::Eq
+                | V2BinOp::Ne
+                | V2BinOp::Lt
+                | V2BinOp::Le
+                | V2BinOp::Gt
+                | V2BinOp::Ge
+                | V2BinOp::FlagTest => {
+                    self.is_pure_single_operand(lhs) && self.is_pure_single_operand(rhs)
+                }
+                _ => false,
+            },
+            V2Expr::Call { .. } | V2Expr::MethodCall { .. } => false,
+            _ => self.is_pure_single_operand(expr),
+        }
+    }
+
+    fn lower_cmp_operands(&mut self, lhs: &V2Expr, rhs: &V2Expr) -> Result<(String, String)> {
+        let (l, _) = self.lower_value_expr(lhs)?;
+        if self.is_pure_single_operand(rhs) {
+            let (r, _) = self.lower_value_expr(rhs)?;
+            Ok((l, r))
+        } else {
+            let snap_l = self.fresh("cmp_l");
+            self.line(format!("let {snap_l} = {l};"));
+            let (r, _) = self.lower_value_expr(rhs)?;
+            Ok((snap_l, r))
+        }
+    }
+
     /// Tries to lower a boolean condition into a single `.air` `Condition` string (no `&&`/`||`).
     fn try_lower_simple_air_cond(&mut self, expr: &V2Expr) -> Result<Option<String>> {
         match expr {
@@ -3105,8 +3480,7 @@ impl<'a> TreeLowerer<'a> {
                 | V2BinOp::Gt
                 | V2BinOp::Ge
                 | V2BinOp::FlagTest => {
-                    let (l, _) = self.lower_value_expr(lhs)?;
-                    let (r, _) = self.lower_value_expr(rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
                     let sym = cmp_op_str(*op);
                     Ok(Some(format!("{l} {sym} {r}")))
                 }
@@ -3163,38 +3537,31 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Binary { lhs, op, rhs, .. } => match op {
                 V2BinOp::And | V2BinOp::Or => Ok(None),
                 V2BinOp::Eq => {
-                    let (l, _) = self.lower_value_expr(lhs)?;
-                    let (r, _) = self.lower_value_expr(rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
                     Ok(Some(format!("{l} != {r}")))
                 }
                 V2BinOp::Ne => {
-                    let (l, _) = self.lower_value_expr(lhs)?;
-                    let (r, _) = self.lower_value_expr(rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
                     Ok(Some(format!("{l} == {r}")))
                 }
                 V2BinOp::Lt => {
-                    let (l, _) = self.lower_value_expr(lhs)?;
-                    let (r, _) = self.lower_value_expr(rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
                     Ok(Some(format!("{l} >= {r}")))
                 }
                 V2BinOp::Le => {
-                    let (l, _) = self.lower_value_expr(lhs)?;
-                    let (r, _) = self.lower_value_expr(rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
                     Ok(Some(format!("{l} > {r}")))
                 }
                 V2BinOp::Gt => {
-                    let (l, _) = self.lower_value_expr(lhs)?;
-                    let (r, _) = self.lower_value_expr(rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
                     Ok(Some(format!("{l} <= {r}")))
                 }
                 V2BinOp::Ge => {
-                    let (l, _) = self.lower_value_expr(lhs)?;
-                    let (r, _) = self.lower_value_expr(rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
                     Ok(Some(format!("{l} < {r}")))
                 }
                 V2BinOp::FlagTest => {
-                    let (l, _) = self.lower_value_expr(lhs)?;
-                    let (r, _) = self.lower_value_expr(rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
                     Ok(Some(format!("!{l} flag_test {r}")))
                 }
                 _ => Err(Error::at(
@@ -3311,10 +3678,12 @@ impl<'a> TreeLowerer<'a> {
                     return Ok(());
                 }
                 if let V2Expr::Ident(_, fname) = callee.as_ref()
-                    && let Some((fn_mod, fn_decl)) = self.env.lookup_fn(&self.owner_module, fname)
+                    && let Some((fn_mod, fn_decl, is_local)) =
+                        self.env
+                            .lookup_fn(&self.owner_module, fname, self.in_object_scope)
                 {
                     let rv = self
-                        .inline_helper_call(&fn_mod, &fn_decl, args, *span)?
+                        .inline_helper_call(&fn_mod, &fn_decl, is_local, args, *span)?
                         .ok_or_else(|| {
                             Error::at(
                                 *span,
@@ -3484,11 +3853,16 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(Binding::Slot(idx)) = self.lookup_var(name) {
                     return Ok(*idx);
                 }
-                self.env
-                    .slots
-                    .get(name)
-                    .map(|(idx, _)| *idx as u16)
-                    .ok_or_else(|| Error::at(*span, format!("unknown slot '{name}'")))
+                match self.env.slots.get(name) {
+                    Some((Some(idx), _)) => Ok(*idx),
+                    Some((None, _)) => Err(Error::at(
+                        *span,
+                        format!(
+                            "slot '{name}' is not a routing slot (only 'kind: routing' slots can be used with route_to/snap/Slot)"
+                        ),
+                    )),
+                    None => Err(Error::at(*span, format!("unknown slot '{name}'"))),
+                }
             }
             V2Expr::Int(span, v) => u16::try_from(*v)
                 .map_err(|_| Error::at(*span, format!("slot index {v} out of u16 range"))),
@@ -3721,8 +4095,15 @@ impl<'a> TreeLowerer<'a> {
         }
         let m = self.resolve_motive_expr(&args[0].value)?;
         let (delta, _) = self.lower_value_expr(&args[1].value)?;
+        let delta_arg = if self.is_pure_single_operand(&args[2].value) {
+            delta
+        } else {
+            let snap = self.fresh("mc_d");
+            self.line(format!("let {snap} = {delta};"));
+            snap
+        };
         let (stop, _) = self.lower_value_expr(&args[2].value)?;
-        Ok(format!("set_motive_change({m}, {delta}, {stop})"))
+        Ok(format!("set_motive_change({m}, {delta_arg}, {stop})"))
     }
 
     fn format_dialog(&self, args: &[CallArg], span: Span) -> Result<String> {
@@ -3828,10 +4209,34 @@ fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
     })
 }
 
+fn stmts_always_return(stmts: &[V2Stmt]) -> bool {
+    for stmt in stmts {
+        match stmt {
+            V2Stmt::Return { .. } => return true,
+            V2Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if !else_body.is_empty()
+                    && stmts_always_return(then_body)
+                    && stmts_always_return(else_body)
+                {
+                    return true;
+                }
+            }
+            V2Stmt::WithLock { body, .. } if stmts_always_return(body) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn stmts_may_clobber_stack_obj(
     stmts: &[V2Stmt],
     env: &ObjectEnv<'_>,
     owner_mod: &str,
+    allow_local_fns: bool,
     depth: usize,
 ) -> bool {
     if depth > MAX_INLINE_DEPTH {
@@ -3841,18 +4246,33 @@ fn stmts_may_clobber_stack_obj(
         V2Stmt::LetSome {
             init, else_body, ..
         } => {
-            expr_may_clobber_stack_obj(init, env, owner_mod, depth)
-                || stmts_may_clobber_stack_obj(else_body, env, owner_mod, depth)
+            expr_may_clobber_stack_obj(init, env, owner_mod, allow_local_fns, depth)
+                || stmts_may_clobber_stack_obj(else_body, env, owner_mod, allow_local_fns, depth)
         }
-        V2Stmt::Let { init, .. } => expr_may_clobber_stack_obj(init, env, owner_mod, depth),
+        V2Stmt::Let { init, .. } => {
+            expr_may_clobber_stack_obj(init, env, owner_mod, allow_local_fns, depth)
+        }
         V2Stmt::Assign { target, value, .. } => {
-            expr_may_clobber_stack_obj(target, env, owner_mod, depth)
-                || expr_may_clobber_stack_obj(value, env, owner_mod, depth)
+            expr_may_clobber_stack_obj(target, env, owner_mod, allow_local_fns, depth)
+                || expr_may_clobber_stack_obj(value, env, owner_mod, allow_local_fns, depth)
         }
-        V2Stmt::WithLock { body, .. }
-        | V2Stmt::Defer { body, .. }
-        | V2Stmt::Repeat { body, .. }
-        | V2Stmt::While { body, .. } => stmts_may_clobber_stack_obj(body, env, owner_mod, depth),
+        V2Stmt::WithLock {
+            lock_expr, body, ..
+        } => {
+            expr_may_clobber_stack_obj(lock_expr, env, owner_mod, allow_local_fns, depth)
+                || stmts_may_clobber_stack_obj(body, env, owner_mod, allow_local_fns, depth)
+        }
+        V2Stmt::Defer { body, .. } => {
+            stmts_may_clobber_stack_obj(body, env, owner_mod, allow_local_fns, depth)
+        }
+        V2Stmt::Repeat { count, body, .. } => {
+            expr_may_clobber_stack_obj(count, env, owner_mod, allow_local_fns, depth)
+                || stmts_may_clobber_stack_obj(body, env, owner_mod, allow_local_fns, depth)
+        }
+        V2Stmt::While { cond, body, .. } => {
+            expr_may_clobber_stack_obj(cond, env, owner_mod, allow_local_fns, depth)
+                || stmts_may_clobber_stack_obj(body, env, owner_mod, allow_local_fns, depth)
+        }
         V2Stmt::ForEach { .. } | V2Stmt::RawAir { .. } => true,
         V2Stmt::If {
             cond,
@@ -3860,12 +4280,12 @@ fn stmts_may_clobber_stack_obj(
             else_body,
             ..
         } => {
-            expr_may_clobber_stack_obj(cond, env, owner_mod, depth)
-                || stmts_may_clobber_stack_obj(then_body, env, owner_mod, depth)
-                || stmts_may_clobber_stack_obj(else_body, env, owner_mod, depth)
+            expr_may_clobber_stack_obj(cond, env, owner_mod, allow_local_fns, depth)
+                || stmts_may_clobber_stack_obj(then_body, env, owner_mod, allow_local_fns, depth)
+                || stmts_may_clobber_stack_obj(else_body, env, owner_mod, allow_local_fns, depth)
         }
         V2Stmt::Return { value: Some(e), .. } | V2Stmt::Expr { expr: e, .. } => {
-            expr_may_clobber_stack_obj(e, env, owner_mod, depth)
+            expr_may_clobber_stack_obj(e, env, owner_mod, allow_local_fns, depth)
         }
         _ => false,
     })
@@ -3875,6 +4295,7 @@ fn expr_may_clobber_stack_obj(
     expr: &V2Expr,
     env: &ObjectEnv<'_>,
     owner_mod: &str,
+    allow_local_fns: bool,
     depth: usize,
 ) -> bool {
     if depth > MAX_INLINE_DEPTH {
@@ -3886,14 +4307,16 @@ fn expr_may_clobber_stack_obj(
                 if matches!(fname.as_str(), "find_best_object" | "create_object") {
                     return true;
                 }
-                if let Some((fmod, fdecl)) = env.lookup_fn(owner_mod, fname)
-                    && stmts_may_clobber_stack_obj(&fdecl.body, env, &fmod, depth + 1)
+                if let Some((fmod, fdecl, is_local)) =
+                    env.lookup_fn(owner_mod, fname, allow_local_fns)
+                    && stmts_may_clobber_stack_obj(&fdecl.body, env, &fmod, is_local, depth + 1)
                 {
                     return true;
                 }
             }
-            args.iter()
-                .any(|a| expr_may_clobber_stack_obj(&a.value, env, owner_mod, depth))
+            args.iter().any(|a| {
+                expr_may_clobber_stack_obj(&a.value, env, owner_mod, allow_local_fns, depth)
+            })
         }
         V2Expr::MethodCall {
             receiver,
@@ -3902,10 +4325,10 @@ fn expr_may_clobber_stack_obj(
             ..
         } => {
             method == "run_functional"
-                || expr_may_clobber_stack_obj(receiver, env, owner_mod, depth)
-                || args
-                    .iter()
-                    .any(|a| expr_may_clobber_stack_obj(&a.value, env, owner_mod, depth))
+                || expr_may_clobber_stack_obj(receiver, env, owner_mod, allow_local_fns, depth)
+                || args.iter().any(|a| {
+                    expr_may_clobber_stack_obj(&a.value, env, owner_mod, allow_local_fns, depth)
+                })
         }
         V2Expr::Index { base, index, .. } => {
             // Foreign `obj.attr[i]` or `obj.data[i]` swaps `stack_obj`!
@@ -3919,18 +4342,18 @@ fn expr_may_clobber_stack_obj(
             {
                 return true;
             }
-            expr_may_clobber_stack_obj(base, env, owner_mod, depth)
-                || expr_may_clobber_stack_obj(index, env, owner_mod, depth)
+            expr_may_clobber_stack_obj(base, env, owner_mod, allow_local_fns, depth)
+                || expr_may_clobber_stack_obj(index, env, owner_mod, allow_local_fns, depth)
         }
         V2Expr::Field { base, .. }
         | V2Expr::Deref { inner: base, .. }
         | V2Expr::MutRef { inner: base, .. }
         | V2Expr::Unary { inner: base, .. } => {
-            expr_may_clobber_stack_obj(base, env, owner_mod, depth)
+            expr_may_clobber_stack_obj(base, env, owner_mod, allow_local_fns, depth)
         }
         V2Expr::Binary { lhs, rhs, .. } => {
-            expr_may_clobber_stack_obj(lhs, env, owner_mod, depth)
-                || expr_may_clobber_stack_obj(rhs, env, owner_mod, depth)
+            expr_may_clobber_stack_obj(lhs, env, owner_mod, allow_local_fns, depth)
+                || expr_may_clobber_stack_obj(rhs, env, owner_mod, allow_local_fns, depth)
         }
         _ => false,
     }
@@ -4011,6 +4434,11 @@ fn escape_str(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             '\0' => out.push_str("\\0"),
+            c if c.is_control() => {
+                for b in c.encode_utf8(&mut [0u8; 4]).as_bytes() {
+                    let _ = write!(out, "\\x{b:02x}");
+                }
+            }
             c => out.push(c),
         }
     }

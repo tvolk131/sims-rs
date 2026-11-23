@@ -466,6 +466,11 @@ fn emit_lifted_bhavs<W: Write>(
         };
 
         if raw {
+            write_or_break!(out.writeln_str(&format!(
+                "// .air (Antics IR) raw tree {} \"{}\"",
+                bhav.id,
+                sanitize_single_line(&bhav.label)
+            )));
             let src = format_bhav_air(&bhav);
             write_or_break!(out.write_str(&src));
             if !src.ends_with('\n') {
@@ -477,13 +482,11 @@ fn emit_lifted_bhavs<W: Write>(
         let outcome = lift_bhav_air_structured(&bhav);
         match outcome {
             StructuredLiftOutcome::Lifted(src) => {
-                if !bhav.label.is_empty() {
-                    write_or_break!(out.writeln_str(&format!(
-                        "// .air (Antics IR) tree {} \"{}\"",
-                        bhav.id,
-                        sanitize_single_line(&bhav.label)
-                    )));
-                }
+                write_or_break!(out.writeln_str(&format!(
+                    "// .air (Antics IR) tree {} \"{}\"",
+                    bhav.id,
+                    sanitize_single_line(&bhav.label)
+                )));
                 write_or_break!(out.write_str(&src));
                 if !src.ends_with('\n') {
                     write_or_break!(out.writeln_str(""));
@@ -1155,6 +1158,44 @@ fn cmd_expand(args: &[OsString]) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Reads a regular UTF-8 text file safely without following symlinks or blocking on FIFOs.
+fn read_regular_text_file(path: &Path) -> Result<String, CliError> {
+    let safe_path = sanitize_path_display(path);
+    let pre_meta =
+        std::fs::symlink_metadata(path).map_err(|e| format!("failed to stat {safe_path}: {e}"))?;
+    if pre_meta.file_type().is_symlink() || !pre_meta.file_type().is_file() {
+        return Err(format!(
+            "{safe_path} is not a regular file (refusing symlinks and special files)"
+        )
+        .into());
+    }
+    let mut file = open_regular_file_nonblocking(path)
+        .map_err(|e| format!("failed to open {safe_path}: {e}"))?;
+    let open_meta = file
+        .metadata()
+        .map_err(|e| format!("failed to stat {safe_path}: {e}"))?;
+    if !open_meta.file_type().is_file() {
+        return Err(format!("{safe_path} is not a regular file").into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if open_meta.dev() != pre_meta.dev() || open_meta.ino() != pre_meta.ino() {
+            return Err(format!("{safe_path} changed between validation and open").into());
+        }
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|e| format!("failed to read {safe_path}: {e}"))?;
+    Ok(text)
+}
+
+fn write_stdout_line(line: &str) -> Result<(), CliError> {
+    let mut out = OutWriter::stdout();
+    out.writeln_str(line)?;
+    out.flush()
+}
+
 fn run() -> Result<(), CliError> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if args.is_empty() {
@@ -1177,54 +1218,70 @@ fn run() -> Result<(), CliError> {
             };
             let meta = std::fs::symlink_metadata(&target)
                 .map_err(|e| format!("failed to access {}: {e}", target.display()))?;
-            if meta.file_type().is_file() {
-                let src = std::fs::read_to_string(&target)
-                    .map_err(|e| format!("failed to read {}: {e}", target.display()))?;
-                if is_v2_source(&src) {
-                    let obj = compile_v2_object_file(&target, pack_dir.as_deref())
-                        .map_err(|e| e.to_string())?;
-                    println!(
-                        "OK: {} (GUID {:#010x}, {} BHAVs, {} bytes IFF, {} WAVs)",
-                        obj.name,
-                        obj.guid,
-                        obj.behaviors.len(),
-                        obj.iff_bytes.len(),
-                        obj.sounds_wav.len()
-                    );
-                } else {
-                    let module = compile_air(&src).map_err(|e| e.to_string())?;
-                    println!(
-                        "OK: .air module {} ({} BHAVs, {} BCONs, {} STR#s)",
-                        target.display(),
-                        module.behaviors.len(),
-                        module.constants.len(),
-                        module.strings.len()
-                    );
+            if meta.file_type().is_symlink() {
+                return Err(format!("refusing symlink target {}", target.display()).into());
+            }
+            if meta.file_type().is_dir() {
+                if pack_dir.is_some() {
+                    return Err("--pack is only valid when checking a single .antics file"
+                        .to_owned()
+                        .into());
                 }
-                return Ok(());
+                let compiled = compile_pack_dir(&target).map_err(|e| e.to_string())?;
+                let total_bhavs: usize = compiled
+                    .objects
+                    .iter()
+                    .map(|o| o.object.behaviors.len())
+                    .sum();
+                return write_stdout_line(&format!(
+                    "OK: {} v{} ({} objects, {} BHAVs, {} bytes {}, {} WAVs)",
+                    compiled.name,
+                    compiled.version,
+                    compiled.objects.len(),
+                    total_bhavs,
+                    compiled.far_bytes.len(),
+                    compiled.archive_name,
+                    compiled.sounds_wav.len()
+                ));
             }
-            if pack_dir.is_some() {
-                return Err("--pack is only valid when checking a single .antics file"
-                    .to_owned()
-                    .into());
+            if !meta.file_type().is_file() {
+                return Err(
+                    format!("{} is not a regular file or directory", target.display()).into(),
+                );
             }
-            let compiled = compile_pack_dir(&target).map_err(|e| e.to_string())?;
-            let total_bhavs: usize = compiled
-                .objects
-                .iter()
-                .map(|o| o.object.behaviors.len())
-                .sum();
-            println!(
-                "OK: {} v{} ({} objects, {} BHAVs, {} bytes {}, {} WAVs)",
-                compiled.name,
-                compiled.version,
-                compiled.objects.len(),
-                total_bhavs,
-                compiled.far_bytes.len(),
-                compiled.archive_name,
-                compiled.sounds_wav.len()
-            );
-            Ok(())
+            // Validate `--pack` containment before reading source bytes.
+            if let Some(ref pdir) = pack_dir {
+                let obj = compile_v2_object_file(&target, Some(pdir)).map_err(|e| e.to_string())?;
+                return write_stdout_line(&format!(
+                    "OK: {} (GUID {:#010x}, {} BHAVs, {} bytes IFF, {} WAVs)",
+                    obj.name,
+                    obj.guid,
+                    obj.behaviors.len(),
+                    obj.iff_bytes.len(),
+                    obj.sounds_wav.len()
+                ));
+            }
+            let src = read_regular_text_file(&target)?;
+            if is_v2_source(&src) {
+                let obj = compile_v2_object_file(&target, None).map_err(|e| e.to_string())?;
+                write_stdout_line(&format!(
+                    "OK: {} (GUID {:#010x}, {} BHAVs, {} bytes IFF, {} WAVs)",
+                    obj.name,
+                    obj.guid,
+                    obj.behaviors.len(),
+                    obj.iff_bytes.len(),
+                    obj.sounds_wav.len()
+                ))
+            } else {
+                let module = compile_air(&src).map_err(|e| e.to_string())?;
+                write_stdout_line(&format!(
+                    "OK: .air module {} ({} BHAVs, {} BCONs, {} STR#s)",
+                    sanitize_path_display(&target),
+                    module.behaviors.len(),
+                    module.constants.len(),
+                    module.strings.len()
+                ))
+            }
         }
         "verify" => {
             let (target, pack_dir) = match parse_path_and_optional_pack(&args, "verify") {
@@ -1234,16 +1291,18 @@ fn run() -> Result<(), CliError> {
             };
             let meta = std::fs::symlink_metadata(&target)
                 .map_err(|e| format!("failed to access {}: {e}", target.display()))?;
+            if meta.file_type().is_symlink() {
+                return Err(format!("refusing symlink target {}", target.display()).into());
+            }
             if meta.file_type().is_file() {
                 let obj = compile_v2_object_file(&target, pack_dir.as_deref())
                     .map_err(|e| e.to_string())?;
                 let report = verify_object_safety(&obj).map_err(|e| e.to_string())?;
                 if report.is_ok() {
-                    println!(
+                    return write_stdout_line(&format!(
                         "VERIFIED: {} ({} BHAVs, {} lock invariants proven, 0 violations)",
                         obj.name, report.trees_checked, report.locks_verified
-                    );
-                    return Ok(());
+                    ));
                 }
                 for v in &report.violations {
                     eprintln!(
@@ -1257,6 +1316,11 @@ fn run() -> Result<(), CliError> {
                 )
                 .into());
             }
+            if !meta.file_type().is_dir() {
+                return Err(
+                    format!("{} is not a regular file or directory", target.display()).into(),
+                );
+            }
             if pack_dir.is_some() {
                 return Err("--pack is only valid when verifying a single .antics file"
                     .to_owned()
@@ -1265,14 +1329,13 @@ fn run() -> Result<(), CliError> {
             let compiled = compile_pack_dir(&target).map_err(|e| e.to_string())?;
             let report = verify_pack_safety(&compiled).map_err(|e| e.to_string())?;
             if report.is_ok() {
-                println!(
+                write_stdout_line(&format!(
                     "VERIFIED: {} ({} objects, {} BHAVs, {} lock invariants proven, 0 violations)",
                     report.pack_name,
                     report.objects.len(),
                     report.total_trees_checked(),
                     report.total_locks_verified()
-                );
-                Ok(())
+                ))
             } else {
                 for obj in &report.objects {
                     for v in &obj.violations {
@@ -1340,22 +1403,27 @@ fn run() -> Result<(), CliError> {
             let iff_path = iff_path.ok_or_else(|| "equiv requires <b.iff>".to_owned())?;
             let tree_id = tree_id.ok_or_else(|| "equiv requires --tree <id>".to_owned())?;
 
-            let antics_src = std::fs::read_to_string(&antics_path)
-                .map_err(|e| format!("failed to read {}: {e}", antics_path.display()))?;
-            let behaviors = if is_v2_source(&antics_src) {
-                compile_v2_object_file(&antics_path, pack_dir.as_deref())
+            let behaviors = if let Some(ref pdir) = pack_dir {
+                compile_v2_object_file(&antics_path, Some(pdir))
                     .map_err(|e| e.to_string())?
                     .behaviors
             } else {
-                compile_air(&antics_src)
-                    .map_err(|e| e.to_string())?
-                    .behaviors
+                let antics_src = read_regular_text_file(&antics_path)?;
+                if is_v2_source(&antics_src) {
+                    compile_v2_object_file(&antics_path, None)
+                        .map_err(|e| e.to_string())?
+                        .behaviors
+                } else {
+                    compile_air(&antics_src)
+                        .map_err(|e| e.to_string())?
+                        .behaviors
+                }
             };
             let bhav_a = behaviors.get(&tree_id).ok_or_else(|| {
                 format!("{} does not define tree #{tree_id}", antics_path.display())
             })?;
-            let iff_bytes = std::fs::read(&iff_path)
-                .map_err(|e| format!("failed to read {}: {e}", iff_path.display()))?;
+            let (iff_file, iff_len, iff_hdr) = read_regular_file_prefix(&iff_path)?;
+            let iff_bytes = read_bounded_iff_file(&iff_path, iff_file, iff_len, iff_hdr)?;
             let bhav_b = extract_bhav_from_iff(&iff_bytes, tree_id).map_err(|e| e.to_string())?;
             let mut arities = extract_bhav_arities_from_iff(&iff_bytes).unwrap_or_default();
             for (&id, bhav) in &behaviors {
@@ -1376,12 +1444,9 @@ fn run() -> Result<(), CliError> {
                 EquivResult::Equivalent {
                     states_checked,
                     paths_verified,
-                } => {
-                    println!(
-                        "EQUIVALENT: tree #{tree_id} ({states_checked} states checked, {paths_verified} paths verified)"
-                    );
-                    Ok(())
-                }
+                } => write_stdout_line(&format!(
+                    "EQUIVALENT: tree #{tree_id} ({states_checked} states checked, {paths_verified} paths verified)"
+                )),
                 EquivResult::Counterexample { path, divergence } => Err(format!(
                     "COUNTEREXAMPLE on tree #{tree_id} after {} step(s): {divergence}",
                     path.len()

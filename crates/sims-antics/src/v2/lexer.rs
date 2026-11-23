@@ -18,6 +18,8 @@ pub enum TokenKind {
     Str(String),
     /// `#RRGGBB` 24-bit RGB color literal.
     Color([u8; 3]),
+    /// Verbatim `.air` body scanned from `raw { ... }` using `.air` comment/string rules.
+    RawBlock(String),
     // Delimiters
     LBrace,
     RBrace,
@@ -261,7 +263,26 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>> {
             b'"' => TokenKind::Str(lexer.lex_string(span)?),
             b'#' => TokenKind::Color(lexer.lex_color(span)?),
             b'0'..=b'9' => lexer.lex_number(span)?,
-            b'a'..=b'z' | b'A'..=b'Z' | b'_' => TokenKind::Ident(lexer.lex_ident()),
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
+                let ident = lexer.lex_ident();
+                if ident == "raw" {
+                    let saved_pos = lexer.pos;
+                    let saved_line = lexer.line;
+                    let saved_col = lexer.col;
+                    lexer.skip_ws_and_comments()?;
+                    if lexer.peek() == Some(b'{') {
+                        let raw_body = lexer.lex_raw_air_block(span)?;
+                        TokenKind::RawBlock(raw_body)
+                    } else {
+                        lexer.pos = saved_pos;
+                        lexer.line = saved_line;
+                        lexer.col = saved_col;
+                        TokenKind::Ident(ident)
+                    }
+                } else {
+                    TokenKind::Ident(ident)
+                }
+            }
             other => {
                 return Err(Error::at(
                     span,
@@ -506,73 +527,88 @@ impl<'a> Lexer<'a> {
         }
         Err(Error::at(span, "unterminated string literal"))
     }
-}
 
-/// Extracts the verbatim text inside a `raw { ... }` block from source text starting at a `{`
-/// token, honoring nested braces, strings, and comments.
-pub fn extract_raw_brace_block(source: &str, open_brace_span: Span) -> Result<(String, Span)> {
-    let mut line = 1usize;
-    let mut col = 1usize;
-    let bytes = source.as_bytes();
-    let mut pos = 0usize;
-    while pos < bytes.len() && (line < open_brace_span.line || col < open_brace_span.column) {
-        if bytes[pos] == b'\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-        pos += 1;
-    }
-    if bytes.get(pos) != Some(&b'{') {
-        return Err(Error::at(open_brace_span, "expected '{' after 'raw'"));
-    }
-    pos += 1;
-    col += 1;
-    let content_start = pos;
-    let mut depth = 1usize;
-    let mut in_str = false;
-    let mut escaped = false;
-    while pos < bytes.len() {
-        let b = bytes[pos];
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_str = false;
-            }
-        } else if b == b'/' && bytes.get(pos + 1) == Some(&b'/') {
-            while pos < bytes.len() && bytes[pos] != b'\n' {
-                pos += 1;
-                col += 1;
-            }
-            continue;
-        } else {
+    /// Scans the opaque `.air` body inside `raw { ... }` honoring `.air` comments
+    /// (`//`, `#`, `/* ... */`), strings with escapes, and nested braces.
+    fn lex_raw_air_block(&mut self, start_span: Span) -> Result<String> {
+        self.bump(); // '{'
+        let content_start = self.pos;
+        let mut depth = 1usize;
+        while let Some(b) = self.peek() {
             match b {
-                b'"' => in_str = true,
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let content = source[content_start..pos].to_owned();
-                        return Ok((content, Span::new(line, col)));
+                b'"' => {
+                    self.bump();
+                    let mut escaped = false;
+                    while let Some(sb) = self.bump() {
+                        if escaped {
+                            escaped = false;
+                        } else if sb == b'\\' {
+                            escaped = true;
+                        } else if sb == b'"' {
+                            break;
+                        }
                     }
                 }
-                _ => {}
+                b'#' => {
+                    while let Some(cb) = self.bump() {
+                        if cb == b'\n' {
+                            break;
+                        }
+                    }
+                }
+                b'/' if self.peek_at(1) == Some(b'/') => {
+                    while let Some(cb) = self.bump() {
+                        if cb == b'\n' {
+                            break;
+                        }
+                    }
+                }
+                b'/' if self.peek_at(1) == Some(b'*') => {
+                    let cspan = self.span();
+                    self.bump();
+                    self.bump();
+                    let mut cdepth = 1usize;
+                    while cdepth > 0 {
+                        match (self.peek(), self.peek_at(1)) {
+                            (Some(b'/'), Some(b'*')) => {
+                                self.bump();
+                                self.bump();
+                                cdepth += 1;
+                            }
+                            (Some(b'*'), Some(b'/')) => {
+                                self.bump();
+                                self.bump();
+                                cdepth -= 1;
+                            }
+                            (Some(_), _) => {
+                                self.bump();
+                            }
+                            (None, _) => {
+                                return Err(Error::at(
+                                    cspan,
+                                    "unterminated block comment inside 'raw { ... }'",
+                                ));
+                            }
+                        }
+                    }
+                }
+                b'{' => {
+                    self.bump();
+                    depth += 1;
+                }
+                b'}' => {
+                    let content_end = self.pos;
+                    self.bump();
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(self.src[content_start..content_end].to_owned());
+                    }
+                }
+                _ => {
+                    self.bump();
+                }
             }
         }
-        if b == b'\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-        pos += 1;
+        Err(Error::at(start_span, "unterminated 'raw { ... }' block"))
     }
-    Err(Error::at(
-        open_brace_span,
-        "unterminated 'raw { ... }' block",
-    ))
 }

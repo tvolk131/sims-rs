@@ -676,7 +676,7 @@ fn validate_slug(slug: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_relative_filename(name: &str, field: &str) -> Result<()> {
+pub(crate) fn validate_relative_filename(name: &str, field: &str) -> Result<()> {
     let valid_chars = !name.is_empty()
         && !name.starts_with('.')
         && !name.contains("..")

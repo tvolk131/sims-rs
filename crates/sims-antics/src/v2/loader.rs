@@ -110,24 +110,7 @@ impl PackResolverConfig {
                             pack_toml_path.display()
                         )));
                     };
-                    let dep_path = pack_dir.join(rel);
-                    let dep_meta = std::fs::symlink_metadata(&dep_path).map_err(|e| {
-                        Error::new(format!(
-                            "failed to access dependency pack '{dep_name}' at {}: {e}",
-                            dep_path.display()
-                        ))
-                    })?;
-                    if dep_meta.file_type().is_symlink() || !dep_meta.file_type().is_dir() {
-                        return Err(Error::new(format!(
-                            "dependency pack '{dep_name}' at {} must be a real directory, not a symlink",
-                            dep_path.display()
-                        )));
-                    }
-                    let dep_canon = std::fs::canonicalize(&dep_path).map_err(|e| {
-                        Error::new(format!(
-                            "failed to resolve dependency pack '{dep_name}': {e}"
-                        ))
-                    })?;
+                    let dep_canon = resolve_relative_dir_no_symlinks(&canon, rel, dep_name)?;
                     dependencies.insert(normalize_pack_ident(dep_name), dep_canon);
                 }
             }
@@ -144,7 +127,11 @@ impl PackResolverConfig {
     /// Infers a pack root by walking up from `file_path` looking for `pack.toml`
     /// without following symlinks; falls back to the file's parent directory.
     pub fn infer_for_file(file_path: &Path) -> Result<Self> {
-        let mut cur = file_path.parent().unwrap_or_else(|| Path::new("."));
+        let start_dir = match file_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let mut cur = start_dir;
         for _ in 0..8 {
             let candidate = cur.join("pack.toml");
             if let Ok(meta) = std::fs::symlink_metadata(&candidate)
@@ -156,11 +143,86 @@ impl PackResolverConfig {
             let Some(parent) = cur.parent() else {
                 break;
             };
+            if parent.as_os_str().is_empty() {
+                break;
+            }
             cur = parent;
         }
-        let fallback = file_path.parent().unwrap_or_else(|| Path::new("."));
-        Self::from_pack_dir(fallback)
+        Self::from_pack_dir(start_dir)
     }
+}
+
+/// Resolves a relative dependency directory from `base_canon`, rejecting absolute paths
+/// and any symlink component along the traversal.
+fn resolve_relative_dir_no_symlinks(
+    base_canon: &Path,
+    rel: &str,
+    dep_name: &str,
+) -> Result<PathBuf> {
+    use std::path::Component;
+
+    if rel.is_empty() {
+        return Err(Error::new(format!(
+            "[dependencies].{dep_name} path cannot be empty"
+        )));
+    }
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err(Error::new(format!(
+            "[dependencies].{dep_name} must be a relative path, got '{}'",
+            rel
+        )));
+    }
+    let mut cur = base_canon.to_path_buf();
+    for comp in rel_path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !cur.pop() {
+                    return Err(Error::new(format!(
+                        "[dependencies].{dep_name} path '{rel}' escapes filesystem root"
+                    )));
+                }
+            }
+            Component::Normal(seg) => {
+                cur.push(seg);
+                let meta = std::fs::symlink_metadata(&cur).map_err(|e| {
+                    Error::new(format!(
+                        "failed to access dependency pack '{dep_name}' at {}: {e}",
+                        cur.display()
+                    ))
+                })?;
+                if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                    return Err(Error::new(format!(
+                        "dependency pack '{dep_name}' path component {} must be a real directory, not a symlink",
+                        cur.display()
+                    )));
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::new(format!(
+                    "[dependencies].{dep_name} must be a relative path, got '{rel}'"
+                )));
+            }
+        }
+    }
+    let final_meta = std::fs::symlink_metadata(&cur).map_err(|e| {
+        Error::new(format!(
+            "failed to access dependency pack '{dep_name}' at {}: {e}",
+            cur.display()
+        ))
+    })?;
+    if final_meta.file_type().is_symlink() || !final_meta.file_type().is_dir() {
+        return Err(Error::new(format!(
+            "dependency pack '{dep_name}' at {} must be a real directory, not a symlink",
+            cur.display()
+        )));
+    }
+    std::fs::canonicalize(&cur).map_err(|e| {
+        Error::new(format!(
+            "failed to resolve dependency pack '{dep_name}': {e}"
+        ))
+    })
 }
 
 /// Normalizes a pack name/slug into an ASCII identifier (`"open-pack"` -> `"open_pack"`).
@@ -198,8 +260,39 @@ pub fn resolve_v2_source(
     loader.resolve_parsed_module(root_name.to_owned(), &file, true)
 }
 
-/// Loads and resolves one `.antics` v2 file from disk (symlink-free regular file check).
+/// Maximum transitive module import nesting depth.
+const MAX_IMPORT_DEPTH: usize = 32;
+
+/// Loads and resolves one `.antics` v2 file from disk (symlink-free regular file check,
+/// rejecting symlinked ancestor components inside the pack root).
 pub fn resolve_v2_file(file_path: &Path, pack_dir: Option<&Path>) -> Result<ResolvedModule> {
+    let config = match pack_dir {
+        Some(dir) => PackResolverConfig::from_pack_dir(dir)?,
+        None => PackResolverConfig::infer_for_file(file_path)?,
+    };
+    let abs_file = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| Error::new(format!("failed to determine current directory: {e}")))?
+            .join(file_path)
+    };
+    // Walk every ancestor component starting from the pack root (or the file itself) to refuse
+    // symlinked directories even when their target happens to resolve back inside `pack_root`.
+    if let Some(root_canon) = &config.pack_root {
+        let base_to_check = match pack_dir {
+            Some(dir) if dir.is_absolute() => dir.to_path_buf(),
+            Some(dir) => std::env::current_dir()
+                .map_err(|e| Error::new(format!("failed to determine current directory: {e}")))?
+                .join(dir),
+            None => root_canon.clone(),
+        };
+        if let Ok(rel) = abs_file.strip_prefix(&base_to_check) {
+            verify_no_symlink_components(&base_to_check, rel)?;
+        } else if let Ok(rel) = abs_file.strip_prefix(root_canon) {
+            verify_no_symlink_components(root_canon, rel)?;
+        }
+    }
     let meta = std::fs::symlink_metadata(file_path)
         .map_err(|e| Error::new(format!("failed to access {}: {e}", file_path.display())))?;
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
@@ -208,29 +301,61 @@ pub fn resolve_v2_file(file_path: &Path, pack_dir: Option<&Path>) -> Result<Reso
             file_path.display()
         )));
     }
-    let config = match pack_dir {
-        Some(dir) => PackResolverConfig::from_pack_dir(dir)?,
-        None => PackResolverConfig::infer_for_file(file_path)?,
-    };
     let canon_file = std::fs::canonicalize(file_path)
         .map_err(|e| Error::new(format!("failed to resolve {}: {e}", file_path.display())))?;
-    if let Some(root) = &config.pack_root
-        && !canon_file.starts_with(root)
-        && pack_dir.is_some()
-    {
-        return Err(Error::new(format!(
-            "source file {} is outside pack root {}",
-            canon_file.display(),
-            root.display()
-        )));
+    if let Some(root) = &config.pack_root {
+        if !canon_file.starts_with(root) && pack_dir.is_some() {
+            return Err(Error::new(format!(
+                "source file {} is outside pack root {}",
+                canon_file.display(),
+                root.display()
+            )));
+        }
+        // Also verify symlink-free components along the canonical path relative to root_canon.
+        if let Ok(rel) = canon_file.strip_prefix(root) {
+            verify_no_symlink_components(root, rel)?;
+        }
     }
-    let source =
-        read_regular_file_checked(&canon_file, canon_file.parent().unwrap_or(Path::new("/")))?;
+    let root_for_read = config
+        .pack_root
+        .as_deref()
+        .filter(|r| canon_file.starts_with(r))
+        .unwrap_or_else(|| canon_file.parent().unwrap_or(Path::new("/")));
+    let source = read_regular_file_checked(&canon_file, root_for_read)?;
     let label = file_path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("<input.antics>");
     resolve_v2_source(label, &source, &config)
+}
+
+fn verify_no_symlink_components(base: &Path, rel: &Path) -> Result<()> {
+    use std::path::Component;
+    let mut cur = base.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(seg) => {
+                cur.push(seg);
+                let meta = std::fs::symlink_metadata(&cur)
+                    .map_err(|e| Error::new(format!("failed to inspect {}: {e}", cur.display())))?;
+                if meta.file_type().is_symlink() {
+                    return Err(Error::new(format!(
+                        "refusing to follow symlink path component: {}",
+                        cur.display()
+                    )));
+                }
+            }
+            Component::ParentDir => {
+                return Err(Error::new(format!(
+                    "refusing '..' traversal component inside {}",
+                    rel.display()
+                )));
+            }
+            Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    Ok(())
 }
 
 struct LoadedModuleData {
@@ -386,6 +511,13 @@ impl<'a> ModuleLoader<'a> {
         let pack_seg = &path[0];
         let mod_segs = &path[1..];
         let canonical_key = path.join("::");
+
+        if self.loading_stack.len() >= MAX_IMPORT_DEPTH {
+            return Err(Error::at(
+                span,
+                format!("module import depth exceeds maximum of {MAX_IMPORT_DEPTH}"),
+            ));
+        }
 
         if let Some(pos) = self.loading_stack.iter().position(|m| m == &canonical_key) {
             let mut cycle: Vec<&str> = self.loading_stack[pos..]

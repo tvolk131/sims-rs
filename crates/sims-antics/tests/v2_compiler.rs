@@ -1923,3 +1923,663 @@ objects = ["open-cot", "open-tv", "open-floor-lamp"]
         "lift must label output as .air (Antics IR): {lift_stdout}"
     );
 }
+
+// ===========================================================================
+// 5. Sol Round 1 Regression Tests (Lowering Correctness, Safety & CLI)
+// ===========================================================================
+
+#[test]
+fn sol_r1_lowering_correctness_in_vm() {
+    let mut cfg = PackResolverConfig::default();
+    cfg.virtual_modules.insert(
+        "r1_pack::mods".to_owned(),
+        r#"
+fn private_tag(out: &mut i16) {
+    *out = 100;
+}
+
+pub fn call_module_private(out: &mut i16) {
+    private_tag(out);
+}
+
+pub fn nested_sleep_helper(sim: Sim, inner_lock: &mut bool, after_sleep: &mut i16) {
+    with lock(*inner_lock) {
+        repeat 2 {
+            sleep(2);
+            *after_sleep += 1;
+            sim.motive.fun += 1;
+        }
+    }
+}
+
+pub fn bump_and_true(counter: &mut i16, delta: i16) -> bool {
+    *counter += delta;
+    return true;
+}
+
+pub fn mutate_handle_and_attr(handle: &mut ObjectId, attr_ref: &mut i16) {
+    *handle = 0;
+    *attr_ref = 42;
+}
+"#
+        .to_owned(),
+    );
+    cfg.virtual_modules.insert(
+        "r1_pack::tpl".to_owned(),
+        r#"
+pub template InitBase {
+    state init_trace: i16 = 0;
+    init {
+        let x = 1;
+        defer {
+            self.init_trace += 10;
+        }
+    }
+}
+"#
+        .to_owned(),
+    );
+
+    let target_src = r#"
+object "R1 Target" {
+    guid: 0x7F30_0002;
+    price: 10;
+    description: "Target object for foreign attr & functional header tests.";
+    sprite: Sprite::procedural("box", primary: #888888, accent: #AAAAAA, trim: #444444);
+    state val: i16 = 5;
+    state remaining: i16 = 2;
+
+    functional prep {
+        score: 50,
+        run(sim) {
+            if self.remaining <= 0 {
+                return false;
+            }
+            self.remaining -= 1;
+            return true;
+        }
+    }
+}
+"#;
+
+    let probe_src = r#"
+use r1_pack::mods::{bump_and_true, call_module_private, mutate_handle_and_attr, nested_sleep_helper};
+use r1_pack::tpl::InitBase;
+
+object "R1 Probe" from InitBase {
+    guid: 0x7F30_0001;
+    price: 100;
+    description: "Exercises Sol R1 lowering fixes in live sims-vm.";
+    sprite: Sprite::procedural("box", primary: #446688, accent: #6688AA, trim: #223344);
+
+    // Local helper with the SAME name as `r1_pack::mods::private_tag` (P1-8)!
+    fn private_tag(out: &mut i16) {
+        *out = 999;
+    }
+
+    state outer_lock: bool = false;   // attr[1]
+    state inner_lock: bool = false;   // attr[2]
+    state after_sleep: i16 = 0;       // attr[3]
+    state while_count: i16 = 0;       // attr[4]
+    state src_val: i16 = 77;          // attr[5]
+    state arith_res: i16 = 0;         // attr[6]
+    state mod_tag: i16 = 0;           // attr[7]
+    state defer_ran: i16 = 0;         // attr[8]
+    state func_loops: i16 = 0;        // attr[9]
+    state counter: i16 = 10;          // attr[10]
+
+    // Mixed SLOT table: container first, then two routing slots (P1-9).
+    slot top {
+        kind: container,
+        offset: [0.0, 0.0, 0.5],
+        standing: false,
+        sitting: false,
+        ground: false,
+        facing: north,
+    }
+    slot route_a {
+        kind: routing,
+        offset: [0.0, -0.75, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: north,
+    }
+    slot route_b {
+        kind: routing,
+        offset: [0.75, 0.0, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: east,
+    }
+
+    // Object init has its own `let x` and top-level `defer` (P1-6).
+    init {
+        let x = 2;
+        defer {
+            self.init_trace += 1;
+        }
+    }
+
+    // P1-1: computed while condition `n + 1 < 4` must re-evaluate every iteration (runs 3 times).
+    // P1-2: foreign write `target.attr[0] = self.src_val` must snapshot self.src_val BEFORE swapping stack_obj!
+    // P1-3: `while target.run_functional(prep)` must preserve stack_obj for `self.func_loops += 1`!
+    // P1-7: `self.counter + bump_and_true(&mut self.counter, 5)` must read LHS (10) before RHS mutates counter to 15!
+    // P1-8: `call_module_private(&mut self.mod_tag)` must call module's private_tag (100), not local (999)!
+    // P2-1: `mutate_handle_and_attr(&mut alias, &mut alias.attr[0])` must write to original target even after `*handle = 0`!
+    interaction "Run Core Probes" {
+        run(sim) {
+            let mut n = 0;
+            while n + 1 < 4 {
+                n += 1;
+                self.while_count += 1;
+            }
+
+            let Some(target) = find_best_object(prep) else {
+                return false;
+            };
+            target.attr[0] = self.src_val;
+            while target.run_functional(prep) {
+                self.func_loops += 1;
+            }
+
+            self.arith_res = self.counter + bump_and_true(&mut self.counter, 5);
+            call_module_private(&mut self.mod_tag);
+
+            // Re-test P2-1 using a separate local handle that gets zeroed inside helper.
+            let mut alias: ObjectId = target;
+            mutate_handle_and_attr(&mut alias, &mut alias.attr[1]);
+            return true;
+        }
+    }
+
+    // P1-4 & P1-5: cancel_on_abort inside nested helper + sleeping defer!
+    interaction "Cancel Nested Helper" {
+        guard(sim) => !self.outer_lock && !self.inner_lock,
+        run(sim) {
+            repeat 3 cancel_on_abort {
+                with lock(self.outer_lock) {
+                    defer {
+                        sleep(1);
+                        self.defer_ran += 1;
+                    }
+                    nested_sleep_helper(sim, &mut self.inner_lock, &mut self.after_sleep);
+                }
+            }
+            return true;
+        }
+    }
+
+    // P1-9 check via expanded `.air`: `route_to(route_b)` must emit routing ordinal 1 (not slot index 2).
+    interaction "Route B" {
+        run(sim) {
+            route_to(route_b);
+            return true;
+        }
+    }
+}
+"#;
+
+    let target = compile_v2_source("r1-target.antics", target_src, &cfg).expect("compile target");
+    let probe = compile_v2_source("r1-probe.antics", probe_src, &cfg).expect("compile probe");
+    // Verify P1-9 routing ordinal in lowered `.air`
+    let probe_air =
+        sims_antics::v2::expand_v2_source_to_objects("r1-probe.antics", probe_src, &cfg)
+            .expect("expand probe")
+            .into_iter()
+            .next()
+            .unwrap()
+            .air_source;
+    assert!(
+        probe_air.contains("route_to(1)"),
+        "route_b must lower to routing-only ordinal 1:\n{probe_air}"
+    );
+    assert!(
+        !probe_air.contains("route_to(2)"),
+        "container slot must not shift routing ordinal:\n{probe_air}"
+    );
+    let rep = verify_object_safety(&probe).expect("verify probe");
+    assert!(rep.is_ok(), "safety violations: {:?}", rep.violations);
+
+    let mut vm = V2VmFixture::from_objects(&[&target, &probe], 500);
+    let target_id = vm.spawn(0x7F30_0002, 3, 3);
+    let probe_id = vm.spawn(0x7F30_0001, 5, 3);
+
+    // P1-6: template init defer (+10) + object init defer (+1) = 11!
+    assert_eq!(
+        vm.obj_attr(probe_id, 0),
+        11,
+        "init top-level defers must run for both template and object"
+    );
+
+    // Run Core Probes
+    vm.run_interaction(probe_id, "Run Core Probes", None);
+    assert_eq!(
+        vm.obj_attr(probe_id, 4),
+        3,
+        "P1-1: while n + 1 < 4 must execute exactly 3 iterations"
+    );
+    assert_eq!(
+        vm.obj_attr(target_id, 0),
+        77,
+        "P1-2: foreign write must copy self.src_val (77), not target's own attr[5]"
+    );
+    assert_eq!(
+        vm.obj_attr(probe_id, 9),
+        2,
+        "P1-3: while target.run_functional(prep) must preserve stack_obj for self.func_loops"
+    );
+    assert_eq!(
+        vm.obj_attr(probe_id, 6),
+        11,
+        "P1-7: self.counter (10) + bump_and_true (1) must snapshot LHS before RHS mutation"
+    );
+    assert_eq!(
+        vm.obj_attr(probe_id, 10),
+        15,
+        "P1-7: counter mutated to 15 by RHS"
+    );
+    assert_eq!(
+        vm.obj_attr(probe_id, 7),
+        100,
+        "P1-8: imported pub fn must resolve its own module's private_tag (100), not object-local (999)"
+    );
+    assert_eq!(
+        vm.obj_attr(target_id, 1),
+        42,
+        "P2-1: &mut foreign.attr[1] must stay bound to original target after handle reassignment"
+    );
+
+    // Cancel Nested Helper on yield 1 (inside `nested_sleep_helper` -> `repeat 2` -> `sleep(2)`):
+    vm.run_interaction(probe_id, "Cancel Nested Helper", Some(1));
+    assert_eq!(
+        vm.obj_attr(probe_id, 1),
+        0,
+        "P1-4: outer_lock must be released on cancel inside helper"
+    );
+    assert_eq!(
+        vm.obj_attr(probe_id, 2),
+        0,
+        "P1-4: inner_lock inside helper must be released on cancel"
+    );
+    assert_eq!(
+        vm.obj_attr(probe_id, 3),
+        0,
+        "P1-4: code after sleep inside helper must not run after cancel"
+    );
+    assert_eq!(
+        vm.obj_attr(probe_id, 8),
+        1,
+        "P1-5: sleeping defer must run once on cancel without compiler stack overflow"
+    );
+}
+
+#[test]
+fn sol_r1_safety_validation_and_cli_regressions() {
+    let empty_cfg = PackResolverConfig::default();
+
+    // P1-9: container slot rejected in route_to
+    let err = compile_v2_source(
+        "bad_slot.antics",
+        r#"
+object "Bad Slot" {
+    guid: 0x7F31_0001;
+    slot surface {
+        kind: container,
+        offset: [0.0, 0.0, 0.5],
+        standing: false,
+        sitting: false,
+        ground: false,
+        facing: north,
+    }
+    interaction "Go" { run(sim) { route_to(surface); return true; } }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("container slot must be rejected in route_to");
+    assert!(err.message.contains("not a routing slot"), "{err}");
+
+    // P2-2: bool assigned to ObjectId / i16 indexed as foreign object / foreign attr in with lock
+    let err = compile_v2_source(
+        "bad_oid.antics",
+        r#"
+object "Bad Oid" {
+    guid: 0x7F31_0002;
+    interaction "Go" { run(sim) { let x: ObjectId = true; return true; } }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("bool->ObjectId must be rejected");
+    assert!(err.message.contains("from bool expression"), "{err}");
+
+    let err = compile_v2_source(
+        "bad_idx.antics",
+        r#"
+object "Bad Idx" {
+    guid: 0x7F31_0003;
+    interaction "Go" { run(sim) { let n: i16 = 5; n.attr[0] = 1; return true; } }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("indexing i16 as foreign object must be rejected");
+    assert!(err.message.contains("expected ObjectId"), "{err}");
+
+    let err = compile_v2_source(
+        "bad_lock.antics",
+        r#"
+object "Bad Lock" {
+    guid: 0x7F31_0004;
+    interaction "Go" {
+        run(sim) {
+            let Some(other) = find_best_object(prep) else { return false; };
+            with lock(other.attr[0]) { sleep(1); }
+            return true;
+        }
+    }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("with lock on foreign i16 attr must be rejected");
+    assert!(err.message.contains("bool state"), "{err}");
+
+    // P2-3: missing return in `-> bool` helper
+    let err = compile_v2_source(
+        "missing_ret.antics",
+        r#"
+fn maybe_ok(flag: bool) -> bool {
+    if flag {
+        return true;
+    }
+}
+object "Missing Ret" {
+    guid: 0x7F31_0005;
+    interaction "Go" { run(sim) { return maybe_ok(true); } }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("missing return in -> bool helper must be rejected");
+    assert!(
+        err.message
+            .contains("does not return on all control-flow paths"),
+        "{err}"
+    );
+
+    // P2-4: `self.parts()` inside `init` uses `my.id` (not `stack_obj`)
+    let init_parts_src = r#"
+object "Init Parts" {
+    guid: 0x7F31_0006;
+    state x: i16 = 0;
+    init {
+        for p in self.parts() {
+            p.attr[0] = 1;
+        }
+    }
+}
+"#;
+    let init_parts_air = sims_antics::v2::expand_v2_source_to_objects(
+        "init_parts.antics",
+        init_parts_src,
+        &empty_cfg,
+    )
+    .expect("self.parts() in init must expand")
+    .into_iter()
+    .next()
+    .unwrap()
+    .air_source;
+    assert!(init_parts_air.contains("my.id"), "{init_parts_air}");
+    compile_v2_source("init_parts.antics", init_parts_src, &empty_cfg)
+        .expect("self.parts() in init must compile");
+
+    // P2-5: re-entrant `with lock` rejected
+    let err = compile_v2_source(
+        "reentrant_lock.antics",
+        r#"
+object "Reentrant Lock" {
+    guid: 0x7F31_0007;
+    state occupied: bool = false;
+    interaction "Go" {
+        run(sim) {
+            with lock(self.occupied) {
+                with lock(self.occupied) {
+                    sleep(1);
+                }
+            }
+            return true;
+        }
+    }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("re-entrant with lock must be rejected");
+    assert!(err.message.contains("re-entrant"), "{err}");
+
+    // P2-6: `raw` control-flow escape under `with lock` and `raw` inside `defer` rejected
+    let err = compile_v2_source(
+        "raw_escape.antics",
+        r#"
+object "Raw Escape" {
+    guid: 0x7F31_0008;
+    state occupied: bool = false;
+    interaction "Go" {
+        run(sim) {
+            with lock(self.occupied) {
+                raw { return true; }
+            }
+            return true;
+        }
+    }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("raw return under with lock must be rejected");
+    assert!(err.message.contains("cannot contain 'return'"), "{err}");
+
+    let err = compile_v2_source(
+        "raw_defer.antics",
+        r#"
+object "Raw Defer" {
+    guid: 0x7F31_0009;
+    interaction "Go" {
+        run(sim) {
+            defer {
+                raw { my.attr[0] := 1; }
+            }
+            return true;
+        }
+    }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("raw inside defer must be rejected");
+    assert!(
+        err.message.contains("not allowed inside a 'defer'"),
+        "{err}"
+    );
+
+    // P2-7: `raw` block with `#` and `/* } */` comments containing unmatched braces compiles cleanly!
+    compile_v2_source(
+        "raw_comments.antics",
+        r#"
+object "Raw Comments" {
+    guid: 0x7F31_000A;
+    state a: i16 = 0;
+    init {
+        raw {
+            # comment with } brace
+            /* block comment with { and } */
+            my.attr[0] := 7;
+        }
+    }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect("raw block with .air comments containing braces must compile");
+
+    // P2-8: deeply nested expression rejected cleanly without stack overflow
+    let deep_parens = format!(
+        "object \"Deep\" {{ guid: 0x7F31_000B; interaction \"G\" {{ run(sim) {{ let x = {}1{}; return true; }} }} }}",
+        "(".repeat(120),
+        ")".repeat(120)
+    );
+    let err = compile_v2_source("deep.antics", &deep_parens, &empty_cfg)
+        .expect_err("excessive nesting must fail cleanly");
+    assert!(err.message.contains("nesting depth"), "{err}");
+
+    // P2-11: multi-graphic + multi-tile implicit DGRP IDs must not collide
+    let multi_gfx_tile = compile_v2_source(
+        "multi_gfx_tile.antics",
+        r#"
+object "Multi Gfx Tile" {
+    guid: 0x7F31_000C;
+    master_id: 1;
+    graphics: [
+        Sprite::procedural("floor_lamp", primary: #988C74, accent: #B4A890, trim: #604E34),
+        Sprite::procedural("floor_lamp", primary: #F2E0AE, accent: #FCF0CE, trim: #745E3E),
+    ];
+    tiles: [
+        tile { name: "Left", guid: 0x7F31_000D, objd_id: 129, offset: [0, 0], lead: true, interaction_group: -1, shape: "cot" },
+        tile { name: "Right", guid: 0x7F31_000E, objd_id: 130, offset: [1, 0], lead: false, interaction_group: 1, shape: "cot" },
+    ];
+}
+"#,
+        &empty_cfg,
+    )
+    .expect("multi-graphic + multi-tile must compile without DGRP collision");
+    let iff = Iff::parse(multi_gfx_tile.iff_bytes).expect("parse iff");
+    assert!(iff.get(b"DGRP", 100).is_some());
+    assert!(iff.get(b"DGRP", 101).is_some());
+    assert!(iff.get(b"DGRP", 102).is_some());
+    assert!(iff.get(b"DGRP", 103).is_some());
+
+    // P2-12: invalid sound WAV filename rejected
+    let err = compile_v2_source(
+        "bad_wav.antics",
+        r#"
+object "Bad Wav" {
+    guid: 0x7F31_000F;
+    sound evil = preset("ui_click", wav: "../escape");
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("path traversal in sound wav must fail");
+    assert!(err.message.contains("sound wav name"), "{err}");
+
+    // P3-1: control character inside string literal escapes cleanly for `.air`
+    compile_v2_source(
+        "ctrl_str.antics",
+        "object \"Ctrl\" {\n    guid: 0x7F31_0010;\n    strings 300 {\n        msg = \"hi\x07there\",\n    }\n}\n",
+        &empty_cfg,
+    )
+    .expect("control char in string must escape cleanly");
+
+    // P1-10: legacy `object.toml` referencing `scripts = ["object.antics"]` still takes legacy path!
+    let tmp = CleanupDir::new("r1-cli");
+    let legacy_pack = tmp.path().join("legacy-pack");
+    std::fs::create_dir_all(legacy_pack.join("objects/demo")).expect("mkdir legacy");
+    std::fs::write(
+        legacy_pack.join("pack.toml"),
+        "[pack]\nid = \"legacy\"\nname = \"Legacy\"\nversion = \"0.1.0\"\narchive = \"legacy.far\"\nobjects = [\"demo\"]\n",
+    )
+    .expect("write legacy pack.toml");
+    std::fs::write(
+        legacy_pack.join("objects/demo/object.toml"),
+        "[object]\nname = \"Legacy Demo\"\nguid = 0x7F31_0020\nscripts = [\"object.antics\"]\ninit = 4096\nmain = 4097\n",
+    )
+    .expect("write object.toml");
+    std::fs::write(
+        legacy_pack.join("objects/demo/object.antics"),
+        "tree 4096 \"Init\" { return true; }\ntree 4097 \"Main\" { return true; }\n",
+    )
+    .expect("write legacy .air script named object.antics");
+    let compiled_legacy = sims_antics::compile_pack_dir(&legacy_pack)
+        .expect("legacy object.toml must take precedence over object.antics");
+    assert_eq!(compiled_legacy.objects.len(), 1);
+
+    // P2-10: bare filename `sims-antics expand demo.antics` from inside its directory succeeds!
+    let bare_dir = tmp.path().join("bare");
+    std::fs::create_dir_all(&bare_dir).expect("mkdir bare");
+    std::fs::write(
+        bare_dir.join("demo.antics"),
+        "object \"Bare Demo\" { guid: 0x7F31_0021; }\n",
+    )
+    .expect("write bare demo");
+    let bare_out = Command::new(cli_bin())
+        .current_dir(&bare_dir)
+        .args(["expand", "demo.antics"])
+        .output()
+        .expect("run expand bare");
+    assert!(
+        bare_out.status.success(),
+        "bare filename expand failed: {}",
+        String::from_utf8_lossy(&bare_out.stderr)
+    );
+
+    // P3-2: `sims-antics lift --raw` includes `.air (Antics IR)` header!
+    let raw_iff_path = tmp.path().join("legacy_demo.iff");
+    std::fs::write(&raw_iff_path, &compiled_legacy.objects[0].object.iff_bytes).expect("write iff");
+    let lift_raw = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&raw_iff_path)
+        .args(["--tree", "4096", "--raw"])
+        .output()
+        .expect("run lift --raw");
+    assert!(lift_raw.status.success());
+    let lift_raw_out = String::from_utf8_lossy(&lift_raw.stdout);
+    assert!(
+        lift_raw_out.contains(".air (Antics IR)"),
+        "lift --raw must identify output as .air (Antics IR): {lift_raw_out}"
+    );
+
+    // P1-11: absolute dependency path and symlinked ancestor directory rejected!
+    let dep_pack = tmp.path().join("dep-pack");
+    std::fs::create_dir_all(dep_pack.join("objects")).expect("mkdir dep-pack");
+    std::fs::write(
+        dep_pack.join("pack.toml"),
+        format!(
+            "[pack]\nid = \"dep_pack\"\nname = \"Dep\"\nversion = \"0.1.0\"\narchive = \"dep.far\"\nobjects = [\"o\"]\n\n[dependencies]\nevil = \"{}\"\n",
+            tmp.path().display()
+        ),
+    )
+    .expect("write dep pack.toml");
+    std::fs::write(
+        dep_pack.join("objects/o.antics"),
+        "object \"O\" { guid: 0x7F31_0022; }\n",
+    )
+    .expect("write o.antics");
+    let err = compile_v2_pack_dir(&dep_pack).expect_err("absolute dependency path must fail");
+    assert!(err.message.contains("must be a relative path"), "{err}");
+
+    #[cfg(unix)]
+    {
+        let sym_pack = tmp.path().join("sym-pack");
+        std::fs::create_dir_all(sym_pack.join("real_mod")).expect("mkdir real_mod");
+        std::fs::write(sym_pack.join("real_mod/h.antics"), "pub fn noop() {}\n")
+            .expect("write h.antics");
+        std::os::unix::fs::symlink(sym_pack.join("real_mod"), sym_pack.join("link_mod"))
+            .expect("symlink");
+        std::fs::write(
+            sym_pack.join("pack.toml"),
+            "[pack]\nid = \"sym_pack\"\nname = \"Sym\"\nversion = \"0.1.0\"\narchive = \"sym.far\"\nobjects = []\n",
+        )
+        .expect("write sym pack.toml");
+        std::fs::write(
+            sym_pack.join("main.antics"),
+            "use sym_pack::link_mod::h::noop;\nobject \"S\" { guid: 0x7F31_0023; }\n",
+        )
+        .expect("write main.antics");
+        let err = compile_v2_object_file(&sym_pack.join("main.antics"), Some(&sym_pack))
+            .expect_err("symlinked ancestor directory must be rejected");
+        assert!(err.message.contains("symlink"), "{err}");
+    }
+}

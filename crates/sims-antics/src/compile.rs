@@ -355,7 +355,8 @@ pub(crate) fn compile_object_from_manifest(
                 (None, Some(shape)) => {
                     let dgrp_id = manifest
                         .dgrp_id
-                        .checked_add(1 + idx as u16)
+                        .checked_add(total_graphics)
+                        .and_then(|base| base.checked_add(idx as u16))
                         .ok_or_else(|| Error::new("multi-tile dgrp_id overflow"))?;
                     if !emitted_dgrp_ids.insert(dgrp_id)
                         || !emitted_spr2_ids.insert(dgrp_id)
@@ -462,7 +463,13 @@ pub(crate) fn compile_object_from_manifest(
             tile_spec.price = 0;
             tile_spec.object_type = manifest.object_type;
             tile_spec.base_graphic_id = tile_dgrp_id;
-            tile_spec.num_graphics = u16::from(tile_dgrp_id != 0);
+            tile_spec.num_graphics = if tile_dgrp_id == 0 {
+                0
+            } else if tile_dgrp_id == manifest.dgrp_id {
+                total_graphics
+            } else {
+                1
+            };
             tile_spec.tree_table_id = tile_ttab_id;
             tile_spec.slots_id = tile_slot_id;
             tile_spec.catalog_strings_id = manifest.ctss_id;
@@ -955,8 +962,15 @@ pub fn compile_pack_dir(dir: &Path) -> Result<CompiledPack> {
                 "object slug '{slug}' produces colliding IFF filename '{iff_name}'"
             )));
         }
-        let compiled = if let Some(v2_path) =
-            crate::v2::resolve_v2_object_path_in_pack(&root_canon, slug)?
+        let legacy_manifest_path = root_canon
+            .join("objects")
+            .join(slug.as_str())
+            .join("object.toml");
+        let has_legacy_manifest = std::fs::symlink_metadata(&legacy_manifest_path).is_ok();
+        let compiled = if has_legacy_manifest {
+            let obj_dir = ensure_contained_path(dir, &root_canon, &["objects", slug.as_str()])?;
+            compile_object_dir(&obj_dir).map_err(|e| e.with_context(format!("object '{slug}'")))?
+        } else if let Some(v2_path) = crate::v2::resolve_v2_object_path_in_pack(&root_canon, slug)?
         {
             crate::v2::compile_v2_object_file(&v2_path, Some(&root_canon))
                 .map_err(|e| e.with_context(format!("object '{slug}'")))?
