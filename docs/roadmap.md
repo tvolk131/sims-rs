@@ -3517,6 +3517,74 @@ through their public interfaces only; the simulation never depends on it.
     - 28,690 / 28,690 BHAVs round-trip byte-exact and prove `Equivalent`.
     - Next: PR 3, a symbolic live-output equivalence verifier and
       `sims-antics verify-equiv`.
+- **Done (Batch 15 — UI Honesty Wave 2, Harness Runtime Rebuild, Legacy
+  Mining, Magic Town Arrivals, Native Destination Bar, #401–#409):**
+  - **UI Honesty Audit Wave 2 (#401):** native special panels and shell
+    dialogs. The UI oracle tour (`SIMS_UI_ORACLE`) is now a ratchet gate in
+    `cargo test`, next to the pixel ratchet.
+  - **Harness runtime (#403):** `build_runtime.sh` rebuilds the guest
+    kernel and initramfs from the guest disk, restoring the emulator
+    harness after the old runtime was lost.
+  - **Legacy mining (#404):** all 10 `legacy/` crates were audited (ported,
+    deliberately dropped, or still to mine), and `sims-kernel`,
+    `sims-tools` and `sims-fixtures` were removed. Citations to deleted
+    crates use the `legacy-final` tag. Per-crate deletion continues only
+    after an audit shows nothing left to mine
+    (`docs/decisions/20261123-legacy-crate-by-crate-cleanup.md`).
+  - **Magic Town arrivals (#408):** ports Generic Sims Call 21 (`0x45098a`)
+    and 3. The Magic Town ped marker's missing routine 21 had faulted every
+    ~21 ticks and re-placed the arriving Sim (the user's "stuck and
+    teleporting" report). The residual unported routines are tabled in the
+    ADR.
+  - **Native destination top bar (#409):** removes the invented lodging
+    tabs, Vacancy badge, switcher and filter strip from the four
+    destination neighborhoods (user report). Draws the native banner
+    `5422` and the native buttons, with Magic Town's press-triggered Move
+    In and Bulldoze, captured-press semantics, and per-destination credits
+    music. A whole-frame shell pixel test guards against shell-drawn
+    chrome.
+  - **The maintainer's 2026-11-23 decisions:**
+    - Hand-written `.antics` need only be proven *behaviourally* equivalent
+      to shipped trees, not byte-identical. A Fridges pilot (hand-port
+      `Fridges.iff`, prove each tree with `equiv` / `verify-equiv`) starts
+      once #402 merges.
+    - A one-table instruction-layout refactor of `sims-antics` follows
+      #402 and #406. It merges only if clearly shorter and cleaner, with
+      round-trip and equivalence verdicts unchanged; otherwise it is
+      discarded.
+    - The lost captures `goth-ticks-20261114-long` and `-to1000` are not
+      re-recorded: `goth-day-20261115` and `goth-rng-4155-20261118` cover
+      them.
+- **Next (in flight, in order of player impact):**
+  - **Travel:**
+    - Downtown arrival (Generic Sims Call 19, companion token, abort
+      revokes it).
+    - The traveler snapping back after a marker places it (Find Location
+      mode 0 skips the person's `0x74` refresh, `0x45e519`).
+    - A traveler-led destination family: Generic Sims Call 18 takes member
+      0, so a solo trip by a non-first member is never placed.
+    - The phone's Go Downtown dropping out of the queue (routines 17, 20,
+      22 and 23).
+    - Downtown townies (routine 25).
+    - Routine 24 (dresser).
+  - **Carried objects drawn at the Sim's hand:** the person draw
+    (`0x459dc0`) draws held objects at body-string attach points
+    (`R_HAND`/`Palm`, `HEAD`/`Top`, `PELVIS`). Today they draw on the
+    floor.
+  - **Open PRs:**
+    - UI Honesty Wave 3 (#405).
+    - The `sims-vm` legacy backlog with co-op `PROTOCOL_VERSION` 2 (#407).
+    - `lift` install-catalog arities (#406).
+    - The live-output equivalence verifier (#402).
+  - **Co-op:** a build identity in `Hello`, so that mixed builds are
+    rejected even when the save format is unchanged.
+  - **Legacy mining backlog:** see
+    `docs/legacy-mining-audit.md#porting-backlog`.
+    - Parity-relevant items: walk animator states 5/7/8/12, footstep and
+      clip sounds, route-cache invalidation, the original wall draw order,
+      the camera glide, the censor mosaic, catalog eligibility and naming,
+      and non-modal/anchored dialogs.
+    - Tooling items: the determinism fuzzer and the oracle comparator.
 - **Needs from other crates:**
   - `sims-vm`: Done — all three failing Goth pie listings (#296) are
     now closed, and every person's pie menu on every object of the Goth

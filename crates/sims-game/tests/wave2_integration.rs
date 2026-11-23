@@ -519,7 +519,7 @@ fn wave2_travel_shell_shop_picker_crash_recovery_and_community_edit() {
     )
     .expect("open NeighborhoodShell");
 
-    // --- 3A. Destination map switching & TravelChrome filter + lodging pixel highlighting ---
+    // --- 3A. Destination map switching & community filter pixel highlighting ---
     for (dest, expected_kind, filter) in [
         (
             Destination::Downtown,
@@ -542,8 +542,11 @@ fn wave2_travel_shell_shop_picker_crash_recovery_and_community_edit() {
             LotFilter::Magic,
         ),
     ] {
-        shell.handle_travel_command(TravelCommand::SwitchDestination(dest));
+        shell
+            .switch_kind(expected_kind)
+            .expect("switch destination map");
         assert_eq!(shell.neighborhood_kind(), expected_kind);
+        assert_eq!(shell.travel_state().destination, dest);
         shell.render();
         let unfiltered = shell.canvas().color.clone();
         shell.handle_travel_command(TravelCommand::SetFilter(Some(filter)));
@@ -554,20 +557,6 @@ fn wave2_travel_shell_shop_picker_crash_recovery_and_community_edit() {
             unfiltered, filtered,
             "activating TravelChrome filter on {dest:?} must update rendered map/chrome pixels"
         );
-        if dest == Destination::VacationIsland {
-            shell.handle_travel_command(TravelCommand::SetFilter(None));
-            shell.render();
-            let base_vac = shell.canvas().color.clone();
-            shell.handle_travel_command(TravelCommand::SetVacationLodging(Some(
-                sims_ui::travel::VacationLodging::Hotel,
-            )));
-            shell.render();
-            let hotel_vac = shell.canvas().color.clone();
-            assert_ne!(
-                base_vac, hotel_vac,
-                "selecting VacationLodging::Hotel must highlight hotel lots on Vacation Island"
-            );
-        }
     }
     shell.handle_travel_command(TravelCommand::ReturnToNeighborhood);
     assert_eq!(shell.neighborhood_kind(), NeighborhoodKind::Unleashed);
@@ -817,16 +806,24 @@ fn wave2_travel_shell_shop_picker_crash_recovery_and_community_edit() {
     );
     shell.close_travel_dialog();
 
-    // Verify Magic Town Family Bin button stays reachable at compact widths (< 800px).
+    // Verify Magic Town's native Move In button (`kNghMoveIn`) stays
+    // reachable at compact widths (< 800px) and opens the Family Bin.
     shell.leave_lot(false).expect("leave Goth lot 5");
-    shell.handle_travel_command(TravelCommand::SwitchDestination(Destination::MagicTown));
+    shell
+        .switch_kind(NeighborhoodKind::MagicTown)
+        .expect("switch to Magic Town");
     shell.resize([640, 480]);
     shell.render();
     let compact_layout = sims_ui::travel::TravelLayout::compute(640, 480, shell.travel_state());
     assert!(compact_layout.compact);
+    let move_in = compact_layout
+        .controls
+        .iter()
+        .find(|c| c.control == sims_ui::travel::TravelControl::MoveIn)
+        .expect("Magic Town Move In control");
     let compact_fb_pt = [
-        compact_layout.filter_strip_rect.x + compact_layout.filter_strip_rect.width - 20,
-        compact_layout.filter_strip_rect.y + compact_layout.filter_strip_rect.height / 2,
+        move_in.rect.x + move_in.rect.width / 2,
+        move_in.rect.y + move_in.rect.height / 2,
     ];
     shell.press(compact_fb_pt);
     shell.release(compact_fb_pt);

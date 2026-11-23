@@ -74,8 +74,8 @@ use sims_ui::shop::{
 };
 use sims_ui::travel::{
     Destination, LotFilter, TravelBarMode, TravelChrome, TravelCommand, TravelDialog,
-    TravelDialogCommand, TravelDialogLayout, TravelDialogState, TravelLayout, TravelState,
-    TravelStrings, TravelTransport as UiTravelTransport,
+    TravelDialogCommand, TravelDialogLayout, TravelDialogState, TravelLayout, TravelPress,
+    TravelState, TravelStrings, TravelTransport as UiTravelTransport,
 };
 use sims_vm::boot::Frames;
 use sims_vm::boot::save::Saved;
@@ -216,8 +216,6 @@ struct NeighborhoodSteadyKey {
     travel_hovered: Option<sims_ui::travel::TravelControl>,
     travel_pressed: Option<sims_ui::travel::TravelControl>,
     pressed_lot_id: Option<u16>,
-    magic_family_bin_hovered: bool,
-    magic_family_bin_pressed: bool,
 }
 
 /// Maximum number of full-resolution album images kept hydrated around the
@@ -643,8 +641,6 @@ pub struct NeighborhoodShell {
     travel_dialog: TravelDialog,
     travel_dialog_state: Option<TravelDialogState>,
     pending_travel: Option<PendingTravel>,
-    magic_family_bin_hovered: bool,
-    magic_family_bin_pressed: bool,
     loading_presenter: Option<LoadingPresenter>,
 
     // Family Bin screen interactive state.
@@ -1016,8 +1012,6 @@ impl NeighborhoodShell {
             travel_dialog: TravelDialog::new(),
             travel_dialog_state: None,
             pending_travel: None,
-            magic_family_bin_hovered: false,
-            magic_family_bin_pressed: false,
             loading_presenter: None,
             family_bin: FamilyBin::new(),
             family_bin_entries,
@@ -1534,10 +1528,8 @@ impl NeighborhoodShell {
             self.nbhd_state.mode,
             NeighborhoodMode::MoveIn { .. } | NeighborhoodMode::Bulldoze | NeighborhoodMode::Rezone
         ) || self.travel_state.mode == TravelBarMode::Bulldoze;
-        let has_active_filter = destination_for_kind(self.kind).is_some()
-            && (self.travel_state.active_filter.is_some()
-                || (self.kind == NeighborhoodKind::Vacation
-                    && self.travel_state.vacation_lodging_filter.is_some()));
+        let has_active_filter =
+            destination_for_kind(self.kind).is_some() && self.travel_state.active_filter.is_some();
         in_action_mode || has_active_filter
     }
 
@@ -2083,15 +2075,15 @@ impl NeighborhoodShell {
             }
             ActiveScreen::Neighborhood => {
                 let is_travel_map = destination_for_kind(self.kind).is_some();
+                if is_travel_map {
+                    self.sync_travel_state();
+                }
                 let highlighted_lots = if is_travel_map {
                     self.travel_filtered_lot_ids()
                 } else {
                     BTreeSet::new()
                 };
-                let active_filter = if is_travel_map
-                    && !(self.kind == NeighborhoodKind::Vacation
-                        && self.travel_state.vacation_lodging_filter.is_some())
-                {
+                let active_filter = if is_travel_map {
                     self.travel_state
                         .active_filter
                         .map(community_filter_for_lot_filter)
@@ -2137,9 +2129,6 @@ impl NeighborhoodShell {
                             &self.travel_art,
                             &self.travel_strings,
                         );
-                        if self.kind == NeighborhoodKind::MagicTown {
-                            self.draw_magic_family_bin_button(&mut frame);
-                        }
                     } else {
                         self.chrome.draw(
                             &mut frame,
@@ -2219,8 +2208,6 @@ impl NeighborhoodShell {
                     travel_hovered: self.travel_chrome.hovered(),
                     travel_pressed: self.travel_chrome.pressed(),
                     pressed_lot_id: self.pressed_lot_id,
-                    magic_family_bin_hovered: self.magic_family_bin_hovered,
-                    magic_family_bin_pressed: self.magic_family_bin_pressed,
                 });
                 let cur_rects = map_damage.unwrap_or_default();
                 if cur_key.is_some() && self.prev_nb_steady_key == cur_key {
@@ -2375,20 +2362,18 @@ impl NeighborhoodShell {
                 let prev_lot = self.hovered_lot_id;
                 let (chrome_changed, over_bar) = if destination_for_kind(self.kind).is_some() {
                     let prev_btn = self.travel_chrome.hovered();
-                    let prev_fb = self.magic_family_bin_hovered;
+                    // The bar mode follows every shell mode change (Move In latch).
+                    self.sync_travel_state();
                     let layout =
                         TravelLayout::compute(frame_size[0], frame_size[1], &self.travel_state);
-                    let over_magic_fb = self
-                        .magic_family_bin_rect(&layout)
-                        .is_some_and(|r| r.contains(point[0], point[1]));
-                    self.magic_family_bin_hovered = over_magic_fb;
                     self.travel_chrome.pointer_move(point[0], point[1], &layout);
                     let cur_btn = self.travel_chrome.hovered();
+                    // A captured press keeps the pointer's moves (`0x5da9e3`):
+                    // no lot hovers until it is released.
                     let over_chrome = cur_btn.is_some()
-                        || over_magic_fb
-                        || layout.bar_rect.contains(point[0], point[1])
-                        || layout.filter_strip_rect.contains(point[0], point[1]);
-                    (cur_btn != prev_btn || over_magic_fb != prev_fb, over_chrome)
+                        || self.travel_chrome.pressed().is_some()
+                        || layout.blocks_map(point[0], point[1]);
+                    (cur_btn != prev_btn, over_chrome)
                 } else {
                     let prev_btn = self.chrome.hovered();
                     let btn = self.chrome.hover(
@@ -2459,11 +2444,11 @@ impl NeighborhoodShell {
                 let had_state = self.chrome.hovered().is_some()
                     || self.chrome.pressed().is_some()
                     || self.travel_chrome.hovered().is_some()
+                    || self.travel_chrome.pressed().is_some()
                     || self.hovered_lot_id.is_some()
                     || self.pressed_lot_id.is_some();
                 self.chrome.clear_pointer();
-                self.magic_family_bin_hovered = false;
-                self.magic_family_bin_pressed = false;
+                self.travel_chrome.clear_pointer();
                 let prev_lot = self.hovered_lot_id.take();
                 self.hovered_lot_since_us = None;
                 self.hover_card_shown_for = None;
@@ -2675,23 +2660,37 @@ impl NeighborhoodShell {
             ActiveScreen::Loading(_) => ShellOutcome::default(),
             ActiveScreen::Neighborhood => {
                 if destination_for_kind(self.kind).is_some() {
+                    // The bar mode follows every shell mode change (Move In latch).
+                    self.sync_travel_state();
                     let layout =
                         TravelLayout::compute(frame_size[0], frame_size[1], &self.travel_state);
-                    if self
-                        .magic_family_bin_rect(&layout)
-                        .is_some_and(|r| r.contains(point[0], point[1]))
-                    {
-                        self.magic_family_bin_pressed = true;
-                        self.pressed_lot_id = None;
-                        return ShellOutcome::redraw();
+                    match self.travel_chrome.pointer_down(
+                        point[0],
+                        point[1],
+                        &layout,
+                        &self.travel_state,
+                    ) {
+                        TravelPress::Missed => {}
+                        TravelPress::Held => {
+                            self.pressed_lot_id = None;
+                            return ShellOutcome::redraw();
+                        }
+                        // Magic Town's Bulldoze and Move In act on mouse-down
+                        // (`0x551e49`, `0x5e4506`).
+                        TravelPress::Activated(cmd) => {
+                            self.pressed_lot_id = None;
+                            let outcome = self.handle_travel_command(cmd);
+                            // A press that left the map (the family bin) drops
+                            // the capture: its release lands elsewhere.
+                            if !matches!(self.screen, ActiveScreen::Neighborhood)
+                                || self.dialog.is_some()
+                            {
+                                self.travel_chrome.clear_pointer();
+                            }
+                            return outcome;
+                        }
                     }
-                    self.magic_family_bin_pressed = false;
-                    if self.travel_chrome.pointer_down(point[0], point[1], &layout) {
-                        self.pressed_lot_id = None;
-                        return ShellOutcome::redraw();
-                    }
-                    let over_chrome = layout.bar_rect.contains(point[0], point[1])
-                        || layout.filter_strip_rect.contains(point[0], point[1]);
+                    let over_chrome = layout.blocks_map(point[0], point[1]);
                     let hit = if over_chrome {
                         None
                     } else {
@@ -2896,18 +2895,10 @@ impl NeighborhoodShell {
             ActiveScreen::Loading(_) => ShellOutcome::default(),
             ActiveScreen::Neighborhood => {
                 if destination_for_kind(self.kind).is_some() {
+                    // The bar mode follows every shell mode change (Move In latch).
+                    self.sync_travel_state();
                     let layout =
                         TravelLayout::compute(frame_size[0], frame_size[1], &self.travel_state);
-                    let was_magic_fb = std::mem::take(&mut self.magic_family_bin_pressed);
-                    if was_magic_fb
-                        && self
-                            .magic_family_bin_rect(&layout)
-                            .is_some_and(|r| r.contains(point[0], point[1]))
-                    {
-                        self.pressed_lot_id = None;
-                        self.open_family_bin();
-                        return ShellOutcome::redraw();
-                    }
                     if let Some(cmd) = self.travel_chrome.pointer_up(
                         point[0],
                         point[1],
@@ -2918,8 +2909,7 @@ impl NeighborhoodShell {
                         return self.handle_travel_command(cmd);
                     }
                     let pressed_lot = self.pressed_lot_id.take();
-                    let over_chrome = layout.bar_rect.contains(point[0], point[1])
-                        || layout.filter_strip_rect.contains(point[0], point[1]);
+                    let over_chrome = layout.blocks_map(point[0], point[1]);
                     let hit = if over_chrome {
                         None
                     } else {
@@ -3011,6 +3001,7 @@ impl NeighborhoodShell {
         }
         self.pressed_lot_id = None;
         self.chrome.clear_pointer();
+        self.travel_chrome.clear_pointer();
         self.family_bin.clear_pointer();
         ShellOutcome::redraw()
     }
@@ -4567,7 +4558,7 @@ impl NeighborhoodShell {
         self.save_manager_snapshot = None;
         self.save_manager_target_lot = None;
         self.close_import_family_picker();
-        self.close_credits_modal();
+        self.drop_credits_modal();
         self.nbhd_state.show_credits_button = destination_for_kind(kind).is_none();
         self.refresh_importable_families();
         self.note = None;
@@ -4604,7 +4595,7 @@ impl NeighborhoodShell {
         self.nbhd_state.show_credits_button = destination_for_kind(kind).is_none();
         self.nbhd_state.hovered_lot = None;
         self.close_import_family_picker();
-        self.close_credits_modal();
+        self.drop_credits_modal();
         self.hovered_lot_id = None;
         self.hovered_lot_since_us = None;
         self.hover_card_shown_for = None;
@@ -4613,8 +4604,8 @@ impl NeighborhoodShell {
         self.pressed_lot_id = None;
         self.move_in_family_id = None;
         self.travel_state.active_filter = None;
-        self.travel_state.vacation_lodging_filter = None;
         self.travel_state.mode = TravelBarMode::Browse;
+        self.travel_chrome.clear_pointer();
         self.sync_travel_state();
         self.audio_queue
             .push(Input::MusicMode(music_mode_for_kind(kind)));
@@ -4667,6 +4658,7 @@ impl NeighborhoodShell {
         };
         self.screen = ActiveScreen::Neighborhood;
         self.dialog = None;
+        self.sync_travel_state();
         self.refresh_hovered_lot();
         self.audio_queue
             .push(Input::MusicMode(music_mode_for_kind(self.kind)));
@@ -5277,7 +5269,7 @@ impl NeighborhoodShell {
                 ShellOutcome::redraw()
             }
             NeighborhoodCommand::OpenCredits => {
-                self.open_credits_modal();
+                self.open_credits_with_music();
                 ShellOutcome::redraw()
             }
         }
@@ -6281,7 +6273,26 @@ impl NeighborhoodShell {
         self.credits_dialog.open();
     }
 
+    /// Closes the credits book and, when it was open over a map, restores
+    /// the map's music, as every native close path does (`station_dtnhood`
+    /// `0x54b879`, `station_superstar` `0x565bf8`, `station_vacation`
+    /// `0x56a5ad`, `music_magictown` `0x552fc5`, `bkground_nhood1`
+    /// `0x5593ff`).
     pub fn close_credits_modal(&mut self) {
+        if !self.credits_dialog.is_open() {
+            self.drop_credits_modal();
+            return;
+        }
+        self.drop_credits_modal();
+        if matches!(self.screen, ActiveScreen::Neighborhood) {
+            self.audio_queue
+                .push(Input::MusicMode(music_mode_for_kind(self.kind)));
+        }
+    }
+
+    /// Discards the credits book without touching the music, for resets
+    /// whose caller sets the music itself (entering a map, switching maps).
+    fn drop_credits_modal(&mut self) {
         self.credits_dialog.close();
         self.credits_snapshot = None;
     }
@@ -6747,101 +6758,26 @@ impl NeighborhoodShell {
         self.travel_state.mode = match self.nbhd_state.mode {
             NeighborhoodMode::Bulldoze => TravelBarMode::Bulldoze,
             NeighborhoodMode::Visit => TravelBarMode::Visit,
+            // `cWinMagicland` holds Move In down while a family is placed
+            // (`0x55478a`).
+            NeighborhoodMode::MoveIn { .. } => TravelBarMode::MoveIn,
             _ => TravelBarMode::Browse,
         };
         self.travel_state.expansions = self.nbhd_state.expansions;
-        self.travel_state.vacation_has_no_vacancy = self
-            .map
-            .lots
-            .iter()
-            .any(|l| (40..=48).contains(&l.id) && l.has_vacation_occupancy);
-        // Show the first occupied household's funds & MagiCoins as a quick status badge.
-        if let Some((&fam_id, fam)) = self.stored.families.iter().find(|(_, f)| f.house != 0) {
-            self.travel_state.simoleons = fam.budget;
-            self.travel_state.magic_coins = lifecycle::family_magic_coins(&self.stored, fam_id);
-        }
     }
 
-    fn magic_family_bin_rect(&self, layout: &TravelLayout) -> Option<Rect> {
-        if self.kind != NeighborhoodKind::MagicTown {
-            return None;
-        }
-        // On native viewports (>= 800px), place the Family Bin button in the open
-        // 78px left margin of `TravelChrome`'s top bar. On compact viewports
-        // (< 800px), top bar controls start at x=4, so dock the compact button on
-        // the open right side of `filter_strip_rect` (Magic Town only has 2 filter
-        // chips on the left) so Family Bin stays reachable at every viewport width.
-        let rect = if layout.compact {
-            let btn_w = 54.min((layout.filter_strip_rect.width - 8).max(0));
-            let btn_h = (layout.filter_strip_rect.height - 4).clamp(0, 26);
-            let x = layout.filter_strip_rect.x + layout.filter_strip_rect.width - btn_w - 4;
-            let y = layout.filter_strip_rect.y + (layout.filter_strip_rect.height - btn_h) / 2;
-            if btn_w <= 0 || btn_h <= 0 {
-                return None;
-            }
-            Rect::new(x, y, btn_w, btn_h)
-        } else {
-            let btn_w = 53;
-            let btn_h = (layout.bar_rect.height - 6).clamp(0, 56);
-            let x = layout.bar_rect.x + 12;
-            let y = layout.bar_rect.y + (layout.bar_rect.height - btn_h) / 2;
-            if btn_w <= 0 || btn_h <= 0 {
-                return None;
-            }
-            Rect::new(x, y, btn_w, btn_h)
+    /// Opens the credits book with the map's credits music. Every map
+    /// screen's logo handler switches music before showing credits:
+    /// `bkground_credits` on the neighborhood (`0x559397`, `0x56099a`),
+    /// Downtown (`0x54b811`), Studio Town (`0x565b90`) and Vacation Island
+    /// (`0x56a545`); `music_magictown_credits` on Magic Town (`0x552f5d`).
+    fn open_credits_with_music(&mut self) {
+        let mode = match self.kind {
+            NeighborhoodKind::MagicTown => MusicMode::MagicTownCredits,
+            _ => MusicMode::Credits,
         };
-        // Never overlap any TravelChrome control.
-        if layout.controls.iter().any(|c| {
-            rect.x < c.rect.x + c.rect.width
-                && rect.x + rect.width > c.rect.x
-                && rect.y < c.rect.y + c.rect.height
-                && rect.y + rect.height > c.rect.y
-        }) {
-            return None;
-        }
-        Some(rect)
-    }
-
-    fn draw_magic_family_bin_button(&self, frame: &mut Frame) {
-        let layout = TravelLayout::compute(frame.width(), frame.height(), &self.travel_state);
-        let Some(rect) = self.magic_family_bin_rect(&layout) else {
-            return;
-        };
-        let state = if self.magic_family_bin_pressed {
-            2
-        } else if self.magic_family_bin_hovered {
-            1
-        } else {
-            0
-        };
-        if !layout.compact
-            && let Some(img) = self
-                .chrome_art
-                .image(sims_ui::neighborhood::art_id::SELECT_FAMILY)
-            && img.width >= 4
-            && img.height > 0
-            && rect.height >= img.height as i32
-        {
-            let sw = (img.width / 4) as i32;
-            let sh = img.height as i32;
-            let src = Rect::new(state * sw, 0, sw, sh);
-            let dx = rect.x + (rect.width - sw) / 2;
-            let dy = rect.y + (rect.height - sh) / 2;
-            frame.draw(img, src, [dx, dy]);
-        } else {
-            let fill = if self.magic_family_bin_pressed {
-                [56, 74, 114]
-            } else if self.magic_family_bin_hovered {
-                [84, 108, 158]
-            } else {
-                [66, 86, 130]
-            };
-            frame.fill(rect, fill);
-            if let Some(font) = self.chrome_art.font(10) {
-                let text_y = rect.y + ((rect.height - 10) / 2).max(2);
-                font.draw(frame, "Fam", [rect.x + 12, text_y], [245, 245, 255]);
-            }
-        }
+        self.audio_queue.push(Input::MusicMode(mode));
+        self.open_credits_modal();
     }
 
     fn travel_filtered_lot_ids(&self) -> BTreeSet<u16> {
@@ -6849,22 +6785,13 @@ impl NeighborhoodShell {
             .travel_state
             .active_filter
             .map(|f| community_filter_for_lot_filter(f) as u16);
-        let lodging = if self.kind == NeighborhoodKind::Vacation {
-            self.travel_state.vacation_lodging_filter
-        } else {
-            None
-        };
-        if filter_mask.is_none() && lodging.is_none() {
+        let Some(mask) = filter_mask else {
             return BTreeSet::new();
-        }
+        };
         self.map
             .lots
             .iter()
-            .filter(|lot| {
-                let matches_filter = filter_mask.is_none_or(|mask| (lot.filter_mask & mask) != 0);
-                let matches_lodging = lodging.is_none_or(|l| vacation_lot_matches_lodging(lot, l));
-                matches_filter && matches_lodging
-            })
+            .filter(|lot| (lot.filter_mask & mask) != 0)
             .map(|lot| lot.id)
             .collect()
     }
@@ -6895,18 +6822,26 @@ impl NeighborhoodShell {
                 self.note = Some("Community lot import is not ported yet.".into());
                 ShellOutcome::redraw()
             }
-            TravelCommand::SwitchDestination(dest) => {
-                if let Err(e) = self.switch_kind(kind_for_destination(dest)) {
-                    self.note = Some(format!("Could not switch destination map: {e}"));
-                }
-                ShellOutcome::redraw()
-            }
             TravelCommand::SetFilter(filter) => {
                 self.travel_state.active_filter = filter;
                 ShellOutcome::redraw()
             }
-            TravelCommand::SetVacationLodging(lodging) => {
-                self.travel_state.vacation_lodging_filter = lodging;
+            // `kNghInet` and `kDowntownCredits` (the Sims logo) behave as on
+            // the neighborhood bar; Magic Town's `kNghMoveIn` opens the
+            // family bin like the neighborhood's Move In button.
+            TravelCommand::OpenWeb => {
+                self.handle_neighborhood_command(NeighborhoodCommand::OpenWeb)
+            }
+            TravelCommand::OpenCredits => {
+                self.handle_neighborhood_command(NeighborhoodCommand::OpenCredits)
+            }
+            TravelCommand::OpenFamilyBin => {
+                // The native resets the placement mode before reopening the
+                // bin (`0x552d96`).
+                self.nbhd_state.mode = NeighborhoodMode::Normal;
+                self.move_in_family_id = None;
+                self.sync_travel_state();
+                self.open_family_bin();
                 ShellOutcome::redraw()
             }
         }
@@ -8196,16 +8131,6 @@ fn album_hydration_window(total: usize, focus_idx: usize) -> (usize, usize) {
     (start, start + ALBUM_IMAGE_WINDOW)
 }
 
-fn vacation_lot_matches_lodging(lot: &MapLot, lodging: sims_ui::travel::VacationLodging) -> bool {
-    let has_lodging_bit = (lot.filter_mask & (CommunityFilter::Lodging as u16)) != 0;
-    let by_zone = match lodging {
-        sims_ui::travel::VacationLodging::Hotel => matches!(lot.id, 40 | 42 | 46),
-        sims_ui::travel::VacationLodging::CabinRental => matches!(lot.id, 44 | 48),
-        sims_ui::travel::VacationLodging::Campground => matches!(lot.id, 41 | 43 | 45 | 47),
-    };
-    by_zone && (has_lodging_bit || (40..=48).contains(&lot.id))
-}
-
 fn load_persisted_custom_thumbs(
     store: &NeighborhoodStore,
     neighborhood_id: &str,
@@ -8253,16 +8178,6 @@ fn destination_for_kind(kind: NeighborhoodKind) -> Option<Destination> {
         NeighborhoodKind::StudioTown => Some(Destination::StudioTown),
         NeighborhoodKind::MagicTown => Some(Destination::MagicTown),
         NeighborhoodKind::Unleashed | NeighborhoodKind::Classic => None,
-    }
-}
-
-fn kind_for_destination(dest: Destination) -> NeighborhoodKind {
-    match dest {
-        Destination::Downtown => NeighborhoodKind::Downtown,
-        Destination::VacationIsland => NeighborhoodKind::Vacation,
-        Destination::OldTown => NeighborhoodKind::Unleashed,
-        Destination::StudioTown => NeighborhoodKind::StudioTown,
-        Destination::MagicTown => NeighborhoodKind::MagicTown,
     }
 }
 

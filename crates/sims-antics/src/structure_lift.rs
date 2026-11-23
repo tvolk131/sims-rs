@@ -100,15 +100,17 @@ fn loaded_str_order(entries: &[sims_formats::strings::TextEntry]) -> Vec<String>
 }
 
 /// Extracts strictly in-memory [`LiftSymbols`] (private `BHAV` labels, local `BCON` tables,
-/// and local `STR#` tables) from a parsed [`sims_formats::iff::Iff`], preferring canonical
-/// high-flag-byte `0` chunks and skipping deleted chunks.
+/// and local `STR#` tables) from a parsed [`sims_formats::iff::Iff`]. A `BHAV` label is the
+/// one on the chunk the VM keeps for that ID
+/// ([`crate::arity_catalog::vm_kept_bhavs`]); `BCON` and `STR#` prefer canonical
+/// high-flag-byte `0` chunks and skip deleted chunks.
 #[must_use]
 pub fn extract_lift_symbols_from_iff(iff: &sims_formats::iff::Iff) -> LiftSymbols {
     let mut symbols = LiftSymbols::default();
 
-    for (id, chunk) in collect_canonical_chunks(iff, b"BHAV") {
-        if (4096..=8191).contains(&id) && !chunk.label.is_empty() {
-            symbols.bhav_labels.insert(id, chunk.label.clone());
+    for chunk in crate::arity_catalog::vm_kept_bhavs(iff).chunks {
+        if (4096..=8191).contains(&chunk.id) && !chunk.label.is_empty() {
+            symbols.bhav_labels.insert(chunk.id, chunk.label.clone());
         }
     }
     for (id, chunk) in collect_canonical_chunks(iff, b"BCON") {
@@ -1784,44 +1786,121 @@ pub fn lift_bhav_structured_with_arities(
     lift_bhav_structured_with_context(chunk, opts, callee_arities, None)
 }
 
-/// Structured `.air` lifter parameterized by [`LiftOptions`], optional `callee_arities`,
-/// and optional in-memory [`LiftSymbols`] for trailing readability comments.
+/// Why [`lift_bhav_structured_with_context`] returned
+/// [`StructuredLiftOutcome::UnsupportedHeaderOrTarget`] for a tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsupportedHeaderReason {
+    /// BHAV format other than `0x8000..=0x8002`.
+    Format(u16),
+    /// More than 251 instructions (no room for the reserved branch targets).
+    TooManyInstructions(usize),
+    /// `kind == 4` indexed multi-entry tree (callers may enter at any node).
+    IndexedEntry,
+    /// A reachable node branches past the end of the tree.
+    TargetOutOfBounds { node: usize, target: u8 },
+    /// A reachable inline call targets a tree whose known arity is above 4, so it reads
+    /// extended arguments from the following instruction records.
+    ExtendedArityCallee {
+        node: usize,
+        callee: u16,
+        arity: usize,
+    },
+    /// A reachable inline call targets a tree with no known arity in a multi-instruction
+    /// tree, so the following records might be extended arguments.
+    UnknownArityCallee { node: usize, callee: u16 },
+}
+
+impl UnsupportedHeaderReason {
+    /// The callee tree ID when the reason is an inline call, else `None`.
+    #[must_use]
+    pub fn callee(&self) -> Option<u16> {
+        match self {
+            Self::ExtendedArityCallee { callee, .. } | Self::UnknownArityCallee { callee, .. } => {
+                Some(*callee)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// `global`, `private`, or `semi-global` for a callee tree ID, following
+/// `sims_vm::interpreter::behavior_from_owner`.
 #[must_use]
-pub fn lift_bhav_structured_with_context(
+pub fn callee_scope_name(id: u16) -> &'static str {
+    match id {
+        0..=255 => "primitive",
+        256..=4095 => "global",
+        4096..=8191 => "private",
+        _ => "semi-global",
+    }
+}
+
+impl std::fmt::Display for UnsupportedHeaderReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Format(format) => write!(f, "unsupported BHAV format {format:#06x}"),
+            Self::TooManyInstructions(n) => write!(f, "{n} instructions (max 251)"),
+            Self::IndexedEntry => write!(f, "kind 4 indexed multi-entry tree"),
+            Self::TargetOutOfBounds { node, target } => {
+                write!(f, "node {node} branches to out-of-bounds node {target}")
+            }
+            Self::ExtendedArityCallee {
+                node,
+                callee,
+                arity,
+            } => write!(
+                f,
+                "node {node} calls {} tree {callee} with inline operands and {arity} args (>4 reads following records)",
+                callee_scope_name(*callee)
+            ),
+            Self::UnknownArityCallee { node, callee } => write!(
+                f,
+                "node {node} calls {} tree {callee} with inline operands but its arity is unknown",
+                callee_scope_name(*callee)
+            ),
+        }
+    }
+}
+
+struct Precheck {
+    max_args: usize,
+    max_locals: usize,
+    reachable: Vec<bool>,
+}
+
+/// Explains why structured lifting would refuse `chunk` as an unsupported header or
+/// target, or returns `Ok(())` when the header/target/callee-arity checks pass (the tree
+/// may still be [`StructuredLiftOutcome::Unstructured`]).
+pub fn structured_lift_header_check(
     chunk: &BhavChunk,
-    opts: LiftOptions,
     callee_arities: Option<&BTreeMap<u16, usize>>,
-    symbols: Option<&LiftSymbols>,
-) -> StructuredLiftOutcome {
+) -> Result<(), UnsupportedHeaderReason> {
+    structured_lift_precheck(chunk, callee_arities).map(|_| ())
+}
+
+fn structured_lift_precheck(
+    chunk: &BhavChunk,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+) -> Result<Precheck, UnsupportedHeaderReason> {
     let Some((max_args, max_locals)) = format_limits(chunk.format) else {
-        return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
+        return Err(UnsupportedHeaderReason::Format(chunk.format));
     };
     let n = chunk.instructions.len();
     if n > 251 {
-        return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
+        return Err(UnsupportedHeaderReason::TooManyInstructions(n));
     }
-    let eff_args = if chunk.format == 0x8000 {
-        chunk.args
-    } else {
-        usize::from(chunk.args).min(max_args) as u8
-    };
-    // Match `sims_vm::interpreter::dimensions`: the local count is truncated to a byte (`locals as u8`).
-    let eff_locals = usize::from(chunk.locals as u8).min(max_locals) as u16;
 
     // Indexed-entry trees (kind 4) can enter at caller-selected PCs (`interpreter.rs:1786`),
     // so renumbering or pruning unreachable-from-0 nodes would alter semantics.
     if chunk.kind == 4 {
-        return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
+        return Err(UnsupportedHeaderReason::IndexedEntry);
     }
-
-    // Header (preserves exact format, kind, effective args/locals, revision with clean placeholder label).
-    let header = format!(
-        "tree {} \"Tree_{}\" (format: {:#06x}, kind: {}, args: {}, locals: {}, revision: {:#010x}) {{\n",
-        chunk.id, chunk.id, chunk.format, chunk.kind, eff_args, eff_locals, chunk.revision
-    );
-
     if n == 0 {
-        return StructuredLiftOutcome::Lifted(format!("{header}}}\n"));
+        return Ok(Precheck {
+            max_args,
+            max_locals,
+            reachable: Vec::new(),
+        });
     }
 
     // 1. Discover reachable nodes from node 0 and validate all targets.
@@ -1840,7 +1919,10 @@ pub fn lift_bhav_structured_with_context(
             if !matches!(t, TARGET_ERROR..=TARGET_FALSE) {
                 let next = usize::from(t);
                 if next >= n {
-                    return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
+                    return Err(UnsupportedHeaderReason::TargetOutOfBounds {
+                        node: idx,
+                        target: t,
+                    });
                 }
                 if !reachable[next] {
                     reachable[next] = true;
@@ -1862,15 +1944,65 @@ pub fn lift_bhav_structured_with_context(
         if ins.opcode >= 256 && ins.operands != [0xFF; 8] {
             match callee_arities.and_then(|m| m.get(&ins.opcode).copied()) {
                 Some(arity) if arity <= 4 => {}
-                Some(_) => {
-                    return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
+                Some(arity) => {
+                    return Err(UnsupportedHeaderReason::ExtendedArityCallee {
+                        node: idx,
+                        callee: ins.opcode,
+                        arity,
+                    });
                 }
                 None if n > 1 => {
-                    return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
+                    return Err(UnsupportedHeaderReason::UnknownArityCallee {
+                        node: idx,
+                        callee: ins.opcode,
+                    });
                 }
                 None => {}
             }
         }
+    }
+    Ok(Precheck {
+        max_args,
+        max_locals,
+        reachable,
+    })
+}
+
+/// Structured `.air` lifter parameterized by [`LiftOptions`], optional `callee_arities`,
+/// and optional in-memory [`LiftSymbols`] for trailing readability comments.
+#[must_use]
+pub fn lift_bhav_structured_with_context(
+    chunk: &BhavChunk,
+    opts: LiftOptions,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+    symbols: Option<&LiftSymbols>,
+) -> StructuredLiftOutcome {
+    let precheck = match structured_lift_precheck(chunk, callee_arities) {
+        Ok(p) => p,
+        Err(_) => return StructuredLiftOutcome::UnsupportedHeaderOrTarget,
+    };
+    let Precheck {
+        max_args,
+        max_locals,
+        reachable,
+    } = precheck;
+    let n = chunk.instructions.len();
+    let eff_args = if chunk.format == 0x8000 {
+        chunk.args
+    } else {
+        usize::from(chunk.args).min(max_args) as u8
+    };
+    // Match `sims_vm::interpreter::dimensions`: the local count is truncated to a byte (`locals as u8`).
+    let eff_locals = usize::from(chunk.locals as u8).min(max_locals) as u16;
+
+    // Header (preserves exact format, kind, effective args/locals, revision with clean placeholder label).
+    let header = format!(
+        "tree {} \"Tree_{}\" (format: {:#06x}, kind: {}, args: {}, locals: {}, revision: {:#010x}) {{\n",
+        chunk.id, chunk.id, chunk.format, chunk.kind, eff_args, eff_locals, chunk.revision
+    );
+
+    if n == 0 {
+        return StructuredLiftOutcome::Lifted(format!("{header}}}\n"));
     }
 
     // 2. Lift every reachable instruction (using inline `op 0xNNNN (...)` per instruction
