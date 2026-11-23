@@ -17,11 +17,11 @@ use crate::art::{Art, KEY};
 use crate::command::Command;
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
-use crate::household::{Careers, Faces, Fame};
+use crate::household::{Acquaintances, Careers, Faces, Fame};
 use crate::hud::{LABEL, rgb565};
 use crate::thumbnail::Thumbnails;
 use crate::{Error, Result};
-use sims_content::ui_graphics::US_ENGLISH;
+use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{Catalog, Index, Install};
 use sims_formats::bitmap::{self, Image};
 use sims_formats::iff::Iff;
@@ -267,7 +267,7 @@ pub struct FamilyInfo {
 /// Optional cached UI context passed into [`Message::read_with_context`] so
 /// ordinary VM dialogs (`0..=4`) resolve `$Me`/`$Object`/`$Neighbor`/`$Job`/
 /// `$FameTitleLocal`/`$Family`/`$FamilyAssets` tokens and icon modes `0, 2`
-/// without re-reading character or career archives from disk.
+/// and 4 without re-reading character or career archives from disk.
 #[derive(Default)]
 pub struct DialogContext<'a> {
     pub faces: Option<&'a Faces>,
@@ -276,6 +276,14 @@ pub struct DialogContext<'a> {
     pub careers: Option<&'a Careers>,
     pub fame: Option<&'a Fame>,
     pub families: Option<&'a std::collections::BTreeMap<i32, FamilyInfo>>,
+    /// The UI bitmaps a `gz`/`gzi` named icon asks for when `art` lacks
+    /// them.
+    pub ui: Option<&'a UiGraphics>,
+    /// Who the selected Sim knows, for a `rel` named icon.
+    pub known: Option<&'a Acquaintances>,
+    /// The household's members, as [`crate::household::Snapshot::read`]
+    /// takes them, for a `rel` named icon.
+    pub members: &'a [u32],
 }
 
 /// OBJD byte offsets used when resolving object display names and portraits.
@@ -577,6 +585,169 @@ fn resolve_guid_icon(
         return Some(portrait);
     }
     resolve_object_icon(guid, index, catalog, thumbnails, art)
+}
+
+/// What a named dialog icon asks for: icon mode 4's formatted string
+/// operand 1, read at 0x436536..0x436933 when nothing set the icon yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedIcon {
+    /// `gz N` and `gzi N`: UI bitmap N (0x4368b6, loaded by 0x5a578d).
+    /// A category of two letters keeps only the first quarter of the
+    /// width, a button strip's first cell (0x4368ff); `gzi` keeps it all.
+    Global { id: i32, button_cell: bool },
+    /// `my N`: `BMP_` N in the caller's own file (0x43665a..0x43669e,
+    /// 0x5a5752), whole.
+    Mine(i32),
+    /// `guid N`: the catalog picture of type N (0x4366d8..0x436728:
+    /// 0x43ac10, its picture at +0x84, 45 by 45).
+    Type(u32),
+    /// `rel`: the third of the five faces of the person the selected Sim's
+    /// relationship list starts with (0x436762..0x436816: 0x4e986d,
+    /// 0x4e9deb listing everyone, 0x4e94a4). The number is not read.
+    Relation,
+    /// `job N`: row N of the 22 job pictures; -1 is the school's row 11
+    /// (0x436850..0x4368b4, 0x530a7b).
+    Job(i32),
+}
+
+/// Reads a named icon the way 0x436552..0x436850 does:
+///
+/// - The text is split at its first space into a category and a number.
+///   Every later space is dropped, so `gz 4 5 0 0` reads 4500, and the
+///   string ends at a NUL.
+/// - The category is compared without ASCII case (0x46f891).
+/// - The number is the CRT's `atol` (0x636029 → 0x635f9e): leading
+///   white space, a sign, then digits, wrapping on overflow.
+/// - An unknown category, or a `gz`, `gzi` or `my` number of 0, shows
+///   nothing.
+pub fn named_icon(text: &str) -> Option<NamedIcon> {
+    let mut category = Vec::new();
+    let mut number = Vec::new();
+    let mut second = false;
+    for &byte in text.as_bytes().iter().take_while(|&&b| b != 0) {
+        if byte == b' ' {
+            second = true;
+        } else if second {
+            number.push(byte);
+        } else {
+            category.push(byte);
+        }
+    }
+    let atol = || {
+        let digits = number
+            .iter()
+            .position(|b| !matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+            .map_or(&[][..], |at| &number[at..]);
+        let (negative, digits) = match digits.first() {
+            Some(b'-') => (true, &digits[1..]),
+            Some(b'+') => (false, &digits[1..]),
+            _ => (false, digits),
+        };
+        let value = digits
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .fold(0u32, |n, d| {
+                n.wrapping_mul(10).wrapping_add(u32::from(d - b'0'))
+            });
+        (if negative { value.wrapping_neg() } else { value }) as i32
+    };
+    let is = |name: &str| category.eq_ignore_ascii_case(name.as_bytes());
+    if is("gz") || is("gzi") {
+        let id = atol();
+        (id != 0).then_some(NamedIcon::Global {
+            id,
+            button_cell: category.len() == 2,
+        })
+    } else if is("my") {
+        let id = atol();
+        (id != 0).then_some(NamedIcon::Mine(id))
+    } else if is("guid") {
+        Some(NamedIcon::Type(atol() as u32))
+    } else if is("rel") {
+        Some(NamedIcon::Relation)
+    } else if is("job") {
+        Some(NamedIcon::Job(atol()))
+    } else {
+        None
+    }
+}
+
+/// The job pictures' row for `job` (0x530a7b): -1, the school, is row
+/// 11, and only 0 to 21 name a row.
+pub fn job_row(job: i32) -> Option<u32> {
+    let row = if job == -1 { 11 } else { job };
+    u32::try_from(row).ok().filter(|&row| row < 22)
+}
+
+/// The picture a named icon shows, or None where the original shows none.
+fn resolve_named_icon(
+    named: NamedIcon,
+    caller_guid: u32,
+    world: &World,
+    index: &Index,
+    catalog: &Catalog,
+    ctx: &mut DialogContext<'_>,
+) -> Option<Image> {
+    match named {
+        NamedIcon::Global { id, button_cell } => {
+            let image = match ctx.art.and_then(|art| art.image(id)) {
+                Some(image) => image.clone(),
+                None => ctx.ui?.bitmap(id, US_ENGLISH).ok()??,
+            };
+            global_picture(image, button_cell)
+        }
+        NamedIcon::Mine(id) => {
+            let id = u16::try_from(id).ok()?;
+            let object = catalog.object(caller_guid)?;
+            let iff = Iff::parse(index.resources.get(object.resource)?.read().ok()?).ok()?;
+            let mut image = bitmap::bmp(iff.data(iff.get(b"BMP_", id)?)).ok()?;
+            image.key(KEY);
+            Some(image)
+        }
+        NamedIcon::Type(guid) => {
+            catalog.object(guid)?;
+            resolve_object_icon(guid, index, catalog, ctx.thumbnails.as_deref_mut(), ctx.art)
+        }
+        NamedIcon::Relation => {
+            let known = ctx.known?;
+            let selected = world.objects.get(&world.selected()?)?;
+            let first = crate::household::first_relation(world, selected.guid, ctx.members, known)?;
+            let moods = match ctx.faces.and_then(|f| f.moods(first)) {
+                Some(moods) => moods.clone(),
+                None => {
+                    let object = catalog.object(first)?;
+                    let iff =
+                        Iff::parse(index.resources.get(object.resource)?.read().ok()?).ok()?;
+                    let mut image =
+                        bitmap::bmp(iff.data(iff.get(b"BMP_", crate::household::MOODS)?)).ok()?;
+                    image.key(KEY);
+                    image
+                }
+            };
+            let width = moods.width / 5;
+            moods.crop(2 * width, 0, width, moods.height)
+        }
+        NamedIcon::Job(job) => job_picture(ctx.art?, job),
+    }
+}
+
+/// A `gz`/`gzi` bitmap keyed (0x436928) and, for `gz`, cut to its first
+/// quarter (0x4368ff..0x43690f).
+fn global_picture(mut image: Image, button_cell: bool) -> Option<Image> {
+    image.key(KEY);
+    if button_cell {
+        image = image.crop(0, 0, image.width / 4, image.height)?;
+    }
+    Some(image)
+}
+
+/// Row [`job_row`] of the job pictures (`kJobPopupComposite`), the
+/// height split evenly in 22 (0x530a95..0x530ad4).
+fn job_picture(art: &Art, job: i32) -> Option<Image> {
+    let row = job_row(job)?;
+    let image = art.image(crate::hud::id::JOB_POPUP)?;
+    let height = image.height / 22;
+    image.crop(0, height * row, image.width, height)
 }
 
 /// Parses optional `:N` and `:M` integer suffixes after a `$Local` / `$TimeLocal`
@@ -1266,7 +1437,8 @@ impl Message {
         //   never checking `world.objects` first, else None.
         // - mode 3: custom `BMP_` (`1000 + operands[1]`, loaded in `from_file`).
         // - mode 4: formats `operands[1]` text (`0x436297..0x4362c0`, discarding
-        //   portrait out-param) and leaves `msg.icon = None`.
+        //   portrait out-param) and reads it as a named icon
+        //   (`0x436536..0x436933`, [`named_icon`]).
         let icon_mode = (dialog.operands[7] >> 1) & 7;
         let stack_object = caller_obj.stack.last().map_or(0, |f| f.stack_object);
         let stack_obj_guid = u16::try_from(stack_object)
@@ -1305,7 +1477,7 @@ impl Message {
                             .filter(|s| !s.is_empty())
                     {
                         let mut ignored = None;
-                        let _ = format_dialog_text(
+                        let named = format_dialog_text(
                             op1_str,
                             dialog.caller,
                             world,
@@ -1317,8 +1489,17 @@ impl Message {
                             ctx.families,
                             &mut ignored,
                         );
+                        msg.icon = named_icon(&named).and_then(|named| {
+                            resolve_named_icon(
+                                named,
+                                caller_obj.guid,
+                                world,
+                                index,
+                                catalog,
+                                &mut *ctx,
+                            )
+                        });
                     }
-                    msg.icon = None;
                 }
                 _ => {}
             }
@@ -3464,6 +3645,86 @@ pub fn press_with_state(layout: &Layout, point: [i32; 2], state: &DialogState) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0x436552..0x436850: the split, the case, `atol` and the six
+    /// categories, from the instructions.
+    #[test]
+    fn a_named_icon_reads_its_category_and_number() {
+        for (text, id, button_cell) in [
+            ("gz 4500", 4500, true),
+            ("GZ 4 5 0 0", 4500, true),
+            ("gzi 4500", 4500, false),
+            ("GzI \t+4500tail", 4500, false),
+            ("gz -1", -1, true),
+            ("gz 4294967297", 1, true),
+            ("gz  4500", 4500, true),
+        ] {
+            assert_eq!(
+                named_icon(text),
+                Some(NamedIcon::Global { id, button_cell }),
+                "{text}"
+            );
+        }
+        // No category the original knows, or a number of 0: no icon. A tab
+        // is no separator, and a NUL ends the string.
+        for text in [
+            "", "gz", "gzi zero", "gz 0", "gz 4294967296", "gz\t4500", "pic 5", "my 0",
+            "gz\0 4500",
+        ] {
+            assert_eq!(named_icon(text), None, "{text}");
+        }
+        assert_eq!(named_icon("My 5001"), Some(NamedIcon::Mine(5001)));
+        assert_eq!(
+            named_icon("guid 0x10"),
+            Some(NamedIcon::Type(0)),
+            "atol stops at the x"
+        );
+        assert_eq!(
+            named_icon("GUID -1"),
+            Some(NamedIcon::Type(u32::MAX))
+        );
+        assert_eq!(named_icon("rel"), Some(NamedIcon::Relation));
+        assert_eq!(named_icon("REL 7"), Some(NamedIcon::Relation));
+        for (text, job) in [("JOB -1", -1), ("job", 0), ("Job 2 1", 21), ("job 22", 22)] {
+            assert_eq!(named_icon(text), Some(NamedIcon::Job(job)), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_job_icon_is_one_of_22_rows_and_school_is_row_11() {
+        assert_eq!(job_row(-1), Some(11));
+        assert_eq!(job_row(0), Some(0));
+        assert_eq!(job_row(21), Some(21));
+        assert_eq!(job_row(22), None);
+        assert_eq!(job_row(-2), None);
+        let mut art = Art::default();
+        let mut strip = Image {
+            width: 84,
+            height: 22 * 63,
+            rgba: vec![0; 84 * 22 * 63 * 4],
+        };
+        // Mark row 11's first pixel.
+        let at = (11 * 63 * 84 * 4) as usize;
+        strip.rgba[at..at + 4].copy_from_slice(&[1, 2, 3, 255]);
+        art.insert(crate::hud::id::JOB_POPUP, strip);
+        let school = job_picture(&art, -1).unwrap();
+        assert_eq!((school.width, school.height), (84, 63));
+        assert_eq!(&school.rgba[..4], &[1, 2, 3, 255]);
+        assert!(job_picture(&art, 22).is_none());
+    }
+
+    #[test]
+    fn a_gz_icon_keeps_the_first_quarter_and_gzi_all_of_it() {
+        let strip = Image {
+            width: 260,
+            height: 33,
+            rgba: vec![255; 260 * 33 * 4],
+        };
+        let cell = global_picture(strip.clone(), true).unwrap();
+        assert_eq!((cell.width, cell.height), (65, 33));
+        let whole = global_picture(strip, false).unwrap();
+        assert_eq!((whole.width, whole.height), (260, 33));
+    }
 
     #[test]
     fn the_frame_is_mitred_and_filled() {

@@ -1209,6 +1209,20 @@ fn person_data(world: &World, guid: u32) -> Option<&[i16]> {
         .or_else(|| world.neighbors.first_of(guid).map(|r| r.data.as_slice()))
 }
 
+/// The person `guid`'s Sim's relationship list starts with, in the
+/// panel's order ([`relations`]): what a `rel` dialog icon shows
+/// (0x436762..0x4367ae takes the first of 0x4e9deb's sorted list).
+pub fn first_relation(
+    world: &World,
+    guid: u32,
+    members: &[u32],
+    known: &Acquaintances,
+) -> Option<u32> {
+    relations(world, guid, members, known)
+        .first()
+        .map(|relation| relation.guid)
+}
+
 fn relations(world: &World, guid: u32, members: &[u32], known: &Acquaintances) -> Vec<Relation> {
     let friendship = known.friendship;
     let neighbors = &world.neighbors;
