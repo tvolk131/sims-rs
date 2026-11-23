@@ -53,6 +53,13 @@ pub const GUARANTEED_ATTRIBUTES: usize = 8;
 /// exception policy (`expression.rs:206`); outside the native error-code range.
 const NEGATIVE_SQRT: u16 = 0xFFFF;
 
+/// Native error for a branch target or instruction index past node 250
+/// (`interpreter.rs:766`, `interpreter.rs:1695`).
+const INVALID_NODE: u16 = 0x44c;
+
+/// The last node index a tree can run (`interpreter.rs:29`).
+const LAST_NODE: usize = 250;
+
 /// Temps every object has (`sims-vm/src/memory.rs:438`).
 const TEMP_COUNT: i16 = 8;
 
@@ -98,6 +105,12 @@ pub struct LiveOptions {
     /// (`interpreter.rs:1195`); scripts that never read a local before writing it
     /// cannot observe them.
     pub observe_frame_residue: bool,
+    /// Compare the thread's last branch result where something reads it: at exit
+    /// (popping the frame of the tree an action started records it in the person's
+    /// last action, `object_uses.rs:246`) and before primitives, which may start a tree
+    /// that reads it (`found_action.rs:102`, `idle.rs:187`). Two trees that return the
+    /// same value from differently-worded final tests differ here.
+    pub observe_last_result: bool,
 }
 
 impl Default for LiveOptions {
@@ -108,6 +121,7 @@ impl Default for LiveOptions {
             max_pair_checks: 250_000,
             observe_scratch_pointer: true,
             observe_frame_residue: false,
+            observe_last_result: true,
         }
     }
 }
@@ -178,11 +192,14 @@ enum EventKind {
         inline_args: Vec<u8>,
         /// The whole instruction suffix after a call whose callee arity is unknown.
         unknown_arity_suffix: Option<Vec<u8>>,
-        /// `(params, locals)` of the running frame, for primitives that push a frame:
-        /// frame storage is one word stack, so a callee's frame starts after this one
-        /// and its initial locals are whatever an earlier frame left there
+        /// The called tree's argument count in this side's file, for subroutine calls.
+        callee_arity: Option<usize>,
+        /// `(params, locals)` of the running frame. Frame storage is one word stack,
+        /// so a tree the primitive runs (a call, or a callback such as a routing door
+        /// tree or Idle For Input's interaction) starts after this frame and its
+        /// initial locals are whatever an earlier frame left there
         /// (`interpreter.rs:1195`).
-        caller_frame: Option<(usize, usize)>,
+        caller_frame: (usize, usize),
     },
     /// An `Expression` read of an untracked operand.
     Read {
@@ -203,14 +220,15 @@ enum EventKind {
 /// A frame slot a primitive reads or writes, with what the checker knows about it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum FrameVal {
-    /// A read of `param`/`local` `idx`: its value, or `None` when out of the frame.
-    Read(u8, i16, Option<Val>),
+    /// A read of `param`/`local` `idx`: its value (`None` when out of the frame), and
+    /// whether it is a local the tree may not have written yet.
+    Read(u8, i16, Option<Val>, bool),
     /// A destination `param`/`local` `idx` and whether it is inside the frame.
     Dst(u8, i16, bool),
-    /// Every local (text formatting `$Local` tokens).
-    AllLocals(Vec<Val>),
-    /// Every parameter and local (unmodeled primitive).
-    WholeFrame(Vec<Val>, Vec<Val>),
+    /// Every local, and which may be unwritten (text formatting `$Local` tokens).
+    AllLocals(Vec<Val>, Vec<bool>),
+    /// Every parameter and local, and which locals may be unwritten (unmodeled primitive).
+    WholeFrame(Vec<Val>, Vec<Val>, Vec<bool>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -221,6 +239,8 @@ struct LiveEvent {
     epoch: u32,
     store: Vec<(Cell, Val)>,
     scratch: Option<Scratch>,
+    /// The thread's last branch result before a primitive (`None` inside: entry value).
+    last_result: Option<Option<bool>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -268,11 +288,31 @@ impl Interner {
         &self.sym_keys[id as usize]
     }
 
-    fn is_leaf(&self, v: Val) -> bool {
-        match v {
-            Val::Const(_) => false,
-            Val::Sym(id) => self.key(id).is_leaf(),
+    /// Whether symbol `id` is an input the checker may pick freely: a value the tree
+    /// starts from, or a read before any primitive ran. Values a primitive produced or
+    /// may have changed can be constrained by what the primitive does (a `Random` result
+    /// is below its bound), so a difference in them is only a possible one.
+    fn is_input(&self, id: u32) -> bool {
+        match self.key(id) {
+            SymKey::InitParam(_) | SymKey::InitLocal(_) | SymKey::Cell(0, _) => true,
+            SymKey::EventValue(prefix) => !self.history(*prefix).iter().any(|node| {
+                matches!(
+                    node,
+                    PrefixNode::Event(
+                        _,
+                        LiveEvent {
+                            kind: EventKind::Primitive { .. } | EventKind::Write { .. },
+                            ..
+                        }
+                    )
+                )
+            }),
+            _ => false,
         }
+    }
+
+    fn is_input_val(&self, v: Val) -> bool {
+        matches!(v, Val::Sym(id) if self.is_input(id))
     }
 
     fn prefix(&mut self, node: PrefixNode) -> u32 {
@@ -301,6 +341,12 @@ impl Interner {
     }
 
     fn describe(&self, v: Val) -> String {
+        self.describe_depth(v, 0)
+    }
+
+    /// Renders `v`, cutting operator terms off below a few levels: terms share
+    /// subterms, so a loop that doubles a value would otherwise print exponentially.
+    fn describe_depth(&self, v: Val, depth: usize) -> String {
         match v {
             Val::Const(c) => c.to_string(),
             Val::Sym(id) => match self.key(id) {
@@ -310,9 +356,12 @@ impl Interner {
                 SymKey::Cell(p, Cell::Attr(i)) => format!("my.attr[{i}]@epoch{p}"),
                 SymKey::EventValue(p) => format!("read#{p}"),
                 SymKey::FrameMaybe(p, s, i, _) => format!("frame({s},{i})@event{p}"),
-                SymKey::Op(op, a, b) => {
-                    format!("({} op{op} {})", self.describe(*a), self.describe(*b))
-                }
+                SymKey::Op(..) if depth >= 3 => format!("t{id}"),
+                SymKey::Op(op, a, b) => format!(
+                    "({} op{op} {})",
+                    self.describe_depth(*a, depth + 1),
+                    self.describe_depth(*b, depth + 1)
+                ),
             },
         }
     }
@@ -504,7 +553,7 @@ fn feasibility(conds: &[&[(Atom, bool)]], interner: &Interner) -> Feasibility {
                             .entry(sym)
                             .or_insert_with(Range::full)
                             .apply(atom, value, sym);
-                        if !interner.key(sym).is_leaf() {
+                        if !interner.is_input(sym) {
                             exact = false;
                         }
                     }
@@ -557,7 +606,10 @@ struct Outputs {
     epoch: u32,
     store: Vec<(Cell, Val)>,
     scratch: Option<Scratch>,
-    residue: Option<(Vec<Val>, Vec<Val>)>,
+    /// The last branch result at exit (`Some(None)`: the caller's, nothing ran).
+    last_result: Option<Option<bool>>,
+    /// Final parameters, locals, and which locals may be unwritten.
+    residue: Option<(Vec<Val>, Vec<Val>, Vec<bool>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -580,6 +632,11 @@ struct PathState {
     locals: Vec<Val>,
     store: BTreeMap<Cell, Val>,
     scratch: Scratch,
+    /// The thread's last branch result (`None`: still the caller's).
+    last_result: Option<bool>,
+    /// Locals the tree may not have written yet. Reading one can fail in the VM when
+    /// it starts as half of a pointer an earlier frame left (`interpreter.rs:1277`).
+    unwritten: Vec<bool>,
     cond: Vec<(Atom, bool)>,
     steps: usize,
     nodes: Vec<u8>,
@@ -643,6 +700,8 @@ impl Explorer<'_> {
             locals,
             store: BTreeMap::new(),
             scratch: Scratch::Inherited,
+            last_result: None,
+            unwritten: vec![true; self.locals],
             cond: Vec::new(),
             steps: 0,
             nodes: Vec::new(),
@@ -673,10 +732,16 @@ impl Explorer<'_> {
 
     fn finish(&self, state: PathState, exit: Exit, interner: &mut Interner) -> Step {
         let store = self.normalized_store(&state, interner);
-        let residue = self
-            .opts
-            .observe_frame_residue
-            .then(|| (state.params.clone(), state.locals.clone()));
+        let residue = self.opts.observe_frame_residue.then(|| {
+            (
+                state.params.clone(),
+                state.locals.clone(),
+                state.unwritten.clone(),
+            )
+        });
+        // A trap leaves the thread; what it last branched on is not read.
+        let last_result = (self.opts.observe_last_result && !matches!(exit, Exit::Trap(_)))
+            .then_some(state.last_result);
         Step::Done(PathSummary {
             out: Outputs {
                 exit,
@@ -684,6 +749,7 @@ impl Explorer<'_> {
                 epoch: state.epoch,
                 store,
                 scratch: self.opts.observe_scratch_pointer.then_some(state.scratch),
+                last_result,
                 residue,
             },
             cond: state.cond,
@@ -708,6 +774,13 @@ impl Explorer<'_> {
             TARGET_TRUE => return Ok(vec![self.finish(state, Exit::True, interner)]),
             TARGET_FALSE => return Ok(vec![self.finish(state, Exit::False, interner)]),
             TARGET_ERROR => return Ok(vec![self.finish(state, Exit::Error, interner)]),
+            // Targets past the last node index (250) other than the three exits are
+            // invalid, whatever the tree's length (`interpreter.rs:1695`).
+            251..=252 => {
+                return Ok(vec![
+                    self.finish(state, Exit::Trap(INVALID_NODE), interner),
+                ]);
+            }
             _ => {}
         }
         let Some(ins) = self.bhav.instructions.get(usize::from(pc)) else {
@@ -808,6 +881,7 @@ impl Explorer<'_> {
         state: &PathState,
         kind: EventKind,
         frame: Vec<FrameVal>,
+        last_result: Option<Option<bool>>,
         interner: &mut Interner,
     ) -> u32 {
         let (store, scratch) = self.snapshot(state, interner);
@@ -817,6 +891,7 @@ impl Explorer<'_> {
             epoch: state.epoch,
             store,
             scratch,
+            last_result,
         };
         interner.prefix(PrefixNode::Event(state.prefix, event))
     }
@@ -833,6 +908,7 @@ impl Explorer<'_> {
         if let Loc::Trap(code) = loc {
             return Ok(Err(code));
         }
+        self.note_unwritten_read(state, loc, scope, idx, interner);
         if let Some(v) = self.tracked(state, loc, interner) {
             return Ok(Ok(v));
         }
@@ -847,16 +923,47 @@ impl Explorer<'_> {
                 indirect,
             },
             Vec::new(),
+            None,
             interner,
         );
         state.prefix = prefix;
         Ok(Ok(interner.sym(SymKey::EventValue(prefix))))
     }
 
+    /// Records the read of a local the tree may not have written yet as an event: the
+    /// VM can fail reading it (`interpreter.rs:1277`), so it is not a pure read.
+    fn note_unwritten_read(
+        &self,
+        state: &mut PathState,
+        loc: Loc,
+        scope: u8,
+        idx: i16,
+        interner: &mut Interner,
+    ) {
+        if let Loc::Local(i) = loc
+            && state.unwritten[i]
+        {
+            state.prefix = self.record(
+                state,
+                EventKind::Read {
+                    scope,
+                    idx,
+                    indirect: None,
+                },
+                Vec::new(),
+                None,
+                interner,
+            );
+        }
+    }
+
     fn write(&self, state: &mut PathState, loc: Loc, val: Val) {
         match loc {
             Loc::Param(i) => state.params[i] = val,
-            Loc::Local(i) => state.locals[i] = val,
+            Loc::Local(i) => {
+                state.locals[i] = val;
+                state.unwritten[i] = false;
+            }
             Loc::Tracked(cell) => {
                 state.store.insert(cell, val);
             }
@@ -899,25 +1006,32 @@ impl Explorer<'_> {
         }
     }
 
-    fn branch(&self, state: PathState, atom: Atom, on_true: u8, on_false: u8, out: &mut Vec<Step>) {
+    /// Continues at `on_true` where `atom` holds and `on_false` where it does not. The
+    /// instruction's own result (`last_result`) is the atom's value, negated for the
+    /// `>=`, `<=` and `!=` tests, which take their false branch when the atom holds.
+    fn branch(
+        &self,
+        state: PathState,
+        atom: Atom,
+        on_true: u8,
+        on_false: u8,
+        negated: bool,
+        out: &mut Vec<Step>,
+    ) {
+        let go = |mut s: PathState, value: bool| {
+            s.pc = if value { on_true } else { on_false };
+            s.last_result = Some(value != negated);
+            Step::Continue(s)
+        };
         match decide(&state.cond, atom) {
-            Some(true) => out.push(Step::Continue(PathState {
-                pc: on_true,
-                ..state
-            })),
-            Some(false) => out.push(Step::Continue(PathState {
-                pc: on_false,
-                ..state
-            })),
+            Some(value) => out.push(go(state, value)),
             None => {
                 let mut t = state.clone();
                 t.cond.push((atom, true));
-                t.pc = on_true;
-                out.push(Step::Continue(t));
+                out.push(go(t, true));
                 let mut f = state;
                 f.cond.push((atom, false));
-                f.pc = on_false;
-                out.push(Step::Continue(f));
+                out.push(go(f, false));
             }
         }
     }
@@ -956,13 +1070,13 @@ impl Explorer<'_> {
                 Ok(v) => v,
                 Err(code) => return Ok(vec![self.finish(state, Exit::Trap(code), interner)]),
             };
-            let (atom, t, f) = match op {
-                0 => (Atom::Lt(rhs, lhs), ins.on_true, ins.on_false),
-                1 => (Atom::Lt(lhs, rhs), ins.on_true, ins.on_false),
-                2 => (eq_atom(lhs, rhs), ins.on_true, ins.on_false),
-                14 => (Atom::Lt(lhs, rhs), ins.on_false, ins.on_true),
-                15 => (Atom::Lt(rhs, lhs), ins.on_false, ins.on_true),
-                16 => (eq_atom(lhs, rhs), ins.on_false, ins.on_true),
+            let (atom, t, f, negated) = match op {
+                0 => (Atom::Lt(rhs, lhs), ins.on_true, ins.on_false, false),
+                1 => (Atom::Lt(lhs, rhs), ins.on_true, ins.on_false, false),
+                2 => (eq_atom(lhs, rhs), ins.on_true, ins.on_false, false),
+                14 => (Atom::Lt(lhs, rhs), ins.on_false, ins.on_true, true),
+                15 => (Atom::Lt(rhs, lhs), ins.on_false, ins.on_true, true),
+                16 => (eq_atom(lhs, rhs), ins.on_false, ins.on_true, true),
                 _ => {
                     // Flag test: the flag index must be 0..=16 (`expression.rs:139`).
                     let Some(s) = self.guard(
@@ -986,10 +1100,10 @@ impl Explorer<'_> {
                         return Ok(out);
                     };
                     state = s;
-                    (Atom::Flag(lhs, rhs), ins.on_true, ins.on_false)
+                    (Atom::Flag(lhs, rhs), ins.on_true, ins.on_false, false)
                 }
             };
-            self.branch(state, atom, t, f, &mut out);
+            self.branch(state, atom, t, f, negated, &mut out);
             return Ok(out);
         }
 
@@ -1005,6 +1119,7 @@ impl Explorer<'_> {
                     rhs,
                 },
                 Vec::new(),
+                None,
                 interner,
             );
             state.prefix = prefix;
@@ -1015,12 +1130,14 @@ impl Explorer<'_> {
                     s.cond.push((Atom::Outcome(prefix), value));
                     Self::havoc_shared(&mut s);
                     s.scratch = Scratch::Expression;
+                    s.last_result = Some(value);
                     s.pc = if value { ins.on_true } else { ins.on_false };
                     out.push(Step::Continue(s));
                 }
             } else {
                 Self::havoc_shared(&mut state);
                 state.scratch = Scratch::Expression;
+                state.last_result = Some(true);
                 state.pc = ins.on_true;
                 out.push(Step::Continue(state));
             }
@@ -1028,6 +1145,11 @@ impl Explorer<'_> {
         }
 
         let writable = !matches!(lhs_loc, Loc::Literal(_));
+        // `=` and square root mark a local written before reading it (`expression.rs:75`);
+        // the other operators read it first.
+        if !matches!(op, 5 | 20) {
+            self.note_unwritten_read(&mut state, lhs_loc, lhs_scope, lhs_idx, interner);
+        }
         let lhs = self
             .tracked(&state, lhs_loc, interner)
             .expect("tracked left operand");
@@ -1044,7 +1166,7 @@ impl Explorer<'_> {
             } else {
                 Atom::Lt(rhs, value)
             };
-            self.branch(state, atom, ins.on_true, ins.on_false, &mut out);
+            self.branch(state, atom, ins.on_true, ins.on_false, false, &mut out);
             return Ok(out);
         }
 
@@ -1118,6 +1240,7 @@ impl Explorer<'_> {
         }
         let value = mk_op(op, lhs, rhs, interner);
         self.write(&mut state, lhs_loc, value);
+        state.last_result = Some(true);
         state.pc = ins.on_true;
         out.push(Step::Continue(state));
         Ok(out)
@@ -1162,13 +1285,16 @@ impl Explorer<'_> {
 
         let mut inline_args = Vec::new();
         let mut unknown_arity_suffix = None;
+        let callee_arity = (ins.opcode >= 256)
+            .then(|| {
+                self.ctx
+                    .callee_arities
+                    .as_ref()
+                    .and_then(|m| m.get(&ins.opcode).copied())
+            })
+            .flatten();
         if ins.opcode >= 256 && *ops != [0xFF; 8] {
-            match self
-                .ctx
-                .callee_arities
-                .as_ref()
-                .and_then(|m| m.get(&ins.opcode).copied())
-            {
+            match callee_arity {
                 Some(arity) if arity <= 4 => {}
                 Some(arity) => {
                     inline_args = collect_inline_call_arg_bytes(self.bhav, pc, arity * 2)
@@ -1209,8 +1335,11 @@ impl Explorer<'_> {
                 FrameUse::Read(scope, idx, _) | FrameUse::Dst(scope @ 22, idx, _) => {
                     let scope = if scope == 22 { 9 } else { scope };
                     if matches!(scope, 9 | 25) {
-                        let val = in_frame(scope, idx).then(|| slot_val(&state, scope, idx));
-                        frame.push(FrameVal::Read(scope, idx, val));
+                        let inside = in_frame(scope, idx);
+                        let val = inside.then(|| slot_val(&state, scope, idx));
+                        let unwritten =
+                            inside && scope == 25 && state.unwritten[idx as usize];
+                        frame.push(FrameVal::Read(scope, idx, val, unwritten));
                     }
                 }
                 FrameUse::Dst(scope, idx, _) => {
@@ -1219,11 +1348,15 @@ impl Explorer<'_> {
                         written.insert((scope, idx));
                     }
                 }
-                FrameUse::AllLocals(_) => frame.push(FrameVal::AllLocals(state.locals.clone())),
+                FrameUse::AllLocals(_) => frame.push(FrameVal::AllLocals(
+                    state.locals.clone(),
+                    state.unwritten.clone(),
+                )),
                 FrameUse::WholeFrame => {
                     frame.push(FrameVal::WholeFrame(
                         state.params.clone(),
                         state.locals.clone(),
+                        state.unwritten.clone(),
                     ));
                     written.extend((0..self.args).map(|i| (9, i as i16)));
                     written.extend((0..self.locals).map(|i| (25, i as i16)));
@@ -1240,14 +1373,19 @@ impl Explorer<'_> {
                 operands: canonicalize_primitive_operands(ins.opcode, *ops),
                 inline_args,
                 unknown_arity_suffix,
-                caller_frame: pushes_frame(ins.opcode).then_some((self.args, self.locals)),
+                callee_arity,
+                caller_frame: (self.args, self.locals),
             },
             frame,
+            self.opts.observe_last_result.then_some(state.last_result),
             interner,
         );
         state.prefix = prefix;
 
-        let outcomes: Vec<(Option<bool>, u8)> = if is_always_true_instruction(ins) {
+        // Random never takes its false branch: it succeeds or traps (`random.rs`).
+        let outcomes: Vec<(Option<bool>, u8)> = if is_always_true_instruction(ins)
+            || ins.opcode == 8
+        {
             vec![(None, ins.on_true)]
         } else {
             vec![(Some(true), ins.on_true), (Some(false), ins.on_false)]
@@ -1268,18 +1406,12 @@ impl Explorer<'_> {
                 }
             }
             Self::havoc_shared(&mut s);
+            s.last_result = Some(outcome.unwrap_or(true));
             s.pc = target;
             out.push(Step::Continue(s));
         }
         Ok(out)
     }
-}
-
-/// Primitives that run another tree on the same object's stack: subroutine calls and
-/// the callback primitives (`FindBestInteraction`, `FindBestObject`, `RunFunctionalTree`,
-/// `RunTreeByName`, `GosubFoundAction`, `UiEffect`, `Reach`).
-fn pushes_frame(opcode: u16) -> bool {
-    matches!(opcode, 3 | 14 | 20 | 28 | 30 | 34 | 47 | 256..=u16::MAX)
 }
 
 /// Frame slots primitives write beyond their listed destinations (mirrors the lockstep
@@ -1402,7 +1534,13 @@ pub fn check_bhav_live_equivalent(
             ),
         };
     }
-    let entries = if a.kind == 4 { a.instructions.len() } else { 1 };
+    // An entry past node 250 fails on both sides alike (`interpreter.rs:766`), as kind-4
+    // trees of different lengths were rejected above.
+    let entries = if a.kind == 4 {
+        a.instructions.len().min(LAST_NODE + 1)
+    } else {
+        1
+    };
 
     let mut interner = Interner::new();
     let mut steps = 0usize;
@@ -1556,8 +1694,8 @@ fn can_differ(x: Val, y: Val, cond: &[(Atom, bool)], interner: &Interner) -> Opt
     }
     match (x, y) {
         (Val::Const(_), Val::Const(_)) => Some(true),
-        _ if (matches!(x, Val::Const(_)) || interner.is_leaf(x))
-            && (matches!(y, Val::Const(_)) || interner.is_leaf(y)) =>
+        _ if (matches!(x, Val::Const(_)) || interner.is_input_val(x))
+            && (matches!(y, Val::Const(_)) || interner.is_input_val(y)) =>
         {
             Some(true)
         }
@@ -1642,10 +1780,13 @@ fn first_difference(
             a.scratch, b.scratch
         ));
     }
+    if let Some(d) = last_result_difference("at exit", a.last_result, b.last_result) {
+        return d;
+    }
     if let Some(d) = store_difference("final", &a.store, &b.store, a.epoch, cond, interner) {
         return d;
     }
-    if let (Some((pa, la)), Some((pb, lb))) = (&a.residue, &b.residue) {
+    if let (Some((pa, la, ua)), Some((pb, lb, ub))) = (&a.residue, &b.residue) {
         if la.len() != lb.len() || pa.len() != pb.len() {
             return Difference::Definite("frame residue layout differs".to_owned());
         }
@@ -1659,8 +1800,38 @@ fn first_difference(
                 return d;
             }
         }
+        if ua != ub {
+            return Difference::Possible(
+                "final locals differ in which may still hold what an earlier frame left"
+                    .to_owned(),
+            );
+        }
     }
     Difference::Possible("outputs differ".to_owned())
+}
+
+/// Compares the thread's last branch result (`None` inside: the caller's, unknown).
+fn last_result_difference(
+    when: &str,
+    a: Option<Option<bool>>,
+    b: Option<Option<bool>>,
+) -> Option<Difference> {
+    if a == b {
+        return None;
+    }
+    let show = |v: Option<Option<bool>>| match v {
+        Some(Some(r)) => r.to_string(),
+        _ => "the caller's".to_owned(),
+    };
+    let what = format!(
+        "last branch result {when} differs: A {} vs B {}",
+        show(a),
+        show(b)
+    );
+    Some(match (a, b) {
+        (Some(Some(_)), Some(Some(_))) => Difference::Definite(what),
+        _ => Difference::Possible(what),
+    })
 }
 
 /// Compares tracked-cell maps (absent cells hold their epoch value).
@@ -1697,7 +1868,11 @@ fn store_difference(
             (Some(&v), None) | (None, Some(&v)) => {
                 match interner.lookup(&SymKey::Cell(epoch, cell)) {
                     Some(old) => can_differ(v, old, cond, interner),
-                    None if matches!(v, Val::Const(_)) || interner.is_leaf(v) => Some(true),
+                    None if epoch == 0
+                        && (matches!(v, Val::Const(_)) || interner.is_input_val(v)) =>
+                    {
+                        Some(true)
+                    }
                     None => None,
                 }
             }
@@ -1729,6 +1904,7 @@ fn event_difference(
                 operands: xa,
                 inline_args: ia,
                 unknown_arity_suffix: sa,
+                callee_arity: ca,
                 caller_frame: fa,
             },
             EventKind::Primitive {
@@ -1736,17 +1912,25 @@ fn event_difference(
                 operands: xb,
                 inline_args: ib,
                 unknown_arity_suffix: sb,
+                callee_arity: cb,
                 caller_frame: fb,
             },
-        ) if oa == ob && xa == xb && ia == ib && (sa != sb || fa != fb) => {
+        ) if oa == ob && xa == xb && ia == ib && (sa != sb || ca != cb || fa != fb) => {
+            if ca != cb {
+                return Difference::Possible(format!(
+                    "{at}: call #{oa} names trees with different argument counts in the two files \
+                     ({ca:?} vs {cb:?})"
+                ));
+            }
             if sa != sb {
                 return Difference::Possible(format!(
                     "{at}: call #{oa} has unknown callee arity and the instructions after it differ"
                 ));
             }
             return Difference::Possible(format!(
-                "{at}: opcode {oa:#06x} runs a tree whose frame starts at a different frame-storage \
-                 offset (caller params/locals A {fa:?} vs B {fb:?}), so its uninitialized locals may differ"
+                "{at}: opcode {oa:#06x} may run a tree whose frame starts at a different \
+                 frame-storage offset (caller params/locals A {fa:?} vs B {fb:?}), so its \
+                 uninitialized locals may differ"
             ));
         }
         (x, y) if !same_shape(x, y) => {
@@ -1819,6 +2003,13 @@ fn event_difference(
             b.scratch
         ));
     }
+    if let Some(d) = last_result_difference(
+        &format!("before {at} ({})", describe_kind(&a.kind, interner)),
+        a.last_result,
+        b.last_result,
+    ) {
+        return d;
+    }
     if let Some(d) = store_difference(
         &format!("before {at} ({})", describe_kind(&a.kind, interner)),
         &a.store,
@@ -1837,7 +2028,16 @@ fn event_difference(
             continue;
         }
         return match (fa, fb) {
-            (FrameVal::Read(s, i, Some(x)), FrameVal::Read(t, j, Some(y))) if s == t && i == j => {
+            (FrameVal::Read(s, i, _, ua), FrameVal::Read(t, j, _, ub))
+                if s == t && i == j && ua != ub =>
+            {
+                Difference::Possible(format!(
+                    "{at}: frame operand scope {s}[{i}] may still hold what an earlier frame left on one side"
+                ))
+            }
+            (FrameVal::Read(s, i, Some(x), _), FrameVal::Read(t, j, Some(y), _))
+                if s == t && i == j =>
+            {
                 match can_differ(*x, *y, cond, interner) {
                     Some(true) => Difference::Definite(format!(
                         "{at} {}: frame operand scope {s}[{i}] A={} vs B={}",
@@ -1850,8 +2050,11 @@ fn event_difference(
                     )),
                 }
             }
-            (FrameVal::AllLocals(_), FrameVal::AllLocals(_)) => Difference::Possible(format!(
+            (FrameVal::AllLocals(..), FrameVal::AllLocals(..)) => Difference::Possible(format!(
                 "{at}: text formatting may read frame locals via $Local tokens and local state differs"
+            )),
+            (FrameVal::WholeFrame(..), FrameVal::WholeFrame(..)) => Difference::Possible(format!(
+                "{at}: an unmodeled primitive may read the frame and frame state differs"
             )),
             _ => Difference::Definite(format!(
                 "{at} {}: frame operands differ ({fa:?} vs {fb:?})",
@@ -1883,6 +2086,7 @@ fn same_shape(a: &EventKind, b: &EventKind) -> bool {
                 operands: xa,
                 inline_args: ia,
                 unknown_arity_suffix: sa,
+                callee_arity: ca,
                 caller_frame: fa,
             },
             EventKind::Primitive {
@@ -1890,9 +2094,10 @@ fn same_shape(a: &EventKind, b: &EventKind) -> bool {
                 operands: xb,
                 inline_args: ib,
                 unknown_arity_suffix: sb,
+                callee_arity: cb,
                 caller_frame: fb,
             },
-        ) => oa == ob && xa == xb && ia == ib && sa == sb && fa == fb,
+        ) => oa == ob && xa == xb && ia == ib && sa == sb && ca == cb && fa == fb,
         (
             EventKind::Read {
                 scope: sa, idx: ia, ..

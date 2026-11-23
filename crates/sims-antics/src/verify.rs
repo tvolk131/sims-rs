@@ -110,7 +110,13 @@ pub struct EquivOptions {
     /// Maximum path depth explored before returning `Inconclusive`.
     pub max_depth: usize,
     /// Maximum consecutive silent local/no-op steps per side before returning `Inconclusive`.
+    /// Zero turns silent steps off, so every node is matched with a node of the other tree.
     pub max_silent_steps: usize,
+    /// Require the thread's last branch result to agree at exit and before primitives
+    /// (see [`LiveOptions::observe_last_result`]). Off by default: a structured lift may
+    /// word a final test the other way round. Needs `max_silent_steps == 0`, since a
+    /// silent step changes the result on one side only.
+    pub observe_last_result: bool,
 }
 
 impl Default for EquivOptions {
@@ -119,6 +125,7 @@ impl Default for EquivOptions {
             max_states: 4096,
             max_depth: 512,
             max_silent_steps: 64,
+            observe_last_result: false,
         }
     }
 }
@@ -4289,6 +4296,9 @@ fn advance_silent(
     limit: usize,
     uses_global_34: bool,
 ) -> std::result::Result<u8, String> {
+    if limit == 0 {
+        return Ok(pc);
+    }
     for _ in 0..limit {
         let Some(next) = try_silent_step(bhav, pc, env, interner, uses_global_34) else {
             return Ok(pc);
@@ -4307,6 +4317,9 @@ struct ProductState {
     env_a: LocalEnv,
     env_b: LocalEnv,
     constraints: BTreeMap<CanonPred, bool>,
+    /// Whether the two threads' last branch results may differ (only tracked with
+    /// [`EquivOptions::observe_last_result`]).
+    last_differs: bool,
 }
 
 /// Checks whether two BHAV chunks `a` and `b` are behaviorally trace-equivalent
@@ -4406,6 +4419,7 @@ pub fn check_bhav_equivalent_with_arities(
             env_a: LocalEnv::new(args_a, locals_a),
             env_b: LocalEnv::new(args_b, locals_b),
             constraints: BTreeMap::new(),
+            last_differs: false,
         };
         if visited.insert(init.clone()) {
             queue.push_back((init, Vec::new()));
@@ -4451,6 +4465,10 @@ pub fn check_bhav_equivalent_with_arities(
             Ok(pc) => pc,
             Err(reason) => return EquivResult::Inconclusive { reason },
         };
+        if opts.observe_last_result && (pc_a != state.pc_a || pc_b != state.pc_b) {
+            // A silent step sets its side's last result alone.
+            state.last_differs = true;
+        }
         state.pc_a = pc_a;
         state.pc_b = pc_b;
 
@@ -4459,6 +4477,15 @@ pub fn check_bhav_equivalent_with_arities(
 
         if term_a || term_b {
             if pc_a == pc_b {
+                if opts.observe_last_result && state.last_differs {
+                    return EquivResult::Counterexample {
+                        path,
+                        divergence: format!(
+                            "both trees reach {} but their last branch results may differ",
+                            format_pc(pc_a)
+                        ),
+                    };
+                }
                 paths_verified += 1;
                 continue;
             }
@@ -4497,6 +4524,7 @@ pub fn check_bhav_equivalent_with_arities(
                 env_a: widened_a,
                 env_b: widened_b,
                 constraints: BTreeMap::new(),
+                last_differs: state.last_differs,
             };
             if !visited.insert(widened.clone()) {
                 paths_verified += 1;
@@ -4562,6 +4590,14 @@ pub fn check_bhav_equivalent_with_arities(
                 ins_b.on_false,
                 can_commute_b,
             );
+            // Whether canonicalization swapped a side's targets, which makes its own
+            // result the negation of the canonical predicate's value.
+            let swapped = |op: u8, l: CanonOperand, r: CanonOperand, commute: bool| {
+                canonicalize_compare(op, l, r, 0, 1, commute).is_some_and(|(_, t, _)| t == 1)
+            };
+            let last_differs = opts.observe_last_result
+                && swapped(ins_a.operands[5], la, ra, can_commute_a)
+                    != swapped(ins_b.operands[5], lb, rb, can_commute_b);
             match (norm_a, norm_b) {
                 (Some((pred_a, ta, fa)), Some((pred_b, tb, fb))) if pred_a == pred_b => {
                     let mut enqueue = |na: u8, nb: u8, branch: bool, record_pred: Option<bool>| {
@@ -4581,6 +4617,7 @@ pub fn check_bhav_equivalent_with_arities(
                             env_a: state.env_a.clone(),
                             env_b: state.env_b.clone(),
                             constraints: next_constraints,
+                            last_differs,
                         };
                         if visited.insert(next.clone()) {
                             let mut next_path = path.clone();
@@ -4701,6 +4738,7 @@ pub fn check_bhav_equivalent_with_arities(
                     env_a: next_env_a.clone(),
                     env_b: next_env_b.clone(),
                     constraints: next_constraints.clone(),
+                    last_differs: false,
                 };
                 if visited.insert(next.clone()) {
                     let mut next_path = path.clone();
@@ -4743,6 +4781,16 @@ pub fn check_bhav_equivalent_with_arities(
                     canonicalize_primitive_operands(ins_a.opcode, ins_a.operands),
                     ins_b.opcode,
                     canonicalize_primitive_operands(ins_b.opcode, ins_b.operands),
+                ),
+            };
+        }
+        // A primitive may start a tree that reads the last result (`found_action.rs:102`).
+        if opts.observe_last_result && state.last_differs {
+            return EquivResult::Counterexample {
+                path,
+                divergence: format!(
+                    "last branch results may differ before op {:#06x} at A@n{pc_a} vs B@n{pc_b}",
+                    ins_a.opcode
                 ),
             };
         }
@@ -4913,6 +4961,7 @@ pub fn check_bhav_equivalent_with_arities(
                 env_a: ea,
                 env_b: eb,
                 constraints: base_constraints.clone(),
+                last_differs: false,
             };
             if visited.insert(next.clone()) {
                 let mut next_path = path.clone();
@@ -5431,13 +5480,80 @@ fn merge_arities(
     }
 }
 
+/// Why two trees cannot be compared as if they ran against the same game data: their
+/// files give them different tuning constants (`BCON`), which neither checker can see
+/// through when a primitive or an unfolded operand reads them. `None` when the files
+/// agree on everything the trees may read.
+#[must_use]
+pub fn context_mismatch(
+    a: &BhavChunk,
+    ctx_a: &LiveContext,
+    b: &BhavChunk,
+    ctx_b: &LiveContext,
+) -> Option<String> {
+    let may_read_constants = |bhav: &BhavChunk| {
+        bhav.instructions
+            .iter()
+            .any(|ins| ins.opcode != 2 || ins.operands[6] == 26 || ins.operands[7] == 26)
+    };
+    (ctx_a.local_bcons != ctx_b.local_bcons && (may_read_constants(a) || may_read_constants(b)))
+        .then(|| {
+            "the files' constant tables (BCON) differ and the trees may read them".to_owned()
+        })
+}
+
+/// Whether a lockstep proof (with silent steps off) also covers everything the
+/// live-output checker observes under `live`.
+fn lockstep_suffices(
+    a: &BhavChunk,
+    ctx_a: &LiveContext,
+    b: &BhavChunk,
+    ctx_b: &LiveContext,
+    live: &LiveOptions,
+) -> bool {
+    // Lockstep ignores the frame's final contents.
+    if live.observe_frame_residue {
+        return false;
+    }
+    // Lockstep does not compare frame sizes, but a tree a primitive runs starts after
+    // the caller's frame in the frame storage, so its uninitialized locals depend on
+    // them (`sims-vm/src/interpreter.rs:1195`).
+    let has_primitive = |bhav: &BhavChunk| bhav.instructions.iter().any(|ins| ins.opcode != 2);
+    if live::frame_dims(a) != live::frame_dims(b) && (has_primitive(a) || has_primitive(b)) {
+        return false;
+    }
+    // Lockstep runs nodes past 250 and branches to 251 and 252, which the VM rejects
+    // (`interpreter.rs:766`, `interpreter.rs:1695`).
+    let past_last_node = |bhav: &BhavChunk| {
+        bhav.instructions.len() > 251
+            || bhav
+                .instructions
+                .iter()
+                .any(|ins| matches!(ins.on_true, 251 | 252) || matches!(ins.on_false, 251 | 252))
+    };
+    if past_last_node(a) || past_last_node(b) {
+        return false;
+    }
+    // A call whose target has different argument counts in the two files runs
+    // different trees; lockstep only sees the call.
+    let arity = |ctx: &LiveContext, id: u16| ctx.callee_arities.as_ref().map(|m| m.get(&id).copied());
+    !a.instructions
+        .iter()
+        .chain(&b.instructions)
+        .filter(|ins| ins.opcode >= 256)
+        .any(|ins| arity(ctx_a, ins.opcode) != arity(ctx_b, ins.opcode))
+}
+
 /// Checks two trees with the lockstep checker first and, when it cannot prove them
 /// equivalent, with the live-output checker, which also accepts trees that differ by
 /// pure reads, dummy nodes and dead frame writes.
 ///
-/// A lockstep counterexample is a divergence in the stricter node-for-node trace (every
-/// memory access observable); when the live-output checker cannot decide, the result is
-/// `Inconclusive` rather than that counterexample.
+/// Lockstep runs with silent steps off (so every `Expression` is matched, which keeps
+/// the scratch pointer and uninitialized-local reads in step) and, when `live` observes
+/// it, with the last branch result compared. Its proof is taken only when it covers
+/// what `live` observes ([`lockstep_suffices`]). A lockstep counterexample is a
+/// divergence in the stricter node-for-node trace; when the live-output checker cannot
+/// decide, the result is `Inconclusive` rather than that counterexample.
 #[must_use]
 pub fn check_bhav_equivalent_combined(
     a: &BhavChunk,
@@ -5447,19 +5563,17 @@ pub fn check_bhav_equivalent_combined(
     lockstep: &EquivOptions,
     live: &LiveOptions,
 ) -> (EquivMethod, EquivResult) {
+    if let Some(reason) = context_mismatch(a, ctx_a, b, ctx_b) {
+        return (EquivMethod::LiveOutput, EquivResult::Inconclusive { reason });
+    }
     let arities = merge_arities(ctx_a.callee_arities.as_ref(), ctx_b.callee_arities.as_ref());
-    let first = check_bhav_equivalent_with_arities(a, b, lockstep, arities.as_ref());
-    // Lockstep does not compare frame sizes, but a callee's frame starts after the
-    // caller's in the frame storage, so its uninitialized locals depend on them
-    // (`sims-vm/src/interpreter.rs:1195`); let the live checker decide those trees.
-    let runs_trees = |bhav: &BhavChunk| {
-        bhav.instructions
-            .iter()
-            .any(|ins| matches!(ins.opcode, 3 | 14 | 20 | 28 | 30 | 34 | 47 | 256..=u16::MAX))
+    let strict = EquivOptions {
+        max_silent_steps: 0,
+        observe_last_result: live.observe_last_result,
+        ..*lockstep
     };
-    let same_frame = live::frame_dims(a) == live::frame_dims(b);
-    if matches!(first, EquivResult::Equivalent { .. })
-        && (same_frame || !(runs_trees(a) || runs_trees(b)))
+    let first = check_bhav_equivalent_with_arities(a, b, &strict, arities.as_ref());
+    if matches!(first, EquivResult::Equivalent { .. }) && lockstep_suffices(a, ctx_a, b, ctx_b, live)
     {
         return (EquivMethod::Lockstep, first);
     }
@@ -5470,11 +5584,9 @@ pub fn check_bhav_equivalent_combined(
                     format!("lockstep counterexample: {divergence}")
                 }
                 EquivResult::Inconclusive { reason } => format!("lockstep: {reason}"),
-                EquivResult::Equivalent { .. } => {
-                    "lockstep: equivalent node for node, but the frames differ in size and \
-                     the trees run other trees"
-                        .to_owned()
-                }
+                EquivResult::Equivalent { .. } => "lockstep: equivalent node for node, but that \
+                     does not cover frame layout, invalid nodes or differing callee arities here"
+                    .to_owned(),
             };
             (
                 EquivMethod::LiveOutput,

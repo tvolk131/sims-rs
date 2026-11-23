@@ -6,8 +6,8 @@
 //! - `sims-antics expand <file.antics> [--pack <pack_dir>]`
 //! - `sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
-//! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]`
-//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--strict-frame-residue] [--all]`
+//! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result]`
+//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--strict-frame-residue] [--all]`
 //!   (exit 0 equivalent, 1 different, 2 inconclusive or error)
 //! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]`
 //! - `sims-antics build <pack_dir> --out <dir>`
@@ -146,8 +146,8 @@ fn print_usage() {
          sims-antics expand <file.antics> [--pack <pack_dir>]\n  \
          sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
-         sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]\n  \
-         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--strict-frame-residue] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n  \
+         sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result]\n  \
+         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--strict-frame-residue] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>"
     );
@@ -1424,6 +1424,7 @@ fn run() -> Result<(), CliError> {
             let mut iff_path: Option<PathBuf> = None;
             let mut tree_id: Option<u16> = None;
             let mut pack_dir: Option<PathBuf> = None;
+            let mut live_opts = LiveOptions::default();
             let mut i = 1usize;
             while i < args.len() {
                 let arg = args[i].as_os_str();
@@ -1443,6 +1444,11 @@ fn run() -> Result<(), CliError> {
                                 .ok_or_else(|| "missing directory path after --pack".to_owned())?;
                             pack_dir = Some(PathBuf::from(val));
                             i += 2;
+                            continue;
+                        }
+                        "--ignore-last-result" => {
+                            live_opts.observe_last_result = false;
+                            i += 1;
                             continue;
                         }
                         other if other.starts_with('-') => {
@@ -1512,7 +1518,7 @@ fn run() -> Result<(), CliError> {
                 &bhav_b,
                 &ctx,
                 &EquivOptions::default(),
-                &LiveOptions::default(),
+                &live_opts,
             );
             match result {
                 EquivResult::Equivalent {
@@ -1726,6 +1732,11 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
                 }
                 "--strict-frame-residue" => {
                     opts.live.observe_frame_residue = true;
+                    i += 1;
+                    continue;
+                }
+                "--ignore-last-result" => {
+                    opts.live.observe_last_result = false;
                     i += 1;
                     continue;
                 }

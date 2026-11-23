@@ -9,7 +9,8 @@
 //!    re-checked with the live-output checker, which must not contradict lockstep;
 //! 3. "CT - Is Fridge" style dummy trees (one `Expression` whose both branches return the
 //!    same value) are proven equal to the matching `return true;` / `return false;`
-//!    whenever their reads cannot trap.
+//!    whenever their reads cannot trap, ignoring the last branch result; with it
+//!    observed, every refutation must be that last result.
 //!
 //! Skips cleanly when `SIMS_INSTALL` is unset (CI-safe).
 
@@ -71,6 +72,10 @@ fn live_output_checker_is_sound_on_the_install() {
     let mut semi_cache: BTreeMap<usize, BTreeMap<u16, usize>> = BTreeMap::new();
 
     let opts = LiveOptions::default();
+    let ignoring_last_result = LiveOptions {
+        observe_last_result: false,
+        ..LiveOptions::default()
+    };
     let lockstep = EquivOptions::default();
     let lift_opts = LiftOptions {
         strict_padding: true,
@@ -97,6 +102,9 @@ fn live_output_checker_is_sound_on_the_install() {
     let mut dummy_trees = 0usize;
     let mut dummy_proven = 0usize;
     let mut dummy_refuted = 0usize;
+    let mut dummy_strict_proven = 0usize;
+    let mut dummy_strict_last_result = 0usize;
+    let mut dummy_strict_other = 0usize;
     let mut fridges_dummy_proven = 0usize;
     let mut first_problem: Option<String> = None;
 
@@ -228,6 +236,23 @@ fn live_output_checker_is_sound_on_the_install() {
                     target.args = bhav.args;
                     target.locals = bhav.locals;
                     match check_bhav_live_equivalent(&bhav, &ctx, &target, &ctx, &opts) {
+                        EquivResult::Equivalent { .. } => dummy_strict_proven += 1,
+                        EquivResult::Counterexample { divergence, .. } => {
+                            if divergence.contains("last branch result") {
+                                dummy_strict_last_result += 1;
+                            } else {
+                                dummy_strict_other += 1;
+                            }
+                        }
+                        EquivResult::Inconclusive { .. } => {}
+                    }
+                    match check_bhav_live_equivalent(
+                        &bhav,
+                        &ctx,
+                        &target,
+                        &ctx,
+                        &ignoring_last_result,
+                    ) {
                         EquivResult::Equivalent { .. } => {
                             dummy_proven += 1;
                             if is_fridges && chunk.id == 4143 {
@@ -249,7 +274,9 @@ fn live_output_checker_is_sound_on_the_install() {
          live_inconclusive={live_inconclusive_on_lockstep_equivalent} \
          live_contradicts={live_contradicts_lockstep} dummy_trees={dummy_trees} \
          dummy_proven={dummy_proven} dummy_refuted={dummy_refuted} \
-         fridges_4143_proven={fridges_dummy_proven}"
+         fridges_4143_proven={fridges_dummy_proven} dummy_strict_proven={dummy_strict_proven} \
+         dummy_strict_last_result={dummy_strict_last_result} \
+         dummy_strict_other={dummy_strict_other}"
     );
     for (reason, count) in &inconclusive_reasons {
         eprintln!("live_equiv_corpus: inconclusive {count}x: {reason}");
@@ -272,6 +299,10 @@ fn live_output_checker_is_sound_on_the_install() {
     );
     assert_eq!(
         fridges_dummy_proven, 1,
-        "Fridges.iff tree 4143 must equal `return true;`"
+        "Fridges.iff tree 4143 must equal `return true;` (ignoring the last result)"
+    );
+    assert_eq!(
+        dummy_strict_other, 0,
+        "a dummy tree was refuted for something other than its last result"
     );
 }

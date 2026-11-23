@@ -4,9 +4,9 @@
 use sims_antics::encode::encode_bhav;
 use sims_antics::ir::BhavChunk;
 use sims_antics::{
-    EquivMethod, EquivOptions, EquivResult, IffEquivOptions, IffVerdict, LiveContext, LiveOptions,
-    ResourceVerdict, check_bhav_equivalent, check_bhav_equivalent_combined,
-    check_bhav_live_equivalent, check_iff_equivalent, compile_air,
+    EquivMethod, EquivOptions, EquivResult, IffEquivOptions, IffEquivReport, IffVerdict,
+    LiveContext, LiveOptions, ResourceReport, ResourceVerdict, check_bhav_equivalent,
+    check_bhav_equivalent_combined, check_bhav_live_equivalent, check_iff_equivalent, compile_air,
 };
 use sims_formats::behavior::Instruction;
 use sims_formats::iff::{ChunkData, write as write_iff};
@@ -106,9 +106,20 @@ fn assert_inconclusive(result: &EquivResult) {
     );
 }
 
+fn ignoring_last_result() -> LiveOptions {
+    LiveOptions {
+        observe_last_result: false,
+        ..LiveOptions::default()
+    }
+}
+
 /// Maxis' "CT - Is Fridge" shape: a single `my.attr[0] > my.attr[0]` node whose both
 /// branches return true. Reading `my.attr[0]` cannot trap (every object has 8
-/// attributes), so the compare is a dead pure read and the tree is `return true;`.
+/// attributes), so the compare is a dead pure read and the tree returns true like
+/// `return true;`. It differs in one thing only: its final test is false, and the VM
+/// records the last branch result when the frame of a tree an action started is popped
+/// (`object_uses.rs:246`). The strict default reports that; ignoring the last result
+/// proves the trees equivalent.
 #[test]
 fn dead_pure_read_dummy_node_equals_return_true() {
     let fridge = tree(4143, 0, 0, vec![expr((ATTR, 0), GT, (ATTR, 0), T, T)]);
@@ -119,22 +130,78 @@ fn dead_pure_read_dummy_node_equals_return_true() {
         check_bhav_equivalent(&fridge, &high_level, &EquivOptions::default()),
         EquivResult::Equivalent { .. }
     ));
-    assert_equivalent(&live(&fridge, &high_level));
+    match live(&fridge, &high_level) {
+        EquivResult::Counterexample { divergence, .. } => {
+            assert!(divergence.contains("last branch result"), "{divergence}");
+        }
+        other => panic!("expected Counterexample, got {other:?}"),
+    }
     let ctx = LiveContext::default();
+    assert_equivalent(&live_with(&fridge, &high_level, &ctx, &ignoring_last_result()));
     let (method, result) = check_bhav_equivalent_combined(
         &fridge,
         &ctx,
         &high_level,
         &ctx,
         &EquivOptions::default(),
-        &LiveOptions::default(),
+        &ignoring_last_result(),
     );
     assert_eq!(method, EquivMethod::LiveOutput);
     assert_equivalent(&result);
 
+    // A dummy test that is true leaves the same last result as `return true;`.
+    let true_dummy = tree(4143, 0, 0, vec![expr((ATTR, 0), EQ, (ATTR, 0), T, T)]);
+    assert_equivalent(&live(&true_dummy, &high_level));
+
     // Different exits are still told apart.
     let returns_false = air(r#"tree 4143 "X" { return false; }"#, 4143);
-    assert_counterexample(&live(&fridge, &returns_false));
+    assert_counterexample(&live_with(
+        &fridge,
+        &returns_false,
+        &ctx,
+        &ignoring_last_result(),
+    ));
+}
+
+/// `p < 5 -> true : false` and `p >= 5 -> false : true` return the same, but their own
+/// results (the thread's last result) are opposite.
+#[test]
+fn last_branch_result_is_observed() {
+    let lt = tree(4096, 1, 0, vec![expr((PARAM, 0), LT, (LIT, 5), T, F)]);
+    let ge = tree(4096, 1, 0, vec![expr((PARAM, 0), 14, (LIT, 5), F, T)]);
+    assert_counterexample(&live(&lt, &ge));
+    assert_equivalent(&live_with(
+        &lt,
+        &ge,
+        &LiveContext::default(),
+        &ignoring_last_result(),
+    ));
+    // Lockstep matches them unless asked to compare last results.
+    assert_equivalent(&check_bhav_equivalent(&lt, &ge, &EquivOptions::default()));
+    let strict_lockstep = EquivOptions {
+        max_silent_steps: 0,
+        observe_last_result: true,
+        ..EquivOptions::default()
+    };
+    assert_counterexample(&check_bhav_equivalent(&lt, &ge, &strict_lockstep));
+    let ctx = LiveContext::default();
+    let (method, result) = check_bhav_equivalent_combined(
+        &lt,
+        &ctx,
+        &ge,
+        &ctx,
+        &EquivOptions::default(),
+        &LiveOptions::default(),
+    );
+    assert_eq!(method, EquivMethod::LiveOutput);
+    assert_counterexample(&result);
+
+    // Before a primitive, which may start a tree that reads it, too.
+    let sound = [1, 0, 0, 0, 0, 0, 0, 0];
+    let then_sound = |test: Instruction| tree(4096, 1, 0, vec![test, prim(23, sound, T, T)]);
+    let a = then_sound(expr((PARAM, 0), LT, (LIT, 5), 1, 1));
+    let b = then_sound(expr((PARAM, 0), 14, (LIT, 5), 1, 1));
+    assert_counterexample(&live(&a, &b));
 }
 
 /// A self assignment `temp[0] := temp[0]` returning false leaves nothing behind.
@@ -152,7 +219,7 @@ fn dummy_self_assignment_equals_return_false() {
 /// dead unless the caller says the object has more attributes.
 #[test]
 fn attribute_read_beyond_guaranteed_count_is_not_dead() {
-    let dummy = tree(4096, 0, 0, vec![expr((ATTR, 8), GT, (ATTR, 8), T, T)]);
+    let dummy = tree(4096, 0, 0, vec![expr((ATTR, 8), EQ, (ATTR, 8), T, T)]);
     let high_level = air(r#"tree 4096 "X" { return true; }"#, 4096);
     let result = live(&dummy, &high_level);
     assert!(
@@ -278,7 +345,14 @@ tree 4097 "Direct" {
     let looped = module.behaviors[&4096].clone();
     let mut direct = module.behaviors[&4097].clone();
     direct.id = 4096;
-    assert_equivalent(&live(&looped, &direct));
+    // The loop returns from its failed exit test, so its last result is false.
+    assert_counterexample(&live(&looped, &direct));
+    assert_equivalent(&live_with(
+        &looped,
+        &direct,
+        &LiveContext::default(),
+        &ignoring_last_result(),
+    ));
 }
 
 #[test]
@@ -325,8 +399,10 @@ fn scratch_pointer_state_before_primitives_is_observed() {
         vec![expr((LIT, 0), EQ, (LIT, 0), 1, 1), prim(23, sound, T, T)],
     );
     assert_counterexample(&live(&bare, &after_expression));
+    // The test before the sound also sets the last result.
     let lenient = LiveOptions {
         observe_scratch_pointer: false,
+        observe_last_result: false,
         ..LiveOptions::default()
     };
     assert_equivalent(&live_with(
@@ -430,12 +506,12 @@ fn fridge_files() -> (Vec<u8>, Vec<u8>) {
     let fridge = tree(4143, 0, 0, vec![expr((ATTR, 0), GT, (ATTR, 0), T, T)]);
     let high_level = air(r#"tree 4143 "CT - Is Fridge" { return true; }"#, 4143);
     let a = write_iff(&[
-        bhav_chunk(&fridge, "original label"),
+        bhav_chunk(&fridge, "CT - Is Fridge"),
         str_chunk(128, &[("alpha", "first"), ("beta", "")]),
     ])
     .expect("write A");
     let b = write_iff(&[
-        bhav_chunk(&high_level, "new label"),
+        bhav_chunk(&high_level, "CT - Is Fridge"),
         str_chunk(128, &[("alpha", "changed comment"), ("beta", "")]),
     ])
     .expect("write B");
@@ -445,7 +521,14 @@ fn fridge_files() -> (Vec<u8>, Vec<u8>) {
 #[test]
 fn whole_file_equivalence_with_notes() {
     let (a, b) = fridge_files();
+    // Strictly, the Fridge tree's final test leaves a different last result.
     let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Different, "{report:#?}");
+    let opts = IffEquivOptions {
+        live: ignoring_last_result(),
+        ..IffEquivOptions::default()
+    };
+    let report = check_iff_equivalent(&a, &b, &opts).expect("check");
     assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
     let bhav = report
         .resources
@@ -456,7 +539,6 @@ fn whole_file_equivalence_with_notes() {
         matches!(&bhav.verdict, ResourceVerdict::Equivalent { how } if how.starts_with("live-output")),
         "{bhav:?}"
     );
-    assert!(bhav.notes.iter().any(|n| n.contains("label")), "{bhav:?}");
     let strings = report
         .resources
         .iter()
@@ -517,6 +599,15 @@ fn verify_equiv_cli_exit_codes() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("last branch result"), "{stdout}");
+    let out = cli()
+        .args(["verify-equiv", "--ignore-last-result"])
+        .arg(&path_a)
+        .arg(&path_b)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -535,14 +626,14 @@ fn verify_equiv_cli_exit_codes() {
     std::fs::write(
         &path_c,
         write_iff(&[
-            bhav_chunk(&returns_false, "x"),
+            bhav_chunk(&returns_false, "CT - Is Fridge"),
             str_chunk(128, &[("alpha", "first"), ("beta", "")]),
         ])
         .unwrap(),
     )
     .unwrap();
     let out = cli()
-        .arg("verify-equiv")
+        .args(["verify-equiv", "--ignore-last-result"])
         .arg(&path_a)
         .arg(&path_c)
         .output()
@@ -552,7 +643,7 @@ fn verify_equiv_cli_exit_codes() {
     assert!(stdout.contains("BHAV #4143: DIFFERENT"), "{stdout}");
 
     // `my.attr[8]` without `--my-attributes` is inconclusive (exit 2), with it equivalent.
-    let attr8 = tree(4143, 0, 0, vec![expr((ATTR, 8), GT, (ATTR, 8), T, T)]);
+    let attr8 = tree(4143, 0, 0, vec![expr((ATTR, 8), EQ, (ATTR, 8), T, T)]);
     let path_d = dir.join("d.iff");
     std::fs::write(&path_d, write_iff(&[bhav_chunk(&attr8, "x")]).unwrap()).unwrap();
     let path_e = dir.join("e.iff");
@@ -585,7 +676,7 @@ fn verify_equiv_cli_exit_codes() {
 
     // `--tree` limits the comparison; usage errors are exit code 2.
     let out = cli()
-        .args(["verify-equiv", "--tree", "4143"])
+        .args(["verify-equiv", "--ignore-last-result", "--tree", "4143"])
         .arg(&path_a)
         .arg(&path_b)
         .output()
@@ -630,4 +721,195 @@ fn caller_frame_size_matters_when_calling_other_trees() {
     let no_call_more = tree(4096, 0, 4, vec![expr((TEMP, 0), SET, (LIT, 1), T, ERR)]);
     let no_call_fewer = tree(4096, 0, 0, vec![expr((TEMP, 0), SET, (LIT, 1), T, ERR)]);
     assert_equivalent(&live(&no_call_more, &no_call_fewer));
+}
+
+/// Branch targets 251 and 252 are invalid whatever the tree's length (native 0x44c).
+#[test]
+fn invalid_branch_targets_trap() {
+    let mut nodes = vec![expr((LIT, 0), EQ, (LIT, 0), 251, 251)];
+    nodes.extend((1..=251).map(|_| expr((LIT, 0), EQ, (LIT, 0), T, T)));
+    let jumps_far = tree(4096, 0, 0, nodes);
+    let returns = tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    match live(&jumps_far, &returns) {
+        EquivResult::Counterexample { divergence, .. } => {
+            assert!(divergence.contains("0x44c"), "{divergence}");
+        }
+        other => panic!("expected Counterexample, got {other:?}"),
+    }
+    let ctx = LiveContext::default();
+    let (_, combined) = check_bhav_equivalent_combined(
+        &jumps_far,
+        &ctx,
+        &returns,
+        &ctx,
+        &EquivOptions::default(),
+        &LiveOptions::default(),
+    );
+    assert_counterexample(&combined);
+}
+
+/// A local the tree has not written may hold half of a pointer an earlier frame left,
+/// and reading it can fail (`interpreter.rs:1277`), so it is not a dead read.
+#[test]
+fn reading_an_unwritten_local_is_not_dead() {
+    let reads = tree(4096, 0, 1, vec![expr((LOCAL, 0), EQ, (LOCAL, 0), T, T)]);
+    let returns = tree(4096, 0, 1, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    assert_inconclusive(&live(&reads, &returns));
+
+    let write_first = |test: Instruction| {
+        tree(
+            4096,
+            0,
+            1,
+            vec![expr((LOCAL, 0), SET, (LIT, 1), 1, ERR), test],
+        )
+    };
+    assert_equivalent(&live(
+        &write_first(expr((LOCAL, 0), EQ, (LOCAL, 0), T, T)),
+        &write_first(expr((LIT, 0), EQ, (LIT, 0), T, T)),
+    ));
+}
+
+/// Random succeeds or traps; it never takes its false branch.
+#[test]
+fn random_never_takes_its_false_branch() {
+    let ops = [0, 0, 8, 0, 10, 0, 7, 0];
+    let a = tree(4096, 0, 0, vec![prim(8, ops, T, F)]);
+    let b = tree(4096, 0, 0, vec![prim(8, ops, T, T)]);
+    assert_equivalent(&live(&a, &b));
+}
+
+/// A call whose target has different argument counts in the two files runs different
+/// trees, so it cannot be matched.
+#[test]
+fn calls_to_trees_with_different_arities_are_inconclusive() {
+    let call = tree(4096, 0, 0, vec![prim(0x1000, [0xFF; 8], T, F)]);
+    let ctx = |arity| LiveContext {
+        callee_arities: Some([(0x1000, arity)].into_iter().collect()),
+        ..LiveContext::default()
+    };
+    let opts = LiveOptions::default();
+    assert_inconclusive(&check_bhav_live_equivalent(
+        &call,
+        &ctx(1),
+        &call,
+        &ctx(2),
+        &opts,
+    ));
+    let (_, combined) = check_bhav_equivalent_combined(
+        &call,
+        &ctx(1),
+        &call,
+        &ctx(2),
+        &EquivOptions::default(),
+        &opts,
+    );
+    assert_inconclusive(&combined);
+}
+
+/// Two trees reading tuning constants cannot be matched when their files' constants
+/// differ: an unfolded read or a primitive would see different values.
+#[test]
+fn differing_constant_tables_are_inconclusive() {
+    let reads_constant = tree(4096, 0, 0, vec![prim(23, [0, 0, 0, 0, 0, 0, 0, 0], T, T)]);
+    let ctx = |value| LiveContext {
+        local_bcons: Some([(4096, vec![value])].into_iter().collect()),
+        ..LiveContext::default()
+    };
+    let (_, combined) = check_bhav_equivalent_combined(
+        &reads_constant,
+        &ctx(1),
+        &reads_constant,
+        &ctx(2),
+        &EquivOptions::default(),
+        &LiveOptions::default(),
+    );
+    assert_inconclusive(&combined);
+
+    // Whole files: identical tree bytes against different constants, with `--tree`.
+    let bcon = |value: i16| ChunkData {
+        tag: *b"BCON",
+        id: 4096,
+        flags: 0x10,
+        label: String::new(),
+        data: [vec![1, 0], value.to_le_bytes().to_vec()].concat(),
+    };
+    let file = |value| {
+        write_iff(&[bhav_chunk(&reads_constant, "T"), bcon(value)]).expect("write")
+    };
+    let opts = IffEquivOptions {
+        tree: Some(4096),
+        ..IffEquivOptions::default()
+    };
+    let report = check_iff_equivalent(&file(1), &file(2), &opts).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+    let report =
+        check_iff_equivalent(&file(1), &file(2), &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Different, "{report:#?}");
+}
+
+/// Run Tree By Name finds trees by chunk label, so a renamed tree is a different file.
+#[test]
+fn bhav_labels_are_lookup_keys() {
+    let t = tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    let a = write_iff(&[bhav_chunk(&t, "Old")]).expect("write");
+    let b = write_iff(&[bhav_chunk(&t, "New")]).expect("write");
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Different, "{report:#?}");
+    assert!(format!("{report:?}").contains("label"));
+}
+
+/// Length-prefixed string tables load with bytes 0xa1 and 0xd5 rewritten.
+#[test]
+fn string_tables_compare_as_loaded() {
+    let mac = ChunkData {
+        tag: *b"STR#",
+        id: 128,
+        flags: 0x10,
+        label: String::new(),
+        // Leading word 1: one length-prefixed string, "f" then 0xa1.
+        data: vec![1, 0, 2, b'f', 0xA1],
+    };
+    let a = write_iff(&[mac]).expect("write");
+    let b = write_iff(&[str_chunk(128, &[("fo", "")])]).expect("write");
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+    let c = write_iff(&[str_chunk(128, &[("fx", "")])]).expect("write");
+    let report = check_iff_equivalent(&a, &c, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Different, "{report:#?}");
+}
+
+/// An unusable resource map means the compared chunks may not be the ones the game
+/// loads, so even a difference is only inconclusive.
+#[test]
+fn file_problems_take_precedence() {
+    let report = IffEquivReport {
+        resources: vec![ResourceReport {
+            tag: *b"BHAV",
+            id: 4096,
+            verdict: ResourceVerdict::Different {
+                why: "x".to_owned(),
+            },
+            notes: Vec::new(),
+        }],
+        file_problems: vec!["map".to_owned()],
+    };
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive);
+}
+
+/// Counterexample text stays short when terms share subterms (doubling 40 times).
+#[test]
+fn deep_terms_are_described_briefly() {
+    let doubling = |times: usize| {
+        let mut nodes = vec![expr((TEMP, 0), SET, (PARAM, 0), 1, ERR)];
+        for i in 0..times {
+            nodes.push(expr((TEMP, 0), ADD, (TEMP, 0), (i + 2) as u8, ERR));
+        }
+        let last = nodes.len() - 1;
+        nodes[last].on_true = T;
+        tree(4096, 1, 0, nodes)
+    };
+    let result = live(&doubling(40), &doubling(41));
+    let text = format!("{result:?}");
+    assert!(text.len() < 4000, "{} bytes", text.len());
 }

@@ -9,7 +9,7 @@
 
 use super::{
     EquivMethod, EquivOptions, EquivResult, LiveContext, LiveOptions, bhav_param_limit,
-    check_bhav_equivalent_combined,
+    check_bhav_equivalent_combined, context_mismatch,
 };
 use crate::error::{Error, Result};
 use crate::ir::BhavChunk;
@@ -17,7 +17,7 @@ use crate::lift::lift_bhav;
 use sims_formats::behavior::Behavior;
 use sims_formats::execution::constants;
 use sims_formats::iff::{DELETED, Iff};
-use sims_formats::strings::StringTable;
+use sims_formats::strings::{Format, StringTable};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Options for [`check_iff_equivalent`].
@@ -109,21 +109,23 @@ pub struct IffEquivReport {
 }
 
 impl IffEquivReport {
-    /// `Different` if any resource differs, else `Inconclusive` if any could not be
-    /// decided, else `Equivalent`.
+    /// `Inconclusive` if a file problem means the compared resources may not be the ones
+    /// the game loads, else `Different` if any resource differs, else `Inconclusive` if
+    /// any could not be decided, else `Equivalent`.
     #[must_use]
     pub fn verdict(&self) -> IffVerdict {
-        if self
+        if !self.file_problems.is_empty() {
+            IffVerdict::Inconclusive
+        } else if self
             .resources
             .iter()
             .any(|r| matches!(r.verdict, ResourceVerdict::Different { .. }))
         {
             IffVerdict::Different
-        } else if !self.file_problems.is_empty()
-            || self
-                .resources
-                .iter()
-                .any(|r| matches!(r.verdict, ResourceVerdict::Inconclusive { .. }))
+        } else if self
+            .resources
+            .iter()
+            .any(|r| matches!(r.verdict, ResourceVerdict::Inconclusive { .. }))
         {
             IffVerdict::Inconclusive
         } else {
@@ -163,12 +165,24 @@ fn resources(iff: &Iff) -> BTreeMap<([u8; 4], u16), usize> {
     out
 }
 
-fn arities(iff: &Iff, extra: &BTreeMap<u16, usize>) -> BTreeMap<u16, usize> {
+/// The chunks the game resolves for `tag`, by id.
+fn resolved<'a>(
+    iff: &'a Iff,
+    res: &'a BTreeMap<([u8; 4], u16), usize>,
+    tag: &'a [u8; 4],
+) -> impl Iterator<Item = &'a sims_formats::iff::Chunk> + 'a {
+    res.iter()
+        .filter(move |((t, _), _)| t == tag)
+        .map(|(_, &index)| &iff.chunks[index])
+}
+
+fn arities(
+    iff: &Iff,
+    res: &BTreeMap<([u8; 4], u16), usize>,
+    extra: &BTreeMap<u16, usize>,
+) -> BTreeMap<u16, usize> {
     let mut map = extra.clone();
-    for chunk in iff.all(b"BHAV") {
-        if chunk.flags & DELETED != 0 {
-            continue;
-        }
+    for chunk in resolved(iff, res, b"BHAV") {
         if let Ok(bhav) = Behavior::parse(iff.data(chunk)) {
             map.insert(chunk.id, bhav_param_limit(&bhav));
         }
@@ -176,9 +190,8 @@ fn arities(iff: &Iff, extra: &BTreeMap<u16, usize>) -> BTreeMap<u16, usize> {
     map
 }
 
-fn bcons(iff: &Iff) -> BTreeMap<u16, Vec<i16>> {
-    iff.all(b"BCON")
-        .filter(|c| c.flags & DELETED == 0)
+fn bcons(iff: &Iff, res: &BTreeMap<([u8; 4], u16), usize>) -> BTreeMap<u16, Vec<i16>> {
+    resolved(iff, res, b"BCON")
         .filter_map(|c| constants(iff.data(c)).ok().map(|v| (c.id, v)))
         .collect()
 }
@@ -199,15 +212,14 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         }
     }
 
-    let ctx = |iff: &Iff| LiveContext {
-        callee_arities: Some(arities(iff, &opts.extra_arities)),
-        my_attribute_count: opts.my_attribute_count,
-        local_bcons: Some(bcons(iff)),
-    };
-    let (ctx_a, ctx_b) = (ctx(&iff_a), ctx(&iff_b));
-
     let res_a = resources(&iff_a);
     let res_b = resources(&iff_b);
+    let ctx = |iff: &Iff, res: &BTreeMap<([u8; 4], u16), usize>| LiveContext {
+        callee_arities: Some(arities(iff, res, &opts.extra_arities)),
+        my_attribute_count: opts.my_attribute_count,
+        local_bcons: Some(bcons(iff, res)),
+    };
+    let (ctx_a, ctx_b) = (ctx(&iff_a, &res_a), ctx(&iff_b, &res_b));
     let keys: BTreeSet<([u8; 4], u16)> = res_a.keys().chain(res_b.keys()).copied().collect();
     for (tag, id) in keys {
         if let Some(tree) = opts.tree
@@ -233,6 +245,15 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
                 why: "only in file B".to_owned(),
             },
             (None, None) => unreachable!("key comes from one of the files"),
+            // Run Tree By Name finds trees by their chunk label (`sims-vm/src/program.rs:607`).
+            (Some(ca), Some(cb))
+                if &tag == b"BHAV" && iff_a.label_bytes(ca) != iff_b.label_bytes(cb) =>
+            {
+                ResourceVerdict::Different {
+                    why: "chunk label differs (Run Tree By Name looks trees up by label)"
+                        .to_owned(),
+                }
+            }
             (Some(ca), Some(cb)) => {
                 if iff_a.label_bytes(ca) != iff_b.label_bytes(cb) {
                     notes.push("chunk label differs".to_owned());
@@ -247,13 +268,16 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
                         notes.push("editor metadata differs".to_owned());
                     }
                     ResourceVerdict::Identical
+                } else if &tag == b"BHAV" {
+                    // Even identical bytes behave differently against different constants
+                    // or callees, so the tree's context is checked too.
+                    compare_bhav(
+                        id, ca, cb, &iff_a, &iff_b, &ctx_a, &ctx_b, opts, &mut notes,
+                    )
                 } else if da == db && (fa == fb || !matches!(&tag, b"STR#" | b"CTSS" | b"TTAs")) {
                     ResourceVerdict::Identical
                 } else {
                     match &tag {
-                        b"BHAV" => compare_bhav(
-                            id, ca, cb, &iff_a, &iff_b, &ctx_a, &ctx_b, opts, &mut notes,
-                        ),
                         b"STR#" | b"CTSS" | b"TTAs" => compare_strings(da, fa, db, fb, &mut notes),
                         b"BCON" => compare_bcon(da, db, &mut notes),
                         _ => ResourceVerdict::Different {
@@ -338,6 +362,21 @@ fn compare_bhav(
     if a.trailing != b.trailing {
         notes.push("trailing bytes differ".to_owned());
     }
+    if iff_a.data(ca) == iff_b.data(cb) {
+        if let Some(reason) = context_mismatch(&a, ctx_a, &b, ctx_b) {
+            return ResourceVerdict::Inconclusive {
+                why: format!("same tree bytes, but {reason}"),
+            };
+        }
+        let callee_arity_differs = a.instructions.iter().any(|ins| {
+            ins.opcode >= 256
+                && ctx_a.callee_arities.as_ref().and_then(|m| m.get(&ins.opcode))
+                    != ctx_b.callee_arities.as_ref().and_then(|m| m.get(&ins.opcode))
+        });
+        if !callee_arity_differs {
+            return ResourceVerdict::Identical;
+        }
+    }
     let (method, result) =
         check_bhav_equivalent_combined(&a, ctx_a, &b, ctx_b, &opts.lockstep, &opts.live);
     match result {
@@ -362,6 +401,42 @@ fn compare_bhav(
     }
 }
 
+/// A string table's entries as the original's loader sees them (0x46feac): `None`
+/// language for layouts without one.
+fn effective_entries(table: &StringTable) -> Vec<(Option<u8>, Vec<u8>)> {
+    match table.format {
+        // The loader reads a leading word of 0 as a count of no strings (0x4700d7).
+        Format::Pascal => Vec::new(),
+        // Length-prefixed strings get bytes 0xa1 and 0xd5 rewritten (0x4700f5).
+        Format::MacResource => table
+            .entries
+            .iter()
+            .map(|e| {
+                let text = e
+                    .raw_text
+                    .iter()
+                    .map(|&c| match c {
+                        0xA1 => b'o',
+                        0xD5 => b'\'',
+                        c => c,
+                    })
+                    .collect();
+                (None, text)
+            })
+            .collect(),
+        Format::Terminated | Format::Commented => table
+            .entries
+            .iter()
+            .map(|e| (None, e.raw_text.clone()))
+            .collect(),
+        Format::Localized => table
+            .entries
+            .iter()
+            .map(|e| (Some(e.language), e.raw_text.clone()))
+            .collect(),
+    }
+}
+
 fn compare_strings(
     da: &[u8],
     fa: u16,
@@ -375,29 +450,41 @@ fn compare_strings(
     ) {
         (Ok(a), Ok(b)) => (a, b),
         _ => {
-            return ResourceVerdict::Different {
-                why: first_byte_difference(da, db),
+            return ResourceVerdict::Inconclusive {
+                why: format!(
+                    "a string table does not parse ({})",
+                    first_byte_difference(da, db)
+                ),
             };
         }
     };
-    if a.entries.len() != b.entries.len() {
-        return ResourceVerdict::Different {
+    // A table with languages is filed by language runs (0x46ffcc); only an identical
+    // sequence of (language, text) is known to load the same.
+    if (a.format == Format::Localized) != (b.format == Format::Localized) {
+        return ResourceVerdict::Inconclusive {
             why: format!(
-                "entry count differs ({} vs {})",
-                a.entries.len(),
-                b.entries.len()
+                "string table layouts {:?} and {:?} load entries by language differently",
+                a.format, b.format
             ),
         };
     }
-    let mut differing = Vec::new();
-    let mut comments = 0usize;
-    for (i, (x, y)) in a.entries.iter().zip(&b.entries).enumerate() {
-        if x.language != y.language || x.raw_text != y.raw_text {
-            differing.push(i);
-        } else if x.raw_comment != y.raw_comment {
-            comments += 1;
-        }
+    let (ea, eb) = (effective_entries(&a), effective_entries(&b));
+    if ea.len() != eb.len() {
+        return ResourceVerdict::Different {
+            why: format!(
+                "entry count as loaded differs ({} vs {})",
+                ea.len(),
+                eb.len()
+            ),
+        };
     }
+    let differing: Vec<usize> = ea
+        .iter()
+        .zip(&eb)
+        .enumerate()
+        .filter(|(_, (x, y))| x != y)
+        .map(|(i, _)| i)
+        .collect();
     if !differing.is_empty() {
         let shown: Vec<String> = differing.iter().take(8).map(usize::to_string).collect();
         let more = if differing.len() > 8 { ", ..." } else { "" };
@@ -416,11 +503,20 @@ fn compare_strings(
             a.format, b.format
         ));
     }
+    let comments = a
+        .entries
+        .iter()
+        .zip(&b.entries)
+        .filter(|(x, y)| x.raw_comment != y.raw_comment)
+        .count();
     if comments > 0 {
         notes.push(format!("{comments} entry comment(s) differ"));
     }
+    if a.entries.len() != b.entries.len() {
+        notes.push("entries the loader skips differ".to_owned());
+    }
     ResourceVerdict::Equivalent {
-        how: "same entries".to_owned(),
+        how: "same entries as loaded".to_owned(),
     }
 }
 
