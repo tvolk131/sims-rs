@@ -141,8 +141,9 @@ impl Interpreter<'_> {
             let id = world.indicators[slot];
             if id != 0 {
                 // 0x445f84 takes the indicator off the lot and deletes it
-                // directly; the reference is cleared after the deletion.
-                self.remove_now(world, id)?;
+                // directly with the interface switched off; the reference is
+                // cleared after the deletion.
+                self.remove_now_inner(world, id, false)?;
                 removed.push(id);
                 world.indicators[slot] = 0;
             }
@@ -164,12 +165,12 @@ impl Interpreter<'_> {
         }
         for id in stars_in_use.into_iter().chain(stars_avail) {
             if world.objects.contains_key(&id) {
-                self.remove_now(world, id)?;
+                self.remove_now_inner(world, id, false)?;
                 removed.push(id);
             }
         }
         while let Some(&id) = world.order.first() {
-            self.remove_now(world, id)?;
+            self.remove_now_inner(world, id, false)?;
             removed.push(id);
         }
         if let Some((&id, _)) = world.objects.first_key_value() {
@@ -202,11 +203,38 @@ impl Interpreter<'_> {
     /// (signal 0xf3), and first drops the interface's references to the
     /// object (0x447d8b). Both are presentation.
     pub fn remove_now(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        self.remove_now_inner(world, id, true)
+    }
+
+    /// Shared implementation of `0x44123f`. When `interface_enabled` is true
+    /// (every live removal outside `clear()`), runs the `0x447d8b -> 0x448097`
+    /// indicator unregistration prelude BEFORE physical removal and callbacks,
+    /// matching `legacy/crates/sims-sim/src/lot_removal/immediate.rs:38` and
+    /// `legacy/crates/sims-vm/src/indicator_unregister.rs:41..74`.
+    fn remove_now_inner(
+        &self,
+        world: &mut World,
+        id: u16,
+        interface_enabled: bool,
+    ) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
             trap,
         };
+        if interface_enabled
+            && world.objects.get(&id).is_some_and(|o| {
+                crate::load::INDICATORS.contains(&o.guid)
+                    || o.guid == crate::placement::STAR_MARKER
+                    || world.indicators.contains(&id)
+            })
+        {
+            for indicator in &mut world.indicators {
+                if *indicator == id {
+                    *indicator = 0;
+                }
+            }
+        }
         let person = world.objects.get(&id).is_some_and(|o| o.person.is_some());
         if person {
             if matches!(
@@ -983,13 +1011,16 @@ impl Interpreter<'_> {
 /// route contexts so immediate ID reuse cannot redirect a route onto an
 /// unrelated replacement object (target, door `word_68`, `objects[0]`,
 /// optionally asked person `objects[1]`, and candidate seats `word_c`).
+///
+/// Leaves `route.path` intact because path points are pure `[i32; 2]` world
+/// coordinates (no object IDs), `plan_route` clears `path` before planning,
+/// and an already `UNDER_WAY` route (`go_to_slot.rs:776`, `0x45b2f7`) requires
+/// a non-empty path to finish or retry without faulting.
 fn scrub_route_contexts(world: &mut World, victim: u16, scrub_asked: bool) {
     let victim_i16 = victim as i16;
     let victim_i32 = i32::from(victim);
     for route in world.routing.routes.values_mut() {
-        let last_index = route.contexts.len().saturating_sub(1);
-        let mut clear_path = false;
-        for (ctx_idx, context) in route.contexts.iter_mut().enumerate() {
+        for context in &mut route.contexts {
             if context.target == victim {
                 context.target = DELETED_ROUTE_TARGET;
             }
@@ -1013,9 +1044,6 @@ fn scrub_route_contexts(world: &mut World, victim: u16, scrub_asked: bool) {
                     {
                         context.chosen = -1;
                         context.best = -1;
-                        if ctx_idx == last_index {
-                            clear_path = true;
-                        }
                     } else {
                         let removed_before = context.candidates
                             [..chosen_idx.min(context.candidates.len())]
@@ -1029,14 +1057,8 @@ fn scrub_route_contexts(world: &mut World, victim: u16, scrub_asked: bool) {
                 if context.candidates.is_empty() {
                     context.chosen = -1;
                     context.best = -1;
-                    if ctx_idx == last_index {
-                        clear_path = true;
-                    }
                 }
             }
-        }
-        if clear_path {
-            route.path.clear();
         }
     }
 }

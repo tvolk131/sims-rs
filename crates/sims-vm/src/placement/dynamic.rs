@@ -178,12 +178,58 @@ impl Interpreter<'_> {
 /// on a damaged group. Never fails or loops even on broken links or missing
 /// intermediate/lead tiles.
 pub(crate) fn unlink_tile_force(world: &mut World, id: u16) {
-    let was_lead = world
+    let old_parent = world
         .objects
         .get(&id)
         .and_then(|o| o.multipart.as_ref())
-        .is_some_and(|m| m.parent == 0);
+        .map(|m| m.parent)
+        .unwrap_or(0);
     let next = world.next_parts.remove(&id);
+
+    // If `id` was a non-lead whose recorded lead is still alive, walk the
+    // chain from that lead so any missing intermediate tiles (e.g. `A -> B
+    // (missing) -> C`, removing `C`) are spliced out and dropped from
+    // `world.next_parts` as well.
+    if let Ok(lead) = u16::try_from(old_parent)
+        && lead != 0
+        && lead != id
+        && world
+            .objects
+            .get(&lead)
+            .is_some_and(|o| o.multipart.is_some())
+    {
+        let mut live_group = Vec::new();
+        let mut walk = Some(lead);
+        let mut group_seen = std::collections::BTreeSet::new();
+        while let Some(cur) = walk {
+            if !group_seen.insert(cur) {
+                break;
+            }
+            let after = if cur == id {
+                next
+            } else {
+                world.next_parts.get(&cur).copied()
+            };
+            if cur == id {
+                // Victim is being unlinked.
+            } else if world
+                .objects
+                .get(&cur)
+                .is_some_and(|o| o.multipart.is_some())
+            {
+                live_group.push(cur);
+            } else {
+                world.next_parts.remove(&cur);
+            }
+            walk = after;
+        }
+        for pair in live_group.windows(2) {
+            world.next_parts.insert(pair[0], pair[1]);
+        }
+        if let Some(&last) = live_group.last() {
+            world.next_parts.remove(&last);
+        }
+    }
 
     // Walk any successors after `id` (cycle-safe), dropping missing
     // intermediate nodes from `world.next_parts` so no broken `B -> C` link
@@ -249,9 +295,10 @@ pub(crate) fn unlink_tile_force(world: &mut World, id: u16) {
         part.parent = 0;
     }
 
-    // Repair any surviving tiles whose `parent` still names `id` (even if
-    // `id`'s own `parent` word was already corrupted) or whose recorded lead
-    // disappeared along `id`'s tail.
+    // Repair ONLY surviving tiles belonging to `id`'s group: tiles whose
+    // `parent` names `id`, or tiles directly reachable in `id`'s `live_tail`
+    // whose recorded lead is `id` or missing. Unrelated multipart groups on
+    // the lot are never touched or merged.
     let id_i16 = id as i16;
     let mut orphans: Vec<u16> = world
         .objects
@@ -262,7 +309,7 @@ pub(crate) fn unlink_tile_force(world: &mut World, id: u16) {
             }
             let part = obj.multipart.as_ref()?;
             let points_to_id = part.parent == id_i16;
-            let tail_lost_lead = (was_lead || live_tail.contains(&other_id))
+            let tail_lost_lead = live_tail.contains(&other_id)
                 && part.parent != 0
                 && u16::try_from(part.parent)
                     .ok()
@@ -365,16 +412,32 @@ fn unlink_tile(world: &mut World, id: u16) -> Result<(), Trap> {
             set_parent(world, next, 0)?;
         }
     } else {
-        // Validate the walk before splicing so a loop never leaves a partial
-        // rewrite behind.
+        // Validate the walk before splicing so a loop or missing intermediate
+        // tile (e.g. `A -> B (missing) -> C`) never leaves a damaged chain
+        // behind.
+        let require_tile = |tile: u16| -> Result<(), Trap> {
+            if world
+                .objects
+                .get(&tile)
+                .and_then(|o| o.multipart.as_ref())
+                .is_none()
+            {
+                return Err(Trap::Invalid(format!(
+                    "object {tile} is not a tile of a group"
+                )));
+            }
+            Ok(())
+        };
         let mut before = parent as u16;
+        require_tile(before)?;
         let mut patches = Vec::new();
-        let mut id_next = world.next_parts.get(&id).copied();
+        let id_next = world.next_parts.get(&id).copied();
         while let Some(after) = if before == id {
             id_next
         } else {
             world.next_parts.get(&before).copied()
         } {
+            require_tile(after)?;
             if after == id {
                 match id_next {
                     Some(next) if next == id => {
@@ -385,6 +448,7 @@ fn unlink_tile(world: &mut World, id: u16) -> Result<(), Trap> {
                         // Simulate re-reading `world.next_parts.get(&before)`
                         // after passing `id` over.
                         if let Some(next) = other {
+                            require_tile(next)?;
                             if !seen.insert(next) {
                                 return Err(Trap::Invalid("a group's tiles link in a loop".into()));
                             }
@@ -400,7 +464,6 @@ fn unlink_tile(world: &mut World, id: u16) -> Result<(), Trap> {
             }
             before = after;
         }
-        let _ = &mut id_next;
         for (pred, replacement) in patches {
             match replacement {
                 Some(next) => world.next_parts.insert(pred, next),

@@ -1562,7 +1562,14 @@ impl Interpreter<'_> {
                 }
                 if let Some(play) = play.as_deref_mut() {
                     let group_parts = self.parts(world, id).unwrap_or_else(|_| vec![id]);
-                    if let Err(fault) = self.remove_now(world, id) {
+                    let local_deleted = RefCell::new(Vec::new());
+                    let deleted_log = self.deleted.unwrap_or(&local_deleted);
+                    let deleted_before = deleted_log.borrow().len();
+                    let remover = Interpreter {
+                        deleted: Some(deleted_log),
+                        ..*self
+                    };
+                    if let Err(fault) = remover.remove_now(world, id) {
                         update.errors.push(ScriptError {
                             tick: world.ticks,
                             object: id,
@@ -1571,13 +1578,29 @@ impl Interpreter<'_> {
                             then: None,
                             recovery: Recovery::Parked(None),
                         });
+                        // Exclude any part ID already deleted during this
+                        // `remove_now` call: if a later part's Reset callback
+                        // created a brand-new object reusing that ID, the
+                        // fallback must NOT delete the replacement!
+                        let already_deleted: std::collections::BTreeSet<u16> = deleted_log.borrow()
+                            [deleted_before..]
+                            .iter()
+                            .copied()
+                            .collect();
+                        for &gone in &already_deleted {
+                            play.fresh.remove(&gone);
+                        }
                         for part in group_parts {
-                            for gone in self.force_remove_object(world, part, &mut update.errors) {
+                            if already_deleted.contains(&part) {
+                                continue;
+                            }
+                            for gone in remover.force_remove_object(world, part, &mut update.errors)
+                            {
                                 play.fresh.remove(&gone);
                             }
                         }
-                        if world.objects.contains_key(&id) {
-                            for gone in self.force_remove_object(world, id, &mut update.errors) {
+                        if !already_deleted.contains(&id) && world.objects.contains_key(&id) {
+                            for gone in remover.force_remove_object(world, id, &mut update.errors) {
                                 play.fresh.remove(&gone);
                             }
                         }

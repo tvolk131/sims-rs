@@ -692,6 +692,46 @@ fn deleting_a_person_handles_head_slot_indicator_without_leaving_stale_indicator
         // Selecting / deselecting nobody now succeeds without 0x0a.
         assert_eq!(interpreter.select(&mut world, None), Ok(()));
     }
+
+    // 3. Direct `remove_now` on an indicator unregisters `world.indicators`
+    // BEFORE callbacks run (`0x447d8b -> 0x448097`), so a Reset callback on
+    // the indicator already observes `world.indicators[0] == 0`.
+    {
+        let mut world = fx.world.clone();
+        let [first, _second] = interpreter.create_indicators(&mut world).unwrap();
+        assert_eq!(world.indicators[0], first);
+        // If `remove_now` faults during Reset, `0x447d8b` has already run
+        // before physical removal/Reset (`legacy/.../immediate.rs:38`), so
+        // `world.indicators[0]` is already unregistered (0).
+        let ind_guid = world.objects[&first].guid;
+        let def = fx
+            .catalog
+            .objects
+            .iter()
+            .find(|o| o.guid == ind_guid)
+            .unwrap()
+            .clone();
+        fx.add(def.resource, 4099, tree(vec![ins(2, ERROR, ERROR, [0; 8])]));
+        fx.program
+            .libraries
+            .get_mut(&def.resource)
+            .unwrap()
+            .callbacks
+            .insert(
+                def.chunk,
+                [0, 0, 0, 4099]
+                    .map(|action| ObjectFunction {
+                        condition: 0,
+                        action,
+                    })
+                    .to_vec(),
+            );
+        assert!(fx.interpreter().remove_now(&mut world, first).is_err());
+        assert_eq!(
+            world.indicators[0], 0,
+            "0x447d8b must unregister indicator before Reset/callbacks run"
+        );
+    }
 }
 
 #[test]

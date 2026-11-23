@@ -3151,6 +3151,7 @@ fn removal_scrubs_route_door_and_seat_candidates_preventing_id_reuse() {
     use sims_sim::route::{Candidate, Context, Route, RouteSlot};
 
     let mut fx = lot(sleeper());
+    fx.world.size = 64;
     // Give SIM_FILE a valid Main callback (4096) so SIM restarts at Main in
     // place while Sim 70 (whose definition has Main == 0) is parked instead.
     fx.program
@@ -3180,16 +3181,17 @@ fn removal_scrubs_route_door_and_seat_candidates_preventing_id_reuse() {
         .callbacks
         .insert(128, callbacks.to_vec());
 
-    // Add a surviving route target (88) and a door (89) to remove alongside
-    // faulting seat LAMP (1), ensuring neither holds SIM in its slots.
+    // Add a surviving on-lot route target (88) and a door (89) to remove
+    // alongside faulting seat LAMP (1), ensuring neither holds SIM in its slots.
     let mut target = fx.lamp().clone();
     target.id = 88;
-    target.position = [-16, -16, 1];
+    target.position = [32, 32, 1];
     target.data[2] = 0;
     target.slots.truncate(1);
     target.set_countdown(5);
     let mut door = target.clone();
     door.id = 89;
+    door.position = [-16, -16, 1];
     fx.world.objects.insert(88, target);
     fx.world.objects.insert(89, door);
     fx.world.order.extend([88, 89]);
@@ -3239,7 +3241,7 @@ fn removal_scrubs_route_door_and_seat_candidates_preventing_id_reuse() {
                 saved: [0; 2],
                 word_68: i32::from(89u16), // door 89
                 start: [0; 3],
-                byte_78: false,
+                byte_78: true,
                 objects: [LAMP, 0],
                 byte_84: false,
                 result: 0,
@@ -3276,9 +3278,362 @@ fn removal_scrubs_route_door_and_seat_candidates_preventing_id_reuse() {
     );
     assert_eq!(ctx.candidates.len(), 1);
     assert_eq!(ctx.chosen, -1, "invalidated chosen seat must reset to -1");
-    assert!(
-        route.path.is_empty(),
-        "path to deleted chosen seat must be cleared"
+    assert_eq!(
+        route.path,
+        vec![[0, 0], [16, 16]],
+        "active path coordinates must stay intact so UNDER_WAY does not fault at 0x45b2f7"
+    );
+
+    // Resuming an UNDER_WAY Go To Routing Slot frame after losing the chosen
+    // seat must NOT fault with `0x45b2f7 with no path`.
+    fx.add(
+        SIM_FILE,
+        4096,
+        tree(vec![
+            ins(45, 1, 1, [0, 0, 0, 0, 0, 0, 0, 0]),
+            ins(0, 1, ERROR, [0; 8]),
+        ]),
+    );
+    let sim = fx.sim_mut();
+    sim.set_countdown(-1);
+    sim.stack[0].tree = 4096;
+    sim.stack[0].node = 0;
+    sim.stack[0].stack_object = 88;
+    sim.stack[0].primitive_state = 3; // UNDER_WAY
+    let person = sim.person.as_mut().unwrap();
+    person.data.fill(0);
+    person.data[29] = 1;
+    person.data[32] = 1;
+    person.active.flags = 0;
+    let mut animator = sims_sim::animator::Animator::new(0);
+    animator.arrival = 1; // still walking
+    fx.world.animators.insert(SIM, animator);
+    // Run Go To Routing Slot directly via Strict Mode update: must stay in
+    // UNDER_WAY (3) and NOT fault with `0x45b2f7 with no path`!
+    let mut strict_fx = fx;
+    let u2 = update(&mut strict_fx, &mut answers(&[])).unwrap();
+    assert!(u2.full);
+    assert!(u2.errors.is_empty());
+    assert_eq!(
+        strict_fx.world.objects[&SIM].stack[0].primitive_state, 3,
+        "UNDER_WAY route must continue cleanly after chosen seat removal"
+    );
+}
+
+#[test]
+fn play_mode_failed_dynamic_unlink_of_non_lead_repairs_missing_intermediate_and_preserves_unrelated_groups()
+ {
+    use sims_formats::execution::ObjectFunction;
+    use sims_formats::saved_objects::Multipart;
+
+    let mut fx = lot(sleeper());
+    fx.world.size = 64;
+    let empty_grid = || sims_formats::lot::Array {
+        width: 64,
+        height: 64,
+        stride: 2,
+        encoding: 0,
+        data: vec![0; 64 * 64 * 2],
+    };
+    fx.world.arrays.insert(3, empty_grid());
+    fx.world.arrays.insert(103, empty_grid());
+    fx.world.rooms.map = [vec![0; 64 * 64], vec![0; 64 * 64]];
+    fx.world.rooms.rooms.insert(
+        0,
+        sims_sim::rooms::Room {
+            outdoors: true,
+            ..Default::default()
+        },
+    );
+    let lib = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    lib.definitions.get_mut(&128).unwrap()[10] = 1;
+    let mut master_def = lib.definitions[&128];
+    master_def[11] = -1;
+    lib.definitions.insert(129, master_def);
+    lib.definition_order.push(129);
+    let mut callbacks = vec![
+        ObjectFunction {
+            condition: 0,
+            action: 0,
+        };
+        9
+    ];
+    callbacks[1].action = 4096;
+    callbacks[8].action = 4096;
+    lib.callbacks.insert(128, callbacks);
+
+    // 1. Damaged chain: A (LAMP) -> B (91, MISSING!) -> C (92, non-lead with C.parent = A).
+    // 2. Completely UNRELATED damaged tile U (95) whose recorded lead 999 is
+    //    also missing; unlinking A or C must NEVER merge U into A/C's group!
+    let mut c = fx.lamp().clone();
+    c.id = 92;
+    c.position = [-16, -16, 1];
+    c.data[2] = 0;
+    c.slots.truncate(1);
+    c.set_countdown(5);
+    c.multipart = Some(Multipart {
+        parent: LAMP as i16,
+        group: [2, 0, 0],
+        offset: [2, 0, 0],
+    });
+    let mut unrelated = c.clone();
+    unrelated.id = 95;
+    unrelated.multipart = Some(Multipart {
+        parent: 999, // unrelated missing lead
+        group: [1, 0, 0],
+        offset: [1, 0, 0],
+    });
+    fx.world.objects.insert(92, c);
+    fx.world.objects.insert(95, unrelated);
+    fx.world.order.extend([92, 95]);
+    fx.world.next_parts.insert(LAMP, 91);
+    fx.world.next_parts.insert(91, 92);
+
+    let lamp = fx.lamp_mut();
+    lamp.set_countdown(5);
+    lamp.position = [-16, -16, 1];
+    lamp.data[2] = 0;
+    lamp.slots.truncate(1);
+    lamp.multipart = Some(Multipart {
+        parent: 0,
+        group: [0, 0, 0],
+        offset: [0, 0, 0],
+    });
+    // Queue non-lead C (92) first!
+    fx.world.removals = vec![92];
+
+    let mut play = Play::default();
+    let u1 = play_update(&mut fx, &mut play);
+    assert!(u1.full);
+    assert_eq!(u1.removed, vec![92]);
+    assert_eq!(u1.errors.len(), 1);
+    assert_eq!(u1.errors[0].recovery, Recovery::Reset);
+    assert!(!fx.world.objects.contains_key(&92));
+    // Surviving lead A (LAMP) must have its broken A -> 91 -> 92 links completely
+    // repaired so A is a clean standalone tile and unrelated tile 95 is untouched!
+    assert!(fx.world.objects.contains_key(&LAMP));
+    assert!(!fx.world.next_parts.contains_key(&LAMP));
+    assert!(!fx.world.next_parts.contains_key(&91));
+    assert_eq!(
+        fx.world.objects[&LAMP].multipart.as_ref().unwrap().parent,
+        0
+    );
+    assert_eq!(
+        fx.world.objects[&95].multipart.as_ref().unwrap().parent,
+        999,
+        "unrelated multipart tile 95 must never be merged"
+    );
+
+    // Now also verify that unlinking a lead with a missing successor does NOT
+    // sweep unrelated tile 95 into its surviving partner's group.
+    let mut partner = fx.lamp().clone();
+    partner.id = 93;
+    partner.multipart = Some(Multipart {
+        parent: LAMP as i16,
+        group: [1, 0, 0],
+        offset: [1, 0, 0],
+    });
+    fx.world.objects.insert(93, partner);
+    fx.world.order.push(93);
+    fx.world.next_parts.insert(LAMP, 94); // 94 is missing
+    fx.world.next_parts.insert(94, 93);
+    fx.world.removals = vec![LAMP];
+
+    let u2 = play_update(&mut fx, &mut play);
+    assert!(u2.full);
+    assert!(!fx.world.objects.contains_key(&LAMP));
+    assert_eq!(fx.world.objects[&93].multipart.as_ref().unwrap().parent, 0);
+    assert!(!fx.world.next_parts.contains_key(&93));
+    assert_eq!(
+        fx.world.objects[&95].multipart.as_ref().unwrap().parent,
+        999,
+        "unrelated tile 95 must not be merged when lead LAMP is force-unlinked"
+    );
+}
+
+#[test]
+fn play_mode_multipart_fallback_preserves_new_object_reusing_deleted_part_id() {
+    use sims_formats::execution::ObjectFunction;
+    use sims_formats::saved_objects::Multipart;
+
+    let mut fx = lot(sleeper());
+    fx.world.size = 64;
+    let empty_grid = || sims_formats::lot::Array {
+        width: 64,
+        height: 64,
+        stride: 2,
+        encoding: 0,
+        data: vec![0; 64 * 64 * 2],
+    };
+    fx.world.arrays.insert(3, empty_grid());
+    fx.world.arrays.insert(103, empty_grid());
+    fx.world.rooms.map = [vec![0; 64 * 64], vec![0; 64 * 64]];
+    fx.world.rooms.rooms.insert(
+        0,
+        sims_sim::rooms::Room {
+            outdoors: true,
+            ..Default::default()
+        },
+    );
+
+    // Lead tile (LAMP = 1) has a clean no-op Reset tree (returns true) so
+    // `delete_one(1)` deletes ID 1 completely.
+    // Partner tile (90) uses a distinct GUID (0x4444) whose Reset tree creates
+    // a brand-new single-tile object (GUID 0x5555, which the factory allocates
+    // at lowest free ID = 1, reusing LAMP's ID!) and THEN faults with ERROR!
+    let partner_guid = 0x4444u32;
+    let fresh_guid = 0x5555u32;
+    let fresh_bytes = fresh_guid.to_le_bytes();
+    // Create New Object Instance (opcode 42), mode 6 (out of world, no
+    // placement): operands[0..4] = GUID LE, operands[4] = 6.
+    let create_fresh = [
+        fresh_bytes[0],
+        fresh_bytes[1],
+        fresh_bytes[2],
+        fresh_bytes[3],
+        6,
+        0,
+        0,
+        0,
+    ];
+    // Lead Reset: simple Return True (assign temp 0 = 1 -> RETURN_TRUE).
+    fx.add(
+        LAMP_FILE,
+        4097,
+        tree(vec![assign(
+            scope::TEMPS,
+            0,
+            scope::LITERAL,
+            1,
+            RETURN_TRUE,
+        )]),
+    );
+    // Fresh object's Main tree (4099): set param 0 = 5, then Sleep(param 0)
+    // so `factory::create_single`'s first turn yields cleanly!
+    fx.add(
+        LAMP_FILE,
+        4099,
+        tree(vec![
+            assign(scope::PARAMETERS, 0, scope::LITERAL, 5, 1),
+            ins(0, 1, ERROR, [0; 8]),
+        ]),
+    );
+    // Partner Reset (4098): Create 0x5555 (reuses ID 1!) -> then ERROR!
+    fx.add(
+        LAMP_FILE,
+        4098,
+        tree(vec![ins(42, ERROR, ERROR, create_fresh)]),
+    );
+
+    let lib = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    lib.definitions.get_mut(&128).unwrap()[10] = 1;
+    let mut master_def = lib.definitions[&128];
+    master_def[11] = -1;
+    lib.definitions.insert(129, master_def);
+    lib.definition_order.push(129);
+
+    let mut partner_def = definition(partner_guid, 4);
+    partner_def[10] = 1;
+    lib.definitions.insert(130, partner_def);
+    lib.definition_order.push(130);
+
+    let mut fresh_def = [0i16; sims_vm::DEFINITION_WORDS];
+    fresh_def[9] = 4;
+    fresh_def[14] = fresh_guid as u16 as i16;
+    fresh_def[15] = (fresh_guid >> 16) as u16 as i16;
+    lib.definitions.insert(131, fresh_def);
+    lib.definition_order.push(131);
+
+    lib.callbacks.insert(
+        128,
+        [0, 4096, 0, 4097]
+            .map(|action| ObjectFunction {
+                condition: 0,
+                action,
+            })
+            .to_vec(),
+    );
+    lib.callbacks.insert(
+        130,
+        [0, 4096, 0, 4098]
+            .map(|action| ObjectFunction {
+                condition: 0,
+                action,
+            })
+            .to_vec(),
+    );
+    lib.callbacks.insert(
+        131,
+        [0, 4099]
+            .map(|action| ObjectFunction {
+                condition: 0,
+                action,
+            })
+            .to_vec(),
+    );
+    let partner_idx = fx.catalog.objects.len();
+    fx.catalog.objects.push(sims_content::Object {
+        guid: partner_guid,
+        resource: LAMP_FILE,
+        chunk: 130,
+        kind: 4,
+        master: 129,
+    });
+    fx.catalog.by_guid.insert(partner_guid, partner_idx);
+    let fresh_idx = fx.catalog.objects.len();
+    fx.catalog.objects.push(sims_content::Object {
+        guid: fresh_guid,
+        resource: LAMP_FILE,
+        chunk: 131,
+        kind: 4,
+        master: 0,
+    });
+    fx.catalog.by_guid.insert(fresh_guid, fresh_idx);
+    fx.world.types.insert(9, partner_guid);
+    fx.world.types.insert(10, fresh_guid);
+
+    let mut partner = fx.lamp().clone();
+    partner.id = 90;
+    partner.guid = partner_guid;
+    partner.position = [-16, -16, 1];
+    partner.data[2] = 0;
+    partner.slots.truncate(1);
+    partner.set_countdown(5);
+    partner.multipart = Some(Multipart {
+        parent: LAMP as i16,
+        group: [1, 0, 0],
+        offset: [1, 0, 0],
+    });
+    fx.world.objects.insert(90, partner);
+    fx.world.order.push(90);
+    fx.world.next_parts.insert(LAMP, 90);
+
+    let lamp = fx.lamp_mut();
+    lamp.set_countdown(5);
+    lamp.position = [-16, -16, 1];
+    lamp.data[2] = 0;
+    lamp.slots.truncate(1);
+    lamp.multipart = Some(Multipart {
+        parent: 0,
+        group: [0, 0, 0],
+        offset: [0, 0, 0],
+    });
+    fx.world.removals = vec![LAMP];
+
+    let mut play = Play::default();
+    let u1 = play_update(&mut fx, &mut play);
+    assert!(u1.full);
+    assert_eq!(u1.errors.len(), 1);
+    assert_eq!(u1.errors[0].recovery, Recovery::Parked(None));
+    // Partner 90 was force-removed, while the brand-new object 0x5555 that
+    // reused deleted lead ID 1 MUST SURVIVE!
+    assert!(!fx.world.objects.contains_key(&90));
+    assert_eq!(
+        fx.world.objects.get(&LAMP).map(|o| o.guid),
+        Some(fresh_guid),
+        "brand-new object reusing already-deleted part ID {LAMP} must survive fallback; errors={:?}, objects={:?}",
+        u1.errors,
+        fx.world.objects.keys().collect::<Vec<_>>()
     );
 }
 
@@ -3370,6 +3725,7 @@ fn play_mode_force_removal_repairs_use_counts_callback_free_and_parks_sim_withou
         ],
     );
     fx.program.libraries.insert(no_main_file, lib);
+    let no_main_idx = fx.catalog.objects.len();
     fx.catalog.objects.push(sims_content::Object {
         guid: no_main_guid,
         resource: no_main_file,
@@ -3377,6 +3733,7 @@ fn play_mode_force_removal_repairs_use_counts_callback_free_and_parks_sim_withou
         kind: 2,
         master: 0,
     });
+    fx.catalog.by_guid.insert(no_main_guid, no_main_idx);
     let mut sim_no_main = fx.world.objects[&SIM].clone();
     sim_no_main.id = 70;
     sim_no_main.guid = no_main_guid;
