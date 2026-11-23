@@ -16,15 +16,17 @@
 //! - `sims-antics build <pack_dir> --out <dir>`
 
 use sims_antics::{
-    EquivOptions, EquivResult, IffEquivOptions, IffVerdict, LiftOptions, LiveContext, LiveOptions,
-    ResourceVerdict, StructuredLiftOutcome, check_bhav_equivalent_combined,
-    check_bhav_equivalent_with_arities, check_iff_equivalent, compile_air, compile_pack_dir,
-    compile_standalone_pack_dir, compile_v2_object_file, expand_v2_to_air,
-    extract_lift_symbols_from_iff,
+    EquivOptions, EquivResult, IffEquivOptions, IffVerdict, LiftOptions, LiveOptions,
+    ResourceVerdict, StructuredLiftOutcome, check_bhav_equivalent_with_arities,
+    check_iff_equivalent, compile_air, compile_pack_dir, compile_standalone_pack_dir,
+    compile_v2_object_file, expand_v2_to_air, extract_lift_symbols_from_iff,
     lift::{format_bhav_labeled_air_with_context, format_bhav_raw_air, lift_bhav},
     lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
     v2::is_v2_source,
-    verify::{extract_bhav_arities_from_iff, extract_bhav_from_iff, single_file_problem},
+    verify::{
+        check_tree_with_callees, extract_bhav_arities_from_iff, extract_bhav_from_iff,
+        single_file_problem,
+    },
     verify_object_safety, verify_pack_safety,
 };
 use sims_formats::far;
@@ -157,7 +159,8 @@ fn print_usage() {
          sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]\n  \
          sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n    \
              (files must differ in BHAV bodies alone; DIFFERENT needs a sims-vm replay that ends differently;\n    \
-              EQUIVALENT assumes neither run exhausts the VM instruction budget; the same holds for equiv)\n  \
+              EQUIVALENT assumes neither run exhausts the VM instruction budget; the same holds for equiv;\n    \
+              a tree is EQUIVALENT only if every tree it may run is the same bytes or proven equivalent too)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>"
     );
@@ -1498,18 +1501,20 @@ fn run() -> Result<(), CliError> {
             } else {
                 read_regular_text_file(&antics_path)?
             };
-            let behaviors = if is_v2_source(&antics_src) {
-                compile_v2_object_file(&antics_path, pack_dir.as_deref())
-                    .map_err(|e| e.to_string())?
-                    .behaviors
+            // Side A: the compiled source, with its IFF when it is a v2 object.
+            let (behaviors, file_a) = if is_v2_source(&antics_src) {
+                let object = compile_v2_object_file(&antics_path, pack_dir.as_deref())
+                    .map_err(|e| e.to_string())?;
+                (object.behaviors, Some(object.iff_bytes))
             } else {
-                compile_air(&antics_src)
-                    .map_err(|e| e.to_string())?
-                    .behaviors
+                let module = compile_air(&antics_src).map_err(|e| e.to_string())?;
+                (module.behaviors, None)
             };
-            let bhav_a = behaviors.get(&tree_id).ok_or_else(|| {
-                format!("{} does not define tree #{tree_id}", antics_path.display())
-            })?;
+            if !behaviors.contains_key(&tree_id) {
+                return Err(
+                    format!("{} does not define tree #{tree_id}", antics_path.display()).into(),
+                );
+            }
             let (iff_file, iff_len, iff_hdr) = read_regular_file_prefix(&iff_path)?;
             let iff_bytes = read_bounded_iff_file(&iff_path, iff_file, iff_len, iff_hdr)?;
             // The tree compared must be the one every loader runs: one chunk per type
@@ -1518,12 +1523,23 @@ fn run() -> Result<(), CliError> {
             if let Some(problem) = single_file_problem(&parsed) {
                 return Err(format!("INCONCLUSIVE on tree #{tree_id}: {problem}").into());
             }
-            let bhav_b = extract_bhav_from_iff(&iff_bytes, tree_id).map_err(|e| e.to_string())?;
+            extract_bhav_from_iff(&iff_bytes, tree_id).map_err(|e| e.to_string())?;
+            // Side B: every tree of the IFF (one chunk per ID, checked above).
+            let trees_b: std::collections::BTreeMap<u16, _> = parsed
+                .chunks
+                .iter()
+                .filter(|c| &c.tag == b"BHAV")
+                .filter_map(|c| {
+                    lift_bhav(c.id, &c.label, parsed.data(c))
+                        .ok()
+                        .map(|bhav| (c.id, bhav))
+                })
+                .collect();
             // Each side calls the trees of its own file: the compiled source's for A,
             // the IFF's for B. A callee only one side defines has an unknown argument
             // count on the other, which the checkers treat as a possible difference.
             let arities_b = extract_bhav_arities_from_iff(&iff_bytes).unwrap_or_default();
-            let arities_a = behaviors
+            let arities_a: std::collections::BTreeMap<u16, usize> = behaviors
                 .iter()
                 .map(|(&id, bhav)| {
                     let argc = match bhav.format {
@@ -1534,19 +1550,16 @@ fn run() -> Result<(), CliError> {
                     (id, argc)
                 })
                 .collect();
-            let ctx_a = LiveContext {
-                callee_arities: Some(arities_a),
-                ..LiveContext::default()
-            };
-            let ctx_b = LiveContext {
-                callee_arities: Some(arities_b),
-                ..LiveContext::default()
-            };
-            let (method, result) = check_bhav_equivalent_combined(
-                bhav_a,
-                &ctx_a,
-                &bhav_b,
-                &ctx_b,
+            // The tree, and every tree it may run, must behave the same; a run that may
+            // read the file's other resources needs two IFFs that differ in BHAV bodies
+            // alone.
+            let (method, result) = check_tree_with_callees(
+                tree_id,
+                &behaviors,
+                file_a.as_deref(),
+                &trees_b,
+                Some(&iff_bytes),
+                (&arities_a, &arities_b),
                 &EquivOptions::default(),
                 &live_opts,
             );

@@ -20,8 +20,9 @@ mod iff;
 mod live;
 mod replay;
 pub use iff::{
-    IffEquivOptions, IffEquivReport, IffVerdict, ResourceReport, ResourceVerdict,
-    check_iff_equivalent, single_file_problem,
+    IffEquivOptions, IffEquivReport, IffVerdict, Reach, ResourceReport, ResourceVerdict,
+    check_iff_equivalent, check_tree_with_callees, same_tree_bytes, single_file_problem,
+    tree_reach,
 };
 pub use live::{GUARANTEED_ATTRIBUTES, LiveContext, LiveOptions, check_bhav_live_equivalent};
 
@@ -5619,6 +5620,28 @@ fn lockstep_suffices(
     // also end with equal contents, which covers frame residue.
     if trace.pairs.iter().any(|&(pa, pb)| pa != pb) {
         return false;
+    }
+    // Lockstep matches what nodes do, not how: two nodes that compute the same thing
+    // with different operands can still fault differently, or leave different partial
+    // state when they fault (`expression.rs:69`). So every node it ran must be the same
+    // bytes on both sides, and a call the same inline arguments after it too. Then the
+    // two runs are the same run.
+    let bytes = |ins: &Instruction| (ins.opcode, ins.on_true, ins.on_false, ins.operands);
+    for p in trace.pairs.iter().map(|&(p, _)| usize::from(p)) {
+        let (Some(ia), Some(ib)) = (a.instructions.get(p), b.instructions.get(p)) else {
+            return false;
+        };
+        if bytes(ia) != bytes(ib) {
+            return false;
+        }
+        if ia.opcode >= 256
+            && !a.instructions[p..]
+                .iter()
+                .map(bytes)
+                .eq(b.instructions[p..].iter().map(bytes))
+        {
+            return false;
+        }
     }
     if live.observe_last_result && trace.last_differs_mid_run {
         return false;

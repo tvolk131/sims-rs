@@ -14,7 +14,9 @@
 //!
 //! A run counts only if it returns: a fault (any VM trap, including running out of
 //! the instruction budget) means the witness shows nothing, so the result stays
-//! undecided.
+//! undecided. Two runs differ only in the plain words the replay defines and the VM
+//! reads back as stored (see `Observed`); a difference anywhere else in the world is
+//! not one this replay vouches for.
 
 use super::LiveOptions;
 use super::live::LiveContext;
@@ -22,7 +24,7 @@ use crate::ir::BhavChunk;
 use sims_content::Catalog;
 use sims_formats::behavior::Behavior;
 use sims_formats::saved_objects::Slot as SavedSlot;
-use sims_sim::{FrameStorage, Object, ScratchPtrs, World};
+use sims_sim::{FrameStorage, Object, World};
 use sims_vm::{DEFINITION_WORDS, Interpreter, Library, Program, Stream};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -37,6 +39,9 @@ const DEFINITION: u16 = 128;
 const BUDGET: usize = 100_000;
 /// Temps every object has (`sims-vm/src/memory.rs:438`).
 const TEMPS: usize = 8;
+/// The frame-storage word the replayed frame's parameters start at: the call marker
+/// and the frame header, eight words each.
+const FRAME_START: usize = 16;
 
 /// Concrete inputs for one replay.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -233,10 +238,12 @@ fn world(w: &Witness, attribute_count: usize) -> World {
     };
     let mut storage = FrameStorage::default();
     if let Some(&last) = w.frame_words.keys().next_back() {
-        // The outermost frame starts at word 0; its header is eight words.
-        storage.words = vec![Some(0); 8 + usize::from(last) + 1];
+        // `run_tree` runs the tree as a synchronous call: an eight-word call marker
+        // comes first (`interpreter.rs:1171`), then the frame's eight-word header, then
+        // its parameters and locals (`interpreter.rs:1217`).
+        storage.words = vec![Some(0); FRAME_START + usize::from(last) + 1];
         for (&k, &v) in &w.frame_words {
-            storage.words[8 + usize::from(k)] = Some(v);
+            storage.words[FRAME_START + usize::from(k)] = Some(v);
         }
     }
     World {
@@ -266,7 +273,13 @@ fn run(bhav: &BhavChunk, ctx: &LiveContext, w: &Witness, attributes: usize) -> O
     Some(Run { returned, world })
 }
 
-/// What a caller and later code can see of a run, under the observation policy.
+/// What a caller and later code can see of a run, field by field: the return value,
+/// the running object's temps, attributes and data words, the globals, and (when
+/// observed) the object's last branch result. These are plain words the VM reads back
+/// as stored (`sims-vm/src/memory.rs`). A difference anywhere else in the world (frame
+/// storage, scratch pointers, records the world keeps in another representation, such
+/// as advertisement deltas) is not one this replay can vouch for, so it never makes a
+/// counterexample.
 #[derive(Debug, PartialEq, Eq)]
 struct Observed {
     returned: bool,
@@ -275,63 +288,37 @@ struct Observed {
     data: Vec<i16>,
     globals: Vec<i16>,
     last_result: Option<bool>,
-    /// Frame-storage words past the outermost frame's header, trailing zeros trimmed
-    /// (words never written read as zero). The header is rewritten by the next
-    /// outermost frame, so nothing reads it back.
-    residue: Option<Vec<Option<i16>>>,
-    scratch: Option<String>,
-    /// Everything else in the lot.
-    rest: String,
 }
 
 fn observe(run: Run, opts: &LiveOptions) -> Observed {
-    let mut world = run.world;
-    let me = world.objects.get(&ME).cloned();
+    let me = run.world.objects.get(&ME).cloned();
     let (temps, attributes, data, last_result) = me.map_or_else(
         || (Vec::new(), Vec::new(), Vec::new(), false),
         |o| (o.temps, o.attributes, o.data, o.last_result),
     );
-    let residue = world.frame_storage.get(&ME).map(|s| {
-        let mut words: Vec<Option<i16>> = s.words.iter().skip(8).copied().collect();
-        while words.last() == Some(&Some(0)) {
-            words.pop();
-        }
-        words
-    });
-    let scratch = format!("{:?}", world.scratch_ptrs);
-    let globals = std::mem::take(&mut world.globals);
-    if let Some(o) = world.objects.get_mut(&ME) {
-        o.temps.clear();
-        o.attributes.clear();
-        o.data.clear();
-        o.last_result = false;
-    }
-    world.frame_storage = BTreeMap::new().into();
-    world.scratch_ptrs = ScratchPtrs::default();
     Observed {
         returned: run.returned,
         temps,
         attributes,
         data,
-        globals,
+        globals: run.world.globals,
         last_result: opts.observe_last_result.then_some(last_result),
-        residue: if opts.observe_frame_residue {
-            residue
-        } else {
-            None
-        },
-        scratch: opts.observe_scratch_pointer.then_some(scratch),
-        rest: format!("{world:?}"),
     }
 }
 
 impl Observed {
     fn difference(&self, other: &Self) -> Option<String> {
+        // Same-length words differ at an index; words of different lengths are a
+        // representation question this replay does not decide.
         fn first(name: &str, a: &[i16], b: &[i16]) -> Option<String> {
-            (a != b).then(|| match a.iter().zip(b).position(|(x, y)| x != y) {
-                Some(i) => format!("{name}[{i}] ends as {} on A but {} on B", a[i], b[i]),
-                None => format!("{name} differ in length"),
-            })
+            if a.len() != b.len() {
+                return None;
+            }
+            let i = a.iter().zip(b).position(|(x, y)| x != y)?;
+            Some(format!(
+                "{name}[{i}] ends as {} on A but {} on B",
+                a[i], b[i]
+            ))
         }
         if self.returned != other.returned {
             return Some(format!(
@@ -347,17 +334,55 @@ impl Observed {
                 (self.last_result != other.last_result)
                     .then(|| "the last branch results differ".to_owned())
             })
-            .or_else(|| {
-                (self.residue != other.residue).then(|| {
-                    "the frame storage left behind differs (later frames read it as their \
-                     initial locals)"
-                        .to_owned()
-                })
-            })
-            .or_else(|| {
-                (self.scratch != other.scratch)
-                    .then(|| "the scratch-pointer state differs".to_owned())
-            })
-            .or_else(|| (self.rest != other.rest).then(|| "other lot state differs".to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sims_formats::behavior::Instruction;
+
+    /// `temp[dst] = scope[idx]`.
+    fn copy_to_temp(dst: i16, scope: u8, idx: i16, next: u8) -> Instruction {
+        let [d0, d1] = dst.to_le_bytes();
+        let [i0, i1] = idx.to_le_bytes();
+        Instruction {
+            opcode: 2,
+            on_true: next,
+            on_false: next,
+            operands: [d0, d1, i0, i1, 0, 5, 8, scope],
+        }
+    }
+
+    /// The replay reads back exactly the witness frame: parameters as passed, and each
+    /// frame word as the local the witness names it for.
+    #[test]
+    fn replay_frame_reads_back_the_witness() {
+        let bhav = BhavChunk {
+            id: 4096,
+            label: String::new(),
+            format: 0x8002,
+            kind: 0,
+            args: 2,
+            locals: 2,
+            revision: 0,
+            instructions: vec![
+                copy_to_temp(0, 25, 0, 1),
+                copy_to_temp(1, 25, 1, 2),
+                copy_to_temp(2, 9, 0, 3),
+                copy_to_temp(3, 9, 1, 0xFE),
+            ],
+            trailing: Vec::new(),
+        };
+        // Frame words are keyed `args + local`.
+        let w = Witness {
+            params: vec![5, -6],
+            frame_words: BTreeMap::from([(2, 7), (3, -3)]),
+            ..Witness::default()
+        };
+        let run = run(&bhav, &LiveContext::default(), &w, 8).expect("the run returns");
+        assert!(run.returned);
+        let temps = &run.world.objects[&ME].temps;
+        assert_eq!(&temps[..4], &[7, -3, 5, -6]);
     }
 }

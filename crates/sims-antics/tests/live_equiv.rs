@@ -433,15 +433,29 @@ fn scratch_pointer_state_before_primitives_is_observed() {
         &tree(4096, 0, 0, vec![call.clone()]),
         &tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), 1, 1), call]),
     ));
-    // The test before the sound also sets the last result.
+    // The test before the sound also sets the last result, and moves the sound to node
+    // 1, where a failing (or yielding) sound leaves the frame: still undecided with
+    // neither the scratch pointer nor the last result observed.
     let lenient = LiveOptions {
         observe_scratch_pointer: false,
         observe_last_result: false,
         ..LiveOptions::default()
     };
+    match live_with(&bare, &after_expression, &LiveContext::default(), &lenient) {
+        EquivResult::Inconclusive { reason } => assert!(reason.contains("node"), "{reason}"),
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+    // After the sound, the same test is only a scratch-pointer and last-result change.
+    let expression_after = tree(
+        4096,
+        0,
+        0,
+        vec![prim(23, sound, 1, 1), expr((LIT, 0), EQ, (LIT, 0), T, T)],
+    );
+    assert_inconclusive(&live(&bare, &expression_after));
     assert_equivalent(&live_with(
         &bare,
-        &after_expression,
+        &expression_after,
         &LiveContext::default(),
         &lenient,
     ));
@@ -1434,15 +1448,40 @@ fn faults_keep_their_state() {
     let false_test = before(expr((LIT, 0), EQ, (LIT, 1), 1, 1));
     assert_inconclusive(&live(&true_test, &false_test));
     let ctx = LiveContext::default();
-    let (_, combined) = check_bhav_equivalent_combined(
-        &true_test,
-        &ctx,
-        &false_test,
-        &ctx,
-        &EquivOptions::default(),
-        &LiveOptions::default(),
-    );
-    assert_inconclusive(&combined);
+    // The fault keeps the last result even when the caller does not observe it at exit
+    // (`--ignore-last-result`).
+    for opts in [LiveOptions::default(), ignoring_last_result()] {
+        match live_with(&true_test, &false_test, &ctx, &opts) {
+            EquivResult::Inconclusive { reason } => {
+                assert!(reason.contains("from different states"), "{reason}");
+            }
+            other => panic!("expected Inconclusive, got {other:?}"),
+        }
+        let (_, combined) = check_bhav_equivalent_combined(
+            &true_test,
+            &ctx,
+            &false_test,
+            &ctx,
+            &EquivOptions::default(),
+            &opts,
+        );
+        assert_inconclusive(&combined);
+    }
+
+    // A square root of -1 into an unwritten local or into a temp: both fault at node 0
+    // with the same state before it, but the VM clears the local's unknown marker
+    // before it faults (`expression.rs:69`), so the instructions must match too.
+    let sqrt_into = |scope: u8| tree(4096, 0, 1, vec![expr((scope, 0), 20, (LIT, -1), T, ERR)]);
+    match live(&sqrt_into(LOCAL), &sqrt_into(TEMP)) {
+        EquivResult::Inconclusive { reason } => {
+            assert!(
+                reason.contains("from different states or instructions"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+    assert_equivalent(&live(&sqrt_into(LOCAL), &sqrt_into(LOCAL)));
 
     // The same fault after a dummy node is at a different node, even with nothing else
     // observed.
@@ -1471,41 +1510,48 @@ fn faults_keep_their_state() {
 }
 
 /// Lockstep matches renumbered nodes, but a fault there would leave the frame at a
-/// different node, so its proof is taken only for nodes that keep their numbers.
+/// different node. Both trees run the same test at node 0; its targets lead to their
+/// own divisions, which B numbers the other way round. Every path computes the same,
+/// so only the node a division faults at tells them apart.
 #[test]
 fn renumbered_faulting_nodes_are_undecided() {
-    let divide = expr((TEMP, 0), DIV, (TEMP, 1), T, ERR);
-    let filler = expr((LIT, 0), EQ, (LIT, 0), T, T);
-    let first = tree(4096, 0, 0, vec![divide.clone(), filler.clone()]);
-    let renumbered = tree(
+    let test = |t, f| expr((TEMP, 0), EQ, (LIT, 0), t, f);
+    let first_divide = expr((TEMP, 1), DIV, (TEMP, 2), T, ERR);
+    let second_divide = expr((TEMP, 3), DIV, (TEMP, 4), T, ERR);
+    let a = tree(
         4096,
         0,
         0,
-        vec![
-            Instruction {
-                on_true: 2,
-                on_false: 2,
-                ..filler.clone()
-            },
-            filler.clone(),
-            divide.clone(),
-        ],
+        vec![test(1, 2), first_divide.clone(), second_divide.clone()],
+    );
+    let b = tree(
+        4096,
+        0,
+        0,
+        vec![test(2, 1), second_divide.clone(), first_divide.clone()],
     );
     let ctx = LiveContext::default();
     let (_, result) = check_bhav_equivalent_combined(
-        &first,
+        &a,
         &ctx,
-        &renumbered,
+        &b,
         &ctx,
         &EquivOptions::default(),
         &LiveOptions::default(),
     );
-    assert_inconclusive(&result);
+    match result {
+        EquivResult::Inconclusive { reason } => {
+            assert!(reason.contains("at different nodes"), "{reason}");
+        }
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+    // Lockstep alone pairs the renumbered nodes.
+    assert_equivalent(&check_bhav_equivalent(&a, &b, &EquivOptions::default()));
     // The same trees with the same numbering are proven node for node.
     let (method, result) = check_bhav_equivalent_combined(
-        &first,
+        &a,
         &ctx,
-        &first.clone(),
+        &a.clone(),
         &ctx,
         &EquivOptions::default(),
         &LiveOptions::default(),
@@ -1551,9 +1597,77 @@ fn resource_maps_compare_by_the_chunks_they_select() {
     let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
     assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
 
+    // Keep the map in B and change only its contents: its unused word, then the pad
+    // byte after an entry's label, which the map parser skips but is still a byte of
+    // the file.
+    let map_at = u32::from_be_bytes(b[60..64].try_into().unwrap()) as usize + 76;
+    for at in [12, 37] {
+        let mut changed = b.clone();
+        changed[map_at + at] ^= 0x5A;
+        let report =
+            check_iff_equivalent(&a, &changed, &IffEquivOptions::default()).expect("check");
+        assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+        assert!(
+            report.file_problems[0].contains("rsmp #0 (the resource map) differs"),
+            "{report:#?}"
+        );
+    }
+
     let unmapped = write_iff(&[bhav_chunk(&long, "T"), strings]).expect("write");
     let report = check_iff_equivalent(&a, &unmapped, &IffEquivOptions::default()).expect("check");
     assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+}
+
+/// The file header and every chunk header are compared byte for byte: a resource map
+/// that only one file's header points at (bytes 60..64 zeroed in B, so B is read in
+/// physical order), and label bytes after the terminator.
+#[test]
+fn file_and_chunk_headers_compare_byte_for_byte() {
+    let short = tree(4096, 0, 0, vec![expr((TEMP, 0), SET, (LIT, 7), T, ERR)]);
+    let long = tree(
+        4096,
+        0,
+        0,
+        vec![
+            expr((TEMP, 0), SET, (LIT, 5), 1, ERR),
+            expr((TEMP, 0), SET, (LIT, 7), T, ERR),
+        ],
+    );
+    // Two string tables, which the map lists in reverse physical order.
+    let chunks = |bhav: &BhavChunk| {
+        [
+            bhav_chunk(bhav, "T"),
+            str_chunk(128, &[("a", "")]),
+            str_chunk(129, &[("b", "")]),
+        ]
+    };
+    let a = write_with_map(&chunks(&short), &[0, 2, 1]);
+    let b = write_with_map(&chunks(&long), &[0, 2, 1]);
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+    let mut unmapped = b.clone();
+    unmapped[60..64].fill(0);
+    let report = check_iff_equivalent(&a, &unmapped, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+    assert!(
+        report.file_problems[0].contains("the file header"),
+        "{report:#?}"
+    );
+
+    // A byte after the NUL that ends a string table's (empty) label.
+    let plain = |bhav: &BhavChunk| {
+        write_iff(&[bhav_chunk(bhav, "T"), str_chunk(128, &[("a", "")])]).expect("write")
+    };
+    let (a, mut b) = (plain(&short), plain(&long));
+    let strings_at = 64 + 76 + encode_bhav(&long).unwrap().len();
+    assert_eq!(&b[strings_at..strings_at + 4], b"STR#");
+    b[strings_at + 12 + 5] = b'x';
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+    assert!(
+        report.file_problems[0].contains("STR# #128 has different labels"),
+        "{report:#?}"
+    );
 }
 
 /// `equiv` refuses an IFF whose target tree is not the only chunk of its type and ID.
@@ -1583,4 +1697,225 @@ fn equiv_requires_a_single_copy() {
         stderr.contains("INCONCLUSIVE") && stderr.contains("more than one chunk"),
         "{stderr}"
     );
+}
+
+/// Any primitive may fault (Random with a zero range raises native error 4,
+/// `random.rs`), and the fault leaves the frame at the primitive's node: the same
+/// Random at node 1 in A and node 2 in B is undecided.
+#[test]
+fn primitives_may_fault_at_their_node() {
+    let random = prim(8, [0, 0, 8, 0, 0, 0, 7, 0], T, T);
+    let filler = |next| expr((LIT, 0), EQ, (LIT, 0), next, next);
+    let a = tree(4096, 0, 0, vec![filler(1), random.clone()]);
+    let b = tree(4096, 0, 0, vec![filler(1), filler(2), random.clone()]);
+    let ctx = LiveContext::default();
+    let relaxed = LiveOptions {
+        observe_last_result: false,
+        observe_frame_residue: false,
+        observe_scratch_pointer: false,
+        ..LiveOptions::default()
+    };
+    for opts in [LiveOptions::default(), relaxed] {
+        match live_with(&a, &b, &ctx, &opts) {
+            EquivResult::Inconclusive { reason } => {
+                assert!(reason.contains("node"), "{reason}");
+            }
+            other => panic!("expected Inconclusive, got {other:?}"),
+        }
+        let (_, combined) =
+            check_bhav_equivalent_combined(&a, &ctx, &b, &ctx, &EquivOptions::default(), &opts);
+        assert_inconclusive(&combined);
+    }
+    // At the same node but after different last results, with nothing but the fault
+    // observing them.
+    let after = |test: Instruction| tree(4096, 0, 0, vec![test, random.clone()]);
+    match live_with(
+        &after(expr((LIT, 0), EQ, (LIT, 0), 1, 1)),
+        &after(expr((LIT, 0), EQ, (LIT, 1), 1, 1)),
+        &ctx,
+        &relaxed,
+    ) {
+        EquivResult::Inconclusive { reason } => {
+            assert!(reason.contains("from different states"), "{reason}");
+        }
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+    // At the same node, from the same state, the two faults are the same.
+    let c = tree(
+        4096,
+        0,
+        0,
+        vec![
+            filler(1),
+            Instruction {
+                on_false: F,
+                ..random
+            },
+        ],
+    );
+    assert_equivalent(&live(&a, &c));
+}
+
+/// A counterexample from locals and temps: the replay must run from the frame and the
+/// temps the witness names (the frame sits after `run_tree`'s call marker).
+#[test]
+fn replays_seed_locals_and_temps() {
+    let set_if = |lhs: (u8, i16), v: i16| {
+        tree(
+            4096,
+            0,
+            1,
+            vec![
+                expr(lhs, EQ, (LIT, v), 1, T),
+                expr((TEMP, 0), SET, (LIT, 1), T, ERR),
+            ],
+        )
+    };
+    for lhs in [(LOCAL, 0), (TEMP, 1)] {
+        match live(&set_if(lhs, 1), &set_if(lhs, 2)) {
+            EquivResult::Counterexample { divergence, .. } => {
+                assert!(divergence.contains("temp[0] ends as"), "{divergence}");
+            }
+            other => panic!("expected Counterexample for {lhs:?}, got {other:?}"),
+        }
+    }
+}
+
+/// The replay compares the words it defines, field by field. Writing a zero
+/// advertisement delta turns the world's "no advertisements copied yet" into sixteen
+/// zeroed ones: a different representation of what the VM reads back as the same
+/// zeros, so it is no counterexample.
+#[test]
+fn replay_ignores_representation_changes() {
+    let write_delta = tree(
+        4096,
+        0,
+        0,
+        vec![
+            expr((12, 0), SET, (LIT, 0), 1, ERR),
+            expr((LIT, 0), EQ, (LIT, 0), T, T),
+        ],
+    );
+    let nothing = tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    match live(&write_delta, &nothing) {
+        EquivResult::Inconclusive { reason } => {
+            assert!(
+                reason.contains("no sims-vm replay confirmed it"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+}
+
+/// `equiv` trusts a call only as far as the callee: the same tree calling a 4097 that
+/// returns true in the source but false in the IFF is undecided, while a callee that
+/// is the same bytes, or proven equivalent, keeps the proof.
+#[test]
+fn equiv_checks_the_trees_a_tree_calls() {
+    let dir = scratch_dir("equiv-callee");
+    let source = dir.join("a.antics");
+    let main = r#"tree 4096 "Main" { if call 4097(temps) { return true; } return false; }"#;
+    std::fs::write(
+        &source,
+        format!("{main}\ntree 4097 \"Callee\" {{ return true; }}\n"),
+    )
+    .unwrap();
+    let root = air(main, 4096);
+    let callee = |instructions| tree(4097, 0, 0, instructions);
+    let run = |callee: &BhavChunk| {
+        let iff = dir.join("b.iff");
+        std::fs::write(
+            &iff,
+            write_iff(&[bhav_chunk(&root, "Main"), bhav_chunk(callee, "Callee")]).unwrap(),
+        )
+        .unwrap();
+        let out = cli()
+            .arg("equiv")
+            .arg(&source)
+            .arg(&iff)
+            .args(["--tree", "4096"])
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let returns = |target| expr((LIT, 0), EQ, (LIT, 0), target, target);
+    let (ok, text) = run(&callee(vec![returns(F)]));
+    assert!(
+        !ok && text.contains("INCONCLUSIVE") && text.contains("tree #4097"),
+        "{text}"
+    );
+    // The same callee, and one that returns true after a dummy node.
+    let same = air(r#"tree 4097 "Callee" { return true; }"#, 4097);
+    let (ok, text) = run(&same);
+    assert!(ok && text.contains("EQUIVALENT"), "{text}");
+    let dummy = callee(vec![expr((ATTR, 0), GT, (ATTR, 0), 1, 1), returns(T)]);
+    let (ok, text) = run(&dummy);
+    assert!(ok && text.contains("EQUIVALENT"), "{text}");
+}
+
+/// In whole-file mode a tree is the same only if every tree it may run is: an
+/// identical tree that calls an undecided one is undecided too, alone (`--tree`) or
+/// with the whole file.
+#[test]
+fn whole_file_trees_depend_on_their_callees() {
+    let root = air(
+        r#"tree 4096 "Main" { if call 4097(temps) { return true; } return false; }"#,
+        4096,
+    );
+    let file = |callee: Instruction| {
+        write_iff(&[
+            bhav_chunk(&root, "Main"),
+            bhav_chunk(&tree(4097, 0, 0, vec![callee]), "Callee"),
+        ])
+        .unwrap()
+    };
+    // Both callees return true, but leave different last results: undecided.
+    let a = file(expr((LIT, 0), EQ, (LIT, 0), T, T));
+    let b = file(expr((LIT, 0), EQ, (LIT, 1), T, T));
+    for tree in [None, Some(4096)] {
+        let opts = IffEquivOptions {
+            tree,
+            ..IffEquivOptions::default()
+        };
+        let report = check_iff_equivalent(&a, &b, &opts).expect("check");
+        assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+        let main = report.resources.iter().find(|r| r.id == 4096).unwrap();
+        match &main.verdict {
+            ResourceVerdict::Inconclusive { why } => {
+                assert!(why.contains("may run tree #4097"), "{why}");
+            }
+            other => panic!("expected Inconclusive, got {other:?}"),
+        }
+    }
+    // A callee proven equivalent keeps the caller identical.
+    let dummy = write_iff(&[
+        bhav_chunk(&root, "Main"),
+        bhav_chunk(
+            &tree(
+                4097,
+                0,
+                0,
+                vec![
+                    expr((ATTR, 0), GT, (ATTR, 0), 1, 1),
+                    expr((LIT, 0), EQ, (LIT, 0), T, T),
+                ],
+            ),
+            "Callee",
+        ),
+    ])
+    .unwrap();
+    let opts = IffEquivOptions {
+        tree: Some(4096),
+        ..IffEquivOptions::default()
+    };
+    let report = check_iff_equivalent(&a, &dummy, &opts).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
 }

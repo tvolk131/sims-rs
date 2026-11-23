@@ -1,14 +1,14 @@
 //! Whole-file equivalence: two IFF files that differ only in `BHAV` bodies.
 //!
-//! The comparison is strict about structure. Unless both files have the same chunks in
-//! the same physical order (type, ID, label, header flags and effective resource-map
-//! flags alike), every chunk that is not a `BHAV` is byte-identical, neither file has
-//! two chunks of one type and ID, and both have the same resource map (or neither has
-//! one), the result is `Inconclusive`: the loaders (the original's and `sims-vm`'s)
-//! would otherwise have to be modeled for every resource type, and each round of
-//! review found another loader corner. Within that precondition only `BHAV` bodies
-//! differ, and each differing pair goes through [`check_bhav_equivalent_combined`].
-//! Reports name chunks only, never their contents.
+//! The comparison is strict about structure. Unless both files are the same bytes
+//! apart from `BHAV` bodies (and the sizes and offsets those move; see
+//! `structure_problem`), and neither file has two chunks of one type and ID, the result
+//! is `Inconclusive`: the loaders (the original's and `sims-vm`'s) would otherwise
+//! have to be modeled for every resource type, and each round of review found another
+//! loader corner. Within that precondition only `BHAV` bodies differ, and each
+//! differing pair goes through [`check_bhav_equivalent_combined`]. A tree counts as the
+//! same only if every tree it may run does too ([`tree_reach`]). Reports name chunks
+//! only, never their contents.
 
 use super::{
     EquivMethod, EquivOptions, EquivResult, LiveContext, LiveOptions, bhav_param_limit,
@@ -19,8 +19,8 @@ use crate::ir::BhavChunk;
 use crate::lift::lift_bhav;
 use sims_formats::behavior::Behavior;
 use sims_formats::execution::constants;
-use sims_formats::iff::{Chunk, Iff, ResourceMap};
-use std::collections::BTreeMap;
+use sims_formats::iff::{Chunk, Iff};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Options for [`check_iff_equivalent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,21 +168,41 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         local_bcons: Some(bcons(iff)),
     };
     let (ctx_a, ctx_b) = (ctx(&iff_a), ctx(&iff_b));
+    // The structure check leaves the same chunks, in the same order, on both sides.
+    let (trees_a, trees_b) = (lift_all(&iff_a), lift_all(&iff_b));
+    let ids: BTreeSet<u16> = iff_a
+        .chunks
+        .iter()
+        .filter(|c| &c.tag == b"BHAV")
+        .map(|c| c.id)
+        .collect();
+    let needed: BTreeSet<u16> = match opts.tree {
+        Some(tree) => tree_reach(tree, &ids, &trees_a, &trees_b).trees,
+        None => ids.clone(),
+    };
+    let mut verdicts: BTreeMap<u16, (ResourceVerdict, Vec<String>)> = BTreeMap::new();
     for (ca, cb) in iff_a.chunks.iter().zip(&iff_b.chunks) {
+        if &ca.tag == b"BHAV" && needed.contains(&ca.id) {
+            let mut notes = Vec::new();
+            let verdict = compare_bhav(
+                ca.id, ca, cb, &iff_a, &iff_b, &ctx_a, &ctx_b, opts, &mut notes,
+            );
+            verdicts.insert(ca.id, (verdict, notes));
+        }
+    }
+    for ca in &iff_a.chunks {
         let is_bhav = &ca.tag == b"BHAV";
-        if let Some(tree) = opts.tree
-            && is_bhav
-            && ca.id != tree
-        {
+        if is_bhav && opts.tree.is_some_and(|tree| ca.id != tree) {
             continue;
         }
-        let mut notes = Vec::new();
-        let verdict = if is_bhav {
-            compare_bhav(
-                ca.id, ca, cb, &iff_a, &iff_b, &ctx_a, &ctx_b, opts, &mut notes,
+        let (verdict, notes) = if is_bhav {
+            let (verdict, notes) = verdicts[&ca.id].clone();
+            (
+                needs_callees(ca.id, verdict, &ids, &trees_a, &trees_b, &verdicts),
+                notes,
             )
         } else {
-            ResourceVerdict::Identical
+            (ResourceVerdict::Identical, Vec::new())
         };
         report.resources.push(ResourceReport {
             tag: ca.tag,
@@ -192,6 +212,223 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         });
     }
     Ok(report)
+}
+
+/// Every `BHAV` of the file that lifts, by ID.
+fn lift_all(iff: &Iff) -> BTreeMap<u16, BhavChunk> {
+    iff.chunks
+        .iter()
+        .filter(|c| &c.tag == b"BHAV")
+        .filter_map(|c| lift(iff, c).ok().map(|b| (c.id, b)))
+        .collect()
+}
+
+/// `verdict` for tree `id`, unless a tree it may run was not shown to behave the same.
+///
+/// Both checkers treat a call (and a primitive that runs a tree) as an event: equal
+/// events from equal states do the same thing only if the trees they run do. So a tree
+/// is the same only if every tree in its reach ([`tree_reach`]) is the same bytes or was
+/// itself proven equivalent. Cycles are fine: by induction on the length of a run
+/// within the instruction budget, every tree of a reach whose trees were each proven
+/// equivalent under that assumption behaves the same.
+fn needs_callees(
+    id: u16,
+    verdict: ResourceVerdict,
+    ids: &BTreeSet<u16>,
+    trees_a: &BTreeMap<u16, BhavChunk>,
+    trees_b: &BTreeMap<u16, BhavChunk>,
+    verdicts: &BTreeMap<u16, (ResourceVerdict, Vec<String>)>,
+) -> ResourceVerdict {
+    if !matches!(
+        verdict,
+        ResourceVerdict::Identical | ResourceVerdict::Equivalent { .. }
+    ) {
+        return verdict;
+    }
+    let reach = tree_reach(id, ids, trees_a, trees_b);
+    for dep in reach.trees.iter().filter(|&&t| t != id) {
+        match verdicts.get(dep).map(|(v, _)| v) {
+            Some(ResourceVerdict::Identical | ResourceVerdict::Equivalent { .. }) => {}
+            Some(ResourceVerdict::Different { .. } | ResourceVerdict::Inconclusive { .. })
+            | None => {
+                return ResourceVerdict::Inconclusive {
+                    why: format!(
+                        "tree #{id} may run tree #{dep}{}, which was not shown to behave \
+                         the same",
+                        if reach.opaque {
+                            " (a primitive or a call outside the file may run any tree of \
+                             the object)"
+                        } else {
+                            ""
+                        }
+                    ),
+                };
+            }
+        }
+    }
+    verdict
+}
+
+/// The trees a run of a tree may enter, over both sides' trees.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reach {
+    /// The tree itself and every tree it may run.
+    pub trees: BTreeSet<u16>,
+    /// Whether one of them has a primitive or calls a tree neither side defines: those
+    /// may run any tree of the object (Run Tree By Name, functional trees, found
+    /// actions, Idle For Input, routing callbacks, Create, ...), and read any resource
+    /// of its file.
+    pub opaque: bool,
+    /// Whether one of them reads a tuning constant (scope 26), a `BCON` of a file.
+    pub reads_constants: bool,
+}
+
+impl Reach {
+    /// Whether a run may read resources of the trees' files other than the trees.
+    #[must_use]
+    pub fn reads_file(&self) -> bool {
+        self.opaque || self.reads_constants
+    }
+}
+
+/// `root` and every tree a run of it may enter. `ids` is every tree either side
+/// defines; `a` and `b` are the ones that lift. Every instruction counts, reachable or
+/// not (inline call arguments included): a call enters its callee, and a primitive or
+/// a call to a tree outside `ids` may enter every tree in `ids`.
+#[must_use]
+pub fn tree_reach(
+    root: u16,
+    ids: &BTreeSet<u16>,
+    a: &BTreeMap<u16, BhavChunk>,
+    b: &BTreeMap<u16, BhavChunk>,
+) -> Reach {
+    let mut reach = Reach::default();
+    let mut work = vec![root];
+    while let Some(id) = work.pop() {
+        if !reach.trees.insert(id) {
+            continue;
+        }
+        for bhav in [a.get(&id), b.get(&id)].into_iter().flatten() {
+            for ins in &bhav.instructions {
+                match ins.opcode {
+                    2 => reach.reads_constants |= ins.operands[6] == 26 || ins.operands[7] == 26,
+                    callee if callee >= 256 && ids.contains(&callee) => work.push(callee),
+                    _ => {
+                        if !reach.opaque {
+                            reach.opaque = true;
+                            work.extend(ids.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    reach
+}
+
+/// Whether two trees are the same bytes where the VM reads them: header words and
+/// every instruction.
+#[must_use]
+pub fn same_tree_bytes(a: &BhavChunk, b: &BhavChunk) -> bool {
+    let words = |x: &BhavChunk| {
+        (
+            x.format,
+            x.kind,
+            x.args,
+            x.locals,
+            x.instructions
+                .iter()
+                .map(|i| (i.opcode, i.on_true, i.on_false, i.operands))
+                .collect::<Vec<_>>(),
+        )
+    };
+    words(a) == words(b)
+}
+
+/// Checks tree `root` of two sides that are not whole files compared chunk for chunk
+/// (`sims-antics equiv`: a compiled source against an IFF). The tree must be
+/// equivalent, and so must every tree it may run ([`tree_reach`]): each the same bytes
+/// on both sides, or proven equivalent by [`check_bhav_equivalent_combined`]. A tree in
+/// reach that only one side defines makes the result `Inconclusive`. When a run may
+/// read other resources of its file (a primitive, a call into the game, a tuning
+/// constant), both sides must be IFF files that differ in `BHAV` bodies alone.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn check_tree_with_callees(
+    root: u16,
+    a: &BTreeMap<u16, BhavChunk>,
+    file_a: Option<&[u8]>,
+    b: &BTreeMap<u16, BhavChunk>,
+    file_b: Option<&[u8]>,
+    arities: (&BTreeMap<u16, usize>, &BTreeMap<u16, usize>),
+    lockstep: &EquivOptions,
+    live: &LiveOptions,
+) -> (EquivMethod, EquivResult) {
+    let inconclusive = |reason: String| {
+        (
+            EquivMethod::LiveOutput,
+            EquivResult::Inconclusive { reason },
+        )
+    };
+    let parsed = |file: Option<&[u8]>| file.and_then(|f| Iff::parse(f.to_vec()).ok());
+    let (iff_a, iff_b) = (parsed(file_a), parsed(file_b));
+    // Constant tables only when both sides have a file; a run that may read them then
+    // needs the two files to match outside BHAV bodies (below).
+    let both = iff_a.is_some() && iff_b.is_some();
+    let ctx = |arities: &BTreeMap<u16, usize>, iff: &Option<Iff>| LiveContext {
+        callee_arities: Some(arities.clone()),
+        local_bcons: iff.as_ref().filter(|_| both).map(bcons),
+        ..LiveContext::default()
+    };
+    let (ctx_a, ctx_b) = (ctx(arities.0, &iff_a), ctx(arities.1, &iff_b));
+    let (Some(ra), Some(rb)) = (a.get(&root), b.get(&root)) else {
+        return inconclusive(format!("tree #{root} is not defined on both sides"));
+    };
+    let first = check_bhav_equivalent_combined(ra, &ctx_a, rb, &ctx_b, lockstep, live);
+    if !matches!(first.1, EquivResult::Equivalent { .. }) {
+        return first;
+    }
+    let ids: BTreeSet<u16> = a.keys().chain(b.keys()).copied().collect();
+    let reach = tree_reach(root, &ids, a, b);
+    if reach.reads_file() {
+        let problem = match (&iff_a, &iff_b) {
+            (Some(x), Some(y)) => structure_problem(x, y),
+            _ => Some("one side is not an IFF file".to_owned()),
+        };
+        if let Some(problem) = problem {
+            return inconclusive(format!(
+                "a run of tree #{root} may read other resources of its file ({}), and {problem}",
+                if reach.opaque {
+                    "a primitive or a call outside the file"
+                } else {
+                    "a tuning constant"
+                }
+            ));
+        }
+    }
+    for dep in reach.trees.iter().filter(|&&t| t != root) {
+        let (Some(da), Some(db)) = (a.get(dep), b.get(dep)) else {
+            return inconclusive(format!(
+                "tree #{root} may run tree #{dep}, which only {} defines",
+                if a.contains_key(dep) { "A" } else { "B" }
+            ));
+        };
+        if same_tree_bytes(da, db) {
+            continue;
+        }
+        let proven = super::live::frame_dims(da).0 == super::live::frame_dims(db).0
+            && matches!(
+                check_bhav_equivalent_combined(da, &ctx_a, db, &ctx_b, lockstep, live).1,
+                EquivResult::Equivalent { .. }
+            );
+        if !proven {
+            return inconclusive(format!(
+                "tree #{root} may run tree #{dep}, which differs between the sides and was \
+                 not proven equivalent"
+            ));
+        }
+    }
+    first
 }
 
 fn has_bhav(iff: &Iff, id: u16) -> bool {
@@ -272,6 +509,15 @@ fn shown(items: &[String]) -> String {
 }
 
 /// Why the two files are not the same apart from `BHAV` bodies, if they are not.
+///
+/// Every byte of both files is accounted for: an IFF is its 64-byte header followed by
+/// its chunks, back to back (`Iff::parse` rejects anything else). The header must be
+/// the same bytes, except that its resource-map offset (bytes 60..64) may differ when
+/// both name the same chunk. Each chunk's 76-byte header must be the same bytes (label
+/// field included, past its terminator), except a `BHAV`'s size. Each chunk that is not
+/// a `BHAV` must have the same payload, except that the offsets in a resource map may
+/// differ when they name the same chunks; anything else in the map, its padding and
+/// label bytes included, must be the same bytes.
 fn structure_problem(a: &Iff, b: &Iff) -> Option<String> {
     if a.chunks.len() != b.chunks.len() {
         return Some(format!(
@@ -283,25 +529,34 @@ fn structure_problem(a: &Iff, b: &Iff) -> Option<String> {
     }
     let name = |c: &Chunk| format!("{} #{}", String::from_utf8_lossy(&c.tag), c.id);
     let mut differ: Vec<String> = Vec::new();
+    if a.bytes.get(..MAP_OFFSET) != b.bytes.get(..MAP_OFFSET)
+        || file_map_target(a) != file_map_target(b)
+    {
+        differ.push("the file header".to_owned());
+    }
     for (i, (ca, cb)) in a.chunks.iter().zip(&b.chunks).enumerate() {
+        let is_bhav = &ca.tag == b"BHAV";
+        let (ha, hb) = (chunk_header(a, ca), chunk_header(b, cb));
         let what = if (ca.tag, ca.id) != (cb.tag, cb.id) {
             Some(format!(
                 "chunk {i} is {} in A but {} in B",
                 name(ca),
                 name(cb)
             ))
-        } else if a.label_bytes(ca) != b.label_bytes(cb) {
+        } else if ha[12..] != hb[12..] {
+            // The whole 64-byte label field, bytes after its terminator included.
             Some(format!("{} has different labels", name(ca)))
-        } else if ca.flags != cb.flags {
+        } else if ha[10..12] != hb[10..12] {
             Some(format!("{} has different header flags", name(ca)))
         } else if a.resource_flags(ca) != b.resource_flags(cb) {
             Some(format!("{} has different resource-map flags", name(ca)))
         } else if &ca.tag == b"rsmp" {
-            (map_view(a, ca) != map_view(b, cb))
+            (ha != hb || map_bytes(a, ca) != map_bytes(b, cb))
                 .then(|| format!("{} (the resource map) differs", name(ca)))
-        } else if &ca.tag != b"BHAV" && a.data(ca) != b.data(cb) {
+        } else if !is_bhav && (ha != hb || a.data(ca) != b.data(cb)) {
             Some(format!("{} has different contents", name(ca)))
         } else {
+            // Tag, ID, flags and label are compared above; a BHAV's size may differ.
             None
         };
         differ.extend(what);
@@ -315,37 +570,82 @@ fn structure_problem(a: &Iff, b: &Iff) -> Option<String> {
     })
 }
 
-/// One map entry: the chunk it points at (by physical index, or the raw offset when it
-/// points at none), ID, flags and label.
-type MapEntry = (std::result::Result<usize, u32>, u16, u16, String);
+/// Where the file header's resource-map offset starts (an IFF 2.5 header keeps it in
+/// bytes 60..64, big-endian; `sims-formats` `iff.rs`).
+const MAP_OFFSET: usize = 60;
 
-/// A parsed resource map: its unused-bytes field and its entries by type.
-type MapView = (u32, BTreeMap<[u8; 4], Vec<MapEntry>>);
+/// A file offset, as the chunk it names (by physical index) or, when it names none,
+/// the raw value.
+type Target = std::result::Result<usize, u32>;
 
-/// A resource map with its offsets replaced by the physical chunk they point at, so
-/// two files whose `BHAV` bodies differ in size compare equal when their maps select
-/// the same chunks. A map that does not parse compares by its bytes.
-fn map_view(iff: &Iff, chunk: &Chunk) -> std::result::Result<MapView, Vec<u8>> {
-    let map = ResourceMap::parse(iff.data(chunk)).map_err(|_| iff.data(chunk).to_vec())?;
-    let types = map
-        .types
-        .into_iter()
-        .map(|(tag, entries)| {
-            let entries = entries
-                .into_iter()
-                .map(|e| {
-                    let target = iff
-                        .chunks
-                        .iter()
-                        .position(|c| c.offset as u64 == u64::from(e.offset))
-                        .ok_or(e.offset);
-                    (target, e.id, e.flags, e.label)
-                })
-                .collect();
-            (tag, entries)
-        })
-        .collect();
-    Ok((map.unused_bytes, types))
+fn target(iff: &Iff, offset: u32) -> Target {
+    iff.chunks
+        .iter()
+        .position(|c| c.offset as u64 == u64::from(offset))
+        .ok_or(offset)
+}
+
+/// The file header's resource-map offset, as the chunk it names.
+fn file_map_target(iff: &Iff) -> Option<Target> {
+    let raw: [u8; 4] = iff.bytes.get(MAP_OFFSET..MAP_OFFSET + 4)?.try_into().ok()?;
+    Some(target(iff, u32::from_be_bytes(raw)))
+}
+
+/// A chunk's raw 76-byte header: tag, size, ID, flags and the whole label field.
+fn chunk_header<'a>(iff: &'a Iff, chunk: &Chunk) -> &'a [u8] {
+    &iff.bytes[chunk.offset..chunk.payload.start]
+}
+
+/// A resource map's bytes with each entry's offset replaced by the chunk it names. The
+/// walk follows the `sims-formats` map parser (`parse_rsmp_raw`) field for field and
+/// copies every other byte as it is; a map it cannot walk compares by its raw bytes.
+fn map_bytes(iff: &Iff, chunk: &Chunk) -> std::result::Result<Vec<u8>, Vec<u8>> {
+    let data = iff.data(chunk);
+    walk_map(iff, data).ok_or_else(|| data.to_vec())
+}
+
+fn walk_map(iff: &Iff, data: &[u8]) -> Option<Vec<u8>> {
+    let mut pos = 0usize;
+    let mut out = Vec::with_capacity(data.len() + 16);
+    let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
+        let bytes = data.get(*pos..pos.checked_add(n)?)?;
+        *pos += n;
+        Some(bytes)
+    };
+    let le32 = |bytes: &[u8]| u32::from_le_bytes(bytes.try_into().expect("four bytes"));
+    // Eight zero bytes, "pmsr", an unused word, and the type count.
+    let head = take(&mut pos, 20)?;
+    if head[..8] != [0; 8] || &head[8..12] != b"pmsr" {
+        return None;
+    }
+    out.extend_from_slice(head);
+    let types = le32(&head[16..20]);
+    for _ in 0..types {
+        // The type's tag and entry count.
+        let ty = take(&mut pos, 8)?;
+        out.extend_from_slice(ty);
+        for _ in 0..le32(&ty[4..8]) {
+            let offset = le32(take(&mut pos, 4)?);
+            match target(iff, offset) {
+                Ok(index) => {
+                    out.push(0);
+                    out.extend_from_slice(&(index as u32).to_le_bytes());
+                }
+                Err(raw) => {
+                    out.push(1);
+                    out.extend_from_slice(&raw.to_le_bytes());
+                }
+            }
+            // ID, flags, the NUL-terminated label, and a pad byte to an even offset.
+            out.extend_from_slice(take(&mut pos, 4)?);
+            let len = data.get(pos..)?.iter().position(|&b| b == 0)? + 1;
+            out.extend_from_slice(take(&mut pos, len)?);
+            if pos & 1 != 0 {
+                out.extend_from_slice(take(&mut pos, 1)?);
+            }
+        }
+    }
+    (pos == data.len()).then_some(out)
 }
 
 fn lift(iff: &Iff, chunk: &Chunk) -> std::result::Result<BhavChunk, String> {

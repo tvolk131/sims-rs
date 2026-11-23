@@ -37,11 +37,14 @@
 //!   reports a counterexample only when the two runs observably differ. A candidate it
 //!   cannot replay (a reachable primitive or call, an inexact path condition, more than
 //!   `MAX_REPLAYS` (32) candidates) or whose runs agree is `Inconclusive`.
-//! - **Traps are never a difference.** A VM trap aborts the tick and leaves the faulting
-//!   frame, the last branch result and the node behind (`interpreter.rs:809`). Two
-//!   faulting paths count as equal only when they fault with the same trap at the same
-//!   node with the same frame residue and last result; any other trap pairing is
-//!   `Inconclusive`, never a counterexample (the replay fails on a fault).
+//! - **Faults are never a difference.** A fault aborts the tick and leaves the faulting
+//!   frame at its node, with whatever the node had done to the frame and the last
+//!   branch result by then (`interpreter.rs:809`). Any node may fault: a modeled trap,
+//!   a branch to the error exit or a missing node, and any primitive or call (each gets
+//!   a faulting path of its own). Two faulting paths are equal only when they fault at
+//!   the same node, with the same opcode and operands, from the same state before it
+//!   (see `FaultPoint`); any other pairing is `Inconclusive`, never a counterexample (the
+//!   replay fails on a fault).
 //! - **The instruction budget is a model assumption.** `Equivalent` means equivalent
 //!   when neither run exhausts the VM's per-tick instruction budget. Dummy nodes change
 //!   the instruction count by design, so requiring equal counts would reject the very
@@ -210,6 +213,9 @@ enum Scratch {
 enum EventKind {
     /// A primitive or subroutine call.
     Primitive {
+        /// The node it runs at: a primitive that yields (or a tree it runs) keeps this
+        /// frame on the stack at that node.
+        node: u8,
         opcode: u16,
         operands: [u8; 8],
         /// Extended inline call arguments read from the following instructions.
@@ -272,6 +278,8 @@ enum PrefixNode {
     Root,
     Event(u32, LiveEvent),
     Branch(u32, bool),
+    /// Names the atom "the event at this prefix faulted".
+    Fault(u32),
 }
 
 /// Shared by both trees so identical keys get identical ids.
@@ -346,7 +354,9 @@ impl Interner {
             out.push(node);
             prefix = match node {
                 PrefixNode::Root => 0,
-                PrefixNode::Event(parent, _) | PrefixNode::Branch(parent, _) => *parent,
+                PrefixNode::Event(parent, _)
+                | PrefixNode::Branch(parent, _)
+                | PrefixNode::Fault(parent) => *parent,
             };
         }
         out.reverse();
@@ -607,6 +617,8 @@ enum Exit {
     Trap(u16),
     /// A jump to a node past the end of the tree.
     BadNode(u8),
+    /// A primitive or call that failed (its error is not modeled).
+    PrimitiveFault,
 }
 
 impl std::fmt::Display for Exit {
@@ -618,6 +630,7 @@ impl std::fmt::Display for Exit {
             Self::Trap(NEGATIVE_SQRT) => write!(f, "square root of a negative number"),
             Self::Trap(code) => write!(f, "VM trap {code:#x}"),
             Self::BadNode(n) => write!(f, "jump to missing node {n}"),
+            Self::PrimitiveFault => write!(f, "a failing primitive or call"),
         }
     }
 }
@@ -626,10 +639,9 @@ impl std::fmt::Display for Exit {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Outputs {
     exit: Exit,
-    /// For a path that faults (a trap, the error target, a bad branch): the node the
-    /// fault happens at. The faulting frame stays on the stack at that node
-    /// (`interpreter.rs:809`), so two faults are the same only at the same node.
-    fault_at: Option<u8>,
+    /// For a path that faults (a trap, the error target, a bad branch, a primitive or
+    /// call that fails): where, and from what state (see [`FaultPoint`]).
+    fault: Option<FaultPoint>,
     /// The event history (interned), which fixes the ordered trace.
     prefix: u32,
     /// The epoch `store` is relative to (fixed by `prefix`).
@@ -640,6 +652,34 @@ struct Outputs {
     last_result: Option<Option<bool>>,
     /// Final parameters, locals, and which locals may be unwritten.
     residue: Option<(Vec<Val>, Vec<Val>, Vec<bool>)>,
+}
+
+/// Where a path faults: the node it faults at, that node's instruction, and the whole
+/// state before the node ran. A fault leaves the faulting frame on the stack at that
+/// node, with whatever the node had done to the frame words, their unknown markers and
+/// the last branch result by then (`interpreter.rs:809`, `expression.rs:69`). The
+/// checker does not model that partial state; it only relies on it being a function of
+/// the state before the node and the node's bytes, so two faults are equal only when
+/// all of those are.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FaultPoint {
+    /// `u8::MAX` for an entry past the last node, which faults before any node runs.
+    node: u8,
+    /// Opcode and operands. The branch targets are left out: a node that faults
+    /// inside never reaches them, and one that faults by branching (to the error exit
+    /// or a missing node) shows the target in its exit.
+    instruction: Option<(u16, [u8; 8])>,
+    prefix: u32,
+    /// For a primitive or call, the prefix after its event (which also fixes the inline
+    /// arguments it reads from the following nodes).
+    event: Option<u32>,
+    epoch: u32,
+    store: Vec<(Cell, Val)>,
+    scratch: Scratch,
+    last_result: Option<bool>,
+    params: Vec<Val>,
+    locals: Vec<Val>,
+    unwritten: Vec<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -670,6 +710,8 @@ struct PathState {
     cond: Vec<(Atom, bool)>,
     steps: usize,
     nodes: Vec<u8>,
+    /// The node running now and the state before it ran (`None` before the first).
+    at: Option<FaultPoint>,
 }
 
 /// Where an `Expression` operand lives.
@@ -754,6 +796,30 @@ impl Explorer<'_> {
             cond,
             steps: 0,
             nodes: Vec::new(),
+            at: None,
+        }
+    }
+
+    /// The state before node `node` (`ins`) runs; see [`FaultPoint`].
+    fn fault_point(
+        &self,
+        state: &PathState,
+        node: u8,
+        ins: Option<&Instruction>,
+        interner: &Interner,
+    ) -> FaultPoint {
+        FaultPoint {
+            node,
+            instruction: ins.map(|i| (i.opcode, i.operands)),
+            prefix: state.prefix,
+            event: None,
+            epoch: state.epoch,
+            store: self.normalized_store(state, interner),
+            scratch: state.scratch,
+            last_result: state.last_result,
+            params: state.params.clone(),
+            locals: state.locals.clone(),
+            unwritten: state.unwritten.clone(),
         }
     }
 
@@ -783,8 +849,16 @@ impl Explorer<'_> {
         let store = self.normalized_store(&state, interner);
         let faults = !matches!(exit, Exit::True | Exit::False);
         // A fault leaves the faulting frame on the stack and the thread's last result
-        // in the object (`interpreter.rs:809`), so both are compared for a faulting
-        // path whatever the observation policy says about frames left behind.
+        // in the object (`interpreter.rs:809`), so a faulting path compares the whole
+        // state at the faulting node, whatever the observation policy says.
+        let fault = faults.then(|| {
+            // An entry past the last node faults before any node runs; it is never
+            // compared (`check_bhav_live_equivalent`).
+            state
+                .at
+                .clone()
+                .unwrap_or_else(|| self.fault_point(&state, u8::MAX, None, interner))
+        });
         let residue = (self.opts.observe_frame_residue || faults).then(|| {
             (
                 state.params.clone(),
@@ -792,21 +866,15 @@ impl Explorer<'_> {
                 state.unwritten.clone(),
             )
         });
-        let last_result = self.opts.observe_last_result.then_some(state.last_result);
+        let last_result = (self.opts.observe_last_result || faults).then_some(state.last_result);
         Step::Done(PathSummary {
             out: Outputs {
                 exit,
-                fault_at: if faults {
-                    // An entry past the last node faults before any node runs; it is
-                    // never compared (`check_bhav_live_equivalent`).
-                    Some(state.nodes.last().copied().unwrap_or(u8::MAX))
-                } else {
-                    None
-                },
+                fault,
                 prefix: state.prefix,
                 epoch: state.epoch,
                 store,
-                scratch: self.opts.observe_scratch_pointer.then_some(state.scratch),
+                scratch: (self.opts.observe_scratch_pointer || faults).then_some(state.scratch),
                 last_result,
                 residue,
             },
@@ -850,6 +918,7 @@ impl Explorer<'_> {
             ));
         }
         state.nodes.push(pc);
+        state.at = Some(self.fault_point(&state, pc, Some(ins), interner));
         if ins.opcode == 2 {
             self.expression(state, ins, interner)
         } else {
@@ -1424,6 +1493,7 @@ impl Explorer<'_> {
         let prefix = self.record(
             &state,
             EventKind::Primitive {
+                node: state.pc,
                 opcode: ins.opcode,
                 operands: canonicalize_primitive_operands(ins.opcode, *ops),
                 inline_args,
@@ -1436,15 +1506,30 @@ impl Explorer<'_> {
             interner,
         );
         state.prefix = prefix;
+        if let Some(at) = state.at.as_mut() {
+            at.event = Some(prefix);
+        }
 
-        // Random never takes its false branch: it succeeds or traps (`random.rs`).
+        let mut out = Vec::new();
+        // Any primitive or call may fault: Random with a zero range (`random.rs`), a
+        // bad operand, a missing object or tree, a trap in a tree it runs. The checker
+        // does not model when, so each one gets a faulting path whose condition is a
+        // fresh atom of the event: two trees agree on it only for the same event from
+        // the same history, and their faults are equal only from the same state at the
+        // same node ([`FaultPoint`]).
+        let faults = interner.prefix(PrefixNode::Fault(prefix));
+        let mut faulted = state.clone();
+        faulted.cond.push((Atom::Outcome(faults), true));
+        out.push(self.finish(faulted, Exit::PrimitiveFault, interner));
+        state.cond.push((Atom::Outcome(faults), false));
+
+        // Random never takes its false branch: it succeeds or faults (`random.rs`).
         let outcomes: Vec<(Option<bool>, u8)> =
             if is_always_true_instruction(ins) || ins.opcode == 8 {
                 vec![(None, ins.on_true)]
             } else {
                 vec![(Some(true), ins.on_true), (Some(false), ins.on_false)]
             };
-        let mut out = Vec::new();
         for (outcome, target) in outcomes {
             let mut s = state.clone();
             if let Some(value) = outcome {
@@ -1956,11 +2041,17 @@ fn first_difference_inner(
     if a.exit != b.exit {
         return Difference::Definite(format!("exit differs: A {} vs B {}", a.exit, b.exit));
     }
-    if a.fault_at != b.fault_at {
-        return Difference::Possible(format!(
-            "both fault with {}, but at different nodes",
-            a.exit
-        ));
+    if let (Some(fa), Some(fb)) = (&a.fault, &b.fault)
+        && fa != fb
+    {
+        return Difference::Possible(if fa.node == fb.node {
+            format!(
+                "both fault with {} at node {}, but from different states or instructions",
+                a.exit, fa.node
+            )
+        } else {
+            format!("both fault with {}, but at different nodes", a.exit)
+        });
     }
     if a.scratch != b.scratch {
         return Difference::Definite(format!(
@@ -2148,6 +2239,20 @@ fn event_difference(
                  uninitialized locals may differ"
             ));
         }
+        (
+            EventKind::Primitive {
+                node: na,
+                opcode: oa,
+                ..
+            },
+            EventKind::Primitive { node: nb, .. },
+        ) if na != nb => {
+            // A primitive that yields, or fails, leaves this frame at its node.
+            return Difference::Possible(format!(
+                "{at}: opcode {oa:#06x} runs at node {na} in A but node {nb} in B, which a \
+                 fault or a yield leaves on the stack"
+            ));
+        }
         (x, y) if !same_shape(x, y) => {
             if matches!(x, EventKind::Read { .. }) || matches!(y, EventKind::Read { .. }) {
                 return Difference::Possible(format!(
@@ -2328,6 +2433,7 @@ fn same_shape(a: &EventKind, b: &EventKind) -> bool {
     match (a, b) {
         (
             EventKind::Primitive {
+                node: na,
                 opcode: oa,
                 operands: xa,
                 inline_args: ia,
@@ -2336,6 +2442,7 @@ fn same_shape(a: &EventKind, b: &EventKind) -> bool {
                 caller_frame: fa,
             },
             EventKind::Primitive {
+                node: nb,
                 opcode: ob,
                 operands: xb,
                 inline_args: ib,
@@ -2343,7 +2450,7 @@ fn same_shape(a: &EventKind, b: &EventKind) -> bool {
                 callee_arity: cb,
                 caller_frame: fb,
             },
-        ) => oa == ob && xa == xb && ia == ib && sa == sb && ca == cb && fa == fb,
+        ) => na == nb && oa == ob && xa == xb && ia == ib && sa == sb && ca == cb && fa == fb,
         (
             EventKind::Read {
                 scope: sa, idx: ia, ..
@@ -2395,6 +2502,7 @@ fn describe_node(node: &PrefixNode) -> String {
         PrefixNode::Root => "entry".to_owned(),
         PrefixNode::Event(_, e) => format!("{:?}", e.kind),
         PrefixNode::Branch(_, v) => format!("branch {v}"),
+        PrefixNode::Fault(_) => "fault".to_owned(),
     }
 }
 
