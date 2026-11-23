@@ -2,7 +2,7 @@
 
 - **Date:** 2026-11-22
 - **Status:** Accepted
-- **Scope:** `crates/sims-game`, `crates/sims-ui`, `crates/sims-vm`
+- **Scope:** `crates/sims-game`, `crates/sims-ui`, `crates/sims-vm`, `crates/sims-sim`
 
 ## Context
 
@@ -34,9 +34,10 @@ Following PR #383 (`6c347669`, fast Save Manager listing, 3D Try-On preview, pag
      - `complete_collection_warm_enter_lot_vm_cache_parity_and_speedup` (5-run median uncached `open_from_store_cached(..., None)` vs warm `NeighborhoodShell::enter_lot(5)`):
        - **555.78 ms → 183.62 ms** (**3.03× faster**), with bit-identical `World::hash()`.
 
-3. **Native REDB v4 CAF Surnames (`crates/sims-game/src/neighborhood.rs`):**
+3. **Native REDB v4 CAF Surnames (`crates/sims-game/src/neighborhood.rs`, `crates/sims-sim/src/neighborhood_store.rs`):**
    - Removed `save_persisted_caf_name` and all `.caf-names.tsv` write paths.
-   - `load_family_names_with_caf` overlays native REDB v4 `StoredNeighborhood.family_surnames` over any existing pre-v4 `<saves>.caf-names.tsv` (kept strictly read-only as a migration fallback), and `NeighborhoodShell::refresh_from_store` syncs `self.family_names` from the refreshed `StoredNeighborhood`.
+   - Added atomic one-time migration (`NeighborhoodStore::migrate_legacy_caf_surnames_checked`) that copies applicable pre-v4 `<saves>.caf-names.tsv` rows into `StoredNeighborhood.family_surnames` and records the `NEIGHBORHOOD_META` completion marker in one transaction while leaving the sidecar strictly read-only, preventing deleted families from resurrecting stale surnames on family-ID reuse.
+   - `load_family_names_with_caf` overlays native REDB v4 `StoredNeighborhood.family_surnames` over base neighborhood names, and `NeighborhoodShell::refresh_from_store` refreshes `self.family_names` from REDB.
 
 4. **`AutosaveStore` SHA-256 Validator Fast Path (`crates/sims-game/src/autosave_worker.rs`, `crates/sims-game/src/neighborhood.rs`):**
    - Added `validate_save_payload_cached_with_sha256(kind, bytes, sha256)` so the LRU validation cache keys directly off the digest already computed by `AutosaveStore`.
@@ -54,9 +55,9 @@ Following PR #383 (`6c347669`, fast Save Manager listing, 3D Try-On preview, pag
    - Added `HudStatic::clean_room_procedural()` and `Hud::open_open_pack(...)` using clean-room procedural Sim portraits (`procedural_sim_portrait`).
 
 3. **Clean-Room Staging & Boot (`crates/sims-game/src/open_pack.rs`, `crates/sims-vm/src/boot.rs`, `crates/sims-game/src/game.rs`, `crates/sims-game/src/sound.rs`):**
-   - `stage_open_pack` compiles the clean-room `open-pack/` Antics scripts (`sims-antics`), object manifests, procedural walls/floors, cottage lot, starter Sims, global tuning tables (`FCNS 1/2/4/5/6`, `STR# 502/504/505`), lot zoning (`LotZoning.iff`), and looping indicator stubs into a temporary clean-room virtual directory cleaned on drop via `std::fs::remove_dir_all`.
+   - `stage_open_pack` compiles the clean-room `open-pack/` Antics scripts (`sims-antics`), object manifests (mounted under a fixed distinct `open_pack_objects.far`), procedural walls/floors, cottage lot, starter Sims, global tuning tables (`FCNS 1/2/4/5/6`, `STR# 502/504/505`), lot zoning (`LotZoning.iff`), and looping indicator/Buy/Build cursor stubs into a temporary clean-room virtual directory cleaned on drop via `std::fs::remove_dir_all`. Save slots use an unambiguous SHA-256 key (`open-pack:v2:<hex>`) over length-prefixed canonical source pack OS path bytes, pack name, and lot number.
    - Added a strictly additive opt-in `Lot::load_open_pack` entry point in `crates/sims-vm/src/boot.rs` that registers minimal clean-room `Skeleton` entries (`"open_sim"`) for clean-room starter Sims without modifying any Complete Collection boot path.
-   - When `Game::open_pack_mode` is `true`, `Game::render` draws clean-room 2D isometric Sim sprites and a bright green plumb bob over the selected Sim via `sims_render::depth::Depth` + `Canvas::draw` (skipped entirely in Complete Collection mode).
+   - When `Game::open_pack_mode` is `true`, `Game::render` draws clean-room directional 2D procedural Sim figures (projected with exact terrain-step elevation & single per-frame `Depth` table and camera-projected movement facing) plus a bright green plumb bob over the selected Sim (skipped entirely in Complete Collection mode).
    - Added `Mixer::open_pack` (`OpenPackAudioBank`) in `crates/sims-game/src/sound.rs` to decode and linearly resample clean-room 16-bit PCM WAV clips to 22,050 Hz and mix them on `SoundEvent::Play`, leaving `Mixer::open` untouched for Complete Collection.
 
 ## Consequences

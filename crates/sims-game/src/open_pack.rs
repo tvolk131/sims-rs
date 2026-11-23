@@ -20,6 +20,7 @@ use sims_antics::ir::{
 use sims_formats::bitmap::Image;
 use sims_formats::execution::ObjectFunction;
 use sims_formats::iff::ChunkData;
+use sims_net::manifest::sha256_bytes;
 use sims_render::canvas::Image as CanvasImage;
 use sims_render::depth::{Anchor, Depth};
 use sims_render::{Camera, Canvas, Lot as RenderLot};
@@ -75,17 +76,32 @@ pub(crate) struct StagedOpenPack {
     pub(crate) starter_sims: Vec<StarterSimSpec>,
 }
 
-/// Computes a stable, pack- and lot-scoped save slot key derived from the
-/// source `open-pack/` directory and manifest identity (never from the
-/// temporary staging directory) so multiple standalone packs sharing one
-/// `--saves` file never overwrite one another.
+/// Computes a stable, unambiguous, pack- and lot-scoped save slot key derived
+/// from the canonical source `open-pack/` path bytes (preserving non-UTF-8 OS
+/// path bytes losslessly), pack name, and lot number (never from the temporary
+/// staging directory) so multiple standalone packs sharing one `--saves` file
+/// can never collide or overwrite one another.
 pub fn open_pack_save_slot(pack_dir: &Path, pack_name: &str, lot_number: i32) -> String {
     let canonical = std::fs::canonicalize(pack_dir).unwrap_or_else(|_| pack_dir.to_path_buf());
-    format!(
-        "open-pack:{}:{}:lot{lot_number}",
-        canonical.to_string_lossy(),
-        pack_name.trim()
-    )
+    let path_bytes = canonical.as_os_str().as_encoded_bytes();
+    let name_bytes = pack_name.trim().as_bytes();
+    let mut payload = Vec::with_capacity(
+        b"sims-rs:open-pack-slot:v2\0".len() + 8 + path_bytes.len() + 8 + name_bytes.len() + 4,
+    );
+    payload.extend_from_slice(b"sims-rs:open-pack-slot:v2\0");
+    payload.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
+    payload.extend_from_slice(path_bytes);
+    payload.extend_from_slice(&(name_bytes.len() as u64).to_le_bytes());
+    payload.extend_from_slice(name_bytes);
+    payload.extend_from_slice(&lot_number.to_le_bytes());
+    let digest = sha256_bytes(&payload);
+    let mut hex = String::with_capacity("open-pack:v2:".len() + 64);
+    hex.push_str("open-pack:v2:");
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Returns `true` when `dir` looks like a valid `open-pack/` source directory.
@@ -150,12 +166,15 @@ pub(crate) fn stage_open_pack(pack_dir: &Path) -> Result<StagedOpenPack, String>
         std::fs::write(&path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))
     };
 
-    // Minimal clean-room Behavior.iff and Global.iff (satisfy Install::detect,
-    // Catalog, and VM motive tuning / mood curves with zero commercial tables).
+    // Minimal clean-room Behavior.iff, Global.iff, and UIText.iff (satisfy
+    // Install::detect, Catalog, VM motive tuning/mood curves, and default
+    // dialog button labels with zero commercial tables).
     let minimal_iff = encode_iff_with_rsmp(&[]).map_err(|e| format!("empty IFF: {e}"))?;
     write_bytes(game_data.join("Behavior.iff"), &minimal_iff)?;
     let global_iff = build_clean_room_global_iff()?;
     write_bytes(global_dir.join("Global.iff"), &global_iff)?;
+    let uitext_iff = build_clean_room_uitext_iff()?;
+    write_bytes(game_data.join("UIText.iff"), &uitext_iff)?;
 
     // Clean-room objects FAR (fixed `.far` name distinct from `open_indicators.iff`
     // so arbitrary manifest `archive_name` values always mount cleanly) + hidden
@@ -281,6 +300,31 @@ fn build_clean_room_global_iff() -> Result<Vec<u8>, String> {
         data: encode_string_table(&house_curves).map_err(|e| e.to_string())?,
     });
 
+    encode_iff_with_rsmp(&chunks).map_err(|e| e.to_string())
+}
+
+/// Builds a minimal clean-room `GameData/UIText.iff` carrying `STR# 142`
+/// default dialog button labels (`OK`, `Yes`, `No`, `Cancel`) with zero `$`
+/// tokens so `dialog(...)` primitives work cleanly in standalone `open-pack/`
+/// packs.
+fn build_clean_room_uitext_iff() -> Result<Vec<u8>, String> {
+    let str_chunk = StringTableChunk::new(
+        *b"STR#",
+        142,
+        "Open Default Dialog Labels",
+        StringFormat::Localized,
+        ["OK", "Yes", "No", "Cancel"]
+            .into_iter()
+            .map(StringEntry::english)
+            .collect(),
+    );
+    let chunks = vec![ChunkData {
+        tag: *b"STR#",
+        id: 142,
+        flags: IFF_CONVERTED_FLAG,
+        label: str_chunk.label.clone(),
+        data: encode_string_table(&str_chunk).map_err(|e| e.to_string())?,
+    }];
     encode_iff_with_rsmp(&chunks).map_err(|e| e.to_string())
 }
 
@@ -676,6 +720,92 @@ pub(crate) fn procedural_sim_portrait(sim_index: usize) -> Image {
     }
 }
 
+/// Screen-space facing direction for a clean-room procedural `open-pack/` Sim,
+/// derived directly from projecting the VM's movement step vector through the
+/// active [`Camera`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenSimFacing {
+    /// Facing straight toward the viewer (`screen_dx == 0, screen_dy > 0`).
+    Front,
+    /// Facing toward the viewer and screen-left (`screen_dx < 0, screen_dy >= 0`).
+    FrontLeft,
+    /// Facing toward the viewer and screen-right (`screen_dx > 0, screen_dy >= 0`).
+    FrontRight,
+    /// Facing away from the viewer and screen-left (`screen_dx < 0, screen_dy < 0`).
+    BackLeft,
+    /// Facing away from the viewer and screen-right (`screen_dx > 0, screen_dy < 0`).
+    BackRight,
+    /// Facing straight away from the viewer (`screen_dx == 0, screen_dy < 0`).
+    Back,
+}
+
+impl OpenSimFacing {
+    /// Horizontal screen-space facing bias: `-1` (left), `0` (centered), `+1` (right).
+    pub const fn screen_x_sign(self) -> i32 {
+        match self {
+            Self::FrontLeft | Self::BackLeft => -1,
+            Self::FrontRight | Self::BackRight => 1,
+            Self::Front | Self::Back => 0,
+        }
+    }
+
+    /// Whether the Sim is facing away from the viewer (`screen_dy < 0`).
+    pub const fn is_away(self) -> bool {
+        matches!(self, Self::Back | Self::BackLeft | Self::BackRight)
+    }
+}
+
+/// Computes the exact screen-space [`OpenSimFacing`] for VM facing `facing`
+/// (`0..8`, matching `sims-vm/src/routing/slot.rs::step`) under `camera`.
+pub fn open_pack_sim_facing(camera: &Camera, facing: i16) -> OpenSimFacing {
+    // VM step table (`0x4222bc`, `sims-vm/src/routing/slot.rs:475`):
+    let [dx, dy] = match facing.rem_euclid(8) {
+        0 => [-1, 0],
+        1 => [-1, 1],
+        2 => [0, 1],
+        3 => [1, 1],
+        4 => [1, 0],
+        5 => [1, -1],
+        6 => [0, -1],
+        _ => [-1, -1],
+    };
+    let origin = [32 * 16, 32 * 16];
+    let p0 = camera.project_fine(camera.rotate_fine(origin), 1, 0);
+    let p1 = camera.project_fine(
+        camera.rotate_fine([origin[0] + dx * 16, origin[1] + dy * 16]),
+        1,
+        0,
+    );
+    let sdx = p1[0] - p0[0];
+    let sdy = p1[1] - p0[1];
+    match (sdx.signum(), sdy.signum()) {
+        (0, 1) | (0, 0) => OpenSimFacing::Front,
+        (-1, 1) | (-1, 0) => OpenSimFacing::FrontLeft,
+        (1, 1) | (1, 0) => OpenSimFacing::FrontRight,
+        (-1, -1) => OpenSimFacing::BackLeft,
+        (1, -1) => OpenSimFacing::BackRight,
+        _ => OpenSimFacing::Back,
+    }
+}
+
+/// Projects an `open-pack/` Sim's fine world position `[x, y, level]` to screen
+/// pixels and its matching [`Depth`] anchor using a caller-owned [`Depth`]
+/// table so per-frame Sim rendering computes depth tables once per draw.
+fn project_open_pack_sim_with_depth(
+    camera: &Camera,
+    lot_shape: &RenderLot,
+    depth_table: &Depth,
+    pos: [i32; 3],
+) -> ([i32; 2], Anchor) {
+    let [x, y, level] = pos;
+    let altitude = lot_shape.altitude_at([x, y]);
+    let elevation_near_px = (altitude * 16.0).round() as i32;
+    let rotated = camera.rotate_fine([x, y]);
+    let screen = camera.project_fine(rotated, level, elevation_near_px);
+    let anchor = depth_table.anchor(screen[1], altitude, level);
+    (screen, anchor)
+}
+
 /// Projects an `open-pack/` Sim's fine world position `[x, y, level]` to screen
 /// pixels and its matching [`Depth`] anchor using terrain steps (`altitude_at`)
 /// converted to near-zoom pixels (`steps * 16`) for [`Camera::project_fine`]
@@ -685,13 +815,8 @@ pub fn project_open_pack_sim(
     lot_shape: &RenderLot,
     pos: [i32; 3],
 ) -> ([i32; 2], Anchor) {
-    let [x, y, level] = pos;
-    let altitude = lot_shape.altitude_at([x, y]);
-    let elevation_near_px = (altitude * 16.0).round() as i32;
-    let rotated = camera.rotate_fine([x, y]);
-    let screen = camera.project_fine(rotated, level, elevation_near_px);
-    let anchor = Depth::new(camera).anchor(screen[1], altitude, level);
-    (screen, anchor)
+    let depth_table = Depth::new(camera);
+    project_open_pack_sim_with_depth(camera, lot_shape, &depth_table, pos)
 }
 
 /// Draws clean-room directional 2D procedural Sims (and a crisp green diamond
@@ -722,11 +847,12 @@ pub(crate) fn draw_open_pack_sims(
     let zoom_idx = camera.zoom.index();
     let active_level = camera.level;
     let selected_id = world.selected();
+    let depth_table = Depth::new(camera);
 
     struct VisibleOpenSim {
         id: u16,
         guid: u32,
-        rel_dir: u8,
+        facing: OpenSimFacing,
         screen: [i32; 2],
         anchor: Anchor,
     }
@@ -741,16 +867,14 @@ pub(crate) fn draw_open_pack_sims(
         if level != active_level || x < 0 || y < 0 {
             continue;
         }
-        let (screen, anchor) = project_open_pack_sim(camera, lot_shape, [x, y, level]);
-        let facing = obj.data.get(1).copied().unwrap_or(0);
-        // Combine world Sim facing (0..8) with camera rotation (0..4) so the
-        // character faces consistently relative to the active camera angle.
-        let rel_dir =
-            ((facing.rem_euclid(8) / 2) + i16::from(camera.rotation & 3)).rem_euclid(4) as u8;
+        let (screen, anchor) =
+            project_open_pack_sim_with_depth(camera, lot_shape, &depth_table, [x, y, level]);
+        let raw_facing = obj.data.get(1).copied().unwrap_or(0);
+        let facing = open_pack_sim_facing(camera, raw_facing);
         sims.push(VisibleOpenSim {
             id,
             guid: obj.guid,
-            rel_dir,
+            facing,
             screen,
             anchor,
         });
@@ -760,7 +884,7 @@ pub(crate) fn draw_open_pack_sims(
     for VisibleOpenSim {
         id,
         guid,
-        rel_dir,
+        facing,
         screen,
         anchor,
     } in sims
@@ -773,7 +897,7 @@ pub(crate) fn draw_open_pack_sims(
         canvas.set_id(Some(id));
         draw_procedural_sim_figure(
             guid,
-            rel_dir,
+            facing,
             screen,
             zoom_idx,
             vp_w,
@@ -816,7 +940,7 @@ pub(crate) fn draw_open_pack_sims(
 #[allow(clippy::too_many_arguments)]
 fn draw_procedural_sim_figure(
     guid: u32,
-    rel_dir: u8,
+    facing: OpenSimFacing,
     screen: [i32; 2],
     zoom_idx: usize,
     vp_w: i32,
@@ -914,19 +1038,38 @@ fn draw_procedural_sim_figure(
                 px = Some(skin);
             }
 
-            // Head, hair crown, and camera-relative directional face/eyes.
+            // Head, hair crown, and camera-relative directional face/eyes
+            // aligned with the Sim's projected screen-space movement vector.
             if dx * dx + dy_h * dy_h <= head_r * head_r {
-                let back_view = rel_dir == 2;
-                let hair_cap = back_view || dy_h <= -scale;
-                let mut c = if hair_cap { hair } else { skin };
-                if !back_view && dy_h >= 0 && dy_h <= scale {
-                    let eye_shift = match rel_dir {
-                        1 => -scale,
-                        3 => scale,
-                        _ => 0,
-                    };
+                let sx = facing.screen_x_sign();
+                let mut c = match facing {
+                    OpenSimFacing::Back => hair,
+                    OpenSimFacing::BackLeft => {
+                        if dy_h > 0 && dx <= -scale {
+                            skin
+                        } else {
+                            hair
+                        }
+                    }
+                    OpenSimFacing::BackRight => {
+                        if dy_h > 0 && dx >= scale {
+                            skin
+                        } else {
+                            hair
+                        }
+                    }
+                    OpenSimFacing::Front | OpenSimFacing::FrontLeft | OpenSimFacing::FrontRight => {
+                        if dy_h <= -scale {
+                            hair
+                        } else {
+                            skin
+                        }
+                    }
+                };
+                if !facing.is_away() && dy_h == 0 {
+                    let eye_shift = sx * scale;
                     let ex = dx - eye_shift;
-                    if (ex == -scale || ex == scale) && dy_h == 0 {
+                    if ex == -scale || ex == scale {
                         c = eye;
                     }
                 }

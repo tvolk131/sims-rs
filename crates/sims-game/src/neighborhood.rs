@@ -8569,13 +8569,12 @@ fn caf_names_sidecar_path(saves_path: &Path) -> PathBuf {
     saves_path.with_extension("caf-names.tsv")
 }
 
-/// One-time read-only migration from any pre-v4 `<saves>.caf-names.tsv` sidecar
-/// into native REDB v4 `StoredNeighborhood.family_surnames`.
+/// One-time atomic read-only migration from any pre-v4 `<saves>.caf-names.tsv`
+/// sidecar into native REDB v4 `StoredNeighborhood.family_surnames`.
 ///
-/// Leaves the sidecar file untouched on disk and records completion in REDB
-/// `NEIGHBORHOOD_META` for `(neighborhood_id, stored.instance_id)` so a family
-/// deleted after migration can never have its stale sidecar name reapplied when
-/// a later family reuses that family ID.
+/// Leaves the sidecar file untouched on disk, commits both the migrated
+/// surnames and the `NEIGHBORHOOD_META` completion marker in a single REDB
+/// transaction, and updates `stored` in memory only after that commit succeeds.
 fn migrate_legacy_caf_sidecar_if_needed(
     store: &NeighborhoodStore,
     saves_path: &Path,
@@ -8586,17 +8585,11 @@ fn migrate_legacy_caf_sidecar_if_needed(
     if !sidecar.is_file() {
         return;
     }
-    if store
-        .caf_sidecar_migrated(neighborhood_id, stored.instance_id)
-        .unwrap_or(false)
-    {
-        return;
-    }
     let Ok(text) = std::fs::read_to_string(&sidecar) else {
         return;
     };
     let inst_hex = format!("{:032x}", stored.instance_id);
-    let mut changed = false;
+    let mut legacy_surnames = BTreeMap::new();
     for line in text.lines() {
         let mut parts = line.splitn(4, '\t');
         let (Some(nh), Some(inst), Some(fam_str), Some(surname)) =
@@ -8608,28 +8601,19 @@ fn migrate_legacy_caf_sidecar_if_needed(
         if nh == neighborhood_id
             && inst == inst_hex
             && let Ok(fam_id) = fam_str.parse::<u16>()
-            && stored.families.contains_key(&fam_id)
             && !trimmed.is_empty()
-            && !stored.family_surnames.contains_key(&fam_id)
         {
-            stored.set_family_surname(fam_id, trimmed);
-            changed = true;
+            legacy_surnames.insert(fam_id, trimmed.to_owned());
         }
     }
-    if changed {
-        match store.save_neighborhood_checked(
-            neighborhood_id,
-            stored.instance_id,
-            stored.revision,
-            stored,
-        ) {
-            Ok(Ok((_, new_rev))) => {
-                stored.revision = new_rev;
-            }
-            _ => return,
-        }
+    if let Ok(Ok(Some(updated))) = store.migrate_legacy_caf_surnames_checked(
+        neighborhood_id,
+        stored.instance_id,
+        stored.revision,
+        &legacy_surnames,
+    ) {
+        *stored = updated;
     }
-    let _ = store.mark_caf_sidecar_migrated(neighborhood_id, stored.instance_id);
 }
 
 /// Loads household surnames for `stored`, overlaying native REDB v4

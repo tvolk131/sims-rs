@@ -17,7 +17,10 @@ use sims_audio::SoundEvent;
 use sims_game::autosave_worker::{AutosaveWorker, validate_save_payload_cached_with_sha256};
 use sims_game::game::Game;
 use sims_game::neighborhood::NeighborhoodShell;
-use sims_game::open_pack::{discover_open_pack_dir, project_open_pack_sim};
+use sims_game::open_pack::{
+    OpenSimFacing, discover_open_pack_dir, open_pack_save_slot, open_pack_sim_facing,
+    project_open_pack_sim,
+};
 use sims_game::sound::{Input, Mixer};
 use sims_game::view::Move;
 use sims_render::depth::Depth;
@@ -232,6 +235,60 @@ fn open_pack_boots_renders_steps_interacts_cheats_and_plays_wavs() {
     }
     let _ = game.apply(Move::ZoomIn);
     game.render();
+
+    // Verify camera-relative Sim facing matches projected VM movement direction
+    // across all 8 VM facings x 4 camera rotations (32 combinations).
+    let vm_steps: [[i32; 2]; 8] = [
+        [-1, 0],
+        [-1, 1],
+        [0, 1],
+        [1, 1],
+        [1, 0],
+        [1, -1],
+        [0, -1],
+        [-1, -1],
+    ];
+    for rotation in 0u8..4 {
+        let cam = Camera {
+            zoom: Zoom::Medium,
+            rotation,
+            level: 1,
+            origin: [400, 120],
+            walls: sims_render::Walls::Up,
+            focus: sims_render::Focus::default(),
+        };
+        for (dir, &[dx, dy]) in vm_steps.iter().enumerate() {
+            let p0 = cam.project_fine(cam.rotate_fine([32 * 16, 32 * 16]), 1, 0);
+            let p1 = cam.project_fine(
+                cam.rotate_fine([32 * 16 + dx * 16, 32 * 16 + dy * 16]),
+                1,
+                0,
+            );
+            let sdx = (p1[0] - p0[0]).signum();
+            let sdy = (p1[1] - p0[1]).signum();
+            let facing = open_pack_sim_facing(&cam, dir as i16);
+            assert_eq!(
+                facing.screen_x_sign(),
+                sdx,
+                "facing {dir} at rotation {rotation} must match projected horizontal sign"
+            );
+            assert_eq!(
+                facing.is_away(),
+                sdy < 0,
+                "facing {dir} at rotation {rotation} must match projected depth direction"
+            );
+        }
+    }
+    // Explicit regression check for facing 0 ([-1, 0]) at rotation 1 -> moves screen-right & away.
+    let rot1_cam = Camera {
+        zoom: Zoom::Medium,
+        rotation: 1,
+        level: 1,
+        origin: [400, 120],
+        walls: sims_render::Walls::Up,
+        focus: sims_render::Focus::default(),
+    };
+    assert_eq!(open_pack_sim_facing(&rot1_cam, 0), OpenSimFacing::BackRight);
 
     // Verify raised-terrain projection & depth anchor at all 3 zooms (1 step = 16 near-zoom px).
     let tile_x = 16usize;
@@ -500,6 +557,26 @@ fn open_pack_two_packs_isolate_save_slots_and_custom_archive_names_boot() {
     )
     .unwrap();
 
+    // Unambiguous length-prefixed encoding prevents delimiter collisions like
+    // (`/tmp/a`, `b:c`) vs (`/tmp/a:b`, `c`) and preserves raw non-UTF-8 path bytes.
+    assert_ne!(
+        open_pack_save_slot(Path::new("/tmp/a"), "b:c", 1),
+        open_pack_save_slot(Path::new("/tmp/a:b"), "c", 1),
+        "save slot encoding must be unambiguous against delimiter collisions"
+    );
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let p1 = Path::new(OsStr::from_bytes(b"/tmp/pack-\xfe"));
+        let p2 = Path::new(OsStr::from_bytes(b"/tmp/pack-\xff"));
+        assert_ne!(
+            open_pack_save_slot(p1, "same", 1),
+            open_pack_save_slot(p2, "same", 1),
+            "save slot encoding must distinguish non-UTF-8 raw OS path bytes"
+        );
+    }
+
     let mut game_a = Game::open_open_pack(&pack_a, &[], false, Frames::default())
         .expect("pack A with colliding archive_name must still boot cleanly");
     let mut game_b = Game::open_open_pack(&pack_b, &[], false, Frames::default())
@@ -640,6 +717,75 @@ fn open_pack_cli_png_renders_non_blank_screenshot_without_sims_install() {
         "decoded 320x240 auto-fallback PNG must be non-blank (got {} colors)",
         colors2.len()
     );
+
+    // 3. Headless choice-dialog fixture: fails with non-zero exit & no PNG without
+    //    `--answers`, and completes cleanly with a valid decoded PNG when `--answers 2`
+    //    is supplied.
+    let dialog_pack = tmp.path().join("dialog-pack");
+    copy_dir_recursive(&pack_dir, &dialog_pack);
+    let mailbox_antics = dialog_pack.join("objects/open-mailbox/behavior.antics");
+    let orig_antics = std::fs::read_to_string(&mailbox_antics).expect("read mailbox antics");
+    let patched_antics = orig_antics.replace(
+        "tree 4097 \"Main\" {\n    return true;\n}",
+        "tree 4097 \"Main\" {\n    if my.attr[2] == 0 {\n        my.attr[2] := 1;\n        dialog(kind: 2, message: 1, title: 1, button1: 0, button2: 0, button3: 0, mode4_str: 0, flags: 1);\n    }\n    idle(300);\n    return true;\n}",
+    );
+    assert_ne!(patched_antics, orig_antics, "patched mailbox Main");
+    std::fs::write(&mailbox_antics, patched_antics).expect("write dialog mailbox antics");
+
+    let out_fail = tmp.path().join("dialog-unanswered.png");
+    let status_fail = Command::new(exe)
+        .env_remove("SIMS_INSTALL")
+        .arg("--open-pack")
+        .arg(&dialog_pack)
+        .arg("--png")
+        .arg(&out_fail)
+        .arg("--ticks")
+        .arg("5")
+        .arg("--size")
+        .arg("320x240")
+        .output()
+        .expect("run dialog pack without --answers");
+    assert!(
+        !status_fail.status.success(),
+        "headless run pausing on an unanswered dialog must exit non-zero"
+    );
+    assert!(
+        !out_fail.exists(),
+        "incomplete headless run must not write a misleading PNG"
+    );
+
+    let out_answered = tmp.path().join("dialog-answered.png");
+    let status_ok = Command::new(exe)
+        .env_remove("SIMS_INSTALL")
+        .arg("--open-pack")
+        .arg(&dialog_pack)
+        .arg("--answers")
+        .arg("2")
+        .arg("--png")
+        .arg(&out_answered)
+        .arg("--ticks")
+        .arg("5")
+        .arg("--size")
+        .arg("320x240")
+        .output()
+        .expect("run dialog pack with --answers 2");
+    let stderr_ok = String::from_utf8_lossy(&status_ok.stderr);
+    assert!(
+        status_ok.status.success(),
+        "headless run with --answers 2 must succeed:\nstderr: {stderr_ok}"
+    );
+    assert!(
+        stderr_ok.contains("ran 5 ticks"),
+        "answered headless run must complete all 5 ticks:\n{stderr_ok}"
+    );
+    let png_ok = std::fs::read(&out_answered).expect("read answered PNG");
+    let (w_ok, h_ok, rgb_ok) = decode_stored_rgb_png(&png_ok);
+    assert_eq!((w_ok, h_ok), (320, 240));
+    let mut colors_ok = BTreeSet::new();
+    for &px in rgb_ok.as_chunks::<3>().0.iter().step_by(5) {
+        colors_ok.insert(px);
+    }
+    assert!(colors_ok.len() >= 12);
 }
 
 #[test]
