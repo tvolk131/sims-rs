@@ -198,21 +198,6 @@ fn selecting_another_sim_deselects_the_first() {
 
 #[test]
 fn a_famous_sim_deselected_takes_and_releases_a_star_marker() {
-    const STAR_MARKER: u32 = 0xE933_7020;
-    let register_star = |fx: &mut Fixture| {
-        let file = fx.add_type(STAR_MARKER, 4, 0, 4096);
-        fx.add(
-            file,
-            4096,
-            tree(vec![assign(
-                scope::TEMPS,
-                0,
-                scope::LITERAL,
-                0,
-                RETURN_TRUE,
-            )]),
-        );
-    };
     // Without Superstar (expansions & 0x40 == 0), deselecting a Sim with word
     // 81 >= 10 leaves no star marker in the head slot (0x446bf4).
     let mut fx = two_residents();
@@ -320,6 +305,57 @@ fn a_famous_sim_deselected_takes_and_releases_a_star_marker() {
     assert!(matches!(result.unwrap_err().trap, Trap::Invalid(_)));
 }
 
+const STAR_MARKER: u32 = 0xE933_7020;
+const OTHER: u16 = PERSON + 1;
+
+/// Gives the lot's catalog the Superstar star marker, whose Init does
+/// nothing.
+fn register_star(fx: &mut Fixture) {
+    let file = fx.add_type(STAR_MARKER, 4, 0, 4096);
+    fx.add(
+        file,
+        4096,
+        tree(vec![assign(
+            scope::TEMPS,
+            0,
+            scope::LITERAL,
+            0,
+            RETURN_TRUE,
+        )]),
+    );
+}
+
+/// Sets a person's fame (person word 81).
+fn famous(fx: &mut Fixture, id: u16, fame: i16) {
+    let sim = fx.world.objects.get_mut(&id).unwrap();
+    sim.person.as_mut().unwrap().data[81] = fame;
+}
+
+fn stars(fx: &Fixture) -> usize {
+    fx.world
+        .objects
+        .values()
+        .filter(|o| o.guid == STAR_MARKER)
+        .count()
+}
+
+/// The one star marker in neither pool: lost.
+fn in_no_pool(fx: &Fixture) -> u16 {
+    let pools = &fx.world.indicator_queues;
+    let lost: Vec<u16> = fx
+        .world
+        .objects
+        .values()
+        .filter(|o| o.guid == STAR_MARKER)
+        .map(|o| o.id)
+        .filter(|id| !pools.available_stars.contains(id) && !pools.stars_in_use.contains(id))
+        .collect();
+    let [lost] = lost[..] else {
+        panic!("one star is lost: {lost:?}");
+    };
+    lost
+}
+
 /// The original's pool order for a famous Sim on a border tile. A star
 /// refresh (0x446ee9) pops the pool's last star (0x447012) before the tile
 /// check (0x44702e), and puts it in the in-use pool only on success
@@ -328,40 +364,13 @@ fn a_famous_sim_deselected_takes_and_releases_a_star_marker() {
 /// after placing (0x446ed9), so it loses none.
 #[test]
 fn a_star_refresh_on_a_border_tile_loses_the_popped_star() {
-    const STAR_MARKER: u32 = 0xE933_7020;
-    let register_star = |fx: &mut Fixture| {
-        let file = fx.add_type(STAR_MARKER, 4, 0, 4096);
-        fx.add(
-            file,
-            4096,
-            tree(vec![assign(
-                scope::TEMPS,
-                0,
-                scope::LITERAL,
-                0,
-                RETURN_TRUE,
-            )]),
-        );
-    };
-    let famous = |fx: &mut Fixture, id: u16| {
-        let sim = fx.world.objects.get_mut(&id).unwrap();
-        sim.person.as_mut().unwrap().data[81] = 10;
-    };
-    let stars = |fx: &Fixture| {
-        fx.world
-            .objects
-            .values()
-            .filter(|o| o.guid == STAR_MARKER)
-            .count()
-    };
-    const OTHER: u16 = PERSON + 1;
 
     // The refresh: OTHER, not selected, is famous on a lot's border tile.
     let mut fx = two_residents();
     fx.program.expansions = 0x40;
     register_star(&mut fx);
     fx.world.size = 32;
-    famous(&mut fx, OTHER);
+    famous(&mut fx, OTHER, 10);
     let inside = fx.world.objects[&OTHER].position;
     fx.world.objects.get_mut(&OTHER).unwrap().position = [31 * 16 + 8, 3 * 16 + 8, 1];
     fx.world.indicator_queues.queue_star(OTHER);
@@ -372,31 +381,31 @@ fn a_star_refresh_on_a_border_tile_loses_the_popped_star() {
         "no star on the border"
     );
     assert_eq!(stars(&fx), 4, "the pool was made (0x446356)");
-    let [lost] = fx.world.indicator_queues.lost_stars[..] else {
-        panic!(
-            "one star is lost: {:?}",
-            fx.world.indicator_queues.lost_stars
-        );
-    };
-    assert_eq!(fx.world.objects[&lost].guid, STAR_MARKER);
+    let pools = &fx.world.indicator_queues;
+    assert!(pools.stars_in_use.is_empty());
+    assert_eq!(pools.available_stars.len(), 3);
+    let lost = in_no_pool(&fx);
     assert_eq!(fx.world.objects[&lost].data[2], 0, "held by nobody");
 
     // Back inside, the next refresh gets another star from the pool, and
-    // the pool is not refilled: three stars are still available.
+    // the pool is not refilled.
     fx.world.objects.get_mut(&OTHER).unwrap().position = inside;
     fx.world.indicator_queues.queue_star(OTHER);
     // With a Sim selected, announcing the house only refreshes (0x4a8679).
+    let next = *fx.world.indicator_queues.available_stars.last().unwrap();
     asking(&mut fx, |i, world| i.announce_house(world).unwrap());
     let star = fx.world.objects[&OTHER].slots[2].object as u16;
-    assert_ne!(star, 0);
+    assert_eq!(star, next, "the available pool's last star");
     assert_ne!(star, lost, "the lost star is in neither pool");
-    assert_eq!(fx.world.objects[&star].guid, STAR_MARKER);
     assert_eq!(stars(&fx), 4);
-    assert_eq!(fx.world.indicator_queues.lost_stars, [lost]);
+    let pools = &fx.world.indicator_queues;
+    assert_eq!(pools.stars_in_use, [star]);
+    assert_eq!(pools.available_stars.len(), 2);
+    assert_eq!(in_no_pool(&fx), lost);
 
-    // Deleting the lost star forgets it.
-    fx.world.indicator_queues.forget(lost);
-    assert!(fx.world.indicator_queues.lost_stars.is_empty());
+    // Deleting a star forgets it (0x448097).
+    fx.world.indicator_queues.forget(star);
+    assert!(fx.world.indicator_queues.stars_in_use.is_empty());
 
     // The deselection: PERSON is famous on the border tile when OTHER is
     // selected. No star goes on it, and none is lost.
@@ -404,7 +413,7 @@ fn a_star_refresh_on_a_border_tile_loses_the_popped_star() {
     fx.program.expansions = 0x40;
     register_star(&mut fx);
     fx.world.size = 32;
-    famous(&mut fx, PERSON);
+    famous(&mut fx, PERSON, 10);
     fx.world.objects.get_mut(&PERSON).unwrap().position = [31 * 16 + 8, 3 * 16 + 8, 1];
     asking(&mut fx, |i, world| i.select(world, Some(OTHER)).unwrap());
     assert_eq!(stars(&fx), 4);
@@ -416,7 +425,111 @@ fn a_star_refresh_on_a_border_tile_loses_the_popped_star() {
             .is_none_or(|o| o.guid != STAR_MARKER)),
         "no star on the border"
     );
-    assert!(fx.world.indicator_queues.lost_stars.is_empty());
+    let pools = &fx.world.indicator_queues;
+    assert_eq!(pools.available_stars.len(), 4);
+    assert!(pools.stars_in_use.is_empty());
+}
+
+/// The available star pool is a stack in the order stars come back: the
+/// original appends a star let go from a head (0x4481eb: 0x4483bd) and
+/// takes the last (0x447012). Two famous Sims take the two newest stars;
+/// letting the newer go and then the older puts the older last, so a
+/// famous Sim refreshed on a border tile loses the older.
+#[test]
+fn the_star_pool_hands_out_the_last_star_let_go() {
+    const THIRD: u16 = PERSON + 2;
+    let mut fx = two_residents();
+    resident(&mut fx, THIRD, [2, 2]);
+    fx.program.expansions = 0x40;
+    register_star(&mut fx);
+    for sim in [OTHER, THIRD] {
+        famous(&mut fx, sim, 10);
+        fx.world.indicator_queues.queue_star(sim);
+    }
+    // PERSON is selected: the refresh puts stars on OTHER, then THIRD.
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    let held = |fx: &Fixture, sim: u16| fx.world.objects[&sim].slots[2].object as u16;
+    let (newer, older) = (held(&fx, OTHER), held(&fx, THIRD));
+    assert_eq!(fx.world.indicator_queues.stars_in_use, [newer, older]);
+    assert!(newer > older, "made in order, the last made handed out first");
+    // Selecting OTHER lets its star go (0x4467d7 -> 0x4481eb); it is then
+    // no longer famous, so selecting THIRD next gives it no star again.
+    asking(&mut fx, |i, world| i.select(world, Some(OTHER)).unwrap());
+    famous(&mut fx, OTHER, 0);
+    asking(&mut fx, |i, world| i.select(world, Some(THIRD)).unwrap());
+    let pools = &fx.world.indicator_queues;
+    assert!(pools.stars_in_use.is_empty());
+    assert_eq!(pools.available_stars[2..], [newer, older]);
+    // PERSON, famous and not selected, is refreshed on a border tile: the
+    // star popped and lost is the older one, let go last.
+    fx.world.size = 32;
+    famous(&mut fx, PERSON, 10);
+    fx.world.objects.get_mut(&PERSON).unwrap().position = [31 * 16 + 8, 3 * 16 + 8, 1];
+    fx.world.indicator_queues.queue_star(PERSON);
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    assert_eq!(in_no_pool(&fx), older);
+    assert_eq!(
+        fx.world.indicator_queues.available_stars.last(),
+        Some(&newer)
+    );
+}
+
+/// A put runs the arrival (0x44752e) when the object was off the active
+/// lot: 0x433366 tests the old position with 0x422632 on the lot, so
+/// against the lot's size, not the 64 tiles of its arrays. A famous Sim
+/// moved from tile 31 to tile 30 of a 32-tile lot arrives and takes a
+/// star; on a 64-tile lot tile 31 is inside and nothing arrives.
+#[test]
+fn a_famous_sim_moved_in_from_a_small_lots_border_takes_a_star() {
+    const FIND_LOCATION: u16 = 16;
+    let star_on = |size: i16| {
+        let mut fx = two_residents();
+        fx.program.expansions = 0x40;
+        register_star(&mut fx);
+        fx.world.size = size;
+        // No pool and no water anywhere, for the place test.
+        fx.world.arrays.insert(9, crate::rooms::array(1, 0xff));
+        fx.world.arrays.insert(10, crate::rooms::array(1, 0xff));
+        // OTHER, famous and not selected, stands on tile (31, 3).
+        let from = [31, 3];
+        let grid = &mut fx.world.arrays.get_mut(&3).unwrap().data;
+        let cell = |t: [i32; 2]| ((t[0] * 64 + t[1]) * 2) as usize;
+        grid[cell([4, 4])..cell([4, 4]) + 2].copy_from_slice(&[0, 0]);
+        grid[cell(from)..cell(from) + 2].copy_from_slice(&OTHER.to_le_bytes());
+        let other = fx.world.objects.get_mut(&OTHER).unwrap();
+        other.position = [from[0] * 16 + 8, from[1] * 16 + 8, 1];
+        // It may stand on level 1 (data word 4 bit 0) on a tile with no
+        // floor (data word 42 flag 2), as the lot's tiles have none.
+        other.data[4] |= 1;
+        other.data[42] |= 2;
+        famous(&mut fx, OTHER, 10);
+        // Find Location mode 2 puts OTHER where the lamp is, on tile 30,
+        // with the lot told (0x433340).
+        fx.lamp_mut().position = [30 * 16 + 8, 3 * 16 + 8, 1];
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                FIND_LOCATION,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [2, 0, 0, 0, 0, 0, 0, 0],
+            )]),
+        );
+        let ran = fx.run_with(LAMP, 4096, OTHER as i16, &[], 1000);
+        assert_eq!(ran, Ok(true), "lot size {size}");
+        assert_eq!(
+            fx.world.objects[&OTHER].position,
+            [30 * 16 + 8, 3 * 16 + 8, 1]
+        );
+        let star = fx.world.objects[&OTHER].slots[2].object as u16;
+        fx.world
+            .objects
+            .get(&star)
+            .is_some_and(|o| o.guid == STAR_MARKER)
+    };
+    assert!(star_on(32), "tile 31 is off a 32-tile lot: OTHER arrives");
+    assert!(!star_on(64), "tile 31 is on a 64-tile lot: no arrival");
 }
 
 #[test]

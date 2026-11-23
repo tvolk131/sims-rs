@@ -455,6 +455,10 @@ fn migrate_v10_to_v11(record: &str, body: &[u8]) -> Result<Vec<u8>, MigrationErr
         family_flags: v10.family_flags,
         indicator_queues: sims_sim::IndicatorQueues::default(),
     };
+    let mut v11 = v11;
+    let pools = crate::placement::adopted_star_pools(&v11.world);
+    v11.world.indicator_queues = pools.clone();
+    v11.indicator_queues = pools;
     postcard::to_allocvec(&v11).map_err(|error| MigrationError::StepFailed {
         record: record.to_owned(),
         from: 10,
@@ -496,7 +500,7 @@ static SAVED_STEPS: &[MigrationStep] = &[
     MigrationStep {
         from: 10,
         to: 11,
-        description: "add format-11 auxiliary World::indicator_queues (empty)",
+        description: "add format-11 auxiliary World::indicator_queues (no refreshes; the star pools from where the stars are)",
         apply: migrate_v10_to_v11,
     },
 ];
@@ -629,7 +633,7 @@ impl Saved {
         &self.world
     }
 
-    /// Replaces the pending indicator refreshes and lost stars
+    /// Replaces the pending indicator refreshes and the star pools
     /// (`World::indicator_queues`), for a save whose world came from
     /// elsewhere: the queues of the lot a [`World`] snapshot is spliced
     /// into may name people the world lacks, so it takes the snapshot's
@@ -1653,7 +1657,8 @@ mod tests {
             dates: vec![4],
             stars: vec![6, 6],
             dirty: true,
-            lost_stars: vec![8],
+            available_stars: vec![8],
+            stars_in_use: vec![10],
         };
         let v10_bytes = dec8.encode();
         let (dec10, rep10) = Saved::decode_with_report(&v10_bytes).unwrap();
@@ -1740,7 +1745,7 @@ mod tests {
         let mut spliced = dec10.clone();
         let mut queues = sims_sim::IndicatorQueues::default();
         queues.queue_star(7);
-        queues.lost_stars.push(9);
+        queues.available_stars.push(9);
         spliced.set_indicator_queues(queues.clone());
         let back = Saved::decode(&spliced.encode()).unwrap();
         assert_eq!(back.indicator_queues, queues);

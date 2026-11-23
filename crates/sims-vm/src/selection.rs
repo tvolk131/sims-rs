@@ -527,7 +527,7 @@ impl Interpreter<'_> {
     ///
     /// For a famous person on the border tiles the original takes a star
     /// from its pool before it checks the tiles, and keeps it in neither
-    /// list; so does the port ([`sims_sim::IndicatorQueues::lost_stars`]).
+    /// pool; so does the port ([`sims_sim::IndicatorQueues::available_stars`]).
     fn refresh_star(&self, world: &mut World, person: u16) -> Result<(), Fault> {
         let selected = world
             .objects

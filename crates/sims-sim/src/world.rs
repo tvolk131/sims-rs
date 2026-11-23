@@ -606,16 +606,23 @@ pub struct IndicatorQueues {
     pub stars: Vec<u16>,
     /// +0xac: a refresh is waiting.
     pub dirty: bool,
-    /// Star markers taken from the available star pool (+0xdc) that went
-    /// into neither pool, in the order they were lost. A star refresh
-    /// (0x446ee9) and a famous Sim's arrival (0x447a57) both pop a star
-    /// (0x447012, 0x447b63) before they check the Sim's tile (0x422632);
-    /// for a Sim on a border tile they stop there, and the star is in
-    /// neither the available pool nor the in-use pool (+0xd0, pushed at
-    /// 0x4471b0 only on success). A deselection (0x446bf0) checks the tile
-    /// first and loses none. The port's pools are where the stars stand,
-    /// so it keeps these apart: none is handed out again.
-    pub lost_stars: Vec<u16>,
+    /// The available star pool (+0xdc): pooled Superstar star markers
+    /// waiting for a famous Sim, the next one last. 0x446356 appends the
+    /// stars it makes in the order made, and letting a star go from a
+    /// head (0x4481eb) moves it here from the in-use pool, at the end
+    /// (0x4483bd), only if it was in use. A star refresh (0x447012), a
+    /// famous Sim's arrival (0x447b63) and a deselection (0x446ed9) take
+    /// the last one.
+    ///
+    /// A refresh and an arrival take the star before they check the Sim's
+    /// tile (0x422632) and put it in the in-use pool only on success
+    /// (0x4471b0, 0x447d22), so a famous Sim on a border tile loses the
+    /// star: it is in neither pool, and is never handed out again. A
+    /// deselection checks the tile first and loses none.
+    pub available_stars: Vec<u16>,
+    /// The in-use star pool (+0xd0): stars put on famous Sims' heads, in
+    /// the order put (0x4471b0, 0x447d22, 0x446eba).
+    pub stars_in_use: Vec<u16>,
 }
 
 impl IndicatorQueues {
@@ -647,13 +654,13 @@ impl IndicatorQueues {
     /// +0xdc, not these), stays queued after it is freed, and the next
     /// refresh reads freed memory. The port drops such an entry instead.
     ///
-    /// A deleted lost star leaves [`IndicatorQueues::lost_stars`] too, so a
-    /// new object with its ID is not taken for it. That is not a departure:
-    /// the original's lost star is in no list.
+    /// A deleted star leaves both star pools too, as in the original
+    /// (0x447e69 -> 0x448097: 0x448164, 0x4481e2).
     pub fn forget(&mut self, object: u16) {
         self.dates.retain(|&other| other != object);
         self.stars.retain(|&other| other != object);
-        self.lost_stars.retain(|&other| other != object);
+        self.available_stars.retain(|&other| other != object);
+        self.stars_in_use.retain(|&other| other != object);
     }
 }
 
@@ -1479,7 +1486,8 @@ mod tests {
     fn a_world_snapshot_payload_keeps_its_pending_refreshes() {
         let mut world = World::empty();
         world.indicator_queues.queue_star(5);
-        world.indicator_queues.lost_stars.push(9);
+        world.indicator_queues.available_stars.push(9);
+        world.indicator_queues.stars_in_use.push(8);
         let payload = world.encode_snapshot();
         // The world's canonical encoding comes first and unchanged.
         assert!(payload.starts_with(&world.encode()));

@@ -376,6 +376,29 @@ pub(crate) fn on_lot(position: [i32; 2]) -> bool {
     inside(position[0]) && inside(position[1])
 }
 
+/// The star pools of a world saved before they were kept (`Saved`
+/// format 10 and older): where the port then took them from. A star
+/// marker held by an object is in use; one off the lot and held by none
+/// is available, the first in the registration order last, as that one
+/// was handed out next.
+pub(crate) fn adopted_star_pools(world: &World) -> sims_sim::IndicatorQueues {
+    let mut pools = sims_sim::IndicatorQueues::default();
+    for &id in world.order.iter().rev() {
+        let Some(obj) = world.objects.get(&id) else {
+            continue;
+        };
+        if obj.guid != STAR_MARKER {
+            continue;
+        }
+        if obj.data.get(data::CONTAINER).copied().unwrap_or(0) != 0 {
+            pools.stars_in_use.push(id);
+        } else if !on_lot([obj.position[0], obj.position[1]]) {
+            pools.available_stars.push(id);
+        }
+    }
+    pools
+}
+
 /// Whether a point is off the lot's inner tiles (0x422632): either
 /// coordinate's tile, as a signed byte, below 1 or not below the lot's
 /// size less 1.
@@ -1335,8 +1358,9 @@ impl Interpreter<'_> {
 
     /// What the object registry does when it is told an object left the
     /// lot (0x447d2b, 0x4481eb): an indicator or star marker (`STAR_MARKER`)
-    /// is taken off the lot once more, this time without telling the registry
-    /// (returning a star marker to the available pool as off-lot uncontained).
+    /// is taken off the lot once more, this time without telling the registry,
+    /// and a star marker in use goes back to the available pool
+    /// ([`Interpreter::release_star`]).
     /// So an indicator or star marker that leaves is asked function 10 twice.
     /// Any other object changes nothing, and neither does a person: the
     /// original looks up what the person holds in its slot 1 and then goes by
@@ -1356,6 +1380,9 @@ impl Interpreter<'_> {
             || object.person.is_some()
         {
             return Ok(());
+        }
+        if object.guid == STAR_MARKER {
+            Self::release_star(world, id);
         }
         self.take_off_one(world, id, false)
     }
@@ -1414,7 +1441,10 @@ impl Interpreter<'_> {
         }
         let words = self.words(world, id).map_err(fail)?;
         let old = position(world, id).map_err(fail)?;
-        let was_outside = !capture_raw(world, id).map_err(fail)?.on_lot;
+        // 0x433349..0x43336f: whether the old position is off the active
+        // lot (0x422632 with the lot, 0x6e552c), so against the lot's size,
+        // not the arrays' 64 tiles.
+        let was_outside = off_lot(world, [old[0], old[1]]);
         let level = match to.container {
             Some(parent) => position(world, parent).map_err(fail)?[2],
             None => to.level,
@@ -1476,7 +1506,10 @@ impl Interpreter<'_> {
             self.callback(world, parent, function::PLACED, 0)?;
         }
         let now = position(world, id).map_err(fail)?;
-        if now[..2] != old[..2] && was_outside && notify {
+        // 0x4335a2..0x4335cc: the arrival (0x44752e) runs when the x word
+        // moved (only +0xf4 is compared) and the old position was off the
+        // lot.
+        if now[0] != old[0] && was_outside && notify {
             self.placed_from_outside(world, id)?;
         }
         if portal {
@@ -1849,31 +1882,22 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// Finds an available (off-lot, uncontained, not lost) star marker in
-    /// `world.order`, returning the most recently created available instance
-    /// first to match the original's LIFO `pool_avail.back()` (0x447b22,
-    /// 0x446ce0). A lost star ([`sims_sim::IndicatorQueues::lost_stars`])
-    /// is in neither of the original's pools.
+    /// The available pool's last star (`pool_avail.back()`, 0x447b22,
+    /// 0x446ce0): [`sims_sim::IndicatorQueues::available_stars`].
     fn available_star(world: &World) -> Option<u16> {
-        world.order.iter().copied().find(|&id| {
-            world.objects.get(&id).is_some_and(|obj| {
-                obj.guid == STAR_MARKER
-                    && obj.data.get(data::CONTAINER).copied().unwrap_or(0) == 0
-                    && !on_lot([obj.position[0], obj.position[1]])
-                    && !world.indicator_queues.lost_stars.contains(&id)
-            })
-        })
+        world.indicator_queues.available_stars.last().copied()
     }
 
     /// Ensures the Superstar star-marker pool (`self + 0xdc` in `Sims.exe`,
     /// 0x446356) has an available `STAR_MARKER` (`0xE933_7020`) instance.
     ///
-    /// When no available star exists and Superstar (`0x40`) is installed with
-    /// `STAR_MARKER` present in the catalog, creates 4 hidden (`data[8] |= 0x4000`)
-    /// instances if no star markers exist on the lot yet (both `pool_avail` and
-    /// `pool_in_use` empty, 0x4463f3..0x446421), or 2 more instances if all
-    /// existing star markers are currently in use (0x44642a). A lost star
-    /// counts in neither pool.
+    /// When the available pool is empty and Superstar (`0x40`) is
+    /// installed with `STAR_MARKER` present in the catalog, creates 4
+    /// hidden (`data[8] |= 0x4000`) instances if the in-use pool is empty
+    /// too (0x4463f3..0x446421), or 2 more otherwise (0x44642a), and
+    /// appends each to the available pool in the order made (0x4464c9).
+    /// A star in neither pool (one lost on a border tile) counts in
+    /// neither.
     fn ensure_star_pool(&self, world: &mut World) -> Result<Option<u16>, Fault> {
         if let Some(star) = Self::available_star(world) {
             return Ok(Some(star));
@@ -1884,10 +1908,11 @@ impl Interpreter<'_> {
         if self.catalog.object(STAR_MARKER).is_none() {
             return Ok(None);
         }
-        let any_existing = world.objects.iter().any(|(id, obj)| {
-            obj.guid == STAR_MARKER && !world.indicator_queues.lost_stars.contains(id)
-        });
-        let count = if any_existing { 2 } else { 4 };
+        let count = if world.indicator_queues.stars_in_use.is_empty() {
+            4
+        } else {
+            2
+        };
         for _ in 0..count {
             let star_id = self.create(world, STAR_MARKER)?;
             if let Some(obj) = world.objects.get_mut(&star_id)
@@ -1896,8 +1921,20 @@ impl Interpreter<'_> {
                 // Hidden: flag 0x4000 of data word 8 (0x446489..0x4464b1).
                 obj.data[data::FLAGS] |= 0x4000;
             }
+            world.indicator_queues.available_stars.push(star_id);
         }
         Ok(Self::available_star(world))
+    }
+
+    /// 0x4481eb (0x448338..0x4483d1): a star marker let go from a head
+    /// moves from the in-use pool to the end of the available pool
+    /// (0x4483bd), if it was in use. One in neither pool stays there.
+    fn release_star(world: &mut World, star: u16) {
+        let pools = &mut world.indicator_queues;
+        if let Some(index) = pools.stars_in_use.iter().position(|&s| s == star) {
+            pools.available_stars.push(star);
+            pools.stars_in_use.remove(index);
+        }
     }
 
     /// Places a pooled Superstar star marker (`STAR_MARKER`, `0xE933_7020`)
@@ -1911,11 +1948,12 @@ impl Interpreter<'_> {
     /// `pops_first`: whether the caller takes the star from the available
     /// pool before it checks the tile. A star refresh (0x447012) and a
     /// famous Sim's arrival (0x447b63) do, and for a Sim on a border tile
-    /// stop without putting it in the in-use pool, so the star is lost
-    /// ([`sims_sim::IndicatorQueues::lost_stars`]) and the next famous Sim
+    /// stop without putting it in the in-use pool, so the star is lost (in
+    /// neither [`sims_sim::IndicatorQueues::available_stars`] nor
+    /// [`sims_sim::IndicatorQueues::stars_in_use`]) and the next famous Sim
     /// gets another. A deselection (0x446ce0..0x446ed9) reads the pool's
-    /// last star, checks the tile, and pops the star only after it is
-    /// placed, so a border tile leaves it available. Not modeled: the
+    /// last star, checks the tile, and pops the pool's last star only after
+    /// it is placed, so a border tile leaves it available. Not modeled: the
     /// popping paths also lose the star when the head slot's flags lack
     /// bit 2 (0x447094..0x4470a8); the port does not keep slot flags.
     pub(crate) fn mark_star(
@@ -1935,11 +1973,12 @@ impl Interpreter<'_> {
         let Some(star) = self.ensure_star_pool(world)? else {
             return Ok(());
         };
+        if pops_first {
+            world.indicator_queues.available_stars.pop();
+        }
         let [p0, p1, level] = position(world, id).map_err(fail)?;
         if off_lot(world, [p0, p1]) {
-            if pops_first {
-                world.indicator_queues.lost_stars.push(star);
-            }
+            // Popped first, the star is now in neither pool: lost.
             return Ok(());
         }
         let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
@@ -1975,7 +2014,14 @@ impl Interpreter<'_> {
                 level,
             },
             true,
-        )
+        )?;
+        // Into the in-use pool (0x4471b0, 0x447d22, 0x446eba); a
+        // deselection then pops the available pool's last star (0x446ed9).
+        world.indicator_queues.stars_in_use.push(star);
+        if !pops_first {
+            world.indicator_queues.available_stars.pop();
+        }
+        Ok(())
     }
 
     /// The selected Sim `id` has come onto the lot (0x4475d2 to 0x4477bb),
@@ -2108,8 +2154,9 @@ impl Interpreter<'_> {
     /// happens). Matching native `0x4481eb` (`legacy/crates/sims-vm/src/indicator_pools.rs:229`),
     /// the GUID check tests the argument's GUID, not the resolved occupant's:
     /// an indicator or pooled star marker (`STAR_MARKER`, `0xE933_7020`) leaves
-    /// the lot unannounced (virtual function 0x50 with 0), which also returns a
-    /// star marker to the available pool (`0x448338..0x4483e0`); any other
+    /// the lot unannounced (virtual function 0x50 with 0), after a star marker
+    /// in use goes back to the available pool (`0x448338..0x4483d1`,
+    /// [`Interpreter::release_star`]); any other
     /// object (including a person passed directly) does nothing.
     pub(crate) fn release_from_head(&self, world: &mut World, id: u16) -> Result<(), Fault> {
         let fail = |trap| Fault {
@@ -2130,6 +2177,9 @@ impl Interpreter<'_> {
         let Some(target) = target else {
             return Ok(());
         };
+        if guid == STAR_MARKER {
+            Self::release_star(world, target);
+        }
         if guid == STAR_MARKER || INDICATORS.contains(&guid) {
             self.take_off(world, target, false)?;
         }

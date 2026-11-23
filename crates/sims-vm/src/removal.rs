@@ -148,22 +148,13 @@ impl Interpreter<'_> {
                 world.indicators[slot] = 0;
             }
         }
-        // 0x44602d..0x446133: after the two indicators, clear pooled star
-        // markers (in-use first, then available).
-        let mut stars_in_use = Vec::new();
-        let mut stars_avail = Vec::new();
-        for &id in world.order.iter().rev() {
-            if let Some(obj) = world.objects.get(&id)
-                && obj.guid == crate::placement::STAR_MARKER
-            {
-                if obj.data.get(2).copied().unwrap_or(0) != 0 {
-                    stars_in_use.push(id);
-                } else {
-                    stars_avail.push(id);
-                }
-            }
-        }
-        for id in stars_in_use.into_iter().chain(stars_avail) {
+        // 0x44602d..0x446133: after the two indicators, the pooled star
+        // markers go, the in-use pool first and then the available pool,
+        // each from its front, and both pools are emptied. A star in
+        // neither pool (lost on a border tile) goes with the other objects.
+        let in_use = std::mem::take(&mut world.indicator_queues.stars_in_use);
+        let available = std::mem::take(&mut world.indicator_queues.available_stars);
+        for id in in_use.into_iter().chain(available) {
             if world.objects.contains_key(&id) {
                 self.remove_now_inner(world, id, false)?;
                 removed.push(id);
