@@ -19,8 +19,9 @@ for f in vmlinuz initramfs.cpio.gz runtime.txt .build; do
     if [ -e "$OUT/$f" ] || [ -L "$OUT/$f" ]; then echo "$OUT/$f exists" >&2; exit 1; fi
 done
 mkdir "$OUT/.build"
-trap 'rm -rf "$OUT/.build"' EXIT
-cp -c "$DISK" "$OUT/.build/disk.ext4"
+trap 'chflags -R nouchg "$OUT/.build" 2>/dev/null; rm -rf "$OUT/.build"' EXIT
+cp -c "$DISK" "$OUT/.build/disk.ext4"  # a free clone on the disk's volume, else a full copy
+chflags nouchg "$OUT/.build/disk.ext4"  # the clone keeps a locked seed's flag
 chmod u+w "$OUT/.build/disk.ext4"
 docker run --rm --network none --platform linux/arm64 ${KERNEL_VERSION:+-e KERNEL_VERSION="$KERNEL_VERSION"} \
  --mount type=bind,src="$HERE/runtime",dst=/h,readonly \

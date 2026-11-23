@@ -37,7 +37,7 @@ the repository, and so do the captures.
 | File | What it does |
 | --- | --- |
 | `Dockerfile` | The `sims-harness-qemu:bookworm` image: Debian bookworm with `qemu-system-i386`, e2fsprogs and perl. |
-| `build_runtime.sh` | Makes the kernel and initramfs from an installed guest disk (see Inputs), with debugfs inside the image, working on an APFS clone of the disk in the output directory (so the output must be on the disk's volume). |
+| `build_runtime.sh` | Makes the kernel and initramfs from an installed guest disk (see Inputs), with debugfs inside the image, working on an APFS clone of the disk in the output directory (free on the disk's volume; elsewhere `cp -c` makes a full copy, removed afterwards). |
 | `runtime/init` | `/init` of the initramfs. |
 | `runtime/build_in_image.sh` | The part of `build_runtime.sh` that runs in the image: it replays the clone's journal, reads the kernel, busybox and modules off it (checking each file's size, and that busybox is a static i386 ELF), and packs them. Any failure stops it before an output is written. |
 | `runtime/newc.pl` | Writes a directory as a cpio archive in the kernel's initramfs format, with names sorted, owner root and mtime 0. Only perl-base, which the image has. |

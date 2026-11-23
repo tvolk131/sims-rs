@@ -26,27 +26,28 @@ trap 'rm -rf "$S"' EXIT
 resolve() {
     p=$1 n=0
     while :; do
-        debugfs -R "stat $p" "$DISK" 2>/dev/null > "$S/stat" || true
+        debugfs -R "stat \"$p\"" "$DISK" 2>/dev/null > "$S/stat" || true
         type=$(sed -n 's/.*Type: \([a-z]*\).*/\1/p' "$S/stat" | head -n 1)
         case $type in
         regular) echo "$p"; return 0 ;;
         symlink)
             n=$((n + 1)); [ "$n" -le 8 ] || { echo "too many links at $1" >&2; return 1; }
             t=$(sed -n 's/^Fast link dest: "\(.*\)"$/\1/p' "$S/stat")
-            [ -n "$t" ] || t=$(debugfs -R "cat $p" "$DISK" 2>/dev/null)
+            [ -n "$t" ] || t=$(debugfs -R "cat \"$p\"" "$DISK" 2>/dev/null)
             case $t in /*) p=$t ;; *) p=$(dirname "$p")/$t ;; esac ;;
         *) echo "$1 is not a regular file on the disk (${type:-missing})" >&2; return 1 ;;
         esac
     done
 }
-# get <absolute path on disk> <local file>: copies it and checks its size.
+# get <absolute path on disk> <local file>: copies it and checks its size,
+# which must not be zero.
 get() {
     src=$(resolve "$1")
     rm -f "$2"
-    debugfs -R "dump $src $2" "$DISK" 2>/dev/null
+    debugfs -R "dump \"$src\" \"$2\"" "$DISK" 2>/dev/null
     want=$(sed -n 's/.*Size: \([0-9]*\).*/\1/p' "$S/stat" | head -n 1)
     have=$(wc -c < "$2" 2>/dev/null || echo none)
-    [ -n "$want" ] && [ "$have" = "$want" ] || { echo "cannot read $1 from the disk ($have of $want bytes)" >&2; exit 1; }
+    [ -n "$want" ] && [ "$want" -gt 0 ] && [ "$have" = "$want" ] || { echo "cannot read $1 from the disk ($have of $want bytes)" >&2; exit 1; }
 }
 
 get "/boot/vmlinuz-$K" "$S/vmlinuz"
@@ -67,11 +68,16 @@ perl -e '
     my ($phoff) = unpack("V", substr($b, 28, 4));
     my ($phentsize, $phnum) = unpack("vv", substr($b, 42, 4));
     die "busybox: bad program headers\n"
-        if $phnum == 0 || $phentsize < 32 || $phoff + $phnum * $phentsize > length $b;
+        if $phnum == 0 || $phentsize != 32 || $phoff + $phnum * $phentsize > length $b;
+    my $loads = 0;
     for my $i (0 .. $phnum - 1) {
-        die "busybox is dynamically linked\n"
-            if unpack("V", substr($b, $phoff + $i * $phentsize, 4)) == 3;
-    }' "$R/bin/busybox"
+        my ($ptype, $off, undef, undef, $filesz) = unpack("V5", substr($b, $phoff + $i * 32, 20));
+        die "busybox is dynamically linked\n" if $ptype == 3;
+        next unless $ptype == 1;
+        $loads++;
+        die "busybox: a load segment lies past the end of the file\n" if $off + $filesz > length $b;
+    }
+    die "busybox: no load segment\n" unless $loads;' "$R/bin/busybox"
 for applet in sh mount mkdir modprobe sleep switch_root uname; do
     ln -s busybox "$R/bin/$applet"
 done
@@ -81,7 +87,7 @@ chmod 0755 "$R/init"
 # The modules /init loads and everything they depend on, from modules.dep,
 # with a modules.dep that names only those (busybox modprobe reads it).
 # Names match as modprobe matches them: '-' and '_' alike, the first row
-# for a name wins. The kernel's modules are not compressed; a compressed
+# for a name (or a path) wins, and the rows keep their order. The kernel's modules are not compressed; a compressed
 # one stops the build.
 get "/$M/modules.dep" "$S/modules.dep"
 awk -v want="$MODULES" '
@@ -93,7 +99,8 @@ awk -v want="$MODULES" '
     {
         key = $1; sub(/:$/, "", key)
         deps = ""; for (j = 2; j <= NF; j++) deps = deps " " $j
-        dep[key] = deps
+        if (key in dep) next
+        dep[key] = deps; order[++rows] = key
         b = name(key); if (!(b in path)) path[b] = key
     }
     END {
@@ -110,12 +117,12 @@ awk -v want="$MODULES" '
             seen[k] = 1
             if (!(k in dep)) { print "no modules.dep row for " k > "/dev/stderr"; exit 1 }
             name(k)
-            print k ":" dep[k]
             nd = split(dep[k], d, " ")
             for (j = 1; j <= nd; j++) stack[++sp] = d[j]
         }
-    }' "$S/modules.dep" > "$S/closure"
-sort "$S/closure" > "$R/$M/modules.dep"
+        # In modules.dep order, so modprobe meets the rows as it would there.
+        for (i = 1; i <= rows; i++) if (order[i] in seen) print order[i] ":" dep[order[i]]
+    }' "$S/modules.dep" > "$R/$M/modules.dep"
 cut -d: -f1 "$R/$M/modules.dep" > "$S/kos"
 while read -r ko; do
     mkdir -p "$R/$M/$(dirname "$ko")"
@@ -135,7 +142,9 @@ gzip -n -9 "$S/initramfs.cpio"
 for f in vmlinuz initramfs.cpio.gz runtime.txt; do
     cp "$S/$f" "/out/.build/$f"
 done
+# build_runtime.sh checked that none of the three exists, so a failed
+# publication removes the ones already moved.
 for f in vmlinuz initramfs.cpio.gz runtime.txt; do
-    mv "/out/.build/$f" "/out/$f"
+    mv "/out/.build/$f" "/out/$f" || { (cd /out && rm -f vmlinuz initramfs.cpio.gz runtime.txt); exit 1; }
 done
 cat /out/runtime.txt

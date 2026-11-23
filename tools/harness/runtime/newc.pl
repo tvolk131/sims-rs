@@ -58,7 +58,7 @@ sub record {
     $out .= "\0" x ((4 - length($out) % 4) % 4);
     $out .= $data;
     $out .= "\0" x ((4 - length($data) % 4) % 4);
-    print $out;
+    print $out or die "write: $!\n";
 }
 binmode STDOUT;
 for my $path (sort keys %entry) {
@@ -66,3 +66,4 @@ for my $path (sort keys %entry) {
     record($path, $mode, $data, $rmaj // 0, $rmin // 0);
 }
 record('TRAILER!!!', 0, '', 0, 0);
+close STDOUT or die "write: $!\n";
