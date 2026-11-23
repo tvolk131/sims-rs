@@ -378,6 +378,14 @@ impl TravelTransport {
 /// - [`Self::Family`] (flag +0x141): the game holds the traveler's family
 ///   and global 9 becomes its number (0x4f2211..0x4f222b).
 ///
+/// 0x4f1ae9 dispatches on the house once the load is done: Downtown 21–30
+/// runs the solo path at 0x4f1c87 when +0x140 is set; Studio Town 81–89
+/// runs it at 0x4f1e12 when +0x142 is set; Vacation 40–49, zoning 2 and
+/// Magic Town 93–99 (0x4f1f82..0x4f1fac) run the solo path at 0x4f2060 for
+/// +0x140 or the family path at 0x4f21bd for +0x141. Any other house,
+/// Magic Town's residential 90–92 among them, gets no arrival
+/// (0x4f1fa2 → 0x4f23e3), so a trip there is [`Self::Group`].
+///
 /// Either way each traveler is made by the person factory (0x4e9719 →
 /// 0x440b2d), which leaves it off the lot: nothing places it until the
 /// middle ped marker's Find Location does. A date's companion is not made
@@ -389,17 +397,29 @@ pub enum ArrivalFamily {
     Solo,
     /// Mode 1: the traveler's whole family.
     Family,
-    /// [`TravelParty::HouseholdGroup`], which no native mode asks for. The
-    /// game holds the traveler's family, as in [`Self::Family`], and the
-    /// travelers are put beside the arrival portal as before this type
-    /// existed. What the marker then does with them is unchanged.
+    /// A trip with no native arrival: [`TravelParty::HouseholdGroup`],
+    /// which no native mode asks for, or a destination 0x4f1ae9 makes no
+    /// arrival on (Magic Town's residential 90–92). The game holds the
+    /// traveler's family, as in [`Self::Family`], and the travelers are put
+    /// beside the arrival portal as before this type existed.
     Group,
 }
 
+/// Whether 0x4f1ae9 makes an arrival on `house` of `destination`: every
+/// destination but Magic Town's residential lots 90–92, which fall through
+/// its dispatch (0x4f1f9f..0x4f1fac, 93–99 only) to 0x4f23e3.
+fn has_native_arrival(destination: TravelDestination, house: u32) -> bool {
+    !(destination == TravelDestination::MagicTown && house < 93)
+}
+
 impl ArrivalFamily {
-    /// The arrival family a departure asks for.
+    /// The arrival family of a departure of `party` to `house` of
+    /// `destination`.
     #[must_use]
-    pub const fn of(party: &TravelParty) -> Self {
+    pub fn of(party: &TravelParty, destination: TravelDestination, house: u32) -> Self {
+        if !has_native_arrival(destination, house) {
+            return Self::Group;
+        }
         match party {
             TravelParty::Single { .. } | TravelParty::Date { .. } => Self::Solo,
             TravelParty::WholeFamily { .. } => Self::Family,
@@ -408,13 +428,32 @@ impl ArrivalFamily {
     }
 
     /// The arrival family of a trip written before envelope version 3,
-    /// which did not record it: [`Self::Solo`] for a date or for a lone
-    /// traveler from a household of more than one, [`Self::Family`] when
-    /// every member of the household traveled, and [`Self::Group`]
-    /// otherwise. A household of one that traveled alone could have been
-    /// either a single traveler or a whole family; it is taken as the
+    /// which did not record it. The destination decides where the travel
+    /// plan allowed one party only: Downtown and Studio Town take a single
+    /// traveler or a date ([`Self::Solo`]), Vacation Island and Old Town a
+    /// whole family ([`Self::Family`]), and Magic Town's residential lots
+    /// have no native arrival ([`Self::Group`]). On Magic Town's community
+    /// lots it is worked out from who traveled: [`Self::Solo`] for a date or
+    /// a lone traveler from a household of more than one, [`Self::Family`]
+    /// when every member of the household traveled, and [`Self::Group`]
+    /// otherwise. There a household of one that traveled alone could have
+    /// been either a single traveler or a whole family; it is taken as the
     /// family, and the two differ only in whether global 9 names it.
-    fn derived(is_date: bool, travelers: &[u32], household: &[u32]) -> Self {
+    fn derived(
+        destination: TravelDestination,
+        house: u32,
+        is_date: bool,
+        travelers: &[u32],
+        household: &[u32],
+    ) -> Self {
+        if !has_native_arrival(destination, house) {
+            return Self::Group;
+        }
+        match destination {
+            TravelDestination::Downtown | TravelDestination::StudioTown => return Self::Solo,
+            TravelDestination::VacationIsland | TravelDestination::OldTown => return Self::Family,
+            TravelDestination::MagicTown => {}
+        }
         let traveled = |guid: &u32| travelers.contains(guid);
         if is_date || (travelers.len() == 1 && household.len() > 1) {
             Self::Solo
@@ -1447,7 +1486,13 @@ impl PersistedTravelRecord {
     fn arrival_family(&self, household: &[u32]) -> ArrivalFamily {
         self.arrival.unwrap_or_else(|| {
             let travelers: Vec<u32> = self.session.travelers.iter().map(|t| t.guid).collect();
-            ArrivalFamily::derived(self.is_date, &travelers, household)
+            ArrivalFamily::derived(
+                self.session.destination,
+                self.session.destination_house,
+                self.is_date,
+                &travelers,
+                household,
+            )
         })
     }
 }
@@ -1924,7 +1969,7 @@ pub fn depart_to_destination(
         home_family,
     );
     let is_date = matches!(request.party, TravelParty::Date { .. });
-    let arrival = ArrivalFamily::of(&request.party);
+    let arrival = ArrivalFamily::of(&request.party, plan.destination, request.destination_house);
 
     // Boot destination lot in memory BEFORE committing REDB, so any destination
     // boot/injection failure rolls back cleanly with zero REDB/home mutations.
@@ -7041,20 +7086,62 @@ mod tests {
         );
     }
 
+    /// Magic Town's residential lots get no native arrival, so a trip there
+    /// keeps the portal placement.
+    #[test]
+    fn a_departure_asks_for_its_destinations_arrival() {
+        let single = TravelParty::Single { sim_guid: 1 };
+        let family = TravelParty::WholeFamily { leader_guid: 1 };
+        let of = ArrivalFamily::of;
+        assert_eq!(
+            of(&single, TravelDestination::Downtown, 21),
+            ArrivalFamily::Solo
+        );
+        assert_eq!(
+            of(&single, TravelDestination::MagicTown, 93),
+            ArrivalFamily::Solo
+        );
+        assert_eq!(
+            of(&family, TravelDestination::MagicTown, 93),
+            ArrivalFamily::Family
+        );
+        assert_eq!(
+            of(&single, TravelDestination::MagicTown, 90),
+            ArrivalFamily::Group
+        );
+        assert_eq!(
+            of(&family, TravelDestination::MagicTown, 92),
+            ArrivalFamily::Group
+        );
+    }
+
     /// A trip written before envelope version 3 recorded no arrival
     /// family; it is worked out from who traveled.
     #[test]
     fn a_trip_from_before_version_3_derives_its_arrival_family() {
         use ArrivalFamily::{Family, Group, Solo};
+        use TravelDestination::{Downtown, MagicTown, OldTown, StudioTown, VacationIsland};
         let household = [1, 2, 3];
-        assert_eq!(ArrivalFamily::derived(true, &[1, 9], &household), Solo);
-        assert_eq!(ArrivalFamily::derived(false, &[2], &household), Solo);
+        let derived = ArrivalFamily::derived;
+        // Magic Town's community lots: from who traveled.
+        assert_eq!(derived(MagicTown, 93, true, &[1, 9], &household), Solo);
+        assert_eq!(derived(MagicTown, 93, false, &[2], &household), Solo);
         assert_eq!(
-            ArrivalFamily::derived(false, &[3, 1, 2], &household),
+            derived(MagicTown, 93, false, &[3, 1, 2], &household),
             Family
         );
-        assert_eq!(ArrivalFamily::derived(false, &[1, 2], &household), Group);
-        assert_eq!(ArrivalFamily::derived(false, &[1], &[1]), Family);
+        assert_eq!(derived(MagicTown, 93, false, &[1, 2], &household), Group);
+        assert_eq!(derived(MagicTown, 93, false, &[1], &[1]), Family);
+        // Magic Town's residential lots have no native arrival.
+        assert_eq!(derived(MagicTown, 90, false, &[2], &household), Group);
+        // The destination decides where the plan allows one party.
+        assert_eq!(derived(Downtown, 21, false, &[1], &[1]), Solo);
+        assert_eq!(derived(StudioTown, 81, false, &[1], &[1]), Solo);
+        assert_eq!(
+            derived(VacationIsland, 40, false, &[1, 2], &household),
+            Family
+        );
+        assert_eq!(derived(OldTown, 58, false, &[1], &household), Family);
     }
 
     /// The departure records the arrival family after the payload
@@ -7113,13 +7200,14 @@ mod tests {
                 resumed.session.home_family, goth_family,
                 "{label}: home family"
             );
+            resumed
         };
         let snapshot = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
         let envelope = snapshot.saved_lot.clone().unwrap();
         assert_eq!(envelope[4..8], TRAVEL_ENVELOPE_VERSION.to_le_bytes());
         let record = decode_travel_envelope(&envelope).unwrap();
         assert_eq!(record.arrival, Some(ArrivalFamily::Solo));
-        check("version 3");
+        drop(check("version 3"));
 
         let mut older = envelope;
         older[4..8].copy_from_slice(&2u32.to_le_bytes());
@@ -7136,6 +7224,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decode_travel_envelope(&older).unwrap().arrival, None);
-        check("version 2");
+        let mut resumed = check("version 2");
+        // The return checks the destination's family against the same
+        // derived arrival, and the funds come home.
+        let returned = return_from_destination(
+            &root,
+            &store,
+            &resumed.session,
+            &mut resumed.destination_lot,
+            &[3],
+            Frames::default(),
+        )
+        .unwrap();
+        assert_eq!(returned.home_lot.world.globals[9], goth_family as i16);
+        assert_eq!(returned.home_lot.world.budget.funds, goth_budget - fare);
     }
 }

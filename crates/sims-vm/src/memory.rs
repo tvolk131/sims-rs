@@ -287,19 +287,30 @@ impl Machine<'_, '_> {
             }
             1 => {
                 let selected = self.world.globals.get(9).copied().unwrap_or(0);
-                if selected == 0 {
-                    return Err(Trap::Unsupported(
-                        "scope 24 field 1 (0x425be2) with global 9 at 0: the selected family \
-                         (game +0x10) may be none or family 0, which is not kept"
-                            .into(),
-                    ));
-                }
-                let family = families
-                    .iter()
-                    .find(|f| f.id == i32::from(selected))
-                    .ok_or_else(|| {
-                        Trap::Invalid(format!("global 9 names family {selected}, which is gone"))
-                    })?;
+                // With global 9 at 0 the game holds the family numbered 0
+                // (0x428041 at 0x42827c..0x42830d), which a solo traveler
+                // leads (0x4f1c87..0x4f1cec).
+                let members = if selected == 0 {
+                    crate::person_factory::family_zero_members(self.active_family, self.world)
+                        .ok_or_else(|| {
+                            Trap::Unsupported(
+                                "scope 24 field 1 (0x425be2) with global 9 at 0 and no family \
+                                 0 kept: the selected family (game +0x10) is not known"
+                                    .into(),
+                            )
+                        })?
+                } else {
+                    families
+                        .iter()
+                        .find(|f| f.id == i32::from(selected))
+                        .ok_or_else(|| {
+                            Trap::Invalid(format!(
+                                "global 9 names family {selected}, which is gone"
+                            ))
+                        })?
+                        .members
+                        .clone()
+                };
                 if crate::interpreter::object_definition(self.catalog, self.world, record.guid)
                     .is_none()
                 {
@@ -309,7 +320,7 @@ impl Machine<'_, '_> {
                         record.guid
                     )));
                 }
-                i16::from(family.members.contains(&record.guid))
+                i16::from(members.contains(&record.guid))
             }
             2 => record.data[58],
             3 | 4 => 0,

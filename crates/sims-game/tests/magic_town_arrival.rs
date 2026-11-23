@@ -158,6 +158,15 @@ fn the_middle_ped_marker_places_an_arriving_family_once() {
         .map(|o| o.id)
         .expect("lot 93 has a middle ped marker");
 
+    let arrived_on_lot: Vec<u16> = travelers
+        .iter()
+        .copied()
+        .filter(|id| game.lot().world().objects[id].position[0] >= 0)
+        .collect();
+    assert!(
+        arrived_on_lot.is_empty(),
+        "travelers {arrived_on_lot:?} arrived on the lot, not off it"
+    );
     let mut last: BTreeMap<u16, [i32; 3]> = travelers
         .iter()
         .map(|&id| (id, game.lot().world().objects[&id].position))

@@ -120,6 +120,7 @@ fn arrive(
     assert_eq!(person_word(game, traveler, PETS_OUTSIDE), 0);
 
     let mut last = game.lot().world().objects[&traveler].position;
+    assert!(last[0] < 0, "the traveler arrived on the lot at {last:?}");
     let mut jumps = Vec::new();
     for _ in 0..ARRIVAL {
         // An unanswered dialog would stop the ticks without stopping the lot.
@@ -245,12 +246,13 @@ fn a_solo_traveler_who_is_not_the_first_member_leads_the_visit() {
                 .find(|f| f.id == family)
                 .expect("the Goth household")
                 .members;
-            members.iter().skip(1).copied().find(|&guid| {
+            let second = members.iter().skip(1).copied().find(|&guid| {
                 world
                     .neighbors
                     .first_of(guid)
                     .is_some_and(|n| n.data[AGE] >= 18)
-            })
+            });
+            Some(second.expect("an adult Goth who is not member 0"))
         },
         |_, leader| TravelRequest::downtown(DOWNTOWN_LOT, leader),
     ) else {

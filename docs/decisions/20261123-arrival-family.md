@@ -34,12 +34,23 @@ Both came from the port's arrival, not from the marker:
   Funds are 0 when that number is 0 (0x428328).
 - With any of the three flags set, edit mode is skipped
   (0x4f1b7c..0x4f1b9d jump to 0x4f1c32).
-- **Solo** (+0x140 or +0x142, 0x4f1c87..0x4f1cec):
+- 0x4f1ae9 then dispatches on the house:
+  - **Downtown 21–30** (0x4f1c32): +0x140 runs the solo path at 0x4f1c87.
+    Without it, 0x4f1f48 sets budget mode and zeroes the funds.
+  - **Studio Town 81–89** (0x4f1dbd): +0x142 runs the solo path at
+    0x4f1e12. Without it, 0x4f1f48 again; +0x141 is not read here.
+  - **Vacation 40–49, zoning 2, Magic Town 93–99** (0x4f1f82..0x4f1fac):
+    +0x140 runs the solo path at 0x4f2060, +0x141 the family path at
+    0x4f21bd. With neither, the lot is edited.
+  - **Any other house**, Magic Town's residential 90–92 among them, falls
+    through to 0x4f23e3: no arrival is made.
+- **Solo** (each of the three solo paths does the same; Downtown's is
+  0x4f1c87..0x4f1cec):
   - family 0's members are erased and the traveler added (0x410a41 →
     0x4d3fe6, 0x410849), so the traveler is member 0;
   - the traveler is made by 0x4e9719 (off the lot);
   - the funds become the traveler's own family's +0x118
-    (0x4f1cc0..0x4f1ce7);
+    (0x4f1cc0..0x4f1ce7 on Downtown);
   - global 9 stays 0.
 - **Family** (+0x141, 0x4f21bd..):
   - the game holds the home family and global 9 becomes its number
@@ -51,7 +62,9 @@ Both came from the port's arrival, not from the marker:
 - **A trip records its arrival family** (`ArrivalFamily`):
   - Single and Date → `Solo`;
   - WholeFamily → `Family`;
-  - HouseholdGroup → `Group`, which no native mode makes.
+  - HouseholdGroup → `Group`, which no native mode makes;
+  - any party to Magic Town's residential 90–92 → `Group`, since
+    0x4f1ae9 makes no arrival there.
 - **Solo:** the destination loads with family number 0, then family 0 is
   made the traveler alone and given the home family's funds less the fare.
   Global 9 stays 0.
@@ -59,11 +72,12 @@ Both came from the port's arrival, not from the marker:
   travelers are made in the family's member order.
 - **Solo and Family travelers stay off the lot.** The middle ped marker
   places them, so the marker's placement is the only jump.
-- **HouseholdGroup keeps its old behaviour.** The game holds the home
-  family, global 9 names it, and the travelers are put beside the arrival
-  portal. The marker then does what it did before. Keeping the old path
-  was chosen over mapping it to Family, which would make members who did
-  not travel.
+- **`Group` keeps the old behaviour.** The game holds the home family,
+  global 9 names it, and the travelers are put beside the arrival portal.
+  For HouseholdGroup, keeping the old path was chosen over mapping it to
+  Family, which would make members who did not travel. For Magic Town's
+  residential lots, no native arrival exists, and without the portal
+  placement nobody would ever be placed.
 - **Find Location mode 0 refreshes a person after the put** (the object's
   virtual 0x74 at 0x44b66e, which for a person is 0x45e519). This clears
   the walk position.
@@ -74,7 +88,9 @@ Both came from the port's arrival, not from the marker:
     reselect scan (0x445501);
   - co-op's interpreters, which pass no fixed family when the World keeps
     family 0;
-  - the HUD's roster (0x4e97dc).
+  - the HUD's roster (0x4e97dc);
+  - scope 24 field 1, whether the selected family has a record's type
+    (0x425be2).
 - **Funds round-trip unchanged:** the destination's funds become the home
   family's budget on return. A purchase made on a solo visit is charged to
   those funds and comes home.
@@ -82,10 +98,13 @@ Both came from the port's arrival, not from the marker:
   is played, not edited, and the shop opens.
 - **The travel envelope goes to version 3.** The arrival family follows
   the payload. Older builds refuse a version 3 trip. Versions 1 and 2 still
-  load:
-  - a date, or one traveler from a household of more than one, is `Solo`;
-  - every household member traveling is `Family`;
-  - anything else is `Group`.
+  load, and their arrival family is derived:
+  - where the travel plan allowed one party, from the destination:
+    Downtown and Studio Town are `Solo`, Vacation Island and Old Town
+    `Family`, Magic Town's residential lots `Group`;
+  - on Magic Town's community lots, from who traveled: a date, or one
+    traveler from a household of more than one, is `Solo`; every household
+    member traveling is `Family`; anything else is `Group`.
 - Saving while away is still refused, and co-op is still refused on a
   travel lot, so no other persisted shape changes.
 

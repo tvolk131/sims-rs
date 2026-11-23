@@ -410,7 +410,8 @@ fn scope_24_field_1_is_whether_the_selected_family_has_the_records_type() {
     assert_eq!(field(&mut fx, 1), 1);
     fx.world.globals[9] = 6;
     assert_eq!(field(&mut fx, 1), 0);
-    // Global 9 at 0 may stand for no family or for family 0.
+    // Global 9 at 0 names the family numbered 0 (0x428041), which a solo
+    // traveler leads; with no family 0 kept, the family is not known.
     fx.world.globals[9] = 0;
     let fault = fx
         .expression(scope::TEMPS, 0, op::ASSIGN, 24, 1)
@@ -419,6 +420,11 @@ fn scope_24_field_1_is_whether_the_selected_family_has_the_records_type() {
         panic!("{fault}");
     };
     assert!(text.contains("global 9 at 0"), "{text}");
+    fx.world.families.push(family(0, 0, &[SIM_GUID]));
+    assert_eq!(field(&mut fx, 1), 1);
+    fx.world.families.last_mut().unwrap().members = vec![LAMP_GUID];
+    assert_eq!(field(&mut fx, 1), 0);
+    fx.world.families.pop();
     // Global 9 naming no family.
     fx.world.globals[9] = 7;
     assert!(matches!(
