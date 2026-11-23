@@ -281,6 +281,25 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                     param_assigns.insert(pa.name.clone(), (pa.span, pa.value));
                 }
                 ObjectMember::State(s) => {
+                    if matches!(
+                        s.name.as_str(),
+                        "id" | "room"
+                            | "graphic"
+                            | "prep_score"
+                            | "cook_score"
+                            | "in_use"
+                            | "attr"
+                            | "data"
+                            | "parts"
+                    ) {
+                        return Err(Error::at(
+                            s.span,
+                            format!(
+                                "state name '{}' conflicts with built-in object property 'self.{}'",
+                                s.name, s.name
+                            ),
+                        ));
+                    }
                     if raw_states.contains_key(&s.name) {
                         return Err(Error::at(
                             s.span,
@@ -1317,6 +1336,9 @@ struct ScopeFrame {
     /// `true` when this frame corresponds to an emitted `.air` `while` loop
     /// (`repeat`, `while`, `for`, or wrapped inline helper `while 1 == 1`).
     is_air_while: bool,
+    /// Active `defer` token when this scope was entered (used to distinguish loop breaks inside
+    /// a defer-local loop from breaks attempting to escape out of a `defer` block).
+    owner_defer_id: Option<usize>,
     cancel_flag: Option<String>,
     repeat_counter: Option<String>,
 }
@@ -1328,6 +1350,7 @@ impl ScopeFrame {
             is_loop_body: false,
             is_fn_root: false,
             is_air_while: false,
+            owner_defer_id: None,
             cancel_flag: None,
             repeat_counter: None,
         }
@@ -1345,6 +1368,9 @@ struct ActiveInlineFn {
     ret_flag: String,
     ret_val: String,
     ret_kind: FnReturnKind,
+    /// Active `defer` token when this helper was entered (returns matching `current_defer_id`
+    /// exit only this helper frame, whereas mismatched returns would escape an enclosing `defer`).
+    owner_defer_id: Option<usize>,
 }
 
 struct TreeLowerer<'a> {
@@ -1363,7 +1389,8 @@ struct TreeLowerer<'a> {
     /// Locks currently held at this point in lowering (including during `defer` execution
     /// until the lock's own `Unlock` cleanup executes).
     held_locks: Vec<LValue>,
-    in_defer: bool,
+    defer_generation: usize,
+    current_defer_id: Option<usize>,
     inline_call_stack: Vec<String>,
     inline_expansions: usize,
     active_inline_fn: Option<ActiveInlineFn>,
@@ -1376,6 +1403,10 @@ impl<'a> TreeLowerer<'a> {
         owner_module: &str,
         has_self_obj_local: bool,
     ) -> Self {
+        let mut root_vars = BTreeMap::new();
+        if let TreeContext::SimOnObject { ref sim_name } = tree_ctx {
+            root_vars.insert(sim_name.clone(), Binding::SimHandle);
+        }
         Self {
             env,
             tree_ctx,
@@ -1385,14 +1416,19 @@ impl<'a> TreeLowerer<'a> {
             out: String::new(),
             indent: 1,
             next_id: 0,
-            var_scopes: vec![BTreeMap::new()],
+            var_scopes: vec![root_vars],
             cleanup_scopes: vec![ScopeFrame::block()],
             held_locks: Vec::new(),
-            in_defer: false,
+            defer_generation: 0,
+            current_defer_id: None,
             inline_call_stack: Vec::new(),
             inline_expansions: 0,
             active_inline_fn: None,
         }
+    }
+
+    fn in_defer(&self) -> bool {
+        self.current_defer_id.is_some()
     }
 
     fn finish(self) -> String {
@@ -1465,10 +1501,7 @@ impl<'a> TreeLowerer<'a> {
     }
 
     fn is_sim_ident(&self, name: &str) -> bool {
-        if matches!(self.lookup_var(name), Some(Binding::SimHandle)) {
-            return true;
-        }
-        matches!(&self.tree_ctx, TreeContext::SimOnObject { sim_name } if sim_name == name)
+        matches!(self.lookup_var(name), Some(Binding::SimHandle))
     }
 
     fn is_self_ident(&self, name: &str) -> bool {
@@ -1569,13 +1602,29 @@ impl<'a> TreeLowerer<'a> {
             .ok_or_else(|| {
                 Error::at(
                     span,
-                    if is_continue {
+                    if self.in_defer() {
+                        if is_continue {
+                            "'continue' cannot exit out of a 'defer' block"
+                        } else {
+                            "'break' cannot exit out of a 'defer' block"
+                        }
+                    } else if is_continue {
                         "'continue' outside of a loop"
                     } else {
                         "'break' outside of a loop"
                     },
                 )
             })?;
+        if self.cleanup_scopes[loop_idx].owner_defer_id != self.current_defer_id {
+            return Err(Error::at(
+                span,
+                if is_continue {
+                    "'continue' cannot exit out of a 'defer' block"
+                } else {
+                    "'break' cannot exit out of a 'defer' block"
+                },
+            ));
+        }
         self.emit_cleanups_down_to(loop_idx)?;
         if is_continue && let Some(counter) = self.cleanup_scopes[loop_idx].repeat_counter.clone() {
             self.line(format!("{counter} += 1;"));
@@ -1584,7 +1633,7 @@ impl<'a> TreeLowerer<'a> {
     }
 
     fn emit_cancel_propagation(&mut self) -> Result<()> {
-        if self.in_defer {
+        if self.in_defer() {
             return Ok(());
         }
         let Some((_, flag)) = self.enclosing_cancel_flag() else {
@@ -1618,10 +1667,10 @@ impl<'a> TreeLowerer<'a> {
                     body,
                     saved_bindings,
                 } => {
-                    let prev_in_defer = self.in_defer;
+                    self.defer_generation += 1;
+                    let prev_defer_id = self.current_defer_id.replace(self.defer_generation);
                     let prev_in_obj = self.in_object_scope;
                     let prev_vars = std::mem::replace(&mut self.var_scopes, saved_bindings.clone());
-                    self.in_defer = true;
                     self.in_object_scope = *in_object_scope;
                     let res = self.with_owner_module(owner_module, |c| {
                         c.push_scope(ScopeFrame::block());
@@ -1629,7 +1678,7 @@ impl<'a> TreeLowerer<'a> {
                         let p = c.pop_scope_and_run_cleanups();
                         r.and(p)
                     });
-                    self.in_defer = prev_in_defer;
+                    self.current_defer_id = prev_defer_id;
                     self.in_object_scope = prev_in_obj;
                     self.var_scopes = prev_vars;
                     res?;
@@ -1762,6 +1811,7 @@ impl<'a> TreeLowerer<'a> {
                     is_loop_body: false,
                     is_fn_root: false,
                     is_air_while: false,
+                    owner_defer_id: self.current_defer_id,
                     cancel_flag: None,
                     repeat_counter: None,
                 });
@@ -1775,7 +1825,7 @@ impl<'a> TreeLowerer<'a> {
                 res.and(pop_res)
             }
             V2Stmt::Defer { span, body } => {
-                if self.in_defer {
+                if self.in_defer() {
                     return Err(Error::at(
                         *span,
                         "nested 'defer' inside another 'defer' block is not allowed",
@@ -1806,7 +1856,7 @@ impl<'a> TreeLowerer<'a> {
                         "'cancel_on_abort' requires a Sim interaction context (not available in init/main)",
                     ));
                 }
-                if *cancel_on_abort && self.in_defer {
+                if *cancel_on_abort && self.in_defer() {
                     return Err(Error::at(
                         *span,
                         "'cancel_on_abort' is not allowed inside a 'defer' block",
@@ -1829,6 +1879,7 @@ impl<'a> TreeLowerer<'a> {
                     is_loop_body: true,
                     is_fn_root: false,
                     is_air_while: true,
+                    owner_defer_id: self.current_defer_id,
                     cancel_flag: cancel_flag.clone(),
                     repeat_counter: Some(counter.clone()),
                 });
@@ -1871,7 +1922,7 @@ impl<'a> TreeLowerer<'a> {
                         "'cancel_on_abort' requires a Sim interaction context (not available in init/main)",
                     ));
                 }
-                if *cancel_on_abort && self.in_defer {
+                if *cancel_on_abort && self.in_defer() {
                     return Err(Error::at(
                         *span,
                         "'cancel_on_abort' is not allowed inside a 'defer' block",
@@ -1894,6 +1945,7 @@ impl<'a> TreeLowerer<'a> {
                         is_loop_body: true,
                         is_fn_root: false,
                         is_air_while: true,
+                        owner_defer_id: self.current_defer_id,
                         cancel_flag: cancel_flag.clone(),
                         repeat_counter: None,
                     });
@@ -1918,6 +1970,7 @@ impl<'a> TreeLowerer<'a> {
                         is_loop_body: true,
                         is_fn_root: false,
                         is_air_while: true,
+                        owner_defer_id: self.current_defer_id,
                         cancel_flag: cancel_flag.clone(),
                         repeat_counter: None,
                     });
@@ -2006,6 +2059,7 @@ impl<'a> TreeLowerer<'a> {
                     is_loop_body: true,
                     is_fn_root: false,
                     is_air_while: true,
+                    owner_defer_id: self.current_defer_id,
                     cancel_flag: None,
                     repeat_counter: None,
                 });
@@ -2073,35 +2127,23 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
             V2Stmt::Break { span } => {
-                if self.in_defer {
-                    return Err(Error::at(
-                        *span,
-                        "'break' cannot exit out of a 'defer' block",
-                    ));
-                }
                 self.emit_loop_cleanups(*span, false)?;
                 self.line("break;".to_owned());
                 Ok(())
             }
             V2Stmt::Continue { span } => {
-                if self.in_defer {
-                    return Err(Error::at(
-                        *span,
-                        "'continue' cannot exit out of a 'defer' block",
-                    ));
-                }
                 self.emit_loop_cleanups(*span, true)?;
                 self.line("continue;".to_owned());
                 Ok(())
             }
             V2Stmt::Return { span, value } => {
-                if self.in_defer {
-                    return Err(Error::at(
-                        *span,
-                        "'return' cannot exit out of a 'defer' block",
-                    ));
-                }
                 if let Some(active_fn) = self.active_inline_fn.as_ref() {
+                    if active_fn.owner_defer_id != self.current_defer_id {
+                        return Err(Error::at(
+                            *span,
+                            "'return' cannot exit out of a 'defer' block",
+                        ));
+                    }
                     let ret_flag = active_fn.ret_flag.clone();
                     let ret_val = active_fn.ret_val.clone();
                     let ret_kind = active_fn.ret_kind;
@@ -2144,6 +2186,12 @@ impl<'a> TreeLowerer<'a> {
                     self.line(format!("{ret_flag} := 1;"));
                     self.line("break;".to_owned());
                     return Ok(());
+                }
+                if self.in_defer() {
+                    return Err(Error::at(
+                        *span,
+                        "'return' cannot exit out of a 'defer' block",
+                    ));
                 }
 
                 match value {
@@ -2188,7 +2236,7 @@ impl<'a> TreeLowerer<'a> {
             }
             V2Stmt::Expr { span: _, expr } => self.lower_expr_stmt(expr),
             V2Stmt::RawAir { span, code } => {
-                if self.in_defer {
+                if self.in_defer() {
                     return Err(Error::at(
                         *span,
                         "'raw { ... }' is not allowed inside a 'defer' block",
@@ -2431,7 +2479,7 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         let (ticks_air, _) = self.lower_value_expr(&args[0].value)?;
-        let cancel = if self.in_defer {
+        let cancel = if self.in_defer() {
             None
         } else {
             self.enclosing_cancel_flag()
@@ -2840,7 +2888,8 @@ impl<'a> TreeLowerer<'a> {
             }
         }
 
-        // Evaluate caller-supplied arguments in call-site order before switching to callee's scope.
+        // Evaluate caller-supplied arguments in call-site order BEFORE registering `fqn` on
+        // `inline_call_stack` (so finite explicit nesting like `f(f(1))` succeeds).
         let mut bound_params: BTreeMap<String, Binding> = BTreeMap::new();
         for (param_idx, arg) in call_order {
             let param = &fn_decl.params[param_idx];
@@ -2848,8 +2897,12 @@ impl<'a> TreeLowerer<'a> {
             bound_params.insert(param.name.clone(), binding);
         }
 
+        // Register `fqn` on `inline_call_stack` BEFORE evaluating omitted default expressions
+        // so recursive default parameters (e.g. `fn f(x: i16 = f())`) trigger cycle/depth detection.
+        self.inline_call_stack.push(fqn);
+
         // Evaluate omitted defaulted parameters hygienically in the callee's module/object scope
-        // (never capturing caller local variables).
+        // (never capturing caller local variables or caller `run(actor)` Sim bindings).
         if supplied.iter().any(|&s| !s) {
             let prev_vars = std::mem::replace(&mut self.var_scopes, vec![BTreeMap::new()]);
             let prev_in_obj = self.in_object_scope;
@@ -2869,7 +2922,10 @@ impl<'a> TreeLowerer<'a> {
             });
             self.in_object_scope = prev_in_obj;
             self.var_scopes = prev_vars;
-            default_res?;
+            if let Err(e) = default_res {
+                self.inline_call_stack.pop();
+                return Err(e);
+            }
         }
 
         let ret_kind = match &fn_decl.return_type {
@@ -2877,6 +2933,7 @@ impl<'a> TreeLowerer<'a> {
             Some(V2Type::Bool) => FnReturnKind::Bool,
             Some(V2Type::I16) => FnReturnKind::I16,
             Some(other) => {
+                self.inline_call_stack.pop();
                 return Err(Error::at(
                     fn_decl.span,
                     format!(
@@ -2888,6 +2945,7 @@ impl<'a> TreeLowerer<'a> {
             }
         };
         if ret_kind != FnReturnKind::Void && !stmts_always_return(&fn_decl.body) {
+            self.inline_call_stack.pop();
             return Err(Error::at(
                 fn_decl.span,
                 format!(
@@ -2903,7 +2961,7 @@ impl<'a> TreeLowerer<'a> {
         }
 
         let has_returns = stmts_have_return(&fn_decl.body);
-        let has_enclosing_cancel = !self.in_defer && self.enclosing_cancel_flag().is_some();
+        let has_enclosing_cancel = !self.in_defer() && self.enclosing_cancel_flag().is_some();
         let needs_wrapper = has_returns || has_enclosing_cancel;
         let ret_val_local = if ret_kind != FnReturnKind::Void {
             let rv = self.fresh(&format!("ret_{}", fn_decl.name));
@@ -2913,7 +2971,6 @@ impl<'a> TreeLowerer<'a> {
             None
         };
 
-        self.inline_call_stack.push(fqn);
         let prev_vars = std::mem::replace(&mut self.var_scopes, vec![bound_params]);
         let prev_active_fn = self.active_inline_fn.take();
         let prev_in_obj = self.in_object_scope;
@@ -2931,6 +2988,7 @@ impl<'a> TreeLowerer<'a> {
                         ret_flag,
                         ret_val: rv_name,
                         ret_kind,
+                        owner_defer_id: c.current_defer_id,
                     });
                 }
                 c.line("while 1 == 1 {".to_owned());
@@ -2940,6 +2998,7 @@ impl<'a> TreeLowerer<'a> {
                     is_loop_body: false,
                     is_fn_root: true,
                     is_air_while: true,
+                    owner_defer_id: c.current_defer_id,
                     cancel_flag: None,
                     repeat_counter: None,
                 });
@@ -2955,6 +3014,7 @@ impl<'a> TreeLowerer<'a> {
                     is_loop_body: false,
                     is_fn_root: true,
                     is_air_while: false,
+                    owner_defer_id: c.current_defer_id,
                     cancel_flag: None,
                     repeat_counter: None,
                 });
@@ -3457,7 +3517,18 @@ impl<'a> TreeLowerer<'a> {
                             })?;
                         return Ok((n.to_string(), ValueType::I16));
                     }
-                    let (v_air, _) = self.lower_value_expr(inner)?;
+                    let (v_air, v_ty) = self.lower_value_expr(inner)?;
+                    if v_ty != ValueType::I16 {
+                        let actual = match v_ty {
+                            ValueType::Bool => "bool",
+                            ValueType::ObjectId => "ObjectId",
+                            ValueType::I16 => "i16",
+                        };
+                        return Err(Error::at(
+                            *span,
+                            format!("cannot apply unary '-' to '{actual}' expression"),
+                        ));
+                    }
                     let tmp = self.fresh("neg");
                     self.line(format!("let {tmp} = 0;"));
                     self.line(format!("{tmp} -= {v_air};"));
@@ -3492,10 +3563,36 @@ impl<'a> TreeLowerer<'a> {
                 | V2BinOp::BitAnd
                 | V2BinOp::BitOr
                 | V2BinOp::BitXor => {
-                    let (l_air, _) = self.lower_value_expr(lhs)?;
+                    let (l_air, l_ty) = self.lower_value_expr(lhs)?;
+                    if l_ty != ValueType::I16 {
+                        let actual = match l_ty {
+                            ValueType::Bool => "bool",
+                            ValueType::ObjectId => "ObjectId",
+                            ValueType::I16 => "i16",
+                        };
+                        return Err(Error::at(
+                            lhs.span(),
+                            format!(
+                                "arithmetic/bitwise operator cannot be applied to '{actual}' operand"
+                            ),
+                        ));
+                    }
                     let tmp = self.fresh("arith");
                     self.line(format!("let {tmp} = {l_air};"));
-                    let (r_air, _) = self.lower_value_expr(rhs)?;
+                    let (r_air, r_ty) = self.lower_value_expr(rhs)?;
+                    if r_ty != ValueType::I16 {
+                        let actual = match r_ty {
+                            ValueType::Bool => "bool",
+                            ValueType::ObjectId => "ObjectId",
+                            ValueType::I16 => "i16",
+                        };
+                        return Err(Error::at(
+                            rhs.span(),
+                            format!(
+                                "arithmetic/bitwise operator cannot be applied to '{actual}' operand"
+                            ),
+                        ));
+                    }
                     let aop = match op {
                         V2BinOp::Add => "+=",
                         V2BinOp::Sub => "-=",
@@ -4216,6 +4313,15 @@ impl<'a> TreeLowerer<'a> {
                         )),
                     };
                 }
+                if self.env.i16_params.contains_key(name) || self.env.bool_params.contains_key(name)
+                {
+                    return Err(Error::at(
+                        *span,
+                        format!(
+                            "parameter '{name}' is not a Motive (use 'Motive::...' to refer to a motive explicitly)"
+                        ),
+                    ));
+                }
                 motive_by_name(name)
                     .ok_or_else(|| Error::at(*span, format!("unknown motive '{name}'")))
             }
@@ -4246,6 +4352,15 @@ impl<'a> TreeLowerer<'a> {
                             format!("variable '{name}' is not a Skill"),
                         )),
                     };
+                }
+                if self.env.i16_params.contains_key(name) || self.env.bool_params.contains_key(name)
+                {
+                    return Err(Error::at(
+                        *span,
+                        format!(
+                            "parameter '{name}' is not a Skill (use 'Skill::...' to refer to a skill explicitly)"
+                        ),
+                    ));
                 }
                 skill_by_name(name)
                     .ok_or_else(|| Error::at(*span, format!("unknown skill '{name}'")))

@@ -1,7 +1,26 @@
 // Shared clean-room behavioral helpers for `open-pack/`.
 
-/// Cancel-safe single-motive restoration loop with early saturation break.
-/// Returns the number of completed cycles.
+/// Cancel-safe single-motive restoration loop with per-cycle counter updates.
+pub fn restore_motive_tracked(
+    sim: Sim,
+    motive: Motive,
+    cycles: i16,
+    step: i16,
+    completed: &mut i16,
+    ticks: i16 = 2,
+    cap: i16 = 100,
+) {
+    repeat cycles cancel_on_abort {
+        sleep(ticks);
+        sim.motive[motive] += step;
+        *completed += 1;
+        if sim.motive[motive] >= cap {
+            break;
+        }
+    }
+}
+
+/// Cancel-safe single-motive restoration loop returning the number of completed cycles.
 pub fn restore_motive_loop(
     sim: Sim,
     motive: Motive,
@@ -11,19 +30,42 @@ pub fn restore_motive_loop(
     cap: i16 = 100,
 ) -> i16 {
     let mut completed: i16 = 0;
-    repeat cycles cancel_on_abort {
-        sleep(ticks);
-        sim.motive[motive] += step;
-        completed += 1;
-        if sim.motive[motive] >= cap {
-            break;
-        }
-    }
+    restore_motive_tracked(
+        sim,
+        motive,
+        cycles: cycles,
+        step: step,
+        completed: &mut completed,
+        ticks: ticks,
+        cap: cap,
+    );
     return completed;
 }
 
-/// Cancel-safe dual-motive restoration loop with early saturation break on the primary motive.
-/// Returns the number of completed cycles.
+/// Cancel-safe dual-motive restoration loop with per-cycle counter updates.
+pub fn restore_two_motives_tracked(
+    sim: Sim,
+    primary: Motive,
+    primary_step: i16,
+    secondary: Motive,
+    secondary_step: i16,
+    cycles: i16,
+    completed: &mut i16,
+    ticks: i16 = 2,
+    primary_cap: i16 = 100,
+) {
+    repeat cycles cancel_on_abort {
+        sleep(ticks);
+        sim.motive[primary] += primary_step;
+        sim.motive[secondary] += secondary_step;
+        *completed += 1;
+        if sim.motive[primary] >= primary_cap {
+            break;
+        }
+    }
+}
+
+/// Cancel-safe dual-motive restoration loop returning the number of completed cycles.
 pub fn restore_two_motives_loop(
     sim: Sim,
     primary: Motive,
@@ -35,15 +77,17 @@ pub fn restore_two_motives_loop(
     primary_cap: i16 = 100,
 ) -> i16 {
     let mut completed: i16 = 0;
-    repeat cycles cancel_on_abort {
-        sleep(ticks);
-        sim.motive[primary] += primary_step;
-        sim.motive[secondary] += secondary_step;
-        completed += 1;
-        if sim.motive[primary] >= primary_cap {
-            break;
-        }
-    }
+    restore_two_motives_tracked(
+        sim,
+        primary,
+        primary_step,
+        secondary,
+        secondary_step,
+        cycles: cycles,
+        completed: &mut completed,
+        ticks: ticks,
+        primary_cap: primary_cap,
+    );
     return completed;
 }
 

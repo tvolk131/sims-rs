@@ -4,6 +4,7 @@ object "Open Ceramic Basin" {
     guid: 0x7F00_0003;
     price: 280;
     category: plumbing;
+    attributes: 1;
     description: "A clean-room porcelain fixture that restores Bladder and Hygiene.";
     sprite: Sprite::procedural("basin", primary: #E8ECF0, accent: #D0E0EE, trim: #949EA8);
 

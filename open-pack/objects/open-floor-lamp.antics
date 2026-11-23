@@ -1,8 +1,8 @@
 // Open Floor Lamp (0x7F00_0070) — toggleable warm lighting with off/on graphics and Room boost.
 
-use crate::templates::toggle::ToggleableDevice;
+use crate::templates::toggle::ToggleablePower;
 
-object "Open Floor Lamp" from ToggleableDevice {
+object "Open Floor Lamp" from ToggleablePower {
     guid: 0x7F00_0070;
     price: 110;
     category: lighting;
@@ -26,6 +26,23 @@ object "Open Floor Lamp" from ToggleableDevice {
             sim.motive.room += room_boost;
         } else {
             set_graphic(1);
+        }
+    }
+
+    interaction "Turn On Light" {
+        autonomy: 40,
+        advertises: [room +40],
+        guard(sim) => !self.power,
+        run(sim) {
+            apply_power(sim, true);
+        }
+    }
+
+    interaction "Turn Off Light" {
+        autonomy: 15,
+        guard(sim) => self.power,
+        run(sim) {
+            apply_power(sim, false);
         }
     }
 

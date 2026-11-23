@@ -64,7 +64,7 @@ object "Open Double Bed" from BedBase {
             play_sound(wake);
         }
         play_sound(settle);
-        self.completed_cycles += run_sleep_loop(sim);
+        run_sleep_loop_tracked(sim, &mut self.completed_cycles);
     }
 
     interaction "Sleep (Left Side)" {

@@ -5,6 +5,7 @@ use crate::templates::bed::BedBase;
 object "Open Camp Cot" from BedBase {
     guid: 0x7F00_0002;
     price: 210;
+    attributes: 1;
     description: "A clean-room folding camp cot that restores Energy over multiple ticks.";
     sprite: Sprite::procedural("cot", primary: #587C60, accent: #E4E0D2, trim: #404844);
 

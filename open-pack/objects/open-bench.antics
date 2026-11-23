@@ -5,6 +5,7 @@ use crate::templates::seat::SeatBase;
 object "Open Pine Bench" from SeatBase {
     guid: 0x7F00_0001;
     price: 120;
+    attributes: 1;
     description: "A clean-room pine wood bench that restores Comfort.";
     sprite: Sprite::procedural("bench", primary: #9C6A3E, accent: #CEA26E, trim: #4C3420);
 

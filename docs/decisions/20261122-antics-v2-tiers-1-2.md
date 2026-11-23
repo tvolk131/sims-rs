@@ -39,9 +39,9 @@ We extend the `.antics` v2 frontend (`crates/sims-antics/src/v2/{ast,parser,lowe
   2. Wraps `run(sim)` in `with lock(self.<bool_state>) { ... }`, so normal fallthrough, early `return false;`, and `cancel_on_abort` all release the lock and re-entrant `with lock(self.<bool_state>)` inside `run(sim)` is rejected at compile time.
 
 ### 3. Template `interaction` Inheritance, Hook Overrides, & Minimal Param Overrides
-- `pub template` declarations may define `interaction "..." { ... }` blocks and default `fn` hooks (e.g. `fn on_power_changed(sim: Sim, on: bool) {}` in `ToggleableDevice`).
+- `pub template` declarations may define `interaction "..." { ... }` blocks and default `fn` hooks (e.g. `fn on_power_changed(sim: Sim, on: bool) {}` in `ToggleableDevice` / `ToggleablePower`).
 - Concrete objects inherit template interactions, override inherited `fn` hooks, override inherited interactions by label in-place, and only specify `param` assignments that differ from template defaults.
-- `open-tv` and `open-floor-lamp` both inherit `"Turn On"` and `"Turn Off"` from `ToggleableDevice`; `open-floor-lamp` overrides `fn on_power_changed(sim: Sim, on: bool)` to switch between lit/off graphics and grant its `room_boost`.
+- `open-tv` inherits `"Turn On"` and `"Turn Off"` directly from `ToggleableDevice`; `open-floor-lamp` inherits from `ToggleablePower`, overrides `fn on_power_changed(sim: Sim, on: bool)` to switch between lit/off graphics and grant its `room_boost`, and preserves its exact `"Turn On Light"` (`autonomy: 40`, `room +40`) and `"Turn Off Light"` (`autonomy: 15`) interactions.
 
 ### 4. Value-Returning `fn -> i16` + Named / Default Parameters
 - `fn` / `pub fn` now supports `-> i16` alongside `-> bool` and void `()`.
@@ -54,46 +54,50 @@ We extend the `.antics` v2 frontend (`crates/sims-antics/src/v2/{ast,parser,lowe
 
 ---
 
-## Example Before / After (`open-floor-lamp.antics`)
+## Example Before / After (`open-tv.antics`)
 
 ```antics
-// Before (72 lines) -> After (42 lines)
+// Before (79 lines) -> After (45 lines)
+use crate::common::helpers::{restore_motive_tracked, set_toggle_state};
 use crate::templates::toggle::ToggleableDevice;
 
-object "Open Floor Lamp" from ToggleableDevice {
-    guid: 0x7F00_0070;
-    price: 110;
-    category: lighting;
-    description: "A clean-room standing floor lamp with toggleable warm light that boosts Room mood.";
-    graphics: [
-        Sprite::procedural("floor_lamp", primary: #F2E0AE, accent: #FCF0CE, trim: #745E3E),
-        Sprite::procedural("floor_lamp", primary: #988C74, accent: #B4A890, trim: #604E34),
-    ];
+object "Open Retro Television" from ToggleableDevice {
+    guid: 0x7F00_0052;
+    price: 380;
+    category: electronics;
+    description: "A clean-room cabinet television with on/off power state and a cancel-safe Fun watch loop.";
+    sprite: Sprite::procedural("television", primary: #765438, accent: #364856, trim: #423022);
 
-    initial_power: true;
-    param room_boost: i16 = 35;
-    param enjoy_ticks: i16 = 1;
+    param watch_ticks: i16 = 2;
+    param max_cycles: i16 = 4;
+    param fun_step: i16 = 24;
+    param max_entry_fun: i16 = 95;
 
-    sound switch_click = preset("ui_click", wav: "open_lamp_switch");
-    slot front = routing([0.0, -0.65, 0.0]);
+    state watch_cycles: i16 = 0;
 
-    fn on_power_changed(sim: Sim, on: bool) {
-        if on {
-            set_graphic(0);
-            sim.motive.room += room_boost;
-        } else {
-            set_graphic(1);
-        }
-    }
+    sound switch_click = preset("ui_click", wav: "open_tv_click");
+    sound jingle = preset("chime", wav: "open_tv_jingle");
 
-    interaction "Enjoy Warm Light" {
-        autonomy: 30,
-        advertises: [room +45],
+    slot viewer = routing([0.0, -1.25, 0.0], sitting: true);
+
+    interaction "Watch TV" {
+        autonomy: 60,
+        advertises: [fun +75],
         lock: self.occupied,
-        guard(sim) => self.power,
+        guard(sim) => sim.motive.fun < max_entry_fun,
         run(sim) {
-            sleep(enjoy_ticks);
-            sim.motive.room += room_boost;
+            if !self.power {
+                set_toggle_state(&mut self.power, true, switch_click);
+            }
+            play_sound(jingle);
+            restore_motive_tracked(
+                sim,
+                Motive::Fun,
+                cycles: max_cycles,
+                step: fun_step,
+                completed: &mut self.watch_cycles,
+                ticks: watch_ticks,
+            );
         }
     }
 }
@@ -105,12 +109,12 @@ object "Open Floor Lamp" from ToggleableDevice {
 
 | Component | Legacy v1 (`object.toml` + `.antics`) | v2 Baseline (`#393`) | v2 Tiers 1 + 2 (PR A) | Delta vs Baseline |
 |---|---:|---:|---:|---:|
-| `common/helpers.antics` (1) | — | 94 | 98 | +4 |
-| `templates/*.antics` (4) | — | 113 | 115 | +2 |
-| `objects/*.antics` (20) | 2,648 (40 files) | 1,502 | 1,097 | -405 (-27.0%) |
-| **Total `open-pack/` `.antics` (25 files)** | **2,648** | **1,709** | **1,310** | **-399 (-23.3%)** |
+| `common/helpers.antics` (1) | — | 94 | 142 | +48 |
+| `templates/*.antics` (4) | — | 113 | 150 | +37 |
+| `objects/*.antics` (20) | 2,648 (40 files) | 1,502 | 1,118 | -384 (-25.6%) |
+| **Total `open-pack/` `.antics` (25 files)** | **2,648** | **1,709** | **1,410** | **-299 (-17.5%)** |
 
-(Total cumulative reduction vs legacy v1: **-1,338 lines / -50.5%**.)
+(Total cumulative reduction vs legacy v1: **-1,238 lines / -46.8%**.)
 
 ---
 

@@ -1,7 +1,25 @@
-// Shared toggleable appliance/lighting template with occupancy lock, power state, and shared Turn On/Off.
+// Shared toggleable appliance/lighting templates with occupancy lock, power state, and hookable toggle helpers.
 
 use crate::common::helpers::set_toggle_state;
 
+/// Power-state template with an overridable `on_power_changed` hook for objects with custom pie-menu labels.
+pub template ToggleablePower {
+    param initial_power: bool = false;
+
+    state occupied: bool = false;
+    state power: bool = initial_power;
+
+    sound switch_click = preset("ui_click");
+
+    fn on_power_changed(sim: Sim, on: bool) {}
+
+    fn apply_power(sim: Sim, on: bool) {
+        set_toggle_state(&mut self.power, on, switch_click);
+        on_power_changed(sim, on);
+    }
+}
+
+/// Toggleable device template adding reusable `"Turn On"` / `"Turn Off"` pie-menu interactions.
 pub template ToggleableDevice {
     param initial_power: bool = false;
 
@@ -12,12 +30,16 @@ pub template ToggleableDevice {
 
     fn on_power_changed(sim: Sim, on: bool) {}
 
+    fn apply_power(sim: Sim, on: bool) {
+        set_toggle_state(&mut self.power, on, switch_click);
+        on_power_changed(sim, on);
+    }
+
     interaction "Turn On" {
         autonomy: 30,
         guard(sim) => !self.power,
         run(sim) {
-            set_toggle_state(&mut self.power, true, switch_click);
-            on_power_changed(sim, true);
+            apply_power(sim, true);
         }
     }
 
@@ -25,8 +47,7 @@ pub template ToggleableDevice {
         autonomy: 20,
         guard(sim) => self.power && !self.occupied,
         run(sim) {
-            set_toggle_state(&mut self.power, false, switch_click);
-            on_power_changed(sim, false);
+            apply_power(sim, false);
         }
     }
 }

@@ -1952,9 +1952,9 @@ pub fn nested_sleep_helper(sim: Sim, inner_lock: &mut bool, after_sleep: &mut i1
     }
 }
 
-pub fn bump_and_true(counter: &mut i16, delta: i16) -> bool {
+pub fn bump_and_one(counter: &mut i16, delta: i16) -> i16 {
     *counter += delta;
-    return true;
+    return 1;
 }
 
 pub fn mutate_handle_and_attr(handle: &mut ObjectId, attr_ref: &mut i16) {
@@ -2003,7 +2003,7 @@ object "R1 Target" {
 "#;
 
     let probe_src = r#"
-use r1_pack::mods::{bump_and_true, call_module_private, mutate_handle_and_attr, nested_sleep_helper};
+use r1_pack::mods::{bump_and_one, call_module_private, mutate_handle_and_attr, nested_sleep_helper};
 use r1_pack::tpl::InitBase;
 
 object "R1 Probe" from InitBase {
@@ -2065,7 +2065,7 @@ object "R1 Probe" from InitBase {
     // P1-1: computed while condition `n + 1 < 4` must re-evaluate every iteration (runs 3 times).
     // P1-2: foreign write `target.attr[0] = self.src_val` must snapshot self.src_val BEFORE swapping stack_obj!
     // P1-3: `while target.run_functional(prep)` must preserve stack_obj for `self.func_loops += 1`!
-    // P1-7: `self.counter + bump_and_true(&mut self.counter, 5)` must read LHS (10) before RHS mutates counter to 15!
+    // P1-7: `self.counter + bump_and_one(&mut self.counter, 5)` must read LHS (10) before RHS mutates counter to 15!
     // P1-8: `call_module_private(&mut self.mod_tag)` must call module's private_tag (100), not local (999)!
     // P2-1: `mutate_handle_and_attr(&mut alias, &mut alias.attr[0])` must write to original target even after `*handle = 0`!
     interaction "Run Core Probes" {
@@ -2084,7 +2084,7 @@ object "R1 Probe" from InitBase {
                 self.func_loops += 1;
             }
 
-            self.arith_res = self.counter + bump_and_true(&mut self.counter, 5);
+            self.arith_res = self.counter + bump_and_one(&mut self.counter, 5);
             call_module_private(&mut self.mod_tag);
 
             // Re-test P2-1 using a separate local handle that gets zeroed inside helper.
@@ -3272,23 +3272,23 @@ fn on_disk_open_pack_is_pure_v2_expands_all_20_objects_and_passes_safety() {
         "lamp must boot with graphic 0 (lit) to preserve v0.3.0 initial world state"
     );
     let room_before = vm.sim_motive(13);
-    vm.run_interaction(lamp_id, "Turn Off", None);
+    vm.run_interaction(lamp_id, "Turn Off Light", None);
     assert_eq!(vm.obj_attr(lamp_id, 1), 0);
     assert_eq!(
         vm.obj_data(lamp_id, 0),
         1,
-        "Turn Off switches to off graphic 1"
+        "Turn Off Light switches to off graphic 1"
     );
-    vm.run_interaction(lamp_id, "Turn On", None);
+    vm.run_interaction(lamp_id, "Turn On Light", None);
     assert_eq!(vm.obj_attr(lamp_id, 1), 1);
     assert_eq!(
         vm.obj_data(lamp_id, 0),
         0,
-        "Turn On switches back to lit graphic 0"
+        "Turn On Light switches back to lit graphic 0"
     );
     assert!(
         vm.sim_motive(13) > room_before + 30.0,
-        "Turn On hook must still boost Sim room motive"
+        "Turn On Light hook must boost Sim room motive"
     );
 
     // 6. Verify 2-Sim contention on `open-cot`: while Sim 1 naps, Sim 2 cannot claim the cot!
@@ -4384,4 +4384,491 @@ object "Bad Slot Ctor" {
             "case '{name}' expected error containing {expected_substr:?}, got: {err}"
         );
     }
+}
+
+#[test]
+fn tiers_1_2_sol_r1_regressions() {
+    let cfg = PackResolverConfig::default();
+
+    // P1-4: Recursive default parameter triggers cycle detection (not 256-expansion budget),
+    // while finite explicit nesting `f(f(1))` succeeds!
+    let rec_def_err = compile_v2_source(
+        "rec_default.antics",
+        r#"
+fn f(x: i16 = f()) -> i16 { return x; }
+object "Rec Def" {
+    guid: 0x7F42_0001;
+    interaction "Go" { run(sim) { let v = f(); } }
+}
+"#,
+        &cfg,
+    )
+    .expect_err("recursive default expression must hit cycle detector");
+    assert!(
+        rec_def_err
+            .message
+            .contains("recursive function call cycle detected"),
+        "{rec_def_err}"
+    );
+
+    let finite_nest_obj = compile_v2_source(
+        "finite_nest.antics",
+        r#"
+fn inc(x: i16 = 0) -> i16 { return x + 1; }
+object "Finite Nest" {
+    guid: 0x7F42_0002;
+    state out: i16 = 0;
+    interaction "Go" { run(sim) { self.out = inc(inc(inc(1))); } }
+}
+"#,
+        &cfg,
+    )
+    .expect("finite explicit nesting inc(inc(inc(1))) must compile");
+    let mut vm_nest = V2VmFixture::from_objects(&[&finite_nest_obj], 100);
+    let nid = vm_nest.spawn(0x7F42_0002, 4, 4);
+    vm_nest.run_interaction(nid, "Go", None);
+    assert_eq!(vm_nest.obj_attr(nid, 0), 4);
+
+    // P1-5: Default expression must NOT capture caller's `run(actor)` Sim binding!
+    let sim_leak_err = compile_v2_source(
+        "sim_leak_default.antics",
+        r#"
+fn f(x: i16 = actor.priority) -> i16 { return x; }
+object "Sim Leak" {
+    guid: 0x7F42_0003;
+    interaction "Go" { run(actor) { let v = f(); } }
+}
+"#,
+        &cfg,
+    )
+    .expect_err("default parameter must not capture caller's run(actor) binding");
+    assert!(
+        sim_leak_err.message.contains("unknown")
+            || sim_leak_err
+                .message
+                .contains("not a valid assignment target"),
+        "{sim_leak_err}"
+    );
+
+    // P1-6: Arithmetic and unary negation reject boolean operands (both in returns and defaults)!
+    for (name, src, expected) in [
+        (
+            "bool_add",
+            r#"
+fn bad() -> i16 { return true + 1; }
+object "Bool Add" {
+    guid: 0x7F42_0004;
+    interaction "Go" { run(sim) { let x = bad(); } }
+}
+"#,
+            "cannot be applied to 'bool' operand",
+        ),
+        (
+            "bool_neg",
+            r#"
+fn bad() -> i16 { return -true; }
+object "Bool Neg" {
+    guid: 0x7F42_0005;
+    interaction "Go" { run(sim) { let x = bad(); } }
+}
+"#,
+            "cannot apply unary '-' to 'bool'",
+        ),
+        (
+            "bool_arith_default",
+            r#"
+fn bad(x: i16 = true + 1) -> i16 { return x; }
+object "Bool Default" {
+    guid: 0x7F42_0006;
+    interaction "Go" { run(sim) { let x = bad(); } }
+}
+"#,
+            "cannot be applied to 'bool' operand",
+        ),
+    ] {
+        let err = compile_v2_source(name, src, &cfg).expect_err(&format!("{name} must fail"));
+        assert!(err.message.contains(expected), "{name}: {err}");
+    }
+
+    // P1-7: Calling a value-returning helper (and helper-local loop break) inside `defer` works,
+    // while `return`/`break` directly escaping `defer` is STILL rejected!
+    let defer_call_obj = compile_v2_source(
+        "defer_call.antics",
+        r#"
+fn compute_cleanup() -> i16 {
+    let mut n: i16 = 0;
+    repeat 5 {
+        n += 1;
+        if n == 3 {
+            break;
+        }
+    }
+    return n * 10;
+}
+object "Defer Helper" {
+    guid: 0x7F42_0007;
+    state out: i16 = 0;
+    interaction "Go" {
+        run(sim) {
+            defer {
+                self.out = compute_cleanup();
+            }
+        }
+    }
+}
+"#,
+        &cfg,
+    )
+    .expect("calling value-returning helper with internal break inside defer must compile");
+    let mut vm_def = V2VmFixture::from_objects(&[&defer_call_obj], 100);
+    let did = vm_def.spawn(0x7F42_0007, 4, 4);
+    vm_def.run_interaction(did, "Go", None);
+    assert_eq!(vm_def.obj_attr(did, 0), 30);
+
+    let defer_escape_fn_err = compile_v2_source(
+        "defer_escape_fn.antics",
+        r#"
+fn bad() -> i16 {
+    defer { return 1; }
+    return 2;
+}
+object "Defer Escape Fn" {
+    guid: 0x7F42_0008;
+    interaction "Go" { run(sim) { let x = bad(); } }
+}
+"#,
+        &cfg,
+    )
+    .expect_err("return inside defer attempting to escape helper must still fail");
+    assert!(
+        defer_escape_fn_err
+            .message
+            .contains("'return' cannot exit out of a 'defer' block"),
+        "{defer_escape_fn_err}"
+    );
+
+    let defer_escape_loop_err = compile_v2_source(
+        "defer_escape_loop.antics",
+        r#"
+object "Defer Escape Loop" {
+    guid: 0x7F42_0009;
+    interaction "Go" {
+        run(sim) {
+            repeat 2 {
+                defer { break; }
+            }
+        }
+    }
+}
+"#,
+        &cfg,
+    )
+    .expect_err("break inside defer targeting outer loop must fail");
+    assert!(
+        defer_escape_loop_err
+            .message
+            .contains("'break' cannot exit out of a 'defer' block"),
+        "{defer_escape_loop_err}"
+    );
+
+    // P2-1: Declaring state conflicting with built-in object property (`room`, `id`, etc.) is rejected!
+    let state_room_err = compile_v2_source(
+        "state_room.antics",
+        r#"
+object "State Room" {
+    guid: 0x7F42_000A;
+    state room: bool = false;
+    interaction "Go" { lock: self.room, run(sim) { sleep(1); } }
+}
+"#,
+        &cfg,
+    )
+    .expect_err("state name conflicting with built-in self.room must be rejected");
+    assert!(
+        state_room_err
+            .message
+            .contains("conflicts with built-in object property 'self.room'"),
+        "{state_room_err}"
+    );
+
+    // P2-2: Object `param` shadowing bare skill/motive name fails cleanly, while `Skill::...`/`Motive::...` works!
+    let param_skill_err = compile_v2_source(
+        "param_skill_shadow.antics",
+        r#"
+object "Param Skill Shadow" {
+    guid: 0x7F42_000B;
+    param cooking: i16 = 5;
+    interaction "Go" { run(sim) { sim.skill[cooking] += 10; } }
+}
+"#,
+        &cfg,
+    )
+    .expect_err("bare param cooking in sim.skill[cooking] must fail");
+    assert!(
+        param_skill_err
+            .message
+            .contains("parameter 'cooking' is not a Skill"),
+        "{param_skill_err}"
+    );
+
+    let param_motive_err = compile_v2_source(
+        "param_motive_shadow.antics",
+        r#"
+object "Param Motive Shadow" {
+    guid: 0x7F42_000C;
+    param energy: i16 = 5;
+    interaction "Go" { run(sim) { sim.motive[energy] += 10; } }
+}
+"#,
+        &cfg,
+    )
+    .expect_err("bare param energy in sim.motive[energy] must fail");
+    assert!(
+        param_motive_err
+            .message
+            .contains("parameter 'energy' is not a Motive"),
+        "{param_motive_err}"
+    );
+
+    let explicit_enum_ok = compile_v2_source(
+        "explicit_enum_shadow.antics",
+        r#"
+object "Explicit Enum Shadow" {
+    guid: 0x7F42_000D;
+    param cooking: i16 = 5;
+    param energy: i16 = 7;
+    interaction "Go" {
+        run(sim) {
+            sim.skill[Skill::Cooking] += cooking;
+            sim.motive[Motive::Energy] += energy;
+        }
+    }
+}
+"#,
+        &cfg,
+    )
+    .expect("Skill::Cooking and Motive::Energy must work even when params share those names");
+    let mut vm_enum = V2VmFixture::from_objects(&[&explicit_enum_ok], 100);
+    let eid = vm_enum.spawn(0x7F42_000D, 4, 4);
+    let e0 = vm_enum.sim_motive(5);
+    vm_enum.run_interaction(eid, "Go", None);
+    assert_eq!(vm_enum.sim_skill(10), 5);
+    assert!((vm_enum.sim_motive(5) - (e0 + 7.0)).abs() < 1e-4);
+
+    // P2-3a: Side-effecting named-argument call-site evaluation order AND omitted default
+    // that iterates foreign objects (restoring `stack_obj` back to `self`).
+    let peer_obj = compile_v2_source(
+        "peer.antics",
+        r#"
+object "Peer Marker" {
+    guid: 0x7F42_000E;
+    state value: i16 = 13;
+}
+"#,
+        &cfg,
+    )
+    .expect("compile peer");
+    let order_and_foreign_obj = compile_v2_source(
+        "order_and_foreign.antics",
+        r#"
+fn push_digit(log: &mut i16, d: i16) -> i16 {
+    *log = *log * 10 + d;
+    return d;
+}
+
+fn sum_peers() -> i16 {
+    let mut total: i16 = 0;
+    for p in objects_by_guid(0x7F42_000E) {
+        total += p.attr[0];
+    }
+    return total;
+}
+
+fn combine(a: i16, b: i16, bonus: i16 = sum_peers()) -> i16 {
+    return a * 100 + b * 10 + bonus;
+}
+
+object "Order And Foreign Default" {
+    guid: 0x7F42_000F;
+    state log: i16 = 0;
+    state result: i16 = 0;
+    state after_self_write: i16 = 0;
+
+    interaction "Run" {
+        run(sim) {
+            // `b` is listed BEFORE `a` at the call site, so `log` must record `2` then `1` (= 21)!
+            // Omitted `bonus` calls `sum_peers()` which clobbers `stack_obj`, then restores `__self_obj`!
+            self.result = combine(b: push_digit(&mut self.log, 2), a: push_digit(&mut self.log, 1));
+            self.after_self_write = 77;
+        }
+    }
+}
+"#,
+        &cfg,
+    )
+    .expect("compile order_and_foreign");
+    let mut vm_ord = V2VmFixture::from_objects(&[&peer_obj, &order_and_foreign_obj], 100);
+    let _peer1 = vm_ord.spawn(0x7F42_000E, 2, 2);
+    let _peer2 = vm_ord.spawn(0x7F42_000E, 2, 3);
+    let ord_id = vm_ord.spawn(0x7F42_000F, 4, 4);
+    vm_ord.run_interaction(ord_id, "Run", None);
+    assert_eq!(
+        vm_ord.obj_attr(ord_id, 0),
+        21,
+        "named args must evaluate in call-site order (b then a => 21)"
+    );
+    assert_eq!(
+        vm_ord.obj_attr(ord_id, 1),
+        100 + 20 + 26,
+        "combine(a=1, b=2, bonus=2*13=26) == 146"
+    );
+    assert_eq!(
+        vm_ord.obj_attr(ord_id, 2),
+        77,
+        "stack_obj must be restored to self after foreign-object default evaluation"
+    );
+
+    // P2-3b: `lock:` + nested `with lock(self.inner)` + `defer` + `continue` & `break`!
+    let nested_lock_obj = compile_v2_source(
+        "nested_lock_loop.antics",
+        r#"
+object "Nested Lock Loop" {
+    guid: 0x7F42_0010;
+    state outer_lock: bool = false;
+    state inner_lock: bool = false;
+    state defer_runs: i16 = 0;
+    state outer_held_after_inner: i16 = 0;
+    state inner_free_after_iter: i16 = 0;
+
+    interaction "Loop Exits" {
+        lock: self.outer_lock,
+        run(sim) {
+            let mut i: i16 = 0;
+            while i < 4 {
+                i += 1;
+                with lock(self.inner_lock) {
+                    defer {
+                        self.defer_runs += 1;
+                    }
+                    if i == 1 {
+                        continue;
+                    }
+                    if i == 2 {
+                        break;
+                    }
+                }
+            }
+            // After loop exits via continue (iter 1) and break (iter 2):
+            // - inner_lock must be 0, outer_lock must STILL be 1, defer_runs must be exactly 2!
+            if self.outer_lock {
+                self.outer_held_after_inner = 1;
+            }
+            if !self.inner_lock {
+                self.inner_free_after_iter = 1;
+            }
+        }
+    }
+}
+"#,
+        &cfg,
+    )
+    .expect("compile nested_lock_loop");
+    let nested_report = verify_object_safety(&nested_lock_obj).expect("verify nested_lock_loop");
+    assert!(nested_report.is_ok(), "{:?}", nested_report.violations);
+    let mut vm_nl = V2VmFixture::from_objects(&[&nested_lock_obj], 100);
+    let nl_id = vm_nl.spawn(0x7F42_0010, 4, 4);
+    vm_nl.run_interaction(nl_id, "Loop Exits", None);
+    assert_eq!(vm_nl.obj_attr(nl_id, 0), 0, "outer lock released on exit");
+    assert_eq!(vm_nl.obj_attr(nl_id, 1), 0, "inner lock released");
+    assert_eq!(
+        vm_nl.obj_attr(nl_id, 2),
+        2,
+        "defer ran exactly once on continue + once on break"
+    );
+    assert_eq!(
+        vm_nl.obj_attr(nl_id, 3),
+        1,
+        "outer lock remained held across loop continue/break"
+    );
+    assert_eq!(
+        vm_nl.obj_attr(nl_id, 4),
+        1,
+        "inner lock was released before post-loop code"
+    );
+
+    // P1-1, P1-2, P1-3: Verify on-disk `open-pack/` metadata & per-cycle counter parity!
+    let pack_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("open-pack");
+    let pack = compile_v2_pack_dir(&pack_dir).expect("compile open-pack");
+    for slug in ["open-basin", "open-bench", "open-cot"] {
+        let obj = &pack.objects.iter().find(|o| o.slug == slug).unwrap().object;
+        let iff = Iff::parse(obj.iff_bytes.clone()).expect("parse iff");
+        let objd_data = iff.data(iff.get(b"OBJD", 128).expect("OBJD #128"));
+        let num_attrs = i16::from_le_bytes([objd_data[58 * 2], objd_data[58 * 2 + 1]]);
+        assert_eq!(
+            num_attrs, 1,
+            "{slug} OBJD num_attributes must remain 1 (no metadata drift)"
+        );
+    }
+
+    // P1-1: Verify `open-floor-lamp` preserves Turn On Light (autonomy 40, room +40) and Turn Off Light (autonomy 15, available even while occupied).
+    let lamp = &pack
+        .objects
+        .iter()
+        .find(|o| o.slug == "open-floor-lamp")
+        .unwrap()
+        .object;
+    let lamp_iff = Iff::parse(lamp.iff_bytes.clone()).expect("parse lamp iff");
+    let ttab =
+        InteractionTable::parse(lamp_iff.data(lamp_iff.get(b"TTAB", 128).expect("TTAB #128")))
+            .expect("parse lamp TTAB");
+    assert_eq!(ttab.interactions[0].autonomy, 40, "Turn On Light autonomy");
+    assert_eq!(
+        ttab.interactions[0].motives[13].delta, 40,
+        "Turn On Light advertises room +40"
+    );
+    assert_eq!(ttab.interactions[1].autonomy, 15, "Turn Off Light autonomy");
+    let mut vm_lamp = V2VmFixture::from_objects(&[lamp], 100);
+    let lamp_id = vm_lamp.spawn(0x7F00_0070, 4, 4);
+    vm_lamp.world.objects.get_mut(&lamp_id).unwrap().attributes[0] = 1; // occupied = true
+    assert!(
+        vm_lamp
+            .pie_menu_labels(lamp_id)
+            .contains(&"Turn Off Light".to_owned()),
+        "Turn Off Light must remain available even while another Sim is enjoying the light"
+    );
+
+    // P1-2: Verify `open-tv` increments `watch_cycles` (attr[2]) live on EACH cycle (not only at loop end)!
+    let tv = &pack
+        .objects
+        .iter()
+        .find(|o| o.slug == "open-tv")
+        .unwrap()
+        .object;
+    let mut vm_tv = V2VmFixture::from_objects(&[tv], 100);
+    let tv_id = vm_tv.spawn(0x7F00_0052, 4, 4);
+    let sim_id = vm_tv.sim_id;
+    let interp = Interpreter::new(&vm_tv.program, &vm_tv.catalog, Stream::Lot);
+    let watch_entry = interp
+        .pie_menu(&mut vm_tv.world, sim_id, tv_id)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.action.table_index == 2)
+        .expect("Watch TV offered");
+    let _ = interp
+        .pick(&mut vm_tv.world, sim_id, watch_entry.action)
+        .unwrap();
+    // Each cycle sleeps 2 ticks; step 3 yields -> cycle 1 finished, cycle 2 mid-sleep!
+    for _ in 0..3 {
+        vm_tv.world.objects.get_mut(&sim_id).unwrap().data[25] = 1;
+        let st = interp.turn(&mut vm_tv.world, sim_id, 4_000).unwrap();
+        assert!(matches!(st, Status::Yielded));
+    }
+    assert_eq!(
+        vm_tv.obj_attr(tv_id, 2),
+        1,
+        "open-tv watch_cycles must increment per cycle (visible during cycle 2)"
+    );
 }
