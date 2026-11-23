@@ -840,11 +840,60 @@ const fn control_sprite_width(control: TravelControl) -> i32 {
     }
 }
 
+fn command_for(control: TravelControl, state: &TravelState) -> TravelCommand {
+    match control {
+        TravelControl::ReturnHome => TravelCommand::ReturnToNeighborhood,
+        TravelControl::Bulldoze => TravelCommand::ToggleBulldoze,
+        TravelControl::ImportLot => TravelCommand::ImportLot,
+        TravelControl::Web => TravelCommand::OpenWeb,
+        TravelControl::Credits => TravelCommand::OpenCredits,
+        TravelControl::MoveIn => TravelCommand::OpenFamilyBin,
+        TravelControl::ToggleFilter(filter) => {
+            if state.active_filter == Some(filter) {
+                TravelCommand::SetFilter(None)
+            } else {
+                TravelCommand::SetFilter(Some(filter))
+            }
+        }
+    }
+}
+
+/// What a mouse-down on the travel chrome did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TravelPress {
+    /// No enabled control under the pointer.
+    Missed,
+    /// A control captured the press; it acts on release.
+    Held,
+    /// A press-triggered control acted at once (and keeps the capture).
+    Activated(TravelCommand),
+}
+
+impl TravelPress {
+    /// Whether the chrome took the press.
+    pub fn consumed(self) -> bool {
+        !matches!(self, Self::Missed)
+    }
+}
+
+/// Whether `control` acts on mouse-down rather than release. Magic Town's
+/// constructor puts its Bulldoze and Move In buttons (button indices 4 and
+/// 5, `+0x180`/`+0x184`) into press-triggered mode (`0x551e49`..`0x551e6b`,
+/// `+0xf8`/`+0xf4`), and `cWinBtn` then dispatches from its mouse-down
+/// handler (`0x5e4506`..`0x5e451a`). No other destination constructor does,
+/// so their buttons act on release.
+pub fn activates_on_press(destination: Destination, control: TravelControl) -> bool {
+    destination == Destination::MagicTown
+        && matches!(control, TravelControl::Bulldoze | TravelControl::MoveIn)
+}
+
 /// Interactive controller for the travel destination bar and picker dialog.
 #[derive(Debug, Clone, Default)]
 pub struct TravelChrome {
     hovered: Option<TravelControl>,
     pressed: Option<TravelControl>,
+    /// The captured press already acted on mouse-down.
+    fired: bool,
     pointer: [i32; 2],
 }
 
@@ -867,31 +916,53 @@ impl TravelChrome {
         let had = self.hovered.is_some() || self.pressed.is_some();
         self.hovered = None;
         self.pressed = None;
+        self.fired = false;
         had
     }
 
-    /// Updates hover state for a pointer move at `(x, y)`.
+    /// Updates hover state for a pointer move at `(x, y)`. While a press is
+    /// held, moves go only to the captured control (`0x5da9e3`..`0x5daa65`):
+    /// it counts as hovered while the pointer is over it, and no other
+    /// control hovers or shows its tooltip.
     pub fn pointer_move(&mut self, x: i32, y: i32, layout: &TravelLayout) {
         self.pointer = [x, y];
-        self.hovered = layout.hit(x, y).map(|c| c.control);
+        let hit = layout.hit(x, y).map(|c| c.control);
+        self.hovered = match self.pressed {
+            Some(captured) => hit.filter(|&c| c == captured),
+            None => hit,
+        };
     }
 
-    /// Records a mouse-down press if an enabled control lies under `(x, y)`.
-    pub fn pointer_down(&mut self, x: i32, y: i32, layout: &TravelLayout) -> bool {
+    /// Records a mouse-down on an enabled control under `(x, y)`. A
+    /// press-triggered control ([`activates_on_press`]) returns its command
+    /// at once; the others act on release.
+    pub fn pointer_down(
+        &mut self,
+        x: i32,
+        y: i32,
+        layout: &TravelLayout,
+        state: &TravelState,
+    ) -> TravelPress {
         self.pointer = [x, y];
+        self.fired = false;
         if let Some(hit) = layout.hit(x, y)
             && hit.enabled
         {
             self.pressed = Some(hit.control);
             self.hovered = Some(hit.control);
-            return true;
+            if activates_on_press(state.destination, hit.control) {
+                self.fired = true;
+                return TravelPress::Activated(command_for(hit.control, state));
+            }
+            return TravelPress::Held;
         }
         self.pressed = None;
-        false
+        TravelPress::Missed
     }
 
     /// Completes a click on mouse-up, returning a [`TravelCommand`] when
-    /// released on the same enabled control.
+    /// released on the same enabled control. A press-triggered control
+    /// already acted on mouse-down, so its release does nothing.
     pub fn pointer_up(
         &mut self,
         x: i32,
@@ -903,25 +974,14 @@ impl TravelChrome {
         let hit = layout.hit(x, y);
         self.hovered = hit.map(|c| c.control);
         let pressed = self.pressed.take()?;
+        if std::mem::take(&mut self.fired) {
+            return None;
+        }
         let hit = hit?;
         if !hit.enabled || hit.control != pressed {
             return None;
         }
-        Some(match hit.control {
-            TravelControl::ReturnHome => TravelCommand::ReturnToNeighborhood,
-            TravelControl::Bulldoze => TravelCommand::ToggleBulldoze,
-            TravelControl::ImportLot => TravelCommand::ImportLot,
-            TravelControl::Web => TravelCommand::OpenWeb,
-            TravelControl::Credits => TravelCommand::OpenCredits,
-            TravelControl::MoveIn => TravelCommand::OpenFamilyBin,
-            TravelControl::ToggleFilter(filter) => {
-                if state.active_filter == Some(filter) {
-                    TravelCommand::SetFilter(None)
-                } else {
-                    TravelCommand::SetFilter(Some(filter))
-                }
-            }
-        })
+        Some(command_for(hit.control, state))
     }
 
     /// Draws the travel destination bar (or Magic Town picker dialog) and

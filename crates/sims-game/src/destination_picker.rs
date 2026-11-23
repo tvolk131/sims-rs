@@ -506,7 +506,13 @@ impl DestinationMapPicker {
         let viewport = [size[0].max(1) as u32, size[1].max(1) as u32];
         if let Some(state) = &self.travel_state {
             let layout = TravelLayout::compute(viewport[0], viewport[1], state);
-            if self.travel_chrome.pointer_down(point[0], point[1], &layout) {
+            // A trip picker's bar has no press-triggered control live (only
+            // Return is enabled in Visit mode), so a press only captures.
+            if self
+                .travel_chrome
+                .pointer_down(point[0], point[1], &layout, state)
+                .consumed()
+            {
                 self.pressed_lot_id = None;
                 return true;
             }

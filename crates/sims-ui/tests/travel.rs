@@ -6,7 +6,7 @@ use sims_ui::neighborhood::ExpansionFlags;
 use sims_ui::travel::{
     Destination, LotFilter, TravelBarMode, TravelChrome, TravelCommand, TravelControl,
     TravelDialog, TravelDialogCommand, TravelDialogLayout, TravelDialogState, TravelLayout,
-    TravelState, TravelStrings, TravelTransport, load_art,
+    TravelPress, TravelState, TravelStrings, TravelTransport, activates_on_press, load_art,
 };
 use std::path::PathBuf;
 
@@ -180,8 +180,22 @@ fn clicking_controls_emits_expected_commands() {
             .find(|c| c.control == control)
             .unwrap_or_else(|| panic!("{control:?} control"));
         let (x, y) = (c.rect.x + c.rect.width / 2, c.rect.y + c.rect.height / 2);
-        assert!(chrome.pointer_down(x, y, &layout), "{control:?} press");
-        assert_eq!(chrome.pointer_up(x, y, &layout, &state), Some(command));
+        // Magic Town's Bulldoze and Move In act on mouse-down (0x551e49).
+        if matches!(control, Bulldoze | MoveIn) {
+            assert_eq!(
+                chrome.pointer_down(x, y, &layout, &state),
+                TravelPress::Activated(command),
+                "{control:?} press"
+            );
+            assert_eq!(chrome.pointer_up(x, y, &layout, &state), None);
+        } else {
+            assert_eq!(
+                chrome.pointer_down(x, y, &layout, &state),
+                TravelPress::Held,
+                "{control:?} press"
+            );
+            assert_eq!(chrome.pointer_up(x, y, &layout, &state), Some(command));
+        }
     }
 
     // Visit mode (lot picking from a trip) keeps only Return live.
@@ -201,7 +215,10 @@ fn clicking_controls_emits_expected_commands() {
         .iter()
         .find(|c| c.control == Bulldoze)
         .expect("Bulldoze control");
-    assert!(!chrome.pointer_down(doze.rect.x + 2, doze.rect.y + 2, &visit_layout));
+    assert_eq!(
+        chrome.pointer_down(doze.rect.x + 2, doze.rect.y + 2, &visit_layout, &state),
+        TravelPress::Missed
+    );
 }
 
 /// The Magic Town lot picker keeps the `dlgframe2.bmp` dialog with its
@@ -540,7 +557,10 @@ fn held_button_shows_down_frame_only_while_hovered() {
         frame.pixel(cx, cy).unwrap()
     };
     let idle = center(&chrome);
-    assert!(chrome.pointer_down(cx, cy, &layout));
+    assert_eq!(
+        chrome.pointer_down(cx, cy, &layout, &state),
+        TravelPress::Held
+    );
     let down = center(&chrome);
     assert_ne!(idle, down, "pressed button shows its down frame");
     chrome.pointer_move(400, 300, &layout);
@@ -551,4 +571,134 @@ fn held_button_shows_down_frame_only_while_hovered() {
         chrome.pointer_up(cx, cy, &layout, &state),
         Some(TravelCommand::ReturnToNeighborhood)
     );
+}
+
+fn control_center(layout: &TravelLayout, control: TravelControl) -> (i32, i32) {
+    let c = layout
+        .controls
+        .iter()
+        .find(|c| c.control == control)
+        .unwrap_or_else(|| panic!("{control:?} control"));
+    (c.rect.x + c.rect.width / 2, c.rect.y + c.rect.height / 2)
+}
+
+/// Magic Town's constructor puts Bulldoze and Move In into press-triggered
+/// mode (`0x551e49`..`0x551e6b`) and `cWinBtn` dispatches them from its
+/// mouse-down handler (`0x5e4506`): pressing acts even if the pointer is
+/// then dragged off. Return, and every other destination's Bulldoze, act on
+/// release over the button.
+#[test]
+fn magic_town_move_in_and_bulldoze_act_on_press_others_on_release() {
+    let magic = TravelState {
+        destination: Destination::MagicTown,
+        expansions: ExpansionFlags(ExpansionFlags::HOT_DATE | ExpansionFlags::MAKIN_MAGIC),
+        ..TravelState::default()
+    };
+    let layout = TravelLayout::compute(800, 600, &magic);
+    for (control, command) in [
+        (TravelControl::MoveIn, TravelCommand::OpenFamilyBin),
+        (TravelControl::Bulldoze, TravelCommand::ToggleBulldoze),
+    ] {
+        assert!(activates_on_press(Destination::MagicTown, control));
+        let mut chrome = TravelChrome::new();
+        let (x, y) = control_center(&layout, control);
+        assert_eq!(
+            chrome.pointer_down(x, y, &layout, &magic),
+            TravelPress::Activated(command),
+            "{control:?} acts on mouse-down"
+        );
+        chrome.pointer_move(400, 300, &layout);
+        assert_eq!(chrome.pointer_up(400, 300, &layout, &magic), None);
+        // Releasing back over it does not act a second time.
+        assert_eq!(
+            chrome.pointer_down(x, y, &layout, &magic),
+            TravelPress::Activated(command)
+        );
+        assert_eq!(chrome.pointer_up(x, y, &layout, &magic), None);
+    }
+    let mut chrome = TravelChrome::new();
+    let (x, y) = control_center(&layout, TravelControl::ReturnHome);
+    assert_eq!(
+        chrome.pointer_down(x, y, &layout, &magic),
+        TravelPress::Held
+    );
+    assert_eq!(chrome.pointer_up(400, 300, &layout, &magic), None);
+
+    for destination in [
+        Destination::Downtown,
+        Destination::VacationIsland,
+        Destination::StudioTown,
+    ] {
+        assert!(!activates_on_press(destination, TravelControl::Bulldoze));
+        let state = TravelState {
+            destination,
+            ..TravelState::default()
+        };
+        let layout = TravelLayout::compute(800, 600, &state);
+        let (x, y) = control_center(&layout, TravelControl::Bulldoze);
+        let mut chrome = TravelChrome::new();
+        assert_eq!(
+            chrome.pointer_down(x, y, &layout, &state),
+            TravelPress::Held,
+            "{destination:?} Bulldoze"
+        );
+        assert_eq!(chrome.pointer_up(400, 300, &layout, &state), None);
+        assert_eq!(
+            chrome.pointer_down(x, y, &layout, &state),
+            TravelPress::Held
+        );
+        assert_eq!(
+            chrome.pointer_up(x, y, &layout, &state),
+            Some(TravelCommand::ToggleBulldoze)
+        );
+    }
+}
+
+/// While a press is held, pointer moves go only to the captured control
+/// (`0x5da9e3`..`0x5daa65`): a neighbouring button neither hovers nor shows
+/// its tooltip.
+#[test]
+fn captured_press_keeps_hover_off_neighbouring_buttons() {
+    let state = TravelState::default();
+    let art = Art::default();
+    let strings = TravelStrings::default();
+    let layout = TravelLayout::compute(800, 600, &state);
+    let draw = |chrome: &TravelChrome| {
+        let mut frame = Frame::new(800, 600, [0, 0, 0]);
+        chrome.draw(&mut frame, &state, &art, &strings);
+        frame
+    };
+    let (rx, ry) = control_center(&layout, TravelControl::ReturnHome);
+    let (bx, by) = control_center(&layout, TravelControl::Bulldoze);
+
+    let mut free = TravelChrome::new();
+    free.pointer_move(bx, by, &layout);
+    assert_eq!(free.hovered(), Some(TravelControl::Bulldoze));
+
+    let mut chrome = TravelChrome::new();
+    assert_eq!(
+        chrome.pointer_down(rx, ry, &layout, &state),
+        TravelPress::Held
+    );
+    chrome.pointer_move(400, 300, &layout);
+    let off = draw(&chrome);
+    chrome.pointer_move(bx, by, &layout);
+    assert_eq!(
+        chrome.hovered(),
+        None,
+        "no hover on a neighbour while captured"
+    );
+    let over_neighbour = draw(&chrome);
+    assert!(
+        off.rgb() == over_neighbour.rgb(),
+        "a neighbour draws no hover or tooltip while the press is captured"
+    );
+    chrome.pointer_move(rx, ry, &layout);
+    assert_eq!(chrome.hovered(), Some(TravelControl::ReturnHome));
+    assert_eq!(
+        chrome.pointer_up(rx, ry, &layout, &state),
+        Some(TravelCommand::ReturnToNeighborhood)
+    );
+    chrome.pointer_move(bx, by, &layout);
+    assert_eq!(chrome.hovered(), Some(TravelControl::Bulldoze), "released");
 }

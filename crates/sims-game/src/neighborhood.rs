@@ -74,8 +74,8 @@ use sims_ui::shop::{
 };
 use sims_ui::travel::{
     Destination, LotFilter, TravelBarMode, TravelChrome, TravelCommand, TravelDialog,
-    TravelDialogCommand, TravelDialogLayout, TravelDialogState, TravelLayout, TravelState,
-    TravelStrings, TravelTransport as UiTravelTransport,
+    TravelDialogCommand, TravelDialogLayout, TravelDialogState, TravelLayout, TravelPress,
+    TravelState, TravelStrings, TravelTransport as UiTravelTransport,
 };
 use sims_vm::boot::Frames;
 use sims_vm::boot::save::Saved;
@@ -2305,7 +2305,11 @@ impl NeighborhoodShell {
                         TravelLayout::compute(frame_size[0], frame_size[1], &self.travel_state);
                     self.travel_chrome.pointer_move(point[0], point[1], &layout);
                     let cur_btn = self.travel_chrome.hovered();
-                    let over_chrome = cur_btn.is_some() || layout.blocks_map(point[0], point[1]);
+                    // A captured press keeps the pointer's moves (`0x5da9e3`):
+                    // no lot hovers until it is released.
+                    let over_chrome = cur_btn.is_some()
+                        || self.travel_chrome.pressed().is_some()
+                        || layout.blocks_map(point[0], point[1]);
                     (cur_btn != prev_btn, over_chrome)
                 } else {
                     let prev_btn = self.chrome.hovered();
@@ -2614,9 +2618,31 @@ impl NeighborhoodShell {
                     self.sync_travel_state();
                     let layout =
                         TravelLayout::compute(frame_size[0], frame_size[1], &self.travel_state);
-                    if self.travel_chrome.pointer_down(point[0], point[1], &layout) {
-                        self.pressed_lot_id = None;
-                        return ShellOutcome::redraw();
+                    match self.travel_chrome.pointer_down(
+                        point[0],
+                        point[1],
+                        &layout,
+                        &self.travel_state,
+                    ) {
+                        TravelPress::Missed => {}
+                        TravelPress::Held => {
+                            self.pressed_lot_id = None;
+                            return ShellOutcome::redraw();
+                        }
+                        // Magic Town's Bulldoze and Move In act on mouse-down
+                        // (`0x551e49`, `0x5e4506`).
+                        TravelPress::Activated(cmd) => {
+                            self.pressed_lot_id = None;
+                            let outcome = self.handle_travel_command(cmd);
+                            // A press that left the map (the family bin) drops
+                            // the capture: its release lands elsewhere.
+                            if !matches!(self.screen, ActiveScreen::Neighborhood)
+                                || self.dialog.is_some()
+                            {
+                                self.travel_chrome.clear_pointer();
+                            }
+                            return outcome;
+                        }
                     }
                     let over_chrome = layout.blocks_map(point[0], point[1]);
                     let hit = if over_chrome {
@@ -2761,7 +2787,7 @@ impl NeighborhoodShell {
             });
             return match cmd {
                 Some(BookCommand::Close) => {
-                    self.close_credits_and_restore_music();
+                    self.close_credits_modal();
                     ShellOutcome::redraw()
                 }
                 Some(BookCommand::ScrollLines(delta)) => {
@@ -2991,7 +3017,7 @@ impl NeighborhoodShell {
             return ShellOutcome::redraw();
         }
         if self.credits_dialog.is_open() {
-            self.close_credits_and_restore_music();
+            self.close_credits_modal();
             return ShellOutcome::redraw();
         }
         if self.coop_lobby.is_open() {
@@ -3437,7 +3463,7 @@ impl NeighborhoodShell {
             };
         }
         if self.credits_dialog.is_open() {
-            self.close_credits_and_restore_music();
+            self.close_credits_modal();
             return ShellOutcome::redraw();
         }
         if self.coop_lobby.is_open() {
@@ -4469,7 +4495,7 @@ impl NeighborhoodShell {
         self.save_manager_snapshot = None;
         self.save_manager_target_lot = None;
         self.close_import_family_picker();
-        self.close_credits_modal();
+        self.drop_credits_modal();
         self.nbhd_state.show_credits_button = destination_for_kind(kind).is_none();
         self.refresh_importable_families();
         self.note = None;
@@ -4506,7 +4532,7 @@ impl NeighborhoodShell {
         self.nbhd_state.show_credits_button = destination_for_kind(kind).is_none();
         self.nbhd_state.hovered_lot = None;
         self.close_import_family_picker();
-        self.close_credits_modal();
+        self.drop_credits_modal();
         self.hovered_lot_id = None;
         self.hovered_lot_since_us = None;
         self.hover_card_shown_for = None;
@@ -6179,7 +6205,26 @@ impl NeighborhoodShell {
         self.credits_dialog.open();
     }
 
+    /// Closes the credits book and, when it was open over a map, restores
+    /// the map's music, as every native close path does (`station_dtnhood`
+    /// `0x54b879`, `station_superstar` `0x565bf8`, `station_vacation`
+    /// `0x56a5ad`, `music_magictown` `0x552fc5`, `bkground_nhood1`
+    /// `0x5593ff`).
     pub fn close_credits_modal(&mut self) {
+        if !self.credits_dialog.is_open() {
+            self.drop_credits_modal();
+            return;
+        }
+        self.drop_credits_modal();
+        if matches!(self.screen, ActiveScreen::Neighborhood) {
+            self.audio_queue
+                .push(Input::MusicMode(music_mode_for_kind(self.kind)));
+        }
+    }
+
+    /// Discards the credits book without touching the music, for resets
+    /// whose caller sets the music itself (entering a map, switching maps).
+    fn drop_credits_modal(&mut self) {
         self.credits_dialog.close();
         self.credits_snapshot = None;
     }
@@ -6696,21 +6741,6 @@ impl NeighborhoodShell {
         };
         self.audio_queue.push(Input::MusicMode(mode));
         self.open_credits_modal();
-    }
-
-    /// Closes the credits book and restores the map's music, as the native
-    /// close paths do (`station_dtnhood` `0x54b879`, `station_superstar`
-    /// `0x565bf8`, `station_vacation` `0x56a5ad`, `music_magictown`
-    /// `0x552fc5`, `bkground_nhood1` `0x5593ff`).
-    fn close_credits_and_restore_music(&mut self) {
-        if !self.credits_dialog.is_open() {
-            return;
-        }
-        self.close_credits_modal();
-        if matches!(self.screen, ActiveScreen::Neighborhood) {
-            self.audio_queue
-                .push(Input::MusicMode(music_mode_for_kind(self.kind)));
-        }
     }
 
     fn travel_filtered_lot_ids(&self) -> BTreeSet<u16> {

@@ -95,9 +95,20 @@ the 1.91 disassembly and the oracle tour (`cache/ui-oracle-tour-20261122`).
      - **Unverified:** native click routing in the overlaps, for example
        (373, 26) on the Return/Bulldoze edge. `cWinBtn` may route by window
        order or by transparent pixels; a harness click would settle it.
-   - As with `cWinBtn`, a held button shows its down frame only while the
-     pointer is over it. Dragging off and back restores it, and the click
-     still lands on release.
+   - Most buttons act on release, as `cWinBtn` does by default. A held
+     button shows its down frame only while the pointer is over it;
+     dragging off and back restores it, and the click lands only if the
+     pointer is released over the button.
+   - Magic Town's Bulldoze and Move In (button indices 4 and 5) are put
+     into press-triggered mode by its constructor (`0x551e49`..`0x551e6b`),
+     and `cWinBtn` dispatches them from its mouse-down handler
+     (`0x5e4506`..`0x5e451a`). Pressing Move In opens the family bin at
+     once, even if the pointer is then dragged off; the release does
+     nothing. No other destination constructor sets this mode, so their
+     Bulldoze acts on release.
+   - While a press is held, pointer moves go only to the captured button
+     (`0x5da9e3`..`0x5daa65`). Neighbouring buttons neither hover nor show
+     tooltips, and lots do not hover, until the release.
    - There is no text label on any button. Missing art falls back to a
      blank chip.
    - `Destination::bar_buttons()` cites the tables.
@@ -120,8 +131,9 @@ the 1.91 disassembly and the oracle tour (`cache/ui-oracle-tour-20261122`).
        (`0x559397`);
      - `music_magictown_credits` on Magic Town (`0x552f5d`).
 
-     Closing credits restores the map station (`0x54b879`, `0x565bf8`,
-     `0x56a5ad`, `0x552fc5`, `0x5593ff`).
+     Closing credits, by any path (the book's Close, Escape, Enter, or
+     `close_credits_modal()`), restores the map station (`0x54b879`,
+     `0x565bf8`, `0x56a5ad`, `0x552fc5`, `0x5593ff`).
    - Magic Town's Move In opens the family bin. It replaces the invented
      "Fam" button.
    - Enable rules follow `0x56b19e`. Import stays greyed until lot import
@@ -150,10 +162,15 @@ the 1.91 disassembly and the oracle tour (`cache/ui-oracle-tour-20261122`).
    - The pixel test compares the whole frame against the banner plus the
      expected native cells, so a label painted inside a sprite also fails.
    - `neighborhood_shell::magic_town_bar_is_native_through_the_shell_with_move_in_latch_and_credits_music`
-     checks the composited shell frame. Every pixel the native chrome
-     covers must equal it, so a shell-drawn button or badge fails. The test
-     also runs Family Bin → choose household → map with Move In latched,
-     and checks credits music in and out.
+     checks the whole composited shell frame. It must equal the map,
+     rendered independently with the shell's options, under the native
+     chrome, so a shell-drawn button, badge or chip anywhere fails, on the
+     bar or below it. The test also runs Move In (acting on press) →
+     Family Bin → choose household → map with Move In latched, and checks
+     credits music in and out.
+   - `magic_town_move_in_and_bulldoze_act_on_press_others_on_release` and
+     `captured_press_keeps_hover_off_neighbouring_buttons` pin the press
+     behaviour.
    - The existing `ui_oracle_tour` Downtown header floor still applies.
 
 ## Follow-ups (not in this change)
