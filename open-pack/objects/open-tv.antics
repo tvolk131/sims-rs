@@ -1,0 +1,79 @@
+// Open Retro Television (0x7F00_0052) — power toggle and cancel-safe Fun watch loop.
+
+use crate::common::helpers::{restore_motive_loop, set_toggle_state};
+use crate::templates::toggle::ToggleableDevice;
+
+object "Open Retro Television" from ToggleableDevice {
+    guid: 0x7F00_0052;
+    price: 380;
+    category: electronics;
+    description: "A clean-room cabinet television with on/off power state and a cancel-safe Fun watch loop.";
+    sprite: Sprite::procedural("television", primary: #765438, accent: #364856, trim: #423022);
+
+    initial_power: false;
+    param watch_ticks: i16 = 2;
+    param max_cycles: i16 = 4;
+    param fun_step: i16 = 24;
+    param max_entry_fun: i16 = 95;
+
+    state watch_cycles: i16 = 0;
+
+    sound switch_click = preset("ui_click", wav: "open_tv_click");
+    sound jingle = preset("chime", wav: "open_tv_jingle");
+
+    slot viewer {
+        kind: routing,
+        offset: [0.0, -1.25, 0.0],
+        standing: true,
+        sitting: true,
+        ground: true,
+        facing: north,
+    }
+
+    interaction "Turn On" {
+        autonomy: 30,
+        attenuation: 0.02,
+        guard(sim) => !self.power,
+        run(sim) {
+            set_toggle_state(self, &mut self.power, true, switch_click);
+            return true;
+        }
+    }
+
+    interaction "Turn Off" {
+        autonomy: 20,
+        attenuation: 0.02,
+        guard(sim) => self.power && !self.occupied,
+        run(sim) {
+            set_toggle_state(self, &mut self.power, false, switch_click);
+            return true;
+        }
+    }
+
+    interaction "Watch TV" {
+        autonomy: 60,
+        attenuation: 0.02,
+        advertises: [
+            fun +75 (min: -100),
+        ],
+        guard(sim) => !self.occupied && sim.motive.fun < max_entry_fun,
+        run(sim) {
+            with lock(self.occupied) {
+                if !self.power {
+                    set_toggle_state(self, &mut self.power, true, switch_click);
+                }
+                play_sound(jingle, self);
+                restore_motive_loop(
+                    sim,
+                    Motive::Fun,
+                    max_cycles,
+                    watch_ticks,
+                    fun_step,
+                    100,
+                    &mut self.watch_cycles,
+                );
+            }
+            return true;
+        }
+    }
+}

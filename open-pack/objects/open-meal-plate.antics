@@ -1,0 +1,72 @@
+// Open Meal Plate (0x7F00_0023) — cooked meal plate spawned on-lot by Open Hearth Stove.
+
+object "Open Meal Plate" {
+    guid: 0x7F00_0023;
+    price: 0;
+    attributes: 8;
+    description: "A clean-room plated meal spawned by the stove that restores Hunger and cleans itself up after eating.";
+    sprite: Sprite::procedural("meal_plate", primary: #F2F0EA, accent: #C48044, trim: #58924C);
+
+    param default_nutrition: i16 = 40;
+    param bite_ticks: i16 = 1;
+    param bites: i16 = 2;
+
+    state nutrition: i16 = default_nutrition;
+    state is_full: bool = true;
+
+    sound eat_sfx = preset("chime", wav: "open_plate_eat");
+    sound dispose_sfx = preset("ui_click", wav: "open_plate_dispose");
+
+    slot front {
+        kind: routing,
+        offset: [0.0, -0.55, 0.0],
+        standing: true,
+        sitting: true,
+        ground: true,
+        facing: north,
+    }
+
+    init {
+        // Allow ground/floor height (data[4] bit 0) and both floor & terrain placement (data[42] bits 0..1).
+        self.data[4] = 1;
+        self.data[42] = 3;
+    }
+
+    fn dispose_plate() {
+        play_sound(dispose_sfx, self);
+        destroy_self();
+    }
+
+    interaction "Eat Meal" {
+        autonomy: 40,
+        attenuation: 0.02,
+        advertises: [
+            hunger +70 (min: -100),
+        ],
+        guard(sim) => self.is_full,
+        run(sim) {
+            let per_bite = self.nutrition / bites;
+            let remainder = self.nutrition % bites;
+            repeat bites {
+                sleep(bite_ticks);
+                sim.motive.hunger += per_bite;
+            }
+            sim.motive.hunger += remainder;
+            play_sound(eat_sfx, self);
+
+            self.is_full = false;
+            dispose_plate();
+            return true;
+        }
+    }
+
+    interaction "Clean Up" {
+        autonomy: 85,
+        attenuation: 0.02,
+        guard(sim) => !self.is_full,
+        run(sim) {
+            dispose_plate();
+            return true;
+        }
+    }
+}

@@ -1,0 +1,73 @@
+// Open Oak Front Door (0x7F00_0080) — architectural entry with welcome social & lock state.
+
+use crate::common::helpers::set_toggle_state;
+
+object "Open Oak Front Door" {
+    guid: 0x7F00_0080;
+    price: 180;
+    category: misc;
+    attributes: 8;
+    description: "A clean-room architectural entry door with knock/welcome social interaction and lock state.";
+    sprite: Sprite::procedural("front_door", primary: #885634, accent: #D6C698, trim: #4E3422);
+
+    param greet_ticks: i16 = 1;
+    param social_gain: i16 = 30;
+    param fun_gain: i16 = 10;
+
+    state occupied: bool = false;
+    state welcomed_guests: i16 = 0;
+    state locked: bool = false;
+
+    sound knock = preset("wood_creak", wav: "open_door_knock");
+    sound bell = preset("chime", wav: "open_door_bell");
+
+    slot front {
+        kind: routing,
+        offset: [0.0, -0.75, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: north,
+    }
+
+    interaction "Knock and Welcome" {
+        autonomy: 35,
+        attenuation: 0.02,
+        advertises: [
+            social +40 (min: -100),
+            fun +15 (min: -100),
+        ],
+        guard(sim) => !self.occupied && !self.locked,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(knock, self);
+                sleep(greet_ticks);
+                play_sound(bell, self);
+                sim.motive.social += social_gain;
+                sim.motive.fun += fun_gain;
+                self.welcomed_guests += 1;
+            }
+            return true;
+        }
+    }
+
+    interaction "Lock Door" {
+        autonomy: 10,
+        attenuation: 0.02,
+        guard(sim) => !self.occupied && !self.locked,
+        run(sim) {
+            set_toggle_state(self, &mut self.locked, true, knock);
+            return true;
+        }
+    }
+
+    interaction "Unlock Door" {
+        autonomy: 10,
+        attenuation: 0.02,
+        guard(sim) => !self.occupied && self.locked,
+        run(sim) {
+            set_toggle_state(self, &mut self.locked, false, knock);
+            return true;
+        }
+    }
+}

@@ -1292,18 +1292,17 @@ fn cli_verify_build_and_equiv_subcommands_work_end_to_end() {
             .is_file()
     );
 
-    // 3. `sims-antics equiv <a.antics> <b.iff> --tree 4100` succeeds on matching script.
-    let toilet_antics = pack
-        .join("objects")
-        .join("open-toilet")
-        .join("behavior.antics");
+    // 3. `sims-antics equiv <a.antics> <b.iff> --tree 4099 --pack <pack>` succeeds on matching v2 script.
+    let toilet_antics = pack.join("objects").join("open-toilet.antics");
     let toilet_iff = out_dir.join("objects").join("open_toilet.iff");
     let equiv_ok = Command::new(bin)
         .arg("equiv")
         .arg(&toilet_antics)
         .arg(&toilet_iff)
         .arg("--tree")
-        .arg("4100")
+        .arg("4099")
+        .arg("--pack")
+        .arg(&pack)
         .output()
         .expect("failed to execute sims-antics equiv");
     assert!(
@@ -1318,11 +1317,26 @@ fn cli_verify_build_and_equiv_subcommands_work_end_to_end() {
         String::from_utf8_lossy(&equiv_ok.stdout)
     );
 
-    // 4. `sims-antics equiv` fails with COUNTEREXAMPLE when script is subtly mutated.
+    // 4. `sims-antics equiv` fails with COUNTEREXAMPLE when v2 script is subtly mutated.
+    let mut_pack = tmp_root.join("mut_pack");
+    std::fs::create_dir_all(mut_pack.join("common")).unwrap();
+    std::fs::create_dir_all(mut_pack.join("templates")).unwrap();
+    std::fs::create_dir_all(mut_pack.join("objects")).unwrap();
+    std::fs::copy(pack.join("pack.toml"), mut_pack.join("pack.toml")).unwrap();
+    std::fs::copy(
+        pack.join("common/helpers.antics"),
+        mut_pack.join("common/helpers.antics"),
+    )
+    .unwrap();
+    std::fs::copy(
+        pack.join("templates/plumbing.antics"),
+        mut_pack.join("templates/plumbing.antics"),
+    )
+    .unwrap();
     let orig_src = std::fs::read_to_string(&toilet_antics).unwrap();
-    let mutated_src = orig_src.replace("play_sound(1, stack_obj);", "play_sound(2, stack_obj);");
+    let mutated_src = orig_src.replace("play_sound(flush, self);", "play_sound(plunge, self);");
     assert_ne!(orig_src, mutated_src);
-    let mutated_path = tmp_root.join("mutated_toilet.antics");
+    let mutated_path = mut_pack.join("objects/open-toilet.antics");
     std::fs::write(&mutated_path, mutated_src).unwrap();
 
     let equiv_fail = Command::new(bin)
@@ -1330,7 +1344,9 @@ fn cli_verify_build_and_equiv_subcommands_work_end_to_end() {
         .arg(&mutated_path)
         .arg(&toilet_iff)
         .arg("--tree")
-        .arg("4100")
+        .arg("4099")
+        .arg("--pack")
+        .arg(&mut_pack)
         .output()
         .expect("failed to execute sims-antics equiv (mutated)");
     assert!(

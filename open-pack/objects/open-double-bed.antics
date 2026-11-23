@@ -1,0 +1,114 @@
+// Open Double Bed (master 0x7F00_0012, lead 0x7F00_0010, slave 0x7F00_0011)
+// Multi-tile double bed with left/right entry slots, synced tile occupancy, and cancel cleanup.
+
+use crate::templates::bed::BedBase;
+
+object "Open Double Bed" from BedBase {
+    guid: 0x7F00_0012;
+    price: 680;
+    attributes: 8;
+    description: "A clean-room two-tile double bed with left/right entry slots, shared occupancy tracking, and player cancel cleanup.";
+    sprite: Sprite::procedural("double_bed", primary: #4C6C92, accent: #ECE8DC, trim: #5E3E2A);
+
+    master_id: 1;
+    tiles: [
+        tile {
+            name: "Open Double Bed (Left Lead)",
+            guid: 0x7F00_0010,
+            objd_id: 129,
+            offset: [0, 0],
+            lead: true,
+            interaction_group: -1,
+            dgrp_id: 101,
+            shape: "double_bed_left",
+        },
+        tile {
+            name: "Open Double Bed (Right Slave)",
+            guid: 0x7F00_0011,
+            objd_id: 130,
+            offset: [1, 0],
+            lead: false,
+            interaction_group: 1,
+            dgrp_id: 102,
+            shape: "double_bed_right",
+        },
+    ];
+
+    sleep_ticks: 2;
+    sleep_cycles: 5;
+    energy_step: 24;
+    comfort_step: 10;
+    max_entry_energy: 85;
+    wake_energy: 95;
+
+    state occupancy_mask: i16 = 0;
+    state reserved: i16 = 0;
+    state completed_cycles: i16 = 0;
+
+    sound settle = preset("soft_thud", wav: "open_double_bed_settle");
+    sound wake = preset("wood_creak", wav: "open_double_bed_wake");
+
+    slot left_entry {
+        kind: routing,
+        offset: [-0.85, 0.0, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: west,
+    }
+
+    slot right_entry {
+        kind: routing,
+        offset: [1.85, 0.0, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: east,
+    }
+
+    fn sync_occupancy() {
+        for part in self.parts() {
+            part.attr[0] = self.occupancy_mask;
+        }
+    }
+
+    fn sleep_side(sim: Sim, side_flag: i16) {
+        self.occupancy_mask flag_set side_flag;
+        sync_occupancy();
+        defer {
+            self.occupancy_mask flag_clear side_flag;
+            sync_occupancy();
+            play_sound(wake, self);
+        }
+        play_sound(settle, self);
+        run_sleep_loop(sim, &mut self.completed_cycles);
+    }
+
+    interaction "Sleep (Left Side)" {
+        autonomy: 60,
+        attenuation: 0.015,
+        advertises: [
+            energy +90 (min: -100),
+            comfort +40 (min: -100),
+        ],
+        guard(sim) => !(self.occupancy_mask flag_test 1) && sim.motive.energy < max_entry_energy,
+        run(sim) {
+            sleep_side(sim, 1);
+            return true;
+        }
+    }
+
+    interaction "Sleep (Right Side)" {
+        autonomy: 60,
+        attenuation: 0.015,
+        advertises: [
+            energy +90 (min: -100),
+            comfort +40 (min: -100),
+        ],
+        guard(sim) => !(self.occupancy_mask flag_test 2) && sim.motive.energy < max_entry_energy,
+        run(sim) {
+            sleep_side(sim, 2);
+            return true;
+        }
+    }
+}

@@ -1,0 +1,141 @@
+// Open Wall Phone (0x7F00_0030) — interactive dialog branching & FWAV phone SFX.
+
+object "Open Wall Phone" {
+    guid: 0x7F00_0030;
+    price: 95;
+    category: electronics;
+    attributes: 8;
+    description: "A clean-room wall telephone with interactive choice dialogs for neighbor calls, grocery delivery, and community info.";
+    sprite: Sprite::procedural("wall_phone", primary: #36485C, accent: #D4DAE0, trim: #222A34);
+
+    param grocery_cost: i16 = 40;
+    param grocery_stock_bonus: i16 = 4;
+    param chat_ticks: i16 = 2;
+    param chat_social_gain: i16 = 35;
+    param chat_fun_gain: i16 = 15;
+    param grocery_comfort_gain: i16 = 10;
+    param info_fun_gain: i16 = 10;
+
+    state occupied: bool = false;
+    state last_outcome: i16 = 0;
+    state completed_calls: i16 = 0;
+
+    sound ring = preset("phone_ring", wav: "open_phone_ring");
+    sound dial = preset("phone_dial", wav: "open_phone_dial");
+    sound confirm = preset("chime", wav: "open_phone_confirm");
+
+    strings 301 "PhoneDialogs" {
+        title = "Open Wall Phone",
+        menu_prompt = "Select a service: Order Groceries ($40), Chat with Neighbor, or Community Info.",
+        btn_groceries = "Order Groceries",
+        btn_chat = "Chat with Neighbor",
+        btn_info = "Call for Info",
+        confirm_groceries = "Order a fresh grocery delivery for $40?",
+        btn_yes = "Order",
+        btn_cancel = "Cancel",
+        info_bulletin = "Community Bulletin: Bright skies and friendly neighbors today.",
+    }
+
+    slot front {
+        kind: routing,
+        offset: [0.0, -0.65, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: north,
+    }
+
+    fn deliver_groceries(sim: Sim) -> bool {
+        if debit_funds(grocery_cost) {
+            for fridge in objects_by_guid(0x7F00_0020) {
+                fridge.attr[0] += grocery_stock_bonus;
+            }
+            sim.motive.comfort += grocery_comfort_gain;
+            play_sound(confirm, self);
+            self.last_outcome = 1;
+            self.completed_calls += 1;
+            return true;
+        }
+        self.last_outcome = 5;
+        return false;
+    }
+
+    interaction "Use Phone" {
+        autonomy: 80,
+        attenuation: 0.02,
+        advertises: [
+            social +40 (min: -100),
+            fun +15 (min: -100),
+        ],
+        guard(sim) => !self.occupied,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(ring, self);
+                play_sound(dial, self);
+
+                if dialog(
+                    kind: yes_no_cancel,
+                    title: title,
+                    message: menu_prompt,
+                    button1: btn_groceries,
+                    button2: btn_chat,
+                    button3: btn_info,
+                    temp: 0,
+                    icon_mode: 1
+                ) {
+                    if !deliver_groceries(sim) {
+                        return false;
+                    }
+                } else if temp[0] == 0 {
+                    // Button 2: Chat with Neighbor
+                    sleep(chat_ticks);
+                    sim.motive.social += chat_social_gain;
+                    sim.motive.fun += chat_fun_gain;
+                    play_sound(confirm, self);
+                    self.last_outcome = 2;
+                    self.completed_calls += 1;
+                } else {
+                    // Button 3: Call for Info (non-blocking info bulletin)
+                    dialog(
+                        kind: ok,
+                        title: title,
+                        message: info_bulletin,
+                        inform: true,
+                        icon_mode: 1
+                    );
+                    sim.motive.fun += info_fun_gain;
+                    play_sound(confirm, self);
+                    self.last_outcome = 3;
+                    self.completed_calls += 1;
+                }
+            }
+            return true;
+        }
+    }
+
+    interaction "Order Groceries" {
+        autonomy: 95,
+        attenuation: 0.02,
+        guard(sim) => !self.occupied,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(dial, self);
+                if dialog(
+                    kind: yes_no,
+                    title: title,
+                    message: confirm_groceries,
+                    button1: btn_yes,
+                    button2: btn_cancel,
+                    icon_mode: 1
+                ) {
+                    if !deliver_groceries(sim) {
+                        return false;
+                    }
+                } else {
+                    self.last_outcome = 4;
+                }
+            }
+            return true;
+        }
+    }
+}

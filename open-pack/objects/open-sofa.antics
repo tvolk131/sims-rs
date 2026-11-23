@@ -1,0 +1,106 @@
+// Open Plush Sofa (0x7F00_0051) — Comfort relax, Energy nap, and Social chat seating.
+
+use crate::common::helpers::restore_two_motives_loop;
+use crate::templates::seat::SeatBase;
+
+object "Open Plush Sofa" from SeatBase {
+    guid: 0x7F00_0051;
+    price: 420;
+    attributes: 8;
+    description: "A clean-room upholstered living room sofa for relaxing, napping, and casual chatting.";
+    sprite: Sprite::procedural("sofa", primary: #5C8098, accent: #84A4B8, trim: #583E2A);
+
+    sit_ticks: 2;
+    sit_cycles: 3;
+    comfort_step: 24;
+    max_entry_comfort: 100;
+
+    param nap_cycles: i16 = 3;
+    param nap_energy_step: i16 = 18;
+    param nap_comfort_step: i16 = 12;
+    param max_nap_energy: i16 = 85;
+    param chat_cycles: i16 = 2;
+    param chat_social_step: i16 = 22;
+    param chat_comfort_step: i16 = 14;
+
+    state sessions: i16 = 0;
+
+    sound creak = preset("wood_creak", wav: "open_sofa_creak");
+    sound chime = preset("chime", wav: "open_sofa_chime");
+
+    interaction "Relax" {
+        autonomy: 55,
+        attenuation: 0.02,
+        advertises: [
+            comfort +65 (min: -100),
+        ],
+        guard(sim) => !self.occupied,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(creak, self);
+                let mut cycles: i16 = 0;
+                sit_comfort_loop(sim, &mut cycles);
+                self.sessions += 1;
+            }
+            return true;
+        }
+    }
+
+    interaction "Take Nap" {
+        autonomy: 50,
+        attenuation: 0.02,
+        advertises: [
+            energy +45 (min: -100),
+            comfort +35 (min: -100),
+        ],
+        guard(sim) => !self.occupied && sim.motive.energy < max_nap_energy,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(creak, self);
+                let mut cycles: i16 = 0;
+                restore_two_motives_loop(
+                    sim,
+                    Motive::Energy,
+                    nap_energy_step,
+                    Motive::Comfort,
+                    nap_comfort_step,
+                    nap_cycles,
+                    sit_ticks,
+                    95,
+                    &mut cycles,
+                );
+                self.sessions += 1;
+            }
+            return true;
+        }
+    }
+
+    interaction "Chat on Sofa" {
+        autonomy: 45,
+        attenuation: 0.02,
+        advertises: [
+            social +40 (min: -100),
+            comfort +30 (min: -100),
+        ],
+        guard(sim) => !self.occupied,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(chime, self);
+                let mut cycles: i16 = 0;
+                restore_two_motives_loop(
+                    sim,
+                    Motive::Social,
+                    chat_social_step,
+                    Motive::Comfort,
+                    chat_comfort_step,
+                    chat_cycles,
+                    sit_ticks,
+                    101,
+                    &mut cycles,
+                );
+                self.sessions += 1;
+            }
+            return true;
+        }
+    }
+}

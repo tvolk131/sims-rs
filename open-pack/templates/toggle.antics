@@ -1,0 +1,12 @@
+// Shared toggleable appliance/lighting template with occupancy lock and persistent power state.
+
+pub template ToggleableDevice {
+    attributes: 8;
+
+    param initial_power: bool = false;
+
+    state occupied: bool = false;
+    state power: bool = initial_power;
+
+    sound switch_click = preset("ui_click");
+}

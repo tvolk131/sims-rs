@@ -1,0 +1,47 @@
+// Open Oak Counter (0x7F00_0021) — kitchen prep surface (OBJf functional prep).
+
+object "Open Oak Counter" {
+    guid: 0x7F00_0021;
+    price: 260;
+    category: surfaces;
+    attributes: 8;
+    description: "A clean-room kitchen prep counter providing a food-preparation surface callback for the cooking chain.";
+    sprite: Sprite::procedural("counter", primary: #A67A4E, accent: #E8E4DA, trim: #583E2A);
+
+    param prep_score: i16 = 50;
+    param prep_nutrition_bonus: i16 = 10;
+
+    state meals_prepped: i16 = 0;
+    state occupied: bool = false;
+
+    sound chop = preset("wood_creak", wav: "open_counter_chop");
+
+    slot top_surface {
+        kind: container,
+        offset: [0.0, 0.0, 0.64],
+        standing: false,
+        sitting: false,
+        ground: false,
+        facing: north,
+    }
+
+    slot front {
+        kind: routing,
+        offset: [0.0, -0.75, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: north,
+    }
+
+    functional prep {
+        score: prep_score,
+        guard(sim) => !self.occupied,
+        run(sim) {
+            self.meals_prepped += 1;
+            temp[3] = prep_nutrition_bonus;
+            play_sound(chop, self);
+            return true;
+        }
+    }
+}

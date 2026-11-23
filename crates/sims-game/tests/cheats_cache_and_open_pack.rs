@@ -723,11 +723,11 @@ fn open_pack_cli_png_renders_non_blank_screenshot_without_sims_install() {
     //    is supplied.
     let dialog_pack = tmp.path().join("dialog-pack");
     copy_dir_recursive(&pack_dir, &dialog_pack);
-    let mailbox_antics = dialog_pack.join("objects/open-mailbox/behavior.antics");
+    let mailbox_antics = dialog_pack.join("objects/open-mailbox.antics");
     let orig_antics = std::fs::read_to_string(&mailbox_antics).expect("read mailbox antics");
     let patched_antics = orig_antics.replace(
-        "tree 4097 \"Main\" {\n    return true;\n}",
-        "tree 4097 \"Main\" {\n    if my.attr[2] == 0 {\n        my.attr[2] := 1;\n        dialog(kind: 2, message: 1, title: 1, button1: 0, button2: 0, button3: 0, mode4_str: 0, flags: 1);\n    }\n    idle(300);\n    return true;\n}",
+        "    main {\n        return true;\n    }",
+        "    main {\n        if self.paid_bills == 0 {\n            self.paid_bills = 1;\n            dialog(kind: 2, message: 1, title: 1, button1: 0, button2: 0, button3: 0, mode4_str: 0, flags: 1);\n        }\n        sleep(300);\n        return true;\n    }",
     );
     assert_ne!(patched_antics, orig_antics, "patched mailbox Main");
     std::fs::write(&mailbox_antics, patched_antics).expect("write dialog mailbox antics");
