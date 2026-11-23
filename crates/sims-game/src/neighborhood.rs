@@ -8246,6 +8246,7 @@ fn kind_for_destination(dest: Destination) -> NeighborhoodKind {
     match dest {
         Destination::Downtown => NeighborhoodKind::Downtown,
         Destination::VacationIsland => NeighborhoodKind::Vacation,
+        Destination::OldTown => NeighborhoodKind::Unleashed,
         Destination::StudioTown => NeighborhoodKind::StudioTown,
         Destination::MagicTown => NeighborhoodKind::MagicTown,
     }
@@ -8265,9 +8266,9 @@ fn ui_destination_for_vm(dest: TravelDestination) -> Destination {
     match dest {
         TravelDestination::Downtown => Destination::Downtown,
         TravelDestination::VacationIsland => Destination::VacationIsland,
+        TravelDestination::OldTown => Destination::OldTown,
         TravelDestination::StudioTown => Destination::StudioTown,
         TravelDestination::MagicTown => Destination::MagicTown,
-        TravelDestination::OldTown => Destination::Downtown,
     }
 }
 

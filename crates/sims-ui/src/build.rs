@@ -2071,10 +2071,22 @@ fn draw_popup_card<F>(
 ) where
     F: FnOnce(&mut Frame, i32, i32),
 {
-    frame.fill(rect, [20, 32, 92]);
-    let border = [120, 148, 212];
-    frame.fill(Rect::new(rect.x, rect.y, rect.width, 2), border);
-    frame.fill(Rect::new(rect.x, rect.y, 2, rect.height), border);
+    if let Some(sheet) = art.image(crate::dialog::BACKGROUND) {
+        crate::dialog::draw_nine_slice(frame, sheet, rect);
+    } else {
+        frame.fill(rect, [20, 32, 92]);
+        let border = [120, 148, 212];
+        frame.fill(Rect::new(rect.x, rect.y, rect.width, 2), border);
+        frame.fill(
+            Rect::new(rect.x, rect.y + rect.height - 2, rect.width, 2),
+            border,
+        );
+        frame.fill(Rect::new(rect.x, rect.y, 2, rect.height), border);
+        frame.fill(
+            Rect::new(rect.x + rect.width - 2, rect.y, 2, rect.height),
+            border,
+        );
+    }
     draw_icon(frame, rect.x + 12, rect.y + 12);
     let text_x = rect.x + 84;
     if let Some(font) = art.font(12) {

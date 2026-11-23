@@ -6,7 +6,8 @@ use sims_game::hud::DialogKey;
 use sims_game::sound::{Feed, Input, Mixer};
 use sims_game::{Game, Options};
 use sims_ui::command::{
-    Command, Mode, OptionsAction, OptionsHelp, OptionsTab, OptionsToggle, VolumeChannel,
+    Command, DetailLevel, Mode, OptionsAction, OptionsHelp, OptionsRadio, OptionsTab,
+    OptionsToggle, VolumeChannel,
 };
 use sims_ui::hud::{self, Kind};
 use sims_vm::boot::Frames;
@@ -1089,5 +1090,150 @@ fn unoccupied_magic_and_studio_lots_boot_into_edit_mode_with_native_save_card() 
         game.release(save_btn);
         assert!(game.has_dialog(), "lot {lot_num} Save Card did not open");
         assert_eq!(game.dialog_entry(), Some(game.lot_name()));
+    }
+}
+
+#[test]
+fn options_saves_and_coop_buttons_never_overlap_any_subpanel_widget_across_resolutions() {
+    let Some(root) = install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to test Options full-composite zero-overlap");
+        return;
+    };
+    let mut game = open_goth(&root);
+
+    let rects_overlap = |a: sims_ui::frame::Rect, b: sims_ui::frame::Rect| {
+        a.width > 0
+            && a.height > 0
+            && b.width > 0
+            && b.height > 0
+            && a.x < b.x + b.width
+            && a.x + a.width > b.x
+            && a.y < b.y + b.height
+            && a.y + a.height > b.y
+    };
+
+    for [w, h] in [[640, 480], [800, 600], [1024, 768], [1280, 720]] {
+        game.resize([w, h]);
+        game.set_mode(Mode::Options);
+        game.render();
+
+        for tab in [
+            None,
+            Some(OptionsTab::Graphics),
+            Some(OptionsTab::Sound),
+            Some(OptionsTab::Play),
+        ] {
+            if let Some(t) = tab {
+                if game.options().tab != Some(t) {
+                    let pt = find_command_point(&game, &Command::OpenOptionsTab(t));
+                    game.press(pt);
+                }
+            } else if game.options().tab.is_some() {
+                assert!(game.escape_options());
+            }
+            let canvas = game.render();
+            if let Some(dir) = std::env::var_os("SIMS_WAVE1_SHOTS_DIR").map(PathBuf::from)
+                && matches!([w, h], [800, 600] | [1024, 768])
+                && matches!(tab, Some(OptionsTab::Play | OptionsTab::Graphics))
+            {
+                let tag = match tab {
+                    Some(OptionsTab::Play) => "play",
+                    Some(OptionsTab::Graphics) => "graphics",
+                    _ => unreachable!(),
+                };
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(
+                    dir.join(format!("options_{tag}_{w}x{h}.png")),
+                    sims_render::png::encode(canvas),
+                );
+            }
+
+            let saves = game
+                .options_saves_button_rect()
+                .expect("Saves button laid out in Options");
+            let coop = game
+                .options_coop_button_rect()
+                .expect("Co-op button laid out in Options");
+            assert!(
+                !rects_overlap(saves, coop),
+                "Saves {saves:?} and Co-op {coop:?} overlap at {w}x{h} tab={tab:?}"
+            );
+            for (name, r) in [("Saves", saves), ("Co-op", coop)] {
+                assert!(
+                    r.x >= 0 && r.y >= 0 && r.x + r.width <= w && r.y + r.height <= h,
+                    "{name} {r:?} clips outside {w}x{h} tab={tab:?}"
+                );
+                let cluster = sims_ui::frame::Rect::new(
+                    0,
+                    (h - sims_ui::hud::CLUSTER[1]).max(0),
+                    sims_ui::hud::CLUSTER[0],
+                    sims_ui::hud::CLUSTER[1],
+                );
+                assert!(
+                    !rects_overlap(r, cluster),
+                    "{name} {r:?} overlaps cluster {cluster:?} at {w}x{h} tab={tab:?}"
+                );
+                for item in game.panel() {
+                    if matches!(
+                        item.kind,
+                        sims_ui::hud::Kind::Stretched(_)
+                            | sims_ui::hud::Kind::Image(
+                                sims_ui::hud::id::STRIP | sims_ui::hud::id::BACK_PATCH
+                            )
+                    ) {
+                        continue;
+                    }
+                    assert!(
+                        !rects_overlap(r, item.rect),
+                        "{name} {r:?} overlaps Options item {:?} ({:?}) at {w}x{h} tab={tab:?}",
+                        item.kind,
+                        item.rect
+                    );
+                }
+            }
+
+            // Confirm Export HTML (Play tab) and Character Detail High radio (Graphics tab)
+            // receive clicks directly without being intercepted by Saves/Co-op!
+            if tab == Some(OptionsTab::Play) {
+                let before = game.options().play.export_html;
+                let pt =
+                    find_command_point(&game, &Command::ToggleOption(OptionsToggle::ExportHtml));
+                game.press(pt);
+                assert_ne!(
+                    game.options().play.export_html,
+                    before,
+                    "Export HTML click must not be intercepted at {w}x{h}"
+                );
+                game.press(pt); // restore
+            }
+            if tab == Some(OptionsTab::Graphics) {
+                let pt = find_command_point(
+                    &game,
+                    &Command::SetDetail {
+                        radio: OptionsRadio::CharacterDetail,
+                        level: DetailLevel::Med,
+                    },
+                );
+                game.press(pt);
+                assert_eq!(
+                    game.options().graphics.character_detail,
+                    DetailLevel::Med,
+                    "Character Detail Med click must not be intercepted at {w}x{h}"
+                );
+                let high = find_command_point(
+                    &game,
+                    &Command::SetDetail {
+                        radio: OptionsRadio::CharacterDetail,
+                        level: DetailLevel::High,
+                    },
+                );
+                game.press(high);
+                assert_eq!(
+                    game.options().graphics.character_detail,
+                    DetailLevel::High,
+                    "Character Detail High click must not be intercepted at {w}x{h}"
+                );
+            }
+        }
     }
 }

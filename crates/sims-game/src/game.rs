@@ -6427,6 +6427,10 @@ impl Game {
             | Command::Refused { .. }
             | Command::ShowRelations(_)
             | Command::RelationsPage(_)
+            | Command::InterestsPage(_)
+            | Command::ShowInventory(_)
+            | Command::InventoryPage(_)
+            | Command::SelectInventoryItem(_)
             | Command::Help(_)
             | Command::OpenOptionsTab(_)
             | Command::OptionsHelp(_)
@@ -6715,9 +6719,10 @@ impl Game {
     /// sell prompt) for the current viewport size and world state.
     fn layout_buy(&mut self) {
         let sell = self.buy_sell_info();
-        self.hud.layout_buy(
+        self.hud.layout_buy_for_lot(
             self.view.size,
             self.lot.world(),
+            self.lot.residential(),
             &self.assets,
             sell.as_ref(),
         );

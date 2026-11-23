@@ -13,11 +13,13 @@
 
 use crate::art::Art;
 use crate::balloon::{self, Balloon, Help, Texts};
-use crate::command::{Camera, Command, Mode, Panel, Relations, Speed, VolumeChannel, Walls};
+use crate::command::{
+    Camera, Command, InventoryTab, Mode, Panel, Relations, Speed, VolumeChannel, Walls,
+};
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
 use crate::house::{self, House};
-use crate::household::{Faces, JobPanel, PetKind, Relation, Snapshot, Work, money};
+use crate::household::{Faces, InventoryEntry, JobPanel, PetKind, Relation, Snapshot, Work, money};
 use crate::options::{self, OptionsState, OptionsTexts};
 use crate::thumbnail::Thumbnails;
 use sims_formats::bitmap::Image;
@@ -118,11 +120,25 @@ pub mod id {
     pub const FAME_BAR_FULL: i32 = 4822;
     pub const FAME_BAR_EMPTY: i32 = 4823;
     pub const FAME_FRIENDS: i32 = 4984;
+    /// Interests panel (`cWinInterests`, `0x50f3c0..0x50f6f0`): the 19
+    /// `Interest*.bmp` icons (`1600..=1618`, `75×25/26`) and the full/empty
+    /// 10-segment bar art (`40×16`, 4 px per point).
+    pub const INTEREST_ICONS: [i32; 19] = [
+        1600, 1601, 1602, 1603, 1604, 1605, 1606, 1607, 1608, 1609, 1610, 1611, 1612, 1613, 1614,
+        1615, 1616, 1617, 1618,
+    ];
+    pub const INTEREST_BARS: i32 = 1619;
+    pub const INTEREST_BARS_BG: i32 = 1620;
+    /// Gifts / Inventory panel sort buttons (`0x51aa96..0x51ac9e`, 4 cells of
+    /// `20×20` each): Gift (`4112`), Magic (`4113`), and Other (`4114`).
+    pub const INVENTORY_GIFT_SORT: i32 = 4112;
+    pub const INVENTORY_MAGIC_SORT: i32 = 4113;
+    pub const INVENTORY_OTHER_SORT: i32 = 4114;
 }
 
 /// Optional / expansion-gated panel and help-balloon artwork loaded with
-/// [`Art::load_optional`] so installs without Superstar still open cleanly.
-pub const OPTIONAL_RESOURCES: [i32; 9] = [
+/// [`Art::load_optional`] so installs without later expansions still open cleanly.
+pub const OPTIONAL_RESOURCES: [i32; 33] = [
     balloon::BACKGROUND,
     id::SOCIAL_POPUP,
     id::JOB_POPUP,
@@ -132,6 +148,30 @@ pub const OPTIONAL_RESOURCES: [i32; 9] = [
     id::FAME_BAR_FULL,
     id::FAME_BAR_EMPTY,
     id::FAME_FRIENDS,
+    1600,
+    1601,
+    1602,
+    1603,
+    1604,
+    1605,
+    1606,
+    1607,
+    1608,
+    1609,
+    1610,
+    1611,
+    1612,
+    1613,
+    1614,
+    1615,
+    1616,
+    1617,
+    1618,
+    id::INTEREST_BARS,
+    id::INTEREST_BARS_BG,
+    id::INVENTORY_GIFT_SORT,
+    id::INVENTORY_MAGIC_SORT,
+    id::INVENTORY_OTHER_SORT,
 ];
 
 /// Every resource the panel needs, for [`Art::load`]. The help
@@ -301,6 +341,13 @@ pub struct Controls {
     /// back to it (0x51db4b).
     pub relations: Relations,
     pub relations_page: u32,
+    /// Current page of the Interests panel (`Panel::Interests`, from 0).
+    pub interests_page: u32,
+    /// Active category tab, page, and selected token GUID in the Gifts /
+    /// Inventory panel (`Panel::Gifts`).
+    pub inventory_tab: InventoryTab,
+    pub inventory_page: u32,
+    pub inventory_selected: Option<u32>,
     /// The help balloon open, if any. It shows while the panel that
     /// opened it does.
     pub help: Option<Help>,
@@ -351,6 +398,10 @@ impl Default for Controls {
             pointer: None,
             relations: Relations::default(),
             relations_page: 0,
+            interests_page: 0,
+            inventory_tab: InventoryTab::default(),
+            inventory_page: 0,
+            inventory_selected: None,
             help: None,
             options: OptionsState::default(),
             pressed_options_action: None,
@@ -389,6 +440,22 @@ impl Controls {
             }
             Command::ShowRelations(list) => self.relations = *list,
             Command::RelationsPage(page) => self.relations_page = *page,
+            Command::InterestsPage(page) => self.interests_page = *page,
+            Command::ShowInventory(tab) => {
+                if self.inventory_tab != *tab {
+                    self.inventory_tab = *tab;
+                    self.inventory_page = 0;
+                    self.inventory_selected = None;
+                }
+            }
+            Command::InventoryPage(page) => self.inventory_page = *page,
+            Command::SelectInventoryItem(guid) => {
+                self.inventory_selected = if self.inventory_selected == *guid {
+                    None
+                } else {
+                    *guid
+                };
+            }
             Command::SetMode(mode) => {
                 // 0x5179eb..0x5179f6: cWinOptions::Show resets its open subpanel
                 // tab to 0 (`None`) whenever Options becomes visible.
@@ -596,6 +663,19 @@ pub enum Kind {
     /// for the lifetime relationship, the two relationships as numbers
     /// and bars, and the icons. `lit` while the pointer is on it.
     Relation { relation: Relation, lit: bool },
+    /// One interest row (`Interest*.bmp` + 10-point bar from `1619`/`1620`,
+    /// `0x50f475..0x50f580`).
+    Interest {
+        icon_id: i32,
+        points: u8,
+        label: &'static str,
+    },
+    /// One inventory token cell in `Panel::Gifts` (`45×45` catalog template
+    /// frame + object thumbnail + count badge + label).
+    InventoryItem {
+        entry: InventoryEntry,
+        selected: bool,
+    },
     /// The house panel's ratings and facts, in `rect`, the subpanel.
     House { house: House },
     /// The first name of the person of type `guid`, in a box centered
@@ -1425,9 +1505,17 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             }
         }
     }
+    if let (Some(resident), Some(Panel::Interests)) = (selected, open_panel) {
+        let panel = Rect::new(gadget.x + 108, strip.y, subpanel_width, STRIP);
+        interests(items, panel, resident, controls);
+    }
     if let (Some(_), Some(Panel::Relationships)) = (selected, open_panel) {
         let panel = Rect::new(gadget.x + 108, strip.y, subpanel_width, STRIP);
         relationships(items, panel, snapshot, controls);
+    }
+    if let (Some(_), Some(Panel::Gifts)) = (selected, open_panel) {
+        let panel = Rect::new(gadget.x + 108, strip.y, subpanel_width, STRIP);
+        gifts(items, panel, snapshot, controls);
     }
     // The house panel's draw needs no selected Sim (0x52e49e), but with
     // nobody selected no panel is open ([`Controls::follow`]), and
@@ -2128,6 +2216,358 @@ fn draw_work(
     }
 }
 
+/// Native `cWinInterests` labels (`Live.iff STR# 140[1..=19]`, indexed `0..19`
+/// matching `id::INTEREST_ICONS` `1600..=1618` and `household::INTEREST_WORDS`).
+const INTEREST_LABELS: [&str; 19] = [
+    "Travel",
+    "Money",
+    "Politics",
+    "The 60's",
+    "Weather",
+    "Sports",
+    "Music",
+    "Outdoors",
+    "Toys",
+    "Aliens",
+    "Pets",
+    "School",
+    "Exercise",
+    "Food",
+    "Parties",
+    "Style",
+    "Hollywood",
+    "Technology",
+    "Romance",
+];
+/// Adult interest indices in `cWinInterests` order (`0x51e26a..0x51e293`: 15 items).
+const ADULT_INTERESTS: [usize; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15, 16, 17, 18];
+/// Child interest indices in `cWinInterests` order (`0x51e26a..0x51e293`: 8 items).
+const CHILD_INTERESTS: [usize; 8] = [8, 9, 10, 11, 4, 5, 6, 7];
+
+/// Lays out the Interests subpanel (`Panel::Interests`, `4505`, `0x50f3c0..0x50f6f0`,
+/// `0x51e260..0x51e342`) with native `Interest*.bmp` icons, `InterestBars.BMP`
+/// meters, and left/right paging arrows.
+fn interests(
+    items: &mut Vec<Item>,
+    panel: Rect,
+    resident: &crate::household::Resident,
+    controls: &Controls,
+) {
+    items.push(Item {
+        rect: panel.offset(6, 2).with_size(100, 16),
+        kind: Kind::Text {
+            text: "Interests".into(),
+            size: 11,
+            rgb: LABEL,
+            align: Align::Left,
+        },
+        command: None,
+    });
+    let list: &[usize] = if resident.school_age {
+        &CHILD_INTERESTS
+    } else {
+        &ADULT_INTERESTS
+    };
+    let [arrow_w, arrow_h] = [9, 49];
+    let cell_w = 120;
+    let cell_h = 25;
+    let col_stride = cell_w + 3;
+    let row_stride = cell_h + 2;
+    let rows = 3usize;
+    let left = arrow_w + 6;
+    let right = panel.width - arrow_w - 4;
+    let cols = ((right - left + 3) / col_stride).max(1) as usize;
+    let per_page = (cols * rows).max(1);
+    let pages = list.len().div_ceil(per_page).max(1);
+    let page = (controls.interests_page as usize).min(pages - 1);
+    let arrow_y = (panel.height - arrow_h) / 2;
+    if page > 0 {
+        items.push(Item {
+            rect: panel.offset(3, arrow_y).with_size(arrow_w, arrow_h),
+            kind: Kind::Button {
+                id: id::PAGE_BACK,
+                cells: 4,
+                selected: false,
+            },
+            command: Some(Command::InterestsPage((page - 1) as u32)),
+        });
+    }
+    if (page + 1) * per_page < list.len() {
+        items.push(Item {
+            rect: panel
+                .offset(panel.width - arrow_w - 2, arrow_y)
+                .with_size(arrow_w, arrow_h),
+            kind: Kind::Button {
+                id: id::PAGE_ON,
+                cells: 4,
+                selected: false,
+            },
+            command: Some(Command::InterestsPage((page + 1) as u32)),
+        });
+    }
+    for (slot, &idx) in list.iter().skip(page * per_page).take(per_page).enumerate() {
+        let col = (slot / rows) as i32;
+        let row = (slot % rows) as i32;
+        let x = left + col * col_stride;
+        let y = 18 + row * row_stride;
+        let points = (resident.interests[idx] / 100).clamp(0, 10) as u8;
+        items.push(Item {
+            rect: panel.offset(x, y).with_size(cell_w, cell_h),
+            kind: Kind::Interest {
+                icon_id: id::INTEREST_ICONS[idx],
+                points,
+                label: INTEREST_LABELS[idx],
+            },
+            command: None,
+        });
+    }
+}
+
+/// Native inventory sort tab buttons down the left edge of `Panel::Gifts`
+/// (`0x51aa96..0x51ac9e`, 4-cell `20×20` buttons).
+const INVENTORY_TABS: [(i32, InventoryTab); 3] = [
+    (id::INVENTORY_GIFT_SORT, InventoryTab::Gifts),
+    (id::INVENTORY_MAGIC_SORT, InventoryTab::Magic),
+    (id::INVENTORY_OTHER_SORT, InventoryTab::Other),
+];
+
+/// Whether an inventory token kind belongs to `tab` (`0x51e3b4..0x51e440`:
+/// kinds `0, 4, 5` -> Gifts, kind `7` -> Magic, kind `8` and remaining -> Other).
+pub fn inventory_kind_matches_tab(kind: i32, tab: InventoryTab) -> bool {
+    match tab {
+        InventoryTab::Gifts => matches!(kind, 0 | 4 | 5),
+        InventoryTab::Magic => kind == 7,
+        InventoryTab::Other => !matches!(kind, 0 | 4 | 5 | 7),
+    }
+}
+
+/// Lays out the Gifts / Inventory subpanel (`Panel::Gifts`, `4507`,
+/// `0x51aa96..0x51ac9e`, `0x51e343..0x51e440`) with the three native sort tabs,
+/// paging arrows, and item token slots.
+fn gifts(items: &mut Vec<Item>, panel: Rect, snapshot: &Snapshot, controls: &Controls) {
+    let mut y = 6;
+    let button_w = 20;
+    for &(bmp_id, tab) in &INVENTORY_TABS {
+        let rect = panel.offset(3, y).with_size(button_w, 20);
+        y += 24;
+        items.push(Item {
+            rect,
+            kind: Kind::Button {
+                id: bmp_id,
+                cells: 4,
+                selected: controls.inventory_tab == tab,
+            },
+            command: Some(Command::ShowInventory(tab)),
+        });
+    }
+    let shown: Vec<&InventoryEntry> = snapshot
+        .inventory
+        .iter()
+        .filter(|entry| inventory_kind_matches_tab(entry.kind, controls.inventory_tab))
+        .collect();
+    let [arrow_w, arrow_h] = [9, 49];
+    let cell_w = 45;
+    let cell_h = 45;
+    let pitch_x = 48;
+    let left = button_w + arrow_w + 8;
+    let right = panel.width - arrow_w - 4;
+    let per_page = ((right - left + 3) / pitch_x).max(1) as usize;
+    let pages = shown.len().div_ceil(per_page).max(1);
+    let page = (controls.inventory_page as usize).min(pages - 1);
+    let arrow_y = (panel.height - arrow_h) / 2;
+
+    let selected_entry = controls
+        .inventory_selected
+        .and_then(|guid| shown.iter().copied().find(|e| e.guid == guid));
+    let header = match selected_entry {
+        Some(entry) => format!("{} (x{})", entry.name, entry.count),
+        None => match controls.inventory_tab {
+            InventoryTab::Gifts => "Inventory - Gifts".into(),
+            InventoryTab::Magic => "Inventory - Magic".into(),
+            InventoryTab::Other => "Inventory - Other".into(),
+        },
+    };
+    items.push(Item {
+        rect: panel.offset(left, 4).with_size((right - left).max(40), 16),
+        kind: Kind::Text {
+            text: header,
+            size: 10,
+            rgb: LABEL,
+            align: Align::Left,
+        },
+        command: None,
+    });
+
+    if page > 0 {
+        items.push(Item {
+            rect: panel
+                .offset(button_w + 4, arrow_y)
+                .with_size(arrow_w, arrow_h),
+            kind: Kind::Button {
+                id: id::PAGE_BACK,
+                cells: 4,
+                selected: false,
+            },
+            command: Some(Command::InventoryPage((page - 1) as u32)),
+        });
+    }
+    if (page + 1) * per_page < shown.len() {
+        items.push(Item {
+            rect: panel
+                .offset(panel.width - arrow_w - 2, arrow_y)
+                .with_size(arrow_w, arrow_h),
+            kind: Kind::Button {
+                id: id::PAGE_ON,
+                cells: 4,
+                selected: false,
+            },
+            command: Some(Command::InventoryPage((page + 1) as u32)),
+        });
+    }
+
+    if shown.is_empty() {
+        items.push(Item {
+            rect: panel.offset(left, 40).with_size((right - left).max(40), 16),
+            kind: Kind::Text {
+                text: "No items".into(),
+                size: 9,
+                rgb: rgb565(0x8430),
+                align: Align::Left,
+            },
+            command: None,
+        });
+        return;
+    }
+
+    for (idx, entry) in shown
+        .iter()
+        .skip(page * per_page)
+        .take(per_page)
+        .enumerate()
+    {
+        let x = left + pitch_x * idx as i32;
+        let rect = panel.offset(x, 24).with_size(cell_w, cell_h);
+        let is_selected = controls.inventory_selected == Some(entry.guid);
+        items.push(Item {
+            rect,
+            kind: Kind::InventoryItem {
+                entry: (*entry).clone(),
+                selected: is_selected,
+            },
+            command: Some(Command::SelectInventoryItem(Some(entry.guid))),
+        });
+    }
+}
+
+/// Draws one native interest icon + 10-point bar (`0x50f475..0x50f580`).
+fn draw_interest(frame: &mut Frame, art: &Art, rect: Rect, icon_id: i32, points: u8, label: &str) {
+    let icon_w = if let Some(icon) = art.image(icon_id) {
+        frame.draw_all(icon, [rect.x, rect.y]);
+        i32::try_from(icon.width).unwrap_or(75)
+    } else {
+        if let Some(font) = art.font(8) {
+            font.draw(frame, label, [rect.x + 2, rect.y + 5], LABEL);
+        }
+        75
+    };
+    let bar_x = rect.x + icon_w + 5;
+    let bar_y = rect.y + 5;
+    let fill_w = i32::from(points.min(10)) * 4;
+    if let Some(bg) = art.image(id::INTEREST_BARS_BG) {
+        frame.draw_all(bg, [bar_x, bar_y]);
+    } else {
+        frame.fill(Rect::new(bar_x, bar_y, 40, 12), [24, 38, 76]);
+    }
+    if fill_w > 0 {
+        if let Some(fg) = art.image(id::INTEREST_BARS) {
+            let h = i32::try_from(fg.height).unwrap_or(16);
+            let w = fill_w.min(i32::try_from(fg.width).unwrap_or(40));
+            frame.draw(fg, Rect::new(0, 0, w, h), [bar_x, bar_y]);
+        } else {
+            frame.fill(Rect::new(bar_x, bar_y, fill_w, 12), GREEN);
+        }
+    }
+}
+
+/// Draws one inventory token slot inside `Panel::Gifts`: 45×45 catalog template
+/// cell + object thumbnail + count badge (`xN`) + short name below.
+fn draw_inventory_item(
+    frame: &mut Frame,
+    art: &Art,
+    thumbnails: Option<&Thumbnails>,
+    rect: Rect,
+    entry: &InventoryEntry,
+    selected: bool,
+    hovered: bool,
+) {
+    let cell = if selected {
+        1
+    } else if hovered {
+        2
+    } else {
+        0
+    };
+    if let Some(bg) = art.cell(crate::thumbnail::TEMPLATE, 4, cell) {
+        frame.draw_all(&bg, [rect.x, rect.y]);
+    } else {
+        let fill = if selected {
+            [44, 96, 176]
+        } else if hovered {
+            [32, 68, 140]
+        } else {
+            [20, 42, 102]
+        };
+        frame.fill(rect, fill);
+    }
+    if let Some(thumbs) = thumbnails {
+        if let Some(thumb) = thumbs.item(entry.guid).and_then(|i| i.thumbnail.as_ref()) {
+            let cell_sz = crate::thumbnail::SIZE;
+            let half = if thumb.width > cell_sz {
+                thumb.width / 2
+            } else {
+                thumb.width
+            };
+            let src_x = if (selected || hovered) && thumb.width > cell_sz {
+                half
+            } else {
+                0
+            };
+            let dx = (cell_sz as i32 - half as i32) / 2;
+            let dy = (cell_sz as i32 - thumb.height as i32) / 2;
+            frame.draw(
+                thumb,
+                Rect::new(src_x as i32, 0, half as i32, thumb.height as i32),
+                [rect.x + dx, rect.y + dy],
+            );
+        } else if let Some(icon) = thumbs.icon(art, entry.guid) {
+            let draw_w = (icon.width as i32).min(rect.width);
+            let draw_h = (icon.height as i32).min(rect.height);
+            frame.draw(&icon, Rect::new(0, 0, draw_w, draw_h), [rect.x, rect.y]);
+        }
+    }
+    if let Some(font) = art.font(8).or_else(|| art.font(9)) {
+        if entry.count > 1 {
+            let badge = format!("x{}", entry.count);
+            let bw = font.width(&badge) + 4;
+            let bh = font.line_height.max(10);
+            let bx = rect.x + rect.width - bw - 1;
+            let by = rect.y + rect.height - bh - 1;
+            frame.fill(Rect::new(bx, by, bw, bh), [8, 16, 44]);
+            font.draw(frame, &badge, [bx + 2, by], [255, 232, 128]);
+        }
+        // Abbreviated item label centered directly beneath the 45×45 slot.
+        let mut short = entry.name.clone();
+        while !short.is_empty() && font.width(&short) > rect.width + 2 {
+            short.pop();
+        }
+        if !short.is_empty() {
+            let tw = font.width(&short);
+            let tx = rect.x + (rect.width - tw) / 2;
+            font.draw(frame, &short, [tx, rect.y + rect.height + 2], LABEL);
+        }
+    }
+}
+
 /// The relationship panel's list buttons, top to bottom, and whom each
 /// lists (0x51d9aa); the Superstar one is disabled without that pack
 /// (0x51a7ea, [`Snapshot::superstar`]).
@@ -2721,6 +3161,15 @@ pub fn draw_with_thumbnails(
                 family_friends,
             } => draw_work(frame, art, r, work, *performance, *family_friends),
             Kind::Relation { relation, lit } => draw_relation(frame, art, faces, r, relation, *lit),
+            Kind::Interest {
+                icon_id,
+                points,
+                label,
+            } => draw_interest(frame, art, r, *icon_id, *points, label),
+            Kind::InventoryItem { entry, selected } => {
+                let hovered = controls.pointer.is_some_and(|[x, y]| r.contains(x, y));
+                draw_inventory_item(frame, art, thumbnails, r, entry, *selected, hovered);
+            }
             Kind::House { house } => draw_house(frame, art, r, house),
             Kind::Needs { .. }
             | Kind::ReportCardButton { .. }
@@ -2991,6 +3440,7 @@ mod tests {
                     fame_needs: [0; 6],
                     fame_friends_text: String::new(),
                     work: Work::default(),
+                    interests: [0; 19],
                 })
                 .collect(),
             selected: Some(21),
@@ -3000,6 +3450,7 @@ mod tests {
             relations: Vec::new(),
             superstar: false,
             house: crate::house::House::default(),
+            inventory: Vec::new(),
         }
     }
 
@@ -3299,6 +3750,7 @@ mod tests {
                 fame_needs: [0; 6],
                 fame_friends_text: String::new(),
                 work: Work::default(),
+                interests: [0; 19],
             })
             .collect();
         let controls = Controls {

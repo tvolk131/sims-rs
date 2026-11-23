@@ -788,7 +788,8 @@ impl Hud {
 
     /// Lays out the Buy Mode catalog strip (or active Hand Tool sell prompt)
     /// for `size` and `world` (or clears it outside expanded Buy Mode),
-    /// syncing `self.buy_state.page` to the clamped page number.
+    /// automatically selecting the lot's residential or expansion commercial
+    /// catalog zone (`0x4cb8e7..0x4cbaa8`) and syncing `self.buy_state.page`.
     pub fn layout_buy(
         &mut self,
         size: [i32; 2],
@@ -796,10 +797,28 @@ impl Hud {
         assets: &Assets,
         sell: Option<&SellInfo>,
     ) {
+        self.layout_buy_for_lot(size, world, true, assets, sell);
+    }
+
+    /// Like [`Hud::layout_buy`], using the lot's residential zoning flag to
+    /// distinguish Old Town community lots (`BuyZone::Community`) from
+    /// residential lots (`BuyZone::Residential`).
+    pub fn layout_buy_for_lot(
+        &mut self,
+        size: [i32; 2],
+        world: &World,
+        residential: bool,
+        assets: &Assets,
+        sell: Option<&SellInfo>,
+    ) {
         if self.controls.mode != Mode::Buy || !self.controls.expanded {
             self.buy_layout = BuyLayout::default();
             return;
         }
+        let lot_id = world.globals.get(10).copied().unwrap_or(0);
+        let zoning = Some(if residential { 1 } else { 2 });
+        let zone = sims_ui::buy::BuyZone::for_lot(lot_id, zoning);
+        self.buy_state.set_zone(zone);
         let rating_labels = self.rating_labels.clone();
         let sell_labels = self.sell_labels.clone();
         let catalog = self.buy_catalog.get_or_insert_with(|| {
@@ -1902,12 +1921,20 @@ impl Hud {
         if self.message.as_ref().is_some_and(|(_, k)| *k == key) {
             return;
         }
-        let read = Message::read(
+        let mut ctx = dialog::DialogContext {
+            faces: Some(&self.faces),
+            thumbnails: Some(&mut self.thumbnails),
+            art: Some(&self.art),
+            careers: Some(&self.careers),
+            fame: Some(&self.fame),
+        };
+        let read = Message::read_with_context(
             world,
             assets.index(),
             assets.catalog(),
             &self.labels,
             pending,
+            &mut ctx,
         )
         .ok()
         .flatten();
@@ -1988,6 +2015,14 @@ impl Hud {
         match self.controls.panel {
             Some(UiPanel::Relationships) => {
                 snapshot.with_relations(world, self.members(world), &self.known)
+            }
+            Some(UiPanel::Gifts) if self.controls.expanded => {
+                snapshot.with_inventory(world, |guid| {
+                    self.buy_catalog
+                        .as_ref()
+                        .map(|cat| cat.display_for_object(guid).1)
+                        .unwrap_or_default()
+                })
             }
             Some(UiPanel::House) if self.controls.expanded && snapshot.residential => {
                 snapshot.with_house(world, &self.house, &self.kinds)
@@ -2142,8 +2177,24 @@ impl Hud {
         if self.controls.expanded && residential && self.controls.panel == Some(UiPanel::House) {
             self.kinds.learn(world, assets.index(), assets.catalog());
         }
+        if self.controls.expanded && self.controls.panel == Some(UiPanel::Gifts) {
+            let rating_labels = self.rating_labels.clone();
+            let sell_labels = self.sell_labels.clone();
+            self.buy_catalog.get_or_insert_with(|| {
+                BuyCatalog::load(assets.index(), assets.catalog())
+                    .with_rating_labels(rating_labels)
+                    .with_sell_labels(sell_labels)
+            });
+        }
         // The pause button shows global 17, which the game's pause sets.
         let snapshot = self.for_panel(household, world);
+        if self.controls.expanded && self.controls.panel == Some(UiPanel::Gifts) {
+            for entry in &snapshot.inventory {
+                let _ = self
+                    .thumbnails
+                    .read(assets.index(), assets.catalog(), entry.guid);
+            }
+        }
         if let Some(help) = self.controls.help
             && !hud::help_matches_snapshot(help, &snapshot, self.controls.panel)
         {
@@ -2307,7 +2358,7 @@ impl Hud {
             self.draw_options_strip_button(&mut frame, rect, "Co-op", self.pressed_coop_button);
         }
         if self.controls.mode == Mode::Buy && self.controls.expanded {
-            self.layout_buy(view.size, world, assets, sell);
+            self.layout_buy_for_lot(view.size, world, residential, assets, sell);
             let mut guids: Vec<u32> = self
                 .buy_layout
                 .widgets
@@ -2416,14 +2467,19 @@ impl Hud {
         canvas.color = frame.into_packed();
     }
 
-    fn compute_options_saves_button_rect(&self, size: [i32; 2]) -> Option<Rect> {
+    /// Computes non-overlapping `(coop_rect, saves_rect)` placements for the
+    /// synthetic Options-strip `"Co-op"` and `"Saves"` buttons across all
+    /// resolutions (`640×480`, `800×600`, `1024×768`, `1280×720`, etc.) and all
+    /// Options subpanel tabs (`None`, `Graphics`, `Sound`, `Play`).
+    ///
+    /// Guarantees pairwise disjointness against `CLUSTER`, every laid-out
+    /// Options strip widget (actions, tabs, dividers, checkboxes, radios,
+    /// sliders, labels, Reset Tutorial), and any open Options help balloon or
+    /// Quick Tips tooltip.
+    fn compute_options_extra_button_rects(&self, size: [i32; 2]) -> Option<(Rect, Rect)> {
         if self.controls.mode != Mode::Options || !self.controls.expanded {
             return None;
         }
-        let quit = self
-            .items
-            .iter()
-            .find(|i| i.command == Some(Command::OptionsAction(OptionsAction::Quit)))?;
         let divider_x = self
             .items
             .iter()
@@ -2434,49 +2490,136 @@ impl Hud {
                 )
             })
             .map(|i| i.rect.x)?;
-        let left = quit.rect.x + quit.rect.width + 4;
-        let avail = divider_x - left - 3;
-        if avail >= 98 {
-            Some(Rect::new(left, quit.rect.y + 6, 46, 28))
-        } else if avail >= 42 {
-            Some(Rect::new(left, quit.rect.y + 2, avail.min(48), 22))
-        } else {
-            // Compact window fallback: sit neatly in the bottom-right corner of the strip.
-            let x = (size[0] - 54).max(divider_x + 4);
-            let y = (size[1] - 26).max(0);
-            Some(Rect::new(x, y, 48, 22))
+        let strip_y = (size[1] - hud::STRIP).max(0);
+        const BTN_W: i32 = 48;
+        const BTN_H: i32 = 22;
+        const GAP: i32 = 4;
+        const PAIR_W: i32 = BTN_W * 2 + GAP; // 100
+
+        let pair_at = |x: i32, y: i32| {
+            (
+                Rect::new(x, y, BTN_W, BTN_H),
+                Rect::new(x + BTN_W + GAP, y, BTN_W, BTN_H),
+            )
+        };
+        let rects_overlap = |a: Rect, b: Rect| {
+            a.width > 0
+                && a.height > 0
+                && b.width > 0
+                && b.height > 0
+                && a.x < b.x + b.width
+                && a.x + a.width > b.x
+                && a.y < b.y + b.height
+                && a.y + a.height > b.y
+        };
+        let cluster_rect = Rect::new(
+            0,
+            (size[1] - hud::CLUSTER[1]).max(0),
+            hud::CLUSTER[0],
+            hud::CLUSTER[1],
+        );
+        let is_clear = |coop: Rect, saves: Rect| -> bool {
+            let inside = |r: Rect| {
+                r.x >= 0 && r.y >= 0 && r.x + r.width <= size[0] && r.y + r.height <= size[1]
+            };
+            if !inside(coop) || !inside(saves) {
+                return false;
+            }
+            if rects_overlap(coop, cluster_rect) || rects_overlap(saves, cluster_rect) {
+                return false;
+            }
+            for item in &self.items {
+                if matches!(
+                    item.kind,
+                    hud::Kind::Stretched(_)
+                        | hud::Kind::Image(hud::id::STRIP | hud::id::BACK_PATCH)
+                ) {
+                    continue;
+                }
+                if rects_overlap(coop, item.rect) || rects_overlap(saves, item.rect) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        // 1. When no subpanel tab is open, the entire right side of the Options
+        //    strip (`x > divider_x`) is empty: dock neatly beside the divider.
+        if self.controls.options.tab.is_none() {
+            let (coop, saves) = pair_at(divider_x + 12, strip_y + (hud::STRIP - BTN_H) / 2);
+            if is_clear(coop, saves) {
+                return Some((coop, saves));
+            }
         }
+
+        // 2. When a subpanel tab IS open and there is room to the right of all
+        //    subpanel controls inside the strip (e.g. 1024×768, 1280×720, or
+        //    Sound at 800×600), right-align inside the strip with >= 8 px margin.
+        let subpanel_right = self
+            .items
+            .iter()
+            .filter(|item| {
+                !matches!(
+                    item.kind,
+                    hud::Kind::Stretched(_)
+                        | hud::Kind::Image(hud::id::STRIP | hud::id::BACK_PATCH)
+                        | hud::Kind::OptionsBalloon(_)
+                        | hud::Kind::OptionsTooltip(_)
+                ) && item.rect.x >= divider_x
+            })
+            .map(|item| item.rect.x + item.rect.width)
+            .max()
+            .unwrap_or(divider_x + 2);
+        let right_x = size[0] - PAIR_W - 6;
+        if right_x >= subpanel_right + 8 {
+            let (coop, saves) = pair_at(right_x, size[1] - BTN_H - 8);
+            if is_clear(coop, saves) {
+                return Some((coop, saves));
+            }
+        }
+
+        // 3. Compact / full-width subpanel fallback (e.g. Graphics & Play at
+        //    800×600 or 640×480): dock cleanly right ABOVE the Options strip
+        //    (`y = strip_y - BTN_H - 4`), strictly right of `CLUSTER` so it can
+        //    never cover `"Export HTML"`, `"Character Detail"`, or any other
+        //    Options subpanel control.
+        let above_y = (strip_y - BTN_H - 4).max(4);
+        let min_x = hud::CLUSTER[0] + 8;
+        let max_x = (size[0] - PAIR_W - 6).max(min_x);
+        for candidate_x in [min_x, max_x, divider_x + 4, (min_x + max_x) / 2] {
+            let x = candidate_x.clamp(min_x, max_x);
+            let (coop, saves) = pair_at(x, above_y);
+            if is_clear(coop, saves) {
+                return Some((coop, saves));
+            }
+        }
+        // If an Options help balloon occupies the row immediately above the
+        // strip, step up cleanly above all floating balloons/tooltips.
+        let top_float = self
+            .items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.kind,
+                    hud::Kind::OptionsBalloon(_) | hud::Kind::OptionsTooltip(_)
+                )
+            })
+            .map(|i| i.rect.y)
+            .min()
+            .unwrap_or(above_y);
+        let lifted_y = (top_float - BTN_H - 4).max(4);
+        let (coop, saves) = pair_at(min_x.min(max_x), lifted_y);
+        Some((coop, saves))
+    }
+
+    fn compute_options_saves_button_rect(&self, size: [i32; 2]) -> Option<Rect> {
+        self.compute_options_extra_button_rects(size)
+            .map(|(_, saves)| saves)
     }
 
     fn compute_options_coop_button_rect(&self, size: [i32; 2]) -> Option<Rect> {
-        if self.controls.mode != Mode::Options || !self.controls.expanded {
-            return None;
-        }
-        let quit = self
-            .items
-            .iter()
-            .find(|i| i.command == Some(Command::OptionsAction(OptionsAction::Quit)))?;
-        let divider_x = self
-            .items
-            .iter()
-            .find(|i| {
-                matches!(
-                    i.kind,
-                    hud::Kind::Image(id) if id == options::id::TOOTHPICK_VERT
-                )
-            })
-            .map(|i| i.rect.x)?;
-        let left = quit.rect.x + quit.rect.width + 4;
-        let avail = divider_x - left - 3;
-        if avail >= 98 {
-            Some(Rect::new(left + 50, quit.rect.y + 6, 46, 28))
-        } else if avail >= 42 {
-            Some(Rect::new(left, quit.rect.y + 26, avail.min(48), 22))
-        } else {
-            let saves_x = (size[0] - 54).max(divider_x + 4);
-            let y = (size[1] - 26).max(0);
-            Some(Rect::new((saves_x - 52).max(0), y, 48, 22))
-        }
+        self.compute_options_extra_button_rects(size)
+            .map(|(coop, _)| coop)
     }
 
     fn draw_options_strip_button(&self, frame: &mut Frame, rect: Rect, label: &str, pressed: bool) {

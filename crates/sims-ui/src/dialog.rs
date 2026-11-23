@@ -17,8 +17,11 @@ use crate::art::{Art, KEY};
 use crate::command::Command;
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
+use crate::household::{Careers, Faces, Fame, money};
 use crate::hud::{LABEL, rgb565};
+use crate::thumbnail::Thumbnails;
 use crate::{Error, Result};
+use sims_content::ui_graphics::US_ENGLISH;
 use sims_content::{Catalog, Index, Install};
 use sims_formats::bitmap::{self, Image};
 use sims_formats::iff::Iff;
@@ -253,6 +256,648 @@ pub fn pending(world: &World) -> Option<&Dialog> {
     world.dialogs.records.iter().find(|r| r.status <= 1)
 }
 
+/// Optional cached UI context passed into [`Message::read_with_context`] so
+/// ordinary VM dialogs (`0..=4`) resolve `$Me`/`$Object`/`$Neighbor`/`$Job`/
+/// `$FameTitleLocal` tokens and icon modes `0, 1, 2, 4` without re-reading
+/// character or career archives from disk.
+#[derive(Default)]
+pub struct DialogContext<'a> {
+    pub faces: Option<&'a Faces>,
+    pub thumbnails: Option<&'a mut Thumbnails>,
+    pub art: Option<&'a Art>,
+    pub careers: Option<&'a Careers>,
+    pub fame: Option<&'a Fame>,
+}
+
+/// OBJD byte offsets used when resolving object display names and portraits.
+const OBJD_MASTER_OFFSET: usize = 0x14;
+const OBJD_SUB_INDEX_OFFSET: usize = 0x16;
+const OBJD_CTSS_OFFSET: usize = 0x52;
+const PERSON_KIND: u16 = 2;
+/// `BMP_` 2002 is the character portrait embedded in `Characters/*.iff` (`0x4e9338`).
+const PORTRAIT_BMP_ID: u16 = 2002;
+const FACE_SIZE: u32 = 45;
+
+/// Reads a localized catalog display name (`CATS` -> `CTSS[0]` -> `OBJD` chunk
+/// label, `0x457d3b` / `0x4061e3`) for `guid`.
+fn catalog_display_name(
+    guid: u32,
+    world: &World,
+    index: &Index,
+    catalog: &Catalog,
+    faces: Option<&Faces>,
+) -> Option<String> {
+    if let Some(name) = faces.and_then(|f| f.name(guid)).filter(|s| !s.is_empty()) {
+        return Some(name.to_owned());
+    }
+    let resolved_guid = world
+        .characters
+        .made
+        .get(&guid)
+        .map_or(guid, |made| made.template);
+    let obj = catalog.object(resolved_guid)?;
+    let res = index.resources.get(obj.resource)?;
+    let bytes = res.read().ok()?;
+    let iff = Iff::parse(bytes).ok()?;
+    let chunk = iff.get(b"OBJD", obj.chunk)?;
+    let data = iff.data(chunk);
+    if data.len() >= OBJD_CTSS_OFFSET + 2 {
+        let ctss_id = u16::from_le_bytes([data[OBJD_CTSS_OFFSET], data[OBJD_CTSS_OFFSET + 1]]);
+        if ctss_id != 0 {
+            if let Some(cats) = iff.get(b"CATS", ctss_id) {
+                let raw = iff.data(cats);
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                let name = sims_formats::strings::decode(&raw[..end], US_ENGLISH);
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+            if let Some(ctss) = iff.get(b"CTSS", ctss_id)
+                && let Ok(table) = StringTable::parse(iff.data(ctss))
+                && let Some(name) = table
+                    .get(0, US_ENGLISH)
+                    .or_else(|| table.entries.first().map(|e| e.text.as_str()))
+                && !name.is_empty()
+            {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    (!chunk.label.is_empty()).then(|| chunk.label.clone())
+}
+
+/// Resolves a multi-tile object GUID to its group master GUID (`0x45728d`).
+fn master_guid_for(guid: u32, index: &Index, catalog: &Catalog) -> u32 {
+    let Some(obj) = catalog.object(guid) else {
+        return guid;
+    };
+    let Some(res) = index.resources.get(obj.resource) else {
+        return guid;
+    };
+    let Ok(bytes) = res.read() else {
+        return guid;
+    };
+    let Ok(iff) = Iff::parse(bytes) else {
+        return guid;
+    };
+    let Some(chunk) = iff.get(b"OBJD", obj.chunk) else {
+        return guid;
+    };
+    let data = iff.data(chunk);
+    if data.len() < OBJD_SUB_INDEX_OFFSET + 2 {
+        return guid;
+    }
+    let master = i16::from_le_bytes([data[OBJD_MASTER_OFFSET], data[OBJD_MASTER_OFFSET + 1]]);
+    let sub = i16::from_le_bytes([data[OBJD_SUB_INDEX_OFFSET], data[OBJD_SUB_INDEX_OFFSET + 1]]);
+    if master == 0 || sub == -1 {
+        return guid;
+    }
+    for (&cand_guid, &idx) in &catalog.by_guid {
+        let cand = &catalog.objects[idx];
+        if cand.resource != obj.resource {
+            continue;
+        }
+        let Some(c) = iff.get(b"OBJD", cand.chunk) else {
+            continue;
+        };
+        let d = iff.data(c);
+        if d.len() >= OBJD_SUB_INDEX_OFFSET + 2 {
+            let cm = i16::from_le_bytes([d[OBJD_MASTER_OFFSET], d[OBJD_MASTER_OFFSET + 1]]);
+            let cs = i16::from_le_bytes([d[OBJD_SUB_INDEX_OFFSET], d[OBJD_SUB_INDEX_OFFSET + 1]]);
+            if cm == master && cs == -1 {
+                return cand_guid;
+            }
+        }
+    }
+    guid
+}
+
+/// Returns whether `guid` is a person object definition (`OBJD +0x12 == 2`).
+fn is_person_guid(guid: u32, world: &World, catalog: &Catalog) -> bool {
+    if world.characters.made.contains_key(&guid) {
+        return true;
+    }
+    if world
+        .objects
+        .values()
+        .any(|o| o.guid == guid && o.person.is_some())
+    {
+        return true;
+    }
+    if world
+        .neighbors
+        .slots
+        .iter()
+        .flatten()
+        .any(|n| n.guid == guid)
+    {
+        return true;
+    }
+    catalog.object(guid).is_some_and(|o| o.kind == PERSON_KIND)
+}
+
+/// Normalizes a character portrait bitmap into a 45×45 face image so
+/// `dialog::layout` backs it with `SimStub.BMP` (`4992`, `0x524a6c..0x524ae7`).
+fn normalize_face_45(src: &Image) -> Image {
+    if src.width == FACE_SIZE && src.height == FACE_SIZE {
+        return src.clone();
+    }
+    // Many character `BMP_ 2002` strips pack multiple square cells side by side.
+    let src_w =
+        if src.height > 0 && src.width >= src.height * 2 && src.width.is_multiple_of(src.height) {
+            src.height
+        } else {
+            src.width.max(1)
+        };
+    let src_h = src.height.max(1);
+    let mut rgba = vec![0u8; (FACE_SIZE * FACE_SIZE * 4) as usize];
+    for y in 0..FACE_SIZE {
+        let sy = ((u64::from(y) * u64::from(src_h)) / u64::from(FACE_SIZE))
+            .min(u64::from(src_h - 1)) as u32;
+        for x in 0..FACE_SIZE {
+            let sx = ((u64::from(x) * u64::from(src_w)) / u64::from(FACE_SIZE))
+                .min(u64::from(src_w - 1)) as u32;
+            if let Some(px) = src.pixel(sx, sy) {
+                let off = ((y * FACE_SIZE + x) * 4) as usize;
+                rgba[off..off + 4].copy_from_slice(&px);
+            }
+        }
+    }
+    Image {
+        width: FACE_SIZE,
+        height: FACE_SIZE,
+        rgba,
+    }
+}
+
+/// Resolves a 45×45 person portrait for `guid` (backed by `SimStub.BMP` `4992`).
+fn resolve_person_portrait(
+    guid: u32,
+    world: &World,
+    index: &Index,
+    catalog: &Catalog,
+    faces: Option<&Faces>,
+) -> Option<Image> {
+    if let Some(face) = faces.and_then(|f| f.face(guid)) {
+        return Some(normalize_face_45(face));
+    }
+    let lookup_guid = world
+        .characters
+        .made
+        .get(&guid)
+        .map_or(guid, |made| made.template);
+    if let Some(face) = faces.and_then(|f| f.face(lookup_guid)) {
+        return Some(normalize_face_45(face));
+    }
+    let obj = catalog.object(lookup_guid)?;
+    let res = index.resources.get(obj.resource)?;
+    let bytes = res.read().ok()?;
+    let iff = Iff::parse(bytes).ok()?;
+    let chunk = iff
+        .get(b"BMP_", PORTRAIT_BMP_ID)
+        .or_else(|| iff.get(b"BMP_", 2001))
+        .or_else(|| iff.get(b"BMP_", 2000))?;
+    let mut img = bitmap::bmp(iff.data(chunk)).ok()?;
+    img.key(KEY);
+    Some(normalize_face_45(&img))
+}
+
+/// Resolves a catalog icon / thumbnail for non-person object `guid`.
+fn resolve_object_icon(
+    guid: u32,
+    index: &Index,
+    catalog: &Catalog,
+    thumbnails: Option<&mut Thumbnails>,
+    art: Option<&Art>,
+) -> Option<Image> {
+    let master = master_guid_for(guid, index, catalog);
+    let extract = |thumbs: &mut Thumbnails| -> Option<Image> {
+        let _ = thumbs.read(index, catalog, master);
+        if let Some(art) = art
+            && let Some(icon) = thumbs.icon(art, master)
+        {
+            return Some(icon);
+        }
+        let thumb = thumbs.item(master).and_then(|i| i.thumbnail.as_ref())?;
+        let w = if thumb.width > crate::thumbnail::SIZE {
+            thumb.width / 2
+        } else {
+            thumb.width
+        };
+        let h = thumb.height;
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                if let Some(px) = thumb.pixel(x, y) {
+                    let off = ((y * w + x) * 4) as usize;
+                    rgba[off..off + 4].copy_from_slice(&px);
+                }
+            }
+        }
+        Some(Image {
+            width: w,
+            height: h,
+            rgba,
+        })
+    };
+    if let Some(thumbs) = thumbnails {
+        extract(thumbs)
+    } else {
+        let mut temp = Thumbnails::default();
+        extract(&mut temp)
+    }
+}
+
+/// Resolves either a 45×45 person portrait or a catalog object icon for `guid`.
+fn resolve_guid_icon(
+    guid: u32,
+    world: &World,
+    index: &Index,
+    catalog: &Catalog,
+    faces: Option<&Faces>,
+    thumbnails: Option<&mut Thumbnails>,
+    art: Option<&Art>,
+) -> Option<Image> {
+    if is_person_guid(guid, world, catalog)
+        && let Some(portrait) = resolve_person_portrait(guid, world, index, catalog, faces)
+    {
+        return Some(portrait);
+    }
+    resolve_object_icon(guid, index, catalog, thumbnails, art)
+}
+
+/// Parses optional `:N` and `:M` integer suffixes after a `$Local` / `$TimeLocal`
+/// / `$NeighborLocal` / `$Job*` token (`0x44caf6`).
+fn parse_token_numbers(bytes: &[u8], mut end: usize) -> (i32, i32, usize) {
+    let mut numbers = [-1i32; 2];
+    for slot in &mut numbers {
+        if bytes.get(end) != Some(&b':') {
+            break;
+        }
+        end += 1;
+        let digits = bytes[end..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits > 0 {
+            *slot = bytes[end..end + digits].iter().take(15).fold(0i32, |n, d| {
+                n.wrapping_mul(10).wrapping_add(i32::from(d - b'0'))
+            });
+        }
+        end += digits;
+    }
+    (numbers[0], numbers[1], end)
+}
+
+/// Replaces each occurrence of `token` in `text` with `replacement`, advancing
+/// past the substituted bytes so names containing `$` cannot loop forever.
+fn replace_token_safe(text: &str, token: &str, replacement: &str) -> String {
+    if !text.contains(token) {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(token) {
+        out.push_str(&rest[..at]);
+        out.push_str(replacement);
+        rest = &rest[at + token.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Formats an hour in `[0, 24)` in US English (`0x4a6ab1` -> `0x5fe51e`:
+/// `"%2u:00 am/pm"`).
+fn format_hour(hour: i16) -> String {
+    let suffix = if hour < 12 { "am" } else { "pm" };
+    let display = if hour == 0 {
+        12
+    } else if hour > 12 {
+        hour - 12
+    } else {
+        hour
+    };
+    format!("{display:2}:00 {suffix}")
+}
+
+/// Formats one ordinary dialog string through the Complete Collection 1.91
+/// `0x44bf1a` pass order without mutating `world`.
+///
+/// Updates `portrait_guid` whenever `$Object`, `$NeighborLocal`, or `$Neighbor`
+/// resolves a valid entity (matching `[ebp+0x14]` in `0x44bf1a`).
+#[allow(clippy::too_many_arguments)]
+fn format_dialog_text(
+    input: &str,
+    caller: u16,
+    world: &World,
+    index: &Index,
+    catalog: &Catalog,
+    faces: Option<&Faces>,
+    careers: Option<&Careers>,
+    fame: Option<&Fame>,
+    portrait_guid: &mut Option<u32>,
+) -> String {
+    if !input.contains('$') {
+        return input.to_owned();
+    }
+    let mut text = input.to_owned();
+    let caller_obj = world.objects.get(&caller);
+    let top_frame = caller_obj.and_then(|o| o.stack.last());
+    let locals: &[i16] = top_frame.map_or(&[], |f| f.locals.as_slice());
+    let stack_object = top_frame.map_or(0, |f| f.stack_object);
+    let stack_obj = u16::try_from(stack_object)
+        .ok()
+        .and_then(|id| world.objects.get(&id));
+    let neighbor_rec = world.neighbors.get(stack_object);
+
+    // Pass 1: `$FamilyAssets` and `$Family`.
+    if text.contains("$FamilyAssets") {
+        let assets_str = money(world.budget.funds);
+        text = replace_token_safe(&text, "$FamilyAssets", &assets_str);
+    }
+    if text.contains("$Family") {
+        // Fallback to active household's first resident name when family surname is absent.
+        let family_name = caller_obj
+            .and_then(|o| catalog_display_name(o.guid, world, index, catalog, faces))
+            .unwrap_or_default();
+        if !family_name.is_empty() {
+            text = replace_token_safe(&text, "$Family", &family_name);
+        }
+    }
+
+    // Pass 2: `$Me` (`0x44c0fc`).
+    if text.contains("$Me")
+        && let Some(obj) = caller_obj
+        && let Some(name) = catalog_display_name(obj.guid, world, index, catalog, faces)
+    {
+        text = replace_token_safe(&text, "$Me", &name);
+    }
+
+    // Pass 3: `$Object` (`0x44c155`).
+    if text.contains("$Object")
+        && let Some(obj) = stack_obj
+    {
+        *portrait_guid = Some(obj.guid);
+        if let Some(name) = catalog_display_name(obj.guid, world, index, catalog, faces) {
+            text = replace_token_safe(&text, "$Object", &name);
+        }
+    }
+
+    // Pass 4: `$Local:N` (`0x44c1f2`; `$$Local:N` naturally preserves the leading `$`).
+    if text.contains("$Local") {
+        let mut out = text.clone();
+        let mut from = 0;
+        while let Some(at) = out
+            .get(from..)
+            .and_then(|s| s.find("$Local"))
+            .map(|i| i + from)
+        {
+            let (n, _, end) = parse_token_numbers(out.as_bytes(), at + "$Local".len());
+            if let Ok(idx) = usize::try_from(n)
+                && idx < locals.len()
+            {
+                let val = locals[idx].to_string();
+                out.replace_range(at..end, &val);
+                from = at + val.len();
+            } else {
+                from = at + "$Local".len();
+            }
+        }
+        text = out;
+    }
+
+    // Pass 5: `$Attrib:N`, `$NameAttrib:N`, `$NameLocal:N`, `$TokenNameLocal:N`.
+    if text.contains("$Attrib")
+        && let Some(obj) = stack_obj
+    {
+        let mut out = text.clone();
+        let mut from = 0;
+        while let Some(at) = out
+            .get(from..)
+            .and_then(|s| s.find("$Attrib"))
+            .map(|i| i + from)
+        {
+            let (n, _, end) = parse_token_numbers(out.as_bytes(), at + "$Attrib".len());
+            if let Ok(idx) = usize::try_from(n)
+                && let Some(&val) = obj.attributes.get(idx)
+            {
+                let s = val.to_string();
+                out.replace_range(at..end, &s);
+                from = at + s.len();
+            } else {
+                from = at + "$Attrib".len();
+            }
+        }
+        text = out;
+    }
+    if text.contains("$NameAttrib")
+        && let Some(obj) = stack_obj
+    {
+        let mut out = text.clone();
+        let mut from = 0;
+        while let Some(at) = out
+            .get(from..)
+            .and_then(|s| s.find("$NameAttrib"))
+            .map(|i| i + from)
+        {
+            let (n, _, end) = parse_token_numbers(out.as_bytes(), at + "$NameAttrib".len());
+            if let Ok(idx) = usize::try_from(n)
+                && let Some(&attr_val) = obj.attributes.get(idx)
+                && let Ok(oid) = u16::try_from(attr_val)
+                && let Some(target) = world.objects.get(&oid)
+                && let Some(name) = catalog_display_name(target.guid, world, index, catalog, faces)
+            {
+                out.replace_range(at..end, &name);
+                from = at + name.len();
+            } else {
+                from = at + "$NameAttrib".len();
+            }
+        }
+        text = out;
+    }
+    if text.contains("$NameLocal") {
+        let mut out = text.clone();
+        let mut from = 0;
+        while let Some(at) = out
+            .get(from..)
+            .and_then(|s| s.find("$NameLocal"))
+            .map(|i| i + from)
+        {
+            let (n, _, end) = parse_token_numbers(out.as_bytes(), at + "$NameLocal".len());
+            if let Ok(idx) = usize::try_from(n)
+                && idx < locals.len()
+                && let Ok(oid) = u16::try_from(locals[idx])
+                && let Some(target) = world.objects.get(&oid)
+                && let Some(name) = catalog_display_name(target.guid, world, index, catalog, faces)
+            {
+                out.replace_range(at..end, &name);
+                from = at + name.len();
+            } else {
+                from = at + "$NameLocal".len();
+            }
+        }
+        text = out;
+    }
+
+    // Pass 6: `$NeighborLocal:N` (`0x44c590`).
+    if text.contains("$NeighborLocal") {
+        let mut out = text.clone();
+        let mut from = 0;
+        while let Some(at) = out
+            .get(from..)
+            .and_then(|s| s.find("$NeighborLocal"))
+            .map(|i| i + from)
+        {
+            let (n, _, end) = parse_token_numbers(out.as_bytes(), at + "$NeighborLocal".len());
+            if let Ok(idx) = usize::try_from(n)
+                && idx < locals.len()
+                && let Some(rec) = world.neighbors.get(locals[idx])
+            {
+                *portrait_guid = Some(rec.guid);
+                if let Some(name) = catalog_display_name(rec.guid, world, index, catalog, faces) {
+                    out.replace_range(at..end, &name);
+                    from = at + name.len();
+                    continue;
+                }
+            }
+            from = at + "$NeighborLocal".len();
+        }
+        text = out;
+    }
+
+    // Pass 7: `$Neighbor` (`0x44c65f`).
+    if text.contains("$Neighbor")
+        && let Some(rec) = neighbor_rec
+    {
+        *portrait_guid = Some(rec.guid);
+        if let Some(name) = catalog_display_name(rec.guid, world, index, catalog, faces) {
+            text = replace_token_safe(&text, "$Neighbor", &name);
+        }
+    }
+
+    // Pass 8: `$FameTitleLocal:N` and `$Grade`.
+    if text.contains("$FameTitleLocal")
+        && let Some(fame) = fame
+    {
+        let mut out = text.clone();
+        let mut from = 0;
+        while let Some(at) = out
+            .get(from..)
+            .and_then(|s| s.find("$FameTitleLocal"))
+            .map(|i| i + from)
+        {
+            let (n, _, end) = parse_token_numbers(out.as_bytes(), at + "$FameTitleLocal".len());
+            if let Ok(idx) = usize::try_from(n)
+                && idx < locals.len()
+            {
+                let title = fame.level_title(locals[idx]);
+                if !title.is_empty() {
+                    out.replace_range(at..end, title);
+                    from = at + title.len();
+                    continue;
+                }
+            }
+            from = at + "$FameTitleLocal".len();
+        }
+        text = out;
+    }
+
+    // Lazily load `work.iff` careers only if a `$Grade` or `$Job*` token is present
+    // and the caller did not supply a cached `&Careers`.
+    let needs_careers = text.contains("$Grade")
+        || text.contains("$JobOffer")
+        || text.contains("$JobDesc")
+        || text.contains("$Job");
+    let loaded_careers = if needs_careers && careers.is_none() {
+        Careers::load(index).ok()
+    } else {
+        None
+    };
+    let careers_ref = careers.or(loaded_careers.as_ref());
+
+    if text.contains("$Grade")
+        && let Some(c) = careers_ref
+        && let Some(person) = caller_obj.and_then(|o| o.person.as_ref())
+    {
+        let grade = c.grade(person.data.get(57).copied().unwrap_or(0));
+        if !grade.is_empty() {
+            text = replace_token_safe(&text, "$Grade", grade);
+        }
+    }
+
+    // Pass 9: `$TimeLocal:N` (`0x44c8c4`).
+    if text.contains("$TimeLocal") {
+        let mut out = text.clone();
+        let mut from = 0;
+        while let Some(at) = out
+            .get(from..)
+            .and_then(|s| s.find("$TimeLocal"))
+            .map(|i| i + from)
+        {
+            let (n, _, end) = parse_token_numbers(out.as_bytes(), at + "$TimeLocal".len());
+            if let Ok(idx) = usize::try_from(n)
+                && idx < locals.len()
+                && (0..24).contains(&locals[idx])
+            {
+                let formatted = format_hour(locals[idx]);
+                out.replace_range(at..end, &formatted);
+                from = at + formatted.len();
+            } else {
+                from = at + "$TimeLocal".len();
+            }
+        }
+        text = out;
+    }
+
+    // Pass 10: `$JobOffer`, `$JobDesc`, `$Job` (`0x44c966`).
+    if let Some(c) = careers_ref
+        && let Some(person) = caller_obj.and_then(|o| o.person.as_ref())
+    {
+        let default_career = person.data.get(56).copied().unwrap_or(0);
+        let default_level = i32::from(person.data.get(57).copied().unwrap_or(0));
+        let female = (person.data.get(65).copied().unwrap_or(0) & 1) != 0;
+        for token in ["$JobOffer", "$JobDesc", "$Job"] {
+            if !text.contains(token) {
+                continue;
+            }
+            let mut out = text.clone();
+            let mut from = 0;
+            while let Some(at) = out
+                .get(from..)
+                .and_then(|s| s.find(token))
+                .map(|i| i + from)
+            {
+                let (n1, n2, end) = parse_token_numbers(out.as_bytes(), at + token.len());
+                let (career_id, level) = match (usize::try_from(n1), usize::try_from(n2)) {
+                    (Ok(i1), Ok(i2)) if i1 < locals.len() && i2 < locals.len() => {
+                        (locals[i1], i32::from(locals[i2]))
+                    }
+                    (Ok(i1), _) if i1 < locals.len() => (locals[i1], default_level),
+                    _ => (default_career, default_level),
+                };
+                let replacement = match token {
+                    "$JobOffer" => c
+                        .offer(career_id)
+                        .or_else(|| c.title(career_id, level, female)),
+                    "$JobDesc" => c.description(career_id, level),
+                    _ => c.title(career_id, level, female),
+                };
+                if let Some(rep) = replacement
+                    && !rep.is_empty()
+                {
+                    out.replace_range(at..end, rep);
+                    from = at + rep.len();
+                } else {
+                    from = at + token.len();
+                }
+            }
+            text = out;
+        }
+    }
+
+    text
+}
+
 impl Message {
     /// Builds a modal notice dialog with one button (for UI/host dialogs
     /// outside the simulation, with `caller == 0`).
@@ -365,9 +1010,10 @@ impl Message {
         self
     }
 
-    /// Reads what `dialog` shows. None when the caller, its code owner or
-    /// its file is gone, or the dialog is of a kind that is not ported
-    /// (text entry and the special panels).
+    /// Reads what `dialog` shows, running `0x44bf1a` string formatting,
+    /// caller display-name title fallback (`0x457d3b`), and icon modes
+    /// `0, 1, 2, 3, 4` (`0x436279..0x4363b5`). Returns `None` when the caller,
+    /// its code owner, or its file is gone, or the dialog is a special panel.
     pub fn read(
         world: &World,
         index: &Index,
@@ -375,10 +1021,32 @@ impl Message {
         labels: &Labels,
         dialog: &Dialog,
     ) -> Result<Option<Self>> {
-        let Some(owner) = world
-            .objects
-            .get(&dialog.caller)
-            .and_then(|o| o.stack.last())
+        Self::read_with_context(
+            world,
+            index,
+            catalog,
+            labels,
+            dialog,
+            &mut DialogContext::default(),
+        )
+    }
+
+    /// Like [`Message::read`], using cached HUD faces, thumbnails, art,
+    /// careers, and fame tables when available.
+    pub fn read_with_context(
+        world: &World,
+        index: &Index,
+        catalog: &Catalog,
+        labels: &Labels,
+        dialog: &Dialog,
+        ctx: &mut DialogContext<'_>,
+    ) -> Result<Option<Self>> {
+        let Some(caller_obj) = world.objects.get(&dialog.caller) else {
+            return Ok(None);
+        };
+        let Some(owner) = caller_obj
+            .stack
+            .last()
             .and_then(|f| u16::try_from(f.code_owner_type).ok())
             .and_then(|t| world.types.get(&t))
             .and_then(|&guid| catalog.object(guid))
@@ -387,7 +1055,188 @@ impl Message {
             return Ok(None);
         };
         let iff = Iff::parse(owner.read().map_err(Error::Content)?).map_err(Error::Format)?;
-        Self::from_file(&iff, labels, dialog.caller, &dialog.operands)
+        let Some(mut msg) = Self::from_file(&iff, labels, dialog.caller, &dialog.operands)? else {
+            return Ok(None);
+        };
+
+        // 0x457d3b: when operand 6 is 0 (or yields an empty title), fall back
+        // to the caller object's localized catalog display name (`CTSS[0]`).
+        if msg.title.is_empty()
+            && let Some(caller_name) =
+                catalog_display_name(caller_obj.guid, world, index, catalog, ctx.faces)
+        {
+            msg.title = caller_name;
+        }
+
+        // 0x436219..0x436265: format buttons, title, and body through `0x44bf1a`,
+        // tracking `[ebp+0x14]` portrait GUID written by `$Object` / `$Neighbor`.
+        let mut portrait_guid = None;
+        for btn in &mut msg.buttons {
+            *btn = format_dialog_text(
+                btn,
+                dialog.caller,
+                world,
+                index,
+                catalog,
+                ctx.faces,
+                ctx.careers,
+                ctx.fame,
+                &mut portrait_guid,
+            );
+        }
+        msg.title = format_dialog_text(
+            &msg.title,
+            dialog.caller,
+            world,
+            index,
+            catalog,
+            ctx.faces,
+            ctx.careers,
+            ctx.fame,
+            &mut portrait_guid,
+        );
+        msg.text = format_dialog_text(
+            &msg.text,
+            dialog.caller,
+            world,
+            index,
+            catalog,
+            ctx.faces,
+            ctx.careers,
+            ctx.fame,
+            &mut portrait_guid,
+        );
+
+        // 0x436279..0x4363b5: resolve icon modes 0, 1, 2, 4 alongside mode 3.
+        let icon_mode = (dialog.operands[7] >> 1) & 7;
+        let stack_object = caller_obj.stack.last().map_or(0, |f| f.stack_object);
+        let stack_obj_guid = u16::try_from(stack_object)
+            .ok()
+            .and_then(|id| world.objects.get(&id))
+            .map(|o| o.guid);
+        let stack_neighbor_guid = world.neighbors.get(stack_object).map(|n| n.guid);
+        if msg.icon.is_none() {
+            match icon_mode {
+                // Mode 0 (auto): `$Object`/`$Neighbor` portrait GUID, else stack
+                // object's master GUID, else caller's portrait/icon.
+                0 => {
+                    msg.icon = portrait_guid
+                        .and_then(|g| {
+                            resolve_guid_icon(
+                                g,
+                                world,
+                                index,
+                                catalog,
+                                ctx.faces,
+                                ctx.thumbnails.as_deref_mut(),
+                                ctx.art,
+                            )
+                        })
+                        .or_else(|| {
+                            stack_obj_guid.and_then(|g| {
+                                resolve_guid_icon(
+                                    g,
+                                    world,
+                                    index,
+                                    catalog,
+                                    ctx.faces,
+                                    ctx.thumbnails.as_deref_mut(),
+                                    ctx.art,
+                                )
+                            })
+                        })
+                        .or_else(|| {
+                            resolve_guid_icon(
+                                caller_obj.guid,
+                                world,
+                                index,
+                                catalog,
+                                ctx.faces,
+                                ctx.thumbnails.as_deref_mut(),
+                                ctx.art,
+                            )
+                        });
+                }
+                // Mode 1 (neighbor / person 45×45 portrait over SimStub.BMP 4992).
+                1 => {
+                    let target = stack_neighbor_guid
+                        .or(portrait_guid)
+                        .or(stack_obj_guid)
+                        .unwrap_or(caller_obj.guid);
+                    msg.icon = resolve_person_portrait(target, world, index, catalog, ctx.faces)
+                        .or_else(|| {
+                            resolve_guid_icon(
+                                target,
+                                world,
+                                index,
+                                catalog,
+                                ctx.faces,
+                                ctx.thumbnails.as_deref_mut(),
+                                ctx.art,
+                            )
+                        })
+                        .or_else(|| {
+                            resolve_person_portrait(
+                                caller_obj.guid,
+                                world,
+                                index,
+                                catalog,
+                                ctx.faces,
+                            )
+                        });
+                }
+                // Mode 2 (stack object thumbnail/icon or stack neighbor portrait).
+                2 => {
+                    msg.icon = stack_obj_guid
+                        .and_then(|g| {
+                            resolve_guid_icon(
+                                g,
+                                world,
+                                index,
+                                catalog,
+                                ctx.faces,
+                                ctx.thumbnails.as_deref_mut(),
+                                ctx.art,
+                            )
+                        })
+                        .or_else(|| {
+                            stack_neighbor_guid.and_then(|g| {
+                                resolve_person_portrait(g, world, index, catalog, ctx.faces)
+                            })
+                        })
+                        .or_else(|| {
+                            resolve_guid_icon(
+                                caller_obj.guid,
+                                world,
+                                index,
+                                catalog,
+                                ctx.faces,
+                                ctx.thumbnails.as_deref_mut(),
+                                ctx.art,
+                            )
+                        });
+                }
+                // Mode 4 (caller/person face portrait).
+                4 => {
+                    msg.icon =
+                        resolve_person_portrait(caller_obj.guid, world, index, catalog, ctx.faces)
+                            .or_else(|| {
+                                resolve_guid_icon(
+                                    caller_obj.guid,
+                                    world,
+                                    index,
+                                    catalog,
+                                    ctx.faces,
+                                    ctx.thumbnails.as_deref_mut(),
+                                    ctx.art,
+                                )
+                            });
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Some(msg))
     }
 
     /// Reads what a Dialog instruction with `operands` shows, from the
@@ -3102,5 +3951,22 @@ mod tests {
         draw_with_state_alpha(&mut f255, &art, &msg, &laid, None, &state, 255);
         draw_with_state(&mut direct, &art, &msg, &laid, None, &state);
         assert_eq!(f255.rgb(), direct.rgb());
+    }
+
+    #[test]
+    fn token_parsers_and_formatters_handle_edge_cases() {
+        assert_eq!(parse_token_numbers(b"$Local:3:12x", 6), (3, 12, 11));
+        assert_eq!(parse_token_numbers(b"$Local:0!", 6), (0, -1, 8));
+        assert_eq!(parse_token_numbers(b"$Local ", 6), (-1, -1, 6));
+        assert_eq!(format_hour(0), "12:00 am");
+        assert_eq!(format_hour(9), " 9:00 am");
+        assert_eq!(format_hour(12), "12:00 pm");
+        assert_eq!(format_hour(13), " 1:00 pm");
+        assert_eq!(format_hour(23), "11:00 pm");
+        // Replacement containing the token itself must not loop.
+        assert_eq!(
+            replace_token_safe("Hi $Me and $Me!", "$Me", "$Me$"),
+            "Hi $Me$ and $Me$!"
+        );
     }
 }

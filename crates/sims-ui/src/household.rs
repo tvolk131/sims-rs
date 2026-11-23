@@ -134,6 +134,9 @@ pub struct Resident {
     /// What the job panel's left column shows: the default until
     /// [`Snapshot::with_careers`] fills it in.
     pub work: Work,
+    /// The 19 interest scores (`0..=1000`, 100 per bar segment) in native
+    /// `cWinInterests` order (`0x50f595..0x50f6a6`, [`INTEREST_WORDS`]).
+    pub interests: [i16; 19],
 }
 
 impl Resident {
@@ -263,6 +266,30 @@ fn nearest_sign(traits: [i16; 5]) -> u8 {
 /// Cooking, Mechanical, Charisma, Body, Logic and Creativity (0x66dfec).
 pub const SKILLS: [usize; 6] = [10, 12, 11, 17, 18, 15];
 
+/// The person data words of the 19 interests in native `cWinInterests` order
+/// (`0x50f595..0x50f6a6`, UIGraphics IDs `1600..=1618`, `Live.iff STR# 140[1..=19]`):
+/// - `0..=7`: Travel, Money, Politics, The 60's, Weather, Sports, Music, Outdoors (`46..=53`)
+/// - `8..=11`: Child-only Toys, Aliens, Pets, School (share `46..=49`)
+/// - `12..=18`: Exercise (`13`), Food (`14`), Parties (`16`), Style (`20`),
+///   Hollywood (`26`), Technology (`54`), Romance (`55`).
+pub const INTEREST_WORDS: [usize; 19] = [
+    46, 47, 48, 49, 50, 51, 52, 53, 46, 47, 48, 49, 13, 14, 16, 20, 26, 54, 55,
+];
+
+/// One inventory token displayed in the Live HUD Gifts/Inventory subpanel
+/// (`Panel::Gifts`, `4507`, `0x51e343..0x51e440`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryEntry {
+    /// Native inventory token kind (`0, 4, 5` Gifts; `7` Magic; `8` Other).
+    pub kind: i32,
+    /// Catalog object GUID of the token.
+    pub guid: u32,
+    /// Quantity carried by the selected Sim.
+    pub count: u16,
+    /// Localized display name from the object's `CTSS` / `OBJD`.
+    pub name: String,
+}
+
 /// The person data words of the career and the level in it.
 const JOB: [usize; 2] = [56, 57];
 
@@ -346,6 +373,9 @@ pub struct Snapshot {
     /// What the house panel shows: nothing until [`Snapshot::with_house`]
     /// works it out.
     pub house: House,
+    /// The selected Sim's inventory tokens (`Neighbor.inventory`, `0x51e343`):
+    /// empty until [`Snapshot::with_inventory`] reads them.
+    pub inventory: Vec<InventoryEntry>,
 }
 
 /// What the relationship panel needs from outside the world: the
@@ -481,6 +511,7 @@ impl Snapshot {
                     fame_needs: [0; 6],
                     fame_friends_text: String::new(),
                     work: Work::default(),
+                    interests: INTEREST_WORDS.map(data),
                 });
             }
         }
@@ -507,6 +538,7 @@ impl Snapshot {
             relations: Vec::new(),
             superstar: false,
             house: House::default(),
+            inventory: Vec::new(),
         }
     }
 
@@ -594,6 +626,62 @@ impl Snapshot {
                 }
             });
         }
+        self
+    }
+
+    /// Populates [`Snapshot::inventory`] for the selected Sim from
+    /// `world.neighbors.inventories` (`0x51e375..0x51e3a7`), resolving each
+    /// token's display name via `resolve_name`.
+    #[must_use]
+    pub fn with_inventory(
+        mut self,
+        world: &World,
+        mut resolve_name: impl FnMut(u32) -> String,
+    ) -> Self {
+        let selected_guid = self.selected_guid.or_else(|| {
+            self.selected
+                .and_then(|id| world.objects.get(&id))
+                .map(|o| o.guid)
+        });
+        let Some(guid) = selected_guid else {
+            self.inventory.clear();
+            return self;
+        };
+        let neighbor_id = world
+            .neighbors
+            .slots
+            .iter()
+            .flatten()
+            .find(|n| n.guid == guid)
+            .map(|n| n.id);
+        let Some(neighbor_id) = neighbor_id else {
+            self.inventory.clear();
+            return self;
+        };
+        self.inventory = world
+            .neighbors
+            .inventories
+            .iter()
+            .find(|inv| inv.neighbor == neighbor_id)
+            .map(|inv| {
+                inv.items
+                    .iter()
+                    .filter(|item| item.count > 0)
+                    .map(|item| {
+                        let mut name = resolve_name(item.guid);
+                        if name.is_empty() {
+                            name = format!("0x{:08X}", item.guid);
+                        }
+                        InventoryEntry {
+                            kind: item.kind,
+                            guid: item.guid,
+                            count: item.count,
+                            name,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         self
     }
 
@@ -708,6 +796,10 @@ pub struct Careers {
     careers: BTreeMap<i16, Vec<Level>>,
     /// Each career's levels' titles, a man's and a woman's.
     titles: BTreeMap<i16, Vec<[String; 2]>>,
+    /// Each career's levels' descriptions (`STR#` entry `4 + 2*k`).
+    descriptions: BTreeMap<i16, Vec<String>>,
+    /// Each career's track/offer name (`STR#` entry `0` / `1`).
+    offers: BTreeMap<i16, String>,
     /// School grade strings (`work.iff STR# 4097`, `"A+"` .. `"F (off to military school)"`).
     grades: Vec<String>,
 }
@@ -769,7 +861,16 @@ impl Careers {
                 let titles = (0..career.levels.len())
                     .map(|k| [text(3 + 2 * k), text(23 + k)])
                     .collect();
+                let descriptions = (0..career.levels.len()).map(|k| text(4 + 2 * k)).collect();
+                let offer = {
+                    let s1 = text(1);
+                    if !s1.is_empty() { s1 } else { text(0) }
+                };
                 out.titles.insert(id, titles);
+                out.descriptions.insert(id, descriptions);
+                if !offer.is_empty() {
+                    out.offers.insert(id, offer);
+                }
             }
             out.careers.insert(id, career.levels);
         }
@@ -820,6 +921,22 @@ impl Careers {
         } else {
             man
         })
+    }
+
+    /// The description of level `level` of career `career` (`STR#` entry `4 + 2*k`),
+    /// used by `$JobDesc` (`0x44c966`).
+    pub fn description(&self, career: i16, level: i32) -> Option<&str> {
+        self.descriptions
+            .get(&career)?
+            .get(usize::try_from(level).ok()?)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// The career offer/track title for `career` (`STR#` entry `1` / `0`),
+    /// used by `$JobOffer` (`0x44c966`).
+    pub fn offer(&self, career: i16) -> Option<&str> {
+        self.offers.get(&career).map(String::as_str)
     }
 
     /// Level `level` (from 0) of career `career`, if both exist.
@@ -1371,6 +1488,7 @@ mod tests {
             relations: Vec::new(),
             superstar: false,
             house: House::default(),
+            inventory: Vec::new(),
         }
     }
 
@@ -1601,6 +1719,7 @@ mod tests {
             fame_needs: [0; 6],
             fame_friends_text: String::new(),
             work: Work::default(),
+            interests: [0; 19],
         };
         let mut s = snapshot(0, 0, 0);
         s.residents = vec![resident([9, 0]), resident([9, 1]), resident([0, 0])];
@@ -1671,6 +1790,7 @@ mod tests {
             fame_needs: [0; 6],
             fame_friends_text: String::new(),
             work: Work::default(),
+            interests: [0; 19],
         };
         let mut s = snapshot(0, 0, 0);
         s.residents = vec![

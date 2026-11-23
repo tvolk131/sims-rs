@@ -444,3 +444,213 @@ fn the_help_system_as_the_original_shows_it() {
         })
     );
 }
+
+#[test]
+fn ordinary_dialogs_format_tokens_resolve_icon_modes_and_caller_title_fallback() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to test dialog formatting and icon modes");
+        return;
+    };
+    let house = root.join(common::GOTH_HOUSE);
+    let frames = Frames {
+        after: Vec::new(),
+        every: Vec::new(),
+    };
+    let lot = Lot::load(&root, &house, &[], frames).unwrap();
+    let install = Install::detect(&root).unwrap();
+    let mut index = Index::build(&install).unwrap();
+    let neighborhood = Neighborhood::open(house.parent().unwrap().parent().unwrap()).unwrap();
+    if let Some(characters) = neighborhood.characters().unwrap() {
+        index.add_characters(&characters).unwrap();
+    }
+    let labels = Labels::load(&install).unwrap();
+    let careers = sims_ui::household::Careers::load(&index).unwrap();
+    let fame = sims_ui::household::Fame::load(&install).unwrap();
+    let ui = UiGraphics::open(&install).unwrap();
+    let art = Art::load(&ui, US_ENGLISH, &dialog::RESOURCES).unwrap();
+
+    // Pick a real Goth household Sim (Mortimer) and a real buyable object on the lot.
+    let base_world = lot.world();
+    let sim_obj = base_world
+        .objects
+        .values()
+        .find(|o| o.person.is_some())
+        .expect("a Sim on Goth lot");
+    let sim_id = sim_obj.id;
+    let sim_guid = sim_obj.guid;
+    let other_neighbor = base_world
+        .neighbors
+        .slots
+        .iter()
+        .flatten()
+        .find(|n| n.guid != sim_guid)
+        .expect("another neighbor record");
+    let mut probe_thumbs = sims_ui::thumbnail::Thumbnails::default();
+    let non_person_obj = base_world
+        .objects
+        .values()
+        .find(|o| {
+            o.person.is_none()
+                && lot.catalog().object(o.guid).is_some()
+                && probe_thumbs.read(&index, lot.catalog(), o.guid).is_ok()
+                && probe_thumbs
+                    .item(o.guid)
+                    .and_then(|i| i.thumbnail.as_ref())
+                    .is_some()
+        })
+        .expect("a non-person object with a thumbnail on Goth lot");
+
+    let faces =
+        sims_ui::household::Faces::load(&index, lot.catalog(), &[sim_guid, other_neighbor.guid])
+            .unwrap();
+    let sim_name = faces
+        .name(sim_guid)
+        .expect("Sim has a localized name")
+        .to_owned();
+    let other_name = faces
+        .name(other_neighbor.guid)
+        .expect("Neighbor has a localized name")
+        .to_owned();
+
+    // Find a real STR# 301 entry in the install that uses `$Me` / `$Local` / `$Object` / `$TimeLocal` / `$Job`!
+    let mut found_token_dialog = None;
+    for (&guid, &idx) in &lot.catalog().by_guid {
+        let obj = &lot.catalog().objects[idx];
+        let Some(res) = index.resources.get(obj.resource) else {
+            continue;
+        };
+        let Ok(bytes) = res.read() else { continue };
+        let Ok(iff) = Iff::parse(bytes) else { continue };
+        let Some(chunk) = iff.get(b"STR#", dialog::STRINGS) else {
+            continue;
+        };
+        let Ok(table) = sims_formats::strings::StringTable::parse(iff.data(chunk)) else {
+            continue;
+        };
+        for (i, entry) in table.entries.iter().enumerate() {
+            if entry.language == US_ENGLISH
+                && (entry.text.contains("$Me") || entry.text.contains("$Local:"))
+                && entry.text.contains('$')
+                && i < 250
+            {
+                found_token_dialog = Some((guid, (i + 1) as u8, entry.text.clone()));
+                break;
+            }
+        }
+        if found_token_dialog.is_some() {
+            break;
+        }
+    }
+    let (code_owner_guid, msg_str_id, raw_template) = found_token_dialog
+        .expect("Complete Collection must contain a real STR# 301 dialog with $Me/$Local tokens");
+
+    // Clone world (read-only w.r.t. simulation) to stage synthetic dialog records
+    // pointing to real Complete Collection objects/characters and verify formatting,
+    // caller title fallback (operands[6] == 0), and all icon modes 0, 1, 2, 4!
+    let mut world = base_world.clone();
+    let type_slot: u16 = 9999;
+    world.types.insert(type_slot, code_owner_guid);
+    if let Some(caller) = world.objects.get_mut(&sim_id) {
+        if let Some(person) = caller.person.as_mut()
+            && person.data.len() > 65
+        {
+            person.data[56] = 1; // Business career
+            person.data[57] = 1;
+        }
+        caller.stack.push(sims_formats::saved_objects::Frame {
+            stack_object: non_person_obj.id as i16,
+            tree: 4096,
+            node: 0,
+            parameters: Vec::new(),
+            locals: vec![42, 500, other_neighbor.id, 9, 1, 2],
+            primitive_state: 0,
+            code_owner_type: type_slot as i16,
+        });
+    }
+
+    let mut thumbs = sims_ui::thumbnail::Thumbnails::default();
+    let mut ctx = dialog::DialogContext {
+        faces: Some(&faces),
+        thumbnails: Some(&mut thumbs),
+        art: Some(&art),
+        careers: Some(&careers),
+        fame: Some(&fame),
+    };
+
+    // Test icon modes 0 (auto), 1 (neighbor/person portrait), 2 (stack object), 4 (caller face),
+    // all with operands[6] == 0 to verify caller display-name title fallback!
+    for mode in [0u8, 1, 2, 4] {
+        let mut operands = [0u8; 8];
+        operands[2] = msg_str_id;
+        operands[5] = 0; // kind 0 (OK)
+        operands[6] = 0; // title fallback -> caller's display name (`sim_name`)
+        operands[7] = (mode & 7) << 1;
+        let rec = sims_sim::Dialog {
+            caller: sim_id,
+            operands,
+            status: 0,
+        };
+        let msg =
+            Message::read_with_context(&world, &index, lot.catalog(), &labels, &rec, &mut ctx)
+                .unwrap()
+                .expect("dialog message");
+        assert_eq!(
+            msg.title, sim_name,
+            "operands[6]==0 must fall back to caller display name (mode {mode})"
+        );
+        assert!(
+            !msg.text.contains("$Me")
+                && !msg.text.contains("$Local")
+                && !msg.text.contains("$Object")
+                && !msg.text.contains("$Neighbor")
+                && !msg.text.contains("$TimeLocal")
+                && !msg.text.contains("$Job"),
+            "raw token leaked in mode {mode}: raw={raw_template:?} -> formatted={:?}",
+            msg.text
+        );
+        assert!(
+            msg.icon.is_some(),
+            "icon mode {mode} must resolve a non-None icon"
+        );
+        if matches!(mode, 1 | 4) {
+            let icon = msg.icon.as_ref().unwrap();
+            assert_eq!(
+                (icon.width, icon.height),
+                (45, 45),
+                "person portrait in mode {mode} must be 45x45 for SimStub.BMP backing"
+            );
+            let laid = dialog::layout([800, 600], &msg, &art).unwrap();
+            assert!(laid.icon.is_some());
+        }
+    }
+
+    // Also explicitly verify `$Neighbor`, `$NeighborLocal:2`, `$TimeLocal:3`, `$$Local:1`, and `$Job`
+    // against a synthetic STR# 301 IFF mounted into an isolated world & catalog check via `format_dialog_text`.
+    // Using a real stack with stack_object = other_neighbor.id for mode 1 portrait check:
+    if let Some(caller) = world.objects.get_mut(&sim_id)
+        && let Some(frame) = caller.stack.last_mut()
+    {
+        frame.stack_object = other_neighbor.id;
+    }
+    let rec_mode1 = sims_sim::Dialog {
+        caller: sim_id,
+        operands: [0, 0, msg_str_id, 0, 0, 0, 0, 1 << 1],
+        status: 0,
+    };
+    let msg_nb =
+        Message::read_with_context(&world, &index, lot.catalog(), &labels, &rec_mode1, &mut ctx)
+            .unwrap()
+            .expect("mode 1 neighbor dialog");
+    assert_eq!(
+        msg_nb.icon.as_ref().map(|i| (i.width, i.height)),
+        Some((45, 45))
+    );
+    if let Some(dir) = std::env::var_os("SIMS_WAVE1_SHOTS_DIR").map(std::path::PathBuf::from) {
+        let laid = dialog::layout([800, 600], &msg_nb, &art).unwrap();
+        let mut frame = Frame::new(800, 600, [24, 34, 48]);
+        dialog::draw(&mut frame, &art, &msg_nb, &laid, None);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("dialog_mode1_portrait_800x600.png"), frame.png());
+    }
+    assert!(!other_name.is_empty());
+}

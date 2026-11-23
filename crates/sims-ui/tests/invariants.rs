@@ -174,6 +174,7 @@ fn resize_continuity_across_1024_to_1025_never_teleports_hud_buy_build_options_o
     for sort in [BuySort::ByFunction, BuySort::ByRoom] {
         for category in [None, Some(0)] {
             let state = BuyState {
+                zone: sims_ui::buy::BuyZone::Residential,
                 sort,
                 category,
                 subcategory: 0,

@@ -134,8 +134,10 @@ pub struct LotVisibility {
     /// Whether the Save action button is visible (`!no_save`, `0x5174ac..0x5174c5`).
     pub can_save: bool,
     /// Whether the Play subpanel's Free Will label and checkbox are visible
-    /// (`0x5177aa..0x517822`: hidden on Downtown `21..=30`, Vacation `81..=89`,
-    /// and Magic Town `93..=98`).
+    /// (`0x5177aa..0x51788e`: hidden on Downtown `21..=30` (`0x40749a`),
+    /// Studio Town `81..=89` (`0x4074b1`), and Magic Town `93..=98` (`0x428825`);
+    /// explicitly shown on Vacation Island `40..=49` (`0x4074c8`),
+    /// Old Town Community (`zoning == 2`, `0x40747c`), and Residential lots).
     pub show_free_will: bool,
     /// Whether the Play subpanel's Reset Tutorial button is visible
     /// (`0x5175d5..0x5175f4`, `0x40745f`: residential lots only).
@@ -156,7 +158,7 @@ impl LotVisibility {
     ) -> Self {
         let is_residential = matches!(zoning, Some(1));
         let is_downtown = lot_id >= 21 && lot_id <= 30;
-        let is_vacation = lot_id >= 81 && lot_id <= 89;
+        let is_studio_town = lot_id >= 81 && lot_id <= 89;
         let is_magic_town = lot_id >= 93 && lot_id <= 98;
         // 0x4f2490..0x4f24e7: community/Studio Town (zoning == 2) or Magic Town
         // lots 93..=99 (`0x5d..=0x63`) cannot save while visiting (`!edit_mode`);
@@ -168,7 +170,11 @@ impl LotVisibility {
         };
         Self {
             can_save: !no_save,
-            show_free_will: !(is_downtown || is_vacation || is_magic_town),
+            // 0x5177b2 (`0x40749a` Downtown 21..=30), 0x51780a (`0x4074b1`
+            // Studio Town 81..=89), and 0x51781b (`0x428825` Magic Town 93..=98)
+            // hide Free Will; 0x51782c (`0x4074c8` Vacation Island 40..=49),
+            // 0x51783d (`0x40747c` zoning == 2 Community), and Residential keep it visible.
+            show_free_will: !(is_downtown || is_studio_town || is_magic_town),
             show_reset_tutorial: is_residential,
         }
     }

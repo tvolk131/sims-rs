@@ -177,6 +177,7 @@ pub fn load_art(ui: &UiGraphics, language: u8) -> Result<Art> {
 
 const BAR_BG_DOWNTOWN: [u8; 3] = [26, 30, 74];
 const BAR_BG_VACATION: [u8; 3] = [20, 66, 86];
+const BAR_BG_OLD_TOWN: [u8; 3] = [24, 62, 48];
 const BAR_BG_STUDIO: [u8; 3] = [62, 24, 58];
 const BAR_BG_MAGIC: [u8; 3] = [42, 22, 68];
 const STRIP_BG: [u8; 3] = [16, 22, 50];
@@ -195,13 +196,15 @@ const TOOLTIP_BG: [u8; 3] = [255, 255, 230];
 const TOOLTIP_BORDER: [u8; 3] = [0, 0, 0];
 const TOOLTIP_TEXT: [u8; 3] = [0, 0, 0];
 
-/// The four Complete Collection travel / sub-neighborhood destinations.
+/// The Complete Collection travel / sub-neighborhood destinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Destination {
     /// Hot Date Downtown (lots `21..=30`).
     Downtown,
     /// Vacation Island (lots `40..=48`).
     VacationIsland,
+    /// Unleashed Old Town community lots (`58..=68` / `zoning == 2`).
+    OldTown,
     /// Superstar Studio Town (lots `81..=89`).
     StudioTown,
     /// Makin' Magic Magic Town (lots `90..=98`).
@@ -209,7 +212,7 @@ pub enum Destination {
 }
 
 impl Destination {
-    /// All four destinations in Complete Collection expansion order.
+    /// The four standalone sub-neighborhood maps in expansion order.
     pub const ALL: [Self; 4] = [
         Self::Downtown,
         Self::VacationIsland,
@@ -222,6 +225,7 @@ impl Destination {
         match self {
             Self::Downtown => (21, 30),
             Self::VacationIsland => (40, 48),
+            Self::OldTown => (58, 68),
             Self::StudioTown => (81, 89),
             Self::MagicTown => (90, 98),
         }
@@ -232,6 +236,7 @@ impl Destination {
         match self {
             Self::Downtown => ExpansionFlags::HOT_DATE,
             Self::VacationIsland => ExpansionFlags::VACATION,
+            Self::OldTown => ExpansionFlags::UNLEASHED,
             Self::StudioTown => ExpansionFlags::SUPERSTAR,
             Self::MagicTown => ExpansionFlags::MAKIN_MAGIC,
         }
@@ -242,6 +247,7 @@ impl Destination {
         match self {
             Self::Downtown => "Downtown",
             Self::VacationIsland => "Vacation",
+            Self::OldTown => "Old Town",
             Self::StudioTown => "Studio",
             Self::MagicTown => "Magic",
         }
@@ -251,7 +257,7 @@ impl Destination {
     pub const fn default_transport(self) -> TravelTransport {
         match self {
             Self::Downtown => TravelTransport::Taxi,
-            Self::VacationIsland | Self::StudioTown => TravelTransport::Shuttle,
+            Self::VacationIsland | Self::OldTown | Self::StudioTown => TravelTransport::Shuttle,
             Self::MagicTown => TravelTransport::MagicHole,
         }
     }
@@ -264,6 +270,14 @@ impl Destination {
                 LotFilter::Lodging,
                 LotFilter::Food,
                 LotFilter::Shopping,
+                LotFilter::Recreation,
+            ],
+            Self::OldTown => &[
+                LotFilter::DogCat,
+                LotFilter::SmallAnimal,
+                LotFilter::Gardening,
+                LotFilter::Shopping,
+                LotFilter::Food,
                 LotFilter::Recreation,
             ],
             Self::StudioTown => &[
@@ -288,6 +302,7 @@ impl Destination {
         match self {
             Self::Downtown => BAR_BG_DOWNTOWN,
             Self::VacationIsland => BAR_BG_VACATION,
+            Self::OldTown => BAR_BG_OLD_TOWN,
             Self::StudioTown => BAR_BG_STUDIO,
             Self::MagicTown => BAR_BG_MAGIC,
         }
@@ -309,7 +324,7 @@ impl Destination {
     /// `UIGraphics` resource ID for this destination's Import button.
     pub const fn import_art_id(self) -> i32 {
         match self {
-            Self::Downtown => art_id::DOWNTOWN_IMPORT,
+            Self::Downtown | Self::OldTown => art_id::DOWNTOWN_IMPORT,
             Self::VacationIsland => art_id::VACATION_IMPORT,
             Self::StudioTown => art_id::STUDIO_TOWN_IMPORT,
             Self::MagicTown => art_id::MAGIC_TOWN_IMPORT,
@@ -553,7 +568,7 @@ impl TravelStrings {
     /// Tooltip string for `control` on `destination`.
     pub fn tooltip(&self, destination: Destination, control: TravelControl) -> Option<&str> {
         let screen_tips = match destination {
-            Destination::Downtown => &self.downtown_tips,
+            Destination::Downtown | Destination::OldTown => &self.downtown_tips,
             Destination::VacationIsland => &self.vacation_tips,
             Destination::StudioTown => &self.studio_town_tips,
             Destination::MagicTown => &self.magic_town_tips,
@@ -1002,7 +1017,7 @@ pub fn format_status_badge(state: &TravelState) -> String {
                 format!("Vacancy | ${}", state.simoleons)
             }
         }
-        Destination::Downtown => format!("${}", state.simoleons),
+        Destination::Downtown | Destination::OldTown => format!("${}", state.simoleons),
     }
 }
 
@@ -1015,6 +1030,7 @@ fn control_art_id(destination: Destination, control: TravelControl) -> Option<i3
         TravelControl::SwitchDestination(Destination::VacationIsland) => {
             Some(art_id::DEST_VACATION)
         }
+        TravelControl::SwitchDestination(Destination::OldTown) => Some(art_id::PHONE_NEIGHBORHOOD),
         TravelControl::SwitchDestination(Destination::StudioTown) => Some(art_id::DEST_STUDIO_TOWN),
         TravelControl::SwitchDestination(Destination::MagicTown) => Some(art_id::DEST_MAGIC_TOWN),
         TravelControl::ToggleFilter(filter) => Some(filter.art_id()),
@@ -1091,7 +1107,7 @@ impl TravelDialogState {
         let (transport, fare_simoleons) = match destination {
             Destination::Downtown => (TravelTransport::Taxi, 50),
             Destination::VacationIsland => (TravelTransport::Shuttle, 500),
-            Destination::StudioTown => (TravelTransport::Shuttle, 0),
+            Destination::OldTown | Destination::StudioTown => (TravelTransport::Shuttle, 0),
             Destination::MagicTown => (TravelTransport::MagicHole, 0),
         };
         Self {
@@ -1250,6 +1266,7 @@ impl TravelDialog {
                 Destination::VacationIsland => {
                     strings.go_vacation_dialog.first().map(String::as_str)
                 }
+                Destination::OldTown => strings.visit_neighborhood.first().map(String::as_str),
                 Destination::StudioTown | Destination::MagicTown => None,
             })
             .unwrap_or_else(|| state.destination.short_label());
