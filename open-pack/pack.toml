@@ -1,6 +1,6 @@
 [pack]
 name = "Open Starter Pack"
-version = "0.3.0"
+version = "0.4.0"
 author = "sims-rs Contributors"
 license = "MIT"
 archive = "open-pack.far"

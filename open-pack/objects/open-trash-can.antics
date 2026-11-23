@@ -1,0 +1,71 @@
+// Open Pedal Trash Can (0x7F00_0071) — cleanliness utility with dispose & cancel-safe empty loop.
+
+object "Open Pedal Trash Can" {
+    guid: 0x7F00_0071;
+    price: 45;
+    category: misc;
+    attributes: 8;
+    description: "A clean-room kitchen pedal bin with dispose and cancel-safe empty loops to keep rooms tidy.";
+    sprite: Sprite::procedural("trash_can", primary: #A4AEB6, accent: #C4CED4, trim: #585E66);
+
+    param max_trash: i16 = 5;
+    param empty_ticks: i16 = 1;
+    param dispose_room_gain: i16 = 15;
+    param empty_room_gain: i16 = 35;
+
+    state occupied: bool = false;
+    state trash_count: i16 = 1;
+    state times_emptied: i16 = 0;
+
+    sound lid = preset("soft_thud", wav: "open_trash_lid");
+
+    slot front {
+        kind: routing,
+        offset: [0.0, -0.60, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: north,
+    }
+
+    interaction "Dispose Trash" {
+        autonomy: 40,
+        attenuation: 0.02,
+        advertises: [
+            room +25 (min: -100),
+        ],
+        guard(sim) => !self.occupied && self.trash_count < max_trash,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(lid, self);
+                self.trash_count += 1;
+                sim.motive.room += dispose_room_gain;
+            }
+            return true;
+        }
+    }
+
+    interaction "Empty Trash" {
+        autonomy: 65,
+        attenuation: 0.02,
+        advertises: [
+            room +45 (min: -100),
+        ],
+        guard(sim) => !self.occupied && self.trash_count > 0,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(lid, self);
+                while self.trash_count > 0 cancel_on_abort {
+                    sleep(empty_ticks);
+                    self.trash_count -= 1;
+                }
+                if self.trash_count == 0 {
+                    sim.motive.room += empty_room_gain;
+                    self.times_emptied += 1;
+                    play_sound(lid, self);
+                }
+            }
+            return true;
+        }
+    }
+}

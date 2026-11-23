@@ -2951,3 +2951,655 @@ fn macos_system_symlink_paths_work_while_user_symlinks_remain_rejected() {
         .expect_err("user symlink under /tmp must still be rejected");
     assert!(err.message.contains("symlink"), "{err}");
 }
+
+// ===========================================================================
+// 6. On-Disk `open-pack/` v2 Migration, Zero-`object.toml`, & 20/20 Expand Gate
+// ===========================================================================
+
+#[test]
+fn on_disk_open_pack_is_pure_v2_expands_all_20_objects_and_passes_safety() {
+    let pack_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("open-pack");
+
+    // 1. Verify ZERO `object.toml` files remain anywhere under `open-pack/`.
+    #[allow(clippy::disallowed_methods)]
+    fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                walk_files(&p, out);
+            } else if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    let mut all_files = Vec::new();
+    walk_files(&pack_dir, &mut all_files);
+    for file in &all_files {
+        assert_ne!(
+            file.file_name().and_then(|s| s.to_str()),
+            Some("object.toml"),
+            "retired object.toml found in open-pack: {}",
+            file.display()
+        );
+        if file.extension().and_then(|s| s.to_str()) == Some("antics") {
+            let src = std::fs::read_to_string(file).expect("read .antics file");
+            assert!(
+                !src.contains("raw {"),
+                "migrated open-pack v2 file must not use raw {{ ... }} escape hatch: {}",
+                file.display()
+            );
+            assert!(
+                !src.contains("@id(") && !src.contains("@guard_id("),
+                "migrated open-pack v2 file should not pin raw @id/@guard_id: {}",
+                file.display()
+            );
+        }
+    }
+
+    // 2. Both `compile_v2_pack_dir` and `compile_pack_dir` produce bit-identical output
+    //    and pass `verify_pack_safety` with 0 violations across all 20 objects.
+    let v2_pack = compile_v2_pack_dir(&pack_dir).expect("compile_v2_pack_dir(open-pack)");
+    let std_pack = sims_antics::compile_pack_dir(&pack_dir).expect("compile_pack_dir(open-pack)");
+    assert_eq!(v2_pack.objects.len(), 20);
+    assert_eq!(v2_pack.far_bytes, std_pack.far_bytes);
+    assert_eq!(v2_pack.sounds_wav, std_pack.sounds_wav);
+
+    let safety = verify_pack_safety(&v2_pack).expect("verify_pack_safety");
+    assert!(
+        safety.is_ok(),
+        "open-pack v2 safety violations: {:?}",
+        safety.objects
+    );
+
+    // 3. Every one of the 20 objects expands cleanly via both `expand_v2_to_air` and
+    //    `sims-antics expand <file> --pack open-pack` into valid `.air` that passes `compile_air`.
+    for entry in &v2_pack.objects {
+        let obj_path = pack_dir
+            .join("objects")
+            .join(format!("{}.antics", entry.slug));
+        assert!(
+            obj_path.is_file(),
+            "expected flat v2 object file {}",
+            obj_path.display()
+        );
+        let expanded = expand_v2_to_air(&obj_path, Some(&pack_dir))
+            .unwrap_or_else(|e| panic!("expand_v2_to_air failed for {}: {e}", entry.slug));
+        let air_mod = compile_air(&expanded)
+            .unwrap_or_else(|e| panic!("compile_air failed for {}: {e}", entry.slug));
+        assert_eq!(
+            air_mod.behaviors.len(),
+            entry.object.behaviors.len(),
+            "expanded .air BHAV count mismatch for {}",
+            entry.slug
+        );
+
+        let cli_out = Command::new(cli_bin())
+            .args(["expand"])
+            .arg(&obj_path)
+            .args(["--pack"])
+            .arg(&pack_dir)
+            .output()
+            .expect("run sims-antics expand");
+        assert!(
+            cli_out.status.success(),
+            "sims-antics expand failed for {}: {}",
+            entry.slug,
+            String::from_utf8_lossy(&cli_out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(cli_out.stdout).expect("utf8 expand stdout"),
+            expanded,
+            "CLI expand output must match expand_v2_to_air for {}",
+            entry.slug
+        );
+    }
+
+    // 4. Verify explicit legacy metadata expectations (GUID, CTSS name, SLOT kinds, FWAV names)
+    //    across all 20 objects, plus open-floor-lamp default graphic 0 = lit / graphic 1 = off.
+    type ExpectedMeta = (
+        &'static str,
+        u32,
+        &'static str,
+        &'static [u16],
+        &'static [&'static str],
+    );
+    let expected_meta: &[ExpectedMeta] = &[
+        (
+            "open-bench",
+            0x7F00_0001,
+            "Open Pine Bench",
+            &[3],
+            &["open_bench_creak"],
+        ),
+        (
+            "open-cot",
+            0x7F00_0002,
+            "Open Camp Cot",
+            &[3],
+            &["open_cot_settle"],
+        ),
+        (
+            "open-basin",
+            0x7F00_0003,
+            "Open Ceramic Basin",
+            &[3],
+            &["open_basin_flush"],
+        ),
+        (
+            "open-double-bed",
+            0x7F00_0012,
+            "Open Double Bed",
+            &[3, 3],
+            &["open_double_bed_settle", "open_double_bed_wake"],
+        ),
+        (
+            "open-fridge",
+            0x7F00_0020,
+            "Open Frost Fridge",
+            &[3],
+            &["open_fridge_door"],
+        ),
+        (
+            "open-counter",
+            0x7F00_0021,
+            "Open Oak Counter",
+            &[0, 3],
+            &["open_counter_chop"],
+        ),
+        (
+            "open-stove",
+            0x7F00_0022,
+            "Open Hearth Stove",
+            &[3],
+            &["open_stove_sizzle"],
+        ),
+        (
+            "open-meal-plate",
+            0x7F00_0023,
+            "Open Meal Plate",
+            &[3],
+            &["open_plate_eat", "open_plate_dispose"],
+        ),
+        (
+            "open-wall-phone",
+            0x7F00_0030,
+            "Open Wall Phone",
+            &[3],
+            &["open_phone_ring", "open_phone_dial", "open_phone_confirm"],
+        ),
+        (
+            "open-shower",
+            0x7F00_0040,
+            "Open Privacy Shower",
+            &[3],
+            &[
+                "open_shower_spray",
+                "open_shower_wrench",
+                "open_shower_fixed",
+            ],
+        ),
+        (
+            "open-toilet",
+            0x7F00_0050,
+            "Open Porcelain Toilet",
+            &[3],
+            &["open_toilet_flush", "open_toilet_plunge"],
+        ),
+        (
+            "open-sofa",
+            0x7F00_0051,
+            "Open Plush Sofa",
+            &[3],
+            &["open_sofa_creak", "open_sofa_chime"],
+        ),
+        (
+            "open-tv",
+            0x7F00_0052,
+            "Open Retro Television",
+            &[3],
+            &["open_tv_click", "open_tv_jingle"],
+        ),
+        (
+            "open-bookshelf",
+            0x7F00_0053,
+            "Open Timber Bookshelf",
+            &[3],
+            &["open_book_turn", "open_skill_chime"],
+        ),
+        (
+            "open-dining-table",
+            0x7F00_0060,
+            "Open Dining Table",
+            &[0, 3],
+            &["open_table_tap"],
+        ),
+        (
+            "open-dining-chair",
+            0x7F00_0061,
+            "Open Dining Chair",
+            &[3],
+            &["open_chair_creak"],
+        ),
+        (
+            "open-floor-lamp",
+            0x7F00_0070,
+            "Open Floor Lamp",
+            &[3],
+            &["open_lamp_switch"],
+        ),
+        (
+            "open-trash-can",
+            0x7F00_0071,
+            "Open Pedal Trash Can",
+            &[3],
+            &["open_trash_lid"],
+        ),
+        (
+            "open-front-door",
+            0x7F00_0080,
+            "Open Oak Front Door",
+            &[3],
+            &["open_door_knock", "open_door_bell"],
+        ),
+        (
+            "open-mailbox",
+            0x7F00_0090,
+            "Open Street Mailbox",
+            &[3],
+            &["open_mailbox_latch", "open_bills_paid"],
+        ),
+    ];
+    assert_eq!(expected_meta.len(), v2_pack.objects.len());
+    for &(slug, guid, name, slot_kinds, wav_names) in expected_meta {
+        let entry = v2_pack
+            .objects
+            .iter()
+            .find(|o| o.slug == slug)
+            .unwrap_or_else(|| panic!("missing compiled object '{slug}'"));
+        assert_eq!(entry.object.guid, guid, "GUID mismatch for {slug}");
+        assert_eq!(entry.object.name, name, "name mismatch for {slug}");
+        let iff = Iff::parse(entry.object.iff_bytes.clone()).expect("parse iff");
+        let slots = sims_formats::execution::Slots::parse(
+            iff.data(iff.get(b"SLOT", 128).expect("SLOT #128")),
+        )
+        .expect("parse SLOT");
+        let actual_kinds: Vec<u16> = slots.entries.iter().map(|s| s.kind).collect();
+        assert_eq!(actual_kinds, slot_kinds, "SLOT kinds mismatch for {slug}");
+        let mut actual_fwavs: Vec<String> = iff
+            .all(b"FWAV")
+            .map(|c| {
+                let d = iff.data(c);
+                let end = d.iter().position(|&b| b == 0).unwrap_or(d.len());
+                d[..end].iter().map(|&b| char::from(b)).collect()
+            })
+            .collect();
+        actual_fwavs.sort();
+        let mut expected_fwavs: Vec<String> = wav_names.iter().map(|s| (*s).to_owned()).collect();
+        expected_fwavs.sort();
+        assert_eq!(
+            actual_fwavs, expected_fwavs,
+            "FWAV names mismatch for {slug}"
+        );
+    }
+
+    // 5. Verify Floor Lamp boots with graphic 0 (lit, data[0] == 0 for v0.3.0 save hash parity)
+    //    and switches to graphic 1 when turned off, back to 0 when turned on.
+    let lamp = &v2_pack
+        .objects
+        .iter()
+        .find(|o| o.slug == "open-floor-lamp")
+        .unwrap()
+        .object;
+    let cot = &v2_pack
+        .objects
+        .iter()
+        .find(|o| o.slug == "open-cot")
+        .unwrap()
+        .object;
+    let mut vm = V2VmFixture::from_objects(&[lamp, cot], 500);
+    let lamp_id = vm.spawn(0x7F00_0070, 4, 4);
+    assert_eq!(vm.obj_attr(lamp_id, 1), 1, "lamp starts powered on");
+    assert_eq!(
+        vm.obj_data(lamp_id, 0),
+        0,
+        "lamp must boot with graphic 0 (lit) to preserve v0.3.0 initial world state"
+    );
+    vm.run_interaction(lamp_id, "Turn Off Light", None);
+    assert_eq!(vm.obj_attr(lamp_id, 1), 0);
+    assert_eq!(
+        vm.obj_data(lamp_id, 0),
+        1,
+        "Turn Off switches to off graphic 1"
+    );
+    vm.run_interaction(lamp_id, "Turn On Light", None);
+    assert_eq!(vm.obj_attr(lamp_id, 1), 1);
+    assert_eq!(
+        vm.obj_data(lamp_id, 0),
+        0,
+        "Turn On switches back to lit graphic 0"
+    );
+
+    // 6. Verify 2-Sim contention on `open-cot`: while Sim 1 naps, Sim 2 cannot claim the cot!
+    let cot_id = vm.spawn(0x7F00_0002, 6, 4);
+    let sim2_id = 10u16;
+    vm.world.order.push(sim2_id);
+    vm.world.people.push(sim2_id);
+    vm.world.objects.insert(sim2_id, make_sim_object(sim2_id));
+
+    let sim1_id = vm.sim_id;
+    let interp = Interpreter::new(&vm.program, &vm.catalog, Stream::Lot);
+    let entries1 = interp.pie_menu(&mut vm.world, sim1_id, cot_id).unwrap();
+    assert_eq!(
+        entries1.len(),
+        1,
+        "Sim 1 sees Take a Nap when cot is vacant"
+    );
+    let uid1 = interp
+        .pick(&mut vm.world, sim1_id, entries1[0].action.clone())
+        .unwrap()
+        .unwrap();
+    vm.world.objects.get_mut(&sim1_id).unwrap().data[25] = 1;
+    let st = interp.turn(&mut vm.world, sim1_id, 4_000).unwrap();
+    assert!(matches!(st, Status::Yielded));
+    assert_eq!(
+        vm.world.objects[&cot_id].attributes[0], 1,
+        "cot locked by Sim 1"
+    );
+    // While Sim 1 occupies the cot, Sim 2's pie menu must hide "Take a Nap"!
+    let entries2_busy = interp.pie_menu(&mut vm.world, sim2_id, cot_id).unwrap();
+    assert!(
+        entries2_busy.is_empty(),
+        "Sim 2 must not be offered Take a Nap while Sim 1 occupies open-cot"
+    );
+    // Cancel Sim 1 -> lock releases -> Sim 2 is offered "Take a Nap"!
+    assert!(interp.cancel(&mut vm.world, sim1_id, uid1).unwrap());
+    for _ in 0..16 {
+        vm.world.objects.get_mut(&sim1_id).unwrap().data[25] = 1;
+        let _ = interp.turn(&mut vm.world, sim1_id, 4_000).unwrap();
+        if vm.world.objects[&sim1_id].stack.len() == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        vm.world.objects[&cot_id].attributes[0], 0,
+        "cot lock released"
+    );
+    let entries2_free = interp.pie_menu(&mut vm.world, sim2_id, cot_id).unwrap();
+    assert_eq!(
+        entries2_free.len(),
+        1,
+        "Sim 2 sees Take a Nap again once Sim 1 vacates open-cot"
+    );
+}
+
+#[test]
+fn const_arg_helper_inlining_folds_immutable_constants_and_spills_mutated_params() {
+    let src = r#"
+fn set_flag(flag: &mut bool, enabled: bool) {
+    *flag = enabled;
+}
+
+fn mutate_copy(val: i16, out: &mut i16) {
+    val += 5;
+    *out = val;
+}
+
+object "Const Fold Probe" {
+    guid: 0x7F34_0001;
+    state power: bool = false;
+    state total: i16 = 0;
+
+    interaction "Power On" {
+        guard(sim) => !self.power,
+        run(sim) {
+            set_flag(&mut self.power, true);
+            mutate_copy(10, &mut self.total);
+            return true;
+        }
+    }
+
+    interaction "Power Off" {
+        guard(sim) => self.power,
+        run(sim) {
+            set_flag(&mut self.power, false);
+            return true;
+        }
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects(
+        "probe.antics",
+        src,
+        &PackResolverConfig::default(),
+    )
+    .expect("expand probe");
+    let air = &expanded[0].air_source;
+    // Immutable `enabled: bool` literal folds directly to `stack.attr[0] := 1;` / `:= 0;`
+    // (no `__arg_enabled` local spilled), so persistent toggle passes verify_object_safety!
+    assert!(
+        air.contains("stack.attr[0] := 1;") && air.contains("stack.attr[0] := 0;"),
+        "expected constant-folded bool writes:\n{air}"
+    );
+    assert!(
+        !air.contains("__arg_enabled"),
+        "immutable bool literal arg must not spill a dummy local:\n{air}"
+    );
+    // Mutated `val: i16` parameter MUST still spill to a fresh local before `+= 5`!
+    assert!(
+        air.contains("__arg_val"),
+        "mutated i16 param must spill to a local:\n{air}"
+    );
+
+    let compiled = compile_v2_source("probe.antics", src, &PackResolverConfig::default())
+        .expect("compile probe");
+    let report = verify_object_safety(&compiled).expect("verify probe");
+    assert!(
+        report.is_ok(),
+        "persistent toggle via const-folded helper must pass safety: {:?}",
+        report.violations
+    );
+
+    let mut vm = V2VmFixture::from_objects(&[&compiled], 100);
+    let obj_id = vm.spawn(0x7F34_0001, 4, 4);
+    vm.run_interaction(obj_id, "Power On", None);
+    assert_eq!(vm.obj_attr(obj_id, 0), 1);
+    assert_eq!(vm.obj_attr(obj_id, 1), 15);
+    vm.run_interaction(obj_id, "Power Off", None);
+    assert_eq!(vm.obj_attr(obj_id, 0), 0);
+
+    // Sol R1 P2-1a: `param self: i16 = 7` must NOT shadow `self` ObjectId when calling a helper!
+    let self_shadow_src = r#"
+fn store_id(v: i16, out: &mut i16) {
+    *out = v;
+}
+
+object "Self Shadow Probe" {
+    guid: 0x7F34_0002;
+    param self: i16 = 7;
+    state captured: i16 = 0;
+
+    interaction "Capture" {
+        run(sim) {
+            store_id(self, &mut self.captured);
+            return true;
+        }
+    }
+}
+"#;
+    let self_expanded = sims_antics::v2::expand_v2_source_to_objects(
+        "self_shadow.antics",
+        self_shadow_src,
+        &PackResolverConfig::default(),
+    )
+    .expect("expand self shadow");
+    assert!(
+        !self_expanded[0].air_source.contains("bcon.self"),
+        "`self` passed to read-only i16 helper must resolve to object id, never `bcon.self`:\n{}",
+        self_expanded[0].air_source
+    );
+    assert!(
+        self_expanded[0].air_source.contains("stack_obj"),
+        "expected stack_obj for `self`:\n{}",
+        self_expanded[0].air_source
+    );
+
+    // Sol R1 P2-1b: `param index: i16 = 0` shadowed by helper param `index: i16` in `self.attr[index]`!
+    // Constant arg `1` must write `attr[1]`, NOT `attr[0]`, and a runtime local must be rejected!
+    let idx_shadow_ok = r#"
+fn write_at(index: i16, val: i16) {
+    self.attr[index] = val;
+}
+
+object "Index Shadow Ok" {
+    guid: 0x7F34_0003;
+    param index: i16 = 0;
+    state a0: i16 = 0;
+    state a1: i16 = 0;
+
+    interaction "Write One" {
+        run(sim) {
+            write_at(1, 42);
+            return true;
+        }
+    }
+}
+"#;
+    let idx_ok_obj = compile_v2_source(
+        "idx_shadow_ok.antics",
+        idx_shadow_ok,
+        &PackResolverConfig::default(),
+    )
+    .expect("compile idx_shadow_ok");
+    let mut vm2 = V2VmFixture::from_objects(&[&idx_ok_obj], 100);
+    let idx_id = vm2.spawn(0x7F34_0003, 4, 4);
+    vm2.run_interaction(idx_id, "Write One", None);
+    assert_eq!(vm2.obj_attr(idx_id, 0), 0, "attr[0] must remain untouched");
+    assert_eq!(
+        vm2.obj_attr(idx_id, 1),
+        42,
+        "helper param `index = 1` must shadow `param index = 0` and write attr[1]"
+    );
+
+    let idx_shadow_runtime_err = r#"
+object "Index Shadow Runtime" {
+    guid: 0x7F34_0004;
+    param index: i16 = 0;
+    state a0: i16 = 0;
+
+    interaction "Bad Dynamic Index" {
+        run(sim) {
+            let index = self.a0;
+            self.attr[index] = 9;
+            return true;
+        }
+    }
+}
+"#;
+    let err = compile_v2_source(
+        "idx_shadow_err.antics",
+        idx_shadow_runtime_err,
+        &PackResolverConfig::default(),
+    )
+    .expect_err(
+        "runtime local `index` shadowing `param index` must be rejected in `self.attr[index]`",
+    );
+    assert!(err.message.contains("non-constant variable"), "{err}");
+
+    // Sol R1 P2-2: Calling a helper with literal `false` must NOT suppress diagnostics in the untaken `if` branch!
+    let dead_branch_err_src = r#"
+fn maybe_call(enabled: bool) {
+    if enabled {
+        missing_helper();
+    }
+}
+
+object "Dead Branch Diagnostic" {
+    guid: 0x7F34_0005;
+
+    interaction "Go" {
+        run(sim) {
+            maybe_call(false);
+            return true;
+        }
+    }
+}
+"#;
+    let err = compile_v2_source(
+        "dead_branch.antics",
+        dead_branch_err_src,
+        &PackResolverConfig::default(),
+    )
+    .expect_err("invalid helper body called with literal false must still report unknown function");
+    assert!(
+        err.message.contains("unknown function 'missing_helper'"),
+        "{err}"
+    );
+
+    // Sol R2 P2-1: Helpers can forward constant bool args into built-in compile-time options (`inform:`, `change_icon:`).
+    let fwd_opt_src = r#"
+fn show_notice(is_inform: bool) {
+    dialog(kind: ok, title: title, message: msg, inform: is_inform);
+}
+
+object "Forward Option Probe" {
+    guid: 0x7F34_0006;
+    strings 301 "ProbeStr" {
+        title = "Notice",
+        msg = "Hello",
+    }
+
+    interaction "Notify" {
+        run(sim) {
+            show_notice(true);
+            return true;
+        }
+    }
+}
+"#;
+    let fwd_expanded = sims_antics::v2::expand_v2_source_to_objects(
+        "fwd_opt.antics",
+        fwd_opt_src,
+        &PackResolverConfig::default(),
+    )
+    .expect("helper must forward const bool arg to dialog inform: option");
+    assert!(
+        fwd_expanded[0].air_source.contains("inform: true"),
+        "{}",
+        fwd_expanded[0].air_source
+    );
+
+    // Sol R2 P2-2: Renamed Sim binding (`run(actor)`) allows `param sim: i16 = 0` in `self.attr[sim]`.
+    let renamed_sim_src = r#"
+object "Renamed Sim Param" {
+    guid: 0x7F34_0007;
+    param sim: i16 = 1;
+    state a0: i16 = 0;
+    state a1: i16 = 0;
+
+    interaction "Write" {
+        run(actor) {
+            self.attr[sim] = 77;
+            return true;
+        }
+    }
+}
+"#;
+    let renamed_obj = compile_v2_source(
+        "renamed_sim.antics",
+        renamed_sim_src,
+        &PackResolverConfig::default(),
+    )
+    .expect("`param sim: i16 = 1` must resolve in `self.attr[sim]` when Sim is bound as `actor`");
+    let mut vm3 = V2VmFixture::from_objects(&[&renamed_obj], 100);
+    let rid = vm3.spawn(0x7F34_0007, 4, 4);
+    vm3.run_interaction(rid, "Write", None);
+    assert_eq!(vm3.obj_attr(rid, 0), 0);
+    assert_eq!(vm3.obj_attr(rid, 1), 77);
+}

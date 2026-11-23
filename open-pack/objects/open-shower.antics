@@ -1,0 +1,80 @@
+// Open Privacy Shower (0x7F00_0040) — privacy guard, wear-to-broken, Mechanic-scaled repair.
+
+use crate::common::helpers::{record_fixture_wear, repair_by_progress, restore_motive_loop};
+use crate::templates::plumbing::PlumbingFixture;
+
+object "Open Privacy Shower" from PlumbingFixture {
+    guid: 0x7F00_0040;
+    price: 520;
+    description: "A clean-room tiled shower stall with privacy occupancy guards, wear-to-broken state transitions, and Mechanic-scaled repair.";
+    sprite: Sprite::procedural("shower", primary: #DEE8EE, accent: #A4CEE0, trim: #84909A);
+
+    break_threshold: 3;
+    use_ticks: 2;
+    max_use_cycles: 4;
+    motive_step: 35;
+    max_entry_motive: 95;
+    repair_ticks: 2;
+    mechanic_xp: 15;
+
+    param repair_goal: i16 = 100;
+    param base_repair_step: i16 = 20;
+    param mechanic_divisor: i16 = 20;
+
+    state reserved: i16 = 0;
+    state last_repair_cycles: i16 = 0;
+
+    sound spray = preset("shower_spray", wav: "open_shower_spray");
+    sound wrench = preset("wrench_clank", wav: "open_shower_wrench");
+    sound fixed = preset("chime", wav: "open_shower_fixed");
+
+    interaction "Take Shower" {
+        autonomy: 55,
+        attenuation: 0.02,
+        advertises: [
+            hygiene +95 (min: -100),
+        ],
+        guard(sim) => !self.broken && !self.occupied && sim.motive.hygiene < max_entry_motive,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(spray, self);
+                let mut cycles: i16 = 0;
+                restore_motive_loop(
+                    sim,
+                    Motive::Hygiene,
+                    max_use_cycles,
+                    use_ticks,
+                    motive_step,
+                    100,
+                    &mut cycles,
+                );
+                if cycles > 0 && record_fixture_wear(&mut self.wear, &mut self.broken, break_threshold) {
+                    play_sound(wrench, self);
+                }
+            }
+            return true;
+        }
+    }
+
+    interaction "Repair Shower" {
+        autonomy: 90,
+        attenuation: 0.02,
+        guard(sim) => self.broken && !self.occupied,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(wrench, self);
+                if repair_by_progress(
+                    sim,
+                    repair_goal,
+                    base_repair_step,
+                    mechanic_divisor,
+                    repair_ticks,
+                    &mut self.last_repair_cycles,
+                ) {
+                    complete_fixture_repair(sim, fixed);
+                }
+            }
+            return true;
+        }
+    }
+}

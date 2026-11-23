@@ -1,0 +1,37 @@
+// Shared seating template for benches, dining chairs, and sofas.
+
+use crate::common::helpers::restore_motive_loop;
+
+pub template SeatBase {
+    category: seating;
+
+    param sit_ticks: i16 = 2;
+    param sit_cycles: i16 = 3;
+    param comfort_step: i16 = 18;
+    param max_entry_comfort: i16 = 95;
+
+    state occupied: bool = false;
+
+    sound creak = preset("wood_creak");
+
+    slot seat_entry {
+        kind: routing,
+        offset: [0.0, -0.75, 0.0],
+        standing: true,
+        sitting: true,
+        ground: true,
+        facing: north,
+    }
+
+    fn sit_comfort_loop(sim: Sim, completed: &mut i16) {
+        restore_motive_loop(
+            sim,
+            Motive::Comfort,
+            sit_cycles,
+            sit_ticks,
+            comfort_step,
+            100,
+            completed,
+        );
+    }
+}

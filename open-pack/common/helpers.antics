@@ -1,0 +1,94 @@
+// Shared clean-room behavioral helpers for `open-pack/`.
+
+/// Cancel-safe single-motive restoration loop with early saturation break.
+pub fn restore_motive_loop(
+    sim: Sim,
+    motive: Motive,
+    cycles: i16,
+    ticks: i16,
+    step: i16,
+    cap: i16,
+    completed: &mut i16,
+) {
+    repeat cycles cancel_on_abort {
+        sleep(ticks);
+        sim.motive[motive] += step;
+        *completed += 1;
+        if sim.motive[motive] >= cap {
+            break;
+        }
+    }
+}
+
+/// Cancel-safe dual-motive restoration loop with early saturation break on the primary motive.
+pub fn restore_two_motives_loop(
+    sim: Sim,
+    primary: Motive,
+    primary_step: i16,
+    secondary: Motive,
+    secondary_step: i16,
+    cycles: i16,
+    ticks: i16,
+    primary_cap: i16,
+    completed: &mut i16,
+) {
+    repeat cycles cancel_on_abort {
+        sleep(ticks);
+        sim.motive[primary] += primary_step;
+        sim.motive[secondary] += secondary_step;
+        *completed += 1;
+        if sim.motive[primary] >= primary_cap {
+            break;
+        }
+    }
+}
+
+/// Sets a boolean toggle/power/lock state and plays the associated object sound.
+pub fn set_toggle_state(obj: Object, flag: &mut bool, enabled: bool, sfx: Sound) {
+    *flag = enabled;
+    play_sound(sfx, obj);
+}
+
+/// Increments a fixture's wear counter and transitions it to broken once `threshold` is reached.
+/// Returns `true` if the fixture broke on this use.
+pub fn record_fixture_wear(wear: &mut i16, broken: &mut bool, threshold: i16) -> bool {
+    *wear += 1;
+    if *wear >= threshold {
+        *broken = true;
+        return true;
+    }
+    return false;
+}
+
+/// Cancel-safe Mechanical-skill-scaled repair loop.
+/// Returns `true` if repair progress reached `goal` (not canceled early).
+pub fn repair_by_progress(
+    sim: Sim,
+    goal: i16,
+    base_step: i16,
+    mechanic_divisor: i16,
+    ticks: i16,
+    cycles_out: &mut i16,
+) -> bool {
+    let step = sim.skill.mechanical / mechanic_divisor + base_step;
+    let mut progress: i16 = 0;
+    let mut cycles: i16 = 0;
+    while progress < goal cancel_on_abort {
+        sleep(ticks);
+        progress += step;
+        cycles += 1;
+    }
+    *cycles_out = cycles;
+    return progress >= goal;
+}
+
+/// Cancel-safe fixed-cycle work loop (e.g. plunging/unclogging).
+/// Returns `true` if all `target_cycles` completed without cancellation.
+pub fn run_timed_cycles(target_cycles: i16, ticks: i16) -> bool {
+    let mut cycles: i16 = 0;
+    repeat target_cycles cancel_on_abort {
+        sleep(ticks);
+        cycles += 1;
+    }
+    return cycles >= target_cycles;
+}

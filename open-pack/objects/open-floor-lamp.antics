@@ -1,0 +1,72 @@
+// Open Floor Lamp (0x7F00_0070) — toggleable warm lighting with off/on graphics and Room boost.
+
+use crate::common::helpers::set_toggle_state;
+use crate::templates::toggle::ToggleableDevice;
+
+object "Open Floor Lamp" from ToggleableDevice {
+    guid: 0x7F00_0070;
+    price: 110;
+    category: lighting;
+    description: "A clean-room standing floor lamp with toggleable warm light that boosts Room mood.";
+    graphics: [
+        Sprite::procedural("floor_lamp", primary: #F2E0AE, accent: #FCF0CE, trim: #745E3E),
+        Sprite::procedural("floor_lamp", primary: #988C74, accent: #B4A890, trim: #604E34),
+    ];
+
+    initial_power: true;
+    param room_boost: i16 = 35;
+    param enjoy_ticks: i16 = 1;
+
+    sound switch_click = preset("ui_click", wav: "open_lamp_switch");
+
+    slot front {
+        kind: routing,
+        offset: [0.0, -0.65, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: north,
+    }
+
+    interaction "Turn On Light" {
+        autonomy: 40,
+        attenuation: 0.02,
+        advertises: [
+            room +40 (min: -100),
+        ],
+        guard(sim) => !self.power,
+        run(sim) {
+            set_toggle_state(self, &mut self.power, true, switch_click);
+            set_graphic(0);
+            sim.motive.room += room_boost;
+            return true;
+        }
+    }
+
+    interaction "Turn Off Light" {
+        autonomy: 15,
+        attenuation: 0.02,
+        guard(sim) => self.power,
+        run(sim) {
+            set_toggle_state(self, &mut self.power, false, switch_click);
+            set_graphic(1);
+            return true;
+        }
+    }
+
+    interaction "Enjoy Warm Light" {
+        autonomy: 30,
+        attenuation: 0.02,
+        advertises: [
+            room +45 (min: -100),
+        ],
+        guard(sim) => !self.occupied && self.power,
+        run(sim) {
+            with lock(self.occupied) {
+                sleep(enjoy_ticks);
+                sim.motive.room += room_boost;
+            }
+            return true;
+        }
+    }
+}

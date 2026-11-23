@@ -1,0 +1,46 @@
+// Open Ceramic Basin (0x7F00_0003) — clean-room porcelain fixture.
+
+object "Open Ceramic Basin" {
+    guid: 0x7F00_0003;
+    price: 280;
+    category: plumbing;
+    description: "A clean-room porcelain fixture that restores Bladder and Hygiene.";
+    sprite: Sprite::procedural("basin", primary: #E8ECF0, accent: #D0E0EE, trim: #949EA8);
+
+    param max_bladder: i16 = 90;
+    param hygiene_gain: i16 = 25;
+
+    state uses: i16 = 0;
+
+    sound flush = preset("water_flush", wav: "open_basin_flush");
+
+    slot front {
+        kind: routing,
+        offset: [0.0, -0.65, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: north,
+    }
+
+    fn wash_hands(sim: Sim) {
+        sim.motive.hygiene += hygiene_gain;
+        play_sound(flush, self);
+    }
+
+    interaction "Use Basin" {
+        autonomy: 70,
+        attenuation: 0.025,
+        advertises: [
+            bladder +80 (min: -100),
+            hygiene +25 (min: -100),
+        ],
+        guard(sim) => sim.motive.bladder < max_bladder,
+        run(sim) {
+            self.uses += 1;
+            sim.motive.bladder = 100;
+            wash_hands(sim);
+            return true;
+        }
+    }
+}
