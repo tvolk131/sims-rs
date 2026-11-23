@@ -22,7 +22,7 @@ All 15 remaining executable primitives in `0..52` (opcodes `38, 39, 40` are the 
 
 | Opcode | `.air` Syntax | VM Reference | Notes |
 |---|---|---|---|
-| `0x0003` (3) | `find_best_interaction()` | `autonomy.rs` | Sets `stack_obj` (`SymWord::Unknown`) |
+| `0x0003` (3) | `find_best_interaction()` | `autonomy.rs` | Invokes TTAB check trees; disables closed-caller param inference & reports `InconclusiveProof` when reachable |
 | `0x0009` (9) | `burn(mode:, flags:)` | `burn.rs` | `mode: u8`, `flags: u8` |
 | `0x000a` (10) | `tutorial(mode)` | `events.rs` | Traps when `mode > 1` |
 | `0x000b` (11) | `get_distance_to(temp[N][, from: <op>][, flags: f])` | `distance.rs` | Always-true; `from` reads `ops[3], ops[4..6]` when `flags & 1 != 0`; Global 34 modeled |

@@ -1408,21 +1408,28 @@ impl<'a> TreeBuilder<'a> {
             .iter()
             .filter(|s| !matches!(s, Stmt::Let { init: None, .. }))
             .collect();
+        let mut pending_sids: Vec<u32> = Vec::new();
         for (idx, &stmt) in active.iter().enumerate() {
             let is_last = idx + 1 == active.len();
+            let before = self.nodes.len();
             let fallthrough = if is_last {
                 next_target.clone()
             } else {
-                PendingTarget::Resolved(TARGET_TRUE)
+                let sid = self.alloc_sentinel();
+                PendingTarget::Sentinel(sid)
             };
-            let before = self.nodes.len();
+            let fallthrough_sid = match fallthrough {
+                PendingTarget::Sentinel(sid) if !is_last => Some(sid),
+                _ => None,
+            };
             match stmt {
                 Stmt::Label { span, name } => {
                     if self.labels.insert(name.clone(), self.nodes.len()).is_some() {
                         return Err(Error::at(*span, format!("duplicate label '{name}'")));
                     }
+                    continue;
                 }
-                Stmt::Let { init: None, .. } => {}
+                Stmt::Let { init: None, .. } => continue,
                 Stmt::RawOp {
                     span,
                     opcode,
@@ -1490,54 +1497,58 @@ impl<'a> TreeBuilder<'a> {
                     self.emit(*span, opcode, operands, on_true, on_false)?;
                 }
                 _ => {
-                    let sentinel_id = self.alloc_sentinel();
-                    let entry = self.lower_structured_stmt(
-                        stmt,
-                        if is_last {
-                            next_target.clone()
-                        } else {
-                            PendingTarget::Sentinel(sentinel_id)
-                        },
-                    )?;
+                    let mut entry = self.lower_structured_stmt(stmt, fallthrough)?;
                     if self.nodes.len() == before
                         && let PendingTarget::Resolved(ret) = entry
+                        && self.labels.values().any(|&pos| pos == before)
                     {
                         self.emit_return_node(Span::default(), PendingTarget::Resolved(ret))?;
+                        entry = PendingTarget::Node {
+                            index: before,
+                            span: Span::default(),
+                        };
                     }
-                    if !is_last {
-                        let next_idx = self.nodes.len();
-                        for node in &mut self.nodes[before..] {
-                            patch_sentinel(&mut node.on_true, sentinel_id, next_idx);
-                            patch_sentinel(&mut node.on_false, sentinel_id, next_idx);
+                    for psid in pending_sids.drain(..) {
+                        for node in &mut self.nodes[start_node..] {
+                            patch_sentinel_target(&mut node.on_true, psid, &entry);
+                            patch_sentinel_target(&mut node.on_false, psid, &entry);
                         }
+                    }
+                    if let Some(sid) = fallthrough_sid
+                        && slice_uses_sentinel(&self.nodes[start_node..], &entry, sid)
+                    {
+                        pending_sids.push(sid);
                     }
                     continue;
                 }
             }
-            if !is_last
-                && self.nodes.len() > before
-                && matches!(
-                    stmt,
-                    Stmt::InlineRawOp { .. }
-                        | Stmt::Primitive { branches: None, .. }
-                        | Stmt::Call { branches: None, .. }
-                )
-            {
-                let next_idx = self.nodes.len();
-                let last_node = self.nodes.last_mut().unwrap();
-                last_node.on_true = PendingTarget::Node {
-                    index: next_idx,
-                    span: last_node.span,
+            if self.nodes.len() > before {
+                let target = PendingTarget::Node {
+                    index: before,
+                    span: self.nodes[before].span,
                 };
-                if matches!(
-                    stmt,
-                    Stmt::InlineRawOp { .. } | Stmt::Primitive { branches: None, .. }
-                ) {
-                    last_node.on_false = PendingTarget::Node {
-                        index: next_idx,
-                        span: last_node.span,
-                    };
+                for psid in pending_sids.drain(..) {
+                    for node in &mut self.nodes[start_node..] {
+                        patch_sentinel_target(&mut node.on_true, psid, &target);
+                        patch_sentinel_target(&mut node.on_false, psid, &target);
+                    }
                 }
+                if let Some(sid) = fallthrough_sid
+                    && matches!(
+                        stmt,
+                        Stmt::InlineRawOp { .. }
+                            | Stmt::Primitive { branches: None, .. }
+                            | Stmt::Call { branches: None, .. }
+                    )
+                {
+                    pending_sids.push(sid);
+                }
+            }
+        }
+        for psid in pending_sids {
+            for node in &mut self.nodes[start_node..] {
+                patch_sentinel_target(&mut node.on_true, psid, &next_target);
+                patch_sentinel_target(&mut node.on_false, psid, &next_target);
             }
         }
         if self.nodes.len() == start_node {
@@ -1621,9 +1632,16 @@ impl<'a> TreeBuilder<'a> {
             }
             if let Some(nsid) = next_sid {
                 // If this statement never falls through to `nsid` (for example,
-                // `while true { return false; }`), stop before emitting dead code that
-                // could otherwise occupy node 0 when `entry` is a zero-node jump.
+                // `while true { return false; }`), still lower the remaining dead
+                // statements into throwaway nodes so semantic errors (unknown trees,
+                // bad operands, invalid break/continue) are still diagnosed, then
+                // truncate those unreachable nodes so dead code never occupies node 0.
                 if !slice_uses_sentinel(&self.nodes[slice_start..], &stmt_entry, nsid) {
+                    let saved_nodes = self.nodes.len();
+                    for dead_stmt in &active[i + 1..] {
+                        let _ = self.lower_structured_stmt(dead_stmt, next_target.clone())?;
+                    }
+                    self.nodes.truncate(saved_nodes);
                     break;
                 }
                 prev_sid = Some(nsid);
@@ -1938,14 +1956,6 @@ fn cond_is_negated(cond: &Condition) -> bool {
         Condition::Not(inner) => !cond_is_negated(inner),
         _ => false,
     }
-}
-
-fn patch_sentinel(target: &mut PendingTarget, sentinel_id: u32, actual_next: usize) {
-    let replacement = PendingTarget::Node {
-        index: actual_next,
-        span: Span::default(),
-    };
-    patch_sentinel_target(target, sentinel_id, &replacement);
 }
 
 fn patch_sentinel_target(

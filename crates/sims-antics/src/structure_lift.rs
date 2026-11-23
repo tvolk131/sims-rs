@@ -3754,5 +3754,56 @@ mod tests {
             !lifted.contains("Seulement"),
             "French-only localized STR# must not emit a misleading preview:\n{lifted}"
         );
+
+        // Sol R2 P1-1: Trailing break-only loop in a labeled tree must fall through to TARGET_TRUE
+        // without leaving a dangling edge past the end of the tree.
+        let labeled_trail = &compile_antics(
+            r#"
+            tree 4096 "LabeledTrail" {
+                @start:
+                refresh(target: 0, mode: 0);
+                while true { break; }
+            }
+            "#,
+        )
+        .expect("labeled trailing break-only loop must compile")
+        .behaviors[&4096];
+        assert_eq!(labeled_trail.instructions.len(), 1);
+        assert_eq!(labeled_trail.instructions[0].opcode, 7);
+        assert_eq!(labeled_trail.instructions[0].on_true, TARGET_TRUE);
+        assert_eq!(labeled_trail.instructions[0].on_false, TARGET_TRUE);
+
+        let labeled_mid = &compile_antics(
+            r#"
+            tree 4096 "LabeledMid" {
+                @start:
+                refresh(target: 0, mode: 0);
+                while true { break; }
+                refresh(target: 0, mode: 1);
+            }
+            "#,
+        )
+        .expect("labeled mid break-only loop must compile")
+        .behaviors[&4096];
+        assert_eq!(labeled_mid.instructions.len(), 2);
+        assert_eq!(labeled_mid.instructions[0].on_true, 1);
+        assert_eq!(labeled_mid.instructions[0].on_false, 1);
+        assert_eq!(labeled_mid.instructions[1].on_true, TARGET_TRUE);
+
+        // Sol R2 P2-1: Non-fallthrough cutoff must still report semantic diagnostics in dead code.
+        let dead_err = compile_antics(
+            r#"
+            tree 4096 "DeadErr" {
+                while true { return false; }
+                call Missing();
+            }
+            "#,
+        )
+        .expect_err("dead `call Missing()` after `while true { return false; }` must still error");
+        assert!(
+            dead_err.message.contains("Missing"),
+            "unexpected diagnostic: {}",
+            dead_err.message
+        );
     }
 }

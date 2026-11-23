@@ -2465,6 +2465,14 @@ fn write_sym_operand(state: &mut LockState, scope: u8, idx: i16, val: SymWord) {
                 }
             }
         }
+        13 => {
+            // Scope 13 writes `stack_obj.temp[idx]`; if `stack_obj == me`, this aliases
+            // the actor's `temp[idx]` (`sims-vm/src/memory.rs:447`), so conservatively clear
+            // any known constant in `state.temps[idx]`.
+            if let Some(slot) = state.temps.get_mut(idx as usize) {
+                *slot = SymWord::Unknown;
+            }
+        }
         25 => {
             if let Some(slot) = frame.locals.get_mut(idx as usize) {
                 *slot = val;
@@ -3421,7 +3429,14 @@ pub(crate) fn is_always_true_instruction(ins: &Instruction) -> bool {
 }
 
 /// Conservative trap predicate for primitives inside [`prove_interaction_lock_safety`]:
-/// returns `true` whenever the instruction can raise a VM trap under the current symbolic
+/// Returns the attribute array length `sims-vm` allocates for an `OBJD` chunk:
+/// word 58 read as signed `i16`, clamped to at least 8 (`sims-vm/src/factory.rs:314`).
+fn objd_attribute_count(objd: &ObjdChunk) -> usize {
+    let raw = objd.words.get(58).copied().unwrap_or(0) as i16;
+    usize::try_from(raw).unwrap_or(0).max(8)
+}
+
+/// Returns `true` whenever the instruction can raise a VM trap under the current symbolic
 /// state (even if `is_always_true_instruction` is true because `on_false` is unreachable).
 fn primitive_may_trap_in_lock_prover(
     model: &ObjectModel,
@@ -3462,10 +3477,10 @@ fn primitive_may_trap_in_lock_prover(
                         frame.stack_obj != SymWord::InitialTarget
                             || dst_idx < 0
                             || model.objds.is_empty()
-                            || !model.objds.values().all(|o| {
-                                usize::from(dst_idx as u16)
-                                    < usize::from(o.words.get(58).copied().unwrap_or(0))
-                            })
+                            || !model
+                                .objds
+                                .values()
+                                .all(|o| usize::from(dst_idx as u16) < objd_attribute_count(o))
                     }
                     6 => !matches!(dst_idx, 34 | 36),
                     8 => !(0..8).contains(&dst_idx),
@@ -3488,8 +3503,7 @@ fn primitive_may_trap_in_lock_prover(
                                 SymWord::Const(a)
                                     if a >= 0
                                         && model.objds.values().all(|o| {
-                                            usize::from(a as u16)
-                                                < usize::from(o.words.get(58).copied().unwrap_or(0))
+                                            usize::from(a as u16) < objd_attribute_count(o)
                                         })
                             )
                     }
@@ -3499,7 +3513,20 @@ fn primitive_may_trap_in_lock_prover(
             };
             dst_may_trap || frame.stack_obj != SymWord::InitialTarget || (ops[4] & 1 != 0)
         }
-        15 => !(word_i16(ops, 2) == 7 && word_i16(ops, 0) == 0),
+        15 => {
+            let scope = word_i16(ops, 2);
+            let cond_idx = word_i16(ops, 0);
+            let safe_read = match scope {
+                7 => true,
+                8 => (0..8).contains(&cond_idx),
+                9 => !check_param(cond_idx),
+                25 => !check_local(cond_idx),
+                26 => lookup_bcon(model, cond_idx).is_some(),
+                _ => false,
+            };
+            !(safe_read
+                && eval_sym_operand(model, state, scope as u8, cond_idx) == SymWord::Const(0))
+        }
         16 => {
             frame.stack_obj != SymWord::InitialTarget
                 || (ops[2] & 1 != 0)
@@ -3669,9 +3696,10 @@ fn bhav_uses_global_34(bhav: &BhavChunk) -> bool {
         }
         15 => word_i16(&ins.operands, 2) == 6 && word_i16(&ins.operands, 0) == 34,
         // `UI Effect` (opcode 34) reads Global 34 / scratch pointers (`ui_effect.rs:371`), and
-        // any dynamic tree callback or subroutine call can invoke a callee that observes the
-        // actor's scratch pointer (e.g. `Reach` calling `CT - Grab` with `ui_effect`).
-        3 | 20 | 28 | 30 | 34 | 47 | 256..=u16::MAX => true,
+        // any dynamic tree callback (`FindBestInteraction`, `FindBestObject`, `RunFunctionalTree`,
+        // `RunTreeByName`, `GosubFoundAction`, `Reach`) or subroutine call can invoke a callee on
+        // the actor's stack that observes the scratch pointer.
+        3 | 14 | 20 | 28 | 30 | 34 | 47 | 256..=u16::MAX => true,
         _ => false,
     })
 }
@@ -6919,6 +6947,195 @@ guard = "Guard"
             bp_safe_rep.violations.is_empty(),
             "zero-condition Breakpoint must pass static checks: {:?}",
             bp_safe_rep.violations
+        );
+    }
+
+    #[test]
+    fn sol_wave2_r2_soundness_regressions() {
+        use crate::compile::{compile_antics, compile_object_from_sources};
+
+        let base_manifest = r#"
+[object]
+name = "SolWave2R2Probe"
+guid = 0x50110005
+init = "Init"
+main = "Init"
+scripts = ["behavior.antics"]
+
+[[interaction]]
+name = "Probe"
+action = "Action"
+guard = "Guard"
+"#;
+
+        // R2 P1-2a: OBJD `attributes = 65535` is read as signed `-1`, so VM allocates 8 attributes
+        // (0..8); writing `scope(22, 0)` with `param[0] = 8` traps before lock release!
+        let neg_attrs_manifest = r#"
+[object]
+name = "NegAttrsProbe"
+guid = 0x50110006
+attributes = 65535
+init = "Init"
+main = "Init"
+scripts = ["behavior.antics"]
+
+[[interaction]]
+name = "Probe"
+action = "Action"
+guard = "Guard"
+"#;
+        let attr8_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            tree 4097 "Action" (args: 1) {
+                stack.attr[0] := 1;
+                param[0] := 8;
+                get_direction_to(scope(22, 0));
+                stack.attr[0] := 0;
+                return true;
+            }
+        "#;
+        let neg_obj =
+            compile_object_from_sources(neg_attrs_manifest, &[("behavior.antics", attr8_script)])
+                .unwrap();
+        let neg_rep = verify_object_safety(&neg_obj).unwrap();
+        assert!(
+            neg_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::LockLeak),
+            "attributes=65535 (signed -1 -> 8 slots) must trap on attr[8] and report LockLeak: {:?}",
+            neg_rep.violations
+        );
+
+        // R2 P1-2b: OBJD `attributes = 0` still allocates 8 attributes (0..8) in VM, so writing
+        // `scope(22, 0)` with `param[0] = 2` (distinct from lock `stack.attr[0]`) must not false-leak!
+        let zero_attrs_manifest = r#"
+[object]
+name = "ZeroAttrsProbe"
+guid = 0x50110007
+attributes = 0
+init = "Init"
+main = "Init"
+scripts = ["behavior.antics"]
+
+[[interaction]]
+name = "Probe"
+action = "Action"
+guard = "Guard"
+"#;
+        let attr2_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            tree 4097 "Action" (args: 1) {
+                stack.attr[0] := 1;
+                param[0] := 2;
+                get_direction_to(scope(22, 0));
+                stack.attr[0] := 0;
+                return true;
+            }
+        "#;
+        let zero_obj =
+            compile_object_from_sources(zero_attrs_manifest, &[("behavior.antics", attr2_script)])
+                .unwrap();
+        let zero_rep = verify_object_safety(&zero_obj).unwrap();
+        assert!(
+            zero_rep.violations.is_empty(),
+            "attributes=0 (VM floor 8 slots) must allow attr[2] without false LockLeak: {:?}",
+            zero_rep.violations
+        );
+
+        // R2 P1-3: Scope 13 (`stack.temp[0]`) aliases actor `temp[0]` when actor == stack_obj,
+        // so `get_direction_to(scope(13, 0))` must invalidate `temp[0]` and catch LockLeak!
+        let scope13_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            tree 4097 "Action" {
+                stack.attr[0] := 1;
+                temp[0] := 0;
+                get_direction_to(scope(13, 0));
+                if temp[0] == 0 {
+                    stack.attr[0] := 0;
+                }
+                return true;
+            }
+        "#;
+        let scope13_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", scope13_script)])
+                .unwrap();
+        let scope13_rep = verify_object_safety(&scope13_obj).unwrap();
+        assert!(
+            scope13_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::LockLeak),
+            "GetDirectionTo writing scope(13, 0) must invalidate temp[0] and catch LockLeak: {:?}",
+            scope13_rep.violations
+        );
+
+        // R2 P1-4: Equivalence must NOT erase `0 == 0` scratch-pointer init before FindBestObject!
+        let fbo_with_init = &compile_antics(
+            r#"
+            tree 4096 "A" {
+                if 0 == 0 {
+                    find_best_object(0, 0);
+                }
+                return true;
+            }
+            "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let fbo_without_init = &compile_antics(
+            r#"
+            tree 4096 "B" {
+                find_best_object(0, 0);
+                return true;
+            }
+            "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        assert!(
+            !matches!(
+                check_bhav_equivalent(fbo_with_init, fbo_without_init, &EquivOptions::default()),
+                EquivResult::Equivalent { .. }
+            ),
+            "Equivalence must not erase `0 == 0` scratch-pointer init before FindBestObject"
+        );
+
+        // R2 P2-2: Proved-zero local Breakpoint while holding a lock must NOT false-leak!
+        let bp_lock_safe_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            tree 4097 "Action" (locals: 1) {
+                stack.attr[0] := 1;
+                local[0] := 0;
+                breakpoint(local[0]);
+                stack.attr[0] := 0;
+                return true;
+            }
+        "#;
+        let bp_lock_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", bp_lock_safe_script)])
+                .unwrap();
+        let bp_lock_rep = verify_object_safety(&bp_lock_obj).unwrap();
+        assert!(
+            bp_lock_rep.violations.is_empty(),
+            "proved-zero local Breakpoint must not add false trap edge in lock prover: {:?}",
+            bp_lock_rep.violations
         );
     }
 }
