@@ -29,7 +29,10 @@ The verdicts follow one rule: converge by narrowing the contract, not by
 modeling more. Three review rounds of point fixes kept finding a new loader or
 trap corner, so the fourth round made the contract structural, and the fifth
 closed what it still let through (faults, callees, the replay, file bytes):
-anything the checker does not model exactly is Inconclusive.
+anything the checker does not model exactly is Inconclusive. The sixth round
+replaced patching with two systematic passes over `sims-vm`: an inventory of
+every error `run_tree` can reach ([Fault inventory](#fault-inventory)), and
+callee resolution exactly as `program.rs` does it.
 
 - **Equivalent** must be sound, under two stated model assumptions (below).
 - **Different** (a counterexample) is reported only from a **concrete
@@ -40,8 +43,17 @@ anything the checker does not model exactly is Inconclusive.
   faulting path equals the other side's only when both fault at the same node,
   with the same instruction, from the same state before it; otherwise the
   pair is Inconclusive.
+- **No error is assumed not to happen.** Every error `run_tree` can reach is
+  either modeled exactly (with its whole error value), or a faulting path at
+  its node, or makes the result Inconclusive. Anything a node may fail on gets
+  a faulting path, over-approximating freely.
 - **A tree is only as equivalent as the trees it may run.** Every tree in its
   reach must be the same bytes on both sides or itself proven equivalent.
+- **Callees resolve as in the VM.** Only private trees (4096 to 8191) run from
+  an object's file; 256 to 4095 come from the global library and 8192 and up
+  from the semi-global one (`program.rs:1015`). A file's own copy of a library
+  tree never supplies an argument count, a body or a replay, and `--tree`
+  refuses one.
 - **Whole files are compared only when they differ in BHAV bodies alone.**
   Every other byte must be identical: the file header, each chunk header
   (label field included), every non-BHAV payload, and the resource map apart
@@ -58,16 +70,24 @@ anything the checker does not model exactly is Inconclusive.
   drops is one instruction fewer. The assumption is stated in this ADR, in `--help` for
   `equiv` and `verify-equiv`, and in every EQUIVALENT line they print.
 - **World faults.** Faults the world raises on its own, independent of the
-  tree's code (an object deleted under it, a stack overflow from a deep call
-  chain), are outside the model, as they were for lockstep.
+  tree's code, are outside the model, as they were for lockstep. The
+  [Fault inventory](#fault-inventory) names them: the running object and its
+  frame exist, its ID fits a script word (`memory.rs:365`), and the run does
+  not start with an inline special panel waiting for an answer
+  (`interpreter.rs:500`). Each would fail every operand or node alike, so a
+  per-node faulting path would forbid every dummy node. Faults of the world
+  that come before the first node (a full stack, no frame storage) are the
+  same on both sides and need no assumption.
 
 ### 1. Live-output checker (`verify/live.rs`, `check_bhav_live_equivalent`)
 
 Each tree runs on its own over symbolic inputs. Each path becomes a summary of
 what the rest of the game can observe:
 
-- **Exit:** true, false, error, a modeled VM trap with its native code, or a
-  jump to a missing node. Branches to nodes 251 and 252, and kind-4 entries
+- **Exit:** true, false, error, a modeled VM trap with its native code, a
+  jump to a missing node with the tree's length (both are in the VM's
+  `InvalidBranch` error, `interpreter.rs:1484`), or an unmodeled fault of a
+  primitive, call or operand. Branches to nodes 251 and 252, and kind-4 entries
   past node 250, trap with 0x44c whatever the tree's length
   (`interpreter.rs:766`, `interpreter.rs:1695`). A kind-4 entry runs at the
   entry clamped to the tree's last node (`interpreter.rs:1790`), so trees of
@@ -143,8 +163,11 @@ A candidate becomes a **counterexample** only when a replay confirms it
 2. Both trees run in `sims-vm` (`Interpreter::run_tree`) from the same
    concrete world: one object (the running object, a synthetic definition in
    library 1) with the witness temps and attributes, 64 globals, and frame
-   storage holding the witness params and locals. Each tree sits at its own
-   ID in the global, private or semi-global library, with its file's BCONs.
+   storage holding the witness params and locals. The program is the one the
+   VM builds for an object whose file holds the tree: the tree and the file's
+   BCONs in the object's own library, an empty global library and no
+   semi-global one. Only private trees have such a program; any other tree is
+   not replayed, so its candidate stays Inconclusive.
 3. Only trees whose every reachable node is an `Expression` are replayed. A
    primitive or call could reach state the replay world lacks.
 4. The checker compares, field by field, only the plain words the replay
@@ -190,7 +213,8 @@ whatever the node had done by then to the frame words, their unknown markers
 and the last result (`interpreter.rs:809`). The checker does not model that
 partial state. For example, `local := sqrt(-1)` clears the local's unknown
 marker before it traps (`expression.rs:69`). Instead each faulting path
-records a **fault point**: the node, its opcode and operands, and the whole
+records a **fault point**: the tree's ID (a fault names its tree), the node,
+its opcode and operands, and the whole
 state before the node ran (the event history, tracked cells, scratch
 pointer, last result, params, locals and which locals may be unwritten).
 Everything the fault leaves is a function of these, so two faults are equal
@@ -219,6 +243,7 @@ What the checker models from `sims-vm`:
   - 0x0d for a flag index out of range;
   - 0x13 for writing to a literal, checked before the zero check for `%=`;
   - out-of-range temp (2), param or local (8), and attribute (6);
+  - scope 10 with a nonzero index (0x0f), and scopes 2, 5 and 39 to 255 (9);
   - square root of a negative number, which is reported as its own exit.
 - **`++` and `--` compares** (ops 11 and 17).
 - **Literal folding** and identities that hold for every 16-bit value. This
@@ -231,6 +256,92 @@ What the checker models from `sims-vm`:
 Global 34 operands, and Random or GetDirectionTo with Global 34 or scope 22
 aliasing, return `Inconclusive`. Kind-4 trees are checked from every entry
 node.
+
+### Fault inventory
+
+Every error `Interpreter::run_tree` (`interpreter.rs:322`) can return for the
+tree under check, and how the checker handles it. `run_tree` calls `run`
+(`interpreter.rs:477`) with `most = usize::MAX`: it enters the tree, then
+steps it until it returns, faults, yields or exhausts its budget. A
+`Fault` is `{object, at: {tree, node}, trap}`, so each error names its tree
+and node; every row below is compared with both.
+
+Handling:
+
+- **Exact:** the checker produces the VM's error, its fields included, at
+  the same node, and compares it with the same rule as any fault. A native
+  error's message is fixed by the site that raises it (0x26 says "division"
+  or "remainder" by operator), and the fault point includes the instruction,
+  so equal fault points carry equal messages.
+- **Fault path:** the node gets a faulting path at that point, with the whole
+  state (see `FaultPoint`). It equals the other side's only for the same
+  node, instruction, events, store, scratch, last result and frame, so it
+  never needs the error value.
+- **Same on both sides:** the error depends only on inputs both runs share
+  (the world, the caller's arguments, the tree's ID and header, all of which
+  are checked equal first), and is raised before the tree's first node runs.
+- **Inconclusive:** the checker gives up on the pair.
+- **Assumption:** one of the two model assumptions above.
+- **Cannot happen:** the VM's own invariants rule it out; the reason is given.
+
+| Where (`sims-vm`) | Error | Handling |
+|---|---|---|
+| **Entering the tree** (`enter_as`, `interpreter.rs:931`; faults at node 0, before any node runs) | | |
+| `objects.get(owner)` | native 0x15, missing object | Same on both sides |
+| type table, type ID, `definition` | `Invalid` (GUID not in the type table, type ID too big, no definition) | Same on both sides |
+| `behavior(owner, tree)` | `MissingTree`, `Invalid` for IDs 0 to 255 | Cannot happen: the tree under check is in the program. Only private trees are checked from a file, and the VM runs those from the object's own library (callee resolution below) |
+| `dimensions` | `Invalid` "BHAV has no instructions" | Inconclusive (`check_bhav_live_equivalent`) |
+| `dimensions` | `Unsupported` format outside 0x8000 to 0x8002 | Inconclusive (round 6) |
+| `args.len() > 255` | `Invalid` | Same on both sides: different tree IDs are Inconclusive (round 6), so the fault is the same value |
+| `argc > most` | `Unsupported` | Cannot happen: `run_tree` passes `most = usize::MAX` |
+| `entry_node` | `Unsupported` negative kind-4 entry | Same on both sides (same ID and kind); a kind mismatch is Inconclusive |
+| stack depth | `StackOverflow` | Same on both sides (the world's stack) |
+| `push_frame` | `Invalid` "no frame storage", empty stack | Same on both sides |
+| **Each node** (`step`, `interpreter.rs:1361`) | | |
+| `current_cached` | native 0x44c for a node past 250 | Exact at entry: an entry past node 250 is equal only to the same entry of the same tree ID with the same frame, otherwise Inconclusive. Cannot happen after a branch: branches check their target first |
+| `current_cached` | `Invalid` node outside the tree | Cannot happen: the entry is clamped to the last node and every branch checks its target |
+| flagged opcode (`opcode & 0x8000`) | `Unsupported` | Fault path: any opcode other than 2 is a primitive or call to the checker |
+| animator refresh, `refuse_unsettled_animator` | `Unsupported`, both-ways runs | Fault path for primitives. Cannot happen for Expression: `reads_no_animator(2)` (`placement.rs:239`) |
+| `primitive_state != 0` | `Unsupported` resuming a primitive | Fault path for primitives. Cannot happen for Expression: a frame starts at 0 and every branch resets it (`interpreter.rs:1482`) |
+| a primitive's error | any `Trap` | Fault path (every primitive, before and after its event) |
+| a primitive's yield | native 0x44f, or `Ok(false)` with an unanswered inline special panel (`interpreter.rs:500`) | Fault path: the run ends at that node, from the same state on both sides or not at all |
+| thread restarted by a primitive | `Unsupported` | Fault path |
+| an inline special panel already unanswered when the run starts | every node, Expression included, ends the run with `Ok(false)` after it runs (`interpreter.rs:1442`) | Assumption (world faults) |
+| branch to node ≤ 250 past the end | `InvalidBranch { target, count }`, after setting the last result | Exact: `Exit::BadNode(target, count)`, at the branching node with the last result (round 6 added `count`) |
+| branch to 253 | `ErrorBranch` | Exact: `Exit::Error` at the branching node |
+| branch to 251 or 252 | native 0x44c | Exact: `Exit::Trap(0x44c)` |
+| return, then the caller's branch | `InvalidBranch` with the caller's `count`, `ErrorBranch`, 0x44c | Exact: the call node's own branch exits, as above |
+| budget | `BudgetExhausted` | Assumption (instruction budget) |
+| **Calls** (`call`, `interpreter.rs:1516`, opcode ≥ 256) | | |
+| stack depth, `resolve_owner`, `behavior_from_owner` | `StackOverflow`, `Invalid`, `MissingTree` | Fault path at the call node |
+| callee's `dimensions`, argument copy, `entry_node`, `push_frame` | `Invalid`, `Unsupported` (temps past 8, arguments read past the end of the BHAV), entry | Fault path at the call node. The argument bytes are compared too: by the callee's argument count when the VM's own library gives it, else the whole suffix of the tree |
+| anything inside the callee | any | The callee is in the tree's reach: it must be the same bytes, or proven equivalent with its own faults compared by this table (cycles by induction). A callee from a library not supplied, or an undefined tree, puts every private tree in reach |
+| **Operands** (`locate`, `memory.rs:364`, then `value` and `store`) | | |
+| `frame()`, `me()`, the running object's ID fitting a word, `object(me)` | `Invalid`, native 10 | Assumption (world faults): they fail for every operand of every node alike, so a per-node fault path would forbid every dummy node |
+| temp 0 to 7 (scope 8), `my` attribute 0 to 7 (scope 0) | none | Cannot happen: every object has 8 temps (`saved_objects.rs:384`) and at least 8 attributes (`factory.rs:314`, `objects.rs:530`). `--my-attributes N` states that the object has N |
+| temp outside 0 to 7 | native 2 | Exact |
+| `my` attribute index < 0 | native 6 | Exact |
+| `my` attribute past the stated count | native 6 | Fault path (opaque read or write) |
+| parameter or local out of range (scopes 9, 25, 22) | native 8 | Exact |
+| scope 10 index ≠ 0 | native 0xf | Exact |
+| scopes 2, 5, 39 to 255 | native 9 | Exact |
+| a local the tree may not have written | `Unsupported` (`check_local`, `interpreter.rs:1277`) | Fault path at the read (round 6) |
+| global 0 to 63 (scope 6) | native 0x3f out of range, `Invalid` on old saves with 32 globals | Fault path at the read or write (round 6) |
+| global 34 | scratch-pointer aliasing, null read | Inconclusive |
+| writing a global other than 34, 36, 3 (`memory.rs:684`) | native 0x13 | Fault path at the write (round 6) |
+| every other scope (stack object, data, person, motive, slot, room, neighbor, definition, dynamic sprite, advertisement, ...) | native codes, `Invalid`, `Unsupported` (motive conversions, unknown person words, data words 2, 3, 11) | Fault path at the read and at the write (round 6). The event records the whole store, so a temp the VM indexes by (scopes 11, 17, 23, 27) is compared |
+| BCON (scope 26), the file's own table | `Invalid` "no tuning constant" | Exact when the file's constants are known: a constant reads as its value, a missing one is an opaque read with a fault path. The files' tables must be equal when either tree may read one |
+| BCON in the semi-global or global tables (64 to 191) | `Invalid` | Fault path (opaque read) |
+| **Expression** (`expression.rs:25`), after its operands | | |
+| right operand Global 34 | `Unsupported` | Inconclusive |
+| op 7 or 8 (divide, remainder) by zero | native 0x26 | Exact |
+| op 9 or 10 flag index outside 0 to 15 (0 to 16 on motives) | native 0x0d | Exact for integer destinations; fault path (opaque write) for motives |
+| op 12 on a literal | native 0x13, before the 0x26 check | Exact |
+| ops 11 and 17 on a literal | native 0x13 | Exact |
+| op 20 of a negative number | `Unsupported` | Exact (`Exit::Trap(NEGATIVE_SQRT)`, its own exit) |
+| an operator above 20 | native 0x01 | Inconclusive |
+| any write to a literal | native 0x13 | Exact |
+| motive destinations | float arithmetic, clamps, 0x13 for integer-only operators, `Unsupported` for ++ and -- | Fault path at the read and the write; the value written is an event, so both sides must write the same thing |
 
 ### 2. Combined checker (`check_bhav_equivalent_combined`)
 
@@ -254,6 +365,8 @@ reports which method decided (`EquivMethod`).
     nodes do, not how; two nodes that compute the same thing differently can
     fault differently. With the same bytes at the same numbers, the two runs
     are the same run;
+  - the trees have the same ID, format, kind and length (round 6). A fault
+    names its tree, and a branch past the end reports the tree's length;
   - the frames have the same size. With silent steps off, lockstep matches
     every frame write, so equal frames end with equal residue;
   - when the last result is observed, it never differed between the sides
@@ -340,10 +453,31 @@ unless all of the following hold:
     copies every other byte (the unused word, labels, pad bytes) as it is.
     A map it cannot walk compares by its raw bytes.
 
-Then only `BHAV` bodies can differ, and each goes through the combined
-checker, with its file's arities and BCONs (identical in both files by the
-rule above) plus any `--with <file.iff>` arities. A tree whose argument count
-differs is `Inconclusive`. A tree that is the same bytes, or proven
+Then only `BHAV` bodies can differ. Each private tree (4096 to 8191) goes
+through the combined checker, with its file's BCONs (identical in both files
+by the rule above) and the argument counts of the trees its calls run:
+
+- **Callees resolve as `program.rs:1015` does.** A call to 4096 to 8191 runs
+  the object's own tree, so the file supplies it. A call to 256 to 4095 runs
+  the global library's tree and one to 8192 and up the semi-global one's,
+  whatever the file holds under that ID; their argument counts come only
+  from `--global <Global.iff>` and `--semi-global <file.iff>` (the old
+  `--with` took any file's trees for any ID). A file's own chunk in those
+  ranges never supplies an argument count, a body or a replay.
+- **A callee whose argument count is unknown** (its library not supplied, or
+  an undefined tree) is compared conservatively: the call node and every node
+  after it must be the same bytes on both sides, which covers every argument
+  count the VM could read. Its body is outside both files, but both runs use
+  the same game's library, so it may run anything: every private tree of the
+  file is then in the tree's reach. This is a judgement: making every such
+  call Inconclusive would lose every tree that calls the game library, and
+  the suffix rule plus the reach rule are sound for any callee.
+- **Trees in the library ranges** in an object's file are never run by the
+  VM from that file, so they compare as bytes only: the same bytes are
+  Identical, anything else is Inconclusive with the reason. `--tree` refuses
+  them (exit 2).
+
+A tree whose argument count differs is `Inconclusive`. A tree that is the same bytes, or proven
 equivalent, is reported so only when every tree in its reach is too (see
 section 2). Otherwise it is `Inconclusive` and names the tree it may run.
 
@@ -363,8 +497,8 @@ its reach are checked too, and it is `Inconclusive` unless they all behave
 the same. The CLI exits 0, 1 or 2 for
 these, and with 2 on usage or I/O errors. The CLI flags are:
 
-- `--tree <id>`
-- `--with <iff>` (repeatable)
+- `--tree <id>` (a private tree, 4096 to 8191)
+- `--global <iff>` and `--semi-global <iff>` (repeatable)
 - `--my-attributes <n>` (at least 8)
 - `--ignore-scratch-pointer`
 - `--ignore-last-result` (also on `equiv`)
@@ -425,6 +559,28 @@ the replay uses its public API only.
     `replay_frame_reads_back_the_witness`;
   - `file_and_chunk_headers_compare_byte_for_byte`: a map one header points
     at, and a label byte after the NUL;
+- round 6 adds each of Sol's repros, plus the inventory's new rules:
+  - `failing_operands_fault_at_their_node`: `temp[0] = global[64]` after
+    one node vs two, an unwritten local read and a `global[5]` write at
+    different nodes, and the same trap in trees 4096 and 4097;
+  - `missing_node_faults_carry_the_tree_length`: a jump to node 2 of a
+    one-node vs a two-node tree, live and combined, and format 0x8003;
+  - `library_trees_in_an_object_file_supply_nothing`: an embedded #256 does
+    not supply the callee's argument count, `--global`'s does, and a private
+    callee that differs is named;
+  - `library_range_trees_are_never_replayed`: #256 differing is
+    Inconclusive, `--tree 256` is refused (also on the CLI, exit 2), and only
+    a private tree's difference is replayed into a counterexample;
+  - `recursive_call_graphs`: 4096 and 4097 calling each other, proven by
+    induction, and both undecided once one of them differs;
+  - `different_tree_ids_never_fault_alike`: the same bytes under 4096 and
+    4097, live and combined (lockstep pairs every node).
+  Each round-6 guard was removed in turn (14 mutations: the opaque-read,
+  unwritten-local and opaque-write fault paths, the bad branch's count, the
+  lockstep header rule, the format check, the fault's tree, the different-ID
+  rule, private-only arities and reach, the replay library, `--tree`'s
+  refusal, byte-only library trees, and the callee rule on cycles), and each
+  made at least one of these tests fail;
 - the round-5 P2 fixtures fail when their guard is removed. This was checked
   by removing each guard in turn: the fault-point comparison, the primitive
   fault path, the fault point's last result and instruction, the replay's
@@ -441,23 +597,24 @@ the replay uses its public API only.
 ## Results (Complete Collection, `SIMS_INSTALL`, in memory, counts only)
 
 `tests/live_equiv_corpus.rs`, default options (last result observed), after
-the round-5 fixes (round-4 numbers in brackets):
+the round-6 fixes (round-5 numbers in brackets):
 
 - **Self-check:** 28,690 trees, each checked against itself.
-  - **16,685 Equivalent** [16,744]. The 59 lost now exceed a budget: every
-    primitive and call adds a faulting path, so more trees pass 4,096 paths.
-  - 12,005 Inconclusive. Of these, 10,880 have a loop whose exit depends on an
-    event or input, 884 exceed 4,096 paths, 124 are empty, 108 exceed the pair
-    budget and 9 use Global 34.
+  - **16,650 Equivalent** [16,685]. The 35 lost exceed a budget: every
+    untracked operand now adds a faulting path too.
+  - 12,040 Inconclusive. Of these, 9,478 have a loop whose exit depends on an
+    event or input, 2,289 exceed 4,096 paths, 140 exceed the pair budget, 124
+    are empty and 9 use Global 34.
   - **0 counterexamples.**
 - **Structured lift, recompiled:** of the 27,781 trees lockstep proves
-  equivalent, live-output agrees on **9,636** [13,784], is Inconclusive on
-  18,145, and **contradicts it on 0**. Most of the 4,148 lost are trees whose
-  lift moves a primitive or call to another node number. Any primitive may
-  now fault, and a fault leaves its node on the stack, so the node is
-  observable: 6,972 Inconclusive results name a primitive that runs at
-  different nodes, 12 a trap and 6 an error exit. This is the intended effect
-  of the fault rule. Lockstep still proves these trees.
+  equivalent, live-output agrees on **7,784** [9,636], is Inconclusive on
+  19,997, and **contradicts it on 0**. The lost trees are lifts that move a
+  fallible node to another node number. Any primitive, call or untracked
+  operand may fault, and a fault leaves its node on the stack, so the node is
+  observable: 6,944 Inconclusive results name a primitive or call at
+  different nodes, 1,851 an operand (new in round 6), 12 a trap and 6 an
+  error exit. This is the intended effect of the fault rule. Lockstep still
+  proves these trees.
 - **One-node dummy compares** whose branches agree: 309 trees.
   - Last result observed: 46 proven, 172 undecided on the last result alone,
     0 counterexamples.

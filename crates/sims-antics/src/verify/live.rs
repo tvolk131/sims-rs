@@ -671,6 +671,8 @@ struct Outputs {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct FaultPoint {
     /// The tree's ID: a fault names the tree it happened in (`fault.rs`, `Location`).
+    /// Trees with different IDs are already Inconclusive on entry; this keeps the
+    /// fault point a whole description of the VM's error location on its own.
     tree: u16,
     /// `u8::MAX` for an entry past the last node, which faults before any node runs.
     node: u8,
@@ -1227,7 +1229,7 @@ impl Explorer<'_> {
             Err(code) => {
                 out.push(self.finish(state, Exit::Trap(code), interner));
                 return Ok(out);
-            },
+            }
         };
         state.scratch = Scratch::Expression;
         let lhs_loc = self.locate(&state, lhs_scope, lhs_idx)?;
@@ -1243,9 +1245,9 @@ impl Explorer<'_> {
             let lhs = match self.read(&mut state, lhs_scope, lhs_idx, &mut out, interner)? {
                 Ok(v) => v,
                 Err(code) => {
-                out.push(self.finish(state, Exit::Trap(code), interner));
-                return Ok(out);
-            },
+                    out.push(self.finish(state, Exit::Trap(code), interner));
+                    return Ok(out);
+                }
             };
             let (atom, t, f, negated) = match op {
                 0 => (Atom::Lt(rhs, lhs), ins.on_true, ins.on_false, false),
@@ -1339,9 +1341,9 @@ impl Explorer<'_> {
             let value = mk_op(3, lhs, Val::Const(delta), interner);
             if !writable {
                 {
-                out.push(self.finish(state, Exit::Trap(0x13), interner));
-                return Ok(out);
-            };
+                    out.push(self.finish(state, Exit::Trap(0x13), interner));
+                    return Ok(out);
+                };
             }
             self.write(&mut state, lhs_loc, value);
             let atom = if op == 11 {
@@ -1697,6 +1699,19 @@ pub fn check_bhav_live_equivalent(
 ) -> EquivResult {
     if let Some(reason) = super::context_mismatch(a, ctx_a, b, ctx_b) {
         return EquivResult::Inconclusive { reason };
+    }
+    // A fault names its tree (`fault.rs`, `Location`), and every tree can fault on
+    // entry, before any node runs, on inputs both runs share: more than 255 arguments,
+    // a negative kind-4 entry, a full stack (`interpreter.rs:931`). So two trees with
+    // different IDs never fault alike.
+    if a.id != b.id {
+        return EquivResult::Inconclusive {
+            reason: format!(
+                "the trees have different IDs (#{} vs #{}), and a fault names its tree; any \
+                 tree can fault on entry",
+                a.id, b.id
+            ),
+        };
     }
     // Only a kind-4 tree is entered at a node other than 0 (`interpreter.rs:1792`), but
     // whether other kinds differ anywhere else is not modeled.

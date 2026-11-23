@@ -1822,13 +1822,14 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
         let bytes = read(extra)?;
         let arities = extract_bhav_arities_from_iff(&bytes)
             .map_err(|e| format!("{}: {e}", extra.display()))?;
-        opts.extra_arities.extend(arities.into_iter().filter(|&(id, _)| {
-            if *semi {
-                id >= 8192
-            } else {
-                (256..=4095).contains(&id)
-            }
-        }));
+        opts.extra_arities
+            .extend(arities.into_iter().filter(|&(id, _)| {
+                if *semi {
+                    id >= 8192
+                } else {
+                    (256..=4095).contains(&id)
+                }
+            }));
     }
     let (a, b) = (read(&path_a)?, read(&path_b)?);
     let report = check_iff_equivalent(&a, &b, &opts).map_err(|e| e.to_string())?;

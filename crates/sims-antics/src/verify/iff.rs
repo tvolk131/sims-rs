@@ -68,7 +68,13 @@ pub fn not_run_from_file(id: u16) -> Option<String> {
         format!(
             "the VM never runs BHAV #{id} from an object's file: it takes {} from the {} \
              library",
-            if id < 256 { "IDs below 256 as primitives, not trees, and 256 to 4095" } else if id < 4096 { "256 to 4095" } else { "8192 and up" },
+            if id < 256 {
+                "IDs below 256 as primitives, not trees, and 256 to 4095"
+            } else if id < 4096 {
+                "256 to 4095"
+            } else {
+                "8192 and up"
+            },
             if id < 4096 { "global" } else { "semi-global" }
         )
     })

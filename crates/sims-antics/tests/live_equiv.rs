@@ -1919,3 +1919,281 @@ fn whole_file_trees_depend_on_their_callees() {
     let report = check_iff_equivalent(&a, &dummy, &opts).expect("check");
     assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
 }
+
+/// Round 6, finding 1: an operand the checker does not track may fail to read or write
+/// (`global[64]` is out of range, `memory.rs:426`), and a local the tree may not have
+/// written may fail to read (`interpreter.rs:1277`). Each is a fault at its node, so
+/// the same read one node later is a different fault.
+#[test]
+fn failing_operands_fault_at_their_node() {
+    let pass = |next| expr((LIT, 0), EQ, (LIT, 0), next, next);
+    let shifted = |op: Instruction| {
+        let one = tree(4096, 0, 1, vec![pass(1), op.clone()]);
+        let two = tree(4096, 0, 1, vec![pass(1), pass(2), op]);
+        (one, two)
+    };
+    for op in [
+        // A read the VM fails: global 64 is past the 64 globals.
+        expr((TEMP, 0), SET, (GLOBAL, 64), T, T),
+        // A read of a local nothing wrote yet.
+        expr((TEMP, 0), SET, (LOCAL, 0), T, T),
+        // A write the VM fails: global 5 is not writable.
+        expr((GLOBAL, 5), SET, (LIT, 1), T, T),
+    ] {
+        let (one, two) = shifted(op);
+        let result = live(&one, &two);
+        assert_inconclusive(&result);
+        let EquivResult::Inconclusive { reason } = &result else {
+            unreachable!()
+        };
+        assert!(reason.contains("failing operand"), "{reason}");
+        // The same tree on both sides is still equivalent.
+        assert_equivalent(&live(&two, &two));
+    }
+    // A fault names the tree it happened in.
+    let divide = |id| tree(id, 0, 0, vec![expr((TEMP, 0), DIV, (TEMP, 1), T, T)]);
+    assert_equivalent(&live(&divide(4096), &divide(4096)));
+    assert_inconclusive(&live(&divide(4096), &divide(4097)));
+}
+
+/// Round 6, finding 2: a jump to a missing node is `InvalidBranch { target, count }`
+/// (`interpreter.rs:1484`), whose count is the tree's length.
+#[test]
+fn missing_node_faults_carry_the_tree_length() {
+    let jump = expr((LIT, 0), EQ, (LIT, 0), 2, 2);
+    let short = tree(4096, 0, 0, vec![jump.clone()]);
+    let long = tree(4096, 0, 0, vec![jump, expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    let result = live(&short, &long);
+    assert_inconclusive(&result);
+    assert_equivalent(&live(&long, &long));
+    // Lockstep pairs node 0 with node 0, but its proof does not cover the length.
+    let ctx = LiveContext::default();
+    let (_, combined) = check_bhav_equivalent_combined(
+        &short,
+        &ctx,
+        &long,
+        &ctx,
+        &EquivOptions::default(),
+        &LiveOptions::default(),
+    );
+    assert_inconclusive(&combined);
+    // The VM enters formats 0x8000 to 0x8002 only.
+    let mut odd = short.clone();
+    odd.format = 0x8003;
+    assert_inconclusive(&live(&short, &odd));
+}
+
+/// Round 6, fault inventory: a fault names its tree, and any tree can fault on entry
+/// (more than 255 arguments, a full stack), so trees with different IDs are never
+/// equivalent, even when their bodies are the same bytes and lockstep pairs every node.
+#[test]
+fn different_tree_ids_never_fault_alike() {
+    let ctx = LiveContext::default();
+    let combined = |a: &BhavChunk, b: &BhavChunk| {
+        check_bhav_equivalent_combined(
+            a,
+            &ctx,
+            b,
+            &ctx,
+            &EquivOptions::default(),
+            &LiveOptions::default(),
+        )
+        .1
+    };
+    for body in [
+        vec![expr((LIT, 0), EQ, (LIT, 0), T, T)],
+        vec![expr((TEMP, 0), DIV, (TEMP, 1), T, T)],
+    ] {
+        let a = tree(4096, 0, 0, body.clone());
+        let b = tree(4097, 0, 0, body);
+        assert_inconclusive(&live(&a, &b));
+        assert_inconclusive(&combined(&a, &b));
+        assert_equivalent(&live(&a, &a));
+        assert_equivalent(&combined(&a, &a));
+    }
+}
+
+/// Round 6, finding 3: a call to 256..=4095 runs the global library's tree, whatever
+/// the object's file holds under that ID (`interpreter.rs:695`). The file's own copy
+/// must not supply the callee's argument count, which decides whether the call reads
+/// the next node's bytes as arguments.
+#[test]
+fn library_trees_in_an_object_file_supply_nothing() {
+    let embedded = tree(256, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    let file = |next: Instruction| {
+        let main = tree(4096, 0, 0, vec![prim(256, [0; 8], T, F), next]);
+        write_iff(&[bhav_chunk(&embedded, "Lib"), bhav_chunk(&main, "Main")]).unwrap()
+    };
+    // The node after the call is never run; only its opcode word differs.
+    let a = file(expr((LIT, 0), EQ, (LIT, 0), T, T));
+    let b = file(prim(3, [0; 8], T, T));
+    let main_verdict = |extra: &[(u16, usize)]| {
+        let opts = IffEquivOptions {
+            extra_arities: extra.iter().copied().collect(),
+            ..IffEquivOptions::default()
+        };
+        let report = check_iff_equivalent(&a, &b, &opts).expect("check");
+        report
+            .resources
+            .iter()
+            .find(|r| r.id == 4096)
+            .unwrap()
+            .verdict
+            .clone()
+    };
+    // Unknown: the global tree may take more than four arguments.
+    assert!(
+        matches!(main_verdict(&[]), ResourceVerdict::Inconclusive { .. }),
+        "{:?}",
+        main_verdict(&[])
+    );
+    // Five arguments read the next node's opcode word.
+    assert!(
+        matches!(
+            main_verdict(&[(256, 5)]),
+            ResourceVerdict::Inconclusive { .. }
+        ),
+        "{:?}",
+        main_verdict(&[(256, 5)])
+    );
+    // Four fit in the call's own operands.
+    assert!(
+        matches!(
+            main_verdict(&[(256, 4)]),
+            ResourceVerdict::Equivalent { .. }
+        ),
+        "{:?}",
+        main_verdict(&[(256, 4)])
+    );
+    // The call runs the global tree, which may run any private tree of the object, not
+    // the embedded copy: a private tree that differs leaves the caller undecided.
+    let other = |target| tree(4097, 0, 0, vec![prim(5, [0; 8], target, target)]);
+    let with_other = |target| {
+        let main = tree(4096, 0, 0, vec![prim(256, [0; 8], T, F)]);
+        write_iff(&[
+            bhav_chunk(&embedded, "Lib"),
+            bhav_chunk(&main, "Main"),
+            bhav_chunk(&other(target), "Other"),
+        ])
+        .unwrap()
+    };
+    let opts = IffEquivOptions {
+        extra_arities: [(256, 0)].into_iter().collect(),
+        ..IffEquivOptions::default()
+    };
+    let report = check_iff_equivalent(&with_other(T), &with_other(F), &opts).expect("check");
+    let main = report.resources.iter().find(|r| r.id == 4096).unwrap();
+    match &main.verdict {
+        ResourceVerdict::Inconclusive { why } => assert!(why.contains("#4097"), "{why}"),
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+}
+
+/// Round 6, finding 4: the VM never runs an object file's copy of a library tree, so
+/// it is neither compared nor replayed, and `--tree` refuses it.
+#[test]
+fn library_range_trees_are_never_replayed() {
+    let returns = |target| {
+        tree(
+            256,
+            0,
+            0,
+            vec![expr((LIT, 0), EQ, (LIT, 0), target, target)],
+        )
+    };
+    let a = write_iff(&[bhav_chunk(&returns(T), "Lib")]).unwrap();
+    let b = write_iff(&[bhav_chunk(&returns(F), "Lib")]).unwrap();
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    match &report.resources[0].verdict {
+        ResourceVerdict::Inconclusive { why } => assert!(why.contains("never runs"), "{why}"),
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+    let opts = IffEquivOptions {
+        tree: Some(256),
+        ..IffEquivOptions::default()
+    };
+    let error = check_iff_equivalent(&a, &b, &opts).unwrap_err().to_string();
+    assert!(error.contains("never runs BHAV #256"), "{error}");
+    let dir = scratch_dir("library-tree");
+    let (pa, pb) = (dir.join("a.iff"), dir.join("b.iff"));
+    std::fs::write(&pa, &a).unwrap();
+    std::fs::write(&pb, &b).unwrap();
+    let out = cli()
+        .arg("verify-equiv")
+        .arg(&pa)
+        .arg(&pb)
+        .args(["--tree", "256"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    // The replay builds the program the VM would: a library tree has none, so its
+    // candidate difference stays undecided; the same trees as private ones differ.
+    assert_inconclusive(&live(&returns(T), &returns(F)));
+    let private = |target| {
+        tree(
+            4096,
+            0,
+            0,
+            vec![expr((LIT, 0), EQ, (LIT, 0), target, target)],
+        )
+    };
+    assert_counterexample(&live(&private(T), &private(F)));
+}
+
+/// Round 6: trees that call each other. A cycle is proven by induction when every
+/// tree in it is the same or proven equivalent, and a tree in the cycle that is not
+/// leaves every caller in it undecided.
+#[test]
+fn recursive_call_graphs() {
+    let calls = |callee| prim(callee, [0; 8], T, F);
+    let main_a = tree(4096, 0, 0, vec![calls(4097)]);
+    // The same call, then a dummy node on its true branch.
+    let main_b = tree(
+        4096,
+        0,
+        0,
+        vec![prim(4097, [0; 8], 1, F), expr((LIT, 0), EQ, (LIT, 0), T, T)],
+    );
+    let back = tree(4097, 0, 0, vec![calls(4096)]);
+    let file = |main: &BhavChunk, back: &BhavChunk| {
+        write_iff(&[bhav_chunk(main, "Main"), bhav_chunk(back, "Back")]).unwrap()
+    };
+    let verdict = |report: &IffEquivReport, id: u16| {
+        report
+            .resources
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .verdict
+            .clone()
+    };
+    // The dummy node leaves the scratch pointer set; this test is about the calls.
+    let live = LiveOptions {
+        observe_scratch_pointer: false,
+        ..LiveOptions::default()
+    };
+    let (a, b) = (file(&main_a, &back), file(&main_b, &back));
+    for tree in [None, Some(4096), Some(4097)] {
+        let opts = IffEquivOptions {
+            tree,
+            live,
+            ..IffEquivOptions::default()
+        };
+        let report = check_iff_equivalent(&a, &b, &opts).expect("check");
+        assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+    }
+    // Break the cycle's other tree: it now returns false whatever its callee does.
+    let back_b = tree(4097, 0, 0, vec![prim(4096, [0; 8], F, F)]);
+    let b = file(&main_b, &back_b);
+    let opts = IffEquivOptions {
+        live,
+        ..IffEquivOptions::default()
+    };
+    let report = check_iff_equivalent(&a, &b, &opts).expect("check");
+    for id in [4096, 4097] {
+        assert!(
+            matches!(verdict(&report, id), ResourceVerdict::Inconclusive { .. }),
+            "{report:#?}"
+        );
+    }
+}
