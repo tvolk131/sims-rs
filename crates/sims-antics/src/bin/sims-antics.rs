@@ -159,6 +159,10 @@ fn sanitize_single_line(s: &str) -> String {
     out
 }
 
+fn sanitize_path_display(path: &Path) -> String {
+    sanitize_single_line(&path.display().to_string())
+}
+
 fn normalize_archive_path(s: &str) -> String {
     s.replace('\\', "/")
 }
@@ -177,7 +181,8 @@ fn format_ambiguous_matches(query: &str, matches: &[&far::Entry]) -> String {
         .collect();
     names.sort();
     let mut msg = format!(
-        "ambiguous --entry '{query}' matched {} FAR entries:",
+        "ambiguous --entry '{}' matched {} FAR entries:",
+        sanitize_single_line(query),
         names.len()
     );
     for name in names.iter().take(MAX_LISTED) {
@@ -260,8 +265,9 @@ fn resolve_far_entry<'a>(
     }
 
     Err(format!(
-        "FAR entry '{query}' not found in {} (use --list to list .iff entries)",
-        archive_path.display()
+        "FAR entry '{}' not found in {} (use --list to list .iff entries)",
+        sanitize_single_line(query),
+        sanitize_path_display(archive_path)
     ))
 }
 
@@ -329,27 +335,28 @@ fn open_regular_file_nonblocking(path: &Path) -> std::io::Result<std::fs::File> 
 }
 
 fn read_regular_file_prefix(path: &Path) -> Result<(std::fs::File, u64, Vec<u8>), String> {
+    let safe_path = sanitize_path_display(path);
     // Reject non-regular files (such as FIFOs/directories) before opening so a named pipe
     // cannot block waiting for a writer, then open non-blocking and re-verify the opened fd.
     let pre_meta =
-        std::fs::metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+        std::fs::metadata(path).map_err(|e| format!("failed to stat {safe_path}: {e}"))?;
     if !pre_meta.file_type().is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
+        return Err(format!("{safe_path} is not a regular file"));
     }
     let mut file = open_regular_file_nonblocking(path)
-        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        .map_err(|e| format!("failed to open {safe_path}: {e}"))?;
     let meta = file
         .metadata()
-        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+        .map_err(|e| format!("failed to stat {safe_path}: {e}"))?;
     if !meta.file_type().is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
+        return Err(format!("{safe_path} is not a regular file"));
     }
     let file_len = meta.len();
     let mut header = Vec::with_capacity(16);
     (&mut file)
         .take(16)
         .read_to_end(&mut header)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        .map_err(|e| format!("failed to read {safe_path}: {e}"))?;
     Ok((file, file_len, header))
 }
 
@@ -359,11 +366,10 @@ fn read_bounded_iff_file(
     file_len: u64,
     header: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
+    let safe_path = sanitize_path_display(path);
     if file_len > far::MAX_MEMBER {
         return Err(format!(
-            "{} exceeds maximum IFF size ({} bytes > {} bytes)",
-            path.display(),
-            file_len,
+            "{safe_path} exceeds maximum IFF size ({file_len} bytes > {} bytes)",
             far::MAX_MEMBER
         ));
     }
@@ -373,11 +379,10 @@ fn read_bounded_iff_file(
     (&mut file)
         .take(max_rest.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        .map_err(|e| format!("failed to read {safe_path}: {e}"))?;
     if bytes.len() as u64 > far::MAX_MEMBER {
         return Err(format!(
-            "{} grew past maximum IFF size ({} bytes)",
-            path.display(),
+            "{safe_path} grew past maximum IFF size ({} bytes)",
             far::MAX_MEMBER
         ));
     }
@@ -394,13 +399,22 @@ fn emit_lifted_bhavs<W: Write>(
     out: &mut OutWriter<W>,
 ) -> Result<(), CliError> {
     if selected_chunks.is_empty() {
-        out.writeln_str(&format!("// no BHAV chunks found in {source_label}"))?;
+        out.writeln_str(&format!(
+            "// no BHAV chunks found in {}",
+            sanitize_single_line(source_label)
+        ))?;
         out.flush()?;
         return Ok(());
     }
 
+    // Match `sims_vm::interpreter::behavior_from_owner`: in a standalone IFF without an
+    // install catalog, only private/local BHAVs (`4096..=8191`) are guaranteed to resolve
+    // within this file; global (`256..=4095`) and semi-global (`8192..=65535`) callees
+    // must remain unknown so stray chunks in an object IFF cannot mask external arities.
     let arities = if verify_equiv {
-        Some(extract_bhav_arities_from_iff(&iff.bytes).unwrap_or_default())
+        let mut local_arities = extract_bhav_arities_from_iff(&iff.bytes).unwrap_or_default();
+        local_arities.retain(|&id, _| (4096..=8191).contains(&id));
+        Some(local_arities)
     } else {
         None
     };
@@ -658,6 +672,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
         return Err("--filter cannot be combined with --tree".to_owned().into());
     }
 
+    let safe_input_path = sanitize_path_display(&input_path);
     let (mut file, file_len, header) = read_regular_file_prefix(&input_path)?;
     let has_far_ext = input_path
         .extension()
@@ -671,41 +686,27 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     let (iff_bytes, source_label) = if is_far {
         if header.len() < 16 {
             return Err(format!(
-                "invalid FAR archive {}: file shorter than 16-byte header",
-                input_path.display()
+                "invalid FAR archive {safe_input_path}: file shorter than 16-byte header"
             )
             .into());
         }
-        let manifest_off = far::manifest_offset(&header, file_len).map_err(|e| {
-            format!(
-                "failed to parse FAR header in {}: {e}",
-                input_path.display()
-            )
-        })?;
+        let manifest_off = far::manifest_offset(&header, file_len)
+            .map_err(|e| format!("failed to parse FAR header in {safe_input_path}: {e}"))?;
         let dir_len = far::directory_len(manifest_off, file_len)
-            .map_err(|e| format!("invalid FAR directory in {}: {e}", input_path.display()))?;
+            .map_err(|e| format!("invalid FAR directory in {safe_input_path}: {e}"))?;
         file.seek(SeekFrom::Start(u64::from(manifest_off)))
-            .map_err(|e| format!("failed to seek {}: {e}", input_path.display()))?;
+            .map_err(|e| format!("failed to seek {safe_input_path}: {e}"))?;
         let mut dir_buf = vec![0u8; dir_len];
-        file.read_exact(&mut dir_buf).map_err(|e| {
-            format!(
-                "failed to read FAR directory in {}: {e}",
-                input_path.display()
-            )
-        })?;
-        let entries = far::directory(&dir_buf, file_len).map_err(|e| {
-            format!(
-                "failed to parse FAR directory in {}: {e}",
-                input_path.display()
-            )
-        })?;
+        file.read_exact(&mut dir_buf)
+            .map_err(|e| format!("failed to read FAR directory in {safe_input_path}: {e}"))?;
+        let entries = far::directory(&dir_buf, file_len)
+            .map_err(|e| format!("failed to parse FAR directory in {safe_input_path}: {e}"))?;
 
         match entry_name {
             None => {
                 if !list {
                     return Err(format!(
-                        "{} is a FAR archive; pass --list to list .iff entries or --entry <name.iff> to inspect one",
-                        input_path.display()
+                        "{safe_input_path} is a FAR archive; pass --list to list .iff entries or --entry <name.iff> to inspect one"
                     )
                     .into());
                 }
@@ -728,74 +729,67 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
             }
             Some(ref query) => {
                 let entry = resolve_far_entry(&entries, query, &input_path)?;
+                let safe_entry = sanitize_single_line(&entry.name);
                 if !entry.within_payload(manifest_off) {
                     return Err(format!(
-                        "FAR entry '{}' in {} has out-of-bounds payload",
-                        sanitize_single_line(&entry.name),
-                        input_path.display()
+                        "FAR entry '{safe_entry}' in {safe_input_path} has out-of-bounds payload"
                     )
                     .into());
                 }
                 if entry.stored_size != entry.unpacked_size {
                     return Err(format!(
-                        "compressed FAR entry '{}' ({} stored / {} unpacked) is not supported",
-                        sanitize_single_line(&entry.name),
-                        entry.stored_size,
-                        entry.unpacked_size
+                        "compressed FAR entry '{safe_entry}' ({} stored / {} unpacked) is not supported",
+                        entry.stored_size, entry.unpacked_size
                     )
                     .into());
                 }
                 if u64::from(entry.stored_size) > far::MAX_MEMBER {
                     return Err(format!(
-                        "FAR entry '{}' exceeds maximum member size ({} > {})",
-                        sanitize_single_line(&entry.name),
+                        "FAR entry '{safe_entry}' exceeds maximum member size ({} > {})",
                         entry.stored_size,
                         far::MAX_MEMBER
                     )
                     .into());
                 }
                 file.seek(SeekFrom::Start(u64::from(entry.offset)))
-                    .map_err(|e| format!("failed to seek {}: {e}", input_path.display()))?;
+                    .map_err(|e| format!("failed to seek {safe_input_path}: {e}"))?;
                 let mut member_bytes = vec![0u8; entry.stored_size as usize];
                 file.read_exact(&mut member_bytes).map_err(|e| {
-                    format!(
-                        "failed to read FAR entry '{}' from {}: {e}",
-                        sanitize_single_line(&entry.name),
-                        input_path.display()
-                    )
+                    format!("failed to read FAR entry '{safe_entry}' from {safe_input_path}: {e}")
                 })?;
-                let label = format!(
-                    "{}!{}",
-                    input_path.display(),
-                    sanitize_single_line(&entry.name)
-                );
+                let label = format!("{safe_input_path}!{safe_entry}");
                 (member_bytes, label)
             }
         }
     } else {
         if entry_name.is_some() {
             return Err(format!(
-                "--entry is only valid for .far archives ({} is not a FAR archive)",
-                input_path.display()
+                "--entry is only valid for .far archives ({safe_input_path} is not a FAR archive)"
             )
             .into());
         }
         let bytes = read_bounded_iff_file(&input_path, file, file_len, header)?;
-        (bytes, input_path.display().to_string())
+        (bytes, safe_input_path)
     };
 
     let iff =
         Iff::parse(iff_bytes).map_err(|e| format!("failed to parse IFF {source_label}: {e}"))?;
 
-    let mut bhav_chunks: Vec<&sims_formats::iff::Chunk> = iff
-        .all(b"BHAV")
-        .filter(|c| c.flags & DELETED == 0)
-        .collect();
-    bhav_chunks.sort_by(|a, b| {
-        a.id.cmp(&b.id)
-            .then_with(|| a.flags.cmp(&b.flags))
-            .then_with(|| a.offset.cmp(&b.offset))
-    });
+    // Deduplicate BHAV chunks by resource ID, preferring canonical high-flag-byte 0
+    // (matching `Iff::get(b"BHAV", id)` and `sims-vm`), then sort by ID.
+    let mut by_id: std::collections::BTreeMap<u16, &sims_formats::iff::Chunk> =
+        std::collections::BTreeMap::new();
+    for chunk in iff.all(b"BHAV").filter(|c| c.flags & DELETED == 0) {
+        by_id
+            .entry(chunk.id)
+            .and_modify(|existing| {
+                if (existing.flags >> 8) != 0 && (chunk.flags >> 8) == 0 {
+                    *existing = chunk;
+                }
+            })
+            .or_insert(chunk);
+    }
+    let bhav_chunks: Vec<&sims_formats::iff::Chunk> = by_id.into_values().collect();
 
     if list {
         let filter_lower = filter.as_deref().map(str::to_lowercase);
@@ -860,9 +854,11 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
             .filter(|c| bhav_matches_filter(c.id, &c.label, &needle))
             .collect();
         if matched.is_empty() {
-            return Err(
-                format!("no BHAV chunks matched filter '{needle_raw}' in {source_label}").into(),
-            );
+            return Err(format!(
+                "no BHAV chunks matched filter '{}' in {source_label}",
+                sanitize_single_line(needle_raw)
+            )
+            .into());
         }
         matched
     } else {

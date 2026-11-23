@@ -8,7 +8,7 @@ use crate::ast::{
 use crate::error::{Error, Result, Span};
 use crate::ir::{BconChunk, BhavChunk, StringEntry, StringFormat, StringTableChunk};
 use sims_formats::behavior::Instruction;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Maximum instruction count in a single SimAntics BHAV tree (`0..=250`).
 pub const MAX_BHAV_NODES: usize = 251;
@@ -28,6 +28,9 @@ pub struct LoweredModule {
 /// Shared module-level symbol tables resolved before lowering individual trees.
 struct ModuleSymbols {
     tree_ids_by_name: BTreeMap<String, u16>,
+    /// Tree labels shared by multiple distinct BHAV IDs (valid for numeric calls/raw lifts,
+    /// rejected if referenced ambiguously by name).
+    ambiguous_tree_names: BTreeSet<String>,
     bcon_by_name: BTreeMap<String, i16>,
     /// 1-based string indices in `STR# 301` (used by `dialog(...)`).
     dialog_strings_by_name: BTreeMap<String, u8>,
@@ -50,6 +53,7 @@ fn bcon_id_to_table(id: u16) -> Option<u16> {
 pub fn lower_module(module: &Module) -> Result<LoweredModule> {
     let mut symbols = ModuleSymbols {
         tree_ids_by_name: BTreeMap::new(),
+        ambiguous_tree_names: BTreeSet::new(),
         bcon_by_name: BTreeMap::new(),
         dialog_strings_by_name: BTreeMap::new(),
         strings_by_name: BTreeMap::new(),
@@ -61,16 +65,14 @@ pub fn lower_module(module: &Module) -> Result<LoweredModule> {
     for item in &module.items {
         match item {
             Item::Tree(tree) => {
+                if symbols.ambiguous_tree_names.contains(&tree.label) {
+                    continue;
+                }
                 if let Some(prev) = symbols.tree_ids_by_name.insert(tree.label.clone(), tree.id)
                     && prev != tree.id
                 {
-                    return Err(Error::at(
-                        tree.span,
-                        format!(
-                            "duplicate tree name '{}' (ids {prev} and {})",
-                            tree.label, tree.id
-                        ),
-                    ));
+                    symbols.tree_ids_by_name.remove(&tree.label);
+                    symbols.ambiguous_tree_names.insert(tree.label.clone());
                 }
             }
             Item::Bcon(bcon) => {
@@ -398,6 +400,7 @@ struct TreeBuilder<'a> {
     idle_scratch_local: Option<usize>,
     max_allowed_args: usize,
     max_allowed_locals: usize,
+    only_raw_ops: bool,
 }
 
 impl<'a> TreeBuilder<'a> {
@@ -408,6 +411,7 @@ impl<'a> TreeBuilder<'a> {
         idle_scratch_local: Option<usize>,
         max_allowed_args: usize,
         max_allowed_locals: usize,
+        only_raw_ops: bool,
     ) -> Self {
         Self {
             symbols,
@@ -421,6 +425,7 @@ impl<'a> TreeBuilder<'a> {
             idle_scratch_local,
             max_allowed_args,
             max_allowed_locals,
+            only_raw_ops,
         }
     }
 
@@ -553,10 +558,15 @@ impl<'a> TreeBuilder<'a> {
         on_false: PendingTarget,
     ) -> Result<usize> {
         let idx = self.nodes.len();
-        if idx >= MAX_BHAV_NODES {
+        let max_nodes = if self.only_raw_ops {
+            usize::from(u16::MAX)
+        } else {
+            MAX_BHAV_NODES
+        };
+        if idx >= max_nodes {
             return Err(Error::at(
                 span,
-                format!("BHAV tree exceeds maximum of {MAX_BHAV_NODES} instructions"),
+                format!("BHAV tree exceeds maximum of {max_nodes} instructions"),
             ));
         }
         self.nodes.push(PendingNode {
@@ -602,12 +612,19 @@ impl<'a> TreeBuilder<'a> {
                 }
                 Ok(*id)
             }
-            CallTarget::Name(name) => self
-                .symbols
-                .tree_ids_by_name
-                .get(name)
-                .copied()
-                .ok_or_else(|| Error::at(span, format!("unknown subroutine tree '{name}'"))),
+            CallTarget::Name(name) => {
+                if self.symbols.ambiguous_tree_names.contains(name) {
+                    return Err(Error::at(
+                        span,
+                        format!("ambiguous subroutine tree name '{name}'"),
+                    ));
+                }
+                self.symbols
+                    .tree_ids_by_name
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| Error::at(span, format!("unknown subroutine tree '{name}'")))
+            }
         }
     }
 
@@ -1335,11 +1352,11 @@ impl<'a> TreeBuilder<'a> {
                     .labels
                     .get(name)
                     .ok_or_else(|| Error::at(*span, format!("unresolved label '@{name}'")))?;
-                if idx >= count {
+                if idx >= count || idx >= MAX_BHAV_NODES {
                     return Err(Error::at(
                         *span,
                         format!(
-                            "label '@{name}' points past end of tree (node {idx}, count {count})"
+                            "label '@{name}' points past addressable node limit (node {idx}, count {count})"
                         ),
                     ));
                 }
@@ -1470,6 +1487,7 @@ fn lower_tree(tree: &TreeDecl, symbols: &ModuleSymbols) -> Result<BhavChunk> {
         idle_scratch_local,
         max_allowed_args,
         max_allowed_locals,
+        usage.only_raw_ops,
     );
     let entry = builder.lower_block(&tree.body, PendingTarget::Resolved(TARGET_TRUE))?;
 

@@ -1088,3 +1088,343 @@ fn lift_handles_non_utf8_unix_path_without_panicking() {
         assert!(!out.status.success());
     }
 }
+
+#[test]
+fn lift_raw_roundtrips_252_instruction_bhav_byte_for_byte() {
+    // 252 instructions: node 0 returns true immediately, nodes 1..=251 are trailing raw records.
+    let mut instructions = Vec::with_capacity(252);
+    instructions.push(Instruction {
+        opcode: 2,
+        on_true: 0xFE,
+        on_false: 0xFE,
+        operands: [0, 0, 1, 0, 0, 5, 0, 7],
+    });
+    for idx in 1..252u16 {
+        instructions.push(Instruction {
+            opcode: 2,
+            on_true: if idx == 251 { 0xfb } else { 0xFE },
+            on_false: 0xFF,
+            operands: [0, 0, (idx & 0xFF) as u8, 0, 0, 5, 0, 7],
+        });
+    }
+    let orig = BhavChunk {
+        id: 4096,
+        label: "Long252Tree".to_owned(),
+        format: 0x8002,
+        kind: 0,
+        args: 0,
+        locals: 0,
+        revision: 0,
+        instructions,
+        trailing: vec![0xCA, 0xFE],
+    };
+    let orig_payload = encode_bhav(&orig).expect("encode 252-ins BHAV");
+
+    let tmp = CleanupDir::new("raw-252");
+    let iff_path = tmp.path().join("long252.iff");
+    std::fs::write(&iff_path, synthetic_bhav_iff(std::slice::from_ref(&orig))).expect("write iff");
+
+    let out = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&iff_path)
+        .args(["--raw", "--tree", "4096"])
+        .output()
+        .expect("run lift --raw on 252-ins BHAV");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("raw(0xfb)"), "{stdout}");
+    let compiled = compile_antics(&stdout).expect("252-instruction raw lift must recompile");
+    let rt_payload = encode_bhav(&compiled.behaviors[&4096]).expect("encode roundtripped");
+    assert_eq!(rt_payload, orig_payload);
+}
+
+#[test]
+fn lift_bulk_raw_compiles_with_duplicate_empty_labels_and_high_flag_variant() {
+    let t1 = BhavChunk {
+        id: 4096,
+        label: String::new(),
+        format: 0x8002,
+        kind: 0,
+        args: 0,
+        locals: 0,
+        revision: 0,
+        instructions: vec![Instruction {
+            opcode: 2,
+            on_true: 0xFE,
+            on_false: 0xFE,
+            operands: [0, 0, 1, 0, 0, 5, 0, 7],
+        }],
+        trailing: Vec::new(),
+    };
+    let t2 = BhavChunk {
+        id: 4097,
+        label: String::new(),
+        format: 0x8002,
+        kind: 0,
+        args: 0,
+        locals: 0,
+        revision: 0,
+        instructions: vec![Instruction {
+            opcode: 2,
+            on_true: 0xFE,
+            on_false: 0xFE,
+            operands: [0, 0, 2, 0, 0, 5, 0, 7],
+        }],
+        trailing: Vec::new(),
+    };
+    let t1_variant = BhavChunk {
+        id: 4096,
+        label: "HighFlagVariant".to_owned(),
+        format: 0x8002,
+        kind: 0,
+        args: 0,
+        locals: 0,
+        revision: 0,
+        instructions: vec![Instruction {
+            opcode: 2,
+            on_true: 0xFF,
+            on_false: 0xFF,
+            operands: [0, 0, 9, 0, 0, 5, 0, 7],
+        }],
+        trailing: Vec::new(),
+    };
+
+    let iff_bytes = write_iff(&[
+        ChunkData {
+            tag: *b"BHAV",
+            id: 4096,
+            flags: 0x0100, // high-flag variant sharing ID 4096
+            label: t1_variant.label.clone(),
+            data: encode_bhav(&t1_variant).expect("encode variant"),
+        },
+        ChunkData {
+            tag: *b"BHAV",
+            id: 4096,
+            flags: 0, // canonical flags high byte 0
+            label: t1.label.clone(),
+            data: encode_bhav(&t1).expect("encode t1"),
+        },
+        ChunkData {
+            tag: *b"BHAV",
+            id: 4097,
+            flags: 0,
+            label: t2.label.clone(),
+            data: encode_bhav(&t2).expect("encode t2"),
+        },
+    ])
+    .expect("write iff");
+
+    let tmp = CleanupDir::new("dup-labels");
+    let iff_path = tmp.path().join("dup_labels.iff");
+    std::fs::write(&iff_path, &iff_bytes).expect("write iff");
+
+    let out = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&iff_path)
+        .arg("--raw")
+        .output()
+        .expect("run bulk lift --raw");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let compiled =
+        compile_antics(&stdout).expect("bulk raw lift with duplicate labels must compile");
+    assert_eq!(compiled.behaviors.len(), 2);
+    assert_eq!(
+        encode_bhav(&compiled.behaviors[&4096]).unwrap(),
+        encode_bhav(&t1).unwrap(),
+        "must pick canonical high-flag-byte 0 resource for ID 4096"
+    );
+    assert_eq!(
+        encode_bhav(&compiled.behaviors[&4097]).unwrap(),
+        encode_bhav(&t2).unwrap()
+    );
+}
+
+#[test]
+fn lift_verify_equiv_ignores_stray_global_id_arity_in_object_iff() {
+    // An object IFF contains a stray BHAV #300 (in the global range 256..=4095) claiming
+    // `args: 0`, plus local BHAV #4096 that makes an inline call to global #300 followed by
+    // a dead instruction. If `--verify-equiv` trusted stray #300's arity (0 args), it would
+    // skip trailing-suffix checks on the inline call and report `Equivalent` even though the
+    // real global #300 could read >4 inline args from the dropped dead instruction!
+    let stray_global = BhavChunk {
+        id: 300,
+        label: "StrayGlobal300".to_owned(),
+        format: 0x8002,
+        kind: 0,
+        args: 0,
+        locals: 0,
+        revision: 0,
+        instructions: vec![Instruction {
+            opcode: 2,
+            on_true: 0xFE,
+            on_false: 0xFE,
+            operands: [0, 0, 0, 0, 0, 5, 0, 7],
+        }],
+        trailing: Vec::new(),
+    };
+    let caller = BhavChunk {
+        id: 4096,
+        label: "CallsGlobal300".to_owned(),
+        format: 0x8002,
+        kind: 0,
+        args: 0,
+        locals: 0,
+        revision: 0,
+        instructions: vec![
+            Instruction {
+                // Inline call to global #300 (non-0xFF operands) returning true/false.
+                opcode: 300,
+                on_true: 0xFE,
+                on_false: 0xFF,
+                operands: [1, 0, 2, 0, 3, 0, 4, 0],
+            },
+            // Dead instruction right after node 0 — structured lifter strips unreachable nodes,
+            // changing trailing bytes that a >4-arg global #300 could read!
+            Instruction {
+                opcode: 2,
+                on_true: 0xFE,
+                on_false: 0xFF,
+                operands: [0x99, 0, 0, 0, 0, 5, 0, 7],
+            },
+        ],
+        trailing: Vec::new(),
+    };
+
+    let tmp = CleanupDir::new("stray-global-arity");
+    let iff_path = tmp.path().join("stray_global.iff");
+    std::fs::write(&iff_path, synthetic_bhav_iff(&[stray_global, caller])).expect("write iff");
+
+    let out = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&iff_path)
+        .args(["--tree", "4096", "--verify-equiv"])
+        .output()
+        .expect("run lift --verify-equiv");
+    assert!(
+        out.status.success(),
+        "Inconclusive should exit 0 while reporting unknown callee arity;\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("// verify-equiv: Equivalent"),
+        "must NOT report Equivalent when stray global #300 arity would mask trailing-suffix divergence:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("// verify-equiv: Inconclusive(")
+            && stdout.contains("unknown callee arity"),
+        "expected Inconclusive(unknown callee arity) comment:\n{stdout}"
+    );
+
+    // Conversely, a local BHAV #4097 (in 4096..=8191) declaring `args: 5` IS resolved
+    // from this IFF, so stripping the trailing dead instruction after an inline call to
+    // #4097 produces a real `Counterexample` and a non-zero exit code!
+    let local_5arg = BhavChunk {
+        id: 4097,
+        label: "LocalFiveArgs".to_owned(),
+        format: 0x8002,
+        kind: 0,
+        args: 5,
+        locals: 0,
+        revision: 0,
+        instructions: vec![Instruction {
+            opcode: 2,
+            on_true: 0xFE,
+            on_false: 0xFE,
+            operands: [0, 0, 0, 0, 0, 5, 0, 7],
+        }],
+        trailing: Vec::new(),
+    };
+    let caller_local = BhavChunk {
+        id: 4098,
+        label: "CallsLocal5Arg".to_owned(),
+        format: 0x8002,
+        kind: 0,
+        args: 0,
+        locals: 0,
+        revision: 0,
+        instructions: vec![
+            Instruction {
+                opcode: 4097,
+                on_true: 0xFE,
+                on_false: 0xFF,
+                operands: [1, 0, 2, 0, 3, 0, 4, 0],
+            },
+            Instruction {
+                opcode: 2,
+                on_true: 0xFE,
+                on_false: 0xFF,
+                operands: [0x99, 0, 0, 0, 0, 5, 0, 7],
+            },
+        ],
+        trailing: Vec::new(),
+    };
+    let local_iff_path = tmp.path().join("local_5arg.iff");
+    std::fs::write(
+        &local_iff_path,
+        synthetic_bhav_iff(&[local_5arg, caller_local]),
+    )
+    .expect("write local_5arg.iff");
+
+    let ce_out = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&local_iff_path)
+        .args(["--tree", "4098", "--verify-equiv"])
+        .output()
+        .expect("run lift --verify-equiv expecting Counterexample");
+    assert!(
+        !ce_out.status.success(),
+        "Counterexample must exit non-zero;\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&ce_out.stdout),
+        String::from_utf8_lossy(&ce_out.stderr)
+    );
+    let ce_stdout = String::from_utf8_lossy(&ce_out.stdout);
+    assert!(
+        ce_stdout.contains("// verify-equiv: Counterexample("),
+        "expected Counterexample comment:\n{ce_stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lift_sanitizes_newlines_and_escapes_in_input_filenames() {
+    let empty_iff = write_iff(&[]).expect("write empty iff");
+    let tmp = CleanupDir::new("sanitize-filename");
+    let weird_path = tmp.path().join("evil\n\x1b[31m_file.iff");
+    std::fs::write(&weird_path, &empty_iff).expect("write weird filename iff");
+
+    let out = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&weird_path)
+        .output()
+        .expect("run lift on weird filename");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    assert!(
+        !stdout.contains('\x1b'),
+        "raw ESC leaked in stdout: {stdout}"
+    );
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "newline in filename must not break out of comment line:\n{stdout}"
+    );
+    assert!(
+        stdout.starts_with("// no BHAV chunks found in "),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\\n\\x1b[31m_file.iff"), "{stdout}");
+}

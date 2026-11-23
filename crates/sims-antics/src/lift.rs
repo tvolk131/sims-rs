@@ -73,7 +73,7 @@ fn format_target(target: u8, count: usize) -> String {
         0xFD => "error".to_owned(),
         0xFE => "true".to_owned(),
         0xFF => "false".to_owned(),
-        n if usize::from(n) < count => format!("@n{n}"),
+        n if n <= 250 && usize::from(n) < count => format!("@n{n}"),
         n => format!("raw({n:#04x})"),
     }
 }
