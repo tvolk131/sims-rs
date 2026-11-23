@@ -11,10 +11,10 @@ publish = false
 [dependencies]
 encoding_rs.workspace = true
 libm.workspace = true
+sims-content.workspace = true
 sims-formats.workspace = true
 
 [dev-dependencies]
-sims-content.workspace = true
 sims-core.workspace = true
 sims-sim.workspace = true
 sims-vm.workspace = true

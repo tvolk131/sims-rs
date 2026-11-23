@@ -7,15 +7,22 @@
 //! - `sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]`
-//! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]`
+//! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]`
 //! - `sims-antics build <pack_dir> --out <dir>`
 
+use sims_antics::arity_catalog::{
+    AritySource, GLOBAL_TREES, InstallArityCatalog, ResolvedArities, SEMI_GLOBAL_TREES,
+    bhav_arities_in_range,
+};
+use sims_antics::ir::BhavChunk;
 use sims_antics::{
-    EquivOptions, EquivResult, LiftOptions, StructuredLiftOutcome,
-    check_bhav_equivalent_with_arities, compile_air, compile_pack_dir, compile_standalone_pack_dir,
-    compile_v2_object_file, expand_v2_to_air, extract_lift_symbols_from_iff,
+    EquivOptions, EquivResult, LiftOptions, StructuredLiftOutcome, UnsupportedHeaderReason,
+    callee_scope_name, check_bhav_equivalent_with_arities, compile_air, compile_pack_dir,
+    compile_standalone_pack_dir, compile_v2_object_file, expand_v2_to_air,
+    extract_lift_symbols_from_iff,
     lift::{format_bhav_labeled_air_with_context, format_bhav_raw_air, lift_bhav},
     lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
+    structured_lift_header_check,
     v2::is_v2_source,
     verify::{extract_bhav_arities_from_iff, extract_bhav_from_iff},
     verify_object_safety, verify_pack_safety,
@@ -141,7 +148,7 @@ fn print_usage() {
          sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]\n  \
-         sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]   (lifts to .air Antics IR)\n  \
+         sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>"
     );
 }
@@ -189,7 +196,7 @@ fn is_iff_entry_name(name: &str) -> bool {
         .is_some_and(|tail| tail.eq_ignore_ascii_case(b".iff"))
 }
 
-fn format_ambiguous_matches(query: &str, matches: &[&far::Entry]) -> String {
+fn format_ambiguous_matches(what: &str, query: &str, matches: &[&far::Entry]) -> String {
     const MAX_LISTED: usize = 20;
     let mut names: Vec<String> = matches
         .iter()
@@ -197,7 +204,7 @@ fn format_ambiguous_matches(query: &str, matches: &[&far::Entry]) -> String {
         .collect();
     names.sort();
     let mut msg = format!(
-        "ambiguous --entry '{}' matched {} FAR entries:",
+        "ambiguous {what} '{}' matched {} FAR entries:",
         sanitize_single_line(query),
         names.len()
     );
@@ -222,7 +229,7 @@ fn resolve_far_entry<'a>(
         return Ok(exact[0]);
     }
     if exact.len() > 1 {
-        return Err(format_ambiguous_matches(query, &exact));
+        return Err(format_ambiguous_matches("--entry", query, &exact));
     }
 
     // 2. Unicode case-insensitive exact match (normalizing `\` and `/`).
@@ -236,7 +243,7 @@ fn resolve_far_entry<'a>(
         return Ok(ci_exact[0]);
     }
     if ci_exact.len() > 1 {
-        return Err(format_ambiguous_matches(query, &ci_exact));
+        return Err(format_ambiguous_matches("--entry", query, &ci_exact));
     }
 
     // 3. Unique path-segment suffix / basename match (Unicode case-insensitive, separator-normalized).
@@ -260,7 +267,7 @@ fn resolve_far_entry<'a>(
             return Ok(seg_suffix[0]);
         }
         if seg_suffix.len() > 1 {
-            return Err(format_ambiguous_matches(query, &seg_suffix));
+            return Err(format_ambiguous_matches("--entry", query, &seg_suffix));
         }
 
         // 4. Unique general Unicode case-insensitive suffix fallback.
@@ -276,7 +283,7 @@ fn resolve_far_entry<'a>(
             return Ok(general_suffix[0]);
         }
         if general_suffix.len() > 1 {
-            return Err(format_ambiguous_matches(query, &general_suffix));
+            return Err(format_ambiguous_matches("--entry", query, &general_suffix));
         }
     }
 
@@ -298,6 +305,289 @@ fn lift_reason(outcome: &StructuredLiftOutcome) -> Option<String> {
         }
         StructuredLiftOutcome::Unstructured => Some("unstructured CFG".to_owned()),
     }
+}
+
+/// The fallback reason for `outcome`, naming the node, callee, or target that made the
+/// header/target check refuse the tree and, for an unknown-arity callee, which arity
+/// source was missing.
+fn detailed_lift_reason(
+    outcome: &StructuredLiftOutcome,
+    bhav: &BhavChunk,
+    resolved: &ResolvedArities,
+) -> String {
+    let base = lift_reason(outcome).unwrap_or_else(|| "unknown".to_owned());
+    if !matches!(outcome, StructuredLiftOutcome::UnsupportedHeaderOrTarget) {
+        return base;
+    }
+    let Err(reason) = structured_lift_header_check(bhav, Some(&resolved.arities)) else {
+        return base;
+    };
+    let mut out = format!("{base}: {reason}");
+    if let UnsupportedHeaderReason::UnknownArityCallee { callee, .. } = reason
+        && let Some(part) = resolved.part_for(callee)
+    {
+        let scope = callee_scope_name(callee);
+        let hint = match &part.source {
+            AritySource::Missing(why) => {
+                let flag = if GLOBAL_TREES.contains(&callee) {
+                    "; pass --globals <Global.iff>"
+                } else if SEMI_GLOBAL_TREES.contains(&callee) {
+                    "; pass --semiglobal <semiglobal.iff>"
+                } else {
+                    ""
+                };
+                format!("; {scope} arities not loaded ({why}){flag}")
+            }
+            AritySource::ThisFile | AritySource::ThisFileBecause(_) => format!(
+                "; no usable arity for tree {callee} in this file (absent, or duplicate chunks disagree)"
+            ),
+            AritySource::Catalog(location) | AritySource::Explicit(location) => format!(
+                "; no usable arity for tree {callee} in {location} (absent, or duplicate chunks disagree)"
+            ),
+        };
+        out.push_str(&sanitize_single_line(&hint));
+    }
+    out
+}
+
+/// A compact fallback reason for the `--list` status column.
+fn short_lift_reason(
+    outcome: &StructuredLiftOutcome,
+    bhav: &BhavChunk,
+    resolved: &ResolvedArities,
+) -> String {
+    if matches!(outcome, StructuredLiftOutcome::UnsupportedHeaderOrTarget)
+        && let Err(reason) = structured_lift_header_check(bhav, Some(&resolved.arities))
+    {
+        return match reason {
+            UnsupportedHeaderReason::Format(format) => format!("format {format:#06x}"),
+            UnsupportedHeaderReason::TooManyInstructions(n) => format!("{n} instructions"),
+            UnsupportedHeaderReason::IndexedEntry => "kind 4 indexed entry".to_owned(),
+            UnsupportedHeaderReason::TargetOutOfBounds { node, target } => {
+                format!("node {node} target {target} out of bounds")
+            }
+            UnsupportedHeaderReason::ExtendedArityCallee { callee, arity, .. } => format!(
+                "calls {} {callee} with {arity} args",
+                callee_scope_name(callee)
+            ),
+            UnsupportedHeaderReason::UnknownArityCallee { callee, .. } => format!(
+                "calls {} {callee}, arity unknown",
+                callee_scope_name(callee)
+            ),
+        };
+    }
+    lift_reason(outcome).unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Where `lift` looks for callee arities.
+#[derive(Default)]
+struct ArityOptions {
+    no_catalog: bool,
+    globals: Option<String>,
+    semi_global: Option<String>,
+}
+
+/// Merges callee arities for the lifted IFF: private trees from the IFF itself, plus
+/// (unless `--no-catalog`) global and semi-global trees from the enclosing install's
+/// catalog, then any explicit `--globals` / `--semiglobal` overrides.
+fn resolve_lift_arities(
+    iff: &Iff,
+    input_path: &Path,
+    member: Option<(&str, u64)>,
+    opts: &ArityOptions,
+) -> Result<ResolvedArities, CliError> {
+    let mut resolved = if opts.no_catalog {
+        ResolvedArities::private_only(iff, "--no-catalog")
+    } else {
+        match InstallArityCatalog::find_install_root(input_path) {
+            Some(root) => match InstallArityCatalog::load(&root) {
+                Ok(mut catalog) => {
+                    let resource = catalog.resource_for(input_path, member);
+                    catalog.resolve(resource, iff)
+                }
+                Err(err) => ResolvedArities::private_only(
+                    iff,
+                    &format!(
+                        "install catalog failed to load: {}",
+                        sanitize_single_line(&err)
+                    ),
+                ),
+            },
+            None => ResolvedArities::private_only(iff, "no Sims install found above the input"),
+        }
+    };
+    if let Some(spec) = &opts.globals {
+        let (globals_iff, label) = read_override_iff(spec, Some("Global.iff"), "--globals")?;
+        resolved.set_global(
+            &bhav_arities_in_range(&globals_iff, GLOBAL_TREES),
+            AritySource::Explicit(label),
+        );
+    }
+    if let Some(spec) = &opts.semi_global {
+        let (semi_iff, label) = read_override_iff(spec, None, "--semiglobal")?;
+        resolved.set_semi_global(
+            &bhav_arities_in_range(&semi_iff, SEMI_GLOBAL_TREES),
+            AritySource::Explicit(label),
+        );
+    }
+    Ok(resolved)
+}
+
+/// Reads an IFF named by an arity override: a `.iff` file, or a FAR archive member given
+/// as `<archive.far>!<member.iff>` (`default_member` when the archive has no `!member`).
+fn read_override_iff(
+    spec: &str,
+    default_member: Option<&str>,
+    flag: &str,
+) -> Result<(Iff, String), CliError> {
+    let with_flag = |e: CliError| match e {
+        CliError::Message(msg) => CliError::Message(format!("{flag}: {msg}")),
+        other => other,
+    };
+    // An existing file named by the whole spec wins. Otherwise `<archive>.far!<member>`
+    // splits at the first `.far!` (ASCII case-insensitive) whose prefix is an existing
+    // file, so both directory names and member names may contain `!`.
+    let (path, member) = if Path::new(spec).is_file() {
+        (Path::new(spec), None)
+    } else {
+        let lower = spec.to_ascii_lowercase();
+        lower
+            .match_indices(".far!")
+            .map(|(at, _)| at)
+            .find(|&at| Path::new(&spec[..at + 4]).is_file())
+            .map_or((Path::new(spec), None), |at| {
+                (Path::new(&spec[..at + 4]), Some(&spec[at + 5..]))
+            })
+    };
+    if member == Some("") {
+        return Err(format!(
+            "{flag}: empty member name after '!' in '{}'",
+            sanitize_single_line(spec)
+        )
+        .into());
+    }
+    let safe_path = sanitize_path_display(path);
+    let (mut file, file_len, header) =
+        read_regular_file_prefix(path).map_err(|e| format!("{flag}: {e}"))?;
+    let is_far = header.len() >= 8 && &header[..8] == b"FAR!byAZ";
+    let (bytes, label) = if is_far {
+        let query = member.or(default_member).ok_or_else(|| {
+            format!(
+                "{flag}: {safe_path} is a FAR archive; name a member as <archive.far>!<member.iff>"
+            )
+        })?;
+        let (manifest_off, entries) =
+            read_far_directory(&mut file, file_len, &header, path).map_err(with_flag)?;
+        let entry =
+            resolve_far_entry_exact(&entries, query, path).map_err(|e| format!("{flag}: {e}"))?;
+        let bytes = read_far_member(&mut file, entry, manifest_off, path).map_err(with_flag)?;
+        let label = format!("{safe_path}!{}", sanitize_single_line(&entry.name));
+        (bytes, label)
+    } else {
+        if member.is_some() {
+            return Err(format!("{flag}: {safe_path} is not a FAR archive").into());
+        }
+        (
+            read_bounded_iff_file(path, file, file_len, header)
+                .map_err(|e| format!("{flag}: {e}"))?,
+            safe_path,
+        )
+    };
+    let iff = Iff::parse(bytes).map_err(|e| format!("{flag}: failed to parse IFF {label}: {e}"))?;
+    Ok((iff, label))
+}
+
+/// Resolves an arity-override member strictly: the exact name, else the whole name or its
+/// last path component compared ASCII case-insensitively. Never a suffix match, and an
+/// ambiguous tier is an error.
+fn resolve_far_entry_exact<'a>(
+    entries: &'a [far::Entry],
+    query: &str,
+    archive_path: &Path,
+) -> Result<&'a far::Entry, String> {
+    let last = |name: &str| name.rsplit(['/', '\\']).next().unwrap_or(name).to_owned();
+    let tiers: [&dyn Fn(&far::Entry) -> bool; 3] = [
+        &|e| e.name == query,
+        &|e| e.name.eq_ignore_ascii_case(query),
+        &|e| last(&e.name).eq_ignore_ascii_case(query),
+    ];
+    for tier in tiers {
+        let matched: Vec<&far::Entry> = entries.iter().filter(|e| tier(e)).collect();
+        match matched.len() {
+            0 => {}
+            1 => return Ok(matched[0]),
+            _ => return Err(format_ambiguous_matches("FAR member", query, &matched)),
+        }
+    }
+    Err(format!(
+        "FAR member '{}' not found in {}",
+        sanitize_single_line(query),
+        sanitize_path_display(archive_path)
+    ))
+}
+
+/// Reads a FAR archive's directory: the manifest offset and its entries.
+fn read_far_directory(
+    file: &mut std::fs::File,
+    file_len: u64,
+    header: &[u8],
+    path: &Path,
+) -> Result<(u32, Vec<far::Entry>), CliError> {
+    let safe_path = sanitize_path_display(path);
+    if header.len() < 16 {
+        return Err(
+            format!("invalid FAR archive {safe_path}: file shorter than 16-byte header").into(),
+        );
+    }
+    let manifest_off = far::manifest_offset(header, file_len)
+        .map_err(|e| format!("failed to parse FAR header in {safe_path}: {e}"))?;
+    let dir_len = far::directory_len(manifest_off, file_len)
+        .map_err(|e| format!("invalid FAR directory in {safe_path}: {e}"))?;
+    file.seek(SeekFrom::Start(u64::from(manifest_off)))
+        .map_err(|e| format!("failed to seek {safe_path}: {e}"))?;
+    let mut dir_buf = vec![0u8; dir_len];
+    file.read_exact(&mut dir_buf)
+        .map_err(|e| format!("failed to read FAR directory in {safe_path}: {e}"))?;
+    let entries = far::directory(&dir_buf, file_len)
+        .map_err(|e| format!("failed to parse FAR directory in {safe_path}: {e}"))?;
+    Ok((manifest_off, entries))
+}
+
+/// Reads the uncompressed FAR member `entry`.
+fn read_far_member(
+    file: &mut std::fs::File,
+    entry: &far::Entry,
+    manifest_off: u32,
+    path: &Path,
+) -> Result<Vec<u8>, CliError> {
+    let safe_path = sanitize_path_display(path);
+    let safe_entry = sanitize_single_line(&entry.name);
+    if !entry.within_payload(manifest_off) {
+        return Err(
+            format!("FAR entry '{safe_entry}' in {safe_path} has out-of-bounds payload").into(),
+        );
+    }
+    if entry.stored_size != entry.unpacked_size {
+        return Err(format!(
+            "compressed FAR entry '{safe_entry}' ({} stored / {} unpacked) is not supported",
+            entry.stored_size, entry.unpacked_size
+        )
+        .into());
+    }
+    if u64::from(entry.stored_size) > far::MAX_MEMBER {
+        return Err(format!(
+            "FAR entry '{safe_entry}' exceeds maximum member size ({} > {})",
+            entry.stored_size,
+            far::MAX_MEMBER
+        )
+        .into());
+    }
+    file.seek(SeekFrom::Start(u64::from(entry.offset)))
+        .map_err(|e| format!("failed to seek {safe_path}: {e}"))?;
+    let mut member_bytes = vec![0u8; entry.stored_size as usize];
+    file.read_exact(&mut member_bytes)
+        .map_err(|e| format!("failed to read FAR entry '{safe_entry}' from {safe_path}: {e}"))?;
+    Ok(member_bytes)
 }
 
 fn bhav_matches_filter(id: u16, label: &str, filter_lower: &str) -> bool {
@@ -412,6 +702,7 @@ fn emit_lifted_bhavs<W: Write>(
     source_label: &str,
     tree_id: Option<u16>,
     raw: bool,
+    resolved: Option<&ResolvedArities>,
     lift_opts: LiftOptions,
     verify_equiv: bool,
     out: &mut OutWriter<W>,
@@ -425,13 +716,7 @@ fn emit_lifted_bhavs<W: Write>(
         return Ok(());
     }
 
-    // Match `sims_vm::interpreter::behavior_from_owner`: in a standalone IFF without an
-    // install catalog, only private/local BHAVs (`4096..=8191`) are guaranteed to resolve
-    // within this file; global (`256..=4095`) and semi-global (`8192..=65535`) callees
-    // must remain unknown so stray chunks in an object IFF cannot mask external arities.
-    let mut local_arities = extract_bhav_arities_from_iff(&iff.bytes).unwrap_or_default();
-    local_arities.retain(|&id, _| (4096..=8191).contains(&id));
-    let arities = Some(local_arities);
+    let arities = resolved.map(|r| r.arities.clone());
     let symbols = if lift_opts.annotate_comments {
         Some(extract_lift_symbols_from_iff(iff))
     } else {
@@ -440,6 +725,19 @@ fn emit_lifted_bhavs<W: Write>(
 
     let mut summary = LiftSummary::default();
     let mut broken_pipe = false;
+
+    // `resolved` is `None` for `--raw`, which does not use callee arities. A broken pipe
+    // here still lets the loop below count parse errors before it stops.
+    if let Some(resolved) = resolved {
+        match out.writeln_str(&format!(
+            "// arity sources: {}",
+            sanitize_single_line(&resolved.describe())
+        )) {
+            Ok(()) => {}
+            Err(CliError::BrokenPipe) => broken_pipe = true,
+            Err(other) => return Err(other),
+        }
+    }
 
     macro_rules! write_or_break {
         ($expr:expr) => {
@@ -509,7 +807,10 @@ fn emit_lifted_bhavs<W: Write>(
                 src
             }
             other => {
-                let reason = lift_reason(&other).unwrap_or_else(|| "unknown".to_owned());
+                let reason = match resolved {
+                    Some(resolved) => detailed_lift_reason(&other, &bhav, resolved),
+                    None => lift_reason(&other).unwrap_or_else(|| "unknown".to_owned()),
+                };
                 write_or_break!(out.writeln_str(&format!(
                     "// tree {} \"{}\": structured lift fallback ({reason}); showing decoded labeled-CFG .air (Antics IR)",
                     bhav.id,
@@ -601,6 +902,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     let mut relax_padding = false;
     let mut no_comments = false;
     let mut verify_equiv = false;
+    let mut arity_opts = ArityOptions::default();
     let mut end_of_flags = false;
 
     let mut i = 1usize;
@@ -676,6 +978,27 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
                         i += 1;
                         continue;
                     }
+                    "--no-catalog" => {
+                        arity_opts.no_catalog = true;
+                        i += 1;
+                        continue;
+                    }
+                    "--globals" | "--semiglobal" => {
+                        let slot = if s == "--globals" {
+                            &mut arity_opts.globals
+                        } else {
+                            &mut arity_opts.semi_global
+                        };
+                        if slot.is_some() {
+                            return Err(format!("duplicate {s} flag").into());
+                        }
+                        let val = args
+                            .get(i + 1)
+                            .ok_or_else(|| format!("missing file after {s}"))?;
+                        *slot = Some(os_arg_to_str(val, &format!("{s} value"))?.to_owned());
+                        i += 2;
+                        continue;
+                    }
                     other if other.starts_with('-') => {
                         return Err(format!("unknown flag '{other}'").into());
                     }
@@ -721,6 +1044,17 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     if tree_id.is_some() && filter.is_some() {
         return Err("--filter cannot be combined with --tree".to_owned().into());
     }
+    if raw
+        && (arity_opts.no_catalog
+            || arity_opts.globals.is_some()
+            || arity_opts.semi_global.is_some())
+    {
+        return Err(
+            "--globals, --semiglobal, and --no-catalog cannot be combined with --raw (raw output does not use callee arities)"
+                .to_owned()
+                .into(),
+        );
+    }
     let lift_opts = LiftOptions {
         strict_padding: !relax_padding,
         annotate_comments: !no_comments,
@@ -737,27 +1071,19 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
 
     let mut out = OutWriter::stdout();
 
-    let (iff_bytes, source_label) = if is_far {
-        if header.len() < 16 {
-            return Err(format!(
-                "invalid FAR archive {safe_input_path}: file shorter than 16-byte header"
-            )
-            .into());
-        }
-        let manifest_off = far::manifest_offset(&header, file_len)
-            .map_err(|e| format!("failed to parse FAR header in {safe_input_path}: {e}"))?;
-        let dir_len = far::directory_len(manifest_off, file_len)
-            .map_err(|e| format!("invalid FAR directory in {safe_input_path}: {e}"))?;
-        file.seek(SeekFrom::Start(u64::from(manifest_off)))
-            .map_err(|e| format!("failed to seek {safe_input_path}: {e}"))?;
-        let mut dir_buf = vec![0u8; dir_len];
-        file.read_exact(&mut dir_buf)
-            .map_err(|e| format!("failed to read FAR directory in {safe_input_path}: {e}"))?;
-        let entries = far::directory(&dir_buf, file_len)
-            .map_err(|e| format!("failed to parse FAR directory in {safe_input_path}: {e}"))?;
-
+    let (iff_bytes, source_label, far_member) = if is_far {
+        let (manifest_off, entries) =
+            read_far_directory(&mut file, file_len, &header, &input_path)?;
         match entry_name {
             None => {
+                if arity_opts.no_catalog
+                    || arity_opts.globals.is_some()
+                    || arity_opts.semi_global.is_some()
+                {
+                    return Err("--globals, --semiglobal, and --no-catalog need --entry <name.iff> (listing an archive's entries does not lift trees)"
+                        .to_owned()
+                        .into());
+                }
                 if !list {
                     return Err(format!(
                         "{safe_input_path} is a FAR archive; pass --list to list .iff entries or --entry <name.iff> to inspect one"
@@ -783,36 +1109,10 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
             }
             Some(ref query) => {
                 let entry = resolve_far_entry(&entries, query, &input_path)?;
-                let safe_entry = sanitize_single_line(&entry.name);
-                if !entry.within_payload(manifest_off) {
-                    return Err(format!(
-                        "FAR entry '{safe_entry}' in {safe_input_path} has out-of-bounds payload"
-                    )
-                    .into());
-                }
-                if entry.stored_size != entry.unpacked_size {
-                    return Err(format!(
-                        "compressed FAR entry '{safe_entry}' ({} stored / {} unpacked) is not supported",
-                        entry.stored_size, entry.unpacked_size
-                    )
-                    .into());
-                }
-                if u64::from(entry.stored_size) > far::MAX_MEMBER {
-                    return Err(format!(
-                        "FAR entry '{safe_entry}' exceeds maximum member size ({} > {})",
-                        entry.stored_size,
-                        far::MAX_MEMBER
-                    )
-                    .into());
-                }
-                file.seek(SeekFrom::Start(u64::from(entry.offset)))
-                    .map_err(|e| format!("failed to seek {safe_input_path}: {e}"))?;
-                let mut member_bytes = vec![0u8; entry.stored_size as usize];
-                file.read_exact(&mut member_bytes).map_err(|e| {
-                    format!("failed to read FAR entry '{safe_entry}' from {safe_input_path}: {e}")
-                })?;
-                let label = format!("{safe_input_path}!{safe_entry}");
-                (member_bytes, label)
+                let member_bytes = read_far_member(&mut file, entry, manifest_off, &input_path)?;
+                let label = format!("{safe_input_path}!{}", sanitize_single_line(&entry.name));
+                let member = (entry.name.clone(), u64::from(entry.offset));
+                (member_bytes, label, Some(member))
             }
         }
     } else {
@@ -823,7 +1123,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
             .into());
         }
         let bytes = read_bounded_iff_file(&input_path, file, file_len, header)?;
-        (bytes, safe_input_path)
+        (bytes, safe_input_path, None)
     };
 
     let iff =
@@ -845,10 +1145,36 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     }
     let bhav_chunks: Vec<&sims_formats::iff::Chunk> = by_id.into_values().collect();
 
+    // Resolved after tree selection (so a bad override never masks a not-found tree), and
+    // skipped for `--raw`, which does not use arities, or when there is nothing to lift and
+    // no explicit override to validate.
+    let has_overrides = arity_opts.globals.is_some() || arity_opts.semi_global.is_some();
+    let nothing_to_lift = bhav_chunks.is_empty();
+    let resolve_arities = || -> Result<Option<ResolvedArities>, CliError> {
+        if raw || (nothing_to_lift && !has_overrides) {
+            return Ok(None);
+        }
+        resolve_lift_arities(
+            &iff,
+            &input_path,
+            far_member
+                .as_ref()
+                .map(|(name, offset)| (name.as_str(), *offset)),
+            &arity_opts,
+        )
+        .map(Some)
+    };
+
     if list {
-        let mut local_arities = extract_bhav_arities_from_iff(&iff.bytes).unwrap_or_default();
-        local_arities.retain(|&id, _| (4096..=8191).contains(&id));
+        let resolved = resolve_arities()?;
         let filter_lower = filter.as_deref().map(str::to_lowercase);
+        if let Some(resolved) = &resolved {
+            out.writeln_str(&format!(
+                "// arity sources: {}",
+                sanitize_single_line(&resolved.describe())
+            ))?;
+        }
+        let list_arities = resolved.as_ref().map(|r| &r.arities);
         out.writeln_str(&format!(
             "{:<7} {:<8} {:<5} {:<5} {:<7} {:<36} {}",
             "ID", "HEX", "INS", "ARGS", "LOCALS", "STATUS", "NAME"
@@ -866,24 +1192,25 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
                         strict_padding: lift_opts.strict_padding,
                         annotate_comments: false,
                     };
-                    let status = match lift_bhav_structured_with_arities(
-                        &bhav,
-                        list_opts,
-                        Some(&local_arities),
-                    ) {
-                        StructuredLiftOutcome::Lifted(src) => {
-                            let raw_count = src.matches("op 0x").count();
-                            if raw_count == 0 {
-                                "structured".to_owned()
-                            } else {
-                                format!("structured ({raw_count} inline raw op)")
+                    let status =
+                        match lift_bhav_structured_with_arities(&bhav, list_opts, list_arities) {
+                            StructuredLiftOutcome::Lifted(src) => {
+                                let raw_count = src.matches("op 0x").count();
+                                if raw_count == 0 {
+                                    "structured".to_owned()
+                                } else {
+                                    format!("structured ({raw_count} inline raw op)")
+                                }
                             }
-                        }
-                        other => format!(
-                            "labeled-cfg ({})",
-                            lift_reason(&other).unwrap_or_else(|| "unknown".to_owned())
-                        ),
-                    };
+                            other => format!(
+                                "labeled-cfg ({})",
+                                match &resolved {
+                                    Some(resolved) => short_lift_reason(&other, &bhav, resolved),
+                                    None =>
+                                        lift_reason(&other).unwrap_or_else(|| "unknown".to_owned()),
+                                }
+                            ),
+                        };
                     out.writeln_str(&format!(
                         "{:<7} {:#06x}   {:<5} {:<5} {:<7} {:<36} {}",
                         bhav.id,
@@ -936,12 +1263,14 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
         bhav_chunks
     };
 
+    let resolved = resolve_arities()?;
     emit_lifted_bhavs(
         &iff,
         &selected_chunks,
         &source_label,
         tree_id,
         raw,
+        resolved.as_ref(),
         lift_opts,
         verify_equiv,
         &mut out,
@@ -1750,12 +2079,14 @@ mod tests {
             fail_after_bytes: 0,
             written: 0,
         });
+        let resolved = ResolvedArities::private_only(&iff, "test");
         let res = emit_lifted_bhavs(
             &iff,
             &chunks,
             "test.iff",
             None,
             false,
+            Some(&resolved),
             LiftOptions::default(),
             false,
             &mut out,

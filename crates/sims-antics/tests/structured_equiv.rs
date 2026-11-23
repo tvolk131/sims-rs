@@ -10,38 +10,16 @@
 //!
 //! Skips cleanly when `SIMS_INSTALL` is unset (CI-safe).
 
+use sims_antics::arity_catalog::{InstallArityCatalog, ResourceMatch};
 use sims_antics::{
     EquivOptions, EquivResult, LiftOptions, StructuredLiftOutcome,
     check_bhav_equivalent_with_arities, compile_antics, extract_lift_symbols_from_iff,
     lift::{format_bhav_labeled_air_with_context, lift_bhav},
     lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
 };
-use sims_content::{ArchivePool, Catalog, Index, Install};
 use sims_formats::behavior::Behavior;
 use sims_formats::iff::{DELETED, Iff};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
-
-fn bhav_arity(b: &Behavior) -> usize {
-    match b.format {
-        0x8000 => 4,
-        0x8001 => usize::from(b.args).min(4),
-        _ => usize::from(b.args),
-    }
-}
-
-fn collect_iff_arities_in_range(iff: &Iff, lo: u16, hi: u16) -> BTreeMap<u16, usize> {
-    let mut out = BTreeMap::new();
-    for chunk in &iff.chunks {
-        if chunk.flags & DELETED != 0 || &chunk.tag != b"BHAV" || chunk.id < lo || chunk.id > hi {
-            continue;
-        }
-        if let Ok(bhav) = Behavior::parse(iff.data(chunk)) {
-            out.insert(chunk.id, bhav_arity(&bhav));
-        }
-    }
-    out
-}
 
 #[test]
 fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
@@ -54,20 +32,11 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
         return;
     }
 
-    let install = Install::detect(&PathBuf::from(&install_root))
-        .expect("SIMS_INSTALL did not resolve to a valid Sims installation");
-    let index = Index::build(&install).expect("failed to index SIMS_INSTALL");
-    let pool = ArchivePool::new();
-    let catalog = Catalog::build_with_pool(&index, &pool).expect("failed to build catalog");
-
-    // Pre-pass (strictly in memory): load global BHAV arities (256..=4095) exclusively from
-    // `Global.iff`, matching `sims_vm::Interpreter::behavior_from_owner`.
-    let global_bytes = index.resources[catalog.global]
-        .read_with(&pool)
-        .expect("failed to read Global.iff");
-    let global_iff = Iff::parse(global_bytes).expect("failed to parse Global.iff");
-    let global_arities = collect_iff_arities_in_range(&global_iff, 256, 4095);
-    let mut semi_global_cache: BTreeMap<usize, BTreeMap<u16, usize>> = BTreeMap::new();
+    // Strictly in memory: the same install catalog `sims-antics lift` uses resolves global
+    // (`Global.iff`), private (this IFF), and semi-global (`GLOB` link) callee arities,
+    // matching `sims_vm::Interpreter::behavior_from_owner`.
+    let mut arity_catalog = InstallArityCatalog::load(&PathBuf::from(&install_root))
+        .expect("SIMS_INSTALL did not resolve to an indexable Sims installation");
 
     let mut total_bhavs = 0usize;
     let mut lifted_structured = 0usize;
@@ -105,35 +74,22 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
         annotate_comments: false,
     };
 
-    for (resource_index, resource) in index.resources.iter().enumerate() {
+    for resource_index in 0..arity_catalog.index.resources.len() {
+        let resource = &arity_catalog.index.resources[resource_index];
         let name = resource.name();
         if name.len() < 4 || !name[name.len() - 4..].eq_ignore_ascii_case(".iff") {
             continue;
         }
-        let Ok(bytes) = resource.read_with(&pool) else {
+        let Ok(bytes) = resource.read_with(&arity_catalog.pool) else {
             continue;
         };
         let Ok(iff) = Iff::parse(bytes) else {
             continue;
         };
 
-        // Match `sims-vm` tree dispatch: 256..=4095 from `Global.iff`, 4096..=8191 from
-        // this IFF, and 8192..=65535 from this IFF's linked semi-global (or self if semi-global).
-        let mut iff_arities = global_arities.clone();
-        iff_arities.extend(collect_iff_arities_in_range(&iff, 4096, 8191));
-        if let Some(Some(semi_res)) = catalog.semi_globals.get(&resource_index).copied() {
-            let semi_map = semi_global_cache.entry(semi_res).or_insert_with(|| {
-                index.resources[semi_res]
-                    .read_with(&pool)
-                    .ok()
-                    .and_then(|b| Iff::parse(b).ok())
-                    .map(|semi_iff| collect_iff_arities_in_range(&semi_iff, 8192, u16::MAX))
-                    .unwrap_or_default()
-            });
-            iff_arities.extend(semi_map.iter().map(|(&id, &arity)| (id, arity)));
-        } else {
-            iff_arities.extend(collect_iff_arities_in_range(&iff, 8192, u16::MAX));
-        }
+        let iff_arities = arity_catalog
+            .resolve(ResourceMatch::Unique(resource_index), &iff)
+            .arities;
 
         let is_fridges = name
             .rsplit(['/', '\\'])
