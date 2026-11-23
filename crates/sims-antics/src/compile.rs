@@ -58,19 +58,34 @@ pub struct CompiledPack {
     pub sounds_wav: BTreeMap<String, Vec<u8>>,
 }
 
-/// Parses and lowers one `.antics` source string into validated `BHAV`/`BCON`/`STR#` chunks.
+/// Parses and lowers one `.air` (Antics IR) source string into validated `BHAV`/`BCON`/`STR#` chunks.
+pub fn compile_air(source: &str) -> Result<CompiledModule> {
+    compile_antics(source)
+}
+
+/// Parses and lowers one `.air` (Antics IR) / legacy v1 `.antics` source string into
+/// validated `BHAV`/`BCON`/`STR#` chunks.
 pub fn compile_antics(source: &str) -> Result<CompiledModule> {
     let ast = parse_module(source)?;
     lower_module(&ast)
 }
 
-/// Compiles an `object.toml` manifest together with named `.antics` sources
+/// Compiles an `object.toml` manifest together with named `.air` / legacy `.antics` sources
 /// entirely in memory into a complete `.iff` (with `rsmp`) and synthesized WAVs.
 pub fn compile_object_from_sources(
     manifest_toml: &str,
     antics_sources: &[(&str, &str)],
 ) -> Result<CompiledObject> {
     let manifest = ObjectManifest::parse(manifest_toml)?;
+    compile_object_from_manifest(manifest, antics_sources)
+}
+
+/// Compiles a pre-built [`ObjectManifest`] together with `.air` (Antics IR) sources into
+/// a complete `.iff` (with `rsmp`) and synthesized WAVs.
+pub(crate) fn compile_object_from_manifest(
+    manifest: ObjectManifest,
+    antics_sources: &[(&str, &str)],
+) -> Result<CompiledObject> {
     let mut combined_items = Vec::new();
     for &(filename, src) in antics_sources {
         let parsed = parse_module(src).map_err(|e| e.with_context(filename))?;
@@ -156,12 +171,47 @@ pub fn compile_object_from_sources(
         Ok(entries)
     };
 
-    // Track per-tile sprite sets so each multi-tile sub-object can emit its own distinct
-    // PALT/SPR2/DGRP while validating every tile resource reference against emitted chunks.
+    // Track per-tile and multi-graphic sprite sets so every graphic state and multi-tile
+    // sub-object emits distinct PALT/SPR2/DGRP chunks while preventing resource ID collisions.
     let mut extra_tile_sprites: Vec<(u16, String, SpriteSpec)> = Vec::new();
     let mut emitted_dgrp_ids = BTreeSet::from([manifest.dgrp_id]);
     let mut emitted_spr2_ids = BTreeSet::from([manifest.spr2_id]);
     let mut emitted_palt_ids = BTreeSet::from([manifest.palt_id]);
+    let mut extra_graphic_bundles: Vec<(u16, u16, u16, String, SpriteSpec)> = Vec::new();
+    for (gidx, gspec) in manifest.extra_graphics.iter().enumerate() {
+        let offset = (gidx + 1) as u16;
+        let gdgrp = manifest
+            .dgrp_id
+            .checked_add(offset)
+            .ok_or_else(|| Error::new("extra graphic dgrp_id overflow"))?;
+        let gspr2 = manifest
+            .spr2_id
+            .checked_add(offset)
+            .ok_or_else(|| Error::new("extra graphic spr2_id overflow"))?;
+        let gpalt = manifest
+            .palt_id
+            .checked_add(offset)
+            .ok_or_else(|| Error::new("extra graphic palt_id overflow"))?;
+        if !emitted_dgrp_ids.insert(gdgrp)
+            || !emitted_spr2_ids.insert(gspr2)
+            || !emitted_palt_ids.insert(gpalt)
+        {
+            return Err(Error::new(format!(
+                "graphic state {offset} in '{}' collides with an existing PALT/SPR2/DGRP chunk id",
+                manifest.name
+            )));
+        }
+        extra_graphic_bundles.push((
+            gpalt,
+            gspr2,
+            gdgrp,
+            format!("{} State {offset}", manifest.name),
+            gspec.clone(),
+        ));
+    }
+    let total_graphics = 1u16
+        .checked_add(manifest.extra_graphics.len() as u16)
+        .ok_or_else(|| Error::new("num_graphics overflow"))?;
 
     // 1. OBJD + OBJf (single-tile or multi-tile master + tile definitions)
     let mut tile_guids = Vec::with_capacity(manifest.tiles.len());
@@ -169,8 +219,9 @@ pub fn compile_object_from_sources(
         let mut objd_spec = ObjdSpec::new(manifest.objd_id, &manifest.name, manifest.guid);
         objd_spec.price = manifest.price;
         objd_spec.object_type = manifest.object_type;
+        objd_spec.catalog_sort_flags = manifest.catalog_sort_flags;
         objd_spec.base_graphic_id = manifest.dgrp_id;
-        objd_spec.num_graphics = 1;
+        objd_spec.num_graphics = total_graphics;
         objd_spec.tree_table_id = manifest.ttab_id;
         objd_spec.slots_id = manifest.slot_id;
         objd_spec.catalog_strings_id = manifest.ctss_id;
@@ -234,8 +285,9 @@ pub fn compile_object_from_sources(
         let mut master_spec = ObjdSpec::new(manifest.objd_id, &manifest.name, manifest.guid);
         master_spec.price = manifest.price;
         master_spec.object_type = manifest.object_type;
+        master_spec.catalog_sort_flags = manifest.catalog_sort_flags;
         master_spec.base_graphic_id = manifest.dgrp_id;
-        master_spec.num_graphics = 1;
+        master_spec.num_graphics = total_graphics;
         master_spec.tree_table_id = manifest.ttab_id;
         master_spec.slots_id = manifest.slot_id;
         master_spec.catalog_strings_id = manifest.ctss_id;
@@ -671,6 +723,30 @@ pub fn compile_object_from_sources(
         label: sprites.dgrp.label.clone(),
         data: encode_dgrp(&sprites.dgrp)?,
     });
+    for (gpalt, gspr2, gdgrp, glabel, gspec) in &extra_graphic_bundles {
+        let gsprites = generate_furniture_sprites(gspec, *gpalt, *gspr2, *gdgrp, glabel);
+        chunks.push(ChunkData {
+            tag: *b"PALT",
+            id: gsprites.palt.id,
+            flags: IFF_CONVERTED_FLAG,
+            label: gsprites.palt.label.clone(),
+            data: encode_palt(&gsprites.palt)?,
+        });
+        chunks.push(ChunkData {
+            tag: *b"SPR2",
+            id: gsprites.spr2.id,
+            flags: IFF_CONVERTED_FLAG,
+            label: gsprites.spr2.label.clone(),
+            data: encode_spr2(&gsprites.spr2)?,
+        });
+        chunks.push(ChunkData {
+            tag: *b"DGRP",
+            id: gsprites.dgrp.id,
+            flags: IFF_CONVERTED_FLAG,
+            label: gsprites.dgrp.label.clone(),
+            data: encode_dgrp(&gsprites.dgrp)?,
+        });
+    }
     for (tile_sprite_id, tile_label, tile_sprite_spec) in &extra_tile_sprites {
         let tile_sprites = generate_furniture_sprites(
             tile_sprite_spec,
@@ -879,9 +955,15 @@ pub fn compile_pack_dir(dir: &Path) -> Result<CompiledPack> {
                 "object slug '{slug}' produces colliding IFF filename '{iff_name}'"
             )));
         }
-        let obj_dir = ensure_contained_path(dir, &root_canon, &["objects", slug.as_str()])?;
-        let compiled =
-            compile_object_dir(&obj_dir).map_err(|e| e.with_context(format!("object '{slug}'")))?;
+        let compiled = if let Some(v2_path) =
+            crate::v2::resolve_v2_object_path_in_pack(&root_canon, slug)?
+        {
+            crate::v2::compile_v2_object_file(&v2_path, Some(&root_canon))
+                .map_err(|e| e.with_context(format!("object '{slug}'")))?
+        } else {
+            let obj_dir = ensure_contained_path(dir, &root_canon, &["objects", slug.as_str()])?;
+            compile_object_dir(&obj_dir).map_err(|e| e.with_context(format!("object '{slug}'")))?
+        };
         for guid in std::iter::once(compiled.guid).chain(compiled.tile_guids.iter().copied()) {
             if let Some(prev_slug) = seen_guids.insert(guid, slug.clone()) {
                 return Err(Error::new(format!(

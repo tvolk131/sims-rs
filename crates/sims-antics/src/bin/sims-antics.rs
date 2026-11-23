@@ -1,20 +1,24 @@
-//! CLI entrypoint for compiling, verifying, checking equivalence, and inspecting
-//! lifted `.antics` behavior trees from `.iff` files and `.far` archives.
+//! CLI entrypoint for expanding `.antics` v2 sources to `.air` (Antics IR),
+//! compiling packs/objects, verifying safety, checking equivalence, and inspecting
+//! lifted `.air` behavior trees from `.iff` files and `.far` archives.
 //!
 //! Usage:
-//! - `sims-antics check <pack_dir>`
-//! - `sims-antics verify <pack_dir>`
-//! - `sims-antics equiv <a.antics> <b.iff> --tree <id>`
+//! - `sims-antics expand <file.antics> [--pack <pack_dir>]`
+//! - `sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]`
+//! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
+//! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]`
 //! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--verify-equiv]`
 //! - `sims-antics build <pack_dir> --out <dir>`
 
 use sims_antics::{
     EquivOptions, EquivResult, StructuredLiftOutcome, check_bhav_equivalent_with_arities,
-    compile_antics, compile_pack_dir, compile_standalone_pack_dir,
-    lift::{format_bhav_antics, lift_bhav},
-    lift_bhav_structured,
+    compile_air, compile_pack_dir, compile_standalone_pack_dir, compile_v2_object_file,
+    expand_v2_to_air,
+    lift::{format_bhav_air, lift_bhav},
+    lift_bhav_air_structured,
+    v2::is_v2_source,
     verify::{extract_bhav_arities_from_iff, extract_bhav_from_iff},
-    verify_pack_safety,
+    verify_object_safety, verify_pack_safety,
 };
 use sims_formats::far;
 use sims_formats::iff::{DELETED, Iff};
@@ -122,10 +126,11 @@ fn os_arg_starts_with_dash(arg: &OsStr) -> bool {
 fn print_usage() {
     eprintln!(
         "Usage:\n  \
-         sims-antics check <pack_dir>\n  \
-         sims-antics verify <pack_dir>\n  \
-         sims-antics equiv <a.antics> <b.iff> --tree <id>\n  \
-         sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--verify-equiv]\n  \
+         sims-antics expand <file.antics> [--pack <pack_dir>]\n  \
+         sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
+         sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
+         sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]\n  \
+         sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--verify-equiv]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>"
     );
 }
@@ -461,7 +466,7 @@ fn emit_lifted_bhavs<W: Write>(
         };
 
         if raw {
-            let src = format_bhav_antics(&bhav);
+            let src = format_bhav_air(&bhav);
             write_or_break!(out.write_str(&src));
             if !src.ends_with('\n') {
                 write_or_break!(out.writeln_str(""));
@@ -469,12 +474,12 @@ fn emit_lifted_bhavs<W: Write>(
             continue;
         }
 
-        let outcome = lift_bhav_structured(&bhav);
+        let outcome = lift_bhav_air_structured(&bhav);
         match outcome {
             StructuredLiftOutcome::Lifted(src) => {
                 if !bhav.label.is_empty() {
                     write_or_break!(out.writeln_str(&format!(
-                        "// tree {} \"{}\"",
+                        "// .air (Antics IR) tree {} \"{}\"",
                         bhav.id,
                         sanitize_single_line(&bhav.label)
                     )));
@@ -484,7 +489,7 @@ fn emit_lifted_bhavs<W: Write>(
                     write_or_break!(out.writeln_str(""));
                 }
                 if verify_equiv {
-                    let status_line = match compile_antics(&src) {
+                    let status_line = match compile_air(&src) {
                         Ok(compiled) => {
                             if let Some(recompiled) = compiled.behaviors.get(&bhav.id) {
                                 match check_bhav_equivalent_with_arities(
@@ -534,11 +539,11 @@ fn emit_lifted_bhavs<W: Write>(
             other => {
                 let reason = lift_reason(&other).unwrap_or_else(|| "unknown".to_owned());
                 write_or_break!(out.writeln_str(&format!(
-                    "// tree {} \"{}\": structured lift fallback ({reason}); showing raw low-level .antics",
+                    "// tree {} \"{}\": structured lift fallback ({reason}); showing raw .air (Antics IR)",
                     bhav.id,
                     sanitize_single_line(&bhav.label)
                 )));
-                let raw_src = format_bhav_antics(&bhav);
+                let raw_src = format_bhav_air(&bhav);
                 write_or_break!(out.write_str(&raw_src));
                 if !raw_src.ends_with('\n') {
                     write_or_break!(out.writeln_str(""));
@@ -806,7 +811,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
             let safe_name = sanitize_single_line(&chunk.label);
             match lift_bhav(chunk.id, &chunk.label, iff.data(chunk)) {
                 Ok(bhav) => {
-                    let status = match lift_bhav_structured(&bhav) {
+                    let status = match lift_bhav_air_structured(&bhav) {
                         StructuredLiftOutcome::Lifted(_) => "structured".to_owned(),
                         other => format!(
                             "raw-only ({})",
@@ -1075,6 +1080,81 @@ fn write_contained_file(parent_canon: &Path, filename: &str, bytes: &[u8]) -> Re
     Ok(())
 }
 
+fn parse_path_and_optional_pack(
+    args: &[OsString],
+    cmd_name: &str,
+) -> Result<(PathBuf, Option<PathBuf>), CliError> {
+    let mut target_path: Option<PathBuf> = None;
+    let mut pack_dir: Option<PathBuf> = None;
+    let mut end_of_flags = false;
+    let mut i = 1usize;
+    while i < args.len() {
+        let arg = args[i].as_os_str();
+        if !end_of_flags {
+            if let Some(s) = arg.to_str() {
+                match s {
+                    "-h" | "--help" => {
+                        print_usage();
+                        return Err(CliError::BrokenPipe);
+                    }
+                    "--" => {
+                        end_of_flags = true;
+                        i += 1;
+                        continue;
+                    }
+                    "--pack" | "-p" => {
+                        if pack_dir.is_some() {
+                            return Err("duplicate --pack flag".to_owned().into());
+                        }
+                        let val = args
+                            .get(i + 1)
+                            .ok_or_else(|| "missing directory path after --pack".to_owned())?;
+                        pack_dir = Some(PathBuf::from(val));
+                        i += 2;
+                        continue;
+                    }
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown flag '{other}'").into());
+                    }
+                    _ => {}
+                }
+            } else if os_arg_starts_with_dash(arg) {
+                return Err(
+                    "unknown non-UTF-8 flag (use '--' before file paths starting with '-')"
+                        .to_owned()
+                        .into(),
+                );
+            }
+        }
+        if target_path.is_some() {
+            return Err(format!("unexpected extra argument '{}'", Path::new(arg).display()).into());
+        }
+        target_path = Some(PathBuf::from(arg));
+        i += 1;
+    }
+    let target_path = target_path.ok_or_else(|| {
+        print_usage();
+        format!("{cmd_name} requires a path argument")
+    })?;
+    Ok((target_path, pack_dir))
+}
+
+fn cmd_expand(args: &[OsString]) -> Result<(), CliError> {
+    let (file_path, pack_dir) = match parse_path_and_optional_pack(args, "expand") {
+        Ok(pair) => pair,
+        Err(CliError::BrokenPipe) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let air = expand_v2_to_air(&file_path, pack_dir.as_deref()).map_err(|e| e.to_string())?;
+    let mut out = OutWriter::stdout();
+    out.write_str(&air)?;
+    if !air.ends_with('\n') {
+        out.writeln_str("")?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 fn run() -> Result<(), CliError> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if args.is_empty() {
@@ -1088,15 +1168,47 @@ fn run() -> Result<(), CliError> {
     }
 
     match subcmd {
+        "expand" => cmd_expand(&args),
         "check" => {
-            if args.len() != 2 {
-                print_usage();
-                return Err("check expects exactly one <pack_dir> argument"
+            let (target, pack_dir) = match parse_path_and_optional_pack(&args, "check") {
+                Ok(pair) => pair,
+                Err(CliError::BrokenPipe) => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            let meta = std::fs::symlink_metadata(&target)
+                .map_err(|e| format!("failed to access {}: {e}", target.display()))?;
+            if meta.file_type().is_file() {
+                let src = std::fs::read_to_string(&target)
+                    .map_err(|e| format!("failed to read {}: {e}", target.display()))?;
+                if is_v2_source(&src) {
+                    let obj = compile_v2_object_file(&target, pack_dir.as_deref())
+                        .map_err(|e| e.to_string())?;
+                    println!(
+                        "OK: {} (GUID {:#010x}, {} BHAVs, {} bytes IFF, {} WAVs)",
+                        obj.name,
+                        obj.guid,
+                        obj.behaviors.len(),
+                        obj.iff_bytes.len(),
+                        obj.sounds_wav.len()
+                    );
+                } else {
+                    let module = compile_air(&src).map_err(|e| e.to_string())?;
+                    println!(
+                        "OK: .air module {} ({} BHAVs, {} BCONs, {} STR#s)",
+                        target.display(),
+                        module.behaviors.len(),
+                        module.constants.len(),
+                        module.strings.len()
+                    );
+                }
+                return Ok(());
+            }
+            if pack_dir.is_some() {
+                return Err("--pack is only valid when checking a single .antics file"
                     .to_owned()
                     .into());
             }
-            let pack_dir = Path::new(&args[1]);
-            let compiled = compile_pack_dir(pack_dir).map_err(|e| e.to_string())?;
+            let compiled = compile_pack_dir(&target).map_err(|e| e.to_string())?;
             let total_bhavs: usize = compiled
                 .objects
                 .iter()
@@ -1115,14 +1227,42 @@ fn run() -> Result<(), CliError> {
             Ok(())
         }
         "verify" => {
-            if args.len() != 2 {
-                print_usage();
-                return Err("verify expects exactly one <pack_dir> argument"
+            let (target, pack_dir) = match parse_path_and_optional_pack(&args, "verify") {
+                Ok(pair) => pair,
+                Err(CliError::BrokenPipe) => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            let meta = std::fs::symlink_metadata(&target)
+                .map_err(|e| format!("failed to access {}: {e}", target.display()))?;
+            if meta.file_type().is_file() {
+                let obj = compile_v2_object_file(&target, pack_dir.as_deref())
+                    .map_err(|e| e.to_string())?;
+                let report = verify_object_safety(&obj).map_err(|e| e.to_string())?;
+                if report.is_ok() {
+                    println!(
+                        "VERIFIED: {} ({} BHAVs, {} lock invariants proven, 0 violations)",
+                        obj.name, report.trees_checked, report.locks_verified
+                    );
+                    return Ok(());
+                }
+                for v in &report.violations {
+                    eprintln!(
+                        "VIOLATION [{}] {} ({:?} node {:?}): {}",
+                        v.object, v.tree_name, v.category, v.node, v.message
+                    );
+                }
+                return Err(format!(
+                    "safety verification failed with {} violation(s)",
+                    report.violations.len()
+                )
+                .into());
+            }
+            if pack_dir.is_some() {
+                return Err("--pack is only valid when verifying a single .antics file"
                     .to_owned()
                     .into());
             }
-            let pack_dir = Path::new(&args[1]);
-            let compiled = compile_pack_dir(pack_dir).map_err(|e| e.to_string())?;
+            let compiled = compile_pack_dir(&target).map_err(|e| e.to_string())?;
             let report = verify_pack_safety(&compiled).map_err(|e| e.to_string())?;
             if report.is_ok() {
                 println!(
@@ -1153,6 +1293,7 @@ fn run() -> Result<(), CliError> {
             let mut antics_path: Option<PathBuf> = None;
             let mut iff_path: Option<PathBuf> = None;
             let mut tree_id: Option<u16> = None;
+            let mut pack_dir: Option<PathBuf> = None;
             let mut i = 1usize;
             while i < args.len() {
                 let arg = args[i].as_os_str();
@@ -1163,6 +1304,14 @@ fn run() -> Result<(), CliError> {
                                 .get(i + 1)
                                 .ok_or_else(|| "missing tree ID after --tree".to_owned())?;
                             tree_id = Some(parse_tree_id(os_arg_to_str(val, "--tree value")?)?);
+                            i += 2;
+                            continue;
+                        }
+                        "--pack" | "-p" => {
+                            let val = args
+                                .get(i + 1)
+                                .ok_or_else(|| "missing directory path after --pack".to_owned())?;
+                            pack_dir = Some(PathBuf::from(val));
                             i += 2;
                             continue;
                         }
@@ -1193,15 +1342,23 @@ fn run() -> Result<(), CliError> {
 
             let antics_src = std::fs::read_to_string(&antics_path)
                 .map_err(|e| format!("failed to read {}: {e}", antics_path.display()))?;
-            let compiled = compile_antics(&antics_src).map_err(|e| e.to_string())?;
-            let bhav_a = compiled.behaviors.get(&tree_id).ok_or_else(|| {
+            let behaviors = if is_v2_source(&antics_src) {
+                compile_v2_object_file(&antics_path, pack_dir.as_deref())
+                    .map_err(|e| e.to_string())?
+                    .behaviors
+            } else {
+                compile_air(&antics_src)
+                    .map_err(|e| e.to_string())?
+                    .behaviors
+            };
+            let bhav_a = behaviors.get(&tree_id).ok_or_else(|| {
                 format!("{} does not define tree #{tree_id}", antics_path.display())
             })?;
             let iff_bytes = std::fs::read(&iff_path)
                 .map_err(|e| format!("failed to read {}: {e}", iff_path.display()))?;
             let bhav_b = extract_bhav_from_iff(&iff_bytes, tree_id).map_err(|e| e.to_string())?;
             let mut arities = extract_bhav_arities_from_iff(&iff_bytes).unwrap_or_default();
-            for (&id, bhav) in &compiled.behaviors {
+            for (&id, bhav) in &behaviors {
                 let argc = match bhav.format {
                     0x8000 => 4,
                     0x8001 => usize::from(bhav.args).min(4),
