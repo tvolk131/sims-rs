@@ -7083,14 +7083,14 @@ impl NeighborhoodShell {
     }
 
     fn default_house_for_destination(&self, dest: TravelDestination) -> Option<u32> {
-        let candidates: &[u32] = match dest {
-            TravelDestination::Downtown => &[21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
-            TravelDestination::VacationIsland => &[40, 41, 42, 43, 44, 45, 46, 47, 48],
-            TravelDestination::OldTown => &[58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68],
-            TravelDestination::StudioTown => &[81, 82, 83, 84, 85, 86, 87, 88, 89],
-            TravelDestination::MagicTown => &[93, 94, 95, 96, 97, 98],
+        let candidates: std::ops::RangeInclusive<u32> = match dest {
+            TravelDestination::Downtown => 21..=30,
+            TravelDestination::VacationIsland => 40..=48,
+            TravelDestination::OldTown => 50..=79,
+            TravelDestination::StudioTown => 81..=89,
+            TravelDestination::MagicTown => 93..=98,
         };
-        candidates.iter().copied().find(|&house| {
+        candidates.into_iter().find(|&house| {
             TravelDestination::classify(house, &self.stored.zoning) == Some(dest)
                 && self
                     .store
@@ -8246,6 +8246,7 @@ fn kind_for_destination(dest: Destination) -> NeighborhoodKind {
     match dest {
         Destination::Downtown => NeighborhoodKind::Downtown,
         Destination::VacationIsland => NeighborhoodKind::Vacation,
+        Destination::OldTown => NeighborhoodKind::Unleashed,
         Destination::StudioTown => NeighborhoodKind::StudioTown,
         Destination::MagicTown => NeighborhoodKind::MagicTown,
     }
@@ -8265,17 +8266,17 @@ fn ui_destination_for_vm(dest: TravelDestination) -> Destination {
     match dest {
         TravelDestination::Downtown => Destination::Downtown,
         TravelDestination::VacationIsland => Destination::VacationIsland,
+        TravelDestination::OldTown => Destination::OldTown,
         TravelDestination::StudioTown => Destination::StudioTown,
         TravelDestination::MagicTown => Destination::MagicTown,
-        TravelDestination::OldTown => Destination::Downtown,
     }
 }
 
 fn ui_transport_for_vm(transport: VmTravelTransport) -> UiTravelTransport {
     match transport {
         VmTravelTransport::DowntownCab => UiTravelTransport::Taxi,
+        VmTravelTransport::OldTownTrolley => UiTravelTransport::Trolley,
         VmTravelTransport::VacationWagon
-        | VmTravelTransport::OldTownTrolley
         | VmTravelTransport::StudioShuttle
         | VmTravelTransport::StudioLimo => UiTravelTransport::Shuttle,
         VmTravelTransport::MagicHole | VmTravelTransport::MagicBlimp => {

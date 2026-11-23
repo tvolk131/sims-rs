@@ -752,3 +752,315 @@ fn expanded_hud_at_800x600_and_1024x768_preserves_native_pixels_outside_backpatc
         }
     }
 }
+
+#[test]
+fn interests_and_gifts_panels_render_native_art_and_paginate() {
+    let Some(root) = common::install_root() else {
+        return;
+    };
+    let opened = common::open(&root, common::GOTH_HOUSE);
+    // Verify all 19 Interest*.bmp (1600..=1618), InterestBars (1619),
+    // InterestBarsBackground (1620), and Inventory{Gift,Magic,Other}Sort (4112..=4114)
+    // loaded cleanly via hud::OPTIONAL_RESOURCES.
+    for id in hud::id::INTEREST_ICONS {
+        assert!(
+            opened.art.image(id).is_some(),
+            "missing native Interest bitmap {id}"
+        );
+    }
+    assert!(opened.art.image(hud::id::INTEREST_BARS).is_some());
+    assert!(opened.art.image(hud::id::INTEREST_BARS_BG).is_some());
+    assert!(opened.art.image(hud::id::INVENTORY_GIFT_SORT).is_some());
+    assert!(opened.art.image(hud::id::INVENTORY_MAGIC_SORT).is_some());
+    assert!(opened.art.image(hud::id::INVENTORY_OTHER_SORT).is_some());
+
+    // 1. Panel::Interests on adult Sim (Mortimer): 15 adult interests paginated
+    //    across pages with non-blank native icons & bars.
+    let mut snap = opened.snapshot.clone();
+    if let Some(r) = snap.residents.first_mut() {
+        r.interests = [
+            700, 500, 800, 300, 600, 900, 400, 200, 700, 500, 800, 300, 1000, 600, 500, 400, 800,
+            700, 900,
+        ];
+    }
+    let mut ctrl = Controls {
+        expanded: true,
+        panel: Some(Panel::Interests),
+        ..Controls::default()
+    };
+    let page0_items = hud::layout([800, 600], &snap, &ctrl);
+    let interest_count_p0 = page0_items
+        .iter()
+        .filter(|i| matches!(i.kind, hud::Kind::Interest { .. }))
+        .count();
+    assert_eq!(interest_count_p0, 6, "2 cols x 3 rows on 800x600 page 0");
+    // Native `0x519251`: 1024x768 shows 3 columns x 3 rows = 9 adult interests on page 0,
+    // while intermediate width 880x600 keeps 2 columns (6 items) strictly left of the next arrow.
+    let page0_880 = hud::layout([880, 600], &snap, &ctrl);
+    let interest_880: Vec<Rect> = page0_880
+        .iter()
+        .filter(|i| matches!(i.kind, hud::Kind::Interest { .. }))
+        .map(|i| i.rect)
+        .collect();
+    let next_880 = page0_880
+        .iter()
+        .find(|i| i.command == Some(Command::InterestsPage(1)))
+        .expect("next arrow at 880x600")
+        .rect;
+    assert_eq!(interest_880.len(), 6, "2 cols x 3 rows at 880x600");
+    assert!(
+        interest_880.iter().all(|r| r.x + r.width <= next_880.x),
+        "880x600 interest cells must stay strictly left of next arrow"
+    );
+    let page0_1024 = hud::layout([1024, 768], &snap, &ctrl);
+    let interest_count_1024 = page0_1024
+        .iter()
+        .filter(|i| matches!(i.kind, hud::Kind::Interest { .. }))
+        .count();
+    assert_eq!(interest_count_1024, 9, "3 cols x 3 rows on 1024x768 page 0");
+    assert!(
+        page0_items
+            .iter()
+            .any(|i| i.command == Some(Command::InterestsPage(1))),
+        "adult 15 interests must show next-page arrow at 800x600"
+    );
+
+    // Draw Panel::Interests and compare subpanel strip pixels against an empty strip.
+    let mut blank_ctrl = ctrl;
+    blank_ctrl.panel = None;
+    let blank_items = hud::layout([800, 600], &snap, &blank_ctrl);
+    let mut blank_frame = Frame::new(800, 600, [0, 0, 0]);
+    hud::draw(
+        &mut blank_frame,
+        &opened.art,
+        &opened.faces,
+        &blank_items,
+        &blank_ctrl,
+    );
+
+    let mut interests_frame = Frame::new(800, 600, [0, 0, 0]);
+    hud::draw(
+        &mut interests_frame,
+        &opened.art,
+        &opened.faces,
+        &page0_items,
+        &ctrl,
+    );
+    if let Some(dir) = std::env::var_os("SIMS_WAVE1_SHOTS_DIR").map(std::path::PathBuf::from) {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+            dir.join("interests_adult_800x600.png"),
+            interests_frame.png(),
+        );
+    }
+    let mut diff_px = 0usize;
+    for y in 500..600 {
+        for x in 521..800 {
+            if interests_frame.pixel(x, y) != blank_frame.pixel(x, y) {
+                diff_px += 1;
+            }
+        }
+    }
+    assert!(
+        diff_px > 4_000,
+        "Panel::Interests must draw native icons/bars (diff_px={diff_px})"
+    );
+
+    // Page forward -> PAGE_BACK appears and distinct icons render.
+    ctrl.apply(&Command::InterestsPage(1));
+    let page1_items = hud::layout([800, 600], &snap, &ctrl);
+    assert!(
+        page1_items
+            .iter()
+            .any(|i| i.command == Some(Command::InterestsPage(0)))
+    );
+
+    // Child Sim shows child-specific interest icons (Toys 1608, Aliens 1609, Pets 1610, School 1611).
+    let mut child_snap = snap.clone();
+    if let Some(r) = child_snap.residents.first_mut() {
+        r.school_age = true;
+    }
+    ctrl.interests_page = 0;
+    let child_items = hud::layout([800, 600], &child_snap, &ctrl);
+    let child_icons: Vec<i32> = child_items
+        .iter()
+        .filter_map(|i| match i.kind {
+            hud::Kind::Interest { icon_id, .. } => Some(icon_id),
+            _ => None,
+        })
+        .collect();
+    assert!(child_icons.contains(&1608) && child_icons.contains(&1611));
+    if let Some(dir) = std::env::var_os("SIMS_WAVE1_SHOTS_DIR").map(std::path::PathBuf::from) {
+        let mut child_frame = Frame::new(800, 600, [0, 0, 0]);
+        hud::draw(
+            &mut child_frame,
+            &opened.art,
+            &opened.faces,
+            &child_items,
+            &ctrl,
+        );
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("interests_child_800x600.png"), child_frame.png());
+    }
+
+    // 2. Panel::Gifts / Inventory with Gifts (kind 0), Magic (kind 7), and Other (kind 8) tokens.
+    snap.inventory = vec![
+        sims_ui::household::InventoryEntry {
+            kind: 0,
+            guid: 0x26bf_bb29,
+            count: 2,
+            name: "Red Roses".into(),
+        },
+        sims_ui::household::InventoryEntry {
+            kind: 7,
+            guid: 0x1234_5678,
+            count: 5,
+            name: "Toad Sweat".into(),
+        },
+        sims_ui::household::InventoryEntry {
+            kind: 8,
+            guid: 0x8765_4321,
+            count: 1,
+            name: "Pet Treat".into(),
+        },
+    ];
+    let mut gifts_ctrl = Controls {
+        expanded: true,
+        panel: Some(Panel::Gifts),
+        ..Controls::default()
+    };
+    let gift_items = hud::layout([800, 600], &snap, &gifts_ctrl);
+    assert!(gift_items.iter().any(|i| matches!(
+        &i.kind,
+        hud::Kind::InventoryItem { entry, .. } if entry.name == "Red Roses"
+    )));
+    assert!(gift_items.iter().any(|i| i.command
+        == Some(Command::ShowInventory(
+            sims_ui::command::InventoryTab::Magic
+        ))));
+
+    let mut thumbs = sims_ui::thumbnail::Thumbnails::default();
+    let _ = thumbs.read(&opened.index, &opened.catalog, 0x26bf_bb29);
+    let mut gifts_frame = Frame::new(800, 600, [0, 0, 0]);
+    hud::draw_with_thumbnails(
+        &mut gifts_frame,
+        &opened.art,
+        &opened.faces,
+        Some(&thumbs),
+        &gift_items,
+        &gifts_ctrl,
+    );
+    if let Some(dir) = std::env::var_os("SIMS_WAVE1_SHOTS_DIR").map(std::path::PathBuf::from) {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("gifts_800x600.png"), gifts_frame.png());
+    }
+    let mut gift_diff_px = 0usize;
+    for y in 500..600 {
+        for x in 521..800 {
+            if gifts_frame.pixel(x, y) != blank_frame.pixel(x, y) {
+                gift_diff_px += 1;
+            }
+        }
+    }
+    assert!(
+        gift_diff_px > 2_000,
+        "Panel::Gifts must draw native sort tabs and token slots (gift_diff_px={gift_diff_px})"
+    );
+
+    // Switch to Magic tab -> shows Toad Sweat, hides Red Roses.
+    gifts_ctrl.apply(&Command::ShowInventory(
+        sims_ui::command::InventoryTab::Magic,
+    ));
+    let magic_items = hud::layout([800, 600], &snap, &gifts_ctrl);
+    assert!(magic_items.iter().any(|i| matches!(
+        &i.kind,
+        hud::Kind::InventoryItem { entry, .. } if entry.name == "Toad Sweat"
+    )));
+    assert!(!magic_items.iter().any(|i| matches!(
+        &i.kind,
+        hud::Kind::InventoryItem { entry, .. } if entry.name == "Red Roses"
+    )));
+
+    // Native `0x51e402`: Other tab enumerates ONLY kind 8 tokens, excluding
+    // internal bookkeeping tokens (kinds 1 and 3) populated via `Snapshot::with_inventory`.
+    let mut mixed_world = opened.world.clone();
+    let sel_guid = snap.selected_guid.unwrap();
+    let nb_id = mixed_world
+        .neighbors
+        .slots
+        .iter()
+        .flatten()
+        .find(|n| n.guid == sel_guid)
+        .expect("selected Sim has neighbor record")
+        .id;
+    mixed_world
+        .neighbors
+        .inventories
+        .retain(|inv| inv.neighbor != nb_id);
+    let mut raw_items = vec![
+        sims_sim::neighbors::Item {
+            kind: 1,
+            guid: 0xAAAA_0001,
+            count: 1,
+        },
+        sims_sim::neighbors::Item {
+            kind: 3,
+            guid: 0xAAAA_0003,
+            count: 2,
+        },
+        sims_sim::neighbors::Item {
+            kind: 8,
+            guid: 0xAAAA_0008,
+            count: 1,
+        },
+    ];
+    for i in 0..10u32 {
+        raw_items.push(sims_sim::neighbors::Item {
+            kind: 0,
+            guid: 0xBBBB_0000 + i,
+            count: 1,
+        });
+    }
+    mixed_world
+        .neighbors
+        .inventories
+        .push(sims_sim::neighbors::Inventory {
+            neighbor: nb_id,
+            items: raw_items,
+        });
+    let mixed_snap = snap
+        .clone()
+        .with_inventory(&mixed_world, |g| format!("Item {g:X}"));
+    gifts_ctrl.apply(&Command::ShowInventory(
+        sims_ui::command::InventoryTab::Other,
+    ));
+    let other_items = hud::layout([800, 600], &mixed_snap, &gifts_ctrl);
+    let other_guids: Vec<u32> = other_items
+        .iter()
+        .filter_map(|i| match &i.kind {
+            hud::Kind::InventoryItem { entry, .. } => Some(entry.guid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        other_guids,
+        vec![0xAAAA_0008],
+        "Other tab must show only kind 8 and exclude internal kinds 1 and 3"
+    );
+
+    // Native `0x51927e` / `0x519262` / `0x51e355`: Gifts shows 5 items/page at
+    // 800x600 and 9 items/page at 1024x768.
+    gifts_ctrl.apply(&Command::ShowInventory(
+        sims_ui::command::InventoryTab::Gifts,
+    ));
+    let gifts_800 = hud::layout([800, 600], &mixed_snap, &gifts_ctrl)
+        .iter()
+        .filter(|i| matches!(i.kind, hud::Kind::InventoryItem { .. }))
+        .count();
+    let gifts_1024 = hud::layout([1024, 768], &mixed_snap, &gifts_ctrl)
+        .iter()
+        .filter(|i| matches!(i.kind, hud::Kind::InventoryItem { .. }))
+        .count();
+    assert_eq!(gifts_800, 5, "Gifts must fit 5 items/page at 800x600");
+    assert_eq!(gifts_1024, 9, "Gifts must fit 9 items/page at 1024x768");
+}

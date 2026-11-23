@@ -4,13 +4,63 @@
 
 use crate::art::Art;
 use crate::command::Command;
+use crate::dialog;
 use crate::frame::{Frame, Rect};
 use crate::hud::STRIP;
 use crate::thumbnail::{SIZE as CELL, TEMPLATE, Thumbnails};
 use sims_content::ui_graphics::US_ENGLISH;
 use sims_content::{Catalog, Index, Install};
+use sims_formats::behavior::InteractionTable;
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
+
+/// Which lot catalog mode Buy Mode filters against (`0x4cb8e7..0x4cbaa8`,
+/// `0x507288`). Residential lots use By-Function / By-Room (`+0x4e`/`+0x50`),
+/// while each expansion's commercial lots use its own 5-category sort word
+/// (`+0xbe`, `+0xc2`, `+0xc6`, `+0xce`, `+0xd0`) plus function subcategories.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum BuyZone {
+    #[default]
+    Residential,
+    Downtown,
+    Vacation,
+    Community,
+    StudioTown,
+    MagicTown,
+}
+
+impl BuyZone {
+    /// Selects the authentic Complete Collection Buy Mode catalog zone for a
+    /// lot ID (`globals[10]`) and neighborhood zoning (`1` residential, `2`
+    /// community).
+    pub const fn for_lot(lot_id: i16, zoning: Option<i32>) -> Self {
+        match lot_id {
+            21..=30 => Self::Downtown,
+            40..=49 => Self::Vacation,
+            81..=89 => Self::StudioTown,
+            93..=98 => Self::MagicTown,
+            _ if matches!(zoning, Some(2))
+                || (zoning.is_none() && lot_id >= 58 && lot_id <= 68) =>
+            {
+                Self::Community
+            }
+            _ => Self::Residential,
+        }
+    }
+
+    /// Number of top-level category buttons for this zone (`8` on Residential,
+    /// `5` on all five expansion commercial lot types).
+    pub const fn category_count(self) -> usize {
+        match self {
+            Self::Residential => 8,
+            Self::Downtown
+            | Self::Vacation
+            | Self::Community
+            | Self::StudioTown
+            | Self::MagicTown => 5,
+        }
+    }
+}
 
 /// Buy Mode catalog sort order (`[ui + 0xa0]`, `0x4cea5d`, `0x507288`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -27,9 +77,11 @@ pub enum BuySort {
 /// Interactive state of the Buy Mode catalog strip.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BuyState {
+    pub zone: BuyZone,
     pub sort: BuySort,
-    /// Selected top-level category `0..8`, or `None` when the 8 top-level
-    /// category icons are shown (`[ui + 0xa4] == 0`).
+    /// Selected top-level category (`0..8` on Residential, `0..5` on commercial
+    /// expansion lots), or `None` when top-level category icons are shown
+    /// (`[ui + 0xa4] == 0`).
     pub category: Option<usize>,
     /// Selected subcategory `0..8` within `category`.
     pub subcategory: usize,
@@ -40,10 +92,26 @@ pub struct BuyState {
 }
 
 impl BuyState {
-    /// Resets the panel to top-level By-Function categories, as entering Buy
-    /// Mode on a residential lot does (`0x4cebf4`).
+    /// Resets the panel to top-level By-Function categories on the current zone,
+    /// as entering Buy Mode does (`0x4cebf4`).
     pub fn reset(&mut self) {
-        *self = Self::default();
+        let zone = self.zone;
+        *self = Self {
+            zone,
+            ..Self::default()
+        };
+    }
+
+    /// Switches the active Buy Mode catalog zone, clearing category/selection
+    /// state if the zone changed.
+    pub fn set_zone(&mut self, zone: BuyZone) {
+        if self.zone != zone {
+            self.zone = zone;
+            self.category = None;
+            self.subcategory = 0;
+            self.page = 0;
+            self.selected = None;
+        }
     }
 
     /// Applies a Buy Mode presentation command (`BuyCategory`,
@@ -51,7 +119,7 @@ impl BuyState {
     /// changed.
     pub fn apply(&mut self, command: &Command) -> bool {
         match *command {
-            Command::BuyCategory(cat) if cat < 8 => {
+            Command::BuyCategory(cat) if cat < self.zone.category_count() => {
                 self.category = Some(cat);
                 self.subcategory = 0;
                 self.page = 0;
@@ -79,6 +147,16 @@ impl BuyState {
                 }
             }
             Command::BuyToggleSort => {
+                if self.zone != BuyZone::Residential {
+                    if self.category.is_some() {
+                        self.category = None;
+                        self.subcategory = 0;
+                        self.page = 0;
+                        self.selected = None;
+                        return true;
+                    }
+                    return false;
+                }
                 self.sort = match self.sort {
                     BuySort::ByFunction => BuySort::ByRoom,
                     BuySort::ByRoom => BuySort::ByFunction,
@@ -107,34 +185,93 @@ impl BuyState {
     }
 }
 
-/// One residential-buyable catalog entry (`0x4cd149`, `0x4cbd44`).
+/// Interaction-table user restriction shown in Buy Mode hover popups from
+/// `GameData/UIText.iff STR# 160[14, 15, 17, 18, 19]` (`0x45775c..0x457978`,
+/// `0x5086c5..0x50873e`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UsageRestriction {
+    /// `STR# 160[14]`: `"Can only be used by adults"`.
+    AdultsOnly,
+    /// `STR# 160[15]`: `"Can only be used by kids"`.
+    KidsOnly,
+    /// `STR# 160[17]`: `"Can only be used by pets"`.
+    PetsOnly,
+    /// `STR# 160[18]`: `"Can only be used by dogs"`.
+    DogsOnly,
+    /// `STR# 160[19]`: `"Can only be used by cats"`.
+    CatsOnly,
+}
+
+impl UsageRestriction {
+    /// Zero-based index into `GameData/UIText.iff STR# 160`.
+    pub const fn str160_index(self) -> usize {
+        match self {
+            Self::AdultsOnly => 14,
+            Self::KidsOnly => 15,
+            Self::PetsOnly => 17,
+            Self::DogsOnly => 18,
+            Self::CatsOnly => 19,
+        }
+    }
+}
+
+/// One Buy Mode catalog entry (`0x4cd149`, `0x4cbd44`, `0x4cb9cd..0x4cbaa8`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuyItem {
     pub guid: u32,
     pub price: i32,
     pub name: String,
     pub description: String,
-    /// OBJD `+0x4e` (word 39): room sort bitmask (`0x4cb8e7`, `0x4cb905`).
+    /// OBJD `+0x4e` (word 39): residential room sort bitmask (`0x4cb8e7`, `0x4cb905`).
     pub room_sort: u16,
     /// OBJD `+0x50` (word 40): function sort bitmask (`0x4cb91d`).
     pub function_sort: u16,
     /// OBJD `+0xbc` (word 94): function subsort bitmask (`0x4cb93b`).
     pub function_subsort: u16,
+    /// OBJD `+0xbe` (word 95): Hot Date Downtown sort bitmask (`0x4cb9cd`).
+    pub downtown_sort: u16,
+    /// OBJD `+0xc2` (word 97): Vacation Island sort bitmask (`0x4cb9ee`).
+    pub vacation_sort: u16,
+    /// OBJD `+0xc6` (word 99): Unleashed Old Town / Community sort bitmask (`0x4cba0f`).
+    pub community_sort: u16,
+    /// OBJD `+0xce` (word 103): Superstar Studio Town sort bitmask (`0x4cba30`).
+    pub studio_sort: u16,
+    /// OBJD `+0xd0` (word 104): Makin' Magic Magic Town sort bitmask (`0x4cba51`).
+    pub magic_sort: u16,
     /// OBJD `+0x8a` (word 69): nonzero for Build-mode catalog objects.
     pub build_mode_type: i16,
     /// OBJD `+0xa4..+0xb0` (words 82..88): Hunger, Comfort, Hygiene, Bladder,
     /// Energy, Fun, Room motive ratings (`0x457a36` cases `0..7`).
     pub ratings: [i16; 7],
-    /// OBJD `+0xb2` low 7 bits: Cooking, Mechanical, Logic, Body, Creativity,
-    /// Charisma, Study skill/activity flags (`0x457a36` cases `7..14`).
-    pub skill_flags: u8,
+    /// OBJD `+0xb2` full 16-bit skill/activity rating flags (`0x457a36` cases
+    /// `7..14`: Cooking, Mechanical, Logic, Body, Creativity, Charisma, Study,
+    /// plus upper bits preserved without truncation).
+    pub skill_flags: u16,
+    /// TTAB user restriction (`0x45775c..0x457978`: adults/kids/pets/dogs/cats).
+    pub usage_restriction: Option<UsageRestriction>,
+    /// TTAB group-activity flag (`0x4579da`: `"Group Activity"`, `STR# 160[16]`).
+    pub group_activity: bool,
+}
+
+impl BuyItem {
+    /// Returns the catalog sort bitmask for `zone`.
+    pub const fn sort_word(&self, zone: BuyZone) -> u16 {
+        match zone {
+            BuyZone::Residential => self.room_sort | self.function_sort,
+            BuyZone::Downtown => self.downtown_sort,
+            BuyZone::Vacation => self.vacation_sort,
+            BuyZone::Community => self.community_sort,
+            BuyZone::StudioTown => self.studio_sort,
+            BuyZone::MagicTown => self.magic_sort,
+        }
+    }
 }
 
 /// Catalog popup rating labels loaded from `GameData/UIText.iff STR# 160`
-/// (`0x508168` → `0x50845d`).
+/// (`0x508168` → `0x50845d`, all 20 entries in Complete Collection 1.91).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RatingLabels {
-    labels: [String; 14],
+    labels: [String; 20],
 }
 
 impl Default for RatingLabels {
@@ -155,12 +292,23 @@ impl Default for RatingLabels {
                 "+ Creativity".into(),
                 "+ Charisma".into(),
                 "+ Study".into(),
+                "Can only be used by adults".into(),
+                "Can only be used by kids".into(),
+                "Group Activity".into(),
+                "Can only be used by pets".into(),
+                "Can only be used by dogs".into(),
+                "Can only be used by cats".into(),
             ],
         }
     }
 }
 
 impl RatingLabels {
+    /// All 20 localized `STR# 160` rating & restriction labels.
+    pub fn labels(&self) -> &[String; 20] {
+        &self.labels
+    }
+
     /// Reads `STR# 160` (`0xa0`) from `GameData/UIText.iff`, falling back to
     /// built-in US English strings for any missing entry.
     pub fn load(install: &Install) -> Self {
@@ -196,8 +344,8 @@ impl RatingLabels {
         out
     }
 
-    /// Formats all nonzero motive ratings and set skill flags for `item`
-    /// (`0x50845d` loop `0..0xe`).
+    /// Formats all nonzero motive ratings, set skill flags, user restriction
+    /// notice, and group-activity flag for `item` (`0x50845d..0x50878e`).
     pub fn format(&self, item: &BuyItem) -> Vec<String> {
         let mut lines = Vec::new();
         for (i, &val) in item.ratings.iter().enumerate() {
@@ -206,9 +354,15 @@ impl RatingLabels {
             }
         }
         for bit in 0..7 {
-            if (item.skill_flags & (1u8 << bit)) != 0 {
+            if (item.skill_flags & (1u16 << bit)) != 0 {
                 lines.push(self.labels[7 + bit].clone());
             }
+        }
+        if let Some(restriction) = item.usage_restriction {
+            lines.push(self.labels[restriction.str160_index()].clone());
+        }
+        if item.group_activity {
+            lines.push(self.labels[16].clone());
         }
         lines
     }
@@ -335,7 +489,7 @@ pub struct BuyCatalog {
     sell_labels: SellLabels,
 }
 
-/// OBJD byte offsets read by `0x4cd149`, `0x4cb8e7..0x4cb979`, and `0x457a36`.
+/// OBJD byte offsets read by `0x4cd149`, `0x4cb8e7..0x4cbaa8`, and `0x457a36`.
 const OBJD_GRAPHICS: usize = 0x08;
 const OBJD_TTAB: usize = 0x0e;
 const OBJD_TYPE: usize = 0x12;
@@ -349,6 +503,11 @@ const OBJD_BUILD_TYPE: usize = 0x8a;
 const OBJD_RATING_BASE: usize = 0xa4;
 const OBJD_RATING_SKILLS: usize = 0xb2;
 const OBJD_FUNC_SUBSORT: usize = 0xbc;
+const OBJD_DOWNTOWN_SORT: usize = 0xbe;
+const OBJD_VACATION_SORT: usize = 0xc2;
+const OBJD_COMMUNITY_SORT: usize = 0xc6;
+const OBJD_STUDIO_SORT: usize = 0xce;
+const OBJD_MAGIC_SORT: usize = 0xd0;
 
 /// Object type 2 is a person (excluded at `0x4575d2`).
 const PERSON_TYPE: i16 = 2;
@@ -364,6 +523,10 @@ pub const FUNCTION_SUB_MASKS: [u16; 8] = [0x01, 0x02, 0x04, 0x08, 0x20, 0x40, 0x
 /// Room-sort category bitmasks in UI slot order `0..8` (`0x507288`).
 pub const ROOM_BITS: [u16; 8] = [0x08, 0x20, 0x02, 0x80, 0x01, 0x04, 0x10, 0x40];
 
+/// Expansion commercial category bitmasks in UI slot order `0..5`
+/// (`0x6cc464..0x6cc500`, `0x4cb9cd..0x4cba6f`).
+pub const COMMERCIAL_BITS: [u16; 5] = [0x01, 0x02, 0x04, 0x08, 0x80];
+
 /// UIGraphics bitmap IDs from `0x6cc3fc..0x6cc684` and `0x5050e4`.
 pub const PREV_ARROW: i32 = 102;
 pub const NEXT_ARROW: i32 = 101;
@@ -372,6 +535,19 @@ pub const ROOM_CAT_BMPS: [i32; 8] = [158, 159, 160, 161, 162, 163, 164, 165];
 pub const ROOM_SUB_BMPS: [i32; 8] = [210, 211, 212, 213, 214, 215, 216, 217];
 pub const BACK_FUNC_BMPS: [i32; 8] = [170, 171, 172, 173, 174, 175, 176, 177];
 pub const BACK_ROOM_BMPS: [i32; 8] = [180, 181, 182, 183, 184, 185, 186, 187];
+pub const DOWNTOWN_CAT_BMPS: [i32; 5] = [200, 201, 202, 203, 204];
+pub const BACK_DOWNTOWN_BMPS: [i32; 5] = [190, 191, 192, 193, 194];
+pub const DOWNTOWN_SUB_BMPS: [i32; 8] = [220, 221, 222, 223, 224, 225, 226, 227];
+pub const VACATION_CAT_BMPS: [i32; 5] = [230, 231, 232, 233, 234];
+pub const BACK_VACATION_BMPS: [i32; 5] = [195, 196, 197, 198, 199];
+pub const VACATION_SUB_BMPS: [i32; 8] = [240, 241, 242, 243, 244, 245, 246, 247];
+pub const COMMUNITY_CAT_BMPS: [i32; 5] = [250, 251, 252, 253, 254];
+pub const BACK_COMMUNITY_BMPS: [i32; 5] = [255, 256, 257, 258, 259];
+pub const COMMUNITY_SUB_BMPS: [i32; 8] = [260, 261, 262, 263, 264, 265, 266, 267];
+pub const STUDIO_CAT_BMPS: [i32; 5] = [273, 274, 276, 275, 277];
+pub const BACK_STUDIO_BMPS: [i32; 5] = [268, 269, 270, 271, 272];
+pub const MAGIC_CAT_BMPS: [i32; 5] = [1705, 1706, 1708, 1707, 1709];
+pub const BACK_MAGIC_BMPS: [i32; 5] = [1700, 1701, 1702, 1703, 1704];
 pub const SUBCAT_MISC_PETS: i32 = 1574;
 pub const SUBCAT_MISC_MAGIC: i32 = 1575;
 pub const SUBCAT_OTHER: i32 = 1580;
@@ -398,6 +574,14 @@ const ROOM_CAT_POS: [[i32; 2]; 8] = [
     [284, 59],
     [322, 55],
     [364, 64],
+];
+
+const COMMERCIAL_CAT_POS: [[i32; 2]; 5] = [
+    ROOM_CAT_POS[0],
+    ROOM_CAT_POS[1],
+    ROOM_CAT_POS[2],
+    ROOM_CAT_POS[3],
+    ROOM_CAT_POS[7],
 ];
 
 const SUBCAT_POS: [[i32; 2]; 8] = [
@@ -439,12 +623,26 @@ pub fn resource_ids() -> Vec<i32> {
         SUBCAT_MISC_MAGIC,
         SUBCAT_OTHER,
         SUBCAT_ALL,
+        dialog::BACKGROUND,
     ];
     ids.extend(FUNC_CAT_BMPS);
     ids.extend(ROOM_CAT_BMPS);
     ids.extend(ROOM_SUB_BMPS);
     ids.extend(BACK_FUNC_BMPS);
     ids.extend(BACK_ROOM_BMPS);
+    ids.extend(DOWNTOWN_CAT_BMPS);
+    ids.extend(BACK_DOWNTOWN_BMPS);
+    ids.extend(DOWNTOWN_SUB_BMPS);
+    ids.extend(VACATION_CAT_BMPS);
+    ids.extend(BACK_VACATION_BMPS);
+    ids.extend(VACATION_SUB_BMPS);
+    ids.extend(COMMUNITY_CAT_BMPS);
+    ids.extend(BACK_COMMUNITY_BMPS);
+    ids.extend(COMMUNITY_SUB_BMPS);
+    ids.extend(STUDIO_CAT_BMPS);
+    ids.extend(BACK_STUDIO_BMPS);
+    ids.extend(MAGIC_CAT_BMPS);
+    ids.extend(BACK_MAGIC_BMPS);
     for cat_bmp in FUNC_CAT_BMPS {
         for sub in 0..4 {
             ids.push(cat_bmp * 10 + sub);
@@ -518,27 +716,42 @@ impl BuyCatalog {
                     name = chunk.label.clone();
                     raw_name = cp1252_bytes(&chunk.label);
                 }
-                // 0x4cb905: residential Buy Mode requires room_sort != 0.
+                // 0x4cb905..0x4cbaa8: keep the object whenever any residential
+                // (`+0x4e` room or `+0x50` function) or expansion commercial
+                // catalog sort word is nonzero.
                 let room_sort = read_i16(data, OBJD_ROOM_SORT) as u16;
+                let function_sort = read_i16(data, OBJD_FUNC_SORT) as u16;
+                let downtown_sort = read_i16(data, OBJD_DOWNTOWN_SORT) as u16;
+                let vacation_sort = read_i16(data, OBJD_VACATION_SORT) as u16;
+                let community_sort = read_i16(data, OBJD_COMMUNITY_SORT) as u16;
+                let studio_sort = read_i16(data, OBJD_STUDIO_SORT) as u16;
+                let magic_sort = read_i16(data, OBJD_MAGIC_SORT) as u16;
+                let any_sort = room_sort
+                    | function_sort
+                    | downtown_sort
+                    | vacation_sort
+                    | community_sort
+                    | studio_sort
+                    | magic_sort;
                 // 0x457588 / 0x4575a1: needs graphics (master != 0 ||
                 // base_graphic_id != 0) or an interaction table.
                 let graphics = read_i16(data, OBJD_GRAPHICS);
                 let ttab = read_i16(data, OBJD_TTAB);
-                if room_sort == 0 || (master == 0 && graphics == 0 && ttab <= 0) {
+                if !is_buy_catalog_eligible(any_sort, master, graphics, ttab) {
                     if !name.is_empty() {
                         fallback_names.insert(guid, name);
                     }
                     continue;
                 }
                 let price = i32::from(read_i16(data, OBJD_PRICE));
-                let function_sort = read_i16(data, OBJD_FUNC_SORT) as u16;
                 let function_subsort = read_i16(data, OBJD_FUNC_SUBSORT) as u16;
                 let build_mode_type = read_i16(data, OBJD_BUILD_TYPE);
                 let mut ratings = [0i16; 7];
                 for (i, slot) in ratings.iter_mut().enumerate() {
                     *slot = read_i16(data, OBJD_RATING_BASE + i * 2);
                 }
-                let skill_flags = data.get(OBJD_RATING_SKILLS).copied().unwrap_or(0) & 0x7f;
+                let skill_flags = read_i16(data, OBJD_RATING_SKILLS) as u16;
+                let (usage_restriction, group_activity) = read_ttab_usage(&iff, ttab);
                 items.push((
                     raw_name,
                     BuyItem {
@@ -549,9 +762,16 @@ impl BuyCatalog {
                         room_sort,
                         function_sort,
                         function_subsort,
+                        downtown_sort,
+                        vacation_sort,
+                        community_sort,
+                        studio_sort,
+                        magic_sort,
                         build_mode_type,
                         ratings,
                         skill_flags,
+                        usage_restriction,
+                        group_activity,
                     },
                 ));
             }
@@ -642,40 +862,64 @@ impl BuyCatalog {
         (master, name)
     }
 
-    /// Every residential-buyable item in catalog sort order.
+    /// Every buyable item across residential and commercial catalogs in sort order.
     pub fn all(&self) -> &[BuyItem] {
         &self.items
     }
 
-    /// Items matching the current `(sort, category, subcategory)` selection
-    /// (`0x507288`, `0x4cb93b`, `0x4cb8e7`, `0x4cb91d`).
+    /// All catalog items available in `zone` (i.e. with a nonzero sort word
+    /// for that zone), preserving `(price, raw_name, guid)` catalog sort order.
+    pub fn items_for_zone(&self, zone: BuyZone) -> Vec<&BuyItem> {
+        self.items
+            .iter()
+            .filter(|item| item.sort_word(zone) != 0)
+            .collect()
+    }
+
+    /// Items matching the current `(zone, sort, category, subcategory)`
+    /// selection (`0x507288`, `0x4cb8e7..0x4cbaa8`).
     pub fn filtered(&self, state: &BuyState) -> Vec<&BuyItem> {
         let Some(cat) = state.category else {
             return Vec::new();
         };
-        if cat >= 8 || state.subcategory >= 8 {
+        if cat >= state.zone.category_count() || state.subcategory >= 8 {
             return Vec::new();
         }
-        match state.sort {
-            BuySort::ByFunction => {
-                let cat_bit = FUNCTION_BITS[cat];
-                let sub_mask = FUNCTION_SUB_MASKS[state.subcategory];
-                self.items
-                    .iter()
-                    .filter(|item| {
-                        (item.function_sort & cat_bit) != 0
-                            && ((item.function_subsort & sub_mask) != 0
-                                || (sub_mask == 0xff && item.function_subsort == 0))
-                    })
-                    .collect()
-            }
-            BuySort::ByRoom => {
-                let room_bit = ROOM_BITS[cat];
+        match state.zone {
+            BuyZone::Residential => match state.sort {
+                BuySort::ByFunction => {
+                    let cat_bit = FUNCTION_BITS[cat];
+                    let sub_mask = FUNCTION_SUB_MASKS[state.subcategory];
+                    self.items
+                        .iter()
+                        .filter(|item| {
+                            (item.function_sort & cat_bit) != 0
+                                && ((item.function_subsort & sub_mask) != 0
+                                    || (sub_mask == 0xff && item.function_subsort == 0))
+                        })
+                        .collect()
+                }
+                BuySort::ByRoom => {
+                    let room_bit = ROOM_BITS[cat];
+                    let func_bit = FUNCTION_BITS[state.subcategory];
+                    self.items
+                        .iter()
+                        .filter(|item| {
+                            (item.room_sort & room_bit) != 0 && (item.function_sort & func_bit) != 0
+                        })
+                        .collect()
+                }
+            },
+            zone => {
+                let cat_bit = COMMERCIAL_BITS[cat];
                 let func_bit = FUNCTION_BITS[state.subcategory];
+                let is_misc_sub = state.subcategory == 7;
                 self.items
                     .iter()
                     .filter(|item| {
-                        (item.room_sort & room_bit) != 0 && (item.function_sort & func_bit) != 0
+                        (item.sort_word(zone) & cat_bit) != 0
+                            && ((item.function_sort & func_bit) != 0
+                                || (is_misc_sub && item.function_sort == 0))
                     })
                     .collect()
             }
@@ -821,28 +1065,48 @@ pub fn layout_with_sell(
 
     match state.category {
         None => {
-            let (bmps, coords) = match state.sort {
-                BuySort::ByFunction => (&FUNC_CAT_BMPS, &FUNC_CAT_POS),
-                BuySort::ByRoom => (&ROOM_CAT_BMPS, &ROOM_CAT_POS),
-            };
-            for i in 0..8 {
-                let id = bmps[i];
-                let [w, h] = btn_size(id);
-                widgets.push(BuyWidget {
-                    rect: Rect::new(coords[i][0], strip_y + coords[i][1], w, h),
-                    kind: BuyWidgetKind::Button {
-                        id,
-                        selected: false,
-                        enabled: true,
-                    },
-                    command: Some(Command::BuyCategory(i)),
-                });
+            if state.zone == BuyZone::Residential {
+                let (bmps, coords) = match state.sort {
+                    BuySort::ByFunction => (&FUNC_CAT_BMPS, &FUNC_CAT_POS),
+                    BuySort::ByRoom => (&ROOM_CAT_BMPS, &ROOM_CAT_POS),
+                };
+                for i in 0..8 {
+                    let id = bmps[i];
+                    let [w, h] = btn_size(id);
+                    widgets.push(BuyWidget {
+                        rect: Rect::new(coords[i][0], strip_y + coords[i][1], w, h),
+                        kind: BuyWidgetKind::Button {
+                            id,
+                            selected: false,
+                            enabled: true,
+                        },
+                        command: Some(Command::BuyCategory(i)),
+                    });
+                }
+            } else {
+                let bmps = commercial_cat_bmps(state.zone);
+                for (i, &id) in bmps.iter().enumerate() {
+                    let [w, h] = btn_size(id);
+                    let pos = COMMERCIAL_CAT_POS[i];
+                    widgets.push(BuyWidget {
+                        rect: Rect::new(pos[0], strip_y + pos[1], w, h),
+                        kind: BuyWidgetKind::Button {
+                            id,
+                            selected: false,
+                            enabled: true,
+                        },
+                        command: Some(Command::BuyCategory(i)),
+                    });
+                }
             }
         }
-        Some(cat) if cat < 8 => {
-            let back_id = match state.sort {
-                BuySort::ByFunction => BACK_FUNC_BMPS[cat],
-                BuySort::ByRoom => BACK_ROOM_BMPS[cat],
+        Some(cat) if cat < state.zone.category_count() => {
+            let back_id = match state.zone {
+                BuyZone::Residential => match state.sort {
+                    BuySort::ByFunction => BACK_FUNC_BMPS[cat],
+                    BuySort::ByRoom => BACK_ROOM_BMPS[cat],
+                },
+                zone => commercial_back_bmps(zone)[cat],
             };
             let [bw, bh] = btn_size(back_id);
             widgets.push(BuyWidget {
@@ -856,16 +1120,19 @@ pub fn layout_with_sell(
             });
 
             for sub in 0..8 {
-                let bmp = match state.sort {
-                    BuySort::ByFunction => match sub {
-                        0..=3 => Some(FUNC_CAT_BMPS[cat] * 10 + sub as i32),
-                        4 if cat == 7 => Some(SUBCAT_MISC_PETS),
-                        5 if cat == 7 => Some(SUBCAT_MISC_MAGIC),
-                        4 | 5 => None,
-                        6 => Some(SUBCAT_OTHER),
-                        _ => Some(SUBCAT_ALL),
+                let bmp = match state.zone {
+                    BuyZone::Residential => match state.sort {
+                        BuySort::ByFunction => match sub {
+                            0..=3 => Some(FUNC_CAT_BMPS[cat] * 10 + sub as i32),
+                            4 if cat == 7 => Some(SUBCAT_MISC_PETS),
+                            5 if cat == 7 => Some(SUBCAT_MISC_MAGIC),
+                            4 | 5 => None,
+                            6 => Some(SUBCAT_OTHER),
+                            _ => Some(SUBCAT_ALL),
+                        },
+                        BuySort::ByRoom => Some(ROOM_SUB_BMPS[sub]),
                     },
-                    BuySort::ByRoom => Some(ROOM_SUB_BMPS[sub]),
+                    zone => Some(commercial_sub_bmps(zone)[sub]),
                 };
                 let Some(id) = bmp else {
                     continue;
@@ -1132,16 +1399,38 @@ pub fn draw(
     }
 
     if let Some(card) = &layout.popup {
-        frame.fill(card.rect, [20, 32, 92]);
-        let border = [120, 148, 212];
-        frame.fill(
-            Rect::new(card.rect.x, card.rect.y, card.rect.width, 2),
-            border,
-        );
-        frame.fill(
-            Rect::new(card.rect.x, card.rect.y, 2, card.rect.height),
-            border,
-        );
+        if let Some(sheet) = art.image(dialog::BACKGROUND) {
+            dialog::draw_nine_slice(frame, sheet, card.rect);
+        } else {
+            frame.fill(card.rect, [20, 32, 92]);
+            let border = [120, 148, 212];
+            frame.fill(
+                Rect::new(card.rect.x, card.rect.y, card.rect.width, 2),
+                border,
+            );
+            frame.fill(
+                Rect::new(
+                    card.rect.x,
+                    card.rect.y + card.rect.height - 2,
+                    card.rect.width,
+                    2,
+                ),
+                border,
+            );
+            frame.fill(
+                Rect::new(card.rect.x, card.rect.y, 2, card.rect.height),
+                border,
+            );
+            frame.fill(
+                Rect::new(
+                    card.rect.x + card.rect.width - 2,
+                    card.rect.y,
+                    2,
+                    card.rect.height,
+                ),
+                border,
+            );
+        }
         if let Some(icon) = thumbnails.icon(art, card.guid) {
             frame.draw_all(&icon, [card.rect.x + 12, card.rect.y + 12]);
         }
@@ -1181,6 +1470,121 @@ pub fn draw(
             }
         }
     }
+}
+
+fn commercial_cat_bmps(zone: BuyZone) -> &'static [i32; 5] {
+    match zone {
+        BuyZone::Downtown | BuyZone::Residential => &DOWNTOWN_CAT_BMPS,
+        BuyZone::Vacation => &VACATION_CAT_BMPS,
+        BuyZone::Community => &COMMUNITY_CAT_BMPS,
+        BuyZone::StudioTown => &STUDIO_CAT_BMPS,
+        BuyZone::MagicTown => &MAGIC_CAT_BMPS,
+    }
+}
+
+fn commercial_back_bmps(zone: BuyZone) -> &'static [i32; 5] {
+    match zone {
+        BuyZone::Downtown | BuyZone::Residential => &BACK_DOWNTOWN_BMPS,
+        BuyZone::Vacation => &BACK_VACATION_BMPS,
+        BuyZone::Community => &BACK_COMMUNITY_BMPS,
+        BuyZone::StudioTown => &BACK_STUDIO_BMPS,
+        BuyZone::MagicTown => &BACK_MAGIC_BMPS,
+    }
+}
+
+fn commercial_sub_bmps(zone: BuyZone) -> &'static [i32; 8] {
+    match zone {
+        BuyZone::Vacation => &VACATION_SUB_BMPS,
+        BuyZone::Community => &COMMUNITY_SUB_BMPS,
+        BuyZone::Downtown | BuyZone::StudioTown | BuyZone::MagicTown | BuyZone::Residential => {
+            &DOWNTOWN_SUB_BMPS
+        }
+    }
+}
+
+/// Parses an object's `TTAB` chunk to determine its user restriction
+/// (`0x45775c..0x457978`: adults/kids/dogs/cats/pets only) and group-activity
+/// flag (`0x4579da`) for `GameData/UIText.iff STR# 160[14..=19]`.
+fn read_ttab_usage(iff: &Iff, ttab_id: i16) -> (Option<UsageRestriction>, bool) {
+    let Ok(id) = u16::try_from(ttab_id) else {
+        return (None, false);
+    };
+    let Some(chunk) = iff.get(b"TTAB", id) else {
+        return (None, false);
+    };
+    let Ok(table) = InteractionTable::parse(iff.data(chunk)) else {
+        return (None, false);
+    };
+    let mut non_debug = 0usize;
+    let mut adults_only = true;
+    let mut kids_only = true;
+    let mut dogs_only = true;
+    let mut cats_only = true;
+    let mut pets_only = true;
+    let mut group_activity = false;
+    for action in &table.interactions {
+        let f = action.flags;
+        // Bit 7 (0x80): debug interaction, skipped by `0x45775c..0x457a25`.
+        if (f & (1 << 7)) != 0 {
+            continue;
+        }
+        non_debug += 1;
+        let no_kids = (f & (1 << 4)) != 0;
+        let no_adults = (f & (1 << 6)) != 0;
+        let dogs = (f & (1 << 9)) != 0;
+        let cats = (f & (1 << 10)) != 0;
+        if !no_kids || dogs || cats {
+            adults_only = false;
+        }
+        if !no_adults || dogs || cats {
+            kids_only = false;
+        }
+        if !no_adults || !no_kids || cats {
+            dogs_only = false;
+        }
+        if !no_adults || !no_kids || dogs {
+            cats_only = false;
+        }
+        if !no_adults || !no_kids {
+            pets_only = false;
+        }
+        // 0x4579da -> 0x41f12c: `joining_index` references a target interaction
+        // by its TTAB menu `string_index`, not its dense vector position.
+        if action.joining_index >= 0
+            && table
+                .interactions
+                .iter()
+                .any(|other| other.string_index == action.joining_index as u32)
+        {
+            group_activity = true;
+        }
+    }
+    if non_debug == 0 {
+        return (None, false);
+    }
+    // Check `adults_only`, `kids_only`, then distinguish both-species `pets_only`
+    // (`!(dogs_only ^ cats_only)`) from species-specific `dogs_only` / `cats_only`
+    // so all three Unleashed pet restriction labels (`STR# 160[17..=19]`) remain reachable.
+    let restriction = if adults_only {
+        Some(UsageRestriction::AdultsOnly)
+    } else if kids_only {
+        Some(UsageRestriction::KidsOnly)
+    } else if pets_only && !(dogs_only ^ cats_only) {
+        Some(UsageRestriction::PetsOnly)
+    } else if dogs_only {
+        Some(UsageRestriction::DogsOnly)
+    } else if cats_only {
+        Some(UsageRestriction::CatsOnly)
+    } else {
+        None
+    };
+    (restriction, group_activity)
+}
+
+/// Whether an OBJD entry passes the Buy Mode catalog sort & art/interaction
+/// filter (`0x4cb905..0x4cbaa8`, `0x457588`).
+fn is_buy_catalog_eligible(any_sort: u16, master: i16, graphics: i16, ttab: i16) -> bool {
+    any_sort != 0 && !(master == 0 && graphics == 0 && ttab <= 0)
 }
 
 fn read_i16(data: &[u8], offset: usize) -> i16 {
@@ -1283,44 +1687,74 @@ fn cp1252_bytes(text: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
+    fn make_item(
+        guid: u32,
+        price: i32,
+        name: &str,
+        description: &str,
+        room_sort: u16,
+        function_sort: u16,
+        function_subsort: u16,
+        ratings: [i16; 7],
+        skill_flags: u16,
+    ) -> BuyItem {
+        BuyItem {
+            guid,
+            price,
+            name: name.into(),
+            description: description.into(),
+            room_sort,
+            function_sort,
+            function_subsort,
+            downtown_sort: 0,
+            vacation_sort: 0,
+            community_sort: 0,
+            studio_sort: 0,
+            magic_sort: 0,
+            build_mode_type: 0,
+            ratings,
+            skill_flags,
+            usage_restriction: None,
+            group_activity: false,
+        }
+    }
+
     fn sample_catalog() -> BuyCatalog {
         BuyCatalog::from_items(vec![
-            BuyItem {
-                guid: 0x1111_1111,
-                price: 200,
-                name: "Fancy Chair".into(),
-                description: "Comfy.".into(),
-                room_sort: 0x20,        // Dining Room
-                function_sort: 0x01,    // Seating
-                function_subsort: 0x01, // Dining Chairs
-                build_mode_type: 0,
-                ratings: [0, 4, 0, 0, 0, 0, 1],
-                skill_flags: 0,
-            },
-            BuyItem {
-                guid: 0x26bf_bb29,
-                price: 80,
-                name: "Werkbunnst All Purpose Chair".into(),
-                description: "Minimal.".into(),
-                room_sort: 0x20,
-                function_sort: 0x01,
-                function_subsort: 0x01,
-                build_mode_type: 0,
-                ratings: [0, 2, 0, 0, 0, 0, 0],
-                skill_flags: 0,
-            },
-            BuyItem {
-                guid: 0x2222_2222,
-                price: 450,
-                name: "Comfy Sofa".into(),
-                description: "Soft.".into(),
-                room_sort: 0x08,        // Living Room
-                function_sort: 0x01,    // Seating
-                function_subsort: 0x04, // Sofas
-                build_mode_type: 0,
-                ratings: [0, 6, 0, 0, 3, 0, 2],
-                skill_flags: 0x04, // + Logic
-            },
+            make_item(
+                0x1111_1111,
+                200,
+                "Fancy Chair",
+                "Comfy.",
+                0x20, // Dining Room
+                0x01, // Seating
+                0x01, // Dining Chairs
+                [0, 4, 0, 0, 0, 0, 1],
+                0,
+            ),
+            make_item(
+                0x26bf_bb29,
+                80,
+                "Werkbunnst All Purpose Chair",
+                "Minimal.",
+                0x20,
+                0x01,
+                0x01,
+                [0, 2, 0, 0, 0, 0, 0],
+                0,
+            ),
+            make_item(
+                0x2222_2222,
+                450,
+                "Comfy Sofa",
+                "Soft.",
+                0x08, // Living Room
+                0x01, // Seating
+                0x04, // Sofas
+                [0, 6, 0, 0, 3, 0, 2],
+                0x04, // + Logic
+            ),
         ])
     }
 
@@ -1344,54 +1778,10 @@ mod tests {
         // -> `0x430100` -> `memcmp` at `0x6363e0`), so `Zoo` precedes `apple`
         // and `™` (`0x99`) precedes `©` (`0xA9`).
         let tied = BuyCatalog::from_items(vec![
-            BuyItem {
-                guid: 1,
-                price: 100,
-                name: "apple".into(),
-                description: String::new(),
-                room_sort: 1,
-                function_sort: 1,
-                function_subsort: 1,
-                build_mode_type: 0,
-                ratings: [0; 7],
-                skill_flags: 0,
-            },
-            BuyItem {
-                guid: 2,
-                price: 100,
-                name: "Zoo".into(),
-                description: String::new(),
-                room_sort: 1,
-                function_sort: 1,
-                function_subsort: 1,
-                build_mode_type: 0,
-                ratings: [0; 7],
-                skill_flags: 0,
-            },
-            BuyItem {
-                guid: 3,
-                price: 100,
-                name: "Lamp©".into(),
-                description: String::new(),
-                room_sort: 1,
-                function_sort: 1,
-                function_subsort: 1,
-                build_mode_type: 0,
-                ratings: [0; 7],
-                skill_flags: 0,
-            },
-            BuyItem {
-                guid: 4,
-                price: 100,
-                name: "Lamp™".into(),
-                description: String::new(),
-                room_sort: 1,
-                function_sort: 1,
-                function_subsort: 1,
-                build_mode_type: 0,
-                ratings: [0; 7],
-                skill_flags: 0,
-            },
+            make_item(1, 100, "apple", "", 1, 1, 1, [0; 7], 0),
+            make_item(2, 100, "Zoo", "", 1, 1, 1, [0; 7], 0),
+            make_item(3, 100, "Lamp©", "", 1, 1, 1, [0; 7], 0),
+            make_item(4, 100, "Lamp™", "", 1, 1, 1, [0; 7], 0),
         ]);
         let names: Vec<&str> = tied.all().iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["Lamp™", "Lamp©", "Zoo", "apple"]);
@@ -1482,5 +1872,100 @@ mod tests {
         let (name, desc, _) = read_ctss(&ctss_only, 2008);
         assert_eq!(name, "CTSS Lamp");
         assert_eq!(desc, "CTSS description");
+    }
+
+    #[test]
+    fn function_only_residential_item_is_retained_and_filtered_by_function() {
+        // OBJD eligibility helper used by `BuyCatalog::load` retains an object
+        // whose ONLY nonzero sort word is `function_sort` (`+0x50`) and rejects
+        // an object with all sort words zero.
+        let room_sort: u16 = 0;
+        let function_sort: u16 = 0x0001;
+        assert!(is_buy_catalog_eligible(room_sort | function_sort, 0, 1, 0));
+        assert!(!is_buy_catalog_eligible(0, 0, 1, 0));
+
+        // An object with `room_sort == 0`, `function_sort != 0`, and
+        // `function_subsort != 0` must be included in Residential ByFunction
+        // (`0x50765c`) and `items_for_zone(BuyZone::Residential)`.
+        let item = make_item(
+            0x3333_3333,
+            150,
+            "Function-Only Chair",
+            "No room bits set",
+            0,      // room_sort == 0
+            0x0001, // Seating
+            0x0001, // Dining chairs subsort
+            [2, 0, 0, 0, 0, 0, 0],
+            0,
+        );
+        let cat = BuyCatalog::from_items(vec![item]);
+        assert_eq!(cat.items_for_zone(BuyZone::Residential).len(), 1);
+        let state = BuyState {
+            zone: BuyZone::Residential,
+            sort: BuySort::ByFunction,
+            category: Some(0),
+            subcategory: 0,
+            page: 0,
+            selected: None,
+        };
+        let filtered = cat.filtered(&state);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].guid, 0x3333_3333);
+    }
+
+    /// Encodes a minimal TTAB v7 chunk from `(string_index, flags, joining_index)` tuples.
+    fn build_ttab(rows: &[(u32, u32, i32)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(rows.len() as u16).to_le_bytes());
+        out.extend_from_slice(&7u16.to_le_bytes()); // version 7 (no compression flag)
+        for &(string_index, flags, joining_index) in rows {
+            out.extend_from_slice(&4096u16.to_le_bytes()); // action
+            out.extend_from_slice(&0u16.to_le_bytes()); // test
+            out.extend_from_slice(&0u32.to_le_bytes()); // motive count
+            out.extend_from_slice(&flags.to_le_bytes());
+            out.extend_from_slice(&string_index.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // attenuation_code
+            out.extend_from_slice(&0f32.to_le_bytes()); // attenuation
+            out.extend_from_slice(&50u32.to_le_bytes()); // autonomy
+            out.extend_from_slice(&joining_index.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn ttab_usage_matches_191_sparse_joining_id_and_pets_precedence() {
+        // Sparse menu string IDs: `joining_index = 42` matches `string_index == 42`
+        // even though `interactions.len() == 2` (`0x41f12c`).
+        let sparse_ttab = build_ttab(&[(10, 0, 42), (42, 0, -1)]);
+        let iff = Iff::parse(build_iff(&[(b"TTAB", 128, &sparse_ttab)])).unwrap();
+        assert_eq!(read_ttab_usage(&iff, 128), (None, true));
+
+        // Nonexistent low `joining_index = 0` must NOT match when no interaction
+        // has `string_index == 0` (even though `0 < interactions.len()`).
+        let bogus_join = build_ttab(&[(10, 0, 0), (20, 0, -1)]);
+        let iff_bogus = Iff::parse(build_iff(&[(b"TTAB", 128, &bogus_join)])).unwrap();
+        assert_eq!(read_ttab_usage(&iff_bogus, 128), (None, false));
+
+        // Pet restriction labels (`STR# 160[17..=19]`): dog-only, cat-only, and
+        // both-species Pets Only must all be reachable without shadowing each other.
+        let pet_flags = (1 << 4) | (1 << 6);
+        let dog_ttab = build_ttab(&[(1, pet_flags | (1 << 9), -1)]);
+        let iff_dog = Iff::parse(build_iff(&[(b"TTAB", 128, &dog_ttab)])).unwrap();
+        assert_eq!(
+            read_ttab_usage(&iff_dog, 128),
+            (Some(UsageRestriction::DogsOnly), false)
+        );
+        let cat_ttab = build_ttab(&[(1, pet_flags | (1 << 10), -1)]);
+        let iff_cat = Iff::parse(build_iff(&[(b"TTAB", 128, &cat_ttab)])).unwrap();
+        assert_eq!(
+            read_ttab_usage(&iff_cat, 128),
+            (Some(UsageRestriction::CatsOnly), false)
+        );
+        let both_pets_ttab = build_ttab(&[(1, pet_flags | (1 << 9) | (1 << 10), -1)]);
+        let iff_pets = Iff::parse(build_iff(&[(b"TTAB", 128, &both_pets_ttab)])).unwrap();
+        assert_eq!(
+            read_ttab_usage(&iff_pets, 128),
+            (Some(UsageRestriction::PetsOnly), false)
+        );
     }
 }

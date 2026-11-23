@@ -222,10 +222,23 @@ fn options_art_and_texts_load_and_lay_out_all_three_subpanels() {
             .any(|i| i.command == Some(Command::OptionsAction(OptionsAction::TutorialReset)))
     );
 
-    // Community lot (40..=49) hides Reset Tutorial & Save (visit) but shows Free Will.
-    let community = LotVisibility::for_lot(42, Some(2), true, false);
-    assert!(!community.can_save && community.show_free_will && !community.show_reset_tutorial);
-    // Edit mode on Magic Town (93..=98) enables Save while still hiding Free Will.
+    // Vacation Island (`40..=49`, `0x4074c8`) hides Reset Tutorial & Save (visit)
+    // but explicitly shows Free Will (`0x51782c -> 0x51784a`).
+    let vacation = LotVisibility::for_lot(42, Some(2), true, false);
+    assert!(!vacation.can_save && vacation.show_free_will && !vacation.show_reset_tutorial);
+    // Old Town Community (`58..=68`, `zoning == 2`, `0x40747c`) hides Reset
+    // Tutorial & Save (visit) and shows Free Will (`0x51783d -> 0x51784a`).
+    let old_town = LotVisibility::for_lot(58, Some(2), true, false);
+    assert!(!old_town.can_save && old_town.show_free_will && !old_town.show_reset_tutorial);
+    // Studio Town (`81..=89`, `0x4074b1`) hides Save (visit), Free Will
+    // (`0x51780a -> 0x5177bb`), and Reset Tutorial.
+    let studio = LotVisibility::for_lot(81, Some(2), true, false);
+    assert!(!studio.can_save && !studio.show_free_will && !studio.show_reset_tutorial);
+    // Residential (`5`, `zoning == 1`) with an active family shows all three.
+    let residential = LotVisibility::for_lot(5, Some(1), true, false);
+    assert!(residential.can_save && residential.show_free_will && residential.show_reset_tutorial);
+    // Edit mode on Magic Town (`93..=98`, `0x428825`) enables Save while still
+    // hiding Free Will (`0x51781b -> 0x5177bb`) and Reset Tutorial.
     let magic_edit = LotVisibility::for_lot(95, Some(2), false, true);
     assert!(magic_edit.can_save && !magic_edit.show_free_will && !magic_edit.show_reset_tutorial);
 

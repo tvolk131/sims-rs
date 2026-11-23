@@ -274,6 +274,9 @@ pub struct Hud {
     pub build_state: BuildState,
     /// The Build Mode strip widgets and popup card as last laid out.
     build_layout: BuildLayout,
+    /// Neighborhood families (`FAMI` / `FAMs`) cached for ordinary VM dialog
+    /// `$Family` (`0x44c034`) and `$FamilyAssets:N` (`0x44bf66`) formatting.
+    families: std::collections::BTreeMap<i32, dialog::FamilyInfo>,
     /// The interface's sounds, until the game takes them.
     sounds: Vec<SoundEvent>,
 }
@@ -451,7 +454,9 @@ impl Hud {
             .and_then(|n| neighborhood.family_in(n))
             .map(|(_, f)| f.members.clone())
             .unwrap_or_default();
-        Self::open_with_members(install, members, assets, world, friendship)
+        let mut hud = Self::open_with_members(install, members, assets, world, friendship)?;
+        hud.families = load_neighborhood_families(&neighborhood);
+        Ok(hud)
     }
 
     /// Reads the art and faces for a lot whose occupying household members
@@ -524,7 +529,7 @@ impl Hud {
             .and_then(|n| neighborhood.family_in(n))
             .map(|(_, f)| f.members.clone())
             .unwrap_or_default();
-        Self::from_preloaded_with_members(
+        let mut hud = Self::from_preloaded_with_members(
             install,
             members,
             assets,
@@ -533,7 +538,9 @@ impl Hud {
             static_part,
             shared_part,
             pool,
-        )
+        )?;
+        hud.families = load_neighborhood_families(neighborhood);
+        Ok(hud)
     }
 
     /// Builds a [`Hud`] from preloaded [`HudStatic`] and [`HudShared`] tables
@@ -700,8 +707,15 @@ impl Hud {
                 ..BuildState::default()
             },
             build_layout: BuildLayout::default(),
+            families: std::collections::BTreeMap::new(),
             sounds: Vec::new(),
         }
+    }
+
+    /// Replaces the cached neighborhood family table used for ordinary VM dialog
+    /// `$Family` / `$FamilyAssets:N` formatting.
+    pub fn set_families(&mut self, families: std::collections::BTreeMap<i32, dialog::FamilyInfo>) {
+        self.families = families;
     }
 
     /// Forgets what the panel kept of the lot it showed, for a lot put
@@ -788,7 +802,8 @@ impl Hud {
 
     /// Lays out the Buy Mode catalog strip (or active Hand Tool sell prompt)
     /// for `size` and `world` (or clears it outside expanded Buy Mode),
-    /// syncing `self.buy_state.page` to the clamped page number.
+    /// automatically selecting the lot's residential or expansion commercial
+    /// catalog zone (`0x4cb8e7..0x4cbaa8`) and syncing `self.buy_state.page`.
     pub fn layout_buy(
         &mut self,
         size: [i32; 2],
@@ -796,10 +811,27 @@ impl Hud {
         assets: &Assets,
         sell: Option<&SellInfo>,
     ) {
+        self.layout_buy_for_lot(size, world, None, assets, sell);
+    }
+
+    /// Like [`Hud::layout_buy`], using the lot's neighborhood zoning (`Some(1)`
+    /// residential, `Some(2)` community) to distinguish Old Town community lots
+    /// (`BuyZone::Community`) from residential lots (`BuyZone::Residential`).
+    pub fn layout_buy_for_lot(
+        &mut self,
+        size: [i32; 2],
+        world: &World,
+        lot_zoning: Option<i32>,
+        assets: &Assets,
+        sell: Option<&SellInfo>,
+    ) {
         if self.controls.mode != Mode::Buy || !self.controls.expanded {
             self.buy_layout = BuyLayout::default();
             return;
         }
+        let lot_id = world.globals.get(10).copied().unwrap_or(0);
+        let zone = sims_ui::buy::BuyZone::for_lot(lot_id, lot_zoning);
+        self.buy_state.set_zone(zone);
         let rating_labels = self.rating_labels.clone();
         let sell_labels = self.sell_labels.clone();
         let catalog = self.buy_catalog.get_or_insert_with(|| {
@@ -1227,11 +1259,13 @@ impl Hud {
     /// Re-lays out the control panel items and Buy/Build strip for `size`
     /// after a mode or panel toggle, so consecutive clicks work even before
     /// the next [`Hud::draw`].
+    #[allow(clippy::too_many_arguments)]
     pub fn relayout_panel(
         &mut self,
         size: [i32; 2],
         world: &World,
         residential: bool,
+        lot_zoning: Option<i32>,
         visibility: options::LotVisibility,
         assets: &Assets,
         sell: Option<&SellInfo>,
@@ -1246,7 +1280,8 @@ impl Hud {
             Some(&self.art),
         );
         hud::fit(&mut self.items, &self.art, &self.texts);
-        self.layout_buy(size, world, assets, sell);
+        self.sync_options_extra_button_rects(size);
+        self.layout_buy_for_lot(size, world, lot_zoning, assets, sell);
         self.layout_build(size, world, assets, false, false);
         self.layout_camera_strip(size);
     }
@@ -1902,12 +1937,21 @@ impl Hud {
         if self.message.as_ref().is_some_and(|(_, k)| *k == key) {
             return;
         }
-        let read = Message::read(
+        let mut ctx = dialog::DialogContext {
+            faces: Some(&self.faces),
+            thumbnails: Some(&mut self.thumbnails),
+            art: Some(&self.art),
+            careers: Some(&self.careers),
+            fame: Some(&self.fame),
+            families: Some(&self.families),
+        };
+        let read = Message::read_with_context(
             world,
             assets.index(),
             assets.catalog(),
             &self.labels,
             pending,
+            &mut ctx,
         )
         .ok()
         .flatten();
@@ -1988,6 +2032,14 @@ impl Hud {
         match self.controls.panel {
             Some(UiPanel::Relationships) => {
                 snapshot.with_relations(world, self.members(world), &self.known)
+            }
+            Some(UiPanel::Gifts) if self.controls.expanded => {
+                snapshot.with_inventory(world, |guid| {
+                    self.buy_catalog
+                        .as_ref()
+                        .map(|cat| cat.display_for_object(guid).1)
+                        .unwrap_or_default()
+                })
             }
             Some(UiPanel::House) if self.controls.expanded && snapshot.residential => {
                 snapshot.with_house(world, &self.house, &self.kinds)
@@ -2079,6 +2131,7 @@ impl Hud {
         self.draw_for_lot_at_with_selection(
             world,
             residential,
+            Some(if residential { 1 } else { 2 }),
             visibility,
             assets,
             view,
@@ -2093,12 +2146,13 @@ impl Hud {
 
     /// Like [`Hud::draw_for_lot_at`], optionally overriding the HUD's displayed
     /// selected Sim (`selected_override`: `Some(local_sel)`) in co-op mode
-    /// without cloning `world`.
+    /// without cloning `world` and passing exact neighborhood `lot_zoning`.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_for_lot_at_with_selection(
         &mut self,
         world: &World,
         residential: bool,
+        lot_zoning: Option<i32>,
         visibility: options::LotVisibility,
         assets: &Assets,
         view: &View,
@@ -2142,8 +2196,24 @@ impl Hud {
         if self.controls.expanded && residential && self.controls.panel == Some(UiPanel::House) {
             self.kinds.learn(world, assets.index(), assets.catalog());
         }
+        if self.controls.expanded && self.controls.panel == Some(UiPanel::Gifts) {
+            let rating_labels = self.rating_labels.clone();
+            let sell_labels = self.sell_labels.clone();
+            self.buy_catalog.get_or_insert_with(|| {
+                BuyCatalog::load(assets.index(), assets.catalog())
+                    .with_rating_labels(rating_labels)
+                    .with_sell_labels(sell_labels)
+            });
+        }
         // The pause button shows global 17, which the game's pause sets.
         let snapshot = self.for_panel(household, world);
+        if self.controls.expanded && self.controls.panel == Some(UiPanel::Gifts) {
+            for entry in &snapshot.inventory {
+                let _ = self
+                    .thumbnails
+                    .read(assets.index(), assets.catalog(), entry.guid);
+            }
+        }
         if let Some(help) = self.controls.help
             && !hud::help_matches_snapshot(help, &snapshot, self.controls.panel)
         {
@@ -2159,6 +2229,7 @@ impl Hud {
             Some(&self.art),
         );
         hud::fit(&mut self.items, &self.art, &self.texts);
+        self.sync_options_extra_button_rects(view.size);
         self.queue = Queue::read(world, snapshot.selected);
         if clock_us > 0 {
             let origin = self.pending_queue_origin.and_then(|(person, pos, ts)| {
@@ -2298,16 +2369,14 @@ impl Hud {
                 );
             }
         }
-        self.saves_button_rect = self.compute_options_saves_button_rect(view.size);
         if let Some(rect) = self.saves_button_rect {
             self.draw_options_strip_button(&mut frame, rect, "Saves", self.pressed_saves_button);
         }
-        self.coop_button_rect = self.compute_options_coop_button_rect(view.size);
         if let Some(rect) = self.coop_button_rect {
             self.draw_options_strip_button(&mut frame, rect, "Co-op", self.pressed_coop_button);
         }
         if self.controls.mode == Mode::Buy && self.controls.expanded {
-            self.layout_buy(view.size, world, assets, sell);
+            self.layout_buy_for_lot(view.size, world, lot_zoning, assets, sell);
             let mut guids: Vec<u32> = self
                 .buy_layout
                 .widgets
@@ -2416,14 +2485,19 @@ impl Hud {
         canvas.color = frame.into_packed();
     }
 
-    fn compute_options_saves_button_rect(&self, size: [i32; 2]) -> Option<Rect> {
+    /// Computes non-overlapping `(coop_rect, saves_rect)` placements for the
+    /// synthetic Options-strip `"Co-op"` and `"Saves"` buttons across all
+    /// resolutions (`640×480`, `800×600`, `1024×768`, `1280×720`, etc.) and all
+    /// Options subpanel tabs (`None`, `Graphics`, `Sound`, `Play`).
+    ///
+    /// Guarantees pairwise disjointness against `CLUSTER`, every laid-out
+    /// Options strip widget (actions, tabs, dividers, checkboxes, radios,
+    /// sliders, labels, Reset Tutorial), and any open Options help balloon or
+    /// Quick Tips tooltip.
+    fn compute_options_extra_button_rects(&self, size: [i32; 2]) -> Option<(Rect, Rect)> {
         if self.controls.mode != Mode::Options || !self.controls.expanded {
             return None;
         }
-        let quit = self
-            .items
-            .iter()
-            .find(|i| i.command == Some(Command::OptionsAction(OptionsAction::Quit)))?;
         let divider_x = self
             .items
             .iter()
@@ -2434,48 +2508,150 @@ impl Hud {
                 )
             })
             .map(|i| i.rect.x)?;
-        let left = quit.rect.x + quit.rect.width + 4;
-        let avail = divider_x - left - 3;
-        if avail >= 98 {
-            Some(Rect::new(left, quit.rect.y + 6, 46, 28))
-        } else if avail >= 42 {
-            Some(Rect::new(left, quit.rect.y + 2, avail.min(48), 22))
-        } else {
-            // Compact window fallback: sit neatly in the bottom-right corner of the strip.
-            let x = (size[0] - 54).max(divider_x + 4);
-            let y = (size[1] - 26).max(0);
-            Some(Rect::new(x, y, 48, 22))
+        let strip_y = (size[1] - hud::STRIP).max(0);
+        const BTN_W: i32 = 48;
+        const BTN_H: i32 = 22;
+        const GAP: i32 = 4;
+        const PAIR_W: i32 = BTN_W * 2 + GAP; // 100
+
+        let pair_at = |x: i32, y: i32| {
+            (
+                Rect::new(x, y, BTN_W, BTN_H),
+                Rect::new(x + BTN_W + GAP, y, BTN_W, BTN_H),
+            )
+        };
+        let rects_overlap = |a: Rect, b: Rect| {
+            a.width > 0
+                && a.height > 0
+                && b.width > 0
+                && b.height > 0
+                && a.x < b.x + b.width
+                && a.x + a.width > b.x
+                && a.y < b.y + b.height
+                && a.y + a.height > b.y
+        };
+        let cluster_rect = Rect::new(
+            0,
+            (size[1] - hud::CLUSTER[1]).max(0),
+            hud::CLUSTER[0],
+            hud::CLUSTER[1],
+        );
+        let is_clear = |coop: Rect, saves: Rect| -> bool {
+            let inside = |r: Rect| {
+                r.x >= 0 && r.y >= 0 && r.x + r.width <= size[0] && r.y + r.height <= size[1]
+            };
+            if !inside(coop) || !inside(saves) {
+                return false;
+            }
+            if rects_overlap(coop, cluster_rect) || rects_overlap(saves, cluster_rect) {
+                return false;
+            }
+            for item in &self.items {
+                if matches!(
+                    item.kind,
+                    hud::Kind::Stretched(_)
+                        | hud::Kind::Image(hud::id::STRIP | hud::id::BACK_PATCH)
+                ) {
+                    continue;
+                }
+                let obstacle = match &item.kind {
+                    hud::Kind::OptionsTooltip(text) => {
+                        options::tooltip_rect(size, &self.art, item.rect, text).unwrap_or(item.rect)
+                    }
+                    _ => item.rect,
+                };
+                if rects_overlap(coop, obstacle) || rects_overlap(saves, obstacle) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        // 1. When no subpanel tab is open, the entire right side of the Options
+        //    strip (`x > divider_x`) is empty: dock neatly beside the divider.
+        if self.controls.options.tab.is_none() {
+            let (coop, saves) = pair_at(divider_x + 12, strip_y + (hud::STRIP - BTN_H) / 2);
+            if is_clear(coop, saves) {
+                return Some((coop, saves));
+            }
         }
+
+        // 2. When a subpanel tab IS open and there is room to the right of all
+        //    subpanel controls inside the strip (e.g. 1024×768, 1280×720, or
+        //    Sound at 800×600), right-align inside the strip with >= 8 px margin.
+        let subpanel_right = self
+            .items
+            .iter()
+            .filter(|item| {
+                !matches!(
+                    item.kind,
+                    hud::Kind::Stretched(_)
+                        | hud::Kind::Image(hud::id::STRIP | hud::id::BACK_PATCH)
+                        | hud::Kind::OptionsBalloon(_)
+                        | hud::Kind::OptionsTooltip(_)
+                ) && item.rect.x >= divider_x
+            })
+            .map(|item| item.rect.x + item.rect.width)
+            .max()
+            .unwrap_or(divider_x + 2);
+        let right_x = size[0] - PAIR_W - 6;
+        if right_x >= subpanel_right + 8 {
+            let (coop, saves) = pair_at(right_x, size[1] - BTN_H - 8);
+            if is_clear(coop, saves) {
+                return Some((coop, saves));
+            }
+        }
+
+        // 3. Compact / full-width subpanel fallback (e.g. Graphics & Play at
+        //    800×600 or 640×480): dock cleanly right ABOVE the Options strip
+        //    (`y = strip_y - BTN_H - 4`), strictly right of `CLUSTER` so it can
+        //    never cover `"Export HTML"`, `"Character Detail"`, or any other
+        //    Options subpanel control.
+        let above_y = (strip_y - BTN_H - 4).max(4);
+        let min_x = hud::CLUSTER[0] + 8;
+        let max_x = (size[0] - PAIR_W - 6).max(min_x);
+        for candidate_x in [min_x, max_x, divider_x + 4, (min_x + max_x) / 2] {
+            let x = candidate_x.clamp(min_x, max_x);
+            let (coop, saves) = pair_at(x, above_y);
+            if is_clear(coop, saves) {
+                return Some((coop, saves));
+            }
+        }
+        // If an Options help balloon or Quick Tips tooltip occupies the row
+        // immediately above the strip, step up cleanly above their actual drawn boxes.
+        let top_float = self
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                hud::Kind::OptionsBalloon(_) => Some(i.rect.y),
+                hud::Kind::OptionsTooltip(text) => {
+                    options::tooltip_rect(size, &self.art, i.rect, text).map(|r| r.y)
+                }
+                _ => None,
+            })
+            .min()
+            .unwrap_or(above_y);
+        let lifted_y = (top_float - BTN_H - 4).max(4);
+        for candidate_x in [min_x, max_x, divider_x + 4, (min_x + max_x) / 2] {
+            let x = candidate_x.clamp(min_x, max_x);
+            let (coop, saves) = pair_at(x, lifted_y);
+            if is_clear(coop, saves) {
+                return Some((coop, saves));
+            }
+        }
+        None
     }
 
-    fn compute_options_coop_button_rect(&self, size: [i32; 2]) -> Option<Rect> {
-        if self.controls.mode != Mode::Options || !self.controls.expanded {
-            return None;
-        }
-        let quit = self
-            .items
-            .iter()
-            .find(|i| i.command == Some(Command::OptionsAction(OptionsAction::Quit)))?;
-        let divider_x = self
-            .items
-            .iter()
-            .find(|i| {
-                matches!(
-                    i.kind,
-                    hud::Kind::Image(id) if id == options::id::TOOTHPICK_VERT
-                )
-            })
-            .map(|i| i.rect.x)?;
-        let left = quit.rect.x + quit.rect.width + 4;
-        let avail = divider_x - left - 3;
-        if avail >= 98 {
-            Some(Rect::new(left + 50, quit.rect.y + 6, 46, 28))
-        } else if avail >= 42 {
-            Some(Rect::new(left, quit.rect.y + 26, avail.min(48), 22))
+    /// Synchronizes stored `"Saves"` and `"Co-op"` hitboxes with the latest
+    /// laid-out Options items so pointer hits immediately after resize or
+    /// Options tab switches never target stale rectangles.
+    fn sync_options_extra_button_rects(&mut self, size: [i32; 2]) {
+        if let Some((coop, saves)) = self.compute_options_extra_button_rects(size) {
+            self.coop_button_rect = Some(coop);
+            self.saves_button_rect = Some(saves);
         } else {
-            let saves_x = (size[0] - 54).max(divider_x + 4);
-            let y = (size[1] - 26).max(0);
-            Some(Rect::new((saves_x - 52).max(0), y, 48, 22))
+            self.coop_button_rect = None;
+            self.saves_button_rect = None;
         }
     }
 
@@ -3402,6 +3578,38 @@ fn render_wall_swatch(
         depth: None,
     };
     render_image_to_swatch(&masked)
+}
+
+/// Reads neighborhood family surnames (`FAMs`) and net assets (`FAMI` budget +
+/// architecture value, `0x410241` / `0x410271`) from `Neighborhood.iff` so
+/// ordinary VM dialog `$Family` / `$FamilyAssets:N` tokens have live data.
+fn load_neighborhood_families(
+    neighborhood: &Neighborhood,
+) -> std::collections::BTreeMap<i32, dialog::FamilyInfo> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut surnames: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
+    let iff_path = neighborhood.directory.join("Neighborhood.iff");
+    if let Ok(bytes) = std::fs::read(&iff_path)
+        && let Ok(iff) = sims_formats::iff::Iff::parse(bytes)
+    {
+        for chunk in &iff.chunks {
+            if chunk.kind() == "FAMs"
+                && let Ok(table) = sims_formats::strings::StringTable::parse(iff.data(chunk))
+                && let Some(name) = table
+                    .get(0, US_ENGLISH)
+                    .or_else(|| table.entries.first().map(|e| e.text.as_str()))
+                && !name.is_empty()
+            {
+                surnames.insert(chunk.id, name.to_owned());
+            }
+        }
+    }
+    for (&id, fam) in &neighborhood.families {
+        let name = surnames.remove(&id).unwrap_or_default();
+        let assets = fam.budget.saturating_add(fam.architecture_value);
+        out.insert(i32::from(id), dialog::FamilyInfo { name, assets });
+    }
+    out
 }
 
 #[cfg(test)]

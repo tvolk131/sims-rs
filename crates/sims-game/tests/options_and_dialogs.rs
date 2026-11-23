@@ -6,7 +6,8 @@ use sims_game::hud::DialogKey;
 use sims_game::sound::{Feed, Input, Mixer};
 use sims_game::{Game, Options};
 use sims_ui::command::{
-    Command, Mode, OptionsAction, OptionsHelp, OptionsTab, OptionsToggle, VolumeChannel,
+    Command, DetailLevel, Mode, OptionsAction, OptionsHelp, OptionsRadio, OptionsTab,
+    OptionsToggle, VolumeChannel,
 };
 use sims_ui::hud::{self, Kind};
 use sims_vm::boot::Frames;
@@ -1089,5 +1090,266 @@ fn unoccupied_magic_and_studio_lots_boot_into_edit_mode_with_native_save_card() 
         game.release(save_btn);
         assert!(game.has_dialog(), "lot {lot_num} Save Card did not open");
         assert_eq!(game.dialog_entry(), Some(game.lot_name()));
+    }
+}
+
+#[test]
+fn options_saves_and_coop_buttons_never_overlap_any_subpanel_widget_across_resolutions() {
+    let Some(root) = install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to test Options full-composite zero-overlap");
+        return;
+    };
+    let mut game = open_goth(&root);
+
+    let rects_overlap = |a: sims_ui::frame::Rect, b: sims_ui::frame::Rect| {
+        a.width > 0
+            && a.height > 0
+            && b.width > 0
+            && b.height > 0
+            && a.x < b.x + b.width
+            && a.x + a.width > b.x
+            && a.y < b.y + b.height
+            && a.y + a.height > b.y
+    };
+
+    for [w, h] in [[640, 480], [800, 600], [1024, 768], [1280, 720]] {
+        game.resize([w, h]);
+        game.set_mode(Mode::Options);
+        game.render();
+
+        for tab in [
+            None,
+            Some(OptionsTab::Graphics),
+            Some(OptionsTab::Sound),
+            Some(OptionsTab::Play),
+        ] {
+            if let Some(t) = tab {
+                if game.options().tab != Some(t) {
+                    let pt = find_command_point(&game, &Command::OpenOptionsTab(t));
+                    game.press(pt);
+                }
+            } else if game.options().tab.is_some() {
+                assert!(game.escape_options());
+            }
+            let canvas = game.render();
+            if let Some(dir) = std::env::var_os("SIMS_WAVE1_SHOTS_DIR").map(PathBuf::from)
+                && matches!([w, h], [800, 600] | [1024, 768])
+                && matches!(tab, Some(OptionsTab::Play | OptionsTab::Graphics))
+            {
+                let tag = match tab {
+                    Some(OptionsTab::Play) => "play",
+                    Some(OptionsTab::Graphics) => "graphics",
+                    _ => unreachable!(),
+                };
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(
+                    dir.join(format!("options_{tag}_{w}x{h}.png")),
+                    sims_render::png::encode(canvas),
+                );
+            }
+
+            let saves = game
+                .options_saves_button_rect()
+                .expect("Saves button laid out in Options");
+            let coop = game
+                .options_coop_button_rect()
+                .expect("Co-op button laid out in Options");
+            assert!(
+                !rects_overlap(saves, coop),
+                "Saves {saves:?} and Co-op {coop:?} overlap at {w}x{h} tab={tab:?}"
+            );
+            for (name, r) in [("Saves", saves), ("Co-op", coop)] {
+                assert!(
+                    r.x >= 0 && r.y >= 0 && r.x + r.width <= w && r.y + r.height <= h,
+                    "{name} {r:?} clips outside {w}x{h} tab={tab:?}"
+                );
+                let cluster = sims_ui::frame::Rect::new(
+                    0,
+                    (h - sims_ui::hud::CLUSTER[1]).max(0),
+                    sims_ui::hud::CLUSTER[0],
+                    sims_ui::hud::CLUSTER[1],
+                );
+                assert!(
+                    !rects_overlap(r, cluster),
+                    "{name} {r:?} overlaps cluster {cluster:?} at {w}x{h} tab={tab:?}"
+                );
+                for item in game.panel() {
+                    if matches!(
+                        item.kind,
+                        sims_ui::hud::Kind::Stretched(_)
+                            | sims_ui::hud::Kind::Image(
+                                sims_ui::hud::id::STRIP | sims_ui::hud::id::BACK_PATCH
+                            )
+                    ) {
+                        continue;
+                    }
+                    assert!(
+                        !rects_overlap(r, item.rect),
+                        "{name} {r:?} overlaps Options item {:?} ({:?}) at {w}x{h} tab={tab:?}",
+                        item.kind,
+                        item.rect
+                    );
+                }
+            }
+
+            // Confirm Export HTML (Play tab) and Character Detail High radio (Graphics tab)
+            // receive clicks directly without being intercepted by Saves/Co-op!
+            if tab == Some(OptionsTab::Play) {
+                let before = game.options().play.export_html;
+                let pt =
+                    find_command_point(&game, &Command::ToggleOption(OptionsToggle::ExportHtml));
+                game.press(pt);
+                assert_ne!(
+                    game.options().play.export_html,
+                    before,
+                    "Export HTML click must not be intercepted at {w}x{h}"
+                );
+                game.press(pt); // restore
+            }
+            if tab == Some(OptionsTab::Graphics) {
+                let pt = find_command_point(
+                    &game,
+                    &Command::SetDetail {
+                        radio: OptionsRadio::CharacterDetail,
+                        level: DetailLevel::Med,
+                    },
+                );
+                game.press(pt);
+                assert_eq!(
+                    game.options().graphics.character_detail,
+                    DetailLevel::Med,
+                    "Character Detail Med click must not be intercepted at {w}x{h}"
+                );
+                let high = find_command_point(
+                    &game,
+                    &Command::SetDetail {
+                        radio: OptionsRadio::CharacterDetail,
+                        level: DetailLevel::High,
+                    },
+                );
+                game.press(high);
+                assert_eq!(
+                    game.options().graphics.character_detail,
+                    DetailLevel::High,
+                    "Character Detail High click must not be intercepted at {w}x{h}"
+                );
+            }
+        }
+    }
+
+    // Synchronous relayout check (`P2 #8`): switching Options tab updates
+    // Saves/Co-op rects immediately BEFORE `render()` is called.
+    game.resize([800, 600]);
+    game.set_mode(Mode::Options);
+    if game.options().tab.is_some() {
+        assert!(game.escape_options());
+    }
+    let before_tab_saves = game
+        .options_saves_button_rect()
+        .expect("Saves laid out synchronously on base Options");
+    let play_btn = find_command_point(&game, &Command::OpenOptionsTab(OptionsTab::Play));
+    game.press(play_btn);
+    let after_tab_saves = game
+        .options_saves_button_rect()
+        .expect("Saves updated synchronously on OpenOptionsTab before render()");
+    assert_ne!(
+        before_tab_saves, after_tab_saves,
+        "Saves button rect must update synchronously before draw when opening Play tab at 800x600"
+    );
+
+    // Help balloon + Quick Tips hover tooltip at 800x600 must NEVER overlap Saves/Co-op.
+    let help_pt = find_command_point(&game, &Command::OptionsHelp(OptionsHelp::FreeWill));
+    game.press(help_pt);
+    let save_action = find_command_point(&game, &Command::OptionsAction(OptionsAction::Save));
+    game.hover(save_action);
+    game.render();
+    if let (Some(saves), Some(coop)) = (
+        game.options_saves_button_rect(),
+        game.options_coop_button_rect(),
+    ) {
+        assert!(!rects_overlap(saves, coop));
+        for r in [saves, coop] {
+            for item in game.panel() {
+                if matches!(
+                    item.kind,
+                    sims_ui::hud::Kind::Stretched(_)
+                        | sims_ui::hud::Kind::Image(
+                            sims_ui::hud::id::STRIP | sims_ui::hud::id::BACK_PATCH
+                        )
+                ) {
+                    continue;
+                }
+                let obstacle = match &item.kind {
+                    sims_ui::hud::Kind::OptionsTooltip(_) => {
+                        // Quick Tips tooltip draws immediately above its anchor rect (`0x517a6f`).
+                        sims_ui::frame::Rect::new(
+                            (item.rect.x - 40).max(0),
+                            (item.rect.y - 26).max(0),
+                            item.rect.width + 80,
+                            24,
+                        )
+                    }
+                    _ => item.rect,
+                };
+                assert!(
+                    !rects_overlap(r, obstacle),
+                    "Saves/Co-op {r:?} overlapped balloon/tooltip/widget {:?} ({obstacle:?})",
+                    item.kind
+                );
+            }
+        }
+    }
+
+    // Extreme narrow viewport (`320x240`, `P3 #1`): when the pair cannot fit
+    // cleanly within bounds without overlap, return `None` instead of clipping.
+    game.resize([320, 240]);
+    game.render();
+    assert_eq!(
+        game.options_saves_button_rect(),
+        None,
+        "Saves button must be hidden rather than clip out of a 320x240 viewport"
+    );
+    assert_eq!(
+        game.options_coop_button_rect(),
+        None,
+        "Co-op button must be hidden rather than clip out of a 320x240 viewport"
+    );
+
+    // Resizing in Buy Mode on an Old Town community lot (`House58.iff`, P2 #4)
+    // must keep `BuyZone::Community` and preserve category/selection across resize + render.
+    let old_town_house = root.join("UserData/Houses/House58.iff");
+    if old_town_house.is_file() {
+        let mut community = Game::open(&Options {
+            install: root.clone(),
+            house: old_town_house,
+            answers: vec![3],
+            play: false,
+            frames: Frames {
+                after: Vec::new(),
+                every: Vec::new(),
+            },
+        })
+        .expect("open Old Town community lot House58");
+        community.resize([800, 600]);
+        community.set_mode(Mode::Buy);
+        community.render();
+        assert_eq!(community.buy_state().zone, sims_ui::buy::BuyZone::Community);
+        let cat0 = community
+            .buy_layout()
+            .widgets
+            .iter()
+            .find(|w| w.command == Some(Command::BuyCategory(0)))
+            .expect("Community BuyCategory(0)")
+            .rect;
+        community.press([cat0.x + cat0.width / 2, cat0.y + cat0.height / 2]);
+        community.render();
+        assert_eq!(community.buy_state().category, Some(0));
+        // Resize from 800x600 -> 1024x768 -> render: zone & category MUST stay intact!
+        community.resize([1024, 768]);
+        assert_eq!(community.buy_state().zone, sims_ui::buy::BuyZone::Community);
+        assert_eq!(community.buy_state().category, Some(0));
+        community.render();
+        assert_eq!(community.buy_state().zone, sims_ui::buy::BuyZone::Community);
+        assert_eq!(community.buy_state().category, Some(0));
     }
 }

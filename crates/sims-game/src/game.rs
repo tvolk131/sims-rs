@@ -4199,6 +4199,7 @@ impl Game {
         self.hud.draw_for_lot_at_with_selection(
             world,
             self.lot.residential(),
+            self.lot.lot_zoning(),
             self.lot_visibility(),
             &self.assets,
             &self.view,
@@ -4347,6 +4348,7 @@ impl Game {
                 size,
                 self.lot.world(),
                 self.lot.residential(),
+                self.lot.lot_zoning(),
                 self.lot_visibility(),
                 &self.assets,
                 sell.as_ref(),
@@ -5434,6 +5436,7 @@ impl Game {
                 self.view.size,
                 self.lot.world(),
                 self.lot.residential(),
+                self.lot.lot_zoning(),
                 self.lot_visibility(),
                 &self.assets,
                 None,
@@ -5969,6 +5972,7 @@ impl Game {
             self.view.size,
             self.lot.world(),
             self.lot.residential(),
+            self.lot.lot_zoning(),
             self.lot_visibility(),
             &self.assets,
             None,
@@ -6423,13 +6427,27 @@ impl Game {
                 }
                 Outcome::redraw()
             }
+            Command::OpenOptionsTab(_) | Command::OptionsHelp(_) => {
+                self.hud.relayout_panel(
+                    self.view.size,
+                    self.lot.world(),
+                    self.lot.residential(),
+                    self.lot.lot_zoning(),
+                    self.lot_visibility(),
+                    &self.assets,
+                    None,
+                );
+                Outcome::redraw()
+            }
             Command::OpenPanel(_)
             | Command::Refused { .. }
             | Command::ShowRelations(_)
             | Command::RelationsPage(_)
+            | Command::InterestsPage(_)
+            | Command::ShowInventory(_)
+            | Command::InventoryPage(_)
+            | Command::SelectInventoryItem(_)
             | Command::Help(_)
-            | Command::OpenOptionsTab(_)
-            | Command::OptionsHelp(_)
             | Command::SetDetail { .. }
             | Command::SetVolume { .. } => Outcome::redraw(),
         }
@@ -6715,9 +6733,10 @@ impl Game {
     /// sell prompt) for the current viewport size and world state.
     fn layout_buy(&mut self) {
         let sell = self.buy_sell_info();
-        self.hud.layout_buy(
+        self.hud.layout_buy_for_lot(
             self.view.size,
             self.lot.world(),
+            self.lot.lot_zoning(),
             &self.assets,
             sell.as_ref(),
         );
@@ -7098,6 +7117,7 @@ impl Game {
             self.view.size,
             self.lot.world(),
             self.lot.residential(),
+            self.lot.lot_zoning(),
             self.lot_visibility(),
             &self.assets,
             None,
