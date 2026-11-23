@@ -7,13 +7,17 @@
 //! - `sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]`
+//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--strict-frame-residue] [--all]`
+//!   (exit 0 equivalent, 1 different, 2 inconclusive or error)
 //! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]`
 //! - `sims-antics build <pack_dir> --out <dir>`
 
 use sims_antics::{
-    EquivOptions, EquivResult, LiftOptions, StructuredLiftOutcome,
-    check_bhav_equivalent_with_arities, compile_air, compile_pack_dir, compile_standalone_pack_dir,
-    compile_v2_object_file, expand_v2_to_air, extract_lift_symbols_from_iff,
+    EquivOptions, EquivResult, IffEquivOptions, IffVerdict, LiftOptions, LiveContext, LiveOptions,
+    ResourceVerdict, StructuredLiftOutcome, check_bhav_equivalent_combined,
+    check_bhav_equivalent_with_arities, check_iff_equivalent, compile_air, compile_pack_dir,
+    compile_standalone_pack_dir, compile_v2_object_file, expand_v2_to_air,
+    extract_lift_symbols_from_iff,
     lift::{format_bhav_labeled_air_with_context, format_bhav_raw_air, lift_bhav},
     lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
     v2::is_v2_source,
@@ -34,6 +38,8 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 enum CliError {
     Message(String),
     BrokenPipe,
+    /// Exit with this status after the subcommand printed its own report.
+    Exit(u8),
 }
 
 impl From<String> for CliError {
@@ -141,6 +147,7 @@ fn print_usage() {
          sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]\n  \
+         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--strict-frame-residue] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>"
     );
@@ -1495,20 +1502,27 @@ fn run() -> Result<(), CliError> {
                 arities.entry(id).or_insert(argc);
             }
 
-            match check_bhav_equivalent_with_arities(
+            let ctx = LiveContext {
+                callee_arities: Some(arities),
+                ..LiveContext::default()
+            };
+            let (method, result) = check_bhav_equivalent_combined(
                 bhav_a,
+                &ctx,
                 &bhav_b,
+                &ctx,
                 &EquivOptions::default(),
-                Some(&arities),
-            ) {
+                &LiveOptions::default(),
+            );
+            match result {
                 EquivResult::Equivalent {
                     states_checked,
                     paths_verified,
                 } => write_stdout_line(&format!(
-                    "EQUIVALENT: tree #{tree_id} ({states_checked} states checked, {paths_verified} paths verified)"
+                    "EQUIVALENT: tree #{tree_id} ({method}: {states_checked} states checked, {paths_verified} paths verified)"
                 )),
                 EquivResult::Counterexample { path, divergence } => Err(format!(
-                    "COUNTEREXAMPLE on tree #{tree_id} after {} step(s): {divergence}",
+                    "COUNTEREXAMPLE on tree #{tree_id} ({method}) after {} step(s): {divergence}",
                     path.len()
                 )
                 .into()),
@@ -1518,6 +1532,13 @@ fn run() -> Result<(), CliError> {
             }
         }
         "lift" => cmd_lift(&args),
+        "verify-equiv" => match cmd_verify_equiv(&args) {
+            Err(CliError::Message(msg)) => {
+                eprintln!("error: {msg}");
+                Err(CliError::Exit(2))
+            }
+            other => other,
+        },
         "build" => {
             let mut pack_dir: Option<PathBuf> = None;
             let mut out_dir: Option<PathBuf> = None;
@@ -1657,6 +1678,142 @@ fn run() -> Result<(), CliError> {
     }
 }
 
+/// `sims-antics verify-equiv <a.iff> <b.iff>`: whole-file resource and BHAV equivalence.
+fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut with: Vec<PathBuf> = Vec::new();
+    let mut opts = IffEquivOptions::default();
+    let mut show_all = false;
+    let mut i = 1usize;
+    while i < args.len() {
+        let arg = args[i].as_os_str();
+        if let Some(s) = arg.to_str() {
+            let value = |name: &str| -> Result<&OsString, CliError> {
+                args.get(i + 1)
+                    .ok_or_else(|| CliError::Message(format!("missing value after {name}")))
+            };
+            match s {
+                "--tree" | "-t" => {
+                    opts.tree = Some(parse_tree_id(os_arg_to_str(value(s)?, "--tree value")?)?);
+                    i += 2;
+                    continue;
+                }
+                "--with" => {
+                    with.push(PathBuf::from(value(s)?));
+                    i += 2;
+                    continue;
+                }
+                "--my-attributes" => {
+                    let v = os_arg_to_str(value(s)?, "--my-attributes value")?;
+                    let n: usize = v
+                        .parse()
+                        .map_err(|_| format!("invalid --my-attributes count '{v}'"))?;
+                    if n < sims_antics::GUARANTEED_ATTRIBUTES {
+                        return Err(format!(
+                            "--my-attributes must be at least {} (every object has that many)",
+                            sims_antics::GUARANTEED_ATTRIBUTES
+                        )
+                        .into());
+                    }
+                    opts.my_attribute_count = n;
+                    i += 2;
+                    continue;
+                }
+                "--ignore-scratch-pointer" => {
+                    opts.live.observe_scratch_pointer = false;
+                    i += 1;
+                    continue;
+                }
+                "--strict-frame-residue" => {
+                    opts.live.observe_frame_residue = true;
+                    i += 1;
+                    continue;
+                }
+                "--all" => {
+                    show_all = true;
+                    i += 1;
+                    continue;
+                }
+                other if other.starts_with('-') => {
+                    return Err(format!("unknown flag '{other}'").into());
+                }
+                _ => {}
+            }
+        } else if os_arg_starts_with_dash(arg) {
+            return Err("unknown non-UTF-8 flag".to_owned().into());
+        }
+        if paths.len() == 2 {
+            return Err(format!("unexpected extra argument '{}'", Path::new(arg).display()).into());
+        }
+        paths.push(PathBuf::from(arg));
+        i += 1;
+    }
+    let [path_a, path_b] = <[PathBuf; 2]>::try_from(paths)
+        .map_err(|_| "verify-equiv requires <a.iff> <b.iff>".to_owned())?;
+    let read = |path: &Path| -> Result<Vec<u8>, CliError> {
+        let (file, len, hdr) = read_regular_file_prefix(path)?;
+        Ok(read_bounded_iff_file(path, file, len, hdr)?)
+    };
+    for extra in &with {
+        let bytes = read(extra)?;
+        let arities = extract_bhav_arities_from_iff(&bytes)
+            .map_err(|e| format!("{}: {e}", extra.display()))?;
+        opts.extra_arities.extend(arities);
+    }
+    let (a, b) = (read(&path_a)?, read(&path_b)?);
+    let report = check_iff_equivalent(&a, &b, &opts).map_err(|e| e.to_string())?;
+
+    let mut out = OutWriter::stdout();
+    let mut counts = [0usize; 4];
+    for problem in &report.file_problems {
+        out.writeln_str(&format!("FILE: {problem}"))?;
+    }
+    for r in &report.resources {
+        let (slot, line) = match &r.verdict {
+            ResourceVerdict::Identical => (0, None),
+            ResourceVerdict::Equivalent { how } => (1, Some(format!("equivalent ({how})"))),
+            ResourceVerdict::Different { why } => (2, Some(format!("DIFFERENT: {why}"))),
+            ResourceVerdict::Inconclusive { why } => (3, Some(format!("INCONCLUSIVE: {why}"))),
+        };
+        counts[slot] += 1;
+        let line = match line {
+            Some(line) => Some(line),
+            None if show_all || !r.notes.is_empty() => Some("identical".to_owned()),
+            None => None,
+        };
+        if let Some(line) = line {
+            let notes = if r.notes.is_empty() {
+                String::new()
+            } else {
+                format!(" [notes: {}]", r.notes.join("; "))
+            };
+            out.writeln_str(&sanitize_single_line(&format!(
+                "{}: {line}{notes}",
+                r.name()
+            )))?;
+        }
+    }
+    let verdict = report.verdict();
+    let word = match verdict {
+        IffVerdict::Equivalent => "EQUIVALENT",
+        IffVerdict::Different => "DIFFERENT",
+        IffVerdict::Inconclusive => "INCONCLUSIVE",
+    };
+    out.writeln_str(&format!(
+        "{word}: {} resources ({} identical, {} equivalent, {} different, {} inconclusive)",
+        report.resources.len(),
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3]
+    ))?;
+    out.flush()?;
+    match verdict.exit_code() {
+        0 => Ok(()),
+        code => Err(CliError::Exit(code as u8)),
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) | Err(CliError::BrokenPipe) => ExitCode::SUCCESS,
@@ -1664,6 +1821,7 @@ fn main() -> ExitCode {
             eprintln!("error: {msg}");
             ExitCode::FAILURE
         }
+        Err(CliError::Exit(code)) => ExitCode::from(code),
     }
 }
 

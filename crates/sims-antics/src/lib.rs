@@ -53,7 +53,9 @@ pub use v2::{
     compile_v2_source, expand_v2_to_air,
 };
 pub use verify::{
-    EquivOptions, EquivResult, PackSafetyReport, SafetyCategory, SafetyReport, SafetyViolation,
-    TraceStep, check_bhav_equivalent, check_bhav_equivalent_with_arities, verify_iff_safety,
-    verify_object_safety, verify_pack_safety,
+    EquivMethod, EquivOptions, EquivResult, GUARANTEED_ATTRIBUTES, IffEquivOptions, IffEquivReport,
+    IffVerdict, LiveContext, LiveOptions, PackSafetyReport, ResourceReport, ResourceVerdict,
+    SafetyCategory, SafetyReport, SafetyViolation, TraceStep, check_bhav_equivalent,
+    check_bhav_equivalent_combined, check_bhav_equivalent_with_arities, check_bhav_live_equivalent,
+    check_iff_equivalent, verify_iff_safety, verify_object_safety, verify_pack_safety,
 };

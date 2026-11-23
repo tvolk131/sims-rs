@@ -16,6 +16,14 @@ use sims_formats::sprite::{DrawGroup, Palette, SpriteSet};
 use sims_formats::strings::StringTable;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+mod iff;
+mod live;
+pub use iff::{
+    IffEquivOptions, IffEquivReport, IffVerdict, ResourceReport, ResourceVerdict,
+    check_iff_equivalent,
+};
+pub use live::{GUARANTEED_ATTRIBUTES, LiveContext, LiveOptions, check_bhav_live_equivalent};
+
 /// Category of safety violation reported by [`verify_object_safety`] / [`verify_pack_safety`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SafetyCategory {
@@ -5030,91 +5038,172 @@ fn check_primitive_frame_reads(
         }
         Ok(())
     };
+    for frame_use in primitive_frame_uses(opcode, ops) {
+        match frame_use {
+            FrameUse::Read(scope, idx, label) => check_op(scope, idx, label)?,
+            FrameUse::Dst(scope, idx, label) => check_dst(scope, idx, label)?,
+            FrameUse::AllLocals(name) => {
+                if env_a.local_count != env_b.local_count || env_a.locals != env_b.locals {
+                    return Err(FrameCheckErr::Inconclusive(format!(
+                        "{name} text formatting may read frame locals via $Local tokens and local state differs"
+                    )));
+                }
+            }
+            FrameUse::WholeFrame => {
+                if env_a != env_b {
+                    return Err(FrameCheckErr::Divergence(format!(
+                        "frame-private state divergence before primitive opcode {opcode:#06x}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One frame-private operand a primitive touches (`sims-vm/src/primitives/*.rs`).
+///
+/// Shared by the lockstep checker ([`check_primitive_frame_reads`]) and the live-output
+/// checker (`live`) so both model exactly the same per-primitive frame reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameUse {
+    /// Reads `(scope, idx)`; scope 22 reads `param[idx]` as its indirection.
+    Read(u8, i16, &'static str),
+    /// Writes (or bounds-checks as a destination) `(scope, idx)`; scope 22 reads `param[idx]`.
+    Dst(u8, i16, &'static str),
+    /// Text formatting may read any frame local (`Dialog` / `ActionString` `$Local` tokens).
+    AllLocals(&'static str),
+    /// Unmodeled primitive: every frame-private slot may be read.
+    WholeFrame,
+}
+
+/// Lists the frame-private operands primitive `opcode` reads or writes.
+fn primitive_frame_uses(opcode: u16, ops: &[u8; 8]) -> Vec<FrameUse> {
+    let mut uses = Vec::new();
     match opcode {
-        0 => check_op(9, word_i16(ops, 0), "Sleep param"),
+        0 => uses.push(FrameUse::Read(9, word_i16(ops, 0), "Sleep param")),
         1 | 3 | 4 | 5 | 6 | 7 | 9 | 10 | 18 | 20 | 21 | 22 | 23 | 27 | 28 | 30 | 33 | 48 | 49
-        | 51 => Ok(()),
+        | 51 => {}
         8 => {
             let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
             if dst_scope <= 255 {
-                check_dst(dst_scope as u8, word_i16(ops, 0), "Random destination")?;
+                uses.push(FrameUse::Dst(
+                    dst_scope as u8,
+                    word_i16(ops, 0),
+                    "Random destination",
+                ));
             }
             let rng_scope = u16::from_le_bytes([ops[6], ops[7]]);
             if rng_scope <= 255 {
-                check_op(rng_scope as u8, word_i16(ops, 4), "Random range")?;
+                uses.push(FrameUse::Read(
+                    rng_scope as u8,
+                    word_i16(ops, 4),
+                    "Random range",
+                ));
             }
-            Ok(())
         }
         11 => {
             if ops[2] & 1 != 0 {
-                check_op(ops[3], word_i16(ops, 4), "GetDistanceTo from")?;
+                uses.push(FrameUse::Read(
+                    ops[3],
+                    word_i16(ops, 4),
+                    "GetDistanceTo from",
+                ));
             }
-            Ok(())
         }
         12 => {
             let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
             if dst_scope <= 255 {
-                check_dst(
+                uses.push(FrameUse::Dst(
                     dst_scope as u8,
                     word_i16(ops, 0),
                     "GetDirectionTo destination",
-                )?;
+                ));
             }
             if ops[4] & 1 != 0 {
-                check_op(ops[5], word_i16(ops, 6), "GetDirectionTo from")?;
+                uses.push(FrameUse::Read(
+                    ops[5],
+                    word_i16(ops, 6),
+                    "GetDirectionTo from",
+                ));
             }
-            Ok(())
         }
         13 => {
             if ops[3] & 2 != 0 {
-                check_op(25, i16::from(ops[1]), "PushInteraction object local")?;
+                uses.push(FrameUse::Read(
+                    25,
+                    i16::from(ops[1]),
+                    "PushInteraction object local",
+                ));
             } else {
-                check_op(9, i16::from(ops[1]), "PushInteraction object param")?;
+                uses.push(FrameUse::Read(
+                    9,
+                    i16::from(ops[1]),
+                    "PushInteraction object param",
+                ));
             }
             if ops[3] & 1 != 0 {
-                check_op(25, i16::from(ops[4]), "PushInteraction icon local")?;
+                uses.push(FrameUse::Read(
+                    25,
+                    i16::from(ops[4]),
+                    "PushInteraction icon local",
+                ));
             }
-            Ok(())
         }
         14 => {
             if ops[6] & 8 != 0 {
                 let scope = u16::from_le_bytes([ops[4], ops[5]]);
                 if scope <= 255 {
-                    check_op(scope as u8, word_i16(ops, 2), "FindBestObject origin")?;
+                    uses.push(FrameUse::Read(
+                        scope as u8,
+                        word_i16(ops, 2),
+                        "FindBestObject origin",
+                    ));
                 }
             }
-            Ok(())
         }
         15 => {
             let scope = word_i16(ops, 2);
             if (0..=255).contains(&scope) {
-                check_op(scope as u8, word_i16(ops, 0), "Breakpoint cond")?;
+                uses.push(FrameUse::Read(
+                    scope as u8,
+                    word_i16(ops, 0),
+                    "Breakpoint cond",
+                ));
             }
-            Ok(())
         }
         16 => {
             if ops[2] & 1 != 0 {
-                check_op(25, i16::from(ops[1]), "FindLocation local")?;
+                uses.push(FrameUse::Read(25, i16::from(ops[1]), "FindLocation local"));
             }
-            Ok(())
         }
-        17 => check_op(9, word_i16(ops, 0), "IdleForInput param"),
+        17 => uses.push(FrameUse::Read(9, word_i16(ops, 0), "IdleForInput param")),
         19 => {
-            check_op(25, i16::from(ops[0]), "MakeNewCharacter skin")?;
-            check_op(25, i16::from(ops[1]), "MakeNewCharacter age")?;
-            check_op(25, i16::from(ops[2]), "MakeNewCharacter sex")?;
-            Ok(())
+            uses.push(FrameUse::Read(
+                25,
+                i16::from(ops[0]),
+                "MakeNewCharacter skin",
+            ));
+            uses.push(FrameUse::Read(
+                25,
+                i16::from(ops[1]),
+                "MakeNewCharacter age",
+            ));
+            uses.push(FrameUse::Read(
+                25,
+                i16::from(ops[2]),
+                "MakeNewCharacter sex",
+            ));
         }
         24 => {
             if matches!(ops[3], 2 | 3) {
-                check_op(9, 0, "OldRelationship param[0]")?;
+                uses.push(FrameUse::Read(9, 0, "OldRelationship param[0]"));
             }
             let p = i16::from(ops[2] as i8);
-            check_dst(9, p, "OldRelationship param")?;
+            uses.push(FrameUse::Dst(9, p, "OldRelationship param"));
             if ops[0] != 0 {
-                check_op(9, p, "OldRelationship param")?;
+                uses.push(FrameUse::Read(9, p, "OldRelationship param"));
             }
-            Ok(())
         }
         25 => {
             let scope = match ops[0] {
@@ -5123,98 +5212,127 @@ fn check_primitive_frame_reads(
                 2 => 25,
                 _ => ops[1],
             };
-            check_op(scope, word_i16(ops, 2), "AlterBudget amount")
+            uses.push(FrameUse::Read(
+                scope,
+                word_i16(ops, 2),
+                "AlterBudget amount",
+            ));
         }
         26 => {
             if matches!(ops[1], 2 | 3) {
-                check_op(25, i16::from(ops[3]), "Relationship local")?;
+                uses.push(FrameUse::Read(25, i16::from(ops[3]), "Relationship local"));
             }
             // `relationship.rs:179` resolves the operand in both read and write directions;
             // validate destination frame bounds even on read write-back (`ops[2] & 4 == 0`).
-            check_dst(ops[4], word_i16(ops, 6), "Relationship value")?;
+            uses.push(FrameUse::Dst(
+                ops[4],
+                word_i16(ops, 6),
+                "Relationship value",
+            ));
             if ops[2] & 4 != 0 || ops[4] == 22 {
-                check_op(ops[4], word_i16(ops, 6), "Relationship value")?;
+                uses.push(FrameUse::Read(
+                    ops[4],
+                    word_i16(ops, 6),
+                    "Relationship value",
+                ));
             }
-            Ok(())
         }
         29 => {
             if ops[3] & 1 == 0 {
-                check_op(ops[0], word_i16(ops, 4), "SetMotiveChange delta")?;
-                check_op(ops[1], word_i16(ops, 6), "SetMotiveChange stop_at")?;
+                uses.push(FrameUse::Read(
+                    ops[0],
+                    word_i16(ops, 4),
+                    "SetMotiveChange delta",
+                ));
+                uses.push(FrameUse::Read(
+                    ops[1],
+                    word_i16(ops, 6),
+                    "SetMotiveChange stop_at",
+                ));
             }
-            Ok(())
         }
         31 => {
             if ops[4] & 0x80 != 0 {
-                check_op(ops[5], i16::from(ops[7]), "SetToNext destination cursor")?;
+                uses.push(FrameUse::Read(
+                    ops[5],
+                    i16::from(ops[7]),
+                    "SetToNext destination cursor",
+                ));
             }
             let base = ops[4] & 0x7F;
             if base == 6 {
-                check_op(9, 0, "SetToNext param[0]")?;
+                uses.push(FrameUse::Read(9, 0, "SetToNext param[0]"));
             } else if base == 9 {
-                check_op(25, i16::from(ops[6]), "SetToNext local")?;
+                uses.push(FrameUse::Read(25, i16::from(ops[6]), "SetToNext local"));
             }
-            Ok(())
         }
-        32 => check_op(ops[6], word_i16(ops, 4), "TestObjectType object"),
+        32 => uses.push(FrameUse::Read(
+            ops[6],
+            word_i16(ops, 4),
+            "TestObjectType object",
+        )),
         34 => {
             if ops[0] <= 2 {
-                check_op(ops[1], word_i16(ops, 2), "UiEffect target")?;
+                uses.push(FrameUse::Read(ops[1], word_i16(ops, 2), "UiEffect target"));
             }
-            Ok(())
         }
         35 => {
             if ops[4] & 0x20 != 0 {
-                check_op(25, word_i16(ops, 0), "SpecialEffect duration local")?;
+                uses.push(FrameUse::Read(
+                    25,
+                    word_i16(ops, 0),
+                    "SpecialEffect duration local",
+                ));
             }
-            Ok(())
         }
         36 | 50 => {
             // Both `Dialog` (`dialog.rs:1498`) and `ActionString` (`action_string.rs:85`)
             // run `format_text`, which reads frame locals via `$Local` / `$NeighborLocal` /
             // `$TimeLocal` tokens (`dialog.rs:1605`). Without string tables loaded, require
             // identical local frame layout and values, otherwise return `Inconclusive`.
-            if env_a.local_count != env_b.local_count || env_a.locals != env_b.locals {
-                let name = if opcode == 36 {
-                    "Dialog"
-                } else {
-                    "ActionString"
-                };
-                return Err(FrameCheckErr::Inconclusive(format!(
-                    "{name} text formatting may read frame locals via $Local tokens and local state differs"
-                )));
-            }
-            Ok(())
+            uses.push(FrameUse::AllLocals(if opcode == 36 {
+                "Dialog"
+            } else {
+                "ActionString"
+            }));
         }
         37 => {
             if ops[0] == 1 {
-                check_op(ops[1], word_i16(ops, 2), "TestSimInteractingWith person")?;
+                uses.push(FrameUse::Read(
+                    ops[1],
+                    word_i16(ops, 2),
+                    "TestSimInteractingWith person",
+                ));
             }
-            Ok(())
         }
         41 => {
             if ops[3] == 7 && ops[2] == 2 {
-                check_op(25, word_i16(ops, 0) >> 1, "SetHeadline local")?;
+                uses.push(FrameUse::Read(
+                    25,
+                    word_i16(ops, 0) >> 1,
+                    "SetHeadline local",
+                ));
             }
-            Ok(())
         }
         42 => {
             if ops[4] == 7 {
-                check_op(9, 0, "CreateObject param[0]")?;
+                uses.push(FrameUse::Read(9, 0, "CreateObject param[0]"));
             } else if ops[4] == 8 || ops[4] == 9 {
                 // `create.rs:177` sign-extends `operands[6] as i8`.
-                check_op(25, i16::from(ops[6] as i8), "CreateObject local")?;
+                uses.push(FrameUse::Read(
+                    25,
+                    i16::from(ops[6] as i8),
+                    "CreateObject local",
+                ));
             }
-            Ok(())
         }
         43 => {
             if word_i16(ops, 0) != 0 {
-                check_op(9, word_i16(ops, 2), "DropOnto src param")?;
+                uses.push(FrameUse::Read(9, word_i16(ops, 2), "DropOnto src param"));
             }
             if word_i16(ops, 4) != 0 {
-                check_op(9, word_i16(ops, 6), "DropOnto dst param")?;
+                uses.push(FrameUse::Read(9, word_i16(ops, 6), "DropOnto dst param"));
             }
-            Ok(())
         }
         44 => {
             let clip_id = word_i16(ops, 0);
@@ -5222,45 +5340,34 @@ fn check_primitive_frame_reads(
             let can_emit_events =
                 matches!(flags & 0x11, 0x00 | 0x11) && (flags & 0x04 != 0 || clip_id != 0);
             if flags & 0x04 != 0 {
-                check_op(9, clip_id, "Animate clip param")?;
+                uses.push(FrameUse::Read(9, clip_id, "Animate clip param"));
             }
             if flags & 0x20 != 0 {
-                check_dst(25, i16::from(ops[2]), "Animate event local")?;
+                uses.push(FrameUse::Dst(25, i16::from(ops[2]), "Animate event local"));
             } else if can_emit_events {
-                check_dst(9, 0, "Animate event param[0]")?;
+                uses.push(FrameUse::Dst(9, 0, "Animate event param[0]"));
             }
-            Ok(())
         }
         45 => {
             if u16::from_le_bytes([ops[2], ops[3]]) == 0 {
-                check_op(9, word_i16(ops, 0), "RouteTo param")?;
+                uses.push(FrameUse::Read(9, word_i16(ops, 0), "RouteTo param"));
             }
-            Ok(())
         }
         46 => {
             if u16::from_le_bytes([ops[2], ops[3]]) == 0 {
-                check_op(9, word_i16(ops, 0), "Snap param")?;
+                uses.push(FrameUse::Read(9, word_i16(ops, 0), "Snap param"));
             }
-            Ok(())
         }
         47 => {
             if word_i16(ops, 0) == 1 {
-                check_op(9, word_i16(ops, 4), "Reach slot param")?;
-            }
-            Ok(())
-        }
-        id if id >= 256 => Ok(()),
-        _ => {
-            // Conservative soundness guard for any unmodeled primitive opcode.
-            if env_a != env_b {
-                Err(FrameCheckErr::Divergence(format!(
-                    "frame-private state divergence before primitive opcode {opcode:#06x}"
-                )))
-            } else {
-                Ok(())
+                uses.push(FrameUse::Read(9, word_i16(ops, 4), "Reach slot param"));
             }
         }
+        id if id >= 256 => {}
+        // Conservative soundness guard for any unmodeled primitive opcode.
+        _ => uses.push(FrameUse::WholeFrame),
     }
+    uses
 }
 
 fn format_pc(pc: u8) -> String {
@@ -5281,6 +5388,88 @@ pub fn extract_bhav_from_iff(iff_bytes: &[u8], tree_id: u16) -> Result<BhavChunk
         .get(b"BHAV", tree_id)
         .ok_or_else(|| Error::new(format!("IFF does not contain BHAV #{tree_id}")))?;
     crate::lift::lift_bhav(chunk.id, &chunk.label, iff.data(chunk))
+}
+
+/// Which checker proved (or refuted) equivalence in [`check_bhav_equivalent_combined`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EquivMethod {
+    /// The node-for-node lockstep bisimulation ([`check_bhav_equivalent_with_arities`]).
+    Lockstep,
+    /// The symbolic live-output checker ([`check_bhav_live_equivalent`]).
+    LiveOutput,
+}
+
+impl std::fmt::Display for EquivMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Lockstep => "lockstep",
+            Self::LiveOutput => "live-output",
+        })
+    }
+}
+
+/// Merges two files' callee arity maps, keeping only the trees both agree on (or that
+/// only one of them knows).
+fn merge_arities(
+    a: Option<&BTreeMap<u16, usize>>,
+    b: Option<&BTreeMap<u16, usize>>,
+) -> Option<BTreeMap<u16, usize>> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m.clone()),
+        (Some(a), Some(b)) => {
+            let mut merged = a.clone();
+            for (&id, &arity) in b {
+                if merged.get(&id).is_some_and(|&other| other != arity) {
+                    merged.remove(&id);
+                } else {
+                    merged.insert(id, arity);
+                }
+            }
+            Some(merged)
+        }
+    }
+}
+
+/// Checks two trees with the lockstep checker first and, when it cannot prove them
+/// equivalent, with the live-output checker, which also accepts trees that differ by
+/// pure reads, dummy nodes and dead frame writes.
+///
+/// A lockstep counterexample is a divergence in the stricter node-for-node trace (every
+/// memory access observable); when the live-output checker cannot decide, the result is
+/// `Inconclusive` rather than that counterexample.
+#[must_use]
+pub fn check_bhav_equivalent_combined(
+    a: &BhavChunk,
+    ctx_a: &LiveContext,
+    b: &BhavChunk,
+    ctx_b: &LiveContext,
+    lockstep: &EquivOptions,
+    live: &LiveOptions,
+) -> (EquivMethod, EquivResult) {
+    let arities = merge_arities(ctx_a.callee_arities.as_ref(), ctx_b.callee_arities.as_ref());
+    let first = check_bhav_equivalent_with_arities(a, b, lockstep, arities.as_ref());
+    if matches!(first, EquivResult::Equivalent { .. }) {
+        return (EquivMethod::Lockstep, first);
+    }
+    match check_bhav_live_equivalent(a, ctx_a, b, ctx_b, live) {
+        EquivResult::Inconclusive { reason } => {
+            let lockstep_note = match first {
+                EquivResult::Counterexample { divergence, .. } => {
+                    format!("lockstep counterexample: {divergence}")
+                }
+                EquivResult::Inconclusive { reason } => format!("lockstep: {reason}"),
+                EquivResult::Equivalent { .. } => unreachable!("returned above"),
+            };
+            (
+                EquivMethod::LiveOutput,
+                EquivResult::Inconclusive {
+                    reason: format!("{reason} ({lockstep_note})"),
+                },
+            )
+        }
+        other => (EquivMethod::LiveOutput, other),
+    }
 }
 
 /// Extracts `(tree_id -> arg_count)` for every valid BHAV chunk inside a raw IFF.
