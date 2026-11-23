@@ -1,0 +1,76 @@
+// Open Frost Fridge (0x7F00_0020) — initiates the multi-object cooking chain with defer rollback.
+
+object "Open Frost Fridge" {
+    guid: 0x7F00_0020;
+    price: 550;
+    category: appliances;
+    attributes: 8;
+    description: "A clean-room kitchen refrigerator that checks funds and stock, then coordinates Counter prep and Stove cooking.";
+    sprite: Sprite::procedural("fridge", primary: #E4EAEE, accent: #B0BCC6, trim: #5C6670);
+
+    param initial_stock: i16 = 5;
+    param meal_cost: i16 = 15;
+    param max_entry_hunger: i16 = 90;
+    param cooking_xp: i16 = 20;
+
+    state stock: i16 = initial_stock;
+    state meals_cooked: i16 = 0;
+    state last_plate: ObjectId = 0;
+
+    sound door = preset("soft_thud", wav: "open_fridge_door");
+
+    slot front {
+        kind: routing,
+        offset: [0.0, -0.75, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: north,
+    }
+
+    interaction "Cook Meal" {
+        autonomy: 55,
+        attenuation: 0.02,
+        advertises: [
+            hunger +75 (min: -100),
+        ],
+        guard(sim) => self.stock > 0 && sim.motive.hunger < max_entry_hunger && can_afford(meal_cost),
+        run(sim) {
+            if self.stock <= 0 {
+                return false;
+            }
+            let Some(counter) = find_best_object(prep) else {
+                return false;
+            };
+            let Some(stove) = find_best_object(cook) else {
+                return false;
+            };
+            if !debit_funds(meal_cost) {
+                return false;
+            }
+            self.stock -= 1;
+            play_sound(door, self);
+
+            let mut committed = false;
+            defer {
+                if !committed {
+                    self.stock += 1;
+                    credit_funds(meal_cost);
+                }
+            }
+
+            if !counter.run_functional(prep, sim.skill.cooking, sim.id, 0, 0) {
+                return false;
+            }
+            if !stove.run_functional(cook) {
+                return false;
+            }
+
+            self.last_plate = temp[2];
+            self.meals_cooked += 1;
+            sim.skill.cooking += cooking_xp;
+            committed = true;
+            return true;
+        }
+    }
+}

@@ -2951,3 +2951,189 @@ fn macos_system_symlink_paths_work_while_user_symlinks_remain_rejected() {
         .expect_err("user symlink under /tmp must still be rejected");
     assert!(err.message.contains("symlink"), "{err}");
 }
+
+// ===========================================================================
+// 6. On-Disk `open-pack/` v2 Migration, Zero-`object.toml`, & 20/20 Expand Gate
+// ===========================================================================
+
+#[test]
+fn on_disk_open_pack_is_pure_v2_expands_all_20_objects_and_passes_safety() {
+    let pack_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("open-pack");
+
+    // 1. Verify ZERO `object.toml` files remain anywhere under `open-pack/`.
+    #[allow(clippy::disallowed_methods)]
+    fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                walk_files(&p, out);
+            } else if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    let mut all_files = Vec::new();
+    walk_files(&pack_dir, &mut all_files);
+    for file in &all_files {
+        assert_ne!(
+            file.file_name().and_then(|s| s.to_str()),
+            Some("object.toml"),
+            "retired object.toml found in open-pack: {}",
+            file.display()
+        );
+        if file.extension().and_then(|s| s.to_str()) == Some("antics") {
+            let src = std::fs::read_to_string(file).expect("read .antics file");
+            assert!(
+                !src.contains("raw {"),
+                "migrated open-pack v2 file must not use raw {{ ... }} escape hatch: {}",
+                file.display()
+            );
+            assert!(
+                !src.contains("@id(") && !src.contains("@guard_id("),
+                "migrated open-pack v2 file should not pin raw @id/@guard_id: {}",
+                file.display()
+            );
+        }
+    }
+
+    // 2. Both `compile_v2_pack_dir` and `compile_pack_dir` produce bit-identical output
+    //    and pass `verify_pack_safety` with 0 violations across all 20 objects.
+    let v2_pack = compile_v2_pack_dir(&pack_dir).expect("compile_v2_pack_dir(open-pack)");
+    let std_pack = sims_antics::compile_pack_dir(&pack_dir).expect("compile_pack_dir(open-pack)");
+    assert_eq!(v2_pack.objects.len(), 20);
+    assert_eq!(v2_pack.far_bytes, std_pack.far_bytes);
+    assert_eq!(v2_pack.sounds_wav, std_pack.sounds_wav);
+
+    let safety = verify_pack_safety(&v2_pack).expect("verify_pack_safety");
+    assert!(
+        safety.is_ok(),
+        "open-pack v2 safety violations: {:?}",
+        safety.objects
+    );
+
+    // 3. Every one of the 20 objects expands cleanly via both `expand_v2_to_air` and
+    //    `sims-antics expand <file> --pack open-pack` into valid `.air` that passes `compile_air`.
+    for entry in &v2_pack.objects {
+        let obj_path = pack_dir
+            .join("objects")
+            .join(format!("{}.antics", entry.slug));
+        assert!(
+            obj_path.is_file(),
+            "expected flat v2 object file {}",
+            obj_path.display()
+        );
+        let expanded = expand_v2_to_air(&obj_path, Some(&pack_dir))
+            .unwrap_or_else(|e| panic!("expand_v2_to_air failed for {}: {e}", entry.slug));
+        let air_mod = compile_air(&expanded)
+            .unwrap_or_else(|e| panic!("compile_air failed for {}: {e}", entry.slug));
+        assert_eq!(
+            air_mod.behaviors.len(),
+            entry.object.behaviors.len(),
+            "expanded .air BHAV count mismatch for {}",
+            entry.slug
+        );
+
+        let cli_out = Command::new(cli_bin())
+            .args(["expand"])
+            .arg(&obj_path)
+            .args(["--pack"])
+            .arg(&pack_dir)
+            .output()
+            .expect("run sims-antics expand");
+        assert!(
+            cli_out.status.success(),
+            "sims-antics expand failed for {}: {}",
+            entry.slug,
+            String::from_utf8_lossy(&cli_out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(cli_out.stdout).expect("utf8 expand stdout"),
+            expanded,
+            "CLI expand output must match expand_v2_to_air for {}",
+            entry.slug
+        );
+    }
+}
+
+#[test]
+fn const_arg_helper_inlining_folds_immutable_constants_and_spills_mutated_params() {
+    let src = r#"
+fn set_flag(flag: &mut bool, enabled: bool) {
+    *flag = enabled;
+}
+
+fn mutate_copy(val: i16, out: &mut i16) {
+    val += 5;
+    *out = val;
+}
+
+object "Const Fold Probe" {
+    guid: 0x7F34_0001;
+    state power: bool = false;
+    state total: i16 = 0;
+
+    interaction "Power On" {
+        guard(sim) => !self.power,
+        run(sim) {
+            set_flag(&mut self.power, true);
+            mutate_copy(10, &mut self.total);
+            return true;
+        }
+    }
+
+    interaction "Power Off" {
+        guard(sim) => self.power,
+        run(sim) {
+            set_flag(&mut self.power, false);
+            return true;
+        }
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects(
+        "probe.antics",
+        src,
+        &PackResolverConfig::default(),
+    )
+    .expect("expand probe");
+    let air = &expanded[0].air_source;
+    // Immutable `enabled: bool` literal folds directly to `stack.attr[0] := 1;` / `:= 0;`
+    // (no `__arg_enabled` local spilled), so persistent toggle passes verify_object_safety!
+    assert!(
+        air.contains("stack.attr[0] := 1;") && air.contains("stack.attr[0] := 0;"),
+        "expected constant-folded bool writes:\n{air}"
+    );
+    assert!(
+        !air.contains("__arg_enabled"),
+        "immutable bool literal arg must not spill a dummy local:\n{air}"
+    );
+    // Mutated `val: i16` parameter MUST still spill to a fresh local before `+= 5`!
+    assert!(
+        air.contains("__arg_val"),
+        "mutated i16 param must spill to a local:\n{air}"
+    );
+
+    let compiled = compile_v2_source("probe.antics", src, &PackResolverConfig::default())
+        .expect("compile probe");
+    let report = verify_object_safety(&compiled).expect("verify probe");
+    assert!(
+        report.is_ok(),
+        "persistent toggle via const-folded helper must pass safety: {:?}",
+        report.violations
+    );
+
+    let mut vm = V2VmFixture::from_objects(&[&compiled], 100);
+    let obj_id = vm.spawn(0x7F34_0001, 4, 4);
+    vm.run_interaction(obj_id, "Power On", None);
+    assert_eq!(vm.obj_attr(obj_id, 0), 1);
+    assert_eq!(vm.obj_attr(obj_id, 1), 15);
+    vm.run_interaction(obj_id, "Power Off", None);
+    assert_eq!(vm.obj_attr(obj_id, 0), 0);
+}

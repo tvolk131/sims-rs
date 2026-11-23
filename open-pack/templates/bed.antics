@@ -1,0 +1,30 @@
+// Shared bed template for single and multi-tile sleeping furniture.
+
+use crate::common::helpers::restore_two_motives_loop;
+
+pub template BedBase {
+    category: seating;
+
+    param sleep_ticks: i16 = 2;
+    param sleep_cycles: i16 = 3;
+    param energy_step: i16 = 20;
+    param comfort_step: i16 = 5;
+    param max_entry_energy: i16 = 80;
+    param wake_energy: i16 = 100;
+
+    sound settle = preset("soft_thud");
+
+    fn run_sleep_loop(sim: Sim, completed: &mut i16) {
+        restore_two_motives_loop(
+            sim,
+            Motive::Energy,
+            energy_step,
+            Motive::Comfort,
+            comfort_step,
+            sleep_cycles,
+            sleep_ticks,
+            wake_energy,
+            completed,
+        );
+    }
+}

@@ -1,0 +1,76 @@
+// Open Porcelain Toilet (0x7F00_0050) — Bladder relief, flush SFX, clog/unclog & cancel safety.
+
+use crate::common::helpers::{record_fixture_wear, restore_motive_loop, run_timed_cycles};
+use crate::templates::plumbing::PlumbingFixture;
+
+object "Open Porcelain Toilet" from PlumbingFixture {
+    guid: 0x7F00_0050;
+    price: 300;
+    description: "A clean-room porcelain toilet with flush audio, clog/unclog state guards, and Mechanic-skill repair.";
+    sprite: Sprite::procedural("toilet", primary: #EAEEF0, accent: #C6D4DC, trim: #949CA4);
+
+    break_threshold: 4;
+    use_ticks: 2;
+    max_use_cycles: 2;
+    motive_step: 55;
+    max_entry_motive: 92;
+    repair_ticks: 2;
+    mechanic_xp: 12;
+
+    param unclog_cycles: i16 = 3;
+
+    sound flush = preset("water_flush", wav: "open_toilet_flush");
+    sound plunge = preset("wrench_clank", wav: "open_toilet_plunge");
+
+    slot front {
+        kind: routing,
+        offset: [0.0, -0.70, 0.0],
+        standing: true,
+        sitting: true,
+        ground: true,
+        facing: north,
+    }
+
+    interaction "Use Toilet" {
+        autonomy: 55,
+        attenuation: 0.02,
+        advertises: [
+            bladder +95 (min: -100),
+        ],
+        guard(sim) => !self.broken && !self.occupied && sim.motive.bladder < max_entry_motive,
+        run(sim) {
+            with lock(self.occupied) {
+                let mut cycles: i16 = 0;
+                restore_motive_loop(
+                    sim,
+                    Motive::Bladder,
+                    max_use_cycles,
+                    use_ticks,
+                    motive_step,
+                    100,
+                    &mut cycles,
+                );
+                if cycles > 0 {
+                    play_sound(flush, self);
+                    record_fixture_wear(&mut self.wear, &mut self.broken, break_threshold);
+                }
+            }
+            return true;
+        }
+    }
+
+    interaction "Unclog Toilet" {
+        autonomy: 85,
+        attenuation: 0.02,
+        guard(sim) => self.broken && !self.occupied,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(plunge, self);
+                if run_timed_cycles(unclog_cycles, repair_ticks) {
+                    complete_fixture_repair(sim, flush);
+                }
+            }
+            return true;
+        }
+    }
+}

@@ -175,7 +175,7 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
     assert!(
         tv_table.contains("4103")
             && tv_table.contains("0x1007")
-            && tv_table.contains("WatchTv")
+            && tv_table.contains("WatchTV")
             && tv_table.contains("structured"),
         "{tv_table}"
     );
@@ -193,7 +193,7 @@ fn lift_far_list_filter_entry_structured_verify_and_raw() {
         .expect("run lift --list --filter on BHAVs");
     assert!(filter_tv.status.success());
     let filter_tv_out = String::from_utf8_lossy(&filter_tv.stdout);
-    assert!(filter_tv_out.contains("WatchTv"), "{filter_tv_out}");
+    assert!(filter_tv_out.contains("WatchTV"), "{filter_tv_out}");
     assert!(!filter_tv_out.contains("Init"), "{filter_tv_out}");
 
     // 4. `lift <open-pack.far> --entry open_tv.iff --tree 4103 --verify-equiv`

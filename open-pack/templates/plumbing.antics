@@ -1,0 +1,34 @@
+// Shared plumbing fixture template with occupancy lock, wear-to-broken state, and repair finish.
+
+pub template PlumbingFixture {
+    category: plumbing;
+    attributes: 8;
+
+    param break_threshold: i16 = 3;
+    param use_ticks: i16 = 2;
+    param max_use_cycles: i16 = 4;
+    param motive_step: i16 = 35;
+    param max_entry_motive: i16 = 95;
+    param repair_ticks: i16 = 2;
+    param mechanic_xp: i16 = 15;
+
+    state occupied: bool = false;
+    state wear: i16 = 0;
+    state broken: bool = false;
+
+    slot front {
+        kind: routing,
+        offset: [0.0, -0.70, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: north,
+    }
+
+    fn complete_fixture_repair(sim: Sim, confirm_sfx: Sound) {
+        self.broken = false;
+        self.wear = 0;
+        sim.skill.mechanical += mechanic_xp;
+        play_sound(confirm_sfx, self);
+    }
+}

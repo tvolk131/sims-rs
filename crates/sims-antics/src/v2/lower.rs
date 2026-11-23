@@ -1149,6 +1149,10 @@ enum TreeContext {
 enum Binding {
     /// Regular local variable in `.air` (`local_name` is unique within the tree).
     Local { air_name: String, ty: ValueType },
+    /// Immutable constant `i16` operand (literal or `bcon.<name>`) forwarded into an inline helper.
+    ConstI16(String),
+    /// Immutable constant `bool` value forwarded into an inline helper.
+    ConstBool(bool),
     /// Immutable BHAV `param[idx]` (from a `functional` parameter).
     BhavParam { index: usize, ty: ValueType },
     /// Mutable reference (`&mut T`) bound to a caller lvalue during helper inlining.
@@ -2466,33 +2470,45 @@ impl<'a> TreeLowerer<'a> {
             }
             let binding = match &param.ty {
                 V2Type::I16 => {
-                    let (air, ty) = self.lower_value_expr(&arg.value)?;
-                    if ty == ValueType::Bool {
-                        return Err(Error::at(
-                            arg.span,
-                            format!("parameter '{}' expects i16, found bool", param.name),
-                        ));
-                    }
-                    let loc = self.fresh(&format!("arg_{}", param.name));
-                    self.line(format!("let {loc} = {air};"));
-                    Binding::Local {
-                        air_name: loc,
-                        ty: ValueType::I16,
+                    if !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name)
+                        && let Some(const_air) = self.try_const_i16_air_operand(&arg.value)?
+                    {
+                        Binding::ConstI16(const_air)
+                    } else {
+                        let (air, ty) = self.lower_value_expr(&arg.value)?;
+                        if ty == ValueType::Bool {
+                            return Err(Error::at(
+                                arg.span,
+                                format!("parameter '{}' expects i16, found bool", param.name),
+                            ));
+                        }
+                        let loc = self.fresh(&format!("arg_{}", param.name));
+                        self.line(format!("let {loc} = {air};"));
+                        Binding::Local {
+                            air_name: loc,
+                            ty: ValueType::I16,
+                        }
                     }
                 }
                 V2Type::Bool => {
-                    let (air, ty) = self.lower_value_expr(&arg.value)?;
-                    if ty != ValueType::Bool {
-                        return Err(Error::at(
-                            arg.span,
-                            format!("parameter '{}' expects bool", param.name),
-                        ));
-                    }
-                    let loc = self.fresh(&format!("arg_{}", param.name));
-                    self.line(format!("let {loc} = {air};"));
-                    Binding::Local {
-                        air_name: loc,
-                        ty: ValueType::Bool,
+                    if !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name)
+                        && let Some(const_b) = self.try_eval_const_bool(&arg.value)
+                    {
+                        Binding::ConstBool(const_b)
+                    } else {
+                        let (air, ty) = self.lower_value_expr(&arg.value)?;
+                        if ty != ValueType::Bool {
+                            return Err(Error::at(
+                                arg.span,
+                                format!("parameter '{}' expects bool", param.name),
+                            ));
+                        }
+                        let loc = self.fresh(&format!("arg_{}", param.name));
+                        self.line(format!("let {loc} = {air};"));
+                        Binding::Local {
+                            air_name: loc,
+                            ty: ValueType::Bool,
+                        }
                     }
                 }
                 V2Type::ObjectId => {
@@ -3052,6 +3068,10 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(binding) = self.lookup_var(name).cloned() {
                     return match binding {
                         Binding::Local { air_name, ty } => Ok((air_name, ty)),
+                        Binding::ConstI16(air) => Ok((air, ValueType::I16)),
+                        Binding::ConstBool(b) => {
+                            Ok((if b { "1" } else { "0" }.to_owned(), ValueType::Bool))
+                        }
                         Binding::BhavParam { index, ty } => Ok((format!("param[{index}]"), ty)),
                         Binding::ForeignObject { air_name } => Ok((air_name, ValueType::ObjectId)),
                         Binding::MutRef { .. } => Err(Error::at(
@@ -3325,16 +3345,47 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    fn try_const_i16_air_operand(&self, expr: &V2Expr) -> Result<Option<String>> {
+        match expr {
+            V2Expr::Int(span, v) => {
+                let n = i16::try_from(*v)
+                    .map_err(|_| Error::at(*span, format!("integer {v} out of i16 range")))?;
+                Ok(Some(n.to_string()))
+            }
+            V2Expr::Unary {
+                span,
+                op: V2UnaryOp::Neg,
+                inner,
+            } => {
+                if let V2Expr::Int(_, v) = inner.as_ref() {
+                    let n = v
+                        .checked_neg()
+                        .and_then(|x| i16::try_from(x).ok())
+                        .ok_or_else(|| {
+                            Error::at(*span, format!("negated integer -{v} out of i16 range"))
+                        })?;
+                    Ok(Some(n.to_string()))
+                } else {
+                    Ok(None)
+                }
+            }
+            V2Expr::Ident(_, name) => match self.lookup_var(name) {
+                Some(Binding::ConstI16(air)) => Ok(Some(air.clone())),
+                None if self.env.i16_params.contains_key(name) => Ok(Some(format!("bcon.{name}"))),
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
     fn try_eval_const_bool(&self, expr: &V2Expr) -> Option<bool> {
         match expr {
             V2Expr::Bool(_, b) => Some(*b),
-            V2Expr::Ident(_, name) => {
-                if self.lookup_var(name).is_none() {
-                    self.env.bool_params.get(name).copied()
-                } else {
-                    None
-                }
-            }
+            V2Expr::Ident(_, name) => match self.lookup_var(name) {
+                Some(Binding::ConstBool(b)) => Some(*b),
+                None => self.env.bool_params.get(name).copied(),
+                _ => None,
+            },
             V2Expr::Unary {
                 op: V2UnaryOp::Not,
                 inner,
@@ -4293,6 +4344,99 @@ fn validate_raw_air_stmts(
 
 fn ends_with_unconditional_return(stmts: &[V2Stmt]) -> bool {
     matches!(stmts.last(), Some(V2Stmt::Return { .. }))
+}
+
+fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
+    stmts.iter().any(|s| match s {
+        V2Stmt::Let { name, init, .. } => {
+            name == target_name || expr_borrows_ident(init, target_name)
+        }
+        V2Stmt::LetSome {
+            name,
+            init,
+            else_body,
+            ..
+        } => {
+            name == target_name
+                || expr_borrows_ident(init, target_name)
+                || stmts_mutate_or_borrow_ident(else_body, target_name)
+        }
+        V2Stmt::Assign { target, value, .. } => {
+            matches!(target, V2Expr::Ident(_, n) if n == target_name)
+                || expr_borrows_ident(target, target_name)
+                || expr_borrows_ident(value, target_name)
+        }
+        V2Stmt::WithLock {
+            lock_expr, body, ..
+        } => {
+            matches!(lock_expr, V2Expr::Ident(_, n) if n == target_name)
+                || expr_borrows_ident(lock_expr, target_name)
+                || stmts_mutate_or_borrow_ident(body, target_name)
+        }
+        V2Stmt::Defer { body, .. } => stmts_mutate_or_borrow_ident(body, target_name),
+        V2Stmt::Repeat { count, body, .. } => {
+            expr_borrows_ident(count, target_name)
+                || stmts_mutate_or_borrow_ident(body, target_name)
+        }
+        V2Stmt::While { cond, body, .. } => {
+            expr_borrows_ident(cond, target_name) || stmts_mutate_or_borrow_ident(body, target_name)
+        }
+        V2Stmt::ForEach { binding, body, .. } => {
+            binding == target_name || stmts_mutate_or_borrow_ident(body, target_name)
+        }
+        V2Stmt::If {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            expr_borrows_ident(cond, target_name)
+                || stmts_mutate_or_borrow_ident(then_body, target_name)
+                || stmts_mutate_or_borrow_ident(else_body, target_name)
+        }
+        V2Stmt::Return { value: Some(e), .. } | V2Stmt::Expr { expr: e, .. } => {
+            expr_borrows_ident(e, target_name)
+        }
+        V2Stmt::Break { .. }
+        | V2Stmt::Continue { .. }
+        | V2Stmt::Return { value: None, .. }
+        | V2Stmt::RawAir { .. } => false,
+    })
+}
+
+fn expr_borrows_ident(expr: &V2Expr, target_name: &str) -> bool {
+    match expr {
+        V2Expr::MutRef { inner, .. } => {
+            matches!(inner.as_ref(), V2Expr::Ident(_, n) if n == target_name)
+                || expr_borrows_ident(inner, target_name)
+        }
+        V2Expr::Field { base, .. }
+        | V2Expr::Deref { inner: base, .. }
+        | V2Expr::Unary { inner: base, .. } => expr_borrows_ident(base, target_name),
+        V2Expr::Index { base, index, .. } => {
+            expr_borrows_ident(base, target_name) || expr_borrows_ident(index, target_name)
+        }
+        V2Expr::Binary { lhs, rhs, .. } => {
+            expr_borrows_ident(lhs, target_name) || expr_borrows_ident(rhs, target_name)
+        }
+        V2Expr::Call { callee, args, .. } => {
+            expr_borrows_ident(callee, target_name)
+                || args
+                    .iter()
+                    .any(|a| expr_borrows_ident(&a.value, target_name))
+        }
+        V2Expr::MethodCall { receiver, args, .. } => {
+            expr_borrows_ident(receiver, target_name)
+                || args
+                    .iter()
+                    .any(|a| expr_borrows_ident(&a.value, target_name))
+        }
+        V2Expr::Int(..)
+        | V2Expr::Bool(..)
+        | V2Expr::Str(..)
+        | V2Expr::Ident(..)
+        | V2Expr::Path(..) => false,
+    }
 }
 
 fn stmts_unconditionally_diverge(stmts: &[V2Stmt]) -> bool {

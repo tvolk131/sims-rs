@@ -1,0 +1,117 @@
+// Open Timber Bookshelf (0x7F00_0053) — Fun reading + Cooking & Mechanical skill study.
+
+use crate::common::helpers::restore_motive_loop;
+
+object "Open Timber Bookshelf" {
+    guid: 0x7F00_0053;
+    price: 340;
+    category: misc;
+    attributes: 8;
+    description: "A clean-room hardwood bookcase for reading novels (Fun) and studying Cooking or Mechanical skills.";
+    sprite: Sprite::procedural("bookshelf", primary: #845A38, accent: #AE5848, trim: #4A3422);
+
+    param read_ticks: i16 = 2;
+    param read_cycles: i16 = 3;
+    param novel_fun_step: i16 = 20;
+    param study_cycles: i16 = 3;
+    param study_skill_step: i16 = 25;
+    param study_fun_step: i16 = 6;
+    param max_skill: i16 = 1000;
+
+    state occupied: bool = false;
+    state sessions: i16 = 0;
+
+    sound page_turn = preset("ui_click", wav: "open_book_turn");
+    sound skill_chime = preset("chime", wav: "open_skill_chime");
+
+    slot front {
+        kind: routing,
+        offset: [0.0, -0.75, 0.0],
+        standing: true,
+        sitting: false,
+        ground: true,
+        facing: north,
+    }
+
+    interaction "Read Novel" {
+        autonomy: 50,
+        attenuation: 0.02,
+        advertises: [
+            fun +55 (min: -100),
+        ],
+        guard(sim) => !self.occupied,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(page_turn, self);
+                let mut cycles: i16 = 0;
+                restore_motive_loop(
+                    sim,
+                    Motive::Fun,
+                    read_cycles,
+                    read_ticks,
+                    novel_fun_step,
+                    100,
+                    &mut cycles,
+                );
+                self.sessions += 1;
+            }
+            return true;
+        }
+    }
+
+    interaction "Study Cooking" {
+        autonomy: 35,
+        attenuation: 0.02,
+        advertises: [
+            fun +15 (min: -100),
+        ],
+        guard(sim) => !self.occupied,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(page_turn, self);
+                let mut cycles: i16 = 0;
+                repeat study_cycles cancel_on_abort {
+                    sleep(read_ticks);
+                    if sim.skill.cooking < max_skill {
+                        sim.skill.cooking += study_skill_step;
+                    }
+                    sim.motive.fun += study_fun_step;
+                    cycles += 1;
+                }
+                if cycles > 0 {
+                    play_sound(skill_chime, self);
+                    self.sessions += 1;
+                }
+            }
+            return true;
+        }
+    }
+
+    interaction "Study Mechanical" {
+        autonomy: 35,
+        attenuation: 0.02,
+        advertises: [
+            fun +15 (min: -100),
+        ],
+        guard(sim) => !self.occupied,
+        run(sim) {
+            with lock(self.occupied) {
+                play_sound(page_turn, self);
+                let mut cycles: i16 = 0;
+                repeat study_cycles cancel_on_abort {
+                    sleep(read_ticks);
+                    if sim.skill.mechanical < max_skill {
+                        sim.skill.mechanical += study_skill_step;
+                    }
+                    sim.motive.fun += study_fun_step;
+                    cycles += 1;
+                }
+                if cycles > 0 {
+                    play_sound(skill_chime, self);
+                    self.sessions += 1;
+                }
+            }
+            return true;
+        }
+    }
+}
