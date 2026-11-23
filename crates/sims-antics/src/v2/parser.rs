@@ -1621,9 +1621,6 @@ impl Parser {
                         value: Some(expr),
                     });
                 }
-                "raw" => {
-                    return Err(Error::at(span, "expected '{' after 'raw'"));
-                }
                 _ => {}
             }
         }
@@ -2078,10 +2075,20 @@ impl Parser {
 
     fn parse_postfix_expr(&mut self) -> Result<V2Expr> {
         let mut expr = self.parse_primary_expr()?;
+        let mut chain = 0usize;
         loop {
             match self.peek().kind {
                 TokenKind::Dot => {
                     let span = self.bump().span;
+                    chain += 1;
+                    if self.depth + chain > MAX_NESTING_DEPTH {
+                        return Err(Error::at(
+                            span,
+                            format!(
+                                "expression nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+                            ),
+                        ));
+                    }
                     let (field, _) = self.expect_ident("field or method name")?;
                     if self.peek().kind == TokenKind::LParen {
                         let args = self.parse_call_args()?;
@@ -2101,6 +2108,15 @@ impl Parser {
                 }
                 TokenKind::LBracket => {
                     let span = self.bump().span;
+                    chain += 1;
+                    if self.depth + chain > MAX_NESTING_DEPTH {
+                        return Err(Error::at(
+                            span,
+                            format!(
+                                "expression nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+                            ),
+                        ));
+                    }
                     self.enter_nesting(span)?;
                     let index = self.parse_expr();
                     self.leave_nesting();
@@ -2114,6 +2130,15 @@ impl Parser {
                 }
                 TokenKind::LParen => {
                     let span = self.span();
+                    chain += 1;
+                    if self.depth + chain > MAX_NESTING_DEPTH {
+                        return Err(Error::at(
+                            span,
+                            format!(
+                                "expression nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+                            ),
+                        ));
+                    }
                     let args = self.parse_call_args()?;
                     expr = V2Expr::Call {
                         span,

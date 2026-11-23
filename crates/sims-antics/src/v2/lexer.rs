@@ -265,7 +265,16 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>> {
             b'0'..=b'9' => lexer.lex_number(span)?,
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
                 let ident = lexer.lex_ident();
-                if ident == "raw" {
+                let at_stmt_start = matches!(
+                    tokens.last().map(|t| &t.kind),
+                    Some(
+                        TokenKind::LBrace
+                            | TokenKind::RBrace
+                            | TokenKind::Semicolon
+                            | TokenKind::RawBlock(_)
+                    )
+                );
+                if ident == "raw" && at_stmt_start {
                     let saved_pos = lexer.pos;
                     let saved_line = lexer.line;
                     let saved_col = lexer.col;

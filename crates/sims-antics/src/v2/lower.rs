@@ -1209,6 +1209,8 @@ enum CleanupAction {
 struct ScopeFrame {
     cleanups: Vec<CleanupAction>,
     is_loop_body: bool,
+    /// `true` when this frame is the root lexical scope of an inlined helper function.
+    is_fn_root: bool,
     /// `true` when this frame corresponds to an emitted `.air` `while` loop
     /// (`repeat`, `while`, `for`, or wrapped inline helper `while 1 == 1`).
     is_air_while: bool,
@@ -1221,6 +1223,7 @@ impl ScopeFrame {
         Self {
             cleanups: Vec::new(),
             is_loop_body: false,
+            is_fn_root: false,
             is_air_while: false,
             cancel_flag: None,
             repeat_counter: None,
@@ -1232,8 +1235,6 @@ struct ActiveInlineFn {
     ret_flag: String,
     ret_val: String,
     has_return_type: bool,
-    /// Scope depth at which this inline function started.
-    fn_scope_depth: usize,
 }
 
 struct TreeLowerer<'a> {
@@ -1249,6 +1250,9 @@ struct TreeLowerer<'a> {
     next_id: usize,
     var_scopes: Vec<BTreeMap<String, Binding>>,
     cleanup_scopes: Vec<ScopeFrame>,
+    /// Locks currently held at this point in lowering (including during `defer` execution
+    /// until the lock's own `Unlock` cleanup executes).
+    held_locks: Vec<LValue>,
     in_defer: bool,
     inline_call_stack: Vec<String>,
     inline_expansions: usize,
@@ -1273,6 +1277,7 @@ impl<'a> TreeLowerer<'a> {
             next_id: 0,
             var_scopes: vec![BTreeMap::new()],
             cleanup_scopes: vec![ScopeFrame::block()],
+            held_locks: Vec::new(),
             in_defer: false,
             inline_call_stack: Vec::new(),
             inline_expansions: 0,
@@ -1400,11 +1405,15 @@ impl<'a> TreeLowerer<'a> {
         self.var_scopes.pop();
     }
 
+    fn fn_scope_floor(&self) -> usize {
+        self.cleanup_scopes
+            .iter()
+            .rposition(|f| f.is_fn_root)
+            .unwrap_or(0)
+    }
+
     fn has_active_cleanups(&self) -> bool {
-        let floor = self
-            .active_inline_fn
-            .as_ref()
-            .map_or(0, |f| f.fn_scope_depth);
+        let floor = self.fn_scope_floor();
         self.cleanup_scopes[floor..]
             .iter()
             .any(|f| !f.cleanups.is_empty())
@@ -1416,6 +1425,7 @@ impl<'a> TreeLowerer<'a> {
 
     fn emit_cleanups_down_to(&mut self, start: usize) -> Result<()> {
         let saved = self.cleanup_scopes.split_off(start);
+        let saved_locks = self.held_locks.clone();
         let mut res = Ok(());
         for frame in saved.iter().rev() {
             if let Err(e) = self.run_frame_cleanups(frame) {
@@ -1423,23 +1433,18 @@ impl<'a> TreeLowerer<'a> {
                 break;
             }
         }
+        self.held_locks = saved_locks;
         self.cleanup_scopes.extend(saved);
         res
     }
 
     fn emit_all_cleanups(&mut self) -> Result<()> {
-        let floor = self
-            .active_inline_fn
-            .as_ref()
-            .map_or(0, |f| f.fn_scope_depth);
+        let floor = self.fn_scope_floor();
         self.emit_cleanups_down_to(floor)
     }
 
     fn emit_loop_cleanups(&mut self, span: Span, is_continue: bool) -> Result<()> {
-        let floor = self
-            .active_inline_fn
-            .as_ref()
-            .map_or(0, |f| f.fn_scope_depth);
+        let floor = self.fn_scope_floor();
         let loop_idx = self.cleanup_scopes[floor..]
             .iter()
             .rposition(|f| f.is_loop_body)
@@ -1486,6 +1491,9 @@ impl<'a> TreeLowerer<'a> {
             match action {
                 CleanupAction::Unlock(lval) => {
                     self.emit_lvalue_assign(lval, V2AssignOp::Set, "0")?;
+                    if let Some(pos) = self.held_locks.iter().rposition(|x| x == lval) {
+                        self.held_locks.remove(pos);
+                    }
                 }
                 CleanupAction::Defer {
                     owner_module,
@@ -1624,21 +1632,18 @@ impl<'a> TreeLowerer<'a> {
                         "with lock(...) requires a bool state or &mut bool target",
                     ));
                 }
-                if self.cleanup_scopes.iter().any(|frame| {
-                    frame
-                        .cleanups
-                        .iter()
-                        .any(|a| matches!(a, CleanupAction::Unlock(existing) if existing == &lval))
-                }) {
+                if self.held_locks.contains(&lval) {
                     return Err(Error::at(
                         *span,
                         "re-entrant 'with lock(...)' on an already-locked target in the same scope chain",
                     ));
                 }
                 self.emit_lvalue_assign(&lval, V2AssignOp::Set, "1")?;
+                self.held_locks.push(lval.clone());
                 self.push_scope(ScopeFrame {
                     cleanups: vec![CleanupAction::Unlock(lval)],
                     is_loop_body: false,
+                    is_fn_root: false,
                     is_air_while: false,
                     cancel_flag: None,
                     repeat_counter: None,
@@ -1700,6 +1705,7 @@ impl<'a> TreeLowerer<'a> {
                 self.push_scope(ScopeFrame {
                     cleanups: Vec::new(),
                     is_loop_body: true,
+                    is_fn_root: false,
                     is_air_while: true,
                     cancel_flag: cancel_flag.clone(),
                     repeat_counter: Some(counter.clone()),
@@ -1764,6 +1770,7 @@ impl<'a> TreeLowerer<'a> {
                     self.push_scope(ScopeFrame {
                         cleanups: Vec::new(),
                         is_loop_body: true,
+                        is_fn_root: false,
                         is_air_while: true,
                         cancel_flag: cancel_flag.clone(),
                         repeat_counter: None,
@@ -1787,6 +1794,7 @@ impl<'a> TreeLowerer<'a> {
                     self.push_scope(ScopeFrame {
                         cleanups: Vec::new(),
                         is_loop_body: true,
+                        is_fn_root: false,
                         is_air_while: true,
                         cancel_flag: cancel_flag.clone(),
                         repeat_counter: None,
@@ -1874,6 +1882,7 @@ impl<'a> TreeLowerer<'a> {
                 self.push_scope(ScopeFrame {
                     cleanups: Vec::new(),
                     is_loop_body: true,
+                    is_fn_root: false,
                     is_air_while: true,
                     cancel_flag: None,
                     repeat_counter: None,
@@ -2046,24 +2055,20 @@ impl<'a> TreeLowerer<'a> {
                     || !self.inline_call_stack.is_empty()
                     || self.enclosing_cancel_flag().is_some()
                 {
-                    let tokens = crate::lexer::tokenize(code).map_err(|e| {
+                    let wrapped = format!("tree 4096 \"__raw_check\" {{\n{code}\n}}\n");
+                    let parsed = crate::parser::parse_module(&wrapped).map_err(|e| {
                         Error::at(
                             *span,
                             format!("invalid .air syntax in raw block: {}", e.message),
                         )
                     })?;
-                    for tok in &tokens {
-                        if let crate::lexer::TokenKind::Ident(ident) = &tok.kind
-                            && matches!(ident.as_str(), "return" | "break" | "continue")
-                        {
-                            return Err(Error::at(
-                                *span,
-                                format!(
-                                    "'raw {{ ... }}' cannot contain '{ident}' while cleanups, inline helpers, or cancel_on_abort loops are active"
-                                ),
-                            ));
-                        }
-                    }
+                    let stmts = match parsed.items.first() {
+                        Some(crate::ast::Item::Tree(t)) => &t.body,
+                        _ => unreachable!("synthetic wrapper always has one tree"),
+                    };
+                    let mut defined_labels = BTreeSet::new();
+                    collect_raw_air_labels(stmts, &mut defined_labels);
+                    validate_raw_air_stmts(stmts, false, &defined_labels, *span)?;
                 }
                 for raw_line in code.lines() {
                     let trimmed = raw_line.trim();
@@ -2406,7 +2411,11 @@ impl<'a> TreeLowerer<'a> {
         args: &[CallArg],
         call_span: Span,
     ) -> Result<Option<String>> {
-        let fqn = format!("{fn_mod}::{}", fn_decl.name);
+        let fqn = format!(
+            "{}::{fn_mod}::{}",
+            if is_local_fn { "local" } else { "mod" },
+            fn_decl.name
+        );
         if let Some(pos) = self.inline_call_stack.iter().position(|n| n == &fqn) {
             let mut chain: Vec<&str> = self.inline_call_stack[pos..]
                 .iter()
@@ -2488,10 +2497,14 @@ impl<'a> TreeLowerer<'a> {
                 }
                 V2Type::ObjectId => {
                     let (air, ty) = self.lower_value_expr(&arg.value)?;
-                    if ty == ValueType::Bool {
+                    let is_null_zero = matches!(arg.value, V2Expr::Int(_, 0));
+                    if ty != ValueType::ObjectId && !is_null_zero {
                         return Err(Error::at(
                             arg.span,
-                            format!("parameter '{}' expects ObjectId, found bool", param.name),
+                            format!(
+                                "parameter '{}' expects ObjectId (or 0), found {ty:?} (convert numeric temps explicitly via 'let id: ObjectId = ...;')",
+                                param.name
+                            ),
                         ));
                     }
                     let loc = self.fresh(&format!("arg_{}", param.name));
@@ -2581,10 +2594,13 @@ impl<'a> TreeLowerer<'a> {
                         Binding::SelfHandle
                     } else {
                         let (air, ty) = self.lower_value_expr(&arg.value)?;
-                        if ty == ValueType::Bool {
+                        if ty != ValueType::ObjectId {
                             return Err(Error::at(
                                 arg.span,
-                                format!("parameter '{}' expects Object, found bool", param.name),
+                                format!(
+                                    "parameter '{}' expects 'self' or ObjectId, found {ty:?}",
+                                    param.name
+                                ),
                             ));
                         }
                         let loc = self.fresh(&format!("obj_{}", param.name));
@@ -2648,7 +2664,6 @@ impl<'a> TreeLowerer<'a> {
         let prev_active_fn = self.active_inline_fn.take();
         let prev_in_obj = self.in_object_scope;
         self.in_object_scope = is_local_fn;
-        let fn_scope_depth = self.cleanup_scopes.len();
 
         let res = self.with_owner_module(fn_mod, |c| {
             if needs_wrapper {
@@ -2662,7 +2677,6 @@ impl<'a> TreeLowerer<'a> {
                         ret_flag,
                         ret_val: rv_name,
                         has_return_type: has_ret,
-                        fn_scope_depth,
                     });
                 }
                 c.line("while 1 == 1 {".to_owned());
@@ -2670,6 +2684,7 @@ impl<'a> TreeLowerer<'a> {
                 c.push_scope(ScopeFrame {
                     cleanups: Vec::new(),
                     is_loop_body: false,
+                    is_fn_root: true,
                     is_air_while: true,
                     cancel_flag: None,
                     repeat_counter: None,
@@ -2681,7 +2696,14 @@ impl<'a> TreeLowerer<'a> {
                 c.line("}".to_owned());
                 r.and(p)
             } else {
-                c.push_scope(ScopeFrame::block());
+                c.push_scope(ScopeFrame {
+                    cleanups: Vec::new(),
+                    is_loop_body: false,
+                    is_fn_root: true,
+                    is_air_while: false,
+                    cancel_flag: None,
+                    repeat_counter: None,
+                });
                 let r = c.lower_stmts(&fn_decl.body);
                 let p = c.pop_scope_and_run_cleanups();
                 r.and(p)
@@ -4168,6 +4190,105 @@ fn cmp_op_str(op: V2BinOp) -> &'static str {
         V2BinOp::FlagTest => "flag_test",
         _ => unreachable!("non-comparison op"),
     }
+}
+
+fn collect_raw_air_labels<'a>(stmts: &'a [crate::ast::Stmt], labels: &mut BTreeSet<&'a str>) {
+    for s in stmts {
+        match s {
+            crate::ast::Stmt::Label { name, .. } => {
+                labels.insert(name.as_str());
+            }
+            crate::ast::Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_raw_air_labels(then_body, labels);
+                collect_raw_air_labels(else_body, labels);
+            }
+            crate::ast::Stmt::While { body, .. } => {
+                collect_raw_air_labels(body, labels);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn validate_raw_air_target(
+    target: &crate::ast::Target,
+    defined_labels: &BTreeSet<&str>,
+    span: Span,
+) -> Result<()> {
+    match target {
+        crate::ast::Target::Label(name) if defined_labels.contains(name.as_str()) => Ok(()),
+        other => Err(Error::at(
+            span,
+            format!(
+                "'raw {{ ... }}' cannot branch to '{other:?}' while cleanups, inline helpers, or cancel_on_abort loops are active"
+            ),
+        )),
+    }
+}
+
+fn validate_raw_air_stmts(
+    stmts: &[crate::ast::Stmt],
+    in_raw_loop: bool,
+    defined_labels: &BTreeSet<&str>,
+    span: Span,
+) -> Result<()> {
+    for s in stmts {
+        match s {
+            crate::ast::Stmt::Return { .. } => {
+                return Err(Error::at(
+                    span,
+                    "'raw { ... }' cannot contain 'return' while cleanups, inline helpers, or cancel_on_abort loops are active",
+                ));
+            }
+            crate::ast::Stmt::Break { .. } | crate::ast::Stmt::Continue { .. } if !in_raw_loop => {
+                return Err(Error::at(
+                    span,
+                    "'raw { ... }' cannot break/continue out of its block while cleanups, inline helpers, or cancel_on_abort loops are active",
+                ));
+            }
+            crate::ast::Stmt::RawOp { branches, .. } => {
+                validate_raw_air_target(&branches.on_true, defined_labels, span)?;
+                validate_raw_air_target(&branches.on_false, defined_labels, span)?;
+            }
+            crate::ast::Stmt::Primitive {
+                branches: Some(branches),
+                ..
+            } => {
+                validate_raw_air_target(&branches.on_true, defined_labels, span)?;
+                validate_raw_air_target(&branches.on_false, defined_labels, span)?;
+            }
+            crate::ast::Stmt::Call {
+                branches: Some(branches),
+                ..
+            } => {
+                validate_raw_air_target(&branches.on_true, defined_labels, span)?;
+                validate_raw_air_target(&branches.on_false, defined_labels, span)?;
+            }
+            crate::ast::Stmt::Call { branches: None, .. } => {
+                return Err(Error::at(
+                    span,
+                    "'raw { ... }' cannot invoke an unbranched subroutine call (whose false branch exits the tree) while cleanups, inline helpers, or cancel_on_abort loops are active",
+                ));
+            }
+            crate::ast::Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                validate_raw_air_stmts(then_body, in_raw_loop, defined_labels, span)?;
+                validate_raw_air_stmts(else_body, in_raw_loop, defined_labels, span)?;
+            }
+            crate::ast::Stmt::While { body, .. } => {
+                validate_raw_air_stmts(body, true, defined_labels, span)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn ends_with_unconditional_return(stmts: &[V2Stmt]) -> bool {

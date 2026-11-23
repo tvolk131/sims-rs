@@ -2583,3 +2583,302 @@ object "Bad Wav" {
         assert!(err.message.contains("symlink"), "{err}");
     }
 }
+
+#[test]
+fn sol_r2_regressions() {
+    let empty_cfg = PackResolverConfig::default();
+
+    // R2 P1-1: void helper containing `break` called inside caller's `repeat ... cancel_on_abort` must be rejected!
+    let err = compile_v2_source(
+        "r2_p1_1.antics",
+        r#"
+fn stop() {
+    break;
+}
+object "Break Escape" {
+    guid: 0x7F32_0001;
+    state count: i16 = 0;
+    interaction "Go" {
+        run(sim) {
+            repeat 2 cancel_on_abort {
+                defer { self.count += 1; }
+                stop();
+            }
+            return true;
+        }
+    }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("break inside helper with no helper-local loop must fail");
+    assert!(err.message.contains("'break' outside of a loop"), "{err}");
+
+    // R2 P1-2: re-entrant `with lock(self.busy)` inside `defer` registered under `with lock(self.busy)` must fail!
+    let err = compile_v2_source(
+        "r2_p1_2.antics",
+        r#"
+object "Defer Relock" {
+    guid: 0x7F32_0002;
+    state busy: bool = false;
+    interaction "Go" {
+        run(sim) {
+            with lock(self.busy) {
+                defer {
+                    with lock(self.busy) {}
+                    sleep(1);
+                }
+            }
+            return true;
+        }
+    }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("re-entrant lock inside defer while outer lock is still held must fail");
+    assert!(err.message.contains("re-entrant"), "{err}");
+
+    // Non-overlapping `defer { with lock(self.busy) {} }` registered OUTSIDE `with lock(self.busy)` is allowed!
+    compile_v2_source(
+        "r2_p1_2_ok.antics",
+        r#"
+object "Defer Relock Ok" {
+    guid: 0x7F32_0003;
+    state busy: bool = false;
+    interaction "Go" {
+        run(sim) {
+            defer {
+                with lock(self.busy) {}
+            }
+            with lock(self.busy) {
+                sleep(1);
+            }
+            return true;
+        }
+    }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect("defer outside lock runs after unlock and may reacquire lock");
+
+    // R2 P1-3: `raw` block with explicit branch targets (`-> true: true, false: true`) or unbranched `call` under `with lock` must fail!
+    let err = compile_v2_source(
+        "r2_p1_3_branch.antics",
+        r#"
+object "Raw Branch" {
+    guid: 0x7F32_0004;
+    state busy: bool = false;
+    interaction "Go" {
+        run(sim) {
+            with lock(self.busy) {
+                raw { random(temp[0], 1) -> true: true, false: true; }
+            }
+            return true;
+        }
+    }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("raw branch exiting tree under with lock must fail");
+    assert!(err.message.contains("cannot branch"), "{err}");
+
+    let err = compile_v2_source(
+        "r2_p1_3_call.antics",
+        r#"
+object "Raw Call" {
+    guid: 0x7F32_0005;
+    state busy: bool = false;
+    interaction "Go" {
+        run(sim) {
+            with lock(self.busy) {
+                raw { call 4096(); }
+            }
+            return true;
+        }
+    }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("raw unbranched call under with lock must fail");
+    assert!(err.message.contains("unbranched subroutine call"), "{err}");
+
+    // R2 P1-4: same-module `fn tag()` + `fn bridge() { tag(); }` + object-local `fn tag() { bridge(); }` must NOT report false recursion!
+    let same_mod_obj = compile_v2_source(
+        "r2_p1_4.antics",
+        r#"
+fn tag(out: &mut i16) {
+    *out = 55;
+}
+fn bridge(out: &mut i16) {
+    tag(out);
+}
+object "Same Mod Non Recursive" {
+    guid: 0x7F32_0006;
+    state res: i16 = 0;
+    fn tag(out: &mut i16) {
+        bridge(out);
+    }
+    interaction "Go" {
+        run(sim) {
+            tag(&mut self.res);
+            return true;
+        }
+    }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect("distinct local::tag -> mod::bridge -> mod::tag must not be flagged recursive");
+    let mut vm = V2VmFixture::from_objects(&[&same_mod_obj], 100);
+    let oid = vm.spawn(0x7F32_0006, 3, 3);
+    vm.run_interaction(oid, "Go", None);
+    assert_eq!(vm.obj_attr(oid, 0), 55);
+
+    // R2 P2-1: unbounded postfix chain rejected cleanly!
+    let deep_postfix = format!(
+        "object \"Deep Postfix\" {{ guid: 0x7F32_0007; interaction \"G\" {{ run(sim) {{ let x = self{}; return true; }} }} }}",
+        ".a".repeat(120)
+    );
+    let err = compile_v2_source("deep_postfix.antics", &deep_postfix, &empty_cfg)
+        .expect_err("deep postfix chain must be rejected");
+    assert!(err.message.contains("nesting depth"), "{err}");
+
+    // R2 P2-2: valid uses of `raw` as identifier (`while raw`, `let mut raw`, `template raw`)!
+    compile_v2_source(
+        "r2_p2_2.antics",
+        r#"
+template raw {
+    state ok: bool = false;
+}
+object "Raw Ident" from raw {
+    guid: 0x7F32_0008;
+    interaction "Go" {
+        run(sim) {
+            let mut raw = true;
+            while raw {
+                raw = false;
+                break;
+            }
+            return true;
+        }
+    }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect("using 'raw' as variable and template identifier must succeed");
+
+    // R2 P2-3: `Object` and `ObjectId` helper params reject plain `i16` locals!
+    let err = compile_v2_source(
+        "r2_p2_3_obj.antics",
+        r#"
+fn write_obj(o: Object) { o.attr[0] = 1; }
+object "Bad Obj Arg" {
+    guid: 0x7F32_0009;
+    interaction "Go" { run(sim) { let n: i16 = 5; write_obj(n); return true; } }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("i16 must not be accepted as Object parameter");
+    assert!(err.message.contains("expects 'self' or ObjectId"), "{err}");
+
+    let err = compile_v2_source(
+        "r2_p2_3_oid.antics",
+        r#"
+fn accept_id(id: ObjectId) { let x = id; }
+object "Bad Oid Arg" {
+    guid: 0x7F32_000A;
+    interaction "Go" { run(sim) { let n: i16 = 5; accept_id(n); return true; } }
+}
+"#,
+        &empty_cfg,
+    )
+    .expect_err("i16 must not be accepted as ObjectId parameter");
+    assert!(err.message.contains("expects ObjectId"), "{err}");
+
+    // R2 P2-5: implicit tile DGRP ID skips explicit tile DGRP ID `103` without colliding!
+    let mixed_dgrp = compile_v2_source(
+        "r2_p2_5.antics",
+        r#"
+object "Mixed Tile DGRP" {
+    guid: 0x7F32_000B;
+    master_id: 1;
+    graphics: [
+        Sprite::procedural("floor_lamp", primary: #988C74, accent: #B4A890, trim: #604E34),
+        Sprite::procedural("floor_lamp", primary: #F2E0AE, accent: #FCF0CE, trim: #745E3E),
+    ];
+    tiles: [
+        tile { name: "Explicit", guid: 0x7F32_000C, objd_id: 129, offset: [0, 0], lead: true, interaction_group: -1, dgrp_id: 103, shape: "cot" },
+        tile { name: "Implicit", guid: 0x7F32_000D, objd_id: 130, offset: [1, 0], lead: false, interaction_group: 1, shape: "cot" },
+    ];
+}
+"#,
+        &empty_cfg,
+    )
+    .expect("implicit tile dgrp_id must skip reserved explicit id 103");
+    let iff = Iff::parse(mixed_dgrp.iff_bytes).expect("parse iff");
+    assert!(iff.get(b"DGRP", 100).is_some());
+    assert!(iff.get(b"DGRP", 101).is_some());
+    assert!(iff.get(b"DGRP", 102).is_some());
+    assert!(iff.get(b"DGRP", 103).is_some());
+
+    // R2 P2-4 & R2 P1-5: CLI `check` & `equiv` with `--pack` on `.air` input, plus symlinked alias to pack root!
+    let tmp = CleanupDir::new("r2-cli");
+    let pack = tmp.path().join("pack");
+    std::fs::create_dir_all(pack.join("sub")).expect("mkdir sub");
+    std::fs::write(
+        pack.join("pack.toml"),
+        "[pack]\nid = \"r2_pack\"\nname = \"R2\"\nversion = \"0.1.0\"\narchive = \"r2.far\"\nobjects = []\n",
+    )
+    .expect("write pack.toml");
+    let air_file = pack.join("sub/raw.air");
+    std::fs::write(&air_file, "tree 4096 \"Init\" { return true; }\n").expect("write raw.air");
+    let v2_file = pack.join("sub/demo.antics");
+    std::fs::write(&v2_file, "object \"Demo\" { guid: 0x7F32_0010; }\n").expect("write demo");
+    let demo_obj = compile_v2_object_file(&v2_file, Some(&pack)).expect("compile demo");
+    let demo_iff = tmp.path().join("demo.iff");
+    std::fs::write(&demo_iff, &demo_obj.iff_bytes).expect("write demo.iff");
+
+    // R2 P2-4: `check` and `equiv` with `--pack` still support `.air` files!
+    let check_air = Command::new(cli_bin())
+        .args(["check"])
+        .arg(&air_file)
+        .args(["--pack"])
+        .arg(&pack)
+        .output()
+        .expect("check air with --pack");
+    assert!(
+        check_air.status.success(),
+        "check .air --pack failed: {}",
+        String::from_utf8_lossy(&check_air.stderr)
+    );
+    let equiv_air = Command::new(cli_bin())
+        .args(["equiv"])
+        .arg(&air_file)
+        .arg(&demo_iff)
+        .args(["--tree", "4096", "--pack"])
+        .arg(&pack)
+        .output()
+        .expect("equiv air with --pack");
+    assert!(
+        equiv_air.status.success(),
+        "equiv .air --pack failed: {}",
+        String::from_utf8_lossy(&equiv_air.stderr)
+    );
+
+    // R2 P1-5: alternate source path through symlink alias `/tmp/alias -> /tmp/pack` must be rejected!
+    #[cfg(unix)]
+    {
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&pack, &alias).expect("symlink alias -> pack");
+        let aliased_src = alias.join("sub/demo.antics");
+        let err = compile_v2_object_file(&aliased_src, Some(&pack))
+            .expect_err("aliased source path through symlinked pack root must be rejected");
+        assert!(err.message.contains("symlink"), "{err}");
+    }
+}

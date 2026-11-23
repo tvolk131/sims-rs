@@ -1249,21 +1249,17 @@ fn run() -> Result<(), CliError> {
                     format!("{} is not a regular file or directory", target.display()).into(),
                 );
             }
-            // Validate `--pack` containment before reading source bytes.
-            if let Some(ref pdir) = pack_dir {
-                let obj = compile_v2_object_file(&target, Some(pdir)).map_err(|e| e.to_string())?;
-                return write_stdout_line(&format!(
-                    "OK: {} (GUID {:#010x}, {} BHAVs, {} bytes IFF, {} WAVs)",
-                    obj.name,
-                    obj.guid,
-                    obj.behaviors.len(),
-                    obj.iff_bytes.len(),
-                    obj.sounds_wav.len()
-                ));
-            }
-            let src = read_regular_text_file(&target)?;
+            // Validate `--pack` containment before reading source bytes, then dispatch by format.
+            let src = if let Some(ref pdir) = pack_dir {
+                sims_antics::v2::loader::read_v2_checked_file(&target, Some(pdir))
+                    .map_err(|e| e.to_string())?
+                    .0
+            } else {
+                read_regular_text_file(&target)?
+            };
             if is_v2_source(&src) {
-                let obj = compile_v2_object_file(&target, None).map_err(|e| e.to_string())?;
+                let obj = compile_v2_object_file(&target, pack_dir.as_deref())
+                    .map_err(|e| e.to_string())?;
                 write_stdout_line(&format!(
                     "OK: {} (GUID {:#010x}, {} BHAVs, {} bytes IFF, {} WAVs)",
                     obj.name,
@@ -1403,21 +1399,21 @@ fn run() -> Result<(), CliError> {
             let iff_path = iff_path.ok_or_else(|| "equiv requires <b.iff>".to_owned())?;
             let tree_id = tree_id.ok_or_else(|| "equiv requires --tree <id>".to_owned())?;
 
-            let behaviors = if let Some(ref pdir) = pack_dir {
-                compile_v2_object_file(&antics_path, Some(pdir))
+            let antics_src = if let Some(ref pdir) = pack_dir {
+                sims_antics::v2::loader::read_v2_checked_file(&antics_path, Some(pdir))
+                    .map_err(|e| e.to_string())?
+                    .0
+            } else {
+                read_regular_text_file(&antics_path)?
+            };
+            let behaviors = if is_v2_source(&antics_src) {
+                compile_v2_object_file(&antics_path, pack_dir.as_deref())
                     .map_err(|e| e.to_string())?
                     .behaviors
             } else {
-                let antics_src = read_regular_text_file(&antics_path)?;
-                if is_v2_source(&antics_src) {
-                    compile_v2_object_file(&antics_path, None)
-                        .map_err(|e| e.to_string())?
-                        .behaviors
-                } else {
-                    compile_air(&antics_src)
-                        .map_err(|e| e.to_string())?
-                        .behaviors
-                }
+                compile_air(&antics_src)
+                    .map_err(|e| e.to_string())?
+                    .behaviors
             };
             let bhav_a = behaviors.get(&tree_id).ok_or_else(|| {
                 format!("{} does not define tree #{tree_id}", antics_path.display())

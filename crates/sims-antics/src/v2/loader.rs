@@ -263,9 +263,12 @@ pub fn resolve_v2_source(
 /// Maximum transitive module import nesting depth.
 const MAX_IMPORT_DEPTH: usize = 32;
 
-/// Loads and resolves one `.antics` v2 file from disk (symlink-free regular file check,
-/// rejecting symlinked ancestor components inside the pack root).
-pub fn resolve_v2_file(file_path: &Path, pack_dir: Option<&Path>) -> Result<ResolvedModule> {
+/// Reads one `.antics` or `.air` file from disk after verifying symlink-free components
+/// and (when `pack_dir` is `Some`) containment within the pack root.
+pub fn read_v2_checked_file(
+    file_path: &Path,
+    pack_dir: Option<&Path>,
+) -> Result<(String, PackResolverConfig)> {
     let config = match pack_dir {
         Some(dir) => PackResolverConfig::from_pack_dir(dir)?,
         None => PackResolverConfig::infer_for_file(file_path)?,
@@ -277,9 +280,24 @@ pub fn resolve_v2_file(file_path: &Path, pack_dir: Option<&Path>) -> Result<Reso
             .map_err(|e| Error::new(format!("failed to determine current directory: {e}")))?
             .join(file_path)
     };
-    // Walk every ancestor component starting from the pack root (or the file itself) to refuse
-    // symlinked directories even when their target happens to resolve back inside `pack_root`.
+    let meta = std::fs::symlink_metadata(file_path)
+        .map_err(|e| Error::new(format!("failed to access {}: {e}", file_path.display())))?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(Error::new(format!(
+            "expected regular file at {} (refusing symlinks and directories)",
+            file_path.display()
+        )));
+    }
+    let canon_file = std::fs::canonicalize(file_path)
+        .map_err(|e| Error::new(format!("failed to resolve {}: {e}", file_path.display())))?;
     if let Some(root_canon) = &config.pack_root {
+        if !canon_file.starts_with(root_canon) && pack_dir.is_some() {
+            return Err(Error::new(format!(
+                "source file {} is outside pack root {}",
+                canon_file.display(),
+                root_canon.display()
+            )));
+        }
         let base_to_check = match pack_dir {
             Some(dir) if dir.is_absolute() => dir.to_path_buf(),
             Some(dir) => std::env::current_dir()
@@ -291,29 +309,15 @@ pub fn resolve_v2_file(file_path: &Path, pack_dir: Option<&Path>) -> Result<Reso
             verify_no_symlink_components(&base_to_check, rel)?;
         } else if let Ok(rel) = abs_file.strip_prefix(root_canon) {
             verify_no_symlink_components(root_canon, rel)?;
-        }
-    }
-    let meta = std::fs::symlink_metadata(file_path)
-        .map_err(|e| Error::new(format!("failed to access {}: {e}", file_path.display())))?;
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return Err(Error::new(format!(
-            "expected regular file at {} (refusing symlinks and directories)",
-            file_path.display()
-        )));
-    }
-    let canon_file = std::fs::canonicalize(file_path)
-        .map_err(|e| Error::new(format!("failed to resolve {}: {e}", file_path.display())))?;
-    if let Some(root) = &config.pack_root {
-        if !canon_file.starts_with(root) && pack_dir.is_some() {
-            return Err(Error::new(format!(
-                "source file {} is outside pack root {}",
-                canon_file.display(),
-                root.display()
-            )));
+        } else if canon_file.starts_with(root_canon) {
+            // Alternate lexical path (e.g. `/tmp/alias/sub/demo.antics` with `--pack /tmp/pack`):
+            // walk the original path BEFORE canonicalization, rejecting any symlink component
+            // along the path up to the common ancestor or canonical pack root.
+            verify_no_symlink_ancestors_to_root(&abs_file, &base_to_check, root_canon)?;
         }
         // Also verify symlink-free components along the canonical path relative to root_canon.
-        if let Ok(rel) = canon_file.strip_prefix(root) {
-            verify_no_symlink_components(root, rel)?;
+        if let Ok(rel) = canon_file.strip_prefix(root_canon) {
+            verify_no_symlink_components(root_canon, rel)?;
         }
     }
     let root_for_read = config
@@ -322,11 +326,69 @@ pub fn resolve_v2_file(file_path: &Path, pack_dir: Option<&Path>) -> Result<Reso
         .filter(|r| canon_file.starts_with(r))
         .unwrap_or_else(|| canon_file.parent().unwrap_or(Path::new("/")));
     let source = read_regular_file_checked(&canon_file, root_for_read)?;
+    Ok((source, config))
+}
+
+/// Loads and resolves one `.antics` v2 file from disk (symlink-free regular file check,
+/// rejecting symlinked ancestor components inside or aliasing the pack root).
+pub fn resolve_v2_file(file_path: &Path, pack_dir: Option<&Path>) -> Result<ResolvedModule> {
+    let (source, config) = read_v2_checked_file(file_path, pack_dir)?;
     let label = file_path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("<input.antics>");
     resolve_v2_source(label, &source, &config)
+}
+
+/// Walks an uncanonicalized source path to catch symlinked ancestor components even when
+/// `abs_file` does not lexically start with `base_to_check` or `root_canon` (e.g.
+/// `/tmp/alias/sub/demo.antics` where `/tmp/alias -> /tmp/pack`).
+fn verify_no_symlink_ancestors_to_root(
+    abs_file: &Path,
+    base_to_check: &Path,
+    root_canon: &Path,
+) -> Result<()> {
+    // 1. Check from the longest common lexical prefix with `base_to_check` down to `abs_file`
+    //    (handles macOS `/var -> /private/var` cleanly while catching `/tmp/alias/...`).
+    let mut common = PathBuf::new();
+    for (a, b) in abs_file.components().zip(base_to_check.components()) {
+        if a == b {
+            common.push(a.as_os_str());
+        } else {
+            break;
+        }
+    }
+    if let Ok(rel) = abs_file.strip_prefix(&common) {
+        verify_no_symlink_components(&common, rel)?;
+    }
+    // 2. Also walk parent links upward while canonical path remains within `root_canon`
+    //    (checking `symlink_metadata` at each step BEFORE testing canonical equality, so a
+    //    symlink pointing directly to `root_canon` itself is rejected).
+    let mut cur = abs_file;
+    while std::fs::canonicalize(cur)
+        .ok()
+        .is_some_and(|c| c.starts_with(root_canon))
+    {
+        let meta = std::fs::symlink_metadata(cur)
+            .map_err(|e| Error::new(format!("failed to inspect {}: {e}", cur.display())))?;
+        if meta.file_type().is_symlink() {
+            return Err(Error::new(format!(
+                "refusing to follow symlink path component: {}",
+                cur.display()
+            )));
+        }
+        if std::fs::canonicalize(cur).ok().as_deref() == Some(root_canon) {
+            break;
+        }
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        if parent == cur {
+            break;
+        }
+        cur = parent;
+    }
+    Ok(())
 }
 
 fn verify_no_symlink_components(base: &Path, rel: &Path) -> Result<()> {

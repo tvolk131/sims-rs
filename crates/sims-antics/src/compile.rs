@@ -319,64 +319,72 @@ pub(crate) fn compile_object_from_manifest(
             data: encode_objf(&master_objf)?,
         });
 
-        // Pass 1: Register all per-tile sprite shapes first so shared tile DGRP references
-        // are independent of [[tile]] declaration order.
+        // Pass 1a: Register all explicit per-tile sprite shapes first so implicit allocations
+        // never collide with explicit tile DGRP IDs regardless of declaration order.
         let mut resolved_tile_dgrps: Vec<Option<u16>> = vec![None; manifest.tiles.len()];
         for (idx, tile) in manifest.tiles.iter().enumerate() {
             let tile_label = tile
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("{} Tile {}", manifest.name, idx));
-            match (tile.dgrp_id, tile.shape) {
-                (Some(dgrp_id), Some(shape)) => {
-                    if dgrp_id == 0 {
-                        return Err(Error::new(format!(
-                            "tile '{tile_label}' cannot combine dgrp_id = 0 with a sprite shape"
-                        )));
-                    }
-                    if !emitted_dgrp_ids.insert(dgrp_id)
-                        || !emitted_spr2_ids.insert(dgrp_id)
-                        || !emitted_palt_ids.insert(dgrp_id)
-                    {
-                        return Err(Error::new(format!(
-                            "tile '{tile_label}' dgrp_id {dgrp_id} collides with an existing PALT/SPR2/DGRP chunk id"
-                        )));
-                    }
-                    extra_tile_sprites.push((
-                        dgrp_id,
-                        tile_label,
-                        SpriteSpec {
-                            shape,
-                            ..manifest.sprite
-                        },
-                    ));
-                    resolved_tile_dgrps[idx] = Some(dgrp_id);
+            if let (Some(dgrp_id), Some(shape)) = (tile.dgrp_id, tile.shape) {
+                if dgrp_id == 0 {
+                    return Err(Error::new(format!(
+                        "tile '{tile_label}' cannot combine dgrp_id = 0 with a sprite shape"
+                    )));
                 }
-                (None, Some(shape)) => {
-                    let dgrp_id = manifest
-                        .dgrp_id
-                        .checked_add(total_graphics)
-                        .and_then(|base| base.checked_add(idx as u16))
+                if !emitted_dgrp_ids.insert(dgrp_id)
+                    || !emitted_spr2_ids.insert(dgrp_id)
+                    || !emitted_palt_ids.insert(dgrp_id)
+                {
+                    return Err(Error::new(format!(
+                        "tile '{tile_label}' dgrp_id {dgrp_id} collides with an existing PALT/SPR2/DGRP chunk id"
+                    )));
+                }
+                extra_tile_sprites.push((
+                    dgrp_id,
+                    tile_label,
+                    SpriteSpec {
+                        shape,
+                        ..manifest.sprite
+                    },
+                ));
+                resolved_tile_dgrps[idx] = Some(dgrp_id);
+            }
+        }
+        // Pass 1b: Assign free implicit DGRP IDs for shaped tiles without an explicit `dgrp_id`.
+        let mut next_implicit_dgrp = manifest
+            .dgrp_id
+            .checked_add(total_graphics)
+            .ok_or_else(|| Error::new("multi-tile dgrp_id overflow"))?;
+        for (idx, tile) in manifest.tiles.iter().enumerate() {
+            let tile_label = tile
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{} Tile {}", manifest.name, idx));
+            if let (None, Some(shape)) = (tile.dgrp_id, tile.shape) {
+                while emitted_dgrp_ids.contains(&next_implicit_dgrp)
+                    || emitted_spr2_ids.contains(&next_implicit_dgrp)
+                    || emitted_palt_ids.contains(&next_implicit_dgrp)
+                {
+                    next_implicit_dgrp = next_implicit_dgrp
+                        .checked_add(1)
                         .ok_or_else(|| Error::new("multi-tile dgrp_id overflow"))?;
-                    if !emitted_dgrp_ids.insert(dgrp_id)
-                        || !emitted_spr2_ids.insert(dgrp_id)
-                        || !emitted_palt_ids.insert(dgrp_id)
-                    {
-                        return Err(Error::new(format!(
-                            "auto-assigned tile dgrp_id {dgrp_id} for '{tile_label}' collides with an existing sprite chunk id"
-                        )));
-                    }
-                    extra_tile_sprites.push((
-                        dgrp_id,
-                        tile_label,
-                        SpriteSpec {
-                            shape,
-                            ..manifest.sprite
-                        },
-                    ));
-                    resolved_tile_dgrps[idx] = Some(dgrp_id);
                 }
-                (Some(_), None) | (None, None) => {}
+                let dgrp_id = next_implicit_dgrp;
+                next_implicit_dgrp = next_implicit_dgrp.saturating_add(1);
+                emitted_dgrp_ids.insert(dgrp_id);
+                emitted_spr2_ids.insert(dgrp_id);
+                emitted_palt_ids.insert(dgrp_id);
+                extra_tile_sprites.push((
+                    dgrp_id,
+                    tile_label,
+                    SpriteSpec {
+                        shape,
+                        ..manifest.sprite
+                    },
+                ));
+                resolved_tile_dgrps[idx] = Some(dgrp_id);
             }
         }
 
