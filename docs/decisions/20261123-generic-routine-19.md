@@ -106,13 +106,15 @@ How it was checked:
   runs. Whether the original also places the companion at arrival, as
   the headless date does, or leaves it to routine 19 to make, is part of
   that follow-up.
-- **A trip led by anyone but the family's first member is never
-  placed.** The marker finds the arriving Sim with Generic Sims Call 18,
-  which names the first member of the game's family (0x4e97dc(0)). On
-  Downtown our family is still the whole household, Mortimer first, so a
-  solo trip by Bella leaves her where she arrives: PetsOutside stays 0 and
-  the marker goes on waiting at node 2. A trip Mortimer leads works, with
-  Bella too as his companion, since routine 19 then finds her. The original lets any adult go Downtown, so it must
+- **The marker takes the family's first member as the traveler.** It
+  finds the arriving Sim with Generic Sims Call 18, which names the first
+  member of the game's family (0x4e97dc(0)). On Downtown our family is
+  still the whole household, Mortimer first. So a trip without Mortimer
+  is never placed: a solo trip by Bella leaves her where she arrives,
+  PetsOutside stays 0 and the marker goes on waiting at node 2. A trip
+  with Mortimer on it is placed with Mortimer as the lead, even one Bella
+  leads with him as her companion; routine 19 then reads Mortimer's
+  inventory, not hers. The original lets any adult go Downtown, so it must
   give the destination a family the traveler leads; which rule it uses is
   not yet found. The date test uses the household's first member for
   this reason. That is a travel follow-up.
