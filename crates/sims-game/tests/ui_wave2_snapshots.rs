@@ -8,10 +8,12 @@
 //! one PNG per panel for visual review. Needs `SIMS_INSTALL`; skips cleanly
 //! without it.
 
+use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{Catalog, Index, Install};
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 use sims_game::game::goth_house;
+use sims_game::hud::DialogKey;
 use sims_game::neighborhood::NeighborhoodShell;
 use sims_game::{Frames, Game, Options};
 use sims_render::{Canvas, png};
@@ -89,6 +91,44 @@ fn assert_drawn(name: &str, before: &[u32], after: &Canvas) {
     assert!(
         changed * 3 >= 400 * 300,
         "{name} must draw over the view: only {changed} of 120000 central pixels changed"
+    );
+}
+
+/// Asserts the album drew the native `scrapback.bmp` (1200, 700×560,
+/// centered): its left bevel (`x` 2..16, `y` 100..400, covered by nothing
+/// else) matches the bitmap. The 9-slice fallback fails this.
+fn assert_scrapback(install: &Install, canvas: &Canvas) {
+    let ui = UiGraphics::open(install).expect("open UIGraphics");
+    let art = sims_ui::album::load_art(&ui, US_ENGLISH).expect("load album art");
+    let scrap = art
+        .image(sims_ui::album::SCRAP_BACK)
+        .expect("scrapback.bmp loads");
+    assert_eq!([scrap.width, scrap.height], [700, 560]);
+    let h = canvas.color.len() / canvas.width;
+    let (ox, oy) = ((canvas.width - 700) / 2, (h - 560) / 2);
+    let (mut opaque, mut matched) = (0, 0);
+    for y in 100..400 {
+        for x in 2..16 {
+            let i = (y * 700 + x) * 4;
+            let px = &scrap.rgba[i..i + 4];
+            if px[3] != 255 {
+                continue;
+            }
+            opaque += 1;
+            let ours = canvas.color[(oy + y) * canvas.width + ox + x];
+            let ours = [(ours >> 16) as u8, (ours >> 8) as u8, ours as u8];
+            if ours.iter().zip(px).all(|(a, b)| a.abs_diff(*b) <= 8) {
+                matched += 1;
+            }
+        }
+    }
+    assert!(
+        opaque >= 1000,
+        "scrapback's left bevel is opaque ({opaque})"
+    );
+    assert!(
+        matched * 100 >= opaque * 95,
+        "the album draws native scrapback.bmp: {matched} of {opaque} bevel pixels match"
     );
 }
 
@@ -276,6 +316,7 @@ fn wave2_panels_open_and_draw_with_native_art() {
     shell.render();
     assert!(shell.album_open());
     assert_drawn("photo-album", &lot_view, shell.canvas());
+    assert_scrapback(&install, shell.canvas());
     snapshot("photo-album", shell.canvas());
     shell.close_photo_album();
 
@@ -320,4 +361,135 @@ fn wave2_panels_open_and_draw_with_native_art() {
     assert!(shell.import_picker_open(), "Import Family opens its picker");
     assert_drawn("import-family", &neighborhood_view, shell.canvas());
     snapshot("import-family", shell.canvas());
+}
+
+/// Every point on the lot (on a 6 px grid, off the panel) with something
+/// under it.
+fn lot_points(game: &Game) -> Vec<[i32; 2]> {
+    (0..SIZE[1])
+        .step_by(6)
+        .flat_map(|y| (0..SIZE[0]).step_by(6).map(move |x| [x, y]))
+        .filter(|&p| !game.over_panel(p) && game.under(p).is_some())
+        .collect()
+}
+
+#[test]
+fn a_panel_preview_never_changes_the_world() {
+    let Some(root) = env_dir("SIMS_INSTALL") else {
+        return;
+    };
+    let mut game = open_goth(&root);
+    let world = game.lot().world().clone();
+    let sim = world.selected().expect("Mortimer selected");
+    let neighbor = world.objects[&sim]
+        .person
+        .as_ref()
+        .and_then(|p| p.data.get(31).copied())
+        .expect("Mortimer's neighbor id");
+    let points = lot_points(&game);
+    assert!(!points.is_empty(), "the lot has things to point at");
+    let before = game.lot().world().hash_hex();
+
+    game.preview_special_panel(
+        SpecialPanelRequest::CallNeighbor {
+            caller_neighbor: neighbor,
+        },
+        &world,
+    );
+    game.render();
+    assert_eq!(game.lot().world().hash_hex(), before, "opening a preview");
+    // Pointing at Sims and objects behind the modal lists no pie menu: the
+    // listing runs check trees, which change the world.
+    for &point in &points {
+        game.hover(point);
+        game.render();
+        assert_eq!(game.listed(), None, "nothing is listed behind a modal");
+    }
+    assert_eq!(
+        game.lot().world().hash_hex(),
+        before,
+        "hovering behind a preview"
+    );
+    game.dialog_confirm_key(DialogKey::Escape);
+    game.render();
+    assert!(!game.has_dialog(), "Escape dismisses the preview");
+    assert_eq!(
+        game.lot().world().hash_hex(),
+        before,
+        "dismissing a preview"
+    );
+
+    // With the modal gone, the same pointing does list a menu.
+    let listed = points.iter().any(|&point| {
+        game.hover(point);
+        game.listed().is_some()
+    });
+    assert!(
+        listed,
+        "with no modal, pointing at the lot lists a pie menu"
+    );
+}
+
+#[test]
+fn enter_behind_a_panel_preview_leaves_the_vm_prompt_pending() {
+    let Some(root) = env_dir("SIMS_INSTALL") else {
+        return;
+    };
+    // No scripted answers: the Goths' opening dialog waits for the player.
+    let mut game = Game::open(&Options {
+        house: goth_house(&root),
+        install: root.to_path_buf(),
+        answers: Vec::new(),
+        play: false,
+        frames: Frames::default(),
+    })
+    .expect("open Goth house");
+    game.resize(SIZE);
+    // Tick until the opening dialog stops the lot to wait for the player.
+    game.run(50);
+    game.render();
+    assert!(game.asking().is_some(), "the opening dialog waits");
+    let world = game.lot().world().clone();
+    let sim = world.selected().expect("Mortimer selected");
+
+    game.preview_special_panel(SpecialPanelRequest::CharmTransform { person: sim }, &world);
+    game.render();
+    game.dialog_submit();
+    game.render();
+    // Enter picks in the preview in front, which answers nothing and closes
+    // it; the VM prompt behind stays pending.
+    assert!(
+        game.asking().is_some(),
+        "Enter goes to the preview in front, not the VM prompt behind it"
+    );
+    assert!(
+        game.active_special_panel_request().is_none(),
+        "a pick closes the preview"
+    );
+
+    // Escape on a phone book preview closes only the preview.
+    let neighbor = world.objects[&sim]
+        .person
+        .as_ref()
+        .and_then(|p| p.data.get(31).copied())
+        .expect("Mortimer's neighbor id");
+    game.preview_special_panel(
+        SpecialPanelRequest::CallNeighbor {
+            caller_neighbor: neighbor,
+        },
+        &world,
+    );
+    game.render();
+    game.dialog_confirm_key(DialogKey::Escape);
+    game.render();
+    assert!(game.asking().is_some(), "Escape closes only the preview");
+    assert!(game.active_special_panel_request().is_none());
+
+    // With no preview up, Enter answers the prompt.
+    game.dialog_submit();
+    game.render();
+    assert!(
+        game.asking().is_none(),
+        "with no preview, Enter answers the prompt"
+    );
 }

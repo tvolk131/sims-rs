@@ -173,6 +173,28 @@ P3=5`, so there was no round 2. Fixed:
 
 The off-map phone book P3 is left as a follow-up above.
 
+The coordinator's Sol re-check of the fix commit `73481873` found `P0=0,
+P1=0, P2=2, P3=2`. All four are fixed:
+
+- **P2:** hovering the lot behind a modal ran pie-menu check trees, which
+  changed the world. `Game::follow` now lists nothing while any modal is
+  up. A test checks that the world hash is unchanged across a preview's
+  open, hover, render and dismiss, and that the same hovering does list a
+  menu once the modal is gone.
+- **P2:** Enter or Escape on a picker preview could reach a VM prompt
+  waiting behind it. `dialog_submit` and `dialog_confirm_key` now send
+  keys to the foreground modal first (phone book, book, shop picker), and
+  swallow them for other special panels and the destination picker. A
+  test checks that the Goths' opening VM dialog stays pending behind a
+  charm preview (Enter) and a phone book preview (Escape), and that Enter
+  answers it once no preview is up.
+- **P3:** whether a panel is a preview now lives on `ActiveSpecialPanel`
+  and is set on every open or replacement. A real VM request that replaces
+  a preview is no longer treated as one.
+- **P3:** the snapshot test checks that the Photo Album's left bevel
+  matches `scrapback.bmp` pixel for pixel (95% within 8 levels), so the
+  9-slice fallback fails it.
+
 ## Unverified assumptions
 
 - Wardrobe modes 1–5 categories, and the item order for kind 14.

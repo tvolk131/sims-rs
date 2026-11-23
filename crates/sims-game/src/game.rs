@@ -246,6 +246,10 @@ struct ActiveSpecialPanel {
     coop_dialog_id: Option<NetDialogId>,
     responses: BTreeMap<String, SpecialPanelResponse>,
     preview_targets: BTreeMap<String, ShopPreviewTarget>,
+    /// Where the panel came from: `true` for [`Game::preview_special_panel`]
+    /// (nothing answers the VM, and [`Game::sync_special_panel`] keeps it
+    /// open), `false` for a VM request. Set on every open or replacement.
+    preview: bool,
 }
 
 /// Conservative invariant key for steady-state Tier-2 lot frames where all
@@ -391,9 +395,6 @@ pub struct Game {
     neighborhood_slot: u8,
     /// Currently presented VM special panel (`Dialog` kinds `5..=15`), if any.
     active_special_panel: Option<ActiveSpecialPanel>,
-    /// The open special panel came from [`Game::preview_special_panel`],
-    /// not the VM, so [`Game::sync_special_panel`] keeps it open.
-    special_panel_preview: bool,
     /// Co-op special-panel dialog ID already answered locally plus pump count
     /// elapsed since submission; cleared when the lockstep commit resolves or
     /// rejects the panel, or after a bounded retry wait if host ingress drops
@@ -1095,7 +1096,6 @@ impl Game {
             shop_preview_assets: None,
             shop_preview_yaw_deg: 0,
             shop_preview_body: None,
-            special_panel_preview: false,
             shop_preview_targets: BTreeMap::new(),
             purchased_shop_items: BTreeSet::new(),
             book_dialog: ReferenceBookDialog::new(),
@@ -1486,7 +1486,6 @@ impl Game {
             shop_preview_assets: None,
             shop_preview_yaw_deg: 0,
             shop_preview_body: None,
-            special_panel_preview: false,
             shop_preview_targets: BTreeMap::new(),
             purchased_shop_items: BTreeSet::new(),
             book_dialog: ReferenceBookDialog::new(),
@@ -1833,7 +1832,6 @@ impl Game {
             shop_preview_assets: None,
             shop_preview_yaw_deg: 0,
             shop_preview_body: None,
-            special_panel_preview: false,
             shop_preview_targets: BTreeMap::new(),
             purchased_shop_items: BTreeSet::new(),
             book_dialog: ReferenceBookDialog::new(),
@@ -2041,7 +2039,6 @@ impl Game {
             shop_preview_assets: None,
             shop_preview_yaw_deg: 0,
             shop_preview_body: None,
-            special_panel_preview: false,
             shop_preview_targets: BTreeMap::new(),
             purchased_shop_items: BTreeSet::new(),
             book_dialog: ReferenceBookDialog::new(),
@@ -3015,6 +3012,18 @@ impl Game {
                 _ => Outcome::default(),
             };
         }
+        // Special-panel pickers sit in front of any VM prompt: their keys
+        // never reach it.
+        if self.shop_dialog.is_open() {
+            return match key {
+                DialogKey::Enter => self.shop_submit(),
+                DialogKey::Escape => self.shop_escape(),
+                _ => Outcome::default(),
+            };
+        }
+        if self.active_special_panel.is_some() || self.destination_picker.is_some() {
+            return Outcome::default();
+        }
         if key == DialogKey::Tab {
             return Outcome {
                 redraw: self.hud.switch_dialog_field(),
@@ -3215,6 +3224,17 @@ impl Game {
 
     /// Submits the active modal dialog via Enter (activates button 0 if enabled).
     pub fn dialog_submit(&mut self) -> Outcome {
+        // The foreground modal takes Enter first, so it never reaches a VM
+        // prompt waiting behind it.
+        if self.phonebook_dialog.is_open()
+            || self.book_dialog.is_open()
+            || self.shop_dialog.is_open()
+        {
+            return self.dialog_confirm_key(DialogKey::Enter);
+        }
+        if self.active_special_panel.is_some() || self.destination_picker.is_some() {
+            return Outcome::default();
+        }
         let Some(command) = self.hud.submit_dialog() else {
             return Outcome::default();
         };
@@ -5281,10 +5301,11 @@ impl Game {
     /// Follows the object under the pointer in the frame last drawn: when
     /// it changes to an object, lists the selected Sim's pie menu on it.
     /// Nothing is listed while the pointer is over the panel, a dialog or
-    /// a menu, or once the lot has stopped. True if a listing may have
-    /// changed the lot.
+    /// a menu, while a modal is up (the lot behind a modal takes no
+    /// pointer, and listing runs check trees that change the world), or
+    /// once the lot has stopped. True if a listing may have changed the lot.
     fn follow(&mut self) -> bool {
-        if self.hud.controls.mode != Mode::Live {
+        if self.hud.controls.mode != Mode::Live || self.has_dialog() {
             self.reached = None;
             self.listed = None;
             return false;
@@ -10007,15 +10028,21 @@ impl Game {
     #[doc(hidden)]
     pub fn preview_special_panel(&mut self, request: SpecialPanelRequest, world: &sims_sim::World) {
         self.close_special_panel_ui();
-        self.open_special_panel_ui(0, request, world, None);
-        self.special_panel_preview = self.active_special_panel.is_some();
+        self.open_special_panel_ui(0, request, world, None, true);
+    }
+
+    /// Whether the open special panel is a synthetic preview rather than a
+    /// VM request.
+    fn previewing_special_panel(&self) -> bool {
+        self.active_special_panel
+            .as_ref()
+            .is_some_and(|p| p.preview)
     }
 
     /// Closes any local UI modal opened for a VM special panel without sending
     /// an answer to the VM (used after answering, on co-op peer dismissal, or on
     /// restore).
     fn close_special_panel_ui(&mut self) {
-        self.special_panel_preview = false;
         if self.active_special_panel.take().is_some() {
             self.shop_dialog.close();
             self.shop_snapshot = None;
@@ -10044,7 +10071,7 @@ impl Game {
             .and_then(|c| c.active_special_panel.as_ref().map(|(id, _)| *id));
         let unchanged = {
             let Some(asking) = self.lot.asking_special_panel() else {
-                if self.special_panel_preview && self.active_special_panel.is_some() {
+                if self.previewing_special_panel() {
                     return;
                 }
                 self.submitted_coop_special_panel = None;
@@ -10071,7 +10098,7 @@ impl Game {
         };
         let tick = asking.shown.tick;
         let request = asking.shown.request.clone();
-        self.open_special_panel_ui(tick, request, &asking.world, coop_dialog_id);
+        self.open_special_panel_ui(tick, request, &asking.world, coop_dialog_id, false);
     }
 
     /// Opens the local modal for `request`, as the VM asked it at `tick`
@@ -10082,6 +10109,7 @@ impl Game {
         request: SpecialPanelRequest,
         world: &sims_sim::World,
         coop_dialog_id: Option<NetDialogId>,
+        preview: bool,
     ) {
         self.close_menu();
         self.hud.close_camera_strip();
@@ -10110,6 +10138,7 @@ impl Game {
                     coop_dialog_id,
                     responses: BTreeMap::new(),
                     preview_targets: BTreeMap::new(),
+                    preview,
                 });
             }
             SpecialPanelRequest::DowntownLotPicker
@@ -10148,6 +10177,7 @@ impl Game {
                         coop_dialog_id,
                         responses: BTreeMap::new(),
                         preview_targets: BTreeMap::new(),
+                        preview,
                     });
                 }
             }
@@ -10178,6 +10208,7 @@ impl Game {
                     items,
                     responses,
                     preview_targets,
+                    preview,
                 );
             }
             SpecialPanelRequest::PetPicker { pet } => {
@@ -10193,6 +10224,7 @@ impl Game {
                     items,
                     responses,
                     preview_targets,
+                    preview,
                 );
             }
             SpecialPanelRequest::CallNeighbor { caller_neighbor } => {
@@ -10207,6 +10239,7 @@ impl Game {
                     coop_dialog_id,
                     responses: BTreeMap::new(),
                     preview_targets: BTreeMap::new(),
+                    preview,
                 });
             }
             SpecialPanelRequest::CharmTransform { person } => {
@@ -10223,6 +10256,7 @@ impl Game {
                     items,
                     responses,
                     preview_targets,
+                    preview,
                 );
             }
         }
@@ -10240,6 +10274,7 @@ impl Game {
         items: Vec<ShopItem>,
         responses: BTreeMap<String, SpecialPanelResponse>,
         preview_targets: BTreeMap<String, ShopPreviewTarget>,
+        preview: bool,
     ) {
         self.ensure_shop_assets();
         let wallet = self.current_shop_wallet();
@@ -10266,6 +10301,7 @@ impl Game {
             coop_dialog_id,
             responses,
             preview_targets,
+            preview,
         });
     }
 
@@ -10273,7 +10309,7 @@ impl Game {
     /// kinds `5..=15`) in either single-player (`Lot::answer_special_panel` +
     /// tick replay) or co-op lockstep (`sims_vm::coop::special_panel_answer_command`).
     pub fn answer_special_panel(&mut self, response: SpecialPanelResponse) -> bool {
-        if self.special_panel_preview {
+        if self.previewing_special_panel() {
             // A synthetic preview panel never answers a real VM request,
             // even one that happens to be waiting.
             self.close_special_panel_ui();
