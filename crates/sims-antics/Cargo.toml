@@ -13,11 +13,11 @@ encoding_rs.workspace = true
 libm.workspace = true
 sims-content.workspace = true
 sims-formats.workspace = true
+sims-vm.workspace = true
 
 [dev-dependencies]
 sims-core.workspace = true
 sims-sim.workspace = true
-sims-vm.workspace = true
 
 [lints]
 workspace = true

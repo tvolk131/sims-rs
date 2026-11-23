@@ -11,7 +11,7 @@
 //! - `sims-antics build <pack_dir> --out <dir>`
 
 use sims_antics::arity_catalog::{
-    AritySource, FileIdentity, GLOBAL_TREES, InstallArityCatalog, ResolvedArities,
+    AritySource, FileArities, FileIdentity, GLOBAL_TREES, InstallArityCatalog, ResolvedArities,
     SEMI_GLOBAL_TREES, bhav_arities_in_range,
 };
 use sims_antics::ir::BhavChunk;
@@ -401,9 +401,9 @@ fn resolve_lift_arities(
     input_identity: Result<&FileIdentity, &str>,
     member: Option<(&str, u64)>,
     opts: &ArityOptions,
-) -> Result<ResolvedArities, CliError> {
+) -> Result<FileArities, CliError> {
     let mut resolved = if opts.no_catalog {
-        ResolvedArities::private_only(iff, "--no-catalog")
+        FileArities::private_only(iff, "--no-catalog")
     } else {
         match InstallArityCatalog::find_install_root(input_path) {
             Some(root) => match InstallArityCatalog::load(&root) {
@@ -412,31 +412,31 @@ fn resolve_lift_arities(
                         let resource = catalog.resource_for(input_path, identity, member);
                         catalog.resolve(resource, iff)
                     }
-                    Err(why) => ResolvedArities::no_role(&format!(
+                    Err(why) => FileArities::no_role(&format!(
                         "could not identify the opened file: {}",
                         sanitize_single_line(why)
                     )),
                 },
-                Err(err) => ResolvedArities::no_role(&format!(
+                Err(err) => FileArities::no_role(&format!(
                     "install catalog failed to load: {}",
                     sanitize_single_line(&err)
                 )),
             },
-            None => ResolvedArities::no_role("no Sims install found above the input"),
+            None => FileArities::no_role("no Sims install found above the input"),
         }
     };
     if let Some(spec) = &opts.globals {
         let (globals_iff, label) = read_override_iff(spec, Some("Global.iff"), "--globals")?;
         resolved.set_global(
             &bhav_arities_in_range(&globals_iff, GLOBAL_TREES),
-            AritySource::Explicit(label),
+            &AritySource::Explicit(label),
         );
     }
     if let Some(spec) = &opts.semi_global {
         let (semi_iff, label) = read_override_iff(spec, None, "--semiglobal")?;
         resolved.set_semi_global(
             &bhav_arities_in_range(&semi_iff, SEMI_GLOBAL_TREES),
-            AritySource::Explicit(label),
+            &AritySource::Explicit(label),
         );
     }
     Ok(resolved)
@@ -711,7 +711,7 @@ fn emit_lifted_bhavs<W: Write>(
     source_label: &str,
     tree_id: Option<u16>,
     raw: bool,
-    resolved: Option<&ResolvedArities>,
+    resolved: Option<&FileArities>,
     lift_opts: LiftOptions,
     verify_equiv: bool,
     out: &mut OutWriter<W>,
@@ -725,7 +725,6 @@ fn emit_lifted_bhavs<W: Write>(
         return Ok(());
     }
 
-    let arities = resolved.map(|r| r.arities.clone());
     let symbols = if lift_opts.annotate_comments {
         Some(extract_lift_symbols_from_iff(iff))
     } else {
@@ -735,13 +734,14 @@ fn emit_lifted_bhavs<W: Write>(
     let mut summary = LiftSummary::default();
     let mut broken_pipe = false;
 
+    let tree_ids: Vec<u16> = selected_chunks.iter().map(|c| c.id).collect();
     // `resolved` is `None` for `--raw`, which does not use callee arities. A broken pipe
     // here still lets the loop below count parse errors before it stops.
     if let Some(resolved) = resolved {
         match out.writeln_str(&format!(
             "// arity sources: {}; lifting and --verify-equiv assume these callee arities (an \
              override, or a lot whose loaded callee versions differ, may change them)",
-            sanitize_single_line(&resolved.describe())
+            sanitize_single_line(&resolved.describe_for(&tree_ids))
         )) {
             Ok(()) => {}
             Err(CliError::BrokenPipe) => broken_pipe = true,
@@ -801,8 +801,11 @@ fn emit_lifted_bhavs<W: Write>(
             continue;
         }
 
+        // Callee arities depend on the scope the calling tree runs in.
+        let tree_arities = resolved.map(|r| r.for_tree(bhav.id));
+        let arities = tree_arities.map(|r| &r.arities);
         let outcome =
-            lift_bhav_structured_with_context(&bhav, lift_opts, arities.as_ref(), symbols.as_ref());
+            lift_bhav_structured_with_context(&bhav, lift_opts, arities, symbols.as_ref());
         let emitted_src = match outcome {
             StructuredLiftOutcome::Lifted(src) => {
                 write_or_break!(out.writeln_str(&format!(
@@ -817,7 +820,7 @@ fn emit_lifted_bhavs<W: Write>(
                 src
             }
             other => {
-                let reason = match resolved {
+                let reason = match tree_arities {
                     Some(resolved) => detailed_lift_reason(&other, &bhav, resolved),
                     None => lift_reason(&other).unwrap_or_else(|| "unknown".to_owned()),
                 };
@@ -829,7 +832,7 @@ fn emit_lifted_bhavs<W: Write>(
                 let labeled_src = format_bhav_labeled_air_with_context(
                     &bhav,
                     lift_opts,
-                    arities.as_ref(),
+                    arities,
                     symbols.as_ref(),
                 );
                 write_or_break!(out.write_str(&labeled_src));
@@ -847,7 +850,7 @@ fn emit_lifted_bhavs<W: Write>(
                             &bhav,
                             recompiled,
                             &EquivOptions::default(),
-                            arities.as_ref(),
+                            arities,
                         ) {
                             EquivResult::Equivalent {
                                 states_checked,
@@ -1170,7 +1173,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     // no explicit override to validate.
     let has_overrides = arity_opts.globals.is_some() || arity_opts.semi_global.is_some();
     let nothing_to_lift = bhav_chunks.is_empty();
-    let resolve_arities = || -> Result<Option<ResolvedArities>, CliError> {
+    let resolve_arities = || -> Result<Option<FileArities>, CliError> {
         if raw || (nothing_to_lift && !has_overrides) {
             return Ok(None);
         }
@@ -1190,12 +1193,20 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
         let resolved = resolve_arities()?;
         let filter_lower = filter.as_deref().map(str::to_lowercase);
         if let Some(resolved) = &resolved {
+            let listed: Vec<u16> = bhav_chunks
+                .iter()
+                .filter(|c| {
+                    filter_lower
+                        .as_ref()
+                        .is_none_or(|needle| bhav_matches_filter(c.id, &c.label, needle))
+                })
+                .map(|c| c.id)
+                .collect();
             out.writeln_str(&format!(
                 "// arity sources: {}",
-                sanitize_single_line(&resolved.describe())
+                sanitize_single_line(&resolved.describe_for(&listed))
             ))?;
         }
-        let list_arities = resolved.as_ref().map(|r| &r.arities);
         out.writeln_str(&format!(
             "{:<7} {:<8} {:<5} {:<5} {:<7} {:<36} {}",
             "ID", "HEX", "INS", "ARGS", "LOCALS", "STATUS", "NAME"
@@ -1213,25 +1224,28 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
                         strict_padding: lift_opts.strict_padding,
                         annotate_comments: false,
                     };
-                    let status =
-                        match lift_bhav_structured_with_arities(&bhav, list_opts, list_arities) {
-                            StructuredLiftOutcome::Lifted(src) => {
-                                let raw_count = src.matches("op 0x").count();
-                                if raw_count == 0 {
-                                    "structured".to_owned()
-                                } else {
-                                    format!("structured ({raw_count} inline raw op)")
-                                }
+                    let tree_arities = resolved.as_ref().map(|r| r.for_tree(bhav.id));
+                    let status = match lift_bhav_structured_with_arities(
+                        &bhav,
+                        list_opts,
+                        tree_arities.map(|r| &r.arities),
+                    ) {
+                        StructuredLiftOutcome::Lifted(src) => {
+                            let raw_count = src.matches("op 0x").count();
+                            if raw_count == 0 {
+                                "structured".to_owned()
+                            } else {
+                                format!("structured ({raw_count} inline raw op)")
                             }
-                            other => format!(
-                                "labeled-cfg ({})",
-                                match &resolved {
-                                    Some(resolved) => short_lift_reason(&other, &bhav, resolved),
-                                    None =>
-                                        lift_reason(&other).unwrap_or_else(|| "unknown".to_owned()),
-                                }
-                            ),
-                        };
+                        }
+                        other => format!(
+                            "labeled-cfg ({})",
+                            match tree_arities {
+                                Some(resolved) => short_lift_reason(&other, &bhav, resolved),
+                                None => lift_reason(&other).unwrap_or_else(|| "unknown".to_owned()),
+                            }
+                        ),
+                    };
                     out.writeln_str(&format!(
                         "{:<7} {:#06x}   {:<5} {:<5} {:<7} {:<36} {}",
                         bhav.id,
@@ -2100,7 +2114,7 @@ mod tests {
             fail_after_bytes: 0,
             written: 0,
         });
-        let resolved = ResolvedArities::private_only(&iff, "test");
+        let resolved = FileArities::private_only(&iff, "test");
         let res = emit_lifted_bhavs(
             &iff,
             &chunks,

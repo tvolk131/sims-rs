@@ -11,11 +11,19 @@
 //! - `4096..=8191` (private): the owner object's own IFF.
 //! - `8192..` (semi-global): the IFF the owner's `GLOB` chunk links to.
 //!
-//! An object IFF's trees run with that object as owner, so its private and semi-global
-//! ranges are known. `Global.iff` and semi-global IFFs run under whichever object called
-//! them, so their owner-dependent ranges stay unknown (a semi-global IFF does know its own
-//! semi-global range: every owner that reaches it links to it). Unknown arities make the
-//! lifter keep the labeled-CFG layout, which is always sound.
+//! The same table, applied to the *calling* tree's own ID, says which file a running
+//! tree came from and therefore which owner it runs under ([`CallerScope`]):
+//!
+//! - A `256..=4095` tree runs only from `Global.iff`, under the calling object: its
+//!   private and semi-global callees are owner-dependent.
+//! - A `4096..=8191` tree runs only as its own file's private tree, so that file is the
+//!   code owner: private callees are its own, semi-global callees come from *its* `GLOB`
+//!   link (none: the VM has no semi-global library and traps).
+//! - An `8192+` tree runs only as the semi-global library of an object linking to its
+//!   file: semi-global callees are that file's own, private callees are the caller's.
+//!
+//! A tree outside those cases never runs, and its owner-dependent ranges stay unknown.
+//! Unknown arities make the lifter keep the labeled-CFG layout, which is always sound.
 //!
 //! [`InstallArityCatalog`] resolves those files through `sims_content`'s [`Catalog`] (the
 //! same index, catalog, and `GLOB` links the VM boots from). The `structured_equiv` corpus
@@ -23,10 +31,12 @@
 //!
 //! Roles are inferred only for a positively identified file: one under the install root
 //! that matches exactly one index entry by file identity ([`ResourceMatch::Unique`]).
-//! Anything else gets [`ResolvedArities::no_role`], with every range unknown.
+//! Anything else gets [`FileArities::no_role`], with every range unknown. A global or
+//! semi-global library supplies arities only if it is a regular file the VM's own
+//! library loader (`sims_vm::load_library`) accepts.
 
 use crate::verify::bhav_param_limit;
-use sims_content::{ArchivePool, Catalog, Index, Install};
+use sims_content::{ArchivePool, Catalog, Index, Install, Resource};
 use sims_formats::behavior::Behavior;
 use sims_formats::iff::Iff;
 use std::collections::BTreeMap;
@@ -133,6 +143,16 @@ pub const NO_ROLE_HINT: &str = "pass --no-catalog to use this file's own private
      --globals <Global.iff> or --semiglobal <file.iff> for the others";
 
 impl ResolvedArities {
+    fn unset() -> Self {
+        Self {
+            arities: BTreeMap::new(),
+            private: ArityPart::missing("unset"),
+            global: ArityPart::missing("unset"),
+            semi_global: ArityPart::missing("unset"),
+            hint: None,
+        }
+    }
+
     /// No code-owner role could be inferred for the file (`why`): every range is unknown,
     /// because even its private calls may belong to a calling object (a semi-global's
     /// `4096+` calls do).
@@ -223,6 +243,130 @@ impl ResolvedArities {
             out.push_str(hint);
         }
         out
+    }
+}
+
+/// Which dispatch a calling tree runs under, from its own ID: the VM finds a running
+/// tree with the same owner table it uses for callees (`behavior_from_owner`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CallerScope {
+    /// `256..=4095`: a `Global.iff` tree, run under the calling object.
+    Global,
+    /// `4096..=8191`: the owner object's own tree.
+    Private,
+    /// `8192+`: a tree of the owner's semi-global library.
+    SemiGlobal,
+}
+
+impl CallerScope {
+    pub const ALL: [Self; 3] = [Self::Global, Self::Private, Self::SemiGlobal];
+
+    /// The scope a tree with ID `tree` runs in.
+    #[must_use]
+    pub fn of(tree: u16) -> Self {
+        if PRIVATE_TREES.contains(&tree) {
+            Self::Private
+        } else if SEMI_GLOBAL_TREES.contains(&tree) {
+            Self::SemiGlobal
+        } else {
+            Self::Global
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Global => "trees 256..=4095",
+            Self::Private => "trees 4096..=8191",
+            Self::SemiGlobal => "trees 8192+",
+        }
+    }
+}
+
+/// Callee arities for one file's trees, per [`CallerScope`] of the calling tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileArities {
+    global: ResolvedArities,
+    private: ResolvedArities,
+    semi_global: ResolvedArities,
+}
+
+impl FileArities {
+    /// The same arities for every calling tree.
+    #[must_use]
+    pub fn uniform(arities: ResolvedArities) -> Self {
+        Self {
+            global: arities.clone(),
+            private: arities.clone(),
+            semi_global: arities,
+        }
+    }
+
+    /// See [`ResolvedArities::no_role`].
+    #[must_use]
+    pub fn no_role(why: &str) -> Self {
+        Self::uniform(ResolvedArities::no_role(why))
+    }
+
+    /// See [`ResolvedArities::private_only`].
+    #[must_use]
+    pub fn private_only(iff: &Iff, why_missing: &str) -> Self {
+        Self::uniform(ResolvedArities::private_only(iff, why_missing))
+    }
+
+    /// The arities for calling trees in `scope`.
+    #[must_use]
+    pub fn for_scope(&self, scope: CallerScope) -> &ResolvedArities {
+        match scope {
+            CallerScope::Global => &self.global,
+            CallerScope::Private => &self.private,
+            CallerScope::SemiGlobal => &self.semi_global,
+        }
+    }
+
+    /// The arities for the calling tree `tree`.
+    #[must_use]
+    pub fn for_tree(&self, tree: u16) -> &ResolvedArities {
+        self.for_scope(CallerScope::of(tree))
+    }
+
+    fn each_mut(&mut self) -> [&mut ResolvedArities; 3] {
+        [&mut self.global, &mut self.private, &mut self.semi_global]
+    }
+
+    /// Replaces the global range for every calling tree.
+    pub fn set_global(&mut self, arities: &BTreeMap<u16, usize>, source: &AritySource) {
+        for scope in self.each_mut() {
+            scope.set_global(arities, source.clone());
+        }
+    }
+
+    /// Replaces the semi-global range for every calling tree.
+    pub fn set_semi_global(&mut self, arities: &BTreeMap<u16, usize>, source: &AritySource) {
+        for scope in self.each_mut() {
+            scope.set_semi_global(arities, source.clone());
+        }
+    }
+
+    /// One line naming every range's source for the calling trees `trees` (all scopes
+    /// when empty). When those trees' scopes resolve differently, each scope is shown
+    /// as `for trees …: …`, separated by ` | `.
+    #[must_use]
+    pub fn describe_for(&self, trees: &[u16]) -> String {
+        let mut scopes: Vec<CallerScope> = trees.iter().map(|&t| CallerScope::of(t)).collect();
+        scopes.sort_unstable();
+        scopes.dedup();
+        if scopes.is_empty() {
+            scopes = CallerScope::ALL.to_vec();
+        }
+        let first = self.for_scope(scopes[0]);
+        if scopes.iter().all(|&s| self.for_scope(s) == first) {
+            return first.describe();
+        }
+        scopes
+            .iter()
+            .map(|&s| format!("for {}: {}", s.label(), self.for_scope(s).describe()))
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 }
 
@@ -338,20 +482,8 @@ impl InstallArityCatalog {
             }
         }
 
-        let global_resource = &index.resources[catalog.global];
-        let global_location = global_resource.location(&index.root);
-        let global = global_resource
-            .read_with(&pool)
-            .map_err(|e| {
-                format!(
-                    "failed to read {global_location}: {}",
-                    relative(e.to_string())
-                )
-            })
-            .and_then(|bytes| {
-                Iff::parse(bytes).map_err(|e| format!("failed to parse {global_location}: {e}"))
-            })
-            .map(|iff| bhav_arities_in_range(&iff, GLOBAL_TREES));
+        let global_location = index.resources[catalog.global].location(&index.root);
+        let global = library_arities(&index, &pool, catalog.global, true, GLOBAL_TREES);
         Ok(Self {
             root_canonical: std::fs::canonicalize(root).ok(),
             index,
@@ -440,41 +572,25 @@ impl InstallArityCatalog {
     }
 
     fn semi_arities(&mut self, semi_res: usize) -> Result<BTreeMap<u16, usize>, String> {
-        let index = &self.index;
-        let pool = &self.pool;
+        let is_global = semi_res == self.catalog.global;
+        let (index, pool) = (&self.index, &self.pool);
         self.semi_cache
             .entry(semi_res)
-            .or_insert_with(|| {
-                let resource = &index.resources[semi_res];
-                let location = resource.location(&index.root);
-                resource
-                    .read_with(pool)
-                    .map_err(|e| {
-                        format!("failed to read {location}: {e}")
-                            .replace(&*index.root.to_string_lossy(), "<install>")
-                    })
-                    .and_then(|b| {
-                        Iff::parse(b).map_err(|e| format!("failed to parse {location}: {e}"))
-                    })
-                    .map(|semi_iff| bhav_arities_in_range(&semi_iff, SEMI_GLOBAL_TREES))
-            })
+            .or_insert_with(|| library_arities(index, pool, semi_res, is_global, SEMI_GLOBAL_TREES))
             .clone()
     }
 
-    /// Merged arities for `iff`, matched to the index as `matched`, following the
-    /// code-owner rules in the module docs. Catalog-derived arities (and the claim that
-    /// private calls are local) apply only to a [`ResourceMatch::Unique`] file of a
-    /// complete catalog; anything else has no inferred role, and every range is unknown.
-    pub fn resolve(&mut self, matched: ResourceMatch, iff: &Iff) -> ResolvedArities {
-        if let Err(why) = &self.global {
-            return ResolvedArities::no_role(&format!("install catalog incomplete: {why}"));
-        }
+    /// Merged arities for `iff`, matched to the index as `matched`, per calling tree,
+    /// following the code-owner rules in the module docs. Catalog-derived arities (and
+    /// the claim that private calls are local) apply only to a [`ResourceMatch::Unique`]
+    /// file; anything else has no inferred role, and every range is unknown.
+    pub fn resolve(&mut self, matched: ResourceMatch, iff: &Iff) -> FileArities {
         match matched {
             ResourceMatch::Unique(resource) => self.resolve_entry(resource, iff),
             ResourceMatch::OutsideInstall => {
-                ResolvedArities::no_role("file resolves outside the install root")
+                FileArities::no_role("file resolves outside the install root")
             }
-            ResourceMatch::Unindexed => ResolvedArities::no_role("file not in install index"),
+            ResourceMatch::Unindexed => FileArities::no_role("file not in install index"),
             ResourceMatch::Ambiguous(entries) => {
                 let mut locations: Vec<String> = entries
                     .iter()
@@ -485,7 +601,7 @@ impl InstallArityCatalog {
                     locations.truncate(3);
                     locations.push(format!("{more} more"));
                 }
-                ResolvedArities::no_role(&format!(
+                FileArities::no_role(&format!(
                     "the same file is indexed as {}",
                     locations.join(" and ")
                 ))
@@ -495,7 +611,7 @@ impl InstallArityCatalog {
                 if paths.len() > 3 {
                     shown.push_str(&format!(" and {} more", paths.len() - 3));
                 }
-                ResolvedArities::no_role(&format!(
+                FileArities::no_role(&format!(
                     "{} install index path(s) that could be this file could not be identified: {shown}",
                     paths.len()
                 ))
@@ -503,70 +619,76 @@ impl InstallArityCatalog {
         }
     }
 
-    /// Merged arities for `iff` as the index resource `resource`.
-    fn resolve_entry(&mut self, resource: usize, iff: &Iff) -> ResolvedArities {
+    /// Merged arities for `iff` as the index resource `resource`, per calling tree.
+    fn resolve_entry(&mut self, resource: usize, iff: &Iff) -> FileArities {
         let is_global = resource == self.catalog.global;
-        let linked_by_others = self
+        let linked = self
             .catalog
             .semi_globals
-            .iter()
-            .any(|(&owner, &target)| owner != resource && target == Some(resource));
+            .values()
+            .any(|&target| target == Some(resource));
         let own_link = self.catalog.semi_globals.get(&resource).copied();
-
-        let mut resolved = ResolvedArities {
-            arities: BTreeMap::new(),
-            private: ArityPart::missing("unset"),
-            global: ArityPart::missing("unset"),
-            semi_global: ArityPart::missing("unset"),
-            hint: None,
+        let with_global = |this: &Self| {
+            let mut scope = ResolvedArities::unset();
+            this.apply_global(&mut scope);
+            scope
         };
-        self.apply_global(&mut resolved);
 
-        if is_global {
-            resolved.private =
-                ArityPart::missing("owner-dependent: Global.iff runs under the calling object");
-        } else if linked_by_others {
-            resolved.private = ArityPart::missing(
+        // 256..=4095 trees run only from Global.iff, under the calling object.
+        let mut global = with_global(self);
+        let why = if is_global {
+            "owner-dependent: Global.iff runs under the calling object"
+        } else {
+            "never runs: the VM runs trees 256..=4095 only from Global.iff"
+        };
+        global.private = ArityPart::missing(why);
+        global.semi_global = ArityPart::missing(why);
+
+        // 4096..=8191 trees run only as this file's own private trees: this file is the
+        // code owner, and its own GLOB link is the semi-global library.
+        let mut private = with_global(self);
+        private.set_private(
+            &bhav_arities_in_range(iff, PRIVATE_TREES),
+            AritySource::ThisFile,
+        );
+        match own_link {
+            Some(Some(target)) => match self.semi_arities(target) {
+                Ok(map) => {
+                    let location = self.index.resources[target].location(&self.index.root);
+                    private.set_semi_global(&map, AritySource::Catalog(location));
+                }
+                Err(why) => private.semi_global = ArityPart::missing(&why),
+            },
+            Some(None) => private.semi_global = ArityPart::missing("GLOB link empty"),
+            None => private.semi_global = ArityPart::missing("no resolved GLOB link"),
+        }
+
+        // 8192+ trees run only as the semi-global library of an object linking here,
+        // under that object: semi-global callees are this file's, private ones the
+        // caller's.
+        let mut semi_global = with_global(self);
+        if linked {
+            semi_global.private = ArityPart::missing(
                 "owner-dependent: semi-global file runs under the calling object",
             );
+            match self.semi_arities(resource) {
+                Ok(map) => semi_global.set_semi_global(
+                    &map,
+                    AritySource::ThisFileBecause("linked as a semi-global".to_owned()),
+                ),
+                Err(why) => semi_global.semi_global = ArityPart::missing(&why),
+            }
         } else {
-            resolved.set_private(
-                &bhav_arities_in_range(iff, PRIVATE_TREES),
-                AritySource::ThisFile,
-            );
+            let why = "never runs: no object links to this file as its semi-global";
+            semi_global.private = ArityPart::missing(why);
+            semi_global.semi_global = ArityPart::missing(why);
         }
 
-        match (is_global, own_link) {
-            (true, _) => {
-                resolved.semi_global =
-                    ArityPart::missing("owner-dependent: Global.iff runs under the calling object");
-            }
-            (false, Some(Some(target))) if !linked_by_others || target == resource => {
-                match self.semi_arities(target) {
-                    Ok(map) => {
-                        let location = self.index.resources[target].location(&self.index.root);
-                        resolved.set_semi_global(&map, AritySource::Catalog(location));
-                    }
-                    Err(why) => resolved.semi_global = ArityPart::missing(&why),
-                }
-            }
-            (false, Some(Some(_))) => {
-                resolved.semi_global = ArityPart::missing(
-                    "ambiguous: linked as a semi-global by other objects and has its own GLOB link",
-                );
-            }
-            (false, _) if linked_by_others => {
-                resolved.set_semi_global(
-                    &bhav_arities_in_range(iff, SEMI_GLOBAL_TREES),
-                    AritySource::ThisFileBecause("linked as a semi-global".to_owned()),
-                );
-            }
-            (false, Some(None)) => resolved.semi_global = ArityPart::missing("GLOB link empty"),
-            (false, None) => {
-                resolved.semi_global = ArityPart::missing("no resolved GLOB link");
-            }
+        FileArities {
+            global,
+            private,
+            semi_global,
         }
-        resolved
     }
 
     fn apply_global(&self, resolved: &mut ResolvedArities) {
@@ -577,6 +699,35 @@ impl InstallArityCatalog {
             Err(why) => resolved.global = ArityPart::missing(why),
         }
     }
+}
+
+/// `range` arities of the library at index resource `resource`, or why it supplies none:
+/// it must be a regular file (checked before any open, so a FIFO cannot block) that the
+/// VM's own library loader accepts. Errors name paths relative to the install.
+fn library_arities(
+    index: &Index,
+    pool: &ArchivePool,
+    resource: usize,
+    is_global: bool,
+    range: RangeInclusive<u16>,
+) -> Result<BTreeMap<u16, usize>, String> {
+    let file: &Resource = &index.resources[resource];
+    let location = file.location(&index.root);
+    let relative = |e: String| e.replace(&*index.root.to_string_lossy(), "<install>");
+    if !file.is_inline() {
+        match std::fs::metadata(&file.path) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Err(format!("failed to read {location}: not a regular file")),
+            Err(e) => return Err(format!("failed to read {location}: {e}")),
+        }
+    }
+    sims_vm::load_library(index, resource, is_global, pool)
+        .map_err(|e| relative(format!("the VM would not load {location}: {e}")))?;
+    let bytes = file
+        .read_with(pool)
+        .map_err(|e| relative(format!("failed to read {location}: {e}")))?;
+    let iff = Iff::parse(bytes).map_err(|e| format!("failed to parse {location}: {e}"))?;
+    Ok(bhav_arities_in_range(&iff, range))
 }
 
 #[cfg(test)]

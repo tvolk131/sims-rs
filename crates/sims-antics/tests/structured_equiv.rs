@@ -87,9 +87,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
             continue;
         };
 
-        let iff_arities = arity_catalog
-            .resolve(ResourceMatch::Unique(resource_index), &iff)
-            .arities;
+        let file_arities = arity_catalog.resolve(ResourceMatch::Unique(resource_index), &iff);
 
         let is_fridges = name
             .rsplit(['/', '\\'])
@@ -112,8 +110,10 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
             if is_fridges {
                 fridges_total += 1;
             }
+            // Callee arities depend on the scope the calling tree runs in.
+            let iff_arities = &file_arities.for_tree(bhav.id).arities;
 
-            match lift_bhav_structured_with_arities(&bhav, strict_lift, Some(&iff_arities)) {
+            match lift_bhav_structured_with_arities(&bhav, strict_lift, Some(iff_arities)) {
                 StructuredLiftOutcome::Lifted(source_text) => {
                     lifted_structured += 1;
                     if is_fridges {
@@ -142,7 +142,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                         &bhav,
                         recompiled,
                         &opts,
-                        Some(&iff_arities),
+                        Some(iff_arities),
                     ) {
                         EquivResult::Equivalent { .. } => {
                             verified_equivalent += 1;
@@ -171,7 +171,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                         lift_bhav_structured_with_context(
                             &bhav,
                             annotated_lift,
-                            Some(&iff_arities),
+                            Some(iff_arities),
                             Some(&lift_symbols),
                         )
                     {
@@ -183,7 +183,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                                         &bhav,
                                         re_ann,
                                         &opts,
-                                        Some(&iff_arities),
+                                        Some(iff_arities),
                                     ),
                                     EquivResult::Equivalent { .. }
                                 ) {
@@ -206,7 +206,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
 
                     // Also verify `--relax-padding` (`strict_padding: false`) compiles & proves Equivalent.
                     if let StructuredLiftOutcome::Lifted(relaxed_src) =
-                        lift_bhav_structured_with_arities(&bhav, relaxed_lift, Some(&iff_arities))
+                        lift_bhav_structured_with_arities(&bhav, relaxed_lift, Some(iff_arities))
                     {
                         if !relaxed_src.contains("op 0x") {
                             lifted_relaxed_pure_high_level += 1;
@@ -221,7 +221,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                                     &bhav,
                                     re_relaxed,
                                     &opts,
-                                    Some(&iff_arities),
+                                    Some(iff_arities),
                                 ) {
                                     EquivResult::Equivalent { .. } => {
                                         verified_relaxed_equivalent += 1;
@@ -285,7 +285,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                         let labeled_src = format_bhav_labeled_air_with_context(
                             &bhav,
                             l_opts,
-                            Some(&iff_arities),
+                            Some(iff_arities),
                             Some(&lift_symbols),
                         );
                         match compile_antics(&labeled_src) {
@@ -295,7 +295,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                                     &bhav,
                                     re_labeled,
                                     &opts,
-                                    Some(&iff_arities),
+                                    Some(iff_arities),
                                 ) {
                                     EquivResult::Equivalent { .. } => {
                                         *counter += 1;
