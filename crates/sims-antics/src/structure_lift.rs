@@ -8,7 +8,7 @@
 
 use crate::ir::BhavChunk;
 use crate::lower::{TARGET_ERROR, TARGET_FALSE, TARGET_TRUE};
-use crate::verify::is_always_true_instruction;
+use crate::verify::{canonicalize_primitive_operands, is_always_true_instruction};
 use sims_formats::behavior::Instruction;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write;
@@ -581,6 +581,27 @@ enum DecodedIns {
     },
 }
 
+impl DecodedIns {
+    /// A linear primitive written `head;` in every mode.
+    fn always_true(head: String) -> Self {
+        Self::AlwaysTrue {
+            structured_stmt: format!("{head};"),
+            labeled_head: head,
+        }
+    }
+
+    /// A branching (non-call) primitive whose text is the same as statement, condition
+    /// and labeled head.
+    fn branching(expr: String) -> Self {
+        Self::Branching {
+            stmt_form: Some(format!("{expr};")),
+            labeled_head: expr.clone(),
+            cond_text: expr,
+            is_call: false,
+        }
+    }
+}
+
 fn format_raw_op(ins: &Instruction) -> String {
     let [b0, b1, b2, b3, b4, b5, b6, b7] = ins.operands;
     format!(
@@ -595,9 +616,16 @@ fn try_decode_instruction(
     max_locals: usize,
     opts: LiftOptions,
 ) -> Option<DecodedIns> {
-    let ops = &ins.operands;
     let opcode = ins.opcode;
     let strict = opts.strict_padding;
+    // Strict lifting keeps every operand bit, rejecting bytes `.air` cannot spell. Relaxed
+    // lifting first drops the bits the VM ignores, with the same normalization the
+    // equivalence checker uses, so the arms below never mask bits themselves.
+    let ops = &if strict {
+        ins.operands
+    } else {
+        canonicalize_primitive_operands(opcode, ins.operands)
+    };
     match opcode {
         0 => {
             if strict && ops[2..8] != [0; 6] {
@@ -608,10 +636,7 @@ fn try_decode_instruction(
                 return None;
             }
             let head = format!("sleep(param[{p}])");
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         1 => {
             if strict && ops[2..8] != [0; 6] {
@@ -619,12 +644,7 @@ fn try_decode_instruction(
             }
             let routine = word_u16(ops, 0);
             let expr = format!("generic_call({routine})");
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         2 => {
             if strict && ops[4] != 0 {
@@ -687,36 +707,21 @@ fn try_decode_instruction(
                 return None;
             }
             let expr = "find_best_interaction()".to_owned();
-            Some(DecodedIns::Branching {
-                stmt_form: Some("find_best_interaction();".to_owned()),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         4 => {
             if strict && *ops != [0; 8] {
                 return None;
             }
             let expr = "grab()".to_owned();
-            Some(DecodedIns::Branching {
-                stmt_form: Some("grab();".to_owned()),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         5 => {
             if strict && *ops != [0; 8] {
                 return None;
             }
             let expr = "drop()".to_owned();
-            Some(DecodedIns::Branching {
-                stmt_form: Some("drop();".to_owned()),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         6 => {
             if strict && (ops[2] > 1 || ops[3..8] != [0; 5]) {
@@ -730,10 +735,7 @@ fn try_decode_instruction(
             } else {
                 format!("change_suit(index: {index}, scope: {scope})")
             };
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         7 => {
             if strict && ops[4..8] != [0; 4] {
@@ -742,10 +744,7 @@ fn try_decode_instruction(
             let target = word_u16(ops, 0);
             let mode = word_u16(ops, 2);
             let head = format!("refresh(target: {target}, mode: {mode})");
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         8 => {
             let dst_idx = word_i16(ops, 0);
@@ -758,42 +757,21 @@ fn try_decode_instruction(
             let dst = format_operand(dst_scope as u8, dst_idx, max_args, max_locals)?;
             let rng = format_operand(rng_scope as u8, rng_idx, max_args, max_locals)?;
             let expr = format!("random({dst}, {rng})");
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         9 => {
             if strict && ops[2..8] != [0; 6] {
                 return None;
             }
-            let mode = if strict {
-                ops[0]
-            } else {
-                u8::from(ops[0] == 1)
-            };
-            let flags = if strict { ops[1] } else { ops[1] & 1 };
-            let expr = format!("burn(mode: {mode}, flags: {flags})");
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            let expr = format!("burn(mode: {}, flags: {})", ops[0], ops[1]);
+            Some(DecodedIns::branching(expr))
         }
         10 => {
             if strict && ops[1..8] != [0; 7] {
                 return None;
             }
             let expr = format!("tutorial({})", ops[0]);
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         11 => {
             let temp = word_i16(ops, 0);
@@ -803,7 +781,7 @@ fn try_decode_instruction(
             if strict && ops[6..8] != [0; 2] {
                 return None;
             }
-            let flags = if strict { ops[2] } else { ops[2] & 1 };
+            let flags = ops[2];
             let head = if flags & 1 != 0 {
                 let from = format_operand(ops[3], word_i16(ops, 4), max_args, max_locals)?;
                 if flags == 1 {
@@ -821,10 +799,7 @@ fn try_decode_instruction(
                     format!("get_distance_to(temp[{temp}], flags: {flags})")
                 }
             };
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         12 => {
             let dst_scope = word_u16(ops, 2);
@@ -832,7 +807,7 @@ fn try_decode_instruction(
                 return None;
             }
             let dst = format_operand(dst_scope as u8, word_i16(ops, 0), max_args, max_locals)?;
-            let flags = if strict { ops[4] } else { ops[4] & 1 };
+            let flags = ops[4];
             let head = if flags & 1 != 0 {
                 let from = format_operand(ops[5], word_i16(ops, 6), max_args, max_locals)?;
                 if flags == 1 {
@@ -850,10 +825,7 @@ fn try_decode_instruction(
                     format!("get_direction_to({dst}, flags: {flags})")
                 }
             };
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         13 => {
             if strict && ops[5..8] != [0; 3] {
@@ -862,8 +834,8 @@ fn try_decode_instruction(
             let menu = ops[0];
             let object_slot = ops[1];
             let priority = ops[2];
-            let flags = if strict { ops[3] } else { ops[3] & 0x0F };
-            let icon = if strict || flags & 1 != 0 { ops[4] } else { 0 };
+            let flags = ops[3];
+            let icon = ops[4];
             if flags & 2 != 0 {
                 if usize::from(object_slot) >= max_locals {
                     return None;
@@ -881,12 +853,7 @@ fn try_decode_instruction(
                 let _ = write!(expr, ", icon: {icon}");
             }
             expr.push(')');
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         14 => {
             if strict && ops[7] != 0 {
@@ -908,12 +875,7 @@ fn try_decode_instruction(
                 }
                 format!("find_best_object({func}, flags: {flags})")
             };
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         15 => {
             if strict && ops[4..8] != [0; 4] {
@@ -925,18 +887,15 @@ fn try_decode_instruction(
             }
             let cond = format_operand(scope as u8, word_i16(ops, 0), max_args, max_locals)?;
             let head = format!("breakpoint({cond})");
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         16 => {
             if strict && ops[3..8] != [0; 5] {
                 return None;
             }
             let mode = ops[0];
-            let flags = if strict { ops[2] } else { ops[2] & 7 };
-            let local = if strict || flags & 1 != 0 { ops[1] } else { 0 };
+            let flags = ops[2];
+            let local = ops[1];
             if flags & 1 != 0 && usize::from(local) >= max_locals {
                 return None;
             }
@@ -946,17 +905,9 @@ fn try_decode_instruction(
             }
             expr.push(')');
             if mode == 1 {
-                Some(DecodedIns::AlwaysTrue {
-                    structured_stmt: format!("{expr};"),
-                    labeled_head: expr,
-                })
+                Some(DecodedIns::always_true(expr))
             } else {
-                Some(DecodedIns::Branching {
-                    stmt_form: Some(format!("{expr};")),
-                    labeled_head: expr.clone(),
-                    cond_text: expr,
-                    is_call: false,
-                })
+                Some(DecodedIns::branching(expr))
             }
         }
         17 => {
@@ -969,12 +920,7 @@ fn try_decode_instruction(
             }
             let allow_push = word_u16(ops, 2);
             let expr = format!("idle_for_input(param[{p}], {allow_push})");
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         18 => {
             if strict && ops[3..8] != [0; 5] {
@@ -986,12 +932,7 @@ fn try_decode_instruction(
             }
             let flags = ops[2];
             let expr = format!("remove_object({target}, flags: {flags})");
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         19 => {
             if strict && ops[4..8] != [0; 4] {
@@ -1010,12 +951,7 @@ fn try_decode_instruction(
             let expr = format!(
                 "make_new_character(skin: {skin}, age: {age}, sex: {sex}, species: {species})"
             );
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         20 => {
             if strict && (ops[2] > 1 || ops[3..8] != [0; 5]) {
@@ -1024,12 +960,7 @@ fn try_decode_instruction(
             let func = word_u16(ops, 0);
             let change_icon = ops[2] & 1 != 0;
             let expr = format!("run_functional_tree({func}, change_icon: {change_icon})");
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         21 => {
             if strict && ops[4..8] != [0; 4] {
@@ -1038,10 +969,7 @@ fn try_decode_instruction(
             let table = word_u16(ops, 0);
             let index = word_u16(ops, 2);
             let head = format!("show_string(table: {table}, index: {index})");
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         22 => {
             if strict && ops[2..8] != [0; 6] {
@@ -1050,17 +978,9 @@ fn try_decode_instruction(
             let mode = word_i16(ops, 0);
             let expr = format!("look_towards({mode})");
             if mode == 0 {
-                Some(DecodedIns::AlwaysTrue {
-                    structured_stmt: format!("{expr};"),
-                    labeled_head: expr,
-                })
+                Some(DecodedIns::always_true(expr))
             } else {
-                Some(DecodedIns::Branching {
-                    stmt_form: Some(format!("{expr};")),
-                    labeled_head: expr.clone(),
-                    cond_text: expr,
-                    is_call: false,
-                })
+                Some(DecodedIns::branching(expr))
             }
         }
         23 => {
@@ -1068,24 +988,12 @@ fn try_decode_instruction(
                 return None;
             }
             let sound_id = word_u16(ops, 0);
-            let head = if strict {
-                match ops[4] {
-                    0 => format!("play_sound({sound_id})"),
-                    2 => format!("play_sound({sound_id}, stack_obj)"),
-                    f => format!("play_sound({sound_id}, flags: {f})"),
-                }
-            } else {
-                let use_stack = ops[4] != 0xFF && ops[4] & 2 != 0;
-                if use_stack {
-                    format!("play_sound({sound_id}, stack_obj)")
-                } else {
-                    format!("play_sound({sound_id})")
-                }
+            let head = match ops[4] {
+                0 => format!("play_sound({sound_id})"),
+                2 => format!("play_sound({sound_id}, stack_obj)"),
+                f => format!("play_sound({sound_id}, flags: {f})"),
             };
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         24 => {
             if strict && (ops[0] > 1 || ops[5..8] != [0; 3]) {
@@ -1095,7 +1003,7 @@ fn try_decode_instruction(
             let col = ops[1];
             let param = ops[2] as i8;
             let dir = ops[3];
-            let flags = if strict { ops[4] } else { ops[4] & 3 };
+            let flags = ops[4];
             if param < 0 || (param as usize) >= max_args {
                 return None;
             }
@@ -1106,17 +1014,9 @@ fn try_decode_instruction(
                 "old_relationship(write: {write}, column: {col}, param: {param}, dir: {dir}, flags: {flags})"
             );
             if flags & 1 == 0 {
-                Some(DecodedIns::AlwaysTrue {
-                    structured_stmt: format!("{expr};"),
-                    labeled_head: expr,
-                })
+                Some(DecodedIns::always_true(expr))
             } else {
-                Some(DecodedIns::Branching {
-                    stmt_form: Some(format!("{expr};")),
-                    labeled_head: expr.clone(),
-                    cond_text: expr,
-                    is_call: false,
-                })
+                Some(DecodedIns::branching(expr))
             }
         }
         25 => {
@@ -1149,12 +1049,7 @@ fn try_decode_instruction(
             }
             let amount = format_operand(scope, idx, max_args, max_locals)?;
             let expr = format!("alter_budget({amount}, category: {category}, flags: {flags})");
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         26 => {
             if strict && ops[5] != 0 {
@@ -1162,12 +1057,8 @@ fn try_decode_instruction(
             }
             let col = ops[0];
             let dir = ops[1];
-            let flags = if strict { ops[2] } else { ops[2] & 7 };
-            let local = if strict || matches!(dir, 2 | 3) {
-                ops[3]
-            } else {
-                0
-            };
+            let flags = ops[2];
+            let local = ops[3];
             if matches!(dir, 2 | 3) && usize::from(local) >= max_locals {
                 return None;
             }
@@ -1179,17 +1070,9 @@ fn try_decode_instruction(
             }
             expr.push(')');
             if flags & 1 == 0 {
-                Some(DecodedIns::AlwaysTrue {
-                    structured_stmt: format!("{expr};"),
-                    labeled_head: expr,
-                })
+                Some(DecodedIns::always_true(expr))
             } else {
-                Some(DecodedIns::Branching {
-                    stmt_form: Some(format!("{expr};")),
-                    labeled_head: expr.clone(),
-                    cond_text: expr,
-                    is_call: false,
-                })
+                Some(DecodedIns::branching(expr))
             }
         }
         27 => {
@@ -1198,16 +1081,11 @@ fn try_decode_instruction(
             }
             let location = ops[2] as i8;
             let facing = ops[3];
-            let options = if strict { ops[6] } else { ops[6] & 6 };
+            let options = ops[6];
             let expr = format!(
                 "go_to_relative(location: {location}, facing: {facing}, options: {options})"
             );
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         28 => {
             if strict && (ops[2] > 1 || ops[3] != 0 || ops[6] != 0 || ops[7] != 0) {
@@ -1224,12 +1102,7 @@ fn try_decode_instruction(
             } else {
                 format!("run_tree_by_name(table: {table}, index: {index}, mode: {mode})")
             };
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         29 => {
             if ops[3] & 1 != 0 {
@@ -1237,10 +1110,7 @@ fn try_decode_instruction(
                     return None;
                 }
                 let head = "clear_motive_changes()".to_owned();
-                Some(DecodedIns::AlwaysTrue {
-                    structured_stmt: "clear_motive_changes();".to_owned(),
-                    labeled_head: head,
-                })
+                Some(DecodedIns::always_true(head))
             } else {
                 if strict && ops[3] != 0 {
                     return None;
@@ -1252,10 +1122,7 @@ fn try_decode_instruction(
                 let delta = format_operand(ops[0], word_i16(ops, 4), max_args, max_locals)?;
                 let stop = format_operand(ops[1], word_i16(ops, 6), max_args, max_locals)?;
                 let head = format!("set_motive_change({motive}, {delta}, {stop})");
-                Some(DecodedIns::AlwaysTrue {
-                    structured_stmt: format!("{head};"),
-                    labeled_head: head,
-                })
+                Some(DecodedIns::always_true(head))
             }
         }
         30 => {
@@ -1263,12 +1130,7 @@ fn try_decode_instruction(
                 return None;
             }
             let expr = "gosub_found_action()".to_owned();
-            Some(DecodedIns::Branching {
-                stmt_form: Some("gosub_found_action();".to_owned()),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         31 => {
             let guid = u32::from_le_bytes([ops[0], ops[1], ops[2], ops[3]]);
@@ -1300,12 +1162,7 @@ fn try_decode_instruction(
                 let _ = write!(expr, ", local: {local_byte}");
             }
             expr.push(')');
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         32 => {
             if strict && ops[7] != 0 {
@@ -1314,12 +1171,7 @@ fn try_decode_instruction(
             let guid = u32::from_le_bytes([ops[0], ops[1], ops[2], ops[3]]);
             let object = format_operand(ops[6], word_i16(ops, 4), max_args, max_locals)?;
             let expr = format!("test_object_type({guid:#010x}, {object})");
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         33 => {
             if strict && ops[0..4] != [0; 4] {
@@ -1328,10 +1180,7 @@ fn try_decode_instruction(
             let target = word_u16(ops, 4);
             let mode = word_u16(ops, 6);
             let head = format!("find_worst_motives(target: {target}, mode: {mode})");
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         34 => {
             if strict && ops[5..8] != [0; 3] {
@@ -1339,7 +1188,7 @@ fn try_decode_instruction(
             }
             let mode = ops[0];
             let head = if mode <= 2 {
-                let flags = if strict { ops[4] } else { ops[4] & 1 };
+                let flags = ops[4];
                 let target = format_operand(ops[1], word_i16(ops, 2), max_args, max_locals)?;
                 format!("ui_effect(mode: {mode}, target: {target}, flags: {flags})")
             } else {
@@ -1348,10 +1197,7 @@ fn try_decode_instruction(
                 }
                 format!("ui_effect(mode: {mode})")
             };
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         35 => {
             if strict && ops[6..8] != [0; 2] {
@@ -1368,10 +1214,7 @@ fn try_decode_instruction(
             let head = format!(
                 "special_effect(duration: {duration}, kind: {kind}, size: {size}, flags: {flags}, str_index: {str_index})"
             );
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         36 => {
             if strict && ops[5] & 0x80 != 0 {
@@ -1382,12 +1225,7 @@ fn try_decode_instruction(
                 "dialog(kind: {kind}, message: {}, title: {}, button1: {}, button2: {}, button3: {}, mode4_str: {}, flags: {})",
                 ops[2], ops[6], ops[3], ops[4], ops[0], ops[1], ops[7]
             );
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         37 => {
             let expr = if ops[0] == 1 {
@@ -1402,12 +1240,7 @@ fn try_decode_instruction(
                 }
                 "test_sim_interacting_with()".to_owned()
             };
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         41 => {
             let w0 = word_i16(ops, 0);
@@ -1438,10 +1271,7 @@ fn try_decode_instruction(
                 let _ = write!(head, ", local: {local_byte}");
             }
             head.push(')');
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         42 => {
             if strict && ops[7] != 0 {
@@ -1460,12 +1290,7 @@ fn try_decode_instruction(
             let expr = format!(
                 "create_object({guid:#010x}, mode: {mode}, flags: {flags}, local: {local})"
             );
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         43 => {
             let sk = word_i16(ops, 0);
@@ -1492,12 +1317,7 @@ fn try_decode_instruction(
                 format!("param[{dv}]")
             };
             let expr = format!("drop_onto({src}, {dst})");
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         44 => {
             if strict && (ops[3] != 0 || ops[7] != 0) {
@@ -1524,12 +1344,7 @@ fn try_decode_instruction(
             let expr = format!(
                 "animate(clip: {clip}, table: {table}, flags: {flags}, events: {events}, local: {local})"
             );
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         45 => {
             let slot = word_u16(ops, 0);
@@ -1543,21 +1358,16 @@ fn try_decode_instruction(
             if strict && ops[5..8] != [0; 3] {
                 return None;
             }
-            let flags = if strict { ops[4] } else { ops[4] & 1 };
+            let flags = ops[4];
             let expr = if source == 1 {
                 format!("route_to(slot: {slot}, flags: {flags})")
             } else {
                 format!("route_to(slot: {slot}, source: {source}, flags: {flags})")
             };
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         46 => {
-            let mut slot = word_u16(ops, 0);
+            let slot = word_u16(ops, 0);
             let mode = word_u16(ops, 2);
             if mode > 4 {
                 return None;
@@ -1568,21 +1378,13 @@ fn try_decode_instruction(
             if strict && ops[5..8] != [0; 3] {
                 return None;
             }
-            if !strict && (mode == 1 || mode == 2) {
-                slot = 0;
-            }
             let flags = ops[4];
             let expr = if mode == 3 {
                 format!("snap({slot}, {flags})")
             } else {
                 format!("snap(slot: {slot}, mode: {mode}, flags: {flags})")
             };
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         47 => {
             if strict && ops[6..8] != [0; 2] {
@@ -1606,12 +1408,7 @@ fn try_decode_instruction(
                 }
                 format!("reach(mode: {mode}, moves: {moves})")
             };
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         48 => {
             let raw_target = word_u16(ops, 0);
@@ -1620,20 +1417,14 @@ fn try_decode_instruction(
             }
             let use_stack = raw_target != 0;
             let head = format!("stop_all_sounds({use_stack})");
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         49 => {
             if strict && *ops != [0; 8] {
                 return None;
             }
             let head = "notify_idle()".to_owned();
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: "notify_idle();".to_owned(),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         50 => {
             if strict && (ops[2] != 0 || ops[3] != 0 || ops[5..8] != [0; 3]) {
@@ -1642,10 +1433,7 @@ fn try_decode_instruction(
             let table = word_u16(ops, 0);
             let index = ops[4];
             let head = format!("action_string(table: {table}, index: {index})");
-            Some(DecodedIns::AlwaysTrue {
-                structured_stmt: format!("{head};"),
-                labeled_head: head,
-            })
+            Some(DecodedIns::always_true(head))
         }
         51 => {
             let op = ops[0];
@@ -1655,12 +1443,7 @@ fn try_decode_instruction(
             let expr = format!(
                 "manage_inventory(op: {op}, kind: {kind}, flags: {flags}, guid: {guid:#010x})"
             );
-            Some(DecodedIns::Branching {
-                stmt_form: Some(format!("{expr};")),
-                labeled_head: expr.clone(),
-                cond_text: expr,
-                is_call: false,
-            })
+            Some(DecodedIns::branching(expr))
         }
         id if id >= 256 => {
             let expr = if *ops == [0xFF; 8] {

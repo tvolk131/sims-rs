@@ -3835,7 +3835,7 @@ fn canonicalize_lt(
 }
 
 /// Canonicalizes primitive operands by zeroing verified-ignored padding bytes.
-fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
+pub(crate) fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
     match opcode {
         // Sleep: word 0 (param_index) only (`sleep.rs:29`).
         0 => [ops[0], ops[1], 0, 0, 0, 0, 0, 0],
