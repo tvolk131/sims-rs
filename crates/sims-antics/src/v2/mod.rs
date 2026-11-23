@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Returns `true` if `source` begins with a high-level `.antics` v2 top-level keyword
-/// (`use`, `pub`, `fn`, `template`, `object`) rather than `.air` IR (`bcon`, `str`, `tree`, `interaction`).
+/// (`use`, `pub`, `fn`, `template`, `object`, `enum`, `bitflags`, `extern`) rather than `.air` IR (`bcon`, `str`, `tree`, `interaction`).
 ///
 /// Scans only leading whitespace/comments and the first identifier so v2 files containing
 /// later lexer errors are still routed to the v2 compiler for accurate diagnostics.
@@ -73,7 +73,7 @@ pub fn is_v2_source(source: &str) -> bool {
     }
     matches!(
         &source[start..pos],
-        "use" | "pub" | "fn" | "template" | "object" | "enum" | "bitflags"
+        "use" | "pub" | "fn" | "template" | "object" | "enum" | "bitflags" | "extern"
     )
 }
 

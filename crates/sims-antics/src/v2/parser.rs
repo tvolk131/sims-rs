@@ -5,17 +5,24 @@ use crate::audio::SoundPreset;
 use crate::error::{Error, Result, Span};
 use crate::parser::motive_by_name;
 use crate::v2::ast::{
-    AdvertiseDecl, BitflagVariant, BitflagsDecl, CallArg, ConstIntExpr, EnumDecl, EnumVariant,
-    FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody, GuardDecl, InteractionDecl,
-    LifecycleBlock, MatchArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl, ObjectMember,
-    ParamAssignDecl, ParamDecl, ParamType, ParamValue, SlotDecl, SoundDecl, SpriteDecl, StateDecl,
-    StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, UseDecl, UseItem, V2AssignOp,
-    V2BinOp, V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp,
+    AbiParam, AbiParamSlot, AdvertiseDecl, BconTableDecl, BitflagVariant, BitflagsDecl, CallArg,
+    ConstIntExpr, EnumDecl, EnumVariant, ExternBconDecl, ExternBconEntry, ExternFnDecl,
+    ExternModDecl, FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
+    InteractionDecl, LifecycleBlock, MatchArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl,
+    ObjectMember, ParamAssignDecl, ParamDecl, ParamType, ParamValue, ReturnAbi, SlotDecl,
+    SoundDecl, SpriteDecl, StateDecl, StateInitValue, StateType, StringsDecl, TemplateDecl,
+    TileDecl, TreeMemberDecl, UseDecl, UseItem, V2AssignOp, V2BinOp, V2Expr, V2File, V2Item,
+    V2Stmt, V2Type, V2UnaryOp,
 };
 use crate::v2::lexer::{Token, TokenKind, tokenize};
 use std::collections::BTreeSet;
 
 const MAX_NESTING_DEPTH: usize = 64;
+
+/// Highest explicit `state name @ <slot>` attribute index accepted by the parser.
+pub(crate) const MAX_STATE_SLOT: u16 = 255;
+/// Number of shared per-thread SimAntics temporaries (`temp[0..=7]`).
+const TEMP_COUNT: i64 = 8;
 
 /// Parses a `.antics` v2 source file into a [`V2File`] AST.
 pub fn parse_v2_file(source: &str) -> Result<V2File> {
@@ -211,9 +218,27 @@ impl Parser {
             }
             let is_pub = self.eat_ident("pub");
             let (kw, kw_span) = self.expect_ident(
-                "top-level item ('use', 'fn', 'template', 'object', 'enum', 'bitflags')",
+                "top-level item ('use', 'fn', 'template', 'object', 'enum', 'bitflags', 'extern')",
             )?;
             match kw.as_str() {
+                "extern" => {
+                    let (what, wspan) = self.expect_ident("'mod' or 'bcon' after 'extern'")?;
+                    match what.as_str() {
+                        "mod" => {
+                            items.push(V2Item::ExternMod(self.parse_extern_mod(kw_span, is_pub)?))
+                        }
+                        "bcon" => {
+                            items
+                                .push(V2Item::ExternBcon(self.parse_extern_bcon(kw_span, is_pub)?));
+                        }
+                        other => {
+                            return Err(Error::at(
+                                wspan,
+                                format!("expected 'mod' or 'bcon' after 'extern', found '{other}'"),
+                            ));
+                        }
+                    }
+                }
                 "fn" => items.push(V2Item::Fn(self.parse_fn(kw_span, is_pub)?)),
                 "template" => items.push(V2Item::Template(self.parse_template(kw_span, is_pub)?)),
                 "enum" => items.push(V2Item::Enum(self.parse_enum(kw_span, is_pub)?)),
@@ -232,7 +257,7 @@ impl Parser {
                         kw_span,
                         format!(
                             "unexpected top-level keyword '{other}' in .antics v2 file \
-                             (expected 'use', 'pub', 'fn', 'template', 'enum', 'bitflags', or 'object')"
+                             (expected 'use', 'pub', 'fn', 'template', 'enum', 'bitflags', 'extern', or 'object')"
                         ),
                     ));
                 }
@@ -559,6 +584,363 @@ impl Parser {
         })
     }
 
+    /// Parses `temp[N]` (after `@`) and validates `N` against the 8 SimAntics temporaries.
+    fn parse_temp_slot(&mut self, what: &str) -> Result<u8> {
+        let (kw, kspan) = self.expect_ident("'temp' ABI binding")?;
+        if kw != "temp" {
+            return Err(Error::at(
+                kspan,
+                format!("{what} ABI binding must be 'temp[N]', found '{kw}'"),
+            ));
+        }
+        self.expect(&TokenKind::LBracket, "'['")?;
+        let (v, vspan) = self.parse_signed_int("temp slot")?;
+        self.expect(&TokenKind::RBracket, "']'")?;
+        if !(0..TEMP_COUNT).contains(&v) {
+            return Err(Error::at(
+                vspan,
+                format!(
+                    "{what} temp slot {v} is out of range (SimAntics has temp[0]..=temp[{}])",
+                    TEMP_COUNT - 1
+                ),
+            ));
+        }
+        Ok(v as u8)
+    }
+
+    /// Parses a BHAV-call ABI parameter list `(a: i16, b: i16 @ temp[1], ...)`.
+    /// When `allow_sim` is set, a leading `name: Sim` binds the Sim-on-object context.
+    fn parse_abi_params(
+        &mut self,
+        what: &str,
+        allow_sim: bool,
+    ) -> Result<(Option<String>, Vec<AbiParam>)> {
+        self.expect(&TokenKind::LParen, "'('")?;
+        let mut sim_binding = None;
+        let mut params: Vec<AbiParam> = Vec::new();
+        let mut seen_names = BTreeSet::new();
+        let mut seen_temps: BTreeSet<u8> = BTreeSet::new();
+        let mut first = true;
+        while !self.eat(&TokenKind::RParen) {
+            let (name, span) = self.expect_ident("parameter name")?;
+            if !seen_names.insert(name.clone()) {
+                return Err(Error::at(
+                    span,
+                    format!("duplicate parameter name '{name}'"),
+                ));
+            }
+            self.expect(&TokenKind::Colon, "':'")?;
+            let ty = self.parse_type()?;
+            if ty == V2Type::Sim {
+                if !(allow_sim && first) {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "'{name}: Sim' is only allowed as the first parameter of a 'tree' (it selects the Sim-on-object context)"
+                        ),
+                    ));
+                }
+                sim_binding = Some(name);
+            } else {
+                let slot = if self.eat(&TokenKind::At) {
+                    let t = self.parse_temp_slot(&format!("{what} parameter '{name}'"))?;
+                    if !seen_temps.insert(t) {
+                        return Err(Error::at(
+                            span,
+                            format!(
+                                "duplicate '@ temp[{t}]' binding for parameter '{name}' in {what}"
+                            ),
+                        ));
+                    }
+                    AbiParamSlot::Temp(t)
+                } else {
+                    AbiParamSlot::Positional
+                };
+                if self.peek().kind == TokenKind::Assign {
+                    return Err(Error::at(
+                        span,
+                        format!("{what} parameter '{name}' cannot have a default value"),
+                    ));
+                }
+                params.push(AbiParam {
+                    span,
+                    name,
+                    ty,
+                    slot,
+                });
+            }
+            first = false;
+            if !self.eat(&TokenKind::Comma) {
+                self.expect(&TokenKind::RParen, "')'")?;
+                break;
+            }
+        }
+        Ok((sim_binding, params))
+    }
+
+    /// Parses an optional `-> bool | -> Result | -> T @ temp[N] | -> Result<T @ temp[N]>` ABI.
+    fn parse_return_abi(&mut self, what: &str) -> Result<ReturnAbi> {
+        if !self.eat(&TokenKind::Arrow) {
+            return Ok(ReturnAbi::Void);
+        }
+        let rspan = self.span();
+        if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "Result") {
+            self.bump();
+            if !self.eat(&TokenKind::Lt) {
+                return Ok(ReturnAbi::Result);
+            }
+            let ty = self.parse_type()?;
+            if !self.eat(&TokenKind::At) {
+                return Err(Error::at(
+                    rspan,
+                    format!(
+                        "{what} 'Result<{}>' return requires an explicit '@ temp[N]' binding (e.g. 'Result<i16 @ temp[0]>')",
+                        ty.display_name()
+                    ),
+                ));
+            }
+            let temp = self.parse_temp_slot(&format!("{what} return"))?;
+            self.expect(&TokenKind::Gt, "'>'")?;
+            return Ok(ReturnAbi::ResultValue { ty, temp });
+        }
+        let ty = self.parse_type()?;
+        if self.eat(&TokenKind::At) {
+            let temp = self.parse_temp_slot(&format!("{what} return"))?;
+            return Ok(ReturnAbi::Value { ty, temp });
+        }
+        if ty == V2Type::Bool {
+            return Ok(ReturnAbi::Bool);
+        }
+        Err(Error::at(
+            rspan,
+            format!(
+                "{what} '-> {}' return requires an explicit '@ temp[N]' binding (e.g. '-> {} @ temp[0]')",
+                ty.display_name(),
+                ty.display_name()
+            ),
+        ))
+    }
+
+    /// Parses `extern mod name { @id(N) fn f(...) [-> Abi]; ... }` (after `extern mod`).
+    fn parse_extern_mod(&mut self, span: Span, is_pub: bool) -> Result<ExternModDecl> {
+        let (name, _) = self.expect_ident("extern mod name")?;
+        self.expect(&TokenKind::LBrace, "'{'")?;
+        let mut fns: Vec<ExternFnDecl> = Vec::new();
+        while !self.eat(&TokenKind::RBrace) {
+            let fspan = self.span();
+            let mut id: Option<u16> = None;
+            while self.eat(&TokenKind::At) {
+                let (attr, aspan) = self.expect_ident("attribute name ('id')")?;
+                if attr != "id" {
+                    return Err(Error::at(
+                        aspan,
+                        format!("unknown annotation '@{attr}' on extern fn (expected '@id(N)')"),
+                    ));
+                }
+                self.expect(&TokenKind::LParen, "'('")?;
+                let ispan = self.span();
+                let v = self.expect_u16("BHAV tree id")?;
+                self.expect(&TokenKind::RParen, "')'")?;
+                if !(256..=4095).contains(&v) && v < 8192 {
+                    return Err(Error::at(
+                        ispan,
+                        format!(
+                            "extern BHAV @id({v}) must be a global (256..=4095) or semi-global (8192..) tree"
+                        ),
+                    ));
+                }
+                if id.replace(v).is_some() {
+                    return Err(Error::at(aspan, "duplicate @id annotation"));
+                }
+            }
+            let (kw, kspan) = self.expect_ident("'fn' inside extern mod")?;
+            if kw != "fn" {
+                return Err(Error::at(
+                    kspan,
+                    format!("expected 'fn' inside 'extern mod {name}', found '{kw}'"),
+                ));
+            }
+            let (fname, nspan) = self.expect_ident("extern fn name")?;
+            let Some(id) = id else {
+                return Err(Error::at(
+                    nspan,
+                    format!("extern fn '{name}::{fname}' requires an '@id(N)' BHAV annotation"),
+                ));
+            };
+            if fns.iter().any(|f| f.name == fname) {
+                return Err(Error::at(
+                    nspan,
+                    format!("duplicate extern fn '{fname}' in 'extern mod {name}'"),
+                ));
+            }
+            let what = format!("extern fn '{name}::{fname}'");
+            let (_, params) = self.parse_abi_params(&what, false)?;
+            let ret = self.parse_return_abi(&what)?;
+            self.expect(&TokenKind::Semicolon, "';' after extern fn signature")?;
+            fns.push(ExternFnDecl {
+                span: fspan,
+                id,
+                name: fname,
+                params,
+                ret,
+            });
+        }
+        Ok(ExternModDecl {
+            span,
+            is_pub,
+            name,
+            fns,
+        })
+    }
+
+    /// Parses `extern bcon name { entry @ <address>; entry @ <bcon_id>[<index>]; ... }`.
+    fn parse_extern_bcon(&mut self, span: Span, is_pub: bool) -> Result<ExternBconDecl> {
+        let (name, _) = self.expect_ident("extern bcon name")?;
+        self.expect(&TokenKind::LBrace, "'{'")?;
+        let mut entries: Vec<ExternBconEntry> = Vec::new();
+        while !self.eat(&TokenKind::RBrace) {
+            let (ename, espan) = self.expect_ident("extern bcon entry name")?;
+            if entries.iter().any(|e| e.name == ename) {
+                return Err(Error::at(
+                    espan,
+                    format!("duplicate entry '{ename}' in 'extern bcon {name}'"),
+                ));
+            }
+            self.expect(&TokenKind::At, "'@' (constant address)")?;
+            let aspan = self.span();
+            let (first, _) = self.parse_signed_int("BCON address")?;
+            let address = if self.eat(&TokenKind::LBracket) {
+                let (entry, _) = self.parse_signed_int("BCON entry index")?;
+                self.expect(&TokenKind::RBracket, "']'")?;
+                let table = u16::try_from(first)
+                    .ok()
+                    .and_then(bcon_chunk_table)
+                    .ok_or_else(|| {
+                        Error::at(
+                            aspan,
+                            format!(
+                                "BCON chunk id {first} is not addressable (expected 4096..=4159 private, 8192..=8255 semi-global, or 256..=319 global)"
+                            ),
+                        )
+                    })?;
+                if !(0..=127).contains(&entry) {
+                    return Err(Error::at(
+                        aspan,
+                        format!("BCON entry index {entry} is out of range 0..=127"),
+                    ));
+                }
+                (table << 7) | entry as u16
+            } else {
+                u16::try_from(first)
+                    .ok()
+                    .filter(|&a| (a >> 7) <= 191)
+                    .ok_or_else(|| {
+                        Error::at(
+                            aspan,
+                            format!(
+                                "BCON address {first} is out of range 0..=24575 (table = address >> 7 must be <= 191)"
+                            ),
+                        )
+                    })?
+            };
+            entries.push(ExternBconEntry {
+                span: espan,
+                name: ename,
+                address,
+            });
+            let _ = self.eat(&TokenKind::Semicolon) || self.eat(&TokenKind::Comma);
+        }
+        Ok(ExternBconDecl {
+            span,
+            is_pub,
+            name,
+            entries,
+        })
+    }
+
+    /// Parses a private `bcon <id> "Label" { name = value, ... }` table member.
+    fn parse_bcon_table(&mut self, span: Span) -> Result<BconTableDecl> {
+        let id = self.expect_u16("BCON chunk id")?;
+        let label = match &self.peek().kind {
+            TokenKind::Str(s) | TokenKind::Ident(s) => {
+                let s = s.clone();
+                self.bump();
+                s
+            }
+            other => {
+                return Err(Error::at(
+                    self.span(),
+                    format!("expected BCON table name (e.g. \"LampTuning\"), found {other:?}"),
+                ));
+            }
+        };
+        self.expect(&TokenKind::LBrace, "'{'")?;
+        let mut entries: Vec<(Span, String, i16)> = Vec::new();
+        while !self.eat(&TokenKind::RBrace) {
+            let (ename, espan) = self.expect_ident("BCON entry name")?;
+            self.expect(&TokenKind::Assign, "'='")?;
+            let val = self.expect_i16("BCON constant value")?;
+            entries.push((espan, ename, val));
+            if !self.eat(&TokenKind::Comma) && !self.eat(&TokenKind::Semicolon) {
+                self.expect(&TokenKind::RBrace, "'}'")?;
+                break;
+            }
+        }
+        Ok(BconTableDecl {
+            span,
+            id,
+            label,
+            entries,
+        })
+    }
+
+    /// Parses `tree [ident] ["Label"] [(params)] [-> Abi] { ... }` (after `tree`).
+    fn parse_tree_member(&mut self, span: Span, pinned_id: Option<u16>) -> Result<TreeMemberDecl> {
+        let ident = if let TokenKind::Ident(s) = &self.peek().kind {
+            let s = s.clone();
+            self.bump();
+            Some(s)
+        } else {
+            None
+        };
+        let label = if let TokenKind::Str(s) = &self.peek().kind {
+            let s = s.clone();
+            self.bump();
+            Some(s)
+        } else {
+            None
+        };
+        let (ident, label) = match (ident, label) {
+            (Some(i), Some(l)) => (i, l),
+            (Some(i), None) => (i.clone(), i),
+            (None, Some(l)) => (snake_case_ident(&l), l),
+            (None, None) => {
+                return Err(Error::at(
+                    span,
+                    "'tree' requires a name or a \"Label\" (e.g. 'tree \"CT - Is Fridge\" { ... }')",
+                ));
+            }
+        };
+        let what = format!("tree '{ident}'");
+        let (sim_binding, params) = if self.peek().kind == TokenKind::LParen {
+            self.parse_abi_params(&what, true)?
+        } else {
+            (None, Vec::new())
+        };
+        let ret = self.parse_return_abi(&what)?;
+        let body = self.parse_block()?;
+        Ok(TreeMemberDecl {
+            span,
+            pinned_id,
+            ident,
+            label,
+            sim_binding,
+            params,
+            ret,
+            body,
+        })
+    }
+
     fn parse_template(&mut self, span: Span, is_pub: bool) -> Result<TemplateDecl> {
         let (name, _) = self.expect_ident("template name")?;
         let members = self.parse_object_members()?;
@@ -621,12 +1003,19 @@ impl Parser {
             if (pinned_id.is_some() || pinned_guard_id.is_some())
                 && !matches!(
                     kw.as_str(),
-                    "init" | "main" | "load" | "reset" | "cleanup" | "functional" | "interaction"
+                    "init"
+                        | "main"
+                        | "load"
+                        | "reset"
+                        | "cleanup"
+                        | "functional"
+                        | "interaction"
+                        | "tree"
                 )
             {
                 return Err(Error::at(
                     kw_span,
-                    "@id/@guard_id annotations are only allowed on init, main, load, reset, cleanup, functional, or interaction",
+                    "@id/@guard_id annotations are only allowed on init, main, load, reset, cleanup, functional, interaction, or tree",
                 ));
             }
             if pinned_guard_id.is_some() && !matches!(kw.as_str(), "functional" | "interaction") {
@@ -721,6 +1110,31 @@ impl Parser {
                 }
                 "fn" => {
                     members.push(ObjectMember::Fn(self.parse_fn(kw_span, false)?));
+                }
+                "tree" => {
+                    members.push(ObjectMember::Tree(
+                        self.parse_tree_member(kw_span, pinned_id)?,
+                    ));
+                }
+                "bcon" => {
+                    members.push(ObjectMember::Bcon(self.parse_bcon_table(kw_span)?));
+                }
+                "extern" => {
+                    let (what, wspan) = self.expect_ident("'mod' or 'bcon' after 'extern'")?;
+                    match what.as_str() {
+                        "mod" => members.push(ObjectMember::ExternMod(
+                            self.parse_extern_mod(kw_span, false)?,
+                        )),
+                        "bcon" => members.push(ObjectMember::ExternBcon(
+                            self.parse_extern_bcon(kw_span, false)?,
+                        )),
+                        other => {
+                            return Err(Error::at(
+                                wspan,
+                                format!("expected 'mod' or 'bcon' after 'extern', found '{other}'"),
+                            ));
+                        }
+                    }
                 }
                 "pub" => {
                     let (next, nspan) = self.expect_ident("'fn'")?;
@@ -847,6 +1261,24 @@ impl Parser {
 
     fn parse_state_decl(&mut self, span: Span) -> Result<StateDecl> {
         let (name, _) = self.expect_ident("state field name")?;
+        let slot = if self.eat(&TokenKind::At) {
+            let sspan = self.span();
+            let (v, _) = self.parse_signed_int("state attribute slot")?;
+            let slot = u16::try_from(v)
+                .ok()
+                .filter(|&s| s <= MAX_STATE_SLOT)
+                .ok_or_else(|| {
+                    Error::at(
+                        sspan,
+                        format!(
+                            "state '{name}' attribute slot {v} is out of range 0..={MAX_STATE_SLOT}"
+                        ),
+                    )
+                })?;
+            Some((sspan, slot))
+        } else {
+            None
+        };
         self.expect(&TokenKind::Colon, "':'")?;
         let (ty_name, _ty_span) =
             self.expect_ident("state type ('bool', 'i16', 'ObjectId', enum, or bitflags)")?;
@@ -884,6 +1316,7 @@ impl Parser {
         Ok(StateDecl {
             span,
             name,
+            slot,
             ty,
             init,
         })
@@ -1934,6 +2367,13 @@ impl Parser {
                     if self.eat(&TokenKind::Semicolon) {
                         return Ok(V2Stmt::Return { span, value: None });
                     }
+                    if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "error")
+                        && self.peek_at(1).kind == TokenKind::Semicolon
+                    {
+                        self.bump();
+                        self.bump();
+                        return Ok(V2Stmt::ReturnError { span });
+                    }
                     let expr = self.parse_expr()?;
                     self.expect(&TokenKind::Semicolon, "';'")?;
                     return Ok(V2Stmt::Return {
@@ -2608,6 +3048,22 @@ impl Parser {
                         index: Box::new(index),
                     };
                 }
+                TokenKind::Question => {
+                    let span = self.bump().span;
+                    chain += 1;
+                    if self.depth + chain > MAX_NESTING_DEPTH {
+                        return Err(Error::at(
+                            span,
+                            format!(
+                                "expression nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+                            ),
+                        ));
+                    }
+                    expr = V2Expr::Try {
+                        span,
+                        inner: Box::new(expr),
+                    };
+                }
                 TokenKind::LParen => {
                     let span = self.span();
                     chain += 1;
@@ -2738,6 +3194,44 @@ impl Parser {
             )),
         }
     }
+}
+
+/// Maps an addressable BCON chunk id to its SimAntics operand table index (`address >> 7`),
+/// matching `sims-vm`'s `Program::constant`.
+pub(crate) fn bcon_chunk_table(id: u16) -> Option<u16> {
+    match id {
+        4096..=4159 => Some(id - 4096),
+        8192..=8255 => Some(id - 8192 + 64),
+        256..=319 => Some(id - 256 + 128),
+        _ => None,
+    }
+}
+
+/// Derives a `snake_case` call identifier from a tree label (`"CT - Is Fridge"` -> `ct_is_fridge`).
+pub(crate) fn snake_case_ident(label: &str) -> String {
+    let mut out = String::new();
+    let mut pending_sep = false;
+    let mut prev_lower = false;
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if ch.is_ascii_uppercase() && prev_lower {
+                pending_sep = true;
+            }
+            if pending_sep && !out.is_empty() {
+                out.push('_');
+            }
+            pending_sep = false;
+            prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            pending_sep = true;
+            prev_lower = false;
+        }
+    }
+    if out.is_empty() || out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert_str(0, "tree_");
+    }
+    out
 }
 
 fn default_routing_slot(span: Span, name: String) -> SlotDecl {

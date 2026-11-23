@@ -271,7 +271,32 @@ struct V2VmFixture {
 
 impl V2VmFixture {
     fn from_objects(objects: &[&CompiledObject], starting_funds: i32) -> Self {
+        Self::from_objects_with_libs(objects, starting_funds, None, None)
+    }
+
+    /// Like [`Self::from_objects`], but also compiles synthetic `.air` into the global library
+    /// (BHAV 256..=4095, BCON 256..) and an optional semi-global library (BHAV/BCON 8192..)
+    /// shared by every object.
+    fn from_objects_with_libs(
+        objects: &[&CompiledObject],
+        starting_funds: i32,
+        global_air: Option<&str>,
+        semi_global_air: Option<&str>,
+    ) -> Self {
         const GLOBAL_RES: usize = 0;
+        fn air_library(src: &str) -> Library {
+            let module = compile_air(src).expect("compile synthetic library .air");
+            let mut lib = Library::default();
+            for (&id, bhav) in &module.behaviors {
+                let raw = sims_antics::encode::encode_bhav(bhav).expect("encode_bhav");
+                lib.behaviors.insert(id, Behavior::parse(&raw).unwrap());
+                lib.names.insert(id, bhav.label.clone());
+            }
+            for (&id, bcon) in &module.constants {
+                lib.constants.insert(id, bcon.values.clone());
+            }
+            lib
+        }
 
         let mut catalog = Catalog {
             global: GLOBAL_RES,
@@ -280,7 +305,13 @@ impl V2VmFixture {
             semi_globals: BTreeMap::new(),
             diagnostics: Vec::new(),
         };
-        let mut libraries = BTreeMap::from([(GLOBAL_RES, Library::default())]);
+        let global_lib = global_air.map_or_else(Library::default, air_library);
+        let mut libraries = BTreeMap::from([(GLOBAL_RES, global_lib)]);
+        let semi_res = objects.len() + 2;
+        let semi_link = semi_global_air.map(|src| {
+            libraries.insert(semi_res, air_library(src));
+            semi_res
+        });
         let mut semi_globals = BTreeMap::new();
         let mut ttas_by_guid = BTreeMap::new();
 
@@ -295,7 +326,7 @@ impl V2VmFixture {
             }
             let lib = load_iff_into_vm(&iff, res_id, &mut catalog);
             libraries.insert(res_id, lib);
-            semi_globals.insert(res_id, None);
+            semi_globals.insert(res_id, semi_link);
         }
 
         let sim_res = objects.len() + 1;
@@ -647,6 +678,48 @@ tree 4097 "SimMain" (args: 1) {
             self.world.frame_storage.insert(sim_id, storage);
         }
         res
+    }
+
+    /// Runs `tree` on the Sim with `target_id` as the stack object and `param0`, returning the
+    /// tree's true/false exit or the VM fault (e.g. `Trap::ErrorBranch` from `return error;`).
+    fn try_run_tree(
+        &mut self,
+        target_id: u16,
+        tree: u16,
+        param0: i16,
+    ) -> Result<bool, sims_vm::Fault> {
+        let sim_id = self.sim_id;
+        let target_guid = self.world.objects[&target_id].guid;
+        let code_owner_type = self
+            .world
+            .types
+            .iter()
+            .find_map(|(&ty_id, &guid)| (guid == target_guid).then_some(ty_id as i16))
+            .expect("target object type registered");
+        let saved_stack = self.world.objects[&sim_id].stack.clone();
+        let saved_storage = self.world.frame_storage.remove(&sim_id);
+        self.world.objects.get_mut(&sim_id).unwrap().stack = vec![Frame {
+            stack_object: target_id as i16,
+            tree,
+            node: 0,
+            parameters: vec![param0, 0, 0, 0],
+            locals: vec![0; 16],
+            primitive_state: 0,
+            code_owner_type,
+        }];
+        let vm = Interpreter::new(&self.program, &self.catalog, Stream::Lot);
+        let status = vm.turn(&mut self.world, sim_id, 4_000);
+        self.world.objects.get_mut(&sim_id).unwrap().stack = saved_stack;
+        self.world.frame_storage.remove(&sim_id);
+        if let Some(storage) = saved_storage {
+            self.world.frame_storage.insert(sim_id, storage);
+        }
+        let status = status?;
+        assert!(
+            matches!(status, Status::Returned(_)),
+            "tree must return synchronously, got {status:?}"
+        );
+        Ok(matches!(status, Status::Returned(true)))
     }
 
     fn sim_motive(&self, m: usize) -> f32 {
@@ -6737,4 +6810,448 @@ object "D5" {
             err.message
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// PR C: Maxis interop (`extern mod` / `extern bcon`), sparse states, named BCON
+// tables, and standalone `tree` declarations. All fixtures are synthetic.
+// ---------------------------------------------------------------------------
+
+const INTEROP_LAMP_V2: &str = r#"
+extern mod light_globals {
+    @id(256) fn add(a: i16, b: i16) -> i16 @ temp[0];
+    @id(257) fn is_dark(level: i16 @ temp[4]) -> bool;
+    @id(258) fn try_light(power: i16) -> Result;
+}
+
+extern mod lamp_semi {
+    @id(8192) fn doubled(x: i16) -> Result<i16 @ temp[1]>;
+}
+
+extern bcon light_consts {
+    table_height_flag @ 16521;
+    by_chunk @ 257[3];
+}
+
+object "Interop Lamp" {
+    guid: 0x7F30_0001;
+    state quality: i16 = 3;
+    state glow @ 9: i16;
+    state sum_lit: i16;
+    state sum_tmp: i16;
+    state dark: bool;
+    state flag: i16;
+    state doubled: i16;
+    state scored: i16;
+    state fridge_hits: i16;
+
+    bcon 4097 "LampTuning" {
+        cheap = 10,
+        bright = 25,
+    }
+
+    @id(4143) tree "CT - Is Fridge" {
+        return true;
+    }
+
+    tree score "Quality Score" -> i16 @ temp[0] {
+        if self.quality > 0 {
+            return (self.quality * 24) / 5 + 1;
+        } else {
+            return 0;
+        }
+    }
+
+    tree bump "Bump Hits" (sim: Sim, n: i16) {
+        self.fridge_hits += n;
+    }
+
+    init {
+        self.sum_lit = light_globals::add(2, LampTuning.cheap);
+        let q = self.quality;
+        self.sum_tmp = light_globals::add(q, lamp_tuning.bright);
+        if light_globals::is_dark(level: 4) {
+            self.dark = true;
+        }
+        self.flag = light_consts.table_height_flag;
+        self.doubled = lamp_semi::doubled(self.quality)?;
+        light_globals::try_light(1)?;
+        self.scored = score();
+        if ct_is_fridge() {
+            self.glow = 5;
+        }
+    }
+
+    interaction "Bump" {
+        run(sim) {
+            bump(sim, 2);
+        }
+    }
+}
+"#;
+
+/// Synthetic stand-ins for Maxis global trees/constants (BHAV 256..=258, BCON 257).
+const INTEROP_GLOBAL_AIR: &str = r#"
+bcon 257 "LightConsts" = [0, 0, 0, 33, 0, 0, 0, 0, 0, 77];
+
+tree 256 "Add" (args: 2) {
+    temp[0] := param[0];
+    temp[0] += param[1];
+    return true;
+}
+
+tree 257 "Is Dark" {
+    if temp[4] > 3 {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+tree 258 "Try Light" (args: 1) {
+    if param[0] > 0 {
+        return true;
+    } else {
+        return false;
+    }
+}
+"#;
+
+/// Synthetic semi-global library (BHAV 8192).
+const INTEROP_SEMI_AIR: &str = r#"
+tree 8192 "Doubled" (args: 1) {
+    temp[1] := param[0];
+    temp[1] *= 2;
+    return true;
+}
+"#;
+
+const INTEROP_PROBE_V2: &str = r#"
+object "Interop Probe" {
+    guid: 0x7F30_0002;
+    state quality: i16 = 4;
+    state flag: i16;
+    state got: i16;
+
+    extern mod g {
+        @id(258) fn try_light(power: i16) -> Result;
+    }
+    extern mod s {
+        @id(8192) fn doubled(x: i16) -> Result<i16 @ temp[1]>;
+    }
+
+    @id(4200) tree probe "Probe" (sim: Sim, p: i16) -> Result {
+        g::try_light(p)?;
+        self.flag = 1;
+        let d = s::doubled(self.quality)?;
+        self.got = d + p;
+    }
+}
+"#;
+
+fn find_call(
+    bhav: &sims_antics::ir::BhavChunk,
+    opcode: u16,
+) -> &sims_formats::behavior::Instruction {
+    bhav.instructions
+        .iter()
+        .find(|i| i.opcode == opcode)
+        .unwrap_or_else(|| panic!("no call to {opcode} in '{}'", bhav.label))
+}
+
+#[test]
+fn maxis_interop_extern_calls_bcon_tables_sparse_states_and_trees_lower_exactly() {
+    let cfg = PackResolverConfig::default();
+    let expanded =
+        sims_antics::v2::expand_v2_source_to_objects("lamp.antics", INTEROP_LAMP_V2, &cfg)
+            .expect("expand interop lamp");
+    let air = &expanded[0].air_source;
+
+    // Sparse state: `glow @ 9` keeps its exact slot, auto states fill 0..=7, attributes = 10,
+    // and the uninitialized explicit slot is NOT zeroed by init.
+    assert!(
+        air.contains("attr[7] = fridge_hits, attr[9] = glow"),
+        "attribute map:\n{air}"
+    );
+    assert_eq!(expanded[0].manifest.attributes, 10);
+    assert!(!air.contains("my.attr[9] := 0;"), "{air}");
+    assert!(
+        air.contains("my.attr[7] := 0;"),
+        "auto states still zero:\n{air}"
+    );
+    assert!(air.contains("my.attr[9] := 5;"), "{air}");
+
+    // Named private BCON table (list form, numeric operands) + extern bcon (no chunk).
+    assert!(
+        air.contains("bcon 4097 \"LampTuning\" = [10, 25];"),
+        "{air}"
+    );
+    assert!(
+        air.contains("temp[1] := bcon[129];"),
+        "lamp_tuning.bright:\n{air}"
+    );
+    assert!(air.contains("my.attr[4] := bcon[16521];"), "{air}");
+    assert!(
+        !air.contains("bcon 257"),
+        "extern bcon must not emit a chunk:\n{air}"
+    );
+
+    // extern mod: literal call (const args incl. a private BCON value), temps call, temp
+    // binding, `?` on Result / Result<T @ temp[1]>, and direct return capture.
+    for needle in [
+        "if call 256(2, 10) {\n    }\n    my.attr[1] := temp[0];",
+        "temp[0] := __v_q_0;\n    temp[1] := bcon[129];\n    if call 256(temps) {\n    }\n    my.attr[2] := temp[0];",
+        "temp[4] := 4;\n    if call 257 {\n        my.attr[3] := 1;\n    }",
+        "temp[0] := my.attr[0];\n    if !call 8192(temps) {\n        return error;\n    }\n    my.attr[5] := temp[1];",
+        "if !call 258(1) {\n        return error;\n    }",
+        "if call 4098 {\n    }\n    my.attr[6] := temp[0];",
+        "if call 4143 {\n        my.attr[9] := 5;\n    }",
+    ] {
+        assert!(air.contains(needle), "missing:\n{needle}\n---\n{air}");
+    }
+
+    // Standalone trees: pinned id, derived ident, real (non-inlined) calls, Sim tree params.
+    assert!(
+        air.contains("tree 4143 \"CT - Is Fridge\" {\n    return true;\n}"),
+        "{air}"
+    );
+    assert!(
+        air.contains(
+            "tree 4098 \"Quality Score\" {\n    if my.attr[0] > 0 {\n        temp[0] := my.attr[0];\n        temp[0] *= 24;\n        temp[0] /= 5;\n        temp[0] += 1;\n        return true;\n    } else {\n        temp[0] := 0;\n        return true;\n    }\n}"
+        ),
+        "{air}"
+    );
+    assert!(
+        air.contains("tree 4099 \"Bump Hits\" (args: 1) {\n    stack.attr[7] += param[0];"),
+        "{air}"
+    );
+    assert!(air.contains("if call 4099(2) {\n    }"), "{air}");
+
+    // Bytecode shapes.
+    let obj = compile_v2_source("lamp.antics", INTEROP_LAMP_V2, &cfg).expect("compile lamp");
+    let init = &obj.behaviors[&4096];
+    let lit = find_call(init, 256);
+    assert_eq!(
+        lit.operands,
+        [2, 0, 10, 0, 0, 0, 0, 0],
+        "literal call operands"
+    );
+    assert_eq!(
+        lit.on_true, lit.on_false,
+        "ignored result: both exits continue"
+    );
+    let semi = find_call(init, 8192);
+    assert_eq!(semi.operands, [0xFF; 8], "call(temps) operands");
+    assert_eq!(
+        semi.on_false, 0xFD,
+        "'?' failure exits through the error branch"
+    );
+    let res = find_call(init, 258);
+    assert_eq!(res.operands, [1, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(res.on_false, 0xFD);
+    let ct = find_call(init, 4143);
+    assert_ne!(ct.on_true, ct.on_false, "condition call branches");
+    // `(self.quality * 24) / 5 + 1` in place into temp[0]: compare + 4 arith + else = 6 nodes.
+    assert_eq!(obj.behaviors[&4098].instructions.len(), 6);
+    assert_eq!(obj.behaviors[&4143].instructions.len(), 1);
+    assert_eq!(obj.behaviors[&4099].args, 1);
+
+    let iff = Iff::parse(obj.iff_bytes.clone()).expect("IFF parse");
+    let bcon = iff.get(b"BCON", 4097).expect("BCON 4097 emitted");
+    assert_eq!(constants(iff.data(bcon)).unwrap(), vec![10, 25]);
+    assert!(iff.get(b"BCON", 257).is_none());
+
+    // Live VM: synthetic global + semi-global libraries.
+    let probe = compile_v2_source("probe.antics", INTEROP_PROBE_V2, &cfg).expect("compile probe");
+    let mut vm = V2VmFixture::from_objects_with_libs(
+        &[&obj, &probe],
+        5000,
+        Some(INTEROP_GLOBAL_AIR),
+        Some(INTEROP_SEMI_AIR),
+    );
+    let lamp = vm.spawn(0x7F30_0001, 4, 4);
+    assert_eq!(vm.obj_attr(lamp, 0), 3, "quality");
+    assert_eq!(vm.obj_attr(lamp, 1), 12, "add(2, LampTuning.cheap)");
+    assert_eq!(
+        vm.obj_attr(lamp, 2),
+        28,
+        "add(q, lamp_tuning.bright) via call(temps)"
+    );
+    assert_eq!(vm.obj_attr(lamp, 3), 1, "is_dark(level: 4) via temp[4]");
+    assert_eq!(
+        vm.obj_attr(lamp, 4),
+        77,
+        "bcon[16521] = global BCON 257 entry 9"
+    );
+    assert_eq!(vm.obj_attr(lamp, 5), 6, "semi-global doubled(3)?");
+    assert_eq!(vm.obj_attr(lamp, 6), 15, "score() = (3 * 24) / 5 + 1");
+    assert_eq!(vm.obj_attr(lamp, 9), 5, "CT marker tree as condition");
+    vm.run_interaction(lamp, "Bump", None);
+    assert_eq!(
+        vm.obj_attr(lamp, 7),
+        2,
+        "Sim-context tree called from interaction"
+    );
+
+    // `?` propagation: failure exits through the error branch before touching state.
+    let p = vm.spawn(0x7F30_0002, 6, 4);
+    let err = vm
+        .try_run_tree(p, 4200, 0)
+        .expect_err("try_light(0)? must exit via error");
+    assert!(format!("{err:?}").contains("ErrorBranch"), "{err:?}");
+    assert_eq!(vm.obj_attr(p, 1), 0);
+    assert!(vm.try_run_tree(p, 4200, 5).expect("success path"));
+    assert_eq!(vm.obj_attr(p, 1), 1);
+    assert_eq!(vm.obj_attr(p, 2), 13, "doubled(4)? + p");
+}
+
+#[test]
+fn maxis_interop_states_trees_and_destroy_flags_lower_compactly() {
+    let cfg = PackResolverConfig::default();
+    let src = r#"
+object "Sparse Holes" {
+    guid: 0x7F30_0010;
+    state a: i16;
+    state b @ 0: i16;
+    state c: i16 = 0;
+    state d @ 2: bool = true;
+    tree sum "Sum" (x: i16, y: i16 @ temp[5]) -> i16 @ temp[0] {
+        return x + y;
+    }
+    main {
+        self.a = sum(self.c, y: 3);
+        self.c = sum(7, y: self.a);
+        destroy_self(no_yield: true, skip_resets: true);
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects("holes.antics", src, &cfg)
+        .expect("expand holes");
+    let air = &expanded[0].air_source;
+    // Explicit slots are reserved first; auto states take the lowest free slots in order.
+    assert!(
+        air.contains("// Attributes: attr[0] = b, attr[1] = a, attr[2] = d, attr[3] = c"),
+        "{air}"
+    );
+    assert_eq!(expanded[0].manifest.attributes, 8);
+    assert!(
+        air.contains("my.attr[1] := 0;"),
+        "auto state zeroed:\n{air}"
+    );
+    assert!(
+        air.contains("my.attr[2] := 1;"),
+        "explicit slot with initializer:\n{air}"
+    );
+    assert!(
+        !air.contains("my.attr[0] := 0;"),
+        "explicit uninitialized slot untouched:\n{air}"
+    );
+    // Temp-bound params are snapshotted at entry; positional params read `param[i]`.
+    assert!(
+        air.contains("tree 4098 \"Sum\" (args: 1) {\n    let __p_y_0 = temp[5];"),
+        "{air}"
+    );
+    // Mixed signature with a non-constant positional arg: positional -> temp[0], bound -> temp[5].
+    assert!(
+        air.contains("temp[0] := my.attr[3];\n    temp[5] := 3;\n    if call 4098(temps) {"),
+        "{air}"
+    );
+    // Constant positional arg stays a literal call operand; the bound arg is still written.
+    assert!(
+        air.contains("temp[5] := my.attr[1];\n    if call 4098(7) {"),
+        "{air}"
+    );
+    assert!(air.contains("remove_object(me, flags: 3);"), "{air}");
+}
+
+#[test]
+fn maxis_interop_negative_diagnostics() {
+    let cfg = PackResolverConfig::default();
+    let expect_err = |name: &str, src: &str, needle: &str| {
+        let err = compile_v2_source(name, src, &cfg).expect_err(&format!("{name} must fail"));
+        assert!(err.span.is_some(), "{name}: expected a span: {err}");
+        assert!(
+            err.message.contains(needle),
+            "{name}: expected '{needle}' in: {err}"
+        );
+    };
+    let obj = |members: &str| format!("object \"Neg\" {{\n    guid: 0x7F30_0020;\n{members}\n}}\n");
+
+    expect_err(
+        "dup_temp.antics",
+        &obj("    extern mod m { @id(256) fn f(a: i16 @ temp[2], b: i16 @ temp[2]); }"),
+        "duplicate '@ temp[2]' binding",
+    );
+    expect_err(
+        "temp_range.antics",
+        &obj("    extern mod m { @id(256) fn f(a: i16 @ temp[8]); }"),
+        "temp slot 8 is out of range",
+    );
+    expect_err(
+        "slot_collide.antics",
+        &obj("    state a @ 3: i16;\n    state b @ 3: i16;"),
+        "overlaps state 'a'",
+    );
+    expect_err(
+        "bcon_id.antics",
+        &obj("    bcon 300 \"Bad\" { a = 1 }"),
+        "must be a private BCON chunk id in 4096..=4159",
+    );
+    expect_err(
+        "bhav_id.antics",
+        &obj("    extern mod m { @id(4100) fn f(); }"),
+        "must be a global (256..=4095) or semi-global (8192..) tree",
+    );
+    expect_err(
+        "pos_temp.antics",
+        &obj(
+            "    extern mod m { @id(256) fn f(a: i16, b: i16 @ temp[0]); }\n    init { m::f(1, b: 2); }",
+        ),
+        "collides with positional parameter #0",
+    );
+    expect_err(
+        "unused_result.antics",
+        &obj("    extern mod m { @id(256) fn f() -> Result; }\n    init { m::f(); }"),
+        "unused Result",
+    );
+    expect_err(
+        "try_value.antics",
+        &obj("    extern mod m { @id(256) fn f() -> i16 @ temp[0]; }\n    init { m::f()?; }"),
+        "'?' needs a call returning 'bool' or 'Result'",
+    );
+    expect_err(
+        "bcon_write.antics",
+        &obj("    bcon 4097 \"T\" { a = 1 }\n    init { T.a = 2; }"),
+        "read-only",
+    );
+    expect_err(
+        "sim_tree_ctx.antics",
+        &obj("    tree t (sim: Sim) { return true; }\n    init { t(); }"),
+        "Sim-on-object context",
+    );
+    expect_err(
+        "tree_paths.antics",
+        &obj("    state q: i16;\n    tree t -> i16 @ temp[0] { if self.q > 0 { return 1; } }"),
+        "must return on all control-flow paths",
+    );
+    expect_err(
+        "try_defer.antics",
+        &obj("    extern mod m { @id(256) fn f() -> Result; }\n    init { defer { m::f()?; } }"),
+        "cannot exit out of a 'defer' block",
+    );
+    expect_err(
+        "bcon_addr.antics",
+        &obj("    extern bcon c { x @ 30000; }"),
+        "out of range",
+    );
+    expect_err(
+        "tree_builtin.antics",
+        &obj("    tree sleep { return true; }"),
+        "shadows the built-in",
+    );
+    expect_err(
+        "bcon_4096.antics",
+        &obj("    param power: i16 = 3;\n    bcon 4096 \"Mine\" { a = 1 }"),
+        "reserved for this object's i16 params",
+    );
 }
