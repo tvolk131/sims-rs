@@ -1024,6 +1024,14 @@ impl<'a> TreeBuilder<'a> {
                     self.note_operand(Operand::new(9, 0), span)?;
                 }
                 let local_byte = self.resolve_local_ref(local, span, *mode == 8 || *mode == 9)?;
+                if (*mode == 8 || *mode == 9) && local_byte >= 128 {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "create_object mode {mode} local index {local_byte} exceeds signed i8 range 0..=127"
+                        ),
+                    ));
+                }
                 let [g0, g1, g2, g3] = guid.to_le_bytes();
                 Ok((42, [g0, g1, g2, g3, *mode, *flags, local_byte, 0]))
             }

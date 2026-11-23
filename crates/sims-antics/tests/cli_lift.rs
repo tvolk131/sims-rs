@@ -1243,6 +1243,36 @@ fn lift_raw_roundtrips_252_instruction_bhav_byte_for_byte() {
     let compiled = compile_antics(&stdout).expect("252-instruction raw lift must recompile");
     let rt_payload = encode_bhav(&compiled.behaviors[&4096]).expect("encode roundtripped");
     assert_eq!(rt_payload, orig_payload);
+
+    // Decoded labeled-CFG counterpart (without `--raw`): must also decode instructions,
+    // preserve all 252 records + trailing bytes + `raw(0xfb)`, and round-trip byte-for-byte!
+    let dec_out = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&iff_path)
+        .args(["--tree", "4096", "--verify-equiv"])
+        .output()
+        .expect("run decoded lift on 252-ins BHAV");
+    assert!(
+        dec_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&dec_out.stderr)
+    );
+    let dec_stdout = String::from_utf8(dec_out.stdout).expect("utf8 dec stdout");
+    assert!(dec_stdout.contains("expr(my.attr[0] := 1)"), "{dec_stdout}");
+    assert!(dec_stdout.contains("raw(0xfb)"), "{dec_stdout}");
+    assert!(
+        dec_stdout.contains("trailing: [0xca, 0xfe]"),
+        "{dec_stdout}"
+    );
+    assert!(
+        dec_stdout.contains("// verify-equiv: Equivalent"),
+        "expected --verify-equiv on labeled-CFG fallback output:\n{dec_stdout}"
+    );
+    let dec_compiled =
+        compile_antics(&dec_stdout).expect("252-instruction decoded labeled lift must recompile");
+    let dec_rt_payload =
+        encode_bhav(&dec_compiled.behaviors[&4096]).expect("encode decoded roundtripped");
+    assert_eq!(dec_rt_payload, orig_payload);
 }
 
 #[test]
@@ -1384,19 +1414,24 @@ fn lift_verify_equiv_ignores_stray_global_id_arity_in_object_iff() {
         revision: 0,
         instructions: vec![
             Instruction {
-                // Inline call to global #300 (non-0xFF operands) returning true/false.
+                // Inline call to global #300 (non-0xFF operands) jumping to node 2 then node 1,
+                // so structured lifting reorders reachable nodes 1 and 2 after the call!
                 opcode: 300,
-                on_true: 0xFE,
+                on_true: 2,
                 on_false: 0xFF,
                 operands: [1, 0, 2, 0, 3, 0, 4, 0],
             },
-            // Dead instruction right after node 0 — structured lifter strips unreachable nodes,
-            // changing trailing bytes that a >4-arg global #300 could read!
             Instruction {
                 opcode: 2,
                 on_true: 0xFE,
-                on_false: 0xFF,
-                operands: [0x99, 0, 0, 0, 0, 5, 0, 7],
+                on_false: 0xFE,
+                operands: [0, 0, 1, 0, 0, 5, 0, 7],
+            },
+            Instruction {
+                opcode: 2,
+                on_true: 1,
+                on_false: 1,
+                operands: [0, 0, 2, 0, 0, 5, 0, 7],
             },
         ],
         trailing: Vec::new(),
@@ -1428,15 +1463,16 @@ fn lift_verify_equiv_ignores_stray_global_id_arity_in_object_iff() {
         "expected Inconclusive(unknown callee arity) comment:\n{stdout}"
     );
 
-    // Conversely, a local BHAV #4097 (in 4096..=8191) declaring `args: 5` IS resolved
-    // from this IFF, so stripping the trailing dead instruction after an inline call to
-    // #4097 produces a real `Counterexample` and a non-zero exit code!
-    let local_5arg = BhavChunk {
+    // Conversely, a local BHAV #4097 (in 4096..=8191) declaring `args: 7` IS resolved
+    // from this IFF, so structured lifting refuses to drop/reorder the following extended-arg
+    // record (even under `--relax-padding`!), falls back to decoded labeled-CFG preserving the
+    // extended argument bytes, and `--verify-equiv` verifies it `Equivalent`!
+    let local_7arg = BhavChunk {
         id: 4097,
-        label: "LocalFiveArgs".to_owned(),
+        label: "LocalSevenArgs".to_owned(),
         format: 0x8002,
         kind: 0,
-        args: 5,
+        args: 7,
         locals: 0,
         revision: 0,
         instructions: vec![Instruction {
@@ -1449,7 +1485,7 @@ fn lift_verify_equiv_ignores_stray_global_id_arity_in_object_iff() {
     };
     let caller_local = BhavChunk {
         id: 4098,
-        label: "CallsLocal5Arg".to_owned(),
+        label: "CallsLocal7Arg".to_owned(),
         format: 0x8002,
         kind: 0,
         args: 0,
@@ -1463,37 +1499,42 @@ fn lift_verify_equiv_ignores_stray_global_id_arity_in_object_iff() {
                 operands: [1, 0, 2, 0, 3, 0, 4, 0],
             },
             Instruction {
-                opcode: 2,
+                // Unreachable NotifyIdle carrying extended arg 7 in operand byte 0 (`0x99`)!
+                opcode: 49,
                 on_true: 0xFE,
                 on_false: 0xFF,
-                operands: [0x99, 0, 0, 0, 0, 5, 0, 7],
+                operands: [0x99, 0, 0, 0, 0, 0, 0, 0],
             },
         ],
         trailing: Vec::new(),
     };
-    let local_iff_path = tmp.path().join("local_5arg.iff");
+    let local_iff_path = tmp.path().join("local_7arg.iff");
     std::fs::write(
         &local_iff_path,
-        synthetic_bhav_iff(&[local_5arg, caller_local]),
+        synthetic_bhav_iff(&[local_7arg, caller_local]),
     )
-    .expect("write local_5arg.iff");
+    .expect("write local_7arg.iff");
 
-    let ce_out = Command::new(cli_bin())
+    let ext_out = Command::new(cli_bin())
         .args(["lift"])
         .arg(&local_iff_path)
-        .args(["--tree", "4098", "--verify-equiv"])
+        .args(["--tree", "4098", "--relax-padding", "--verify-equiv"])
         .output()
-        .expect("run lift --verify-equiv expecting Counterexample");
+        .expect("run lift --relax-padding --verify-equiv on 7-arg local call");
     assert!(
-        !ce_out.status.success(),
-        "Counterexample must exit non-zero;\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&ce_out.stdout),
-        String::from_utf8_lossy(&ce_out.stderr)
+        ext_out.status.success(),
+        "7-arg local call fallback must preserve extended args and prove Equivalent;\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&ext_out.stdout),
+        String::from_utf8_lossy(&ext_out.stderr)
     );
-    let ce_stdout = String::from_utf8_lossy(&ce_out.stdout);
+    let ext_stdout = String::from_utf8_lossy(&ext_out.stdout);
     assert!(
-        ce_stdout.contains("// verify-equiv: Counterexample("),
-        "expected Counterexample comment:\n{ce_stdout}"
+        ext_stdout.contains("structured lift fallback") && ext_stdout.contains("op 0x0031 (0x99"),
+        "expected labeled-CFG fallback preserving arg-7 byte 0x99:\n{ext_stdout}"
+    );
+    assert!(
+        ext_stdout.contains("// verify-equiv: Equivalent"),
+        "expected Equivalent on protected labeled-CFG fallback:\n{ext_stdout}"
     );
 }
 

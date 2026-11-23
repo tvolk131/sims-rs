@@ -754,7 +754,7 @@ fn try_decode_instruction(
             if mode == 7 && max_args == 0 {
                 return None;
             }
-            if (mode == 8 || mode == 9) && usize::from(local) >= max_locals {
+            if (mode == 8 || mode == 9) && ((local as i8) < 0 || usize::from(local) >= max_locals) {
                 return None;
             }
             let expr = format!(
@@ -1046,6 +1046,21 @@ pub fn lift_bhav_structured_with_options(
     chunk: &BhavChunk,
     opts: LiftOptions,
 ) -> StructuredLiftOutcome {
+    lift_bhav_structured_with_arities(chunk, opts, None)
+}
+
+/// Structured `.air` lifter parameterized by [`LiftOptions`] and optional `callee_arities`.
+///
+/// Refuses structured reordering when a reachable inline subroutine call (`opcode >= 256` with
+/// non-`0xFF` operands) targets a known `> 4`-argument callee, or when a callee's arity is
+/// unknown and an unreachable instruction record immediately follows the call (where Edith
+/// stores extended inline argument bytes, `sims-vm/src/interpreter.rs:1548`).
+#[must_use]
+pub fn lift_bhav_structured_with_arities(
+    chunk: &BhavChunk,
+    opts: LiftOptions,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+) -> StructuredLiftOutcome {
     let Some((max_args, max_locals)) = format_limits(chunk.format) else {
         return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
     };
@@ -1099,6 +1114,25 @@ pub fn lift_bhav_structured_with_options(
                     reachable[next] = true;
                     queue.push_back(next);
                 }
+            }
+        }
+    }
+
+    // Protect layout-dependent extended (>4-arg) inline subroutine calls before reordering
+    // or pruning unreachable instruction records (`sims-vm/src/interpreter.rs:1548`).
+    for (idx, ins) in chunk.instructions.iter().enumerate() {
+        if !reachable[idx] {
+            continue;
+        }
+        if ins.opcode >= 256 && ins.operands != [0xFF; 8] {
+            match callee_arities.and_then(|m| m.get(&ins.opcode).copied()) {
+                Some(arity) if arity > 4 => {
+                    return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
+                }
+                None if idx + 1 < n && !reachable[idx + 1] => {
+                    return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
+                }
+                _ => {}
             }
         }
     }
@@ -1906,6 +1940,120 @@ mod tests {
         assert!(
             matches!(equiv, EquivResult::Equivalent { .. }),
             "expected Equivalent under --relax-padding, got {equiv:?}\nRelaxed:\n{relaxed_src}"
+        );
+    }
+
+    #[test]
+    fn extended_inline_call_args_protected_in_relaxed_labeled_and_structured_lift() {
+        use crate::encode::encode_bhav;
+        use crate::lift::format_bhav_labeled_air_with_arities;
+        use crate::verify::check_bhav_equivalent_with_arities;
+
+        // Node 0 calls private BHAV #4097 (7 args => needs 14 bytes: 8 from node 0 + 6 from node 1,
+        // meaning bytes 0..2 of node 1's `notify_idle` operands carry argument 7!).
+        // Node 1 is an unreachable `notify_idle` record with dirty byte 0 = 0x77 (arg 7 low byte).
+        let orig = BhavChunk {
+            id: 4096,
+            label: "ExtendedArgs7".to_owned(),
+            format: 0x8002,
+            kind: 0,
+            args: 0,
+            locals: 0,
+            revision: 0,
+            instructions: vec![
+                Instruction {
+                    opcode: 4097,
+                    on_true: 0xFE,
+                    on_false: 0xFF,
+                    operands: [1, 0, 2, 0, 3, 0, 4, 0],
+                },
+                Instruction {
+                    opcode: 49, // NotifyIdle, unreachable as code, carries args 5..7 bytes!
+                    on_true: 0xFE,
+                    on_false: 0xFF,
+                    operands: [0x77, 0x00, 0, 0, 0, 0, 0, 0],
+                },
+            ],
+            trailing: Vec::new(),
+        };
+        let arities_7 = BTreeMap::from([(4097u16, 7usize)]);
+        let arities_4 = BTreeMap::from([(4097u16, 4usize)]);
+        let relaxed = LiftOptions {
+            strict_padding: false,
+        };
+
+        // 1. Structured lifter rejects reordering when callee takes >4 args OR when callee
+        //    arity is unknown and an unreachable record immediately follows the call.
+        assert_eq!(
+            lift_bhav_structured_with_arities(&orig, relaxed, Some(&arities_7)),
+            StructuredLiftOutcome::UnsupportedHeaderOrTarget
+        );
+        assert_eq!(
+            lift_bhav_structured_with_arities(&orig, relaxed, None),
+            StructuredLiftOutcome::UnsupportedHeaderOrTarget
+        );
+
+        // 2. Relaxed labeled-CFG preserves node 1's byte 0 (`0x77`) BOTH when arity is 7
+        //    AND when arity is unknown (`None`), so arg 7 is NEVER zeroed!
+        for maybe_arities in [Some(&arities_7), None] {
+            let labeled = format_bhav_labeled_air_with_arities(&orig, relaxed, maybe_arities);
+            let re = &compile_antics(&labeled).unwrap().behaviors[&4096];
+            assert_eq!(
+                encode_bhav(re).unwrap(),
+                encode_bhav(&orig).unwrap(),
+                "extended call argument record must stay byte-exact under --relax-padding:\n{labeled}"
+            );
+            let equiv = check_bhav_equivalent_with_arities(
+                &orig,
+                re,
+                &EquivOptions::default(),
+                Some(&arities_7),
+            );
+            assert!(
+                matches!(equiv, EquivResult::Equivalent { .. }),
+                "expected Equivalent for extended-arg labeled CFG, got {equiv:?}"
+            );
+        }
+
+        // 3. When callee is known to take <=4 args, relaxed labeled-CFG is free to clean node 1!
+        let cleaned = format_bhav_labeled_air_with_arities(&orig, relaxed, Some(&arities_4));
+        assert!(
+            cleaned.contains("notify_idle()"),
+            "4-arg callee should allow relaxing unreachable notify_idle:\n{cleaned}"
+        );
+
+        // 4. CreateObject mode 8 with local byte 128 (`-128` signed) must NOT decode to `local: 128`
+        //    and lowerer must reject `create_object(..., mode: 8, local: 128)`.
+        let co_signed = BhavChunk {
+            id: 4096,
+            label: "CreateObjSignedLocal".to_owned(),
+            format: 0x8002,
+            kind: 0,
+            args: 0,
+            locals: 200,
+            revision: 0,
+            instructions: vec![Instruction {
+                opcode: 42,
+                on_true: 0xFE,
+                on_false: 0xFF,
+                operands: [0x11, 0x22, 0x33, 0x44, 8, 0, 128, 0],
+            }],
+            trailing: Vec::new(),
+        };
+        let co_lifted = match lift_bhav_structured_with_options(&co_signed, relaxed) {
+            StructuredLiftOutcome::Lifted(s) => s,
+            other => panic!("expected Lifted, got {other:?}"),
+        };
+        assert!(
+            co_lifted.contains("op 0x002a"),
+            "CreateObject mode 8 local byte 128 (signed -128) must stay raw op:\n{co_lifted}"
+        );
+        assert!(
+            compile_antics(
+                r#"tree 4096 "BadCo" (format: 0x8002, locals: 200) { create_object(0x11223344, mode: 8, flags: 0, local: 128); return true; }"#
+            )
+            .is_err(),
+            "lowerer must reject create_object mode 8 with local >= 128"
         );
     }
 }

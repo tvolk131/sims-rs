@@ -12,6 +12,7 @@ use crate::structure_lift::{LiftOptions, decode_instruction_for_labeled_air};
 use sims_formats::behavior::{Behavior, Interaction, InteractionTable, MotiveAdvertisement};
 use sims_formats::execution::{ObjectFunctions, Slots};
 use sims_formats::strings::{Format, StringTable};
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 /// Lifts a raw `BHAV` chunk payload into a [`BhavChunk`] IR.
@@ -57,6 +58,22 @@ pub fn format_bhav_antics(chunk: &BhavChunk) -> String {
 /// byte-exact BHAV round-tripping.
 #[must_use]
 pub fn format_bhav_labeled_air(chunk: &BhavChunk, opts: LiftOptions) -> String {
+    format_bhav_labeled_air_with_arities(chunk, opts, None)
+}
+
+/// Formats a [`BhavChunk`] into labeled-CFG `.air` (Antics IR) source text using optional
+/// `callee_arities` to protect trailing instruction records that may carry extended (>4-arg)
+/// inline subroutine arguments when `opts.strict_padding == false` (`--relax-padding`).
+///
+/// Any instruction record consumed by an extended inline call (or any record following an
+/// inline call whose callee arity is unknown) is decoded with `strict_padding: true` so its
+/// 12 raw bytes are preserved identically.
+#[must_use]
+pub fn format_bhav_labeled_air_with_arities(
+    chunk: &BhavChunk,
+    opts: LiftOptions,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+) -> String {
     let mut out = format_bhav_header(chunk);
     let bounds = match chunk.format {
         0x8000 => Some((4usize, 0usize)),
@@ -67,13 +84,48 @@ pub fn format_bhav_labeled_air(chunk: &BhavChunk, opts: LiftOptions) -> String {
         0x8002 => Some((usize::from(chunk.args), usize::from(chunk.locals as u8))),
         _ => None,
     };
+
+    // Protect instruction records whose raw bytes can be read as extended (>4) inline
+    // subroutine arguments (`sims-vm/src/interpreter.rs:1548`) when relaxing padding.
+    let n = chunk.instructions.len();
+    let mut protected = vec![false; n];
+    if !opts.strict_padding {
+        for (i, ins) in chunk.instructions.iter().enumerate() {
+            if ins.opcode >= 256 && ins.operands != [0xFF; 8] {
+                match callee_arities.and_then(|m| m.get(&ins.opcode).copied()) {
+                    Some(arity) if arity <= 4 => {}
+                    Some(arity) => {
+                        let extra_records = (arity * 2 - 8).div_ceil(12);
+                        let end = (i + 1 + extra_records).min(n);
+                        for slot in &mut protected[i + 1..end] {
+                            *slot = true;
+                        }
+                    }
+                    None => {
+                        for slot in &mut protected[i + 1..n] {
+                            *slot = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     for (idx, ins) in chunk.instructions.iter().enumerate() {
         let _ = writeln!(out, "    @n{idx}:");
-        let on_true = format_target(ins.on_true, chunk.instructions.len());
-        let on_false = format_target(ins.on_false, chunk.instructions.len());
+        let on_true = format_target(ins.on_true, n);
+        let on_false = format_target(ins.on_false, n);
+        let ins_opts = if protected[idx] {
+            LiftOptions {
+                strict_padding: true,
+            }
+        } else {
+            opts
+        };
         if let Some((arg_bound, local_bound)) = bounds
             && let Some(decoded) =
-                decode_instruction_for_labeled_air(ins, arg_bound, local_bound, opts)
+                decode_instruction_for_labeled_air(ins, arg_bound, local_bound, ins_opts)
         {
             let _ = writeln!(out, "    {decoded} -> true: {on_true}, false: {on_false};");
         } else {

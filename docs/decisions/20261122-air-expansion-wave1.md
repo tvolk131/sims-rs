@@ -23,8 +23,10 @@ Only `14,692 / 28,690` (51.2%) Complete Collection `BHAV`s lifted structurally.
   - Parser accepts both comma-separated `(0x01, 0x02, ...)` and space-separated `(0x01 0x02 ...)` operand bytes.
   - Whenever a single instruction is unmodeled, has an out-of-frame local/param index, or carries dirty Edith padding bytes under `strict_padding: true`, only that instruction falls back to an inline `op 0xNNNN (...)`; the surrounding `if`/`else`/`while` control flow is preserved.
 - **Decoded instructions in irreducible / labeled CFGs (`lift.rs`, `structure_lift.rs`, `lower.rs`, `bin/sims-antics.rs`):**
-  - `format_bhav_labeled_air(chunk, opts)` (now the default for `format_bhav_air` / `format_bhav_antics` and the CLI fallback on irreducible CFGs) keeps `@n0:` labels and explicit `-> true: ..., false: ...` targets while decoding every clean modeled instruction into readable `.air` primitive / `expr(...)` / `call ...` syntax.
+  - `format_bhav_labeled_air_with_arities(chunk, opts, callee_arities)` (with `format_bhav_labeled_air` as the arity-free default) keeps `@n0:` labels and explicit `-> true: ..., false: ...` targets while decoding every clean modeled instruction into readable `.air` primitive / `expr(...)` / `call ...` syntax. Under `--relax-padding`, instruction records consumed by extended (`> 4`-arg) inline calls — or following unknown-arity inline calls — remain protected with `strict_padding: true` so extended argument bytes are never altered.
+  - `lift_bhav_structured_with_arities` similarly refuses structured reordering before a known `> 4`-arg inline call or an unknown-arity inline call immediately followed by an unreachable data record.
   - `format_bhav_raw_air(chunk)` preserves pure hex `op 0xNNNN (...)` output for `sims-antics lift --raw`.
+  - `sims-antics lift --verify-equiv` compiles and verifies both structured output and decoded labeled-CFG fallback output.
   - `lower.rs` treats verbatim explicit-branch trees (`is_verbatim_explicit`) as 1-to-1 instruction streams supporting `> 251` instructions and preserving verbatim header `args`/`locals` when all decoded operand accesses are in-bounds.
 - **Strict padding default + `--relax-padding` toggle (`LiftOptions`):**
   - `LiftOptions { strict_padding: true }` (default): decodes an instruction only when unused/reserved operand bytes are zero (preserving 100% operand byte-exactness and 100% full-BHAV byte-exactness in labeled-CFG mode).
@@ -59,12 +61,12 @@ Every operand byte, unused padding mask, frame read/write side effect, and `is_a
   15. `0x0006` (6) `change_suit(index:, scope:[, remove: true])` (`change_suit.rs`, always-true)
   16. `0x0010` (16) `find_location(mode:, flags:[, local:])` (`find_location.rs`, always-true when `mode == 1`)
 
-## Sample `.air` Output (Clean-Room Examples)
+## Sample `.air` Output (Synthetic Examples)
 
 ### Structured `.air` with Wave 1 primitives & inline `op` fallback
 
 ```air
-tree 4096 "CleanRoomSample" (format: 0x8002, kind: 0, args: 1, locals: 1, revision: 0x00000000) {
+tree 4096 "SyntheticSample" (format: 0x8002, kind: 0, args: 1, locals: 1, revision: 0x00000000) {
     action_string(table: 300, index: 1);
     if test_object_type(0x12345678, stack_obj) {
         if route_to(slot: 0, source: 0, flags: 1) {
@@ -105,6 +107,6 @@ All corpus checks ran strictly in memory with `SIMS_INSTALL` (0 bytes written to
 | Pure zero-raw-op structured (`strict_padding: true`) | 14,692 | **20,017** |
 | Structured with inline `op 0xNNNN` (`strict_padding: true`) | 0 (fell off cliff) | **5,924** |
 | Pure zero-raw-op structured (`--relax-padding`) | N/A | **23,890** |
-| Decoded labeled-CFG fallback (`unstructured` CFGs) verified `Equivalent` | 0 | **2,748 / 2,748 (100.0%)** |
-| Formal bounded-trace-equivalence (`compile_failures` / `counterexamples` / `inconclusive`) | `0 / 0 / 0` | **`0 / 0 / 0`** (strict, relaxed, and labeled-CFG) |
+| Decoded labeled-CFG fallback (`unstructured` CFGs) verified `Equivalent` (strict & relaxed) | 0 | **2,748 / 2,748 strict + 2,748 / 2,748 relaxed (100.0%)** |
+| Formal bounded-trace-equivalence (`compile_failures` / `counterexamples` / `inconclusive`) | `0 / 0 / 0` | **`0 / 0 / 0`** (strict, relaxed, and strict/relaxed labeled-CFG) |
 | `Fridges.iff` (`Objects.far`, 51 BHAVs) — structured vs decoded labeled-CFG | 26 structured / 25 raw | **48 / 51 structured** (38 pure strict / 43 pure `--relax-padding`) + **3 / 51 decoded labeled-CFG** (`#4096 main`, `#4100 open`, `#4116 open with no food`) |
