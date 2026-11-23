@@ -99,16 +99,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// with `secondary_house` AND prevents `lifecycle::enter_lot` from opening or
 /// overwriting the frozen home lot while the trip is active.
 const TRAVEL_ENVELOPE_MAGIC: &[u8; 4] = b"TRVL";
-/// The version new envelopes are written with. Version 2: a date's
-/// departure left the companion's token in the leader's inventory
-/// ([`write_companion_token`]), which an abort takes back. Version 1
-/// envelopes, from before, are still read; their departure wrote no token,
-/// so an abort leaves the leader's tokens alone.
-const TRAVEL_ENVELOPE_VERSION: u32 = 2;
+/// The version new envelopes are written with.
+///
+/// - Version 2: a date's departure left the companion's token in the
+///   leader's inventory ([`write_companion_token`]), which an abort takes
+///   back. Version 1 envelopes, from before, are still read; their
+///   departure wrote no token, so an abort leaves the leader's tokens alone.
+/// - Version 3: the baseline's made types are in the order made, with the
+///   layout unchanged. A build that keeps them by GUID refuses it, rather
+///   than reading it and writing it back in GUID order
+///   (`docs/decisions/20261123-made-types-order-format-bumps.md`).
+const TRAVEL_ENVELOPE_VERSION: u32 = 3;
 /// The oldest envelope version still read; the payload is the same.
 const OLDEST_TRAVEL_ENVELOPE_VERSION: u32 = 1;
 /// The first version whose date departure wrote the companion's token.
 const COMPANION_TOKEN_ENVELOPE_VERSION: u32 = 2;
+/// The first version whose baseline keeps made types in the order made. An
+/// older one reads them back in GUID order, as its build wrote them.
+const MADE_ORDER_ENVELOPE_VERSION: u32 = 3;
 
 static NEXT_TRIP_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1459,6 +1467,9 @@ fn decode_travel_envelope(bytes: &[u8]) -> Result<PersistedTravelRecord, TravelE
             "corrupt travel envelope: inconsistent trip_id".into(),
         ));
     }
+    if version < MADE_ORDER_ENVELOPE_VERSION {
+        record.baseline.made_characters.made.sort_by_guid();
+    }
     record.version = version;
     Ok(record)
 }
@@ -1516,51 +1527,12 @@ fn capture_traveler_snapshot(
     })
 }
 
-/// Safely selects `sim` on `lot`, handling Superstar celebrity deselection
-/// (`person.data[81] >= 10`, unported star-marker pool `0x446c15`) and active
-/// Downtown date links (`person.data[77] != 0`, unported second indicator
-/// `0x44664c`) while preserving exact fame and date words on every Sim.
+/// Selects `sim` on `lot` ([`Lot::select`]): the previous Sim is
+/// deselected, which gives a famous one its star (0x446c15), and a Sim
+/// with a date has the second indicator put on it (0x446924).
 pub fn select_sim(lot: &mut Lot, sim: u16) -> Result<Vec<crate::SoundEvent>, TravelError> {
-    let mut saved: Vec<(u16, i16, i16)> = Vec::new();
-    let prev = selected(&lot.world);
-    for id in prev.into_iter().chain(std::iter::once(sim)) {
-        if saved.iter().any(|&(s, _, _)| s == id) {
-            continue;
-        }
-        if let Some(person) = lot
-            .world
-            .objects
-            .get_mut(&id)
-            .and_then(|o| o.person.as_mut())
-        {
-            let fame = person.data.get(PERSON_FAME_LEVEL).copied().unwrap_or(0);
-            let date = person.data.get(PERSON_DATE).copied().unwrap_or(0);
-            saved.push((id, fame, date));
-            if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
-                *f = 0;
-            }
-            if let Some(d) = person.data.get_mut(PERSON_DATE) {
-                *d = 0;
-            }
-        }
-    }
-    let result = lot.select(sim);
-    for (id, fame, date) in saved {
-        if let Some(person) = lot
-            .world
-            .objects
-            .get_mut(&id)
-            .and_then(|o| o.person.as_mut())
-        {
-            if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
-                *f = fame;
-            }
-            if let Some(d) = person.data.get_mut(PERSON_DATE) {
-                *d = date;
-            }
-        }
-    }
-    result.map_err(|e| TravelError::Lot(format!("selecting Sim {sim}: {e}")))
+    lot.select(sim)
+        .map_err(|e| TravelError::Lot(format!("selecting Sim {sim}: {e}")))
 }
 
 /// Internal world-level equivalent of [`select_sim`] used during destination
@@ -1570,36 +1542,9 @@ fn select_sim_in_world(
     world: &mut World,
     sim: u16,
 ) -> Result<(), TravelError> {
-    let mut saved: Vec<(u16, i16, i16)> = Vec::new();
-    let prev = selected(world);
-    for id in prev.into_iter().chain(std::iter::once(sim)) {
-        if saved.iter().any(|&(s, _, _)| s == id) {
-            continue;
-        }
-        if let Some(person) = world.objects.get_mut(&id).and_then(|o| o.person.as_mut()) {
-            let fame = person.data.get(PERSON_FAME_LEVEL).copied().unwrap_or(0);
-            let date = person.data.get(PERSON_DATE).copied().unwrap_or(0);
-            saved.push((id, fame, date));
-            if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
-                *f = 0;
-            }
-            if let Some(d) = person.data.get_mut(PERSON_DATE) {
-                *d = 0;
-            }
-        }
-    }
-    let result = interpreter.select(world, Some(sim));
-    for (id, fame, date) in saved {
-        if let Some(person) = world.objects.get_mut(&id).and_then(|o| o.person.as_mut()) {
-            if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
-                *f = fame;
-            }
-            if let Some(d) = person.data.get_mut(PERSON_DATE) {
-                *d = date;
-            }
-        }
-    }
-    result.map_err(|e| TravelError::Lot(format!("selecting Sim {sim}: {e}")))
+    interpreter
+        .select(world, Some(sim))
+        .map_err(|e| TravelError::Lot(format!("selecting Sim {sim}: {e}")))
 }
 
 /// Atomically departs from `home_lot` to `request.destination_house`:
@@ -3567,7 +3512,7 @@ fn load_destination_world(
     interpreter
         .create_indicators(&mut world)
         .map_err(|e| TravelError::Lot(e.to_string()))?;
-    world.read_simulator(&file.simulator);
+    crate::boot::read_simulator(&mut world, &file.simulator, program);
     world.read_house_model(
         file.model
             .as_ref()
@@ -3963,9 +3908,9 @@ fn boot_destination_lot(
                     })?;
                 (id, false)
             };
-            // Place on a distinct walkable tile near the arrival portal BEFORE
-            // applying fame >= 10 (so `placed_from_outside` 0x447a82 does not
-            // trap on unported star-marker pool for non-selected celebrities).
+            // The traveler comes onto the lot with its fame, so a famous Sim
+            // that is not selected gets its star as it is placed (0x447a57 ->
+            // 0x447a82). Its date link is written after placement.
             let saved_fame = snap
                 .person_data
                 .get(PERSON_FAME_LEVEL)
@@ -3977,7 +3922,7 @@ fn boot_destination_lot(
                 .and_then(|o| o.person.as_mut())
             {
                 if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
-                    *f = 0;
+                    *f = saved_fame;
                 }
                 if let Some(d) = person.data.get_mut(PERSON_DATE) {
                     *d = 0;
@@ -4371,7 +4316,7 @@ fn reconcile_frozen_home_lot(
                 .and_then(|o| o.person.as_mut())
             {
                 if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
-                    *f = 0;
+                    *f = saved_fame;
                 }
                 if let Some(d) = person.data.get_mut(PERSON_DATE) {
                     *d = 0;
@@ -5035,6 +4980,7 @@ fn strip_person_for_travel_deferred(
         }
     }
     world.objects.remove(&id);
+    world.indicator_queues.forget(id);
     world.frame_storage.remove(&id);
     world.headlines.remove(&id);
     world.fires.retain(|&other| other != id);
@@ -5554,6 +5500,89 @@ mod tests {
     use sims_formats::saved_objects::{Interaction, Person};
     use sims_sim::characters::Characters;
     use sims_sim::neighbors::{Neighbor, PERSON_WORDS};
+
+    /// A trip's baseline keeps its made types in the order made (envelope
+    /// version 3); an envelope of an older version reads them in GUID
+    /// order.
+    #[test]
+    fn a_trip_envelope_keeps_made_types_in_the_order_made() {
+        let made = |guid: u32, file: i32| {
+            (
+                guid,
+                sims_sim::characters::Character {
+                    template: 0x1234,
+                    file,
+                    strings: Default::default(),
+                },
+            )
+        };
+        let session = TravelSession {
+            store_id: 1,
+            instance_id: 1,
+            trip_id: 42,
+            neighborhood_id: "UserData".into(),
+            home_house: 5,
+            home_family: 5,
+            destination_house: 21,
+            destination: TravelDestination::Downtown,
+            transport: TravelTransport::DowntownCab,
+            accommodation: VacationAccommodation::None,
+            fare_paid: 0,
+            departure_ticks: 0,
+            departure_world_ticks: 0,
+            departure_clock: (8, 0, 0),
+            funds_before_fare: 0,
+            funds_at_arrival: 0,
+            magic_coins_at_arrival: 0,
+            leader_guid: 0x1001,
+            travelers: vec![],
+        };
+        let record = PersistedTravelRecord {
+            trip_id: 42,
+            is_date: false,
+            view_centre: None,
+            session,
+            baseline: DepartureBaseline {
+                revision: 0,
+                neighbors: vec![],
+                inventories: vec![],
+                type_attributes: None,
+                made_characters: Characters {
+                    made: [made(0x0005_7000, 1), made(0x0005_1000, 2)]
+                        .into_iter()
+                        .collect(),
+                    next_file: 3,
+                },
+                home_family_members: vec![],
+                home_family_budget: 0,
+            },
+            departure_snapshots: vec![],
+            frozen_home_bytes: vec![],
+            version: TRAVEL_ENVELOPE_VERSION,
+        };
+        let keys = |record: &PersistedTravelRecord| {
+            record
+                .baseline
+                .made_characters
+                .made
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+
+        let mut bytes = encode_travel_envelope(&record).unwrap();
+        assert_eq!(bytes[4..8], 3u32.to_le_bytes());
+        let now = decode_travel_envelope(&bytes).unwrap();
+        assert_eq!(keys(&now), [0x0005_7000, 0x0005_1000]);
+        assert_eq!(now.version, 3);
+
+        for old in [1u32, 2] {
+            bytes[4..8].copy_from_slice(&old.to_le_bytes());
+            let then = decode_travel_envelope(&bytes).unwrap();
+            assert_eq!(keys(&then), [0x0005_1000, 0x0005_7000]);
+            assert_eq!(then.version, old);
+        }
+    }
 
     fn test_zoning() -> BTreeMap<i16, i32> {
         let mut z = BTreeMap::new();
@@ -6167,6 +6196,18 @@ mod tests {
             100,
         );
 
+        // The companion is famous, so it arrives with a star (0x447a82).
+        if let Some(row) = goth
+            .world
+            .neighbors
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|row| row.guid == non_goth_adult_guid)
+        {
+            row.data[PERSON_FAME_LEVEL] = 15;
+        }
+
         // 1. Downtown Date (Mortimer + non-household adult companion) to House 21.
         let date_req = TravelRequest::downtown_date(21, mortimer_guid, non_goth_adult_guid);
         let dep = depart_to_destination(&root, &store, "UserData", &mut goth, &date_req).unwrap();
@@ -6196,6 +6237,23 @@ mod tests {
                 .data[PERSON_DATE],
             dt_mortimer_id as i16
         );
+
+        // The famous companion is not selected: placing it on the lot put a
+        // pooled star over its head (0x447a57 -> 0x447a82). The leader is
+        // selected and has none.
+        assert!(!dt.world.objects[&dt_companion_id].selected);
+        let star_over = |id: u16| {
+            dt.world.objects.values().any(|o| {
+                o.guid == crate::placement::STAR_MARKER
+                    && o.data[2] == id as i16
+                    && dt.world.objects[&id].slots[2].object == o.id as i16
+            })
+        };
+        assert!(
+            star_over(dt_companion_id),
+            "the famous companion has a star"
+        );
+        assert!(!star_over(dt_mortimer_id));
 
         // Mutate funds, motives, skills, fame, accessories, outfits, made_outfits,
         // MagiCoins, souvenir/gift token, and relationship with the date companion!
@@ -6314,6 +6372,13 @@ mod tests {
         assert_eq!(mort.data[10], 500);
         assert_eq!(mort.data[PERSON_FAME_LEVEL], 25);
         assert_eq!(mort.data[PERSON_DATE], 0, "date link cleared on return");
+        // A famous Sim that is not selected comes home with a star over its
+        // head (0x447a57 -> 0x447a82); the selected one has the plumb bob.
+        let mortimer_selected = home.world.objects[&home_mortimer_id].selected;
+        let star_over_mortimer = home.world.objects.values().any(|o| {
+            o.guid == crate::placement::STAR_MARKER && o.data[2] == home_mortimer_id as i16
+        });
+        assert_eq!(star_over_mortimer, !mortimer_selected);
         assert!(
             mort.accessories
                 .iter()
@@ -6362,8 +6427,7 @@ mod tests {
         assert!(stored_after.families[&5].friends >= 1);
 
         // Switching away from famous Mortimer (`fame=25`) via `select_sim`
-        // succeeds cleanly without tripping unported star-marker pool `0x446c15`
-        // and preserves exact fame!
+        // gives him a star (0x446c15) and keeps his fame.
         let bella_id = home
             .world
             .people
@@ -6411,6 +6475,56 @@ mod tests {
         for _ in 0..20 {
             home_final.step().unwrap();
         }
+
+        // A follower made famous away comes home with its fame, and as it
+        // is not selected, with a star (0x447a57 -> 0x447a82).
+        let vac_req = TravelRequest::vacation(40, mortimer_guid, VacationAccommodation::None);
+        let vac_dep =
+            depart_to_destination(&root, &store, "UserData", &mut home_final, &vac_req).unwrap();
+        let mut vac = vac_dep.destination_lot;
+        let vac_bella_id = vac_dep
+            .session
+            .travelers
+            .iter()
+            .find(|t| t.guid == bella_guid)
+            .expect("Bella travels with the family")
+            .destination_object_id;
+        vac.world
+            .objects
+            .get_mut(&vac_bella_id)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[PERSON_FAME_LEVEL] = 15;
+        let ret_vac = return_from_destination(
+            &root,
+            &store,
+            &vac_dep.session,
+            &mut vac,
+            &[3],
+            Frames::default(),
+        )
+        .unwrap();
+        let back = ret_vac.home_lot;
+        let back_bella_id = ret_vac
+            .report
+            .returning_travelers
+            .iter()
+            .find(|&&(guid, _)| guid == bella_guid)
+            .expect("Bella returns")
+            .1;
+        let bella = &back.world.objects[&back_bella_id];
+        assert_eq!(bella.person.as_ref().unwrap().data[PERSON_FAME_LEVEL], 15);
+        assert!(!bella.selected, "the leader is selected on return");
+        let held = bella.slots[2].object;
+        assert!(
+            held > 0
+                && back.world.objects.get(&(held as u16)).is_some_and(|o| {
+                    o.guid == crate::placement::STAR_MARKER && o.data[2] == back_bella_id as i16
+                }),
+            "the famous follower has a star over her head"
+        );
     }
 
     #[test]

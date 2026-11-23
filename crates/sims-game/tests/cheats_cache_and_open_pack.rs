@@ -796,7 +796,9 @@ fn autosave_worker_sha256_fast_path_commits_and_loads_cleanly() {
     let worker = AutosaveWorker::spawn(store.clone());
 
     let world = sims_sim::World::empty();
-    let world_bytes = world.encode();
+    // The world's encoding, then its pending indicator refreshes.
+    let world_bytes = world.encode_snapshot();
+    assert!(world_bytes.starts_with(&world.encode()));
     worker
         .enqueue_job(SaveJob::manual(
             "UserData",

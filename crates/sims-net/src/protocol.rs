@@ -10,9 +10,27 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Wire protocol version negotiated during `Hello` / `Welcome`.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// **Bump it with any change that makes two builds unable to share a
+/// session**, in particular:
+///
+/// - a new `sims_vm::boot::save::Saved` format, since the host sends the lot
+///   as a `Saved` snapshot and an older joiner rejects a newer format;
+/// - any change to what the co-op world fingerprint covers
+///   (`CoopWorldFingerprintTail` in `sims-vm`), since peers compare
+///   fingerprints every few ticks and a mismatch fails even on an idle lot.
+///
+/// The host rejects a `Hello` with another version before it sends anything
+/// else ([`RejectReason::ProtocolVersionMismatch`]), so the joiner sees why.
+/// [`ALPN`] stays the same across bumps for that reason: a different ALPN
+/// would fail the QUIC handshake without a message.
+///
+/// History: 2 for `Saved` format 11 and the indicator refresh queues in
+/// the fingerprint.
+pub const PROTOCOL_VERSION: u32 = 2;
 
-/// ALPN identifier for `iroh` QUIC co-op sessions.
+/// ALPN identifier for `iroh` QUIC co-op sessions. Not tied to
+/// [`PROTOCOL_VERSION`]: see there.
 pub const ALPN: &[u8] = b"sims-rs/coop/1";
 
 /// Maximum length of a single length-prefixed wire message (4 MiB).
@@ -641,6 +659,16 @@ pub enum RejectReason {
     InvalidEndpointHint,
     /// Peer received an invalid session configuration from host.
     InvalidConfig,
+}
+
+/// What a joiner tells its player when the host's [`PROTOCOL_VERSION`]
+/// differs from its own ([`RejectReason::ProtocolVersionMismatch`]).
+#[must_use]
+pub fn protocol_mismatch_message(host: u32, local: u32) -> String {
+    format!(
+        "Join rejected: the host runs a different sims-rs build (co-op protocol \
+         v{host}, this build v{local}). Both players need the same version."
+    )
 }
 
 /// Reason a REDB snapshot transfer was initiated.

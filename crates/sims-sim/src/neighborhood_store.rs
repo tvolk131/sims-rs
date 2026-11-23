@@ -988,8 +988,10 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// (`NEIGHBORHOOD_MIN_FORMAT..NEIGHBORHOOD_FORMAT`) are upgraded deterministically
 /// via [`crate::migration::NEIGHBORHOOD_MIGRATIONS`] (format 2 added
 /// `instance_id` and `deleted_characters`; format 3 added `deletion_epoch` and
-/// `deleted_at_epoch`; format 4 added `family_surnames`).
-pub const NEIGHBORHOOD_FORMAT: u32 = 4;
+/// `deleted_at_epoch`; format 4 added `family_surnames`; format 5 keeps
+/// `made_characters` in the order made, in format 4's layout, so a format-4
+/// build refuses it).
+pub const NEIGHBORHOOD_FORMAT: u32 = 5;
 
 /// Default `"architecture value multiplier"` from `Global.far` `FCNS #4`
 /// (`0x6e4a88`, `0x3f333333`).

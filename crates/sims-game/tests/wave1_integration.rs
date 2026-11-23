@@ -18,7 +18,7 @@ use sims_game::game::goth_house;
 use sims_game::neighborhood::{NeighborhoodShell, ScreenKind};
 use sims_game::sound::{Input, Mixer};
 use sims_game::{Frames, Game, Options};
-use sims_sim::autosave::{SaveSlot, SaveTarget};
+use sims_sim::autosave::{SaveJob, SavePayload, SaveSlot, SaveTarget};
 use sims_ui::caf::{Age, CafScreen, Gender, Personality, SimAppearance, SimDraft, SkinTone, Trait};
 use sims_ui::command::{BuildTool, Mode};
 use sims_ui::saves::{SaveHealth, SaveManagerCommand};
@@ -848,4 +848,150 @@ fn sound_mixer_radio_streaming_and_ambience_integration() {
     assert_eq!(mixer.radio().active_emitters(), 0);
     assert!(!mixer.ambience().is_playing());
     assert!(mixer.render(512).iter().all(|&s| s == 0));
+}
+
+/// Sets the open lot's pending indicator refreshes and star pools, through
+/// a save of the lot and its restore.
+fn set_open_queues(shell: &mut NeighborhoodShell, queues: sims_sim::IndicatorQueues) {
+    let game = shell.game_mut().expect("lot game");
+    let mut saved = game.save().expect("save the open lot");
+    saved.set_indicator_queues(queues);
+    game.lot_mut().restore(saved).expect("restore the open lot");
+}
+
+/// A `WorldSnapshot` slot saved before the indicator queues were kept (the
+/// world's encoding with nothing after it) restores with its star pools
+/// taken from where its stars stand, as a `Saved` of that age does, not
+/// with both pools empty: otherwise the next famous Sim would make four new
+/// stars while one star is held and three are free.
+#[test]
+fn an_old_world_snapshot_slot_adopts_its_star_pools() {
+    const STAR_MARKER: u32 = 0xE933_7020;
+    let Some(install) = install_dir() else {
+        eprintln!("SIMS_INSTALL is not set; skipping the old snapshot star pools test");
+        return;
+    };
+    let tmp = TempTestDir::new("old-snapshot-pools");
+    let saves = tmp.path().join("saves.redb");
+    let mut shell = NeighborhoodShell::open(install, saves, 1, false, vec![3], Frames::default())
+        .expect("NeighborhoodShell opens");
+    shell.enter_lot(5).expect("enter Goth lot 5");
+    let game = shell.game().expect("lot game");
+    let mut world = game.lot().world().clone();
+    let tick = u64::from(game.lot().ticks());
+    let person = world.people[0];
+
+    // Four stars: one held by a Sim, three free off the lot.
+    let template = world
+        .order
+        .iter()
+        .map(|id| &world.objects[id])
+        .find(|o| o.person.is_none() && o.multipart.is_none() && o.data.len() > 2)
+        .expect("an object to copy")
+        .clone();
+    let first = world.objects.keys().max().unwrap() + 1;
+    let stars: Vec<u16> = (first..first + 4).collect();
+    for (n, &id) in stars.iter().enumerate() {
+        let mut star = template.clone();
+        star.id = id;
+        star.guid = STAR_MARKER;
+        star.position = [-16, -16, 1];
+        star.slots.truncate(1);
+        star.data[2] = if n == 0 { person as i16 } else { 0 };
+        world.order.push(id);
+        world.objects.insert(id, star);
+    }
+    let expected = sims_vm::boot::save::queues_saved_before_kept(&world);
+    assert_eq!(expected.stars_in_use, [stars[0]]);
+    assert_eq!(expected.available_stars, [stars[3], stars[2], stars[1]]);
+
+    shell
+        .store()
+        .autosaves()
+        .commit_job(SaveJob::manual_for_instance(
+            shell.neighborhood_id(),
+            shell.stored_neighborhood().instance_id,
+            5,
+            tick,
+            SavePayload::world_bytes(world.encode()),
+        ))
+        .expect("save the old-style slot");
+
+    assert!(shell.open_save_manager(None));
+    let _ = shell.handle_save_manager_command(SaveManagerCommand::LoadSlot {
+        slot_id: "manual".into(),
+    });
+    assert!(
+        !shell.save_manager_open(),
+        "loading the WorldSnapshot slot must succeed"
+    );
+    assert_eq!(
+        shell
+            .game()
+            .expect("lot game")
+            .lot()
+            .world()
+            .indicator_queues,
+        expected,
+        "the pools from where the slot's stars stand"
+    );
+}
+
+/// Loading a `WorldSnapshot` slot through the Save Manager restores the
+/// slot's own indicator refreshes and star pools, not the open lot's: the
+/// restore splices the snapshot's world into the open lot's `Saved`, whose
+/// queues may name people the restored world lacks.
+#[test]
+fn a_world_snapshot_slot_restores_its_own_indicator_queues() {
+    let Some(install) = install_dir() else {
+        eprintln!("SIMS_INSTALL is not set; skipping the snapshot queues restore test");
+        return;
+    };
+    let tmp = TempTestDir::new("snapshot-queues");
+    let saves = tmp.path().join("saves.redb");
+    let mut shell = NeighborhoodShell::open(install, saves, 1, false, vec![3], Frames::default())
+        .expect("NeighborhoodShell opens");
+    shell.enter_lot(5).expect("enter Goth lot 5");
+    let people = shell.game().expect("lot game").lot().world().people.clone();
+    let [first, second, ..] = people[..] else {
+        panic!("the Goth house has two people: {people:?}");
+    };
+
+    // The slot: the world with `saved` pending.
+    let mut saved = sims_sim::IndicatorQueues::default();
+    saved.queue_date(first, 1);
+    saved.queue_star(first);
+    set_open_queues(&mut shell, saved.clone());
+    assert_eq!(shell.game().unwrap().lot().world().indicator_queues, saved);
+    shell
+        .enqueue_background_world_save(SaveTarget::Manual)
+        .expect("enqueue a WorldSnapshot manual save");
+    shell.flush_background_saves();
+    assert_eq!(shell.pending_background_saves(), 0);
+
+    // The open lot then has others pending.
+    let mut open = sims_sim::IndicatorQueues::default();
+    open.queue_star(second);
+    open.queue_star(second);
+    set_open_queues(&mut shell, open.clone());
+    assert_ne!(open, saved);
+
+    assert!(shell.open_save_manager(None));
+    let _ = shell.handle_save_manager_command(SaveManagerCommand::LoadSlot {
+        slot_id: "manual".into(),
+    });
+    assert!(
+        !shell.save_manager_open(),
+        "loading the WorldSnapshot slot must succeed"
+    );
+    assert_eq!(
+        shell
+            .game()
+            .expect("lot game")
+            .lot()
+            .world()
+            .indicator_queues,
+        saved,
+        "the slot's queues, not the open lot's"
+    );
 }

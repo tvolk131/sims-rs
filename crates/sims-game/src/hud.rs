@@ -161,6 +161,8 @@ pub struct Hud {
     /// autonomy tuning's friendship threshold (0x6c4398) for its
     /// smileys, the neighborhood's characters, and the Superstar pack.
     known: Acquaintances,
+    /// The UI archive, for a dialog's named icon outside `art`.
+    ui: Option<UiGraphics>,
     labels: Labels,
     /// The help balloons' texts.
     texts: Texts,
@@ -286,6 +288,8 @@ pub struct Hud {
 #[derive(Clone)]
 pub(crate) struct HudStatic {
     art: Art,
+    /// The UI archive, for a dialog's named icon outside `art` (`gz N`).
+    ui: Option<UiGraphics>,
     labels: Labels,
     rating_labels: RatingLabels,
     sell_labels: SellLabels,
@@ -321,7 +325,7 @@ impl HudStatic {
                     camera_strings,
                 ))
             });
-            let art_res = (|| -> Result<Art, String> {
+            let art_res = (|| -> Result<(Art, UiGraphics), String> {
                 let ui = UiGraphics::open_with_pool(install, pool).map_err(|e| e.to_string())?;
                 let resources: Vec<i32> = hud::RESOURCES
                     .iter()
@@ -347,6 +351,7 @@ impl HudStatic {
                     .chain(build::resource_ids())
                     .collect();
                 Art::load_with_optional(&ui, US_ENGLISH, &resources, &optional)
+                    .map(|art| (art, ui))
                     .map_err(|e| e.to_string())
             })();
             (
@@ -354,7 +359,7 @@ impl HudStatic {
                 text_handle.join().expect("hud text worker panicked"),
             )
         });
-        let art = art_res?;
+        let (art, ui) = art_res?;
         let (
             labels,
             rating_labels,
@@ -367,6 +372,7 @@ impl HudStatic {
         ) = text_res?;
         Ok(Self {
             art,
+            ui: Some(ui),
             labels,
             rating_labels,
             sell_labels,
@@ -383,6 +389,7 @@ impl HudStatic {
     pub(crate) fn clean_room_procedural() -> Self {
         Self {
             art: Art::clean_room_procedural(),
+            ui: None,
             labels: Labels::default(),
             rating_labels: RatingLabels::default(),
             sell_labels: SellLabels::default(),
@@ -637,6 +644,7 @@ impl Hud {
         );
         Self {
             art: static_part.art,
+            ui: static_part.ui,
             boot_faces: faces.clone(),
             faces,
             thumbnails: Thumbnails::default(),
@@ -1953,6 +1961,9 @@ impl Hud {
             careers: Some(&self.careers),
             fame: Some(&self.fame),
             families: Some(&self.families),
+            ui: self.ui.as_ref(),
+            known: Some(&self.known),
+            members: &self.members,
         };
         let read = Message::read_with_context(
             world,

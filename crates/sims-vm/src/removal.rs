@@ -148,22 +148,13 @@ impl Interpreter<'_> {
                 world.indicators[slot] = 0;
             }
         }
-        // 0x44602d..0x446133: after the two indicators, clear pooled star
-        // markers (in-use first, then available).
-        let mut stars_in_use = Vec::new();
-        let mut stars_avail = Vec::new();
-        for &id in world.order.iter().rev() {
-            if let Some(obj) = world.objects.get(&id)
-                && obj.guid == crate::placement::STAR_MARKER
-            {
-                if obj.data.get(2).copied().unwrap_or(0) != 0 {
-                    stars_in_use.push(id);
-                } else {
-                    stars_avail.push(id);
-                }
-            }
-        }
-        for id in stars_in_use.into_iter().chain(stars_avail) {
+        // 0x44602d..0x446133: after the two indicators, the pooled star
+        // markers go, the in-use pool first and then the available pool,
+        // each from its front, and both pools are emptied. A star in
+        // neither pool (lost on a border tile) goes with the other objects.
+        let in_use = std::mem::take(&mut world.indicator_queues.stars_in_use);
+        let available = std::mem::take(&mut world.indicator_queues.available_stars);
+        for id in in_use.into_iter().chain(available) {
             if world.objects.contains_key(&id) {
                 self.remove_now_inner(world, id, false)?;
                 removed.push(id);
@@ -232,6 +223,32 @@ impl Interpreter<'_> {
             for indicator in &mut world.indicators {
                 if *indicator == id {
                     *indicator = 0;
+                }
+            }
+        }
+        // 0x447e69 -> 0x448097: a star marker leaves both star pools here,
+        // before it is taken off the lot (0x4412a4), so a callback fault
+        // during the take-off leaves no in-use entry for a star detached
+        // from its head.
+        if interface_enabled
+            && world
+                .objects
+                .get(&id)
+                .is_some_and(|o| o.guid == crate::placement::STAR_MARKER)
+        {
+            let pools = &mut world.indicator_queues;
+            pools.available_stars.retain(|&star| star != id);
+            pools.stars_in_use.retain(|&star| star != id);
+        }
+        // 0x447ed5..0x447f74 and 0x447fdd..0x448068: a person leaves the
+        // indicator refresh queues, the first entry of each that names it
+        // (0x448663 erases one element). Any other entry goes when the
+        // object is deleted below (`sims_sim::IndicatorQueues::forget`).
+        if interface_enabled && world.objects.get(&id).is_some_and(|o| o.person.is_some()) {
+            let queues = &mut world.indicator_queues;
+            for queue in [&mut queues.dates, &mut queues.stars] {
+                if let Some(index) = queue.iter().position(|&other| other == id) {
+                    queue.remove(index);
                 }
             }
         }
@@ -508,6 +525,7 @@ impl Interpreter<'_> {
         // The object's destructor stops its sounds (0x4323c9).
         self.sound(SoundEvent::Stop { object: id as i16 });
         world.objects.remove(&id);
+        world.indicator_queues.forget(id);
         // 0x447d8b -> 0x448097 (`legacy/crates/sims-vm/src/indicator_unregister.rs`):
         // unregister a deleted indicator from `world.indicators` so later
         // selection/deselection never dereferences a missing indicator ID.
@@ -751,6 +769,15 @@ impl Interpreter<'_> {
                             || o.guid == crate::placement::STAR_MARKER
                     });
                 if is_protected_marker {
+                    // A star let go goes back to the available pool, as a
+                    // star taken off a head does (0x4481eb).
+                    if world
+                        .objects
+                        .get(&held)
+                        .is_some_and(|o| o.guid == crate::placement::STAR_MARKER)
+                    {
+                        Self::release_star(world, held);
+                    }
                     let _ = crate::placement::unlink_off_lot(world, held);
                     if let Some(parent_obj) = world.objects.get_mut(&cur)
                         && let Some(slot) = parent_obj.slots.get_mut(slot_idx)
@@ -889,6 +916,7 @@ impl Interpreter<'_> {
             }
             // Remove `victim` from `world.objects` and all side tables.
             world.objects.remove(&victim);
+            world.indicator_queues.forget(victim);
             if let Some(marks) = self.deleting {
                 marks.borrow_mut().remove(&victim);
             }
