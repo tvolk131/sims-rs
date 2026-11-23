@@ -6508,10 +6508,27 @@ mod tests {
             dt_mortimer_id as i16
         );
 
-        // The famous companion is not selected: placing it on the lot put a
-        // pooled star over its head (0x447a57 -> 0x447a82). The leader is
-        // selected and has none.
+        // The famous companion is not selected: placing it on the lot puts a
+        // pooled star over its head (0x447a57 -> 0x447a82). The person
+        // factory leaves it off the lot (0x4e9719 -> 0x440b2d), so the star
+        // comes when the middle ped marker places it. The leader is selected
+        // and has none.
         assert!(!dt.world.objects[&dt_companion_id].selected);
+        let on_lot = |dt: &crate::boot::Lot, id: u16| {
+            let position = dt.world.objects[&id].position;
+            position[0] >= 0 && position[1] >= 0
+        };
+        assert!(!on_lot(&dt, dt_companion_id));
+        for _ in 0..220 {
+            if on_lot(&dt, dt_companion_id) && on_lot(&dt, dt_mortimer_id) {
+                break;
+            }
+            dt.step_play().unwrap();
+        }
+        assert!(
+            on_lot(&dt, dt_companion_id),
+            "the marker places the companion"
+        );
         let star_over = |id: u16| {
             dt.world.objects.values().any(|o| {
                 o.guid == crate::placement::STAR_MARKER
