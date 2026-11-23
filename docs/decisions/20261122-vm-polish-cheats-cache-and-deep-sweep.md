@@ -27,7 +27,7 @@ Added strictly additive live-lot APIs on `Lot` (all defaulting to strict, unmodi
     - `can_delete` still refuses surfaces carrying child objects (`has_child`).
     - Disabling `move_objects` mid-drag revalidates any override-placed preview before commit, while `buy_cancel` / `buy_snap_back` still restores captured overlapped origins cleanly so held objects are never stranded.
 - **`Lot::add_funds(&mut self, delta: i32) -> Result<i32, OrderError>`:**
-  - Applies `saturating_add(delta)` clamped to the exact lossless `globals[13..14]` script range `[-327_680_000, 327_679_999]` via `World::set_funds` directly on the live `World` (respecting budget mode `global[32] != 0`) without invoking `Lot::restore`, preserving Buy/Build undo history and `neighborhood_origin`. Refused while a co-op session is attached so peers cannot desynchronize.
+  - Applies `saturating_add(delta)` clamped to the exact lossless `globals[13..14]` script range `[-327_689_999, 327_679_999]` via `World::set_funds` directly on the live `World` (respecting budget mode `global[32] != 0`) without invoking `Lot::restore`, preserving Buy/Build undo history and `neighborhood_origin`. Refused while a co-op session is attached so peers cannot desynchronize.
 - **`Lot::set_hour(&mut self, hour: u8) -> Result<(), OrderError>`:**
   - Rejects `hour >= 24`, updates `globals[0] = hour`, clears `globals[5]` and `globals[6]` (minute/second), updates `globals[4]` (time-of-day period matching `Sims.exe` `0x46d525`: `0..=5 => 2`, `6 => 3`, `7..=17 => 0`, `18 => 1`, `19..=23 => 2`), calls `world.mark_all_rooms()` when the period changes, preserves Buy/Build undo history and `neighborhood_origin`, and refuses mutation while a co-op session is attached.
 

@@ -1971,7 +1971,16 @@ fn splice_character_catalog(
     const CATALOG_TAGS: [[u8; 4]; 2] = [*b"OBJD", *b"GLOB"];
     let mut inserted_objects: Vec<Object> = Vec::new();
     let mut inserted_globs: Vec<(usize, String, Option<String>)> = Vec::new();
-    let mut diagnostics = base_catalog.diagnostics.clone();
+    // Retain non-replacement base diagnostics and regenerate duplicate-GUID
+    // replacement diagnostics from the final merged object order so an inserted
+    // character resource between two base definitions does not leave an
+    // obsolete `C replaces A` entry behind.
+    let mut diagnostics: Vec<String> = base_catalog
+        .diagnostics
+        .iter()
+        .filter(|d| !(d.starts_with("GUID 0x") && d.contains(" replaces ")))
+        .cloned()
+        .collect();
 
     for res_idx in inserted_range {
         let resource = &index.resources[res_idx];
@@ -2042,23 +2051,18 @@ fn splice_character_catalog(
         objects.push(shifted);
     }
 
-    let inserted_end = start + delta;
     let mut by_guid = BTreeMap::new();
     for (idx, object) in objects.iter().enumerate() {
         if let Some(previous_idx) = by_guid.insert(object.guid, idx) {
             let prev = &objects[previous_idx];
-            if (start..inserted_end).contains(&object.resource)
-                || (start..inserted_end).contains(&prev.resource)
-            {
-                diagnostics.push(format!(
-                    "GUID 0x{:08X} in {} OBJD #{} replaces {} OBJD #{}",
-                    object.guid,
-                    index.resources[object.resource].location(&index.root),
-                    object.chunk,
-                    index.resources[prev.resource].location(&index.root),
-                    prev.chunk,
-                ));
-            }
+            diagnostics.push(format!(
+                "GUID 0x{:08X} in {} OBJD #{} replaces {} OBJD #{}",
+                object.guid,
+                index.resources[object.resource].location(&index.root),
+                object.chunk,
+                index.resources[prev.resource].location(&index.root),
+                prev.chunk,
+            ));
         }
     }
 
@@ -3453,6 +3457,7 @@ fn save_and_leave_lot_inner(
         tuning.friendship_threshold,
     );
     saved.deletion_epoch = stored.deletion_epoch;
+    saved.family_flags = Some(saved.world.family_flags.clone());
     let lot_bytes = saved.encode();
     let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
         neighborhood_id,
@@ -3887,6 +3892,7 @@ fn evict_or_bulldoze(
         .save()
         .map_err(|e| LifecycleError::Lot(format!("saving cleared lot {house}: {e}")))?;
     saved.deletion_epoch = stored.deletion_epoch;
+    saved.family_flags = Some(saved.world.family_flags.clone());
     let lot_bytes = saved.encode();
     match store.save_lot_and_neighborhood_checked(
         neighborhood_id,

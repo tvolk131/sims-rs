@@ -134,7 +134,7 @@ fn add_funds_and_set_hour_mutate_live_world_and_preserve_undo_history() {
     assert_eq!(after_minus, start_funds + 750);
     assert_eq!(lot.world().budget.funds, start_funds + 750);
 
-    // Clamps to the lossless globals[13..14] script-visible ceiling without wrapping.
+    // Clamps to the lossless globals[13..14] script-visible bounds without wrapping.
     let clamped = lot.add_funds(i32::MAX).unwrap();
     assert_eq!(clamped, 327_679_999);
     assert_eq!(lot.world().budget.funds, 327_679_999);
@@ -143,8 +143,16 @@ fn add_funds_and_set_hour_mutate_live_world_and_preserve_undo_history() {
         327_679_999
     );
 
+    let clamped_min = lot.add_funds(i32::MIN).unwrap();
+    assert_eq!(clamped_min, -327_689_999);
+    assert_eq!(lot.world().budget.funds, -327_689_999);
+    assert_eq!(
+        i32::from(lot.world().globals[14]) * 10_000 + i32::from(lot.world().globals[13]),
+        -327_689_999
+    );
+
     // Reset to a sane value before saving.
-    lot.add_funds(-(327_679_999 - 5000)).unwrap();
+    lot.add_funds(327_689_999 + 5000).unwrap();
     assert_eq!(lot.world().budget.funds, 5000);
 
     // 2. set_hour rejects >= 24, updates global 0/4/5/6, and marks rooms on period change.
@@ -299,8 +307,8 @@ fn move_objects_overrides_in_use_and_overlap_while_preserving_invariants() {
         lot.buy_move(&mut cursor, occupied_pos, level).unwrap(),
         "move_objects must allow overlapping placement on an occupied in-bounds tile"
     );
-    // P0 regression: invalid floor passed to buy_put_if_fits must be refused
-    // without overwriting cursor.position[2] or crashing commit!
+    // P0/P1 regression: invalid floors passed to buy_put_if_fits / buy_recheck
+    // must be refused without overwriting cursor.position[2] or overflowing.
     assert!(
         !lot.buy_put_if_fits(&mut cursor, i32::MIN).unwrap(),
         "buy_put_if_fits must refuse i32::MIN level"
@@ -309,9 +317,17 @@ fn move_objects_overrides_in_use_and_overlap_while_preserving_invariants() {
         !lot.buy_put_if_fits(&mut cursor, 0).unwrap(),
         "buy_put_if_fits must refuse level 0"
     );
+    assert!(
+        !lot.buy_recheck(&mut cursor, i32::MIN).unwrap(),
+        "buy_recheck must refuse i32::MIN level without overflowing"
+    );
+    assert!(
+        !lot.buy_recheck(&mut cursor, 0).unwrap(),
+        "buy_recheck must refuse level 0"
+    );
     assert_eq!(
         cursor.position[2], level,
-        "refused buy_put_if_fits must preserve the previous valid floor"
+        "refused buy_put_if_fits/buy_recheck must preserve the previous valid floor"
     );
     assert!(
         lot.buy_put_if_fits(&mut cursor, level).unwrap(),

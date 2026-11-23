@@ -1165,6 +1165,34 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    fn clear_portal_if_unoccupied(
+        &self,
+        world: &mut World,
+        id: u16,
+        at: [i8; 3],
+    ) -> Result<(), Fault> {
+        if !tile_inside_lot(world, at) {
+            return Ok(());
+        }
+        for (&other_id, other) in &world.objects {
+            if other_id == id || other.position[0] < 0 || other.position[1] < 0 {
+                continue;
+            }
+            if (other.position[0] >> 4) == i32::from(at[0])
+                && (other.position[1] >> 4) == i32::from(at[1])
+                && other.position[2] == i32::from(at[2])
+                && self.is_portal_object(world, other_id)?
+            {
+                return Ok(());
+            }
+        }
+        self.mark_portal(world, at, false).map_err(|trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        })
+    }
+
     /// One object leaves the lot (0x433125). An object that is not a tile
     /// of a group is asked function 10 first; a group asks all its tiles
     /// before any leaves. Then the object's links go to the object behind
@@ -1205,30 +1233,15 @@ impl Interpreter<'_> {
             self.callback(world, parent, function::PLACED, 0)?;
         }
         // 0x4332b7: the door test reads the definition the object stands
-        // for, not its own. Only clear `PORTAL_TILE` when no other on-lot
-        // portal remains on `was` (e.g. if two doors ever shared a tile).
+        // for, not its own. Use the captured `old_tile` (including its floor)
+        // and only clear `PORTAL_TILE` when no other on-lot portal remains on
+        // that tile (e.g. if two doors ever shared a tile).
         let door = self
             .master_words(world, id, "taking a door off (0x4332af)")
             .map_err(fail)?[word::PORTAL]
             == 6;
         if door {
-            let mut another_portal_remains = false;
-            for (&other_id, other) in &world.objects {
-                if other_id == id || other.position[0] < 0 || other.position[1] < 0 {
-                    continue;
-                }
-                if (other.position[0] >> 4) == i32::from(was[0])
-                    && (other.position[1] >> 4) == i32::from(was[1])
-                    && other.position[2] == i32::from(was[2])
-                    && self.is_portal_object(world, other_id)?
-                {
-                    another_portal_remains = true;
-                    break;
-                }
-            }
-            if !another_portal_remains {
-                self.mark_portal(world, was, false).map_err(fail)?;
-            }
+            self.clear_portal_if_unoccupied(world, id, old_tile)?;
         }
         if notify {
             self.left_lot(world, id)?;
@@ -1336,7 +1349,7 @@ impl Interpreter<'_> {
             .map_err(fail)?[word::PORTAL]
             == 6;
         if portal {
-            self.mark_portal(world, was, false).map_err(fail)?;
+            self.clear_portal_if_unoccupied(world, id, old_tile)?;
         }
         let point = match to.container {
             Some(parent) => {

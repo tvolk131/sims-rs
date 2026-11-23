@@ -2064,10 +2064,10 @@ impl Lot {
     /// history and `neighborhood_origin`. Updates globals 13 and 14 via
     /// [`World::set_funds`] (respecting budget mode `global[32]`), clamps the
     /// resulting balance to the exact lossless `globals[13..14]` script range
-    /// `[-327_680_000, 327_679_999]`, refuses mutation while a co-op session is
+    /// `[-327_689_999, 327_679_999]`, refuses mutation while a co-op session is
     /// attached, and returns the resulting `world.budget.funds`.
     pub fn add_funds(&mut self, delta: i32) -> Result<i32, OrderError> {
-        const MIN_CHEAT_FUNDS: i32 = -327_680_000;
+        const MIN_CHEAT_FUNDS: i32 = -327_689_999;
         const MAX_CHEAT_FUNDS: i32 = 327_679_999;
         self.ready()?;
         if self.coop.is_some() {
@@ -4813,7 +4813,7 @@ mod tests {
         assert!(!lot.move_objects());
 
         // add_funds updates budget + globals 13/14 and clamps to the exact
-        // lossless script-visible range [-327_680_000, 327_679_999].
+        // lossless script-visible range [-327_689_999, 327_679_999].
         assert_eq!(lot.add_funds(500).unwrap(), 1500);
         assert_eq!(lot.world().budget.funds, 1500);
         assert_eq!(lot.world().globals[13], 1500);
@@ -4825,10 +4825,12 @@ mod tests {
             i32::from(lot.world().globals[14]) * 10_000 + i32::from(lot.world().globals[13]),
             327_679_999
         );
-        assert_eq!(lot.add_funds(i32::MIN).unwrap(), -327_680_000);
+        assert_eq!(lot.add_funds(i32::MIN).unwrap(), -327_689_999);
+        assert_eq!(lot.world().globals[14], -32768);
+        assert_eq!(lot.world().globals[13], -9999);
         assert_eq!(
             i32::from(lot.world().globals[14]) * 10_000 + i32::from(lot.world().globals[13]),
-            -327_680_000
+            -327_689_999
         );
 
         // Budget mode (global 32 == 1): World::set_funds is a no-op, preserving

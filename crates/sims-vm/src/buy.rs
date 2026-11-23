@@ -626,6 +626,58 @@ impl Interpreter<'_> {
         }
     }
 
+    /// Returns whether `(tx, ty, level)` carries `PORTAL_TILE` due to another
+    /// portal (or pre-existing flag) rather than only `exclude_parts` sitting
+    /// on that tile in place (e.g. during `buy_put_if_fits`).
+    fn tile_has_other_portal(
+        &self,
+        world: &World,
+        exclude_parts: &[u16],
+        tx: i8,
+        ty: i8,
+        level: i32,
+    ) -> Result<bool, Fault> {
+        let fail = |trap| Fault {
+            object: exclude_parts.first().copied().unwrap_or(0),
+            at: None,
+            trap,
+        };
+        let flags = crate::placement::tile_flags(world, tx, ty, level).map_err(fail)?;
+        if (flags & crate::placement::PORTAL_TILE) == 0 {
+            return Ok(false);
+        }
+        let mut self_on_tile = false;
+        for &part in exclude_parts {
+            if let Some(obj) = world.objects.get(&part)
+                && obj.position[0] >= 0
+                && obj.position[1] >= 0
+                && (obj.position[0] >> 4) == i32::from(tx)
+                && (obj.position[1] >> 4) == i32::from(ty)
+                && obj.position[2] == level
+                && self.is_portal_object(world, part)?
+            {
+                self_on_tile = true;
+                break;
+            }
+        }
+        if !self_on_tile {
+            return Ok(true);
+        }
+        for (&other_id, other) in &world.objects {
+            if exclude_parts.contains(&other_id) || other.position[0] < 0 || other.position[1] < 0 {
+                continue;
+            }
+            if (other.position[0] >> 4) == i32::from(tx)
+                && (other.position[1] >> 4) == i32::from(ty)
+                && other.position[2] == level
+                && self.is_portal_object(world, other_id)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Bounds-checked ground placement fallback used only when
     /// `self.move_objects` is enabled: still requires tile-centred coordinates
     /// (`(x & 15) == 8 && (y & 15) == 8`), `level in 1..=2`, every part of the
@@ -654,17 +706,16 @@ impl Interpreter<'_> {
             .get(&id)
             .is_some_and(|o| o.multipart.is_some());
         if !is_group {
-            if self.is_portal_object(world, id)? {
-                let flags = crate::placement::tile_flags(
+            if self.is_portal_object(world, id)?
+                && self.tile_has_other_portal(
                     world,
+                    &[id],
                     (pos[0] >> 4) as i8,
                     (pos[1] >> 4) as i8,
                     level,
-                )
-                .map_err(fail)?;
-                if (flags & crate::placement::PORTAL_TILE) != 0 {
-                    return Ok(false);
-                }
+                )?
+            {
+                return Ok(false);
             }
             return Ok(true);
         }
@@ -679,7 +730,8 @@ impl Interpreter<'_> {
             pos[1].wrapping_sub(selected[1].wrapping_mul(16)),
         ];
         let origin_level = level.wrapping_sub(selected[2]);
-        for part in self.parts(world, id).map_err(fail)? {
+        let parts = self.parts(world, id).map_err(fail)?;
+        for &part in &parts {
             if !self.is_portal_object(world, part)? {
                 continue;
             }
@@ -696,14 +748,13 @@ impl Interpreter<'_> {
                 origin[1].wrapping_add(offset[1].wrapping_mul(16)),
             ];
             let part_level = origin_level.wrapping_add(offset[2]);
-            let flags = crate::placement::tile_flags(
+            if self.tile_has_other_portal(
                 world,
+                &parts,
                 (at[0] >> 4) as i8,
                 (at[1] >> 4) as i8,
                 part_level,
-            )
-            .map_err(fail)?;
-            if (flags & crate::placement::PORTAL_TILE) != 0 {
+            )? {
                 return Ok(false);
             }
         }
@@ -1075,14 +1126,17 @@ impl Interpreter<'_> {
             .then_some(cursor.container)
             .flatten();
         self.remove_cursor_and_held(world, cursor)?;
-        if !inside_placement_bounds(world, pos) {
-            // Native `0x485c75` -> `0x422632`: exit immediately on border
-            // rejection without overwriting the last saved turn position.
+        if !(1..=2).contains(&level) || !inside_placement_bounds(world, pos) {
+            // Native `0x485c75` -> `0x422632`: exit immediately on border or
+            // invalid-floor rejection without overwriting the last saved turn
+            // position.
             cursor.valid = false;
+            cursor.placed_via_override = false;
             return Ok(false);
         }
         cursor.valid = false;
         cursor.container = None;
+        cursor.placed_via_override = false;
         // Native `0x485ced`: check whether `"Tile Cursor"` fits at snapped
         // `pos` BEFORE writing `cursor.position` (`0x421e72`) or trying
         // snapped placement / wall auto-rotation (`0x48736b`); if it does not
@@ -1183,8 +1237,9 @@ impl Interpreter<'_> {
             at,
             level,
             retained,
+            allow_override,
         )? {
-            Some(container) => (container, false),
+            Some(fit) => (fit.container, fit.used_override),
             None if allow_override
                 && self.move_objects
                 && self.user_test_place_ground_override(world, cursor.held, at, level)? =>
@@ -1485,6 +1540,9 @@ impl Interpreter<'_> {
         cursor: &mut BuyCursor,
         level: i32,
     ) -> Result<bool, Fault> {
+        if !(1..=2).contains(&level) {
+            return Ok(false);
+        }
         let Some([x, y]) = world
             .objects
             .get(&cursor.cursor)
@@ -1505,11 +1563,13 @@ impl Interpreter<'_> {
         }
         cursor.valid = false;
         cursor.container = None;
+        cursor.placed_via_override = false;
         if self.try_place_buy_at_mode(world, cursor, [x, y], level, retained, true)? {
             return Ok(cursor.valid);
         }
         cursor.valid = false;
         cursor.container = None;
+        cursor.placed_via_override = false;
         if cursor_on_lot && inside_placement_bounds(world, [x, y]) {
             cursor.position = [x, y, level];
             let cursor_place = Place {
@@ -1610,21 +1670,27 @@ impl Interpreter<'_> {
                 "cannot commit Buy Mode placement: insufficient funds".into(),
             )));
         }
-        self.remove_cursor_and_held(world, cursor)?;
         if cursor.placed_via_override {
-            let still_valid = if self.move_objects {
-                cursor.container.is_none()
-                    && self.user_test_place_ground_override(world, cursor.held, [x, y], level)?
-            } else {
-                self.test_buy_placement(
-                    world,
-                    cursor.cursor,
-                    cursor.held,
-                    [x, y],
-                    level,
-                    cursor.container,
-                )?
-                .is_some()
+            let mut check_world = world.clone();
+            self.remove_cursor_and_held(&mut check_world, cursor)?;
+            let still_valid = match (self.move_objects, cursor.container) {
+                (true, None) => {
+                    self.user_test_place_ground_override(&check_world, cursor.held, [x, y], level)?
+                }
+                (false, None) => self
+                    .user_test_place_ground(&mut check_world, cursor.held, [x, y], level)?
+                    .is_ok(),
+                (_, Some((cid, slot))) => {
+                    self.user_fits_in(
+                        &mut check_world,
+                        cursor.held,
+                        cid,
+                        i32::from(slot),
+                        [x, y],
+                        level,
+                        self.move_objects,
+                    )? != SurfaceFit::No
+                }
             };
             if !still_valid {
                 return Err(fail(Trap::Invalid(
@@ -1633,6 +1699,7 @@ impl Interpreter<'_> {
                 )));
             }
         }
+        self.remove_cursor_and_held(world, cursor)?;
         self.remove_now(world, self.lead_object(world, cursor.cursor))?;
         let place = Place {
             on_lot: true,
@@ -1780,7 +1847,15 @@ impl Interpreter<'_> {
         self.rotate_object_to(world, id, target.facing)?;
         let fits = match target.container {
             Some((cid, slot)) => {
-                self.user_fits_in(world, id, cid, i32::from(slot), [x, y], level)?
+                self.user_fits_in(
+                    world,
+                    id,
+                    cid,
+                    i32::from(slot),
+                    [x, y],
+                    level,
+                    allow_override,
+                )? != SurfaceFit::No
             }
             None => {
                 self.user_test_place_ground(world, id, [x, y], level)?
@@ -2499,7 +2574,8 @@ impl Interpreter<'_> {
     /// an existing on-lot container, lot-interior bounds and ground flag
     /// `0x20` clear, `fits_in` (`0x4355b5`), tile-centred coordinates
     /// (`0x4355bc..0x4355cd`), and containment slot height not in `5..=7`
-    /// (`0x43560c..0x435623`) when `move_objects` is off.
+    /// (`0x43560c..0x435623`) when `move_objects` override is not active.
+    #[allow(clippy::too_many_arguments)]
     fn user_fits_in(
         &self,
         world: &mut World,
@@ -2508,7 +2584,8 @@ impl Interpreter<'_> {
         slot: i32,
         pos: [i32; 2],
         level: i32,
-    ) -> Result<bool, Fault> {
+        override_active: bool,
+    ) -> Result<SurfaceFit, Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -2519,41 +2596,46 @@ impl Interpreter<'_> {
             .get(&container)
             .is_some_and(|c| on_lot([c.position[0], c.position[1]]))
         {
-            return Ok(false);
+            return Ok(SurfaceFit::No);
         }
         if !inside_placement_bounds(world, pos) {
-            return Ok(false);
+            return Ok(SurfaceFit::No);
         }
-        if !self.move_objects {
-            let a = i8::try_from(pos[0] >> 4).unwrap_or(-1);
-            let b = i8::try_from(pos[1] >> 4).unwrap_or(-1);
-            if (crate::placement::tile_flags(world, a, b, 1).map_err(fail)? & 0x20) != 0 {
-                return Ok(false);
-            }
+        let a = i8::try_from(pos[0] >> 4).unwrap_or(-1);
+        let b = i8::try_from(pos[1] >> 4).unwrap_or(-1);
+        let locked_tile = (crate::placement::tile_flags(world, a, b, 1).map_err(fail)? & 0x20) != 0;
+        if locked_tile && !override_active {
+            return Ok(SurfaceFit::No);
         }
         if !self.fits_in(world, id, container, slot, pos, level)? {
-            return Ok(false);
+            return Ok(SurfaceFit::No);
         }
         if (pos[0] & 0x0f) != 8 || (pos[1] & 0x0f) != 8 {
-            return Ok(false);
-        }
-        if self.move_objects {
-            return Ok(true);
+            return Ok(SurfaceFit::No);
         }
         let height = self
             .container_slot_height(world, container, slot)
             .map_err(fail)?;
-        Ok(!matches!(height, Some(5..=7)))
+        let restricted_height = matches!(height, Some(5..=7));
+        if restricted_height && !override_active {
+            return Ok(SurfaceFit::No);
+        }
+        Ok(if locked_tile || restricted_height {
+            SurfaceFit::Override
+        } else {
+            SurfaceFit::Strict
+        })
     }
 
     /// Tests whether `held` fits at `[pos, level]` (`0x422050`): first tries
     /// any `retained` surface container at the same tile without re-aligning
     /// facing (`0x422050` line `0x422078`), then runs `UserTestPlace`
-    /// (`0x435522` / `0x422de4`, `Some(None)`), and — after a collision
-    /// refusal (`0x0b`) on a single-tile object — searches compatible surface
-    /// slots on that tile (`Some(Some((container_id, slot)))`), rejecting slot
-    /// heights `5..=7` (`0x43560c..0x435623`) and aligning facing via
-    /// `0x4221e4..0x422280` + `0x43244d`.
+    /// (`0x435522` / `0x422de4`, `Some((None, false))`), and — after a
+    /// collision refusal (`0x0b`) on a single-tile object — searches compatible
+    /// surface slots on that tile (`Some((Some((container_id, slot)), used_override))`),
+    /// rejecting slot heights `5..=7` (`0x43560c..0x435623`) unless override is
+    /// active and aligning facing via `0x4221e4..0x422280` + `0x43244d`.
+    #[allow(clippy::too_many_arguments)]
     fn test_buy_placement(
         &self,
         world: &mut World,
@@ -2562,14 +2644,33 @@ impl Interpreter<'_> {
         pos: [i32; 2],
         level: i32,
         retained: Option<(u16, i16)>,
-    ) -> Result<Option<Option<(u16, i16)>>, Fault> {
-        if let Some((container, slot)) = retained
-            && self.user_fits_in(world, held, container, i32::from(slot), pos, level)?
-        {
-            return Ok(Some(Some((container, slot))));
+        allow_override: bool,
+    ) -> Result<Option<PlacementFit>, Fault> {
+        let override_active = allow_override && self.move_objects;
+        if let Some((container, slot)) = retained {
+            let fit = self.user_fits_in(
+                world,
+                held,
+                container,
+                i32::from(slot),
+                pos,
+                level,
+                override_active,
+            )?;
+            if fit != SurfaceFit::No {
+                return Ok(Some(PlacementFit {
+                    container: Some((container, slot)),
+                    used_override: fit == SurfaceFit::Override,
+                }));
+            }
         }
         match self.user_test_place_ground(world, held, pos, level)? {
-            Ok(()) => return Ok(Some(None)),
+            Ok(()) => {
+                return Ok(Some(PlacementFit {
+                    container: None,
+                    used_override: false,
+                }));
+            }
             Err(Refusal::Collision(_)) => {}
             Err(_) => return Ok(None),
         }
@@ -2605,16 +2706,40 @@ impl Interpreter<'_> {
                 .get(&container)
                 .map_or(0, |o| o.slots.len().saturating_sub(1));
             for slot in 0..slot_count {
-                if self.user_fits_in(world, held, container, slot as i32, pos, level)? {
+                let fit = self.user_fits_in(
+                    world,
+                    held,
+                    container,
+                    slot as i32,
+                    pos,
+                    level,
+                    override_active,
+                )?;
+                if fit != SurfaceFit::No {
                     let target_dir =
                         surface_aligned_direction(world, container, current_facing, level)?;
                     self.rotate_held_to(world, cursor, held, target_dir)?;
-                    return Ok(Some(Some((container, slot as i16))));
+                    return Ok(Some(PlacementFit {
+                        container: Some((container, slot as i16)),
+                        used_override: fit == SurfaceFit::Override,
+                    }));
                 }
             }
         }
         Ok(None)
     }
+}
+
+struct PlacementFit {
+    container: Option<(u16, i16)>,
+    used_override: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SurfaceFit {
+    No,
+    Strict,
+    Override,
 }
 
 /// Computes the surface-aligned facing direction for a single-tile object
