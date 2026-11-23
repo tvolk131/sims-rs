@@ -47,8 +47,13 @@ use crate::play::Play;
 use crate::program::{Callback, DEFINITION_WORDS};
 use crate::selection::selected;
 use crate::{Answers, BuyCursor, Program};
-use sims_content::{Animations, Catalog, House, Index, Install, People, SurfaceCatalog, Surfaces};
+use sims_content::{
+    Animations, ArchivePool, AvatarRegistry, Catalog, House, Index, Install, Object, People,
+    SurfaceCatalog, Surfaces,
+};
 use sims_core::CrtRng;
+use sims_formats::behavior::ObjectDefinition;
+use sims_formats::execution::global_link;
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 use sims_sim::load::{Context, ExpandedWall, FLOORS, WALLS, visitor_again};
@@ -62,6 +67,7 @@ use sims_sim::{FULL_SIZE, HouseUsage, Usage, World};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// `Global.far` `FCNS` chunk IDs read by neighborhood tuning (`0x424216`) and
 /// autonomy (`0x6c4398`).
@@ -679,6 +685,17 @@ fn update_lot_values(
         .map_err(|e| LifecycleError::Lot(e.to_string()))?;
     if let Some(slot) = world.globals.get_mut(BUILT) {
         *slot = i16::from(built_from_objects || built_from_arch);
+    }
+    let active_family = i32::from(world.globals.get(9).copied().unwrap_or(0));
+    if active_family != 0 {
+        let entry = world.family_flags.entry(active_family).or_insert(0);
+        *entry &= !0x3;
+        if has_cat1 {
+            *entry |= 0x1;
+        }
+        if has_cat9 {
+            *entry |= 0x2;
+        }
     }
     Ok((has_cat1, has_cat9))
 }
@@ -1689,15 +1706,408 @@ fn move_in_inner(
     })
 }
 
+/// Reusable install-wide VM asset cache shared across lot entries.
+///
+/// Loading an install once into `VmInstallCache` keeps the immutable base
+/// [`Install`], [`ArchivePool`], base [`Index`], base [`Catalog`], base
+/// [`Program`] libraries (Global, semi-globals, and base objects),
+/// [`Animations`], [`AvatarRegistry`], base [`People`], [`Surfaces`],
+/// [`sims_content::Wardrobe`], sprite frame counts, and default character name
+/// warm in memory. Each [`enter_lot_with_cache`] call only splices and links
+/// the neighborhood's `Characters` files instead of re-reading the entire
+/// install from disk.
+#[derive(Clone)]
+pub struct VmInstallCache {
+    inner: Arc<VmInstallCacheInner>,
+}
+
+struct VmInstallCacheInner {
+    install: Install,
+    pool: ArchivePool,
+    base_index: Index,
+    base_first_by_name: BTreeMap<String, usize>,
+    base_qualified_names: BTreeSet<String>,
+    base_missing_unqualified_semi_globals: BTreeSet<String>,
+    base_missing_qualified_semi_globals: BTreeSet<String>,
+    base_catalog: Catalog,
+    base_program: Option<Program>,
+    animations: Animations,
+    avatar_registry: AvatarRegistry,
+    base_people: Option<(People, BTreeMap<u32, String>)>,
+    icon_frames: Option<BTreeMap<u16, i32>>,
+    wardrobe: sims_content::Wardrobe,
+    surfaces: Surfaces,
+    tuning: Option<NeighborhoodTuning>,
+    default_character_name: String,
+}
+
+impl fmt::Debug for VmInstallCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VmInstallCache")
+            .field("install_root", &self.inner.install.root)
+            .field("base_objects", &self.inner.base_catalog.objects.len())
+            .field(
+                "base_libraries",
+                &self
+                    .inner
+                    .base_program
+                    .as_ref()
+                    .map_or(0, |p| p.libraries.len()),
+            )
+            .finish()
+    }
+}
+
+impl VmInstallCache {
+    /// Scans and links all immutable install-wide VM assets under `install_root`
+    /// once so subsequent [`enter_lot_with_cache`] calls avoid re-reading base
+    /// archives from disk.
+    pub fn load(install_root: &Path) -> Result<Self, LifecycleError> {
+        let install =
+            Install::detect(install_root).map_err(|e| LifecycleError::Lot(e.to_string()))?;
+        let pool = ArchivePool::new();
+        let base_index = Index::build(&install).map_err(|e| LifecycleError::Lot(e.to_string()))?;
+        let base_catalog = Catalog::build_with_pool(&base_index, &pool)
+            .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+
+        let (
+            program_res,
+            animations_res,
+            registry_res,
+            surfaces_res,
+            icon_frames_res,
+            wardrobe,
+            default_character_name,
+        ) = std::thread::scope(|scope| {
+            let program_handle = scope.spawn(|| {
+                Program::link_with_pool(
+                    &base_index,
+                    &base_catalog,
+                    base_catalog.objects.iter().map(|o| o.guid),
+                    &pool,
+                )
+            });
+            let animations_handle =
+                scope.spawn(|| Animations::load_with_pool(&install, &base_index, &pool));
+            let registry_handle = scope.spawn(|| AvatarRegistry::load_with_pool(&install, &pool));
+            let surfaces_handle = scope.spawn(|| Surfaces::build_with_pool(&install, &pool));
+            let icon_frames_handle = scope.spawn(|| crate::program::icon_frames(&install));
+            let wardrobe_handle = scope.spawn(|| match sims_content::Assets::scan(&install.root) {
+                Ok(assets) => sims_content::Wardrobe::load_with_pool(&assets, &pool),
+                Err(error) => sims_content::Wardrobe::unread(error),
+            });
+            let default_name_handle =
+                scope.spawn(|| crate::boot::read_default_character_name(&install));
+
+            (
+                program_handle
+                    .join()
+                    .expect("vm cache program worker panicked"),
+                animations_handle
+                    .join()
+                    .expect("vm cache animations worker panicked"),
+                registry_handle
+                    .join()
+                    .expect("vm cache avatar registry worker panicked"),
+                surfaces_handle
+                    .join()
+                    .expect("vm cache surfaces worker panicked"),
+                icon_frames_handle
+                    .join()
+                    .expect("vm cache icon_frames worker panicked"),
+                wardrobe_handle
+                    .join()
+                    .expect("vm cache wardrobe worker panicked"),
+                default_name_handle
+                    .join()
+                    .expect("vm cache default_character_name worker panicked"),
+            )
+        });
+
+        // Defer base `Program` or `People` load failures to per-neighborhood
+        // full linking so a malformed base BHAV or base person that is shadowed
+        // by a valid neighborhood `Characters` definition still opens cleanly,
+        // matching uncached `enter_lot`.
+        let base_program = program_res.ok();
+        let animations = animations_res.map_err(|e| LifecycleError::Lot(e.to_string()))?;
+        let avatar_registry = registry_res.map_err(|e| LifecycleError::Lot(e.to_string()))?;
+        let surfaces = surfaces_res.map_err(|e| LifecycleError::Lot(e.to_string()))?;
+        let icon_frames = icon_frames_res.map_err(|e| LifecycleError::Lot(e.to_string()))?;
+
+        let base_person_types = base_catalog
+            .objects
+            .iter()
+            .filter(|o| o.kind == 2)
+            .map(|o| o.guid);
+        let base_people = People::load_each_with_registry(
+            &base_index,
+            &base_catalog,
+            base_person_types,
+            &avatar_registry,
+            &pool,
+        )
+        .ok();
+
+        let tuning = base_program.as_ref().map(NeighborhoodTuning::from_program);
+        let base_first_by_name = base_index.first_by_file_name();
+        let base_qualified_names: BTreeSet<String> = base_index
+            .resources
+            .iter()
+            .map(|r| r.name().replace('\\', "/").to_ascii_lowercase())
+            .collect();
+        let mut base_missing_unqualified_semi_globals = BTreeSet::new();
+        let mut base_missing_qualified_semi_globals = BTreeSet::new();
+        for diag in &base_catalog.diagnostics {
+            if let Some(rest) = diag.rsplit(": semi-global ").next()
+                && let Some(file) = rest.strip_suffix(" not found")
+            {
+                if file.contains(['\\', '/']) {
+                    base_missing_qualified_semi_globals
+                        .insert(file.replace('\\', "/").to_ascii_lowercase());
+                } else {
+                    base_missing_unqualified_semi_globals.insert(file.to_ascii_lowercase());
+                }
+            }
+        }
+
+        Ok(Self {
+            inner: Arc::new(VmInstallCacheInner {
+                install,
+                pool,
+                base_index,
+                base_first_by_name,
+                base_qualified_names,
+                base_missing_unqualified_semi_globals,
+                base_missing_qualified_semi_globals,
+                base_catalog,
+                base_program,
+                animations,
+                avatar_registry,
+                base_people,
+                icon_frames,
+                wardrobe,
+                surfaces,
+                tuning,
+                default_character_name,
+            }),
+        })
+    }
+
+    /// Root directory of the cached installation.
+    pub fn install_root(&self) -> &Path {
+        &self.inner.install.root
+    }
+
+    /// Cached install metadata.
+    pub fn install(&self) -> &Install {
+        &self.inner.install
+    }
+
+    /// Cached base object catalog (without neighborhood `Characters`).
+    pub fn base_catalog(&self) -> &Catalog {
+        &self.inner.base_catalog
+    }
+
+    /// Cached install-wide animations.
+    pub fn animations(&self) -> &Animations {
+        &self.inner.animations
+    }
+}
+
 /// Shared install + neighborhood resources built when opening a lot from REDB.
 struct StoreRuntime {
     install: Install,
     index: Index,
     catalog: Catalog,
     program: Program,
+    unresolved_people: BTreeMap<u32, String>,
     surfaces: Surfaces,
     tuning: NeighborhoodTuning,
+    default_character_name: String,
     stored: StoredNeighborhood,
+}
+
+/// Incrementally splices `inserted_range` (neighborhood `Characters` files)
+/// into `base_catalog` when no inserted filename collides with any base file
+/// name, base qualified path, or unresolved base semi-global name; otherwise
+/// falls back to [`Catalog::build_with_pool`]. Returns `(catalog, can_reuse_base_program)`.
+#[allow(clippy::too_many_arguments)]
+fn splice_character_catalog(
+    base_catalog: &Catalog,
+    base_first_by_name: &BTreeMap<String, usize>,
+    base_qualified_names: &BTreeSet<String>,
+    base_missing_unqualified_semi_globals: &BTreeSet<String>,
+    base_missing_qualified_semi_globals: &BTreeSet<String>,
+    index: &Index,
+    pool: &ArchivePool,
+    inserted_range: std::ops::Range<usize>,
+) -> Result<(Catalog, bool), LifecycleError> {
+    let start = inserted_range.start;
+    let delta = inserted_range.len();
+    let mut safe_to_splice = base_catalog.global < start;
+    if safe_to_splice {
+        for resource in &index.resources[inserted_range.clone()] {
+            let lower_file = resource.file_name().to_ascii_lowercase();
+            let lower_qualified = resource.name().replace('\\', "/").to_ascii_lowercase();
+            if lower_file == "global.iff"
+                || lower_file == "work.iff"
+                || lower_file == "careers.txt"
+                || base_first_by_name.contains_key(&lower_file)
+                || base_missing_unqualified_semi_globals.contains(&lower_file)
+                || base_qualified_names.contains(&lower_qualified)
+                || base_missing_qualified_semi_globals.contains(&lower_qualified)
+            {
+                safe_to_splice = false;
+                break;
+            }
+        }
+    }
+    if !safe_to_splice {
+        let catalog = Catalog::build_with_pool(index, pool)
+            .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+        return Ok((catalog, false));
+    }
+
+    const CATALOG_TAGS: [[u8; 4]; 2] = [*b"OBJD", *b"GLOB"];
+    let mut inserted_objects: Vec<Object> = Vec::new();
+    let mut inserted_globs: Vec<(usize, String, Option<String>)> = Vec::new();
+    // Retain non-replacement base diagnostics and regenerate duplicate-GUID
+    // replacement diagnostics from the final merged object order so an inserted
+    // character resource between two base definitions does not leave an
+    // obsolete `C replaces A` entry behind.
+    let mut diagnostics: Vec<String> = base_catalog
+        .diagnostics
+        .iter()
+        .filter(|d| !(d.starts_with("GUID 0x") && d.contains(" replaces ")))
+        .cloned()
+        .collect();
+
+    for res_idx in inserted_range {
+        let resource = &index.resources[res_idx];
+        let name = resource.name();
+        let bytes = name.as_bytes();
+        if bytes.len() < 4 || !bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".iff") {
+            continue;
+        }
+        let location = resource.location(&index.root);
+        let raw = match resource.read_with(pool) {
+            Ok(raw) => raw,
+            Err(err) => {
+                diagnostics.push(err.to_string());
+                continue;
+            }
+        };
+        let iff = match Iff::scan_types(&raw, &CATALOG_TAGS) {
+            Ok(iff) => iff,
+            Err(err) => {
+                diagnostics.push(format!("{location}: {err}"));
+                continue;
+            }
+        };
+        let objd_chunks = match iff.resource_order(b"OBJD") {
+            Ok(chunks) => chunks,
+            Err(err) => {
+                diagnostics.push(format!("{location}: {err}"));
+                continue;
+            }
+        };
+        for chunk in objd_chunks {
+            match ObjectDefinition::parse(&chunk.data) {
+                Ok(definition) => {
+                    inserted_objects.push(Object {
+                        guid: definition.guid,
+                        resource: res_idx,
+                        chunk: chunk.id,
+                        kind: definition.object_type,
+                        master: definition.master_id,
+                    });
+                }
+                Err(error) => {
+                    diagnostics.push(format!("{location} OBJD #{}: {error}", chunk.id));
+                }
+            }
+        }
+        if let Some(link) = iff.all(b"GLOB").next() {
+            match global_link(&link.data) {
+                Ok(target) => inserted_globs.push((res_idx, location, target)),
+                Err(error) => {
+                    diagnostics.push(format!("{location} GLOB #{}: {error}", link.id));
+                }
+            }
+        }
+    }
+
+    let mut objects = Vec::with_capacity(base_catalog.objects.len() + inserted_objects.len());
+    let split_pos = base_catalog
+        .objects
+        .iter()
+        .position(|o| o.resource >= start)
+        .unwrap_or(base_catalog.objects.len());
+    objects.extend_from_slice(&base_catalog.objects[..split_pos]);
+    objects.extend(inserted_objects);
+    for object in &base_catalog.objects[split_pos..] {
+        let mut shifted = object.clone();
+        shifted.resource += delta;
+        objects.push(shifted);
+    }
+
+    let mut by_guid = BTreeMap::new();
+    for (idx, object) in objects.iter().enumerate() {
+        if let Some(previous_idx) = by_guid.insert(object.guid, idx) {
+            let prev = &objects[previous_idx];
+            diagnostics.push(format!(
+                "GUID 0x{:08X} in {} OBJD #{} replaces {} OBJD #{}",
+                object.guid,
+                index.resources[object.resource].location(&index.root),
+                object.chunk,
+                index.resources[prev.resource].location(&index.root),
+                prev.chunk,
+            ));
+        }
+    }
+
+    let shift = |r: usize| if r >= start { r + delta } else { r };
+    let mut semi_globals = BTreeMap::new();
+    for (&res_idx, &target) in &base_catalog.semi_globals {
+        semi_globals.insert(shift(res_idx), target.map(shift));
+    }
+    if !inserted_globs.is_empty() {
+        let first_by_name = index.first_by_file_name();
+        for (res_idx, location, glob) in inserted_globs {
+            match glob {
+                None => {
+                    semi_globals.insert(res_idx, None);
+                }
+                Some(name) => {
+                    let file = format!("{name}.iff");
+                    let found = if file.contains(['\\', '/']) {
+                        index.named(&file).next().map(|(target, _)| target)
+                    } else {
+                        first_by_name.get(&file.to_ascii_lowercase()).copied()
+                    };
+                    match found {
+                        Some(target) => {
+                            semi_globals.insert(res_idx, Some(target));
+                        }
+                        None => {
+                            diagnostics.push(format!("{location}: semi-global {file} not found"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((
+        Catalog {
+            global: base_catalog.global,
+            objects,
+            by_guid,
+            semi_globals,
+            diagnostics,
+        },
+        true,
+    ))
 }
 
 impl StoreRuntime {
@@ -1737,9 +2147,10 @@ impl StoreRuntime {
             .iter()
             .filter(|o| o.kind == 2)
             .map(|o| o.guid);
-        program.people = People::load_each(&install, &index, &catalog, person_types)
-            .map_err(|e| LifecycleError::Lot(e.to_string()))?
-            .0;
+        let (people, unresolved_people) =
+            People::load_each(&install, &index, &catalog, person_types)
+                .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+        program.people = people;
         program.icon_frames = crate::program::icon_frames(&install)
             .map_err(|e| LifecycleError::Lot(e.to_string()))?;
         program.wardrobe = Some(match sims_content::Assets::scan(&install.root) {
@@ -1761,13 +2172,204 @@ impl StoreRuntime {
             .extend(stored.made_characters.made.values().map(|c| c.file));
         let surfaces = Surfaces::build(&install).map_err(|e| LifecycleError::Lot(e.to_string()))?;
         let tuning = NeighborhoodTuning::from_program(&program);
+        let default_character_name = crate::boot::read_default_character_name(&install);
         Ok(Self {
             install,
             index,
             catalog,
             program,
+            unresolved_people,
             surfaces,
             tuning,
+            default_character_name,
+            stored,
+        })
+    }
+
+    fn from_snapshot_with_cache(
+        cache: &VmInstallCache,
+        stored: StoredNeighborhood,
+        character_files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self, LifecycleError> {
+        let inner = &cache.inner;
+        let mut index = inner.base_index.clone();
+        let inserted_range = if character_files.is_empty() {
+            0..0
+        } else {
+            let char_mount = index
+                .mounts
+                .iter()
+                .position(|m| m.path == "GameData/UserObjects")
+                .map_or(index.mounts.len(), |n| n + 1);
+            let insert_at = index
+                .resources
+                .iter()
+                .position(|r| r.mount >= char_mount)
+                .unwrap_or(index.resources.len());
+            let before_len = index.resources.len();
+            index
+                .add_character_files(character_files)
+                .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+            let delta = index.resources.len().saturating_sub(before_len);
+            insert_at..insert_at + delta
+        };
+
+        let (catalog, can_reuse_base_program) = if inserted_range.is_empty() {
+            (inner.base_catalog.clone(), true)
+        } else {
+            splice_character_catalog(
+                &inner.base_catalog,
+                &inner.base_first_by_name,
+                &inner.base_qualified_names,
+                &inner.base_missing_unqualified_semi_globals,
+                &inner.base_missing_qualified_semi_globals,
+                &index,
+                &inner.pool,
+                inserted_range.clone(),
+            )?
+        };
+
+        let context = Context::COMPLETE_COLLECTION;
+        let reused_base_program = can_reuse_base_program && inner.base_program.is_some();
+        let mut program = if inserted_range.is_empty()
+            && let Some(base_program) = &inner.base_program
+        {
+            base_program.clone()
+        } else if can_reuse_base_program && let Some(base_program) = &inner.base_program {
+            Program::link_with_base_cache(
+                &index,
+                &catalog,
+                catalog.objects.iter().map(|o| o.guid),
+                &inner.pool,
+                base_program,
+                inserted_range.clone(),
+            )
+            .map_err(|e| LifecycleError::Lot(e.to_string()))?
+        } else {
+            Program::link_with_pool(
+                &index,
+                &catalog,
+                catalog.objects.iter().map(|o| o.guid),
+                &inner.pool,
+            )
+            .map_err(|e| LifecycleError::Lot(e.to_string()))?
+        };
+        program.zoning = stored.zoning.clone();
+        program.expansions = context.expansions;
+        program.characters = catalog
+            .objects
+            .iter()
+            .map(|o| o.guid)
+            .filter(|&guid| {
+                catalog.object(guid).is_some_and(|o| {
+                    index.mounts[index.resources[o.resource].mount].path == Index::CHARACTERS
+                })
+            })
+            .collect();
+
+        let has_inserted_animation = index.resources[inserted_range.clone()].iter().any(|r| {
+            let name = r.name();
+            let b = name.as_bytes();
+            b.len() >= 4
+                && (b[b.len() - 4..].eq_ignore_ascii_case(b".cfp")
+                    || b[b.len() - 4..].eq_ignore_ascii_case(b".bcf"))
+        });
+        program.animations = if has_inserted_animation {
+            Animations::load_with_pool(&inner.install, &index, &inner.pool)
+                .map_err(|e| LifecycleError::Lot(e.to_string()))?
+        } else {
+            inner.animations.clone()
+        };
+
+        let (people, unresolved_people) = if inserted_range.is_empty()
+            && let Some((base_people, base_unresolved)) = &inner.base_people
+        {
+            (base_people.clone(), base_unresolved.clone())
+        } else if can_reuse_base_program
+            && let Some((base_people, base_unresolved)) = &inner.base_people
+        {
+            let mut people = base_people.clone();
+            let mut unresolved = base_unresolved.clone();
+            let mut char_person_guids = Vec::new();
+            for object in &catalog.objects {
+                if inserted_range.contains(&object.resource) {
+                    // Only touch GUIDs whose final winning definition lives in
+                    // `inserted_range`; if a later mount overrode it, keep base.
+                    if let Some(winner) = catalog.object(object.guid)
+                        && inserted_range.contains(&winner.resource)
+                    {
+                        people.skeletons.remove(&object.guid);
+                        people.skeleton_names.remove(&object.guid);
+                        people.profiles.remove(&object.guid);
+                        people.portrait_head.remove(&object.guid);
+                        unresolved.remove(&object.guid);
+                        if winner.kind == 2 {
+                            char_person_guids.push(object.guid);
+                        }
+                    }
+                }
+            }
+            if !char_person_guids.is_empty() {
+                let (char_people, char_unresolved) = People::load_each_with_registry(
+                    &index,
+                    &catalog,
+                    char_person_guids,
+                    &inner.avatar_registry,
+                    &inner.pool,
+                )
+                .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+                people.skeletons.extend(char_people.skeletons);
+                people.skeleton_names.extend(char_people.skeleton_names);
+                people.profiles.extend(char_people.profiles);
+                people.portrait_head.extend(char_people.portrait_head);
+                unresolved.extend(char_unresolved);
+            }
+            (people, unresolved)
+        } else {
+            let person_types = catalog
+                .objects
+                .iter()
+                .filter(|o| o.kind == 2)
+                .map(|o| o.guid);
+            People::load_each_with_registry(
+                &index,
+                &catalog,
+                person_types,
+                &inner.avatar_registry,
+                &inner.pool,
+            )
+            .map_err(|e| LifecycleError::Lot(e.to_string()))?
+        };
+        program.people = people;
+        program.icon_frames = inner.icon_frames.clone();
+        program.wardrobe = Some(inner.wardrobe.clone());
+        if !character_files.is_empty() {
+            program.character_files =
+                crate::program::character_files(&index, Path::new(Index::CHARACTERS));
+        }
+        program
+            .characters
+            .extend(stored.made_characters.made.keys().copied());
+        program
+            .characters
+            .retain(|guid| !stored.deleted_characters.contains(guid));
+        program
+            .character_files
+            .extend(stored.made_characters.made.values().map(|c| c.file));
+        let tuning = if reused_base_program && let Some(cached_tuning) = inner.tuning {
+            cached_tuning
+        } else {
+            NeighborhoodTuning::from_program(&program)
+        };
+        Ok(Self {
+            install: inner.install.clone(),
+            index,
+            catalog,
+            program,
+            unresolved_people,
+            surfaces: inner.surfaces.clone(),
+            tuning,
+            default_character_name: inner.default_character_name.clone(),
             stored,
         })
     }
@@ -1856,10 +2458,99 @@ pub fn enter_lot_with(
         snapshot.neighborhood,
         &snapshot.character_files,
     )?;
-    if let Some(saved_bytes) = snapshot.saved_lot {
+    boot_from_snapshot_runtime(
+        runtime,
+        store.store_id(),
+        neighborhood_id,
+        house,
+        snapshot.saved_lot,
+        snapshot.base_house,
+        answers,
+        frames,
+        crt,
+        view_centre,
+    )
+}
+
+/// Like [`enter_lot`], reusing immutable install-wide assets from `cache` so
+/// warm lot transitions avoid re-reading and re-linking the base install.
+pub fn enter_lot_with_cache(
+    cache: &VmInstallCache,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    house: u32,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<Lot, LifecycleError> {
+    enter_lot_with_cache_and_options(
+        cache,
+        store,
+        neighborhood_id,
+        house,
+        answers,
+        frames,
+        CrtRng::from_state(1),
+        None,
+    )
+}
+
+/// Like [`enter_lot_with`], reusing immutable install-wide assets from `cache`.
+#[allow(clippy::too_many_arguments)]
+pub fn enter_lot_with_cache_and_options(
+    cache: &VmInstallCache,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    house: u32,
+    answers: &[u8],
+    frames: Frames,
+    crt: CrtRng,
+    view_centre: Option<[i8; 2]>,
+) -> Result<Lot, LifecycleError> {
+    let snapshot = store
+        .load_lot_snapshot(neighborhood_id, house)?
+        .ok_or_else(|| LifecycleError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    if snapshot.saved_lot.is_none() && snapshot.base_house.is_none() {
+        return Err(LifecycleError::HouseNotFound {
+            neighborhood: neighborhood_id.to_owned(),
+            house,
+        });
+    }
+    let runtime = StoreRuntime::from_snapshot_with_cache(
+        cache,
+        snapshot.neighborhood,
+        &snapshot.character_files,
+    )?;
+    boot_from_snapshot_runtime(
+        runtime,
+        store.store_id(),
+        neighborhood_id,
+        house,
+        snapshot.saved_lot,
+        snapshot.base_house,
+        answers,
+        frames,
+        crt,
+        view_centre,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn boot_from_snapshot_runtime(
+    runtime: StoreRuntime,
+    store_id: u128,
+    neighborhood_id: &str,
+    house: u32,
+    saved_lot: Option<Vec<u8>>,
+    base_house: Option<Vec<u8>>,
+    answers: &[u8],
+    frames: Frames,
+    crt: CrtRng,
+    view_centre: Option<[i8; 2]>,
+) -> Result<Lot, LifecycleError> {
+    if let Some(saved_bytes) = saved_lot {
         boot_from_saved_lot(
             runtime,
-            store.store_id(),
+            store_id,
             neighborhood_id,
             house,
             &saved_bytes,
@@ -1870,10 +2561,10 @@ pub fn enter_lot_with(
     } else {
         boot_from_base_house(
             runtime,
-            store.store_id(),
+            store_id,
             neighborhood_id,
             house,
-            snapshot.base_house.expect("checked above"),
+            base_house.expect("checked above"),
             answers,
             frames,
             crt,
@@ -1906,12 +2597,12 @@ fn boot_from_saved_lot(
         )));
     }
     let StoreRuntime {
-        install,
         index,
         catalog,
         program,
         surfaces,
         tuning,
+        default_character_name,
         stored,
         ..
     } = runtime;
@@ -2188,7 +2879,7 @@ fn boot_from_saved_lot(
         replay_view: saved.replay_view,
         last_dialog_text: saved.last_dialog_text,
         character_names: saved.character_names,
-        default_character_name: crate::boot::read_default_character_name(&install),
+        default_character_name,
         lot_name: saved.lot_name,
         lot_description: saved.lot_description,
         loaded: saved.loaded,
@@ -2208,6 +2899,7 @@ fn boot_from_saved_lot(
             revision: origin_revision,
         }),
         coop: None,
+        move_objects: false,
     })
 }
 
@@ -2227,13 +2919,15 @@ fn boot_from_base_house(
     enter_live: bool,
 ) -> Result<Lot, LifecycleError> {
     let StoreRuntime {
-        install,
         index,
         catalog,
         program,
+        unresolved_people,
         surfaces,
         tuning,
+        default_character_name,
         stored,
+        ..
     } = runtime;
     let origin_instance_id = stored.instance_id;
     let origin_revision = stored.revision;
@@ -2371,15 +3065,20 @@ fn boot_from_base_house(
             &stored.deleted_characters,
             &stored.deleted_at_epoch,
         );
-        let people = People::load(
-            &install,
-            &index,
-            &catalog,
-            file.objects.instances.values().map(|o| o.guid),
-        )
-        .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+        for instance in file.objects.instances.values() {
+            if let Some(reason) = unresolved_people.get(&instance.guid) {
+                return Err(LifecycleError::Lot(
+                    sims_content::Error::Unsupported(reason.clone()).to_string(),
+                ));
+            }
+        }
         let read = interpreter
-            .read_objects_with_frame_tree_bits(&mut world, &file.objects, &people, &BTreeSet::new())
+            .read_objects_with_frame_tree_bits(
+                &mut world,
+                &file.objects,
+                &program.people,
+                &BTreeSet::new(),
+            )
             .map_err(|e| LifecycleError::Lot(e.to_string()))?;
         load.read = read.objects.len();
         load.draws = read.draws;
@@ -2451,7 +3150,7 @@ fn boot_from_base_house(
 
         load.to_visit = world.order.len();
         if enter_live {
-            let visited = interpreter.visit_objects(&mut world, &people);
+            let visited = interpreter.visit_objects(&mut world, &program.people);
             load.visited = visited.objects.len();
             load.reset = visited.reset.len();
             load.stopped = visited.stopped.map(|fault| fault.to_string());
@@ -2475,7 +3174,7 @@ fn boot_from_base_house(
                     .get(&id)
                     .is_some_and(|o| world.changed_types.contains(&o.guid));
                 let mut next = world.clone();
-                match interpreter.visit(&mut next, id, &people) {
+                match interpreter.visit(&mut next, id, &program.people) {
                     Ok(()) => {
                         world = next;
                         load.visited += 1;
@@ -2609,7 +3308,7 @@ fn boot_from_base_house(
         replay_view: None,
         last_dialog_text: String::new(),
         character_names: std::collections::BTreeMap::new(),
-        default_character_name: crate::boot::read_default_character_name(&install),
+        default_character_name,
         lot_name: String::new(),
         lot_description: String::new(),
         loaded,
@@ -2629,6 +3328,7 @@ fn boot_from_base_house(
             revision: origin_revision,
         }),
         coop: None,
+        move_objects: false,
     })
 }
 
@@ -2757,6 +3457,7 @@ fn save_and_leave_lot_inner(
         tuning.friendship_threshold,
     );
     saved.deletion_epoch = stored.deletion_epoch;
+    saved.family_flags = Some(saved.world.family_flags.clone());
     let lot_bytes = saved.encode();
     let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
         neighborhood_id,
@@ -2781,6 +3482,7 @@ fn save_and_leave_lot_inner(
             });
         }
     };
+    lot.world.family_flags = saved.world.family_flags;
     lot.neighborhood_origin = Some(NeighborhoodOrigin {
         store_id: store.store_id(),
         neighborhood_id: neighborhood_id.to_owned(),
@@ -3190,6 +3892,7 @@ fn evict_or_bulldoze(
         .save()
         .map_err(|e| LifecycleError::Lot(format!("saving cleared lot {house}: {e}")))?;
     saved.deletion_epoch = stored.deletion_epoch;
+    saved.family_flags = Some(saved.world.family_flags.clone());
     let lot_bytes = saved.encode();
     match store.save_lot_and_neighborhood_checked(
         neighborhood_id,

@@ -137,6 +137,10 @@ pub struct BuyCursor {
     /// Monotonic token stamped by `Lot` so retired cursor handles can never
     /// alias newly created objects that reuse a numeric ID.
     pub(crate) token: u64,
+    /// Whether the current valid preview was accepted only via the
+    /// `move_objects` ground override (so disabling `move_objects` before
+    /// commit requires revalidation under strict rules).
+    pub(crate) placed_via_override: bool,
 }
 
 impl BuyCursor {
@@ -510,6 +514,7 @@ impl Interpreter<'_> {
             container: None,
             origin: None,
             token: 0,
+            placed_via_override: false,
         };
         self.buy_rotate(world, &mut out, direction)?;
         Ok(Some(out))
@@ -526,11 +531,246 @@ impl Interpreter<'_> {
             .unwrap_or(id)
     }
 
+    /// Returns whether `id` is a reserved, sentinel, person, or global
+    /// controller object that must never be picked up or deleted even when
+    /// `move_objects` is enabled.
+    fn is_reserved_or_unpickable(&self, world: &World, id: u16) -> Result<bool, Fault> {
+        if id == 0 || world.indicators.contains(&id) {
+            return Ok(true);
+        }
+        let Some(obj) = world.objects.get(&id) else {
+            return Ok(true);
+        };
+        if obj.person.is_some()
+            || obj.guid == TILE_CURSOR_GUID
+            || obj.guid == crate::WALL_CURSOR_GUID
+            || obj.guid == COMEANDSEE_GUID
+        {
+            return Ok(true);
+        }
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let words = self.words(world, id).map_err(fail)?;
+        // OBJD word 9 == 7 (system/controller) or word 42 != 0 (global controller).
+        Ok(words[word::TYPE] == 7 || words[42] != 0)
+    }
+
+    /// Checks that `id` (or every part of its multi-tile group) lands strictly
+    /// inside lot interior bounds (`1..size - 1`) on `level in 1..=2`.
+    fn all_parts_within_lot_bounds(
+        &self,
+        world: &World,
+        id: u16,
+        pos: [i32; 2],
+        level: i32,
+    ) -> Result<bool, Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        if !on_lot(pos) {
+            return Ok(false);
+        }
+        let Some(selected) = world
+            .objects
+            .get(&id)
+            .and_then(|o| o.multipart.as_ref())
+            .map(|m| m.offset)
+        else {
+            return Ok((1..=2).contains(&level) && inside_placement_bounds(world, pos));
+        };
+        let origin = [
+            pos[0].wrapping_sub(selected[0].wrapping_mul(16)),
+            pos[1].wrapping_sub(selected[1].wrapping_mul(16)),
+        ];
+        let origin_level = level.wrapping_sub(selected[2]);
+        for part in self.parts(world, id).map_err(fail)? {
+            let Some(offset) = world
+                .objects
+                .get(&part)
+                .and_then(|o| o.multipart.as_ref())
+                .map(|m| m.offset)
+            else {
+                return Ok(false);
+            };
+            let at = [
+                origin[0].wrapping_add(offset[0].wrapping_mul(16)),
+                origin[1].wrapping_add(offset[1].wrapping_mul(16)),
+            ];
+            let part_level = origin_level.wrapping_add(offset[2]);
+            if !(1..=2).contains(&part_level) || !inside_placement_bounds(world, at) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Cursor fit check for Buy Mode: delegates to [`Self::fits`] normally, or
+    /// enforces strict lot interior bounds + valid floor level when
+    /// `self.move_objects` is enabled.
+    fn cursor_fits_for_buy(
+        &self,
+        world: &mut World,
+        cursor: u16,
+        pos: [i32; 2],
+        level: i32,
+    ) -> Result<bool, Fault> {
+        if self.move_objects {
+            self.all_parts_within_lot_bounds(world, cursor, pos, level)
+        } else {
+            self.fits(world, cursor, pos, level)
+        }
+    }
+
+    /// Returns whether `(tx, ty, level)` carries `PORTAL_TILE` due to another
+    /// portal (or pre-existing flag) rather than only `exclude_parts` sitting
+    /// on that tile in place (e.g. during `buy_put_if_fits`).
+    fn tile_has_other_portal(
+        &self,
+        world: &World,
+        exclude_parts: &[u16],
+        tx: i8,
+        ty: i8,
+        level: i32,
+    ) -> Result<bool, Fault> {
+        let fail = |trap| Fault {
+            object: exclude_parts.first().copied().unwrap_or(0),
+            at: None,
+            trap,
+        };
+        let flags = crate::placement::tile_flags(world, tx, ty, level).map_err(fail)?;
+        if (flags & crate::placement::PORTAL_TILE) == 0 {
+            return Ok(false);
+        }
+        let mut self_on_tile = false;
+        for &part in exclude_parts {
+            if let Some(obj) = world.objects.get(&part)
+                && obj.position[0] >= 0
+                && obj.position[1] >= 0
+                && (obj.position[0] >> 4) == i32::from(tx)
+                && (obj.position[1] >> 4) == i32::from(ty)
+                && obj.position[2] == level
+                && self.is_portal_object(world, part)?
+            {
+                self_on_tile = true;
+                break;
+            }
+        }
+        if !self_on_tile {
+            return Ok(true);
+        }
+        for (&other_id, other) in &world.objects {
+            if exclude_parts.contains(&other_id) || other.position[0] < 0 || other.position[1] < 0 {
+                continue;
+            }
+            if (other.position[0] >> 4) == i32::from(tx)
+                && (other.position[1] >> 4) == i32::from(ty)
+                && other.position[2] == level
+                && self.is_portal_object(world, other_id)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Bounds-checked ground placement fallback used only when
+    /// `self.move_objects` is enabled: still requires tile-centred coordinates
+    /// (`(x & 15) == 8 && (y & 15) == 8`), `level in 1..=2`, every part of the
+    /// object strictly inside `1..size - 1`, and rejects overlapping two
+    /// doors/portals onto the same tile so `PORTAL_TILE` invariants hold.
+    fn user_test_place_ground_override(
+        &self,
+        world: &World,
+        id: u16,
+        pos: [i32; 2],
+        level: i32,
+    ) -> Result<bool, Fault> {
+        if (pos[0] & 0x0f) != 8 || (pos[1] & 0x0f) != 8 {
+            return Ok(false);
+        }
+        if !self.all_parts_within_lot_bounds(world, id, pos, level)? {
+            return Ok(false);
+        }
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let is_group = world
+            .objects
+            .get(&id)
+            .is_some_and(|o| o.multipart.is_some());
+        if !is_group {
+            if self.is_portal_object(world, id)?
+                && self.tile_has_other_portal(
+                    world,
+                    &[id],
+                    (pos[0] >> 4) as i8,
+                    (pos[1] >> 4) as i8,
+                    level,
+                )?
+            {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+        let selected = world
+            .objects
+            .get(&id)
+            .and_then(|o| o.multipart.as_ref())
+            .map(|m| m.offset)
+            .unwrap_or([0; 3]);
+        let origin = [
+            pos[0].wrapping_sub(selected[0].wrapping_mul(16)),
+            pos[1].wrapping_sub(selected[1].wrapping_mul(16)),
+        ];
+        let origin_level = level.wrapping_sub(selected[2]);
+        let parts = self.parts(world, id).map_err(fail)?;
+        for &part in &parts {
+            if !self.is_portal_object(world, part)? {
+                continue;
+            }
+            let Some(offset) = world
+                .objects
+                .get(&part)
+                .and_then(|o| o.multipart.as_ref())
+                .map(|m| m.offset)
+            else {
+                return Ok(false);
+            };
+            let at = [
+                origin[0].wrapping_add(offset[0].wrapping_mul(16)),
+                origin[1].wrapping_add(offset[1].wrapping_mul(16)),
+            ];
+            let part_level = origin_level.wrapping_add(offset[2]);
+            if self.tile_has_other_portal(
+                world,
+                &parts,
+                (at[0] >> 4) as i8,
+                (at[1] >> 4) as i8,
+                part_level,
+            )? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Checks `cTSObject::CanPickUp` (`0x4352e8`) / `cTSMultiTileObject::CanPickUp`
     /// (`0x422fdc`): every part in `id`'s group must have `data[43] & 0x02 != 0`,
     /// `data[62] <= 0`, `data[8] & 0x20 == 0`, level-1 tile flag `0x20` clear,
     /// and every object in its surface containment slots must recursively pass
     /// `can_pick_up`.
+    ///
+    /// When `self.move_objects` is enabled, bypasses the `data[43]`, in-use
+    /// (`data[62]`, `data[8] & 0x20`), and locked-tile (`tile_flags & 0x20`)
+    /// guards while still refusing reserved/unpickable sentinels, persons, and
+    /// global controllers.
     pub fn can_pick_up(&self, world: &World, id: u16) -> Result<bool, Fault> {
         let mut visited = BTreeSet::new();
         self.can_pick_up_inner(world, id, &mut visited)
@@ -549,7 +789,7 @@ impl Interpreter<'_> {
         let Some(lead_obj) = world.objects.get(&lead) else {
             return Ok(false);
         };
-        if lead_obj.person.is_some() {
+        if self.is_reserved_or_unpickable(world, lead)? {
             return Ok(false);
         }
         let fail = |trap| Fault {
@@ -584,16 +824,18 @@ impl Interpreter<'_> {
         let Some(obj) = world.objects.get(&part) else {
             return Ok(false);
         };
-        if obj.person.is_some() {
+        if self.is_reserved_or_unpickable(world, part)? {
             return Ok(false);
         }
-        if (obj.data.get(DATA_BUY_FLAGS).copied().unwrap_or(0) & 0x02) == 0 {
-            return Ok(false);
-        }
-        if obj.data.get(DATA_USE_COUNT).copied().unwrap_or(0) > 0
-            || (obj.data.get(DATA_PLACEMENT_FLAGS).copied().unwrap_or(0) & 0x20) != 0
-        {
-            return Ok(false);
+        if !self.move_objects {
+            if (obj.data.get(DATA_BUY_FLAGS).copied().unwrap_or(0) & 0x02) == 0 {
+                return Ok(false);
+            }
+            if obj.data.get(DATA_USE_COUNT).copied().unwrap_or(0) > 0
+                || (obj.data.get(DATA_PLACEMENT_FLAGS).copied().unwrap_or(0) & 0x20) != 0
+            {
+                return Ok(false);
+            }
         }
         let children: Vec<u16> = obj
             .slots
@@ -608,13 +850,16 @@ impl Interpreter<'_> {
                 return Ok(false);
             }
         }
-        let tx = obj.position[0] >> 4;
-        let ty = obj.position[1] >> 4;
-        let size = i32::from(world.size);
-        if (0..size).contains(&tx) && (0..size).contains(&ty) {
-            let flags = crate::placement::tile_flags(world, tx as i8, ty as i8, 1).map_err(fail)?;
-            if (flags & 0x20) != 0 {
-                return Ok(false);
+        if !self.move_objects {
+            let tx = obj.position[0] >> 4;
+            let ty = obj.position[1] >> 4;
+            let size = i32::from(world.size);
+            if (0..size).contains(&tx) && (0..size).contains(&ty) {
+                let flags =
+                    crate::placement::tile_flags(world, tx as i8, ty as i8, 1).map_err(fail)?;
+                if (flags & 0x20) != 0 {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -623,12 +868,16 @@ impl Interpreter<'_> {
     /// Checks `cTSObject::CanDelete` (`0x435440`) / `cTSMultiTileObject::CanDelete`
     /// (`0x423135`): every part in `id`'s group must pass `can_pick_up`, have
     /// `data[43] & 0x08 != 0`, and have all surface containment slots empty.
+    ///
+    /// When `self.move_objects` is enabled, bypasses the `data[43] & 0x08`
+    /// guard while still refusing reserved/unpickable sentinels, persons,
+    /// global controllers, and surfaces carrying children.
     pub fn can_delete(&self, world: &World, id: u16) -> Result<bool, Fault> {
         let lead = self.lead_object(world, id);
         let Some(lead_obj) = world.objects.get(&lead) else {
             return Ok(false);
         };
-        if lead_obj.person.is_some() {
+        if self.is_reserved_or_unpickable(world, lead)? {
             return Ok(false);
         }
         let fail = |trap| Fault {
@@ -649,7 +898,9 @@ impl Interpreter<'_> {
             let Some(obj) = world.objects.get(&part) else {
                 return Ok(false);
             };
-            if (obj.data.get(DATA_BUY_FLAGS).copied().unwrap_or(0) & 0x08) == 0 {
+            if !self.move_objects
+                && (obj.data.get(DATA_BUY_FLAGS).copied().unwrap_or(0) & 0x08) == 0
+            {
                 return Ok(false);
             }
             let has_child = obj.slots.iter().skip(1).any(|s| {
@@ -829,11 +1080,12 @@ impl Interpreter<'_> {
             container: origin.container,
             origin: Some(origin),
             token: 0,
+            placed_via_override: false,
         };
         let retained = out.container;
         if on_lot([px, py])
-            && self.fits(world, out.cursor, [px, py], level)?
-            && !self.try_place_buy_at(world, &mut out, [px, py], level, retained)?
+            && self.cursor_fits_for_buy(world, out.cursor, [px, py], level)?
+            && !self.try_place_buy_at_mode(world, &mut out, [px, py], level, retained, true)?
         {
             let cursor_place = Place {
                 on_lot: true,
@@ -874,21 +1126,24 @@ impl Interpreter<'_> {
             .then_some(cursor.container)
             .flatten();
         self.remove_cursor_and_held(world, cursor)?;
-        if !inside_placement_bounds(world, pos) {
-            // Native `0x485c75` -> `0x422632`: exit immediately on border
-            // rejection without overwriting the last saved turn position.
+        if !(1..=2).contains(&level) || !inside_placement_bounds(world, pos) {
+            // Native `0x485c75` -> `0x422632`: exit immediately on border or
+            // invalid-floor rejection without overwriting the last saved turn
+            // position.
             cursor.valid = false;
+            cursor.placed_via_override = false;
             return Ok(false);
         }
         cursor.valid = false;
         cursor.container = None;
+        cursor.placed_via_override = false;
         // Native `0x485ced`: check whether `"Tile Cursor"` fits at snapped
         // `pos` BEFORE writing `cursor.position` (`0x421e72`) or trying
         // snapped placement / wall auto-rotation (`0x48736b`); if it does not
         // fit, jump straight to unsnapped fallback (`0x485f23`).
-        if self.fits(world, cursor.cursor, pos, level)? {
+        if self.cursor_fits_for_buy(world, cursor.cursor, pos, level)? {
             cursor.position = [pos[0], pos[1], level];
-            if self.try_place_buy_at(world, cursor, pos, level, retained)? {
+            if self.try_place_buy_at_mode(world, cursor, pos, level, retained, false)? {
                 return Ok(cursor.valid);
             }
             // Native `0x485cee` → `0x421e72` → `0x421fc3` (`0x422c2f`): even
@@ -906,6 +1161,16 @@ impl Interpreter<'_> {
             if self.try_wall_auto_rotate(world, cursor, pos, level)? {
                 return Ok(cursor.valid);
             }
+            // Under `move_objects`, if strict placement and wall auto-rotation
+            // both refused, allow bounds-checked ground placement override.
+            if self.move_objects {
+                self.remove_cursor_and_held(world, cursor)?;
+                cursor.valid = false;
+                cursor.container = None;
+                if self.try_place_buy_at_mode(world, cursor, pos, level, retained, true)? {
+                    return Ok(cursor.valid);
+                }
+            }
         }
         // Snapped placement (and any wall/pool auto-rotation) failed: native
         // `0x485f2f` checks whether `"Tile Cursor"` fits at unsnapped `fine`
@@ -919,13 +1184,13 @@ impl Interpreter<'_> {
         // jumping to the tile centre.
         cursor.valid = false;
         cursor.container = None;
-        if self.fits(world, cursor.cursor, fine, level)? {
+        if self.cursor_fits_for_buy(world, cursor.cursor, fine, level)? {
             // Native `0x485f44` always calls `0x421e72` at `fine` (even when
             // `fine == pos`): `try_place_buy_at` runs `UserTestPlace`
             // (`0x435522` / `0x422de4`), which succeeds only if `fine` is
             // tile-centred and otherwise runs `test_tile` (`0x4355b5`) on the
             // first part before rejecting unsnapped coordinates (`0x4355bc`).
-            if self.try_place_buy_at(world, cursor, fine, level, None)? {
+            if self.try_place_buy_at_mode(world, cursor, fine, level, None, true)? {
                 return Ok(cursor.valid);
             }
             let cursor_place = Place {
@@ -951,26 +1216,41 @@ impl Interpreter<'_> {
     /// Tries placing `cursor.held` (and `cursor.cursor`) at `[at, level]`
     /// (`0x421e72` → `0x422050`). Callers on the cursor-gated paths
     /// (`0x485ced`, `0x485f2f`, `0x422752`, `0x485e59`) check
-    /// `self.fits(world, cursor.cursor, at, level)` first, while `buy_recheck`
-    /// (`0x485bda`) calls `0x421e72` directly without a prior fit check.
-    /// Returns `Ok(true)` if the held object fit and was placed (setting
-    /// `cursor.valid` based on affordability).
-    fn try_place_buy_at(
+    /// `self.cursor_fits_for_buy(world, cursor.cursor, at, level)` first,
+    /// while `buy_recheck` (`0x485bda`) calls `0x421e72` directly without a
+    /// prior fit check. Returns `Ok(true)` if the held object fit and was
+    /// placed (setting `cursor.valid` based on affordability).
+    fn try_place_buy_at_mode(
         &self,
         world: &mut World,
         cursor: &mut BuyCursor,
         at: [i32; 2],
         level: i32,
         retained: Option<(u16, i16)>,
+        allow_override: bool,
     ) -> Result<bool, Fault> {
         let affordable = cursor.price <= 0 || cursor.price <= available_funds(world);
-        let Some(container) =
-            self.test_buy_placement(world, cursor.cursor, cursor.held, at, level, retained)?
-        else {
-            return Ok(false);
+        let (container, used_override) = match self.test_buy_placement(
+            world,
+            cursor.cursor,
+            cursor.held,
+            at,
+            level,
+            retained,
+            allow_override,
+        )? {
+            Some(fit) => (fit.container, fit.used_override),
+            None if allow_override
+                && self.move_objects
+                && self.user_test_place_ground_override(world, cursor.held, at, level)? =>
+            {
+                (None, true)
+            }
+            None => return Ok(false),
         };
         cursor.position = [at[0], at[1], level];
         cursor.container = container;
+        cursor.placed_via_override = used_override;
         if affordable {
             cursor.valid = true;
         }
@@ -1021,11 +1301,11 @@ impl Interpreter<'_> {
         cursor.position = [pos[0], pos[1], level];
         let count = 8 / step;
         for k in 1..count {
-            self.buy_turn_steps(world, cursor, i32::from(k), None, level)?;
+            self.buy_turn_steps_mode(world, cursor, i32::from(k), None, level, false)?;
             if cursor.valid {
                 return Ok(true);
             }
-            self.buy_turn_steps(world, cursor, -i32::from(k), None, level)?;
+            self.buy_turn_steps_mode(world, cursor, -i32::from(k), None, level, false)?;
         }
         Ok(false)
     }
@@ -1091,6 +1371,18 @@ impl Interpreter<'_> {
         retained: Option<(u16, i16)>,
         level: i32,
     ) -> Result<bool, Fault> {
+        self.buy_turn_steps_mode(world, cursor, steps, retained, level, true)
+    }
+
+    fn buy_turn_steps_mode(
+        &self,
+        world: &mut World,
+        cursor: &mut BuyCursor,
+        steps: i32,
+        retained: Option<(u16, i16)>,
+        level: i32,
+        allow_override: bool,
+    ) -> Result<bool, Fault> {
         // Native `0x421bff`: unconditional `TakeOff(1)` on cursor and held.
         self.take_off_cursor_and_held_unconditional(world, cursor)?;
         // Native `0x421c0d`: turn held object by signed `steps` and sync cursor
@@ -1098,7 +1390,7 @@ impl Interpreter<'_> {
         self.turn_held_by(world, cursor.cursor, cursor.held, steps)?;
         // Native `0x421db6`: test fit and place at saved coordinates, clearing
         // valid on fit refusal.
-        self.put_if_cursor_fits(world, cursor, retained, level, true)
+        self.put_if_cursor_fits_mode(world, cursor, retained, level, true, allow_override)
     }
 
     /// Rotates the held object to `direction` (`0x4226bc` → `0x421be4`),
@@ -1173,7 +1465,6 @@ impl Interpreter<'_> {
         level: i32,
     ) -> Result<bool, Fault> {
         let retained = cursor.container;
-        cursor.position[2] = level;
         self.put_if_cursor_fits(world, cursor, retained, level, false)
     }
 
@@ -1185,29 +1476,45 @@ impl Interpreter<'_> {
         level: i32,
         clear_on_refusal: bool,
     ) -> Result<bool, Fault> {
+        self.put_if_cursor_fits_mode(world, cursor, retained, level, clear_on_refusal, true)
+    }
+
+    fn put_if_cursor_fits_mode(
+        &self,
+        world: &mut World,
+        cursor: &mut BuyCursor,
+        retained: Option<(u16, i16)>,
+        level: i32,
+        clear_on_refusal: bool,
+        allow_override: bool,
+    ) -> Result<bool, Fault> {
         let [x, y, _] = cursor.position;
-        if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
+        if !(1..=2).contains(&level) || !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
             if clear_on_refusal {
                 cursor.valid = false;
                 cursor.container = None;
+                cursor.placed_via_override = false;
             }
             return Ok(false);
         }
-        if !self.fits(world, cursor.cursor, [x, y], level)? {
+        if !self.cursor_fits_for_buy(world, cursor.cursor, [x, y], level)? {
             if clear_on_refusal {
                 cursor.valid = false;
                 cursor.container = None;
+                cursor.placed_via_override = false;
             }
-            return Ok(cursor.valid);
+            return Ok(false);
         }
         cursor.valid = false;
         cursor.container = None;
-        if self.try_place_buy_at(world, cursor, [x, y], level, retained)? {
+        cursor.placed_via_override = false;
+        if self.try_place_buy_at_mode(world, cursor, [x, y], level, retained, allow_override)? {
             return Ok(cursor.valid);
         }
         cursor.position = [x, y, level];
         cursor.valid = false;
         cursor.container = None;
+        cursor.placed_via_override = false;
         let cursor_place = Place {
             on_lot: true,
             position: [x, y],
@@ -1233,6 +1540,9 @@ impl Interpreter<'_> {
         cursor: &mut BuyCursor,
         level: i32,
     ) -> Result<bool, Fault> {
+        if !(1..=2).contains(&level) {
+            return Ok(false);
+        }
         let Some([x, y]) = world
             .objects
             .get(&cursor.cursor)
@@ -1253,11 +1563,13 @@ impl Interpreter<'_> {
         }
         cursor.valid = false;
         cursor.container = None;
-        if self.try_place_buy_at(world, cursor, [x, y], level, retained)? {
+        cursor.placed_via_override = false;
+        if self.try_place_buy_at_mode(world, cursor, [x, y], level, retained, true)? {
             return Ok(cursor.valid);
         }
         cursor.valid = false;
         cursor.container = None;
+        cursor.placed_via_override = false;
         if cursor_on_lot && inside_placement_bounds(world, [x, y]) {
             cursor.position = [x, y, level];
             let cursor_place = Place {
@@ -1344,14 +1656,51 @@ impl Interpreter<'_> {
                     .into(),
             )));
         }
+        let [x, y, level] = cursor.position;
+        if !(1..=2).contains(&level)
+            || !self.all_parts_within_lot_bounds(world, cursor.held, [x, y], level)?
+        {
+            return Err(fail(Trap::Invalid(
+                "cannot commit Buy Mode placement: target position or level is out of bounds"
+                    .into(),
+            )));
+        }
         if cursor.price > 0 && cursor.price > available_funds(world) {
             return Err(fail(Trap::Invalid(
                 "cannot commit Buy Mode placement: insufficient funds".into(),
             )));
         }
+        if cursor.placed_via_override {
+            let mut check_world = world.clone();
+            self.remove_cursor_and_held(&mut check_world, cursor)?;
+            let still_valid = match (self.move_objects, cursor.container) {
+                (true, None) => {
+                    self.user_test_place_ground_override(&check_world, cursor.held, [x, y], level)?
+                }
+                (false, None) => self
+                    .user_test_place_ground(&mut check_world, cursor.held, [x, y], level)?
+                    .is_ok(),
+                (_, Some((cid, slot))) => {
+                    self.user_fits_in(
+                        &mut check_world,
+                        cursor.held,
+                        cid,
+                        i32::from(slot),
+                        [x, y],
+                        level,
+                        self.move_objects,
+                    )? != SurfaceFit::No
+                }
+            };
+            if !still_valid {
+                return Err(fail(Trap::Invalid(
+                    "cannot commit Buy Mode placement: preview requires move_objects override"
+                        .into(),
+                )));
+            }
+        }
         self.remove_cursor_and_held(world, cursor)?;
         self.remove_now(world, self.lead_object(world, cursor.cursor))?;
-        let [x, y, level] = cursor.position;
         let place = Place {
             on_lot: true,
             position: [x, y],
@@ -1476,9 +1825,10 @@ impl Interpreter<'_> {
         world: &mut World,
         target: &BuyPlacement,
         allow_create: bool,
+        allow_override: bool,
     ) -> Result<Option<u16>, Fault> {
         let [x, y, level] = target.position;
-        if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
+        if !(1..=2).contains(&level) || !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
             return Ok(None);
         }
         let snapshot = (!target.children.is_empty()).then(|| world.clone());
@@ -1497,11 +1847,22 @@ impl Interpreter<'_> {
         self.rotate_object_to(world, id, target.facing)?;
         let fits = match target.container {
             Some((cid, slot)) => {
-                self.user_fits_in(world, id, cid, i32::from(slot), [x, y], level)?
+                self.user_fits_in(
+                    world,
+                    id,
+                    cid,
+                    i32::from(slot),
+                    [x, y],
+                    level,
+                    allow_override,
+                )? != SurfaceFit::No
             }
-            None => self
-                .user_test_place_ground(world, id, [x, y], level)?
-                .is_ok(),
+            None => {
+                self.user_test_place_ground(world, id, [x, y], level)?
+                    .is_ok()
+                    || (allow_override
+                        && self.user_test_place_ground_override(world, id, [x, y], level)?)
+            }
         };
         if !fits {
             if created_fresh {
@@ -1526,7 +1887,7 @@ impl Interpreter<'_> {
         self.run_user_placement(world, id)?;
         for child in &target.children {
             if self
-                .restore_placement(world, child, allow_create)?
+                .restore_placement(world, child, allow_create, allow_override)?
                 .is_none()
             {
                 if let Some(saved) = snapshot {
@@ -1583,7 +1944,8 @@ impl Interpreter<'_> {
                 if !all_placement_objects_on_lot(world, &before) {
                     return Ok(false);
                 }
-                let Some(id) = self.restore_placement(world, &before, false)? else {
+                let Some(id) = self.restore_placement(world, &before, false, self.move_objects)?
+                else {
                     return Ok(false);
                 };
                 purchase.object = id;
@@ -1613,7 +1975,8 @@ impl Interpreter<'_> {
                     return Ok(false);
                 }
                 let before_restore = world.clone();
-                let Some(id) = self.restore_placement(world, &target, true)? else {
+                let Some(id) = self.restore_placement(world, &target, true, self.move_objects)?
+                else {
                     return Ok(false);
                 };
                 if purchase.price > 0 && available_funds(world) < purchase.price {
@@ -1668,7 +2031,8 @@ impl Interpreter<'_> {
                     return Ok(false);
                 }
                 let before_restore = world.clone();
-                let Some(id) = self.restore_placement(world, &target, true)? else {
+                let Some(id) = self.restore_placement(world, &target, true, self.move_objects)?
+                else {
                     return Ok(false);
                 };
                 if purchase.price > 0 && available_funds(world) < purchase.price {
@@ -1687,7 +2051,8 @@ impl Interpreter<'_> {
                 if !all_placement_objects_on_lot(world, &after) {
                     return Ok(false);
                 }
-                let Some(id) = self.restore_placement(world, &after, false)? else {
+                let Some(id) = self.restore_placement(world, &after, false, self.move_objects)?
+                else {
                     return Ok(false);
                 };
                 purchase.object = id;
@@ -1805,7 +2170,13 @@ impl Interpreter<'_> {
         self.take_off_cursor_and_held_unconditional(world, cursor)?;
         self.remove_now(world, self.lead_object(world, cursor.cursor))?;
         if let Some(origin) = &cursor.origin {
-            if self.restore_placement(world, origin, false)?.is_none() {
+            // Always permit bounds-checked ground override when restoring the
+            // captured pre-pickup origin so toggling `move_objects` off mid-drag
+            // can never strand an already-overlapped object off-lot.
+            if self
+                .restore_placement(world, origin, false, true)?
+                .is_none()
+            {
                 return Err(Fault {
                     object: cursor.held,
                     at: None,
@@ -2203,7 +2574,8 @@ impl Interpreter<'_> {
     /// an existing on-lot container, lot-interior bounds and ground flag
     /// `0x20` clear, `fits_in` (`0x4355b5`), tile-centred coordinates
     /// (`0x4355bc..0x4355cd`), and containment slot height not in `5..=7`
-    /// (`0x43560c..0x435623`) when `move_objects` is off.
+    /// (`0x43560c..0x435623`) when `move_objects` override is not active.
+    #[allow(clippy::too_many_arguments)]
     fn user_fits_in(
         &self,
         world: &mut World,
@@ -2212,7 +2584,8 @@ impl Interpreter<'_> {
         slot: i32,
         pos: [i32; 2],
         level: i32,
-    ) -> Result<bool, Fault> {
+        override_active: bool,
+    ) -> Result<SurfaceFit, Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -2223,36 +2596,46 @@ impl Interpreter<'_> {
             .get(&container)
             .is_some_and(|c| on_lot([c.position[0], c.position[1]]))
         {
-            return Ok(false);
+            return Ok(SurfaceFit::No);
         }
         if !inside_placement_bounds(world, pos) {
-            return Ok(false);
+            return Ok(SurfaceFit::No);
         }
         let a = i8::try_from(pos[0] >> 4).unwrap_or(-1);
         let b = i8::try_from(pos[1] >> 4).unwrap_or(-1);
-        if (crate::placement::tile_flags(world, a, b, 1).map_err(fail)? & 0x20) != 0 {
-            return Ok(false);
+        let locked_tile = (crate::placement::tile_flags(world, a, b, 1).map_err(fail)? & 0x20) != 0;
+        if locked_tile && !override_active {
+            return Ok(SurfaceFit::No);
         }
         if !self.fits_in(world, id, container, slot, pos, level)? {
-            return Ok(false);
+            return Ok(SurfaceFit::No);
         }
         if (pos[0] & 0x0f) != 8 || (pos[1] & 0x0f) != 8 {
-            return Ok(false);
+            return Ok(SurfaceFit::No);
         }
         let height = self
             .container_slot_height(world, container, slot)
             .map_err(fail)?;
-        Ok(!matches!(height, Some(5..=7)))
+        let restricted_height = matches!(height, Some(5..=7));
+        if restricted_height && !override_active {
+            return Ok(SurfaceFit::No);
+        }
+        Ok(if locked_tile || restricted_height {
+            SurfaceFit::Override
+        } else {
+            SurfaceFit::Strict
+        })
     }
 
     /// Tests whether `held` fits at `[pos, level]` (`0x422050`): first tries
     /// any `retained` surface container at the same tile without re-aligning
     /// facing (`0x422050` line `0x422078`), then runs `UserTestPlace`
-    /// (`0x435522` / `0x422de4`, `Some(None)`), and — after a collision
-    /// refusal (`0x0b`) on a single-tile object — searches compatible surface
-    /// slots on that tile (`Some(Some((container_id, slot)))`), rejecting slot
-    /// heights `5..=7` (`0x43560c..0x435623`) and aligning facing via
-    /// `0x4221e4..0x422280` + `0x43244d`.
+    /// (`0x435522` / `0x422de4`, `Some((None, false))`), and — after a
+    /// collision refusal (`0x0b`) on a single-tile object — searches compatible
+    /// surface slots on that tile (`Some((Some((container_id, slot)), used_override))`),
+    /// rejecting slot heights `5..=7` (`0x43560c..0x435623`) unless override is
+    /// active and aligning facing via `0x4221e4..0x422280` + `0x43244d`.
+    #[allow(clippy::too_many_arguments)]
     fn test_buy_placement(
         &self,
         world: &mut World,
@@ -2261,14 +2644,33 @@ impl Interpreter<'_> {
         pos: [i32; 2],
         level: i32,
         retained: Option<(u16, i16)>,
-    ) -> Result<Option<Option<(u16, i16)>>, Fault> {
-        if let Some((container, slot)) = retained
-            && self.user_fits_in(world, held, container, i32::from(slot), pos, level)?
-        {
-            return Ok(Some(Some((container, slot))));
+        allow_override: bool,
+    ) -> Result<Option<PlacementFit>, Fault> {
+        let override_active = allow_override && self.move_objects;
+        if let Some((container, slot)) = retained {
+            let fit = self.user_fits_in(
+                world,
+                held,
+                container,
+                i32::from(slot),
+                pos,
+                level,
+                override_active,
+            )?;
+            if fit != SurfaceFit::No {
+                return Ok(Some(PlacementFit {
+                    container: Some((container, slot)),
+                    used_override: fit == SurfaceFit::Override,
+                }));
+            }
         }
         match self.user_test_place_ground(world, held, pos, level)? {
-            Ok(()) => return Ok(Some(None)),
+            Ok(()) => {
+                return Ok(Some(PlacementFit {
+                    container: None,
+                    used_override: false,
+                }));
+            }
             Err(Refusal::Collision(_)) => {}
             Err(_) => return Ok(None),
         }
@@ -2304,16 +2706,40 @@ impl Interpreter<'_> {
                 .get(&container)
                 .map_or(0, |o| o.slots.len().saturating_sub(1));
             for slot in 0..slot_count {
-                if self.user_fits_in(world, held, container, slot as i32, pos, level)? {
+                let fit = self.user_fits_in(
+                    world,
+                    held,
+                    container,
+                    slot as i32,
+                    pos,
+                    level,
+                    override_active,
+                )?;
+                if fit != SurfaceFit::No {
                     let target_dir =
                         surface_aligned_direction(world, container, current_facing, level)?;
                     self.rotate_held_to(world, cursor, held, target_dir)?;
-                    return Ok(Some(Some((container, slot as i16))));
+                    return Ok(Some(PlacementFit {
+                        container: Some((container, slot as i16)),
+                        used_override: fit == SurfaceFit::Override,
+                    }));
                 }
             }
         }
         Ok(None)
     }
+}
+
+struct PlacementFit {
+    container: Option<(u16, i16)>,
+    used_override: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SurfaceFit {
+    No,
+    Strict,
+    Override,
 }
 
 /// Computes the surface-aligned facing direction for a single-tile object

@@ -47,6 +47,12 @@ use sims_sim::rooms::RoomError;
 /// Off the lot: where the factory puts a new object.
 const OFF_LOT: i32 = -16;
 
+/// Sentinel stored in [`sims_sim::route::Context::target`] when its target
+/// object is deleted while the route context survives (`0x440fff`). Because
+/// live object IDs are positive `i16` (`1..=32767`) and `0` is reserved for
+/// loaded contexts, `u16::MAX` can never collide with a reused object ID.
+pub(crate) const DELETED_ROUTE_TARGET: u16 = u16::MAX;
+
 /// The callback table's entry for the Reset tree.
 const RESET: usize = 3;
 
@@ -406,20 +412,13 @@ impl Interpreter<'_> {
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
         let person = object.person.is_some();
         let selected = object.selected;
-        // A route context holds a pointer to its slot's object
-        // (context +0x48); what the original does with it when the object
-        // goes is not known.
-        if let Some((&other, _)) = world
-            .routing
-            .routes
-            .iter()
-            .find(|(_, r)| r.contexts.iter().any(|c| c.target == id))
-        {
-            return Err(fail(Trap::Unsupported(format!(
-                "person {other} has a route to object {id}; deleting an object a route \
-                 leads to is not ported"
-            ))));
-        }
+        // Native `0x440fff` never refuses deletion when another person holds a
+        // route context targeting `id`: `0x441096` (`drop_references` ->
+        // `0x45e791`) resets any person using `id` or displaying its icon
+        // (clearing its route contexts at `0x45e8aa`), and any surviving route
+        // context targeting `id` transitions cleanly through `LOST` /
+        // `LOST_UNDER_WAY` (`0x45ae8d`) when `Go To Routing Slot` next ticks
+        // and observes `frame.stack_object` absent from `world.objects`.
         if world.event_owner == id {
             world.event_owner = 0;
         }
@@ -433,6 +432,16 @@ impl Interpreter<'_> {
             marks.borrow_mut().insert(id);
         }
         self.drop_references(world, id)?;
+        // Record target loss on any surviving route context pointing at `id` so
+        // immediate object-ID reuse before `Go To Routing Slot` next ticks
+        // cannot redirect the route onto an unrelated newly-created object.
+        for route in world.routing.routes.values_mut() {
+            for context in &mut route.contexts {
+                if context.target == id {
+                    context.target = DELETED_ROUTE_TARGET;
+                }
+            }
+        }
         if person {
             self.reset_person_to_delete(world, id)?;
         } else {

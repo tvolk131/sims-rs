@@ -1182,45 +1182,23 @@ fn studio_town_house81_celebrity_pooled_stars_and_downtown_house21_bar_avoid_uns
     }
 }
 
-#[test]
-#[ignore = "full 9-lot Complete Collection sweep; run explicitly with --ignored --nocapture"]
-fn complete_collection_interactive_object_sweep() {
-    let Some(root) = sims_install() else {
-        eprintln!("SIMS_INSTALL not set; skipping Complete Collection interactive object sweep");
-        return;
-    };
-
-    // Mirror `tests/destination_lots.rs`: Vacation (`House40`) requires `global[3] != 0`
-    // to avoid the Maxis uninitialized `local 6` bug in `NPC_Vacation_Controller.iff`,
-    // whereas other destination lots run without selecting an NPC/visitor.
-    let lots = [
-        ("Goth (House05)", "UserData/Houses/House05.iff", false),
-        ("Newbies (House07)", "UserData/Houses/House07.iff", false),
-        ("Charming (House69)", "UserData/Houses/House69.iff", false),
-        ("Downtown (House21)", "UserData/Houses/House21.iff", false),
-        ("Vacation (House40)", "UserData/Houses/House40.iff", true),
-        ("Old Town (House58)", "UserData/Houses/House58.iff", false),
-        (
-            "Studio Town (House81)",
-            "UserData/Houses/House81.iff",
-            false,
-        ),
-        (
-            "Magic Town Res (House90)",
-            "UserData/Houses/House90.iff",
-            false,
-        ),
-        (
-            "Magic Town Comm (House93)",
-            "UserData/Houses/House93.iff",
-            false,
-        ),
-    ];
-
+fn run_sweep_suite(
+    root: &std::path::Path,
+    lots: &[(&str, &str, bool)],
+    ticks_per_interaction: u32,
+    report_title: &str,
+) -> (Vec<LotSweepStats>, BTreeMap<String, UnsupportedBucket>) {
     let mut buckets: BTreeMap<String, UnsupportedBucket> = BTreeMap::new();
     let mut all_stats = Vec::new();
-    for (label, rel, select_actor) in lots {
-        let stats = sweep_one_lot(&root, label, rel, select_actor, 200, &mut buckets);
+    for &(label, rel, select_actor) in lots {
+        let stats = sweep_one_lot(
+            root,
+            label,
+            rel,
+            select_actor,
+            ticks_per_interaction,
+            &mut buckets,
+        );
         eprintln!(
             "{}: objects={} entries={} clean={} native={} invalid={} unsupported={} pie_unsup={} warmup_errs={} skipped={:?} panels={:?}",
             stats.lot_name,
@@ -1242,13 +1220,12 @@ fn complete_collection_interactive_object_sweep() {
     ranked.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
 
     let mut report = String::new();
+    let _ = writeln!(report, "# {report_title}\n");
     let _ = writeln!(
         report,
-        "# Complete Collection Interactive Object Sweep Report\n"
-    );
-    let _ = writeln!(
-        report,
-        "Swept 9 representative lots (base + expansions), 200 strict ticks per pie-menu entry.\n"
+        "Swept {} representative lots (base + expansions), {} strict ticks per pie-menu entry.\n",
+        lots.len(),
+        ticks_per_interaction,
     );
     let _ = writeln!(report, "## Per-Lot Summary\n");
     let _ = writeln!(
@@ -1352,6 +1329,54 @@ fn complete_collection_interactive_object_sweep() {
         "\nTOTAL: objects={tot_obj} entries={tot_ent} clean={tot_clean} unsupported={tot_unsup} pie_unsup={tot_pie} distinct_unsupported={}",
         ranked.len()
     );
+    (all_stats, buckets)
+}
+
+#[test]
+#[ignore = "full 9-lot Complete Collection sweep; run explicitly with --ignored --nocapture"]
+fn complete_collection_interactive_object_sweep() {
+    let Some(root) = sims_install() else {
+        eprintln!("SIMS_INSTALL not set; skipping Complete Collection interactive object sweep");
+        return;
+    };
+
+    // Mirror `tests/destination_lots.rs`: Vacation (`House40`) requires `global[3] != 0`
+    // to avoid the Maxis uninitialized `local 6` bug in `NPC_Vacation_Controller.iff`,
+    // whereas other destination lots run without selecting an NPC/visitor.
+    let lots = [
+        ("Goth (House05)", "UserData/Houses/House05.iff", false),
+        ("Newbies (House07)", "UserData/Houses/House07.iff", false),
+        ("Charming (House69)", "UserData/Houses/House69.iff", false),
+        ("Downtown (House21)", "UserData/Houses/House21.iff", false),
+        ("Vacation (House40)", "UserData/Houses/House40.iff", true),
+        ("Old Town (House58)", "UserData/Houses/House58.iff", false),
+        (
+            "Studio Town (House81)",
+            "UserData/Houses/House81.iff",
+            false,
+        ),
+        (
+            "Magic Town Res (House90)",
+            "UserData/Houses/House90.iff",
+            false,
+        ),
+        (
+            "Magic Town Comm (House93)",
+            "UserData/Houses/House93.iff",
+            false,
+        ),
+    ];
+
+    let (all_stats, buckets) = run_sweep_suite(
+        &root,
+        &lots,
+        200,
+        "Complete Collection Interactive Object Sweep Report",
+    );
+    let tot_ent: usize = all_stats.iter().map(|s| s.entries_tested).sum();
+    let tot_unsup: usize = all_stats.iter().map(|s| s.unsupported_hits).sum();
+    let tot_pie: usize = all_stats.iter().map(|s| s.pie_menu_unsupported).sum();
+
     for s in &all_stats {
         if !s.lot_name.contains("House90") {
             assert!(
@@ -1376,7 +1401,74 @@ fn complete_collection_interactive_object_sweep() {
         "expected 0 pie_menu Trap::Unsupported hits across all swept Complete Collection lots"
     );
     assert!(
-        ranked.is_empty(),
+        buckets.is_empty(),
         "expected 0 distinct Trap::Unsupported buckets across all swept Complete Collection lots"
+    );
+}
+
+#[test]
+#[ignore = "deep 600-tick Complete Collection expansion sweep; run explicitly with --ignored --nocapture"]
+fn deep_expansion_600_tick_sweep() {
+    let Some(root) = sims_install() else {
+        eprintln!("SIMS_INSTALL not set; skipping 600-tick deep expansion sweep");
+        return;
+    };
+
+    let lots = [
+        ("Goth (House05)", "UserData/Houses/House05.iff", false),
+        ("Downtown (House21)", "UserData/Houses/House21.iff", false),
+        ("Vacation (House40)", "UserData/Houses/House40.iff", true),
+        ("Old Town (House58)", "UserData/Houses/House58.iff", false),
+        (
+            "Studio Town (House81)",
+            "UserData/Houses/House81.iff",
+            false,
+        ),
+        (
+            "Magic Town Comm (House93)",
+            "UserData/Houses/House93.iff",
+            false,
+        ),
+    ];
+
+    let (all_stats, buckets) = run_sweep_suite(
+        &root,
+        &lots,
+        600,
+        "Complete Collection Interactive Object Sweep Report (600-Tick Deep Expansion Sweep)",
+    );
+    let tot_ent: usize = all_stats.iter().map(|s| s.entries_tested).sum();
+    let tot_unsup: usize = all_stats.iter().map(|s| s.unsupported_hits).sum();
+    let tot_pie: usize = all_stats.iter().map(|s| s.pie_menu_unsupported).sum();
+
+    for s in &all_stats {
+        assert!(
+            s.skipped_reason.is_none() && s.entries_tested > 0,
+            "expected active lot {} to contribute swept interactions (skipped={:?}, entries={})",
+            s.lot_name,
+            s.skipped_reason,
+            s.entries_tested
+        );
+    }
+    assert!(
+        tot_ent >= 1200,
+        "expected >= 1200 swept interactions across 6 deep-sweep lots, got {tot_ent}"
+    );
+    let non_presentation_unsupported: usize = buckets
+        .iter()
+        .filter(|(reason, _)| !reason.contains("animator byte +0x109"))
+        .map(|(_, bucket)| bucket.count)
+        .sum();
+    assert_eq!(
+        tot_pie, 0,
+        "expected 0 pie_menu Trap::Unsupported hits across 600-tick deep expansion sweep"
+    );
+    assert_eq!(
+        non_presentation_unsupported, 0,
+        "expected 0 non-presentation Trap::Unsupported hits across 600-tick deep expansion sweep; see report"
+    );
+    assert!(
+        tot_unsup <= 10,
+        "expected at most 10 strict-mode +0x109 viewport-cull presentation traps across 600-tick sweep, got {tot_unsup}"
     );
 }

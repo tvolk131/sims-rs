@@ -533,3 +533,64 @@ fn a_failed_cancel_keeps_its_place_and_the_queue_its_ring() {
     assert_eq!(queue.len(), 8, "{fault}");
     assert_eq!(queue[0].uid, 1);
 }
+
+#[test]
+fn deleting_an_object_that_a_person_is_routing_to_succeeds_without_trapping() {
+    let (mut fx, _) = lot(2, false);
+    fx.add_sim(9);
+    // Give Sim 9 an active route context whose target is widget 2 (`0x440fff`
+    // deletes widget 2 directly; `cXPerson::CheckGoal` / `go_to_slot.rs` at
+    // `0x45ae8d` handles the missing target via LOST / LOST_UNDER_WAY).
+    let ctx = sims_sim::route::Context {
+        candidates: Vec::new(),
+        slot: sims_sim::route::RouteSlot {
+            offset: [0; 3],
+            number: 1,
+            standing: 0,
+            sitting: 0,
+            ground: 0,
+            flags: 0,
+            snap_target: 0,
+            proximity: [0; 3],
+            gradient: 0,
+            facing: 0,
+            resolution: 0,
+        },
+        target: 2,
+        person: 9,
+        chosen: -1,
+        best: -1,
+        word_58: 0,
+        time: 0,
+        saved: [0; 2],
+        word_68: 0,
+        start: [0; 3],
+        byte_78: false,
+        objects: [0; 2],
+        byte_84: false,
+        result: 0,
+        word_8c: 0,
+        byte_8e: false,
+        word_94: 0,
+        limit: 0x30,
+        action: 0,
+    };
+    let route = sims_sim::route::Route {
+        contexts: vec![ctx],
+        ..Default::default()
+    };
+    fx.world.routing.routes.insert(9, route);
+
+    let interpreter = fx.interpreter();
+    let mut world = fx.world.clone();
+    assert_eq!(interpreter.delete(&mut world, 2), Ok(()));
+    assert!(!world.objects.contains_key(&2));
+    assert!(world.objects.contains_key(&1));
+    assert!(world.objects.contains_key(&9));
+    // P1 regression: surviving route context is stamped with u16::MAX so even
+    // if `create` immediately reuses freed ID 2, the route cannot target the
+    // newly allocated object.
+    assert_eq!(world.routing.routes[&9].contexts[0].target, u16::MAX);
+    assert_eq!(interpreter.create(&mut world, WIDGET), Ok(2));
+    assert_eq!(world.routing.routes[&9].contexts[0].target, u16::MAX);
+}

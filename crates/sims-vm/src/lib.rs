@@ -109,6 +109,7 @@ pub use factory::TURN_BUDGET;
 pub use fault::{Fault, Location, Trap};
 pub use frame::PanelMode;
 pub use interpreter::{Asked, Interpreter, MAX_STACK, Status, Stream};
+pub use lifecycle::VmInstallCache;
 pub use load::{INDICATORS, Reconciled, Roomed};
 pub use memory::scope_name;
 pub use objects::{READ_BEFORE_THE_FIRST_LOAD, SavedRead, read_before_the_first_load};

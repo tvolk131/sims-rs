@@ -431,6 +431,11 @@ impl World {
         }
         self.neighbors = neighbors.into();
         self.families = ordered.into_iter().map(|(_, family)| family).collect();
+        self.family_flags = families
+            .iter()
+            .map(|(&id, family)| (i32::from(id), family.flags))
+            .collect();
+        self.family_flags.entry(0).or_insert(0);
         Ok(())
     }
 

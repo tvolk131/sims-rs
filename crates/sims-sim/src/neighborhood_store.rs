@@ -41,6 +41,7 @@ use sims_formats::lot::Simulator;
 use sims_formats::neighborhood::{
     Family, Inventory, InventoryItem, Neighbor, Relationship as SavedRelationship,
 };
+use sims_formats::strings::StringTable;
 use sims_formats::tatt::{Entry as TattEntry, Tatt};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -987,8 +988,8 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// (`NEIGHBORHOOD_MIN_FORMAT..NEIGHBORHOOD_FORMAT`) are upgraded deterministically
 /// via [`crate::migration::NEIGHBORHOOD_MIGRATIONS`] (format 2 added
 /// `instance_id` and `deleted_characters`; format 3 added `deletion_epoch` and
-/// `deleted_at_epoch`).
-pub const NEIGHBORHOOD_FORMAT: u32 = 3;
+/// `deleted_at_epoch`; format 4 added `family_surnames`).
+pub const NEIGHBORHOOD_FORMAT: u32 = 4;
 
 /// Default `"architecture value multiplier"` from `Global.far` `FCNS #4`
 /// (`0x6e4a88`, `0x3f333333`).
@@ -1075,6 +1076,12 @@ pub struct StoredNeighborhood {
     pub name: String,
     /// Families by FAMI chunk ID.
     pub families: BTreeMap<u16, Family>,
+    /// Optional household surnames keyed by FAMI / `FAMs` chunk ID (populated
+    /// from `Neighborhood.iff` `FAMs` chunks on import and written natively by
+    /// Create-A-Family / `.FAM` import so surnames persist inside REDB without
+    /// an external sidecar file).
+    #[serde(default)]
+    pub family_surnames: BTreeMap<u16, String>,
     /// Neighbor records in native slot order (including empty `None` slots).
     pub neighbors: Vec<Option<Neighbor>>,
     /// Neighbor inventories from `NGBH`.
@@ -1189,6 +1196,29 @@ impl StoredNeighborhood {
             })
             .map(|(&id, family)| (id, family))
             .collect()
+    }
+
+    /// Returns the persisted household surname for `family_id`, if any.
+    #[must_use]
+    pub fn family_surname(&self, family_id: u16) -> Option<&str> {
+        self.family_surnames.get(&family_id).map(String::as_str)
+    }
+
+    /// Sets (or clears, if blank) the persisted household surname for
+    /// `family_id`.
+    pub fn set_family_surname(&mut self, family_id: u16, surname: impl Into<String>) {
+        let trimmed = surname.into().trim().to_owned();
+        if trimmed.is_empty() {
+            self.family_surnames.remove(&family_id);
+        } else {
+            self.family_surnames.insert(family_id, trimmed);
+        }
+    }
+
+    /// Removes and returns the persisted household surname for `family_id`, if
+    /// present.
+    pub fn remove_family_surname(&mut self, family_id: u16) -> Option<String> {
+        self.family_surnames.remove(&family_id)
     }
 
     /// Whether `house` is zoned residential (`1`, matching `0x427327..0x42734a`).
@@ -1412,6 +1442,8 @@ impl StoredNeighborhood {
         // Call 6) so empty households never persist or block other lot loads.
         self.families
             .retain(|&id, family| id == 0 || !family.members.is_empty());
+        self.family_surnames
+            .retain(|id, _| self.families.contains_key(id));
 
         // 4. TATT (0x425455 → 0x43e0be): merge updated world type attributes.
         if !world.type_attributes.is_empty() {
@@ -1460,6 +1492,61 @@ pub struct NeighborhoodStore {
 
 fn store(error: impl std::fmt::Display) -> Error {
     Error::Store(error.to_string())
+}
+
+/// Reads optional household surnames from `Neighborhood.iff` `FAMs` chunks for
+/// every family present in `families`. Missing or unreadable `FAMs` chunks are
+/// skipped non-fatally so synthetic or minimal neighborhood fixtures still
+/// import cleanly.
+fn read_family_surnames(
+    directory: &Path,
+    families: &BTreeMap<u16, Family>,
+) -> BTreeMap<u16, String> {
+    let mut surnames = BTreeMap::new();
+    let direct = directory.join("Neighborhood.iff");
+    let path = if direct.is_file() {
+        Some(direct)
+    } else {
+        #[expect(clippy::disallowed_methods, reason = "entries are sorted before use")]
+        let entries = std::fs::read_dir(directory).ok();
+        entries.and_then(|entries| {
+            let mut paths: Vec<PathBuf> = entries
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .collect();
+            paths.sort();
+            paths.into_iter().find(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.eq_ignore_ascii_case("Neighborhood.iff"))
+            })
+        })
+    };
+    let Some(path) = path else {
+        return surnames;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return surnames;
+    };
+    let Ok(iff) = Iff::parse(bytes) else {
+        return surnames;
+    };
+    for chunk in iff.all(b"FAMs") {
+        if !families.contains_key(&chunk.id) {
+            continue;
+        }
+        let Ok(table) = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)) else {
+            continue;
+        };
+        let raw = table
+            .get(0, 1)
+            .or_else(|| table.entries.first().map(|entry| entry.text.as_str()));
+        if let Some(name) = raw.map(str::trim).filter(|name| !name.is_empty()) {
+            surnames.insert(chunk.id, name.to_owned());
+        }
+    }
+    surnames
 }
 
 /// Mixes a store's persisted database ID with its OS file identity (device +
@@ -1888,6 +1975,7 @@ impl NeighborhoodStore {
 
         let mut stored = StoredNeighborhood {
             name: id.to_owned(),
+            family_surnames: read_family_surnames(directory, &neighborhood.families),
             families: neighborhood.families,
             neighbors: neighborhood.neighbors,
             inventories: neighborhood.inventories,

@@ -120,6 +120,7 @@ fn move_in_unit_validation_and_accounting() {
     let nh = StoredNeighborhood {
         name: "TestNH".into(),
         families,
+        family_surnames: BTreeMap::new(),
         neighbors: Vec::new(),
         inventories: Vec::new(),
         data: [0; 16],
@@ -664,6 +665,7 @@ fn concurrent_move_in_only_allows_one_winner() {
     let nh = StoredNeighborhood {
         name: "Race".into(),
         families,
+        family_surnames: BTreeMap::new(),
         neighbors: Vec::new(),
         inventories: Vec::new(),
         data: [0; 16],
@@ -1133,5 +1135,222 @@ fn bulldoze_occupied_newbie_house_7_evicts_and_clears_lot_atomically() {
     assert_eq!(
         lot_price(&store, "UserData", 7, DEFAULT_ARCH_VALUE_MULTIPLIER).unwrap(),
         6_000
+    );
+}
+
+#[test]
+fn vm_install_cache_matches_uncached_enter_lot_for_base_saved_and_caf_households() {
+    fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
+    assert_send_sync_clone::<sims_vm::VmInstallCache>();
+
+    let Some(root) = install() else {
+        return;
+    };
+    let db = TempDb::new("vm-install-cache-parity");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .import_directory("UserData", &root.join("UserData"), 0xff)
+        .unwrap();
+
+    let cache = sims_vm::VmInstallCache::load(&root).unwrap();
+    assert_eq!(cache.install_root(), root.as_path());
+    assert!(!cache.base_catalog().objects.is_empty());
+
+    // 1. Base-house entry parity on Goth House05 (initial + 15 ticks).
+    let no_frames = Frames::default();
+    let mut uncached = enter_lot(&root, &store, "UserData", 5, &[3], no_frames.clone()).unwrap();
+    let mut cached = sims_vm::lifecycle::enter_lot_with_cache(
+        &cache,
+        &store,
+        "UserData",
+        5,
+        &[3],
+        no_frames.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        cached.world().hash(),
+        uncached.world().hash(),
+        "cached base-house entry must produce exact same initial World::hash()"
+    );
+    for _ in 0..15 {
+        uncached.step().unwrap();
+        cached.step().unwrap();
+    }
+    assert_eq!(
+        cached.world().hash(),
+        uncached.world().hash(),
+        "cached base-house entry must stay bit-identical across ticks"
+    );
+
+    // 2. Saved-lot re-entry parity after Save & Leave.
+    save_and_leave_lot(&root, &store, "UserData", &mut cached).unwrap();
+    let mut uncached_saved =
+        enter_lot(&root, &store, "UserData", 5, &[3], no_frames.clone()).unwrap();
+    let mut cached_saved = sims_vm::lifecycle::enter_lot_with_cache(
+        &cache,
+        &store,
+        "UserData",
+        5,
+        &[3],
+        no_frames.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        cached_saved.world().hash(),
+        uncached_saved.world().hash(),
+        "cached saved-lot re-entry must produce exact same World::hash()"
+    );
+    for _ in 0..15 {
+        uncached_saved.step().unwrap();
+        cached_saved.step().unwrap();
+    }
+    assert_eq!(
+        cached_saved.world().hash(),
+        uncached_saved.world().hash(),
+        "cached saved-lot re-entry must stay bit-identical across ticks"
+    );
+
+    // 3. CAF-created character household parity (verifies incremental character
+    //    catalog splice + People::load_each_with_registry on newly added User*.iff).
+    let sim = sims_vm::caf::SimSpec {
+        first_name: "CacheTest".into(),
+        bio: "Cache test Sim.".into(),
+        age: sims_vm::caf::Age::Adult,
+        gender: sims_vm::caf::Gender::Female,
+        skin_tone: sims_vm::caf::SkinTone::Medium,
+        body_appearance: "b002fafit_01".into(),
+        body_texture: "b002fafitmed_mom02".into(),
+        head_appearance: "c809fa_beth".into(),
+        head_texture: "c809famed_beth3".into(),
+        personality: sims_vm::caf::Personality::new(5, 5, 5, 5, 5).unwrap(),
+        portraits: None,
+    };
+    let fam_spec = sims_vm::caf::FamilySpec::new("CacheFam", "Cached CAF test", vec![sim]);
+    let mut rng = sims_core::CrtRng::from_state(0x4242_1337);
+    let created =
+        sims_vm::caf::commit_family(&root, &store, "UserData", &fam_spec, &mut rng).unwrap();
+    move_in(&root, &store, "UserData", created.family_id, 4).unwrap();
+
+    let mut uncached_caf =
+        enter_lot(&root, &store, "UserData", 4, &[3], no_frames.clone()).unwrap();
+    let mut cached_caf =
+        sims_vm::lifecycle::enter_lot_with_cache(&cache, &store, "UserData", 4, &[3], no_frames)
+            .unwrap();
+    assert_eq!(
+        cached_caf.world().hash(),
+        uncached_caf.world().hash(),
+        "cached CAF lot entry must match uncached World::hash() identically"
+    );
+    for _ in 0..10 {
+        uncached_caf.step().unwrap();
+        cached_caf.step().unwrap();
+    }
+    assert_eq!(cached_caf.world().hash(), uncached_caf.world().hash());
+}
+
+#[test]
+#[ignore = "release warm enter_lot latency benchmark; run with --release -- --ignored --nocapture"]
+#[allow(clippy::disallowed_methods)]
+fn benchmark_enter_lot_uncached_vs_vm_install_cache() {
+    use std::time::Instant;
+
+    let Some(root) = install() else {
+        return;
+    };
+    let db = TempDb::new("vm-install-cache-bench");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .import_directory("UserData", &root.join("UserData"), 0xff)
+        .unwrap();
+
+    let t_cache = Instant::now();
+    let cache = sims_vm::VmInstallCache::load(&root).unwrap();
+    let cache_load_ms = t_cache.elapsed().as_secs_f64() * 1000.0;
+
+    fn measure<F: FnMut() -> sims_vm::boot::Lot>(runs: usize, mut f: F) -> Vec<f64> {
+        let mut samples = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let t0 = Instant::now();
+            let lot = f();
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            std::hint::black_box(lot.world().hash());
+            samples.push(ms);
+        }
+        samples.sort_by(|a, b| a.total_cmp(b));
+        samples
+    }
+
+    let base_uncached = measure(5, || {
+        enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap()
+    });
+    let base_cached = measure(5, || {
+        sims_vm::lifecycle::enter_lot_with_cache(
+            &cache,
+            &store,
+            "UserData",
+            5,
+            &[3],
+            Frames::default(),
+        )
+        .unwrap()
+    });
+
+    // Save lot 5 once, then benchmark warm saved-lot re-entry.
+    let mut lot5 = sims_vm::lifecycle::enter_lot_with_cache(
+        &cache,
+        &store,
+        "UserData",
+        5,
+        &[3],
+        Frames::default(),
+    )
+    .unwrap();
+    for _ in 0..10 {
+        lot5.step().unwrap();
+    }
+    save_and_leave_lot(&root, &store, "UserData", &mut lot5).unwrap();
+
+    let saved_uncached = measure(5, || {
+        enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap()
+    });
+    let saved_cached = measure(5, || {
+        sims_vm::lifecycle::enter_lot_with_cache(
+            &cache,
+            &store,
+            "UserData",
+            5,
+            &[3],
+            Frames::default(),
+        )
+        .unwrap()
+    });
+
+    eprintln!(
+        "VmInstallCache::load: {cache_load_ms:.1} ms\n\
+         Base House05 uncached median: {:.1} ms (all: {:?})\n\
+         Base House05 cached   median: {:.1} ms (all: {:?})\n\
+         Saved House05 uncached median: {:.1} ms (all: {:?})\n\
+         Saved House05 cached   median: {:.1} ms (all: {:?})",
+        base_uncached[2],
+        base_uncached,
+        base_cached[2],
+        base_cached,
+        saved_uncached[2],
+        saved_uncached,
+        saved_cached[2],
+        saved_cached,
+    );
+    assert!(
+        base_cached[2] < base_uncached[2],
+        "expected cached base enter_lot ({:.1} ms) to beat uncached ({:.1} ms)",
+        base_cached[2],
+        base_uncached[2]
+    );
+    assert!(
+        saved_cached[2] < saved_uncached[2],
+        "expected cached saved enter_lot ({:.1} ms) to beat uncached ({:.1} ms)",
+        saved_cached[2],
+        saved_uncached[2]
     );
 }

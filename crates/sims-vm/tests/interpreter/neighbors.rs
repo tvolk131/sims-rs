@@ -316,18 +316,31 @@ fn scope_24_reads_other_fields_of_the_record() {
         code(fx.expression(24, 2, op::ASSIGN, scope::LITERAL, 1)),
         Some(0x13)
     );
-    // Fields that read what the simulation does not keep fail loudly,
-    // naming the original's code, even in a write.
-    for (index, address) in [(7, "0x425c5e"), (8, "0x425cb4")] {
-        for operator in [op::EQUAL, op::ASSIGN] {
-            let fault = fx
-                .expression(24, index, operator, scope::LITERAL, 0)
-                .unwrap_err();
-            let Trap::Unsupported(text) = &fault.trap else {
-                panic!("{fault}");
-            };
-            assert!(text.contains(address), "{text}");
-        }
+    // Fields 7 (0x425c5e) and 8 (0x425cb4) read bits 0 and 1 of the neighbor's
+    // family's flags (+0x138) when the family lives in a house (house != 0),
+    // and return 0 when unhoused or missing. Writes fail with native error 0x13.
+    fx.world.neighbors.get_mut(2).unwrap().data[FAMILY] = 7;
+    assert_eq!(field(&mut fx, 7), 0);
+    assert_eq!(field(&mut fx, 8), 0);
+    fx.world.family_flags.insert(7, 0x1);
+    assert_eq!(field(&mut fx, 7), 1);
+    assert_eq!(field(&mut fx, 8), 0);
+    fx.world.family_flags.insert(7, 0x2);
+    assert_eq!(field(&mut fx, 7), 0);
+    assert_eq!(field(&mut fx, 8), 1);
+    fx.world.family_flags.insert(7, 0x3);
+    assert_eq!(field(&mut fx, 7), 1);
+    assert_eq!(field(&mut fx, 8), 1);
+    let saved_house = fx.world.families[0].house;
+    fx.world.families[0].house = 0;
+    assert_eq!(field(&mut fx, 7), 0);
+    assert_eq!(field(&mut fx, 8), 0);
+    fx.world.families[0].house = saved_house;
+    for index in [7, 8] {
+        assert_eq!(
+            code(fx.expression(24, index, op::ASSIGN, scope::LITERAL, 0)),
+            Some(0x13)
+        );
     }
     // No record in the stack object's slot: every field is 0.
     fx.world.neighbors.slots.truncate(1);

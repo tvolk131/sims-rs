@@ -261,7 +261,7 @@ const GRIDS: [u16; 2] = [3, 103];
 /// The tile flags of the two levels.
 const FLAGS: [u16; 2] = [8, 108];
 /// The tile flag a door or window sets on the tile it stands on (0x4330d7).
-const PORTAL_TILE: u8 = 8;
+pub(crate) const PORTAL_TILE: u8 = 8;
 
 /// Data words.
 mod data {
@@ -1132,6 +1132,19 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    /// Whether `id`'s master definition marks it as a door/portal (`word::PORTAL == 6`).
+    pub(crate) fn is_portal_object(&self, world: &World, id: u16) -> Result<bool, Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        Ok(self
+            .master_words(world, id, "checking portal object (0x4332af)")
+            .map_err(fail)?[word::PORTAL]
+            == 6)
+    }
+
     /// Sets or clears the mark a door or window keeps on its tile
     /// (0x4330d7), which does nothing outside the lot's border.
     fn mark_portal(&self, world: &mut World, at: [i8; 3], set: bool) -> Result<(), Trap> {
@@ -1150,6 +1163,34 @@ impl Interpreter<'_> {
             .ok_or_else(|| Trap::Invalid("the lot has no tile flags".into()))?;
         *flags = (*flags & !PORTAL_TILE) | if set { PORTAL_TILE } else { 0 };
         Ok(())
+    }
+
+    fn clear_portal_if_unoccupied(
+        &self,
+        world: &mut World,
+        id: u16,
+        at: [i8; 3],
+    ) -> Result<(), Fault> {
+        if !tile_inside_lot(world, at) {
+            return Ok(());
+        }
+        for (&other_id, other) in &world.objects {
+            if other_id == id || other.position[0] < 0 || other.position[1] < 0 {
+                continue;
+            }
+            if (other.position[0] >> 4) == i32::from(at[0])
+                && (other.position[1] >> 4) == i32::from(at[1])
+                && other.position[2] == i32::from(at[2])
+                && self.is_portal_object(world, other_id)?
+            {
+                return Ok(());
+            }
+        }
+        self.mark_portal(world, at, false).map_err(|trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        })
     }
 
     /// One object leaves the lot (0x433125). An object that is not a tile
@@ -1192,13 +1233,15 @@ impl Interpreter<'_> {
             self.callback(world, parent, function::PLACED, 0)?;
         }
         // 0x4332b7: the door test reads the definition the object stands
-        // for, not its own.
+        // for, not its own. Use the captured `old_tile` (including its floor)
+        // and only clear `PORTAL_TILE` when no other on-lot portal remains on
+        // that tile (e.g. if two doors ever shared a tile).
         let door = self
             .master_words(world, id, "taking a door off (0x4332af)")
             .map_err(fail)?[word::PORTAL]
             == 6;
         if door {
-            self.mark_portal(world, was, false).map_err(fail)?;
+            self.clear_portal_if_unoccupied(world, id, old_tile)?;
         }
         if notify {
             self.left_lot(world, id)?;
@@ -1306,7 +1349,7 @@ impl Interpreter<'_> {
             .map_err(fail)?[word::PORTAL]
             == 6;
         if portal {
-            self.mark_portal(world, was, false).map_err(fail)?;
+            self.clear_portal_if_unoccupied(world, id, old_tile)?;
         }
         let point = match to.container {
             Some(parent) => {

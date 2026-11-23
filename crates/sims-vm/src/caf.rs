@@ -1867,6 +1867,7 @@ fn commit_family_with_context_hook(
         tail: vec![0; 16],
     };
     stored.families.insert(family_id, family.clone());
+    stored.set_family_surname(family_id, &family_name);
 
     let committed_revision = persist_household_atomic(
         store,
@@ -1942,6 +1943,7 @@ pub fn delete_bin_family(
         .families
         .remove(&family_id)
         .expect("verified present above");
+    stored.remove_family_surname(family_id);
     let still_referenced: BTreeSet<u32> = stored
         .families
         .values()
@@ -2839,6 +2841,7 @@ pub fn import_family_fam(
         tail: vec![0; 16],
     };
     stored.families.insert(family_id, family.clone());
+    stored.set_family_surname(family_id, &family_name);
 
     let committed_revision = persist_household_atomic(
         store,
@@ -3222,6 +3225,7 @@ mod tests {
         let empty = StoredNeighborhood {
             name: "FarTest".into(),
             families: BTreeMap::new(),
+            family_surnames: BTreeMap::new(),
             neighbors: Vec::new(),
             inventories: Vec::new(),
             data: [0; 16],
@@ -3349,6 +3353,7 @@ mod tests {
         let stored = StoredNeighborhood {
             name: "Collide".into(),
             families,
+            family_surnames: BTreeMap::new(),
             neighbors,
             inventories: Vec::new(),
             data: [0; 16],
@@ -3433,6 +3438,7 @@ mod tests {
         let neighbor = synthesize_neighbor(&make_spec("FreshLoose"), 1, guid, 1, 1, &mut rng);
         let stored = StoredNeighborhood {
             name: "Precedence".into(),
+            family_surnames: BTreeMap::new(),
             families: BTreeMap::from([(
                 1,
                 Family {
@@ -3495,6 +3501,7 @@ mod tests {
         let store = NeighborhoodStore::open(&db_path).unwrap();
         let make_nh = |marker: i16| StoredNeighborhood {
             name: "PauseNH".into(),
+            family_surnames: BTreeMap::new(),
             families: BTreeMap::from([(
                 0,
                 Family {
