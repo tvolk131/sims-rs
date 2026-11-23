@@ -38,6 +38,7 @@ use crate::factory::word;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use crate::placement::{floor, pool_byte, segments, stands_on_lot, tile_flags};
+use crate::play::{Recovery, ScriptError};
 use sims_sim::World;
 
 /// Globals the day's turn changes: the day of the month, the month, the
@@ -148,6 +149,96 @@ pub(crate) fn turn_day(interpreter: &Interpreter<'_>, world: &mut World) -> Resu
         set(world, MONTH_LENGTH, DAYS_IN_MONTH)?;
     }
     Ok(())
+}
+
+/// Play-mode variant of [`turn_day`]: catches per-object aging/depreciation
+/// faults and budget-shift faults in `errors` so the day still turns without
+/// halting the lot.
+pub(crate) fn turn_day_play(
+    interpreter: &Interpreter<'_>,
+    world: &mut World,
+    errors: &mut Vec<ScriptError>,
+) {
+    let record = |errors: &mut Vec<ScriptError>, tick: u32, object: u16, trap: Trap| {
+        errors.push(ScriptError {
+            tick,
+            object,
+            fault: Fault {
+                object,
+                at: None,
+                trap,
+            },
+            in_thread: false,
+            then: None,
+            recovery: Recovery::Reset,
+        });
+    };
+    let tick = world.ticks;
+    if let Some(slot) = world.globals.get_mut(DAYS_PLAYED) {
+        *slot = slot.wrapping_add(1);
+    } else {
+        record(
+            errors,
+            tick,
+            0,
+            Trap::Invalid(format!("the lot has no global {DAYS_PLAYED}")),
+        );
+        return;
+    }
+    if let Some(slot) = world.globals.get_mut(DAY) {
+        *slot = slot.wrapping_add(1);
+    } else {
+        record(
+            errors,
+            tick,
+            0,
+            Trap::Invalid(format!("the lot has no global {DAY}")),
+        );
+        return;
+    }
+    for id in world.order.clone() {
+        if let Err(trap) = age(world, id) {
+            record(errors, tick, id, trap);
+        }
+        if let Err(trap) = depreciate(interpreter, world, id) {
+            record(errors, tick, id, trap);
+        }
+    }
+    if let Err(trap) = shift_budget(world) {
+        record(errors, tick, 0, trap);
+        if world.budget.days.len() == 6 {
+            let today = world.budget.days[0].unwrap_or([0; 8]);
+            let yesterday = world.budget.days[1].unwrap_or([0; 8]);
+            for day in &mut world.budget.days[2..] {
+                *day = Some(yesterday);
+            }
+            world.budget.days[1] = Some(today);
+            world.budget.days[0] = Some([0; 8]);
+        }
+    }
+    if world.globals.get(DAY).copied().unwrap_or(0) > DAYS_IN_MONTH {
+        if let (Some(&month_cur), Some(&year_cur)) =
+            (world.globals.get(MONTH), world.globals.get(YEAR))
+        {
+            let mut month = month_cur.wrapping_add(1);
+            world.globals[DAY] = 1;
+            if month >= 13 {
+                world.globals[YEAR] = year_cur.wrapping_add(1);
+                month = 1;
+            }
+            world.globals[MONTH] = month;
+            if let Some(len) = world.globals.get_mut(MONTH_LENGTH) {
+                *len = DAYS_IN_MONTH;
+            }
+        } else {
+            record(
+                errors,
+                tick,
+                0,
+                Trap::Invalid("the lot has no date globals".into()),
+            );
+        }
+    }
 }
 
 /// An object's age (0x4322e7): data word 18 becomes its age in whole
@@ -402,6 +493,90 @@ impl Interpreter<'_> {
             .ok_or_else(|| fail(0, Trap::Invalid("the lot has no global 22".into())))? =
             i16::from(built);
         Ok(())
+    }
+
+    /// Play-mode variant of [`Self::day_statistics`]: catches per-object,
+    /// architecture-wall, or statistics faults in `errors` and continues so
+    /// the day turn never halts the lot.
+    pub(crate) fn day_statistics_play(&self, world: &mut World, errors: &mut Vec<ScriptError>) {
+        let tick = world.ticks;
+        let record = |errors: &mut Vec<ScriptError>, object: u16, trap: Trap| {
+            errors.push(ScriptError {
+                tick,
+                object,
+                fault: Fault {
+                    object,
+                    at: None,
+                    trap,
+                },
+                in_thread: false,
+                then: None,
+                recovery: Recovery::Reset,
+            });
+        };
+        let mut built = false;
+        let mut objects_value = 0i32;
+        for id in world.order.clone() {
+            let step = (|| -> Result<(), Trap> {
+                let object = world
+                    .objects
+                    .get(&id)
+                    .ok_or_else(|| Trap::Invalid("object on the lot's list is gone".into()))?;
+                let category = object.data.get(data::CATEGORY).copied().unwrap_or(0);
+                let lead = object
+                    .multipart
+                    .as_ref()
+                    .is_none_or(|part| part.parent == 0 || part.parent as u16 == id);
+                let words = *self.words(world, id)?;
+                if category == 1 {
+                    stands_on_lot(world, id)?;
+                }
+                if (words[word::GROUP] != 0 && !lead) || words[word::TYPE] == SKIPPED_TYPE {
+                    return Ok(());
+                }
+                let on_lot = stands_on_lot(world, id)?;
+                if on_lot && def::BUILT.iter().any(|&w| words[w] != 0) {
+                    let position = world.objects[&id].position;
+                    let [a, b, level] = World::tile(position);
+                    let flags = tile_flags(world, a, b, i32::from(level))?;
+                    if flags & UNCOUNTED == 0 {
+                        built = true;
+                    }
+                }
+                let on_lot = stands_on_lot(world, id)?;
+                if on_lot && self.valued(world, id)? {
+                    let v = value(world, &words, id)?;
+                    objects_value = objects_value.wrapping_add(i32::from(v));
+                }
+                Ok(())
+            })();
+            if let Err(trap) = step {
+                record(errors, id, trap);
+            }
+        }
+        world.budget.objects_value = objects_value;
+        if !built {
+            match architecture_counts(world) {
+                Ok(counts) => built = counts,
+                Err(trap) => {
+                    // The only `Unsupported` branch in `architecture_counts` is
+                    // a lot with walls but no floor or pool, where walls count
+                    // as built in 0x47b006.
+                    if matches!(trap, Trap::Unsupported(_)) {
+                        built = true;
+                    }
+                    record(errors, 0, trap);
+                }
+            }
+        }
+        if let Err(error) = world.update_statistics() {
+            record(errors, 0, Trap::Invalid(error.to_string()));
+        }
+        if let Some(slot) = world.globals.get_mut(BUILT) {
+            *slot = i16::from(built);
+        } else {
+            record(errors, 0, Trap::Invalid("the lot has no global 22".into()));
+        }
     }
 }
 

@@ -1191,14 +1191,12 @@ impl Interpreter<'_> {
                     ))));
                 }
                 self.drop_references(world, target)?;
-                if world
-                    .objects
-                    .get(&target)
-                    .is_some_and(|o| o.person.is_some())
-                {
-                    self.reset_person(world, target, &self.program.people)?;
-                } else {
-                    self.reset(world, target, false)?;
+                if let Some(obj) = world.objects.get(&target) {
+                    if obj.person.is_some() {
+                        self.reset_person(world, target, &self.program.people)?;
+                    } else {
+                        self.reset(world, target, false)?;
+                    }
                 }
             }
             if uses(world)?.0 >= count {
@@ -1339,8 +1337,11 @@ impl Interpreter<'_> {
                 break;
             }
             let action = person.queue.remove(0);
-            if action.target != 0 {
-                self.callback(world, action.target as u16, CANCELLED, id as i16)?;
+            if let Ok(target_id) = u16::try_from(action.target)
+                && target_id != 0
+                && world.objects.contains_key(&target_id)
+            {
+                self.callback(world, target_id, CANCELLED, id as i16)?;
             }
         }
         Ok(())
