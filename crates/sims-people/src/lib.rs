@@ -16,6 +16,7 @@
 
 pub mod animation;
 pub mod appearance;
+pub mod attach;
 /// The person files of an install, found by [`sims_content::assets`].
 pub use sims_content::assets;
 pub mod bob;

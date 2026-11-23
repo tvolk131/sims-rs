@@ -101,6 +101,7 @@
 use crate::animation::{Clip, Library};
 use crate::appearance::{Body, Outfit};
 use crate::assets::Assets;
+use crate::attach::{self, Attach};
 use crate::bob::{self, Bob};
 use crate::house::Cast;
 use crate::math::{Transform, Vec3};
@@ -189,6 +190,22 @@ impl View {
             ],
             elevation + lift,
         )
+    }
+
+    /// A posed point as the lot renderer places a moved object (its
+    /// `place_moved`, the original's `0x4b9991`): the lot's own fine
+    /// position (sixteenths of a tile, before the camera's rotation) and
+    /// the altitude in height units, of which a sprite rises `2 << zoom`
+    /// pixels each (16 at near zoom). The point is [`View::place`]'s, with
+    /// no level offset: the original moves a person's model by its level's
+    /// offset (`0x5922d2`..`0x592394`) and takes it off again before it
+    /// projects a sprite there (`0x4b9716`..`0x4b9750`), and `0x4b9991`
+    /// raises the sprite to its level's floor itself.
+    pub fn lot_point(&self, p: Vec3) -> [f32; 3] {
+        let (fine, elevation) = self.place(p);
+        let [x, y] = rotate((4 - (self.camera.rotation & 3)) & 3, fine, ARRAY_FINE);
+        let per_unit = (2u32 << sims_render::Zoom::Near.level()) as f32;
+        [x, y, elevation / per_unit]
     }
 
     /// How far the original's model root is from the floor's on `level`,
@@ -1180,6 +1197,9 @@ pub struct People {
     clock: u32,
     /// Reusable per-frame scratch buffers for posing, lighting, and rasterization.
     scratch: PeopleScratch,
+    /// Each person the last draw drew, with their attach points
+    /// ([`crate::attach`]).
+    drawn_attach: BTreeMap<u16, Attach>,
 }
 
 impl People {
@@ -1203,6 +1223,7 @@ impl People {
             bob: None,
             clock: 0,
             scratch: PeopleScratch::default(),
+            drawn_attach: BTreeMap::new(),
         }
     }
 
@@ -1210,6 +1231,28 @@ impl People {
     /// original's 0x6e54e0). It starts at 0, where the bob has not spun.
     pub fn set_clock(&mut self, milliseconds: u32) {
         self.clock = milliseconds;
+    }
+
+    /// Where each person the last draw drew draws what they hold, in the
+    /// lot renderer's units for `camera` ([`View::lot_point`]): their
+    /// attach points ([`crate::attach`]), for
+    /// `sims_render::draw_held_with_attach`.
+    pub fn held_attach(&self, camera: &Camera) -> BTreeMap<u16, sims_render::PersonAttach> {
+        let view = View::new(camera);
+        self.drawn_attach
+            .iter()
+            .map(|(&id, points)| {
+                let at = |p: Option<Vec3>| p.map(|p| view.lot_point(p));
+                (
+                    id,
+                    sims_render::PersonAttach {
+                        palm: at(points.palm),
+                        head_top: at(points.head_top),
+                        pelvis: at(points.pelvis),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Follows `world`: loads the body of each person who appeared or
@@ -1557,8 +1600,11 @@ impl People {
         let People {
             people: loaded_people,
             scratch,
+            drawn_attach,
+            cast,
             ..
         } = self;
+        drawn_attach.clear();
         // Far to near by the root's depth, then by ID, so nearer soft
         // edges blend over farther people.
         scratch.draw_order.clear();
@@ -1589,6 +1635,20 @@ impl People {
             let Some(cached) = &loaded.cached_pose else {
                 continue;
             };
+            // Bound by the type's body strings (`0x5924a4`). A point they
+            // leave unbound hides what its slot holds, so body strings we
+            // could not read give no points at all (what the person holds
+            // stays at its own position), not unbound ones.
+            if let Some(rows) = world
+                .objects
+                .get(&person_id)
+                .and_then(|o| cast.body_strings(o.guid).ok())
+            {
+                drawn_attach.insert(
+                    person_id,
+                    attach::attach(&body.skeleton, &cached.bones, &rows),
+                );
+            }
             let project = |p| project_lot_vertex(&view, p, person_level, &depth);
             // Each pixel the person draws names them, for a click.
             target.set_id(Some(person_id));
@@ -1745,6 +1805,35 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// A posed point goes to the lot renderer as the lot's own position,
+    /// whatever the view: a person's root at fine (x, y) on the terrain is
+    /// [x, y, altitude] at every zoom and rotation, as an object's pose is
+    /// (no level offset: `0x4b9716` takes it off before `0x4b9991`).
+    #[test]
+    fn a_posed_point_goes_to_the_lot_as_an_objects_pose() {
+        let step = sims_sim::head::terrain_height(F32::from_f32(1.0)).to_f32();
+        for zoom in Zoom::ALL {
+            for rotation in 0..4 {
+                let view = View::new(&camera(zoom, rotation));
+                for [x, y] in [[0, 0], [37, 5], [360, 376], [1000, 17]] {
+                    let mut animator = Animator::new(0);
+                    animator.position = [x as f32, y as f32, 3.0].map(F32::from_f32);
+                    let mut root = placement(&animator).unwrap().translation;
+                    root.y = 2.0 * step;
+                    let [lx, ly, lz] = view.lot_point(root);
+                    assert!(
+                        (lx - x as f32).abs() < 1e-3
+                            && (ly - y as f32).abs() < 1e-3
+                            && (lz - 2.0).abs() < 1e-3,
+                        "{zoom:?} {rotation}: {:?} != {:?}",
+                        [lx, ly, lz],
+                        [x, y, 2]
+                    );
                 }
             }
         }
