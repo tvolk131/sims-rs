@@ -39,7 +39,7 @@ fn find_lot_hit_point(shell: &NeighborhoodShell, lot_id: u16) -> Option<[i32; 2]
                 viewport[1],
                 shell.travel_state(),
             );
-            layout.bar_rect.height + layout.filter_strip_rect.height
+            layout.bar_rect.height
         }
         _ => sims_ui::neighborhood::BAR_HEIGHT,
     };

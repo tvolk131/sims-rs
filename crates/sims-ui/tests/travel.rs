@@ -6,7 +6,7 @@ use sims_ui::neighborhood::ExpansionFlags;
 use sims_ui::travel::{
     Destination, LotFilter, TravelBarMode, TravelChrome, TravelCommand, TravelControl,
     TravelDialog, TravelDialogCommand, TravelDialogLayout, TravelDialogState, TravelLayout,
-    TravelState, TravelStrings, TravelTransport, VacationLodging, format_status_badge, load_art,
+    TravelState, TravelStrings, TravelTransport, load_art,
 };
 use std::path::PathBuf;
 
@@ -28,134 +28,199 @@ fn rects_overlap(a: Rect, b: Rect) -> bool {
 #[test]
 fn all_four_destinations_have_disjoint_controls_across_resolutions() {
     for dest in Destination::ALL {
-        let state = TravelState {
-            destination: dest,
-            has_importable_lot: true,
-            studio_fame_half_stars: 7,
-            magic_coins: 250,
-            simoleons: 12_345,
-            ..TravelState::default()
-        };
-        for (w, h) in [(1024u32, 768u32), (800, 600), (640, 480), (320, 240)] {
-            let layout = TravelLayout::compute(w, h, &state);
-            assert!(
-                !layout.controls.is_empty(),
-                "expected controls for {dest:?} at {w}x{h}"
-            );
-            for (i, a) in layout.controls.iter().enumerate() {
-                assert!(a.rect.x >= 0 && a.rect.y >= 0);
-                assert!(a.rect.x + a.rect.width <= w as i32);
-                assert!(a.rect.y + a.rect.height <= h as i32);
+        for mode in [
+            TravelBarMode::Browse,
+            TravelBarMode::Visit,
+            TravelBarMode::Bulldoze,
+        ] {
+            let state = TravelState {
+                destination: dest,
+                mode,
+                has_importable_lot: true,
+                ..TravelState::default()
+            };
+            for (w, h) in [(1024u32, 768u32), (800, 600), (640, 480), (320, 240)] {
+                let layout = TravelLayout::compute(w, h, &state);
                 assert!(
-                    !rects_overlap(a.rect, layout.status_badge_rect),
-                    "control {:?} overlapped status badge at {w}x{h}",
-                    a.control
+                    !layout.controls.is_empty(),
+                    "expected controls for {dest:?} {mode:?} at {w}x{h}"
                 );
-                for b in &layout.controls[i + 1..] {
-                    assert!(
-                        !rects_overlap(a.rect, b.rect),
-                        "controls {:?} and {:?} overlapped at {w}x{h}",
-                        a.control,
-                        b.control
-                    );
+                for (i, a) in layout.controls.iter().enumerate() {
+                    assert!(a.rect.x >= 0 && a.rect.y >= 0);
+                    assert!(a.rect.x + a.rect.width <= w as i32);
+                    assert!(a.rect.y + a.rect.height <= h as i32);
+                    for b in &layout.controls[i + 1..] {
+                        assert!(
+                            !rects_overlap(a.rect, b.rect),
+                            "controls {:?} and {:?} overlapped at {w}x{h}",
+                            a.control,
+                            b.control
+                        );
+                    }
                 }
             }
         }
     }
 }
 
+/// The 1.91 destination screens (`cWinDowntown`, `cWinVacation`,
+/// `cWinStudiotown`, `cWinMagicland`) build their bar from one button table
+/// each and a shared position table: Sims logo `(5, 0)`, Return `(323, 0)`,
+/// Bulldoze `(373, 0)`, Import `(422, 0)`, Sims.com `(762, 0)`, and Magic
+/// Town's Move In `(200, 0)`. Nothing else is on the bar: no destination
+/// switcher, filter strip, lodging tabs, or status badge.
 #[test]
-fn clicking_controls_emits_expected_commands_and_respects_visit_and_expansion_gates() {
+fn destination_bars_hold_exactly_the_native_button_table() {
+    use TravelControl::*;
+    for dest in Destination::ALL {
+        let mut expected = vec![
+            (Credits, 5),
+            (ReturnHome, 323),
+            (Bulldoze, 373),
+            (ImportLot, 422),
+            (Web, 762),
+        ];
+        if dest == Destination::MagicTown {
+            expected.insert(1, (MoveIn, 200));
+        }
+        for (w, h, origin) in [(800u32, 600u32, [0, 0]), (1024, 768, [112, 84])] {
+            let state = TravelState {
+                destination: dest,
+                ..TravelState::default()
+            };
+            let layout = TravelLayout::compute(w, h, &state);
+            assert_eq!(layout.origin, origin);
+            assert_eq!(
+                layout.bar_rect,
+                Rect::new(origin[0], origin[1], 800, 52),
+                "{dest:?} bar"
+            );
+            let mut got: Vec<_> = layout
+                .controls
+                .iter()
+                .map(|c| {
+                    assert_eq!(c.rect.y, origin[1], "{:?} must sit on row 0", c.control);
+                    (c.control, c.rect.x - origin[0])
+                })
+                .collect();
+            got.sort_by_key(|&(_, x)| x);
+            assert_eq!(got, expected, "{dest:?} at {w}x{h}");
+            assert!(layout.dialog_rect.is_none() && layout.title_rect.is_none());
+        }
+    }
+}
+
+/// Enable rules of `cWinVacation`'s mode switch (`0x56b19e`) and Import's
+/// file check (`0x56b870`).
+#[test]
+fn destination_bar_enable_rules_follow_the_native_mode_switch() {
+    use TravelControl::*;
+    let enabled = |dest, mode, importable| {
+        let state = TravelState {
+            destination: dest,
+            mode,
+            has_importable_lot: importable,
+            ..TravelState::default()
+        };
+        let layout = TravelLayout::compute(800, 600, &state);
+        let mut v: Vec<_> = layout
+            .controls
+            .iter()
+            .map(|c| (c.control, c.enabled, c.active))
+            .collect();
+        v.sort_by_key(|&(c, ..)| format!("{c:?}"));
+        v
+    };
+    let dest = Destination::MagicTown;
+    let browse = enabled(dest, TravelBarMode::Browse, false);
+    assert!(browse.contains(&(ImportLot, false, false)));
+    assert!(browse.contains(&(Bulldoze, true, false)));
+    assert!(browse.contains(&(ReturnHome, true, false)));
+    assert!(browse.contains(&(Web, true, false)));
+    assert!(browse.contains(&(Credits, true, false)));
+    assert!(browse.contains(&(MoveIn, true, false)));
+    assert!(enabled(dest, TravelBarMode::Browse, true).contains(&(ImportLot, true, false)));
+
+    let doze = enabled(Destination::VacationIsland, TravelBarMode::Bulldoze, true);
+    assert_eq!(
+        doze,
+        vec![
+            (Bulldoze, true, true),
+            (Credits, false, false),
+            (ImportLot, false, false),
+            (ReturnHome, false, false),
+            (Web, false, false),
+        ]
+    );
+}
+
+#[test]
+fn clicking_controls_emits_expected_commands() {
+    use TravelControl::*;
     let mut state = TravelState {
-        destination: Destination::VacationIsland,
+        destination: Destination::MagicTown,
         mode: TravelBarMode::Browse,
-        expansions: ExpansionFlags(ExpansionFlags::HOT_DATE | ExpansionFlags::VACATION),
-        has_importable_lot: false,
+        expansions: ExpansionFlags(ExpansionFlags::HOT_DATE | ExpansionFlags::MAKIN_MAGIC),
+        has_importable_lot: true,
         ..TravelState::default()
     };
     let layout = TravelLayout::compute(800, 600, &state);
     let mut chrome = TravelChrome::new();
+    for (control, command) in [
+        (ReturnHome, TravelCommand::ReturnToNeighborhood),
+        (Bulldoze, TravelCommand::ToggleBulldoze),
+        (ImportLot, TravelCommand::ImportLot),
+        (Web, TravelCommand::OpenWeb),
+        (Credits, TravelCommand::OpenCredits),
+        (MoveIn, TravelCommand::OpenFamilyBin),
+    ] {
+        let c = layout
+            .controls
+            .iter()
+            .find(|c| c.control == control)
+            .unwrap_or_else(|| panic!("{control:?} control"));
+        let (x, y) = (c.rect.x + c.rect.width / 2, c.rect.y + c.rect.height / 2);
+        assert!(chrome.pointer_down(x, y, &layout), "{control:?} press");
+        assert_eq!(chrome.pointer_up(x, y, &layout, &state), Some(command));
+    }
 
-    // ReturnHome works.
-    let home = layout
-        .controls
-        .iter()
-        .find(|c| c.control == TravelControl::ReturnHome)
-        .expect("ReturnHome control");
-    let hx = home.rect.x + home.rect.width / 2;
-    let hy = home.rect.y + home.rect.height / 2;
-    assert!(chrome.pointer_down(hx, hy, &layout));
-    assert_eq!(
-        chrome.pointer_up(hx, hy, &layout, &state),
-        Some(TravelCommand::ReturnToNeighborhood)
-    );
-
-    // Vacation lodging legend toggles Hotel on and off.
-    let hotel = layout
-        .controls
-        .iter()
-        .find(|c| c.control == TravelControl::ToggleVacationLodging(VacationLodging::Hotel))
-        .expect("Hotel legend control");
-    let lx = hotel.rect.x + hotel.rect.width / 2;
-    let ly = hotel.rect.y + hotel.rect.height / 2;
-    assert!(chrome.pointer_down(lx, ly, &layout));
-    assert_eq!(
-        chrome.pointer_up(lx, ly, &layout, &state),
-        Some(TravelCommand::SetVacationLodging(Some(
-            VacationLodging::Hotel
-        )))
-    );
-    state.vacation_lodging_filter = Some(VacationLodging::Hotel);
-    assert!(chrome.pointer_down(lx, ly, &layout));
-    assert_eq!(
-        chrome.pointer_up(lx, ly, &layout, &state),
-        Some(TravelCommand::SetVacationLodging(None))
-    );
-
-    // Missing expansion (Magic Town) is disabled.
-    let magic_tab = layout
-        .controls
-        .iter()
-        .find(|c| c.control == TravelControl::SwitchDestination(Destination::MagicTown))
-        .expect("MagicTown tab");
-    assert!(!magic_tab.enabled);
-    assert!(!chrome.pointer_down(magic_tab.rect.x + 2, magic_tab.rect.y + 2, &layout));
-
-    // Visit mode disables Bulldoze and destination switching.
+    // Visit mode (lot picking from a trip) disables the editing buttons.
     state.mode = TravelBarMode::Visit;
+    state.destination = Destination::Downtown;
     let visit_layout = TravelLayout::compute(800, 600, &state);
+    for c in &visit_layout.controls {
+        let editing = matches!(c.control, Bulldoze | ImportLot | MoveIn);
+        assert_eq!(c.enabled, !editing, "{:?} in Visit", c.control);
+    }
     let doze = visit_layout
         .controls
         .iter()
-        .find(|c| c.control == TravelControl::Bulldoze)
+        .find(|c| c.control == Bulldoze)
         .expect("Bulldoze control");
-    assert!(!doze.enabled);
+    assert!(!chrome.pointer_down(doze.rect.x + 2, doze.rect.y + 2, &visit_layout));
 }
 
+/// The Magic Town lot picker keeps the `dlgframe2.bmp` dialog with its
+/// 7-filter row at `x = 225 + 50·i, y = 20` (`0x6f54d0`).
 #[test]
-fn status_badges_format_magicoins_fame_and_vacancy() {
-    let magic = TravelState {
+fn magic_town_picker_dialog_filter_row_matches_native_positions() {
+    let state = TravelState {
         destination: Destination::MagicTown,
-        magic_coins: 125,
-        simoleons: 4_500,
+        mode: TravelBarMode::Visit,
         ..TravelState::default()
     };
-    assert_eq!(format_status_badge(&magic), "MC 125 | $4500");
-
-    let studio = TravelState {
-        destination: Destination::StudioTown,
-        studio_fame_half_stars: 7,
-        ..TravelState::default()
-    };
-    assert_eq!(format_status_badge(&studio), "Fame 3.5");
-
-    let vacation_full = TravelState {
-        destination: Destination::VacationIsland,
-        vacation_has_no_vacancy: true,
-        simoleons: 900,
-        ..TravelState::default()
-    };
-    assert_eq!(format_status_badge(&vacation_full), "Full | $900");
+    let layout = TravelLayout::compute(800, 600, &state);
+    assert!(layout.dialog_rect.is_some());
+    let xs: Vec<_> = layout
+        .controls
+        .iter()
+        .map(|c| {
+            assert!(matches!(c.control, TravelControl::ToggleFilter(_)));
+            assert_eq!(c.rect.y, 20);
+            c.rect.x
+        })
+        .collect();
+    assert_eq!(xs, vec![225, 275, 325, 375, 425, 475, 525]);
 }
 
 #[test]
@@ -271,22 +336,35 @@ fn complete_collection_loads_travel_art_and_localized_tooltips() {
             strings.tooltip(dest, TravelControl::ReturnHome).is_some(),
             "missing return tooltip for {dest:?}"
         );
+        for control in [
+            TravelControl::Web,
+            TravelControl::Credits,
+            TravelControl::ImportLot,
+            TravelControl::Bulldoze,
+        ] {
+            assert!(
+                strings.tooltip(dest, control).is_some(),
+                "missing {control:?} tooltip for {dest:?}"
+            );
+        }
         let state = TravelState {
             destination: dest,
-            active_filter: Some(dest.filters()[0]),
-            studio_fame_half_stars: 9,
-            magic_coins: 500,
-            simoleons: 8_000,
             ..TravelState::default()
         };
         let mut frame = Frame::new(800, 600, [0, 0, 0]);
         let layout = chrome.draw(&mut frame, &state, &art, &strings);
-        assert!(layout.controls.len() >= 8);
+        assert_eq!(layout.controls.len(), dest.bar_buttons().len());
 
         let dstate = TravelDialogState::for_destination(dest, vec!["Sim".into()]);
         dialog.draw(&mut frame, &dstate, &art, &strings);
     }
 
+    assert!(
+        strings
+            .tooltip(Destination::MagicTown, TravelControl::MoveIn)
+            .is_some(),
+        "Magic Town's STR# 174 has a sixth (Move In) tooltip"
+    );
     assert!(
         strings
             .tooltip(
@@ -327,14 +405,92 @@ fn complete_collection_loads_travel_art_and_localized_tooltips() {
             .icon_art_id(Destination::OldTown),
         sims_ui::travel::art_id::PHONE_NEIGHBORHOOD
     );
-    assert!(Destination::OldTown.filters().contains(&LotFilter::DogCat));
-    assert!(
-        Destination::OldTown
-            .filters()
-            .contains(&LotFilter::Gardening)
-    );
     let old_town_dlg = TravelDialogState::for_destination(Destination::OldTown, vec!["Sim".into()]);
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
     let layout = dialog.draw(&mut frame, &old_town_dlg, &art, &strings);
     assert!(layout.panel_rect.width > 100);
+}
+
+/// Pixel guard: with the real art, the browse bar is `banner_downtown.bmp`
+/// plus the native button sprites at their native origins, and nothing is
+/// drawn below row 52. Any invented label, tab, badge, or strip changes a
+/// banner pixel outside the sprites or paints the map area.
+#[test]
+fn browse_bar_draws_only_the_banner_and_native_sprites() {
+    let Some(root) = sims_install() else {
+        return;
+    };
+    let install = Install::detect(&root).expect("open Complete Collection install");
+    let ui = UiGraphics::open(&install).expect("open UIGraphics");
+    let art = load_art(&ui, US_ENGLISH).expect("load travel art");
+    let strings = TravelStrings::load(&install, US_ENGLISH).expect("load UIText.iff strings");
+    let banner = art
+        .image(sims_ui::travel::art_id::DOWNTOWN_BAR_BKG)
+        .expect("banner_downtown.bmp");
+    assert_eq!((banner.width, banner.height), (800, 52));
+    const CLEAR: [u8; 3] = [1, 2, 3];
+    for dest in Destination::ALL {
+        for mode in [TravelBarMode::Browse, TravelBarMode::Bulldoze] {
+            let state = TravelState {
+                destination: dest,
+                mode,
+                ..TravelState::default()
+            };
+            let mut frame = Frame::new(1024, 768, CLEAR);
+            let layout = TravelChrome::new().draw(&mut frame, &state, &art, &strings);
+            let [ox, oy] = layout.origin;
+            let sprites: Vec<Rect> = layout
+                .controls
+                .iter()
+                .map(|c| {
+                    let id = match c.control {
+                        TravelControl::ReturnHome => sims_ui::travel::art_id::DOWNTOWN_RETURN,
+                        TravelControl::Web => sims_ui::travel::art_id::INET,
+                        TravelControl::Credits => sims_ui::travel::art_id::DOWNTOWN_LOGO,
+                        TravelControl::ImportLot => dest.import_art_id(),
+                        TravelControl::Bulldoze => sims_ui::travel::art_id::DOWNTOWN_BULLDOZE,
+                        TravelControl::MoveIn => sims_ui::travel::art_id::MOVE_IN,
+                        TravelControl::ToggleFilter(_) => unreachable!("no filters on the bar"),
+                    };
+                    let img = art.image(id).expect("button art");
+                    let cells = if c.control == TravelControl::Credits {
+                        1
+                    } else {
+                        4
+                    };
+                    Rect::new(
+                        c.rect.x,
+                        c.rect.y,
+                        img.width as i32 / cells,
+                        img.height as i32,
+                    )
+                })
+                .collect();
+            for y in 0..768 {
+                for x in 0..1024 {
+                    let got = frame.pixel(x, y).expect("in frame");
+                    let in_bar = (ox..ox + 800).contains(&x) && (oy..oy + 52).contains(&y);
+                    if !in_bar {
+                        assert_eq!(
+                            got, CLEAR,
+                            "{dest:?} {mode:?} painted ({x}, {y}) off the bar"
+                        );
+                        continue;
+                    }
+                    if sprites.iter().any(|r| r.contains(x, y)) {
+                        continue;
+                    }
+                    let b = banner
+                        .pixel((x - ox) as u32, (y - oy) as u32)
+                        .expect("banner pixel");
+                    // Color-keyed banner pixels stay see-through.
+                    let want = if b[3] == 0 { CLEAR } else { [b[0], b[1], b[2]] };
+                    assert_eq!(
+                        got, want,
+                        "{dest:?} {mode:?} drew over the banner at ({x}, {y}): banner {b:?}"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -1,18 +1,27 @@
-//! Complete Collection 1.91 travel destination & community sub-neighborhood
-//! chrome for **Downtown**, **Vacation Island**, **Studio Town**, and
-//! **Magic Town**.
+//! Complete Collection 1.91 travel destination chrome for **Downtown**,
+//! **Vacation Island**, **Studio Town**, and **Magic Town**.
 //!
-//! Matches the four expansion maps rendered by `sims_render::neighborhood`
-//! (`cWinDowntown`, `cWinVacation`, `cWinStudiotown`, `cWinMagicland`),
-//! providing:
+//! Every element drawn here has a native source in `Sims.exe` 1.91
+//! (`cWinDowntown`, `cWinVacation`, `cWinStudiotown`, `cWinMagicland`); see
+//! `docs/decisions/20261123-travel-chrome-native-audit.md`.
 //!
-//! - Top control bar with Return-to-Neighborhood, Bulldoze, Import, destination
-//!   switcher, and expansion-specific status badges (`Res_Nbhd.RT` / `Res_Nbhd.h`).
-//! - Interactive community lot filter bar (`STR# 171`, `NghUI/Filter*Btn.bmp`)
-//!   including Vacation Island hotel / rental / campground lodging legend,
-//!   Studio Town fame star rating & lot tags, and Magic Town MagiCoins balance.
-//! - Taxi / Shuttle / Magic Hole travel-confirm dialog view-model
-//!   (`STR# 212`, `STR# 213`, `STR# 260`, `STR# 261`, phone/hole icons).
+//! Each destination constructor takes one flag byte (`cWinVacation` stores it
+//! at `0x5687e8`). The neighborhood shell passes `1` (`0x4f5d7d`, `0x4f5f2c`,
+//! `0x4f60db`, `0x4f628a`); lot-side lot pickers pass `0` (`0x441503`,
+//! `0x441e28`, `0x44201b`, `0x4421ab`, `0x4443e8`, `0x44452f`, `0x4445a2`,
+//! `0x444615`).
+//!
+//! - **Flag `1` (map browse, bulldoze, visit from the map):** the
+//!   `banner_downtown.bmp` (`kDTBarBkg` `5422`) bar with the class's button
+//!   table, drawn at the shared native position table (`0x6f53b0`,
+//!   `0x6f5750`, `0x6f5f58`, `0x6f62a0`): Sims logo `(5, 0)`, Return
+//!   `(323, 0)`, Bulldoze `(373, 0)`, Import `(422, 0)`, Sims.com `(762, 0)`,
+//!   plus Magic Town's Move In `(200, 0)`. There is no filter row, no
+//!   destination switcher, and no status text on this bar.
+//! - **Flag `0` (lot-side picker):** `Downtown/dlgframe2.bmp` (`5432`) with a
+//!   random `STR# 212`/`213` title and a 7-button filter row at `x = 225 +
+//!   50·i, y = 20` (Studio Town: `175 + 50·i`). Only Magic Town's picker is
+//!   pixel-checked against the oracle, so only Magic Town uses it here.
 //!
 //! All localized tooltips and dialog labels are loaded from `GameData/UIText.iff`;
 //! no verbatim game prose is embedded in source.
@@ -34,15 +43,15 @@ use sims_formats::strings::StringTable;
 pub mod str_id {
     /// `ObjDialogs` default button strings (`OK`, `Cancel`, `Yes`, `No`).
     pub const DIALOG_BUTTONS: u16 = 142;
-    /// `Downtown Screen Tooltips` (5 entries).
+    /// `Downtown Screen Tooltips` (5 entries, `0x54a9cd`).
     pub const DOWNTOWN_TIPS: u16 = 169;
-    /// `Vacation Island Screen Tooltips` (5 entries).
+    /// `Vacation Island Screen Tooltips` (5 entries, `0x5693a5`).
     pub const VACATION_TIPS: u16 = 170;
     /// `Filter Bar` tooltips (13 entries).
     pub const FILTER_BAR: u16 = 171;
-    /// `Studio Town Screen Tooltips` (5 entries).
+    /// `Studio Town Screen Tooltips` (5 entries, `0x564e9f`).
     pub const STUDIO_TOWN_TIPS: u16 = 173;
-    /// `Magic land Screen Tooltips` (6 entries).
+    /// `Magic land Screen Tooltips` (6 entries, `0x551c48`).
     pub const MAGIC_TOWN_TIPS: u16 = 174;
     /// `Go Downtown Dialog Strings` (3 entries).
     pub const GO_DOWNTOWN_DIALOG: u16 = 212;
@@ -57,39 +66,33 @@ pub mod str_id {
 /// `UIGraphics/Res_Nbhd.h` resource identifiers for travel destination bars,
 /// filter toolbars, and travel-confirm dialogs.
 pub mod art_id {
-    /// `NghUI/banner_downtown.bmp` (800×52).
+    /// `NghUI/banner_downtown.bmp` (`kDTBarBkg`, 800×52): the bar backdrop of
+    /// all four destination screens (`0x54a4b8`, `0x551810`, `0x564a83`,
+    /// `0x568e87`).
     pub const DOWNTOWN_BAR_BKG: i32 = 5422;
-    /// `NghUI/banner_neighborhood.bmp` (800×52, fallback bar background).
+    /// `NghUI/banner_neighborhood.bmp` (800×52, Old Town picker bar).
     pub const NEIGHBORHOOD_BAR_BKG: i32 = 5420;
-    /// `Downtown/Return.bmp` (`kDowntownExitToNgh`).
+    /// `Downtown/Return.bmp` (`kDowntownExitToNgh`): entry 0 of every
+    /// destination button table, Studio Town included (`0x6ce200`).
     pub const DOWNTOWN_RETURN: i32 = 5209;
-    /// `Downtown/TheSimsLogo.bmp` (`kDowntownCredits`).
+    /// `Downtown/TheSimsLogo.bmp` (`kDowntownCredits`): entry 2 of every
+    /// destination button table, one cell. Non-US languages swap in
+    /// `kNghSimsLogo*` (`0x54a561..0x54a591`, `0x568f30..0x568f60`).
     pub const DOWNTOWN_LOGO: i32 = 5210;
-    /// `Downtown/Bulldoze.bmp` (`kDowntownBulldoze`).
+    /// `Downtown/Bulldoze.bmp` (`kDowntownBulldoze`): entry 4 of every table.
     pub const DOWNTOWN_BULLDOZE: i32 = 5211;
     /// `Downtown/Import.bmp` (`kDowntownImport`).
     pub const DOWNTOWN_IMPORT: i32 = 5212;
     /// `VIsland/Import.bmp` (`kVacationImport`).
     pub const VACATION_IMPORT: i32 = 5214;
-    /// `VIsland/vacationlogosmall.bmp` (`kNghVacationLogo`).
-    pub const VACATION_LOGO: i32 = 5441;
-    /// `VIsland/no_vacancy.bmp` (`kVacationNoVacancy`).
-    pub const VACATION_NO_VACANCY: i32 = 5510;
-    /// `Studiotown/Return.bmp` (`kStudiotownExitToNgh`).
-    pub const STUDIO_TOWN_RETURN: i32 = 5217;
     /// `Studiotown/Import.bmp` (`kStudiotownImport`).
     pub const STUDIO_TOWN_IMPORT: i32 = 5218;
-    /// `Studiotown/Bulldoze.bmp` (`kStudiotownBulldoze`).
-    pub const STUDIO_TOWN_BULLDOZE: i32 = 5219;
-    /// `Studiotown/TheSimsLogo.bmp` (`kStudiotownCredits`).
-    pub const STUDIO_TOWN_LOGO: i32 = 5220;
     /// `Magicland/Import.bmp` (`kMagictownImport`).
     pub const MAGIC_TOWN_IMPORT: i32 = 5222;
-    /// Destination switcher badges (`NghUI/*`).
-    pub const DEST_DOWNTOWN: i32 = 5208;
-    pub const DEST_VACATION: i32 = 5213;
-    pub const DEST_STUDIO_TOWN: i32 = 5216;
-    pub const DEST_MAGIC_TOWN: i32 = 5221;
+    /// `kNghInet` (Sims.com button): entry 1 of every destination table.
+    pub const INET: i32 = 5306;
+    /// `kNghMoveIn`: entry 5 of the Magic Town table only (`0x6cdcb0`).
+    pub const MOVE_IN: i32 = 5200;
     /// Travel dialog phone / hole icons (`Res_Nbhd.h`).
     pub const PHONE_DOWNTOWN: i32 = 5426;
     pub const PHONE_VACATION: i32 = 5431;
@@ -100,9 +103,6 @@ pub mod art_id {
     /// Dialog frames (`Downtown/dlgframe.bmp`, `Downtown/dlgframe2.bmp`).
     pub const DIALOG_FRAME: i32 = 5423;
     pub const DIALOG_FRAME_ALT: i32 = 5432;
-    /// Filter bar backgrounds (`NghUI/Filter_Toolbar_*.bmp`).
-    pub const FILTER_TOOLBAR: i32 = 5045;
-    pub const FILTER_TOOLBAR_ST: i32 = 5046;
     /// Community filter toggle buttons (`NghUI/Filter*Btn.bmp`).
     pub const FILTER_LODGING: i32 = 5060;
     pub const FILTER_FOOD: i32 = 5061;
@@ -120,10 +120,7 @@ pub mod art_id {
 }
 
 /// Every `UIGraphics` resource ID used by the travel destination chrome.
-///
-/// Note: `Res_Nbhd.RT` misspells `kStudiotownBulldoze` (`5219`) as
-/// `kStudiownBulldoze`, so Studio Town falls back to [`art_id::DOWNTOWN_BULLDOZE`].
-pub const RESOURCES: [i32; 41] = [
+pub const RESOURCES: [i32; 33] = [
     DIALOG_BACKGROUND,
     DIALOG_BUTTON,
     art_id::DOWNTOWN_BAR_BKG,
@@ -133,16 +130,10 @@ pub const RESOURCES: [i32; 41] = [
     art_id::DOWNTOWN_BULLDOZE,
     art_id::DOWNTOWN_IMPORT,
     art_id::VACATION_IMPORT,
-    art_id::VACATION_LOGO,
-    art_id::VACATION_NO_VACANCY,
-    art_id::STUDIO_TOWN_RETURN,
     art_id::STUDIO_TOWN_IMPORT,
-    art_id::STUDIO_TOWN_LOGO,
     art_id::MAGIC_TOWN_IMPORT,
-    art_id::DEST_DOWNTOWN,
-    art_id::DEST_VACATION,
-    art_id::DEST_STUDIO_TOWN,
-    art_id::DEST_MAGIC_TOWN,
+    art_id::INET,
+    art_id::MOVE_IN,
     art_id::PHONE_DOWNTOWN,
     art_id::PHONE_VACATION,
     art_id::PHONE_NEIGHBORHOOD,
@@ -150,8 +141,6 @@ pub const RESOURCES: [i32; 41] = [
     art_id::PHONE_MAGIC_TOWN,
     art_id::MAGIC_HOLE_ICON,
     art_id::DIALOG_FRAME_ALT,
-    art_id::FILTER_TOOLBAR,
-    art_id::FILTER_TOOLBAR_ST,
     art_id::FILTER_LODGING,
     art_id::FILTER_FOOD,
     art_id::FILTER_GARDENING,
@@ -170,11 +159,6 @@ pub const RESOURCES: [i32; 41] = [
 /// Native top control bar dimensions (`800×52`).
 pub const NATIVE_WIDTH: i32 = 800;
 pub const BAR_HEIGHT: i32 = 52;
-/// Secondary filter / legend strip height below the top bar (accommodates 52 px
-/// native filter button strips on >= 800 px viewports).
-pub const FILTER_STRIP_HEIGHT: i32 = 56;
-/// Compact filter strip height on viewports narrower than 800 px.
-pub const COMPACT_FILTER_STRIP_HEIGHT: i32 = 30;
 /// Native destination map height. Viewports taller than this center the
 /// `800×600` map and its chrome (`0x556db7..0x556ddc`: origin `[112, 84]` at
 /// `1024×768`).
@@ -189,27 +173,31 @@ pub const DIALOG_HEADER_HEIGHT: i32 = 62;
 pub const DIALOG_MAP_HOLE: Rect = Rect::new(15, DIALOG_HEADER_HEIGHT, 774, 523);
 /// Width of one `NghUI/Filter*Btn.bmp` cell (`200×52`, four states).
 const PICKER_FILTER_CELL: i32 = 50;
-/// Top of the picker dialog's filter row relative to the map origin (oracle).
+/// Top of the picker dialog's filter row relative to the map origin
+/// (position table `0x6f54d0`: `y = 20`).
 const PICKER_FILTER_Y: i32 = 20;
-/// Visit-mode bar button columns relative to the map origin, measured against
-/// the 1.91 oracle (`flow-cab-downtown-picker.png`): Return `kDowntownExitToNgh`
-/// (`5209`), Bulldoze (`5211`), Import (`5212`).
-const VISIT_BAR_BUTTON_X: [i32; 3] = [323, 373, 422];
-/// `TheSimsLogo.bmp` (`5210`) left inset inside the bar (oracle).
-const LOGO_X: i32 = 5;
+/// Hit width of a 53 px bar button: Return (`323`) and Bulldoze (`373`) sit
+/// 50 px apart, so the hit rects are trimmed to stay disjoint while the
+/// sprites still draw their full cell.
+const BAR_BUTTON_HIT_W: i32 = 49;
+/// Native cell size of the bar buttons (`212 / 4 × 52`).
+const BAR_BUTTON_W: i32 = 53;
+const BAR_BUTTON_H: i32 = 52;
+/// Native `kNghInet` cell width (`156 / 4`). At `x = 762` its last column
+/// falls past the 800 px bar, so the hit rect is clipped to the bar.
+const INET_W: i32 = 39;
+/// Width of the one-cell Sims logo (`Downtown/TheSimsLogo.bmp`, `70×52`).
+const LOGO_W: i32 = 70;
 
 /// Loads all travel chrome bitmaps and UI fonts from `ui`.
 pub fn load_art(ui: &UiGraphics, language: u8) -> Result<Art> {
     Art::load(ui, language, &RESOURCES)
 }
 
-const BAR_BG_DOWNTOWN: [u8; 3] = [26, 30, 74];
-const BAR_BG_VACATION: [u8; 3] = [20, 66, 86];
-const BAR_BG_OLD_TOWN: [u8; 3] = [24, 62, 48];
-const BAR_BG_STUDIO: [u8; 3] = [62, 24, 58];
-const BAR_BG_MAGIC: [u8; 3] = [42, 22, 68];
-const STRIP_BG: [u8; 3] = [16, 22, 50];
-const STRIP_BORDER: [u8; 3] = [76, 110, 184];
+/// Bar fill used only when `banner_downtown.bmp` is missing or the viewport
+/// is narrower than the native bar.
+const BAR_FALLBACK_BG: [u8; 3] = [26, 30, 74];
+const BAR_FALLBACK_BORDER: [u8; 3] = [76, 110, 184];
 const CHIP_BG: [u8; 3] = [30, 44, 96];
 const CHIP_ACTIVE_BG: [u8; 3] = [66, 132, 218];
 const CHIP_DISABLED_BG: [u8; 3] = [28, 32, 48];
@@ -289,44 +277,37 @@ impl Destination {
         }
     }
 
-    /// Returns the community filter tags applicable to this destination.
-    pub const fn filters(self) -> &'static [LotFilter] {
+    /// The native bar buttons of this destination's map screen with their
+    /// `800×600` draw origins, in button-table order (`0x6cd798` Downtown,
+    /// `0x6ce368` Vacation Island, `0x6ce200` Studio Town, `0x6cdc9c` Magic
+    /// Town; positions `0x6f53b0`, `0x6f62a0`, `0x6f5f58`, `0x6f5750`). The
+    /// table index is also the screen's tooltip index.
+    pub const fn bar_buttons(self) -> &'static [(TravelControl, [i32; 2])] {
+        const COMMON: [(TravelControl, [i32; 2]); 5] = [
+            (TravelControl::ReturnHome, [323, 0]),
+            (TravelControl::Web, [762, 0]),
+            (TravelControl::Credits, [5, 0]),
+            (TravelControl::ImportLot, [422, 0]),
+            (TravelControl::Bulldoze, [373, 0]),
+        ];
+        const MAGIC: [(TravelControl, [i32; 2]); 6] = [
+            COMMON[0],
+            COMMON[1],
+            COMMON[2],
+            COMMON[3],
+            COMMON[4],
+            (TravelControl::MoveIn, [200, 0]),
+        ];
         match self {
-            Self::Downtown => &[LotFilter::Food, LotFilter::Shopping, LotFilter::Recreation],
-            Self::VacationIsland => &[
-                LotFilter::Lodging,
-                LotFilter::Food,
-                LotFilter::Shopping,
-                LotFilter::Recreation,
-            ],
-            Self::OldTown => &[
-                LotFilter::DogCat,
-                LotFilter::SmallAnimal,
-                LotFilter::Gardening,
-                LotFilter::Shopping,
-                LotFilter::Food,
-                LotFilter::Recreation,
-            ],
-            Self::StudioTown => &[
-                LotFilter::Music,
-                LotFilter::Movie,
-                LotFilter::Model,
-                LotFilter::Spa,
-                LotFilter::Food,
-                LotFilter::Shopping,
-            ],
-            Self::MagicTown => &[
-                LotFilter::Magic,
-                LotFilter::Rides,
-                LotFilter::Food,
-                LotFilter::Shopping,
-            ],
+            Self::MagicTown => &MAGIC,
+            _ => &COMMON,
         }
     }
 
     /// Filter buttons shown in the destination picker dialog header, in the
     /// native left-to-right order. Only Magic Town uses the dialog header; the
-    /// order is measured against the 1.91 oracle (`flow-magic-hole-picker.png`).
+    /// order is measured against the 1.91 oracle (`flow-magic-hole-picker.png`)
+    /// and matches `cWinMagicland`'s filter setup (`0x555372..0x55567c`).
     pub const fn picker_filters(self) -> &'static [LotFilter] {
         match self {
             Self::MagicTown => &[
@@ -343,46 +324,14 @@ impl Destination {
     }
 
     /// Whether this destination's lot picker uses the full `dlgframe2.bmp`
-    /// dialog frame with a title header (Magic Town) instead of the plain
-    /// top bar (Downtown and the rest).
+    /// dialog frame with a title header (Magic Town) instead of the native
+    /// map bar (Downtown and the rest).
     pub const fn picker_uses_dialog_frame(self) -> bool {
         matches!(self, Self::MagicTown)
     }
 
-    /// Whether this destination's Visit picker uses the native 1.91 layout
-    /// measured against the oracle (Downtown's plain bar, Magic Town's
-    /// dialog). Vacation Island, Old Town and Studio Town have no oracle
-    /// shot yet, so they keep the full bar with their filter strip rather
-    /// than lose filters a player may already have active.
-    pub const fn picker_is_native(self) -> bool {
-        matches!(self, Self::Downtown | Self::MagicTown)
-    }
-
-    /// Fallback bar fill RGB for this destination.
-    const fn bar_fallback_bg(self) -> [u8; 3] {
-        match self {
-            Self::Downtown => BAR_BG_DOWNTOWN,
-            Self::VacationIsland => BAR_BG_VACATION,
-            Self::OldTown => BAR_BG_OLD_TOWN,
-            Self::StudioTown => BAR_BG_STUDIO,
-            Self::MagicTown => BAR_BG_MAGIC,
-        }
-    }
-
-    /// `UIGraphics` resource ID for this destination's Return-to-Neighborhood button.
-    pub const fn return_art_id(self) -> i32 {
-        match self {
-            Self::StudioTown => art_id::STUDIO_TOWN_RETURN,
-            _ => art_id::DOWNTOWN_RETURN,
-        }
-    }
-
-    /// `UIGraphics` resource ID for this destination's Bulldoze button.
-    pub const fn bulldoze_art_id(self) -> i32 {
-        art_id::DOWNTOWN_BULLDOZE
-    }
-
-    /// `UIGraphics` resource ID for this destination's Import button.
+    /// `UIGraphics` resource ID for this destination's Import button (entry
+    /// 3 of its button table).
     pub const fn import_art_id(self) -> i32 {
         match self {
             Self::Downtown | Self::OldTown => art_id::DOWNTOWN_IMPORT,
@@ -450,53 +399,6 @@ impl LotFilter {
             Self::Rides => 12,
         }
     }
-
-    /// Compact ASCII fallback label when `STR# 171` is unavailable.
-    pub const fn short_label(self) -> &'static str {
-        match self {
-            Self::Lodging => "Lodge",
-            Self::Food => "Food",
-            Self::Gardening => "Garden",
-            Self::Shopping => "Shop",
-            Self::DogCat => "Pets",
-            Self::SmallAnimal => "Critters",
-            Self::Recreation => "Fun",
-            Self::Spa => "Spa",
-            Self::Movie => "Film",
-            Self::Model => "Model",
-            Self::Music => "Music",
-            Self::Magic => "Magic",
-            Self::Rides => "Rides",
-        }
-    }
-}
-
-/// Vacation Island lodging legend categories (Hotel / Cabin Rental / Campground).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VacationLodging {
-    Hotel,
-    CabinRental,
-    Campground,
-}
-
-impl VacationLodging {
-    pub const ALL: [Self; 3] = [Self::Hotel, Self::CabinRental, Self::Campground];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Hotel => "Hotel",
-            Self::CabinRental => "Rental",
-            Self::Campground => "Camp",
-        }
-    }
-
-    pub const fn badge_color(self) -> [u8; 3] {
-        match self {
-            Self::Hotel => [216, 162, 48],
-            Self::CabinRental => [74, 152, 212],
-            Self::Campground => [76, 168, 92],
-        }
-    }
 }
 
 /// Active interaction mode on a travel destination map screen.
@@ -505,7 +407,8 @@ pub enum TravelBarMode {
     /// Browsing lots (or picking a lot to edit in Build/Buy).
     #[default]
     Browse,
-    /// Visiting a lot with an active household (disables Bulldoze / Import).
+    /// Picking a lot to visit with an active household (disables Bulldoze /
+    /// Import / Move In).
     Visit,
     /// Bulldozing / resetting a community lot back to template.
     Bulldoze,
@@ -517,19 +420,11 @@ pub struct TravelState {
     pub destination: Destination,
     pub mode: TravelBarMode,
     pub expansions: ExpansionFlags,
+    /// Whether the import folder holds a lot to import: the native Import
+    /// button is enabled only then (`0x56b870`).
     pub has_importable_lot: bool,
-    /// Active community filter highlight (if any).
+    /// Active community filter highlight in the picker dialog (if any).
     pub active_filter: Option<LotFilter>,
-    /// Vacation Island: optional lodging legend filter (`Hotel`/`CabinRental`/`Campground`).
-    pub vacation_lodging_filter: Option<VacationLodging>,
-    /// Vacation Island: whether any resort lot currently shows No Vacancy.
-    pub vacation_has_no_vacancy: bool,
-    /// Studio Town: active Sim's fame rating in half-stars (`0..=10`, i.e. 0.0..=5.0 stars).
-    pub studio_fame_half_stars: u8,
-    /// Magic Town: active household's MagiCoins balance.
-    pub magic_coins: i32,
-    /// Active household's Simoleon balance (displayed in Visit / Magic / Vacation contexts).
-    pub simoleons: i32,
     /// Filters with no matching lot on the current map. The picker dialog
     /// draws these with the disabled cell and ignores clicks on them.
     pub unavailable_filters: Vec<LotFilter>,
@@ -543,25 +438,44 @@ impl Default for TravelState {
             expansions: ExpansionFlags::ALL,
             has_importable_lot: false,
             active_filter: None,
-            vacation_lodging_filter: None,
-            vacation_has_no_vacancy: false,
-            studio_fame_half_stars: 0,
-            magic_coins: 0,
-            simoleons: 0,
             unavailable_filters: Vec::new(),
         }
     }
 }
 
-/// Interactive controls in the destination top bar and filter legend strip.
+/// Interactive controls on the destination map bar and picker dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TravelControl {
+    /// `kDowntownExitToNgh` (`5209`).
     ReturnHome,
-    Bulldoze,
+    /// `kNghInet` (`5306`).
+    Web,
+    /// `kDowntownCredits` (`5210`, the Sims logo).
+    Credits,
+    /// Destination Import button (`5212`, `5214`, `5218`, `5222`).
     ImportLot,
-    SwitchDestination(Destination),
+    /// `kDowntownBulldoze` (`5211`).
+    Bulldoze,
+    /// `kNghMoveIn` (`5200`), Magic Town only.
+    MoveIn,
+    /// Picker dialog filter button.
     ToggleFilter(LotFilter),
-    ToggleVacationLodging(VacationLodging),
+}
+
+impl TravelControl {
+    /// Index into this destination's screen tooltip table (`STR# 169`,
+    /// `170`, `173`, `174`), which follows button-table order.
+    pub const fn screen_tooltip_index(self) -> Option<usize> {
+        match self {
+            Self::ReturnHome => Some(0),
+            Self::Web => Some(1),
+            Self::Credits => Some(2),
+            Self::ImportLot => Some(3),
+            Self::Bulldoze => Some(4),
+            Self::MoveIn => Some(5),
+            Self::ToggleFilter(_) => None,
+        }
+    }
 }
 
 /// Commands emitted when the player clicks a control in [`TravelChrome`].
@@ -570,9 +484,11 @@ pub enum TravelCommand {
     ReturnToNeighborhood,
     ToggleBulldoze,
     ImportLot,
-    SwitchDestination(Destination),
+    OpenWeb,
+    OpenCredits,
+    /// Magic Town's Move In button (opens the family bin).
+    OpenFamilyBin,
     SetFilter(Option<LotFilter>),
-    SetVacationLodging(Option<VacationLodging>),
 }
 
 /// Localized strings read from `GameData/UIText.iff` for travel screens and
@@ -634,7 +550,9 @@ impl TravelStrings {
     }
 
     /// Picker dialog title for `destination` (`UIText.iff STR# 212[2]`,
-    /// "Where am I taking you?" for the Magic Town hole).
+    /// "Where am I taking you?" for the Magic Town hole). The native picks
+    /// one of `STR# 212[0..3]` at random (`0x551ded..0x551e0e`); the 1.91
+    /// oracle caught entry 2.
     pub fn picker_title(&self, destination: Destination) -> Option<&str> {
         match destination {
             Destination::MagicTown => self.go_downtown_dialog.get(2),
@@ -690,13 +608,13 @@ impl TravelStrings {
             Destination::MagicTown => &self.magic_town_tips,
         };
         match control {
-            TravelControl::ReturnHome => screen_tips.first().map(String::as_str),
-            TravelControl::ImportLot => screen_tips.get(3).map(String::as_str),
-            TravelControl::Bulldoze => screen_tips.get(4).map(String::as_str),
             TravelControl::ToggleFilter(f) => {
                 self.filter_tips.get(f.tooltip_index()).map(String::as_str)
             }
-            TravelControl::SwitchDestination(_) | TravelControl::ToggleVacationLodging(_) => None,
+            other => other
+                .screen_tooltip_index()
+                .and_then(|i| screen_tips.get(i))
+                .map(String::as_str),
         }
         .filter(|s| !s.is_empty())
     }
@@ -711,15 +629,13 @@ pub struct ControlPlacement {
     pub active: bool,
 }
 
-/// Computed layout for the travel destination top bar and filter legend strip.
+/// Computed layout for the travel destination bar or picker dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TravelLayout {
     pub frame_size: [i32; 2],
     /// Top-left of the native `800×600` map area (`[112, 84]` at `1024×768`).
     pub origin: [i32; 2],
     pub bar_rect: Rect,
-    pub filter_strip_rect: Rect,
-    pub status_badge_rect: Rect,
     pub controls: Vec<ControlPlacement>,
     pub compact: bool,
     /// Picker dialog frame (`dlgframe2.bmp`, `800×600` at `origin`), if used.
@@ -728,15 +644,12 @@ pub struct TravelLayout {
     pub map_hole: Option<Rect>,
     /// Area for the picker dialog title text.
     pub title_rect: Option<Rect>,
-    /// Draw native-size button sprites at their hit rect's top-left (the
-    /// picker bar's oracle-measured columns) instead of centering them.
-    sprites_top_left: bool,
 }
 
 impl TravelLayout {
     /// Whether `(x, y)` lies on chrome that should swallow map clicks.
     pub fn blocks_map(&self, x: i32, y: i32) -> bool {
-        if self.bar_rect.contains(x, y) || self.filter_strip_rect.contains(x, y) {
+        if self.bar_rect.contains(x, y) {
             return true;
         }
         if let (Some(dialog), Some(hole)) = (self.dialog_rect, self.map_hole) {
@@ -745,80 +658,41 @@ impl TravelLayout {
         self.controls.iter().any(|c| c.rect.contains(x, y))
     }
 
-    /// Native lot-picker layout (`TravelBarMode::Visit` on viewports at least
-    /// `800` wide): the plain bar with centered Return / Bulldoze / Import for
-    /// Downtown, or the `dlgframe2.bmp` dialog with a title and
-    /// filter row for Magic Town. No destination tabs or wallet badge: the
-    /// 1.91 picker shows neither.
-    fn compute_picker(w: i32, h: i32, origin: [i32; 2], state: &TravelState) -> Self {
+    /// Magic Town lot-picker layout (`TravelBarMode::Visit` on viewports at
+    /// least `800` wide): the `dlgframe2.bmp` dialog with a title and filter
+    /// row. The native dialog has no visible cancel control; Esc backs out.
+    fn compute_picker_dialog(w: i32, h: i32, origin: [i32; 2], state: &TravelState) -> Self {
         let [ox, oy] = origin;
-        let mut controls = Vec::new();
-        if state.destination.picker_uses_dialog_frame() {
-            let dialog = Rect::new(ox, oy, NATIVE_WIDTH, NATIVE_HEIGHT.min(h - oy));
-            let header_h = DIALOG_HEADER_HEIGHT.min(dialog.height);
-            let bar_rect = Rect::new(ox, oy, NATIVE_WIDTH, header_h);
-            let filters = state.destination.picker_filters();
-            let count = filters.len() as i32;
-            let start = ox + (NATIVE_WIDTH - count * PICKER_FILTER_CELL) / 2;
-            // The native dialog has no visible cancel control; Esc backs out.
-            for (i, &filter) in filters.iter().enumerate() {
-                controls.push(ControlPlacement {
-                    control: TravelControl::ToggleFilter(filter),
-                    rect: Rect::new(
-                        start + i as i32 * PICKER_FILTER_CELL,
-                        oy + PICKER_FILTER_Y,
-                        PICKER_FILTER_CELL,
-                        BAR_HEIGHT,
-                    ),
-                    enabled: !state.unavailable_filters.contains(&filter),
-                    active: state.active_filter == Some(filter),
-                });
-            }
-            return Self {
-                frame_size: [w, h],
-                origin,
-                bar_rect,
-                filter_strip_rect: Rect::new(ox, oy + header_h, NATIVE_WIDTH, 0),
-                status_badge_rect: Rect::new(ox, oy, 0, 0),
-                controls,
-                compact: false,
-                dialog_rect: Some(dialog),
-                map_hole: Some(DIALOG_MAP_HOLE.offset(ox, oy)),
-                title_rect: Some(Rect::new(ox, oy + 2, NATIVE_WIDTH, PICKER_FILTER_Y)),
-                sprites_top_left: true,
-            };
-        }
-
-        let bar_h = BAR_HEIGHT.min(h - oy).max(0);
-        let bar_rect = Rect::new(ox, oy, NATIVE_WIDTH, bar_h);
-        let items = [
-            (TravelControl::ReturnHome, true),
-            (TravelControl::Bulldoze, false),
-            (TravelControl::ImportLot, false),
-        ];
-        for ((control, enabled), x) in items.into_iter().zip(VISIT_BAR_BUTTON_X) {
-            controls.push(ControlPlacement {
-                control,
-                // Hit rects are trimmed to 49 px so the native columns
-                // (`323`, `373`, `422`) stay disjoint; sprites still draw at
-                // their full 53 px cell from the column's left edge.
-                rect: Rect::new(ox + x, oy, 49, bar_h),
-                enabled,
-                active: false,
-            });
-        }
+        let dialog = Rect::new(ox, oy, NATIVE_WIDTH, NATIVE_HEIGHT.min(h - oy));
+        let header_h = DIALOG_HEADER_HEIGHT.min(dialog.height);
+        let bar_rect = Rect::new(ox, oy, NATIVE_WIDTH, header_h);
+        let filters = state.destination.picker_filters();
+        let count = filters.len() as i32;
+        let start = ox + (NATIVE_WIDTH - count * PICKER_FILTER_CELL) / 2;
+        let controls = filters
+            .iter()
+            .enumerate()
+            .map(|(i, &filter)| ControlPlacement {
+                control: TravelControl::ToggleFilter(filter),
+                rect: Rect::new(
+                    start + i as i32 * PICKER_FILTER_CELL,
+                    oy + PICKER_FILTER_Y,
+                    PICKER_FILTER_CELL,
+                    BAR_HEIGHT,
+                ),
+                enabled: !state.unavailable_filters.contains(&filter),
+                active: state.active_filter == Some(filter),
+            })
+            .collect();
         Self {
             frame_size: [w, h],
             origin,
             bar_rect,
-            filter_strip_rect: Rect::new(ox, oy + bar_h, NATIVE_WIDTH, 0),
-            status_badge_rect: Rect::new(ox, oy, 0, 0),
             controls,
             compact: false,
-            dialog_rect: None,
-            map_hole: None,
-            title_rect: None,
-            sprites_top_left: true,
+            dialog_rect: Some(dialog),
+            map_hole: Some(DIALOG_MAP_HOLE.offset(ox, oy)),
+            title_rect: Some(Rect::new(ox, oy + 2, NATIVE_WIDTH, PICKER_FILTER_Y)),
         }
     }
 
@@ -835,143 +709,70 @@ impl TravelLayout {
         } else {
             0
         };
-        if !compact && state.mode == TravelBarMode::Visit && state.destination.picker_is_native() {
-            return Self::compute_picker(w, h, [bar_x, oy], state);
+        if !compact
+            && state.mode == TravelBarMode::Visit
+            && state.destination.picker_uses_dialog_frame()
+        {
+            return Self::compute_picker_dialog(w, h, [bar_x, oy], state);
         }
-        let bar_h = BAR_HEIGHT.min(h - oy);
+        let bar_h = BAR_HEIGHT.min(h - oy).max(0);
         let bar_rect = Rect::new(bar_x, oy, bar_w, bar_h);
 
-        let desired_strip_h = if compact {
-            COMPACT_FILTER_STRIP_HEIGHT
-        } else {
-            FILTER_STRIP_HEIGHT
+        // Enable rules from `cWinVacation`'s mode switch (`0x56b19e`): in
+        // Bulldoze mode Return / Sims.com / logo / Import are disabled and
+        // Bulldoze is held down; Import otherwise needs an importable lot
+        // (`0x56b870`). Visit mode (lot picking from a trip) keeps only the
+        // non-editing buttons live.
+        let mode = state.mode;
+        let enabled = |control: TravelControl| match (control, mode) {
+            (TravelControl::Bulldoze, TravelBarMode::Visit) => false,
+            (TravelControl::Bulldoze, _) => true,
+            (TravelControl::ImportLot, TravelBarMode::Browse) => state.has_importable_lot,
+            (TravelControl::ImportLot, _) => false,
+            (TravelControl::MoveIn, TravelBarMode::Browse) => true,
+            (TravelControl::MoveIn, _) => false,
+            (_, TravelBarMode::Bulldoze) => false,
+            _ => true,
         };
-        let strip_h = desired_strip_h.min((h - oy - bar_h).max(0));
-        let filter_strip_rect = Rect::new(bar_x, oy + bar_h, bar_w, strip_h);
 
-        let mut controls = Vec::new();
-        let is_visit = state.mode == TravelBarMode::Visit;
-
-        // Top bar controls: ReturnHome, Bulldoze, ImportLot, + 4 destination tabs.
-        let top_items: [(TravelControl, bool, bool); 7] = [
-            (TravelControl::ReturnHome, true, false),
-            (
-                TravelControl::Bulldoze,
-                !is_visit,
-                state.mode == TravelBarMode::Bulldoze,
-            ),
-            (
-                TravelControl::ImportLot,
-                !is_visit && state.has_importable_lot,
-                false,
-            ),
-            (
-                TravelControl::SwitchDestination(Destination::Downtown),
-                state.expansions.has(ExpansionFlags::HOT_DATE) && !is_visit,
-                state.destination == Destination::Downtown,
-            ),
-            (
-                TravelControl::SwitchDestination(Destination::VacationIsland),
-                state.expansions.has(ExpansionFlags::VACATION) && !is_visit,
-                state.destination == Destination::VacationIsland,
-            ),
-            (
-                TravelControl::SwitchDestination(Destination::StudioTown),
-                state.expansions.has(ExpansionFlags::SUPERSTAR) && !is_visit,
-                state.destination == Destination::StudioTown,
-            ),
-            (
-                TravelControl::SwitchDestination(Destination::MagicTown),
-                state.expansions.has(ExpansionFlags::MAKIN_MAGIC) && !is_visit,
-                state.destination == Destination::MagicTown,
-            ),
-        ];
-
-        // Reserve right side of top bar for status badge (MagiCoins / Fame / Simoleons).
-        let badge_w = if compact {
-            (bar_w / 4).clamp(64, 120).min(bar_w)
-        } else {
-            170
-        };
-        let status_badge_rect = Rect::new(
-            bar_x + bar_w - badge_w - 6,
-            oy + 6.min(bar_h),
-            (badge_w).max(0),
-            (bar_h - 12).max(0),
-        );
-
-        let left_pad = if compact { 4 } else { 78 };
-        let avail_top_w = (status_badge_rect.x - (bar_x + left_pad) - 6).max(0);
-        let gap = if compact { 2 } else { 6 };
-        let count = top_items.len() as i32;
-        let btn_w = if compact {
-            ((avail_top_w - gap * (count - 1)).max(0)) / count
-        } else {
-            53.min(((avail_top_w - gap * (count - 1)).max(0)) / count)
-        };
-        let btn_h = (bar_h - 6).max(0);
-        let btn_y = oy + (bar_h - btn_h) / 2;
-
-        for (idx, (control, enabled, active)) in top_items.into_iter().enumerate() {
-            let x = bar_x + left_pad + idx as i32 * (btn_w + gap);
-            if btn_w > 0 && btn_h > 0 && x + btn_w <= status_badge_rect.x {
+        let buttons = state.destination.bar_buttons();
+        let mut controls = Vec::with_capacity(buttons.len());
+        if compact {
+            // Narrower than the native bar: keep the native left-to-right
+            // order (logo first, Sims.com last) packed edge to edge at the
+            // full sprite width, dropping what does not fit.
+            let mut ordered: Vec<_> = buttons.to_vec();
+            ordered.sort_by_key(|&(_, [x, _])| x);
+            let mut x = bar_x;
+            for (control, _) in ordered {
+                let cw = match control {
+                    TravelControl::Web | TravelControl::Credits => control_hit_width(control),
+                    _ => BAR_BUTTON_W,
+                };
+                if x + cw > bar_x + bar_w {
+                    break;
+                }
                 controls.push(ControlPlacement {
                     control,
-                    rect: Rect::new(x, btn_y, btn_w, btn_h),
-                    enabled,
-                    active,
+                    rect: Rect::new(x, oy, cw, bar_h),
+                    enabled: enabled(control),
+                    active: control == TravelControl::Bulldoze && mode == TravelBarMode::Bulldoze,
                 });
+                x += cw;
             }
-        }
-
-        // Secondary strip: filter buttons (+ Vacation Island lodging legend chips).
-        if strip_h >= 14 {
-            let filters = state.destination.filters();
-            let extra_lodging = if state.destination == Destination::VacationIsland {
-                VacationLodging::ALL.len()
-            } else {
-                0
-            };
-            let total_chips = (filters.len() + extra_lodging) as i32;
-            if total_chips > 0 {
-                let chip_gap = if compact { 3 } else { 6 };
-                let strip_pad = if compact { 4 } else { 12 };
-                let avail_w = (bar_w - strip_pad * 2).max(0);
-                let max_chip_w = if compact { 58 } else { 76 };
-                let chip_w = (((avail_w - chip_gap * (total_chips - 1)).max(0)) / total_chips)
-                    .min(max_chip_w);
-                let chip_h = if compact {
-                    (strip_h - 6).max(10)
-                } else {
-                    (strip_h - 4).max(10)
-                };
-                let chip_y = filter_strip_rect.y + (strip_h - chip_h) / 2;
-                let mut cursor_x = bar_x + strip_pad;
-
-                for &filter in filters {
-                    if chip_w > 0 && cursor_x + chip_w <= bar_x + bar_w {
-                        controls.push(ControlPlacement {
-                            control: TravelControl::ToggleFilter(filter),
-                            rect: Rect::new(cursor_x, chip_y, chip_w, chip_h),
-                            enabled: true,
-                            active: state.active_filter == Some(filter),
-                        });
-                        cursor_x += chip_w + chip_gap;
-                    }
-                }
-                if state.destination == Destination::VacationIsland {
-                    for lodging in VacationLodging::ALL {
-                        if chip_w > 0 && cursor_x + chip_w <= bar_x + bar_w {
-                            controls.push(ControlPlacement {
-                                control: TravelControl::ToggleVacationLodging(lodging),
-                                rect: Rect::new(cursor_x, chip_y, chip_w, chip_h),
-                                enabled: true,
-                                active: state.vacation_lodging_filter == Some(lodging),
-                            });
-                            cursor_x += chip_w + chip_gap;
-                        }
-                    }
-                }
+        } else {
+            for &(control, [x, y]) in buttons {
+                controls.push(ControlPlacement {
+                    control,
+                    rect: Rect::new(
+                        bar_x + x,
+                        oy + y,
+                        control_hit_width(control).min(NATIVE_WIDTH - x),
+                        BAR_BUTTON_H.min(bar_h),
+                    ),
+                    enabled: enabled(control),
+                    active: control == TravelControl::Bulldoze && mode == TravelBarMode::Bulldoze,
+                });
             }
         }
 
@@ -979,14 +780,11 @@ impl TravelLayout {
             frame_size: [w, h],
             origin: [bar_x, oy],
             bar_rect,
-            filter_strip_rect,
-            status_badge_rect,
             controls,
             compact,
             dialog_rect: None,
             map_hole: None,
             title_rect: None,
-            sprites_top_left: false,
         }
     }
 
@@ -999,7 +797,16 @@ impl TravelLayout {
     }
 }
 
-/// Interactive controller for the travel destination top bar and filter strip.
+const fn control_hit_width(control: TravelControl) -> i32 {
+    match control {
+        TravelControl::Web => INET_W,
+        TravelControl::Credits => LOGO_W,
+        TravelControl::ToggleFilter(_) => PICKER_FILTER_CELL,
+        _ => BAR_BUTTON_HIT_W,
+    }
+}
+
+/// Interactive controller for the travel destination bar and picker dialog.
 #[derive(Debug, Clone, Default)]
 pub struct TravelChrome {
     hovered: Option<TravelControl>,
@@ -1070,7 +877,9 @@ impl TravelChrome {
             TravelControl::ReturnHome => TravelCommand::ReturnToNeighborhood,
             TravelControl::Bulldoze => TravelCommand::ToggleBulldoze,
             TravelControl::ImportLot => TravelCommand::ImportLot,
-            TravelControl::SwitchDestination(dest) => TravelCommand::SwitchDestination(dest),
+            TravelControl::Web => TravelCommand::OpenWeb,
+            TravelControl::Credits => TravelCommand::OpenCredits,
+            TravelControl::MoveIn => TravelCommand::OpenFamilyBin,
             TravelControl::ToggleFilter(filter) => {
                 if state.active_filter == Some(filter) {
                     TravelCommand::SetFilter(None)
@@ -1078,18 +887,11 @@ impl TravelChrome {
                     TravelCommand::SetFilter(Some(filter))
                 }
             }
-            TravelControl::ToggleVacationLodging(lodging) => {
-                if state.vacation_lodging_filter == Some(lodging) {
-                    TravelCommand::SetVacationLodging(None)
-                } else {
-                    TravelCommand::SetVacationLodging(Some(lodging))
-                }
-            }
         })
     }
 
-    /// Draws the travel destination top bar, filter legend strip, status badge,
-    /// and hover tooltip into `frame`.
+    /// Draws the travel destination bar (or Magic Town picker dialog) and
+    /// hover tooltip into `frame`.
     pub fn draw(
         &self,
         frame: &mut Frame,
@@ -1101,60 +903,15 @@ impl TravelChrome {
 
         if let Some(dialog) = layout.dialog_rect {
             draw_picker_dialog(frame, &layout, dialog, state, art, strings);
+        } else if !layout.compact
+            && let Some(img) = art.image(art_id::DOWNTOWN_BAR_BKG)
+        {
+            frame.draw_all(img, [layout.bar_rect.x, layout.bar_rect.y]);
         } else {
-            // Top bar backdrop.
-            let bar_bg = art
-                .image(art_id::DOWNTOWN_BAR_BKG)
-                .or_else(|| art.image(art_id::NEIGHBORHOOD_BAR_BKG));
-            if !layout.compact
-                && let Some(img) = bar_bg
-            {
-                frame.draw_all(img, [layout.bar_rect.x, layout.bar_rect.y]);
-            } else {
-                frame.fill(layout.bar_rect, state.destination.bar_fallback_bg());
-                draw_border(frame, layout.bar_rect, STRIP_BORDER);
-            }
+            frame.fill(layout.bar_rect, BAR_FALLBACK_BG);
+            draw_border(frame, layout.bar_rect, BAR_FALLBACK_BORDER);
         }
 
-        // Destination emblem on left of top bar when non-compact.
-        if !layout.compact && layout.dialog_rect.is_none() {
-            let logo_id = match state.destination {
-                Destination::VacationIsland => art_id::VACATION_LOGO,
-                Destination::StudioTown => art_id::STUDIO_TOWN_LOGO,
-                _ => art_id::DOWNTOWN_LOGO,
-            };
-            if let Some(logo) = art.image(logo_id) {
-                let ly = layout.bar_rect.y + (layout.bar_rect.height - logo.height as i32) / 2;
-                frame.draw_all(logo, [layout.bar_rect.x + LOGO_X, ly.max(0)]);
-            }
-        }
-
-        // Secondary filter & legend strip.
-        if layout.filter_strip_rect.height > 0 {
-            fill_alpha(frame, layout.filter_strip_rect, STRIP_BG, 225);
-            if !layout.compact {
-                let toolbar_id = if state.destination == Destination::StudioTown {
-                    art_id::FILTER_TOOLBAR_ST
-                } else {
-                    art_id::FILTER_TOOLBAR
-                };
-                if let Some(toolbar) = art.image(toolbar_id) {
-                    let ty = layout.filter_strip_rect.y
-                        + (layout.filter_strip_rect.height - toolbar.height as i32) / 2;
-                    frame.draw_all(
-                        toolbar,
-                        [
-                            layout.filter_strip_rect.x,
-                            ty.max(layout.filter_strip_rect.y),
-                        ],
-                    );
-                }
-            }
-            draw_border(frame, layout.filter_strip_rect, STRIP_BORDER);
-        }
-
-        // Draw controls.
-        let font = pick_font(art, if layout.compact { 8 } else { 10 });
         for placement in &layout.controls {
             let is_hovered = self.hovered == Some(placement.control);
             let is_pressed = self.pressed == Some(placement.control);
@@ -1167,63 +924,48 @@ impl TravelChrome {
             } else {
                 0
             };
-
-            let maybe_art = control_art_id(state.destination, placement.control)
-                .and_then(|id| art.cell(id, 4, cell));
-
-            if !layout.compact
-                && let Some(sprite) = maybe_art
-                && sprite.width as i32 <= placement.rect.width + 6
-                && sprite.height as i32 <= placement.rect.height + 6
-            {
-                let (sx, sy) = if layout.sprites_top_left {
-                    (placement.rect.x, placement.rect.y)
+            let sprite = control_art_id(state.destination, placement.control).and_then(|id| {
+                if placement.control == TravelControl::Credits {
+                    // One-cell bitmap (`0x569445`: cell count 1).
+                    art.image(id).cloned()
                 } else {
-                    (
-                        placement.rect.x + (placement.rect.width - sprite.width as i32) / 2,
-                        placement.rect.y + (placement.rect.height - sprite.height as i32) / 2,
-                    )
-                };
-                frame.draw_all(&sprite, [sx, sy]);
-            } else {
-                let bg = match placement.control {
-                    TravelControl::ToggleVacationLodging(lodging) => {
-                        if placement.active {
-                            lodging.badge_color()
-                        } else {
-                            CHIP_BG
-                        }
-                    }
-                    _ if !placement.enabled => CHIP_DISABLED_BG,
-                    _ if placement.active || is_pressed => CHIP_ACTIVE_BG,
-                    _ => CHIP_BG,
-                };
-                frame.fill(placement.rect, bg);
-                let border = if is_hovered && placement.enabled {
-                    TEXT_GOLD
-                } else {
-                    STRIP_BORDER
-                };
-                draw_border(frame, placement.rect, border);
-                if let Some(f) = font {
-                    let label = control_short_label(placement.control);
-                    let ink = if placement.enabled {
-                        TEXT_LIGHT
-                    } else {
-                        TEXT_MUTED
-                    };
-                    draw_centered_text(frame, f, placement.rect, label, ink);
+                    art.cell(id, 4, cell)
                 }
-            }
-        }
-
-        // Destination-specific status badge (MagiCoins / Studio Fame / Vacation Vacancy / Simoleons).
-        if layout.status_badge_rect.width >= 32 && layout.status_badge_rect.height >= 16 {
-            fill_alpha(frame, layout.status_badge_rect, STRIP_BG, 230);
-            draw_border(frame, layout.status_badge_rect, TEXT_GOLD);
-            if let Some(f) = font {
-                let badge_text = format_status_badge(state);
-                draw_centered_text(frame, f, layout.status_badge_rect, &badge_text, TEXT_GOLD);
+            });
+            match sprite {
+                // Native sprites draw at the button's origin (the hit rect's
+                // top-left), overhanging the trimmed hit rect.
+                Some(sprite)
+                    if !layout.compact || sprite.width as i32 <= placement.rect.width + 4 =>
+                {
+                    // The bar window clips its children: Sims.com at `762`
+                    // loses its last column past the 800 px edge.
+                    let bar_right = layout.bar_rect.x + layout.bar_rect.width;
+                    let visible = (sprite.width as i32).min(bar_right - placement.rect.x);
+                    frame.draw(
+                        &sprite,
+                        Rect::new(0, 0, visible, sprite.height as i32),
+                        [placement.rect.x, placement.rect.y],
+                    );
+                }
+                _ => {
+                    // Missing art: a plain chip with no invented label.
+                    let bg = if !placement.enabled {
+                        CHIP_DISABLED_BG
+                    } else if placement.active || is_pressed {
+                        CHIP_ACTIVE_BG
+                    } else {
+                        CHIP_BG
+                    };
+                    let rect = Rect::new(
+                        placement.rect.x + 2,
+                        placement.rect.y + 2,
+                        (placement.rect.width - 4).max(0),
+                        (placement.rect.height - 4).max(0),
+                    );
+                    frame.fill(rect, bg);
+                    draw_border(frame, rect, BAR_FALLBACK_BORDER);
+                }
             }
         }
 
@@ -1253,9 +995,9 @@ fn draw_picker_dialog(
         frame.draw_all(img, [dialog.x, dialog.y]);
         fill_dialog_header_gap(frame, img, [dialog.x, dialog.y]);
     } else {
-        let bg = state.destination.bar_fallback_bg();
+        let bg = BAR_FALLBACK_BG;
         frame.fill(layout.bar_rect, bg);
-        draw_border(frame, layout.bar_rect, STRIP_BORDER);
+        draw_border(frame, layout.bar_rect, BAR_FALLBACK_BORDER);
         if let Some(hole) = layout.map_hole {
             let right = hole.x + hole.width;
             let bottom = hole.y + hole.height;
@@ -1320,52 +1062,16 @@ fn fill_dialog_header_gap(frame: &mut Frame, img: &Image, at: [i32; 2]) {
     }
 }
 
-/// Formats the destination-specific status badge (MagiCoins, Studio Fame stars,
-/// Vacation availability, or Simoleon balance).
-pub fn format_status_badge(state: &TravelState) -> String {
-    match state.destination {
-        Destination::MagicTown => format!("MC {} | ${}", state.magic_coins, state.simoleons),
-        Destination::StudioTown => {
-            let half = state.studio_fame_half_stars.min(10);
-            format!("Fame {}.{}", half / 2, (half % 2) * 5)
-        }
-        Destination::VacationIsland => {
-            if state.vacation_has_no_vacancy {
-                format!("Full | ${}", state.simoleons)
-            } else {
-                format!("Vacancy | ${}", state.simoleons)
-            }
-        }
-        Destination::Downtown | Destination::OldTown => format!("${}", state.simoleons),
-    }
-}
-
 fn control_art_id(destination: Destination, control: TravelControl) -> Option<i32> {
-    match control {
-        TravelControl::ReturnHome => Some(destination.return_art_id()),
-        TravelControl::Bulldoze => Some(destination.bulldoze_art_id()),
-        TravelControl::ImportLot => Some(destination.import_art_id()),
-        TravelControl::SwitchDestination(Destination::Downtown) => Some(art_id::DEST_DOWNTOWN),
-        TravelControl::SwitchDestination(Destination::VacationIsland) => {
-            Some(art_id::DEST_VACATION)
-        }
-        TravelControl::SwitchDestination(Destination::OldTown) => Some(art_id::PHONE_NEIGHBORHOOD),
-        TravelControl::SwitchDestination(Destination::StudioTown) => Some(art_id::DEST_STUDIO_TOWN),
-        TravelControl::SwitchDestination(Destination::MagicTown) => Some(art_id::DEST_MAGIC_TOWN),
-        TravelControl::ToggleFilter(filter) => Some(filter.art_id()),
-        TravelControl::ToggleVacationLodging(_) => None,
-    }
-}
-
-fn control_short_label(control: TravelControl) -> &'static str {
-    match control {
-        TravelControl::ReturnHome => "Home",
-        TravelControl::Bulldoze => "Doze",
-        TravelControl::ImportLot => "Imp",
-        TravelControl::SwitchDestination(d) => d.short_label(),
-        TravelControl::ToggleFilter(f) => f.short_label(),
-        TravelControl::ToggleVacationLodging(l) => l.label(),
-    }
+    Some(match control {
+        TravelControl::ReturnHome => art_id::DOWNTOWN_RETURN,
+        TravelControl::Web => art_id::INET,
+        TravelControl::Credits => art_id::DOWNTOWN_LOGO,
+        TravelControl::ImportLot => destination.import_art_id(),
+        TravelControl::Bulldoze => art_id::DOWNTOWN_BULLDOZE,
+        TravelControl::MoveIn => art_id::MOVE_IN,
+        TravelControl::ToggleFilter(filter) => filter.art_id(),
+    })
 }
 
 /// Transport vehicle / portal shown in the travel confirmation dialog.
