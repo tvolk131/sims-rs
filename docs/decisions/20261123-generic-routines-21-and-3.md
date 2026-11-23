@@ -39,8 +39,9 @@ What was decided:
     check) is not modeled either. If it ever is, routine 3 has to close
     it.
 - **A test lists the routines still missing.**
-  - `crates/sims-vm/tests/generic_routines.rs` reads every tree in the
-    install. It runs each Generic Sims Call routine number they use on the
+  - `crates/sims-vm/tests/generic_routines.rs` reads the trees in every
+    IFF file the install's index lists and in the neighborhoods'
+    character files (not saved lots). It runs each Generic Sims Call routine number they use on the
     synthetic lot, and checks that the refused ones are exactly its
     `RESIDUALS` list.
   - There are 24 today: 0, 1, 4, 5, 13, 17, 19, 20, 22, 23, 24, 25, 27, 29,
