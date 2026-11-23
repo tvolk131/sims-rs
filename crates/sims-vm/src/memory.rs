@@ -232,9 +232,15 @@ impl Machine<'_, '_> {
     ///   0x415fc6 and 0x4164f6 clear it and select family 0 (0x415fd7,
     ///   0x416509), 0x4278f6 clears it and leaves the pointer, and the
     ///   game's start and end set the pointer alone (0x415bd2, 0x415d21,
-    ///   0x415ecd). The World keeps no pointer, so field 1 with global 9 at
-    ///   0 fails loudly. A record of a GUID with no definition fails, as
-    ///   the original would read through a null pointer.
+    ///   0x415ecd). The World keeps no pointer. With global 9 at 0 the
+    ///   port reads family 0's members through `family_zero_members`: the
+    ///   interpreter's active family when it is given one, else the World's
+    ///   family numbered 0. That is the family a load with no family for
+    ///   the house selects (0x428041 at 0x42827c..0x4282b7) and a solo
+    ///   arrival fills with the traveler (0x4f1c87..0x4f1cec). With
+    ///   neither, field 1 fails loudly. A record of a GUID with no
+    ///   definition fails, as the original would read through a null
+    ///   pointer.
     /// - 2: the record's person data word 58.
     /// - 3 and 4: 0.
     /// - 6: the house of the first family, in the families' order, whose
@@ -287,9 +293,7 @@ impl Machine<'_, '_> {
             }
             1 => {
                 let selected = self.world.globals.get(9).copied().unwrap_or(0);
-                // With global 9 at 0 the game holds the family numbered 0
-                // (0x428041 at 0x42827c..0x42830d), which a solo traveler
-                // leads (0x4f1c87..0x4f1cec).
+                // Global 9 at 0: family 0's members, as the doc above says.
                 let members = if selected == 0 {
                     crate::person_factory::family_zero_members(self.active_family, self.world)
                         .ok_or_else(|| {

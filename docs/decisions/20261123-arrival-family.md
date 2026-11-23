@@ -64,7 +64,9 @@ Both came from the port's arrival, not from the marker:
   - WholeFamily → `Family`;
   - HouseholdGroup → `Group`, which no native mode makes;
   - any party to Magic Town's residential 90–92 → `Group`, since
-    0x4f1ae9 makes no arrival there.
+    0x4f1ae9 makes no arrival there. A lot there zoned community takes
+    the arrival (0x4f1f9d checks zoning 2 before the lot number). The
+    check runs again on resume and return, ahead of the recorded value.
 - **Solo:** the destination loads with family number 0, then family 0 is
   made the traveler alone and given the home family's funds less the fare.
   Global 9 stays 0.

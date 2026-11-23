@@ -405,19 +405,34 @@ pub enum ArrivalFamily {
     Group,
 }
 
-/// Whether 0x4f1ae9 makes an arrival on `house` of `destination`: every
-/// destination but Magic Town's residential lots 90–92, which fall through
-/// its dispatch (0x4f1f9f..0x4f1fac, 93–99 only) to 0x4f23e3.
-fn has_native_arrival(destination: TravelDestination, house: u32) -> bool {
-    !(destination == TravelDestination::MagicTown && house < 93)
+/// Whether 0x4f1ae9 makes an arrival on `house` of `destination`, given the
+/// neighborhood's lot zoning: every destination but a Magic Town lot below
+/// 93 that is not zoned community. 0x4f1f9d takes zoning 2 to the arrival
+/// before the lot-number check at 0x4f1fa2 (93–99 only), and anything else
+/// falls through to 0x4f23e3.
+fn has_native_arrival(
+    destination: TravelDestination,
+    house: u32,
+    zoning: &BTreeMap<i16, i32>,
+) -> bool {
+    let community = i16::try_from(house)
+        .ok()
+        .and_then(|lot| zoning.get(&lot))
+        .is_some_and(|&zone| zone == 2);
+    !(destination == TravelDestination::MagicTown && house < 93 && !community)
 }
 
 impl ArrivalFamily {
     /// The arrival family of a departure of `party` to `house` of
-    /// `destination`.
+    /// `destination`, with the neighborhood's lot `zoning`.
     #[must_use]
-    pub fn of(party: &TravelParty, destination: TravelDestination, house: u32) -> Self {
-        if !has_native_arrival(destination, house) {
+    pub fn of(
+        party: &TravelParty,
+        destination: TravelDestination,
+        house: u32,
+        zoning: &BTreeMap<i16, i32>,
+    ) -> Self {
+        if !has_native_arrival(destination, house, zoning) {
             return Self::Group;
         }
         match party {
@@ -442,11 +457,12 @@ impl ArrivalFamily {
     fn derived(
         destination: TravelDestination,
         house: u32,
+        zoning: &BTreeMap<i16, i32>,
         is_date: bool,
         travelers: &[u32],
         household: &[u32],
     ) -> Self {
-        if !has_native_arrival(destination, house) {
+        if !has_native_arrival(destination, house, zoning) {
             return Self::Group;
         }
         match destination {
@@ -1480,15 +1496,22 @@ struct PersistedTravelRecord {
 }
 
 impl PersistedTravelRecord {
-    /// The trip's arrival family: the recorded one, or for a trip from
-    /// before version 3 the one [`ArrivalFamily::derived`] works out from
-    /// the household's members (`household`).
-    fn arrival_family(&self, household: &[u32]) -> ArrivalFamily {
+    /// The trip's arrival family: [`ArrivalFamily::Group`] where 0x4f1ae9
+    /// makes no arrival, whatever was recorded; else the recorded one, or
+    /// for a trip from before version 3 the one [`ArrivalFamily::derived`]
+    /// works out from the household's members (`household`). `zoning` is
+    /// the neighborhood's lot zoning.
+    fn arrival_family(&self, household: &[u32], zoning: &BTreeMap<i16, i32>) -> ArrivalFamily {
+        let (destination, house) = (self.session.destination, self.session.destination_house);
+        if !has_native_arrival(destination, house, zoning) {
+            return ArrivalFamily::Group;
+        }
         self.arrival.unwrap_or_else(|| {
             let travelers: Vec<u32> = self.session.travelers.iter().map(|t| t.guid).collect();
             ArrivalFamily::derived(
-                self.session.destination,
-                self.session.destination_house,
+                destination,
+                house,
+                zoning,
                 self.is_date,
                 &travelers,
                 household,
@@ -1969,7 +1992,12 @@ pub fn depart_to_destination(
         home_family,
     );
     let is_date = matches!(request.party, TravelParty::Date { .. });
-    let arrival = ArrivalFamily::of(&request.party, plan.destination, request.destination_house);
+    let arrival = ArrivalFamily::of(
+        &request.party,
+        plan.destination,
+        request.destination_house,
+        &staged_stored.zoning,
+    );
 
     // Boot destination lot in memory BEFORE committing REDB, so any destination
     // boot/injection failure rolls back cleanly with zero REDB/home mutations.
@@ -2212,7 +2240,7 @@ pub fn resume_active_trip(
         .get(&persisted.session.home_family)
         .map(|f| f.members.clone())
         .unwrap_or_default();
-    let arrival = persisted.arrival_family(&household);
+    let arrival = persisted.arrival_family(&household, &home_snapshot.neighborhood.zoning);
 
     let runtime = StoreRuntime::from_snapshot(
         install_root,
@@ -3058,10 +3086,11 @@ pub fn return_from_destination(
         .get(&session.home_family)
         .map(|f| f.members.clone())
         .unwrap_or_default();
-    let expected_family = match persisted.arrival_family(&household) {
-        ArrivalFamily::Solo => 0,
-        ArrivalFamily::Family | ArrivalFamily::Group => session.home_family,
-    };
+    let expected_family =
+        match persisted.arrival_family(&household, &home_snapshot.neighborhood.zoning) {
+            ArrivalFamily::Solo => 0,
+            ArrivalFamily::Family | ArrivalFamily::Group => session.home_family,
+        };
     if destination_lot.load.family != expected_family {
         return Err(TravelError::SessionMismatch(format!(
             "destination lot active family is {}, the trip's arrival holds family {}",
@@ -7090,28 +7119,22 @@ mod tests {
     /// keeps the portal placement.
     #[test]
     fn a_departure_asks_for_its_destinations_arrival() {
+        use TravelDestination::{Downtown, MagicTown};
         let single = TravelParty::Single { sim_guid: 1 };
         let family = TravelParty::WholeFamily { leader_guid: 1 };
-        let of = ArrivalFamily::of;
+        let residential = BTreeMap::from([(90, 1), (92, 1)]);
+        let of =
+            |party, destination, house| ArrivalFamily::of(party, destination, house, &residential);
+        assert_eq!(of(&single, Downtown, 21), ArrivalFamily::Solo);
+        assert_eq!(of(&single, MagicTown, 93), ArrivalFamily::Solo);
+        assert_eq!(of(&family, MagicTown, 93), ArrivalFamily::Family);
+        assert_eq!(of(&single, MagicTown, 90), ArrivalFamily::Group);
+        assert_eq!(of(&family, MagicTown, 92), ArrivalFamily::Group);
+        // A lot below 93 zoned community takes the arrival (0x4f1f9d).
+        let community = BTreeMap::from([(90, 2)]);
         assert_eq!(
-            of(&single, TravelDestination::Downtown, 21),
+            ArrivalFamily::of(&single, MagicTown, 90, &community),
             ArrivalFamily::Solo
-        );
-        assert_eq!(
-            of(&single, TravelDestination::MagicTown, 93),
-            ArrivalFamily::Solo
-        );
-        assert_eq!(
-            of(&family, TravelDestination::MagicTown, 93),
-            ArrivalFamily::Family
-        );
-        assert_eq!(
-            of(&single, TravelDestination::MagicTown, 90),
-            ArrivalFamily::Group
-        );
-        assert_eq!(
-            of(&family, TravelDestination::MagicTown, 92),
-            ArrivalFamily::Group
         );
     }
 
@@ -7122,7 +7145,10 @@ mod tests {
         use ArrivalFamily::{Family, Group, Solo};
         use TravelDestination::{Downtown, MagicTown, OldTown, StudioTown, VacationIsland};
         let household = [1, 2, 3];
-        let derived = ArrivalFamily::derived;
+        let zoning = BTreeMap::from([(90, 1)]);
+        let derived = |destination, house, is_date, travelers: &[u32], household: &[u32]| {
+            ArrivalFamily::derived(destination, house, &zoning, is_date, travelers, household)
+        };
         // Magic Town's community lots: from who traveled.
         assert_eq!(derived(MagicTown, 93, true, &[1, 9], &household), Solo);
         assert_eq!(derived(MagicTown, 93, false, &[2], &household), Solo);
