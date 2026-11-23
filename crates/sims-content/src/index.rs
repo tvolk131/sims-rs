@@ -1077,18 +1077,65 @@ pub fn far_members(path: &Path) -> Result<(Vec<Member>, Vec<String>)> {
 /// An archive member with the bytes of its name as the archive stores them.
 type RawMember = (Member, Vec<u8>);
 
+/// Opens `path` for reading with `O_NONBLOCK` where its value is known, so a
+/// FIFO does not block the open. The same flags as `sims-antics lift`'s input
+/// open. The later opens of indexed files (`Resource::read`, `catalog.rs`,
+/// `pool.rs`) still block if a FIFO replaces a file after indexing; that
+/// residual hangs rather than misreads (ADR 20261123-lift-cli-catalog-arities).
+fn open_nonblocking(path: &Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0x0004;
+        options.custom_flags(O_NONBLOCK);
+    }
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0x0800;
+        options.custom_flags(O_NONBLOCK);
+    }
+    options.open(path)
+}
+
 /// [`far_members`], each with the bytes of its name.
 fn archive_members(path: &Path) -> Result<(Vec<RawMember>, Vec<String>)> {
     let io = |e| Error::io(path, e);
-    // Opening a FIFO (e.g. a `*.far` pipe in Downloads) blocks until a writer
-    // appears, so anything but a regular file is refused before the open.
-    if !std::fs::metadata(path).map_err(io)?.is_file() {
-        return Err(io(std::io::Error::new(
+    let not_regular = || {
+        io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
-        )));
+        ))
+    };
+    // A blocking open of a FIFO (e.g. a `*.far` pipe in Downloads) waits for a
+    // writer. The open is non-blocking, and the opened handle must be a regular
+    // file (fstat), so a FIFO swapped in after the first check cannot block
+    // either. Regular files ignore O_NONBLOCK.
+    if !std::fs::metadata(path).map_err(io)?.is_file() {
+        return Err(not_regular());
     }
-    let mut file = File::open(path).map_err(io)?;
+    let mut file = open_nonblocking(path).map_err(io)?;
+    if !file.metadata().map_err(io)?.is_file() {
+        return Err(not_regular());
+    }
     let len = file.metadata().map_err(io)?.len();
     let mut header = [0; 16];
     file.read_exact(&mut header).map_err(io)?;

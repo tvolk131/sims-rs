@@ -194,34 +194,55 @@ impl ResolvedArities {
     }
 }
 
-/// How a lifted file matched the install index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How an opened file matched the install index.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceMatch {
     /// Exactly one index resource.
     Unique(usize),
-    /// Several index resources (e.g. one file reached through symlinks in two mounts),
-    /// which may give it different code-owner roles.
-    Ambiguous(usize),
-    /// Not in the index.
+    /// Several index resources are the same file (hard links, or symlinks into two
+    /// mounts), which may give it different code-owner roles.
+    Ambiguous(Vec<usize>),
+    /// No index resource is this file.
     Unindexed,
-    /// The path as written names an index entry, but resolves to a different file (a
-    /// symlinked directory before `..`), and the file actually opened is not indexed.
-    PathMismatch,
 }
 
-/// Lexically normalizes an absolute path: drops `.` and folds `..` into its parent.
-fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
+/// The identity of a file: `(device, inode)` on Unix. For an opened file it comes from
+/// the open handle (`fstat`), so a file replaced at the same path after it was read (an
+/// atomic save) is a different file, and so is a path that reaches another file through
+/// symlinks and `..`. Elsewhere it is the canonical path, which cannot see a replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileIdentity(#[cfg(unix)] (u64, u64), #[cfg(not(unix))] PathBuf);
+
+impl FileIdentity {
+    /// The identity of `file`, opened from `path`.
+    pub fn of_open(file: &std::fs::File, path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let _ = path;
+            let meta = file.metadata()?;
+            Ok(Self((meta.dev(), meta.ino())))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            Ok(Self(std::fs::canonicalize(path)?))
         }
     }
-    out
+
+    /// The identity of the file `path` names now (following symlinks).
+    pub fn of_path(path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(path)?;
+            Ok(Self((meta.dev(), meta.ino())))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self(std::fs::canonicalize(path)?))
+        }
+    }
 }
 
 /// An install's index and catalog, with `Global.iff` arities loaded and semi-global
@@ -234,6 +255,8 @@ pub struct InstallArityCatalog {
     global: Result<BTreeMap<u16, usize>, String>,
     global_location: String,
     semi_cache: BTreeMap<usize, Result<BTreeMap<u16, usize>, String>>,
+    /// Each index resource's file identity, taken when the catalog was built.
+    identities: Vec<Option<FileIdentity>>,
 }
 
 impl InstallArityCatalog {
@@ -252,6 +275,17 @@ impl InstallArityCatalog {
                 .entry(r.path.clone())
                 .or_insert_with(|| std::fs::metadata(&r.path).is_ok_and(|m| m.is_file()))
         });
+        let mut identity_of: BTreeMap<PathBuf, Option<FileIdentity>> = BTreeMap::new();
+        let identities = index
+            .resources
+            .iter()
+            .map(|r| {
+                identity_of
+                    .entry(r.path.clone())
+                    .or_insert_with(|| FileIdentity::of_path(&r.path).ok())
+                    .clone()
+            })
+            .collect();
         let pool = ArchivePool::new();
         let catalog =
             Catalog::build_with_pool(&index, &pool).map_err(|e| relative(e.to_string()))?;
@@ -276,6 +310,7 @@ impl InstallArityCatalog {
             global,
             global_location,
             semi_cache: BTreeMap::new(),
+            identities,
         })
     }
 
@@ -295,58 +330,33 @@ impl InstallArityCatalog {
         })
     }
 
-    /// The index resource for the file at `path`, or for its FAR member `name` at byte
-    /// `offset` when `member` is given. The path as given (then lexically normalized)
-    /// is tried first, but only accepted when that entry is the file actually opened:
-    /// `link/../X.iff` opens the `X.iff` beside the link's *target*, not the one the
-    /// lexical form names. Otherwise canonical paths are compared, and more than one
-    /// canonical match is [`ResourceMatch::Ambiguous`].
+    /// The index resources that are the file `identity`, or its FAR member `name` at
+    /// byte `offset` when `member` is given. Paths play no part: only an entry whose file
+    /// is the one actually read can supply its code-owner role.
     #[must_use]
-    pub fn resource_for(&self, path: &Path, member: Option<(&str, u64)>) -> ResourceMatch {
+    pub fn resource_for(
+        &self,
+        identity: &FileIdentity,
+        member: Option<(&str, u64)>,
+    ) -> ResourceMatch {
         let member_matches = |resource: &sims_content::Resource| match (&resource.member, member) {
             (None, None) => true,
             (Some(have), Some((name, offset))) => have.name == name && have.offset == offset,
             _ => false,
         };
-        let (Ok(given), Ok(canonical)) = (std::path::absolute(path), std::fs::canonicalize(path))
-        else {
-            return ResourceMatch::Unindexed;
-        };
-        let mut lexical_mismatch = false;
-        for logical in [given.clone(), normalize_lexically(&given)] {
-            if let Some(found) = self
-                .index
-                .resources
-                .iter()
-                .position(|r| member_matches(r) && r.path == logical)
-            {
-                if std::fs::canonicalize(&logical).is_ok_and(|c| c == canonical) {
-                    return ResourceMatch::Unique(found);
-                }
-                lexical_mismatch = true;
-            }
-        }
-        let mut canonical_of: BTreeMap<&Path, Option<PathBuf>> = BTreeMap::new();
         let matches: Vec<usize> = self
             .index
             .resources
             .iter()
+            .zip(&self.identities)
             .enumerate()
-            .filter(|(_, r)| {
-                member_matches(r)
-                    && canonical_of
-                        .entry(r.path.as_path())
-                        .or_insert_with(|| std::fs::canonicalize(&r.path).ok())
-                        .as_ref()
-                        == Some(&canonical)
-            })
+            .filter(|(_, (r, id))| member_matches(r) && id.as_ref() == Some(identity))
             .map(|(n, _)| n)
             .collect();
         match matches.as_slice() {
-            [] if lexical_mismatch => ResourceMatch::PathMismatch,
             [] => ResourceMatch::Unindexed,
             [one] => ResourceMatch::Unique(*one),
-            many => ResourceMatch::Ambiguous(many.len()),
+            _ => ResourceMatch::Ambiguous(matches),
         }
     }
 
@@ -374,23 +384,34 @@ impl InstallArityCatalog {
 
     /// Merged arities for `iff`, matched to the index as `matched`, following the
     /// code-owner rules in the module docs. A file outside the index gets only its
-    /// private range (it may come from another install); an ambiguous match gets only the
-    /// owner-independent global range.
+    /// private range (it may come from another install). A file indexed more than once
+    /// keeps an owner-dependent range only when every entry resolves it the same way;
+    /// otherwise it gets only the owner-independent global range.
     pub fn resolve(&mut self, matched: ResourceMatch, iff: &Iff) -> ResolvedArities {
-        let resource = match matched {
-            ResourceMatch::Unique(resource) => Some(resource),
+        match matched {
+            ResourceMatch::Unique(resource) => self.resolve_entry(resource, iff),
             ResourceMatch::Unindexed => {
-                return ResolvedArities::private_only(iff, "file not in install index");
+                ResolvedArities::private_only(iff, "file not in install index")
             }
-            ResourceMatch::PathMismatch => {
-                return ResolvedArities::private_only(
-                    iff,
-                    "path names an install index entry but opens a different, unindexed \
-                     file (symlink before `..`)",
+            ResourceMatch::Ambiguous(entries) => {
+                let mut each = entries.iter().map(|&r| self.resolve_entry(r, iff));
+                let first = each.next().expect("an ambiguous match has entries");
+                if each.all(|other| other == first) {
+                    return first;
+                }
+                let mut locations: Vec<String> = entries
+                    .iter()
+                    .map(|&r| self.index.resources[r].location(&self.index.root))
+                    .collect();
+                if locations.len() > 4 {
+                    let more = locations.len() - 3;
+                    locations.truncate(3);
+                    locations.push(format!("{more} more"));
+                }
+                let why = format!(
+                    "ambiguous: the same file is indexed as {}, with different code-owner roles",
+                    locations.join(" and ")
                 );
-            }
-            ResourceMatch::Ambiguous(count) => {
-                let why = format!("owner-dependent: file matches {count} install index entries");
                 let mut resolved = ResolvedArities {
                     arities: BTreeMap::new(),
                     private: ArityPart::missing(&why),
@@ -398,17 +419,20 @@ impl InstallArityCatalog {
                     semi_global: ArityPart::missing(&why),
                 };
                 self.apply_global(&mut resolved);
-                return resolved;
+                resolved
             }
-        };
-        let is_global = resource == Some(self.catalog.global);
-        let linked_by_others = resource.is_some_and(|r| {
-            self.catalog
-                .semi_globals
-                .iter()
-                .any(|(&owner, &target)| owner != r && target == Some(r))
-        });
-        let own_link = resource.and_then(|r| self.catalog.semi_globals.get(&r).copied());
+        }
+    }
+
+    /// Merged arities for `iff` as the index resource `resource`.
+    fn resolve_entry(&mut self, resource: usize, iff: &Iff) -> ResolvedArities {
+        let is_global = resource == self.catalog.global;
+        let linked_by_others = self
+            .catalog
+            .semi_globals
+            .iter()
+            .any(|(&owner, &target)| owner != resource && target == Some(resource));
+        let own_link = self.catalog.semi_globals.get(&resource).copied();
 
         let mut resolved = ResolvedArities {
             arities: BTreeMap::new(),
@@ -432,13 +456,12 @@ impl InstallArityCatalog {
             );
         }
 
-        let this = resource;
         match (is_global, own_link) {
             (true, _) => {
                 resolved.semi_global =
                     ArityPart::missing("owner-dependent: Global.iff runs under the calling object");
             }
-            (false, Some(Some(target))) if !linked_by_others || Some(target) == this => {
+            (false, Some(Some(target))) if !linked_by_others || target == resource => {
                 match self.semi_arities(target) {
                     Ok(map) => {
                         let location = self.index.resources[target].location(&self.index.root);

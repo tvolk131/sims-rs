@@ -11,8 +11,8 @@
 //! - `sims-antics build <pack_dir> --out <dir>`
 
 use sims_antics::arity_catalog::{
-    AritySource, GLOBAL_TREES, InstallArityCatalog, ResolvedArities, SEMI_GLOBAL_TREES,
-    bhav_arities_in_range,
+    AritySource, FileIdentity, GLOBAL_TREES, InstallArityCatalog, ResolvedArities,
+    SEMI_GLOBAL_TREES, bhav_arities_in_range,
 };
 use sims_antics::ir::BhavChunk;
 use sims_antics::{
@@ -396,6 +396,7 @@ struct ArityOptions {
 fn resolve_lift_arities(
     iff: &Iff,
     input_path: &Path,
+    input_identity: Option<&FileIdentity>,
     member: Option<(&str, u64)>,
     opts: &ArityOptions,
 ) -> Result<ResolvedArities, CliError> {
@@ -404,10 +405,16 @@ fn resolve_lift_arities(
     } else {
         match InstallArityCatalog::find_install_root(input_path) {
             Some(root) => match InstallArityCatalog::load(&root) {
-                Ok(mut catalog) => {
-                    let resource = catalog.resource_for(input_path, member);
-                    catalog.resolve(resource, iff)
-                }
+                Ok(mut catalog) => match input_identity {
+                    Some(identity) => {
+                        let resource = catalog.resource_for(identity, member);
+                        catalog.resolve(resource, iff)
+                    }
+                    None => ResolvedArities::private_only(
+                        iff,
+                        "could not identify the opened file (fstat failed)",
+                    ),
+                },
                 Err(err) => ResolvedArities::private_only(
                     iff,
                     &format!(
@@ -1071,6 +1078,9 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
 
     let safe_input_path = sanitize_path_display(&input_path);
     let (mut file, file_len, header) = read_regular_file_prefix(&input_path)?;
+    // The identity of the file the bytes are read from (fstat on this handle), so the
+    // catalog lookup can never match a different file now at this path.
+    let input_identity = FileIdentity::of_open(&file, &input_path).ok();
     let has_far_ext = input_path
         .extension()
         .and_then(|e| e.to_str())
@@ -1166,6 +1176,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
         resolve_lift_arities(
             &iff,
             &input_path,
+            input_identity.as_ref(),
             far_member
                 .as_ref()
                 .map(|(name, offset)| (name.as_str(), *offset)),

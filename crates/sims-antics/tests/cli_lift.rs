@@ -2295,13 +2295,13 @@ fn lift_through_symlink_uses_the_install_it_was_reached_from() {
     assert!(stdout.contains("// verify-equiv: Equivalent"), "{stdout}");
 }
 
-/// Path matching: a `..` path resolves to its logical index entry; a file reached only
-/// through a path outside the index that canonicalizes to two index entries (one of
-/// them in the global mount) keeps owner-dependent ranges unknown; an unindexed file
-/// under the install root gets private arities only.
+/// Index matching is by file identity: a `..` path finds its entry; a file reached
+/// through an outside symlink and indexed twice (as `Objects/Loose.iff` and a
+/// `Global/Shadow.iff` alias) resolves when both entries agree; an unindexed copy under
+/// the install root gets private arities only.
 #[cfg(unix)]
 #[test]
-fn lift_index_matching_is_logical_first_and_ambiguity_is_conservative() {
+fn lift_index_matching_uses_file_identity() {
     let install = SyntheticInstall::new();
     let objects = install.root.join("GameData").join("Objects");
     let loose = objects.join("Loose.iff");
@@ -2325,13 +2325,9 @@ fn lift_index_matching_is_logical_first_and_ambiguity_is_conservative() {
     assert!(ok, "stderr: {stderr}");
     assert!(
         stdout.contains("global 256..=4095: 2 from GameData/Global/Global.iff (install catalog)")
-            && stdout.contains(
-                "private 4096..=8191: none (owner-dependent: file matches 2 install index entries)"
-            )
-            && stdout.contains(
-                "semi-global 8192+: none (owner-dependent: file matches 2 install index entries)"
-            ),
-        "{stdout}"
+            && stdout.contains("private 4096..=8191: 3 from this file")
+            && stdout.contains("semi-global 8192+: none (no resolved GLOB link)"),
+        "both entries resolve the same way:\n{stdout}"
     );
 
     let scratch = install.root.join("scratch");
@@ -2493,10 +2489,73 @@ fn lift_symlink_then_dotdot_uses_the_opened_file_not_the_lexical_entry() {
     let (ok, stdout, stderr) = run_lift(&[via.as_os_str(), OsStr::new("--list")]);
     assert!(ok, "stderr: {stderr}");
     assert!(
-        stdout.contains(
-            "global 256..=4095: none (path names an install index entry but opens a different, unindexed file (symlink before `..`))"
-        ) && stdout.contains("private 4096..=8191: 3 from this file")
-            && stdout.contains("semi-global 8192+: none (path names an install index entry"),
+        stdout.contains("global 256..=4095: none (file not in install index)")
+            && stdout.contains("private 4096..=8191: 3 from this file")
+            && stdout.contains("semi-global 8192+: none (file not in install index)"),
         "{stdout}"
     );
+}
+
+/// `Objects/Global.iff` is a hard link to `Global/Global.iff`, and `Objects/link` points
+/// at `Global/sub`. Whether the file is opened directly or as `Objects/link/../Global.iff`
+/// (which names the object alias lexically), it is one file with two roles, so its
+/// owner-dependent ranges stay unknown and the header names both entries.
+#[cfg(unix)]
+#[test]
+fn lift_file_indexed_under_two_roles_is_ambiguous() {
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    let global = install.global_dir().join("Global.iff");
+    std::fs::hard_link(&global, objects.join("Global.iff")).expect("hard link Global.iff");
+    std::fs::create_dir_all(install.global_dir().join("sub")).expect("mkdir Global/sub");
+    std::os::unix::fs::symlink(install.global_dir().join("sub"), objects.join("link"))
+        .expect("symlink link");
+
+    let why = "ambiguous: the same file is indexed as GameData/Global/Global.iff and GameData/Objects/Global.iff, with different code-owner roles";
+    for input in [
+        global.clone(),
+        objects.join("link").join("..").join("Global.iff"),
+    ] {
+        let (ok, stdout, stderr) = run_lift(&[input.as_os_str(), OsStr::new("--list")]);
+        assert!(ok, "stderr: {stderr}");
+        assert!(
+            stdout
+                .contains("global 256..=4095: 2 from GameData/Global/Global.iff (install catalog)")
+                && stdout.contains(&format!("private 4096..=8191: none ({why})"))
+                && stdout.contains(&format!("semi-global 8192+: none ({why})")),
+            "{}:\n{stdout}",
+            input.display()
+        );
+    }
+}
+
+/// An atomic save replaces the file at a path with a new inode. The catalog lookup uses
+/// the identity of the handle the bytes were read from, so the replaced file never
+/// matches the new index entry.
+#[cfg(unix)]
+#[test]
+fn catalog_lookup_never_matches_a_file_replaced_after_reading() {
+    use sims_antics::arity_catalog::{FileIdentity, InstallArityCatalog, ResourceMatch};
+
+    let install = SyntheticInstall::new();
+    let objects = install.root.join("GameData").join("Objects");
+    let loose = objects.join("Loose.iff");
+    let read_handle = std::fs::File::open(&loose).expect("open Loose.iff");
+
+    let staged = objects.join("Loose.iff.saving");
+    std::fs::write(&staged, synthetic_object_iff(Some(b"TestGlobals"))).expect("stage");
+    std::fs::rename(&staged, &loose).expect("atomic replace");
+
+    let catalog = InstallArityCatalog::load(&install.root).expect("load catalog");
+    let read_identity = FileIdentity::of_open(&read_handle, &loose).expect("fstat");
+    assert_eq!(
+        catalog.resource_for(&read_identity, None),
+        ResourceMatch::Unindexed,
+        "the file that was read is no longer indexed"
+    );
+    let now = FileIdentity::of_path(&loose).expect("stat");
+    assert!(matches!(
+        catalog.resource_for(&now, None),
+        ResourceMatch::Unique(_)
+    ));
 }

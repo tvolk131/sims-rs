@@ -18,10 +18,16 @@ The `structured_equiv` corpus run resolved callee arities the way `sims_vm::inte
   - `Global.iff` knows only the global range. Its private and semi-global ranges are owner-dependent.
   - A semi-global IFF (some object links to it) knows its own semi-global range, since every owner that reaches it links to it. Its private range is owner-dependent. If the file also links to a different semi-global itself, its semi-global range is ambiguous and stays unknown.
   - A file under the install root but outside its index (a scratch copy) knows only its private range.
-  - A path that matches more than one index entry only through symlinks (for example a file mounted both as an object and in the global directory) keeps its private and semi-global ranges unknown, since the owner depends on which entry the game loaded.
+  - A file indexed more than once (hard links, or symlinks into two mounts) is resolved as each entry. If every entry gives the same arities and sources, that result stands. Otherwise its private and semi-global ranges stay unknown, and the header names the entries (`ambiguous: the same file is indexed as … and …`), since the owner depends on which entry the game loaded.
   - This is stricter than the self-fallback the corpus used before. It leaves the Complete Collection numbers unchanged: on real data the looser rule never changed an arity.
 - **Duplicate IDs.** The VM's library loader keeps the last physical BHAV chunk of an ID, deleted ones included. The original's loader skips deleted chunks. The extractor therefore reads every parseable chunk and leaves an ID unknown when its chunks disagree on arity. That is sound under either rule.
-- **Auto-discovery.** `lift` walks up from the input path *as given* to the nearest install root (`Install::detect`), so a symlink into another install still uses the install it was reached from. Only after that does it try the canonical path. It then matches the input to its index resource: exact path first, then the lexically normalized path (so `Objects/sub/../X.iff` is `Objects/X.iff`), then the canonical path. An exact or lexical match counts only when that entry is the file actually opened: if `Objects/link` is a symlink to `Objects/actual/sub`, then `Objects/link/../X.iff` opens `Objects/actual/X.iff`, which can have a different `GLOB`. When the opened file is not indexed, only its private range is known, and the header says why. It matches the loose file, or the FAR path plus member name and offset. Only regular files enter the catalog, so a FIFO or socket in a mount such as `Downloads/` cannot block discovery. `sims_content` index building likewise refuses to open a `*.far` that is not a regular file, and records a diagnostic, as it does for any unreadable archive. Catalog errors name paths as `<install>/…`. A `Global.iff` that fails to load leaves only the global range unknown; semi-global links still resolve. On the Complete Collection this adds about 0.4 s.
+- **Auto-discovery and file identity.**
+  - `lift` walks up from the input path *as given* to the nearest install root (`Install::detect`), so a symlink into another install still uses the install it was reached from. Only after that does it try the canonical path.
+  - The input is opened once. Its bytes are read from that handle, and its identity is taken from the same handle with `fstat`: `(device, inode)` on Unix. At catalog load, every index entry's file is `stat`ed the same way. The input matches the entries with its identity (plus member name and offset inside a FAR), never by path.
+  - This closes the path cases. `Objects/link/../X.iff` opens the `X.iff` beside the link's target, which can have a different `GLOB`, and a hard link or symlink can give one file two roles. It also closes an atomic save between the read and the lookup: the replaced file is a different inode, so it finds no entry and gets private arities only.
+  - Off Unix, the identity is the canonical path, which cannot see a replacement.
+  - Only regular files enter the catalog, so a FIFO or socket in a mount such as `Downloads/` cannot block discovery. `sims_content` index building opens each `*.far` with `O_NONBLOCK` and refuses the handle unless `fstat` says it is a regular file, recording a diagnostic as it does for any unreadable archive.
+  - Catalog errors name paths as `<install>/…`. A `Global.iff` that fails to load leaves only the global range unknown; semi-global links still resolve. On the Complete Collection this adds about 0.4 s.
 - **Overrides.**
   - `--globals <Global.iff | archive.far[!member.iff]>`: a FAR without `!member` defaults to `Global.iff`.
   - `--semiglobal <file.iff | archive.far!member.iff>`.
@@ -42,6 +48,11 @@ The `structured_equiv` corpus run resolved callee arities the way `sims_vm::inte
 
 - `lift Objects.far --entry Fridges.iff`: **51/51 structured, 51/51 `Equivalent`** (strict and `--relax-padding`). Previously 43/51 + 8 labeled-CFG.
 - `--no-catalog` reproduces the old 43/51. Each of the 8 fallbacks now reads, for example, `node 0 calls global tree 280 with inline operands but its arity is unknown; global arities not loaded (--no-catalog); pass --globals <Global.iff>`.
+
+## Residuals
+
+- `sims_content` opens indexed files again later with blocking opens: `Resource::read`, the catalog scan (`catalog.rs`) and the archive pool (`pool.rs`). A FIFO that replaces a file between indexing and those opens makes them hang. They never misread, and changing them is out of scope here.
+- Between the catalog's `stat` of an entry and its own read of that entry, a replacement can still change what the catalog read (for example a `GLOB` link). This window is inside catalog loading, not between the lifted file's read and its lookup.
 
 ## Declined
 
