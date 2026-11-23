@@ -75,6 +75,7 @@ use sims_sim::animator::{Animator, HeldPose, Layer};
 use std::collections::BTreeSet;
 
 mod dynamic;
+pub(crate) use dynamic::unlink_tile_force;
 mod find;
 pub(crate) use find::Rules;
 pub(crate) use find::{
@@ -1165,7 +1166,7 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    fn clear_portal_if_unoccupied(
+    pub(crate) fn clear_portal_if_unoccupied(
         &self,
         world: &mut World,
         id: u16,
@@ -1229,7 +1230,9 @@ impl Interpreter<'_> {
         if self.has_function(world, id, SEAT) {
             self.seats_beside(world, forward(was, old_facing).map_err(fail)?)?;
         }
-        if let Some(parent) = parent {
+        if let Some(parent) = parent
+            && world.objects.contains_key(&parent)
+        {
             self.callback(world, parent, function::PLACED, 0)?;
         }
         // 0x4332b7: the door test reads the definition the object stands
@@ -1941,7 +1944,7 @@ impl Interpreter<'_> {
 
     /// 0x4481eb, for an object in a Sim's head slot: for a person, the object
     /// in its own head slot instead (record 2; none, nothing happens). Then by
-    /// the first object's GUID: an indicator or pooled star marker
+    /// the target object's GUID: an indicator or pooled star marker
     /// (`STAR_MARKER`, `0xE933_7020`) leaves the lot unannounced (virtual
     /// function 0x50 with 0), which also returns a star marker to the
     /// available pool (`0x448338..0x4483e0`); any other does nothing.
@@ -1952,7 +1955,6 @@ impl Interpreter<'_> {
             trap,
         };
         let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
-        let guid = object.guid;
         let target = if self.words(world, id).map_err(fail)?[word::TYPE] == 2 {
             object
                 .slots
@@ -1964,7 +1966,10 @@ impl Interpreter<'_> {
         let Some(target) = target else {
             return Ok(());
         };
-        if guid == STAR_MARKER || INDICATORS.contains(&guid) {
+        let Some(target_guid) = world.objects.get(&target).map(|o| o.guid) else {
+            return Ok(());
+        };
+        if target_guid == STAR_MARKER || INDICATORS.contains(&target_guid) {
             self.take_off(world, target, false)?;
         }
         Ok(())
@@ -2027,10 +2032,14 @@ impl Interpreter<'_> {
         }
         let parts = self.parts(world, id).map_err(fail)?;
         for &part in &parts {
-            self.callback(world, part, function::LEAVING, 0)?;
+            if world.objects.contains_key(&part) {
+                self.callback(world, part, function::LEAVING, 0)?;
+            }
         }
         for &part in &parts {
-            self.take_off_one(world, part, notify)?;
+            if world.objects.contains_key(&part) {
+                self.take_off_one(world, part, notify)?;
+            }
         }
         Ok(())
     }

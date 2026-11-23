@@ -161,13 +161,73 @@ impl Interpreter<'_> {
             Some(parent as u16)
         };
         unlink_tile(world, id).map_err(fail)?;
-        if let Some(rest) = rest {
+        if let Some(rest) = rest
+            && world.objects.contains_key(&rest)
+        {
             self.find_neighbours(world, rest)?;
         }
-        if stands_on_lot(world, id).map_err(fail)? {
+        if world.objects.contains_key(&id) && stands_on_lot(world, id).map_err(fail)? {
             self.find_neighbours(world, id)?;
         }
         Ok(())
+    }
+}
+
+/// Best-effort, callback-free unlink of tile `id` from any multipart group
+/// chain, used by Play Mode recovery when `leave_group` or `remove_now` faults
+/// on a damaged group. Never fails or loops even on broken links.
+pub(crate) fn unlink_tile_force(world: &mut World, id: u16) {
+    let next = world.next_parts.remove(&id);
+    // Splice any predecessor pointing to `id` directly to `next` (avoiding self-loop).
+    let preds: Vec<u16> = world
+        .next_parts
+        .iter()
+        .filter_map(|(&k, &v)| (v == id).then_some(k))
+        .collect();
+    for pred in preds {
+        match next {
+            Some(n) if n != pred && n != id => {
+                world.next_parts.insert(pred, n);
+            }
+            _ => {
+                world.next_parts.remove(&pred);
+            }
+        }
+    }
+    let was_lead = world
+        .objects
+        .get(&id)
+        .and_then(|o| o.multipart.as_ref())
+        .is_some_and(|m| m.parent == 0);
+    if let Some(part) = world
+        .objects
+        .get_mut(&id)
+        .and_then(|o| o.multipart.as_mut())
+    {
+        part.parent = 0;
+    }
+    if was_lead {
+        let new_lead = next.filter(|&n| n != id && world.objects.contains_key(&n));
+        let id_i16 = id as i16;
+        for (&other_id, obj) in &mut world.objects {
+            if let Some(part) = obj.multipart.as_mut()
+                && part.parent == id_i16
+            {
+                part.parent = match new_lead {
+                    Some(lead) if other_id == lead => 0,
+                    Some(lead) => lead as i16,
+                    None => 0,
+                };
+            }
+        }
+        if let Some(lead) = new_lead
+            && let Some(part) = world
+                .objects
+                .get_mut(&lead)
+                .and_then(|o| o.multipart.as_mut())
+        {
+            part.parent = 0;
+        }
     }
 }
 

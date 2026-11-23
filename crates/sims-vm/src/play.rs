@@ -62,12 +62,14 @@
 //! - A frame of the house view that fails is skipped, and noted in
 //!   [`crate::Update::frame_errors`] with the tick it was drawn before or
 //!   after.
-//!
-//! Only an object's tick and the frames are caught. A fault anywhere else
-//! in the update (the registry's dialogs and removals, the clock) still
-//! halts the lot, as in strict mode. The failure then carries what the
-//! step did before it: the errors caught, a skipped frame before the
-//! first tick, and the sounds ([`crate::boot::StepError::Tick`]).
+//! - Faults during `end_of_update` (queued removals, dynamic-group unlinks,
+//!   dialog-owning removals, deferred `+0x109` partial-pass person removals,
+//!   unported/non-modal dialogs, and resident reselection) and midnight daily
+//!   rollover (`daily::turn_day`, `day_statistics`, grass growth) are caught
+//!   in [`crate::Update::errors`] and cleaned up safely (force-removing a
+//!   faulting queued object without leaving dangling references) rather than
+//!   halting the lot. Missing required clock/scheduler globals and unanswered
+//!   player dialogs/special panels still stop the step as before.
 
 use crate::fault::Fault;
 use std::collections::BTreeSet;

@@ -1607,12 +1607,13 @@ impl Lot {
 
     /// Runs the next tick in play mode ([`crate::play`]): an error in an
     /// object's tick, such as an unported primitive, resets the object as
-    /// the original does on a SimAntics error, and the lot goes on. The
-    /// errors caught are in [`Update::errors`]. A frame that fails is
-    /// skipped and noted in [`Update::frame_errors`]. Any other failure
-    /// ends the step as in [`Lot::step`]. A lot update that fails
-    /// ([`StepError::Tick`]) halts the lot, and carries what the step did
-    /// before it failed.
+    /// the original does on a SimAntics error, and the lot goes on. Faults
+    /// during end-of-update removals, resident reselection, and midnight
+    /// daily rollover are caught in [`Update::errors`] and cleaned up safely
+    /// (force-removing faulting queued objects without dangling references)
+    /// rather than halting the lot. A frame that fails is skipped and noted
+    /// in [`Update::frame_errors`]. Missing required globals or unanswered
+    /// dialogs still stop the step as in [`Lot::step`].
     ///
     /// Play mode is not the original's behaviour wherever a caught error
     /// comes from something not ported, so a lot stepped this way is not

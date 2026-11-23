@@ -594,3 +594,144 @@ fn deleting_an_object_that_a_person_is_routing_to_succeeds_without_trapping() {
     assert_eq!(interpreter.create(&mut world, WIDGET), Ok(2));
     assert_eq!(world.routing.routes[&9].contexts[0].target, u16::MAX);
 }
+
+fn place_test_person(fx: &mut Fixture, person_id: u16) {
+    fx.add(SIM_FILE, 4096, sleeper());
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .callbacks
+        .insert(
+            128,
+            vec![
+                ObjectFunction {
+                    condition: 0,
+                    action: 0,
+                },
+                ObjectFunction {
+                    condition: 0,
+                    action: 4096,
+                },
+            ],
+        );
+    let position = [2 * 16 + 8, 3 * 16 + 8, 1];
+    let room = fx.world.room_at(position).unwrap();
+    let sim = fx.add_sim(person_id);
+    sim.position = position;
+    sim.data[29] = room;
+    (sim.data[2], sim.data[3], sim.data[14], sim.data[26]) = (0, -1, -1, 0);
+    sim.slots = vec![
+        Slot {
+            unknown: 0,
+            object: 0,
+        };
+        6
+    ];
+    sim.person.as_mut().unwrap().data[73] = 0;
+    fx.program
+        .people
+        .profiles
+        .insert(SIM_GUID, sims_content::Profile::default());
+    let cell = ((2 * 64 + 3) * 2) as usize;
+    fx.world.arrays.get_mut(&3).unwrap().data[cell..cell + 2]
+        .copy_from_slice(&person_id.to_le_bytes());
+}
+
+#[test]
+fn deleting_a_person_releases_head_slot_indicator_instead_of_deleting_it() {
+    let (mut fx, _) = crate::visits::lot();
+    let person_id = 50u16;
+    place_test_person(&mut fx, person_id);
+
+    let interpreter = fx.interpreter();
+    let mut world = fx.world.clone();
+    // Create the lot's indicator pair (`world.indicators = [first, second]`).
+    let [first, _second] = interpreter.create_indicators(&mut world).unwrap();
+    // Put the first indicator into `person_id`'s head slot (slot 2) while
+    // `selected == false` (modeling a date marker / star marker / stale head slot).
+    world.objects.get_mut(&person_id).unwrap().selected = false;
+    world.objects.get_mut(&person_id).unwrap().slots[2].object = first as i16;
+    world.objects.get_mut(&first).unwrap().data[2] = person_id as i16;
+    world.objects.get_mut(&first).unwrap().data[3] = 1;
+    world.objects.get_mut(&first).unwrap().data[14] = 2;
+    world.objects.get_mut(&first).unwrap().data[26] = person_id as i16;
+
+    // Removing `person_id` releases `first` off-lot (`0x4481eb`) rather than
+    // deleting it in `delete_one`'s held-children walk (`0x4410e7`).
+    assert_eq!(interpreter.remove_now(&mut world, person_id), Ok(()));
+    assert!(!world.objects.contains_key(&person_id));
+    assert!(
+        world.objects.contains_key(&first),
+        "indicator {first} must survive person deletion"
+    );
+    assert_eq!(world.indicators[0], first);
+    assert_eq!(world.objects[&first].data[2], 0);
+    assert_eq!(world.objects[&first].position, [-16, -16, 1]);
+}
+
+#[test]
+fn deleting_an_object_skips_stale_missing_targets_in_person_queues() {
+    let (mut fx, _) = lot(2, false);
+    fx.add_sim(9);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&9)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    let mut stale_icon_match = person.last.clone();
+    // Queued action whose icon is widget 2 (about to be deleted), while its
+    // target 383 is already absent from `world.objects`.
+    stale_icon_match.target = 383;
+    stale_icon_match.icon = 2;
+    stale_icon_match.uid = 10;
+    let mut stale_direct = person.last.clone();
+    stale_direct.target = 383;
+    stale_direct.icon = 383;
+    stale_direct.uid = 11;
+    person.queue = vec![stale_icon_match, stale_direct];
+
+    let interpreter = fx.interpreter();
+    let mut world = fx.world.clone();
+    // `drop_references` -> `filter_queue` drops the action naming widget 2 as
+    // icon without throwing `object 383: missing object (native error 0x0a)`.
+    assert_eq!(interpreter.delete(&mut world, 2), Ok(()));
+    assert!(!world.objects.contains_key(&2));
+    let remaining_uids: Vec<i32> = world.objects[&9]
+        .person
+        .as_ref()
+        .unwrap()
+        .queue
+        .iter()
+        .map(|a| a.uid)
+        .collect();
+    assert_eq!(remaining_uids, [11]);
+
+    // And deleting a person whose queue contains a stale missing target 383
+    // (`delete_one` -> `reset_person_to_delete` -> `reset_marked`) skips 383
+    // cleanly without throwing `native error 0x0a`.
+    let (mut fx2, _) = crate::visits::lot();
+    let person_id = 50u16;
+    place_test_person(&mut fx2, person_id);
+    let p2 = fx2
+        .world
+        .objects
+        .get_mut(&person_id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    let mut stale = p2.last.clone();
+    stale.target = 383;
+    stale.icon = 383;
+    stale.uid = 12;
+    p2.queue = vec![stale];
+
+    let interp2 = fx2.interpreter();
+    let mut world2 = fx2.world.clone();
+    assert_eq!(interp2.remove_now(&mut world2, person_id), Ok(()));
+    assert!(!world2.objects.contains_key(&person_id));
+}
