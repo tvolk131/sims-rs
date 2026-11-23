@@ -139,18 +139,22 @@ fn the_generic_routines_the_install_calls_are_ported_or_listed() {
     // The neighborhoods' character files, which a lot's load adds to its
     // index (`Index::add_characters`: the Characters folder found whatever
     // its case, walked recursively, archives' members included) but
-    // `Index::build` does not. A neighborhood is a folder whose name starts
-    // with "UserData"; one without a Characters folder has none. A folder
-    // that cannot be listed or a neighborhood that cannot be opened fails
-    // the test.
+    // `Index::build` does not. A neighborhood is a folder named UserData or
+    // UserData2 to UserData8, whatever the case, the folders the game's
+    // neighborhoods live in; one without a Characters folder has none. A
+    // folder that cannot be listed, a neighborhood that cannot be opened and
+    // a Characters entry that is no folder fail the test.
     let neighborhoods: Vec<PathBuf> = sorted_paths(&root)
         .expect("list the install")
         .into_iter()
         .filter(|p| {
             p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.to_ascii_lowercase().starts_with("userdata"))
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    let n = n.to_ascii_lowercase();
+                    n == "userdata"
+                        || n.strip_prefix("userdata")
+                            .is_some_and(|d| matches!(d, "2" | "3" | "4" | "5" | "6" | "7" | "8"))
+                })
         })
         .collect();
     let shown = |path: &Path| {
@@ -162,7 +166,12 @@ fn the_generic_routines_the_install_calls_are_ported_or_listed() {
     let mut characters = 0;
     for neighborhood in neighborhoods {
         let folder = match Neighborhood::open(&neighborhood).and_then(|n| n.characters()) {
-            Ok(Some(folder)) => folder,
+            Ok(Some(folder)) if folder.is_dir() => folder,
+            Ok(Some(folder)) => {
+                // `Index::add_characters` would skip it without a word.
+                unread.push(format!("{}: not a folder", shown(&folder)));
+                continue;
+            }
             Ok(None) => continue,
             Err(e) => {
                 unread.push(format!("{}: {e}", shown(&neighborhood)));

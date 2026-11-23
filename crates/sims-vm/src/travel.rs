@@ -2176,6 +2176,22 @@ pub fn abort_active_trip(
             }
         }
     }
+    // A Downtown date (the only Downtown party of two) left the
+    // companion's token in the leader's inventory at departure
+    // ([`write_companion_token`]). An aborted trip never reaches the arrival
+    // marker that takes it, so it goes back with the trip, as a hotel key
+    // the trip granted does; otherwise the leader's next trip would bring
+    // the companion along.
+    if auth_session.destination == TravelDestination::Downtown
+        && let [leader, companion] = auth_session.travelers.as_slice()
+    {
+        clear_stored_inventory_token(
+            &mut updated_stored,
+            leader.neighbor_id,
+            COMPANION_TOKEN_KIND,
+            companion.guid,
+        );
+    }
 
     let home_runtime = StoreRuntime::from_snapshot(
         install_root,

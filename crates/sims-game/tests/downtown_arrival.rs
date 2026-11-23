@@ -150,28 +150,7 @@ fn the_middle_ped_marker_brings_back_a_date() {
     arrive(
         "sims-downtown-date",
         |game, leader| {
-            // An adult of another family.
-            let world = game.lot().world();
-            let family = world
-                .neighbors
-                .first_of(leader)
-                .expect("the leader's record")
-                .data[FAMILY];
-            let guid = world
-                .neighbors
-                .slots
-                .iter()
-                .flatten()
-                .find(|n| {
-                    n.guid != leader
-                        && n.data.len() > KIND
-                        && n.data[FAMILY] != 0
-                        && n.data[FAMILY] != family
-                        && n.data[AGE] >= 18
-                        && (0..=1).contains(&n.data[KIND])
-                })
-                .expect("an adult of another family")
-                .guid;
+            let guid = date_for(game, leader);
             companion_guid.set(guid);
             TravelRequest::downtown_date(DOWNTOWN_LOT, leader, guid)
         },
@@ -184,19 +163,11 @@ fn the_middle_ped_marker_brings_back_a_date() {
                 .map(|o| o.id)
                 .expect("the companion is on the lot");
             let leader_guid = world.objects[&traveler].guid;
-            let record = world
-                .neighbors
-                .first_of(leader_guid)
-                .expect("leader record");
-            let tokens = world
-                .neighbors
-                .inventories
-                .iter()
-                .filter(|i| i.neighbor == record.id)
-                .flat_map(|i| &i.items)
-                .filter(|t| t.kind == COMPANION_TOKEN)
-                .count();
-            assert_eq!(tokens, 0, "routine 19 left the companion's token");
+            assert_eq!(
+                companion_tokens(game, leader_guid),
+                0,
+                "routine 19 left the companion's token"
+            );
             // Node 26 marks the companion, node 16 links it to the leader.
             assert_eq!(person_word(game, companion, PETS_OUTSIDE), 1);
             assert_eq!(
@@ -205,5 +176,101 @@ fn the_middle_ped_marker_brings_back_a_date() {
                 "the companion's DateFlag does not name the leader"
             );
         },
+    );
+}
+
+/// An adult human of another family than `leader`'s, from the lot's
+/// neighbor records.
+fn date_for(game: &sims_game::Game, leader: u32) -> u32 {
+    let world = game.lot().world();
+    let family = world
+        .neighbors
+        .first_of(leader)
+        .expect("the leader's record")
+        .data[FAMILY];
+    world
+        .neighbors
+        .slots
+        .iter()
+        .flatten()
+        .find(|n| {
+            n.guid != leader
+                && n.data.len() > KIND
+                && n.data[FAMILY] != 0
+                && n.data[FAMILY] != family
+                && n.data[AGE] >= 18
+                && (0..=1).contains(&n.data[KIND])
+        })
+        .expect("an adult of another family")
+        .guid
+}
+
+/// The kind-1 tokens in `guid`'s neighbor inventory.
+fn companion_tokens(game: &sims_game::Game, guid: u32) -> usize {
+    let world = game.lot().world();
+    let record = world.neighbors.first_of(guid).expect("a neighbor record");
+    world
+        .neighbors
+        .inventories
+        .iter()
+        .filter(|i| i.neighbor == record.id)
+        .flat_map(|i| &i.items)
+        .filter(|t| t.kind == COMPANION_TOKEN)
+        .count()
+}
+
+#[test]
+fn an_aborted_date_takes_back_the_companion_token() {
+    let Some(root) = install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to run the Downtown arrival test");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("sims-downtown-abort-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let open = || {
+        let mut shell = NeighborhoodShell::open(
+            root.clone(),
+            dir.join("saves.redb"),
+            1,
+            true,
+            vec![3],
+            Frames::default(),
+        )
+        .expect("open the neighborhood");
+        shell.resize([1024, 768]);
+        shell
+    };
+    let mut shell = open();
+    shell.enter_lot(5).expect("enter the Goth house");
+    let game = shell.game_mut().expect("active lot");
+    assert_eq!(game.run(30), 30);
+    let leader = {
+        let world = game.lot().world();
+        world.objects[&world.selected().expect("selected Goth Sim")].guid
+    };
+    let companion = date_for(game, leader);
+    shell
+        .depart_to_destination(TravelRequest::downtown_date(
+            DOWNTOWN_LOT,
+            leader,
+            companion,
+        ))
+        .expect("travel Downtown");
+    // The token is there on arrival, before the marker takes it.
+    assert_eq!(
+        companion_tokens(shell.game_mut().expect("the Downtown lot"), leader),
+        1
+    );
+    drop(shell);
+
+    let mut shell = open();
+    assert_eq!(shell.abort_active_trip(5).expect("abort the trip"), 5);
+    shell.enter_lot(5).expect("enter the Goth house again");
+    let game = shell.game_mut().expect("the Goth house again");
+    assert_eq!(
+        companion_tokens(game, leader),
+        0,
+        "the aborted date kept its token"
     );
 }

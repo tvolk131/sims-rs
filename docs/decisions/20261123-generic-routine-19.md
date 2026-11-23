@@ -54,11 +54,15 @@ What was decided:
   Departure now does what that operation does (0x455437) to the leader's
   inventory: every kind-1 token is erased and one is added with count 1
   and the companion's GUID. Without it the marker took the no-companion
-  branch on a date.
+  branch on a date. An aborted date (Abort Trip, our recovery, not the
+  original's) takes the token back, as it takes back a hotel key the trip
+  granted; otherwise the leader's next trip would bring the companion.
 - **The residual scan reads character files as a lot's load does.** It
-  adds each neighborhood's Characters folder with `Index::add_characters`
-  (found whatever its case, subfolders and archives included), so a tree
-  in `Characters/Imported/` or a character archive is scanned too.
+  adds the Characters folder of each neighborhood (UserData, UserData2 to
+  UserData8) with `Index::add_characters` (found whatever its case,
+  subfolders and archives included), so a tree in `Characters/Imported/`
+  or a character archive is scanned too. A Characters entry that is no
+  folder fails the scan rather than being skipped.
 - **Routine 19 comes off the residuals.** `RESIDUALS` in
   `crates/sims-vm/tests/generic_routines.rs` now lists 23 routines.
 
@@ -85,6 +89,8 @@ How it was checked:
   token, and that the marker marked the companion (PetsOutside 1) and set
   its DateFlag to the leader. Without the departure token it fails on the
   companion's PetsOutside.
+- A third test departs on a date, reopens the neighborhood, aborts the
+  trip and checks the leader holds no kind-1 token.
 - The Goth house's 43,200-tick hash is unchanged.
 
 **Unverified:**
@@ -95,6 +101,15 @@ How it was checked:
   runs. Whether the original also places the companion at arrival, as
   the headless date does, or leaves it to routine 19 to make, is part of
   that follow-up.
+- **A traveler other than the family's first member is never placed.**
+  The marker finds the arriving Sim with Generic Sims Call 18, which
+  names the first member of the game's family (0x4e97dc(0)). On Downtown
+  our family is still the whole household, Mortimer first, so a solo trip
+  by Bella leaves her where she arrives: PetsOutside stays 0 and nothing
+  after node 2 runs. The original lets any adult go Downtown, so it must
+  give the destination a family the traveler leads; which rule it uses is
+  not yet found. The date test uses the household's first member for
+  this reason. That is a travel follow-up.
 - The traveler jumps back about 16 ticks after the marker places it. The
   Sim's walk keeps its own position (see the Magic Town note,
   `20261123-generic-routines-21-and-3.md`). That is the arrival-hold
