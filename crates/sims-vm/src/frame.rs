@@ -149,6 +149,9 @@ impl Interpreter<'_> {
             }
         }
         self.update_pending_rooms(world)?;
+        // 0x4a8b12: the interface's indicator refresh, before the list of
+        // objects to draw is rebuilt.
+        self.refresh_indicators(world)?;
         let people: Vec<u16> = world
             .order
             .iter()

@@ -1356,9 +1356,8 @@ impl App {
     }
 
     fn photo(&mut self) {
-        // Match the mouse Camera Snapshot button (`hud.rs:998`): close the
-        // Camera strip before rendering so Large crops never capture the
-        // Camera controls themselves.
+        // Close the Camera strip first, as a Camera Mode lot click does;
+        // the photo itself is the house view alone (`Game::take_photo`).
         let closed_camera = self
             .session
             .game_mut()
@@ -1366,9 +1365,8 @@ impl App {
         self.session.render();
         let path = PathBuf::from(format!("sims-game-{}.png", self.photos));
         self.photos += 1;
-        let bytes = if let Some(game) = self.session.game() {
-            let cropped = game.capture_snapshot_canvas();
-            png::encode(&cropped)
+        let bytes = if let Some(game) = self.session.game_mut() {
+            png::encode(&game.take_photo())
         } else {
             png::encode(self.session.canvas())
         };

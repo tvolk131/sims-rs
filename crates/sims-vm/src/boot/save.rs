@@ -33,16 +33,16 @@ use sims_sim::{
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Earliest [`Saved::encode`] layout version supported by the explicit forward
-/// schema migration chain ([`SAVED_MIGRATIONS`]: `6 -> 7 -> 8 -> 9`).
+/// schema migration chain ([`SAVED_MIGRATIONS`]: `6 -> 7 -> ... -> 11`).
 pub const MIN_FORMAT: u32 = 6;
 
 /// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
 /// their order and their types (postcard is not self-describing). Bump it
 /// in the commit that changes any of them. The world inside is versioned
 /// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. Formats in
-/// [`MIN_FORMAT`]..=[`FORMAT`] (`6..=9`) with matching [`sims_sim::SNAPSHOT_FORMAT`]
+/// [`MIN_FORMAT`]..=[`FORMAT`] (`6..=11`) with matching [`sims_sim::SNAPSHOT_FORMAT`]
 /// are upgraded deterministically through [`SAVED_MIGRATIONS`]; older (`< 6`),
-/// future (`> 9`), or mismatched world-format saves are refused cleanly. Layout 2
+/// future (`> 11`), or mismatched world-format saves are refused cleanly. Layout 2
 /// keeps each pending dialog answer's bitmap ID ([`crate::Answer`]); layout 3
 /// kept the pre-resolved house view centre; layout 4 keeps the house file's saved
 /// floor rotation baseline (`HOUS 0` `camera_direction & 3`); layout 5
@@ -56,11 +56,18 @@ pub const MIN_FORMAT: u32 = 6;
 /// deleted character GUID never revives stale instances on older saved lots;
 /// layout 8 keeps the unencoded auxiliary portrait, outfit, lazy-index,
 /// and scratch-pointer tables omitted from [`World::encode`]; layout 9 keeps
-/// layout 9 keeps registry special-panel slots ([`SpecialPanels`]) and queued
+/// registry special-panel slots ([`SpecialPanels`]) and queued
 /// [`SpecialPanelResponse`]s for `Dialog` kinds `5..=15`; layout 10 keeps the
 /// per-family `FAMI` flags (`World::family_flags`) omitted from
-/// [`World::encode`].
-pub const FORMAT: u32 = 10;
+/// [`World::encode`]; layout 11 keeps the interface's indicator refresh
+/// queues (`World::indicator_queues`), omitted from it too.
+///
+/// **A new format also bumps `sims_net::PROTOCOL_VERSION`.** A co-op host
+/// sends the lot as a [`Saved`], so a joiner on an older format would
+/// reject it after the handshake; the protocol bump turns it away at the
+/// handshake with a message instead. The same holds for a change to what
+/// the co-op world fingerprint covers (`crate::coop`).
+pub const FORMAT: u32 = 11;
 
 /// Historical `Answers` layout in [`Saved`] format 6 (before `choices_after`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,7 +330,7 @@ fn migrate_v8_to_v9(record: &str, body: &[u8]) -> Result<Vec<u8>, MigrationError
 
 fn migrate_v9_to_v10(record: &str, body: &[u8]) -> Result<Vec<u8>, MigrationError> {
     let v9: SavedV9 = decode_postcard_exact(record, 9, body)?;
-    let v10 = Saved {
+    let v10 = SavedV10 {
         world: v9.world,
         ticks: v9.ticks,
         start: v9.start,
@@ -368,6 +375,108 @@ fn migrate_v9_to_v10(record: &str, body: &[u8]) -> Result<Vec<u8>, MigrationErro
     })
 }
 
+/// Historical [`Saved`] layout 10 (before format-11 `indicator_queues`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedV10 {
+    world: World,
+    ticks: u32,
+    start: u32,
+    answers: Answers,
+    fresh: BTreeSet<u16>,
+    view_rotation: u8,
+    answered: bool,
+    house: u32,
+    family: u16,
+    loaded: [u8; 32],
+    view_centre: Option<[i8; 2]>,
+    floor_rotation: u8,
+    replay_view: Option<(u8, Option<[i8; 2]>)>,
+    last_dialog_text: String,
+    character_names: BTreeMap<u32, String>,
+    lot_name: String,
+    lot_description: String,
+    deletion_epoch: u64,
+    generated_portrait_2002: BTreeSet<PortraitFile>,
+    made_portrait_head: BTreeMap<u32, Option<bool>>,
+    ambiguous_portraits: BTreeSet<u32>,
+    loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
+    loaded_indexed_suits: BTreeMap<String, Option<bool>>,
+    loaded_indexed_suit_bones: BTreeMap<String, Vec<Vec<String>>>,
+    made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
+    person_outfits: BTreeMap<u16, PersonOutfit>,
+    scratch_ptr_set: BTreeSet<u16>,
+    scratch_ptr_set_to_next: BTreeSet<u16>,
+    scratch_ptr_expression: BTreeSet<u16>,
+    scratch_ptr_arg_slot: BTreeSet<u16>,
+    runtime_added_suits: Vec<String>,
+    suit_scan_cache: Option<Vec<String>>,
+    special_panels: SpecialPanels,
+    special_panel_responses: VecDeque<SpecialPanelResponse>,
+    family_flags: Option<BTreeMap<i32, u32>>,
+}
+
+/// The pending indicator refreshes and star pools for a world saved before
+/// they were kept: a `Saved` of format 10 or older, or a `WorldSnapshot`
+/// payload without its queues (`World::decode_snapshot_parts`). None are
+/// pending, and the star pools are taken from where the world's stars
+/// stand, as the port picked them then: a star held by an object is in
+/// use, and one off the lot and held by none is available.
+pub fn queues_saved_before_kept(world: &World) -> sims_sim::IndicatorQueues {
+    crate::placement::adopted_star_pools(world)
+}
+
+fn migrate_v10_to_v11(record: &str, body: &[u8]) -> Result<Vec<u8>, MigrationError> {
+    let v10: SavedV10 = decode_postcard_exact(record, 10, body)?;
+    let v11 = Saved {
+        world: v10.world,
+        ticks: v10.ticks,
+        start: v10.start,
+        answers: v10.answers,
+        fresh: v10.fresh,
+        view_rotation: v10.view_rotation,
+        answered: v10.answered,
+        house: v10.house,
+        family: v10.family,
+        loaded: v10.loaded,
+        view_centre: v10.view_centre,
+        floor_rotation: v10.floor_rotation,
+        replay_view: v10.replay_view,
+        last_dialog_text: v10.last_dialog_text,
+        character_names: v10.character_names,
+        lot_name: v10.lot_name,
+        lot_description: v10.lot_description,
+        deletion_epoch: v10.deletion_epoch,
+        generated_portrait_2002: v10.generated_portrait_2002,
+        made_portrait_head: v10.made_portrait_head,
+        ambiguous_portraits: v10.ambiguous_portraits,
+        loaded_indexed_skeletons: v10.loaded_indexed_skeletons,
+        loaded_indexed_suits: v10.loaded_indexed_suits,
+        loaded_indexed_suit_bones: v10.loaded_indexed_suit_bones,
+        made_outfits: v10.made_outfits,
+        person_outfits: v10.person_outfits,
+        scratch_ptr_set: v10.scratch_ptr_set,
+        scratch_ptr_set_to_next: v10.scratch_ptr_set_to_next,
+        scratch_ptr_expression: v10.scratch_ptr_expression,
+        scratch_ptr_arg_slot: v10.scratch_ptr_arg_slot,
+        runtime_added_suits: v10.runtime_added_suits,
+        suit_scan_cache: v10.suit_scan_cache,
+        special_panels: v10.special_panels,
+        special_panel_responses: v10.special_panel_responses,
+        family_flags: v10.family_flags,
+        indicator_queues: sims_sim::IndicatorQueues::default(),
+    };
+    let mut v11 = v11;
+    let pools = queues_saved_before_kept(&v11.world);
+    v11.world.indicator_queues = pools.clone();
+    v11.indicator_queues = pools;
+    postcard::to_allocvec(&v11).map_err(|error| MigrationError::StepFailed {
+        record: record.to_owned(),
+        from: 10,
+        to: 11,
+        detail: error.to_string(),
+    })
+}
+
 fn validate_saved_current(record: &str, body: &[u8]) -> Result<(), MigrationError> {
     let _: Saved = decode_postcard_exact(record, FORMAT, body)?;
     Ok(())
@@ -398,9 +507,16 @@ static SAVED_STEPS: &[MigrationStep] = &[
         description: "add format-10 auxiliary World::family_flags for scope 24 fields 7 & 8",
         apply: migrate_v9_to_v10,
     },
+    MigrationStep {
+        from: 10,
+        to: 11,
+        description: "add format-11 auxiliary World::indicator_queues (no refreshes; the star pools from where the stars are)",
+        apply: migrate_v10_to_v11,
+    },
 ];
 
-/// Registered forward schema migration chain for [`Saved`] (`v6 -> v7 -> v8 -> v9`).
+/// Registered forward schema migration chain for [`Saved`] (`v6 -> v7 -> v8 -> v9 ->
+/// v10 -> v11`).
 ///
 /// Expects bytes framed with `[layout: u32 LE][postcard body]` (i.e. after
 /// verifying the 4-byte `world_format == sims_sim::SNAPSHOT_FORMAT` header).
@@ -471,6 +587,10 @@ pub struct Saved {
     /// 7 and 8 (`None` when upgraded from pre-v10 saves so `Lot::restore` falls
     /// back to the destination lot's loaded family flags).
     pub(crate) family_flags: Option<BTreeMap<i32, u32>>,
+    /// Format 11 on: the interface's indicator refresh queues
+    /// (`World::indicator_queues`, 0x4448a6, 0x444962), omitted from
+    /// [`World::encode`].
+    pub(crate) indicator_queues: sims_sim::IndicatorQueues,
 }
 
 /// Why a lot could not be saved or restored.
@@ -523,6 +643,16 @@ impl Saved {
         &self.world
     }
 
+    /// Replaces the pending indicator refreshes and the star pools
+    /// (`World::indicator_queues`), for a save whose world came from
+    /// elsewhere: the queues of the lot a [`World`] snapshot is spliced
+    /// into may name people the world lacks, so it takes the snapshot's
+    /// own (`World::decode_snapshot`).
+    pub fn set_indicator_queues(&mut self, queues: sims_sim::IndicatorQueues) {
+        self.world.indicator_queues = queues.clone();
+        self.indicator_queues = queues;
+    }
+
     /// Save Card lot name (`0x50e1f8..0x50e42c`).
     pub fn lot_name(&self) -> &str {
         &self.lot_name
@@ -564,11 +694,12 @@ impl Saved {
         if let Some(flags) = &self.family_flags {
             self.world.family_flags = flags.clone();
         }
+        self.world.indicator_queues = self.indicator_queues.clone();
         self.world.mark_all_frame_storage_dirty();
     }
 
     /// Reads [`Saved::encode`]'s bytes, deterministically migrating supported
-    /// older layouts ([`MIN_FORMAT`]..=[`FORMAT`], i.e. `6 -> 7 -> 8 -> 9`) forward
+    /// older layouts ([`MIN_FORMAT`]..=[`FORMAT`], i.e. `6 -> 7 -> 8 -> 9 -> 10 -> 11`) forward
     /// through [`SAVED_MIGRATIONS`]. Truncated payloads, trailing bytes,
     /// unsupported layout versions, and mismatched world formats are refused.
     pub fn decode(bytes: &[u8]) -> Result<Self, SaveError> {
@@ -792,6 +923,7 @@ impl Lot {
         let runtime_added_suits = world.runtime_added_suits.clone();
         let suit_scan_cache = world.suit_scan_cache.clone();
         let family_flags = Some(world.family_flags.clone());
+        let indicator_queues = world.indicator_queues.clone();
         Ok(Saved {
             world,
             ticks: self.ticks,
@@ -828,6 +960,7 @@ impl Lot {
             special_panels: self.special_panels.clone(),
             special_panel_responses: self.special_panel_responses.clone(),
             family_flags,
+            indicator_queues,
         })
     }
 
@@ -956,6 +1089,7 @@ mod tests {
             runtime_added_suits: world.runtime_added_suits.clone(),
             suit_scan_cache: world.suit_scan_cache.clone(),
             family_flags: Some(world.family_flags.clone()),
+            indicator_queues: world.indicator_queues.clone(),
             world,
             ticks: 1,
             start: 0,
@@ -1108,11 +1242,11 @@ mod tests {
             Err(SaveError::Format(_))
         ));
 
-        // Migrating decode upgrades 6 -> 7 -> 8 -> 9 -> 10 deterministically.
+        // Migrating decode upgrades 6 -> 7 -> 8 -> 9 -> 10 -> 11 deterministically.
         let (migrated_v6, report_v6) = Saved::decode_with_report(&bytes_v6_replay).unwrap();
         assert_eq!(report_v6.original_version, 6);
         assert_eq!(report_v6.final_version, FORMAT);
-        assert_eq!(report_v6.steps_applied, 4);
+        assert_eq!(report_v6.steps_applied, 5);
         assert!(report_v6.was_migrated());
         assert_eq!(migrated_v6.ticks, 123);
         assert_eq!(migrated_v6.start, 10);
@@ -1185,7 +1319,7 @@ mod tests {
         let (migrated_v7, report_v7) = Saved::decode_with_report(&bytes_v7).unwrap();
         assert_eq!(report_v7.original_version, 7);
         assert_eq!(report_v7.final_version, FORMAT);
-        assert_eq!(report_v7.steps_applied, 3);
+        assert_eq!(report_v7.steps_applied, 4);
         assert_eq!(migrated_v7.answers, v7_answers);
         assert_eq!(migrated_v7.deletion_epoch, 19);
         assert_eq!(migrated_v7.lot_name(), "7 Sim Lane");
@@ -1219,7 +1353,7 @@ mod tests {
         let direct_v6 = SAVED_MIGRATIONS.migrate_bytes("test", &raw_v6).unwrap();
         assert_eq!(direct_v6.original_version, 6);
         assert_eq!(direct_v6.final_version, FORMAT);
-        assert_eq!(direct_v6.steps_applied, 4);
+        assert_eq!(direct_v6.steps_applied, 5);
 
         let mut raw_v8 = FORMAT.to_le_bytes().to_vec();
         raw_v8.extend_from_slice(&canonical_v8[8..]);
@@ -1296,8 +1430,8 @@ mod tests {
 
         let (dec_v6, rep_v6) = Saved::decode_with_report(&v6_bytes).unwrap();
         let (dec_v7, rep_v7) = Saved::decode_with_report(&v7_bytes).unwrap();
-        assert_eq!(rep_v6.steps_applied, 4);
-        assert_eq!(rep_v7.steps_applied, 3);
+        assert_eq!(rep_v6.steps_applied, 5);
+        assert_eq!(rep_v7.steps_applied, 4);
 
         let mut from_v6 = Lot::load(&root, &house, &[], super::super::Frames::default()).unwrap();
         let mut from_v7 = Lot::load(&root, &house, &[], super::super::Frames::default()).unwrap();
@@ -1393,7 +1527,7 @@ mod tests {
         let (dec6, rep6) = Saved::decode_with_report(&raw_2ddea688).unwrap();
         assert_eq!(rep6.original_version, 6);
         assert_eq!(rep6.final_version, FORMAT);
-        assert_eq!(rep6.steps_applied, 4);
+        assert_eq!(rep6.steps_applied, 5);
         assert_eq!(dec6.ticks, 777);
         assert_eq!(dec6.start, 33);
         assert_eq!(
@@ -1458,7 +1592,7 @@ mod tests {
         let (dec7, rep7) = Saved::decode_with_report(&raw_50106efb).unwrap();
         assert_eq!(rep7.original_version, 7);
         assert_eq!(rep7.final_version, FORMAT);
-        assert_eq!(rep7.steps_applied, 3);
+        assert_eq!(rep7.steps_applied, 4);
         let mut expected_ans7 = Answers::replay(&[Answer::from(2)]);
         expected_ans7.extend_choices_after(&[3, 4]);
         assert_eq!(dec7.ticks, 888);
@@ -1514,12 +1648,13 @@ mod tests {
         let (mut dec8, rep8) = Saved::decode_with_report(&raw_v8).unwrap();
         assert_eq!(rep8.original_version, 8);
         assert_eq!(rep8.final_version, FORMAT);
-        assert_eq!(rep8.steps_applied, 2);
+        assert_eq!(rep8.steps_applied, 3);
         assert_eq!(dec8.ticks, 999);
         assert_eq!(dec8.deletion_epoch, 77);
         assert_eq!(dec8.special_panels, SpecialPanels::default());
         assert!(dec8.special_panel_responses.is_empty());
         assert_eq!(dec8.family_flags, None);
+        assert_eq!(dec8.indicator_queues, sims_sim::IndicatorQueues::default());
 
         // Populated v10 special panels, responses, & family_flags roundtrip losslessly.
         dec8.special_panels.magic_lot = 93;
@@ -1528,6 +1663,13 @@ mod tests {
         dec8.special_panel_responses
             .push_back(SpecialPanelResponse::Lot(Some(93)));
         dec8.family_flags = Some(BTreeMap::from([(5, 0x3), (7, 0x1)]));
+        dec8.indicator_queues = sims_sim::IndicatorQueues {
+            dates: vec![4],
+            stars: vec![6, 6],
+            dirty: true,
+            available_stars: vec![8],
+            stars_in_use: vec![10],
+        };
         let v10_bytes = dec8.encode();
         let (dec10, rep10) = Saved::decode_with_report(&v10_bytes).unwrap();
         assert_eq!(rep10.original_version, FORMAT);
@@ -1543,6 +1685,96 @@ mod tests {
             dec10.world.family_flags,
             BTreeMap::from([(5, 0x3), (7, 0x1)])
         );
+        assert_eq!(dec10.world.indicator_queues, dec8.indicator_queues);
+
+        // --- A real format-10 record migrates to 11 ---
+        // Its world has stars: two free off the lot and one held.
+        let mut s = dec10.clone();
+        let star = crate::placement::STAR_MARKER;
+        for o in [
+            crate::placement::tests::pool_object(4001, star, [-16, -16, 1], 0),
+            crate::placement::tests::pool_object(4002, star, [40, 40, 1], 4003),
+            crate::placement::tests::pool_object(4003, 0x1234, [40, 40, 1], 0),
+            crate::placement::tests::pool_object(4004, star, [-16, -16, 1], 0),
+        ] {
+            assert!(!s.world.objects.contains_key(&o.id));
+            s.world.order.push(o.id);
+            s.world.objects.insert(o.id, o);
+        }
+        let with_stars = s.world.clone();
+        let v10 = SavedV10 {
+            world: s.world.clone(),
+            ticks: s.ticks,
+            start: s.start,
+            answers: s.answers,
+            fresh: s.fresh,
+            view_rotation: s.view_rotation,
+            answered: s.answered,
+            house: s.house,
+            family: s.family,
+            loaded: s.loaded,
+            view_centre: s.view_centre,
+            floor_rotation: s.floor_rotation,
+            replay_view: s.replay_view,
+            last_dialog_text: s.last_dialog_text,
+            character_names: s.character_names,
+            lot_name: s.lot_name,
+            lot_description: s.lot_description,
+            deletion_epoch: s.deletion_epoch,
+            generated_portrait_2002: s.generated_portrait_2002,
+            made_portrait_head: s.made_portrait_head,
+            ambiguous_portraits: s.ambiguous_portraits,
+            loaded_indexed_skeletons: s.loaded_indexed_skeletons,
+            loaded_indexed_suits: s.loaded_indexed_suits,
+            loaded_indexed_suit_bones: s.loaded_indexed_suit_bones,
+            made_outfits: s.made_outfits,
+            person_outfits: s.person_outfits,
+            scratch_ptr_set: s.scratch_ptr_set,
+            scratch_ptr_set_to_next: s.scratch_ptr_set_to_next,
+            scratch_ptr_expression: s.scratch_ptr_expression,
+            scratch_ptr_arg_slot: s.scratch_ptr_arg_slot,
+            runtime_added_suits: s.runtime_added_suits,
+            suit_scan_cache: s.suit_scan_cache,
+            special_panels: s.special_panels,
+            special_panel_responses: s.special_panel_responses,
+            family_flags: s.family_flags,
+        };
+        let mut raw_v10 = Vec::new();
+        raw_v10.extend_from_slice(&10u32.to_le_bytes());
+        raw_v10.extend_from_slice(&sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
+        raw_v10.extend_from_slice(&postcard::to_allocvec(&v10).unwrap());
+        let (from10, rep) = Saved::decode_with_report(&raw_v10).unwrap();
+        assert_eq!(rep.original_version, 10);
+        assert_eq!(rep.final_version, FORMAT);
+        assert_eq!(rep.steps_applied, 1);
+        assert_eq!(from10.world.hash(), with_stars.hash());
+        assert_eq!(from10.world.family_flags, dec10.world.family_flags);
+        assert_eq!(from10.special_panels, dec10.special_panels);
+        assert_eq!(
+            from10.special_panel_responses,
+            dec10.special_panel_responses
+        );
+        // No refreshes pending, and the star pools from where the stars are.
+        let adopted = sims_sim::IndicatorQueues {
+            available_stars: vec![4004, 4001],
+            stars_in_use: vec![4002],
+            ..Default::default()
+        };
+        assert_eq!(queues_saved_before_kept(&with_stars), adopted);
+        assert_eq!(from10.indicator_queues, adopted);
+        assert_eq!(from10.world.indicator_queues, adopted);
+
+        // A save whose world came from a snapshot takes the snapshot's
+        // queues, and its world hash does not move.
+        let mut spliced = dec10.clone();
+        let mut queues = sims_sim::IndicatorQueues::default();
+        queues.queue_star(7);
+        queues.available_stars.push(9);
+        spliced.set_indicator_queues(queues.clone());
+        let back = Saved::decode(&spliced.encode()).unwrap();
+        assert_eq!(back.indicator_queues, queues);
+        assert_eq!(back.world.indicator_queues, queues);
+        assert_eq!(back.world.hash(), dec10.world.hash());
     }
 
     #[test]
@@ -1610,6 +1842,7 @@ mod tests {
             special_panels: SpecialPanels::default(),
             special_panel_responses: VecDeque::new(),
             family_flags: Some(BTreeMap::new()),
+            indicator_queues: Default::default(),
             deletion_epoch: 0,
         };
         let bytes = bad.encode();

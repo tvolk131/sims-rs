@@ -366,3 +366,87 @@ fn live_install_roof_catalog_subtool_prices_and_narrow_layout_rendering() {
         }
     }
 }
+
+#[test]
+fn roof_page_arrows_and_page_size_follow_roofpanelstrs() {
+    // `cWinRoofPanel` (`0x52911a`, `STR# 147`): 16 patterns a page with Next
+    // Page at panel + 433, or 8 with it at panel + 253 on an 800-wide screen;
+    // Previous Page at panel + 58; both 20 below the panel's top. The panel
+    // is at (538, strip_y + 5) here, and the 1.91 oracle's Next Page sits at
+    // (971, 693) on 1024×768.
+    let names: Vec<String> = (0..18).map(|i| format!("p{i:02}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let catalog = BuildCatalog::default().with_roof_patterns(&refs);
+    let art = Art::default();
+    let arrow = |layout: &build::BuildLayout, delta: i32| {
+        layout
+            .widgets
+            .iter()
+            .find(|w| w.command == Some(Command::BuildPage(delta)))
+            .map(|w| [w.rect.x, w.rect.y])
+    };
+    let shown = |layout: &build::BuildLayout| -> Vec<usize> {
+        layout
+            .subtools
+            .iter()
+            .filter_map(|s| match s.action {
+                BuildSubtoolAction::RoofPattern(i) => Some(i),
+                _ => None,
+            })
+            .collect()
+    };
+    for (width, per_page, next_x) in [(800, 8usize, 791), (1024, 16, 971)] {
+        let height = width * 3 / 4;
+        let strip_y = height - 100;
+        let layout_at = |state: &BuildState| {
+            build::layout(
+                [width, height],
+                &catalog,
+                state,
+                &art,
+                1000,
+                false,
+                false,
+                None,
+            )
+        };
+        let page_ids = |page: usize| -> Vec<usize> {
+            (page * per_page..((page + 1) * per_page).min(18)).collect()
+        };
+        let mut state = BuildState::default();
+        state.select_tool(BuildTool::Roof, &catalog);
+        // Walk the pages with the Next Page arrow to the last.
+        let mut seen = Vec::new();
+        loop {
+            let page = state.page;
+            let layout = layout_at(&state);
+            assert_eq!(shown(&layout), page_ids(page), "{width} page {page}");
+            let has_next = (page + 1) * per_page < 18;
+            assert_eq!(
+                arrow(&layout, 1),
+                has_next.then_some([next_x, strip_y + 25]),
+                "{width} page {page}"
+            );
+            assert_eq!(
+                arrow(&layout, -1),
+                (page > 0).then_some([596, strip_y + 25]),
+                "{width} page {page}"
+            );
+            assert_layout_has_no_overlaps_and_in_bounds(&layout, width);
+            seen.extend(shown(&layout));
+            if !has_next {
+                break;
+            }
+            assert!(state.step_page(1));
+        }
+        assert_eq!(state.page + 1, 18usize.div_ceil(per_page), "{width}");
+        assert_eq!(
+            seen,
+            (0..18).collect::<Vec<_>>(),
+            "{width}: every pattern once"
+        );
+        // Previous Page from the last page shows the page before again.
+        assert!(state.step_page(-1));
+        assert_eq!(shown(&layout_at(&state)), page_ids(state.page), "{width}");
+    }
+}

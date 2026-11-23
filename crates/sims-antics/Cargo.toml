@@ -13,6 +13,7 @@ encoding_rs.workspace = true
 libm.workspace = true
 sims-content = { workspace = true, optional = true }
 sims-formats.workspace = true
+sims-sim = { workspace = true, optional = true }
 sims-vm = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -22,11 +23,14 @@ sims-sim.workspace = true
 sims-vm.workspace = true
 
 [features]
-default = ["install-catalog"]
+default = ["install-catalog", "vm-replay"]
 # `lift`'s install catalog: callee arities from the install, resolved with the VM's own
 # loader. Pulls in `sims-vm` (and through it networking and storage crates); turn it off
 # for compiler-only builds.
 install-catalog = ["dep:sims-content", "dep:sims-vm"]
+# The equivalence checker confirms every counterexample by running both trees in
+# `sims-vm`. Without it nothing is confirmed, so a difference is only ever inconclusive.
+vm-replay = ["dep:sims-content", "dep:sims-sim", "dep:sims-vm"]
 
 [[test]]
 name = "cli_lift"
@@ -35,6 +39,14 @@ required-features = ["install-catalog"]
 [[test]]
 name = "structured_equiv"
 required-features = ["install-catalog"]
+
+[[test]]
+name = "live_equiv"
+required-features = ["vm-replay"]
+
+[[test]]
+name = "live_equiv_corpus"
+required-features = ["vm-replay"]
 
 [lints]
 workspace = true

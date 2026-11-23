@@ -394,6 +394,15 @@ pub struct Acquaintances {
     /// Whether the Superstar pack is installed: the installed packs'
     /// mask (`[0x6e48bc]+0x66`) has its bit, 0x40 (0x51a7ea).
     pub superstar: bool,
+    /// The interface's table of person types (0x6f2698), by GUID, in its
+    /// order: each person definition (`OBJD` type 2) in the definition
+    /// registry's order at startup (0x4e8b3d walks the registry's vector
+    /// with 0x43ac3a), a GUID's first place kept (0x4e9753 finds the
+    /// first). The relationship panel lists only people in it, and breaks
+    /// its last tie by their place (0x4e9e80, 0x4ea035). A person type
+    /// made while the game runs is appended after these
+    /// ([`Acquaintances::portrait_place`]).
+    pub portraits: Vec<u32>,
 }
 
 impl Acquaintances {
@@ -414,13 +423,45 @@ impl Acquaintances {
                 })
             })
             .collect();
+        let mut portraits = Vec::new();
+        for object in &catalog.objects {
+            if object.kind == PERSON_KIND && !portraits.contains(&object.guid) {
+                portraits.push(object.guid);
+            }
+        }
         Self {
             friendship,
             characters,
             superstar: expansions.contains(Self::SUPERSTAR),
+            portraits,
         }
     }
+
+    /// A person type's place in the interface's table of person types
+    /// (0x4e9753), or None when it is not there (-1).
+    ///
+    /// Types made while the game runs (`world.characters.made`) come
+    /// after the startup ones, in the order made: making one appends it
+    /// (0x4265fd → 0x4e8a3a, which walks the registry again and appends
+    /// each person GUID the table lacks, 0x4e8add, and then only the new
+    /// type is missing). The GUID does not give that order: two types
+    /// made in one tick can have descending GUIDs.
+    pub fn portrait_place(&self, world: &World, guid: u32) -> Option<usize> {
+        if let Some(place) = self.portraits.iter().position(|&other| other == guid) {
+            return Some(place);
+        }
+        world
+            .characters
+            .made
+            .keys()
+            .filter(|other| !self.portraits.contains(other))
+            .position(|&other| other == guid)
+            .map(|place| self.portraits.len() + place)
+    }
 }
+
+/// The `OBJD` type of a person (definition +0x12, 0x4e8b6a).
+const PERSON_KIND: u16 = 2;
 
 /// A person in the relationship panel: what 0x4ea042 reads of the
 /// selected Sim's relationship row toward them.
@@ -794,8 +835,12 @@ pub fn money(amount: i32) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct Careers {
     careers: BTreeMap<i16, Vec<Level>>,
-    /// Each career's levels' titles, a man's and a woman's.
+    /// Each career's levels' titles, a man's and a woman's, as the job
+    /// panel and dialogs show them (+0x54, +0xe0).
     titles: BTreeMap<i16, Vec<[String; 2]>>,
+    /// The same from the career's first table (+0x16c, +0x1f8), as a list
+    /// of people shows them ([`Careers::list_title`]).
+    list_titles: BTreeMap<i16, Vec<[String; 2]>>,
     /// Each career's levels' descriptions (`STR#` entry `4 + 2*k`).
     descriptions: BTreeMap<i16, Vec<String>>,
     /// Each career's track/offer name (`STR#` entry `0` / `1`).
@@ -810,10 +855,23 @@ const UNTITLED: usize = 10;
 
 impl Careers {
     /// Reads every `CARR` of the install's `work.iff`, the levels' titles
-    /// from the `STR#` of the career's ID (0x403f26: for level `k`, string
-    /// `3 + 2k`, and a woman's, `23 + k`, in US English), and the school
-    /// grade strings from `STR# 4097` (0x403f43). An install without the
-    /// file has no careers.
+    /// and the school grade strings from `STR# 4097` (0x403f43). An
+    /// install without the file has no careers.
+    ///
+    /// A career's strings are in the `STR#` of its ID (0x403f26), in US
+    /// English; a career without that table keeps none (0x403fec). Its
+    /// level `k`'s description is string `4 + 2k` (+0x3b4). The titles the
+    /// game shows, a man's and a woman's (+0x54, +0xe0), are strings
+    /// `3 + 2k` and `23 + k` of a second table, the `STR#` of the ID plus
+    /// 1000 (0x404027..0x404057, 0x40427a..0x40430f). Without that table
+    /// they are strings 1000 further on in the first (0x4041d4..0x404269),
+    /// which no career has. The first table's own titles go to +0x16c and
+    /// +0x1f8 ([`Careers::list_title`]).
+    ///
+    /// The second tables differ: they spell some titles differently
+    /// ("Back-up Musician", "Free Lance Photographer", "Douser",
+    /// "Papparazzi"), and the Livin' Large careers' woman's titles are
+    /// empty, so the man's shows ([`Careers::title`]).
     ///
     /// The original reads the titles of only the first 11, 16 or 21
     /// careers, by the game's expansion level (0x403f53); here every
@@ -858,7 +916,23 @@ impl Careers {
                         .unwrap_or_default()
                         .to_owned()
                 };
+                let shown = match iff.get(b"STR#", chunk.id.wrapping_add(1000)) {
+                    Some(chunk) => {
+                        Some(StringTable::parse(iff.data(chunk)).map_err(Error::Format)?)
+                    }
+                    None => None,
+                };
+                let title = |i: usize| match &shown {
+                    Some(table) => table
+                        .get(i, sims_content::ui_graphics::US_ENGLISH)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    None => text(i + 1000),
+                };
                 let titles = (0..career.levels.len())
+                    .map(|k| [title(3 + 2 * k), title(23 + k)])
+                    .collect();
+                let list_titles = (0..career.levels.len())
                     .map(|k| [text(3 + 2 * k), text(23 + k)])
                     .collect();
                 let descriptions = (0..career.levels.len()).map(|k| text(4 + 2 * k)).collect();
@@ -867,6 +941,7 @@ impl Careers {
                     if !s1.is_empty() { s1 } else { text(0) }
                 };
                 out.titles.insert(id, titles);
+                out.list_titles.insert(id, list_titles);
                 out.descriptions.insert(id, descriptions);
                 if !offer.is_empty() {
                     out.offers.insert(id, offer);
@@ -908,19 +983,20 @@ impl Careers {
         self.careers.contains_key(&career)
     }
 
-    /// The title of level `level` of career `career` (0x4033a4): a
-    /// woman's where the level has one, else the level's; empty for a
-    /// level without a title.
+    /// The title of level `level` of career `career` as the game shows it
+    /// (0x4033d2, from the second table): a woman's where the level has
+    /// one, else the level's; empty for a level without a title. The live
+    /// job panel (0x53074c, at 0x530e79) and `$Job` (0x44ca89) read it.
     pub fn title(&self, career: i16, level: i32, female: bool) -> Option<&str> {
-        let [man, woman] = self
-            .titles
-            .get(&career)?
-            .get(usize::try_from(level).ok()?)?;
-        Some(if female && !woman.is_empty() {
-            woman
-        } else {
-            man
-        })
+        pick_title(&self.titles, career, level, female)
+    }
+
+    /// The title from the career's first table (0x4033a4), chosen the same
+    /// way. Only a list box of people reads it: 0x52ff7e (vtable 0x66e354,
+    /// at 0x530674) fills a row's first column with it, next to a number
+    /// and a field of the person, which the port does not draw.
+    pub fn list_title(&self, career: i16, level: i32, female: bool) -> Option<&str> {
+        pick_title(&self.list_titles, career, level, female)
     }
 
     /// The description of level `level` of career `career` (`STR#` entry `4 + 2*k`),
@@ -1179,13 +1255,15 @@ fn friends_family(
 /// panel's order: 0x4e9deb lists the neighbor records, in slot order,
 /// that the Sim's own record (the first of its type) has a row toward,
 /// and 0x4e9fad sorts them: the household's members first, then people on
-/// the lot, then by the daily relationship, highest first, then by
-/// record.
+/// the lot, then by the daily relationship, highest first, then by their
+/// place in the interface's table of person types (0x4ea035 compares the
+/// places 0x4e9753 gave, [`Acquaintances::portrait_place`]). A record
+/// whose type is not in that table is left out (0x4e9e8c).
 ///
 /// **Not ported:** 0x4e9deb's test of each record (0x423f30, and words
 /// of the person on the lot), so a record the original leaves out may be
-/// listed; and the original breaks the last tie by its own list of
-/// people (0x6f2698), not by record (**unverified** that they agree).
+/// listed. Two records of one type tie completely; the port keeps them
+/// in slot order, the original's sort (0x4eb3d1) is not stable.
 /// Person data word 32: whether the person lives on the lot. A 6 keeps
 /// anyone in the relationship panel (0x4e9eae); what a 6 stands for is
 /// not known.
@@ -1199,6 +1277,20 @@ const FAME: usize = 81;
 /// first person on the lot of the record's type, in the lot's people
 /// order (0x4e9608 walks the lot's people for the first of the GUID),
 /// or else the first record of the type.
+fn pick_title(
+    titles: &BTreeMap<i16, Vec<[String; 2]>>,
+    career: i16,
+    level: i32,
+    female: bool,
+) -> Option<&str> {
+    let [man, woman] = titles.get(&career)?.get(usize::try_from(level).ok()?)?;
+    Some(if female && !woman.is_empty() {
+        woman
+    } else {
+        man
+    })
+}
+
 fn person_data(world: &World, guid: u32) -> Option<&[i16]> {
     world
         .people
@@ -1207,6 +1299,20 @@ fn person_data(world: &World, guid: u32) -> Option<&[i16]> {
         .find_map(|o| o.person.as_ref().filter(|_| o.guid == guid))
         .map(|p| p.data.as_slice())
         .or_else(|| world.neighbors.first_of(guid).map(|r| r.data.as_slice()))
+}
+
+/// The person `guid`'s Sim's relationship list starts with, in the
+/// panel's order ([`relations`]): what a `rel` dialog icon shows
+/// (0x436762..0x4367ae takes the first of 0x4e9deb's sorted list).
+pub fn first_relation(
+    world: &World,
+    guid: u32,
+    members: &[u32],
+    known: &Acquaintances,
+) -> Option<u32> {
+    relations(world, guid, members, known)
+        .first()
+        .map(|relation| relation.guid)
 }
 
 fn relations(world: &World, guid: u32, members: &[u32], known: &Acquaintances) -> Vec<Relation> {
@@ -1244,6 +1350,9 @@ fn relations(world: &World, guid: u32, members: &[u32], known: &Acquaintances) -
         // (0x4ea192). So a second record of a type is listed with the
         // first's row, or not at all where only it has a row; 0x4ea042
         // reads friendship between the first records too.
+        let Some(place) = known.portrait_place(world, record.guid) else {
+            continue;
+        };
         let Some(target) = neighbors.first_of(record.guid) else {
             continue;
         };
@@ -1270,7 +1379,7 @@ fn relations(world: &World, guid: u32, members: &[u32], known: &Acquaintances) -
             !members.contains(&record.guid),
             !on_lot(record.guid),
             std::cmp::Reverse(value(0)),
-            record.id,
+            place,
         );
         listed.push((order, relation));
     }
@@ -1521,6 +1630,7 @@ mod tests {
             friendship: 50,
             characters: (100..1000).collect(),
             superstar: true,
+            portraits: (100..1000).collect(),
         }
     }
 
@@ -1578,6 +1688,88 @@ mod tests {
         // Nobody known, or a viewer without a record: an empty list.
         assert_eq!(listed(&[]), []);
         assert!(relations(&World::empty(), 100, &[], &known()).is_empty());
+    }
+
+    /// 0x4e9fad's last tie: two equally liked acquaintances come in the
+    /// order of their places in the interface's table of person types
+    /// (0x4ea035 compares the places 0x4e9753 gave), not by record. A
+    /// type missing from the table is not listed (0x4e9e8c); a type made
+    /// while the game runs comes after the startup ones (0x4e8a3a).
+    #[test]
+    fn equally_liked_acquaintances_tie_on_the_portrait_table_place() {
+        let mut world = World::empty();
+        world.neighbors.slots = vec![
+            Some(record(1, 100, &[(2, 30), (3, 30), (4, 30), (5, 30)])),
+            Some(record(2, 200, &[])),
+            Some(record(3, 300, &[])),
+            Some(record(4, 400, &[])),
+            Some(record(5, 500, &[])),
+        ];
+        let mut known = known();
+        // The registry put 300 before 200; 400 has no place; 500 was made.
+        known.portraits = vec![100, 300, 200];
+        world.characters.made.insert(
+            500,
+            sims_sim::characters::Character {
+                template: 100,
+                file: 0,
+                strings: BTreeMap::new(),
+            },
+        );
+        let ids: Vec<_> = relations(&world, 100, &[], &known)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, [3, 2, 5]);
+        assert_eq!(known.portrait_place(&world, 500), Some(3));
+        assert_eq!(known.portrait_place(&world, 400), None);
+        assert_eq!(first_relation(&world, 100, &[], &known), Some(300));
+    }
+
+    /// Made types take their places in the order made (0x4265fd →
+    /// 0x4e8a3a), not by GUID: two made in one tick share the GUID's high
+    /// word (the tick) and can descend in the low (0x4260e1's draw).
+    #[test]
+    fn made_types_tie_in_the_order_they_were_made() {
+        // Made in one tick: first 0x0005_7000, then 0x0005_1000.
+        let (first, second) = (0x0005_7000_u32, 0x0005_1000_u32);
+        let mut world = World::empty();
+        world.neighbors.slots = vec![
+            Some(record(1, 100, &[(6, 30), (7, 30)])),
+            Some(record(6, first, &[])),
+            Some(record(7, second, &[])),
+        ];
+        let made = |template| sims_sim::characters::Character {
+            template,
+            file: 0,
+            strings: BTreeMap::new(),
+        };
+        world.characters.made.insert(first, made(100));
+        world.characters.made.insert(second, made(100));
+        let mut known = known();
+        known.characters.extend([first, second]);
+        known.portraits = vec![100];
+        assert_eq!(known.portrait_place(&world, first), Some(1));
+        assert_eq!(known.portrait_place(&world, second), Some(2));
+        let ids: Vec<_> = relations(&world, 100, &[], &known)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            ids,
+            [6, 7],
+            "the first made first, though its GUID is higher"
+        );
+        assert_eq!(first_relation(&world, 100, &[], &known), Some(first));
+
+        // The order survives the world's encoding, and a save (`Saved`
+        // keeps the world's encoding), as the map is written in it.
+        let back = World::decode(&world.encode()).unwrap();
+        assert_eq!(
+            back.characters.made.keys().copied().collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert_eq!(known.portrait_place(&back, second), Some(2));
     }
 
     #[test]
@@ -2085,6 +2277,7 @@ mod tests {
             friendship: 50,
             characters: [0x100, 0x200, 0x300, 0x400, 0x500].into_iter().collect(),
             superstar: true,
+            portraits: Vec::new(),
         };
         // Only `star_friend` (5 half-stars) qualifies.
         assert_eq!(friend_star_power(&world, 0x100, &known), 5);

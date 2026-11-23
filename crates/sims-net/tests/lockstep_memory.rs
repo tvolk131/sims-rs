@@ -1706,3 +1706,63 @@ fn round2_host_without_hint_delay_cap_split_brain_and_peer_ack_backpressure() {
     assert!(h_p3.is_syncing());
     let _ = p2_addr;
 }
+
+/// A joiner from a build before protocol 2 (`Saved` format 11 and the
+/// indicator refresh queues in the co-op fingerprint) says protocol 1. The
+/// host turns it away before the snapshot, with a message that names both
+/// versions.
+#[test]
+fn a_hello_from_protocol_1_is_rejected_with_a_clear_message() {
+    assert_eq!(sims_net::PROTOCOL_VERSION, 2);
+    let mesh = MemoryMesh::new(407);
+    let manifest = sample_manifest(b"protocol-v2");
+    let host_addr = PeerAddress::new("mem:host");
+    let mut host_t = mesh.add_node("mem:host");
+    let mut old_t = mesh.add_node("mem:old");
+    old_t.connect(&host_addr).unwrap();
+    let mut host = LockstepNode::new_host(
+        "Host",
+        Some("mem:host".to_string()),
+        manifest,
+        SessionConfig::default(),
+    );
+    old_t
+        .send(
+            &host_addr,
+            WireMessage::Hello {
+                protocol_version: 1,
+                player_name: "Old build".to_string(),
+                manifest,
+                endpoint_hint: Some("mem:old".to_string()),
+            },
+        )
+        .unwrap();
+    mesh.step();
+    host.poll(&mut host_t);
+    mesh.step();
+
+    let replies: Vec<_> = old_t
+        .drain_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            sims_net::TransportEvent::Message { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replies,
+        [WireMessage::Reject {
+            reason: RejectReason::ProtocolVersionMismatch {
+                expected: 2,
+                actual: 1
+            }
+        }],
+        "the host sends the reject and nothing else"
+    );
+    assert_eq!(host.session().players.len(), 1, "nobody joined");
+    assert_eq!(
+        sims_net::protocol_mismatch_message(2, 1),
+        "Join rejected: the host runs a different sims-rs build (co-op protocol v2, \
+         this build v1). Both players need the same version."
+    );
+}

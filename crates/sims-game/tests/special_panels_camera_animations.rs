@@ -485,12 +485,61 @@ fn native_camera_panel_wires_all_8_buttons_strings_album_and_clean_capture() {
         SnapshotSize::Large
     );
     shell.render();
-    let large_cap = shell.game().unwrap().capture_snapshot_canvas();
-    assert_eq!(
-        (large_cap.width, large_cap.height),
-        (640, 480),
-        "Large SnapshotSize must crop captured PNG canvas to 640x480"
-    );
+    // The Large frame is 600x400 (`0x6f0ef0`), centred on the clicked
+    // point and ending at its row (`0x4b14a1`); a frame above the top of
+    // the viewport is shifted down into it. The photo is the frame less
+    // its one-pixel outline (`0x4d1f6e..0x4d1f98`): 598x400.
+    let click = [400, 300];
+    shell.game_mut().unwrap().hover(click);
+    let large_cap = shell.game_mut().unwrap().take_photo();
+    {
+        let game = shell.game().unwrap();
+        let canvas = game.canvas();
+        let (view_w, view_h) = game.house_viewport_size();
+        assert!(
+            (view_h as usize) < canvas.height,
+            "the panel is open below the viewport"
+        );
+        assert_eq!(
+            sims_ui::camera::snapshot_frame(
+                click,
+                [600, 400],
+                [0, 0, view_w as i32, view_h as i32]
+            ),
+            [99, 0, 699, 402]
+        );
+        assert_eq!(
+            (large_cap.width, large_cap.height),
+            (598, 400),
+            "Large SnapshotSize must crop to the native 600x400 frame less its outline"
+        );
+        // The photo is the house view inside the frame, never the panel
+        // below it: its rows match the frame's own rows of the screen. Only
+        // the upper rows are compared: the Large button's Quick Tips
+        // balloon, which the photo leaves out, covers part of the lower
+        // viewport.
+        for y in 0..150 {
+            let row = (1 + y) * canvas.width + 100;
+            assert_eq!(
+                &large_cap.color[y * 598..(y + 1) * 598],
+                &canvas.color[row..row + 598],
+                "photo row {y} must be screen row {}",
+                1 + y
+            );
+        }
+        // A click near the bottom-right corner shifts the frame left into
+        // the viewport; it still ends at the clicked row.
+        let (view_w, view_h) = (view_w as i32, view_h as i32);
+        let near_edge = sims_ui::camera::snapshot_capture_rect(
+            [view_w - 5, view_h - 10],
+            [600, 400],
+            [0, 0, view_w, view_h],
+        );
+        assert_eq!(
+            near_edge,
+            [view_w - 600, view_h - 411, view_w - 2, view_h - 11]
+        );
+    }
 
     // Toggle snapshot quality -> Low (keeps CameraPanel open).
     let low_pt = [
@@ -515,19 +564,30 @@ fn native_camera_panel_wires_all_8_buttons_strings_album_and_clean_capture() {
     shell.release(album_pt);
     assert!(shell.album_open());
     assert!(!shell.game().unwrap().camera_strip_open());
+    let photos_before = shell.album_snapshot().map_or(0, |a| a.entries.len());
     shell.close_photo_album();
 
-    // Re-open CameraPanel, then click the house viewport -> closes CameraPanel and
-    // emits `photo == true` so PNG capture excludes CameraPanel!
+    // Re-open CameraPanel, then click the house viewport: the click closes
+    // CameraPanel and stores the photo in the album, and only there
+    // (`cWinCamera`): the host is not asked to write a file.
     shell.press(cam_pt);
     shell.release(cam_pt);
     shell.render();
     assert!(shell.game().unwrap().camera_strip_open());
     let viewport_snap = shell.press([400, 200]);
     assert!(
-        viewport_snap.photo,
-        "clicking house viewport in Camera Mode must capture snapshot"
+        !viewport_snap.photo,
+        "a Camera Mode click saves to the album, not a screenshot file"
     );
+    shell
+        .open_photo_album()
+        .expect("open the album after the photo");
+    assert_eq!(
+        shell.album_snapshot().map_or(0, |a| a.entries.len()),
+        photos_before + 1,
+        "clicking the house viewport in Camera Mode stores one album photo"
+    );
+    shell.close_photo_album();
     assert!(
         !shell.game().unwrap().camera_strip_open(),
         "viewport snapshot capture must close CameraPanel before PNG render"

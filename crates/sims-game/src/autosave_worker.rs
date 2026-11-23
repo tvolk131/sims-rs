@@ -114,7 +114,7 @@ pub fn validate_save_payload(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(),
         SavePayloadKind::SavedLot => Saved::decode(bytes)
             .map(|_| ())
             .map_err(|e| format!("invalid Saved lot payload: {e}")),
-        SavePayloadKind::WorldSnapshot => World::decode(bytes)
+        SavePayloadKind::WorldSnapshot => World::decode_snapshot(bytes)
             .map(|_| ())
             .map_err(|e| format!("invalid World snapshot payload: {e}")),
         SavePayloadKind::Custom(_) => Ok(()),

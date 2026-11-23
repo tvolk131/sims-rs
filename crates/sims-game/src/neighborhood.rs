@@ -658,8 +658,13 @@ pub struct NeighborhoodShell {
     album_token: Option<AlbumFamilyToken>,
     album_neighborhood_id: Option<String>,
     album_has_image: BTreeSet<PhotoId>,
-    album_strip_scroll: usize,
-    album_strip_pressed: Option<i32>,
+    /// Each household album's current photo. Native keeps it on the
+    /// household's album object (`+0x10`), which outlives the dialog
+    /// (`0x4108e4`) and is freed with the family (`0x41010b`). The key is
+    /// the album token, whose neighborhood instance and family epoch change
+    /// when the family is freed, so a later family with the same ID starts
+    /// again at 0, the index a missing entry means.
+    album_index: BTreeMap<AlbumFamilyToken, usize>,
     // Crash-safe Save & Rotating Autosave Manager dialog (overlay over Lot/Neighborhood).
     save_manager: SaveManagerDialog,
     save_manager_snapshot: Option<SaveManagerSnapshot>,
@@ -1018,8 +1023,7 @@ impl NeighborhoodShell {
             album_token: None,
             album_neighborhood_id: None,
             album_has_image: BTreeSet::new(),
-            album_strip_scroll: 0,
-            album_strip_pressed: None,
+            album_index: BTreeMap::new(),
             save_manager: SaveManagerDialog::new(),
             save_manager_snapshot: None,
             save_manager_target_lot: None,
@@ -1218,7 +1222,11 @@ impl NeighborhoodShell {
     pub fn show_notice(&mut self, title: impl Into<String>, body: impl Into<String>) {
         let title = title.into();
         let body = body.into();
-        if let ActiveScreen::Lot(session) = &mut self.screen {
+        // Over the open Photo Album the notice is the shell's own dialog,
+        // drawn and answered above the album ([`Self::album_notice_open`]).
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && !self.album_dialog.is_open()
+        {
             session.game.show_notice(title, body);
         } else {
             if self.debug {
@@ -1229,6 +1237,69 @@ impl NeighborhoodShell {
                 ShellDialogKind::Notice,
                 Message::notice(title, body, self.dialogs.ok()).with_frame(FrameStyle::Generic),
             );
+        }
+    }
+
+    /// Whether a shell notice is open over the Photo Album: it then takes
+    /// the pointer and keys before the album.
+    fn album_notice_open(&self) -> bool {
+        self.album_dialog.is_open() && self.dialog.is_some()
+    }
+
+    /// Presses the shell dialog's buttons.
+    fn press_shell_dialog(&mut self, point: [i32; 2]) -> ShellOutcome {
+        if let Some(dlg) = &mut self.dialog
+            && let Some(layout) = &dlg.layout
+            && let Some(Command::AnswerDialog { button, .. }) =
+                dialog::press_with_state(layout, point, &dlg.state)
+        {
+            dlg.state.pressed_button = Some(usize::from(button));
+            return ShellOutcome::redraw();
+        }
+        ShellOutcome::default()
+    }
+
+    /// Releases over the shell dialog, answering it on a full click.
+    fn release_shell_dialog(&mut self, point: [i32; 2]) -> ShellOutcome {
+        if let Some(dlg) = &mut self.dialog {
+            let pressed = dlg.state.pressed_button.take();
+            if let (Some(pressed_idx), Some(layout)) = (pressed, &dlg.layout)
+                && let Some(Command::AnswerDialog { button, .. }) =
+                    dialog::press_with_state(layout, point, &dlg.state)
+                && usize::from(button) == pressed_idx
+            {
+                return self.answer_dialog(button);
+            }
+            return ShellOutcome {
+                redraw: pressed.is_some(),
+                ..ShellOutcome::default()
+            };
+        }
+        ShellOutcome::default()
+    }
+
+    /// Draws the shell dialog (fading in while the clock runs).
+    fn draw_shell_dialog(&mut self, frame: &mut Frame) {
+        if let Some(dlg) = &mut self.dialog {
+            if dlg.layout.is_none() {
+                dlg.layout = dialog::layout(self.size, &dlg.message, &self.dialog_art);
+            }
+            if let Some(layout) = &dlg.layout {
+                let alpha = if self.clock_us == 0 {
+                    255
+                } else {
+                    self.dialog_fade.alpha((self.clock_us / 1_000) as u32)
+                };
+                dialog::draw_with_state_alpha(
+                    frame,
+                    &self.dialog_art,
+                    &dlg.message,
+                    layout,
+                    self.pointer,
+                    &dlg.state,
+                    alpha,
+                );
+            }
         }
     }
 
@@ -1522,9 +1593,11 @@ impl NeighborhoodShell {
         matches!(&self.screen, ActiveScreen::Lot(s) if s.game.destination_picker_open())
     }
 
+    /// The dialog in front: on a lot, the lot's, unless the shell's notice
+    /// is over the Photo Album ([`Self::album_notice_open`]).
     pub fn dialog_layout(&self) -> Option<&dialog::Layout> {
         match &self.screen {
-            ActiveScreen::Lot(session) => session.game.dialog(),
+            ActiveScreen::Lot(session) if !self.album_notice_open() => session.game.dialog(),
             _ => self.dialog.as_ref().and_then(|d| d.layout.as_ref()),
         }
     }
@@ -1647,17 +1720,19 @@ impl NeighborhoodShell {
         let size = [size[0].max(1), size[1].max(1)];
         let changed = self.size != size;
         self.size = size;
+        if changed {
+            // The shell's notice (also the one over the Photo Album on a
+            // lot) is centred on the window.
+            self.relayout_dialog();
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             return session.game.resize(size) || changed;
         }
-        if changed {
-            self.relayout_dialog();
-            if matches!(self.screen, ActiveScreen::Neighborhood) {
-                if let Some(point) = self.pointer {
-                    let _ = self.hover(point);
-                }
-                self.refresh_hovered_lot();
+        if changed && matches!(self.screen, ActiveScreen::Neighborhood) {
+            if let Some(point) = self.pointer {
+                let _ = self.hover(point);
             }
+            self.refresh_hovered_lot();
         }
         changed
     }
@@ -1935,6 +2010,7 @@ impl NeighborhoodShell {
             let has_overlay = self.save_manager.is_open()
                 || self.album_dialog.is_open()
                 || self.travel_dialog_state.is_some();
+            let album_open = self.album_dialog.is_open();
             if has_overlay {
                 session.game.invalidate_present_damage();
                 let lot_canvas = session.game.canvas();
@@ -1962,6 +2038,9 @@ impl NeighborhoodShell {
                     {
                         self.save_manager
                             .draw(&mut frame, snapshot, &self.save_manager_art);
+                    }
+                    if album_open {
+                        self.draw_shell_dialog(&mut frame);
                     }
                     let mut composed = Canvas::new(w, h, [0, 0, 0]);
                     composed.color = frame.into_packed();
@@ -2064,6 +2143,7 @@ impl NeighborhoodShell {
                     {
                         self.album_dialog
                             .draw(&mut frame, snapshot, &self.album_art);
+                        self.draw_shell_dialog(&mut frame);
                     }
                     if let Some(td_state) = &self.travel_dialog_state {
                         self.travel_dialog.draw(
@@ -2204,26 +2284,9 @@ impl NeighborhoodShell {
             frame.fill(Rect::new(0, y, w, bar_h), [16, 24, 68]);
             font.draw(frame, note, [8, y + 3], [240, 245, 255]);
         }
-        if let Some(dlg) = &mut self.dialog {
-            if dlg.layout.is_none() {
-                dlg.layout = dialog::layout(self.size, &dlg.message, &self.dialog_art);
-            }
-            if let Some(layout) = &dlg.layout {
-                let alpha = if self.clock_us == 0 {
-                    255
-                } else {
-                    self.dialog_fade.alpha((self.clock_us / 1_000) as u32)
-                };
-                dialog::draw_with_state_alpha(
-                    frame,
-                    &self.dialog_art,
-                    &dlg.message,
-                    layout,
-                    self.pointer,
-                    &dlg.state,
-                    alpha,
-                );
-            }
+        // A notice over the open album is drawn after the album.
+        if !self.album_dialog.is_open() {
+            self.draw_shell_dialog(frame);
         }
         if self.coop_lobby.is_open() {
             let snap = self.shell_coop_snapshot();
@@ -2454,6 +2517,11 @@ impl NeighborhoodShell {
             }
             return false;
         }
+        if self.album_notice_open() {
+            // A notice over the album takes the wheel too: nothing behind
+            // it scrolls.
+            return false;
+        }
         if self.album_dialog.is_open() {
             let delta = if delta_y > 0.0 {
                 -1
@@ -2463,27 +2531,10 @@ impl NeighborhoodShell {
                 return false;
             };
             if let Some(snapshot) = &self.album_snapshot {
-                let layout = self.album_dialog.layout(self.size[0], self.size[1]);
-                let in_caption = self
-                    .pointer
-                    .is_some_and(|p| layout.caption_box.contains(p[0], p[1]));
+                // Only the caption scrolls; the modal takes the wheel
+                // either way.
                 self.album_dialog
                     .handle_scroll(delta, self.size, snapshot, &self.album_art);
-                if !in_caption {
-                    let max_scroll = snapshot
-                        .entries
-                        .len()
-                        .saturating_sub(layout.thumb_slots.len());
-                    if delta > 0 {
-                        self.album_strip_scroll =
-                            (self.album_strip_scroll + delta as usize).min(max_scroll);
-                    } else {
-                        self.album_strip_scroll = self
-                            .album_strip_scroll
-                            .saturating_sub(delta.unsigned_abs() as usize);
-                    }
-                }
-                self.hydrate_album_images();
                 return true;
             }
             return false;
@@ -2575,16 +2626,11 @@ impl NeighborhoodShell {
                 ..ShellOutcome::default()
             };
         }
+        if self.album_notice_open() {
+            return self.press_shell_dialog(point);
+        }
         if self.album_dialog.is_open() {
             if let Some(snapshot) = &self.album_snapshot {
-                let layout = self.album_dialog.layout(self.size[0], self.size[1]);
-                self.album_strip_pressed = if layout.strip_prev.contains(point[0], point[1]) {
-                    Some(-1)
-                } else if layout.strip_next.contains(point[0], point[1]) {
-                    Some(1)
-                } else {
-                    None
-                };
                 let changed = self
                     .album_dialog
                     .handle_pointer_down(point, self.size, snapshot);
@@ -2814,23 +2860,15 @@ impl NeighborhoodShell {
                 None => ShellOutcome::redraw(),
             };
         }
+        if self.album_notice_open() {
+            return self.release_shell_dialog(point);
+        }
         if self.album_dialog.is_open() {
-            let strip_pressed = self.album_strip_pressed.take();
-            let layout = self.album_dialog.layout(self.size[0], self.size[1]);
             let cmds = self
                 .album_snapshot
                 .clone()
                 .map(|snap| self.album_dialog.handle_pointer_up(point, self.size, &snap))
                 .unwrap_or_default();
-            if let Some(snap) = &self.album_snapshot {
-                let max_scroll = snap.entries.len().saturating_sub(layout.thumb_slots.len());
-                if strip_pressed == Some(-1) && layout.strip_prev.contains(point[0], point[1]) {
-                    self.album_strip_scroll = self.album_strip_scroll.saturating_sub(1);
-                } else if strip_pressed == Some(1) && layout.strip_next.contains(point[0], point[1])
-                {
-                    self.album_strip_scroll = (self.album_strip_scroll + 1).min(max_scroll);
-                }
-            }
             let out = self.execute_album_commands(cmds);
             self.hydrate_album_images();
             return out;
@@ -2969,10 +3007,18 @@ impl NeighborhoodShell {
     }
 
     pub fn key_dialog(&mut self, key: DialogKey) -> ShellOutcome {
+        if self.album_notice_open() {
+            return self.key_shell_dialog(key);
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             let out = session.game.dialog_confirm_key(key);
             return self.handle_lot_outcome(out);
         }
+        self.key_shell_dialog(key)
+    }
+
+    /// Answers the shell dialog from a key.
+    fn key_shell_dialog(&mut self, key: DialogKey) -> ShellOutcome {
         let Some(dlg) = &self.dialog else {
             return ShellOutcome::default();
         };
@@ -3040,6 +3086,9 @@ impl NeighborhoodShell {
             self.close_travel_dialog();
             return ShellOutcome::redraw();
         }
+        if self.album_notice_open() {
+            return self.key_shell_dialog(DialogKey::Escape);
+        }
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::Escape);
         }
@@ -3096,6 +3145,9 @@ impl NeighborhoodShell {
     }
 
     pub fn key_char(&mut self, ch: char) -> ShellOutcome {
+        if self.album_notice_open() {
+            return self.key_shell_dialog(DialogKey::Char(ch));
+        }
         if self.coop_lobby.is_open() {
             return ShellOutcome {
                 redraw: self.coop_lobby.insert_char(ch),
@@ -3485,6 +3537,9 @@ impl NeighborhoodShell {
             }
             return ShellOutcome::default();
         }
+        if self.album_notice_open() {
+            return self.key_shell_dialog(DialogKey::Enter);
+        }
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::Enter);
         }
@@ -3515,11 +3570,19 @@ impl NeighborhoodShell {
     /// Quit, and Photo).
     pub fn handle_lot_outcome(&mut self, outcome: crate::game::Outcome) -> ShellOutcome {
         self.persist_options();
+        // A Camera Mode click's photo goes to the household's album only
+        // (`cWinCamera`, `0x4a9144`): the host writes no file for it. The
+        // screenshot hotkey keeps its own route.
         let mut out = ShellOutcome {
             redraw: outcome.redraw,
             quit: false,
-            photo: outcome.photo,
+            photo: false,
         };
+        if outcome.photo
+            && let Err(err) = self.capture_lot_photo()
+        {
+            self.show_notice("Photo Album", format!("The photo was not saved: {err}"));
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen
             && session.game.asking().is_none()
             && session.game.asking_special_panel().is_none()
@@ -4066,7 +4129,16 @@ impl NeighborhoodShell {
                 (loaded.payload.clone(), None)
             }
             SavePayloadKind::WorldSnapshot => {
-                let world = sims_sim::World::decode(&loaded.payload).map_err(|e| e.to_string())?;
+                let (mut world, queues) = sims_sim::World::decode_snapshot_parts(&loaded.payload)
+                    .map_err(|e| e.to_string())?;
+                if loaded.metadata.format_version < sims_sim::AUTOSAVE_MADE_ORDER_FORMAT {
+                    world.characters.made.sort_by_guid();
+                }
+                // A payload saved before the queues were kept takes its star
+                // pools from where its stars stand, as a `Saved` of that age
+                // does.
+                let queues =
+                    queues.unwrap_or_else(|| sims_vm::boot::save::queues_saved_before_kept(&world));
                 // Obtain a compatible base `Saved` envelope without touching a
                 // potentially corrupt SAVED_LOTS entry: reuse the open lot if it
                 // matches `lot_id`, otherwise boot the clean base house in staging.
@@ -4090,6 +4162,12 @@ impl NeighborhoodShell {
                     }
                 };
                 let spliced = splice_world_into_saved_bytes(&base_saved, &world)?;
+                // The splice keeps the base lot's pending indicator refreshes,
+                // which may name people the restored world lacks: take the
+                // snapshot's own (`World::encode_snapshot`).
+                let mut spliced = Saved::decode(&spliced).map_err(|e| e.to_string())?;
+                spliced.set_indicator_queues(queues);
+                let spliced = spliced.encode();
                 (spliced, Some(loaded.metadata.sim_tick))
             }
             SavePayloadKind::Custom(tag) => {
@@ -6005,6 +6083,8 @@ impl NeighborhoodShell {
             preview_image: None,
             preview_label: None,
             hide_wallet_and_prices: true,
+            choice: None,
+            body_shapes: Vec::new(),
         });
         self.import_picker.open();
         true
@@ -6022,7 +6102,10 @@ impl NeighborhoodShell {
                 self.close_import_family_picker();
                 ShellOutcome::redraw()
             }
-            ShopCommand::TryOn { .. } | ShopCommand::RotatePreview(_) => ShellOutcome::redraw(),
+            // The import picker is a list, never a choice dialog.
+            ShopCommand::TryOn { .. }
+            | ShopCommand::RotatePreview(_)
+            | ShopCommand::NoSelection => ShellOutcome::redraw(),
             ShopCommand::Buy { item_id, .. } => {
                 let Some(entry) = self.import_picker_entries.get(&item_id).cloned() else {
                     return ShellOutcome::redraw();
@@ -6256,7 +6339,17 @@ impl NeighborhoodShell {
     /// Opens the Photo Album modal for the active lot's household (or hovered /
     /// first neighborhood household when on the Neighborhood map).
     pub fn open_photo_album(&mut self) -> Result<(), String> {
-        let family_id = match &self.screen {
+        let family_id = self
+            .album_family()
+            .ok_or_else(|| "no household available for Photo Album".to_owned())?;
+        self.open_photo_album_for_family(family_id)
+    }
+
+    /// The household whose album the Photo Album opens and Camera Mode
+    /// photos go into: the active lot's family, or the hovered or first
+    /// household on the Neighborhood map.
+    fn album_family(&self) -> Option<u16> {
+        match &self.screen {
             ActiveScreen::Lot(session) => {
                 if let Some(trip) = &session.active_trip {
                     Some(trip.home_family)
@@ -6285,8 +6378,6 @@ impl NeighborhoodShell {
                 .and_then(|lot| self.stored.family_in(u32::from(lot)).map(|(id, _)| id))
                 .or_else(|| self.stored.families.keys().next().copied()),
         }
-        .ok_or_else(|| "no household available for Photo Album".to_owned())?;
-        self.open_photo_album_for_family(family_id)
     }
 
     /// Opens the Photo Album modal for a specific `family_id` in the active
@@ -6302,30 +6393,111 @@ impl NeighborhoodShell {
             .family_token(&nh_id, family_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("family {family_id} not found in neighborhood {nh_id:?}"))?;
+        // A fresh dialog, as native's new `cWinScrapbook` is (see
+        // `PhotoAlbumDialog::reset_view`), on the album's current photo.
+        self.album_dialog.reset_view();
         let (snapshot, has_image) = self.build_album_snapshot(&nh_id, family_id, None)?;
         self.clear_hover_state();
         if let ActiveScreen::Lot(session) = &mut self.screen {
             session.game.close_camera_strip();
         }
         self.album_token = Some(token);
-        self.album_neighborhood_id = Some(nh_id);
         self.album_has_image = has_image;
-        self.album_strip_scroll = 0;
-        self.album_strip_pressed = None;
         self.album_dialog.open(&snapshot);
+        // `0x52b119` shows the album's current photo; Done leaves it as it
+        // was last shown (`close_photo_album`).
+        let current = self.album_index.get(&token).copied().unwrap_or(0);
+        self.album_dialog.show_index(&snapshot, current);
+        self.album_neighborhood_id = Some(nh_id);
         self.album_snapshot = Some(snapshot);
+        self.hydrate_album_images();
         Ok(())
     }
 
-    /// Closes the Photo Album modal cleanly.
+    /// Stores a Camera Mode photo of the open lot in its household's album
+    /// (`cWinCamera`: clicking the lot takes the picture). The picture is
+    /// the Camera Mode size crop of the house view ([`Game::take_photo`]).
+    ///
+    /// An error means the photo was not stored. Once it is stored the ID
+    /// is returned; an open album that then fails to refresh is reported
+    /// with a notice, not as an error, so a retry cannot store it twice.
+    pub fn capture_lot_photo(&mut self) -> Result<PhotoId, String> {
+        let family_id = self
+            .album_family()
+            .ok_or_else(|| "no household for the photo".to_owned())?;
+        let ActiveScreen::Lot(session) = &mut self.screen else {
+            return Err("a photo needs an open lot".to_owned());
+        };
+        let nh_id = session.neighborhood_id.clone();
+        let image = capture_canvas_to_album_image(&session.game.take_photo())?;
+        let sim_day = u32::try_from(
+            session
+                .game
+                .lot()
+                .world()
+                .globals
+                .get(28)
+                .copied()
+                .unwrap_or(0)
+                .max(0),
+        )
+        .ok()
+        .map(|d| d + 1);
+        let title = {
+            let name = session.game.lot().lot_name().trim();
+            if name.is_empty() {
+                format!("Lot {}", session.house)
+            } else {
+                name.to_owned()
+            }
+        };
+        let token = self
+            .store
+            .albums()
+            .family_token(&nh_id, family_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("family {family_id} not found in neighborhood {nh_id:?}"))?;
+        let mut entry = NewAlbumPhoto::with_image(title, "", image);
+        if let Some(day) = sim_day {
+            entry = entry.with_sim_day(day);
+        }
+        let photo = self
+            .store
+            .albums()
+            .add(&nh_id, token, entry)
+            .map_err(|e| e.to_string())?;
+        let id = PhotoId(photo.id);
+        // Adding a photo makes it the album's current one (`0x4ed857`): the
+        // index past the end is clamped to the newest when the album opens.
+        // An album open now keeps the photo it shows, and records that on
+        // close.
+        self.album_index.insert(token, usize::MAX);
+        if self.album_dialog.is_open()
+            && self.album_token == Some(token)
+            && let Err(err) = self.refresh_album_snapshot()
+        {
+            self.show_notice(
+                "Photo Album",
+                format!("The photo was saved, but the album did not refresh: {err}"),
+            );
+        }
+        Ok(id)
+    }
+
+    /// Closes the Photo Album modal cleanly. The album keeps the photo it
+    /// showed as its current one, for the next opening.
     pub fn close_photo_album(&mut self) {
+        if self.album_dialog.is_open()
+            && let (Some(token), Some(snapshot)) = (self.album_token, self.album_snapshot.as_ref())
+        {
+            let shown = self.album_dialog.shown_index(snapshot).unwrap_or(0);
+            self.album_index.insert(token, shown);
+        }
         self.album_dialog.close();
         self.album_snapshot = None;
         self.album_token = None;
         self.album_neighborhood_id = None;
         self.album_has_image.clear();
-        self.album_strip_scroll = 0;
-        self.album_strip_pressed = None;
     }
 
     fn build_album_snapshot(
@@ -6349,15 +6521,6 @@ impl NeighborhoodShell {
             .and_then(|sel| summaries.iter().position(|s| s.id == sel.0))
             .unwrap_or(0);
         let (win_start, win_end) = album_hydration_window(summaries.len(), focus_idx);
-        let visible_slots = self
-            .album_dialog
-            .layout(self.size[0], self.size[1])
-            .thumb_slots
-            .len();
-        let strip_start = self
-            .album_strip_scroll
-            .min(summaries.len().saturating_sub(visible_slots));
-        let strip_end = (strip_start + visible_slots + 2).min(summaries.len());
         let mut entries = Vec::with_capacity(summaries.len());
         let mut has_image = BTreeSet::new();
         for (idx, s) in summaries.into_iter().enumerate() {
@@ -6367,10 +6530,8 @@ impl NeighborhoodShell {
                 has_image.insert(pid);
             }
             let in_sel = idx >= win_start && idx < win_end;
-            let in_strip = idx >= strip_start && idx < strip_end;
-            let (image, thumbnail) = if entry_has_img && (in_sel || in_strip) {
-                let loaded = self
-                    .store
+            let image = if entry_has_img && in_sel {
+                self.store
                     .albums()
                     .get(nh_id, family_id, s.id)
                     .map_err(|e| e.to_string())?
@@ -6379,24 +6540,15 @@ impl NeighborhoodShell {
                         width: img.width,
                         height: img.height,
                         rgba: img.to_rgba(),
-                    });
-                let thumb = loaded
-                    .as_ref()
-                    .map(|img| downscale_album_thumbnail(img, 78, 60));
-                if in_sel {
-                    (loaded, thumb)
-                } else {
-                    (None, thumb)
-                }
+                    })
             } else {
-                (None, None)
+                None
             };
             entries.push(AlbumEntry {
                 id: pid,
                 title: s.title,
                 caption: s.caption,
                 image,
-                thumbnail,
                 sim_day: s.sim_day,
             });
         }
@@ -6404,107 +6556,62 @@ impl NeighborhoodShell {
             AlbumSnapshot {
                 family_name,
                 entries,
-                can_capture_snapshot: matches!(self.screen, ActiveScreen::Lot(_)),
             },
             has_image,
         ))
     }
 
-    fn sync_album_strip_scroll_to_selection(&mut self) {
-        let Some(selected) = self.album_dialog.selected_id() else {
-            return;
-        };
-        let Some(snapshot) = &self.album_snapshot else {
-            return;
-        };
-        let total = snapshot.entries.len();
-        let visible_slots = self
-            .album_dialog
-            .layout(self.size[0], self.size[1])
-            .thumb_slots
-            .len();
-        if visible_slots == 0 || total == 0 {
-            self.album_strip_scroll = 0;
-            return;
-        }
-        let max_scroll = total.saturating_sub(visible_slots);
-        if let Some(idx) = snapshot.entries.iter().position(|e| e.id == selected) {
-            if idx < self.album_strip_scroll {
-                self.album_strip_scroll = idx;
-            } else if idx >= self.album_strip_scroll + visible_slots {
-                self.album_strip_scroll = idx + 1 - visible_slots;
-            }
-        }
-        self.album_strip_scroll = self.album_strip_scroll.min(max_scroll);
-    }
-
+    /// Loads the shown photo and its neighbors, and drops the rest, so
+    /// a large album stays bounded in memory.
     fn hydrate_album_images(&mut self) {
         let (Some(nh_id), Some(token)) = (self.album_neighborhood_id.clone(), self.album_token)
         else {
             return;
         };
-        let visible_slots = self
-            .album_dialog
-            .layout(self.size[0], self.size[1])
-            .thumb_slots
-            .len();
         let selected = self.album_dialog.selected_id();
         let Some(snapshot) = self.album_snapshot.as_mut() else {
             return;
         };
         let total = snapshot.entries.len();
         if total == 0 {
-            self.album_strip_scroll = 0;
             return;
         }
         let focus_idx = selected
             .and_then(|sel| snapshot.entries.iter().position(|e| e.id == sel))
             .unwrap_or(0);
         let (win_start, win_end) = album_hydration_window(total, focus_idx);
-        let max_scroll = total.saturating_sub(visible_slots);
-        self.album_strip_scroll = self.album_strip_scroll.min(max_scroll);
-        let strip_start = self.album_strip_scroll.saturating_sub(1);
-        let strip_end = (self.album_strip_scroll + visible_slots + 2).min(total);
         for (idx, entry) in snapshot.entries.iter_mut().enumerate() {
-            let in_sel = idx >= win_start && idx < win_end;
-            let in_strip = idx >= strip_start && idx < strip_end;
-            let has_img = self.album_has_image.contains(&entry.id);
-            if in_sel {
-                if has_img
-                    && entry.image.is_none()
-                    && let Ok(Some(photo)) =
-                        self.store.albums().get(&nh_id, token.family_id, entry.id.0)
-                    && let Some(img) = photo.image
-                {
-                    let full = Image {
-                        width: img.width,
-                        height: img.height,
-                        rgba: img.to_rgba(),
-                    };
-                    if entry.thumbnail.is_none() {
-                        entry.thumbnail = Some(downscale_album_thumbnail(&full, 78, 60));
-                    }
-                    entry.image = Some(full);
-                }
-            } else {
-                // Keep full-resolution memory bounded even for large albums.
+            if !(win_start..win_end).contains(&idx) {
                 entry.image = None;
-                if in_strip
-                    && has_img
-                    && entry.thumbnail.is_none()
-                    && let Ok(Some(photo)) =
-                        self.store.albums().get(&nh_id, token.family_id, entry.id.0)
-                    && let Some(img) = photo.image
-                {
-                    let full = Image {
-                        width: img.width,
-                        height: img.height,
-                        rgba: img.to_rgba(),
-                    };
-                    entry.thumbnail = Some(downscale_album_thumbnail(&full, 78, 60));
-                }
+            } else if entry.image.is_none()
+                && self.album_has_image.contains(&entry.id)
+                && let Ok(Some(photo)) =
+                    self.store.albums().get(&nh_id, token.family_id, entry.id.0)
+                && let Some(img) = photo.image
+            {
+                entry.image = Some(Image {
+                    width: img.width,
+                    height: img.height,
+                    rgba: img.to_rgba(),
+                });
             }
         }
+    }
+
+    /// After a delete, native keeps the current index, clamped to the new
+    /// last photo (`0x4ee087`): with A B C D, deleting C shows D and
+    /// deleting D shows C. Deleting the only photo closes the album
+    /// (`0x52b0c8`).
+    fn after_album_delete(&mut self, index: usize) {
+        let Some(snapshot) = self.album_snapshot.clone() else {
+            return;
+        };
+        if snapshot.entries.is_empty() {
+            self.close_photo_album();
+            return;
+        }
+        self.album_dialog.show_index(&snapshot, index);
+        self.hydrate_album_images();
     }
 
     fn reload_album_snapshot(&mut self, select_id: Option<PhotoId>) -> Result<(), String> {
@@ -6520,12 +6627,32 @@ impl NeighborhoodShell {
             self.album_dialog.select_entry(&snapshot, id);
         }
         self.album_snapshot = Some(snapshot);
-        self.sync_album_strip_scroll_to_selection();
+        self.hydrate_album_images();
+        Ok(())
+    }
+
+    /// Rebuilds the open album from the store without moving its
+    /// selection: the selected photo and any caption being typed stay as
+    /// they are, and new photos join the list.
+    fn refresh_album_snapshot(&mut self) -> Result<(), String> {
+        let (Some(nh_id), Some(token)) = (self.album_neighborhood_id.clone(), self.album_token)
+        else {
+            return Err("Photo Album is not open".into());
+        };
+        let keep = self.album_dialog.selected_id();
+        let (snapshot, has_image) = self.build_album_snapshot(&nh_id, token.family_id, keep)?;
+        self.album_has_image = has_image;
+        self.album_dialog.sync_snapshot(&snapshot);
+        self.album_snapshot = Some(snapshot);
         self.hydrate_album_images();
         Ok(())
     }
 
     fn send_album_key(&mut self, key: AlbumKey) -> ShellOutcome {
+        // A notice over the album takes the keys (see `album_notice_open`).
+        if self.dialog.is_some() {
+            return ShellOutcome::default();
+        }
         let cmds = self
             .album_snapshot
             .clone()
@@ -6535,7 +6662,6 @@ impl NeighborhoodShell {
             })
             .unwrap_or_default();
         let out = self.execute_album_commands(cmds);
-        self.sync_album_strip_scroll_to_selection();
         self.hydrate_album_images();
         out
     }
@@ -6563,87 +6689,7 @@ impl NeighborhoodShell {
                 if let Some(snap) = &self.album_snapshot {
                     self.album_dialog.select_entry(snap, id);
                 }
-                self.sync_album_strip_scroll_to_selection();
                 self.hydrate_album_images();
-                ShellOutcome::redraw()
-            }
-            AlbumCommand::CaptureSnapshot => {
-                let (Some(nh_id), Some(token)) =
-                    (self.album_neighborhood_id.clone(), self.album_token)
-                else {
-                    return ShellOutcome::redraw();
-                };
-                let capture = if let ActiveScreen::Lot(session) = &mut self.screen {
-                    session.game.render();
-                    let canvas = session.game.canvas();
-                    let sim_day = u32::try_from(
-                        session
-                            .game
-                            .lot()
-                            .world()
-                            .globals
-                            .get(28)
-                            .copied()
-                            .unwrap_or(0)
-                            .max(0),
-                    )
-                    .ok()
-                    .map(|d| d + 1);
-                    let lot_title = {
-                        let name = session.game.lot().lot_name().trim();
-                        if !name.is_empty() {
-                            name.to_owned()
-                        } else {
-                            format!("Lot {}", session.house)
-                        }
-                    };
-                    capture_canvas_to_album_image(canvas).map(|img| (lot_title, img, sim_day))
-                } else {
-                    Err("snapshot capture requires an open lot".to_owned())
-                };
-                match capture {
-                    Ok((title, img, sim_day)) => {
-                        let mut entry = NewAlbumPhoto::with_image(title, "", img);
-                        if let Some(day) = sim_day {
-                            entry = entry.with_sim_day(day);
-                        }
-                        match self.store.albums().add(&nh_id, token, entry) {
-                            Ok(photo) => {
-                                if let Err(err) =
-                                    self.reload_album_snapshot(Some(PhotoId(photo.id)))
-                                {
-                                    self.set_note(format!(
-                                        "Saved snapshot; album reload error: {err}"
-                                    ));
-                                }
-                            }
-                            Err(err) => {
-                                self.set_note(format!("Could not save snapshot: {err}"));
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        self.set_note(format!("Snapshot capture failed: {err}"));
-                    }
-                }
-                ShellOutcome::redraw()
-            }
-            AlbumCommand::AddBlankPage => {
-                if let (Some(nh_id), Some(token)) =
-                    (self.album_neighborhood_id.clone(), self.album_token)
-                {
-                    let page = NewAlbumPhoto::blank("", "");
-                    match self.store.albums().add(&nh_id, token, page) {
-                        Ok(photo) => {
-                            if let Err(err) = self.reload_album_snapshot(Some(PhotoId(photo.id))) {
-                                self.set_note(format!("Added page; album reload error: {err}"));
-                            }
-                        }
-                        Err(err) => {
-                            self.set_note(format!("Could not add album page: {err}"));
-                        }
-                    }
-                }
                 ShellOutcome::redraw()
             }
             AlbumCommand::UpdateEntryText { id, title, caption } => {
@@ -6694,12 +6740,18 @@ impl NeighborhoodShell {
                 if let (Some(nh_id), Some(token)) =
                     (self.album_neighborhood_id.clone(), self.album_token)
                 {
+                    let index = self
+                        .album_snapshot
+                        .as_ref()
+                        .and_then(|snap| snap.entries.iter().position(|e| e.id == id))
+                        .unwrap_or(0);
                     match self.store.albums().delete(&nh_id, token, id.0) {
-                        Ok(_) => {
-                            if let Err(err) = self.reload_album_snapshot(None) {
+                        Ok(_) => match self.reload_album_snapshot(None) {
+                            Ok(()) => self.after_album_delete(index),
+                            Err(err) => {
                                 self.set_note(format!("Deleted entry; album reload error: {err}"));
                             }
-                        }
+                        },
                         Err(err) => {
                             self.set_note(format!("Could not delete album entry: {err}"));
                         }
@@ -8092,32 +8144,6 @@ fn album_hydration_window(total: usize, focus_idx: usize) -> (usize, usize) {
         .saturating_sub(half)
         .min(total - ALBUM_IMAGE_WINDOW);
     (start, start + ALBUM_IMAGE_WINDOW)
-}
-
-fn downscale_album_thumbnail(src: &Image, max_w: u32, max_h: u32) -> Image {
-    if src.width == 0 || src.height == 0 || (src.width <= max_w && src.height <= max_h) {
-        return src.clone();
-    }
-    let scale = (max_w as f32 / src.width as f32).min(max_h as f32 / src.height as f32);
-    let dst_w = ((src.width as f32 * scale).round() as u32).clamp(1, max_w);
-    let dst_h = ((src.height as f32 * scale).round() as u32).clamp(1, max_h);
-    let mut rgba = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
-    for dy in 0..dst_h {
-        let sy = ((u64::from(dy) * u64::from(src.height)) / u64::from(dst_h))
-            .min(u64::from(src.height.saturating_sub(1))) as usize;
-        for dx in 0..dst_w {
-            let sx = ((u64::from(dx) * u64::from(src.width)) / u64::from(dst_w))
-                .min(u64::from(src.width.saturating_sub(1))) as usize;
-            let s = (sy * src.width as usize + sx) * 4;
-            let d = (dy as usize * dst_w as usize + dx as usize) * 4;
-            rgba[d..d + 4].copy_from_slice(&src.rgba[s..s + 4]);
-        }
-    }
-    Image {
-        width: dst_w,
-        height: dst_h,
-        rgba,
-    }
 }
 
 fn load_persisted_custom_thumbs(

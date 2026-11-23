@@ -16,6 +16,16 @@ use sims_formats::sprite::{DrawGroup, Palette, SpriteSet};
 use sims_formats::strings::StringTable;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+mod iff;
+mod live;
+mod replay;
+pub use iff::{
+    IffEquivOptions, IffEquivReport, IffVerdict, Reach, ResourceReport, ResourceVerdict,
+    check_iff_equivalent, check_tree_with_callees, library_arities_from_iff, not_run_from_file,
+    runs_from_own_file, same_tree_bytes, single_file_problem, tree_reach,
+};
+pub use live::{GUARANTEED_ATTRIBUTES, LiveContext, LiveOptions, check_bhav_live_equivalent};
+
 /// Category of safety violation reported by [`verify_object_safety`] / [`verify_pack_safety`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SafetyCategory {
@@ -102,7 +112,13 @@ pub struct EquivOptions {
     /// Maximum path depth explored before returning `Inconclusive`.
     pub max_depth: usize,
     /// Maximum consecutive silent local/no-op steps per side before returning `Inconclusive`.
+    /// Zero turns silent steps off, so every node is matched with a node of the other tree.
     pub max_silent_steps: usize,
+    /// Require the thread's last branch result to agree at exit and before primitives
+    /// (see [`LiveOptions::observe_last_result`]). Off by default: a structured lift may
+    /// word a final test the other way round. Needs `max_silent_steps == 0`, since a
+    /// silent step changes the result on one side only.
+    pub observe_last_result: bool,
 }
 
 impl Default for EquivOptions {
@@ -111,6 +127,7 @@ impl Default for EquivOptions {
             max_states: 4096,
             max_depth: 512,
             max_silent_steps: 64,
+            observe_last_result: false,
         }
     }
 }
@@ -4281,6 +4298,9 @@ fn advance_silent(
     limit: usize,
     uses_global_34: bool,
 ) -> std::result::Result<u8, String> {
+    if limit == 0 {
+        return Ok(pc);
+    }
     for _ in 0..limit {
         let Some(next) = try_silent_step(bhav, pc, env, interner, uses_global_34) else {
             return Ok(pc);
@@ -4299,6 +4319,9 @@ struct ProductState {
     env_a: LocalEnv,
     env_b: LocalEnv,
     constraints: BTreeMap<CanonPred, bool>,
+    /// Whether the two threads' last branch results may differ (only tracked with
+    /// [`EquivOptions::observe_last_result`]).
+    last_differs: bool,
 }
 
 /// Checks whether two BHAV chunks `a` and `b` are behaviorally trace-equivalent
@@ -4324,6 +4347,25 @@ pub fn check_bhav_equivalent_with_arities(
     b: &BhavChunk,
     opts: &EquivOptions,
     callee_arities: Option<&BTreeMap<u16, usize>>,
+) -> EquivResult {
+    lockstep_traced(a, b, opts, callee_arities, &mut LockstepTrace::default())
+}
+
+/// Which node pairs a lockstep run visited.
+#[derive(Debug, Default)]
+struct LockstepTrace {
+    /// Every `(node in A, node in B)` pair the product ran.
+    pairs: BTreeSet<(u8, u8)>,
+    /// Whether some pair ran while the two sides' last branch results may differ.
+    last_differs_mid_run: bool,
+}
+
+fn lockstep_traced(
+    a: &BhavChunk,
+    b: &BhavChunk,
+    opts: &EquivOptions,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+    trace: &mut LockstepTrace,
 ) -> EquivResult {
     if a.kind != b.kind {
         return EquivResult::Counterexample {
@@ -4398,6 +4440,7 @@ pub fn check_bhav_equivalent_with_arities(
             env_a: LocalEnv::new(args_a, locals_a),
             env_b: LocalEnv::new(args_b, locals_b),
             constraints: BTreeMap::new(),
+            last_differs: false,
         };
         if visited.insert(init.clone()) {
             queue.push_back((init, Vec::new()));
@@ -4443,6 +4486,10 @@ pub fn check_bhav_equivalent_with_arities(
             Ok(pc) => pc,
             Err(reason) => return EquivResult::Inconclusive { reason },
         };
+        if opts.observe_last_result && (pc_a != state.pc_a || pc_b != state.pc_b) {
+            // A silent step sets its side's last result alone.
+            state.last_differs = true;
+        }
         state.pc_a = pc_a;
         state.pc_b = pc_b;
 
@@ -4451,6 +4498,15 @@ pub fn check_bhav_equivalent_with_arities(
 
         if term_a || term_b {
             if pc_a == pc_b {
+                if opts.observe_last_result && state.last_differs {
+                    return EquivResult::Counterexample {
+                        path,
+                        divergence: format!(
+                            "both trees reach {} but their last branch results may differ",
+                            format_pc(pc_a)
+                        ),
+                    };
+                }
                 paths_verified += 1;
                 continue;
             }
@@ -4468,6 +4524,8 @@ pub fn check_bhav_equivalent_with_arities(
         // frame-local environments on A and B, widen both sides symmetrically to distinct
         // `WidenedLocal`/`WidenedParam` tokens (never colliding with `Sym`) so unbounded
         // identical loops prove equivalent in O(N) states!
+        trace.pairs.insert((pc_a, pc_b));
+        trace.last_differs_mid_run |= state.last_differs;
         let pair_hits = pc_pair_visits.entry((pc_a, pc_b)).or_insert(0);
         *pair_hits += 1;
         if *pair_hits > 4 && state.env_a == state.env_b {
@@ -4489,6 +4547,7 @@ pub fn check_bhav_equivalent_with_arities(
                 env_a: widened_a,
                 env_b: widened_b,
                 constraints: BTreeMap::new(),
+                last_differs: state.last_differs,
             };
             if !visited.insert(widened.clone()) {
                 paths_verified += 1;
@@ -4554,6 +4613,14 @@ pub fn check_bhav_equivalent_with_arities(
                 ins_b.on_false,
                 can_commute_b,
             );
+            // Whether canonicalization swapped a side's targets, which makes its own
+            // result the negation of the canonical predicate's value.
+            let swapped = |op: u8, l: CanonOperand, r: CanonOperand, commute: bool| {
+                canonicalize_compare(op, l, r, 0, 1, commute).is_some_and(|(_, t, _)| t == 1)
+            };
+            let last_differs = opts.observe_last_result
+                && swapped(ins_a.operands[5], la, ra, can_commute_a)
+                    != swapped(ins_b.operands[5], lb, rb, can_commute_b);
             match (norm_a, norm_b) {
                 (Some((pred_a, ta, fa)), Some((pred_b, tb, fb))) if pred_a == pred_b => {
                     let mut enqueue = |na: u8, nb: u8, branch: bool, record_pred: Option<bool>| {
@@ -4573,6 +4640,7 @@ pub fn check_bhav_equivalent_with_arities(
                             env_a: state.env_a.clone(),
                             env_b: state.env_b.clone(),
                             constraints: next_constraints,
+                            last_differs,
                         };
                         if visited.insert(next.clone()) {
                             let mut next_path = path.clone();
@@ -4693,6 +4761,7 @@ pub fn check_bhav_equivalent_with_arities(
                     env_a: next_env_a.clone(),
                     env_b: next_env_b.clone(),
                     constraints: next_constraints.clone(),
+                    last_differs: false,
                 };
                 if visited.insert(next.clone()) {
                     let mut next_path = path.clone();
@@ -4735,6 +4804,16 @@ pub fn check_bhav_equivalent_with_arities(
                     canonicalize_primitive_operands(ins_a.opcode, ins_a.operands),
                     ins_b.opcode,
                     canonicalize_primitive_operands(ins_b.opcode, ins_b.operands),
+                ),
+            };
+        }
+        // A primitive may start a tree that reads the last result (`found_action.rs:102`).
+        if opts.observe_last_result && state.last_differs {
+            return EquivResult::Counterexample {
+                path,
+                divergence: format!(
+                    "last branch results may differ before op {:#06x} at A@n{pc_a} vs B@n{pc_b}",
+                    ins_a.opcode
                 ),
             };
         }
@@ -4905,6 +4984,7 @@ pub fn check_bhav_equivalent_with_arities(
                 env_a: ea,
                 env_b: eb,
                 constraints: base_constraints.clone(),
+                last_differs: false,
             };
             if visited.insert(next.clone()) {
                 let mut next_path = path.clone();
@@ -5030,91 +5110,172 @@ fn check_primitive_frame_reads(
         }
         Ok(())
     };
+    for frame_use in primitive_frame_uses(opcode, ops) {
+        match frame_use {
+            FrameUse::Read(scope, idx, label) => check_op(scope, idx, label)?,
+            FrameUse::Dst(scope, idx, label) => check_dst(scope, idx, label)?,
+            FrameUse::AllLocals(name) => {
+                if env_a.local_count != env_b.local_count || env_a.locals != env_b.locals {
+                    return Err(FrameCheckErr::Inconclusive(format!(
+                        "{name} text formatting may read frame locals via $Local tokens and local state differs"
+                    )));
+                }
+            }
+            FrameUse::WholeFrame => {
+                if env_a != env_b {
+                    return Err(FrameCheckErr::Divergence(format!(
+                        "frame-private state divergence before primitive opcode {opcode:#06x}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One frame-private operand a primitive touches (`sims-vm/src/primitives/*.rs`).
+///
+/// Shared by the lockstep checker ([`check_primitive_frame_reads`]) and the live-output
+/// checker (`live`) so both model exactly the same per-primitive frame reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameUse {
+    /// Reads `(scope, idx)`; scope 22 reads `param[idx]` as its indirection.
+    Read(u8, i16, &'static str),
+    /// Writes (or bounds-checks as a destination) `(scope, idx)`; scope 22 reads `param[idx]`.
+    Dst(u8, i16, &'static str),
+    /// Text formatting may read any frame local (`Dialog` / `ActionString` `$Local` tokens).
+    AllLocals(&'static str),
+    /// Unmodeled primitive: every frame-private slot may be read.
+    WholeFrame,
+}
+
+/// Lists the frame-private operands primitive `opcode` reads or writes.
+fn primitive_frame_uses(opcode: u16, ops: &[u8; 8]) -> Vec<FrameUse> {
+    let mut uses = Vec::new();
     match opcode {
-        0 => check_op(9, word_i16(ops, 0), "Sleep param"),
+        0 => uses.push(FrameUse::Read(9, word_i16(ops, 0), "Sleep param")),
         1 | 3 | 4 | 5 | 6 | 7 | 9 | 10 | 18 | 20 | 21 | 22 | 23 | 27 | 28 | 30 | 33 | 48 | 49
-        | 51 => Ok(()),
+        | 51 => {}
         8 => {
             let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
             if dst_scope <= 255 {
-                check_dst(dst_scope as u8, word_i16(ops, 0), "Random destination")?;
+                uses.push(FrameUse::Dst(
+                    dst_scope as u8,
+                    word_i16(ops, 0),
+                    "Random destination",
+                ));
             }
             let rng_scope = u16::from_le_bytes([ops[6], ops[7]]);
             if rng_scope <= 255 {
-                check_op(rng_scope as u8, word_i16(ops, 4), "Random range")?;
+                uses.push(FrameUse::Read(
+                    rng_scope as u8,
+                    word_i16(ops, 4),
+                    "Random range",
+                ));
             }
-            Ok(())
         }
         11 => {
             if ops[2] & 1 != 0 {
-                check_op(ops[3], word_i16(ops, 4), "GetDistanceTo from")?;
+                uses.push(FrameUse::Read(
+                    ops[3],
+                    word_i16(ops, 4),
+                    "GetDistanceTo from",
+                ));
             }
-            Ok(())
         }
         12 => {
             let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
             if dst_scope <= 255 {
-                check_dst(
+                uses.push(FrameUse::Dst(
                     dst_scope as u8,
                     word_i16(ops, 0),
                     "GetDirectionTo destination",
-                )?;
+                ));
             }
             if ops[4] & 1 != 0 {
-                check_op(ops[5], word_i16(ops, 6), "GetDirectionTo from")?;
+                uses.push(FrameUse::Read(
+                    ops[5],
+                    word_i16(ops, 6),
+                    "GetDirectionTo from",
+                ));
             }
-            Ok(())
         }
         13 => {
             if ops[3] & 2 != 0 {
-                check_op(25, i16::from(ops[1]), "PushInteraction object local")?;
+                uses.push(FrameUse::Read(
+                    25,
+                    i16::from(ops[1]),
+                    "PushInteraction object local",
+                ));
             } else {
-                check_op(9, i16::from(ops[1]), "PushInteraction object param")?;
+                uses.push(FrameUse::Read(
+                    9,
+                    i16::from(ops[1]),
+                    "PushInteraction object param",
+                ));
             }
             if ops[3] & 1 != 0 {
-                check_op(25, i16::from(ops[4]), "PushInteraction icon local")?;
+                uses.push(FrameUse::Read(
+                    25,
+                    i16::from(ops[4]),
+                    "PushInteraction icon local",
+                ));
             }
-            Ok(())
         }
         14 => {
             if ops[6] & 8 != 0 {
                 let scope = u16::from_le_bytes([ops[4], ops[5]]);
                 if scope <= 255 {
-                    check_op(scope as u8, word_i16(ops, 2), "FindBestObject origin")?;
+                    uses.push(FrameUse::Read(
+                        scope as u8,
+                        word_i16(ops, 2),
+                        "FindBestObject origin",
+                    ));
                 }
             }
-            Ok(())
         }
         15 => {
             let scope = word_i16(ops, 2);
             if (0..=255).contains(&scope) {
-                check_op(scope as u8, word_i16(ops, 0), "Breakpoint cond")?;
+                uses.push(FrameUse::Read(
+                    scope as u8,
+                    word_i16(ops, 0),
+                    "Breakpoint cond",
+                ));
             }
-            Ok(())
         }
         16 => {
             if ops[2] & 1 != 0 {
-                check_op(25, i16::from(ops[1]), "FindLocation local")?;
+                uses.push(FrameUse::Read(25, i16::from(ops[1]), "FindLocation local"));
             }
-            Ok(())
         }
-        17 => check_op(9, word_i16(ops, 0), "IdleForInput param"),
+        17 => uses.push(FrameUse::Read(9, word_i16(ops, 0), "IdleForInput param")),
         19 => {
-            check_op(25, i16::from(ops[0]), "MakeNewCharacter skin")?;
-            check_op(25, i16::from(ops[1]), "MakeNewCharacter age")?;
-            check_op(25, i16::from(ops[2]), "MakeNewCharacter sex")?;
-            Ok(())
+            uses.push(FrameUse::Read(
+                25,
+                i16::from(ops[0]),
+                "MakeNewCharacter skin",
+            ));
+            uses.push(FrameUse::Read(
+                25,
+                i16::from(ops[1]),
+                "MakeNewCharacter age",
+            ));
+            uses.push(FrameUse::Read(
+                25,
+                i16::from(ops[2]),
+                "MakeNewCharacter sex",
+            ));
         }
         24 => {
             if matches!(ops[3], 2 | 3) {
-                check_op(9, 0, "OldRelationship param[0]")?;
+                uses.push(FrameUse::Read(9, 0, "OldRelationship param[0]"));
             }
             let p = i16::from(ops[2] as i8);
-            check_dst(9, p, "OldRelationship param")?;
+            uses.push(FrameUse::Dst(9, p, "OldRelationship param"));
             if ops[0] != 0 {
-                check_op(9, p, "OldRelationship param")?;
+                uses.push(FrameUse::Read(9, p, "OldRelationship param"));
             }
-            Ok(())
         }
         25 => {
             let scope = match ops[0] {
@@ -5123,98 +5284,127 @@ fn check_primitive_frame_reads(
                 2 => 25,
                 _ => ops[1],
             };
-            check_op(scope, word_i16(ops, 2), "AlterBudget amount")
+            uses.push(FrameUse::Read(
+                scope,
+                word_i16(ops, 2),
+                "AlterBudget amount",
+            ));
         }
         26 => {
             if matches!(ops[1], 2 | 3) {
-                check_op(25, i16::from(ops[3]), "Relationship local")?;
+                uses.push(FrameUse::Read(25, i16::from(ops[3]), "Relationship local"));
             }
             // `relationship.rs:179` resolves the operand in both read and write directions;
             // validate destination frame bounds even on read write-back (`ops[2] & 4 == 0`).
-            check_dst(ops[4], word_i16(ops, 6), "Relationship value")?;
+            uses.push(FrameUse::Dst(
+                ops[4],
+                word_i16(ops, 6),
+                "Relationship value",
+            ));
             if ops[2] & 4 != 0 || ops[4] == 22 {
-                check_op(ops[4], word_i16(ops, 6), "Relationship value")?;
+                uses.push(FrameUse::Read(
+                    ops[4],
+                    word_i16(ops, 6),
+                    "Relationship value",
+                ));
             }
-            Ok(())
         }
         29 => {
             if ops[3] & 1 == 0 {
-                check_op(ops[0], word_i16(ops, 4), "SetMotiveChange delta")?;
-                check_op(ops[1], word_i16(ops, 6), "SetMotiveChange stop_at")?;
+                uses.push(FrameUse::Read(
+                    ops[0],
+                    word_i16(ops, 4),
+                    "SetMotiveChange delta",
+                ));
+                uses.push(FrameUse::Read(
+                    ops[1],
+                    word_i16(ops, 6),
+                    "SetMotiveChange stop_at",
+                ));
             }
-            Ok(())
         }
         31 => {
             if ops[4] & 0x80 != 0 {
-                check_op(ops[5], i16::from(ops[7]), "SetToNext destination cursor")?;
+                uses.push(FrameUse::Read(
+                    ops[5],
+                    i16::from(ops[7]),
+                    "SetToNext destination cursor",
+                ));
             }
             let base = ops[4] & 0x7F;
             if base == 6 {
-                check_op(9, 0, "SetToNext param[0]")?;
+                uses.push(FrameUse::Read(9, 0, "SetToNext param[0]"));
             } else if base == 9 {
-                check_op(25, i16::from(ops[6]), "SetToNext local")?;
+                uses.push(FrameUse::Read(25, i16::from(ops[6]), "SetToNext local"));
             }
-            Ok(())
         }
-        32 => check_op(ops[6], word_i16(ops, 4), "TestObjectType object"),
+        32 => uses.push(FrameUse::Read(
+            ops[6],
+            word_i16(ops, 4),
+            "TestObjectType object",
+        )),
         34 => {
             if ops[0] <= 2 {
-                check_op(ops[1], word_i16(ops, 2), "UiEffect target")?;
+                uses.push(FrameUse::Read(ops[1], word_i16(ops, 2), "UiEffect target"));
             }
-            Ok(())
         }
         35 => {
             if ops[4] & 0x20 != 0 {
-                check_op(25, word_i16(ops, 0), "SpecialEffect duration local")?;
+                uses.push(FrameUse::Read(
+                    25,
+                    word_i16(ops, 0),
+                    "SpecialEffect duration local",
+                ));
             }
-            Ok(())
         }
         36 | 50 => {
             // Both `Dialog` (`dialog.rs:1498`) and `ActionString` (`action_string.rs:85`)
             // run `format_text`, which reads frame locals via `$Local` / `$NeighborLocal` /
             // `$TimeLocal` tokens (`dialog.rs:1605`). Without string tables loaded, require
             // identical local frame layout and values, otherwise return `Inconclusive`.
-            if env_a.local_count != env_b.local_count || env_a.locals != env_b.locals {
-                let name = if opcode == 36 {
-                    "Dialog"
-                } else {
-                    "ActionString"
-                };
-                return Err(FrameCheckErr::Inconclusive(format!(
-                    "{name} text formatting may read frame locals via $Local tokens and local state differs"
-                )));
-            }
-            Ok(())
+            uses.push(FrameUse::AllLocals(if opcode == 36 {
+                "Dialog"
+            } else {
+                "ActionString"
+            }));
         }
         37 => {
             if ops[0] == 1 {
-                check_op(ops[1], word_i16(ops, 2), "TestSimInteractingWith person")?;
+                uses.push(FrameUse::Read(
+                    ops[1],
+                    word_i16(ops, 2),
+                    "TestSimInteractingWith person",
+                ));
             }
-            Ok(())
         }
         41 => {
             if ops[3] == 7 && ops[2] == 2 {
-                check_op(25, word_i16(ops, 0) >> 1, "SetHeadline local")?;
+                uses.push(FrameUse::Read(
+                    25,
+                    word_i16(ops, 0) >> 1,
+                    "SetHeadline local",
+                ));
             }
-            Ok(())
         }
         42 => {
             if ops[4] == 7 {
-                check_op(9, 0, "CreateObject param[0]")?;
+                uses.push(FrameUse::Read(9, 0, "CreateObject param[0]"));
             } else if ops[4] == 8 || ops[4] == 9 {
                 // `create.rs:177` sign-extends `operands[6] as i8`.
-                check_op(25, i16::from(ops[6] as i8), "CreateObject local")?;
+                uses.push(FrameUse::Read(
+                    25,
+                    i16::from(ops[6] as i8),
+                    "CreateObject local",
+                ));
             }
-            Ok(())
         }
         43 => {
             if word_i16(ops, 0) != 0 {
-                check_op(9, word_i16(ops, 2), "DropOnto src param")?;
+                uses.push(FrameUse::Read(9, word_i16(ops, 2), "DropOnto src param"));
             }
             if word_i16(ops, 4) != 0 {
-                check_op(9, word_i16(ops, 6), "DropOnto dst param")?;
+                uses.push(FrameUse::Read(9, word_i16(ops, 6), "DropOnto dst param"));
             }
-            Ok(())
         }
         44 => {
             let clip_id = word_i16(ops, 0);
@@ -5222,45 +5412,34 @@ fn check_primitive_frame_reads(
             let can_emit_events =
                 matches!(flags & 0x11, 0x00 | 0x11) && (flags & 0x04 != 0 || clip_id != 0);
             if flags & 0x04 != 0 {
-                check_op(9, clip_id, "Animate clip param")?;
+                uses.push(FrameUse::Read(9, clip_id, "Animate clip param"));
             }
             if flags & 0x20 != 0 {
-                check_dst(25, i16::from(ops[2]), "Animate event local")?;
+                uses.push(FrameUse::Dst(25, i16::from(ops[2]), "Animate event local"));
             } else if can_emit_events {
-                check_dst(9, 0, "Animate event param[0]")?;
+                uses.push(FrameUse::Dst(9, 0, "Animate event param[0]"));
             }
-            Ok(())
         }
         45 => {
             if u16::from_le_bytes([ops[2], ops[3]]) == 0 {
-                check_op(9, word_i16(ops, 0), "RouteTo param")?;
+                uses.push(FrameUse::Read(9, word_i16(ops, 0), "RouteTo param"));
             }
-            Ok(())
         }
         46 => {
             if u16::from_le_bytes([ops[2], ops[3]]) == 0 {
-                check_op(9, word_i16(ops, 0), "Snap param")?;
+                uses.push(FrameUse::Read(9, word_i16(ops, 0), "Snap param"));
             }
-            Ok(())
         }
         47 => {
             if word_i16(ops, 0) == 1 {
-                check_op(9, word_i16(ops, 4), "Reach slot param")?;
-            }
-            Ok(())
-        }
-        id if id >= 256 => Ok(()),
-        _ => {
-            // Conservative soundness guard for any unmodeled primitive opcode.
-            if env_a != env_b {
-                Err(FrameCheckErr::Divergence(format!(
-                    "frame-private state divergence before primitive opcode {opcode:#06x}"
-                )))
-            } else {
-                Ok(())
+                uses.push(FrameUse::Read(9, word_i16(ops, 4), "Reach slot param"));
             }
         }
+        id if id >= 256 => {}
+        // Conservative soundness guard for any unmodeled primitive opcode.
+        _ => uses.push(FrameUse::WholeFrame),
     }
+    uses
 }
 
 fn format_pc(pc: u8) -> String {
@@ -5281,6 +5460,293 @@ pub fn extract_bhav_from_iff(iff_bytes: &[u8], tree_id: u16) -> Result<BhavChunk
         .get(b"BHAV", tree_id)
         .ok_or_else(|| Error::new(format!("IFF does not contain BHAV #{tree_id}")))?;
     crate::lift::lift_bhav(chunk.id, &chunk.label, iff.data(chunk))
+}
+
+/// Which checker proved (or refuted) equivalence in [`check_bhav_equivalent_combined`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EquivMethod {
+    /// The node-for-node lockstep bisimulation ([`check_bhav_equivalent_with_arities`]).
+    Lockstep,
+    /// The symbolic live-output checker ([`check_bhav_live_equivalent`]).
+    LiveOutput,
+}
+
+impl std::fmt::Display for EquivMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Lockstep => "lockstep",
+            Self::LiveOutput => "live-output",
+        })
+    }
+}
+
+/// Merges two files' callee arity maps, keeping only the trees both agree on (or that
+/// only one of them knows).
+fn merge_arities(
+    a: Option<&BTreeMap<u16, usize>>,
+    b: Option<&BTreeMap<u16, usize>>,
+) -> Option<BTreeMap<u16, usize>> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m.clone()),
+        (Some(a), Some(b)) => {
+            let mut merged = a.clone();
+            for (&id, &arity) in b {
+                if merged.get(&id).is_some_and(|&other| other != arity) {
+                    merged.remove(&id);
+                } else {
+                    merged.insert(id, arity);
+                }
+            }
+            Some(merged)
+        }
+    }
+}
+
+/// Why two trees cannot be compared as if they ran against the same game data: their
+/// files give them different tuning constants (`BCON`), which neither checker can see
+/// through when a primitive or an unfolded operand reads them. `None` when the files
+/// agree on everything the trees may read.
+#[must_use]
+pub fn context_mismatch(
+    a: &BhavChunk,
+    ctx_a: &LiveContext,
+    b: &BhavChunk,
+    ctx_b: &LiveContext,
+) -> Option<String> {
+    let may_read_constants = |bhav: &BhavChunk| {
+        bhav.instructions
+            .iter()
+            .any(|ins| ins.opcode != 2 || ins.operands[6] == 26 || ins.operands[7] == 26)
+    };
+    (ctx_a.local_bcons != ctx_b.local_bcons && (may_read_constants(a) || may_read_constants(b)))
+        .then(|| "the files' constant tables (BCON) differ and the trees may read them".to_owned())
+}
+
+/// Whether some path through `bhav` may read a local before writing it.
+///
+/// A forward must-be-written analysis: only `:=` (op 5) and op 20, which mark the
+/// local written before reading it (`expression.rs:75`), count as writes; other
+/// operators read the left side first. Primitive writes are not counted, so the
+/// answer errs towards "may". Every node of a kind-4 tree is an entry point.
+fn may_read_unwritten_local(bhav: &BhavChunk) -> bool {
+    let locals = live::frame_dims(bhav).1;
+    if locals == 0 {
+        return false;
+    }
+    let local = |idx: i16| usize::try_from(idx).ok().filter(|&i| i < locals);
+    let len = bhav.instructions.len().min(251);
+    let all = vec![true; locals];
+    // `written[n]`: locals written on every path reaching node `n` (None: unreached).
+    let mut written: Vec<Option<Vec<bool>>> = vec![None; len];
+    let mut work: Vec<usize> = Vec::new();
+    for (n, w) in written.iter_mut().enumerate() {
+        if n == 0 || bhav.kind == 4 {
+            *w = Some(vec![false; locals]);
+            work.push(n);
+        }
+    }
+    while let Some(n) = work.pop() {
+        let ins = &bhav.instructions[n];
+        let mut out = written[n].clone().unwrap_or_else(|| all.clone());
+        if ins.opcode == 2 {
+            let ops = &ins.operands;
+            let (lhs, rhs) = (word_i16(ops, 0), word_i16(ops, 2));
+            let op = ops[5];
+            if ops[7] == 25
+                && let Some(i) = local(rhs)
+                && !out[i]
+            {
+                return true;
+            }
+            if ops[6] == 25
+                && let Some(i) = local(lhs)
+            {
+                if matches!(op, 5 | 20) {
+                    out[i] = true;
+                } else if !out[i] {
+                    return true;
+                }
+            }
+        } else {
+            for u in primitive_frame_uses(ins.opcode, &ins.operands) {
+                match u {
+                    FrameUse::Read(25, idx, _) => {
+                        if local(idx).is_some_and(|i| !out[i]) {
+                            return true;
+                        }
+                    }
+                    FrameUse::AllLocals(_) | FrameUse::WholeFrame if out.iter().any(|w| !w) => {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for target in [ins.on_true, ins.on_false] {
+            let t = usize::from(target);
+            if t >= len {
+                continue;
+            }
+            let merged = match &written[t] {
+                None => out.clone(),
+                Some(prev) => prev.iter().zip(&out).map(|(&p, &o)| p && o).collect(),
+            };
+            if written[t].as_ref() != Some(&merged) {
+                written[t] = Some(merged);
+                work.push(t);
+            }
+        }
+    }
+    false
+}
+
+/// Whether a lockstep proof (with silent steps off) also covers everything the
+/// live-output checker observes under `live`, faults included.
+fn lockstep_suffices(
+    a: &BhavChunk,
+    ctx_a: &LiveContext,
+    b: &BhavChunk,
+    ctx_b: &LiveContext,
+    live: &LiveOptions,
+    trace: &LockstepTrace,
+) -> bool {
+    // Any node may fault (a trap, the error target, a bad branch), and a fault leaves
+    // the faulting frame on the stack at its node with the thread's last result
+    // (`interpreter.rs:809`). So the proof stands only if every matched pair is the
+    // same node on both sides, the frames have the same layout, and the last results
+    // never differ while a node runs. With silent steps off, lockstep matches every
+    // frame write (expression destinations and primitive operands), so equal layouts
+    // also end with equal contents, which covers frame residue.
+    if trace.pairs.iter().any(|&(pa, pb)| pa != pb) {
+        return false;
+    }
+    // Lockstep matches what nodes do, not how: two nodes that compute the same thing
+    // with different operands can still fault differently, or leave different partial
+    // state when they fault (`expression.rs:69`). So every node it ran must be the same
+    // bytes on both sides, and a call the same inline arguments after it too. Then the
+    // two runs are the same run.
+    let bytes = |ins: &Instruction| (ins.opcode, ins.on_true, ins.on_false, ins.operands);
+    for p in trace.pairs.iter().map(|&(p, _)| usize::from(p)) {
+        let (Some(ia), Some(ib)) = (a.instructions.get(p), b.instructions.get(p)) else {
+            return false;
+        };
+        if bytes(ia) != bytes(ib) {
+            return false;
+        }
+        if ia.opcode >= 256
+            && !a.instructions[p..]
+                .iter()
+                .map(bytes)
+                .eq(b.instructions[p..].iter().map(bytes))
+        {
+            return false;
+        }
+    }
+    if live.observe_last_result && trace.last_differs_mid_run {
+        return false;
+    }
+    if live::frame_dims(a) != live::frame_dims(b) {
+        return false;
+    }
+    // A fault names the tree, a jump to a missing node carries the tree's length
+    // (`interpreter.rs:1484`), and the VM enters a tree by its format and kind.
+    if (a.id, a.format, a.kind, a.instructions.len())
+        != (b.id, b.format, b.kind, b.instructions.len())
+    {
+        return false;
+    }
+    // Lockstep runs nodes past 250 and branches to 251 and 252, which the VM rejects
+    // (`interpreter.rs:766`, `interpreter.rs:1695`).
+    let past_last_node = |bhav: &BhavChunk| {
+        bhav.instructions.len() > 251
+            || bhav
+                .instructions
+                .iter()
+                .any(|ins| matches!(ins.on_true, 251 | 252) || matches!(ins.on_false, 251 | 252))
+    };
+    if past_last_node(a) || past_last_node(b) {
+        return false;
+    }
+    // Reading a local the tree has not written yet can fail in the VM
+    // (`interpreter.rs:1277`), but lockstep folds such reads (`local[0] == local[0]`
+    // becomes `true`). Leave trees that may do so to the live-output checker, which
+    // records those reads.
+    if may_read_unwritten_local(a) || may_read_unwritten_local(b) {
+        return false;
+    }
+    // A call whose target has different argument counts in the two files runs
+    // different trees; lockstep only sees the call.
+    let arity =
+        |ctx: &LiveContext, id: u16| ctx.callee_arities.as_ref().map(|m| m.get(&id).copied());
+    !a.instructions
+        .iter()
+        .chain(&b.instructions)
+        .filter(|ins| ins.opcode >= 256)
+        .any(|ins| arity(ctx_a, ins.opcode) != arity(ctx_b, ins.opcode))
+}
+
+/// Checks two trees with the lockstep checker first and, when it cannot prove them
+/// equivalent, with the live-output checker, which also accepts trees that differ by
+/// pure reads and dummy nodes (and dead frame writes, with frame residue ignored).
+///
+/// Lockstep runs with silent steps off (so every `Expression` is matched, which keeps
+/// the scratch pointer and uninitialized-local reads in step) and, when `live` observes
+/// it, with the last branch result compared. Its proof is taken only when it covers
+/// what `live` observes ([`lockstep_suffices`]): among other things it must have paired
+/// every node with the node of the same number, since a fault leaves the node number
+/// behind. A lockstep counterexample is a divergence in the stricter node-for-node
+/// trace and is never reported; only a live-output counterexample, which a `sims-vm`
+/// replay has confirmed, is. Otherwise the result is `Inconclusive`.
+#[must_use]
+pub fn check_bhav_equivalent_combined(
+    a: &BhavChunk,
+    ctx_a: &LiveContext,
+    b: &BhavChunk,
+    ctx_b: &LiveContext,
+    lockstep: &EquivOptions,
+    live: &LiveOptions,
+) -> (EquivMethod, EquivResult) {
+    if let Some(reason) = context_mismatch(a, ctx_a, b, ctx_b) {
+        return (
+            EquivMethod::LiveOutput,
+            EquivResult::Inconclusive { reason },
+        );
+    }
+    let arities = merge_arities(ctx_a.callee_arities.as_ref(), ctx_b.callee_arities.as_ref());
+    let strict = EquivOptions {
+        max_silent_steps: 0,
+        observe_last_result: live.observe_last_result,
+        ..*lockstep
+    };
+    let mut trace = LockstepTrace::default();
+    let first = lockstep_traced(a, b, &strict, arities.as_ref(), &mut trace);
+    if matches!(first, EquivResult::Equivalent { .. })
+        && lockstep_suffices(a, ctx_a, b, ctx_b, live, &trace)
+    {
+        return (EquivMethod::Lockstep, first);
+    }
+    match check_bhav_live_equivalent(a, ctx_a, b, ctx_b, live) {
+        EquivResult::Inconclusive { reason } => {
+            let lockstep_note = match first {
+                EquivResult::Counterexample { divergence, .. } => {
+                    format!("lockstep counterexample: {divergence}")
+                }
+                EquivResult::Inconclusive { reason } => format!("lockstep: {reason}"),
+                EquivResult::Equivalent { .. } => "lockstep: equivalent node for node, but that \
+                     does not cover renumbered nodes (where a fault would differ), frame layout, \
+                     invalid nodes or differing callee arities here"
+                    .to_owned(),
+            };
+            (
+                EquivMethod::LiveOutput,
+                EquivResult::Inconclusive {
+                    reason: format!("{reason} ({lockstep_note})"),
+                },
+            )
+        }
+        other => (EquivMethod::LiveOutput, other),
+    }
 }
 
 /// Extracts `(tree_id -> arg_count)` for every valid BHAV chunk inside a raw IFF.

@@ -20,7 +20,8 @@ use sims_render::{Canvas, png};
 use sims_sim::neighbors::{FAMILY, KIND, Row};
 use sims_ui::art::Art;
 use sims_ui::neighborhood::{BarButton, BarLayout};
-use sims_vm::SpecialPanelRequest;
+use sims_ui::shop::ShopCommand;
+use sims_vm::{SpecialPanelRequest, SpecialPanelResponse};
 use std::path::{Path, PathBuf};
 
 const SIZE: [i32; 2] = [800, 600];
@@ -193,17 +194,33 @@ fn wave2_panels_open_and_draw_with_native_art() {
         .find(|r| r.id == neighbor)
         .map(|r| r.data[FAMILY])
         .expect("Mortimer's record");
-    let townies: Vec<i16> = social_world
+    // Callable as `0x522ea1` has it: a member of a listed family other
+    // than the caller's, which below ID 2000 needs a house.
+    let callable = |r: &&sims_sim::neighbors::Neighbor| {
+        let family = r.data[FAMILY];
+        r.id > 0
+            && r.data[KIND] <= 1
+            && family != goth_family
+            && world.families.iter().any(|f| {
+                f.id == i32::from(family)
+                    && f.members.contains(&r.guid)
+                    && (family >= 2000 || (family != 0 && f.house >= 1))
+            })
+    };
+    let candidates: Vec<i16> = social_world
         .neighbors
         .slots
         .iter()
         .flatten()
-        .filter(|r| r.id > 0 && r.data[KIND] <= 1 && r.data[FAMILY] > 0)
-        .filter(|r| r.data[FAMILY] != goth_family)
+        .filter(callable)
         .map(|r| r.id)
-        .take(10)
+        .take(11)
         .collect();
-    assert!(!townies.is_empty(), "the neighborhood has other families");
+    assert!(candidates.len() >= 2, "the neighborhood has other families");
+    // The last candidate gets a row without values, which `0x522f17`
+    // skips; the first gets a second row, listed once.
+    let (&unmet, townies) = candidates.split_last().expect("candidates");
+    let townies = townies.to_vec();
     let mortimer = social_world
         .neighbors
         .slots
@@ -218,6 +235,14 @@ fn wave2_panels_open_and_draw_with_native_art() {
             values: vec![i * 22 - 60, i * 15 - 30],
         });
     }
+    mortimer.relationships.push(Row {
+        target: i32::from(unmet),
+        values: Vec::new(),
+    });
+    mortimer.relationships.push(Row {
+        target: i32::from(townies[0]),
+        values: vec![90, 90],
+    });
     preview(
         &mut game,
         "phonebook",
@@ -227,11 +252,16 @@ fn wave2_panels_open_and_draw_with_native_art() {
         &social_world,
         &before,
     );
-    let listed = game.phonebook_snapshot().expect("phone book").entries.len();
+    let listed: Vec<i16> = game
+        .phonebook_snapshot()
+        .expect("phone book")
+        .entries
+        .iter()
+        .map(|e| e.neighbor_id)
+        .collect();
     assert_eq!(
-        listed,
-        townies.len(),
-        "every townie Mortimer knows is listed"
+        listed, townies,
+        "every townie Mortimer knows is listed once, in his row order"
     );
 
     preview(
@@ -244,8 +274,54 @@ fn wave2_panels_open_and_draw_with_native_art() {
         &world,
         &before,
     );
-    let wardrobe = game.shop_snapshot().expect("wardrobe").items.len();
-    assert!(wardrobe > 0, "the everyday wardrobe lists outfits");
+    let wardrobe = game.shop_snapshot().expect("wardrobe").clone();
+    assert!(
+        !wardrobe.items.is_empty(),
+        "the everyday wardrobe lists outfits"
+    );
+    // The view opens on Mortimer as he is (`0x56d3d9`), and the chosen
+    // outfit is the first one equal to his everyday row
+    // (`b004mafit_01,BODY=B004MAFitlgt_rat`, matched ignoring case as
+    // `0x40d0a4` does), not the list's first.
+    let worn = wardrobe
+        .tried_on_item_id
+        .clone()
+        .expect("the wardrobe opens on the outfit Mortimer wears");
+    let at = wardrobe
+        .items
+        .iter()
+        .position(|item| item.id == worn)
+        .expect("a listed outfit");
+    assert_ne!(at, 0, "Mortimer's outfit is not the list's first");
+    assert_eq!(
+        game.shop_dialog()
+            .chosen_item(&wardrobe)
+            .map(|item| item.id.as_str()),
+        Some(worn.as_str()),
+        "the worn outfit is the one OK answers"
+    );
+    assert!(
+        matches!(
+            game.shop_dialog().submit(&wardrobe),
+            Some(ShopCommand::Buy { item_id, .. }) if item_id == worn
+        ),
+        "OK untouched answers the worn outfit, not the first"
+    );
+    assert!(
+        wardrobe.preview_image.is_some(),
+        "the wardrobe opens with the outfit in 3D: {:?}",
+        wardrobe.preview_label
+    );
+    // Previous shows the outfit before it.
+    assert!(game.shop_select_prev(), "the previous arrow moves");
+    assert_eq!(
+        game.shop_snapshot()
+            .expect("wardrobe")
+            .tried_on_item_id
+            .as_ref(),
+        Some(&wardrobe.items[at - 1].id),
+        "previous shows the outfit before the worn one"
+    );
     preview(
         &mut game,
         "charm-transform",
@@ -253,8 +329,133 @@ fn wave2_panels_open_and_draw_with_native_art() {
         &world,
         &before,
     );
-    let charms = game.shop_snapshot().expect("charm").items.len();
-    assert!(charms > 0, "the charm transform lists outfits");
+    // `cWinCharmDlg` (`0x536a6b`) steps eight costume presets, starting at
+    // preset 0; for an adult man preset 0 is suit 48 (`0x5374d3`), and an
+    // immediate OK sends it (`0x5373df`).
+    let charm = game.shop_snapshot().expect("charm").clone();
+    assert_eq!(charm.items.len(), 8, "the Charm has eight presets");
+    assert_eq!(
+        charm.tried_on_item_id.as_deref(),
+        Some("special_charm:0"),
+        "the Charm opens on preset 0"
+    );
+    // The arrows wrap through all eight: previous from preset 0 is 7.
+    assert!(game.shop_select_prev(), "the previous arrow moves");
+    assert_eq!(
+        game.shop_snapshot()
+            .expect("charm")
+            .tried_on_item_id
+            .as_deref(),
+        Some("special_charm:7"),
+        "previous wraps from preset 0 to 7"
+    );
+    assert!(game.shop_select_next(), "the next arrow moves");
+    game.shop_submit();
+    assert_eq!(
+        game.preview_special_panel_reply(),
+        Some(&SpecialPanelResponse::Selection {
+            accepted: true,
+            index: 48,
+        }),
+        "OK on preset 0 sends suit 48 for an adult man"
+    );
+    // It is `cWinCharmDlg`, titled from its own `STR# 273` (`0x536c26`).
+    assert_eq!(charm.choice, Some(sims_ui::shop::ChoiceDialog::Charm));
+    // Cancel sends the suit on show as well (`0x5373fc`), not accepted:
+    // preset 2 is 44 for an adult man.
+    let charm_on = |game: &mut Game, world: &sims_sim::World| {
+        game.preview_special_panel(SpecialPanelRequest::CharmTransform { person: sim }, world);
+        game.render();
+    };
+    charm_on(&mut game, &world);
+    assert!(game.shop_select_next() && game.shop_select_next());
+    game.shop_escape();
+    assert_eq!(
+        game.preview_special_panel_reply(),
+        Some(&SpecialPanelResponse::Selection {
+            accepted: false,
+            index: 44,
+        }),
+        "Cancel on preset 2 sends suit 44 for an adult man"
+    );
+    // A woman's table (`0x5374de`: word 65 equal to 1): preset 1 is 43.
+    let mut woman = world.clone();
+    woman
+        .objects
+        .get_mut(&sim)
+        .expect("Mortimer")
+        .person
+        .as_mut()
+        .expect("person")
+        .data[KIND] = 1;
+    charm_on(&mut game, &woman);
+    assert!(game.shop_select_next());
+    game.shop_submit();
+    assert_eq!(
+        game.preview_special_panel_reply(),
+        Some(&SpecialPanelResponse::Selection {
+            accepted: true,
+            index: 43,
+        }),
+        "OK on preset 1 sends suit 43 for an adult woman"
+    );
+    // A child (word 58 nonzero and below 18, compared signed): even
+    // presets are the boy's 53, odd ones the skeleton, 60; age -1 counts.
+    for age in [10, -1] {
+        let mut child = world.clone();
+        child
+            .objects
+            .get_mut(&sim)
+            .expect("Mortimer")
+            .person
+            .as_mut()
+            .expect("person")
+            .data[58] = age;
+        charm_on(&mut game, &child);
+        game.shop_submit();
+        assert_eq!(
+            game.preview_special_panel_reply(),
+            Some(&SpecialPanelResponse::Selection {
+                accepted: true,
+                index: 53,
+            }),
+            "OK on preset 0 sends the boy's 53 at age {age}"
+        );
+        charm_on(&mut game, &child);
+        assert!(game.shop_select_prev());
+        game.shop_submit();
+        assert_eq!(
+            game.preview_special_panel_reply(),
+            Some(&SpecialPanelResponse::Selection {
+                accepted: true,
+                index: 60,
+            }),
+            "OK on preset 7 sends the skeleton, 60, at age {age}"
+        );
+    }
+    let mut girl = world.clone();
+    {
+        let data = &mut girl
+            .objects
+            .get_mut(&sim)
+            .expect("Mortimer")
+            .person
+            .as_mut()
+            .expect("person")
+            .data;
+        data[KIND] = 1;
+        data[58] = 8;
+    }
+    charm_on(&mut game, &girl);
+    game.shop_submit();
+    assert_eq!(
+        game.preview_special_panel_reply(),
+        Some(&SpecialPanelResponse::Selection {
+            accepted: true,
+            index: 54,
+        }),
+        "OK on preset 0 sends the girl's 54"
+    );
 
     // A dog in Mortimer's place, so the pet picker has a skeleton to turn.
     if let Some(guid) = dog_guid(&install) {
@@ -269,16 +470,38 @@ fn wave2_panels_open_and_draw_with_native_art() {
             &dog_world,
             &before,
         );
-        // Try On turns the breed on the 3D turntable.
-        game.shop_try_on_selected();
-        game.shop_rotate_preview(45);
-        game.render();
+        // The pet dialog's view opens on the animal as it is (`0x521fd8`,
+        // kind 0). This type's everyday row is `racoon,BODY=racoon`, which
+        // no listed breed equals, so nothing is chosen: OK would answer
+        // `-1`, and the next arrow goes to the first breed (`0x40d1bb`).
+        let snap = game.shop_snapshot().expect("pet picker").clone();
+        assert_eq!(snap.tried_on_item_id, None, "no breed equals the racoon");
+        assert!(game.shop_dialog().chosen_item(&snap).is_none());
+        assert_eq!(
+            game.shop_dialog().submit(&snap),
+            Some(ShopCommand::NoSelection),
+            "OK with no breed in the view answers -1"
+        );
+        assert_eq!(snap.preview_label.as_deref(), Some("Current outfit"));
+        assert!(
+            snap.preview_image.is_some(),
+            "the pet picker shows the animal in 3D"
+        );
+        assert!(game.shop_select_next(), "the next arrow moves");
         let snap = game.shop_snapshot().expect("pet picker");
+        assert_eq!(
+            snap.tried_on_item_id.as_deref(),
+            snap.items.first().map(|item| item.id.as_str()),
+            "next from no breed shows the first breed"
+        );
         assert!(
             snap.preview_image.is_some(),
             "the pet picker previews the breed in 3D: {:?}",
             snap.preview_label
         );
+
+        game.shop_rotate_preview(45);
+        game.render();
         snapshot("pet-picker-preview", game.canvas());
     } else {
         panic!("Complete Collection must define a dog person type");

@@ -267,14 +267,16 @@ fn world() -> World {
         )]),
         stops_asked: BTreeSet::from([5]),
         characters: Characters {
-            made: BTreeMap::from([(
+            made: [(
                 0x1234_0042,
                 Character {
                     template: 0x7fd9_6b54,
                     file: 3,
                     strings: BTreeMap::from([(0, "child".into()), (14, "med".into())]),
                 },
-            )]),
+            )]
+            .into_iter()
+            .collect(),
             next_file: 4,
         },
         portraits: BTreeSet::from([0x1234_0042, 0x7fd9_6b54]),

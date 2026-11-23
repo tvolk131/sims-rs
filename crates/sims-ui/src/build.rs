@@ -174,6 +174,20 @@ const COMPACT_PITCH_MIN_W: i32 = 19;
 const ROOF_PITCH_DX: i32 = -14;
 const ROOF_PATTERN_DX: i32 = 50;
 const ROOF_PATTERN_DY: i32 = 1;
+/// `cWinRoofPanel` (`0x52911a`) places its page arrows from `UIText.iff`
+/// `STR# 147` `roofpanelstrs`, relative to the panel at
+/// `(GRID_LEFT - 20, strip_y + 5)` (its pitch column is at `(10 - 4, ·)`,
+/// its pattern grid at `(74 - 4, 3 - 2)`): Previous Page at `(62 - 4, 20)`;
+/// Next Page at `(256 - 3, 20)` with 8 patterns a page on an 800-wide
+/// screen, otherwise at `(460 - 27, 20)` with 16. The oracle's Next Page
+/// sits at `(971, 693)` on 1024×768, as this gives.
+const ROOF_PANEL_DX: i32 = -20;
+const ROOF_PANEL_DY: i32 = 5;
+const ROOF_ARROW_DY: i32 = 20;
+const ROOF_PREV_DX: i32 = 62 - 4;
+/// `(Next Page x, pattern columns)`: the 16-pattern layout, then the
+/// 800-wide 8-pattern one.
+const ROOF_PAGES: [(i32, usize); 2] = [(460 - 27, 8), (256 - 3, 4)];
 /// Pitch buttons top to bottom (oracle `build-roof.png`).
 const ROOF_PITCH_ORDER: [RoofPitchPreset; 4] = [
     RoofPitchPreset::Steep,
@@ -1018,6 +1032,14 @@ impl BuildCatalog {
                     .then_with(|| a.id.cmp(&b.id))
             });
         }
+        if tool == BuildTool::Floor {
+            // `cWinArch` re-sorts the floors by price alone (`0x5013ea`,
+            // key 0 → `+0x1c`) with its unstable `std::sort` (`0x501a69`),
+            // so equal-price floors take that routine's permutation of the
+            // price-and-name order (oracle `build-floor.png`). Wallpapers
+            // (tool 3) skip the re-sort and stay in name order.
+            crate::native_sort::sort_by(&mut list, |a, b| a.price < b.price);
+        }
         list
     }
 
@@ -1514,7 +1536,7 @@ pub fn layout(
                     grid_left,
                     grid_right,
                     width,
-                    strip_y,
+                    strip_y + ARROW_Y,
                     [prev_aw, prev_ah],
                     [next_aw, next_ah],
                 );
@@ -1597,7 +1619,7 @@ pub fn layout(
                     grid_left,
                     grid_right,
                     width,
-                    strip_y,
+                    strip_y + ARROW_Y,
                     [prev_aw, prev_ah],
                     [next_aw, next_ah],
                 );
@@ -1639,12 +1661,41 @@ pub fn layout(
                     py += ph + gap;
                 }
             }
-            // Paginated `GameData/Roofs/*.bmp` pattern swatches strictly within
-            // `pattern_left..grid_right` (never overflowing into `next_arrow_x`).
+            // Paginated `GameData/Roofs/*.bmp` pattern swatches, left of the
+            // Next Page arrow.
             let pattern_left = grid_left + pitch_col_w;
             let pattern_top = strip_y + GRID_TOP + if narrow { 0 } else { ROOF_PATTERN_DY };
             let patterns = catalog.roof_patterns();
-            let cols = ((grid_right - pattern_left) / cell).max(0) as usize;
+            let panel_x = grid_left + ROOF_PANEL_DX;
+            // The native page that fits: 16 patterns, else the 800-wide 8.
+            let native = (!narrow)
+                .then(|| {
+                    ROOF_PAGES.into_iter().find(|&(next_dx, cols)| {
+                        let next_x = panel_x + next_dx;
+                        pattern_left + cols as i32 * cell <= next_x && next_x + next_aw <= width
+                    })
+                })
+                .flatten();
+            let (cols, roof_prev_x, roof_next_x, roof_arrow_y, roof_grid_right) = match native {
+                Some((next_dx, cols)) => (
+                    cols,
+                    panel_x + ROOF_PREV_DX,
+                    panel_x + next_dx,
+                    strip_y + ROOF_PANEL_DY + ROOF_ARROW_DY,
+                    pattern_left + cols as i32 * cell,
+                ),
+                None => (
+                    ((grid_right - pattern_left) / cell).max(0) as usize,
+                    if narrow {
+                        prev_arrow_x
+                    } else {
+                        pattern_left - prev_aw - 2
+                    },
+                    next_arrow_x,
+                    strip_y + ARROW_Y,
+                    grid_right,
+                ),
+            };
             if !patterns.is_empty() && cols > 0 {
                 let per_page = cols * GRID_ROWS;
                 total_pages = patterns.len().div_ceil(per_page);
@@ -1679,17 +1730,13 @@ pub fn layout(
                     &mut widgets,
                     page,
                     start + per_page < patterns.len(),
-                    if narrow {
-                        prev_arrow_x
-                    } else {
-                        pattern_left - prev_aw - 2
-                    },
-                    next_arrow_x,
+                    roof_prev_x,
+                    roof_next_x,
                     undo_right,
                     pattern_left,
-                    grid_right,
+                    roof_grid_right,
                     width,
-                    strip_y,
+                    roof_arrow_y,
                     [prev_aw, prev_ah],
                     [next_aw, next_ah],
                 );
@@ -1736,7 +1783,7 @@ pub fn layout(
                     grid_left,
                     grid_right,
                     width,
-                    strip_y,
+                    strip_y + ARROW_Y,
                     [prev_aw, prev_ah],
                     [next_aw, next_ah],
                 );
@@ -1814,13 +1861,13 @@ fn push_page_arrows(
     grid_left: i32,
     grid_right: i32,
     width: i32,
-    strip_y: i32,
+    arrow_y: i32,
     prev_size: [i32; 2],
     next_size: [i32; 2],
 ) {
     if page > 0 && prev_arrow_x >= undo_right && prev_arrow_x + prev_size[0] <= grid_left {
         widgets.push(BuildWidget {
-            rect: Rect::new(prev_arrow_x, strip_y + ARROW_Y, prev_size[0], prev_size[1]),
+            rect: Rect::new(prev_arrow_x, arrow_y, prev_size[0], prev_size[1]),
             kind: BuildWidgetKind::Button {
                 id: id::PREV_ARROW,
                 selected: false,
@@ -1832,7 +1879,7 @@ fn push_page_arrows(
     }
     if has_next && next_arrow_x >= grid_right && next_arrow_x + next_size[0] <= width {
         widgets.push(BuildWidget {
-            rect: Rect::new(next_arrow_x, strip_y + ARROW_Y, next_size[0], next_size[1]),
+            rect: Rect::new(next_arrow_x, arrow_y, next_size[0], next_size[1]),
             kind: BuildWidgetKind::Button {
                 id: id::NEXT_ARROW,
                 selected: false,

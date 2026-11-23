@@ -47,14 +47,12 @@ fn solid_image(width: u32, height: u32, rgb: [u8; 3]) -> Image {
 fn sample_snapshot() -> AlbumSnapshot {
     AlbumSnapshot {
         family_name: "TestFamily".to_owned(),
-        can_capture_snapshot: true,
         entries: vec![
             AlbumEntry {
                 id: PhotoId(10),
                 title: "First Day".to_owned(),
                 caption: "Moved into the starter lot.".to_owned(),
                 image: Some(solid_image(64, 48, [200, 80, 60])),
-                thumbnail: None,
                 sim_day: Some(1),
             },
             AlbumEntry {
@@ -62,7 +60,6 @@ fn sample_snapshot() -> AlbumSnapshot {
                 title: "Dinner Party".to_owned(),
                 caption: "Neighbors visited for supper and music.".to_owned(),
                 image: Some(solid_image(48, 64, [60, 180, 90])),
-                thumbnail: Some(solid_image(16, 16, [80, 200, 110])),
                 sim_day: Some(3),
             },
             AlbumEntry {
@@ -70,7 +67,6 @@ fn sample_snapshot() -> AlbumSnapshot {
                 title: "Garden".to_owned(),
                 caption: "Planted hedges along the front walk.".to_owned(),
                 image: None,
-                thumbnail: None,
                 sim_day: Some(5),
             },
         ],
@@ -78,7 +74,7 @@ fn sample_snapshot() -> AlbumSnapshot {
 }
 
 #[test]
-fn browse_prev_next_first_last_and_thumbnail_strip() {
+fn browse_prev_next_first_last() {
     let screen = [800, 600];
     let snapshot = sample_snapshot();
     let mut dialog = PhotoAlbumDialog::default();
@@ -111,50 +107,71 @@ fn browse_prev_next_first_last_and_thumbnail_strip() {
     assert_eq!(dialog.selected_id(), Some(PhotoId(30)));
     assert!(click(&mut dialog, layout.btn_next, screen, &snapshot).is_empty());
 
-    // Thumbnail slot 0 -> PhotoId(10)
+    // First -> PhotoId(10)
     assert_eq!(
-        click(&mut dialog, layout.thumb_slots[0], screen, &snapshot),
+        click(&mut dialog, layout.btn_first, screen, &snapshot),
         vec![AlbumCommand::SelectEntry(PhotoId(10))]
     );
     assert_eq!(dialog.selected_id(), Some(PhotoId(10)));
 }
 
 #[test]
-fn thumbnail_strip_scroll_persists_across_draw_without_snapping_back() {
+fn the_well_holds_the_shown_photos_caption_and_edits_it() {
     let screen = [800, 600];
     let art = Art::default();
-    let mut frame = Frame::new(800, 600, [20, 30, 50]);
-    let snapshot = AlbumSnapshot {
-        family_name: "LargeAlbum".to_owned(),
-        can_capture_snapshot: true,
-        entries: (0..12)
-            .map(|i| AlbumEntry {
-                id: PhotoId(100 + i),
-                title: format!("Photo {i}"),
-                caption: String::new(),
-                image: None,
-                thumbnail: None,
-                sim_day: Some(i as u32 + 1),
-            })
-            .collect(),
-    };
-
+    let snapshot = sample_snapshot();
     let mut dialog = PhotoAlbumDialog::default();
     dialog.open(&snapshot);
+    dialog.select_entry(&snapshot, PhotoId(20));
     let layout = dialog.layout(screen[0], screen[1]);
-    let slots = layout.thumb_slots.len();
-    assert!(slots < snapshot.entries.len());
+    assert_eq!(
+        native_rel(layout.caption_box, screen),
+        (90, 435, 520, 72),
+        "the caption control sits in the well"
+    );
+    assert_eq!(
+        dialog.draft_caption(),
+        "Neighbors visited for supper and music."
+    );
 
-    // Scroll strip right while entry 0 remains selected, then draw.
-    assert!(click(&mut dialog, layout.strip_next, screen, &snapshot).is_empty());
+    // A click anywhere in the well edits the caption; it never chooses
+    // another photo.
+    for point in [
+        [layout.caption_box.x + 4, layout.caption_box.y + 4],
+        [layout.caption_box.x + 300, layout.caption_box.y + 36],
+        [
+            layout.caption_box.x + layout.caption_box.width - 4,
+            layout.caption_box.y + layout.caption_box.height - 4,
+        ],
+    ] {
+        assert!(dialog.handle_pointer_down(point, screen, &snapshot));
+        assert!(
+            dialog
+                .handle_pointer_up(point, screen, &snapshot)
+                .is_empty()
+        );
+        assert_eq!(dialog.selected_id(), Some(PhotoId(20)));
+        assert_eq!(dialog.focus(), Some(EditFocus::Caption));
+    }
+    for ch in " Again.".chars() {
+        dialog.handle_key(AlbumKey::Char(ch), screen, &snapshot, &art);
+    }
+    let mut frame = Frame::new(800, 600, [20, 30, 50]);
     dialog.draw(&mut frame, &snapshot, &art);
 
-    // Clicking the first visible slot must select entry 1 (PhotoId(101)), proving
-    // draw did not snap strip_scroll back to entry 0.
+    // Previous writes the caption back to the shown photo before moving.
     assert_eq!(
-        click(&mut dialog, layout.thumb_slots[0], screen, &snapshot),
-        vec![AlbumCommand::SelectEntry(PhotoId(101))]
+        click(&mut dialog, layout.btn_prev, screen, &snapshot),
+        vec![
+            AlbumCommand::UpdateEntryText {
+                id: PhotoId(20),
+                title: "Dinner Party".to_owned(),
+                caption: "Neighbors visited for supper and music. Again.".to_owned(),
+            },
+            AlbumCommand::SelectEntry(PhotoId(10)),
+        ]
     );
+    assert_eq!(dialog.draft_caption(), "Moved into the starter lot.");
 }
 
 #[test]
@@ -227,22 +244,12 @@ fn edit_title_and_wrapped_caption_and_auto_commit_on_nav_or_done() {
 }
 
 #[test]
-fn add_snapshot_reorder_and_two_step_delete_confirmation() {
+fn reorder_and_two_step_delete_confirmation() {
     let screen = [800, 600];
     let snapshot = sample_snapshot();
     let mut dialog = PhotoAlbumDialog::default();
     dialog.open(&snapshot);
     let layout = dialog.layout(screen[0], screen[1]);
-
-    // Add blank page and trigger camera snapshot
-    assert_eq!(
-        click(&mut dialog, layout.btn_add, screen, &snapshot),
-        vec![AlbumCommand::AddBlankPage]
-    );
-    assert_eq!(
-        click(&mut dialog, layout.btn_snapshot, screen, &snapshot),
-        vec![AlbumCommand::CaptureSnapshot]
-    );
 
     // Reorder: MoveEarlier disabled at index 0, MoveLater moves 10 -> index 1
     assert!(click(&mut dialog, layout.btn_move_earlier, screen, &snapshot).is_empty());
@@ -272,16 +279,12 @@ fn add_snapshot_reorder_and_two_step_delete_confirmation() {
 }
 
 #[test]
-fn press_bound_pointer_guard_rejects_drag_off_and_disabled_snapshot() {
+fn press_bound_pointer_guard_rejects_drag_off() {
     let screen = [800, 600];
-    let mut snapshot = sample_snapshot();
-    snapshot.can_capture_snapshot = false;
+    let snapshot = sample_snapshot();
     let mut dialog = PhotoAlbumDialog::default();
     dialog.open(&snapshot);
     let layout = dialog.layout(screen[0], screen[1]);
-
-    // Snapshot button disabled when can_capture_snapshot == false
-    assert!(click(&mut dialog, layout.btn_snapshot, screen, &snapshot).is_empty());
 
     // Press on Next, release on Done -> neither fires
     assert!(dialog.handle_pointer_down(center(layout.btn_next), screen, &snapshot));
@@ -343,4 +346,60 @@ fn loads_complete_collection_art_and_uitext_strings() {
     dialog.open(&snapshot);
     let mut frame = Frame::new(800, 600, [20, 40, 60]);
     dialog.draw(&mut frame, &snapshot, &art);
+}
+
+/// The modal-relative rect of `rect` in the 800×600 native layout.
+fn native_rel(rect: Rect, screen: [i32; 2]) -> (i32, i32, i32, i32) {
+    let dialog = PhotoAlbumDialog::default();
+    let modal = dialog.layout(screen[0], screen[1]).modal;
+    (rect.x - modal.x, rect.y - modal.y, rect.width, rect.height)
+}
+
+#[test]
+fn native_layout_puts_done_and_the_caption_where_str_144_does() {
+    for screen in [[800, 600], [1024, 768]] {
+        let dialog = PhotoAlbumDialog::default();
+        let layout = dialog.layout(screen[0], screen[1]);
+        assert!(layout.native_scrap);
+        // `STR# 144[0]` "(129;512)", not `STR# 141`'s (150, 512).
+        assert_eq!(native_rel(layout.btn_done, screen).0, 129);
+        assert_eq!(native_rel(layout.btn_done, screen).1, 512);
+        // The caption control: entry 15's origin and entry 14's size
+        // (`0x52a8e9`, `0x52a921`).
+        assert_eq!(native_rel(layout.caption_box, screen), (90, 435, 520, 72));
+    }
+}
+
+#[test]
+fn str_144_holds_the_positions_the_layout_uses() {
+    let Some(path) = install() else {
+        return;
+    };
+    let install = Install::detect(&path).expect("open Complete Collection install");
+    let bytes = std::fs::read(install.file("GameData/UIText.iff").expect("UIText.iff"))
+        .expect("read UIText.iff");
+    let iff = sims_formats::iff::Iff::parse(bytes).expect("parse UIText.iff");
+    let chunk = iff
+        .get(b"STR#", sims_ui::album::SCRAPBOOK_STRINGS)
+        .expect("STR# 144");
+    let table =
+        sims_formats::strings::StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk))
+            .expect("parse STR# 144");
+    let pair = |index: usize| -> (i32, i32) {
+        let text = table.get(index, 1).expect("entry");
+        let (a, b) = text
+            .trim_matches(|c| c == '(' || c == ')')
+            .split_once(';')
+            .expect("(a;b)");
+        (a.trim().parse().unwrap(), b.trim().parse().unwrap())
+    };
+    let layout = PhotoAlbumDialog::default().layout(800, 600);
+    let screen = [800, 600];
+    let done = native_rel(layout.btn_done, screen);
+    assert_eq!(pair(0), (done.0, done.1), "Done");
+    let delete = native_rel(layout.btn_delete, screen);
+    assert_eq!(pair(3), (delete.0, delete.1), "Delete");
+    let well = native_rel(layout.caption_box, screen);
+    assert_eq!(pair(14), (well.2, well.3), "the well's size");
+    assert_eq!(pair(15), (well.0, well.1), "the well's origin");
 }

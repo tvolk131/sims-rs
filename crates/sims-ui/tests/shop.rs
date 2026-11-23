@@ -4,8 +4,8 @@ use sims_formats::bitmap::Image;
 use sims_ui::art::Art;
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::shop::{
-    CurrencyKind, ShopCommand, ShopItem, ShopKind, ShopPickerDialog, ShopSnapshot, ShopStrings,
-    Wallet, WardrobeCategory, load_art,
+    CHOICE_VIEW, ChoiceDialog, CurrencyKind, ShopCommand, ShopItem, ShopKind, ShopPickerDialog,
+    ShopSnapshot, ShopStrings, Wallet, WardrobeCategory, load_art,
 };
 use std::path::PathBuf;
 
@@ -87,6 +87,8 @@ fn sample_boutique_snapshot() -> ShopSnapshot {
         preview_image: None,
         preview_label: None,
         hide_wallet_and_prices: false,
+        choice: None,
+        body_shapes: Vec::new(),
     }
 }
 
@@ -142,6 +144,84 @@ fn boutique_try_on_buy_affordability_and_cancel_flow() {
     // Escape closes dialog and emits Cancel.
     assert_eq!(dialog.escape(), Some(ShopCommand::Cancel));
     assert!(!dialog.is_open());
+}
+
+#[test]
+fn choice_dialog_is_a_view_between_arrows_with_ok_and_cancel() {
+    // `cWinClothingChoiceDlg` (`0x5090d0`): no list, a 200×300 3D view with
+    // the 300/301 arrows beside it, OK and Cancel below.
+    let mut snap = sample_boutique_snapshot();
+    snap.choice = Some(ChoiceDialog::Clothing);
+    let mut dialog = ShopPickerDialog::new();
+    dialog.open();
+    let size = [800, 600];
+    let layout = dialog.layout(size, &snap);
+    let view = layout.preview_pane.expect("3D view");
+    assert_eq!([view.width as u32, view.height as u32], CHOICE_VIEW);
+    assert!(layout.visible_cards.is_empty(), "no list");
+    let previous = layout.previous_btn.expect("previous arrow");
+    let next = layout.next_btn.expect("next arrow");
+    assert!(previous.x + previous.width <= view.x);
+    assert!(next.x >= view.x + view.width);
+    assert!(!intersects(layout.buy_btn, layout.cancel_btn));
+    assert!(layout.buy_btn.y >= view.y + view.height);
+
+    let try_on = |id: &str| Some(ShopCommand::TryOn { item_id: id.into() });
+    // The arrows wrap (`0x40d360`, `0x40d229`): previous on the first
+    // outfit shows the last, next on the last shows the first.
+    let (px, py) = center(previous);
+    dialog.pointer_down(size, &snap, px, py);
+    assert_eq!(dialog.pointer_up(size, &snap, px, py), try_on("formal_03"));
+    let (nx, ny) = center(next);
+    dialog.pointer_down(size, &snap, nx, ny);
+    assert_eq!(dialog.pointer_up(size, &snap, nx, ny), try_on("formal_01"));
+    dialog.pointer_down(size, &snap, nx, ny);
+    assert_eq!(dialog.pointer_up(size, &snap, nx, ny), try_on("formal_02"));
+    assert_eq!(dialog.choose(&snap, false), try_on("formal_01"));
+    // An item that cannot be tried on is still shown (as its fallback).
+    let mut plain = snap.clone();
+    plain.items[1].supports_try_on = false;
+    assert_eq!(dialog.choose(&plain, true), try_on("formal_02"));
+    assert_eq!(dialog.choose(&plain, false), try_on("formal_01"));
+    // One choice: the arrows have nowhere to go.
+    let mut single = snap.clone();
+    single.items.truncate(1);
+    assert_eq!(dialog.choose(&single, true), None);
+    // The wardrobe's arrows pass over outfits of another body shape
+    // (`0x40d6fa..0x40d714`), keeping each outfit's own place in the list.
+    let mut shaped = snap.clone();
+    shaped.body_shapes = vec!["fit".into(), "fat".into(), "fit".into()];
+    let mut arrows = dialog.clone();
+    arrows.select_item("formal_01");
+    assert_eq!(arrows.choose(&shaped, true), try_on("formal_03"));
+    assert_eq!(arrows.choose(&shaped, true), try_on("formal_01"));
+    assert_eq!(arrows.choose(&shaped, false), try_on("formal_03"));
+    // The only `fat` outfit: an arrow comes back to it and nothing moves.
+    arrows.select_item("formal_02");
+    assert_eq!(arrows.choose(&shaped, true), None);
+    assert_eq!(arrows.choose(&shaped, false), None);
+
+    // Cancel closes without buying.
+    let mut cancelled = dialog.clone();
+    let (cx, cy) = center(layout.cancel_btn);
+    cancelled.pointer_down(size, &snap, cx, cy);
+    assert_eq!(
+        cancelled.pointer_up(size, &snap, cx, cy),
+        Some(ShopCommand::Cancel)
+    );
+    assert!(!cancelled.is_open());
+
+    // OK buys the outfit on show.
+    let (bx, by) = center(layout.buy_btn);
+    dialog.pointer_down(size, &snap, bx, by);
+    assert_eq!(
+        dialog.pointer_up(size, &snap, bx, by),
+        Some(ShopCommand::Buy {
+            item_id: "formal_01".into(),
+            currency: CurrencyKind::Simoleons,
+            price: 250,
+        })
+    );
 }
 
 #[test]
@@ -242,6 +322,8 @@ fn magic_vendor_magicoins_and_negative_price_guard() {
         preview_image: None,
         preview_label: None,
         hide_wallet_and_prices: false,
+        choice: None,
+        body_shapes: Vec::new(),
     };
 
     let mut dialog = ShopPickerDialog::new();
@@ -399,6 +481,27 @@ fn complete_collection_live_install_loads_uitext_and_renders_shop_picker() {
     assert!(!strings.title_swimwear.is_empty());
     assert!(!strings.title_pajamas.is_empty());
     assert!(!strings.title_pet.is_empty());
+    // Each choice dialog is titled from its own table: `STR# 220[4]`,
+    // `STR# 221[4]` and the Charm's `STR# 273[4]` (`0x536c26`).
+    assert_eq!(
+        strings.choice_title(ChoiceDialog::Clothing),
+        "Please Select Outfit"
+    );
+    assert_eq!(
+        strings.choice_title(ChoiceDialog::Charm),
+        "Choose the New You"
+    );
+    // The English defaults match those entries, so a localized table pins
+    // which resource each title comes from.
+    let german = ShopStrings::load(&install, 4).expect("load German UIText.iff strings");
+    assert_eq!(
+        german.choice_title(ChoiceDialog::Charm),
+        "Wähle Dein neues Ich"
+    );
+    assert_eq!(
+        german.choice_title(ChoiceDialog::Clothing),
+        "Bitte ein Outfit auswählen."
+    );
 
     let snap = sample_boutique_snapshot();
     let mut dialog = ShopPickerDialog::new();

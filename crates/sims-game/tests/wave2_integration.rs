@@ -371,6 +371,17 @@ fn wave2_photo_album_and_persistent_custom_lot_thumbnails() {
         shell.press(cam_center);
         shell.release(cam_center);
         shell.render();
+
+        // `cWinCamera`: clicking the lot with the Camera strip open takes a
+        // photo into the household's album and closes the strip.
+        assert!(shell.game().expect("active game").camera_strip_open());
+        let lot_point = [400, 200];
+        shell.press(lot_point);
+        shell.release(lot_point);
+        assert!(!shell.game().expect("active game").camera_strip_open());
+        shell.press(cam_center);
+        shell.release(cam_center);
+        shell.render();
         let album_rect = shell
             .game()
             .expect("active game")
@@ -391,16 +402,16 @@ fn wave2_photo_album_and_persistent_custom_lot_thumbnails() {
             "clicking Photo Album in Camera sub-strip must open PhotoAlbumDialog"
         );
 
-        // Capture a live lot framebuffer snapshot, add a blank page, edit text, reorder, and render.
-        shell.execute_album_command(AlbumCommand::CaptureSnapshot);
-        shell.execute_album_command(AlbumCommand::AddBlankPage);
+        // A second photo while the album is open shows up in it at once.
+        // Then edit text, reorder, and render.
+        let second_id = shell.capture_lot_photo().expect("second photo");
         let snap = shell.album_snapshot().expect("album snapshot").clone();
         assert_eq!(snap.entries.len(), 2);
         let snap_id = snap.entries[0].id;
-        let blank_id = snap.entries[1].id;
+        assert_eq!(snap.entries[1].id, second_id);
         assert!(
-            snap.entries[0].image.is_some(),
-            "captured snapshot must store a real framebuffer bitmap"
+            snap.entries.iter().all(|entry| entry.image.is_some()),
+            "each photo must store a real framebuffer bitmap"
         );
         shell.execute_album_command(AlbumCommand::UpdateEntryText {
             id: snap_id,
@@ -408,7 +419,7 @@ fn wave2_photo_album_and_persistent_custom_lot_thumbnails() {
             caption: "First evening in the garden".to_owned(),
         });
         shell.execute_album_command(AlbumCommand::MoveEntry {
-            id: blank_id,
+            id: second_id,
             new_index: 0,
         });
         shell.render();
@@ -457,10 +468,11 @@ fn wave2_photo_album_and_persistent_custom_lot_thumbnails() {
             .expect("reopened album snapshot")
             .clone();
         assert_eq!(snap.entries.len(), 2);
-        assert!(
-            snap.entries[0].image.is_none(),
-            "blank page moved to index 0"
+        assert_ne!(
+            snap.entries[0].title, "Goth Manor",
+            "the second photo moved to index 0"
         );
+        assert!(snap.entries[0].image.is_some());
         assert_eq!(snap.entries[1].title, "Goth Manor");
         assert_eq!(snap.entries[1].caption, "First evening in the garden");
         assert!(snap.entries[1].image.is_some());
@@ -1144,22 +1156,18 @@ fn wave2_large_photo_album_60_snapshots_and_loading_presenter() {
         snap.entries[0].image.is_some(),
         "selected entry 0 must have hydrated image"
     );
+    let first_id = snap.entries[0].id;
     let last_id = snap.entries[59].id;
-    // Scroll the thumbnail strip forward by 20 entries WITHOUT changing selection,
-    // verifying visible strip entries receive downscaled thumbnails (never blank)
-    // while selection stays on entry 0.
+    // The wheel over the photo changes nothing: only the caption scrolls.
     shell.hover([100, 100]);
     for _ in 0..20 {
-        assert!(shell.wheel(-1.0));
+        assert!(shell.wheel(-1.0), "the open album takes the wheel");
     }
-    let after_scroll = shell.album_snapshot().expect("scrolled snapshot");
+    assert_eq!(shell.album_dialog().selected_id(), Some(first_id));
+    let after_wheel = shell.album_snapshot().expect("snapshot after the wheel");
     assert!(
-        after_scroll.entries[0].image.is_some(),
-        "selection image must remain hydrated while scrolling strip"
-    );
-    assert!(
-        after_scroll.entries[20].thumbnail.is_some(),
-        "scrolled visible thumbnail slot must have a hydrated thumbnail"
+        after_wheel.entries[0].image.is_some(),
+        "the shown photo stays loaded"
     );
     shell.execute_album_command(AlbumCommand::SelectEntry(last_id));
     let after_select = shell.album_snapshot().expect("hydrated snapshot");
@@ -1167,17 +1175,87 @@ fn wave2_large_photo_album_60_snapshots_and_loading_presenter() {
         after_select.entries[59].image.is_some(),
         "selecting entry 60 must lazily hydrate its image"
     );
+    // Deleting the last photo shows the new last one (`0x4ee087`).
     shell.execute_album_command(AlbumCommand::DeleteEntry(last_id));
+    let after_delete = shell.album_snapshot().expect("after delete");
+    assert_eq!(after_delete.entries.len(), 59);
     assert_eq!(
-        shell.album_snapshot().expect("after delete").entries.len(),
-        59
+        shell.album_dialog().selected_id(),
+        Some(after_delete.entries[58].id)
     );
+    assert!(after_delete.entries[58].image.is_some(), "and loads it");
     shell.close_photo_album();
 
     // Verify Save Manager refuses to restore over a lot holding a persisted (even corrupt) `TRVL` envelope.
     shell
         .enter_lot(5)
         .expect("enter Goth lot 5 to save a manual slot");
+
+    // A Camera Mode photo taken while the album is open joins the list
+    // and leaves the shown photo where it was.
+    shell
+        .open_photo_album()
+        .expect("open the Goths' album on the lot");
+    let first = shell.album_snapshot().expect("album").entries[0].id;
+    shell.execute_album_command(AlbumCommand::SelectEntry(first));
+    shell
+        .capture_lot_photo()
+        .expect("photo with the album open");
+    assert_eq!(shell.album_dialog().selected_id(), Some(first));
+    let snap = shell.album_snapshot().expect("album");
+    assert_eq!(snap.entries.len(), 60, "59 stored plus the new photo");
+    // Choose photo 25 and close with Done.
+    let chosen = snap.entries[25].id;
+    shell.execute_album_command(AlbumCommand::SelectEntry(chosen));
+    shell.close_photo_album();
+
+    // The dialog is new on every open (`0x4d2100`, `0x52a4c9`), but the
+    // photo it shows is the household album's current one, which outlives
+    // it (`0x4108e4`, read at `0x52b119`) and which Done leaves alone: the
+    // album reopens on photo 25, loaded.
+    shell.open_photo_album().expect("reopen the Goths' album");
+    assert_eq!(shell.album_dialog().selected_id(), Some(chosen));
+    let reopened = shell.album_snapshot().expect("album");
+    assert!(reopened.entries[25].image.is_some(), "photo 25 shows");
+    shell.close_photo_album();
+
+    // A photo taken with the album closed becomes its current one
+    // (`0x4ed857`), so the album next opens on it.
+    let newest = shell
+        .capture_lot_photo()
+        .expect("photo with the album closed");
+    shell.open_photo_album().expect("reopen after a photo");
+    let reopened = shell.album_snapshot().expect("album");
+    assert_eq!(reopened.entries.len(), 61);
+    assert_eq!(reopened.entries.last().map(|e| e.id), Some(newest));
+    assert_eq!(shell.album_dialog().selected_id(), Some(newest));
+
+    // A notice over the album takes the wheel.
+    shell.show_notice("Photo Album", "A notice over the album.");
+    assert!(!shell.wheel(-1.0), "the wheel does not reach the album");
+    // The notice is centred on the window, and follows a resize.
+    let centre = |shell: &NeighborhoodShell| {
+        let rect = shell.dialog_layout().expect("the notice is in front").rect;
+        (rect.x + rect.width / 2, rect.y + rect.height / 2)
+    };
+    let small = centre(&shell);
+    shell.resize([1024, 768]);
+    let large = centre(&shell);
+    assert_eq!(
+        (large.0 - small.0, large.1 - small.1),
+        (112, 84),
+        "the notice moves with the window's centre"
+    );
+    shell.resize([800, 600]);
+    assert_eq!(centre(&shell), small);
+    shell.escape();
+    assert!(shell.album_open(), "Escape closes only the notice");
+    assert!(
+        shell.wheel(1.0),
+        "with the notice gone the album takes the wheel"
+    );
+    assert_eq!(shell.album_dialog().selected_id(), Some(newest));
+    shell.close_photo_album();
     shell
         .enqueue_background_lot_save(sims_sim::autosave::SaveTarget::Manual)
         .expect("enqueue manual lot save");
@@ -1214,4 +1292,142 @@ fn wave2_large_photo_album_60_snapshots_and_loading_presenter() {
         "refused restore must preserve the persisted TRVL envelope untouched"
     );
     shell.close_save_manager();
+}
+
+/// Deleting a photo keeps the album's current index, clamped to the new
+/// last photo (`0x4ee087`), and deleting the only photo closes the album
+/// (`0x52b0c8`). The current photo belongs to the household's album,
+/// which is freed with the family (`0x41010b`): a later family with the
+/// same ID starts on its first photo.
+#[test]
+fn album_delete_clamps_the_shown_photo_and_a_freed_family_forgets_it() {
+    let Some(install) = install_root() else {
+        return;
+    };
+    let tmp = TempDir::new("album-delete");
+    let saves = tmp.path().join("album-delete.redb");
+    let mut shell = NeighborhoodShell::open(install, saves, 1, true, vec![3], Frames::default())
+        .expect("open NeighborhoodShell");
+    let family = shell
+        .family_bin_entries()
+        .first()
+        .map(|entry| entry.id as u16)
+        .expect("a Family Bin household");
+    let add_pages = |shell: &NeighborhoodShell, titles: &[&str]| {
+        let token = shell
+            .store()
+            .albums()
+            .family_token("UserData", family)
+            .expect("family token")
+            .expect("the family's token");
+        for title in titles {
+            shell
+                .store()
+                .albums()
+                .add(
+                    "UserData",
+                    token,
+                    sims_sim::album_store::NewAlbumPhoto::blank(*title, ""),
+                )
+                .expect("add a page");
+        }
+    };
+    let shown_title = |shell: &NeighborhoodShell| {
+        let snapshot = shell.album_snapshot().expect("the album is open");
+        let id = shell.album_dialog().selected_id().expect("a shown photo");
+        snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.title.clone())
+            .expect("the shown photo is listed")
+    };
+    let id_of = |shell: &NeighborhoodShell, title: &str| {
+        shell
+            .album_snapshot()
+            .expect("the album is open")
+            .entries
+            .iter()
+            .find(|entry| entry.title == title)
+            .map(|entry| entry.id)
+            .expect("the photo is listed")
+    };
+    add_pages(&shell, &["A", "B", "C", "D"]);
+    shell
+        .open_photo_album_for_family(family)
+        .expect("open the album");
+    assert_eq!(
+        shown_title(&shell),
+        "A",
+        "a new album opens on its first photo"
+    );
+
+    // A B C D: deleting C keeps index 2, which is now D.
+    let c = id_of(&shell, "C");
+    shell.execute_album_command(AlbumCommand::SelectEntry(c));
+    shell.execute_album_command(AlbumCommand::DeleteEntry(c));
+    assert_eq!(shown_title(&shell), "D");
+    // A B D: deleting D, the last, clamps to the new last, B.
+    let d = id_of(&shell, "D");
+    shell.execute_album_command(AlbumCommand::DeleteEntry(d));
+    assert_eq!(shown_title(&shell), "B");
+    // A B: deleting A keeps index 0, which is now B.
+    let a = id_of(&shell, "A");
+    shell.execute_album_command(AlbumCommand::SelectEntry(a));
+    shell.execute_album_command(AlbumCommand::DeleteEntry(a));
+    assert_eq!(shown_title(&shell), "B");
+    // Deleting the only photo closes the album.
+    let b = id_of(&shell, "B");
+    shell.execute_album_command(AlbumCommand::DeleteEntry(b));
+    assert!(
+        !shell.album_open(),
+        "deleting the only photo closes the album"
+    );
+
+    // The album remembers its current photo across openings ...
+    add_pages(&shell, &["E", "F", "G"]);
+    shell
+        .open_photo_album_for_family(family)
+        .expect("reopen the album");
+    let g = id_of(&shell, "G");
+    shell.execute_album_command(AlbumCommand::SelectEntry(g));
+    shell.close_photo_album();
+    shell
+        .open_photo_album_for_family(family)
+        .expect("reopen the album");
+    assert_eq!(shown_title(&shell), "G");
+    shell.close_photo_album();
+
+    // ... until the family is freed. A new family with the same ID has a
+    // new album, which opens on its first photo.
+    let before = shell
+        .store()
+        .load_neighborhood("UserData")
+        .expect("load the neighborhood")
+        .expect("the neighborhood");
+    shell
+        .execute_delete_family(family)
+        .expect("delete the household");
+    let mut after = shell
+        .store()
+        .load_neighborhood("UserData")
+        .expect("load the neighborhood")
+        .expect("the neighborhood");
+    assert!(!after.families.contains_key(&family));
+    after
+        .families
+        .insert(family, before.families[&family].clone());
+    shell
+        .store()
+        .save_neighborhood("UserData", &after)
+        .expect("a new family with the same ID");
+    add_pages(&shell, &["H", "I", "J"]);
+    shell
+        .open_photo_album_for_family(family)
+        .expect("open the new family's album");
+    assert_eq!(
+        shown_title(&shell),
+        "H",
+        "the new family does not inherit the old album's photo"
+    );
 }
