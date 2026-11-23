@@ -16,6 +16,9 @@ use crate::coop::{
     CoopController, CoopPollOutput, CoopPumpStats, CoopStartOptions, CoopTransport, clipboard_copy,
     clipboard_paste, default_player_name, player_badge_color,
 };
+use crate::destination_picker::{
+    DestinationMapPicker, DestinationPickerAction, DestinationPickerAssets,
+};
 use crate::hud::{DialogKey, Hud, HudShared, HudStatic, OptionsDialog};
 use crate::menu::{self, Listing, Menu};
 use crate::pace::{self, Pace};
@@ -355,6 +358,14 @@ pub struct Game {
     book_art: Option<Art>,
     book_strings: Option<BookStrings>,
     book_snapshot: Option<ReferenceBookSnapshot>,
+    /// Real graphical destination map picker for VM special lot pickers
+    /// (`Dialog` kinds `5, 7, 8, 11, 13`: Downtown, Vacation, Old Town,
+    /// Studio Town, Magic Town).
+    destination_picker: Option<DestinationMapPicker>,
+    destination_picker_assets: Option<DestinationPickerAssets>,
+    /// Neighborhood slot (`1..=8`) owning this lot, used to load the matching
+    /// graphical destination map when a special lot picker opens.
+    neighborhood_slot: u8,
     /// Currently presented VM special panel (`Dialog` kinds `5..=15`), if any.
     active_special_panel: Option<ActiveSpecialPanel>,
     /// Co-op special-panel dialog ID already answered locally plus pump count
@@ -1064,6 +1075,9 @@ impl Game {
             book_art: None,
             book_strings: None,
             book_snapshot: None,
+            destination_picker: None,
+            destination_picker_assets: None,
+            neighborhood_slot: 1,
             active_special_panel: None,
             submitted_coop_special_panel: None,
             ordered_wardrobe: None,
@@ -1447,6 +1461,9 @@ impl Game {
             book_art: None,
             book_strings: None,
             book_snapshot: None,
+            destination_picker: None,
+            destination_picker_assets: None,
+            neighborhood_slot: 1,
             active_special_panel: None,
             submitted_coop_special_panel: None,
             ordered_wardrobe: None,
@@ -1786,6 +1803,9 @@ impl Game {
             book_art: None,
             book_strings: None,
             book_snapshot: None,
+            destination_picker: None,
+            destination_picker_assets: None,
+            neighborhood_slot: 1,
             active_special_panel: None,
             submitted_coop_special_panel: None,
             ordered_wardrobe: None,
@@ -1986,6 +2006,9 @@ impl Game {
             book_art: None,
             book_strings: None,
             book_snapshot: None,
+            destination_picker: None,
+            destination_picker_assets: None,
+            neighborhood_slot: 1,
             active_special_panel: None,
             submitted_coop_special_panel: None,
             ordered_wardrobe: None,
@@ -2613,6 +2636,60 @@ impl Game {
         self.special_lot_catalog = lots;
     }
 
+    /// Sets the owning neighborhood slot (`1..=8`) so graphical destination
+    /// map pickers load the matching `UserData*` map.
+    pub fn set_neighborhood_slot(&mut self, slot: u8) {
+        self.neighborhood_slot = slot.clamp(1, 8);
+    }
+
+    /// Whether the graphical destination map picker (`Dialog` kinds `5, 7, 8, 11, 13`)
+    /// is currently open.
+    pub fn destination_picker_open(&self) -> bool {
+        self.destination_picker.is_some()
+    }
+
+    /// Active graphical [`DestinationMapPicker`], when a destination lot-picker
+    /// special panel is open.
+    pub fn destination_picker(&self) -> Option<&DestinationMapPicker> {
+        self.destination_picker.as_ref()
+    }
+
+    /// Cancels the open graphical destination map picker (`Esc` or Return button),
+    /// delivering `SpecialPanelResponse::Lot(None)` to the VM.
+    pub fn destination_picker_escape(&mut self) -> Outcome {
+        if self.destination_picker.is_none() {
+            return Outcome::default();
+        }
+        if self.answer_special_panel(SpecialPanelResponse::Lot(None)) {
+            self.hud.play(crate::hud::CLICK);
+        } else {
+            self.hud.play(crate::hud::ERROR);
+        }
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        Outcome::redraw()
+    }
+
+    /// Confirms the currently hovered visitable lot on the graphical
+    /// destination map picker (`Enter`), if any.
+    pub fn destination_picker_submit(&mut self) -> Outcome {
+        let Some(lot_id) = self
+            .destination_picker
+            .as_ref()
+            .and_then(DestinationMapPicker::hovered_lot)
+        else {
+            return Outcome::default();
+        };
+        if self.answer_special_panel(SpecialPanelResponse::Lot(Some(lot_id as i16))) {
+            self.hud.play(crate::hud::CLICK);
+        } else {
+            self.hud.play(crate::hud::ERROR);
+        }
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        Outcome::redraw()
+    }
+
     /// Takes any destination lot chosen in a VM special lot picker (`5, 7, 8, 11, 13`)
     /// so `NeighborhoodShell` can cleanly transition via `depart_to_destination`.
     pub fn take_pending_travel_lot(&mut self) -> Option<(SpecialPanelRequest, u32)> {
@@ -2667,13 +2744,23 @@ impl Game {
         self.lot.roof_state_with_base(&self.base_roof)
     }
 
+    /// Laid-out HUD items from the last rendered frame.
+    pub fn hud_items(&self) -> &[sims_ui::hud::Item] {
+        self.hud.items()
+    }
+
     /// Whether the Camera Roof preview toggle (`Camera::Roof`) is active.
     pub fn roof_view(&self) -> bool {
         self.roof_view
     }
 
-    /// Sets the Camera Roof preview toggle (`Camera::Roof`).
+    /// Sets the Camera Roof view (`Camera::Roof`, native 4-way radio state
+    /// `[ui + 0x48] == 8`). Turning Roof view on also raises walls to
+    /// [`Walls::Up`] so the roof never floats over lowered walls.
     pub fn set_roof_view(&mut self, on: bool) {
+        if on {
+            self.view.camera.walls = Walls::Up;
+        }
         self.roof_view = on;
         self.hud.set_roof_view(on);
     }
@@ -2803,6 +2890,7 @@ impl Game {
     pub fn has_dialog(&self) -> bool {
         self.hud.has_dialog()
             || self.book_dialog.is_open()
+            || self.destination_picker.is_some()
             || self.lot.asking().is_some()
             || self.lot.asking_special_panel().is_some()
             || self.active_special_panel.is_some()
@@ -3400,6 +3488,7 @@ impl Game {
         let ticks_active = self.hud.controls.mode == Mode::Live
             && !self.hud.has_ui_dialog()
             && !self.book_dialog.is_open()
+            && self.destination_picker.is_none()
             && self.lot.asking().is_none()
             && self.lot.asking_special_panel().is_none()
             && self.stopped.is_none();
@@ -3407,6 +3496,15 @@ impl Game {
             consider(self.pace.remaining_us(self.lot.world().speed()));
         }
         if can_draw {
+            if let Some(picker) = &self.destination_picker {
+                if let Some(us) = picker.next_wake_us(self.clock_us, anim_interval_us) {
+                    consider(us);
+                }
+                if let Some(us) = self.coop_lobby.next_blink_us(self.clock_us) {
+                    consider(us);
+                }
+                return best;
+            }
             if self.is_edge_scrolling(dragging)
                 || self.pie_animating()
                 || self.ui_animating()
@@ -3512,6 +3610,11 @@ impl Game {
         if self.hud.sync_clock_blink(self.lot.world(), self.clock_us)
             || self.hud.sync_dialog_blink(self.clock_us)
             || self.coop_lobby.sync_blink(self.clock_us)
+        {
+            self.blink_dirty = true;
+        }
+        if let Some(picker) = &mut self.destination_picker
+            && picker.tick(self.clock_us)
         {
             self.blink_dirty = true;
         }
@@ -4117,6 +4220,7 @@ impl Game {
         self.draw_build_cost_label();
         self.draw_shop_dialog();
         self.draw_book_dialog();
+        self.draw_destination_picker();
         self.draw_coop_hud_and_lobby();
         // The help balloon closed by the selection's going.
         let sounds = self.hud.take_sounds();
@@ -4148,6 +4252,7 @@ impl Game {
             && !self.cheat_console_open()
             && !self.shop_dialog.is_open()
             && !self.book_dialog.is_open()
+            && self.destination_picker.is_none()
             && self.highlighted_buttons.is_empty()
             && self.highlighted_portraits.is_empty()
             && self.highlighted_relationships.is_empty()
@@ -4259,6 +4364,11 @@ impl Game {
     /// no-op or wall-mode commands preserve a restored pick.
     pub fn apply(&mut self, command: Move) -> bool {
         let cancelled_pan = self.camera_pan.take().is_some();
+        let cleared_roof = matches!(command, Move::Walls(_)) && self.roof_view;
+        if cleared_roof {
+            self.roof_view = false;
+            self.hud.set_roof_view(false);
+        }
         let before = self.view.camera;
         let (w, h) = self.house_viewport_size();
         let viewport = [w as i32, h as i32];
@@ -4289,7 +4399,7 @@ impl Game {
         {
             self.sync_view();
         }
-        moved
+        moved || cleared_roof
     }
 
     /// Whether the panel takes presses at `point`.
@@ -4351,6 +4461,9 @@ impl Game {
                     .pointer_move(size, snapshot, point[0], point[1]);
             }
             return true;
+        }
+        if let Some(picker) = &mut self.destination_picker {
+            return picker.hover(self.view.size, point, self.clock_us);
         }
         let mut redraw = self.hud.hover(point);
         let sounds = self.hud.take_sounds();
@@ -4429,6 +4542,14 @@ impl Game {
                 };
             }
             return Outcome::default();
+        }
+        if let Some(picker) = &mut self.destination_picker {
+            self.pointer = Some(point);
+            let changed = picker.press(self.view.size, point, self.clock_us);
+            return Outcome {
+                redraw: changed,
+                ..Outcome::default()
+            };
         }
         if !self.has_dialog() && self.hud.menu.is_some() {
             self.pointer = Some(point);
@@ -4743,6 +4864,36 @@ impl Game {
                 None => Outcome::redraw(),
             };
         }
+        if let Some(picker) = &mut self.destination_picker {
+            self.pointer = Some(point);
+            let action = picker.release(self.view.size, point);
+            return match action {
+                Some(DestinationPickerAction::SelectLot(lot_id)) => {
+                    if self.answer_special_panel(SpecialPanelResponse::Lot(Some(lot_id as i16))) {
+                        self.hud.play(crate::hud::CLICK);
+                    } else {
+                        self.hud.play(crate::hud::ERROR);
+                    }
+                    let sounds = self.hud.take_sounds();
+                    self.keep_sounds(sounds);
+                    Outcome::redraw()
+                }
+                Some(DestinationPickerAction::Cancel) => self.destination_picker_escape(),
+                Some(DestinationPickerAction::InvalidLot) => {
+                    self.hud.play(crate::hud::ERROR);
+                    let sounds = self.hud.take_sounds();
+                    self.keep_sounds(sounds);
+                    Outcome::redraw()
+                }
+                Some(DestinationPickerAction::Redraw) => {
+                    self.hud.play(crate::hud::CLICK);
+                    let sounds = self.hud.take_sounds();
+                    self.keep_sounds(sounds);
+                    Outcome::redraw()
+                }
+                None => Outcome::redraw(),
+            };
+        }
         let released_slider = self.hud.release_slider(Some(point));
         let (released_saves, open_saves) = self.hud.release_saves_button(Some(point));
         if open_saves {
@@ -4932,6 +5083,13 @@ impl Game {
     /// pie without checking or choosing any entry.
     pub fn release_outside(&mut self) -> Outcome {
         let _ = self.coop_overlay_buttons.release(None);
+        if let Some(picker) = &mut self.destination_picker {
+            let redraw = picker.leave(self.clock_us);
+            return Outcome {
+                redraw,
+                ..Outcome::default()
+            };
+        }
         let released_slider = self.hud.release_slider(None);
         let (released_saves, _) = self.hud.release_saves_button(None);
         let (released_coop, _) = self.hud.release_coop_button(None);
@@ -4991,6 +5149,9 @@ impl Game {
     pub fn leave(&mut self) -> bool {
         self.pointer = None;
         self.highlighted = None;
+        if let Some(picker) = &mut self.destination_picker {
+            return picker.leave(self.clock_us);
+        }
         let mut redraw = self.hud.leave();
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
@@ -5869,8 +6030,11 @@ impl Game {
                     Outcome::redraw()
                 }
                 UiCamera::Roof => {
-                    self.roof_view = !self.roof_view;
-                    self.hud.set_roof_view(self.roof_view);
+                    // Native `Sims.exe` `0x53a34d -> 0x4cef10(8, 1)`: 4-way
+                    // mutually exclusive radio button (`ROOF` / `WALLS_UP` /
+                    // `CUTAWAY` / `WALLS_DOWN`). Selecting Roof raises walls
+                    // and enables roof rendering, unlighting all 3 wall buttons.
+                    self.set_roof_view(true);
                     self.hud.play(crate::hud::CLICK);
                     Outcome::redraw()
                 }
@@ -6457,8 +6621,13 @@ impl Game {
 
     /// Steps wall display mode upward (`Home`: `Down → Cutaway → Up`, `0x4d135b`)
     /// or downward (`End`: `Up → Cutaway → Down`, `0x4d1393`), playing
-    /// `UI_error` at either boundary.
+    /// `UI_error` at either boundary. When Roof view (`[ui + 0x48] == 8`) is
+    /// active, `Home`/`End` do not match `1`/`2`/`4` in `Sims.exe` 1.91 and
+    /// leave Roof view unchanged without playing an error.
     pub fn step_walls(&mut self, up: bool) -> bool {
+        if self.roof_view {
+            return false;
+        }
         let next = match (self.view.camera.walls, up) {
             (Walls::Down, true) => Some(Walls::Cutaway),
             (Walls::Cutaway, true) => Some(Walls::Up),
@@ -9131,6 +9300,22 @@ impl Game {
         self.canvas.color = frame.into_packed();
     }
 
+    fn draw_destination_picker(&mut self) {
+        if self.destination_picker.is_none() {
+            return;
+        }
+        if self.destination_picker_assets.is_none() {
+            self.destination_picker_assets =
+                Some(DestinationPickerAssets::load(self.hud.install()));
+        }
+        let Some(assets) = self.destination_picker_assets.as_ref() else {
+            return;
+        };
+        if let Some(picker) = self.destination_picker.as_mut() {
+            picker.draw(&mut self.canvas, assets, self.clock_us);
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Paginated Spellbook & Cookbook Reference Modal (`sims_ui::book`)
     // -------------------------------------------------------------------------
@@ -9650,6 +9835,7 @@ impl Game {
             self.shop_preview_targets.clear();
             self.book_dialog.close();
             self.book_snapshot = None;
+            self.destination_picker = None;
             self.hud.close_special_book_dialog();
         }
     }
@@ -9696,6 +9882,7 @@ impl Game {
         self.hud.close_special_book_dialog();
         self.book_dialog.close();
         self.book_snapshot = None;
+        self.destination_picker = None;
         self.shop_dialog.close();
         self.shop_snapshot = None;
         self.shop_preview_yaw_deg = 0;
@@ -9723,19 +9910,49 @@ impl Game {
             | SpecialPanelRequest::OldTownLotPicker { .. }
             | SpecialPanelRequest::StudioTownLotPicker { .. }
             | SpecialPanelRequest::MagicTownLotPicker { .. } => {
-                let (shop_kind, title, items, responses) =
-                    self.build_destination_lot_picker(&request, &asking.world);
-                self.open_special_picker(
-                    tick,
-                    request,
-                    coop_dialog_id,
-                    shop_kind,
-                    title,
-                    None,
-                    items,
-                    responses,
-                    BTreeMap::new(),
-                );
+                let entries = self.resolve_special_lot_entries();
+                let wallet = self.current_shop_wallet();
+                let fame_half_stars = asking
+                    .world
+                    .selected()
+                    .and_then(|sel| asking.world.objects.get(&sel))
+                    .and_then(|o| o.person.as_ref())
+                    .and_then(|p| p.data.get(15).copied())
+                    .map(|score| (score.clamp(0, 1000) / 100) as u8)
+                    .unwrap_or(0);
+                match DestinationMapPicker::open(
+                    self.hud.install(),
+                    self.neighborhood_slot,
+                    request.clone(),
+                    entries,
+                    wallet.simoleons,
+                    wallet.magic_coins,
+                    fame_half_stars,
+                ) {
+                    Ok(picker) => {
+                        self.destination_picker = Some(picker);
+                        self.active_special_panel = Some(ActiveSpecialPanel {
+                            tick,
+                            request,
+                            coop_dialog_id,
+                            responses: BTreeMap::new(),
+                            preview_targets: BTreeMap::new(),
+                        });
+                    }
+                    Err(err) => {
+                        self.note = Some(format!(
+                            "Could not load destination map for special panel kind {}: {err}",
+                            request.kind()
+                        ));
+                        self.active_special_panel = Some(ActiveSpecialPanel {
+                            tick,
+                            request,
+                            coop_dialog_id,
+                            responses: BTreeMap::new(),
+                            preview_targets: BTreeMap::new(),
+                        });
+                    }
+                }
             }
             SpecialPanelRequest::WardrobeShop { person, mode } => {
                 let category = match *mode {
@@ -10223,105 +10440,6 @@ impl Game {
                 }
             })
             .collect()
-    }
-
-    fn build_destination_lot_picker(
-        &self,
-        request: &SpecialPanelRequest,
-        _world: &sims_sim::World,
-    ) -> (
-        ShopKind,
-        Option<String>,
-        Vec<ShopItem>,
-        BTreeMap<String, SpecialPanelResponse>,
-    ) {
-        let entries = self.resolve_special_lot_entries();
-        let shop_kind = match request {
-            SpecialPanelRequest::DowntownLotPicker => {
-                ShopKind::DowntownBoutique(WardrobeCategory::Formal)
-            }
-            SpecialPanelRequest::VacationLotPicker { .. } => ShopKind::VacationKiosk,
-            SpecialPanelRequest::OldTownLotPicker { .. } => ShopKind::PetAdoption,
-            SpecialPanelRequest::StudioTownLotPicker { .. } => ShopKind::StudioWardrobe,
-            SpecialPanelRequest::MagicTownLotPicker { .. } => ShopKind::MagicVendor,
-            _ => ShopKind::MagicVendor,
-        };
-        let travel_strings =
-            sims_ui::travel::TravelStrings::load(self.hud.install(), US_ENGLISH).ok();
-        let non_empty = |s: Option<&String>| -> Option<String> {
-            s.map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-                .map(str::to_owned)
-        };
-        let title_override = match request {
-            SpecialPanelRequest::DowntownLotPicker => travel_strings
-                .as_ref()
-                .and_then(|ts| non_empty(ts.go_downtown_dialog.first()))
-                .or_else(|| Some("21-30".into())),
-            SpecialPanelRequest::VacationLotPicker { .. } => travel_strings
-                .as_ref()
-                .and_then(|ts| non_empty(ts.go_vacation_dialog.first())),
-            SpecialPanelRequest::OldTownLotPicker { .. } => travel_strings
-                .as_ref()
-                .and_then(|ts| non_empty(ts.visit_neighborhood.first()))
-                .or_else(|| Some("58-68".into())),
-            SpecialPanelRequest::StudioTownLotPicker { .. } => None,
-            SpecialPanelRequest::MagicTownLotPicker { .. } => travel_strings
-                .as_ref()
-                .and_then(|ts| non_empty(ts.visit_magic_town.first())),
-            _ => None,
-        };
-
-        let filtered: Vec<SpecialLotEntry> = entries
-            .into_iter()
-            .filter(|e| match request {
-                SpecialPanelRequest::DowntownLotPicker => (21..=30).contains(&e.lot_id),
-                SpecialPanelRequest::VacationLotPicker { .. } => (40..=48).contains(&e.lot_id),
-                SpecialPanelRequest::OldTownLotPicker { .. } => {
-                    e.zoning == 2
-                        && !(21..=30).contains(&e.lot_id)
-                        && !(40..=48).contains(&e.lot_id)
-                        && !(81..=89).contains(&e.lot_id)
-                        && !(90..=98).contains(&e.lot_id)
-                }
-                SpecialPanelRequest::StudioTownLotPicker { .. } => (81..=89).contains(&e.lot_id),
-                SpecialPanelRequest::MagicTownLotPicker { .. } => (93..=98).contains(&e.lot_id),
-                _ => false,
-            })
-            .collect();
-
-        let mut items = Vec::with_capacity(filtered.len());
-        let mut responses = BTreeMap::new();
-        for entry in filtered {
-            let id = format!("special_lot:{}", entry.lot_id);
-            let display_name = if !entry.name.trim().is_empty() {
-                entry.name.trim().to_owned()
-            } else if let Some(addr) = entry.address.as_deref().filter(|a| !a.trim().is_empty()) {
-                addr.trim().to_owned()
-            } else {
-                format!("#{}", entry.lot_id)
-            };
-            let description = if !entry.description.trim().is_empty() {
-                entry.description.trim().to_owned()
-            } else if let Some(addr) = entry.address.as_deref().filter(|a| !a.trim().is_empty()) {
-                addr.trim().to_owned()
-            } else {
-                format!("#{}", entry.lot_id)
-            };
-            items.push(ShopItem {
-                id: id.clone(),
-                name: display_name,
-                description,
-                price: 0,
-                currency: CurrencyKind::Simoleons,
-                icon: None,
-                supports_try_on: false,
-                owned: false,
-                available: true,
-            });
-            responses.insert(id, SpecialPanelResponse::Lot(Some(entry.lot_id as i16)));
-        }
-        (shop_kind, title_override, items, responses)
     }
 
     fn format_wardrobe_row_label(suit: &str, row: &str) -> String {

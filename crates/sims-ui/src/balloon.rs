@@ -739,10 +739,12 @@ pub fn lay_out(art: &Art, text: &Text, owner: Rect) -> Balloon {
 
 /// Computes the vertical span `(top, height)` of picture slot `slot_index`
 /// inside a balloon of `balloon_height` on a screen of `frame_width`
-/// (`0x50fef5..0x50ff91`): at width `1024`, slot 0 subtracts `50` from the
-/// effective layout height while still clamping `bottom` to `balloon_height`.
-fn slot_vertical(slot_index: usize, balloon_height: i32, frame_width: u32) -> (i32, i32) {
-    let effective = if slot_index == 0 && frame_width == 1024 {
+/// (`0x50fef5..0x50ff91`): at widescreen widths `>= 1024`, slot 0 subtracts
+/// `50` from the effective layout height while still clamping `bottom` to
+/// `balloon_height` (preserving exact 800×600 and 1024×768 parity while
+/// preventing a 50 px discontinuity at `1024 → 1025`).
+pub fn slot_vertical(slot_index: usize, balloon_height: i32, frame_width: u32) -> (i32, i32) {
+    let effective = if slot_index == 0 && frame_width >= 1024 {
         balloon_height.saturating_sub(50)
     } else {
         balloon_height
