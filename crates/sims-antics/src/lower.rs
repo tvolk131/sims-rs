@@ -267,6 +267,59 @@ fn scan_primitive(prim: &PrimitiveCall, usage: &mut TreeUsage) {
             scan_operand(dst, usage);
             scan_operand(range, usage);
         }
+        PrimitiveCall::GetDistanceTo { flags, from, .. } => {
+            if flags & 1 != 0
+                && let Some(op) = from
+            {
+                scan_operand(op, usage);
+            }
+        }
+        PrimitiveCall::GetDirectionTo { dst, flags, from } => {
+            scan_operand(dst, usage);
+            if flags & 1 != 0
+                && let Some(op) = from
+            {
+                scan_operand(op, usage);
+            }
+        }
+        PrimitiveCall::Breakpoint { cond } => {
+            scan_operand(cond, usage);
+        }
+        PrimitiveCall::MakeNewCharacter { skin, age, sex, .. } => {
+            scan_local_ref(skin, usage);
+            scan_local_ref(age, usage);
+            scan_local_ref(sex, usage);
+        }
+        PrimitiveCall::OldRelationship {
+            param, direction, ..
+        } => {
+            if *param == 0 || matches!(direction, 2 | 3) {
+                usage.uses_param0 = true;
+            }
+        }
+        PrimitiveCall::UiEffect { mode, target, .. } => {
+            if *mode <= 2
+                && let Some(op) = target
+            {
+                scan_operand(op, usage);
+            }
+        }
+        PrimitiveCall::SpecialEffect {
+            duration, flags, ..
+        } => {
+            if flags & 0x20 != 0 && *duration >= 0 {
+                let idx = *duration as usize;
+                usage.max_explicit_local =
+                    Some(usage.max_explicit_local.map_or(idx, |m| m.max(idx)));
+            }
+        }
+        PrimitiveCall::Reach {
+            mode, slot_param, ..
+        } => {
+            if *mode == 1 && *slot_param == 0 {
+                usage.uses_param0 = true;
+            }
+        }
         PrimitiveCall::PushInteraction {
             object_slot,
             flags,
@@ -454,6 +507,10 @@ fn scan_stmts(stmts: &[Stmt], usage: &mut TreeUsage) {
             Stmt::While { cond, body, .. } => {
                 usage.is_verbatim_explicit = false;
                 scan_condition(cond, usage);
+                scan_stmts(body, usage);
+            }
+            Stmt::Loop { body, .. } => {
+                usage.is_verbatim_explicit = false;
                 scan_stmts(body, usage);
             }
             Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Return { .. } => {
@@ -719,6 +776,7 @@ impl<'a> TreeBuilder<'a> {
                 let rhs = self.resolve_operand(rhs, span)?;
                 Ok((2, encode_expr_operands(lhs, *operator, rhs)))
             }
+            PrimitiveCall::FindBestInteraction => Ok((3, [0; 8])),
             PrimitiveCall::Grab => Ok((4, [0; 8])),
             PrimitiveCall::Drop => Ok((5, [0; 8])),
             PrimitiveCall::ChangeSuit {
@@ -739,6 +797,153 @@ impl<'a> TreeBuilder<'a> {
                 let [r0, r1] = range.index.to_le_bytes();
                 let [rs0, rs1] = u16::from(range.scope).to_le_bytes();
                 Ok((8, [d0, d1, ds0, ds1, r0, r1, rs0, rs1]))
+            }
+            PrimitiveCall::Burn { mode, flags } => Ok((9, [*mode, *flags, 0, 0, 0, 0, 0, 0])),
+            PrimitiveCall::Tutorial { mode } => Ok((10, [*mode, 0, 0, 0, 0, 0, 0, 0])),
+            PrimitiveCall::GetDistanceTo { temp, flags, from } => {
+                if *temp >= 8 {
+                    return Err(Error::at(
+                        span,
+                        format!("get_distance_to temp {temp} out of 0..=7 range"),
+                    ));
+                }
+                let [t0, t1] = u16::from(*temp).to_le_bytes();
+                if flags & 1 != 0 {
+                    let op = from.as_ref().ok_or_else(|| {
+                        Error::at(
+                            span,
+                            "get_distance_to with flag bit 0 requires a 'from' operand",
+                        )
+                    })?;
+                    let resolved = self.resolve_operand(op, span)?;
+                    let [i0, i1] = resolved.index.to_le_bytes();
+                    Ok((11, [t0, t1, *flags, resolved.scope, i0, i1, 0, 0]))
+                } else {
+                    Ok((11, [t0, t1, *flags, 0, 0, 0, 0, 0]))
+                }
+            }
+            PrimitiveCall::GetDirectionTo { dst, flags, from } => {
+                let dst = self.resolve_operand(dst, span)?;
+                let [d0, d1] = dst.index.to_le_bytes();
+                let [ds0, ds1] = u16::from(dst.scope).to_le_bytes();
+                if flags & 1 != 0 {
+                    let op = from.as_ref().ok_or_else(|| {
+                        Error::at(
+                            span,
+                            "get_direction_to with flag bit 0 requires a 'from' operand",
+                        )
+                    })?;
+                    let resolved = self.resolve_operand(op, span)?;
+                    let [i0, i1] = resolved.index.to_le_bytes();
+                    Ok((12, [d0, d1, ds0, ds1, *flags, resolved.scope, i0, i1]))
+                } else {
+                    Ok((12, [d0, d1, ds0, ds1, *flags, 0, 0, 0]))
+                }
+            }
+            PrimitiveCall::Breakpoint { cond } => {
+                let cond = self.resolve_operand(cond, span)?;
+                let [i0, i1] = cond.index.to_le_bytes();
+                let [s0, s1] = u16::from(cond.scope).to_le_bytes();
+                Ok((15, [i0, i1, s0, s1, 0, 0, 0, 0]))
+            }
+            PrimitiveCall::MakeNewCharacter {
+                skin,
+                age,
+                sex,
+                species,
+            } => {
+                let skin = self.resolve_local_ref(skin, span, true)?;
+                let age = self.resolve_local_ref(age, span, true)?;
+                let sex = self.resolve_local_ref(sex, span, true)?;
+                Ok((19, [skin, age, sex, *species, 0, 0, 0, 0]))
+            }
+            PrimitiveCall::ShowString { table, index } => {
+                let [t0, t1] = table.to_le_bytes();
+                let [i0, i1] = index.to_le_bytes();
+                Ok((21, [t0, t1, i0, i1, 0, 0, 0, 0]))
+            }
+            PrimitiveCall::LookTowards { mode } => {
+                let [m0, m1] = mode.to_le_bytes();
+                Ok((22, [m0, m1, 0, 0, 0, 0, 0, 0]))
+            }
+            PrimitiveCall::OldRelationship {
+                write,
+                column,
+                param,
+                direction,
+                flags,
+            } => {
+                self.note_operand(Operand::new(9, i16::from(*param)), span)?;
+                if matches!(direction, 2 | 3) {
+                    self.note_operand(Operand::new(9, 0), span)?;
+                }
+                Ok((
+                    24,
+                    [
+                        u8::from(*write),
+                        *column,
+                        *param as u8,
+                        *direction,
+                        *flags,
+                        0,
+                        0,
+                        0,
+                    ],
+                ))
+            }
+            PrimitiveCall::GosubFoundAction => Ok((30, [0; 8])),
+            PrimitiveCall::FindWorstMotives { target, mode } => {
+                let [t0, t1] = target.to_le_bytes();
+                let [m0, m1] = mode.to_le_bytes();
+                Ok((33, [0, 0, 0, 0, t0, t1, m0, m1]))
+            }
+            PrimitiveCall::UiEffect {
+                mode,
+                target,
+                flags,
+            } => {
+                if *mode <= 2 {
+                    let op = target.as_ref().ok_or_else(|| {
+                        Error::at(
+                            span,
+                            format!("ui_effect mode {mode} requires a 'target' operand"),
+                        )
+                    })?;
+                    let resolved = self.resolve_operand(op, span)?;
+                    let [i0, i1] = resolved.index.to_le_bytes();
+                    Ok((34, [*mode, resolved.scope, i0, i1, *flags, 0, 0, 0]))
+                } else if let Some(op) = target {
+                    let resolved = self.resolve_operand(op, span)?;
+                    let [i0, i1] = resolved.index.to_le_bytes();
+                    Ok((34, [*mode, resolved.scope, i0, i1, *flags, 0, 0, 0]))
+                } else {
+                    Ok((34, [*mode, 0, 0, 0, *flags, 0, 0, 0]))
+                }
+            }
+            PrimitiveCall::SpecialEffect {
+                duration,
+                kind,
+                size,
+                flags,
+                str_index,
+            } => {
+                if flags & 0x20 != 0 {
+                    self.note_operand(Operand::new(25, *duration), span)?;
+                }
+                let [d0, d1] = duration.to_le_bytes();
+                Ok((35, [d0, d1, *kind, *size, *flags, *str_index, 0, 0]))
+            }
+            PrimitiveCall::Reach {
+                mode,
+                moves,
+                slot_param,
+            } => {
+                if *mode == 1 {
+                    self.note_operand(Operand::new(9, *slot_param), span)?;
+                }
+                let [m0, m1] = mode.to_le_bytes();
+                let [p0, p1] = slot_param.to_le_bytes();
+                Ok((47, [m0, m1, u8::from(*moves), 0, p0, p1, 0, 0]))
             }
             PrimitiveCall::PushInteraction {
                 menu,
@@ -1203,21 +1408,28 @@ impl<'a> TreeBuilder<'a> {
             .iter()
             .filter(|s| !matches!(s, Stmt::Let { init: None, .. }))
             .collect();
+        let mut pending_sids: Vec<u32> = Vec::new();
         for (idx, &stmt) in active.iter().enumerate() {
             let is_last = idx + 1 == active.len();
+            let before = self.nodes.len();
             let fallthrough = if is_last {
                 next_target.clone()
             } else {
-                PendingTarget::Resolved(TARGET_TRUE)
+                let sid = self.alloc_sentinel();
+                PendingTarget::Sentinel(sid)
             };
-            let before = self.nodes.len();
+            let fallthrough_sid = match fallthrough {
+                PendingTarget::Sentinel(sid) if !is_last => Some(sid),
+                _ => None,
+            };
             match stmt {
                 Stmt::Label { span, name } => {
                     if self.labels.insert(name.clone(), self.nodes.len()).is_some() {
                         return Err(Error::at(*span, format!("duplicate label '{name}'")));
                     }
+                    continue;
                 }
-                Stmt::Let { init: None, .. } => {}
+                Stmt::Let { init: None, .. } => continue,
                 Stmt::RawOp {
                     span,
                     opcode,
@@ -1285,54 +1497,58 @@ impl<'a> TreeBuilder<'a> {
                     self.emit(*span, opcode, operands, on_true, on_false)?;
                 }
                 _ => {
-                    let sentinel_id = self.alloc_sentinel();
-                    let entry = self.lower_structured_stmt(
-                        stmt,
-                        if is_last {
-                            next_target.clone()
-                        } else {
-                            PendingTarget::Sentinel(sentinel_id)
-                        },
-                    )?;
+                    let mut entry = self.lower_structured_stmt(stmt, fallthrough)?;
                     if self.nodes.len() == before
                         && let PendingTarget::Resolved(ret) = entry
+                        && self.labels.values().any(|&pos| pos == before)
                     {
                         self.emit_return_node(Span::default(), PendingTarget::Resolved(ret))?;
+                        entry = PendingTarget::Node {
+                            index: before,
+                            span: Span::default(),
+                        };
                     }
-                    if !is_last {
-                        let next_idx = self.nodes.len();
-                        for node in &mut self.nodes[before..] {
-                            patch_sentinel(&mut node.on_true, sentinel_id, next_idx);
-                            patch_sentinel(&mut node.on_false, sentinel_id, next_idx);
+                    for psid in pending_sids.drain(..) {
+                        for node in &mut self.nodes[start_node..] {
+                            patch_sentinel_target(&mut node.on_true, psid, &entry);
+                            patch_sentinel_target(&mut node.on_false, psid, &entry);
                         }
+                    }
+                    if let Some(sid) = fallthrough_sid
+                        && slice_uses_sentinel(&self.nodes[start_node..], &entry, sid)
+                    {
+                        pending_sids.push(sid);
                     }
                     continue;
                 }
             }
-            if !is_last
-                && self.nodes.len() > before
-                && matches!(
-                    stmt,
-                    Stmt::InlineRawOp { .. }
-                        | Stmt::Primitive { branches: None, .. }
-                        | Stmt::Call { branches: None, .. }
-                )
-            {
-                let next_idx = self.nodes.len();
-                let last_node = self.nodes.last_mut().unwrap();
-                last_node.on_true = PendingTarget::Node {
-                    index: next_idx,
-                    span: last_node.span,
+            if self.nodes.len() > before {
+                let target = PendingTarget::Node {
+                    index: before,
+                    span: self.nodes[before].span,
                 };
-                if matches!(
-                    stmt,
-                    Stmt::InlineRawOp { .. } | Stmt::Primitive { branches: None, .. }
-                ) {
-                    last_node.on_false = PendingTarget::Node {
-                        index: next_idx,
-                        span: last_node.span,
-                    };
+                for psid in pending_sids.drain(..) {
+                    for node in &mut self.nodes[start_node..] {
+                        patch_sentinel_target(&mut node.on_true, psid, &target);
+                        patch_sentinel_target(&mut node.on_false, psid, &target);
+                    }
                 }
+                if let Some(sid) = fallthrough_sid
+                    && matches!(
+                        stmt,
+                        Stmt::InlineRawOp { .. }
+                            | Stmt::Primitive { branches: None, .. }
+                            | Stmt::Call { branches: None, .. }
+                    )
+                {
+                    pending_sids.push(sid);
+                }
+            }
+        }
+        for psid in pending_sids {
+            for node in &mut self.nodes[start_node..] {
+                patch_sentinel_target(&mut node.on_true, psid, &next_target);
+                patch_sentinel_target(&mut node.on_false, psid, &next_target);
             }
         }
         if self.nodes.len() == start_node {
@@ -1358,21 +1574,41 @@ impl<'a> TreeBuilder<'a> {
         if active.is_empty() {
             return Ok(next_target);
         }
+        let slice_start = self.nodes.len();
         let mut i = 0usize;
-        let mut entry = None;
+        let mut entry: Option<PendingTarget> = None;
+        let mut prev_sid: Option<u32> = None;
         while i < active.len() {
             let is_last = i + 1 == active.len();
             let stmt = active[i];
             if let Some(jump) = self.resolve_jump_stmt(stmt)? {
+                if let Some(psid) = prev_sid.take() {
+                    for node in &mut self.nodes[slice_start..] {
+                        patch_sentinel_target(&mut node.on_true, psid, &jump);
+                        patch_sentinel_target(&mut node.on_false, psid, &jump);
+                    }
+                    if let Some(ent) = &mut entry {
+                        patch_sentinel_target(ent, psid, &jump);
+                    }
+                }
                 if entry.is_none() {
                     return Ok(jump);
                 }
                 break;
             }
-            let (after, sentinel_id) = if is_last {
+            let (after, next_sid) = if is_last {
                 (next_target.clone(), None)
             } else if let Some(jump) = self.resolve_jump_stmt(active[i + 1])? {
                 let stmt_entry = self.lower_structured_stmt(stmt, jump)?;
+                if let Some(psid) = prev_sid.take() {
+                    for node in &mut self.nodes[slice_start..] {
+                        patch_sentinel_target(&mut node.on_true, psid, &stmt_entry);
+                        patch_sentinel_target(&mut node.on_false, psid, &stmt_entry);
+                    }
+                    if let Some(ent) = &mut entry {
+                        patch_sentinel_target(ent, psid, &stmt_entry);
+                    }
+                }
                 if entry.is_none() {
                     entry = Some(stmt_entry);
                 }
@@ -1381,17 +1617,34 @@ impl<'a> TreeBuilder<'a> {
                 let sid = self.alloc_sentinel();
                 (PendingTarget::Sentinel(sid), Some(sid))
             };
-            let before = self.nodes.len();
             let stmt_entry = self.lower_structured_stmt(stmt, after)?;
-            if entry.is_none() {
-                entry = Some(stmt_entry);
-            }
-            if let Some(sid) = sentinel_id {
-                let next_idx = self.nodes.len();
-                for node in &mut self.nodes[before..] {
-                    patch_sentinel(&mut node.on_true, sid, next_idx);
-                    patch_sentinel(&mut node.on_false, sid, next_idx);
+            if let Some(psid) = prev_sid.take() {
+                for node in &mut self.nodes[slice_start..] {
+                    patch_sentinel_target(&mut node.on_true, psid, &stmt_entry);
+                    patch_sentinel_target(&mut node.on_false, psid, &stmt_entry);
                 }
+                if let Some(ent) = &mut entry {
+                    patch_sentinel_target(ent, psid, &stmt_entry);
+                }
+            }
+            if entry.is_none() {
+                entry = Some(stmt_entry.clone());
+            }
+            if let Some(nsid) = next_sid {
+                // If this statement never falls through to `nsid` (for example,
+                // `while true { return false; }`), still lower the remaining dead
+                // statements into throwaway nodes so semantic errors (unknown trees,
+                // bad operands, invalid break/continue) are still diagnosed, then
+                // truncate those unreachable nodes so dead code never occupies node 0.
+                if !slice_uses_sentinel(&self.nodes[slice_start..], &stmt_entry, nsid) {
+                    let saved_nodes = self.nodes.len();
+                    for dead_stmt in &active[i + 1..] {
+                        let _ = self.lower_structured_stmt(dead_stmt, next_target.clone())?;
+                    }
+                    self.nodes.truncate(saved_nodes);
+                    break;
+                }
+                prev_sid = Some(nsid);
             }
             i += 1;
         }
@@ -1581,6 +1834,33 @@ impl<'a> TreeBuilder<'a> {
                     span: *span,
                 })
             }
+            Stmt::Loop { span, body } => {
+                let header_sid = self.alloc_sentinel();
+                let loop_back = PendingTarget::Sentinel(header_sid);
+                let before = self.nodes.len();
+                self.loop_stack
+                    .push((loop_back.clone(), next_target.clone()));
+                let body_result = self.lower_structured_slice(body, loop_back);
+                self.loop_stack.pop();
+                let body_target = body_result?;
+                let resolved_entry = match body_target {
+                    PendingTarget::Sentinel(id) if id == header_sid => {
+                        let idx = self.nodes.len();
+                        let self_target = PendingTarget::Node {
+                            index: idx,
+                            span: *span,
+                        };
+                        self.emit_return_node(*span, self_target.clone())?;
+                        self_target
+                    }
+                    other => other,
+                };
+                for node in &mut self.nodes[before..] {
+                    patch_sentinel_target(&mut node.on_true, header_sid, &resolved_entry);
+                    patch_sentinel_target(&mut node.on_false, header_sid, &resolved_entry);
+                }
+                Ok(resolved_entry)
+            }
             Stmt::InlineRawOp {
                 span,
                 opcode,
@@ -1678,15 +1958,24 @@ fn cond_is_negated(cond: &Condition) -> bool {
     }
 }
 
-fn patch_sentinel(target: &mut PendingTarget, sentinel_id: u32, actual_next: usize) {
+fn patch_sentinel_target(
+    target: &mut PendingTarget,
+    sentinel_id: u32,
+    replacement: &PendingTarget,
+) {
     if let PendingTarget::Sentinel(id) = target
         && *id == sentinel_id
     {
-        *target = PendingTarget::Node {
-            index: actual_next,
-            span: Span::default(),
-        };
+        *target = replacement.clone();
     }
+}
+
+fn slice_uses_sentinel(nodes: &[PendingNode], entry: &PendingTarget, sentinel_id: u32) -> bool {
+    matches!(entry, PendingTarget::Sentinel(id) if *id == sentinel_id)
+        || nodes.iter().any(|n| {
+            matches!(n.on_true, PendingTarget::Sentinel(id) if id == sentinel_id)
+                || matches!(n.on_false, PendingTarget::Sentinel(id) if id == sentinel_id)
+        })
 }
 
 fn encode_expr_operands(lhs: Operand, operator: u8, rhs: Operand) -> [u8; 8] {

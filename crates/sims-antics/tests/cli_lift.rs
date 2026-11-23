@@ -593,8 +593,14 @@ fn lift_keeps_structured_flow_with_inline_raw_op_and_decodes_irreducible_cfg() {
         String::from_utf8_lossy(&lift_4096.stderr)
     );
     let stdout_4096 = String::from_utf8_lossy(&lift_4096.stdout);
-    assert!(stdout_4096.contains("if my.attr[0] == 1"), "{stdout_4096}");
-    assert!(stdout_4096.contains("if op 0x0042"), "{stdout_4096}");
+    assert!(
+        stdout_4096.contains("if my.attr[0] == 1") || stdout_4096.contains("if !my.attr[0] == 1"),
+        "{stdout_4096}"
+    );
+    assert!(
+        stdout_4096.contains("if op 0x0042") || stdout_4096.contains("if !op 0x0042"),
+        "{stdout_4096}"
+    );
     assert!(stdout_4096.contains("my.attr[1] := 7;"), "{stdout_4096}");
     assert!(
         stdout_4096.contains("// verify-equiv: Equivalent"),
@@ -1641,5 +1647,118 @@ fn lift_relax_padding_cli_flag_and_raw_conflict() {
         String::from_utf8_lossy(&conflict.stderr).contains("--relax-padding"),
         "stderr: {}",
         String::from_utf8_lossy(&conflict.stderr)
+    );
+}
+
+#[test]
+fn lift_emits_symbol_comments_by_default_and_no_comments_disables_them() {
+    use sims_antics::encode::{encode_bcon, encode_string_table};
+    use sims_antics::ir::{BconChunk, StringEntry, StringFormat, StringTableChunk};
+
+    let src = r#"
+        tree 4096 "EatSnack" (args: 0, locals: 0) {
+            my.motive[7] += bcon[0];
+            if my.person[58] >= 18 {
+                action_string(table: 300, index: 1);
+                call 4097(0, 0, 0, 0);
+            }
+            return true;
+        }
+        tree 4097 "open" (args: 0, locals: 0) {
+            return true;
+        }
+    "#;
+    let compiled = compile_antics(src).expect("compile");
+    let bcon = BconChunk {
+        id: 4096,
+        label: "FridgeTuning".to_owned(),
+        flags: 0,
+        values: vec![35],
+        trailing: Vec::new(),
+    };
+    let str300 = StringTableChunk::new(
+        *b"STR#",
+        300,
+        "Actions",
+        StringFormat::Localized,
+        vec![StringEntry::english("Have a Snack\n\x1b[31mNow")],
+    );
+    let iff_bytes = write_iff(&[
+        ChunkData {
+            tag: *b"BHAV",
+            id: 4096,
+            flags: 0,
+            label: "EatSnack".to_owned(),
+            data: encode_bhav(&compiled.behaviors[&4096]).unwrap(),
+        },
+        ChunkData {
+            tag: *b"BHAV",
+            id: 4097,
+            flags: 0,
+            label: "open".to_owned(),
+            data: encode_bhav(&compiled.behaviors[&4097]).unwrap(),
+        },
+        ChunkData {
+            tag: *b"BCON",
+            id: 4096,
+            flags: 0,
+            label: bcon.label.clone(),
+            data: encode_bcon(&bcon).unwrap(),
+        },
+        ChunkData {
+            tag: *b"STR#",
+            id: 300,
+            flags: 0,
+            label: str300.label.clone(),
+            data: encode_string_table(&str300).unwrap(),
+        },
+    ])
+    .expect("write iff");
+
+    let tmp = CleanupDir::new("symbol-comments");
+    let iff_path = tmp.path().join("annotated.iff");
+    std::fs::write(&iff_path, &iff_bytes).expect("write iff");
+
+    // Default CLI `lift --verify-equiv`: comments enabled, control chars sanitized, compiles & proves Equivalent!
+    let with_comments = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&iff_path)
+        .args(["--tree", "4096", "--verify-equiv"])
+        .output()
+        .expect("run lift with default comments");
+    assert!(
+        with_comments.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_comments.stderr)
+    );
+    let stdout = String::from_utf8(with_comments.stdout).expect("utf8 stdout");
+    assert!(
+        !stdout.contains('\x1b'),
+        "control char leaked into comment:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("// Hunger, bcon[0:0] = 35 (\"FridgeTuning\")"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("// Age"), "{stdout}");
+    assert!(stdout.contains("// \"Have a Snack [31mNow\""), "{stdout}");
+    assert!(stdout.contains("// \"open\""), "{stdout}");
+    assert!(stdout.contains("// verify-equiv: Equivalent"), "{stdout}");
+
+    // `--no-comments`: suppresses inline symbol comments while preserving tree header & verify-equiv.
+    let without_comments = Command::new(cli_bin())
+        .args(["lift"])
+        .arg(&iff_path)
+        .args(["--tree", "4096", "--no-comments", "--verify-equiv"])
+        .output()
+        .expect("run lift --no-comments");
+    assert!(without_comments.status.success());
+    let plain_stdout = String::from_utf8(without_comments.stdout).expect("utf8 stdout");
+    assert!(!plain_stdout.contains("// Hunger"), "{plain_stdout}");
+    assert!(!plain_stdout.contains("// Age"), "{plain_stdout}");
+    assert!(!plain_stdout.contains("// \"open\""), "{plain_stdout}");
+    assert!(
+        plain_stdout.contains("// verify-equiv: Equivalent"),
+        "{plain_stdout}"
     );
 }

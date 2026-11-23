@@ -24,13 +24,419 @@ pub struct LiftOptions {
     /// When `false` (`--relax-padding`), verified-ignored padding bytes are
     /// stripped during lifting while preserving bounded trace equivalence.
     pub strict_padding: bool,
+    /// When `true`, emit trailing `// ...` readability comments annotating
+    /// canonical VM field names (`my.motive[N]`, `my.person[N]`, `my.data[N]`),
+    /// sibling private BHAV call labels, local `BCON` values/labels, and local
+    /// `STR#` previews (when [`LiftSymbols`] is provided).
+    ///
+    /// Defaults to `false` so canonical programmatic callers stay noise-free;
+    /// `sims-antics lift` enables it by default unless `--no-comments` is passed.
+    pub annotate_comments: bool,
 }
 
 impl Default for LiftOptions {
     fn default() -> Self {
         Self {
             strict_padding: true,
+            annotate_comments: false,
         }
+    }
+}
+
+/// Optional in-memory `.iff` symbol tables used when `LiftOptions::annotate_comments` is enabled.
+///
+/// Strictly in-memory: never written to disk by library functions.
+#[derive(Debug, Clone, Default)]
+pub struct LiftSymbols {
+    /// Private `BHAV` chunk labels (`4096..=8191`) from the same `.iff`.
+    pub bhav_labels: BTreeMap<u16, String>,
+    /// Local `BCON` tables (`4096..=4159`): `chunk_id -> (label, values)`.
+    pub bcons: BTreeMap<u16, (String, Vec<i16>)>,
+    /// Local `STR#` tables: `chunk_id -> entry texts` (0-indexed; SimAntics uses 1-based indices).
+    pub strings: BTreeMap<u16, Vec<String>>,
+}
+
+fn collect_canonical_chunks<'a>(
+    iff: &'a sims_formats::iff::Iff,
+    tag: &'a [u8; 4],
+) -> BTreeMap<u16, &'a sims_formats::iff::Chunk> {
+    use sims_formats::iff::DELETED;
+
+    let mut by_id: BTreeMap<u16, &'a sims_formats::iff::Chunk> = BTreeMap::new();
+    for chunk in iff.all(tag).filter(|c| c.flags & DELETED == 0) {
+        by_id
+            .entry(chunk.id)
+            .and_modify(|existing| {
+                if (existing.flags >> 8) != 0 && (chunk.flags >> 8) == 0 {
+                    *existing = chunk;
+                }
+            })
+            .or_insert(chunk);
+    }
+    by_id
+}
+
+/// Extracts US English strings in the exact order the original Sims 1 loader
+/// (`sims-vm/src/program.rs::loaded_order`) indexes them: each run of one language
+/// restarts its insertion slot at 0, so a later English run is inserted in front of
+/// earlier runs. Non-localized formats decode every entry with `language == 1` in
+/// file order, so this helper handles all `STR#` formats uniformly and returns an
+/// empty list for localized tables with no English entries (matching VM behavior).
+fn loaded_str_order(entries: &[sims_formats::strings::TextEntry]) -> Vec<String> {
+    let mut loaded: Vec<String> = Vec::new();
+    let mut run = None;
+    let mut place = 0usize;
+    for entry in entries {
+        if run != Some(entry.language) {
+            run = Some(entry.language);
+            place = 0;
+        }
+        if entry.language == 1 {
+            loaded.insert(place.min(loaded.len()), entry.text.clone());
+            place += 1;
+        }
+    }
+    loaded
+}
+
+/// Extracts strictly in-memory [`LiftSymbols`] (private `BHAV` labels, local `BCON` tables,
+/// and local `STR#` tables) from a parsed [`sims_formats::iff::Iff`], preferring canonical
+/// high-flag-byte `0` chunks and skipping deleted chunks.
+#[must_use]
+pub fn extract_lift_symbols_from_iff(iff: &sims_formats::iff::Iff) -> LiftSymbols {
+    let mut symbols = LiftSymbols::default();
+
+    for (id, chunk) in collect_canonical_chunks(iff, b"BHAV") {
+        if (4096..=8191).contains(&id) && !chunk.label.is_empty() {
+            symbols.bhav_labels.insert(id, chunk.label.clone());
+        }
+    }
+    for (id, chunk) in collect_canonical_chunks(iff, b"BCON") {
+        if (4096..=4159).contains(&id)
+            && let Ok(values) = sims_formats::execution::constants(iff.data(chunk))
+        {
+            symbols.bcons.insert(id, (chunk.label.clone(), values));
+        }
+    }
+    for (id, chunk) in collect_canonical_chunks(iff, b"STR#") {
+        let data = iff.data(chunk);
+        let parsed = sims_formats::strings::StringTable::parse(data).or_else(|_| {
+            sims_formats::strings::StringTable::parse_chunk(data, iff.resource_flags(chunk))
+        });
+        if let Ok(table) = parsed {
+            let texts = loaded_str_order(&table.entries);
+            if !texts.is_empty() {
+                symbols.strings.insert(id, texts);
+            }
+        }
+    }
+
+    symbols
+}
+
+const MAX_COMMENT_PREVIEW_CHARS: usize = 48;
+
+fn sanitize_comment_preview(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (count, ch) in s.chars().enumerate() {
+        if count >= max_chars {
+            truncated = true;
+            break;
+        }
+        match ch {
+            '\n' | '\r' | '\t' => out.push(' '),
+            '"' => out.push_str("\\\""),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    if truncated {
+        out.push_str("...");
+    }
+    out
+}
+
+fn canonical_motive_name(index: i16) -> Option<&'static str> {
+    match index {
+        3 => Some("Mood"),
+        5 => Some("Energy"),
+        6 => Some("Comfort"),
+        7 => Some("Hunger"),
+        8 => Some("Hygiene"),
+        9 => Some("Bladder"),
+        11 => Some("Alertness"),
+        13 => Some("Room"),
+        14 => Some("Social"),
+        15 => Some("Fun"),
+        _ => None,
+    }
+}
+
+fn canonical_person_field_name(index: i16) -> Option<&'static str> {
+    match index {
+        0 => Some("Posture"),
+        2 => Some("Nice"),
+        3 => Some("Active"),
+        5 => Some("Playful"),
+        6 => Some("Outgoing"),
+        7 => Some("Neat"),
+        8 => Some("BodySuit"),
+        10 => Some("Cooking"),
+        11 => Some("Charisma"),
+        12 => Some("Mechanical"),
+        15 => Some("Creativity"),
+        17 => Some("Body"),
+        18 => Some("Logic"),
+        21 => Some("SuitVariant"),
+        22 => Some("LeftHand"),
+        23 => Some("RightHand"),
+        30 => Some("Censor"),
+        31 => Some("NeighborId"),
+        32 => Some("IsVisitor"),
+        33 => Some("Priority"),
+        34 => Some("PetsOutside"),
+        36 => Some("Autonomy"),
+        41 => Some("HeadTarget"),
+        56 => Some("JobType"),
+        57 => Some("JobLevel"),
+        58 => Some("Age"),
+        60 => Some("SkinColor"),
+        61 => Some("FamilyId"),
+        65 => Some("PersonKind"),
+        67 => Some("HomeLot"),
+        70 => Some("Zodiac"),
+        77 => Some("DateFlag"),
+        81 => Some("FameLevel"),
+        _ => None,
+    }
+}
+
+fn canonical_object_data_name(index: i16) -> Option<&'static str> {
+    match index {
+        0 => Some("Graphic"),
+        1 => Some("Direction"),
+        2 => Some("ContainerId"),
+        3 => Some("SlotNumber"),
+        8 => Some("Flags"),
+        11 => Some("ObjectId"),
+        20 => Some("ChosenAction"),
+        25 => Some("Lockout"),
+        29 => Some("Room"),
+        31 => Some("PrepScore"),
+        32 => Some("CookScore"),
+        40 => Some("Flags2"),
+        59 => Some("Category"),
+        _ => None,
+    }
+}
+
+fn push_unique_note(notes: &mut Vec<String>, note: String) {
+    if !note.is_empty() && !notes.contains(&note) {
+        notes.push(note);
+    }
+}
+
+fn annotate_operand_note(
+    scope: u8,
+    index: i16,
+    symbols: Option<&LiftSymbols>,
+    notes: &mut Vec<String>,
+) {
+    match scope {
+        14 | 15 => {
+            if let Some(name) = canonical_motive_name(index) {
+                push_unique_note(notes, name.to_owned());
+            }
+        }
+        18 | 19 => {
+            if let Some(name) = canonical_person_field_name(index) {
+                push_unique_note(notes, name.to_owned());
+            }
+        }
+        3 | 4 => {
+            if let Some(name) = canonical_object_data_name(index) {
+                push_unique_note(notes, name.to_owned());
+            }
+        }
+        26 => {
+            let Some(syms) = symbols else {
+                return;
+            };
+            let raw = index as u16;
+            let table = raw >> 7;
+            let entry = usize::from(raw & 127);
+            if table < 64
+                && let Some((label, values)) = syms.bcons.get(&(4096 + table))
+                && let Some(&val) = values.get(entry)
+            {
+                let note = if label.is_empty() {
+                    format!("bcon[{table}:{entry}] = {val}")
+                } else {
+                    format!(
+                        "bcon[{table}:{entry}] = {val} (\"{}\")",
+                        sanitize_comment_preview(label, 32)
+                    )
+                };
+                push_unique_note(notes, note);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn lookup_str_preview(symbols: &LiftSymbols, table: u16, one_based: usize) -> Option<String> {
+    let idx = one_based.checked_sub(1)?;
+    let text = symbols.strings.get(&table)?.get(idx)?;
+    if text.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\"{}\"",
+        sanitize_comment_preview(text, MAX_COMMENT_PREVIEW_CHARS)
+    ))
+}
+
+/// Builds an optional single-line trailing comment (without leading `// `) for `ins`.
+pub(crate) fn instruction_comment(
+    ins: &Instruction,
+    symbols: Option<&LiftSymbols>,
+) -> Option<String> {
+    let ops = &ins.operands;
+    let mut notes = Vec::new();
+    match ins.opcode {
+        2 => {
+            annotate_operand_note(ops[6], word_i16(ops, 0), symbols, &mut notes);
+            annotate_operand_note(ops[7], word_i16(ops, 2), symbols, &mut notes);
+        }
+        8 => {
+            let dst_scope = word_u16(ops, 2);
+            if dst_scope <= 255 {
+                annotate_operand_note(dst_scope as u8, word_i16(ops, 0), symbols, &mut notes);
+            }
+            let rng_scope = word_u16(ops, 6);
+            if rng_scope <= 255 {
+                annotate_operand_note(rng_scope as u8, word_i16(ops, 4), symbols, &mut notes);
+            }
+        }
+        11 => {
+            if ops[2] & 1 != 0 {
+                annotate_operand_note(ops[3], word_i16(ops, 4), symbols, &mut notes);
+            }
+        }
+        12 => {
+            let dst_scope = word_u16(ops, 2);
+            if dst_scope <= 255 {
+                annotate_operand_note(dst_scope as u8, word_i16(ops, 0), symbols, &mut notes);
+            }
+            if ops[4] & 1 != 0 {
+                annotate_operand_note(ops[5], word_i16(ops, 6), symbols, &mut notes);
+            }
+        }
+        14 => {
+            if ops[6] & 8 != 0 {
+                let scope = word_u16(ops, 4);
+                if scope <= 255 {
+                    annotate_operand_note(scope as u8, word_i16(ops, 2), symbols, &mut notes);
+                }
+            }
+        }
+        15 => {
+            let scope = word_i16(ops, 2);
+            if (0..=255).contains(&scope) {
+                annotate_operand_note(scope as u8, word_i16(ops, 0), symbols, &mut notes);
+            }
+        }
+        21 => {
+            if let Some(syms) = symbols
+                && let Some(preview) =
+                    lookup_str_preview(syms, word_u16(ops, 0), usize::from(word_u16(ops, 2)))
+            {
+                push_unique_note(&mut notes, preview);
+            }
+        }
+        25 => {
+            let scope = match ops[0] {
+                0 => 7,
+                1 => 9,
+                2 => 25,
+                _ => ops[1],
+            };
+            annotate_operand_note(scope, word_i16(ops, 2), symbols, &mut notes);
+        }
+        26 => {
+            annotate_operand_note(ops[4], word_i16(ops, 6), symbols, &mut notes);
+        }
+        28 => {
+            if ops[2] & 1 == 0
+                && let Some(syms) = symbols
+                && let Some(preview) =
+                    lookup_str_preview(syms, word_u16(ops, 0), usize::from(ops[4]))
+            {
+                push_unique_note(&mut notes, preview);
+            }
+        }
+        29 => {
+            if ops[3] & 1 == 0 {
+                if let Some(name) = canonical_motive_name(i16::from(ops[2])) {
+                    push_unique_note(&mut notes, name.to_owned());
+                }
+                annotate_operand_note(ops[0], word_i16(ops, 4), symbols, &mut notes);
+                annotate_operand_note(ops[1], word_i16(ops, 6), symbols, &mut notes);
+            }
+        }
+        31 => {
+            if ops[4] & 0x80 != 0 {
+                annotate_operand_note(ops[5], i16::from(ops[7]), symbols, &mut notes);
+            }
+        }
+        32 => {
+            annotate_operand_note(ops[6], word_i16(ops, 4), symbols, &mut notes);
+        }
+        34 => {
+            if ops[0] <= 2 {
+                annotate_operand_note(ops[1], word_i16(ops, 2), symbols, &mut notes);
+            }
+        }
+        36 => {
+            if let Some(syms) = symbols {
+                if let Some(preview) = lookup_str_preview(syms, 301, usize::from(ops[2])) {
+                    push_unique_note(&mut notes, preview);
+                } else if let Some(preview) = lookup_str_preview(syms, 301, usize::from(ops[6])) {
+                    push_unique_note(&mut notes, preview);
+                }
+            }
+        }
+        37 => {
+            if ops[0] == 1 {
+                annotate_operand_note(ops[1], word_i16(ops, 2), symbols, &mut notes);
+            }
+        }
+        50 => {
+            if let Some(syms) = symbols
+                && let Some(preview) =
+                    lookup_str_preview(syms, word_u16(ops, 0), usize::from(ops[4]))
+            {
+                push_unique_note(&mut notes, preview);
+            }
+        }
+        id if (4096..=8191).contains(&id) => {
+            if let Some(syms) = symbols
+                && let Some(label) = syms.bhav_labels.get(&id)
+                && !label.is_empty()
+            {
+                push_unique_note(
+                    &mut notes,
+                    format!("\"{}\"", sanitize_comment_preview(label, 48)),
+                );
+            }
+        }
+        _ => {}
+    }
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join(", "))
     }
 }
 
@@ -113,13 +519,19 @@ fn format_operand(scope: u8, index: i16, max_args: usize, max_locals: usize) -> 
 #[derive(Debug, Clone)]
 enum LiftedIns {
     /// Unconditional linear statement (always takes `on_true` in `sims-vm`).
-    Stmt { text: String, next: u8 },
+    Stmt {
+        text: String,
+        comment: Option<String>,
+        next: u8,
+    },
     /// Branching high-level condition (used in `if` / `while`).
     Cond {
         /// Condition text (e.g. `my.attr[0] == 0`, `call 4098(0, 0, 0, 0)`, `play_sound(...)`).
         text: String,
         /// Optional statement form when `on_true == on_false` (or `call` with `on_false == 0xFF`).
         stmt_form: Option<String>,
+        /// Optional trailing readability comment (when `LiftOptions::annotate_comments` is enabled).
+        comment: Option<String>,
         /// True when `stmt_form` is a `call` (whose standalone `Stmt::Call` branches `on_false = 0xFF`).
         is_call: bool,
         on_true: u8,
@@ -251,6 +663,18 @@ fn try_decode_instruction(
                 _ => None,
             }
         }
+        3 => {
+            if strict && *ops != [0; 8] {
+                return None;
+            }
+            let expr = "find_best_interaction()".to_owned();
+            Some(DecodedIns::Branching {
+                stmt_form: Some("find_best_interaction();".to_owned()),
+                labeled_head: expr.clone(),
+                cond_text: expr,
+                is_call: false,
+            })
+        }
         4 => {
             if strict && *ops != [0; 8] {
                 return None;
@@ -322,6 +746,96 @@ fn try_decode_instruction(
                 is_call: false,
             })
         }
+        9 => {
+            if strict && ops[2..8] != [0; 6] {
+                return None;
+            }
+            let mode = if strict {
+                ops[0]
+            } else {
+                u8::from(ops[0] == 1)
+            };
+            let flags = if strict { ops[1] } else { ops[1] & 1 };
+            let expr = format!("burn(mode: {mode}, flags: {flags})");
+            Some(DecodedIns::Branching {
+                stmt_form: Some(format!("{expr};")),
+                labeled_head: expr.clone(),
+                cond_text: expr,
+                is_call: false,
+            })
+        }
+        10 => {
+            if strict && ops[1..8] != [0; 7] {
+                return None;
+            }
+            let expr = format!("tutorial({})", ops[0]);
+            Some(DecodedIns::Branching {
+                stmt_form: Some(format!("{expr};")),
+                labeled_head: expr.clone(),
+                cond_text: expr,
+                is_call: false,
+            })
+        }
+        11 => {
+            let temp = word_i16(ops, 0);
+            if !(0..=7).contains(&temp) {
+                return None;
+            }
+            if strict && ops[6..8] != [0; 2] {
+                return None;
+            }
+            let flags = if strict { ops[2] } else { ops[2] & 1 };
+            let head = if flags & 1 != 0 {
+                let from = format_operand(ops[3], word_i16(ops, 4), max_args, max_locals)?;
+                if flags == 1 {
+                    format!("get_distance_to(temp[{temp}], from: {from})")
+                } else {
+                    format!("get_distance_to(temp[{temp}], flags: {flags}, from: {from})")
+                }
+            } else {
+                if strict && ops[3..6] != [0; 3] {
+                    return None;
+                }
+                if flags == 0 {
+                    format!("get_distance_to(temp[{temp}])")
+                } else {
+                    format!("get_distance_to(temp[{temp}], flags: {flags})")
+                }
+            };
+            Some(DecodedIns::AlwaysTrue {
+                structured_stmt: format!("{head};"),
+                labeled_head: head,
+            })
+        }
+        12 => {
+            let dst_scope = word_u16(ops, 2);
+            if dst_scope > 255 {
+                return None;
+            }
+            let dst = format_operand(dst_scope as u8, word_i16(ops, 0), max_args, max_locals)?;
+            let flags = if strict { ops[4] } else { ops[4] & 1 };
+            let head = if flags & 1 != 0 {
+                let from = format_operand(ops[5], word_i16(ops, 6), max_args, max_locals)?;
+                if flags == 1 {
+                    format!("get_direction_to({dst}, from: {from})")
+                } else {
+                    format!("get_direction_to({dst}, flags: {flags}, from: {from})")
+                }
+            } else {
+                if strict && ops[5..8] != [0; 3] {
+                    return None;
+                }
+                if flags == 0 {
+                    format!("get_direction_to({dst})")
+                } else {
+                    format!("get_direction_to({dst}, flags: {flags})")
+                }
+            };
+            Some(DecodedIns::AlwaysTrue {
+                structured_stmt: format!("{head};"),
+                labeled_head: head,
+            })
+        }
         13 => {
             if strict && ops[5..8] != [0; 3] {
                 return None;
@@ -380,6 +894,21 @@ fn try_decode_instruction(
                 labeled_head: expr.clone(),
                 cond_text: expr,
                 is_call: false,
+            })
+        }
+        15 => {
+            if strict && ops[4..8] != [0; 4] {
+                return None;
+            }
+            let scope = word_i16(ops, 2);
+            if !(0..=255).contains(&scope) {
+                return None;
+            }
+            let cond = format_operand(scope as u8, word_i16(ops, 0), max_args, max_locals)?;
+            let head = format!("breakpoint({cond})");
+            Some(DecodedIns::AlwaysTrue {
+                structured_stmt: format!("{head};"),
+                labeled_head: head,
             })
         }
         16 => {
@@ -445,6 +974,30 @@ fn try_decode_instruction(
                 is_call: false,
             })
         }
+        19 => {
+            if strict && ops[4..8] != [0; 4] {
+                return None;
+            }
+            let skin = ops[0];
+            let age = ops[1];
+            let sex = ops[2];
+            let species = ops[3];
+            if usize::from(skin) >= max_locals
+                || usize::from(age) >= max_locals
+                || usize::from(sex) >= max_locals
+            {
+                return None;
+            }
+            let expr = format!(
+                "make_new_character(skin: {skin}, age: {age}, sex: {sex}, species: {species})"
+            );
+            Some(DecodedIns::Branching {
+                stmt_form: Some(format!("{expr};")),
+                labeled_head: expr.clone(),
+                cond_text: expr,
+                is_call: false,
+            })
+        }
         20 => {
             if strict && (ops[2] > 1 || ops[3..8] != [0; 5]) {
                 return None;
@@ -458,6 +1011,38 @@ fn try_decode_instruction(
                 cond_text: expr,
                 is_call: false,
             })
+        }
+        21 => {
+            if strict && ops[4..8] != [0; 4] {
+                return None;
+            }
+            let table = word_u16(ops, 0);
+            let index = word_u16(ops, 2);
+            let head = format!("show_string(table: {table}, index: {index})");
+            Some(DecodedIns::AlwaysTrue {
+                structured_stmt: format!("{head};"),
+                labeled_head: head,
+            })
+        }
+        22 => {
+            if strict && ops[2..8] != [0; 6] {
+                return None;
+            }
+            let mode = word_i16(ops, 0);
+            let expr = format!("look_towards({mode})");
+            if mode == 0 {
+                Some(DecodedIns::AlwaysTrue {
+                    structured_stmt: format!("{expr};"),
+                    labeled_head: expr,
+                })
+            } else {
+                Some(DecodedIns::Branching {
+                    stmt_form: Some(format!("{expr};")),
+                    labeled_head: expr.clone(),
+                    cond_text: expr,
+                    is_call: false,
+                })
+            }
         }
         23 => {
             if strict && (ops[2..4] != [0; 2] || ops[5..8] != [0; 3]) {
@@ -482,6 +1067,38 @@ fn try_decode_instruction(
                 structured_stmt: format!("{head};"),
                 labeled_head: head,
             })
+        }
+        24 => {
+            if strict && (ops[0] > 1 || ops[5..8] != [0; 3]) {
+                return None;
+            }
+            let write = ops[0] != 0;
+            let col = ops[1];
+            let param = ops[2] as i8;
+            let dir = ops[3];
+            let flags = if strict { ops[4] } else { ops[4] & 3 };
+            if param < 0 || (param as usize) >= max_args {
+                return None;
+            }
+            if matches!(dir, 2 | 3) && max_args == 0 {
+                return None;
+            }
+            let expr = format!(
+                "old_relationship(write: {write}, column: {col}, param: {param}, dir: {dir}, flags: {flags})"
+            );
+            if flags & 1 == 0 {
+                Some(DecodedIns::AlwaysTrue {
+                    structured_stmt: format!("{expr};"),
+                    labeled_head: expr,
+                })
+            } else {
+                Some(DecodedIns::Branching {
+                    stmt_form: Some(format!("{expr};")),
+                    labeled_head: expr.clone(),
+                    cond_text: expr,
+                    is_call: false,
+                })
+            }
         }
         25 => {
             let scope = match ops[0] {
@@ -622,6 +1239,18 @@ fn try_decode_instruction(
                 })
             }
         }
+        30 => {
+            if strict && *ops != [0; 8] {
+                return None;
+            }
+            let expr = "gosub_found_action()".to_owned();
+            Some(DecodedIns::Branching {
+                stmt_form: Some("gosub_found_action();".to_owned()),
+                labeled_head: expr.clone(),
+                cond_text: expr,
+                is_call: false,
+            })
+        }
         31 => {
             let guid = u32::from_le_bytes([ops[0], ops[1], ops[2], ops[3]]);
             let mode = ops[4];
@@ -671,6 +1300,58 @@ fn try_decode_instruction(
                 labeled_head: expr.clone(),
                 cond_text: expr,
                 is_call: false,
+            })
+        }
+        33 => {
+            if strict && ops[0..4] != [0; 4] {
+                return None;
+            }
+            let target = word_u16(ops, 4);
+            let mode = word_u16(ops, 6);
+            let head = format!("find_worst_motives(target: {target}, mode: {mode})");
+            Some(DecodedIns::AlwaysTrue {
+                structured_stmt: format!("{head};"),
+                labeled_head: head,
+            })
+        }
+        34 => {
+            if strict && ops[5..8] != [0; 3] {
+                return None;
+            }
+            let mode = ops[0];
+            let head = if mode <= 2 {
+                let flags = if strict { ops[4] } else { ops[4] & 1 };
+                let target = format_operand(ops[1], word_i16(ops, 2), max_args, max_locals)?;
+                format!("ui_effect(mode: {mode}, target: {target}, flags: {flags})")
+            } else {
+                if strict && ops[1..5] != [0; 4] {
+                    return None;
+                }
+                format!("ui_effect(mode: {mode})")
+            };
+            Some(DecodedIns::AlwaysTrue {
+                structured_stmt: format!("{head};"),
+                labeled_head: head,
+            })
+        }
+        35 => {
+            if strict && ops[6..8] != [0; 2] {
+                return None;
+            }
+            let duration = word_i16(ops, 0);
+            let kind = ops[2];
+            let size = ops[3];
+            let flags = ops[4];
+            let str_index = ops[5];
+            if flags & 0x20 != 0 && (duration < 0 || duration as usize >= max_locals) {
+                return None;
+            }
+            let head = format!(
+                "special_effect(duration: {duration}, kind: {kind}, size: {size}, flags: {flags}, str_index: {str_index})"
+            );
+            Some(DecodedIns::AlwaysTrue {
+                structured_stmt: format!("{head};"),
+                labeled_head: head,
             })
         }
         36 => {
@@ -884,6 +1565,35 @@ fn try_decode_instruction(
                 is_call: false,
             })
         }
+        47 => {
+            if strict && ops[6..8] != [0; 2] {
+                return None;
+            }
+            let mode = word_i16(ops, 0);
+            let moves_raw = word_i16(ops, 2);
+            if strict && moves_raw != 0 && moves_raw != 1 {
+                return None;
+            }
+            let moves = moves_raw != 0;
+            let expr = if mode == 1 {
+                let p = word_i16(ops, 4);
+                if p < 0 || p as usize >= max_args {
+                    return None;
+                }
+                format!("reach(mode: {mode}, moves: {moves}, param: {p})")
+            } else {
+                if strict && ops[4..6] != [0; 2] {
+                    return None;
+                }
+                format!("reach(mode: {mode}, moves: {moves})")
+            };
+            Some(DecodedIns::Branching {
+                stmt_form: Some(format!("{expr};")),
+                labeled_head: expr.clone(),
+                cond_text: expr,
+                is_call: false,
+            })
+        }
         48 => {
             let raw_target = word_u16(ops, 0);
             if strict && (raw_target > 1 || ops[2..8] != [0; 6]) {
@@ -973,13 +1683,20 @@ fn lift_instruction(
     max_args: usize,
     max_locals: usize,
     opts: LiftOptions,
+    symbols: Option<&LiftSymbols>,
 ) -> LiftedIns {
+    let comment = if opts.annotate_comments {
+        instruction_comment(ins, symbols)
+    } else {
+        None
+    };
     if let Some(decoded) = try_decode_instruction(ins, max_args, max_locals, opts) {
         return match decoded {
             DecodedIns::AlwaysTrue {
                 structured_stmt, ..
             } => LiftedIns::Stmt {
                 text: structured_stmt,
+                comment,
                 next: ins.on_true,
             },
             DecodedIns::Branching {
@@ -990,6 +1707,7 @@ fn lift_instruction(
             } => LiftedIns::Cond {
                 text: cond_text,
                 stmt_form,
+                comment,
                 is_call,
                 on_true: ins.on_true,
                 on_false: ins.on_false,
@@ -1003,12 +1721,14 @@ fn lift_instruction(
     if is_always_true_instruction(ins) {
         LiftedIns::Stmt {
             text: format!("{raw};"),
+            comment,
             next: ins.on_true,
         }
     } else {
         LiftedIns::Cond {
             stmt_form: Some(format!("{raw};")),
             text: raw,
+            comment,
             is_call: false,
             on_true: ins.on_true,
             on_false: ins.on_false,
@@ -1060,6 +1780,18 @@ pub fn lift_bhav_structured_with_arities(
     chunk: &BhavChunk,
     opts: LiftOptions,
     callee_arities: Option<&BTreeMap<u16, usize>>,
+) -> StructuredLiftOutcome {
+    lift_bhav_structured_with_context(chunk, opts, callee_arities, None)
+}
+
+/// Structured `.air` lifter parameterized by [`LiftOptions`], optional `callee_arities`,
+/// and optional in-memory [`LiftSymbols`] for trailing readability comments.
+#[must_use]
+pub fn lift_bhav_structured_with_context(
+    chunk: &BhavChunk,
+    opts: LiftOptions,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+    symbols: Option<&LiftSymbols>,
 ) -> StructuredLiftOutcome {
     let Some((max_args, max_locals)) = format_limits(chunk.format) else {
         return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
@@ -1156,7 +1888,7 @@ pub fn lift_bhav_structured_with_arities(
             usize::from(eff_args)
         };
         let local_bound = usize::from(eff_locals);
-        let li = lift_instruction(ins, arg_bound, local_bound, opts);
+        let li = lift_instruction(ins, arg_bound, local_bound, opts, symbols);
         let mut edges = Vec::new();
         match &li {
             LiftedIns::Stmt { next, .. } => {
@@ -1227,18 +1959,24 @@ pub fn lift_bhav_structured_with_arities(
         }
     }
 
+    // Compute per-loop DAG post-dominators so `if`/`else` diamonds inside infinite loops
+    // (such as object `Main` loops with no `return`) merge cleanly without node duplication.
+    let loop_ipdoms = compute_loop_ipdoms(n, &succs, &has_terminal_edge, &loop_bodies);
+
     // 4. Recursively emit structured `.antics` statements.
     let mut emitter = StructEmitter {
         lifted: &lifted,
+        succs: &succs,
         ipdom: &ipdom,
         loop_bodies: &loop_bodies,
+        loop_ipdoms: &loop_ipdoms,
         out: header,
         emitted_nodes: 0,
         max_emitted_nodes: 245, // Stay safely under MAX_BHAV_NODES (251)
     };
 
     if emitter
-        .emit_region(0, None, None, &mut BTreeSet::new(), 1)
+        .emit_region(0, None, None, &mut BTreeSet::new(), 1, false)
         .is_err()
     {
         return StructuredLiftOutcome::Unstructured;
@@ -1389,16 +2127,110 @@ fn compute_immediate_postdominators(
     ipdom
 }
 
+/// Computes immediate post-dominators within each natural loop's DAG (treating back-edges
+/// to `header`, edges exiting `body_set`, and terminal returns as edges to a virtual exit)
+/// so diamonds inside infinite loops merge cleanly without duplicating the loop tail.
+fn compute_loop_ipdoms(
+    n: usize,
+    succs: &[Vec<usize>],
+    has_terminal_edge: &[bool],
+    loop_bodies: &BTreeMap<usize, BTreeSet<usize>>,
+) -> BTreeMap<usize, BTreeMap<usize, usize>> {
+    let exit = n;
+    let total = n + 1;
+    let mut out = BTreeMap::new();
+    for (&header, body) in loop_bodies {
+        let mut rsuccs: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut rpreds: Vec<Vec<usize>> = vec![Vec::new(); total];
+        for &u in body {
+            let mut reaches_exit_directly = has_terminal_edge[u];
+            for &v in &succs[u] {
+                if v == header || !body.contains(&v) {
+                    reaches_exit_directly = true;
+                } else {
+                    rsuccs[u].push(v);
+                }
+            }
+            if reaches_exit_directly {
+                rsuccs[u].push(exit);
+            }
+            for &v in &rsuccs[u] {
+                rpreds[v].push(u);
+            }
+        }
+        let mut can_reach = vec![false; total];
+        let mut q = VecDeque::new();
+        can_reach[exit] = true;
+        q.push_back(exit);
+        while let Some(v) = q.pop_front() {
+            for &u in &rpreds[v] {
+                if !can_reach[u] {
+                    can_reach[u] = true;
+                    q.push_back(u);
+                }
+            }
+        }
+        let all: BTreeSet<usize> = body
+            .iter()
+            .copied()
+            .filter(|&u| can_reach[u])
+            .chain([exit])
+            .collect();
+        let mut pdom: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        pdom.insert(exit, BTreeSet::from([exit]));
+        for &u in body {
+            if can_reach[u] {
+                pdom.insert(u, all.clone());
+            }
+        }
+        let nodes: Vec<usize> = body.iter().copied().filter(|&u| can_reach[u]).collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &u in nodes.iter().rev() {
+                let mut iter = rsuccs[u].iter().copied().filter(|&v| can_reach[v]);
+                let Some(first) = iter.next() else {
+                    continue;
+                };
+                let mut inter = pdom[&first].clone();
+                for s in iter {
+                    inter.retain(|x| pdom[&s].contains(x));
+                }
+                inter.insert(u);
+                if pdom.get(&u) != Some(&inter) {
+                    pdom.insert(u, inter);
+                    changed = true;
+                }
+            }
+        }
+        let mut map = BTreeMap::new();
+        for &u in &nodes {
+            if let Some(best) = pdom[&u]
+                .iter()
+                .copied()
+                .filter(|&d| d != u && d != exit && d != header)
+                .max_by_key(|&d| pdom[&d].len())
+            {
+                map.insert(u, best);
+            }
+        }
+        out.insert(header, map);
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LoopCtx {
     header: u8,
-    exit: u8,
+    exit: Option<u8>,
 }
 
 struct StructEmitter<'a> {
     lifted: &'a [Option<LiftedIns>],
+    succs: &'a [Vec<usize>],
     ipdom: &'a [Option<usize>],
     loop_bodies: &'a BTreeMap<usize, BTreeSet<usize>>,
+    loop_ipdoms: &'a BTreeMap<usize, BTreeMap<usize, usize>>,
     out: String,
     emitted_nodes: usize,
     max_emitted_nodes: usize,
@@ -1409,6 +2241,14 @@ impl StructEmitter<'_> {
         for _ in 0..depth {
             self.out.push_str("    ");
         }
+    }
+
+    fn push_comment(&mut self, comment: Option<&str>) {
+        if let Some(c) = comment {
+            self.out.push_str(" // ");
+            self.out.push_str(c);
+        }
+        self.out.push('\n');
     }
 
     fn emit_terminal(&mut self, target: u8, depth: usize) -> std::result::Result<(), ()> {
@@ -1424,6 +2264,54 @@ impl StructEmitter<'_> {
         Ok(())
     }
 
+    fn immediate_terminator(target: u8, loop_ctx: Option<LoopCtx>) -> Option<&'static str> {
+        if let Some(ctx) = loop_ctx {
+            if target == ctx.header {
+                return Some("continue;");
+            }
+            if ctx.exit == Some(target) {
+                return Some("break;");
+            }
+        }
+        match target {
+            TARGET_TRUE => Some("return true;"),
+            TARGET_FALSE => Some("return false;"),
+            TARGET_ERROR => Some("return error;"),
+            _ => None,
+        }
+    }
+
+    /// Selects a canonical `break` exit target for a `while true` natural loop:
+    /// - If the loop has no non-terminal exits, returns `None` (all exits are `return` or infinite).
+    /// - If the loop has a unique non-terminal exit `E`, returns `Some(E)`.
+    /// - If multiple non-terminal exits exist, prefers the header's immediate post-dominator
+    ///   (when outside the loop body), otherwise the most-targeted exit from `body_set`.
+    fn pick_loop_exit(&self, header: usize, body_set: &BTreeSet<usize>) -> Option<u8> {
+        let mut exit_counts: BTreeMap<usize, usize> = BTreeMap::new();
+        for &u in body_set {
+            for &v in &self.succs[u] {
+                if !body_set.contains(&v) {
+                    *exit_counts.entry(v).or_insert(0) += 1;
+                }
+            }
+        }
+        if exit_counts.is_empty() {
+            return None;
+        }
+        if exit_counts.len() == 1 {
+            return exit_counts.keys().next().map(|&v| v as u8);
+        }
+        if let Some(ipd) = self.ipdom.get(header).and_then(|&m| m)
+            && !body_set.contains(&ipd)
+        {
+            return Some(ipd as u8);
+        }
+        exit_counts
+            .into_iter()
+            .max_by(|(v1, c1), (v2, c2)| c1.cmp(c2).then_with(|| v2.cmp(v1)))
+            .map(|(v, _)| v as u8)
+    }
+
     fn emit_region(
         &mut self,
         mut cur: u8,
@@ -1431,83 +2319,129 @@ impl StructEmitter<'_> {
         loop_ctx: Option<LoopCtx>,
         active: &mut BTreeSet<u8>,
         depth: usize,
+        mut entering_loop_header: bool,
     ) -> std::result::Result<(), ()> {
-        if depth > 32 {
+        // Keep well below parser's `MAX_NESTING_DEPTH = 64` (each `if`/`while` + block adds 2).
+        if depth > 28 {
             return Err(());
         }
+        let mut local_seen = BTreeSet::new();
         loop {
-            if Some(cur) == stop_at {
-                return Ok(());
-            }
-            if let Some(ctx) = loop_ctx {
-                if cur == ctx.header {
-                    self.indent(depth);
-                    self.out.push_str("continue;\n");
+            if !entering_loop_header {
+                if Some(cur) == stop_at {
                     return Ok(());
                 }
-                if cur == ctx.exit {
-                    self.indent(depth);
-                    self.out.push_str("break;\n");
-                    return Ok(());
+                if let Some(ctx) = loop_ctx {
+                    if cur == ctx.header {
+                        self.indent(depth);
+                        self.out.push_str("continue;\n");
+                        return Ok(());
+                    }
+                    if ctx.exit == Some(cur) {
+                        self.indent(depth);
+                        self.out.push_str("break;\n");
+                        return Ok(());
+                    }
+                }
+                if matches!(cur, TARGET_ERROR..=TARGET_FALSE) {
+                    return self.emit_terminal(cur, depth);
+                }
+                if active.contains(&cur) || !local_seen.insert(cur) {
+                    // Back-edge to an active non-loop-header node -> irreducible CFG.
+                    return Err(());
                 }
             }
-            if matches!(cur, TARGET_ERROR..=TARGET_FALSE) {
-                return self.emit_terminal(cur, depth);
-            }
+            let is_entering = entering_loop_header;
+            entering_loop_header = false;
 
             let idx = usize::from(cur);
-            if active.contains(&cur) {
-                // Back-edge to an active non-loop-header node -> irreducible CFG.
-                return Err(());
-            }
             let Some(li) = self.lifted.get(idx).and_then(Option::as_ref) else {
                 return Err(());
             };
 
-            // Check if `cur` is a natural `while` loop header.
-            if let Some(body_set) = self.loop_bodies.get(&idx)
-                && let LiftedIns::Cond {
+            // Check if `cur` is a natural loop header (when entering fresh, not re-entering its own body).
+            if !is_entering && let Some(body_set) = self.loop_bodies.get(&idx) {
+                // Case 1: Clean `while cond { ... }` header where exactly one branch enters the loop.
+                if let LiftedIns::Cond {
                     text,
+                    comment,
                     on_true,
                     on_false,
                     ..
                 } = li
-            {
-                let true_in = !matches!(*on_true, TARGET_ERROR..=TARGET_FALSE)
-                    && body_set.contains(&usize::from(*on_true));
-                let false_in = !matches!(*on_false, TARGET_ERROR..=TARGET_FALSE)
-                    && body_set.contains(&usize::from(*on_false));
+                {
+                    let true_in = !matches!(*on_true, TARGET_ERROR..=TARGET_FALSE)
+                        && body_set.contains(&usize::from(*on_true));
+                    let false_in = !matches!(*on_false, TARGET_ERROR..=TARGET_FALSE)
+                        && body_set.contains(&usize::from(*on_false));
 
-                if true_in ^ false_in {
-                    self.emitted_nodes += 1;
-                    if self.emitted_nodes > self.max_emitted_nodes {
-                        return Err(());
+                    if true_in ^ false_in {
+                        let (cond_str, body_entry, exit_target) = if true_in {
+                            (text.clone(), *on_true, *on_false)
+                        } else {
+                            (format!("!{text}"), *on_false, *on_true)
+                        };
+                        // When the header's own exit is a terminal `return` while the loop body
+                        // has a real non-terminal exit node `E`, prefer `while true` so `break;`
+                        // targets `E` (avoiding duplicating `E` across multiple exits!).
+                        let defer_to_loop = matches!(exit_target, TARGET_ERROR..=TARGET_FALSE)
+                            && self.pick_loop_exit(idx, body_set).is_some();
+                        if !defer_to_loop {
+                            self.emitted_nodes += 1;
+                            if self.emitted_nodes > self.max_emitted_nodes {
+                                return Err(());
+                            }
+                            self.indent(depth);
+                            let _ = write!(self.out, "while {cond_str} {{");
+                            self.push_comment(comment.as_deref());
+                            active.insert(cur);
+                            let res = self.emit_region(
+                                body_entry,
+                                Some(cur),
+                                Some(LoopCtx {
+                                    header: cur,
+                                    exit: Some(exit_target),
+                                }),
+                                active,
+                                depth + 1,
+                                false,
+                            );
+                            active.remove(&cur);
+                            res?;
+                            self.indent(depth);
+                            self.out.push_str("}\n");
+                            cur = exit_target;
+                            continue;
+                        }
                     }
-                    let (cond_str, body_entry, exit_target) = if true_in {
-                        (text.clone(), *on_true, *on_false)
-                    } else {
-                        (format!("!{text}"), *on_false, *on_true)
-                    };
-                    self.indent(depth);
-                    let _ = writeln!(self.out, "while {cond_str} {{");
-                    active.insert(cur);
-                    let res = self.emit_region(
-                        body_entry,
-                        Some(cur),
-                        Some(LoopCtx {
-                            header: cur,
-                            exit: exit_target,
-                        }),
-                        active,
-                        depth + 1,
-                    );
-                    active.remove(&cur);
-                    res?;
-                    self.indent(depth);
-                    self.out.push_str("}\n");
-                    cur = exit_target;
+                }
+
+                // Case 2: Unconditional / statement-headed / both-branches-in-loop natural loop:
+                // emit zero-overhead `while true { ... }` with `break;` / `continue;` support!
+                let loop_exit = self.pick_loop_exit(idx, body_set);
+                self.indent(depth);
+                self.out.push_str("while true {\n");
+                active.insert(cur);
+                let res = self.emit_region(
+                    cur,
+                    Some(cur),
+                    Some(LoopCtx {
+                        header: cur,
+                        exit: loop_exit,
+                    }),
+                    active,
+                    depth + 1,
+                    true,
+                );
+                active.remove(&cur);
+                res?;
+                self.indent(depth);
+                self.out.push_str("}\n");
+                if let Some(exit_node) = loop_exit {
+                    cur = exit_node;
                     continue;
                 }
+                return Ok(());
             }
 
             self.emitted_nodes += 1;
@@ -1516,35 +2450,20 @@ impl StructEmitter<'_> {
             }
 
             match li {
-                LiftedIns::Stmt { text, next } => {
+                LiftedIns::Stmt {
+                    text,
+                    comment,
+                    next,
+                } => {
                     self.indent(depth);
                     self.out.push_str(text);
-                    self.out.push('\n');
-                    active.insert(cur);
+                    self.push_comment(comment.as_deref());
                     cur = *next;
-                    // Remove after stepping? Wait: keep active on current straight-line path
-                    // to guard against unexpected self-loops! We remove on return.
-                    // Actually, popping at function exit is cleanest: track local_active!
-                    if active.contains(&cur)
-                        && Some(cur) != stop_at
-                        && loop_ctx.map(|c| c.header) != Some(cur)
-                        && loop_ctx.map(|c| c.exit) != Some(cur)
-                    {
-                        active.remove(&(idx as u8));
-                        return Err(());
-                    }
-                    // Continue sequentially; note we leave `cur` checked in loop.
-                    // Clean up `idx` when we finish this region via recursion or guard:
-                    // To avoid false cycle detection across sequential diamonds, only keep
-                    // `active` for enclosing ancestors!
-                    active.remove(&(idx as u8));
-                    if cur == idx as u8 {
-                        return Err(());
-                    }
                 }
                 LiftedIns::Cond {
                     text,
                     stmt_form,
+                    comment,
                     is_call,
                     on_true,
                     on_false,
@@ -1556,10 +2475,7 @@ impl StructEmitter<'_> {
                     {
                         self.indent(depth);
                         self.out.push_str(stmt);
-                        self.out.push('\n');
-                        if *on_true == cur {
-                            return Err(());
-                        }
+                        self.push_comment(comment.as_deref());
                         cur = *on_true;
                         continue;
                     }
@@ -1571,62 +2487,124 @@ impl StructEmitter<'_> {
                     {
                         self.indent(depth);
                         self.out.push_str(stmt);
-                        self.out.push('\n');
-                        if *on_true == cur {
-                            return Err(());
-                        }
+                        self.push_comment(comment.as_deref());
                         cur = *on_true;
                         continue;
                     }
 
-                    // Case C: General `if` / `else`, merging at immediate post-dominator if valid.
-                    let merge = self
-                        .ipdom
-                        .get(idx)
-                        .and_then(|&m| m)
+                    // Case C: General `if` / `else`, merging at loop-DAG ipdom or global ipdom.
+                    let loop_merge = loop_ctx.and_then(|ctx| {
+                        self.loop_ipdoms
+                            .get(&usize::from(ctx.header))
+                            .and_then(|m| m.get(&idx))
+                            .copied()
+                    });
+                    let merge = loop_merge
+                        .or_else(|| self.ipdom.get(idx).and_then(|&m| m))
                         .map(|m| m as u8)
                         .filter(|&m| {
                             Some(m) != stop_at
                                 && !active.contains(&m)
-                                && loop_ctx.is_none_or(|c| m != c.header && m != c.exit)
+                                && loop_ctx.is_none_or(|c| m != c.header && c.exit != Some(m))
                         });
                     let branch_stop = merge.or(stop_at);
 
                     let true_is_skip = Some(*on_true) == branch_stop;
                     let false_is_skip = Some(*on_false) == branch_stop;
 
+                    // Immediate-terminator flattening: when one branch immediately exits
+                    // (`return ...;` / `break;` / `continue;`) and the other continues, emit
+                    // a flat `if cond { <term> }` guard and continue linearly at the same depth!
+                    if merge.is_none() && !true_is_skip && !false_is_skip {
+                        let term_t = Self::immediate_terminator(*on_true, loop_ctx);
+                        let term_f = Self::immediate_terminator(*on_false, loop_ctx);
+                        if let (Some(tt), None) = (term_t, term_f) {
+                            self.indent(depth);
+                            let _ = write!(self.out, "if {text} {{");
+                            self.push_comment(comment.as_deref());
+                            self.indent(depth + 1);
+                            self.out.push_str(tt);
+                            self.out.push('\n');
+                            self.indent(depth);
+                            self.out.push_str("}\n");
+                            cur = *on_false;
+                            continue;
+                        }
+                        if let (None, Some(tf)) = (term_t, term_f) {
+                            self.indent(depth);
+                            let _ = write!(self.out, "if !{text} {{");
+                            self.push_comment(comment.as_deref());
+                            self.indent(depth + 1);
+                            self.out.push_str(tf);
+                            self.out.push('\n');
+                            self.indent(depth);
+                            self.out.push_str("}\n");
+                            cur = *on_true;
+                            continue;
+                        }
+                    }
+
                     active.insert(cur);
                     let res = if true_is_skip && false_is_skip {
                         self.indent(depth);
-                        let _ = writeln!(self.out, "if {text} {{");
+                        let _ = write!(self.out, "if {text} {{");
+                        self.push_comment(comment.as_deref());
                         self.indent(depth);
                         self.out.push_str("}\n");
                         Ok(())
                     } else if false_is_skip {
                         self.indent(depth);
-                        let _ = writeln!(self.out, "if {text} {{");
-                        let r =
-                            self.emit_region(*on_true, branch_stop, loop_ctx, active, depth + 1);
+                        let _ = write!(self.out, "if {text} {{");
+                        self.push_comment(comment.as_deref());
+                        let r = self.emit_region(
+                            *on_true,
+                            branch_stop,
+                            loop_ctx,
+                            active,
+                            depth + 1,
+                            false,
+                        );
                         self.indent(depth);
                         self.out.push_str("}\n");
                         r
                     } else if true_is_skip {
                         self.indent(depth);
-                        let _ = writeln!(self.out, "if !{text} {{");
-                        let r =
-                            self.emit_region(*on_false, branch_stop, loop_ctx, active, depth + 1);
+                        let _ = write!(self.out, "if !{text} {{");
+                        self.push_comment(comment.as_deref());
+                        let r = self.emit_region(
+                            *on_false,
+                            branch_stop,
+                            loop_ctx,
+                            active,
+                            depth + 1,
+                            false,
+                        );
                         self.indent(depth);
                         self.out.push_str("}\n");
                         r
                     } else {
                         self.indent(depth);
-                        let _ = writeln!(self.out, "if {text} {{");
-                        let r1 =
-                            self.emit_region(*on_true, branch_stop, loop_ctx, active, depth + 1);
+                        let _ = write!(self.out, "if {text} {{");
+                        self.push_comment(comment.as_deref());
+                        let r1 = self.emit_region(
+                            *on_true,
+                            branch_stop,
+                            loop_ctx,
+                            active,
+                            depth + 1,
+                            false,
+                        );
                         self.indent(depth);
                         self.out.push_str("} else {\n");
                         let r2 = r1.and_then(|()| {
-                            self.emit_region(*on_false, branch_stop, loop_ctx, active, depth + 1)
+                            self.emit_region(
+                                *on_false,
+                                branch_stop,
+                                loop_ctx,
+                                active,
+                                depth + 1,
+                                false,
+                            )
                         });
                         self.indent(depth);
                         self.out.push_str("}\n");
@@ -1842,7 +2820,10 @@ mod tests {
         };
         assert!(lifted.contains("op 0x0042"), "{lifted}");
         assert!(lifted.contains("while !op 0x0043"), "{lifted}");
-        assert!(lifted.contains("if op 0x0044"), "{lifted}");
+        assert!(
+            lifted.contains("if op 0x0044") || lifted.contains("if !op 0x0044"),
+            "{lifted}"
+        );
         let recompiled = &compile_antics(&lifted)
             .expect("recompile inline raw op")
             .behaviors[&4096];
@@ -1896,12 +2877,16 @@ mod tests {
             &orig,
             LiftOptions {
                 strict_padding: true,
+                annotate_comments: false,
             },
         ) {
             StructuredLiftOutcome::Lifted(s) => s,
             other => panic!("expected Lifted, got {other:?}"),
         };
-        assert!(strict_src.contains("if op 0x0004"), "{strict_src}");
+        assert!(
+            strict_src.contains("if op 0x0004") || strict_src.contains("if !op 0x0004"),
+            "{strict_src}"
+        );
         assert!(strict_src.contains("op 0x0007"), "{strict_src}");
         assert!(strict_src.contains("op 0x0002"), "{strict_src}");
 
@@ -1910,6 +2895,7 @@ mod tests {
             &orig,
             LiftOptions {
                 strict_padding: true,
+                annotate_comments: false,
             },
         );
         let re_strict_labeled = &compile_antics(&strict_labeled).unwrap().behaviors[&4096];
@@ -1924,6 +2910,7 @@ mod tests {
             &orig,
             LiftOptions {
                 strict_padding: false,
+                annotate_comments: false,
             },
         ) {
             StructuredLiftOutcome::Lifted(s) => s,
@@ -1933,7 +2920,10 @@ mod tests {
             !relaxed_src.contains("op 0x"),
             "relaxed padding should lift all 3 dirty instructions cleanly:\n{relaxed_src}"
         );
-        assert!(relaxed_src.contains("if grab()"), "{relaxed_src}");
+        assert!(
+            relaxed_src.contains("if grab()") || relaxed_src.contains("if !grab()"),
+            "{relaxed_src}"
+        );
         assert!(
             relaxed_src.contains("refresh(target: 0, mode: 1);"),
             "{relaxed_src}"
@@ -1984,6 +2974,7 @@ mod tests {
         let arities_4 = BTreeMap::from([(4097u16, 4usize)]);
         let relaxed = LiftOptions {
             strict_padding: false,
+            annotate_comments: false,
         };
 
         // 1. Structured lifter rejects reordering when callee takes >4 args OR when callee
@@ -2087,6 +3078,732 @@ mod tests {
             )
             .is_err(),
             "lowerer must reject create_object mode 8 with local >= 128"
+        );
+    }
+
+    #[test]
+    fn wave2_all_15_remaining_primitives_roundtrip_strict_relaxed_and_equiv() {
+        use crate::encode::encode_bhav;
+        use crate::lift::format_bhav_labeled_air;
+
+        let src = r#"
+            tree 4096 "Wave2All15Primitives" (args: 2, locals: 3) {
+                if find_best_interaction() {
+                    if gosub_found_action() {
+                        if burn(mode: 1, flags: 1) {
+                            if tutorial(0) {
+                                tutorial(1);
+                            }
+                        }
+                    }
+                }
+                get_distance_to(temp[2]);
+                get_distance_to(temp[3], from: stack_obj);
+                get_direction_to(temp[4]);
+                get_direction_to(local[0], from: my.data[11]);
+                breakpoint(0);
+                breakpoint(my.attr[0]);
+                if make_new_character(skin: 0, age: 1, sex: 2, species: 1) {
+                    show_string(table: 300, index: 1);
+                    look_towards(0);
+                    if look_towards(2) {
+                        old_relationship(write: true, column: 0, param: 0, dir: 0, flags: 0);
+                        if old_relationship(write: false, column: 1, param: 1, dir: 2, flags: 3) {
+                            find_worst_motives(target: 0, mode: 1);
+                            ui_effect(mode: 0, target: 42, flags: 1);
+                            ui_effect(mode: 3);
+                            special_effect(duration: 30, kind: 1, size: 2, flags: 0, str_index: 1);
+                            special_effect(duration: 1, kind: 0, size: 0, flags: 32, str_index: 0);
+                            if reach(mode: 0, moves: true) {
+                                reach(mode: 1, moves: true, param: 1);
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+        "#;
+        let orig = &compile_antics(src).expect("compile wave2 src").behaviors[&4096];
+
+        // 1. Structured lift under strict padding must emit ZERO raw ops and prove Equivalent.
+        let structured = match lift_bhav_structured_with_options(orig, LiftOptions::default()) {
+            StructuredLiftOutcome::Lifted(s) => s,
+            other => panic!("expected Lifted, got {other:?}"),
+        };
+        assert!(
+            !structured.contains("op 0x"),
+            "all Wave 2 primitives must lift with zero raw ops:\n{structured}"
+        );
+        for expected in [
+            "find_best_interaction()",
+            "gosub_found_action()",
+            "burn(mode: 1, flags: 1)",
+            "tutorial(0)",
+            "tutorial(1);",
+            "get_distance_to(temp[2]);",
+            "get_distance_to(temp[3], from: stack_obj);",
+            "get_direction_to(temp[4]);",
+            "get_direction_to(local[0], from: my.data[11]);",
+            "breakpoint(0);",
+            "breakpoint(my.attr[0]);",
+            "make_new_character(skin: 0, age: 1, sex: 2, species: 1)",
+            "show_string(table: 300, index: 1);",
+            "look_towards(0);",
+            "look_towards(2)",
+            "old_relationship(write: true, column: 0, param: 0, dir: 0, flags: 0);",
+            "old_relationship(write: false, column: 1, param: 1, dir: 2, flags: 3)",
+            "find_worst_motives(target: 0, mode: 1);",
+            "ui_effect(mode: 0, target: 42, flags: 1);",
+            "ui_effect(mode: 3);",
+            "special_effect(duration: 30, kind: 1, size: 2, flags: 0, str_index: 1);",
+            "special_effect(duration: 1, kind: 0, size: 0, flags: 32, str_index: 0);",
+            "reach(mode: 0, moves: true)",
+            "reach(mode: 1, moves: true, param: 1);",
+        ] {
+            assert!(
+                structured.contains(expected),
+                "missing `{expected}` in Wave 2 structured lift:\n{structured}"
+            );
+        }
+        let recompiled = &compile_antics(&structured)
+            .expect("recompile Wave 2 structured")
+            .behaviors[&4096];
+        let equiv = check_bhav_equivalent(orig, recompiled, &EquivOptions::default());
+        assert!(
+            matches!(equiv, EquivResult::Equivalent { .. }),
+            "expected Equivalent, got {equiv:?}\nStructured:\n{structured}"
+        );
+
+        // 2. Decoded labeled-CFG must emit ZERO raw ops and round-trip BYTE-EXACTLY.
+        let labeled = format_bhav_labeled_air(orig, LiftOptions::default());
+        assert!(
+            !labeled.contains("op 0x"),
+            "decoded labeled CFG should decode all 15 Wave 2 primitives:\n{labeled}"
+        );
+        let re_labeled = &compile_antics(&labeled)
+            .expect("recompile Wave 2 labeled")
+            .behaviors[&4096];
+        assert_eq!(
+            encode_bhav(re_labeled).unwrap(),
+            encode_bhav(orig).unwrap(),
+            "decoded labeled-CFG must round-trip byte-for-byte"
+        );
+
+        // 3. Dirty padding on Wave 2 primitives: strict preserves via inline raw op,
+        //    relaxed strips verified-ignored bytes and still proves Equivalent!
+        let dirty = BhavChunk {
+            id: 4096,
+            label: "DirtyWave2".to_owned(),
+            format: 0x8002,
+            kind: 0,
+            args: 1,
+            locals: 0,
+            revision: 0,
+            instructions: vec![
+                Instruction {
+                    // Burn with mode=2 (treated as 0) and dirty byte 7=0xAA
+                    opcode: 9,
+                    on_true: 1,
+                    on_false: 0xFF,
+                    operands: [2, 0xFE, 0, 0, 0, 0, 0, 0xAA],
+                },
+                Instruction {
+                    // GetDistanceTo temp[0] with flags=0 and dirty bytes 3..8
+                    opcode: 11,
+                    on_true: 2,
+                    on_false: 0xFD,
+                    operands: [0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0x55],
+                },
+                Instruction {
+                    // FindWorstMotives with dirty bytes 0..4
+                    opcode: 33,
+                    on_true: 3,
+                    on_false: 0xFD,
+                    operands: [0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 1, 0],
+                },
+                Instruction {
+                    // Reach mode 0, moves=5 (nonzero), dirty slot_param & tail
+                    opcode: 47,
+                    on_true: 0xFE,
+                    on_false: 0xFF,
+                    operands: [0, 0, 5, 0, 0x77, 0x88, 0x99, 0xAA],
+                },
+            ],
+            trailing: Vec::new(),
+        };
+        let strict_dirty = match lift_bhav_structured_with_options(&dirty, LiftOptions::default()) {
+            StructuredLiftOutcome::Lifted(s) => s,
+            other => panic!("expected Lifted, got {other:?}"),
+        };
+        assert!(strict_dirty.contains("op 0x0009"), "{strict_dirty}");
+        assert!(strict_dirty.contains("op 0x000b"), "{strict_dirty}");
+        assert!(strict_dirty.contains("op 0x0021"), "{strict_dirty}");
+        assert!(strict_dirty.contains("op 0x002f"), "{strict_dirty}");
+
+        let relaxed = LiftOptions {
+            strict_padding: false,
+            annotate_comments: false,
+        };
+        let relaxed_dirty = match lift_bhav_structured_with_options(&dirty, relaxed) {
+            StructuredLiftOutcome::Lifted(s) => s,
+            other => panic!("expected Lifted, got {other:?}"),
+        };
+        assert!(
+            !relaxed_dirty.contains("op 0x"),
+            "relaxed Wave 2 dirty padding must decode cleanly:\n{relaxed_dirty}"
+        );
+        assert!(
+            relaxed_dirty.contains("burn(mode: 0, flags: 0)"),
+            "{relaxed_dirty}"
+        );
+        assert!(
+            relaxed_dirty.contains("get_distance_to(temp[0]);"),
+            "{relaxed_dirty}"
+        );
+        assert!(
+            relaxed_dirty.contains("find_worst_motives(target: 0, mode: 1);"),
+            "{relaxed_dirty}"
+        );
+        assert!(
+            relaxed_dirty.contains("reach(mode: 0, moves: true)"),
+            "{relaxed_dirty}"
+        );
+        let re_dirty = &compile_antics(&relaxed_dirty).unwrap().behaviors[&4096];
+        let eq_dirty = check_bhav_equivalent(&dirty, re_dirty, &EquivOptions::default());
+        assert!(
+            matches!(eq_dirty, EquivResult::Equivalent { .. }),
+            "expected Equivalent for relaxed dirty Wave 2, got {eq_dirty:?}\n{relaxed_dirty}"
+        );
+    }
+
+    #[test]
+    fn loop_structuring_handles_while_true_break_continue_infinite_main_and_global34() {
+        // 1. Statement-headed natural loop with both `continue` and `break` + post-loop tail.
+        //    Must lower with ZERO extra nodes (exact node count parity) and lift cleanly to `while true`.
+        let stmt_loop_src = r#"
+            tree 4096 "StmtLoop" (args: 1, locals: 0) {
+                while true {
+                    sleep(param[0]);
+                    if my.attr[0] == 1 {
+                        continue;
+                    }
+                    if my.attr[0] == 2 {
+                        break;
+                    }
+                    my.attr[1] += 1;
+                }
+                my.attr[2] := 9;
+                return true;
+            }
+        "#;
+        let orig = &compile_antics(stmt_loop_src).unwrap().behaviors[&4096];
+        assert_eq!(
+            orig.instructions.len(),
+            5,
+            "while true must emit zero dummy header nodes (expected 5 instructions)"
+        );
+        let lifted = match lift_bhav_structured(orig) {
+            StructuredLiftOutcome::Lifted(s) => s,
+            other => panic!("expected Lifted, got {other:?}"),
+        };
+        assert!(lifted.contains("while true {"), "{lifted}");
+        assert!(lifted.contains("continue;"), "{lifted}");
+        assert!(lifted.contains("break;"), "{lifted}");
+        let recompiled = &compile_antics(&lifted).unwrap().behaviors[&4096];
+        assert_eq!(recompiled.instructions.len(), orig.instructions.len());
+        assert!(matches!(
+            check_bhav_equivalent(orig, recompiled, &EquivOptions::default()),
+            EquivResult::Equivalent { .. }
+        ));
+
+        // 2. Infinite `Main` loop with multiple sequential `if`/`else` diamonds (no `return`).
+        let main_loop_src = r#"
+            tree 4097 "InfiniteMain" (args: 1, locals: 0) {
+                while true {
+                    if my.attr[0] == 0 {
+                        my.attr[1] := 1;
+                    } else {
+                        my.attr[1] := 2;
+                    }
+                    if my.attr[2] == 0 {
+                        my.attr[3] := 1;
+                    } else {
+                        my.attr[3] := 2;
+                    }
+                    sleep(param[0]);
+                }
+            }
+        "#;
+        let main_orig = &compile_antics(main_loop_src).unwrap().behaviors[&4097];
+        let main_lifted = match lift_bhav_structured(main_orig) {
+            StructuredLiftOutcome::Lifted(s) => s,
+            other => panic!("expected Lifted for infinite Main loop, got {other:?}"),
+        };
+        assert!(main_lifted.contains("while true {"), "{main_lifted}");
+        // Loop-DAG post-dominators must prevent duplicating `sleep(param[0])`!
+        assert_eq!(
+            main_lifted.matches("sleep(param[0]);").count(),
+            1,
+            "infinite Main loop diamonds must merge cleanly without duplicating tail:\n{main_lifted}"
+        );
+        let main_re = &compile_antics(&main_lifted).unwrap().behaviors[&4097];
+        assert!(matches!(
+            check_bhav_equivalent(main_orig, main_re, &EquivOptions::default()),
+            EquivResult::Equivalent { .. }
+        ));
+
+        // 3. Global 34 preservation across `while true`: zero dummy `0 == 0` node means
+        //    even a loop touching `ui_effect` / `global[34]` stays 100% Equivalent!
+        let g34_src = r#"
+            tree 4098 "Global34Loop" (args: 0, locals: 0) {
+                while true {
+                    ui_effect(mode: 0, target: global[34], flags: 1);
+                    if my.attr[0] == 1 {
+                        break;
+                    }
+                }
+                return true;
+            }
+        "#;
+        let g34_orig = &compile_antics(g34_src).unwrap().behaviors[&4098];
+        let g34_lifted = match lift_bhav_structured(g34_orig) {
+            StructuredLiftOutcome::Lifted(s) => s,
+            other => panic!("expected Lifted, got {other:?}"),
+        };
+        let g34_re = &compile_antics(&g34_lifted).unwrap().behaviors[&4098];
+        assert!(matches!(
+            check_bhav_equivalent(g34_orig, g34_re, &EquivOptions::default()),
+            EquivResult::Equivalent { .. }
+        ));
+    }
+
+    #[test]
+    fn symbol_comments_annotate_calls_bcon_strings_and_vm_fields_and_roundtrip_equiv() {
+        use crate::encode::{encode_bcon, encode_bhav, encode_string_table};
+        use crate::ir::{BconChunk, StringEntry, StringFormat, StringTableChunk};
+        use crate::lift::format_bhav_labeled_air_with_context;
+        use sims_formats::iff::{ChunkData, Iff, write as write_iff};
+
+        let caller_src = r#"
+            tree 4096 "Caller" (args: 0, locals: 0) {
+                my.motive[7] += bcon[1];
+                if my.person[58] < 18 {
+                    my.data[25] := 0;
+                    action_string(table: 300, index: 1);
+                    dialog(kind: 0, message: 1, title: 0, button1: 0, button2: 0, button3: 0, mode4_str: 0, flags: 0);
+                    run_tree_by_name(table: 303, index: 1, mode: 2);
+                    set_motive_change(5, 10, 100);
+                    call 4097(0, 0, 0, 0);
+                }
+                return true;
+            }
+            tree 4097 "open" (args: 0, locals: 0) {
+                return true;
+            }
+        "#;
+        let compiled = compile_antics(caller_src).unwrap();
+        let caller = &compiled.behaviors[&4096];
+        let callee = &compiled.behaviors[&4097];
+
+        let bcon = BconChunk {
+            id: 4096,
+            label: "Tuning".to_owned(),
+            flags: 0,
+            values: vec![10, 25, 50],
+            trailing: Vec::new(),
+        };
+        let str300 = StringTableChunk::new(
+            *b"STR#",
+            300,
+            "ActionStrings",
+            StringFormat::Localized,
+            vec![StringEntry::english("Grab Snack")],
+        );
+        let str301 = StringTableChunk::new(
+            *b"STR#",
+            301,
+            "Dialogs",
+            StringFormat::Localized,
+            vec![StringEntry::english("Fridge empty!\nRefill soon.")],
+        );
+        let str303 = StringTableChunk::new(
+            *b"STR#",
+            303,
+            "TreeNames",
+            StringFormat::Localized,
+            vec![StringEntry::english("CT - Open")],
+        );
+
+        let iff_bytes = write_iff(&[
+            ChunkData {
+                tag: *b"BHAV",
+                id: 4096,
+                flags: 0,
+                label: caller.label.clone(),
+                data: encode_bhav(caller).unwrap(),
+            },
+            ChunkData {
+                tag: *b"BHAV",
+                id: 4097,
+                flags: 0,
+                label: callee.label.clone(),
+                data: encode_bhav(callee).unwrap(),
+            },
+            ChunkData {
+                tag: *b"BCON",
+                id: 4096,
+                flags: 0,
+                label: bcon.label.clone(),
+                data: encode_bcon(&bcon).unwrap(),
+            },
+            ChunkData {
+                tag: *b"STR#",
+                id: 300,
+                flags: 0,
+                label: str300.label.clone(),
+                data: encode_string_table(&str300).unwrap(),
+            },
+            ChunkData {
+                tag: *b"STR#",
+                id: 301,
+                flags: 0,
+                label: str301.label.clone(),
+                data: encode_string_table(&str301).unwrap(),
+            },
+            ChunkData {
+                tag: *b"STR#",
+                id: 303,
+                flags: 0,
+                label: str303.label.clone(),
+                data: encode_string_table(&str303).unwrap(),
+            },
+        ])
+        .unwrap();
+        let iff = Iff::parse(iff_bytes).unwrap();
+        let symbols = extract_lift_symbols_from_iff(&iff);
+        let arities = BTreeMap::from([(4096u16, 0usize), (4097u16, 0usize)]);
+
+        // Annotated structured lift:
+        let annotated_opts = LiftOptions {
+            strict_padding: true,
+            annotate_comments: true,
+        };
+        let annotated = match lift_bhav_structured_with_context(
+            caller,
+            annotated_opts,
+            Some(&arities),
+            Some(&symbols),
+        ) {
+            StructuredLiftOutcome::Lifted(s) => s,
+            other => panic!("expected Lifted, got {other:?}"),
+        };
+        for expected_comment in [
+            "// Hunger, bcon[0:1] = 25 (\"Tuning\")",
+            "// Age",
+            "// Lockout",
+            "// \"Grab Snack\"",
+            "// \"Fridge empty! Refill soon.\"",
+            "// \"CT - Open\"",
+            "// Energy",
+            "// \"open\"",
+        ] {
+            assert!(
+                annotated.contains(expected_comment),
+                "missing `{expected_comment}` in annotated structured lift:\n{annotated}"
+            );
+        }
+        // Annotated `.air` must compile cleanly and prove Equivalent!
+        let re_annotated = &compile_antics(&annotated)
+            .expect("annotated structured .air must compile")
+            .behaviors[&4096];
+        assert!(matches!(
+            check_bhav_equivalent(caller, re_annotated, &EquivOptions::default()),
+            EquivResult::Equivalent { .. }
+        ));
+
+        // Annotated labeled-CFG lift must ALSO compile cleanly and round-trip byte-for-byte!
+        let labeled_ann = format_bhav_labeled_air_with_context(
+            caller,
+            annotated_opts,
+            Some(&arities),
+            Some(&symbols),
+        );
+        assert!(labeled_ann.contains("// \"open\""), "{labeled_ann}");
+        assert!(labeled_ann.contains("// Hunger"), "{labeled_ann}");
+        let re_labeled = &compile_antics(&labeled_ann)
+            .expect("annotated labeled-CFG .air must compile")
+            .behaviors[&4096];
+        assert_eq!(
+            encode_bhav(re_labeled).unwrap(),
+            encode_bhav(caller).unwrap()
+        );
+
+        // Default (`annotate_comments: false`) emits zero trailing comments!
+        let plain = match lift_bhav_structured_with_context(
+            caller,
+            LiftOptions::default(),
+            Some(&arities),
+            Some(&symbols),
+        ) {
+            StructuredLiftOutcome::Lifted(s) => s,
+            other => panic!("expected Lifted, got {other:?}"),
+        };
+        assert!(
+            !plain.contains("//"),
+            "plain lift must emit zero comments:\n{plain}"
+        );
+    }
+
+    #[test]
+    fn sol_wave2_r1_zero_instruction_while_true_and_localized_str_order_regressions() {
+        use crate::compile::compile_antics;
+        use crate::encode::{encode_bhav, encode_string_table};
+        use crate::ir::{StringEntry, StringFormat, StringTableChunk};
+        use sims_formats::iff::{ChunkData, Iff, write as write_iff};
+
+        // P1-1a: `refresh(0, 0); while true { return false; } refresh(0, 1);`
+        // First refresh must jump directly to TARGET_FALSE and never emit/jump to refresh(0, 1).
+        let t1 = &compile_antics(
+            r#"
+            tree 4096 "T1" {
+                refresh(target: 0, mode: 0);
+                while true { return false; }
+                refresh(target: 0, mode: 1);
+            }
+            "#,
+        )
+        .expect("compile T1")
+        .behaviors[&4096];
+        assert_eq!(t1.instructions.len(), 1);
+        assert_eq!(t1.instructions[0].opcode, 7);
+        assert_eq!(t1.instructions[0].on_true, TARGET_FALSE);
+        assert_eq!(t1.instructions[0].on_false, TARGET_FALSE);
+
+        // P1-1b: `refresh(0, 0); while true { return false; }` (no trailing stmt) must not point OOB.
+        let t2 = &compile_antics(
+            r#"
+            tree 4096 "T2" {
+                refresh(target: 0, mode: 0);
+                while true { return false; }
+            }
+            "#,
+        )
+        .expect("compile T2")
+        .behaviors[&4096];
+        assert_eq!(t2.instructions.len(), 1);
+        assert_eq!(t2.instructions[0].on_true, TARGET_FALSE);
+        assert_eq!(t2.instructions[0].on_false, TARGET_FALSE);
+
+        // P1-1c: `while true { return false; } refresh(0, 0);` must return false, not run refresh.
+        let t3 = &compile_antics(
+            r#"
+            tree 4096 "T3" {
+                while true { return false; }
+                refresh(target: 0, mode: 0);
+            }
+            "#,
+        )
+        .expect("compile T3")
+        .behaviors[&4096];
+        assert_eq!(t3.instructions.len(), 1);
+        assert_eq!(t3.instructions[0].opcode, 2);
+        assert_eq!(t3.instructions[0].on_true, TARGET_FALSE);
+        assert_eq!(t3.instructions[0].on_false, TARGET_FALSE);
+
+        // P1-1d: Nested `while true { while true { break; } refresh(0, 0); }` must patch outer
+        // back-edge cleanly to node 0 with zero unpatched sentinels!
+        let t4 = &compile_antics(
+            r#"
+            tree 4096 "T4" {
+                while true {
+                    while true { break; }
+                    refresh(target: 0, mode: 0);
+                }
+            }
+            "#,
+        )
+        .expect("compile T4")
+        .behaviors[&4096];
+        assert_eq!(t4.instructions.len(), 1);
+        assert_eq!(t4.instructions[0].opcode, 7);
+        assert_eq!(t4.instructions[0].on_true, 0);
+        assert_eq!(t4.instructions[0].on_false, 0);
+
+        // P1-1e: `while true { while true { break; } }` must emit a clean 1-node self-loop.
+        let t5 = &compile_antics(
+            r#"
+            tree 4096 "T5" {
+                while true {
+                    while true { break; }
+                }
+            }
+            "#,
+        )
+        .expect("compile T5")
+        .behaviors[&4096];
+        assert_eq!(t5.instructions.len(), 1);
+        assert_eq!(t5.instructions[0].on_true, 0);
+        assert_eq!(t5.instructions[0].on_false, 0);
+
+        // P1-1f: `refresh(0, 0); while true { break; } return true;` jumps directly to TARGET_TRUE.
+        let t6 = &compile_antics(
+            r#"
+            tree 4096 "T6" {
+                refresh(target: 0, mode: 0);
+                while true { break; }
+                return true;
+            }
+            "#,
+        )
+        .expect("compile T6")
+        .behaviors[&4096];
+        assert_eq!(t6.instructions.len(), 1);
+        assert_eq!(t6.instructions[0].on_true, TARGET_TRUE);
+
+        // P2-2: Localized STR# with interleaved English/French/English matches VM `loaded_order`
+        // (`Last` before `First`), and French-only localized STR# produces NO preview comment.
+        let str_interleaved = StringTableChunk::new(
+            *b"STR#",
+            300,
+            "Interleaved",
+            StringFormat::Localized,
+            vec![
+                StringEntry::english("First"),
+                StringEntry {
+                    language: 2,
+                    text: "Autre".to_owned(),
+                    comment: String::new(),
+                    raw_text: None,
+                    raw_comment: None,
+                },
+                StringEntry::english("Last"),
+            ],
+        );
+        let str_french_only = StringTableChunk::new(
+            *b"STR#",
+            301,
+            "FrenchOnly",
+            StringFormat::Localized,
+            vec![StringEntry {
+                language: 2,
+                text: "Seulement".to_owned(),
+                comment: String::new(),
+                raw_text: None,
+                raw_comment: None,
+            }],
+        );
+        let probe = &compile_antics(
+            r#"
+            tree 4096 "Probe" {
+                action_string(table: 300, index: 1);
+                action_string(table: 300, index: 2);
+                dialog(kind: 0, message: 1, title: 0, button1: 0, button2: 0, button3: 0, mode4_str: 0, flags: 0);
+                return true;
+            }
+            "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let iff_bytes = write_iff(&[
+            ChunkData {
+                tag: *b"BHAV",
+                id: 4096,
+                flags: 0,
+                label: "Probe".to_owned(),
+                data: encode_bhav(probe).unwrap(),
+            },
+            ChunkData {
+                tag: *b"STR#",
+                id: 300,
+                flags: 0,
+                label: "Interleaved".to_owned(),
+                data: encode_string_table(&str_interleaved).unwrap(),
+            },
+            ChunkData {
+                tag: *b"STR#",
+                id: 301,
+                flags: 0,
+                label: "FrenchOnly".to_owned(),
+                data: encode_string_table(&str_french_only).unwrap(),
+            },
+        ])
+        .unwrap();
+        let iff = Iff::parse(iff_bytes).unwrap();
+        let symbols = extract_lift_symbols_from_iff(&iff);
+        let lifted = match lift_bhav_structured_with_context(
+            probe,
+            LiftOptions {
+                strict_padding: true,
+                annotate_comments: true,
+            },
+            None,
+            Some(&symbols),
+        ) {
+            StructuredLiftOutcome::Lifted(s) => s,
+            other => panic!("expected Lifted, got {other:?}"),
+        };
+        assert!(
+            lifted.contains("action_string(table: 300, index: 1); // \"Last\""),
+            "interleaved localized STR# index 1 must preview \"Last\" matching VM loaded_order:\n{lifted}"
+        );
+        assert!(
+            lifted.contains("action_string(table: 300, index: 2); // \"First\""),
+            "interleaved localized STR# index 2 must preview \"First\" matching VM loaded_order:\n{lifted}"
+        );
+        assert!(
+            !lifted.contains("Seulement"),
+            "French-only localized STR# must not emit a misleading preview:\n{lifted}"
+        );
+
+        // Sol R2 P1-1: Trailing break-only loop in a labeled tree must fall through to TARGET_TRUE
+        // without leaving a dangling edge past the end of the tree.
+        let labeled_trail = &compile_antics(
+            r#"
+            tree 4096 "LabeledTrail" {
+                @start:
+                refresh(target: 0, mode: 0);
+                while true { break; }
+            }
+            "#,
+        )
+        .expect("labeled trailing break-only loop must compile")
+        .behaviors[&4096];
+        assert_eq!(labeled_trail.instructions.len(), 1);
+        assert_eq!(labeled_trail.instructions[0].opcode, 7);
+        assert_eq!(labeled_trail.instructions[0].on_true, TARGET_TRUE);
+        assert_eq!(labeled_trail.instructions[0].on_false, TARGET_TRUE);
+
+        let labeled_mid = &compile_antics(
+            r#"
+            tree 4096 "LabeledMid" {
+                @start:
+                refresh(target: 0, mode: 0);
+                while true { break; }
+                refresh(target: 0, mode: 1);
+            }
+            "#,
+        )
+        .expect("labeled mid break-only loop must compile")
+        .behaviors[&4096];
+        assert_eq!(labeled_mid.instructions.len(), 2);
+        assert_eq!(labeled_mid.instructions[0].on_true, 1);
+        assert_eq!(labeled_mid.instructions[0].on_false, 1);
+        assert_eq!(labeled_mid.instructions[1].on_true, TARGET_TRUE);
+
+        // Sol R2 P2-1: Non-fallthrough cutoff must still report semantic diagnostics in dead code.
+        let dead_err = compile_antics(
+            r#"
+            tree 4096 "DeadErr" {
+                while true { return false; }
+                call Missing();
+            }
+            "#,
+        )
+        .expect_err("dead `call Missing()` after `while true { return false; }` must still error");
+        assert!(
+            dead_err.message.contains("Missing"),
+            "unexpected diagnostic: {}",
+            dead_err.message
         );
     }
 }
