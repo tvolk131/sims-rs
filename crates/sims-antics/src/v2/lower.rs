@@ -1150,7 +1150,7 @@ enum Binding {
     /// Regular local variable in `.air` (`local_name` is unique within the tree).
     Local { air_name: String, ty: ValueType },
     /// Immutable constant `i16` operand (literal or `bcon.<name>`) forwarded into an inline helper.
-    ConstI16(String),
+    ConstI16 { air: String, value: i16 },
     /// Immutable constant `bool` value forwarded into an inline helper.
     ConstBool(bool),
     /// Immutable BHAV `param[idx]` (from a `functional` parameter).
@@ -2471,9 +2471,13 @@ impl<'a> TreeLowerer<'a> {
             let binding = match &param.ty {
                 V2Type::I16 => {
                     if !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name)
-                        && let Some(const_air) = self.try_const_i16_air_operand(&arg.value)?
+                        && let Some((const_air, const_val)) =
+                            self.try_const_i16_air_operand(&arg.value)?
                     {
-                        Binding::ConstI16(const_air)
+                        Binding::ConstI16 {
+                            air: const_air,
+                            value: const_val,
+                        }
                     } else {
                         let (air, ty) = self.lower_value_expr(&arg.value)?;
                         if ty == ValueType::Bool {
@@ -2492,7 +2496,7 @@ impl<'a> TreeLowerer<'a> {
                 }
                 V2Type::Bool => {
                     if !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name)
-                        && let Some(const_b) = self.try_eval_const_bool(&arg.value)
+                        && let Some(const_b) = self.try_const_bool_arg(&arg.value)
                     {
                         Binding::ConstBool(const_b)
                     } else {
@@ -3068,7 +3072,7 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(binding) = self.lookup_var(name).cloned() {
                     return match binding {
                         Binding::Local { air_name, ty } => Ok((air_name, ty)),
-                        Binding::ConstI16(air) => Ok((air, ValueType::I16)),
+                        Binding::ConstI16 { air, .. } => Ok((air, ValueType::I16)),
                         Binding::ConstBool(b) => {
                             Ok((if b { "1" } else { "0" }.to_owned(), ValueType::Bool))
                         }
@@ -3345,12 +3349,12 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
-    fn try_const_i16_air_operand(&self, expr: &V2Expr) -> Result<Option<String>> {
+    fn try_const_i16_air_operand(&self, expr: &V2Expr) -> Result<Option<(String, i16)>> {
         match expr {
             V2Expr::Int(span, v) => {
                 let n = i16::try_from(*v)
                     .map_err(|_| Error::at(*span, format!("integer {v} out of i16 range")))?;
-                Ok(Some(n.to_string()))
+                Ok(Some((n.to_string(), n)))
             }
             V2Expr::Unary {
                 span,
@@ -3364,28 +3368,56 @@ impl<'a> TreeLowerer<'a> {
                         .ok_or_else(|| {
                             Error::at(*span, format!("negated integer -{v} out of i16 range"))
                         })?;
-                    Ok(Some(n.to_string()))
+                    Ok(Some((n.to_string(), n)))
                 } else {
                     Ok(None)
                 }
             }
-            V2Expr::Ident(_, name) => match self.lookup_var(name) {
-                Some(Binding::ConstI16(air)) => Ok(Some(air.clone())),
-                None if self.env.i16_params.contains_key(name) => Ok(Some(format!("bcon.{name}"))),
-                _ => Ok(None),
-            },
+            V2Expr::Ident(_, name) => {
+                if let Some(binding) = self.lookup_var(name) {
+                    return match binding {
+                        Binding::ConstI16 { air, value } => Ok(Some((air.clone(), *value))),
+                        _ => Ok(None),
+                    };
+                }
+                if self.is_self_ident(name) || self.is_sim_ident(name) || name == "sim" {
+                    return Ok(None);
+                }
+                if let Some(&val) = self.env.i16_params.get(name) {
+                    return Ok(Some((format!("bcon.{name}"), val)));
+                }
+                Ok(None)
+            }
             _ => Ok(None),
         }
+    }
+
+    /// Resolves a compile-time bool for helper argument substitution (including transitive
+    /// `Binding::ConstBool` forwarding). Unlike `try_eval_const_bool`, this is NEVER used to
+    /// prune `if` branches inside helpers, so dead branches remain type- and symbol-checked.
+    fn try_const_bool_arg(&self, expr: &V2Expr) -> Option<bool> {
+        if let V2Expr::Ident(_, name) = expr
+            && let Some(Binding::ConstBool(b)) = self.lookup_var(name)
+        {
+            return Some(*b);
+        }
+        self.try_eval_const_bool(expr)
     }
 
     fn try_eval_const_bool(&self, expr: &V2Expr) -> Option<bool> {
         match expr {
             V2Expr::Bool(_, b) => Some(*b),
-            V2Expr::Ident(_, name) => match self.lookup_var(name) {
-                Some(Binding::ConstBool(b)) => Some(*b),
-                None => self.env.bool_params.get(name).copied(),
-                _ => None,
-            },
+            V2Expr::Ident(_, name) => {
+                if self.lookup_var(name).is_some()
+                    || self.is_self_ident(name)
+                    || self.is_sim_ident(name)
+                    || name == "sim"
+                {
+                    None
+                } else {
+                    self.env.bool_params.get(name).copied()
+                }
+            }
             V2Expr::Unary {
                 op: V2UnaryOp::Not,
                 inner,
@@ -3439,6 +3471,21 @@ impl<'a> TreeLowerer<'a> {
                     .ok_or_else(|| Error::at(*span, "i16 negation overflow"))
             }
             V2Expr::Ident(span, name) => {
+                if let Some(binding) = self.lookup_var(name) {
+                    return match binding {
+                        Binding::ConstI16 { value, .. } => Ok(*value),
+                        _ => Err(Error::at(
+                            *span,
+                            format!("expected constant i16, found non-constant variable '{name}'"),
+                        )),
+                    };
+                }
+                if self.is_self_ident(name) || self.is_sim_ident(name) || name == "sim" {
+                    return Err(Error::at(
+                        *span,
+                        format!("expected constant i16, found '{name}'"),
+                    ));
+                }
                 self.env.i16_params.get(name).copied().ok_or_else(|| {
                     Error::at(*span, format!("expected constant i16, found '{name}'"))
                 })
