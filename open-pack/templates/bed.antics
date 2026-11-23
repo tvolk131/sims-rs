@@ -14,17 +14,16 @@ pub template BedBase {
 
     sound settle = preset("soft_thud");
 
-    fn run_sleep_loop(sim: Sim, completed: &mut i16) {
-        restore_two_motives_loop(
+    fn run_sleep_loop(sim: Sim) -> i16 {
+        return restore_two_motives_loop(
             sim,
             Motive::Energy,
             energy_step,
             Motive::Comfort,
             comfort_step,
-            sleep_cycles,
-            sleep_ticks,
-            wake_energy,
-            completed,
+            cycles: sleep_cycles,
+            ticks: sleep_ticks,
+            primary_cap: wake_energy,
         );
     }
 }

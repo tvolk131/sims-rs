@@ -10,25 +10,19 @@ object "Open Pine Bench" from SeatBase {
 
     sit_cycles: 4;
     comfort_step: 10;
-    max_entry_comfort: 95;
 
     sound creak = preset("wood_creak", wav: "open_bench_creak");
 
     interaction "Sit and Rest" {
         autonomy: 55,
-        attenuation: 0.02,
-        advertises: [
-            comfort +45 (min: -100),
-        ],
-        guard(sim) => !self.occupied && sim.motive.comfort < max_entry_comfort,
+        advertises: [comfort +45],
+        lock: self.occupied,
+        guard(sim) => sim.motive.comfort < max_entry_comfort,
         run(sim) {
-            with lock(self.occupied) {
-                play_sound(creak, self);
-                repeat sit_cycles {
-                    sim.motive.comfort += comfort_step;
-                }
+            play_sound(creak);
+            repeat sit_cycles {
+                sim.motive.comfort += comfort_step;
             }
-            return true;
         }
     }
 }

@@ -6,7 +6,6 @@ object "Open Timber Bookshelf" {
     guid: 0x7F00_0053;
     price: 340;
     category: misc;
-    attributes: 8;
     description: "A clean-room hardwood bookcase for reading novels (Fun) and studying Cooking or Mechanical skills.";
     sprite: Sprite::procedural("bookshelf", primary: #845A38, accent: #AE5848, trim: #4A3422);
 
@@ -24,94 +23,51 @@ object "Open Timber Bookshelf" {
     sound page_turn = preset("ui_click", wav: "open_book_turn");
     sound skill_chime = preset("chime", wav: "open_skill_chime");
 
-    slot front {
-        kind: routing,
-        offset: [0.0, -0.75, 0.0],
-        standing: true,
-        sitting: false,
-        ground: true,
-        facing: north,
+    slot front = routing([0.0, -0.75, 0.0]);
+
+    fn study_skill(sim: Sim, skill: Skill) {
+        play_sound(page_turn);
+        let mut cycles: i16 = 0;
+        repeat study_cycles cancel_on_abort {
+            sleep(read_ticks);
+            if sim.skill[skill] < max_skill {
+                sim.skill[skill] += study_skill_step;
+            }
+            sim.motive.fun += study_fun_step;
+            cycles += 1;
+        }
+        if cycles > 0 {
+            play_sound(skill_chime);
+            self.sessions += 1;
+        }
     }
 
     interaction "Read Novel" {
         autonomy: 50,
-        attenuation: 0.02,
-        advertises: [
-            fun +55 (min: -100),
-        ],
-        guard(sim) => !self.occupied,
+        advertises: [fun +55],
+        lock: self.occupied,
         run(sim) {
-            with lock(self.occupied) {
-                play_sound(page_turn, self);
-                let mut cycles: i16 = 0;
-                restore_motive_loop(
-                    sim,
-                    Motive::Fun,
-                    read_cycles,
-                    read_ticks,
-                    novel_fun_step,
-                    100,
-                    &mut cycles,
-                );
-                self.sessions += 1;
-            }
-            return true;
+            play_sound(page_turn);
+            restore_motive_loop(sim, Motive::Fun, cycles: read_cycles, step: novel_fun_step, ticks: read_ticks);
+            self.sessions += 1;
         }
     }
 
     interaction "Study Cooking" {
         autonomy: 35,
-        attenuation: 0.02,
-        advertises: [
-            fun +15 (min: -100),
-        ],
-        guard(sim) => !self.occupied,
+        advertises: [fun +15],
+        lock: self.occupied,
         run(sim) {
-            with lock(self.occupied) {
-                play_sound(page_turn, self);
-                let mut cycles: i16 = 0;
-                repeat study_cycles cancel_on_abort {
-                    sleep(read_ticks);
-                    if sim.skill.cooking < max_skill {
-                        sim.skill.cooking += study_skill_step;
-                    }
-                    sim.motive.fun += study_fun_step;
-                    cycles += 1;
-                }
-                if cycles > 0 {
-                    play_sound(skill_chime, self);
-                    self.sessions += 1;
-                }
-            }
-            return true;
+            study_skill(sim, Skill::Cooking);
         }
     }
 
     interaction "Study Mechanical" {
         autonomy: 35,
-        attenuation: 0.02,
-        advertises: [
-            fun +15 (min: -100),
-        ],
-        guard(sim) => !self.occupied,
+        advertises: [fun +15],
+        lock: self.occupied,
         run(sim) {
-            with lock(self.occupied) {
-                play_sound(page_turn, self);
-                let mut cycles: i16 = 0;
-                repeat study_cycles cancel_on_abort {
-                    sleep(read_ticks);
-                    if sim.skill.mechanical < max_skill {
-                        sim.skill.mechanical += study_skill_step;
-                    }
-                    sim.motive.fun += study_fun_step;
-                    cycles += 1;
-                }
-                if cycles > 0 {
-                    play_sound(skill_chime, self);
-                    self.sessions += 1;
-                }
-            }
-            return true;
+            study_skill(sim, Skill::Mechanical);
         }
     }
 }

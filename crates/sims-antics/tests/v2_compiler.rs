@@ -3271,19 +3271,24 @@ fn on_disk_open_pack_is_pure_v2_expands_all_20_objects_and_passes_safety() {
         0,
         "lamp must boot with graphic 0 (lit) to preserve v0.3.0 initial world state"
     );
-    vm.run_interaction(lamp_id, "Turn Off Light", None);
+    let room_before = vm.sim_motive(13);
+    vm.run_interaction(lamp_id, "Turn Off", None);
     assert_eq!(vm.obj_attr(lamp_id, 1), 0);
     assert_eq!(
         vm.obj_data(lamp_id, 0),
         1,
         "Turn Off switches to off graphic 1"
     );
-    vm.run_interaction(lamp_id, "Turn On Light", None);
+    vm.run_interaction(lamp_id, "Turn On", None);
     assert_eq!(vm.obj_attr(lamp_id, 1), 1);
     assert_eq!(
         vm.obj_data(lamp_id, 0),
         0,
         "Turn On switches back to lit graphic 0"
+    );
+    assert!(
+        vm.sim_motive(13) > room_before + 30.0,
+        "Turn On hook must still boost Sim room motive"
     );
 
     // 6. Verify 2-Sim contention on `open-cot`: while Sim 1 naps, Sim 2 cannot claim the cot!
@@ -3602,4 +3607,781 @@ object "Renamed Sim Param" {
     vm3.run_interaction(rid, "Write", None);
     assert_eq!(vm3.obj_attr(rid, 0), 0);
     assert_eq!(vm3.obj_attr(rid, 1), 77);
+}
+
+// ===========================================================================
+// 7. `.antics` v2 Tiers 1 + 2 Ergonomics & Language Extensions
+// ===========================================================================
+
+#[test]
+fn tiers_1_2_compact_slots_defaults_and_autosized_attributes() {
+    let cfg = PackResolverConfig::default();
+    let src = r#"
+object "Compact Defaults Probe" {
+    guid: 0x7F40_0001;
+    price: 150;
+    category: misc;
+    description: "Tests compact slot syntax, interaction defaults, auto-sized attributes, and play_sound default target.";
+    sprite: Sprite::procedural("cot", primary: #556677, accent: #8899AA, trim: #223344);
+
+    state uses: i16 = 0;
+    state flag: bool = false;
+
+    sound ding = preset("chime", wav: "compact_ding");
+
+    slot front = routing([0.0, -0.75, 0.0]);
+    slot side = routing([0.5, 0.25, 0.0], facing: east, sitting: true, standing: false, ground: false, min_dist: 16, max_dist: 48, optimal_dist: 32);
+    slot top = container([0.0, 0.0, 0.64]);
+
+    interaction "Ping" {
+        autonomy: 60,
+        advertises: [hunger +75, energy +40 (min: -50)],
+        run(sim) {
+            self.uses += 1;
+            self.flag = true;
+            play_sound(ding);
+            sim.motive.hunger += 20;
+        }
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects("compact.antics", src, &cfg)
+        .expect("expand compact defaults");
+    assert_eq!(expanded.len(), 1);
+    let obj_exp = &expanded[0];
+    // Auto-sized attributes defaults to state_count.max(8) = 8.
+    assert_eq!(obj_exp.manifest.attributes, 8);
+    // Interaction defaults: attenuation == 0.02, advertises min defaults to -100 while explicit -50 is preserved.
+    assert_eq!(obj_exp.manifest.interactions.len(), 1);
+    let inter = &obj_exp.manifest.interactions[0];
+    assert!((inter.attenuation - 0.02).abs() < 1e-6);
+    assert_eq!(inter.motives.len(), 2);
+    assert_eq!(inter.motives[0].delta, 75);
+    assert_eq!(inter.motives[0].minimum, -100);
+    assert_eq!(inter.motives[1].delta, 40);
+    assert_eq!(inter.motives[1].minimum, -50);
+    // Compact slots produce exact SlotSpec fields.
+    assert_eq!(obj_exp.manifest.slots.len(), 3);
+    assert_eq!(obj_exp.manifest.slots[0].kind, 3);
+    assert_eq!(obj_exp.manifest.slots[0].offset, [0.0, -0.75, 0.0]);
+    assert_eq!(
+        (
+            obj_exp.manifest.slots[0].standing,
+            obj_exp.manifest.slots[0].sitting,
+            obj_exp.manifest.slots[0].ground,
+            obj_exp.manifest.slots[0].facing
+        ),
+        (1, 0, 1, 0)
+    );
+    assert_eq!(obj_exp.manifest.slots[1].kind, 3);
+    assert_eq!(obj_exp.manifest.slots[1].offset, [0.5, 0.25, 0.0]);
+    assert_eq!(
+        (
+            obj_exp.manifest.slots[1].standing,
+            obj_exp.manifest.slots[1].sitting,
+            obj_exp.manifest.slots[1].ground,
+            obj_exp.manifest.slots[1].facing
+        ),
+        (0, 1, 0, 2)
+    );
+    assert_eq!(obj_exp.manifest.slots[1].proximity, [16, 48, 32]);
+    assert_eq!(obj_exp.manifest.slots[2].kind, 0);
+    assert_eq!(obj_exp.manifest.slots[2].offset, [0.0, 0.0, 0.64]);
+    assert_eq!(
+        (
+            obj_exp.manifest.slots[2].standing,
+            obj_exp.manifest.slots[2].sitting,
+            obj_exp.manifest.slots[2].ground,
+            obj_exp.manifest.slots[2].height
+        ),
+        (0, 0, 0, 5)
+    );
+    // play_sound(ding) defaults to stack_obj in interaction context.
+    assert!(
+        obj_exp.air_source.contains("play_sound(1, stack_obj);"),
+        "{}",
+        obj_exp.air_source
+    );
+
+    let compiled = compile_v2_source("compact.antics", src, &cfg).expect("compile compact");
+    let report = verify_object_safety(&compiled).expect("verify compact");
+    assert!(report.is_ok(), "{:?}", report.violations);
+
+    let mut vm = V2VmFixture::from_objects(&[&compiled], 100);
+    let oid = vm.spawn(0x7F40_0001, 4, 4);
+    let hunger_before = vm.sim_motive(7);
+    let sounds = vm.run_interaction(oid, "Ping", None);
+    assert_eq!(vm.obj_attr(oid, 0), 1);
+    assert_eq!(vm.obj_attr(oid, 1), 1);
+    assert!((vm.sim_motive(7) - (hunger_before + 20.0)).abs() < 1e-4);
+    let sound_names: Vec<&str> = sounds
+        .iter()
+        .filter_map(|e| match e {
+            SoundEvent::Play { name, .. } => Some(name.as_str()),
+            SoundEvent::Stop { .. } => None,
+        })
+        .collect();
+    assert_eq!(sound_names, vec!["compact_ding"]);
+
+    // Auto-sized attributes grows above 8 when > 8 states are declared, and respects explicit attributes.
+    let ten_states = r#"
+object "Ten States" {
+    guid: 0x7F40_0002;
+    state s0: i16 = 0; state s1: i16 = 0; state s2: i16 = 0; state s3: i16 = 0; state s4: i16 = 0;
+    state s5: i16 = 0; state s6: i16 = 0; state s7: i16 = 0; state s8: i16 = 0; state s9: i16 = 0;
+}
+"#;
+    let exp_ten = sims_antics::v2::expand_v2_source_to_objects("ten.antics", ten_states, &cfg)
+        .expect("expand ten states");
+    assert_eq!(exp_ten[0].manifest.attributes, 10);
+
+    let explicit_four = r#"
+object "Explicit Four" {
+    guid: 0x7F40_0003;
+    attributes: 4;
+    state s0: i16 = 0;
+}
+"#;
+    let exp_four = sims_antics::v2::expand_v2_source_to_objects("four.antics", explicit_four, &cfg)
+        .expect("expand explicit four");
+    assert_eq!(exp_four[0].manifest.attributes, 4);
+}
+
+#[test]
+fn tiers_1_2_declarative_lock_clause_guard_and_unlock_on_all_paths() {
+    let cfg = PackResolverConfig::default();
+    let src = r#"
+object "Declarative Lock Probe" {
+    guid: 0x7F40_0010;
+    state occupied: bool = false;
+    state completed: i16 = 0;
+    state fail_early: bool = false;
+
+    // 1. No explicit guard -> auto-generates `!self.occupied`
+    interaction "Lock Only" {
+        lock: self.occupied,
+        run(sim) {
+            if self.fail_early {
+                return false;
+            }
+            repeat 3 cancel_on_abort {
+                sleep(2);
+                self.completed += 1;
+            }
+        }
+    }
+
+    // 2. Expression guard -> conjoins `!self.occupied && sim.motive.energy < 80`
+    interaction "Lock And Guard" {
+        lock: self.occupied,
+        guard(sim) => sim.motive.energy < 80,
+        run(sim) {
+            self.completed += 10;
+        }
+    }
+
+    // 3. Redundant leading `!self.occupied` in guard -> deduplicated cleanly
+    interaction "Lock Redundant Guard" {
+        lock: self.occupied,
+        guard(sim) => !self.occupied && sim.motive.energy < 80,
+        run(sim) {
+            self.completed += 100;
+        }
+    }
+
+    // 4. Block guard -> prepends `if self.occupied { return false; }`
+    interaction "Lock Block Guard" {
+        lock: self.occupied,
+        guard(sim) {
+            if sim.motive.energy >= 80 {
+                return false;
+            }
+            return true;
+        }
+        run(sim) {
+            self.completed += 1000;
+        }
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects("lock_probe.antics", src, &cfg)
+        .expect("expand lock probe");
+    // Verify redundant guard does not emit duplicate `stack.attr[0] != 0` checks inside `Can_LockRedundantGuard`.
+    let air = &expanded[0].air_source;
+    let redundant_tree = air
+        .split("tree ")
+        .find(|s| s.contains("Can_LockRedundantGuard"))
+        .expect("Can_LockRedundantGuard tree");
+    assert_eq!(
+        redundant_tree.matches("stack.attr[0] != 0").count(),
+        1,
+        "redundant leading !self.occupied must be deduplicated:\n{redundant_tree}"
+    );
+
+    let compiled = compile_v2_source("lock_probe.antics", src, &cfg).expect("compile lock probe");
+    let report = verify_object_safety(&compiled).expect("verify lock probe");
+    assert!(
+        report.is_ok(),
+        "declarative lock interactions must pass safety: {:?}",
+        report.violations
+    );
+
+    let mut vm = V2VmFixture::from_objects(&[&compiled], 100);
+    let oid = vm.spawn(0x7F40_0010, 4, 4);
+    let sim1_id = vm.sim_id;
+    let sim2_id = 10u16;
+    vm.world.order.push(sim2_id);
+    vm.world.people.push(sim2_id);
+    vm.world.objects.insert(sim2_id, make_sim_object(sim2_id));
+
+    // Early `return false;` releases lock!
+    vm.world.objects.get_mut(&oid).unwrap().attributes[2] = 1; // fail_early = true
+    vm.run_interaction(oid, "Lock Only", None);
+    assert_eq!(vm.obj_attr(oid, 0), 0, "early return false must unlock");
+    assert_eq!(vm.obj_attr(oid, 1), 0);
+
+    // Normal execution with 2-Sim contention & cancel releases lock!
+    vm.world.objects.get_mut(&oid).unwrap().attributes[2] = 0; // fail_early = false
+    let interp = Interpreter::new(&vm.program, &vm.catalog, Stream::Lot);
+    let entries1 = interp.pie_menu(&mut vm.world, sim1_id, oid).unwrap();
+    assert_eq!(entries1.len(), 4, "all 4 interactions offered when vacant");
+    let uid1 = interp
+        .pick(&mut vm.world, sim1_id, entries1[0].action.clone())
+        .unwrap()
+        .unwrap();
+    vm.world.objects.get_mut(&sim1_id).unwrap().data[25] = 1;
+    let st = interp.turn(&mut vm.world, sim1_id, 4_000).unwrap();
+    assert!(matches!(st, Status::Yielded));
+    assert_eq!(
+        vm.world.objects[&oid].attributes[0], 1,
+        "locked while running"
+    );
+
+    // While Sim 1 holds `self.occupied`, Sim 2 sees ZERO of the 4 interactions (including block-guarded)!
+    let entries2_busy = interp.pie_menu(&mut vm.world, sim2_id, oid).unwrap();
+    assert!(
+        entries2_busy.is_empty(),
+        "all 4 lock: interactions must hide while occupied, got {}",
+        entries2_busy.len()
+    );
+
+    // Cancel Sim 1 -> lock releases -> Sim 2 sees all 4 again!
+    assert!(interp.cancel(&mut vm.world, sim1_id, uid1).unwrap());
+    for _ in 0..16 {
+        vm.world.objects.get_mut(&sim1_id).unwrap().data[25] = 1;
+        let _ = interp.turn(&mut vm.world, sim1_id, 4_000).unwrap();
+        if vm.world.objects[&sim1_id].stack.len() == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        vm.world.objects[&oid].attributes[0], 0,
+        "cancel must unlock"
+    );
+    let entries2_free = interp.pie_menu(&mut vm.world, sim2_id, oid).unwrap();
+    assert_eq!(entries2_free.len(), 4);
+
+    // Block guard & expression guard still respect `energy < 80` when vacant.
+    vm.world
+        .objects
+        .get_mut(&sim2_id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .motives[5] = 90.0;
+    let entries2_energetic = interp.pie_menu(&mut vm.world, sim2_id, oid).unwrap();
+    assert_eq!(
+        entries2_energetic.len(),
+        1,
+        "only 'Lock Only' should pass when energy >= 80"
+    );
+}
+
+#[test]
+fn tiers_1_2_template_interactions_hook_overrides_and_minimal_params() {
+    let mut cfg = PackResolverConfig::default();
+    cfg.virtual_modules.insert(
+        "test_pack::tpl".to_owned(),
+        r#"
+pub fn add_bonus(sim: Sim, amount: i16) {
+    sim.motive.room += amount;
+}
+
+pub template SmartGadget {
+    param initial_power: bool = false;
+    param boost: i16 = 10;
+    param unused_default: i16 = 99;
+
+    state occupied: bool = false;
+    state power: bool = initial_power;
+    state hook_calls: i16 = 0;
+
+    sound click = preset("ui_click");
+    slot front = routing([0.0, -0.75, 0.0]);
+
+    fn on_power_changed(sim: Sim, on: bool) {}
+
+    interaction "Power On" {
+        autonomy: 30,
+        guard(sim) => !self.power,
+        run(sim) {
+            self.power = true;
+            play_sound(click);
+            on_power_changed(sim, true);
+        }
+    }
+
+    interaction "Power Off" {
+        autonomy: 20,
+        guard(sim) => self.power && !self.occupied,
+        run(sim) {
+            self.power = false;
+            play_sound(click);
+            on_power_changed(sim, false);
+        }
+    }
+
+    interaction "Inspect" {
+        autonomy: 10,
+        lock: self.occupied,
+        run(sim) {
+            add_bonus(sim, boost);
+        }
+    }
+}
+"#
+        .to_owned(),
+    );
+
+    let obj_src = r#"
+use test_pack::tpl::SmartGadget;
+
+fn record_hook(counter: &mut i16) {
+    *counter += 1;
+}
+
+object "Custom Lamp" from SmartGadget {
+    guid: 0x7F40_0020;
+    // Minimal overrides: omit `initial_power` (defaults false) and `unused_default` (defaults 99)!
+    boost: 25;
+
+    sound click = preset("chime", wav: "custom_lamp_click");
+
+    // Override inherited hook (calling local module helper + reading overridden param `boost`)!
+    fn on_power_changed(sim: Sim, on: bool) {
+        record_hook(&mut self.hook_calls);
+        if on {
+            set_graphic(1);
+            sim.motive.room += boost;
+        } else {
+            set_graphic(0);
+        }
+    }
+
+    // Override inherited "Inspect" interaction in-place!
+    interaction "Inspect" {
+        autonomy: 15,
+        lock: self.occupied,
+        run(sim) {
+            self.hook_calls += 10;
+        }
+    }
+
+    // Add a new object-specific interaction!
+    interaction "Pulse" {
+        autonomy: 25,
+        lock: self.occupied,
+        guard(sim) => self.power,
+        run(sim) {
+            sim.motive.fun += 30;
+        }
+    }
+}
+"#;
+    let compiled = compile_v2_source("custom_lamp.antics", obj_src, &cfg).expect("compile");
+    let report = verify_object_safety(&compiled).expect("verify");
+    assert!(report.is_ok(), "{:?}", report.violations);
+
+    let mut vm = V2VmFixture::from_objects(&[&compiled], 100);
+    let oid = vm.spawn(0x7F40_0020, 4, 4);
+    assert_eq!(
+        vm.obj_attr(oid, 1),
+        0,
+        "inherited default initial_power=false"
+    );
+    let room0 = vm.sim_motive(13);
+    let sounds = vm.run_interaction(oid, "Power On", None);
+    let sound_names: Vec<&str> = sounds
+        .iter()
+        .filter_map(|e| match e {
+            SoundEvent::Play { name, .. } => Some(name.as_str()),
+            SoundEvent::Stop { .. } => None,
+        })
+        .collect();
+    assert_eq!(sound_names, vec!["custom_lamp_click"]);
+    assert_eq!(vm.obj_attr(oid, 1), 1);
+    assert_eq!(vm.obj_attr(oid, 2), 1, "on_power_changed hook ran");
+    assert_eq!(vm.obj_data(oid, 0), 1, "graphic updated by hook");
+    assert!((vm.sim_motive(13) - (room0 + 25.0)).abs() < 1e-4);
+
+    // Overridden "Inspect" adds 10 instead of template body.
+    vm.run_interaction(oid, "Inspect", None);
+    assert_eq!(vm.obj_attr(oid, 2), 11);
+
+    // Added "Pulse" works when powered on.
+    let fun0 = vm.sim_motive(15);
+    vm.run_interaction(oid, "Pulse", None);
+    assert!((vm.sim_motive(15) - (fun0 + 30.0)).abs() < 1e-4);
+
+    // Inherited "Power Off" runs hook with on=false.
+    vm.run_interaction(oid, "Power Off", None);
+    assert_eq!(vm.obj_attr(oid, 1), 0);
+    assert_eq!(vm.obj_attr(oid, 2), 12);
+    assert_eq!(vm.obj_data(oid, 0), 0);
+}
+
+#[test]
+fn tiers_1_2_value_returning_i16_named_and_default_parameters() {
+    let cfg = PackResolverConfig::default();
+    let src = r#"
+pub fn add_scaled(base: i16, step: i16 = 10, mult: i16 = 2) -> i16 {
+    return base + step * mult;
+}
+
+pub fn count_cycles(limit: i16, ticks: i16 = 2) -> i16 {
+    let mut done: i16 = 0;
+    repeat limit cancel_on_abort {
+        sleep(ticks);
+        done += 1;
+    }
+    return done;
+}
+
+pub fn return_before_defer(val: &mut i16) -> i16 {
+    *val = 42;
+    defer {
+        *val = 99;
+    }
+    return *val;
+}
+
+object "Fn I16 And Named Args Probe" {
+    guid: 0x7F40_0030;
+    param default_step: i16 = 7;
+
+    state r0: i16 = 0;
+    state r1: i16 = 0;
+    state r2: i16 = 0;
+    state r3: i16 = 0;
+    state r4: i16 = 0;
+    state r5: i16 = 0;
+    state r6: i16 = 0;
+    state defer_target: i16 = 0;
+
+    // Local helper whose default references object param `default_step` (must not be hijacked by caller local).
+    fn use_param_default(x: i16, inc: i16 = default_step) -> i16 {
+        return x + inc;
+    }
+
+    interaction "Test Math" {
+        run(sim) {
+            // Positional + defaults: 5 + 10 * 2 = 25
+            self.r0 = add_scaled(5);
+            // Named out-of-order: 5 + 4 * 3 = 17
+            self.r1 = add_scaled(5, mult: 3, step: 4);
+            // Partial named + default step=10: 5 + 10 * 4 = 45
+            self.r2 = add_scaled(5, mult: 4);
+            // All named out-of-order + default mult=2: 1 + 7 * 2 = 15
+            self.r3 = add_scaled(step: 7, base: 1);
+            // Discarded i16 return value as statement + expression composition
+            add_scaled(100);
+            if add_scaled(5) > 20 {
+                self.r4 = add_scaled(1, step: 2, mult: 3) + add_scaled(2, mult: 1);
+            }
+            // Hygiene: caller local named `default_step` must NOT hijack callee's default param `default_step = 7`!
+            let default_step: i16 = 500;
+            self.r5 = use_param_default(10) + (default_step - 500);
+            // Return expression evaluated BEFORE defer mutates `*val`!
+            self.r6 = return_before_defer(&mut self.defer_target);
+        }
+    }
+
+    interaction "Test Cancel Count" {
+        run(sim) {
+            self.r0 = count_cycles(4, ticks: 2);
+        }
+    }
+}
+"#;
+    let compiled = compile_v2_source("fn_i16.antics", src, &cfg).expect("compile fn_i16");
+    let report = verify_object_safety(&compiled).expect("verify fn_i16");
+    assert!(report.is_ok(), "{:?}", report.violations);
+
+    let mut vm = V2VmFixture::from_objects(&[&compiled], 100);
+    let oid = vm.spawn(0x7F40_0030, 4, 4);
+    vm.run_interaction(oid, "Test Math", None);
+    assert_eq!(vm.obj_attr(oid, 0), 25);
+    assert_eq!(vm.obj_attr(oid, 1), 17);
+    assert_eq!(vm.obj_attr(oid, 2), 45);
+    assert_eq!(vm.obj_attr(oid, 3), 15);
+    assert_eq!(vm.obj_attr(oid, 4), 19); // (1 + 2*3) + (2 + 10*1) = 7 + 12 = 19
+    assert_eq!(
+        vm.obj_attr(oid, 5),
+        17,
+        "default param hygiene: 10 + 7 = 17"
+    );
+    assert_eq!(vm.obj_attr(oid, 6), 42, "return captured before defer ran");
+    assert_eq!(vm.obj_attr(oid, 7), 99, "defer ran after capturing return");
+
+    // Full run returns 4 cycles; canceling after 1 yield returns 0 completed cycles (aborted during first sleep).
+    vm.run_interaction(oid, "Test Cancel Count", None);
+    assert_eq!(vm.obj_attr(oid, 0), 4);
+    vm.run_interaction(oid, "Test Cancel Count", Some(1));
+    assert_eq!(vm.obj_attr(oid, 0), 0);
+}
+
+#[test]
+fn tiers_1_2_dynamic_skill_indexing_all_six_skills() {
+    let cfg = PackResolverConfig::default();
+    let src = r#"
+pub fn train_skill(sim: Sim, sk: Skill, gain: i16 = 25, cap: i16 = 1000) -> i16 {
+    if sim.skill[sk] < cap {
+        sim.skill[sk] += gain;
+    }
+    return sim.skill[sk];
+}
+
+object "Skill Trainer" {
+    guid: 0x7F40_0040;
+    state last_level: i16 = 0;
+
+    interaction "Train All" {
+        run(sim) {
+            train_skill(sim, Skill::Cooking, gain: 10);
+            train_skill(sim, Skill::Charisma, gain: 20);
+            train_skill(sim, Skill::Mechanical, gain: 30);
+            train_skill(sim, Skill::Creativity, gain: 40);
+            train_skill(sim, Skill::Body, gain: 50);
+            self.last_level = train_skill(sim, Skill::Logic, gain: 60);
+        }
+    }
+}
+"#;
+    let compiled = compile_v2_source("skills.antics", src, &cfg).expect("compile skills");
+    let mut vm = V2VmFixture::from_objects(&[&compiled], 100);
+    let oid = vm.spawn(0x7F40_0040, 4, 4);
+    vm.run_interaction(oid, "Train All", None);
+    assert_eq!(vm.sim_skill(10), 10, "Cooking = person.data[10]");
+    assert_eq!(vm.sim_skill(11), 20, "Charisma = person.data[11]");
+    assert_eq!(vm.sim_skill(12), 30, "Mechanical = person.data[12]");
+    assert_eq!(vm.sim_skill(15), 40, "Creativity = person.data[15]");
+    assert_eq!(vm.sim_skill(17), 50, "Body = person.data[17]");
+    assert_eq!(vm.sim_skill(18), 60, "Logic = person.data[18]");
+    assert_eq!(vm.obj_attr(oid, 0), 60, "returned new Logic skill level");
+}
+
+#[test]
+fn tiers_1_2_error_diagnostics() {
+    let cfg = PackResolverConfig::default();
+
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "lock_non_bool",
+            r#"
+object "Bad Lock Type" {
+    guid: 0x7F41_0001;
+    state count: i16 = 0;
+    interaction "Go" { lock: self.count, run(sim) { sleep(1); } }
+}
+"#,
+            "requires a bool state",
+        ),
+        (
+            "lock_unknown",
+            r#"
+object "Bad Lock Field" {
+    guid: 0x7F41_0002;
+    interaction "Go" { lock: self.missing, run(sim) { sleep(1); } }
+}
+"#,
+            "unknown state 'missing'",
+        ),
+        (
+            "lock_not_self",
+            r#"
+object "Bad Lock Base" {
+    guid: 0x7F41_0003;
+    interaction "Go" { lock: sim.occupied, run(sim) { sleep(1); } }
+}
+"#,
+            "must target a bool state on 'self'",
+        ),
+        (
+            "lock_reentrant",
+            r#"
+object "Double Lock" {
+    guid: 0x7F41_0004;
+    state busy: bool = false;
+    interaction "Go" {
+        lock: self.busy,
+        run(sim) {
+            with lock(self.busy) { sleep(1); }
+        }
+    }
+}
+"#,
+            "re-entrant",
+        ),
+        (
+            "dup_named_arg",
+            r#"
+fn f(a: i16, b: i16 = 1) -> i16 { return a + b; }
+object "Dup Named" {
+    guid: 0x7F41_0005;
+    interaction "Go" { run(sim) { let x = f(1, a: 2); } }
+}
+"#,
+            "duplicate argument for parameter 'a'",
+        ),
+        (
+            "pos_after_named",
+            r#"
+fn f(a: i16, b: i16) -> i16 { return a + b; }
+object "Pos After Named" {
+    guid: 0x7F41_0006;
+    interaction "Go" { run(sim) { let x = f(a: 1, 2); } }
+}
+"#,
+            "positional argument cannot follow a named argument",
+        ),
+        (
+            "unknown_named_arg",
+            r#"
+fn f(a: i16) -> i16 { return a; }
+object "Unknown Named" {
+    guid: 0x7F41_0007;
+    interaction "Go" { run(sim) { let x = f(bogus: 1); } }
+}
+"#,
+            "has no parameter named 'bogus'",
+        ),
+        (
+            "missing_required_arg",
+            r#"
+fn f(a: i16, b: i16 = 2) -> i16 { return a + b; }
+object "Missing Req" {
+    guid: 0x7F41_0008;
+    interaction "Go" { run(sim) { let x = f(b: 5); } }
+}
+"#,
+            "missing required argument 'a'",
+        ),
+        (
+            "req_after_default",
+            r#"
+fn f(a: i16 = 1, b: i16) -> i16 { return a + b; }
+object "Req After Default" { guid: 0x7F41_0009; }
+"#,
+            "cannot follow a parameter with a default value",
+        ),
+        (
+            "mutref_default",
+            r#"
+fn f(x: &mut i16 = 0) {}
+object "MutRef Default" { guid: 0x7F41_000A; }
+"#,
+            "cannot have a default value",
+        ),
+        (
+            "functional_default",
+            r#"
+object "Func Default" {
+    guid: 0x7F41_000B;
+    functional prep(a: i16 = 1) { run(sim) {} }
+}
+"#,
+            "functional parameter 'a' cannot have a default value",
+        ),
+        (
+            "i16_fn_returns_bool",
+            r#"
+fn bad() -> i16 { return true; }
+object "Wrong Ret" {
+    guid: 0x7F41_000C;
+    interaction "Go" { run(sim) { let x = bad(); } }
+}
+"#,
+            "returning 'i16' cannot return 'bool'",
+        ),
+        (
+            "i16_fn_missing_return",
+            r#"
+fn bad(c: bool) -> i16 {
+    if c { return 1; }
+}
+object "Missing Ret" {
+    guid: 0x7F41_000D;
+    interaction "Go" { run(sim) { let x = bad(true); } }
+}
+"#,
+            "does not return on all control-flow paths",
+        ),
+        (
+            "i16_fn_used_as_bool",
+            r#"
+fn num() -> i16 { return 1; }
+object "I16 As Bool" {
+    guid: 0x7F41_000E;
+    interaction "Go" { run(sim) { if num() { sleep(1); } } }
+}
+"#,
+            "returns 'i16' and cannot be used directly as a bool condition",
+        ),
+        (
+            "unknown_skill",
+            r#"
+fn train(sim: Sim, sk: Skill) { sim.skill[sk] += 10; }
+object "Bad Skill" {
+    guid: 0x7F41_000F;
+    interaction "Go" { run(sim) { train(sim, Skill::Alchemy); } }
+}
+"#,
+            "unknown Skill::Alchemy",
+        ),
+        (
+            "shadowed_skill_ident",
+            r#"
+object "Shadow Skill" {
+    guid: 0x7F41_0010;
+    interaction "Go" {
+        run(sim) {
+            let cooking: i16 = 5;
+            sim.skill[cooking] += 10;
+        }
+    }
+}
+"#,
+            "variable 'cooking' is not a Skill",
+        ),
+        (
+            "unknown_slot_ctor",
+            r#"
+object "Bad Slot Ctor" {
+    guid: 0x7F41_0011;
+    slot front = magic([0.0, 0.0, 0.0]);
+}
+"#,
+            "unknown slot constructor 'magic'",
+        ),
+    ];
+
+    for &(name, src, expected_substr) in cases {
+        let err = compile_v2_source(name, src, &cfg)
+            .expect_err(&format!("case '{name}' must fail to compile"));
+        assert!(
+            err.message.contains(expected_substr),
+            "case '{name}' expected error containing {expected_substr:?}, got: {err}"
+        );
+    }
 }

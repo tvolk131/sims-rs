@@ -4,7 +4,6 @@ object "Open Oak Counter" {
     guid: 0x7F00_0021;
     price: 260;
     category: surfaces;
-    attributes: 8;
     description: "A clean-room kitchen prep counter providing a food-preparation surface callback for the cooking chain.";
     sprite: Sprite::procedural("counter", primary: #A67A4E, accent: #E8E4DA, trim: #583E2A);
 
@@ -16,23 +15,8 @@ object "Open Oak Counter" {
 
     sound chop = preset("wood_creak", wav: "open_counter_chop");
 
-    slot top_surface {
-        kind: container,
-        offset: [0.0, 0.0, 0.64],
-        standing: false,
-        sitting: false,
-        ground: false,
-        facing: north,
-    }
-
-    slot front {
-        kind: routing,
-        offset: [0.0, -0.75, 0.0],
-        standing: true,
-        sitting: false,
-        ground: true,
-        facing: north,
-    }
+    slot top_surface = container([0.0, 0.0, 0.64]);
+    slot front = routing([0.0, -0.75, 0.0]);
 
     functional prep {
         score: prep_score,
@@ -40,8 +24,7 @@ object "Open Oak Counter" {
         run(sim) {
             self.meals_prepped += 1;
             temp[3] = prep_nutrition_bonus;
-            play_sound(chop, self);
-            return true;
+            play_sound(chop);
         }
     }
 }

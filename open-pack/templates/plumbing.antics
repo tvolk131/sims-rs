@@ -2,7 +2,6 @@
 
 pub template PlumbingFixture {
     category: plumbing;
-    attributes: 8;
 
     param break_threshold: i16 = 3;
     param use_ticks: i16 = 2;
@@ -16,19 +15,12 @@ pub template PlumbingFixture {
     state wear: i16 = 0;
     state broken: bool = false;
 
-    slot front {
-        kind: routing,
-        offset: [0.0, -0.70, 0.0],
-        standing: true,
-        sitting: false,
-        ground: true,
-        facing: north,
-    }
+    slot front = routing([0.0, -0.70, 0.0]);
 
     fn complete_fixture_repair(sim: Sim, confirm_sfx: Sound) {
         self.broken = false;
         self.wear = 0;
         sim.skill.mechanical += mechanic_xp;
-        play_sound(confirm_sfx, self);
+        play_sound(confirm_sfx);
     }
 }

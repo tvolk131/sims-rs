@@ -46,6 +46,7 @@ pub enum V2Type {
     Object,
     ObjectId,
     Motive,
+    Skill,
     Sound,
     Slot,
     MutRef(Box<V2Type>),
@@ -61,6 +62,7 @@ impl V2Type {
             Self::Object => "Object".to_owned(),
             Self::ObjectId => "ObjectId".to_owned(),
             Self::Motive => "Motive".to_owned(),
+            Self::Skill => "Skill".to_owned(),
             Self::Sound => "Sound".to_owned(),
             Self::Slot => "Slot".to_owned(),
             Self::MutRef(inner) => format!("&mut {}", inner.display_name()),
@@ -69,14 +71,15 @@ impl V2Type {
 }
 
 /// One parameter in a `fn` / `pub fn` declaration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FnParam {
     pub span: Span,
     pub name: String,
     pub ty: V2Type,
+    pub default: Option<V2Expr>,
 }
 
-/// Reusable helper function declaration (`[pub] fn name(...) [-> bool] { ... }`).
+/// Reusable helper function declaration (`[pub] fn name(...) [-> bool | -> i16] { ... }`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
     pub span: Span,
@@ -342,6 +345,8 @@ pub struct InteractionDecl {
     pub flags2: u32,
     pub joining_index: i32,
     pub advertises: Vec<AdvertiseDecl>,
+    /// Optional declarative occupancy lock (`lock: self.<bool_state>`).
+    pub lock: Option<(Span, String)>,
     pub guard: Option<GuardDecl>,
     pub sim_binding: String,
     pub run_body: Vec<V2Stmt>,

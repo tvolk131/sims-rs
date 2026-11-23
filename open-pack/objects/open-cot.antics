@@ -8,41 +8,23 @@ object "Open Camp Cot" from BedBase {
     description: "A clean-room folding camp cot that restores Energy over multiple ticks.";
     sprite: Sprite::procedural("cot", primary: #587C60, accent: #E4E0D2, trim: #404844);
 
-    sleep_cycles: 3;
-    sleep_ticks: 2;
-    energy_step: 20;
-    comfort_step: 5;
-    max_entry_energy: 80;
     wake_energy: 101;
 
     state occupied: bool = false;
 
     sound settle = preset("soft_thud", wav: "open_cot_settle");
 
-    slot side_entry {
-        kind: routing,
-        offset: [0.75, 0.0, 0.0],
-        standing: true,
-        sitting: false,
-        ground: true,
-        facing: east,
-    }
+    slot side_entry = routing([0.75, 0.0, 0.0], facing: east);
 
     interaction "Take a Nap" {
         autonomy: 65,
         attenuation: 0.015,
-        advertises: [
-            energy +60 (min: -100),
-            comfort +20 (min: -100),
-        ],
-        guard(sim) => !self.occupied && sim.motive.energy < max_entry_energy,
+        advertises: [energy +60, comfort +20],
+        lock: self.occupied,
+        guard(sim) => sim.motive.energy < max_entry_energy,
         run(sim) {
-            with lock(self.occupied) {
-                play_sound(settle, self);
-                let mut cycles: i16 = 0;
-                run_sleep_loop(sim, &mut cycles);
-            }
-            return true;
+            play_sound(settle);
+            run_sleep_loop(sim);
         }
     }
 }
