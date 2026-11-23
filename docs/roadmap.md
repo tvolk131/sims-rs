@@ -3417,6 +3417,55 @@ through their public interfaces only; the simulation never depends on it.
     **3.01×** uncached pan (`6.569 → 2.184 ms`), **−57.7%** steady-state
     memory traffic, and **−41.4%** resident buffer RAM with `8/8 ratchet: ok`
     and zero new crates.
+- **Done (Batch 13 — Complete Collection Polish, Formal `sims-antics` Verifier
+  & Dual-Mode Standalone `open-pack/` Boot, #383–#387):**
+  - **UI polish, fast Save Manager, live 3D Try-On & paginated reference books
+    (#383):** zero-decompress `AutosaveStore::list_saves_metadata` cutting Save
+    Manager listing from `11.93–12.16 ms → 0.84 ms` (**14.2×** faster), live 3D
+    Sim "Try On" preview (`sims_people::caf_preview`, ±45° rotation) in
+    Wardrobe/Charm/Boutique/Studio shops, native 9-slice paginated
+    `ReferenceBookDialog` for Spellbook/Cookbook (`Dialog` kinds `12`/`15` from
+    `GameData/magic.iff`), Neighborhood top-bar secondary actions
+    (`ToggleRezone`, `ImportFamily`, `OpenCredits`, `OpenWeb`), and exact caret
+    blink deadlines.
+  - **Formal `sims-antics` safety & trace-equivalence verifier + 20-object
+    standalone `open-pack/` (#384):** pure-Rust static/symbolic safety prover
+    (`sims-antics verify`, **20/20** `open-pack/` objects passing with **0
+    violations**) and CFG product-graph trace-equivalence verifier
+    (`sims-antics equiv`), in-memory structured high-level lifter proving
+    **14,692 / 14,692 (100.0%)** real Complete Collection BHAVs `Equivalent`
+    (**0 counterexamples, 0 inconclusive**, 0 bytes written to disk), plus 10
+    new clean-room objects (20 total covering all 8 motives), procedural `.flr`
+    floors & `.wll` walls, and starter cottage `House01.iff` + 2-Sim `Sunvale
+    Household` + `Neighborhood.iff` validated end-to-end in `sims-vm` (**0
+    traps**).
+  - **Native VM live cheats, warm `VmInstallCache`, 600-tick deep expansion
+    sweep & REDB v4 CAF surnames (#385):** `Lot::set_move_objects` /
+    `add_funds` / `set_hour` preserving Buy/Build undo history, thread-safe
+    `VmInstallCache` accelerating warm `House05` `enter_lot` **277.4 → 60.4 ms
+    (4.59×)** base and **260.0 → 56.1 ms (4.63×)** saved at bit-identical
+    `World::hash()`, 600-tick 6-lot deep expansion sweep (`2,591` objects,
+    `1,239` entries) burning unsupported hits down **54 → 10** (**0**
+    non-presentation unsupported, **98.9%** clean) via active-route-target
+    deletion (`0x440fff`) and Scope 24 `family_flags` (`Saved` v10), native
+    `StoredNeighborhood` v4 `family_surnames`, and `AutosaveStore` SHA-256
+    validator fast paths.
+  - **`sims-game` integration & dual-mode zero-asset standalone `open-pack/`
+    boot (#386):** wired native `move_objects`/`rosebud`/`klapaucius`/`set_hour`
+    cheats, `InstallAssets + VmInstallCache` caching (**2.33×** over
+    `InstallAssets`-only; **~3.0×** vs uncached `enter_lot`), atomic single-txn
+    REDB v4 CAF surname migration retiring `.caf-names.tsv` writes, single-hash
+    SHA-256 autosave validation, and dual-mode standalone `open-pack/` boot
+    (`--open-pack` or default when neither `<install>` nor `SIMS_INSTALL` is
+    set, plus `--open-pack --png`) with clean-room procedural UI chrome & 5×7
+    font (`Art::clean_room_procedural()`), directional 2D procedural Sims +
+    plumb bob, and synthesized WAV playback (`7/7` CI tests passing without
+    `SIMS_INSTALL`; Goth 43,200-tick hash `df6eb544...` and `8/8 ratchet: ok`
+    unchanged).
+  - **Stdout-only `sims-antics lift` CLI inspector (#387):** interactive
+    `.iff`/`.far` inspector (`--list`, `--entry`, `--filter`, `--tree`, `--raw`,
+    `--verify-equiv`) with strict stdout-only/FIFO-safe I/O, Windows-1252 case
+    resolution, and byte-exact raw round-trip hardening (`49/49` tests passing).
 - **Needs from other crates:**
   - `sims-vm`: Done — all three failing Goth pie listings (#296) are
     now closed, and every person's pie menu on every object of the Goth
