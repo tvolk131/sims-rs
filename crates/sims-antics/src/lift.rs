@@ -88,6 +88,8 @@ pub fn format_bhav_labeled_air_with_context(
     callee_arities: Option<&BTreeMap<u16, usize>>,
     symbols: Option<&LiftSymbols>,
 ) -> String {
+    let scoped = symbols.map(|s| s.for_caller(chunk.id));
+    let symbols = scoped.as_deref();
     let mut out = format_bhav_header(chunk);
     let bounds = match chunk.format {
         0x8000 => Some((4usize, 0usize)),

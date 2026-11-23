@@ -72,11 +72,13 @@ The resolver asks the VM's own code (its boot path, catalog, library loader and 
   - Override members must match exactly: the full name, or the full name or last path component case-insensitively. Suffix matching is never used.
   - Each override replaces only its own ID range.
   - `--no-catalog` disables catalog lookup, leaving private arities from the file only. It is not byte-for-byte the old behaviour: a private ID whose chunks disagree on arity (e.g. a live 4-arg tree plus a deleted 6-arg duplicate) is now unknown, where the old path took one of them. On Fridges it reproduces the old 43/51.
+    - Like the explicit overrides, `--no-catalog` is outside the rule's guarantee. It applies the file's own private arities to every lifted tree, so a semi-global caller's private-callee arities come from the semi-global file, while the VM runs the calling object's own private trees there.
   - All three are rejected with `--raw`, which does not use arities, and with an archive `--list` that has no `--entry`.
   - Arities are resolved after tree selection, so a bad override never hides a missing `--tree`.
 - **Explainable output.**
   - Lift and `--list` output start with `// arity sources: global …; private …; semi-global …`. Each range shows its count and source: this file, install catalog (path relative to the install), explicit, or none, with the reason.
   - `Equivalent` from `--verify-equiv` is relative to the callee arities used, and the header and the verify line say so. An explicit override, or a lot whose loaded callee versions differ from the base install's catalog, can supply a different arity, and then a different lift. A `Characters` file shadowing a `GLOB` target is excluded by the rule above; an override is not checked against anything.
+  - Call comments name a private callee (`LiftSymbols::bhav_labels`, taken from the chunk the VM keeps) only when the calling tree is itself private (`LiftSymbols::for_caller`). A private call runs the code owner's tree, and only a private caller's owner is known to be the lifted file. Global and semi-global callers get no private-callee label, in every mode.
   - `structure_lift` exposes `structured_lift_header_check` / `UnsupportedHeaderReason`, refactored out of the lifter's own guard so the two cannot drift. Fallback lines name the format, instruction count, kind-4 entry, out-of-bounds target, or the node and callee whose arity is above 4 or unknown. An unknown arity also names the missing source and the flag that would supply it.
 
 ## Results
