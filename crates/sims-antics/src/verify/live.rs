@@ -20,13 +20,16 @@
 //!   effects (`sims-vm/src/memory.rs:364`);
 //! - the scratch-pointer state every `Expression` sets (`expression.rs:51`), which a later
 //!   read of Global 34 observes;
-//! - optionally, the frame's final parameters and locals, which stay in the frame
-//!   storage after the tree returns (`interpreter.rs:1195`).
+//! - unless turned off, the frame's final parameters and locals, which stay in the
+//!   frame storage after the tree returns and seed a later frame (`interpreter.rs:1216`).
 //!
 //! Two trees are equivalent when every pair of paths whose path conditions can hold
 //! together has the same summary. Pure reads of tracked cells, self assignments, and
-//! writes that are overwritten or land in a dead frame slot leave no trace, so they
-//! drop out of the comparison.
+//! overwritten writes leave no trace, so they drop out of the comparison; writes to
+//! dead frame slots do too when frame residue is not observed.
+//!
+//! Verdicts are conservative: `Equivalent` must be sound, a counterexample must have a
+//! witness the VM can reach, and everything else is `Inconclusive`.
 //!
 //! Soundness: values are named by what determines them (initial inputs, or an event
 //! together with the whole event history before it), so equal names always mean equal

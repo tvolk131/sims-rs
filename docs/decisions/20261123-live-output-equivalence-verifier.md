@@ -25,6 +25,14 @@ by default (see Policies).
 
 ## Decision
 
+The verdicts follow one rule, adopted after three review rounds kept finding
+new holes: converge by being conservative, not by modeling more.
+
+- **Equivalent** must be sound.
+- **Different** (a counterexample) must be backed by a witness the VM can
+  reach.
+- Anything in between is **Inconclusive**. Fewer proofs is an accepted cost.
+
 ### 1. Live-output checker (`verify/live.rs`, `check_bhav_live_equivalent`)
 
 Each tree runs on its own over symbolic inputs. Each path becomes a summary of
@@ -35,7 +43,9 @@ what the rest of the game can observe:
   past node 250, trap with 0x44c whatever the tree's length
   (`interpreter.rs:766`, `interpreter.rs:1695`). A kind-4 entry runs at the
   entry clamped to the tree's last node (`interpreter.rs:1790`), so trees of
-  different lengths are compared entry by entry, not rejected.
+  different lengths are compared entry by entry, not rejected. The entry is
+  also `param[0]` (`interpreter.rs:964`): the checker fixes it to the entry,
+  or bounds it below for the last node, which every larger entry reaches.
 - **Last branch result** at exit and before each primitive (a primitive may
   start a tree that reads it, `found_action.rs:102`, `idle.rs:187`). Before a
   built-in primitive other than Idle and Gosub Found Action, which read it
@@ -63,7 +73,11 @@ what the rest of the game can observe:
   these cells never trap and have no side effects.
 - **Scratch-pointer state at exit.** Every `Expression` sets it
   (`expression.rs:51`), and a caller's later read of Global 34 sees it.
-- **Frame residue (opt-in):** the frame's final params and locals.
+- **Frame residue (on by default):** the frame's final params and locals,
+  and which locals may be unwritten. A later frame at the same depth starts
+  from these words and can read one before writing it
+  (`interpreter.rs:1216`). A difference here is only ever possible, since it
+  shows only if such a reader runs.
 
 Values are named by what determines them. A name is one of:
 
@@ -92,6 +106,13 @@ A difference becomes a **counterexample** only when both of these hold:
 - no primitive runs before the paths diverge. A primitive both paths ran may
   never succeed, or never take the branch they took after it (a `Random`
   with a zero bound always fails);
+- the difference is in the exit, the last result at exit, the final tracked
+  cells, or one trace having an event the other lacks. Two different events
+  at the same point are only possibly different: both may fail before doing
+  anything, as two `Random`s with a zero bound do. So are differences in what
+  a primitive or a called tree is handed (temps, scratch pointer, last
+  result, frame operands, inline arguments), since it may not read them, and
+  frame residue;
 - the differing values provably can differ.
 
 Anything else is `Inconclusive`. This includes extra or different reads,
@@ -134,8 +155,9 @@ reports which method decided (`EquivMethod`).
   reads in step. With `observe_last_result`, it also tracks whether the two
   sides' own results may differ (`EquivOptions::observe_last_result`).
 - Its proof is taken only when it covers everything live-output observes
-  (`lockstep_suffices`). It is not taken when frame residue is observed, when
-  the frames differ and a tree has a primitive, when a tree has more than 251
+  (`lockstep_suffices`). With silent steps off, lockstep matches every frame
+  write, so equal frames end with equal residue. It is not taken when the
+  frames differ in size and residue is observed or a tree has a primitive, when a tree has more than 251
   nodes or branches to 251 or 252, or when a called tree's argument count
   differs between the files. Nor is it taken when a path may read a local
   before writing it: lockstep folds `local[0] == local[0]` to `true`, but the
@@ -146,7 +168,9 @@ A lockstep counterexample is a divergence in the stricter
 all-accesses-observable trace. When live-output cannot decide, the result is
 `Inconclusive`, with the lockstep note attached, rather than "different".
 
-`sims-antics equiv` now uses this checker. So a mutated script whose tree
+`sims-antics equiv` now uses this checker, with each side's own callee
+argument counts: the compiled source's trees for A and the IFF's for B. A
+callee only one side defines has an unknown count on the other. So a mutated script whose tree
 live-output cannot bound comes out INCONCLUSIVE (still a non-zero exit), with
 the lockstep divergence named. One example is the open-pack toilet's motive
 loop. `tests/open_pack_household_sim.rs` now accepts that.
@@ -164,18 +188,20 @@ arities and BCON tables come from the chunks it resolves.
 | Resource | How it is compared |
 |---|---|
 | `BHAV` | Combined checker. Each side uses its own file's arities and BCONs, plus any `--with <file.iff>` arities. Identical bytes are `Identical` only when the tree's context matches too (BCONs it may read, callees' arities). A label difference is a difference: Run Tree By Name looks trees up by label (`sims-vm/src/program.rs:607`). An argument-count mismatch is a difference. Locals, format, revision and trailing bytes are notes. |
-| `STR#`, `CTSS`, `TTAs` | Parsed with the chunk's byte-order flag, then compared as the loader reads them. Version-0 tables load empty (0x4700d7). Length-prefixed strings get 0xa1 → `o` and 0xd5 → `'` (0x4700f5). Language-tagged tables must match language and text in order, and a change to or from that layout is `Inconclusive`. Layout version and comments are notes. A table that does not parse is `Inconclusive`. |
+| `STR#`, `CTSS`, `TTAs` | Parsed with the chunk's byte-order flag, then compared as the original's loader reads them. Version-0 tables load empty (0x4700d7). Length-prefixed strings get 0xa1 → `o` and 0xd5 → `'` (0x4700f5). Language-tagged tables must match language and text in order, and a change to or from that layout is `Inconclusive`. Layout version and comments are notes. A table that does not parse is `Inconclusive`. Every `STR#` is also compared as `sims-vm` loads it: its own parse, the language-1 entries in file order (`program.rs:615`) and by language runs (`loaded_order`, `program.rs:719`). When the two readings disagree about whether the tables match, in either direction, the result is `Inconclusive`. Primitives read these tables (Run Tree By Name #303, Change Suit, dialogs). |
 | `BCON` | Values must match; the flags byte is a note. |
 | `TPRP`, `TRCN` | Editor metadata, notes only. |
 | Everything else | Bytes must match. |
 
-Two more file problems make the verdict `Inconclusive`. One is a file whose
-resource map picks a different chunk for some `(type, id)` than `sims-vm`,
-which loads every chunk in file order so the last one wins
-(`program.rs:601`); duplicate or deleted chunks cause this. The other is a
-`STR#` #303 whose tree names, as `sims-vm` reads them for Run Tree By Name
-(`program.rs:615`), differ though the original loader reads the two tables
-alike. A version-0 table is the example: the loader reads it as empty.
+Two more file problems make the verdict `Inconclusive`:
+
+- A file whose resource map picks a different chunk for some `(type, id)`
+  than `sims-vm`, which loads every chunk in file order so the last one wins
+  (`program.rs:601`). Duplicate or deleted chunks cause this.
+- Duplicate chunks of any type that are not the same, copy for copy, in both
+  files. `sims-vm` parses every copy as it loads, so a malformed earlier copy
+  stops the load even when a later one would be kept.
+
 String tables are parsed even when their bytes match, so identical tables
 that do not parse are `Inconclusive` too.
 
@@ -187,8 +213,10 @@ may not be the ones the game loads). Otherwise it is Different if anything
 differs, otherwise Inconclusive if anything is undecided, otherwise
 Equivalent.
 
-With `--tree`, only that tree is compared. Its callees are assumed to behave
-the same; a whole-file run checks them as their own resources. The CLI exits 0, 1 or 2 for
+With `--tree`, the other trees are skipped but every other resource is still
+compared, since the tree may read constants, strings and tables. Its callees
+are assumed to behave the same; a whole-file run checks them as their own
+resources. The CLI exits 0, 1 or 2 for
 these, and with 2 on usage or I/O errors. The CLI flags are:
 
 - `--tree <id>`
@@ -196,15 +224,18 @@ these, and with 2 on usage or I/O errors. The CLI flags are:
 - `--my-attributes <n>` (at least 8)
 - `--ignore-scratch-pointer`
 - `--ignore-last-result` (also on `equiv`)
-- `--strict-frame-residue`
+- `--ignore-frame-residue` (also on `equiv`)
 - `--all`
 
 ## Policies and why
 
-- **Frame residue is not observed by default.** A frame's final locals do
-  become the next same-depth frame's initial locals (`interpreter.rs:1195`).
-  Scripts that read a local before writing it are rare, and lockstep ignores
-  residue too. `--strict-frame-residue` turns it on.
+- **Frame residue is observed by default.** A frame's final locals become
+  the next same-depth frame's initial locals (`interpreter.rs:1216`), and an
+  identical later reader can see what differs. A difference in it is only
+  ever `Inconclusive`. `--ignore-frame-residue`
+  (`LiveOptions::observe_frame_residue = false`) relaxes it for callers that
+  know no later frame reads a local first. Dead local writes are therefore
+  undecided by default.
 - **The scratch pointer is observed by default.** A dummy `Expression`
   placed before a primitive changes what a later Global 34 read sees. The
   Fridge tree and `return true;` both end in one `Expression`, so they agree.

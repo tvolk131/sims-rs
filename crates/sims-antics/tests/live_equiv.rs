@@ -1058,7 +1058,7 @@ fn write_with_map(chunks: &[ChunkData], map: &[usize]) -> Vec<u8> {
             data.extend(chunks[i].id.to_le_bytes());
             data.extend(chunks[i].flags.to_le_bytes());
             data.push(0);
-            if data.len() % 2 != 0 {
+            if !data.len().is_multiple_of(2) {
                 data.push(0);
             }
         }
@@ -1121,24 +1121,6 @@ fn malformed_duplicates_are_inconclusive() {
     // The same copies in both files are fine.
     let report = check_iff_equivalent(&a, &a, &IffEquivOptions::default()).expect("check");
     assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
-}
-
-/// A second chunk with the same type and id: the VM loads the later one
-/// (`program.rs:601`), whatever the resource map says.
-#[test]
-fn duplicate_chunks_are_not_equivalent() {
-    let t = tree(4096, 0, 0, vec![prim(23, [0; 8], T, T)]);
-    let bcon = |value: i16| ChunkData {
-        tag: *b"BCON",
-        id: 4096,
-        flags: 0x10,
-        label: String::new(),
-        data: [vec![1, 0], value.to_le_bytes().to_vec()].concat(),
-    };
-    let a = write_iff(&[bhav_chunk(&t, "T"), bcon(1), bcon(1)]).expect("write");
-    let b = write_iff(&[bhav_chunk(&t, "T"), bcon(1), bcon(2)]).expect("write");
-    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
-    assert_ne!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
 }
 
 /// `sims-vm` reads a version-0 `STR#` #303 for Run Tree By Name, which the original

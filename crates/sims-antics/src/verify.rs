@@ -5632,7 +5632,7 @@ fn lockstep_suffices(
 
 /// Checks two trees with the lockstep checker first and, when it cannot prove them
 /// equivalent, with the live-output checker, which also accepts trees that differ by
-/// pure reads, dummy nodes and dead frame writes.
+/// pure reads and dummy nodes (and dead frame writes, with frame residue ignored).
 ///
 /// Lockstep runs with silent steps off (so every `Expression` is matched, which keeps
 /// the scratch pointer and uninitialized-local reads in step) and, when `live` observes
