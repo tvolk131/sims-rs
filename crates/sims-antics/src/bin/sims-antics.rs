@@ -112,6 +112,12 @@ impl LiftSummary {
                 self.parse_errors
             )));
         }
+        if self.inconclusive > 0 {
+            eprintln!(
+                "warning: verify-equiv reported {} inconclusive tree(s)",
+                self.inconclusive
+            );
+        }
         if broken_pipe {
             return Err(CliError::BrokenPipe);
         }

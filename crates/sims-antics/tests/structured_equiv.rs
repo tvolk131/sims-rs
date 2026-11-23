@@ -241,13 +241,16 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                     }
                 }
                 StructuredLiftOutcome::UnsupportedOpcode(_) => unsupported_opcode += 1,
-                StructuredLiftOutcome::UnsupportedHeaderOrTarget => {
-                    unsupported_header_or_target += 1;
-                }
-                StructuredLiftOutcome::Unstructured => {
-                    unstructured += 1;
+                outcome @ (StructuredLiftOutcome::UnsupportedHeaderOrTarget
+                | StructuredLiftOutcome::Unstructured) => {
+                    if matches!(outcome, StructuredLiftOutcome::UnsupportedHeaderOrTarget) {
+                        unsupported_header_or_target += 1;
+                    } else {
+                        unstructured += 1;
+                    }
                     // Verify BOTH strict and relaxed decoded labeled-CFG `.air` compile cleanly
-                    // and prove Equivalent (protecting extended inline-call arguments!).
+                    // and prove Equivalent on ALL fallback trees (`Unstructured` AND
+                    // `UnsupportedHeaderOrTarget`, protecting extended inline-call arguments!).
                     for (mode_label, l_opts, counter) in [
                         ("labeled-cfg-strict", strict_lift, &mut labeled_cfg_verified),
                         (
@@ -307,13 +310,14 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
         }
     }
 
+    let total_fallbacks = unstructured + unsupported_header_or_target;
     eprintln!(
         "structured_equiv summary: total_bhavs={total_bhavs}, lifted_structured={lifted_structured} \
          (pure_zero_raw_op_strict={lifted_pure_high_level}, with_inline_raw_op_strict={lifted_with_inline_raw_op}, \
          pure_zero_raw_op_relaxed={lifted_relaxed_pure_high_level}), \
          verified_equivalent_strict={verified_equivalent}, verified_equivalent_relaxed={verified_relaxed_equivalent}, \
-         labeled_cfg_verified_strict={labeled_cfg_verified}/{unstructured}, \
-         labeled_cfg_verified_relaxed={labeled_cfg_relaxed_verified}/{unstructured}, \
+         labeled_cfg_verified_strict={labeled_cfg_verified}/{total_fallbacks}, \
+         labeled_cfg_verified_relaxed={labeled_cfg_relaxed_verified}/{total_fallbacks}, \
          inconclusive={inconclusive}, counterexamples={counterexamples}, compile_failures={compile_failures}, \
          unsupported_opcode={unsupported_opcode}, unsupported_header_or_target={unsupported_header_or_target}, \
          unstructured={unstructured}"
@@ -340,11 +344,11 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
         "every --relax-padding lifted structured BHAV must formally verify Equivalent"
     );
     assert_eq!(
-        labeled_cfg_verified, unstructured,
+        labeled_cfg_verified, total_fallbacks,
         "every strict decoded labeled-CFG fallback BHAV must formally verify Equivalent"
     );
     assert_eq!(
-        labeled_cfg_relaxed_verified, unstructured,
+        labeled_cfg_relaxed_verified, total_fallbacks,
         "every relaxed decoded labeled-CFG fallback BHAV must formally verify Equivalent"
     );
     assert_eq!(

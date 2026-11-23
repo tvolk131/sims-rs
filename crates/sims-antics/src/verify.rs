@@ -154,7 +154,7 @@ struct ObjectModel {
     behaviors: BTreeMap<u16, (String, Behavior)>,
     bcons: BTreeMap<u16, Vec<i16>>,
     strings: BTreeMap<u16, usize>,
-    tree_names_303: Vec<String>,
+    string_entries: BTreeMap<u16, Vec<String>>,
     ttas: BTreeMap<u16, usize>,
     ttabs: BTreeMap<u16, InteractionTable>,
     slots: BTreeMap<u16, usize>,
@@ -194,7 +194,7 @@ pub fn verify_iff_safety(name: &str, guid: u32, iff_bytes: &[u8]) -> Result<Safe
         behaviors: BTreeMap::new(),
         bcons: BTreeMap::new(),
         strings: BTreeMap::new(),
-        tree_names_303: Vec::new(),
+        string_entries: BTreeMap::new(),
         ttas: BTreeMap::new(),
         ttabs: BTreeMap::new(),
         slots: BTreeMap::new(),
@@ -254,10 +254,8 @@ pub fn verify_iff_safety(name: &str, guid: u32, iff_bytes: &[u8]) -> Result<Safe
                         .filter(|e| e.language == 0 || e.language == 1)
                         .map(|e| e.text.clone())
                         .collect();
-                    if chunk.id == 303 {
-                        model.tree_names_303 = en_entries.clone();
-                    }
                     model.strings.insert(chunk.id, en_entries.len());
+                    model.string_entries.insert(chunk.id, en_entries);
                 }
                 Err(e) => violations.push(SafetyViolation {
                     object: model.name.clone(),
@@ -1558,16 +1556,35 @@ fn verify_bhav_static(
                 Some((callee_name, callee)) => {
                     let callee_args = bhav_param_limit(callee);
                     let pass_temps = *ops == [0xFF; 8];
-                    if !pass_temps && callee_args > 4 {
-                        add_err(
-                            violations,
-                            SafetyCategory::ArityMismatch,
-                            idx,
-                            format!(
-                                "calls private BHAV #{} ('{callee_name}') requiring {callee_args} args via 4-arg inline operands",
-                                ins.opcode
-                            ),
-                        );
+                    if pass_temps {
+                        if callee_args > 8 {
+                            add_err(
+                                violations,
+                                SafetyCategory::ArityMismatch,
+                                idx,
+                                format!(
+                                    "calls private BHAV #{} ('{callee_name}') requiring {callee_args} args via 8-temp convention",
+                                    ins.opcode
+                                ),
+                            );
+                        }
+                    } else if callee_args > 4 {
+                        // Extended inline calls read `callee_args * 2` bytes across this
+                        // instruction's 8 operand bytes plus 12 bytes per following record
+                        // (`sims-vm/src/interpreter.rs:1548`).
+                        let avail_bytes = 8usize.saturating_add((n - 1 - idx).saturating_mul(12));
+                        if avail_bytes < callee_args * 2 {
+                            add_err(
+                                violations,
+                                SafetyCategory::ArityMismatch,
+                                idx,
+                                format!(
+                                    "calls private BHAV #{} ('{callee_name}') requiring {callee_args} inline args ({} bytes), but only {avail_bytes} bytes remain in BHAV",
+                                    ins.opcode,
+                                    callee_args * 2
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -1673,8 +1690,21 @@ enum SymWord {
     Unknown,
     Const(i16),
     InitialTarget,
-    /// Freshly created object (`CreateObject`), guaranteed distinct from `InitialTarget`.
+    /// Freshly created object (`CreateObject`) or proven-distinct object (`x != InitialTarget`).
     OtherObject,
+}
+
+impl SymWord {
+    /// Returns `true` whenever this symbolic object ID could alias `InitialTarget` at runtime.
+    /// Any positive literal ID (`Const(v)` with `v > 0`) could equal the target's runtime ID;
+    /// `Const(0)` / negative IDs and `OtherObject` can never alias `InitialTarget`.
+    fn may_alias_initial_target(self) -> bool {
+        match self {
+            Self::InitialTarget | Self::Unknown => true,
+            Self::Const(v) => v > 0,
+            Self::OtherObject => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1684,6 +1714,12 @@ struct SymFrame {
     stack_obj: SymWord,
     params: Vec<SymWord>,
     locals: Vec<SymWord>,
+    /// For `Run Tree By Name` mode 1 (which runs on the target's thread with target's temps,
+    /// `named_tree.rs:102`), saves the caller's temps to restore/join on return.
+    saved_caller_temps: Option<[SymWord; 8]>,
+    /// True when executing inside a synchronous `Run Tree By Name` (mode 0 or 1), where
+    /// yielding primitives trap (`named_tree.rs:33`).
+    synchronous: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1775,20 +1811,72 @@ fn resolve_named_tree_local(model: &ObjectModel, ops: &[u8; 8]) -> NamedTreeReso
     let Some(idx) = usize::from(ops[4]).checked_sub(1) else {
         return NamedTreeResolution::NoMatchFalse;
     };
-    let Some(name) = model.tree_names_303.get(idx).filter(|s| !s.is_empty()) else {
+    let Some(name) = model
+        .string_entries
+        .get(&303)
+        .and_then(|t| t.get(idx))
+        .filter(|s| !s.is_empty())
+    else {
         return NamedTreeResolution::NoMatchFalse;
     };
-    if let Some((&callee_id, _)) = model
+    // Match `sims-vm/src/program.rs:1236` (`Program::named_tree`):
+    // Exact name lookup checks the local library FIRST before semi-global/global, and traps
+    // on duplicates. Only a UNIQUE exact match in this object is guaranteed not to be shadowed
+    // by a semi-global or global exact match! A case-insensitive-only match may be shadowed.
+    let mut exact_matches = model
         .behaviors
         .iter()
-        .find(|(id, (label, _))| (4096..=8191).contains(*id) && label.eq_ignore_ascii_case(name))
-    {
-        NamedTreeResolution::Private(callee_id)
-    } else {
-        NamedTreeResolution::Unresolved(format!(
-            "Run Tree By Name '{name}' may resolve to a semi-global or global tree"
-        ))
+        .filter(|(_, (label, _))| label.as_str() == name.as_str());
+    if let Some((&callee_id, _)) = exact_matches.next() {
+        if exact_matches.next().is_some() {
+            return NamedTreeResolution::Unresolved(format!(
+                "duplicate local trees named '{name}' trap in Program::named_tree"
+            ));
+        }
+        return NamedTreeResolution::Private(callee_id);
     }
+    NamedTreeResolution::Unresolved(format!(
+        "Run Tree By Name '{name}' has no unique exact local match and may resolve to a semi-global or global tree"
+    ))
+}
+
+/// Collects parameter indices that may be mutated anywhere in the reachable instructions of `bhav`
+/// so lock discovery never uses stale caller-passed `initial_params` values.
+fn collect_mutated_params(bhav: &Behavior, reachable: &[bool]) -> BTreeSet<i16> {
+    let mut mutated = BTreeSet::new();
+    for (idx, ins) in bhav.instructions.iter().enumerate() {
+        if !reachable[idx] {
+            continue;
+        }
+        let ops = &ins.operands;
+        match ins.opcode {
+            0 | 17 => {
+                mutated.insert(word_i16(ops, 0));
+            }
+            2 => {
+                let op = ops[5];
+                if ops[6] == 9 && matches!(op, 3..=7 | 9..=13 | 17..=20) {
+                    mutated.insert(word_i16(ops, 0));
+                }
+            }
+            8 => {
+                if u16::from_le_bytes([ops[2], ops[3]]) == 9 {
+                    mutated.insert(word_i16(ops, 0));
+                }
+            }
+            26 if ops[2] & 4 == 0 && ops[4] == 9 => {
+                mutated.insert(word_i16(ops, 6));
+            }
+            31 if ops[4] & 0x80 != 0 && ops[5] == 9 => {
+                mutated.insert(i16::from(ops[7]));
+            }
+            44 if ops[5] & 0x20 == 0 => {
+                mutated.insert(0);
+            }
+            _ => {}
+        }
+    }
+    mutated
 }
 
 /// Collects scalar/bitmask lock acquires and releases reachable from `root_tree`
@@ -1812,13 +1900,19 @@ fn collect_tree_lock_ops(
     } else {
         reachable_nodes(&bhav.instructions)
     };
+    let mutated_params = collect_mutated_params(bhav, &reachable);
     let resolve_val = |scope: u8, idx: i16| -> Option<i16> {
         match scope {
             7 => Some(idx),
-            9 => match initial_params.get(idx as usize).copied() {
-                Some(SymWord::Const(v)) => Some(v),
-                _ => None,
-            },
+            9 => {
+                if mutated_params.contains(&idx) {
+                    return None;
+                }
+                match initial_params.get(idx as usize).copied() {
+                    Some(SymWord::Const(v)) => Some(v),
+                    _ => None,
+                }
+            }
             26 => lookup_bcon(model, idx),
             _ => None,
         }
@@ -2058,6 +2152,19 @@ fn verify_object_locks(model: &ObjectModel, violations: &mut Vec<SafetyViolation
         }
 
         if tracked_locks.is_empty() {
+            if ops.has_dynamic_call {
+                violations.push(SafetyViolation {
+                    object: model.name.clone(),
+                    tree_id: Some(action),
+                    tree_name: tree_name.clone(),
+                    category: SafetyCategory::InconclusiveProof,
+                    node: None,
+                    message:
+                        "reachable unresolved Run Tree By Name prevents complete lock safety proof"
+                            .to_owned(),
+                    path: Vec::new(),
+                });
+            }
             continue;
         }
 
@@ -2201,6 +2308,8 @@ fn prove_interaction_lock_safety(
             params: vec![SymWord::Unknown; bhav_param_limit(root_bhav).max(4)],
             // Frame locals can inherit nonzero values from prior frames (`interpreter.rs:1210`).
             locals: vec![SymWord::Unknown; bhav_local_limit(root_bhav)],
+            saved_caller_temps: None,
+            synchronous: false,
         }],
         temps: [SymWord::Unknown; 8],
         target_attrs: initial_attrs,
@@ -2266,7 +2375,18 @@ fn prove_interaction_lock_safety(
                             TARGET_FALSE => "return false",
                             _ => "error",
                         };
-                        next_state.frames.pop();
+                        let popped = next_state.frames.pop();
+                        // Returning from `Run Tree By Name` mode 1 (which runs on the target's
+                        // thread with target's temps, `named_tree.rs:102`): join saved caller
+                        // temps with callee temps so distinct caller/target never falsely inherits
+                        // callee temp writes, while same-thread aliasing is also preserved.
+                        if let Some(saved) = popped.and_then(|f| f.saved_caller_temps) {
+                            for (slot, orig) in next_state.temps.iter_mut().zip(saved) {
+                                if *slot != orig {
+                                    *slot = SymWord::Unknown;
+                                }
+                            }
+                        }
                         if next_state.frames.is_empty() {
                             // Top-level interaction exited: check EVERY acquired tracked lock!
                             for &lock in &next_state.acquired {
@@ -2343,8 +2463,7 @@ fn prove_interaction_lock_safety(
         };
         let apply_unknown_write = |next: &mut LockState, scope: u8, idx: i16| {
             let cur_stack_obj = next.frames.last().expect("frame").stack_obj;
-            let may_alias_initial =
-                matches!(cur_stack_obj, SymWord::InitialTarget | SymWord::Unknown);
+            let may_alias_initial = cur_stack_obj.may_alias_initial_target();
             if scope == 1 {
                 if may_alias_initial {
                     mark_attr_unknown_acquired(next, idx);
@@ -2401,8 +2520,7 @@ fn prove_interaction_lock_safety(
                     let mut next = state.clone();
                     let cur_stack_obj = next.frames.last().expect("frame").stack_obj;
                     let on_initial_target = cur_stack_obj == SymWord::InitialTarget;
-                    let may_alias_initial =
-                        matches!(cur_stack_obj, SymWord::InitialTarget | SymWord::Unknown);
+                    let may_alias_initial = cur_stack_obj.may_alias_initial_target();
 
                     // Resolve direct `stack.attr[lhs_idx]` (scope 1) or indirect `stack.attr[param[lhs_idx]]` (scope 22).
                     let resolved_target_attr = if may_alias_initial && lhs_scope == 1 {
@@ -2648,8 +2766,13 @@ fn prove_interaction_lock_safety(
                                 &mut queue,
                             )?;
                         } else {
-                            // Mode 1 passes target's temps (unknown); modes 0 & 2 pass caller's temps.
-                            let mut params = if ops[5] == 1 {
+                            // Mode 1 runs on target's thread with target's own temps (unknown),
+                            // preserving caller's temps on return; modes 0 & 1 are synchronous.
+                            let is_mode_1 = ops[5] == 1;
+                            let is_sync = ops[5] == 0
+                                || is_mode_1
+                                || state.frames.last().expect("frame").synchronous;
+                            let mut params = if is_mode_1 {
                                 vec![SymWord::Unknown; 8]
                             } else {
                                 state.temps.to_vec()
@@ -2667,12 +2790,21 @@ fn prove_interaction_lock_safety(
                             };
                             for entry_pc in entry_pcs {
                                 let mut next = state.clone();
+                                let saved_caller_temps = if is_mode_1 {
+                                    let saved = next.temps;
+                                    next.temps = [SymWord::Unknown; 8];
+                                    Some(saved)
+                                } else {
+                                    None
+                                };
                                 next.frames.push(SymFrame {
                                     tree_id: callee_id,
                                     pc: entry_pc,
                                     stack_obj: cur_stack_obj,
                                     params: params.clone(),
                                     locals: vec![SymWord::Unknown; bhav_local_limit(callee)],
+                                    saved_caller_temps,
+                                    synchronous: is_sync,
                                 });
                                 if visited.insert(next.clone()) {
                                     let mut next_trace = trace.clone();
@@ -2713,15 +2845,36 @@ fn prove_interaction_lock_safety(
                             &mut queue,
                         )?;
                     } else {
-                        let caller_stack_obj = state.frames.last().expect("frame").stack_obj;
+                        let caller_frame = state.frames.last().expect("frame");
+                        let caller_stack_obj = caller_frame.stack_obj;
+                        let caller_sync = caller_frame.synchronous;
+                        let needed = bhav_param_limit(callee).max(4);
                         let mut params = if *ops == [0xFF; 8] {
                             state.temps.to_vec()
-                        } else {
+                        } else if needed <= 4 {
                             (0..4)
                                 .map(|i| SymWord::Const(word_i16(ops, i * 2)))
                                 .collect()
+                        } else {
+                            let mut raw = Vec::with_capacity(needed * 2 + 12);
+                            raw.extend_from_slice(ops);
+                            for next_ins in bhav.instructions.iter().skip(usize::from(cur_pc) + 1) {
+                                if raw.len() >= needed * 2 {
+                                    break;
+                                }
+                                raw.extend_from_slice(&next_ins.opcode.to_le_bytes());
+                                raw.push(next_ins.on_true);
+                                raw.push(next_ins.on_false);
+                                raw.extend_from_slice(&next_ins.operands);
+                            }
+                            (0..needed)
+                                .map(|i| {
+                                    raw.get(i * 2..i * 2 + 2)
+                                        .map(|b| SymWord::Const(i16::from_le_bytes([b[0], b[1]])))
+                                        .unwrap_or(SymWord::Unknown)
+                                })
+                                .collect()
                         };
-                        let needed = bhav_param_limit(callee).max(4);
                         if params.len() < needed {
                             params.resize(needed, SymWord::Const(0));
                         }
@@ -2743,6 +2896,8 @@ fn prove_interaction_lock_safety(
                                 params: params.clone(),
                                 // Frame locals can inherit nonzero values from prior frames.
                                 locals: vec![SymWord::Unknown; bhav_local_limit(callee)],
+                                saved_caller_temps: None,
+                                synchronous: caller_sync,
                             });
                             if visited.insert(next.clone()) {
                                 let mut next_trace = trace.clone();
@@ -2836,20 +2991,26 @@ fn prove_interaction_lock_safety(
                     }
                     31 => {
                         // SetToNext writes dest (or stack_obj if bit 7 clear) on `true`;
-                        // on `false`, modes 1/3/5/7 write 0 while other modes preserve the cursor.
+                        // on `false`:
+                        // - modes 1/3/5/7 store `0` (`set_to_next.rs:14, 188, 203`)
+                        // - mode 4 stores `0` when GUID exists or keeps cursor when missing (`set_to_next.rs:230`),
+                        //   so `stack_obj` becomes `Unknown` (refuses release credit while still catching acquires!)
+                        // - other modes preserve the cursor.
                         let mode = ops[4];
                         let base = mode & 0x7F;
                         if mode & 0x80 != 0 {
                             let dst_scope = ops[5];
                             let dst_idx = i16::from(ops[7]);
                             apply_unknown_write(&mut next_true, dst_scope, dst_idx);
-                            if matches!(base, 1 | 3 | 5 | 7) {
+                            if matches!(base, 1 | 3 | 4 | 5 | 7) {
                                 apply_unknown_write(&mut next_false, dst_scope, dst_idx);
                             }
                         } else {
                             write_sym_operand(&mut next_true, 10, 0, SymWord::Unknown);
                             if matches!(base, 1 | 3 | 5 | 7) {
                                 write_sym_operand(&mut next_false, 10, 0, SymWord::Const(0));
+                            } else if base == 4 {
+                                write_sym_operand(&mut next_false, 10, 0, SymWord::Unknown);
                             }
                         }
                     }
@@ -3014,7 +3175,7 @@ fn primitive_may_trap_in_lock_prover(
     let check_param = |p: i16| p < 0 || (p as usize) >= frame.params.len();
     let check_local = |l: i16| l < 0 || (l as usize) >= frame.locals.len();
     match ins.opcode {
-        0 => check_param(word_i16(ops, 0)),
+        0 => frame.synchronous || check_param(word_i16(ops, 0)),
         6 => ops[1] != 1, // scope > 2 traps 0x2f; accessory lookup (0|2) can trap 0x2f/0x30
         7 => {
             let selector = word_i16(ops, 0);
@@ -3028,6 +3189,7 @@ fn primitive_may_trap_in_lock_prover(
                 || (ops[2] & 1 != 0)
                 || matches!(ops[0], 3 | 4)
         }
+        17 | 27 | 44 | 45 => frame.synchronous,
         23 | 48 => false,
         26 => true, // Relationship can trap on missing target/neighbor or unwritable destination
         29 => {
@@ -3042,9 +3204,19 @@ fn primitive_may_trap_in_lock_prover(
         }
         49 => frame.stack_obj != SymWord::InitialTarget,
         50 => {
+            // `action_string.rs:83-107`: traps if synchronous, if string is missing, or if
+            // `format_text` encounters any `$`-token that can trap (`$Family`, `$Local`, etc.).
+            if frame.synchronous {
+                return true;
+            }
             let table = u16::from_le_bytes([ops[0], ops[1]]);
-            let index = usize::from(ops[4]);
-            index == 0 || index > model.strings.get(&table).copied().unwrap_or(0)
+            let Some(idx) = usize::from(ops[4]).checked_sub(1) else {
+                return true;
+            };
+            match model.string_entries.get(&table).and_then(|t| t.get(idx)) {
+                Some(text) => text.contains('$'),
+                None => true,
+            }
         }
         _ => false,
     }
@@ -5675,6 +5847,262 @@ guard = "Guard"
             inv_order_report.is_ok(),
             "ManageInventory op 4 false branch must write count=0 then index=-1 to temp[0]: {:?}",
             inv_order_report.violations
+        );
+    }
+
+    #[test]
+    fn sol_wave1_r2_soundness_regressions() {
+        let base_manifest = r#"
+[object]
+name = "SolWave1R2Probe"
+guid = 0x50110002
+init = "Init"
+main = "Init"
+scripts = ["behavior.antics"]
+
+[[interaction]]
+name = "Use"
+action = "Action"
+guard = "Guard"
+"#;
+
+        // R2 P1-2: Mutated param[0] in private callee before scope(22, 0) Relationship read
+        // must NOT use stale initial param[0] = 0 during lock discovery!
+        let stale_param_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[1] != 0 { return false; }
+                return true;
+            }
+            tree 4099 "Helper" (args: 1) {
+                param[0] := 1;
+                relationship(column: 0, dir: 0, flags: 0, value: scope(22, 0));
+                return true;
+            }
+            tree 4097 "Action" {
+                call 4099(0, 0, 0, 0);
+                return true;
+            }
+        "#;
+        let stale_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", stale_param_script)])
+                .unwrap();
+        let stale_rep = verify_object_safety(&stale_obj).unwrap();
+        assert!(
+            stale_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::LockLeak),
+            "mutated param[0] + scope(22, 0) Relationship read must catch LockLeak on attr[1]: {:?}",
+            stale_rep.violations
+        );
+
+        // R2 P1-3 (case-insensitive shadowing & empty tracked lock set):
+        // Case-insensitive-only local match `cleanup` for STR# 303 `"Cleanup"` must return
+        // `InconclusiveProof` (could be shadowed by exact semi-global/global `"Cleanup"`!).
+        let ci_shadow_script = r#"
+            str 303 "TreeNames" { "Cleanup" }
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            tree 4099 "cleanup" {
+                stack.attr[0] := 0;
+                return true;
+            }
+            tree 4097 "Action" {
+                stack.attr[0] := 1;
+                run_tree_by_name(table: 303, index: 1, mode: 2);
+                return true;
+            }
+        "#;
+        let ci_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", ci_shadow_script)])
+                .unwrap();
+        let ci_rep = verify_object_safety(&ci_obj).unwrap();
+        assert!(
+            ci_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::InconclusiveProof),
+            "case-insensitive-only local match must return InconclusiveProof: {:?}",
+            ci_rep.violations
+        );
+
+        // Unresolved Run Tree By Name even when tracked_locks is empty must still report InconclusiveProof!
+        let empty_locks_dyn_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" { return true; }
+            tree 4097 "Action" {
+                run_tree_by_name(table: 303, index: 1, mode: 2, global: true);
+                return true;
+            }
+        "#;
+        let empty_dyn_obj = compile_object_from_sources(
+            base_manifest,
+            &[("behavior.antics", empty_locks_dyn_script)],
+        )
+        .unwrap();
+        let empty_dyn_rep = verify_object_safety(&empty_dyn_obj).unwrap();
+        assert!(
+            empty_dyn_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::InconclusiveProof),
+            "unresolved Run Tree By Name with empty tracked_locks must still report InconclusiveProof: {:?}",
+            empty_dyn_rep.violations
+        );
+
+        // R2 P1-4: Named-tree mode 1 runs on target's thread with target's own temps, so callee
+        // writing `temp[0] := 1` must NOT make prover assume caller sees `temp[0] == 1`!
+        let mode1_temps_script = r#"
+            str 303 "TreeNames" { "SetTargetTemp" }
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            tree 4099 "SetTargetTemp" {
+                temp[0] := 1;
+                return true;
+            }
+            tree 4097 "Action" {
+                stack.attr[0] := 1;
+                temp[0] := 0;
+                run_tree_by_name(table: 303, index: 1, mode: 1);
+                if temp[0] == 1 {
+                    stack.attr[0] := 0;
+                }
+                return true;
+            }
+        "#;
+        let mode1_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", mode1_temps_script)])
+                .unwrap();
+        let mode1_rep = verify_object_safety(&mode1_obj).unwrap();
+        assert!(
+            mode1_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::LockLeak),
+            "Run Tree By Name mode 1 writing target temp[0] must not credit caller's temp[0] == 1 unlock: {:?}",
+            mode1_rep.violations
+        );
+
+        // R2 P1-5: Literal positive `stack_obj := 1` may alias InitialTarget (runtime ID 1),
+        // so writing `stack.attr[0] := 1` after `stack_obj := 1` must catch LockLeak!
+        let lit_id_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            tree 4097 "Action" {
+                stack.attr[0] := 1;
+                stack.attr[0] := 0;
+                stack_obj := 1;
+                stack.attr[0] := 1;
+                return true;
+            }
+        "#;
+        let lit_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", lit_id_script)])
+                .unwrap();
+        let lit_rep = verify_object_safety(&lit_obj).unwrap();
+        assert!(
+            lit_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::LockLeak),
+            "literal stack_obj := 1 may alias InitialTarget and must catch LockLeak: {:?}",
+            lit_rep.violations
+        );
+
+        // R2 P1-6: SetToNext mode 4 false path can store `0` into `stack_obj`, so subsequent
+        // `stack.attr[0] := 0` must NOT be credited as releasing InitialTarget's lock!
+        let stn4_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            tree 4097 "Action" {
+                stack.attr[0] := 1;
+                if set_to_next(4, guid: 0x12345678) {
+                    return true;
+                } else {
+                    stack.attr[0] := 0;
+                    return false;
+                }
+            }
+        "#;
+        let stn4_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", stn4_script)])
+                .unwrap();
+        let stn4_rep = verify_object_safety(&stn4_obj).unwrap();
+        assert!(
+            stn4_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::LockLeak),
+            "SetToNext mode 4 false path stores 0 into stack_obj and must catch LockLeak: {:?}",
+            stn4_rep.violations
+        );
+
+        // R2 P1-7: ActionString with valid STR# index containing `$Family` traps during formatting
+        // and must be caught as LockLeak when called while holding a lock!
+        let act_str_script = r#"
+            str 300 "ActionStrings" { "Visit $Family" }
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            tree 4097 "Action" {
+                stack.attr[0] := 1;
+                action_string(table: 300, index: 1);
+                stack.attr[0] := 0;
+                return true;
+            }
+        "#;
+        let act_str_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", act_str_script)])
+                .unwrap();
+        let act_str_rep = verify_object_safety(&act_str_obj).unwrap();
+        assert!(
+            act_str_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::LockLeak),
+            "ActionString with $Family token must be modeled as trapping and catch LockLeak: {:?}",
+            act_str_rep.violations
+        );
+
+        // R2 P2-1: Valid 7-argument extended inline private call (with following record supplying
+        // remaining bytes) must NOT emit ArityMismatch!
+        let ext7_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" { return true; }
+            tree 4099 "SevenArgs" (format: 0x8002, args: 7) { return true; }
+            tree 4097 "Action" {
+                @n0:
+                call 4099(1, 2, 3, 4) -> true: @n1, false: false;
+                @n1:
+                notify_idle() -> true: true, false: true;
+            }
+        "#;
+        let ext7_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", ext7_script)])
+                .unwrap();
+        let ext7_rep = verify_object_safety(&ext7_obj).unwrap();
+        assert!(
+            !ext7_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::ArityMismatch),
+            "valid 7-arg extended inline call with following record must not fail ArityMismatch: {:?}",
+            ext7_rep.violations
         );
     }
 }

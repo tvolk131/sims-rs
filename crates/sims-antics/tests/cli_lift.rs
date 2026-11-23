@@ -1444,23 +1444,22 @@ fn lift_verify_equiv_ignores_stray_global_id_arity_in_object_iff() {
     let out = Command::new(cli_bin())
         .args(["lift"])
         .arg(&iff_path)
-        .args(["--tree", "4096", "--verify-equiv"])
+        .args(["--tree", "4096", "--relax-padding", "--verify-equiv"])
         .output()
         .expect("run lift --verify-equiv");
     assert!(
         out.status.success(),
-        "Inconclusive should exit 0 while reporting unknown callee arity;\nstderr: {}",
+        "unknown-arity global #300 must fall back to protected labeled-CFG and verify Equivalent;\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !stdout.contains("// verify-equiv: Equivalent"),
-        "must NOT report Equivalent when stray global #300 arity would mask trailing-suffix divergence:\n{stdout}"
+        stdout.contains("structured lift fallback"),
+        "must NOT trust stray global #300 arity=0 to structurally reorder nodes after call #300:\n{stdout}"
     );
     assert!(
-        stdout.contains("// verify-equiv: Inconclusive(")
-            && stdout.contains("unknown callee arity"),
-        "expected Inconclusive(unknown callee arity) comment:\n{stdout}"
+        stdout.contains("// verify-equiv: Equivalent"),
+        "protected labeled-CFG fallback must prove Equivalent:\n{stdout}"
     );
 
     // Conversely, a local BHAV #4097 (in 4096..=8191) declaring `args: 7` IS resolved

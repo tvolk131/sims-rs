@@ -1119,20 +1119,24 @@ pub fn lift_bhav_structured_with_arities(
     }
 
     // Protect layout-dependent extended (>4-arg) inline subroutine calls before reordering
-    // or pruning unreachable instruction records (`sims-vm/src/interpreter.rs:1548`).
+    // or pruning instruction records (`sims-vm/src/interpreter.rs:1548`).
+    // Any call with known `arity > 4` or with unknown arity in a multi-instruction tree
+    // can read raw bytes (opcode, branch bytes, operands) from following records even when
+    // those records are reachable as code, so fall back to labeled-CFG mode.
     for (idx, ins) in chunk.instructions.iter().enumerate() {
         if !reachable[idx] {
             continue;
         }
         if ins.opcode >= 256 && ins.operands != [0xFF; 8] {
             match callee_arities.and_then(|m| m.get(&ins.opcode).copied()) {
-                Some(arity) if arity > 4 => {
+                Some(arity) if arity <= 4 => {}
+                Some(_) => {
                     return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
                 }
-                None if idx + 1 < n && !reachable[idx + 1] => {
+                None if n > 1 => {
                     return StructuredLiftOutcome::UnsupportedHeaderOrTarget;
                 }
-                _ => {}
+                None => {}
             }
         }
     }
@@ -1990,6 +1994,35 @@ mod tests {
         );
         assert_eq!(
             lift_bhav_structured_with_arities(&orig, relaxed, None),
+            StructuredLiftOutcome::UnsupportedHeaderOrTarget
+        );
+
+        // 1b. Even when node 1 IS reachable (node 0 branches directly to node 1!), unknown-arity
+        //     structured lifting must still fall back so neither branch targets nor operands of
+        //     node 1 (which supply args 5-7!) can be rewritten.
+        let reachable_ext = BhavChunk {
+            instructions: vec![
+                Instruction {
+                    opcode: 4097,
+                    on_true: 1,
+                    on_false: 0xFF,
+                    operands: [1, 0, 2, 0, 3, 0, 4, 0],
+                },
+                Instruction {
+                    opcode: 49, // NotifyIdle, REACHABLE as code AND carries args 5..7 bytes!
+                    on_true: 0xFE,
+                    on_false: 0xFD,
+                    operands: [0x77, 0x00, 0, 0, 0, 0, 0, 0],
+                },
+            ],
+            ..orig.clone()
+        };
+        assert_eq!(
+            lift_bhav_structured_with_arities(&reachable_ext, LiftOptions::default(), None),
+            StructuredLiftOutcome::UnsupportedHeaderOrTarget
+        );
+        assert_eq!(
+            lift_bhav_structured_with_arities(&reachable_ext, relaxed, None),
             StructuredLiftOutcome::UnsupportedHeaderOrTarget
         );
 
