@@ -237,7 +237,17 @@ fn goth_downtown_house21_round_trip_and_community_edit_persistence() {
     assert_eq!(dt.world().budget.funds, home_funds_before - DOWNTOWN_FARE);
     assert_eq!(dt.world().globals[32], 0, "live community spending mode");
     assert_eq!(dt.world().globals[10], 21);
-    assert_eq!(dt.world().globals[9], 5);
+    // A solo arrival leaves global 9 at 0 and makes family 0 the traveler
+    // alone (0x4f1c87..0x4f1cec).
+    assert_eq!(dt.world().globals[9], 0);
+    assert_eq!(
+        dt.world()
+            .families
+            .iter()
+            .find(|f| f.id == 0)
+            .map(|f| f.members.clone()),
+        Some(vec![mortimer_guid])
+    );
     assert_eq!(session.travelers.len(), 1);
     assert_eq!(dt.lot_name(), "Goth Downtown Lounge");
     assert_eq!(dt.lot_description(), "Persisted community edit");
@@ -300,6 +310,7 @@ fn goth_downtown_house21_round_trip_and_community_edit_persistence() {
 
     // Tick Downtown lot 220 ticks cleanly.
     step_community(&mut dt, 220, "downtown house 21");
+    assert_on_lot(&dt, &session, "downtown house 21");
     let dt_mortimer_id = session.travelers[0].destination_object_id;
     let dt_motives_after = dt.world().objects[&dt_mortimer_id]
         .person
@@ -462,6 +473,7 @@ fn goth_vacation_house40_whole_family_hotel_checkin_round_trip() {
     }
 
     step_community(&mut vac, 220, "vacation house 40");
+    assert_on_lot(&vac, &session, "vacation house 40");
 
     let ret = return_from_destination(&root, &store, &session, &mut vac, &[3], Frames::default())
         .unwrap();
@@ -517,11 +529,25 @@ fn goth_studio_town_house81_round_trip() {
     assert_eq!(st.world().globals[10], 81);
 
     step_community(&mut st, 220, "studio town house 81");
+    assert_on_lot(&st, &session, "studio town house 81");
 
     let ret =
         return_from_destination(&root, &store, &session, &mut st, &[3], Frames::default()).unwrap();
     let mut home_after = ret.home_lot;
     step_strict(&mut home_after, 50, "goth home post-studio return");
+}
+
+/// Every traveler of `session` stands on `lot` (not at the off-lot
+/// position the person factory leaves, 0x440b2d).
+fn assert_on_lot(lot: &sims_vm::boot::Lot, session: &sims_vm::travel::TravelSession, label: &str) {
+    for traveler in &session.travelers {
+        let position = lot.world().objects[&traveler.destination_object_id].position;
+        assert!(
+            position[0] >= 0 && position[1] >= 0,
+            "{label}: traveler 0x{:08x} is off the lot at {position:?}",
+            traveler.guid
+        );
+    }
 }
 
 #[test]
@@ -568,6 +594,9 @@ fn goth_magic_town_house90_and_house93_round_trips() {
     assert_eq!(mt90.world().budget.funds, funds_before);
     // House 90 is zoned residential (1) in LotZoning.iff and ticks all 220 ticks in STRICT mode!
     step_strict(&mut mt90, 220, "magic town house 90");
+    // 0x4f1ae9 makes no arrival on a residential Magic Town lot, so the
+    // travelers keep the portal placement and stand on the lot.
+    assert_on_lot(&mt90, &session90, "magic town house 90");
 
     let ret90 = return_from_destination(
         &root,
@@ -596,6 +625,8 @@ fn goth_magic_town_house90_and_house93_round_trips() {
     assert_eq!(session93.fare_paid, MAGIC_BLIMP_FARE);
     assert_eq!(mt93.world().budget.funds, funds_before - MAGIC_BLIMP_FARE);
     step_community(&mut mt93, 220, "magic town house 93");
+    // The middle ped marker places the solo traveler.
+    assert_on_lot(&mt93, &session93, "magic town house 93");
 
     let ret93 = return_from_destination(
         &root,
@@ -696,6 +727,7 @@ fn goth_old_town_community_house58_and_atomicity_guards() {
     ));
 
     step_community(&mut ot, 220, "old town house 58");
+    assert_on_lot(&ot, &session, "old town house 58");
 
     // Return with a mismatched session fails cleanly without clearing destination origin.
     let mut bad_session = session.clone();

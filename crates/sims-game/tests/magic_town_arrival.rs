@@ -10,6 +10,13 @@
 //! every 21 ticks the marker put the first traveler beside it again,
 //! whatever the Sim was doing.
 //!
+//! The travelers are watched from their first tick on the lot. Each is
+//! made off the lot, as the person factory leaves it (0x4e9719 ->
+//! 0x440b2d), and the marker's placement is the one jump each makes. A
+//! traveler put beside the portal on arrival used to have its walk jump
+//! it back there after the marker placed it, and the marker never placed
+//! the household's first member, who already stood on the lot.
+//!
 //! Needs an install (`SIMS_INSTALL`); skipped otherwise.
 
 use sims_game::Frames;
@@ -20,11 +27,9 @@ use std::path::PathBuf;
 
 const MAGIC_PORTAL_GUID: u32 = 0x2baa_0029;
 const MIDDLE_PED_MARKER_GUID: u32 = 0x12e8_4823;
-/// Ticks the marker's arrival pass may take: it sleeps 20 ticks before
-/// placing anyone.
-const ARRIVAL: u32 = 60;
-/// Ticks watched after that. The old loop moved a traveler every 21.
-const WATCHED: u32 = 600;
+/// Ticks watched from the travelers' arrival. The marker sleeps 20 ticks
+/// before placing anyone; the old loop moved a traveler every 21.
+const WATCHED: u32 = 660;
 
 fn install_root() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
@@ -93,6 +98,16 @@ fn the_middle_ped_marker_places_an_arriving_family_once() {
     shell.enter_lot(5).expect("enter the Goth house");
     let game = shell.game_mut().expect("active lot");
     game.run(30);
+    let household: Vec<u32> = {
+        let world = game.lot().world();
+        let family = i32::from(world.globals[9]);
+        world
+            .families
+            .iter()
+            .find(|f| f.id == family)
+            .map(|f| f.members.clone())
+            .expect("the Goth household")
+    };
     place_and_queue_magic_hole(game);
     let mut picker = false;
     for _ in 0..800 {
@@ -125,11 +140,15 @@ fn the_middle_ped_marker_places_an_arriving_family_once() {
         world
             .objects
             .values()
-            .filter(|o| o.person.is_some() && o.position[0] >= 0)
+            .filter(|o| o.person.is_some() && household.contains(&o.guid))
             .map(|o| o.id)
             .collect()
     };
-    assert!(!travelers.is_empty(), "nobody arrived on lot 93");
+    assert_eq!(
+        travelers.len(),
+        household.len(),
+        "the whole household travels through the Magic Hole"
+    );
     let marker = game
         .lot()
         .world()
@@ -139,12 +158,20 @@ fn the_middle_ped_marker_places_an_arriving_family_once() {
         .map(|o| o.id)
         .expect("lot 93 has a middle ped marker");
 
-    assert_eq!(game.run(ARRIVAL), ARRIVAL, "lot 93 stopped advancing");
+    let arrived_on_lot: Vec<u16> = travelers
+        .iter()
+        .copied()
+        .filter(|id| game.lot().world().objects[id].position[0] >= 0)
+        .collect();
+    assert!(
+        arrived_on_lot.is_empty(),
+        "travelers {arrived_on_lot:?} arrived on the lot, not off it"
+    );
     let mut last: BTreeMap<u16, [i32; 3]> = travelers
         .iter()
         .map(|&id| (id, game.lot().world().objects[&id].position))
         .collect();
-    let mut jumps = Vec::new();
+    let mut jumps: BTreeMap<u16, Vec<String>> = BTreeMap::new();
     for _ in 0..WATCHED {
         // An unanswered dialog would stop the ticks without stopping the
         // lot, and the positions would stand still.
@@ -161,7 +188,10 @@ fn the_middle_ped_marker_places_an_arriving_family_once() {
             // than a tile and a half at once is a jump.
             let step = (now[0] - before[0]).abs().max((now[1] - before[1]).abs());
             if step > 24 || now[2] != before[2] {
-                jumps.push(format!("tick {tick}: Sim {id} {before:?} -> {now:?}"));
+                jumps
+                    .entry(id)
+                    .or_default()
+                    .push(format!("tick {tick}: Sim {id} {before:?} -> {now:?}"));
             }
         }
     }
@@ -176,9 +206,26 @@ fn the_middle_ped_marker_places_an_arriving_family_once() {
         .filter(|e| e.contains("Generic Sims Call"))
         .collect();
     assert!(generic.is_empty(), "caught: {generic:?}");
+    let off_lot: Vec<u16> = travelers
+        .iter()
+        .copied()
+        .filter(|id| world.objects[id].position[0] < 0)
+        .collect();
+    assert!(off_lot.is_empty(), "never placed on the lot: {off_lot:?}");
+    // Each traveler's one jump is the marker's placement.
+    let wrong: Vec<u16> = travelers
+        .iter()
+        .copied()
+        .filter(|id| jumps.get(id).map_or(0, Vec::len) != 1)
+        .collect();
     assert!(
-        jumps.is_empty(),
-        "travelers jumped after arrival:\n{}",
-        jumps.join("\n")
+        wrong.is_empty(),
+        "travelers {wrong:?} did not jump exactly once:\n{}",
+        jumps
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }

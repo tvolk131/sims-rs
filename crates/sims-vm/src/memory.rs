@@ -251,9 +251,15 @@ impl Machine<'_, '_> {
     ///   0x415fc6 and 0x4164f6 clear it and select family 0 (0x415fd7,
     ///   0x416509), 0x4278f6 clears it and leaves the pointer, and the
     ///   game's start and end set the pointer alone (0x415bd2, 0x415d21,
-    ///   0x415ecd). The World keeps no pointer, so field 1 with global 9 at
-    ///   0 fails loudly. A record of a GUID with no definition fails, as
-    ///   the original would read through a null pointer.
+    ///   0x415ecd). The World keeps no pointer. With global 9 at 0 the
+    ///   port reads family 0's members through `family_zero_members`: the
+    ///   interpreter's active family when it is given one, else the World's
+    ///   family numbered 0. That is the family a load with no family for
+    ///   the house selects (0x428041 at 0x42827c..0x4282b7) and a solo
+    ///   arrival fills with the traveler (0x4f1c87..0x4f1cec). With
+    ///   neither, field 1 fails loudly. A record of a GUID with no
+    ///   definition fails, as the original would read through a null
+    ///   pointer.
     /// - 2: the record's person data word 58.
     /// - 3 and 4: 0.
     /// - 6: the house of the first family, in the families' order, whose
@@ -306,19 +312,28 @@ impl Machine<'_, '_> {
             }
             1 => {
                 let selected = self.world.globals.get(9).copied().unwrap_or(0);
-                if selected == 0 {
-                    return Err(Trap::Unsupported(
-                        "scope 24 field 1 (0x425be2) with global 9 at 0: the selected family \
-                         (game +0x10) may be none or family 0, which is not kept"
-                            .into(),
-                    ));
-                }
-                let family = families
-                    .iter()
-                    .find(|f| f.id == i32::from(selected))
-                    .ok_or_else(|| {
-                        Trap::Invalid(format!("global 9 names family {selected}, which is gone"))
-                    })?;
+                // Global 9 at 0: family 0's members, as the doc above says.
+                let members = if selected == 0 {
+                    crate::person_factory::family_zero_members(self.active_family, self.world)
+                        .ok_or_else(|| {
+                            Trap::Unsupported(
+                                "scope 24 field 1 (0x425be2) with global 9 at 0 and no family \
+                                 0 kept: the selected family (game +0x10) is not known"
+                                    .into(),
+                            )
+                        })?
+                } else {
+                    families
+                        .iter()
+                        .find(|f| f.id == i32::from(selected))
+                        .ok_or_else(|| {
+                            Trap::Invalid(format!(
+                                "global 9 names family {selected}, which is gone"
+                            ))
+                        })?
+                        .members
+                        .clone()
+                };
                 if crate::interpreter::object_definition(self.catalog, self.world, record.guid)
                     .is_none()
                 {
@@ -328,7 +343,7 @@ impl Machine<'_, '_> {
                         record.guid
                     )));
                 }
-                i16::from(family.members.contains(&record.guid))
+                i16::from(members.contains(&record.guid))
             }
             2 => record.data[58],
             3 | 4 => 0,

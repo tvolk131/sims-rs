@@ -493,6 +493,23 @@ fn residential(program: &Program, world: &World) -> bool {
     lot == 0 || program.zoning.get(&lot) == Some(&1)
 }
 
+/// The members of the family the game holds (`game +0x10`) when global 9
+/// is 0: `active`, the interpreter's [`Interpreter::active_family`], when
+/// it is given; otherwise the family numbered 0, the one the lot load picks
+/// when no family lives on the lot (0x428041 at 0x42827c..0x4282b7, which
+/// writes that family's number, 0, to global 9 at 0x42830d). `None` when the
+/// World holds no family 0, as before a neighborhood is read.
+pub(crate) fn family_zero_members(active: Option<&[u32]>, world: &World) -> Option<Vec<u32>> {
+    if let Some(members) = active {
+        return Some(members.to_vec());
+    }
+    world
+        .families
+        .iter()
+        .find(|f| f.id == 0)
+        .map(|f| f.members.clone())
+}
+
 /// The visitor pass (0x42a2b4): see [`Interpreter::visitor_pass`].
 pub(crate) fn visitor_pass(
     program: &Program,
@@ -504,14 +521,14 @@ pub(crate) fn visitor_pass(
     }
     let family = i32::from(world.globals.get(9).copied().unwrap_or(0));
     let members: Vec<u32> = if family == 0 {
-        let Some(members) = active_family else {
+        let Some(members) = family_zero_members(active_family, world) else {
             return Err(Trap::Unsupported(
                 "0x42a2b4: the visitor pass with global 9 at 0: which family the game holds \
                  (game +0x10) is not kept"
                     .into(),
             ));
         };
-        members.to_vec()
+        members
     } else {
         world
             .families

@@ -1630,7 +1630,16 @@ impl Interpreter<'_> {
             // `0x445501` (`0x4455e8..0x4456e3`): when the active family
             // (`game + 0x10`) has zero members (an unoccupied lot), scanning
             // for a replacement Sim returns NULL without changing selection.
-            None => self.active_family != Some(&[]),
+            None => match self.active_family {
+                Some(members) => !members.is_empty(),
+                // With global 9 at 0 the game holds the family numbered 0
+                // (0x428041 at 0x42827c..0x42830d), which the World keeps.
+                None if world.globals.get(9).copied().unwrap_or(0) == 0 => {
+                    crate::person_factory::family_zero_members(None, world)
+                        .is_none_or(|members| !members.is_empty())
+                }
+                None => true,
+            },
             Some(sim) => {
                 let visitor = world
                     .objects

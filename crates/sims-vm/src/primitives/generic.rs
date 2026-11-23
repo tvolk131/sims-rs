@@ -284,7 +284,9 @@ impl Machine<'_, '_> {
     fn controlled_family_first_member(&self, routine: u16) -> Result<(i16, Option<u32>), Trap> {
         let family_id = self.world.globals.get(9).copied().unwrap_or(0);
         let first_guid = if family_id == 0 {
-            let Some(members) = self.active_family else {
+            let Some(members) =
+                crate::person_factory::family_zero_members(self.active_family, self.world)
+            else {
                 return Err(Trap::Unsupported(format!(
                     "Generic Sims Call {routine} with global 9 at 0: which family the game holds \
                      (game +0x10) is not kept"

@@ -109,7 +109,11 @@ const TRAVEL_ENVELOPE_MAGIC: &[u8; 4] = b"TRVL";
 ///   layout unchanged. A build that keeps them by GUID refuses it, rather
 ///   than reading it and writing it back in GUID order
 ///   (`docs/decisions/20261123-made-types-order-format-bumps.md`).
-const TRAVEL_ENVELOPE_VERSION: u32 = 3;
+/// - Version 4: the payload is followed by the trip's [`ArrivalFamily`],
+///   which decides the family the destination's game holds. A build that
+///   does not know it refuses the trip. Versions 1 to 3 are still read, and
+///   their arrival family is worked out ([`ArrivalFamily::derived`]).
+const TRAVEL_ENVELOPE_VERSION: u32 = 4;
 /// The oldest envelope version still read; the payload is the same.
 const OLDEST_TRAVEL_ENVELOPE_VERSION: u32 = 1;
 /// The first version whose date departure wrote the companion's token.
@@ -117,6 +121,8 @@ const COMPANION_TOKEN_ENVELOPE_VERSION: u32 = 2;
 /// The first version whose baseline keeps made types in the order made. An
 /// older one reads them back in GUID order, as its build wrote them.
 const MADE_ORDER_ENVELOPE_VERSION: u32 = 3;
+/// The first version that records the trip's [`ArrivalFamily`].
+const ARRIVAL_FAMILY_ENVELOPE_VERSION: u32 = 4;
 
 static NEXT_TRIP_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -359,6 +365,127 @@ impl TravelTransport {
             Self::StudioLimo => STUDIO_LIMO_FARE,
             Self::MagicHole => MAGIC_HOLE_FARE,
             Self::MagicBlimp => MAGIC_BLIMP_FARE,
+        }
+    }
+}
+
+/// The family the destination's game holds (`game +0x10`), and so who the
+/// middle ped marker brings onto the lot.
+///
+/// Generic Sims Call 17 (0x450660 → 0x45a22d) asks for a trip one of two
+/// ways (temp 3): mode 0 names the traveler (0x4fc713 with the person's
+/// GUID and family 0), mode 1 the traveler's family (0x4fc713 with GUID 0
+/// and the family's number). 0x4fc59b turns that into the flags 0x4f1ae9
+/// reads once the destination is loaded (0x428041):
+///
+/// - [`Self::Solo`] (flag +0x140, or +0x142 on Studio Town): the family
+///   numbered 0 is emptied and given the traveler (0x410a41 → 0x4d3fe6,
+///   0x410849), so the traveler is its member 0. Global 9 stays 0, the
+///   family the load picked (0x42827c..0x428317); the funds become the
+///   traveler's own family's (0x4f1cc0..0x4f1ce7). Downtown always takes
+///   this path (0x4fc5f2..0x4fc606).
+/// - [`Self::Family`] (flag +0x141): the game holds the traveler's family
+///   and global 9 becomes its number (0x4f2211..0x4f222b).
+///
+/// 0x4f1ae9 dispatches on the house once the load is done: Downtown 21–30
+/// runs the solo path at 0x4f1c87 when +0x140 is set; Studio Town 81–89
+/// runs it at 0x4f1e12 when +0x142 is set; Vacation 40–49, zoning 2 and
+/// Magic Town 93–99 (0x4f1f82..0x4f1fac) run the solo path at 0x4f2060 for
+/// +0x140 or the family path at 0x4f21bd for +0x141. Any other house,
+/// Magic Town's residential 90–92 among them, gets no arrival
+/// (0x4f1fa2 → 0x4f23e3), so a trip there is [`Self::Group`].
+///
+/// Either way each traveler is made by the person factory (0x4e9719 →
+/// 0x440b2d), which leaves it off the lot: nothing places it until the
+/// middle ped marker's Find Location does. A date's companion is not made
+/// by 0x4f1ae9 at all; the marker's Generic Sims Call 19 makes it from the
+/// leader's token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArrivalFamily {
+    /// Mode 0: the traveler alone, in family 0.
+    Solo,
+    /// Mode 1: the traveler's whole family.
+    Family,
+    /// A trip with no native arrival: [`TravelParty::HouseholdGroup`],
+    /// which no native mode asks for, or a destination 0x4f1ae9 makes no
+    /// arrival on (Magic Town's residential 90–92). The game holds the
+    /// traveler's family, as in [`Self::Family`], and the travelers are put
+    /// beside the arrival portal as before this type existed.
+    Group,
+}
+
+/// Whether 0x4f1ae9 makes an arrival on `house` of `destination`, given the
+/// neighborhood's lot zoning: every destination but a Magic Town lot below
+/// 93 that is not zoned community. 0x4f1f9d takes zoning 2 to the arrival
+/// before the lot-number check at 0x4f1fa2 (93–99 only), and anything else
+/// falls through to 0x4f23e3.
+fn has_native_arrival(
+    destination: TravelDestination,
+    house: u32,
+    zoning: &BTreeMap<i16, i32>,
+) -> bool {
+    let community = i16::try_from(house)
+        .ok()
+        .and_then(|lot| zoning.get(&lot))
+        .is_some_and(|&zone| zone == 2);
+    !(destination == TravelDestination::MagicTown && house < 93 && !community)
+}
+
+impl ArrivalFamily {
+    /// The arrival family of a departure of `party` to `house` of
+    /// `destination`, with the neighborhood's lot `zoning`.
+    #[must_use]
+    pub fn of(
+        party: &TravelParty,
+        destination: TravelDestination,
+        house: u32,
+        zoning: &BTreeMap<i16, i32>,
+    ) -> Self {
+        if !has_native_arrival(destination, house, zoning) {
+            return Self::Group;
+        }
+        match party {
+            TravelParty::Single { .. } | TravelParty::Date { .. } => Self::Solo,
+            TravelParty::WholeFamily { .. } => Self::Family,
+            TravelParty::HouseholdGroup { .. } => Self::Group,
+        }
+    }
+
+    /// The arrival family of a trip written before envelope version 4,
+    /// which did not record it. The destination decides where the travel
+    /// plan allowed one party only: Downtown and Studio Town take a single
+    /// traveler or a date ([`Self::Solo`]), Vacation Island and Old Town a
+    /// whole family ([`Self::Family`]), and Magic Town's residential lots
+    /// have no native arrival ([`Self::Group`]). On Magic Town's community
+    /// lots it is worked out from who traveled: [`Self::Solo`] for a date or
+    /// a lone traveler from a household of more than one, [`Self::Family`]
+    /// when every member of the household traveled, and [`Self::Group`]
+    /// otherwise. There a household of one that traveled alone could have
+    /// been either a single traveler or a whole family; it is taken as the
+    /// family, and the two differ only in whether global 9 names it.
+    fn derived(
+        destination: TravelDestination,
+        house: u32,
+        zoning: &BTreeMap<i16, i32>,
+        is_date: bool,
+        travelers: &[u32],
+        household: &[u32],
+    ) -> Self {
+        if !has_native_arrival(destination, house, zoning) {
+            return Self::Group;
+        }
+        match destination {
+            TravelDestination::Downtown | TravelDestination::StudioTown => return Self::Solo,
+            TravelDestination::VacationIsland | TravelDestination::OldTown => return Self::Family,
+            TravelDestination::MagicTown => {}
+        }
+        let traveled = |guid: &u32| travelers.contains(guid);
+        if is_date || (travelers.len() == 1 && household.len() > 1) {
+            Self::Solo
+        } else if !household.is_empty() && household.iter().all(traveled) {
+            Self::Family
+        } else {
+            Self::Group
         }
     }
 }
@@ -1371,6 +1498,35 @@ struct PersistedTravelRecord {
     /// payload; the header holds it). A trip written again keeps it.
     #[serde(skip)]
     version: u32,
+    /// The trip's arrival family, written after the payload from version 4
+    /// on; `None` for an older trip.
+    #[serde(skip)]
+    arrival: Option<ArrivalFamily>,
+}
+
+impl PersistedTravelRecord {
+    /// The trip's arrival family: [`ArrivalFamily::Group`] where 0x4f1ae9
+    /// makes no arrival, whatever was recorded; else the recorded one, or
+    /// for a trip from before version 4 the one [`ArrivalFamily::derived`]
+    /// works out from the household's members (`household`). `zoning` is
+    /// the neighborhood's lot zoning.
+    fn arrival_family(&self, household: &[u32], zoning: &BTreeMap<i16, i32>) -> ArrivalFamily {
+        let (destination, house) = (self.session.destination, self.session.destination_house);
+        if !has_native_arrival(destination, house, zoning) {
+            return ArrivalFamily::Group;
+        }
+        self.arrival.unwrap_or_else(|| {
+            let travelers: Vec<u32> = self.session.travelers.iter().map(|t| t.guid).collect();
+            ArrivalFamily::derived(
+                destination,
+                house,
+                zoning,
+                self.is_date,
+                &travelers,
+                household,
+            )
+        })
+    }
 }
 
 fn mix64(mut x: u64) -> u64 {
@@ -1434,10 +1590,21 @@ fn is_travel_envelope(bytes: &[u8]) -> bool {
 fn encode_travel_envelope(record: &PersistedTravelRecord) -> Result<Vec<u8>, TravelError> {
     let payload = postcard::to_allocvec(record)
         .map_err(|e| TravelError::Lot(format!("encoding active travel envelope: {e}")))?;
-    let mut out = Vec::with_capacity(8 + payload.len());
+    let mut out = Vec::with_capacity(9 + payload.len());
     out.extend_from_slice(TRAVEL_ENVELOPE_MAGIC);
     out.extend_from_slice(&record.version.to_le_bytes());
     out.extend_from_slice(&payload);
+    if record.version >= ARRIVAL_FAMILY_ENVELOPE_VERSION {
+        let arrival = record.arrival.ok_or_else(|| {
+            TravelError::Lot(format!(
+                "a version {} travel envelope needs the trip's arrival family",
+                record.version
+            ))
+        })?;
+        let tail = postcard::to_allocvec(&arrival)
+            .map_err(|e| TravelError::Lot(format!("encoding active travel envelope: {e}")))?;
+        out.extend_from_slice(&tail);
+    }
     Ok(out)
 }
 
@@ -1454,8 +1621,14 @@ fn decode_travel_envelope(bytes: &[u8]) -> Result<PersistedTravelRecord, TravelE
              {OLDEST_TRAVEL_ENVELOPE_VERSION} to {TRAVEL_ENVELOPE_VERSION})"
         )));
     }
-    let (mut record, rest) = postcard::take_from_bytes::<PersistedTravelRecord>(&bytes[8..])
+    let (mut record, mut rest) = postcard::take_from_bytes::<PersistedTravelRecord>(&bytes[8..])
         .map_err(|e| TravelError::SessionMismatch(format!("corrupt travel envelope: {e}")))?;
+    if version >= ARRIVAL_FAMILY_ENVELOPE_VERSION {
+        let (arrival, after) = postcard::take_from_bytes::<ArrivalFamily>(rest)
+            .map_err(|e| TravelError::SessionMismatch(format!("corrupt travel envelope: {e}")))?;
+        record.arrival = Some(arrival);
+        rest = after;
+    }
     if !rest.is_empty() {
         return Err(TravelError::SessionMismatch(format!(
             "corrupt travel envelope: {} trailing byte(s)",
@@ -1765,6 +1938,12 @@ pub fn depart_to_destination(
         home_family,
     );
     let is_date = matches!(request.party, TravelParty::Date { .. });
+    let arrival = ArrivalFamily::of(
+        &request.party,
+        plan.destination,
+        request.destination_house,
+        &staged_stored.zoning,
+    );
 
     // Boot destination lot in memory BEFORE committing REDB, so any destination
     // boot/injection failure rolls back cleanly with zero REDB/home mutations.
@@ -1783,6 +1962,7 @@ pub fn depart_to_destination(
         plan.accommodation,
         plan.leader_guid,
         is_date,
+        arrival,
         request.view_centre,
         &request.answers,
         request.frames.clone(),
@@ -1832,6 +2012,7 @@ pub fn depart_to_destination(
         departure_snapshots: snapshots,
         frozen_home_bytes,
         version: TRAVEL_ENVELOPE_VERSION,
+        arrival: Some(arrival),
     })?;
     let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
         neighborhood_id,
@@ -1999,6 +2180,14 @@ pub fn resume_active_trip(
         persisted.session.home_family,
     );
 
+    let household = home_snapshot
+        .neighborhood
+        .families
+        .get(&persisted.session.home_family)
+        .map(|f| f.members.clone())
+        .unwrap_or_default();
+    let arrival = persisted.arrival_family(&household, &home_snapshot.neighborhood.zoning);
+
     let runtime = StoreRuntime::from_snapshot(
         install_root,
         home_snapshot.neighborhood.clone(),
@@ -2014,6 +2203,7 @@ pub fn resume_active_trip(
         persisted.session.accommodation,
         persisted.session.leader_guid,
         persisted.is_date,
+        arrival,
         persisted.view_centre,
         answers,
         frames,
@@ -2778,9 +2968,11 @@ pub fn return_from_destination(
             destination_lot.load.house, session.destination_house
         )));
     }
-    if destination_lot.load.family != session.home_family {
+    // A solo arrival holds family 0 ([`ArrivalFamily::Solo`]); which one the
+    // trip asked for is checked once its envelope is read.
+    if destination_lot.load.family != session.home_family && destination_lot.load.family != 0 {
         return Err(TravelError::SessionMismatch(format!(
-            "destination lot active family is {}, session expects family {}",
+            "destination lot active family is {}, session expects family {} or 0",
             destination_lot.load.family, session.home_family
         )));
     }
@@ -2832,6 +3024,23 @@ pub fn return_from_destination(
         return Err(TravelError::SessionMismatch(format!(
             "stale or mismatched travel session (trip {:032x} vs active trip {:032x})",
             session.trip_id, persisted.trip_id
+        )));
+    }
+    let household = home_snapshot
+        .neighborhood
+        .families
+        .get(&session.home_family)
+        .map(|f| f.members.clone())
+        .unwrap_or_default();
+    let expected_family =
+        match persisted.arrival_family(&household, &home_snapshot.neighborhood.zoning) {
+            ArrivalFamily::Solo => 0,
+            ArrivalFamily::Family | ArrivalFamily::Group => session.home_family,
+        };
+    if destination_lot.load.family != expected_family {
+        return Err(TravelError::SessionMismatch(format!(
+            "destination lot active family is {}, the trip's arrival holds family {}",
+            destination_lot.load.family, expected_family
         )));
     }
 
@@ -3755,6 +3964,7 @@ fn boot_destination_lot(
     accommodation: VacationAccommodation,
     leader_guid: u32,
     is_date: bool,
+    arrival: ArrivalFamily,
     requested_view_centre: Option<[i8; 2]>,
     answers: &[u8],
     frames: Frames,
@@ -3780,11 +3990,19 @@ fn boot_destination_lot(
         .transpose()
         .map_err(|e| TravelError::Lot(e.to_string()))?
         .flatten();
-    let family_members = stored
+    let household = stored
         .families
         .get(&home_family)
         .map(|f| f.members.clone())
         .unwrap_or_default();
+    // The family the load picks (0x428041 → 0x425d95): the traveler's
+    // family on a family arrival, which the port names as it loads, and on a
+    // solo arrival the family numbered 0, which 0x4f1ae9 fills only after
+    // the load ([`hold_family_zero`]).
+    let (loaded_family, loaded_members) = match arrival {
+        ArrivalFamily::Solo => (0, Vec::new()),
+        ArrivalFamily::Family | ArrivalFamily::Group => (home_family, household.clone()),
+    };
 
     let (
         mut world,
@@ -3805,14 +4023,21 @@ fn boot_destination_lot(
         &stored,
         neighborhood_id,
         dest_house,
-        home_family,
+        loaded_family,
         arrival_funds,
         family_magic,
-        &family_members,
+        &loaded_members,
         requested_view_centre,
         saved_lot,
         base_house,
     )?;
+    let family_members = match arrival {
+        ArrivalFamily::Solo => {
+            hold_family_zero(&mut world, leader_guid, arrival_funds)?;
+            vec![leader_guid]
+        }
+        ArrivalFamily::Family | ArrivalFamily::Group => household.clone(),
+    };
 
     // Unpause and configure live away-from-home play.
     if let Some(slot) = world.globals.get_mut(GLOBAL_BUDGET_MODE) {
@@ -3852,7 +4077,17 @@ fn boot_destination_lot(
         }
     }
 
-    // Inject traveling party near the destination's arrival portal/curb.
+    // Make the travelers. On a family arrival 0x4f1ae9 makes them in the
+    // order of the family's members (0x4f2253..0x4f235c).
+    let mut ordered: Vec<&LiveTravelerSnapshot> = snapshots.iter().collect();
+    if arrival == ArrivalFamily::Family {
+        ordered.sort_by_key(|snap| {
+            household
+                .iter()
+                .position(|&guid| guid == snap.guid)
+                .unwrap_or(usize::MAX)
+        });
+    }
     let (traveler_records, leader_id, counted) = {
         let interpreter = Interpreter {
             view_rotation,
@@ -3866,7 +4101,7 @@ fn boot_destination_lot(
         let mut leader_obj_id = None;
         let mut used_tiles = BTreeSet::new();
 
-        for snap in snapshots {
+        for snap in ordered {
             let mut matching: Vec<u16> = world
                 .people
                 .iter()
@@ -3908,9 +4143,10 @@ fn boot_destination_lot(
                     })?;
                 (id, false)
             };
-            // The traveler comes onto the lot with its fame, so a famous Sim
-            // that is not selected gets its star as it is placed (0x447a57 ->
-            // 0x447a82). Its date link is written after placement.
+            // The traveler carries its fame, so a famous Sim that is not
+            // selected gets its star when it is placed (0x447a57 ->
+            // 0x447a82), here or by the middle ped marker. Its date link is
+            // written after selection.
             let saved_fame = snap
                 .person_data
                 .get(PERSON_FAME_LEVEL)
@@ -3928,15 +4164,21 @@ fn boot_destination_lot(
                     *d = 0;
                 }
             }
-            let tile_pos = find_free_arrival_position(
-                &interpreter,
-                &mut world,
-                person_id,
-                anchor,
-                &used_tiles,
-            )?;
-            used_tiles.insert([tile_pos[0].div_euclid(16), tile_pos[1].div_euclid(16)]);
-            place_person_on_tile(&interpreter, &mut world, person_id, tile_pos)?;
+            // The person factory leaves a traveler off the lot (0x4e9719 →
+            // 0x440b2d), and so does the port's reuse above; the middle ped
+            // marker's Find Location places it. Only a household group, which
+            // no native mode makes, is still put beside the arrival portal.
+            if arrival == ArrivalFamily::Group {
+                let tile_pos = find_free_arrival_position(
+                    &interpreter,
+                    &mut world,
+                    person_id,
+                    anchor,
+                    &used_tiles,
+                )?;
+                used_tiles.insert([tile_pos[0].div_euclid(16), tile_pos[1].div_euclid(16)]);
+                place_person_on_tile(&interpreter, &mut world, person_id, tile_pos)?;
+            }
             if reused {
                 interpreter
                     .reset_person_after_purge(&mut world, person_id)
@@ -4451,6 +4693,25 @@ fn reconcile_frozen_home_lot(
 /// Ensures `world.budget.days[0]` is `Some([0; 8])` so native `Alter Budget`
 /// (`primitives/budget.rs::spend`) never fails on a lot whose base `SIMI`
 /// stored an empty budget history.
+/// A solo arrival's family 0 (0x4f1c87..0x4f1cec): the family numbered 0
+/// is emptied and given the traveler (0x410a41 → 0x4d3fe6, 0x410849), so
+/// the traveler is its member 0, the one the middle ped marker's Generic
+/// Sims Call 18 names (0x4e97dc(0)). The funds become the traveler's own
+/// family's (0x4f1cc0..0x4f1ce7, 0x46d8dc with that family's +0x118), not
+/// the 0 the load gave family 0 (0x428328..0x42833b). Global 9 stays 0.
+fn hold_family_zero(world: &mut World, traveler: u32, funds: i32) -> Result<(), TravelError> {
+    let family = world
+        .families
+        .iter_mut()
+        .find(|f| f.id == 0)
+        .ok_or_else(|| TravelError::Lot("the destination has no family 0".into()))?;
+    family.members.clear();
+    family.members.push(traveler);
+    world
+        .set_funds(funds)
+        .map_err(|e| TravelError::Lot(e.to_string()))
+}
+
 fn ensure_today_budget_slot(world: &mut World) {
     if world.budget.days.is_empty() {
         world.budget.days = vec![Some([0; 8]); 6];
@@ -5502,8 +5763,8 @@ mod tests {
     use sims_sim::neighbors::{Neighbor, PERSON_WORDS};
 
     /// A trip's baseline keeps its made types in the order made (envelope
-    /// version 3); an envelope of an older version reads them in GUID
-    /// order.
+    /// version 3 on); an envelope of an older version reads them in GUID
+    /// order. Version 4 adds the arrival family after the payload.
     #[test]
     fn a_trip_envelope_keeps_made_types_in_the_order_made() {
         let made = |guid: u32, file: i32| {
@@ -5559,6 +5820,7 @@ mod tests {
             departure_snapshots: vec![],
             frozen_home_bytes: vec![],
             version: TRAVEL_ENVELOPE_VERSION,
+            arrival: Some(ArrivalFamily::Solo),
         };
         let keys = |record: &PersistedTravelRecord| {
             record
@@ -5571,10 +5833,18 @@ mod tests {
         };
 
         let mut bytes = encode_travel_envelope(&record).unwrap();
-        assert_eq!(bytes[4..8], 3u32.to_le_bytes());
+        assert_eq!(bytes[4..8], 4u32.to_le_bytes());
         let now = decode_travel_envelope(&bytes).unwrap();
         assert_eq!(keys(&now), [0x0005_7000, 0x0005_1000]);
-        assert_eq!(now.version, 3);
+        assert_eq!(now.version, 4);
+        assert_eq!(now.arrival, Some(ArrivalFamily::Solo));
+
+        // Versions before 4 have no arrival family after the payload.
+        bytes.pop();
+        bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+        let v3 = decode_travel_envelope(&bytes).unwrap();
+        assert_eq!(keys(&v3), [0x0005_7000, 0x0005_1000]);
+        assert_eq!(v3.arrival, None);
 
         for old in [1u32, 2] {
             bytes[4..8].copy_from_slice(&old.to_le_bytes());
@@ -6238,10 +6508,27 @@ mod tests {
             dt_mortimer_id as i16
         );
 
-        // The famous companion is not selected: placing it on the lot put a
-        // pooled star over its head (0x447a57 -> 0x447a82). The leader is
-        // selected and has none.
+        // The famous companion is not selected: placing it on the lot puts a
+        // pooled star over its head (0x447a57 -> 0x447a82). The person
+        // factory leaves it off the lot (0x4e9719 -> 0x440b2d), so the star
+        // comes when the middle ped marker places it. The leader is selected
+        // and has none.
         assert!(!dt.world.objects[&dt_companion_id].selected);
+        let on_lot = |dt: &crate::boot::Lot, id: u16| {
+            let position = dt.world.objects[&id].position;
+            position[0] >= 0 && position[1] >= 0
+        };
+        assert!(!on_lot(&dt, dt_companion_id));
+        for _ in 0..220 {
+            if on_lot(&dt, dt_companion_id) && on_lot(&dt, dt_mortimer_id) {
+                break;
+            }
+            dt.step_play().unwrap();
+        }
+        assert!(
+            on_lot(&dt, dt_companion_id),
+            "the marker places the companion"
+        );
         let star_over = |id: u16| {
             dt.world.objects.values().any(|o| {
                 o.guid == crate::placement::STAR_MARKER
@@ -6946,6 +7233,8 @@ mod tests {
         let mut envelope = snapshot.saved_lot.clone().unwrap();
         assert_eq!(envelope[4..8], TRAVEL_ENVELOPE_VERSION.to_le_bytes());
         envelope[4..8].copy_from_slice(&1u32.to_le_bytes());
+        // Version 1 had no arrival family after the payload.
+        envelope.pop();
         store
             .save_lot_and_neighborhood_checked(
                 "UserData",
@@ -6965,5 +7254,156 @@ mod tests {
             1,
             "the abort took the leader's own token"
         );
+    }
+
+    /// Magic Town's residential lots get no native arrival, so a trip there
+    /// keeps the portal placement.
+    #[test]
+    fn a_departure_asks_for_its_destinations_arrival() {
+        use TravelDestination::{Downtown, MagicTown};
+        let single = TravelParty::Single { sim_guid: 1 };
+        let family = TravelParty::WholeFamily { leader_guid: 1 };
+        let residential = BTreeMap::from([(90, 1), (92, 1)]);
+        let of =
+            |party, destination, house| ArrivalFamily::of(party, destination, house, &residential);
+        assert_eq!(of(&single, Downtown, 21), ArrivalFamily::Solo);
+        assert_eq!(of(&single, MagicTown, 93), ArrivalFamily::Solo);
+        assert_eq!(of(&family, MagicTown, 93), ArrivalFamily::Family);
+        assert_eq!(of(&single, MagicTown, 90), ArrivalFamily::Group);
+        assert_eq!(of(&family, MagicTown, 92), ArrivalFamily::Group);
+        // A lot below 93 zoned community takes the arrival (0x4f1f9d).
+        let community = BTreeMap::from([(90, 2)]);
+        assert_eq!(
+            ArrivalFamily::of(&single, MagicTown, 90, &community),
+            ArrivalFamily::Solo
+        );
+    }
+
+    /// A trip written before envelope version 4 recorded no arrival
+    /// family; it is worked out from who traveled.
+    #[test]
+    fn a_trip_from_before_version_4_derives_its_arrival_family() {
+        use ArrivalFamily::{Family, Group, Solo};
+        use TravelDestination::{Downtown, MagicTown, OldTown, StudioTown, VacationIsland};
+        let household = [1, 2, 3];
+        let zoning = BTreeMap::from([(90, 1)]);
+        let derived = |destination, house, is_date, travelers: &[u32], household: &[u32]| {
+            ArrivalFamily::derived(destination, house, &zoning, is_date, travelers, household)
+        };
+        // Magic Town's community lots: from who traveled.
+        assert_eq!(derived(MagicTown, 93, true, &[1, 9], &household), Solo);
+        assert_eq!(derived(MagicTown, 93, false, &[2], &household), Solo);
+        assert_eq!(
+            derived(MagicTown, 93, false, &[3, 1, 2], &household),
+            Family
+        );
+        assert_eq!(derived(MagicTown, 93, false, &[1, 2], &household), Group);
+        assert_eq!(derived(MagicTown, 93, false, &[1], &[1]), Family);
+        // Magic Town's residential lots have no native arrival.
+        assert_eq!(derived(MagicTown, 90, false, &[2], &household), Group);
+        // The destination decides where the plan allows one party.
+        assert_eq!(derived(Downtown, 21, false, &[1], &[1]), Solo);
+        assert_eq!(derived(StudioTown, 81, false, &[1], &[1]), Solo);
+        assert_eq!(
+            derived(VacationIsland, 40, false, &[1, 2], &household),
+            Family
+        );
+        assert_eq!(derived(OldTown, 58, false, &[1], &household), Family);
+    }
+
+    /// The departure records the arrival family after the payload
+    /// (version 4), and a resumed trip, whether written as version 4 or
+    /// rewritten as version 3, holds the solo traveler's family 0 with
+    /// global 9 at 0 (0x4f1c87..0x4f1cec).
+    #[test]
+    fn a_resumed_solo_trip_keeps_its_arrival_family() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let db_path = std::env::temp_dir().join(format!(
+            "sims-vm-travel-arrival-family-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        struct Guard(PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _guard = Guard(db_path.clone());
+
+        let store = NeighborhoodStore::open(&db_path).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let (goth_family, goth) = nh.family_in(5).unwrap();
+        let (goth_members, goth_budget) = (goth.members.clone(), goth.budget);
+        let traveler = goth_members[1];
+        let mut home =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        let departed = depart_to_destination(
+            &root,
+            &store,
+            "UserData",
+            &mut home,
+            &TravelRequest::downtown(21, traveler),
+        )
+        .unwrap();
+        let fare = departed.session.fare_paid;
+        drop(departed);
+
+        let check = |label: &str| {
+            let resumed =
+                resume_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+            let world = &resumed.destination_lot.world;
+            assert_eq!(world.globals[9], 0, "{label}: global 9");
+            let family_zero = world.families.iter().find(|f| f.id == 0).unwrap();
+            assert_eq!(family_zero.members, vec![traveler], "{label}: family 0");
+            assert_eq!(world.budget.funds, goth_budget - fare, "{label}: funds");
+            assert_eq!(
+                resumed.session.home_family, goth_family,
+                "{label}: home family"
+            );
+            resumed
+        };
+        let snapshot = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
+        let envelope = snapshot.saved_lot.clone().unwrap();
+        assert_eq!(envelope[4..8], TRAVEL_ENVELOPE_VERSION.to_le_bytes());
+        let record = decode_travel_envelope(&envelope).unwrap();
+        assert_eq!(record.arrival, Some(ArrivalFamily::Solo));
+        drop(check("version 4"));
+
+        let mut older = envelope;
+        older[4..8].copy_from_slice(&3u32.to_le_bytes());
+        older.pop();
+        store
+            .save_lot_and_neighborhood_checked(
+                "UserData",
+                5,
+                None,
+                &older,
+                &snapshot.neighborhood,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode_travel_envelope(&older).unwrap().arrival, None);
+        let mut resumed = check("version 3");
+        // The return checks the destination's family against the same
+        // derived arrival, and the funds come home.
+        let returned = return_from_destination(
+            &root,
+            &store,
+            &resumed.session,
+            &mut resumed.destination_lot,
+            &[3],
+            Frames::default(),
+        )
+        .unwrap();
+        assert_eq!(returned.home_lot.world.globals[9], goth_family as i16);
+        assert_eq!(returned.home_lot.world.budget.funds, goth_budget - fare);
     }
 }
