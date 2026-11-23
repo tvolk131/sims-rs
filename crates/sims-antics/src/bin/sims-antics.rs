@@ -7,15 +7,15 @@
 //! - `sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]`
-//! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--verify-equiv]`
+//! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]`
 //! - `sims-antics build <pack_dir> --out <dir>`
 
 use sims_antics::{
     EquivOptions, EquivResult, LiftOptions, StructuredLiftOutcome,
     check_bhav_equivalent_with_arities, compile_air, compile_pack_dir, compile_standalone_pack_dir,
-    compile_v2_object_file, expand_v2_to_air,
-    lift::{format_bhav_labeled_air_with_arities, format_bhav_raw_air, lift_bhav},
-    lift_bhav_structured_with_arities,
+    compile_v2_object_file, expand_v2_to_air, extract_lift_symbols_from_iff,
+    lift::{format_bhav_labeled_air_with_context, format_bhav_raw_air, lift_bhav},
+    lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
     v2::is_v2_source,
     verify::{extract_bhav_arities_from_iff, extract_bhav_from_iff},
     verify_object_safety, verify_pack_safety,
@@ -141,7 +141,7 @@ fn print_usage() {
          sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]\n  \
-         sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--verify-equiv]   (lifts to .air Antics IR)\n  \
+         sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>"
     );
 }
@@ -432,6 +432,11 @@ fn emit_lifted_bhavs<W: Write>(
     let mut local_arities = extract_bhav_arities_from_iff(&iff.bytes).unwrap_or_default();
     local_arities.retain(|&id, _| (4096..=8191).contains(&id));
     let arities = Some(local_arities);
+    let symbols = if lift_opts.annotate_comments {
+        Some(extract_lift_symbols_from_iff(iff))
+    } else {
+        None
+    };
 
     let mut summary = LiftSummary::default();
     let mut broken_pipe = false;
@@ -488,7 +493,8 @@ fn emit_lifted_bhavs<W: Write>(
             continue;
         }
 
-        let outcome = lift_bhav_structured_with_arities(&bhav, lift_opts, arities.as_ref());
+        let outcome =
+            lift_bhav_structured_with_context(&bhav, lift_opts, arities.as_ref(), symbols.as_ref());
         let emitted_src = match outcome {
             StructuredLiftOutcome::Lifted(src) => {
                 write_or_break!(out.writeln_str(&format!(
@@ -509,8 +515,12 @@ fn emit_lifted_bhavs<W: Write>(
                     bhav.id,
                     sanitize_single_line(&bhav.label)
                 )));
-                let labeled_src =
-                    format_bhav_labeled_air_with_arities(&bhav, lift_opts, arities.as_ref());
+                let labeled_src = format_bhav_labeled_air_with_context(
+                    &bhav,
+                    lift_opts,
+                    arities.as_ref(),
+                    symbols.as_ref(),
+                );
                 write_or_break!(out.write_str(&labeled_src));
                 if !labeled_src.ends_with('\n') {
                     write_or_break!(out.writeln_str(""));
@@ -589,6 +599,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     let mut filter: Option<String> = None;
     let mut raw = false;
     let mut relax_padding = false;
+    let mut no_comments = false;
     let mut verify_equiv = false;
     let mut end_of_flags = false;
 
@@ -655,6 +666,11 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
                         i += 1;
                         continue;
                     }
+                    "--no-comments" => {
+                        no_comments = true;
+                        i += 1;
+                        continue;
+                    }
                     "--verify-equiv" => {
                         verify_equiv = true;
                         i += 1;
@@ -707,6 +723,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     }
     let lift_opts = LiftOptions {
         strict_padding: !relax_padding,
+        annotate_comments: !no_comments,
     };
 
     let safe_input_path = sanitize_path_display(&input_path);
@@ -845,9 +862,13 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
             let safe_name = sanitize_single_line(&chunk.label);
             match lift_bhav(chunk.id, &chunk.label, iff.data(chunk)) {
                 Ok(bhav) => {
+                    let list_opts = LiftOptions {
+                        strict_padding: lift_opts.strict_padding,
+                        annotate_comments: false,
+                    };
                     let status = match lift_bhav_structured_with_arities(
                         &bhav,
-                        lift_opts,
+                        list_opts,
                         Some(&local_arities),
                     ) {
                         StructuredLiftOutcome::Lifted(src) => {

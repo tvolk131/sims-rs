@@ -12,9 +12,9 @@
 
 use sims_antics::{
     EquivOptions, EquivResult, LiftOptions, StructuredLiftOutcome,
-    check_bhav_equivalent_with_arities, compile_antics,
-    lift::{format_bhav_labeled_air_with_arities, lift_bhav},
-    lift_bhav_structured_with_arities,
+    check_bhav_equivalent_with_arities, compile_antics, extract_lift_symbols_from_iff,
+    lift::{format_bhav_labeled_air_with_context, lift_bhav},
+    lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
 };
 use sims_content::{ArchivePool, Catalog, Index, Install};
 use sims_formats::behavior::Behavior;
@@ -75,9 +75,13 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
     let mut lifted_with_inline_raw_op = 0usize;
     let mut lifted_relaxed_pure_high_level = 0usize;
     let mut verified_equivalent = 0usize;
+    let mut verified_annotated_equivalent = 0usize;
     let mut verified_relaxed_equivalent = 0usize;
     let mut labeled_cfg_verified = 0usize;
     let mut labeled_cfg_relaxed_verified = 0usize;
+    let mut fridges_total = 0usize;
+    let mut fridges_structured = 0usize;
+    let mut fridges_pure_relaxed = 0usize;
     let mut inconclusive = 0usize;
     let mut counterexamples = 0usize;
     let mut unsupported_opcode = 0usize;
@@ -90,9 +94,15 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
     let opts = EquivOptions::default();
     let strict_lift = LiftOptions {
         strict_padding: true,
+        annotate_comments: false,
+    };
+    let annotated_lift = LiftOptions {
+        strict_padding: true,
+        annotate_comments: true,
     };
     let relaxed_lift = LiftOptions {
         strict_padding: false,
+        annotate_comments: false,
     };
 
     for (resource_index, resource) in index.resources.iter().enumerate() {
@@ -125,6 +135,12 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
             iff_arities.extend(collect_iff_arities_in_range(&iff, 8192, u16::MAX));
         }
 
+        let is_fridges = name
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|base| base.eq_ignore_ascii_case("Fridges.iff"));
+        let lift_symbols = extract_lift_symbols_from_iff(&iff);
+
         for chunk in &iff.chunks {
             if chunk.flags & DELETED != 0 || &chunk.tag != b"BHAV" {
                 continue;
@@ -137,10 +153,16 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                 continue;
             };
             total_bhavs += 1;
+            if is_fridges {
+                fridges_total += 1;
+            }
 
             match lift_bhav_structured_with_arities(&bhav, strict_lift, Some(&iff_arities)) {
                 StructuredLiftOutcome::Lifted(source_text) => {
                     lifted_structured += 1;
+                    if is_fridges {
+                        fridges_structured += 1;
+                    }
                     if source_text.contains("op 0x") {
                         lifted_with_inline_raw_op += 1;
                     } else {
@@ -148,11 +170,11 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                     }
                     let compiled = match compile_antics(&source_text) {
                         Ok(m) => m,
-                        Err(_) => {
+                        Err(e) => {
                             compile_failures += 1;
                             if first_compile_failure_meta.is_none() {
                                 first_compile_failure_meta = Some(format!(
-                                    "resource_index={resource_index} BHAV #{} (strict compile_failure)",
+                                    "resource_index={resource_index} BHAV #{} (strict compile_failure: {e})",
                                     chunk.id
                                 ));
                             }
@@ -188,12 +210,53 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                         }
                     }
 
+                    // Verify comment-annotated `.air` (`annotate_comments: true`) parses & proves Equivalent!
+                    if let StructuredLiftOutcome::Lifted(ann_src) =
+                        lift_bhav_structured_with_context(
+                            &bhav,
+                            annotated_lift,
+                            Some(&iff_arities),
+                            Some(&lift_symbols),
+                        )
+                    {
+                        match compile_antics(&ann_src) {
+                            Ok(m) => {
+                                let re_ann = &m.behaviors[&chunk.id];
+                                if matches!(
+                                    check_bhav_equivalent_with_arities(
+                                        &bhav,
+                                        re_ann,
+                                        &opts,
+                                        Some(&iff_arities),
+                                    ),
+                                    EquivResult::Equivalent { .. }
+                                ) {
+                                    verified_annotated_equivalent += 1;
+                                } else {
+                                    counterexamples += 1;
+                                }
+                            }
+                            Err(e) => {
+                                compile_failures += 1;
+                                if first_compile_failure_meta.is_none() {
+                                    first_compile_failure_meta = Some(format!(
+                                        "resource_index={resource_index} BHAV #{} (annotated compile_failure: {e})",
+                                        chunk.id
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     // Also verify `--relax-padding` (`strict_padding: false`) compiles & proves Equivalent.
                     if let StructuredLiftOutcome::Lifted(relaxed_src) =
                         lift_bhav_structured_with_arities(&bhav, relaxed_lift, Some(&iff_arities))
                     {
                         if !relaxed_src.contains("op 0x") {
                             lifted_relaxed_pure_high_level += 1;
+                            if is_fridges {
+                                fridges_pure_relaxed += 1;
+                            }
                         }
                         match compile_antics(&relaxed_src) {
                             Ok(m) => {
@@ -252,15 +315,23 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                     // and prove Equivalent on ALL fallback trees (`Unstructured` AND
                     // `UnsupportedHeaderOrTarget`, protecting extended inline-call arguments!).
                     for (mode_label, l_opts, counter) in [
-                        ("labeled-cfg-strict", strict_lift, &mut labeled_cfg_verified),
+                        (
+                            "labeled-cfg-strict",
+                            annotated_lift,
+                            &mut labeled_cfg_verified,
+                        ),
                         (
                             "labeled-cfg-relaxed",
                             relaxed_lift,
                             &mut labeled_cfg_relaxed_verified,
                         ),
                     ] {
-                        let labeled_src =
-                            format_bhav_labeled_air_with_arities(&bhav, l_opts, Some(&iff_arities));
+                        let labeled_src = format_bhav_labeled_air_with_context(
+                            &bhav,
+                            l_opts,
+                            Some(&iff_arities),
+                            Some(&lift_symbols),
+                        );
                         match compile_antics(&labeled_src) {
                             Ok(m) => {
                                 let re_labeled = &m.behaviors[&chunk.id];
@@ -315,9 +386,11 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
         "structured_equiv summary: total_bhavs={total_bhavs}, lifted_structured={lifted_structured} \
          (pure_zero_raw_op_strict={lifted_pure_high_level}, with_inline_raw_op_strict={lifted_with_inline_raw_op}, \
          pure_zero_raw_op_relaxed={lifted_relaxed_pure_high_level}), \
-         verified_equivalent_strict={verified_equivalent}, verified_equivalent_relaxed={verified_relaxed_equivalent}, \
+         verified_equivalent_strict={verified_equivalent}, verified_annotated_equivalent={verified_annotated_equivalent}, \
+         verified_equivalent_relaxed={verified_relaxed_equivalent}, \
          labeled_cfg_verified_strict={labeled_cfg_verified}/{total_fallbacks}, \
          labeled_cfg_verified_relaxed={labeled_cfg_relaxed_verified}/{total_fallbacks}, \
+         fridges_catalog={fridges_structured}/{fridges_total} (pure_relaxed={fridges_pure_relaxed}), \
          inconclusive={inconclusive}, counterexamples={counterexamples}, compile_failures={compile_failures}, \
          unsupported_opcode={unsupported_opcode}, unsupported_header_or_target={unsupported_header_or_target}, \
          unstructured={unstructured}"
@@ -328,16 +401,25 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
         "expected Complete Collection corpus (>=28k BHAVs), got {total_bhavs}"
     );
     assert!(
-        verified_equivalent >= 20_000,
-        "expected >=20,000 real BHAVs formally verified Equivalent from structured .air, got {verified_equivalent}"
+        verified_equivalent >= 27_000,
+        "expected >=27,000 real BHAVs formally verified Equivalent from structured .air, got {verified_equivalent}"
     );
     assert_eq!(
         inconclusive, 0,
         "expected 0 inconclusive proofs among lifted BHAVs, got {inconclusive}"
     );
     assert_eq!(
+        compile_failures, 0,
+        "high-level structured lifter produced uncompilable .antics: {:?}",
+        first_compile_failure_meta
+    );
+    assert_eq!(
         verified_equivalent, lifted_structured,
         "every cleanly lifted structured BHAV must formally verify Equivalent"
+    );
+    assert_eq!(
+        verified_annotated_equivalent, lifted_structured,
+        "every comment-annotated structured BHAV must compile and formally verify Equivalent"
     );
     assert_eq!(
         verified_relaxed_equivalent, lifted_structured,
@@ -350,11 +432,6 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
     assert_eq!(
         labeled_cfg_relaxed_verified, total_fallbacks,
         "every relaxed decoded labeled-CFG fallback BHAV must formally verify Equivalent"
-    );
-    assert_eq!(
-        compile_failures, 0,
-        "high-level structured lifter produced uncompilable .antics: {:?}",
-        first_compile_failure_meta
     );
     assert_eq!(
         counterexamples, 0,
