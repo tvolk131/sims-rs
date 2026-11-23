@@ -19,6 +19,10 @@
 //! Photos arrive only from Camera Mode, by clicking the lot (`cWinCamera`).
 //! The album itself has no capture or blank-page button: `STR# 144` lists
 //! only Done, Delete, First, Previous, Next and Last.
+//!
+//! The native layout has no thumbnail strip. The well between Previous and
+//! Next holds the shown photo's caption, editable, and written back to the
+//! photo on navigating and on Done (`cWinScrapbook`'s `+0xf8` text control).
 
 use crate::art::Art;
 use crate::dialog::{BACKGROUND, BUTTON, CARET_BLINK_US, draw_nine_slice};
@@ -95,11 +99,6 @@ const DIALOG_FALLBACK_BG: [u8; 3] = [24, 34, 112];
 const DIALOG_FALLBACK_BORDER: [u8; 3] = [96, 132, 224];
 const PHOTO_MATTE_BG: [u8; 3] = [8, 12, 34];
 const PHOTO_MATTE_BORDER: [u8; 3] = [110, 144, 224];
-const STRIP_BG: [u8; 3] = [12, 20, 74];
-const STRIP_BORDER: [u8; 3] = [66, 96, 176];
-const THUMB_BG: [u8; 3] = [18, 28, 88];
-const THUMB_SELECTED_BORDER: [u8; 3] = [0, 255, 255];
-const THUMB_HOVER_BORDER: [u8; 3] = [210, 228, 255];
 const CONFIRM_BG: [u8; 3] = [56, 24, 36];
 const CONFIRM_BORDER: [u8; 3] = [228, 128, 128];
 
@@ -121,8 +120,6 @@ pub struct AlbumEntry {
     pub caption: String,
     /// Full-size photo bitmap (drawn aspect-preserving inside the viewport).
     pub image: Option<Image>,
-    /// Optional pre-scaled thumbnail bitmap; falls back to scaling `image`.
-    pub thumbnail: Option<Image>,
     /// Optional in-game day number when the photo was taken.
     pub sim_day: Option<u32>,
 }
@@ -331,9 +328,6 @@ enum ControlId {
     Done,
     TitleBox,
     CaptionBox,
-    StripPrev,
-    StripNext,
-    Thumbnail(PhotoId),
 }
 
 /// Computed layout rectangles for a given viewport size.
@@ -361,10 +355,6 @@ pub struct AlbumLayout {
     pub btn_prev: Rect,
     pub btn_next: Rect,
     pub btn_last: Rect,
-    pub strip_box: Rect,
-    pub strip_prev: Rect,
-    pub strip_next: Rect,
-    pub thumb_slots: Vec<Rect>,
 }
 
 /// Interactive Photo Album / Family Storybook modal controller.
@@ -381,8 +371,6 @@ pub struct PhotoAlbumDialog {
     caption_scroll_line: usize,
     dirty: bool,
     focus: Option<EditFocus>,
-    /// Horizontal scroll offset (first visible index) in the thumbnail strip.
-    strip_scroll: usize,
     /// Entry awaiting inline delete confirmation, if any.
     pending_delete: Option<PhotoId>,
     /// Pointer state for hover tooltips and press-bound clicks.
@@ -413,7 +401,6 @@ impl PhotoAlbumDialog {
             caption_scroll_line: 0,
             dirty: false,
             focus: None,
-            strip_scroll: 0,
             pending_delete: None,
             pointer: None,
             hovered: None,
@@ -455,7 +442,7 @@ impl PhotoAlbumDialog {
 
     /// Forgets the last opening's dialog state: no selection (the first
     /// photo is chosen on the next sync, unless [`Self::show_index`]
-    /// picks one), no draft, and the strip at its start. Native builds a
+    /// picks one) and no draft. Native builds a
     /// new `cWinScrapbook` for every opening (`0x4d2100`, `0x503e9e` →
     /// `0x52a4c9`, which zeroes the dialog's own state). The photo it
     /// shows is not the dialog's: see [`Self::show_index`].
@@ -468,36 +455,28 @@ impl PhotoAlbumDialog {
         self.caption_scroll_line = 0;
         self.dirty = false;
         self.pending_delete = None;
-        self.strip_scroll = 0;
     }
 
-    /// Shows the photo at `index` (clamped to the last), scrolling the
-    /// strip just far enough to show it. Native's current photo belongs to
-    /// the household's album object, which outlives the dialog
-    /// (`0x4108e4` keeps it on the family at `+0x148`): `0x52b119` reads
-    /// its index (`+0x10`) when the dialog opens. The strip is ours (native
-    /// has none), so it only follows the selection.
-    pub fn show_index(&mut self, snapshot: &AlbumSnapshot, index: usize, visible_slots: usize) {
-        let total = snapshot.entries.len();
-        let Some(entry) = total
+    /// Shows the photo at `index`, clamped to the last. Native's current
+    /// photo belongs to the household's album object, which outlives the
+    /// dialog (`0x4108e4` keeps it on the family at `+0x148`): `0x52b119`
+    /// reads its index (`+0x10`) when the dialog opens, and after a delete
+    /// `0x4ee087` keeps the index, clamped to the new last photo.
+    pub fn show_index(&mut self, snapshot: &AlbumSnapshot, index: usize) {
+        let Some(entry) = snapshot
+            .entries
+            .len()
             .checked_sub(1)
             .and_then(|last| snapshot.entries.get(index.min(last)))
         else {
             return;
         };
-        let index = index.min(total - 1);
         self.select_entry(snapshot, entry.id);
-        self.ensure_strip_visible(index, visible_slots, total);
     }
 
     /// The index of the photo shown, if any.
     pub fn shown_index(&self, snapshot: &AlbumSnapshot) -> Option<usize> {
         self.selected_index(snapshot)
-    }
-
-    /// The first thumbnail the strip shows (its horizontal scroll).
-    pub fn strip_scroll(&self) -> usize {
-        self.strip_scroll
     }
 
     /// Currently selected photo ID, if any.
@@ -569,7 +548,6 @@ impl PhotoAlbumDialog {
             self.caption_scroll_line = 0;
             self.dirty = false;
             self.pending_delete = None;
-            self.strip_scroll = 0;
             return;
         }
 
@@ -641,25 +619,12 @@ impl PhotoAlbumDialog {
         snapshot.entries.iter().position(|e| e.id == id)
     }
 
-    fn ensure_strip_visible(&mut self, idx: usize, visible_slots: usize, total: usize) {
-        if visible_slots == 0 || total == 0 {
-            self.strip_scroll = 0;
-            return;
-        }
-        let max_scroll = total.saturating_sub(visible_slots);
-        if idx < self.strip_scroll {
-            self.strip_scroll = idx;
-        } else if idx >= self.strip_scroll + visible_slots {
-            self.strip_scroll = idx + 1 - visible_slots;
-        }
-        self.strip_scroll = self.strip_scroll.min(max_scroll);
-    }
-
+    /// Moves to another photo. The caption being typed is written back
+    /// to the shown photo first, as native's navigation handlers do.
     fn switch_to_index(
         &mut self,
         snapshot: &AlbumSnapshot,
         target_idx: usize,
-        visible_slots: usize,
     ) -> Vec<AlbumCommand> {
         let mut cmds = Vec::new();
         let Some(entry) = snapshot.entries.get(target_idx) else {
@@ -674,7 +639,6 @@ impl PhotoAlbumDialog {
         self.selected_id = Some(entry.id);
         self.pending_delete = None;
         self.load_draft(entry);
-        self.ensure_strip_visible(target_idx, visible_slots, snapshot.entries.len());
         cmds.push(AlbumCommand::SelectEntry(entry.id));
         cmds
     }
@@ -723,16 +687,15 @@ impl PhotoAlbumDialog {
                 width: right_w,
                 height: 26,
             };
-            let caption_label_pos = [right_x, title_box.y + title_box.height + 8];
             let action_row_h = 26;
             let actions_top = content_bottom - action_row_h * 2 - 6;
-            let caption_top = caption_label_pos[1] + 16;
-            let caption_box = Rect {
-                x: right_x,
-                y: caption_top,
-                width: right_w,
-                height: (actions_top - 8 - caption_top).max(60),
-            };
+            // The caption is native's text control in the well between
+            // Previous and Next: `STR# 144` entry 15's origin and entry
+            // 14's size (`0x52a8e9`, `0x52a921`, set at `0x52a96b` on
+            // `+0xf8`), filled with the photo's text (`0x52b157`). Native
+            // draws no label for it.
+            let caption_box = Rect::new(mx + 90, my + 435, 520, 72);
+            let caption_label_pos = [caption_box.x, caption_box.y];
             let half_w = (right_w - 6) / 2;
             let btn_move_earlier = Rect {
                 x: right_x,
@@ -763,40 +726,6 @@ impl PhotoAlbumDialog {
             let btn_last = Rect::new(mx + 643, my + 442, 37, 46);
             let btn_done = Rect::new(mx + 129, my + 512, 130, 41);
             let btn_delete = Rect::new(mx + 442, my + 511, 130, 41);
-
-            // The well between Previous and Next is `STR# 144` entry 15's
-            // origin (90, 435) and entry 14's size 520×72 (`0x52a8e9`,
-            // `0x52a921`, set at `0x52a96b`). Native puts the photo's
-            // caption text control there (`+0xf8`, filled at `0x52b157`);
-            // our thumbnail strip has it instead.
-            let strip_box = Rect::new(mx + 90, my + 435, 520, 72);
-            let arrow_w = 24;
-            let strip_prev = Rect::new(
-                strip_box.x + 4,
-                strip_box.y + 8,
-                arrow_w,
-                strip_box.height - 16,
-            );
-            let strip_next = Rect::new(
-                strip_box.x + strip_box.width - 4 - arrow_w,
-                strip_box.y + 8,
-                arrow_w,
-                strip_box.height - 16,
-            );
-            let thumbs_x = strip_prev.x + strip_prev.width + 6;
-            let thumbs_avail = (strip_next.x - 6 - thumbs_x).max(0);
-            let thumb_w = 78;
-            let thumb_gap = 6;
-            let slot_count = ((thumbs_avail + thumb_gap) / (thumb_w + thumb_gap)).max(1) as usize;
-            let mut thumb_slots = Vec::with_capacity(slot_count);
-            for i in 0..slot_count {
-                thumb_slots.push(Rect {
-                    x: thumbs_x + (i as i32) * (thumb_w + thumb_gap),
-                    y: strip_box.y + 7,
-                    width: thumb_w,
-                    height: strip_box.height - 14,
-                });
-            }
 
             // Inline delete confirmation replaces `btn_delete` cleanly without overlapping `btn_done`.
             let confirm_bar = Rect::new(mx + 392, my + 514, 230, 36);
@@ -836,10 +765,6 @@ impl PhotoAlbumDialog {
                 btn_prev,
                 btn_next,
                 btn_last,
-                strip_box,
-                strip_prev,
-                strip_next,
-                thumb_slots,
             };
         }
 
@@ -868,46 +793,9 @@ impl PhotoAlbumDialog {
         };
         let page_counter = [btn_done.x - 92, header_y + 6];
 
-        // Bottom thumbnail strip
-        let strip_h = 74;
-        let strip_box = Rect {
-            x: mx + pad,
-            y: my + modal_h - pad - strip_h,
-            width: modal_w - pad * 2,
-            height: strip_h,
-        };
-        let arrow_w = 24;
-        let strip_prev = Rect {
-            x: strip_box.x + 4,
-            y: strip_box.y + 8,
-            width: arrow_w,
-            height: strip_h - 16,
-        };
-        let strip_next = Rect {
-            x: strip_box.x + strip_box.width - 4 - arrow_w,
-            y: strip_box.y + 8,
-            width: arrow_w,
-            height: strip_h - 16,
-        };
-
-        let thumbs_x = strip_prev.x + strip_prev.width + 6;
-        let thumbs_avail = (strip_next.x - 6 - thumbs_x).max(0);
-        let thumb_w = 78;
-        let thumb_gap = 6;
-        let slot_count = ((thumbs_avail + thumb_gap) / (thumb_w + thumb_gap)).max(1) as usize;
-        let mut thumb_slots = Vec::with_capacity(slot_count);
-        for i in 0..slot_count {
-            thumb_slots.push(Rect {
-                x: thumbs_x + (i as i32) * (thumb_w + thumb_gap),
-                y: strip_box.y + 7,
-                width: thumb_w,
-                height: strip_h - 14,
-            });
-        }
-
-        // Main content area between header and strip
+        // Main content area below the header
         let content_top = header_y + btn_h + 12;
-        let content_bottom = strip_box.y - 10;
+        let content_bottom = my + modal_h - pad;
         let content_h = (content_bottom - content_top).max(120);
 
         // Left: photo viewport + page nav bar below it
@@ -1042,19 +930,10 @@ impl PhotoAlbumDialog {
             btn_prev,
             btn_next,
             btn_last,
-            strip_box,
-            strip_prev,
-            strip_next,
-            thumb_slots,
         }
     }
 
-    fn hit_test(
-        &self,
-        layout: &AlbumLayout,
-        snapshot: &AlbumSnapshot,
-        pos: [i32; 2],
-    ) -> Option<ControlId> {
+    fn hit_test(&self, layout: &AlbumLayout, pos: [i32; 2]) -> Option<ControlId> {
         if !layout.modal.contains(pos[0], pos[1]) {
             return None;
         }
@@ -1108,28 +987,10 @@ impl PhotoAlbumDialog {
                 return Some(ControlId::MoveLater(id));
             }
         }
-        if layout.strip_prev.contains(pos[0], pos[1]) {
-            return Some(ControlId::StripPrev);
-        }
-        if layout.strip_next.contains(pos[0], pos[1]) {
-            return Some(ControlId::StripNext);
-        }
-        for (slot_idx, rect) in layout.thumb_slots.iter().enumerate() {
-            if rect.contains(pos[0], pos[1])
-                && let Some(entry) = snapshot.entries.get(self.strip_scroll + slot_idx)
-            {
-                return Some(ControlId::Thumbnail(entry.id));
-            }
-        }
         None
     }
 
-    fn control_enabled(
-        &self,
-        control: ControlId,
-        snapshot: &AlbumSnapshot,
-        visible_slots: usize,
-    ) -> bool {
+    fn control_enabled(&self, control: ControlId, snapshot: &AlbumSnapshot) -> bool {
         let len = snapshot.entries.len();
         let idx = self.selected_index(snapshot);
         match control {
@@ -1149,9 +1010,6 @@ impl PhotoAlbumDialog {
             ControlId::ConfirmDeleteNo => self.pending_delete.is_some(),
             ControlId::Save(id) => self.selected_id == Some(id) && self.dirty,
             ControlId::TitleBox | ControlId::CaptionBox => idx.is_some(),
-            ControlId::StripPrev => self.strip_scroll > 0,
-            ControlId::StripNext => self.strip_scroll + visible_slots < len,
-            ControlId::Thumbnail(id) => snapshot.entries.iter().any(|e| e.id == id),
         }
     }
 
@@ -1168,7 +1026,7 @@ impl PhotoAlbumDialog {
         self.sync_snapshot(snapshot);
         self.pointer = Some(pos);
         let layout = self.layout(screen[0], screen[1]);
-        self.hovered = self.hit_test(&layout, snapshot, pos);
+        self.hovered = self.hit_test(&layout, pos);
     }
 
     /// Handles a mouse press inside the modal. Returns `true` if the modal
@@ -1185,10 +1043,10 @@ impl PhotoAlbumDialog {
         self.sync_snapshot(snapshot);
         self.pointer = Some(pos);
         let layout = self.layout(screen[0], screen[1]);
-        let hit = self.hit_test(&layout, snapshot, pos);
+        let hit = self.hit_test(&layout, pos);
         self.hovered = hit;
         if let Some(ctrl) = hit
-            && self.control_enabled(ctrl, snapshot, layout.thumb_slots.len())
+            && self.control_enabled(ctrl, snapshot)
         {
             self.pressed = Some(ctrl);
         } else {
@@ -1212,17 +1070,16 @@ impl PhotoAlbumDialog {
         self.sync_snapshot(snapshot);
         self.pointer = Some(pos);
         let layout = self.layout(screen[0], screen[1]);
-        let hit = self.hit_test(&layout, snapshot, pos);
+        let hit = self.hit_test(&layout, pos);
         self.hovered = hit;
         let pressed = self.pressed.take();
         let Some(ctrl) = pressed else {
             return cmds;
         };
-        if hit != Some(ctrl) || !self.control_enabled(ctrl, snapshot, layout.thumb_slots.len()) {
+        if hit != Some(ctrl) || !self.control_enabled(ctrl, snapshot) {
             return cmds;
         }
 
-        let visible_slots = layout.thumb_slots.len();
         let idx = self.selected_index(snapshot);
         match ctrl {
             ControlId::Done => {
@@ -1233,29 +1090,25 @@ impl PhotoAlbumDialog {
                 cmds.push(AlbumCommand::Close);
             }
             ControlId::First => {
-                cmds.extend(self.switch_to_index(snapshot, 0, visible_slots));
+                cmds.extend(self.switch_to_index(snapshot, 0));
             }
             ControlId::Prev => {
                 if let Some(i) = idx
                     && i > 0
                 {
-                    cmds.extend(self.switch_to_index(snapshot, i - 1, visible_slots));
+                    cmds.extend(self.switch_to_index(snapshot, i - 1));
                 }
             }
             ControlId::Next => {
                 if let Some(i) = idx
                     && i + 1 < snapshot.entries.len()
                 {
-                    cmds.extend(self.switch_to_index(snapshot, i + 1, visible_slots));
+                    cmds.extend(self.switch_to_index(snapshot, i + 1));
                 }
             }
             ControlId::Last => {
                 if !snapshot.entries.is_empty() {
-                    cmds.extend(self.switch_to_index(
-                        snapshot,
-                        snapshot.entries.len() - 1,
-                        visible_slots,
-                    ));
+                    cmds.extend(self.switch_to_index(snapshot, snapshot.entries.len() - 1));
                 }
             }
             ControlId::MoveEarlier(id) => {
@@ -1266,7 +1119,6 @@ impl PhotoAlbumDialog {
                         cmds.push(save);
                     }
                     self.pending_delete = None;
-                    self.ensure_strip_visible(i - 1, visible_slots, snapshot.entries.len());
                     cmds.push(AlbumCommand::MoveEntry {
                         id,
                         new_index: i - 1,
@@ -1281,7 +1133,6 @@ impl PhotoAlbumDialog {
                         cmds.push(save);
                     }
                     self.pending_delete = None;
-                    self.ensure_strip_visible(i + 1, visible_slots, snapshot.entries.len());
                     cmds.push(AlbumCommand::MoveEntry {
                         id,
                         new_index: i + 1,
@@ -1315,24 +1166,12 @@ impl PhotoAlbumDialog {
                 self.caption_cursor = self.draft_caption.len();
                 self.blink_us = 0;
             }
-            ControlId::StripPrev => {
-                self.strip_scroll = self.strip_scroll.saturating_sub(1);
-            }
-            ControlId::StripNext => {
-                let max_scroll = snapshot.entries.len().saturating_sub(visible_slots);
-                self.strip_scroll = (self.strip_scroll + 1).min(max_scroll);
-            }
-            ControlId::Thumbnail(id) => {
-                if let Some(target_idx) = snapshot.entries.iter().position(|e| e.id == id) {
-                    cmds.extend(self.switch_to_index(snapshot, target_idx, visible_slots));
-                }
-            }
         }
 
         cmds
     }
 
-    /// Handles horizontal thumbnail-strip or caption scrolling via mouse wheel.
+    /// Scrolls the caption by mouse wheel while the pointer is over it.
     pub fn handle_scroll(
         &mut self,
         delta_lines: i32,
@@ -1361,18 +1200,6 @@ impl PhotoAlbumDialog {
                     .caption_scroll_line
                     .saturating_sub(delta_lines.unsigned_abs() as usize);
             }
-            return;
-        }
-        let max_scroll = snapshot
-            .entries
-            .len()
-            .saturating_sub(layout.thumb_slots.len());
-        if delta_lines > 0 {
-            self.strip_scroll = (self.strip_scroll + delta_lines as usize).min(max_scroll);
-        } else {
-            self.strip_scroll = self
-                .strip_scroll
-                .saturating_sub(delta_lines.unsigned_abs() as usize);
         }
     }
 
@@ -1390,7 +1217,6 @@ impl PhotoAlbumDialog {
         }
         self.sync_snapshot(snapshot);
         let layout = self.layout(screen[0], screen[1]);
-        let visible_slots = layout.thumb_slots.len();
 
         if key == AlbumKey::SaveShortcut {
             if let Some(save) = self.commit_edits() {
@@ -1428,28 +1254,24 @@ impl PhotoAlbumDialog {
                 if let Some(i) = idx
                     && i > 0
                 {
-                    cmds.extend(self.switch_to_index(snapshot, i - 1, visible_slots));
+                    cmds.extend(self.switch_to_index(snapshot, i - 1));
                 }
             }
             AlbumKey::Right | AlbumKey::PageDown => {
                 if let Some(i) = idx
                     && i + 1 < snapshot.entries.len()
                 {
-                    cmds.extend(self.switch_to_index(snapshot, i + 1, visible_slots));
+                    cmds.extend(self.switch_to_index(snapshot, i + 1));
                 }
             }
             AlbumKey::Home => {
                 if !snapshot.entries.is_empty() {
-                    cmds.extend(self.switch_to_index(snapshot, 0, visible_slots));
+                    cmds.extend(self.switch_to_index(snapshot, 0));
                 }
             }
             AlbumKey::End => {
                 if !snapshot.entries.is_empty() {
-                    cmds.extend(self.switch_to_index(
-                        snapshot,
-                        snapshot.entries.len() - 1,
-                        visible_slots,
-                    ));
+                    cmds.extend(self.switch_to_index(snapshot, snapshot.entries.len() - 1));
                 }
             }
             AlbumKey::Delete => {
@@ -1637,9 +1459,6 @@ impl PhotoAlbumDialog {
         }
         self.sync_snapshot(snapshot);
         let layout = self.layout(frame.width() as i32, frame.height() as i32);
-        let visible_slots = layout.thumb_slots.len();
-        let max_scroll = snapshot.entries.len().saturating_sub(visible_slots);
-        self.strip_scroll = self.strip_scroll.min(max_scroll);
 
         // 1. Subtle modal backdrop dimming
         dim_backdrop(frame);
@@ -1694,7 +1513,6 @@ impl PhotoAlbumDialog {
                 Some(&self.strings.done),
                 ControlId::Done,
                 snapshot,
-                visible_slots,
             );
         } else {
             self.draw_button(
@@ -1704,7 +1522,6 @@ impl PhotoAlbumDialog {
                 &self.strings.done,
                 ControlId::Done,
                 snapshot,
-                visible_slots,
             );
         }
 
@@ -1756,7 +1573,6 @@ impl PhotoAlbumDialog {
                 None,
                 ControlId::First,
                 snapshot,
-                visible_slots,
             );
             self.draw_scrap_button(
                 frame,
@@ -1766,7 +1582,6 @@ impl PhotoAlbumDialog {
                 None,
                 ControlId::Prev,
                 snapshot,
-                visible_slots,
             );
             self.draw_scrap_button(
                 frame,
@@ -1776,7 +1591,6 @@ impl PhotoAlbumDialog {
                 None,
                 ControlId::Next,
                 snapshot,
-                visible_slots,
             );
             self.draw_scrap_button(
                 frame,
@@ -1786,7 +1600,6 @@ impl PhotoAlbumDialog {
                 None,
                 ControlId::Last,
                 snapshot,
-                visible_slots,
             );
         } else {
             self.draw_button(
@@ -1796,35 +1609,10 @@ impl PhotoAlbumDialog {
                 "|<",
                 ControlId::First,
                 snapshot,
-                visible_slots,
             );
-            self.draw_button(
-                frame,
-                art,
-                layout.btn_prev,
-                "<",
-                ControlId::Prev,
-                snapshot,
-                visible_slots,
-            );
-            self.draw_button(
-                frame,
-                art,
-                layout.btn_next,
-                ">",
-                ControlId::Next,
-                snapshot,
-                visible_slots,
-            );
-            self.draw_button(
-                frame,
-                art,
-                layout.btn_last,
-                ">|",
-                ControlId::Last,
-                snapshot,
-                visible_slots,
-            );
+            self.draw_button(frame, art, layout.btn_prev, "<", ControlId::Prev, snapshot);
+            self.draw_button(frame, art, layout.btn_next, ">", ControlId::Next, snapshot);
+            self.draw_button(frame, art, layout.btn_last, ">|", ControlId::Last, snapshot);
         }
 
         // 6. Title & wrapped caption editors (`cTSWinTextEdit2`)
@@ -1846,14 +1634,16 @@ impl PhotoAlbumDialog {
             self.selected_id.is_some(),
         );
 
-        draw_text(
-            frame,
-            art.font(10),
-            layout.caption_label_pos[0],
-            layout.caption_label_pos[1],
-            &self.strings.caption_label,
-            TEXT_NORMAL,
-        );
+        if !layout.native_scrap {
+            draw_text(
+                frame,
+                art.font(10),
+                layout.caption_label_pos[0],
+                layout.caption_label_pos[1],
+                &self.strings.caption_label,
+                TEXT_NORMAL,
+            );
+        }
         self.draw_multiline_caption(
             frame,
             art.font(10),
@@ -1871,7 +1661,6 @@ impl PhotoAlbumDialog {
             &self.strings.move_earlier,
             ControlId::MoveEarlier(selected_id),
             snapshot,
-            visible_slots,
         );
         self.draw_button(
             frame,
@@ -1880,7 +1669,6 @@ impl PhotoAlbumDialog {
             &self.strings.move_later,
             ControlId::MoveLater(selected_id),
             snapshot,
-            visible_slots,
         );
 
         if layout.native_scrap {
@@ -1891,7 +1679,6 @@ impl PhotoAlbumDialog {
                 &self.strings.save,
                 ControlId::Save(selected_id),
                 snapshot,
-                visible_slots,
             );
             if let Some(pending) = self.pending_delete {
                 frame.fill(layout.confirm_bar, CONFIRM_BG);
@@ -1912,7 +1699,6 @@ impl PhotoAlbumDialog {
                     &self.strings.confirm_yes,
                     ControlId::ConfirmDeleteYes(pending),
                     snapshot,
-                    visible_slots,
                 );
                 self.draw_button(
                     frame,
@@ -1921,7 +1707,6 @@ impl PhotoAlbumDialog {
                     &self.strings.confirm_no,
                     ControlId::ConfirmDeleteNo,
                     snapshot,
-                    visible_slots,
                 );
             } else {
                 self.draw_scrap_button(
@@ -1932,7 +1717,6 @@ impl PhotoAlbumDialog {
                     Some(&self.strings.delete),
                     ControlId::Delete(selected_id),
                     snapshot,
-                    visible_slots,
                 );
             }
         } else if let Some(pending) = self.pending_delete {
@@ -1954,7 +1738,6 @@ impl PhotoAlbumDialog {
                 &self.strings.confirm_yes,
                 ControlId::ConfirmDeleteYes(pending),
                 snapshot,
-                visible_slots,
             );
             self.draw_button(
                 frame,
@@ -1963,7 +1746,6 @@ impl PhotoAlbumDialog {
                 &self.strings.confirm_no,
                 ControlId::ConfirmDeleteNo,
                 snapshot,
-                visible_slots,
             );
         } else {
             self.draw_button(
@@ -1973,7 +1755,6 @@ impl PhotoAlbumDialog {
                 &self.strings.save,
                 ControlId::Save(selected_id),
                 snapshot,
-                visible_slots,
             );
             self.draw_button(
                 frame,
@@ -1982,57 +1763,10 @@ impl PhotoAlbumDialog {
                 &self.strings.delete,
                 ControlId::Delete(selected_id),
                 snapshot,
-                visible_slots,
             );
         }
 
-        // 8. Bottom thumbnail strip
-        frame.fill(layout.strip_box, STRIP_BG);
-        draw_outline(frame, layout.strip_box, STRIP_BORDER);
-        self.draw_button(
-            frame,
-            art,
-            layout.strip_prev,
-            "<",
-            ControlId::StripPrev,
-            snapshot,
-            visible_slots,
-        );
-        self.draw_button(
-            frame,
-            art,
-            layout.strip_next,
-            ">",
-            ControlId::StripNext,
-            snapshot,
-            visible_slots,
-        );
-        for (slot_idx, slot_rect) in layout.thumb_slots.iter().enumerate() {
-            let entry_idx = self.strip_scroll + slot_idx;
-            let Some(entry) = snapshot.entries.get(entry_idx) else {
-                frame.fill(*slot_rect, THUMB_BG);
-                draw_outline(frame, *slot_rect, STRIP_BORDER);
-                continue;
-            };
-            frame.fill(*slot_rect, THUMB_BG);
-            let inner = inset_rect(*slot_rect, 2);
-            if let Some(thumb) = entry.thumbnail.as_ref().or(entry.image.as_ref()) {
-                blit_aspect_fit(frame, thumb, inner);
-            } else {
-                let num = format!("#{}", entry_idx + 1);
-                draw_centered_text(frame, art.font(10), inner, &num, TEXT_MUTED);
-            }
-            let border = if self.selected_id == Some(entry.id) {
-                THUMB_SELECTED_BORDER
-            } else if self.hovered == Some(ControlId::Thumbnail(entry.id)) {
-                THUMB_HOVER_BORDER
-            } else {
-                STRIP_BORDER
-            };
-            draw_outline(frame, *slot_rect, border);
-        }
-
-        // 9. Hover tooltip
+        // 8. Hover tooltip
         if let (Some(pos), Some(ctrl)) = (self.pointer, self.hovered)
             && let Some(tip) = self.tooltip_for(ctrl)
         {
@@ -2062,9 +1796,8 @@ impl PhotoAlbumDialog {
         label: Option<&str>,
         control: ControlId,
         snapshot: &AlbumSnapshot,
-        visible_slots: usize,
     ) {
-        let enabled = self.control_enabled(control, snapshot, visible_slots);
+        let enabled = self.control_enabled(control, snapshot);
         let pressed = enabled && self.pressed == Some(control) && self.hovered == Some(control);
         let hovered = enabled && self.hovered == Some(control);
         let (cell_idx, text_color) = if !enabled {
@@ -2101,7 +1834,7 @@ impl PhotoAlbumDialog {
                 ControlId::Last => ">|",
                 _ => "",
             });
-            self.draw_button(frame, art, rect, fallback, control, snapshot, visible_slots);
+            self.draw_button(frame, art, rect, fallback, control, snapshot);
         }
     }
 
@@ -2114,9 +1847,8 @@ impl PhotoAlbumDialog {
         label: &str,
         control: ControlId,
         snapshot: &AlbumSnapshot,
-        visible_slots: usize,
     ) {
-        let enabled = self.control_enabled(control, snapshot, visible_slots);
+        let enabled = self.control_enabled(control, snapshot);
         let pressed = enabled && self.pressed == Some(control) && self.hovered == Some(control);
         let hovered = enabled && self.hovered == Some(control);
         let (cell_idx, text_color) = if !enabled {

@@ -143,10 +143,18 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
      (150, 512); the other positions agree. Ours now reads `STR# 144`.
    - Its entries 14 and 15 are the size 520×72 and origin (90, 435)
      (`0x52a8e9`, `0x52a921`) of the control set at `0x52a96b`: the well
-     between Previous and Next. Our thumbnail strip now sits in that
-     box. Native's control there is the photo's caption text (`+0xf8`,
-     filled from the photo at `0x52b157`); native has no thumbnail
-     strip. Entries 16 to 18 are not traced.
+     between Previous and Next. That control is the photo's caption text
+     (`+0xf8`, filled from the photo's `+0xc` text at `0x52b157` via
+     `0x5f45c7`). Entries 16 to 18 are not traced.
+   - Native has no thumbnail strip, so ours is removed: it replaced
+     native's caption control, and a click meant to edit the caption
+     chose another photo. The well now holds the caption, editable, with
+     no label (native draws none). The edit is written back to the shown
+     photo when Previous, Next, First or Last moves away and on Done, as
+     native's handlers do (`AlbumCommand::UpdateEntryText`, stored by
+     `AlbumStore::update_text`; the store already keeps a caption, so
+     its format is unchanged). The editor is the album's own caption
+     editor, moved into the well.
    - "Snap", "Add", `AlbumCommand::CaptureSnapshot`/`AddBlankPage` and
      `AlbumSnapshot::can_capture_snapshot` are removed.
    - Photos now come from where they come from natively: clicking the lot
@@ -185,18 +193,24 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
      photo index (`+0x10`) outlives the dialog. It starts at 0
      (`0x4ed6a8`), a new photo makes it the newest (`0x4ed857`), Done
      leaves it alone, and `0x52b119` shows it when the dialog opens.
-   - Ours resets the dialog on open (drafts, strip offset), then shows
-     the household's current photo (`NeighborhoodShell::album_index`, by
-     neighborhood and family, recorded on close, newest after a Camera
-     photo). The strip, which is ours, scrolls just far enough to show
-     it, and the opening strip's thumbnails load, so a reopened album is
-     never blank.
+   - Ours resets the dialog on open (drafts), then shows the household's
+     current photo (`NeighborhoodShell::album_index`, recorded on close,
+     newest after a Camera photo), loaded, so a reopened album is never
+     blank.
+   - The index is keyed by the album token: the neighborhood instance
+     and the family epoch, which changes when the family is deleted.
+     Native frees the album with the family (`0x41010b`), so a later
+     family with the same ID opens on its first photo rather than the
+     old family's.
+   - Deleting a photo keeps the current index, clamped to the new last
+     photo (`0x4ee087`): with A B C D, deleting C shows D and deleting D
+     shows C. Deleting the only photo closes the album (`0x52b0c8`).
+     Before this, the shown photo after a delete was ours, and an empty
+     album stayed open.
    - A notice over the album also takes the wheel, so nothing behind it
      scrolls, and it is laid out again when the window is resized.
-   - The album loads thumbnails for the strip the dialog draws. The
-     shell's copy of the strip offset is now read from the dialog, so a
-     refresh can no longer move the loaded window away from the shown
-     strip.
+   - The album loads the shown photo and its neighbors only, so a large
+     album stays bounded in memory.
    - The Camera strip's dead Take Snapshot path is removed:
      `CameraCommand::TakeSnapshot` and its button state.
 7. **Roof page arrows.**
@@ -245,6 +259,10 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
        name is therefore never empty, and the check skips no readable
        definition; only one the port cannot read is left out. The
        listed name is the same string.
+     - In a length-prefixed table (count format), the loader rewrites
+       byte 0xa1 to `o` and 0xd5 to `'` (`0x470f45..0x470f5b`), so
+       `R\xa1sa` is "Rosa". Ours does the same; null-terminated tables
+       keep those bytes.
    - Each neighbor is listed once, judged by their first row.
 
 ## Oracle tour
@@ -311,10 +329,6 @@ choice dialogs. All three were inspected by eye.
   (`0x4b7fb4`). The port stores album photos losslessly and has no JPEG
   encoder, so the setting changes no pixel. `SnapshotQuality::jpeg_quality`
   now gives native's numbers. Porting the encoder is left for later.
-- **Album well.** Native shows the photo's caption in the well between
-  Previous and Next (`STR# 144` entries 14 and 15) and has no thumbnail
-  strip. Ours draws a thumbnail strip there and edits the caption beside
-  the photo. Moving the caption into the well is left for later.
 - **Camera frame outline.** Native draws the frame under the pointer
   while Camera Mode is open (`0x4b156a`). Ours does not draw it.
 - **Phone book pages.** Native `cWinPhoneBook` shows one family per page:

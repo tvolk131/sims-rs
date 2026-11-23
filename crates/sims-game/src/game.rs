@@ -14006,15 +14006,35 @@ fn outfit_key(row: &str) -> (String, String) {
 }
 
 /// A definition's `CATS` bytes and its `CTSS` table, both numbered by
-/// definition word 41. The `CTSS` is read in the byte order its flags give,
-/// as the loader does: without flag 0x10 it is big-endian (`0x470351`).
+/// definition word 41, read as the loader reads them:
+///
+/// - in the byte order the resource's flags give: without flag 0x10 it is
+///   big-endian (`0x470351`);
+/// - in a table of length-prefixed strings, bytes 0xa1 become `o` and
+///   0xd5 become `'` (`0x470f45..0x470f5b`).
 fn catalog_strings(
     iff: &sims_formats::iff::Iff,
     table: u16,
 ) -> (Option<&[u8]>, Option<sims_formats::strings::StringTable>) {
+    use sims_formats::strings::{Format, StringTable, decode};
     let cats = iff.get(b"CATS", table).map(|c| iff.data(c));
     let ctss = iff.get(b"CTSS", table).and_then(|c| {
-        sims_formats::strings::StringTable::parse_chunk(iff.data(c), iff.resource_flags(c)).ok()
+        let mut table = StringTable::parse_chunk(iff.data(c), iff.resource_flags(c)).ok()?;
+        if matches!(table.format, Format::Pascal | Format::MacResource) {
+            for entry in &mut table.entries {
+                let bytes: Vec<u8> = entry
+                    .raw_text
+                    .iter()
+                    .map(|&b| match b {
+                        0xa1 => b'o',
+                        0xd5 => b'\'',
+                        b => b,
+                    })
+                    .collect();
+                entry.text = decode(&bytes, entry.language);
+            }
+        }
+        Some(table)
     });
     (cats, ctss)
 }
@@ -14384,6 +14404,21 @@ mod tests {
                 "flags {flags:#x}"
             );
         }
+        // A table of length-prefixed strings (a count, not a version)
+        // reads 0xa1 as `o` and 0xd5 as `'` (`0x470f45`).
+        let iff = file(0x10, b"\x02\x00\x04R\xa1sa\x03O\xd5s".to_vec());
+        let (_, ctss) = catalog_strings(&iff, 2000);
+        let ctss = ctss.expect("length-prefixed CTSS");
+        assert_eq!(ctss.entries[0].text, "Rosa");
+        assert_eq!(ctss.entries[1].text, "O's");
+        assert_eq!(
+            definition_catalog_name(None, Some(&ctss), true, "Label"),
+            "Rosa"
+        );
+        // Only that layout: a NUL-terminated table keeps the byte.
+        let iff = file(0x10, b"\xff\xff\x01\x00R\xa1sa\x00".to_vec());
+        let (_, ctss) = catalog_strings(&iff, 2000);
+        assert_eq!(ctss.expect("terminated CTSS").entries[0].text, "R¡sa");
     }
 
     #[test]
