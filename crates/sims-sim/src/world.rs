@@ -578,6 +578,90 @@ pub struct World {
     /// [`World::encode`] to preserve snapshot format 32.
     #[serde(skip)]
     pub family_flags: BTreeMap<i32, u32>,
+    /// The interface's indicator refresh queues ([`IndicatorQueues`]).
+    /// The house file does not hold them. Kept out of [`World::encode`] to
+    /// preserve snapshot format 32; `sims_vm::boot::save::Saved` keeps
+    /// them across lot save/restore.
+    #[serde(skip)]
+    pub indicator_queues: IndicatorQueues,
+}
+
+/// The people whose indicators the interface will refresh when it next
+/// draws the house view (the interface object's vectors +0xb0 and +0xbc
+/// and its flag +0xac).
+///
+/// Resolving a person's data word with write intent, before the word is
+/// written, queues the person (0x4538e3, the resolver's person-data case):
+///
+/// - word 77, the date: 0x4448a6 queues the person unless its word 77 is
+///   0 before the write, or the person is already queued;
+/// - word 81, fame: 0x444962 queues the person every time.
+///
+/// Either sets `dirty`, which only the drain (0x4464db) clears.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndicatorQueues {
+    /// People whose date indicator to refresh (+0xb0), each once.
+    pub dates: Vec<u16>,
+    /// People whose star marker to refresh (+0xbc), repeats kept.
+    pub stars: Vec<u16>,
+    /// +0xac: a refresh is waiting.
+    pub dirty: bool,
+    /// The available star pool (+0xdc): pooled Superstar star markers
+    /// waiting for a famous Sim, the next one last. 0x446356 appends the
+    /// stars it makes in the order made, and letting a star go from a
+    /// head (0x4481eb) moves it here from the in-use pool, at the end
+    /// (0x4483bd), only if it was in use. A star refresh (0x447012), a
+    /// famous Sim's arrival (0x447b63) and a deselection (0x446ed9) take
+    /// the last one.
+    ///
+    /// A refresh and an arrival take the star before they check the Sim's
+    /// tile (0x422632) and put it in the in-use pool only on success
+    /// (0x4471b0, 0x447d22), so a famous Sim on a border tile loses the
+    /// star: it is in neither pool, and is never handed out again. A
+    /// deselection checks the tile first and loses none.
+    pub available_stars: Vec<u16>,
+    /// The in-use star pool (+0xd0): stars put on famous Sims' heads, in
+    /// the order put (0x4471b0, 0x447d22, 0x446eba).
+    pub stars_in_use: Vec<u16>,
+}
+
+impl IndicatorQueues {
+    /// 0x4448a6: queues `person` for a date refresh, given its word 77
+    /// before the write. A date of 0 or a person already queued (compared
+    /// by object ID, object +0xf0) changes nothing.
+    pub fn queue_date(&mut self, person: u16, date: i16) {
+        if date == 0 || self.dates.contains(&person) {
+            return;
+        }
+        self.dates.push(person);
+        self.dirty = true;
+    }
+
+    /// 0x444962: queues `person` for a star refresh. Unlike a date, a
+    /// person already queued is queued again.
+    pub fn queue_star(&mut self, person: u16) {
+        self.stars.push(person);
+        self.dirty = true;
+    }
+
+    /// Drops every entry for `object`, as it is deleted.
+    ///
+    /// **A departure.** The original erases only the first entry of each
+    /// queue, and only for a removal with the interface on (0x447d8b:
+    /// 0x447f2b..0x447f46 and 0x448030..0x448059, then 0x448663). A person
+    /// queued twice for a star (0x444962 does not check), or queued while
+    /// the lot is cleared (0x445f84 empties the star pools at +0xd0 and
+    /// +0xdc, not these), stays queued after it is freed, and the next
+    /// refresh reads freed memory. The port drops such an entry instead.
+    ///
+    /// A deleted star leaves both star pools too, as in the original
+    /// (0x447e69 -> 0x448097: 0x448164, 0x4481e2).
+    pub fn forget(&mut self, object: u16) {
+        self.dates.retain(|&other| other != object);
+        self.stars.retain(|&other| other != object);
+        self.available_stars.retain(|&other| other != object);
+        self.stars_in_use.retain(|&other| other != object);
+    }
 }
 
 /// One appearance attachment slot on `cTSPerson` (`0x583559`: suit name at
@@ -994,6 +1078,7 @@ impl World {
             event_owner: 0,
             magic_history: None,
             indicators: [0; 2],
+            indicator_queues: IndicatorQueues::default(),
             changed_types: BTreeSet::new(),
             next_parts: BTreeMap::new(),
             skeleton_files: BTreeSet::new(),
@@ -1090,6 +1175,23 @@ impl World {
         ans
     }
 
+    /// What the simulator read (0x46cfb3) does next on a lot not zoned
+    /// residential (`0x40745f` false, asked with the saved global 10): it
+    /// drops both saved streams and seeds each from a reading of the
+    /// host's millisecond clock (`timeGetTime`, import slot `0x666400`),
+    /// the lot's stream first (`0x46d0d3`, written to lot `+0xac`), then
+    /// the global stream (`0x46d0db`, set through `0x46f44d`). A
+    /// residential lot instead sets the global stream to its saved state
+    /// (`0x46d0ce`). Every SIMI version the port reads is at least 14, the
+    /// first to hold the streams (`0x46d096`).
+    ///
+    /// `readings` are the two clock readings, in that order. The port has
+    /// no host clock in the simulation, so a load passes them in.
+    pub fn seed_from_host_clock(&mut self, readings: [u32; 2]) {
+        self.lot_rng = GameRng::from_state(readings[0]);
+        self.global_rng = GameRng::from_state(readings[1]);
+    }
+
     /// Reads a house's usage counts from its house model (HOUS 1;
     /// 0x416568). The file stores each pair as the routing count, then
     /// the total; the five earlier days first, today last. A model of a
@@ -1111,6 +1213,10 @@ impl World {
     ///
     /// The globals are the saved 32 or 64 words as they are;
     /// [`World::apply_context`] turns them into the ones the lot runs with.
+    ///
+    /// Both streams take their saved states, as on a residential lot. A lot
+    /// zoned otherwise reseeds them straight after
+    /// ([`World::seed_from_host_clock`]).
     pub fn read_simulator(&mut self, simulator: &Simulator) {
         self.ticks = simulator.ticks;
         self.globals = simulator.globals.clone();
@@ -1228,6 +1334,54 @@ impl World {
         Ok(world)
     }
 
+    /// A world snapshot's save payload
+    /// ([`crate::autosave::SavePayloadKind::WorldSnapshot`]): the canonical
+    /// encoding ([`World::encode`]), then the pending indicator refreshes
+    /// ([`World::indicator_queues`]), which the encoding leaves out. The
+    /// encoding comes first and unchanged, so [`World::decode`], which reads
+    /// it and stops, still reads the payload, as an older build does.
+    pub fn encode_snapshot(&self) -> Vec<u8> {
+        let mut bytes = self.encode();
+        let queues =
+            postcard::to_allocvec(&self.indicator_queues).expect("encoding to memory cannot fail");
+        bytes.extend_from_slice(&queues);
+        bytes
+    }
+
+    /// Reads [`World::encode_snapshot`]'s payload. A payload with nothing
+    /// after the world (one saved before the refreshes were kept) has none
+    /// pending and empty star pools: a caller that plays the world on
+    /// takes its pools from where its stars stand, through
+    /// [`World::decode_snapshot_parts`].
+    pub fn decode_snapshot(bytes: &[u8]) -> Result<Self> {
+        let (mut world, queues) = Self::decode_snapshot_parts(bytes)?;
+        world.indicator_queues = queues.unwrap_or_default();
+        Ok(world)
+    }
+
+    /// [`World::decode_snapshot`]'s parts: the world, with no pending
+    /// indicator refreshes, and the payload's own refreshes and star pools,
+    /// or None for a payload saved before they were kept.
+    pub fn decode_snapshot_parts(bytes: &[u8]) -> Result<(Self, Option<IndicatorQueues>)> {
+        let (mut world, rest): (Self, _) =
+            postcard::take_from_bytes(bytes).map_err(|e| Error::Snapshot(e.to_string()))?;
+        let queues = if rest.is_empty() {
+            None
+        } else {
+            let (queues, rest) = postcard::take_from_bytes::<IndicatorQueues>(rest)
+                .map_err(|e| Error::Snapshot(format!("indicator refreshes: {e}")))?;
+            if !rest.is_empty() {
+                return Err(Error::Snapshot(format!(
+                    "{} bytes after the indicator refreshes",
+                    rest.len()
+                )));
+            }
+            Some(queues)
+        };
+        world.mark_all_frame_storage_dirty();
+        Ok((world, queues))
+    }
+
     /// Marks every existing [`Self::frame_storage`] entry dirty so each object
     /// performs one full `sync_frames` on its first frame push/pop after a
     /// save/restore (preserving bit-exact parity for lower frames edited before
@@ -1318,6 +1472,53 @@ impl Object {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_date_is_queued_once_and_only_while_set_and_fame_every_time() {
+        // 0x4448a6 and 0x444962.
+        let mut queues = IndicatorQueues::default();
+        queues.queue_date(5, 0);
+        assert_eq!(queues, IndicatorQueues::default());
+        queues.queue_date(5, -3);
+        queues.queue_date(5, 7);
+        queues.queue_date(6, 1);
+        queues.queue_star(5);
+        queues.queue_star(5);
+        assert_eq!(
+            queues,
+            IndicatorQueues {
+                dates: vec![5, 6],
+                stars: vec![5, 5],
+                dirty: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_world_snapshot_payload_keeps_its_pending_refreshes() {
+        let mut world = World::empty();
+        world.indicator_queues.queue_star(5);
+        world.indicator_queues.available_stars.push(9);
+        world.indicator_queues.stars_in_use.push(8);
+        let payload = world.encode_snapshot();
+        // The world's canonical encoding comes first and unchanged.
+        assert!(payload.starts_with(&world.encode()));
+        let back = World::decode_snapshot(&payload).unwrap();
+        assert_eq!(back.indicator_queues, world.indicator_queues);
+        assert_eq!(back.hash(), world.hash());
+        // An older build's decode reads the world and stops.
+        let old = World::decode(&payload).unwrap();
+        assert_eq!(old.indicator_queues, IndicatorQueues::default());
+        assert_eq!(old.hash(), world.hash());
+        // A payload from before the refreshes were kept has none pending.
+        let before = World::decode_snapshot(&world.encode()).unwrap();
+        assert_eq!(before.indicator_queues, IndicatorQueues::default());
+        // Bytes after the refreshes are refused.
+        let mut longer = payload.clone();
+        longer.push(0);
+        assert!(World::decode_snapshot(&longer).is_err());
+    }
 
     #[test]
     fn scratch_ptrs_serialize_bit_matches_btreeset_postcard_bytes() {

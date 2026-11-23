@@ -72,13 +72,6 @@ fn asking<T>(
     (result, calls)
 }
 
-fn unsupported<T: std::fmt::Debug>(result: Result<T, sims_vm::Fault>) -> String {
-    match result.expect_err("expected a fault").trap {
-        Trap::Unsupported(what) => what,
-        other => panic!("expected an unsupported fault, got {other:?}"),
-    }
-}
-
 #[test]
 fn announcing_the_house_makes_the_indicators_and_clears_the_selection() {
     let mut fx = lot_with_person();
@@ -205,21 +198,6 @@ fn selecting_another_sim_deselects_the_first() {
 
 #[test]
 fn a_famous_sim_deselected_takes_and_releases_a_star_marker() {
-    const STAR_MARKER: u32 = 0xE933_7020;
-    let register_star = |fx: &mut Fixture| {
-        let file = fx.add_type(STAR_MARKER, 4, 0, 4096);
-        fx.add(
-            file,
-            4096,
-            tree(vec![assign(
-                scope::TEMPS,
-                0,
-                scope::LITERAL,
-                0,
-                RETURN_TRUE,
-            )]),
-        );
-    };
     // Without Superstar (expansions & 0x40 == 0), deselecting a Sim with word
     // 81 >= 10 leaves no star marker in the head slot (0x446bf4).
     let mut fx = two_residents();
@@ -327,6 +305,243 @@ fn a_famous_sim_deselected_takes_and_releases_a_star_marker() {
     assert!(matches!(result.unwrap_err().trap, Trap::Invalid(_)));
 }
 
+const STAR_MARKER: u32 = 0xE933_7020;
+const OTHER: u16 = PERSON + 1;
+
+/// Gives the lot's catalog the Superstar star marker, whose Init does
+/// nothing.
+fn register_star(fx: &mut Fixture) {
+    let file = fx.add_type(STAR_MARKER, 4, 0, 4096);
+    fx.add(
+        file,
+        4096,
+        tree(vec![assign(
+            scope::TEMPS,
+            0,
+            scope::LITERAL,
+            0,
+            RETURN_TRUE,
+        )]),
+    );
+}
+
+/// Sets a person's fame (person word 81).
+fn famous(fx: &mut Fixture, id: u16, fame: i16) {
+    let sim = fx.world.objects.get_mut(&id).unwrap();
+    sim.person.as_mut().unwrap().data[81] = fame;
+}
+
+fn stars(fx: &Fixture) -> usize {
+    fx.world
+        .objects
+        .values()
+        .filter(|o| o.guid == STAR_MARKER)
+        .count()
+}
+
+/// The one star marker in neither pool: lost.
+fn in_no_pool(fx: &Fixture) -> u16 {
+    let pools = &fx.world.indicator_queues;
+    let lost: Vec<u16> = fx
+        .world
+        .objects
+        .values()
+        .filter(|o| o.guid == STAR_MARKER)
+        .map(|o| o.id)
+        .filter(|id| !pools.available_stars.contains(id) && !pools.stars_in_use.contains(id))
+        .collect();
+    let [lost] = lost[..] else {
+        panic!("one star is lost: {lost:?}");
+    };
+    lost
+}
+
+/// The original's pool order for a famous Sim on a border tile. A star
+/// refresh (0x446ee9) pops the pool's last star (0x447012) before the tile
+/// check (0x44702e), and puts it in the in-use pool only on success
+/// (0x4471b0): the star is lost, and the next famous Sim gets another. A
+/// deselection (0x446bf0) checks the tile first (0x446d17) and pops only
+/// after placing (0x446ed9), so it loses none.
+#[test]
+fn a_star_refresh_on_a_border_tile_loses_the_popped_star() {
+    // The refresh: OTHER, not selected, is famous on a lot's border tile.
+    let mut fx = two_residents();
+    fx.program.expansions = 0x40;
+    register_star(&mut fx);
+    fx.world.size = 32;
+    famous(&mut fx, OTHER, 10);
+    let inside = fx.world.objects[&OTHER].position;
+    fx.world.objects.get_mut(&OTHER).unwrap().position = [31 * 16 + 8, 3 * 16 + 8, 1];
+    fx.world.indicator_queues.queue_star(OTHER);
+    // With a Sim selected, announcing the house only refreshes (0x4a8679).
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    assert_eq!(
+        fx.world.objects[&OTHER].slots[2].object, 0,
+        "no star on the border"
+    );
+    assert_eq!(stars(&fx), 4, "the pool was made (0x446356)");
+    let pools = &fx.world.indicator_queues;
+    assert!(pools.stars_in_use.is_empty());
+    assert_eq!(pools.available_stars.len(), 3);
+    let lost = in_no_pool(&fx);
+    assert_eq!(fx.world.objects[&lost].data[2], 0, "held by nobody");
+
+    // Back inside, the next refresh gets another star from the pool, and
+    // the pool is not refilled.
+    fx.world.objects.get_mut(&OTHER).unwrap().position = inside;
+    fx.world.indicator_queues.queue_star(OTHER);
+    // With a Sim selected, announcing the house only refreshes (0x4a8679).
+    let next = *fx.world.indicator_queues.available_stars.last().unwrap();
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    let star = fx.world.objects[&OTHER].slots[2].object as u16;
+    assert_eq!(star, next, "the available pool's last star");
+    assert_ne!(star, lost, "the lost star is in neither pool");
+    assert_eq!(stars(&fx), 4);
+    let pools = &fx.world.indicator_queues;
+    assert_eq!(pools.stars_in_use, [star]);
+    assert_eq!(pools.available_stars.len(), 2);
+    assert_eq!(in_no_pool(&fx), lost);
+
+    // Deleting a star forgets it (0x448097).
+    fx.world.indicator_queues.forget(star);
+    assert!(fx.world.indicator_queues.stars_in_use.is_empty());
+
+    // The deselection: PERSON is famous on the border tile when OTHER is
+    // selected. No star goes on it, and none is lost.
+    let mut fx = two_residents();
+    fx.program.expansions = 0x40;
+    register_star(&mut fx);
+    fx.world.size = 32;
+    famous(&mut fx, PERSON, 10);
+    fx.world.objects.get_mut(&PERSON).unwrap().position = [31 * 16 + 8, 3 * 16 + 8, 1];
+    asking(&mut fx, |i, world| i.select(world, Some(OTHER)).unwrap());
+    assert_eq!(stars(&fx), 4);
+    assert!(
+        fx.world.objects[&PERSON].slots.iter().all(|slot| fx
+            .world
+            .objects
+            .get(&(slot.object as u16))
+            .is_none_or(|o| o.guid != STAR_MARKER)),
+        "no star on the border"
+    );
+    let pools = &fx.world.indicator_queues;
+    assert_eq!(pools.available_stars.len(), 4);
+    assert!(pools.stars_in_use.is_empty());
+}
+
+/// The available star pool is a stack in the order stars come back: the
+/// original appends a star let go from a head (0x4481eb: 0x4483bd) and
+/// takes the last (0x447012). Two famous Sims take the two newest stars;
+/// letting the newer go and then the older puts the older last, so a
+/// famous Sim refreshed on a border tile loses the older.
+#[test]
+fn the_star_pool_hands_out_the_last_star_let_go() {
+    const THIRD: u16 = PERSON + 2;
+    let mut fx = two_residents();
+    resident(&mut fx, THIRD, [2, 2]);
+    fx.program.expansions = 0x40;
+    register_star(&mut fx);
+    for sim in [OTHER, THIRD] {
+        famous(&mut fx, sim, 10);
+        fx.world.indicator_queues.queue_star(sim);
+    }
+    // PERSON is selected: the refresh puts stars on OTHER, then THIRD.
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    let held = |fx: &Fixture, sim: u16| fx.world.objects[&sim].slots[2].object as u16;
+    let (newer, older) = (held(&fx, OTHER), held(&fx, THIRD));
+    assert_eq!(fx.world.indicator_queues.stars_in_use, [newer, older]);
+    assert!(
+        newer > older,
+        "made in order, the last made handed out first"
+    );
+    // Selecting OTHER lets its star go (0x4467d7 -> 0x4481eb); it is then
+    // no longer famous, so selecting THIRD next gives it no star again.
+    asking(&mut fx, |i, world| i.select(world, Some(OTHER)).unwrap());
+    famous(&mut fx, OTHER, 0);
+    asking(&mut fx, |i, world| i.select(world, Some(THIRD)).unwrap());
+    let pools = &fx.world.indicator_queues;
+    assert!(pools.stars_in_use.is_empty());
+    assert_eq!(pools.available_stars[2..], [newer, older]);
+    // PERSON, famous and not selected, is refreshed on a border tile: the
+    // star popped and lost is the older one, let go last.
+    fx.world.size = 32;
+    famous(&mut fx, PERSON, 10);
+    fx.world.objects.get_mut(&PERSON).unwrap().position = [31 * 16 + 8, 3 * 16 + 8, 1];
+    fx.world.indicator_queues.queue_star(PERSON);
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    assert_eq!(in_no_pool(&fx), older);
+    assert_eq!(
+        fx.world.indicator_queues.available_stars.last(),
+        Some(&newer)
+    );
+}
+
+/// A put runs the arrival (0x44752e) when the object was off the active
+/// lot: 0x433366 tests the old position with 0x422632 on the lot, so
+/// against the lot's size, not the 64 tiles of its arrays. A famous Sim
+/// moved from tile 31 to tile 30 of a 32-tile lot arrives and takes a
+/// star; on a 64-tile lot tile 31 is inside and nothing arrives. Only
+/// the x word is compared for a move (0x4335a2..0x4335a5), so a move
+/// from (3, 31) to (3, 30) on the 32-tile lot runs no arrival.
+#[test]
+fn a_famous_sim_moved_in_from_a_small_lots_border_takes_a_star() {
+    const FIND_LOCATION: u16 = 16;
+    let star_on = |size: i16, from: [i32; 2], to: [i32; 2]| {
+        let mut fx = two_residents();
+        fx.program.expansions = 0x40;
+        register_star(&mut fx);
+        fx.world.size = size;
+        // No pool and no water anywhere, for the place test.
+        fx.world.arrays.insert(9, crate::rooms::array(1, 0xff));
+        fx.world.arrays.insert(10, crate::rooms::array(1, 0xff));
+        // OTHER, famous and not selected, stands on tile `from`.
+        let grid = &mut fx.world.arrays.get_mut(&3).unwrap().data;
+        let cell = |t: [i32; 2]| ((t[0] * 64 + t[1]) * 2) as usize;
+        grid[cell([4, 4])..cell([4, 4]) + 2].copy_from_slice(&[0, 0]);
+        grid[cell(from)..cell(from) + 2].copy_from_slice(&OTHER.to_le_bytes());
+        let other = fx.world.objects.get_mut(&OTHER).unwrap();
+        other.position = [from[0] * 16 + 8, from[1] * 16 + 8, 1];
+        // It may stand on level 1 (data word 4 bit 0) on a tile with no
+        // floor (data word 42 flag 2), as the lot's tiles have none.
+        other.data[4] |= 1;
+        other.data[42] |= 2;
+        famous(&mut fx, OTHER, 10);
+        // Find Location mode 2 puts OTHER where the lamp is, on tile `to`,
+        // with the lot told (0x433340).
+        fx.lamp_mut().position = [to[0] * 16 + 8, to[1] * 16 + 8, 1];
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                FIND_LOCATION,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [2, 0, 0, 0, 0, 0, 0, 0],
+            )]),
+        );
+        let ran = fx.run_with(LAMP, 4096, OTHER as i16, &[], 1000);
+        assert_eq!(ran, Ok(true), "lot size {size}");
+        assert_eq!(
+            fx.world.objects[&OTHER].position,
+            [to[0] * 16 + 8, to[1] * 16 + 8, 1]
+        );
+        let star = fx.world.objects[&OTHER].slots[2].object as u16;
+        fx.world
+            .objects
+            .get(&star)
+            .is_some_and(|o| o.guid == STAR_MARKER)
+    };
+    assert!(
+        star_on(32, [31, 3], [30, 3]),
+        "tile 31 is off a 32-tile lot: OTHER arrives"
+    );
+    assert!(
+        !star_on(64, [31, 3], [30, 3]),
+        "tile 31 is on a 64-tile lot: no arrival"
+    );
+    assert!(!star_on(32, [3, 31], [3, 30]), "x did not move: no arrival");
+}
+
 #[test]
 fn selecting_nobody_or_a_sim_that_is_off_the_lot() {
     let mut fx = lot_with_person();
@@ -361,15 +576,118 @@ fn a_lot_without_indicators_still_selects() {
     assert_eq!(fx.world.globals[3], PERSON as i16);
 }
 
+/// The date of the date tests: a second resident.
+const DATE: u16 = 51;
+
+fn date_word(fx: &mut Fixture, id: u16, value: i16) {
+    let sim = fx.world.objects.get_mut(&id).unwrap();
+    sim.person.as_mut().unwrap().data[77] = value;
+}
+
 #[test]
-fn what_the_selection_does_not_port_fails() {
-    // A Sim with a date, which the second indicator marks.
+fn selecting_a_sim_with_a_date_puts_the_second_indicator_on_the_date() {
+    // 0x446924..0x446bae: a word 77 below 0 names the date by its negated
+    // ID. The second indicator leaves the lot and goes into the date's
+    // head slot (record 2, slot 1), letting go what was there.
     let mut fx = lot_with_person();
+    resident(&mut fx, DATE, [3, 2]);
     asking(&mut fx, |i, world| i.announce_house(world).unwrap());
-    let sim = fx.world.objects.get_mut(&PERSON).unwrap();
-    sim.person.as_mut().unwrap().data[77] = -3;
-    let (result, _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON)));
-    assert!(unsupported(result).contains("date"));
+    let [first, second] = fx.world.indicators;
+    date_word(&mut fx, PERSON, -(DATE as i16));
+    let ((), _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON)).unwrap());
+    assert_eq!(fx.world.objects[&PERSON].slots[2].object, first as i16);
+    assert_eq!(fx.world.objects[&DATE].slots[2].object, second as i16);
+    let marker = &fx.world.objects[&second];
+    assert_eq!((marker.data[2], marker.data[3]), (DATE as i16, 1));
+    assert_eq!(marker.position, fx.world.objects[&DATE].position);
+
+    // A word 77 above 0 does nothing here, and neither does a date that
+    // is not on the lot (only the indicator leaves).
+    for date in [DATE as i16, -999] {
+        let mut fx = lot_with_person();
+        resident(&mut fx, DATE, [3, 2]);
+        asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+        let second = fx.world.indicators[1];
+        date_word(&mut fx, PERSON, date);
+        let ((), _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON)).unwrap());
+        assert_eq!(fx.world.objects[&DATE].slots[2].object, 0);
+        assert_eq!(fx.world.objects[&second].data[2], 0);
+    }
+}
+
+#[test]
+fn writing_a_date_or_fame_queues_an_indicator_refresh() {
+    // 0x4538e3: resolving person word 77 or 81 with write intent queues
+    // the person, before the write. A date is queued once and only while
+    // word 77 is not 0 (0x4448a6); fame every time (0x444962).
+    let mut fx = lot_with_person();
+    let write = |fx: &mut Fixture, word: i16, value: i16| {
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![assign(
+                scope::MY_PERSON,
+                word,
+                scope::LITERAL,
+                value,
+                RETURN_TRUE,
+            )]),
+        );
+        assert_eq!(fx.run_with(PERSON, 4096, 0, &[], 100), Ok(true));
+    };
+    write(&mut fx, 77, -(DATE as i16));
+    assert_eq!(fx.world.indicator_queues, Default::default());
+    write(&mut fx, 77, 0);
+    write(&mut fx, 77, 5);
+    assert_eq!(fx.world.indicator_queues.dates, [PERSON]);
+    write(&mut fx, 77, 6);
+    assert_eq!(fx.world.indicator_queues.dates, [PERSON]);
+    write(&mut fx, 81, 3);
+    write(&mut fx, 81, 4);
+    assert_eq!(fx.world.indicator_queues.stars, [PERSON, PERSON]);
+    assert!(fx.world.indicator_queues.dirty);
+}
+
+#[test]
+fn the_indicator_refresh_moves_the_date_marker_and_empties_the_queues() {
+    // 0x4464db -> 0x4472a2: the second indicator leaves the lot, and goes
+    // onto the date of a selected person whose word 77 is below 0. The
+    // queues are emptied and the flag cleared (0x448847, 0x446643).
+    let mut fx = lot_with_person();
+    resident(&mut fx, DATE, [3, 2]);
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    let ((), _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON)).unwrap());
+    let second = fx.world.indicators[1];
+    date_word(&mut fx, PERSON, -(DATE as i16));
+    fx.world.indicator_queues = sims_sim::IndicatorQueues {
+        dates: vec![PERSON],
+        stars: vec![DATE],
+        dirty: true,
+        ..Default::default()
+    };
+    // Announcing the house with a Sim selected only refreshes (0x4a8679).
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    assert_eq!(fx.world.objects[&DATE].slots[2].object, second as i16);
+    assert_eq!(fx.world.indicator_queues, Default::default());
+
+    // A person that is not selected loses the marker and gives no new one.
+    fx.world.objects.get_mut(&PERSON).unwrap().selected = false;
+    fx.world.indicator_queues = sims_sim::IndicatorQueues {
+        dates: vec![PERSON],
+        stars: Vec::new(),
+        dirty: true,
+        ..Default::default()
+    };
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    assert_eq!(fx.world.objects[&DATE].slots[2].object, 0);
+    assert_eq!(fx.world.objects[&second].data[2], 0);
+
+    // Nothing is refreshed while the flag is clear.
+    fx.world.objects.get_mut(&PERSON).unwrap().selected = true;
+    fx.world.indicator_queues.dates = vec![PERSON];
+    let before = fx.world.hash();
+    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    assert_eq!(fx.world.hash(), before);
 }
 
 #[test]

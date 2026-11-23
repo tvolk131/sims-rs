@@ -253,7 +253,7 @@ pub(crate) const STAR_MARKER: u32 = 0xE933_7020;
 /// Superstar expansion bit in `[0x6e48bc] + 0x66` (`Program::expansions`),
 /// checked before creating or placing star markers (0x44639f, 0x446bf4,
 /// 0x447a36).
-const EXPANSION_SUPERSTAR: u16 = 0x40;
+pub(crate) const EXPANSION_SUPERSTAR: u16 = 0x40;
 
 /// A container entry in a definition's SLOT list.
 const CONTAINER_SLOT: u16 = 0;
@@ -374,6 +374,29 @@ pub(crate) fn on_lot(position: [i32; 2]) -> bool {
         n > 0 && n < FULL - 1
     };
     inside(position[0]) && inside(position[1])
+}
+
+/// The star pools of a world saved before they were kept (`Saved`
+/// format 10 and older): where the port then took them from. A star
+/// marker held by an object is in use; one off the lot and held by none
+/// is available, the first in the registration order last, as that one
+/// was handed out next.
+pub(crate) fn adopted_star_pools(world: &World) -> sims_sim::IndicatorQueues {
+    let mut pools = sims_sim::IndicatorQueues::default();
+    for &id in world.order.iter().rev() {
+        let Some(obj) = world.objects.get(&id) else {
+            continue;
+        };
+        if obj.guid != STAR_MARKER {
+            continue;
+        }
+        if obj.data.get(data::CONTAINER).copied().unwrap_or(0) != 0 {
+            pools.stars_in_use.push(id);
+        } else if !on_lot([obj.position[0], obj.position[1]]) {
+            pools.available_stars.push(id);
+        }
+    }
+    pools
 }
 
 /// Whether a point is off the lot's inner tiles (0x422632): either
@@ -1335,8 +1358,9 @@ impl Interpreter<'_> {
 
     /// What the object registry does when it is told an object left the
     /// lot (0x447d2b, 0x4481eb): an indicator or star marker (`STAR_MARKER`)
-    /// is taken off the lot once more, this time without telling the registry
-    /// (returning a star marker to the available pool as off-lot uncontained).
+    /// is taken off the lot once more, this time without telling the registry,
+    /// and a star marker in use goes back to the available pool
+    /// ([`Interpreter::release_star`]).
     /// So an indicator or star marker that leaves is asked function 10 twice.
     /// Any other object changes nothing, and neither does a person: the
     /// original looks up what the person holds in its slot 1 and then goes by
@@ -1356,6 +1380,9 @@ impl Interpreter<'_> {
             || object.person.is_some()
         {
             return Ok(());
+        }
+        if object.guid == STAR_MARKER {
+            Self::release_star(world, id);
         }
         self.take_off_one(world, id, false)
     }
@@ -1414,7 +1441,10 @@ impl Interpreter<'_> {
         }
         let words = self.words(world, id).map_err(fail)?;
         let old = position(world, id).map_err(fail)?;
-        let was_outside = !capture_raw(world, id).map_err(fail)?.on_lot;
+        // 0x433349..0x43336f: whether the old position is off the active
+        // lot (0x422632 with the lot, 0x6e552c), so against the lot's size,
+        // not the arrays' 64 tiles.
+        let was_outside = off_lot(world, [old[0], old[1]]);
         let level = match to.container {
             Some(parent) => position(world, parent).map_err(fail)?[2],
             None => to.level,
@@ -1476,7 +1506,10 @@ impl Interpreter<'_> {
             self.callback(world, parent, function::PLACED, 0)?;
         }
         let now = position(world, id).map_err(fail)?;
-        if now[..2] != old[..2] && was_outside && notify {
+        // 0x4335a2..0x4335cc: the arrival (0x44752e) runs when the x word
+        // moved (only +0xf4 is compared) and the old position was off the
+        // lot.
+        if now[0] != old[0] && was_outside && notify {
             self.placed_from_outside(world, id)?;
         }
         if portal {
@@ -1795,9 +1828,9 @@ impl Interpreter<'_> {
     ///
     /// - the person is the selected Sim: the first indicator goes into its
     ///   head slot ([`Interpreter::mark_selected`], 0x4475d2);
-    /// - person word 77 names an object (is above 0): the second
-    ///   indicator moves to that object (0x4477fb), which is not ported
-    ///   and fails;
+    /// - person word 77 names an object (is above 0): the person has a
+    ///   date with it, and the second indicator moves onto its head
+    ///   (0x4477fb; taken off the lot first if the person is selected);
     /// - the person is not selected and person word 81 is 10 or more:
     ///   with bit 0x40 of the installed-expansions mask (application field
     ///   +0x66, [`crate::Program::expansions`]), a pooled star marker
@@ -1828,44 +1861,43 @@ impl Interpreter<'_> {
             trap: Trap::Invalid("a person stopped being one".into()),
         })?;
         let word = |index: usize| person.data.get(index).copied().unwrap_or(0);
-        if word(77) > 0 {
-            return Err(Fault {
-                object: id,
-                at: None,
-                trap: Trap::Unsupported(
-                    "a person whose person word 77 names an object moves the second indicator \
-                     there (0x4477fb); not ported"
-                        .into(),
-                ),
-            });
+        let (date, fame) = (word(77), word(81));
+        // 0x4477c8..0x447a2d: a person whose word 77 is above 0 has a date
+        // with the object of that ID. If the person is selected the second
+        // indicator first leaves the lot (virtual function 0x50 with 1);
+        // then, if the object exists (0x40743b), the indicator goes onto its
+        // head ([`Interpreter::mark_date`]).
+        let second = world.indicators[1];
+        if second != 0 && date > 0 {
+            if selected {
+                self.take_off(world, second, true)?;
+            }
+            if let Some(target) = registered(world, date) {
+                self.mark_date(world, target)?;
+            }
         }
-        if !selected && word(81) >= 10 {
-            self.mark_star(world, id)?;
+        if !selected && fame >= 10 {
+            self.mark_star(world, id, true)?;
         }
         Ok(())
     }
 
-    /// Finds an available (off-lot, uncontained) star marker in `world.order`,
-    /// returning the most recently created available instance first to match
-    /// the original's LIFO `pool_avail.back()` (0x447b22, 0x446ce0).
+    /// The available pool's last star (`pool_avail.back()`, 0x447b22,
+    /// 0x446ce0): [`sims_sim::IndicatorQueues::available_stars`].
     fn available_star(world: &World) -> Option<u16> {
-        world.order.iter().copied().find(|&id| {
-            world.objects.get(&id).is_some_and(|obj| {
-                obj.guid == STAR_MARKER
-                    && obj.data.get(data::CONTAINER).copied().unwrap_or(0) == 0
-                    && !on_lot([obj.position[0], obj.position[1]])
-            })
-        })
+        world.indicator_queues.available_stars.last().copied()
     }
 
     /// Ensures the Superstar star-marker pool (`self + 0xdc` in `Sims.exe`,
     /// 0x446356) has an available `STAR_MARKER` (`0xE933_7020`) instance.
     ///
-    /// When no available star exists and Superstar (`0x40`) is installed with
-    /// `STAR_MARKER` present in the catalog, creates 4 hidden (`data[8] |= 0x4000`)
-    /// instances if no star markers exist on the lot yet (both `pool_avail` and
-    /// `pool_in_use` empty, 0x4463f3..0x446421), or 2 more instances if all
-    /// existing star markers are currently in use (0x44642a).
+    /// When the available pool is empty and Superstar (`0x40`) is
+    /// installed with `STAR_MARKER` present in the catalog, creates 4
+    /// hidden (`data[8] |= 0x4000`) instances if the in-use pool is empty
+    /// too (0x4463f3..0x446421), or 2 more otherwise (0x44642a), and
+    /// appends each to the available pool in the order made (0x4464c9).
+    /// A star in neither pool (one lost on a border tile) counts in
+    /// neither.
     fn ensure_star_pool(&self, world: &mut World) -> Result<Option<u16>, Fault> {
         if let Some(star) = Self::available_star(world) {
             return Ok(Some(star));
@@ -1876,8 +1908,11 @@ impl Interpreter<'_> {
         if self.catalog.object(STAR_MARKER).is_none() {
             return Ok(None);
         }
-        let any_existing = world.objects.values().any(|obj| obj.guid == STAR_MARKER);
-        let count = if any_existing { 2 } else { 4 };
+        let count = if world.indicator_queues.stars_in_use.is_empty() {
+            4
+        } else {
+            2
+        };
         for _ in 0..count {
             let star_id = self.create(world, STAR_MARKER)?;
             if let Some(obj) = world.objects.get_mut(&star_id)
@@ -1886,8 +1921,20 @@ impl Interpreter<'_> {
                 // Hidden: flag 0x4000 of data word 8 (0x446489..0x4464b1).
                 obj.data[data::FLAGS] |= 0x4000;
             }
+            world.indicator_queues.available_stars.push(star_id);
         }
         Ok(Self::available_star(world))
+    }
+
+    /// 0x4481eb (0x448338..0x4483d1): a star marker let go from a head
+    /// moves from the in-use pool to the end of the available pool
+    /// (0x4483bd), if it was in use. One in neither pool stays there.
+    pub(crate) fn release_star(world: &mut World, star: u16) {
+        let pools = &mut world.indicator_queues;
+        if let Some(index) = pools.stars_in_use.iter().position(|&s| s == star) {
+            pools.available_stars.push(star);
+            pools.stars_in_use.remove(index);
+        }
     }
 
     /// Places a pooled Superstar star marker (`STAR_MARKER`, `0xE933_7020`)
@@ -1897,7 +1944,24 @@ impl Interpreter<'_> {
     /// Requires bit `0x40` (`EXPANSION_SUPERSTAR`) in [`crate::Program::expansions`].
     /// Skips silently if Superstar is not installed, `STAR_MARKER` is absent
     /// from the catalog, or the Sim stands on a border tile (`0x422632`).
-    pub(crate) fn mark_star(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+    ///
+    /// `pops_first`: whether the caller takes the star from the available
+    /// pool before it checks the tile. A star refresh (0x447012) and a
+    /// famous Sim's arrival (0x447b63) do, and for a Sim on a border tile
+    /// stop without putting it in the in-use pool, so the star is lost (in
+    /// neither [`sims_sim::IndicatorQueues::available_stars`] nor
+    /// [`sims_sim::IndicatorQueues::stars_in_use`]) and the next famous Sim
+    /// gets another. A deselection (0x446ce0..0x446ed9) reads the pool's
+    /// last star, checks the tile, and pops the pool's last star only after
+    /// it is placed, so a border tile leaves it available. Not modeled: the
+    /// popping paths also lose the star when the head slot's flags lack
+    /// bit 2 (0x447094..0x4470a8); the port does not keep slot flags.
+    pub(crate) fn mark_star(
+        &self,
+        world: &mut World,
+        id: u16,
+        pops_first: bool,
+    ) -> Result<(), Fault> {
         if self.program.expansions & EXPANSION_SUPERSTAR == 0 {
             return Ok(());
         }
@@ -1909,8 +1973,12 @@ impl Interpreter<'_> {
         let Some(star) = self.ensure_star_pool(world)? else {
             return Ok(());
         };
+        if pops_first {
+            world.indicator_queues.available_stars.pop();
+        }
         let [p0, p1, level] = position(world, id).map_err(fail)?;
         if off_lot(world, [p0, p1]) {
+            // Popped first, the star is now in neither pool: lost.
             return Ok(());
         }
         let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
@@ -1946,7 +2014,14 @@ impl Interpreter<'_> {
                 level,
             },
             true,
-        )
+        )?;
+        // Into the in-use pool (0x4471b0, 0x447d22, 0x446eba); a
+        // deselection then pops the available pool's last star (0x446ed9).
+        world.indicator_queues.stars_in_use.push(star);
+        if !pops_first {
+            world.indicator_queues.available_stars.pop();
+        }
+        Ok(())
     }
 
     /// The selected Sim `id` has come onto the lot (0x4475d2 to 0x4477bb),
@@ -1982,30 +2057,44 @@ impl Interpreter<'_> {
         if capture(world, indicator).map_err(fail)?.container != Some(id) {
             self.take_off(world, indicator, true)?;
         }
+        self.put_in_head(world, indicator, id)
+    }
+
+    /// Puts `indicator` into the head slot of `id`, as the interface does
+    /// with each of its markers (0x4475d2 for the selected Sim's,
+    /// 0x446924, 0x4477c8 and 0x447376 for a date's):
+    ///
+    /// 1. An object on the lot's border tiles (0x422632) stops here.
+    /// 2. Its slot 1 as scripts count it (record 2) is its head slot, when
+    ///    its definition has no container slots of its own (the person's
+    ///    records, 0x45962b); one with any fails loudly. The head slot has
+    ///    flag 2 (record +0x1c), so the step goes on.
+    /// 3. The object the head slot holds, if any, is let go
+    ///    ([`Interpreter::release_from_head`], 0x4481eb).
+    /// 4. The indicator is put into the head slot with the lot told
+    ///    (virtual function 0x58: the object's position and level, slot 1,
+    ///    last argument 1).
+    ///
+    /// The rest is drawing: the indicator's sprite is told the object's
+    /// draw group and shown.
+    pub(crate) fn put_in_head(
+        &self,
+        world: &mut World,
+        indicator: u16,
+        id: u16,
+    ) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
         let [p0, p1, level] = position(world, id).map_err(fail)?;
         if off_lot(world, [p0, p1]) {
             return Ok(());
         }
-        let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
-        let definition = crate::interpreter::object_definition(self.catalog, world, object.guid)
-            .ok_or_else(|| fail(Trap::Invalid("object has no definition".into())))?;
-        let own = self
-            .program
-            .slots(definition.resource, definition.chunk)
-            .iter()
-            .filter(|entry| entry.kind == CONTAINER_SLOT)
-            .count();
-        if own != 0 {
-            return Err(fail(Trap::Unsupported(format!(
-                "the selected Sim {id} comes onto the lot with {own} container slots of its \
-                 own: its slot 1 (0x4476a2) is then one of them, whose flags are not read"
-            ))));
-        }
-        let held = object
-            .slots
-            .get(2)
-            .ok_or_else(|| fail(Trap::Invalid(format!("person {id} has no head slot"))))?
-            .object;
+        let Some(held) = self.head_slot(world, id)? else {
+            return Err(fail(Trap::Invalid(format!("object {id} has no head slot"))));
+        };
         if let Some(held) = registered(world, held) {
             self.release_from_head(world, held)?;
         }
@@ -2023,13 +2112,51 @@ impl Interpreter<'_> {
         )
     }
 
+    /// What the head slot of `id` holds (record 2, slot 1 as scripts count
+    /// it): an object ID or 0, or None when `id` has no such record. The
+    /// record is the head slot only when the definition has no container
+    /// slots of its own; one with any fails loudly, since its slot 1 is
+    /// then one of them, whose flags are not read.
+    pub(crate) fn head_slot(&self, world: &World, id: u16) -> Result<Option<i16>, Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
+        let definition = crate::interpreter::object_definition(self.catalog, world, object.guid)
+            .ok_or_else(|| fail(Trap::Invalid("object has no definition".into())))?;
+        let own = self
+            .program
+            .slots(definition.resource, definition.chunk)
+            .iter()
+            .filter(|entry| entry.kind == CONTAINER_SLOT)
+            .count();
+        if own != 0 {
+            return Err(fail(Trap::Unsupported(format!(
+                "object {id} has {own} container slots of its own: its slot 1 (0x4476a2, and \
+                 for a date 0x446a4a, 0x4478d0) is then one of them, whose flags are not read"
+            ))));
+        }
+        Ok(object.slots.get(2).map(|slot| slot.object))
+    }
+
+    /// The date indicator (the lot's second indicator) onto `target`'s head
+    /// ([`Interpreter::put_in_head`]). The callers have looked `target` up
+    /// by its ID (0x40743b) from the dating person's word 77.
+    pub(crate) fn mark_date(&self, world: &mut World, target: u16) -> Result<(), Fault> {
+        let indicator = world.indicators[1];
+        self.put_in_head(world, indicator, target)
+    }
+
     /// 0x4481eb, for an object in a Sim's head slot: reads the argument's GUID
     /// FIRST, then for a person resolves its head slot (record 2; none, nothing
     /// happens). Matching native `0x4481eb` (`legacy/crates/sims-vm/src/indicator_pools.rs:229`),
     /// the GUID check tests the argument's GUID, not the resolved occupant's:
     /// an indicator or pooled star marker (`STAR_MARKER`, `0xE933_7020`) leaves
-    /// the lot unannounced (virtual function 0x50 with 0), which also returns a
-    /// star marker to the available pool (`0x448338..0x4483e0`); any other
+    /// the lot unannounced (virtual function 0x50 with 0), after a star marker
+    /// in use goes back to the available pool (`0x448338..0x4483d1`,
+    /// [`Interpreter::release_star`]); any other
     /// object (including a person passed directly) does nothing.
     pub(crate) fn release_from_head(&self, world: &mut World, id: u16) -> Result<(), Fault> {
         let fail = |trap| Fault {
@@ -2050,6 +2177,9 @@ impl Interpreter<'_> {
         let Some(target) = target else {
             return Ok(());
         };
+        if guid == STAR_MARKER {
+            Self::release_star(world, target);
+        }
         if guid == STAR_MARKER || INDICATORS.contains(&guid) {
             self.take_off(world, target, false)?;
         }
@@ -2720,8 +2850,72 @@ fn forward(at: [i8; 3], facing: i16) -> Result<[i8; 3], Trap> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// An object for the star-pool tests: `held_by` is its container
+    /// (`data::CONTAINER`).
+    pub(crate) fn pool_object(
+        id: u16,
+        guid: u32,
+        position: [i32; 3],
+        held_by: i16,
+    ) -> sims_sim::Object {
+        let mut data = vec![0; 128];
+        data[data::CONTAINER] = held_by;
+        sims_sim::Object {
+            id,
+            guid,
+            footprint: [0; 4],
+            position,
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: Vec::new(),
+            data,
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: 0,
+            relationships: Vec::new(),
+            slots: Vec::new(),
+            dynamic_sprites: Vec::new(),
+            multipart: None,
+            portal: None,
+            person: None,
+            registry_word: None,
+            last_result: false,
+            removal_skips_resets: false,
+            selected: false,
+        }
+    }
+
+    /// A world saved before the star pools were kept: its stars go into
+    /// the pools where the port took them from. Held ones are in use;
+    /// free ones off the lot are available, the first registered last,
+    /// as the port handed that one out next. A star on the lot held by
+    /// none, and any other object, is in neither.
+    #[test]
+    fn a_world_saved_without_star_pools_adopts_its_stars() {
+        let object = pool_object;
+        let off = [-16, -16, 1];
+        let on = [40, 40, 1];
+        let mut world = World::empty();
+        for o in [
+            object(4, STAR_MARKER, off, 0),
+            object(5, STAR_MARKER, on, 9),
+            object(6, STAR_MARKER, off, 0),
+            object(7, STAR_MARKER, on, 0),
+            object(8, 0x1234, off, 0),
+            object(9, STAR_MARKER, on, 3),
+        ] {
+            world.order.push(o.id);
+            world.objects.insert(o.id, o);
+        }
+        let pools = adopted_star_pools(&world);
+        assert_eq!(pools.available_stars, [6, 4]);
+        assert_eq!(pools.stars_in_use, [9, 5]);
+        assert!(pools.stars.is_empty() && pools.dates.is_empty() && !pools.dirty);
+    }
 
     #[test]
     fn portrait_start_checks_rotated_bounds_falls_back_and_unrotates() {

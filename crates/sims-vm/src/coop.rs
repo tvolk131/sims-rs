@@ -819,6 +819,10 @@ struct CoopSnapshotEnvelope {
 
 /// Canonical subset of format-8 unencoded `World` fields plus `Lot`/co-op
 /// continuation inputs hashed into [`Lot::coop_world_hash`].
+///
+/// **A change to these fields bumps `sims_net::PROTOCOL_VERSION`**: peers
+/// on two builds would otherwise pass the handshake and then fail every
+/// fingerprint check, even on an idle lot.
 #[derive(Serialize)]
 struct CoopWorldFingerprintTail<'a> {
     world_hash: [u8; 32],
@@ -859,6 +863,9 @@ struct CoopWorldFingerprintTail<'a> {
     active_special_panel: Option<(DialogId, &'a ShownSpecialPanel)>,
     frozen_dialog_digest: Option<[u8; 32]>,
     pending_speed_sync: bool,
+    /// The people the next draw refreshes the indicators of: the lot
+    /// snapshot carries them (`Saved` format 11).
+    indicator_queues: &'a sims_sim::IndicatorQueues,
 }
 
 /// Writes fixed session globals (`Free Will` 30, `Machine Level` 33,
@@ -2952,6 +2959,7 @@ impl Lot {
                 .and_then(|c| c.active_special_panel.as_ref().map(|(id, s)| (*id, s))),
             frozen_dialog_digest,
             pending_speed_sync: self.coop.as_ref().is_some_and(|c| c.pending_speed_sync),
+            indicator_queues: &w.indicator_queues,
         };
         let mut hasher = Sha256::new();
         hasher.update(COOP_WORLD_HASH_DOMAIN);
@@ -5372,6 +5380,24 @@ mod tests {
         );
         assert_eq!(interactive.world().hash(), restored.world().hash());
         assert_eq!(interactive.world().hash(), headless.world().hash());
+    }
+
+    #[test]
+    fn a_pending_indicator_refresh_counts_in_the_fingerprint_and_lot_compare() {
+        // A fame write that leaves the word as it was still queues a star
+        // refresh (0x444962), which the next draw acts on.
+        let (program, catalog, world) = run_expr_world();
+        let lot_a = synthetic_coop_lot(
+            program.clone(),
+            catalog.clone(),
+            world.clone(),
+            Frames::default(),
+        );
+        let mut lot_b = synthetic_coop_lot(program, catalog, world, Frames::default());
+        lot_b.world.indicator_queues.queue_star(1);
+        assert_eq!(lot_a.world().hash(), lot_b.world().hash());
+        assert_ne!(lot_a.coop_world_hash(), lot_b.coop_world_hash());
+        assert!(!crate::both_ways::same_lot(lot_a.world(), lot_b.world()));
     }
 
     #[test]

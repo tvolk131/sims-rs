@@ -7,7 +7,6 @@ use sims_formats::{
     iff::{Iff, ScanError, ScannedIff},
 };
 use std::collections::BTreeMap;
-use std::fs::File;
 #[cfg(not(unix))]
 use std::io::{Read, Seek, SeekFrom};
 #[cfg(unix)]
@@ -72,10 +71,12 @@ fn scan_loose_iff(
             std::io::Error::new(std::io::ErrorKind::InvalidData, message),
         )
     };
+    // Non-blocking, and refused unless the handle is a regular file, so a FIFO
+    // in a mount (e.g. Downloads) is a diagnostic instead of a hang.
     #[cfg(unix)]
-    let file = File::open(&resource.path).map_err(io)?;
+    let file = crate::index::open_regular_nonblocking(&resource.path).map_err(io)?;
     #[cfg(not(unix))]
-    let mut file = File::open(&resource.path).map_err(io)?;
+    let mut file = crate::index::open_regular_nonblocking(&resource.path).map_err(io)?;
     let len = file.metadata().map_err(io)?.len();
     if len > far::MAX_MEMBER {
         return Err(invalid(format!(

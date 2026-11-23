@@ -585,6 +585,7 @@ fn ordinary_dialogs_format_tokens_resolve_icon_modes_and_caller_title_fallback()
         careers: Some(&careers),
         fame: Some(&fame),
         families: Some(&families),
+        ..Default::default()
     };
 
     // 1. Real VM-emitted dialog check: step the Goth house to tick 2 where the

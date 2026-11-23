@@ -98,9 +98,10 @@ Both came from the port's arrival, not from the marker:
   those funds and comes home.
 - **The shop and edit mode use the household, not global 9.** A solo visit
   is played, not edited, and the shop opens.
-- **The travel envelope goes to version 3.** The arrival family follows
-  the payload. Older builds refuse a version 3 trip. Versions 1 and 2 still
-  load, and their arrival family is derived:
+- **The travel envelope goes to version 4** (version 3 is the made-types
+  order, `20261123-made-types-order-format-bumps.md`). The arrival family
+  follows the payload. Older builds refuse a version 4 trip. Versions 1 to
+  3 still load, and their arrival family is derived:
   - where the travel plan allowed one party, from the destination:
     Downtown and Studio Town are `Solo`, Vacation Island and Old Town
     `Family`, Magic Town's residential lots `Group`;

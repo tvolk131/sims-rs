@@ -436,6 +436,7 @@ pub(crate) fn same_lot(a: &World, b: &World) -> bool {
         && a.portraits == b.portraits
         && a.dirty_portraits == b.dirty_portraits
         && a.saved_portraits == b.saved_portraits
+        && a.indicator_queues == b.indicator_queues
         && a.generated_portrait_2002 == b.generated_portrait_2002
         && a.made_portrait_head == b.made_portrait_head
         && a.ambiguous_portraits == b.ambiguous_portraits

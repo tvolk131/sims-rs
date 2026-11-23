@@ -280,16 +280,23 @@ impl Index {
         map
     }
 
+    /// The mount number a neighborhood's `Characters` directory takes when it is
+    /// added ([`Index::add_characters`]): right after the user objects. Every resource
+    /// of a mount below it comes before every `Characters` resource in load order.
+    #[must_use]
+    pub fn characters_mount(&self) -> usize {
+        self.mounts
+            .iter()
+            .position(|m| m.path == Install::USER_OBJECTS)
+            .map_or(self.mounts.len(), |n| n + 1)
+    }
+
     /// Adds a neighborhood's `Characters` directory as a mount named
     /// `Characters`. The original scans the neighborhood's people after the
     /// user objects and before Downloads (0x43c609), so the mount and its
     /// resources go there, not at the end.
     pub fn add_characters(&mut self, path: &Path) -> Result<()> {
-        let number = self
-            .mounts
-            .iter()
-            .position(|m| m.path == Install::USER_OBJECTS)
-            .map_or(self.mounts.len(), |n| n + 1);
+        let number = self.characters_mount();
         self.mounts.insert(
             number,
             Mount {
@@ -319,11 +326,7 @@ impl Index {
     /// case-folded ordering, Windows-1252 key encoding, and file-table hash
     /// order as [`Index::add_characters`].
     pub fn add_character_files(&mut self, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
-        let number = self
-            .mounts
-            .iter()
-            .position(|m| m.path == Install::USER_OBJECTS)
-            .map_or(self.mounts.len(), |n| n + 1);
+        let number = self.characters_mount();
         self.mounts.insert(
             number,
             Mount {
@@ -1077,10 +1080,73 @@ pub fn far_members(path: &Path) -> Result<(Vec<Member>, Vec<String>)> {
 /// An archive member with the bytes of its name as the archive stores them.
 type RawMember = (Member, Vec<u8>);
 
+/// Opens `path` for reading with `O_NONBLOCK` where its value is known, so a
+/// FIFO does not block the open. The same flags as `sims-antics lift`'s input
+/// open. The catalog's loose-file scan uses it too. The later opens of
+/// indexed files (`Resource::read`, `pool.rs`) still block if a FIFO replaces
+/// a file after indexing; that residual hangs rather than misreads (ADR
+/// 20261123-lift-cli-catalog-arities).
+fn open_nonblocking(path: &Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0x0004;
+        options.custom_flags(O_NONBLOCK);
+    }
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0x0800;
+        options.custom_flags(O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+fn not_regular_file() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file")
+}
+
+/// Opens `path` without blocking on a FIFO ([`open_nonblocking`]) and refuses
+/// the handle unless `fstat` says it is a regular file. Regular files ignore
+/// O_NONBLOCK, so reads from the returned file behave as usual.
+pub(crate) fn open_regular_nonblocking(path: &Path) -> std::io::Result<File> {
+    let file = open_nonblocking(path)?;
+    if file.metadata()?.is_file() {
+        Ok(file)
+    } else {
+        Err(not_regular_file())
+    }
+}
+
 /// [`far_members`], each with the bytes of its name.
 fn archive_members(path: &Path) -> Result<(Vec<RawMember>, Vec<String>)> {
     let io = |e| Error::io(path, e);
-    let mut file = File::open(path).map_err(io)?;
+    // A blocking open of a FIFO (e.g. a `*.far` pipe in Downloads) waits for a
+    // writer. The path is checked first (for targets without a known
+    // O_NONBLOCK), then opened non-blocking and the handle itself checked, so a
+    // FIFO swapped in after the first check cannot block either.
+    if !std::fs::metadata(path).map_err(io)?.is_file() {
+        return Err(io(not_regular_file()));
+    }
+    let mut file = open_regular_nonblocking(path).map_err(io)?;
     let len = file.metadata().map_err(io)?.len();
     let mut header = [0; 16];
     file.read_exact(&mut header).map_err(io)?;
@@ -1133,4 +1199,39 @@ fn archive_members(path: &Path) -> Result<(Vec<RawMember>, Vec<String>)> {
         ));
     }
     Ok((members, skipped))
+}
+
+#[cfg(all(test, unix))]
+mod fifo_tests {
+    use super::open_regular_nonblocking;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// The open-then-`fstat` path on its own, past the path pre-check: a FIFO with no
+    /// writer is refused without blocking.
+    #[test]
+    fn open_regular_nonblocking_refuses_a_fifo_without_blocking() {
+        let dir =
+            std::env::temp_dir().join(format!("sims-content-fifo-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let fifo = dir.join("pipe.far");
+        let _ = std::fs::remove_file(&fifo);
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should be available on Unix");
+        assert!(status.success(), "mkfifo failed");
+
+        let (send, receive) = mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = send.send(open_regular_nonblocking(&path).map(|_| ()));
+        });
+        let result = receive.recv_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = result
+            .expect("opening a FIFO blocked")
+            .expect_err("a FIFO must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+    }
 }

@@ -893,3 +893,28 @@ fn make_new_character_names_new_child_and_pet_from_last_kind3_dialog_text() {
         Some("DefaultKid")
     );
 }
+
+/// Two types made in one tick are kept in the order made, though the
+/// second's GUID is lower: the tick gives the GUID's high word and the
+/// draw its low (0x4260e1), and the original appends each new type to the
+/// interface's table of person types as it is made (0x4265fd -> 0x4e8a3a).
+#[test]
+fn types_made_in_one_tick_keep_the_order_made() {
+    let mut fx = fixture(0, 10, 1, 0, &TONES);
+    // The first GUID draw from this state is 0x7ff1, so the second is lower.
+    fx.world.crt_rng = CrtRng::from_state(10018);
+    assert_eq!(fx.run(), Ok(true));
+    assert_eq!(fx.run(), Ok(true));
+    let made: Vec<u32> = fx.world.characters.made.keys().copied().collect();
+    let [first, second] = made[..] else {
+        panic!("two types: {made:08X?}");
+    };
+    assert_eq!(first >> 16, second >> 16, "made in one tick");
+    assert!(second < first, "{first:08X} then {second:08X}");
+    // The order survives the world's encoding.
+    let back = sims_sim::World::decode(&fx.world.encode()).unwrap();
+    assert_eq!(
+        back.characters.made.keys().copied().collect::<Vec<_>>(),
+        [first, second]
+    );
+}
