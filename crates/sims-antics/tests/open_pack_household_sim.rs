@@ -1353,9 +1353,15 @@ fn cli_verify_build_and_equiv_subcommands_work_end_to_end() {
         !equiv_fail.status.success(),
         "expected non-zero exit for mutated script"
     );
+    // `equiv` reports a lockstep divergence as a counterexample only when the
+    // live-output checker confirms it; this tree's motive loop is not bounded by
+    // literals, so it stays inconclusive and names the divergent Play Sound (0x0017).
+    let stderr = String::from_utf8_lossy(&equiv_fail.stderr);
     assert!(
-        String::from_utf8_lossy(&equiv_fail.stderr).contains("COUNTEREXAMPLE"),
-        "stderr: {}",
-        String::from_utf8_lossy(&equiv_fail.stderr)
+        stderr.contains("COUNTEREXAMPLE")
+            || (stderr.contains("INCONCLUSIVE")
+                && stderr.contains("lockstep counterexample")
+                && stderr.contains("op 0x0017")),
+        "stderr: {stderr}"
     );
 }

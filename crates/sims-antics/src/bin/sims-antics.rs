@@ -6,7 +6,12 @@
 //! - `sims-antics expand <file.antics> [--pack <pack_dir>]`
 //! - `sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
-//! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]`
+//! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]`
+//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]`
+//!   (exit 0 equivalent, 1 different, 2 inconclusive or error). Only files that differ in
+//!   BHAV bodies alone are compared; DIFFERENT is reported only when both trees, run in
+//!   sims-vm from the same world, end differently; EQUIVALENT assumes neither run
+//!   exhausts the VM's instruction budget.
 //! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]`
 //! - `sims-antics build <pack_dir> --out <dir>`
 
@@ -16,15 +21,19 @@ use sims_antics::arity_catalog::{
 };
 use sims_antics::ir::BhavChunk;
 use sims_antics::{
-    EquivOptions, EquivResult, LiftOptions, StructuredLiftOutcome, UnsupportedHeaderReason,
-    callee_scope_name, check_bhav_equivalent_with_arities, compile_air, compile_pack_dir,
+    EquivOptions, EquivResult, IffEquivOptions, IffVerdict, LiftOptions, LiveOptions,
+    ResourceVerdict, StructuredLiftOutcome, UnsupportedHeaderReason, callee_scope_name,
+    check_bhav_equivalent_with_arities, check_iff_equivalent, compile_air, compile_pack_dir,
     compile_standalone_pack_dir, compile_v2_object_file, expand_v2_to_air,
     extract_lift_symbols_from_iff,
     lift::{format_bhav_labeled_air_with_context, format_bhav_raw_air, lift_bhav},
     lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
     structured_lift_header_check,
     v2::is_v2_source,
-    verify::{extract_bhav_arities_from_iff, extract_bhav_from_iff},
+    verify::{
+        check_tree_with_callees, extract_bhav_from_iff, library_arities_from_iff,
+        single_file_problem,
+    },
     verify_object_safety, verify_pack_safety,
 };
 use sims_formats::far;
@@ -41,6 +50,8 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 enum CliError {
     Message(String),
     BrokenPipe,
+    /// Exit with this status after the subcommand printed its own report.
+    Exit(u8),
 }
 
 impl From<String> for CliError {
@@ -141,13 +152,29 @@ fn os_arg_starts_with_dash(arg: &OsStr) -> bool {
     arg.as_encoded_bytes().starts_with(b"-")
 }
 
+/// The model assumption every EQUIVALENT verdict carries: the checkers compare what the
+/// trees do, not how many instructions they take, and `sims-vm` faults a run that
+/// exceeds its per-tick instruction budget (`interpreter.rs:494`).
+const BUDGET_ASSUMPTION: &str = ", assuming neither run exhausts the VM instruction budget";
+
 fn print_usage() {
     eprintln!(
         "Usage:\n  \
          sims-antics expand <file.antics> [--pack <pack_dir>]\n  \
          sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
-         sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]\n  \
+         sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]\n  \
+         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n    \
+             (files must differ in BHAV bodies alone; DIFFERENT needs a sims-vm replay that ends differently;\n    \
+              EQUIVALENT assumes neither run exhausts the VM instruction budget; the same holds for equiv;\n    \
+              a tree is EQUIVALENT only if every tree it may run is the same bytes or proven equivalent too;\n    \
+              --ignore-last-result and --ignore-frame-residue relax the named tree only: the trees it may run are\n    \
+              proven with both observed, since a primitive may run one as an object use whose return records them;\n    \
+              only private trees, 4096 to 8191, are run from an object's file: --global and --semi-global\n    \
+              name the libraries calls to 256-4095 and 8192 and up run; they are trusted to be the game's,\n    \
+              and two that disagree on a tree are refused;\n    \
+              --my-attributes is the attribute count of whatever runs as me, which call_as may make another\n    \
+              object than the one whose file holds the tree: give the smallest count of anything that runs it)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>\n\
          lift arities: inside an install, global and semi-global callee arities come from its catalog;\n  \
@@ -1823,6 +1850,7 @@ fn run() -> Result<(), CliError> {
             let mut iff_path: Option<PathBuf> = None;
             let mut tree_id: Option<u16> = None;
             let mut pack_dir: Option<PathBuf> = None;
+            let mut live_opts = LiveOptions::default();
             let mut i = 1usize;
             while i < args.len() {
                 let arg = args[i].as_os_str();
@@ -1842,6 +1870,16 @@ fn run() -> Result<(), CliError> {
                                 .ok_or_else(|| "missing directory path after --pack".to_owned())?;
                             pack_dir = Some(PathBuf::from(val));
                             i += 2;
+                            continue;
+                        }
+                        "--ignore-last-result" => {
+                            live_opts.observe_last_result = false;
+                            i += 1;
+                            continue;
+                        }
+                        "--ignore-frame-residue" => {
+                            live_opts.observe_frame_residue = false;
+                            i += 1;
                             continue;
                         }
                         other if other.starts_with('-') => {
@@ -1876,45 +1914,83 @@ fn run() -> Result<(), CliError> {
             } else {
                 read_regular_text_file(&antics_path)?
             };
-            let behaviors = if is_v2_source(&antics_src) {
-                compile_v2_object_file(&antics_path, pack_dir.as_deref())
-                    .map_err(|e| e.to_string())?
-                    .behaviors
+            // Side A: the compiled source, with its IFF when it is a v2 object.
+            let (behaviors, file_a) = if is_v2_source(&antics_src) {
+                let object = compile_v2_object_file(&antics_path, pack_dir.as_deref())
+                    .map_err(|e| e.to_string())?;
+                (object.behaviors, Some(object.iff_bytes))
             } else {
-                compile_air(&antics_src)
-                    .map_err(|e| e.to_string())?
-                    .behaviors
+                let module = compile_air(&antics_src).map_err(|e| e.to_string())?;
+                (module.behaviors, None)
             };
-            let bhav_a = behaviors.get(&tree_id).ok_or_else(|| {
-                format!("{} does not define tree #{tree_id}", antics_path.display())
-            })?;
+            if !behaviors.contains_key(&tree_id) {
+                return Err(
+                    format!("{} does not define tree #{tree_id}", antics_path.display()).into(),
+                );
+            }
             let (mut iff_file, iff_len, iff_hdr) = read_regular_file_prefix(&iff_path)?;
             let iff_bytes = read_bounded_iff_file(&iff_path, &mut iff_file, iff_len, iff_hdr)?;
-            let bhav_b = extract_bhav_from_iff(&iff_bytes, tree_id).map_err(|e| e.to_string())?;
-            let mut arities = extract_bhav_arities_from_iff(&iff_bytes).unwrap_or_default();
-            for (&id, bhav) in &behaviors {
-                let argc = match bhav.format {
-                    0x8000 => 4,
-                    0x8001 => usize::from(bhav.args).min(4),
-                    _ => usize::from(bhav.args),
-                };
-                arities.entry(id).or_insert(argc);
+            // The tree compared must be the one every loader runs: one chunk per type
+            // and ID, and a usable map that selects it.
+            let parsed = Iff::parse(iff_bytes.clone()).map_err(|e| e.to_string())?;
+            if let Some(problem) = single_file_problem(&parsed) {
+                return Err(format!("INCONCLUSIVE on tree #{tree_id}: {problem}").into());
             }
-
-            match check_bhav_equivalent_with_arities(
-                bhav_a,
-                &bhav_b,
+            extract_bhav_from_iff(&iff_bytes, tree_id).map_err(|e| e.to_string())?;
+            // Side B: every tree of the IFF (one chunk per ID, checked above).
+            let trees_b: std::collections::BTreeMap<u16, _> = parsed
+                .chunks
+                .iter()
+                .filter(|c| &c.tag == b"BHAV")
+                .filter_map(|c| {
+                    lift_bhav(c.id, &c.label, parsed.data(c))
+                        .ok()
+                        .map(|bhav| (c.id, bhav))
+                })
+                .collect();
+            // Each side calls the trees of its own file: the compiled source's for A,
+            // the IFF's for B. A callee only one side defines has an unknown argument
+            // count on the other, which the checkers treat as a possible difference.
+            // As the VM's loader keeps them (`program.rs:588`).
+            let arities_b: std::collections::BTreeMap<u16, usize> =
+                library_arities_from_iff(&iff_bytes)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(id, n)| Some((id, n?)))
+                    .collect();
+            let arities_a: std::collections::BTreeMap<u16, usize> = behaviors
+                .iter()
+                .map(|(&id, bhav)| {
+                    let argc = match bhav.format {
+                        0x8000 => 4,
+                        0x8001 => usize::from(bhav.args).min(4),
+                        _ => usize::from(bhav.args),
+                    };
+                    (id, argc)
+                })
+                .collect();
+            // The tree, and every tree it may run, must behave the same; a run that may
+            // read the file's other resources needs two IFFs that differ in BHAV bodies
+            // alone.
+            let (method, result) = check_tree_with_callees(
+                tree_id,
+                &behaviors,
+                file_a.as_deref(),
+                &trees_b,
+                Some(&iff_bytes),
+                (&arities_a, &arities_b),
                 &EquivOptions::default(),
-                Some(&arities),
-            ) {
+                &live_opts,
+            );
+            match result {
                 EquivResult::Equivalent {
                     states_checked,
                     paths_verified,
                 } => write_stdout_line(&format!(
-                    "EQUIVALENT: tree #{tree_id} ({states_checked} states checked, {paths_verified} paths verified)"
+                    "EQUIVALENT: tree #{tree_id} ({method}: {states_checked} states checked, {paths_verified} paths verified){BUDGET_ASSUMPTION}"
                 )),
                 EquivResult::Counterexample { path, divergence } => Err(format!(
-                    "COUNTEREXAMPLE on tree #{tree_id} after {} step(s): {divergence}",
+                    "COUNTEREXAMPLE on tree #{tree_id} ({method}) after {} step(s): {divergence}",
                     path.len()
                 )
                 .into()),
@@ -1924,6 +2000,13 @@ fn run() -> Result<(), CliError> {
             }
         }
         "lift" => cmd_lift(&args),
+        "verify-equiv" => match cmd_verify_equiv(&args) {
+            Err(CliError::Message(msg)) => {
+                eprintln!("error: {msg}");
+                Err(CliError::Exit(2))
+            }
+            other => other,
+        },
         "build" => {
             let mut pack_dir: Option<PathBuf> = None;
             let mut out_dir: Option<PathBuf> = None;
@@ -2063,6 +2146,196 @@ fn run() -> Result<(), CliError> {
     }
 }
 
+/// `sims-antics verify-equiv <a.iff> <b.iff>`: whole-file resource and BHAV equivalence.
+fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    // Library files and whether each is a semi-global one.
+    let mut with: Vec<(PathBuf, bool)> = Vec::new();
+    let mut opts = IffEquivOptions::default();
+    let mut show_all = false;
+    let mut i = 1usize;
+    while i < args.len() {
+        let arg = args[i].as_os_str();
+        if let Some(s) = arg.to_str() {
+            let value = |name: &str| -> Result<&OsString, CliError> {
+                args.get(i + 1)
+                    .ok_or_else(|| CliError::Message(format!("missing value after {name}")))
+            };
+            match s {
+                "--tree" | "-t" => {
+                    opts.tree = Some(parse_tree_id(os_arg_to_str(value(s)?, "--tree value")?)?);
+                    i += 2;
+                    continue;
+                }
+                "--global" => {
+                    with.push((PathBuf::from(value(s)?), false));
+                    i += 2;
+                    continue;
+                }
+                "--semi-global" => {
+                    with.push((PathBuf::from(value(s)?), true));
+                    i += 2;
+                    continue;
+                }
+                "--my-attributes" => {
+                    let v = os_arg_to_str(value(s)?, "--my-attributes value")?;
+                    let n: usize = v
+                        .parse()
+                        .map_err(|_| format!("invalid --my-attributes count '{v}'"))?;
+                    if n < sims_antics::GUARANTEED_ATTRIBUTES {
+                        return Err(format!(
+                            "--my-attributes must be at least {} (whatever runs as me has that many)",
+                            sims_antics::GUARANTEED_ATTRIBUTES
+                        )
+                        .into());
+                    }
+                    opts.my_attribute_count = n;
+                    i += 2;
+                    continue;
+                }
+                "--ignore-scratch-pointer" => {
+                    opts.live.observe_scratch_pointer = false;
+                    i += 1;
+                    continue;
+                }
+                "--ignore-frame-residue" => {
+                    opts.live.observe_frame_residue = false;
+                    i += 1;
+                    continue;
+                }
+                "--ignore-last-result" => {
+                    opts.live.observe_last_result = false;
+                    i += 1;
+                    continue;
+                }
+                "--all" => {
+                    show_all = true;
+                    i += 1;
+                    continue;
+                }
+                other if other.starts_with('-') => {
+                    return Err(format!("unknown flag '{other}'").into());
+                }
+                _ => {}
+            }
+        } else if os_arg_starts_with_dash(arg) {
+            return Err("unknown non-UTF-8 flag".to_owned().into());
+        }
+        if paths.len() == 2 {
+            return Err(format!("unexpected extra argument '{}'", Path::new(arg).display()).into());
+        }
+        paths.push(PathBuf::from(arg));
+        i += 1;
+    }
+    let [path_a, path_b] = <[PathBuf; 2]>::try_from(paths)
+        .map_err(|_| "verify-equiv requires <a.iff> <b.iff>".to_owned())?;
+    let read = |path: &Path| -> Result<Vec<u8>, CliError> {
+        let (mut file, len, hdr) = read_regular_file_prefix(path)?;
+        Ok(read_bounded_iff_file(path, &mut file, len, hdr)?)
+    };
+    // Each library supplies only its own range (`program.rs:1015`): the global file
+    // trees 256 to 4095, a semi-global file 8192 and up, with the argument counts the
+    // VM's loader keeps. The files are trusted to be the libraries the game loads; two
+    // that disagree on a tree cannot both be, so that is an error.
+    let mut library: std::collections::BTreeMap<u16, (Option<usize>, PathBuf)> =
+        std::collections::BTreeMap::new();
+    for (extra, semi) in &with {
+        let bytes = read(extra)?;
+        let arities =
+            library_arities_from_iff(&bytes).map_err(|e| format!("{}: {e}", extra.display()))?;
+        let in_range = |id: u16| {
+            if *semi {
+                id >= 8192
+            } else {
+                (256..=4095).contains(&id)
+            }
+        };
+        for (id, argc) in arities.into_iter().filter(|&(id, _)| in_range(id)) {
+            if let Some((seen, from)) = library.get(&id)
+                && *seen != argc
+            {
+                let count = |n: &Option<usize>| {
+                    n.map_or_else(
+                        || "an unparseable tree".to_owned(),
+                        |n| format!("{n} arguments"),
+                    )
+                };
+                return Err(format!(
+                    "library tree #{id} has {} in {} but {} in {}",
+                    count(seen),
+                    from.display(),
+                    count(&argc),
+                    extra.display()
+                )
+                .into());
+            }
+            library.insert(id, (argc, extra.clone()));
+        }
+    }
+    opts.extra_arities.extend(
+        library
+            .into_iter()
+            .filter_map(|(id, (argc, _))| Some((id, argc?))),
+    );
+    let (a, b) = (read(&path_a)?, read(&path_b)?);
+    let report = check_iff_equivalent(&a, &b, &opts).map_err(|e| e.to_string())?;
+
+    let mut out = OutWriter::stdout();
+    let mut counts = [0usize; 4];
+    for problem in &report.file_problems {
+        out.writeln_str(&format!("FILE: {problem}"))?;
+    }
+    for r in &report.resources {
+        let (slot, line) = match &r.verdict {
+            ResourceVerdict::Identical => (0, None),
+            ResourceVerdict::Equivalent { how } => (1, Some(format!("equivalent ({how})"))),
+            ResourceVerdict::Different { why } => (2, Some(format!("DIFFERENT: {why}"))),
+            ResourceVerdict::Inconclusive { why } => (3, Some(format!("INCONCLUSIVE: {why}"))),
+        };
+        counts[slot] += 1;
+        let line = match line {
+            Some(line) => Some(line),
+            None if show_all || !r.notes.is_empty() => Some("identical".to_owned()),
+            None => None,
+        };
+        if let Some(line) = line {
+            let notes = if r.notes.is_empty() {
+                String::new()
+            } else {
+                format!(" [notes: {}]", r.notes.join("; "))
+            };
+            out.writeln_str(&sanitize_single_line(&format!(
+                "{}: {line}{notes}",
+                r.name()
+            )))?;
+        }
+    }
+    let verdict = report.verdict();
+    let word = match verdict {
+        IffVerdict::Equivalent => "EQUIVALENT",
+        IffVerdict::Different => "DIFFERENT",
+        IffVerdict::Inconclusive => "INCONCLUSIVE",
+    };
+    out.writeln_str(&format!(
+        "{word}: {} resources ({} identical, {} equivalent, {} different, {} inconclusive){}",
+        report.resources.len(),
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        if verdict == IffVerdict::Equivalent {
+            BUDGET_ASSUMPTION
+        } else {
+            ""
+        }
+    ))?;
+    out.flush()?;
+    match verdict.exit_code() {
+        0 => Ok(()),
+        code => Err(CliError::Exit(code as u8)),
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) | Err(CliError::BrokenPipe) => ExitCode::SUCCESS,
@@ -2070,6 +2343,7 @@ fn main() -> ExitCode {
             eprintln!("error: {msg}");
             ExitCode::FAILURE
         }
+        Err(CliError::Exit(code)) => ExitCode::from(code),
     }
 }
 
