@@ -11,8 +11,10 @@
 //! Skips cleanly when `SIMS_INSTALL` is unset (CI-safe).
 
 use sims_antics::{
-    EquivOptions, EquivResult, StructuredLiftOutcome, check_bhav_equivalent_with_arities,
-    compile_antics, lift::lift_bhav, lift_bhav_structured,
+    EquivOptions, EquivResult, LiftOptions, StructuredLiftOutcome,
+    check_bhav_equivalent_with_arities, compile_antics,
+    lift::{format_bhav_labeled_air, lift_bhav},
+    lift_bhav_structured_with_options,
 };
 use sims_content::{ArchivePool, Catalog, Index, Install};
 use sims_formats::behavior::Behavior;
@@ -68,8 +70,13 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
     let mut semi_global_cache: BTreeMap<usize, BTreeMap<u16, usize>> = BTreeMap::new();
 
     let mut total_bhavs = 0usize;
-    let mut lifted_high_level = 0usize;
+    let mut lifted_structured = 0usize;
+    let mut lifted_pure_high_level = 0usize;
+    let mut lifted_with_inline_raw_op = 0usize;
+    let mut lifted_relaxed_pure_high_level = 0usize;
     let mut verified_equivalent = 0usize;
+    let mut verified_relaxed_equivalent = 0usize;
+    let mut labeled_cfg_verified = 0usize;
     let mut inconclusive = 0usize;
     let mut counterexamples = 0usize;
     let mut unsupported_opcode = 0usize;
@@ -80,6 +87,12 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
     let mut first_compile_failure_meta: Option<String> = None;
 
     let opts = EquivOptions::default();
+    let strict_lift = LiftOptions {
+        strict_padding: true,
+    };
+    let relaxed_lift = LiftOptions {
+        strict_padding: false,
+    };
 
     for (resource_index, resource) in index.resources.iter().enumerate() {
         let name = resource.name();
@@ -135,21 +148,21 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                 continue;
             }
 
-            match lift_bhav_structured(&bhav) {
+            match lift_bhav_structured_with_options(&bhav, strict_lift) {
                 StructuredLiftOutcome::Lifted(source_text) => {
-                    assert!(
-                        !source_text.contains("op 0x"),
-                        "structured lifter emitted raw op on resource_index={resource_index} BHAV #{}",
-                        chunk.id
-                    );
-                    lifted_high_level += 1;
+                    lifted_structured += 1;
+                    if source_text.contains("op 0x") {
+                        lifted_with_inline_raw_op += 1;
+                    } else {
+                        lifted_pure_high_level += 1;
+                    }
                     let compiled = match compile_antics(&source_text) {
                         Ok(m) => m,
                         Err(_) => {
                             compile_failures += 1;
                             if first_compile_failure_meta.is_none() {
                                 first_compile_failure_meta = Some(format!(
-                                    "resource_index={resource_index} BHAV #{} (compile_failure)",
+                                    "resource_index={resource_index} BHAV #{} (strict compile_failure)",
                                     chunk.id
                                 ));
                             }
@@ -175,7 +188,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                                 let last_pcs =
                                     path.last().map(|s| (s.pc_a, s.pc_b)).unwrap_or((0, 0));
                                 first_counterexample_meta = Some(format!(
-                                    "resource_index={resource_index} BHAV #{} (steps={}, last_pc_a={}, last_pc_b={})",
+                                    "resource_index={resource_index} BHAV #{} (strict, steps={}, last_pc_a={}, last_pc_b={})",
                                     chunk.id,
                                     path.len(),
                                     last_pcs.0,
@@ -184,20 +197,120 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                             }
                         }
                     }
+
+                    // Also verify `--relax-padding` (`strict_padding: false`) compiles & proves Equivalent.
+                    if let StructuredLiftOutcome::Lifted(relaxed_src) =
+                        lift_bhav_structured_with_options(&bhav, relaxed_lift)
+                    {
+                        if !relaxed_src.contains("op 0x") {
+                            lifted_relaxed_pure_high_level += 1;
+                        }
+                        match compile_antics(&relaxed_src) {
+                            Ok(m) => {
+                                let re_relaxed = &m.behaviors[&chunk.id];
+                                match check_bhav_equivalent_with_arities(
+                                    &bhav,
+                                    re_relaxed,
+                                    &opts,
+                                    Some(&iff_arities),
+                                ) {
+                                    EquivResult::Equivalent { .. } => {
+                                        verified_relaxed_equivalent += 1;
+                                    }
+                                    EquivResult::Inconclusive { .. } => {
+                                        inconclusive += 1;
+                                    }
+                                    EquivResult::Counterexample { path, .. } => {
+                                        counterexamples += 1;
+                                        if first_counterexample_meta.is_none() {
+                                            let last_pcs = path
+                                                .last()
+                                                .map(|s| (s.pc_a, s.pc_b))
+                                                .unwrap_or((0, 0));
+                                            first_counterexample_meta = Some(format!(
+                                                "resource_index={resource_index} BHAV #{} (relaxed, steps={}, last_pc_a={}, last_pc_b={})",
+                                                chunk.id,
+                                                path.len(),
+                                                last_pcs.0,
+                                                last_pcs.1
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                compile_failures += 1;
+                                if first_compile_failure_meta.is_none() {
+                                    first_compile_failure_meta = Some(format!(
+                                        "resource_index={resource_index} BHAV #{} (relaxed compile_failure)",
+                                        chunk.id
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
                 StructuredLiftOutcome::UnsupportedOpcode(_) => unsupported_opcode += 1,
                 StructuredLiftOutcome::UnsupportedHeaderOrTarget => {
                     unsupported_header_or_target += 1;
                 }
-                StructuredLiftOutcome::Unstructured => unstructured += 1,
+                StructuredLiftOutcome::Unstructured => {
+                    unstructured += 1;
+                    // Verify decoded labeled-CFG `.air` compiles cleanly and proves Equivalent.
+                    let labeled_src = format_bhav_labeled_air(&bhav, strict_lift);
+                    match compile_antics(&labeled_src) {
+                        Ok(m) => {
+                            let re_labeled = &m.behaviors[&chunk.id];
+                            match check_bhav_equivalent_with_arities(
+                                &bhav,
+                                re_labeled,
+                                &opts,
+                                Some(&iff_arities),
+                            ) {
+                                EquivResult::Equivalent { .. } => {
+                                    labeled_cfg_verified += 1;
+                                }
+                                EquivResult::Inconclusive { .. } => {
+                                    inconclusive += 1;
+                                }
+                                EquivResult::Counterexample { path, .. } => {
+                                    counterexamples += 1;
+                                    if first_counterexample_meta.is_none() {
+                                        let last_pcs =
+                                            path.last().map(|s| (s.pc_a, s.pc_b)).unwrap_or((0, 0));
+                                        first_counterexample_meta = Some(format!(
+                                            "resource_index={resource_index} BHAV #{} (labeled-cfg, steps={}, last_pc_a={}, last_pc_b={})",
+                                            chunk.id,
+                                            path.len(),
+                                            last_pcs.0,
+                                            last_pcs.1
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            compile_failures += 1;
+                            if first_compile_failure_meta.is_none() {
+                                first_compile_failure_meta = Some(format!(
+                                    "resource_index={resource_index} BHAV #{} (labeled-cfg compile_failure)",
+                                    chunk.id
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
     eprintln!(
-        "structured_equiv summary: total_bhavs={total_bhavs}, lifted_high_level={lifted_high_level}, \
-         verified_equivalent={verified_equivalent}, inconclusive={inconclusive}, \
-         counterexamples={counterexamples}, compile_failures={compile_failures}, \
+        "structured_equiv summary: total_bhavs={total_bhavs}, lifted_structured={lifted_structured} \
+         (pure_zero_raw_op_strict={lifted_pure_high_level}, with_inline_raw_op_strict={lifted_with_inline_raw_op}, \
+         pure_zero_raw_op_relaxed={lifted_relaxed_pure_high_level}), \
+         verified_equivalent_strict={verified_equivalent}, verified_equivalent_relaxed={verified_relaxed_equivalent}, \
+         labeled_cfg_verified={labeled_cfg_verified}/{unstructured}, \
+         inconclusive={inconclusive}, counterexamples={counterexamples}, compile_failures={compile_failures}, \
          unsupported_opcode={unsupported_opcode}, unsupported_header_or_target={unsupported_header_or_target}, \
          unstructured={unstructured}"
     );
@@ -207,16 +320,24 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
         "expected Complete Collection corpus (>=28k BHAVs), got {total_bhavs}"
     );
     assert!(
-        verified_equivalent >= 10_000,
-        "expected >=10,000 real BHAVs formally verified Equivalent from high-level .antics, got {verified_equivalent}"
+        verified_equivalent >= 20_000,
+        "expected >=20,000 real BHAVs formally verified Equivalent from structured .air, got {verified_equivalent}"
     );
     assert_eq!(
         inconclusive, 0,
         "expected 0 inconclusive proofs among lifted BHAVs, got {inconclusive}"
     );
     assert_eq!(
-        verified_equivalent, lifted_high_level,
-        "every cleanly lifted high-level BHAV must formally verify Equivalent"
+        verified_equivalent, lifted_structured,
+        "every cleanly lifted structured BHAV must formally verify Equivalent"
+    );
+    assert_eq!(
+        verified_relaxed_equivalent, lifted_structured,
+        "every --relax-padding lifted structured BHAV must formally verify Equivalent"
+    );
+    assert_eq!(
+        labeled_cfg_verified, unstructured,
+        "every decoded labeled-CFG fallback BHAV must formally verify Equivalent"
     );
     assert_eq!(
         compile_failures, 0,

@@ -8,6 +8,7 @@ use crate::ir::{
     BconChunk, BhavChunk, ObjdChunk, ObjfChunk, SlotChunk, StringEntry, StringFormat,
     StringTableChunk, TtabChunk,
 };
+use crate::structure_lift::{LiftOptions, decode_instruction_for_labeled_air};
 use sims_formats::behavior::{Behavior, Interaction, InteractionTable, MotiveAdvertisement};
 use sims_formats::execution::{ObjectFunctions, Slots};
 use sims_formats::strings::{Format, StringTable};
@@ -31,17 +32,84 @@ pub fn lift_bhav(id: u16, label: &str, data: &[u8]) -> Result<BhavChunk> {
     })
 }
 
-/// Formats a [`BhavChunk`] into canonical low-level `.air` (Antics IR) source text that
+/// Formats a [`BhavChunk`] into canonical decoded labeled-CFG `.air` (Antics IR) source text
+/// using [`LiftOptions::default`] (`strict_padding: true`), preserving `@n0:` labels and
+/// `-> true: ..., false: ...` edges while decoding every clean modeled instruction so it
 /// parses and lowers back to the exact same instruction stream and payload bytes.
 #[must_use]
 pub fn format_bhav_air(chunk: &BhavChunk) -> String {
-    format_bhav_antics(chunk)
+    format_bhav_labeled_air(chunk, LiftOptions::default())
 }
 
-/// Formats a [`BhavChunk`] into canonical low-level `.air` (Antics IR) source text that
-/// parses and lowers back to the exact same instruction stream and payload bytes.
+/// Alias for [`format_bhav_air`].
 #[must_use]
 pub fn format_bhav_antics(chunk: &BhavChunk) -> String {
+    format_bhav_air(chunk)
+}
+
+/// Formats a [`BhavChunk`] into labeled-CFG `.air` (Antics IR) source text, keeping
+/// `@n0:` labels and `-> true: ..., false: ...` edges while decoding every modeled
+/// instruction according to `opts`.
+///
+/// With `opts.strict_padding == true`, every decoded instruction encodes back to the
+/// exact original 8 operand bytes (falling back to `op 0xNNNN (...)` per instruction on
+/// unmodeled opcodes, dirty padding bytes, or out-of-range operands), guaranteeing 100%
+/// byte-exact BHAV round-tripping.
+#[must_use]
+pub fn format_bhav_labeled_air(chunk: &BhavChunk, opts: LiftOptions) -> String {
+    let mut out = format_bhav_header(chunk);
+    let bounds = match chunk.format {
+        0x8000 => Some((4usize, 0usize)),
+        0x8001 => Some((
+            usize::from(chunk.args).min(4),
+            usize::from(chunk.locals as u8).min(4),
+        )),
+        0x8002 => Some((usize::from(chunk.args), usize::from(chunk.locals as u8))),
+        _ => None,
+    };
+    for (idx, ins) in chunk.instructions.iter().enumerate() {
+        let _ = writeln!(out, "    @n{idx}:");
+        let on_true = format_target(ins.on_true, chunk.instructions.len());
+        let on_false = format_target(ins.on_false, chunk.instructions.len());
+        if let Some((arg_bound, local_bound)) = bounds
+            && let Some(decoded) =
+                decode_instruction_for_labeled_air(ins, arg_bound, local_bound, opts)
+        {
+            let _ = writeln!(out, "    {decoded} -> true: {on_true}, false: {on_false};");
+        } else {
+            let [b0, b1, b2, b3, b4, b5, b6, b7] = ins.operands;
+            let _ = writeln!(
+                out,
+                "    op {:#06x} ({b0:#04x}, {b1:#04x}, {b2:#04x}, {b3:#04x}, {b4:#04x}, {b5:#04x}, {b6:#04x}, {b7:#04x}) -> true: {on_true}, false: {on_false};",
+                ins.opcode
+            );
+        }
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Formats a [`BhavChunk`] into raw hex-only `.air` (Antics IR) source text (`op 0xNNNN (...)`
+/// for every instruction) for `--raw` inspection.
+#[must_use]
+pub fn format_bhav_raw_air(chunk: &BhavChunk) -> String {
+    let mut out = format_bhav_header(chunk);
+    for (idx, ins) in chunk.instructions.iter().enumerate() {
+        let _ = writeln!(out, "    @n{idx}:");
+        let on_true = format_target(ins.on_true, chunk.instructions.len());
+        let on_false = format_target(ins.on_false, chunk.instructions.len());
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = ins.operands;
+        let _ = writeln!(
+            out,
+            "    op {:#06x} ({b0:#04x}, {b1:#04x}, {b2:#04x}, {b3:#04x}, {b4:#04x}, {b5:#04x}, {b6:#04x}, {b7:#04x}) -> true: {on_true}, false: {on_false};",
+            ins.opcode
+        );
+    }
+    out.push_str("}\n");
+    out
+}
+
+fn format_bhav_header(chunk: &BhavChunk) -> String {
     let mut out = String::new();
     let escaped_label = escape_antics_string(&chunk.label);
     let _ = write!(
@@ -60,18 +128,6 @@ pub fn format_bhav_antics(chunk: &BhavChunk) -> String {
         out.push(']');
     }
     out.push_str(") {\n");
-    for (idx, ins) in chunk.instructions.iter().enumerate() {
-        let _ = writeln!(out, "    @n{idx}:");
-        let on_true = format_target(ins.on_true, chunk.instructions.len());
-        let on_false = format_target(ins.on_false, chunk.instructions.len());
-        let [b0, b1, b2, b3, b4, b5, b6, b7] = ins.operands;
-        let _ = writeln!(
-            out,
-            "    op {:#06x} ({b0:#04x}, {b1:#04x}, {b2:#04x}, {b3:#04x}, {b4:#04x}, {b5:#04x}, {b6:#04x}, {b7:#04x}) -> true: {on_true}, false: {on_false};",
-            ins.opcode
-        );
-    }
-    out.push_str("}\n");
     out
 }
 

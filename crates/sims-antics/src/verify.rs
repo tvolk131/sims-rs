@@ -851,6 +851,14 @@ fn compute_node_const_sets(
             17 => {
                 cur_p.insert(word_i16(ops, 0), None);
             }
+            26 if ops[2] & 4 == 0 => {
+                // Relationship read writes into `(ops[4], word_i16(ops, 6))` (`relationship.rs:190`).
+                if ops[4] == 9 {
+                    cur_p.insert(word_i16(ops, 6), None);
+                } else if ops[4] == 25 {
+                    cur_l.insert(word_i16(ops, 6), None);
+                }
+            }
             31 if ops[4] & 0x80 != 0 => {
                 if ops[5] == 9 {
                     cur_p.insert(i16::from(ops[7]), None);
@@ -1237,6 +1245,30 @@ fn verify_bhav_static(
                         }
                     }
                 }
+                13 => {
+                    let obj_slot = i16::from(ops[1]);
+                    if ops[3] & 2 != 0 {
+                        check_operand(25, obj_slot, false, violations);
+                    } else {
+                        check_operand(9, obj_slot, false, violations);
+                    }
+                    if ops[3] & 1 != 0 {
+                        check_operand(25, i16::from(ops[4]), false, violations);
+                    }
+                }
+                14 => {
+                    if ops[6] & 8 != 0 {
+                        let scope = u16::from_le_bytes([ops[4], ops[5]]);
+                        if scope <= 255 {
+                            check_operand(scope as u8, word_i16(ops, 2), false, violations);
+                        }
+                    }
+                }
+                16 => {
+                    if ops[2] & 1 != 0 {
+                        check_operand(25, i16::from(ops[1]), false, violations);
+                    }
+                }
                 17 => {
                     let p = word_i16(ops, 0);
                     check_operand(9, p, false, violations);
@@ -1282,6 +1314,13 @@ fn verify_bhav_static(
                     }
                     check_operand(scope, amount_idx, false, violations);
                 }
+                26 => {
+                    if matches!(ops[1], 2 | 3) {
+                        check_operand(25, i16::from(ops[3]), false, violations);
+                    }
+                    let writes_operand = ops[2] & 4 == 0;
+                    check_operand(ops[4], word_i16(ops, 6), writes_operand, violations);
+                }
                 29 => {
                     if ops[3] & 1 == 0 {
                         let motive = ops[2];
@@ -1310,6 +1349,9 @@ fn verify_bhav_static(
                         check_operand(ops[5], i16::from(ops[7]), true, violations);
                     }
                 }
+                32 => {
+                    check_operand(ops[6], word_i16(ops, 4), false, violations);
+                }
                 36 => {
                     // Dialog STR# 301 indices: [0]=btn3, [1]=mode4, [2]=msg, [3]=btn1, [4]=btn2, [6]=title.
                     for &(byte_pos, field) in &[
@@ -1333,12 +1375,30 @@ fn verify_bhav_static(
                         }
                     }
                 }
+                37 => {
+                    if ops[0] == 1 {
+                        check_operand(ops[1], word_i16(ops, 2), false, violations);
+                    }
+                }
+                41 => {
+                    if ops[3] == 7 && ops[2] == 2 {
+                        check_operand(25, word_i16(ops, 0) >> 1, false, violations);
+                    }
+                }
                 42 => {
                     let mode = ops[4];
                     if mode == 7 {
                         check_operand(9, 0, false, violations);
                     } else if mode == 8 || mode == 9 {
                         check_operand(25, i16::from(ops[6]), false, violations);
+                    }
+                }
+                43 => {
+                    if word_i16(ops, 0) != 0 {
+                        check_operand(9, word_i16(ops, 2), false, violations);
+                    }
+                    if word_i16(ops, 4) != 0 {
+                        check_operand(9, word_i16(ops, 6), false, violations);
                     }
                 }
                 44 => {
@@ -2322,6 +2382,15 @@ fn prove_interaction_lock_safety(
                         let p = word_i16(ops, 0);
                         write_sym_operand(&mut next_true, 9, p, SymWord::Unknown);
                     }
+                    26 if ops[2] & 4 == 0 => {
+                        // Relationship read writes into its value operand on the true branch.
+                        write_sym_operand(
+                            &mut next_true,
+                            ops[4],
+                            word_i16(ops, 6),
+                            SymWord::Unknown,
+                        );
+                    }
                     31 => {
                         // SetToNext writes dest (or stack_obj if bit 7 clear).
                         let mode = ops[4];
@@ -2341,10 +2410,20 @@ fn prove_interaction_lock_safety(
                         let t = usize::from((ops[7] >> 4) & 7);
                         next_true.temps[t] = SymWord::Unknown;
                     }
+                    51 if matches!(ops[0], 3 | 4) => {
+                        // ManageInventory find/walk writes count and index temps.
+                        let flags = u16::from_le_bytes([ops[2], ops[3]]);
+                        next_true.temps[usize::from((flags >> 5) & 3)] = SymWord::Unknown;
+                        next_true.temps[usize::from((flags >> 11) & 3)] = SymWord::Unknown;
+                    }
                     _ => {}
                 }
 
                 let mut next_false = next_true.clone();
+                if ins.opcode == 26 && ops[2] & 4 == 0 {
+                    // Relationship returns false before writing its destination operand.
+                    next_false = state.clone();
+                }
                 if ins.opcode == 44 {
                     // Animate (`animate.rs:197`): firing an animation event takes `on_false`
                     // and writes the event ID into local[ops[2]] (when bit 0x20 set) or param[0].
@@ -2438,10 +2517,17 @@ fn eval_expr_compare(l: i16, op: u8, r: i16) -> Option<bool> {
 /// (meaning its `on_false` branch is architecturally unreachable).
 pub(crate) fn is_always_true_instruction(ins: &Instruction) -> bool {
     match ins.opcode {
-        0 => true,  // Sleep (yields until done, then branches true)
-        23 => true, // PlaySound
-        29 => true, // SetMotiveChange / ClearMotiveChanges
-        48 => true, // StopAllSounds
+        0 => true,                      // Sleep (yields until done, then branches true)
+        6 => true,                      // ChangeSuit (`change_suit.rs:66`)
+        7 => true,                      // Refresh (`refresh.rs:36,42,53,56`)
+        16 => ins.operands[0] == 1, // FindLocation mode 1 (take off lot, `find_location.rs:122`)
+        23 => true,                 // PlaySound (`sound.rs:61`)
+        26 => ins.operands[2] & 1 == 0, // Relationship without fail-if-missing (`relationship.rs:161`)
+        29 => true, // SetMotiveChange / ClearMotiveChanges (`motive_change.rs:54,70`)
+        41 => true, // SetHeadline (`headline.rs:123..176`)
+        48 => true, // StopAllSounds (`sound.rs:71`)
+        49 => true, // NotifyIdle (`notify.rs:36,64`)
+        50 => true, // ActionString (`action_string.rs:102,105,120`)
         2 => matches!(ins.operands[5], 3..=7 | 9 | 10 | 12 | 13 | 18 | 19 | 20),
         _ => false,
     }
@@ -2671,6 +2757,44 @@ fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
         0 => [ops[0], ops[1], 0, 0, 0, 0, 0, 0],
         // GenericCall: word 0 (routine) only.
         1 => [ops[0], ops[1], 0, 0, 0, 0, 0, 0],
+        // Grab / Drop: operands ignored (`grab.rs:4`, `drop.rs:5`).
+        4 | 5 => [0; 8],
+        // ChangeSuit: index, scope, bit 0 of flags (`change_suit.rs:49-50`).
+        6 => [ops[0], ops[1], ops[2] & 1, 0, 0, 0, 0, 0],
+        // Refresh: word 0 (target) + word 1 (mode) (`refresh.rs:25`).
+        7 => [ops[0], ops[1], ops[2], ops[3], 0, 0, 0, 0],
+        // PushInteraction: menu, object_slot, priority, flags & 0x0F, icon (when bit 0 set) (`push.rs:65-165`).
+        13 => [
+            ops[0],
+            ops[1],
+            ops[2],
+            ops[3] & 0x0F,
+            if ops[3] & 1 != 0 { ops[4] } else { 0 },
+            0,
+            0,
+            0,
+        ],
+        // FindBestObject: word 0 (func), optional origin when flags & 8, byte 6 (flags) (`find_best_object.rs:153-168`).
+        14 => {
+            if ops[6] & 8 != 0 {
+                [ops[0], ops[1], ops[2], ops[3], ops[4], ops[5], ops[6], 0]
+            } else {
+                [ops[0], ops[1], 0, 0, 0, 0, ops[6], 0]
+            }
+        }
+        // FindLocation: mode, local (when flags & 1), flags & 7 (`find_location.rs:70-128`).
+        16 => [
+            ops[0],
+            if ops[2] & 1 != 0 { ops[1] } else { 0 },
+            ops[2] & 7,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+        // IdleForInput: word 0 (param_index) + word 1 (allow_push) (`idle.rs:7-9`).
+        17 => [ops[0], ops[1], ops[2], ops[3], 0, 0, 0, 0],
         // RemoveObject: word 0 (target) + byte 2 (flags) (`remove.rs:47-53`).
         18 => [ops[0], ops[1], ops[2], 0, 0, 0, 0, 0],
         // RunFunctionalTree: word 0 (function) + byte 2 bit 0 (`run_functional_tree.rs:75-93`).
@@ -2696,6 +2820,21 @@ fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
             };
             [sel, scope, ops[2], ops[3], ops[4] & 3, 0, ops[6], 0]
         }
+        // Relationship: col, dir, flags & 7, local (when dir 2|3), value scope, pad 0, value idx (`relationship.rs:78-179`).
+        26 => [
+            ops[0],
+            ops[1],
+            ops[2] & 7,
+            if matches!(ops[1], 2 | 3) { ops[3] } else { 0 },
+            ops[4],
+            0,
+            ops[6],
+            ops[7],
+        ],
+        // GoToRelative: byte 2 (location), byte 3 (facing), byte 6 bits 1..=2 (`go_to_slot.rs:278-302`).
+        27 => [0, 0, ops[2], ops[3], 0, 0, ops[6] & 6, 0],
+        // RunTreeByName: word 0 (table), byte 2 bit 0 (global), byte 4 (index), byte 5 (mode) (`named_tree.rs:60-85`).
+        28 => [ops[0], ops[1], ops[2] & 1, 0, ops[4], ops[5], 0, 0],
         // SetMotiveChange: if flags & 1 != 0, clear all (other bytes ignored; `motive_change.rs:52`).
         29 => {
             if ops[3] & 1 != 0 {
@@ -2704,11 +2843,76 @@ fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
                 [ops[0], ops[1], ops[2], 0, ops[4], ops[5], ops[6], ops[7]]
             }
         }
+        // SetToNext: when bit 7 of mode is clear, dest scope/index bytes 5 and 7 are ignored (`set_to_next.rs:7-9`).
+        31 => {
+            if ops[4] & 0x80 != 0 {
+                ops
+            } else {
+                [ops[0], ops[1], ops[2], ops[3], ops[4], 0, ops[6], 0]
+            }
+        }
+        // TestObjectType: GUID (0..4), index (4..6), scope (6); byte 7 ignored (`object_type.rs:6-7`).
+        32 => [ops[0], ops[1], ops[2], ops[3], ops[4], ops[5], ops[6], 0],
+        // Dialog: kind is low 7 bits of byte 5 (`dialog.rs:569`).
+        36 => [
+            ops[0],
+            ops[1],
+            ops[2],
+            ops[3],
+            ops[4],
+            ops[5] & 0x7F,
+            ops[6],
+            ops[7],
+        ],
+        // TestSimInteractingWith: byte 0 == 1 reads scope/index (1..4); otherwise ignores all (`interacting.rs:27-39`).
+        37 => {
+            if ops[0] == 1 {
+                [1, ops[1], ops[2], ops[3], 0, 0, 0, 0]
+            } else {
+                [0; 8]
+            }
+        }
+        // SetHeadline: word 0 upper bits only read when kind == 7 && index == 2 (`headline.rs:111,198`).
+        41 => {
+            let (b0, b1) = if ops[3] == 7 && ops[2] == 2 {
+                (ops[0], ops[1])
+            } else {
+                (ops[0] & 1, 0)
+            };
+            [b0, b1, ops[2], ops[3], ops[4], ops[5], ops[6], ops[7]]
+        }
+        // CreateObject: bytes 0..7; byte 7 unused (`create.rs:9-10`).
+        42 => [ops[0], ops[1], ops[2], ops[3], ops[4], ops[5], ops[6], 0],
+        // DropOnto: kind words are zero vs nonzero booleans (`drop_onto.rs:120`).
+        43 => {
+            let sk = u8::from(word_i16(&ops, 0) != 0);
+            let dk = u8::from(word_i16(&ops, 4) != 0);
+            [sk, 0, ops[2], ops[3], dk, 0, ops[6], ops[7]]
+        }
+        // Animate: bytes 3 and 7 unused (`animate.rs:8-10`).
+        44 => [ops[0], ops[1], ops[2], 0, ops[4], ops[5], ops[6], 0],
+        // RouteTo: word 0 (slot), word 1 (source), byte 4 bit 0 (`go_to_slot.rs:338-388`).
+        45 => [ops[0], ops[1], ops[2], ops[3], ops[4] & 1, 0, 0, 0],
+        // Snap: word 0 (slot; ignored in modes 1/2), word 1 (mode), byte 4 (flags) (`snap.rs:4-14`).
+        46 => {
+            let mode = word_i16(&ops, 2);
+            if mode == 1 || mode == 2 {
+                [0, 0, ops[2], ops[3], ops[4], 0, 0, 0]
+            } else {
+                [ops[0], ops[1], ops[2], ops[3], ops[4], 0, 0, 0]
+            }
+        }
         // StopAllSounds: word 0 != 0 boolean (`sound.rs:65`).
         48 => {
             let flag = u8::from(i16::from_le_bytes([ops[0], ops[1]]) != 0);
             [flag, 0, 0, 0, 0, 0, 0, 0]
         }
+        // NotifyIdle: operands ignored (`notify.rs:24`).
+        49 => [0; 8],
+        // ActionString: word 0 (table) + byte 4 (index) (`action_string.rs:126-127`).
+        50 => [ops[0], ops[1], 0, 0, ops[4], 0, 0, 0],
+        // ManageInventory: all 8 bytes used (`inventory.rs:98-121`).
+        51 => ops,
         _ => ops,
     }
 }
@@ -3494,6 +3698,14 @@ pub fn check_bhav_equivalent_with_arities(
                     env_false_b.write(dst_scope as u8, dst_idx, sym);
                 }
             }
+            26 if ins_a.operands[2] & 4 == 0 => {
+                // Relationship read writes into `(ops[4], word_i16(ops, 6))` on `on_true` only.
+                let sym = interner.fresh_event();
+                let idx_a = word_i16(&ins_a.operands, 6);
+                let idx_b = word_i16(&ins_b.operands, 6);
+                env_true_a.write(ins_a.operands[4], idx_a, sym);
+                env_true_b.write(ins_b.operands[4], idx_b, sym);
+            }
             31 if ins_a.operands[4] & 0x80 != 0 => {
                 let sym = interner.fresh_event();
                 env_true_a.write(ins_a.operands[5], i16::from(ins_a.operands[7]), sym);
@@ -3627,11 +3839,37 @@ fn check_primitive_frame_reads(
     };
     match opcode {
         0 => check_op(9, word_i16(ops, 0), "Sleep param"),
-        1 | 14 | 18 | 20 | 23 | 36 | 48 => Ok(()),
+        1 | 4 | 5 | 6 | 7 | 18 | 20 | 23 | 27 | 28 | 36 | 48 | 49 | 51 => Ok(()),
         8 => {
             let rng_scope = u16::from_le_bytes([ops[6], ops[7]]);
             if rng_scope <= 255 {
                 check_op(rng_scope as u8, word_i16(ops, 4), "Random range")?;
+            }
+            Ok(())
+        }
+        13 => {
+            if ops[3] & 2 != 0 {
+                check_op(25, i16::from(ops[1]), "PushInteraction object local")?;
+            } else {
+                check_op(9, i16::from(ops[1]), "PushInteraction object param")?;
+            }
+            if ops[3] & 1 != 0 {
+                check_op(25, i16::from(ops[4]), "PushInteraction icon local")?;
+            }
+            Ok(())
+        }
+        14 => {
+            if ops[6] & 8 != 0 {
+                let scope = u16::from_le_bytes([ops[4], ops[5]]);
+                if scope <= 255 {
+                    check_op(scope as u8, word_i16(ops, 2), "FindBestObject origin")?;
+                }
+            }
+            Ok(())
+        }
+        16 => {
+            if ops[2] & 1 != 0 {
+                check_op(25, i16::from(ops[1]), "FindLocation local")?;
             }
             Ok(())
         }
@@ -3644,6 +3882,15 @@ fn check_primitive_frame_reads(
                 _ => ops[1],
             };
             check_op(scope, word_i16(ops, 2), "AlterBudget amount")
+        }
+        26 => {
+            if matches!(ops[1], 2 | 3) {
+                check_op(25, i16::from(ops[3]), "Relationship local")?;
+            }
+            if ops[2] & 4 != 0 || ops[4] == 22 {
+                check_op(ops[4], word_i16(ops, 6), "Relationship value")?;
+            }
+            Ok(())
         }
         29 => {
             if ops[3] & 1 == 0 {
@@ -3664,11 +3911,33 @@ fn check_primitive_frame_reads(
             }
             Ok(())
         }
+        32 => check_op(ops[6], word_i16(ops, 4), "TestObjectType object"),
+        37 => {
+            if ops[0] == 1 {
+                check_op(ops[1], word_i16(ops, 2), "TestSimInteractingWith person")?;
+            }
+            Ok(())
+        }
+        41 => {
+            if ops[3] == 7 && ops[2] == 2 {
+                check_op(25, word_i16(ops, 0) >> 1, "SetHeadline local")?;
+            }
+            Ok(())
+        }
         42 => {
             if ops[4] == 7 {
                 check_op(9, 0, "CreateObject param[0]")?;
             } else if ops[4] == 8 || ops[4] == 9 {
                 check_op(25, i16::from(ops[6]), "CreateObject local")?;
+            }
+            Ok(())
+        }
+        43 => {
+            if word_i16(ops, 0) != 0 {
+                check_op(9, word_i16(ops, 2), "DropOnto src param")?;
+            }
+            if word_i16(ops, 4) != 0 {
+                check_op(9, word_i16(ops, 6), "DropOnto dst param")?;
             }
             Ok(())
         }

@@ -2,8 +2,8 @@
 
 use crate::ast::{
     AssignOp, BconDecl, Branches, CallTarget, CompareOp, Condition, Item, LocalRef, Module,
-    Operand, OperandRef, PrimitiveCall, Stmt, StrDecl, StrEntryDecl, StringRef, Target, TreeDecl,
-    TreeHeader,
+    Operand, OperandRef, PrimitiveCall, SlotSpec, Stmt, StrDecl, StrEntryDecl, StringRef, Target,
+    TreeDecl, TreeHeader,
 };
 use crate::error::{Error, Result, Span};
 use crate::lexer::{Token, TokenKind, tokenize};
@@ -415,23 +415,43 @@ impl Parser {
                     "sleep"
                     | "generic_call"
                     | "expr"
+                    | "grab"
+                    | "drop"
+                    | "change_suit"
+                    | "refresh"
                     | "random"
+                    | "push_interaction"
                     | "find_best_object"
+                    | "find_location"
                     | "idle_for_input"
                     | "remove_object"
                     | "run_functional_tree"
                     | "play_sound"
                     | "alter_budget"
+                    | "relationship"
+                    | "go_to_relative"
+                    | "run_tree_by_name"
                     | "stop_all_sounds"
                     | "set_motive_change"
                     | "clear_motive_changes"
                     | "set_to_next"
+                    | "test_object_type"
                     | "dialog"
+                    | "test_sim_interacting_with"
+                    | "set_headline"
                     | "create_object"
+                    | "drop_onto"
                     | "animate"
                     | "route"
                     | "route_to"
-                    | "snap" => self.parse_primitive_stmt(),
+                    | "snap"
+                    | "notify_idle"
+                    | "action_string"
+                    | "manage_inventory"
+                        if self.peek_at(1).kind == TokenKind::LParen =>
+                    {
+                        self.parse_primitive_stmt()
+                    }
                     _ => self.parse_assign_stmt(),
                 }
             }
@@ -460,7 +480,7 @@ impl Parser {
         Ok(Stmt::Let { span, name, init })
     }
 
-    fn parse_raw_op(&mut self) -> Result<Stmt> {
+    fn parse_raw_op_head(&mut self) -> Result<(Span, u16, [u8; 8])> {
         let (_, span) = self.expect_ident("'op'")?;
         let opcode = self.expect_u16("opcode")?;
         self.expect(&TokenKind::LParen, "'('")?;
@@ -468,19 +488,32 @@ impl Parser {
         for (i, slot) in operands.iter_mut().enumerate() {
             *slot = self.expect_u8("operand byte")?;
             if i < 7 {
-                self.expect(&TokenKind::Comma, "',' between operand bytes")?;
+                // Accept both comma-separated `(0x01, 0x02, ...)` and space-separated `(0x01 0x02 ...)`.
+                self.eat(&TokenKind::Comma);
             }
         }
         self.eat(&TokenKind::Comma);
         self.expect(&TokenKind::RParen, "')'")?;
-        let branches = self.parse_branches()?;
+        Ok((span, opcode, operands))
+    }
+
+    fn parse_raw_op(&mut self) -> Result<Stmt> {
+        let (span, opcode, operands) = self.parse_raw_op_head()?;
+        let branches = self.parse_optional_branches()?;
         self.expect(&TokenKind::Semicolon, "';'")?;
-        Ok(Stmt::RawOp {
-            span,
-            opcode,
-            operands,
-            branches,
-        })
+        match branches {
+            Some(branches) => Ok(Stmt::RawOp {
+                span,
+                opcode,
+                operands,
+                branches,
+            }),
+            None => Ok(Stmt::InlineRawOp {
+                span,
+                opcode,
+                operands,
+            }),
+        }
     }
 
     fn parse_branches(&mut self) -> Result<Branches> {
@@ -922,25 +955,273 @@ impl Parser {
                 let rhs = self.parse_operand()?;
                 PrimitiveCall::ExprRaw { lhs, operator, rhs }
             }
+            "grab" => PrimitiveCall::Grab,
+            "drop" => PrimitiveCall::Drop,
+            "change_suit" => {
+                let mut index = 0u8;
+                let mut scope = 1u8;
+                let mut remove = false;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("change_suit option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "index" => index = self.expect_u8("change_suit index")?,
+                            "scope" => scope = self.expect_u8("change_suit scope")?,
+                            "remove" | "off" => remove = self.parse_bool()?,
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown change_suit parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in change_suit()",
+                            ));
+                        }
+                        match positional {
+                            0 => index = self.expect_u8("change_suit index")?,
+                            1 => scope = self.expect_u8("change_suit scope")?,
+                            2 => remove = self.parse_bool()?,
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to change_suit()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                PrimitiveCall::ChangeSuit {
+                    index,
+                    scope,
+                    remove,
+                }
+            }
+            "refresh" => {
+                let mut target = 0u16;
+                let mut mode = 0u16;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("refresh option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "target" => target = self.parse_refresh_target()?,
+                            "mode" => mode = self.expect_u16("refresh mode")?,
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown refresh parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in refresh()",
+                            ));
+                        }
+                        match positional {
+                            0 => target = self.parse_refresh_target()?,
+                            1 => mode = self.expect_u16("refresh mode")?,
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to refresh()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                PrimitiveCall::Refresh { target, mode }
+            }
             "random" => {
                 let dst = self.parse_operand()?;
                 self.expect(&TokenKind::Comma, "','")?;
                 let range = self.parse_operand()?;
                 PrimitiveCall::Random { dst, range }
             }
+            "push_interaction" => {
+                let mut menu = 0u8;
+                let mut object_slot = 0u8;
+                let mut priority = 0u8;
+                let mut flags = 0u8;
+                let mut icon_local = LocalRef::Index(0);
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("push_interaction option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "menu" => menu = self.expect_u8("push_interaction menu")?,
+                            "object" => {
+                                object_slot = self.expect_u8("push_interaction object slot")?
+                            }
+                            "priority" => priority = self.expect_u8("push_interaction priority")?,
+                            "flags" => flags = self.expect_u8("push_interaction flags")?,
+                            "icon" => {
+                                icon_local = self.parse_local_ref("push_interaction icon local")?
+                            }
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown push_interaction parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in push_interaction()",
+                            ));
+                        }
+                        match positional {
+                            0 => menu = self.expect_u8("push_interaction menu")?,
+                            1 => object_slot = self.expect_u8("push_interaction object slot")?,
+                            2 => priority = self.expect_u8("push_interaction priority")?,
+                            3 => flags = self.expect_u8("push_interaction flags")?,
+                            4 => {
+                                icon_local = self.parse_local_ref("push_interaction icon local")?
+                            }
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to push_interaction()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                PrimitiveCall::PushInteraction {
+                    menu,
+                    object_slot,
+                    priority,
+                    flags,
+                    icon_local,
+                }
+            }
             "find_best_object" => {
                 let function = self.parse_function_index()?;
                 let mut flags = 0u8;
-                if self.eat(&TokenKind::Comma) {
-                    if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "flags")
+                let mut origin = None;
+                let mut saw_named = false;
+                while self.eat(&TokenKind::Comma) {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
                         && self.peek_at(1).kind == TokenKind::Colon
                     {
-                        self.bump();
-                        self.bump();
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("find_best_object option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "flags" => flags = self.expect_u8("find_best_object flags")?,
+                            "origin" => origin = Some(self.parse_operand()?),
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown find_best_object parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in find_best_object()",
+                            ));
+                        }
+                        flags = self.expect_u8("find_best_object flags")?;
                     }
-                    flags = self.expect_u8("find_best_object flags")?;
                 }
-                PrimitiveCall::FindBestObject { function, flags }
+                if origin.is_some() {
+                    flags |= 8;
+                }
+                PrimitiveCall::FindBestObject {
+                    function,
+                    flags,
+                    origin,
+                }
+            }
+            "find_location" => {
+                let mut mode = 0u8;
+                let mut local = LocalRef::Index(0);
+                let mut flags = 0u8;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("find_location option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "mode" => mode = self.expect_u8("find_location mode")?,
+                            "local" => local = self.parse_local_ref("find_location local")?,
+                            "flags" => flags = self.expect_u8("find_location flags")?,
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown find_location parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in find_location()",
+                            ));
+                        }
+                        match positional {
+                            0 => mode = self.expect_u8("find_location mode")?,
+                            1 => flags = self.expect_u8("find_location flags")?,
+                            2 => local = self.parse_local_ref("find_location local")?,
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to find_location()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                PrimitiveCall::FindLocation { mode, local, flags }
             }
             "idle_for_input" => {
                 let op = self.parse_operand()?;
@@ -1044,23 +1325,26 @@ impl Parser {
             }
             "play_sound" => {
                 let sound_id = self.expect_u16("FWAV sound id")?;
-                let mut use_stack_object = false;
+                let mut flags = 0u8;
                 if self.eat(&TokenKind::Comma) {
-                    if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "stack_obj") {
+                    if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "flags")
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        self.bump();
+                        self.bump();
+                        flags = self.expect_u8("play_sound flags")?;
+                    } else if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "stack_obj") {
                         self.bump();
                         if self.eat(&TokenKind::Colon) {
-                            use_stack_object = self.parse_bool()?;
+                            flags = if self.parse_bool()? { 2 } else { 0 };
                         } else {
-                            use_stack_object = true;
+                            flags = 2;
                         }
                     } else {
-                        use_stack_object = self.parse_bool()?;
+                        flags = if self.parse_bool()? { 2 } else { 0 };
                     }
                 }
-                PrimitiveCall::PlaySound {
-                    sound_id,
-                    use_stack_object,
-                }
+                PrimitiveCall::PlaySound { sound_id, flags }
             }
             "alter_budget" => {
                 let amount = self.parse_operand()?;
@@ -1094,6 +1378,186 @@ impl Parser {
                     amount,
                     category,
                     flags,
+                }
+            }
+            "relationship" => {
+                let mut column = 0u8;
+                let mut direction = 0u8;
+                let mut flags = 0u8;
+                let mut local = LocalRef::Index(0);
+                let mut value: Option<OperandRef> = None;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("relationship option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "column" | "col" => column = self.expect_u8("relationship column")?,
+                            "dir" | "direction" => {
+                                direction = self.expect_u8("relationship direction")?;
+                            }
+                            "flags" => flags = self.expect_u8("relationship flags")?,
+                            "local" => local = self.parse_local_ref("relationship local")?,
+                            "value" => value = Some(self.parse_operand()?),
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown relationship parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in relationship()",
+                            ));
+                        }
+                        match positional {
+                            0 => column = self.expect_u8("relationship column")?,
+                            1 => direction = self.expect_u8("relationship direction")?,
+                            2 => flags = self.expect_u8("relationship flags")?,
+                            3 => value = Some(self.parse_operand()?),
+                            4 => local = self.parse_local_ref("relationship local")?,
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to relationship()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                let value = value
+                    .ok_or_else(|| Error::at(span, "relationship() requires a 'value' operand"))?;
+                PrimitiveCall::Relationship {
+                    column,
+                    direction,
+                    flags,
+                    local,
+                    value,
+                }
+            }
+            "go_to_relative" => {
+                let mut location = 0i8;
+                let mut facing = 0u8;
+                let mut options = 0u8;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("go_to_relative option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "location" => location = self.expect_i8("go_to_relative location")?,
+                            "facing" => facing = self.expect_u8("go_to_relative facing")?,
+                            "options" | "flags" => {
+                                options = self.expect_u8("go_to_relative options")?;
+                            }
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown go_to_relative parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in go_to_relative()",
+                            ));
+                        }
+                        match positional {
+                            0 => location = self.expect_i8("go_to_relative location")?,
+                            1 => facing = self.expect_u8("go_to_relative facing")?,
+                            2 => options = self.expect_u8("go_to_relative options")?,
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to go_to_relative()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                PrimitiveCall::GoToRelative {
+                    location,
+                    facing,
+                    options,
+                }
+            }
+            "run_tree_by_name" => {
+                let mut table = 303u16;
+                let mut index = 0u8;
+                let mut mode = 2u8;
+                let mut global = false;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("run_tree_by_name option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "table" => table = self.expect_u16("run_tree_by_name table")?,
+                            "index" => index = self.expect_u8("run_tree_by_name string index")?,
+                            "mode" => mode = self.expect_u8("run_tree_by_name mode")?,
+                            "global" => global = self.parse_bool()?,
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown run_tree_by_name parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in run_tree_by_name()",
+                            ));
+                        }
+                        match positional {
+                            0 => table = self.expect_u16("run_tree_by_name table")?,
+                            1 => index = self.expect_u8("run_tree_by_name string index")?,
+                            2 => mode = self.expect_u8("run_tree_by_name mode")?,
+                            3 => global = self.parse_bool()?,
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to run_tree_by_name()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                PrimitiveCall::RunTreeByName {
+                    table,
+                    index,
+                    mode,
+                    global,
                 }
             }
             "stop_all_sounds" => {
@@ -1369,8 +1833,296 @@ impl Parser {
                     local_index,
                 }
             }
+            "test_object_type" => {
+                let mut guid = None;
+                let mut object = None;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("test_object_type option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "guid" => guid = Some(self.expect_u32("GUID")?),
+                            "object" => object = Some(self.parse_operand()?),
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown test_object_type parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in test_object_type()",
+                            ));
+                        }
+                        match positional {
+                            0 => guid = Some(self.expect_u32("GUID")?),
+                            1 => object = Some(self.parse_operand()?),
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to test_object_type()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                let guid =
+                    guid.ok_or_else(|| Error::at(span, "test_object_type() requires a GUID"))?;
+                let object = object.ok_or_else(|| {
+                    Error::at(span, "test_object_type() requires an object operand")
+                })?;
+                PrimitiveCall::TestObjectType { guid, object }
+            }
+            "test_sim_interacting_with" => {
+                let person = if self.peek().kind == TokenKind::RParen {
+                    None
+                } else if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "person")
+                    && self.peek_at(1).kind == TokenKind::Colon
+                {
+                    self.bump();
+                    self.bump();
+                    Some(self.parse_operand()?)
+                } else {
+                    Some(self.parse_operand()?)
+                };
+                PrimitiveCall::TestSimInteractingWith { person }
+            }
+            "set_headline" => {
+                let mut use_stack_object = false;
+                let mut local = LocalRef::Index(0);
+                let mut index = 0u8;
+                let mut kind = 0u8;
+                let mut duration = 0i16;
+                let mut options = 0u16;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("set_headline option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "kind" => kind = self.expect_u8("set_headline kind")?,
+                            "index" => index = self.expect_u8("set_headline index")?,
+                            "duration" => duration = self.expect_i16("set_headline duration")?,
+                            "options" => options = self.expect_u16("set_headline options")?,
+                            "stack_obj" => use_stack_object = self.parse_bool()?,
+                            "local" => local = self.parse_local_ref("set_headline local")?,
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown set_headline parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in set_headline()",
+                            ));
+                        }
+                        match positional {
+                            0 => kind = self.expect_u8("set_headline kind")?,
+                            1 => index = self.expect_u8("set_headline index")?,
+                            2 => duration = self.expect_i16("set_headline duration")?,
+                            3 => options = self.expect_u16("set_headline options")?,
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to set_headline()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                PrimitiveCall::SetHeadline {
+                    use_stack_object,
+                    local,
+                    index,
+                    kind,
+                    duration,
+                    options,
+                }
+            }
+            "drop_onto" => {
+                let mut src = None;
+                let mut dst = None;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("drop_onto option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "src" => src = Some(self.parse_slot_spec()?),
+                            "dst" => dst = Some(self.parse_slot_spec()?),
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown drop_onto parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in drop_onto()",
+                            ));
+                        }
+                        match positional {
+                            0 => src = Some(self.parse_slot_spec()?),
+                            1 => dst = Some(self.parse_slot_spec()?),
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to drop_onto()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                let src = src.unwrap_or(SlotSpec::Literal(0));
+                let dst = dst.unwrap_or(SlotSpec::Literal(0));
+                PrimitiveCall::DropOnto { src, dst }
+            }
+            "notify_idle" => PrimitiveCall::NotifyIdle,
+            "action_string" => {
+                let mut table = 300u16;
+                let mut index = 0u8;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("action_string option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "table" => table = self.expect_u16("action_string table")?,
+                            "index" => index = self.expect_u8("action_string index")?,
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown action_string parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in action_string()",
+                            ));
+                        }
+                        match positional {
+                            0 => table = self.expect_u16("action_string table")?,
+                            1 => index = self.expect_u8("action_string index")?,
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to action_string()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                PrimitiveCall::ActionString { table, index }
+            }
+            "manage_inventory" => {
+                let mut operation = 0u8;
+                let mut kind = 0u8;
+                let mut flags = 0u16;
+                let mut guid = 0u32;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("manage_inventory option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "op" | "operation" => {
+                                operation = self.expect_u8("manage_inventory operation")?;
+                            }
+                            "kind" => kind = self.expect_u8("manage_inventory kind")?,
+                            "flags" => flags = self.expect_u16("manage_inventory flags")?,
+                            "guid" => guid = self.expect_u32("manage_inventory guid")?,
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown manage_inventory parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in manage_inventory()",
+                            ));
+                        }
+                        match positional {
+                            0 => operation = self.expect_u8("manage_inventory operation")?,
+                            1 => kind = self.expect_u8("manage_inventory kind")?,
+                            2 => flags = self.expect_u16("manage_inventory flags")?,
+                            3 => guid = self.expect_u32("manage_inventory guid")?,
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to manage_inventory()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                PrimitiveCall::ManageInventory {
+                    operation,
+                    kind,
+                    flags,
+                    guid,
+                }
+            }
             "route" | "route_to" => {
                 let mut slot = 0u16;
+                let mut source = 1u16;
                 let mut flags = 0u8;
                 let mut positional = 0usize;
                 while self.peek().kind != TokenKind::RParen {
@@ -1381,6 +2133,7 @@ impl Parser {
                         self.expect(&TokenKind::Colon, "':'")?;
                         match k.as_str() {
                             "slot" => slot = self.expect_u16("routing slot")?,
+                            "source" => source = self.parse_route_source()?,
                             "flags" => flags = self.expect_u8("routing flags")?,
                             other => {
                                 return Err(Error::at(
@@ -1393,6 +2146,7 @@ impl Parser {
                         match positional {
                             0 => slot = self.expect_u16("routing slot")?,
                             1 => flags = self.expect_u8("routing flags")?,
+                            2 => source = self.parse_route_source()?,
                             _ => {
                                 return Err(Error::at(
                                     self.span(),
@@ -1406,16 +2160,61 @@ impl Parser {
                         break;
                     }
                 }
-                PrimitiveCall::RouteTo { slot, flags }
+                PrimitiveCall::RouteTo {
+                    slot,
+                    source,
+                    flags,
+                }
             }
             "snap" => {
-                let slot = self.expect_u16("snap slot")?;
-                let flags = if self.eat(&TokenKind::Comma) {
-                    self.expect_u8("snap flags")?
-                } else {
-                    0
-                };
-                PrimitiveCall::Snap { slot, flags }
+                let mut slot = 0u16;
+                let mut mode = 3u16;
+                let mut flags = 0u8;
+                let mut positional = 0usize;
+                let mut saw_named = false;
+                while self.peek().kind != TokenKind::RParen {
+                    if matches!(&self.peek().kind, TokenKind::Ident(_))
+                        && self.peek_at(1).kind == TokenKind::Colon
+                    {
+                        saw_named = true;
+                        let (k, kspan) = self.expect_ident("snap option")?;
+                        self.expect(&TokenKind::Colon, "':'")?;
+                        match k.as_str() {
+                            "slot" => slot = self.expect_u16("snap slot")?,
+                            "mode" => mode = self.parse_snap_mode()?,
+                            "flags" => flags = self.expect_u8("snap flags")?,
+                            other => {
+                                return Err(Error::at(
+                                    kspan,
+                                    format!("unknown snap parameter '{other}'"),
+                                ));
+                            }
+                        }
+                    } else {
+                        if saw_named {
+                            return Err(Error::at(
+                                self.span(),
+                                "positional argument cannot follow named arguments in snap()",
+                            ));
+                        }
+                        match positional {
+                            0 => slot = self.expect_u16("snap slot")?,
+                            1 => flags = self.expect_u8("snap flags")?,
+                            2 => mode = self.parse_snap_mode()?,
+                            _ => {
+                                return Err(Error::at(
+                                    self.span(),
+                                    "too many positional arguments to snap()",
+                                ));
+                            }
+                        }
+                        positional += 1;
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                PrimitiveCall::Snap { slot, mode, flags }
             }
             other => {
                 return Err(Error::at(span, format!("unknown primitive '{other}'")));
@@ -1423,6 +2222,97 @@ impl Parser {
         };
         self.expect(&TokenKind::RParen, "')'")?;
         Ok(prim)
+    }
+
+    fn parse_refresh_target(&mut self) -> Result<u16> {
+        match &self.peek().kind {
+            TokenKind::Int(_) => self.expect_u16("refresh target"),
+            TokenKind::Ident(s) => {
+                let name = s.clone();
+                let span = self.span();
+                self.bump();
+                match name.as_str() {
+                    "me" | "self" => Ok(0),
+                    "stack_obj" => Ok(1),
+                    other => Err(Error::at(
+                        span,
+                        format!(
+                            "unknown refresh target '{other}' (expected me, stack_obj, 0, or 1)"
+                        ),
+                    )),
+                }
+            }
+            other => Err(Error::at(
+                self.span(),
+                format!("expected refresh target, found {other:?}"),
+            )),
+        }
+    }
+
+    fn parse_slot_spec(&mut self) -> Result<SlotSpec> {
+        if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "param")
+            && self.peek_at(1).kind == TokenKind::LBracket
+        {
+            self.bump();
+            let idx = self.parse_bracket_index()?;
+            Ok(SlotSpec::Param(idx))
+        } else {
+            Ok(SlotSpec::Literal(self.expect_i16("slot index")?))
+        }
+    }
+
+    fn parse_route_source(&mut self) -> Result<u16> {
+        match &self.peek().kind {
+            TokenKind::Int(_) => self.expect_u16("route source"),
+            TokenKind::Ident(s) => {
+                let name = s.clone();
+                let span = self.span();
+                self.bump();
+                match name.as_str() {
+                    "param" => Ok(0),
+                    "object" | "slot" => Ok(1),
+                    "global" => Ok(2),
+                    other => Err(Error::at(
+                        span,
+                        format!(
+                            "unknown route source '{other}' (expected param, object, global, or 0..=2)"
+                        ),
+                    )),
+                }
+            }
+            other => Err(Error::at(
+                self.span(),
+                format!("expected route source, found {other:?}"),
+            )),
+        }
+    }
+
+    fn parse_snap_mode(&mut self) -> Result<u16> {
+        match &self.peek().kind {
+            TokenKind::Int(_) => self.expect_u16("snap mode"),
+            TokenKind::Ident(s) => {
+                let name = s.clone();
+                let span = self.span();
+                self.bump();
+                match name.as_str() {
+                    "param" => Ok(0),
+                    "object" | "container" => Ok(1),
+                    "front" => Ok(2),
+                    "slot" => Ok(3),
+                    "global" => Ok(4),
+                    other => Err(Error::at(
+                        span,
+                        format!(
+                            "unknown snap mode '{other}' (expected param, object, front, slot, global, or 0..=4)"
+                        ),
+                    )),
+                }
+            }
+            other => Err(Error::at(
+                self.span(),
+                format!("expected snap mode, found {other:?}"),
+            )),
+        }
     }
 
     fn parse_bool(&mut self) -> Result<bool> {
@@ -1529,6 +2419,14 @@ impl Parser {
         let span = self.span();
         let base = if let TokenKind::Ident(ident) = &self.peek().kind {
             match ident.as_str() {
+                "op" => {
+                    let (op_span, opcode, operands) = self.parse_raw_op_head()?;
+                    Condition::RawOp {
+                        span: op_span,
+                        opcode,
+                        operands,
+                    }
+                }
                 "call" => {
                     self.bump();
                     let (target, args, pass_temps) = self.parse_call_args_and_target()?;
@@ -1542,6 +2440,7 @@ impl Parser {
                 "route"
                 | "route_to"
                 | "find_best_object"
+                | "find_location"
                 | "dialog"
                 | "animate"
                 | "snap"
@@ -1557,7 +2456,24 @@ impl Parser {
                 | "idle_for_input"
                 | "stop_all_sounds"
                 | "set_motive_change"
-                | "clear_motive_changes" => {
+                | "clear_motive_changes"
+                | "grab"
+                | "drop"
+                | "change_suit"
+                | "refresh"
+                | "push_interaction"
+                | "relationship"
+                | "go_to_relative"
+                | "run_tree_by_name"
+                | "test_object_type"
+                | "test_sim_interacting_with"
+                | "set_headline"
+                | "drop_onto"
+                | "notify_idle"
+                | "action_string"
+                | "manage_inventory"
+                    if self.peek_at(1).kind == TokenKind::LParen =>
+                {
                     let prim = self.parse_primitive_call()?;
                     Condition::Primitive { span, prim }
                 }
