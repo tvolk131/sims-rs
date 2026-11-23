@@ -1,39 +1,42 @@
 #!/bin/sh
-# Run by build_runtime.sh in the harness image, with a throwaway clone of the
-# installed guest disk at /out/.build/disk.ext4, this directory at /h and the
-# output directory at /out. Replays the clone's journal (as prepare_disk.sh
-# does for a guest), then copies the guest's kernel out of /boot and builds an
+# Run by build_runtime.sh in the harness image, with its staging directory at
+# /s (holding a throwaway clone of the installed guest disk, disk.ext4) and
+# this directory at /h. Replays the clone's journal (as prepare_disk.sh does
+# for a guest), then copies the guest's kernel out of /boot and builds an
 # initramfs from the guest's own busybox and modules, so the runtime matches
-# the disk a prepared guest boots. Every step's failure stops the build, and
-# the outputs appear only once all of them are written.
+# the disk a prepared guest boots. Every step's failure stops the build. The
+# outputs go to /s/runtime, which build_runtime.sh publishes, whole, only
+# after this exits with success.
 set -eu
-DISK=/out/.build/disk.ext4
+DISK=/s/disk.ext4
 MODULES="virtio_pci virtio_blk crc32c_generic ext4"
 e2fsck -fy "$DISK" > /dev/null || test $? -le 1
 K=${KERNEL_VERSION:-}
 if [ -z "$K" ]; then
     # `ls -p` prints /inode/mode/uid/gid/name/size/ per entry.
-    debugfs -R 'ls -p /lib/modules' "$DISK" 2>/dev/null > /out/.build/kernels
-    K=$(awk -F/ '$6 != "." && $6 != ".." && $6 != "" { print $6 }' /out/.build/kernels)
+    debugfs -R 'ls -p /lib/modules' "$DISK" 2>/dev/null > /s/kernels
+    K=$(awk -F/ '$6 != "." && $6 != ".." && $6 != "" { print $6 }' /s/kernels)
     [ -n "$K" ] && [ "$(printf '%s\n' "$K" | wc -l)" -eq 1 ] || { echo "not one kernel in /lib/modules: $K" >&2; exit 1; }
 fi
 echo "kernel $K"
 S=$(mktemp -d /tmp/runtime.XXXXXX)
 trap 'rm -rf "$S"' EXIT
 
+# q <text>: the text as one debugfs argument: quoted, with any '"' doubled.
+q() { printf '"%s"' "$(printf '%s' "$1" | sed 's/"/""/g')"; }
 # resolve <absolute path on disk>: the path of the regular file it names,
 # following symbolic links (debugfs itself does not follow a last one).
 resolve() {
     p=$1 n=0
     while :; do
-        debugfs -R "stat \"$p\"" "$DISK" 2>/dev/null > "$S/stat" || true
+        debugfs -R "stat $(q "$p")" "$DISK" 2>/dev/null > "$S/stat" || true
         type=$(sed -n 's/.*Type: \([a-z]*\).*/\1/p' "$S/stat" | head -n 1)
         case $type in
         regular) echo "$p"; return 0 ;;
         symlink)
             n=$((n + 1)); [ "$n" -le 8 ] || { echo "too many links at $1" >&2; return 1; }
             t=$(sed -n 's/^Fast link dest: "\(.*\)"$/\1/p' "$S/stat")
-            [ -n "$t" ] || t=$(debugfs -R "cat \"$p\"" "$DISK" 2>/dev/null)
+            [ -n "$t" ] || t=$(debugfs -R "cat $(q "$p")" "$DISK" 2>/dev/null)
             case $t in /*) p=$t ;; *) p=$(dirname "$p")/$t ;; esac ;;
         *) echo "$1 is not a regular file on the disk (${type:-missing})" >&2; return 1 ;;
         esac
@@ -44,7 +47,7 @@ resolve() {
 get() {
     src=$(resolve "$1")
     rm -f "$2"
-    debugfs -R "dump \"$src\" \"$2\"" "$DISK" 2>/dev/null
+    debugfs -R "dump $(q "$src") $(q "$2")" "$DISK" 2>/dev/null
     want=$(sed -n 's/.*Size: \([0-9]*\).*/\1/p' "$S/stat" | head -n 1)
     have=$(wc -c < "$2" 2>/dev/null || echo none)
     [ -n "$want" ] && [ "$want" -gt 0 ] && [ "$have" = "$want" ] || { echo "cannot read $1 from the disk ($have of $want bytes)" >&2; exit 1; }
@@ -71,11 +74,12 @@ perl -e '
         if $phnum == 0 || $phentsize != 32 || $phoff + $phnum * $phentsize > length $b;
     my $loads = 0;
     for my $i (0 .. $phnum - 1) {
-        my ($ptype, $off, undef, undef, $filesz) = unpack("V5", substr($b, $phoff + $i * 32, 20));
+        my ($ptype, $off, undef, undef, $filesz, $memsz) = unpack("V6", substr($b, $phoff + $i * 32, 24));
         die "busybox is dynamically linked\n" if $ptype == 3;
         next unless $ptype == 1;
         $loads++;
         die "busybox: a load segment lies past the end of the file\n" if $off + $filesz > length $b;
+        die "busybox: a load segment has more file than memory\n" if $filesz > $memsz;
     }
     die "busybox: no load segment\n" unless $loads;' "$R/bin/busybox"
 for applet in sh mount mkdir modprobe sleep switch_root uname; do
@@ -86,15 +90,16 @@ chmod 0755 "$R/init"
 
 # The modules /init loads and everything they depend on, from modules.dep,
 # with a modules.dep that names only those (busybox modprobe reads it).
-# Names match as modprobe matches them: '-' and '_' alike, the first row
-# for a name (or a path) wins, and the rows keep their order. The kernel's modules are not compressed; a compressed
+# Names match as busybox modprobe makes them: the file name up to its first
+# '.', with '-' and '_' alike. The first row for a name (or a path) wins, and
+# the rows keep their order. The kernel's modules are not compressed; a compressed
 # one stops the build.
 get "/$M/modules.dep" "$S/modules.dep"
 awk -v want="$MODULES" '
     function name(path,   n, p, b) {
         n = split(path, p, "/"); b = p[n]
         if (b !~ /\.ko$/) { print "unsupported module file " path > "/dev/stderr"; bad = 1; exit 1 }
-        sub(/\.ko$/, "", b); gsub(/-/, "_", b); return b
+        sub(/\..*$/, "", b); gsub(/-/, "_", b); return b
     }
     {
         key = $1; sub(/:$/, "", key)
@@ -107,7 +112,7 @@ awk -v want="$MODULES" '
         if (bad) exit 1
         nw = split(want, w, " ")
         for (i = 1; i <= nw; i++) {
-            b = w[i]; gsub(/-/, "_", b)
+            b = w[i]; sub(/\..*$/, "", b); gsub(/-/, "_", b)
             if (!(b in path)) { print "no module " w[i] > "/dev/stderr"; exit 1 }
             stack[++sp] = path[b]
         }
@@ -139,12 +144,8 @@ gzip -n -9 "$S/initramfs.cpio"
     (cd "$S" && sha256sum vmlinuz initramfs.cpio.gz)
     (cd "$R" && sha256sum init bin/busybox)
 } > "$S/runtime.txt"
+mkdir /s/runtime
 for f in vmlinuz initramfs.cpio.gz runtime.txt; do
-    cp "$S/$f" "/out/.build/$f"
+    cp "$S/$f" "/s/runtime/$f"
 done
-# build_runtime.sh checked that none of the three exists, so a failed
-# publication removes the ones already moved.
-for f in vmlinuz initramfs.cpio.gz runtime.txt; do
-    mv "/out/.build/$f" "/out/$f" || { (cd /out && rm -f vmlinuz initramfs.cpio.gz runtime.txt); exit 1; }
-done
-cat /out/runtime.txt
+cat /s/runtime/runtime.txt

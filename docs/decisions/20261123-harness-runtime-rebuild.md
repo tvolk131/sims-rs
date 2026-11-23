@@ -10,7 +10,7 @@ VM boots from those two files, so no new capture could start.
 What was decided:
 
 - **The kernel and initramfs come from the installed guest disk.**
-  `tools/harness/build_runtime.sh <installed guest ext4> <out dir>` reads the
+  `tools/harness/build_runtime.sh <installed guest ext4> <new out dir>` reads the
   disk with debugfs inside the harness image. It works on an APFS clone
   with the journal replayed, as `prepare_guest.sh` does for a guest, so it
   reads what a prepared guest boots and never mounts the disk itself. It
@@ -18,7 +18,8 @@ What was decided:
   from the disk's own static busybox and modules. The kernel, the modules
   and the disk then always match. The script needs only the disk and the
   image (no download, no `cpio` package: `runtime/newc.pl` packs the archive
-  with perl-base). The same disk gives the same files byte for byte.
+  with perl-base). The same disk gives the same files byte for byte. The
+  output directory appears whole or not at all.
 - **The initramfs does what the old one did.** The old `/init` was found in
   a session log of 2026-11-14 and is kept as `runtime/init`. It loads
   virtio_pci, virtio_blk, crc32c_generic and ext4, mounts `/dev/vda`, moves
