@@ -57,9 +57,27 @@
 //!   person ID matching member 0 (`0x4e9608`) and temp 1 becomes 0 (or fails
 //!   with `Trap::Unsupported` if member 0 is off-lot, where `0x450764`
 //!   dereferences null). Takes the true branch when it succeeds.
+//! - 21 (0x45098a): restore the saved state of the person whose object ID
+//!   is in the running object's temp 0 from that person's neighbor
+//!   inventory. See [`Machine::restore_saved_state`]. Magic Town's middle
+//!   ped marker (tree 0x100e, node 35) runs it after it places each member
+//!   of an arriving family.
+//! - 3 (0x44fb41): take down the interface's travel picture, if it shows
+//!   one (0x4fc3ca on the interface, `[0x6f2a58]`). That picture is the
+//!   full-screen window 0x4fc416 opens: a bitmap picked by kind and screen
+//!   width (interface +0x78) in a window (+0x7c), with the game's
+//!   `[0x6e48bc]+0x2c` word +0x60 set to 15. Routine 3 removes the window
+//!   from the window manager (0x5da5ce), clears +0x7c and that word, and
+//!   frees the bitmap (0x5e369b), then takes the true branch. It is
+//!   presentation; the simulation keeps no such window, so here routine 3
+//!   only takes the true branch. The middle ped marker runs it once an
+//!   arriving family is placed (tree 0x100e, node 36). What else reads
+//!   +0x7c (the pause's refusal, `sims_sim::World::pause`; Dialog's
+//!   modal check, `dialog.rs`) is not modeled either.
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
+use sims_core::F32;
 use sims_sim::World;
 
 impl Machine<'_, '_> {
@@ -139,6 +157,12 @@ impl Machine<'_, '_> {
                 self.controlled_family_info()?;
                 Ok(true)
             }
+            21 => {
+                self.restore_saved_state()?;
+                Ok(true)
+            }
+            // Presentation only (see the module's notes).
+            3 => Ok(true),
             35 => {
                 // `0x451142..0x4511a1`: casts caller to cXPerson (native error
                 // `0x1c` if not a person) and records it in registry `+0x10c`
@@ -465,5 +489,137 @@ impl Machine<'_, '_> {
         for (attribute, value) in controller.attributes.iter_mut().zip(values) {
             *attribute = (*attribute).max(value);
         }
+    }
+}
+
+/// The inventory token kind routine 21 restores from.
+const SAVED_STATE: i32 = 2;
+
+/// Where routine 21 puts a token's count, by the token's GUID (the
+/// switch at 0x450a53, through the table at 0x4514ea).
+enum Restored {
+    /// A motive, set to the count as a float (0x45d133: person +0x78c).
+    Motive(usize),
+    /// A person data word, set to the count.
+    Word(usize),
+}
+
+/// GUIDs 0 to 6 name motives, 9 to 12 person data words (+0x59c, +0x62c,
+/// +0x630, +0x62e); 7, 8 and anything above 12 name nothing.
+fn restored(guid: u32) -> Option<Restored> {
+    Some(match guid {
+        0 => Restored::Motive(9),
+        1 => Restored::Motive(6),
+        2 => Restored::Motive(5),
+        3 => Restored::Motive(15),
+        4 => Restored::Motive(7),
+        5 => Restored::Motive(8),
+        6 => Restored::Motive(14),
+        9 => Restored::Word(8),
+        10 => Restored::Word(80),
+        11 => Restored::Word(82),
+        12 => Restored::Word(81),
+        _ => return None,
+    })
+}
+
+impl Machine<'_, '_> {
+    /// Routine 21 (0x45098a to 0x450b26).
+    ///
+    /// 1. The running object's temp 0 (+0x3a) names a person. An ID that
+    ///    names no object, or an object that is not a person, is native
+    ///    error 0x1c (the cast at 0x4509be).
+    /// 2. The person's neighbor inventory is the one with its neighbor ID
+    ///    (person data word 31, +0x5ca); one is added, empty, when there
+    ///    is none (0x42a8a1).
+    /// 3. The tokens of kind 2 are counted (0x41f7a7), and the count cut
+    ///    to a signed word. That many times: the first token of kind 2,
+    ///    any GUID, is found from the start (0x41f69c, from place -1 each
+    ///    time). Its GUID says where its count goes ([`restored`]): a
+    ///    motive takes the signed count as a float, a data word the count.
+    ///    The token is then erased (0x41f56b with -1). A token whose GUID
+    ///    names nothing is left where it is, so later passes find it
+    ///    again and the tokens after it are not reached.
+    ///
+    /// The routine always ends with the true branch (0x44f7f0).
+    ///
+    /// The place found is kept as a word (0x41f6e1), and adding stops at
+    /// 0x7fff tokens, but a loaded inventory can hold more. A token found
+    /// past 0x7fff is read and erased through its place cut to a signed
+    /// word:
+    /// - -1 (index 65535 and every 65536 after) reads as nothing found,
+    ///   and the pass ends;
+    /// - any other negative place is past the end for the read (0x41f746
+    ///   compares it unsigned), so the token keeps the values the routine
+    ///   gave it before the search (kind 0, GUID 0, count 1, 0x450a1d to
+    ///   0x450a23): motive 9 becomes 1, and nothing is erased (0x41f56b
+    ///   also compares unsigned);
+    /// - a place that wraps back to 0 or more reads, and erases, the
+    ///   token there, whatever its kind.
+    fn restore_saved_state(&mut self) -> Result<(), Trap> {
+        let temp = *self
+            .me()?
+            .temps
+            .first()
+            .ok_or_else(|| Trap::Invalid("object has no temps".into()))?;
+        let not_person = || Trap::native(0x1c, "object is not a person");
+        let person = u16::try_from(temp)
+            .ok()
+            .filter(|&id| id > 0)
+            .filter(|id| {
+                self.world
+                    .objects
+                    .get(id)
+                    .is_some_and(|object| object.person.is_some())
+            })
+            .ok_or_else(not_person)?;
+        let neighbor = self.world.objects[&person]
+            .person
+            .as_ref()
+            .ok_or_else(not_person)?
+            .data
+            .get(31)
+            .copied()
+            .ok_or_else(|| Trap::Invalid("a person has no data word 31".into()))?;
+        let inventory = self.inventory_slot(neighbor);
+        let items = &self.world.neighbors.inventories[inventory].items;
+        let passes = items.iter().filter(|item| item.kind == SAVED_STATE).count() as i16;
+        for _ in 0..passes.max(0) {
+            let items = &self.world.neighbors.inventories[inventory].items;
+            let Some(index) = items.iter().position(|item| item.kind == SAVED_STATE) else {
+                continue;
+            };
+            let place = (index as u16) as i16;
+            if place == -1 {
+                continue;
+            }
+            let token = usize::try_from(place).ok().and_then(|at| items.get(at));
+            // A negative place reads nothing and leaves the routine's own
+            // values: GUID 0, count 1 (0x450a1d to 0x450a23).
+            let (guid, count) = token.map_or((0, 1), |token| (token.guid, token.count as i16));
+            let Some(target) = restored(guid) else {
+                continue;
+            };
+            match target {
+                Restored::Motive(motive) => {
+                    self.set_motive(person, motive, F32::from_f32(f32::from(count)))?;
+                }
+                Restored::Word(word) => {
+                    *self
+                        .world
+                        .objects
+                        .get_mut(&person)
+                        .and_then(|object| object.person.as_mut())
+                        .and_then(|data| data.data.get_mut(word))
+                        .ok_or_else(|| {
+                            Trap::Invalid(format!("a person has no data word {word}"))
+                        })? = count;
+                }
+            }
+            if let Ok(at) = usize::try_from(place) {
+                self.world.neighbors.inventories[inventory].items.remove(at);
+            }
+        }
+        Ok(())
     }
 }
