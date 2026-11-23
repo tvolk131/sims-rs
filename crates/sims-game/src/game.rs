@@ -391,6 +391,9 @@ pub struct Game {
     neighborhood_slot: u8,
     /// Currently presented VM special panel (`Dialog` kinds `5..=15`), if any.
     active_special_panel: Option<ActiveSpecialPanel>,
+    /// The open special panel came from [`Game::preview_special_panel`],
+    /// not the VM, so [`Game::sync_special_panel`] keeps it open.
+    special_panel_preview: bool,
     /// Co-op special-panel dialog ID already answered locally plus pump count
     /// elapsed since submission; cleared when the lockstep commit resolves or
     /// rejects the panel, or after a bounded retry wait if host ingress drops
@@ -1092,6 +1095,7 @@ impl Game {
             shop_preview_assets: None,
             shop_preview_yaw_deg: 0,
             shop_preview_body: None,
+            special_panel_preview: false,
             shop_preview_targets: BTreeMap::new(),
             purchased_shop_items: BTreeSet::new(),
             book_dialog: ReferenceBookDialog::new(),
@@ -1482,6 +1486,7 @@ impl Game {
             shop_preview_assets: None,
             shop_preview_yaw_deg: 0,
             shop_preview_body: None,
+            special_panel_preview: false,
             shop_preview_targets: BTreeMap::new(),
             purchased_shop_items: BTreeSet::new(),
             book_dialog: ReferenceBookDialog::new(),
@@ -1828,6 +1833,7 @@ impl Game {
             shop_preview_assets: None,
             shop_preview_yaw_deg: 0,
             shop_preview_body: None,
+            special_panel_preview: false,
             shop_preview_targets: BTreeMap::new(),
             purchased_shop_items: BTreeSet::new(),
             book_dialog: ReferenceBookDialog::new(),
@@ -2035,6 +2041,7 @@ impl Game {
             shop_preview_assets: None,
             shop_preview_yaw_deg: 0,
             shop_preview_body: None,
+            special_panel_preview: false,
             shop_preview_targets: BTreeMap::new(),
             purchased_shop_items: BTreeSet::new(),
             book_dialog: ReferenceBookDialog::new(),
@@ -9972,7 +9979,7 @@ impl Game {
             let outfit = sims_people::appearance::Outfit {
                 parts: vec![(app, tex)],
             };
-            let body = sims_people::appearance::Body::load(assets, skeleton, &outfit).ok()?;
+            let body = load_pet_body(assets, skeleton, &outfit).ok()?;
             self.shop_preview_body = Some((item_id.to_owned(), body));
         }
         let (_, body) = self.shop_preview_body.as_ref()?;
@@ -9994,10 +10001,21 @@ impl Game {
     // Special Dialog Panels (`Dialog` kinds `5..=15`, single-player & co-op)
     // -------------------------------------------------------------------------
 
+    /// Opens `request`'s panel over `world` without the VM asking, so
+    /// headless snapshot tests can draw it. Nothing answers the VM: picks
+    /// are refused as unasked, and Escape closes the panel.
+    #[doc(hidden)]
+    pub fn preview_special_panel(&mut self, request: SpecialPanelRequest, world: &sims_sim::World) {
+        self.close_special_panel_ui();
+        self.open_special_panel_ui(0, request, world, None);
+        self.special_panel_preview = self.active_special_panel.is_some();
+    }
+
     /// Closes any local UI modal opened for a VM special panel without sending
     /// an answer to the VM (used after answering, on co-op peer dismissal, or on
     /// restore).
     fn close_special_panel_ui(&mut self) {
+        self.special_panel_preview = false;
         if self.active_special_panel.take().is_some() {
             self.shop_dialog.close();
             self.shop_snapshot = None;
@@ -10026,6 +10044,9 @@ impl Game {
             .and_then(|c| c.active_special_panel.as_ref().map(|(id, _)| *id));
         let unchanged = {
             let Some(asking) = self.lot.asking_special_panel() else {
+                if self.special_panel_preview && self.active_special_panel.is_some() {
+                    return;
+                }
                 self.submitted_coop_special_panel = None;
                 self.close_special_panel_ui();
                 return;
@@ -10050,6 +10071,18 @@ impl Game {
         };
         let tick = asking.shown.tick;
         let request = asking.shown.request.clone();
+        self.open_special_panel_ui(tick, request, &asking.world, coop_dialog_id);
+    }
+
+    /// Opens the local modal for `request`, as the VM asked it at `tick`
+    /// with `world` as the asking tick left it.
+    fn open_special_panel_ui(
+        &mut self,
+        tick: u32,
+        request: SpecialPanelRequest,
+        world: &sims_sim::World,
+        coop_dialog_id: Option<NetDialogId>,
+    ) {
         self.close_menu();
         self.hud.close_camera_strip();
         self.hud.close_special_book_dialog();
@@ -10069,7 +10102,7 @@ impl Game {
                 let is_cookbook = matches!(request, SpecialPanelRequest::CookBook { .. });
                 self.ensure_book_assets();
                 let snapshot =
-                    self.build_reference_book_snapshot(&asking.world, *caller, is_cookbook);
+                    self.build_reference_book_snapshot(&world, *caller, is_cookbook);
                 self.book_snapshot = Some(snapshot);
                 self.book_dialog.open();
                 self.active_special_panel = Some(ActiveSpecialPanel {
@@ -10087,10 +10120,9 @@ impl Game {
             | SpecialPanelRequest::MagicTownLotPicker { .. } => {
                 let entries = self.resolve_special_lot_entries();
                 let wallet = self.current_shop_wallet();
-                let fame_half_stars = asking
-                    .world
+                let fame_half_stars = world
                     .selected()
-                    .and_then(|sel| asking.world.objects.get(&sel))
+                    .and_then(|sel| world.objects.get(&sel))
                     .and_then(|o| o.person.as_ref())
                     .and_then(|p| p.data.get(81).copied())
                     .map(|level| level.clamp(0, 10) as u8)
@@ -10134,9 +10166,9 @@ impl Game {
                 } else {
                     ShopKind::DowntownBoutique(category)
                 };
-                let shopper = self.person_display_name(&asking.world, *person);
+                let shopper = self.person_display_name(&world, *person);
                 let (items, responses, preview_targets) =
-                    self.build_wardrobe_picker_items(&asking.world, *person, *mode);
+                    self.build_wardrobe_picker_items(&world, *person, *mode);
                 self.open_special_picker(
                     tick,
                     request,
@@ -10150,9 +10182,9 @@ impl Game {
                 );
             }
             SpecialPanelRequest::PetPicker { pet } => {
-                let shopper = self.person_display_name(&asking.world, *pet);
+                let shopper = self.person_display_name(&world, *pet);
                 let (items, responses, preview_targets) =
-                    self.build_pet_picker_items(&asking.world, *pet);
+                    self.build_pet_picker_items(&world, *pet);
                 self.open_special_picker(
                     tick,
                     request,
@@ -10168,7 +10200,7 @@ impl Game {
             SpecialPanelRequest::CallNeighbor { caller_neighbor } => {
                 // Native `cWinPhoneBook` (`0x5221d0`) on `phonebookbkg.bmp`.
                 self.ensure_phonebook_assets();
-                let snapshot = self.build_phonebook_snapshot(&asking.world, *caller_neighbor);
+                let snapshot = self.build_phonebook_snapshot(&world, *caller_neighbor);
                 self.phonebook_snapshot = Some(snapshot);
                 self.phonebook_dialog.open();
                 self.active_special_panel = Some(ActiveSpecialPanel {
@@ -10180,9 +10212,9 @@ impl Game {
                 });
             }
             SpecialPanelRequest::CharmTransform { person } => {
-                let shopper = self.person_display_name(&asking.world, *person);
+                let shopper = self.person_display_name(&world, *person);
                 let (items, responses, preview_targets) =
-                    self.build_charm_transform_items(&asking.world, *person);
+                    self.build_charm_transform_items(&world, *person);
                 self.open_special_picker(
                     tick,
                     request,
@@ -14000,6 +14032,62 @@ mod tests {
         // Interior pixels stay untouched.
         assert_eq!(pixel(&canvas, 6, 6), [0, 0, 0]);
     }
+}
+
+/// Loads a pet's body for the pet picker's turntable. Pets' skeletons are
+/// `dog_skeleton.cmx.bcf` and `kat_skeleton.cmx.bcf` (`ExpansionShared.far`
+/// `Skeletons\`), an underscore where people's `<name>-skeleton.cmx.bcf`
+/// has a hyphen, so [`sims_people::Body::load`] cannot find them; this
+/// tries the hyphen first, then the underscore, and binds the outfit the
+/// same way.
+fn load_pet_body(
+    assets: &sims_people::Assets,
+    skeleton: &str,
+    outfit: &sims_people::Outfit,
+) -> Result<sims_people::Body, String> {
+    if let Ok(body) = sims_people::Body::load(assets, skeleton, outfit) {
+        return Ok(body);
+    }
+    use sims_people::appearance::{load_appearance, load_mesh, load_texture, texture_for};
+    use sims_people::rig::bone;
+    let file = format!("{skeleton}_skeleton.cmx.bcf");
+    let catalog = sims_formats::avatar::read_bcf(&assets.read(&file)?)
+        .map_err(|e| format!("{file}: {e}"))?;
+    let skeleton = catalog
+        .skeletons
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("{file} holds no skeleton"))?;
+    let mut parts = Vec::new();
+    for (name, textures) in &outfit.parts {
+        let appearance = load_appearance(assets, name)?;
+        for binding in &appearance.bindings {
+            let at = bone(&skeleton, &binding.bone)
+                .ok_or_else(|| format!("{name:?} binds the missing bone {:?}", binding.bone))?;
+            let mesh = load_mesh(assets, &binding.mesh)?;
+            let bones = mesh
+                .bones
+                .iter()
+                .map(|b| bone(&skeleton, b).ok_or_else(|| format!("missing bone {b:?}")))
+                .collect::<Result<Vec<_>, _>>()?;
+            let texture_name = texture_for(&binding.mesh, textures)
+                .or_else(|| (!mesh.texture.is_empty()).then(|| mesh.texture.clone()));
+            let texture = match &texture_name {
+                Some(t) => load_texture(assets, t)?,
+                None => sims_people::texture::Texture::solid([200, 200, 200, 255]),
+            };
+            parts.push(sims_people::Part {
+                appearance: name.clone(),
+                bone: at,
+                bones,
+                mesh,
+                texture_name,
+                texture,
+                censor: binding.censor,
+            });
+        }
+    }
+    Ok(sims_people::Body { skeleton, parts })
 }
 
 /// `person.data[31]`: the person's neighbor record ID (`PERSON_NEIGHBOR`).
