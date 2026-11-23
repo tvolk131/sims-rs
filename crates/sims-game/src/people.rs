@@ -395,6 +395,15 @@ impl People {
         self.note(drawn.problems);
     }
 
+    /// Where each person the last draw drew draws what they hold
+    /// ([`sims_people::People::held_attach`]).
+    pub fn held_attach(
+        &self,
+        camera: &Camera,
+    ) -> std::collections::BTreeMap<u16, sims_render::PersonAttach> {
+        self.people.held_attach(camera)
+    }
+
     /// The head of `person` for the middle of the pie menu in neutral pose
     /// ([`People::head_looking`] with [`Look::neutral`]).
     pub fn head(&mut self, world: &World, person: u16, size: [u32; 2]) -> Result<Image, String> {

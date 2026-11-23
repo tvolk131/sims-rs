@@ -9458,3 +9458,63 @@ fn build_mode_walls_floors_wallpaper_doors_windows_and_undo_redo() {
         }
     }
 }
+
+/// A Sim draws what it carries at its right palm, not on the floor at its
+/// feet: the original draws a person's slot objects from the person's own
+/// draw (0x459dc0 → 0x59185d), slot 0 at the animator's attach point 0,
+/// `R_HAND`'s "Palm" (0x5924a4, 0x5a1631). Mortimer, sent for a snack,
+/// carries its plate (object 263, his slot 0) away from the fridge at
+/// chest height, inside his own figure; on his tile's floor it would sit
+/// at the bottom of it.
+#[test]
+fn a_carried_snack_is_drawn_in_the_carriers_hand() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
+    game.resize([800, 600]);
+    game.render();
+    let person = game.lot().world().selected().expect("a Sim is selected");
+    let (_, snack, _) = snack_pie(&mut game);
+    game.press(snack);
+    game.release(snack);
+    assert_eq!(game.run(780), 780);
+    let plate = &game.lot().world().objects[&263];
+    assert_eq!(
+        (plate.data[2], plate.data[3]),
+        (person as i16, 0),
+        "Mortimer carries the snack in his slot 0"
+    );
+    game.render();
+    let bounds = |id: u16| {
+        let mut b: Option<[i32; 4]> = None;
+        for y in 0..600 {
+            for x in 0..800 {
+                if game.canvas().id_at(x, y) == Some(id) {
+                    let b = b.get_or_insert([x, y, x, y]);
+                    *b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+                }
+            }
+        }
+        b.unwrap_or_else(|| panic!("object {id} is not drawn"))
+    };
+    let [px0, py0, px1, py1] = bounds(person);
+    let [sx0, sy0, sx1, sy1] = bounds(263);
+    let height = py1 - py0;
+    assert!(height > 20, "Mortimer is {height} pixels tall");
+    // In his figure, across it, and in its upper half: at his hands.
+    assert!(
+        sx0 >= px0 - 4 && sx1 <= px1 + 8,
+        "the plate {:?} is beside Mortimer {:?}",
+        [sx0, sy0, sx1, sy1],
+        [px0, py0, px1, py1]
+    );
+    let middle = (sy0 + sy1) / 2;
+    assert!(
+        middle > py0 + height / 8 && middle < py0 + height * 5 / 8,
+        "the plate {:?} is not at Mortimer's hands {:?}",
+        [sx0, sy0, sx1, sy1],
+        [px0, py0, px1, py1]
+    );
+}

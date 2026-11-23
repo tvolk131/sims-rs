@@ -4178,12 +4178,21 @@ impl Game {
         // Who the pick notes: the people as drawn, before a bench they sit
         // on draws over them, captured only within their tight drawn rects.
         self.people_ids.take_rects(&self.canvas, &self.people_rects);
-        sims_render::draw_held_with_options(
+        // What a Sim holds is drawn at the Sim's attach points (a carried
+        // plate in the right palm), after the people and depth-tested, as
+        // the person's own draw does (0x459dc0 → 0x59185d).
+        let attach = if self.open_pack_mode {
+            std::collections::BTreeMap::new()
+        } else {
+            self.people.held_attach(&self.view.camera)
+        };
+        sims_render::draw_held_with_attach(
             world,
             draw_shape,
             &mut self.assets,
             &self.view.camera,
             render_options,
+            &attach,
             &mut self.canvas,
         );
         let mut cur_dynamic_rects = self.people_rects.clone();
