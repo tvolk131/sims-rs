@@ -18,9 +18,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 mod iff;
 mod live;
+mod replay;
 pub use iff::{
     IffEquivOptions, IffEquivReport, IffVerdict, ResourceReport, ResourceVerdict,
-    check_iff_equivalent,
+    check_iff_equivalent, single_file_problem,
 };
 pub use live::{GUARANTEED_ATTRIBUTES, LiveContext, LiveOptions, check_bhav_live_equivalent};
 
@@ -4346,6 +4347,25 @@ pub fn check_bhav_equivalent_with_arities(
     opts: &EquivOptions,
     callee_arities: Option<&BTreeMap<u16, usize>>,
 ) -> EquivResult {
+    lockstep_traced(a, b, opts, callee_arities, &mut LockstepTrace::default())
+}
+
+/// Which node pairs a lockstep run visited.
+#[derive(Debug, Default)]
+struct LockstepTrace {
+    /// Every `(node in A, node in B)` pair the product ran.
+    pairs: BTreeSet<(u8, u8)>,
+    /// Whether some pair ran while the two sides' last branch results may differ.
+    last_differs_mid_run: bool,
+}
+
+fn lockstep_traced(
+    a: &BhavChunk,
+    b: &BhavChunk,
+    opts: &EquivOptions,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+    trace: &mut LockstepTrace,
+) -> EquivResult {
     if a.kind != b.kind {
         return EquivResult::Counterexample {
             path: Vec::new(),
@@ -4503,6 +4523,8 @@ pub fn check_bhav_equivalent_with_arities(
         // frame-local environments on A and B, widen both sides symmetrically to distinct
         // `WidenedLocal`/`WidenedParam` tokens (never colliding with `Sym`) so unbounded
         // identical loops prove equivalent in O(N) states!
+        trace.pairs.insert((pc_a, pc_b));
+        trace.last_differs_mid_run |= state.last_differs;
         let pair_hits = pc_pair_visits.entry((pc_a, pc_b)).or_insert(0);
         *pair_hits += 1;
         if *pair_hits > 4 && state.env_a == state.env_b {
@@ -5579,25 +5601,29 @@ fn may_read_unwritten_local(bhav: &BhavChunk) -> bool {
 }
 
 /// Whether a lockstep proof (with silent steps off) also covers everything the
-/// live-output checker observes under `live`.
+/// live-output checker observes under `live`, faults included.
 fn lockstep_suffices(
     a: &BhavChunk,
     ctx_a: &LiveContext,
     b: &BhavChunk,
     ctx_b: &LiveContext,
     live: &LiveOptions,
+    trace: &LockstepTrace,
 ) -> bool {
-    // With silent steps off, lockstep matches every frame write (expression
-    // destinations and primitive operands), so equal frames end with equal contents;
-    // frames of different sizes leave different residue.
-    if live.observe_frame_residue && live::frame_dims(a) != live::frame_dims(b) {
+    // Any node may fault (a trap, the error target, a bad branch), and a fault leaves
+    // the faulting frame on the stack at its node with the thread's last result
+    // (`interpreter.rs:809`). So the proof stands only if every matched pair is the
+    // same node on both sides, the frames have the same layout, and the last results
+    // never differ while a node runs. With silent steps off, lockstep matches every
+    // frame write (expression destinations and primitive operands), so equal layouts
+    // also end with equal contents, which covers frame residue.
+    if trace.pairs.iter().any(|&(pa, pb)| pa != pb) {
         return false;
     }
-    // Lockstep does not compare frame sizes, but a tree a primitive runs starts after
-    // the caller's frame in the frame storage, so its uninitialized locals depend on
-    // them (`sims-vm/src/interpreter.rs:1195`).
-    let has_primitive = |bhav: &BhavChunk| bhav.instructions.iter().any(|ins| ins.opcode != 2);
-    if live::frame_dims(a) != live::frame_dims(b) && (has_primitive(a) || has_primitive(b)) {
+    if live.observe_last_result && trace.last_differs_mid_run {
+        return false;
+    }
+    if live::frame_dims(a) != live::frame_dims(b) {
         return false;
     }
     // Lockstep runs nodes past 250 and branches to 251 and 252, which the VM rejects
@@ -5637,9 +5663,11 @@ fn lockstep_suffices(
 /// Lockstep runs with silent steps off (so every `Expression` is matched, which keeps
 /// the scratch pointer and uninitialized-local reads in step) and, when `live` observes
 /// it, with the last branch result compared. Its proof is taken only when it covers
-/// what `live` observes ([`lockstep_suffices`]). A lockstep counterexample is a
-/// divergence in the stricter node-for-node trace; when the live-output checker cannot
-/// decide, the result is `Inconclusive` rather than that counterexample.
+/// what `live` observes ([`lockstep_suffices`]): among other things it must have paired
+/// every node with the node of the same number, since a fault leaves the node number
+/// behind. A lockstep counterexample is a divergence in the stricter node-for-node
+/// trace and is never reported; only a live-output counterexample, which a `sims-vm`
+/// replay has confirmed, is. Otherwise the result is `Inconclusive`.
 #[must_use]
 pub fn check_bhav_equivalent_combined(
     a: &BhavChunk,
@@ -5661,9 +5689,10 @@ pub fn check_bhav_equivalent_combined(
         observe_last_result: live.observe_last_result,
         ..*lockstep
     };
-    let first = check_bhav_equivalent_with_arities(a, b, &strict, arities.as_ref());
+    let mut trace = LockstepTrace::default();
+    let first = lockstep_traced(a, b, &strict, arities.as_ref(), &mut trace);
     if matches!(first, EquivResult::Equivalent { .. })
-        && lockstep_suffices(a, ctx_a, b, ctx_b, live)
+        && lockstep_suffices(a, ctx_a, b, ctx_b, live, &trace)
     {
         return (EquivMethod::Lockstep, first);
     }
@@ -5675,7 +5704,8 @@ pub fn check_bhav_equivalent_combined(
                 }
                 EquivResult::Inconclusive { reason } => format!("lockstep: {reason}"),
                 EquivResult::Equivalent { .. } => "lockstep: equivalent node for node, but that \
-                     does not cover frame layout, invalid nodes or differing callee arities here"
+                     does not cover renumbered nodes (where a fault would differ), frame layout, \
+                     invalid nodes or differing callee arities here"
                     .to_owned(),
             };
             (

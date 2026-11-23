@@ -11,13 +11,14 @@ publish = false
 [dependencies]
 encoding_rs.workspace = true
 libm.workspace = true
-sims-formats.workspace = true
-
-[dev-dependencies]
 sims-content.workspace = true
-sims-core.workspace = true
+sims-formats.workspace = true
+# The equivalence checker confirms every counterexample by running both trees.
 sims-sim.workspace = true
 sims-vm.workspace = true
+
+[dev-dependencies]
+sims-core.workspace = true
 
 [lints]
 workspace = true

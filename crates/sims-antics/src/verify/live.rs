@@ -28,17 +28,34 @@
 //! overwritten writes leave no trace, so they drop out of the comparison; writes to
 //! dead frame slots do too when frame residue is not observed.
 //!
-//! Verdicts are conservative: `Equivalent` must be sound, a counterexample must have a
-//! witness the VM can reach, and everything else is `Inconclusive`.
+//! Verdicts are conservative: `Equivalent` must be sound, a counterexample must be a
+//! concrete run, and everything else is `Inconclusive`.
+//!
+//! - **Counterexamples come from `sims-vm`.** A symbolic difference is only a candidate.
+//!   The checker picks concrete inputs that satisfy the combined path condition, runs
+//!   both trees in `sims-vm` from the same world and frame (`super::replay`), and
+//!   reports a counterexample only when the two runs observably differ. A candidate it
+//!   cannot replay (a reachable primitive or call, an inexact path condition, more than
+//!   `MAX_REPLAYS` (32) candidates) or whose runs agree is `Inconclusive`.
+//! - **Traps are never a difference.** A VM trap aborts the tick and leaves the faulting
+//!   frame, the last branch result and the node behind (`interpreter.rs:809`). Two
+//!   faulting paths count as equal only when they fault with the same trap at the same
+//!   node with the same frame residue and last result; any other trap pairing is
+//!   `Inconclusive`, never a counterexample (the replay fails on a fault).
+//! - **The instruction budget is a model assumption.** `Equivalent` means equivalent
+//!   when neither run exhausts the VM's per-tick instruction budget. Dummy nodes change
+//!   the instruction count by design, so requiring equal counts would reject the very
+//!   trees this checker exists for. Likewise, faults the world can raise on its own
+//!   (an object deleted under the tree, a stack overflow from deep calls) are outside
+//!   the model.
 //!
 //! Soundness: values are named by what determines them (initial inputs, or an event
 //! together with the whole event history before it), so equal names always mean equal
-//! values. Branches are pruned only when the path condition provably rules them out,
-//! and a difference is reported as a counterexample only when the combined path
-//! condition is satisfiable in the checker's model and the differing values can
-//! actually differ; otherwise the result is `Inconclusive`. The checker never reports
-//! `Equivalent` for trees it cannot fully explore within its bounds.
+//! values. Branches are pruned only when the path condition provably rules them out.
+//! The checker never reports `Equivalent` for trees it cannot fully explore within its
+//! bounds.
 
+use super::replay::{self, Witness};
 use super::{
     EquivResult, FrameUse, TraceStep, canonicalize_primitive_operands,
     collect_inline_call_arg_bytes, is_always_true_instruction, primitive_frame_uses, word_i16,
@@ -65,6 +82,9 @@ const LAST_NODE: usize = 250;
 
 /// Temps every object has (`sims-vm/src/memory.rs:438`).
 const TEMP_COUNT: i16 = 8;
+
+/// Most concrete replays one comparison runs before leaving the rest undecided.
+const MAX_REPLAYS: usize = 32;
 
 /// What the checker may assume about where one side's tree runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,6 +479,19 @@ impl Range {
         span - holes
     }
 
+    /// The allowed value closest to `target`, if any.
+    fn pick_near(&self, target: i16) -> Option<i16> {
+        if self.count() <= 0 {
+            return None;
+        }
+        let t = i32::from(target).clamp(self.lo, self.hi);
+        let ok = |v: i32| (self.lo..=self.hi).contains(&v) && !self.excluded.contains(&v);
+        (0..=self.excluded.len() as i32 + 1)
+            .flat_map(|d| [t + d, t - d])
+            .find(|&v| ok(v))
+            .map(|v| v as i16)
+    }
+
     fn single(&self) -> Option<i16> {
         if self.count() != 1 {
             return None;
@@ -593,6 +626,10 @@ impl std::fmt::Display for Exit {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Outputs {
     exit: Exit,
+    /// For a path that faults (a trap, the error target, a bad branch): the node the
+    /// fault happens at. The faulting frame stays on the stack at that node
+    /// (`interpreter.rs:809`), so two faults are the same only at the same node.
+    fault_at: Option<u8>,
     /// The event history (interned), which fixes the ordered trace.
     prefix: u32,
     /// The epoch `store` is relative to (fixed by `prefix`).
@@ -744,19 +781,28 @@ impl Explorer<'_> {
 
     fn finish(&self, state: PathState, exit: Exit, interner: &mut Interner) -> Step {
         let store = self.normalized_store(&state, interner);
-        let residue = self.opts.observe_frame_residue.then(|| {
+        let faults = !matches!(exit, Exit::True | Exit::False);
+        // A fault leaves the faulting frame on the stack and the thread's last result
+        // in the object (`interpreter.rs:809`), so both are compared for a faulting
+        // path whatever the observation policy says about frames left behind.
+        let residue = (self.opts.observe_frame_residue || faults).then(|| {
             (
                 state.params.clone(),
                 state.locals.clone(),
                 state.unwritten.clone(),
             )
         });
-        // A trap leaves the thread; what it last branched on is not read.
-        let last_result = (self.opts.observe_last_result && !matches!(exit, Exit::Trap(_)))
-            .then_some(state.last_result);
+        let last_result = self.opts.observe_last_result.then_some(state.last_result);
         Step::Done(PathSummary {
             out: Outputs {
                 exit,
+                fault_at: if faults {
+                    // An entry past the last node faults before any node runs; it is
+                    // never compared (`check_bhav_live_equivalent`).
+                    Some(state.nodes.last().copied().unwrap_or(u8::MAX))
+                } else {
+                    None
+                },
                 prefix: state.prefix,
                 epoch: state.epoch,
                 store,
@@ -1509,26 +1555,21 @@ pub fn check_bhav_live_equivalent(
     if let Some(reason) = super::context_mismatch(a, ctx_a, b, ctx_b) {
         return EquivResult::Inconclusive { reason };
     }
+    // Only a kind-4 tree is entered at a node other than 0 (`interpreter.rs:1792`), but
+    // whether other kinds differ anywhere else is not modeled.
     if a.kind != b.kind {
-        return EquivResult::Counterexample {
-            path: Vec::new(),
-            divergence: format!(
-                "BHAV kind mismatch: A has kind {} vs B has kind {}",
+        return EquivResult::Inconclusive {
+            reason: format!(
+                "the trees have different kinds ({} vs {}), which the checker does not model",
                 a.kind, b.kind
             ),
         };
     }
+    // An empty tree faults on entry (`interpreter.rs:1786`).
     if a.instructions.is_empty() || b.instructions.is_empty() {
-        if a.instructions.is_empty() && b.instructions.is_empty() {
-            return EquivResult::Equivalent {
-                states_checked: 1,
-                paths_verified: 1,
-            };
-        }
-        return EquivResult::Counterexample {
-            path: Vec::new(),
-            divergence: format!(
-                "instruction emptiness mismatch: a has {} nodes, b has {} nodes",
+        return EquivResult::Inconclusive {
+            reason: format!(
+                "an empty tree faults when entered (A has {} nodes, B has {})",
                 a.instructions.len(),
                 b.instructions.len()
             ),
@@ -1544,11 +1585,27 @@ pub fn check_bhav_live_equivalent(
     let mut steps = 0usize;
     let mut paths = 0usize;
     let mut undecided: Option<String> = None;
+    let mut replays = 0usize;
     for entry in 0..entries {
         let (entry_a, entry_b) = (entry.min(len_a - 1), entry.min(len_b - 1));
-        if entry_a > LAST_NODE && entry_b > LAST_NODE {
-            // Both fail with 0x44c before running anything.
-            continue;
+        if entry_a > LAST_NODE || entry_b > LAST_NODE {
+            // The frame is pushed at the clamped entry node, which then faults with
+            // 0x44c (`interpreter.rs:766`), leaving the frame at that node. Two such
+            // faults are the same only at the same node with the same frame.
+            if entry_a == entry_b && frame_dims(a) == frame_dims(b) {
+                continue;
+            }
+            return EquivResult::Inconclusive {
+                reason: format!(
+                    "entry {entry} faults past node {LAST_NODE} on {} (entered at node {entry_a} on A, \
+                     {entry_b} on B)",
+                    if entry_a > LAST_NODE && entry_b > LAST_NODE {
+                        "both sides, at different nodes or with different frames"
+                    } else {
+                        "one side only"
+                    }
+                ),
+            };
         }
         // Entries below the last pair are passed exactly; the last pair stands for every
         // larger entry too. A negative entry fails alike on both sides.
@@ -1590,7 +1647,27 @@ pub fn check_bhav_live_equivalent(
         };
         steps += steps_a + steps_b;
         paths += paths_a.len() + paths_b.len();
-        match compare_paths(&paths_a, &paths_b, &interner, opts) {
+        // A difference counts only if both trees, run in `sims-vm` from the same world
+        // built from a witness, end differently.
+        let mut confirm = |w: &Witness| -> Option<String> {
+            if replays >= MAX_REPLAYS
+                || !replay::replayable(a, entry_a)
+                || !replay::replayable(b, entry_b)
+            {
+                return None;
+            }
+            replays += 1;
+            replay::replay(a, ctx_a, b, ctx_b, opts, w)
+        };
+        match compare_paths(
+            &paths_a,
+            &paths_b,
+            &interner,
+            opts,
+            entry_param,
+            frame_dims(a).0.max(frame_dims(b).0),
+            &mut confirm,
+        ) {
             PairVerdict::Same => {}
             PairVerdict::Differ(path, divergence) => {
                 return EquivResult::Counterexample { path, divergence };
@@ -1615,11 +1692,17 @@ enum PairVerdict {
     Undecided(String),
 }
 
+/// Compares every pair of paths with different summaries. A pair that may differ is
+/// undecided unless `confirm` (a concrete VM replay) shows it does for a witness built
+/// from the pair's path condition.
 fn compare_paths(
     paths_a: &[PathSummary],
     paths_b: &[PathSummary],
     interner: &Interner,
     opts: &LiveOptions,
+    entry_param: Option<(i16, bool)>,
+    args: usize,
+    confirm: &mut dyn FnMut(&Witness) -> Option<String>,
 ) -> PairVerdict {
     fn group(paths: &[PathSummary]) -> BTreeMap<&Outputs, Vec<usize>> {
         let mut groups: BTreeMap<&Outputs, Vec<usize>> = BTreeMap::new();
@@ -1655,15 +1738,28 @@ fn compare_paths(
                     cond.extend_from_slice(&pb.cond);
                     match first_difference(&pa.out, &pb.out, &cond, interner) {
                         Difference::Definite(what) if exact => {
-                            return PairVerdict::Differ(
-                                trace_steps(pa, pb),
+                            let shown = witnesses(&cond, interner, entry_param, args)
+                                .iter()
+                                .find_map(&mut *confirm);
+                            if let Some(vm) = shown {
+                                return PairVerdict::Differ(
+                                    trace_steps(pa, pb),
+                                    format!(
+                                        "{what} (A path {}, B path {}{}); {vm}",
+                                        format_nodes(pa),
+                                        format_nodes(pb),
+                                        format_cond(&cond, interner)
+                                    ),
+                                );
+                            }
+                            undecided.get_or_insert_with(|| {
                                 format!(
-                                    "{what} (A path {}, B path {}{})",
+                                    "paths may differ, but no sims-vm replay confirmed it: {what} (A path {}, B path {}{})",
                                     format_nodes(pa),
                                     format_nodes(pb),
                                     format_cond(&cond, interner)
-                                ),
-                            );
+                                )
+                            });
                         }
                         Difference::Definite(what) | Difference::Possible(what) => {
                             undecided.get_or_insert_with(|| {
@@ -1684,6 +1780,68 @@ fn compare_paths(
         Some(reason) => PairVerdict::Undecided(reason),
         None => PairVerdict::Same,
     }
+}
+
+/// Concrete inputs for a pair of paths: each input the path condition bounds gets a
+/// value inside its bounds, and each other input a default. Two variants: unbounded
+/// inputs all zero, and unbounded inputs pairwise distinct (so outputs that copy
+/// different inputs differ). The replay decides whether a witness shows anything, so
+/// these need not satisfy every constraint.
+fn witnesses(
+    cond: &[(Atom, bool)],
+    interner: &Interner,
+    entry_param: Option<(i16, bool)>,
+    args: usize,
+) -> Vec<Witness> {
+    let mut out: Vec<Witness> = Vec::new();
+    for distinct in [false, true] {
+        // A kind-4 entry is passed as the first argument even to a tree that takes none.
+        let mut w = Witness {
+            params: vec![0; args.max(usize::from(entry_param.is_some()))],
+            ..Witness::default()
+        };
+        let mut feasible = true;
+        for (id, key) in interner.sym_keys.iter().enumerate() {
+            let id = id as u32;
+            if !interner.is_input(id) {
+                continue;
+            }
+            let base = if distinct {
+                i16::try_from(3 * (id + 1)).unwrap_or(i16::MAX)
+            } else {
+                0
+            };
+            let Some(v) = range_of(cond, id).pick_near(base) else {
+                feasible = false;
+                break;
+            };
+            match key {
+                SymKey::InitParam(i) => {
+                    if let Some(slot) = w.params.get_mut(usize::from(*i)) {
+                        *slot = v;
+                    }
+                }
+                SymKey::InitLocal(word) => {
+                    w.frame_words.insert(*word, v);
+                }
+                SymKey::Cell(_, Cell::Temp(i)) => {
+                    w.temps.insert(*i, v);
+                }
+                SymKey::Cell(_, Cell::Attr(i)) => {
+                    w.attrs.insert(*i, v);
+                }
+                _ => {}
+            }
+        }
+        // An exact kind-4 entry is a literal first parameter, not an input.
+        if let (Some((raw, true)), Some(first)) = (entry_param, w.params.first_mut()) {
+            *first = raw;
+        }
+        if feasible && !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
 }
 
 enum Difference {
@@ -1797,6 +1955,12 @@ fn first_difference_inner(
     }
     if a.exit != b.exit {
         return Difference::Definite(format!("exit differs: A {} vs B {}", a.exit, b.exit));
+    }
+    if a.fault_at != b.fault_at {
+        return Difference::Possible(format!(
+            "both fault with {}, but at different nodes",
+            a.exit
+        ));
     }
     if a.scratch != b.scratch {
         return Difference::Definite(format!(

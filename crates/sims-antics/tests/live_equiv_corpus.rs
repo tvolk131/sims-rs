@@ -47,6 +47,22 @@ fn arities_in_range(iff: &Iff, lo: u16, hi: u16) -> BTreeMap<u16, usize> {
     out
 }
 
+/// The leading words of an inconclusive reason, for a tally.
+fn reason_key(reason: &str) -> String {
+    const UNDECIDED: &str = "paths may differ but the checker cannot decide it: ";
+    if let Some(rest) = reason.strip_prefix(UNDECIDED) {
+        return format!("undecided: {}", reason_key(rest));
+    }
+    reason
+        .trim_start_matches("A: ")
+        .trim_start_matches("B: ")
+        .split(|c: char| c.is_ascii_digit() || c == '(' || c == ':')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_owned()
+}
+
 #[test]
 fn live_output_checker_is_sound_on_the_install() {
     let Ok(install_root) = std::env::var("SIMS_INSTALL") else {
@@ -95,6 +111,7 @@ fn live_output_checker_is_sound_on_the_install() {
     let mut self_inconclusive = 0usize;
     let mut self_counterexamples = 0usize;
     let mut inconclusive_reasons: BTreeMap<String, usize> = BTreeMap::new();
+    let mut lift_inconclusive_reasons: BTreeMap<String, usize> = BTreeMap::new();
     let mut lockstep_equivalent = 0usize;
     let mut live_agrees = 0usize;
     let mut live_inconclusive_on_lockstep_equivalent = 0usize;
@@ -164,15 +181,7 @@ fn live_output_checker_is_sound_on_the_install() {
                 EquivResult::Equivalent { .. } => self_equivalent += 1,
                 EquivResult::Inconclusive { reason } => {
                     self_inconclusive += 1;
-                    let key: String = reason
-                        .trim_start_matches("A: ")
-                        .trim_start_matches("B: ")
-                        .split(|c: char| c.is_ascii_digit() || c == '(')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_owned();
-                    *inconclusive_reasons.entry(key).or_default() += 1;
+                    *inconclusive_reasons.entry(reason_key(&reason)).or_default() += 1;
                 }
                 EquivResult::Counterexample { divergence, .. } => {
                     self_counterexamples += 1;
@@ -203,8 +212,11 @@ fn live_output_checker_is_sound_on_the_install() {
                 lockstep_equivalent += 1;
                 match check_bhav_live_equivalent(&bhav, &ctx, recompiled, &ctx, &opts) {
                     EquivResult::Equivalent { .. } => live_agrees += 1,
-                    EquivResult::Inconclusive { .. } => {
+                    EquivResult::Inconclusive { reason } => {
                         live_inconclusive_on_lockstep_equivalent += 1;
+                        *lift_inconclusive_reasons
+                            .entry(reason_key(&reason))
+                            .or_default() += 1;
                     }
                     EquivResult::Counterexample { divergence, .. } => {
                         live_contradicts_lockstep += 1;
@@ -235,16 +247,17 @@ fn live_output_checker_is_sound_on_the_install() {
                     target.format = bhav.format;
                     target.args = bhav.args;
                     target.locals = bhav.locals;
+                    // The replay world has no action to record the last result in, so a
+                    // difference there is undecided rather than a counterexample.
                     match check_bhav_live_equivalent(&bhav, &ctx, &target, &ctx, &opts) {
                         EquivResult::Equivalent { .. } => dummy_strict_proven += 1,
-                        EquivResult::Counterexample { divergence, .. } => {
-                            if divergence.contains("last branch result") {
-                                dummy_strict_last_result += 1;
-                            } else {
-                                dummy_strict_other += 1;
-                            }
+                        EquivResult::Inconclusive { reason }
+                            if reason.contains("last branch result") =>
+                        {
+                            dummy_strict_last_result += 1;
                         }
                         EquivResult::Inconclusive { .. } => {}
+                        EquivResult::Counterexample { .. } => dummy_strict_other += 1,
                     }
                     match check_bhav_live_equivalent(
                         &bhav,
@@ -281,6 +294,9 @@ fn live_output_checker_is_sound_on_the_install() {
     for (reason, count) in &inconclusive_reasons {
         eprintln!("live_equiv_corpus: inconclusive {count}x: {reason}");
     }
+    for (reason, count) in &lift_inconclusive_reasons {
+        eprintln!("live_equiv_corpus: lift inconclusive {count}x: {reason}");
+    }
     if let Some(problem) = &first_problem {
         eprintln!("live_equiv_corpus: first problem: {problem}");
     }
@@ -303,6 +319,6 @@ fn live_output_checker_is_sound_on_the_install() {
     );
     assert_eq!(
         dummy_strict_other, 0,
-        "a dummy tree was refuted for something other than its last result"
+        "a dummy tree was refuted against its return value"
     );
 }

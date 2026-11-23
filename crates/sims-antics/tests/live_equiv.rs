@@ -118,8 +118,9 @@ fn ignoring_last_result() -> LiveOptions {
 /// attributes), so the compare is a dead pure read and the tree returns true like
 /// `return true;`. It differs in one thing only: its final test is false, and the VM
 /// records the last branch result when the frame of a tree an action started is popped
-/// (`object_uses.rs:246`). The strict default reports that; ignoring the last result
-/// proves the trees equivalent.
+/// (`object_uses.rs:246`). The strict default cannot rule that out, and the replay
+/// world (no person, no action) cannot show it, so the result is undecided; ignoring
+/// the last result proves the trees equivalent.
 #[test]
 fn dead_pure_read_dummy_node_equals_return_true() {
     let fridge = tree(4143, 0, 0, vec![expr((ATTR, 0), GT, (ATTR, 0), T, T)]);
@@ -131,10 +132,10 @@ fn dead_pure_read_dummy_node_equals_return_true() {
         EquivResult::Equivalent { .. }
     ));
     match live(&fridge, &high_level) {
-        EquivResult::Counterexample { divergence, .. } => {
-            assert!(divergence.contains("last branch result"), "{divergence}");
+        EquivResult::Inconclusive { reason } => {
+            assert!(reason.contains("last branch result"), "{reason}");
         }
-        other => panic!("expected Counterexample, got {other:?}"),
+        other => panic!("expected Inconclusive, got {other:?}"),
     }
     let ctx = LiveContext::default();
     assert_equivalent(&live_with(
@@ -158,14 +159,18 @@ fn dead_pure_read_dummy_node_equals_return_true() {
     let true_dummy = tree(4143, 0, 0, vec![expr((ATTR, 0), EQ, (ATTR, 0), T, T)]);
     assert_equivalent(&live(&true_dummy, &high_level));
 
-    // Different exits are still told apart.
+    // Different exits are still told apart: the replay runs both and they return
+    // different values.
     let returns_false = air(r#"tree 4143 "X" { return false; }"#, 4143);
-    assert_counterexample(&live_with(
-        &fridge,
-        &returns_false,
-        &ctx,
-        &ignoring_last_result(),
-    ));
+    match live_with(&fridge, &returns_false, &ctx, &ignoring_last_result()) {
+        EquivResult::Counterexample { divergence, .. } => {
+            assert!(
+                divergence.contains("sims-vm runs both") && divergence.contains("A returns true"),
+                "{divergence}"
+            );
+        }
+        other => panic!("expected Counterexample, got {other:?}"),
+    }
 }
 
 /// `p < 5 -> true : false` and `p >= 5 -> false : true` return the same, but their own
@@ -174,7 +179,8 @@ fn dead_pure_read_dummy_node_equals_return_true() {
 fn last_branch_result_is_observed() {
     let lt = tree(4096, 1, 0, vec![expr((PARAM, 0), LT, (LIT, 5), T, F)]);
     let ge = tree(4096, 1, 0, vec![expr((PARAM, 0), 14, (LIT, 5), F, T)]);
-    assert_counterexample(&live(&lt, &ge));
+    // Observed, but no replay shows it (the replay world has no action to record it).
+    assert_inconclusive(&live(&lt, &ge));
     assert_equivalent(&live_with(
         &lt,
         &ge,
@@ -199,7 +205,7 @@ fn last_branch_result_is_observed() {
         &LiveOptions::default(),
     );
     assert_eq!(method, EquivMethod::LiveOutput);
-    assert_counterexample(&result);
+    assert_inconclusive(&result);
 
     // Before a primitive or a call it is observed too, but only as a possible
     // difference: the primitive (Idle, `idle.rs:187`) or the called tree may fail
@@ -364,8 +370,9 @@ tree 4097 "Direct" {
     let looped = module.behaviors[&4096].clone();
     let mut direct = module.behaviors[&4097].clone();
     direct.id = 4096;
-    // The loop returns from its failed exit test, so its last result is false.
-    assert_counterexample(&live(&looped, &direct));
+    // The loop returns from its failed exit test, so its last result is false: a
+    // possible difference no replay shows.
+    assert_inconclusive(&live(&looped, &direct));
     assert_equivalent(&live_with(
         &looped,
         &direct,
@@ -388,7 +395,8 @@ fn division_by_zero_traps_are_observable() {
     );
     assert_equivalent(&live(&divide, &divide_then_dummy));
 
-    // Guarding the zero case changes a VM trap into `return false`.
+    // Guarding the zero case changes a VM trap into `return false`. A path that faults
+    // is undecided: the replay counts only runs that return.
     let guarded = tree(
         4096,
         0,
@@ -399,10 +407,10 @@ fn division_by_zero_traps_are_observable() {
         ],
     );
     match live(&divide, &guarded) {
-        EquivResult::Counterexample { divergence, .. } => {
-            assert!(divergence.contains("trap"), "{divergence}");
+        EquivResult::Inconclusive { reason } => {
+            assert!(reason.contains("trap"), "{reason}");
         }
-        other => panic!("expected Counterexample, got {other:?}"),
+        other => panic!("expected Inconclusive, got {other:?}"),
     }
 }
 
@@ -539,18 +547,19 @@ fn fridge_files() -> (Vec<u8>, Vec<u8>) {
     .expect("write A");
     let b = write_iff(&[
         bhav_chunk(&high_level, "CT - Is Fridge"),
-        str_chunk(128, &[("alpha", "changed comment"), ("beta", "")]),
+        str_chunk(128, &[("alpha", "first"), ("beta", "")]),
     ])
     .expect("write B");
     (a, b)
 }
 
 #[test]
-fn whole_file_equivalence_with_notes() {
+fn whole_file_mode_compares_bhav_bodies() {
     let (a, b) = fridge_files();
-    // Strictly, the Fridge tree's final test leaves a different last result.
+    // Strictly, the Fridge tree's final test leaves a different last result, which no
+    // replay shows: undecided.
     let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
-    assert_eq!(report.verdict(), IffVerdict::Different, "{report:#?}");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
     let opts = IffEquivOptions {
         live: ignoring_last_result(),
         ..IffEquivOptions::default()
@@ -571,32 +580,26 @@ fn whole_file_equivalence_with_notes() {
         .iter()
         .find(|r| &r.tag == b"STR#")
         .expect("STR# report");
-    assert!(matches!(
-        strings.verdict,
-        ResourceVerdict::Equivalent { .. }
-    ));
-    assert!(strings.notes.iter().any(|n| n.contains("comment")));
+    assert_eq!(strings.verdict, ResourceVerdict::Identical);
 }
 
 #[test]
-fn whole_file_differences_name_indices_only() {
+fn whole_file_reports_never_show_contents() {
     let (a, _) = fridge_files();
     let fridge = tree(4143, 0, 0, vec![expr((ATTR, 0), GT, (ATTR, 0), T, T)]);
     let b = write_iff(&[
-        bhav_chunk(&fridge, "original label"),
+        bhav_chunk(&fridge, "CT - Is Fridge"),
         str_chunk(128, &[("alpha", "first"), ("secret text", "")]),
-        str_chunk(129, &[("extra", "")]),
     ])
     .expect("write B");
     let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
-    assert_eq!(report.verdict(), IffVerdict::Different);
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive);
     let text = format!("{report:?}");
     assert!(
         !text.contains("secret"),
         "report leaks string contents: {text}"
     );
-    assert!(text.contains("indices 1"), "{text}");
-    assert!(text.contains("only in file B"), "{text}");
+    assert!(text.contains("STR# #128 has different contents"), "{text}");
 }
 
 fn cli() -> Command {
@@ -626,7 +629,7 @@ fn verify_equiv_cli_exit_codes() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert_eq!(out.status.code(), Some(2), "{stdout}");
     assert!(stdout.contains("last branch result"), "{stdout}");
     let out = cli()
         .args(["verify-equiv", "--ignore-last-result"])
@@ -768,11 +771,12 @@ fn invalid_branch_targets_trap() {
     nodes.extend((1..=251).map(|_| expr((LIT, 0), EQ, (LIT, 0), T, T)));
     let jumps_far = tree(4096, 0, 0, nodes);
     let returns = tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    // A trap makes the pair undecided (the replay counts only runs that return).
     match live(&jumps_far, &returns) {
-        EquivResult::Counterexample { divergence, .. } => {
-            assert!(divergence.contains("0x44c"), "{divergence}");
+        EquivResult::Inconclusive { reason } => {
+            assert!(reason.contains("0x44c"), "{reason}");
         }
-        other => panic!("expected Counterexample, got {other:?}"),
+        other => panic!("expected Inconclusive, got {other:?}"),
     }
     let ctx = LiveContext::default();
     let (_, combined) = check_bhav_equivalent_combined(
@@ -783,7 +787,7 @@ fn invalid_branch_targets_trap() {
         &EquivOptions::default(),
         &LiveOptions::default(),
     );
-    assert_counterexample(&combined);
+    assert_inconclusive(&combined);
 }
 
 /// A local the tree has not written may hold half of a pointer an earlier frame left,
@@ -877,58 +881,98 @@ fn differing_constant_tables_are_inconclusive() {
         tree: Some(4096),
         ..IffEquivOptions::default()
     };
-    // `--tree` keeps the other resources, so the changed constant is reported.
-    let report = check_iff_equivalent(&file(1), &file(2), &opts).expect("check");
-    assert_eq!(report.verdict(), IffVerdict::Different, "{report:#?}");
-    let tree_report = report
-        .resources
-        .iter()
-        .find(|r| &r.tag == b"BHAV")
-        .expect("tree");
-    assert!(
-        matches!(tree_report.verdict, ResourceVerdict::Inconclusive { .. }),
-        "{report:#?}"
-    );
-    let report =
-        check_iff_equivalent(&file(1), &file(2), &IffEquivOptions::default()).expect("check");
-    assert_eq!(report.verdict(), IffVerdict::Different, "{report:#?}");
+    // Only BHAV bodies may differ, with `--tree` too: a changed constant table is
+    // outside the precondition.
+    for opts in [opts, IffEquivOptions::default()] {
+        let report = check_iff_equivalent(&file(1), &file(2), &opts).expect("check");
+        assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+        assert!(
+            report
+                .file_problems
+                .iter()
+                .any(|p| p.contains("BCON #4096 has different contents")),
+            "{report:#?}"
+        );
+    }
 }
 
-/// Run Tree By Name finds trees by chunk label, so a renamed tree is a different file.
+/// Run Tree By Name finds trees by chunk label, so a renamed tree is outside the
+/// precondition (only BHAV bodies may differ).
 #[test]
 fn bhav_labels_are_lookup_keys() {
     let t = tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
     let a = write_iff(&[bhav_chunk(&t, "Old")]).expect("write");
     let b = write_iff(&[bhav_chunk(&t, "New")]).expect("write");
     let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
-    assert_eq!(report.verdict(), IffVerdict::Different, "{report:#?}");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
     assert!(format!("{report:?}").contains("label"));
 }
 
-/// Length-prefixed string tables load with bytes 0xa1 and 0xd5 rewritten by the
-/// original's loader, which `sims-vm` does not do: where the two readers disagree, the
-/// result is undecided.
+/// Every chunk that is not a `BHAV` must be byte-identical, in the same place, with the
+/// same label and flags: string tables that load the same (a comment-only change, a
+/// different layout) are still outside the precondition.
 #[test]
-fn string_tables_compare_as_loaded() {
-    let mac = ChunkData {
-        tag: *b"STR#",
-        id: 128,
-        flags: 0x10,
-        label: String::new(),
-        // Leading word 1: one length-prefixed string, "f" then 0xa1.
-        data: vec![1, 0, 2, b'f', 0xA1],
+fn non_bhav_chunks_must_be_identical() {
+    let t = tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    let check = |a: &[ChunkData], b: &[ChunkData]| {
+        let report = check_iff_equivalent(
+            &write_iff(a).expect("write"),
+            &write_iff(b).expect("write"),
+            &IffEquivOptions::default(),
+        )
+        .expect("check");
+        (report.verdict(), report.file_problems.join("; "))
     };
-    let a = write_iff(&[mac]).expect("write");
-    let b = write_iff(&[str_chunk(128, &[("fo", "")])]).expect("write");
-    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
-    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
-    // Both readers agree on a comment-only change.
-    let commented = write_iff(&[str_chunk(128, &[("fo", "note")])]).expect("write");
-    let report = check_iff_equivalent(&b, &commented, &IffEquivOptions::default()).expect("check");
-    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
-    let c = write_iff(&[str_chunk(128, &[("fx", "")])]).expect("write");
-    let report = check_iff_equivalent(&a, &c, &IffEquivOptions::default()).expect("check");
-    assert_eq!(report.verdict(), IffVerdict::Different, "{report:#?}");
+    let strings = str_chunk(128, &[("fo", "")]);
+    let commented = str_chunk(128, &[("fo", "note")]);
+    let mac = ChunkData {
+        data: vec![1, 0, 2, b'f', b'o'],
+        ..strings.clone()
+    };
+    let base = [bhav_chunk(&t, "T"), strings.clone()];
+    assert_eq!(check(&base, &base).0, IffVerdict::Equivalent);
+    for (other, expect) in [
+        (
+            vec![bhav_chunk(&t, "T"), commented],
+            "STR# #128 has different contents",
+        ),
+        (
+            vec![bhav_chunk(&t, "T"), mac],
+            "STR# #128 has different contents",
+        ),
+        (
+            vec![strings.clone(), bhav_chunk(&t, "T")],
+            "chunk 0 is BHAV #4096 in A but STR# #128 in B",
+        ),
+        (
+            vec![
+                bhav_chunk(&t, "T"),
+                ChunkData {
+                    label: "renamed".to_owned(),
+                    ..strings.clone()
+                },
+            ],
+            "STR# #128 has different labels",
+        ),
+        (
+            vec![
+                bhav_chunk(&t, "T"),
+                ChunkData {
+                    flags: 0,
+                    ..strings.clone()
+                },
+            ],
+            "STR# #128 has different header flags",
+        ),
+        (
+            vec![bhav_chunk(&t, "T"), strings.clone(), str_chunk(129, &[])],
+            "different chunk layouts",
+        ),
+    ] {
+        let (verdict, problems) = check(&base, &other);
+        assert_eq!(verdict, IffVerdict::Inconclusive, "{problems}");
+        assert!(problems.contains(expect), "{problems}");
+    }
 }
 
 /// An unusable resource map means the compared chunks may not be the ones the game
@@ -1118,9 +1162,17 @@ fn malformed_duplicates_are_inconclusive() {
     let b = write_iff(&[bhav_chunk(&t, "T"), bcon(valid.clone())]).expect("w");
     let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
     assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
-    // The same copies in both files are fine.
+    // Even the same copies in both files: a file with two chunks of one type and ID is
+    // outside the precondition.
     let report = check_iff_equivalent(&a, &a, &IffEquivOptions::default()).expect("check");
-    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+    assert!(
+        report
+            .file_problems
+            .iter()
+            .any(|p| p.contains("more than one chunk of the same type and ID")),
+        "{report:#?}"
+    );
 }
 
 /// `sims-vm` reads a version-0 `STR#` #303 for Run Tree By Name, which the original
@@ -1168,9 +1220,10 @@ fn tree_name_tables_follow_both_readers() {
     assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
 }
 
-/// Identical bytes that do not parse as a string table are still undecided.
+/// Identical bytes load the same way in both files, even when they do not parse as a
+/// string table: only the trees are compared.
 #[test]
-fn identical_malformed_string_tables_are_inconclusive() {
+fn identical_malformed_string_tables_are_identical() {
     let bad = ChunkData {
         tag: *b"STR#",
         id: 128,
@@ -1180,7 +1233,7 @@ fn identical_malformed_string_tables_are_inconclusive() {
     };
     let a = write_iff(&[bad]).expect("write");
     let report = check_iff_equivalent(&a, &a, &IffEquivOptions::default()).expect("check");
-    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
 }
 
 /// A primitive both trees run may never succeed (a `Random` with a zero range always
@@ -1224,9 +1277,9 @@ fn inline_calls_with_different_arities_are_inconclusive() {
     ));
 }
 
-/// Kind-4 trees are entered at the clamped node: entries past node 250 fail alike
-/// whatever the lengths, and a shorter tree's last node answers the longer one's
-/// extra entries.
+/// Kind-4 trees are entered at the clamped node, and a shorter tree's last node answers
+/// the longer one's extra entries. An entry past node 250 faults at the clamped node, so
+/// trees of different lengths past it fault at different nodes (undecided).
 #[test]
 fn kind4_entries_follow_the_clamp() {
     let node = |exit| expr((LIT, 0), EQ, (LIT, 0), exit, exit);
@@ -1236,13 +1289,20 @@ fn kind4_entries_follow_the_clamp() {
     };
     let long_a = indexed(vec![node(T); 252]);
     let long_b = indexed(vec![node(T); 253]);
-    assert_equivalent(&live(&long_a, &long_b));
+    assert_inconclusive(&live(&long_a, &long_b));
+    let long_c = indexed([vec![node(T); 251], vec![node(F)]].concat());
+    assert_equivalent(&live(&long_a, &long_c));
 
     let short = indexed(vec![node(T), node(T), node(F)]);
     let same = indexed(vec![node(T), node(T), node(F), node(F), node(F)]);
     assert_equivalent(&live(&short, &same));
     let differs = indexed(vec![node(T), node(T), node(F), node(T), node(F)]);
-    assert_counterexample(&live(&short, &differs));
+    match live(&short, &differs) {
+        EquivResult::Counterexample { divergence, .. } => {
+            assert!(divergence.contains("params [3]"), "{divergence}");
+        }
+        other => panic!("expected Counterexample, got {other:?}"),
+    }
 }
 
 /// Scope 35 reads only ever give 0 or 1 (`memory.rs:542`), so a test against 2 that
@@ -1304,4 +1364,223 @@ fn call_arity_is_checked_before_operands() {
         }
         other => panic!("expected Inconclusive, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Narrowed contract: DIFFERENT from a VM replay, faults undecided, strict files
+// ---------------------------------------------------------------------------
+
+/// A counterexample carries the concrete run that shows it; a symbolic difference the
+/// replay cannot run (a primitive, a different kind) is undecided.
+#[test]
+fn counterexamples_come_from_a_vm_replay() {
+    let copy = |src: i16| tree(4096, 2, 0, vec![expr((TEMP, 0), SET, (PARAM, src), T, ERR)]);
+    match live(&copy(0), &copy(1)) {
+        EquivResult::Counterexample { divergence, .. } => {
+            assert!(
+                divergence.contains("sims-vm runs both from params")
+                    && divergence.contains("temp[0] ends as"),
+                "{divergence}"
+            );
+        }
+        other => panic!("expected Counterexample, got {other:?}"),
+    }
+    // The same definite difference, but the trees also hold a primitive (behind a
+    // branch no input takes) that the replay world does not run.
+    let then_sound = |src: i16| {
+        tree(
+            4096,
+            2,
+            0,
+            vec![
+                expr((TEMP, 0), SET, (PARAM, src), 1, ERR),
+                expr((LIT, 0), EQ, (LIT, 0), T, 2),
+                prim(23, [1, 0, 0, 0, 0, 0, 0, 0], T, T),
+            ],
+        )
+    };
+    match live(&then_sound(0), &then_sound(1)) {
+        EquivResult::Inconclusive { reason } => {
+            assert!(
+                reason.contains("no sims-vm replay confirmed it"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+    // Kinds 0 and 1 both enter at node 0 (`interpreter.rs:1792`): not a difference.
+    let returns = tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    let kind1 = BhavChunk {
+        kind: 1,
+        ..returns.clone()
+    };
+    assert_inconclusive(&live(&returns, &kind1));
+}
+
+/// A fault leaves the faulting frame and the last result behind (`interpreter.rs:809`):
+/// two faults are the same only at the same node with the same state.
+#[test]
+fn faults_keep_their_state() {
+    // Different last results before the same division by zero.
+    let before = |test: Instruction| {
+        tree(
+            4096,
+            0,
+            0,
+            vec![test, expr((TEMP, 0), DIV, (LIT, 0), T, ERR)],
+        )
+    };
+    let true_test = before(expr((LIT, 0), EQ, (LIT, 0), 1, 1));
+    let false_test = before(expr((LIT, 0), EQ, (LIT, 1), 1, 1));
+    assert_inconclusive(&live(&true_test, &false_test));
+    let ctx = LiveContext::default();
+    let (_, combined) = check_bhav_equivalent_combined(
+        &true_test,
+        &ctx,
+        &false_test,
+        &ctx,
+        &EquivOptions::default(),
+        &LiveOptions::default(),
+    );
+    assert_inconclusive(&combined);
+
+    // The same fault after a dummy node is at a different node, even with nothing else
+    // observed.
+    let relaxed = LiveOptions {
+        observe_last_result: false,
+        observe_frame_residue: false,
+        observe_scratch_pointer: false,
+        ..LiveOptions::default()
+    };
+    let direct = tree(4096, 0, 0, vec![expr((TEMP, 0), DIV, (LIT, 0), T, ERR)]);
+    let after_dummy = tree(
+        4096,
+        0,
+        0,
+        vec![
+            expr((LIT, 0), EQ, (LIT, 0), 1, 1),
+            expr((TEMP, 0), DIV, (LIT, 0), T, ERR),
+        ],
+    );
+    match live_with(&direct, &after_dummy, &ctx, &relaxed) {
+        EquivResult::Inconclusive { reason } => {
+            assert!(reason.contains("at different nodes"), "{reason}");
+        }
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+}
+
+/// Lockstep matches renumbered nodes, but a fault there would leave the frame at a
+/// different node, so its proof is taken only for nodes that keep their numbers.
+#[test]
+fn renumbered_faulting_nodes_are_undecided() {
+    let divide = expr((TEMP, 0), DIV, (TEMP, 1), T, ERR);
+    let filler = expr((LIT, 0), EQ, (LIT, 0), T, T);
+    let first = tree(4096, 0, 0, vec![divide.clone(), filler.clone()]);
+    let renumbered = tree(
+        4096,
+        0,
+        0,
+        vec![
+            Instruction {
+                on_true: 2,
+                on_false: 2,
+                ..filler.clone()
+            },
+            filler.clone(),
+            divide.clone(),
+        ],
+    );
+    let ctx = LiveContext::default();
+    let (_, result) = check_bhav_equivalent_combined(
+        &first,
+        &ctx,
+        &renumbered,
+        &ctx,
+        &EquivOptions::default(),
+        &LiveOptions::default(),
+    );
+    assert_inconclusive(&result);
+    // The same trees with the same numbering are proven node for node.
+    let (method, result) = check_bhav_equivalent_combined(
+        &first,
+        &ctx,
+        &first.clone(),
+        &ctx,
+        &EquivOptions::default(),
+        &LiveOptions::default(),
+    );
+    assert_eq!(method, EquivMethod::Lockstep);
+    assert_equivalent(&result);
+}
+
+/// Equal outputs from different instruction counts are equivalent under the stated
+/// assumption that neither run exhausts the VM's instruction budget.
+#[test]
+fn instruction_budget_is_a_model_assumption() {
+    let twice = tree(
+        4096,
+        0,
+        0,
+        vec![
+            expr((TEMP, 0), SET, (LIT, 5), 1, ERR),
+            expr((TEMP, 0), SET, (LIT, 7), T, ERR),
+        ],
+    );
+    let once = tree(4096, 0, 0, vec![expr((TEMP, 0), SET, (LIT, 7), T, ERR)]);
+    assert_equivalent(&live(&twice, &once));
+}
+
+/// A resource map that selects the same chunks compares equal even when a differing
+/// BHAV body moves the offsets; a map in one file only is outside the precondition.
+#[test]
+fn resource_maps_compare_by_the_chunks_they_select() {
+    let short = tree(4096, 0, 0, vec![expr((TEMP, 0), SET, (LIT, 7), T, ERR)]);
+    let long = tree(
+        4096,
+        0,
+        0,
+        vec![
+            expr((TEMP, 0), SET, (LIT, 5), 1, ERR),
+            expr((TEMP, 0), SET, (LIT, 7), T, ERR),
+        ],
+    );
+    let strings = str_chunk(128, &[("a", "")]);
+    let a = write_with_map(&[bhav_chunk(&short, "T"), strings.clone()], &[0, 1]);
+    let b = write_with_map(&[bhav_chunk(&long, "T"), strings.clone()], &[0, 1]);
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+
+    let unmapped = write_iff(&[bhav_chunk(&long, "T"), strings]).expect("write");
+    let report = check_iff_equivalent(&a, &unmapped, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+}
+
+/// `equiv` refuses an IFF whose target tree is not the only chunk of its type and ID.
+#[test]
+fn equiv_requires_a_single_copy() {
+    let dir = scratch_dir("equiv-dup");
+    let source = dir.join("a.antics");
+    std::fs::write(&source, "tree 4096 \"X\" { return true; }\n").unwrap();
+    let t = tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    let f = tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), F, F)]);
+    let iff = dir.join("b.iff");
+    std::fs::write(
+        &iff,
+        write_iff(&[bhav_chunk(&t, "X"), bhav_chunk(&f, "X")]).unwrap(),
+    )
+    .unwrap();
+    let out = cli()
+        .arg("equiv")
+        .arg(&source)
+        .arg(&iff)
+        .args(["--tree", "4096"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("INCONCLUSIVE") && stderr.contains("more than one chunk"),
+        "{stderr}"
+    );
 }

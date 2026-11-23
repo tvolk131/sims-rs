@@ -8,7 +8,10 @@
 //! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]`
 //! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]`
-//!   (exit 0 equivalent, 1 different, 2 inconclusive or error)
+//!   (exit 0 equivalent, 1 different, 2 inconclusive or error). Only files that differ in
+//!   BHAV bodies alone are compared; DIFFERENT is reported only when both trees, run in
+//!   sims-vm from the same world, end differently; EQUIVALENT assumes neither run
+//!   exhausts the VM's instruction budget.
 //! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]`
 //! - `sims-antics build <pack_dir> --out <dir>`
 
@@ -21,7 +24,7 @@ use sims_antics::{
     lift::{format_bhav_labeled_air_with_context, format_bhav_raw_air, lift_bhav},
     lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
     v2::is_v2_source,
-    verify::{extract_bhav_arities_from_iff, extract_bhav_from_iff},
+    verify::{extract_bhav_arities_from_iff, extract_bhav_from_iff, single_file_problem},
     verify_object_safety, verify_pack_safety,
 };
 use sims_formats::far;
@@ -140,6 +143,11 @@ fn os_arg_starts_with_dash(arg: &OsStr) -> bool {
     arg.as_encoded_bytes().starts_with(b"-")
 }
 
+/// The model assumption every EQUIVALENT verdict carries: the checkers compare what the
+/// trees do, not how many instructions they take, and `sims-vm` faults a run that
+/// exceeds its per-tick instruction budget (`interpreter.rs:494`).
+const BUDGET_ASSUMPTION: &str = ", assuming neither run exhausts the VM instruction budget";
+
 fn print_usage() {
     eprintln!(
         "Usage:\n  \
@@ -147,7 +155,9 @@ fn print_usage() {
          sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]\n  \
-         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n  \
+         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n    \
+             (files must differ in BHAV bodies alone; DIFFERENT needs a sims-vm replay that ends differently;\n    \
+              EQUIVALENT assumes neither run exhausts the VM instruction budget; the same holds for equiv)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>"
     );
@@ -1502,6 +1512,12 @@ fn run() -> Result<(), CliError> {
             })?;
             let (iff_file, iff_len, iff_hdr) = read_regular_file_prefix(&iff_path)?;
             let iff_bytes = read_bounded_iff_file(&iff_path, iff_file, iff_len, iff_hdr)?;
+            // The tree compared must be the one every loader runs: one chunk per type
+            // and ID, and a usable map that selects it.
+            let parsed = Iff::parse(iff_bytes.clone()).map_err(|e| e.to_string())?;
+            if let Some(problem) = single_file_problem(&parsed) {
+                return Err(format!("INCONCLUSIVE on tree #{tree_id}: {problem}").into());
+            }
             let bhav_b = extract_bhav_from_iff(&iff_bytes, tree_id).map_err(|e| e.to_string())?;
             // Each side calls the trees of its own file: the compiled source's for A,
             // the IFF's for B. A callee only one side defines has an unknown argument
@@ -1539,7 +1555,7 @@ fn run() -> Result<(), CliError> {
                     states_checked,
                     paths_verified,
                 } => write_stdout_line(&format!(
-                    "EQUIVALENT: tree #{tree_id} ({method}: {states_checked} states checked, {paths_verified} paths verified)"
+                    "EQUIVALENT: tree #{tree_id} ({method}: {states_checked} states checked, {paths_verified} paths verified){BUDGET_ASSUMPTION}"
                 )),
                 EquivResult::Counterexample { path, divergence } => Err(format!(
                     "COUNTEREXAMPLE on tree #{tree_id} ({method}) after {} step(s): {divergence}",
@@ -1825,12 +1841,17 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
         IffVerdict::Inconclusive => "INCONCLUSIVE",
     };
     out.writeln_str(&format!(
-        "{word}: {} resources ({} identical, {} equivalent, {} different, {} inconclusive)",
+        "{word}: {} resources ({} identical, {} equivalent, {} different, {} inconclusive){}",
         report.resources.len(),
         counts[0],
         counts[1],
         counts[2],
-        counts[3]
+        counts[3],
+        if verdict == IffVerdict::Equivalent {
+            BUDGET_ASSUMPTION
+        } else {
+            ""
+        }
     ))?;
     out.flush()?;
     match verdict.exit_code() {

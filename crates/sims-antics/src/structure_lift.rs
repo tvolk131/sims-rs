@@ -82,7 +82,7 @@ fn collect_canonical_chunks<'a>(
 /// earlier runs. Non-localized formats decode every entry with `language == 1` in
 /// file order, so this helper handles all `STR#` formats uniformly and returns an
 /// empty list for localized tables with no English entries (matching VM behavior).
-pub(crate) fn loaded_str_order(entries: &[sims_formats::strings::TextEntry]) -> Vec<String> {
+fn loaded_str_order(entries: &[sims_formats::strings::TextEntry]) -> Vec<String> {
     let mut loaded: Vec<String> = Vec::new();
     let mut run = None;
     let mut place = 0usize;
