@@ -7164,6 +7164,112 @@ object "Sparse Holes" {
     assert!(air.contains("remove_object(me, flags: 3);"), "{air}");
 }
 
+const INTEROP_REVIEW_V2: &str = r#"
+object "Interop Review" {
+    guid: 0x7F30_0030;
+    state n: i16 = 1;
+    state seen: i16;
+    state r: i16;
+    state h: i16;
+    state cleaned: i16;
+    state got: i16;
+
+    tree take "Take" (a: i16, b: i16) -> i16 @ temp[4] {
+        return b;
+    }
+    tree change "Change" -> i16 @ temp[4] {
+        self.n = 5;
+        return 0;
+    }
+    tree chk "Check" {
+        let error = false;
+        return error;
+    }
+    fn h(error: bool) -> bool {
+        return error;
+    }
+
+    @id(4210) tree read "Read" (sim: Sim, x: i16) -> Result<i16 @ temp[0]> {
+        if x > 0 {
+            return x;
+        }
+        return None;
+    }
+    @id(4211) tree use_read "Use Read" (sim: Sim, x: i16) -> Result {
+        defer {
+            self.cleaned += 1;
+        }
+        let v = read(sim, x)?;
+        self.got = v;
+    }
+
+    init {
+        // Named arguments evaluate left to right in source order.
+        self.seen = take(b: self.n, a: change());
+        if chk() {
+            self.r = 1;
+        } else {
+            self.r = 2;
+        }
+        if h(false) {
+            self.h = 1;
+        } else {
+            self.h = 2;
+        }
+    }
+}
+"#;
+
+#[test]
+fn maxis_interop_review_regressions_run_live() {
+    let cfg = PackResolverConfig::default();
+    let obj = compile_v2_source("review.antics", INTEROP_REVIEW_V2, &cfg).expect("compile review");
+    let mut vm = V2VmFixture::from_objects(&[&obj], 5000);
+    let o = vm.spawn(0x7F30_0030, 4, 4);
+    assert_eq!(vm.obj_attr(o, 0), 5, "change() ran");
+    assert_eq!(vm.obj_attr(o, 1), 1, "b: self.n read before a: change()");
+    assert_eq!(
+        vm.obj_attr(o, 2),
+        2,
+        "'return error;' with a local 'error' returns it"
+    );
+    assert_eq!(
+        vm.obj_attr(o, 3),
+        2,
+        "'return error;' with an 'error' param returns it"
+    );
+
+    // `return None;` in a `Result<T>` tree takes the false exit, so the caller's `?` runs the
+    // caller's own `defer` before exiting through the error branch.
+    let err = vm
+        .try_run_tree(o, 4211, 0)
+        .expect_err("read(0)? must exit via error");
+    assert!(format!("{err:?}").contains("ErrorBranch"), "{err:?}");
+    assert_eq!(vm.obj_attr(o, 4), 1, "caller defer ran on '?' failure");
+    assert_eq!(vm.obj_attr(o, 5), 0);
+    assert!(vm.try_run_tree(o, 4211, 7).expect("success path"));
+    assert_eq!(vm.obj_attr(o, 4), 2);
+    assert_eq!(vm.obj_attr(o, 5), 7);
+
+    // Rebinding the Sim name turns `actor.count` into a foreign read that swaps stack_obj, so the
+    // tree must save its own object first and write through the saved handle.
+    let src = r#"
+object "Rebind" {
+    guid: 0x7F30_0031;
+    state count: i16;
+    tree copy "Copy" (actor: Sim, other: Self) {
+        let actor = other;
+        let n = actor.count;
+        self.count = n + 1;
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects("rebind.antics", src, &cfg)
+        .expect("expand rebind");
+    let air = &expanded[0].air_source;
+    assert!(air.contains("let __self_obj = stack_obj;"), "{air}");
+}
+
 #[test]
 fn maxis_interop_negative_diagnostics() {
     let cfg = PackResolverConfig::default();
@@ -7253,5 +7359,43 @@ fn maxis_interop_negative_diagnostics() {
         "bcon_4096.antics",
         &obj("    param power: i16 = 3;\n    bcon 4096 \"Mine\" { a = 1 }"),
         "reserved for this object's i16 params",
+    );
+    expect_err(
+        "sparse_enum.antics",
+        &format!(
+            "enum Mode {{ Off = 1, On = 2 }}\n{}",
+            obj("    state mode @ 9: Mode;")
+        ),
+        "requires an explicit initializer",
+    );
+    expect_err(
+        "const_try_defer.antics",
+        &obj("    init { defer { true?; } }"),
+        "cannot exit out of a 'defer' block",
+    );
+    expect_err(
+        "many_params.antics",
+        &obj(&format!(
+            "    tree t ({}) {{ }}",
+            (0..256)
+                .map(|i| format!("p{i}: i16"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        "positional parameters",
+    );
+
+    // An inherited tree may not shadow a helper fn of the deriving object's module.
+    let mut cfg = PackResolverConfig::default();
+    cfg.virtual_modules.insert(
+        "test_pack::base".to_owned(),
+        "pub template Base {\n    tree check { return false; }\n}\n".to_owned(),
+    );
+    let src = "use test_pack::base::Base;\nfn check() -> bool { return true; }\nobject \"Derived\" from Base {\n    guid: 0x7F30_0021;\n    state x: i16;\n    init { if check() { self.x = 1; } }\n}\n";
+    let err = compile_v2_source("derived.antics", src, &cfg).expect_err("shadowed helper");
+    assert!(
+        err.message
+            .contains("collides with helper function 'check'"),
+        "{err}"
     );
 }

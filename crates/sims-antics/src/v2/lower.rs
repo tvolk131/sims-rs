@@ -613,7 +613,7 @@ impl<'a> ObjectEnv<'a> {
                 })
         };
         let mut out_params = Vec::with_capacity(params.len());
-        let mut positional = 0u8;
+        let mut positional = 0usize;
         for p in params {
             let ty = resolve(&p.ty, p.span, &format!("parameter '{}'", p.name))?;
             if p.slot == AbiParamSlot::Positional {
@@ -637,7 +637,7 @@ impl<'a> ObjectEnv<'a> {
         // `@ temp[N]` binding inside that window would be overwritten.
         for p in params {
             if let AbiParamSlot::Temp(t) = p.slot
-                && t < positional
+                && usize::from(t) < positional
             {
                 return Err(Error::at(
                     p.span,
@@ -771,11 +771,15 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     let mut local_extern_bcons: BTreeMap<String, (String, ExternBconDecl)> = BTreeMap::new();
     let mut bcon_decls: Vec<BconTableDecl> = Vec::new();
     let mut tree_members: Vec<OwnedTree> = Vec::new();
+    // Every module that contributes members (templates + the object): helper-fn lookups from any
+    // of their code must not be shadowed by an (inherited) tree ident.
+    let mut member_modules: BTreeSet<String> = BTreeSet::new();
 
     let mut apply_members = |owner_mod: &str,
                              members: &[ObjectMember],
                              is_override: bool|
      -> Result<()> {
+        member_modules.insert(owner_mod.to_owned());
         let mut seen_sounds_here = BTreeSet::new();
         let mut seen_slots_here = BTreeSet::new();
         let mut seen_functionals_here = BTreeSet::new();
@@ -1498,7 +1502,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     };
     let env = {
         let mut env = env;
-        let tree_sigs = resolve_tree_sigs(&env, &tree_members, obj.span)?;
+        let tree_sigs = resolve_tree_sigs(&env, &tree_members, &member_modules)?;
         env.trees = tree_sigs;
         env
     };
@@ -1635,6 +1639,19 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         for sname in &env.state_order {
             let st = &env.states[sname];
             if st.skip_zero_init {
+                // `match` lowers the last enum arm as a plain `else`, so an uninitialized explicit
+                // slot (0, or whatever a previous owner left) would silently dispatch to it.
+                if let ValueType::Enum(ref key) = st.ty
+                    && let Some(e) = env.all_enums.get(key)
+                {
+                    return Err(Error::at(
+                        st.span,
+                        format!(
+                            "state '{sname}' @ {} of enum type '{}' requires an explicit initializer (init leaves an explicit slot without one untouched, so it may hold an undeclared value)",
+                            st.attr_index, e.display_name
+                        ),
+                    ));
+                }
                 continue;
             }
             let owner_mod = state_owners
@@ -2355,7 +2372,7 @@ fn resolve_bcon_tables(
 fn resolve_tree_sigs(
     env: &ObjectEnv<'_>,
     trees: &[OwnedTree],
-    _obj_span: Span,
+    member_modules: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, CallableSig>> {
     let mut out = BTreeMap::new();
     for t in trees {
@@ -2366,11 +2383,14 @@ fn resolve_tree_sigs(
                 format!("tree '{}' shadows the built-in '{}()'", d.ident, d.ident),
             ));
         }
-        if env.lookup_fn(&t.owner_module, &d.ident, true).is_some() {
+        if let Some(m) = std::iter::once(&t.owner_module)
+            .chain(member_modules)
+            .find(|m| env.lookup_fn(m, &d.ident, true).is_some())
+        {
             return Err(Error::at(
                 d.span,
                 format!(
-                    "tree '{}' collides with helper function '{}' in scope",
+                    "tree '{}' collides with helper function '{}' in scope (module '{m}')",
                     d.ident, d.ident
                 ),
             ));
@@ -2427,7 +2447,9 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
             ctx.value_return = Some(ValueReturnAbi {
                 ty: ty.clone(),
                 temp: *temp,
-                allow_none: false,
+                // `Result<T @ temp[N]>` trees take the false exit with `return None;` (or
+                // `return false;` when T is not bool), so a caller's `?` runs its own cleanups.
+                allow_none: matches!(sig.ret, ResolvedReturnAbi::ResultValue { .. }),
                 in_place: true,
                 what: "tree",
             });
@@ -3303,6 +3325,8 @@ impl<'a> TreeLowerer<'a> {
         // Match arguments to parameters (positional first, then by name).
         let n = sig.params.len();
         let mut slots: Vec<Option<&V2Expr>> = vec![None; n];
+        // Parameter indices in source (evaluation) order.
+        let mut source_order: Vec<usize> = Vec::with_capacity(n);
         let mut next_pos = 0usize;
         let mut seen_named = false;
         for a in args {
@@ -3324,6 +3348,7 @@ impl<'a> TreeLowerer<'a> {
                         ));
                     }
                     slots[next_pos] = Some(&a.value);
+                    source_order.push(next_pos);
                     next_pos += 1;
                 }
                 Some(name) => {
@@ -3348,6 +3373,7 @@ impl<'a> TreeLowerer<'a> {
                         ));
                     }
                     slots[idx] = Some(&a.value);
+                    source_order.push(idx);
                 }
             }
         }
@@ -3364,11 +3390,12 @@ impl<'a> TreeLowerer<'a> {
             })?);
         }
 
-        // Evaluate operands in parameter order. An operand is snapshotted into a fresh local when
-        // it reads a temp (about to be overwritten) or a later argument may run code (calls,
-        // foreign reads) that could change it.
-        let mut operands: Vec<(String, Option<i16>)> = Vec::with_capacity(n);
-        for (i, expr) in values.iter().enumerate() {
+        // Evaluate operands left to right in source order (named arguments may be reordered). An
+        // operand is snapshotted into a fresh local when it reads a temp (about to be overwritten)
+        // or a later-evaluated argument may run code (calls, foreign reads) that could change it.
+        let mut operands: Vec<(String, Option<i16>)> = vec![(String::new(), None); n];
+        for (k, &i) in source_order.iter().enumerate() {
+            let expr = values[i];
             let (air, ty) = self.lower_value_expr(expr)?;
             let pty = &sig.params[i].ty;
             if !types_compatible_for_assign(pty, &ty) {
@@ -3389,16 +3416,16 @@ impl<'a> TreeLowerer<'a> {
                     .flatten()
                     .map(|(_, v)| v)
             });
-            let later_impure = values[i + 1..]
+            let later_impure = source_order[k + 1..]
                 .iter()
-                .any(|e| !self.is_pure_single_operand(e));
-            if const_val.is_none() && (air.contains("temp[") || later_impure) {
+                .any(|&j| !self.is_pure_single_operand(values[j]));
+            operands[i] = if const_val.is_none() && (air.contains("temp[") || later_impure) {
                 let snap = self.fresh("arg");
                 self.line(format!("let {snap} = {air};"));
-                operands.push((snap, None));
+                (snap, None)
             } else {
-                operands.push((air, const_val));
-            }
+                (air, const_val)
+            };
         }
 
         let positional: Vec<usize> = (0..n)
@@ -4600,6 +4627,17 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
             V2Stmt::ReturnError { span } => {
+                // `error` bound as a local/param/i16 or bool param keeps its pre-v2-interop
+                // meaning: `return error;` returns that value, not the BHAV error exit.
+                if self.lookup_var("error").is_some()
+                    || self.env.i16_params.contains_key("error")
+                    || self.env.bool_params.contains_key("error")
+                {
+                    return self.lower_stmt(&V2Stmt::Return {
+                        span: *span,
+                        value: Some(V2Expr::Ident(*span, "error".to_owned())),
+                    });
+                }
                 if self.in_defer() {
                     return Err(Error::at(
                         *span,
@@ -5463,6 +5501,11 @@ impl<'a> TreeLowerer<'a> {
     fn lower_expr_stmt(&mut self, expr: &V2Expr) -> Result<()> {
         match expr {
             V2Expr::Try { span, inner } => {
+                // Checked up front: the generic desugaring below may constant-fold its error
+                // branch away before `return error;` would report it.
+                if self.in_defer() {
+                    return Err(Error::at(*span, "'?' cannot exit out of a 'defer' block"));
+                }
                 if let V2Expr::Call {
                     span: cspan,
                     callee,
@@ -7145,7 +7188,13 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Index { base, index, .. } => {
                 self.expr_may_trap_arith(base) || self.expr_may_trap_arith(index)
             }
-            V2Expr::Field { base, .. } => self.expr_may_trap_arith(base),
+            V2Expr::Field { base, .. } => match self.bcon_field_ref(expr) {
+                // `extern bcon` entries are read at runtime and trap when the chunk/entry is
+                // missing; private tables are compile-time constants.
+                Some(Ok((_, Some(_)))) => false,
+                Some(_) => true,
+                None => self.expr_may_trap_arith(base),
+            },
             V2Expr::Tuple(_, elems) => elems.iter().any(|e| self.expr_may_trap_arith(e)),
             V2Expr::Call { .. } | V2Expr::MethodCall { .. } | V2Expr::Try { .. } => true,
             V2Expr::Int(..)
@@ -9869,7 +9918,8 @@ fn stmts_unconditionally_diverge(
 
 fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
     stmts.iter().any(|s| match s {
-        V2Stmt::Return { .. } => true,
+        // `return error;` may resolve to an ordinary `return <local error>;` (see lowering).
+        V2Stmt::Return { .. } | V2Stmt::ReturnError { .. } => true,
         V2Stmt::WithLock { body, .. }
         | V2Stmt::Defer { body, .. }
         | V2Stmt::Repeat { body, .. }
@@ -9942,6 +9992,13 @@ fn stmts_may_clobber_stack_obj(
         return true;
     }
     stmts.iter().any(|s| match s {
+        // Rebinding the Sim name makes later `sim.x` reads foreign-object reads (stack_obj swaps)
+        // that the field check below would otherwise treat as plain Sim reads.
+        V2Stmt::Let { name, .. } | V2Stmt::LetSome { name, .. }
+            if Some(name.as_str()) == sim_name =>
+        {
+            true
+        }
         V2Stmt::LetSome {
             init, else_body, ..
         } => {

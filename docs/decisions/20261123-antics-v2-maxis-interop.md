@@ -39,7 +39,7 @@ extern mod lamp_semi { @id(8192) fn doubled(x: i16) -> Result<i16 @ temp[1]>; }
   - `call ID(a, b)` (literal operands) is used when every positional argument is a compile-time constant. Constants include literals, bools, i16 params, enum constants and private BCON entries. There must be at most 4, and not all four may be `-1` (the `call(temps)` sentinel).
   - Otherwise the call uses `temp[i] := arg_i; ...; call ID(temps)`.
   - Temp-bound arguments are always written as `temp[N] := expr;` before the call.
-  - Arguments are evaluated left to right before any temp is written. An operand that reads a temp, or one followed by an argument that may run code, is snapshotted into a fresh local first.
+  - Arguments are evaluated left to right in *source* order (named arguments may be reordered) before any temp is written. An operand that reads a temp, or one followed by an argument that may run code, is snapshotted into a fresh local first.
 - **Return ABIs:**
 
   | Declared | Statement `f();` | `f()?;` | Condition `if f()` | Value `x = f()` |
@@ -54,7 +54,8 @@ extern mod lamp_semi { @id(8192) fn doubled(x: i16) -> Result<i16 @ temp[1]>; }
 - **`return error;`** is a new statement that exits through the BHAV error branch after running every active cleanup (all scopes, including an inlined helper's caller).
   - Postfix `?` on a call lowers as described above.
   - `cond?;` on any bool expression is sugar for `if !cond { return error; }`.
-  - `return error;` and `?` are rejected inside `defer`.
+  - `return error;` and `?` are rejected inside `defer`. That includes a constant `true?`.
+  - **Backward compatibility.** When `error` is bound (a local, a helper/tree parameter, or an i16/bool `param`), `return error;` keeps its old meaning: it returns that value.
 - **Why `if call X { }` rather than a bare `call X;`:** `.air` routes a bare call's false exit to `return false`. The empty `if` sends both exits to the next node: one node, no extra instructions.
 
 ### 2. Sparse / Explicit-Slot States
@@ -67,6 +68,7 @@ state quality: i16 = 3;       // auto slot; unchanged behaviour
 - **Shared allocator.** `lower_object` and imported object schemas (`build_object_schema`) use the same allocator, so typed cross-object access sees the same slots. Explicit slots are reserved first. Auto states then take the lowest free slot in declaration order. Without explicit slots the layout is exactly the old `0..N`, which keeps open-pack byte-identical.
 - **Validation.** Overlapping explicit slots, and any slot above 255, are compile errors.
 - **Init behaviour.** An explicit-slot state *without* an initializer is not written by `init`, so it keeps whatever the VM or a previous owner left there. An explicit slot *with* an initializer, and every auto state, are initialized as before.
+- **Enum states need an initializer.** An enum-typed explicit-slot state *must* have an initializer. `match` lowers its last arm as a plain `else`, so an undeclared value would otherwise dispatch silently.
 - **Attribute count and map.** `attributes:` auto-sizes to `max(max_slot + 1, explicit attributes or 8)`. The `// Attributes:` comment is sorted by slot.
 
 ### 3. Named BCON Tables
@@ -87,6 +89,7 @@ extern bcon light_consts { table_height_flag @ 16521; by_chunk @ 257[3]; }
   - tables 128..191 map to global `256 + t - 128`.
 - **Read-only.** Assigning to a BCON entry is a compile error.
 - **Name priority.** A BCON table name takes priority over a same-named variable when used as `Name.entry`, consistently in lowering and in `stack_obj`-clobber analysis.
+- **Trapping.** `extern bcon` reads count as possibly trapping, since the chunk may be missing. A value return that reads one is therefore computed in a scratch local and never partially written into `temp[N]`.
 
 ### 4. Standalone `tree` Declarations
 
@@ -107,9 +110,12 @@ tree bump "Bump Hits" (sim: Sim, n: i16) { self.fridge_hits += n; }  // Sim-on-o
   - A tree whose first parameter is `name: Sim` runs in the Sim-on-object context: `self.x` is `stack.attr[i]`. Callers must be in that context and must pass the Sim handle first.
   - Otherwise the tree runs in the object's own context (`my.attr[i]`) and is callable only from `init`/`main`/`load`/`reset`/`cleanup`/object trees.
   - A mismatch is a compile error. BHAV calls copy, but never propagate back, the caller's `stack_obj`, so calls never clobber it.
+  - Rebinding the Sim name with `let` makes the `stack_obj`-clobber analysis assume a clobber, so the tree saves `__self_obj`.
 - **No `->` means a check tree.** A tree without `->` behaves like a SimAntics check/action tree: it may `return true/false/<bool>`, falls through to `return true`, and can be used as a condition.
+- **`Result<T @ temp[N]>` failure.** `Result<T @ temp[N]>` trees take the false exit with `return None;`, or with `return false;` when `T` is not bool. The caller's `?` then runs the caller's own cleanups before its error exit.
 - **Must return on every path.** Trees declaring `-> bool`, `-> T @ temp[N]` or `-> Result<T @ temp[N]>` must return on every path. Value returns write `temp[N]`. When the expression is alias- and trap-safe and no cleanups are active, compound arithmetic lowers in place into `temp[N]`. The example above is 6 nodes in total: compare, 4 in-place arithmetic, and `else`.
-- **Reserved idents.** Tree idents may not shadow built-in calls or helper `fn`s.
+- **Reserved idents.** Tree idents may not shadow built-in calls or helper `fn`s. The check covers every module that contributes members to the object, so an inherited tree cannot shadow the deriving module's helper.
+- **Return analysis ignores constant conditions.** It is a syntactic check, like Rust's: `if true { return 7; }` without an `else` still needs a final return. Write `return error;` rather than `false?;` for an unconditional error exit.
 
 ### 5. `destroy_self(flags: N | no_yield: b | skip_resets: b)`
 Lowers to `remove_object(me|stack_obj, flags: N)`, using the same bits as `.air` (`no_yield` = 1, `skip_resets` = 2). Plain `destroy_self()` is unchanged.
@@ -140,6 +146,14 @@ Lowers to `remove_object(me|stack_obj, flags: N)`, using the same bits as `.air`
     - invalid BCON table ID, invalid extern BHAV ID;
     - a positional/temp collision;
     - unused Result, `?` on a value ABI, writing to BCON;
-    - wrong tree context, a value tree missing a return, `?` in `defer`;
-    - a BCON address out of range, a tree shadowing a builtin, BCON 4096 conflicting with params.
+    - wrong tree context, a value tree missing a return, `?` in `defer` (including constant `true?`);
+    - a BCON address out of range, a tree shadowing a builtin, BCON 4096 conflicting with params;
+    - a sparse enum state without an initializer;
+    - 256 positional parameters (no `u8` overflow);
+    - an inherited tree shadowing the deriving module's helper.
+  - Review regressions, run live in `sims-vm`:
+    - named arguments evaluated in source order;
+    - `return error;` with a bound `error` (a tree local and an inlined helper parameter);
+    - `Result<T>` tree `return None;` running the caller's `defer` before `?` exits via error;
+    - a rebound Sim name saving `__self_obj`.
 - **Parity.** All 20 `open-pack/objects/*.antics` expand to **byte-identical** `.air` against `main` (`ce1110c4`, CLI `expand --pack open-pack`). `sims-game --test cheats_cache_and_open_pack` passes 7/7.
