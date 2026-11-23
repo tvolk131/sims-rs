@@ -635,11 +635,12 @@ impl Hud {
             install.expansions,
             friendship,
         );
+        let thumbnails = Thumbnails::with_template(&static_part.art);
         Self {
             art: static_part.art,
             boot_faces: faces.clone(),
             faces,
-            thumbnails: Thumbnails::default(),
+            thumbnails,
             problems: Vec::new(),
             careers: shared_part.careers,
             fame: static_part.fame,
@@ -1233,15 +1234,11 @@ impl Hud {
                         assets.floor(key, 1).map(render_image_to_swatch)
                     }
                 }
-                BuildItemId::Wallpaper(key) => {
-                    if let Some(frames) = assets.pattern(key, 0) {
-                        Some(render_image_to_swatch(&frames[0]))
-                    } else {
-                        assets
-                            .pattern(key, 1)
-                            .map(|frames| render_image_to_swatch(&frames[0]))
-                    }
-                }
+                BuildItemId::Wallpaper(key) => [2, 1, 0].into_iter().find_map(|zoom| {
+                    assets
+                        .pattern(key, zoom)
+                        .map(|frames| render_wallpaper_swatch(&frames[2]))
+                }),
                 BuildItemId::WallStyle(style_id) => {
                     let pat = sims_vm::WallStyle::from_style_id(style_id)
                         .map(sims_vm::WallStyle::default_pattern)
@@ -3494,6 +3491,65 @@ fn render_image_to_swatch(src: &sims_render::Image) -> sims_formats::bitmap::Ima
         width: dw as u32,
         height: dh as u32,
         rgba: pixels,
+    }
+}
+
+/// Side of the square a wallpaper swatch is fitted into: the 41 px slot
+/// interior less a 2 px margin (oracle `build-wallpaper.png`: 19.7×37 at
+/// 615.6..635.4, 677..713 in a slot at 603, 673).
+const WALLPAPER_SWATCH_BOX: f32 = 37.0;
+
+/// A wallpaper's catalog swatch: the pattern's flat, camera-facing frame
+/// (frame 2, the diagonal wall) scaled to fit [`WALLPAPER_SWATCH_BOX`],
+/// centred in a [`sims_ui::thumbnail::SIZE`] slot, with area-averaged
+/// sampling so its edges blend like the original's.
+fn render_wallpaper_swatch(src: &sims_render::Image) -> sims_formats::bitmap::Image {
+    let cell = sims_ui::thumbnail::SIZE as usize;
+    let (sw, sh) = (src.width.max(1) as f32, src.height.max(1) as f32);
+    let scale = (WALLPAPER_SWATCH_BOX / sw).min(WALLPAPER_SWATCH_BOX / sh);
+    let ox = (cell as f32 - sw * scale) / 2.0;
+    let oy = (cell as f32 - sh * scale) / 2.0;
+    let area = 1.0 / (scale * scale);
+    let mut rgba = vec![0u8; cell * cell * 4];
+    for v in 0..cell {
+        let y0 = ((v as f32 - oy) / scale).max(0.0);
+        let y1 = ((v as f32 + 1.0 - oy) / scale).min(sh);
+        if y1 <= y0 {
+            continue;
+        }
+        for u in 0..cell {
+            let x0 = ((u as f32 - ox) / scale).max(0.0);
+            let x1 = ((u as f32 + 1.0 - ox) / scale).min(sw);
+            if x1 <= x0 {
+                continue;
+            }
+            let (mut a_sum, mut rgb) = (0.0f32, [0.0f32; 3]);
+            for sy in y0.floor() as usize..(y1.ceil() as usize).min(src.height) {
+                let wy = (y1.min(sy as f32 + 1.0) - y0.max(sy as f32)).max(0.0);
+                for sx in x0.floor() as usize..(x1.ceil() as usize).min(src.width) {
+                    let wx = (x1.min(sx as f32 + 1.0) - x0.max(sx as f32)).max(0.0);
+                    let i = (sy * src.width + sx) * 4;
+                    let a = f32::from(src.rgba[i + 3]) / 255.0 * wx * wy;
+                    a_sum += a;
+                    for (c, value) in rgb.iter_mut().enumerate() {
+                        *value += f32::from(src.rgba[i + c]) * a;
+                    }
+                }
+            }
+            if a_sum <= 0.0 {
+                continue;
+            }
+            let di = (v * cell + u) * 4;
+            for c in 0..3 {
+                rgba[di + c] = (rgb[c] / a_sum).round().clamp(0.0, 255.0) as u8;
+            }
+            rgba[di + 3] = (a_sum / area * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    sims_formats::bitmap::Image {
+        width: cell as u32,
+        height: cell as u32,
+        rgba,
     }
 }
 

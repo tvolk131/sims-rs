@@ -14,6 +14,10 @@
 //! simulation coupling: callers pass a read-only [`AlbumSnapshot`] (ready for
 //! REDB photo storage) and execute returned [`AlbumCommand`] values in
 //! `sims-game`.
+//!
+//! Photos arrive only from Camera Mode, by clicking the lot (`cWinCamera`).
+//! The album itself has no capture or blank-page button: `STR# 141` lists
+//! only Done, Delete, First, Previous, Next and Last.
 
 use crate::art::Art;
 use crate::dialog::{BACKGROUND, BUTTON, CARET_BLINK_US, draw_nine_slice};
@@ -125,9 +129,6 @@ pub struct AlbumEntry {
 pub struct AlbumSnapshot {
     pub family_name: String,
     pub entries: Vec<AlbumEntry>,
-    /// Whether the Camera Snapshot trigger button is currently available
-    /// (e.g. enabled on a live lot, disabled on the neighborhood screen).
-    pub can_capture_snapshot: bool,
 }
 
 /// Localized chrome strings for [`PhotoAlbumDialog`].
@@ -148,8 +149,6 @@ pub struct AlbumStrings {
     pub next_tooltip: String,
     pub last_tooltip: String,
     pub empty_caption: String,
-    pub add_page: String,
-    pub snapshot: String,
     pub move_earlier: String,
     pub move_later: String,
     pub save: String,
@@ -172,8 +171,6 @@ impl Default for AlbumStrings {
             next_tooltip: "Next".to_owned(),
             last_tooltip: "Last".to_owned(),
             empty_caption: "(empty)".to_owned(),
-            add_page: "Add".to_owned(),
-            snapshot: "Snap".to_owned(),
             move_earlier: "Move <".to_owned(),
             move_later: "Move >".to_owned(),
             save: "Save".to_owned(),
@@ -272,10 +269,6 @@ pub enum AlbumCommand {
     Close,
     /// User selected a different photo entry.
     SelectEntry(PhotoId),
-    /// User clicked the Camera Snapshot button to capture a new lot screenshot.
-    CaptureSnapshot,
-    /// User clicked Add to append a blank storybook page.
-    AddBlankPage,
     /// User confirmed deletion of an album entry.
     DeleteEntry(PhotoId),
     /// User reordered an album entry to `new_index` (`0..entries.len()`).
@@ -323,8 +316,6 @@ enum ControlId {
     Prev,
     Next,
     Last,
-    AddPage,
-    CaptureSnapshot,
     MoveEarlier(PhotoId),
     MoveLater(PhotoId),
     Delete(PhotoId),
@@ -352,8 +343,6 @@ pub struct AlbumLayout {
     pub title_box: Rect,
     pub caption_label_pos: [i32; 2],
     pub caption_box: Rect,
-    pub btn_snapshot: Rect,
-    pub btn_add: Rect,
     pub btn_move_earlier: Rect,
     pub btn_move_later: Rect,
     pub btn_delete: Rect,
@@ -660,19 +649,7 @@ impl PhotoAlbumDialog {
             let header_y = my + 24;
             let header_title = [inner_x, header_y + 4];
             let small_btn_h = 24;
-            let btn_add = Rect {
-                x: inner_right - 58,
-                y: header_y,
-                width: 58,
-                height: small_btn_h,
-            };
-            let btn_snapshot = Rect {
-                x: btn_add.x - 6 - 68,
-                y: header_y,
-                width: 68,
-                height: small_btn_h,
-            };
-            let page_counter = [btn_snapshot.x - 84, header_y + 5];
+            let page_counter = [inner_right - 84, header_y + 5];
 
             let content_top = header_y + small_btn_h + 8;
             let content_bottom = my + 412;
@@ -790,8 +767,6 @@ impl PhotoAlbumDialog {
                 title_box,
                 caption_label_pos,
                 caption_box,
-                btn_snapshot,
-                btn_add,
                 btn_move_earlier,
                 btn_move_later,
                 btn_delete,
@@ -826,7 +801,7 @@ impl PhotoAlbumDialog {
         let header_y = my + 14;
         let header_title = [mx + pad, header_y + 4];
 
-        // Top-right action buttons: [Snap] [Add] [Done]
+        // Top-right: the page counter, then Done.
         let btn_h = 26;
         let btn_done = Rect {
             x: mx + modal_w - pad - 68,
@@ -834,19 +809,7 @@ impl PhotoAlbumDialog {
             width: 68,
             height: btn_h,
         };
-        let btn_add = Rect {
-            x: btn_done.x - 6 - 58,
-            y: header_y,
-            width: 58,
-            height: btn_h,
-        };
-        let btn_snapshot = Rect {
-            x: btn_add.x - 6 - 68,
-            y: header_y,
-            width: 68,
-            height: btn_h,
-        };
-        let page_counter = [btn_snapshot.x - 92, header_y + 6];
+        let page_counter = [btn_done.x - 92, header_y + 6];
 
         // Bottom thumbnail strip
         let strip_h = 74;
@@ -1010,8 +973,6 @@ impl PhotoAlbumDialog {
             title_box,
             caption_label_pos,
             caption_box,
-            btn_snapshot,
-            btn_add,
             btn_move_earlier,
             btn_move_later,
             btn_delete,
@@ -1042,12 +1003,6 @@ impl PhotoAlbumDialog {
         }
         if layout.btn_done.contains(pos[0], pos[1]) {
             return Some(ControlId::Done);
-        }
-        if layout.btn_add.contains(pos[0], pos[1]) {
-            return Some(ControlId::AddPage);
-        }
-        if layout.btn_snapshot.contains(pos[0], pos[1]) {
-            return Some(ControlId::CaptureSnapshot);
         }
         if layout.btn_first.contains(pos[0], pos[1]) {
             return Some(ControlId::First);
@@ -1121,8 +1076,7 @@ impl PhotoAlbumDialog {
         let len = snapshot.entries.len();
         let idx = self.selected_index(snapshot);
         match control {
-            ControlId::Done | ControlId::AddPage => true,
-            ControlId::CaptureSnapshot => snapshot.can_capture_snapshot,
+            ControlId::Done => true,
             ControlId::First | ControlId::Prev => idx.is_some_and(|i| i > 0),
             ControlId::Next | ControlId::Last => idx.is_some_and(|i| i + 1 < len),
             ControlId::MoveEarlier(id) => {
@@ -1220,20 +1174,6 @@ impl PhotoAlbumDialog {
                 }
                 self.close();
                 cmds.push(AlbumCommand::Close);
-            }
-            ControlId::AddPage => {
-                if let Some(save) = self.commit_edits() {
-                    cmds.push(save);
-                }
-                self.pending_delete = None;
-                cmds.push(AlbumCommand::AddBlankPage);
-            }
-            ControlId::CaptureSnapshot => {
-                if let Some(save) = self.commit_edits() {
-                    cmds.push(save);
-                }
-                self.pending_delete = None;
-                cmds.push(AlbumCommand::CaptureSnapshot);
             }
             ControlId::First => {
                 cmds.extend(self.switch_to_index(snapshot, 0, visible_slots));
@@ -1688,24 +1628,6 @@ impl PhotoAlbumDialog {
             TEXT_SELECTED,
         );
 
-        self.draw_button(
-            frame,
-            art,
-            layout.btn_snapshot,
-            &self.strings.snapshot,
-            ControlId::CaptureSnapshot,
-            snapshot,
-            visible_slots,
-        );
-        self.draw_button(
-            frame,
-            art,
-            layout.btn_add,
-            &self.strings.add_page,
-            ControlId::AddPage,
-            snapshot,
-            visible_slots,
-        );
         if layout.native_scrap {
             self.draw_scrap_button(
                 frame,

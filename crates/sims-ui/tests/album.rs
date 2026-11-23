@@ -47,7 +47,6 @@ fn solid_image(width: u32, height: u32, rgb: [u8; 3]) -> Image {
 fn sample_snapshot() -> AlbumSnapshot {
     AlbumSnapshot {
         family_name: "TestFamily".to_owned(),
-        can_capture_snapshot: true,
         entries: vec![
             AlbumEntry {
                 id: PhotoId(10),
@@ -126,7 +125,6 @@ fn thumbnail_strip_scroll_persists_across_draw_without_snapping_back() {
     let mut frame = Frame::new(800, 600, [20, 30, 50]);
     let snapshot = AlbumSnapshot {
         family_name: "LargeAlbum".to_owned(),
-        can_capture_snapshot: true,
         entries: (0..12)
             .map(|i| AlbumEntry {
                 id: PhotoId(100 + i),
@@ -227,22 +225,12 @@ fn edit_title_and_wrapped_caption_and_auto_commit_on_nav_or_done() {
 }
 
 #[test]
-fn add_snapshot_reorder_and_two_step_delete_confirmation() {
+fn reorder_and_two_step_delete_confirmation() {
     let screen = [800, 600];
     let snapshot = sample_snapshot();
     let mut dialog = PhotoAlbumDialog::default();
     dialog.open(&snapshot);
     let layout = dialog.layout(screen[0], screen[1]);
-
-    // Add blank page and trigger camera snapshot
-    assert_eq!(
-        click(&mut dialog, layout.btn_add, screen, &snapshot),
-        vec![AlbumCommand::AddBlankPage]
-    );
-    assert_eq!(
-        click(&mut dialog, layout.btn_snapshot, screen, &snapshot),
-        vec![AlbumCommand::CaptureSnapshot]
-    );
 
     // Reorder: MoveEarlier disabled at index 0, MoveLater moves 10 -> index 1
     assert!(click(&mut dialog, layout.btn_move_earlier, screen, &snapshot).is_empty());
@@ -272,16 +260,12 @@ fn add_snapshot_reorder_and_two_step_delete_confirmation() {
 }
 
 #[test]
-fn press_bound_pointer_guard_rejects_drag_off_and_disabled_snapshot() {
+fn press_bound_pointer_guard_rejects_drag_off() {
     let screen = [800, 600];
-    let mut snapshot = sample_snapshot();
-    snapshot.can_capture_snapshot = false;
+    let snapshot = sample_snapshot();
     let mut dialog = PhotoAlbumDialog::default();
     dialog.open(&snapshot);
     let layout = dialog.layout(screen[0], screen[1]);
-
-    // Snapshot button disabled when can_capture_snapshot == false
-    assert!(click(&mut dialog, layout.btn_snapshot, screen, &snapshot).is_empty());
 
     // Press on Next, release on Done -> neither fires
     assert!(dialog.handle_pointer_down(center(layout.btn_next), screen, &snapshot));

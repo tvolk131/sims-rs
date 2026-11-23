@@ -366,3 +366,64 @@ fn live_install_roof_catalog_subtool_prices_and_narrow_layout_rendering() {
         }
     }
 }
+
+#[test]
+fn roof_page_arrows_and_page_size_follow_roofpanelstrs() {
+    // `cWinRoofPanel` (`0x52911a`, `STR# 147`): 16 patterns a page with Next
+    // Page at panel + 433, or 8 with it at panel + 253 on an 800-wide screen;
+    // Previous Page at panel + 58; both 20 below the panel's top. The panel
+    // is at (538, strip_y + 5) here, and the 1.91 oracle's Next Page sits at
+    // (971, 693) on 1024×768.
+    let names: Vec<String> = (0..18).map(|i| format!("p{i:02}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let catalog = BuildCatalog::default().with_roof_patterns(&refs);
+    let art = Art::default();
+    for (width, per_page, next_x) in [(800, 8, 791), (1024, 16, 971)] {
+        let height = width * 3 / 4;
+        let strip_y = height - 100;
+        for page in [0, 1] {
+            let mut state = BuildState::default();
+            state.select_tool(BuildTool::Roof, &catalog);
+            state.page = page;
+            let layout = build::layout(
+                [width, height],
+                &catalog,
+                &state,
+                &art,
+                1000,
+                false,
+                false,
+                None,
+            );
+            let arrow = |delta: i32| {
+                layout
+                    .widgets
+                    .iter()
+                    .find(|w| w.command == Some(Command::BuildPage(delta)))
+                    .map(|w| [w.rect.x, w.rect.y])
+            };
+            let patterns = layout
+                .subtools
+                .iter()
+                .filter(|s| matches!(s.action, BuildSubtoolAction::RoofPattern(_)))
+                .count();
+            assert_eq!(
+                patterns,
+                per_page.min(18 - page * per_page),
+                "{width} page {page}"
+            );
+            let has_next = (page + 1) * per_page < 18;
+            assert_eq!(
+                arrow(1),
+                has_next.then_some([next_x, strip_y + 25]),
+                "{width} page {page}"
+            );
+            assert_eq!(
+                arrow(-1),
+                (page > 0).then_some([596, strip_y + 25]),
+                "{width} page {page}"
+            );
+            assert_layout_has_no_overlaps_and_in_bounds(&layout, width);
+        }
+    }
+}

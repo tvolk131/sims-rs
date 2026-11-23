@@ -22,8 +22,10 @@
 //!   definition with graphics, it is kept only if it is 74 by 37: two 37
 //!   by 37 cells, the object on the catalog's normal background and on
 //!   its highlighted one. Global 0x6f2a3c (0 in our capture) would drop
-//!   it. With no thumbnail kept, the original renders the object into one
-//!   (0x4e57a6), which is **not ported**.
+//!   it. With no thumbnail kept, a definition with graphics gets one
+//!   rendered (0x4cbf90, 0x4e57a6; see [`rendered`]): the object drawn on
+//!   each of the template's first two cells' centre colours (0x4cbfee),
+//!   cropped to a square around it and shrunk to 37 by 37, side by side.
 //! - **The icon** (0x4ccaa0): a 45 by 45 picture, the first cell of
 //!   `kCatalogTemplate` (`CPanel/Catalog/ThumbTemplate.bmp`, four 45 by 45
 //!   cells, loaded by 0x4ccfb0), then the thumbnail over it, its left
@@ -81,12 +83,31 @@ pub struct Item {
 #[derive(Debug, Clone, Default)]
 pub struct Thumbnails {
     items: BTreeMap<u32, Option<Item>>,
+    /// The backgrounds a rendered thumbnail is drawn on (0x4cbfee): the
+    /// centre pixels of the template's first two cells. Transparent when
+    /// the template is not loaded.
+    backgrounds: [[u8; 4]; 2],
     /// Isometric sprites for help-balloon object slots (`0x4e5306 -> 0x4384c8`),
     /// indexed `[zoom 1 (far), zoom 2 (medium), zoom 3 (near)]`.
     balloon_pictures: BTreeMap<u32, Option<[Option<Image>; 3]>>,
 }
 
 impl Thumbnails {
+    /// No items yet, rendering missing thumbnails on `art`'s template
+    /// colours (0x4cbfee: the pixel at the middle of cells 0 and 1).
+    pub fn with_template(art: &Art) -> Self {
+        let centre = SIZE / 2;
+        let background = |cell: u32| {
+            art.cell(TEMPLATE, 4, cell)
+                .and_then(|image| image.pixel(centre, centre))
+                .unwrap_or([0; 4])
+        };
+        Self {
+            backgrounds: [background(0), background(1)],
+            ..Self::default()
+        }
+    }
+
     /// Reads the catalog item `guid`'s objects show, if it was not read.
     /// A type with no file, no definition or no item has none. A file
     /// that cannot be read is an error, and the type is kept with no
@@ -97,7 +118,7 @@ impl Thumbnails {
         if self.items.contains_key(&guid) {
             return Ok(());
         }
-        match item(index, catalog, guid) {
+        match item(index, catalog, guid, self.backgrounds) {
             Ok((item, problem)) => {
                 self.items.insert(guid, item);
                 problem.map_or(Ok(()), Err)
@@ -228,7 +249,12 @@ fn paste(icon: &mut Image, thumbnail: &Image) {
 
 /// The catalog item `guid`'s objects show (see the module's notes), and
 /// the error its thumbnail gave if it did not decode.
-fn item(index: &Index, catalog: &Catalog, guid: u32) -> Result<(Option<Item>, Option<Error>)> {
+fn item(
+    index: &Index,
+    catalog: &Catalog,
+    guid: u32,
+    backgrounds: [[u8; 4]; 2],
+) -> Result<(Option<Item>, Option<Error>)> {
     let Some(object) = catalog.object(guid) else {
         return Ok((None, None));
     };
@@ -273,7 +299,10 @@ fn item(index: &Index, catalog: &Catalog, guid: u32) -> Result<(Option<Item>, Op
             return Ok((None, None));
         }
     }
-    let (thumbnail, problem) = thumbnail(&iff, lead, graphics);
+    let (mut thumbnail, problem) = thumbnail(&iff, lead, graphics);
+    if thumbnail.is_none() && graphics {
+        thumbnail = rendered(&iff, lead, backgrounds);
+    }
     Ok((Some(Item { thumbnail }), problem))
 }
 
@@ -289,6 +318,167 @@ fn thumbnail(iff: &Iff, definition: &[u8], graphics: bool) -> (Option<Image>, Op
         Some(Err(e)) => (None, Some(Error::Format(e))),
         None => (None, None),
     }
+}
+
+/// The side of the square surface 0x4e57a6 draws an object on (`0xc8`).
+const SURFACE: i64 = 200;
+
+/// The thumbnail 0x4e57a6 renders for a definition with graphics and no
+/// kept `BMP_` (0x4cbf90), one 37 by 37 cell per background:
+///
+/// - 0x4cbfcf: the cell is the template's cell size less 8.
+/// - 0x438660..0x438702: the object at the nearest zoom whose picture
+///   leaves at least 3 pixels each side in the 200 by 200 surface, else
+///   the far zoom, centred (halves rounding toward zero).
+/// - 0x4e5aee: the picture's rectangle grown to the cell's size where it
+///   is smaller, then squared by growing its short side about its centre
+///   (an odd extra pixel to the right or bottom), clipped to the surface
+///   (its right and bottom to 199), and shrunk by `37 / width`, never
+///   enlarged (`0x666748` = 1.0), through 0x4ba778.
+/// - 0x4cc0eb: the two results side by side, the second at the first's
+///   width.
+///
+/// **Unverified:** 0x4ba778's filter, taken here as an area average; its
+/// output size, taken as the nearest whole pixel (it floors through
+/// 0x636b98 and adds 0.5); and the flag 0x4e5886 passes for the second
+/// cell (0x4384c8 `[ebp-0x67]`), taken as changing nothing but the
+/// background.
+fn rendered(iff: &Iff, definition: &[u8], backgrounds: [[u8; 4]; 2]) -> Option<Image> {
+    let fits = |image: &Image| {
+        (SURFACE - i64::from(image.width)) / 2 >= 3 && (SURFACE - i64::from(image.height)) / 2 >= 3
+    };
+    let picture = [3, 2]
+        .into_iter()
+        .filter_map(|zoom| render_object_zoom(iff, definition, zoom))
+        .find(fits)
+        .or_else(|| render_object_zoom(iff, definition, 1))?;
+    let (w, h) = (i64::from(picture.width), i64::from(picture.height));
+    let (x, y) = ((SURFACE - w) / 2, (SURFACE - h) / 2);
+    let ([left, top, right, bottom], scale) = fit(x, y, w, h)?;
+    let out = |size: i64| ((size as f64 * f64::from(scale)).round() as i64).max(1);
+    let (out_w, out_h) = (out(right - left), out(bottom - top));
+    let width = usize::try_from(out_w * 2).ok()?;
+    let mut rgba = vec![0u8; width * usize::try_from(out_h).ok()? * 4];
+    for (i, background) in backgrounds.into_iter().enumerate() {
+        let surface = draw_on_surface(&picture, x, y, background);
+        let step = f64::from(scale).recip();
+        let area = step * step;
+        for oy in 0..out_h {
+            for ox in 0..out_w {
+                let (x0, y0) = (
+                    left as f64 + ox as f64 * step,
+                    top as f64 + oy as f64 * step,
+                );
+                let mut sum = [0f64; 4];
+                let mut sy = y0.floor() as i64;
+                while (sy as f64) < y0 + step && sy < bottom {
+                    let cover_y = (y0 + step).min(sy as f64 + 1.0) - y0.max(sy as f64);
+                    let mut sx = x0.floor() as i64;
+                    while (sx as f64) < x0 + step && sx < right {
+                        let cover =
+                            cover_y * ((x0 + step).min(sx as f64 + 1.0) - x0.max(sx as f64));
+                        let at = ((sy * SURFACE + sx) * 4) as usize;
+                        let a = f64::from(surface[at + 3]);
+                        for c in 0..3 {
+                            sum[c] += f64::from(surface[at + c]) * a * cover;
+                        }
+                        sum[3] += a * cover;
+                        sx += 1;
+                    }
+                    sy += 1;
+                }
+                let at = ((oy as usize * width) + (i as i64 * out_w + ox) as usize) * 4;
+                if sum[3] > 0.0 {
+                    for c in 0..3 {
+                        rgba[at + c] = (sum[c] / sum[3]).round().clamp(0.0, 255.0) as u8;
+                    }
+                    rgba[at + 3] = (sum[3] / area).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+    Some(Image {
+        width: u32::try_from(width).ok()?,
+        height: u32::try_from(out_h).ok()?,
+        rgba,
+    })
+}
+
+/// The part of the 200 by 200 surface 0x4e5aee shrinks into a cell, for
+/// a picture drawn at `(x, y)` with size `w` by `h`, and the scale:
+/// `[left, top, right, bottom]`.
+fn fit(x: i64, y: i64, w: i64, h: i64) -> Option<([i64; 4], f32)> {
+    let cell = i64::from(SIZE) - 8;
+    let [mut left, mut top, mut right, mut bottom] = [x, y, x + w, y + h];
+    // 0x4e5b05..0x4e5bb8: grow a side shorter than the cell to the cell.
+    let grow = |low: &mut i64, high: &mut i64| {
+        let size = *high - *low;
+        if size < cell {
+            let half = (cell - size) / 2;
+            *low -= half;
+            *high += cell - size - half;
+        }
+    };
+    if h < w {
+        grow(&mut left, &mut right);
+    } else if h > w {
+        grow(&mut top, &mut bottom);
+    } else {
+        grow(&mut left, &mut right);
+        grow(&mut top, &mut bottom);
+    }
+    // 0x4e5bbb..0x4e5bf9: square it.
+    let excess = (right - left) - (bottom - top);
+    let half = excess / 2;
+    if excess > 0 {
+        top -= half;
+        bottom += excess - half;
+    } else if excess < 0 {
+        left += half;
+        right -= excess - half;
+    }
+    // 0x4e5bfc..0x4e5c21.
+    left = left.max(0);
+    top = top.max(0);
+    right = right.min(SURFACE - 1);
+    bottom = bottom.min(SURFACE - 1);
+    if left >= right || top >= bottom {
+        return None;
+    }
+    let scale = (cell as f32 / (right - left) as f32).min(1.0);
+    Some(([left, top, right, bottom], scale))
+}
+
+/// The 200 by 200 surface filled with `background`, `picture` drawn over
+/// it at `(x, y)`.
+fn draw_on_surface(picture: &Image, x: i64, y: i64, background: [u8; 4]) -> Vec<u8> {
+    let side = SURFACE as usize;
+    let mut surface = background.repeat(side * side);
+    for py in 0..i64::from(picture.height) {
+        for px in 0..i64::from(picture.width) {
+            let (sx, sy) = (x + px, y + py);
+            if !(0..SURFACE).contains(&sx) || !(0..SURFACE).contains(&sy) {
+                continue;
+            }
+            let Some(src) = picture.pixel(px as u32, py as u32) else {
+                continue;
+            };
+            let at = ((sy * SURFACE + sx) * 4) as usize;
+            let a = u32::from(src[3]);
+            let da = u32::from(surface[at + 3]);
+            let alpha = a + da * (255 - a) / 255;
+            if alpha == 0 {
+                continue;
+            }
+            for c in 0..3 {
+                surface[at + c] = ((u32::from(src[c]) * a
+                    + u32::from(surface[at + c]) * da * (255 - a) / 255)
+                    / alpha) as u8;
+            }
+            surface[at + 3] = alpha as u8;
+        }
+    }
+    surface
 }
 
 /// The ID of the interaction table `definition` names (0x45726a): its
@@ -702,6 +892,16 @@ mod tests {
         // No BMP_ of that ID is no thumbnail and no error.
         let (kept, problem) = thumbnail(&iff(&[]), &definition, true);
         assert!(kept.is_none() && problem.is_none());
+    }
+
+    #[test]
+    fn a_rendered_thumbnail_squares_the_picture_and_shrinks_it_into_the_cell() {
+        // Tall: no grow, squared about its centre, shrunk by 37/60.
+        assert_eq!(fit(90, 70, 20, 60), Some(([70, 70, 130, 130], 37.0 / 60.0)));
+        // Small: both sides grow to the 37-px cell, so no shrink.
+        assert_eq!(fit(95, 95, 10, 10), Some(([82, 82, 119, 119], 1.0)));
+        // Wide: squared downward, then clamped to the surface's last pixel.
+        assert_eq!(fit(1, 95, 198, 10), Some(([1, 1, 199, 199], 37.0 / 198.0)));
     }
 
     #[test]

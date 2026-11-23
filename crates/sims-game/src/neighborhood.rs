@@ -3529,6 +3529,11 @@ impl NeighborhoodShell {
             quit: false,
             photo: outcome.photo,
         };
+        if outcome.photo
+            && let Err(err) = self.capture_lot_photo()
+        {
+            self.set_note(format!("The photo was not saved: {err}"));
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen
             && session.game.asking().is_none()
             && session.game.asking_special_panel().is_none()
@@ -6013,6 +6018,7 @@ impl NeighborhoodShell {
             preview_image: None,
             preview_label: None,
             hide_wallet_and_prices: true,
+            choice: None,
         });
         self.import_picker.open();
         true
@@ -6245,7 +6251,17 @@ impl NeighborhoodShell {
     /// Opens the Photo Album modal for the active lot's household (or hovered /
     /// first neighborhood household when on the Neighborhood map).
     pub fn open_photo_album(&mut self) -> Result<(), String> {
-        let family_id = match &self.screen {
+        let family_id = self
+            .album_family()
+            .ok_or_else(|| "no household available for Photo Album".to_owned())?;
+        self.open_photo_album_for_family(family_id)
+    }
+
+    /// The household whose album the Photo Album opens and Camera Mode
+    /// photos go into: the active lot's family, or the hovered or first
+    /// household on the Neighborhood map.
+    fn album_family(&self) -> Option<u16> {
+        match &self.screen {
             ActiveScreen::Lot(session) => {
                 if let Some(trip) = &session.active_trip {
                     Some(trip.home_family)
@@ -6274,8 +6290,6 @@ impl NeighborhoodShell {
                 .and_then(|lot| self.stored.family_in(u32::from(lot)).map(|(id, _)| id))
                 .or_else(|| self.stored.families.keys().next().copied()),
         }
-        .ok_or_else(|| "no household available for Photo Album".to_owned())?;
-        self.open_photo_album_for_family(family_id)
     }
 
     /// Opens the Photo Album modal for a specific `family_id` in the active
@@ -6304,6 +6318,62 @@ impl NeighborhoodShell {
         self.album_dialog.open(&snapshot);
         self.album_snapshot = Some(snapshot);
         Ok(())
+    }
+
+    /// Stores a Camera Mode photo of the open lot in its household's album
+    /// (`cWinCamera`: clicking the lot takes the picture). The picture is
+    /// the Camera Mode size crop of the rendered lot.
+    pub fn capture_lot_photo(&mut self) -> Result<PhotoId, String> {
+        let family_id = self
+            .album_family()
+            .ok_or_else(|| "no household for the photo".to_owned())?;
+        let ActiveScreen::Lot(session) = &mut self.screen else {
+            return Err("a photo needs an open lot".to_owned());
+        };
+        let nh_id = session.neighborhood_id.clone();
+        session.game.render();
+        let image = capture_canvas_to_album_image(&session.game.capture_snapshot_canvas())?;
+        let sim_day = u32::try_from(
+            session
+                .game
+                .lot()
+                .world()
+                .globals
+                .get(28)
+                .copied()
+                .unwrap_or(0)
+                .max(0),
+        )
+        .ok()
+        .map(|d| d + 1);
+        let title = {
+            let name = session.game.lot().lot_name().trim();
+            if name.is_empty() {
+                format!("Lot {}", session.house)
+            } else {
+                name.to_owned()
+            }
+        };
+        let token = self
+            .store
+            .albums()
+            .family_token(&nh_id, family_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("family {family_id} not found in neighborhood {nh_id:?}"))?;
+        let mut entry = NewAlbumPhoto::with_image(title, "", image);
+        if let Some(day) = sim_day {
+            entry = entry.with_sim_day(day);
+        }
+        let photo = self
+            .store
+            .albums()
+            .add(&nh_id, token, entry)
+            .map_err(|e| e.to_string())?;
+        let id = PhotoId(photo.id);
+        if self.album_dialog.is_open() && self.album_token == Some(token) {
+            self.reload_album_snapshot(Some(id))?;
+        }
+        Ok(id)
     }
 
     /// Closes the Photo Album modal cleanly.
@@ -6393,7 +6463,6 @@ impl NeighborhoodShell {
             AlbumSnapshot {
                 family_name,
                 entries,
-                can_capture_snapshot: matches!(self.screen, ActiveScreen::Lot(_)),
             },
             has_image,
         ))
@@ -6554,85 +6623,6 @@ impl NeighborhoodShell {
                 }
                 self.sync_album_strip_scroll_to_selection();
                 self.hydrate_album_images();
-                ShellOutcome::redraw()
-            }
-            AlbumCommand::CaptureSnapshot => {
-                let (Some(nh_id), Some(token)) =
-                    (self.album_neighborhood_id.clone(), self.album_token)
-                else {
-                    return ShellOutcome::redraw();
-                };
-                let capture = if let ActiveScreen::Lot(session) = &mut self.screen {
-                    session.game.render();
-                    let canvas = session.game.canvas();
-                    let sim_day = u32::try_from(
-                        session
-                            .game
-                            .lot()
-                            .world()
-                            .globals
-                            .get(28)
-                            .copied()
-                            .unwrap_or(0)
-                            .max(0),
-                    )
-                    .ok()
-                    .map(|d| d + 1);
-                    let lot_title = {
-                        let name = session.game.lot().lot_name().trim();
-                        if !name.is_empty() {
-                            name.to_owned()
-                        } else {
-                            format!("Lot {}", session.house)
-                        }
-                    };
-                    capture_canvas_to_album_image(canvas).map(|img| (lot_title, img, sim_day))
-                } else {
-                    Err("snapshot capture requires an open lot".to_owned())
-                };
-                match capture {
-                    Ok((title, img, sim_day)) => {
-                        let mut entry = NewAlbumPhoto::with_image(title, "", img);
-                        if let Some(day) = sim_day {
-                            entry = entry.with_sim_day(day);
-                        }
-                        match self.store.albums().add(&nh_id, token, entry) {
-                            Ok(photo) => {
-                                if let Err(err) =
-                                    self.reload_album_snapshot(Some(PhotoId(photo.id)))
-                                {
-                                    self.set_note(format!(
-                                        "Saved snapshot; album reload error: {err}"
-                                    ));
-                                }
-                            }
-                            Err(err) => {
-                                self.set_note(format!("Could not save snapshot: {err}"));
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        self.set_note(format!("Snapshot capture failed: {err}"));
-                    }
-                }
-                ShellOutcome::redraw()
-            }
-            AlbumCommand::AddBlankPage => {
-                if let (Some(nh_id), Some(token)) =
-                    (self.album_neighborhood_id.clone(), self.album_token)
-                {
-                    let page = NewAlbumPhoto::blank("", "");
-                    match self.store.albums().add(&nh_id, token, page) {
-                        Ok(photo) => {
-                            if let Err(err) = self.reload_album_snapshot(Some(PhotoId(photo.id))) {
-                                self.set_note(format!("Added page; album reload error: {err}"));
-                            }
-                        }
-                        Err(err) => {
-                            self.set_note(format!("Could not add album page: {err}"));
-                        }
-                    }
-                }
                 ShellOutcome::redraw()
             }
             AlbumCommand::UpdateEntryText { id, title, caption } => {

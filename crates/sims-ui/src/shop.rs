@@ -25,10 +25,25 @@ use sims_formats::bitmap::Image;
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 
+/// `kClothingDialogPrevious` (`Res_CPanel.h`,
+/// `Nbhd/DesignCharSkinsLeftBtn.bmp`, four 18×34 cells).
+pub const CLOTHING_PREVIOUS: i32 = 300;
+/// `kClothingDialogNext` (`Nbhd/DesignCharSkinsRightBtn.bmp`).
+pub const CLOTHING_NEXT: i32 = 301;
+
 /// `UIGraphics` resource IDs used by [`ShopPickerDialog`]:
-/// `PopupInfoTiles.bmp` (`3008`), `WinBtn.bmp` (`17`), and
-/// `HotspotPopupTiler.TGA` (`5107`).
-pub const RESOURCES: [i32; 3] = [BACKGROUND, BUTTON, POPUP_TILER];
+/// `PopupInfoTiles.bmp` (`3008`), `WinBtn.bmp` (`17`),
+/// `HotspotPopupTiler.TGA` (`5107`), and the choice dialogs' arrows.
+pub const RESOURCES: [i32; 5] = [
+    BACKGROUND,
+    BUTTON,
+    POPUP_TILER,
+    CLOTHING_PREVIOUS,
+    CLOTHING_NEXT,
+];
+
+/// The 3D view of the native choice dialogs (`0x509779`: 200 by 300).
+pub const CHOICE_VIEW: [u32; 2] = [200, 300];
 
 /// `GameData/UIText.iff` default dialog button labels (`STR# 142`).
 pub const DIALOG_LABELS_STR: u16 = 142;
@@ -79,6 +94,17 @@ pub enum WardrobeCategory {
     Everyday,
 }
 
+/// The native choice dialogs, which show one 3D preview between two
+/// arrows instead of a list (see [`ShopPickerDialog::layout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChoiceDialog {
+    /// `cWinClothingChoiceDlg` (`0x5090d0`, `STR# 220`): Wardrobe and
+    /// Charm Transform.
+    Clothing,
+    /// The pet choice dialog (`0x521911`, `STR# 221`).
+    Pet,
+}
+
 /// Destination / vendor picker variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShopKind {
@@ -120,6 +146,9 @@ impl CurrencyKind {
 /// generic technical fallbacks when an install is not present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShopStrings {
+    /// The choice dialogs' accept button: standard label 3 (`0x5e5214`,
+    /// "OK", `STR# 142` entry 0).
+    pub ok: String,
     pub buy_clothing: String,
     pub buy_pet: String,
     pub buy_generic: String,
@@ -143,6 +172,7 @@ pub struct ShopStrings {
 impl Default for ShopStrings {
     fn default() -> Self {
         Self {
+            ok: "OK".into(),
             buy_clothing: "Buy".into(),
             buy_pet: "Adopt".into(),
             buy_generic: "Buy".into(),
@@ -187,9 +217,13 @@ impl ShopStrings {
 
         if let Some(chunk) = iff.get(b"STR#", DIALOG_LABELS_STR)
             && let Ok(table) = StringTable::parse(iff.data(chunk))
-            && let Some(cancel) = read_entry(&table, 1)
         {
-            strings.cancel = cancel;
+            if let Some(ok) = read_entry(&table, 0) {
+                strings.ok = ok;
+            }
+            if let Some(cancel) = read_entry(&table, 1) {
+                strings.cancel = cancel;
+            }
         }
 
         if let Some(chunk) = iff.get(b"STR#", CLOTHING_STR)
@@ -253,6 +287,15 @@ impl ShopStrings {
             ShopKind::PetAdoption => &self.title_pet,
             ShopKind::StudioWardrobe => &self.title_studio,
             ShopKind::MagicVendor => &self.title_magic,
+        }
+    }
+
+    /// The title of a choice dialog: entry 4 of its table, whatever the
+    /// wardrobe mode (`0x50914a` reads entries 0 to 4 only).
+    pub fn choice_title(&self, choice: ChoiceDialog) -> &str {
+        match choice {
+            ChoiceDialog::Clothing => &self.title_wardrobe,
+            ChoiceDialog::Pet => &self.title_pet,
         }
     }
 
@@ -330,6 +373,8 @@ pub struct ShopSnapshot {
     /// and disabled `Try On` button so non-monetary pickers (e.g. `.FAM` family
     /// import or free charm/wardrobe selectors) never display a bogus `$0` wallet.
     pub hide_wallet_and_prices: bool,
+    /// Draws the native choice dialog instead of the list.
+    pub choice: Option<ChoiceDialog>,
 }
 
 /// Typed commands emitted by [`ShopPickerDialog`] for `sims-game` / `sims-vm`.
@@ -353,6 +398,10 @@ pub enum ShopCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShopHit {
     ItemCard(usize),
+    /// A choice dialog's previous arrow (`kClothingDialogPrevious`).
+    PreviousItem,
+    /// A choice dialog's next arrow (`kClothingDialogNext`).
+    NextItem,
     ScrollUp,
     ScrollDown,
     RotateLeft,
@@ -377,6 +426,9 @@ pub struct ShopLayout {
     pub preview_pane: Option<Rect>,
     pub rotate_left_btn: Option<Rect>,
     pub rotate_right_btn: Option<Rect>,
+    /// A choice dialog's arrows either side of its 3D view.
+    pub previous_btn: Option<Rect>,
+    pub next_btn: Option<Rect>,
     pub detail_bar: Rect,
     pub try_on_btn: Rect,
     pub buy_btn: Rect,
@@ -397,6 +449,12 @@ impl ShopLayout {
         }
         if self.rotate_right_btn.is_some_and(|r| r.contains(x, y)) {
             return Some(ShopHit::RotateRight);
+        }
+        if self.previous_btn.is_some_and(|r| r.contains(x, y)) {
+            return Some(ShopHit::PreviousItem);
+        }
+        if self.next_btn.is_some_and(|r| r.contains(x, y)) {
+            return Some(ShopHit::NextItem);
         }
         for &(idx, rect) in &self.visible_cards {
             if rect.contains(x, y) {
@@ -625,6 +683,9 @@ impl ShopPickerDialog {
     pub fn layout(&self, frame_size: [u32; 2], snapshot: &ShopSnapshot) -> ShopLayout {
         let fw = i32::try_from(frame_size[0]).unwrap_or(800).max(1);
         let fh = i32::try_from(frame_size[1]).unwrap_or(600).max(1);
+        if snapshot.choice.is_some() {
+            return Self::choice_layout(fw, fh);
+        }
 
         let margin = 12;
         let max_w = (fw - margin * 2).max(220).min(fw);
@@ -762,8 +823,69 @@ impl ShopPickerDialog {
             preview_pane,
             rotate_left_btn,
             rotate_right_btn,
+            previous_btn: None,
+            next_btn: None,
             detail_bar,
             try_on_btn,
+            buy_btn,
+            cancel_btn,
+        }
+    }
+
+    /// The native choice dialogs' geometry (`0x5092b2..0x5097c4`): the
+    /// title, a 200 by 300 3D view centred in the area between the title
+    /// and the buttons, an 18 by 34 arrow 9 pixels outside each side of it,
+    /// centred on it, and OK then Cancel along the bottom, 9 pixels in.
+    ///
+    /// **Unverified:** the dialog's own size and its frame's border, which
+    /// the original takes from the window it opens in; here the area is
+    /// just big enough for the view and arrows.
+    fn choice_layout(fw: i32, fh: i32) -> ShopLayout {
+        let [view_w, view_h] = CHOICE_VIEW.map(|v| v as i32);
+        let (arrow_w, arrow_h) = (18, 34);
+        let inset = 9;
+        let pad = 16;
+        let title_h = 20;
+        let footer_h = 30;
+        // Title, then 18 above the view area (`[ebp-0x20]`), and 18 above
+        // the buttons below it (`[ebp-0x18]`).
+        let width = view_w + 2 * (arrow_w + 2 * inset) + 2 * pad;
+        let height = 12 + title_h + 18 + view_h + 18 + footer_h + 14;
+        let dialog = Rect::new(
+            ((fw - width) / 2).max(0),
+            ((fh - height) / 2).max(0),
+            width,
+            height,
+        );
+        let inner_x = dialog.x + pad;
+        let inner_w = dialog.width - 2 * pad;
+        let title_bar = Rect::new(inner_x, dialog.y + 12, inner_w, title_h);
+        let top = title_bar.y + title_h + 18;
+        let view = Rect::new(dialog.x + (dialog.width - view_w) / 2, top, view_w, view_h);
+        let arrow_y = view.y + (view_h - arrow_h) / 2;
+        let previous_btn = Rect::new(view.x - inset - arrow_w, arrow_y, arrow_w, arrow_h);
+        let next_btn = Rect::new(view.x + view_w + inset, arrow_y, arrow_w, arrow_h);
+        let footer_y = view.y + view_h + 18;
+        let gap = 15;
+        let btn_w = ((inner_w - gap) / 2).max(48);
+        let buy_btn = Rect::new(inner_x, footer_y, btn_w, footer_h);
+        let cancel_btn = Rect::new(inner_x + btn_w + gap, footer_y, btn_w, footer_h);
+        let none = Rect::new(inner_x, footer_y, 0, 0);
+        ShopLayout {
+            dialog,
+            title_bar,
+            wallet_bar: none,
+            list_area: none,
+            visible_cards: Vec::new(),
+            scroll_up: None,
+            scroll_down: None,
+            preview_pane: Some(view),
+            rotate_left_btn: None,
+            rotate_right_btn: None,
+            previous_btn: Some(previous_btn),
+            next_btn: Some(next_btn),
+            detail_bar: none,
+            try_on_btn: none,
             buy_btn,
             cancel_btn,
         }
@@ -839,6 +961,8 @@ impl ShopPickerDialog {
                 }
                 None
             }
+            ShopHit::PreviousItem => self.choose(snapshot, false),
+            ShopHit::NextItem => self.choose(snapshot, true),
             ShopHit::ScrollUp => {
                 self.scroll(-1, frame_size, snapshot);
                 None
@@ -890,6 +1014,24 @@ impl ShopPickerDialog {
         }
     }
 
+    /// A choice dialog's arrow: the next or previous item, tried on so the
+    /// 3D view shows it. None at either end.
+    pub fn choose(&mut self, snapshot: &ShopSnapshot, next: bool) -> Option<ShopCommand> {
+        let moved = if next {
+            self.select_next(snapshot)
+        } else {
+            self.select_prev(snapshot)
+        };
+        if !moved {
+            return None;
+        }
+        self.selected_item(snapshot)
+            .filter(|item| item.supports_try_on)
+            .map(|item| ShopCommand::TryOn {
+                item_id: item.id.clone(),
+            })
+    }
+
     fn button_state(&self, target: ShopHit, enabled: bool) -> ButtonState {
         if !enabled {
             ButtonState::Disabled
@@ -915,6 +1057,10 @@ impl ShopPickerDialog {
         }
         let layout = self.layout([frame.width(), frame.height()], snapshot);
         draw_dialog_frame(frame, art, layout.dialog);
+        if let Some(choice) = snapshot.choice {
+            self.draw_choice(frame, snapshot, strings, art, &layout, choice);
+            return;
+        }
 
         let title_font = art.font(12).or_else(|| art.font(10));
         let body_font = art.font(10).or_else(|| art.font(12));
@@ -1284,6 +1430,81 @@ impl ShopPickerDialog {
             art,
             layout.buy_btn,
             buy_label,
+            self.button_state(ShopHit::BuyButton, self.can_buy_selected(snapshot)),
+        );
+        draw_button(
+            frame,
+            art,
+            layout.cancel_btn,
+            &strings.cancel,
+            self.button_state(ShopHit::CancelButton, true),
+        );
+    }
+}
+
+impl ShopPickerDialog {
+    /// The native choice dialog: title, 3D view, arrows, OK and Cancel.
+    fn draw_choice(
+        &self,
+        frame: &mut Frame,
+        snapshot: &ShopSnapshot,
+        strings: &ShopStrings,
+        art: &Art,
+        layout: &ShopLayout,
+        choice: ChoiceDialog,
+    ) {
+        if let Some(font) = art.font(12).or_else(|| art.font(10)) {
+            let title = strings.choice_title(choice);
+            let width = font.width(title).min(layout.title_bar.width);
+            draw_clipped_text(
+                frame,
+                font,
+                title,
+                [
+                    layout.title_bar.x + (layout.title_bar.width - width) / 2,
+                    layout.title_bar.y + 1,
+                ],
+                layout.title_bar.width,
+                TEXT_HOVER,
+            );
+        }
+        if let (Some(view), Some(image)) = (layout.preview_pane, snapshot.preview_image.as_ref()) {
+            // Rendered at the view's size; a smaller picture sits centred.
+            let x = view.x + (view.width - image.width as i32) / 2;
+            let y = view.y + (view.height - image.height as i32) / 2;
+            frame.draw_all(image, [x, y]);
+        }
+        let selected = self.selected_index(snapshot);
+        let count = snapshot.items.len();
+        for (rect, hit, id, enabled) in [
+            (
+                layout.previous_btn,
+                ShopHit::PreviousItem,
+                CLOTHING_PREVIOUS,
+                selected.is_some_and(|i| i > 0),
+            ),
+            (
+                layout.next_btn,
+                ShopHit::NextItem,
+                CLOTHING_NEXT,
+                selected.is_some_and(|i| i + 1 < count),
+            ),
+        ] {
+            let Some(rect) = rect else {
+                continue;
+            };
+            let state = self.button_state(hit, enabled);
+            if let Some(cell) = art.cell(id, 4, state.cell()) {
+                frame.draw_all(&cell, [rect.x, rect.y]);
+            } else {
+                draw_button(frame, art, rect, "", state);
+            }
+        }
+        draw_button(
+            frame,
+            art,
+            layout.buy_btn,
+            &strings.ok,
             self.button_state(ShopHit::BuyButton, self.can_buy_selected(snapshot)),
         );
         draw_button(

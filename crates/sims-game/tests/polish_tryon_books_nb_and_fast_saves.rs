@@ -880,7 +880,6 @@ fn chained_save_quit_failure_notice_and_exact_caret_blink_deadlines() {
             thumbnail: None,
             sim_day: Some(1),
         }],
-        can_capture_snapshot: true,
     };
     album.open(&album_snap);
     // Open but unfocused -> zero idle wakeups!

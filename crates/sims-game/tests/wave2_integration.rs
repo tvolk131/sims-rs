@@ -371,6 +371,17 @@ fn wave2_photo_album_and_persistent_custom_lot_thumbnails() {
         shell.press(cam_center);
         shell.release(cam_center);
         shell.render();
+
+        // `cWinCamera`: clicking the lot with the Camera strip open takes a
+        // photo into the household's album and closes the strip.
+        assert!(shell.game().expect("active game").camera_strip_open());
+        let lot_point = [400, 200];
+        shell.press(lot_point);
+        shell.release(lot_point);
+        assert!(!shell.game().expect("active game").camera_strip_open());
+        shell.press(cam_center);
+        shell.release(cam_center);
+        shell.render();
         let album_rect = shell
             .game()
             .expect("active game")
@@ -391,16 +402,16 @@ fn wave2_photo_album_and_persistent_custom_lot_thumbnails() {
             "clicking Photo Album in Camera sub-strip must open PhotoAlbumDialog"
         );
 
-        // Capture a live lot framebuffer snapshot, add a blank page, edit text, reorder, and render.
-        shell.execute_album_command(AlbumCommand::CaptureSnapshot);
-        shell.execute_album_command(AlbumCommand::AddBlankPage);
+        // A second photo while the album is open shows up in it at once.
+        // Then edit text, reorder, and render.
+        let second_id = shell.capture_lot_photo().expect("second photo");
         let snap = shell.album_snapshot().expect("album snapshot").clone();
         assert_eq!(snap.entries.len(), 2);
         let snap_id = snap.entries[0].id;
-        let blank_id = snap.entries[1].id;
+        assert_eq!(snap.entries[1].id, second_id);
         assert!(
-            snap.entries[0].image.is_some(),
-            "captured snapshot must store a real framebuffer bitmap"
+            snap.entries.iter().all(|entry| entry.image.is_some()),
+            "each photo must store a real framebuffer bitmap"
         );
         shell.execute_album_command(AlbumCommand::UpdateEntryText {
             id: snap_id,
@@ -408,7 +419,7 @@ fn wave2_photo_album_and_persistent_custom_lot_thumbnails() {
             caption: "First evening in the garden".to_owned(),
         });
         shell.execute_album_command(AlbumCommand::MoveEntry {
-            id: blank_id,
+            id: second_id,
             new_index: 0,
         });
         shell.render();
@@ -457,10 +468,11 @@ fn wave2_photo_album_and_persistent_custom_lot_thumbnails() {
             .expect("reopened album snapshot")
             .clone();
         assert_eq!(snap.entries.len(), 2);
-        assert!(
-            snap.entries[0].image.is_none(),
-            "blank page moved to index 0"
+        assert_ne!(
+            snap.entries[0].title, "Goth Manor",
+            "the second photo moved to index 0"
         );
+        assert!(snap.entries[0].image.is_some());
         assert_eq!(snap.entries[1].title, "Goth Manor");
         assert_eq!(snap.entries[1].caption, "First evening in the garden");
         assert!(snap.entries[1].image.is_some());

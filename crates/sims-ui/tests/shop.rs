@@ -4,8 +4,8 @@ use sims_formats::bitmap::Image;
 use sims_ui::art::Art;
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::shop::{
-    CurrencyKind, ShopCommand, ShopItem, ShopKind, ShopPickerDialog, ShopSnapshot, ShopStrings,
-    Wallet, WardrobeCategory, load_art,
+    CHOICE_VIEW, ChoiceDialog, CurrencyKind, ShopCommand, ShopItem, ShopKind, ShopPickerDialog,
+    ShopSnapshot, ShopStrings, Wallet, WardrobeCategory, load_art,
 };
 use std::path::PathBuf;
 
@@ -87,6 +87,7 @@ fn sample_boutique_snapshot() -> ShopSnapshot {
         preview_image: None,
         preview_label: None,
         hide_wallet_and_prices: false,
+        choice: None,
     }
 }
 
@@ -142,6 +143,60 @@ fn boutique_try_on_buy_affordability_and_cancel_flow() {
     // Escape closes dialog and emits Cancel.
     assert_eq!(dialog.escape(), Some(ShopCommand::Cancel));
     assert!(!dialog.is_open());
+}
+
+#[test]
+fn choice_dialog_is_a_view_between_arrows_with_ok_and_cancel() {
+    // `cWinClothingChoiceDlg` (`0x5090d0`): no list, a 200×300 3D view with
+    // the 300/301 arrows beside it, OK and Cancel below.
+    let mut snap = sample_boutique_snapshot();
+    snap.choice = Some(ChoiceDialog::Clothing);
+    let mut dialog = ShopPickerDialog::new();
+    dialog.open();
+    let size = [800, 600];
+    let layout = dialog.layout(size, &snap);
+    let view = layout.preview_pane.expect("3D view");
+    assert_eq!([view.width as u32, view.height as u32], CHOICE_VIEW);
+    assert!(layout.visible_cards.is_empty(), "no list");
+    let previous = layout.previous_btn.expect("previous arrow");
+    let next = layout.next_btn.expect("next arrow");
+    assert!(previous.x + previous.width <= view.x);
+    assert!(next.x >= view.x + view.width);
+    assert!(!intersects(layout.buy_btn, layout.cancel_btn));
+    assert!(layout.buy_btn.y >= view.y + view.height);
+
+    // The previous arrow does nothing on the first outfit (no wrap).
+    let (px, py) = center(previous);
+    dialog.pointer_down(size, &snap, px, py);
+    assert_eq!(dialog.pointer_up(size, &snap, px, py), None);
+
+    // The next arrow steps and tries the outfit on.
+    let (nx, ny) = center(next);
+    dialog.pointer_down(size, &snap, nx, ny);
+    assert_eq!(
+        dialog.pointer_up(size, &snap, nx, ny),
+        Some(ShopCommand::TryOn {
+            item_id: "formal_02".into()
+        })
+    );
+    assert_eq!(
+        dialog.choose(&snap, false),
+        Some(ShopCommand::TryOn {
+            item_id: "formal_01".into()
+        })
+    );
+
+    // OK buys the outfit on show.
+    let (bx, by) = center(layout.buy_btn);
+    dialog.pointer_down(size, &snap, bx, by);
+    assert_eq!(
+        dialog.pointer_up(size, &snap, bx, by),
+        Some(ShopCommand::Buy {
+            item_id: "formal_01".into(),
+            currency: CurrencyKind::Simoleons,
+            price: 250,
+        })
+    );
 }
 
 #[test]
@@ -242,6 +297,7 @@ fn magic_vendor_magicoins_and_negative_price_guard() {
         preview_image: None,
         preview_label: None,
         hide_wallet_and_prices: false,
+        choice: None,
     };
 
     let mut dialog = ShopPickerDialog::new();

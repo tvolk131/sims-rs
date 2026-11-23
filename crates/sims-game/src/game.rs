@@ -69,8 +69,8 @@ use sims_ui::phonebook::{
 };
 use sims_ui::queue::QueueSlideState;
 use sims_ui::shop::{
-    CurrencyKind, ShopCommand, ShopItem, ShopKind, ShopPickerDialog, ShopSnapshot, ShopStrings,
-    Wallet, WardrobeCategory,
+    ChoiceDialog, CurrencyKind, ShopCommand, ShopItem, ShopKind, ShopPickerDialog, ShopSnapshot,
+    ShopStrings, Wallet, WardrobeCategory,
 };
 use sims_vm::Program;
 use sims_vm::ShownSpecialPanel;
@@ -9198,6 +9198,7 @@ impl Game {
             preview_image: None,
             preview_label: None,
             hide_wallet_and_prices: false,
+            choice: None,
         });
         self.shop_preview_yaw_deg = 0;
         self.shop_preview_body = None;
@@ -9255,15 +9256,33 @@ impl Game {
     }
 
     pub fn shop_select_prev(&mut self) -> bool {
-        self.shop_snapshot
-            .as_ref()
-            .is_some_and(|snap| self.shop_dialog.select_prev(snap))
+        self.shop_step(false)
     }
 
     pub fn shop_select_next(&mut self) -> bool {
-        self.shop_snapshot
-            .as_ref()
-            .is_some_and(|snap| self.shop_dialog.select_next(snap))
+        self.shop_step(true)
+    }
+
+    /// Moves the shop selection one item. A choice dialog shows only its
+    /// 3D view, so there the new item is tried on, as its arrows do.
+    fn shop_step(&mut self, next: bool) -> bool {
+        let Some(snap) = self.shop_snapshot.as_ref() else {
+            return false;
+        };
+        if snap.choice.is_none() {
+            return if next {
+                self.shop_dialog.select_next(snap)
+            } else {
+                self.shop_dialog.select_prev(snap)
+            };
+        }
+        match self.shop_dialog.choose(snap, next) {
+            Some(cmd) => {
+                self.execute_shop_command(cmd);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn shop_wheel(&mut self, delta_y: f64) -> bool {
@@ -9828,10 +9847,7 @@ impl Game {
             (i32::from(self.shop_preview_yaw_deg) + i32::from(delta_deg)).rem_euclid(360) as i16;
         let yaw = sims_people::caf_preview::TURNTABLE_BASE_YAW
             + f32::from(self.shop_preview_yaw_deg).to_radians();
-        let params = sims_people::caf_preview::TurntableParams {
-            yaw,
-            ..sims_people::caf_preview::TurntableParams::default()
-        };
+        let params = self.shop_preview_params(yaw);
         let rendered = self
             .shop_preview_body
             .as_ref()
@@ -9996,10 +10012,7 @@ impl Game {
         let (_, body) = self.shop_preview_body.as_ref()?;
         let yaw = sims_people::caf_preview::TURNTABLE_BASE_YAW
             + f32::from(self.shop_preview_yaw_deg).to_radians();
-        let params = sims_people::caf_preview::TurntableParams {
-            yaw,
-            ..sims_people::caf_preview::TurntableParams::default()
-        };
+        let params = self.shop_preview_params(yaw);
         let canvas = sims_people::caf_preview::render_turntable(body, None, &params).ok()?;
         Some(sims_formats::bitmap::Image {
             width: canvas.width,
@@ -10038,10 +10051,7 @@ impl Game {
         let (_, body) = self.shop_preview_body.as_ref()?;
         let yaw = sims_people::caf_preview::TURNTABLE_BASE_YAW
             + f32::from(self.shop_preview_yaw_deg).to_radians();
-        let params = sims_people::caf_preview::TurntableParams {
-            yaw,
-            ..sims_people::caf_preview::TurntableParams::default()
-        };
+        let params = self.shop_preview_params(yaw);
         let canvas = sims_people::caf_preview::render_turntable(body, None, &params).ok()?;
         Some(sims_formats::bitmap::Image {
             width: canvas.width,
@@ -10316,6 +10326,15 @@ impl Game {
     ) {
         self.ensure_shop_assets();
         let wallet = self.current_shop_wallet();
+        // Wardrobe and Charm open `cWinClothingChoiceDlg` (`0x5090d0`), the
+        // pet pen its pet twin (`0x521911`): one 3D view between arrows.
+        let choice = match request {
+            SpecialPanelRequest::WardrobeShop { .. }
+            | SpecialPanelRequest::CharmTransform { .. } => Some(ChoiceDialog::Clothing),
+            SpecialPanelRequest::PetPicker { .. } => Some(ChoiceDialog::Pet),
+            _ => None,
+        };
+        let first = items.first().map(|item| item.id.clone());
         self.shop_snapshot = Some(ShopSnapshot {
             kind,
             title_override,
@@ -10329,10 +10348,15 @@ impl Game {
             // Special VM pickers carry no price: the calling object's own
             // tree charges (if anything), so never show a bogus `$0` wallet.
             hide_wallet_and_prices: true,
+            choice,
         });
         self.shop_preview_yaw_deg = 0;
         self.shop_preview_body = None;
         self.shop_dialog.open();
+        // A choice dialog opens on its first item already in the view.
+        let shown = choice
+            .and(first)
+            .map(|id| (preview_targets.get(&id).cloned(), id));
         self.active_special_panel = Some(ActiveSpecialPanel {
             tick,
             request,
@@ -10341,6 +10365,32 @@ impl Game {
             preview_targets,
             preview,
         });
+        if let Some((target, id)) = shown {
+            self.apply_shop_try_on(&id, target.as_ref());
+        }
+    }
+
+    /// The 3D preview's parameters at `yaw`: a choice dialog's view is
+    /// 200 by 300 (`0x509779`), and the pet dialog builds its view with
+    /// 5.0 (`0x667678`) where the clothing dialog and Create-a-Sim pass
+    /// 3.25 (`0x66ad3c`, `0x53724f`), so pets draw that much larger.
+    fn shop_preview_params(&self, yaw: f32) -> sims_people::caf_preview::TurntableParams {
+        let defaults = sims_people::caf_preview::TurntableParams {
+            yaw,
+            ..sims_people::caf_preview::TurntableParams::default()
+        };
+        match self.shop_snapshot.as_ref().and_then(|s| s.choice) {
+            Some(ChoiceDialog::Clothing) => sims_people::caf_preview::TurntableParams {
+                size: sims_ui::shop::CHOICE_VIEW,
+                ..defaults
+            },
+            Some(ChoiceDialog::Pet) => sims_people::caf_preview::TurntableParams {
+                size: sims_ui::shop::CHOICE_VIEW,
+                scale: defaults.scale * 5.0 / 3.25,
+                ..defaults
+            },
+            None => defaults,
+        }
     }
 
     /// Delivers `response` to the currently waiting VM special panel (`Dialog`
@@ -10978,8 +11028,13 @@ impl Game {
     /// caller has a relationship row naming them (`"They can only call people
     /// they've already met"`, `UIText.iff STR# 166[59]`), and they are not the
     /// caller, not in the caller's family (`person.data[61]`), not a pet
-    /// (`person.data[65] > 1`, `0x427c69`), not familyless (service NPC), and
-    /// not already on this lot. Rows keep the caller's relationship order.
+    /// (`person.data[65] > 1`, `0x427c69`) and not familyless (service NPC).
+    /// Rows keep the caller's relationship order.
+    ///
+    /// Native lists neighbors on this lot too: `cWinPhoneBook` filters by
+    /// family (`0x522ea1`), kind and relationship (`0x522f17`), and that the
+    /// neighbor's character resolves by GUID (`0x43ac10` on the object
+    /// definitions, `0x523136`), never by presence.
     fn build_phonebook_snapshot(
         &self,
         world: &sims_sim::World,
@@ -10998,13 +11053,6 @@ impl Game {
         let caller_family = caller
             .and_then(|r| r.data.get(sims_sim::neighbors::FAMILY).copied())
             .unwrap_or(0);
-        let on_lot: std::collections::BTreeSet<i16> = world
-            .objects
-            .values()
-            .filter_map(|o| o.person.as_ref())
-            .filter_map(|p| p.data.get(PERSON_NEIGHBOR_WORD).copied())
-            .filter(|&id| id > 0)
-            .collect();
         let entries = caller
             .map(|c| c.relationships.as_slice())
             .unwrap_or_default()
@@ -11012,7 +11060,7 @@ impl Game {
             .filter_map(|row| {
                 let id = i16::try_from(row.target).ok()?;
                 let record = records.get(&id).copied()?;
-                phonebook_eligible(record, caller_neighbor, caller_family, &on_lot).then(|| {
+                phonebook_eligible(record, caller_neighbor, caller_family).then(|| {
                     let daily = row.values.first().copied().unwrap_or(0);
                     let lifetime = row.values.get(1).copied().unwrap_or(0);
                     let clamp = |v: i32| v.clamp(-100, 100) as i16;
@@ -13562,16 +13610,12 @@ fn load_pet_body(
     Ok(sims_people::Body { skeleton, parts })
 }
 
-/// `person.data[31]`: the person's neighbor record ID (`PERSON_NEIGHBOR`).
-const PERSON_NEIGHBOR_WORD: usize = 31;
-
 /// Whether `record` may appear in `caller`'s Phonebook (see
 /// [`Game::build_phonebook_snapshot`]).
 fn phonebook_eligible(
     record: &sims_sim::neighbors::Neighbor,
     caller: i16,
     caller_family: i16,
-    on_lot: &std::collections::BTreeSet<i16>,
 ) -> bool {
     let family = record
         .data
@@ -13588,7 +13632,6 @@ fn phonebook_eligible(
         && kind <= 1
         && family > 0
         && (caller_family <= 0 || family != caller_family)
-        && !on_lot.contains(&record.id)
 }
 
 /// The suit category letter of `Dialog` kind 6 mode `0..=5` (`0x5097c9`):
@@ -14370,5 +14413,33 @@ mod tests {
         assert_eq!(pixel(&canvas, 44, 2), [0, 0, 0]);
         // Interior pixels stay untouched.
         assert_eq!(pixel(&canvas, 6, 6), [0, 0, 0]);
+    }
+
+    #[test]
+    fn phone_book_eligibility_is_family_kind_and_caller_only() {
+        // `cWinPhoneBook` never asks where a neighbor is (`0x522f17`), so
+        // there is no presence input at all.
+        let record = |id: i16, family: i16, kind: i16| {
+            let mut data = vec![0i16; sims_sim::neighbors::PERSON_WORDS];
+            data[sims_sim::neighbors::FAMILY] = family;
+            data[sims_sim::neighbors::KIND] = kind;
+            sims_sim::neighbors::Neighbor {
+                id,
+                guid: 0,
+                revision: 1,
+                data,
+                relationships: Vec::new(),
+                friends: 0,
+                stale: false,
+            }
+        };
+        assert!(phonebook_eligible(&record(5, 3, 0), 1, 2), "a neighbor");
+        assert!(
+            !phonebook_eligible(&record(5, 2, 0), 1, 2),
+            "the caller's family"
+        );
+        assert!(!phonebook_eligible(&record(5, 0, 0), 1, 2), "familyless");
+        assert!(!phonebook_eligible(&record(5, 3, 2), 1, 2), "a pet");
+        assert!(!phonebook_eligible(&record(1, 3, 0), 1, 2), "the caller");
     }
 }
