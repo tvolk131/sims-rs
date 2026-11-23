@@ -622,6 +622,15 @@ impl Saved {
         &self.world
     }
 
+    /// Drops the people waiting for an indicator refresh
+    /// (`World::indicator_queues`), for a save whose world came from
+    /// elsewhere: a bare [`World`] snapshot holds none, and the queue of
+    /// the lot it is spliced into may name people the world lacks.
+    pub fn forget_indicator_refreshes(&mut self) {
+        self.indicator_queues = sims_sim::IndicatorQueues::default();
+        self.world.indicator_queues = sims_sim::IndicatorQueues::default();
+    }
+
     /// Save Card lot name (`0x50e1f8..0x50e42c`).
     pub fn lot_name(&self) -> &str {
         &self.lot_name
@@ -1716,6 +1725,17 @@ mod tests {
             from10.world.indicator_queues,
             sims_sim::IndicatorQueues::default()
         );
+
+        // A save whose world came from a snapshot forgets the queues.
+        let mut spliced = dec10.clone();
+        spliced.forget_indicator_refreshes();
+        let back = Saved::decode(&spliced.encode()).unwrap();
+        assert_eq!(back.indicator_queues, sims_sim::IndicatorQueues::default());
+        assert_eq!(
+            back.world.indicator_queues,
+            sims_sim::IndicatorQueues::default()
+        );
+        assert_eq!(back.world.hash(), dec10.world.hash());
     }
 
     #[test]

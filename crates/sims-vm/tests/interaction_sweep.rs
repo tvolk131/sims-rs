@@ -1023,6 +1023,13 @@ fn studio_town_house81_celebrity_pooled_stars_and_downtown_house21_bar_avoid_uns
         let mut player = SweepPlayer::new(&world);
         let mut play = Play::default();
         let mut saw_star_attached = false;
+        // Stars already over someone before the interaction runs.
+        let attached_before: Vec<(u16, i16)> = world
+            .objects
+            .values()
+            .filter(|o| o.guid == STAR_MARKER_GUID && o.data[2] > 0)
+            .map(|o| (o.id, o.data[2]))
+            .collect();
         for tick in 1..=200 {
             let (u, res) =
                 interp.lot_update_kept(&mut world, &tuning, &mut player, Some(&mut play));
@@ -1043,11 +1050,19 @@ fn studio_town_house81_celebrity_pooled_stars_and_downtown_house21_bar_avoid_uns
             if let Err(err) = interp.draw_frame(&mut world, 1) {
                 panic!("House81 frame failed at tick {tick}: {err}");
             }
-            if world
-                .objects
-                .values()
-                .any(|o| o.guid == STAR_MARKER_GUID && o.data.get(2).copied().unwrap_or(0) > 0)
-            {
+            // A new star, in the head slot of a famous Sim that is not
+            // selected.
+            if world.objects.values().any(|o| {
+                let head = o.data[2];
+                o.guid == STAR_MARKER_GUID
+                    && head > 0
+                    && !attached_before.contains(&(o.id, head))
+                    && world.objects.get(&(head as u16)).is_some_and(|sim| {
+                        !sim.selected
+                            && sim.slots.get(2).map(|s| s.object) == Some(o.id as i16)
+                            && sim.person.as_ref().is_some_and(|p| p.data[81] >= 10)
+                    })
+            }) {
                 saw_star_attached = true;
             }
         }

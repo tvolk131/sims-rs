@@ -4099,6 +4099,11 @@ impl NeighborhoodShell {
                     }
                 };
                 let spliced = splice_world_into_saved_bytes(&base_saved, &world)?;
+                // A world snapshot holds no pending indicator refreshes, and
+                // the base lot's may name people the restored world lacks.
+                let mut spliced = Saved::decode(&spliced).map_err(|e| e.to_string())?;
+                spliced.forget_indicator_refreshes();
+                let spliced = spliced.encode();
                 (spliced, Some(loaded.metadata.sim_tick))
             }
             SavePayloadKind::Custom(tag) => {

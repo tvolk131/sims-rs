@@ -3818,9 +3818,9 @@ fn boot_destination_lot(
                     })?;
                 (id, false)
             };
-            // Place on a distinct walkable tile near the arrival portal BEFORE
-            // applying fame >= 10 (so `placed_from_outside` 0x447a82 does not
-            // trap on unported star-marker pool for non-selected celebrities).
+            // The traveler comes onto the lot with its fame, so a famous Sim
+            // that is not selected gets its star as it is placed (0x447a57 ->
+            // 0x447a82). Its date link is written after placement.
             let saved_fame = snap
                 .person_data
                 .get(PERSON_FAME_LEVEL)
@@ -3832,7 +3832,7 @@ fn boot_destination_lot(
                 .and_then(|o| o.person.as_mut())
             {
                 if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
-                    *f = 0;
+                    *f = saved_fame;
                 }
                 if let Some(d) = person.data.get_mut(PERSON_DATE) {
                     *d = 0;
@@ -4226,7 +4226,7 @@ fn reconcile_frozen_home_lot(
                 .and_then(|o| o.person.as_mut())
             {
                 if let Some(f) = person.data.get_mut(PERSON_FAME_LEVEL) {
-                    *f = 0;
+                    *f = saved_fame;
                 }
                 if let Some(d) = person.data.get_mut(PERSON_DATE) {
                     *d = 0;
@@ -6023,6 +6023,18 @@ mod tests {
             100,
         );
 
+        // The companion is famous, so it arrives with a star (0x447a82).
+        if let Some(row) = goth
+            .world
+            .neighbors
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|row| row.guid == non_goth_adult_guid)
+        {
+            row.data[PERSON_FAME_LEVEL] = 15;
+        }
+
         // 1. Downtown Date (Mortimer + non-household adult companion) to House 21.
         let date_req = TravelRequest::downtown_date(21, mortimer_guid, non_goth_adult_guid);
         let dep = depart_to_destination(&root, &store, "UserData", &mut goth, &date_req).unwrap();
@@ -6052,6 +6064,23 @@ mod tests {
                 .data[PERSON_DATE],
             dt_mortimer_id as i16
         );
+
+        // The famous companion is not selected: placing it on the lot put a
+        // pooled star over its head (0x447a57 -> 0x447a82). The leader is
+        // selected and has none.
+        assert!(!dt.world.objects[&dt_companion_id].selected);
+        let star_over = |id: u16| {
+            dt.world.objects.values().any(|o| {
+                o.guid == crate::placement::STAR_MARKER
+                    && o.data[2] == id as i16
+                    && dt.world.objects[&id].slots[2].object == o.id as i16
+            })
+        };
+        assert!(
+            star_over(dt_companion_id),
+            "the famous companion has a star"
+        );
+        assert!(!star_over(dt_mortimer_id));
 
         // Mutate funds, motives, skills, fame, accessories, outfits, made_outfits,
         // MagiCoins, souvenir/gift token, and relationship with the date companion!
@@ -6170,6 +6199,13 @@ mod tests {
         assert_eq!(mort.data[10], 500);
         assert_eq!(mort.data[PERSON_FAME_LEVEL], 25);
         assert_eq!(mort.data[PERSON_DATE], 0, "date link cleared on return");
+        // A famous Sim that is not selected comes home with a star over its
+        // head (0x447a57 -> 0x447a82); the selected one has the plumb bob.
+        let mortimer_selected = home.world.objects[&home_mortimer_id].selected;
+        let star_over_mortimer = home.world.objects.values().any(|o| {
+            o.guid == crate::placement::STAR_MARKER && o.data[2] == home_mortimer_id as i16
+        });
+        assert_eq!(star_over_mortimer, !mortimer_selected);
         assert!(
             mort.accessories
                 .iter()
@@ -6218,8 +6254,7 @@ mod tests {
         assert!(stored_after.families[&5].friends >= 1);
 
         // Switching away from famous Mortimer (`fame=25`) via `select_sim`
-        // succeeds cleanly without tripping unported star-marker pool `0x446c15`
-        // and preserves exact fame!
+        // gives him a star (0x446c15) and keeps his fame.
         let bella_id = home
             .world
             .people
