@@ -1654,6 +1654,9 @@ impl NeighborhoodShell {
         }
         if changed {
             self.relayout_dialog();
+            if matches!(self.screen, ActiveScreen::Neighborhood) {
+                self.refresh_hovered_lot();
+            }
         }
         changed
     }

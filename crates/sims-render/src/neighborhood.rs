@@ -1514,7 +1514,8 @@ impl NeighborhoodMap {
             }
         }
 
-        let active_large_frame = if viewport[0] > MAP_WIDTH {
+        let draw_outer_frame = viewport[0] > MAP_WIDTH || viewport[1] > MAP_HEIGHT;
+        let active_large_frame = if draw_outer_frame {
             self.large_frame.as_ref()
         } else {
             None
@@ -1550,10 +1551,20 @@ impl NeighborhoodMap {
             canvas.clear([0, 0, 0]);
             canvas.set_id(None);
 
-            // 1. 1024×768 outer frame only when viewport width exceeds 800
-            //    (`cmp eax, 0x320; jle` at 0x556d89, 0x569025).
-            if let Some(frame) = active_large_frame {
-                blit_surface_to_canvas(canvas, frame, [0, 0], full_clip, false, None);
+            // 1. Outer Neighborhood frame:
+            //    - `800×600` (or `<= 800×600`): omitted (exact native fast path).
+            //    - `1024×768`: blitted 1:1 at `[0, 0]` (exact native fast path).
+            //    - Any other viewport exceeding `800×600` in width or height:
+            //      seamless viewport-sized beveled surround + map drop shadow.
+            if draw_outer_frame {
+                render_outer_frame(
+                    canvas,
+                    active_large_frame,
+                    viewport,
+                    origin,
+                    [self.backdrop.width, self.backdrop.height],
+                    full_clip,
+                );
             }
 
             // 2. Map backdrop at centered origin (0x556db7..0x556ddc, 0x568fa7..0x568fe6).
@@ -1680,10 +1691,15 @@ impl NeighborhoodMap {
         canvas.clear([0, 0, 0]);
         canvas.set_id(None);
 
-        if viewport[0] > MAP_WIDTH
-            && let Some(frame) = &self.large_frame
-        {
-            blit_surface_to_canvas(canvas, frame, [0, 0], full_clip, false, None);
+        if viewport[0] > MAP_WIDTH || viewport[1] > MAP_HEIGHT {
+            render_outer_frame(
+                canvas,
+                self.large_frame.as_ref(),
+                viewport,
+                origin,
+                [self.backdrop.width, self.backdrop.height],
+                full_clip,
+            );
         }
 
         blit_surface_to_canvas(canvas, &self.backdrop, origin, backdrop_clip, false, None);
@@ -4366,6 +4382,569 @@ fn blend_565_over_packed(table: &[u8; 32768], row_a5: usize, fg: u16, bg: u32) -
     )
 }
 
+/// Native `1024×768` outer frame asset dimensions (`Downtown/LargeBack.bmp`,
+/// `Studiotown/dlgframe_1024x768.bmp`).
+const LARGE_FRAME_NATIVE_WIDTH: u32 = 1024;
+const LARGE_FRAME_NATIVE_HEIGHT: u32 = 768;
+/// Native `800×600` map cutout origin inside the `1024×768` outer frame.
+const LARGE_FRAME_CUTOUT_X: usize = 112;
+const LARGE_FRAME_CUTOUT_Y: usize = 84;
+const LARGE_FRAME_CUTOUT_W: usize = MAP_WIDTH as usize;
+const LARGE_FRAME_CUTOUT_H: usize = MAP_HEIGHT as usize;
+/// Thickness of the raised outer bevel rim on all four sides of `large_frame`.
+const LARGE_FRAME_BEVEL: usize = 16;
+/// Drop-shadow reach outside the `800×600` map cutout in `large_frame`.
+const LARGE_FRAME_SHADOW_LEFT: i32 = 4;
+const LARGE_FRAME_SHADOW_TOP: i32 = 4;
+const LARGE_FRAME_SHADOW_RIGHT: i32 = 32;
+const LARGE_FRAME_SHADOW_BOTTOM: i32 = 32;
+/// Native Sims 1 royal-blue diagonal gradient fallback corners (TL, TR, BL, BR)
+/// used when `large_frame` is absent on arbitrary resized viewports.
+const DEFAULT_FRAME_CORNERS: [[f32; 3]; 4] = [
+    [0.0, 2.0, 80.0],
+    [0.0, 14.0, 100.0],
+    [0.0, 24.0, 112.0],
+    [0.0, 42.0, 134.0],
+];
+
+/// Renders the Neighborhood outer frame behind the centered map backdrop.
+///
+/// - At native `1024×768`, blits `large_frame` 1:1 at `[0, 0]` (100% bit-exact
+///   with Complete Collection 1.91).
+/// - At any other viewport exceeding `800×600` in width or height, composes a
+///   seamless viewport-sized beveled royal-blue surround derived from
+///   `large_frame` (or a native royal-blue fallback when absent) plus a soft
+///   recessed drop shadow hugging the centered map rectangle.
+fn render_outer_frame(
+    canvas: &mut Canvas,
+    frame: Option<&Surface565>,
+    viewport: [u32; 2],
+    origin: [i32; 2],
+    backdrop_size: [usize; 2],
+    full_clip: [i32; 4],
+) {
+    if viewport == [LARGE_FRAME_NATIVE_WIDTH, LARGE_FRAME_NATIVE_HEIGHT] {
+        if let Some(frame) = frame {
+            blit_surface_to_canvas(canvas, frame, [0, 0], full_clip, false, None);
+        }
+        return;
+    }
+    render_arbitrary_large_frame(canvas, frame, origin, backdrop_size);
+}
+
+fn sample_patch_mean_rgb(
+    frame: &Surface565,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    fallback: [f32; 3],
+) -> [f32; 3] {
+    let mut sum = [0.0f64; 3];
+    let mut count = 0u64;
+    let xe = x1.min(frame.width);
+    let ye = y1.min(frame.height);
+    for y in y0.min(ye)..ye {
+        let row = &frame.pixels[y * frame.width..(y + 1) * frame.width];
+        for &pixel in &row[x0.min(xe)..xe] {
+            if pixel == COLOR_KEY_565 {
+                continue;
+            }
+            let [r, g, b] = widen_565(pixel);
+            sum[0] += f64::from(r);
+            sum[1] += f64::from(g);
+            sum[2] += f64::from(b);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        fallback
+    } else {
+        let inv = 1.0 / (count as f64);
+        [
+            (sum[0] * inv) as f32,
+            (sum[1] * inv) as f32,
+            (sum[2] * inv) as f32,
+        ]
+    }
+}
+
+fn sample_frame_corners(frame: Option<&Surface565>) -> [[f32; 3]; 4] {
+    let Some(f) = frame.filter(|f| f.is_valid() && f.width > 0 && f.height > 0) else {
+        return DEFAULT_FRAME_CORNERS;
+    };
+    if f.width >= 64 && f.height >= 64 {
+        let bx = LARGE_FRAME_BEVEL.min(f.width / 4);
+        let by = LARGE_FRAME_BEVEL.min(f.height / 4);
+        let pw = 16.min((f.width - bx * 2) / 2).max(1);
+        let ph = 16.min((f.height - by * 2) / 2).max(1);
+        [
+            sample_patch_mean_rgb(f, bx, by, bx + pw, by + ph, DEFAULT_FRAME_CORNERS[0]),
+            sample_patch_mean_rgb(
+                f,
+                f.width - bx - pw,
+                by,
+                f.width - bx,
+                by + ph,
+                DEFAULT_FRAME_CORNERS[1],
+            ),
+            sample_patch_mean_rgb(
+                f,
+                bx,
+                f.height - by - ph,
+                bx + pw,
+                f.height - by,
+                DEFAULT_FRAME_CORNERS[2],
+            ),
+            sample_patch_mean_rgb(
+                f,
+                f.width - bx - pw,
+                f.height - by - ph,
+                f.width - bx,
+                f.height - by,
+                DEFAULT_FRAME_CORNERS[3],
+            ),
+        ]
+    } else {
+        [
+            sample_patch_mean_rgb(f, 0, 0, 1, 1, DEFAULT_FRAME_CORNERS[0]),
+            sample_patch_mean_rgb(f, f.width - 1, 0, f.width, 1, DEFAULT_FRAME_CORNERS[1]),
+            sample_patch_mean_rgb(f, 0, f.height - 1, 1, f.height, DEFAULT_FRAME_CORNERS[2]),
+            sample_patch_mean_rgb(
+                f,
+                f.width - 1,
+                f.height - 1,
+                f.width,
+                f.height,
+                DEFAULT_FRAME_CORNERS[3],
+            ),
+        ]
+    }
+}
+
+#[inline]
+fn bilerp_corner_rgb(corners: &[[f32; 3]; 4], u: f32, v: f32) -> [f32; 3] {
+    let u = u.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
+    let w00 = (1.0 - u) * (1.0 - v);
+    let w10 = u * (1.0 - v);
+    let w01 = (1.0 - u) * v;
+    let w11 = u * v;
+    [
+        corners[0][0] * w00 + corners[1][0] * w10 + corners[2][0] * w01 + corners[3][0] * w11,
+        corners[0][1] * w00 + corners[1][1] * w10 + corners[2][1] * w01 + corners[3][1] * w11,
+        corners[0][2] * w00 + corners[1][2] * w10 + corners[2][2] * w01 + corners[3][2] * w11,
+    ]
+}
+
+fn blit_keyed_subrect_stretched(
+    canvas: &mut Canvas,
+    src: &Surface565,
+    src_rect: [usize; 4],
+    dst_rect: [usize; 4],
+) {
+    let [sx0, sy0, sw, sh] = src_rect;
+    let [dx0, dy0, dw, dh] = dst_rect;
+    if !src.is_valid()
+        || sw == 0
+        || sh == 0
+        || dw == 0
+        || dh == 0
+        || sx0.saturating_add(sw) > src.width
+        || sy0.saturating_add(sh) > src.height
+        || dx0 >= canvas.width
+        || dy0 >= canvas.height
+    {
+        return;
+    }
+    let dx1 = dx0.saturating_add(dw).min(canvas.width);
+    let dy1 = dy0.saturating_add(dh).min(canvas.height);
+    if canvas.has_pixel_storage() {
+        for py in dy0..dy1 {
+            let sy = sy0 + (((py - dy0) * sh) / dh).min(sh - 1);
+            let src_row = &src.pixels[sy * src.width..(sy + 1) * src.width];
+            let dst_row = &mut canvas.color[py * canvas.width + dx0..py * canvas.width + dx1];
+            for (i, dst) in dst_row.iter_mut().enumerate() {
+                let sx = sx0 + ((i * sw) / dw).min(sw - 1);
+                let pixel = src_row[sx];
+                if pixel != COLOR_KEY_565 {
+                    *dst = widen_565_packed(pixel);
+                }
+            }
+        }
+    } else {
+        for py in dy0..dy1 {
+            let sy = sy0 + (((py - dy0) * sh) / dh).min(sh - 1);
+            let src_row = &src.pixels[sy * src.width..(sy + 1) * src.width];
+            for px in dx0..dx1 {
+                let sx = sx0 + (((px - dx0) * sw) / dw).min(sw - 1);
+                let pixel = src_row[sx];
+                if pixel != COLOR_KEY_565 {
+                    canvas.plot_color(px as i32, py as i32, widen_565(pixel));
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn scale_packed_rgb(packed: u32, factor: f32) -> u32 {
+    let [r, g, b] = unpack_rgb(packed);
+    pack_rgb([
+        (f32::from(r) * factor + 0.5).clamp(0.0, 255.0) as u8,
+        (f32::from(g) * factor + 0.5).clamp(0.0, 255.0) as u8,
+        (f32::from(b) * factor + 0.5).clamp(0.0, 255.0) as u8,
+    ])
+}
+
+#[inline]
+fn adjust_packed_rgb(packed: u32, delta: [i32; 3]) -> u32 {
+    let [r, g, b] = unpack_rgb(packed);
+    pack_rgb([
+        (i32::from(r) + delta[0]).clamp(0, 255) as u8,
+        (i32::from(g) + delta[1]).clamp(0, 255) as u8,
+        (i32::from(b) + delta[2]).clamp(0, 255) as u8,
+    ])
+}
+
+fn render_arbitrary_large_frame(
+    canvas: &mut Canvas,
+    frame: Option<&Surface565>,
+    origin: [i32; 2],
+    backdrop_size: [usize; 2],
+) {
+    let vw = canvas.width;
+    let vh = canvas.height;
+    if vw == 0 || vh == 0 {
+        return;
+    }
+
+    let valid_frame = frame.filter(|f| f.is_valid() && f.width > 0 && f.height > 0);
+    let corners = sample_frame_corners(valid_frame);
+
+    // 1. Fill full viewport with smooth royal-blue diagonal gradient derived from
+    //    `large_frame`'s clean outer perimeter bands (never sampling its inner
+    //    cutout or magenta color key).
+    let inv_w = if vw > 1 { 1.0 / (vw - 1) as f32 } else { 0.0 };
+    let inv_h = if vh > 1 { 1.0 / (vh - 1) as f32 } else { 0.0 };
+    if canvas.has_pixel_storage() {
+        for y in 0..vh {
+            let v = y as f32 * inv_h;
+            let left = [
+                corners[0][0] * (1.0 - v) + corners[2][0] * v,
+                corners[0][1] * (1.0 - v) + corners[2][1] * v,
+                corners[0][2] * (1.0 - v) + corners[2][2] * v,
+            ];
+            let right = [
+                corners[1][0] * (1.0 - v) + corners[3][0] * v,
+                corners[1][1] * (1.0 - v) + corners[3][1] * v,
+                corners[1][2] * (1.0 - v) + corners[3][2] * v,
+            ];
+            let dst_row = &mut canvas.color[y * vw..(y + 1) * vw];
+            for (x, dst) in dst_row.iter_mut().enumerate() {
+                let u = x as f32 * inv_w;
+                let rgb = [
+                    (left[0] + (right[0] - left[0]) * u + 0.5).clamp(0.0, 255.0) as u8,
+                    (left[1] + (right[1] - left[1]) * u + 0.5).clamp(0.0, 255.0) as u8,
+                    (left[2] + (right[2] - left[2]) * u + 0.5).clamp(0.0, 255.0) as u8,
+                ];
+                *dst = pack_rgb(rgb);
+            }
+        }
+    } else {
+        for y in 0..vh {
+            let v = y as f32 * inv_h;
+            for x in 0..vw {
+                let u = x as f32 * inv_w;
+                let c = bilerp_corner_rgb(&corners, u, v);
+                canvas.plot_color(
+                    x as i32,
+                    y as i32,
+                    [
+                        (c[0] + 0.5).clamp(0.0, 255.0) as u8,
+                        (c[1] + 0.5).clamp(0.0, 255.0) as u8,
+                        (c[2] + 0.5).clamp(0.0, 255.0) as u8,
+                    ],
+                );
+            }
+        }
+    }
+
+    // 2. Draw crisp 1:1-thickness outer bevel rim hugging `(0, 0)..(vw, vh)`.
+    if let Some(f) = valid_frame.filter(|f| f.width >= 64 && f.height >= 64) {
+        let bx = LARGE_FRAME_BEVEL.min(vw / 2).min(f.width / 2);
+        let by = LARGE_FRAME_BEVEL.min(vh / 2).min(f.height / 2);
+        if bx > 0 && by > 0 {
+            let fw = f.width;
+            let fh = f.height;
+            // Four 1:1 outer corners.
+            blit_keyed_subrect_stretched(canvas, f, [0, 0, bx, by], [0, 0, bx, by]);
+            blit_keyed_subrect_stretched(canvas, f, [fw - bx, 0, bx, by], [vw - bx, 0, bx, by]);
+            blit_keyed_subrect_stretched(canvas, f, [0, fh - by, bx, by], [0, vh - by, bx, by]);
+            blit_keyed_subrect_stretched(
+                canvas,
+                f,
+                [fw - bx, fh - by, bx, by],
+                [vw - bx, vh - by, bx, by],
+            );
+            // Horizontal bevel bands (top & bottom).
+            if vw > bx * 2 && fw > bx * 2 {
+                let dst_mid_w = vw - bx * 2;
+                let src_mid_w = fw - bx * 2;
+                blit_keyed_subrect_stretched(
+                    canvas,
+                    f,
+                    [bx, 0, src_mid_w, by],
+                    [bx, 0, dst_mid_w, by],
+                );
+                blit_keyed_subrect_stretched(
+                    canvas,
+                    f,
+                    [bx, fh - by, src_mid_w, by],
+                    [bx, vh - by, dst_mid_w, by],
+                );
+            }
+            // Vertical bevel bands (left & right).
+            if vh > by * 2 && fh > by * 2 {
+                let dst_mid_h = vh - by * 2;
+                let src_mid_h = fh - by * 2;
+                blit_keyed_subrect_stretched(
+                    canvas,
+                    f,
+                    [0, by, bx, src_mid_h],
+                    [0, by, bx, dst_mid_h],
+                );
+                blit_keyed_subrect_stretched(
+                    canvas,
+                    f,
+                    [fw - bx, by, bx, src_mid_h],
+                    [vw - bx, by, bx, dst_mid_h],
+                );
+            }
+        }
+    } else if vw >= 16 && vh >= 16 {
+        // Subtle procedural outer bevel when `large_frame` is absent.
+        let ridge: [i32; 8] = [-4, 0, 6, 16, 36, 18, 6, 0];
+        let shade: [i32; 8] = [0, -2, -5, -10, -14, -18, -20, -22];
+        let has_storage = canvas.has_pixel_storage();
+        for y in 0..vh {
+            for x in 0..vw {
+                let mut d = 0i32;
+                if y < 8 && x >= y && x < vw - y {
+                    d = ridge[y];
+                } else if x < 8 && y >= x && y < vh - x {
+                    d = ridge[x] / 2;
+                } else if y >= vh - 8 && x >= vh - 1 - y && x < vw - (vh - 1 - y) {
+                    d = shade[y - (vh - 8)];
+                } else if x >= vw - 8 && y >= vw - 1 - x && y < vh - (vw - 1 - x) {
+                    d = shade[x - (vw - 8)];
+                }
+                if d != 0 {
+                    let delta = [d / 2, d * 3 / 4, d];
+                    if has_storage {
+                        let idx = y * vw + x;
+                        canvas.color[idx] = adjust_packed_rgb(canvas.color[idx], delta);
+                    } else if let Some(&prev) = canvas.color.get(y * vw + x) {
+                        canvas.plot_color(
+                            x as i32,
+                            y as i32,
+                            unpack_rgb(adjust_packed_rgb(prev, delta)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Apply soft recessed drop shadow hugging the centered map rectangle
+    //    `[ox..ox+bw, oy..oy+bh)` so the map sits cleanly inside the surround
+    //    at every aspect ratio without hard edges or misaligned cutouts.
+    let vw_i = vw.min(i32::MAX as usize) as i32;
+    let vh_i = vh.min(i32::MAX as usize) as i32;
+    let map_x0 = origin[0];
+    let map_y0 = origin[1];
+    let map_x1 = map_x0.saturating_add(backdrop_size[0].min(i32::MAX as usize) as i32);
+    let map_y1 = map_y0.saturating_add(backdrop_size[1].min(i32::MAX as usize) as i32);
+    if map_x0 >= map_x1 || map_y0 >= map_y1 {
+        return;
+    }
+
+    let sh_x0 = map_x0
+        .saturating_sub(LARGE_FRAME_SHADOW_LEFT)
+        .clamp(0, vw_i);
+    let sh_y0 = map_y0.saturating_sub(LARGE_FRAME_SHADOW_TOP).clamp(0, vh_i);
+    let sh_x1 = map_x1
+        .saturating_add(LARGE_FRAME_SHADOW_RIGHT)
+        .clamp(sh_x0, vw_i);
+    let sh_y1 = map_y1
+        .saturating_add(LARGE_FRAME_SHADOW_BOTTOM)
+        .clamp(sh_y0, vh_i);
+
+    let has_storage = canvas.has_pixel_storage();
+    let native_shadow_frame = valid_frame.filter(|f| {
+        f.width == LARGE_FRAME_NATIVE_WIDTH as usize
+            && f.height == LARGE_FRAME_NATIVE_HEIGHT as usize
+    });
+
+    if let Some(f) = native_shadow_frame {
+        let cx0 = LARGE_FRAME_CUTOUT_X;
+        let cy0 = LARGE_FRAME_CUTOUT_Y;
+        let cx1 = cx0 + LARGE_FRAME_CUTOUT_W;
+        let cy1 = cy0 + LARGE_FRAME_CUTOUT_H;
+        let map_w = (map_x1 - map_x0).max(1);
+        let map_h = (map_y1 - map_y0).max(1);
+        let fw_span = (f.width.saturating_sub(48)).max(1) as f32;
+        let fh_span = (f.height.saturating_sub(48)).max(1) as f32;
+        const CORNER_KEEP: i32 = 40;
+        const FEATHER: f32 = 6.0;
+
+        for py in sh_y0..sh_y1 {
+            let inside_y = py >= map_y0 && py < map_y1;
+            let (sy, fy_feather) = if py < map_y0 {
+                let dist = map_y0 - py;
+                let s = cy0.saturating_sub(dist as usize);
+                let feather = ((LARGE_FRAME_SHADOW_TOP - dist + 1) as f32
+                    / LARGE_FRAME_SHADOW_TOP as f32)
+                    .clamp(0.0, 1.0);
+                (s, feather)
+            } else if py >= map_y1 {
+                let dist = py - map_y1;
+                let s = (cy1 + dist as usize).min(f.height - 1);
+                let feather = ((LARGE_FRAME_SHADOW_BOTTOM - dist) as f32 / FEATHER).clamp(0.0, 1.0);
+                (s, feather)
+            } else {
+                let d_top = py - map_y0;
+                let d_bot = (map_y1 - 1) - py;
+                let s = if map_h == LARGE_FRAME_CUTOUT_H as i32
+                    || (d_top < CORNER_KEEP && d_top <= d_bot)
+                {
+                    cy0 + d_top as usize
+                } else if d_bot < CORNER_KEEP {
+                    (cy1 - 1).saturating_sub(d_bot as usize)
+                } else {
+                    cy0 + (((i64::from(d_top) * LARGE_FRAME_CUTOUT_H as i64) / i64::from(map_h))
+                        as usize)
+                        .min(LARGE_FRAME_CUTOUT_H - 1)
+                };
+                (s, 1.0)
+            };
+            if sy < LARGE_FRAME_BEVEL || sy >= f.height - LARGE_FRAME_BEVEL {
+                continue;
+            }
+            let src_row = &f.pixels[sy * f.width..(sy + 1) * f.width];
+            let v_src = ((sy as f32 - 24.0) / fh_span).clamp(0.0, 1.0);
+
+            for px in sh_x0..sh_x1 {
+                if inside_y && px >= map_x0 && px < map_x1 {
+                    continue;
+                }
+                let (sx, fx_feather) = if px < map_x0 {
+                    let dist = map_x0 - px;
+                    let s = cx0.saturating_sub(dist as usize);
+                    let feather = ((LARGE_FRAME_SHADOW_LEFT - dist + 1) as f32
+                        / LARGE_FRAME_SHADOW_LEFT as f32)
+                        .clamp(0.0, 1.0);
+                    (s, feather)
+                } else if px >= map_x1 {
+                    let dist = px - map_x1;
+                    let s = (cx1 + dist as usize).min(f.width - 1);
+                    let feather =
+                        ((LARGE_FRAME_SHADOW_RIGHT - dist) as f32 / FEATHER).clamp(0.0, 1.0);
+                    (s, feather)
+                } else {
+                    let d_left = px - map_x0;
+                    let d_right = (map_x1 - 1) - px;
+                    let s = if map_w == LARGE_FRAME_CUTOUT_W as i32
+                        || (d_left < CORNER_KEEP && d_left <= d_right)
+                    {
+                        cx0 + d_left as usize
+                    } else if d_right < CORNER_KEEP {
+                        (cx1 - 1).saturating_sub(d_right as usize)
+                    } else {
+                        cx0 + (((i64::from(d_left) * LARGE_FRAME_CUTOUT_W as i64)
+                            / i64::from(map_w)) as usize)
+                            .min(LARGE_FRAME_CUTOUT_W - 1)
+                    };
+                    (s, 1.0)
+                };
+                if sx < LARGE_FRAME_BEVEL || sx >= f.width - LARGE_FRAME_BEVEL {
+                    continue;
+                }
+                let pixel = src_row[sx];
+                if pixel == COLOR_KEY_565 {
+                    continue;
+                }
+                let actual = widen_565(pixel);
+                let u_src = ((sx as f32 - 24.0) / fw_span).clamp(0.0, 1.0);
+                let expected = bilerp_corner_rgb(&corners, u_src, v_src);
+                let l_act = f32::from(actual[0]) + f32::from(actual[1]) + f32::from(actual[2]);
+                let l_exp = expected[0] + expected[1] + expected[2];
+                if l_exp <= 1.0 || l_act >= l_exp {
+                    continue;
+                }
+                let raw_factor = (l_act / l_exp).clamp(0.25, 1.0);
+                let weight = fx_feather.min(fy_feather);
+                let factor = 1.0 - (1.0 - raw_factor) * weight;
+                if factor >= 0.995 {
+                    continue;
+                }
+                let idx = py as usize * vw + px as usize;
+                if has_storage {
+                    canvas.color[idx] = scale_packed_rgb(canvas.color[idx], factor);
+                } else if let Some(&prev) = canvas.color.get(idx) {
+                    canvas.plot_color(px, py, unpack_rgb(scale_packed_rgb(prev, factor)));
+                }
+            }
+        }
+    } else if valid_frame.is_none() {
+        // Soft synthetic drop shadow offset down-right when `large_frame` is absent.
+        const SHADOW_OFFSET: i32 = 8;
+        const SHADOW_BLUR: i32 = 14;
+        let box_x0 = map_x0.saturating_add(SHADOW_OFFSET);
+        let box_y0 = map_y0.saturating_add(SHADOW_OFFSET);
+        let box_x1 = map_x1.saturating_add(SHADOW_OFFSET);
+        let box_y1 = map_y1.saturating_add(SHADOW_OFFSET);
+        let fb_x0 = box_x0.saturating_sub(SHADOW_BLUR).clamp(0, vw_i);
+        let fb_y0 = box_y0.saturating_sub(SHADOW_BLUR).clamp(0, vh_i);
+        let fb_x1 = box_x1.saturating_add(SHADOW_BLUR).clamp(fb_x0, vw_i);
+        let fb_y1 = box_y1.saturating_add(SHADOW_BLUR).clamp(fb_y0, vh_i);
+        for py in fb_y0..fb_y1 {
+            let inside_y = py >= map_y0 && py < map_y1;
+            let dy = if py < box_y0 {
+                box_y0 - py
+            } else if py >= box_y1 {
+                py - box_y1
+            } else {
+                0
+            };
+            for px in fb_x0..fb_x1 {
+                if inside_y && px >= map_x0 && px < map_x1 {
+                    continue;
+                }
+                let dx = if px < box_x0 {
+                    box_x0 - px
+                } else if px >= box_x1 {
+                    px - box_x1
+                } else {
+                    0
+                };
+                let dist = ((dx * dx + dy * dy) as f32).sqrt();
+                if dist >= SHADOW_BLUR as f32 {
+                    continue;
+                }
+                let t = 1.0 - dist / SHADOW_BLUR as f32;
+                let factor = 1.0 - 0.55 * t * t;
+                let idx = py as usize * vw + px as usize;
+                if has_storage {
+                    canvas.color[idx] = scale_packed_rgb(canvas.color[idx], factor);
+                } else if let Some(&prev) = canvas.color.get(idx) {
+                    canvas.plot_color(px, py, unpack_rgb(scale_packed_rgb(prev, factor)));
+                }
+            }
+        }
+    }
+}
+
 fn blit_surface_to_canvas(
     canvas: &mut Canvas,
     surface: &Surface565,
@@ -6511,5 +7090,138 @@ mod tests {
         assert_eq!(cached.color, uncached.color);
         assert_eq!(cached.depth, uncached.depth);
         assert_eq!(cached.ids(), uncached.ids());
+    }
+
+    #[test]
+    fn arbitrary_viewport_framing_cached_matches_uncached_and_eliminates_black_voids() {
+        // Build a synthetic 1024×768 frame mirroring `dlgframe_1024x768.bmp`:
+        // royal-blue outer surround, raised bevel, inner drop shadow on right & bottom,
+        // and COLOR_KEY_565 magenta inside the [112..912, 84..684) cutout.
+        let bg_565 = pack_565([0, 20, 108]);
+        let bevel_565 = pack_565([48, 60, 152]);
+        let shadow_565 = pack_565([0, 8, 48]);
+        let mut frame = Surface565::filled(1024, 768, bg_565);
+        for y in 0..768 {
+            for x in 0..1024 {
+                if !(16..1008).contains(&x) || !(16..752).contains(&y) {
+                    frame.pixels[y * 1024 + x] = bevel_565;
+                } else if (112..912).contains(&x) && (84..684).contains(&y) {
+                    frame.pixels[y * 1024 + x] = COLOR_KEY_565;
+                } else if ((912..936).contains(&x) && (84..708).contains(&y))
+                    || ((112..936).contains(&x) && (684..708).contains(&y))
+                {
+                    frame.pixels[y * 1024 + x] = shadow_565;
+                }
+            }
+        }
+
+        let lot = make_lot(
+            5,
+            [40, 40],
+            Surface565::filled(20, 20, pack_565([200, 180, 40])),
+        );
+        let mut map = make_test_map(NeighborhoodKind::StudioTown, vec![lot]);
+        map.large_frame = Some(frame);
+
+        let magenta_packed = widen_565_packed(COLOR_KEY_565);
+        for viewport in [
+            [800, 800],
+            [950, 700],
+            [1024, 860],
+            [1440, 768],
+            [1600, 900],
+        ] {
+            let [vw, vh] = viewport;
+            let [ox, oy] = map.map_origin_for(viewport);
+            let opts = RenderOptions {
+                viewport,
+                ..RenderOptions::default()
+            };
+            let mut cached = Canvas::new(vw as usize, vh as usize, [0, 0, 0]);
+            let mut uncached = Canvas::new(vw as usize, vh as usize, [0, 0, 0]);
+            map.render_into(&mut cached, &opts);
+            map.render_into_uncached(&mut uncached, &opts);
+            assert_eq!(
+                cached.color, uncached.color,
+                "cached != uncached at {viewport:?}"
+            );
+            assert_eq!(
+                cached.depth, uncached.depth,
+                "depth mismatch at {viewport:?}"
+            );
+            assert_eq!(cached.ids(), uncached.ids(), "ids mismatch at {viewport:?}");
+
+            // Every outer margin pixel must be non-black and non-magenta.
+            for y in 0..vh as i32 {
+                for x in 0..vw as i32 {
+                    if x >= ox && x < ox + 800 && y >= oy && y < oy + 600 {
+                        continue;
+                    }
+                    let px = cached.color[y as usize * vw as usize + x as usize];
+                    assert_ne!(px, 0, "black outer void at ({x}, {y}) in {viewport:?}");
+                    assert_ne!(
+                        px, magenta_packed,
+                        "magenta cutout leaked at ({x}, {y}) in {viewport:?}"
+                    );
+                }
+            }
+
+            // Inner drop shadow right of map must darken below the outer field.
+            if vw >= 950 {
+                let shadow_px = unpack_rgb(
+                    cached.color[(oy + 300) as usize * vw as usize + (ox + 804) as usize],
+                );
+                let field_px = unpack_rgb(
+                    cached.color[(oy + 300) as usize * vw as usize + (ox - 24).max(20) as usize],
+                );
+                assert!(
+                    shadow_px[2] < field_px[2],
+                    "expected drop shadow right of map at {viewport:?}: shadow={shadow_px:?}, field={field_px:?}"
+                );
+            }
+
+            // Lot hit-test agrees with Canvas::id_at.
+            let p = [ox + 45, oy + 45];
+            assert_eq!(map.hit_test(viewport, p), Some(5));
+            assert_eq!(cached.id_at(p[0], p[1]), Some(5));
+        }
+
+        // Cache must invalidate when `large_frame` changes at tall-only 800×800.
+        let tall_opts = RenderOptions {
+            viewport: [800, 800],
+            ..RenderOptions::default()
+        };
+        let before = map.render(&tall_opts);
+        map.large_frame = Some(Surface565::filled(1024, 768, pack_565([40, 80, 160])));
+        let after = map.render(&tall_opts);
+        assert_ne!(before.color[50 * 800 + 400], after.color[50 * 800 + 400]);
+
+        // Fallback when `large_frame` is None still paints royal-blue surround with 0 black margins.
+        map.large_frame = None;
+        for viewport in [[800, 800], [1440, 768]] {
+            let [vw, vh] = viewport;
+            let [ox, oy] = map.map_origin_for(viewport);
+            let opts = RenderOptions {
+                viewport,
+                ..RenderOptions::default()
+            };
+            let mut cached = Canvas::new(vw as usize, vh as usize, [0, 0, 0]);
+            let mut uncached = Canvas::new(vw as usize, vh as usize, [0, 0, 0]);
+            map.render_into(&mut cached, &opts);
+            map.render_into_uncached(&mut uncached, &opts);
+            assert_eq!(cached.color, uncached.color);
+            for y in 0..vh as i32 {
+                for x in 0..vw as i32 {
+                    if x >= ox && x < ox + 800 && y >= oy && y < oy + 600 {
+                        continue;
+                    }
+                    assert_ne!(
+                        cached.color[y as usize * vw as usize + x as usize],
+                        0,
+                        "fallback black void at ({x}, {y}) in {viewport:?}"
+                    );
+                }
+            }
+        }
     }
 }

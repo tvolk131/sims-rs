@@ -1074,8 +1074,31 @@ fn draw_four_cell_button(frame: &mut Frame, art: &Art, id: i32, cell: u32, dest:
         if dest.width == cw && dest.height == ch {
             frame.draw(img, Rect::new(sx, 0, cw, ch), [dest.x, dest.y]);
         } else {
-            // Nearest-neighbor scale within `dest` for compact viewports < 800 px.
-            draw_scaled_region(frame, img, Rect::new(sx, 0, cw, ch), dest);
+            // Preserve aspect ratio within `dest` for compact viewports < 800 px
+            // so circular neighborhood buttons stay round instead of squishing
+            // into vertical slivers.
+            let (fit_w, fit_h) = if i64::from(dest.width) * i64::from(ch)
+                <= i64::from(dest.height) * i64::from(cw)
+            {
+                let fw = dest.width;
+                let fh = ((i64::from(dest.width) * i64::from(ch) + i64::from(cw) / 2)
+                    / i64::from(cw))
+                .clamp(1, i64::from(dest.height)) as i32;
+                (fw, fh)
+            } else {
+                let fh = dest.height;
+                let fw = ((i64::from(dest.height) * i64::from(cw) + i64::from(ch) / 2)
+                    / i64::from(ch))
+                .clamp(1, i64::from(dest.width)) as i32;
+                (fw, fh)
+            };
+            let fit_dest = Rect::new(
+                dest.x + (dest.width - fit_w) / 2,
+                dest.y + (dest.height - fit_h) / 2,
+                fit_w,
+                fit_h,
+            );
+            draw_scaled_region(frame, img, Rect::new(sx, 0, cw, ch), fit_dest);
         }
     } else {
         let color = match cell {

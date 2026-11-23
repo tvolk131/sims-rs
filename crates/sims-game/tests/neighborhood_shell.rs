@@ -820,3 +820,118 @@ fn move_in_rollback_magic_town_magicoins_pace_sync_and_family_bin_clicks() {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn neighborhood_shell_resizes_cleanly_across_non_native_viewports() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL is not set; skipping neighborhood shell resize test");
+        return;
+    };
+    let install = PathBuf::from(root);
+    let (tmp_dir, saves_path) = temp_redb("resize");
+    let dump_dir = std::env::var_os("SIMS_DUMP_NBHD_SHELL_DIR").map(PathBuf::from);
+    if let Some(dir) = &dump_dir {
+        std::fs::create_dir_all(dir).expect("create shell dump dir");
+    }
+
+    let mut shell =
+        NeighborhoodShell::open(install, saves_path, 1, true, vec![3], Frames::default())
+            .expect("NeighborhoodShell opens");
+
+    let sizes = [
+        [800i32, 600i32],
+        [1024, 768],
+        [800, 800],
+        [960, 720],
+        [1024, 860],
+        [1440, 768],
+    ];
+    for size in sizes {
+        let [w, h] = size;
+        shell.resize(size);
+        shell.leave();
+        shell.render();
+
+        let canvas = shell.canvas();
+        assert_eq!((canvas.width, canvas.height), (w as usize, h as usize));
+
+        if let Some(dir) = &dump_dir {
+            let path = dir.join(format!("shell-nbhd-{w}x{h}.png"));
+            std::fs::write(&path, sims_render::png::encode(canvas)).expect("write shell png");
+        }
+
+        // At every size > 800×600, outer margins outside the centered 800×600 map
+        // and centered 800×52 top bar must have zero pure-black voids.
+        if w > 800 || h > 600 {
+            let [ox, oy] = shell.map().map_origin_for([w as u32, h as u32]);
+            for y in 0..h {
+                for x in 0..w {
+                    let in_map = x >= ox && x < ox + 800 && y >= oy && y < oy + 600;
+                    let in_bar = x >= ox && x < ox + 800 && y < sims_ui::neighborhood::BAR_HEIGHT;
+                    if in_map || in_bar {
+                        continue;
+                    }
+                    assert_ne!(
+                        canvas.color[y as usize * w as usize + x as usize],
+                        0,
+                        "shell {w}x{h} has black void pixel at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    // Hover Goth lot 5 at 1440×768, verify hover popup opens with centered anchor,
+    // then resize to 1024×860 and verify the open popup anchor updates immediately.
+    shell.resize([1440, 768]);
+    let goth_lot = shell.map().lot(5).expect("Goth lot 5");
+    let goth_anchor_1440 = {
+        let [ox, oy] = shell.map().map_origin_for([1440, 768]);
+        [ox + goth_lot.anchor[0], oy + goth_lot.anchor[1]]
+    };
+    let goth_rect_1440 = shell.map().lot_screen_rect(goth_lot, [1440, 768]);
+    let mut goth_pt_1440 = None;
+    'search: for y in (goth_rect_1440[1].max(sims_ui::neighborhood::BAR_HEIGHT)
+        ..goth_rect_1440[3].min(768))
+        .step_by(2)
+    {
+        for x in (goth_rect_1440[0].max(0)..goth_rect_1440[2].min(1440)).step_by(2) {
+            if shell.map().hit_test([1440, 768], [x, y]) == Some(5) {
+                goth_pt_1440 = Some([x, y]);
+                break 'search;
+            }
+        }
+    }
+    let goth_pt_1440 = goth_pt_1440.expect("hit-testable Goth lot 5 pixel at 1440x768");
+    assert!(shell.hover(goth_pt_1440));
+    assert_eq!(shell.hovered_lot_id(), Some(5));
+    assert!(shell.tick_shell(sims_game::neighborhood::HOVER_CARD_DELAY_US));
+    assert_eq!(
+        shell
+            .neighborhood_state()
+            .hovered_lot
+            .as_ref()
+            .expect("Goth popup visible at 1440x768")
+            .anchor,
+        goth_anchor_1440
+    );
+
+    shell.resize([1024, 860]);
+    let goth_anchor_1024 = {
+        let [ox, oy] = shell.map().map_origin_for([1024, 860]);
+        let lot = shell.map().lot(5).expect("Goth lot 5");
+        [ox + lot.anchor[0], oy + lot.anchor[1]]
+    };
+    assert_eq!(
+        shell
+            .neighborhood_state()
+            .hovered_lot
+            .as_ref()
+            .expect("Goth popup still visible after resize")
+            .anchor,
+        goth_anchor_1024,
+        "open lot hover popup anchor must track centered map origin on resize"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

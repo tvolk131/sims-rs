@@ -976,6 +976,43 @@ impl FocusFilter {
     }
 }
 
+/// Default initial logical window size (`1024×768`).
+const INITIAL_WINDOW_SIZE: [u32; 2] = [1024, 768];
+
+/// Minimum logical window size (`800×600`), matching The Sims 1's smallest
+/// native resolution so the neighborhood map and top bar never crush below
+/// native dimensions.
+const MIN_WINDOW_SIZE: [u32; 2] = [800, 600];
+
+/// Builds the desktop window attributes with initial `1024×768` size and a
+/// `800×600` minimum logical inner size.
+fn window_attributes() -> winit::window::WindowAttributes {
+    Window::default_attributes()
+        .with_title("sims-game")
+        .with_inner_size(LogicalSize::new(
+            f64::from(INITIAL_WINDOW_SIZE[0]),
+            f64::from(INITIAL_WINDOW_SIZE[1]),
+        ))
+        .with_min_inner_size(LogicalSize::new(
+            f64::from(MIN_WINDOW_SIZE[0]),
+            f64::from(MIN_WINDOW_SIZE[1]),
+        ))
+}
+
+/// Converts a display `scale_factor` into an integer pixel-doubling scale.
+///
+/// Uses floor (with a tiny epsilon for floating-point noise like `1.99999`)
+/// rather than round so fractional HiDPI scales (e.g. `1.5×` or `1.75×`)
+/// never divide an `800×600` logical minimum window down below `800×600`
+/// canvas pixels (`1200 / 2 = 600 < 800`), while keeping integer Retina
+/// scales (`1.0 → 1`, `2.0 → 2`, `3.0 → 3`) exact.
+fn window_scale(scale_factor: f64) -> u32 {
+    if !scale_factor.is_finite() || scale_factor <= 1.0 {
+        return 1;
+    }
+    ((scale_factor + 1e-4).floor().clamp(1.0, 16.0)) as u32
+}
+
 /// The canvas dimensions for a physical client area `size` at `scale`,
 /// matching [`App::redraw`].
 fn canvas_size(size: winit::dpi::PhysicalSize<u32>, scale: u32) -> Option<[i32; 2]> {
@@ -983,10 +1020,19 @@ fn canvas_size(size: winit::dpi::PhysicalSize<u32>, scale: u32) -> Option<[i32; 
         return None;
     }
     let scale = scale.max(1);
-    Some(
-        [size.width / scale, size.height / scale]
-            .map(|n| i32::try_from(n).unwrap_or(i32::MAX).max(1)),
-    )
+    let snap_min = |phys: u32, min_logical: u32| -> i32 {
+        let floored = phys / scale;
+        let dim = if scale > 1 && floored < min_logical && phys.div_ceil(scale) == min_logical {
+            min_logical
+        } else {
+            floored
+        };
+        i32::try_from(dim).unwrap_or(i32::MAX).max(1)
+    };
+    Some([
+        snap_min(size.width, MIN_WINDOW_SIZE[0]),
+        snap_min(size.height, MIN_WINDOW_SIZE[1]),
+    ])
 }
 
 /// Maps a physical pointer `position` inside `size` at `scale` to its
@@ -2204,9 +2250,7 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attributes = Window::default_attributes()
-            .with_title("sims-game")
-            .with_inner_size(LogicalSize::new(1024.0, 768.0));
+        let attributes = window_attributes();
         let window = match event_loop.create_window(attributes) {
             Ok(w) => Rc::new(w),
             Err(e) => {
@@ -2228,8 +2272,7 @@ impl ApplicationHandler for App {
                 return;
             }
         }
-        self.scale
-            .set(window.scale_factor().round().max(1.0) as u32);
+        self.scale.set(window_scale(window.scale_factor()));
         self.window = Some(window.clone());
         self.attach_loading_presenter();
         self.refresh_monitor_rate();
@@ -2307,7 +2350,7 @@ impl ApplicationHandler for App {
                 self.changed(true, true);
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.scale.set(scale_factor.round().max(1.0) as u32);
+                self.scale.set(window_scale(scale_factor));
                 self.surface_size.set(None);
                 self.refresh_monitor_rate();
                 if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
@@ -4181,6 +4224,58 @@ mod tests {
                 None,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn window_attributes_enforces_800x600_min_size_and_hidpi_scale_floor() {
+        assert_eq!(MIN_WINDOW_SIZE, [800, 600]);
+        assert_eq!(INITIAL_WINDOW_SIZE, [1024, 768]);
+
+        let attrs = window_attributes();
+        assert_eq!(
+            attrs.inner_size,
+            Some(winit::dpi::Size::Logical(LogicalSize::new(1024.0, 768.0)))
+        );
+        assert_eq!(
+            attrs.min_inner_size,
+            Some(winit::dpi::Size::Logical(LogicalSize::new(800.0, 600.0)))
+        );
+
+        assert_eq!(window_scale(1.0), 1);
+        assert_eq!(window_scale(1.25), 1);
+        assert_eq!(window_scale(1.5), 1);
+        assert_eq!(window_scale(1.75), 1);
+        assert_eq!(window_scale(1.99999), 2);
+        assert_eq!(window_scale(2.0), 2);
+        assert_eq!(window_scale(2.5), 2);
+        assert_eq!(window_scale(3.0), 3);
+        assert_eq!(window_scale(0.0), 1);
+        assert_eq!(window_scale(-2.0), 1);
+        assert_eq!(window_scale(f64::NAN), 1);
+
+        // Odd physical rounding right at the 800×600 logical minimum on Retina/HiDPI
+        // never drops the canvas below 800×600, while non-boundary odd sizes keep
+        // their existing floor behavior.
+        assert_eq!(
+            canvas_size(PhysicalSize::new(1600, 1200), 2),
+            Some([800, 600])
+        );
+        assert_eq!(
+            canvas_size(PhysicalSize::new(1599, 1199), 2),
+            Some([800, 600])
+        );
+        assert_eq!(
+            canvas_size(PhysicalSize::new(1598, 1198), 2),
+            Some([799, 599])
+        );
+        assert_eq!(
+            canvas_size(PhysicalSize::new(2399, 1799), 3),
+            Some([800, 600])
+        );
+        assert_eq!(
+            canvas_size(PhysicalSize::new(1200, 900), window_scale(1.5)),
+            Some([1200, 900])
         );
     }
 }

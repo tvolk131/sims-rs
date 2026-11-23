@@ -490,3 +490,85 @@ fn install_neighborhood_art_strings_and_rendering() {
         "hovering SelectFamily should draw tooltip box, got {tooltip_cream}"
     );
 }
+
+#[test]
+fn non_native_wide_tall_and_compact_chrome_alignment_and_round_buttons() {
+    let art = Art::default();
+    let strings = synthetic_strings();
+    let state = NeighborhoodState::default();
+
+    for (w, h) in [
+        (800u32, 800u32),
+        (920, 680),
+        (1024, 860),
+        (1440, 768),
+        (1920, 1080),
+    ] {
+        let layout = BarLayout::compute(w, h, &state, &art);
+        let ox = (w as i32 - 800) / 2;
+        let oy = (h as i32 - 600) / 2;
+        assert_eq!(layout.bar_rect, Rect::new(ox, 0, 800, BAR_HEIGHT));
+        let credits = layout.button(BarButton::Credits).expect("credits button");
+        assert_eq!(credits.draw_rect.x, ox + 195);
+        assert_eq!(credits.draw_rect.y, oy + 540);
+
+        // Lot hover popup anchored near the centered map stays in-bounds and below top bar.
+        let lot = LotInfo {
+            lot_number: 5,
+            kind: LotKind::Residential,
+            anchor: [ox + 400, oy + 300],
+            ..Default::default()
+        };
+        let popup = LotPopupLayout::compute(&lot, &state, [w, h], &art, &strings);
+        assert!(popup.rect.x >= 0 && popup.rect.x + popup.rect.width <= w as i32);
+        assert!(popup.rect.y >= BAR_HEIGHT && popup.rect.y + popup.rect.height <= h as i32);
+    }
+
+    // Defensive compact `< 800` layout preserves circular button aspect ratio
+    // rather than stretching sprites into tall thin vertical slivers.
+    let mut compact_art = Art::default();
+    let cell_w = 53u32;
+    let cell_h = 52u32;
+    let mut strip = vec![0u8; (cell_w * 4 * cell_h * 4) as usize];
+    for y in 0..cell_h {
+        for x in 0..cell_w {
+            let idx = ((y * (cell_w * 4) + x) * 4) as usize;
+            strip[idx..idx + 4].copy_from_slice(&[240, 180, 40, 255]);
+        }
+    }
+    compact_art.insert(
+        art_id::SELECT_FAMILY,
+        Image {
+            width: cell_w * 4,
+            height: cell_h,
+            rgba: strip,
+        },
+    );
+
+    let chrome = NeighborhoodChrome::new();
+    let mut frame = Frame::new(400, 480, [0, 0, 0]);
+    let layout = chrome.draw(&mut frame, &state, &compact_art, &strings);
+    let sel = layout
+        .button(BarButton::SelectFamily)
+        .expect("select family button in compact layout");
+    assert!(sel.draw_rect.width <= 34);
+    assert_eq!(sel.draw_rect.height, BAR_HEIGHT);
+    // Measure painted vertical span of SelectFamily: should match its narrow width
+    // (preserving ~1:1 circular aspect ratio) rather than filling all 52 px vertically.
+    let mut min_y = i32::MAX;
+    let mut max_y = i32::MIN;
+    for y in 0..BAR_HEIGHT {
+        for x in sel.draw_rect.x..(sel.draw_rect.x + sel.draw_rect.width) {
+            if frame.pixel(x, y) == Some([240, 180, 40]) {
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    let painted_h = max_y - min_y + 1;
+    assert!(
+        (painted_h - sel.draw_rect.width).abs() <= 2,
+        "compact button should keep 1:1 aspect ratio: width={}, painted_h={painted_h}",
+        sel.draw_rect.width
+    );
+}
