@@ -1388,14 +1388,11 @@ fn a_phone_book_preview_takes_keys_before_a_text_entry_behind_it() {
     assert_eq!(game.dialog_entry(), Some("ab"));
 
     let world = game.lot().world().clone();
-    let neighbor = world
-        .neighbors
-        .slots
-        .iter()
-        .flatten()
-        .find(|r| r.id > 0)
-        .expect("a neighbor")
-        .id;
+    // A caller missing from the world has no relationships, so the book is
+    // empty no matter what the saved neighborhood holds.
+    let neighbor = (1..=i16::MAX)
+        .find(|id| !world.neighbors.slots.iter().flatten().any(|r| r.id == *id))
+        .expect("a free neighbor id");
     let preview = |game: &mut Game| {
         game.preview_special_panel(
             sims_vm::SpecialPanelRequest::CallNeighbor {

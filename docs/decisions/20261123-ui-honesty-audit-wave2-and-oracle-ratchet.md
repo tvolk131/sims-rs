@@ -228,6 +228,18 @@ pixels. All four are fixed:
     no kind 3 prompt. So the test uses the Save Card's
     `cTSWinTextEdit2`, which takes the same desktop path.
 
+A third re-check of `0cc14d3e` found one P2 and one P3, both fixed:
+
+- **P2: closing the F8 shop could still run a lot check.** `close_shop`
+  now clears the lot pointer too. It does this every time, because Escape
+  and the Cancel button close the dialog before the Cancel command arrives.
+  The shop test now goes on through Escape and two redraws, checking that
+  nothing is listed and the hash is unchanged. It then checks that a fresh
+  hover lists again. Without the fix, the test fails at the redraw.
+- **P3: the keyboard test's empty phone book is now deterministic.** The
+  caller is a neighbor id that isn't in the world, so the book is empty
+  whatever the saved neighborhood holds.
+
 ## Unverified assumptions
 
 - Wardrobe modes 1–5 categories, and the item order for kind 14.

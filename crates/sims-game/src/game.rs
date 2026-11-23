@@ -9209,6 +9209,13 @@ impl Game {
 
     /// Closes the open [`ShopPickerDialog`].
     pub fn close_shop(&mut self) {
+        // The pointer last moved over the shop, not the lot: listing resumes
+        // only on fresh pointer input, so closing never runs a lot check.
+        // Unconditional: Escape and the Cancel button close the dialog
+        // before the Cancel command reaches here.
+        self.pointer = None;
+        self.reached = None;
+        self.listed = None;
         self.shop_dialog.close();
         self.shop_snapshot = None;
         self.shop_preview_yaw_deg = 0;

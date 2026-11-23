@@ -485,6 +485,26 @@ fn the_community_shop_blocks_listing_behind_it() {
         before,
         "hovering behind the shop"
     );
+    // Escape closes the shop with the pointer still over the target; the
+    // redraws after it must not list (and run checks under) that pointer.
+    let _ = game.dialog_confirm_key(DialogKey::Escape);
+    assert!(!game.shop_open(), "Escape closes the shop");
+    game.render();
+    game.render();
+    assert_eq!(game.listed(), None, "closing the shop lists nothing");
+    assert_eq!(
+        game.lot().world().hash_hex(),
+        before,
+        "closing the shop runs no lot check"
+    );
+    game.hover(target);
+    game.render();
+    assert!(game.listed().is_some(), "fresh pointer input lists again");
+    assert_ne!(
+        game.lot().world().hash_hex(),
+        before,
+        "the target's checks run once the shop is gone"
+    );
 }
 
 #[test]
