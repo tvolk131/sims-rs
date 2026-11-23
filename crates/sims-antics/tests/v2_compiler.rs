@@ -541,6 +541,114 @@ tree 4097 "SimMain" (args: 1) {
         sounds.into_inner()
     }
 
+    fn run_interaction_with_dialog(&mut self, target_id: u16, label: &str, answer_status: u8) {
+        let vm = Interpreter::new(&self.program, &self.catalog, Stream::Lot);
+        let entries = vm
+            .pie_menu(&mut self.world, self.sim_id, target_id)
+            .expect("pie_menu");
+        let guid = self.world.objects[&target_id].guid;
+        let names = self.ttas_by_guid.get(&guid);
+        let chosen = entries
+            .into_iter()
+            .find(|e| {
+                let ename = e.name.clone().unwrap_or_else(|| {
+                    names
+                        .and_then(|v| v.get(e.action.table_index as usize))
+                        .cloned()
+                        .unwrap_or_default()
+                });
+                ename == label
+            })
+            .unwrap_or_else(|| panic!("interaction '{label}' not offered on object {target_id}"));
+        let uid = vm
+            .pick(&mut self.world, self.sim_id, chosen.action)
+            .expect("pick")
+            .expect("queue accepted");
+        assert!(uid > 0);
+        let mut saw_started = false;
+        for _ in 0..80 {
+            self.world.objects.get_mut(&self.sim_id).unwrap().data[25] = 1;
+            let status = vm
+                .turn(&mut self.world, self.sim_id, 4_000)
+                .expect("VM trap during dialog interaction");
+            if let Some(rec) = self
+                .world
+                .dialogs
+                .records
+                .iter_mut()
+                .rev()
+                .find(|r| r.caller == self.sim_id && r.status != DIALOG_DONE)
+            {
+                rec.status = answer_status;
+            }
+            let depth = self.world.objects[&self.sim_id].stack.len();
+            if depth > 1 {
+                saw_started = true;
+            } else if saw_started {
+                break;
+            } else if matches!(status, Status::Yielded) {
+                let person = self.world.objects[&self.sim_id].person.as_ref().unwrap();
+                if person.queue.is_empty() && (person.active.uid == uid || person.last.uid == uid) {
+                    break;
+                }
+            }
+        }
+        if let Some(person) = self
+            .world
+            .objects
+            .get_mut(&self.sim_id)
+            .unwrap()
+            .person
+            .as_mut()
+        {
+            person.active.uid = 0;
+            person.active.flags = 0;
+            person.data[33] = 0;
+            person.object_uses.clear();
+        }
+        self.world
+            .dialogs
+            .records
+            .retain(|r| r.status != DIALOG_DONE);
+    }
+
+    fn eval_guard_tree(&mut self, target_id: u16, tree: u16, param0: i16) -> bool {
+        let sim_id = self.sim_id;
+        let target_guid = self.world.objects[&target_id].guid;
+        let code_owner_type = self
+            .world
+            .types
+            .iter()
+            .find_map(|(&ty_id, &guid)| (guid == target_guid).then_some(ty_id as i16))
+            .expect("target object type registered");
+        let saved_stack = self.world.objects[&sim_id].stack.clone();
+        let saved_storage = self.world.frame_storage.remove(&sim_id);
+        self.world.objects.get_mut(&sim_id).unwrap().stack = vec![Frame {
+            stack_object: target_id as i16,
+            tree,
+            node: 0,
+            parameters: vec![param0, 0, 0, 0],
+            locals: vec![0; 16],
+            primitive_state: 0,
+            code_owner_type,
+        }];
+        let vm = Interpreter::new(&self.program, &self.catalog, Stream::Lot);
+        let status = vm
+            .turn(&mut self.world, sim_id, 4_000)
+            .expect("guard tree must not trap");
+        assert!(
+            matches!(status, Status::Returned(_)),
+            "guard tree must return synchronously, got {status:?}"
+        );
+        let res = matches!(status, Status::Returned(true));
+        self.world.objects.get_mut(&sim_id).unwrap().stack = saved_stack;
+        self.world.frame_storage.remove(&sim_id);
+        if let Some(storage) = saved_storage {
+            self.world.frame_storage.insert(sim_id, storage);
+        }
+        res
+    }
+
     fn sim_motive(&self, m: usize) -> f32 {
         self.world.objects[&self.sim_id]
             .person
@@ -3000,6 +3108,11 @@ fn on_disk_open_pack_is_pure_v2_expands_all_20_objects_and_passes_safety() {
                 "migrated open-pack v2 file should not pin raw @id/@guard_id: {}",
                 file.display()
             );
+            assert!(
+                !src.contains("attr[") && !src.contains("data[") && !src.contains("temp["),
+                "migrated open-pack v2 file must not use raw attr[]/data[]/temp[] indexing: {}",
+                file.display()
+            );
         }
     }
 
@@ -4928,4 +5041,1700 @@ object "R2 Default Reader" {
         0,
         "peer.sentinel must remain untouched (stack_obj restored before writing self.result)"
     );
+}
+
+#[test]
+fn tier3_match_dialog_and_auto_interned_strings_in_vm() {
+    let cfg = PackResolverConfig::default();
+    let obj = compile_v2_source(
+        "dialog_match_test.antics",
+        r#"
+object "Dialog Tester" {
+    guid: 0x7F50_0001;
+    state choice: i16 = 0;
+
+    strings 301 "ExistingDialogs" {
+        existing_title = "Dialog Tester",
+    }
+
+    interaction "Three Way" {
+        run(sim) {
+            match dialog(
+                kind: yes_no_cancel,
+                title: "Dialog Tester",
+                message: "Pick an option",
+                buttons: ("Alpha", "Beta", "Gamma"),
+                icon_mode: 1,
+            ) {
+                Button1 => { self.choice = 11; }
+                Button2 => { self.choice = 22; }
+                Button3 => { self.choice = 33; }
+            }
+        }
+    }
+
+    interaction "Two Way" {
+        run(sim) {
+            match dialog(
+                kind: yes_no,
+                title: "Dialog Tester",
+                message: "Confirm action?",
+                buttons: ("Confirm", "Abort"),
+                icon_mode: 1,
+            ) {
+                Yes => { self.choice = 44; }
+                No => { self.choice = 55; }
+            }
+        }
+    }
+}
+"#,
+        &cfg,
+    )
+    .expect("compile dialog tester");
+
+    // Verify STR# 301 preserved explicit entry AND deduplicated "Dialog Tester" across all dialogs!
+    let iff = Iff::parse(obj.iff_bytes.clone()).expect("parse iff");
+    let str301 =
+        StringTable::parse(iff.data(iff.get(b"STR#", 301).expect("STR# 301"))).expect("parse 301");
+    let texts: Vec<&str> = str301.entries.iter().map(|e| e.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        vec![
+            "Dialog Tester",
+            "Pick an option",
+            "Alpha",
+            "Beta",
+            "Gamma",
+            "Confirm action?",
+            "Confirm",
+            "Abort",
+        ],
+        "STR# 301 must preserve explicit entries first and deduplicate repeated inline strings"
+    );
+
+    let report = verify_object_safety(&obj).expect("verify safety");
+    assert!(report.is_ok(), "{:?}", report.violations);
+
+    // Execute all 5 button paths live in sims-vm!
+    let mut vm = V2VmFixture::from_objects(&[&obj], 100);
+    let oid = vm.spawn(0x7F50_0001, 4, 4);
+
+    for (label, answer_status, expected) in [
+        ("Three Way", 2u8, 11i16),
+        ("Three Way", 3u8, 22i16),
+        ("Three Way", 4u8, 33i16),
+        ("Two Way", 2u8, 44i16),
+        ("Two Way", 3u8, 55i16),
+    ] {
+        vm.run_interaction_with_dialog(oid, label, answer_status);
+        assert_eq!(
+            vm.obj_attr(oid, 0),
+            expected,
+            "{label} with dialog answer {answer_status} must set choice={expected}"
+        );
+    }
+}
+
+#[test]
+fn tier3_enums_and_bitflags_with_1_based_bits_and_module_imports_in_vm() {
+    let mut cfg = PackResolverConfig::default();
+    cfg.virtual_modules.insert(
+        "crate::shared::types".to_owned(),
+        r#"
+pub enum Mode {
+    Idle,
+    Active = 5,
+    Done,
+}
+
+pub bitflags Channels {
+    Left = 1,
+    Right = 2,
+    Center = 3,
+    Sub = 8,
+}
+
+pub fn enable_channel(ch: &mut Channels, bit: Channels) {
+    ch.set(bit);
+}
+
+pub fn toggle_channel(ch: &mut Channels, bit: Channels) -> bool {
+    if ch.contains(bit) {
+        ch.clear(bit);
+        return false;
+    }
+    ch.set(bit);
+    return true;
+}
+
+pub fn next_mode(m: Mode) -> Mode {
+    match m {
+        Mode::Idle => { return Mode::Active; }
+        Mode::Active => { return Mode::Done; }
+        _ => { return Mode::Idle; }
+    }
+}
+"#
+        .to_owned(),
+    );
+
+    let src = r#"
+use crate::shared::types::{Mode, Channels, enable_channel, toggle_channel, next_mode};
+
+object "Typed Device" {
+    guid: 0x7F50_0002;
+
+    enum LocalStatus {
+        Ok = 1,
+        Warn = 2,
+    }
+
+    state mode: Mode = Mode::Idle;
+    state channels: Channels = Channels::Left | Channels::Center;
+    state status: LocalStatus = LocalStatus::Ok;
+    state runtime_check: i16 = 0;
+
+    interaction "Exercise Types" {
+        run(sim) {
+            // Advance enum twice: Idle(0) -> Active(5) -> Done(6)
+            self.mode = next_mode(self.mode);
+            if self.mode == Mode::Active {
+                self.mode = next_mode(self.mode);
+            }
+            if self.mode == Mode::Done {
+                self.status = LocalStatus::Warn;
+            }
+
+            // Bitflags 1-based bits: starts with Left(bit1=1) | Center(bit3=4) = 5.
+            // Clear Left (bit1 -> 4), set Sub (bit8=128 -> 132), enable Right via &mut state (bit2=2 -> 134).
+            self.channels.clear(Channels::Left);
+            self.channels.set(Channels::Sub);
+            enable_channel(&mut self.channels, Channels::Right);
+
+            // Toggle on a local `&mut Channels` exercises both set and clear branches cleanly.
+            let mut scratch: Channels = Channels::Center;
+            let first = toggle_channel(&mut scratch, Channels::Right);
+            let second = toggle_channel(&mut scratch, Channels::Right);
+
+            // Runtime mask variable + multi-bit contains / clear!
+            let mask: Channels = Channels::Center | Channels::Sub;
+            if first
+                && !second
+                && self.channels.contains(mask)
+                && self.channels.contains(Channels::Right)
+                && !self.channels.is_empty()
+            {
+                self.runtime_check = 1;
+            }
+        }
+    }
+}
+"#;
+
+    let expanded = sims_antics::v2::expand_v2_source_to_objects("typed_device.antics", src, &cfg)
+        .expect("expand typed_device");
+    let air = &expanded[0].air_source;
+    // Verify single-bit constant flag ops emit compact 1-based SimAntics flag ops!
+    assert!(
+        air.contains("flag_clear 1") && air.contains("flag_set 8") && air.contains("flag_test 2"),
+        "expected compact 1-based flag_set/flag_clear/flag_test in .air:\n{air}"
+    );
+
+    let obj = compile_v2_source("typed_device.antics", src, &cfg).expect("compile typed_device");
+    let report = verify_object_safety(&obj).expect("verify");
+    assert!(report.is_ok(), "{:?}", report.violations);
+
+    let mut vm = V2VmFixture::from_objects(&[&obj], 100);
+    let oid = vm.spawn(0x7F50_0002, 4, 4);
+    // Initial states: mode=0, channels=1|4=5, status=1
+    assert_eq!(vm.obj_attr(oid, 0), 0);
+    assert_eq!(vm.obj_attr(oid, 1), 5);
+    assert_eq!(vm.obj_attr(oid, 2), 1);
+
+    vm.run_interaction(oid, "Exercise Types", None);
+    assert_eq!(vm.obj_attr(oid, 0), 6, "Mode::Done == 6");
+    assert_eq!(
+        vm.obj_attr(oid, 1),
+        (1 << 2) | (1 << 7) | (1 << 1),
+        "Center(4) | Sub(128) | Right(2) == 134"
+    );
+    assert_eq!(vm.obj_attr(oid, 2), 2, "LocalStatus::Warn == 2");
+    assert_eq!(
+        vm.obj_attr(oid, 3),
+        1,
+        "multi-bit .contains(mask) succeeded"
+    );
+}
+
+#[test]
+fn tier3_named_placement_properties_and_typed_cross_object_refs_in_vm() {
+    let mut cfg = PackResolverConfig::default();
+    let widget_src = r#"
+object "Open Widget" {
+    guid: 0x7F50_0010;
+    state charge: i16 = 10;
+    state ready: bool = false;
+
+    init {
+        self.allowed_heights = Height::Floor | Height::Table;
+        self.placement = Placement::Floor | Placement::Terrain;
+    }
+
+    functional prep(boost: i16) -> i16 {
+        score: 40,
+        run(sim) {
+            self.charge += boost;
+            self.ready = true;
+            return self.charge;
+        }
+    }
+}
+"#;
+    cfg.virtual_modules.insert(
+        "crate::objects::open_widget".to_owned(),
+        widget_src.to_owned(),
+    );
+
+    let hub_src = r#"
+use crate::objects::open_widget::OpenWidget;
+
+object "Open Hub" {
+    guid: 0x7F50_0011;
+    state last_charge: i16 = 0;
+    state spawned_id: ObjectId = 0;
+
+    interaction "Orchestrate" {
+        run(sim) {
+            for w in objects_of::<OpenWidget>() {
+                w.charge += 5;
+            }
+            let Some(found) = find_best_object::<OpenWidget>(prep) else {
+                return false;
+            };
+            let Some(total) = found.run_functional(prep, 7) else {
+                return false;
+            };
+            self.last_charge = total;
+
+            let Some(spawned) = create_object::<OpenWidget>(mode: stack_ahead, flags: 0x40) else {
+                return false;
+            };
+            spawned.charge = total;
+            spawned.ready = true;
+            self.spawned_id = spawned;
+        }
+    }
+}
+"#;
+
+    let widget = compile_v2_source("open_widget.antics", widget_src, &cfg).expect("compile widget");
+    let hub = compile_v2_source("open_hub.antics", hub_src, &cfg).expect("compile hub");
+
+    let mut vm = V2VmFixture::from_objects(&[&widget, &hub], 100);
+    let wid = vm.spawn(0x7F50_0010, 3, 4);
+    let hid = vm.spawn(0x7F50_0011, 5, 5);
+
+    // Verify named object-data properties initialized data[4] and data[42]!
+    assert_eq!(
+        vm.world.objects[&wid].data[4], 5,
+        "Height::Floor(1) | Height::Table(4) == 5"
+    );
+    assert_eq!(
+        vm.world.objects[&wid].data[42], 3,
+        "Placement::Floor(1) | Placement::Terrain(2) == 3"
+    );
+
+    vm.run_interaction(hid, "Orchestrate", None);
+    // 10 (init) + 5 (objects_of loop) + 7 (prep boost) = 22!
+    assert_eq!(vm.obj_attr(wid, 0), 22);
+    assert_eq!(vm.obj_attr(wid, 1), 1, "ready == true");
+    assert_eq!(
+        vm.obj_attr(hid, 0),
+        22,
+        "hub.last_charge received typed prep return"
+    );
+
+    let spawned_id = vm.obj_attr(hid, 1) as u16;
+    assert!(spawned_id > 0 && spawned_id != wid);
+    assert_eq!(vm.obj_attr(spawned_id, 0), 22, "spawned.charge == 22");
+    assert_eq!(vm.obj_attr(spawned_id, 1), 1, "spawned.ready == true");
+}
+
+#[test]
+fn tier3_guard_is_autonomous_runtime_vm() {
+    let cfg = PackResolverConfig::default();
+    let src = r#"
+object "Autonomy Gate" {
+    guid: 0x7F50_0020;
+    state occupied: bool = false;
+    state uses: i16 = 0;
+
+    interaction "Smart Nap" {
+        autonomy: 50,
+        lock: self.occupied,
+        guard(sim, is_autonomous) => !is_autonomous || sim.motive.energy < 20,
+        run(sim) {
+            self.uses += 1;
+        }
+    }
+
+    interaction "Manual Only" {
+        autonomy: 50,
+        guard(sim, is_auto) {
+            if is_auto {
+                return false;
+            }
+            return true;
+        }
+        run(sim) {
+            self.uses += 10;
+        }
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects("autonomy_gate.antics", src, &cfg)
+        .expect("expand");
+    assert!(
+        expanded[0].air_source.contains("(args: 1)"),
+        "guard(sim, is_autonomous) must emit (args: 1):\n{}",
+        expanded[0].air_source
+    );
+
+    let obj = compile_v2_source("autonomy_gate.antics", src, &cfg).expect("compile");
+    let iff = Iff::parse(obj.iff_bytes.clone()).expect("parse iff");
+    let ttab = InteractionTable::parse(iff.data(iff.get(b"TTAB", 128).expect("TTAB"))).unwrap();
+    let smart_nap_guard = ttab.interactions[0].test;
+    let manual_only_guard = ttab.interactions[1].test;
+    assert!(smart_nap_guard != 0 && manual_only_guard != 0);
+
+    let mut vm = V2VmFixture::from_objects(&[&obj], 100);
+    let oid = vm.spawn(0x7F50_0020, 4, 4);
+    let sim_id = vm.sim_id;
+
+    // Set energy = 50 (above autonomous threshold of 20).
+    vm.world
+        .objects
+        .get_mut(&sim_id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .motives[MOTIVE_ENERGY] = 50.0;
+
+    // 1. Player pie menu (`param[0] == 0`): BOTH interactions must be offered!
+    let labels = vm.pie_menu_labels(oid);
+    assert_eq!(labels, vec!["Smart Nap", "Manual Only"]);
+
+    // 2. Direct VM guard invocation with autonomous probe `param[0] == 1`:
+    //    - Smart Nap rejected while energy == 50, Manual Only always rejected autonomously!
+    assert!(
+        !vm.eval_guard_tree(oid, smart_nap_guard, 1),
+        "autonomous probe must fail when energy == 50"
+    );
+    assert!(
+        !vm.eval_guard_tree(oid, manual_only_guard, 1),
+        "Manual Only must reject autonomous probe"
+    );
+    assert!(
+        vm.eval_guard_tree(oid, smart_nap_guard, 0),
+        "user probe must pass for Smart Nap"
+    );
+    assert!(
+        vm.eval_guard_tree(oid, manual_only_guard, 0),
+        "user probe must pass for Manual Only"
+    );
+
+    // 3. Lower energy to 10 (< 20): autonomous probe for Smart Nap now passes!
+    vm.world
+        .objects
+        .get_mut(&sim_id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .motives[MOTIVE_ENERGY] = 10.0;
+    assert!(
+        vm.eval_guard_tree(oid, smart_nap_guard, 1),
+        "autonomous probe must pass when energy == 10"
+    );
+
+    // 4. Lock held (`occupied = true`) must reject BOTH user and autonomous probes!
+    vm.world.objects.get_mut(&oid).unwrap().attributes[0] = 1;
+    assert!(!vm.eval_guard_tree(oid, smart_nap_guard, 1));
+    assert!(!vm.eval_guard_tree(oid, smart_nap_guard, 0));
+    assert!(!vm.pie_menu_labels(oid).contains(&"Smart Nap".to_owned()));
+}
+
+#[test]
+fn tier3_lifecycle_hooks_load_reset_cleanup_objf_slots() {
+    let cfg = PackResolverConfig::default();
+    let src = r#"
+template LifecycleBase {
+    state base_loads: i16 = 0;
+
+    load {
+        self.base_loads += 1;
+    }
+}
+
+object "Lifecycle Widget" from LifecycleBase {
+    guid: 0x7F50_0030;
+    state obj_loads: i16 = 0;
+    state resets: i16 = 0;
+    state cleanups: i16 = 0;
+
+    load {
+        self.obj_loads += 10;
+    }
+
+    reset {
+        self.resets += 1;
+    }
+
+    cleanup {
+        self.cleanups += 1;
+    }
+}
+"#;
+    let obj = compile_v2_source("lifecycle_widget.antics", src, &cfg).expect("compile lifecycle");
+    let report = verify_object_safety(&obj).expect("verify");
+    assert!(report.is_ok(), "{:?}", report.violations);
+
+    let iff = Iff::parse(obj.iff_bytes.clone()).expect("parse iff");
+    let objf = ObjectFunctions::parse(iff.data(iff.get(b"OBJf", 128).expect("OBJf"))).unwrap();
+    assert!(objf.entries.len() >= 5, "OBJf must have slots 0..=4");
+    assert!(objf.entries[0].action >= 4096, "OBJf[0] Init");
+    assert!(objf.entries[1].action >= 4096, "OBJf[1] Main");
+    assert!(objf.entries[2].action >= 4096, "OBJf[2] Load");
+    assert!(objf.entries[3].action >= 4096, "OBJf[3] Reset");
+    assert!(objf.entries[4].action >= 4096, "OBJf[4] Cleanup");
+
+    // Execute Load (OBJf[2] via real vm.visit), Reset (OBJf[3] via real vm.reset),
+    // and Cleanup (OBJf[4] via vm.run_tree) live in sims-vm!
+    let mut vm = V2VmFixture::from_objects(&[&obj], 100);
+    let oid = vm.spawn(0x7F50_0030, 4, 4);
+    let interp = Interpreter::new(&vm.program, &vm.catalog, Stream::Lot);
+
+    interp
+        .visit(&mut vm.world, oid, &Default::default())
+        .expect("vm.visit should run OBJf[2] Load");
+    assert_eq!(vm.obj_attr(oid, 0), 1, "template load ran via vm.visit");
+    assert_eq!(vm.obj_attr(oid, 1), 10, "object load ran via vm.visit");
+
+    interp
+        .reset(&mut vm.world, oid, false)
+        .expect("vm.reset should run OBJf[3] Reset");
+    assert_eq!(vm.obj_attr(oid, 2), 1, "reset hook ran via vm.reset");
+
+    assert!(
+        interp
+            .run_tree(&mut vm.world, oid, objf.entries[4].action, 0, &[], 4_000)
+            .unwrap()
+    );
+    assert_eq!(vm.obj_attr(oid, 3), 1, "cleanup hook ran");
+}
+
+#[test]
+fn tier3_compound_arithmetic_compact_lowering_and_aliasing_in_vm() {
+    let cfg = PackResolverConfig::default();
+    let src = r#"
+fn calc_chain(a: i16) -> i16 {
+    return (a * 24) / 5 + 1;
+}
+
+object "Math Lab" {
+    guid: 0x7F50_0040;
+    state out_chain: i16 = 0;
+    state out_self_update: i16 = 10;
+    state out_alias_rhs: i16 = 7;
+    state out_alias_mul: i16 = 4;
+    state out_neg: i16 = 13;
+    state out_nested: i16 = 0;
+    state out_cond: i16 = 0;
+
+    interaction "Compute" {
+        run(sim) {
+            let a: i16 = 10;
+            // Compact in-place chain: zero scratch locals!
+            let chain_let = (a * 24) / 5 + 1;
+            self.out_chain = (a * 24) / 5 + 1;
+
+            // Self-updating chain where target is leftmost operand only: 10*24/5+1 = 49
+            self.out_self_update = (self.out_self_update * 24) / 5 + 1;
+
+            // Aliasing RHS: (10 + 1) + 7 = 18 (must NOT overwrite out_alias_rhs before reading it!)
+            self.out_alias_rhs = (a + 1) + self.out_alias_rhs;
+
+            // Compound aliasing RHS: (4 + 1) * (4 + 2) = 30
+            self.out_alias_mul = (self.out_alias_mul + 1) * (self.out_alias_mul + 2);
+
+            // Unary negation aliasing target: -13
+            self.out_neg = -self.out_neg;
+
+            // Nested binary + bitwise: (10 + 2) * (9 - 4) + ((10 & 6) | (5 ^ 3)) = 12*5 + (2 | 6) = 66
+            let b: i16 = 2;
+            let c: i16 = 9;
+            let d: i16 = 4;
+            self.out_nested = (a + b) * (c - d) + ((a & 6) | (5 ^ 3));
+
+            // Condition + helper return using compound arithmetic
+            if chain_let == 49 && calc_chain(10) == (a * 24) / 5 + 1 {
+                self.out_cond = 1;
+            }
+
+            // Motive assignment must NOT clamp intermediate `* 24` before `/ 5`!
+            // 10 * 24 = 240 (would clamp to 100 if done in-place on motive!), 240 / 5 = 48!
+            sim.motive.energy = (a * 24) / 5;
+        }
+    }
+}
+"#;
+    let expanded =
+        sims_antics::v2::expand_v2_source_to_objects("math_lab.antics", src, &cfg).expect("expand");
+    let air = &expanded[0].air_source;
+    // Verify compact in-place lowering for `let chain_let = (a * 24) / 5 + 1;` and `self.out_chain = (a * 24) / 5 + 1;`!
+    assert!(
+        air.contains("stack.attr[0] := __v_a_0;\n    stack.attr[0] *= 24;\n    stack.attr[0] /= 5;\n    stack.attr[0] += 1;"),
+        "expected zero-scratch in-place chain lowering into stack.attr[0]:\n{air}"
+    );
+    assert!(
+        air.contains("stack.attr[1] *= 24;\n    stack.attr[1] /= 5;\n    stack.attr[1] += 1;"),
+        "expected self-updating chain without redundant self-copy on stack.attr[1]:\n{air}"
+    );
+
+    let obj = compile_v2_source("math_lab.antics", src, &cfg).expect("compile math_lab");
+    let mut vm = V2VmFixture::from_objects(&[&obj], 100);
+    let oid = vm.spawn(0x7F50_0040, 4, 4);
+    vm.run_interaction(oid, "Compute", None);
+
+    assert_eq!(vm.obj_attr(oid, 0), 49, "out_chain");
+    assert_eq!(vm.obj_attr(oid, 1), 49, "out_self_update");
+    assert_eq!(vm.obj_attr(oid, 2), 18, "out_alias_rhs");
+    assert_eq!(vm.obj_attr(oid, 3), 30, "out_alias_mul");
+    assert_eq!(vm.obj_attr(oid, 4), -13, "out_neg");
+    assert_eq!(vm.obj_attr(oid, 5), 66, "out_nested");
+    assert_eq!(vm.obj_attr(oid, 6), 1, "out_cond");
+    assert!(
+        (vm.sim_motive(MOTIVE_ENERGY) - 48.0).abs() < 1e-4,
+        "motive energy must be 48.0 (not prematurely clamped to 100/5=20), got {}",
+        vm.sim_motive(MOTIVE_ENERGY)
+    );
+}
+
+#[test]
+fn tier3_compile_time_error_diagnostics() {
+    let mut cfg = PackResolverConfig::default();
+    cfg.virtual_modules.insert(
+        "crate::objects::peer".to_owned(),
+        r#"
+object "Peer Box" {
+    guid: 0x7F50_0099;
+    state count: i16 = 0;
+}
+"#
+        .to_owned(),
+    );
+
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "mismatched_enum_assign",
+            r#"
+enum A { X = 1 }
+enum B { Y = 1 }
+object "E1" {
+    guid: 0x7F51_0001;
+    state a: A = A::X;
+    interaction "Go" { run(sim) { self.a = B::Y; } }
+}
+"#,
+            "cannot assign",
+        ),
+        (
+            "enum_assign_raw_i16",
+            r#"
+enum A { X = 1 }
+object "E2" {
+    guid: 0x7F51_0002;
+    state a: A = A::X;
+    interaction "Go" { run(sim) { self.a = 1; } }
+}
+"#,
+            "cannot assign",
+        ),
+        (
+            "mismatched_bitflags_set",
+            r#"
+bitflags F1 { A = 1 }
+bitflags F2 { B = 1 }
+object "B1" {
+    guid: 0x7F51_0003;
+    state f: F1 = F1::None;
+    interaction "Go" { run(sim) { self.f.set(F2::B); } }
+}
+"#,
+            "type mismatch",
+        ),
+        (
+            "bitflags_out_of_range_zero",
+            r#"
+bitflags Bad { Zero = 0 }
+object "B2" { guid: 0x7F51_0004; }
+"#,
+            "1..=16",
+        ),
+        (
+            "unknown_cross_object_field",
+            r#"
+use crate::objects::peer::PeerBox;
+object "X1" {
+    guid: 0x7F51_0005;
+    interaction "Go" {
+        run(sim) {
+            for p in objects_of::<PeerBox>() {
+                p.missing_field = 1;
+            }
+        }
+    }
+}
+"#,
+            "no state field 'missing_field'",
+        ),
+        (
+            "invalid_match_dialog_arm_for_yes_no",
+            r#"
+object "D1" {
+    guid: 0x7F51_0006;
+    interaction "Go" {
+        run(sim) {
+            match dialog(kind: yes_no, title: "T", message: "M") {
+                Button1 => {}
+                Button2 => {}
+                Button3 => {}
+            }
+        }
+    }
+}
+"#,
+            "invalid for 2-button 'yes_no'",
+        ),
+        (
+            "non_exhaustive_match_dialog",
+            r#"
+object "D2" {
+    guid: 0x7F51_0007;
+    interaction "Go" {
+        run(sim) {
+            match dialog(kind: yes_no_cancel, title: "T", message: "M") {
+                Button1 => {}
+                Button2 => {}
+            }
+        }
+    }
+}
+"#,
+            "non-exhaustive 'match dialog'",
+        ),
+        (
+            "functional_guard_rejects_is_autonomous",
+            r#"
+object "G1" {
+    guid: 0x7F51_0008;
+    functional prep {
+        guard(sim, is_auto) => !is_auto,
+        run(sim) {}
+    }
+}
+"#,
+            "functional guards do not support",
+        ),
+        (
+            "typed_functional_missing_return",
+            r#"
+object "F1" {
+    guid: 0x7F51_0009;
+    functional prep -> i16 {
+        run(sim) {
+            let x = 1;
+        }
+    }
+}
+"#,
+            "must return a value on all control-flow paths",
+        ),
+    ];
+
+    for (name, src, expected_substr) in cases {
+        let err = compile_v2_source(&format!("{name}.antics"), src, &cfg)
+            .expect_err(&format!("expected compile error for {name}"));
+        assert!(
+            err.message.contains(expected_substr),
+            "case '{name}': expected error containing {expected_substr:?}, got: {}",
+            err.message
+        );
+    }
+}
+
+#[test]
+fn tier3_sol_r1_p0_find_best_object_type_filtering_and_fallback_in_vm() {
+    let mut cfg = PackResolverConfig::default();
+    let typed_counter_src = r#"
+object "Typed Counter" {
+    guid: 0x7F52_0001;
+    state preps: i16 = 0;
+
+    functional prep -> i16 {
+        score: 40,
+        run(sim) {
+            self.preps += 1;
+            return 42;
+        }
+    }
+}
+"#;
+    let foreign_counter_src = r#"
+object "Foreign High Score Counter" {
+    guid: 0x7F52_0002;
+    state foreign_hits: i16 = 0;
+
+    functional prep -> i16 {
+        score: 200,
+        run(sim) {
+            self.foreign_hits += 1;
+            return 999;
+        }
+    }
+}
+"#;
+    cfg.virtual_modules.insert(
+        "crate::objects::typed_counter".to_owned(),
+        typed_counter_src.to_owned(),
+    );
+    let caller_src = r#"
+use crate::objects::typed_counter::TypedCounter;
+
+object "Typed Caller" {
+    guid: 0x7F52_0003;
+    state got_bonus: i16 = 0;
+    state missed: i16 = 0;
+
+    interaction "Use Typed Counter" {
+        run(sim) {
+            let Some(c) = find_best_object::<TypedCounter>(prep) else {
+                self.missed += 1;
+                return false;
+            };
+            let Some(bonus) = c.run_functional(prep) else {
+                return false;
+            };
+            self.got_bonus = bonus;
+        }
+    }
+}
+"#;
+    let typed_counter =
+        compile_v2_source("typed_counter.antics", typed_counter_src, &cfg).expect("compile");
+    let foreign_counter =
+        compile_v2_source("foreign_counter.antics", foreign_counter_src, &cfg).expect("compile");
+    let caller = compile_v2_source("typed_caller.antics", caller_src, &cfg).expect("compile");
+
+    // Case 1: Higher-scoring foreign object (score 200) + lower-scoring TypedCounter (score 40):
+    // find_best_object::<TypedCounter>(prep) MUST ignore the foreign object and still find TypedCounter!
+    let mut vm = V2VmFixture::from_objects(&[&typed_counter, &foreign_counter, &caller], 100);
+    let foreign_id = vm.spawn(0x7F52_0002, 4, 4);
+    let typed_id = vm.spawn(0x7F52_0001, 5, 4);
+    let caller_id = vm.spawn(0x7F52_0003, 6, 4);
+
+    vm.run_interaction(caller_id, "Use Typed Counter", None);
+    assert_eq!(
+        vm.obj_attr(caller_id, 0),
+        42,
+        "must call TypedCounter and get 42, not foreign 999"
+    );
+    assert_eq!(vm.obj_attr(caller_id, 1), 0, "must not miss TypedCounter");
+    assert_eq!(vm.obj_attr(typed_id, 0), 1, "TypedCounter must be invoked");
+    assert_eq!(
+        vm.obj_attr(foreign_id, 0),
+        0,
+        "foreign object must NOT be invoked as TypedCounter"
+    );
+
+    // Case 2: Only foreign object on the lot -> must take the `else` branch cleanly!
+    let mut vm2 = V2VmFixture::from_objects(&[&typed_counter, &foreign_counter, &caller], 100);
+    let foreign2 = vm2.spawn(0x7F52_0002, 4, 4);
+    let caller2 = vm2.spawn(0x7F52_0003, 6, 4);
+    vm2.run_interaction(caller2, "Use Typed Counter", None);
+    assert_eq!(vm2.obj_attr(caller2, 0), 0);
+    assert_eq!(
+        vm2.obj_attr(caller2, 1),
+        1,
+        "must take else branch when only foreign prep object exists"
+    );
+    assert_eq!(vm2.obj_attr(foreign2, 0), 0);
+}
+
+#[test]
+fn tier3_sol_r1_p0_aliasing_fault_safety_and_is_empty_loop_in_vm() {
+    let mut cfg = PackResolverConfig::default();
+    let peer_src = r#"
+pub bitflags Flags {
+    A = 1,
+    B = 2,
+}
+
+object "Flag Peer" {
+    guid: 0x7F52_0010;
+    state flags: Flags = Flags::None;
+}
+"#;
+    cfg.virtual_modules
+        .insert("crate::objects::flag_peer".to_owned(), peer_src.to_owned());
+
+    let host_src = r#"
+use crate::objects::flag_peer::{Flags, FlagPeer};
+
+object "Alias Host" {
+    guid: 0x7F52_0011;
+    state n: i16 = 7;
+    state divisor: i16 = 0;
+
+    fn fill(f: &mut Flags) {
+        while f.is_empty() {
+            f.set(Flags::A);
+        }
+    }
+
+    init {
+        self.prep_score = 7;
+    }
+
+    load {
+        for p in objects_of::<Self>() {
+            self.n = 2 + p.n;
+        }
+    }
+
+    reset {
+        self.n = (10 + 2) / self.divisor;
+    }
+
+    interaction "Test Aliasing And Loop" {
+        run(sim) {
+            // Canonical cell alias: self.prep_score == self.data[31] (7 -> 2 + 7 = 9, NOT 4!)
+            self.prep_score = 2 + self.data[31];
+            // `&mut peer.flags` inside `while f.is_empty()` MUST re-read inside the loop!
+            for peer in objects_of::<FlagPeer>() {
+                fill(&mut peer.flags);
+            }
+        }
+    }
+}
+"#;
+    let peer = compile_v2_source("flag_peer.antics", peer_src, &cfg).expect("compile peer");
+    let host = compile_v2_source("alias_host.antics", host_src, &cfg).expect("compile host");
+
+    let mut vm = V2VmFixture::from_objects(&[&peer, &host], 100);
+    let peer_id = vm.spawn(0x7F52_0010, 4, 4);
+    let host_id = vm.spawn(0x7F52_0011, 5, 4);
+
+    // 1. Trigger `load` (OBJf 2): `self.n = 2 + p.n` when `p == self` must yield 9 (not 4)!
+    {
+        let interp = Interpreter::new(&vm.program, &vm.catalog, Stream::Lot);
+        interp
+            .visit(&mut vm.world, host_id, &Default::default())
+            .expect("load");
+    }
+    assert_eq!(
+        vm.obj_attr(host_id, 0),
+        9,
+        "load self.n = 2 + p.n must not clobber self.n before reading p.n"
+    );
+
+    // 2. Run interaction: `self.prep_score = 2 + self.data[31]` -> 9, and `fill(&mut peer.flags)` terminates!
+    vm.run_interaction(host_id, "Test Aliasing And Loop", None);
+    assert_eq!(
+        vm.world.objects[&host_id].data[31], 9,
+        "self.prep_score = 2 + self.data[31] must equal 9 (not 4)"
+    );
+    assert_eq!(
+        vm.obj_attr(peer_id, 0),
+        1,
+        "while f.is_empty() on &mut peer.flags must terminate with Flags::A set"
+    );
+
+    // 3. Fault atomicity: `self.n = (10 + 2) / self.divisor` with divisor == 0 traps WITHOUT overwriting `self.n` to 12!
+    let interp = Interpreter::new(&vm.program, &vm.catalog, Stream::Lot);
+    let fault = interp.reset(&mut vm.world, host_id, false);
+    assert!(fault.is_err(), "division by zero must fault in VM");
+    assert_eq!(
+        vm.obj_attr(host_id, 0),
+        9,
+        "failed division must NOT leave partial write 12 in self.n"
+    );
+}
+
+#[test]
+fn tier3_sol_r1_p1_dialog_flags_temp_preservation_and_255_cap_in_vm() {
+    let cfg = PackResolverConfig::default();
+    let src = r#"
+object "Dialog Edge" {
+    guid: 0x7F52_0020;
+    state saved_in_arm: i16 = 0;
+    state saved_in_defer: i16 = 0;
+    state flags_dispatch: i16 = 0;
+    state loop_defers: i16 = 0;
+
+    interaction "Implicit Temp0" {
+        run(sim) {
+            temp[0] = 77;
+            defer {
+                self.saved_in_defer = temp[0];
+            }
+            match dialog(
+                kind: yes_no_cancel,
+                title: "Pick",
+                message: "Choose",
+                buttons: ("One", "Two", "Three"),
+            ) {
+                Button1 => { self.saved_in_arm = temp[0]; }
+                Button2 => { self.saved_in_arm = temp[0]; }
+                Button3 => { self.saved_in_arm = temp[0]; }
+            }
+        }
+    }
+
+    interaction "Explicit Flags Temp1" {
+        run(sim) {
+            // flags: 0x10 encodes temp slot 1 in bits 4..6!
+            match dialog(
+                kind: yes_no_cancel,
+                flags: 0x10,
+                title: "Pick",
+                message: "Flags",
+                buttons: ("A", "B", "C"),
+            ) {
+                Button1 => { self.flags_dispatch = 1; }
+                Button2 => { self.flags_dispatch = 2; }
+                Button3 => { self.flags_dispatch = 3; }
+            }
+        }
+    }
+
+    interaction "Loop Defer Break" {
+        run(sim) {
+            repeat 3 {
+                defer { self.loop_defers += 1; }
+                match dialog(
+                    kind: yes_no,
+                    title: "Loop",
+                    message: "Break?",
+                    buttons: ("Stop", "More"),
+                ) {
+                    Yes => { break; }
+                    No => {}
+                }
+            }
+        }
+    }
+}
+"#;
+    let obj = compile_v2_source("dialog_edge.antics", src, &cfg).expect("compile");
+    let mut vm = V2VmFixture::from_objects(&[&obj], 100);
+    let oid = vm.spawn(0x7F52_0020, 4, 4);
+
+    // Implicit 3-way match preserves temp[0] == 77 across ALL 3 answers and inside `defer`!
+    for answer in [2u8, 3u8, 4u8] {
+        vm.run_interaction_with_dialog(oid, "Implicit Temp0", answer);
+        assert_eq!(
+            vm.obj_attr(oid, 0),
+            77,
+            "temp[0] must remain 77 inside arm for answer {answer}"
+        );
+        assert_eq!(
+            vm.obj_attr(oid, 1),
+            77,
+            "temp[0] must remain 77 inside defer for answer {answer}"
+        );
+    }
+
+    // Explicit `flags: 0x10` (temp[1]) dispatches Button2 and Button3 accurately!
+    vm.run_interaction_with_dialog(oid, "Explicit Flags Temp1", 3);
+    assert_eq!(vm.obj_attr(oid, 2), 2);
+    vm.run_interaction_with_dialog(oid, "Explicit Flags Temp1", 4);
+    assert_eq!(vm.obj_attr(oid, 2), 3);
+
+    // `match dialog` arm with `defer` + `break` inside a loop runs defer cleanly and exits after 1 iteration!
+    vm.run_interaction_with_dialog(oid, "Loop Defer Break", 2);
+    assert_eq!(vm.obj_attr(oid, 3), 1);
+
+    // 255 explicit entries (including empty placeholder + numeric ref) succeed; 256th auto-interned fails!
+    let mut s255 = String::from("object \"StrCap\" {\n    guid: 0x7F52_0021;\n    strings 301 {\n");
+    s255.push_str("        s0: \"\",\n");
+    for i in 1..255 {
+        s255.push_str(&format!("        s{i}: \"entry_{i}\",\n"));
+    }
+    s255.push_str("    }\n    interaction \"Ok\" {\n        run(sim) {\n");
+    // Referencing existing text deduplicates cleanly & numeric ref 0 works at 255 entries!
+    s255.push_str("            dialog(kind: ok, title: 0, message: \"entry_1\", inform: true);\n");
+    s255.push_str("        }\n    }\n}\n");
+    compile_v2_source("str255_ok.antics", &s255, &cfg).expect("255 entries + dedup must succeed");
+
+    let s256 = s255.replacen(
+        "message: \"entry_1\"",
+        "message: \"brand_new_256th_string\"",
+        1,
+    );
+    let err =
+        compile_v2_source("str256_fail.antics", &s256, &cfg).expect_err("256th entry must fail");
+    assert!(err.message.contains("255 entries"), "got: {}", err.message);
+}
+
+#[test]
+fn tier3_sol_r1_p1_enums_bit16_shadowing_multitile_and_lifecycle_cancel_in_vm() {
+    let mut cfg = PackResolverConfig::default();
+    cfg.virtual_modules.insert(
+        "crate::shared::mod_types".to_owned(),
+        r#"
+pub enum Mode {
+    Global = 10,
+}
+
+pub enum Sign {
+    Neg = -1,
+    Pos = 1,
+}
+
+pub fn sign_code(s: Sign) -> i16 {
+    // Exhaustive enum match WITHOUT `_` must satisfy all-paths-return analysis!
+    match s {
+        Sign::Neg => { return -10; }
+        Sign::Pos => { return 10; }
+    }
+}
+"#
+        .to_owned(),
+    );
+    let multi_src = r#"
+object "Dual Tile" {
+    guid: 0x7F52_0030;
+    master_id: 1;
+    tiles: [
+        tile { name: "Dual Lead", guid: 0x7F52_0031, objd_id: 129, offset: [0, 0], lead: true },
+        tile { name: "Dual Slave", guid: 0x7F52_0032, objd_id: 130, offset: [1, 0], lead: false },
+    ];
+    state pinged: i16 = 0;
+    state peer: Self;
+}
+"#;
+    cfg.virtual_modules
+        .insert("crate::objects::dual_tile".to_owned(), multi_src.to_owned());
+
+    let test_src = r#"
+use crate::shared::mod_types::{Mode, Sign, sign_code};
+use crate::objects::dual_tile::DualTile;
+
+template OrderedLoadBase {
+    state step: i16 = 0;
+    load {
+        self.step = 10;
+    }
+}
+
+object "Full Coverage" from OrderedLoadBase {
+    guid: 0x7F52_0033;
+
+    // Local bitflags shadows module-level `enum Mode` consistently everywhere!
+    bitflags Mode {
+        Local = 1,
+        Top = 16,
+    }
+
+    state mode: Mode = Mode::None;
+    state sign_val: i16 = 0;
+    state load_saw_base: i16 = 0;
+    state cancel_sim_seen: i16 = 0;
+    state cancel_peer_val: i16 = 0;
+
+    load {
+        // Must observe template `load` having already written `self.step = 10`!
+        self.load_saw_base = self.step + 5;
+    }
+
+    cleanup {
+        // Read foreign object via `objects_of::<DualTile>()` AND verify incoming `stack_obj`
+        // (cancelling Sim ID!) is preserved right after!
+        for bed in objects_of::<DualTile>() {
+            bed.pinged += 1;
+            self.cancel_peer_val = bed.pinged;
+        }
+        raw { my.attr[4] := stack_obj; }
+    }
+
+    interaction "Run All" {
+        run(sim) {
+            let local_m: Mode = Mode::Local | Mode::Top;
+            self.mode.set(Mode::Top);
+            if self.mode.contains(Mode::Top) {
+                self.mode.set(Mode::Local);
+            }
+            if self.mode == local_m {
+                self.mode.clear(Mode::Top);
+            }
+            self.sign_val = sign_code(Sign::Neg);
+            for bed in objects_of::<DualTile>() {
+                bed.pinged += 7;
+            }
+        }
+    }
+
+    interaction "Slow Action" {
+        run(sim) {
+            repeat 5 {
+                sleep(2);
+            }
+        }
+    }
+}
+"#;
+    let multi_obj = compile_v2_source("dual_tile.antics", multi_src, &cfg).expect("compile dual");
+    let full_obj = compile_v2_source("full_cov.antics", test_src, &cfg).expect("compile full");
+
+    let mut vm = V2VmFixture::from_objects(&[&multi_obj, &full_obj], 100);
+    let dual_lead = vm.spawn(0x7F52_0030, 3, 3);
+    let full_id = vm.spawn(0x7F52_0033, 5, 5);
+
+    // 1. `load` template-before-object ordering:
+    {
+        let interp = Interpreter::new(&vm.program, &vm.catalog, Stream::Lot);
+        interp
+            .visit(&mut vm.world, full_id, &Default::default())
+            .expect("load");
+    }
+    assert_eq!(vm.obj_attr(full_id, 0), 10);
+    assert_eq!(
+        vm.obj_attr(full_id, 3),
+        15,
+        "object load must observe template load write (10 + 5 = 15)"
+    );
+
+    // 2. Bit-16 (`i16::MIN` / `-32768`), local shadowing of module `enum Mode`, exhaustive enum match,
+    //    and `objects_of::<DualTile>()` hitting the spawned lead tile!
+    vm.run_interaction(full_id, "Run All", None);
+    assert_eq!(vm.obj_attr(full_id, 1), 1, "Top cleared, Local(1) remains");
+    assert_eq!(vm.obj_attr(full_id, 2), -10, "sign_code(Sign::Neg) == -10");
+    assert_eq!(
+        vm.obj_attr(dual_lead, 0),
+        7,
+        "objects_of::<DualTile>() must find spawned lead tile"
+    );
+
+    // 3. Real VM queued-action cancellation (`pick` then `cancel`) drives OBJf slot 4 (`cleanup`)
+    //    with the cancelling Sim ID in `stack_obj`, and `cleanup` preserves `stack_obj` across
+    //    `objects_of::<DualTile>()`!
+    {
+        let interp = Interpreter::new(&vm.program, &vm.catalog, Stream::Lot);
+        let entries = interp
+            .pie_menu(&mut vm.world, vm.sim_id, full_id)
+            .expect("pie_menu");
+        let slow = entries
+            .into_iter()
+            .find(|e| e.action.table_index == 1)
+            .expect("Slow Action menu entry");
+        let uid = interp
+            .pick(&mut vm.world, vm.sim_id, slow.action)
+            .expect("pick")
+            .expect("queued");
+        assert!(
+            interp
+                .cancel(&mut vm.world, vm.sim_id, uid)
+                .expect("cancel"),
+            "cancelling queued action must return true and invoke OBJf[4] Cleanup"
+        );
+    }
+    assert_eq!(
+        vm.obj_attr(full_id, 4),
+        vm.sim_id as i16,
+        "cleanup must preserve cancelling Sim ID in stack_obj after foreign object access"
+    );
+    assert_eq!(
+        vm.obj_attr(full_id, 5),
+        8,
+        "cleanup must have incremented DualTile.pinged from 7 -> 8"
+    );
+}
+
+#[test]
+fn tier3_sol_r1_diagnostics_p0_p1_p2() {
+    let mut cfg = PackResolverConfig::default();
+    cfg.virtual_modules.insert(
+        "crate::objects::widget".to_owned(),
+        r#"
+object "Widget" {
+    guid: 0x7F52_0040;
+    state x: i16 = 0;
+    functional prep -> i16 { run(sim) { return 1; } }
+}
+"#
+        .to_owned(),
+    );
+    cfg.virtual_modules.insert(
+        "crate::objects::cyc_a".to_owned(),
+        r#"
+use crate::objects::cyc_b::CycB;
+object "CycA" { guid: 0x7F52_0041; state b: CycB = 0; }
+"#
+        .to_owned(),
+    );
+    cfg.virtual_modules.insert(
+        "crate::objects::cyc_b".to_owned(),
+        r#"
+use crate::objects::cyc_a::CycA;
+object "CycB" { guid: 0x7F52_0042; state a: CycA = 0; }
+"#
+        .to_owned(),
+    );
+
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "create_object_typed_from_record_rejected",
+            r#"
+use crate::objects::widget::Widget;
+object "T1" {
+    guid: 0x7F52_0050;
+    interaction "Go" {
+        run(sim) {
+            let Some(w) = create_object::<Widget>(flags: 0x04) else { return false; };
+            w.x = 1;
+        }
+    }
+}
+"#,
+            "FROM_RECORD",
+        ),
+        (
+            "untyped_run_functional_nominal_rejected",
+            r#"
+use crate::objects::widget::Widget;
+object "T2" {
+    guid: 0x7F52_0051;
+    state raw_id: ObjectId = 0;
+    interaction "Go" {
+        run(sim) {
+            let Some(w) = self.raw_id.run_functional::<Widget>(prep) else { return false; };
+            w.x = 1;
+        }
+    }
+}
+"#,
+            "cannot safely manufacture nominal type",
+        ),
+        (
+            "match_dialog_raw_inform_flag_rejected",
+            r#"
+object "T3" {
+    guid: 0x7F52_0052;
+    interaction "Go" {
+        run(sim) {
+            match dialog(kind: yes_no, flags: 1, title: "T", message: "M") {
+                Yes => {}
+                No => {}
+            }
+        }
+    }
+}
+"#,
+            "inform bit",
+        ),
+        (
+            "dialog_buttons_arity_mismatch_rejected",
+            r#"
+object "T4" {
+    guid: 0x7F52_0053;
+    interaction "Go" {
+        run(sim) {
+            dialog(kind: yes_no, title: "T", message: "M", buttons: ("A", "B", "C"));
+        }
+    }
+}
+"#,
+            "requires exactly 2",
+        ),
+        (
+            "match_dialog_arm_after_wildcard_rejected",
+            r#"
+object "T5" {
+    guid: 0x7F52_0054;
+    interaction "Go" {
+        run(sim) {
+            match dialog(kind: yes_no, title: "T", message: "M") {
+                _ => {}
+                Yes => {}
+            }
+        }
+    }
+}
+"#,
+            "unreachable arm after '_'",
+        ),
+        (
+            "enum_state_missing_init_without_zero_rejected",
+            r#"
+object "T6" {
+    guid: 0x7F52_0055;
+    enum NonZero { A = -1, B = 1 }
+    state e: NonZero;
+}
+"#,
+            "requires an explicit initializer",
+        ),
+        (
+            "enum_match_non_exhaustive_rejected",
+            r#"
+object "T7" {
+    guid: 0x7F52_0056;
+    enum NonZero { A = -1, B = 1 }
+    state e: NonZero = NonZero::A;
+    interaction "Go" {
+        run(sim) {
+            match self.e {
+                NonZero::A => {}
+            }
+        }
+    }
+}
+"#,
+            "non-exhaustive match on enum",
+        ),
+        (
+            "duplicate_enum_discriminant_rejected",
+            r#"
+object "T8" {
+    guid: 0x7F52_0057;
+    enum Dup { A = 1, B = 1 }
+}
+"#,
+            "duplicate discriminant value 1",
+        ),
+        (
+            "duplicate_bitflag_bit_rejected",
+            r#"
+object "T9" {
+    guid: 0x7F52_0058;
+    bitflags Dup { A = 16, B = 16 }
+}
+"#,
+            "duplicate bit index 16",
+        ),
+        (
+            "reserved_builtin_height_rejected",
+            r#"
+object "T10" {
+    guid: 0x7F52_0059;
+    bitflags Height { Custom = 1 }
+}
+"#,
+            "reserved built-in type name",
+        ),
+        (
+            "enum_autoincrement_overflow_rejected",
+            r#"
+object "T11" {
+    guid: 0x7F52_005A;
+    enum Over { Max = 32767, Boom }
+}
+"#,
+            "overflows i16",
+        ),
+        (
+            "mutual_object_import_cycle_rejected",
+            r#"
+use crate::objects::cyc_a::CycA;
+object "T12" {
+    guid: 0x7F52_005B;
+    state a: CycA = 0;
+}
+"#,
+            "cyclic",
+        ),
+    ];
+
+    for (name, src, expected_substr) in cases {
+        let err = compile_v2_source(&format!("{name}.antics"), src, &cfg)
+            .expect_err(&format!("expected compile error for {name}"));
+        assert!(
+            err.message
+                .to_lowercase()
+                .contains(&expected_substr.to_lowercase()),
+            "case '{name}': expected error containing {expected_substr:?}, got: {}",
+            err.message
+        );
+    }
+}
+
+#[test]
+fn tier3_sol_r2_regressions() {
+    let mut cfg = PackResolverConfig::default();
+
+    // 1. P1-1: Guard-rejected (`occupied = true`) and zero-score `TypedCounter` MUST NOT be bound
+    //    by `find_best_object::<TypedCounter>(prep)` fallback when a foreign higher-scoring counter wins!
+    let guarded_counter_src = r#"
+object "Guarded Counter" {
+    guid: 0x7F53_0001;
+    state occupied: bool = false;
+    state hits: i16 = 0;
+
+    functional prep -> i16 {
+        score: 40,
+        guard(sim) => !self.occupied,
+        run(sim) {
+            self.hits += 1;
+            return 55;
+        }
+    }
+}
+"#;
+    let foreign_src = r#"
+object "Foreign Counter R2" {
+    guid: 0x7F53_0002;
+    functional prep -> i16 {
+        score: 200,
+        run(sim) { return 999; }
+    }
+}
+"#;
+    cfg.virtual_modules.insert(
+        "crate::objects::guarded_counter".to_owned(),
+        guarded_counter_src.to_owned(),
+    );
+    let caller_src = r#"
+use crate::objects::guarded_counter::GuardedCounter;
+
+object "Guarded Caller" {
+    guid: 0x7F53_0003;
+    state bonus: i16 = 0;
+    state missed: i16 = 0;
+
+    interaction "Find Guarded" {
+        run(sim) {
+            let Some(c) = find_best_object::<GuardedCounter>(prep) else {
+                self.missed += 1;
+                return false;
+            };
+            let Some(b) = c.run_functional(prep) else { return false; };
+            self.bonus = b;
+        }
+    }
+}
+"#;
+    let gc = compile_v2_source("guarded_counter.antics", guarded_counter_src, &cfg).unwrap();
+    let fc = compile_v2_source("foreign_r2.antics", foreign_src, &cfg).unwrap();
+    let caller = compile_v2_source("guarded_caller.antics", caller_src, &cfg).unwrap();
+
+    let mut vm = V2VmFixture::from_objects(&[&gc, &fc, &caller], 100);
+    let _foreign_id = vm.spawn(0x7F53_0002, 4, 4);
+    let gc_id = vm.spawn(0x7F53_0001, 5, 4);
+    let caller_id = vm.spawn(0x7F53_0003, 6, 4);
+
+    // Mark GuardedCounter occupied: fallback MUST skip it and take `else`!
+    vm.world.objects.get_mut(&gc_id).unwrap().attributes[0] = 1;
+    vm.run_interaction(caller_id, "Find Guarded", None);
+    assert_eq!(
+        vm.obj_attr(caller_id, 1),
+        1,
+        "occupied GuardedCounter must be rejected by fallback"
+    );
+    assert_eq!(vm.obj_attr(gc_id, 1), 0);
+
+    // Unoccupy it but set prep_score == 0: fallback MUST also skip zero-score candidates!
+    vm.world.objects.get_mut(&gc_id).unwrap().attributes[0] = 0;
+    vm.world.objects.get_mut(&gc_id).unwrap().data[31] = 0;
+    vm.run_interaction(caller_id, "Find Guarded", None);
+    assert_eq!(
+        vm.obj_attr(caller_id, 1),
+        2,
+        "zero-score GuardedCounter must be rejected by fallback"
+    );
+
+    // Restore positive score -> now fallback cleanly binds GuardedCounter!
+    vm.world.objects.get_mut(&gc_id).unwrap().data[31] = 40;
+    vm.run_interaction(caller_id, "Find Guarded", None);
+    assert_eq!(vm.obj_attr(caller_id, 0), 55);
+    assert_eq!(vm.obj_attr(gc_id, 1), 1);
+
+    // 2. P1-2: Multi-tile implicit lead selection picks (0, 0) origin tile even when listed second!
+    let rev_multi_src = r#"
+object "Reversed Multi" {
+    guid: 0x7F53_0010;
+    master_id: 1;
+    tiles: [
+        tile { name: "Slave First", guid: 0x7F53_0011, objd_id: 129, offset: [1, 0] },
+        tile { name: "Origin Second", guid: 0x7F53_0012, objd_id: 130, offset: [0, 0] },
+    ];
+    state pinged: i16 = 0;
+}
+"#;
+    cfg.virtual_modules.insert(
+        "crate::objects::reversed_multi".to_owned(),
+        rev_multi_src.to_owned(),
+    );
+    let pinger_src = r#"
+use crate::objects::reversed_multi::ReversedMulti;
+
+object "Origin Pinger" {
+    guid: 0x7F53_0013;
+    interaction "Ping" {
+        run(sim) {
+            for m in objects_of::<ReversedMulti>() {
+                m.pinged += 1;
+            }
+        }
+    }
+}
+"#;
+    let pinger_exp =
+        sims_antics::v2::expand_v2_source_to_objects("pinger.antics", pinger_src, &cfg).unwrap();
+    assert!(
+        pinger_exp[0].air_source.contains("0x7f530012"),
+        "objects_of::<ReversedMulti>() must enumerate origin tile 0x7f530012, not first-listed slave:\n{}",
+        pinger_exp[0].air_source
+    );
+
+    // 3. P1-3: Side-effecting object data (`self.data[1]` facing) stages through scratch local!
+    let facing_src = r#"
+object "Safe Data Write" {
+    guid: 0x7F53_0020;
+    interaction "Set Facing" {
+        run(sim) {
+            self.data[1] = 2 + 2 - 3;
+        }
+    }
+}
+"#;
+    let facing_exp =
+        sims_antics::v2::expand_v2_source_to_objects("facing.antics", facing_src, &cfg).unwrap();
+    assert!(
+        !facing_exp[0].air_source.contains("stack.data[1] := 2;"),
+        "self.data[1] compound arithmetic must stage in scratch local before writing facing:\n{}",
+        facing_exp[0].air_source
+    );
+
+    // 4. P2-2: Module helper using `objects_of::<GuardedCounter>()` ignores caller-local `enum GuardedCounter`!
+    cfg.virtual_modules.insert(
+        "crate::shared::counter_util".to_owned(),
+        r#"
+use crate::objects::guarded_counter::GuardedCounter;
+
+pub fn count_all() -> i16 {
+    let mut n: i16 = 0;
+    for c in objects_of::<GuardedCounter>() {
+        n += 1;
+    }
+    return n;
+}
+"#
+        .to_owned(),
+    );
+    let shadow_caller_src = r#"
+use crate::shared::counter_util::count_all;
+
+object "Shadow Caller" {
+    guid: 0x7F53_0021;
+    enum GuardedCounter { LocalOnly = 1 }
+    state total: i16 = 0;
+    interaction "Count" {
+        run(sim) {
+            self.total = count_all();
+        }
+    }
+}
+"#;
+    compile_v2_source("shadow_caller.antics", shadow_caller_src, &cfg)
+        .expect("module helper objects_of::<T> must ignore caller-local enum with same name");
+
+    // 5. P2-1, P2-3, P2-4 diagnostics:
+    cfg.virtual_modules.insert(
+        "crate::shared::some_enum".to_owned(),
+        "pub enum SomeMode { A = 0 }\n".to_owned(),
+    );
+    let diag_cases: &[(&str, &str, &str)] = &[
+        (
+            "run_functional_generic_checked_before_annotation",
+            r#"
+use crate::objects::guarded_counter::GuardedCounter;
+object "D1" {
+    guid: 0x7F53_0030;
+    interaction "Go" {
+        run(sim) {
+            let Some(c) = find_best_object::<GuardedCounter>(prep) else { return false; };
+            let Some(x: i16) = c.run_functional::<bool>(prep) else { return false; };
+            let y = x;
+        }
+    }
+}
+"#,
+            "run_functional::<bool> does not match",
+        ),
+        (
+            "import_alias_reserved_builtin_rejected",
+            r#"
+use crate::shared::some_enum::SomeMode as Height;
+object "D2" { guid: 0x7F53_0031; }
+"#,
+            "reserved built-in type name",
+        ),
+        (
+            "object_named_self_rejected",
+            r#"
+object "Self" { guid: 0x7F53_0032; }
+"#,
+            "reserved built-in type name",
+        ),
+        (
+            "enum_named_object_rejected",
+            r#"
+object "D3" {
+    guid: 0x7F53_0033;
+    enum Object { A = 0 }
+}
+"#,
+            "reserved built-in type name",
+        ),
+        (
+            "dialog_text_entry_two_buttons_rejected",
+            r#"
+object "D4" {
+    guid: 0x7F53_0034;
+    interaction "Go" {
+        run(sim) {
+            dialog(kind: text_entry, title: "T", message: "M", buttons: ("Save", "Cancel"));
+        }
+    }
+}
+"#,
+            "'text_entry' dialog requires exactly 1",
+        ),
+        (
+            "dialog_icon_two_buttons_rejected",
+            r#"
+object "D5" {
+    guid: 0x7F53_0035;
+    interaction "Go" {
+        run(sim) {
+            dialog(kind: icon, title: "T", message: "M", buttons: ("A", "B"));
+        }
+    }
+}
+"#,
+            "'icon' dialog requires exactly 1",
+        ),
+    ];
+    for (name, src, expected) in diag_cases {
+        let err = compile_v2_source(&format!("{name}.antics"), src, &cfg)
+            .expect_err(&format!("expected compile error for {name}"));
+        assert!(
+            err.message.contains(expected),
+            "case '{name}': expected {expected:?}, got: {}",
+            err.message
+        );
+    }
 }

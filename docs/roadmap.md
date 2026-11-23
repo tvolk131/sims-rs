@@ -3466,6 +3466,57 @@ through their public interfaces only; the simulation never depends on it.
     `.iff`/`.far` inspector (`--list`, `--entry`, `--filter`, `--tree`, `--raw`,
     `--verify-equiv`) with strict stdout-only/FIFO-safe I/O, Windows-1252 case
     resolution, and byte-exact raw round-trip hardening (`49/49` tests passing).
+- **Done (Batch 14 — Playtest UI Fixes, Play-Mode Recovery, UI Honesty Audit
+  Wave 1, `.antics` v2 Tiers 1–3 & `.air` 49/49 Primitives, #389–#399):**
+  - **Neighborhood resizing (#389):** an `800×600` minimum logical window,
+    floor-rounded HiDPI scaling, and outer framing at any viewport size. The
+    native `≤800×600` and `1024×768` paths stay bit-exact.
+  - **Play-Mode recovery and `0x0a` deletion parity (#391):** fixes the Goth
+    Play-Mode "Lot Stopped" crash (`object 383: missing object`). It ports the
+    native indicator unregistration (`0x447d8b`), adds existence checks in the
+    cancel walks, removal and placement, scrubs deleted IDs from routes, and
+    makes `placement::Cursor` cycle-safe. Play Mode now recovers in place from
+    end-of-update, midnight-rollover and grass-growth faults. A 50,000-tick
+    Play-Mode Goth test crosses midnight. Strict mode is unchanged (43,200-tick
+    hash `df6eb544…`).
+  - **HUD and hotkeys (#392):** the widescreen mood gadget stays anchored, and
+    the native `BackPatch.bmp` (`2036`) wedge removes the gray patch beside the
+    Camera button. Also ports the `Sims.exe` 1.91 hotkeys and adds a strict
+    text-input guard.
+  - **Build/Buy/Travel fixes (#394):**
+    - Build catalog: `OBJD` word-69 tool mapping and `CTSS` offsets.
+    - Buy Mode: the 100 px `PanelBack.bmp` strip.
+    - The 4-way Roof/Walls radio group.
+    - Graphical destination-map pickers for VM `Dialog` kinds 5/7/8/11/13.
+    - Widescreen balloon continuity.
+  - **UI Honesty Audit Wave 1 (#397):**
+    - Native Interests and Gifts panels.
+    - All 5 commercial expansion Buy catalogs, plus all 20 `STR# 160` rating
+      labels.
+    - 9-slice `PopupInfoTiles.bmp` hover cards.
+    - Options buttons no longer overlap.
+    - `Destination::OldTown`.
+    - Read-only `0x44bf1a` dialog token substitution, with the 1.91 icon modes.
+    - Two `sims-vm` follow-ups are recorded in the ADR.
+  - **`.antics` v2 (#390, #393, #395, #399):**
+    - The `.antics` → `.air` → `.iff` two-layer compiler (#390).
+    - All 20 `open-pack/` objects migrated to v2, retiring `object.toml` (#393).
+    - Tier 1–2 language features (#395): defaults, declarative locks, template
+      interaction inheritance, `fn -> i16`, named/default parameters, `Skill`
+      indexing. These bring the pack to 1,410 lines, down 46.8% from v1.
+    - Tier 3 (#399): `match dialog`, `enum`/`bitflags`, typed cross-object
+      refs, autonomy guards, lifecycle hooks, compound expressions.
+    - The pack has 0 safety violations throughout.
+  - **`.air` expansion (#396, #398):**
+    - Removed the all-or-nothing fallback cliff: unmodelled opcodes fall back
+      to inline raw ops, and labelled-CFG decoding is added.
+    - Strict padding by default, with `--relax-padding` to strip it.
+    - All 49 of 49 Sims 1 primitives are named.
+    - `while true`/`break`/`continue` loop structuring.
+    - Optional symbol comments in the lift.
+    - 28,690 / 28,690 BHAVs round-trip byte-exact and prove `Equivalent`.
+    - Next: PR 3, a symbolic live-output equivalence verifier and
+      `sims-antics verify-equiv`.
 - **Needs from other crates:**
   - `sims-vm`: Done — all three failing Goth pie listings (#296) are
     now closed, and every person's pie menu on every object of the Goth

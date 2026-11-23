@@ -73,7 +73,7 @@ pub fn is_v2_source(source: &str) -> bool {
     }
     matches!(
         &source[start..pos],
-        "use" | "pub" | "fn" | "template" | "object"
+        "use" | "pub" | "fn" | "template" | "object" | "enum" | "bitflags"
     )
 }
 
