@@ -7,15 +7,15 @@
 //! - `sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]`
-//! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--verify-equiv]`
+//! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--verify-equiv]`
 //! - `sims-antics build <pack_dir> --out <dir>`
 
 use sims_antics::{
-    EquivOptions, EquivResult, StructuredLiftOutcome, check_bhav_equivalent_with_arities,
-    compile_air, compile_pack_dir, compile_standalone_pack_dir, compile_v2_object_file,
-    expand_v2_to_air,
-    lift::{format_bhav_air, lift_bhav},
-    lift_bhav_air_structured,
+    EquivOptions, EquivResult, LiftOptions, StructuredLiftOutcome,
+    check_bhav_equivalent_with_arities, compile_air, compile_pack_dir, compile_standalone_pack_dir,
+    compile_v2_object_file, expand_v2_to_air,
+    lift::{format_bhav_labeled_air_with_arities, format_bhav_raw_air, lift_bhav},
+    lift_bhav_structured_with_arities,
     v2::is_v2_source,
     verify::{extract_bhav_arities_from_iff, extract_bhav_from_iff},
     verify_object_safety, verify_pack_safety,
@@ -86,6 +86,7 @@ impl<W: Write> OutWriter<W> {
 struct LiftSummary {
     counterexamples: usize,
     compile_errors: usize,
+    inconclusive: usize,
     parse_errors: usize,
 }
 
@@ -93,9 +94,13 @@ impl LiftSummary {
     fn into_result(self, broken_pipe: bool) -> Result<(), CliError> {
         if self.counterexamples > 0 || self.compile_errors > 0 {
             let mut msg = format!(
-                "verify-equiv failed ({} counterexample(s), {} compile error(s))",
+                "verify-equiv failed ({} counterexample(s), {} compile error(s)",
                 self.counterexamples, self.compile_errors
             );
+            if self.inconclusive > 0 {
+                msg.push_str(&format!(", {} inconclusive", self.inconclusive));
+            }
+            msg.push(')');
             if self.parse_errors > 0 {
                 msg.push_str(&format!("; {} BHAV(s) failed to parse", self.parse_errors));
             }
@@ -106,6 +111,12 @@ impl LiftSummary {
                 "failed to parse {} BHAV chunk(s)",
                 self.parse_errors
             )));
+        }
+        if self.inconclusive > 0 {
+            eprintln!(
+                "warning: verify-equiv reported {} inconclusive tree(s)",
+                self.inconclusive
+            );
         }
         if broken_pipe {
             return Err(CliError::BrokenPipe);
@@ -130,7 +141,7 @@ fn print_usage() {
          sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>]\n  \
-         sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--verify-equiv]   (lifts to .air Antics IR)\n  \
+         sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--verify-equiv]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>"
     );
 }
@@ -394,12 +405,14 @@ fn read_bounded_iff_file(
     Ok(bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_lifted_bhavs<W: Write>(
     iff: &Iff,
     selected_chunks: &[&sims_formats::iff::Chunk],
     source_label: &str,
     tree_id: Option<u16>,
     raw: bool,
+    lift_opts: LiftOptions,
     verify_equiv: bool,
     out: &mut OutWriter<W>,
 ) -> Result<(), CliError> {
@@ -416,13 +429,9 @@ fn emit_lifted_bhavs<W: Write>(
     // install catalog, only private/local BHAVs (`4096..=8191`) are guaranteed to resolve
     // within this file; global (`256..=4095`) and semi-global (`8192..=65535`) callees
     // must remain unknown so stray chunks in an object IFF cannot mask external arities.
-    let arities = if verify_equiv {
-        let mut local_arities = extract_bhav_arities_from_iff(&iff.bytes).unwrap_or_default();
-        local_arities.retain(|&id, _| (4096..=8191).contains(&id));
-        Some(local_arities)
-    } else {
-        None
-    };
+    let mut local_arities = extract_bhav_arities_from_iff(&iff.bytes).unwrap_or_default();
+    local_arities.retain(|&id, _| (4096..=8191).contains(&id));
+    let arities = Some(local_arities);
 
     let mut summary = LiftSummary::default();
     let mut broken_pipe = false;
@@ -471,7 +480,7 @@ fn emit_lifted_bhavs<W: Write>(
                 bhav.id,
                 sanitize_single_line(&bhav.label)
             )));
-            let src = format_bhav_air(&bhav);
+            let src = format_bhav_raw_air(&bhav);
             write_or_break!(out.write_str(&src));
             if !src.ends_with('\n') {
                 write_or_break!(out.writeln_str(""));
@@ -479,8 +488,8 @@ fn emit_lifted_bhavs<W: Write>(
             continue;
         }
 
-        let outcome = lift_bhav_air_structured(&bhav);
-        match outcome {
+        let outcome = lift_bhav_structured_with_arities(&bhav, lift_opts, arities.as_ref());
+        let emitted_src = match outcome {
             StructuredLiftOutcome::Lifted(src) => {
                 write_or_break!(out.writeln_str(&format!(
                     "// .air (Antics IR) tree {} \"{}\"",
@@ -491,67 +500,73 @@ fn emit_lifted_bhavs<W: Write>(
                 if !src.ends_with('\n') {
                     write_or_break!(out.writeln_str(""));
                 }
-                if verify_equiv {
-                    let status_line = match compile_air(&src) {
-                        Ok(compiled) => {
-                            if let Some(recompiled) = compiled.behaviors.get(&bhav.id) {
-                                match check_bhav_equivalent_with_arities(
-                                    &bhav,
-                                    recompiled,
-                                    &EquivOptions::default(),
-                                    arities.as_ref(),
-                                ) {
-                                    EquivResult::Equivalent {
-                                        states_checked,
-                                        paths_verified,
-                                    } => format!(
-                                        "// verify-equiv: Equivalent ({states_checked} states checked, {paths_verified} paths verified)"
-                                    ),
-                                    EquivResult::Counterexample { path, divergence } => {
-                                        summary.counterexamples += 1;
-                                        format!(
-                                            "// verify-equiv: Counterexample(after {} step(s): {})",
-                                            path.len(),
-                                            sanitize_single_line(&divergence)
-                                        )
-                                    }
-                                    EquivResult::Inconclusive { reason } => format!(
-                                        "// verify-equiv: Inconclusive({})",
-                                        sanitize_single_line(&reason)
-                                    ),
-                                }
-                            } else {
-                                summary.compile_errors += 1;
-                                format!(
-                                    "// verify-equiv: CompileError(recompiled output missing tree #{})",
-                                    bhav.id
-                                )
-                            }
-                        }
-                        Err(err) => {
-                            summary.compile_errors += 1;
-                            format!(
-                                "// verify-equiv: CompileError({})",
-                                sanitize_single_line(&err.to_string())
-                            )
-                        }
-                    };
-                    write_or_break!(out.writeln_str(&status_line));
-                }
+                src
             }
             other => {
                 let reason = lift_reason(&other).unwrap_or_else(|| "unknown".to_owned());
                 write_or_break!(out.writeln_str(&format!(
-                    "// tree {} \"{}\": structured lift fallback ({reason}); showing raw .air (Antics IR)",
+                    "// tree {} \"{}\": structured lift fallback ({reason}); showing decoded labeled-CFG .air (Antics IR)",
                     bhav.id,
                     sanitize_single_line(&bhav.label)
                 )));
-                let raw_src = format_bhav_air(&bhav);
-                write_or_break!(out.write_str(&raw_src));
-                if !raw_src.ends_with('\n') {
+                let labeled_src =
+                    format_bhav_labeled_air_with_arities(&bhav, lift_opts, arities.as_ref());
+                write_or_break!(out.write_str(&labeled_src));
+                if !labeled_src.ends_with('\n') {
                     write_or_break!(out.writeln_str(""));
                 }
+                labeled_src
             }
+        };
+        if verify_equiv {
+            let status_line = match compile_air(&emitted_src) {
+                Ok(compiled) => {
+                    if let Some(recompiled) = compiled.behaviors.get(&bhav.id) {
+                        match check_bhav_equivalent_with_arities(
+                            &bhav,
+                            recompiled,
+                            &EquivOptions::default(),
+                            arities.as_ref(),
+                        ) {
+                            EquivResult::Equivalent {
+                                states_checked,
+                                paths_verified,
+                            } => format!(
+                                "// verify-equiv: Equivalent ({states_checked} states checked, {paths_verified} paths verified)"
+                            ),
+                            EquivResult::Counterexample { path, divergence } => {
+                                summary.counterexamples += 1;
+                                format!(
+                                    "// verify-equiv: Counterexample(after {} step(s): {})",
+                                    path.len(),
+                                    sanitize_single_line(&divergence)
+                                )
+                            }
+                            EquivResult::Inconclusive { reason } => {
+                                summary.inconclusive += 1;
+                                format!(
+                                    "// verify-equiv: Inconclusive({})",
+                                    sanitize_single_line(&reason)
+                                )
+                            }
+                        }
+                    } else {
+                        summary.compile_errors += 1;
+                        format!(
+                            "// verify-equiv: CompileError(recompiled output missing tree #{})",
+                            bhav.id
+                        )
+                    }
+                }
+                Err(err) => {
+                    summary.compile_errors += 1;
+                    format!(
+                        "// verify-equiv: CompileError({})",
+                        sanitize_single_line(&err.to_string())
+                    )
+                }
+            };
+            write_or_break!(out.writeln_str(&status_line));
         }
     }
 
@@ -573,6 +588,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     let mut list = false;
     let mut filter: Option<String> = None;
     let mut raw = false;
+    let mut relax_padding = false;
     let mut verify_equiv = false;
     let mut end_of_flags = false;
 
@@ -634,6 +650,11 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
                         i += 1;
                         continue;
                     }
+                    "--relax-padding" => {
+                        relax_padding = true;
+                        i += 1;
+                        continue;
+                    }
                     "--verify-equiv" => {
                         verify_equiv = true;
                         i += 1;
@@ -676,9 +697,17 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
             .to_owned()
             .into());
     }
+    if raw && relax_padding {
+        return Err("--relax-padding cannot be combined with --raw"
+            .to_owned()
+            .into());
+    }
     if tree_id.is_some() && filter.is_some() {
         return Err("--filter cannot be combined with --tree".to_owned().into());
     }
+    let lift_opts = LiftOptions {
+        strict_padding: !relax_padding,
+    };
 
     let safe_input_path = sanitize_path_display(&input_path);
     let (mut file, file_len, header) = read_regular_file_prefix(&input_path)?;
@@ -800,6 +829,8 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     let bhav_chunks: Vec<&sims_formats::iff::Chunk> = by_id.into_values().collect();
 
     if list {
+        let mut local_arities = extract_bhav_arities_from_iff(&iff.bytes).unwrap_or_default();
+        local_arities.retain(|&id, _| (4096..=8191).contains(&id));
         let filter_lower = filter.as_deref().map(str::to_lowercase);
         out.writeln_str(&format!(
             "{:<7} {:<8} {:<5} {:<5} {:<7} {:<36} {}",
@@ -814,10 +845,21 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
             let safe_name = sanitize_single_line(&chunk.label);
             match lift_bhav(chunk.id, &chunk.label, iff.data(chunk)) {
                 Ok(bhav) => {
-                    let status = match lift_bhav_air_structured(&bhav) {
-                        StructuredLiftOutcome::Lifted(_) => "structured".to_owned(),
+                    let status = match lift_bhav_structured_with_arities(
+                        &bhav,
+                        lift_opts,
+                        Some(&local_arities),
+                    ) {
+                        StructuredLiftOutcome::Lifted(src) => {
+                            let raw_count = src.matches("op 0x").count();
+                            if raw_count == 0 {
+                                "structured".to_owned()
+                            } else {
+                                format!("structured ({raw_count} inline raw op)")
+                            }
+                        }
                         other => format!(
-                            "raw-only ({})",
+                            "labeled-cfg ({})",
                             lift_reason(&other).unwrap_or_else(|| "unknown".to_owned())
                         ),
                     };
@@ -879,6 +921,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
         &source_label,
         tree_id,
         raw,
+        lift_opts,
         verify_equiv,
         &mut out,
     )
@@ -1641,8 +1684,7 @@ mod tests {
     fn broken_pipe_does_not_erase_already_recorded_failures() {
         let counterexample = LiftSummary {
             counterexamples: 1,
-            compile_errors: 0,
-            parse_errors: 0,
+            ..Default::default()
         };
         assert!(matches!(
             counterexample.into_result(true),
@@ -1650,9 +1692,8 @@ mod tests {
         ));
 
         let compile_err = LiftSummary {
-            counterexamples: 0,
             compile_errors: 1,
-            parse_errors: 0,
+            ..Default::default()
         };
         assert!(matches!(
             compile_err.into_result(true),
@@ -1660,9 +1701,8 @@ mod tests {
         ));
 
         let parse_err = LiftSummary {
-            counterexamples: 0,
-            compile_errors: 0,
             parse_errors: 1,
+            ..Default::default()
         };
         assert!(matches!(
             parse_err.into_result(true),
@@ -1689,7 +1729,16 @@ mod tests {
             fail_after_bytes: 0,
             written: 0,
         });
-        let res = emit_lifted_bhavs(&iff, &chunks, "test.iff", None, false, false, &mut out);
+        let res = emit_lifted_bhavs(
+            &iff,
+            &chunks,
+            "test.iff",
+            None,
+            false,
+            LiftOptions::default(),
+            false,
+            &mut out,
+        );
         assert!(matches!(
             res,
             Err(CliError::Message(msg)) if msg.contains("failed to parse 1 BHAV")
