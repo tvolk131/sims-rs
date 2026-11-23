@@ -6,7 +6,6 @@ use crate::templates::bed::BedBase;
 object "Open Double Bed" from BedBase {
     guid: 0x7F00_0012;
     price: 680;
-    attributes: 8;
     description: "A clean-room two-tile double bed with left/right entry slots, shared occupancy tracking, and player cancel cleanup.";
     sprite: Sprite::procedural("double_bed", primary: #4C6C92, accent: #ECE8DC, trim: #5E3E2A);
 
@@ -34,7 +33,6 @@ object "Open Double Bed" from BedBase {
         },
     ];
 
-    sleep_ticks: 2;
     sleep_cycles: 5;
     energy_step: 24;
     comfort_step: 10;
@@ -48,23 +46,8 @@ object "Open Double Bed" from BedBase {
     sound settle = preset("soft_thud", wav: "open_double_bed_settle");
     sound wake = preset("wood_creak", wav: "open_double_bed_wake");
 
-    slot left_entry {
-        kind: routing,
-        offset: [-0.85, 0.0, 0.0],
-        standing: true,
-        sitting: false,
-        ground: true,
-        facing: west,
-    }
-
-    slot right_entry {
-        kind: routing,
-        offset: [1.85, 0.0, 0.0],
-        standing: true,
-        sitting: false,
-        ground: true,
-        facing: east,
-    }
+    slot left_entry = routing([-0.85, 0.0, 0.0], facing: west);
+    slot right_entry = routing([1.85, 0.0, 0.0], facing: east);
 
     fn sync_occupancy() {
         for part in self.parts() {
@@ -78,37 +61,29 @@ object "Open Double Bed" from BedBase {
         defer {
             self.occupancy_mask flag_clear side_flag;
             sync_occupancy();
-            play_sound(wake, self);
+            play_sound(wake);
         }
-        play_sound(settle, self);
-        run_sleep_loop(sim, &mut self.completed_cycles);
+        play_sound(settle);
+        run_sleep_loop_tracked(sim, &mut self.completed_cycles);
     }
 
     interaction "Sleep (Left Side)" {
         autonomy: 60,
         attenuation: 0.015,
-        advertises: [
-            energy +90 (min: -100),
-            comfort +40 (min: -100),
-        ],
+        advertises: [energy +90, comfort +40],
         guard(sim) => !(self.occupancy_mask flag_test 1) && sim.motive.energy < max_entry_energy,
         run(sim) {
             sleep_side(sim, 1);
-            return true;
         }
     }
 
     interaction "Sleep (Right Side)" {
         autonomy: 60,
         attenuation: 0.015,
-        advertises: [
-            energy +90 (min: -100),
-            comfort +40 (min: -100),
-        ],
+        advertises: [energy +90, comfort +40],
         guard(sim) => !(self.occupancy_mask flag_test 2) && sim.motive.energy < max_entry_energy,
         run(sim) {
             sleep_side(sim, 2);
-            return true;
         }
     }
 }

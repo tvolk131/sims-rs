@@ -4,7 +4,6 @@ object "Open Street Mailbox" {
     guid: 0x7F00_0090;
     price: 50;
     category: misc;
-    attributes: 8;
     description: "A clean-room curbside mailbox for receiving and paying daily household bills via alter_budget.";
     sprite: Sprite::procedural("mailbox", primary: #486C94, accent: #D0403A, trim: #765638);
 
@@ -21,14 +20,7 @@ object "Open Street Mailbox" {
     sound latch = preset("ui_click", wav: "open_mailbox_latch");
     sound paid_chime = preset("chime", wav: "open_bills_paid");
 
-    slot front {
-        kind: routing,
-        offset: [0.0, -0.75, 0.0],
-        standing: true,
-        sitting: false,
-        ground: true,
-        facing: north,
-    }
+    slot front = routing([0.0, -0.75, 0.0]);
 
     main {
         return true;
@@ -36,46 +28,35 @@ object "Open Street Mailbox" {
 
     interaction "Pay Bills" {
         autonomy: 70,
-        attenuation: 0.02,
-        advertises: [
-            room +25 (min: -100),
-        ],
-        guard(sim) => !self.occupied && self.unpaid_bills > 0 && can_afford(bill_amount, category: 5),
+        advertises: [room +25],
+        lock: self.occupied,
+        guard(sim) => self.unpaid_bills > 0 && can_afford(bill_amount, category: 5),
         run(sim) {
-            with lock(self.occupied) {
-                play_sound(latch, self);
-                if self.unpaid_bills <= 0 {
-                    return false;
-                }
-                sleep(pay_ticks);
-                if !debit_funds(bill_amount, category: 5) {
-                    return false;
-                }
-                self.unpaid_bills -= 1;
-                self.paid_bills += 1;
-                sim.motive.room += paid_room_gain;
-                play_sound(paid_chime, self);
+            play_sound(latch);
+            if self.unpaid_bills <= 0 {
+                return false;
             }
-            return true;
+            sleep(pay_ticks);
+            if !debit_funds(bill_amount, category: 5) {
+                return false;
+            }
+            self.unpaid_bills -= 1;
+            self.paid_bills += 1;
+            sim.motive.room += paid_room_gain;
+            play_sound(paid_chime);
         }
     }
 
     interaction "Check Mail" {
         autonomy: 25,
-        attenuation: 0.02,
-        advertises: [
-            fun +10 (min: -100),
-        ],
-        guard(sim) => !self.occupied,
+        advertises: [fun +10],
+        lock: self.occupied,
         run(sim) {
-            with lock(self.occupied) {
-                play_sound(latch, self);
-                if self.unpaid_bills == 0 {
-                    self.unpaid_bills = 1;
-                }
-                sim.motive.fun += check_fun_gain;
+            play_sound(latch);
+            if self.unpaid_bills == 0 {
+                self.unpaid_bills = 1;
             }
-            return true;
+            sim.motive.fun += check_fun_gain;
         }
     }
 }

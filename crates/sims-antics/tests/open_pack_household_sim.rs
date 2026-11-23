@@ -1334,7 +1334,7 @@ fn cli_verify_build_and_equiv_subcommands_work_end_to_end() {
     )
     .unwrap();
     let orig_src = std::fs::read_to_string(&toilet_antics).unwrap();
-    let mutated_src = orig_src.replace("play_sound(flush, self);", "play_sound(plunge, self);");
+    let mutated_src = orig_src.replace("play_sound(flush);", "play_sound(plunge);");
     assert_ne!(orig_src, mutated_src);
     let mutated_path = mut_pack.join("objects/open-toilet.antics");
     std::fs::write(&mutated_path, mutated_src).unwrap();

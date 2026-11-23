@@ -4,7 +4,6 @@ object "Open Frost Fridge" {
     guid: 0x7F00_0020;
     price: 550;
     category: appliances;
-    attributes: 8;
     description: "A clean-room kitchen refrigerator that checks funds and stock, then coordinates Counter prep and Stove cooking.";
     sprite: Sprite::procedural("fridge", primary: #E4EAEE, accent: #B0BCC6, trim: #5C6670);
 
@@ -19,21 +18,11 @@ object "Open Frost Fridge" {
 
     sound door = preset("soft_thud", wav: "open_fridge_door");
 
-    slot front {
-        kind: routing,
-        offset: [0.0, -0.75, 0.0],
-        standing: true,
-        sitting: false,
-        ground: true,
-        facing: north,
-    }
+    slot front = routing([0.0, -0.75, 0.0]);
 
     interaction "Cook Meal" {
         autonomy: 55,
-        attenuation: 0.02,
-        advertises: [
-            hunger +75 (min: -100),
-        ],
+        advertises: [hunger +75],
         guard(sim) => self.stock > 0 && sim.motive.hunger < max_entry_hunger && can_afford(meal_cost),
         run(sim) {
             if self.stock <= 0 {
@@ -49,7 +38,7 @@ object "Open Frost Fridge" {
                 return false;
             }
             self.stock -= 1;
-            play_sound(door, self);
+            play_sound(door);
 
             let mut committed = false;
             defer {
@@ -70,7 +59,6 @@ object "Open Frost Fridge" {
             self.meals_cooked += 1;
             sim.skill.cooking += cooking_xp;
             committed = true;
-            return true;
         }
     }
 }

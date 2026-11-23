@@ -1,14 +1,14 @@
 // Shared clean-room behavioral helpers for `open-pack/`.
 
-/// Cancel-safe single-motive restoration loop with early saturation break.
-pub fn restore_motive_loop(
+/// Cancel-safe single-motive restoration loop with per-cycle counter updates.
+pub fn restore_motive_tracked(
     sim: Sim,
     motive: Motive,
     cycles: i16,
-    ticks: i16,
     step: i16,
-    cap: i16,
     completed: &mut i16,
+    ticks: i16 = 2,
+    cap: i16 = 100,
 ) {
     repeat cycles cancel_on_abort {
         sleep(ticks);
@@ -20,17 +20,39 @@ pub fn restore_motive_loop(
     }
 }
 
-/// Cancel-safe dual-motive restoration loop with early saturation break on the primary motive.
-pub fn restore_two_motives_loop(
+/// Cancel-safe single-motive restoration loop returning the number of completed cycles.
+pub fn restore_motive_loop(
+    sim: Sim,
+    motive: Motive,
+    cycles: i16,
+    step: i16,
+    ticks: i16 = 2,
+    cap: i16 = 100,
+) -> i16 {
+    let mut completed: i16 = 0;
+    restore_motive_tracked(
+        sim,
+        motive,
+        cycles: cycles,
+        step: step,
+        completed: &mut completed,
+        ticks: ticks,
+        cap: cap,
+    );
+    return completed;
+}
+
+/// Cancel-safe dual-motive restoration loop with per-cycle counter updates.
+pub fn restore_two_motives_tracked(
     sim: Sim,
     primary: Motive,
     primary_step: i16,
     secondary: Motive,
     secondary_step: i16,
     cycles: i16,
-    ticks: i16,
-    primary_cap: i16,
     completed: &mut i16,
+    ticks: i16 = 2,
+    primary_cap: i16 = 100,
 ) {
     repeat cycles cancel_on_abort {
         sleep(ticks);
@@ -43,10 +65,36 @@ pub fn restore_two_motives_loop(
     }
 }
 
+/// Cancel-safe dual-motive restoration loop returning the number of completed cycles.
+pub fn restore_two_motives_loop(
+    sim: Sim,
+    primary: Motive,
+    primary_step: i16,
+    secondary: Motive,
+    secondary_step: i16,
+    cycles: i16,
+    ticks: i16 = 2,
+    primary_cap: i16 = 100,
+) -> i16 {
+    let mut completed: i16 = 0;
+    restore_two_motives_tracked(
+        sim,
+        primary,
+        primary_step,
+        secondary,
+        secondary_step,
+        cycles: cycles,
+        completed: &mut completed,
+        ticks: ticks,
+        primary_cap: primary_cap,
+    );
+    return completed;
+}
+
 /// Sets a boolean toggle/power/lock state and plays the associated object sound.
-pub fn set_toggle_state(obj: Object, flag: &mut bool, enabled: bool, sfx: Sound) {
+pub fn set_toggle_state(flag: &mut bool, enabled: bool, sfx: Sound) {
     *flag = enabled;
-    play_sound(sfx, obj);
+    play_sound(sfx);
 }
 
 /// Increments a fixture's wear counter and transitions it to broken once `threshold` is reached.
@@ -67,8 +115,8 @@ pub fn repair_by_progress(
     goal: i16,
     base_step: i16,
     mechanic_divisor: i16,
-    ticks: i16,
     cycles_out: &mut i16,
+    ticks: i16 = 2,
 ) -> bool {
     let step = sim.skill.mechanical / mechanic_divisor + base_step;
     let mut progress: i16 = 0;
@@ -84,7 +132,7 @@ pub fn repair_by_progress(
 
 /// Cancel-safe fixed-cycle work loop (e.g. plunging/unclogging).
 /// Returns `true` if all `target_cycles` completed without cancellation.
-pub fn run_timed_cycles(target_cycles: i16, ticks: i16) -> bool {
+pub fn run_timed_cycles(target_cycles: i16, ticks: i16 = 2) -> bool {
     let mut cycles: i16 = 0;
     repeat target_cycles cancel_on_abort {
         sleep(ticks);

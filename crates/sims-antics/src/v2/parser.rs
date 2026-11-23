@@ -12,6 +12,7 @@ use crate::v2::ast::{
     V2BinOp, V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp,
 };
 use crate::v2::lexer::{Token, TokenKind, tokenize};
+use std::collections::BTreeSet;
 
 const MAX_NESTING_DEPTH: usize = 64;
 
@@ -331,20 +332,60 @@ impl Parser {
             "Object" => Ok(V2Type::Object),
             "ObjectId" => Ok(V2Type::ObjectId),
             "Motive" => Ok(V2Type::Motive),
+            "Skill" => Ok(V2Type::Skill),
             "Sound" => Ok(V2Type::Sound),
             "Slot" => Ok(V2Type::Slot),
             other => Err(Error::at(nspan, format!("unknown type '{other}'"))),
         }
     }
 
-    fn parse_fn_params(&mut self) -> Result<Vec<FnParam>> {
+    fn parse_fn_params(&mut self, allow_defaults: bool) -> Result<Vec<FnParam>> {
         self.expect(&TokenKind::LParen, "'('")?;
         let mut params = Vec::new();
+        let mut seen_names = BTreeSet::new();
+        let mut seen_default = false;
         while !self.eat(&TokenKind::RParen) {
             let (name, span) = self.expect_ident("parameter name")?;
+            if !seen_names.insert(name.clone()) {
+                return Err(Error::at(
+                    span,
+                    format!("duplicate parameter name '{name}'"),
+                ));
+            }
             self.expect(&TokenKind::Colon, "':'")?;
             let ty = self.parse_type()?;
-            params.push(FnParam { span, name, ty });
+            let default = if self.eat(&TokenKind::Assign) {
+                if !allow_defaults {
+                    return Err(Error::at(
+                        span,
+                        format!("functional parameter '{name}' cannot have a default value"),
+                    ));
+                }
+                if matches!(ty, V2Type::MutRef(_)) {
+                    return Err(Error::at(
+                        span,
+                        format!("'&mut' parameter '{name}' cannot have a default value"),
+                    ));
+                }
+                seen_default = true;
+                Some(self.parse_expr()?)
+            } else {
+                if seen_default {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "required parameter '{name}' cannot follow a parameter with a default value"
+                        ),
+                    ));
+                }
+                None
+            };
+            params.push(FnParam {
+                span,
+                name,
+                ty,
+                default,
+            });
             if !self.eat(&TokenKind::Comma) {
                 self.expect(&TokenKind::RParen, "')'")?;
                 break;
@@ -355,7 +396,7 @@ impl Parser {
 
     fn parse_fn(&mut self, span: Span, is_pub: bool) -> Result<FnDecl> {
         let (name, _) = self.expect_ident("function name")?;
-        let params = self.parse_fn_params()?;
+        let params = self.parse_fn_params(true)?;
         let return_type = if self.eat(&TokenKind::Arrow) {
             Some(self.parse_type()?)
         } else {
@@ -748,96 +789,40 @@ impl Parser {
 
     fn parse_slot_decl(&mut self, span: Span) -> Result<SlotDecl> {
         let (name, _) = self.expect_ident("slot name")?;
-        self.expect(&TokenKind::LBrace, "'{'")?;
-        let mut slot = SlotDecl {
-            span,
-            name,
-            kind: 3,
-            offset: [0.0, -0.75, 0.0],
-            standing: 1,
-            sitting: 0,
-            ground: 1,
-            flags: 1,
-            snap_target: -1,
-            proximity: [0, 0, 0],
-            max_size: 100,
-            gradient: 0.0,
-            height: 5,
-            facing: 0,
-            resolution: 16,
-        };
+        if self.eat(&TokenKind::Assign) {
+            let (ctor, cspan) = self.expect_ident("slot constructor ('routing' or 'container')")?;
+            let mut slot = match ctor.as_str() {
+                "routing" => default_routing_slot(span, name),
+                "container" => default_container_slot(span, name),
+                other => {
+                    return Err(Error::at(
+                        cspan,
+                        format!(
+                            "unknown slot constructor '{other}' (expected 'routing' or 'container')"
+                        ),
+                    ));
+                }
+            };
+            self.expect(&TokenKind::LParen, "'('")?;
+            slot.offset = self.parse_f32_3()?;
+            while self.eat(&TokenKind::Comma) {
+                if self.peek().kind == TokenKind::RParen {
+                    break;
+                }
+                let (key, kspan) = self.expect_ident("slot option name")?;
+                self.expect(&TokenKind::Colon, "':'")?;
+                self.parse_slot_field(&mut slot, &key, kspan, false)?;
+            }
+            self.expect(&TokenKind::RParen, "')'")?;
+            self.eat_member_terminator();
+            return Ok(slot);
+        }
+        self.expect(&TokenKind::LBrace, "'{' or '='")?;
+        let mut slot = default_routing_slot(span, name);
         while !self.eat(&TokenKind::RBrace) {
             let (key, kspan) = self.expect_ident("slot field name")?;
             self.expect(&TokenKind::Colon, "':'")?;
-            match key.as_str() {
-                "kind" => {
-                    slot.kind = match &self.peek().kind {
-                        TokenKind::Int(_) | TokenKind::Minus | TokenKind::Plus => {
-                            self.expect_u16("slot kind")?
-                        }
-                        TokenKind::Ident(_) => {
-                            let (kname, s) = self.expect_ident("slot kind")?;
-                            match kname.as_str() {
-                                "container" => 0,
-                                "routing" => 3,
-                                other => {
-                                    return Err(Error::at(
-                                        s,
-                                        format!(
-                                            "unknown slot kind '{other}' (expected 'routing', 'container', or u16)"
-                                        ),
-                                    ));
-                                }
-                            }
-                        }
-                        other => {
-                            return Err(Error::at(
-                                kspan,
-                                format!("expected slot kind, found {other:?}"),
-                            ));
-                        }
-                    };
-                }
-                "offset" => {
-                    slot.offset = self.parse_f32_3()?;
-                }
-                "standing" => {
-                    slot.standing = self.parse_bool_or_i32("slot standing")?;
-                }
-                "sitting" => {
-                    slot.sitting = self.parse_bool_or_i32("slot sitting")?;
-                }
-                "ground" => {
-                    slot.ground = self.parse_bool_or_i32("slot ground")?;
-                }
-                "flags" => {
-                    slot.flags = self.expect_u32("slot flags")?;
-                }
-                "snap_target" => {
-                    slot.snap_target = self.expect_i32("slot snap_target")?;
-                }
-                "proximity" => {
-                    slot.proximity = self.parse_i32_3()?;
-                }
-                "max_size" => {
-                    slot.max_size = self.expect_i32("slot max_size")?;
-                }
-                "gradient" => {
-                    slot.gradient = self.parse_signed_float("slot gradient")?.0 as f32;
-                }
-                "height" => {
-                    slot.height = self.expect_i32("slot height")?;
-                }
-                "facing" => {
-                    slot.facing = self.parse_facing()?;
-                }
-                "resolution" => {
-                    slot.resolution = self.expect_i32("slot resolution")?;
-                }
-                other => {
-                    return Err(Error::at(kspan, format!("unknown slot field '{other}'")));
-                }
-            }
+            self.parse_slot_field(&mut slot, &key, kspan, true)?;
             if !self.eat(&TokenKind::Comma) && !self.eat(&TokenKind::Semicolon) {
                 self.expect(&TokenKind::RBrace, "'}'")?;
                 break;
@@ -845,6 +830,94 @@ impl Parser {
         }
         self.eat(&TokenKind::Semicolon);
         Ok(slot)
+    }
+
+    fn parse_slot_field(
+        &mut self,
+        slot: &mut SlotDecl,
+        key: &str,
+        kspan: Span,
+        allow_kind_offset: bool,
+    ) -> Result<()> {
+        match key {
+            "kind" if allow_kind_offset => {
+                slot.kind = match &self.peek().kind {
+                    TokenKind::Int(_) | TokenKind::Minus | TokenKind::Plus => {
+                        self.expect_u16("slot kind")?
+                    }
+                    TokenKind::Ident(_) => {
+                        let (kname, s) = self.expect_ident("slot kind")?;
+                        match kname.as_str() {
+                            "container" => 0,
+                            "routing" => 3,
+                            other => {
+                                return Err(Error::at(
+                                    s,
+                                    format!(
+                                        "unknown slot kind '{other}' (expected 'routing', 'container', or u16)"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(Error::at(
+                            kspan,
+                            format!("expected slot kind, found {other:?}"),
+                        ));
+                    }
+                };
+            }
+            "offset" if allow_kind_offset => {
+                slot.offset = self.parse_f32_3()?;
+            }
+            "standing" => {
+                slot.standing = self.parse_bool_or_i32("slot standing")?;
+            }
+            "sitting" => {
+                slot.sitting = self.parse_bool_or_i32("slot sitting")?;
+            }
+            "ground" => {
+                slot.ground = self.parse_bool_or_i32("slot ground")?;
+            }
+            "flags" => {
+                slot.flags = self.expect_u32("slot flags")?;
+            }
+            "snap_target" => {
+                slot.snap_target = self.expect_i32("slot snap_target")?;
+            }
+            "proximity" => {
+                slot.proximity = self.parse_i32_3()?;
+            }
+            "min_dist" => {
+                slot.proximity[0] = self.expect_i32("slot min_dist")?;
+            }
+            "max_dist" => {
+                slot.proximity[1] = self.expect_i32("slot max_dist")?;
+            }
+            "optimal_dist" => {
+                slot.proximity[2] = self.expect_i32("slot optimal_dist")?;
+            }
+            "max_size" => {
+                slot.max_size = self.expect_i32("slot max_size")?;
+            }
+            "gradient" => {
+                slot.gradient = self.parse_signed_float("slot gradient")?.0 as f32;
+            }
+            "height" => {
+                slot.height = self.expect_i32("slot height")?;
+            }
+            "facing" => {
+                slot.facing = self.parse_facing()?;
+            }
+            "resolution" => {
+                slot.resolution = self.expect_i32("slot resolution")?;
+            }
+            other => {
+                return Err(Error::at(kspan, format!("unknown slot field '{other}'")));
+            }
+        }
+        Ok(())
     }
 
     fn parse_bool_or_i32(&mut self, desc: &str) -> Result<i32> {
@@ -1309,7 +1382,7 @@ impl Parser {
     ) -> Result<FunctionalDecl> {
         let (kind, kind_span) = self.expect_ident("functional kind (e.g. 'prep', 'cook')")?;
         let params = if self.peek().kind == TokenKind::LParen {
-            self.parse_fn_params()?
+            self.parse_fn_params(false)?
         } else {
             Vec::new()
         };
@@ -1416,6 +1489,7 @@ impl Parser {
         let mut flags2 = 0u32;
         let mut joining_index = -1i32;
         let mut advertises = Vec::new();
+        let mut lock: Option<(Span, String)> = None;
         let mut guard = None;
         let mut sim_binding = "sim".to_owned();
         let mut run_body: Option<Vec<V2Stmt>> = None;
@@ -1463,6 +1537,29 @@ impl Parser {
                             break;
                         }
                     }
+                    self.eat_member_terminator();
+                }
+                "lock" => {
+                    if lock.is_some() {
+                        return Err(Error::at(
+                            fspan,
+                            format!("duplicate 'lock' in interaction '{label}'"),
+                        ));
+                    }
+                    self.expect(&TokenKind::Colon, "':'")?;
+                    let lspan = self.span();
+                    let (base, bspan) = self.expect_ident("'self'")?;
+                    if base != "self" {
+                        return Err(Error::at(
+                            bspan,
+                            format!(
+                                "interaction 'lock:' must target a bool state on 'self' (e.g. 'lock: self.occupied'), found '{base}'"
+                            ),
+                        ));
+                    }
+                    self.expect(&TokenKind::Dot, "'.'")?;
+                    let (field_name, _) = self.expect_ident("state field name")?;
+                    lock = Some((lspan, field_name));
                     self.eat_member_terminator();
                 }
                 "guard" => {
@@ -1515,6 +1612,7 @@ impl Parser {
             flags2,
             joining_index,
             advertises,
+            lock,
             guard,
             sim_binding,
             run_body,
@@ -2237,6 +2335,46 @@ impl Parser {
                 format!("expected expression, found {other:?}"),
             )),
         }
+    }
+}
+
+fn default_routing_slot(span: Span, name: String) -> SlotDecl {
+    SlotDecl {
+        span,
+        name,
+        kind: 3,
+        offset: [0.0, -0.75, 0.0],
+        standing: 1,
+        sitting: 0,
+        ground: 1,
+        flags: 1,
+        snap_target: -1,
+        proximity: [0, 0, 0],
+        max_size: 100,
+        gradient: 0.0,
+        height: 5,
+        facing: 0,
+        resolution: 16,
+    }
+}
+
+fn default_container_slot(span: Span, name: String) -> SlotDecl {
+    SlotDecl {
+        span,
+        name,
+        kind: 0,
+        offset: [0.0, 0.0, 0.64],
+        standing: 0,
+        sitting: 0,
+        ground: 0,
+        flags: 1,
+        snap_target: -1,
+        proximity: [0, 0, 0],
+        max_size: 100,
+        gradient: 0.0,
+        height: 5,
+        facing: 0,
+        resolution: 16,
     }
 }
 

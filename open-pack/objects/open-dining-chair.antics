@@ -5,40 +5,21 @@ use crate::templates::seat::SeatBase;
 object "Open Dining Chair" from SeatBase {
     guid: 0x7F00_0061;
     price: 95;
-    attributes: 8;
     description: "A clean-room timber dining chair with cancel-safe Comfort seating.";
     sprite: Sprite::procedural("chair", primary: #AC7C4E, accent: #D0AE84, trim: #583C24);
 
-    sit_ticks: 2;
-    sit_cycles: 3;
-    comfort_step: 18;
-    max_entry_comfort: 95;
-
     sound creak = preset("wood_creak", wav: "open_chair_creak");
 
-    slot seat_entry {
-        kind: routing,
-        offset: [0.0, -0.65, 0.0],
-        standing: true,
-        sitting: true,
-        ground: true,
-        facing: north,
-    }
+    slot seat_entry = routing([0.0, -0.65, 0.0], sitting: true);
 
     interaction "Sit" {
         autonomy: 45,
-        attenuation: 0.02,
-        advertises: [
-            comfort +45 (min: -100),
-        ],
-        guard(sim) => !self.occupied && sim.motive.comfort < max_entry_comfort,
+        advertises: [comfort +45],
+        lock: self.occupied,
+        guard(sim) => sim.motive.comfort < max_entry_comfort,
         run(sim) {
-            with lock(self.occupied) {
-                play_sound(creak, self);
-                let mut cycles: i16 = 0;
-                sit_comfort_loop(sim, &mut cycles);
-            }
-            return true;
+            play_sound(creak);
+            sit_comfort_loop(sim);
         }
     }
 }
