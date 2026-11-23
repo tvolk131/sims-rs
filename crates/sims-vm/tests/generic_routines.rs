@@ -1,9 +1,11 @@
 //! Which Generic Sims Call routines the install's trees call that the
 //! port still refuses.
 //!
-//! Every BHAV in the install is read, the neighborhoods' character
-//! files included; a file, tree, archive or folder that cannot be read
-//! fails the test.
+//! The BHAVs read are those in every IFF file the install's index
+//! lists (loose and in archives) and in the neighborhoods' character
+//! files; a file, tree, archive or folder that cannot be read fails the
+//! test. Other files a game might load (saved lots, downloads outside the
+//! index) are not read.
 //! Each call of opcode 1, Generic Sims Call, gives its routine number
 //! (operand word 0). Each number is
 //! then run once on the synthetic lot of the interpreter tests. A routine
@@ -136,34 +138,45 @@ fn the_generic_routines_the_install_calls_are_ported_or_listed() {
     }
     // The neighborhoods' character files, which a lot's load adds to its
     // index (`Index::add_characters`) but `Index::build` does not. A
-    // neighborhood without a Characters folder has none; any other folder
-    // that cannot be listed fails the test.
+    // neighborhood is a folder whose name starts with "UserData", and its
+    // Characters folder is matched whatever its case, as the game's own
+    // filesystem ignores case. A neighborhood without one has none; a
+    // folder that cannot be listed fails the test.
+    let named = |path: &Path, test: &dyn Fn(&str) -> bool| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| test(&n.to_ascii_lowercase()))
+    };
     let neighborhoods: Vec<PathBuf> = sorted_paths(&root)
         .expect("list the install")
         .into_iter()
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.to_ascii_lowercase().starts_with("userdata"))
-        })
+        .filter(|p| p.is_dir() && named(p, &|n| n.starts_with("userdata")))
         .collect();
+    let shown = |path: &Path| {
+        path.strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    };
     let mut characters = 0;
     for neighborhood in neighborhoods {
-        let folder = neighborhood.join("Characters");
-        let shown = |path: &Path| {
-            path.strip_prefix(&root)
-                .unwrap_or(path)
-                .display()
-                .to_string()
-        };
-        let entries = match sorted_paths(&folder) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+        let folders = match sorted_paths(&neighborhood) {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|p| p.is_dir() && named(p, &|n| n == "characters"))
+                .collect::<Vec<_>>(),
             Err(e) => {
-                unread.push(format!("{}: {e}", shown(&folder)));
+                unread.push(format!("{}: {e}", shown(&neighborhood)));
                 continue;
             }
         };
+        let mut entries = Vec::new();
+        for folder in folders {
+            match sorted_paths(&folder) {
+                Ok(found) => entries.extend(found),
+                Err(e) => unread.push(format!("{}: {e}", shown(&folder))),
+            }
+        }
         let paths = entries.into_iter().filter(|p| {
             p.extension()
                 .and_then(|e| e.to_str())
