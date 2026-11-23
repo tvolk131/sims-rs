@@ -846,6 +846,41 @@ pub fn family_magic_coins(world: &World, family_members: &[u32]) -> i32 {
     total
 }
 
+/// The token kind that names the neighbor a traveler takes along
+/// (Manage Inventory operation 5, 0x455437; read back by Generic Sims Call
+/// 19, 0x450787).
+const COMPANION_TOKEN_KIND: i32 = 1;
+/// The most tokens one inventory holds (0x41f38d).
+const MOST_TOKENS: usize = 0x7fff;
+
+/// What Manage Inventory operation 5 (0x455437) does to `neighbor_id`'s
+/// inventory: every token of kind 1 is erased (0x41f4e5), then one token of
+/// kind 1, count 1 and the companion's GUID is added, unless the inventory
+/// still holds 0x7fff tokens (0x41f38d). The inventory is added empty when
+/// the neighbor has none (0x42a8a1).
+fn write_companion_token(world: &mut World, neighbor_id: i16, companion_guid: u32) {
+    let inventories = &mut world.neighbors.inventories;
+    let at = match inventories.iter().position(|i| i.neighbor == neighbor_id) {
+        Some(at) => at,
+        None => {
+            inventories.push(Inventory {
+                neighbor: neighbor_id,
+                items: Vec::new(),
+            });
+            inventories.len() - 1
+        }
+    };
+    let items = &mut inventories[at].items;
+    items.retain(|i| i.kind != COMPANION_TOKEN_KIND);
+    if items.len() < MOST_TOKENS {
+        items.push(Item {
+            kind: COMPANION_TOKEN_KIND,
+            guid: companion_guid,
+            count: 1,
+        });
+    }
+}
+
 /// Returns the current token count for `(neighbor_id, kind, guid)` in `world`.
 #[must_use]
 pub fn neighbor_token_count(world: &World, neighbor_id: i16, kind: i32, guid: u32) -> u16 {
@@ -1684,6 +1719,18 @@ pub fn depart_to_destination(
         .save()
         .map_err(|e| TravelError::Lot(format!("snapshotting home lot {home_house}: {e}")))?;
     ensure_today_budget_slot(&mut frozen_home.world);
+
+    // A date leaves its companion's token in the leader's inventory, as
+    // the date's departure tree does with Manage Inventory operation 5; the
+    // arrival marker's Generic Sims Call 19 reads it to bring the
+    // companion back.
+    if let TravelParty::Date { companion_guid, .. } = request.party {
+        write_companion_token(
+            &mut frozen_home.world,
+            plan.members[0].neighbor_id,
+            companion_guid,
+        );
+    }
 
     // Deduct travel fare from the staged home lot snapshot.
     if plan.fare > 0 {

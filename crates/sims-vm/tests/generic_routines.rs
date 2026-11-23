@@ -3,8 +3,8 @@
 //!
 //! The BHAVs read are those in every IFF file the install's index
 //! lists (loose and in archives) and in the neighborhoods' character
-//! files; a file, tree, archive or folder that cannot be read fails the
-//! test. Other files a game might load (saved lots, downloads outside the
+//! files (in subfolders and archives too, as a lot's load reads them); a
+//! file, tree, archive or folder that cannot be read fails the test. Other files a game might load (saved lots, downloads outside the
 //! index) are not read.
 //! Each call of opcode 1, Generic Sims Call, gives its routine number
 //! (operand word 0). Each number is
@@ -22,7 +22,7 @@
 #[allow(dead_code)]
 mod support;
 
-use sims_content::{ArchivePool, Index, Install};
+use sims_content::{ArchivePool, Index, Install, Neighborhood};
 use sims_formats::behavior::Behavior;
 use sims_formats::iff::{DELETED, Iff};
 use sims_vm::Trap;
@@ -137,20 +137,21 @@ fn the_generic_routines_the_install_calls_are_ported_or_listed() {
         );
     }
     // The neighborhoods' character files, which a lot's load adds to its
-    // index (`Index::add_characters`) but `Index::build` does not. A
-    // neighborhood is a folder whose name starts with "UserData", and its
-    // Characters folder is matched whatever its case, as the game's own
-    // filesystem ignores case. A neighborhood without one has none; a
-    // folder that cannot be listed fails the test.
-    let named = |path: &Path, test: &dyn Fn(&str) -> bool| {
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| test(&n.to_ascii_lowercase()))
-    };
+    // index (`Index::add_characters`: the Characters folder found whatever
+    // its case, walked recursively, archives' members included) but
+    // `Index::build` does not. A neighborhood is a folder whose name starts
+    // with "UserData"; one without a Characters folder has none. A folder
+    // that cannot be listed or a neighborhood that cannot be opened fails
+    // the test.
     let neighborhoods: Vec<PathBuf> = sorted_paths(&root)
         .expect("list the install")
         .into_iter()
-        .filter(|p| p.is_dir() && named(p, &|n| n.starts_with("userdata")))
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.to_ascii_lowercase().starts_with("userdata"))
+        })
         .collect();
     let shown = |path: &Path| {
         path.strip_prefix(&root)
@@ -160,34 +161,45 @@ fn the_generic_routines_the_install_calls_are_ported_or_listed() {
     };
     let mut characters = 0;
     for neighborhood in neighborhoods {
-        let folders = match sorted_paths(&neighborhood) {
-            Ok(entries) => entries
-                .into_iter()
-                .filter(|p| p.is_dir() && named(p, &|n| n == "characters"))
-                .collect::<Vec<_>>(),
+        let folder = match Neighborhood::open(&neighborhood).and_then(|n| n.characters()) {
+            Ok(Some(folder)) => folder,
+            Ok(None) => continue,
             Err(e) => {
                 unread.push(format!("{}: {e}", shown(&neighborhood)));
                 continue;
             }
         };
-        let mut entries = Vec::new();
-        for folder in folders {
-            match sorted_paths(&folder) {
-                Ok(found) => entries.extend(found),
-                Err(e) => unread.push(format!("{}: {e}", shown(&folder))),
-            }
+        let mut with = index.clone();
+        if let Err(e) = with.add_characters(&folder) {
+            unread.push(format!("{}: {e}", shown(&folder)));
+            continue;
         }
-        let paths = entries.into_iter().filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("iff"))
-        });
-        for path in paths {
+        unread.extend(
+            with.diagnostics
+                .iter()
+                .skip(index.diagnostics.len())
+                .cloned(),
+        );
+        let mount = with
+            .mounts
+            .iter()
+            .position(|m| m.path == Index::CHARACTERS)
+            .expect("the Characters mount just added");
+        for resource in with.resources.iter().filter(|r| r.mount == mount) {
+            if !resource.name().to_ascii_lowercase().ends_with(".iff") {
+                continue;
+            }
             characters += 1;
-            let bytes = std::fs::read(&path).map_err(|e| e.to_string());
-            scan(&shown(&path), bytes, &mut calls, &mut unread);
+            let bytes = resource.read_with(&pool).map_err(|e| e.to_string());
+            scan(
+                &resource.location(&with.root),
+                bytes,
+                &mut calls,
+                &mut unread,
+            );
         }
     }
+    eprintln!("{characters} neighborhood character files");
     assert!(
         characters > 0,
         "the install has no neighborhood character files"

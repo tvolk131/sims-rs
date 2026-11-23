@@ -48,6 +48,17 @@ What was decided:
   neighborhood's inventories live in the world and are written when the
   lot is saved. They differ from the original's file only if the game
   stops before the next save.
+- **A headless Downtown date leaves the companion's token.**
+  `TravelRequest::downtown_date` stands in for the date's departure tree,
+  which runs Manage Inventory operation 5 on the leader before the trip.
+  Departure now does what that operation does (0x455437) to the leader's
+  inventory: every kind-1 token is erased and one is added with count 1
+  and the companion's GUID. Without it the marker took the no-companion
+  branch on a date.
+- **The residual scan reads character files as a lot's load does.** It
+  adds each neighborhood's Characters folder with `Index::add_characters`
+  (found whatever its case, subfolders and archives included), so a tree
+  in `Characters/Imported/` or a character archive is scanned too.
 - **Routine 19 comes off the residuals.** `RESIDUALS` in
   `crates/sims-vm/tests/generic_routines.rs` now lists 23 routines.
 
@@ -69,16 +80,21 @@ How it was checked:
   - no error from the marker is caught.
 
   Without the port it fails on the routine 19 fault.
+- A second test there sends the same Sim on a date with an adult of
+  another family. It checks that routine 19 took the leader's kind-1
+  token, and that the marker marked the companion (PetsOutside 1) and set
+  its DateFlag to the leader. Without the departure token it fails on the
+  companion's PetsOutside.
 - The Goth house's 43,200-tick hash is unchanged.
 
 **Unverified:**
 
-- The companion path on a real trip. The trip tested has no companion,
-  and the departure that writes the kind-1 token could not be run
-  headlessly: the phone's "Call Cab.../Go Downtown" action is dropped from
-  the queue before it runs. The interpreter tests cover the routine
-  itself; what the marker does with a companion after node 11 is not
-  tested.
+- The date's own departure tree. The token is written by the headless
+  date departure, not by the tree that writes it in play: the phone's
+  "Call Cab.../Go Downtown" action is dropped from the queue before it
+  runs. Whether the original also places the companion at arrival, as
+  the headless date does, or leaves it to routine 19 to make, is part of
+  that follow-up.
 - The traveler jumps back about 16 ticks after the marker places it. The
   Sim's walk keeps its own position (see the Magic Town note,
   `20261123-generic-routines-21-and-3.md`). That is the arrival-hold
