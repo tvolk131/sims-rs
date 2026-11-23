@@ -36,7 +36,7 @@ postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 redb = "4.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 sims-antics = { path = "crates/sims-antics" }
 sims-content = { path = "crates/sims-content" }
 sims-core = { path = "crates/sims-core" }
