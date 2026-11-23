@@ -2369,3 +2369,86 @@ fn the_installs_career_texts_hold_no_career_token() {
     let lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
     assert!(lot.program().career_texts_end);
 }
+
+#[test]
+fn play_mode_goth_multi_day_stability() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load_viewed(
+        &root,
+        &house,
+        &[],
+        Frames::default(),
+        Some(GOTH_VIEW_CENTRE),
+    )
+    .unwrap();
+    lot.wait_for_answers();
+    assert_eq!(lot.world().indicators[0], 383);
+
+    // Run 50,000 Play Mode ticks (> 1.15 full Sim days, well past tick 16,407
+    // and midnight rollover at tick 31,478) answering any interactive dialogs
+    // or special panels without ever halting the lot.
+    const TARGET_TICKS: u32 = 50_000;
+    while lot.ticks() < TARGET_TICKS {
+        match lot.step_play() {
+            Ok(_) => {}
+            Err(StepError::Asking { .. }) => {
+                if let Some(asking) = lot.asking() {
+                    let choice = *asking.shown.answers.last().unwrap_or(&2);
+                    lot.answer(choice).unwrap();
+                } else if let Some(asking_sp) = lot.asking_special_panel() {
+                    let resp = match asking_sp.shown.request {
+                        sims_vm::SpecialPanelRequest::CallNeighbor { .. } => {
+                            sims_vm::SpecialPanelResponse::Neighbor(None)
+                        }
+                        sims_vm::SpecialPanelRequest::DowntownLotPicker
+                        | sims_vm::SpecialPanelRequest::VacationLotPicker { .. }
+                        | sims_vm::SpecialPanelRequest::OldTownLotPicker { .. }
+                        | sims_vm::SpecialPanelRequest::StudioTownLotPicker { .. }
+                        | sims_vm::SpecialPanelRequest::MagicTownLotPicker { .. } => {
+                            sims_vm::SpecialPanelResponse::Lot(None)
+                        }
+                        sims_vm::SpecialPanelRequest::WardrobeShop { .. }
+                        | sims_vm::SpecialPanelRequest::CharmTransform { .. }
+                        | sims_vm::SpecialPanelRequest::PetPicker { .. } => {
+                            sims_vm::SpecialPanelResponse::Selection {
+                                accepted: false,
+                                index: 0,
+                            }
+                        }
+                        sims_vm::SpecialPanelRequest::SpellBook { .. }
+                        | sims_vm::SpecialPanelRequest::CookBook { .. } => {
+                            sims_vm::SpecialPanelResponse::Dismissed
+                        }
+                    };
+                    lot.answer_special_panel(resp).unwrap();
+                } else {
+                    panic!("StepError::Asking with neither dialog nor special panel");
+                }
+            }
+            Err(other) => {
+                panic!(
+                    "Play Mode halted on Goth at tick {} (world.ticks={}): {other}",
+                    lot.ticks(),
+                    lot.world().ticks
+                );
+            }
+        }
+    }
+    assert_eq!(lot.ticks(), TARGET_TICKS);
+    assert!(
+        lot.world().globals[28] >= 1,
+        "expected midnight day rollover (days_played={})",
+        lot.world().globals[28]
+    );
+    let plumb_bob = lot.world().indicators[0];
+    assert_eq!(plumb_bob, 383);
+    assert!(
+        lot.world().objects.contains_key(&plumb_bob),
+        "plumb bob (object 383) must remain registered after 50,000 Play Mode ticks"
+    );
+}

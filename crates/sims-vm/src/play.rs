@@ -62,12 +62,14 @@
 //! - A frame of the house view that fails is skipped, and noted in
 //!   [`crate::Update::frame_errors`] with the tick it was drawn before or
 //!   after.
-//!
-//! Only an object's tick and the frames are caught. A fault anywhere else
-//! in the update (the registry's dialogs and removals, the clock) still
-//! halts the lot, as in strict mode. The failure then carries what the
-//! step did before it: the errors caught, a skipped frame before the
-//! first tick, and the sounds ([`crate::boot::StepError::Tick`]).
+//! - Faults during `end_of_update` (queued removals, dynamic-group unlinks,
+//!   dialog-owning removals, deferred `+0x109` partial-pass person removals,
+//!   unported/non-modal dialogs, and resident reselection) and midnight daily
+//!   rollover (`daily::turn_day`, `day_statistics`, grass growth) are caught
+//!   in [`crate::Update::errors`] and cleaned up safely (force-removing a
+//!   faulting queued object without leaving dangling references) rather than
+//!   halting the lot. Missing required clock/scheduler globals and unanswered
+//!   player dialogs/special panels still stop the step as before.
 
 use crate::fault::Fault;
 use std::collections::BTreeSet;
@@ -97,16 +99,29 @@ pub struct ScriptError {
 }
 
 /// What play mode did with an object after its error.
+///
+/// For faults outside `pass()` (`end_of_update` and daily rollover), Play Mode
+/// reuses the existing variants with the following convention:
+/// - [`Recovery::Reset`]: non-terminal fallback recovery (dynamic-group forced
+///   unlink before normal removal, auto-answering/dismissing a non-modal or
+///   unported dialog, reconciling selection/global 3 after a reselection fault,
+///   or daily rollover / grass-growth fallback).
+/// - [`Recovery::Parked`]`(None)`: an object queued for removal was
+///   force-removed after a missing definition or failed `remove_now` (it is no
+///   longer on the lot).
+/// - [`Recovery::Parked`]`(Some(fault))`: a surviving person could not restart
+///   at `Main` during forced-removal recovery and was parked with `fault`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recovery {
     /// What the original does: the other objects were told and the object
-    /// was reset.
+    /// was reset (or, outside `pass()`, a non-terminal fallback completed).
     Reset,
     /// The reset failed with this fault; the object's thread restarted at
     /// Main instead.
     Restarted(Fault),
-    /// The object was parked and is never ticked again: it faulted on its
-    /// first tick after a reset, or (with this fault) even restarting its
+    /// The object was parked (or force-removed in `end_of_update`) and is
+    /// never ticked again: it faulted on its first tick after a reset, was
+    /// force-removed on a failed deletion, or (with this fault) restarting its
     /// thread failed.
     Parked(Option<Fault>),
 }

@@ -75,6 +75,7 @@ use sims_sim::animator::{Animator, HeldPose, Layer};
 use std::collections::BTreeSet;
 
 mod dynamic;
+pub(crate) use dynamic::unlink_tile_force;
 mod find;
 pub(crate) use find::Rules;
 pub(crate) use find::{
@@ -592,18 +593,93 @@ pub(crate) const LEVEL_GRIDS: [u16; 2] = [3, 103];
 /// Unlinks `id` from its tile (ground or upper floor) or container — promoting
 /// any next object in `slot 0` to take its place — and moves it off-lot without
 /// invoking object callbacks.
+///
+/// Unlike [`relink`], verifies that each incoming link (container slot or grid
+/// head) still names `id` before modifying it so a partial failure in
+/// [`Interpreter::take_off_one`] (where `relink` already promoted `slot 0`
+/// before `move_tree` faulted) can never overwrite a surviving object's grid
+/// cell or parent slot.
 pub(crate) fn unlink_off_lot(world: &mut World, id: u16) -> Result<(), Trap> {
-    relink(
-        world,
-        id,
-        Place {
-            on_lot: false,
-            position: [-16, -16],
-            container: None,
-            slot: -1,
-            level: 1,
-        },
-    )?;
+    let old = capture_raw(world, id)?;
+    let next = slot(world, id, 0).ok().flatten().filter(|&n| n != id);
+    let linked_here = if let Some(parent) = old.container {
+        slot(world, parent, old.slot).ok().flatten() == Some(id)
+    } else if old.on_lot {
+        read_head(world, old.position, old.level) == Some(id)
+    } else {
+        false
+    };
+    if linked_here {
+        if let Some(parent) = old.container {
+            write_slot(world, parent, old.slot, 0)?;
+        } else if old.on_lot {
+            write_head(world, old.position, old.level, 0)?;
+        }
+        set_datum(world, id, data::SLOT, -1)?;
+        set_datum(world, id, data::BEFORE, 0)?;
+        if let Some(next) = next {
+            let _ = write_slot(world, id, 0, 0);
+            if let Some(parent) = old.container {
+                write_slot(world, parent, old.slot, next)?;
+                set_datum(world, next, data::SLOT, old.slot as i16)?;
+                set_datum(world, next, data::BEFORE, parent as i16)?;
+            } else {
+                write_head(world, old.position, old.level, next)?;
+                set_datum(world, next, data::SLOT, -1)?;
+                set_datum(world, next, data::BEFORE, 0)?;
+            }
+            if let Some(next_obj) = world.objects.get_mut(&next) {
+                next_obj.position[2] = old.level;
+            }
+        }
+    } else {
+        // `id` is not at `old` (e.g. `take_off_one` already promoted `slot 0`
+        // before `move_tree` faulted). Never touch whatever occupies `old`;
+        // only clear `id`'s own link words and splice any lingering grid cell
+        // or slot elsewhere that still names `id`.
+        set_datum(world, id, data::SLOT, -1)?;
+        set_datum(world, id, data::BEFORE, 0)?;
+        let replacement = next.unwrap_or(0);
+        let mut promoted = false;
+        let needle = id.to_le_bytes();
+        for array_id in LEVEL_GRIDS {
+            if let Some(array) = world.arrays.get_mut(&array_id) {
+                for cell in array.data.as_chunks_mut::<2>().0 {
+                    if *cell == needle {
+                        *cell = if !promoted {
+                            promoted = true;
+                            replacement.to_le_bytes()
+                        } else {
+                            [0, 0]
+                        };
+                    }
+                }
+            }
+        }
+        if promoted && let Some(next) = next {
+            let _ = write_slot(world, id, 0, 0);
+            let _ = set_datum(world, next, data::SLOT, -1);
+            let _ = set_datum(world, next, data::BEFORE, 0);
+        } else if let Some(next) = next {
+            // Look for any surviving object whose slot still names `id`.
+            let id_i16 = id as i16;
+            let holder = world.objects.iter().find_map(|(&oid, obj)| {
+                if oid == id {
+                    return None;
+                }
+                obj.slots
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, s)| (s.object == id_i16).then_some((oid, idx)))
+            });
+            if let Some((parent, idx)) = holder {
+                let _ = write_slot(world, id, 0, 0);
+                let _ = write_slot(world, parent, idx as i32, next);
+                let _ = set_datum(world, next, data::SLOT, idx as i16);
+                let _ = set_datum(world, next, data::BEFORE, parent as i16);
+            }
+        }
+    }
     if let Some(obj) = world.objects.get_mut(&id) {
         obj.position = [-16, -16, 1];
     }
@@ -618,9 +694,24 @@ pub(crate) fn unlink_off_lot(world: &mut World, id: u16) -> Result<(), Trap> {
 pub(crate) struct Cursor {
     root: u16,
     current: Option<u16>,
+    /// Objects already visited across the entire walk so cyclic slot-0 or
+    /// container links (`A <-> B`) return an error instead of looping forever.
+    visited: BTreeSet<u16>,
 }
 
 impl Cursor {
+    fn from_root(root: Option<u16>) -> Cursor {
+        let mut visited = BTreeSet::new();
+        if let Some(r) = root {
+            visited.insert(r);
+        }
+        Cursor {
+            root: root.unwrap_or(0),
+            current: root,
+            visited,
+        }
+    }
+
     /// A walk of the objects on a tile, as 0x43f331 starts it from a
     /// three-byte location (column, row, level; 0x432500): none for a tile
     /// outside the lot's size (lot +0x10) or off levels 1 and 2.
@@ -632,10 +723,7 @@ impl Cursor {
         } else {
             None
         };
-        Cursor {
-            root: root.unwrap_or(0),
-            current: root,
-        }
+        Cursor::from_root(root)
     }
 
     /// The object the walk is at; None when it has ended.
@@ -650,14 +738,17 @@ impl Cursor {
             return Ok(());
         };
         let mut from = 0;
-        let mut seen = BTreeSet::new();
+        let mut ascended = BTreeSet::new();
         loop {
-            if !seen.insert(node) {
+            if !ascended.insert(node) {
                 return Err(Trap::Invalid("the objects on a tile link in a loop".into()));
             }
             let object = world.objects.get(&node).ok_or_else(missing)?;
             for entry in object.slots.iter().skip(from) {
                 if let Some(child) = registered(world, entry.object) {
+                    if !self.visited.insert(child) {
+                        return Err(Trap::Invalid("the objects on a tile link in a loop".into()));
+                    }
                     self.current = Some(child);
                     return Ok(());
                 }
@@ -693,10 +784,7 @@ pub(crate) fn standing_on(world: &World, at: [u8; 3]) -> Result<Vec<u16>, Trap> 
     let Some(root) = head(world, [at[0] as i8, at[1] as i8, at[2] as i8]) else {
         return Ok(Vec::new());
     };
-    let mut cursor = Cursor {
-        root,
-        current: Some(root),
-    };
+    let mut cursor = Cursor::from_root(Some(root));
     let mut chain = Vec::new();
     while let Some(current) = cursor.current {
         if chain.contains(&current) {
@@ -767,10 +855,7 @@ pub(crate) fn on_tile(world: &World, id: u16) -> Result<Option<Vec<u16>>, Trap> 
     if first_on(world, [i32::from(at[0]), i32::from(at[1])], at[2]) != Some(root) {
         return Ok(None);
     }
-    let mut cursor = Cursor {
-        root,
-        current: Some(root),
-    };
+    let mut cursor = Cursor::from_root(Some(root));
     let mut chain = Vec::new();
     while let Some(current) = cursor.current {
         if chain.contains(&current) {
@@ -1071,10 +1156,7 @@ impl Interpreter<'_> {
                 break;
             }
         }
-        let mut cursor = Cursor {
-            root,
-            current: Some(root),
-        };
+        let mut cursor = Cursor::from_root(Some(root));
         let mut seen = BTreeSet::new();
         while let Some(id) = cursor.current {
             if !seen.insert(id) {
@@ -1165,7 +1247,7 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    fn clear_portal_if_unoccupied(
+    pub(crate) fn clear_portal_if_unoccupied(
         &self,
         world: &mut World,
         id: u16,
@@ -1229,7 +1311,9 @@ impl Interpreter<'_> {
         if self.has_function(world, id, SEAT) {
             self.seats_beside(world, forward(was, old_facing).map_err(fail)?)?;
         }
-        if let Some(parent) = parent {
+        if let Some(parent) = parent
+            && world.objects.contains_key(&parent)
+        {
             self.callback(world, parent, function::PLACED, 0)?;
         }
         // 0x4332b7: the door test reads the definition the object stands
@@ -1939,12 +2023,14 @@ impl Interpreter<'_> {
         )
     }
 
-    /// 0x4481eb, for an object in a Sim's head slot: for a person, the object
-    /// in its own head slot instead (record 2; none, nothing happens). Then by
-    /// the first object's GUID: an indicator or pooled star marker
-    /// (`STAR_MARKER`, `0xE933_7020`) leaves the lot unannounced (virtual
-    /// function 0x50 with 0), which also returns a star marker to the
-    /// available pool (`0x448338..0x4483e0`); any other does nothing.
+    /// 0x4481eb, for an object in a Sim's head slot: reads the argument's GUID
+    /// FIRST, then for a person resolves its head slot (record 2; none, nothing
+    /// happens). Matching native `0x4481eb` (`legacy/crates/sims-vm/src/indicator_pools.rs:229`),
+    /// the GUID check tests the argument's GUID, not the resolved occupant's:
+    /// an indicator or pooled star marker (`STAR_MARKER`, `0xE933_7020`) leaves
+    /// the lot unannounced (virtual function 0x50 with 0), which also returns a
+    /// star marker to the available pool (`0x448338..0x4483e0`); any other
+    /// object (including a person passed directly) does nothing.
     pub(crate) fn release_from_head(&self, world: &mut World, id: u16) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
@@ -2027,10 +2113,14 @@ impl Interpreter<'_> {
         }
         let parts = self.parts(world, id).map_err(fail)?;
         for &part in &parts {
-            self.callback(world, part, function::LEAVING, 0)?;
+            if world.objects.contains_key(&part) {
+                self.callback(world, part, function::LEAVING, 0)?;
+            }
         }
         for &part in &parts {
-            self.take_off_one(world, part, notify)?;
+            if world.objects.contains_key(&part) {
+                self.take_off_one(world, part, notify)?;
+            }
         }
         Ok(())
     }

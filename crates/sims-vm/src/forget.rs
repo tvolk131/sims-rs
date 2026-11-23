@@ -122,8 +122,14 @@ impl Interpreter<'_> {
         if person.object_uses.iter().any(|u| u.target == t) || person.active.icon == t {
             self.reset_person_letting_go(world, me, target)?;
         }
+        if !world.objects.contains_key(&me) {
+            return Ok(());
+        }
         if person_of(world, me).map_err(fail)?.queue.iter().any(names) {
             self.filter_queue(world, me, target)?;
+        }
+        if !world.objects.contains_key(&me) {
+            return Ok(());
         }
         let person = person_of(world, me).map_err(fail)?;
         if person.last.target == t {
@@ -172,8 +178,11 @@ impl Interpreter<'_> {
                     if kept.len() < KEPT {
                         kept.push(front);
                     }
-                } else if front.target != 0 {
-                    self.callback(world, front.target as u16, CANCELLED, me as i16)?;
+                } else if let Ok(target_id) = u16::try_from(front.target)
+                    && target_id != 0
+                    && world.objects.contains_key(&target_id)
+                {
+                    self.callback(world, target_id, CANCELLED, me as i16)?;
                 }
             }
         })();

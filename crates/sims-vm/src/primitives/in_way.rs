@@ -860,9 +860,12 @@ impl Machine<'_, '_> {
         let queue = person.queue.clone();
         let interpreter = self.interpreter();
         for action in queue.iter().filter(|a| a.uid == uid) {
-            if action.target != 0 {
+            if let Ok(target_id) = u16::try_from(action.target)
+                && target_id != 0
+                && self.world.objects.contains_key(&target_id)
+            {
                 interpreter
-                    .callback(self.world, action.target as u16, CANCELLED, id as i16)
+                    .callback(self.world, target_id, CANCELLED, id as i16)
                     .map_err(|fault: crate::fault::Fault| {
                         fault.unsupported_in(format!(
                             "cancelling action {uid} of person {id} (0x45d6c4)"

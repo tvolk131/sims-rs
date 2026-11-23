@@ -71,8 +71,8 @@ use crate::interpreter::{Interpreter, Status, Stream};
 use crate::placement::Refreshing;
 use crate::play::{Play, Recovery, ScriptError};
 use crate::primitives::dialog::{
-    self, CALL_NEIGHBOR_CANCELLED, DONE, InlineSpecialPanel, NEW, SHOWN, SPECIAL_PANEL_ACCEPTED,
-    SPECIAL_PANEL_CANCELLED, SpecialPanelRequest, SpecialPanelResponse,
+    self, CALL_NEIGHBOR_CANCELLED, DONE, FIRST, InlineSpecialPanel, NEW, SHOWN,
+    SPECIAL_PANEL_ACCEPTED, SPECIAL_PANEL_CANCELLED, SpecialPanelRequest, SpecialPanelResponse,
 };
 use crate::primitives::ui_effect::UiEffectEvent;
 use crate::selection::{publish_waited_for, selected};
@@ -570,13 +570,17 @@ impl Interpreter<'_> {
                     if hours >= 24 {
                         set_global(world, HOURS, hours.wrapping_sub(24))?;
                         signal = Some(0xdc);
-                        daily::turn_day(&game, world).map_err(TickError::Fault)?;
+                        if play.is_some() {
+                            daily::turn_day_play(&game, world, &mut update.errors);
+                        } else {
+                            daily::turn_day(&game, world).map_err(TickError::Fault)?;
+                        }
                     }
                 }
             }
         }
-        game.end_of_update(world, !update.full, player, update)?;
-        if let Some(play) = play {
+        game.end_of_update_with(world, !update.full, player, play.as_deref_mut(), update)?;
+        if let Some(play) = play.as_deref_mut() {
             for gone in deleted.take() {
                 play.fresh.remove(&gone);
             }
@@ -586,7 +590,11 @@ impl Interpreter<'_> {
         // takes its part (see `daily`).
         if signal == Some(0xdc) {
             daily::shift_usage(world);
-            game.day_statistics(world).map_err(TickError::Fault)?;
+            if play.is_some() {
+                game.day_statistics_play(world, &mut update.errors);
+            } else {
+                game.day_statistics(world).map_err(TickError::Fault)?;
+            }
         }
         if hour_turned {
             let period = time_of_day(global(world, HOURS)?);
@@ -598,10 +606,25 @@ impl Interpreter<'_> {
                 // documentation. The original sets global 4 first; neither
                 // the growth nor the marking reads it, so growing first,
                 // which leaves the lot unchanged when it fails, is the same.
-                if global(world, GROW_LAWN)? != 0 {
-                    world
-                        .grow_grass(LAWN_GROWTH)
-                        .map_err(TickError::Unsupported)?;
+                if global(world, GROW_LAWN)? != 0
+                    && let Err(msg) = world.grow_grass(LAWN_GROWTH)
+                {
+                    if play.is_some() {
+                        update.errors.push(ScriptError {
+                            tick: world.ticks,
+                            object: 0,
+                            fault: Fault {
+                                object: 0,
+                                at: None,
+                                trap: Trap::Unsupported(msg),
+                            },
+                            in_thread: false,
+                            then: None,
+                            recovery: Recovery::Reset,
+                        });
+                    } else {
+                        return Err(TickError::Unsupported(msg));
+                    }
                 }
                 set_global(world, TIME_OF_DAY, period)?;
                 world.mark_all_rooms();
@@ -975,7 +998,7 @@ impl Interpreter<'_> {
             let pending = self
                 .taken_off
                 .and_then(|taken_off| taken_off.borrow_mut().remove(&id));
-            if pending.is_none() {
+            if pending.is_none() && catch.is_none() {
                 return Err(fail(Trap::Unsupported(format!(
                     "person {id} starts its tick while queued for removal, with no animator's \
                      refresh worked out as it left the lot: that refresh (0x58da12) depends on \
@@ -1259,6 +1282,28 @@ impl Interpreter<'_> {
         player: &mut dyn Player,
         update: &mut Update,
     ) -> Result<(), TickError> {
+        self.end_of_update_with(world, partial, player, None, update)
+    }
+
+    /// Registry end-of-update pass (`0x4412d1`), with Play Mode recovery when
+    /// `play` is `Some`: removal, dynamic-group, dialog-owner, `+0x109`
+    /// partial-pass person deferral, and resident-reselection faults are caught
+    /// and cleaned up instead of halting the lot. Strict Mode (`play: None`)
+    /// is unchanged.
+    fn end_of_update_with(
+        &self,
+        world: &mut World,
+        partial: bool,
+        player: &mut dyn Player,
+        mut play: Option<&mut Play>,
+        update: &mut Update,
+    ) -> Result<(), TickError> {
+        if play.is_some() {
+            world
+                .dialogs
+                .records
+                .retain(|record| world.objects.contains_key(&record.caller));
+        }
         loop {
             let records = &mut world.dialogs.records;
             let Some(index) = records
@@ -1268,6 +1313,10 @@ impl Interpreter<'_> {
                 break;
             };
             if records[index].status == DONE {
+                records.remove(index);
+                continue;
+            }
+            if play.is_some() && !world.objects.contains_key(&records[index].caller) {
                 records.remove(index);
                 continue;
             }
@@ -1314,18 +1363,65 @@ impl Interpreter<'_> {
                     }
                 }
             }
-            let answers = dialog::answers(record.operands[5]).ok_or_else(|| {
-                TickError::Unsupported(format!(
-                    "object {}'s dialog is of a kind that is not ported (0x436da0)",
-                    record.caller
-                ))
-            })?;
+            let Some(answers) = dialog::answers(record.operands[5]) else {
+                let caller = record.caller;
+                let msg =
+                    format!("object {caller}'s dialog is of a kind that is not ported (0x436da0)");
+                if play.is_some() {
+                    // An informing dialog already branched; a yielding dialog
+                    // needs `FIRST` so its caller consumes the answer once on
+                    // its next tick instead of recreating the record forever.
+                    record.status = if dialog::informs(&record.operands) {
+                        DONE
+                    } else {
+                        FIRST
+                    };
+                    update.errors.push(ScriptError {
+                        tick: world.ticks,
+                        object: caller,
+                        fault: Fault {
+                            object: caller,
+                            at: None,
+                            trap: Trap::Unsupported(msg),
+                        },
+                        in_thread: false,
+                        then: None,
+                        recovery: Recovery::Reset,
+                    });
+                    continue;
+                }
+                return Err(TickError::Unsupported(msg));
+            };
             if !dialog::modal(&record.operands) {
-                return Err(TickError::Unsupported(format!(
-                    "object {} shows a dialog that does not stop the game; answering one \
-                     while the game runs is not ported (0x436da0)",
-                    record.caller
-                )));
+                let caller = record.caller;
+                let msg = format!(
+                    "object {caller} shows a dialog that does not stop the game; answering one \
+                     while the game runs is not ported (0x436da0)"
+                );
+                if play.is_some() {
+                    // For a non-modal choice dialog (`!informs`), supply
+                    // `FIRST` so the yielding caller advances on its next turn
+                    // and then marks the record `DONE`.
+                    record.status = if dialog::informs(&record.operands) {
+                        DONE
+                    } else {
+                        FIRST
+                    };
+                    update.errors.push(ScriptError {
+                        tick: world.ticks,
+                        object: caller,
+                        fault: Fault {
+                            object: caller,
+                            at: None,
+                            trap: Trap::Unsupported(msg),
+                        },
+                        in_thread: false,
+                        then: None,
+                        recovery: Recovery::Reset,
+                    });
+                    continue;
+                }
+                return Err(TickError::Unsupported(msg));
             }
             let shown = Shown {
                 tick: world.ticks,
@@ -1368,6 +1464,7 @@ impl Interpreter<'_> {
         }
         self.end_of_update_special_panels(world, player, update)?;
         if partial
+            && play.is_none()
             && let Some(&id) = world.removals.iter().find(|id| {
                 world
                     .objects
@@ -1388,28 +1485,137 @@ impl Interpreter<'_> {
                     continue;
                 };
                 let guid = object.guid;
+                let has_multipart = object.multipart.is_some();
                 let master = crate::interpreter::object_definition(self.catalog, world, guid)
                     .and_then(|d| self.program.definition(d.resource, d.chunk))
-                    .map(|words| words[10])
-                    .ok_or_else(|| Fault {
-                        object: id,
-                        at: None,
-                        trap: Trap::Invalid(format!("no definition for GUID 0x{guid:08X}")),
-                    })?;
+                    .map(|words| words[10]);
+                let master = match master {
+                    Some(master) => master,
+                    None => {
+                        let fault = Fault {
+                            object: id,
+                            at: None,
+                            trap: Trap::Invalid(format!("no definition for GUID 0x{guid:08X}")),
+                        };
+                        if let Some(play) = play.as_deref_mut() {
+                            update.errors.push(ScriptError {
+                                tick: world.ticks,
+                                object: id,
+                                fault,
+                                in_thread: false,
+                                then: None,
+                                recovery: Recovery::Parked(None),
+                            });
+                            for gone in self.force_remove_object(world, id, &mut update.errors) {
+                                play.fresh.remove(&gone);
+                            }
+                            world
+                                .dialogs
+                                .records
+                                .retain(|r| world.objects.contains_key(&r.caller));
+                            update.removed.push(id);
+                            continue;
+                        }
+                        return Err(fault.into());
+                    }
+                };
                 // 0x442450 to 0x4424b0: a tile of a group whose type has
                 // the dynamic group function leaves its group first.
                 if master != 0
-                    && object.multipart.is_some()
+                    && has_multipart
                     && self.has_function(world, id, function::DYNAMIC_GROUP)
+                    && let Err(fault) = self.leave_group(world, id)
                 {
-                    self.leave_group(world, id)?;
+                    if play.is_some() {
+                        update.errors.push(ScriptError {
+                            tick: world.ticks,
+                            object: id,
+                            fault,
+                            in_thread: false,
+                            then: None,
+                            recovery: Recovery::Reset,
+                        });
+                        crate::placement::unlink_tile_force(world, id);
+                    } else {
+                        return Err(fault.into());
+                    }
+                }
+                if !world.objects.contains_key(&id) {
+                    if let Some(play) = play.as_deref_mut() {
+                        play.fresh.remove(&id);
+                        world
+                            .dialogs
+                            .records
+                            .retain(|r| world.objects.contains_key(&r.caller));
+                    }
+                    update.removed.push(id);
+                    continue;
                 }
                 if world.dialogs.records.iter().any(|r| r.caller == id) {
-                    return Err(TickError::Unsupported(format!(
-                        "removing object {id}, which owns a dialog, is not ported"
-                    )));
+                    if play.is_some() {
+                        world.dialogs.records.retain(|r| r.caller != id);
+                    } else {
+                        return Err(TickError::Unsupported(format!(
+                            "removing object {id}, which owns a dialog, is not ported"
+                        )));
+                    }
                 }
-                self.remove_now(world, id)?;
+                if let Some(play) = play.as_deref_mut() {
+                    let group_parts = self.parts(world, id).unwrap_or_else(|_| vec![id]);
+                    let local_deleted = RefCell::new(Vec::new());
+                    let deleted_log = self.deleted.unwrap_or(&local_deleted);
+                    let deleted_before = deleted_log.borrow().len();
+                    let remover = Interpreter {
+                        deleted: Some(deleted_log),
+                        ..*self
+                    };
+                    if let Err(fault) = remover.remove_now(world, id) {
+                        update.errors.push(ScriptError {
+                            tick: world.ticks,
+                            object: id,
+                            fault,
+                            in_thread: false,
+                            then: None,
+                            recovery: Recovery::Parked(None),
+                        });
+                        // Exclude any part ID already deleted during this
+                        // `remove_now` call: if a later part's Reset callback
+                        // created a brand-new object reusing that ID, the
+                        // fallback must NOT delete the replacement!
+                        let already_deleted: std::collections::BTreeSet<u16> = deleted_log.borrow()
+                            [deleted_before..]
+                            .iter()
+                            .copied()
+                            .collect();
+                        for &gone in &already_deleted {
+                            play.fresh.remove(&gone);
+                        }
+                        for part in group_parts {
+                            if already_deleted.contains(&part) {
+                                continue;
+                            }
+                            for gone in remover.force_remove_object(world, part, &mut update.errors)
+                            {
+                                play.fresh.remove(&gone);
+                            }
+                        }
+                        if !already_deleted.contains(&id) && world.objects.contains_key(&id) {
+                            for gone in remover.force_remove_object(world, id, &mut update.errors) {
+                                play.fresh.remove(&gone);
+                            }
+                        }
+                        play.fresh.remove(&id);
+                    }
+                    // Drop any orphaned dialog records left by deleted held
+                    // children, multi-tile partners, or removal callbacks that
+                    // posted an informing dialog on an object being removed.
+                    world
+                        .dialogs
+                        .records
+                        .retain(|r| world.objects.contains_key(&r.caller));
+                } else {
+                    self.remove_now(world, id)?;
+                }
                 update.removed.push(id);
             }
             // 0x4424cb: on a tick count that is a multiple of 40, registry
@@ -1440,10 +1646,33 @@ impl Interpreter<'_> {
         };
         if reselect {
             let before = selected(world);
-            let chosen = self.select_next_resident(world)?;
+            let mut reselect_faulted = false;
+            let chosen = match self.select_next_resident(world) {
+                Ok(chosen) => chosen,
+                Err(fault) if play.is_some() => {
+                    reselect_faulted = true;
+                    update.errors.push(ScriptError {
+                        tick: world.ticks,
+                        object: fault.object,
+                        fault,
+                        in_thread: false,
+                        then: None,
+                        recovery: Recovery::Reset,
+                    });
+                    // Reconcile global 3 with the live `selected` flag (for
+                    // example if `select` marked a resident selected before
+                    // faulting on an unported date marker in `move_indicators`).
+                    let reconciled = selected(world).map_or(0, |sim| sim as i16);
+                    if let Some(slot) = world.globals.get_mut(3) {
+                        *slot = reconciled;
+                    }
+                    None
+                }
+                Err(fault) => return Err(fault.into()),
+            };
             let after = selected(world);
             if let Some(coop) = self.coop
-                && (chosen.is_some() || after != before)
+                && (chosen.is_some() || after != before || reselect_faulted)
             {
                 let mut ctx = coop.borrow_mut();
                 let host_id = ctx.session.host_id;

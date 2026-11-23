@@ -318,12 +318,14 @@ impl Interpreter<'_> {
             return Ok(());
         }
         if selected(world).is_none() {
-            self.take_off(world, first, true)?;
+            if world.objects.contains_key(&first) {
+                self.take_off(world, first, true)?;
+            }
             self.refresh_animator(world, sim)
                 .and_then(|()| head_slot_redraw(world, sim))
                 .map_err(|trap| fault(sim, trap))?;
         }
-        if selected(world).is_none() && second != 0 {
+        if selected(world).is_none() && second != 0 && world.objects.contains_key(&second) {
             self.take_off(world, second, true)?;
         }
         if person_word(world, sim, person::FAME)? >= 10 {
