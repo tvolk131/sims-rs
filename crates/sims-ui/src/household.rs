@@ -810,10 +810,23 @@ const UNTITLED: usize = 10;
 
 impl Careers {
     /// Reads every `CARR` of the install's `work.iff`, the levels' titles
-    /// from the `STR#` of the career's ID (0x403f26: for level `k`, string
-    /// `3 + 2k`, and a woman's, `23 + k`, in US English), and the school
-    /// grade strings from `STR# 4097` (0x403f43). An install without the
-    /// file has no careers.
+    /// and the school grade strings from `STR# 4097` (0x403f43). An
+    /// install without the file has no careers.
+    ///
+    /// A career's strings are in the `STR#` of its ID (0x403f26), in US
+    /// English; a career without that table keeps none (0x403fec). Its
+    /// level `k`'s description is string `4 + 2k` (+0x3b4). The titles the
+    /// game shows, a man's and a woman's (+0x54, +0xe0), are strings
+    /// `3 + 2k` and `23 + k` of a second table, the `STR#` of the ID plus
+    /// 1000 (0x404027..0x404057, 0x40427a..0x40430f). Without that table
+    /// they are strings 1000 further on in the first (0x4041d4..0x404269),
+    /// which no career has. The first table's own titles go to +0x16c and
+    /// +0x1f8, which nothing is known to read.
+    ///
+    /// The second tables differ: they spell some titles differently
+    /// ("Back-up Musician", "Free Lance Photographer", "Douser",
+    /// "Papparazzi"), and the Livin' Large careers' woman's titles are
+    /// empty, so the man's shows ([`Careers::title`]).
     ///
     /// The original reads the titles of only the first 11, 16 or 21
     /// careers, by the game's expansion level (0x403f53); here every
@@ -858,8 +871,19 @@ impl Careers {
                         .unwrap_or_default()
                         .to_owned()
                 };
+                let shown = match iff.get(b"STR#", chunk.id.wrapping_add(1000)) {
+                    Some(chunk) => Some(StringTable::parse(iff.data(chunk)).map_err(Error::Format)?),
+                    None => None,
+                };
+                let title = |i: usize| match &shown {
+                    Some(table) => table
+                        .get(i, sims_content::ui_graphics::US_ENGLISH)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    None => text(i + 1000),
+                };
                 let titles = (0..career.levels.len())
-                    .map(|k| [text(3 + 2 * k), text(23 + k)])
+                    .map(|k| [title(3 + 2 * k), title(23 + k)])
                     .collect();
                 let descriptions = (0..career.levels.len()).map(|k| text(4 + 2 * k)).collect();
                 let offer = {

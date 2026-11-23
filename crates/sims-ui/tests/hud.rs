@@ -1064,3 +1064,32 @@ fn interests_and_gifts_panels_render_native_art_and_paginate() {
     assert_eq!(gifts_800, 5, "Gifts must fit 5 items/page at 800x600");
     assert_eq!(gifts_1024, 9, "Gifts must fit 9 items/page at 1024x768");
 }
+
+/// 0x403d64 takes the titles it shows from each career's second string
+/// table, `STR#` ID + 1000, which spells some differently from the first,
+/// and leaves the Livin' Large careers' woman's titles empty.
+#[test]
+fn career_titles_come_from_the_second_string_table() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to read work.iff's career titles");
+        return;
+    };
+    let install = sims_content::Install::detect(&root).unwrap();
+    let index = sims_content::Index::build(&install).unwrap();
+    let careers = household::Careers::load(&index).unwrap();
+    // Musician (12) level 6, Slacker (13) level 7, Paranormal (14) level 5,
+    // Journalism (15) level 3.
+    for (career, level, title) in [
+        (12, 6, "Back-up Musician"),
+        (13, 7, "Free Lance Photographer"),
+        (14, 5, "Douser"),
+        (15, 3, "Papparazzi"),
+    ] {
+        assert_eq!(careers.title(career, level, false), Some(title));
+        // The second table's woman's title is empty: the man's shows.
+        assert_eq!(careers.title(career, level, true), Some(title));
+    }
+    // Where both tables agree, nothing changes.
+    assert_eq!(careers.title(2, 0, false), Some("Waiter"));
+    assert_eq!(careers.title(2, 0, true), Some("Waitress"));
+}
