@@ -3541,4 +3541,65 @@ object "Dead Branch Diagnostic" {
         err.message.contains("unknown function 'missing_helper'"),
         "{err}"
     );
+
+    // Sol R2 P2-1: Helpers can forward constant bool args into built-in compile-time options (`inform:`, `change_icon:`).
+    let fwd_opt_src = r#"
+fn show_notice(is_inform: bool) {
+    dialog(kind: ok, title: title, message: msg, inform: is_inform);
+}
+
+object "Forward Option Probe" {
+    guid: 0x7F34_0006;
+    strings 301 "ProbeStr" {
+        title = "Notice",
+        msg = "Hello",
+    }
+
+    interaction "Notify" {
+        run(sim) {
+            show_notice(true);
+            return true;
+        }
+    }
+}
+"#;
+    let fwd_expanded = sims_antics::v2::expand_v2_source_to_objects(
+        "fwd_opt.antics",
+        fwd_opt_src,
+        &PackResolverConfig::default(),
+    )
+    .expect("helper must forward const bool arg to dialog inform: option");
+    assert!(
+        fwd_expanded[0].air_source.contains("inform: true"),
+        "{}",
+        fwd_expanded[0].air_source
+    );
+
+    // Sol R2 P2-2: Renamed Sim binding (`run(actor)`) allows `param sim: i16 = 0` in `self.attr[sim]`.
+    let renamed_sim_src = r#"
+object "Renamed Sim Param" {
+    guid: 0x7F34_0007;
+    param sim: i16 = 1;
+    state a0: i16 = 0;
+    state a1: i16 = 0;
+
+    interaction "Write" {
+        run(actor) {
+            self.attr[sim] = 77;
+            return true;
+        }
+    }
+}
+"#;
+    let renamed_obj = compile_v2_source(
+        "renamed_sim.antics",
+        renamed_sim_src,
+        &PackResolverConfig::default(),
+    )
+    .expect("`param sim: i16 = 1` must resolve in `self.attr[sim]` when Sim is bound as `actor`");
+    let mut vm3 = V2VmFixture::from_objects(&[&renamed_obj], 100);
+    let rid = vm3.spawn(0x7F34_0007, 4, 4);
+    vm3.run_interaction(rid, "Write", None);
+    assert_eq!(vm3.obj_attr(rid, 0), 0);
+    assert_eq!(vm3.obj_attr(rid, 1), 77);
 }

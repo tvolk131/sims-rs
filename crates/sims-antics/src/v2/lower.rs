@@ -3380,7 +3380,10 @@ impl<'a> TreeLowerer<'a> {
                         _ => Ok(None),
                     };
                 }
-                if self.is_self_ident(name) || self.is_sim_ident(name) || name == "sim" {
+                if self.is_self_ident(name)
+                    || self.is_sim_ident(name)
+                    || (name == "sim" && matches!(self.tree_ctx, TreeContext::ObjectSelf))
+                {
                     return Ok(None);
                 }
                 if let Some(&val) = self.env.i16_params.get(name) {
@@ -3392,26 +3395,31 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
-    /// Resolves a compile-time bool for helper argument substitution (including transitive
-    /// `Binding::ConstBool` forwarding). Unlike `try_eval_const_bool`, this is NEVER used to
-    /// prune `if` branches inside helpers, so dead branches remain type- and symbol-checked.
+    /// Resolves a compile-time bool for helper argument substitution and built-in compile-time
+    /// options (`inform:`, `non_modal:`, `change_icon:`), including `Binding::ConstBool`.
+    /// Unlike `try_eval_const_bool`, this is NEVER used to prune `if` branches inside helpers,
+    /// so untaken branches remain type- and symbol-checked.
     fn try_const_bool_arg(&self, expr: &V2Expr) -> Option<bool> {
-        if let V2Expr::Ident(_, name) = expr
-            && let Some(Binding::ConstBool(b)) = self.lookup_var(name)
-        {
-            return Some(*b);
-        }
-        self.try_eval_const_bool(expr)
+        self.try_eval_const_bool_inner(expr, true)
     }
 
     fn try_eval_const_bool(&self, expr: &V2Expr) -> Option<bool> {
+        self.try_eval_const_bool_inner(expr, false)
+    }
+
+    fn try_eval_const_bool_inner(&self, expr: &V2Expr, allow_const_binding: bool) -> Option<bool> {
         match expr {
             V2Expr::Bool(_, b) => Some(*b),
             V2Expr::Ident(_, name) => {
-                if self.lookup_var(name).is_some()
-                    || self.is_self_ident(name)
+                if let Some(binding) = self.lookup_var(name) {
+                    if allow_const_binding && let Binding::ConstBool(b) = binding {
+                        return Some(*b);
+                    }
+                    return None;
+                }
+                if self.is_self_ident(name)
                     || self.is_sim_ident(name)
-                    || name == "sim"
+                    || (name == "sim" && matches!(self.tree_ctx, TreeContext::ObjectSelf))
                 {
                     None
                 } else {
@@ -3422,15 +3430,17 @@ impl<'a> TreeLowerer<'a> {
                 op: V2UnaryOp::Not,
                 inner,
                 ..
-            } => self.try_eval_const_bool(inner).map(|b| !b),
+            } => self
+                .try_eval_const_bool_inner(inner, allow_const_binding)
+                .map(|b| !b),
             V2Expr::Binary {
                 lhs,
                 op: V2BinOp::And,
                 rhs,
                 ..
-            } => match self.try_eval_const_bool(lhs) {
+            } => match self.try_eval_const_bool_inner(lhs, allow_const_binding) {
                 Some(false) => Some(false),
-                Some(true) => self.try_eval_const_bool(rhs),
+                Some(true) => self.try_eval_const_bool_inner(rhs, allow_const_binding),
                 None => None,
             },
             V2Expr::Binary {
@@ -3438,9 +3448,9 @@ impl<'a> TreeLowerer<'a> {
                 op: V2BinOp::Or,
                 rhs,
                 ..
-            } => match self.try_eval_const_bool(lhs) {
+            } => match self.try_eval_const_bool_inner(lhs, allow_const_binding) {
                 Some(true) => Some(true),
-                Some(false) => self.try_eval_const_bool(rhs),
+                Some(false) => self.try_eval_const_bool_inner(rhs, allow_const_binding),
                 None => None,
             },
             _ => None,
@@ -3448,7 +3458,7 @@ impl<'a> TreeLowerer<'a> {
     }
 
     fn eval_const_bool_required(&self, expr: &V2Expr, span: Span) -> Result<bool> {
-        self.try_eval_const_bool(expr).ok_or_else(|| {
+        self.try_const_bool_arg(expr).ok_or_else(|| {
             Error::at(
                 span,
                 "expected compile-time boolean ('true', 'false', or bool param)",
@@ -3480,7 +3490,10 @@ impl<'a> TreeLowerer<'a> {
                         )),
                     };
                 }
-                if self.is_self_ident(name) || self.is_sim_ident(name) || name == "sim" {
+                if self.is_self_ident(name)
+                    || self.is_sim_ident(name)
+                    || (name == "sim" && matches!(self.tree_ctx, TreeContext::ObjectSelf))
+                {
                     return Err(Error::at(
                         *span,
                         format!("expected constant i16, found '{name}'"),
