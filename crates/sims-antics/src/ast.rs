@@ -276,6 +276,7 @@ pub enum PrimitiveCall {
         operator: u8,
         rhs: OperandRef,
     },
+    FindBestInteraction,
     Grab,
     Drop,
     ChangeSuit {
@@ -291,6 +292,23 @@ pub enum PrimitiveCall {
         dst: OperandRef,
         range: OperandRef,
     },
+    Burn {
+        mode: u8,
+        flags: u8,
+    },
+    Tutorial {
+        mode: u8,
+    },
+    GetDistanceTo {
+        temp: u8,
+        flags: u8,
+        from: Option<OperandRef>,
+    },
+    GetDirectionTo {
+        dst: OperandRef,
+        flags: u8,
+        from: Option<OperandRef>,
+    },
     PushInteraction {
         menu: u8,
         object_slot: u8,
@@ -302,6 +320,9 @@ pub enum PrimitiveCall {
         function: u16,
         flags: u8,
         origin: Option<OperandRef>,
+    },
+    Breakpoint {
+        cond: OperandRef,
     },
     FindLocation {
         mode: u8,
@@ -317,12 +338,32 @@ pub enum PrimitiveCall {
         target: u16,
         flags: u8,
     },
+    MakeNewCharacter {
+        skin: LocalRef,
+        age: LocalRef,
+        sex: LocalRef,
+        species: u8,
+    },
     RunFunctionalTree {
         function: u16,
         change_icon: bool,
     },
+    ShowString {
+        table: u16,
+        index: u16,
+    },
+    LookTowards {
+        mode: i16,
+    },
     PlaySound {
         sound_id: u16,
+        flags: u8,
+    },
+    OldRelationship {
+        write: bool,
+        column: u8,
+        param: i8,
+        direction: u8,
         flags: u8,
     },
     AlterBudget {
@@ -358,6 +399,7 @@ pub enum PrimitiveCall {
         stop_at: OperandRef,
     },
     ClearMotiveChanges,
+    GosubFoundAction,
     SetToNext {
         mode: u8,
         guid: u32,
@@ -367,6 +409,22 @@ pub enum PrimitiveCall {
     TestObjectType {
         guid: u32,
         object: OperandRef,
+    },
+    FindWorstMotives {
+        target: u16,
+        mode: u16,
+    },
+    UiEffect {
+        mode: u8,
+        target: Option<OperandRef>,
+        flags: u8,
+    },
+    SpecialEffect {
+        duration: i16,
+        kind: u8,
+        size: u8,
+        flags: u8,
+        str_index: u8,
     },
     Dialog {
         kind: u8,
@@ -415,6 +473,11 @@ pub enum PrimitiveCall {
         slot: u16,
         mode: u16,
         flags: u8,
+    },
+    Reach {
+        mode: i16,
+        moves: bool,
+        slot_param: i16,
     },
     NotifyIdle,
     ActionString {
@@ -483,6 +546,10 @@ pub enum Stmt {
     While {
         span: Span,
         cond: Condition,
+        body: Vec<Stmt>,
+    },
+    Loop {
+        span: Span,
         body: Vec<Stmt>,
     },
     Break {

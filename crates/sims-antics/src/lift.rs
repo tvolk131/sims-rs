@@ -8,7 +8,9 @@ use crate::ir::{
     BconChunk, BhavChunk, ObjdChunk, ObjfChunk, SlotChunk, StringEntry, StringFormat,
     StringTableChunk, TtabChunk,
 };
-use crate::structure_lift::{LiftOptions, decode_instruction_for_labeled_air};
+use crate::structure_lift::{
+    LiftOptions, LiftSymbols, decode_instruction_for_labeled_air, instruction_comment,
+};
 use sims_formats::behavior::{Behavior, Interaction, InteractionTable, MotiveAdvertisement};
 use sims_formats::execution::{ObjectFunctions, Slots};
 use sims_formats::strings::{Format, StringTable};
@@ -74,6 +76,18 @@ pub fn format_bhav_labeled_air_with_arities(
     opts: LiftOptions,
     callee_arities: Option<&BTreeMap<u16, usize>>,
 ) -> String {
+    format_bhav_labeled_air_with_context(chunk, opts, callee_arities, None)
+}
+
+/// Formats a [`BhavChunk`] into labeled-CFG `.air` (Antics IR) source text with optional
+/// `callee_arities` protection and optional in-memory [`LiftSymbols`] readability comments.
+#[must_use]
+pub fn format_bhav_labeled_air_with_context(
+    chunk: &BhavChunk,
+    opts: LiftOptions,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+    symbols: Option<&LiftSymbols>,
+) -> String {
     let mut out = format_bhav_header(chunk);
     let bounds = match chunk.format {
         0x8000 => Some((4usize, 0usize)),
@@ -119,23 +133,33 @@ pub fn format_bhav_labeled_air_with_arities(
         let ins_opts = if protected[idx] {
             LiftOptions {
                 strict_padding: true,
+                annotate_comments: opts.annotate_comments,
             }
         } else {
             opts
+        };
+        let comment = if opts.annotate_comments {
+            instruction_comment(ins, symbols)
+        } else {
+            None
         };
         if let Some((arg_bound, local_bound)) = bounds
             && let Some(decoded) =
                 decode_instruction_for_labeled_air(ins, arg_bound, local_bound, ins_opts)
         {
-            let _ = writeln!(out, "    {decoded} -> true: {on_true}, false: {on_false};");
+            let _ = write!(out, "    {decoded} -> true: {on_true}, false: {on_false};");
         } else {
             let [b0, b1, b2, b3, b4, b5, b6, b7] = ins.operands;
-            let _ = writeln!(
+            let _ = write!(
                 out,
                 "    op {:#06x} ({b0:#04x}, {b1:#04x}, {b2:#04x}, {b3:#04x}, {b4:#04x}, {b5:#04x}, {b6:#04x}, {b7:#04x}) -> true: {on_true}, false: {on_false};",
                 ins.opcode
             );
         }
+        if let Some(c) = comment {
+            let _ = write!(out, " // {c}");
+        }
+        out.push('\n');
     }
     out.push_str("}\n");
     out

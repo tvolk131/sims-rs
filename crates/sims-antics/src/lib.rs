@@ -38,12 +38,14 @@ pub use compile::{
 pub use error::{Error, Result, Span};
 pub use lift::{
     format_bhav_air, format_bhav_antics, format_bhav_labeled_air,
-    format_bhav_labeled_air_with_arities, format_bhav_raw_air,
+    format_bhav_labeled_air_with_arities, format_bhav_labeled_air_with_context,
+    format_bhav_raw_air,
 };
 pub use sim_pack::{StandalonePack, compile_standalone_pack_dir};
 pub use structure_lift::{
-    LiftOptions, StructuredLiftOutcome, lift_bhav_air_structured,
-    lift_bhav_air_structured_with_options, lift_bhav_structured, lift_bhav_structured_with_arities,
+    LiftOptions, LiftSymbols, StructuredLiftOutcome, extract_lift_symbols_from_iff,
+    lift_bhav_air_structured, lift_bhav_air_structured_with_options, lift_bhav_structured,
+    lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
     lift_bhav_structured_with_options,
 };
 pub use v2::{

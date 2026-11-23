@@ -712,9 +712,10 @@ fn compute_private_helper_param_consts(
             if !reach[i] {
                 continue;
             }
-            // `RunFunctionalTree` (20) or `RunTreeByName` (28) can invoke private trees dynamically
-            // with caller temps (`named_tree.rs:100`), so no private helper has a closed inline caller set.
-            if matches!(ins.opcode, 20 | 28) {
+            // `RunFunctionalTree` (20), `RunTreeByName` (28), `GosubFoundAction` (30), and
+            // `Reach` (47, which runs `"CT - Grab"` / `"CT - Put"` by name) can invoke private
+            // trees dynamically, so no private helper has a closed inline caller set.
+            if matches!(ins.opcode, 20 | 28 | 30 | 47) {
                 has_dynamic_tree_dispatch = true;
             }
             if !(4096..=8191).contains(&ins.opcode) {
@@ -855,7 +856,7 @@ fn compute_node_const_sets(
                     }
                 }
             }
-            8 => {
+            8 | 12 => {
                 let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
                 let dst_idx = word_i16(ops, 0);
                 if dst_scope == 9 {
@@ -870,6 +871,10 @@ fn compute_node_const_sets(
                 let p = word_i16(ops, 0);
                 true_p.insert(p, None);
                 false_p.insert(p, None);
+            }
+            24 if ops[0] == 0 => {
+                // Old Relationship read writes `param[ops[2] as i8]` on `on_true` only (`relationship.rs:61`).
+                true_p.insert(i16::from(ops[2] as i8), None);
             }
             26 if ops[2] & 4 == 0 => {
                 // Relationship read writes into `(ops[4], word_i16(ops, 6))` on `on_true` only.
@@ -1301,6 +1306,56 @@ fn verify_bhav_static(
                         );
                     }
                 }
+                10 => {
+                    if ops[0] > 1 {
+                        add_err(
+                            violations,
+                            SafetyCategory::PotentialTrap,
+                            idx,
+                            format!("Tutorial invalid mode {} (must be 0 or 1)", ops[0]),
+                        );
+                    }
+                }
+                11 => {
+                    let temp = word_i16(ops, 0);
+                    if !(0..=7).contains(&temp) {
+                        add_err(
+                            violations,
+                            SafetyCategory::PotentialTrap,
+                            idx,
+                            format!("GetDistanceTo temp {temp} out of 0..=7 range"),
+                        );
+                    }
+                    if ops[2] & 1 != 0 {
+                        check_operand(ops[3], word_i16(ops, 4), false, violations);
+                    }
+                }
+                12 => {
+                    let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
+                    if dst_scope > 255 {
+                        add_err(
+                            violations,
+                            SafetyCategory::PotentialTrap,
+                            idx,
+                            format!("GetDirectionTo destination scope {dst_scope} exceeds 255"),
+                        );
+                    } else {
+                        check_operand(dst_scope as u8, word_i16(ops, 0), true, violations);
+                        if matches!(dst_scope, 14 | 15 | 17) {
+                            add_err(
+                                violations,
+                                SafetyCategory::PotentialTrap,
+                                idx,
+                                format!(
+                                    "GetDirectionTo destination scope {dst_scope} is a float motive (no word pointer)"
+                                ),
+                            );
+                        }
+                    }
+                    if ops[4] & 1 != 0 {
+                        check_operand(ops[5], word_i16(ops, 6), false, violations);
+                    }
+                }
                 13 => {
                     let obj_slot = i16::from(ops[1]);
                     if ops[3] & 2 != 0 {
@@ -1325,6 +1380,19 @@ fn verify_bhav_static(
                                 format!("FindBestObject origin scope {scope} exceeds u8 range"),
                             );
                         }
+                    }
+                }
+                15 => {
+                    let scope = word_i16(ops, 2);
+                    if !(0..=255).contains(&scope) {
+                        add_err(
+                            violations,
+                            SafetyCategory::PotentialTrap,
+                            idx,
+                            format!("Breakpoint scope {scope} out of 0..=255 range"),
+                        );
+                    } else {
+                        check_operand(scope as u8, word_i16(ops, 0), false, violations);
                     }
                 }
                 16 => {
@@ -1358,6 +1426,22 @@ fn verify_bhav_static(
                         );
                     }
                 }
+                19 => {
+                    check_operand(25, i16::from(ops[0]), false, violations);
+                    check_operand(25, i16::from(ops[1]), false, violations);
+                    check_operand(25, i16::from(ops[2]), false, violations);
+                }
+                22 => {
+                    let mode = word_i16(ops, 0);
+                    if !(0..=3).contains(&mode) {
+                        add_err(
+                            violations,
+                            SafetyCategory::PotentialTrap,
+                            idx,
+                            format!("LookTowards invalid mode {mode} (must be 0..=3)"),
+                        );
+                    }
+                }
                 23 => {
                     let sound_id = u16::from_le_bytes([ops[0], ops[1]]);
                     if sound_id != 0 && !model.fwavs.contains(&sound_id) {
@@ -1368,6 +1452,32 @@ fn verify_bhav_static(
                             format!("PlaySound references missing FWAV #{sound_id}"),
                         );
                     }
+                }
+                24 => {
+                    if (ops[1] as i8) < 0 {
+                        add_err(
+                            violations,
+                            SafetyCategory::PotentialTrap,
+                            idx,
+                            format!("OldRelationship negative column {}", ops[1] as i8),
+                        );
+                    }
+                    if ops[3] > 3 {
+                        add_err(
+                            violations,
+                            SafetyCategory::PotentialTrap,
+                            idx,
+                            format!(
+                                "OldRelationship invalid direction {} (must be 0..=3)",
+                                ops[3]
+                            ),
+                        );
+                    }
+                    if matches!(ops[3], 2 | 3) {
+                        check_operand(9, 0, false, violations);
+                    }
+                    let writes_param = ops[0] == 0;
+                    check_operand(9, i16::from(ops[2] as i8), writes_param, violations);
                 }
                 25 => {
                     let scope = match ops[0] {
@@ -1433,6 +1543,36 @@ fn verify_bhav_static(
                 }
                 32 => {
                     check_operand(ops[6], word_i16(ops, 4), false, violations);
+                }
+                33 => {
+                    let target = u16::from_le_bytes([ops[4], ops[5]]);
+                    let mode = u16::from_le_bytes([ops[6], ops[7]]);
+                    if target == 2 {
+                        add_err(
+                            violations,
+                            SafetyCategory::PotentialTrap,
+                            idx,
+                            "FindWorstMotives target 2 always names no person".to_owned(),
+                        );
+                    }
+                    if mode > 2 {
+                        add_err(
+                            violations,
+                            SafetyCategory::PotentialTrap,
+                            idx,
+                            format!("FindWorstMotives invalid mode {mode} (must be 0..=2)"),
+                        );
+                    }
+                }
+                34 => {
+                    if ops[0] <= 2 {
+                        check_operand(ops[1], word_i16(ops, 2), false, violations);
+                    }
+                }
+                35 => {
+                    if ops[4] & 0x20 != 0 {
+                        check_operand(25, word_i16(ops, 0), false, violations);
+                    }
                 }
                 36 => {
                     // Dialog STR# 301 indices: [0]=btn3, [1]=mode4, [2]=msg, [3]=btn1, [4]=btn2, [6]=title.
@@ -1541,6 +1681,9 @@ fn verify_bhav_static(
                             format!("Snap invalid mode {mode} (must be 0..=4)"),
                         );
                     }
+                }
+                47 if word_i16(ops, 0) == 1 => {
+                    check_operand(9, word_i16(ops, 4), false, violations);
                 }
                 _ => {}
             }
@@ -1859,10 +2002,13 @@ fn collect_mutated_params(bhav: &Behavior, reachable: &[bool]) -> BTreeSet<i16> 
                     mutated.insert(word_i16(ops, 0));
                 }
             }
-            8 => {
+            8 | 12 => {
                 if u16::from_le_bytes([ops[2], ops[3]]) == 9 {
                     mutated.insert(word_i16(ops, 0));
                 }
+            }
+            24 if ops[0] == 0 => {
+                mutated.insert(i16::from(ops[2] as i8));
             }
             26 if ops[2] & 4 == 0 && ops[4] == 9 => {
                 mutated.insert(word_i16(ops, 6));
@@ -1993,7 +2139,7 @@ fn collect_tree_lock_ops(
                     out.wildcard_attr_write = true;
                 }
             }
-        } else if ins.opcode == 8 {
+        } else if matches!(ins.opcode, 8 | 12) {
             let dst_scope = u16::from_le_bytes([ins.operands[2], ins.operands[3]]);
             if dst_scope <= 255 {
                 record_unknown_dst_write(dst_scope as u8, word_i16(&ins.operands, 0), out);
@@ -2004,6 +2150,9 @@ fn collect_tree_lock_ops(
             record_unknown_dst_write(ins.operands[4], word_i16(&ins.operands, 6), out);
         } else if ins.opcode == 31 && ins.operands[4] & 0x80 != 0 {
             record_unknown_dst_write(ins.operands[5], i16::from(ins.operands[7]), out);
+        } else if matches!(ins.opcode, 30 | 47) {
+            // GosubFoundAction (30) and Reach (47, CT - Grab/Put) invoke dynamic trees.
+            out.has_dynamic_call = true;
         } else if ins.opcode == 28 {
             match resolve_named_tree_local(model, &ins.operands) {
                 NamedTreeResolution::NoMatchFalse => {}
@@ -2934,12 +3083,33 @@ fn prove_interaction_lock_safety(
                         write_sym_operand(&mut next_true, 9, p, SymWord::Const(0));
                         write_sym_operand(&mut next_false, 9, p, SymWord::Const(0));
                     }
+                    3 | 19 => {
+                        // FindBestInteraction (3) and MakeNewCharacter (19) overwrite `stack_obj`
+                        // on `true` (`autonomy.rs:11`, `make_character.rs:30`).
+                        write_sym_operand(&mut next_true, 10, 0, SymWord::Unknown);
+                    }
                     8 => {
                         let dst_idx = word_i16(ops, 0);
                         let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
                         if dst_scope <= 255 {
                             apply_unknown_write(&mut next_true, dst_scope as u8, dst_idx);
                             apply_unknown_write(&mut next_false, dst_scope as u8, dst_idx);
+                        }
+                    }
+                    11 => {
+                        // GetDistanceTo writes distance into `temps[word(ops, 0)]` (`distance.rs:68`).
+                        if let Ok(t) = usize::try_from(word_i16(ops, 0))
+                            && t < 8
+                        {
+                            next_true.temps[t] = SymWord::Unknown;
+                        }
+                    }
+                    12 => {
+                        // GetDirectionTo writes direction into `(word_u16(ops, 2), word_i16(ops, 0))`.
+                        let dst_idx = word_i16(ops, 0);
+                        let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
+                        if dst_scope <= 255 {
+                            apply_unknown_write(&mut next_true, dst_scope as u8, dst_idx);
                         }
                     }
                     14 => {
@@ -2984,10 +3154,25 @@ fn prove_interaction_lock_safety(
                         write_sym_operand(&mut next_true, 9, p, SymWord::Unknown);
                         write_sym_operand(&mut next_false, 9, p, SymWord::Unknown);
                     }
+                    24 if ops[0] == 0 => {
+                        // OldRelationship read writes `param[ops[2] as i8]` on `true` only.
+                        write_sym_operand(
+                            &mut next_true,
+                            9,
+                            i16::from(ops[2] as i8),
+                            SymWord::Unknown,
+                        );
+                    }
                     26 if ops[2] & 4 == 0 => {
                         // Relationship read writes into `(ops[4], word_i16(ops, 6))` on `true` only
                         // (`relationship.rs:178-195`); `false` exits before writing.
                         apply_unknown_write(&mut next_true, ops[4], word_i16(ops, 6));
+                    }
+                    33 => {
+                        // FindWorstMotives overwrites temps 0..5 (`worst_motives.rs:93`).
+                        for slot in &mut next_true.temps[..5] {
+                            *slot = SymWord::Unknown;
+                        }
                     }
                     31 => {
                         // SetToNext writes dest (or stack_obj if bit 7 clear) on `true`;
@@ -3146,13 +3331,22 @@ fn eval_expr_compare(l: i16, op: u8, r: i16) -> Option<bool> {
 /// [`primitive_may_trap_in_lock_prover`] for lock-safety trap modeling.
 pub(crate) fn is_always_true_instruction(ins: &Instruction) -> bool {
     match ins.opcode {
-        0 => true,                      // Sleep (yields until done, then branches true)
-        6 => true,                      // ChangeSuit (`change_suit.rs:66`)
-        7 => true,                      // Refresh (`refresh.rs:36,42,53,56`)
+        0 => true,                             // Sleep (yields until done, then branches true)
+        6 => true,                             // ChangeSuit (`change_suit.rs:66`)
+        7 => true,                             // Refresh (`refresh.rs:36,42,53,56`)
+        11 => true,                            // GetDistanceTo (`distance.rs:69`)
+        12 => true,                            // GetDirectionTo (`direction.rs:88`)
+        15 => true,                            // Breakpoint (`debug.rs:37`)
         16 => ins.operands[0] == 1, // FindLocation mode 1 (take off lot, `find_location.rs:122`)
+        21 => true,                 // ShowString (`debug.rs:41`)
+        22 => word_i16(&ins.operands, 0) == 0, // LookTowards mode 0 (`look_towards.rs:84`)
         23 => true,                 // PlaySound (`sound.rs:61`)
+        24 => ins.operands[4] & 1 == 0, // OldRelationship without fail-if-missing (`relationship.rs:62,161`)
         26 => ins.operands[2] & 1 == 0, // Relationship without fail-if-missing (`relationship.rs:161`)
         29 => true, // SetMotiveChange / ClearMotiveChanges (`motive_change.rs:54,70`)
+        33 => true, // FindWorstMotives (`worst_motives.rs:97`)
+        34 => true, // UiEffect (`ui_effect.rs:358`)
+        35 => true, // SpecialEffect (`special_effect.rs:110,113`)
         41 => true, // SetHeadline (`headline.rs:123..176`)
         48 => true, // StopAllSounds (`sound.rs:71`)
         49 => true, // NotifyIdle (`notify.rs:36,64`)
@@ -3184,24 +3378,71 @@ fn primitive_may_trap_in_lock_prover(
                 || !(0..=2).contains(&mode)
                 || (selector == 1 && frame.stack_obj != SymWord::InitialTarget)
         }
+        9 => frame.stack_obj != SymWord::InitialTarget,
+        10 => ops[0] > 1,
+        11 => {
+            !(0..=7).contains(&word_i16(ops, 0))
+                || frame.stack_obj != SymWord::InitialTarget
+                || (ops[2] & 1 != 0)
+        }
+        12 => {
+            let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
+            let dst_idx = word_i16(ops, 0);
+            dst_scope > 255
+                || !is_valid_memory_scope(dst_scope as u8)
+                || matches!(
+                    dst_scope,
+                    7 | 14 | 15 | 17 | 21 | 24 | 26 | 27 | 28 | 29 | 33 | 35 | 38
+                )
+                || (dst_scope == 6 && !matches!(dst_idx, 34 | 36))
+                || (dst_scope == 9 && check_param(dst_idx))
+                || (dst_scope == 25 && check_local(dst_idx))
+                || frame.stack_obj != SymWord::InitialTarget
+                || (ops[4] & 1 != 0)
+        }
+        15 => !(word_i16(ops, 2) == 7 && word_i16(ops, 0) == 0),
         16 => {
             frame.stack_obj != SymWord::InitialTarget
                 || (ops[2] & 1 != 0)
                 || matches!(ops[0], 3 | 4)
         }
         17 | 27 | 44 | 45 => frame.synchronous,
-        23 | 48 => false,
-        26 => true, // Relationship can trap on missing target/neighbor or unwritable destination
+        19 | 24 | 26 | 30 => true,
+        21 | 23 | 48 => false,
+        22 => {
+            let m = word_i16(ops, 0);
+            !(0..=3).contains(&m)
+                || (m != 0 && frame.synchronous)
+                || (matches!(m, 2 | 3) && frame.stack_obj != SymWord::InitialTarget)
+        }
         29 => {
             ops[3] & 1 == 0
                 && (!matches!(ops[2], 5..=9 | 14..=15)
                     || !is_valid_memory_scope(ops[0])
                     || !is_valid_memory_scope(ops[1]))
         }
+        33 => {
+            let target = u16::from_le_bytes([ops[4], ops[5]]);
+            let mode = u16::from_le_bytes([ops[6], ops[7]]);
+            target == 2 || mode > 2 || (target == 1 && frame.stack_obj != SymWord::InitialTarget)
+        }
+        34 => {
+            ops[0] <= 2
+                && (!is_valid_memory_scope(ops[1])
+                    || (ops[1] == 6 && word_i16(ops, 2) == 34)
+                    || (ops[1] == 9 && check_param(word_i16(ops, 2)))
+                    || (ops[1] == 25 && check_local(word_i16(ops, 2))))
+        }
+        35 => {
+            frame.synchronous
+                || frame.stack_obj != SymWord::InitialTarget
+                || (ops[4] & 0x20 != 0 && check_local(word_i16(ops, 0)))
+        }
         41 => {
             (ops[0] & 1 != 0 && frame.stack_obj != SymWord::InitialTarget)
                 || (ops[3] == 7 && ops[2] == 2 && check_local(word_i16(ops, 0) >> 1))
         }
+        47 => frame.synchronous || (word_i16(ops, 0) == 1 && check_param(word_i16(ops, 4))),
         49 => frame.stack_obj != SymWord::InitialTarget,
         50 => {
             // `action_string.rs:83-107`: traps if synchronous, if string is missing, or if
@@ -3320,6 +3561,14 @@ fn bhav_uses_global_34(bhav: &BhavChunk) -> bool {
                 || (u16::from_le_bytes([ins.operands[6], ins.operands[7]]) == 6
                     && word_i16(&ins.operands, 4) == 34)
         }
+        11 => ins.operands[2] & 1 != 0 && is_global_34(ins.operands[3], word_i16(&ins.operands, 4)),
+        12 => {
+            (u16::from_le_bytes([ins.operands[2], ins.operands[3]]) == 6
+                && word_i16(&ins.operands, 0) == 34)
+                || (ins.operands[4] & 1 != 0
+                    && is_global_34(ins.operands[5], word_i16(&ins.operands, 6)))
+        }
+        15 => word_i16(&ins.operands, 2) == 6 && word_i16(&ins.operands, 0) == 34,
         // `UI Effect` (opcode 34) reads Global 34 / scratch pointers (`ui_effect.rs:371`).
         34 => true,
         _ => false,
@@ -3446,12 +3695,32 @@ fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
         0 => [ops[0], ops[1], 0, 0, 0, 0, 0, 0],
         // GenericCall: word 0 (routine) only.
         1 => [ops[0], ops[1], 0, 0, 0, 0, 0, 0],
-        // Grab / Drop: operands ignored (`grab.rs:4`, `drop.rs:5`).
-        4 | 5 => [0; 8],
+        // FindBestInteraction / Grab / Drop / GosubFoundAction: operands ignored.
+        3 | 4 | 5 | 30 => [0; 8],
         // ChangeSuit: index, scope, bit 0 of flags (`change_suit.rs:49-50`).
         6 => [ops[0], ops[1], ops[2] & 1, 0, 0, 0, 0, 0],
         // Refresh: word 0 (target) + word 1 (mode) (`refresh.rs:25`).
         7 => [ops[0], ops[1], ops[2], ops[3], 0, 0, 0, 0],
+        // Burn: byte 0 == 1 (in_front), byte 1 bit 0 (any_state) (`burn.rs:136,172`).
+        9 => [u8::from(ops[0] == 1), ops[1] & 1, 0, 0, 0, 0, 0, 0],
+        // Tutorial: byte 0 (mode) only (`events.rs:22`).
+        10 => [ops[0], 0, 0, 0, 0, 0, 0, 0],
+        // GetDistanceTo: word 0 (temp), byte 2 bit 0 (has_from), optional from (3..6) (`distance.rs:47-55`).
+        11 => {
+            if ops[2] & 1 != 0 {
+                [ops[0], ops[1], 1, ops[3], ops[4], ops[5], 0, 0]
+            } else {
+                [ops[0], ops[1], 0, 0, 0, 0, 0, 0]
+            }
+        }
+        // GetDirectionTo: dst (0..4), byte 4 bit 0 (has_from), optional from (5..8) (`direction.rs:45-59`).
+        12 => {
+            if ops[4] & 1 != 0 {
+                [ops[0], ops[1], ops[2], ops[3], 1, ops[5], ops[6], ops[7]]
+            } else {
+                [ops[0], ops[1], ops[2], ops[3], 0, 0, 0, 0]
+            }
+        }
         // PushInteraction: menu, object_slot, priority, flags & 0x0F, icon (when bit 0 set) (`push.rs:65-165`).
         13 => [
             ops[0],
@@ -3471,6 +3740,8 @@ fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
                 [ops[0], ops[1], 0, 0, 0, 0, ops[6], 0]
             }
         }
+        // Breakpoint: word 0 (index) + word 1 (scope) (`debug.rs:32-34`).
+        15 => [ops[0], ops[1], ops[2], ops[3], 0, 0, 0, 0],
         // FindLocation: mode, local (when flags & 1), flags & 7 (`find_location.rs:70-128`).
         16 => [
             ops[0],
@@ -3486,13 +3757,30 @@ fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
         17 => [ops[0], ops[1], ops[2], ops[3], 0, 0, 0, 0],
         // RemoveObject: word 0 (target) + byte 2 (flags) (`remove.rs:47-53`).
         18 => [ops[0], ops[1], ops[2], 0, 0, 0, 0, 0],
+        // MakeNewCharacter: bytes 0..4 (skin, age, sex, species) (`make_character.rs:8-16`).
+        19 => [ops[0], ops[1], ops[2], ops[3], 0, 0, 0, 0],
         // RunFunctionalTree: word 0 (function) + byte 2 bit 0 (`run_functional_tree.rs:75-93`).
         20 => [ops[0], ops[1], ops[2] & 1, 0, 0, 0, 0, 0],
+        // ShowString: word 0 (table) + word 1 (index); bytes 4..8 unused (`debug.rs:12`).
+        21 => [ops[0], ops[1], ops[2], ops[3], 0, 0, 0, 0],
+        // LookTowards: word 0 (mode) only (`look_towards.rs:66`).
+        22 => [ops[0], ops[1], 0, 0, 0, 0, 0, 0],
         // PlaySound: word 0 (sound_id) + effective stack_obj flag (`sound.rs:41-47`).
         23 => {
             let use_stack = ops[4] != 0xFF && ops[4] & 2 != 0;
             [ops[0], ops[1], 0, 0, if use_stack { 2 } else { 0 }, 0, 0, 0]
         }
+        // OldRelationship: byte 0 != 0 (write), col, param, dir, flags & 3 (`relationship.rs:45-64`).
+        24 => [
+            u8::from(ops[0] != 0),
+            ops[1],
+            ops[2],
+            ops[3],
+            ops[4] & 3,
+            0,
+            0,
+            0,
+        ],
         // AlterBudget: resolved scope, index, flags & 3, category (`budget.rs:38-50`).
         25 => {
             let scope = match ops[0] {
@@ -3542,6 +3830,18 @@ fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
         }
         // TestObjectType: GUID (0..4), index (4..6), scope (6); byte 7 ignored (`object_type.rs:6-7`).
         32 => [ops[0], ops[1], ops[2], ops[3], ops[4], ops[5], ops[6], 0],
+        // FindWorstMotives: words 2..4 (target, mode); bytes 0..4 unread (`worst_motives.rs:56-68`).
+        33 => [0, 0, 0, 0, ops[4], ops[5], ops[6], ops[7]],
+        // UiEffect: mode (0); for mode <= 2: scope (1), index (2..4), highlight bit 0 (4) (`ui_effect.rs:324-356`).
+        34 => {
+            if ops[0] <= 2 {
+                [ops[0], ops[1], ops[2], ops[3], ops[4] & 1, 0, 0, 0]
+            } else {
+                [ops[0], 0, 0, 0, 0, 0, 0, 0]
+            }
+        }
+        // SpecialEffect: bytes 0..6 (duration, kind, size, flags, str_index); bytes 6..8 unread (`special_effect.rs:5-7`).
+        35 => [ops[0], ops[1], ops[2], ops[3], ops[4], ops[5], 0, 0],
         // Dialog: kind is low 7 bits of byte 5 (`dialog.rs:569`).
         36 => [
             ops[0],
@@ -3589,6 +3889,16 @@ fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
                 [0, 0, ops[2], ops[3], ops[4], 0, 0, 0]
             } else {
                 [ops[0], ops[1], ops[2], ops[3], ops[4], 0, 0, 0]
+            }
+        }
+        // Reach: word 0 (mode), word 1 != 0 (moves), word 2 (slot_param, mode 1 only) (`reach.rs:106-107,213`).
+        47 => {
+            let mode = word_i16(&ops, 0);
+            let moves = u8::from(word_i16(&ops, 2) != 0);
+            if mode == 1 {
+                [ops[0], ops[1], moves, 0, ops[4], ops[5], 0, 0]
+            } else {
+                [ops[0], ops[1], moves, 0, 0, 0, 0, 0]
             }
         }
         // StopAllSounds: word 0 != 0 boolean (`sound.rs:65`).
@@ -4359,8 +4669,9 @@ pub fn check_bhav_equivalent_with_arities(
             };
         }
 
-        // Random (opcode 8): when range resolves to Global 34, the VM redirects the store
-        // to the range cell (`random.rs:38`), so treat that aliasing pattern as Inconclusive.
+        // Random (opcode 8) / GetDirectionTo (opcode 12): when the secondary read resolves to
+        // Global 34, the VM redirects the store to Global 34 (`random.rs:38`, `direction.rs:65`),
+        // so treat Global 34 / scope 22 aliasing as Inconclusive.
         if ins_a.opcode == 8 {
             let dst_scope = u16::from_le_bytes([ins_a.operands[2], ins_a.operands[3]]);
             let rng_scope = u16::from_le_bytes([ins_a.operands[6], ins_a.operands[7]]);
@@ -4369,6 +4680,18 @@ pub fn check_bhav_equivalent_with_arities(
                 return EquivResult::Inconclusive {
                     reason: format!(
                         "Random instruction at A@n{pc_a}/B@n{pc_b} uses unmodeled Global 34 / scope 22 aliasing"
+                    ),
+                };
+            }
+        } else if ins_a.opcode == 12 {
+            let dst_scope = u16::from_le_bytes([ins_a.operands[2], ins_a.operands[3]]);
+            let from_g34 = ins_a.operands[4] & 1 != 0
+                && ins_a.operands[5] == 6
+                && word_i16(&ins_a.operands, 6) == 34;
+            if from_g34 || dst_scope == 22 {
+                return EquivResult::Inconclusive {
+                    reason: format!(
+                        "GetDirectionTo instruction at A@n{pc_a}/B@n{pc_b} uses unmodeled Global 34 / scope 22 aliasing"
                     ),
                 };
             }
@@ -4399,7 +4722,7 @@ pub fn check_bhav_equivalent_with_arities(
                 env_false_a.write(9, p, sym);
                 env_false_b.write(9, p, sym);
             }
-            8 => {
+            8 | 12 => {
                 let dst_scope = u16::from_le_bytes([ins_a.operands[2], ins_a.operands[3]]);
                 let dst_idx = word_i16(&ins_a.operands, 0);
                 if matches!(dst_scope, 9 | 25) {
@@ -4409,6 +4732,12 @@ pub fn check_bhav_equivalent_with_arities(
                     env_false_a.write(dst_scope as u8, dst_idx, sym);
                     env_false_b.write(dst_scope as u8, dst_idx, sym);
                 }
+            }
+            24 if ins_a.operands[0] == 0 => {
+                // OldRelationship read writes `param[ops[2] as i8]` on `on_true` only.
+                let sym = interner.fresh_event();
+                env_true_a.write(9, i16::from(ins_a.operands[2] as i8), sym);
+                env_true_b.write(9, i16::from(ins_b.operands[2] as i8), sym);
             }
             26 if ins_a.operands[2] & 4 == 0 => {
                 // Relationship read writes into `(ops[4], word_i16(ops, 6))` on `on_true` only.
@@ -4574,7 +4903,8 @@ fn check_primitive_frame_reads(
     };
     match opcode {
         0 => check_op(9, word_i16(ops, 0), "Sleep param"),
-        1 | 4 | 5 | 6 | 7 | 18 | 20 | 23 | 27 | 28 | 48 | 49 | 51 => Ok(()),
+        1 | 3 | 4 | 5 | 6 | 7 | 9 | 10 | 18 | 20 | 21 | 22 | 23 | 27 | 28 | 30 | 33 | 48 | 49
+        | 51 => Ok(()),
         8 => {
             let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
             if dst_scope <= 255 {
@@ -4583,6 +4913,26 @@ fn check_primitive_frame_reads(
             let rng_scope = u16::from_le_bytes([ops[6], ops[7]]);
             if rng_scope <= 255 {
                 check_op(rng_scope as u8, word_i16(ops, 4), "Random range")?;
+            }
+            Ok(())
+        }
+        11 => {
+            if ops[2] & 1 != 0 {
+                check_op(ops[3], word_i16(ops, 4), "GetDistanceTo from")?;
+            }
+            Ok(())
+        }
+        12 => {
+            let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
+            if dst_scope <= 255 {
+                check_dst(
+                    dst_scope as u8,
+                    word_i16(ops, 0),
+                    "GetDirectionTo destination",
+                )?;
+            }
+            if ops[4] & 1 != 0 {
+                check_op(ops[5], word_i16(ops, 6), "GetDirectionTo from")?;
             }
             Ok(())
         }
@@ -4606,6 +4956,13 @@ fn check_primitive_frame_reads(
             }
             Ok(())
         }
+        15 => {
+            let scope = word_i16(ops, 2);
+            if (0..=255).contains(&scope) {
+                check_op(scope as u8, word_i16(ops, 0), "Breakpoint cond")?;
+            }
+            Ok(())
+        }
         16 => {
             if ops[2] & 1 != 0 {
                 check_op(25, i16::from(ops[1]), "FindLocation local")?;
@@ -4613,6 +4970,23 @@ fn check_primitive_frame_reads(
             Ok(())
         }
         17 => check_op(9, word_i16(ops, 0), "IdleForInput param"),
+        19 => {
+            check_op(25, i16::from(ops[0]), "MakeNewCharacter skin")?;
+            check_op(25, i16::from(ops[1]), "MakeNewCharacter age")?;
+            check_op(25, i16::from(ops[2]), "MakeNewCharacter sex")?;
+            Ok(())
+        }
+        24 => {
+            if matches!(ops[3], 2 | 3) {
+                check_op(9, 0, "OldRelationship param[0]")?;
+            }
+            let p = i16::from(ops[2] as i8);
+            check_dst(9, p, "OldRelationship param")?;
+            if ops[0] != 0 {
+                check_op(9, p, "OldRelationship param")?;
+            }
+            Ok(())
+        }
         25 => {
             let scope = match ops[0] {
                 0 => 7,
@@ -4654,6 +5028,18 @@ fn check_primitive_frame_reads(
             Ok(())
         }
         32 => check_op(ops[6], word_i16(ops, 4), "TestObjectType object"),
+        34 => {
+            if ops[0] <= 2 {
+                check_op(ops[1], word_i16(ops, 2), "UiEffect target")?;
+            }
+            Ok(())
+        }
+        35 => {
+            if ops[4] & 0x20 != 0 {
+                check_op(25, word_i16(ops, 0), "SpecialEffect duration local")?;
+            }
+            Ok(())
+        }
         36 | 50 => {
             // Both `Dialog` (`dialog.rs:1498`) and `ActionString` (`action_string.rs:85`)
             // run `format_text`, which reads frame locals via `$Local` / `$NeighborLocal` /
@@ -4725,6 +5111,12 @@ fn check_primitive_frame_reads(
         46 => {
             if u16::from_le_bytes([ops[2], ops[3]]) == 0 {
                 check_op(9, word_i16(ops, 0), "Snap param")?;
+            }
+            Ok(())
+        }
+        47 => {
+            if word_i16(ops, 0) == 1 {
+                check_op(9, word_i16(ops, 4), "Reach slot param")?;
             }
             Ok(())
         }
@@ -6103,6 +6495,133 @@ guard = "Guard"
                 .any(|v| v.category == SafetyCategory::ArityMismatch),
             "valid 7-arg extended inline call with following record must not fail ArityMismatch: {:?}",
             ext7_rep.violations
+        );
+    }
+
+    #[test]
+    fn wave2_primitives_verifier_static_lock_and_equiv_models() {
+        use crate::compile::{compile_antics, compile_object_from_sources};
+
+        let base_manifest = r#"
+[object]
+name = "Wave2VerifierProbe"
+guid = 0x50110003
+init = "Init"
+main = "Init"
+scripts = ["behavior.antics"]
+
+[[interaction]]
+name = "Probe"
+action = "Action"
+guard = "Guard"
+"#;
+
+        // 1. GetDirectionTo writing into `stack.attr[0]` must be tracked as acquiring the lock!
+        let gdt_lock_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4098 "Guard" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            tree 4097 "Action" {
+                get_direction_to(stack.attr[0]);
+                return true;
+            }
+        "#;
+        let gdt_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", gdt_lock_script)])
+                .unwrap();
+        let gdt_rep = verify_object_safety(&gdt_obj).unwrap();
+        assert!(
+            gdt_rep
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::LockLeak),
+            "GetDirectionTo writing stack.attr[0] must be caught as LockLeak: {:?}",
+            gdt_rep.violations
+        );
+
+        // 2. Static trap checks on Tutorial (mode > 1), FindWorstMotives (target 2 / mode > 2),
+        //    LookTowards (mode > 3), and OldRelationship (dir > 3).
+        let traps_script = r#"
+            tree 4096 "Init" (args: 1) {
+                tutorial(2);
+                find_worst_motives(target: 2, mode: 3);
+                look_towards(9);
+                old_relationship(write: true, column: 0, param: 0, dir: 5, flags: 0);
+                return true;
+            }
+            tree 4098 "Guard" { return true; }
+            tree 4097 "Action" { return true; }
+        "#;
+        let traps_obj =
+            compile_object_from_sources(base_manifest, &[("behavior.antics", traps_script)])
+                .unwrap();
+        let traps_rep = verify_object_safety(&traps_obj).unwrap();
+        let trap_msgs: Vec<&str> = traps_rep
+            .violations
+            .iter()
+            .filter(|v| v.category == SafetyCategory::PotentialTrap)
+            .map(|v| v.message.as_str())
+            .collect();
+        assert!(
+            trap_msgs.iter().any(|m| m.contains("Tutorial"))
+                && trap_msgs.iter().any(|m| m.contains("FindWorstMotives"))
+                && trap_msgs.iter().any(|m| m.contains("LookTowards"))
+                && trap_msgs.iter().any(|m| m.contains("OldRelationship")),
+            "expected static PotentialTrap diagnostics for Wave 2 primitives, got: {trap_msgs:?}"
+        );
+
+        // 3. GetDirectionTo with Global 34 `from` redirects destination -> Equiv returns Inconclusive.
+        let gdt_g34_a = &compile_antics(
+            r#"tree 4096 "A" { get_direction_to(temp[0], from: global[34]); return true; }"#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let gdt_g34_b = &compile_antics(
+            r#"tree 4096 "B" { get_direction_to(temp[0], from: global[34]); return true; }"#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        assert!(
+            matches!(
+                check_bhav_equivalent(gdt_g34_a, gdt_g34_b, &EquivOptions::default()),
+                EquivResult::Inconclusive { .. }
+            ),
+            "GetDirectionTo with Global 34 from operand must return Inconclusive"
+        );
+
+        // 4. OldRelationship read (write: false) mutates param[0] on `true`; subsequent read must
+        //    not reuse stale constant `param[0] == 7`.
+        let or_a = &compile_antics(
+            r#"
+            tree 4096 "A" (args: 1) {
+                param[0] := 7;
+                old_relationship(write: false, column: 0, param: 0, dir: 0, flags: 0);
+                if param[0] == 7 { return true; }
+                return false;
+            }
+            "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let or_b = &compile_antics(
+            r#"
+            tree 4096 "B" (args: 1) {
+                param[0] := 7;
+                old_relationship(write: false, column: 0, param: 0, dir: 0, flags: 0);
+                return true;
+            }
+            "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        assert!(
+            matches!(
+                check_bhav_equivalent(or_a, or_b, &EquivOptions::default()),
+                EquivResult::Counterexample { .. }
+            ),
+            "OldRelationship read mutates param[0], so folding param[0] == 7 to true must be rejected"
         );
     }
 }
