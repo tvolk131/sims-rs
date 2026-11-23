@@ -4866,7 +4866,7 @@ impl Game {
         }
         if let Some(picker) = &mut self.destination_picker {
             self.pointer = Some(point);
-            let action = picker.release(self.view.size, point);
+            let action = picker.release(self.view.size, point, self.clock_us);
             return match action {
                 Some(DestinationPickerAction::SelectLot(lot_id)) => {
                     if self.answer_special_panel(SpecialPanelResponse::Lot(Some(lot_id as i16))) {
@@ -4885,13 +4885,13 @@ impl Game {
                     self.keep_sounds(sounds);
                     Outcome::redraw()
                 }
-                Some(DestinationPickerAction::Redraw) => {
+                Some(DestinationPickerAction::Clicked) => {
                     self.hud.play(crate::hud::CLICK);
                     let sounds = self.hud.take_sounds();
                     self.keep_sounds(sounds);
                     Outcome::redraw()
                 }
-                None => Outcome::redraw(),
+                Some(DestinationPickerAction::Redraw) | None => Outcome::redraw(),
             };
         }
         let released_slider = self.hud.release_slider(Some(point));
@@ -9917,10 +9917,10 @@ impl Game {
                     .selected()
                     .and_then(|sel| asking.world.objects.get(&sel))
                     .and_then(|o| o.person.as_ref())
-                    .and_then(|p| p.data.get(15).copied())
-                    .map(|score| (score.clamp(0, 1000) / 100) as u8)
+                    .and_then(|p| p.data.get(81).copied())
+                    .map(|level| level.clamp(0, 10) as u8)
                     .unwrap_or(0);
-                match DestinationMapPicker::open(
+                if let Ok(picker) = DestinationMapPicker::open(
                     self.hud.install(),
                     self.neighborhood_slot,
                     request.clone(),
@@ -9929,29 +9929,20 @@ impl Game {
                     wallet.magic_coins,
                     fame_half_stars,
                 ) {
-                    Ok(picker) => {
-                        self.destination_picker = Some(picker);
-                        self.active_special_panel = Some(ActiveSpecialPanel {
-                            tick,
-                            request,
-                            coop_dialog_id,
-                            responses: BTreeMap::new(),
-                            preview_targets: BTreeMap::new(),
-                        });
-                    }
-                    Err(err) => {
+                    if let Some(err) = picker.map_error() {
                         self.note = Some(format!(
                             "Could not load destination map for special panel kind {}: {err}",
                             request.kind()
                         ));
-                        self.active_special_panel = Some(ActiveSpecialPanel {
-                            tick,
-                            request,
-                            coop_dialog_id,
-                            responses: BTreeMap::new(),
-                            preview_targets: BTreeMap::new(),
-                        });
                     }
+                    self.destination_picker = Some(picker);
+                    self.active_special_panel = Some(ActiveSpecialPanel {
+                        tick,
+                        request,
+                        coop_dialog_id,
+                        responses: BTreeMap::new(),
+                        preview_targets: BTreeMap::new(),
+                    });
                 }
             }
             SpecialPanelRequest::WardrobeShop { person, mode } => {
