@@ -18,8 +18,9 @@ the repository, and so do the captures.
   can be kept read-only. Its kernel is in `/boot` and its modules in
   `/lib/modules`.
 - The kernel and initramfs the guest boots, made from that disk by
-  `build_runtime.sh <installed guest ext4> <out dir>`. It copies the disk's
-  `/boot/vmlinuz-<version>` and builds an initramfs with the disk's static
+  `build_runtime.sh <installed guest ext4> <out dir>`. It works on a clone
+  of the disk with its journal replayed (what a prepared guest boots), and
+  copies the disk's `/boot/vmlinuz-<version>` and builds an initramfs with the disk's static
   busybox, the modules for the root disk (virtio_pci, virtio_blk,
   crc32c_generic, ext4 and what they need) and `runtime/init`, which mounts
   `/dev/vda`, moves `/dev`, `/proc` and `/sys` onto it and switch_roots into
@@ -36,9 +37,9 @@ the repository, and so do the captures.
 | File | What it does |
 | --- | --- |
 | `Dockerfile` | The `sims-harness-qemu:bookworm` image: Debian bookworm with `qemu-system-i386`, e2fsprogs and perl. |
-| `build_runtime.sh` | Makes the kernel and initramfs from an installed guest disk (see Inputs), with debugfs inside the image and the disk mounted read-only. |
+| `build_runtime.sh` | Makes the kernel and initramfs from an installed guest disk (see Inputs), with debugfs inside the image, working on an APFS clone of the disk in the output directory (so the output must be on the disk's volume). |
 | `runtime/init` | `/init` of the initramfs. |
-| `runtime/build_in_image.sh` | The part of `build_runtime.sh` that runs in the image: it reads the kernel, busybox and modules off the disk and packs them. |
+| `runtime/build_in_image.sh` | The part of `build_runtime.sh` that runs in the image: it replays the clone's journal, reads the kernel, busybox and modules off it (checking each file's size, and that busybox is a static i386 ELF), and packs them. Any failure stops it before an output is written. |
 | `runtime/newc.pl` | Writes a directory as a cpio archive in the kernel's initramfs format, with names sorted, owner root and mtime 0. Only perl-base, which the image has. |
 | `prepare_guest.sh` | Makes a new guest directory. It clones the disk, copies the UserData folders and their hashes, and installs `guest/sims-init.sh`. |
 | `guest/sims-init.sh` | PID 1 in the guest. It mounts the host share at `/research` and runs each `/research/cmd/<n>.sh` once. |

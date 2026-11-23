@@ -11,8 +11,10 @@ What was decided:
 
 - **The kernel and initramfs come from the installed guest disk.**
   `tools/harness/build_runtime.sh <installed guest ext4> <out dir>` reads the
-  disk with debugfs inside the harness image, with the disk mounted
-  read-only. It copies `/boot/vmlinuz-<version>` and builds the initramfs
+  disk with debugfs inside the harness image. It works on an APFS clone
+  with the journal replayed, as `prepare_guest.sh` does for a guest, so it
+  reads what a prepared guest boots and never mounts the disk itself. It
+  copies `/boot/vmlinuz-<version>` and builds the initramfs
   from the disk's own static busybox and modules. The kernel, the modules
   and the disk then always match. The script needs only the disk and the
   image (no download, no `cpio` package: `runtime/newc.pl` packs the archive
