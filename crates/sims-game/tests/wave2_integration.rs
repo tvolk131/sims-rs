@@ -1193,6 +1193,49 @@ fn wave2_large_photo_album_60_snapshots_and_loading_presenter() {
     shell
         .enter_lot(5)
         .expect("enter Goth lot 5 to save a manual slot");
+
+    // A Camera Mode photo taken while the open album's strip is scrolled
+    // well past its selection: the refresh keeps the strip where it is,
+    // and the thumbnails loaded are the ones the strip shows.
+    shell
+        .open_photo_album()
+        .expect("open the Goths' album on the lot");
+    let first = shell.album_snapshot().expect("album").entries[0].id;
+    shell.execute_album_command(AlbumCommand::SelectEntry(first));
+    shell.hover([100, 100]);
+    // Back to the strip's start, then 20 photos past the selection.
+    for _ in 0..60 {
+        shell.wheel(1.0);
+    }
+    assert_eq!(shell.album_dialog().strip_scroll(), 0);
+    for _ in 0..20 {
+        assert!(shell.wheel(-1.0));
+    }
+    assert_eq!(shell.album_dialog().strip_scroll(), 20);
+    shell
+        .capture_lot_photo()
+        .expect("photo with the album open");
+    assert_eq!(shell.album_dialog().selected_id(), Some(first));
+    assert_eq!(
+        shell.album_dialog().strip_scroll(),
+        20,
+        "the refresh leaves the strip where it was"
+    );
+    for _ in 0..10 {
+        assert!(shell.wheel(-1.0));
+    }
+    let shown = shell.album_dialog().strip_scroll();
+    assert_eq!(shown, 30);
+    let slots = shell.album_dialog().layout(800, 600).thumb_slots.len();
+    let snap = shell.album_snapshot().expect("album");
+    assert_eq!(snap.entries.len(), 60, "59 stored plus the new photo");
+    for (idx, entry) in snap.entries.iter().enumerate().skip(shown).take(slots) {
+        assert!(
+            entry.thumbnail.is_some(),
+            "strip slot {idx} shows a loaded thumbnail"
+        );
+    }
+    shell.close_photo_album();
     shell
         .enqueue_background_lot_save(sims_sim::autosave::SaveTarget::Manual)
         .expect("enqueue manual lot save");

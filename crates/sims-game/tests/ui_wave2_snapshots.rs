@@ -20,6 +20,7 @@ use sims_render::{Canvas, png};
 use sims_sim::neighbors::{FAMILY, KIND, Row};
 use sims_ui::art::Art;
 use sims_ui::neighborhood::{BarButton, BarLayout};
+use sims_ui::shop::ShopCommand;
 use sims_vm::SpecialPanelRequest;
 use std::path::{Path, PathBuf};
 
@@ -278,27 +279,48 @@ fn wave2_panels_open_and_draw_with_native_art() {
         !wardrobe.items.is_empty(),
         "the everyday wardrobe lists outfits"
     );
-    // The dialog opens with its first outfit on show, unprompted.
+    // The view opens on Mortimer as he is (`0x56d3d9`), and the chosen
+    // outfit is the first one equal to his everyday row
+    // (`b004mafit_01,BODY=B004MAFitlgt_rat`, matched ignoring case as
+    // `0x40d0a4` does), not the list's first.
+    let worn = wardrobe
+        .tried_on_item_id
+        .clone()
+        .expect("the wardrobe opens on the outfit Mortimer wears");
+    let at = wardrobe
+        .items
+        .iter()
+        .position(|item| item.id == worn)
+        .expect("a listed outfit");
+    assert_ne!(at, 0, "Mortimer's outfit is not the list's first");
     assert_eq!(
-        wardrobe.tried_on_item_id.as_deref(),
-        Some(wardrobe.items[0].id.as_str()),
-        "the wardrobe opens on its first outfit"
+        game.shop_dialog()
+            .chosen_item(&wardrobe)
+            .map(|item| item.id.as_str()),
+        Some(worn.as_str()),
+        "the worn outfit is the one OK answers"
+    );
+    assert!(
+        matches!(
+            game.shop_dialog().submit(&wardrobe),
+            Some(ShopCommand::Buy { item_id, .. }) if item_id == worn
+        ),
+        "OK untouched answers the worn outfit, not the first"
     );
     assert!(
         wardrobe.preview_image.is_some(),
         "the wardrobe opens with the outfit in 3D: {:?}",
         wardrobe.preview_label
     );
-    // Previous wraps to the last outfit and shows it.
-    assert!(game.shop_select_prev(), "the previous arrow wraps");
-    let last = &wardrobe.items[wardrobe.items.len() - 1].id;
+    // Previous shows the outfit before it.
+    assert!(game.shop_select_prev(), "the previous arrow moves");
     assert_eq!(
         game.shop_snapshot()
             .expect("wardrobe")
             .tried_on_item_id
             .as_ref(),
-        Some(last),
-        "previous on the first outfit shows the last"
+        Some(&wardrobe.items[at - 1].id),
+        "previous shows the outfit before the worn one"
     );
     preview(
         &mut game,
@@ -323,18 +345,36 @@ fn wave2_panels_open_and_draw_with_native_art() {
             &dog_world,
             &before,
         );
-        // The pet dialog opens with its first breed already in the view.
+        // The pet dialog's view opens on the animal as it is (`0x521fd8`,
+        // kind 0). This type's everyday row is `racoon,BODY=racoon`, which
+        // no listed breed equals, so nothing is chosen: OK would answer
+        // `-1`, and the next arrow goes to the first breed (`0x40d1bb`).
+        let snap = game.shop_snapshot().expect("pet picker").clone();
+        assert_eq!(snap.tried_on_item_id, None, "no breed equals the racoon");
+        assert!(game.shop_dialog().chosen_item(&snap).is_none());
+        assert_eq!(
+            game.shop_dialog().submit(&snap),
+            Some(ShopCommand::KeepCurrent),
+            "OK with no breed in the view answers -1"
+        );
+        assert_eq!(snap.preview_label.as_deref(), Some("Current outfit"));
+        assert!(
+            snap.preview_image.is_some(),
+            "the pet picker shows the animal in 3D"
+        );
+        assert!(game.shop_select_next(), "the next arrow moves");
         let snap = game.shop_snapshot().expect("pet picker");
         assert_eq!(
             snap.tried_on_item_id.as_deref(),
             snap.items.first().map(|item| item.id.as_str()),
-            "the pet picker opens on its first breed"
+            "next from no breed shows the first breed"
         );
         assert!(
             snap.preview_image.is_some(),
             "the pet picker previews the breed in 3D: {:?}",
             snap.preview_label
         );
+
         game.shop_rotate_preview(45);
         game.render();
         snapshot("pet-picker-preview", game.canvas());

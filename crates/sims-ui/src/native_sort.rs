@@ -238,9 +238,11 @@ mod tests {
         v.iter().map(|e| e.1).collect()
     }
 
-    // The permutations below are what the 1.91 code itself leaves: the
-    // routines run under an x86 emulator over the shipped image, with the
-    // predicate call (`0x501c80`) answered by the same keys.
+    // The permutations below are fixed data, produced offline: the 1.91
+    // routines (`0x501a69`, and `0x501b21` with an exhausted budget) were
+    // run under the unicorn x86 emulator over the shipped image, with the
+    // predicate call (`0x501c80`) answered by the same keys. No test here
+    // runs the emulator; these compare the port against those results.
 
     #[test]
     fn the_whole_sort_leaves_the_native_permutation() {

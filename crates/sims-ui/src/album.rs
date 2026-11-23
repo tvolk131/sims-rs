@@ -447,6 +447,11 @@ impl PhotoAlbumDialog {
         self.focus = None;
     }
 
+    /// The first thumbnail the strip shows (its horizontal scroll).
+    pub fn strip_scroll(&self) -> usize {
+        self.strip_scroll
+    }
+
     /// Currently selected photo ID, if any.
     pub fn selected_id(&self) -> Option<PhotoId> {
         self.selected_id

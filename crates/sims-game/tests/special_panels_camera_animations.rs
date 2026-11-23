@@ -485,37 +485,60 @@ fn native_camera_panel_wires_all_8_buttons_strings_album_and_clean_capture() {
         SnapshotSize::Large
     );
     shell.render();
+    // The Large frame is 600x400 (`0x6f0ef0`), centred on the clicked
+    // point and ending at its row (`0x4b14a1`); a frame above the top of
+    // the viewport is shifted down into it. The photo is the frame less
+    // its one-pixel outline (`0x4d1f6e..0x4d1f98`): 598x400.
+    let click = [400, 300];
+    shell.game_mut().unwrap().hover(click);
     let large_cap = shell.game_mut().unwrap().take_photo();
-    assert_eq!(
-        (large_cap.width, large_cap.height),
-        (640, 480),
-        "Large SnapshotSize must crop captured PNG canvas to 640x480"
-    );
-    // The photo is the house view centred in the viewport, never the panel
-    // below it: its rows match the frame's own rows inside the viewport (a
-    // crop of the whole frame would sit 50 rows lower). Only the upper
-    // half is compared: the Large button's Quick Tips balloon, which the
-    // photo leaves out, covers part of the lower viewport.
     {
         let game = shell.game().unwrap();
         let canvas = game.canvas();
         let (view_w, view_h) = game.house_viewport_size();
-        let (view_w, view_h) = (view_w as usize, view_h as usize);
         assert!(
-            view_h < canvas.height,
+            (view_h as usize) < canvas.height,
             "the panel is open below the viewport"
         );
-        let x0 = (view_w - 640) / 2;
-        let y0 = (view_h - 480) / 2;
-        for y in 0..240 {
-            let row = (y0 + y) * canvas.width + x0;
+        assert_eq!(
+            sims_ui::camera::snapshot_frame(
+                click,
+                [600, 400],
+                [0, 0, view_w as i32, view_h as i32]
+            ),
+            [99, 0, 699, 402]
+        );
+        assert_eq!(
+            (large_cap.width, large_cap.height),
+            (598, 400),
+            "Large SnapshotSize must crop to the native 600x400 frame less its outline"
+        );
+        // The photo is the house view inside the frame, never the panel
+        // below it: its rows match the frame's own rows of the screen. Only
+        // the upper rows are compared: the Large button's Quick Tips
+        // balloon, which the photo leaves out, covers part of the lower
+        // viewport.
+        for y in 0..150 {
+            let row = (1 + y) * canvas.width + 100;
             assert_eq!(
-                &large_cap.color[y * 640..(y + 1) * 640],
-                &canvas.color[row..row + 640],
-                "photo row {y} must be viewport row {}",
-                y0 + y
+                &large_cap.color[y * 598..(y + 1) * 598],
+                &canvas.color[row..row + 598],
+                "photo row {y} must be screen row {}",
+                1 + y
             );
         }
+        // A click near the bottom-right corner shifts the frame left into
+        // the viewport; it still ends at the clicked row.
+        let (view_w, view_h) = (view_w as i32, view_h as i32);
+        let near_edge = sims_ui::camera::snapshot_capture_rect(
+            [view_w - 5, view_h - 10],
+            [600, 400],
+            [0, 0, view_w, view_h],
+        );
+        assert_eq!(
+            near_edge,
+            [view_w - 600, view_h - 411, view_w - 2, view_h - 11]
+        );
     }
 
     // Toggle snapshot quality -> Low (keeps CameraPanel open).

@@ -112,16 +112,65 @@ pub enum SnapshotSize {
 }
 
 impl SnapshotSize {
-    /// Standard Complete Collection snapshot crop dimensions `[width, height]`
-    /// in pixels (`custom_dims` is used when `self == Self::Custom`).
-    pub const fn dimensions(self, custom_dims: [u32; 2]) -> [u32; 2] {
+    /// Camera Mode frame dimensions `[width, height]` in pixels (`0x4cfb08`
+    /// reads the table at `0x6f0ef0`, filled at `0x4cfac9..0x4cfaf3`:
+    /// Small 200×150, Medium 400×300, Large 600×400). A Custom frame is
+    /// clamped between Small and Large, as `0x4cfb5e` clamps it.
+    pub fn dimensions(self, custom_dims: [u32; 2]) -> [u32; 2] {
         match self {
-            Self::Small => [160, 120],
-            Self::Medium => [320, 240],
-            Self::Large => [640, 480],
-            Self::Custom => custom_dims,
+            Self::Small => [200, 150],
+            Self::Medium => [400, 300],
+            Self::Large => [600, 400],
+            Self::Custom => [
+                custom_dims[0].clamp(200, 600),
+                custom_dims[1].clamp(150, 400),
+            ],
         }
     }
+}
+
+/// The Camera Mode frame around the pointer `[x, y]` (`0x4b14a1`), as
+/// `[left, top, right, bottom]` with exclusive right and bottom. The frame
+/// is `size[0]` wide, centred on the pointer, and ends at the pointer's
+/// row: `[x - w/2 - 1, y - h - 2, x + w/2 - 1, y]`. A frame that crosses
+/// the `viewport` is first shifted back inside it (left before right, top
+/// before bottom, `0x4b150b..0x4b154b`) and then intersected with it
+/// (`0x4a76ed`).
+pub fn snapshot_frame(pointer: [i32; 2], size: [u32; 2], viewport: [i32; 4]) -> [i32; 4] {
+    let [x, y] = pointer;
+    let w = i32::try_from(size[0]).unwrap_or(i32::MAX);
+    let h = i32::try_from(size[1]).unwrap_or(i32::MAX);
+    // `cdq; sub eax, edx; sar eax, 1`: halving rounds toward zero.
+    let half = w / 2;
+    let [vl, vt, vr, vb] = viewport;
+    let mut r = [x - half - 1, y - h - 2, x + half - 1, y];
+    let shift_x = if r[0] < vl {
+        vl - r[0]
+    } else if r[2] >= vr {
+        vr - r[2] - 1
+    } else {
+        0
+    };
+    r[0] += shift_x;
+    r[2] += shift_x;
+    let shift_y = if r[1] < vt {
+        vt - r[1]
+    } else if r[3] >= vb {
+        vb - r[3] - 1
+    } else {
+        0
+    };
+    r[1] += shift_y;
+    r[3] += shift_y;
+    [r[0].max(vl), r[1].max(vt), r[2].min(vr), r[3].min(vb)]
+}
+
+/// The pixels a Camera Mode click stores (`0x4d1f6e..0x4d1f98`): the
+/// [`snapshot_frame`] less its one-pixel outline on every side, so the
+/// photo is `w - 2` by `h` pixels when the frame fits the viewport.
+pub fn snapshot_capture_rect(pointer: [i32; 2], size: [u32; 2], viewport: [i32; 4]) -> [i32; 4] {
+    let f = snapshot_frame(pointer, size, viewport);
+    [f[0] + 1, f[1] + 1, f[2] - 1, f[3] - 1]
 }
 
 /// Snapshot JPEG compression quality (`0x4cfc2a`, `0x50427b`: `0=Low`,
@@ -135,11 +184,15 @@ pub enum SnapshotQuality {
 }
 
 impl SnapshotQuality {
-    /// Approximate JPEG encoder quality percentage (`1..=100`).
+    /// The quality number native passes to the album image writer
+    /// (`0x4cfc53`: Low 20, Medium 50, High 90; `0x4a9144` → `0x4ed79c`
+    /// stores it at entry `+8`, and `0x4ed52c` passes it to the file writer
+    /// `0x4b7fb4`). The port stores album photos losslessly, so this number
+    /// does not yet change any pixel (a recorded residual).
     pub const fn jpeg_quality(self) -> u8 {
         match self {
-            Self::Low => 45,
-            Self::Medium => 70,
+            Self::Low => 20,
+            Self::Medium => 50,
             Self::High => 90,
         }
     }
@@ -906,6 +959,49 @@ fn draw_four_cell_button(frame: &mut Frame, art: &Art, id: i32, cell: u32, dest:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_sizes_are_the_native_table() {
+        assert_eq!(SnapshotSize::Small.dimensions([0, 0]), [200, 150]);
+        assert_eq!(SnapshotSize::Medium.dimensions([0, 0]), [400, 300]);
+        assert_eq!(SnapshotSize::Large.dimensions([0, 0]), [600, 400]);
+        assert_eq!(SnapshotSize::Custom.dimensions([10, 900]), [200, 400]);
+        assert_eq!(SnapshotSize::Custom.dimensions([321, 222]), [321, 222]);
+        assert_eq!(SnapshotQuality::Low.jpeg_quality(), 20);
+        assert_eq!(SnapshotQuality::Medium.jpeg_quality(), 50);
+        assert_eq!(SnapshotQuality::High.jpeg_quality(), 90);
+    }
+
+    #[test]
+    fn the_snapshot_frame_ends_at_the_pointer_and_stays_in_the_viewport() {
+        let view = [0, 0, 800, 500];
+        // Inside: centred on x, ending at y.
+        assert_eq!(
+            snapshot_frame([400, 450], [400, 300], view),
+            [199, 148, 599, 450]
+        );
+        assert_eq!(
+            snapshot_capture_rect([400, 450], [400, 300], view),
+            [200, 149, 598, 449]
+        );
+        // Odd widths halve toward zero.
+        assert_eq!(
+            snapshot_frame([400, 450], [201, 150], view)[..3],
+            [299, 298, 499]
+        );
+        // Off the left and top: shifted right and down.
+        assert_eq!(snapshot_frame([10, 20], [200, 150], view), [0, 0, 200, 152]);
+        // Off the right and bottom: shifted left and up, one short of the edge.
+        assert_eq!(
+            snapshot_frame([795, 499], [200, 150], view),
+            [599, 347, 799, 499]
+        );
+        // Larger than the viewport: shifted, then intersected.
+        assert_eq!(
+            snapshot_frame([100, 100], [600, 400], [0, 0, 320, 240]),
+            [0, 0, 320, 240]
+        );
+    }
 
     fn rects_overlap(a: Rect, b: Rect) -> bool {
         a.width > 0

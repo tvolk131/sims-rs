@@ -313,6 +313,9 @@ pub struct Game {
     note: Option<String>,
     /// Where the pointer is on the canvas, while it is over the window.
     pointer: Option<[i32; 2]>,
+    /// Where the last Camera Mode lot click was (`0x4ab80d` records the
+    /// pointer at `+0x4c4`/`+0x4c8`), for [`Game::take_photo`]'s frame.
+    photo_point: Option<[i32; 2]>,
     /// The object the pointer last reached on the lot, if it is still on
     /// it.
     reached: Option<u16>,
@@ -1081,6 +1084,7 @@ impl Game {
             highlighted_portraits: BTreeSet::new(),
             highlighted_relationships: BTreeSet::new(),
             pointer: None,
+            photo_point: None,
             reached: None,
             listed: None,
             highlighted: None,
@@ -1471,6 +1475,7 @@ impl Game {
             highlighted_portraits: BTreeSet::new(),
             highlighted_relationships: BTreeSet::new(),
             pointer: None,
+            photo_point: None,
             reached: None,
             listed: None,
             highlighted: None,
@@ -1817,6 +1822,7 @@ impl Game {
             highlighted_portraits: BTreeSet::new(),
             highlighted_relationships: BTreeSet::new(),
             pointer: None,
+            photo_point: None,
             reached: None,
             listed: None,
             highlighted: None,
@@ -2024,6 +2030,7 @@ impl Game {
             highlighted_portraits: BTreeSet::new(),
             highlighted_relationships: BTreeSet::new(),
             pointer: None,
+            photo_point: None,
             reached: None,
             listed: None,
             highlighted: None,
@@ -4767,6 +4774,7 @@ impl Game {
         // Native `cWinCamera`: clicking inside the house viewport while Camera
         // Mode is open closes the Camera subpanel and captures a clean snapshot.
         if self.hud.camera_strip_open() {
+            self.photo_point = Some(point);
             self.hud.close_camera_strip();
             self.hud.play(crate::hud::CLICK);
             let sounds = self.hud.take_sounds();
@@ -9332,7 +9340,8 @@ impl Game {
             return self.execute_special_panel_shop_command(active, cmd);
         }
         match cmd {
-            ShopCommand::Cancel => {
+            // Community shops are lists, never choice dialogs.
+            ShopCommand::Cancel | ShopCommand::KeepCurrent => {
                 self.close_shop();
                 self.hud.play(crate::hud::CLICK);
                 let sounds = self.hud.take_sounds();
@@ -10234,13 +10243,14 @@ impl Game {
                 }
             }
             SpecialPanelRequest::WardrobeShop { person, mode } => {
+                // `0x5097c9` and the letter table at `0x6c0fac`: mode 1
+                // lists formal (`F`) and mode 2 swimwear (`S`).
                 let category = match *mode {
-                    0 => WardrobeCategory::Everyday,
-                    1 => WardrobeCategory::Swimwear,
-                    2 => WardrobeCategory::Formal,
+                    1 => WardrobeCategory::Formal,
+                    2 => WardrobeCategory::Swimwear,
                     3 => WardrobeCategory::Pajamas,
                     4 => WardrobeCategory::Winterwear,
-                    _ => WardrobeCategory::Formal,
+                    _ => WardrobeCategory::Everyday,
                 };
                 let shop_kind = if *mode == 5 {
                     ShopKind::StudioWardrobe
@@ -10250,6 +10260,7 @@ impl Game {
                 let shopper = self.person_display_name(world, *person);
                 let (items, responses, preview_targets) =
                     self.build_wardrobe_picker_items(world, *person, *mode);
+                let current = self.current_look(world, *person, wardrobe_mode_row(*mode), None);
                 self.open_special_picker(
                     tick,
                     request,
@@ -10260,12 +10271,19 @@ impl Game {
                     items,
                     responses,
                     preview_targets,
+                    current,
                     preview,
                 );
             }
             SpecialPanelRequest::PetPicker { pet } => {
                 let shopper = self.person_display_name(world, *pet);
                 let (items, responses, preview_targets) = self.build_pet_picker_items(world, *pet);
+                let skeleton = world
+                    .objects
+                    .get(pet)
+                    .and_then(|o| self.person_body_string(o.guid, 0))
+                    .filter(|s| !s.trim().is_empty());
+                let current = self.current_look(world, *pet, 1, skeleton);
                 self.open_special_picker(
                     tick,
                     request,
@@ -10276,6 +10294,7 @@ impl Game {
                     items,
                     responses,
                     preview_targets,
+                    current,
                     preview,
                 );
             }
@@ -10298,6 +10317,8 @@ impl Game {
                 let shopper = self.person_display_name(world, *person);
                 let (items, responses, preview_targets) =
                     self.build_charm_transform_items(world, *person);
+                // `0x5372d4`: the charm's view is kind 0, the everyday body.
+                let current = self.current_look(world, *person, 1, None);
                 self.open_special_picker(
                     tick,
                     request,
@@ -10308,6 +10329,7 @@ impl Game {
                     items,
                     responses,
                     preview_targets,
+                    current,
                     preview,
                 );
             }
@@ -10326,6 +10348,7 @@ impl Game {
         items: Vec<ShopItem>,
         responses: BTreeMap<String, SpecialPanelResponse>,
         preview_targets: BTreeMap<String, ShopPreviewTarget>,
+        current: Option<ShopPreviewTarget>,
         preview: bool,
     ) {
         self.ensure_shop_assets();
@@ -10338,7 +10361,23 @@ impl Game {
             SpecialPanelRequest::PetPicker { .. } => Some(ChoiceDialog::Pet),
             _ => None,
         };
-        let first = items.first().map(|item| item.id.clone());
+        // A choice dialog's view opens on the person as they are
+        // (`0x56d3d9` copies them), and OK answers the first item equal to
+        // the view's outfit (`0x56d852` → `0x40d0a4` and its kin compare
+        // suit and texture, ignoring case): the first item equal to the
+        // person's current row, or none (`-1`).
+        let shown_id = choice.and(current.as_ref()).and_then(|look| {
+            let key = outfit_key(look.row.as_deref()?);
+            items
+                .iter()
+                .find(|item| {
+                    preview_targets
+                        .get(&item.id)
+                        .and_then(|t| t.row.as_deref())
+                        .is_some_and(|row| outfit_key(row) == key)
+                })
+                .map(|item| item.id.clone())
+        });
         self.shop_snapshot = Some(ShopSnapshot {
             kind,
             title_override,
@@ -10357,15 +10396,14 @@ impl Game {
         self.shop_preview_yaw_deg = 0;
         self.shop_preview_body = None;
         self.shop_dialog.open();
-        // A choice dialog opens on its first item already in the view, and
-        // that item is the selection OK accepts: a new request must not
-        // inherit the previous request's selection.
-        let shown = choice
-            .and(first)
-            .map(|id| (preview_targets.get(&id).cloned(), id));
-        if let Some((_, id)) = &shown {
-            self.shop_dialog.select_item(id.clone());
+        // A new request never inherits the previous request's selection.
+        if choice.is_some() {
+            match &shown_id {
+                Some(id) => self.shop_dialog.select_item(id.clone()),
+                None => self.shop_dialog.clear_selection(),
+            }
         }
+        let shown = shown_id.map(|id| (preview_targets.get(&id).cloned(), id));
         self.active_special_panel = Some(ActiveSpecialPanel {
             tick,
             request,
@@ -10374,9 +10412,59 @@ impl Game {
             preview_targets,
             preview,
         });
-        if let Some((target, id)) = shown {
-            self.apply_shop_try_on(&id, target.as_ref());
+        match (choice, shown, current) {
+            (Some(_), Some((target, id)), _) => self.apply_shop_try_on(&id, target.as_ref()),
+            (Some(_), None, current) => self.show_current_look(current.as_ref()),
+            (None, ..) => {}
         }
+    }
+
+    /// The person's look a choice dialog opens on: their body string `row`
+    /// (`1` everyday, `30..=34` formal, swim, pajamas, winter and high
+    /// fashion; native passes the 1-based slot to `0x472ec4`), as live as
+    /// the port keeps it (strings Make New Character wrote, then rows the
+    /// clothing initialization filled, then the type's own `STR# 200`).
+    fn current_look(
+        &self,
+        world: &sims_sim::World,
+        person: u16,
+        row: usize,
+        pet_skeleton: Option<String>,
+    ) -> Option<ShopPreviewTarget> {
+        let guid = world.objects.get(&person)?.guid;
+        let raw = world
+            .characters
+            .made
+            .get(&guid)
+            .and_then(|c| c.strings.get(&row))
+            .or_else(|| world.made_outfits.get(&guid).and_then(|m| m.get(&row)))
+            .cloned()
+            .or_else(|| self.person_body_string(guid, row))?;
+        let (suit, _) = outfit_key(&raw);
+        Some(ShopPreviewTarget {
+            person,
+            suit,
+            row: Some(raw),
+            pet_skeleton,
+        })
+    }
+
+    /// Shows the person as they are in a choice dialog's view, with no
+    /// item chosen.
+    fn show_current_look(&mut self, look: Option<&ShopPreviewTarget>) {
+        self.shop_preview_yaw_deg = 0;
+        self.shop_preview_body = None;
+        let image = look.and_then(|look| self.render_shop_try_on_image("", Some(look)));
+        if let Some(snap) = &mut self.shop_snapshot {
+            snap.tried_on_item_id = None;
+            snap.preview_label = Some(if image.is_some() {
+                "Current outfit".to_owned()
+            } else {
+                "Current outfit (preview unavailable)".to_owned()
+            });
+            snap.preview_image = image;
+        }
+        self.note = Some("Previewing the current outfit.".to_owned());
     }
 
     /// The 3D preview's parameters at `yaw`: a choice dialog's view is
@@ -10474,7 +10562,22 @@ impl Game {
     ) -> Outcome {
         match cmd {
             ShopCommand::Cancel => {
-                let cancel = special_panel_cancel_response(&active.request);
+                let mut cancel = special_panel_cancel_response(&active.request);
+                // Cancel also sends the view's index (`0x5098d1`, `0x522087`):
+                // the shown item's, or `-1` with none.
+                if let SpecialPanelResponse::Selection { index, .. } = &mut cancel
+                    && let Some(snapshot) = &self.shop_snapshot
+                    && snapshot.choice.is_some()
+                {
+                    *index = self
+                        .shop_dialog
+                        .chosen_item(snapshot)
+                        .and_then(|item| active.responses.get(&item.id))
+                        .map_or(-1, |resp| match resp {
+                            SpecialPanelResponse::Selection { index, .. } => *index,
+                            _ => -1,
+                        });
+                }
                 if self.answer_special_panel(cancel) {
                     self.hud.play(crate::hud::CLICK);
                 } else {
@@ -10503,6 +10606,30 @@ impl Game {
             ShopCommand::RotatePreview(delta_deg) => {
                 self.apply_shop_rotate_preview(delta_deg);
                 self.hud.play(crate::hud::CLICK);
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+            ShopCommand::KeepCurrent => {
+                // OK with none of the items in the view: index `-1`.
+                let mut keep = special_panel_cancel_response(&active.request);
+                if let SpecialPanelResponse::Selection { accepted, index } = &mut keep {
+                    *accepted = true;
+                    *index = -1;
+                    if self.answer_special_panel(keep) {
+                        self.hud.play(crate::hud::CLICK);
+                    } else {
+                        self.hud.play(crate::hud::ERROR);
+                        if self.shop_snapshot.is_some() {
+                            self.shop_dialog.open();
+                        } else {
+                            self.active_special_panel = None;
+                            self.sync_special_panel();
+                        }
+                    }
+                } else {
+                    self.hud.play(crate::hud::ERROR);
+                }
                 let sounds = self.hud.take_sounds();
                 self.keep_sounds(sounds);
                 Outcome::redraw()
@@ -10877,10 +11004,14 @@ impl Game {
         let mut items = Vec::with_capacity(outfits.len());
         let mut responses = BTreeMap::new();
         let mut preview_targets = BTreeMap::new();
+        let mut first_of = BTreeMap::new();
         for (idx, (suit, row)) in outfits.into_iter().enumerate() {
             let Ok(index) = i16::try_from(idx) else {
                 break;
             };
+            // OK answers the first item equal to the view's outfit
+            // (`0x40d0a4`), so a repeated outfit answers its first index.
+            let index = *first_of.entry(outfit_key(&row)).or_insert(index);
             let id = format!("{id_prefix}:{idx}");
             items.push(ShopItem {
                 id: id.clone(),
@@ -10949,10 +11080,13 @@ impl Game {
         let mut items = Vec::with_capacity(rows.len());
         let mut responses = BTreeMap::new();
         let mut preview_targets = BTreeMap::new();
+        let mut first_of = BTreeMap::new();
         for (idx, (suit, row)) in rows.into_iter().enumerate() {
             let Ok(index) = i16::try_from(idx) else {
                 break;
             };
+            // `0x522069` resolves like the wardrobe: the first equal item.
+            let index = *first_of.entry(outfit_key(&row)).or_insert(index);
             let id = format!("special_pet:{idx}");
             items.push(ShopItem {
                 id: id.clone(),
@@ -11044,7 +11178,9 @@ impl Game {
     /// where a neighbor is. It filters by family (`0x522ea1`), kind and a
     /// relationship row with values (`0x522f17`), and skips a neighbor whose
     /// GUID no longer resolves to a definition (`0x523011` after
-    /// `0x43ac10`). See [`phonebook_eligible`]. Each target is judged by
+    /// `0x43ac10`) or whose type's catalog name is empty (`0x523064`; the
+    /// port reads the name as the Sim's display name). See
+    /// [`phonebook_eligible`]. Each target is judged by
     /// its first row, as `0x464f74` finds it, and listed once.
     ///
     /// **Not native:** `cWinPhoneBook` pages by family (`0x5230cc` picks
@@ -11089,15 +11225,21 @@ impl Game {
                     &world.families,
                     row,
                 ) && resolves;
-                eligible.then(|| {
+                if !eligible {
+                    return None;
+                }
+                // `0x52304c..0x523064`: a neighbor whose type has an empty
+                // catalog name (`0x4573d9`) is not listed.
+                let name = self
+                    .neighbor_display_name(record.guid)
+                    .filter(|name| !name.is_empty())?;
+                Some({
                     let daily = row.values.first().copied().unwrap_or(0);
                     let lifetime = row.values.get(1).copied().unwrap_or(0);
                     let clamp = |v: i32| v.clamp(-100, 100) as i16;
                     PhoneBookEntry {
                         neighbor_id: id,
-                        name: self
-                            .neighbor_display_name(record.guid)
-                            .unwrap_or_else(|| format!("#{id}")),
+                        name,
                         daily: clamp(daily),
                         lifetime: clamp(lifetime),
                         portrait: self.hud.face(record.guid).cloned(),
@@ -11218,38 +11360,44 @@ impl Game {
     }
 
     /// The Camera Mode photo: the house view drawn alone (no panel, menus
-    /// or dialogs), cropped by [`Game::capture_snapshot_canvas`]. The full
-    /// frame is drawn again afterwards, so the canvas still shows the screen.
+    /// or dialogs), cropped by [`Game::capture_snapshot_canvas`] around the
+    /// last Camera Mode click. The full frame is drawn again afterwards, so
+    /// the canvas still shows the screen.
     pub fn take_photo(&mut self) -> Canvas {
+        let at = self.photo_point.take();
         self.draw_frame(true);
-        let shot = self.capture_snapshot_canvas();
+        let shot = self.capture_snapshot_canvas(at);
         self.draw();
         shot
     }
 
-    /// Crops the canvas to the active Camera Mode `SnapshotSize`, centred
-    /// on the house viewport and clamped to it, so selecting Small, Medium,
-    /// Large or Custom changes the saved picture's size and the panel below
-    /// the viewport never shows. (**Unverified:** that native centres the
-    /// crop on the house view.)
-    pub fn capture_snapshot_canvas(&self) -> Canvas {
+    /// Crops the canvas to the Camera Mode frame for the active
+    /// `SnapshotSize` (`0x4d1f6e`: [`sims_ui::camera::snapshot_capture_rect`]
+    /// of the frame at the pointer, shifted into and clamped to the house
+    /// viewport, less its outline). `at` is the clicked point; without one
+    /// (the `C` screenshot key has no click) the pointer is the last one
+    /// seen over the window, else the viewport's centre.
+    pub fn capture_snapshot_canvas(&self, at: Option<[i32; 2]>) -> Canvas {
         let state = self.hud.camera_state();
-        let [req_w, req_h] = state.size.dimensions(state.custom_dimensions);
+        let size = state.size.dimensions(state.custom_dimensions);
         let src_w = self.canvas.width;
         let src_h = self.canvas.height;
         let (view_w, view_h) = self.house_viewport_size();
-        let area_w = (view_w as usize).min(src_w);
-        let area_h = (view_h as usize).min(src_h);
-        if area_w == 0 || area_h == 0 || req_w == 0 || req_h == 0 {
+        let area_w = i32::try_from((view_w as usize).min(src_w)).unwrap_or(0);
+        let area_h = i32::try_from((view_h as usize).min(src_h)).unwrap_or(0);
+        if area_w <= 0 || area_h <= 0 {
             return self.canvas.clone();
         }
-        let crop_w = (req_w as usize).min(area_w);
-        let crop_h = (req_h as usize).min(area_h);
-        if crop_w == src_w && crop_h == src_h {
-            return self.canvas.clone();
+        let point = at.or(self.pointer).unwrap_or([area_w / 2, area_h / 2]);
+        let [l, t, r, b] =
+            sims_ui::camera::snapshot_capture_rect(point, size, [0, 0, area_w, area_h]);
+        let crop_w = usize::try_from(r - l).unwrap_or(0);
+        let crop_h = usize::try_from(b - t).unwrap_or(0);
+        if crop_w == 0 || crop_h == 0 {
+            // Native takes no picture of an empty frame (`0x4b055c`).
+            return Canvas::new(0, 0, [0, 0, 0]);
         }
-        let x0 = (area_w - crop_w) / 2;
-        let y0 = (area_h - crop_h) / 2;
+        let (x0, y0) = (l as usize, t as usize);
         let mut out = Canvas::new(crop_w, crop_h, [0, 0, 0]);
         for y in 0..crop_h {
             let src_row = (y0 + y) * src_w + x0;
@@ -13687,18 +13835,48 @@ fn phonebook_eligible(
     record.id > 0 && record.id != caller && kind <= 1 && family_ok && !row.values.is_empty()
 }
 
-/// The suit category letter of `Dialog` kind 6 mode `0..=5` (`0x5097c9`):
-/// everyday `b`, swimwear `s`, formal `f`, pajamas `l`, winter `w`, and
-/// Superstar high fashion `h`.
+/// The suit category letter of `Dialog` kind 6 mode `0..=5`. `0x5097c9`
+/// turns the mode into the view kind `0, 4, 2, 5, 0x11, 0x12` (any other
+/// mode is kind 0), whose lists filter by the letters at `0x6c0fac`
+/// (`0x408bf5` `B`, `0x4098f1` `F`, `0x409b08` `S`, `0x409d1f` `L`, then
+/// `W` and `H`): everyday `b`, formal `f`, swimwear `s`, pajamas `l`,
+/// winter `w`, and Superstar high fashion `h`.
 fn wardrobe_mode_category(mode: i16) -> u8 {
     match mode {
-        1 => b's',
-        2 => b'f',
+        1 => b'f',
+        2 => b's',
         3 => b'l',
         4 => b'w',
         5 => b'h',
         _ => b'b',
     }
+}
+
+/// The person's body string row of `Dialog` kind 6 mode `0..=5`: the view
+/// kind's resolver (`0x40d0a4`, `0x40d52f`, `0x40d847`, `0x40db5f`,
+/// `0x40de77`, `0x40e18f`) reads 1-based slot `2, 0x1f, 0x20, 0x21, 0x22,
+/// 0x23` through `0x472ec4`: everyday 1, formal 30, swim 31, pajamas 32,
+/// winter 33, high fashion 34.
+fn wardrobe_mode_row(mode: i16) -> usize {
+    match mode {
+        1 => 30,
+        2 => 31,
+        3 => 32,
+        4 => 33,
+        5 => 34,
+        _ => 1,
+    }
+}
+
+/// The `(suit, texture)` an outfit row compares by (`0x5874ca`): the part
+/// before any `;`, split at the first `,`, each kept to the 63 characters
+/// of its 64-byte buffer and lowercased, since `0x472f92` compares both
+/// with `0x46f874`, which ignores ASCII case.
+fn outfit_key(row: &str) -> (String, String) {
+    let half = row.split(';').next().unwrap_or("");
+    let (suit, texture) = half.split_once(',').unwrap_or((half, ""));
+    let fit = |s: &str| -> String { s.chars().take(63).collect::<String>().to_ascii_lowercase() };
+    (fit(suit), fit(texture))
 }
 
 /// Every `(suit, "suit,BODY=texture")` of category `first` that a person

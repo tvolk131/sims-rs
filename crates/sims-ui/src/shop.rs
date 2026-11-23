@@ -392,6 +392,10 @@ pub enum ShopCommand {
     },
     /// Close the shop picker without purchasing.
     Cancel,
+    /// A choice dialog's OK while none of its items is in the view: the
+    /// person keeps the look they opened it in. Native answers index `-1`
+    /// (`0x5098b3`: `0x56d852` finds no item equal to the view's outfit).
+    KeepCurrent,
 }
 
 /// Interactive hit targets inside [`ShopPickerDialog`].
@@ -522,6 +526,21 @@ impl ShopPickerDialog {
     pub fn select_item(&mut self, item_id: impl Into<String>) {
         self.selected_item_id = Some(item_id.into());
         self.follow_selection = true;
+    }
+
+    /// Chooses no item. A choice dialog then shows the person as they
+    /// are, its OK answers [`ShopCommand::KeepCurrent`], and its arrows
+    /// start from before the first item (`0x40d1bb`: next from `-1` is
+    /// item 0; previous wraps to the last).
+    pub fn clear_selection(&mut self) {
+        self.selected_item_id = None;
+        self.follow_selection = false;
+    }
+
+    /// The item a choice dialog shows, if any (no fallback to the first).
+    pub fn chosen_item<'a>(&self, snapshot: &'a ShopSnapshot) -> Option<&'a ShopItem> {
+        let id = self.selected_item_id.as_deref()?;
+        snapshot.items.iter().find(|i| i.id == id)
     }
 
     /// Returns the currently selected item, defaulting to the first item when
@@ -659,7 +678,13 @@ impl ShopPickerDialog {
 
     /// Handles `Enter` key submission (buys the selected item if affordable).
     pub fn submit(&self, snapshot: &ShopSnapshot) -> Option<ShopCommand> {
-        if !self.open || !self.can_buy_selected(snapshot) {
+        if !self.open {
+            return None;
+        }
+        if snapshot.choice.is_some() && self.chosen_item(snapshot).is_none() {
+            return Some(ShopCommand::KeepCurrent);
+        }
+        if !self.can_buy_selected(snapshot) {
             return None;
         }
         let item = self.selected_item(snapshot)?;
@@ -991,6 +1016,9 @@ impl ShopPickerDialog {
                     })
             }
             ShopHit::BuyButton => {
+                if snapshot.choice.is_some() && self.chosen_item(snapshot).is_none() {
+                    return Some(ShopCommand::KeepCurrent);
+                }
                 let (expected_id, expected_currency, expected_price) = pressed_item?;
                 if !self.can_buy_selected(snapshot) {
                     return None;
@@ -1022,14 +1050,18 @@ impl ShopPickerDialog {
     /// there is nothing to move to.
     pub fn choose(&mut self, snapshot: &ShopSnapshot, next: bool) -> Option<ShopCommand> {
         let count = snapshot.items.len();
-        let idx = self.selected_index(snapshot)?;
-        if count < 2 {
+        if count == 0 {
             return None;
         }
-        let to = if next {
-            (idx + 1) % count
-        } else {
-            (idx + count - 1) % count
+        let current = self
+            .chosen_item(snapshot)
+            .and_then(|item| snapshot.items.iter().position(|i| i.id == item.id));
+        let to = match current {
+            Some(_) if count < 2 => return None,
+            Some(idx) if next => (idx + 1) % count,
+            Some(idx) => (idx + count - 1) % count,
+            None if next => 0,
+            None => count - 1,
         };
         let item = &snapshot.items[to];
         self.select_item(item.id.clone());
@@ -1485,17 +1517,15 @@ impl ShopPickerDialog {
                 // Not native: when the 3D view cannot render (a missing
                 // skeleton or mesh), name the candidate so OK never accepts
                 // an unseen choice.
-                if let (Some(font), Some(item)) = (
-                    art.font(10).or_else(|| art.font(12)),
-                    self.selected_item(snapshot),
-                ) {
+                if let Some(font) = art.font(10).or_else(|| art.font(12)) {
+                    let name = self.chosen_item(snapshot).map(|item| item.name.as_str());
                     let note = snapshot
                         .preview_label
                         .as_deref()
-                        .filter(|label| *label != item.name);
+                        .filter(|label| Some(*label) != name);
                     let line_h = 14;
                     let mut y = view.y + view.height / 2 - line_h;
-                    for line in std::iter::once(item.name.as_str()).chain(note) {
+                    for line in name.into_iter().chain(note) {
                         let width = font.width(line).min(view.width);
                         draw_clipped_text(
                             frame,

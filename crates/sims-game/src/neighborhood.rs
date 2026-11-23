@@ -1224,7 +1224,11 @@ impl NeighborhoodShell {
     pub fn show_notice(&mut self, title: impl Into<String>, body: impl Into<String>) {
         let title = title.into();
         let body = body.into();
-        if let ActiveScreen::Lot(session) = &mut self.screen {
+        // Over the open Photo Album the notice is the shell's own dialog,
+        // drawn and answered above the album ([`Self::album_notice_open`]).
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && !self.album_dialog.is_open()
+        {
             session.game.show_notice(title, body);
         } else {
             if self.debug {
@@ -1235,6 +1239,69 @@ impl NeighborhoodShell {
                 ShellDialogKind::Notice,
                 Message::notice(title, body, self.dialogs.ok()).with_frame(FrameStyle::Generic),
             );
+        }
+    }
+
+    /// Whether a shell notice is open over the Photo Album: it then takes
+    /// the pointer and keys before the album.
+    fn album_notice_open(&self) -> bool {
+        self.album_dialog.is_open() && self.dialog.is_some()
+    }
+
+    /// Presses the shell dialog's buttons.
+    fn press_shell_dialog(&mut self, point: [i32; 2]) -> ShellOutcome {
+        if let Some(dlg) = &mut self.dialog
+            && let Some(layout) = &dlg.layout
+            && let Some(Command::AnswerDialog { button, .. }) =
+                dialog::press_with_state(layout, point, &dlg.state)
+        {
+            dlg.state.pressed_button = Some(usize::from(button));
+            return ShellOutcome::redraw();
+        }
+        ShellOutcome::default()
+    }
+
+    /// Releases over the shell dialog, answering it on a full click.
+    fn release_shell_dialog(&mut self, point: [i32; 2]) -> ShellOutcome {
+        if let Some(dlg) = &mut self.dialog {
+            let pressed = dlg.state.pressed_button.take();
+            if let (Some(pressed_idx), Some(layout)) = (pressed, &dlg.layout)
+                && let Some(Command::AnswerDialog { button, .. }) =
+                    dialog::press_with_state(layout, point, &dlg.state)
+                && usize::from(button) == pressed_idx
+            {
+                return self.answer_dialog(button);
+            }
+            return ShellOutcome {
+                redraw: pressed.is_some(),
+                ..ShellOutcome::default()
+            };
+        }
+        ShellOutcome::default()
+    }
+
+    /// Draws the shell dialog (fading in while the clock runs).
+    fn draw_shell_dialog(&mut self, frame: &mut Frame) {
+        if let Some(dlg) = &mut self.dialog {
+            if dlg.layout.is_none() {
+                dlg.layout = dialog::layout(self.size, &dlg.message, &self.dialog_art);
+            }
+            if let Some(layout) = &dlg.layout {
+                let alpha = if self.clock_us == 0 {
+                    255
+                } else {
+                    self.dialog_fade.alpha((self.clock_us / 1_000) as u32)
+                };
+                dialog::draw_with_state_alpha(
+                    frame,
+                    &self.dialog_art,
+                    &dlg.message,
+                    layout,
+                    self.pointer,
+                    &dlg.state,
+                    alpha,
+                );
+            }
         }
     }
 
@@ -1943,6 +2010,7 @@ impl NeighborhoodShell {
             let has_overlay = self.save_manager.is_open()
                 || self.album_dialog.is_open()
                 || self.travel_dialog_state.is_some();
+            let album_open = self.album_dialog.is_open();
             if has_overlay {
                 session.game.invalidate_present_damage();
                 let lot_canvas = session.game.canvas();
@@ -1970,6 +2038,9 @@ impl NeighborhoodShell {
                     {
                         self.save_manager
                             .draw(&mut frame, snapshot, &self.save_manager_art);
+                    }
+                    if album_open {
+                        self.draw_shell_dialog(&mut frame);
                     }
                     let mut composed = Canvas::new(w, h, [0, 0, 0]);
                     composed.color = frame.into_packed();
@@ -2075,6 +2146,7 @@ impl NeighborhoodShell {
                     {
                         self.album_dialog
                             .draw(&mut frame, snapshot, &self.album_art);
+                        self.draw_shell_dialog(&mut frame);
                     }
                     if let Some(td_state) = &self.travel_dialog_state {
                         self.travel_dialog.draw(
@@ -2217,26 +2289,9 @@ impl NeighborhoodShell {
             frame.fill(Rect::new(0, y, w, bar_h), [16, 24, 68]);
             font.draw(frame, note, [8, y + 3], [240, 245, 255]);
         }
-        if let Some(dlg) = &mut self.dialog {
-            if dlg.layout.is_none() {
-                dlg.layout = dialog::layout(self.size, &dlg.message, &self.dialog_art);
-            }
-            if let Some(layout) = &dlg.layout {
-                let alpha = if self.clock_us == 0 {
-                    255
-                } else {
-                    self.dialog_fade.alpha((self.clock_us / 1_000) as u32)
-                };
-                dialog::draw_with_state_alpha(
-                    frame,
-                    &self.dialog_art,
-                    &dlg.message,
-                    layout,
-                    self.pointer,
-                    &dlg.state,
-                    alpha,
-                );
-            }
+        // A notice over the open album is drawn after the album.
+        if !self.album_dialog.is_open() {
+            self.draw_shell_dialog(frame);
         }
         if self.coop_lobby.is_open() {
             let snap = self.shell_coop_snapshot();
@@ -2590,6 +2645,9 @@ impl NeighborhoodShell {
                 ..ShellOutcome::default()
             };
         }
+        if self.album_notice_open() {
+            return self.press_shell_dialog(point);
+        }
         if self.album_dialog.is_open() {
             if let Some(snapshot) = &self.album_snapshot {
                 let layout = self.album_dialog.layout(self.size[0], self.size[1]);
@@ -2815,6 +2873,9 @@ impl NeighborhoodShell {
                 None => ShellOutcome::redraw(),
             };
         }
+        if self.album_notice_open() {
+            return self.release_shell_dialog(point);
+        }
         if self.album_dialog.is_open() {
             let strip_pressed = self.album_strip_pressed.take();
             let layout = self.album_dialog.layout(self.size[0], self.size[1]);
@@ -2978,10 +3039,18 @@ impl NeighborhoodShell {
     }
 
     pub fn key_dialog(&mut self, key: DialogKey) -> ShellOutcome {
+        if self.album_notice_open() {
+            return self.key_shell_dialog(key);
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             let out = session.game.dialog_confirm_key(key);
             return self.handle_lot_outcome(out);
         }
+        self.key_shell_dialog(key)
+    }
+
+    /// Answers the shell dialog from a key.
+    fn key_shell_dialog(&mut self, key: DialogKey) -> ShellOutcome {
         let Some(dlg) = &self.dialog else {
             return ShellOutcome::default();
         };
@@ -3049,6 +3118,9 @@ impl NeighborhoodShell {
             self.close_travel_dialog();
             return ShellOutcome::redraw();
         }
+        if self.album_notice_open() {
+            return self.key_shell_dialog(DialogKey::Escape);
+        }
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::Escape);
         }
@@ -3105,6 +3177,9 @@ impl NeighborhoodShell {
     }
 
     pub fn key_char(&mut self, ch: char) -> ShellOutcome {
+        if self.album_notice_open() {
+            return self.key_shell_dialog(DialogKey::Char(ch));
+        }
         if self.coop_lobby.is_open() {
             return ShellOutcome {
                 redraw: self.coop_lobby.insert_char(ch),
@@ -3493,6 +3568,9 @@ impl NeighborhoodShell {
                 return self.handle_travel_dialog_command(cmd);
             }
             return ShellOutcome::default();
+        }
+        if self.album_notice_open() {
+            return self.key_shell_dialog(DialogKey::Enter);
         }
         if self.album_dialog.is_open() {
             return self.send_album_key(AlbumKey::Enter);
@@ -6036,7 +6114,10 @@ impl NeighborhoodShell {
                 self.close_import_family_picker();
                 ShellOutcome::redraw()
             }
-            ShopCommand::TryOn { .. } | ShopCommand::RotatePreview(_) => ShellOutcome::redraw(),
+            // The import picker is a list, never a choice dialog.
+            ShopCommand::TryOn { .. }
+            | ShopCommand::RotatePreview(_)
+            | ShopCommand::KeepCurrent => ShellOutcome::redraw(),
             ShopCommand::Buy { item_id, .. } => {
                 let Some(entry) = self.import_picker_entries.get(&item_id).cloned() else {
                     return ShellOutcome::redraw();
@@ -6529,7 +6610,10 @@ impl NeighborhoodShell {
             .unwrap_or(0);
         let (win_start, win_end) = album_hydration_window(total, focus_idx);
         let max_scroll = total.saturating_sub(visible_slots);
-        self.album_strip_scroll = self.album_strip_scroll.min(max_scroll);
+        // The strip the dialog draws is the one to load: a refresh that
+        // moved only the shell's copy would leave the shown thumbnails
+        // outside the loaded window.
+        self.album_strip_scroll = self.album_dialog.strip_scroll().min(max_scroll);
         let strip_start = self.album_strip_scroll.saturating_sub(1);
         let strip_end = (self.album_strip_scroll + visible_slots + 2).min(total);
         for (idx, entry) in snapshot.entries.iter_mut().enumerate() {
@@ -6611,6 +6695,10 @@ impl NeighborhoodShell {
     }
 
     fn send_album_key(&mut self, key: AlbumKey) -> ShellOutcome {
+        // A notice over the album takes the keys (see `album_notice_open`).
+        if self.dialog.is_some() {
+            return ShellOutcome::default();
+        }
         let cmds = self
             .album_snapshot
             .clone()
