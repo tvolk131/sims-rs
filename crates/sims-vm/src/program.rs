@@ -585,6 +585,18 @@ impl Program {
     }
 }
 
+/// Loads one index resource as a code library exactly as [`Program::link_with_pool`]
+/// does, so a caller can tell whether the VM would accept it (a failure here fails the
+/// whole link). `is_global` must be true for the catalog's `Global.iff`.
+pub fn load_library(
+    index: &Index,
+    resource: usize,
+    is_global: bool,
+    pool: &ArchivePool,
+) -> Result<Library> {
+    load_library_with_pool(index, resource, is_global, pool)
+}
+
 fn load_library_with_pool(
     index: &Index,
     resource: usize,
