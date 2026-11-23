@@ -606,6 +606,16 @@ pub struct IndicatorQueues {
     pub stars: Vec<u16>,
     /// +0xac: a refresh is waiting.
     pub dirty: bool,
+    /// Star markers taken from the available star pool (+0xdc) that went
+    /// into neither pool, in the order they were lost. A star refresh
+    /// (0x446ee9) and a famous Sim's arrival (0x447a57) both pop a star
+    /// (0x447012, 0x447b63) before they check the Sim's tile (0x422632);
+    /// for a Sim on a border tile they stop there, and the star is in
+    /// neither the available pool nor the in-use pool (+0xd0, pushed at
+    /// 0x4471b0 only on success). A deselection (0x446bf0) checks the tile
+    /// first and loses none. The port's pools are where the stars stand,
+    /// so it keeps these apart: none is handed out again.
+    pub lost_stars: Vec<u16>,
 }
 
 impl IndicatorQueues {
@@ -636,9 +646,14 @@ impl IndicatorQueues {
     /// the lot is cleared (0x445f84 empties the star pools at +0xd0 and
     /// +0xdc, not these), stays queued after it is freed, and the next
     /// refresh reads freed memory. The port drops such an entry instead.
+    ///
+    /// A deleted lost star leaves [`IndicatorQueues::lost_stars`] too, so a
+    /// new object with its ID is not taken for it. That is not a departure:
+    /// the original's lost star is in no list.
     pub fn forget(&mut self, object: u16) {
         self.dates.retain(|&other| other != object);
         self.stars.retain(|&other| other != object);
+        self.lost_stars.retain(|&other| other != object);
     }
 }
 
@@ -1312,6 +1327,41 @@ impl World {
         Ok(world)
     }
 
+    /// A world snapshot's save payload
+    /// ([`crate::autosave::SavePayloadKind::WorldSnapshot`]): the canonical
+    /// encoding ([`World::encode`]), then the pending indicator refreshes
+    /// ([`World::indicator_queues`]), which the encoding leaves out. The
+    /// encoding comes first and unchanged, so [`World::decode`], which reads
+    /// it and stops, still reads the payload, as an older build does.
+    pub fn encode_snapshot(&self) -> Vec<u8> {
+        let mut bytes = self.encode();
+        let queues =
+            postcard::to_allocvec(&self.indicator_queues).expect("encoding to memory cannot fail");
+        bytes.extend_from_slice(&queues);
+        bytes
+    }
+
+    /// Reads [`World::encode_snapshot`]'s payload. A payload with nothing
+    /// after the world (one saved before the refreshes were kept) has none
+    /// pending.
+    pub fn decode_snapshot(bytes: &[u8]) -> Result<Self> {
+        let (mut world, rest): (Self, _) =
+            postcard::take_from_bytes(bytes).map_err(|e| Error::Snapshot(e.to_string()))?;
+        if !rest.is_empty() {
+            let (queues, rest) = postcard::take_from_bytes::<IndicatorQueues>(rest)
+                .map_err(|e| Error::Snapshot(format!("indicator refreshes: {e}")))?;
+            if !rest.is_empty() {
+                return Err(Error::Snapshot(format!(
+                    "{} bytes after the indicator refreshes",
+                    rest.len()
+                )));
+            }
+            world.indicator_queues = queues;
+        }
+        world.mark_all_frame_storage_dirty();
+        Ok(world)
+    }
+
     /// Marks every existing [`Self::frame_storage`] entry dirty so each object
     /// performs one full `sync_frames` on its first frame push/pop after a
     /// save/restore (preserving bit-exact parity for lower frames edited before
@@ -1420,8 +1470,33 @@ mod tests {
                 dates: vec![5, 6],
                 stars: vec![5, 5],
                 dirty: true,
+                ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn a_world_snapshot_payload_keeps_its_pending_refreshes() {
+        let mut world = World::empty();
+        world.indicator_queues.queue_star(5);
+        world.indicator_queues.lost_stars.push(9);
+        let payload = world.encode_snapshot();
+        // The world's canonical encoding comes first and unchanged.
+        assert!(payload.starts_with(&world.encode()));
+        let back = World::decode_snapshot(&payload).unwrap();
+        assert_eq!(back.indicator_queues, world.indicator_queues);
+        assert_eq!(back.hash(), world.hash());
+        // An older build's decode reads the world and stops.
+        let old = World::decode(&payload).unwrap();
+        assert_eq!(old.indicator_queues, IndicatorQueues::default());
+        assert_eq!(old.hash(), world.hash());
+        // A payload from before the refreshes were kept has none pending.
+        let before = World::decode_snapshot(&world.encode()).unwrap();
+        assert_eq!(before.indicator_queues, IndicatorQueues::default());
+        // Bytes after the refreshes are refused.
+        let mut longer = payload.clone();
+        longer.push(0);
+        assert!(World::decode_snapshot(&longer).is_err());
     }
 
     #[test]

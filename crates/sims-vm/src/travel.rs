@@ -6302,6 +6302,56 @@ mod tests {
         for _ in 0..20 {
             home_final.step().unwrap();
         }
+
+        // A follower made famous away comes home with its fame, and as it
+        // is not selected, with a star (0x447a57 -> 0x447a82).
+        let vac_req = TravelRequest::vacation(40, mortimer_guid, VacationAccommodation::None);
+        let vac_dep =
+            depart_to_destination(&root, &store, "UserData", &mut home_final, &vac_req).unwrap();
+        let mut vac = vac_dep.destination_lot;
+        let vac_bella_id = vac_dep
+            .session
+            .travelers
+            .iter()
+            .find(|t| t.guid == bella_guid)
+            .expect("Bella travels with the family")
+            .destination_object_id;
+        vac.world
+            .objects
+            .get_mut(&vac_bella_id)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[PERSON_FAME_LEVEL] = 15;
+        let ret_vac = return_from_destination(
+            &root,
+            &store,
+            &vac_dep.session,
+            &mut vac,
+            &[3],
+            Frames::default(),
+        )
+        .unwrap();
+        let back = ret_vac.home_lot;
+        let back_bella_id = ret_vac
+            .report
+            .returning_travelers
+            .iter()
+            .find(|&&(guid, _)| guid == bella_guid)
+            .expect("Bella returns")
+            .1;
+        let bella = &back.world.objects[&back_bella_id];
+        assert_eq!(bella.person.as_ref().unwrap().data[PERSON_FAME_LEVEL], 15);
+        assert!(!bella.selected, "the leader is selected on return");
+        let held = bella.slots[2].object;
+        assert!(
+            held > 0
+                && back.world.objects.get(&(held as u16)).is_some_and(|o| {
+                    o.guid == crate::placement::STAR_MARKER && o.data[2] == back_bella_id as i16
+                }),
+            "the famous follower has a star over her head"
+        );
     }
 
     #[test]

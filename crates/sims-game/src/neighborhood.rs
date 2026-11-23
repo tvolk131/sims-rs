@@ -4075,7 +4075,8 @@ impl NeighborhoodShell {
                 (loaded.payload.clone(), None)
             }
             SavePayloadKind::WorldSnapshot => {
-                let world = sims_sim::World::decode(&loaded.payload).map_err(|e| e.to_string())?;
+                let world =
+                    sims_sim::World::decode_snapshot(&loaded.payload).map_err(|e| e.to_string())?;
                 // Obtain a compatible base `Saved` envelope without touching a
                 // potentially corrupt SAVED_LOTS entry: reuse the open lot if it
                 // matches `lot_id`, otherwise boot the clean base house in staging.
@@ -4099,10 +4100,11 @@ impl NeighborhoodShell {
                     }
                 };
                 let spliced = splice_world_into_saved_bytes(&base_saved, &world)?;
-                // A world snapshot holds no pending indicator refreshes, and
-                // the base lot's may name people the restored world lacks.
+                // The splice keeps the base lot's pending indicator refreshes,
+                // which may name people the restored world lacks: take the
+                // snapshot's own (`World::encode_snapshot`).
                 let mut spliced = Saved::decode(&spliced).map_err(|e| e.to_string())?;
-                spliced.forget_indicator_refreshes();
+                spliced.set_indicator_queues(world.indicator_queues.clone());
                 let spliced = spliced.encode();
                 (spliced, Some(loaded.metadata.sim_tick))
             }

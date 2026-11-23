@@ -1844,20 +1844,23 @@ impl Interpreter<'_> {
             }
         }
         if !selected && fame >= 10 {
-            self.mark_star(world, id)?;
+            self.mark_star(world, id, true)?;
         }
         Ok(())
     }
 
-    /// Finds an available (off-lot, uncontained) star marker in `world.order`,
-    /// returning the most recently created available instance first to match
-    /// the original's LIFO `pool_avail.back()` (0x447b22, 0x446ce0).
+    /// Finds an available (off-lot, uncontained, not lost) star marker in
+    /// `world.order`, returning the most recently created available instance
+    /// first to match the original's LIFO `pool_avail.back()` (0x447b22,
+    /// 0x446ce0). A lost star ([`sims_sim::IndicatorQueues::lost_stars`])
+    /// is in neither of the original's pools.
     fn available_star(world: &World) -> Option<u16> {
         world.order.iter().copied().find(|&id| {
             world.objects.get(&id).is_some_and(|obj| {
                 obj.guid == STAR_MARKER
                     && obj.data.get(data::CONTAINER).copied().unwrap_or(0) == 0
                     && !on_lot([obj.position[0], obj.position[1]])
+                    && !world.indicator_queues.lost_stars.contains(&id)
             })
         })
     }
@@ -1869,7 +1872,8 @@ impl Interpreter<'_> {
     /// `STAR_MARKER` present in the catalog, creates 4 hidden (`data[8] |= 0x4000`)
     /// instances if no star markers exist on the lot yet (both `pool_avail` and
     /// `pool_in_use` empty, 0x4463f3..0x446421), or 2 more instances if all
-    /// existing star markers are currently in use (0x44642a).
+    /// existing star markers are currently in use (0x44642a). A lost star
+    /// counts in neither pool.
     fn ensure_star_pool(&self, world: &mut World) -> Result<Option<u16>, Fault> {
         if let Some(star) = Self::available_star(world) {
             return Ok(Some(star));
@@ -1880,7 +1884,9 @@ impl Interpreter<'_> {
         if self.catalog.object(STAR_MARKER).is_none() {
             return Ok(None);
         }
-        let any_existing = world.objects.values().any(|obj| obj.guid == STAR_MARKER);
+        let any_existing = world.objects.iter().any(|(id, obj)| {
+            obj.guid == STAR_MARKER && !world.indicator_queues.lost_stars.contains(id)
+        });
         let count = if any_existing { 2 } else { 4 };
         for _ in 0..count {
             let star_id = self.create(world, STAR_MARKER)?;
@@ -1901,7 +1907,23 @@ impl Interpreter<'_> {
     /// Requires bit `0x40` (`EXPANSION_SUPERSTAR`) in [`crate::Program::expansions`].
     /// Skips silently if Superstar is not installed, `STAR_MARKER` is absent
     /// from the catalog, or the Sim stands on a border tile (`0x422632`).
-    pub(crate) fn mark_star(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+    ///
+    /// `pops_first`: whether the caller takes the star from the available
+    /// pool before it checks the tile. A star refresh (0x447012) and a
+    /// famous Sim's arrival (0x447b63) do, and for a Sim on a border tile
+    /// stop without putting it in the in-use pool, so the star is lost
+    /// ([`sims_sim::IndicatorQueues::lost_stars`]) and the next famous Sim
+    /// gets another. A deselection (0x446ce0..0x446ed9) reads the pool's
+    /// last star, checks the tile, and pops the star only after it is
+    /// placed, so a border tile leaves it available. Not modeled: the
+    /// popping paths also lose the star when the head slot's flags lack
+    /// bit 2 (0x447094..0x4470a8); the port does not keep slot flags.
+    pub(crate) fn mark_star(
+        &self,
+        world: &mut World,
+        id: u16,
+        pops_first: bool,
+    ) -> Result<(), Fault> {
         if self.program.expansions & EXPANSION_SUPERSTAR == 0 {
             return Ok(());
         }
@@ -1915,6 +1937,9 @@ impl Interpreter<'_> {
         };
         let [p0, p1, level] = position(world, id).map_err(fail)?;
         if off_lot(world, [p0, p1]) {
+            if pops_first {
+                world.indicator_queues.lost_stars.push(star);
+            }
             return Ok(());
         }
         let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;

@@ -819,6 +819,10 @@ struct CoopSnapshotEnvelope {
 
 /// Canonical subset of format-8 unencoded `World` fields plus `Lot`/co-op
 /// continuation inputs hashed into [`Lot::coop_world_hash`].
+///
+/// **A change to these fields bumps `sims_net::PROTOCOL_VERSION`**: peers
+/// on two builds would otherwise pass the handshake and then fail every
+/// fingerprint check, even on an idle lot.
 #[derive(Serialize)]
 struct CoopWorldFingerprintTail<'a> {
     world_hash: [u8; 32],

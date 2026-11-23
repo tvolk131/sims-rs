@@ -33,16 +33,16 @@ use sims_sim::{
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Earliest [`Saved::encode`] layout version supported by the explicit forward
-/// schema migration chain ([`SAVED_MIGRATIONS`]: `6 -> 7 -> 8 -> 9`).
+/// schema migration chain ([`SAVED_MIGRATIONS`]: `6 -> 7 -> ... -> 11`).
 pub const MIN_FORMAT: u32 = 6;
 
 /// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
 /// their order and their types (postcard is not self-describing). Bump it
 /// in the commit that changes any of them. The world inside is versioned
 /// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. Formats in
-/// [`MIN_FORMAT`]..=[`FORMAT`] (`6..=9`) with matching [`sims_sim::SNAPSHOT_FORMAT`]
+/// [`MIN_FORMAT`]..=[`FORMAT`] (`6..=11`) with matching [`sims_sim::SNAPSHOT_FORMAT`]
 /// are upgraded deterministically through [`SAVED_MIGRATIONS`]; older (`< 6`),
-/// future (`> 9`), or mismatched world-format saves are refused cleanly. Layout 2
+/// future (`> 11`), or mismatched world-format saves are refused cleanly. Layout 2
 /// keeps each pending dialog answer's bitmap ID ([`crate::Answer`]); layout 3
 /// kept the pre-resolved house view centre; layout 4 keeps the house file's saved
 /// floor rotation baseline (`HOUS 0` `camera_direction & 3`); layout 5
@@ -56,11 +56,17 @@ pub const MIN_FORMAT: u32 = 6;
 /// deleted character GUID never revives stale instances on older saved lots;
 /// layout 8 keeps the unencoded auxiliary portrait, outfit, lazy-index,
 /// and scratch-pointer tables omitted from [`World::encode`]; layout 9 keeps
-/// layout 9 keeps registry special-panel slots ([`SpecialPanels`]) and queued
+/// registry special-panel slots ([`SpecialPanels`]) and queued
 /// [`SpecialPanelResponse`]s for `Dialog` kinds `5..=15`; layout 10 keeps the
 /// per-family `FAMI` flags (`World::family_flags`) omitted from
 /// [`World::encode`]; layout 11 keeps the interface's indicator refresh
 /// queues (`World::indicator_queues`), omitted from it too.
+///
+/// **A new format also bumps `sims_net::PROTOCOL_VERSION`.** A co-op host
+/// sends the lot as a [`Saved`], so a joiner on an older format would
+/// reject it after the handshake; the protocol bump turns it away at the
+/// handshake with a message instead. The same holds for a change to what
+/// the co-op world fingerprint covers (`crate::coop`).
 pub const FORMAT: u32 = 11;
 
 /// Historical `Answers` layout in [`Saved`] format 6 (before `choices_after`).
@@ -495,7 +501,8 @@ static SAVED_STEPS: &[MigrationStep] = &[
     },
 ];
 
-/// Registered forward schema migration chain for [`Saved`] (`v6 -> v7 -> v8 -> v9`).
+/// Registered forward schema migration chain for [`Saved`] (`v6 -> v7 -> v8 -> v9 ->
+/// v10 -> v11`).
 ///
 /// Expects bytes framed with `[layout: u32 LE][postcard body]` (i.e. after
 /// verifying the 4-byte `world_format == sims_sim::SNAPSHOT_FORMAT` header).
@@ -622,13 +629,14 @@ impl Saved {
         &self.world
     }
 
-    /// Drops the people waiting for an indicator refresh
+    /// Replaces the pending indicator refreshes and lost stars
     /// (`World::indicator_queues`), for a save whose world came from
-    /// elsewhere: a bare [`World`] snapshot holds none, and the queue of
-    /// the lot it is spliced into may name people the world lacks.
-    pub fn forget_indicator_refreshes(&mut self) {
-        self.indicator_queues = sims_sim::IndicatorQueues::default();
-        self.world.indicator_queues = sims_sim::IndicatorQueues::default();
+    /// elsewhere: the queues of the lot a [`World`] snapshot is spliced
+    /// into may name people the world lacks, so it takes the snapshot's
+    /// own (`World::decode_snapshot`).
+    pub fn set_indicator_queues(&mut self, queues: sims_sim::IndicatorQueues) {
+        self.world.indicator_queues = queues.clone();
+        self.indicator_queues = queues;
     }
 
     /// Save Card lot name (`0x50e1f8..0x50e42c`).
@@ -1645,6 +1653,7 @@ mod tests {
             dates: vec![4],
             stars: vec![6, 6],
             dirty: true,
+            lost_stars: vec![8],
         };
         let v10_bytes = dec8.encode();
         let (dec10, rep10) = Saved::decode_with_report(&v10_bytes).unwrap();
@@ -1726,15 +1735,16 @@ mod tests {
             sims_sim::IndicatorQueues::default()
         );
 
-        // A save whose world came from a snapshot forgets the queues.
+        // A save whose world came from a snapshot takes the snapshot's
+        // queues, and its world hash does not move.
         let mut spliced = dec10.clone();
-        spliced.forget_indicator_refreshes();
+        let mut queues = sims_sim::IndicatorQueues::default();
+        queues.queue_star(7);
+        queues.lost_stars.push(9);
+        spliced.set_indicator_queues(queues.clone());
         let back = Saved::decode(&spliced.encode()).unwrap();
-        assert_eq!(back.indicator_queues, sims_sim::IndicatorQueues::default());
-        assert_eq!(
-            back.world.indicator_queues,
-            sims_sim::IndicatorQueues::default()
-        );
+        assert_eq!(back.indicator_queues, queues);
+        assert_eq!(back.world.indicator_queues, queues);
         assert_eq!(back.world.hash(), dec10.world.hash());
     }
 

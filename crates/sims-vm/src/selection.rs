@@ -353,7 +353,7 @@ impl Interpreter<'_> {
             self.take_off(world, second, true)?;
         }
         if person_word(world, sim, person::FAME)? >= 10 {
-            self.mark_star(world, sim)?;
+            self.mark_star(world, sim, false)?;
         }
         Ok(())
     }
@@ -527,8 +527,7 @@ impl Interpreter<'_> {
     ///
     /// For a famous person on the border tiles the original takes a star
     /// from its pool before it checks the tiles, and keeps it in neither
-    /// list; the port's pool is where the stars stand, so that star stays
-    /// available.
+    /// list; so does the port ([`sims_sim::IndicatorQueues::lost_stars`]).
     fn refresh_star(&self, world: &mut World, person: u16) -> Result<(), Fault> {
         let selected = world
             .objects
@@ -539,7 +538,7 @@ impl Interpreter<'_> {
             return Ok(());
         }
         if person_word(world, person, person::FAME)? >= 10 {
-            return self.mark_star(world, person);
+            return self.mark_star(world, person, true);
         }
         let Some(held) = self.head_slot(world, person)? else {
             return Ok(());

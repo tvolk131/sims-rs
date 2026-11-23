@@ -129,7 +129,8 @@ impl fmt::Display for SaveSlot {
 /// Tag describing the serialized bytes inside a [`LoadedSave`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SavePayloadKind {
-    /// Encoded [`World`] snapshot (`World::encode`).
+    /// Encoded [`World`] snapshot ([`World::encode_snapshot`]: the world's
+    /// canonical encoding, then its pending indicator refreshes).
     WorldSnapshot,
     /// Encoded `sims_vm::boot::save::Saved` lot bytes (`Saved::encode`).
     SavedLot,
@@ -140,7 +141,7 @@ pub enum SavePayloadKind {
 /// Owned payload handed to a background save worker via [`SaveJob`].
 #[derive(Debug, Clone)]
 pub enum SavePayload {
-    /// Cloned CoW [`World`] snapshot; encoded (`World::encode`) on the worker
+    /// Cloned CoW [`World`] snapshot; encoded ([`World::encode_snapshot`]) on the worker
     /// thread rather than blocking the simulation thread.
     World(Box<World>),
     /// Pre-encoded `sims_vm::boot::save::Saved` lot bytes (`Saved::encode`).
@@ -173,7 +174,7 @@ impl SavePayload {
 
     fn into_encoded(self) -> (SavePayloadKind, Vec<u8>) {
         match self {
-            Self::World(world) => (SavePayloadKind::WorldSnapshot, world.encode()),
+            Self::World(world) => (SavePayloadKind::WorldSnapshot, world.encode_snapshot()),
             Self::SavedLot(bytes) => (SavePayloadKind::SavedLot, bytes),
             Self::Custom { kind, bytes } => (SavePayloadKind::Custom(kind), bytes),
         }
@@ -382,7 +383,7 @@ impl LoadedSave {
                 ),
             });
         }
-        World::decode(&self.payload).map_err(|error| SaveError::DecodeFailed {
+        World::decode_snapshot(&self.payload).map_err(|error| SaveError::DecodeFailed {
             neighborhood_id: self.metadata.neighborhood_id.clone(),
             lot_id: self.metadata.lot_id,
             slot: self.metadata.slot,
@@ -801,7 +802,7 @@ where
     F: Fn(&SavePayloadKind, &[u8; 32], &[u8]) -> std::result::Result<(), String>,
 {
     if *kind == SavePayloadKind::WorldSnapshot {
-        World::decode(payload).map_err(|error| SaveError::DecodeFailed {
+        World::decode_snapshot(payload).map_err(|error| SaveError::DecodeFailed {
             neighborhood_id: neighborhood_id.to_owned(),
             lot_id,
             slot,

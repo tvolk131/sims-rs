@@ -1023,13 +1023,15 @@ fn studio_town_house81_celebrity_pooled_stars_and_downtown_house21_bar_avoid_uns
         let mut player = SweepPlayer::new(&world);
         let mut play = Play::default();
         let mut saw_star_attached = false;
-        // Stars already over someone before the interaction runs.
-        let attached_before: Vec<(u16, i16)> = world
-            .objects
-            .values()
-            .filter(|o| o.guid == STAR_MARKER_GUID && o.data[2] > 0)
-            .map(|o| (o.id, o.data[2]))
-            .collect();
+        let star_over = |world: &World, sim: u16| {
+            world.objects.get(&sim).is_some_and(|o| {
+                let held = o.slots.get(2).map_or(0, |s| s.object);
+                held > 0
+                    && world.objects.get(&(held as u16)).is_some_and(|star| {
+                        star.guid == STAR_MARKER_GUID && star.data[2] == sim as i16
+                    })
+            })
+        };
         for tick in 1..=200 {
             let (u, res) =
                 interp.lot_update_kept(&mut world, &tuning, &mut player, Some(&mut play));
@@ -1047,28 +1049,31 @@ fn studio_town_house81_celebrity_pooled_stars_and_downtown_house21_bar_avoid_uns
             // next frame refreshes the indicators (0x4a8b12 -> 0x4464db).
             // On this community lot the load reseeds both streams, and the
             // celebrity summoned arrives at fame 0 and is made famous here.
+            // Before the frame: famous Sims that are not selected, queued
+            // for a star refresh by the fame write (0x444962), with no star.
+            let waiting: Vec<u16> = world
+                .objects
+                .values()
+                .filter(|o| {
+                    !o.selected
+                        && o.person.as_ref().is_some_and(|p| p.data[81] >= 10)
+                        && world.indicator_queues.stars.contains(&o.id)
+                        && !star_over(&world, o.id)
+                })
+                .map(|o| o.id)
+                .collect();
             if let Err(err) = interp.draw_frame(&mut world, 1) {
                 panic!("House81 frame failed at tick {tick}: {err}");
             }
-            // A new star, in the head slot of a famous Sim that is not
-            // selected.
-            if world.objects.values().any(|o| {
-                let head = o.data[2];
-                o.guid == STAR_MARKER_GUID
-                    && head > 0
-                    && !attached_before.contains(&(o.id, head))
-                    && world.objects.get(&(head as u16)).is_some_and(|sim| {
-                        !sim.selected
-                            && sim.slots.get(2).map(|s| s.object) == Some(o.id as i16)
-                            && sim.person.as_ref().is_some_and(|p| p.data[81] >= 10)
-                    })
-            }) {
+            // After it: the same Sim holds a pooled star in its head slot.
+            if waiting.iter().any(|&sim| star_over(&world, sim)) {
                 saw_star_attached = true;
             }
         }
         assert!(
             saw_star_attached,
-            "a House81 celebrity must get a pooled star marker (0xE9337020)"
+            "a House81 celebrity made famous must get a pooled star marker (0xE9337020) \
+             at the next frame"
         );
     }
 

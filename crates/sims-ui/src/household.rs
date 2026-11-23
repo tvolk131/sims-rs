@@ -394,6 +394,15 @@ pub struct Acquaintances {
     /// Whether the Superstar pack is installed: the installed packs'
     /// mask (`[0x6e48bc]+0x66`) has its bit, 0x40 (0x51a7ea).
     pub superstar: bool,
+    /// The interface's table of person types (0x6f2698), by GUID, in its
+    /// order: each person definition (`OBJD` type 2) in the definition
+    /// registry's order at startup (0x4e8b3d walks the registry's vector
+    /// with 0x43ac3a), a GUID's first place kept (0x4e9753 finds the
+    /// first). The relationship panel lists only people in it, and breaks
+    /// its last tie by their place (0x4e9e80, 0x4ea035). A person type
+    /// made while the game runs is appended after these
+    /// ([`Acquaintances::portrait_place`]).
+    pub portraits: Vec<u32>,
 }
 
 impl Acquaintances {
@@ -414,13 +423,46 @@ impl Acquaintances {
                 })
             })
             .collect();
+        let mut portraits = Vec::new();
+        for object in &catalog.objects {
+            if object.kind == PERSON_KIND && !portraits.contains(&object.guid) {
+                portraits.push(object.guid);
+            }
+        }
         Self {
             friendship,
             characters,
             superstar: expansions.contains(Self::SUPERSTAR),
+            portraits,
         }
     }
+
+    /// A person type's place in the interface's table of person types
+    /// (0x4e9753), or None when it is not there (-1).
+    ///
+    /// Types made while the game runs (`world.characters.made`) come
+    /// after the startup ones: making one appends it (0x4265fd →
+    /// 0x4e8a3a, which walks the registry again and appends each person
+    /// GUID the table lacks, 0x4e8add). The port keeps made types by GUID,
+    /// not in the order they were made, so it places them in GUID order
+    /// (**unverified** that the two agree when two were made).
+    pub fn portrait_place(&self, world: &World, guid: u32) -> Option<usize> {
+        if let Some(place) = self.portraits.iter().position(|&other| other == guid) {
+            return Some(place);
+        }
+        let made = &world.characters.made;
+        made.contains_key(&guid).then(|| {
+            self.portraits.len()
+                + made
+                    .keys()
+                    .filter(|&&other| other < guid && !self.portraits.contains(&other))
+                    .count()
+        })
+    }
 }
+
+/// The `OBJD` type of a person (definition +0x12, 0x4e8b6a).
+const PERSON_KIND: u16 = 2;
 
 /// A person in the relationship panel: what 0x4ea042 reads of the
 /// selected Sim's relationship row toward them.
@@ -1214,13 +1256,15 @@ fn friends_family(
 /// panel's order: 0x4e9deb lists the neighbor records, in slot order,
 /// that the Sim's own record (the first of its type) has a row toward,
 /// and 0x4e9fad sorts them: the household's members first, then people on
-/// the lot, then by the daily relationship, highest first, then by
-/// record.
+/// the lot, then by the daily relationship, highest first, then by their
+/// place in the interface's table of person types (0x4ea035 compares the
+/// places 0x4e9753 gave, [`Acquaintances::portrait_place`]). A record
+/// whose type is not in that table is left out (0x4e9e8c).
 ///
 /// **Not ported:** 0x4e9deb's test of each record (0x423f30, and words
 /// of the person on the lot), so a record the original leaves out may be
-/// listed; and the original breaks the last tie by its own list of
-/// people (0x6f2698), not by record (**unverified** that they agree).
+/// listed. Two records of one type tie completely; the port keeps them
+/// in slot order, the original's sort (0x4eb3d1) is not stable.
 /// Person data word 32: whether the person lives on the lot. A 6 keeps
 /// anyone in the relationship panel (0x4e9eae); what a 6 stands for is
 /// not known.
@@ -1307,6 +1351,9 @@ fn relations(world: &World, guid: u32, members: &[u32], known: &Acquaintances) -
         // (0x4ea192). So a second record of a type is listed with the
         // first's row, or not at all where only it has a row; 0x4ea042
         // reads friendship between the first records too.
+        let Some(place) = known.portrait_place(world, record.guid) else {
+            continue;
+        };
         let Some(target) = neighbors.first_of(record.guid) else {
             continue;
         };
@@ -1333,7 +1380,7 @@ fn relations(world: &World, guid: u32, members: &[u32], known: &Acquaintances) -
             !members.contains(&record.guid),
             !on_lot(record.guid),
             std::cmp::Reverse(value(0)),
-            record.id,
+            place,
         );
         listed.push((order, relation));
     }
@@ -1584,6 +1631,7 @@ mod tests {
             friendship: 50,
             characters: (100..1000).collect(),
             superstar: true,
+            portraits: (100..1000).collect(),
         }
     }
 
@@ -1641,6 +1689,42 @@ mod tests {
         // Nobody known, or a viewer without a record: an empty list.
         assert_eq!(listed(&[]), []);
         assert!(relations(&World::empty(), 100, &[], &known()).is_empty());
+    }
+
+    /// 0x4e9fad's last tie: two equally liked acquaintances come in the
+    /// order of their places in the interface's table of person types
+    /// (0x4ea035 compares the places 0x4e9753 gave), not by record. A
+    /// type missing from the table is not listed (0x4e9e8c); a type made
+    /// while the game runs comes after the startup ones (0x4e8a3a).
+    #[test]
+    fn equally_liked_acquaintances_tie_on_the_portrait_table_place() {
+        let mut world = World::empty();
+        world.neighbors.slots = vec![
+            Some(record(1, 100, &[(2, 30), (3, 30), (4, 30), (5, 30)])),
+            Some(record(2, 200, &[])),
+            Some(record(3, 300, &[])),
+            Some(record(4, 400, &[])),
+            Some(record(5, 500, &[])),
+        ];
+        let mut known = known();
+        // The registry put 300 before 200; 400 has no place; 500 was made.
+        known.portraits = vec![100, 300, 200];
+        world.characters.made.insert(
+            500,
+            sims_sim::characters::Character {
+                template: 100,
+                file: 0,
+                strings: BTreeMap::new(),
+            },
+        );
+        let ids: Vec<_> = relations(&world, 100, &[], &known)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, [3, 2, 5]);
+        assert_eq!(known.portrait_place(&world, 500), Some(3));
+        assert_eq!(known.portrait_place(&world, 400), None);
+        assert_eq!(first_relation(&world, 100, &[], &known), Some(300));
     }
 
     #[test]
@@ -2148,6 +2232,7 @@ mod tests {
             friendship: 50,
             characters: [0x100, 0x200, 0x300, 0x400, 0x500].into_iter().collect(),
             superstar: true,
+            portraits: Vec::new(),
         };
         // Only `star_friend` (5 half-stars) qualifies.
         assert_eq!(friend_star_power(&world, 0x100, &known), 5);
