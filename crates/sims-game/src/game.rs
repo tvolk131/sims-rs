@@ -457,8 +457,8 @@ pub struct Game {
     /// Set whenever `step_camera_pan` advances the camera origin, consumed by
     /// the desktop host loop so the final landing frame always redraws.
     camera_pan_moved: bool,
-    /// Classic cheat console toggles (`move_objects`, `map_edit`, `autonomy`, `sim_speed`).
-    cheat_move_objects: bool,
+    /// Classic cheat console toggles (`map_edit`, `autonomy`, `sim_speed`).
+    /// (`move_objects` is stored natively on `self.lot`.)
     cheat_map_edit: bool,
     cheat_autonomy: Option<u8>,
     cheat_sim_speed: Option<i16>,
@@ -495,6 +495,15 @@ pub struct Game {
     /// Monotonic counter bumped on world-mutating operations so
     /// [`sound::Feed::update`] can dirty-gate `Snapshot` rebuilds in O(1).
     world_sound_rev: u64,
+    /// `true` when running a clean-room standalone `open-pack/` lot with zero
+    /// commercial EA/Maxis assets (uses 2D sprite Sim rendering and procedural
+    /// UI art instead of commercial 3D `.skn`/`.cmx` meshes).
+    open_pack_mode: bool,
+    /// Keeps the compiled `open-pack/` temporary staging directory alive for
+    /// the lifetime of this [`Game`].
+    _open_pack_staging: Option<crate::open_pack::OpenPackStagingDir>,
+    /// Synthesized PCM WAV sound bank from `open-pack/` (for `Mixer::open_pack`).
+    open_pack_wavs: Option<BTreeMap<String, Vec<u8>>>,
 }
 
 /// Immutable install-wide assets cached on [`crate::neighborhood::NeighborhoodShell`]
@@ -515,9 +524,15 @@ pub struct InstallAssets {
     pub(crate) people_library: PeopleLibrary,
     pub(crate) avatar_registry: Option<Arc<AvatarRegistry>>,
     pub(crate) base_preloaded_cast: Option<PreloadedCast>,
+    pub(crate) vm_cache: Arc<sims_vm::lifecycle::VmInstallCache>,
 }
 
 impl InstallAssets {
+    /// Returns the warm install-wide VM cache reused across lot entries.
+    pub fn vm_cache(&self) -> &Arc<sims_vm::lifecycle::VmInstallCache> {
+        &self.vm_cache
+    }
+
     /// Loads all immutable install-wide assets in parallel, optionally reusing
     /// an already-opened [`ArchivePool`] and base [`Index`] (e.g. from
     /// [`crate::neighborhood::NeighborhoodShell::open`]).
@@ -527,7 +542,7 @@ impl InstallAssets {
         existing_base_index: Option<Arc<Index>>,
         existing_base_catalog: Option<Arc<Catalog>>,
     ) -> Result<Self, String> {
-        let (idx_cat_shared_res, plugins, hud_static_res, people_res, registry_res) =
+        let (idx_cat_shared_res, plugins, hud_static_res, people_res, registry_res, vm_cache_res) =
             std::thread::scope(|scope| {
                 let plugins_handle = scope.spawn(|| Surfaces::plugins_with_pool(install, &pool));
                 let hud_handle = scope.spawn(|| HudStatic::load(install, Arc::clone(&pool)));
@@ -538,6 +553,11 @@ impl InstallAssets {
                 });
                 let registry_handle =
                     scope.spawn(|| AvatarRegistry::load_with_pool(install, &pool));
+                let vm_cache_handle = scope.spawn(|| {
+                    sims_vm::lifecycle::VmInstallCache::load(&install.root)
+                        .map(Arc::new)
+                        .map_err(|e| e.to_string())
+                });
                 let idx_cat_shared_res = (|| -> Result<_, String> {
                     let base_index = match existing_base_index {
                         Some(idx) => idx,
@@ -567,12 +587,16 @@ impl InstallAssets {
                     registry_handle
                         .join()
                         .expect("install assets avatar registry worker panicked"),
+                    vm_cache_handle
+                        .join()
+                        .expect("install assets vm cache worker panicked"),
                 )
             });
         let (base_index, base_catalog, hud_shared) = idx_cat_shared_res?;
         let (floor_plugins, wall_plugins) = plugins;
         let hud_static = hud_static_res?;
         let (content_assets, people_library) = people_res?;
+        let vm_cache = vm_cache_res?;
         let avatar_registry = registry_res.ok().map(Arc::new);
         let base_preloaded_cast = avatar_registry.as_ref().and_then(|registry| {
             let person_types = base_catalog
@@ -610,6 +634,7 @@ impl InstallAssets {
             people_library,
             avatar_registry,
             base_preloaded_cast,
+            vm_cache,
         })
     }
 
@@ -1071,7 +1096,6 @@ impl Game {
             smooth_camera_pan: false,
             camera_pan: None,
             camera_pan_moved: false,
-            cheat_move_objects: false,
             cheat_map_edit: false,
             cheat_autonomy: None,
             cheat_sim_speed: None,
@@ -1088,6 +1112,9 @@ impl Game {
             coop_overlay_buttons: CoopOverlayButtons::default(),
             coop_buy_preview: None,
             world_sound_rev: 0,
+            open_pack_mode: false,
+            _open_pack_staging: None,
+            open_pack_wavs: None,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -1247,14 +1274,24 @@ impl Game {
                     let people_library = PeopleLibrary::scan_with_pool(&content_assets, &pool)?;
                     Ok((content_assets, people_library))
                 });
-                let lot_res = sims_vm::lifecycle::enter_lot(
-                    install_root,
-                    store,
-                    neighborhood_id,
-                    house,
-                    answers,
-                    frames.clone(),
-                )
+                let lot_res = match cached {
+                    Some(shared) => sims_vm::lifecycle::enter_lot_with_cache(
+                        &shared.vm_cache,
+                        store,
+                        neighborhood_id,
+                        house,
+                        answers,
+                        frames.clone(),
+                    ),
+                    None => sims_vm::lifecycle::enter_lot(
+                        install_root,
+                        store,
+                        neighborhood_id,
+                        house,
+                        answers,
+                        frames.clone(),
+                    ),
+                }
                 .map_err(|e| format!("{neighborhood_id} House{house:02}: {e}"));
                 (
                     lot_res,
@@ -1441,7 +1478,6 @@ impl Game {
             smooth_camera_pan: false,
             camera_pan: None,
             camera_pan_moved: false,
-            cheat_move_objects: false,
             cheat_map_edit: false,
             cheat_autonomy: None,
             cheat_sim_speed: None,
@@ -1458,6 +1494,9 @@ impl Game {
             coop_overlay_buttons: CoopOverlayButtons::default(),
             coop_buy_preview: None,
             world_sound_rev: 0,
+            open_pack_mode: false,
+            _open_pack_staging: None,
+            open_pack_wavs: None,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -1777,7 +1816,6 @@ impl Game {
             smooth_camera_pan: false,
             camera_pan: None,
             camera_pan_moved: false,
-            cheat_move_objects: false,
             cheat_map_edit: false,
             cheat_autonomy: None,
             cheat_sim_speed: None,
@@ -1794,6 +1832,9 @@ impl Game {
             coop_overlay_buttons: CoopOverlayButtons::default(),
             coop_buy_preview: None,
             world_sound_rev: 0,
+            open_pack_mode: false,
+            _open_pack_staging: None,
+            open_pack_wavs: None,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -1801,6 +1842,207 @@ impl Game {
             game.set_mode(Mode::Buy);
         }
         Ok(game)
+    }
+
+    /// Compiles and boots a clean-room standalone `open-pack/` directory with
+    /// zero commercial EA/Maxis assets required.
+    ///
+    /// Uses `sims_antics::compile_standalone_pack_dir` to build all 20 objects,
+    /// 4 `.flr` floors, 4 `.wll` walls, `House01.iff`, `Neighborhood.iff`,
+    /// starter Sims, and synthesized PCM WAV bank, paired with
+    /// [`sims_ui::art::Art::clean_room_procedural`] and 2D clean-room Sim
+    /// sprite rendering.
+    pub fn open_open_pack(pack_dir: &Path, play: bool, frames: Frames) -> Result<Self, String> {
+        let staged = crate::open_pack::stage_open_pack(pack_dir)?;
+        let install_root = staged.staging_dir.path();
+        let house = &staged.house_path;
+        let neighborhood_dir = house
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("staged open-pack house is not in a Houses folder")?;
+        let install = Install::detect(install_root).map_err(|e| e.to_string())?;
+        let neighborhood = Neighborhood::open(neighborhood_dir).map_err(|e| e.to_string())?;
+        let pool = Arc::new(ArchivePool::new());
+        let mut index = Index::build(&install).map_err(|e| e.to_string())?;
+        if let Some(characters) = neighborhood.characters().map_err(|e| e.to_string())? {
+            index
+                .add_characters(&characters)
+                .map_err(|e| e.to_string())?;
+        }
+        let catalog = Arc::new(Catalog::build_with_pool(&index, &pool).map_err(|e| e.to_string())?);
+        let index = Arc::new(index);
+        let base_assets = BaseAssets::load(&install).map_err(|e| e.to_string())?;
+        let (floor_plugins, wall_plugins) = Surfaces::plugins_with_pool(&install, &pool);
+
+        let mut lot = Lot::load_open_pack(install_root, house, &[], frames.clone())
+            .map_err(|e| format!("{}: {e}", house.display()))?;
+        lot.wait_for_answers();
+        let stopped = lot
+            .load_report()
+            .stopped
+            .as_ref()
+            .map(|s| format!("The load stopped, so the lot cannot run: {s}"));
+
+        let assets = sims_render::Assets::from_base(
+            base_assets,
+            floor_plugins,
+            wall_plugins,
+            Arc::clone(&index),
+            Arc::clone(&catalog),
+            Arc::clone(&pool),
+        );
+        let lot_shape = sims_render::Lot::from_world(lot.world())
+            .map_err(|e| e.to_string())?
+            .with_floor_rotation(lot.floor_rotation());
+        let friendship = lot.program().autonomy_constants().friendship_threshold;
+        let members: Vec<u32> = staged.starter_sims.iter().map(|s| s.guid).collect();
+        let mut hud = Hud::open_open_pack(
+            &install,
+            members,
+            &staged.starter_sims,
+            &assets,
+            lot.world(),
+            friendship,
+            &pool,
+        )?;
+        hud.sync_clock_blink(lot.world(), 0);
+        let content_assets = ContentAssets::scan(install_root)?;
+        let people_library = PeopleLibrary::scan_with_pool(&content_assets, &pool)?;
+        let cast = Cast::from_shared(
+            install,
+            Arc::clone(&index),
+            Arc::clone(&catalog),
+            None,
+            Arc::clone(&pool),
+        )?;
+        let people = People::from_inner(sims_people::People::new(
+            content_assets,
+            people_library,
+            cast,
+        ));
+        let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
+        let drawn_camera = view.camera;
+
+        let mut game = Self {
+            lot,
+            lot_shape,
+            assets,
+            view,
+            people,
+            hud,
+            pace: Pace::default(),
+            play,
+            stopped,
+            errors: Errors::default(),
+            sounds: VecDeque::new(),
+            ui_effects: VecDeque::new(),
+            highlighted_buttons: BTreeSet::new(),
+            highlighted_portraits: BTreeSet::new(),
+            highlighted_relationships: BTreeSet::new(),
+            pointer: None,
+            reached: None,
+            listed: None,
+            highlighted: None,
+            buy_selected: None,
+            buy_cursor: None,
+            buy_in_house: false,
+            buy_last_guid: None,
+            buy_facing: None,
+            buy_dragging: None,
+            buy_grab_offset: [0, 0],
+            buy_commit_on_release: false,
+            live_panel_expanded: true,
+            shift_held: false,
+            ctrl_held: false,
+            wall_cursor: None,
+            build_drag: None,
+            build_preview_shape: None,
+            base_roof: RoofState::default(),
+            roof_catalog: None,
+            roof_view: false,
+            terrain_hover_overlay: None,
+            water_hover_overlay: None,
+            shop_dialog: ShopPickerDialog::new(),
+            shop_art: None,
+            shop_strings: None,
+            shop_snapshot: None,
+            shop_preview_assets: None,
+            shop_preview_yaw_deg: 0,
+            shop_preview_body: None,
+            shop_preview_targets: BTreeMap::new(),
+            purchased_shop_items: BTreeSet::new(),
+            book_dialog: ReferenceBookDialog::new(),
+            book_art: None,
+            book_strings: None,
+            book_snapshot: None,
+            active_special_panel: None,
+            submitted_coop_special_panel: None,
+            ordered_wardrobe: None,
+            pending_travel_lot: None,
+            special_lot_catalog: Vec::new(),
+            ui_animating_prev: false,
+            voice_inputs: VecDeque::new(),
+            buy_moneyback_us: None,
+            buy_delete_us: None,
+            note: None,
+            clock_us: 0,
+            drawn_us: 0,
+            blink_dirty: false,
+            dirty: false,
+            restore_dirty_on_quit_cancel: false,
+            pending_after_save_note: None,
+            pending_after_notice: None,
+            edit_mode: false,
+            edge_scroll_rem: [0, 0],
+            canvas: Canvas::new(1, 1, [0, 0, 0]),
+            lot_cache: sims_render::LotCache::new(),
+            drawn_camera,
+            lot_depth: Vec::new(),
+            lot_depth_from_cache: false,
+            people_ids: sims_render::Ids::default(),
+            people_rects: Vec::new(),
+            prev_dynamic_rects: Vec::new(),
+            prev_steady_key: None,
+            present_damage: None,
+            pie_animations: false,
+            debug: false,
+            last_debug_logged_note: None,
+            smooth_camera_pan: false,
+            camera_pan: None,
+            camera_pan_moved: false,
+            cheat_map_edit: false,
+            cheat_autonomy: None,
+            cheat_sim_speed: None,
+            world_mutated_via_restore: false,
+            restore_generation: 0,
+            frames,
+            coop: CoopController::new(),
+            coop_lobby: CoopLobbyDialog::new(),
+            coop_art: None,
+            coop_player_name: default_player_name("Player"),
+            coop_iroh_config: IrohConfig::P2pDefault,
+            coop_travel_blocked: false,
+            coop_remote_world: false,
+            coop_overlay_buttons: CoopOverlayButtons::default(),
+            coop_buy_preview: None,
+            world_sound_rev: 0,
+            open_pack_mode: true,
+            _open_pack_staging: Some(staged.staging_dir),
+            open_pack_wavs: Some(staged.sounds_wav),
+        };
+        game.sync_view();
+        Ok(game)
+    }
+
+    /// Whether this game is running in standalone clean-room `open-pack/` mode.
+    pub fn is_open_pack(&self) -> bool {
+        self.open_pack_mode
+    }
+
+    /// Synthesized PCM WAV sound bank loaded from `open-pack/`, when running
+    /// in standalone clean-room mode.
+    pub fn open_pack_sounds(&self) -> Option<&BTreeMap<String, Vec<u8>>> {
+        self.open_pack_wavs.as_ref()
     }
 
     /// Saves the active lot back to its REDB [`sims_sim::neighborhood_store::NeighborhoodStore`]
@@ -1966,9 +2208,9 @@ impl Game {
         self.note = Some(note.into());
     }
 
-    /// Whether `move_objects on` is currently enabled via the cheat console.
+    /// Whether `move_objects on` is currently enabled on the live lot.
     pub fn cheat_move_objects(&self) -> bool {
-        self.cheat_move_objects
+        self.lot.move_objects()
     }
 
     /// Whether `map_edit on` is currently enabled via the cheat console.
@@ -2092,14 +2334,11 @@ impl Game {
                     total_funds_delta = total_funds_delta.saturating_add(amount);
                 }
                 CheatCommand::SetHour(hour) => {
-                    target_hour = Some(hour % 24);
+                    target_hour = Some(hour);
                 }
                 CheatCommand::MoveObjects(on) => {
-                    self.cheat_move_objects = on;
-                    messages.push(format!(
-                        "move_objects {} (VM placement override pending)",
-                        if on { "on" } else { "off" }
-                    ));
+                    self.lot.set_move_objects(on);
+                    messages.push(format!("move_objects {}", if on { "on" } else { "off" }));
                 }
                 CheatCommand::MapEdit(on) => {
                     self.cheat_map_edit = on;
@@ -2152,57 +2391,39 @@ impl Game {
             }
         }
 
-        if total_funds_delta != 0 || target_hour.is_some() {
-            let mut funds_blocked_by_edit_budget = false;
-            let res = self.mutate_world_via_saved(|world| {
-                if total_funds_delta != 0 {
-                    if world.globals.get(32).copied().unwrap_or(0) != 0 {
-                        funds_blocked_by_edit_budget = true;
+        if total_funds_delta != 0 {
+            let edit_budget = self.lot.world().globals.get(32).copied().unwrap_or(0) != 0;
+            match self.lot.add_funds(total_funds_delta) {
+                Ok(_) => {
+                    if edit_budget {
+                        messages.push("Funds unchanged in edit-budget mode".into());
                     } else {
-                        let next_funds = world.budget.funds.saturating_add(total_funds_delta);
-                        let _ = world.set_funds(next_funds);
+                        self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
+                        self.dirty = true;
+                        messages.push(format!("Added ${total_funds_delta}"));
                     }
                 }
-                if let Some(hour) = target_hour {
-                    if !world.globals.is_empty() {
-                        world.globals[0] = i16::from(hour);
-                    }
-                    if world.globals.len() > 5 {
-                        world.globals[5] = 0;
-                    }
-                    if world.globals.len() > 6 {
-                        world.globals[6] = 0;
-                    }
-                    if world.globals.len() > 4 {
-                        // Matches `sims_vm::tick::time_of_day` (`0x46d525`):
-                        // `0..=5` night (2), `6` dawn (3), `7..=17` day (0),
-                        // `18` dusk (1), `19..=23` night (2).
-                        let period = match hour {
-                            0..=5 => 2,
-                            6 => 3,
-                            7..=17 => 0,
-                            18 => 1,
-                            _ => 2,
-                        };
-                        if world.globals[4] != period {
-                            world.globals[4] = period;
-                            world.mark_all_rooms();
-                        }
-                    }
+                Err(err) => {
+                    self.hud
+                        .cheat_console
+                        .set_feedback(FeedbackKind::Error, format!("Cheat failed: {err}"));
+                    return;
                 }
-            });
-            match res {
+            }
+        }
+
+        if let Some(hour) = target_hour {
+            match self.lot.set_hour(hour) {
                 Ok(()) => {
-                    if total_funds_delta != 0 {
-                        if funds_blocked_by_edit_budget {
-                            messages.push("Funds unchanged in edit-budget mode".into());
-                        } else {
-                            messages.push(format!("Added ${total_funds_delta}"));
-                        }
+                    self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
+                    self.dirty = true;
+                    self.clear_lot_cache();
+                    let world = self.lot.world();
+                    if let Ok(shape) = sims_render::Lot::from_world(world) {
+                        self.lot_shape = shape.with_floor_rotation(self.lot.floor_rotation());
                     }
-                    if let Some(hour) = target_hour {
-                        messages.push(format!("Hour set to {hour:02}:00"));
-                    }
+                    self.hud.sync_clock_blink(self.lot.world(), self.clock_us);
+                    messages.push(format!("Hour set to {hour:02}:00"));
                 }
                 Err(err) => {
                     self.hud
@@ -2279,7 +2500,9 @@ impl Game {
         self.dirty = true;
         self.clear_lot_cache();
         let world = self.lot.world();
-        self.people.refresh(world);
+        if !self.open_pack_mode {
+            self.people.refresh(world);
+        }
         if let Ok(shape) = sims_render::Lot::from_world(world) {
             self.lot_shape = shape.with_floor_rotation(self.lot.floor_rotation());
         }
@@ -3679,13 +3902,25 @@ impl Game {
         let milliseconds = (self.clock_us / 1000) as u32;
         self.people.set_clock(milliseconds);
         self.people_rects.clear();
-        self.people.draw_in_viewport_tracked(
-            world,
-            &self.view.camera,
-            viewport,
-            &mut self.canvas,
-            &mut self.people_rects,
-        );
+        if self.open_pack_mode {
+            crate::open_pack::draw_open_pack_sims(
+                world,
+                draw_shape,
+                &mut self.assets,
+                &self.view.camera,
+                viewport,
+                &mut self.canvas,
+                &mut self.people_rects,
+            );
+        } else {
+            self.people.draw_in_viewport_tracked(
+                world,
+                &self.view.camera,
+                viewport,
+                &mut self.canvas,
+                &mut self.people_rects,
+            );
+        }
         for (&id, obj) in &world.objects {
             if (obj.person.is_some() || obj.guid == sims_people::bob::STANDARD)
                 && let Some(rect) = self.canvas.drawn(id)
@@ -3778,7 +4013,9 @@ impl Game {
                         viewport,
                     );
                 }
-                if let Some(center) = menu.main_center() {
+                if let Some(center) = menu.main_center()
+                    && !self.open_pack_mode
+                {
                     let rendered = if let Some(pose) = menu.head_pose_at(pointer, milliseconds) {
                         self.people.head_in_viewport_pose(
                             world,
@@ -5541,7 +5778,9 @@ impl Game {
             }
         }
         self.pace.restart();
-        self.people.refresh(world);
+        if !self.open_pack_mode {
+            self.people.refresh(world);
+        }
         match sims_render::Lot::from_world(world) {
             Ok(shape) => self.lot_shape = shape.with_floor_rotation(self.lot.floor_rotation()),
             Err(e) => self
@@ -8275,7 +8514,9 @@ impl Game {
     fn refresh_world(&mut self) {
         self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
         let world = self.lot.world();
-        self.people.refresh(world);
+        if !self.open_pack_mode {
+            self.people.refresh(world);
+        }
         match sims_render::Lot::from_world(world) {
             Ok(shape) => self.lot_shape = shape.with_floor_rotation(self.lot.floor_rotation()),
             Err(e) => self

@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+sims-antics = { path = "../sims-antics" }
 sims-audio = { path = "../sims-audio" }
 sims-content.workspace = true
 sims-core.workspace = true

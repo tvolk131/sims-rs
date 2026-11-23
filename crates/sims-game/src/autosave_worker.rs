@@ -123,11 +123,15 @@ pub fn validate_save_payload(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(),
 }
 
 /// Full payload validator backed by a bounded `(SavePayloadKind, SHA-256)`
-/// cache so Save Manager listings, overwrite/pruning safeguards, and
-/// self-encoded commits agree 100% with [`validate_save_payload`] without
-/// repeatedly re-decoding identical immutable payloads.
-pub fn validate_save_payload_cached(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(), String> {
-    let key = (ValidationKind::from(kind), sha256_bytes(bytes));
+/// cache using an already-computed `sha256` digest so `AutosaveStore`
+/// commits and loads avoid hashing immutable payloads a second time while
+/// agreeing 100% with [`validate_save_payload`].
+pub fn validate_save_payload_cached_with_sha256(
+    kind: &SavePayloadKind,
+    sha256: &[u8; 32],
+    bytes: &[u8],
+) -> Result<(), String> {
+    let key = (ValidationKind::from(kind), *sha256);
     {
         let guard = validation_cache().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = guard.get(&key) {
@@ -140,6 +144,15 @@ pub fn validate_save_payload_cached(kind: &SavePayloadKind, bytes: &[u8]) -> Res
         guard.insert(key, result.clone());
     }
     result
+}
+
+/// Full payload validator backed by a bounded `(SavePayloadKind, SHA-256)`
+/// cache so Save Manager listings, overwrite/pruning safeguards, and
+/// self-encoded commits agree 100% with [`validate_save_payload`] without
+/// repeatedly re-decoding identical immutable payloads.
+pub fn validate_save_payload_cached(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(), String> {
+    let sha256 = sha256_bytes(bytes);
+    validate_save_payload_cached_with_sha256(kind, &sha256, bytes)
 }
 
 /// Fast header-only check verifying the 8-byte `Saved` format and
@@ -614,7 +627,10 @@ fn worker_loop(
                 let lot_id = job.lot_id;
                 let target = job.target;
                 let sim_tick = job.sim_tick;
-                let result = store.commit_job_validated(job, validate_save_payload_cached);
+                let result = store.commit_job_validated_with_sha256(
+                    job,
+                    validate_save_payload_cached_with_sha256,
+                );
                 publish(SaveCompletion {
                     neighborhood_id,
                     lot_id,
@@ -667,7 +683,10 @@ fn worker_loop(
                 // Incoming payload hits the SHA-256 validation cache in O(1);
                 // existing manual/ring records still run full `Saved::decode`
                 // on first sight so corrupt slots are never overwritten/pruned.
-                let result = store.commit_job_validated(job, validate_save_payload_cached);
+                let result = store.commit_job_validated_with_sha256(
+                    job,
+                    validate_save_payload_cached_with_sha256,
+                );
                 publish(SaveCompletion {
                     neighborhood_id,
                     lot_id,
