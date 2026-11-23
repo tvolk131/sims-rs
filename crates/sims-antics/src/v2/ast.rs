@@ -35,6 +35,42 @@ pub enum V2Item {
     Fn(FnDecl),
     Template(TemplateDecl),
     Object(ObjectDecl),
+    Enum(EnumDecl),
+    Bitflags(BitflagsDecl),
+}
+
+/// Zero-cost integer enum declaration (`[pub] enum Name { VariantA, VariantB = 2 }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDecl {
+    pub span: Span,
+    pub is_pub: bool,
+    pub name: String,
+    pub variants: Vec<EnumVariant>,
+}
+
+/// One variant inside an `enum` declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumVariant {
+    pub span: Span,
+    pub name: String,
+    pub value: i16,
+}
+
+/// Zero-cost 1-based SimAntics bitflags declaration (`[pub] bitflags Name { FlagA = 1, FlagB = 2 }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitflagsDecl {
+    pub span: Span,
+    pub is_pub: bool,
+    pub name: String,
+    pub flags: Vec<BitflagVariant>,
+}
+
+/// One flag inside a `bitflags` declaration, storing its 1-based SimAntics bit position (`1..=16`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitflagVariant {
+    pub span: Span,
+    pub name: String,
+    pub bit: u8,
 }
 
 /// Type annotations in `.antics` v2.
@@ -49,6 +85,7 @@ pub enum V2Type {
     Skill,
     Sound,
     Slot,
+    Named(String),
     MutRef(Box<V2Type>),
 }
 
@@ -65,6 +102,7 @@ impl V2Type {
             Self::Skill => "Skill".to_owned(),
             Self::Sound => "Sound".to_owned(),
             Self::Slot => "Slot".to_owned(),
+            Self::Named(name) => name.clone(),
             Self::MutRef(inner) => format!("&mut {}", inner.display_name()),
         }
     }
@@ -118,8 +156,13 @@ pub enum ObjectMember {
     Sound(SoundDecl),
     Slot(SlotDecl),
     Strings(StringsDecl),
+    Enum(EnumDecl),
+    Bitflags(BitflagsDecl),
     Init(LifecycleBlock),
     Main(LifecycleBlock),
+    Load(LifecycleBlock),
+    Reset(LifecycleBlock),
+    Cleanup(LifecycleBlock),
     Functional(FunctionalDecl),
     Interaction(InteractionDecl),
     Fn(FnDecl),
@@ -222,11 +265,12 @@ pub struct StateDecl {
     pub init: Option<StateInitValue>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateType {
     Bool,
     I16,
     ObjectId,
+    Named(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +278,8 @@ pub enum StateInitValue {
     Int(i16),
     Bool(bool),
     Param(String),
+    Path(Span, Vec<String>),
+    BitOr(Span, Box<StateInitValue>, Box<StateInitValue>),
 }
 
 /// Typed sound declaration (`sound settle = preset("soft_thud");`).
@@ -285,13 +331,14 @@ pub struct LifecycleBlock {
     pub body: Vec<V2Stmt>,
 }
 
-/// Functional callback declaration (`functional prep { score: 50, guard(sim) => ..., run(sim) { ... } }`).
+/// Functional callback declaration (`functional prep [-> RetType] { score: 50, guard(sim) => ..., run(sim) { ... } }`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionalDecl {
     pub span: Span,
     pub kind: String,
     pub kind_span: Span,
     pub params: Vec<FnParam>,
+    pub return_type: Option<V2Type>,
     pub score: Option<ConstIntExpr>,
     pub pinned_id: Option<u16>,
     pub pinned_guard_id: Option<u16>,
@@ -322,6 +369,8 @@ pub struct AdvertiseDecl {
 pub struct GuardDecl {
     pub span: Span,
     pub sim_binding: String,
+    /// Optional 2nd parameter (`guard(sim, is_autonomous)`) on `interaction` guards.
+    pub autonomous_binding: Option<String>,
     pub kind: GuardBody,
 }
 
@@ -409,6 +458,7 @@ pub enum V2Stmt {
     LetSome {
         span: Span,
         name: String,
+        ty: Option<V2Type>,
         init: V2Expr,
         else_body: Vec<V2Stmt>,
     },
@@ -451,6 +501,11 @@ pub enum V2Stmt {
         then_body: Vec<V2Stmt>,
         else_body: Vec<V2Stmt>,
     },
+    Match {
+        span: Span,
+        scrutinee: V2Expr,
+        arms: Vec<MatchArm>,
+    },
     Break {
         span: Span,
     },
@@ -471,10 +526,28 @@ pub enum V2Stmt {
     },
 }
 
+/// One arm of a `match` statement (`Pattern => { ... }`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub span: Span,
+    pub pattern: MatchPattern,
+    pub body: Vec<V2Stmt>,
+}
+
+/// Pattern inside a `match` arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchPattern {
+    Wildcard(Span),
+    Ident(Span, String),
+    Int(Span, i16),
+    Path(Span, Vec<String>),
+}
+
 /// Built-in loop iteration sources for `for obj in ...`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForEachIter {
     ObjectsByGuid(u32),
+    ObjectsOf { span: Span, object_type: String },
     SelfParts,
 }
 
@@ -495,6 +568,8 @@ pub enum V2Expr {
     Ident(Span, String),
     /// Qualified path like `module::helper` or `Motive::Energy`.
     Path(Span, Vec<String>),
+    /// Parenthesized tuple like `("Order Groceries", "Chat", "Info")`.
+    Tuple(Span, Vec<V2Expr>),
     Field {
         span: Span,
         base: Box<V2Expr>,
@@ -527,12 +602,14 @@ pub enum V2Expr {
     Call {
         span: Span,
         callee: Box<V2Expr>,
+        type_args: Vec<V2Type>,
         args: Vec<CallArg>,
     },
     MethodCall {
         span: Span,
         receiver: Box<V2Expr>,
         method: String,
+        type_args: Vec<V2Type>,
         args: Vec<CallArg>,
     },
 }
@@ -546,6 +623,7 @@ impl V2Expr {
             | Self::Str(s, _)
             | Self::Ident(s, _)
             | Self::Path(s, _)
+            | Self::Tuple(s, _)
             | Self::Field { span: s, .. }
             | Self::Index { span: s, .. }
             | Self::Deref { span: s, .. }
@@ -556,4 +634,50 @@ impl V2Expr {
             | Self::MethodCall { span: s, .. } => *s,
         }
     }
+}
+
+/// Converts a display name (e.g. `"Open Frost Fridge"`) into its PascalCase type identifier
+/// (`"OpenFrostFridge"`).
+#[must_use]
+pub(crate) fn object_type_ident(name: &str) -> String {
+    let mut out = String::new();
+    let mut cap = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if cap {
+                out.push(ch.to_ascii_uppercase());
+                cap = false;
+            } else {
+                out.push(ch);
+            }
+        } else {
+            cap = true;
+        }
+    }
+    if out.is_empty() {
+        "Object".to_owned()
+    } else {
+        out
+    }
+}
+
+/// Returns `true` if `name` is a built-in/reserved type name that user `enum`, `bitflags`,
+/// `object` type identifiers, and `use ... as <Alias>` bindings may not shadow.
+#[must_use]
+pub(crate) fn is_reserved_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "i16"
+            | "bool"
+            | "Object"
+            | "ObjectId"
+            | "Sim"
+            | "Motive"
+            | "Skill"
+            | "Sound"
+            | "Slot"
+            | "Height"
+            | "Placement"
+            | "Self"
+    )
 }

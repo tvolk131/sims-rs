@@ -1,5 +1,8 @@
 // Open Frost Fridge (0x7F00_0020) — initiates the multi-object cooking chain with defer rollback.
 
+use crate::objects::open_counter::OpenOakCounter;
+use crate::objects::open_stove::OpenHearthStove;
+
 object "Open Frost Fridge" {
     guid: 0x7F00_0020;
     price: 550;
@@ -28,10 +31,10 @@ object "Open Frost Fridge" {
             if self.stock <= 0 {
                 return false;
             }
-            let Some(counter) = find_best_object(prep) else {
+            let Some(counter) = find_best_object::<OpenOakCounter>(prep) else {
                 return false;
             };
-            let Some(stove) = find_best_object(cook) else {
+            let Some(stove) = find_best_object::<OpenHearthStove>(cook) else {
                 return false;
             };
             if !debit_funds(meal_cost) {
@@ -48,14 +51,14 @@ object "Open Frost Fridge" {
                 }
             }
 
-            if !counter.run_functional(prep, sim.skill.cooking, sim.id, 0, 0) {
+            let Some(prep_bonus) = counter.run_functional(prep) else {
                 return false;
-            }
-            if !stove.run_functional(cook) {
+            };
+            let Some(plate) = stove.run_functional(cook, sim.skill.cooking, sim.id, 0, prep_bonus) else {
                 return false;
-            }
+            };
 
-            self.last_plate = temp[2];
+            self.last_plate = plate;
             self.meals_cooked += 1;
             sim.skill.cooking += cooking_xp;
             committed = true;
